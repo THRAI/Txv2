@@ -1,0 +1,37 @@
+---
+name: tx-hal-axhal
+description: Use when editing HAL, boot, pmap, trap, page-substrate, platform, or old OSTD-alignment docs.
+---
+
+# tx-hal-axhal
+
+Use this skill for HAL/substrate boundary work.
+
+## Read First
+
+- `docs/design/01_substrate/HAL_v1.md`
+- `docs/design/01_substrate/PAGE_SUBSTRATE_v1.md`
+- `docs/design/00_meta-framework/MODULE_MAP_v1.md`
+- `docs/design/00_meta-framework/INVARIANTS_v4.md` MAP-2A and HAL rules
+
+## Preserve
+
+- HAL is an axHal-style static platform family.
+- One platform is selected at compile/link time.
+- No runtime `HalManager`.
+- No `Box<dyn Hal>`.
+- No `__ostd_main`.
+- No HAL-owned semantic entities.
+- No HAL callback slot for subsystem policy.
+
+## Boundary
+
+- HAL owns platform boot, traps, low-level hardware facts, pmap primitive surface, timer/IRQ/console traits.
+- Page substrate owns frame allocator, `FrameMeta`, slab heap, and steady-state page accounting.
+- Semantic subsystems own user-visible entities and policy.
+
+## Done Means
+
+- Old OSTD terms appear only as historical/migration/negative-rule notes.
+- `PAGE_SUBSTRATE_v1.md` preconditions match `HAL_v1.md` H0-H4 boot sequence.
+- No active doc describes HAL as a runtime subsystem or service manager.

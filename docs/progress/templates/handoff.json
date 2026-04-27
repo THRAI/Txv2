@@ -1,0 +1,35 @@
+{
+  "schema": "tx.progress.handoff.v1",
+  "id": "YYYY-MM-DD-short-title",
+  "title": "Short handoff title",
+  "created": "YYYY-MM-DD",
+  "from": "agent-or-human",
+  "status": "open",
+  "plan": null,
+  "current_state": [
+    "What is true right now."
+  ],
+  "changed_files": [
+    {
+      "path": "path/to/file",
+      "reason": "Why it changed."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask check",
+      "status": "not-run",
+      "notes": ""
+    }
+  ],
+  "next_actions": [
+    {
+      "id": "next-1",
+      "title": "Next action",
+      "paths": [],
+      "notes": ""
+    }
+  ],
+  "caveats": [],
+  "links": []
+}

@@ -1,0 +1,14 @@
+[package]
+name = "tx-drivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+std = []
+
+[lib]
+path = "src/lib.rs"
+doctest = false

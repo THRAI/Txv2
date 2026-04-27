@@ -1,0 +1,114 @@
+# Skills are maintained from canonical docs. This manifest records source inputs
+# so drift is visible during doc cleanup.
+
+skills:
+  tx-agentic-development:
+    sources:
+      - AGENTS.md
+      - .agents/skills/tx-design-reference/SKILL.md
+      - .agents/skills/tx-progress-memory/SKILL.md
+      - docs/progress/STATUS.md
+      - docs/progress/templates/plan.json
+      - docs/progress/templates/handoff.json
+      - docs/progress/templates/worktree.json
+      - external/humanlayer-reference/.claude/commands/create_plan.md
+      - external/humanlayer-reference/.claude/commands/implement_plan.md
+      - external/humanlayer-reference/.claude/commands/resume_handoff.md
+      - external/humanlayer-reference/.claude/commands/research_codebase.md
+      - external/humanlayer-reference/.claude/commands/create_worktree.md
+      - external/humanlayer-reference/.claude/agents/codebase-locator.md
+      - external/humanlayer-reference/.claude/agents/codebase-analyzer.md
+      - external/humanlayer-reference/.claude/agents/codebase-pattern-finder.md
+      - external/humanlayer-reference/.claude/agents/thoughts-locator.md
+      - external/humanlayer-reference/.claude/agents/thoughts-analyzer.md
+    purpose: Run HumanLayer-inspired agentic development with isolated research roles and durable progress memory.
+
+  tx-design-reference:
+    sources:
+      - docs/design/INDEX.md
+      - docs/design/00_meta-framework/CONCEPTS_v4.md
+      - docs/design/00_meta-framework/INVARIANTS_v4.md
+      - docs/design/00_meta-framework/CI_REPORTING_v1.md
+      - docs/design/00_meta-framework/MODULE_MAP_v1.md
+      - docs/design/00_meta-framework/object_model_v2.md
+      - docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md
+      - docs/ebr-zone/02_EBR_design.en-US.md
+      - docs/ebr-zone/03_Zone_Cap_object_storage_design.en-US.md
+    purpose: Gather the relevant active design docs for an implementation, audit, or planning task.
+
+  tx-docs-cleanup:
+    sources:
+      - docs/design/INDEX.md
+      - docs/design/00_meta-framework/CONCEPTS_v4.md
+      - docs/design/00_meta-framework/INVARIANTS_v4.md
+      - docs/design/00_meta-framework/CI_REPORTING_v1.md
+      - docs/design/00_meta-framework/MODULE_MAP_v1.md
+    purpose: Broad active-doc cleanup, link checking, stale-term scans.
+
+  tx-docs-skill-maintenance:
+    sources:
+      - AGENTS.md
+      - .agents/skills/README.md
+      - docs/design/INDEX.md
+      - docs/design/00_meta-framework/CONCEPTS_v4.md
+      - docs/design/00_meta-framework/INVARIANTS_v4.md
+      - docs/design/00_meta-framework/CI_REPORTING_v1.md
+    purpose: Create, refresh, and audit skills from canonical docs.
+
+  tx-meta-alignment:
+    sources:
+      - docs/design/00_meta-framework/CONCEPTS_v4.md
+      - docs/design/00_meta-framework/INVARIANTS_v4.md
+      - docs/design/00_meta-framework/object_model_v2.md
+      - docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md
+      - docs/design/00_meta-framework/MODULE_MAP_v1.md
+      - docs/design/00_meta-framework/CI_REPORTING_v1.md
+    purpose: Keep the canonical meta framework coherent.
+
+  tx-ebr-zone:
+    sources:
+      - docs/design/00_meta-framework/object_model_v2.md
+      - docs/design/00_meta-framework/INVARIANTS_v4.md
+      - docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md
+      - docs/ebr-zone/02_EBR_design.en-US.md
+      - docs/ebr-zone/03_Zone_Cap_object_storage_design.en-US.md
+    purpose: Maintain EBR, zone, cap, weak, witness, identity-slot, and projection-reference docs.
+
+  tx-hal-axhal:
+    sources:
+      - docs/design/01_substrate/HAL_v1.md
+      - docs/design/01_substrate/PAGE_SUBSTRATE_v1.md
+      - docs/design/00_meta-framework/MODULE_MAP_v1.md
+      - docs/design/00_meta-framework/INVARIANTS_v4.md
+    purpose: Keep HAL and page substrate aligned with axHal-style static platform selection.
+
+  tx-subsystem-manifest:
+    sources:
+      - docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md
+      - docs/design/00_meta-framework/object_model_v2.md
+      - docs/design/00_meta-framework/INVARIANTS_v4.md
+    purpose: Add or audit zone-derived type policy sections in subsystem specs.
+
+  tx-implementation-readiness:
+    sources:
+      - docs/design/INDEX.md
+      - docs/design/00_meta-framework/INVARIANTS_v4.md
+      - docs/design/00_meta-framework/object_model_v2.md
+      - docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md
+      - docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md
+      - docs/design/01_substrate/HAL_v1.md
+    purpose: Decide whether docs are precise enough to implement from.
+
+  tx-progress-memory:
+    sources:
+      - docs/progress/README.md
+      - docs/progress/STATUS.md
+      - docs/progress/templates/decision.md
+      - docs/progress/templates/plan.json
+      - docs/progress/templates/handoff.json
+      - docs/progress/templates/worktree.json
+      - docs/progress/templates/research.md
+      - docs/progress/research/2026-04-27-humanlayer-progress-memory.md
+      - .agents/commands/README.md
+      - .agents/commands/finish-catchup.md
+    purpose: Record and resume decisions, status, plans, handoffs, and research memory.

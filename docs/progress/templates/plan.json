@@ -1,0 +1,60 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "YYYY-MM-DD-short-title",
+  "title": "Short plan title",
+  "status": "proposed",
+  "created": "YYYY-MM-DD",
+  "updated": "YYYY-MM-DD",
+  "owner": "agent-or-human",
+  "summary": "Concrete outcome this plan is meant to produce.",
+  "scope": {
+    "in": [
+      "paths or areas in scope"
+    ],
+    "out": [
+      "explicit non-goals"
+    ],
+    "write_sets": [
+      {
+        "owner": "agent-or-worker-id",
+        "paths": [
+          "path/prefix"
+        ],
+        "notes": "Disjoint write-scope note."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/INDEX.md"
+    ],
+    "progress_refs": [],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "step-1",
+      "title": "First step",
+      "status": "pending",
+      "depends_on": [],
+      "paths": [],
+      "verification": [
+        "cargo xtask check"
+      ],
+      "notes": ""
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask check",
+      "status": "not-run",
+      "notes": ""
+    }
+  ],
+  "risks": [],
+  "blockers": [],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

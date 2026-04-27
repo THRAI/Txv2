@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "xtask",
+    "crates/tx-hal",
+    "crates/tx-kernel",
+    "crates/tx-substrate",
+    "crates/tx-reactor",
+    "crates/tx-policy",
+    "crates/tx-drivers",
+    "crates/tx-subsystems",
+    "crates/tx-services",
+    "crates/tx-fs",
+    "crates/tx-scripts",
+    "crates/tx-shims",
+    "boards/tx-hal-riscv64-qemu-virt",
+    "boards/tx-hal-riscv64-m1dock-mock",
+    "boards/tx-hal-loongarch64-qemu-virt",
+    "boards/tx-kernel-riscv64-qemu-virt",
+    "boards/tx-kernel-riscv64-m1dock-mock",
+    "boards/tx-kernel-loongarch64-qemu-virt",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/txkernel"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,17 @@
+[package]
+name = "tx-kernel-loongarch64-qemu-virt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tx-hal = { path = "../../crates/tx-hal" }
+tx-hal-loongarch64-qemu-virt = { path = "../tx-hal-loongarch64-qemu-virt" }
+tx-kernel = { path = "../../crates/tx-kernel" }
+
+[[bin]]
+name = "tx-kernel-loongarch64-qemu-virt"
+path = "src/main.rs"
+test = false
+doctest = false
