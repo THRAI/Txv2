@@ -207,6 +207,19 @@
   riscv64gc-unknown-none-elf`, `cargo xtask lint unused`, and
   `cargo xtask progress validate`; next step is for reactor/scheduler code to
   consume `TimeIf` without adding a runtime HAL manager. No blocker.
+- `tx-reactor` now has host-driven timeout waits on top of the task-aware wait
+  channel: `Reactor::channel()` creates timer-aware channels, timeout
+  `WaitProtocol` variants carry absolute nanosecond deadlines, and
+  `Reactor::advance_time_to(now_ns)` wakes expired deadlines so
+  `wait_event` can return `TimedOut` while still rechecking semantic readiness
+  after every event wake. Focused tests cover no early timeout,
+  ready-before-timeout unregister, and spurious event wake re-parking before
+  timeout. Verification: `cargo fmt --check`, `cargo test -p tx-reactor`,
+  `cargo xtask lint unused`, `cargo xtask lint docs`,
+  `cargo xtask progress validate`, `cargo xtask ci`, `cargo xtask ci-slow`,
+  and `git diff --check`. Next step: scheduler shell boundary types and, after
+  the saved-register trap shell exists, a narrow trap-to-kernel timer delivery
+  hook; no EBR/zone work was touched.
 - `TrapIf` now includes typed trap snapshots and classification. RV64 QEMU
   decodes common synchronous faults and supervisor interrupts from `scause`;
   the direct-mode vector still panics/spins until the full saved-register

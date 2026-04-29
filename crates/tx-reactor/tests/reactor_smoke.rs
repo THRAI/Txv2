@@ -326,3 +326,146 @@ fn wait_event_rechecks_condition_after_spurious_wake() {
     assert_eq!(waiter_done.load(Ordering::SeqCst), 1);
     assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Completed));
 }
+
+#[test]
+fn wait_event_timeout_completes_only_after_deadline_is_driven() {
+    let mut reactor = Reactor::new();
+    let channel = reactor.channel();
+    let mask = Mask::from_bits(0x1);
+    let outcome = Arc::new(Mutex::new(None));
+    let deadline_ns = 10;
+
+    let waiter = {
+        let channel = channel.clone();
+        let outcome = Arc::clone(&outcome);
+        reactor.submit(async move {
+            let wait_outcome = channel
+                .wait_event(
+                    mask,
+                    WaitProtocol::InterruptibleTimeout(deadline_ns),
+                    || false,
+                )
+                .await;
+            *outcome.lock().expect("outcome slot poisoned") = Some(wait_outcome);
+        })
+    };
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 0
+        }
+    );
+    assert_eq!(*outcome.lock().expect("outcome slot poisoned"), None);
+    assert_eq!(reactor.advance_time_to(deadline_ns - 1), 0);
+    assert_eq!(reactor.run_until_idle().polled, 0);
+    assert_eq!(*outcome.lock().expect("outcome slot poisoned"), None);
+
+    assert_eq!(reactor.advance_time_to(deadline_ns), 1);
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 1
+        }
+    );
+    assert_eq!(
+        *outcome.lock().expect("outcome slot poisoned"),
+        Some(WaitOutcome::TimedOut)
+    );
+    assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Completed));
+}
+
+#[test]
+fn wait_event_ready_before_timeout_unregisters_timer() {
+    let mut reactor = Reactor::new();
+    let channel = reactor.channel();
+    let mask = Mask::from_bits(0x1);
+    let condition_ready = Arc::new(AtomicUsize::new(0));
+    let outcome = Arc::new(Mutex::new(None));
+    let deadline_ns = 20;
+
+    let waiter = {
+        let channel = channel.clone();
+        let condition_ready = Arc::clone(&condition_ready);
+        let outcome = Arc::clone(&outcome);
+        reactor.submit(async move {
+            let wait_outcome = channel
+                .wait_event(
+                    mask,
+                    WaitProtocol::InterruptibleTimeout(deadline_ns),
+                    move || condition_ready.load(Ordering::SeqCst) != 0,
+                )
+                .await;
+            *outcome.lock().expect("outcome slot poisoned") = Some(wait_outcome);
+        })
+    };
+
+    assert_eq!(reactor.run_until_idle().polled, 1);
+    condition_ready.store(1, Ordering::SeqCst);
+    assert_eq!(channel.fire(mask), 1);
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 1
+        }
+    );
+    assert_eq!(
+        *outcome.lock().expect("outcome slot poisoned"),
+        Some(WaitOutcome::Ready)
+    );
+    assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Completed));
+    assert_eq!(reactor.advance_time_to(deadline_ns), 0);
+}
+
+#[test]
+fn wait_event_spurious_wake_reparks_before_timeout() {
+    let mut reactor = Reactor::new();
+    let channel = reactor.channel();
+    let mask = Mask::from_bits(0x1);
+    let outcome = Arc::new(Mutex::new(None));
+    let deadline_ns = 30;
+
+    let waiter = {
+        let channel = channel.clone();
+        let outcome = Arc::clone(&outcome);
+        reactor.submit(async move {
+            let wait_outcome = channel
+                .wait_event(
+                    mask,
+                    WaitProtocol::InterruptibleTimeout(deadline_ns),
+                    || false,
+                )
+                .await;
+            *outcome.lock().expect("outcome slot poisoned") = Some(wait_outcome);
+        })
+    };
+
+    assert_eq!(reactor.run_until_idle().polled, 1);
+    assert_eq!(channel.fire(mask), 1);
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 0
+        }
+    );
+    assert_eq!(*outcome.lock().expect("outcome slot poisoned"), None);
+    assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Parked));
+
+    assert_eq!(reactor.advance_time_to(deadline_ns), 1);
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 1
+        }
+    );
+    assert_eq!(
+        *outcome.lock().expect("outcome slot poisoned"),
+        Some(WaitOutcome::TimedOut)
+    );
+}
