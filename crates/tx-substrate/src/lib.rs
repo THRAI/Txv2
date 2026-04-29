@@ -1,5 +1,7 @@
 #![no_std]
 
+extern crate alloc;
+
 use tx_hal::TxPlatform;
 
 #[doc(hidden)]
@@ -15,11 +17,7 @@ pub mod bus {
     pub struct RawTrace;
 }
 
-pub mod epoch {
-    pub struct Guard<'g> {
-        _marker: core::marker::PhantomData<&'g ()>,
-    }
-}
+pub mod epoch;
 
 pub mod index {
     pub struct IndexReservation;
@@ -35,6 +33,7 @@ pub mod pmap {
 
 pub mod page_allocator;
 pub mod slab;
+pub mod zone;
 
 pub mod page {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,27 +270,11 @@ pub mod shootdown {
     }
 }
 
-pub mod zone {
-    pub struct Cap<T: ?Sized> {
-        _marker: core::marker::PhantomData<T>,
-    }
-
-    pub struct Weak<T: ?Sized> {
-        _marker: core::marker::PhantomData<T>,
-    }
-
-    pub struct IdentRef<'g, T: ?Sized> {
-        _marker: core::marker::PhantomData<&'g T>,
-    }
-
-    pub struct ZoneReservation<T> {
-        _marker: core::marker::PhantomData<T>,
-    }
-}
-
 pub fn init<P: TxPlatform>() {
     let _ = P::platform_info();
     boot_memory::init_from_hal::<P>();
+    epoch::init_on_bsp::<P>().expect("tx_substrate::init epoch initialization failed");
+    zone::init_on_bsp::<P>().expect("tx_substrate::init zone initialization failed");
     slab::init::<P>().expect("tx_substrate::init slab heap initialization failed");
     slab::allocation_smoke().expect("tx_substrate::init slab allocation smoke failed");
 }
