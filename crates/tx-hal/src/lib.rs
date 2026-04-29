@@ -158,6 +158,7 @@ pub struct PlatformInfo {
 pub trait PlatformConfig {
     const ARCH: Arch;
     const BOARD: &'static str;
+    const SUBSTRATE_BOOT_READY: bool = false;
     const PAGE_SIZE: usize = 4096;
     const PAGE_SHIFT: usize = 12;
     const PHYS_ADDR_BITS: u8 = 0;
@@ -495,8 +496,16 @@ impl PmapUnmapResult {
         self.phys
     }
 
+    pub const fn base_ppn(self) -> Ppn {
+        Ppn(self.phys.0 / 4096)
+    }
+
     pub const fn kind(self) -> PmapReserveKind {
         self.kind
+    }
+
+    pub const fn page_count(self) -> usize {
+        self.kind.size() / 4096
     }
 
     pub const fn invalidation(self) -> PmapInvalidation {
@@ -570,6 +579,12 @@ pub trait PmapIf {
 
     fn shootdown_kernel_mapping(_invalidation: PmapInvalidation) {}
 
+    fn shootdown_kernel_mappings(invalidations: &[PmapInvalidation]) {
+        for invalidation in invalidations {
+            Self::shootdown_kernel_mapping(*invalidation);
+        }
+    }
+
     fn create_pmap_root() -> Result<PmapRoot, PmapError> {
         Err(PmapError::Unsupported)
     }
@@ -612,38 +627,17 @@ pub trait PmapIf {
     }
 
     fn shootdown_mapping(_asid: Asid, _invalidation: PmapInvalidation) {}
+
+    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        for invalidation in invalidations {
+            Self::shootdown_mapping(asid, *invalidation);
+        }
+    }
 }
 
 pub mod pmap;
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TrapClass {
-    InstructionPageFault,
-    LoadPageFault,
-    StorePageFault,
-    IllegalInstruction,
-    Breakpoint,
-    UserEnvCall,
-    SupervisorTimer,
-    SupervisorExternal,
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TrapFrameSnapshot {
-    pub scause: usize,
-    pub sepc: usize,
-    pub stval: usize,
-}
-
-pub trait TrapIf {
-    fn install_minimal_trap_vector() {}
-
-    fn install_kernel_trap_vector() {}
-
-    fn classify_trap(_snapshot: TrapFrameSnapshot) -> TrapClass {
-        TrapClass::Unknown
-    }
-}
+pub mod trap;
+pub use trap::{TrapClass, TrapFrameSnapshot, TrapIf, TrapPreviousMode, TrapSnapshot};
 pub trait UserAccessIf {}
 pub trait SignalFrameIf {}
 pub trait IrqIf {}
