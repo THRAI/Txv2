@@ -1,5 +1,7 @@
 #![no_std]
 
+use core::marker::PhantomData;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Arch {
     Riscv64,
@@ -8,6 +10,26 @@ pub enum Arch {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuId(pub usize);
+
+#[derive(Debug)]
+#[must_use]
+pub struct CpuPinGuard {
+    cpu_id: CpuId,
+    _not_send_sync: PhantomData<*mut ()>,
+}
+
+impl CpuPinGuard {
+    pub const fn new(cpu_id: CpuId) -> Self {
+        Self {
+            cpu_id,
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    pub const fn cpu_id(&self) -> CpuId {
+        self.cpu_id
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootArg(pub usize);
@@ -646,12 +668,40 @@ pub trait TrapIf {
 }
 pub trait UserAccessIf {}
 pub trait SignalFrameIf {}
-pub trait IrqIf {}
+pub trait IrqIf {
+    fn in_irq_context() -> bool {
+        false
+    }
+
+    fn interrupts_enabled() -> bool {
+        true
+    }
+}
 pub trait TimeIf {}
-pub trait PercpuIf {}
+pub trait PercpuIf {
+    fn current_cpu_id() -> CpuId {
+        CpuId(0)
+    }
+
+    fn pin_current_cpu() -> CpuPinGuard {
+        CpuPinGuard::new(Self::current_cpu_id())
+    }
+}
 pub trait CacheIf {}
 pub trait DmaIf {}
-pub trait SmpIf {}
+pub trait SmpIf {
+    fn possible_cpu_count() -> usize {
+        1
+    }
+
+    fn online_cpu_count() -> usize {
+        1
+    }
+
+    fn is_cpu_online(cpu: CpuId) -> bool {
+        cpu.0 < Self::online_cpu_count()
+    }
+}
 pub trait PowerIf {
     fn system_off() -> !;
 }
