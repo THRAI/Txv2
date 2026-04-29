@@ -48,7 +48,9 @@ pub mod shootdown {
     use core::fmt;
     use core::marker::PhantomData;
     use core::mem::MaybeUninit;
-    use tx_hal::{Asid, PhysAddr, PmapIf, PmapReserveKind, PmapUnmapResult, Ppn};
+    use tx_hal::{
+        Asid, PhysAddr, PmapIf, PmapInvalidation, PmapReserveKind, PmapUnmapResult, Ppn, VirtAddr,
+    };
 
     use crate::page_allocator::{MapPin, MapPinRun, PageAllocator};
 
@@ -219,11 +221,19 @@ pub mod shootdown {
 
         pub fn issue_and_release<P: PmapIf>(mut self) {
             let len = self.len;
+
+            let mut invalidations = [PmapInvalidation::new(VirtAddr(0), 0); N];
+            for (index, slot) in invalidations.iter_mut().enumerate().take(len) {
+                let entry = unsafe { self.entries[index].assume_init_ref() };
+                *slot = entry.result.invalidation();
+            }
+
+            P::shootdown_kernel_mappings(&invalidations[..len]);
+
             self.len = 0;
 
             for index in 0..len {
                 let entry = unsafe { self.entries[index].assume_init_read() };
-                P::shootdown_kernel_mapping(entry.result.invalidation());
                 entry.token.release();
             }
         }
@@ -339,11 +349,19 @@ pub mod shootdown {
 
         pub fn issue_and_release<P: PmapIf>(mut self) {
             let len = self.len;
+
+            let mut invalidations = [PmapInvalidation::new(VirtAddr(0), 0); N];
+            for (index, slot) in invalidations.iter_mut().enumerate().take(len) {
+                let entry = unsafe { self.entries[index].assume_init_ref() };
+                *slot = entry.result.invalidation();
+            }
+
+            P::shootdown_mappings(self.asid, &invalidations[..len]);
+
             self.len = 0;
 
             for index in 0..len {
                 let entry = unsafe { self.entries[index].assume_init_read() };
-                P::shootdown_mapping(self.asid, entry.result.invalidation());
                 entry.token.release();
             }
         }
