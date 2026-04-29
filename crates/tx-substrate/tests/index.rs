@@ -1,5 +1,23 @@
+use tx_hal::{IrqIf, PercpuIf, SmpIf};
 use tx_substrate::epoch;
 use tx_substrate::index::{Index, IndexError};
+
+static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct TestPlatform;
+
+impl PercpuIf for TestPlatform {}
+impl IrqIf for TestPlatform {}
+impl SmpIf for TestPlatform {}
+
+fn reset_epoch() -> std::sync::MutexGuard<'static, ()> {
+    let guard = EPOCH_TEST_LOCK.lock().expect("epoch test lock");
+    unsafe {
+        epoch::testing::reset_for_test();
+    }
+    epoch::init_on_bsp::<TestPlatform>().expect("epoch init");
+    guard
+}
 
 #[derive(Debug, Eq, PartialEq)]
 struct NonCloneValue {
@@ -25,6 +43,7 @@ fn duplicate_reservations_fail_and_dropped_reservation_rolls_back() {
 
 #[test]
 fn committed_lookup_is_guard_observed_without_cloning_value() {
+    let _epoch = reset_epoch();
     let index = Index::<u32, NonCloneValue, 2>::new();
     index
         .reserve(8)

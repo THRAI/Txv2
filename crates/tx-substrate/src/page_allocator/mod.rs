@@ -241,6 +241,15 @@ pub fn free_count() -> Result<usize, AllocError> {
     Ok(installed_bitmap_allocator()?.free_count())
 }
 
+/// Release one owned frame through the installed bitmap allocator.
+///
+/// This is for substrate components that intentionally hold a raw PPN after
+/// committing an `OwnedFrame` token into their own lifetime protocol.
+pub(crate) fn release_owned_frame(ppn: Ppn) -> Result<(), AllocError> {
+    installed_bitmap_allocator()?.release_owned(ppn);
+    Ok(())
+}
+
 /// Total frame count from the installed backend.
 pub fn total_count() -> Result<usize, AllocError> {
     Ok(installed_bitmap_allocator()?.total_count())

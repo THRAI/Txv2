@@ -16,8 +16,8 @@ an axHal-style static platform family.
 - [`docs/progress/README.md`](docs/progress/README.md) records durable plans,
   decisions, handoffs, and status.
 - [`AGENTS.md`](AGENTS.md) records agent guidance and canonical read order.
-- [`external/humanlayer-reference/.claude/`](external/humanlayer-reference/.claude/)
-  is a reference-only copy of HumanLayer's agent workflow prompts.
+- [`external/humanlayer-reference/`](external/humanlayer-reference/) contains
+  the reference-only HumanLayer `.claude` workflow prompts.
 
 ## Workspace Map
 
