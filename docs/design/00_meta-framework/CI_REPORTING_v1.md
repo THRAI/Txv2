@@ -73,6 +73,10 @@ The default CI gate is `cargo xtask ci`. It reports these checks individually:
 
 - `cargo xtask lint docs`
 
+<!-- txdoc:CI-GATE-UNUSED-LINT -->
+
+- `cargo xtask lint unused`
+
 <!-- txdoc:CI-GATE-PROGRESS-JSON -->
 
 - `cargo xtask progress validate`

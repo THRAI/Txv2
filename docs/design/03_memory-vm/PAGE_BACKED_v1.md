@@ -35,6 +35,13 @@ This document does *not* cover:
 4. **No swap.** Anonymous pages are pinned until explicit teardown. The Anon variant has no flush-to-disk path; its `evict` does nothing (the CachePin drop + map_count transitions handle reclamation naturally).
 5. **Stackless coroutines.** Every step function returns `StepOutcome<T>`. Page fetches that need I/O return `Blocked(carrier, mask)`; the script composes a wait; the step retries after wake.
 
+6. **Page-backed code stays above raw address arithmetic.** This document may
+   talk about page indexes, file offsets, `Frame` evidence, and typed user
+   buffers, but it does not own pmap layout, direct-map arithmetic, or user
+   pointer dereference. Page-backed operations obtain content through
+   `Cap<PageContainer>`, `CachePin`/Frame evidence, and VM/user-access helper
+   gates.
+
 **Companion documents.**
 
 - [`PAGE_SUBSTRATE_v1.md`](../01_substrate/PAGE_SUBSTRATE_v1.md) — frame allocator, FrameMeta, pmap substrate this doc consumes.
@@ -60,6 +67,29 @@ independent reclamation:
 
 This document does not introduce `Zone<T, Policy>` at dispatch sites. Backing
 variants carry the role-shaped evidence supplied by their owning subsystem.
+
+### Address boundary policy
+<!-- txdoc:PAGE-BACKED-ADDRESS-BOUNDARY-POLICY -->
+
+PAGE_BACKED lives above PAGE_SUBSTRATE and below syscall scripts. Its native
+coordinates are semantic and content-relative: RNode evidence, PageContainer
+evidence, page indexes, byte offsets, and Frame role evidence. It should not
+manufacture kernel pointers from `Ppn`/`PhysAddr`, compute direct-map addresses
+inline, or treat user buffers as ordinary Rust references.
+
+When bytes move:
+
+- user buffers arrive as typed user-buffer/user-pointer values owned by the
+  syscall and `UserAccessIf` discipline;
+- page content is reached by asking PAGE_SUBSTRATE/VM helpers for a direct-map
+  copy source/destination or by materializing a Frame for pmap installation;
+- device-backed page containers may carry device `Ppn` facts, but those facts
+  remain mapping inputs, not allocator ownership or ordinary pointer authority.
+
+Thus PAGE_BACKED still speaks txKernel's semantic language at its public
+surface: `Cap<RNode>`, `Cap<PageContainer>`, `Weak<T>`, `IdentRef<'g, T>`, and
+role-shaped Frame tokens. Address values appear only at the handoff to
+PAGE_SUBSTRATE, VM, or user-access helpers.
 
 ---
 

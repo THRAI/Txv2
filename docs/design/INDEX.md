@@ -17,7 +17,7 @@ The architectural vocabulary every other doc references. Read these first.
 - [`CONCEPTS_v4.md`](00_meta-framework/CONCEPTS_v4.md) — draft unified concepts rewrite: placement homes, step/script/reactor async model, middleware/protocol combinators, completion, publication rule.
 - [`INVARIANTS_v4.md`](00_meta-framework/INVARIANTS_v4.md) — canonical grep-friendly invariant set: BIF/PRED/WIT/OBL/SIG/STEP/ASYNC/SCRIPT/COMP/ARCH plus linter notes.
 - [`object_model_v2.md`](00_meta-framework/object_model_v2.md) — identity / capability / payload entity decomposition.
-- [`SUBSYSTEM_ANATOMY_v2_1.md`](00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — four-module subsystem layout, five-phase commit discipline, import rules.
+- [`SUBSYSTEM_ANATOMY_v2_1.md`](00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — four-module subsystem layout, five-stage step discipline, import rules.
 - [`MODULE_MAP_v1.md`](00_meta-framework/MODULE_MAP_v1.md) — draft placement taxonomy for foundation, substrate, reactor, policy, subsystems, services, filesystem instances, scripts, shims, projections, and static registries.
 - [`CI_REPORTING_v1.md`](00_meta-framework/CI_REPORTING_v1.md) — CI output shape, design-reference tags, required gates, and future boot-sentinel reporting contract.
 - [`OBJECT_PATTERN_AUDIT_v1.md`](00_meta-framework/OBJECT_PATTERN_AUDIT_v1.md) — implementation cleanup audit of existing objects against the identity/payload, binding, filesystem-instance, service, and static carve-out patterns.
@@ -56,7 +56,7 @@ Primitives that sit below every subsystem.
 
 How work runs: the step primitive and the runtime that drives it.
 
-- [`STEP_MODEL_v1.md`](02_execution/STEP_MODEL_v1.md) — the synchronous, bounded step; outcome algebra; in-step commit discipline.
+- [`STEP_MODEL_v1.md`](02_execution/STEP_MODEL_v1.md) — the synchronous, bounded step; outcome algebra; five-stage in-step discipline.
 - [`THREAD_RUNTIME_v1.md`](02_execution/THREAD_RUNTIME_v1.md) — running-thread states, reactor interaction, signal-delivery boundary.
 - [`REACTOR_v0.md`](02_execution/REACTOR_v0.md) — reactor boundary contract.
 - [`SCHEDULER_v0.md`](02_execution/SCHEDULER_v0.md) — scheduler policy and interface contract.
@@ -85,7 +85,7 @@ How work runs: the step primitive and the runtime that drives it.
 <!-- txdoc:INDEX-FILESYSTEM-1 -->
 
 - [`MOUNT_v1.md`](05_filesystem/MOUNT_v1.md) — mount subsystem: mount namespaces, mount tree, mountpoint index, filesystem-instance hosting, mount/umount steps.
-- [`VFS_CHECKS_V2.1.md`](05_filesystem/VFS_CHECKS_V2.1.md) — VFS walker, witness consumption at STEP-4 phase 2, refinement wrappers.
+- [`VFS_CHECKS_V2.1.md`](05_filesystem/VFS_CHECKS_V2.1.md) — VFS walker, witness consumption at STEP-4 stage 2, refinement wrappers.
 - [`BDEV_FS.md`](05_filesystem/BDEV_FS.md) — block-device pseudo-filesystem; bytes ↔ blocks translation over PAGE_BACKED.
 - [`bringup_fs_specs_v_1 (1).md`](<05_filesystem/bringup_fs_specs_v_1 (1).md>) — bringup filesystem specs for tmpfs, initramfs cpio `newc`, and minimal procfs.
 - [`TX_EXT4_PLAN_v1_2.md`](05_filesystem/TX_EXT4_PLAN_v1_2.md) — ext4 backend project plan; stateless-per-inode rule, cache & reclaim policy.

@@ -287,6 +287,14 @@ pub trait PlatformConfig {
     /// Highest legal user virtual address + 1.
     const USER_TOP: VirtAddr;
 
+    /// Bytes below USER_TOP reserved for fixed user-helper pages.
+    /// Phase 1 leaves this range unmapped except for ordinary stack trampolines;
+    /// later phases may place sigreturn/VDSO/trampoline pages here.
+    const USER_RESERVED_TOP_SIZE: usize;
+
+    /// Highest address ordinary mmap/brk/stack placement may allocate below.
+    const USER_ALLOC_TOP: VirtAddr;
+
     /// Per-hart kernel stack size.
     const KERNEL_STACK_SIZE: usize;
 
@@ -324,7 +332,54 @@ A board crate is free to have private `pub const PLIC_BASE: usize = 0x0c00_0000;
 
 This gives the substrate compile-time constants without coupling it to a specific board crate.
 
-### 4.2 What does *not* belong in `PlatformConfig`
+### 4.2 Address values and dereference boundary
+<!-- txdoc:HAL-PLATFORMCONFIG-ASSOCIATED-CONSTANTS-ADDRESS-VALUES-AND-DEREFERENCE-BOUNDARY-1 -->
+
+HAL owns the low-level address dialect: `PhysAddr`, `Ppn`, `VirtAddr`,
+`VirtRange`, page-table indexes, bootstrap symbol crossings, and PTE encoding.
+Those are address **values**, not dereference authority. A `VirtAddr` does not
+become a Rust pointer by construction; it must pass through a named HAL,
+substrate, or user-access conversion that states which mapping is being used.
+
+The discipline:
+
+- pmap, boot, user-access, and page-substrate code may speak typed address
+  values because address layout is their job;
+- ordinary kernel subsystems should speak semantic evidence (`Cap<T>`,
+  `Weak<T>`, `IdentRef<'g, T>`, witnesses, reservations, role tokens), not raw
+  physical or virtual addresses;
+- no broad address arithmetic API (`Add<usize>` style) is part of the contract;
+  arithmetic is exposed as checked helpers such as page alignment, page-index
+  extraction, and named conversions (`phys -> direct-map`, `boot-linked ->
+  kernel alias`);
+- board code may name linker/static symbols only inside its boot-static capture
+  surface; the rest of the board consumes typed methods that return physical
+  facts, high kernel pointers, or direct-map pointers as appropriate. RV64 QEMU
+  calls this surface `BootStaticBag`: `_start` constructs
+  `BootStaticBag<IdentityLive>` exactly once, stores the firmware DTB pointer
+  inside it, and the post-entry pipeline consumes it into the steady handoff
+  typestate. The bag is neither `Copy` nor `Clone`, so the typestate transition
+  is the guard against accidentally using identity-era dereference authority
+  after the DTB and boot statics have been published; the transferred bag may
+  retain the firmware DTB as a raw provenance value, but only the live state
+  exposes it for parsing. On the current low-linked RV64 QEMU image this
+  authority transition does not imply that the low identity PTE has been
+  cleared; live identity teardown waits for high-VMA/low-LMA linking or
+  relocation.
+  `cargo xtask lint arch` rejects `addr_of!`, raw
+  `UnsafeCell::get() as usize`, and Rust linker-symbol extern blocks elsewhere
+  in that board crate. `cargo xtask lint unused` runs Rust unused/dead-code
+  checks as hard errors and the arch lint rejects `#[allow(dead_code)]` /
+  `#[allow(unused...)]` escape hatches in normal code, so staged boot helpers
+  must either be live or explicitly test-gated.
+
+Once a conversion has produced a valid high-kernel `&T`, `&mut T`, `NonNull<T>`,
+or raw pointer for a narrow unsafe operation, normal Rust pointer/reference
+rules apply. User memory is the exception: user virtual addresses stay as
+`UserPtr<T>`/`UserRange`-style values and are accessed only through
+`UserAccessIf`/copyin/copyout paths.
+
+### 4.3 What does *not* belong in `PlatformConfig`
 <!-- txdoc:HAL-PLATFORMCONFIG-ASSOCIATED-CONSTANTS-WHAT-DOES-NOT-BELONG-IN-PLATFORMCONFIG-1 -->
 
 - MMIO base addresses (those go through `PlatformInfoIf::platform_info()`).
@@ -462,6 +517,41 @@ H1 obligations, in order:
    - The early-UART MMIO region at a known kernel virtual address.
 
    Activate the page table: `satp` write + `sfence.vma` on RV64; DMW + `csrwr` + `invtlb` on LA64. After this point, the kernel is running with MMU on.
+
+   During the low-to-high transition, a platform may also keep a temporary
+   identity leaf for the boot RAM window. That identity bridge is only for the
+   bootstrap smoke path. The stack transition is a per-hart stack alias
+   transition: if execution moves from identity to high-half addresses, the BSP
+   rewrites `sp` to the high/direct-map alias of the same per-hart stack
+   storage. This does not introduce per-thread kernel stacks; tasks remain
+   stackless futures polled on the current hart's stack.
+
+   The portable interface for this handoff is a board-private boot-static
+   authority advanced by typestate. The authority owns all boot/static address
+   facts and exposes two named pipelines:
+
+   - a pre-entry pipeline that runs before the architecture activation jump:
+     capture firmware/static facts, build bootstrap mappings, publish pmap and
+     high-entry transition facts, and return the architecture activation value
+     to assembly;
+   - a post-entry pipeline that runs after the high/translated entry point:
+     publish `BootInfo` while any required firmware/identity access remains
+     valid, prove the new execution context, and install the steady-state
+     authority. A board may remove temporary low mappings here only if its
+     linked image and compiler-generated tables no longer depend on them.
+
+   RV64 QEMU implements that interface with its board-private
+   `BootStaticBag<IdentityLive>`. `_start` constructs it exactly once with the
+   OpenSBI DTB pointer, linked boot stack, `gp`, and `rust_entry` facts; the
+   bag converts the static addresses to the high kernel alias and publishes the
+   bootstrap pmap facts. `_start` then installs `satp`, rewrites `sp`/`gp`, and
+   jumps through the high entry PC. The post-entry pipeline parses the
+   bag-owned DTB pointer into static `BootInfo`, verifies high `pc`/`sp`/`gp`,
+   and consumes the live bag into the steady handoff typestate. The low
+   identity leaf deliberately remains mapped for live boot because the current
+   Rust image is linked low and may still contain compiler-generated absolute
+   references to low text; explicit low-bridge removal is deferred to the
+   high-linker/relocation slice.
 
 5. **Install a minimal trap vector.** The vector must be sufficient to catch a panic and dump it through the early UART. Full trap discipline is established later in H3 by `TrapIf::install_kernel_trap_vector`.
 
@@ -689,6 +779,33 @@ The platform crate sets this up by:
 
 No `Vec`. No `String`. The slab is not up; allocation is not legal.
 
+RV64 QEMU centralizes these boot-owned statics and linker-symbol crossings in
+its board-private `BootStaticBag`. The bag is constructed once in H1, carries
+the DTB pointer while identity-era dereference authority is live, and advances
+by typestate after BootInfo and boot pmap facts have been published. The
+transferred bag keeps the DTB only as a value fact; parsing authority exists
+only on `BootStaticBag<IdentityLive>`. On the current RV64 QEMU low-linked
+image, this typestate transfer does not clear the low identity bridge in the
+live boot path. `BootInfoIf`, `PlatformInfoIf`, and bootstrap pmap code consume
+the bag's semantic accessors instead of deriving addresses from raw static
+pointers locally.
+
+Boards that need a low-to-high or firmware-to-kernel transition should expose
+the same conceptual pipeline even if their concrete bag type differs:
+
+```text
+Captured/IdentityLive
+  -> pre-entry pipeline
+  -> architecture activation / jump boundary
+  -> post-entry pipeline
+  -> HandoffReady
+```
+
+The HAL-level contract is the phase discipline and the published facts, not a
+shared storage layout. RV64 QEMU keeps `BootStaticBag` private; another board
+may use different fields or no temporary identity bridge, but it must still
+make the authority transition explicit before generic kernel code runs.
+
 ### 7.2 Mutability
 <!-- txdoc:HAL-BOOTINFOIF-MUTABILITY-1 -->
 
@@ -715,6 +832,9 @@ pub trait PlatformInfoIf {
 }
 
 pub struct PlatformInfo {
+    pub board: &'static str;
+    pub spi_sd: Option<SpiSdInfo>;
+
     /// MMIO regions that should be mapped into the kernel page table.
     /// Includes the early UART, interrupt controller, timer, and any
     /// platform devices the board has at fixed addresses (e.g.,
@@ -724,19 +844,18 @@ pub struct PlatformInfo {
 
 pub struct MmioRegion {
     pub name: &'static str,           // diagnostic only
-    pub phys_base: PhysAddr,
-    pub virt_base: VirtAddr,           // where to map in kernel space
-    pub size: usize,
+    pub phys: PhysRange,
+    pub virt: VirtRange,              // where to map in kernel space
     pub flags: MmioFlags,
 }
 
-bitflags::bitflags! {
-    pub struct MmioFlags: u32 {
-        const DEVICE_NGNRNE = 1 << 0;  // strongly-ordered device memory
-        const DEVICE_NGNRE  = 1 << 1;  // device memory, gathering allowed
-        const READ          = 1 << 2;
-        const WRITE         = 1 << 3;
-    }
+pub struct MmioFlags(pub u32);
+
+impl MmioFlags {
+    pub const DEVICE_NGNRNE: Self = Self(1 << 0); // strongly-ordered device memory
+    pub const DEVICE_NGNRE: Self = Self(1 << 1);  // device memory, gathering allowed
+    pub const READ: Self = Self(1 << 2);
+    pub const WRITE: Self = Self(1 << 3);
 }
 ```
 
@@ -750,7 +869,7 @@ The exception is tier-1 HAL devices (PLIC, CLINT, early UART). These live *insid
 ### 8.2 PlatformInfo and substrate phase 3
 <!-- txdoc:HAL-PLATFORMINFOIF-PLATFORMINFO-AND-SUBSTRATE-PHASE-3-1 -->
 
-PAGE_SUBSTRATE phase 3 walks `mmio_regions` and installs page-table mappings via `PmapIf`. This is why `MmioRegion.virt_base` exists: the platform decides where in kernel virtual space each MMIO region lives, and substrate installs the mapping there.
+PAGE_SUBSTRATE phase 3 walks `mmio_regions` and installs page-table mappings via `PmapIf`. This is why `MmioRegion.virt` exists: the platform decides where in kernel virtual space each MMIO region lives, and substrate installs the mapping there.
 
 ### 8.3 Auxv facts
 <!-- txdoc:HAL-PLATFORMINFOIF-AUXV-FACTS-1 -->
@@ -834,29 +953,93 @@ pub struct BootstrapPmapInfo {
     pub root: PhysAddr,
     pub mapped: PhysRange,
     pub direct_map_base: VirtAddr,
+    pub direct_map: VirtRange,
+    pub kernel_image: VirtRange,
+    pub identity: Option<VirtRange>,
     pub pt_node_pool: PhysRange,
+    pub reserved_page_tables: &'static [PhysRange],
 }
 
 pub trait PmapIf {
     fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo>;
     fn alloc_pt_node() -> Result<PtNode, AllocError>;
     fn free_pt_node(node: PtNode);
+    fn install_pt_node_allocator(allocator: PtNodeAllocator) -> Result<(), PmapError>;
+    fn reserve_kernel_direct_map_1g(phys: PhysAddr)
+        -> Result<Option<PmapReservation>, PmapError>;
+    fn commit_kernel_direct_map_1g(reservation: PmapReservation);
+    fn extend_direct_map(phys_end: PhysAddr) -> Result<(), PmapError>;
+    fn reserve_kernel_mapping(
+        virt: VirtAddr,
+        phys: PhysAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapReservation>, PmapError>;
+    fn rollback_kernel_mapping(reservation: PmapReservation);
+    fn commit_kernel_mapping(reservation: PmapReservation);
+    fn unmap_kernel_mapping(
+        virt: VirtAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapUnmapResult>, PmapError>;
+    fn protect_kernel_mapping(
+        virt: VirtAddr,
+        kind: PmapReserveKind,
+        permissions: PmapPermissions,
+    ) -> Result<Option<PmapInvalidation>, PmapError>;
+    fn shootdown_kernel_mapping(invalidation: PmapInvalidation);
 }
 ```
 
-For RV64 QEMU's first bootstrap pmap, the kernel remains identity-linked and a
-single Sv39 1 GiB leaf maps the QEMU RAM window at `0x8000_0000`. This is a
-valid bootstrap map for the smoke path and for early substrate staging. The
-live low-linked boot path validates that PC/SP/GP have crossed to the high
-alias, but it keeps the low identity leaf mapped until the kernel is linked at
-its high VMA or the linker/relocation path can rewrite compiler-generated
-absolute tables. Explicit identity teardown remains a pmap operation under
-test, not a live substrate boot step yet. RV64 QEMU also publishes the
-OpenSBI/kernel-loader gap below `0x8020_0000` as reserved RAM so page-substrate
-metadata is not carved over firmware-owned pages. The
-full direct-map invariant below still governs the substrate-ready milestone:
-kernel high-half mapping, direct-map extension, reservation/commit/unmap, and
-global shootdown support must be implemented before real VM or userspace work.
+For RV64 QEMU's current bootstrap pmap, the kernel remains physically linked at
+`0x8020_0000` and keeps a temporary Sv39 1 GiB identity leaf for the QEMU RAM
+window at `0x8000_0000`. It also publishes a high direct-map alias at
+`0xffff_ffc0_0000_0000 + phys` and a high kernel alias starting at
+`0xffff_ffff_8020_0000`. The kernel alias uses board-owned 4 KiB leaf tables so
+text is RX, rodata is R, data/bss/boot-stack pages are RW, and the remaining
+reserved high-alias window is left unmapped. This is the low-to-high transition
+slice: it proves the aliases, rewrites `sp`/`gp`, enters Rust through the high
+alias, and validates high `pc`/`sp`/`gp`. The live low-linked path then keeps
+the low identity bridge mapped, because Rust and `core` can still use
+compiler-generated absolute jump tables or data pointers that name low linked
+text until a high-VMA/low-LMA linker or relocation slice exists. Explicit
+identity teardown remains implemented and unit-tested as a pmap operation, but
+it is not a live substrate boot step yet. The
+`reserved_page_tables` slice names every bootstrap page-table page/range that
+substrate must subtract from allocator-free RAM, including the root,
+kernel-alias L1, kernel-alias L0 table range, and PT-node pool on RV64 QEMU.
+RV64 QEMU also publishes the OpenSBI/kernel-loader gap below `0x8020_0000` as
+reserved RAM so page-substrate metadata is not carved over firmware-owned
+pages.
+The executable pmap mutation surface is still intentionally narrow:
+`extend_direct_map()` uses idempotent 1 GiB direct-map leaf reservations and
+commits before the allocator is installed, while `reserve_kernel_mapping()` /
+`commit_kernel_mapping()` cover boot-time kernel mappings at 2 MiB or 4 KiB
+granularity for platform MMIO.
+Abandoned 2 MiB / 4 KiB reservations can be rolled back, releasing any
+`PT_NODE_POOL` intermediates allocated while reserving. Kernel 2 MiB / 4 KiB
+mappings can also be unmapped into a `PmapUnmapResult`, whose invalidation is
+then passed to `shootdown_kernel_mapping()`; on the current single-hart RV64
+QEMU path this is a local `sfence.vma`. Safe same-granularity kernel
+permission changes use `protect_kernel_mapping()` to update an existing leaf in
+place and return an invalidation; absent mappings are left alone for the later
+VM/fault path, and unsafe cases such as split-required superpages return
+`InvalidRequest`. After `tx_substrate::init()` installs
+the frame allocator, it calls `install_pt_node_allocator()` so new pmap
+intermediates come from typed page-table frames first, with `PT_NODE_POOL`
+retained as an exhaustion fallback.
+
+The current process-root subset exposes `PmapRoot` and `Asid` as concrete
+shared HAL types. RV64 QEMU allocates a fresh root page, copies the kernel
+high-half entries from the bootstrap root, assigns an ASID from a fixed bitmap,
+and tears user-half page-table trees down through the same committed `PtNode`
+registry used by kernel pmap unmap. Single mapping reserve/commit, unmap, and
+safe in-place protect are implemented for VM-owned roots; unsafe cases still
+return `InvalidRequest` so VM can keep the recipe authoritative and fault or
+rematerialize later. `tx_hal::pmap` provides the generic no-alloc page-range
+session API over those single mapping operations; the board still owns the
+actual PTE walk and mutation. Substrate has an ASID-scoped page shootdown batch
+that holds `MapPin`s until after `PmapIf::shootdown_mapping()`.
+Superpage/multi-frame accounting and real remote-hart shootdown coordination
+remain before userspace work.
 
 The full planned trait surface is:
 
@@ -888,6 +1071,10 @@ pub trait PmapIf: PlatformConfig {
     /// (pre-substrate) or from the frame allocator (post-substrate
     /// phase 7).
     fn alloc_pt_node() -> Result<PtNode, AllocError>;
+
+    /// Install the post-frame-allocator PT-node source. Platforms retain
+    /// PT_NODE_POOL as a fallback when the installed source is exhausted.
+    fn install_pt_node_allocator(allocator: PtNodeAllocator) -> Result<(), PmapError>;
 
     /// Free an intermediate page-table page.
     fn free_pt_node(node: PtNode);
@@ -1041,6 +1228,13 @@ The substrate-side aggregator (`ShootdownBatch` in PAGE_SUBSTRATE §7.2) consume
 
 For kernel-half mappings (extending the direct map, mapping new MMIO regions), the substrate uses `kernel_pmap_root()` and the result's `asid` is the kernel ASID; the substrate calls `P::shootdown_global(&invalidations)` instead of `P::shootdown` to get cross-ASID invalidation.
 
+The current executable kernel-only subset is smaller: `PmapUnmapResult` names
+one cleared mapping and its `PmapInvalidation`, while
+`KernelShootdownBatch` in PAGE_SUBSTRATE §7.2 owns the matching `MapPin`.
+It calls `P::shootdown_kernel_mapping()` first and drops the `MapPin` only
+afterward. That gives the same map-count ordering without requiring HAL to know
+about `FrameMeta`.
+
 ### 10.5 The direct-map invariant
 <!-- txdoc:HAL-PMAPIF-PMAP-MATERIALIZATION-PROOF-OBJECTS-THE-DIRECT-MAP-INVARIANT-1 -->
 
@@ -1074,6 +1268,16 @@ The substrate, VM, and any other consumer knows:
 `TrapIf` is the second load-bearing HAL trait. It owns trap entry, trap-frame interpretation, and return-to-userspace. The kernel-side dispatch sink (next subsection) is what the trap shell calls *into*.
 
 **Cross-reference.** Trap-cause dispatch from HAL is direct and named, not via linkme. See §21 for the registration discipline; this section covers the trap-frame view surface and the shell-to-sink contract.
+
+The current executable RV64 QEMU subset installs a minimal direct-mode `stvec`
+panic vector before `BootPlatformIf::boot_handoff()` and reinstalls it from
+`kernel_main` after `init_later()`. That vector prints `scause`, `sepc`, and
+`stval` through the SBI console, then spins. `TrapIf` also exposes a typed
+snapshot/classification API; RV64 QEMU decodes `scause` into page-fault,
+illegal-instruction, breakpoint, user-ecall, supervisor-timer, and
+supervisor-external classes. The full saved-register `RawTrapFrame`,
+`KernelTrapSink`, syscall dispatch, signal/user-return path, and user-access
+recovery remain before user execution is enabled.
 
 ### 11.1 Trait surface
 <!-- txdoc:HAL-TRAPIF-TRAP-FRAME-DISCIPLINE-AND-RETURN-BOUNDARY-TRAIT-SURFACE-1 -->
@@ -2313,7 +2517,7 @@ PAGE_SUBSTRATE_v1 §2 listed seven HAL deliverables. With HAL_v1, those are real
 |---|---|
 | `BootInfo` (static) | `BootInfoIf::boot_info()` returns `&'static BootInfo` (§7) |
 | Bootstrap page table (satp live) | Established in H1 (§5.2); covered by `PlatformConfig::DIRECT_MAP_BASE` and the platform's H1 obligations |
-| `PT_NODE_POOL` | `PmapIf::alloc_pt_node()` (§10.1); pool itself is platform-private during H1, rewired to frame allocator in substrate phase 7 |
+| `PT_NODE_POOL` | `PmapIf::alloc_pt_node()` (§10.1); pool itself is platform-private during H1, then becomes the fallback after substrate installs the typed PT-node allocator in phase 7 |
 | `PlatformInfo` | `PlatformInfoIf::platform_info()` returns `&'static PlatformInfo` (§8) |
 | Early UART + logger | `ConsoleIf::write_bytes` (§9), live by end of H1 |
 | Trap infrastructure | `TrapIf::install_kernel_trap_vector` (§11) called from kernel_main after init_later; minimal vector installed in H1 for panic |
