@@ -21,8 +21,9 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use std::vec::Vec;
 
-use tx_hal::{AllocError, PhysAddr, PmapPermissions, PmapReserveKind, PtNode, VirtAddr};
+use tx_hal::{AllocError, PhysAddr, PmapError, PmapPermissions, PmapReserveKind, PtNode, VirtAddr};
 
 use super::address_space::{
     commit_mapping_from_root, create_pmap_root_from_bag, destroy_pmap_root_from_bag,
@@ -43,8 +44,9 @@ use super::pte::{
     PTE_W, PTE_X,
 };
 use super::topology::{
-    bootstrap_satp_value, rv64_1g_leaf_index, rv64_2m_leaf_index, rv64_4k_leaf_index, PAGE_SIZE,
-    QEMU_BOOTSTRAP_MAP_SIZE, QEMU_RAM_BASE, SV39_MODE,
+    bootstrap_satp_value, rv64_1g_leaf_index, rv64_2m_leaf_index, rv64_4k_leaf_index,
+    DIRECT_MAP_BASE, PAGE_SIZE, QEMU_BOOTSTRAP_MAP_SIZE, QEMU_RAM_BASE, SV39_MODE,
+    SV39_USER_ALLOC_TOP,
 };
 use super::{
     l0_table_for_test, l0_table_mut, l1_table_for_test, reset_pt_node_pool_for_test,
@@ -59,6 +61,8 @@ const PTE_G_TEST: u64 = 1 << 5;
 static PMAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static TEST_TYPED_ALLOC_NEXT: AtomicUsize = AtomicUsize::new(0);
 static TEST_TYPED_RELEASED: AtomicUsize = AtomicUsize::new(0);
+static TEST_ROOT_ALLOC_NEXT: AtomicUsize = AtomicUsize::new(0);
+static TEST_ROOT_RELEASED: AtomicUsize = AtomicUsize::new(0);
 
 /// Host-side table storage used by the fake typed PT-node allocator.
 ///
@@ -72,6 +76,14 @@ static TEST_TYPED_PT_TABLES: TestTypedPtTables = TestTypedPtTables(UnsafeCell::n
     [crate::boot_static::PageTable([0; 512]); 2],
 ));
 
+struct TestRootPtTables(UnsafeCell<[crate::boot_static::PageTable; 64]>);
+
+unsafe impl Sync for TestRootPtTables {}
+
+static TEST_ROOT_PT_TABLES: TestRootPtTables = TestRootPtTables(UnsafeCell::new(
+    [crate::boot_static::PageTable([0; 512]); 64],
+));
+
 // Test fixtures construct a host `BootStaticBag`, then drive the same pmap
 // pipeline methods the assembly boot path uses on RV64.
 fn pmap_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -81,6 +93,8 @@ fn pmap_test_guard() -> std::sync::MutexGuard<'static, ()> {
 fn reset_typed_pt_allocator_test_state() {
     TEST_TYPED_ALLOC_NEXT.store(0, Ordering::Release);
     TEST_TYPED_RELEASED.store(0, Ordering::Release);
+    TEST_ROOT_ALLOC_NEXT.store(0, Ordering::Release);
+    TEST_ROOT_RELEASED.store(0, Ordering::Release);
     install_pt_node_allocator_for_test(None);
 }
 
@@ -102,6 +116,26 @@ fn test_typed_pt_allocator() -> Result<PtNode, AllocError> {
 
 unsafe fn test_typed_pt_release(_phys: PhysAddr) {
     TEST_TYPED_RELEASED.fetch_add(1, Ordering::AcqRel);
+}
+
+fn test_root_pt_allocator() -> Result<PtNode, AllocError> {
+    let index = TEST_ROOT_ALLOC_NEXT.fetch_add(1, Ordering::AcqRel);
+    if index >= 64 {
+        return Err(AllocError::Exhausted);
+    }
+
+    unsafe {
+        let tables = &mut *TEST_ROOT_PT_TABLES.0.get();
+        tables[index].0.fill(0);
+        Ok(PtNode::typed_frame(
+            PhysAddr((&mut tables[index]) as *mut _ as usize),
+            test_root_pt_release,
+        ))
+    }
+}
+
+unsafe fn test_root_pt_release(_phys: PhysAddr) {
+    TEST_ROOT_RELEASED.fetch_add(1, Ordering::AcqRel);
 }
 
 fn test_bag() -> BootStaticBag<IdentityLive> {
@@ -723,7 +757,19 @@ fn process_root_copies_kernel_half_and_reuses_asid_after_destroy() {
         first_table.0[rv64_1g_leaf_index(EXPECTED_KERNEL_VIRT_BASE)],
         bag.bootstrap_root_ref().0[rv64_1g_leaf_index(EXPECTED_KERNEL_VIRT_BASE)]
     );
-    assert_eq!(first_table.0[0], 0);
+    for index in 0..256 {
+        assert_eq!(
+            first_table.0[index], 0,
+            "lower-half slot {index} must be empty"
+        );
+    }
+    for index in 256..512 {
+        assert_eq!(
+            first_table.0[index],
+            bag.bootstrap_root_ref().0[index],
+            "kernel-half slot {index} must match bootstrap root"
+        );
+    }
 
     destroy_pmap_root_from_bag(&bag, first);
     assert_eq!(pt_node_allocated_for_test(), 0);
@@ -731,6 +777,93 @@ fn process_root_copies_kernel_half_and_reuses_asid_after_destroy() {
     let second = create_pmap_root_from_bag(&bag).expect("second root");
     assert_eq!(second.asid().0, 1);
     destroy_pmap_root_from_bag(&bag, second);
+}
+
+#[test]
+fn process_root_exhausts_asids_without_allocating_reserved_zero() {
+    let _guard = pmap_test_guard();
+    reset_typed_pt_allocator_test_state();
+    reset_pt_node_pool_for_test();
+    install_pt_node_allocator_for_test(Some(test_root_pt_allocator));
+    let mut bag = test_bag();
+    publish_bootstrap_bag(&mut bag);
+
+    let mut roots = Vec::new();
+    for expected_asid in 1..64 {
+        let root = create_pmap_root_from_bag(&bag).expect("root should allocate until ASIDs end");
+        assert_eq!(root.asid().0, expected_asid);
+        roots.push(root);
+    }
+
+    assert_eq!(
+        create_pmap_root_from_bag(&bag).err(),
+        Some(PmapError::Exhausted)
+    );
+
+    for root in roots {
+        assert_ne!(root.asid().0, 0);
+        destroy_pmap_root_from_bag(&bag, root);
+    }
+    reset_typed_pt_allocator_test_state();
+}
+
+#[test]
+fn process_root_allocation_failure_rolls_back_asid() {
+    let _guard = pmap_test_guard();
+    reset_typed_pt_allocator_test_state();
+    reset_pt_node_pool_for_test();
+    let bag = test_bag();
+    let mut held_nodes = Vec::new();
+    while let Ok(node) = alloc_pt_node_from_bag(&bag) {
+        held_nodes.push(node);
+    }
+
+    assert_eq!(
+        create_pmap_root_from_bag(&bag).err(),
+        Some(PmapError::Exhausted)
+    );
+
+    for node in held_nodes {
+        free_pt_node_from_bag(&bag, node);
+    }
+
+    let root = create_pmap_root_from_bag(&bag).expect("ASID should be reusable after rollback");
+    assert_eq!(root.asid().0, 1);
+    destroy_pmap_root_from_bag(&bag, root);
+}
+
+#[test]
+fn destroying_process_root_tears_down_committed_user_tables() {
+    let _guard = pmap_test_guard();
+    reset_typed_pt_allocator_test_state();
+    reset_pt_node_pool_for_test();
+    reset_committed_pt_nodes_for_test();
+    let mut bag = test_bag();
+    publish_bootstrap_bag(&mut bag);
+
+    let root = create_pmap_root_from_bag(&bag).expect("process root");
+    let virt = VirtAddr(0x4000);
+    let phys = PhysAddr(0x8100_0000);
+    let reservation =
+        reserve_mapping_from_root(&bag, root.phys(), virt, phys, PmapReserveKind::Page4K)
+            .expect("reserve user page")
+            .expect("empty user leaf");
+    commit_mapping_from_root(
+        root.phys(),
+        reservation,
+        PmapPermissions::READ.union(PmapPermissions::USER),
+    );
+
+    assert_ne!(pt_node_allocated_for_test(), 0);
+
+    destroy_pmap_root_from_bag(&bag, root);
+
+    assert_eq!(
+        pt_node_allocated_for_test(),
+        0,
+        "destroy should release root plus committed L1/L0 user tables"
+    );
+    reset_committed_pt_nodes_for_test();
 }
 
 #[test]
@@ -789,4 +922,109 @@ fn process_root_maps_protects_unmaps_and_prunes_user_tables() {
 
     destroy_pmap_root_from_bag(&bag, root);
     assert_eq!(pt_node_allocated_for_test(), 0);
+}
+
+#[test]
+fn process_root_maps_existing_user_granularities() {
+    let _guard = pmap_test_guard();
+    reset_typed_pt_allocator_test_state();
+    reset_pt_node_pool_for_test();
+    let mut bag = test_bag();
+    publish_bootstrap_bag(&mut bag);
+
+    let root = create_pmap_root_from_bag(&bag).expect("process root");
+    let cases = [
+        (
+            VirtAddr(0),
+            PhysAddr(0x8000_0000),
+            PmapReserveKind::Superpage1G,
+        ),
+        (
+            VirtAddr(0x4000_0000),
+            PhysAddr(0xc000_0000),
+            PmapReserveKind::Superpage2M,
+        ),
+        (
+            VirtAddr(0x4020_0000),
+            PhysAddr(0xc020_0000),
+            PmapReserveKind::Page4K,
+        ),
+    ];
+
+    for (virt, phys, kind) in cases {
+        let reservation = reserve_mapping_from_root(&bag, root.phys(), virt, phys, kind)
+            .expect("reserve user mapping")
+            .expect("empty user leaf");
+        commit_mapping_from_root(
+            root.phys(),
+            reservation,
+            PmapPermissions::READ.union(PmapPermissions::USER),
+        );
+
+        let result = unmap_mapping_from_root(&bag, root.phys(), virt, kind)
+            .expect("unmap user mapping")
+            .expect("mapping should exist");
+        assert_eq!(result.phys(), phys);
+        assert_eq!(result.kind(), kind);
+        assert_eq!(result.page_count(), kind.size() / PAGE_SIZE);
+    }
+
+    destroy_pmap_root_from_bag(&bag, root);
+}
+
+#[test]
+fn process_root_rejects_upper_half_and_user_reserved_band() {
+    let _guard = pmap_test_guard();
+    reset_typed_pt_allocator_test_state();
+    reset_pt_node_pool_for_test();
+    let mut bag = test_bag();
+    publish_bootstrap_bag(&mut bag);
+
+    let root = create_pmap_root_from_bag(&bag).expect("process root");
+    let permissions = PmapPermissions::READ.union(PmapPermissions::USER);
+
+    assert_eq!(
+        reserve_mapping_from_root(
+            &bag,
+            root.phys(),
+            VirtAddr(DIRECT_MAP_BASE),
+            PhysAddr(0x8000_0000),
+            PmapReserveKind::Page4K,
+        )
+        .err(),
+        Some(PmapError::InvalidRequest)
+    );
+    assert_eq!(
+        reserve_mapping_from_root(
+            &bag,
+            root.phys(),
+            VirtAddr(SV39_USER_ALLOC_TOP),
+            PhysAddr(0x8000_0000),
+            PmapReserveKind::Page4K,
+        )
+        .err(),
+        Some(PmapError::InvalidRequest)
+    );
+    assert_eq!(
+        protect_mapping_from_root(
+            root.phys(),
+            VirtAddr(SV39_USER_ALLOC_TOP),
+            PmapReserveKind::Page4K,
+            permissions,
+        )
+        .err(),
+        Some(PmapError::InvalidRequest)
+    );
+    assert_eq!(
+        unmap_mapping_from_root(
+            &bag,
+            root.phys(),
+            VirtAddr(SV39_USER_ALLOC_TOP),
+            PmapReserveKind::Page4K,
+        )
+        .err(),
+        Some(PmapError::InvalidRequest)
+    );
+
+    destroy_pmap_root_from_bag(&bag, root);
 }

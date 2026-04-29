@@ -54,8 +54,8 @@ pub use bitmap_backend::BitmapPageAllocator;
 pub use diagnostics::{AllocatorBackendKind, AllocatorDiagnostics};
 pub use frame_meta::FrameMeta;
 pub use tokens::{
-    CachePin, DeviceFrame, DmaPin, FrameReservation, FrameRunReservation, MapPin, OwnedFrame,
-    OwnedFrameRun, OwnedFrameRunIter, PermanentFrame, PtFrame,
+    CachePin, DeviceFrame, DmaPin, FrameReservation, FrameRunReservation, MapPin, MapPinRun,
+    OwnedFrame, OwnedFrameRun, OwnedFrameRunIter, PermanentFrame, PtFrame,
 };
 
 /// Allocation failures surfaced by the page allocator.

@@ -495,8 +495,16 @@ impl PmapUnmapResult {
         self.phys
     }
 
+    pub const fn base_ppn(self) -> Ppn {
+        Ppn(self.phys.0 / 4096)
+    }
+
     pub const fn kind(self) -> PmapReserveKind {
         self.kind
+    }
+
+    pub const fn page_count(self) -> usize {
+        self.kind.size() / 4096
     }
 
     pub const fn invalidation(self) -> PmapInvalidation {
@@ -570,6 +578,12 @@ pub trait PmapIf {
 
     fn shootdown_kernel_mapping(_invalidation: PmapInvalidation) {}
 
+    fn shootdown_kernel_mappings(invalidations: &[PmapInvalidation]) {
+        for invalidation in invalidations {
+            Self::shootdown_kernel_mapping(*invalidation);
+        }
+    }
+
     fn create_pmap_root() -> Result<PmapRoot, PmapError> {
         Err(PmapError::Unsupported)
     }
@@ -612,6 +626,12 @@ pub trait PmapIf {
     }
 
     fn shootdown_mapping(_asid: Asid, _invalidation: PmapInvalidation) {}
+
+    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        for invalidation in invalidations {
+            Self::shootdown_mapping(asid, *invalidation);
+        }
+    }
 }
 
 pub mod pmap;

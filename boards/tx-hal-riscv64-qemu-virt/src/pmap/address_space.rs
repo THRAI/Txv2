@@ -60,6 +60,8 @@ struct RootEnsuredTable {
     node: Option<tx_hal::PtNode>,
 }
 
+struct RootInvalidated;
+
 // Root lifecycle: new process roots get a fresh PT-node, a small ASID, and a
 // copy of the upper-half kernel template. Destruction walks only the user half,
 // releases committed intermediates through the PT-node registry, and then
@@ -100,8 +102,8 @@ pub(super) fn destroy_pmap_root_from_bag<State>(bag: &BootStaticBag<State>, root
         }
         *slot = 0;
     }
-    sfence_vma_all();
-    free_asid(root.asid());
+    let invalidated = invalidate_destroyed_root();
+    free_asid_after_invalidation(root.asid(), invalidated);
     free_pt_node_from_bag(bag, root.into_node());
 }
 
@@ -422,6 +424,15 @@ fn free_asid(asid: Asid) {
         return;
     }
     ALLOCATED_ASIDS.fetch_and(!(1u64 << asid.0), Ordering::AcqRel);
+}
+
+fn invalidate_destroyed_root() -> RootInvalidated {
+    sfence_vma_all();
+    RootInvalidated
+}
+
+fn free_asid_after_invalidation(asid: Asid, _invalidated: RootInvalidated) {
+    free_asid(asid);
 }
 
 // Root-relative intermediate table management mirrors the kernel-bootstrap
