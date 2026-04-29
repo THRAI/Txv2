@@ -2,6 +2,9 @@
 
 use tx_hal::TxPlatform;
 
+#[doc(hidden)]
+pub mod boot_memory;
+
 pub mod bitmap {
     pub struct BitmapReservation;
 }
@@ -27,8 +30,11 @@ pub mod mutation {
 }
 
 pub mod pmap {
-    pub struct PmapBatch;
+    pub use tx_hal::pmap::*;
 }
+
+pub mod page_allocator;
+pub mod slab;
 
 pub mod page {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,7 +53,222 @@ pub mod reservation {
 }
 
 pub mod shootdown {
+    use core::fmt;
+    use core::marker::PhantomData;
+    use core::mem::MaybeUninit;
+    use tx_hal::{Asid, PhysAddr, PmapIf, PmapReserveKind, PmapUnmapResult, Ppn};
+
+    use crate::page_allocator::{MapPin, PageAllocator};
+
+    const PAGE_SIZE_4K: usize = 4096;
+
     pub struct ShootdownToken;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum ShootdownError {
+        Full,
+        UnsupportedMapping,
+        MismatchedFrame,
+    }
+
+    pub struct ShootdownPushError<'a, A: PageAllocator> {
+        reason: ShootdownError,
+        map_pin: MapPin<'a, A>,
+    }
+
+    impl<'a, A: PageAllocator> ShootdownPushError<'a, A> {
+        pub fn reason(&self) -> ShootdownError {
+            self.reason
+        }
+
+        pub fn into_map_pin(self) -> MapPin<'a, A> {
+            self.map_pin
+        }
+    }
+
+    impl<A: PageAllocator> fmt::Debug for ShootdownPushError<'_, A> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("ShootdownPushError")
+                .field("reason", &self.reason)
+                .field("map_pin", &self.map_pin)
+                .finish()
+        }
+    }
+
+    struct PendingMapRelease<'a, A: PageAllocator> {
+        result: PmapUnmapResult,
+        map_pin: MapPin<'a, A>,
+    }
+
+    pub struct KernelShootdownBatch<'a, A: PageAllocator, const N: usize> {
+        entries: [MaybeUninit<PendingMapRelease<'a, A>>; N],
+        len: usize,
+        _not_send: PhantomData<*const ()>,
+    }
+
+    impl<'a, A: PageAllocator, const N: usize> KernelShootdownBatch<'a, A, N> {
+        pub fn new() -> Self {
+            Self {
+                entries: [const { MaybeUninit::uninit() }; N],
+                len: 0,
+                _not_send: PhantomData,
+            }
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn push_page_unmap_result(
+            &mut self,
+            result: PmapUnmapResult,
+            map_pin: MapPin<'a, A>,
+        ) -> Result<(), ShootdownPushError<'a, A>> {
+            if result.kind() != PmapReserveKind::Page4K
+                || !result.phys().0.is_multiple_of(PAGE_SIZE_4K)
+            {
+                return Err(ShootdownPushError {
+                    reason: ShootdownError::UnsupportedMapping,
+                    map_pin,
+                });
+            }
+
+            if result_ppn(result.phys()) != map_pin.ppn() {
+                return Err(ShootdownPushError {
+                    reason: ShootdownError::MismatchedFrame,
+                    map_pin,
+                });
+            }
+
+            if self.len == N {
+                return Err(ShootdownPushError {
+                    reason: ShootdownError::Full,
+                    map_pin,
+                });
+            }
+
+            self.entries[self.len].write(PendingMapRelease { result, map_pin });
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn issue_and_release<P: PmapIf>(mut self) {
+            let len = self.len;
+            self.len = 0;
+
+            for index in 0..len {
+                let entry = unsafe { self.entries[index].assume_init_read() };
+                P::shootdown_kernel_mapping(entry.result.invalidation());
+                drop(entry.map_pin);
+            }
+        }
+    }
+
+    impl<A: PageAllocator, const N: usize> Default for KernelShootdownBatch<'_, A, N> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl<A: PageAllocator, const N: usize> Drop for KernelShootdownBatch<'_, A, N> {
+        fn drop(&mut self) {
+            debug_assert!(
+                self.len == 0,
+                "KernelShootdownBatch must be issued before pending map pins release"
+            );
+        }
+    }
+
+    pub struct AddressSpaceShootdownBatch<'a, A: PageAllocator, const N: usize> {
+        asid: Asid,
+        entries: [MaybeUninit<PendingMapRelease<'a, A>>; N],
+        len: usize,
+        _not_send: PhantomData<*const ()>,
+    }
+
+    impl<'a, A: PageAllocator, const N: usize> AddressSpaceShootdownBatch<'a, A, N> {
+        pub fn new(asid: Asid) -> Self {
+            Self {
+                asid,
+                entries: [const { MaybeUninit::uninit() }; N],
+                len: 0,
+                _not_send: PhantomData,
+            }
+        }
+
+        pub fn asid(&self) -> Asid {
+            self.asid
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn push_page_unmap_result(
+            &mut self,
+            result: PmapUnmapResult,
+            map_pin: MapPin<'a, A>,
+        ) -> Result<(), ShootdownPushError<'a, A>> {
+            if result.kind() != PmapReserveKind::Page4K
+                || !result.phys().0.is_multiple_of(PAGE_SIZE_4K)
+            {
+                return Err(ShootdownPushError {
+                    reason: ShootdownError::UnsupportedMapping,
+                    map_pin,
+                });
+            }
+
+            if result_ppn(result.phys()) != map_pin.ppn() {
+                return Err(ShootdownPushError {
+                    reason: ShootdownError::MismatchedFrame,
+                    map_pin,
+                });
+            }
+
+            if self.len == N {
+                return Err(ShootdownPushError {
+                    reason: ShootdownError::Full,
+                    map_pin,
+                });
+            }
+
+            self.entries[self.len].write(PendingMapRelease { result, map_pin });
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn issue_and_release<P: PmapIf>(mut self) {
+            let len = self.len;
+            self.len = 0;
+
+            for index in 0..len {
+                let entry = unsafe { self.entries[index].assume_init_read() };
+                P::shootdown_mapping(self.asid, entry.result.invalidation());
+                drop(entry.map_pin);
+            }
+        }
+    }
+
+    impl<A: PageAllocator, const N: usize> Drop for AddressSpaceShootdownBatch<'_, A, N> {
+        fn drop(&mut self) {
+            debug_assert!(
+                self.len == 0,
+                "AddressSpaceShootdownBatch must be issued before pending map pins release"
+            );
+        }
+    }
+
+    fn result_ppn(phys: PhysAddr) -> Ppn {
+        Ppn(phys.0 / PAGE_SIZE_4K)
+    }
 }
 
 pub mod zone {
@@ -69,6 +290,8 @@ pub mod zone {
 }
 
 pub fn init<P: TxPlatform>() {
-    let _ = P::boot_info();
     let _ = P::platform_info();
+    boot_memory::init_from_hal::<P>();
+    slab::init::<P>().expect("tx_substrate::init slab heap initialization failed");
+    slab::allocation_smoke().expect("tx_substrate::init slab allocation smoke failed");
 }
