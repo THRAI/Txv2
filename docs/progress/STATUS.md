@@ -36,6 +36,17 @@
   coverage so those addresses are not reported as direct-map addresses.
 - HumanLayer `.claude` workflow references are available as a sparse submodule
   at `external/humanlayer-reference`.
+- The Tx Parallel Agent Runner MVP now exists under `tools/agent-runner` as a
+  standalone `uv`/LangGraph project. It loads active worktree records, validates
+  path/branch/write-scope leases, compiles bounded Codex worker prompts, runs
+  dry-run or `codex exec` fanout with a configurable worker cap, captures
+  prompt/event/final/summary artifacts under `target/tx-agent-runs/`, and runs
+  `cargo xtask progress validate` after real worker completion. Verification:
+  the agent-runner pytest suite, active-worktree inspect, active status dry-run
+  with `--max-workers 2`, safe non-dry smoke through the local fake Codex
+  adapter, `cargo xtask progress validate`, `cargo xtask lint docs`, and
+  `git diff --check`. Next step: run an optional real one-worktree status smoke
+  only with explicit external-service approval; no implementation blocker.
 - `cargo xtask ci` provides concise CI reporting with `txdoc:` references into
   the active design docs.
 - Active design docs now carry fine-grained `txdoc:` anchors; docs lint rejects
