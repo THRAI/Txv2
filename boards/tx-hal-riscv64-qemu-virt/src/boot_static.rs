@@ -607,7 +607,7 @@ impl<State> BootStaticBag<State> {
         PhysAddr(self.pt_node_pool.raw() + index * PAGE_SIZE)
     }
 
-    #[cfg(any(test, target_arch = "riscv64"))]
+    #[cfg(target_arch = "riscv64")]
     pub(crate) fn pt_node_direct_va(&self, index: usize) -> VirtAddr {
         VirtAddr(DIRECT_MAP_BASE + self.pt_node_phys(index).0)
     }
