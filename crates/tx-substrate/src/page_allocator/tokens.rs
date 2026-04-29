@@ -234,6 +234,23 @@ impl<'a, A: PageAllocator> OwnedFrameRun<'a, A> {
         self.count
     }
 
+    /// Acquire pmap/PTE role evidence for every frame in this live run.
+    pub fn try_map_pin_run(&self) -> Result<MapPinRun<'a, A>, AllocError> {
+        let mut acquired = 0usize;
+        while acquired < self.count {
+            let ppn = Ppn(self.base.0 + acquired);
+            if let Err(err) = self.allocator.acquire_map_pin(ppn) {
+                while acquired > 0 {
+                    acquired -= 1;
+                    self.allocator.release_map_pin(Ppn(self.base.0 + acquired));
+                }
+                return Err(err);
+            }
+            acquired += 1;
+        }
+        Ok(MapPinRun::new(self.allocator, self.base, self.count))
+    }
+
     /// Split the run into individual `OwnedFrame` tokens without heap use.
     pub fn split(mut self) -> OwnedFrameRunIter<'a, A> {
         self.active = false;
@@ -372,6 +389,62 @@ role_pin!(
     MapPin,
     release_map_pin
 );
+
+/// Evidence that pmap/PTE state may still reference a contiguous frame run.
+///
+/// This is the run-shaped counterpart to `MapPin`, used for superpage PTEs
+/// that retain many 4 KiB frame rows through one mapping.
+#[must_use]
+pub struct MapPinRun<'a, A: PageAllocator> {
+    allocator: &'a A,
+    base: Ppn,
+    count: usize,
+    active: bool,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<'a, A: PageAllocator> MapPinRun<'a, A> {
+    fn new(allocator: &'a A, base: Ppn, count: usize) -> Self {
+        Self {
+            allocator,
+            base,
+            count,
+            active: true,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Base PPN protected by this role token.
+    pub fn base(&self) -> Ppn {
+        self.base
+    }
+
+    /// Number of 4 KiB frames protected by this role token.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+}
+
+impl<A: PageAllocator> Drop for MapPinRun<'_, A> {
+    fn drop(&mut self) {
+        if self.active {
+            for offset in 0..self.count {
+                self.allocator.release_map_pin(Ppn(self.base.0 + offset));
+            }
+        }
+    }
+}
+
+impl<A: PageAllocator> fmt::Debug for MapPinRun<'_, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MapPinRun")
+            .field("base", &self.base)
+            .field("count", &self.count)
+            .field("active", &self.active)
+            .finish()
+    }
+}
+
 role_pin!(
     /// Evidence that page-cache indexing may still reference a frame.
     ///
