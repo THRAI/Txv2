@@ -57,6 +57,11 @@
   PlatformInfo, bootstrap pmap roots, the kernel alias L1, and the PT-node pool
   flow through named pre-entry and post-entry bag pipelines. `cargo xtask lint
   arch` enforces that other board files do not recreate static address facts.
+- RV64 QEMU pmap host tests now avoid manufacturing direct-map aliases from
+  host static pointers. `BootStaticBag::pt_node_direct_va()` is target-only, and
+  the boot PT-node pool test checks pool bookkeeping instead of adding the high
+  direct-map base to a host pointer. Verification: `cargo test -p
+  tx-hal-riscv64-qemu-virt`; no blocker.
 - `cargo xtask lint unused` now runs Rust unused/dead-code checks as hard
   errors for the host workspace and installed board targets, and `lint arch`
   rejects `#[allow(dead_code)]` / `#[allow(unused...)]` escape hatches in

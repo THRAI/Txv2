@@ -14,11 +14,14 @@ repeatable capture helper. `_start` constructs `BootStaticBag<IdentityLive>`
 exactly once, passing the OpenSBI DTB pointer into the bag together with the
 boot stack, `gp`, `rust_entry`, BootInfo storage, bootstrap root, kernel-alias
 L1, and PT-node pool facts. The type is intentionally neither `Copy` nor
-`Clone`; identity teardown consumes the live bag and stores a
-`BootStaticBag<IdentityDropped>` for steady-state `BootInfoIf`,
-`PlatformInfoIf`, and `PmapIf` access. The dropped bag retains the DTB only as
-a raw value/provenance fact; the parser-facing `firmware_dtb()` accessor exists
-only on the identity-live state.
+`Clone`; the post-entry pipeline consumes the live bag and stores the
+post-entry authority for steady-state `BootInfoIf`, `PlatformInfoIf`, and
+`PmapIf` access. The transferred bag retains the DTB only as a raw
+value/provenance fact; the parser-facing `firmware_dtb()` accessor exists only
+on the identity-live state. A later QEMU trace showed that the current
+low-linked RV64 image must retain the low identity PTE after this authority
+transfer; live identity teardown waits for a high-VMA/low-LMA linker or
+relocation slice.
 
 `BootLinkedAddr` represents an identity-linked boot address before the
 high-half jump. It exposes explicit conversions to physical, identity,
@@ -26,9 +29,9 @@ direct-map, and checked kernel-alias address values. Bootstrap pmap and
 BootInfo publication consume bag methods such as `bootstrap_root_phys()`,
 `pt_node_pool_phys_range()`, `boot_info_mut()`, and `kernel_image_phys()`.
 Pmap code now receives the live bag during high boot preparation and uses the
-dropped global bag only after the low identity bridge is gone. PT-node zeroing
-uses a bag-derived direct-map pointer on RV64 so post-teardown allocation does
-not dereference low physical addresses.
+transferred global bag only after firmware pointer parsing is gone. PT-node
+zeroing uses a bag-derived direct-map pointer on RV64 so post-entry allocation
+does not dereference low physical addresses.
 
 Follow-up cleanup keeps the code shape aligned with that authority model. The
 low side is now a named pre-entry pipeline on `BootStaticBag<IdentityLive>`:
@@ -37,9 +40,10 @@ identity bridge, direct map, high kernel alias, bootstrap pmap info, high entry
 transition tuple, and `satp` value. The high side is now a value-consuming
 post-entry pipeline:
 `take_global() -> publish_boot_info_before_identity_drop(firmware_arg) ->
-complete_post_entry_pipeline() -> install_global()`. That publishes
-`BootStaticBag<IdentityDropped>` as the steady-state authority without an
-intermediate mutable global borrow.
+complete_post_entry_pipeline() -> install_global()`. That publishes the
+post-entry bag as the steady-state authority without an intermediate mutable
+global borrow; on the current live path, it does not clear the low identity
+bridge.
 
 The portable extraction is the phase contract, not the concrete RV64 storage
 layout: every board that needs a firmware/low-to-high transition should have a
