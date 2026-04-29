@@ -7,7 +7,10 @@ use core::{
 use std::sync::{Arc, Mutex};
 
 use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
-use tx_reactor::{Reactor, RunStats, TaskId, TaskStatus};
+use tx_reactor::{
+    HartId, InitialSchedMeta, Phase1Scheduler, Reactor, RunStats, SliceConfig, StopReason,
+    TaskHandle, TaskId, TaskStatus, WakeHint,
+};
 
 static READY_POLLS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_POLLS: AtomicUsize = AtomicUsize::new(0);
@@ -468,4 +471,248 @@ fn wait_event_spurious_wake_reparks_before_timeout() {
         *outcome.lock().expect("outcome slot poisoned"),
         Some(WaitOutcome::TimedOut)
     );
+}
+
+#[test]
+fn submitted_task_uses_scheduler_backed_runnable_path() {
+    READY_POLLS.store(0, Ordering::SeqCst);
+
+    let mut reactor = Reactor::new();
+    let task_id = reactor.submit(CountOnce);
+
+    assert_eq!(task_id, TaskId(0));
+    assert!(!reactor.is_idle());
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(task, slice)| (task.id(), slice)),
+        Some((task_id, SliceConfig::Cooperative))
+    );
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 1
+        }
+    );
+    assert_eq!(READY_POLLS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn blocked_task_reports_stop_reason_and_waits_for_wake() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(AtomicUsize::new(0));
+    let waker_slot = Arc::new(Mutex::new(None));
+
+    let mut reactor = Reactor::new();
+    let task = reactor.submit(ExternallyWoken {
+        polls: Arc::clone(&polls),
+        ready: Arc::clone(&ready),
+        waker_slot: Arc::clone(&waker_slot),
+    });
+
+    assert_eq!(reactor.run_until_idle().polled, 1);
+    assert_eq!(reactor.last_stop_reason(task), Some(StopReason::Blocked));
+    assert_eq!(reactor.task_status(task), Some(TaskStatus::Parked));
+    assert_eq!(reactor.next_scheduled_task(HartId(0)), None);
+
+    ready.store(1, Ordering::SeqCst);
+    waker_slot
+        .lock()
+        .expect("waker slot poisoned")
+        .take()
+        .expect("task waker")
+        .wake();
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(task, slice)| (task.id(), slice)),
+        Some((task, SliceConfig::Cooperative))
+    );
+}
+
+#[test]
+fn duplicate_wakes_coalesce_into_one_scheduler_notification() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(AtomicUsize::new(0));
+    let waker_slot = Arc::new(Mutex::new(None));
+
+    let mut reactor = Reactor::new();
+    let task = reactor.submit(ExternallyWoken {
+        polls: Arc::clone(&polls),
+        ready: Arc::clone(&ready),
+        waker_slot: Arc::clone(&waker_slot),
+    });
+
+    assert_eq!(reactor.run_until_idle().polled, 1);
+
+    let waker = waker_slot
+        .lock()
+        .expect("waker slot poisoned")
+        .as_ref()
+        .expect("task waker")
+        .clone();
+    waker.wake_by_ref();
+    waker.wake_by_ref();
+
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(0))
+            .map(|(task, _)| task.id()),
+        Some(task)
+    );
+    assert_eq!(reactor.run_until_idle().polled, 1);
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    assert_eq!(reactor.task_status(task), Some(TaskStatus::Parked));
+}
+
+#[test]
+fn completed_task_reports_stop_reason() {
+    let mut reactor = Reactor::new();
+    let task = reactor.submit(CountOnce);
+
+    assert_eq!(reactor.run_until_idle().completed, 1);
+
+    assert_eq!(reactor.last_stop_reason(task), Some(StopReason::Completed));
+    assert_eq!(reactor.task_status(task), Some(TaskStatus::Completed));
+    assert_eq!(reactor.next_scheduled_task(HartId(0)), None);
+}
+
+#[test]
+fn phase1_scheduler_prioritizes_kernel_then_new_then_preempted() {
+    let mut scheduler = Phase1Scheduler::new();
+    let fair_new = TaskId(0);
+    let fair_preempted = TaskId(1);
+    let kernel = TaskId(2);
+
+    scheduler.task_submitted(
+        fair_preempted,
+        TaskHandle::new(fair_preempted),
+        InitialSchedMeta::fair(),
+    );
+    assert_eq!(
+        scheduler.pick_next(HartId(0)),
+        Some((
+            TaskHandle::new(fair_preempted),
+            SliceConfig::Preemptive {
+                slice_ns: Phase1Scheduler::NEW_QUEUE_SLICE_NS
+            }
+        ))
+    );
+    scheduler.task_stopped(
+        fair_preempted,
+        StopReason::SliceExpired,
+        Phase1Scheduler::NEW_QUEUE_SLICE_NS,
+        HartId(0),
+    );
+
+    scheduler.task_submitted(
+        fair_new,
+        TaskHandle::new(fair_new),
+        InitialSchedMeta::fair(),
+    );
+    scheduler.task_submitted(kernel, TaskHandle::new(kernel), InitialSchedMeta::kernel());
+
+    assert_eq!(
+        scheduler.pick_next(HartId(0)),
+        Some((TaskHandle::new(kernel), SliceConfig::Cooperative))
+    );
+    assert_eq!(
+        scheduler.pick_next(HartId(0)),
+        Some((
+            TaskHandle::new(fair_new),
+            SliceConfig::Preemptive {
+                slice_ns: Phase1Scheduler::NEW_QUEUE_SLICE_NS
+            }
+        ))
+    );
+    assert_eq!(
+        scheduler.pick_next(HartId(0)),
+        Some((
+            TaskHandle::new(fair_preempted),
+            SliceConfig::Preemptive {
+                slice_ns: Phase1Scheduler::PREEMPTED_QUEUE_SLICE_NS
+            }
+        ))
+    );
+}
+
+#[test]
+fn phase1_scheduler_preserves_remaining_budget_after_blocked_wake() {
+    let mut scheduler = Phase1Scheduler::new();
+    let task = TaskId(7);
+
+    scheduler.task_submitted(task, TaskHandle::new(task), InitialSchedMeta::fair());
+    assert_eq!(
+        scheduler.pick_next(HartId(0)).map(|(_, slice)| slice),
+        Some(SliceConfig::Preemptive {
+            slice_ns: Phase1Scheduler::NEW_QUEUE_SLICE_NS,
+        })
+    );
+
+    scheduler.task_stopped(task, StopReason::Blocked, 250_000, HartId(0));
+    scheduler.task_runnable(task, WakeHint::Normal);
+
+    assert_eq!(
+        scheduler.pick_next(HartId(0)),
+        Some((
+            TaskHandle::new(task),
+            SliceConfig::Preemptive {
+                slice_ns: Phase1Scheduler::NEW_QUEUE_SLICE_NS - 250_000
+            }
+        ))
+    );
+}
+
+#[test]
+fn next_deadline_ns_reports_earliest_and_clears_after_resolution() {
+    let mut reactor = Reactor::new();
+    let first = reactor.channel();
+    let second = reactor.channel();
+    let mask = Mask::from_bits(0x1);
+    let first_ready = Arc::new(AtomicUsize::new(0));
+    let first_outcome = Arc::new(Mutex::new(None));
+    let second_outcome = Arc::new(Mutex::new(None));
+
+    let first_task = {
+        let first = first.clone();
+        let first_ready = Arc::clone(&first_ready);
+        let first_outcome = Arc::clone(&first_outcome);
+        reactor.submit(async move {
+            let outcome = first
+                .wait_event(mask, WaitProtocol::InterruptibleTimeout(50), move || {
+                    first_ready.load(Ordering::SeqCst) != 0
+                })
+                .await;
+            *first_outcome.lock().expect("first outcome poisoned") = Some(outcome);
+        })
+    };
+    let second_task = {
+        let second = second.clone();
+        let second_outcome = Arc::clone(&second_outcome);
+        reactor.submit(async move {
+            let outcome = second
+                .wait_event(mask, WaitProtocol::InterruptibleTimeout(20), || false)
+                .await;
+            *second_outcome.lock().expect("second outcome poisoned") = Some(outcome);
+        })
+    };
+
+    assert_eq!(reactor.run_until_idle().polled, 2);
+    assert_eq!(reactor.next_deadline_ns(), Some(20));
+
+    assert_eq!(reactor.advance_time_to(20), 1);
+    assert_eq!(reactor.run_until_idle().completed, 1);
+    assert_eq!(
+        reactor.task_status(second_task),
+        Some(TaskStatus::Completed)
+    );
+    assert_eq!(reactor.next_deadline_ns(), Some(50));
+
+    first_ready.store(1, Ordering::SeqCst);
+    assert_eq!(first.fire(mask), 1);
+    assert_eq!(reactor.run_until_idle().completed, 1);
+    assert_eq!(reactor.task_status(first_task), Some(TaskStatus::Completed));
+    assert_eq!(reactor.next_deadline_ns(), None);
 }
