@@ -158,6 +158,7 @@ pub struct PlatformInfo {
 pub trait PlatformConfig {
     const ARCH: Arch;
     const BOARD: &'static str;
+    const SUBSTRATE_BOOT_READY: bool = false;
     const PAGE_SIZE: usize = 4096;
     const PAGE_SHIFT: usize = 12;
     const PHYS_ADDR_BITS: u8 = 0;

@@ -1,0 +1,27 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-04-29-trap-coreinit",
+  "created": "2026-04-29",
+  "updated": "2026-04-29",
+  "status": "merged",
+  "branch": "codex/trap-coreinit",
+  "path": "/private/tmp/Tx-worktrees/codex-trap-coreinit",
+  "base": "0857ab9",
+  "plan": null,
+  "owner": "Codex trap/core-init lane",
+  "write_scope": [
+    "crates/tx-hal/src/lib.rs",
+    "crates/tx-hal/src/trap.rs",
+    "boards/tx-hal-riscv64-qemu-virt/src/lib.rs",
+    "boards/tx-hal-riscv64-qemu-virt/src/trap.rs"
+  ],
+  "verification": [
+    "cargo test -p tx-hal-riscv64-qemu-virt",
+    "cargo fmt --check",
+    "cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf",
+    "cargo xtask lint arch",
+    "cargo xtask lint unused",
+    "cargo xtask ci-slow"
+  ],
+  "notes": "Merged into codex/substrate-parallel-integration as df150eb. Extracts shared HAL trap vocabulary and RV64 trap code while preserving the current panic vector. The saved-register trap shell still needs an explicit monomorphic kernel sink bridge decision."
+}

@@ -170,6 +170,14 @@
   covering the path from the current H3 sentinel/shutdown endpoint through
   CoreInit, zone/epoch/bus, trap shell, reactor/scheduler, VM, process/thread
   runtime, exec, first userspace, SMP coordination, and runtime boot tests.
+- Four parallel substrate/kernel-main lanes have been merged into the
+  controller integration branch `codex/substrate-parallel-integration`:
+  reactor smoke, bounded zone/index/mutation primitives, pmap
+  root/ASID/shootdown hardening with `MapPinRun`, and trap vocabulary/RV64
+  trap module extraction. The branch is tracked by
+  `docs/progress/worktrees/2026-04-29-substrate-parallel-integration.json`.
+  Next step: integrated verification and publishing; remaining design decision
+  is the monomorphic kernel sink bridge for a future saved-register trap shell.
 - `TrapIf` now includes typed trap snapshots and classification. RV64 QEMU
   decodes common synchronous faults and supervisor interrupts from `scause`;
   the direct-mode vector still panics/spins until the full saved-register

@@ -1,0 +1,25 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-04-29-reactor-smoke",
+  "created": "2026-04-29",
+  "updated": "2026-04-29",
+  "status": "merged",
+  "branch": "codex/reactor-smoke",
+  "path": "/private/tmp/Tx-worktrees/codex-reactor-smoke",
+  "base": "0857ab9",
+  "plan": null,
+  "owner": "Codex reactor lane",
+  "write_scope": [
+    "crates/tx-reactor",
+    "crates/tx-kernel/src/lib.rs"
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test -p tx-reactor",
+    "cargo check -p tx-kernel",
+    "cargo xtask build --target rv64-qemu",
+    "cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel",
+    "rg \"txkernel:qemu-riscv64-virt:reactor:task:ok\" target/qemu-rv64-qemu-smoke.serial.log"
+  ],
+  "notes": "Merged into codex/substrate-parallel-integration as 853698e. Adds the first tiny reactor smoke executor and moves the boot sentinel into a kernel reactor task while preserving txkernel:<board>:boot:ok."
+}
