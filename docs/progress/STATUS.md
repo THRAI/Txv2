@@ -123,6 +123,30 @@
   anchor via `OwnedFrame::into_permanent_frame()`. `TrapIf` now exposes
   `install_kernel_trap_vector()` and generic `tx_kernel::kernel_main::<P>()`
   calls it after `P::init_later()`.
+- `tx-substrate` now has the first executable EBR/Zone substrate slice:
+  `epoch::guard`, per-CPU retired-node slices, bounded drain, `Zone<T>` static
+  registration, frame-backed bitmap slabs, compact `Cap<T>` / `Weak<T>` keys,
+  `ZoneReservation<T>` reserve/sign publication, `Weak -> IdentRef -> Cap`
+  upgrade, and EBR-delayed slot/slab reclamation. `Cap<T>` is 4 bytes and
+  `Weak<T>` is 8 bytes by compile-time assertion. RV64 QEMU smoke can run the
+  kernel-side zone smoke path and prints `txkernel:zone:smoke:ok` before the
+  boot sentinel. Remaining gaps are linker-section auto-registration of all
+  static zones, full upper-subsystem zone manifests, SMP stress coverage, and
+  the still-pending bus/index/mutation substrate pieces.
+- The remote `origin/zone` EBR/Zone branch (`e53956e`) has been audited and
+  conflict-resolved on `codex/zone-ebr-integration` against
+  `codex/reactor-task-aware`. The merge keeps the newer HAL trap/pmap/TimeIf
+  surface, adopts the directory-based EBR/Zone implementation, removes the old
+  flat placeholder modules, wires CoreInit to run the kernel zone smoke, and
+  updates stale host tests to the new static-zone API. The integration also
+  removed imported clippy blockers, repaired the HumanLayer README link target
+  for docs lint, and made the reactor smoke test counters per-test so full
+  workspace CI is deterministic. Verification: `cargo fmt --check`, `cargo
+  test -p tx-substrate`, `cargo test -p tx-hal-riscv64-qemu-virt`, `cargo
+  check -p tx-kernel`, `cargo xtask lint unused`, `cargo xtask lint docs`,
+  `cargo xtask progress validate`, `cargo xtask ci`, RV64 QEMU smoke sentinel
+  with `txkernel:zone:smoke:ok`, and `git diff --check`. Blocker: none found
+  in the conflict audit.
 - RV64 QEMU now implements safe in-place kernel pmap permission updates through
   `PmapIf::protect_kernel_mapping()`. It rewrites existing same-granularity
   leaves, returns a `PmapInvalidation`, treats absent mappings as no mutation,
@@ -290,6 +314,7 @@
 
 ## Latest Decisions
 
+- `docs/progress/decisions/2026-04-29-ebr-zone-first-executable-slice.md`
 - `docs/progress/decisions/2026-04-29-rv64-high-vma-low-lma-linker.md`
 - `docs/progress/decisions/2026-04-29-rv64-low-linked-identity-retention.md`
 - `docs/progress/decisions/2026-04-28-pageallocator-token-interface.md`

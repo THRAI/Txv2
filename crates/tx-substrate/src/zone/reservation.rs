@@ -1,0 +1,115 @@
+//! Linear reservation and publication path for zone objects.
+//!
+//! Allocation is split into reserve and sign so higher-level steps can reserve
+//! all resources first and publish only after every preparation has succeeded.
+
+use core::marker::PhantomData;
+use core::ptr::NonNull;
+use core::sync::atomic::Ordering;
+
+use super::cap::Cap;
+use super::meta::SlotState;
+use super::registry;
+use super::slot::Slot;
+use super::{runtime, Zone, ZoneError};
+
+pub struct ZoneReservation<T: 'static> {
+    /// Owning zone. Drop rollback returns the reserved slot here.
+    zone: &'static Zone<T>,
+    /// Slot currently in `Reserved` state.
+    pub(crate) slot: NonNull<Slot<T>>,
+    /// Cleared by `sign` so Drop does not roll back a published slot.
+    active: bool,
+    _not_send_sync: PhantomData<*mut ()>,
+}
+
+impl<T: 'static> ZoneReservation<T> {
+    pub(crate) fn new(zone: &'static Zone<T>, slot: NonNull<Slot<T>>) -> Self {
+        Self {
+            zone,
+            slot,
+            active: true,
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    pub fn zone(&self) -> &'static Zone<T> {
+        self.zone
+    }
+}
+
+impl<T: 'static> Drop for ZoneReservation<T> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        // Rollback never bumps generation because the slot was never visible to
+        // weak observers.
+        let meta = unsafe { self.slot.as_ref().meta() };
+        loop {
+            let cur = meta.load(Ordering::Acquire);
+            if cur.state() != SlotState::Reserved {
+                return;
+            }
+            let new = cur.with_state(SlotState::Free);
+            match meta.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    self.zone.return_slot(self.slot);
+                    return;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+pub fn reserve<T: 'static>(zone: &'static Zone<T>) -> Result<ZoneReservation<T>, ZoneError> {
+    runtime::ensure_initialized()?;
+    // Lazy registration lets early placeholder zones work even before a final
+    // linker-section based static registry exists.
+    registry::register_static_zone(zone)?;
+    let slot = zone.pop_free_slot()?;
+    let meta = unsafe { slot.as_ref().meta() };
+    loop {
+        let cur = meta.load(Ordering::Acquire);
+        if cur.state() != SlotState::Free || cur.retain() != 0 {
+            zone.return_slot(slot);
+            return Err(ZoneError::InvalidState);
+        }
+        let new = cur.with_state(SlotState::Reserved);
+        if meta
+            .compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    Ok(ZoneReservation::new(zone, slot))
+}
+
+pub fn sign<T: 'static>(mut reservation: ZoneReservation<T>, value: T) -> Cap<T> {
+    let slot = reservation.slot;
+    unsafe {
+        slot.as_ref().write_value(value);
+    }
+
+    // Publication is infallible after reservation: write the value, then publish
+    // the slot as Live with the initial retain count.
+    let meta = unsafe { slot.as_ref().meta() };
+    loop {
+        let cur = meta.load(Ordering::Acquire);
+        debug_assert_eq!(cur.state(), SlotState::Reserved);
+        debug_assert_eq!(cur.retain(), 0);
+        let new = cur.with_retain(1).with_state(SlotState::Live);
+        if meta
+            .compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
+
+    reservation.active = false;
+    unsafe { Cap::from_slot(slot) }
+}

@@ -3,6 +3,8 @@
 pub mod init;
 pub mod vm;
 
+mod zones;
+
 use tx_hal::{BootHandoff, TxPlatform};
 
 #[cfg(all(not(target_os = "none"), not(test)))]

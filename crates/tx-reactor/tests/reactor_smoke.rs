@@ -12,7 +12,6 @@ use tx_reactor::{
     TaskHandle, TaskId, TaskStatus, WakeHint,
 };
 
-static READY_POLLS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_POLLS: AtomicUsize = AtomicUsize::new(0);
 
 struct CountOnce;
@@ -21,7 +20,19 @@ impl Future for CountOnce {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        READY_POLLS.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(())
+    }
+}
+
+struct CountPolls {
+    polls: Arc<AtomicUsize>,
+}
+
+impl Future for CountPolls {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
         Poll::Ready(())
     }
 }
@@ -59,10 +70,12 @@ impl Future for ExternallyWoken {
 
 #[test]
 fn submitted_ready_task_runs_to_completion() {
-    READY_POLLS.store(0, Ordering::SeqCst);
+    let polls = Arc::new(AtomicUsize::new(0));
 
     let mut reactor = Reactor::new();
-    let task_id = reactor.submit(CountOnce);
+    let task_id = reactor.submit(CountPolls {
+        polls: Arc::clone(&polls),
+    });
 
     assert_eq!(task_id, TaskId(0));
     assert!(!reactor.is_idle());
@@ -76,7 +89,7 @@ fn submitted_ready_task_runs_to_completion() {
             completed: 1
         }
     );
-    assert_eq!(READY_POLLS.load(Ordering::SeqCst), 1);
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
     assert!(reactor.is_idle());
 }
 
@@ -475,10 +488,12 @@ fn wait_event_spurious_wake_reparks_before_timeout() {
 
 #[test]
 fn submitted_task_uses_scheduler_backed_runnable_path() {
-    READY_POLLS.store(0, Ordering::SeqCst);
+    let polls = Arc::new(AtomicUsize::new(0));
 
     let mut reactor = Reactor::new();
-    let task_id = reactor.submit(CountOnce);
+    let task_id = reactor.submit(CountPolls {
+        polls: Arc::clone(&polls),
+    });
 
     assert_eq!(task_id, TaskId(0));
     assert!(!reactor.is_idle());
@@ -496,7 +511,7 @@ fn submitted_task_uses_scheduler_backed_runnable_path() {
             completed: 1
         }
     );
-    assert_eq!(READY_POLLS.load(Ordering::SeqCst), 1);
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

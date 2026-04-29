@@ -31,6 +31,7 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_substrate::init::<P>();
             Self::init_later(handoff);
             Self::install_kernel_trap_vector();
+            Self::run_zone_smoke();
             Self::run_reactor_smoke_task();
 
             // Deferred H4 spine slots:
@@ -50,6 +51,10 @@ impl<P: TxPlatform> CoreInit<P> {
 
     fn install_kernel_trap_vector() {
         P::install_kernel_trap_vector();
+    }
+
+    fn run_zone_smoke() {
+        crate::zones::run_smoke::<P>().expect("tx_kernel zone smoke failed");
     }
 
     fn run_reactor_smoke_task() {
