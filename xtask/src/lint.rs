@@ -600,4 +600,54 @@ fn sym() -> usize {
                 .is_some_and(|reason| reason.contains("rustup target add loongarch64"))
         }));
     }
+
+    #[test]
+    fn rv64_qemu_linker_separates_low_load_and_high_vma_symbols() {
+        let linker = include_str!("../../boards/tx-hal-riscv64-qemu-virt/linker-rv64-qemu-virt.ld");
+
+        assert!(linker.contains("KERNEL_LOAD_BASE = 0x80200000;"));
+        assert!(linker.contains("KERNEL_VIRT_BASE = 0xffffffff80200000;"));
+        assert!(linker.contains("KERNEL_VIRT_OFFSET = KERNEL_VIRT_BASE - KERNEL_LOAD_BASE;"));
+        assert!(linker.contains(".text.trampoline"));
+        assert!(linker.contains("__kernel_start = .;"));
+        assert!(linker.contains("__kernel_start_load = KERNEL_LOAD_BASE;"));
+        assert!(linker.contains("__text_start_load = LOADADDR(.text);"));
+        assert!(linker.contains("__bss_start_load = __bss_start - KERNEL_VIRT_OFFSET;"));
+        assert!(linker.contains("__tx_boot_stack_top_load"));
+        assert!(linker.contains("__bootstrap_root_load"));
+        assert!(linker.contains("__kernel_alias_l1_load"));
+        assert!(linker.contains("__kernel_alias_l0_tables_load"));
+        assert!(linker.contains("__pt_node_pool_load"));
+    }
+
+    #[test]
+    fn rv64_qemu_trampoline_uses_only_low_load_symbols() {
+        let source = include_str!("../../boards/tx-hal-riscv64-qemu-virt/src/lib.rs");
+        let start = source
+            .find(".section .text.trampoline")
+            .expect("trampoline section");
+        let end = source[start..]
+            .find(".section .text.trap")
+            .map(|offset| start + offset)
+            .expect("trap section after trampoline");
+        let trampoline = &source[start..end];
+
+        assert!(!trampoline.contains("call tx_rv64_qemu_prepare_high_boot"));
+        for high_symbol in [
+            "__kernel_start",
+            "__bss_start",
+            "__tx_boot_stack_top",
+            "__global_pointer$",
+            "rust_entry",
+        ] {
+            for line in trampoline.lines() {
+                if line.contains(high_symbol) {
+                    assert!(
+                        line.contains("_load"),
+                        "trampoline line references high symbol `{high_symbol}` without _load: {line}"
+                    );
+                }
+            }
+        }
+    }
 }

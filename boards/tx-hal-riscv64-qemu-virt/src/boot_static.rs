@@ -84,6 +84,7 @@ impl BootLinkedAddr {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HighBootTransition {
     pub(crate) stack_top: VirtAddr,
@@ -91,6 +92,7 @@ pub(crate) struct HighBootTransition {
     pub(crate) rust_entry: VirtAddr,
 }
 
+#[cfg(test)]
 impl HighBootTransition {
     pub(crate) fn from_linked(
         stack_top: BootLinkedAddr,
@@ -148,11 +150,27 @@ static PLATFORM_MMIO_REGIONS: PlatformMmioRegionsCell =
 static RESERVED_PAGE_TABLES: ReservedPageTablesCell = ReservedPageTablesCell(UnsafeCell::new(
     [PhysRange::empty(); BOOTSTRAP_PMAP_RESERVED_RANGES],
 ));
+#[cfg_attr(
+    target_arch = "riscv64",
+    link_section = ".bss.boot.pagetable.bootstrap_root"
+)]
 static BOOTSTRAP_ROOT: PageTableCell = PageTableCell(UnsafeCell::new(PageTable([0; 512])));
+#[cfg_attr(
+    target_arch = "riscv64",
+    link_section = ".bss.boot.pagetable.kernel_alias_l1"
+)]
 static KERNEL_ALIAS_L1: PageTableCell = PageTableCell(UnsafeCell::new(PageTable([0; 512])));
+#[cfg_attr(
+    target_arch = "riscv64",
+    link_section = ".bss.boot.pagetable.kernel_alias_l0_tables"
+)]
 static KERNEL_ALIAS_L0_TABLES_STORAGE: KernelAliasL0TablesCell = KernelAliasL0TablesCell(
     UnsafeCell::new([PageTable([0; 512]); KERNEL_ALIAS_L0_TABLES]),
 );
+#[cfg_attr(
+    target_arch = "riscv64",
+    link_section = ".bss.boot.pagetable.pt_node_pool"
+)]
 static PT_NODE_POOL: PtNodePoolCell =
     PtNodePoolCell(UnsafeCell::new([PageTable([0; 512]); PT_NODE_POOL_ENTRIES]));
 static STORED_BOOT_STATIC_BAG: StoredBootStaticBagCell =
@@ -508,7 +526,9 @@ impl<State> BootStaticBag<State> {
             match &*STORED_BOOT_STATIC_BAG.0.get() {
                 StoredBootStaticBag::IdentityLive(bag) => bag.trap_vector_kernel_alias(),
                 StoredBootStaticBag::IdentityDropped(bag) => bag.trap_vector_kernel_alias(),
-                StoredBootStaticBag::Uninit | StoredBootStaticBag::Taken => VirtAddr(0),
+                StoredBootStaticBag::Uninit | StoredBootStaticBag::Taken => {
+                    linked_trap_vector_kernel_alias()
+                }
             }
         }
     }
@@ -544,6 +564,7 @@ impl<State> BootStaticBag<State> {
         unsafe { &mut *BOOTSTRAP_ROOT.0.get() }
     }
 
+    #[cfg(test)]
     pub(crate) unsafe fn kernel_alias_l1_mut(&self) -> &'static mut PageTable {
         unsafe { &mut *KERNEL_ALIAS_L1.0.get() }
     }
@@ -601,6 +622,7 @@ impl<State> BootStaticBag<State> {
         linked_range(self.boot_stack_bottom, self.boot_stack_top)
     }
 
+    #[cfg(test)]
     pub(crate) fn high_boot_transition(&self) -> Option<HighBootTransition> {
         HighBootTransition::from_linked(self.boot_stack_top, self.global_pointer, self.rust_entry)
     }
@@ -619,6 +641,7 @@ impl<State> BootStaticBag<State> {
         self.kernel_alias_l1.phys()
     }
 
+    #[cfg(test)]
     pub(crate) fn kernel_alias_l0_phys(&self, index: usize) -> PhysAddr {
         PhysAddr(self.kernel_alias_l0_tables.raw() + index * PAGE_SIZE)
     }
@@ -644,6 +667,25 @@ impl<State> BootStaticBag<State> {
             start: self.pt_node_pool.phys(),
             size: PT_NODE_POOL_ENTRIES * PAGE_SIZE,
         }
+    }
+}
+
+fn linked_trap_vector_kernel_alias() -> VirtAddr {
+    #[cfg(target_arch = "riscv64")]
+    {
+        unsafe extern "C" {
+            fn tx_rv64_qemu_minimal_trap_vector();
+        }
+
+        let linked = BootLinkedAddr::from_runtime_addr(
+            tx_rv64_qemu_minimal_trap_vector as *const () as usize,
+        );
+        linked.kernel_alias_va().unwrap_or(VirtAddr(linked.raw()))
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        VirtAddr(0)
     }
 }
 

@@ -4,12 +4,16 @@ Date: 2026-04-29
 
 ## Decision
 
-RV64 QEMU keeps the low identity mapping live during the current low-linked
-Rust boot path, even after validating that PC/SP/GP have crossed to the high
-kernel alias. The explicit identity-teardown pmap operation remains implemented
-and unit-tested, but it is not used by live substrate boot until the kernel is
-linked at its high VMA with a low load address, or until an equivalent
-relocation pass rewrites compiler-generated absolute tables.
+Superseded by
+`docs/progress/decisions/2026-04-29-rv64-high-vma-low-lma-linker.md`.
+This note records why identity retention was necessary while RV64 QEMU was
+still low-linked.
+
+RV64 QEMU kept the low identity mapping live during the earlier low-linked Rust
+boot path, even after validating that PC/SP/GP had crossed to the high kernel
+alias. The explicit identity-teardown pmap operation remained implemented and
+unit-tested, but it was not used by live substrate boot until the kernel was
+linked at its high VMA with a low load address.
 
 RV64 QEMU `BootInfo` also publishes the firmware/kernel-loader gap
 `[0x8000_0000, 0x8020_0000)` as reserved RAM. Substrate must not carve
