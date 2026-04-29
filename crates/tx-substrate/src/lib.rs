@@ -25,7 +25,6 @@ pub mod pmap {
 
 pub mod page_allocator;
 pub mod slab;
-
 pub mod zone;
 
 pub mod page {
@@ -384,6 +383,8 @@ pub mod shootdown {
 pub fn init<P: TxPlatform>() {
     let _ = P::platform_info();
     boot_memory::init_from_hal::<P>();
+    epoch::init_on_bsp::<P>().expect("tx_substrate::init epoch initialization failed");
+    zone::init_on_bsp::<P>().expect("tx_substrate::init zone initialization failed");
     slab::init::<P>().expect("tx_substrate::init slab heap initialization failed");
     slab::allocation_smoke().expect("tx_substrate::init slab allocation smoke failed");
 }
