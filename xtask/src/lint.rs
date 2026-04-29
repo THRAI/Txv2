@@ -627,9 +627,9 @@ fn sym() -> usize {
             .find(".section .text.trampoline")
             .expect("trampoline section");
         let end = source[start..]
-            .find(".section .text.trap")
+            .find("\n\"#\n);")
             .map(|offset| start + offset)
-            .expect("trap section after trampoline");
+            .expect("trampoline asm string terminator");
         let trampoline = &source[start..end];
 
         assert!(!trampoline.contains("call tx_rv64_qemu_prepare_high_boot"));
