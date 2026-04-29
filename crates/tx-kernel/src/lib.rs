@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod vm;
+
 use tx_hal::{BootHandoff, TxPlatform};
 
 pub mod init;
