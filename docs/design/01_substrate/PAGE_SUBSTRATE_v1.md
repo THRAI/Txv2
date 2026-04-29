@@ -115,30 +115,26 @@ available.
 RV64 QEMU currently has the low-to-high bootstrap-pmap slice: an Sv39 root with
 a temporary 1 GiB identity leaf for QEMU RAM during the H1/H2 crossing, a 1 GiB
 high direct-map leaf for the same RAM window, a coarse high kernel alias for
-early execution/storage coverage, a high-entry handoff that rewrites `sp`/`gp`
-before `rust_entry`, a high sentinel that proves `pc`/`sp`/`gp`, a fixed
+early execution/storage coverage, a high-VMA/low-LMA linker layout, an
+assembly-only low trampoline that rewrites `sp`/`gp` before `rust_entry`, a
+high sentinel that proves `pc`/`sp`/`gp`, live identity teardown, a fixed
 PT-node pool, direct-map extension, boot MMIO mapping, and
 typed frame-allocator-backed PT-node allocation after substrate init. This proves
 the MMU handoff and gives substrate code a place to hang early page-table
-allocation tests. The live low-linked path deliberately retains the identity
-leaf after the sentinel: Rust and `core` may emit absolute jump tables or data
-pointers that still name low linked text until the kernel is linked high or
-relocated. Explicit identity teardown remains implemented and unit-tested as a
-pmap operation, but it is not a live substrate boot step yet.
+allocation tests.
 The boot-owned statics that back `BootInfo` and the bootstrap pmap are captured
-through the board-private `BootStaticBag`. RV64 QEMU constructs the bag once in
-the identity-live phase. Its pre-entry pipeline publishes the bootstrap pmap and
-high-entry facts before the assembly `satp`/jump boundary. Its post-entry
-pipeline publishes `BootInfo`, proves high `pc`/`sp`/`gp`, then consumes the
-bag into the post-entry typestate before substrate runs. The bag may still
-remember the DTB as a raw value, but the parsing/dereference authority is gone.
-Substrate consumes published HAL facts rather than reconstructing linker,
-static, or firmware-pointer addresses. `BootInfo` must also mark
-firmware/loader RAM below the kernel load base as reserved; otherwise this
-phase can carve `FrameMeta[]` over OpenSBI-owned pages. Remaining
-substrate-ready pmap work includes high-VMA/low-LMA linking or relocation
-before live identity teardown, final process-root materialization, range
-protect, committed intermediate teardown, and SMP/global shootdown aggregation.
+through the board-private `BootStaticBag`. RV64 QEMU's pre-entry assembly uses
+only suffixed `_load` symbols while translation is off; high Rust constructs
+the bag once after the `satp`/jump boundary, publishes `BootInfo`, proves high
+`pc`/`sp`/`gp`, clears the identity bridge, then consumes the bag into the
+post-entry typestate before substrate runs. The bag may still remember the DTB
+as a raw value, but the parsing/dereference authority is gone. Substrate
+consumes published HAL facts rather than reconstructing linker, static, or
+firmware-pointer addresses. `BootInfo` must also mark firmware/loader RAM below
+the kernel load base as reserved; otherwise this phase can carve `FrameMeta[]`
+over OpenSBI-owned pages. Remaining substrate-ready pmap work includes final
+process-root materialization, range protect, committed intermediate teardown,
+and SMP/global shootdown aggregation.
 
 `substrate::init::<P>()` runs before any SMP bring-up and before downstream subsystem init. By its return, the following are live:
 

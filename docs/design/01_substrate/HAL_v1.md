@@ -355,17 +355,14 @@ The discipline:
 - board code may name linker/static symbols only inside its boot-static capture
   surface; the rest of the board consumes typed methods that return physical
   facts, high kernel pointers, or direct-map pointers as appropriate. RV64 QEMU
-  calls this surface `BootStaticBag`: `_start` constructs
-  `BootStaticBag<IdentityLive>` exactly once, stores the firmware DTB pointer
-  inside it, and the post-entry pipeline consumes it into the steady handoff
-  typestate. The bag is neither `Copy` nor `Clone`, so the typestate transition
-  is the guard against accidentally using identity-era dereference authority
-  after the DTB and boot statics have been published; the transferred bag may
-  retain the firmware DTB as a raw provenance value, but only the live state
-  exposes it for parsing. On the current low-linked RV64 QEMU image this
-  authority transition does not imply that the low identity PTE has been
-  cleared; live identity teardown waits for high-VMA/low-LMA linking or
-  relocation.
+  calls this surface `BootStaticBag`: the low `.text.trampoline` uses only
+  `_load` linker symbols while translation is off, then high Rust constructs
+  `BootStaticBag<IdentityLive>` exactly once with high VMA/static facts and the
+  firmware DTB value. The bag is neither `Copy` nor `Clone`, so the typestate
+  transition is the guard against accidentally using identity-era dereference
+  authority after the DTB and boot statics have been published. The transferred
+  bag may retain the firmware DTB as a raw provenance value, but only the live
+  state exposes it for parsing.
   `cargo xtask lint arch` rejects `addr_of!`, raw
   `UnsafeCell::get() as usize`, and Rust linker-symbol extern blocks elsewhere
   in that board crate. `cargo xtask lint unused` runs Rust unused/dead-code
@@ -540,18 +537,15 @@ H1 obligations, in order:
      authority. A board may remove temporary low mappings here only if its
      linked image and compiler-generated tables no longer depend on them.
 
-   RV64 QEMU implements that interface with its board-private
-   `BootStaticBag<IdentityLive>`. `_start` constructs it exactly once with the
-   OpenSBI DTB pointer, linked boot stack, `gp`, and `rust_entry` facts; the
-   bag converts the static addresses to the high kernel alias and publishes the
-   bootstrap pmap facts. `_start` then installs `satp`, rewrites `sp`/`gp`, and
-   jumps through the high entry PC. The post-entry pipeline parses the
-   bag-owned DTB pointer into static `BootInfo`, verifies high `pc`/`sp`/`gp`,
-   and consumes the live bag into the steady handoff typestate. The low
-   identity leaf deliberately remains mapped for live boot because the current
-   Rust image is linked low and may still contain compiler-generated absolute
-   references to low text; explicit low-bridge removal is deferred to the
-   high-linker/relocation slice.
+   RV64 QEMU implements that interface with an assembly-only low
+   `.text.trampoline` plus its board-private `BootStaticBag<IdentityLive>`.
+   `_start` uses `_load` symbols to clear BSS, build the identity/direct-map/
+   high-kernel bootstrap tables, install `satp`, rewrite `sp`/`gp`, and jump
+   to the high VMA `rust_entry`. High Rust then constructs the bag exactly
+   once, captures canonical high linker symbols as physical facts, publishes
+   the bootstrap pmap facts, parses the DTB into static `BootInfo`, verifies
+   high `pc`/`sp`/`gp`, clears the low identity leaf, and consumes the live bag
+   into the steady handoff typestate.
 
 5. **Install a minimal trap vector.** The vector must be sufficient to catch a panic and dump it through the early UART. Full trap discipline is established later in H3 by `TrapIf::install_kernel_trap_vector`.
 
@@ -780,15 +774,14 @@ The platform crate sets this up by:
 No `Vec`. No `String`. The slab is not up; allocation is not legal.
 
 RV64 QEMU centralizes these boot-owned statics and linker-symbol crossings in
-its board-private `BootStaticBag`. The bag is constructed once in H1, carries
-the DTB pointer while identity-era dereference authority is live, and advances
-by typestate after BootInfo and boot pmap facts have been published. The
+its board-private `BootStaticBag`. The low trampoline names only suffixed
+`_load` symbols. The bag is constructed once after the high VMA entry, carries
+the DTB value while identity-era dereference authority is live, and advances by
+typestate after BootInfo and boot pmap facts have been published. The
 transferred bag keeps the DTB only as a value fact; parsing authority exists
-only on `BootStaticBag<IdentityLive>`. On the current RV64 QEMU low-linked
-image, this typestate transfer does not clear the low identity bridge in the
-live boot path. `BootInfoIf`, `PlatformInfoIf`, and bootstrap pmap code consume
-the bag's semantic accessors instead of deriving addresses from raw static
-pointers locally.
+only on `BootStaticBag<IdentityLive>`. `BootInfoIf`, `PlatformInfoIf`, and
+bootstrap pmap code consume the bag's semantic accessors instead of deriving
+addresses from raw static pointers locally.
 
 Boards that need a low-to-high or firmware-to-kernel transition should expose
 the same conceptual pipeline even if their concrete bag type differs:
@@ -989,20 +982,17 @@ pub trait PmapIf {
 }
 ```
 
-For RV64 QEMU's current bootstrap pmap, the kernel remains physically linked at
-`0x8020_0000` and keeps a temporary Sv39 1 GiB identity leaf for the QEMU RAM
-window at `0x8000_0000`. It also publishes a high direct-map alias at
+For RV64 QEMU's current bootstrap pmap, the kernel is linked at high VMA
+`0xffff_ffff_8020_0000` with low load addresses beginning at `0x8020_0000`.
+Firmware enters the low `.text.trampoline`, which keeps a temporary Sv39 1 GiB
+identity leaf for the QEMU RAM window at `0x8000_0000`. It also publishes a
+high direct-map alias at
 `0xffff_ffc0_0000_0000 + phys` and a high kernel alias starting at
 `0xffff_ffff_8020_0000`. The kernel alias uses board-owned 4 KiB leaf tables so
 text is RX, rodata is R, data/bss/boot-stack pages are RW, and the remaining
 reserved high-alias window is left unmapped. This is the low-to-high transition
 slice: it proves the aliases, rewrites `sp`/`gp`, enters Rust through the high
-alias, and validates high `pc`/`sp`/`gp`. The live low-linked path then keeps
-the low identity bridge mapped, because Rust and `core` can still use
-compiler-generated absolute jump tables or data pointers that name low linked
-text until a high-VMA/low-LMA linker or relocation slice exists. Explicit
-identity teardown remains implemented and unit-tested as a pmap operation, but
-it is not a live substrate boot step yet. The
+alias, validates high `pc`/`sp`/`gp`, then clears the low identity bridge. The
 `reserved_page_tables` slice names every bootstrap page-table page/range that
 substrate must subtract from allocator-free RAM, including the root,
 kernel-alias L1, kernel-alias L0 table range, and PT-node pool on RV64 QEMU.

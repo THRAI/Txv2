@@ -13,14 +13,12 @@
 //!   any future identity teardown.
 //!
 //! Main data-flow functions:
-//! - `tx_rv64_qemu_prepare_high_boot()` is called from assembly before the high
-//!   jump and drives the identity-live boot pipeline.
-//! - `prepare_pre_entry_pipeline()` chains `begin_bootstrap_pmap()`,
-//!   `map_identity_bridge()`, `map_direct_map_window()`,
-//!   `map_kernel_high_alias()`, `publish_bootstrap_pmap_info()`, and
-//!   `write_high_boot_transition()`.
-//! - `complete_post_entry_pipeline()` validates the high sentinel and keeps the
-//!   lower identity bridge until the kernel is linked high or relocated.
+//! - the assembly trampoline builds the first low-LMA bootstrap tables before
+//!   enabling Sv39.
+//! - `adopt_high_linked_bootstrap_pmap()` captures those tables as HAL facts
+//!   and refines the high kernel alias leaves once Rust is executing high.
+//! - `complete_post_entry_pipeline()` validates the high sentinel and drops the
+//!   temporary lower identity bridge.
 //!
 //! Helper groups:
 //! - intermediate-table helpers build and roll back speculative branch tables;
@@ -38,9 +36,7 @@ use tx_hal::{
     VirtAddr, VirtRange,
 };
 
-use crate::boot_static::{
-    BootStaticBag, HighBootTransition, IdentityDropped, IdentityLive, PageTable,
-};
+use crate::boot_static::{BootStaticBag, IdentityDropped, IdentityLive, PageTable};
 
 mod address_space;
 mod kernel_space;
@@ -122,34 +118,49 @@ struct HighSentinel {
     gp: usize,
 }
 
-// `_start` calls this once, before Rust is executing at its final high alias.
-// The bag pipeline builds a dual-mapped bootstrap address space, publishes HAL
-// pmap facts for substrate, and returns the SATP value plus high SP/GP/entry
-// addresses through the scratch output array.
-#[no_mangle]
-pub extern "C" fn tx_rv64_qemu_prepare_high_boot(dtb_addr: usize, out: *mut usize) -> usize {
-    BootStaticBag::<IdentityLive>::capture_once(dtb_addr).prepare_pre_entry_pipeline(out)
+// The identity-live bag models the H1/H2 transition as a sequence of
+// borrow-returning steps. In the high-VMA/low-LMA path, the pre-entry half is
+// pure assembly and Rust starts only after the high alias is active. Rust then
+// adopts/refines the assembly-built tables, publishes pmap facts, and finally
+// removes the temporary identity bridge after BootInfo has consumed firmware
+// pointers.
+pub(crate) fn adopt_high_linked_bootstrap_pmap(bag: &mut BootStaticBag<IdentityLive>) {
+    bag.adopt_high_linked_bootstrap_pmap();
 }
 
-// The identity-live bag models the H1/H2 transition as a sequence of
-// borrow-returning steps. The pre-entry half creates identity, direct-map, and
-// high-kernel aliases; the post-entry half proves PC/SP/GP are high. The
-// explicit `drop_lower*` helpers remain tested, but the live boot path keeps
-// identity because this low-linked Rust image can still contain compiler-built
-// absolute jump tables (for example in `core::sync::atomic`) that target low
-// text addresses. See the 2026-04-28 high-half decision notes and the later
-// high-linker follow-up.
 impl BootStaticBag<IdentityLive> {
-    fn prepare_pre_entry_pipeline(&mut self, out: *mut usize) -> usize {
-        self.begin_bootstrap_pmap()
-            .map_identity_bridge()
-            .map_direct_map_window()
-            .map_kernel_high_alias()
+    pub(crate) fn adopt_high_linked_bootstrap_pmap(&mut self) -> &mut Self {
+        self.refine_kernel_high_alias()
             .publish_bootstrap_pmap_info()
-            .write_high_boot_transition(out)
-            .bootstrap_satp()
     }
 
+    fn refine_kernel_high_alias(&mut self) -> &mut Self {
+        unsafe {
+            let image = self.kernel_image_phys();
+            let Some(image_end) = align_up(image.end().0, PAGE_SIZE) else {
+                return self;
+            };
+            let alias_end = QEMU_KERNEL_PHYS_BASE + KERNEL_BOOTSTRAP_ALIAS_SIZE;
+            let mut phys = image.start.0;
+            while phys < image_end.min(alias_end) {
+                if phys >= QEMU_KERNEL_PHYS_BASE {
+                    let offset = phys - QEMU_KERNEL_PHYS_BASE;
+                    let table_index = offset / SUPERPAGE_2M_SIZE;
+                    if table_index < KERNEL_ALIAS_L0_TABLES {
+                        let virt = KERNEL_VIRT_BASE + offset;
+                        let permissions = kernel_alias_permissions_for_phys(self, phys);
+                        let table = self.kernel_alias_l0_mut(table_index);
+                        table.0[rv64_4k_leaf_index(virt)] =
+                            encode_leaf_pte_with_permissions(PhysAddr(phys), permissions);
+                    }
+                }
+                phys += PAGE_SIZE;
+            }
+        }
+        self
+    }
+
+    #[cfg(test)]
     fn begin_bootstrap_pmap(&mut self) -> &mut Self {
         unsafe {
             self.bootstrap_root_mut().0.fill(0);
@@ -158,6 +169,7 @@ impl BootStaticBag<IdentityLive> {
         self
     }
 
+    #[cfg(test)]
     fn map_identity_bridge(&mut self) -> &mut Self {
         unsafe {
             self.bootstrap_root_mut().0[rv64_1g_leaf_index(QEMU_RAM_BASE)] =
@@ -166,6 +178,7 @@ impl BootStaticBag<IdentityLive> {
         self
     }
 
+    #[cfg(test)]
     fn map_direct_map_window(&mut self) -> &mut Self {
         unsafe {
             self.bootstrap_root_mut().0[rv64_1g_leaf_index(direct_map_virt(QEMU_RAM_BASE))] =
@@ -174,6 +187,7 @@ impl BootStaticBag<IdentityLive> {
         self
     }
 
+    #[cfg(test)]
     fn map_kernel_high_alias(&mut self) -> &mut Self {
         unsafe {
             self.bootstrap_root_mut().0[rv64_1g_leaf_index(KERNEL_VIRT_BASE)] =
@@ -258,26 +272,6 @@ impl BootStaticBag<IdentityLive> {
         self
     }
 
-    fn write_high_boot_transition(&mut self, out: *mut usize) -> &mut Self {
-        let transition = self.high_boot_transition_or_spin();
-        if out.is_null() {
-            loop {
-                core::hint::spin_loop();
-            }
-        }
-
-        unsafe {
-            out.add(0).write(transition.stack_top.0);
-            out.add(1).write(transition.global_pointer.0);
-            out.add(2).write(transition.rust_entry.0);
-        }
-        self
-    }
-
-    fn bootstrap_satp(&self) -> usize {
-        bootstrap_satp_value(self.bootstrap_root_phys())
-    }
-
     #[cfg(target_arch = "riscv64")]
     pub(crate) fn require_current_high_sentinel_or_spin(self) -> Self {
         // Last guard before the boot path relies on the high alias: if the high
@@ -299,7 +293,7 @@ impl BootStaticBag<IdentityLive> {
     pub(crate) fn complete_post_entry_pipeline(self) -> BootStaticBag<IdentityDropped> {
         #[cfg(target_arch = "riscv64")]
         {
-            self.require_current_high_sentinel_or_spin().into_dropped()
+            self.require_current_high_sentinel_or_spin().drop_lower()
         }
 
         #[cfg(not(target_arch = "riscv64"))]
@@ -331,28 +325,19 @@ impl BootStaticBag<IdentityLive> {
             .drop_lower())
     }
 
-    fn high_boot_transition_or_spin(&self) -> HighBootTransition {
-        let Some(transition) = self.high_boot_transition() else {
-            loop {
-                core::hint::spin_loop();
-            }
-        };
-        transition
-    }
-
     #[cfg(any(test, target_arch = "riscv64"))]
     fn require_high_sentinel(self, sentinel: HighSentinel) -> Result<Self, HighSentinelError> {
         validate_high_sentinel(sentinel)?;
         Ok(self)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, target_arch = "riscv64"))]
     pub(crate) fn drop_lower(mut self) -> BootStaticBag<IdentityDropped> {
         self.drop_identity_bridge();
         self.into_dropped()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, target_arch = "riscv64"))]
     fn drop_identity_bridge(&mut self) -> &mut Self {
         unsafe {
             self.bootstrap_root_mut().0[rv64_1g_leaf_index(QEMU_RAM_BASE)] = 0;
