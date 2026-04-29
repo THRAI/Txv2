@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::lint::{lint_arch, lint_docs};
+use crate::lint::{lint_arch, lint_docs, lint_unused};
 use crate::target::{installed_targets, target_triple, TxTarget};
 use crate::util::run_cmd;
 use crate::Result;
@@ -28,6 +28,7 @@ pub(crate) fn check(root: &Path) -> Result<()> {
     run_cmd(root, "cargo", &["check", "--workspace"])?;
     lint_arch(root)?;
     lint_docs(root)?;
+    lint_unused(root)?;
 
     let installed = installed_targets().unwrap_or_default();
     for target in [
