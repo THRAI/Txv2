@@ -21,6 +21,7 @@ static BOOT_INFO: BootInfo = BootInfo::empty();
 static PLATFORM_INFO: PlatformInfo = PlatformInfo {
     board: Platform::BOARD,
     spi_sd: Some(SPI0_CS0_SD),
+    mmio_regions: &[],
 };
 
 impl PlatformConfig for Platform {

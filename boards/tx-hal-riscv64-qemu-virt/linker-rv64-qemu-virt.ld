@@ -7,6 +7,7 @@ SECTIONS
 {
     . = BASE_ADDRESS;
     __kernel_start = .;
+    __text_start = .;
 
     .text.boot : ALIGN(4K) {
         KEEP(*(.text.boot))
@@ -15,17 +16,22 @@ SECTIONS
     .text : ALIGN(4K) {
         *(.text .text.*)
     }
+    __text_end = .;
 
+    __rodata_start = .;
     .rodata : ALIGN(4K) {
         *(.srodata .srodata.*)
         *(.rodata .rodata.*)
     }
+    __rodata_end = .;
 
+    __data_start = .;
     .data : ALIGN(4K) {
         PROVIDE(__global_pointer$ = . + 0x800);
         *(.sdata .sdata.*)
         *(.data .data.*)
     }
+    __data_end = .;
 
     .bss (NOLOAD) : ALIGN(4K) {
         __bss_start = .;

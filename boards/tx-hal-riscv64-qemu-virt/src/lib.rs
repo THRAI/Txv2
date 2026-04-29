@@ -3,17 +3,22 @@
 #[cfg(test)]
 extern crate std;
 
+mod boot_static;
 mod dtb;
 mod pmap;
 
-use core::cell::UnsafeCell;
-
+use boot_static::{
+    reserved_region, BootStaticBag, IdentityDropped, IdentityLive, CMDLINE_CAPACITY,
+};
 use dtb::parse_boot_info_from_fdt;
+use pmap::topology as pmap_topology;
 use tx_hal::{
-    AllocError, Arch, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf, BootPlatformIf,
+    AllocError, Arch, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf, BootPlatformIf,
     BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, DmaIf, InitIf, IrqIf, MemoryRegion,
-    MemoryRegionKind, PercpuIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf,
-    PmapIf, PowerIf, PtNode, SignalFrameIf, SmpIf, TimeIf, TrapIf, UserAccessIf,
+    MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError,
+    PmapIf, PmapInvalidation, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
+    PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SignalFrameIf, SmpIf, TimeIf, TrapClass,
+    TrapFrameSnapshot, TrapIf, UserAccessIf,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -40,57 +45,79 @@ _start:
     j 1b
 
 2:
-    call tx_rv64_qemu_bootstrap_satp
+    addi sp, sp, -32
+    mv a0, s1
+    mv a1, sp
+    call tx_rv64_qemu_prepare_high_boot
+    ld s2, 0(sp)
+    ld s3, 8(sp)
+    ld s4, 16(sp)
+    addi sp, sp, 32
+
     csrw satp, a0
     sfence.vma
 
+    mv sp, s2
+    .option push
+    .option norelax
+    mv gp, s3
+    .option pop
+
     mv a0, s0
     mv a1, s1
-    call rust_entry
+    jr s4
 
 3:
     wfi
     j 3b
+
+    .section .text.trap, "ax"
+    .align 2
+    .globl tx_rv64_qemu_minimal_trap_vector
+tx_rv64_qemu_minimal_trap_vector:
+    csrr a0, scause
+    csrr a1, sepc
+    csrr a2, stval
+    call tx_rv64_qemu_trap_panic
+4:
+    wfi
+    j 4b
 "#
 );
 
 pub struct Platform;
 
-const MAX_MEMORY_REGIONS: usize = 8;
-const CMDLINE_CAPACITY: usize = 256;
 const QEMU_VIRT_RAM_BASE: usize = 0x8000_0000;
 const QEMU_VIRT_FALLBACK_RAM_SIZE: usize = 256 * 1024 * 1024;
-
-struct BootInfoCell(UnsafeCell<BootInfo>);
-struct MemoryRegionsCell(UnsafeCell<[MemoryRegion; MAX_MEMORY_REGIONS]>);
-struct CmdlineCell(UnsafeCell<[u8; CMDLINE_CAPACITY]>);
-
-unsafe impl Sync for BootInfoCell {}
-unsafe impl Sync for MemoryRegionsCell {}
-unsafe impl Sync for CmdlineCell {}
-
-static BOOT_INFO: BootInfoCell = BootInfoCell(UnsafeCell::new(BootInfo::empty()));
-static MEMORY_REGIONS: MemoryRegionsCell =
-    MemoryRegionsCell(UnsafeCell::new([reserved_region(); MAX_MEMORY_REGIONS]));
-static CMDLINE: CmdlineCell = CmdlineCell(UnsafeCell::new([0; CMDLINE_CAPACITY]));
-
-static PLATFORM_INFO: PlatformInfo = PlatformInfo {
-    board: Platform::BOARD,
-    spi_sd: None,
-};
 
 impl PlatformConfig for Platform {
     const ARCH: Arch = Arch::Riscv64;
     const BOARD: &'static str = "qemu-riscv64-virt";
+    const PHYS_ADDR_BITS: u8 = 56;
+    const VIRT_ADDR_BITS: u8 = 39;
+    const DIRECT_MAP_BASE: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::DIRECT_MAP_BASE);
+    const DIRECT_MAP_SIZE: usize = pmap_topology::DIRECT_MAP_SIZE;
+    const KERNEL_VIRT_BASE: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::KERNEL_VIRT_BASE);
+    const USER_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_TOP);
+    const USER_RESERVED_TOP_SIZE: usize = pmap_topology::USER_RESERVED_TOP_SIZE;
+    const USER_ALLOC_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_ALLOC_TOP);
+    const KERNEL_STACK_SIZE: usize = 64 * 1024;
+    const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE;
+    const PAGE_TABLE_LEVELS: u8 = 3;
+    const ASID_BITS: u8 = 16;
+    const CACHE_LINE_SIZE: usize = 64;
+    const DMA_COHERENT: bool = true;
 }
 
 impl BootPlatformIf for Platform {
     const BOOT_PROTOCOL: BootProtocol = BootProtocol::RiscvSbi;
 
     fn boot_handoff(cpu_id: usize, firmware_arg: usize) -> BootHandoff {
-        unsafe {
-            publish_boot_info(firmware_arg);
-        }
+        BootStaticBag::<IdentityLive>::take_global()
+            .publish_boot_info_before_identity_drop(firmware_arg)
+            .complete_post_entry_pipeline()
+            .install_global();
+
         BootHandoff {
             cpu_id: CpuId(cpu_id),
             firmware_arg: BootArg(firmware_arg),
@@ -106,13 +133,13 @@ impl InitIf for Platform {
 
 impl BootInfoIf for Platform {
     fn boot_info() -> &'static BootInfo {
-        unsafe { &*BOOT_INFO.0.get() }
+        BootStaticBag::<IdentityDropped>::global_ref().boot_info_ref()
     }
 }
 
 impl PlatformInfoIf for Platform {
     fn platform_info() -> &'static PlatformInfo {
-        &PLATFORM_INFO
+        BootStaticBag::<IdentityDropped>::global_ref().platform_info_ref()
     }
 }
 
@@ -142,8 +169,135 @@ impl PmapIf for Platform {
     fn free_pt_node(node: PtNode) {
         pmap::free_pt_node(node);
     }
+
+    fn install_pt_node_allocator(allocator: PtNodeAllocator) -> Result<(), PmapError> {
+        pmap::install_pt_node_allocator(allocator)
+    }
+
+    fn reserve_kernel_direct_map_1g(phys: PhysAddr) -> Result<Option<PmapReservation>, PmapError> {
+        pmap::reserve_kernel_direct_map_1g(phys)
+    }
+
+    fn commit_kernel_direct_map_1g(reservation: PmapReservation) {
+        pmap::commit_kernel_direct_map_1g(reservation);
+    }
+
+    fn extend_direct_map(phys_end: PhysAddr) -> Result<(), PmapError> {
+        pmap::extend_direct_map(phys_end)
+    }
+
+    fn reserve_kernel_mapping(
+        virt: tx_hal::VirtAddr,
+        phys: PhysAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapReservation>, PmapError> {
+        pmap::reserve_kernel_mapping(virt, phys, kind)
+    }
+
+    fn rollback_kernel_mapping(reservation: PmapReservation) {
+        pmap::rollback_kernel_mapping(reservation);
+    }
+
+    fn commit_kernel_mapping(reservation: PmapReservation) {
+        pmap::commit_kernel_mapping(reservation);
+    }
+
+    fn unmap_kernel_mapping(
+        virt: tx_hal::VirtAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapUnmapResult>, PmapError> {
+        pmap::unmap_kernel_mapping(virt, kind)
+    }
+
+    fn protect_kernel_mapping(
+        virt: tx_hal::VirtAddr,
+        kind: PmapReserveKind,
+        permissions: PmapPermissions,
+    ) -> Result<Option<PmapInvalidation>, PmapError> {
+        pmap::protect_kernel_mapping(virt, kind, permissions)
+    }
+
+    fn shootdown_kernel_mapping(invalidation: PmapInvalidation) {
+        pmap::shootdown_kernel_mapping(invalidation);
+    }
+
+    fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+        pmap::create_pmap_root()
+    }
+
+    fn destroy_pmap_root(root: PmapRoot) {
+        pmap::destroy_pmap_root(root);
+    }
+
+    fn reserve_mapping(
+        root: &PmapRoot,
+        virt: tx_hal::VirtAddr,
+        phys: PhysAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapReservation>, PmapError> {
+        pmap::reserve_mapping(root, virt, phys, kind)
+    }
+
+    fn rollback_mapping(root: &PmapRoot, reservation: PmapReservation) {
+        pmap::rollback_mapping(root, reservation);
+    }
+
+    fn commit_mapping(root: &PmapRoot, reservation: PmapReservation, permissions: PmapPermissions) {
+        pmap::commit_mapping(root, reservation, permissions);
+    }
+
+    fn unmap_mapping(
+        root: &PmapRoot,
+        virt: tx_hal::VirtAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapUnmapResult>, PmapError> {
+        pmap::unmap_mapping(root, virt, kind)
+    }
+
+    fn protect_mapping(
+        root: &PmapRoot,
+        virt: tx_hal::VirtAddr,
+        kind: PmapReserveKind,
+        permissions: PmapPermissions,
+    ) -> Result<Option<PmapInvalidation>, PmapError> {
+        pmap::protect_mapping(root, virt, kind, permissions)
+    }
+
+    fn shootdown_mapping(asid: Asid, invalidation: PmapInvalidation) {
+        pmap::shootdown_mapping(asid, invalidation);
+    }
 }
-impl TrapIf for Platform {}
+impl TrapIf for Platform {
+    fn install_minimal_trap_vector() {
+        install_rv64_trap_vector();
+    }
+
+    fn install_kernel_trap_vector() {
+        install_rv64_trap_vector();
+    }
+
+    fn classify_trap(snapshot: TrapFrameSnapshot) -> TrapClass {
+        classify_rv64_trap(snapshot.scause)
+    }
+}
+
+fn classify_rv64_trap(scause: usize) -> TrapClass {
+    let interrupt_bit = 1usize << (usize::BITS as usize - 1);
+    let is_interrupt = scause & interrupt_bit != 0;
+    let code = scause & !interrupt_bit;
+
+    match (is_interrupt, code) {
+        (false, 2) => TrapClass::IllegalInstruction,
+        (false, 3) => TrapClass::Breakpoint,
+        (false, 8) => TrapClass::UserEnvCall,
+        (false, 12) => TrapClass::InstructionPageFault,
+        (false, 13) => TrapClass::LoadPageFault,
+        (false, 15) => TrapClass::StorePageFault,
+        (true, 5) => TrapClass::SupervisorTimer,
+        (true, 9) => TrapClass::SupervisorExternal,
+        _ => TrapClass::Unknown,
+    }
+}
 impl UserAccessIf for Platform {}
 impl SignalFrameIf for Platform {}
 impl IrqIf for Platform {}
@@ -183,69 +337,132 @@ fn sbi_shutdown() {
     }
 }
 
-const fn reserved_region() -> MemoryRegion {
-    MemoryRegion {
-        base: PhysAddr(0),
-        size: 0,
-        kind: MemoryRegionKind::Reserved,
-    }
-}
+fn install_rv64_trap_vector() {
+    let vector = BootStaticBag::<IdentityLive>::current_trap_vector_kernel_alias();
 
-unsafe fn publish_boot_info(dtb_addr: usize) {
-    let memory_regions = &mut *MEMORY_REGIONS.0.get();
-    let cmdline = &mut *CMDLINE.0.get();
-    memory_regions.fill(reserved_region());
-    cmdline.fill(0);
-
-    let parsed = parse_boot_info_from_fdt(dtb_addr, memory_regions, cmdline);
-    let (memory_region_count, initrd, cmdline_len) = if let Some(parsed) = parsed {
-        (
-            parsed.memory_region_count,
-            parsed.initrd,
-            parsed.cmdline_len.min(CMDLINE_CAPACITY),
-        )
-    } else {
-        memory_regions[0] = MemoryRegion {
-            base: PhysAddr(QEMU_VIRT_RAM_BASE),
-            size: QEMU_VIRT_FALLBACK_RAM_SIZE,
-            kind: MemoryRegionKind::Usable,
-        };
-        (1, None, 0)
-    };
-
-    let cmdline = if cmdline_len > 0 {
-        Some(core::str::from_utf8_unchecked(&cmdline[..cmdline_len]))
-    } else {
-        None
-    };
-    let memory_regions = core::slice::from_raw_parts(memory_regions.as_ptr(), memory_region_count);
-
-    *BOOT_INFO.0.get() = BootInfo {
-        memory_regions,
-        kernel_image: kernel_image_range(),
-        initrd,
-        cmdline,
-    };
-}
-
-fn kernel_image_range() -> PhysRange {
     #[cfg(target_arch = "riscv64")]
-    {
-        unsafe extern "C" {
-            static __kernel_start: u8;
-            static __kernel_end: u8;
-        }
-
-        let start = core::ptr::addr_of!(__kernel_start) as usize;
-        let end = core::ptr::addr_of!(__kernel_end) as usize;
-        PhysRange {
-            start: PhysAddr(start),
-            size: end.saturating_sub(start),
-        }
+    unsafe {
+        core::arch::asm!(
+            "csrw stvec, {vector}",
+            vector = in(reg) vector.0,
+            options(nostack)
+        );
     }
 
     #[cfg(not(target_arch = "riscv64"))]
-    {
-        PhysRange::empty()
+    let _ = vector;
+}
+
+#[cfg(target_arch = "riscv64")]
+#[no_mangle]
+extern "C" fn tx_rv64_qemu_trap_panic(scause: usize, sepc: usize, stval: usize) -> ! {
+    console_write_literal(b"txkernel:qemu-riscv64-virt:trap\nscause=0x");
+    console_write_hex(scause);
+    console_write_literal(b" sepc=0x");
+    console_write_hex(sepc);
+    console_write_literal(b" stval=0x");
+    console_write_hex(stval);
+    console_write_literal(b"\n");
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn console_write_literal(bytes: &[u8]) {
+    for &byte in bytes {
+        sbi_console_putchar(byte);
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn console_write_hex(value: usize) {
+    for shift in (0..usize::BITS).rev().step_by(4) {
+        let digit = ((value >> shift) & 0xf) as u8;
+        let byte = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + (digit - 10)
+        };
+        sbi_console_putchar(byte);
+    }
+}
+
+impl BootStaticBag<IdentityLive> {
+    fn publish_boot_info_before_identity_drop(mut self, firmware_arg: usize) -> Self {
+        debug_assert_eq!(self.firmware_dtb().addr(), firmware_arg);
+        unsafe {
+            self.publish_boot_info_from_fdt();
+        }
+        self
+    }
+
+    unsafe fn publish_boot_info_from_fdt(&mut self) {
+        let dtb_addr = self.firmware_dtb().addr();
+        let memory_regions = unsafe { self.memory_regions_mut() };
+        let cmdline = unsafe { self.cmdline_mut() };
+        memory_regions.fill(reserved_region());
+        cmdline.fill(0);
+
+        let parsed = parse_boot_info_from_fdt(dtb_addr, memory_regions, cmdline);
+        let (memory_region_count, initrd, cmdline_len) = if let Some(parsed) = parsed {
+            (
+                parsed.memory_region_count,
+                parsed.initrd,
+                parsed.cmdline_len.min(CMDLINE_CAPACITY),
+            )
+        } else {
+            memory_regions[0] = MemoryRegion {
+                base: PhysAddr(QEMU_VIRT_RAM_BASE),
+                size: QEMU_VIRT_FALLBACK_RAM_SIZE,
+                kind: MemoryRegionKind::Usable,
+            };
+            (1, None, 0)
+        };
+
+        let cmdline = if cmdline_len > 0 {
+            Some(core::str::from_utf8_unchecked(&cmdline[..cmdline_len]))
+        } else {
+            None
+        };
+        let memory_regions =
+            core::slice::from_raw_parts(memory_regions.as_ptr(), memory_region_count);
+
+        *unsafe { self.boot_info_mut() } = BootInfo {
+            memory_regions,
+            kernel_image: self.kernel_image_phys(),
+            initrd,
+            cmdline,
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tx_hal::{TrapClass, TrapFrameSnapshot, TrapIf};
+
+    use crate::{classify_rv64_trap, Platform};
+
+    #[test]
+    fn rv64_trap_classification_decodes_sync_faults_and_interrupts() {
+        assert_eq!(classify_rv64_trap(2), TrapClass::IllegalInstruction);
+        assert_eq!(classify_rv64_trap(12), TrapClass::InstructionPageFault);
+        assert_eq!(classify_rv64_trap(13), TrapClass::LoadPageFault);
+        assert_eq!(classify_rv64_trap(15), TrapClass::StorePageFault);
+
+        let interrupt_bit = 1usize << (usize::BITS as usize - 1);
+        assert_eq!(
+            classify_rv64_trap(interrupt_bit | 5),
+            TrapClass::SupervisorTimer
+        );
+        assert_eq!(
+            Platform::classify_trap(TrapFrameSnapshot {
+                scause: interrupt_bit | 9,
+                sepc: 0x1000,
+                stval: 0,
+            }),
+            TrapClass::SupervisorExternal
+        );
     }
 }
