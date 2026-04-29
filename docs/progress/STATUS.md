@@ -178,6 +178,48 @@
   `docs/progress/worktrees/2026-04-29-substrate-parallel-integration.json`.
   Next step: integrated verification and publishing; remaining design decision
   is the monomorphic kernel sink bridge for a future saved-register trap shell.
+- `tx-reactor` now has task-aware wake and first wait-channel mechanics:
+  tasks carry explicit `Runnable`/`Polling`/`Parked`/`Completed` status, enter a
+  runnable queue on submit or task-local wake, and repeated wake calls coalesce
+  before the next poll. `wait::Channel`, `Mask`, `WaitFuture`,
+  `WaitProtocol`, `WaitOutcome`, and `wait_event` now let a task park on a mask
+  and let another task fire the channel; matching waiter readiness is
+  token-backed so later nonmatching fires cannot erase a wake before the waiter
+  is repolled. `wait_event` rechecks its condition after each wake, preserving
+  the REACTOR_v0 rule that wake is not truth. Focused tests cover per-task wake
+  isolation, pending wake idleness, duplicate wake coalescing, task-to-task
+  channel wake, matching-wake preservation, and spurious wake re-parking.
+  Verification:
+  `cargo fmt --check`, `cargo test -p tx-reactor`, `cargo xtask lint unused`,
+  `cargo xtask progress validate`, `cargo xtask ci`, `cargo xtask ci-slow`, and
+  `git diff --check`; next step is timer/signal classification hooks plus the
+  scheduler/idle loop boundary.
+- `TimeIf` is now a concrete HAL deadline surface for reactor/scheduler use:
+  `tx-hal` exposes `read_ns`, `set_deadline_ns`, `cancel_deadline`, and
+  `frequency_hz`, plus saturating ns/tick conversion helpers. RV64 QEMU parses
+  root DTB `timebase-frequency` through the existing DTB reader, publishes it
+  as `PlatformInfo.timebase_frequency_hz`, reads `rdtime`, and programs
+  absolute deadlines with legacy SBI `set_timer`; the qemu virt 10 MHz
+  fallback is documented for absent/zero/invalid firmware data. LA64 and M1
+  Dock mock boards have explicit compile stubs only. Verification:
+  `cargo fmt --check`, `cargo test -p tx-hal-riscv64-qemu-virt`,
+  `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`, `cargo xtask lint unused`, and
+  `cargo xtask progress validate`; next step is for reactor/scheduler code to
+  consume `TimeIf` without adding a runtime HAL manager. No blocker.
+- `tx-reactor` now has host-driven timeout waits on top of the task-aware wait
+  channel: `Reactor::channel()` creates timer-aware channels, timeout
+  `WaitProtocol` variants carry absolute nanosecond deadlines, and
+  `Reactor::advance_time_to(now_ns)` wakes expired deadlines so
+  `wait_event` can return `TimedOut` while still rechecking semantic readiness
+  after every event wake. Focused tests cover no early timeout,
+  ready-before-timeout unregister, and spurious event wake re-parking before
+  timeout. Verification: `cargo fmt --check`, `cargo test -p tx-reactor`,
+  `cargo xtask lint unused`, `cargo xtask lint docs`,
+  `cargo xtask progress validate`, `cargo xtask ci`, `cargo xtask ci-slow`,
+  and `git diff --check`. Next step: scheduler shell boundary types and, after
+  the saved-register trap shell exists, a narrow trap-to-kernel timer delivery
+  hook; no EBR/zone work was touched.
 - `TrapIf` now includes typed trap snapshots and classification. RV64 QEMU
   decodes common synchronous faults and supervisor interrupts from `scause`;
   the direct-mode vector still panics/spins until the full saved-register

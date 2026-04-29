@@ -2,10 +2,12 @@ use core::{
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
+use std::sync::{Arc, Mutex};
 
-use tx_reactor::{Reactor, RunStats, TaskId};
+use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
+use tx_reactor::{Reactor, RunStats, TaskId, TaskStatus};
 
 static READY_POLLS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_POLLS: AtomicUsize = AtomicUsize::new(0);
@@ -29,6 +31,26 @@ impl Future for ParkForever {
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         PENDING_POLLS.fetch_add(1, Ordering::SeqCst);
         Poll::Pending
+    }
+}
+
+struct ExternallyWoken {
+    polls: Arc<AtomicUsize>,
+    ready: Arc<AtomicUsize>,
+    waker_slot: Arc<Mutex<Option<Waker>>>,
+}
+
+impl Future for ExternallyWoken {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        if self.ready.load(Ordering::SeqCst) != 0 {
+            Poll::Ready(())
+        } else {
+            *self.waker_slot.lock().expect("waker slot poisoned") = Some(cx.waker().clone());
+            Poll::Pending
+        }
     }
 }
 
@@ -83,4 +105,367 @@ fn pending_task_is_parked_after_one_poll() {
     );
     assert_eq!(PENDING_POLLS.load(Ordering::SeqCst), 1);
     assert!(reactor.is_idle());
+}
+
+#[test]
+fn task_waker_marks_only_its_task_runnable() {
+    let polls_a = Arc::new(AtomicUsize::new(0));
+    let ready_a = Arc::new(AtomicUsize::new(0));
+    let waker_a = Arc::new(Mutex::new(None));
+    let polls_b = Arc::new(AtomicUsize::new(0));
+    let ready_b = Arc::new(AtomicUsize::new(0));
+    let waker_b = Arc::new(Mutex::new(None));
+
+    let mut reactor = Reactor::new();
+    let task_a = reactor.submit(ExternallyWoken {
+        polls: Arc::clone(&polls_a),
+        ready: Arc::clone(&ready_a),
+        waker_slot: Arc::clone(&waker_a),
+    });
+    let task_b = reactor.submit(ExternallyWoken {
+        polls: Arc::clone(&polls_b),
+        ready: Arc::clone(&ready_b),
+        waker_slot: Arc::clone(&waker_b),
+    });
+
+    assert_eq!(reactor.run_until_idle().polled, 2);
+    assert_eq!(reactor.task_status(task_a), Some(TaskStatus::Parked));
+    assert_eq!(reactor.task_status(task_b), Some(TaskStatus::Parked));
+
+    ready_a.store(1, Ordering::SeqCst);
+    waker_a
+        .lock()
+        .expect("waker slot poisoned")
+        .take()
+        .expect("task A waker")
+        .wake();
+    assert!(!reactor.is_idle());
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 1
+        }
+    );
+    assert_eq!(polls_a.load(Ordering::SeqCst), 2);
+    assert_eq!(polls_b.load(Ordering::SeqCst), 1);
+    assert_eq!(reactor.task_status(task_a), Some(TaskStatus::Completed));
+    assert_eq!(reactor.task_status(task_b), Some(TaskStatus::Parked));
+}
+
+#[test]
+fn repeated_wakes_enqueue_task_once_before_next_poll() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(AtomicUsize::new(0));
+    let waker_slot = Arc::new(Mutex::new(None));
+
+    let mut reactor = Reactor::new();
+    let task = reactor.submit(ExternallyWoken {
+        polls: Arc::clone(&polls),
+        ready: Arc::clone(&ready),
+        waker_slot: Arc::clone(&waker_slot),
+    });
+
+    assert_eq!(reactor.run_until_idle().polled, 1);
+    assert_eq!(reactor.task_status(task), Some(TaskStatus::Parked));
+
+    let waker = waker_slot
+        .lock()
+        .expect("waker slot poisoned")
+        .as_ref()
+        .expect("task waker")
+        .clone();
+    waker.wake_by_ref();
+    waker.wake_by_ref();
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 0
+        }
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    assert_eq!(reactor.task_status(task), Some(TaskStatus::Parked));
+}
+
+#[test]
+fn wait_channel_wakes_registered_task_from_another_task() {
+    let channel = Channel::new();
+    let mask = Mask::from_bits(0x1);
+    let waiter_done = Arc::new(AtomicUsize::new(0));
+    let publisher_done = Arc::new(AtomicUsize::new(0));
+
+    let mut reactor = Reactor::new();
+    let waiter = {
+        let channel = channel.clone();
+        let waiter_done = Arc::clone(&waiter_done);
+        reactor.submit(async move {
+            assert_eq!(channel.wait(mask).await, WaitOutcome::Ready);
+            waiter_done.store(1, Ordering::SeqCst);
+        })
+    };
+    let publisher = {
+        let channel = channel.clone();
+        let publisher_done = Arc::clone(&publisher_done);
+        reactor.submit(async move {
+            assert_eq!(channel.fire(mask), 1);
+            publisher_done.store(1, Ordering::SeqCst);
+        })
+    };
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 3,
+            completed: 2
+        }
+    );
+    assert_eq!(waiter_done.load(Ordering::SeqCst), 1);
+    assert_eq!(publisher_done.load(Ordering::SeqCst), 1);
+    assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Completed));
+    assert_eq!(reactor.task_status(publisher), Some(TaskStatus::Completed));
+}
+
+#[test]
+fn wait_channel_preserves_matching_wake_across_later_nonmatching_fire() {
+    let channel = Channel::new();
+    let waited_mask = Mask::from_bits(0x1);
+    let other_mask = Mask::from_bits(0x2);
+    let waiter_done = Arc::new(AtomicUsize::new(0));
+
+    let mut reactor = Reactor::new();
+    let waiter = {
+        let channel = channel.clone();
+        let waiter_done = Arc::clone(&waiter_done);
+        reactor.submit(async move {
+            assert_eq!(channel.wait(waited_mask).await, WaitOutcome::Ready);
+            waiter_done.store(1, Ordering::SeqCst);
+        })
+    };
+    reactor.submit({
+        let channel = channel.clone();
+        async move {
+            assert_eq!(channel.fire(waited_mask), 1);
+        }
+    });
+    reactor.submit({
+        let channel = channel.clone();
+        async move {
+            assert_eq!(channel.fire(other_mask), 0);
+        }
+    });
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 4,
+            completed: 3
+        }
+    );
+    assert_eq!(waiter_done.load(Ordering::SeqCst), 1);
+    assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Completed));
+}
+
+#[test]
+fn wait_event_rechecks_condition_after_spurious_wake() {
+    let channel = Channel::new();
+    let mask = Mask::from_bits(0x1);
+    let condition_ready = Arc::new(AtomicUsize::new(0));
+    let waiter_done = Arc::new(AtomicUsize::new(0));
+
+    let mut reactor = Reactor::new();
+    let waiter = {
+        let channel = channel.clone();
+        let condition_ready = Arc::clone(&condition_ready);
+        let waiter_done = Arc::clone(&waiter_done);
+        reactor.submit(async move {
+            let outcome = channel
+                .wait_event(mask, WaitProtocol::Interruptible, move || {
+                    condition_ready.load(Ordering::SeqCst) != 0
+                })
+                .await;
+            assert_eq!(outcome, WaitOutcome::Ready);
+            waiter_done.store(1, Ordering::SeqCst);
+        })
+    };
+
+    reactor.submit({
+        let channel = channel.clone();
+        async move {
+            assert_eq!(channel.fire(mask), 1);
+        }
+    });
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 3,
+            completed: 1
+        }
+    );
+    assert_eq!(waiter_done.load(Ordering::SeqCst), 0);
+    assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Parked));
+
+    condition_ready.store(1, Ordering::SeqCst);
+    reactor.submit({
+        let channel = channel.clone();
+        async move {
+            assert_eq!(channel.fire(mask), 1);
+        }
+    });
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 2,
+            completed: 2
+        }
+    );
+    assert_eq!(waiter_done.load(Ordering::SeqCst), 1);
+    assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Completed));
+}
+
+#[test]
+fn wait_event_timeout_completes_only_after_deadline_is_driven() {
+    let mut reactor = Reactor::new();
+    let channel = reactor.channel();
+    let mask = Mask::from_bits(0x1);
+    let outcome = Arc::new(Mutex::new(None));
+    let deadline_ns = 10;
+
+    let waiter = {
+        let channel = channel.clone();
+        let outcome = Arc::clone(&outcome);
+        reactor.submit(async move {
+            let wait_outcome = channel
+                .wait_event(
+                    mask,
+                    WaitProtocol::InterruptibleTimeout(deadline_ns),
+                    || false,
+                )
+                .await;
+            *outcome.lock().expect("outcome slot poisoned") = Some(wait_outcome);
+        })
+    };
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 0
+        }
+    );
+    assert_eq!(*outcome.lock().expect("outcome slot poisoned"), None);
+    assert_eq!(reactor.advance_time_to(deadline_ns - 1), 0);
+    assert_eq!(reactor.run_until_idle().polled, 0);
+    assert_eq!(*outcome.lock().expect("outcome slot poisoned"), None);
+
+    assert_eq!(reactor.advance_time_to(deadline_ns), 1);
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 1
+        }
+    );
+    assert_eq!(
+        *outcome.lock().expect("outcome slot poisoned"),
+        Some(WaitOutcome::TimedOut)
+    );
+    assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Completed));
+}
+
+#[test]
+fn wait_event_ready_before_timeout_unregisters_timer() {
+    let mut reactor = Reactor::new();
+    let channel = reactor.channel();
+    let mask = Mask::from_bits(0x1);
+    let condition_ready = Arc::new(AtomicUsize::new(0));
+    let outcome = Arc::new(Mutex::new(None));
+    let deadline_ns = 20;
+
+    let waiter = {
+        let channel = channel.clone();
+        let condition_ready = Arc::clone(&condition_ready);
+        let outcome = Arc::clone(&outcome);
+        reactor.submit(async move {
+            let wait_outcome = channel
+                .wait_event(
+                    mask,
+                    WaitProtocol::InterruptibleTimeout(deadline_ns),
+                    move || condition_ready.load(Ordering::SeqCst) != 0,
+                )
+                .await;
+            *outcome.lock().expect("outcome slot poisoned") = Some(wait_outcome);
+        })
+    };
+
+    assert_eq!(reactor.run_until_idle().polled, 1);
+    condition_ready.store(1, Ordering::SeqCst);
+    assert_eq!(channel.fire(mask), 1);
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 1
+        }
+    );
+    assert_eq!(
+        *outcome.lock().expect("outcome slot poisoned"),
+        Some(WaitOutcome::Ready)
+    );
+    assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Completed));
+    assert_eq!(reactor.advance_time_to(deadline_ns), 0);
+}
+
+#[test]
+fn wait_event_spurious_wake_reparks_before_timeout() {
+    let mut reactor = Reactor::new();
+    let channel = reactor.channel();
+    let mask = Mask::from_bits(0x1);
+    let outcome = Arc::new(Mutex::new(None));
+    let deadline_ns = 30;
+
+    let waiter = {
+        let channel = channel.clone();
+        let outcome = Arc::clone(&outcome);
+        reactor.submit(async move {
+            let wait_outcome = channel
+                .wait_event(
+                    mask,
+                    WaitProtocol::InterruptibleTimeout(deadline_ns),
+                    || false,
+                )
+                .await;
+            *outcome.lock().expect("outcome slot poisoned") = Some(wait_outcome);
+        })
+    };
+
+    assert_eq!(reactor.run_until_idle().polled, 1);
+    assert_eq!(channel.fire(mask), 1);
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 0
+        }
+    );
+    assert_eq!(*outcome.lock().expect("outcome slot poisoned"), None);
+    assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Parked));
+
+    assert_eq!(reactor.advance_time_to(deadline_ns), 1);
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 1,
+            completed: 1
+        }
+    );
+    assert_eq!(
+        *outcome.lock().expect("outcome slot poisoned"),
+        Some(WaitOutcome::TimedOut)
+    );
 }
