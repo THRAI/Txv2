@@ -23,7 +23,7 @@ impl UserVirtAddr {
     }
 
     pub const fn is_page_aligned(self) -> bool {
-        self.0 % USER_PAGE_SIZE == 0
+        self.0.is_multiple_of(USER_PAGE_SIZE)
     }
 
     pub const fn containing_page(self) -> UserPage {
@@ -65,7 +65,7 @@ impl UserRange {
         if len == 0 {
             return Err(UserRangeError::ZeroLength);
         }
-        if !start.is_page_aligned() || len % USER_PAGE_SIZE != 0 {
+        if !start.is_page_aligned() || !len.is_multiple_of(USER_PAGE_SIZE) {
             return Err(UserRangeError::Unaligned);
         }
         let end = start.0.checked_add(len).ok_or(UserRangeError::Overflow)?;
