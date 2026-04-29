@@ -375,10 +375,7 @@ fn pt_node_pool_allocates_fixed_boot_nodes() {
     reset_pt_node_pool_for_test();
     let bag = test_bag();
 
-    assert_eq!(
-        bag.pt_node_direct_va(0),
-        VirtAddr(EXPECTED_DIRECT_MAP_BASE + bag.pt_node_phys(0).0)
-    );
+    assert_eq!(bag.pt_node_phys(0), bag.pt_node_pool_phys_range().start);
 
     let first = alloc_pt_node_from_bag(&bag).expect("first node");
     let second = alloc_pt_node_from_bag(&bag).expect("second node");
