@@ -1,0 +1,26 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-04-29-coreinit-spine",
+  "created": "2026-04-29",
+  "updated": "2026-04-29",
+  "status": "closed",
+  "branch": "codex/coreinit-spine",
+  "path": "/private/tmp/Tx-worktrees/codex-coreinit-spine",
+  "base": "63fab30 reactor: add timeout wait queue",
+  "plan": "docs/progress/plans/2026-04-29-kernel-main-long-term-checklist.json",
+  "owner": "Worker 2, CoreInit spine lane",
+  "write_scope": [
+    "crates/tx-kernel/src/lib.rs",
+    "crates/tx-kernel/src/init.rs",
+    "docs/progress/worktrees/2026-04-29-coreinit-spine.json"
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test -p tx-kernel",
+    "cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf",
+    "cargo xtask lint unused",
+    "cargo xtask ci-slow",
+    "git diff --check"
+  ],
+  "notes": "Factored tx_kernel::kernel_main into an explicit CoreInit H3 skeleton while preserving the existing board reactor and boot sentinels. VFS, device, scheduler, process, and userspace init remain named deferred placeholders until their no_std contracts are ready. Next step: integrate post-substrate/init-hook slots and real H4 subsystem init when the owning lanes provide concrete APIs. Blockers: none for the structure-first spine."
+}
