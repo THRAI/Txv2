@@ -1,19 +1,24 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use crate::util::{collect_files, relative};
+use crate::target::{installed_targets, target_triple, TxTarget};
+use crate::util::{collect_files, relative, shell_join};
 use crate::Result;
+
+const MAX_AUTHORED_RUST_FILE_LINES: usize = 1_500;
 
 pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
-        return Err("lint command needs `arch` or `docs`".into());
+        return Err("lint command needs `arch`, `docs`, or `unused`".into());
     };
     match kind.as_str() {
         "arch" => lint_arch(root),
         "docs" => lint_docs(root),
+        "unused" => lint_unused(root),
         other => Err(format!(
-            "unknown lint kind '{other}', expected arch or docs"
+            "unknown lint kind '{other}', expected arch, docs, or unused"
         )),
     }
 }
@@ -29,6 +34,9 @@ pub(crate) fn lint_arch(root: &Path) -> Result<()> {
 
         if normalized.starts_with("target/") || normalized.starts_with("external/") {
             continue;
+        }
+        if let Some(finding) = lint_file_size(&normalized, &relative, &text) {
+            findings.push(finding);
         }
         if normalized.starts_with("xtask/") {
             continue;
@@ -100,6 +108,22 @@ pub(crate) fn lint_docs(root: &Path) -> Result<()> {
         }
         Err(format!("docs lint found {} broken link(s)", errors.len()))
     }
+}
+
+pub(crate) fn lint_unused(root: &Path) -> Result<()> {
+    let installed = installed_targets().unwrap_or_default();
+    let steps = unused_check_steps(&installed);
+
+    for step in steps {
+        if let Some(reason) = step.skip_reason {
+            println!("skip: unused lint {}: {reason}", step.name);
+            continue;
+        }
+        run_unused_check(root, &step.args)?;
+    }
+
+    println!("unused lint: ok");
+    Ok(())
 }
 
 fn extract_txdoc_tags(text: &str) -> Vec<(usize, String)> {
@@ -207,10 +231,31 @@ fn board_import_allowed(path: &str, arch: &str) -> bool {
                 || path.starts_with("boards/tx-hal-riscv64-m1dock-mock/")))
 }
 
+fn boot_static_capture_allowed(path: &str) -> bool {
+    path == "boards/tx-hal-riscv64-qemu-virt/src/boot_static.rs"
+}
+
+fn rv64_qemu_boot_static_path(path: &str) -> bool {
+    path.starts_with("boards/tx-hal-riscv64-qemu-virt/src/")
+}
+
+fn unused_allowance(line: &str) -> bool {
+    (line.contains("#[allow(") || line.contains("#![allow("))
+        && (line.contains("dead_code")
+            || line.contains("unused")
+            || line.contains("unused_imports")
+            || line.contains("unused_variables"))
+}
+
 fn lint_arch_text(path: &str, display: &str, text: &str) -> Vec<String> {
     let mut findings = Vec::new();
     for (idx, line) in text.lines().enumerate() {
         let line_no = idx + 1;
+        if unused_allowance(line) {
+            findings.push(format!(
+                "{display}:{line_no}: unused/dead-code allowances hide stale boot and API surfaces; remove the item or gate it behind cfg(test)"
+            ));
+        }
         if path.starts_with("crates/tx-kernel/") && line.contains("#[cfg(target_arch") {
             findings.push(format!(
                 "{display}:{line_no}: tx-kernel must not cfg on target_arch"
@@ -258,13 +303,125 @@ fn lint_arch_text(path: &str, display: &str, text: &str) -> Vec<String> {
                 "{display}:{line_no}: concrete LA64 platform imported outside board boundary"
             ));
         }
+        if rv64_qemu_boot_static_path(path)
+            && !boot_static_capture_allowed(path)
+            && (line.contains("addr_of!")
+                || line.contains("addr_of_mut!")
+                || line.contains(".get() as usize")
+                || line.contains("unsafe extern \"C\""))
+        {
+            findings.push(format!(
+                "{display}:{line_no}: RV64 QEMU boot-static capture must go through boot_static.rs"
+            ));
+        }
     }
     findings
+}
+
+fn lint_file_size(path: &str, display: &str, text: &str) -> Option<String> {
+    if !path.ends_with(".rs") {
+        return None;
+    }
+    let lines = text.lines().count();
+    if lines <= MAX_AUTHORED_RUST_FILE_LINES {
+        return None;
+    }
+    Some(format!(
+        "{display}: authored Rust source file has {lines} lines; split files above {MAX_AUTHORED_RUST_FILE_LINES} lines by responsibility"
+    ))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UnusedCheckStep {
+    name: &'static str,
+    args: Vec<String>,
+    skip_reason: Option<String>,
+}
+
+fn unused_check_steps(installed: &BTreeSet<String>) -> Vec<UnusedCheckStep> {
+    unused_check_steps_for_targets(
+        installed,
+        [
+            (TxTarget::Rv64Qemu, target_triple(TxTarget::Rv64Qemu)),
+            (
+                TxTarget::Rv64M1DockMock,
+                target_triple(TxTarget::Rv64M1DockMock),
+            ),
+            (TxTarget::La64Qemu, target_triple(TxTarget::La64Qemu)),
+        ],
+    )
+}
+
+fn unused_check_steps_for_targets<I>(
+    installed: &BTreeSet<String>,
+    targets: I,
+) -> Vec<UnusedCheckStep>
+where
+    I: IntoIterator<Item = (TxTarget, Result<String>)>,
+{
+    let mut steps = vec![UnusedCheckStep {
+        name: "host workspace",
+        args: strings(["check", "--workspace"]),
+        skip_reason: None,
+    }];
+
+    for (target, triple) in targets {
+        let name = target.name();
+        match triple {
+            Ok(triple) if installed.contains(&triple) => steps.push(UnusedCheckStep {
+                name,
+                args: strings(["check", "-p", target.package(), "--target", &triple]),
+                skip_reason: None,
+            }),
+            Ok(triple) => steps.push(UnusedCheckStep {
+                name,
+                args: Vec::new(),
+                skip_reason: Some(format!("install with `rustup target add {triple}`")),
+            }),
+            Err(err) => steps.push(UnusedCheckStep {
+                name,
+                args: Vec::new(),
+                skip_reason: Some(err),
+            }),
+        }
+    }
+
+    steps
+}
+
+fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
+    values.into_iter().map(str::to_string).collect()
+}
+
+fn run_unused_check(root: &Path, args: &[String]) -> Result<()> {
+    let rustflags = unused_rustflags();
+    println!("$ RUSTFLAGS={} cargo {}", rustflags, shell_join(args));
+    let status = Command::new("cargo")
+        .args(args)
+        .current_dir(root)
+        .env("RUSTFLAGS", rustflags)
+        .status()
+        .map_err(|err| format!("failed to run cargo: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cargo exited with {status}"))
+    }
+}
+
+fn unused_rustflags() -> String {
+    let unused = "-Dunused";
+    match std::env::var("RUSTFLAGS") {
+        Ok(current) if current.split_whitespace().any(|flag| flag == unused) => current,
+        Ok(current) if !current.trim().is_empty() => format!("{current} {unused}"),
+        _ => unused.to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::TxTarget;
 
     #[test]
     fn arch_lint_rejects_generic_kernel_target_cfg() {
@@ -354,5 +511,93 @@ mod tests {
             "type ActivePlatform = tx_hal_riscv64_m1dock_mock::Platform;",
         );
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn arch_lint_rejects_rv64_qemu_boot_static_address_leaks() {
+        let findings = lint_arch_text(
+            "boards/tx-hal-riscv64-qemu-virt/src/pmap.rs",
+            "boards/tx-hal-riscv64-qemu-virt/src/pmap.rs",
+            r#"
+fn root() -> usize {
+    BOOTSTRAP_ROOT.0.get() as usize
+}
+
+unsafe extern "C" {
+    static __kernel_start: u8;
+}
+
+fn sym() -> usize {
+    core::ptr::addr_of!(__kernel_start) as usize
+}
+"#,
+        );
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("boot-static capture")));
+    }
+
+    #[test]
+    fn arch_lint_rejects_dead_code_or_unused_allowances() {
+        let findings = lint_arch_text(
+            "boards/tx-hal-riscv64-qemu-virt/src/boot_static.rs",
+            "boards/tx-hal-riscv64-qemu-virt/src/boot_static.rs",
+            "#[allow(dead_code)]\nfn stale_boot_helper() {}",
+        );
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("unused/dead-code allowances")));
+    }
+
+    #[test]
+    fn file_size_lint_rejects_authored_rust_files_over_limit() {
+        let text = "fn f() {}\n".repeat(MAX_AUTHORED_RUST_FILE_LINES + 1);
+        let finding = lint_file_size(
+            "boards/tx-hal-riscv64-qemu-virt/src/pmap/mod.rs",
+            "boards/tx-hal-riscv64-qemu-virt/src/pmap/mod.rs",
+            &text,
+        );
+
+        assert!(finding.is_some_and(|finding| finding.contains("1500")));
+    }
+
+    #[test]
+    fn file_size_lint_allows_non_rust_files() {
+        let text = "# heading\n".repeat(MAX_AUTHORED_RUST_FILE_LINES + 1);
+        let finding = lint_file_size("docs/design/01_substrate/HAL_v1.md", "HAL_v1.md", &text);
+
+        assert!(finding.is_none());
+    }
+
+    #[test]
+    fn unused_lint_plan_checks_workspace_and_installed_targets() {
+        let installed = std::collections::BTreeSet::from(["riscv64gc-unknown-none-elf".into()]);
+        let steps = unused_check_steps_for_targets(
+            &installed,
+            [
+                (TxTarget::Rv64Qemu, Ok("riscv64gc-unknown-none-elf".into())),
+                (
+                    TxTarget::La64Qemu,
+                    Ok("loongarch64-unknown-none-softfloat".into()),
+                ),
+            ],
+        );
+
+        assert!(steps.iter().any(|step| {
+            step.skip_reason.is_none() && step.args == vec!["check", "--workspace"]
+        }));
+        assert!(steps.iter().any(|step| {
+            step.skip_reason.is_none()
+                && step
+                    .args
+                    .contains(&"tx-kernel-riscv64-qemu-virt".to_string())
+        }));
+        assert!(steps.iter().any(|step| {
+            step.skip_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("rustup target add loongarch64"))
+        }));
     }
 }

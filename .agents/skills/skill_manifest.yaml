@@ -36,6 +36,16 @@ skills:
       - docs/ebr-zone/03_Zone_Cap_object_storage_design.en-US.md
     purpose: Gather the relevant active design docs for an implementation, audit, or planning task.
 
+  tx-code-reorganization:
+    sources:
+      - AGENTS.md
+      - docs/design/00_meta-framework/MODULE_MAP_v1.md
+      - docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md
+      - docs/design/00_meta-framework/CI_REPORTING_v1.md
+      - docs/progress/decisions/2026-04-29-rv64-pmap-module-extraction.md
+      - docs/progress/decisions/2026-04-29-rv64-pmap-helper-extraction.md
+    purpose: Reorganize large code modules by responsibility, state/lifecycle/helper flow, and group-level comments.
+
   tx-docs-cleanup:
     sources:
       - docs/design/INDEX.md
