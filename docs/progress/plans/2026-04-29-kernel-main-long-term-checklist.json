@@ -28,14 +28,9 @@
       {
         "owner": "future-kernel-main-workers",
         "paths": [
-          "crates/tx-kernel",
-          "crates/tx-hal",
-          "crates/tx-substrate",
-          "boards/tx-hal-riscv64-qemu-virt",
-          "boards/tx-kernel-riscv64-qemu-virt",
-          "docs/progress"
+          "docs/progress/plans/2026-04-29-kernel-main-long-term-checklist.json"
         ],
-        "notes": "Split individual implementation slices into disjoint write sets before parallel work; this plan is the shared long-term checklist."
+        "notes": "Shared roadmap only. Individual implementation slices claim disjoint write sets through their worktree records before parallel work."
       }
     ]
   },

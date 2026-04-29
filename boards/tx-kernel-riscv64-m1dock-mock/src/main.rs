@@ -15,11 +15,6 @@ impl KernelMain<ActivePlatform> for Kernel {
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    rust_entry(0, 0)
-}
-
-#[no_mangle]
 pub extern "C" fn rust_entry(cpu_id: usize, firmware_arg: usize) -> ! {
     tx_hal::entry::<ActivePlatform, Kernel>(cpu_id, firmware_arg)
 }

@@ -36,6 +36,22 @@
   coverage so those addresses are not reported as direct-map addresses.
 - HumanLayer `.claude` workflow references are available as a sparse submodule
   at `external/humanlayer-reference`.
+- Agent cooperation framework research now records both the local HumanLayer
+  command/specialist-agent adaptation and a follow-up mature-framework scan for
+  Codex-without-native-subagents. The current recommendation is a Tx-owned
+  cooperation protocol plus an optional external LangGraph-style runner, MCP
+  tool surface, A2A service boundary only if needed, and Temporal only for
+  durable long-running execution. A local Codex 0.125.0 probe confirmed both
+  `codex exec` subprocess execution and `codex mcp-server` tools (`codex` and
+  `codex-reply`) as practical runner integration surfaces. See
+  `docs/progress/research/2026-04-29-agent-cooperation-framework.md`.
+  The same note now clarifies that LangGraph should live in an external Tx
+  runner: Tx publishes plans, the runner instantiates the graph, Codex executes
+  bounded nodes, and progress artifacts advance the graph.
+  A follow-up section now states that LangGraph is sufficient as the
+  orchestration core but not the whole command system; Tx still needs a runner
+  with plan compilation, Codex worker adapters, worktree/scope leases, artifact
+  protocol, verifier/reviewer gates, human control, budget policy, and recovery.
 - The Tx Parallel Agent Runner MVP now exists under `tools/agent-runner` as a
   standalone `uv`/LangGraph project. It loads active worktree records, validates
   path/branch/write-scope leases, compiles bounded Codex worker prompts, runs
@@ -47,6 +63,56 @@
   adapter, `cargo xtask progress validate`, `cargo xtask lint docs`, and
   `git diff --check`. Next step: run an optional real one-worktree status smoke
   only with explicit external-service approval; no implementation blocker.
+- Architecture-parallelism research now records that Zone/EBR is the main
+  semantic-entity unlock, but safe subsystem fanout also needs index/mutation,
+  bus, credit, and a minimal reactor/waker shell. The current coarse
+  `kernel_main` plan reaches width 3; finer subsystem/module splits can
+  plausibly support 3-5 implementation lanes after substrate, with wider
+  read-only research and narrower final integration. See
+  `docs/progress/research/2026-04-29-architecture-parallelism-after-zone-ebr.md`.
+- `rsext4` is available as the `external/rsext4` submodule, pinned to upstream
+  `Starry-OS/rsext4` commit `984201f`. It is a source baseline for future
+  async, uncached `tx-ext4` adaptation work and is not wired as a workspace
+  dependency yet. Verification: `git submodule status`,
+  `git -C external/rsext4 log -1 --oneline`, and
+  `cargo xtask progress validate`. Next step: reshape the library around the
+  active filesystem docs before integrating it into `crates/tx-fs`; no blocker.
+- `tx-ext4-format` now exists as a host-testable, no-kernel-interface workspace
+  crate. It provides reusable on-disk ext4/JBD2 parsers, CRC32C plus ext4
+  metadata-checksum chaining helpers, 32/64-bit group descriptor parsing,
+  multi-group inode-table location, recursive extent-index resolution,
+  directory entry and HTree/DX record parsing, bitmap allocation primitives,
+  and a thin `BlockImage` pager that can return inode metadata, read 4 KiB
+  pages with hole/EOF zero-fill, write back existing mapped pages, list and
+  look up directory entries, and journal/replay inode metadata blocks on mock
+  images.
+  Optional host-tool verification creates a real ext4 image with `mkfs.ext4`,
+  populates `/folder/hello.txt` with `debugfs`, verifies it with
+  `dumpe2fs`/`e2fsck`, and compares pager folder/file observations against
+  `debugfs` when those tools are installed; the current host lacks those tools,
+  so that path compiles and skips locally. Verification:
+  `cargo test -p tx-ext4-format`,
+  `cargo test -p tx-ext4-format --test host_tools -- --nocapture`,
+  `cargo fmt -p tx-ext4-format -- --check`,
+  `cargo tree -p tx-ext4-format`, static grep for rsext4/kernel-interface
+  imports, scoped `git diff --check`, `cargo xtask progress validate`, and
+  `cargo xtask lint docs`. Next step: add host-generated fixtures for htree,
+  sparse, and multi-level extent images when e2fsprogs is available, then add
+  the thin txKernel async adapter; no blocker.
+- `tx-ext4` now exists as the host-first async adapter crate above
+  `tx-ext4-format`. Its `host_async` layer defines an `AsyncBlockDevice`
+  Future-returning trait, `FsObjectId`, an `Ext4Async` adapter, a small
+  file-page cache, async inode metadata loading, page fetch with cache-hit
+  short-circuiting, directory lookup, existing-page writeback, and ordered
+  descriptor/payload/commit metadata journaling with test replay. Tokio is
+  test-only and used as the mock reactor; production code has no Tokio,
+  rsext4, VFS, VM, or kernel-interface imports. Verification:
+  `cargo test -p tx-ext4`, `cargo test -p tx-ext4-format`,
+  `cargo fmt -p tx-ext4 -p tx-ext4-format -- --check`,
+  `cargo tree -p tx-ext4`, `cargo tree -p tx-ext4-format`, static boundary
+  greps, scoped `git diff --check`, `cargo xtask progress validate`, and
+  `cargo xtask lint docs`. Next step: swap the host Future trait for the real
+  `StepOutcome`/reactor wrapper once the VM/VFS traits land; no blocker.
 - `cargo xtask ci` provides concise CI reporting with `txdoc:` references into
   the active design docs.
 - Active design docs now carry fine-grained `txdoc:` anchors; docs lint rejects
@@ -181,6 +247,106 @@
   covering the path from the current H3 sentinel/shutdown endpoint through
   CoreInit, zone/epoch/bus, trap shell, reactor/scheduler, VM, process/thread
   runtime, exec, first userspace, SMP coordination, and runtime boot tests.
+- Pre-substrate board smoke boot is now gated by
+  `PlatformConfig::SUBSTRATE_BOOT_READY`. RV64 QEMU opts in and still runs
+  substrate init, `init_later()`, and the kernel trap-vector install before its
+  sentinel. The first LA64 QEMU and RV64 M1 Dock mock wave kept the default
+  false gate, moved `_start` into platform crates, preserved firmware registers
+  into `rust_entry`, and reached smoke sentinels through board early consoles.
+  Verification: `cargo fmt --check`, `cargo xtask check`, all three
+  `cargo xtask build --target ...` lanes, all three QEMU smoke sentinel lanes,
+  `cargo xtask lint docs`, `cargo xtask progress validate`, and
+  `git diff --check`. Follow-up board-worker validation re-ran LA64 and M1
+  mock builds/smoke boots and confirmed the sentinels are emitted from the
+  generic `tx_kernel::kernel_main` path, not from board-local stubs.
+- LA64 QEMU and RV64 M1 Dock mock now publish board-owned memory and
+  bootstrap-pmap prep facts as the substrate-smoke prerequisite.
+  LA64 describes QEMU `virt` RAM `0x0..0x1000_0000`, reserves the low/kernel
+  loaded range, derives `kernel_image` from linker symbols, and exposes an
+  identity/direct bootstrap pmap description. M1 mock describes QEMU/OpenSBI
+  RAM `0x8000_0000..0x9000_0000`, the firmware loader gap
+  `0x8000_0000..0x8020_0000`, linker-derived `kernel_image`, and the current
+  identity/direct bootstrap pmap description. The first prep pass deliberately
+  left platform MMIO unclaimed until the boards had a clear pmap story.
+  Verification: board HAL unit tests, `cargo xtask check`, LA64/M1 builds and
+  smoke sentinels, plus RV64 QEMU substrate-ready smoke as a guardrail. The
+  follow-ups below record the PT-node allocator handoff and identity-MMIO
+  coverage that made substrate smoke stronger.
+- LA64 QEMU and RV64 M1 Dock mock now opt into substrate smoke after adding the
+  board-local typed PT-node allocator handoff required by
+  `tx_substrate::init::<P>()`. `SUBSTRATE_BOOT_READY=true` is now limited to
+  RV64 QEMU, LA64 QEMU, and the QEMU/OpenSBI M1 mock; LA64/M1 still expose no
+  fake direct-map extension, process-root, or general kernel pmap mutation.
+  Verification: board HAL unit tests, `cargo xtask check`, all three board
+  build lanes, all three QEMU smoke sentinel lanes, `cargo xtask lint docs`,
+  `cargo xtask progress validate`, and `git diff --check`. Next step:
+  implement real mapping/MMIO and process-root surfaces before BusyBox or real
+  K210 boot claims.
+- LA64 QEMU and RV64 M1 Dock mock now publish one UART MMIO region each and
+  implement the minimal pmap phase-3 response for the exact page-aligned
+  identity mapping already covered by their early boot execution model.
+  `PmapIf::reserve_kernel_mapping()` returns `Ok(None)` only for those
+  precovered identity UART pages; all other kernel mapping requests remain
+  `Unsupported`. Verification: board HAL unit tests plus LA64 and M1 QEMU
+  smoke sentinel lanes with nonempty `PlatformInfo.mmio_regions`. Next step:
+  replace this identity-precovered bridge with real LA64 DMW/MMU and M1 Sv39
+  mutation before enabling drivers or process roots on these boards.
+- The RV64 M1 Dock mock now has a high-VMA/low-LMA Sv39 bootstrap pmap. H1
+  stays in assembly until `satp` is live, maps QEMU RAM both through a temporary
+  low identity leaf and through the high direct map, maps the kernel at
+  `0xffff_ffff_8020_0000`, pre-covers the QEMU UART at its high direct-map
+  alias, rewrites `sp`/`gp`, and jumps to high `rust_entry`. Verification: M1
+  HAL unit tests, target build, `RUSTFLAGS=-Dunused` target check, and M1 QEMU
+  smoke. Still no real K210 hardware boot claim.
+- The RV64 M1 Dock mock pmap can now grow beyond the preinstalled UART L0:
+  high direct-map low-MMIO 4 KiB kernel mappings walk root/L1/L0 tables,
+  allocate missing L1/L0 tables through the installed `PtNodeAllocator`, carry
+  fresh nodes in `PmapReservationIntermediates`, roll back uncommitted
+  intermediates, and commit final leaf PTEs. Verification used a red-first unit
+  test for the next UART 2 MiB window, M1 HAL tests, target build,
+  `RUSTFLAGS=-Dunused` target check, and M1 QEMU smoke.
+- The RV64 M1 Dock mock now has committed low-MMIO kernel pmap lifecycle
+  coverage: commit records newly allocated PT-node intermediates, unmap clears
+  high direct-map 4 KiB low-MMIO leaves and prunes empty committed L0/L1 tables
+  back through their typed frame releasers, protect rewrites same-granularity
+  kernel leaves in place, and `shootdown_kernel_mapping()` issues the local
+  Sv39 fence on target. Verification: M1 HAL unit tests, scoped fmt check,
+  target build, `RUSTFLAGS=-Dunused` target check, M1 QEMU smoke sentinel,
+  docs lint, progress validation, and `git diff --check`. Next step: keep LA64
+  on its own DMW/MMU path and grow M1 process-root/ASID support without
+  claiming real K210 hardware boot.
+- The RV64 M1 Dock mock HAL crate is now split so `lib.rs` is a small platform
+  facade and `_start`, while `pmap.rs` owns topology constants, boot pmap
+  tables, BootInfo/BootstrapPmapInfo publication, the PT-node registry, kernel
+  mapping lifecycle hooks. The private pmap tests now live in
+  `src/pmap_tests.rs`, keeping current file sizes under the arch-lint cap:
+  `lib.rs` 375 lines, `pmap.rs` 1352 lines, and `pmap_tests.rs` 462 lines.
+  Verification: M1 HAL tests, target build, `RUSTFLAGS=-Dunused` target check,
+  M1 QEMU smoke sentinel, scoped fmt check, and arch lint. Next step: grow
+  VM/trap-facing behavior without bloating the platform facade.
+- The RV64 M1 Dock mock now implements the `PmapIf` process-root and ASID
+  surface for the QEMU/OpenSBI smoke lane. Process roots allocate a typed
+  page-table root, copy the bootstrap root's kernel high half, receive/reuse an
+  ASID from a fixed bitmap, materialize user 1 GiB / 2 MiB / 4 KiB mappings,
+  protect and unmap same-granularity leaves, prune committed user L0/L1 tables,
+  and issue local Sv39 fences for ASID-shaped shootdown. The private pmap tests
+  moved to `src/pmap_tests.rs`, leaving `lib.rs`, `pmap.rs`, and the test module
+  below the 1,500-line arch-lint cap. Verification: red-first process-root
+  tests, full M1 HAL tests, scoped fmt check, clippy, target build,
+  `RUSTFLAGS=-Dunused` target check, M1 QEMU smoke sentinel, arch/docs lints,
+  progress validation, and `git diff --check`. Aggregate `cargo xtask check`
+  is currently blocked outside this slice by `tx-ext4` Clippy
+  `manual_is_multiple_of` in `crates/tx-ext4/src/host_async.rs`. Next step:
+  keep VM/user runtime behind the later AddressSpace and trap-shell slices;
+  still no real K210 hardware boot claim.
+- Four parallel substrate/kernel-main follow-up worktrees are prepared from
+  `origin/main` commit `0857ab9`: reactor smoke
+  (`codex/reactor-smoke`), zone/index/mutation
+  (`codex/zone-index-mutation`), pmap root/ASID/shootdown
+  (`codex/pmap-root-asid-shootdown`), and trap/core-init
+  (`codex/trap-coreinit`). Their ownership, paths, and verification commands
+  are recorded under `docs/progress/worktrees/`; next step is per-lane planning
+  before implementation. No blocker.
 - `TrapIf` now includes typed trap snapshots and classification. RV64 QEMU
   decodes common synchronous faults and supervisor interrupts from `scause`;
   the direct-mode vector still panics/spins until the full saved-register
@@ -215,16 +381,28 @@
 - Real K210 boot, linker, and hardware path are not implemented yet.
 - OSComp FAT32 image/test runner integration is not yet a passing boot test.
 - LA64 target availability depends on local rustup support.
-- LA64 and M1 Dock mock boot protocols are compile-first only.
+- LA64 QEMU still needs process-root/ASID-equivalent pmap work. M1 Dock mock
+  now has local ASID-shaped process roots for QEMU/OpenSBI, but both LA64 and
+  M1 still need full VM/trap integration before they are user/VM-ready. Real
+  K210 boot is still out of scope.
 - RV64 QEMU still needs superpage/multi-frame map-count batching, remote-hart
   shootdown coordination, and the full trap shell before the page substrate is
   user/VM-ready.
 - ext4 image creation requires host `mkfs.ext4`.
+- `cargo xtask check` is currently blocked by an unrelated `tx-ext4` Clippy
+  `manual_is_multiple_of` finding in `crates/tx-ext4/src/host_async.rs`.
 - BusyBox images require `TX_BUSYBOX`; dynamic musl layouts also require
   `TX_MUSL_LIBC`.
 
 ## Latest Decisions
 
+- `docs/progress/decisions/2026-04-29-m1dock-mock-high-half-boot.md`
+- `docs/progress/decisions/2026-04-29-m1dock-mock-process-root-asid.md`
+- `docs/progress/decisions/2026-04-29-m1dock-mock-pmap-module-split.md`
+- `docs/progress/decisions/2026-04-29-m1dock-mock-kernel-unmap-protect.md`
+- `docs/progress/decisions/2026-04-29-m1dock-mock-pt-node-kernel-mapping.md`
+- `docs/progress/decisions/2026-04-29-la64-m1-memory-pmap-prep.md`
+- `docs/progress/decisions/2026-04-29-pre-substrate-smoke-gate.md`
 - `docs/progress/decisions/2026-04-29-rv64-high-vma-low-lma-linker.md`
 - `docs/progress/decisions/2026-04-29-rv64-low-linked-identity-retention.md`
 - `docs/progress/decisions/2026-04-28-pageallocator-token-interface.md`

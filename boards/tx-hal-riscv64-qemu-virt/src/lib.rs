@@ -176,6 +176,7 @@ const QEMU_VIRT_FALLBACK_RAM_SIZE: usize = 256 * 1024 * 1024;
 impl PlatformConfig for Platform {
     const ARCH: Arch = Arch::Riscv64;
     const BOARD: &'static str = "qemu-riscv64-virt";
+    const SUBSTRATE_BOOT_READY: bool = true;
     const PHYS_ADDR_BITS: u8 = 56;
     const VIRT_ADDR_BITS: u8 = 39;
     const DIRECT_MAP_BASE: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::DIRECT_MAP_BASE);
