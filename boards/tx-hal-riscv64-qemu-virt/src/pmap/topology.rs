@@ -31,6 +31,7 @@ use tx_hal::{PhysAddr, PmapError, PmapReserveKind};
 // Architectural and board address constants. The upper-half layout reserves a
 // direct map, a high kernel alias, and a small user-top helper band while the
 // bootstrap path temporarily keeps one low identity leaf.
+#[cfg(test)]
 pub(crate) const SV39_MODE: usize = 8;
 
 pub(crate) const SV39_USER_TOP: usize = 0x0000_0040_0000_0000;
@@ -87,6 +88,7 @@ pub(crate) fn validate_user_mapping_virt(
 
 // Indexing and address-construction helpers centralize the Sv39 bit slicing so
 // mapping code reads in terms of page-table levels rather than shifts.
+#[cfg(test)]
 pub(crate) fn bootstrap_satp_value(root: PhysAddr) -> usize {
     (SV39_MODE << 60) | (root.0 >> 12)
 }

@@ -211,7 +211,6 @@ mod tests {
         unsafe {
             BootStaticBag::<IdentityLive>::reset_global_for_test();
         }
-        BootStaticBag::<IdentityLive>::capture_once(dtb_addr);
 
         let handoff = Platform::boot_handoff(0, dtb_addr);
         let boot_info = Platform::boot_info();

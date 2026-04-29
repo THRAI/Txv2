@@ -37,26 +37,23 @@
   tests, RV64 no-std check/build, arch/docs/progress lints, and the RV64 QEMU
   smoke sentinel, with no parser blocker and the next step still the
   page-substrate boot handoff.
-- RV64 QEMU now enables an Sv39 bootstrap pmap before `rust_entry`: a temporary
-  1 GiB identity leaf for QEMU RAM, a high direct-map alias, a coarse high
-  kernel alias, richer bootstrap pmap facts, and a fixed early PT-node pool
-  exposed through `PmapIf`; `_start` rewrites `sp`/`gp` and jumps to the high
-  `rust_entry` alias, then a high sentinel proves PC/SP/GP are high while the
-  live low-linked path deliberately retains the low identity leaf. QEMU trace
-  showed `core::sync::atomic` can jump through compiler-generated tables
-  containing low linked text addresses after identity teardown; full live
-  teardown is blocked on a high-VMA/low-LMA linker or relocation slice. BootInfo
-  also marks `[0x8000_0000, 0x8020_0000)` reserved so allocator metadata is not
-  carved over OpenSBI/kernel-loader RAM. Verification: `cargo test -p
-  tx-hal-riscv64-qemu-virt` and `cargo xtask ci-slow`.
+- RV64 QEMU now uses a high-VMA/low-LMA linker layout. Firmware enters only the
+  low `.text.trampoline` at `0x8020_0000`; that assembly uses suffixed `_load`
+  symbols to clear BSS, build identity/direct-map/high-kernel page tables,
+  enable Sv39, rewrite `sp`/`gp`, and jump to high `rust_entry`. High Rust then
+  captures boot statics, publishes pmap facts, proves high PC/SP/GP, drops the
+  low identity leaf, and still reserves `[0x8000_0000, 0x8020_0000)` so
+  allocator metadata is not carved over OpenSBI/kernel-loader RAM. Verification:
+  `cargo test -p tx-hal-riscv64-qemu-virt`, ELF layout inspection, and
+  `cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel`.
 - RV64 QEMU centralizes Rust boot-static/linker-symbol address capture in a
-  single `BootStaticBag` authority; `_start` constructs
+  single `BootStaticBag` authority; high Rust constructs
   `BootStaticBag<IdentityLive>` once with the firmware DTB and boot/static
-  facts, the post-entry pipeline consumes it into the post-entry bag typestate
-  while the live low identity bridge remains mapped, and BootInfo,
-  PlatformInfo, bootstrap pmap roots, the kernel alias L1, and the PT-node pool
-  flow through named pre-entry and post-entry bag pipelines. `cargo xtask lint
-  arch` enforces that other board files do not recreate static address facts.
+  facts, then the post-entry pipeline consumes it into the post-entry bag
+  typestate after identity teardown. BootInfo, PlatformInfo, bootstrap pmap
+  roots, the kernel alias L1, and the PT-node pool flow through named bag
+  accessors. `cargo xtask lint arch` enforces that other board files do not
+  recreate static address facts.
 - RV64 QEMU pmap host tests now avoid manufacturing direct-map aliases from
   host static pointers. `BootStaticBag::pt_node_direct_va()` is target-only, and
   the boot PT-node pool test checks pool bookkeeping instead of adding the high
@@ -194,16 +191,16 @@
 - OSComp FAT32 image/test runner integration is not yet a passing boot test.
 - LA64 target availability depends on local rustup support.
 - LA64 and M1 Dock mock boot protocols are compile-first only.
-- RV64 QEMU still needs high-VMA/low-LMA linking or relocation before live
-  identity teardown. It also needs superpage/multi-frame map-count batching,
-  remote-hart shootdown coordination, and the full trap shell before the page
-  substrate is user/VM-ready.
+- RV64 QEMU still needs superpage/multi-frame map-count batching, remote-hart
+  shootdown coordination, and the full trap shell before the page substrate is
+  user/VM-ready.
 - ext4 image creation requires host `mkfs.ext4`.
 - BusyBox images require `TX_BUSYBOX`; dynamic musl layouts also require
   `TX_MUSL_LIBC`.
 
 ## Latest Decisions
 
+- `docs/progress/decisions/2026-04-29-rv64-high-vma-low-lma-linker.md`
 - `docs/progress/decisions/2026-04-29-rv64-low-linked-identity-retention.md`
 - `docs/progress/decisions/2026-04-28-pageallocator-token-interface.md`
 - `docs/progress/decisions/2026-04-29-code-reorganization-skill-and-line-limit.md`
