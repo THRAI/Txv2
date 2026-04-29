@@ -6,7 +6,7 @@ use core::{
 };
 use std::sync::{Arc, Mutex};
 
-use tx_reactor::wait::{Channel, Mask, WaitOutcome};
+use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
 use tx_reactor::{Reactor, RunStats, TaskId, TaskStatus};
 
 static READY_POLLS: AtomicUsize = AtomicUsize::new(0);
@@ -262,6 +262,65 @@ fn wait_channel_preserves_matching_wake_across_later_nonmatching_fire() {
         RunStats {
             polled: 4,
             completed: 3
+        }
+    );
+    assert_eq!(waiter_done.load(Ordering::SeqCst), 1);
+    assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Completed));
+}
+
+#[test]
+fn wait_event_rechecks_condition_after_spurious_wake() {
+    let channel = Channel::new();
+    let mask = Mask::from_bits(0x1);
+    let condition_ready = Arc::new(AtomicUsize::new(0));
+    let waiter_done = Arc::new(AtomicUsize::new(0));
+
+    let mut reactor = Reactor::new();
+    let waiter = {
+        let channel = channel.clone();
+        let condition_ready = Arc::clone(&condition_ready);
+        let waiter_done = Arc::clone(&waiter_done);
+        reactor.submit(async move {
+            let outcome = channel
+                .wait_event(mask, WaitProtocol::Interruptible, move || {
+                    condition_ready.load(Ordering::SeqCst) != 0
+                })
+                .await;
+            assert_eq!(outcome, WaitOutcome::Ready);
+            waiter_done.store(1, Ordering::SeqCst);
+        })
+    };
+
+    reactor.submit({
+        let channel = channel.clone();
+        async move {
+            assert_eq!(channel.fire(mask), 1);
+        }
+    });
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 3,
+            completed: 1
+        }
+    );
+    assert_eq!(waiter_done.load(Ordering::SeqCst), 0);
+    assert_eq!(reactor.task_status(waiter), Some(TaskStatus::Parked));
+
+    condition_ready.store(1, Ordering::SeqCst);
+    reactor.submit({
+        let channel = channel.clone();
+        async move {
+            assert_eq!(channel.fire(mask), 1);
+        }
+    });
+
+    assert_eq!(
+        reactor.run_until_idle(),
+        RunStats {
+            polled: 2,
+            completed: 2
         }
     );
     assert_eq!(waiter_done.load(Ordering::SeqCst), 1);
