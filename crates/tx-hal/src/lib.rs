@@ -615,35 +615,8 @@ pub trait PmapIf {
 }
 
 pub mod pmap;
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TrapClass {
-    InstructionPageFault,
-    LoadPageFault,
-    StorePageFault,
-    IllegalInstruction,
-    Breakpoint,
-    UserEnvCall,
-    SupervisorTimer,
-    SupervisorExternal,
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TrapFrameSnapshot {
-    pub scause: usize,
-    pub sepc: usize,
-    pub stval: usize,
-}
-
-pub trait TrapIf {
-    fn install_minimal_trap_vector() {}
-
-    fn install_kernel_trap_vector() {}
-
-    fn classify_trap(_snapshot: TrapFrameSnapshot) -> TrapClass {
-        TrapClass::Unknown
-    }
-}
+pub mod trap;
+pub use trap::{TrapClass, TrapFrameSnapshot, TrapIf, TrapPreviousMode, TrapSnapshot};
 pub trait UserAccessIf {}
 pub trait SignalFrameIf {}
 pub trait IrqIf {}
