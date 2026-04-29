@@ -1,0 +1,28 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-04-29-reactor-task-aware",
+  "created": "2026-04-29",
+  "updated": "2026-04-29",
+  "status": "closed",
+  "branch": "codex/reactor-task-aware",
+  "path": "/private/tmp/Tx-worktrees/codex-reactor-task-aware",
+  "base": "1fd968b",
+  "plan": "docs/progress/plans/2026-04-29-kernel-main-long-term-checklist.json",
+  "owner": "Codex reactor lane",
+  "write_scope": [
+    "crates/tx-reactor",
+    "docs/progress/STATUS.md",
+    "docs/progress/worktrees/2026-04-29-reactor-task-aware.json",
+    "docs/progress/plans/2026-04-29-kernel-main-long-term-checklist.json"
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test -p tx-reactor",
+    "cargo xtask lint unused",
+    "cargo xtask progress validate",
+    "cargo xtask ci",
+    "cargo xtask ci-slow",
+    "git diff --check"
+  ],
+  "notes": "Advances the reactor smoke executor into task-aware and first wait-channel/wait-adapt mechanics: submitted tasks enter a runnable queue, each task owns wake state used by its RawWaker, parked tasks become runnable only through their own waker, repeated wakes coalesce before the next poll, and task status is queryable for tests. The wait slices add Channel/Mask/WaitFuture/WaitProtocol/WaitOutcome so one task can park on a mask and another task can fire the channel; matching readiness is retained per waiter token until repoll, even if later nonmatching masks fire first. wait_event wraps the raw wake future with the REACTOR_v0 re-observation rule and re-parks after spurious wakes. Remaining reactor work: timer/signal classification hooks, AST/preemption slots, scheduler policy, and the long-running kernel loop."
+}

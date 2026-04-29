@@ -3,25 +3,26 @@
   "id": "2026-04-29-zone-index-mutation",
   "created": "2026-04-29",
   "updated": "2026-04-29",
-  "status": "active",
+  "status": "merged",
   "branch": "codex/zone-index-mutation",
   "path": "/private/tmp/Tx-worktrees/codex-zone-index-mutation",
   "base": "0857ab9",
   "plan": null,
   "owner": "Codex substrate primitives lane",
   "write_scope": [
-    "crates/tx-substrate/src/zone",
-    "crates/tx-substrate/src/index",
-    "crates/tx-substrate/src/mutation",
+    "crates/tx-substrate/src/lib.rs",
+    "crates/tx-substrate/src/epoch.rs",
+    "crates/tx-substrate/src/zone.rs",
+    "crates/tx-substrate/src/index.rs",
+    "crates/tx-substrate/src/mutation.rs",
     "crates/tx-substrate/tests/zone.rs",
     "crates/tx-substrate/tests/index.rs",
-    "crates/tx-substrate/tests/mutation.rs",
-    "docs/progress/worktrees/2026-04-29-zone-index-mutation.json"
+    "crates/tx-substrate/tests/mutation.rs"
   ],
   "verification": [
+    "cargo fmt --check",
     "cargo test -p tx-substrate",
-    "cargo xtask lint unused",
-    "cargo xtask progress validate"
+    "cargo xtask lint unused"
   ],
-  "notes": "Lane B for host-testable substrate primitives. It should implement or plan reserve/commit zone, index, and mutation helpers without touching HAL, QEMU boot, pmap, or reactor runtime integration. Shared docs/status updates are controller-owned during parallel work."
+  "notes": "Merged into codex/substrate-parallel-integration as d229964. Adds bounded host-testable epoch, zone, index, and mutation primitives. The epoch/guard surface is intentionally minimal and not full EBR."
 }

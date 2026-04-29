@@ -10,6 +10,7 @@ use crate::pmap::topology::{
     DIRECT_MAP_BASE, KERNEL_ALIAS_L0_TABLES, KERNEL_BOOTSTRAP_ALIAS_SIZE, KERNEL_VIRT_BASE,
     PAGE_SIZE, PT_NODE_POOL_ENTRIES, QEMU_KERNEL_PHYS_BASE,
 };
+use crate::time::QEMU_VIRT_FALLBACK_TIMEBASE_HZ;
 use crate::Platform;
 
 pub(crate) const MAX_MEMORY_REGIONS: usize = 8;
@@ -117,6 +118,7 @@ struct CmdlineCell(UnsafeCell<[u8; CMDLINE_CAPACITY]>);
 struct MemoryRegionsCell(UnsafeCell<[MemoryRegion; MAX_MEMORY_REGIONS]>);
 struct PlatformInfoCell(UnsafeCell<PlatformInfo>);
 struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; 4]>);
+struct TimebaseFrequencyCell(UnsafeCell<u64>);
 struct ReservedPageTablesCell(UnsafeCell<[PhysRange; BOOTSTRAP_PMAP_RESERVED_RANGES]>);
 struct PageTableCell(UnsafeCell<PageTable>);
 struct KernelAliasL0TablesCell(UnsafeCell<[PageTable; KERNEL_ALIAS_L0_TABLES]>);
@@ -129,6 +131,7 @@ unsafe impl Sync for CmdlineCell {}
 unsafe impl Sync for MemoryRegionsCell {}
 unsafe impl Sync for PlatformInfoCell {}
 unsafe impl Sync for PlatformMmioRegionsCell {}
+unsafe impl Sync for TimebaseFrequencyCell {}
 unsafe impl Sync for ReservedPageTablesCell {}
 unsafe impl Sync for PageTableCell {}
 unsafe impl Sync for KernelAliasL0TablesCell {}
@@ -144,9 +147,12 @@ static PLATFORM_INFO: PlatformInfoCell = PlatformInfoCell(UnsafeCell::new(Platfo
     board: "",
     spi_sd: None,
     mmio_regions: &[],
+    timebase_frequency_hz: QEMU_VIRT_FALLBACK_TIMEBASE_HZ,
 }));
 static PLATFORM_MMIO_REGIONS: PlatformMmioRegionsCell =
     PlatformMmioRegionsCell(UnsafeCell::new([empty_mmio_region(); 4]));
+static TIMEBASE_FREQUENCY_HZ: TimebaseFrequencyCell =
+    TimebaseFrequencyCell(UnsafeCell::new(QEMU_VIRT_FALLBACK_TIMEBASE_HZ));
 static RESERVED_PAGE_TABLES: ReservedPageTablesCell = ReservedPageTablesCell(UnsafeCell::new(
     [PhysRange::empty(); BOOTSTRAP_PMAP_RESERVED_RANGES],
 ));
@@ -372,6 +378,7 @@ impl BootStaticBag<IdentityLive> {
     pub(crate) unsafe fn reset_global_for_test() {
         unsafe {
             *STORED_BOOT_STATIC_BAG.0.get() = StoredBootStaticBag::Uninit;
+            *TIMEBASE_FREQUENCY_HZ.0.get() = QEMU_VIRT_FALLBACK_TIMEBASE_HZ;
         }
     }
 
@@ -593,8 +600,15 @@ impl<State> BootStaticBag<State> {
                 board: Platform::BOARD,
                 spi_sd: None,
                 mmio_regions: &mmio_regions[..],
+                timebase_frequency_hz: *TIMEBASE_FREQUENCY_HZ.0.get(),
             };
             platform_info
+        }
+    }
+
+    pub(crate) fn publish_timebase_frequency_hz(&self, frequency_hz: u64) {
+        unsafe {
+            *TIMEBASE_FREQUENCY_HZ.0.get() = frequency_hz;
         }
     }
 
