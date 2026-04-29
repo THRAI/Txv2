@@ -1,6 +1,7 @@
 [submodule "external/oscomp-autotest"]
 	path = external/oscomp-autotest
 	url = https://github.com/oscomp/autotest-for-oskernel
+	ignore = untracked
 [submodule "external/humanlayer-reference"]
 	path = external/humanlayer-reference
 	url = https://github.com/humanlayer/humanlayer
