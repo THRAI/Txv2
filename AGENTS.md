@@ -36,6 +36,10 @@ Start with:
 - Upper subsystems expose role-shaped types: `Cap<T>`, `PayloadCap<T>`, `Weak<T>`, `IdentRef<'g, T>`, witnesses, identity slots, and projection rows.
 - Active design docs carry grep-stable `txdoc:` tags. Use those tags in CI,
   review, and implementation-plan references.
+- For RV64 QEMU trap or fault logs, prefer `cargo xtask fault-decode
+  --target rv64-qemu` before hand-decoding `scause`/`sepc`/`stval`. The tool
+  handles low-linked and high-VMA ELF layouts, direct-map classification,
+  demangling, and conservative data code-pointer candidate tracing.
 - Before declaring any task complete, do a progress catch-up in
   `docs/progress/`: update `STATUS.md` and, when useful, close or update the
   relevant JSON plan/worktree/handoff or add a dated decision/research note.
