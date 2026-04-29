@@ -178,15 +178,20 @@
   `docs/progress/worktrees/2026-04-29-substrate-parallel-integration.json`.
   Next step: integrated verification and publishing; remaining design decision
   is the monomorphic kernel sink bridge for a future saved-register trap shell.
-- `tx-reactor` now has task-aware wake mechanics rather than a no-op waker:
+- `tx-reactor` now has task-aware wake and first wait-channel mechanics:
   tasks carry explicit `Runnable`/`Polling`/`Parked`/`Completed` status, enter a
   runnable queue on submit or task-local wake, and repeated wake calls coalesce
-  before the next poll. Focused tests cover per-task wake isolation, pending
-  wake idleness, and duplicate wake coalescing. Verification:
+  before the next poll. `wait::Channel`, `Mask`, `WaitFuture`, and
+  `WaitOutcome` now let a task park on a mask and let another task fire the
+  channel; matching waiter readiness is token-backed so later nonmatching fires
+  cannot erase a wake before the waiter is repolled. Focused tests cover
+  per-task wake isolation, pending wake idleness, duplicate wake coalescing,
+  task-to-task channel wake, and the matching-wake preservation edge.
+  Verification:
   `cargo fmt --check`, `cargo test -p tx-reactor`, `cargo xtask lint unused`,
   `cargo xtask progress validate`, `cargo xtask ci`, `cargo xtask ci-slow`, and
-  `git diff --check`; next step is wait-adapt channels plus the scheduler/idle
-  loop boundary.
+  `git diff --check`; next step is classified wait-adapt policy and the
+  scheduler/idle loop boundary.
 - `TrapIf` now includes typed trap snapshots and classification. RV64 QEMU
   decodes common synchronous faults and supervisor interrupts from `scause`;
   the direct-mode vector still panics/spins until the full saved-register

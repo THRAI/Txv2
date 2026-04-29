@@ -44,7 +44,204 @@ pub mod task {
 }
 
 pub mod wait {
-    pub struct WaitToken;
+    use alloc::{rc::Rc, vec::Vec};
+    use core::{
+        cell::RefCell,
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+
+    /// Bit mask naming the wait events a task cares about on a channel.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Mask(u64);
+
+    impl Mask {
+        pub const fn from_bits(bits: u64) -> Self {
+            Self(bits)
+        }
+
+        pub const fn bits(self) -> u64 {
+            self.0
+        }
+
+        pub const fn is_empty(self) -> bool {
+            self.0 == 0
+        }
+
+        const fn intersects(self, other: Self) -> bool {
+            self.0 & other.0 != 0
+        }
+    }
+
+    /// Classified wait result shape from REACTOR_v0.
+    ///
+    /// The v0 smoke implementation only produces `Ready`; the other variants
+    /// name the future interruption and timeout boundary so callers do not grow
+    /// a boolean-only API that would have to be broken later.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum WaitOutcome {
+        Ready,
+        Interrupted,
+        Killed,
+        TimedOut,
+    }
+
+    /// Reactor-owned wait channel.
+    ///
+    /// Channels are publication surfaces, not truth sources: firing a mask wakes
+    /// matching waiters, and the resumed task is still responsible for
+    /// re-observing the semantic condition before committing work.
+    #[derive(Clone)]
+    pub struct Channel {
+        state: Rc<RefCell<ChannelState>>,
+    }
+
+    struct ChannelState {
+        next_waiter: usize,
+        waiters: Vec<Waiter>,
+        ready: Vec<WaitToken>,
+    }
+
+    struct Waiter {
+        token: WaitToken,
+        mask: Mask,
+        waker: Waker,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct WaitToken(usize);
+
+    /// Future returned by `Channel::wait`.
+    pub struct WaitFuture {
+        channel: Channel,
+        mask: Mask,
+        token: Option<WaitToken>,
+    }
+
+    impl Channel {
+        pub fn new() -> Self {
+            Self {
+                state: Rc::new(RefCell::new(ChannelState {
+                    next_waiter: 0,
+                    waiters: Vec::new(),
+                    ready: Vec::new(),
+                })),
+            }
+        }
+
+        pub fn wait(&self, mask: Mask) -> WaitFuture {
+            WaitFuture {
+                channel: self.clone(),
+                mask,
+                token: None,
+            }
+        }
+
+        pub fn fire(&self, mask: Mask) -> usize {
+            if mask.is_empty() {
+                return 0;
+            }
+
+            let mut wakers = Vec::new();
+            {
+                let mut state = self.state.borrow_mut();
+                let mut index = 0;
+                while index < state.waiters.len() {
+                    if state.waiters[index].mask.intersects(mask) {
+                        let waiter = state.waiters.swap_remove(index);
+                        state.ready.push(waiter.token);
+                        wakers.push(waiter.waker);
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+
+            let woke = wakers.len();
+            for waker in wakers {
+                waker.wake();
+            }
+            woke
+        }
+
+        fn unregister(&self, token: WaitToken) {
+            let mut state = self.state.borrow_mut();
+            if let Some(index) = state
+                .waiters
+                .iter()
+                .position(|waiter| waiter.token == token)
+            {
+                state.waiters.swap_remove(index);
+            }
+            if let Some(index) = state.ready.iter().position(|ready| *ready == token) {
+                state.ready.swap_remove(index);
+            }
+        }
+    }
+
+    impl Default for Channel {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Future for WaitFuture {
+        type Output = WaitOutcome;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if this.mask.is_empty() {
+                return Poll::Ready(WaitOutcome::Ready);
+            }
+
+            let mut state = this.channel.state.borrow_mut();
+            match this.token {
+                Some(token) => {
+                    if let Some(index) = state.ready.iter().position(|ready| *ready == token) {
+                        state.ready.swap_remove(index);
+                        this.token = None;
+                        return Poll::Ready(WaitOutcome::Ready);
+                    }
+
+                    if let Some(waiter) = state
+                        .waiters
+                        .iter_mut()
+                        .find(|waiter| waiter.token == token)
+                    {
+                        waiter.mask = this.mask;
+                        waiter.waker = cx.waker().clone();
+                    } else {
+                        state.waiters.push(Waiter {
+                            token,
+                            mask: this.mask,
+                            waker: cx.waker().clone(),
+                        });
+                    }
+                }
+                None => {
+                    let token = WaitToken(state.next_waiter);
+                    state.next_waiter = state.next_waiter.wrapping_add(1);
+                    state.waiters.push(Waiter {
+                        token,
+                        mask: this.mask,
+                        waker: cx.waker().clone(),
+                    });
+                    this.token = Some(token);
+                }
+            }
+
+            Poll::Pending
+        }
+    }
+
+    impl Drop for WaitFuture {
+        fn drop(&mut self) {
+            if let Some(token) = self.token.take() {
+                self.channel.unregister(token);
+            }
+        }
+    }
 }
 
 pub use task::{TaskId, TaskStatus};
