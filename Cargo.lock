@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "fdt"
+version = "0.2.0-alpha2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8ccfb5c9d9425b2191070f0435636f4a9cdfedd107e33b15f861622b222726a"
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -116,6 +122,7 @@ dependencies = [
 name = "tx-hal-riscv64-qemu-virt"
 version = "0.1.0"
 dependencies = [
+ "fdt",
  "tx-hal",
 ]
 
