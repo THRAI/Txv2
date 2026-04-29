@@ -198,7 +198,7 @@
         "cargo test -p tx-kernel",
         "cargo xtask ci"
       ],
-      "notes": "In progress via docs/progress/worktrees/2026-04-29-reactor-task-aware.json. The current slice implements task-local wakers, task status, parked/runnable state, and duplicate wake coalescing in crates/tx-reactor. Remaining pieces still follow REACTOR_v0 and SCHEDULER_v0: wait-adapt channels, AST/preemption slots, scheduler policy, and the long-running idle loop."
+      "notes": "In progress via docs/progress/worktrees/2026-04-29-reactor-task-aware.json. The current slices implement task-local wakers, task status, parked/runnable state, duplicate wake coalescing, and first wait-channel mechanics in crates/tx-reactor: a task can park on Channel::wait(mask), another task can Channel::fire(mask), and matching readiness is retained per waiter token until repoll. Remaining pieces still follow REACTOR_v0 and SCHEDULER_v0: classified wait-adapt policy, AST/preemption slots, scheduler policy, and the long-running idle loop."
     },
     {
       "id": "vm-address-space-core",
