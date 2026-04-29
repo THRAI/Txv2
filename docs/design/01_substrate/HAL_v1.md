@@ -847,6 +847,13 @@ pub trait PmapIf {
 For RV64 QEMU's first bootstrap pmap, the kernel remains identity-linked and a
 single Sv39 1 GiB leaf maps the QEMU RAM window at `0x8000_0000`. This is a
 valid bootstrap map for the smoke path and for early substrate staging. The
+live low-linked boot path validates that PC/SP/GP have crossed to the high
+alias, but it keeps the low identity leaf mapped until the kernel is linked at
+its high VMA or the linker/relocation path can rewrite compiler-generated
+absolute tables. Explicit identity teardown remains a pmap operation under
+test, not a live substrate boot step yet. RV64 QEMU also publishes the
+OpenSBI/kernel-loader gap below `0x8020_0000` as reserved RAM so page-substrate
+metadata is not carved over firmware-owned pages. The
 full direct-map invariant below still governs the substrate-ready milestone:
 kernel high-half mapping, direct-map extension, reservation/commit/unmap, and
 global shootdown support must be implemented before real VM or userspace work.

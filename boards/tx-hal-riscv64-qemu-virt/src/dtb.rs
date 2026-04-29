@@ -217,8 +217,12 @@ mod tests {
         let boot_info = Platform::boot_info();
 
         assert_eq!(handoff.protocol, BootProtocol::RiscvSbi);
-        assert_eq!(boot_info.memory_regions.len(), 1);
+        assert_eq!(boot_info.memory_regions.len(), 2);
         assert_eq!(boot_info.memory_regions[0].base, PhysAddr(0x8000_0000));
+        assert_eq!(boot_info.memory_regions[0].kind, MemoryRegionKind::Usable);
+        assert_eq!(boot_info.memory_regions[1].base, PhysAddr(0x8000_0000));
+        assert_eq!(boot_info.memory_regions[1].size, 0x20_0000);
+        assert_eq!(boot_info.memory_regions[1].kind, MemoryRegionKind::Reserved);
         assert_eq!(
             boot_info.initrd,
             Some(PhysRange {

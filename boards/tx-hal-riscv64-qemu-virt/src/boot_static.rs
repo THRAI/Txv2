@@ -113,6 +113,8 @@ struct BootInfoCell(UnsafeCell<BootInfo>);
 struct BootstrapPmapInfoCell(UnsafeCell<Option<BootstrapPmapInfo>>);
 struct CmdlineCell(UnsafeCell<[u8; CMDLINE_CAPACITY]>);
 struct MemoryRegionsCell(UnsafeCell<[MemoryRegion; MAX_MEMORY_REGIONS]>);
+struct PlatformInfoCell(UnsafeCell<PlatformInfo>);
+struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; 4]>);
 struct ReservedPageTablesCell(UnsafeCell<[PhysRange; BOOTSTRAP_PMAP_RESERVED_RANGES]>);
 struct PageTableCell(UnsafeCell<PageTable>);
 struct KernelAliasL0TablesCell(UnsafeCell<[PageTable; KERNEL_ALIAS_L0_TABLES]>);
@@ -123,6 +125,8 @@ unsafe impl Sync for BootInfoCell {}
 unsafe impl Sync for BootstrapPmapInfoCell {}
 unsafe impl Sync for CmdlineCell {}
 unsafe impl Sync for MemoryRegionsCell {}
+unsafe impl Sync for PlatformInfoCell {}
+unsafe impl Sync for PlatformMmioRegionsCell {}
 unsafe impl Sync for ReservedPageTablesCell {}
 unsafe impl Sync for PageTableCell {}
 unsafe impl Sync for KernelAliasL0TablesCell {}
@@ -134,6 +138,13 @@ static BOOTSTRAP_PMAP_INFO: BootstrapPmapInfoCell = BootstrapPmapInfoCell(Unsafe
 static CMDLINE: CmdlineCell = CmdlineCell(UnsafeCell::new([0; CMDLINE_CAPACITY]));
 static MEMORY_REGIONS: MemoryRegionsCell =
     MemoryRegionsCell(UnsafeCell::new([reserved_region(); MAX_MEMORY_REGIONS]));
+static PLATFORM_INFO: PlatformInfoCell = PlatformInfoCell(UnsafeCell::new(PlatformInfo {
+    board: "",
+    spi_sd: None,
+    mmio_regions: &[],
+}));
+static PLATFORM_MMIO_REGIONS: PlatformMmioRegionsCell =
+    PlatformMmioRegionsCell(UnsafeCell::new([empty_mmio_region(); 4]));
 static RESERVED_PAGE_TABLES: ReservedPageTablesCell = ReservedPageTablesCell(UnsafeCell::new(
     [PhysRange::empty(); BOOTSTRAP_PMAP_RESERVED_RANGES],
 ));
@@ -151,62 +162,67 @@ const MMIO_RW_DEVICE: MmioFlags = MmioFlags::DEVICE_NGNRNE
     .union(MmioFlags::READ)
     .union(MmioFlags::WRITE);
 
-static MMIO_REGIONS: [MmioRegion; 4] = [
+const fn empty_mmio_region() -> MmioRegion {
     MmioRegion {
-        name: "clint",
-        phys: PhysRange {
-            start: PhysAddr(0x0200_0000),
-            size: 0x1_0000,
-        },
-        virt: VirtRange {
-            start: VirtAddr(DIRECT_MAP_BASE + 0x0200_0000),
-            size: 0x1_0000,
-        },
-        flags: MMIO_RW_DEVICE,
-    },
-    MmioRegion {
-        name: "plic",
-        phys: PhysRange {
-            start: PhysAddr(0x0c00_0000),
-            size: 0x400_0000,
-        },
-        virt: VirtRange {
-            start: VirtAddr(DIRECT_MAP_BASE + 0x0c00_0000),
-            size: 0x400_0000,
-        },
-        flags: MMIO_RW_DEVICE,
-    },
-    MmioRegion {
-        name: "uart0",
-        phys: PhysRange {
-            start: PhysAddr(0x1000_0000),
-            size: 0x1000,
-        },
-        virt: VirtRange {
-            start: VirtAddr(DIRECT_MAP_BASE + 0x1000_0000),
-            size: 0x1000,
-        },
-        flags: MMIO_RW_DEVICE,
-    },
-    MmioRegion {
-        name: "virtio0",
-        phys: PhysRange {
-            start: PhysAddr(0x1000_1000),
-            size: 0x1000,
-        },
-        virt: VirtRange {
-            start: VirtAddr(DIRECT_MAP_BASE + 0x1000_1000),
-            size: 0x1000,
-        },
-        flags: MMIO_RW_DEVICE,
-    },
-];
+        name: "",
+        phys: PhysRange::empty(),
+        virt: VirtRange::empty(),
+        flags: MmioFlags::empty(),
+    }
+}
 
-static PLATFORM_INFO: PlatformInfo = PlatformInfo {
-    board: Platform::BOARD,
-    spi_sd: None,
-    mmio_regions: &MMIO_REGIONS,
-};
+fn qemu_mmio_regions() -> [MmioRegion; 4] {
+    [
+        MmioRegion {
+            name: "clint",
+            phys: PhysRange {
+                start: PhysAddr(0x0200_0000),
+                size: 0x1_0000,
+            },
+            virt: VirtRange {
+                start: VirtAddr(DIRECT_MAP_BASE + 0x0200_0000),
+                size: 0x1_0000,
+            },
+            flags: MMIO_RW_DEVICE,
+        },
+        MmioRegion {
+            name: "plic",
+            phys: PhysRange {
+                start: PhysAddr(0x0c00_0000),
+                size: 0x400_0000,
+            },
+            virt: VirtRange {
+                start: VirtAddr(DIRECT_MAP_BASE + 0x0c00_0000),
+                size: 0x400_0000,
+            },
+            flags: MMIO_RW_DEVICE,
+        },
+        MmioRegion {
+            name: "uart0",
+            phys: PhysRange {
+                start: PhysAddr(0x1000_0000),
+                size: 0x1000,
+            },
+            virt: VirtRange {
+                start: VirtAddr(DIRECT_MAP_BASE + 0x1000_0000),
+                size: 0x1000,
+            },
+            flags: MMIO_RW_DEVICE,
+        },
+        MmioRegion {
+            name: "virtio0",
+            phys: PhysRange {
+                start: PhysAddr(0x1000_1000),
+                size: 0x1000,
+            },
+            virt: VirtRange {
+                start: VirtAddr(DIRECT_MAP_BASE + 0x1000_1000),
+                size: 0x1000,
+            },
+            flags: MMIO_RW_DEVICE,
+        },
+    ]
+}
 
 enum StoredBootStaticBag {
     Uninit,
@@ -547,7 +563,18 @@ impl<State> BootStaticBag<State> {
     }
 
     pub(crate) fn platform_info_ref(&self) -> &'static PlatformInfo {
-        &PLATFORM_INFO
+        unsafe {
+            let mmio_regions = &mut *PLATFORM_MMIO_REGIONS.0.get();
+            *mmio_regions = qemu_mmio_regions();
+
+            let platform_info = &mut *PLATFORM_INFO.0.get();
+            *platform_info = PlatformInfo {
+                board: Platform::BOARD,
+                spi_sd: None,
+                mmio_regions: &mmio_regions[..],
+            };
+            platform_info
+        }
     }
 
     pub(crate) fn kernel_image_phys(&self) -> PhysRange {
