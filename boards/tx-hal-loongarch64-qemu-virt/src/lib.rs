@@ -14,6 +14,7 @@ static PLATFORM_INFO: PlatformInfo = PlatformInfo {
     board: Platform::BOARD,
     spi_sd: None,
     mmio_regions: &[],
+    timebase_frequency_hz: 0,
 };
 
 impl PlatformConfig for Platform {
@@ -51,7 +52,19 @@ impl TrapIf for Platform {}
 impl UserAccessIf for Platform {}
 impl SignalFrameIf for Platform {}
 impl IrqIf for Platform {}
-impl TimeIf for Platform {}
+impl TimeIf for Platform {
+    fn read_ns() -> u64 {
+        0
+    }
+
+    fn set_deadline_ns(_deadline: u64) {}
+
+    fn cancel_deadline() {}
+
+    fn frequency_hz() -> u64 {
+        PLATFORM_INFO.timebase_frequency_hz
+    }
+}
 impl PercpuIf for Platform {}
 impl CacheIf for Platform {}
 impl DmaIf for Platform {}

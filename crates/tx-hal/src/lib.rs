@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod time;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Arch {
     Riscv64,
@@ -153,6 +155,7 @@ pub struct PlatformInfo {
     pub board: &'static str,
     pub spi_sd: Option<SpiSdInfo>,
     pub mmio_regions: &'static [MmioRegion],
+    pub timebase_frequency_hz: u64,
 }
 
 pub trait PlatformConfig {
@@ -641,7 +644,28 @@ pub use trap::{TrapClass, TrapFrameSnapshot, TrapIf, TrapPreviousMode, TrapSnaps
 pub trait UserAccessIf {}
 pub trait SignalFrameIf {}
 pub trait IrqIf {}
-pub trait TimeIf {}
+pub trait TimeIf {
+    /// Read monotonic nanoseconds since the platform's boot-time epoch.
+    ///
+    /// Values must be non-decreasing on the current hart and cheap enough for
+    /// scheduler/reactor hot paths.
+    fn read_ns() -> u64;
+
+    /// Program the current hart's timer for an absolute monotonic deadline.
+    ///
+    /// `deadline` uses the same nanosecond epoch as `read_ns()`. Platforms
+    /// must not intentionally arm an earlier hardware deadline than requested;
+    /// interrupts may arrive late due to firmware, hardware, or emulator
+    /// latency. A past deadline should fire as soon as the platform can arrange.
+    fn set_deadline_ns(deadline: u64);
+
+    /// Cancel the current hart's pending timer deadline when the platform has
+    /// a cancellation mechanism.
+    fn cancel_deadline();
+
+    /// Return the hardware timer frequency used for ns/tick conversion.
+    fn frequency_hz() -> u64;
+}
 pub trait PercpuIf {}
 pub trait CacheIf {}
 pub trait DmaIf {}
