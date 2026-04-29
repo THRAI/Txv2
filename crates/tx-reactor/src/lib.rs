@@ -1,12 +1,21 @@
 #![no_std]
+//! Minimal task-aware reactor machinery.
+//!
+//! This crate is still below the full REACTOR_v0 contract: there are no wait
+//! channels, timers, AST slots, scheduler policy hooks, or long-running idle
+//! loop yet. The implemented invariant is narrower and load-bearing for those
+//! later pieces: each submitted task owns the wake state used by its `Waker`,
+//! so a wake marks exactly that task runnable and does not authorize semantic
+//! truth. The future must re-observe its condition on the next poll.
 
 extern crate alloc;
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 use core::{
     future::Future,
     pin::Pin,
-    task::{Context, RawWaker, RawWakerVTable, Waker},
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
 pub mod ast {
@@ -20,13 +29,25 @@ pub mod preempt {
 pub mod task {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct TaskId(pub usize);
+
+    /// Current reactor-visible state of a task future.
+    ///
+    /// These states describe polling mechanics only. They are not thread,
+    /// process, or subsystem state, and do not carry object-model authority.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum TaskStatus {
+        Runnable,
+        Polling,
+        Parked,
+        Completed,
+    }
 }
 
 pub mod wait {
     pub struct WaitToken;
 }
 
-pub use task::TaskId;
+pub use task::{TaskId, TaskStatus};
 
 type TaskFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 
@@ -38,18 +59,51 @@ pub struct RunStats {
 
 pub struct Reactor {
     tasks: Vec<Task>,
+    runnable: VecDeque<usize>,
     next_task_id: usize,
 }
 
 struct Task {
+    id: TaskId,
     future: Option<TaskFuture>,
-    runnable: bool,
+    status: TaskStatus,
+    wake_state: Arc<TaskWakeState>,
+}
+
+/// Shared state behind every waker cloned from a task poll.
+///
+/// A single atomic bit is enough for the v0 smoke executor: multiple wake calls
+/// before the next drain coalesce into one runnable transition, and the future
+/// decides on poll whether the underlying wait condition actually became true.
+struct TaskWakeState {
+    wake_requested: AtomicBool,
+}
+
+impl TaskWakeState {
+    fn new() -> Self {
+        Self {
+            wake_requested: AtomicBool::new(false),
+        }
+    }
+
+    fn wake(&self) {
+        self.wake_requested.store(true, Ordering::Release);
+    }
+
+    fn take_wake(&self) -> bool {
+        self.wake_requested.swap(false, Ordering::AcqRel)
+    }
+
+    fn clear(&self) {
+        self.wake_requested.store(false, Ordering::Release);
+    }
 }
 
 impl Reactor {
     pub fn new() -> Self {
         Self {
             tasks: Vec::new(),
+            runnable: VecDeque::new(),
             next_task_id: 0,
         }
     }
@@ -60,10 +114,14 @@ impl Reactor {
     {
         let id = TaskId(self.next_task_id);
         self.next_task_id += 1;
+        let index = self.tasks.len();
         self.tasks.push(Task {
+            id,
             future: Some(Box::pin(future)),
-            runnable: true,
+            status: TaskStatus::Runnable,
+            wake_state: Arc::new(TaskWakeState::new()),
         });
+        self.runnable.push_back(index);
         id
     }
 
@@ -72,21 +130,54 @@ impl Reactor {
             polled: 0,
             completed: 0,
         };
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        while let Some(index) = self.next_runnable_task_index() {
-            let task = &mut self.tasks[index];
-            task.runnable = false;
-
-            let Some(future) = task.future.as_mut() else {
-                continue;
+        loop {
+            // External wakers only set a task-local bit. The reactor owns the
+            // transition from Parked to Runnable and does it at poll-loop
+            // boundaries, where duplicate wakes naturally coalesce.
+            self.drain_wakes();
+            let Some(index) = self.runnable.pop_front() else {
+                break;
             };
 
-            stats.polled += 1;
-            if future.as_mut().poll(&mut cx).is_ready() {
-                task.future = None;
-                stats.completed += 1;
+            if self.tasks[index].status != TaskStatus::Runnable
+                || self.tasks[index].future.is_none()
+            {
+                continue;
+            }
+
+            let wake_state = Arc::clone(&self.tasks[index].wake_state);
+            let waker = task_waker(wake_state);
+            let mut cx = Context::from_waker(&waker);
+
+            let poll = {
+                let task = &mut self.tasks[index];
+                debug_assert_eq!(task.id.0, index);
+                task.status = TaskStatus::Polling;
+                task.wake_state.clear();
+
+                let Some(future) = task.future.as_mut() else {
+                    continue;
+                };
+
+                stats.polled += 1;
+                future.as_mut().poll(&mut cx)
+            };
+
+            match poll {
+                Poll::Ready(()) => {
+                    let task = &mut self.tasks[index];
+                    task.future = None;
+                    task.status = TaskStatus::Completed;
+                    task.wake_state.clear();
+                    stats.completed += 1;
+                }
+                Poll::Pending => {
+                    if self.tasks[index].wake_state.take_wake() {
+                        self.enqueue_runnable(index);
+                    } else {
+                        self.tasks[index].status = TaskStatus::Parked;
+                    }
+                }
             }
         }
 
@@ -94,13 +185,32 @@ impl Reactor {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.next_runnable_task_index().is_none()
+        self.tasks.iter().all(|task| {
+            task.status != TaskStatus::Runnable
+                && !task.wake_state.wake_requested.load(Ordering::Acquire)
+        })
     }
 
-    fn next_runnable_task_index(&self) -> Option<usize> {
-        self.tasks
-            .iter()
-            .position(|task| task.runnable && task.future.is_some())
+    pub fn task_status(&self, task: TaskId) -> Option<TaskStatus> {
+        self.tasks.get(task.0).map(|entry| entry.status)
+    }
+
+    fn drain_wakes(&mut self) {
+        for index in 0..self.tasks.len() {
+            if self.tasks[index].wake_state.take_wake()
+                && self.tasks[index].status == TaskStatus::Parked
+            {
+                self.enqueue_runnable(index);
+            }
+        }
+    }
+
+    fn enqueue_runnable(&mut self, index: usize) {
+        let task = &mut self.tasks[index];
+        if task.future.is_some() && task.status != TaskStatus::Runnable {
+            task.status = TaskStatus::Runnable;
+            self.runnable.push_back(index);
+        }
     }
 }
 
@@ -110,34 +220,39 @@ impl Default for Reactor {
     }
 }
 
-fn noop_waker() -> Waker {
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(
-        noop_waker_clone,
-        noop_waker_wake,
-        noop_waker_wake_by_ref,
-        noop_waker_drop,
-    );
-
-    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+fn task_waker(state: Arc<TaskWakeState>) -> Waker {
+    unsafe { Waker::from_raw(raw_task_waker(state)) }
 }
 
-unsafe fn noop_waker_clone(_data: *const ()) -> RawWaker {
-    noop_raw_waker()
+fn raw_task_waker(state: Arc<TaskWakeState>) -> RawWaker {
+    RawWaker::new(Arc::into_raw(state) as *const (), &TASK_WAKER_VTABLE)
 }
 
-unsafe fn noop_waker_wake(_data: *const ()) {}
+const TASK_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    task_waker_clone,
+    task_waker_wake,
+    task_waker_wake_by_ref,
+    task_waker_drop,
+);
 
-unsafe fn noop_waker_wake_by_ref(_data: *const ()) {}
+unsafe fn task_waker_clone(data: *const ()) -> RawWaker {
+    let state = unsafe { Arc::from_raw(data as *const TaskWakeState) };
+    let cloned = Arc::clone(&state);
+    let _ = Arc::into_raw(state);
+    raw_task_waker(cloned)
+}
 
-unsafe fn noop_waker_drop(_data: *const ()) {}
+unsafe fn task_waker_wake(data: *const ()) {
+    let state = unsafe { Arc::from_raw(data as *const TaskWakeState) };
+    state.wake();
+}
 
-fn noop_raw_waker() -> RawWaker {
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(
-        noop_waker_clone,
-        noop_waker_wake,
-        noop_waker_wake_by_ref,
-        noop_waker_drop,
-    );
+unsafe fn task_waker_wake_by_ref(data: *const ()) {
+    let state = unsafe { Arc::from_raw(data as *const TaskWakeState) };
+    state.wake();
+    let _ = Arc::into_raw(state);
+}
 
-    RawWaker::new(core::ptr::null(), &VTABLE)
+unsafe fn task_waker_drop(data: *const ()) {
+    drop(unsafe { Arc::from_raw(data as *const TaskWakeState) });
 }

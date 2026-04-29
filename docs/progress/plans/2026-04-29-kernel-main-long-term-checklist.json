@@ -183,12 +183,13 @@
     {
       "id": "reactor-and-round-robin-scheduler",
       "title": "Implement reactor task table, wait-adapt, wakers, idle, and MVP scheduler",
-      "status": "pending",
+      "status": "in-progress",
       "depends_on": [
         "zone-epoch-bus-foundation",
         "percpu-smp-gates"
       ],
       "paths": [
+        "crates/tx-reactor",
         "crates/tx-kernel/src/reactor",
         "crates/tx-kernel/src/scheduler",
         "crates/tx-kernel/src/lib.rs"
@@ -197,7 +198,7 @@
         "cargo test -p tx-kernel",
         "cargo xtask ci"
       ],
-      "notes": "Follow REACTOR_v0 and SCHEDULER_v0: tasks are temporal handles, not entities; steps never call reactor; scripts translate Blocked outcomes into wait-adapt calls; wakers are cheap and do not grant truth; phase-1 scheduler is round-robin with fixed slice and idle when no runnable task exists."
+      "notes": "In progress via docs/progress/worktrees/2026-04-29-reactor-task-aware.json. The current slice implements task-local wakers, task status, parked/runnable state, and duplicate wake coalescing in crates/tx-reactor. Remaining pieces still follow REACTOR_v0 and SCHEDULER_v0: wait-adapt channels, AST/preemption slots, scheduler policy, and the long-running idle loop."
     },
     {
       "id": "vm-address-space-core",
