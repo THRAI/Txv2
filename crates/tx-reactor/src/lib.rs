@@ -1,13 +1,13 @@
 #![no_std]
 //! Minimal task-aware reactor machinery.
 //!
-//! This crate is still below the full REACTOR_v0 contract: timers, signal
-//! interruption, AST slots, scheduler policy hooks, and the long-running idle
-//! loop are not implemented yet. The implemented invariant is narrower and
-//! load-bearing for those later pieces: each submitted task owns the wake state
-//! used by its `Waker`, so a wake marks exactly that task runnable and does not
-//! authorize semantic truth. `wait_event` makes that re-observation rule
-//! explicit by rechecking its condition after every channel wake.
+//! This crate is still below the full REACTOR_v0 contract: signal interruption,
+//! AST slots, scheduler policy hooks, and the long-running idle loop are not
+//! implemented yet. The implemented invariant is narrower and load-bearing for
+//! those later pieces: each submitted task owns the wake state used by its
+//! `Waker`, so a wake marks exactly that task runnable and does not authorize
+//! semantic truth. `wait_event` makes that re-observation rule explicit by
+//! rechecking its condition after every channel wake or timeout wake.
 
 extern crate alloc;
 
@@ -51,7 +51,6 @@ pub mod wait {
         future::Future,
         pin::Pin,
         task::{Context, Poll, Waker},
-        time::Duration,
     };
 
     /// Bit mask naming the wait events a task cares about on a channel.
@@ -77,24 +76,32 @@ pub mod wait {
     }
 
     /// Script-selected wait policy.
-    ///
-    /// The current reactor has no signal or timer injection path, so
-    /// `wait_event` only completes with `Ready`. The full protocol shape is
-    /// present now so scripts can be typed against REACTOR_v0 without learning
-    /// a temporary boolean wait API.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum WaitProtocol {
         Uninterruptible,
         Interruptible,
         Killable,
-        InterruptibleTimeout(Duration),
-        KillableTimeout(Duration),
+        /// Interruptible wait with an absolute nanosecond deadline.
+        InterruptibleTimeout(u64),
+        /// Killable wait with an absolute nanosecond deadline.
+        KillableTimeout(u64),
+    }
+
+    impl WaitProtocol {
+        const fn deadline_ns(self) -> Option<u64> {
+            match self {
+                Self::InterruptibleTimeout(deadline_ns) | Self::KillableTimeout(deadline_ns) => {
+                    Some(deadline_ns)
+                }
+                Self::Uninterruptible | Self::Interruptible | Self::Killable => None,
+            }
+        }
     }
 
     /// Classified wait result shape from REACTOR_v0.
     ///
-    /// The v0 smoke implementation only produces `Ready`; the other variants
-    /// name the future interruption and timeout boundary so callers do not grow
+    /// The v0 smoke implementation produces `Ready` and timeout outcomes. The
+    /// other variants name future interruption boundaries so callers do not grow
     /// a boolean-only API that would have to be broken later.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum WaitOutcome {
@@ -112,6 +119,7 @@ pub mod wait {
     #[derive(Clone)]
     pub struct Channel {
         state: Rc<RefCell<ChannelState>>,
+        timers: Option<TimerQueue>,
     }
 
     struct ChannelState {
@@ -129,6 +137,32 @@ pub mod wait {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct WaitToken(usize);
 
+    #[derive(Clone)]
+    pub(crate) struct TimerQueue {
+        state: Rc<RefCell<TimerQueueState>>,
+    }
+
+    struct TimerQueueState {
+        now_ns: u64,
+        next_timer: usize,
+        timers: Vec<TimerWaiter>,
+    }
+
+    struct TimerWaiter {
+        token: TimerToken,
+        deadline_ns: u64,
+        waker: Waker,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TimerToken(usize);
+
+    struct DeadlineFuture {
+        timers: TimerQueue,
+        deadline_ns: u64,
+        token: Option<TimerToken>,
+    }
+
     /// Future returned by `Channel::wait`.
     pub struct WaitFuture {
         channel: Channel,
@@ -143,9 +177,64 @@ pub mod wait {
         protocol: WaitProtocol,
         condition: C,
         wait: Option<WaitFuture>,
+        timer: Option<DeadlineFuture>,
+    }
+
+    impl TimerQueue {
+        pub(crate) fn new() -> Self {
+            Self {
+                state: Rc::new(RefCell::new(TimerQueueState {
+                    now_ns: 0,
+                    next_timer: 0,
+                    timers: Vec::new(),
+                })),
+            }
+        }
+
+        pub(crate) fn advance_time_to(&self, now_ns: u64) -> usize {
+            let mut wakers = Vec::new();
+            {
+                let mut state = self.state.borrow_mut();
+                state.now_ns = state.now_ns.max(now_ns);
+                let mut index = 0;
+                while index < state.timers.len() {
+                    if state.timers[index].deadline_ns <= state.now_ns {
+                        let waiter = state.timers.swap_remove(index);
+                        wakers.push(waiter.waker);
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+
+            let woke = wakers.len();
+            for waker in wakers {
+                waker.wake();
+            }
+            woke
+        }
+
+        fn wait_until(&self, deadline_ns: u64) -> DeadlineFuture {
+            DeadlineFuture {
+                timers: self.clone(),
+                deadline_ns,
+                token: None,
+            }
+        }
+
+        fn unregister(&self, token: TimerToken) {
+            let mut state = self.state.borrow_mut();
+            if let Some(index) = state.timers.iter().position(|waiter| waiter.token == token) {
+                state.timers.swap_remove(index);
+            }
+        }
     }
 
     impl Channel {
+        /// Creates an event-only wait channel.
+        ///
+        /// Timeout-capable wait channels are produced by `Reactor::channel()`
+        /// so they share the reactor's deadline queue and clock source.
         pub fn new() -> Self {
             Self {
                 state: Rc::new(RefCell::new(ChannelState {
@@ -153,6 +242,19 @@ pub mod wait {
                     waiters: Vec::new(),
                     ready: Vec::new(),
                 })),
+                timers: None,
+            }
+        }
+
+        /// Creates a channel wired to a reactor-owned timer queue.
+        pub(crate) fn with_timer_queue(timers: TimerQueue) -> Self {
+            Self {
+                state: Rc::new(RefCell::new(ChannelState {
+                    next_waiter: 0,
+                    waiters: Vec::new(),
+                    ready: Vec::new(),
+                })),
+                timers: Some(timers),
             }
         }
 
@@ -179,6 +281,7 @@ pub mod wait {
                 protocol,
                 condition,
                 wait: None,
+                timer: None,
             }
         }
 
@@ -287,6 +390,56 @@ pub mod wait {
         }
     }
 
+    impl Future for DeadlineFuture {
+        type Output = WaitOutcome;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            let mut state = this.timers.state.borrow_mut();
+            if state.now_ns >= this.deadline_ns {
+                this.token = None;
+                return Poll::Ready(WaitOutcome::TimedOut);
+            }
+
+            match this.token {
+                Some(token) => {
+                    if let Some(waiter) =
+                        state.timers.iter_mut().find(|waiter| waiter.token == token)
+                    {
+                        waiter.deadline_ns = this.deadline_ns;
+                        waiter.waker = cx.waker().clone();
+                    } else {
+                        state.timers.push(TimerWaiter {
+                            token,
+                            deadline_ns: this.deadline_ns,
+                            waker: cx.waker().clone(),
+                        });
+                    }
+                }
+                None => {
+                    let token = TimerToken(state.next_timer);
+                    state.next_timer = state.next_timer.wrapping_add(1);
+                    state.timers.push(TimerWaiter {
+                        token,
+                        deadline_ns: this.deadline_ns,
+                        waker: cx.waker().clone(),
+                    });
+                    this.token = Some(token);
+                }
+            }
+
+            Poll::Pending
+        }
+    }
+
+    impl Drop for DeadlineFuture {
+        fn drop(&mut self) {
+            if let Some(token) = self.token.take() {
+                self.timers.unregister(token);
+            }
+        }
+    }
+
     impl<C> Future for WaitEventFuture<C>
     where
         C: FnMut() -> bool + Unpin,
@@ -295,12 +448,26 @@ pub mod wait {
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
-            let _ = this.protocol;
+            let deadline_ns = this.protocol.deadline_ns();
 
             loop {
                 if (this.condition)() {
                     this.wait = None;
+                    this.timer = None;
                     return Poll::Ready(WaitOutcome::Ready);
+                }
+
+                if let Some(deadline_ns) = deadline_ns {
+                    if let Some(timers) = this.channel.timers.as_ref() {
+                        let timer = this
+                            .timer
+                            .get_or_insert_with(|| timers.wait_until(deadline_ns));
+                        if Pin::new(timer).poll(cx).is_ready() {
+                            this.wait = None;
+                            this.timer = None;
+                            return Poll::Ready(WaitOutcome::TimedOut);
+                        }
+                    }
                 }
 
                 if this.mask.is_empty() {
@@ -339,6 +506,7 @@ pub struct Reactor {
     tasks: Vec<Task>,
     runnable: VecDeque<usize>,
     next_task_id: usize,
+    timers: wait::TimerQueue,
 }
 
 struct Task {
@@ -383,7 +551,18 @@ impl Reactor {
             tasks: Vec::new(),
             runnable: VecDeque::new(),
             next_task_id: 0,
+            timers: wait::TimerQueue::new(),
         }
+    }
+
+    /// Creates a wait channel attached to this reactor's timer queue.
+    pub fn channel(&self) -> wait::Channel {
+        wait::Channel::with_timer_queue(self.timers.clone())
+    }
+
+    /// Advances the reactor-owned absolute nanosecond clock and wakes expired timers.
+    pub fn advance_time_to(&mut self, now_ns: u64) -> usize {
+        self.timers.advance_time_to(now_ns)
     }
 
     pub fn submit<F>(&mut self, future: F) -> TaskId
