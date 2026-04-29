@@ -178,6 +178,15 @@
   `docs/progress/worktrees/2026-04-29-substrate-parallel-integration.json`.
   Next step: integrated verification and publishing; remaining design decision
   is the monomorphic kernel sink bridge for a future saved-register trap shell.
+- `tx-reactor` now has task-aware wake mechanics rather than a no-op waker:
+  tasks carry explicit `Runnable`/`Polling`/`Parked`/`Completed` status, enter a
+  runnable queue on submit or task-local wake, and repeated wake calls coalesce
+  before the next poll. Focused tests cover per-task wake isolation, pending
+  wake idleness, and duplicate wake coalescing. Verification:
+  `cargo fmt --check`, `cargo test -p tx-reactor`, `cargo xtask lint unused`,
+  `cargo xtask progress validate`, `cargo xtask ci`, `cargo xtask ci-slow`, and
+  `git diff --check`; next step is wait-adapt channels plus the scheduler/idle
+  loop boundary.
 - `TrapIf` now includes typed trap snapshots and classification. RV64 QEMU
   decodes common synchronous faults and supervisor interrupts from `scause`;
   the direct-mode vector still panics/spins until the full saved-register
