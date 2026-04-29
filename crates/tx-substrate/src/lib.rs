@@ -15,19 +15,9 @@ pub mod bus {
     pub struct RawTrace;
 }
 
-pub mod epoch {
-    pub struct Guard<'g> {
-        _marker: core::marker::PhantomData<&'g ()>,
-    }
-}
-
-pub mod index {
-    pub struct IndexReservation;
-}
-
-pub mod mutation {
-    pub struct CommitPoint;
-}
+pub mod epoch;
+pub mod index;
+pub mod mutation;
 
 pub mod pmap {
     pub use tx_hal::pmap::*;
@@ -35,6 +25,8 @@ pub mod pmap {
 
 pub mod page_allocator;
 pub mod slab;
+
+pub mod zone;
 
 pub mod page {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,24 +260,6 @@ pub mod shootdown {
 
     fn result_ppn(phys: PhysAddr) -> Ppn {
         Ppn(phys.0 / PAGE_SIZE_4K)
-    }
-}
-
-pub mod zone {
-    pub struct Cap<T: ?Sized> {
-        _marker: core::marker::PhantomData<T>,
-    }
-
-    pub struct Weak<T: ?Sized> {
-        _marker: core::marker::PhantomData<T>,
-    }
-
-    pub struct IdentRef<'g, T: ?Sized> {
-        _marker: core::marker::PhantomData<&'g T>,
-    }
-
-    pub struct ZoneReservation<T> {
-        _marker: core::marker::PhantomData<T>,
     }
 }
 
