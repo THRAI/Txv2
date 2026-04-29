@@ -1,5 +1,7 @@
 use tx_hal::{MemoryRegion, MemoryRegionKind, PhysAddr, PhysRange};
 
+use fdt::nodes::AsNode;
+
 type FallibleFdtNode<'a> = fdt::nodes::Node<
     'a,
     (
@@ -20,6 +22,7 @@ pub(crate) struct DtbBootInfo {
     pub(crate) memory_region_count: usize,
     pub(crate) initrd: Option<PhysRange>,
     pub(crate) cmdline_len: usize,
+    pub(crate) timebase_frequency_hz: Option<u64>,
 }
 
 pub(crate) unsafe fn parse_boot_info_from_fdt(
@@ -37,6 +40,12 @@ pub(crate) unsafe fn parse_boot_info_from_fdt(
         .cell_sizes()
         .ok()
         .map_or(2, |sizes| sizes.address_cells);
+    let timebase_frequency_hz = root
+        .as_node()
+        .raw_property("timebase-frequency")
+        .ok()
+        .flatten()
+        .and_then(|prop| read_timebase_frequency_hz(prop.value));
     let memory_region_count = copy_memory_regions(&fdt, memory_regions)?;
     let chosen = fdt.find_node("/chosen").ok().flatten();
     let cmdline_len = copy_bootargs(chosen, cmdline);
@@ -61,6 +70,7 @@ pub(crate) unsafe fn parse_boot_info_from_fdt(
         memory_region_count,
         initrd,
         cmdline_len,
+        timebase_frequency_hz,
     })
 }
 
@@ -111,6 +121,22 @@ fn read_cells(data: &[u8], cells: usize) -> Option<usize> {
     usize::try_from(value).ok()
 }
 
+fn read_timebase_frequency_hz(value: &[u8]) -> Option<u64> {
+    let frequency_hz = if value.len() == 4 {
+        u64::from(u32::from_be_bytes(value.try_into().ok()?))
+    } else if value.len() == 8 {
+        u64::from_be_bytes(value.try_into().ok()?)
+    } else {
+        return None;
+    };
+
+    if frequency_hz == 0 {
+        None
+    } else {
+        Some(frequency_hz)
+    }
+}
+
 fn copy_bootargs(chosen: Option<FallibleFdtNode<'_>>, dst: &mut [u8]) -> usize {
     let Some(bootargs) = chosen
         .and_then(|node| node.raw_property("bootargs").ok().flatten())
@@ -131,7 +157,7 @@ mod tests {
 
     use tx_hal::{
         BootInfoIf, BootPlatformIf, BootProtocol, MemoryRegion, MemoryRegionKind, PhysAddr,
-        PhysRange,
+        PhysRange, PlatformInfoIf,
     };
 
     use super::{parse_boot_info_from_fdt, DtbBootInfo};
@@ -161,6 +187,7 @@ mod tests {
                     size: 0x20_0000,
                 }),
                 cmdline_len: 12,
+                timebase_frequency_hz: Some(10_000_000),
             }
         );
         assert_eq!(regions[0].base, PhysAddr(0x8000_0000));
@@ -204,6 +231,23 @@ mod tests {
     }
 
     #[test]
+    fn zero_timebase_frequency_is_treated_as_absent() {
+        let fdt = fake_qemu_fdt_with_timebase_frequency(0);
+        let mut regions = [MemoryRegion {
+            base: PhysAddr(0),
+            size: 0,
+            kind: MemoryRegionKind::Reserved,
+        }; 4];
+        let mut cmdline = [0u8; 64];
+
+        let parsed =
+            unsafe { parse_boot_info_from_fdt(fdt.as_ptr() as usize, &mut regions, &mut cmdline) }
+                .expect("valid fdt should parse");
+
+        assert_eq!(parsed.timebase_frequency_hz, None);
+    }
+
+    #[test]
     fn boot_handoff_publishes_static_boot_info() {
         let fdt = fake_qemu_fdt();
         let dtb_addr = fdt.as_ptr() as usize;
@@ -230,6 +274,8 @@ mod tests {
             })
         );
         assert_eq!(boot_info.cmdline, Some("console=hvc0"));
+        assert_eq!(Platform::platform_info().timebase_frequency_hz, 10_000_000);
+        assert_eq!(<Platform as tx_hal::TimeIf>::frequency_hz(), 10_000_000);
 
         unsafe {
             BootStaticBag::<IdentityLive>::reset_global_for_test();
@@ -241,6 +287,20 @@ mod tests {
     }
 
     fn fake_qemu_fdt_with_memory_ranges(memory_ranges: &[(u64, u64)]) -> Vec<u8> {
+        fake_qemu_fdt_with_memory_ranges_and_timebase(memory_ranges, 10_000_000)
+    }
+
+    fn fake_qemu_fdt_with_timebase_frequency(timebase_frequency_hz: u32) -> Vec<u8> {
+        fake_qemu_fdt_with_memory_ranges_and_timebase(
+            &[(0x8000_0000, 0x0800_0000)],
+            timebase_frequency_hz,
+        )
+    }
+
+    fn fake_qemu_fdt_with_memory_ranges_and_timebase(
+        memory_ranges: &[(u64, u64)],
+        timebase_frequency_hz: u32,
+    ) -> Vec<u8> {
         let mut strings = Vec::new();
         let address_cells = add_string(&mut strings, "#address-cells");
         let size_cells = add_string(&mut strings, "#size-cells");
@@ -249,11 +309,13 @@ mod tests {
         let bootargs = add_string(&mut strings, "bootargs");
         let initrd_start = add_string(&mut strings, "linux,initrd-start");
         let initrd_end = add_string(&mut strings, "linux,initrd-end");
+        let timebase_frequency = add_string(&mut strings, "timebase-frequency");
 
         let mut structure = Vec::new();
         begin_node(&mut structure, "");
         prop_u32(&mut structure, address_cells, 2);
         prop_u32(&mut structure, size_cells, 2);
+        prop_u32(&mut structure, timebase_frequency, timebase_frequency_hz);
 
         for (base, size) in memory_ranges {
             begin_node(&mut structure, &format!("memory@{base:x}"));

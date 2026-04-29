@@ -6,6 +6,7 @@ extern crate std;
 mod boot_static;
 mod dtb;
 mod pmap;
+mod time;
 mod trap;
 
 use boot_static::{
@@ -346,7 +347,23 @@ impl PmapIf for Platform {
 impl UserAccessIf for Platform {}
 impl SignalFrameIf for Platform {}
 impl IrqIf for Platform {}
-impl TimeIf for Platform {}
+impl TimeIf for Platform {
+    fn read_ns() -> u64 {
+        time::read_ns(Self::frequency_hz())
+    }
+
+    fn set_deadline_ns(deadline: u64) {
+        time::set_deadline_ns(deadline, Self::frequency_hz());
+    }
+
+    fn cancel_deadline() {
+        time::cancel_deadline();
+    }
+
+    fn frequency_hz() -> u64 {
+        Self::platform_info().timebase_frequency_hz
+    }
+}
 impl PercpuIf for Platform {}
 impl CacheIf for Platform {}
 impl DmaIf for Platform {}
@@ -399,20 +416,25 @@ impl BootStaticBag<IdentityLive> {
         cmdline.fill(0);
 
         let parsed = parse_boot_info_from_fdt(dtb_addr, memory_regions, cmdline);
-        let (memory_region_count, initrd, cmdline_len) = if let Some(parsed) = parsed {
-            (
-                parsed.memory_region_count,
-                parsed.initrd,
-                parsed.cmdline_len.min(CMDLINE_CAPACITY),
-            )
-        } else {
-            memory_regions[0] = MemoryRegion {
-                base: PhysAddr(QEMU_VIRT_RAM_BASE),
-                size: QEMU_VIRT_FALLBACK_RAM_SIZE,
-                kind: MemoryRegionKind::Usable,
+        let (memory_region_count, initrd, cmdline_len, timebase_frequency_hz) =
+            if let Some(parsed) = parsed {
+                (
+                    parsed.memory_region_count,
+                    parsed.initrd,
+                    parsed.cmdline_len.min(CMDLINE_CAPACITY),
+                    parsed
+                        .timebase_frequency_hz
+                        .unwrap_or(time::QEMU_VIRT_FALLBACK_TIMEBASE_HZ),
+                )
+            } else {
+                memory_regions[0] = MemoryRegion {
+                    base: PhysAddr(QEMU_VIRT_RAM_BASE),
+                    size: QEMU_VIRT_FALLBACK_RAM_SIZE,
+                    kind: MemoryRegionKind::Usable,
+                };
+                (1, None, 0, time::QEMU_VIRT_FALLBACK_TIMEBASE_HZ)
             };
-            (1, None, 0)
-        };
+        self.publish_timebase_frequency_hz(timebase_frequency_hz);
         let memory_region_count =
             reserve_firmware_loader_region(memory_regions, memory_region_count);
 
