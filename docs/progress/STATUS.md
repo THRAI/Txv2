@@ -1,6 +1,6 @@
 # txKernel Status
 
-**Updated:** 2026-04-28
+**Updated:** 2026-04-29
 
 ## Current Shape
 
@@ -31,24 +31,154 @@
   smoke sentinel `txkernel:qemu-riscv64-virt:boot:ok`.
 - RV64 QEMU publishes BootInfo v1 from the OpenSBI-provided DTB: usable memory
   regions, kernel image linker bounds, chosen bootargs, and initrd bounds.
-- RV64 QEMU now enables an Sv39 bootstrap pmap before `rust_entry`: a 1 GiB
-  identity leaf for QEMU RAM plus a fixed early PT-node pool exposed through
-  `PmapIf`.
-- RV64 QEMU's low-linked high-alias boot path now validates high PC/SP/GP but
-  deliberately retains the low identity leaf for live substrate boot. QEMU
-  trace showed `core::sync::atomic` can jump through compiler-generated tables
-  containing low linked text addresses after identity teardown; full teardown is
-  blocked on a high-VMA/low-LMA linker or relocation slice. BootInfo also marks
-  `[0x8000_0000, 0x8020_0000)` reserved so allocator metadata is not carved over
-  OpenSBI/kernel-loader RAM. Verification: `cargo test -p
+- RV64 QEMU DTB parsing now delegates flattened-devicetree traversal to the
+  `fdt` crate while keeping board-owned BootInfo normalization for memory
+  regions, chosen bootargs, and Linux initrd bounds; verification covered host
+  tests, RV64 no-std check/build, arch/docs/progress lints, and the RV64 QEMU
+  smoke sentinel, with no parser blocker and the next step still the
+  page-substrate boot handoff.
+- RV64 QEMU now enables an Sv39 bootstrap pmap before `rust_entry`: a temporary
+  1 GiB identity leaf for QEMU RAM, a high direct-map alias, a coarse high
+  kernel alias, richer bootstrap pmap facts, and a fixed early PT-node pool
+  exposed through `PmapIf`; `_start` rewrites `sp`/`gp` and jumps to the high
+  `rust_entry` alias, then a high sentinel proves PC/SP/GP are high while the
+  live low-linked path deliberately retains the low identity leaf. QEMU trace
+  showed `core::sync::atomic` can jump through compiler-generated tables
+  containing low linked text addresses after identity teardown; full live
+  teardown is blocked on a high-VMA/low-LMA linker or relocation slice. BootInfo
+  also marks `[0x8000_0000, 0x8020_0000)` reserved so allocator metadata is not
+  carved over OpenSBI/kernel-loader RAM. Verification: `cargo test -p
   tx-hal-riscv64-qemu-virt` and `cargo xtask ci-slow`.
+- RV64 QEMU centralizes Rust boot-static/linker-symbol address capture in a
+  single `BootStaticBag` authority; `_start` constructs
+  `BootStaticBag<IdentityLive>` once with the firmware DTB and boot/static
+  facts, the post-entry pipeline consumes it into the post-entry bag typestate
+  while the live low identity bridge remains mapped, and BootInfo,
+  PlatformInfo, bootstrap pmap roots, the kernel alias L1, and the PT-node pool
+  flow through named pre-entry and post-entry bag pipelines. `cargo xtask lint
+  arch` enforces that other board files do not recreate static address facts.
+- `cargo xtask lint unused` now runs Rust unused/dead-code checks as hard
+  errors for the host workspace and installed board targets, and `lint arch`
+  rejects `#[allow(dead_code)]` / `#[allow(unused...)]` escape hatches in
+  normal code. The RV64 high sentinel remains live target code because it is the
+  final proof before substrate relies on the high alias; explicit identity
+  teardown stays test-only until the high-linker/relocation slice.
+- `tx-substrate` now has the v1 typed page allocator interface:
+  `PageAllocator`, `BitmapPageAllocator`, `FrameMeta`, reservation/owned-frame
+  tokens, role pins, permanent/device/page-table frame classes, installed
+  bitmap-backend delegation, allocator interface tests, rustdoc covering map
+  topology/function usage, no-alloc run splitting, and module files grouped by
+  state-machine topic.
+- `tx_substrate::init::<P>()` now performs the first real page-substrate boot
+  handoff: it normalizes HAL `BootInfo` memory regions, consumes
+  `BootstrapPmapInfo.reserved_page_tables`, carves direct-mapped `FrameMeta[]`
+  and bitmap storage, installs a dense `base_ppn` bitmap allocator, and wires
+  `ZeroPolicy::Zeroed` to the direct-map scrubber. Verification:
+  `cargo fmt --check`, `cargo test -p tx-substrate`, `cargo test -p
+  tx-hal-riscv64-qemu-virt`, `cargo xtask lint unused`, `cargo xtask lint
+  docs`, `cargo xtask progress validate`, `cargo xtask ci`, RV64 QEMU smoke
+  sentinel, and `git diff --check`.
+- RV64 QEMU now exposes the first executable pmap reserve/commit mutation:
+  idempotent 1 GiB kernel direct-map leaf reservation/commit plus
+  `PmapIf::extend_direct_map()`. `tx_substrate::init::<P>()` calls it before
+  allocator metadata placement when `BootInfo` reports RAM beyond the bootstrap
+  direct-map window.
+- RV64 QEMU now maps platform MMIO during `tx_substrate::init::<P>()` through
+  `PlatformInfo.mmio_regions` and `PmapIf::reserve_kernel_mapping()` /
+  `commit_kernel_mapping()`, using 2 MiB leaves when aligned and 4 KiB leaves
+  for small or tail regions.
+- The pmap lifecycle surface now includes abandoned-reservation rollback,
+  kernel mapping unmap, and explicit invalidation tokens. RV64 QEMU rollback
+  releases `PT_NODE_POOL` intermediates allocated during 2 MiB / 4 KiB
+  reservation, and kernel unmap clears 2 MiB / 4 KiB leaves before a local
+  shootdown.
+- After the frame allocator is installed, `tx_substrate::init::<P>()` now
+  installs a typed pmap PT-node source with `PmapIf::install_pt_node_allocator`.
+  RV64 QEMU uses typed `PtFrame` pages for new intermediates first and retains
+  `PT_NODE_POOL` as the exhaustion fallback.
+- Substrate now has a no-alloc `KernelShootdownBatch` for page-sized kernel
+  unmaps. It owns the `MapPin` for the cleared mapping, issues
+  `P::shootdown_kernel_mapping()` first, and only then drops the pin so
+  `map_count` cannot reach zero before invalidation.
+- `tx_substrate::init::<P>()` now brings up the first no-std slab heap after the
+  frame allocator is installed: small classes up to 2 KiB, page-run backing for
+  page-sized and larger allocations, empty slab-page return, a kernel-target
+  `GlobalAlloc`, a boot-time allocation smoke, and a permanent zero-frame
+  anchor via `OwnedFrame::into_permanent_frame()`. `TrapIf` now exposes
+  `install_kernel_trap_vector()` and generic `tx_kernel::kernel_main::<P>()`
+  calls it after `P::init_later()`.
+- RV64 QEMU now implements safe in-place kernel pmap permission updates through
+  `PmapIf::protect_kernel_mapping()`. It rewrites existing same-granularity
+  leaves, returns a `PmapInvalidation`, treats absent mappings as no mutation,
+  and rejects unsafe split/rematerialization cases for VM to handle later.
+- RV64 QEMU committed kernel pmap intermediates now have teardown ownership:
+  commit registers new branch-table `PtNode`s, unmap prunes empty L0/L1 tables,
+  and release returns typed page-table frames or static PT-node pool entries
+  through the pmap path instead of losing authority in the branch PTE.
+- RV64 QEMU high-kernel alias now uses reserved 4 KiB L0 tables with final
+  permissions: text RX, rodata R, data/bss/boot stack RW, direct map/MMIO RW
+  and NX. The alias table range is published through
+  `BootstrapPmapInfo.reserved_page_tables`.
+- RV64 QEMU now has concrete `PmapRoot`/`Asid` process-root handoff: roots copy
+  the shared kernel half, ASIDs are allocated/reused from a fixed bitmap, user
+  mappings can reserve/commit/protect/unmap, and root teardown recursively
+  releases committed user page-table intermediates.
+- Substrate shootdown now has both kernel-global and ASID-scoped page batches;
+  both hold `MapPin`s until after the HAL invalidation call. Boot also anchors
+  allocator metadata, kernel-image pages, and bootstrap pmap pages as permanent
+  frames after allocator installation.
+- `tx_hal::pmap` now has no-alloc page-range surface helpers:
+  `PmapRangeReservation<P, N>` rolls back uncommitted reserved prefixes on drop,
+  `commit()` publishes the range, and range unmap/protect collect per-page
+  results into caller-provided slices for later shootdown batching. Substrate
+  re-exports the helpers, but the implementation now lives at the HAL surface.
+- The pmap implementation is now split by responsibility: generic range
+  orchestration lives in `crates/tx-hal/src/pmap.rs`, while RV64 QEMU separates
+  process-root/ASID orchestration (`pmap/address_space.rs`), PT-node
+  pool/typed-node ownership (`pmap/pt_node.rs`), and kernel direct-map/MMIO
+  mapping mutations (`pmap/kernel_space.rs`). RV64 QEMU also separates PTE
+  encoding/inspection (`pmap/pte.rs`) from Sv39/QEMU topology and big-page
+  sizing/index helpers (`pmap/topology.rs`). The board facade is now
+  `pmap/mod.rs`; it keeps bootstrap/high-half flow and shared table
+  orchestration, with data structures first, lifecycle/data-flow functions
+  next, and helper machinery after. Pmap unit tests live in `pmap/tests.rs`;
+  non-pmap board code uses `pmap::topology` for constants instead of the pmap
+  operation facade.
+- Agent skills now include `tx-code-reorganization`, a reusable workflow for
+  behavior-preserving module splits, `foo.rs` to `foo/mod.rs` facade moves,
+  state/lifecycle/helper function ordering, group-level comments, and
+  verification. `cargo xtask lint arch` also rejects authored Rust source files
+  above 1,500 lines outside `target/` and `external/`.
+- The long-term `kernel_main` roadmap is recorded as
+  `docs/progress/plans/2026-04-29-kernel-main-long-term-checklist.json`,
+  covering the path from the current H3 sentinel/shutdown endpoint through
+  CoreInit, zone/epoch/bus, trap shell, reactor/scheduler, VM, process/thread
+  runtime, exec, first userspace, SMP coordination, and runtime boot tests.
+- `TrapIf` now includes typed trap snapshots and classification. RV64 QEMU
+  decodes common synchronous faults and supervisor interrupts from `scause`;
+  the direct-mode vector still panics/spins until the full saved-register
+  trap shell and user-return path exist.
+- RV64 QEMU now installs a minimal direct-mode `stvec` panic vector before
+  boot handoff and again after `init_later()`. The vector prints `scause`,
+  `sepc`, and `stval` through the SBI console and spins; the full
+  `RawTrapFrame`/`KernelTrapSink` user trap shell remains a later slice.
 - `cargo xtask ci-slow` runs the RV64 QEMU smoke sentinel lane separately from
   fast compile/lint CI.
 - The active HAL, page-substrate, module-map, and invariant docs now state the
   portable boot contract later platforms must follow.
+- HAL and memory/VM docs now state the address boundary policy: address typing
+  belongs to pmap/boot/page-substrate/VM/user-access gates, while ordinary
+  kernel subsystems speak caps, weak refs, IdentRefs, witnesses, reservations,
+  recipes, and role-shaped Frame tokens.
 - Agent workflow now requires a finish catch-up in `docs/progress/` before any
   completed task is declared done; see
   `docs/progress/decisions/2026-04-28-finish-catchup-progress-memory.md`.
+- Step model terminology now names the STEP-4 order as a five-stage in-step
+  discipline (`observe`, `upgrade`, `reserve`, `commit`, `publish`) in
+  `docs/design/02_execution/STEP_MODEL_v1.md`, with INDEX/CONCEPTS summaries
+  aligned. Verification: `git diff --check`, `cargo xtask lint docs`, and
+  `cargo xtask progress validate`. Next step: continue using stage vocabulary
+  when touching step examples; no blocker.
 - This foundational workspace snapshot is ready to publish to the Txv2 remote:
   it captures the Rust skeleton, xtask tooling, docs/progress memory, OSComp and
   HumanLayer references, RV64 QEMU smoke boot, BootInfo v1, and bootstrap pmap.
@@ -60,9 +190,9 @@
 - LA64 target availability depends on local rustup support.
 - LA64 and M1 Dock mock boot protocols are compile-first only.
 - RV64 QEMU still needs high-VMA/low-LMA linking or relocation before live
-  identity teardown; it also needs full pmap reserve/commit/unmap, shootdown
-  integration, and a minimal trap vector before the page substrate is
-  substrate-ready.
+  identity teardown. It also needs superpage/multi-frame map-count batching,
+  remote-hart shootdown coordination, and the full trap shell before the page
+  substrate is user/VM-ready.
 - ext4 image creation requires host `mkfs.ext4`.
 - BusyBox images require `TX_BUSYBOX`; dynamic musl layouts also require
   `TX_MUSL_LIBC`.
@@ -70,6 +200,25 @@
 ## Latest Decisions
 
 - `docs/progress/decisions/2026-04-29-rv64-low-linked-identity-retention.md`
+- `docs/progress/decisions/2026-04-28-pageallocator-token-interface.md`
+- `docs/progress/decisions/2026-04-29-code-reorganization-skill-and-line-limit.md`
+- `docs/progress/decisions/2026-04-29-substrate-slab-heap-zero-frame.md`
+- `docs/progress/decisions/2026-04-29-rv64-pmap-helper-extraction.md`
+- `docs/progress/decisions/2026-04-29-rv64-pmap-module-extraction.md`
+- `docs/progress/decisions/2026-04-29-pmap-kernel-protect-in-place.md`
+- `docs/progress/decisions/2026-04-29-rv64-minimal-trap-vector.md`
+- `docs/progress/decisions/2026-04-28-substrate-init-frameallocator-handoff.md`
+- `docs/progress/decisions/2026-04-29-kernel-shootdown-map-accounting.md`
+- `docs/progress/decisions/2026-04-29-pmap-typed-intermediate-source.md`
+- `docs/progress/decisions/2026-04-29-pmap-rollback-unmap-vocabulary.md`
+- `docs/progress/decisions/2026-04-28-rv64-mmio-pmap-reserve-commit.md`
+- `docs/progress/decisions/2026-04-28-rv64-direct-map-extension.md`
+- `docs/progress/decisions/2026-04-28-unused-lint-gate.md`
+- `docs/progress/decisions/2026-04-28-rv64-identity-teardown-sentinel.md`
+- `docs/progress/decisions/2026-04-28-rv64-high-half-entry.md`
+- `docs/progress/decisions/2026-04-28-rv64-boot-static-bag.md`
+- `docs/progress/decisions/2026-04-28-address-boundary-policy.md`
+- `docs/progress/decisions/2026-04-28-rv64-high-half-alias-bootstrap.md`
 - `docs/progress/decisions/2026-04-28-finish-catchup-progress-memory.md`
 - `docs/progress/decisions/2026-04-28-arceos-aligned-portable-boot.md`
 - `docs/progress/decisions/2026-04-27-fine-grained-txdoc-anchors.md`

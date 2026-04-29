@@ -37,6 +37,14 @@ Does *not* cover:
 
 5. **No rmap.** No reverse mapping from Frame to mapping PTEs. Consequences: certain reflink and migration paths are unavailable; MAP_PRIVATE's private Frames are tracked only via their PTEs, not indexed per-VmEntry.
 
+6. **Address typing is a boundary tool, not the upper-kernel language.** VM owns
+   user virtual ranges, fault addresses, pmap materialization addresses, and
+   copyin/copyout gates. Above those gates, kernel code speaks semantic
+   evidence: `Cap<T>`, `Weak<T>`, `IdentRef<'g, T>`, witnesses, reservations,
+   and role tokens. A typed virtual address is not a dereferenceable pointer;
+   it becomes a kernel pointer only through HAL/substrate/user-access helpers
+   that name the mapping and lifetime.
+
 **Companion documents.**
 
 - [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) §1 (third basis claim), §8 (authoritative bindings and derived materializations; justification invariant; publication rule; conditional-commit primitive family).
@@ -65,6 +73,32 @@ entities:
 VM operation code never chooses a raw `Zone<T, Policy>`. It obtains
 `AddressSpace` evidence through process Frame slots or witnesses, and it
 publishes mapping values through the recipes index.
+
+### Address boundary policy
+<!-- txdoc:VM-ADDRESS-BOUNDARY-POLICY -->
+
+VM is the memory subsystem boundary where user address values are meaningful.
+It may carry typed `UserVirtAddr`/`UserRange`/`UserPtr<T>`-style values in
+syscall arguments, recipes, fault reports, `RangeLock`, and pmap
+materialization. These values are still just addresses: they are never
+dereferenced directly and never confer authority by themselves.
+
+The authority split is:
+
+- `AddressSpace` identity and lifetime are reached through zone-derived
+  evidence (`Cap<AddressSpace>`, `Weak<AddressSpace>`, `IdentRef<'g,
+  AddressSpace>`) and process/thread witnesses;
+- `VmEntry` values are authoritative mapping bindings in the recipes BTree;
+- pmap PTEs are derived materializations justified by recipes and RangeLock;
+- user bytes cross the boundary only through `UserAccessIf`/copyin/copyout or
+  through a fault-script materialization path that re-reads recipes before PTE
+  publication.
+
+No VM caller should receive a raw kernel pointer to user memory, a freeing
+authority encoded as a PPN, or a permission decision encoded only in address
+arithmetic. Arithmetic on user addresses is local to VM helpers that align,
+split, and index ranges; syscall and subsystem code should consume VM results
+as semantic outcomes.
 
 ---
 
