@@ -194,6 +194,19 @@
   `cargo xtask progress validate`, `cargo xtask ci`, `cargo xtask ci-slow`, and
   `git diff --check`; next step is timer/signal classification hooks plus the
   scheduler/idle loop boundary.
+- `TimeIf` is now a concrete HAL deadline surface for reactor/scheduler use:
+  `tx-hal` exposes `read_ns`, `set_deadline_ns`, `cancel_deadline`, and
+  `frequency_hz`, plus saturating ns/tick conversion helpers. RV64 QEMU parses
+  root DTB `timebase-frequency` through the existing DTB reader, publishes it
+  as `PlatformInfo.timebase_frequency_hz`, reads `rdtime`, and programs
+  absolute deadlines with legacy SBI `set_timer`; the qemu virt 10 MHz
+  fallback is documented for absent/zero/invalid firmware data. LA64 and M1
+  Dock mock boards have explicit compile stubs only. Verification:
+  `cargo fmt --check`, `cargo test -p tx-hal-riscv64-qemu-virt`,
+  `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`, `cargo xtask lint unused`, and
+  `cargo xtask progress validate`; next step is for reactor/scheduler code to
+  consume `TimeIf` without adding a runtime HAL manager. No blocker.
 - `TrapIf` now includes typed trap snapshots and classification. RV64 QEMU
   decodes common synchronous faults and supervisor interrupts from `scause`;
   the direct-mode vector still panics/spins until the full saved-register
