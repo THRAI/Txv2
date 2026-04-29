@@ -1,12 +1,13 @@
 #![no_std]
 //! Minimal task-aware reactor machinery.
 //!
-//! This crate is still below the full REACTOR_v0 contract: there are no wait
-//! channels, timers, AST slots, scheduler policy hooks, or long-running idle
-//! loop yet. The implemented invariant is narrower and load-bearing for those
-//! later pieces: each submitted task owns the wake state used by its `Waker`,
-//! so a wake marks exactly that task runnable and does not authorize semantic
-//! truth. The future must re-observe its condition on the next poll.
+//! This crate is still below the full REACTOR_v0 contract: timers, signal
+//! interruption, AST slots, scheduler policy hooks, and the long-running idle
+//! loop are not implemented yet. The implemented invariant is narrower and
+//! load-bearing for those later pieces: each submitted task owns the wake state
+//! used by its `Waker`, so a wake marks exactly that task runnable and does not
+//! authorize semantic truth. `wait_event` makes that re-observation rule
+//! explicit by rechecking its condition after every channel wake.
 
 extern crate alloc;
 
@@ -50,6 +51,7 @@ pub mod wait {
         future::Future,
         pin::Pin,
         task::{Context, Poll, Waker},
+        time::Duration,
     };
 
     /// Bit mask naming the wait events a task cares about on a channel.
@@ -72,6 +74,21 @@ pub mod wait {
         const fn intersects(self, other: Self) -> bool {
             self.0 & other.0 != 0
         }
+    }
+
+    /// Script-selected wait policy.
+    ///
+    /// The current reactor has no signal or timer injection path, so
+    /// `wait_event` only completes with `Ready`. The full protocol shape is
+    /// present now so scripts can be typed against REACTOR_v0 without learning
+    /// a temporary boolean wait API.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum WaitProtocol {
+        Uninterruptible,
+        Interruptible,
+        Killable,
+        InterruptibleTimeout(Duration),
+        KillableTimeout(Duration),
     }
 
     /// Classified wait result shape from REACTOR_v0.
@@ -119,6 +136,15 @@ pub mod wait {
         token: Option<WaitToken>,
     }
 
+    /// Future returned by `Channel::wait_event`.
+    pub struct WaitEventFuture<C> {
+        channel: Channel,
+        mask: Mask,
+        protocol: WaitProtocol,
+        condition: C,
+        wait: Option<WaitFuture>,
+    }
+
     impl Channel {
         pub fn new() -> Self {
             Self {
@@ -135,6 +161,24 @@ pub mod wait {
                 channel: self.clone(),
                 mask,
                 token: None,
+            }
+        }
+
+        pub fn wait_event<C>(
+            &self,
+            mask: Mask,
+            protocol: WaitProtocol,
+            condition: C,
+        ) -> WaitEventFuture<C>
+        where
+            C: FnMut() -> bool,
+        {
+            WaitEventFuture {
+                channel: self.clone(),
+                mask,
+                protocol,
+                condition,
+                wait: None,
             }
         }
 
@@ -239,6 +283,43 @@ pub mod wait {
         fn drop(&mut self) {
             if let Some(token) = self.token.take() {
                 self.channel.unregister(token);
+            }
+        }
+    }
+
+    impl<C> Future for WaitEventFuture<C>
+    where
+        C: FnMut() -> bool + Unpin,
+    {
+        type Output = WaitOutcome;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            let _ = this.protocol;
+
+            loop {
+                if (this.condition)() {
+                    this.wait = None;
+                    return Poll::Ready(WaitOutcome::Ready);
+                }
+
+                if this.mask.is_empty() {
+                    return Poll::Pending;
+                }
+
+                let wait = this
+                    .wait
+                    .get_or_insert_with(|| this.channel.wait(this.mask));
+                match Pin::new(wait).poll(cx) {
+                    Poll::Ready(WaitOutcome::Ready) => {
+                        this.wait = None;
+                    }
+                    Poll::Ready(outcome) => {
+                        this.wait = None;
+                        return Poll::Ready(outcome);
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
             }
         }
     }
