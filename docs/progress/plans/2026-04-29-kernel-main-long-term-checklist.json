@@ -1,0 +1,442 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-04-29-kernel-main-long-term-checklist",
+  "title": "Long-term kernel_main checklist",
+  "status": "proposed",
+  "created": "2026-04-29",
+  "updated": "2026-04-29",
+  "owner": "codex",
+  "summary": "Track the path from the current sentinel-and-shutdown kernel_main to the design-doc target: CoreInit, trap shell, reactor/scheduler, VM, subsystem init, and first userspace.",
+  "scope": {
+    "in": [
+      "crates/tx-kernel",
+      "crates/tx-hal",
+      "crates/tx-substrate",
+      "boards/tx-hal-riscv64-qemu-virt",
+      "boards/tx-kernel-riscv64-qemu-virt",
+      "docs/design",
+      "docs/progress"
+    ],
+    "out": [
+      "crates/tx-kernel/src/syscall/full-posix-completeness",
+      "crates/tx-kernel/src/device/tier3-dynamic-discovery",
+      "crates/tx-kernel/src/scheduler/phase2-policies",
+      "crates/tx-kernel/src/fpu",
+      "boards/tx-kernel-k210"
+    ],
+    "write_sets": [
+      {
+        "owner": "future-kernel-main-workers",
+        "paths": [
+          "crates/tx-kernel",
+          "crates/tx-hal",
+          "crates/tx-substrate",
+          "boards/tx-hal-riscv64-qemu-virt",
+          "boards/tx-kernel-riscv64-qemu-virt",
+          "docs/progress"
+        ],
+        "notes": "Split individual implementation slices into disjoint write sets before parallel work; this plan is the shared long-term checklist."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/INDEX.md",
+      "docs/design/00_meta-framework/MODULE_MAP_v1.md",
+      "docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md",
+      "docs/design/00_meta-framework/INVARIANTS_v4.md",
+      "docs/design/01_substrate/HAL_v1.md",
+      "docs/design/01_substrate/PAGE_SUBSTRATE_v1.md",
+      "docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md",
+      "docs/design/01_substrate/BUS_v1.md",
+      "docs/design/02_execution/STEP_MODEL_v1.md",
+      "docs/design/02_execution/REACTOR_v0.md",
+      "docs/design/02_execution/SCHEDULER_v0.md",
+      "docs/design/02_execution/THREAD_RUNTIME_v1.md",
+      "docs/design/02_execution/EXEC_v1.md",
+      "docs/design/03_memory-vm/VM_v1_2.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/04_process-signals/PROCESS_v1.md",
+      "docs/design/04_process-signals/SIGNAL_v1.md",
+      "docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md",
+      "docs/design/05_filesystem/VFS_CHECKS_V2.1.md",
+      "docs/design/06_devices/DEVICE.md",
+      "docs/design/06_devices/TTY.md"
+    ],
+    "progress_refs": [
+      "docs/progress/STATUS.md",
+      "docs/progress/decisions/2026-04-29-code-reorganization-skill-and-line-limit.md",
+      "docs/progress/decisions/2026-04-29-substrate-slab-heap-zero-frame.md",
+      "docs/progress/decisions/2026-04-29-process-root-asid-shootdown-anchors.md",
+      "docs/progress/decisions/2026-04-29-rv64-minimal-trap-vector.md",
+      "docs/progress/decisions/2026-04-29-substrate-pmap-range-wrappers.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "baseline-h3-sentinel-kernel-main",
+      "title": "Keep the current H3 kernel_main sentinel baseline green",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/lib.rs",
+        "boards/tx-kernel-riscv64-qemu-virt/src/main.rs",
+        "boards/tx-hal-riscv64-qemu-virt/src/lib.rs",
+        "crates/tx-substrate/src/lib.rs"
+      ],
+      "verification": [
+        "cargo xtask ci",
+        "cargo xtask ci-slow --target rv64-qemu --profile smoke --expect-sentinel"
+      ],
+      "notes": "Current kernel_main reaches P::init_early, tx_substrate::init::<P>(), P::init_later, P::install_kernel_trap_vector, prints txkernel:qemu-riscv64-virt:boot:ok, then powers off. Preserve this while replacing the tail with runtime init."
+    },
+    {
+      "id": "coreinit-spine",
+      "title": "Replace sentinel tail with an explicit CoreInit spine",
+      "status": "pending",
+      "depends_on": [
+        "baseline-h3-sentinel-kernel-main"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/lib.rs",
+        "crates/tx-kernel/src/init.rs",
+        "crates/tx-hal/src/lib.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel",
+        "cargo xtask ci"
+      ],
+      "notes": "Encode the HAL/PAGE_SUBSTRATE H3 order directly: init_early, substrate::init, init_later, install full trap vector, run post-substrate init hooks, initialize VFS before device, run post-device hooks, initialize reactor/scheduler/subsystems, then enter H4. Keep INIT_HOOKS sparse and never let them reorder substrate, VFS, or device init."
+    },
+    {
+      "id": "zone-epoch-bus-foundation",
+      "title": "Bring up zone, epoch, index, mutation, and bus foundations before semantic subsystems",
+      "status": "pending",
+      "depends_on": [
+        "coreinit-spine"
+      ],
+      "paths": [
+        "crates/tx-substrate/src",
+        "crates/tx-kernel/src"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate",
+        "cargo xtask lint arch",
+        "cargo xtask ci"
+      ],
+      "notes": "Implement the substrate pieces upper subsystems assume: epoch::guard, zone::reserve/sign, Weak/IdentRef/Cap/PayloadCap mechanics, persistent index mutation primitives, and RawQueue/RawPort/RawTrace bus carriers with reactor-owned wakers. These must remain substrate mechanisms, not semantic subsystem owners."
+    },
+    {
+      "id": "trap-shell-and-kernel-sink",
+      "title": "Replace the panic-only vector with the full trap shell and KernelTrapSink",
+      "status": "pending",
+      "depends_on": [
+        "coreinit-spine"
+      ],
+      "paths": [
+        "crates/tx-hal/src",
+        "crates/tx-kernel/src/trap.rs",
+        "boards/tx-hal-riscv64-qemu-virt/src"
+      ],
+      "verification": [
+        "cargo test -p tx-hal",
+        "cargo test -p tx-hal-riscv64-qemu-virt",
+        "cargo xtask ci"
+      ],
+      "notes": "Implement RawTrapFrame, TrapFrameView, TrapFrameMut, classify-from-frame, user and kernel vector installation, return_to_userspace, and direct named KernelTrapSink methods for page fault, syscall, timer, external IRQ, IPI, and sync fault. Keep trap dispatch out of linkme."
+    },
+    {
+      "id": "user-access-fixups",
+      "title": "Install user-access and kernel-mode fault recovery",
+      "status": "pending",
+      "depends_on": [
+        "trap-shell-and-kernel-sink",
+        "vm-address-space-core"
+      ],
+      "paths": [
+        "crates/tx-hal/src",
+        "crates/tx-kernel/src",
+        "boards/tx-hal-riscv64-qemu-virt/src"
+      ],
+      "verification": [
+        "cargo test -p tx-hal",
+        "cargo xtask ci"
+      ],
+      "notes": "Implement UserAccessIf copyin/copyout and the KERNEL_FIXUP_TABLE path for kernel-mode faults. User bytes cross only through this boundary or VM's detached population helper; typed addresses are never raw dereference authority."
+    },
+    {
+      "id": "percpu-smp-gates",
+      "title": "Publish per-hart state and explicit SMP gates",
+      "status": "pending",
+      "depends_on": [
+        "coreinit-spine",
+        "trap-shell-and-kernel-sink"
+      ],
+      "paths": [
+        "crates/tx-hal/src",
+        "crates/tx-kernel/src",
+        "boards/tx-hal-riscv64-qemu-virt/src"
+      ],
+      "verification": [
+        "cargo test -p tx-hal-riscv64-qemu-virt",
+        "cargo xtask lint unused",
+        "cargo xtask ci"
+      ],
+      "notes": "Define per-hart kernel stack/scratch/TLS state, current task pointer access, AP parked/online states, and a clear single-hart gate for features that do not yet have remote coordination. AP startup may stay disabled until remote shootdown and scheduler handoff land."
+    },
+    {
+      "id": "reactor-and-round-robin-scheduler",
+      "title": "Implement reactor task table, wait-adapt, wakers, idle, and MVP scheduler",
+      "status": "pending",
+      "depends_on": [
+        "zone-epoch-bus-foundation",
+        "percpu-smp-gates"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/reactor",
+        "crates/tx-kernel/src/scheduler",
+        "crates/tx-kernel/src/lib.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel",
+        "cargo xtask ci"
+      ],
+      "notes": "Follow REACTOR_v0 and SCHEDULER_v0: tasks are temporal handles, not entities; steps never call reactor; scripts translate Blocked outcomes into wait-adapt calls; wakers are cheap and do not grant truth; phase-1 scheduler is round-robin with fixed slice and idle when no runnable task exists."
+    },
+    {
+      "id": "vm-address-space-core",
+      "title": "Implement VM AddressSpace, recipes, RangeLock, and pmap materialization",
+      "status": "pending",
+      "depends_on": [
+        "zone-epoch-bus-foundation",
+        "baseline-h3-sentinel-kernel-main"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm",
+        "crates/tx-substrate/src",
+        "crates/tx-hal/src/pmap.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm",
+        "cargo test -p tx-substrate",
+        "cargo xtask ci"
+      ],
+      "notes": "Create AddressSpace as a zone entity containing recipes BTree, PmapRoot, RangeLock, and stats. Preserve VM's invariant: pmap PTEs are derived materializations justified by recipes; binding changes linearize at recipes mutation; pmap teardown follows binding withdrawal and shootdown."
+    },
+    {
+      "id": "pmap-shootdown-completion",
+      "title": "Complete multi-page, superpage, ASID/global, and remote shootdown accounting",
+      "status": "pending",
+      "depends_on": [
+        "vm-address-space-core",
+        "percpu-smp-gates"
+      ],
+      "paths": [
+        "crates/tx-substrate/src",
+        "crates/tx-hal/src/pmap.rs",
+        "boards/tx-hal-riscv64-qemu-virt/src/pmap"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate --test pmap",
+        "cargo test -p tx-hal-riscv64-qemu-virt",
+        "cargo xtask ci"
+      ],
+      "notes": "Generalize current page-sized local batches to multi-frame runs, superpage accounting, ASID-scoped and global invalidations, and remote-hart acknowledgment. Until this lands, keep user/VM runtime behind a single-hart gate or explicit no-remote-shootdown mode."
+    },
+    {
+      "id": "page-backed-and-reclaim",
+      "title": "Implement PageContainer, RNodeBacking, materialize_page, and reclaim policy hooks",
+      "status": "pending",
+      "depends_on": [
+        "vm-address-space-core",
+        "reactor-and-round-robin-scheduler"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/page_backed",
+        "crates/tx-kernel/src/vfs",
+        "crates/tx-kernel/src/vm"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed",
+        "cargo xtask ci"
+      ],
+      "notes": "Supply VM's backing model: anonymous zero-fill, file-backed PageContainer materialization, RNodeBacking, cache refs, and reclaim retry policy for non-urgent allocations. Substrate continues to return Exhausted; VM/page-backed decides reclaim and retry."
+    },
+    {
+      "id": "process-and-thread-runtime-core",
+      "title": "Implement Process, ThreadIdentity/ThreadPayload, and thread_future skeleton",
+      "status": "pending",
+      "depends_on": [
+        "reactor-and-round-robin-scheduler",
+        "vm-address-space-core",
+        "trap-shell-and-kernel-sink"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/process",
+        "crates/tx-kernel/src/thread_runtime",
+        "crates/tx-kernel/src/trap.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel thread_runtime",
+        "cargo xtask ci"
+      ],
+      "notes": "Create the object-model entities and the long-lived thread future. ThreadPayload owns saved user regs, signal mask/summary, pending queues, stop state, child_tid_clear, and TaskHandle; the reactor owns the future, which holds Cap<ThreadPayload>. No per-thread kernel stacks."
+    },
+    {
+      "id": "syscall-dispatch-and-ast-loop",
+      "title": "Add syscall dispatch, page-fault dispatch, and AST return-to-user loop",
+      "status": "pending",
+      "depends_on": [
+        "process-and-thread-runtime-core",
+        "user-access-fixups",
+        "page-backed-and-reclaim"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/syscall",
+        "crates/tx-kernel/src/trap.rs",
+        "crates/tx-kernel/src/thread_runtime"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel syscall",
+        "cargo xtask ci"
+      ],
+      "notes": "Implement fixed syscall table dispatch, VM page-fault materializer dispatch, error/return-value writes through TrapFrameMut, and Site B AST handling before user re-entry. Timer preemption should not advance thread_future; interesting traps do."
+    },
+    {
+      "id": "vfs-device-and-tty-init",
+      "title": "Initialize VFS, tier-1/tier-2 devices, IRQ dispatch, devfs, and console/TTY",
+      "status": "pending",
+      "depends_on": [
+        "coreinit-spine",
+        "zone-epoch-bus-foundation",
+        "trap-shell-and-kernel-sink"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vfs",
+        "crates/tx-kernel/src/device",
+        "crates/tx-kernel/src/tty",
+        "crates/tx-hal/src"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel device",
+        "cargo test -p tx-kernel vfs",
+        "cargo xtask ci"
+      ],
+      "notes": "Follow DEVICE.md: HAL tier-1 devices remain platform statics; tier-2 static device bindings are enumerated during init; IRQ_HANDLERS are walked once to build an installed dispatch table; devfs exposes device RNodes; console/TTY gets a real userspace-visible path."
+    },
+    {
+      "id": "exec-loader-and-detached-aspace",
+      "title": "Build exec loader and detached AddressSpace construction",
+      "status": "pending",
+      "depends_on": [
+        "vfs-device-and-tty-init",
+        "page-backed-and-reclaim",
+        "process-and-thread-runtime-core"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/exec",
+        "crates/tx-kernel/src/vm",
+        "crates/tx-kernel/src/process"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel exec",
+        "cargo xtask ci"
+      ],
+      "notes": "Implement static-ELF image planning, targeted file reads, detached AddressSpace construction, stack/auxv population, process Frame vm replacement at the point of no return, and ThreadRuntime trap-context install. Keep fallible work before exec's PoNR."
+    },
+    {
+      "id": "first-userspace-entry",
+      "title": "Replace kernel_main shutdown with init process spawn and first return_to_userspace",
+      "status": "pending",
+      "depends_on": [
+        "syscall-dispatch-and-ast-loop",
+        "exec-loader-and-detached-aspace",
+        "reactor-and-round-robin-scheduler"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/lib.rs",
+        "crates/tx-kernel/src/init.rs",
+        "crates/tx-kernel/src/thread_runtime"
+      ],
+      "verification": [
+        "cargo xtask qemu --target rv64-qemu --profile busybox --expect-sentinel",
+        "cargo xtask ci"
+      ],
+      "notes": "kernel_main should spawn the init thread task, enter the reactor loop, dispatch to userspace through return_to_userspace, and keep the kernel alive until init exits. The old boot sentinel may stay as an early milestone, but successful runtime boot should be a distinct userspace/init sentinel."
+    },
+    {
+      "id": "smp-runtime-and-remote-coordination",
+      "title": "Enable AP runtime, cross-hart wakeups, IPIs, and remote shootdown",
+      "status": "pending",
+      "depends_on": [
+        "pmap-shootdown-completion",
+        "reactor-and-round-robin-scheduler",
+        "trap-shell-and-kernel-sink"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/smp",
+        "crates/tx-kernel/src/reactor",
+        "crates/tx-substrate/src",
+        "boards/tx-hal-riscv64-qemu-virt/src"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel smp",
+        "cargo xtask ci"
+      ],
+      "notes": "Bring secondary harts online after substrate and before multi-hart scheduling. Install trap vectors on APs, initialize per-hart reactor/scheduler state, support SmpIf IPIs for wake/reschedule/shootdown, and remove the single-hart runtime gate."
+    },
+    {
+      "id": "oscomp-busybox-runtime-milestones",
+      "title": "Add long-running boot tests for shell, BusyBox, and OSComp images",
+      "status": "pending",
+      "depends_on": [
+        "first-userspace-entry"
+      ],
+      "paths": [
+        "xtask/src/qemu.rs",
+        "xtask/src/image.rs",
+        "xtask/src/oscomp.rs",
+        "docs/progress"
+      ],
+      "verification": [
+        "cargo xtask ci-slow",
+        "cargo xtask oscomp run"
+      ],
+      "notes": "Keep smoke boot separate from runtime boot. Add sentinels for first init entry, first syscall roundtrip, shell prompt, BusyBox command, and OSComp suite readiness as the syscall/VFS/device surface grows."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask progress validate",
+      "status": "not-run",
+      "notes": "Validates this plan's JSON shape."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "not-run",
+      "notes": "Use after design-doc cross-reference edits."
+    },
+    {
+      "command": "cargo xtask ci",
+      "status": "not-run",
+      "notes": "Use after implementation slices, not required for pure checklist creation."
+    }
+  ],
+  "risks": [
+    "The current code is substrate-heavy but has no zone/epoch/bus/reactor implementation yet; those are prerequisites for most upper subsystems.",
+    "A full trap shell without a VM fault path can only panic or terminate; user execution should stay gated until VM and thread runtime exist.",
+    "Remote shootdown and AP scheduling can be deferred for single-hart runtime, but the gate must be explicit to avoid false SMP safety.",
+    "Design docs reference many future subsystems; individual implementation slices should refresh readiness before coding from them."
+  ],
+  "blockers": [
+    "No implemented reactor/task table yet.",
+    "No implemented zone/entity substrate for upper semantic subsystems yet.",
+    "No full RawTrapFrame/user-return path yet.",
+    "No VM AddressSpace/recipes/RangeLock implementation yet."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

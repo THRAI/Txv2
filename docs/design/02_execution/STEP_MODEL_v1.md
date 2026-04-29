@@ -4,14 +4,14 @@
 
 **Status.** v1 (2026-04-19).
 
-**Purpose.** Specify the step primitive: the synchronous, bounded unit of execution that replaces the prepare/commit phase pattern as txKernel's operation-building primitive. Define the step outcome algebra, the in-step commit discipline, witness scope in practice, and how steps compose with drivers and the wait primitive to form operations.
+**Purpose.** Specify the step primitive: the synchronous, bounded unit of execution that replaces the prepare/commit split as txKernel's operation-building primitive. Define the step outcome algebra, the five-stage in-step discipline, witness scope in practice, and how steps compose with drivers and the wait primitive to form operations.
 
 **Audience.** Subsystem authors writing execution code, reviewers evaluating step-function designs, lint-infrastructure authors encoding STEP-* invariants.
 
 **Companion documents.**
 
 - [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — STEP-* rules this document implements; PRED-*, WIT-*, OBL-*, SIG-* rules that steps must honor.
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — vocabulary (step, step outcome, commit discipline, scripts, waits).
+- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — vocabulary (step, step outcome, five-stage discipline, scripts, waits).
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) — reference hierarchy, reclamation, bindings.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — module layout within which step functions live.
 - [`BUS_v1.md`](../01_substrate/BUS_v1.md) — bus primitive APIs invoked from step commits.
@@ -91,19 +91,20 @@ The driver treats the carrier opaquely (DISP-2): it does not inspect what the ca
 
 ---
 
-## 3. The in-step commit discipline
+## 3. The five-stage in-step discipline
 <!-- txdoc:STEP-3-THE-IN-STEP-COMMIT-DISCIPLINE -->
 
-When a step mutates state, it follows a fixed four-phase internal discipline (STEP-4):
+When a step mutates state, it follows a fixed five-stage internal discipline (STEP-4):
 
 ```
 1. Observe      — require produces witnesses under epoch guard (WIT-*)
 2. Upgrade      — IdentRef → Cap / PayloadCap / typed contribution (OBL-4)
-3. Mutate       — substrate primitives install/remove/modify bindings
-4. Publish      — bus primitives fire signals for attached transitions (SIG-4)
+3. Reserve      — linear substrate reservations acquire slots, ids, or credit
+4. Commit       — substrate commit primitives install/remove/modify bindings
+5. Publish      — bus primitives fire signals for attached transitions (SIG-4)
 ```
 
-Each phase has a specific role and constraints. Skipping or reordering is a STEP-4 violation.
+Each stage has a specific role and constraints. Skipping or reordering is a STEP-4 violation.
 
 ### 3.1 Observe
 <!-- txdoc:STEP-3-1-OBSERVE -->
@@ -120,32 +121,39 @@ For bindings the step intends to install or modify, observations must be promote
 - Addressability bindings require `Cap<T>` — upgrade succeeds unless the entity has been marked dead.
 - Operational bindings require `T::OperationalEvidence` — upgrade succeeds unless the payload has been released.
 
-If any upgrade fails, the step releases all already-acquired reservations and returns `Err` (typically `ESTALE` or the appropriate errno for "target gone during resolution"). Partial upgrade is not allowed; either all required evidence is held, or none is.
+If any upgrade fails, the step releases all already-acquired evidence and returns `Err` (typically `ESTALE` or the appropriate errno for "target gone during resolution"). Partial upgrade is not allowed; either all required evidence is held, or none is.
 
-### 3.3 Mutate
-<!-- txdoc:STEP-3-3-MUTATE -->
+### 3.3 Reserve
+<!-- txdoc:STEP-3-3-RESERVE -->
 
-With evidence in hand, mutations apply through **substrate primitives** (`zone::sign`, `index::commit`, `index::withdraw_commit`, `index::swap_commit`, `credit::commit`). These primitives enforce observer-safety: concurrent walkers see either the pre-mutation or post-mutation state, never an intermediate.
+With evidence in hand, the step acquires every fallible substrate reservation it will need: zone slots, index slots, bitmap ids, credit reservations, page frames, or subsystem-specific linear reservation tokens. Reservation is still pre-visibility work. If any reservation fails, already-acquired reservations drop cleanly and the step returns `Err` before any observer-visible change has occurred.
+
+Reservation code may initialize private, unpublished objects behind the reserved slots. These objects are not reachable from public indexes or bindings until the commit stage consumes the reservation.
+
+### 3.4 Commit
+<!-- txdoc:STEP-3-4-COMMIT -->
+
+Mutations apply through **substrate commit primitives** (`zone::sign`, `index::commit`, `index::withdraw_commit`, `index::swap_commit`, `credit::commit`). These primitives consume the reservations from stage 3 and enforce observer-safety: concurrent walkers see either the pre-mutation or post-mutation state, never an intermediate.
 
 Mutations are linearized at each substrate primitive's atomic transition. Multiple mutations within one step are sequenced by the step's code; each is its own linearization point, each observable independently (per-carrier ordering, SIG-5). Compound mutations that must be jointly atomic use `swap_commit` or similar substrate primitives that bundle the transition.
 
 Direct field writes that bypass substrate primitives are STEP-4 violations and compromise the observer-safety guarantee.
 
-### 3.4 Publish
-<!-- txdoc:STEP-3-4-PUBLISH -->
+### 3.5 Publish
+<!-- txdoc:STEP-3-5-PUBLISH -->
 
 After each linearizing write, the step fires signal attachments declared for that transition (SIG-4). The fire happens on the same carrier as the transition, within the same step's synchronous execution, after the write is visible to observers.
 
-Not every mutation publishes (SIG-3). Only transitions with external subscribers need signal attachments. The attachment catalog (SIGNAL_ATTACHMENTS.md) records which transitions fire which wires.
+Not every committed mutation publishes (SIG-3). Only transitions with external subscribers need signal attachments. The attachment catalog (SIGNAL_ATTACHMENTS.md) records which transitions fire which wires.
 
-Publication uses bus primitives directly (SIG-6). Substrate primitives do not fire signals; the subsystem's step code does, as the step's final action before returning.
+Publication uses bus primitives directly (SIG-6). Substrate primitives do not fire signals; the subsystem's step code does, as the step's final externally visible action before returning.
 
-### 3.5 Return
-<!-- txdoc:STEP-3-5-RETURN -->
+### 3.6 Return
+<!-- txdoc:STEP-3-6-RETURN -->
 
-The step returns a step outcome reflecting what happened. A mutating step that completes its work returns `Done(value)`. A mutating step that made progress but could not finish returns `Advanced(progress)` or `AdvancedThenBlocked(progress, carrier, interests)`. A step that tried to mutate but hit a reclamation sentinel on upgrade returns `Err(errno)`.
+The step returns a step outcome reflecting what happened. A mutating step that completes its work returns `Done(value)`. A mutating step that made progress but could not finish returns `Advanced(progress)` or `AdvancedThenBlocked(progress, carrier, interests)`. A step that intended to mutate but hit a reclamation sentinel on upgrade returns `Err(errno)`.
 
-Non-mutating steps skip phases 2, 3, and 4 and return outcomes based on observation alone. A step consulting a predicate to answer `fstat` observes, formats the result into `Done(stat_result)`, and returns.
+Non-mutating steps skip stages 2 through 5 and return outcomes based on observation alone. A step consulting a predicate to answer `fstat` observes, formats the result into `Done(stat_result)`, and returns.
 
 ---
 
@@ -239,10 +247,12 @@ pipe::step_open(ctx, path, flags, mode) -> StepOutcome<Fd>:
     [upgrade]
     target_cap = upgrade_cap(lookup_witness.target())?    // Cap<RNode>
 
-    [mutate]
+    [reserve]
     openfile_slot = zone::reserve::<OpenFile>()?
     fd_slot = ctx.fd_table.reserve_slot()?
     openfile = OpenFile { rnode: target_cap, offset: 0, flags, ... }
+
+    [commit]
     zone::sign(openfile_slot, openfile)                  // publishes OpenFile
     index::commit(ctx.fd_table, fd_slot, Cap(openfile_slot))  // publishes fd
 
@@ -256,7 +266,7 @@ pipe::step_open(ctx, path, flags, mode) -> StepOutcome<Fd>:
 
 One guard, one require-chain, two coordinated substrate commits, no publications. If any require fails, the step returns `Err(errno)`. If either substrate reservation fails, all prior reservations drop cleanly (linear reservation types enforce this at the type level).
 
-There is no `open_prepare` + `open_commit` split. The four-phase discipline happens within the single step. The "prepare" language in prior iterations corresponded to the observe+upgrade phases; "commit" to mutate+publish; the split into two functions was a v11/v12 convenience, not a framework requirement.
+There is no `open_prepare` + `open_commit` split. The five-stage discipline happens within the single step. The "prepare" language in prior iterations corresponded to the observe+upgrade+reserve stages; "commit" to commit+publish; the split into two functions was a v11/v12 convenience, not a framework requirement.
 
 ### 5.2 Example: `unlink`
 <!-- txdoc:STEP-5-2-EXAMPLE-UNLINK -->
@@ -275,8 +285,11 @@ vfs::step_unlink(ctx, path) -> StepOutcome<()>:
     parent_cap = upgrade_cap(parent_witness.parent())?
     binding_cap = upgrade_cap(resolve_witness.binding())?
 
-    [mutate]
-    index::withdraw_commit(parent_cap.children, binding_cap.key)
+    [reserve]
+    binding_withdrawal = index::reserve_withdraw(parent_cap.children, binding_cap.key)?
+
+    [commit]
+    index::withdraw_commit(binding_withdrawal)
     // Drop of binding_cap's evidence decrements LinkPin on RNode;
     // if nlinks→0 and no open refs, triggers reclaim.
 
@@ -305,7 +318,7 @@ process::step_fork(ctx, flags) -> StepOutcome<Pid>:
     [upgrade]
     parent_cap = upgrade_cap(parent_witness.process())?
 
-    [mutate]
+    [reserve]
     child_identity_slot = zone::reserve::<ProcessIdentity>()?
     child_payload_slot = zone::reserve::<ProcessPayload>()?
     thread_identity_slot = zone::reserve::<ThreadIdentity>()?
@@ -318,6 +331,7 @@ process::step_fork(ctx, flags) -> StepOutcome<Pid>:
     child_pid_name = new_pid_name(child_pid_reservation.nr, Cap(child_identity_slot))
     // ... similarly for thread
 
+    [commit]
     zone::sign(child_payload_slot, child_payload)
     zone::sign(thread_payload_slot, thread_payload)
     zone::sign(child_identity_slot, child_identity)
@@ -384,7 +398,9 @@ pipe::step_read(ctx, handle, buf, resume) -> StepOutcome<usize>:
         pipe_cap = upgrade_cap(pipe_witness)?
         //   (only upgrade if we mutate; but read mutates the cursor)
 
-        [mutate — consume from ring]
+        [reserve — no separate reservation needed for bounded ring cursor update]
+
+        [commit — consume from ring]
         n = min(available, remaining);
         pipe.ring.pop_into(&mut buf.slice_mut(n));   // substrate-protected ring op
         pipe.ring.advance_read(n);                   // substrate index::commit
@@ -481,7 +497,8 @@ splice::step_move(ctx, src_handle, sink_handle, count, resume) -> StepOutcome<us
     // both have something; move a bounded chunk
     chunk = min(src_available, sink_space, remaining, STEP_CHUNK_LIMIT);
     [upgrade src + sink caps]
-    [mutate: move chunk bytes from src to sink via substrate]
+    [reserve: acquire any destination buffer or credit reservations]
+    [commit: move chunk bytes from src to sink via substrate]
     [publish: src write_wq (space freed), sink read_wq (data available)]
 
     advanced = Progress(chunk);
@@ -556,7 +573,7 @@ wait::wait_event(
 ).await
 ```
 
-Under the identity "retry is recheck" from CONCEPTS §9.4, the `condition` closure is a lightweight predicate check that returns true if step would now return `Advanced*` or `Done` or `Err`. In practice, the condition often matches the step's early-observation phase: check the same fields the step would check first.
+Under the identity "retry is recheck" from CONCEPTS §9.4, the `condition` closure is a lightweight predicate check that returns true if step would now return `Advanced*` or `Done` or `Err`. In practice, the condition often matches the step's early observe stage: check the same fields the step would check first.
 
 Some subsystems implement `condition` by calling into a dedicated predicate function that the step itself also uses internally — keeping the re-check and the step in sync by construction.
 
@@ -598,7 +615,7 @@ execution/vfs/
 
 One file per step function is the common pattern; related steps may share a file (e.g., `step_read` and `step_write` on a simple ring-based entity might be co-located). Resume types are subsystem-private; they do not leak into the driver layer beyond their opaque handle.
 
-The prior `*_prepare` + `*_commit` pair convention is retired. A step function does both halves (observe+upgrade, then mutate+publish) within one function body, reflecting STEP-6's rejection of an operation-level commit phase.
+The prior `*_prepare` + `*_commit` pair convention is retired. A step function does all five stages (observe, upgrade, reserve, commit, publish) within one function body, reflecting STEP-6's rejection of an operation-level commit phase.
 
 ---
 
@@ -613,11 +630,11 @@ Patterns that violate the step model, with the violated invariants:
 
 **A-3.** Calling `.await` inside a step. *Violates STEP-2.* Fix: if the step cannot complete synchronously, return `Blocked` with the carrier the async operation would wake on, and let the driver compose the wait.
 
-**A-4.** Inspecting subsystem state from a driver (e.g., "check pipe buffer size before calling step_read"). *Violates DISP-2.* Fix: the check belongs in step_read's observation phase.
+**A-4.** Inspecting subsystem state from a driver (e.g., "check pipe buffer size before calling step_read"). *Violates DISP-2.* Fix: the check belongs in step_read's observe stage.
 
 **A-5.** Firing a signal before the corresponding mutation. *Violates SIG-4.* Fix: always fire after `substrate::*_commit` returns, never before.
 
-**A-6.** Firing a signal from outside a step's publish phase (e.g., from checks/, or from a projection). *Violates SIG-6 and the commit discipline.* Fix: signals only fire from the publish phase of a step.
+**A-6.** Firing a signal from outside a step's publish stage (e.g., from checks/, or from a projection). *Violates SIG-6 and the five-stage discipline.* Fix: signals only fire from the publish stage of a step.
 
 **A-7.** Writing fields directly to mutate state, bypassing substrate primitives. *Violates STEP-4 and observer-safety.* Fix: all binding mutations go through `substrate::index::*`; all zone writes go through `substrate::zone::sign`.
 
@@ -640,7 +657,7 @@ Each anti-pattern has a canonical fix. Lints can detect many of these structural
 
 For readers familiar with earlier iterations:
 
-- **v11 prepare/commit pairs** are now single step functions. The prepare phase corresponds to observe+upgrade; the commit phase to mutate+publish. One function, four internal phases, STEP-6 explicitly rejects operation-level phase separation.
+- **v11 prepare/commit pairs** are now single step functions. The old prepare half maps to observe+upgrade+reserve; the old commit half maps to commit+publish. One function, five internal stages, STEP-6 explicitly rejects operation-level phase separation.
 
 - **v11 attempt functions** (as used in blocking I/O path) are now step functions with multi-step trajectories. The former "attempt" is one invocation of a step; the former "driver retry loop" is unchanged but its primitive is now "call step" rather than "call attempt."
 

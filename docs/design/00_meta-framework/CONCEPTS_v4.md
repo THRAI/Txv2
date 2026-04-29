@@ -14,7 +14,7 @@
 - [`object_model_v2.md`](object_model_v2.md) — current implementation object model: entities, references, bindings, obligations, retention, and reclamation.
 - [`INVARIANTS_v4.md`](INVARIANTS_v4.md) — canonical grep-friendly invariant set and linter notes.
 - [`REACTOR_v0.md`](../02_execution/REACTOR_v0.md) — reactor boundary.
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) — step outcome algebra and in-step discipline.
+- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) — step outcome algebra and five-stage in-step discipline.
 - [`THREAD_RUNTIME_v1.md`](../02_execution/THREAD_RUNTIME_v1.md) — thread future, AST, signal delivery, and thread exit.
 - [`BUS_v1.md`](../01_substrate/BUS_v1.md) — bus primitives and wait integration.
 - [`COMPLETION_v1.md`](../02_execution/COMPLETION_v1.md) — completion as specialized wait middleware.
