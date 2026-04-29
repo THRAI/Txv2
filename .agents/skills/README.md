@@ -24,8 +24,8 @@ Current orientation skills:
 - `tx-docs-skill-maintenance` refreshes generated skills from canonical docs.
 - `tx-ebr-zone` covers object model, EBR, zone, cap, weak, witness, identity
   slot, and projection-reference docs.
-- `tx-hal-axhal` covers HAL, boot, page substrate, traps, pmap, and platform
-  docs.
+- `tx-hal-axhal` covers HAL, boot, page substrate, traps, pmap, platform docs,
+  and host-side RV64 fault decoding with `cargo xtask fault-decode`.
 - `tx-implementation-readiness` audits whether a doc area is ready to implement
   from.
 - `tx-meta-alignment` covers edits under `docs/design/00_meta-framework/`.

@@ -30,6 +30,12 @@ Use this skill for HAL/substrate boundary work.
 - Page substrate owns frame allocator, `FrameMeta`, slab heap, and steady-state page accounting.
 - Semantic subsystems own user-visible entities and policy.
 
+## Debugging
+
+- For RV64 QEMU `scause`/`sepc`/`stval` dumps, use `cargo xtask fault-decode
+  --target rv64-qemu` before manual `nm`/`addr2line` work. It is a host-side
+  decoder for trap logs and raw addresses; it does not change HAL trap policy.
+
 ## Done Means
 
 - Old OSTD terms appear only as historical/migration/negative-rule notes.
