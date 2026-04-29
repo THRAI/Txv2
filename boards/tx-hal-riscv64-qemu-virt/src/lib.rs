@@ -6,6 +6,8 @@ extern crate std;
 mod boot_static;
 mod dtb;
 mod pmap;
+mod time;
+mod trap;
 
 use boot_static::{
     reserved_region, BootStaticBag, IdentityDropped, IdentityLive, CMDLINE_CAPACITY,
@@ -17,8 +19,7 @@ use tx_hal::{
     BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, DmaIf, InitIf, IrqIf, MemoryRegion,
     MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError,
     PmapIf, PmapInvalidation, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
-    PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SignalFrameIf, SmpIf, TimeIf, TrapClass,
-    TrapFrameSnapshot, TrapIf, UserAccessIf,
+    PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SignalFrameIf, SmpIf, TimeIf, UserAccessIf,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -154,17 +155,6 @@ _start:
     wfi
     j 7b
 
-    .section .text.trap, "ax"
-    .align 2
-    .globl tx_rv64_qemu_minimal_trap_vector
-tx_rv64_qemu_minimal_trap_vector:
-    csrr a0, scause
-    csrr a1, sepc
-    csrr a2, stval
-    call tx_rv64_qemu_trap_panic
-4:
-    wfi
-    j 4b
 "#
 );
 
@@ -354,41 +344,26 @@ impl PmapIf for Platform {
         pmap::shootdown_mapping(asid, invalidation);
     }
 }
-impl TrapIf for Platform {
-    fn install_minimal_trap_vector() {
-        install_rv64_trap_vector();
-    }
-
-    fn install_kernel_trap_vector() {
-        install_rv64_trap_vector();
-    }
-
-    fn classify_trap(snapshot: TrapFrameSnapshot) -> TrapClass {
-        classify_rv64_trap(snapshot.scause)
-    }
-}
-
-fn classify_rv64_trap(scause: usize) -> TrapClass {
-    let interrupt_bit = 1usize << (usize::BITS as usize - 1);
-    let is_interrupt = scause & interrupt_bit != 0;
-    let code = scause & !interrupt_bit;
-
-    match (is_interrupt, code) {
-        (false, 2) => TrapClass::IllegalInstruction,
-        (false, 3) => TrapClass::Breakpoint,
-        (false, 8) => TrapClass::UserEnvCall,
-        (false, 12) => TrapClass::InstructionPageFault,
-        (false, 13) => TrapClass::LoadPageFault,
-        (false, 15) => TrapClass::StorePageFault,
-        (true, 5) => TrapClass::SupervisorTimer,
-        (true, 9) => TrapClass::SupervisorExternal,
-        _ => TrapClass::Unknown,
-    }
-}
 impl UserAccessIf for Platform {}
 impl SignalFrameIf for Platform {}
 impl IrqIf for Platform {}
-impl TimeIf for Platform {}
+impl TimeIf for Platform {
+    fn read_ns() -> u64 {
+        time::read_ns(Self::frequency_hz())
+    }
+
+    fn set_deadline_ns(deadline: u64) {
+        time::set_deadline_ns(deadline, Self::frequency_hz());
+    }
+
+    fn cancel_deadline() {
+        time::cancel_deadline();
+    }
+
+    fn frequency_hz() -> u64 {
+        Self::platform_info().timebase_frequency_hz
+    }
+}
 impl PercpuIf for Platform {}
 impl CacheIf for Platform {}
 impl DmaIf for Platform {}
@@ -424,58 +399,6 @@ fn sbi_shutdown() {
     }
 }
 
-fn install_rv64_trap_vector() {
-    let vector = BootStaticBag::<IdentityLive>::current_trap_vector_kernel_alias();
-
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        core::arch::asm!(
-            "csrw stvec, {vector}",
-            vector = in(reg) vector.0,
-            options(nostack)
-        );
-    }
-
-    #[cfg(not(target_arch = "riscv64"))]
-    let _ = vector;
-}
-
-#[cfg(target_arch = "riscv64")]
-#[no_mangle]
-extern "C" fn tx_rv64_qemu_trap_panic(scause: usize, sepc: usize, stval: usize) -> ! {
-    console_write_literal(b"txkernel:qemu-riscv64-virt:trap\nscause=0x");
-    console_write_hex(scause);
-    console_write_literal(b" sepc=0x");
-    console_write_hex(sepc);
-    console_write_literal(b" stval=0x");
-    console_write_hex(stval);
-    console_write_literal(b"\n");
-
-    loop {
-        core::hint::spin_loop();
-    }
-}
-
-#[cfg(target_arch = "riscv64")]
-fn console_write_literal(bytes: &[u8]) {
-    for &byte in bytes {
-        sbi_console_putchar(byte);
-    }
-}
-
-#[cfg(target_arch = "riscv64")]
-fn console_write_hex(value: usize) {
-    for shift in (0..usize::BITS).rev().step_by(4) {
-        let digit = ((value >> shift) & 0xf) as u8;
-        let byte = if digit < 10 {
-            b'0' + digit
-        } else {
-            b'a' + (digit - 10)
-        };
-        sbi_console_putchar(byte);
-    }
-}
-
 impl BootStaticBag<IdentityLive> {
     fn publish_boot_info_before_identity_drop(mut self, firmware_arg: usize) -> Self {
         debug_assert_eq!(self.firmware_dtb().addr(), firmware_arg);
@@ -493,20 +416,25 @@ impl BootStaticBag<IdentityLive> {
         cmdline.fill(0);
 
         let parsed = parse_boot_info_from_fdt(dtb_addr, memory_regions, cmdline);
-        let (memory_region_count, initrd, cmdline_len) = if let Some(parsed) = parsed {
-            (
-                parsed.memory_region_count,
-                parsed.initrd,
-                parsed.cmdline_len.min(CMDLINE_CAPACITY),
-            )
-        } else {
-            memory_regions[0] = MemoryRegion {
-                base: PhysAddr(QEMU_VIRT_RAM_BASE),
-                size: QEMU_VIRT_FALLBACK_RAM_SIZE,
-                kind: MemoryRegionKind::Usable,
+        let (memory_region_count, initrd, cmdline_len, timebase_frequency_hz) =
+            if let Some(parsed) = parsed {
+                (
+                    parsed.memory_region_count,
+                    parsed.initrd,
+                    parsed.cmdline_len.min(CMDLINE_CAPACITY),
+                    parsed
+                        .timebase_frequency_hz
+                        .unwrap_or(time::QEMU_VIRT_FALLBACK_TIMEBASE_HZ),
+                )
+            } else {
+                memory_regions[0] = MemoryRegion {
+                    base: PhysAddr(QEMU_VIRT_RAM_BASE),
+                    size: QEMU_VIRT_FALLBACK_RAM_SIZE,
+                    kind: MemoryRegionKind::Usable,
+                };
+                (1, None, 0, time::QEMU_VIRT_FALLBACK_TIMEBASE_HZ)
             };
-            (1, None, 0)
-        };
+        self.publish_timebase_frequency_hz(timebase_frequency_hz);
         let memory_region_count =
             reserve_firmware_loader_region(memory_regions, memory_region_count);
 
@@ -548,21 +476,66 @@ fn reserve_firmware_loader_region(
 
 #[cfg(test)]
 mod tests {
-    use tx_hal::{TrapClass, TrapFrameSnapshot, TrapIf};
+    use tx_hal::{TrapClass, TrapFrameSnapshot, TrapIf, VirtAddr};
 
-    use crate::{classify_rv64_trap, Platform};
+    use crate::{trap::classify_rv64_trap, Platform};
 
     #[test]
     fn rv64_trap_classification_decodes_sync_faults_and_interrupts() {
         assert_eq!(classify_rv64_trap(2), TrapClass::IllegalInstruction);
-        assert_eq!(classify_rv64_trap(12), TrapClass::InstructionPageFault);
-        assert_eq!(classify_rv64_trap(13), TrapClass::LoadPageFault);
-        assert_eq!(classify_rv64_trap(15), TrapClass::StorePageFault);
+        assert_eq!(classify_rv64_trap(3), TrapClass::Breakpoint);
+        assert_eq!(
+            classify_rv64_trap(4),
+            TrapClass::AlignmentFault {
+                write: false,
+                instruction: false,
+            }
+        );
+        assert_eq!(
+            classify_rv64_trap(6),
+            TrapClass::AlignmentFault {
+                write: true,
+                instruction: false,
+            }
+        );
+        assert_eq!(
+            classify_rv64_trap(0),
+            TrapClass::AlignmentFault {
+                write: false,
+                instruction: true,
+            }
+        );
+        assert_eq!(classify_rv64_trap(8), TrapClass::Syscall);
+        assert_eq!(
+            classify_rv64_trap(12),
+            TrapClass::PageFault {
+                write: false,
+                instruction: true,
+            }
+        );
+        assert_eq!(
+            classify_rv64_trap(13),
+            TrapClass::PageFault {
+                write: false,
+                instruction: false,
+            }
+        );
+        assert_eq!(
+            classify_rv64_trap(15),
+            TrapClass::PageFault {
+                write: true,
+                instruction: false,
+            }
+        );
 
         let interrupt_bit = 1usize << (usize::BITS as usize - 1);
         assert_eq!(
+            classify_rv64_trap(interrupt_bit | 1),
+            TrapClass::InterprocessorInterrupt
+        );
+        assert_eq!(
             classify_rv64_trap(interrupt_bit | 5),
-            TrapClass::SupervisorTimer
+            TrapClass::TimerInterrupt
         );
         assert_eq!(
             Platform::classify_trap(TrapFrameSnapshot {
@@ -570,7 +543,68 @@ mod tests {
                 sepc: 0x1000,
                 stval: 0,
             }),
-            TrapClass::SupervisorExternal
+            TrapClass::ExternalInterrupt
         );
+    }
+
+    #[test]
+    fn rv64_trap_classification_distinguishes_unknown_sync_and_interrupt() {
+        let interrupt_bit = 1usize << (usize::BITS as usize - 1);
+
+        assert_eq!(classify_rv64_trap(63), TrapClass::UnknownSync);
+        assert_eq!(
+            classify_rv64_trap(interrupt_bit | 63),
+            TrapClass::UnknownInterrupt
+        );
+    }
+
+    #[test]
+    fn trap_class_legacy_names_remain_compatible() {
+        assert_eq!(
+            TrapClass::InstructionPageFault,
+            TrapClass::PageFault {
+                write: false,
+                instruction: true,
+            }
+        );
+        assert_eq!(
+            TrapClass::LoadPageFault,
+            TrapClass::PageFault {
+                write: false,
+                instruction: false,
+            }
+        );
+        assert_eq!(
+            TrapClass::StorePageFault,
+            TrapClass::PageFault {
+                write: true,
+                instruction: false,
+            }
+        );
+        assert_eq!(TrapClass::UserEnvCall, TrapClass::Syscall);
+        assert_eq!(TrapClass::SupervisorTimer, TrapClass::TimerInterrupt);
+        assert_eq!(TrapClass::SupervisorExternal, TrapClass::ExternalInterrupt);
+        assert_eq!(TrapClass::Unknown, TrapClass::UnknownSync);
+    }
+
+    #[test]
+    fn platform_trap_snapshot_projects_portable_fault_fields() {
+        let snapshot = TrapFrameSnapshot {
+            scause: 15,
+            sepc: 0x2000,
+            stval: 0xfeed_cafe,
+        };
+
+        let portable = Platform::snapshot_trap(snapshot);
+
+        assert_eq!(
+            portable.class,
+            TrapClass::PageFault {
+                write: true,
+                instruction: false,
+            }
+        );
+        assert_eq!(portable.pc, VirtAddr(0x2000));
+        assert_eq!(portable.fault_address, Some(VirtAddr(0xfeed_cafe)));
     }
 }

@@ -200,6 +200,30 @@
   anchor via `OwnedFrame::into_permanent_frame()`. `TrapIf` now exposes
   `install_kernel_trap_vector()` and generic `tx_kernel::kernel_main::<P>()`
   calls it after `P::init_later()`.
+- `tx-substrate` now has the first executable EBR/Zone substrate slice:
+  `epoch::guard`, per-CPU retired-node slices, bounded drain, `Zone<T>` static
+  registration, frame-backed bitmap slabs, compact `Cap<T>` / `Weak<T>` keys,
+  `ZoneReservation<T>` reserve/sign publication, `Weak -> IdentRef -> Cap`
+  upgrade, and EBR-delayed slot/slab reclamation. `Cap<T>` is 4 bytes and
+  `Weak<T>` is 8 bytes by compile-time assertion. RV64 QEMU smoke can run the
+  kernel-side zone smoke path and prints `txkernel:zone:smoke:ok` before the
+  boot sentinel. Remaining gaps are linker-section auto-registration of all
+  static zones, full upper-subsystem zone manifests, SMP stress coverage, and
+  the still-pending bus/index/mutation substrate pieces.
+- The remote `origin/zone` EBR/Zone branch (`e53956e`) has been audited and
+  conflict-resolved on `codex/zone-ebr-integration` against
+  `codex/reactor-task-aware`. The merge keeps the newer HAL trap/pmap/TimeIf
+  surface, adopts the directory-based EBR/Zone implementation, removes the old
+  flat placeholder modules, wires CoreInit to run the kernel zone smoke, and
+  updates stale host tests to the new static-zone API. The integration also
+  removed imported clippy blockers, repaired the HumanLayer README link target
+  for docs lint, and made the reactor smoke test counters per-test so full
+  workspace CI is deterministic. Verification: `cargo fmt --check`, `cargo
+  test -p tx-substrate`, `cargo test -p tx-hal-riscv64-qemu-virt`, `cargo
+  check -p tx-kernel`, `cargo xtask lint unused`, `cargo xtask lint docs`,
+  `cargo xtask progress validate`, `cargo xtask ci`, RV64 QEMU smoke sentinel
+  with `txkernel:zone:smoke:ok`, and `git diff --check`. Blocker: none found
+  in the conflict audit.
 - RV64 QEMU now implements safe in-place kernel pmap permission updates through
   `PmapIf::protect_kernel_mapping()`. It rewrites existing same-granularity
   leaves, returns a `PmapInvalidation`, treats absent mappings as no mutation,
@@ -347,6 +371,92 @@
   (`codex/trap-coreinit`). Their ownership, paths, and verification commands
   are recorded under `docs/progress/worktrees/`; next step is per-lane planning
   before implementation. No blocker.
+- The earlier substrate/kernel-main integration branch is closed and
+  superseded by `codex/reactor-task-aware`; see
+  `docs/progress/worktrees/2026-04-29-substrate-parallel-integration.json`.
+  The trap vocabulary/RV64 extraction, pmap root/ASID/shootdown hardening,
+  bounded zone/index/mutation primitives, and initial reactor smoke work are
+  now part of the later reactor-task-aware line.
+- `tx_kernel::kernel_main` now delegates to `init::CoreInit<P>::boot`, which
+  names the current H3 order explicitly while preserving the
+  `txkernel:<board>:reactor:task:ok` and `txkernel:<board>:boot:ok`
+  sentinels. The H4 slots for post-substrate hooks, VFS/device ordering,
+  scheduler/process init, and userspace entry remain deferred placeholders; see
+  `docs/progress/worktrees/2026-04-29-coreinit-spine.json`.
+- `tx-reactor` now has task-aware wake and first wait-channel mechanics:
+  tasks carry explicit `Runnable`/`Polling`/`Parked`/`Completed` status, enter a
+  runnable queue on submit or task-local wake, and repeated wake calls coalesce
+  before the next poll. `wait::Channel`, `Mask`, `WaitFuture`,
+  `WaitProtocol`, `WaitOutcome`, and `wait_event` now let a task park on a mask
+  and let another task fire the channel; matching waiter readiness is
+  token-backed so later nonmatching fires cannot erase a wake before the waiter
+  is repolled. `wait_event` rechecks its condition after each wake, preserving
+  the REACTOR_v0 rule that wake is not truth. Focused tests cover per-task wake
+  isolation, pending wake idleness, duplicate wake coalescing, task-to-task
+  channel wake, matching-wake preservation, and spurious wake re-parking.
+  Verification:
+  `cargo fmt --check`, `cargo test -p tx-reactor`, `cargo xtask lint unused`,
+  `cargo xtask progress validate`, `cargo xtask ci`, `cargo xtask ci-slow`, and
+  `git diff --check`; next step is timer/signal classification hooks plus the
+  scheduler/idle loop boundary.
+- `TimeIf` is now a concrete HAL deadline surface for reactor/scheduler use:
+  `tx-hal` exposes `read_ns`, `set_deadline_ns`, `cancel_deadline`, and
+  `frequency_hz`, plus saturating ns/tick conversion helpers. RV64 QEMU parses
+  root DTB `timebase-frequency` through the existing DTB reader, publishes it
+  as `PlatformInfo.timebase_frequency_hz`, reads `rdtime`, and programs
+  absolute deadlines with legacy SBI `set_timer`; the qemu virt 10 MHz
+  fallback is documented for absent/zero/invalid firmware data. LA64 and M1
+  Dock mock boards have explicit compile stubs only. Verification:
+  `cargo fmt --check`, `cargo test -p tx-hal-riscv64-qemu-virt`,
+  `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`, `cargo xtask lint unused`, and
+  `cargo xtask progress validate`; next step is for reactor/scheduler code to
+  consume `TimeIf` without adding a runtime HAL manager. No blocker.
+- `tx-reactor` now has host-driven timeout waits on top of the task-aware wait
+  channel: `Reactor::channel()` creates timer-aware channels, timeout
+  `WaitProtocol` variants carry absolute nanosecond deadlines, and
+  `Reactor::advance_time_to(now_ns)` wakes expired deadlines so
+  `wait_event` can return `TimedOut` while still rechecking semantic readiness
+  after every event wake. Focused tests cover no early timeout,
+  ready-before-timeout unregister, and spurious event wake re-parking before
+  timeout. Verification: `cargo fmt --check`, `cargo test -p tx-reactor`,
+  `cargo xtask lint unused`, `cargo xtask lint docs`,
+  `cargo xtask progress validate`, `cargo xtask ci`, `cargo xtask ci-slow`,
+  and `git diff --check`. Next step: scheduler shell boundary types and, after
+  the saved-register trap shell exists, a narrow trap-to-kernel timer delivery
+  hook; no EBR/zone work was touched.
+- `tx-reactor` now also has the first scheduler shell:
+  scheduler-facing task/hart/slice/stop/wake/meta types, `SchedulerPolicy`,
+  `Phase1Scheduler`, policy-backed submit/wake/pick paths, stop-reason
+  reporting for tests, and `Reactor::next_deadline_ns()`. Plain
+  `Reactor::submit` futures remain kernel-only cooperative tasks; trap-driven
+  timer delivery and userspace-run dispatch remain later slices. See
+  `docs/progress/worktrees/2026-04-29-reactor-scheduler-shell.json`.
+- `tx_kernel::vm` now has a pure/mock VM foundation: `UserVirtAddr`,
+  `UserPage`, `UserRange`, protection/access flags, draft `VmEntry`
+  split/rewrite helpers for `munmap`/`mprotect`-like value behavior, and a
+  bounded no-alloc `RangeLock` with materializer/writer modes. It does not
+  publish a real zone-owned `AddressSpace`, `PageContainer`, pmap
+  materialization, shootdown retention, or user-access path yet; see
+  `docs/progress/worktrees/2026-04-29-vm-range-foundation.json`.
+  Integrated verification on `codex/reactor-task-aware`: `cargo fmt --check`,
+  `cargo test -p tx-reactor`, `cargo test -p tx-kernel vm`, `cargo test -p
+  tx-kernel`, `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`, `cargo xtask lint unused`, `cargo xtask lint
+  docs`, `cargo xtask progress validate`, `cargo xtask ci`, `cargo xtask
+  ci-slow`, and `git diff --check`. Next step: either wire a kernel
+  scheduler/CoreInit adapter or start the timer-trap delivery shell; blockers
+  remain the full saved-register trap shell and real zone-owned VM entities.
+- Local `main` has been merged forward with remote `origin/main` after the
+  reactor-task-aware and zone/EBR PRs landed, while preserving the local
+  agent-runner commits. Conflict resolution kept the board MMIO facts with the
+  new `PlatformInfo.timebase_frequency_hz` field, kept the `CoreInit` kernel
+  entry path, and accepted the upstream merged progress records. Verification:
+  `cargo fmt --check`, `cargo xtask progress validate`, `cargo xtask lint
+  docs`, `cargo xtask ci`, `cargo xtask build --target rv64-qemu`, RV64 QEMU
+  smoke sentinel, and serial grep for zone/reactor/boot sentinels. Next step
+  is pushing the merge commit if this local agent-runner mainline should become
+  the remote `main`. Blocker: none.
 - `TrapIf` now includes typed trap snapshots and classification. RV64 QEMU
   decodes common synchronous faults and supervisor interrupts from `scause`;
   the direct-mode vector still panics/spins until the full saved-register
@@ -403,6 +513,7 @@
 - `docs/progress/decisions/2026-04-29-m1dock-mock-pt-node-kernel-mapping.md`
 - `docs/progress/decisions/2026-04-29-la64-m1-memory-pmap-prep.md`
 - `docs/progress/decisions/2026-04-29-pre-substrate-smoke-gate.md`
+- `docs/progress/decisions/2026-04-29-ebr-zone-first-executable-slice.md`
 - `docs/progress/decisions/2026-04-29-rv64-high-vma-low-lma-linker.md`
 - `docs/progress/decisions/2026-04-29-rv64-low-linked-identity-retention.md`
 - `docs/progress/decisions/2026-04-28-pageallocator-token-interface.md`

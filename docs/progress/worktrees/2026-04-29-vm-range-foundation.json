@@ -1,0 +1,26 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-04-29-vm-range-foundation",
+  "created": "2026-04-29",
+  "updated": "2026-04-29",
+  "status": "closed",
+  "branch": "codex/vm-range-foundation",
+  "path": "/private/tmp/Tx-worktrees/codex-vm-range-foundation",
+  "base": "63fab30",
+  "plan": "docs/progress/plans/2026-04-29-kernel-main-long-term-checklist.json",
+  "owner": "Worker 3",
+  "write_scope": [
+    "crates/tx-kernel/src/lib.rs",
+    "crates/tx-kernel/src/vm",
+    "crates/tx-kernel/tests/vm_*.rs",
+    "docs/progress/worktrees/2026-04-29-vm-range-foundation.json"
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test -p tx-kernel vm",
+    "cargo xtask lint unused",
+    "cargo xtask progress validate",
+    "git diff --check"
+  ],
+  "notes": "Implemented pure/mock VM foundation only: user VA/page/range math, protection/access flags, draft VmEntry backing values, split/rewrite helpers for munmap/mprotect-like value behavior, and a host-testable bounded RangeLock with writer-preference pending-writer tokens plus atomic pair acquire. No real AddressSpace, zone/cap ownership, PageContainer, frame, pmap materialization, shootdown, or user-access path was introduced. Next step is to attach these values to the zone-owned AddressSpace/recipes and page-backed materialization work after those lanes land; blocker is intentional dependency on EBR/zone and PageContainer ownership."
+}

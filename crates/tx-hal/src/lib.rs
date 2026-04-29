@@ -1,5 +1,9 @@
 #![no_std]
 
+pub mod time;
+
+use core::marker::PhantomData;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Arch {
     Riscv64,
@@ -8,6 +12,26 @@ pub enum Arch {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuId(pub usize);
+
+#[derive(Debug)]
+#[must_use]
+pub struct CpuPinGuard {
+    cpu_id: CpuId,
+    _not_send_sync: PhantomData<*mut ()>,
+}
+
+impl CpuPinGuard {
+    pub const fn new(cpu_id: CpuId) -> Self {
+        Self {
+            cpu_id,
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    pub const fn cpu_id(&self) -> CpuId {
+        self.cpu_id
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootArg(pub usize);
@@ -153,6 +177,7 @@ pub struct PlatformInfo {
     pub board: &'static str,
     pub spi_sd: Option<SpiSdInfo>,
     pub mmio_regions: &'static [MmioRegion],
+    pub timebase_frequency_hz: u64,
 }
 
 pub trait PlatformConfig {
@@ -496,8 +521,16 @@ impl PmapUnmapResult {
         self.phys
     }
 
+    pub const fn base_ppn(self) -> Ppn {
+        Ppn(self.phys.0 / 4096)
+    }
+
     pub const fn kind(self) -> PmapReserveKind {
         self.kind
+    }
+
+    pub const fn page_count(self) -> usize {
+        self.kind.size() / 4096
     }
 
     pub const fn invalidation(self) -> PmapInvalidation {
@@ -571,6 +604,12 @@ pub trait PmapIf {
 
     fn shootdown_kernel_mapping(_invalidation: PmapInvalidation) {}
 
+    fn shootdown_kernel_mappings(invalidations: &[PmapInvalidation]) {
+        for invalidation in invalidations {
+            Self::shootdown_kernel_mapping(*invalidation);
+        }
+    }
+
     fn create_pmap_root() -> Result<PmapRoot, PmapError> {
         Err(PmapError::Unsupported)
     }
@@ -613,46 +652,75 @@ pub trait PmapIf {
     }
 
     fn shootdown_mapping(_asid: Asid, _invalidation: PmapInvalidation) {}
+
+    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        for invalidation in invalidations {
+            Self::shootdown_mapping(asid, *invalidation);
+        }
+    }
 }
 
 pub mod pmap;
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TrapClass {
-    InstructionPageFault,
-    LoadPageFault,
-    StorePageFault,
-    IllegalInstruction,
-    Breakpoint,
-    UserEnvCall,
-    SupervisorTimer,
-    SupervisorExternal,
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TrapFrameSnapshot {
-    pub scause: usize,
-    pub sepc: usize,
-    pub stval: usize,
-}
-
-pub trait TrapIf {
-    fn install_minimal_trap_vector() {}
-
-    fn install_kernel_trap_vector() {}
-
-    fn classify_trap(_snapshot: TrapFrameSnapshot) -> TrapClass {
-        TrapClass::Unknown
-    }
-}
+pub mod trap;
+pub use trap::{TrapClass, TrapFrameSnapshot, TrapIf, TrapPreviousMode, TrapSnapshot};
 pub trait UserAccessIf {}
 pub trait SignalFrameIf {}
-pub trait IrqIf {}
-pub trait TimeIf {}
-pub trait PercpuIf {}
+pub trait IrqIf {
+    fn in_irq_context() -> bool {
+        false
+    }
+
+    fn interrupts_enabled() -> bool {
+        true
+    }
+}
+
+pub trait TimeIf {
+    /// Read monotonic nanoseconds since the platform's boot-time epoch.
+    ///
+    /// Values must be non-decreasing on the current hart and cheap enough for
+    /// scheduler/reactor hot paths.
+    fn read_ns() -> u64;
+
+    /// Program the current hart's timer for an absolute monotonic deadline.
+    ///
+    /// `deadline` uses the same nanosecond epoch as `read_ns()`. Platforms
+    /// must not intentionally arm an earlier hardware deadline than requested;
+    /// interrupts may arrive late due to firmware, hardware, or emulator
+    /// latency. A past deadline should fire as soon as the platform can arrange.
+    fn set_deadline_ns(deadline: u64);
+
+    /// Cancel the current hart's pending timer deadline when the platform has
+    /// a cancellation mechanism.
+    fn cancel_deadline();
+
+    /// Return the hardware timer frequency used for ns/tick conversion.
+    fn frequency_hz() -> u64;
+}
+pub trait PercpuIf {
+    fn current_cpu_id() -> CpuId {
+        CpuId(0)
+    }
+
+    fn pin_current_cpu() -> CpuPinGuard {
+        CpuPinGuard::new(Self::current_cpu_id())
+    }
+}
 pub trait CacheIf {}
 pub trait DmaIf {}
-pub trait SmpIf {}
+pub trait SmpIf {
+    fn possible_cpu_count() -> usize {
+        1
+    }
+
+    fn online_cpu_count() -> usize {
+        1
+    }
+
+    fn is_cpu_online(cpu: CpuId) -> bool {
+        cpu.0 < Self::online_cpu_count()
+    }
+}
 pub trait PowerIf {
     fn system_off() -> !;
 }

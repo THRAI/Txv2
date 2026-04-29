@@ -3,7 +3,7 @@
   "id": "2026-04-29-reactor-smoke",
   "created": "2026-04-29",
   "updated": "2026-04-29",
-  "status": "active",
+  "status": "merged",
   "branch": "codex/reactor-smoke",
   "path": "/private/tmp/Tx-worktrees/codex-reactor-smoke",
   "base": "0857ab9",
@@ -11,14 +11,15 @@
   "owner": "Codex reactor lane",
   "write_scope": [
     "crates/tx-reactor",
-    "crates/tx-kernel/src/lib.rs",
-    "docs/progress/worktrees/2026-04-29-reactor-smoke.json"
+    "crates/tx-kernel/src/lib.rs"
   ],
   "verification": [
+    "cargo fmt --check",
     "cargo test -p tx-reactor",
+    "cargo check -p tx-kernel",
     "cargo xtask build --target rv64-qemu",
     "cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel",
-    "cargo xtask progress validate"
+    "rg \"txkernel:qemu-riscv64-virt:reactor:task:ok\" target/qemu-rv64-qemu-smoke.serial.log"
   ],
-  "notes": "Lane A for the first reactor smoke milestone: initialize the reactor after substrate/trap setup, submit one kernel task, print a reactor task sentinel, complete the task, and shut down. This lane owns the tx-kernel integration point; trap/core-init work should avoid editing kernel_main until controller integration. Shared docs/status updates are controller-owned during parallel work."
+  "notes": "Merged into codex/substrate-parallel-integration as 853698e. Adds the first tiny reactor smoke executor and moves the boot sentinel into a kernel reactor task while preserving txkernel:<board>:boot:ok."
 }

@@ -1,0 +1,29 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-04-29-timeif-hal",
+  "created": "2026-04-29",
+  "updated": "2026-04-29",
+  "status": "closed",
+  "branch": "codex/reactor-task-aware",
+  "path": "/private/tmp/Tx-worktrees/codex-reactor-task-aware",
+  "base": "dc153ec",
+  "plan": null,
+  "owner": "Codex TimeIf lane",
+  "write_scope": [
+    "crates/tx-hal/src/lib.rs",
+    "crates/tx-hal/src/time.rs",
+    "boards/tx-hal-riscv64-qemu-virt/src",
+    "boards/tx-hal-loongarch64-qemu-virt/src/lib.rs",
+    "boards/tx-hal-riscv64-m1dock-mock/src/lib.rs",
+    "docs/progress/STATUS.md",
+    "docs/progress/worktrees/2026-04-29-timeif-hal.json"
+  ],
+  "verification": [
+    "cargo fmt --check",
+    "cargo test -p tx-hal-riscv64-qemu-virt",
+    "cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf",
+    "cargo xtask lint unused",
+    "cargo xtask progress validate"
+  ],
+  "notes": "Adds the HAL_v1 TimeIf methods and shared saturating ns/tick conversion helpers, publishes RV64 QEMU DTB timebase-frequency through PlatformInfo, treats absent/zero/invalid timebase data as the documented qemu virt fallback, implements rdtime plus legacy SBI set_timer deadlines for RV64 QEMU, and keeps LA64/M1 mock boards as explicit compile stubs. No EBR/zone or tx-reactor code was touched."
+}
