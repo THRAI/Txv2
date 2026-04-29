@@ -1,0 +1,27 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-04-29-pmap-root-asid-shootdown",
+  "created": "2026-04-29",
+  "updated": "2026-04-29",
+  "status": "active",
+  "branch": "codex/pmap-root-asid-shootdown",
+  "path": "/private/tmp/Tx-worktrees/codex-pmap-root-asid-shootdown",
+  "base": "0857ab9",
+  "plan": null,
+  "owner": "Codex pmap lane",
+  "write_scope": [
+    "crates/tx-hal/src/pmap.rs",
+    "boards/tx-hal-riscv64-qemu-virt/src/pmap",
+    "crates/tx-substrate/src/page_allocator",
+    "crates/tx-substrate/tests/pmap.rs",
+    "crates/tx-substrate/tests/shootdown.rs",
+    "docs/progress/worktrees/2026-04-29-pmap-root-asid-shootdown.json"
+  ],
+  "verification": [
+    "cargo test -p tx-hal-riscv64-qemu-virt",
+    "cargo test -p tx-substrate",
+    "cargo xtask ci-slow",
+    "cargo xtask progress validate"
+  ],
+  "notes": "Lane C for process-root pmap, ASID, and shootdown completion. It owns HAL pmap and RV64 board pmap modules. It should avoid VM policy materialization and leave reactor/trap orchestration alone. Shared docs/status updates are controller-owned during parallel work."
+}

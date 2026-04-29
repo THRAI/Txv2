@@ -1,13 +1,10 @@
 [package]
-name = "tx-hal-riscv64-m1dock-mock"
+name = "tx-ext4-format"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[dependencies]
-tx-hal = { path = "../../crates/tx-hal" }
-
 [lib]
 path = "src/lib.rs"
-doctest = false
+

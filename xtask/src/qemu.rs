@@ -106,10 +106,7 @@ fn qemu_command(
             args.push("-bios".into());
             args.push("default".into());
         }
-        TxTarget::La64Qemu => {
-            args.push("-bios".into());
-            args.push("default".into());
-        }
+        TxTarget::La64Qemu => {}
     }
 
     if options.expect_sentinel {
@@ -132,13 +129,13 @@ fn qemu_command(
     } else {
         args.push("-append".into());
         if target == TxTarget::Rv64M1DockMock {
-            args.push("tx.profile=smoke tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0".into());
+            args.push("tx.profile=smoke tx.board=m1dock-mock console=ttyS0".into());
         } else {
             args.push("tx.profile=smoke console=ttyS0".into());
         }
     }
 
-    if profile == Profile::Busybox || target == TxTarget::Rv64M1DockMock {
+    if profile == Profile::Busybox {
         args.push("-device".into());
         if target == TxTarget::Rv64M1DockMock {
             args.push("virtio-blk-device,drive=m1sd,bus=virtio-mmio-bus.0".into());

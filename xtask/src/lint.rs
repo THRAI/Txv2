@@ -272,6 +272,15 @@ fn lint_arch_text(path: &str, display: &str, text: &str) -> Vec<String> {
                 "{display}:{line_no}: tx-kernel must consume BootHandoff, not raw firmware boot values"
             ));
         }
+        if path.starts_with("boards/tx-kernel-")
+            && (line.contains("fn _start")
+                || line.contains("extern \"C\" fn _start")
+                || line.contains(".globl _start"))
+        {
+            findings.push(format!(
+                "{display}:{line_no}: board kernel binaries must export rust_entry only; platform crates own _start"
+            ));
+        }
         if line.contains("HalManager")
             || line.contains("Box<dyn Hal>")
             || line.contains("dyn Hal")

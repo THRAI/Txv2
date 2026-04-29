@@ -5,3 +5,6 @@
 	path = external/humanlayer-reference
 	url = https://github.com/humanlayer/humanlayer
 	shallow = true
+[submodule "external/rsext4"]
+	path = external/rsext4
+	url = https://github.com/Starry-OS/rsext4.git

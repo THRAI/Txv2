@@ -1,0 +1,24 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-04-29-trap-coreinit",
+  "created": "2026-04-29",
+  "updated": "2026-04-29",
+  "status": "active",
+  "branch": "codex/trap-coreinit",
+  "path": "/private/tmp/Tx-worktrees/codex-trap-coreinit",
+  "base": "0857ab9",
+  "plan": null,
+  "owner": "Codex trap/core-init lane",
+  "write_scope": [
+    "crates/tx-hal/src/lib.rs",
+    "boards/tx-hal-riscv64-qemu-virt/src/lib.rs",
+    "docs/progress/worktrees/2026-04-29-trap-coreinit.json"
+  ],
+  "verification": [
+    "cargo test -p tx-hal-riscv64-qemu-virt",
+    "cargo xtask build --target rv64-qemu",
+    "cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel",
+    "cargo xtask progress validate"
+  ],
+  "notes": "Lane D for typed trap snapshots, trap sink boundary, and CoreInit/trap phase cleanup. The reactor lane owns tx-kernel/src/lib.rs initially; this lane should coordinate any kernel_main edits through the controller. Shared docs/status updates are controller-owned during parallel work."
+}

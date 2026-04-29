@@ -34,13 +34,16 @@
 
 - Generic `tx-kernel` receives typed boot facts and must not depend on concrete
   firmware registers, DTBs, SBI details, or board crates.
-- RV64 QEMU now has a real linker script and boot assembly path; LA64 and the
-  M1 Dock mock stay compile-first until their boot protocols are implemented.
+- RV64 QEMU now has a real linker script and boot assembly path. LA64 QEMU and
+  the M1 Dock mock also own platform `_start` paths, but remain
+  pre-substrate smoke-only until their board pmap, allocator, and BootInfo
+  readiness are implemented.
 - CI has two lanes: fast compile/lint and slow QEMU smoke. Slow failures should
   point at the serial log and the HAL boot design docs.
-- Architecture lint rejects raw firmware boot values in generic `tx-kernel`;
-  later stronger lint can validate board-binary minimalism once LA64 and M1
-  Dock move from compile-first stubs to platform-owned `_start` paths.
+- Architecture lint rejects raw firmware boot values in generic `tx-kernel`
+  and board-binary `_start` definitions; board binaries should select
+  `ActivePlatform`, implement `KernelMain`, export `rust_entry`, and define
+  panic handling.
 
 ## Alternatives Considered
 
