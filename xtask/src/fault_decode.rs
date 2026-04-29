@@ -640,6 +640,12 @@ fn detect_link_mode(symbols: &[SymbolInfo], spec: &TargetSpec) -> Option<KernelL
 }
 
 fn classify_runtime_address(addr: u64, spec: &TargetSpec) -> RuntimeClass {
+    if in_high_kernel_window(addr, spec) {
+        return RuntimeClass::HighKernelAlias;
+    }
+    if in_low_kernel_window(addr, spec) {
+        return RuntimeClass::LowKernelAddress;
+    }
     if addr >= spec.direct_map_base {
         let phys = addr - spec.direct_map_base;
         let region = if spec.firmware_gap.contains(&phys) {
@@ -650,12 +656,6 @@ fn classify_runtime_address(addr: u64, spec: &TargetSpec) -> RuntimeClass {
             None
         };
         return RuntimeClass::DirectMap { phys, region };
-    }
-    if in_high_kernel_window(addr, spec) {
-        return RuntimeClass::HighKernelAlias;
-    }
-    if in_low_kernel_window(addr, spec) {
-        return RuntimeClass::LowKernelAddress;
     }
     if addr < RV64_USER_TOP {
         return RuntimeClass::UserAddress;
@@ -1050,6 +1050,10 @@ txkernel:qemu-riscv64-virt:trap scause=0xf sepc=0x80219096 stval=0x0
     #[test]
     fn classifies_direct_map_and_firmware_gap() {
         let spec = TargetSpec::rv64_qemu();
+        assert_eq!(
+            classify_runtime_address(0xffff_ffff_8021_9096, &spec),
+            RuntimeClass::HighKernelAlias
+        );
         assert_eq!(
             classify_runtime_address(0xffff_ffc0_8000_0000, &spec),
             RuntimeClass::DirectMap {

@@ -31,7 +31,9 @@
   `cargo xtask build --target rv64-qemu`, and manual `fault-decode --addr` /
   `fault-decode --serial` smoke runs in the
   `codex/fault-decode-tool-impl` worktree. Next step: wire QEMU failure
-  auto-annotation later if desired; no blocker.
+  auto-annotation later if desired; no blocker. Post-merge high-VMA smoke
+  coverage also fixed high-kernel alias classification and added regression
+  coverage so those addresses are not reported as direct-map addresses.
 - HumanLayer `.claude` workflow references are available as a sparse submodule
   at `external/humanlayer-reference`.
 - `cargo xtask ci` provides concise CI reporting with `txdoc:` references into

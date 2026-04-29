@@ -25,7 +25,8 @@
     "cargo test -p xtask",
     "cargo xtask build --target rv64-qemu",
     "cargo xtask fault-decode --target rv64-qemu --addr 0x80219096",
-    "cargo xtask fault-decode --target rv64-qemu --serial /private/tmp/tx-fault-decode.serial.log"
+    "cargo xtask fault-decode --target rv64-qemu --serial /private/tmp/tx-fault-decode.serial.log",
+    "cargo xtask fault-decode --target rv64-qemu --scause 0x7 --sepc 0xffffffff80219096 --stval 0xffff_ffc0_8000_0000"
   ],
-  "notes": "Host-side RV64 fault decoder implemented in an isolated /private/tmp worktree to avoid mixing with the dirty high-VMA/low-LMA branch. No kernel trap-path changes."
+  "notes": "Host-side RV64 fault decoder implemented in an isolated /private/tmp worktree to avoid mixing with the dirty high-VMA/low-LMA branch. Merged into the high-VMA branch with a post-merge regression for high-kernel-alias classification. No kernel trap-path changes."
 }
