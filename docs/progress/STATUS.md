@@ -20,6 +20,18 @@
   operational JSON records.
 - `xtask` is split by command family under `xtask/src/`, with a local module
   map in `xtask/README.md`.
+- `cargo xtask fault-decode` now exists as a host-side RV64 trap/address
+  decoder. It parses `scause`/`sepc`/`stval` logs, detects low-linked versus
+  high-VMA ELF layouts, classifies direct-map and firmware-gap addresses,
+  symbolizes through Rust-native ELF/DWARF readers, and conservatively reports
+  data code-pointer candidates without changing the kernel trap path.
+  `AGENTS.md` and the HAL/trap skill now point future debugging sessions at
+  this command before manual `nm`/`addr2line` work.
+  Verification: `cargo fmt --check`, `cargo test -p xtask`,
+  `cargo xtask build --target rv64-qemu`, and manual `fault-decode --addr` /
+  `fault-decode --serial` smoke runs in the
+  `codex/fault-decode-tool-impl` worktree. Next step: wire QEMU failure
+  auto-annotation later if desired; no blocker.
 - HumanLayer `.claude` workflow references are available as a sparse submodule
   at `external/humanlayer-reference`.
 - `cargo xtask ci` provides concise CI reporting with `txdoc:` references into

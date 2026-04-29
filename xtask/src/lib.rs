@@ -6,6 +6,7 @@ pub type Result<T> = std::result::Result<T, String>;
 mod check_build;
 mod ci;
 mod doctor;
+mod fault_decode;
 mod image;
 mod lint;
 mod oscomp;
@@ -34,6 +35,7 @@ pub fn run() -> Result<()> {
             check_build::build(&root, &target)
         }
         "qemu" => qemu::qemu(&root, args.collect()),
+        "fault-decode" => fault_decode::fault_decode(&root, args.collect()),
         "image" => image::image(&root, args.collect()),
         "oscomp" => oscomp::oscomp(&root, args.collect()),
         "submit" => submit::submit(&root, args.collect()),
@@ -57,6 +59,7 @@ fn print_usage() {
            cargo xtask check\n\
            cargo xtask build --target rv64-qemu|rv64-m1dock-mock|la64-qemu|all\n\
            cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox [--dry-run] [--expect-sentinel] [--timeout-ms N]\n\
+           cargo xtask fault-decode --target rv64-qemu [--elf PATH] [--serial PATH [--all] | --scause HEX --sepc HEX --stval HEX | --addr HEX]\n\
            cargo xtask image cpio --profile busybox\n\
            cargo xtask image ext4 --profile busybox [--size 64M]\n\
            cargo xtask image m1dock-sd --profile busybox [--size 64M]\n\
