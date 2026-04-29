@@ -1139,6 +1139,7 @@ txkernel:qemu-riscv64-virt:trap scause=0xf sepc=0x80219096 stval=0x0
         data[0..8].copy_from_slice(&0x8021_9096u64.to_le_bytes());
         data[8..16].copy_from_slice(&3u64.to_le_bytes());
         data[16..24].copy_from_slice(&0xffff_ffff_8021_90c0u64.to_le_bytes());
+        let text_range = 0x8021_0000..0x8022_0000;
 
         let entries = scan_data_code_pointers(
             0x8023_f120,
@@ -1149,7 +1150,7 @@ txkernel:qemu-riscv64-virt:trap scause=0xf sepc=0x80219096 stval=0x0
                 high_alias_base: spec.kernel_virt_base,
             },
             &spec,
-            &[0x8021_0000..0x8022_0000],
+            std::slice::from_ref(&text_range),
         );
 
         assert_eq!(
