@@ -15,6 +15,8 @@ Current orientation skills:
 
 - `tx-agentic-development` adapts HumanLayer-style subagent workflows for
   isolated research, planning, implementation, and progress memory.
+- `tx-code-reorganization` guides behavior-preserving module splits, large-file
+  reduction, group-level comments, and verification for code shape work.
 - `tx-design-reference` gathers the relevant active docs for implementation,
   planning, and audits.
 - `tx-docs-cleanup` guides broad active-doc cleanup, stale-reference scans, and

@@ -90,6 +90,13 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
         ),
         ci_run(
             root,
+            "unused lint",
+            "cargo",
+            &["xtask", "lint", "unused"],
+            "txdoc:CI-GATE-UNUSED-LINT",
+        ),
+        ci_run(
+            root,
             "progress json",
             "cargo",
             &["xtask", "progress", "validate"],
