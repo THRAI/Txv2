@@ -58,7 +58,7 @@ pub mod shootdown {
     use core::mem::MaybeUninit;
     use tx_hal::{Asid, PhysAddr, PmapIf, PmapReserveKind, PmapUnmapResult, Ppn};
 
-    use crate::page_allocator::{MapPin, PageAllocator};
+    use crate::page_allocator::{MapPin, MapPinRun, PageAllocator};
 
     const PAGE_SIZE_4K: usize = 4096;
 
@@ -95,9 +95,47 @@ pub mod shootdown {
         }
     }
 
+    pub struct ShootdownRunPushError<'a, A: PageAllocator> {
+        reason: ShootdownError,
+        map_pin_run: MapPinRun<'a, A>,
+    }
+
+    impl<'a, A: PageAllocator> ShootdownRunPushError<'a, A> {
+        pub fn reason(&self) -> ShootdownError {
+            self.reason
+        }
+
+        pub fn into_map_pin_run(self) -> MapPinRun<'a, A> {
+            self.map_pin_run
+        }
+    }
+
+    impl<A: PageAllocator> fmt::Debug for ShootdownRunPushError<'_, A> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("ShootdownRunPushError")
+                .field("reason", &self.reason)
+                .field("map_pin_run", &self.map_pin_run)
+                .finish()
+        }
+    }
+
+    enum PendingMapReleaseToken<'a, A: PageAllocator> {
+        Page(MapPin<'a, A>),
+        Run(MapPinRun<'a, A>),
+    }
+
+    impl<A: PageAllocator> PendingMapReleaseToken<'_, A> {
+        fn release(self) {
+            match self {
+                Self::Page(map_pin) => drop(map_pin),
+                Self::Run(map_pin_run) => drop(map_pin_run),
+            }
+        }
+    }
+
     struct PendingMapRelease<'a, A: PageAllocator> {
         result: PmapUnmapResult,
-        map_pin: MapPin<'a, A>,
+        token: PendingMapReleaseToken<'a, A>,
     }
 
     pub struct KernelShootdownBatch<'a, A: PageAllocator, const N: usize> {
@@ -151,7 +189,38 @@ pub mod shootdown {
                 });
             }
 
-            self.entries[self.len].write(PendingMapRelease { result, map_pin });
+            self.entries[self.len].write(PendingMapRelease {
+                result,
+                token: PendingMapReleaseToken::Page(map_pin),
+            });
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn push_unmap_result(
+            &mut self,
+            result: PmapUnmapResult,
+            map_pin_run: MapPinRun<'a, A>,
+        ) -> Result<(), ShootdownRunPushError<'a, A>> {
+            if result.page_count() != map_pin_run.count() || result.base_ppn() != map_pin_run.base()
+            {
+                return Err(ShootdownRunPushError {
+                    reason: ShootdownError::MismatchedFrame,
+                    map_pin_run,
+                });
+            }
+
+            if self.len == N {
+                return Err(ShootdownRunPushError {
+                    reason: ShootdownError::Full,
+                    map_pin_run,
+                });
+            }
+
+            self.entries[self.len].write(PendingMapRelease {
+                result,
+                token: PendingMapReleaseToken::Run(map_pin_run),
+            });
             self.len += 1;
             Ok(())
         }
@@ -163,7 +232,7 @@ pub mod shootdown {
             for index in 0..len {
                 let entry = unsafe { self.entries[index].assume_init_read() };
                 P::shootdown_kernel_mapping(entry.result.invalidation());
-                drop(entry.map_pin);
+                entry.token.release();
             }
         }
     }
@@ -240,7 +309,38 @@ pub mod shootdown {
                 });
             }
 
-            self.entries[self.len].write(PendingMapRelease { result, map_pin });
+            self.entries[self.len].write(PendingMapRelease {
+                result,
+                token: PendingMapReleaseToken::Page(map_pin),
+            });
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn push_unmap_result(
+            &mut self,
+            result: PmapUnmapResult,
+            map_pin_run: MapPinRun<'a, A>,
+        ) -> Result<(), ShootdownRunPushError<'a, A>> {
+            if result.page_count() != map_pin_run.count() || result.base_ppn() != map_pin_run.base()
+            {
+                return Err(ShootdownRunPushError {
+                    reason: ShootdownError::MismatchedFrame,
+                    map_pin_run,
+                });
+            }
+
+            if self.len == N {
+                return Err(ShootdownRunPushError {
+                    reason: ShootdownError::Full,
+                    map_pin_run,
+                });
+            }
+
+            self.entries[self.len].write(PendingMapRelease {
+                result,
+                token: PendingMapReleaseToken::Run(map_pin_run),
+            });
             self.len += 1;
             Ok(())
         }
@@ -252,7 +352,7 @@ pub mod shootdown {
             for index in 0..len {
                 let entry = unsafe { self.entries[index].assume_init_read() };
                 P::shootdown_mapping(self.asid, entry.result.invalidation());
-                drop(entry.map_pin);
+                entry.token.release();
             }
         }
     }
