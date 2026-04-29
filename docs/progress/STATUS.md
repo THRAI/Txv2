@@ -170,14 +170,18 @@
   covering the path from the current H3 sentinel/shutdown endpoint through
   CoreInit, zone/epoch/bus, trap shell, reactor/scheduler, VM, process/thread
   runtime, exec, first userspace, SMP coordination, and runtime boot tests.
-- Four parallel substrate/kernel-main lanes have been merged into the
-  controller integration branch `codex/substrate-parallel-integration`:
-  reactor smoke, bounded zone/index/mutation primitives, pmap
-  root/ASID/shootdown hardening with `MapPinRun`, and trap vocabulary/RV64
-  trap module extraction. The branch is tracked by
+- The earlier substrate/kernel-main integration branch is closed and
+  superseded by `codex/reactor-task-aware`; see
   `docs/progress/worktrees/2026-04-29-substrate-parallel-integration.json`.
-  Next step: integrated verification and publishing; remaining design decision
-  is the monomorphic kernel sink bridge for a future saved-register trap shell.
+  The trap vocabulary/RV64 extraction, pmap root/ASID/shootdown hardening,
+  bounded zone/index/mutation primitives, and initial reactor smoke work are
+  now part of the later reactor-task-aware line.
+- `tx_kernel::kernel_main` now delegates to `init::CoreInit<P>::boot`, which
+  names the current H3 order explicitly while preserving the
+  `txkernel:<board>:reactor:task:ok` and `txkernel:<board>:boot:ok`
+  sentinels. The H4 slots for post-substrate hooks, VFS/device ordering,
+  scheduler/process init, and userspace entry remain deferred placeholders; see
+  `docs/progress/worktrees/2026-04-29-coreinit-spine.json`.
 - `tx-reactor` now has task-aware wake and first wait-channel mechanics:
   tasks carry explicit `Runnable`/`Polling`/`Parked`/`Completed` status, enter a
   runnable queue on submit or task-local wake, and repeated wake calls coalesce
@@ -220,6 +224,28 @@
   and `git diff --check`. Next step: scheduler shell boundary types and, after
   the saved-register trap shell exists, a narrow trap-to-kernel timer delivery
   hook; no EBR/zone work was touched.
+- `tx-reactor` now also has the first scheduler shell:
+  scheduler-facing task/hart/slice/stop/wake/meta types, `SchedulerPolicy`,
+  `Phase1Scheduler`, policy-backed submit/wake/pick paths, stop-reason
+  reporting for tests, and `Reactor::next_deadline_ns()`. Plain
+  `Reactor::submit` futures remain kernel-only cooperative tasks; trap-driven
+  timer delivery and userspace-run dispatch remain later slices. See
+  `docs/progress/worktrees/2026-04-29-reactor-scheduler-shell.json`.
+- `tx_kernel::vm` now has a pure/mock VM foundation: `UserVirtAddr`,
+  `UserPage`, `UserRange`, protection/access flags, draft `VmEntry`
+  split/rewrite helpers for `munmap`/`mprotect`-like value behavior, and a
+  bounded no-alloc `RangeLock` with materializer/writer modes. It does not
+  publish a real zone-owned `AddressSpace`, `PageContainer`, pmap
+  materialization, shootdown retention, or user-access path yet; see
+  `docs/progress/worktrees/2026-04-29-vm-range-foundation.json`.
+  Integrated verification on `codex/reactor-task-aware`: `cargo fmt --check`,
+  `cargo test -p tx-reactor`, `cargo test -p tx-kernel vm`, `cargo test -p
+  tx-kernel`, `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`, `cargo xtask lint unused`, `cargo xtask lint
+  docs`, `cargo xtask progress validate`, `cargo xtask ci`, `cargo xtask
+  ci-slow`, and `git diff --check`. Next step: either wire a kernel
+  scheduler/CoreInit adapter or start the timer-trap delivery shell; blockers
+  remain the full saved-register trap shell and real zone-owned VM entities.
 - `TrapIf` now includes typed trap snapshots and classification. RV64 QEMU
   decodes common synchronous faults and supervisor interrupts from `scause`;
   the direct-mode vector still panics/spins until the full saved-register

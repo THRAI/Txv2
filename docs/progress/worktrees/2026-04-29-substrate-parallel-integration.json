@@ -3,7 +3,7 @@
   "id": "2026-04-29-substrate-parallel-integration",
   "created": "2026-04-29",
   "updated": "2026-04-29",
-  "status": "active",
+  "status": "closed",
   "branch": "codex/substrate-parallel-integration",
   "path": "/private/tmp/Tx-worktrees/codex-substrate-parallel-integration",
   "base": "0857ab9",
@@ -39,5 +39,5 @@
     "cargo xtask ci-slow",
     "git diff --check"
   ],
-  "notes": "Controller integration branch that merged the four parallel lanes: trap-coreinit, pmap-root-asid-shootdown, zone-index-mutation, and reactor-smoke. Next step is integrated verification, then publish."
+  "notes": "Controller integration branch that merged the four parallel lanes: trap-coreinit, pmap-root-asid-shootdown, zone-index-mutation, and reactor-smoke. This record is now closed because that work was merged and superseded by codex/reactor-task-aware, which added task-aware waits, TimeIf, timeout waits, CoreInit, the scheduler shell, and the VM range foundation."
 }

@@ -1,10 +1,9 @@
 #![no_std]
 
+pub mod init;
 pub mod vm;
 
 use tx_hal::{BootHandoff, TxPlatform};
-
-pub mod init;
 
 #[cfg(all(not(target_os = "none"), not(test)))]
 mod host_check_allocator {

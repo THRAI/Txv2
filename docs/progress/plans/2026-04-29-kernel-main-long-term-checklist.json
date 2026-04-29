@@ -89,7 +89,7 @@
     {
       "id": "coreinit-spine",
       "title": "Replace sentinel tail with an explicit CoreInit spine",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "baseline-h3-sentinel-kernel-main"
       ],
@@ -102,7 +102,7 @@
         "cargo test -p tx-kernel",
         "cargo xtask ci"
       ],
-      "notes": "Encode the HAL/PAGE_SUBSTRATE H3 order directly: init_early, substrate::init, init_later, install full trap vector, run post-substrate init hooks, initialize VFS before device, run post-device hooks, initialize reactor/scheduler/subsystems, then enter H4. Keep INIT_HOOKS sparse and never let them reorder substrate, VFS, or device init."
+      "notes": "Complete in docs/progress/worktrees/2026-04-29-coreinit-spine.json. tx_kernel::kernel_main now delegates to init::CoreInit<P>::boot, which encodes the current H3 order directly while preserving the reactor task and boot sentinels. H4 slots for post-substrate hooks, VFS/device ordering, scheduler/process/userspace init remain explicit deferred placeholders."
     },
     {
       "id": "zone-epoch-bus-foundation",
@@ -198,12 +198,12 @@
         "cargo test -p tx-kernel",
         "cargo xtask ci"
       ],
-      "notes": "In progress via docs/progress/worktrees/2026-04-29-reactor-task-aware.json. The current slices implement task-local wakers, task status, parked/runnable state, duplicate wake coalescing, and first wait-channel/wait-adapt mechanics in crates/tx-reactor: a task can park on Channel::wait(mask), another task can Channel::fire(mask), matching readiness is retained per waiter token until repoll, and wait_event rechecks its condition after every wake. Remaining pieces still follow REACTOR_v0 and SCHEDULER_v0: timer/signal classification hooks for WaitOutcome, AST/preemption slots, scheduler policy, and the long-running idle loop."
+      "notes": "In progress via docs/progress/worktrees/2026-04-29-reactor-task-aware.json, docs/progress/worktrees/2026-04-29-reactor-timer-queue.json, and docs/progress/worktrees/2026-04-29-reactor-scheduler-shell.json. The current slices implement task-local wakers, task status, parked/runnable state, duplicate wake coalescing, wait-channel/wait-adapt mechanics, host-driven timeout waits, Reactor::next_deadline_ns(), scheduler-facing task/hart/slice/stop/wake/meta types, SchedulerPolicy, and Phase1Scheduler. Plain Reactor::submit futures remain kernel-only cooperative tasks. Remaining pieces still follow REACTOR_v0 and SCHEDULER_v0: signal classification hooks, AST/preemption slots, long-running idle loop, and later trap-driven timer delivery."
     },
     {
       "id": "vm-address-space-core",
       "title": "Implement VM AddressSpace, recipes, RangeLock, and pmap materialization",
-      "status": "pending",
+      "status": "in-progress",
       "depends_on": [
         "zone-epoch-bus-foundation",
         "baseline-h3-sentinel-kernel-main"
@@ -218,7 +218,7 @@
         "cargo test -p tx-substrate",
         "cargo xtask ci"
       ],
-      "notes": "Create AddressSpace as a zone entity containing recipes BTree, PmapRoot, RangeLock, and stats. Preserve VM's invariant: pmap PTEs are derived materializations justified by recipes; binding changes linearize at recipes mutation; pmap teardown follows binding withdrawal and shootdown."
+      "notes": "Pure/mock foundation complete in docs/progress/worktrees/2026-04-29-vm-range-foundation.json: tx_kernel::vm now has user VA/page/range arithmetic, protection/access flags, draft VmEntry split/rewrite helpers, and a bounded no-alloc RangeLock. Real AddressSpace remains pending on zone/epoch/index/cap ownership, recipes BTree integration, pmap materialization, shootdown retention, and the user-access/trap path."
     },
     {
       "id": "pmap-shootdown-completion",
