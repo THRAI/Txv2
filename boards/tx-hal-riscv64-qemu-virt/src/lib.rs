@@ -420,6 +420,8 @@ impl BootStaticBag<IdentityLive> {
             };
             (1, None, 0)
         };
+        let memory_region_count =
+            reserve_firmware_loader_region(memory_regions, memory_region_count);
 
         let cmdline = if cmdline_len > 0 {
             Some(core::str::from_utf8_unchecked(&cmdline[..cmdline_len]))
@@ -436,6 +438,25 @@ impl BootStaticBag<IdentityLive> {
             cmdline,
         };
     }
+}
+
+fn reserve_firmware_loader_region(
+    memory_regions: &mut [MemoryRegion],
+    memory_region_count: usize,
+) -> usize {
+    let Some(size) = pmap_topology::QEMU_KERNEL_PHYS_BASE.checked_sub(QEMU_VIRT_RAM_BASE) else {
+        return memory_region_count;
+    };
+    if size == 0 || memory_region_count >= memory_regions.len() {
+        return memory_region_count;
+    }
+
+    memory_regions[memory_region_count] = MemoryRegion {
+        base: PhysAddr(QEMU_VIRT_RAM_BASE),
+        size,
+        kind: MemoryRegionKind::Reserved,
+    };
+    memory_region_count + 1
 }
 
 #[cfg(test)]

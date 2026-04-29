@@ -34,6 +34,14 @@
 - RV64 QEMU now enables an Sv39 bootstrap pmap before `rust_entry`: a 1 GiB
   identity leaf for QEMU RAM plus a fixed early PT-node pool exposed through
   `PmapIf`.
+- RV64 QEMU's low-linked high-alias boot path now validates high PC/SP/GP but
+  deliberately retains the low identity leaf for live substrate boot. QEMU
+  trace showed `core::sync::atomic` can jump through compiler-generated tables
+  containing low linked text addresses after identity teardown; full teardown is
+  blocked on a high-VMA/low-LMA linker or relocation slice. BootInfo also marks
+  `[0x8000_0000, 0x8020_0000)` reserved so allocator metadata is not carved over
+  OpenSBI/kernel-loader RAM. Verification: `cargo test -p
+  tx-hal-riscv64-qemu-virt` and `cargo xtask ci-slow`.
 - `cargo xtask ci-slow` runs the RV64 QEMU smoke sentinel lane separately from
   fast compile/lint CI.
 - The active HAL, page-substrate, module-map, and invariant docs now state the
@@ -51,15 +59,17 @@
 - OSComp FAT32 image/test runner integration is not yet a passing boot test.
 - LA64 target availability depends on local rustup support.
 - LA64 and M1 Dock mock boot protocols are compile-first only.
-- RV64 QEMU still needs high-half/direct-map completion, full pmap
-  reserve/commit/unmap, shootdown integration, and a minimal trap vector before
-  the page substrate is substrate-ready.
+- RV64 QEMU still needs high-VMA/low-LMA linking or relocation before live
+  identity teardown; it also needs full pmap reserve/commit/unmap, shootdown
+  integration, and a minimal trap vector before the page substrate is
+  substrate-ready.
 - ext4 image creation requires host `mkfs.ext4`.
 - BusyBox images require `TX_BUSYBOX`; dynamic musl layouts also require
   `TX_MUSL_LIBC`.
 
 ## Latest Decisions
 
+- `docs/progress/decisions/2026-04-29-rv64-low-linked-identity-retention.md`
 - `docs/progress/decisions/2026-04-28-finish-catchup-progress-memory.md`
 - `docs/progress/decisions/2026-04-28-arceos-aligned-portable-boot.md`
 - `docs/progress/decisions/2026-04-27-fine-grained-txdoc-anchors.md`

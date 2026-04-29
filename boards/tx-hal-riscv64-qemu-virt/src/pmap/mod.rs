@@ -9,7 +9,8 @@
 //! - `PageTable`: the board page-table page shape shared by all pmap modules.
 //! - `EnsuredTable`: a speculative L1/L0 table plus the PT-node authority that
 //!   must be committed or rolled back.
-//! - `HighSentinel`: the final PC/SP/GP proof before identity teardown.
+//! - `HighSentinel`: the PC/SP/GP proof that the high alias is live before
+//!   any future identity teardown.
 //!
 //! Main data-flow functions:
 //! - `tx_rv64_qemu_prepare_high_boot()` is called from assembly before the high
@@ -18,8 +19,8 @@
 //!   `map_identity_bridge()`, `map_direct_map_window()`,
 //!   `map_kernel_high_alias()`, `publish_bootstrap_pmap_info()`, and
 //!   `write_high_boot_transition()`.
-//! - `complete_post_entry_pipeline()` validates the high sentinel and drops the
-//!   lower identity bridge.
+//! - `complete_post_entry_pipeline()` validates the high sentinel and keeps the
+//!   lower identity bridge until the kernel is linked high or relocated.
 //!
 //! Helper groups:
 //! - intermediate-table helpers build and roll back speculative branch tables;
@@ -89,8 +90,10 @@ use topology::*;
 //
 // Process roots will leave the lower half private to the AddressSpace and
 // share/copy the upper-half kernel entries. The BSP enters Rust through the
-// high kernel alias; the low identity leaf survives only long enough for
-// BootInfo to consume the firmware DTB pointer, then the high sentinel clears it.
+// high kernel alias. The low identity leaf intentionally stays live for this
+// low-linked Rust image because compiler-generated absolute tables can still
+// target low text addresses; explicit teardown is deferred to the high-linker
+// slice.
 
 #[cfg(any(test, target_arch = "riscv64"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,9 +133,12 @@ pub extern "C" fn tx_rv64_qemu_prepare_high_boot(dtb_addr: usize, out: *mut usiz
 
 // The identity-live bag models the H1/H2 transition as a sequence of
 // borrow-returning steps. The pre-entry half creates identity, direct-map, and
-// high-kernel aliases; the post-entry half proves PC/SP/GP are high before
-// clearing the low identity bridge. See the 2026-04-28 high-half and identity
-// teardown decision notes for the staged handoff rationale.
+// high-kernel aliases; the post-entry half proves PC/SP/GP are high. The
+// explicit `drop_lower*` helpers remain tested, but the live boot path keeps
+// identity because this low-linked Rust image can still contain compiler-built
+// absolute jump tables (for example in `core::sync::atomic`) that target low
+// text addresses. See the 2026-04-28 high-half decision notes and the later
+// high-linker follow-up.
 impl BootStaticBag<IdentityLive> {
     fn prepare_pre_entry_pipeline(&mut self, out: *mut usize) -> usize {
         self.begin_bootstrap_pmap()
@@ -274,8 +280,9 @@ impl BootStaticBag<IdentityLive> {
 
     #[cfg(target_arch = "riscv64")]
     pub(crate) fn require_current_high_sentinel_or_spin(self) -> Self {
-        // Last guard before dropping the identity bridge: if the high jump or
-        // sp/gp rewrite regresses, spin while low memory is still mapped.
+        // Last guard before the boot path relies on the high alias: if the high
+        // jump or sp/gp rewrite regresses, spin while low memory is still
+        // mapped.
         match self.require_high_sentinel(HighSentinel::current()) {
             Ok(bag) => bag,
             Err(_) => loop {
@@ -292,7 +299,7 @@ impl BootStaticBag<IdentityLive> {
     pub(crate) fn complete_post_entry_pipeline(self) -> BootStaticBag<IdentityDropped> {
         #[cfg(target_arch = "riscv64")]
         {
-            self.require_current_high_sentinel_or_spin().drop_lower()
+            self.require_current_high_sentinel_or_spin().into_dropped()
         }
 
         #[cfg(not(target_arch = "riscv64"))]
@@ -339,13 +346,13 @@ impl BootStaticBag<IdentityLive> {
         Ok(self)
     }
 
-    #[cfg(any(test, target_arch = "riscv64"))]
+    #[cfg(test)]
     pub(crate) fn drop_lower(mut self) -> BootStaticBag<IdentityDropped> {
         self.drop_identity_bridge();
         self.into_dropped()
     }
 
-    #[cfg(any(test, target_arch = "riscv64"))]
+    #[cfg(test)]
     fn drop_identity_bridge(&mut self) -> &mut Self {
         unsafe {
             self.bootstrap_root_mut().0[rv64_1g_leaf_index(QEMU_RAM_BASE)] = 0;
@@ -359,9 +366,9 @@ impl BootStaticBag<IdentityLive> {
     }
 }
 
-// The sentinel is deliberately narrow: before dropping the identity mapping it
-// only proves that control flow and the two static-ish registers that could
-// still reference low addresses have crossed into the kernel alias range.
+// The sentinel is deliberately narrow: it only proves that control flow and the
+// two static-ish registers that could still reference low addresses have crossed
+// into the kernel alias range.
 #[cfg(target_arch = "riscv64")]
 impl HighSentinel {
     fn current() -> Self {

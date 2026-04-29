@@ -113,11 +113,15 @@ minimal trap vector, platform MMIO facts, and pmap mutation surface are all
 available.
 
 RV64 QEMU currently has the first bootstrap-pmap slice: an Sv39 root with a
-single 1 GiB identity leaf for QEMU RAM plus a fixed PT-node pool. This proves
-the MMU handoff and gives substrate code a place to hang early page-table
-allocation tests. It is not yet the full substrate-ready pmap: high-half kernel
-mapping, direct-map extension beyond the first GiB, reserve/commit/unmap, and
-shootdown integration remain later steps.
+single 1 GiB identity leaf for QEMU RAM plus a fixed PT-node pool. The live
+low-linked path validates the high alias but retains identity, because Rust and
+`core` may emit absolute jump tables or data pointers that still name low
+linked text until the kernel is linked high or relocated. `BootInfo` must also
+mark firmware/loader RAM below the kernel load base as reserved; otherwise this
+phase can carve `FrameMeta[]` over OpenSBI-owned pages. It is not yet the full
+substrate-ready pmap: high-link/identity teardown, direct-map extension beyond
+the first GiB, reserve/commit/unmap, and shootdown integration remain later
+steps.
 
 `substrate::init::<P>()` runs before any SMP bring-up and before downstream subsystem init. By its return, the following are live:
 
