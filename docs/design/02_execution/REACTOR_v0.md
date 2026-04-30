@@ -150,10 +150,22 @@ Steps are synchronous and bounded (STEP-2). Steps must not call reactor services
 
 When a step returns `Blocked(channel, mask)` or `AdvancedThenBlocked(progress, channel, mask)`, the enclosing script invokes the reactor's wait service.
 
-### The wait primitive
+### The wait-adapt primitive
 <!-- txdoc:REACTOR-THE-WAIT-PRIMITIVE -->
 
-The reactor exposes a wait-adapt service whose public contract is expressed in terms of `Channel`, `Mask`, `WaitProtocol`, and `WaitOutcome`. The full behavioral specification of this service is given in CONCEPTS §14 and STEP_MODEL §5; this document pins only its boundary.
+The reactor exposes a wait-adapt service whose public contract is expressed in
+terms of `Channel`, `Mask`, `WaitProtocol`, a caller-supplied condition, and
+`WaitOutcome`. The canonical script-facing shape is:
+
+```text
+wait_event(channel, mask, protocol, condition) -> WaitOutcome
+```
+
+The lower raw channel wait is an implementation detail for the adapter and for
+host smoke tests. Scripts use `wait_event` so the condition recheck remains
+inside the wait-adapt boundary. The full behavioral specification of this
+service is given in CONCEPTS §14 and STEP_MODEL §5; this document pins only its
+boundary.
 
 ### Protocol selection is script responsibility
 <!-- txdoc:REACTOR-PROTOCOL-SELECTION-IS-SCRIPT-RESPONSIBILITY -->
@@ -173,12 +185,15 @@ This maps onto the closed driver modes from CONCEPTS §14.2 (nonblocking, waitin
 
 Wait returns a `WaitOutcome`:
 
-- `Ready` — a wake event relevant to this wait has fired; the caller should re-run the step's observe sub-phase to determine whether the condition actually holds. This is not a truth claim (SIG-1: wake is not truth; fresh observation authorizes action).
+- `Ready` — the wait adapter's condition check says the caller should re-run the step. This is not a claim that the wake itself was truth (SIG-1: wake is not truth; fresh observation authorizes action).
 - `Interrupted` — a signal interrupted the wait; driver translates to `EINTR` or partial progress per syscall semantics.
 - `Killed` — the task is being terminated; driver unwinds cleanly.
 - `TimedOut` — the wait's timeout elapsed; driver translates to the syscall's timeout semantics.
 
-The reactor never returns `Ready` as a guarantee that the waited-on condition holds. `Ready` says only that the reactor has observed a wake event and the caller should re-check. The caller re-invokes the step's observe sub-phase under a fresh guard (STEP-7) to establish actual truth.
+The reactor never returns `Ready` as a guarantee that the waited-on semantic
+operation will commit. `Ready` says only that the adapter's recheck reached the
+retry point. The caller re-invokes the step's observe sub-phase under a fresh
+guard (STEP-7) to establish actual truth.
 
 ### What the contract does not specify
 <!-- txdoc:REACTOR-WHAT-THE-CONTRACT-DOES-NOT-SPECIFY -->
@@ -397,11 +412,12 @@ pub trait Reactor {
 
     /// Wait for a condition on a channel, under a script-chosen protocol.
     /// Invoked by scripts on Blocked* step outcomes; never by steps directly.
-    fn wait(
+    fn wait_event(
         &self,
         channel: Channel,
         mask: impl InterestMask,
         protocol: WaitProtocol,
+        condition: impl FnMut() -> bool,
     ) -> impl Future<Output = WaitOutcome>;
 
     /// Request userspace execution for this task. Returns a future that

@@ -63,7 +63,13 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":reactor:task:ok\n");
         });
-        reactor.run_until_idle();
+        reactor.run_until_idle_with_clock(
+            || P::read_ns(),
+            |deadline| match deadline {
+                Some(deadline) => P::set_deadline_ns(deadline),
+                None => P::cancel_deadline(),
+            },
+        );
     }
 
     fn boot_sentinel() {

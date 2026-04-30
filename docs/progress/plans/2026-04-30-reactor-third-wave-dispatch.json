@@ -1,0 +1,275 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-04-30-reactor-third-wave-dispatch",
+  "title": "Reactor third-wave dispatch sharding",
+  "status": "complete",
+  "created": "2026-04-30",
+  "updated": "2026-04-30",
+  "owner": "codex",
+  "summary": "Completed third-wave reactor integration/hardening wave: cooperative yield, AST poll-boundary consumption, CoreInit HAL-clock smoke wiring, and substrate bus wire hardening. Userspace-run remains deferred.",
+  "scope": {
+    "in": [
+      "crates/tx-reactor/src/lib.rs",
+      "crates/tx-reactor/src/yield_now.rs",
+      "crates/tx-reactor/src/task.rs",
+      "crates/tx-reactor/src/runtime.rs",
+      "crates/tx-reactor/tests/yield_now.rs",
+      "crates/tx-reactor/tests/ast_runtime.rs",
+      "crates/tx-reactor/tests/wait_bus.rs",
+      "crates/tx-kernel/src/init.rs",
+      "crates/tx-substrate/src/bus/mod.rs",
+      "crates/tx-substrate/tests/bus.rs",
+      "docs/progress/research/2026-04-30-reactor-third-wave-scout.md",
+      "docs/progress/plans/2026-04-30-reactor-third-wave-dispatch.json",
+      "docs/progress/STATUS.md"
+    ],
+    "out": [
+      "non-goals/full-userspace-run",
+      "non-goals/saved-register-trap-return",
+      "non-goals/posix-signal-routing",
+      "non-goals/threadpayload-entity-implementation",
+      "non-goals/full-smp-shootdown-protocol",
+      "non-goals/epoll-or-long-lived-typed-poll-tables",
+      "non-goals/permanent-coreinit-wfi-loop"
+    ],
+    "write_sets": [
+      {
+        "owner": "coordinator",
+        "paths": [
+          "docs/progress/research/2026-04-30-reactor-third-wave-scout.md",
+          "docs/progress/plans/2026-04-30-reactor-third-wave-dispatch.json",
+          "docs/progress/STATUS.md",
+          "docs/progress/worktrees/2026-04-29-zone-ebr-integration.json"
+        ],
+        "notes": "Own dispatch plan, scout note, stale lease closure, progress status, final audit, and integration decisions."
+      },
+      {
+        "owner": "worker-reactor-yield-now",
+        "paths": [
+          "crates/tx-reactor/src/lib.rs",
+          "crates/tx-reactor/src/yield_now.rs",
+          "crates/tx-reactor/tests/yield_now.rs"
+        ],
+        "notes": "Own the cooperative yield helper and its public facade export. Avoid runtime/task/scheduler changes."
+      },
+      {
+        "owner": "worker-reactor-ast-poll-boundary",
+        "paths": [
+          "crates/tx-reactor/src/task.rs",
+          "crates/tx-reactor/src/runtime.rs",
+          "crates/tx-reactor/tests/ast_runtime.rs"
+        ],
+        "notes": "Own per-task AST slot storage, queue/consume APIs, and poll-boundary consumption. Do not touch signal/thread-runtime policy."
+      },
+      {
+        "owner": "worker-kernel-coreinit-hal-clock",
+        "paths": [
+          "crates/tx-kernel/src/init.rs",
+          "crates/tx-reactor/tests/timer_idle.rs"
+        ],
+        "notes": "Own moving the current CoreInit reactor smoke onto run_until_idle_with_clock using P: TimeIf. Do not add the permanent idle loop."
+      },
+      {
+        "owner": "worker-substrate-bus-wire-hardening",
+        "paths": [
+          "crates/tx-substrate/src/bus/mod.rs",
+          "crates/tx-substrate/tests/bus.rs",
+          "crates/tx-reactor/tests/wait_bus.rs"
+        ],
+        "notes": "Own first-slice RawQueue/RawPort terminal/subscriber hardening. Preserve substrate-to-reactor dependency direction."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/02_execution/REACTOR_v0.md",
+      "docs/design/02_execution/SCHEDULER_v0.md",
+      "docs/design/02_execution/THREAD_RUNTIME_v1.md",
+      "docs/design/01_substrate/BUS_v1.md",
+      "docs/design/01_substrate/HAL_v1.md",
+      "docs/design/01_substrate/PAGE_SUBSTRATE_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/research/2026-04-30-reactor-readiness-for-subsystems.md",
+      "docs/progress/research/2026-04-30-reactor-first-wave-audit.md",
+      "docs/progress/research/2026-04-30-reactor-second-wave-audit.md",
+      "docs/progress/research/2026-04-30-reactor-third-wave-scout.md",
+      "docs/progress/research/2026-04-30-reactor-third-wave-audit.md",
+      "docs/progress/plans/2026-04-30-reactor-parallel-shards.json"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "serial-lease-rendezvous",
+      "title": "Close stale zone/EBR worktree lease before dispatch",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/progress/worktrees/2026-04-29-zone-ebr-integration.json"
+      ],
+      "verification": [
+        "git worktree list --porcelain",
+        "cargo xtask progress validate"
+      ],
+      "notes": "The recorded worktree path no longer exists and git worktree list only reports the main checkout. The worktree record is now marked merged."
+    },
+    {
+      "id": "parallel-reactor-yield-now",
+      "title": "Implement cooperative yield_now helper",
+      "status": "complete",
+      "depends_on": [
+        "serial-lease-rendezvous"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/lib.rs",
+        "crates/tx-reactor/src/yield_now.rs",
+        "crates/tx-reactor/tests/yield_now.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test yield_now"
+      ],
+      "notes": "Dispatched to subagent 019ddd64-2e61-7fc3-927d-bcba50139437 and merged. Adds YieldNow and yield_now over the existing task waker path, without scheduler policy or runtime/task changes."
+    },
+    {
+      "id": "parallel-reactor-ast-poll-boundary",
+      "title": "Consume AST markers at reactor poll boundaries",
+      "status": "complete",
+      "depends_on": [
+        "serial-lease-rendezvous"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/task.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/tests/ast_runtime.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test ast_runtime"
+      ],
+      "notes": "Dispatched to subagent 019ddd64-2e7f-7f21-88a5-4c77d73b90cb and merged. Stores AstSlot per task, exposes TaskKey-checked queue/consume APIs, and consumes AST batches before polling. Mechanism-only; no POSIX signal routing or ThreadPayload access."
+    },
+    {
+      "id": "parallel-kernel-coreinit-hal-clock",
+      "title": "Drive CoreInit reactor smoke through HAL TimeIf",
+      "status": "complete",
+      "depends_on": [
+        "serial-lease-rendezvous"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/init.rs",
+        "crates/tx-reactor/tests/timer_idle.rs"
+      ],
+      "verification": [
+        "cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf"
+      ],
+      "notes": "Dispatched to subagent 019ddd64-2e8e-73b3-b8fb-ceb5f7b4be61 and merged. CoreInit reactor smoke now uses run_until_idle_with_clock with P::read_ns, P::set_deadline_ns, and P::cancel_deadline while preserving current sentinels."
+    },
+    {
+      "id": "parallel-substrate-bus-wire-hardening",
+      "title": "Harden first-slice RawQueue and RawPort wire behavior",
+      "status": "complete",
+      "depends_on": [
+        "serial-lease-rendezvous"
+      ],
+      "paths": [
+        "crates/tx-substrate/src/bus/mod.rs",
+        "crates/tx-substrate/tests/bus.rs",
+        "crates/tx-reactor/tests/wait_bus.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate",
+        "cargo test -p tx-reactor --test wait_bus"
+      ],
+      "notes": "Dispatched to subagent 019ddd64-2eca-7201-b9c6-9e90008f9ab8 and merged. Adds first-slice subscriber validity and terminal/gone behavior without semantic predicates, epoll, SMP storage, or a reactor dependency."
+    },
+    {
+      "id": "coordinator-third-wave-integration",
+      "title": "Audit and integrate third-wave worker results",
+      "status": "complete",
+      "depends_on": [
+        "parallel-reactor-yield-now",
+        "parallel-reactor-ast-poll-boundary",
+        "parallel-kernel-coreinit-hal-clock",
+        "parallel-substrate-bus-wire-hardening"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/lib.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/src/task.rs",
+        "crates/tx-kernel/src/init.rs",
+        "crates/tx-substrate/src/bus/mod.rs",
+        "docs/progress/STATUS.md",
+        "docs/progress/plans/2026-04-30-reactor-third-wave-dispatch.json"
+      ],
+      "verification": [
+        "cargo fmt --check",
+        "cargo test -p tx-reactor",
+        "cargo test -p tx-substrate",
+        "cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate",
+        "cargo xtask ci",
+        "git diff --check"
+      ],
+      "notes": "Coordinator audited all worker diffs, fixed the tx-reactor crate overview after AST queues became real mechanism, ran the full verification gate, and recorded docs/progress/research/2026-04-30-reactor-third-wave-audit.md. Userspace-run remains deferred."
+    }
+  ],
+  "verification": [
+    {
+      "command": "git worktree list --porcelain",
+      "status": "passed",
+      "notes": "Only the main checkout is listed; the stale zone/EBR worktree path is gone."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed after closing the stale zone/EBR worktree lease and before writing this dispatch plan."
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed",
+      "notes": "Passed after running rustfmt on the new yield test."
+    },
+    {
+      "command": "cargo test -p tx-reactor",
+      "status": "passed",
+      "notes": "Passed after third-wave integration: 71 reactor tests."
+    },
+    {
+      "command": "cargo test -p tx-substrate",
+      "status": "passed",
+      "notes": "Passed after bus hardening: 50 substrate tests."
+    },
+    {
+      "command": "cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf",
+      "status": "passed",
+      "notes": "Passed after CoreInit HAL-clock wiring."
+    },
+    {
+      "command": "cargo xtask ci",
+      "status": "passed",
+      "notes": "Passed after third-wave integration: 11 passed, 0 skipped, 0 failed."
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "notes": "Passed after third-wave integration."
+    }
+  ],
+  "risks": [
+    "The current checkout is still dirty with accumulated first-wave, second-wave, and third-wave reactor changes; checkpoint before launching external worktree-based agents.",
+    "AST poll-boundary consumption must stay mechanism-only and must not imply POSIX signal delivery or ThreadPayload ownership.",
+    "Bus hardening may require small compatibility adjustments in reactor wait tests, but substrate must not depend on tx-reactor.",
+    "CoreInit HAL-clock wiring must preserve current boot sentinel behavior and must not introduce an infinite WFI loop in the smoke path."
+  ],
+  "blockers": [
+    "No active worktree lease blocker remains after closing the stale zone/EBR record.",
+    "Full userspace-run is blocked on saved-register trap return, ThreadPayload runtime entities, and AST signal delivery policy."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}
