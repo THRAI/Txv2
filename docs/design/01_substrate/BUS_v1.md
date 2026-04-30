@@ -385,9 +385,13 @@ pseudocode (inside wait::wait_event):
 
 loop {
     g = epoch::guard()
-    if condition(&g) { return ConditionTrue }
+    if condition(&g) { return Ready }
 
     sub = wire.subscribe(interest, waker_for_current_task())
+    if condition(&g) {
+        wire.unsubscribe(sub)
+        return Ready
+    }
     drop(g)                        // release guard before sleep
 
     park_task(protocol)            // async suspend
@@ -401,11 +405,16 @@ The wait primitive:
 
 1. Checks the condition (predicate) under an epoch guard. If true, done.
 2. Subscribes to the wire with the interest mask.
-3. Drops the guard and parks the task.
-4. On wake, unsubscribes and re-checks the condition.
-5. Loops until the condition holds or the protocol's interrupt/timeout fires.
+3. Re-checks the condition after registration, before parking.
+4. Drops the guard and parks the task only if the predicate is still false.
+5. On wake, unsubscribes and re-checks the condition.
+6. Loops until the condition holds or the protocol's interrupt/timeout fires.
 
-The subscribe happens *after* the condition check to close a race: if the condition changed between check and subscribe, the wire would have already fired, and the subscribe would see a subsequent-or-concurrent wake. (Sequencing the subscribe first would create a different race where a concurrent unfire might be missed.) The re-check on wake closes this: even if the subscribe missed a fire, the next condition-check will discover the state.
+The subscribe happens *after* the first condition check, but it is not enough
+by itself. `ASYNC-4` requires register-or-recheck safety: if the condition
+changed between the first check and the subscription, the second check observes
+it before the task parks. The re-check on wake then closes stale and spurious
+wake cases.
 
 This is the wait-side realization of "signals are not truth" (SIG-1): the subscribe enables sleep; the condition-check determines truth.
 
@@ -427,7 +436,7 @@ When a step returns `Blocked(carrier, interests)` or `AdvancedThenBlocked(progre
 - `condition` = a closure that re-observes the step's readiness (typically by calling a subsystem-provided predicate)
 - `protocol` = driver's configured wait protocol (Interruptible, Killable, Timed)
 
-The wait primitive then executes §7's pseudocode. On return (ConditionTrue or interrupt/timeout), the driver loops and re-invokes step.
+The wait primitive then executes §7's pseudocode. On return (`Ready` or interrupt/timeout), the driver loops and re-invokes step.
 
 The subsystem does not need to provide a separate condition closure for the wait: in the common case, the next step invocation's initial predicate check serves this role. Some implementations may optimize by providing a dedicated lightweight condition function that matches what the step would check first; this is an optimization, not a structural requirement.
 

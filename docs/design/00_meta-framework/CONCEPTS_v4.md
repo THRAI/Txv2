@@ -352,16 +352,19 @@ Canonical wait protocols are:
 Canonical wait outcomes are:
 
 ```text
-ConditionTrue | Interrupted | Killed | TimedOut
+Ready | Interrupted | Killed | TimedOut
 ```
 
 The structural loop is:
 
 ```text
-check condition -> subscribe/arm -> sleep -> wake -> recheck condition
+check condition -> subscribe/arm -> recheck condition -> sleep -> wake -> recheck condition
 ```
 
-Wake does not authorize action. A wake says only "try again." The condition or the next step invocation establishes truth under a fresh guard.
+`Ready` means the wait adapter's condition check says the driver may retry the
+step. It does not mean the wake itself was truth. Wake does not authorize
+action. A wake says only "try again." The condition or the next step invocation
+establishes truth under a fresh guard.
 
 The retry-is-recheck identity is load-bearing:
 
@@ -406,6 +409,10 @@ Completion = wait_event(
     protocol  = caller-selected WaitProtocol
 )
 ```
+
+The default completion consumes one completion credit per successful waiter.
+Broadcast or latch semantics require an explicitly named type such as
+`BroadcastCompletion` or `LatchCompletion`.
 
 Completion is middleware because it packages a recurring protocol shape; it does not define subsystem truth.
 

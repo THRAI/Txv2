@@ -9,3 +9,6 @@ repository.workspace = true
 path = "src/lib.rs"
 test = false
 doctest = false
+
+[dependencies]
+tx-substrate = { path = "../tx-substrate" }

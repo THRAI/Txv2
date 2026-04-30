@@ -1,6 +1,6 @@
 # txKernel Status
 
-**Updated:** 2026-04-29
+**Updated:** 2026-04-30
 
 ## Current Shape
 
@@ -432,6 +432,71 @@
   `Reactor::submit` futures remain kernel-only cooperative tasks; trap-driven
   timer delivery and userspace-run dispatch remain later slices. See
   `docs/progress/worktrees/2026-04-29-reactor-scheduler-shell.json`.
+- Reactor readiness was audited against active design docs, existing
+  `tx-reactor` code, tests, and progress memory. The design contract is mostly
+  ready for subsystem authors to write step/script skeletons. The first
+  follow-up worker wave has now closed several of the earlier implementation
+  gaps: generation-checked task keys, cancel/drain lifecycle, bus-backed
+  wait_event, and a HAL-shaped timer/idle adapter exist in host-testable form.
+  Remaining blockers for a full subsystem runtime are interruptible/killable
+  classification, userspace-run, AST return-to-user delivery, full cross-hart
+  coordination, and CoreInit timer wiring. See
+  `docs/progress/research/2026-04-30-reactor-readiness-for-subsystems.md`.
+- Reactor first-wave parallel work is merged back into the coordinator tree.
+  The accepted serial API decisions are recorded in
+  `docs/progress/decisions/2026-04-30-reactor-serial-api-prework.md`; the
+  worker merge and coordinator audit are recorded in
+  `docs/progress/research/2026-04-30-reactor-first-wave-audit.md`. The merged
+  surface includes the `tx-reactor` module facade, generation-safe `TaskKey`
+  and `TaskTable`, `Reactor::submit_task` / `cancel_task` /
+  `drain_completed` / `drain_cancelled`, scheduler direct tests and tightened
+  `Yielded` behavior, `tx_substrate::bus::{RawQueue, RawPort, RawTrace}`,
+  bus-backed `wait_event` with check/register/recheck/park, and
+  `run_until_idle_with_clock` / `RunIdleReport` for HAL-shaped timer driving.
+  Verification: `cargo fmt --check`, `cargo test -p tx-reactor` (43 tests),
+  `cargo test -p tx-substrate`, RV64 kernel target check, `cargo xtask lint
+  arch`, `cargo xtask lint unused`, `cargo xtask lint docs` (31
+  stale-vocabulary warnings only), `cargo xtask progress validate`,
+  `cargo xtask ci` (11 passed), and `git diff --check`. Next step: continue
+  through the second-wave reactor audit and wire CoreInit once the `init.rs`
+  lease clears. See
+  `docs/progress/plans/2026-04-30-reactor-parallel-shards.json`.
+- Reactor second-wave parallel work is merged back into the coordinator tree.
+  The accepted surface adds the `InterruptSource` / `AtomicInterruptSummary`
+  wait-classification seam, `wait_event_with_interrupts`, task-local AST
+  marker batching, atomic preemption markers, counted `Completion`,
+  `NonZeroU32` `CountdownCompletion`, and reactor-local `SyncRendezvous`
+  acknowledgment coordination. Coordinator audit kept the work mechanism-only:
+  no POSIX signal routing, ThreadPayload entities, HAL return path, real SMP
+  shootdown protocol, or CoreInit loop wiring were added. Verification:
+  `cargo fmt --check`, `cargo test -p tx-reactor --test wait_interrupt`,
+  `cargo test -p tx-reactor --test completion`,
+  `cargo test -p tx-reactor --test sync_coord`, and
+  `cargo test -p tx-reactor` (65 tests), `cargo test -p tx-substrate`, RV64
+  kernel target check, `cargo xtask lint arch`, `cargo xtask lint unused`,
+  `cargo xtask lint docs` (31 stale-vocabulary warnings only),
+  `cargo xtask progress validate`, `cargo xtask ci` (11 passed), and
+  `git diff --check`. Next step: move to userspace-run/CoreInit only after the
+  active leases clear.
+  See `docs/progress/research/2026-04-30-reactor-second-wave-audit.md`.
+- Reactor third-wave parallel work is merged back into the coordinator tree.
+  The stale `2026-04-29-zone-ebr-integration` worktree lease was marked
+  `merged`, then four isolated workers landed cooperative `yield_now`, AST
+  poll-boundary consumption, CoreInit HAL-clock smoke wiring, and RawQueue /
+  RawPort terminal/subscriber hardening. Coordinator audit kept the work
+  mechanism-only: no userspace-run, POSIX signal routing, `ThreadPayload`, real
+  SMP shootdown protocol, epoll, or permanent WFI loop was added.
+  Verification: `cargo test -p tx-reactor --test yield_now`,
+  `cargo test -p tx-reactor --test ast_runtime`,
+  `cargo test -p tx-reactor --test wait_bus`, `cargo test -p tx-substrate`,
+  `cargo test -p tx-reactor` (71 tests), RV64 kernel target check,
+  `cargo fmt --check`, `cargo xtask lint arch`, `cargo xtask lint unused`,
+  `cargo xtask lint docs` (31 stale-vocabulary warnings only),
+  `cargo xtask progress validate`, `cargo xtask ci` (11 passed), and
+  `git diff --check`. Next step: decide between the trap/thread-runtime
+  userspace-run prerequisite slice and a bus typed-declaration/SMP-storage
+  hardening slice. See
+  `docs/progress/research/2026-04-30-reactor-third-wave-audit.md`.
 - `tx_kernel::vm` now has a pure/mock VM foundation: `UserVirtAddr`,
   `UserPage`, `UserRange`, protection/access flags, draft `VmEntry`
   split/rewrite helpers for `munmap`/`mprotect`-like value behavior, and a

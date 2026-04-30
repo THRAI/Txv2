@@ -9,11 +9,7 @@ pub mod bitmap {
     pub struct BitmapReservation;
 }
 
-pub mod bus {
-    pub struct RawPort;
-    pub struct RawQueue;
-    pub struct RawTrace;
-}
+pub mod bus;
 
 pub mod epoch;
 pub mod index;
