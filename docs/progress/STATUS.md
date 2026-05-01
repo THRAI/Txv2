@@ -14,13 +14,17 @@
   placement, v1 disjoint-only `mremap` recipe movement, and a staging
   PageBacked recipe token that lets fault outcomes compute a PageContainer page
   index and delegate anonymous page materialization back to `PageContainer`.
+  It also has a staging `PmapSeam` that records derived mappings, revalidates
+  recipes before publication, and accounts teardown/shootdown after recipe
+  mutation for unmap/protect.
   Verification so far: focused `tx-kernel` VM/PageBacked tests plus full
   `tx-kernel --lib`, progress validation, docs lint, fmt, and diff checks.
-  Next step: replace staging `PageFrame`/PageBacked tokens with
-  `Cap<Frame>`/`CachePin` and `Cap<PageContainer>` evidence, then attach real
-  pmap/shootdown and VFS `FsPageBacking`; blockers remain persistent epoch
-  recipe snapshots, zone-owned VM/PageContainer evidence, trap/process/runtime
-  integration, and file/device backing.
+  Next step: replace staging `PageFrame`/PageBacked/`PmapSeam` tokens with
+  `Cap<Frame>`/`CachePin`, `Cap<PageContainer>`, and HAL `PmapIf`
+  reserve/commit/shootdown evidence, then connect VFS `FsPageBacking`;
+  blockers remain persistent epoch recipe snapshots, zone-owned
+  VM/PageContainer evidence, trap/process/runtime integration, and file/device
+  backing.
 - 2026-05-02 skill refresh: added subsystem-specific operational skills for
   VM/PageBacked, VFS/filesystem, and Process/ThreadRuntime work so future
   agents load the canonical subsystem docs before implementation and preserve
