@@ -1,10 +1,12 @@
 //! VM foundation values and the first bounded AddressSpace recipe core.
 //!
 //! This module now carries zone-owned `AddressSpace` identity and cap-backed
-//! `PageContainer` recipe evidence. Persistent epoch recipe snapshots and real
-//! HAL pmap roots are still staged seams.
+//! `PageContainer` recipe evidence. Persistent epoch recipe snapshots remain a
+//! staged seam; pmap materialization now owns HAL `PmapIf` root evidence.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+mod pmap;
 
 use crate::page_backed::{
     MaterializeAccess, MaterializedPage, PageCacheError, PageContainer, PageIndex,
@@ -12,11 +14,10 @@ use crate::page_backed::{
 use crate::sync::SpinMutex;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use tx_hal::Ppn;
-use tx_substrate::{
-    page_allocator::{BitmapPageAllocator, MapPin},
-    zone::{self, Cap, Zone, ZoneAllocated, ZoneError},
-};
+use pmap::VmPmap;
+pub use pmap::{PmapMappingSnapshot, PmapPublishOutcome, PmapStats, VmPmapError};
+use tx_hal::PmapIf;
+use tx_substrate::zone::{self, Cap, Zone, ZoneAllocated};
 
 static ADDRESS_SPACE_ZONE: Zone<AddressSpace> = Zone::const_new();
 
@@ -379,186 +380,6 @@ pub struct AddressSpaceStats {
     pub vm_size: usize,
 }
 
-#[derive(Debug)]
-pub struct PmapMapping {
-    pub ppn: Ppn,
-    pub prot: Prot,
-    _map_pin: MapPin<'static, BitmapPageAllocator<'static>>,
-}
-
-impl PmapMapping {
-    fn new(ppn: Ppn, prot: Prot, map_pin: MapPin<'static, BitmapPageAllocator<'static>>) -> Self {
-        Self {
-            ppn,
-            prot,
-            _map_pin: map_pin,
-        }
-    }
-
-    fn snapshot(&self) -> PmapMappingSnapshot {
-        PmapMappingSnapshot {
-            ppn: self.ppn,
-            prot: self.prot,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PmapMappingSnapshot {
-    pub ppn: Ppn,
-    pub prot: Prot,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PmapStats {
-    pub mapped_pages: usize,
-    pub reservations: usize,
-    pub commits: usize,
-    pub rollbacks: usize,
-    pub shootdowns: usize,
-}
-
-pub struct PmapSeam {
-    materialization_deferred: bool,
-    state: SpinMutex<PmapState>,
-}
-
-impl PmapSeam {
-    fn new_deferred() -> Self {
-        Self {
-            materialization_deferred: true,
-            state: SpinMutex::new(PmapState::new()),
-        }
-    }
-
-    pub const fn materialization_deferred(&self) -> bool {
-        self.materialization_deferred
-    }
-
-    pub fn lookup(&self, page: UserPage) -> Option<PmapMappingSnapshot> {
-        self.state
-            .lock()
-            .mappings
-            .get(&page)
-            .map(PmapMapping::snapshot)
-    }
-
-    pub fn stats(&self) -> PmapStats {
-        let state = self.state.lock();
-        PmapStats {
-            mapped_pages: state.mappings.len(),
-            reservations: state.reservations,
-            commits: state.commits,
-            rollbacks: state.rollbacks,
-            shootdowns: state.shootdowns,
-        }
-    }
-
-    fn reserve_page(
-        &self,
-        page: UserPage,
-        mapping: PmapMapping,
-    ) -> Result<PmapReservationSeam<'_>, VmFaultError> {
-        self.state.lock().reservations += 1;
-        Ok(PmapReservationSeam {
-            pmap: self,
-            page,
-            mapping: Some(mapping),
-            committed: false,
-        })
-    }
-
-    fn commit_page(
-        &self,
-        page: UserPage,
-        mapping: PmapMapping,
-    ) -> Result<PmapPublishOutcome, VmFaultError> {
-        let mut state = self.state.lock();
-        if let Some(existing) = state.mappings.get(&page) {
-            if existing.ppn == mapping.ppn && existing.prot == mapping.prot {
-                return Ok(PmapPublishOutcome {
-                    page,
-                    replaced: false,
-                });
-            }
-            return Err(VmFaultError::StaleRecipe);
-        }
-
-        state.mappings.insert(page, mapping);
-        state.commits += 1;
-        Ok(PmapPublishOutcome {
-            page,
-            replaced: false,
-        })
-    }
-
-    fn rollback_page(&self) {
-        self.state.lock().rollbacks += 1;
-    }
-
-    fn teardown_range(&self, range: UserRange) -> usize {
-        let mut state = self.state.lock();
-        let mut removed = 0;
-        for page in range.iter_pages() {
-            if state.mappings.remove(&page).is_some() {
-                removed += 1;
-            }
-        }
-        if removed != 0 {
-            state.shootdowns += 1;
-        }
-        removed
-    }
-}
-
-#[derive(Debug)]
-struct PmapState {
-    mappings: BTreeMap<UserPage, PmapMapping>,
-    reservations: usize,
-    commits: usize,
-    rollbacks: usize,
-    shootdowns: usize,
-}
-
-impl PmapState {
-    fn new() -> Self {
-        Self {
-            mappings: BTreeMap::new(),
-            reservations: 0,
-            commits: 0,
-            rollbacks: 0,
-            shootdowns: 0,
-        }
-    }
-}
-
-pub struct PmapReservationSeam<'a> {
-    pmap: &'a PmapSeam,
-    page: UserPage,
-    mapping: Option<PmapMapping>,
-    committed: bool,
-}
-
-impl PmapReservationSeam<'_> {
-    pub const fn page(&self) -> UserPage {
-        self.page
-    }
-
-    fn commit(mut self) -> Result<PmapPublishOutcome, VmFaultError> {
-        self.committed = true;
-        let mapping = self.mapping.take().ok_or(VmFaultError::StaleRecipe)?;
-        self.pmap.commit_page(self.page, mapping)
-    }
-}
-
-impl Drop for PmapReservationSeam<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.pmap.rollback_page();
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VmMapCommit {
     pub changed_pages: usize,
@@ -572,6 +393,13 @@ pub enum VmMapError {
     NoFreeRange,
     WouldBlock,
     BackingOffsetOverflow,
+    Pmap(VmPmapError),
+}
+
+impl From<VmPmapError> for VmMapError {
+    fn from(value: VmPmapError) -> Self {
+        Self::Pmap(value)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -722,12 +550,6 @@ pub struct VmFaultMaterialization {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PmapPublishOutcome {
-    pub page: UserPage,
-    pub replaced: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VmFaultError {
     Range(UserRangeError),
     NoRecipe,
@@ -737,31 +559,48 @@ pub enum VmFaultError {
     BackingOffsetOverflow,
     PageCache(PageCacheError),
     StaleRecipe,
+    Pmap(VmPmapError),
+}
+
+impl From<VmPmapError> for VmFaultError {
+    fn from(value: VmPmapError) -> Self {
+        Self::Pmap(value)
+    }
 }
 
 pub struct AddressSpace {
     recipes: RecipeIndex,
-    pmap: PmapSeam,
+    pmap: VmPmap,
     range_lock: RangeLock,
     stats: AddressSpaceStatsCell,
 }
 
 impl AddressSpace {
-    pub fn new() -> Self {
-        Self {
+    pub fn new_for_platform<P: PmapIf>() -> Result<Self, VmPmapError> {
+        Ok(Self {
             recipes: RecipeIndex::new(),
-            pmap: PmapSeam::new_deferred(),
+            pmap: VmPmap::new_for_platform::<P>()?,
             range_lock: RangeLock::new(),
             stats: AddressSpaceStatsCell::new(),
-        }
+        })
     }
 
-    pub fn new_cap() -> Result<Cap<AddressSpace>, ZoneError> {
+    pub fn new_cap_for_platform<P: PmapIf>() -> Result<Cap<AddressSpace>, VmPmapError> {
         let reservation = zone::reserve_for::<AddressSpace>()?;
-        Ok(zone::sign_for(reservation, Self::new()))
+        Ok(zone::sign_for(reservation, Self::new_for_platform::<P>()?))
     }
 
-    pub const fn pmap(&self) -> &PmapSeam {
+    #[cfg(test)]
+    pub fn new() -> Self {
+        Self::new_for_platform::<pmap::TestPmap>().expect("test pmap creates root")
+    }
+
+    #[cfg(test)]
+    pub fn new_cap() -> Result<Cap<AddressSpace>, VmPmapError> {
+        Self::new_cap_for_platform::<pmap::TestPmap>()
+    }
+
+    pub const fn pmap(&self) -> &VmPmap {
         &self.pmap
     }
 
@@ -832,15 +671,14 @@ impl AddressSpace {
             return Err(VmFaultError::StaleRecipe);
         }
 
-        let reservation = self.pmap.reserve_page(
-            outcome.page_range.start().containing_page(),
-            PmapMapping::new(
+        self.pmap
+            .publish_page(
+                outcome.page_range.start().containing_page(),
                 materialization.page.ppn,
                 entry.prot,
                 materialization.page.map_pin,
-            ),
-        )?;
-        reservation.commit()
+            )
+            .map_err(VmFaultError::Pmap)
     }
 
     pub fn map_script(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
@@ -882,7 +720,7 @@ impl AddressSpace {
         let commit = self
             .recipes
             .remap_disjoint(request.old_range, request.new_range)?;
-        self.pmap.teardown_range(request.old_range);
+        self.pmap.teardown_range(request.old_range)?;
         self.stats.store(self.recipes.stats());
         Ok(VmRemapOutcome {
             old_range: request.old_range,
@@ -915,7 +753,7 @@ impl AddressSpace {
     pub fn unmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
         let _guard = self.acquire_writer(range)?;
         let commit = self.recipes.unmap(range)?;
-        self.pmap.teardown_range(range);
+        self.pmap.teardown_range(range)?;
         self.stats.store(self.recipes.stats());
         Ok(commit)
     }
@@ -923,7 +761,7 @@ impl AddressSpace {
     pub fn protect(&self, range: UserRange, prot: Prot) -> Result<VmMapCommit, VmMapError> {
         let _guard = self.acquire_writer(range)?;
         let commit = self.recipes.protect(range, prot)?;
-        self.pmap.teardown_range(range);
+        self.pmap.teardown_range(range)?;
         self.stats.store(self.recipes.stats());
         Ok(commit)
     }
@@ -943,13 +781,14 @@ impl AddressSpace {
         let range = entry.range;
         let commit = self.recipes.commit_map(entry, placement)?;
         if placement == MapPlacement::FixedReplace {
-            self.pmap.teardown_range(range);
+            self.pmap.teardown_range(range)?;
         }
         self.stats.store(self.recipes.stats());
         Ok(commit)
     }
 }
 
+#[cfg(test)]
 impl Default for AddressSpace {
     fn default() -> Self {
         Self::new()
@@ -2037,9 +1876,148 @@ fn min_option_id(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::collections::BTreeMap;
+    use std::sync::{LazyLock, Mutex};
+    use tx_hal::{
+        Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+        PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
+    };
+
+    static COUNTING_PMAP_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static COUNTING_PMAP_STATE: LazyLock<Mutex<CountingPmapState>> =
+        LazyLock::new(|| Mutex::new(CountingPmapState::new()));
+
+    struct CountingPmap;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct CountingPmapCounters {
+        creates: usize,
+        destroys: usize,
+        reserves: usize,
+        commits: usize,
+        unmaps: usize,
+        shoots: usize,
+        last_asid: Option<Asid>,
+    }
+
+    struct CountingPmapState {
+        next_root: usize,
+        fail_reserve: Option<PmapError>,
+        mappings: BTreeMap<(usize, usize), PhysAddr>,
+        counters: CountingPmapCounters,
+    }
+
+    impl CountingPmapState {
+        fn new() -> Self {
+            Self {
+                next_root: 1,
+                fail_reserve: None,
+                mappings: BTreeMap::new(),
+                counters: CountingPmapCounters::default(),
+            }
+        }
+    }
+
+    fn reset_counting_pmap() {
+        *COUNTING_PMAP_STATE.lock().expect("counting pmap lock") = CountingPmapState::new();
+    }
+
+    fn fail_counting_reserve(error: PmapError) {
+        COUNTING_PMAP_STATE
+            .lock()
+            .expect("counting pmap lock")
+            .fail_reserve = Some(error);
+    }
+
+    fn counting_pmap_counters() -> CountingPmapCounters {
+        COUNTING_PMAP_STATE
+            .lock()
+            .expect("counting pmap lock")
+            .counters
+    }
+
+    fn counting_root_key(root: &PmapRoot) -> usize {
+        root.phys().0
+    }
+
+    impl PmapIf for CountingPmap {
+        fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+            let mut state = COUNTING_PMAP_STATE.lock().expect("counting pmap lock");
+            let root_id = state.next_root;
+            state.next_root += 1;
+            state.counters.creates += 1;
+            Ok(PmapRoot::new(
+                PtNode::boot_pool(PhysAddr(root_id * USER_PAGE_SIZE)),
+                Asid(root_id as u16),
+            ))
+        }
+
+        fn destroy_pmap_root(root: PmapRoot) {
+            let mut state = COUNTING_PMAP_STATE.lock().expect("counting pmap lock");
+            state.counters.destroys += 1;
+            let root_key = root.phys().0;
+            state
+                .mappings
+                .retain(|(mapped_root, _), _| *mapped_root != root_key);
+        }
+
+        fn reserve_mapping(
+            root: &PmapRoot,
+            virt: VirtAddr,
+            phys: PhysAddr,
+            kind: PmapReserveKind,
+        ) -> Result<Option<PmapReservation>, PmapError> {
+            let mut state = COUNTING_PMAP_STATE.lock().expect("counting pmap lock");
+            state.counters.reserves += 1;
+            if let Some(error) = state.fail_reserve {
+                return Err(error);
+            }
+            if state
+                .mappings
+                .contains_key(&(counting_root_key(root), virt.0))
+            {
+                return Err(PmapError::AlreadyMapped);
+            }
+            Ok(Some(PmapReservation::new(virt, phys, kind)))
+        }
+
+        fn commit_mapping(
+            root: &PmapRoot,
+            reservation: PmapReservation,
+            _permissions: PmapPermissions,
+        ) {
+            let mut state = COUNTING_PMAP_STATE.lock().expect("counting pmap lock");
+            state.counters.commits += 1;
+            state.mappings.insert(
+                (counting_root_key(root), reservation.virt().0),
+                reservation.phys(),
+            );
+        }
+
+        fn unmap_mapping(
+            root: &PmapRoot,
+            virt: VirtAddr,
+            kind: PmapReserveKind,
+        ) -> Result<Option<PmapUnmapResult>, PmapError> {
+            let mut state = COUNTING_PMAP_STATE.lock().expect("counting pmap lock");
+            state.counters.unmaps += 1;
+            let Some(phys) = state.mappings.remove(&(counting_root_key(root), virt.0)) else {
+                return Ok(None);
+            };
+            Ok(Some(PmapUnmapResult::new(virt, phys, kind)))
+        }
+
+        fn shootdown_mapping(asid: Asid, _invalidation: PmapInvalidation) {
+            let mut state = COUNTING_PMAP_STATE.lock().expect("counting pmap lock");
+            state.counters.shoots += 1;
+            state.counters.last_asid = Some(asid);
+        }
+    }
 
     fn setup_host_substrate() {
         tx_substrate::testing::init_host_for_test_once();
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
     }
 
     fn page_backing(offset: u64) -> VmBacking {
@@ -2064,19 +2042,6 @@ mod tests {
             pc: pc.clone(),
             offset,
         }
-    }
-
-    fn pmap_mapping_for_test(prot: Prot) -> PmapMapping {
-        setup_host_substrate();
-        let frame = tx_substrate::page_allocator::reserve_frame(
-            tx_substrate::page_allocator::ZeroPolicy::Zeroed,
-        )
-        .expect("frame reservation")
-        .commit();
-        let ppn = frame.ppn();
-        let map_pin = frame.try_map_pin().expect("map pin");
-        drop(frame);
-        PmapMapping::new(ppn, prot, map_pin)
     }
 
     fn range(start: usize, pages: usize) -> UserRange {
@@ -2687,7 +2652,7 @@ mod tests {
 
         assert_eq!(outcome.page_range, range(0x4000, 1));
         assert_eq!(outcome.entry, entry);
-        assert!(outcome.pmap_materialization_deferred);
+        assert!(!outcome.pmap_materialization_deferred);
         assert_eq!(
             aspace.resolve_fault(VmFault::new(UserVirtAddr(0x4008), AccessMode::Write)),
             Err(VmFaultError::ProtectionViolation)
@@ -2879,24 +2844,120 @@ mod tests {
     }
 
     #[test]
-    fn vm_pmap_staging_reservation_rolls_back_when_abandoned() {
-        let pmap = PmapSeam::new_deferred();
-        let reservation = pmap
-            .reserve_page(UserPage(9), pmap_mapping_for_test(Prot::READ))
-            .expect("reserve");
+    fn vm_pmap_duplicate_publish_converges_on_existing_mapping() {
+        let aspace = AddressSpace::new();
+        let entry = VmEntry::new(
+            range(0xa000, 1),
+            Prot::READ,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("map");
+        let outcome = aspace
+            .resolve_fault(VmFault::new(UserVirtAddr(0xa000), AccessMode::Read))
+            .expect("fault resolves");
+        let first = outcome.materialize_pagebacked_anon().expect("first page");
+        let ppn = first.page.ppn;
+        let second = outcome.materialize_pagebacked_anon().expect("second page");
 
-        assert_eq!(reservation.page(), UserPage(9));
-        drop(reservation);
+        aspace
+            .publish_fault_materialization(outcome.clone(), first)
+            .expect("first publish");
+        aspace
+            .publish_fault_materialization(outcome, second)
+            .expect("duplicate publish");
 
-        assert_eq!(pmap.lookup(UserPage(9)), None);
         assert_eq!(
-            pmap.stats(),
+            aspace.pmap().lookup(UserPage(10)),
+            Some(PmapMappingSnapshot {
+                ppn,
+                prot: Prot::READ,
+            })
+        );
+        assert_eq!(
+            aspace.pmap().stats(),
             PmapStats {
-                mapped_pages: 0,
+                mapped_pages: 1,
                 reservations: 1,
-                commits: 0,
-                rollbacks: 1,
+                commits: 1,
+                rollbacks: 0,
                 shootdowns: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn vm_pmap_reserve_failure_is_reported_without_shadow_mapping() {
+        let _guard = COUNTING_PMAP_TEST_LOCK.lock().expect("counting test lock");
+        setup_host_substrate();
+        reset_counting_pmap();
+        fail_counting_reserve(PmapError::Exhausted);
+        let aspace =
+            AddressSpace::new_for_platform::<CountingPmap>().expect("counting pmap address space");
+        let entry = VmEntry::new(
+            range(0xb000, 1),
+            Prot::READ,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("map");
+        let outcome = aspace
+            .resolve_fault(VmFault::new(UserVirtAddr(0xb000), AccessMode::Read))
+            .expect("fault resolves");
+        let materialized = outcome.materialize_pagebacked_anon().expect("materialize");
+
+        assert_eq!(
+            aspace.publish_fault_materialization(outcome, materialized),
+            Err(VmFaultError::Pmap(VmPmapError::Pmap(PmapError::Exhausted)))
+        );
+        assert_eq!(aspace.pmap().lookup(UserPage(11)), None);
+        assert_eq!(aspace.pmap().stats().mapped_pages, 0);
+        assert_eq!(counting_pmap_counters().reserves, 1);
+    }
+
+    #[test]
+    fn address_space_cap_drop_tears_down_pmap_before_destroying_root() {
+        let _guard = COUNTING_PMAP_TEST_LOCK.lock().expect("counting test lock");
+        setup_host_substrate();
+        reset_counting_pmap();
+        {
+            let aspace =
+                AddressSpace::new_cap_for_platform::<CountingPmap>().expect("address space cap");
+            let entry = VmEntry::new(
+                range(0xc000, 1),
+                Prot::READ,
+                VmEntryFlags::SHARED,
+                page_backing(0),
+            );
+            map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+                .commit()
+                .expect("map");
+            let outcome = aspace
+                .resolve_fault(VmFault::new(UserVirtAddr(0xc000), AccessMode::Read))
+                .expect("fault resolves");
+            let materialized = outcome.materialize_pagebacked_anon().expect("materialize");
+            aspace
+                .publish_fault_materialization(outcome, materialized)
+                .expect("publish");
+        }
+
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+
+        assert_eq!(
+            counting_pmap_counters(),
+            CountingPmapCounters {
+                creates: 1,
+                destroys: 1,
+                reserves: 1,
+                commits: 1,
+                unmaps: 1,
+                shoots: 1,
+                last_asid: Some(Asid(1)),
             }
         );
     }

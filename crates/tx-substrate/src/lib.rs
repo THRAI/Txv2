@@ -404,7 +404,7 @@ pub mod shootdown {
             Ok(())
         }
 
-        pub fn issue_and_release<P: PmapIf>(mut self) {
+        pub fn issue_and_release_with(mut self, shootdown_mappings: fn(Asid, &[PmapInvalidation])) {
             let len = self.len;
 
             let mut invalidations = [PmapInvalidation::new(VirtAddr(0), 0); N];
@@ -413,7 +413,7 @@ pub mod shootdown {
                 *slot = entry.result.invalidation();
             }
 
-            P::shootdown_mappings(self.asid, &invalidations[..len]);
+            shootdown_mappings(self.asid, &invalidations[..len]);
 
             self.len = 0;
 
@@ -421,6 +421,10 @@ pub mod shootdown {
                 let entry = unsafe { self.entries[index].assume_init_read() };
                 entry.token.release();
             }
+        }
+
+        pub fn issue_and_release<P: PmapIf>(self) {
+            self.issue_and_release_with(P::shootdown_mappings);
         }
     }
 

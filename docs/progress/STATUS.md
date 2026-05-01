@@ -12,16 +12,18 @@
   registered VM/PageBacked zones, recipes carrying `VmBacking::Page { pc:
   Cap<PageContainer>, offset }`, PageBacked-owned `PageCacheIndex` entries
   backed by real PPN plus `CachePin`, and fault materialization that returns
-  `MapPin` evidence for pmap publication. The remaining `PmapSeam` is still a
-  host-testable HAL-shaped seam, but it now owns mapping `MapPin`s and releases
-  them through rollback or teardown/shootdown. Verification so far: focused
-  `tx-substrate` page-allocator tests, focused and full `tx-kernel`
-  VM/PageBacked tests, full `tx-kernel --lib`, `cargo fmt --check`,
-  `cargo xtask progress validate`, `cargo xtask lint docs`, and
-  `git diff --check`. Next step: replace the host-testable `PmapSeam` with
-  real HAL `PmapIf` root/reservation/commit/shootdown evidence and connect VFS
-  `FsPageBacking`; blockers remain persistent epoch recipe snapshots,
-  trap/process/runtime integration, and file/device backing.
+  `MapPin` evidence for pmap publication. The pmap lane now replaces the
+  remaining `PmapSeam` with a VM-owned `VmPmap`: `AddressSpace` construction
+  captures a root-local `PmapIf` ops table, owns a real `PmapRoot`/ASID,
+  publishes faults through HAL reserve/commit, keeps a VM shadow map solely for
+  `MapPin` ownership, and tears down mappings through HAL unmap plus
+  ASID-scoped shootdown before releasing map-count evidence. Verification so
+  far: focused `tx-substrate` page-allocator tests, focused and full
+  `tx-kernel` VM/PageBacked tests, full `tx-kernel --lib`, `cargo fmt
+  --check`, `cargo xtask progress validate`, `cargo xtask lint docs`, and
+  `git diff --check`. Next step: connect VFS `FsPageBacking` and later trap /
+  Process / ThreadRuntime fault dispatch; blockers remain persistent epoch
+  recipe snapshots, trap/process/runtime integration, and file/device backing.
 - 2026-05-02 skill refresh: added subsystem-specific operational skills for
   VM/PageBacked, VFS/filesystem, and Process/ThreadRuntime work so future
   agents load the canonical subsystem docs before implementation and preserve
