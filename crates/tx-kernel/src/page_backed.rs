@@ -1,11 +1,27 @@
 //! PageBacked structure and sparse page-cache publication core.
 //!
 //! This is the first PageBacked-owned seam toward `PAGE_BACKED_v1.md`.
-//! `PageFrame` is a host-testable staging token for the future `Cap<Frame>`;
-//! the ownership and publication shape is intentionally `PageContainer` +
-//! offset-keyed `PageCacheIndex`, not VM-local file-cache state.
+//! Page cache entries now hold real page-substrate `CachePin` evidence, while
+//! VM fault materialization returns `MapPin` evidence for pmap publication.
+//! `Frame` is intentionally not a zone entity: frame liveness is represented by
+//! typed page-substrate contributors.
 
 use alloc::collections::BTreeMap;
+
+use crate::sync::SpinMutex;
+use tx_hal::Ppn;
+use tx_substrate::{
+    page_allocator::{self, AllocError, BitmapPageAllocator, CachePin, MapPin, ZeroPolicy},
+    zone::{self, Cap, Zone, ZoneAllocated, ZoneError},
+};
+
+static PAGE_CONTAINER_ZONE: Zone<PageContainer> = Zone::const_new();
+
+unsafe impl ZoneAllocated for PageContainer {
+    fn zone() -> &'static Zone<Self> {
+        &PAGE_CONTAINER_ZONE
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PageIndex(u64);
@@ -20,19 +36,6 @@ impl PageIndex {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PageFrame(u64);
-
-impl PageFrame {
-    pub const fn new(id: u64) -> Self {
-        Self(id)
-    }
-
-    pub const fn id(self) -> u64 {
-        self.0
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PageMarks {
     pub dirty: bool,
@@ -41,22 +44,38 @@ pub struct PageMarks {
     pub no_reclaim: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PageCacheEntry {
-    frame: PageFrame,
+    ppn: Ppn,
+    cache_pin: CachePin<'static, BitmapPageAllocator<'static>>,
     marks: PageMarks,
 }
 
 impl PageCacheEntry {
-    const fn new(frame: PageFrame) -> Self {
+    fn new(frame: CachedFrame) -> Self {
         Self {
-            frame,
+            ppn: frame.ppn,
+            cache_pin: frame.cache_pin,
             marks: PageMarks {
                 referenced: true,
                 ..PageMarks::new()
             },
         }
     }
+}
+
+impl core::fmt::Debug for PageCacheEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageCacheEntry")
+            .field("ppn", &self.ppn)
+            .field("cache_pin", &self.cache_pin)
+            .field("marks", &self.marks)
+            .finish()
+    }
+}
+
+struct CachedFrame {
+    ppn: Ppn,
+    cache_pin: CachePin<'static, BitmapPageAllocator<'static>>,
 }
 
 impl PageMarks {
@@ -72,11 +91,12 @@ impl PageMarks {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PageCacheError {
-    AlreadyPresent { current: PageFrame },
+    AlreadyPresent { current: Ppn },
     MissingPage,
-    MismatchedFrame { current: PageFrame },
+    MismatchedFrame { current: Ppn },
     OutOfBounds,
     UnsupportedKind,
+    Alloc(AllocError),
 }
 
 #[derive(Debug, Default)]
@@ -99,45 +119,41 @@ impl PageCacheIndex {
         self.pages.is_empty()
     }
 
-    pub fn lookup(&self, page: PageIndex) -> Option<PageFrame> {
-        self.pages.get(&page).map(|entry| entry.frame)
+    pub fn lookup(&self, page: PageIndex) -> Option<Ppn> {
+        self.pages.get(&page).map(|entry| entry.ppn)
     }
 
     pub fn marks(&self, page: PageIndex) -> Option<PageMarks> {
         self.pages.get(&page).map(|entry| entry.marks)
     }
 
-    pub fn install_if_absent(
+    fn install_if_absent(
         &mut self,
         page: PageIndex,
-        frame: PageFrame,
+        frame: CachedFrame,
     ) -> Result<(), PageCacheError> {
         if let Some(entry) = self.pages.get(&page) {
-            return Err(PageCacheError::AlreadyPresent {
-                current: entry.frame,
-            });
+            return Err(PageCacheError::AlreadyPresent { current: entry.ppn });
         }
 
         self.pages.insert(page, PageCacheEntry::new(frame));
         Ok(())
     }
 
-    pub fn install_if_match(
+    fn install_if_match(
         &mut self,
         page: PageIndex,
-        expected: PageFrame,
-        replacement: Option<PageFrame>,
-    ) -> Result<Option<PageFrame>, PageCacheError> {
+        expected: Ppn,
+        replacement: Option<CachedFrame>,
+    ) -> Result<Option<Ppn>, PageCacheError> {
         let Some(entry) = self.pages.get_mut(&page) else {
             return Err(PageCacheError::MissingPage);
         };
-        if entry.frame != expected {
-            return Err(PageCacheError::MismatchedFrame {
-                current: entry.frame,
-            });
+        if entry.ppn != expected {
+            return Err(PageCacheError::MismatchedFrame { current: entry.ppn });
         }
 
-        let previous = entry.frame;
+        let previous = entry.ppn;
         match replacement {
             Some(frame) => {
                 *entry = PageCacheEntry::new(frame);
@@ -178,9 +194,10 @@ pub enum MaterializeAccess {
     Write,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct MaterializedPage {
-    pub frame: PageFrame,
+    pub ppn: Ppn,
+    pub map_pin: MapPin<'static, BitmapPageAllocator<'static>>,
     pub newly_installed: bool,
     pub dirty: bool,
 }
@@ -189,8 +206,12 @@ pub struct MaterializedPage {
 pub struct PageContainer {
     kind: PageContainerKind,
     page_count: u64,
+    state: SpinMutex<PageContainerState>,
+}
+
+#[derive(Debug)]
+struct PageContainerState {
     pages: PageCacheIndex,
-    next_frame_id: u64,
 }
 
 impl PageContainer {
@@ -198,9 +219,18 @@ impl PageContainer {
         Self {
             kind,
             page_count,
-            pages: PageCacheIndex::new(),
-            next_frame_id: 1,
+            state: SpinMutex::new(PageContainerState {
+                pages: PageCacheIndex::new(),
+            }),
         }
+    }
+
+    pub fn new_cap(
+        kind: PageContainerKind,
+        page_count: u64,
+    ) -> Result<Cap<PageContainer>, ZoneError> {
+        let reservation = zone::reserve_for::<PageContainer>()?;
+        Ok(zone::sign_for(reservation, Self::new(kind, page_count)))
     }
 
     pub const fn kind(&self) -> PageContainerKind {
@@ -212,19 +242,19 @@ impl PageContainer {
     }
 
     pub fn resident_pages(&self) -> usize {
-        self.pages.len()
+        self.state.lock().pages.len()
     }
 
-    pub fn lookup(&self, page: PageIndex) -> Option<PageFrame> {
-        self.pages.lookup(page)
+    pub fn lookup(&self, page: PageIndex) -> Option<Ppn> {
+        self.state.lock().pages.lookup(page)
     }
 
     pub fn page_marks(&self, page: PageIndex) -> Option<PageMarks> {
-        self.pages.marks(page)
+        self.state.lock().pages.marks(page)
     }
 
     pub fn materialize_anon(
-        &mut self,
+        &self,
         page: PageIndex,
         access: MaterializeAccess,
     ) -> Result<MaterializedPage, PageCacheError> {
@@ -233,23 +263,29 @@ impl PageContainer {
         }
         self.check_bounds(page)?;
 
-        let newly_installed = match self.pages.lookup(page) {
+        let mut state = self.state.lock();
+        let newly_installed = match state.pages.lookup(page) {
             Some(_) => false,
             None => {
-                let frame = self.allocate_staging_frame();
-                self.pages.install_if_absent(page, frame)?;
+                let frame = allocate_cached_frame()?;
+                state.pages.install_if_absent(page, frame)?;
                 true
             }
         };
 
         if access == MaterializeAccess::Write {
-            self.pages.mark_dirty(page)?;
+            state.pages.mark_dirty(page)?;
         }
 
-        let frame = self.pages.lookup(page).ok_or(PageCacheError::MissingPage)?;
-        let marks = self.pages.marks(page).ok_or(PageCacheError::MissingPage)?;
+        let ppn = state
+            .pages
+            .lookup(page)
+            .ok_or(PageCacheError::MissingPage)?;
+        let map_pin = page_allocator::acquire_map_pin(ppn).map_err(PageCacheError::Alloc)?;
+        let marks = state.pages.marks(page).ok_or(PageCacheError::MissingPage)?;
         Ok(MaterializedPage {
-            frame,
+            ppn,
+            map_pin,
             newly_installed,
             dirty: marks.dirty,
         })
@@ -261,32 +297,47 @@ impl PageContainer {
         }
         Ok(())
     }
+}
 
-    fn allocate_staging_frame(&mut self) -> PageFrame {
-        let frame = PageFrame::new(self.next_frame_id);
-        self.next_frame_id += 1;
-        frame
-    }
+fn allocate_cached_frame() -> Result<CachedFrame, PageCacheError> {
+    let frame = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
+        .map_err(PageCacheError::Alloc)?
+        .commit();
+    let ppn = frame.ppn();
+    let cache_pin = frame.try_cache_pin().map_err(PageCacheError::Alloc)?;
+    drop(frame);
+    Ok(CachedFrame { ppn, cache_pin })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tx_substrate::epoch;
+
+    fn setup_host_substrate() {
+        tx_substrate::testing::init_host_for_test_once();
+    }
+
+    fn cached_frame_for_test() -> CachedFrame {
+        setup_host_substrate();
+        allocate_cached_frame().expect("cached frame")
+    }
 
     #[test]
     fn page_cache_index_install_if_absent_linearizes_sparse_offsets() {
         let mut index = PageCacheIndex::new();
         let page = PageIndex::new(7);
-        let first = PageFrame::new(11);
-        let second = PageFrame::new(12);
+        let first = cached_frame_for_test();
+        let first_ppn = first.ppn;
+        let second = cached_frame_for_test();
 
         assert_eq!(index.lookup(page), None);
         assert_eq!(index.install_if_absent(page, first), Ok(()));
         assert_eq!(
             index.install_if_absent(page, second),
-            Err(PageCacheError::AlreadyPresent { current: first })
+            Err(PageCacheError::AlreadyPresent { current: first_ppn })
         );
-        assert_eq!(index.lookup(page), Some(first));
+        assert_eq!(index.lookup(page), Some(first_ppn));
         assert_eq!(index.len(), 1);
     }
 
@@ -294,31 +345,36 @@ mod tests {
     fn page_cache_index_install_if_match_replaces_or_withdraws_exact_frame() {
         let mut index = PageCacheIndex::new();
         let page = PageIndex::new(3);
-        let first = PageFrame::new(21);
-        let replacement = PageFrame::new(22);
+        let first = cached_frame_for_test();
+        let first_ppn = first.ppn;
+        let wrong = cached_frame_for_test().ppn;
+        let replacement = cached_frame_for_test();
 
         index
             .install_if_absent(page, first)
             .expect("initial insert");
         assert_eq!(
-            index.install_if_match(page, PageFrame::new(99), Some(replacement)),
-            Err(PageCacheError::MismatchedFrame { current: first })
+            index.install_if_match(page, wrong, Some(replacement)),
+            Err(PageCacheError::MismatchedFrame { current: first_ppn })
         );
+        let replacement = cached_frame_for_test();
+        let replacement_ppn = replacement.ppn;
         assert_eq!(
-            index.install_if_match(page, first, Some(replacement)),
-            Ok(Some(first))
+            index.install_if_match(page, first_ppn, Some(replacement)),
+            Ok(Some(first_ppn))
         );
-        assert_eq!(index.lookup(page), Some(replacement));
+        assert_eq!(index.lookup(page), Some(replacement_ppn));
         assert_eq!(
-            index.install_if_match(page, replacement, None),
-            Ok(Some(replacement))
+            index.install_if_match(page, replacement_ppn, None),
+            Ok(Some(replacement_ppn))
         );
         assert_eq!(index.lookup(page), None);
     }
 
     #[test]
     fn anon_page_container_materializes_once_and_tracks_dirty_writes() {
-        let mut pc = PageContainer::new(
+        setup_host_substrate();
+        let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
             },
@@ -335,10 +391,39 @@ mod tests {
 
         assert!(first.newly_installed);
         assert!(!first.dirty);
-        assert_eq!(second.frame, first.frame);
+        assert_eq!(second.ppn, first.ppn);
         assert!(!second.newly_installed);
         assert!(second.dirty);
-        assert_eq!(pc.lookup(page), Some(first.frame));
+        assert_eq!(pc.lookup(page), Some(first.ppn));
+        assert_eq!(pc.resident_pages(), 1);
+    }
+
+    #[test]
+    fn page_container_cap_materializes_anon_pages() {
+        setup_host_substrate();
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            4,
+        )
+        .expect("page container cap");
+        let weak = pc.downgrade();
+        let guard = epoch::guard();
+        let ident = weak.observe(&guard).expect("live page container");
+        assert_eq!(ident.page_count(), 4);
+
+        let first = pc
+            .materialize_anon(PageIndex::new(1), MaterializeAccess::Read)
+            .expect("cap-backed materialization");
+        let second = pc
+            .materialize_anon(PageIndex::new(1), MaterializeAccess::Write)
+            .expect("cap-backed rematerialization");
+
+        assert_eq!(first.ppn, second.ppn);
+        assert!(first.newly_installed);
+        assert!(!second.newly_installed);
+        assert!(second.dirty);
         assert_eq!(pc.resident_pages(), 1);
     }
 }

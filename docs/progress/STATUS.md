@@ -6,26 +6,22 @@
 
 - 2026-05-02 VM/PageBacked implementation lane now lives on
   `codex/vm-pagebacked-impl`. It brought in the corrected AddressSpace
-  range-index core, added a PageBacked-owned sparse `PageCacheIndex` /
-  anonymous `PageContainer` seam, exposed recipe gap/overlap queries for mmap
-  placement, and added a test-callable VM fault resolve path that takes a
-  Materializer reservation and validates recipes/protections before deferred
-  pmap materialization. The lane now also has mmap-style `map_script` gap
-  placement, v1 disjoint-only `mremap` recipe movement, and a staging
-  PageBacked recipe token that lets fault outcomes compute a PageContainer page
-  index and delegate anonymous page materialization back to `PageContainer`.
-  It also has a staging `PmapSeam` that records derived mappings, revalidates
-  recipes before publication, and accounts teardown/shootdown after recipe
-  mutation for unmap/protect. The pmap seam now follows a HAL-shaped
-  reserve/commit/rollback state machine with rollback-on-drop reservations.
-  Verification so far: focused `tx-kernel` VM/PageBacked tests plus full
-  `tx-kernel --lib`, progress validation, docs lint, fmt, and diff checks.
-  Next step: replace staging `PageFrame`/PageBacked/`PmapSeam` tokens with
-  `Cap<Frame>`/`CachePin`, `Cap<PageContainer>`, and HAL `PmapIf`
-  root/reservation/commit/shootdown evidence, then connect VFS `FsPageBacking`;
-  blockers remain persistent epoch recipe snapshots, zone-owned
-  VM/PageContainer evidence, trap/process/runtime integration, and file/device
-  backing.
+  range-index core, mmap-style gap placement, v1 disjoint-only `mremap`, and
+  fault resolution over authoritative recipes. The lane now also has
+  zone-backed `Cap<AddressSpace>` and `Cap<PageContainer>` constructors,
+  registered VM/PageBacked zones, recipes carrying `VmBacking::Page { pc:
+  Cap<PageContainer>, offset }`, PageBacked-owned `PageCacheIndex` entries
+  backed by real PPN plus `CachePin`, and fault materialization that returns
+  `MapPin` evidence for pmap publication. The remaining `PmapSeam` is still a
+  host-testable HAL-shaped seam, but it now owns mapping `MapPin`s and releases
+  them through rollback or teardown/shootdown. Verification so far: focused
+  `tx-substrate` page-allocator tests, focused and full `tx-kernel`
+  VM/PageBacked tests, full `tx-kernel --lib`, `cargo fmt --check`,
+  `cargo xtask progress validate`, `cargo xtask lint docs`, and
+  `git diff --check`. Next step: replace the host-testable `PmapSeam` with
+  real HAL `PmapIf` root/reservation/commit/shootdown evidence and connect VFS
+  `FsPageBacking`; blockers remain persistent epoch recipe snapshots,
+  trap/process/runtime integration, and file/device backing.
 - 2026-05-02 skill refresh: added subsystem-specific operational skills for
   VM/PageBacked, VFS/filesystem, and Process/ThreadRuntime work so future
   agents load the canonical subsystem docs before implementation and preserve

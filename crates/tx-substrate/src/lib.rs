@@ -25,6 +25,48 @@ pub mod page_allocator;
 pub mod slab;
 pub mod zone;
 
+#[doc(hidden)]
+pub mod testing {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    const UNINITIALIZED: usize = 0;
+    const INITIALIZING: usize = 1;
+    const INITIALIZED: usize = 2;
+    static STATE: AtomicUsize = AtomicUsize::new(UNINITIALIZED);
+
+    pub fn init_host_for_test_once() {
+        match STATE.compare_exchange(
+            UNINITIALIZED,
+            INITIALIZING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(INITIALIZED) => return,
+            Err(_) => {
+                while STATE.load(Ordering::Acquire) != INITIALIZED {
+                    core::hint::spin_loop();
+                }
+                return;
+            }
+        }
+
+        crate::page_allocator::testing::install_test_allocator_once()
+            .expect("test page allocator install");
+        unsafe {
+            crate::epoch::testing::reset_for_test();
+            crate::zone::testing::reset_for_test();
+        }
+        crate::epoch::testing::init_for_test();
+        crate::zone::testing::init_for_test(
+            4096,
+            crate::page_allocator::testing::direct_map_base_for_test(),
+        )
+        .expect("test zone runtime init");
+        STATE.store(INITIALIZED, Ordering::Release);
+    }
+}
+
 pub mod page {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct PageSize(pub usize);
