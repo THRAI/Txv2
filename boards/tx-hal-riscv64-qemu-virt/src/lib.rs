@@ -3,11 +3,14 @@
 #[cfg(test)]
 extern crate std;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 mod boot_static;
 mod dtb;
 mod pmap;
 mod time;
 mod trap;
+pub use trap::{dispatch_trap_frame, return_to_userspace, Rv64TrapFrame};
 
 use boot_static::{
     reserved_region, BootStaticBag, IdentityDropped, IdentityLive, CMDLINE_CAPACITY,
@@ -16,10 +19,11 @@ use dtb::parse_boot_info_from_fdt;
 use pmap::topology as pmap_topology;
 use tx_hal::{
     AllocError, Arch, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf, BootPlatformIf,
-    BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, DmaIf, InitIf, IrqIf, MemoryRegion,
-    MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError,
-    PmapIf, PmapInvalidation, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
-    PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SignalFrameIf, SmpIf, TimeIf, UserAccessIf,
+    BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaIf, InitIf, IpiKind,
+    IrqIf, MemoryRegion, MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
+    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry,
+    SignalFrameIf, SmpIf, TimeIf, UserAccessIf,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -34,6 +38,7 @@ core::arch::global_asm!(
     .equ TX_RV64_KERNEL_L1_START_SLOT, 1
     .equ TX_RV64_KERNEL_ALIAS_L0_TABLES, 8
     .equ TX_RV64_PAGE_SIZE, 4096
+    .equ TX_RV64_MAX_BOOT_CPUS, 4
     .equ TX_RV64_SATP_SV39, 0x8000000000000000
     .equ TX_RV64_PTE_V, 0x001
     .equ TX_RV64_PTE_R, 0x002
@@ -51,6 +56,11 @@ _start:
     mv s0, a0
     mv s1, a1
     la sp, __tx_boot_stack_top_load
+    li t0, TX_RV64_MAX_BOOT_CPUS
+    bgeu s0, t0, .Ltx_bsp_stack_ready
+    slli t1, s0, 16
+    sub sp, sp, t1
+.Ltx_bsp_stack_ready:
 
     la t0, __bss_start_load
     la t1, __bss_end_load
@@ -138,6 +148,11 @@ _start:
 
     li t0, TX_RV64_KERNEL_VIRT_OFFSET
     la sp, __tx_boot_stack_top_load
+    li t1, TX_RV64_MAX_BOOT_CPUS
+    bgeu s0, t1, .Ltx_bsp_high_stack_ready
+    slli t2, s0, 16
+    sub sp, sp, t2
+.Ltx_bsp_high_stack_ready:
     add sp, sp, t0
     .option push
     .option norelax
@@ -151,6 +166,40 @@ _start:
     add t1, t1, t0
     jr t1
 
+    .globl tx_rv64_qemu_secondary_start
+    .type tx_rv64_qemu_secondary_start, @function
+tx_rv64_qemu_secondary_start:
+    mv s0, a0
+    mv s1, a1
+    li t0, TX_RV64_MAX_BOOT_CPUS
+    bgeu s0, t0, 9f
+
+    la sp, __tx_boot_stack_top_load
+    slli t1, s0, 16
+    sub sp, sp, t1
+    li t0, TX_RV64_KERNEL_VIRT_OFFSET
+    add sp, sp, t0
+    .option push
+    .option norelax
+    la gp, __global_pointer_load
+    add gp, gp, t0
+    .option pop
+
+    la t0, __bootstrap_root_load
+    srli t0, t0, 12
+    li t1, TX_RV64_SATP_SV39
+    or t0, t0, t1
+    csrw satp, t0
+    sfence.vma
+
+    mv a0, s0
+    jr s1
+
+9:
+    wfi
+    j 9b
+    .size tx_rv64_qemu_secondary_start, . - tx_rv64_qemu_secondary_start
+
 7:
     wfi
     j 7b
@@ -162,6 +211,9 @@ pub struct Platform;
 
 const QEMU_VIRT_RAM_BASE: usize = 0x8000_0000;
 const QEMU_VIRT_FALLBACK_RAM_SIZE: usize = 256 * 1024 * 1024;
+const MAX_BOOT_CPUS: usize = 4;
+static ONLINE_CPUS: AtomicU64 = AtomicU64::new(0);
+static IPI_ACKED_CPUS: AtomicU64 = AtomicU64::new(0);
 
 impl PlatformConfig for Platform {
     const ARCH: Arch = Arch::Riscv64;
@@ -296,6 +348,7 @@ impl PmapIf for Platform {
 
     fn shootdown_kernel_mapping(invalidation: PmapInvalidation) {
         pmap::shootdown_kernel_mapping(invalidation);
+        remote_sfence_vma(invalidation);
     }
 
     fn create_pmap_root() -> Result<PmapRoot, PmapError> {
@@ -342,6 +395,7 @@ impl PmapIf for Platform {
 
     fn shootdown_mapping(asid: Asid, invalidation: PmapInvalidation) {
         pmap::shootdown_mapping(asid, invalidation);
+        remote_sfence_vma_asid(asid, invalidation);
     }
 }
 impl UserAccessIf for Platform {}
@@ -360,14 +414,116 @@ impl TimeIf for Platform {
         time::cancel_deadline();
     }
 
+    fn enable_timer_wakeups() {
+        time::enable_timer_wakeups();
+    }
+
     fn frequency_hz() -> u64 {
         Self::platform_info().timebase_frequency_hz
     }
 }
-impl PercpuIf for Platform {}
+impl PercpuIf for Platform {
+    fn current_cpu_id() -> CpuId {
+        current_cpu_id()
+    }
+
+    fn install_early_percpu(cpu_id: CpuId) {
+        install_early_percpu(cpu_id);
+    }
+}
 impl CacheIf for Platform {}
 impl DmaIf for Platform {}
-impl SmpIf for Platform {}
+impl SmpIf for Platform {
+    fn current_cpu_id() -> CpuId {
+        current_cpu_id()
+    }
+
+    fn possible_cpus() -> CpuMask {
+        CpuMask::first(Self::platform_info().possible_cpu_count.min(MAX_BOOT_CPUS))
+    }
+
+    fn online_cpus() -> CpuMask {
+        CpuMask::from_bits(ONLINE_CPUS.load(Ordering::Acquire))
+    }
+
+    fn mark_cpu_online(cpu: CpuId) {
+        if cpu.0 < u64::BITS as usize {
+            ONLINE_CPUS.fetch_or(1u64 << cpu.0, Ordering::AcqRel);
+        }
+    }
+
+    fn boot_secondary_cpus(entry: SecondaryEntry) -> usize {
+        let possible = Self::possible_cpus();
+        let current = current_cpu_id();
+        let mut started_mask = CpuMask::EMPTY;
+
+        IPI_ACKED_CPUS.store(0, Ordering::Release);
+        pmap::install_secondary_identity_bridge();
+        for cpu in 0..MAX_BOOT_CPUS {
+            let cpu = CpuId(cpu);
+            if cpu == current || !possible.contains(cpu) {
+                continue;
+            }
+            if start_secondary_hart(cpu, entry) {
+                started_mask =
+                    CpuMask::from_bits(started_mask.bits() | CpuMask::single(cpu).bits());
+            }
+        }
+        let online = wait_for_online_secondaries(started_mask);
+        pmap::remove_secondary_identity_bridge();
+
+        online
+    }
+
+    fn enable_ipi_wakeups() {
+        enable_supervisor_software_wakeups();
+    }
+
+    fn wait_for_interrupt_once() {
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+
+        #[cfg(not(target_arch = "riscv64"))]
+        core::hint::spin_loop();
+    }
+
+    fn pending_ipi(_kind: IpiKind) -> bool {
+        supervisor_software_interrupt_pending()
+    }
+
+    fn park_this_cpu() -> ! {
+        enable_supervisor_software_interrupts();
+        loop {
+            Self::wait_for_interrupt_once();
+        }
+    }
+
+    fn send_ipi(target: CpuId, _kind: IpiKind) {
+        if target == current_cpu_id() {
+            return;
+        }
+        send_sbi_ipi(CpuMask::single(target));
+    }
+
+    fn broadcast_ipi(mask: CpuMask, _kind: IpiKind) {
+        send_sbi_ipi(mask);
+    }
+
+    fn ack_ipi(_kind: IpiKind) {
+        mark_ipi_ack(current_cpu_id());
+        clear_supervisor_software_interrupt();
+    }
+
+    fn clear_ipi_ack_cpus(_kind: IpiKind, mask: CpuMask) {
+        IPI_ACKED_CPUS.fetch_and(!mask.bits(), Ordering::AcqRel);
+    }
+
+    fn ipi_ack_cpus(_kind: IpiKind) -> CpuMask {
+        CpuMask::from_bits(IPI_ACKED_CPUS.load(Ordering::Acquire))
+    }
+}
 
 impl PowerIf for Platform {
     fn system_off() -> ! {
@@ -377,6 +533,171 @@ impl PowerIf for Platform {
         loop {
             core::hint::spin_loop();
         }
+    }
+}
+
+fn current_cpu_id() -> CpuId {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let cpu_id: usize;
+        unsafe {
+            core::arch::asm!("mv {cpu_id}, tp", cpu_id = out(reg) cpu_id, options(nomem, nostack));
+        }
+        CpuId(cpu_id)
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        CpuId(0)
+    }
+}
+
+fn install_early_percpu(cpu_id: CpuId) {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("mv tp, {cpu_id}", cpu_id = in(reg) cpu_id.0, options(nomem, nostack));
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = cpu_id;
+}
+
+fn enable_supervisor_software_interrupts() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("csrsi sie, 2", "csrsi sstatus, 2", options(nomem, nostack));
+    }
+}
+
+fn enable_supervisor_software_wakeups() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("csrsi sie, 2", "csrci sstatus, 2", options(nomem, nostack));
+    }
+}
+
+fn supervisor_software_interrupt_pending() -> bool {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let sip: usize;
+        unsafe {
+            core::arch::asm!("csrr {sip}, sip", sip = out(reg) sip, options(nomem, nostack));
+        }
+        sip & 0x2 != 0
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        false
+    }
+}
+
+fn mark_ipi_ack(cpu_id: CpuId) {
+    if cpu_id.0 < u64::BITS as usize {
+        IPI_ACKED_CPUS.fetch_or(1u64 << cpu_id.0, Ordering::AcqRel);
+    }
+}
+
+fn start_secondary_hart(cpu: CpuId, entry: SecondaryEntry) -> bool {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let start_addr = boot_static::secondary_start_entry();
+        sbi_hart_start(cpu.0, start_addr, entry as usize) == 0
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        let _ = (cpu, entry);
+        false
+    }
+}
+
+fn wait_for_online_secondaries(target: CpuMask) -> usize {
+    let target = target.bits();
+    if target == 0 {
+        return 0;
+    }
+
+    for _ in 0..100_000 {
+        let online = ONLINE_CPUS.load(Ordering::Acquire) & target;
+        if online == target {
+            return online.count_ones() as usize;
+        }
+        core::hint::spin_loop();
+    }
+    (ONLINE_CPUS.load(Ordering::Acquire) & target).count_ones() as usize
+}
+
+fn remote_sfence_vma(invalidation: PmapInvalidation) {
+    let targets = remote_sfence_targets();
+    if targets.is_empty() {
+        return;
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let error = sbi_remote_sfence_vma(
+            targets.bits(),
+            0,
+            invalidation.virt().0,
+            invalidation.size(),
+        );
+        assert_eq!(error, 0, "SBI remote sfence.vma failed");
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = invalidation;
+}
+
+fn remote_sfence_vma_asid(asid: Asid, invalidation: PmapInvalidation) {
+    let targets = remote_sfence_targets();
+    if targets.is_empty() {
+        return;
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let error = sbi_remote_sfence_vma_asid(
+            targets.bits(),
+            0,
+            invalidation.virt().0,
+            invalidation.size(),
+            asid.0 as usize,
+        );
+        assert_eq!(error, 0, "SBI remote sfence.vma.asid failed");
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = (asid, invalidation);
+}
+
+fn remote_sfence_targets() -> CpuMask {
+    remote_sfence_targets_from(<Platform as SmpIf>::online_cpus(), current_cpu_id())
+}
+
+fn remote_sfence_targets_from(online: CpuMask, current: CpuId) -> CpuMask {
+    CpuMask::from_bits(online.bits() & !CpuMask::single(current).bits())
+}
+
+fn send_sbi_ipi(mask: CpuMask) {
+    let mask = mask.bits();
+    if mask == 0 {
+        return;
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let _ = sbi_send_ipi(mask, 0);
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = mask;
+}
+
+fn clear_supervisor_software_interrupt() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("csrci sip, 2", options(nomem, nostack));
     }
 }
 
@@ -390,6 +711,91 @@ fn sbi_console_putchar(byte: u8) {
             options(nostack)
         );
     }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn sbi_hart_start(hart_id: usize, start_addr: usize, opaque: usize) -> isize {
+    let error: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") hart_id => error,
+            in("a1") start_addr,
+            in("a2") opaque,
+            in("a6") 0usize,
+            in("a7") 0x48534dusize,
+            lateout("a1") _,
+            options(nostack)
+        );
+    }
+    error
+}
+
+#[cfg(target_arch = "riscv64")]
+fn sbi_send_ipi(hart_mask: u64, hart_mask_base: usize) -> isize {
+    let error: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") hart_mask as usize => error,
+            in("a1") hart_mask_base,
+            in("a6") 0usize,
+            in("a7") 0x735049usize,
+            lateout("a1") _,
+            options(nostack)
+        );
+    }
+    error
+}
+
+#[cfg(target_arch = "riscv64")]
+fn sbi_remote_sfence_vma(
+    hart_mask: u64,
+    hart_mask_base: usize,
+    start_addr: usize,
+    size: usize,
+) -> isize {
+    let error: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") hart_mask as usize => error,
+            in("a1") hart_mask_base,
+            in("a2") start_addr,
+            in("a3") size,
+            in("a6") 1usize,
+            in("a7") 0x52464e43usize,
+            lateout("a1") _,
+            options(nostack)
+        );
+    }
+    error
+}
+
+#[cfg(target_arch = "riscv64")]
+fn sbi_remote_sfence_vma_asid(
+    hart_mask: u64,
+    hart_mask_base: usize,
+    start_addr: usize,
+    size: usize,
+    asid: usize,
+) -> isize {
+    let error: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") hart_mask as usize => error,
+            in("a1") hart_mask_base,
+            in("a2") start_addr,
+            in("a3") size,
+            in("a4") asid,
+            in("a6") 2usize,
+            in("a7") 0x52464e43usize,
+            lateout("a1") _,
+            options(nostack)
+        );
+    }
+    error
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -416,7 +822,7 @@ impl BootStaticBag<IdentityLive> {
         cmdline.fill(0);
 
         let parsed = parse_boot_info_from_fdt(dtb_addr, memory_regions, cmdline);
-        let (memory_region_count, initrd, cmdline_len, timebase_frequency_hz) =
+        let (memory_region_count, initrd, cmdline_len, timebase_frequency_hz, possible_cpu_count) =
             if let Some(parsed) = parsed {
                 (
                     parsed.memory_region_count,
@@ -425,6 +831,7 @@ impl BootStaticBag<IdentityLive> {
                     parsed
                         .timebase_frequency_hz
                         .unwrap_or(time::QEMU_VIRT_FALLBACK_TIMEBASE_HZ),
+                    parsed.possible_cpu_count,
                 )
             } else {
                 memory_regions[0] = MemoryRegion {
@@ -432,9 +839,10 @@ impl BootStaticBag<IdentityLive> {
                     size: QEMU_VIRT_FALLBACK_RAM_SIZE,
                     kind: MemoryRegionKind::Usable,
                 };
-                (1, None, 0, time::QEMU_VIRT_FALLBACK_TIMEBASE_HZ)
+                (1, None, 0, time::QEMU_VIRT_FALLBACK_TIMEBASE_HZ, 1)
             };
         self.publish_timebase_frequency_hz(timebase_frequency_hz);
+        self.publish_possible_cpu_count(possible_cpu_count);
         let memory_region_count =
             reserve_firmware_loader_region(memory_regions, memory_region_count);
 
@@ -476,9 +884,54 @@ fn reserve_firmware_loader_region(
 
 #[cfg(test)]
 mod tests {
-    use tx_hal::{TrapClass, TrapFrameSnapshot, TrapIf, VirtAddr};
+    use tx_hal::{
+        CpuId, CpuMask, FaultInfo, IpiKind, KernelTrapSink, SmpIf, TrapAction, TrapClass,
+        TrapFrameMut, TrapFrameSnapshot, TrapIf, TrapPreviousMode, VirtAddr,
+    };
 
-    use crate::{trap::classify_rv64_trap, Platform};
+    use crate::{
+        dispatch_trap_frame, mark_ipi_ack, remote_sfence_targets_from, trap::classify_rv64_trap,
+        Platform, Rv64TrapFrame,
+    };
+
+    struct RecordingTrapSink;
+
+    impl KernelTrapSink<Platform> for RecordingTrapSink {
+        fn on_page_fault(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction {
+            assert_eq!(view.view().previous_mode, TrapPreviousMode::User);
+            assert_eq!(fault.address, VirtAddr(0xfeed_cafe));
+            assert!(fault.write);
+            assert!(!fault.instruction);
+            assert!(fault.from_user);
+            TrapAction::Terminate
+        }
+
+        fn on_syscall(mut view: TrapFrameMut<'_>) -> TrapAction {
+            assert_eq!(view.view().syscall_number, 64);
+            assert_eq!(view.view().syscall_args, [1, 2, 3, 4, 5, 6]);
+            view.set_syscall_return(123);
+            TrapAction::Resume
+        }
+
+        fn on_timer_interrupt(_cpu: CpuId) -> TrapAction {
+            TrapAction::Reschedule
+        }
+
+        fn on_external_irq(_cpu: CpuId) -> TrapAction {
+            TrapAction::Resume
+        }
+
+        fn on_ipi(_cpu: CpuId) -> TrapAction {
+            TrapAction::Resume
+        }
+
+        fn on_illegal_or_sync_fault(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction {
+            assert_eq!(view.view().pc, VirtAddr(0x4040));
+            assert_eq!(fault.address, VirtAddr(0x4040));
+            assert!(fault.instruction);
+            TrapAction::Terminate
+        }
+    }
 
     #[test]
     fn rv64_trap_classification_decodes_sync_faults_and_interrupts() {
@@ -606,5 +1059,136 @@ mod tests {
         );
         assert_eq!(portable.pc, VirtAddr(0x2000));
         assert_eq!(portable.fault_address, Some(VirtAddr(0xfeed_cafe)));
+    }
+
+    #[test]
+    fn trap_frame_view_projects_syscall_fields() {
+        let mut frame = test_trap_frame(8, 0x1000, 0);
+        frame.x[10] = 1;
+        frame.x[11] = 2;
+        frame.x[12] = 3;
+        frame.x[13] = 4;
+        frame.x[14] = 5;
+        frame.x[15] = 6;
+        frame.x[17] = 64;
+
+        let action = dispatch_trap_frame::<RecordingTrapSink>(&mut frame);
+
+        assert_eq!(action, TrapAction::Resume);
+        assert_eq!(frame.x[10], 123);
+    }
+
+    #[test]
+    fn trap_frame_mutators_write_saved_registers() {
+        let mut frame = test_trap_frame(8, 0x1000, 0);
+
+        {
+            let mut view = frame.view_mut();
+            view.set_pc(VirtAddr(0x1111));
+            view.set_sp(VirtAddr(0x2222));
+            view.set_syscall_return(7);
+            view.set_user_tls_register(0x3333);
+
+            assert_eq!(view.view().pc, VirtAddr(0x1111));
+            assert_eq!(view.view().sp, VirtAddr(0x2222));
+            assert_eq!(view.view().syscall_args[0], 7);
+        }
+
+        assert_eq!(frame.sepc, 0x1111);
+        assert_eq!(frame.x[2], 0x2222);
+        assert_eq!(frame.x[10], 7);
+        assert_eq!(frame.x[4], 0x3333);
+    }
+
+    #[test]
+    fn trap_frame_mutators_encode_syscall_error() {
+        let mut frame = test_trap_frame(8, 0x1000, 0);
+
+        frame.view_mut().set_syscall_error(5);
+
+        assert_eq!(frame.x[10], (-5isize) as usize);
+    }
+
+    #[test]
+    fn trap_frame_prepare_user_return_sets_sret_mode_bits() {
+        let mut frame = test_trap_frame(8, 0x1000, 0);
+
+        frame.prepare_user_return();
+
+        assert_eq!(frame.sstatus & (1 << 8), 0);
+        assert_ne!(frame.sstatus & (1 << 5), 0);
+        assert_eq!(frame.previous_mode(), TrapPreviousMode::User);
+    }
+
+    #[test]
+    fn trap_dispatch_routes_timer_to_sink_action() {
+        let interrupt_bit = 1usize << (usize::BITS as usize - 1);
+        let mut frame = test_trap_frame(interrupt_bit | 5, 0x2000, 0);
+
+        let action = dispatch_trap_frame::<RecordingTrapSink>(&mut frame);
+
+        assert_eq!(action, TrapAction::Reschedule);
+    }
+
+    #[test]
+    fn trap_dispatch_routes_page_fault_with_user_flag() {
+        let mut frame = test_trap_frame(15, 0x3000, 0xfeed_cafe);
+        frame.sstatus &= !(1 << 8);
+
+        let action = dispatch_trap_frame::<RecordingTrapSink>(&mut frame);
+
+        assert_eq!(action, TrapAction::Terminate);
+    }
+
+    #[test]
+    fn trap_dispatch_routes_sync_fault_to_illegal_or_sync_sink() {
+        let mut frame = test_trap_frame(2, 0x4040, 0);
+
+        let action = dispatch_trap_frame::<RecordingTrapSink>(&mut frame);
+
+        assert_eq!(action, TrapAction::Terminate);
+    }
+
+    #[test]
+    fn remote_sfence_targets_exclude_current_hart() {
+        let targets = remote_sfence_targets_from(CpuMask::from_bits(0b1111), CpuId(2));
+
+        assert_eq!(targets.bits(), 0b1011);
+    }
+
+    #[test]
+    fn remote_sfence_targets_are_empty_for_uniprocessor_online_mask() {
+        let targets = remote_sfence_targets_from(CpuMask::single(CpuId(0)), CpuId(0));
+
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn ipi_ack_observation_can_be_cleared_by_mask() {
+        <Platform as SmpIf>::clear_ipi_ack_cpus(IpiKind::Reschedule, CpuMask::from_bits(u64::MAX));
+        mark_ipi_ack(CpuId(1));
+        mark_ipi_ack(CpuId(3));
+
+        assert_eq!(
+            <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Reschedule).bits(),
+            0b1010
+        );
+
+        <Platform as SmpIf>::clear_ipi_ack_cpus(IpiKind::Reschedule, CpuMask::single(CpuId(1)));
+
+        assert_eq!(
+            <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Reschedule).bits(),
+            0b1000
+        );
+    }
+
+    fn test_trap_frame(scause: usize, sepc: usize, stval: usize) -> Rv64TrapFrame {
+        Rv64TrapFrame {
+            x: [0; 32],
+            scause,
+            sepc,
+            stval,
+            sstatus: 1 << 8,
+        }
     }
 }

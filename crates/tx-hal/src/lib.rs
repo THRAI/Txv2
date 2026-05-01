@@ -13,6 +13,51 @@ pub enum Arch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuId(pub usize);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuMask(pub u64);
+
+impl CpuMask {
+    pub const EMPTY: Self = Self(0);
+
+    pub const fn single(cpu: CpuId) -> Self {
+        if cpu.0 < u64::BITS as usize {
+            Self(1u64 << cpu.0)
+        } else {
+            Self::EMPTY
+        }
+    }
+
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    pub const fn first(count: usize) -> Self {
+        if count == 0 {
+            Self::EMPTY
+        } else if count >= u64::BITS as usize {
+            Self(u64::MAX)
+        } else {
+            Self((1u64 << count) - 1)
+        }
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub const fn contains(self, cpu: CpuId) -> bool {
+        cpu.0 < u64::BITS as usize && (self.0 & (1u64 << cpu.0)) != 0
+    }
+
+    pub fn count(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 #[derive(Debug)]
 #[must_use]
 pub struct CpuPinGuard {
@@ -178,6 +223,7 @@ pub struct PlatformInfo {
     pub spi_sd: Option<SpiSdInfo>,
     pub mmio_regions: &'static [MmioRegion],
     pub timebase_frequency_hz: u64,
+    pub possible_cpu_count: usize,
 }
 
 pub trait PlatformConfig {
@@ -217,6 +263,10 @@ pub trait BootPlatformIf {
 pub trait InitIf {
     fn init_early(handoff: BootHandoff);
     fn init_later(handoff: BootHandoff);
+
+    fn init_early_secondary(_cpu_id: CpuId) {}
+
+    fn init_later_secondary(_cpu_id: CpuId) {}
 }
 
 pub trait BootInfoIf {
@@ -662,7 +712,10 @@ pub trait PmapIf {
 
 pub mod pmap;
 pub mod trap;
-pub use trap::{TrapClass, TrapFrameSnapshot, TrapIf, TrapPreviousMode, TrapSnapshot};
+pub use trap::{
+    FaultInfo, KernelTrapSink, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable,
+    TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, TrapSnapshot,
+};
 pub trait UserAccessIf {}
 pub trait SignalFrameIf {}
 pub trait IrqIf {
@@ -694,6 +747,10 @@ pub trait TimeIf {
     /// a cancellation mechanism.
     fn cancel_deadline();
 
+    /// Prepare the current hart so a programmed timer deadline can wake or
+    /// trap out of the platform idle path.
+    fn enable_timer_wakeups() {}
+
     /// Return the hardware timer frequency used for ns/tick conversion.
     fn frequency_hz() -> u64;
 }
@@ -702,23 +759,98 @@ pub trait PercpuIf {
         CpuId(0)
     }
 
+    fn install_early_percpu(_cpu_id: CpuId) {}
+
     fn pin_current_cpu() -> CpuPinGuard {
         CpuPinGuard::new(Self::current_cpu_id())
     }
 }
 pub trait CacheIf {}
 pub trait DmaIf {}
+
+pub type SecondaryEntry = unsafe extern "C" fn(cpu_id: usize) -> !;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IpiKind {
+    Reschedule,
+    TlbShootdown,
+    Stop,
+}
+
 pub trait SmpIf {
+    fn current_cpu_id() -> CpuId {
+        CpuId(0)
+    }
+
+    fn possible_cpus() -> CpuMask {
+        CpuMask::single(CpuId(0))
+    }
+
+    fn online_cpus() -> CpuMask {
+        CpuMask::single(CpuId(0))
+    }
+
     fn possible_cpu_count() -> usize {
-        1
+        Self::possible_cpus().count()
     }
 
     fn online_cpu_count() -> usize {
-        1
+        Self::online_cpus().count()
     }
 
     fn is_cpu_online(cpu: CpuId) -> bool {
-        cpu.0 < Self::online_cpu_count()
+        Self::online_cpus().contains(cpu)
+    }
+
+    fn mark_cpu_online(_cpu: CpuId) {}
+
+    fn boot_secondary_cpus(_entry: SecondaryEntry) -> usize {
+        0
+    }
+
+    fn enable_ipi_wakeups() {}
+
+    fn wait_for_interrupt_once() {
+        core::hint::spin_loop();
+    }
+
+    fn pending_ipi(_kind: IpiKind) -> bool {
+        false
+    }
+
+    fn park_this_cpu() -> ! {
+        loop {
+            Self::wait_for_interrupt_once();
+        }
+    }
+
+    fn send_ipi(target: CpuId, _kind: IpiKind) {
+        assert_eq!(target, Self::current_cpu_id());
+    }
+
+    fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
+        if !mask.is_empty() {
+            Self::send_ipi(Self::current_cpu_id(), kind);
+        }
+    }
+
+    fn ack_ipi(_kind: IpiKind) {}
+
+    fn clear_ipi_ack_cpus(_kind: IpiKind, _mask: CpuMask) {}
+
+    fn ipi_ack_cpus(_kind: IpiKind) -> CpuMask {
+        CpuMask::EMPTY
+    }
+
+    fn wait_for_ipi_ack_cpus(mask: CpuMask, kind: IpiKind) -> usize {
+        for _ in 0..100_000 {
+            let acked = Self::ipi_ack_cpus(kind);
+            if (acked.bits() & mask.bits()) == mask.bits() {
+                return mask.count();
+            }
+            core::hint::spin_loop();
+        }
+        (Self::ipi_ack_cpus(kind).bits() & mask.bits()).count_ones() as usize
     }
 }
 pub trait PowerIf {
@@ -789,5 +921,8 @@ where
     K: KernelMain<P>,
 {
     P::install_minimal_trap_vector();
-    K::kernel_main(P::boot_handoff(cpu_id, firmware_arg))
+    let handoff = P::boot_handoff(cpu_id, firmware_arg);
+    P::install_early_percpu(handoff.cpu_id);
+    P::mark_cpu_online(handoff.cpu_id);
+    K::kernel_main(handoff)
 }
