@@ -1,0 +1,31 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-05-02-vm-pagebacked-impl",
+  "created": "2026-05-02",
+  "updated": "2026-05-02",
+  "status": "active",
+  "branch": "codex/vm-pagebacked-impl",
+  "path": "/Users/3y/Downloads/Tx",
+  "base": "main",
+  "plan": "docs/progress/plans/2026-04-29-kernel-main-long-term-checklist.json",
+  "owner": "VM/PageBacked implementation lane",
+  "write_scope": [
+    "crates/tx-kernel/src/lib.rs",
+    "crates/tx-kernel/src/vm",
+    "crates/tx-kernel/src/page_backed.rs",
+    "docs/progress/STATUS.md",
+    "docs/progress/worktrees/2026-05-02-vm-pagebacked-impl.json"
+  ],
+  "verification": [
+    "cargo test -p tx-kernel page_backed",
+    "cargo test -p tx-kernel vm_address_space_",
+    "cargo test -p tx-kernel vm_fault_resolution",
+    "cargo fmt --check",
+    "cargo test -p tx-kernel vm",
+    "cargo test -p tx-kernel --lib",
+    "cargo xtask progress validate",
+    "cargo xtask lint docs",
+    "git diff --check"
+  ],
+  "notes": "Implementation lane for the VM_v1_2/PageBacked_v1 plan. Landed the corrected AddressSpace BTreeMap range-index staging core via ecf3361, then added PageBacked-owned PageCacheIndex/PageContainer anonymous materialization, recipe gap/overlap APIs for mmap placement, and a test-callable VM fault resolve seam that acquires Materializer, re-reads recipes, validates permissions, and returns pmap-deferred outcomes. Next step: replace staging PageFrame with Cap<Frame>/CachePin evidence, attach real pmap root reserve/commit/shootdown, and connect file/device PageContainer paths through VFS FsPageBacking. Blockers/deferred work: persistent epoch recipe snapshots, zone-owned AddressSpace/PageContainer evidence, real pmap materialization, trap dispatch integration, Process/ThreadRuntime ownership, and VFS/ext4 backing integration."
+}

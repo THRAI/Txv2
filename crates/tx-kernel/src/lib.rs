@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod init;
+pub mod page_backed;
 pub mod trap;
 pub mod vm;
 

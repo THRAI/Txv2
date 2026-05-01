@@ -9,6 +9,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 pub const USER_PAGE_SIZE: usize = 4096;
 
@@ -387,6 +388,33 @@ pub enum VmMapError {
     BackingOffsetOverflow,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmFault {
+    pub addr: UserVirtAddr,
+    pub access: AccessMode,
+}
+
+impl VmFault {
+    pub const fn new(addr: UserVirtAddr, access: AccessMode) -> Self {
+        Self { addr, access }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmFaultOutcome {
+    pub page_range: UserRange,
+    pub entry: VmEntry,
+    pub pmap_materialization_deferred: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmFaultError {
+    Range(UserRangeError),
+    NoRecipe,
+    ProtectionViolation,
+    WouldBlock,
+}
+
 pub struct AddressSpace {
     recipes: RecipeIndex,
     pmap: PmapSeam,
@@ -420,6 +448,36 @@ impl AddressSpace {
 
     pub fn lookup(&self, addr: UserVirtAddr) -> Option<VmEntry> {
         self.recipes.lookup(addr)
+    }
+
+    pub fn find_free_range(&self, window: UserRange, page_count: usize) -> Option<UserRange> {
+        self.recipes.find_free_range(window, page_count)
+    }
+
+    pub fn recipes_overlapping(&self, range: UserRange) -> Vec<VmEntry> {
+        self.recipes.overlapping(range)
+    }
+
+    pub fn resolve_fault(&self, fault: VmFault) -> Result<VmFaultOutcome, VmFaultError> {
+        let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
+        let _guard = match self.range_lock.acquire(page_range, LockMode::Materializer) {
+            AcquireResult::Acquired(guard) => guard,
+            AcquireResult::WouldBlock(_) => return Err(VmFaultError::WouldBlock),
+        };
+
+        let entry = self
+            .recipes
+            .lookup(fault.addr)
+            .ok_or(VmFaultError::NoRecipe)?;
+        if !entry.prot.permits(fault.access) {
+            return Err(VmFaultError::ProtectionViolation);
+        }
+
+        Ok(VmFaultOutcome {
+            page_range,
+            entry,
+            pmap_materialization_deferred: self.pmap.materialization_deferred,
+        })
     }
 
     pub fn reserve_map(&self, entry: VmEntry, placement: MapPlacement) -> MapReserveResult<'_> {
@@ -542,6 +600,16 @@ impl RecipeIndex {
     fn stats(&self) -> AddressSpaceStats {
         let entries = self.entries.lock();
         stats_for(&entries)
+    }
+
+    fn find_free_range(&self, window: UserRange, page_count: usize) -> Option<UserRange> {
+        let entries = self.entries.lock();
+        find_gap_in(&entries, window, page_count)
+    }
+
+    fn overlapping(&self, range: UserRange) -> Vec<VmEntry> {
+        let entries = self.entries.lock();
+        overlapping_in(&entries, range)
     }
 
     fn validate_map(&self, entry: VmEntry, placement: MapPlacement) -> Result<(), VmMapError> {
@@ -752,6 +820,59 @@ fn stats_for(entries: &BTreeMap<UserVirtAddr, VmEntry>) -> AddressSpaceStats {
         stats.vm_size += entry.range.len();
     }
     stats
+}
+
+fn find_gap_in(
+    entries: &BTreeMap<UserVirtAddr, VmEntry>,
+    window: UserRange,
+    page_count: usize,
+) -> Option<UserRange> {
+    let len = page_count.checked_mul(USER_PAGE_SIZE)?;
+    if len == 0 || len > window.len() {
+        return None;
+    }
+
+    let mut cursor = window.start().as_usize();
+    let window_end = window.end().as_usize();
+
+    for entry in entries.values().copied() {
+        if entry.range.end().as_usize() <= cursor {
+            continue;
+        }
+        if entry.range.start().as_usize() >= window_end {
+            break;
+        }
+        if !entry.range.overlaps(window) {
+            continue;
+        }
+
+        let entry_start = entry
+            .range
+            .start()
+            .as_usize()
+            .max(window.start().as_usize());
+        if cursor.checked_add(len)? <= entry_start {
+            return UserRange::new_aligned(UserVirtAddr(cursor), len).ok();
+        }
+        cursor = cursor.max(entry.range.end().as_usize());
+        if cursor >= window_end {
+            return None;
+        }
+    }
+
+    if cursor.checked_add(len)? <= window_end {
+        UserRange::new_aligned(UserVirtAddr(cursor), len).ok()
+    } else {
+        None
+    }
+}
+
+fn overlapping_in(entries: &BTreeMap<UserVirtAddr, VmEntry>, range: UserRange) -> Vec<VmEntry> {
+    entries
+        .values()
+        .copied()
+        .filter(|entry| entry.range.overlaps(range))
+        .collect()
 }
 
 fn range_intersection(a: UserRange, b: UserRange) -> Option<UserRange> {
@@ -2006,6 +2127,117 @@ mod tests {
         assert_eq!(
             aspace.protect(range(0x8000, 1), Prot::READ),
             Err(VmMapError::MissingMapping)
+        );
+    }
+
+    #[test]
+    fn vm_address_space_finds_first_gap_inside_search_window() {
+        let aspace = AddressSpace::new();
+        let first = VmEntry::new(
+            range(0x1000, 2),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBackingDraft::PrivateAnon,
+        );
+        let second = VmEntry::new(
+            range(0x5000, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBackingDraft::PrivateAnon,
+        );
+        map_reserved(aspace.reserve_map(first, MapPlacement::RequireFree))
+            .commit()
+            .expect("first map");
+        map_reserved(aspace.reserve_map(second, MapPlacement::RequireFree))
+            .commit()
+            .expect("second map");
+
+        assert_eq!(
+            aspace.find_free_range(range(0x1000, 6), 2),
+            Some(range(0x3000, 2))
+        );
+        assert_eq!(aspace.find_free_range(range(0x1000, 6), 3), None);
+    }
+
+    #[test]
+    fn vm_address_space_lists_recipes_overlapping_declared_range_in_order() {
+        let aspace = AddressSpace::new();
+        let left = VmEntry::new(
+            range(0x1000, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBackingDraft::PrivateAnon,
+        );
+        let right = VmEntry::new(
+            range(0x3000, 2),
+            Prot::READ_WRITE,
+            VmEntryFlags::SHARED,
+            VmBackingDraft::MockPage { id: 5, offset: 0 },
+        );
+        map_reserved(aspace.reserve_map(left, MapPlacement::RequireFree))
+            .commit()
+            .expect("left map");
+        map_reserved(aspace.reserve_map(right, MapPlacement::RequireFree))
+            .commit()
+            .expect("right map");
+
+        assert_eq!(
+            aspace.recipes_overlapping(range(0x1000, 3)),
+            alloc::vec![left, right]
+        );
+    }
+
+    #[test]
+    fn vm_fault_resolution_requires_authoritative_recipe_and_permissions() {
+        let aspace = AddressSpace::new();
+        let entry = VmEntry::new(
+            range(0x4000, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBackingDraft::PrivateAnon,
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("map");
+
+        let outcome = aspace
+            .resolve_fault(VmFault::new(UserVirtAddr(0x4008), AccessMode::Read))
+            .expect("read fault resolves");
+
+        assert_eq!(outcome.page_range, range(0x4000, 1));
+        assert_eq!(outcome.entry, entry);
+        assert!(outcome.pmap_materialization_deferred);
+        assert_eq!(
+            aspace.resolve_fault(VmFault::new(UserVirtAddr(0x4008), AccessMode::Write)),
+            Err(VmFaultError::ProtectionViolation)
+        );
+        assert_eq!(
+            aspace.resolve_fault(VmFault::new(UserVirtAddr(0x8000), AccessMode::Read)),
+            Err(VmFaultError::NoRecipe)
+        );
+    }
+
+    #[test]
+    fn vm_fault_resolution_waits_behind_overlapping_writer() {
+        let aspace = AddressSpace::new();
+        let entry = VmEntry::new(
+            range(0x1000, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBackingDraft::PrivateAnon,
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("map");
+        let _writer = acquired(
+            aspace
+                .range_lock()
+                .acquire(range(0x1000, 1), LockMode::ExclusiveWriter),
+        );
+
+        assert_eq!(
+            aspace.resolve_fault(VmFault::new(UserVirtAddr(0x1000), AccessMode::Read)),
+            Err(VmFaultError::WouldBlock)
         );
     }
 }
