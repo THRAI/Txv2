@@ -122,3 +122,37 @@ skills:
       - .agents/commands/README.md
       - .agents/commands/finish-catchup.md
     purpose: Record and resume decisions, status, plans, handoffs, and research memory.
+
+  tx-vm-pagebacked:
+    sources:
+      - docs/design/03_memory-vm/VM_v1_2.md
+      - docs/design/03_memory-vm/PAGE_BACKED_v1.md
+      - docs/design/01_substrate/PAGE_SUBSTRATE_v1.md
+      - docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md
+      - docs/design/00_meta-framework/INVARIANTS_v4.md
+      - docs/design/02_execution/STEP_MODEL_v1.md
+    purpose: Guide VM, AddressSpace, RangeLock, recipes, PageBacked, and fault-materialization implementation from canonical docs.
+
+  tx-vfs-filesystem:
+    sources:
+      - docs/design/05_filesystem/VFS_CHECKS_V2.1.md
+      - docs/design/05_filesystem/MOUNT_v1.md
+      - docs/design/03_memory-vm/PAGE_BACKED_v1.md
+      - docs/design/05_filesystem/BDEV_FS.md
+      - docs/design/05_filesystem/TX_EXT4_PLAN_v1_2.md
+      - docs/design/06_devices/DEVICE.md
+      - docs/design/03_memory-vm/VM_v1_2.md
+    purpose: Guide VFS, Mount, PageBacked filesystem interfaces, bdev-fs, devfs, and filesystem backend fanout.
+
+  tx-process-threadruntime:
+    sources:
+      - docs/design/04_process-signals/PROCESS_v1.md
+      - docs/design/02_execution/THREAD_RUNTIME_v1.md
+      - docs/design/04_process-signals/SIGNAL_v1.md
+      - docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md
+      - docs/design/02_execution/EXEC_v1.md
+      - docs/design/02_execution/REACTOR_v0.md
+      - docs/design/02_execution/SCHEDULER_v0.md
+      - docs/design/03_memory-vm/VM_v1_2.md
+      - docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md
+    purpose: Guide Process, ThreadRuntime, signal, syscall, exec, and first-userspace implementation from canonical docs.
