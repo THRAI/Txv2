@@ -1,0 +1,22 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-05-01-vfs-interface-scout",
+  "created": "2026-05-01",
+  "updated": "2026-05-01",
+  "status": "active",
+  "branch": "codex/vfs-interface-scout",
+  "path": "/private/tmp/Tx-worktrees/codex-vfs-interface-scout",
+  "base": "main",
+  "plan": "docs/progress/plans/2026-04-29-kernel-main-long-term-checklist.json",
+  "owner": "VFS interface scout worker",
+  "write_scope": [
+    "docs/progress/research/2026-05-01-vfs-interface-scout.md",
+    "docs/progress/worktrees/2026-05-01-vfs-interface-scout.json"
+  ],
+  "verification": [
+    "cargo xtask progress validate",
+    "cargo xtask lint docs",
+    "git diff --check"
+  ],
+  "notes": "Scout lane only. Produce a VFS/Mount/PageBacked interface readiness note and minimal dispatch plan. Do not implement VFS code yet and do not edit crates/tx-kernel/src/vfs unless the coordinator expands the lease after VM/PageBacked seams are clearer. Worker is not alone in the codebase and must not revert other lanes. Coordinator owns final docs/progress/STATUS.md catch-up."
+}
