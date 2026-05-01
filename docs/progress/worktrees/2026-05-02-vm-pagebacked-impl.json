@@ -20,6 +20,8 @@
     "cargo test -p tx-kernel page_backed",
     "cargo test -p tx-kernel vm_address_space_",
     "cargo test -p tx-kernel vm_fault_resolution",
+    "cargo test -p tx-kernel vm_map_script",
+    "cargo test -p tx-kernel vm_remap_script",
     "cargo fmt --check",
     "cargo test -p tx-kernel vm",
     "cargo test -p tx-kernel --lib",
@@ -27,5 +29,5 @@
     "cargo xtask lint docs",
     "git diff --check"
   ],
-  "notes": "Implementation lane for the VM_v1_2/PageBacked_v1 plan. Landed the corrected AddressSpace BTreeMap range-index staging core via ecf3361, then added PageBacked-owned PageCacheIndex/PageContainer anonymous materialization, recipe gap/overlap APIs for mmap placement, and a test-callable VM fault resolve seam that acquires Materializer, re-reads recipes, validates permissions, and returns pmap-deferred outcomes. Next step: replace staging PageFrame with Cap<Frame>/CachePin evidence, attach real pmap root reserve/commit/shootdown, and connect file/device PageContainer paths through VFS FsPageBacking. Blockers/deferred work: persistent epoch recipe snapshots, zone-owned AddressSpace/PageContainer evidence, real pmap materialization, trap dispatch integration, Process/ThreadRuntime ownership, and VFS/ext4 backing integration."
+  "notes": "Implementation lane for the VM_v1_2/PageBacked_v1 plan. Landed the corrected AddressSpace BTreeMap range-index staging core via ecf3361, then added PageBacked-owned PageCacheIndex/PageContainer anonymous materialization, recipe gap/overlap APIs for mmap placement, a test-callable VM fault resolve seam that acquires Materializer, re-reads recipes, validates permissions, and returns pmap-deferred outcomes, plus mmap-style map_script and disjoint-only mremap_script request surfaces over authoritative recipes. Next step: replace staging PageFrame with Cap<Frame>/CachePin evidence, attach real pmap root reserve/commit/shootdown, and connect file/device PageContainer paths through VFS FsPageBacking. Blockers/deferred work: persistent epoch recipe snapshots, zone-owned AddressSpace/PageContainer evidence, real pmap materialization, trap dispatch integration, Process/ThreadRuntime ownership, and VFS/ext4 backing integration."
 }
