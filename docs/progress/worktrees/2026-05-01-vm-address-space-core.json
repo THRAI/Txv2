@@ -2,8 +2,8 @@
   "schema": "tx.progress.worktree.v1",
   "id": "2026-05-01-vm-address-space-core",
   "created": "2026-05-01",
-  "updated": "2026-05-01",
-  "status": "active",
+  "updated": "2026-05-02",
+  "status": "closed",
   "branch": "codex/vm-address-space-core",
   "path": "/private/tmp/Tx-worktrees/codex-vm-address-space-core",
   "base": "main",
@@ -21,5 +21,5 @@
     "cargo xtask progress validate",
     "git diff --check"
   ],
-  "notes": "Implementation lane for the real VM AddressSpace skeleton. Owns VM module and VM tests only. Keep PageContainer/PageBacked, Process, ThreadRuntime, syscall/page-fault dispatch, public trap integration, and HAL pmap API changes out unless the coordinator explicitly expands the lease. Worker is not alone in the codebase and must not revert other lanes. Coordinator owns final docs/progress/STATUS.md catch-up."
+  "notes": "Closed VM AddressSpace core plus corrective range-index follow-up. Changed surface: crates/tx-kernel/src/lib.rs now imports alloc for tx-kernel; crates/tx-kernel/src/vm/mod.rs has AddressSpace backed by a BTreeMap-keyed RecipeIndex instead of the artificial fixed-capacity RecipeTable, so the obsolete RecipeFull capacity path is gone. MapReservation reserve/commit/drop rollback, RequireFree/FixedReplace map placement, lookup, stats, unmap, protect, and the pmap placeholder seam remain covered. RangeLock internals are documented as a bounded VM_v1 interval-reservation set rather than the final optimized concurrent interval structure; the current implementation uses bounded no-alloc augmented interval-tree internals with max_end overlap pruning and tests for removal cleanup, disjoint independence, range-scoped pending-writer FIFO, and active writer overlap blocking. Verification after correction: cargo fmt --check PASS; cargo test -p tx-kernel vm PASS, 19 tests; cargo test -p tx-kernel PASS; cargo xtask progress validate PASS; git diff --check PASS. Next step after this lane: replace the BTreeMap wrapper with the real persistent/epoch snapshot recipe index and attach zone-owned AddressSpace evidence once the substrate APIs fit. Blockers/deferred work: true persistent/epoch snapshot recipes, PageContainer/PageBacked backing, pmap root/shootdown/materialization, syscall page-fault dispatch, Process Frame integration, ThreadRuntime userspace state, public trap integration, and HAL API changes were not implemented in this lease."
 }
