@@ -8,6 +8,9 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::page_backed::{
+    MaterializeAccess, MaterializedPage, PageCacheError, PageContainer, PageIndex,
+};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
@@ -238,12 +241,24 @@ impl VmEntryFlags {
 pub enum VmBackingDraft {
     None,
     PrivateAnon,
+    PageBacked { container_id: u64, offset: u64 },
     MockPage { id: u64, offset: u64 },
 }
 
 impl VmBackingDraft {
     fn at_range_offset(self, delta: usize) -> Result<Self, VmEntryError> {
         match self {
+            Self::PageBacked {
+                container_id,
+                offset,
+            } => Ok(Self::PageBacked {
+                container_id,
+                offset: offset
+                    .checked_add(
+                        u64::try_from(delta).map_err(|_| VmEntryError::BackingOffsetOverflow)?,
+                    )
+                    .ok_or(VmEntryError::BackingOffsetOverflow)?,
+            }),
             Self::MockPage { id, offset } => Ok(Self::MockPage {
                 id,
                 offset: offset
@@ -486,6 +501,54 @@ impl VmFault {
 pub struct VmFaultOutcome {
     pub page_range: UserRange,
     pub entry: VmEntry,
+    pub access: AccessMode,
+    pub pmap_materialization_deferred: bool,
+}
+
+impl VmFaultOutcome {
+    pub fn materialize_pagebacked_anon(
+        self,
+        pc: &mut PageContainer,
+    ) -> Result<VmFaultMaterialization, VmFaultError> {
+        let page_index = self.backing_page_index()?;
+        let access = match self.access {
+            AccessMode::Write => MaterializeAccess::Write,
+            AccessMode::Read | AccessMode::Execute => MaterializeAccess::Read,
+        };
+        let page = pc
+            .materialize_anon(page_index, access)
+            .map_err(VmFaultError::PageCache)?;
+        Ok(VmFaultMaterialization {
+            page_index,
+            page,
+            pmap_materialization_deferred: self.pmap_materialization_deferred,
+        })
+    }
+
+    fn backing_page_index(self) -> Result<PageIndex, VmFaultError> {
+        let VmBackingDraft::PageBacked { offset, .. } = self.entry.backing else {
+            return Err(VmFaultError::BackingMismatch);
+        };
+        let delta = self
+            .page_range
+            .start()
+            .as_usize()
+            .checked_sub(self.entry.range.start().as_usize())
+            .ok_or(VmFaultError::BackingOffsetOverflow)?;
+        let byte_offset = offset
+            .checked_add(u64::try_from(delta).map_err(|_| VmFaultError::BackingOffsetOverflow)?)
+            .ok_or(VmFaultError::BackingOffsetOverflow)?;
+        if !byte_offset.is_multiple_of(USER_PAGE_SIZE as u64) {
+            return Err(VmFaultError::BackingOffsetOverflow);
+        }
+        Ok(PageIndex::new(byte_offset / USER_PAGE_SIZE as u64))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmFaultMaterialization {
+    pub page_index: PageIndex,
+    pub page: MaterializedPage,
     pub pmap_materialization_deferred: bool,
 }
 
@@ -495,6 +558,9 @@ pub enum VmFaultError {
     NoRecipe,
     ProtectionViolation,
     WouldBlock,
+    BackingMismatch,
+    BackingOffsetOverflow,
+    PageCache(PageCacheError),
 }
 
 pub struct AddressSpace {
@@ -558,6 +624,7 @@ impl AddressSpace {
         Ok(VmFaultOutcome {
             page_range,
             entry,
+            access: fault.access,
             pmap_materialization_deferred: self.pmap.materialization_deferred,
         })
     }
@@ -2446,6 +2513,76 @@ mod tests {
         assert_eq!(
             aspace.resolve_fault(VmFault::new(UserVirtAddr(0x1000), AccessMode::Read)),
             Err(VmFaultError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn vm_fault_materializes_pagebacked_anon_page_from_recipe_offset() {
+        let aspace = AddressSpace::new();
+        let entry = VmEntry::new(
+            range(0x2000, 2),
+            Prot::READ_WRITE,
+            VmEntryFlags::SHARED,
+            VmBackingDraft::PageBacked {
+                container_id: 7,
+                offset: USER_PAGE_SIZE as u64,
+            },
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("map");
+        let mut pc = crate::page_backed::PageContainer::new(
+            crate::page_backed::PageContainerKind::Anon {
+                swap_policy: crate::page_backed::AnonSwapPolicy::Reclaimable,
+            },
+            4,
+        );
+
+        let outcome = aspace
+            .resolve_fault(VmFault::new(UserVirtAddr(0x3000), AccessMode::Write))
+            .expect("fault resolves");
+        let materialized = outcome
+            .materialize_pagebacked_anon(&mut pc)
+            .expect("pagebacked materialization");
+
+        assert_eq!(
+            materialized.page_index,
+            crate::page_backed::PageIndex::new(2)
+        );
+        assert!(materialized.page.newly_installed);
+        assert!(materialized.page.dirty);
+        assert_eq!(
+            pc.lookup(crate::page_backed::PageIndex::new(2)),
+            Some(materialized.page.frame)
+        );
+    }
+
+    #[test]
+    fn vm_fault_materialization_rejects_non_pagebacked_recipe() {
+        let aspace = AddressSpace::new();
+        let entry = VmEntry::new(
+            range(0x4000, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBackingDraft::PrivateAnon,
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("map");
+        let mut pc = crate::page_backed::PageContainer::new(
+            crate::page_backed::PageContainerKind::Anon {
+                swap_policy: crate::page_backed::AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        );
+
+        let outcome = aspace
+            .resolve_fault(VmFault::new(UserVirtAddr(0x4000), AccessMode::Read))
+            .expect("fault resolves");
+
+        assert_eq!(
+            outcome.materialize_pagebacked_anon(&mut pc),
+            Err(VmFaultError::BackingMismatch)
         );
     }
 
