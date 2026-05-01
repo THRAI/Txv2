@@ -16,12 +16,13 @@
   index and delegate anonymous page materialization back to `PageContainer`.
   It also has a staging `PmapSeam` that records derived mappings, revalidates
   recipes before publication, and accounts teardown/shootdown after recipe
-  mutation for unmap/protect.
+  mutation for unmap/protect. The pmap seam now follows a HAL-shaped
+  reserve/commit/rollback state machine with rollback-on-drop reservations.
   Verification so far: focused `tx-kernel` VM/PageBacked tests plus full
   `tx-kernel --lib`, progress validation, docs lint, fmt, and diff checks.
   Next step: replace staging `PageFrame`/PageBacked/`PmapSeam` tokens with
   `Cap<Frame>`/`CachePin`, `Cap<PageContainer>`, and HAL `PmapIf`
-  reserve/commit/shootdown evidence, then connect VFS `FsPageBacking`;
+  root/reservation/commit/shootdown evidence, then connect VFS `FsPageBacking`;
   blockers remain persistent epoch recipe snapshots, zone-owned
   VM/PageContainer evidence, trap/process/runtime integration, and file/device
   backing.

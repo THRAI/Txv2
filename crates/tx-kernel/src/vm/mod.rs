@@ -394,6 +394,9 @@ pub struct PmapMapping {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PmapStats {
     pub mapped_pages: usize,
+    pub reservations: usize,
+    pub commits: usize,
+    pub rollbacks: usize,
     pub shootdowns: usize,
 }
 
@@ -422,14 +425,36 @@ impl PmapSeam {
         let state = self.state.lock();
         PmapStats {
             mapped_pages: state.mappings.len(),
+            reservations: state.reservations,
+            commits: state.commits,
+            rollbacks: state.rollbacks,
             shootdowns: state.shootdowns,
         }
     }
 
-    fn install_page(&self, page: UserPage, mapping: PmapMapping) -> PmapPublishOutcome {
+    fn reserve_page(
+        &self,
+        page: UserPage,
+        mapping: PmapMapping,
+    ) -> Result<PmapReservationSeam<'_>, VmFaultError> {
+        self.state.lock().reservations += 1;
+        Ok(PmapReservationSeam {
+            pmap: self,
+            page,
+            mapping,
+            committed: false,
+        })
+    }
+
+    fn commit_page(&self, page: UserPage, mapping: PmapMapping) -> PmapPublishOutcome {
         let mut state = self.state.lock();
         let replaced = state.mappings.insert(page, mapping).is_some();
+        state.commits += 1;
         PmapPublishOutcome { page, replaced }
+    }
+
+    fn rollback_page(&self) {
+        self.state.lock().rollbacks += 1;
     }
 
     fn teardown_range(&self, range: UserRange) -> usize {
@@ -450,6 +475,9 @@ impl PmapSeam {
 #[derive(Debug)]
 struct PmapState {
     mappings: BTreeMap<UserPage, PmapMapping>,
+    reservations: usize,
+    commits: usize,
+    rollbacks: usize,
     shootdowns: usize,
 }
 
@@ -457,7 +485,36 @@ impl PmapState {
     fn new() -> Self {
         Self {
             mappings: BTreeMap::new(),
+            reservations: 0,
+            commits: 0,
+            rollbacks: 0,
             shootdowns: 0,
+        }
+    }
+}
+
+pub struct PmapReservationSeam<'a> {
+    pmap: &'a PmapSeam,
+    page: UserPage,
+    mapping: PmapMapping,
+    committed: bool,
+}
+
+impl PmapReservationSeam<'_> {
+    pub const fn page(&self) -> UserPage {
+        self.page
+    }
+
+    fn commit(mut self) -> PmapPublishOutcome {
+        self.committed = true;
+        self.pmap.commit_page(self.page, self.mapping)
+    }
+}
+
+impl Drop for PmapReservationSeam<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.pmap.rollback_page();
         }
     }
 }
@@ -730,13 +787,14 @@ impl AddressSpace {
             return Err(VmFaultError::StaleRecipe);
         }
 
-        Ok(self.pmap.install_page(
+        let reservation = self.pmap.reserve_page(
             outcome.page_range.start().containing_page(),
             PmapMapping {
                 frame: materialization.page.frame,
                 prot: entry.prot,
             },
-        ))
+        )?;
+        Ok(reservation.commit())
     }
 
     pub fn map_script(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
@@ -2789,7 +2847,83 @@ mod tests {
             aspace.pmap().stats(),
             PmapStats {
                 mapped_pages: 0,
+                reservations: 1,
+                commits: 1,
+                rollbacks: 0,
                 shootdowns: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn vm_pmap_staging_reservation_rolls_back_when_abandoned() {
+        let pmap = PmapSeam::new_deferred();
+        let reservation = pmap
+            .reserve_page(
+                UserPage(9),
+                PmapMapping {
+                    frame: crate::page_backed::PageFrame::new(900),
+                    prot: Prot::READ,
+                },
+            )
+            .expect("reserve");
+
+        assert_eq!(reservation.page(), UserPage(9));
+        drop(reservation);
+
+        assert_eq!(pmap.lookup(UserPage(9)), None);
+        assert_eq!(
+            pmap.stats(),
+            PmapStats {
+                mapped_pages: 0,
+                reservations: 1,
+                commits: 0,
+                rollbacks: 1,
+                shootdowns: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn vm_pmap_publish_uses_reserve_commit_sequence() {
+        let aspace = AddressSpace::new();
+        let entry = VmEntry::new(
+            range(0x9000, 1),
+            Prot::READ,
+            VmEntryFlags::SHARED,
+            VmBackingDraft::PageBacked {
+                container_id: 9,
+                offset: 0,
+            },
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("map");
+        let mut pc = crate::page_backed::PageContainer::new(
+            crate::page_backed::PageContainerKind::Anon {
+                swap_policy: crate::page_backed::AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        );
+        let outcome = aspace
+            .resolve_fault(VmFault::new(UserVirtAddr(0x9000), AccessMode::Read))
+            .expect("fault resolves");
+        let materialized = outcome
+            .materialize_pagebacked_anon(&mut pc)
+            .expect("materialize");
+
+        aspace
+            .publish_fault_materialization(outcome, materialized)
+            .expect("publish");
+
+        assert_eq!(
+            aspace.pmap().stats(),
+            PmapStats {
+                mapped_pages: 1,
+                reservations: 1,
+                commits: 1,
+                rollbacks: 0,
+                shootdowns: 0,
             }
         );
     }
