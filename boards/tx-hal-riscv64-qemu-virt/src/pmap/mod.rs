@@ -128,6 +128,26 @@ pub(crate) fn adopt_high_linked_bootstrap_pmap(bag: &mut BootStaticBag<IdentityL
     bag.adopt_high_linked_bootstrap_pmap();
 }
 
+pub(crate) fn install_secondary_identity_bridge() {
+    let bag = BootStaticBag::<IdentityDropped>::global_ref();
+    unsafe {
+        bag.bootstrap_root_mut().0[rv64_1g_leaf_index(QEMU_RAM_BASE)] =
+            encode_leaf_pte(PhysAddr(QEMU_RAM_BASE), PTE_R | PTE_W | PTE_X);
+    }
+    sfence_vma_all();
+}
+
+pub(crate) fn remove_secondary_identity_bridge() {
+    let bag = BootStaticBag::<IdentityDropped>::global_ref();
+    unsafe {
+        bag.bootstrap_root_mut().0[rv64_1g_leaf_index(QEMU_RAM_BASE)] = 0;
+        if let Some(info) = bag.bootstrap_pmap_info_mut().as_mut() {
+            info.identity = None;
+        }
+    }
+    sfence_vma_all();
+}
+
 impl BootStaticBag<IdentityLive> {
     pub(crate) fn adopt_high_linked_bootstrap_pmap(&mut self) -> &mut Self {
         self.refine_kernel_high_alias()

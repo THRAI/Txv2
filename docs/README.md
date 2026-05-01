@@ -46,8 +46,9 @@ architecture contracts:
 
 ## Cleanup Rules
 
-Active docs override archived and source-trace notes. Do not resurrect v11,
-OSTD HAL manager, runtime `HalManager`, or upper-layer raw `Zone<T, Policy>`.
+Active docs override archived and source-trace notes. Do not resurrect the
+retired architecture draft, legacy dynamic HAL manager, runtime HAL-manager
+type, or upper-layer raw `Zone<T, Policy>`.
 Active design docs use grep-stable `txdoc:` tags for CI and review references;
 see [`design/00_meta-framework/CI_REPORTING_v1.md`](design/00_meta-framework/CI_REPORTING_v1.md).
 After doc edits, run:

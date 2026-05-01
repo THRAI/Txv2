@@ -19,6 +19,7 @@ struct QemuOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SentinelState {
     Found,
+    Trapped,
     Pending,
     TimedOut,
 }
@@ -90,6 +91,12 @@ fn qemu_command(
         target.qemu_machine().to_string(),
         "-m".to_string(),
         "256M".to_string(),
+        "-smp".to_string(),
+        match target {
+            TxTarget::Rv64Qemu => "4",
+            TxTarget::Rv64M1DockMock | TxTarget::La64Qemu => "1",
+        }
+        .to_string(),
         "-display".to_string(),
         "none".to_string(),
         "-monitor".to_string(),
@@ -106,10 +113,7 @@ fn qemu_command(
             args.push("-bios".into());
             args.push("default".into());
         }
-        TxTarget::La64Qemu => {
-            args.push("-bios".into());
-            args.push("default".into());
-        }
+        TxTarget::La64Qemu => {}
     }
 
     if options.expect_sentinel {
@@ -132,13 +136,13 @@ fn qemu_command(
     } else {
         args.push("-append".into());
         if target == TxTarget::Rv64M1DockMock {
-            args.push("tx.profile=smoke tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0".into());
+            args.push("tx.profile=smoke tx.board=m1dock-mock console=ttyS0".into());
         } else {
             args.push("tx.profile=smoke console=ttyS0".into());
         }
     }
 
-    if profile == Profile::Busybox || target == TxTarget::Rv64M1DockMock {
+    if profile == Profile::Busybox {
         args.push("-device".into());
         if target == TxTarget::Rv64M1DockMock {
             args.push("virtio-blk-device,drive=m1sd,bus=virtio-mmio-bus.0".into());
@@ -206,10 +210,22 @@ fn run_with_sentinel(
             SentinelState::TimedOut => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let annotation = fault_decode_annotation(root, target, &serial_log, &serial);
                 return Err(format!(
-                    "qemu timed out after {} ms waiting for {sentinel}\nserial tail:\n{}",
+                    "qemu timed out after {} ms waiting for {sentinel}\nserial tail:\n{}{}",
                     options.timeout.as_millis(),
-                    tail_lines(&serial, 80)
+                    tail_lines(&serial, 80),
+                    annotation.unwrap_or_default()
+                ));
+            }
+            SentinelState::Trapped => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let annotation = fault_decode_annotation(root, target, &serial_log, &serial);
+                return Err(format!(
+                    "qemu observed trap before sentinel {sentinel}\nserial tail:\n{}{}",
+                    tail_lines(&serial, 80),
+                    annotation.unwrap_or_default()
                 ));
             }
             SentinelState::Pending => {}
@@ -221,9 +237,11 @@ fn run_with_sentinel(
                 println!("qemu smoke sentinel observed: {sentinel}");
                 return Ok(());
             }
+            let annotation = fault_decode_annotation(root, target, &serial_log, &serial);
             return Err(format!(
-                "qemu exited with {status} before sentinel {sentinel}\nserial tail:\n{}",
-                tail_lines(&serial, 80)
+                "qemu exited with {status} before sentinel {sentinel}\nserial tail:\n{}{}",
+                tail_lines(&serial, 80),
+                annotation.unwrap_or_default()
             ));
         }
 
@@ -247,11 +265,101 @@ fn sentinel_state(
 ) -> SentinelState {
     if serial_contains_sentinel(serial, sentinel) {
         SentinelState::Found
+    } else if serial_contains_trap_summary(serial) {
+        SentinelState::Trapped
     } else if elapsed >= timeout {
         SentinelState::TimedOut
     } else {
         SentinelState::Pending
     }
+}
+
+fn serial_contains_trap_summary(serial: &str) -> bool {
+    serial
+        .lines()
+        .any(|line| line.contains("scause=") && line.contains("sepc=") && line.contains("stval="))
+}
+
+fn fault_decode_annotation(
+    root: &Path,
+    target: TxTarget,
+    serial_log: &Path,
+    serial: &str,
+) -> Option<String> {
+    fault_decode_annotation_with_runner(target, serial_log, serial, |args| {
+        let exe = std::env::current_exe().ok()?;
+        let output = Command::new(exe)
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()?;
+        Some(FaultDecodeRun {
+            success: output.status.success(),
+            status: output.status.to_string(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FaultDecodeRun {
+    success: bool,
+    status: String,
+    stdout: String,
+    stderr: String,
+}
+
+fn fault_decode_annotation_with_runner<F>(
+    target: TxTarget,
+    serial_log: &Path,
+    serial: &str,
+    run_fault_decode: F,
+) -> Option<String>
+where
+    F: FnOnce(&[String]) -> Option<FaultDecodeRun>,
+{
+    if !serial_contains_trap_summary(serial) {
+        return None;
+    }
+
+    let args = fault_decode_args_for_serial(target, serial_log)?;
+    let output = run_fault_decode(&args)?;
+    if output.success {
+        return Some(format!("\n\nfault-decode:\n{}", output.stdout.trim_end()));
+    }
+
+    let stdout = output.stdout.trim_end();
+    let stderr = output.stderr.trim_end();
+    let mut details = String::new();
+    if !stdout.is_empty() {
+        details.push_str(stdout);
+    }
+    if !stderr.is_empty() {
+        if !details.is_empty() {
+            details.push('\n');
+        }
+        details.push_str(stderr);
+    }
+
+    Some(format!(
+        "\n\nfault-decode failed with {}:\n{}",
+        output.status, details
+    ))
+}
+
+fn fault_decode_args_for_serial(target: TxTarget, serial_log: &Path) -> Option<Vec<String>> {
+    if target != TxTarget::Rv64Qemu {
+        return None;
+    }
+
+    Some(vec![
+        "fault-decode".to_string(),
+        "--target".to_string(),
+        target.name().to_string(),
+        "--serial".to_string(),
+        serial_log.display().to_string(),
+    ])
 }
 
 fn serial_log_relative(target: TxTarget, profile: Profile) -> PathBuf {
@@ -303,6 +411,98 @@ mod tests {
     }
 
     #[test]
+    fn reports_trap_before_sentinel_timeout() {
+        assert_eq!(
+            sentinel_state(
+                "txkernel:qemu-riscv64-virt:trap\nscause=0xd sepc=0xffffffff80201234 stval=0x40001000\n",
+                "txkernel:qemu-riscv64-virt:boot:ok",
+                Duration::from_millis(10),
+                Duration::from_secs(10)
+            ),
+            SentinelState::Trapped
+        );
+    }
+
+    #[test]
+    fn builds_fault_decode_serial_args_for_rv64_qemu_traps() {
+        let args = fault_decode_args_for_serial(
+            TxTarget::Rv64Qemu,
+            Path::new("/tmp/tx/target/qemu-rv64-qemu-smoke.serial.log"),
+        )
+        .expect("rv64-qemu should support fault decode annotation");
+
+        assert_eq!(
+            args,
+            vec![
+                "fault-decode",
+                "--target",
+                "rv64-qemu",
+                "--serial",
+                "/tmp/tx/target/qemu-rv64-qemu-smoke.serial.log",
+            ]
+        );
+        assert!(fault_decode_args_for_serial(
+            TxTarget::La64Qemu,
+            Path::new("/tmp/tx/target/qemu-la64-qemu-smoke.serial.log"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fault_decode_annotation_embeds_runner_output_for_rv64_traps() {
+        let mut observed_args = None;
+        let annotation = fault_decode_annotation_with_runner(
+            TxTarget::Rv64Qemu,
+            Path::new("/tmp/tx/target/qemu-rv64-qemu-smoke.serial.log"),
+            "scause=0xd sepc=0xffffffff80201234 stval=0x40001000\n",
+            |args| {
+                observed_args = Some(args.to_vec());
+                Some(FaultDecodeRun {
+                    success: true,
+                    status: "exit status: 0".into(),
+                    stdout: "trap #1\nsepc:\n  raw: 0xffffffff80201234\n".into(),
+                    stderr: String::new(),
+                })
+            },
+        )
+        .expect("rv64 trap serial should produce annotation");
+
+        assert_eq!(
+            observed_args,
+            Some(vec![
+                "fault-decode".to_string(),
+                "--target".to_string(),
+                "rv64-qemu".to_string(),
+                "--serial".to_string(),
+                "/tmp/tx/target/qemu-rv64-qemu-smoke.serial.log".to_string(),
+            ])
+        );
+        assert!(annotation.contains("fault-decode:\ntrap #1"));
+        assert!(annotation.contains("0xffffffff80201234"));
+    }
+
+    #[test]
+    fn fault_decode_annotation_reports_decoder_failure() {
+        let annotation = fault_decode_annotation_with_runner(
+            TxTarget::Rv64Qemu,
+            Path::new("/tmp/tx/target/qemu-rv64-qemu-smoke.serial.log"),
+            "scause=0xd sepc=0xffffffff80201234 stval=0x40001000\n",
+            |_| {
+                Some(FaultDecodeRun {
+                    success: false,
+                    status: "exit status: 2".into(),
+                    stdout: String::new(),
+                    stderr: "decoder failed\n".into(),
+                })
+            },
+        )
+        .expect("rv64 trap serial should report decoder failure");
+
+        assert!(annotation.contains("fault-decode failed with exit status: 2"));
+        assert!(annotation.contains("decoder failed"));
+    }
+
+    #[test]
     fn qemu_smoke_command_captures_serial_without_block_image() {
         let options = QemuOptions {
             expect_sentinel: true,
@@ -318,6 +518,7 @@ mod tests {
         let rendered = command.join(" ");
         assert!(rendered.contains("qemu-system-riscv64"));
         assert!(rendered.contains("-machine virt"));
+        assert!(rendered.contains("-smp 4"));
         assert!(rendered.contains("-serial file:target/qemu-rv64-qemu-smoke.serial.log"));
         assert!(rendered.contains(
             "-kernel /tmp/tx/target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt"

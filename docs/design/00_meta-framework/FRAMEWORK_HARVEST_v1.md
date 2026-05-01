@@ -342,7 +342,7 @@ The framework should name "shim" as a category so POSIX, Linux ABI, and future c
 
 <!-- txdoc:FRAMEWORK-HARVEST-TWO-CLAIMS-GAP-1 -->
 
-`object_model_v2` still opens with the two-claim v11 basis. The new canonical object model should instead present itself as the lifecycle/resolution half under the three-claim framework, with publication as a peer handled across object and substrate rules.
+`object_model_v2` still opens with the two-claim retired-draft basis. The new canonical object model should instead present itself as the lifecycle/resolution half under the three-claim framework, with publication as a peer handled across object and substrate rules.
 
 ### 5.2 Liveness Is Both Theory and Catalog
 

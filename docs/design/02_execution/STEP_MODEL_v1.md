@@ -266,7 +266,7 @@ pipe::step_open(ctx, path, flags, mode) -> StepOutcome<Fd>:
 
 One guard, one require-chain, two coordinated substrate commits, no publications. If any require fails, the step returns `Err(errno)`. If either substrate reservation fails, all prior reservations drop cleanly (linear reservation types enforce this at the type level).
 
-There is no `open_prepare` + `open_commit` split. The five-stage discipline happens within the single step. The "prepare" language in prior iterations corresponded to the observe+upgrade+reserve stages; "commit" to commit+publish; the split into two functions was a v11/v12 convenience, not a framework requirement.
+There is no `open_prepare` + `open_commit` split. The five-stage discipline happens within the single step. The "prepare" language in prior iterations corresponded to the observe+upgrade+reserve stages; "commit" to commit+publish; the split into two functions was a retired-draft convenience, not a framework requirement.
 
 ### 5.2 Example: `unlink`
 <!-- txdoc:STEP-5-2-EXAMPLE-UNLINK -->
@@ -657,9 +657,9 @@ Each anti-pattern has a canonical fix. Lints can detect many of these structural
 
 For readers familiar with earlier iterations:
 
-- **v11 prepare/commit pairs** are now single step functions. The old prepare half maps to observe+upgrade+reserve; the old commit half maps to commit+publish. One function, five internal stages, STEP-6 explicitly rejects operation-level phase separation.
+- **Retired prepare/commit pairs** are now single step functions. The old prepare half maps to observe+upgrade+reserve; the old commit half maps to commit+publish. One function, five internal stages, STEP-6 explicitly rejects operation-level phase separation.
 
-- **v11 attempt functions** (as used in blocking I/O path) are now step functions with multi-step trajectories. The former "attempt" is one invocation of a step; the former "driver retry loop" is unchanged but its primitive is now "call step" rather than "call attempt."
+- **Retired attempt functions** (as used in blocking I/O path) are now step functions with multi-step trajectories. The former "attempt" is one invocation of a step; the former "driver retry loop" is unchanged but its primitive is now "call step" rather than "call attempt."
 
 - **v12 `poll_read`-style ops** with `&mut Option<WakerGuard>` parameters threaded through subsystems are retired. The WakerGuard plumbing is internal to the wait primitive; step functions never see it. `Blocked` outcomes name the carrier abstractly; the wait primitive handles subscribe/unsubscribe.
 
