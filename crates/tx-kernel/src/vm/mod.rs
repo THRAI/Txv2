@@ -383,9 +383,91 @@ pub struct VmMapCommit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VmMapError {
     AlreadyMapped,
+    InvalidRange,
     MissingMapping,
+    NoFreeRange,
     WouldBlock,
     BackingOffsetOverflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmMapTarget {
+    Anywhere {
+        window: UserRange,
+        page_count: usize,
+    },
+    Fixed {
+        range: UserRange,
+        placement: MapPlacement,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmMapRequest {
+    pub target: VmMapTarget,
+    pub prot: Prot,
+    pub flags: VmEntryFlags,
+    pub backing: VmBackingDraft,
+}
+
+impl VmMapRequest {
+    pub const fn anywhere(
+        window: UserRange,
+        page_count: usize,
+        prot: Prot,
+        flags: VmEntryFlags,
+        backing: VmBackingDraft,
+    ) -> Self {
+        Self {
+            target: VmMapTarget::Anywhere { window, page_count },
+            prot,
+            flags,
+            backing,
+        }
+    }
+
+    pub const fn fixed(
+        range: UserRange,
+        placement: MapPlacement,
+        prot: Prot,
+        flags: VmEntryFlags,
+        backing: VmBackingDraft,
+    ) -> Self {
+        Self {
+            target: VmMapTarget::Fixed { range, placement },
+            prot,
+            flags,
+            backing,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmMapOutcome {
+    pub range: UserRange,
+    pub commit: VmMapCommit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmRemapRequest {
+    pub old_range: UserRange,
+    pub new_range: UserRange,
+}
+
+impl VmRemapRequest {
+    pub const fn new(old_range: UserRange, new_range: UserRange) -> Self {
+        Self {
+            old_range,
+            new_range,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmRemapOutcome {
+    pub old_range: UserRange,
+    pub new_range: UserRange,
+    pub commit: VmMapCommit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -477,6 +559,53 @@ impl AddressSpace {
             page_range,
             entry,
             pmap_materialization_deferred: self.pmap.materialization_deferred,
+        })
+    }
+
+    pub fn map_script(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
+        let (range, placement) = match request.target {
+            VmMapTarget::Anywhere { window, page_count } => {
+                let range = self
+                    .find_free_range(window, page_count)
+                    .ok_or(VmMapError::NoFreeRange)?;
+                (range, MapPlacement::RequireFree)
+            }
+            VmMapTarget::Fixed { range, placement } => (range, placement),
+        };
+        let entry = VmEntry::new(range, request.prot, request.flags, request.backing);
+
+        match self.reserve_map(entry, placement) {
+            MapReserveResult::Reserved(reservation) => {
+                let commit = reservation.commit()?;
+                Ok(VmMapOutcome { range, commit })
+            }
+            MapReserveResult::WouldBlock(_) => Err(VmMapError::WouldBlock),
+            MapReserveResult::Err(error) => Err(error),
+        }
+    }
+
+    pub fn remap_script(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
+        if request.old_range.overlaps(request.new_range)
+            || request.old_range.len() != request.new_range.len()
+        {
+            return Err(VmMapError::InvalidRange);
+        }
+
+        let _guard_pair = match self.range_lock.acquire_pair(
+            (request.old_range, LockMode::ExclusiveWriter),
+            (request.new_range, LockMode::ExclusiveWriter),
+        ) {
+            AcquirePairResult::Acquired(pair) => pair,
+            AcquirePairResult::WouldBlock(_) => return Err(VmMapError::WouldBlock),
+        };
+        let commit = self
+            .recipes
+            .remap_disjoint(request.old_range, request.new_range)?;
+        self.stats.store(self.recipes.stats());
+        Ok(VmRemapOutcome {
+            old_range: request.old_range,
+            new_range: request.new_range,
+            commit,
         })
     }
 
@@ -655,6 +784,17 @@ impl RecipeIndex {
         *entries = rewritten;
         Ok(VmMapCommit { changed_pages })
     }
+
+    fn remap_disjoint(
+        &self,
+        old_range: UserRange,
+        new_range: UserRange,
+    ) -> Result<VmMapCommit, VmMapError> {
+        let mut entries = self.entries.lock();
+        let (rewritten, changed_pages) = rewrite_remap_disjoint(&entries, old_range, new_range)?;
+        *entries = rewritten;
+        Ok(VmMapCommit { changed_pages })
+    }
 }
 
 struct AddressSpaceStatsCell {
@@ -785,6 +925,74 @@ fn rewrite_protect(
     }
 
     Ok((rewritten, changed_pages))
+}
+
+fn rewrite_remap_disjoint(
+    entries: &BTreeMap<UserVirtAddr, VmEntry>,
+    old_range: UserRange,
+    new_range: UserRange,
+) -> Result<(BTreeMap<UserVirtAddr, VmEntry>, usize), VmMapError> {
+    if old_range.overlaps(new_range) || old_range.len() != new_range.len() {
+        return Err(VmMapError::InvalidRange);
+    }
+    if !range_is_fully_mapped(entries, old_range) {
+        return Err(VmMapError::MissingMapping);
+    }
+    validate_insert_free(
+        entries,
+        VmEntry::new(
+            new_range,
+            Prot::NONE,
+            VmEntryFlags::PRIVATE,
+            VmBackingDraft::None,
+        ),
+    )?;
+
+    let mut rewritten = BTreeMap::new();
+    let mut moved = Vec::new();
+
+    for existing in entries.values().copied() {
+        let Some(overlap) = range_intersection(existing.range, old_range) else {
+            push_entry(&mut rewritten, existing);
+            continue;
+        };
+
+        let rewrite = existing.split_for_unmap(overlap).map_err(vm_entry_error)?;
+        if let Some(before) = rewrite.before {
+            push_entry(&mut rewritten, before);
+        }
+        if let Some(after) = rewrite.after {
+            push_entry(&mut rewritten, after);
+        }
+
+        let moving = existing
+            .split_for_protect(overlap, existing.prot)
+            .map_err(vm_entry_error)?
+            .target
+            .ok_or(VmMapError::MissingMapping)?;
+        let delta = overlap.start().as_usize() - old_range.start().as_usize();
+        let target_start = UserVirtAddr(
+            new_range
+                .start()
+                .as_usize()
+                .checked_add(delta)
+                .ok_or(VmMapError::InvalidRange)?,
+        );
+        let target_range = UserRange::new_aligned(target_start, overlap.len())
+            .map_err(|_| VmMapError::InvalidRange)?;
+        moved.push(VmEntry::new(
+            target_range,
+            moving.prot,
+            moving.flags,
+            moving.backing,
+        ));
+    }
+
+    for entry in moved {
+        push_entry(&mut rewritten, entry);
+    }
+
+    Ok((rewritten, old_range.page_count() + new_range.page_count()))
 }
 
 fn range_is_fully_mapped(entries: &BTreeMap<UserVirtAddr, VmEntry>, range: UserRange) -> bool {
@@ -2238,6 +2446,180 @@ mod tests {
         assert_eq!(
             aspace.resolve_fault(VmFault::new(UserVirtAddr(0x1000), AccessMode::Read)),
             Err(VmFaultError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn vm_map_script_places_nonfixed_mapping_in_first_recipe_gap() {
+        let aspace = AddressSpace::new();
+        map_reserved(aspace.reserve_map(
+            VmEntry::new(
+                range(0x1000, 1),
+                Prot::READ,
+                VmEntryFlags::PRIVATE,
+                VmBackingDraft::PrivateAnon,
+            ),
+            MapPlacement::RequireFree,
+        ))
+        .commit()
+        .expect("seed left");
+        map_reserved(aspace.reserve_map(
+            VmEntry::new(
+                range(0x4000, 1),
+                Prot::READ,
+                VmEntryFlags::PRIVATE,
+                VmBackingDraft::PrivateAnon,
+            ),
+            MapPlacement::RequireFree,
+        ))
+        .commit()
+        .expect("seed right");
+
+        let outcome = aspace
+            .map_script(VmMapRequest::anywhere(
+                range(0x1000, 5),
+                2,
+                Prot::READ_WRITE,
+                VmEntryFlags::PRIVATE,
+                VmBackingDraft::PrivateAnon,
+            ))
+            .expect("map into gap");
+
+        assert_eq!(outcome.range, range(0x2000, 2));
+        assert_eq!(outcome.commit.changed_pages, 2);
+        assert_eq!(
+            aspace.lookup(UserVirtAddr(0x2000)).expect("mapped").prot,
+            Prot::READ_WRITE
+        );
+        assert_eq!(
+            aspace.map_script(VmMapRequest::anywhere(
+                range(0x1000, 5),
+                2,
+                Prot::READ,
+                VmEntryFlags::PRIVATE,
+                VmBackingDraft::PrivateAnon,
+            )),
+            Err(VmMapError::NoFreeRange)
+        );
+    }
+
+    #[test]
+    fn vm_map_script_fixed_replace_uses_declared_range() {
+        let aspace = AddressSpace::new();
+        let original = VmEntry::new(
+            range(0x1000, 3),
+            Prot::READ_WRITE,
+            VmEntryFlags::SHARED,
+            VmBackingDraft::MockPage { id: 33, offset: 0 },
+        );
+        map_reserved(aspace.reserve_map(original, MapPlacement::RequireFree))
+            .commit()
+            .expect("seed");
+
+        let replacement = VmMapRequest::fixed(
+            range(0x2000, 1),
+            MapPlacement::FixedReplace,
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBackingDraft::PrivateAnon,
+        );
+        let outcome = aspace.map_script(replacement).expect("fixed replace");
+
+        assert_eq!(outcome.range, range(0x2000, 1));
+        assert_eq!(outcome.commit.changed_pages, 2);
+        assert_eq!(
+            aspace.lookup(UserVirtAddr(0x1000)).expect("left").range,
+            range(0x1000, 1)
+        );
+        assert_eq!(
+            aspace
+                .lookup(UserVirtAddr(0x2000))
+                .expect("replacement")
+                .prot,
+            Prot::READ
+        );
+        assert_eq!(
+            aspace.lookup(UserVirtAddr(0x3000)).expect("right").range,
+            range(0x3000, 1)
+        );
+    }
+
+    #[test]
+    fn vm_remap_script_moves_disjoint_range_and_preserves_source_survivors() {
+        let aspace = AddressSpace::new();
+        let original = VmEntry::new(
+            range(0x1000, 4),
+            Prot::READ_WRITE,
+            VmEntryFlags::SHARED,
+            VmBackingDraft::MockPage { id: 44, offset: 0 },
+        );
+        map_reserved(aspace.reserve_map(original, MapPlacement::RequireFree))
+            .commit()
+            .expect("seed");
+
+        let outcome = aspace
+            .remap_script(VmRemapRequest::new(range(0x2000, 2), range(0x8000, 2)))
+            .expect("remap");
+
+        assert_eq!(outcome.old_range, range(0x2000, 2));
+        assert_eq!(outcome.new_range, range(0x8000, 2));
+        assert_eq!(outcome.commit.changed_pages, 4);
+        assert_eq!(
+            aspace.lookup(UserVirtAddr(0x1000)).expect("left").range,
+            range(0x1000, 1)
+        );
+        assert_eq!(aspace.lookup(UserVirtAddr(0x2000)), None);
+        assert_eq!(
+            aspace.lookup(UserVirtAddr(0x4000)).expect("right").range,
+            range(0x4000, 1)
+        );
+        assert_eq!(
+            aspace.lookup(UserVirtAddr(0x8000)),
+            Some(VmEntry::new(
+                range(0x8000, 2),
+                Prot::READ_WRITE,
+                VmEntryFlags::SHARED,
+                VmBackingDraft::MockPage {
+                    id: 44,
+                    offset: USER_PAGE_SIZE as u64,
+                },
+            ))
+        );
+    }
+
+    #[test]
+    fn vm_remap_script_rejects_overlapping_or_occupied_destination() {
+        let aspace = AddressSpace::new();
+        map_reserved(aspace.reserve_map(
+            VmEntry::new(
+                range(0x1000, 4),
+                Prot::READ,
+                VmEntryFlags::PRIVATE,
+                VmBackingDraft::PrivateAnon,
+            ),
+            MapPlacement::RequireFree,
+        ))
+        .commit()
+        .expect("seed old");
+        map_reserved(aspace.reserve_map(
+            VmEntry::new(
+                range(0x8000, 1),
+                Prot::READ,
+                VmEntryFlags::PRIVATE,
+                VmBackingDraft::PrivateAnon,
+            ),
+            MapPlacement::RequireFree,
+        ))
+        .commit()
+        .expect("seed dest");
+
+        assert_eq!(
+            aspace.remap_script(VmRemapRequest::new(range(0x1000, 2), range(0x2000, 2))),
+            Err(VmMapError::InvalidRange)
+        );
+        assert_eq!(
+            aspace.remap_script(VmRemapRequest::new(range(0x1000, 1), range(0x8000, 1))),
+            Err(VmMapError::AlreadyMapped)
         );
     }
 }

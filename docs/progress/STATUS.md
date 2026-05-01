@@ -10,12 +10,13 @@
   anonymous `PageContainer` seam, exposed recipe gap/overlap queries for mmap
   placement, and added a test-callable VM fault resolve path that takes a
   Materializer reservation and validates recipes/protections before deferred
-  pmap materialization. Verification so far: focused `tx-kernel` VM/PageBacked
-  tests plus full `tx-kernel --lib`, progress validation, docs lint, fmt, and
-  diff checks. Next step: attach real `Cap<Frame>`/pmap/shootdown evidence and
-  VFS `FsPageBacking`; blockers remain persistent epoch recipe snapshots,
-  zone-owned VM/PageContainer evidence, trap/process/runtime integration, and
-  file/device backing.
+  pmap materialization. The lane now also has mmap-style `map_script` gap
+  placement and v1 disjoint-only `mremap` recipe movement. Verification so far:
+  focused `tx-kernel` VM/PageBacked tests plus full `tx-kernel --lib`,
+  progress validation, docs lint, fmt, and diff checks. Next step: attach real
+  `Cap<Frame>`/pmap/shootdown evidence and VFS `FsPageBacking`; blockers
+  remain persistent epoch recipe snapshots, zone-owned VM/PageContainer
+  evidence, trap/process/runtime integration, and file/device backing.
 - 2026-05-02 skill refresh: added subsystem-specific operational skills for
   VM/PageBacked, VFS/filesystem, and Process/ThreadRuntime work so future
   agents load the canonical subsystem docs before implementation and preserve
