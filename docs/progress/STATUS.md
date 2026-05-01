@@ -1,6 +1,6 @@
 # txKernel Status
 
-**Updated:** 2026-04-29
+**Updated:** 2026-05-01
 
 ## Current Shape
 
@@ -255,6 +255,35 @@
   `Reactor::submit` futures remain kernel-only cooperative tasks; trap-driven
   timer delivery and userspace-run dispatch remain later slices. See
   `docs/progress/worktrees/2026-04-29-reactor-scheduler-shell.json`.
+- `tx-reactor` is now split into focused modules and has the full prototype
+  reactor shell for subsystem development: generation-checked `TaskKey`
+  lifecycle, task-local wakers, wake-as-hint re-observation, timer-backed
+  waits, interruptible/killable wait classification, completion/rendezvous
+  helpers, AST marker queues, scheduler stop reasons, affinity wake placement,
+  remote reschedule dispatch markers, typed declared wait/readiness channels
+  over substrate bus declarations, a public single-slot
+  `Reactor::request_userspace_run` facade, userspace-entry AST checkpointing,
+  and a platform-neutral per-hart `hart_loop` step. The same PR slice carries
+  the reactor runtime dependency spine: HAL `TimeIf::enable_timer_wakeups`,
+  `SmpIf` parked-AP/IPI hooks, AP-local `tx_substrate::init_on_ap`, the
+  CoreInit shared `BOOT_REACTOR` hart-loop adapter, RV64 saved-trap dispatch
+  and trap-frame writeback, and timer/IPI interrupt paths that can drive the
+  reactor loop on real harts. Verification: `cargo fmt --check`, `cargo test
+  -p tx-reactor --test userspace_run`, `cargo test -p tx-reactor --test
+  hart_loop`, `cargo test -p tx-reactor`, `cargo test -p tx-substrate --test
+  bus`, `cargo test -p tx-substrate --test ap_init`, `cargo test -p
+  tx-hal-riscv64-qemu-virt`, `cargo check -p tx-kernel-riscv64-qemu-virt
+  --target riscv64gc-unknown-none-elf`, `cargo xtask lint docs`, `cargo xtask
+  progress validate`, `cargo xtask ci`, and `git diff --check`. Boundary: this
+  is enough for prototype reactor tasks, mock device completions, timer
+  preemption, and AP wake/reschedule smokes to update owner truth and fire
+  wakes, but it is not production-complete VFS/device/block runtime:
+  ThreadRuntime-backed per-task userspace state, VM fault policy, signal
+  delivery, syscall dispatch, external IRQ/device completion dispatch, and the
+  final production sharding policy remain later. See
+  `docs/progress/research/2026-05-01-reactor-runtime-dispatch-audit.md`,
+  `docs/progress/decisions/2026-05-01-coreinit-hart-loop-adapter.md`, and
+  `docs/progress/decisions/2026-05-01-reactor-userspace-entry-ast-checkpoint.md`.
 - `tx_kernel::vm` now has a pure/mock VM foundation: `UserVirtAddr`,
   `UserPage`, `UserRange`, protection/access flags, draft `VmEntry`
   split/rewrite helpers for `munmap`/`mprotect`-like value behavior, and a
@@ -270,14 +299,17 @@
   ci-slow`, and `git diff --check`. Next step: either wire a kernel
   scheduler/CoreInit adapter or start the timer-trap delivery shell; blockers
   remain the full saved-register trap shell and real zone-owned VM entities.
-- `TrapIf` now includes typed trap snapshots and classification. RV64 QEMU
-  decodes common synchronous faults and supervisor interrupts from `scause`;
-  the direct-mode vector still panics/spins until the full saved-register
-  trap shell and user-return path exist.
-- RV64 QEMU now installs a minimal direct-mode `stvec` panic vector before
-  boot handoff and again after `init_later()`. The vector prints `scause`,
-  `sepc`, and `stval` through the SBI console and spins; the full
-  `RawTrapFrame`/`KernelTrapSink` user trap shell remains a later slice.
+- `TrapIf` now includes typed trap snapshots, classification, mutable trap-frame
+  views, and a `KernelTrapSink` dispatch boundary. RV64 QEMU decodes common
+  synchronous faults and supervisor interrupts from `scause`, saves full trap
+  frames for the Rust dispatcher, routes timer/external/IPI/syscall/fault cases
+  through the kernel sink, and can write back trap-frame mutations before
+  resume. Full VM/syscall/user-return policy remains a later kernel slice.
+- RV64 QEMU still keeps the minimal direct-mode panic vector for early boot, but
+  post-init trap handling now switches to the saved-register dispatch vector.
+  Fault logs include trap-frame context for `sepc` failures, and the host
+  decoder/QEMU runner can annotate those logs through `cargo xtask
+  fault-decode`.
 - `cargo xtask ci-slow` runs the RV64 QEMU smoke sentinel lane separately from
   fast compile/lint CI.
 - The active HAL, page-substrate, module-map, and invariant docs now state the
@@ -305,15 +337,31 @@
 - OSComp FAT32 image/test runner integration is not yet a passing boot test.
 - LA64 target availability depends on local rustup support.
 - LA64 and M1 Dock mock boot protocols are compile-first only.
-- RV64 QEMU still needs superpage/multi-frame map-count batching, remote-hart
-  shootdown coordination, and the full trap shell before the page substrate is
-  user/VM-ready.
+- RV64 QEMU still needs superpage/multi-frame map-count batching, production
+  remote-hart shootdown coordination, and VM/syscall/user-return trap policy
+  before the page substrate is user/VM-ready.
 - ext4 image creation requires host `mkfs.ext4`.
 - BusyBox images require `TX_BUSYBOX`; dynamic musl layouts also require
   `TX_MUSL_LIBC`.
 
 ## Latest Decisions
 
+- `docs/progress/decisions/2026-05-01-reactor-userspace-entry-ast-checkpoint.md`
+- `docs/progress/decisions/2026-05-01-rv64-trapframe-fault-decode.md`
+- `docs/progress/decisions/2026-05-01-rv64-trap-frame-writeback.md`
+- `docs/progress/decisions/2026-05-01-rv64-timer-trap-idle-smoke.md`
+- `docs/progress/decisions/2026-05-01-rv64-saved-trap-dispatch.md`
+- `docs/progress/decisions/2026-05-01-coreinit-hart-loop-adapter.md`
+- `docs/progress/decisions/2026-04-30-ap-reactor-shared-runqueue-smoke.md`
+- `docs/progress/decisions/2026-04-30-ap-reactor-loop-wfi-smoke.md`
+- `docs/progress/decisions/2026-04-30-rv64-ipi-ack-smoke.md`
+- `docs/progress/decisions/2026-04-30-ap-substrate-before-online.md`
+- `docs/progress/decisions/2026-04-30-rv64-smp-rfence-shootdown.md`
+- `docs/progress/decisions/2026-04-30-smpif-parked-ap-boot.md`
+- `docs/progress/decisions/2026-04-30-reactor-reschedule-dispatch-bridge.md`
+- `docs/progress/decisions/2026-04-30-reactor-affinity-wake-placement.md`
+- `docs/progress/decisions/2026-04-30-reactor-declared-readiness-channel.md`
+- `docs/progress/decisions/2026-04-30-reactor-declared-wait-channel.md`
 - `docs/progress/decisions/2026-04-29-ebr-zone-first-executable-slice.md`
 - `docs/progress/decisions/2026-04-29-rv64-high-vma-low-lma-linker.md`
 - `docs/progress/decisions/2026-04-29-rv64-low-linked-identity-retention.md`
@@ -348,4 +396,8 @@
 
 ## Latest Research
 
+- `docs/progress/research/2026-05-01-reactor-runtime-dispatch-audit.md`
+- `docs/progress/research/2026-05-01-ast-return-to-user-scout.md`
+- `docs/progress/research/2026-05-01-coreinit-runtime-loop-scout.md`
+- `docs/progress/research/2026-04-30-reactor-readiness-for-subsystems.md`
 - `docs/progress/research/2026-04-27-humanlayer-progress-memory.md`

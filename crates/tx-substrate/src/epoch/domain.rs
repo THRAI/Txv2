@@ -105,7 +105,7 @@ impl EpochDomain {
             self.cpu_states[cpu].reset();
         }
 
-        self.init_cpu(P::current_cpu_id())
+        self.init_cpu(<P as PercpuIf>::current_cpu_id())
     }
 
     fn init_on_ap(&'static self, cpu: CpuId) -> Result<(), EpochError> {

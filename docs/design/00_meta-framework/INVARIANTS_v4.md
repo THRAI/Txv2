@@ -487,9 +487,9 @@ LINT: module/spec template requires `home = ...`.
 
 LINT: HAL crates/modules cannot import subsystem/service/script paths.
 
-**MAP-2A.** HAL is an axHal-style static platform family: one platform selected at compile/link time, no runtime HAL manager, no `Box<dyn Hal>`, no HAL-owned semantic entities, and no HAL callback slot for subsystem policy.
+**MAP-2A.** HAL is an axHal-style static platform family: one platform selected at compile/link time, no runtime HAL manager, no boxed dynamic HAL trait object, no HAL-owned semantic entities, and no HAL callback slot for subsystem policy.
 
-LINT: reject `HalManager`, `dyn Hal`, `__ostd_main`, HAL signal-hook slots, or board-independent code that matches on runtime architecture instead of using the selected platform axis.
+LINT: reject runtime HAL-manager types, dynamic HAL trait objects, `__ostd_main`, HAL signal-hook slots, or board-independent code that matches on runtime architecture instead of using the selected platform axis.
 
 **MAP-2B.** Portable boot follows the platform-owned handoff shape:
 firmware/reset enters the concrete platform crate's `_start`; `_start`

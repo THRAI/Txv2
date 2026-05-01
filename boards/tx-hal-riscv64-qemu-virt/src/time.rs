@@ -18,6 +18,19 @@ pub(crate) fn cancel_deadline() {
     sbi_set_timer(u64::MAX);
 }
 
+pub(crate) fn enable_timer_wakeups() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        let stie = 1usize << 5;
+        core::arch::asm!(
+            "csrs sie, {stie}",
+            "csrsi sstatus, 2",
+            stie = in(reg) stie,
+            options(nomem, nostack)
+        );
+    }
+}
+
 #[cfg(target_arch = "riscv64")]
 fn read_time_ticks() -> u64 {
     let ticks: u64;

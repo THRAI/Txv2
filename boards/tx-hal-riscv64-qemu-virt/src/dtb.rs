@@ -23,6 +23,7 @@ pub(crate) struct DtbBootInfo {
     pub(crate) initrd: Option<PhysRange>,
     pub(crate) cmdline_len: usize,
     pub(crate) timebase_frequency_hz: Option<u64>,
+    pub(crate) possible_cpu_count: usize,
 }
 
 pub(crate) unsafe fn parse_boot_info_from_fdt(
@@ -47,6 +48,7 @@ pub(crate) unsafe fn parse_boot_info_from_fdt(
         .flatten()
         .and_then(|prop| read_timebase_frequency_hz(prop.value));
     let memory_region_count = copy_memory_regions(&fdt, memory_regions)?;
+    let possible_cpu_count = count_cpu_nodes(&fdt).max(1);
     let chosen = fdt.find_node("/chosen").ok().flatten();
     let cmdline_len = copy_bootargs(chosen, cmdline);
     let initrd_start = chosen
@@ -71,6 +73,7 @@ pub(crate) unsafe fn parse_boot_info_from_fdt(
         initrd,
         cmdline_len,
         timebase_frequency_hz,
+        possible_cpu_count,
     })
 }
 
@@ -137,6 +140,13 @@ fn read_timebase_frequency_hz(value: &[u8]) -> Option<u64> {
     }
 }
 
+fn count_cpu_nodes(fdt: &FallibleFdt<'_>) -> usize {
+    let Ok(nodes) = fdt.find_all_nodes_with_name("cpu") else {
+        return 0;
+    };
+    nodes.filter_map(Result::ok).count()
+}
+
 fn copy_bootargs(chosen: Option<FallibleFdtNode<'_>>, dst: &mut [u8]) -> usize {
     let Some(bootargs) = chosen
         .and_then(|node| node.raw_property("bootargs").ok().flatten())
@@ -188,6 +198,7 @@ mod tests {
                 }),
                 cmdline_len: 12,
                 timebase_frequency_hz: Some(10_000_000),
+                possible_cpu_count: 4,
             }
         );
         assert_eq!(regions[0].base, PhysAddr(0x8000_0000));
@@ -275,6 +286,7 @@ mod tests {
         );
         assert_eq!(boot_info.cmdline, Some("console=hvc0"));
         assert_eq!(Platform::platform_info().timebase_frequency_hz, 10_000_000);
+        assert_eq!(Platform::platform_info().possible_cpu_count, 4);
         assert_eq!(<Platform as tx_hal::TimeIf>::frequency_hz(), 10_000_000);
 
         unsafe {
@@ -310,12 +322,25 @@ mod tests {
         let initrd_start = add_string(&mut strings, "linux,initrd-start");
         let initrd_end = add_string(&mut strings, "linux,initrd-end");
         let timebase_frequency = add_string(&mut strings, "timebase-frequency");
+        let status = add_string(&mut strings, "status");
 
         let mut structure = Vec::new();
         begin_node(&mut structure, "");
         prop_u32(&mut structure, address_cells, 2);
         prop_u32(&mut structure, size_cells, 2);
         prop_u32(&mut structure, timebase_frequency, timebase_frequency_hz);
+
+        begin_node(&mut structure, "cpus");
+        prop_u32(&mut structure, address_cells, 1);
+        prop_u32(&mut structure, size_cells, 0);
+        for cpu in 0..4u32 {
+            begin_node(&mut structure, &format!("cpu@{cpu}"));
+            prop_bytes(&mut structure, device_type, b"cpu\0");
+            prop_bytes(&mut structure, status, b"okay\0");
+            prop_cells(&mut structure, reg, &[cpu]);
+            end_node(&mut structure);
+        }
+        end_node(&mut structure);
 
         for (base, size) in memory_ranges {
             begin_node(&mut structure, &format!("memory@{base:x}"));
