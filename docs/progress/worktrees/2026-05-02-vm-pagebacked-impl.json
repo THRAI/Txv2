@@ -13,6 +13,7 @@
     "crates/tx-kernel/src/lib.rs",
     "crates/tx-kernel/src/sync.rs",
     "crates/tx-kernel/src/vm",
+    "crates/tx-kernel/src/vm/pmap.rs",
     "crates/tx-kernel/src/page_backed.rs",
     "crates/tx-kernel/src/zones.rs",
     "crates/tx-substrate/src/epoch/",
@@ -32,11 +33,16 @@
     "cargo test -p tx-kernel vm_pmap_",
     "cargo test -p tx-substrate --test page_allocator",
     "cargo fmt --check",
+    "cargo test -p tx-substrate --test pmap",
+    "cargo test -p tx-substrate --test shootdown",
     "cargo test -p tx-kernel vm",
     "cargo test -p tx-kernel --lib",
+    "cargo test -p tx-kernel",
+    "cargo test -p tx-hal-riscv64-qemu-virt pmap",
+    "cargo test -p tx-hal-riscv64-m1dock-mock pmap",
     "cargo xtask progress validate",
     "cargo xtask lint docs",
     "git diff --check"
   ],
-  "notes": "Implementation lane for the VM_v1_2/PageBacked_v1 plan. Landed the corrected AddressSpace BTreeMap range-index staging core via ecf3361, then added mmap-style map_script gap placement, disjoint-only mremap_script request surfaces, PageBacked-owned PageCacheIndex/PageContainer anonymous materialization, and a test-callable VM fault resolve seam over authoritative recipes. The lane now integrates the first real cap/zone evidence pass: AddressSpace and PageContainer have zone-backed new_cap constructors and are registered from kernel zones; VM recipes store VmBacking::Page { pc: Cap<PageContainer>, offset }; PageContainer uses interior synchronized state so cap-held PCs can materialize pages; page-cache entries store real PPN plus CachePin; fault materialization returns MapPin evidence; and the host-testable PmapSeam owns MapPins through reserve/commit/rollback and teardown/shootdown. Next step: replace the remaining host-testable PmapSeam with real HAL PmapIf root/reservation/commit/shootdown evidence, then connect file/device PageContainer paths through VFS FsPageBacking. Blockers/deferred work: persistent epoch recipe snapshots, real HAL pmap materialization, trap dispatch integration, Process/ThreadRuntime ownership, and VFS/ext4 backing integration."
+  "notes": "Implementation lane for the VM_v1_2/PageBacked_v1 plan. Landed the corrected AddressSpace BTreeMap range-index staging core via ecf3361, then added mmap-style map_script gap placement, disjoint-only mremap_script request surfaces, PageBacked-owned PageCacheIndex/PageContainer anonymous materialization, and a test-callable VM fault resolve seam over authoritative recipes. The lane now integrates cap/zone evidence plus real VM pmap publication: AddressSpace and PageContainer have zone-backed constructors and registered zones; VM recipes store VmBacking::Page { pc: Cap<PageContainer>, offset }; PageContainer uses interior synchronized state; page-cache entries store real PPN plus CachePin; fault materialization returns MapPin evidence; and AddressSpace owns a VmPmap that creates a HAL PmapRoot/ASID, captures root-local PmapIf ops, commits page faults through HAL reserve/commit, preserves a VM shadow map for MapPin ownership, and tears down mappings through HAL unmap plus ASID-scoped shootdown before releasing pins. Next step: connect file/device PageContainer paths through VFS FsPageBacking, then integrate trap/process/runtime fault dispatch. Blockers/deferred work: persistent epoch recipe snapshots, trap dispatch integration, Process/ThreadRuntime ownership, and VFS/ext4 backing integration."
 }
