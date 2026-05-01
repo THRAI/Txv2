@@ -37,9 +37,13 @@
 
 ## Residual Gaps
 
-- `RawQueue` / `RawPort` are still minimal host-testable primitives: no typed
-  declaration macros, no SMP/epoch-protected subscriber storage, no terminal
-  wire destruction handshake, and no epoll long-lived subscription graph.
+- `RawQueue` / `RawPort` are still minimal host-testable primitives in this
+  first-wave snapshot: no typed declaration macros, no SMP/epoch-protected
+  subscriber storage, no terminal wire destruction handshake, and no epoll
+  long-lived subscription graph. Later SMP/bus follow-ups add SMP-safe raw
+  storage, typed queue/port wrappers, and an epoch-fenced terminal/drain retire
+  handshake, bounded subscription graph, and owner-storage EBR fence, but not
+  the final epoll graph or concrete VFS/device owner implementations.
 - Timer/idle has a HAL-shaped callback adapter but is not wired into
   `CoreInit`; `crates/tx-kernel/src/init.rs` remains deferred because another
   progress worktree still records that path in its active lease.
@@ -60,4 +64,4 @@
 - `git diff --check`
 
 All listed commands passed. `cargo xtask lint docs` continues to report the
-known 31 stale-vocabulary warnings as warnings only.
+the then-current docs lint warning policy.

@@ -32,7 +32,8 @@ Start with:
 ## Rules
 
 - Active docs override archived and source-trace docs.
-- Do not resurrect v11, OSTD HAL manager, runtime `HalManager`, or upper-layer raw `Zone<T, Policy>`.
+- Do not resurrect the retired architecture draft, legacy dynamic HAL manager,
+  runtime HAL-manager type, or upper-layer raw `Zone<T, Policy>`.
 - Upper subsystems expose role-shaped types: `Cap<T>`, `PayloadCap<T>`, `Weak<T>`, `IdentRef<'g, T>`, witnesses, identity slots, and projection rows.
 - Active design docs carry grep-stable `txdoc:` tags. Use those tags in CI,
   review, and implementation-plan references.

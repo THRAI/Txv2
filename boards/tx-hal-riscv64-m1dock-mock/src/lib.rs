@@ -151,6 +151,7 @@ static PLATFORM_INFO: PlatformInfo = PlatformInfo {
     spi_sd: Some(SPI0_CS0_SD),
     mmio_regions: MMIO_REGIONS,
     timebase_frequency_hz: 0,
+    possible_cpu_count: 1,
 };
 
 // The mock runs on QEMU virt under OpenSBI. The smoke console stays SBI-backed,

@@ -8,19 +8,39 @@ use core::{
 
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect},
+    dispatch::{DispatchState, NoopRescheduleSignal, RescheduleSignal, WakeDispatchReport},
+    preempt::PreemptMarkers,
     scheduler::{
         HartId, InitialSchedMeta, Phase1Scheduler, SliceConfig, StopReason, TaskHandle, WakeHint,
     },
+    spin_lock::SpinLock,
     task::{TaskDrainRecord, TaskId, TaskKey, TaskLifecycleError, TaskStatus, TaskTable},
     timer::TimerQueue,
+    userspace::{
+        UserspaceEntryCheckpoint, UserspaceEntryDecision, UserspaceEntryOutcome,
+        UserspaceEntryTaskError, UserspaceRunError, UserspaceRunRequest, UserspaceRunSlot,
+        UserspaceRunStatus, UserspaceRunWait, UserspaceTrapInfo,
+    },
     wait,
     waker::task_waker,
+};
+use tx_substrate::bus::{
+    DeclaredPort, DeclaredQueue, WireDeclaration, WireDeclarationError, WireEventSet,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RunStats {
     pub polled: usize,
     pub completed: usize,
+}
+
+impl RunStats {
+    pub const fn empty() -> Self {
+        Self {
+            polled: 0,
+            completed: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,7 +101,40 @@ where
 pub struct Reactor {
     tasks: TaskTable,
     scheduler: Phase1Scheduler,
+    dispatch: DispatchState,
     timers: TimerQueue,
+    userspace: UserspaceRunSlot,
+}
+
+pub struct SharedReactor {
+    reactor: SpinLock<Option<Reactor>>,
+}
+
+impl SharedReactor {
+    pub const fn empty() -> Self {
+        Self {
+            reactor: SpinLock::new(None),
+        }
+    }
+
+    pub fn init(&self) -> bool {
+        let mut reactor = self.reactor.lock();
+        if reactor.is_some() {
+            return false;
+        }
+
+        *reactor = Some(Reactor::new());
+        true
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.reactor.lock().is_some()
+    }
+
+    pub fn with<R>(&self, f: impl FnOnce(&mut Reactor) -> R) -> Option<R> {
+        let mut reactor = self.reactor.lock();
+        reactor.as_mut().map(f)
+    }
 }
 
 impl Reactor {
@@ -89,13 +142,56 @@ impl Reactor {
         Self {
             tasks: TaskTable::new(),
             scheduler: Phase1Scheduler::new(),
+            dispatch: DispatchState::new(),
             timers: TimerQueue::new(),
+            userspace: UserspaceRunSlot::new(),
         }
     }
 
     /// Creates a wait channel attached to this reactor's timer queue.
     pub fn channel(&self) -> wait::Channel {
         wait::Channel::with_timer_queue(self.timers.clone())
+    }
+
+    /// Creates a typed declared wait channel attached to this reactor's timer queue.
+    pub fn declared_channel<E>(
+        &self,
+        declaration: WireDeclaration<E>,
+    ) -> Result<wait::DeclaredChannel<E>, WireDeclarationError>
+    where
+        E: WireEventSet + Send + Sync + 'static,
+    {
+        wait::DeclaredChannel::with_timer_queue(declaration, self.timers.clone())
+    }
+
+    /// Attaches an existing typed declared bus port to this reactor's timer queue.
+    pub fn declared_channel_from_port<E>(&self, port: DeclaredPort<E>) -> wait::DeclaredChannel<E>
+    where
+        E: WireEventSet + Send + Sync + 'static,
+    {
+        wait::DeclaredChannel::from_port_with_timer_queue(port, self.timers.clone())
+    }
+
+    /// Creates a typed declared readiness channel attached to this reactor's timer queue.
+    pub fn declared_readiness_channel<E>(
+        &self,
+        declaration: WireDeclaration<E>,
+    ) -> Result<wait::DeclaredReadinessChannel<E>, WireDeclarationError>
+    where
+        E: WireEventSet + Send + Sync + 'static,
+    {
+        wait::DeclaredReadinessChannel::with_timer_queue(declaration, self.timers.clone())
+    }
+
+    /// Attaches an existing typed declared bus queue to this reactor's timer queue.
+    pub fn declared_readiness_channel_from_queue<E>(
+        &self,
+        queue: DeclaredQueue<E>,
+    ) -> wait::DeclaredReadinessChannel<E>
+    where
+        E: WireEventSet + Send + Sync + 'static,
+    {
+        wait::DeclaredReadinessChannel::from_queue_with_timer_queue(queue, self.timers.clone())
     }
 
     /// Advances the reactor-owned absolute nanosecond clock and wakes expired timers.
@@ -135,7 +231,7 @@ impl Reactor {
     /// [`Reactor::submit_task`] and keep the returned [`TaskKey`].
     pub fn submit<F>(&mut self, future: F) -> TaskId
     where
-        F: Future<Output = ()> + 'static,
+        F: Future<Output = ()> + Send + 'static,
     {
         self.submit_task(future).id()
     }
@@ -143,14 +239,19 @@ impl Reactor {
     /// Submit a kernel-only cooperative task and return a generation-checked key.
     pub fn submit_task<F>(&mut self, future: F) -> TaskKey
     where
-        F: Future<Output = ()> + 'static,
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.submit_task_with_meta(future, InitialSchedMeta::kernel())
+    }
+
+    /// Submit a task with explicit scheduler metadata.
+    pub fn submit_task_with_meta<F>(&mut self, future: F, initial_meta: InitialSchedMeta) -> TaskKey
+    where
+        F: Future<Output = ()> + Send + 'static,
     {
         let key = self.tasks.submit(future);
-        self.scheduler.task_submitted(
-            key.id(),
-            TaskHandle::new(key.id()),
-            InitialSchedMeta::kernel(),
-        );
+        self.scheduler
+            .task_submitted(key.id(), TaskHandle::new(key.id()), initial_meta);
         key
     }
 
@@ -176,6 +277,55 @@ impl Reactor {
         self.tasks.last_consumed_ast_batch(task)
     }
 
+    /// Request userspace execution for a future userspace-thread task.
+    ///
+    /// This is the public reactor facade for the current single-slot
+    /// userspace-run shell. It is still mechanism only: there is no
+    /// `ThreadPayload`, VM fault policy, signal routing, or HAL return path
+    /// hidden behind this method.
+    pub fn request_userspace_run(&self) -> Result<UserspaceRunWait, UserspaceRunError> {
+        self.userspace.start_request()
+    }
+
+    pub fn userspace_run_status(&self) -> Option<UserspaceRunStatus> {
+        self.userspace.status()
+    }
+
+    pub fn dispatch_userspace_run(
+        &self,
+        request: UserspaceRunRequest,
+    ) -> Result<UserspaceRunStatus, UserspaceRunError> {
+        self.userspace.dispatch(request)
+    }
+
+    pub fn record_userspace_timer_preemption(
+        &self,
+        request: UserspaceRunRequest,
+    ) -> Result<UserspaceRunStatus, UserspaceRunError> {
+        self.userspace.record_timer_preemption(request)
+    }
+
+    pub fn complete_userspace_run(
+        &self,
+        request: UserspaceRunRequest,
+        trap: UserspaceTrapInfo,
+    ) -> Result<UserspaceRunStatus, UserspaceRunError> {
+        self.userspace.complete_interesting_trap(request, trap)
+    }
+
+    pub fn checkpoint_task_userspace_entry(
+        &mut self,
+        task: TaskKey,
+        request: UserspaceRunRequest,
+        decide: impl FnOnce(&UserspaceEntryCheckpoint) -> UserspaceEntryDecision,
+    ) -> Result<UserspaceEntryOutcome, UserspaceEntryTaskError> {
+        self.userspace.status_for_request(request)?;
+        let ast = self.tasks.consume_ast_markers(task)?;
+        Ok(self
+            .userspace
+            .checkpoint_userspace_entry_batch(request, ast, decide)?)
+    }
+
     pub fn drain_completed(&mut self) -> Vec<TaskDrainRecord> {
         self.drain_terminal(TaskStatus::Completed)
     }
@@ -185,6 +335,22 @@ impl Reactor {
     }
 
     pub fn run_until_idle(&mut self) -> RunStats {
+        self.run_until_idle_on_hart(HartId(0))
+    }
+
+    pub fn run_until_idle_on_hart(&mut self, hart: HartId) -> RunStats {
+        let mut signal = NoopRescheduleSignal::new();
+        self.run_until_idle_on_hart_with_reschedule(hart, &mut signal)
+    }
+
+    pub fn run_until_idle_on_hart_with_reschedule<S>(
+        &mut self,
+        hart: HartId,
+        signal: &mut S,
+    ) -> RunStats
+    where
+        S: RescheduleSignal,
+    {
         let mut stats = RunStats {
             polled: 0,
             completed: 0,
@@ -193,8 +359,8 @@ impl Reactor {
             // External wakers only set a task-local bit. The reactor owns the
             // transition from Parked to Runnable and does it at poll-loop
             // boundaries, where duplicate wakes naturally coalesce.
-            self.drain_wakes();
-            let Some((handle, _slice)) = self.scheduler.pick_next(HartId(0)) else {
+            self.drain_wakes_for_hart(hart, signal);
+            let Some((handle, _slice)) = self.scheduler.pick_next(hart) else {
                 break;
             };
             let Some(key) = self.tasks.key_for_id(handle.id()) else {
@@ -240,7 +406,7 @@ impl Reactor {
                 Poll::Ready(()) => {
                     if self.tasks.complete_task(key).is_ok() {
                         self.scheduler
-                            .task_stopped(key.id(), StopReason::Completed, 0, HartId(0));
+                            .task_stopped(key.id(), StopReason::Completed, 0, hart);
                         self.scheduler.task_dropped(key.id());
                         stats.completed += 1;
                     }
@@ -252,18 +418,33 @@ impl Reactor {
                         .map(|task| task.wake_state.take_wake())
                         .unwrap_or(false);
                     if woke_during_poll {
-                        self.mark_runnable(key, WakeHint::Normal);
+                        self.mark_runnable_from_hart(key, WakeHint::Normal, hart, signal);
                     } else if let Ok(task) = self.tasks.task_mut(key) {
                         task.status = TaskStatus::Parked;
                         task.last_stop_reason = Some(StopReason::Blocked);
                         self.scheduler
-                            .task_stopped(key.id(), StopReason::Blocked, 0, HartId(0));
+                            .task_stopped(key.id(), StopReason::Blocked, 0, hart);
                     }
                 }
             }
         }
 
         stats
+    }
+
+    pub fn run_rescheduled_on_hart_with_reschedule<S>(
+        &mut self,
+        hart: HartId,
+        signal: &mut S,
+    ) -> RunStats
+    where
+        S: RescheduleSignal,
+    {
+        if !self.consume_dispatch_markers(hart).need_resched() {
+            return RunStats::empty();
+        }
+
+        self.run_until_idle_on_hart_with_reschedule(hart, signal)
     }
 
     fn run_until_idle_with_clock_source<C>(&mut self, clock: &mut C) -> RunIdleReport
@@ -303,23 +484,60 @@ impl Reactor {
     }
 
     pub fn next_scheduled_task(&mut self, hart: HartId) -> Option<(TaskHandle, SliceConfig)> {
-        self.drain_wakes();
+        let mut signal = NoopRescheduleSignal::new();
+        self.drain_wakes_for_hart(HartId(0), &mut signal);
         self.scheduler.peek_next(hart)
     }
 
-    fn drain_wakes(&mut self) -> usize {
+    pub fn drain_wakes_for_hart<S>(
+        &mut self,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> WakeDispatchReport
+    where
+        S: RescheduleSignal,
+    {
         let woken = self.tasks.drain_wakes();
-        let notified = woken.len();
+        let mut report = WakeDispatchReport::empty();
         for key in woken {
-            self.scheduler.task_runnable(key.id(), WakeHint::Normal);
+            if let Some(placement) =
+                self.scheduler
+                    .task_runnable_from(key.id(), WakeHint::Normal, current_hart)
+            {
+                report.record(self.dispatch.apply_runnable_placement(placement, signal));
+            }
         }
-        notified
+        report
     }
 
-    fn mark_runnable(&mut self, key: TaskKey, hint: WakeHint) {
+    pub fn dispatch_markers(&self, hart: HartId) -> PreemptMarkers {
+        self.dispatch.snapshot_markers(hart)
+    }
+
+    pub fn consume_dispatch_markers(&self, hart: HartId) -> PreemptMarkers {
+        self.dispatch.consume_markers(hart)
+    }
+
+    fn mark_runnable_from_hart<S>(
+        &mut self,
+        key: TaskKey,
+        hint: WakeHint,
+        current_hart: HartId,
+        signal: &mut S,
+    ) -> WakeDispatchReport
+    where
+        S: RescheduleSignal,
+    {
+        let mut report = WakeDispatchReport::empty();
         if self.tasks.mark_runnable(key).is_ok() {
-            self.scheduler.task_runnable(key.id(), hint);
+            if let Some(placement) = self
+                .scheduler
+                .task_runnable_from(key.id(), hint, current_hart)
+            {
+                report.record(self.dispatch.apply_runnable_placement(placement, signal));
+            }
         }
+        report
     }
 
     fn drain_terminal(&mut self, status: TaskStatus) -> Vec<TaskDrainRecord> {

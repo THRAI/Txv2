@@ -366,7 +366,7 @@
     }
   ],
   "risks": [
-    "RawQueue/RawPort are still first-slice primitives without typed declarations, SMP subscriber storage, or terminal wire destruction handshake.",
+    "RawQueue/RawPort now have first typed declaration wrappers, typed readiness/lifecycle bit-set declaration macros, typed RawTrace payload declarations, generated owner-manifest boilerplate, SMP-safe raw subscriber storage, an epoch-fenced terminal/drain retire handshake, static raw backing storage, typed static wrappers, a bounded SubscriptionGraph<N> owner for long-lived raw subscriptions, ready/terminal graph scans, explicit graph clear teardown, a WireOwnerRetireFence bridge into EBR-delayed owner-storage reclaim, and a generic WireOwnerManifest typed owner hook, but still lack trace subscriber/nop-patching runtime, target-fd reverse-index teardown, final global epoll table integration, spill/fanout policy, and concrete VFS/device owner implementations.",
     "timer-idle work depends on HAL TimeIf integration but must preserve host-driven tests.",
     "completion-middleware and wait-interrupt both exercise wait_event behavior; collision is avoided by keeping completion on the existing public wait API and reserving wait.rs edits for the wait-interrupt worker.",
     "userspace-run should not be dispatched yet because ThreadRuntime, saved-register trap return, AST delivery policy, and CoreInit reactor-loop wiring are not isolated enough."

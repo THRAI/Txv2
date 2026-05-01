@@ -4,7 +4,7 @@
 
 **Status.** v1 (2026-04-19). Draft.
 
-**Purpose.** Specify `PageContainer` — the offset-keyed Frame store — and the three-variant `RNodeBacking` that factors every RNode into (page-backed, struct-backed, projected). This document supersedes v11's "Inode + FileOps injection" model, eliminates the `FileOps` and `InodeOps` vtables, and unifies persistent files, tmpfs, shm, memfd, anonymous mmap, and MMIO-mapped devices into a single page-backed shape.
+**Purpose.** Specify `PageContainer` — the offset-keyed Frame store — and the three-variant `RNodeBacking` that factors every RNode into (page-backed, struct-backed, projected). This document supersedes the retired "Inode + FileOps injection" model, eliminates the `FileOps` and `InodeOps` vtables, and unifies persistent files, tmpfs, shm, memfd, anonymous mmap, and MMIO-mapped devices into a single page-backed shape.
 
 **Scope.** Everything above the page substrate (frame allocator, FrameMeta, kernel heap, pmap — see [`PAGE_SUBSTRATE_v1.md`](../01_substrate/PAGE_SUBSTRATE_v1.md)) and below the syscall scripts. Specifically:
 

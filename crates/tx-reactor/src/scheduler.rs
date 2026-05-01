@@ -84,6 +84,11 @@ impl InitialSchedMeta {
             kernel_only: true,
         }
     }
+
+    pub const fn with_affinity(mut self, affinity: u64) -> Self {
+        self.affinity = affinity;
+        self
+    }
 }
 
 pub trait SchedulerPolicy {
@@ -111,6 +116,12 @@ pub struct Phase1QueueDepths {
     pub preempted: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunnablePlacement {
+    pub target_hart: HartId,
+    pub wake_remote: bool,
+}
+
 #[derive(Clone, Debug)]
 struct TaskSchedMeta {
     handle: TaskHandle,
@@ -119,6 +130,7 @@ struct TaskSchedMeta {
     current_slice_ns: u64,
     total_runtime_ns: u64,
     last_hart: Option<HartId>,
+    affinity: u64,
     kernel_only: bool,
     queued: bool,
 }
@@ -168,6 +180,15 @@ impl Phase1Scheduler {
 
     pub fn task_runnable(&mut self, task: TaskId, hint: WakeHint) {
         <Self as SchedulerPolicy>::task_runnable(self, task, hint);
+    }
+
+    pub fn task_runnable_from(
+        &mut self,
+        task: TaskId,
+        hint: WakeHint,
+        current_hart: HartId,
+    ) -> Option<RunnablePlacement> {
+        self.task_runnable_inner(task, hint, current_hart)
     }
 
     pub fn task_submitted(
@@ -255,6 +276,17 @@ impl Phase1Scheduler {
 
     fn meta_for_mut(&mut self, task: TaskId) -> Option<&mut TaskSchedMeta> {
         self.meta.get_mut(task.0).and_then(Option::as_mut)
+    }
+
+    fn home_hart_for_meta(&self, meta: &TaskSchedMeta) -> HartId {
+        let requested = meta
+            .last_hart
+            .unwrap_or_else(|| first_hart_in_mask(meta.affinity));
+        if hart_allowed(meta.affinity, requested) {
+            requested
+        } else {
+            first_hart_in_mask(meta.affinity)
+        }
     }
 
     fn ensure_hart(&mut self, hart: HartId) {
@@ -350,6 +382,44 @@ impl Phase1Scheduler {
             }
         }
     }
+
+    fn task_runnable_inner(
+        &mut self,
+        task: TaskId,
+        _hint: WakeHint,
+        current_hart: HartId,
+    ) -> Option<RunnablePlacement> {
+        let meta = self.meta_for(task)?;
+        let hart = self.home_hart_for_meta(meta);
+        let was_queued = meta.queued;
+        if meta.kernel_only {
+            self.enqueue_kernel(task, hart);
+        } else {
+            match meta.class {
+                SchedClass::Fair => {
+                    if meta.remaining_budget_ns > 0 {
+                        self.enqueue_preempted_front(task, hart);
+                    } else {
+                        self.enqueue_new(task, hart);
+                    }
+                }
+                SchedClass::RtFifo
+                | SchedClass::RtRoundRobin
+                | SchedClass::Deadline
+                | SchedClass::Idle => self.enqueue_new(task, hart),
+            }
+        }
+
+        let queued = self.meta_for(task).map(|meta| meta.queued).unwrap_or(false);
+        if !was_queued && queued {
+            Some(RunnablePlacement {
+                target_hart: hart,
+                wake_remote: hart != current_hart,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 enum QueueKind {
@@ -407,28 +477,8 @@ impl SchedulerPolicy for Phase1Scheduler {
         }
     }
 
-    fn task_runnable(&mut self, task: TaskId, _hint: WakeHint) {
-        let Some(meta) = self.meta_for(task) else {
-            return;
-        };
-        let hart = meta.last_hart.unwrap_or(HartId(0));
-        if meta.kernel_only {
-            self.enqueue_kernel(task, hart);
-        } else {
-            match meta.class {
-                SchedClass::Fair => {
-                    if meta.remaining_budget_ns > 0 {
-                        self.enqueue_preempted_front(task, hart);
-                    } else {
-                        self.enqueue_new(task, hart);
-                    }
-                }
-                SchedClass::RtFifo
-                | SchedClass::RtRoundRobin
-                | SchedClass::Deadline
-                | SchedClass::Idle => self.enqueue_new(task, hart),
-            }
-        }
+    fn task_runnable(&mut self, task: TaskId, hint: WakeHint) {
+        let _ = self.task_runnable_inner(task, hint, HartId(0));
     }
 
     fn task_submitted(&mut self, task: TaskId, handle: TaskHandle, initial_meta: InitialSchedMeta) {
@@ -442,14 +492,16 @@ impl SchedulerPolicy for Phase1Scheduler {
             current_slice_ns: 0,
             total_runtime_ns: 0,
             last_hart: None,
+            affinity: normalize_affinity(initial_meta.affinity),
             kernel_only: initial_meta.kernel_only,
             queued: false,
         });
 
+        let hart = first_hart_in_mask(normalize_affinity(initial_meta.affinity));
         if initial_meta.kernel_only {
-            self.enqueue_kernel(task, HartId(0));
+            self.enqueue_kernel(task, hart);
         } else {
-            self.enqueue_new(task, HartId(0));
+            self.enqueue_new(task, hart);
         }
     }
 
@@ -458,6 +510,22 @@ impl SchedulerPolicy for Phase1Scheduler {
             *slot = None;
         }
     }
+}
+
+fn normalize_affinity(affinity: u64) -> u64 {
+    if affinity == 0 {
+        1
+    } else {
+        affinity
+    }
+}
+
+fn first_hart_in_mask(mask: u64) -> HartId {
+    HartId(normalize_affinity(mask).trailing_zeros() as usize)
+}
+
+fn hart_allowed(mask: u64, hart: HartId) -> bool {
+    hart.0 < u64::BITS as usize && (normalize_affinity(mask) & (1u64 << hart.0)) != 0
 }
 
 impl Default for Phase1Scheduler {

@@ -251,8 +251,8 @@ pub struct CharDeviceBinding {
     pub driver_state: &'static (dyn Any + Send + Sync),
     pub mmio_regions: &'static [MmioRegion],
     pub irqs: &'static [IrqHandle],
-    pub readable_wire: RawQueue,               // const-constructed; see §12.3
-    pub uevent_wire: RawPort,                  // const-constructed
+    pub readable_wire: RawQueue,               // static-backed; see §12.3
+    pub uevent_wire: RawPort,                  // static-backed
 }
 
 pub struct CharDeviceOps {
@@ -476,6 +476,9 @@ pub static UART0_STATE: Ns16550aState = Ns16550aState { mmio_base: 0x1000_0000, 
 pub static VIRTIO_BLK0_STATE: VirtioBlkState = VirtioBlkState { mmio_base: 0x1000_1000, ... };
 // ...
 
+pub static CONSOLE_READABLE_WIRE: StaticRawQueue = StaticRawQueue::new();
+pub static CONSOLE_UEVENT_WIRE: StaticRawPort = StaticRawPort::new();
+
 /// Bindings: one per tier-2 device, referencing driver vtables + per-instance state.
 pub static UART0_BINDING: CharDeviceBinding = CharDeviceBinding {
     devt: DevT::new(MAJ_TTY_S, 0),
@@ -485,8 +488,8 @@ pub static UART0_BINDING: CharDeviceBinding = CharDeviceBinding {
     driver_state: &UART0_STATE,
     mmio_regions: &[MmioRegion { base: 0x1000_0000, len: 0x100 }],
     irqs: &[IrqHandle { plic_num: 10 }],
-    readable_wire: RawQueue::new_const(),
-    uevent_wire: RawPort::new_const(),
+    readable_wire: CONSOLE_READABLE_WIRE.raw(),
+    uevent_wire: CONSOLE_UEVENT_WIRE.raw(),
 };
 
 pub static VIRTIO_BLK0_REGISTRATION: BlockDeviceRegistration = BlockDeviceRegistration { ... };
@@ -761,11 +764,36 @@ Rationale: DEV-1. A companion note in PAGE_BACKED §11.2 mentioning the retained
 
 Replaced with §10.2 above. The "Device" host is now `CharDeviceBinding` (`&'static`); the "DeviceNode" host is resolved into either `CharDeviceBinding` or `BlockDeviceRegistration` depending on class.
 
-### 12.3 `BUS.md` — const constructors
+### 12.3 `BUS.md` — static wire storage
 
 <!-- txdoc:DEVICE-BUS-MD-CONST-CONSTRUCTORS-1 -->
 
-Added requirement: `RawQueue` and `RawPort` must expose `const fn new_const() -> Self` so that wires can be embedded in `static` structs. This is a constraint on the bus implementation; it does not change the bus API surface for firing or subscription. Internal mutability (atomics, `Mutex`, intrusive subscriber-list heads) is required for the wire state, since the enclosing struct is `&'static` and cannot be `&mut`-accessed.
+Added requirement: bus wires used by static device/block tables must be backed
+by const-constructible storage. The current implementation provides
+`StaticRawQueue` and `StaticRawPort` as the storage objects; static
+registrations embed `RawQueue` / `RawPort` handles produced by
+`STATIC_WIRE.raw()` or `RawQueue::from_static(&STATIC_WIRE)` /
+`RawPort::from_static(&STATIC_WIRE)`. This keeps the hot `RawQueue` /
+`RawPort` fire/subscribe API unchanged while avoiding allocation for
+statically declared devices. Internal mutability (atomics, locks, or
+intrusive subscriber-list heads) is required for the wire state, since the
+enclosing struct is `&'static` and cannot be `&mut`-accessed.
+
+Static device and block declarations should use the bus's first declaration
+macro slice (`bus_readiness!` / `bus_lifecycle!`) for typed readiness and
+lifecycle bit sets, then pair those types with `DeclaredQueue<E>` /
+`DeclaredPort<E>` when subsystem-facing validation is needed. Tracepoint
+payload structs can now use `bus_tracepoint!`; trace subscriber/nop-patching
+runtime remains later bus work.
+
+Dynamic zone/device owners that embed bus wires use the bus owner-manifest
+path instead of static storage. The owner type implements `WireOwnerManifest`,
+retires every embedded queue/port under one epoch guard, and calls
+`retire_wire_owner<T>()` so the typed owner reclaim callback is queued through
+EBR only after all embedded wires are terminal-drained. Owners with a simple
+embedded-wire field list can generate the manifest through
+`bus_wire_owner_manifest!`. Concrete device owner manifests remain part of the
+later dynamic device/VFS integration, not the static registration rows above.
 
 ---
 

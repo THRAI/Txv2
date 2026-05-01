@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
 use tx_reactor::{
-    HartId, InitialSchedMeta, Phase1Scheduler, Reactor, RunStats, SliceConfig, StopReason,
-    TaskHandle, TaskId, TaskStatus, WakeHint,
+    HartId, InitialSchedMeta, Phase1Scheduler, Reactor, RescheduleSignal, RunStats, SharedReactor,
+    SliceConfig, StopReason, TaskHandle, TaskId, TaskStatus, WakeDispatchReport, WakeHint,
 };
 
 static PENDING_POLLS: AtomicUsize = AtomicUsize::new(0);
@@ -65,6 +65,17 @@ impl Future for ExternallyWoken {
             *self.waker_slot.lock().expect("waker slot poisoned") = Some(cx.waker().clone());
             Poll::Pending
         }
+    }
+}
+
+#[derive(Default)]
+struct RecordingRescheduleSignal {
+    sent: Vec<HartId>,
+}
+
+impl RescheduleSignal for RecordingRescheduleSignal {
+    fn send_reschedule_ipi(&mut self, target_hart: HartId) {
+        self.sent.push(target_hart);
     }
 }
 
@@ -512,6 +523,189 @@ fn submitted_task_uses_scheduler_backed_runnable_path() {
         }
     );
     assert_eq!(polls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn submitted_task_with_affinity_uses_target_hart_queue() {
+    let mut reactor = Reactor::new();
+    let task =
+        reactor.submit_task_with_meta(async {}, InitialSchedMeta::fair().with_affinity(0b0100));
+
+    assert_eq!(reactor.next_scheduled_task(HartId(0)), None);
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(2))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+}
+
+#[test]
+fn remote_task_wake_dispatches_reschedule_signal() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(AtomicUsize::new(0));
+    let waker_slot = Arc::new(Mutex::new(None));
+
+    let mut reactor = Reactor::new();
+    let task = reactor.submit_task_with_meta(
+        ExternallyWoken {
+            polls: Arc::clone(&polls),
+            ready: Arc::clone(&ready),
+            waker_slot: Arc::clone(&waker_slot),
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0100),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(2)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+
+    ready.store(1, Ordering::SeqCst);
+    waker_slot
+        .lock()
+        .expect("waker slot poisoned")
+        .take()
+        .expect("task waker")
+        .wake();
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let report = reactor.drain_wakes_for_hart(HartId(0), &mut signal);
+
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(2)]);
+    assert!(reactor.dispatch_markers(HartId(2)).need_resched());
+    assert!(reactor.consume_dispatch_markers(HartId(2)).need_resched());
+    assert_eq!(
+        reactor
+            .next_scheduled_task(HartId(2))
+            .map(|(handle, _)| handle.id()),
+        Some(task.id())
+    );
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(2)),
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+}
+
+#[test]
+fn rescheduled_hart_consumes_marker_before_draining_runqueue() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(AtomicUsize::new(0));
+    let waker_slot = Arc::new(Mutex::new(None));
+
+    let mut reactor = Reactor::new();
+    let task = reactor.submit_task_with_meta(
+        ExternallyWoken {
+            polls: Arc::clone(&polls),
+            ready: Arc::clone(&ready),
+            waker_slot: Arc::clone(&waker_slot),
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0100),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(2)).polled, 1);
+    ready.store(1, Ordering::SeqCst);
+    waker_slot
+        .lock()
+        .expect("waker slot poisoned")
+        .take()
+        .expect("task waker")
+        .wake();
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let report = reactor.drain_wakes_for_hart(HartId(0), &mut signal);
+    assert_eq!(report.remote_ipis, 1);
+    assert!(reactor.dispatch_markers(HartId(2)).need_resched());
+
+    let stats = reactor.run_rescheduled_on_hart_with_reschedule(HartId(2), &mut signal);
+
+    assert_eq!(
+        stats,
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Completed));
+    assert!(reactor.consume_dispatch_markers(HartId(2)).is_empty());
+}
+
+#[test]
+fn shared_reactor_serializes_rescheduled_hart_runqueue_drain() {
+    let shared = SharedReactor::empty();
+    assert!(!shared.is_initialized());
+    assert!(shared.init());
+    assert!(shared.is_initialized());
+    assert!(!shared.init());
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(AtomicUsize::new(0));
+    let waker_slot = Arc::new(Mutex::new(None));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let completed_task = Arc::clone(&completed);
+
+    let task = shared
+        .with(|reactor| {
+            let polls = Arc::clone(&polls);
+            let ready = Arc::clone(&ready);
+            let waker_slot = Arc::clone(&waker_slot);
+            reactor.submit_task_with_meta(
+                async move {
+                    ExternallyWoken {
+                        polls,
+                        ready,
+                        waker_slot,
+                    }
+                    .await;
+                    completed_task.store(1, Ordering::SeqCst);
+                },
+                InitialSchedMeta::kernel().with_affinity(0b0100),
+            )
+        })
+        .expect("shared reactor initialized");
+
+    let first = shared
+        .with(|reactor| reactor.run_until_idle_on_hart(HartId(2)))
+        .expect("shared reactor initialized");
+    assert_eq!(first.polled, 1);
+
+    ready.store(1, Ordering::SeqCst);
+    waker_slot
+        .lock()
+        .expect("waker slot poisoned")
+        .take()
+        .expect("task waker")
+        .wake();
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let report = shared
+        .with(|reactor| reactor.drain_wakes_for_hart(HartId(0), &mut signal))
+        .expect("shared reactor initialized");
+    assert_eq!(report.remote_ipis, 1);
+    assert_eq!(signal.sent, vec![HartId(2)]);
+
+    let stats = shared
+        .with(|reactor| reactor.run_rescheduled_on_hart_with_reschedule(HartId(2), &mut signal))
+        .expect("shared reactor initialized");
+
+    assert_eq!(stats.polled, 1);
+    assert_eq!(stats.completed, 1);
+    assert_eq!(
+        shared
+            .with(|reactor| reactor.task_key_status(task))
+            .expect("shared reactor initialized"),
+        Some(TaskStatus::Completed)
+    );
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
 }
 
 #[test]

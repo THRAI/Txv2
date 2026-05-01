@@ -1,4 +1,7 @@
-use std::{cell::Cell, num::NonZeroU32, rc::Rc};
+use std::{
+    num::NonZeroU32,
+    sync::{Arc, Mutex},
+};
 
 use tx_reactor::{
     completion::{Completion, CountdownCompletion},
@@ -8,6 +11,14 @@ use tx_reactor::{
 
 fn nz(count: u32) -> NonZeroU32 {
     NonZeroU32::new(count).expect("test count must be nonzero")
+}
+
+fn record(outcome: &Arc<Mutex<Option<WaitOutcome>>>, value: WaitOutcome) {
+    *outcome.lock().expect("outcome lock poisoned") = Some(value);
+}
+
+fn recorded(outcome: &Arc<Mutex<Option<WaitOutcome>>>) -> Option<WaitOutcome> {
+    *outcome.lock().expect("outcome lock poisoned")
 }
 
 #[test]
@@ -29,17 +40,20 @@ fn counted_completion_consumes_available_credits_once() {
 
 #[test]
 fn counted_wait_consumes_preexisting_credit() {
-    let completion = Rc::new(Completion::new());
-    let outcome = Rc::new(Cell::new(None));
+    let completion = Arc::new(Completion::new());
+    let outcome = Arc::new(Mutex::new(None));
 
     completion.complete();
 
     let mut reactor = Reactor::new();
     let task = {
-        let completion = Rc::clone(&completion);
-        let outcome = Rc::clone(&outcome);
+        let completion = Arc::clone(&completion);
+        let outcome = Arc::clone(&outcome);
         reactor.submit(async move {
-            outcome.set(Some(completion.wait(WaitProtocol::Uninterruptible).await));
+            record(
+                &outcome,
+                completion.wait(WaitProtocol::Uninterruptible).await,
+            );
         })
     };
 
@@ -50,30 +64,36 @@ fn counted_wait_consumes_preexisting_credit() {
             completed: 1
         }
     );
-    assert_eq!(outcome.get(), Some(WaitOutcome::Ready));
+    assert_eq!(recorded(&outcome), Some(WaitOutcome::Ready));
     assert_eq!(reactor.task_status(task), Some(TaskStatus::Completed));
     assert!(!completion.try_consume());
 }
 
 #[test]
 fn counted_completion_wake_is_rechecked_and_consumed_by_one_waiter() {
-    let completion = Rc::new(Completion::new());
-    let first_outcome = Rc::new(Cell::new(None));
-    let second_outcome = Rc::new(Cell::new(None));
+    let completion = Arc::new(Completion::new());
+    let first_outcome = Arc::new(Mutex::new(None));
+    let second_outcome = Arc::new(Mutex::new(None));
     let mut reactor = Reactor::new();
 
     let first = {
-        let completion = Rc::clone(&completion);
-        let first_outcome = Rc::clone(&first_outcome);
+        let completion = Arc::clone(&completion);
+        let first_outcome = Arc::clone(&first_outcome);
         reactor.submit(async move {
-            first_outcome.set(Some(completion.wait(WaitProtocol::Interruptible).await));
+            record(
+                &first_outcome,
+                completion.wait(WaitProtocol::Interruptible).await,
+            );
         })
     };
     let second = {
-        let completion = Rc::clone(&completion);
-        let second_outcome = Rc::clone(&second_outcome);
+        let completion = Arc::clone(&completion);
+        let second_outcome = Arc::clone(&second_outcome);
         reactor.submit(async move {
-            second_outcome.set(Some(completion.wait(WaitProtocol::Interruptible).await));
+            record(
+                &second_outcome,
+                completion.wait(WaitProtocol::Interruptible).await,
+            );
         })
     };
 
@@ -95,8 +115,8 @@ fn counted_completion_wake_is_rechecked_and_consumed_by_one_waiter() {
             completed: 1
         }
     );
-    let ready_count = usize::from(first_outcome.get() == Some(WaitOutcome::Ready))
-        + usize::from(second_outcome.get() == Some(WaitOutcome::Ready));
+    let ready_count = usize::from(recorded(&first_outcome) == Some(WaitOutcome::Ready))
+        + usize::from(recorded(&second_outcome) == Some(WaitOutcome::Ready));
     assert_eq!(ready_count, 1);
     assert!(!completion.try_consume());
 
@@ -108,8 +128,8 @@ fn counted_completion_wake_is_rechecked_and_consumed_by_one_waiter() {
             completed: 1
         }
     );
-    assert_eq!(first_outcome.get(), Some(WaitOutcome::Ready));
-    assert_eq!(second_outcome.get(), Some(WaitOutcome::Ready));
+    assert_eq!(recorded(&first_outcome), Some(WaitOutcome::Ready));
+    assert_eq!(recorded(&second_outcome), Some(WaitOutcome::Ready));
     assert_eq!(reactor.task_status(first), Some(TaskStatus::Completed));
     assert_eq!(reactor.task_status(second), Some(TaskStatus::Completed));
 }
@@ -117,19 +137,20 @@ fn counted_completion_wake_is_rechecked_and_consumed_by_one_waiter() {
 #[test]
 fn counted_completion_wait_propagates_timeout() {
     let mut reactor = Reactor::new();
-    let completion = Rc::new(Completion::with_channel(reactor.channel()));
-    let outcome = Rc::new(Cell::new(None));
+    let completion = Arc::new(Completion::with_channel(reactor.channel()));
+    let outcome = Arc::new(Mutex::new(None));
     let deadline_ns = 10;
 
     let task = {
-        let completion = Rc::clone(&completion);
-        let outcome = Rc::clone(&outcome);
+        let completion = Arc::clone(&completion);
+        let outcome = Arc::clone(&outcome);
         reactor.submit(async move {
-            outcome.set(Some(
+            record(
+                &outcome,
                 completion
                     .wait(WaitProtocol::InterruptibleTimeout(deadline_ns))
                     .await,
-            ));
+            );
         })
     };
 
@@ -140,7 +161,7 @@ fn counted_completion_wait_propagates_timeout() {
             completed: 0
         }
     );
-    assert_eq!(outcome.get(), None);
+    assert_eq!(recorded(&outcome), None);
     assert_eq!(reactor.task_status(task), Some(TaskStatus::Parked));
 
     assert_eq!(reactor.advance_time_to(deadline_ns), 1);
@@ -151,22 +172,22 @@ fn counted_completion_wait_propagates_timeout() {
             completed: 1
         }
     );
-    assert_eq!(outcome.get(), Some(WaitOutcome::TimedOut));
+    assert_eq!(recorded(&outcome), Some(WaitOutcome::TimedOut));
     assert_eq!(reactor.task_status(task), Some(TaskStatus::Completed));
     assert!(!completion.try_consume());
 }
 
 #[test]
 fn countdown_completion_waits_until_final_arrival() {
-    let countdown = Rc::new(CountdownCompletion::new(nz(2)));
-    let outcome = Rc::new(Cell::new(None));
+    let countdown = Arc::new(CountdownCompletion::new(nz(2)));
+    let outcome = Arc::new(Mutex::new(None));
     let mut reactor = Reactor::new();
 
     let task = {
-        let countdown = Rc::clone(&countdown);
-        let outcome = Rc::clone(&outcome);
+        let countdown = Arc::clone(&countdown);
+        let outcome = Arc::clone(&outcome);
         reactor.submit(async move {
-            outcome.set(Some(countdown.wait(WaitProtocol::Killable).await));
+            record(&outcome, countdown.wait(WaitProtocol::Killable).await);
         })
     };
 
@@ -189,7 +210,7 @@ fn countdown_completion_waits_until_final_arrival() {
             completed: 0
         }
     );
-    assert_eq!(outcome.get(), None);
+    assert_eq!(recorded(&outcome), None);
 
     countdown.arrive();
     assert!(countdown.is_complete());
@@ -200,7 +221,7 @@ fn countdown_completion_waits_until_final_arrival() {
             completed: 1
         }
     );
-    assert_eq!(outcome.get(), Some(WaitOutcome::Ready));
+    assert_eq!(recorded(&outcome), Some(WaitOutcome::Ready));
     assert_eq!(reactor.task_status(task), Some(TaskStatus::Completed));
 }
 

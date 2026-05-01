@@ -66,9 +66,14 @@ The next pass should dispatch four isolated reactor lanes:
   wiring. That is not isolated enough yet.
 - **CoreInit reactor loop wiring** waits for the active init lease to clear.
 - **bus hardening** waits for the substrate lease to clear. `RawQueue` /
-  `RawPort` still need typed declarations, SMP-safe subscriber storage, epoch
-  destruction, and epoll-style long-lived subscriptions, but those are
-  substrate work rather than the next reactor-mechanism pass.
+  `RawPort` have since gained typed declarations, SMP-safe subscriber storage,
+  epoch destruction, static backing, and a bounded `SubscriptionGraph<N>` owner
+  for long-lived raw subscriptions. Follow-up work also added
+  `WireOwnerRetireFence` for EBR-delayed owner-storage reclaim. Remaining bus
+  hardening is concrete VFS/device owner implementations plus target-fd
+  reverse-index teardown, global epoll table integration, and spill/fanout
+  policy, but that is substrate/runtime work rather than the next
+  reactor-mechanism pass.
 - **full POSIX signal delivery** waits on thread-runtime/process entities. The
   next wait-interrupt lane should stop at the predicate and classification
   seam.

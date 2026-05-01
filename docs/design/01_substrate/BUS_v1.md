@@ -187,6 +187,63 @@ A declaration establishes the wire's *type*; each capability instance carries it
 
 The instance lives inside the capability's structure; its lifetime follows the capability's. Reclamation of the capability (per object_model §6) finalizes the wire instance after its subscribers have released.
 
+### 3.6 Current implementation checkpoint
+<!-- txdoc:BUS-WIRE-DECLARATIONS-STATIC-LAYER-CURRENT-IMPLEMENTATION-CHECKPOINT-1 -->
+
+The first Rust static-layer slice exposes typed declarations as wrappers over
+the raw temporal carriers:
+
+- `WireEventSet` names the declared event/readiness bit set for one wire type.
+- `bus_event_set!`, `bus_readiness!`, and `bus_lifecycle!` generate first-slice
+  `WireEventSet` bit newtypes with a declared-bit union, `from_bits`, `bits`,
+  `contains`, and bitwise composition. Subsystem examples can use these helpers
+  instead of hand-writing boilerplate bit-set wrappers.
+- `WireDeclaration<E>` records the wire name, carrier kind, and declared bit
+  set.
+- `DeclaredQueue<E>` and `DeclaredPort<E>` wrap `RawQueue` and `RawPort`,
+  validate fired bits and subscription interests against the declaration, and
+  preserve the raw terminal/unsubscribed behavior.
+- `WireRetirement` records the epoch guard, CPU, terminal bits, and wake count
+  for a queue/port destruction handshake.
+- `StaticRawQueue` and `StaticRawPort` are const-constructible backing storage
+  for device/block tables; `raw()` and `RawQueue::from_static` /
+  `RawPort::from_static` produce cloneable handles to that static storage.
+- `DeclaredQueue<E>::from_static` and `DeclaredPort<E>::from_static` combine
+  static backing storage with typed declaration validation.
+- `SubscriptionGraph<N>` is a bounded long-lived subscription owner for raw
+  queue/port carriers. It stores queue/port subscription tokens, returns
+  generation-checked keys, and supports update, remove, kind/state inspection,
+  readiness consumption, bounded ready/terminal scans through
+  `SubscriptionGraphReady`, and explicit graph clear teardown for epoll-style
+  consumers.
+- `DeclaredSubscriptionGraphKey<E>` and the declared graph helpers subscribe,
+  update, inspect, remove, and consume readiness through `DeclaredQueue<E>` /
+  `DeclaredPort<E>`, validating interests against the declared event set
+  before delegating to the raw graph.
+- `TracePayload`, `TraceDeclaration<P>`, `RawTrace<P>`, and
+  `bus_tracepoint!` provide the first typed tracepoint payload surface.
+  `emit(payload)` is currently a no-op when no trace runtime is attached, but
+  call sites keep the payload type and trace declaration name.
+- `WireOwnerRetireFence` bridges wire-level retire records to owner-level EBR.
+  It proves all embedded wires for one owner were terminal-drained under the
+  same guard before the caller queues the containing storage for
+  epoch-delayed reclaim.
+- `WireOwnerManifest` and `retire_wire_owner<T>()` provide the typed owner hook
+  over that fence: the owner type supplies the complete embedded-wire retire
+  sequence and typed reclaim callback, avoiding erased reclaim callbacks at
+  semantic call sites. `bus_wire_owner_manifest!` generates the repetitive
+  manifest implementation for owners whose embedded wires can be described as
+  simple field retire calls.
+
+The raw `u64` APIs remain available for substrate-internal compatibility and
+raw reactor internals. New subsystem-facing code should prefer the declared
+wrappers. The current declaration macros cover typed queue/port bit-set
+wrappers, typed tracepoint payload structs, and simple owner-manifest
+boilerplate; full trace subscriber registration, nop-patching, target-fd
+reverse-index teardown, global epoll table integration, spill/fanout policy,
+and concrete zone/device owner implementations remain later implementation
+slices.
+
 ---
 
 ## 4. Subscription (static layer)
@@ -215,6 +272,18 @@ Interest values are type-checked against the wire's declaration. For RawQueue, `
 The aggregate of all active subscriptions across all wires is the subscription graph. Each wire holds its local subscriber list (typically as inline storage for small counts plus spill-to-heap for larger); each subscription references its wire.
 
 The graph is modified only through `subscribe`/`unsubscribe` calls. Hot-path code (step publish, wake delivery) reads the graph but does not modify it.
+
+Current Rust code exposes a bounded `SubscriptionGraph<N>` checkpoint for
+long-lived queue/port subscriptions. It owns the returned subscription tokens
+so consumers such as epoll can keep registrations alive across waits, uses
+generation-checked handles to reject stale removals/updates after slot reuse,
+delegates actual wake delivery to the existing raw carrier storage, and exposes
+declared helper methods over `DeclaredQueue<E>` / `DeclaredPort<E>` so
+subsystem-facing graph users do not erase typed interests to raw masks. It also
+has a bounded `collect_ready(&mut [SubscriptionGraphReady])` scan for
+ready/terminal entries and `clear()` for explicit epoll-fd close teardown. This
+is not the final global epoll table yet: target-fd reverse indexes, spill
+storage, fanout policy, and fd/owner integration remain separate slices.
 
 ### 4.3 Subscription lifecycle
 <!-- txdoc:BUS-SUBSCRIPTION-STATIC-LAYER-SUBSCRIPTION-LIFECYCLE-1 -->
@@ -308,6 +377,12 @@ When no tracepoint subscribers exist (the common case), `emit` is nop-patched at
 
 No wake delivery; no state. Tracepoints are purely passive.
 
+Current Rust code exposes the typed tracepoint payload shape as
+`TracePayload`, `TraceDeclaration<P>`, `RawTrace<P>`, and `bus_tracepoint!`.
+`RawTrace<P>::emit(payload)` is intentionally no-op until the trace runtime and
+nop-patching layer exists; it exists now so subsystem code can declare and call
+typed tracepoints without inventing a parallel raw API.
+
 ### 5.4 Ordering guarantees (SIG-4, SIG-5)
 <!-- txdoc:BUS-FIRING-TEMPORAL-LAYER-ORDERING-GUARANTEES-SIG-4-SIG-5-1 -->
 
@@ -361,6 +436,23 @@ When a capability is reclaimed while subscribers remain registered:
 On the subscriber side, a wake that arrives with a terminal notification is observable per the wire's declaration: a RawQueue subscriber sees POLLHUP and adjusts its behavior (a waiting reader returns EOF or broken-pipe); a RawPort subscriber sees the Gone event or observes its subscription become invalid.
 
 This handshake closes the reclamation race: the wire is not reclaimed until its subscription list is drained, which happens after all subscribers have been woken with the terminal signal.
+
+The current Rust checkpoint exposes this as `retire(..., &epoch::Guard)` and
+`retire_silently(&epoch::Guard)` on `RawQueue`, `RawPort`, `DeclaredQueue<E>`,
+and `DeclaredPort<E>`. These calls require the caller to hold an epoch guard,
+terminate the wire, drain subscribers, and return a `WireRetirement` record
+that captures the guard epoch and CPU used for the handshake. The current
+backing storage is still `Arc`-owned raw wire state; embedding wires directly
+in zone/device owner storage additionally uses `WireOwnerRetireFence`: the
+owner retires every embedded wire under one guard, combines the returned
+`WireRetirement` records, then calls the fence's unsafe owner-storage retire
+hook to enqueue the containing storage through EBR. The unsafe boundary belongs
+to the owner because only the owner knows which wire set is complete and which
+typed reclaim callback returns its storage. The current typed hook is
+`WireOwnerManifest` plus `retire_wire_owner<T>()`: callers pass a typed owner
+pointer and guard, the manifest retires all embedded wires, and the helper
+enqueues storage with the owner type's reclaim callback. Concrete VFS/device
+owner manifests remain later subsystem work.
 
 ### 6.3 Wake delivery is best-effort
 <!-- txdoc:BUS-WAKE-DELIVERY-TEMPORAL-LAYER-WAKE-DELIVERY-IS-BEST-EFFORT-1 -->
@@ -427,6 +519,14 @@ This framing matches CONCEPTS's one-liner: "Signals make waiting efficient." The
 
 The wait primitive realizes the subscriber-side obligations SIG-9 (wake does not grant truth; re-observe before acting) and SIG-10 (bus state is not truth; only predicate evaluation under a fresh guard is). Its structure — park on wake, re-invoke condition on resumption — is exactly what these invariants require. Subscribers that bypass the wait primitive (consuming wake notifications directly) must implement equivalent re-observation discipline; SIG-9 and SIG-10 are not optional.
 
+Current Rust reactor code exposes this discipline through the raw
+`tx_reactor::wait::Channel` / `Mask` compatibility path and through
+`DeclaredChannel<E>` for typed declared-port waits over `DeclaredPort<E>` plus
+`DeclaredReadinessChannel<E>` for typed readiness waits over `DeclaredQueue<E>`.
+Subsystem-facing waits should prefer declared channels so the interest type
+remains tied to the bus declaration. Concrete subsystem migrations and fd/epoll
+graph policy remain later slices.
+
 ### 7.2 The step's Blocked outcome as wait-primitive input
 <!-- txdoc:BUS-INTEGRATION-WITH-THE-WAIT-PRIMITIVE-THE-STEPS-BLOCKED-OUTCOME-AS-WAIT-PRIMITIVE-INPUT-1 -->
 
@@ -467,6 +567,31 @@ bus/
 ```
 
 Clients of the bus (subsystems, wait primitive, epoll) import from `bus::` top-level paths. The internal static/temporal distinction is implementation structure, not API.
+
+Current Rust code is split as a smaller implementation checkpoint under
+`crates/tx-substrate/src/bus/`:
+
+- `mod.rs` is the public facade.
+- `common.rs` owns shared declaration types, errors, raw storage selection,
+  spin locking, and `WireRetirement`.
+- `queue.rs` owns `RawQueue`, `StaticRawQueue`, `DeclaredQueue<E>`, and their
+  subscriptions.
+- `port.rs` owns `RawPort`, `StaticRawPort`, `DeclaredPort<E>`, and their
+  subscriptions.
+- `graph.rs` owns the bounded `SubscriptionGraph<N>` long-lived subscription
+  owner, generation-checked keys, ready/terminal scan records, and explicit
+  graph teardown.
+- `owner.rs` owns the `WireOwnerRetireFence` bridge from wire terminal/drain
+  records to owner-storage EBR retirement plus the `WireOwnerManifest` typed
+  owner hook.
+- `trace.rs` owns `TracePayload`, `TraceDeclaration<P>`, and `RawTrace<P>`.
+- `macros.rs` owns the first declaration macros that generate typed
+  `WireEventSet` bit newtypes for declared queues/ports and typed tracepoint
+  payload structs, plus simple `WireOwnerManifest` implementations.
+
+This split is behavior-preserving and keeps authored Rust files below the
+repo's source-size lint while the final static/temporal subdirectory shape is
+still growing.
 
 ---
 
@@ -521,7 +646,7 @@ For readers familiar with earlier iterations:
 
 - **v12's `Pollable` trait** is retired. Its role (introspection of what a capability publishes) is now the static bus's wire-declaration query. A capability's static declaration is accessible via its type; no runtime trait dispatch is needed.
 - **v12's WakerGuard-threading** through subsystem step functions is retired. The WakerGuard is internal to the wait primitive; subsystems return `Blocked` outcomes naming the carrier abstractly; the wait primitive handles subscribe/unsubscribe.
-- **v11's bus-as-one-layer** is retired. The static/temporal split is new in v3; it disentangles compile-time declaration from runtime fire-and-wake, making invariants easier to state and enforce.
+- **The retired bus-as-one-layer model** is gone. The static/temporal split is new in v3; it disentangles compile-time declaration from runtime fire-and-wake, making invariants easier to state and enforce.
 
 ---
 

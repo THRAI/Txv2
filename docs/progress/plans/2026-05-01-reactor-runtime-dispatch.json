@@ -1,0 +1,226 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-05-01-reactor-runtime-dispatch",
+  "title": "Reactor Runtime Production Dispatch",
+  "status": "complete",
+  "created": "2026-05-01",
+  "updated": "2026-05-01",
+  "owner": "codex",
+  "summary": "Freeze the reactor-owned runtime seams and dispatch isolated workers for userspace-run shell, per-hart runtime loop, CoreInit timer/trap integration scouting, and AST return-to-user hook scouting.",
+  "scope": {
+    "in": [
+      "crates/tx-reactor/src",
+      "crates/tx-reactor/tests",
+      "crates/tx-kernel/src/init.rs",
+      "docs/design/02_execution/REACTOR_v0.md",
+      "docs/progress/STATUS.md",
+      "docs/progress/research"
+    ],
+    "out": [
+      "vm-address-space-implementation",
+      "threadruntime-entities-and-posix-signal-routing",
+      "real-return-to-userspace-trap-frame-restore",
+      "vfs-device-fs-block-owner-implementation",
+      "fd-epoll-policy"
+    ],
+    "write_sets": [
+      {
+        "owner": "coordinator",
+        "paths": [
+          "crates/tx-reactor/src/runtime.rs",
+          "crates/tx-reactor/src/task.rs",
+          "crates/tx-reactor/src/lib.rs",
+          "docs/progress/plans/2026-05-01-reactor-runtime-dispatch.json",
+          "docs/progress/STATUS.md",
+          "docs/progress/research/2026-05-01-reactor-runtime-dispatch-audit.md"
+        ],
+        "notes": "Owns shared reactor facade/task-table edits, seam decisions, progress catch-up, final audit, and integration."
+      },
+      {
+        "owner": "worker-userspace-run-shell",
+        "paths": [
+          "crates/tx-reactor/src/userspace.rs",
+          "crates/tx-reactor/tests/userspace_run.rs"
+        ],
+        "notes": "Own the reactor-local userspace-run request/result shell. Do not edit runtime.rs/task.rs/lib.rs; report any needed facade hooks to the coordinator."
+      },
+      {
+        "owner": "worker-per-hart-loop",
+        "paths": [
+          "crates/tx-reactor/src/hart_loop.rs",
+          "crates/tx-reactor/tests/hart_loop.rs"
+        ],
+        "notes": "Own the platform-independent per-hart loop result/step API over existing scheduler, timer, and dispatch state. Do not edit runtime.rs/lib.rs; report any needed facade hooks to the coordinator."
+      },
+      {
+        "owner": "worker-coreinit-runtime-scout",
+        "paths": [
+          "docs/progress/research/2026-05-01-coreinit-runtime-loop-scout.md"
+        ],
+        "notes": "Read-only scout for CoreInit/HAL timer/trap integration. No code edits in the first pass."
+      },
+      {
+        "owner": "worker-ast-return-scout",
+        "paths": [
+          "docs/progress/research/2026-05-01-ast-return-to-user-scout.md"
+        ],
+        "notes": "Read-only scout for AST return-to-user hook shape across reactor, trap, ThreadRuntime, and signal policy."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/02_execution/REACTOR_v0.md",
+      "docs/design/02_execution/SCHEDULER_v0.md",
+      "docs/design/01_substrate/HAL_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/STATUS.md",
+      "docs/progress/plans/2026-04-30-reactor-parallel-shards.json",
+      "docs/progress/plans/2026-04-30-reactor-third-wave-dispatch.json",
+      "docs/progress/research/2026-04-30-reactor-readiness-for-subsystems.md",
+      "docs/progress/research/2026-04-30-reactor-third-wave-audit.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "serial-seam-freeze",
+      "title": "Freeze dispatch seam and worker write scopes",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/progress/plans/2026-05-01-reactor-runtime-dispatch.json"
+      ],
+      "verification": [
+        "cargo xtask progress validate"
+      ],
+      "notes": "Serial prework defines the split: userspace-run and per-hart loop are implementation shards; CoreInit runtime loop and AST return-to-user are scout-only until trap/thread-runtime ownership is ready."
+    },
+    {
+      "id": "userspace-run-shell",
+      "title": "Implement reactor-local userspace-run shell",
+      "status": "complete",
+      "depends_on": [
+        "serial-seam-freeze"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/userspace.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/src/task.rs",
+        "crates/tx-reactor/src/lib.rs",
+        "crates/tx-reactor/tests/userspace_run.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test userspace_run",
+        "cargo test -p tx-reactor"
+      ],
+      "notes": "Added a host-testable UserspaceRunSlot/UserspaceRunWait shell that resolves only on interesting traps; timer preemption records reactor-internal state without completing the wait. Coordinator kept full Reactor::request_userspace_run facade and ThreadRuntime/trap integration out of this pass."
+    },
+    {
+      "id": "per-hart-loop-shell",
+      "title": "Implement platform-independent per-hart loop step API",
+      "status": "complete",
+      "depends_on": [
+        "serial-seam-freeze"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/hart_loop.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/src/lib.rs",
+        "crates/tx-reactor/tests/hart_loop.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test hart_loop",
+        "cargo test -p tx-reactor"
+      ],
+      "notes": "Added tx_reactor::hart_loop with a bounded per-hart step API over timer advancement, wake dispatch, preemption markers, ready polling, and deadline reporting. WFI, timer programming, IPI ack/send, and trap mechanics remain outside tx-reactor."
+    },
+    {
+      "id": "coreinit-runtime-scout",
+      "title": "Scout CoreInit timer/trap runtime integration",
+      "status": "complete",
+      "depends_on": [
+        "serial-seam-freeze"
+      ],
+      "paths": [
+        "docs/progress/research/2026-05-01-coreinit-runtime-loop-scout.md"
+      ],
+      "verification": [
+        "cargo xtask progress validate"
+      ],
+      "notes": "Scout recommends the next CoreInit<P> adapter over tx_reactor::hart_loop, binding TimeIf/SmpIf trap mechanics outside tx-reactor while preserving the current boot smoke contract."
+    },
+    {
+      "id": "ast-return-to-user-scout",
+      "title": "Scout AST return-to-user hook",
+      "status": "complete",
+      "depends_on": [
+        "serial-seam-freeze"
+      ],
+      "paths": [
+        "docs/progress/research/2026-05-01-ast-return-to-user-scout.md"
+      ],
+      "verification": [
+        "cargo xtask progress validate"
+      ],
+      "notes": "Scout defines a policy-neutral userspace-entry AST checkpoint and leaves signal selection, ThreadPayload mutation, VM fault policy, and return_to_userspace with adjacent owners."
+    },
+    {
+      "id": "coordinator-audit",
+      "title": "Audit, integrate, and catch up progress",
+      "status": "complete",
+      "depends_on": [
+        "userspace-run-shell",
+        "per-hart-loop-shell",
+        "coreinit-runtime-scout",
+        "ast-return-to-user-scout"
+      ],
+      "paths": [
+        "docs/progress/STATUS.md",
+        "docs/progress/research/2026-05-01-reactor-runtime-dispatch-audit.md"
+      ],
+      "verification": [
+        "cargo fmt --check",
+        "cargo test -p tx-reactor",
+        "cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf",
+        "cargo xtask progress validate",
+        "cargo xtask lint docs",
+        "cargo xtask ci",
+        "git diff --check"
+      ],
+      "notes": "Coordinator accepted the two implementation shells, kept the two high-coupling runtime pieces as scouts, updated design/progress wording, and passed the final validation gates."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed after plan creation and after coordinator catch-up."
+    },
+    {
+      "command": "cargo test -p tx-reactor",
+      "status": "passed",
+      "notes": "Passed after userspace-run and per-hart loop shards landed."
+    },
+    {
+      "command": "cargo xtask ci",
+      "status": "passed",
+      "notes": "Final coordinator gate passed after implementation and progress catch-up."
+    }
+  ],
+  "risks": [
+    "userspace-run crosses trap-frame return, ThreadRuntime payloads, VM, and AST policy; the first shard must stop at a reactor-local shell.",
+    "per-hart loop and userspace-run both need runtime.rs exports, so coordinator must audit overlap before integration.",
+    "CoreInit integration should remain scout-only until the reactor loop step API exists.",
+    "AST return-to-user cannot be fully implemented until ThreadRuntime and signal policy define the consumer."
+  ],
+  "blockers": [
+    "Real return_to_userspace and saved-register trap-frame restore are still pending in the trap shell.",
+    "ThreadRuntime entities and signal delivery policy are not implemented."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

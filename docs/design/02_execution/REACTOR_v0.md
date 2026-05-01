@@ -120,6 +120,14 @@ Semantic code does not touch scheduling internals. The ways a task enters the re
 
 Submission is the reactor's concern. Other code hands a future (or an authored coroutine) to the reactor; the reactor decides when that future is polled.
 
+For the SMP-capable kernel runtime, submitted futures must be `Send + 'static`.
+That does not relax witness discipline: guard-scoped witnesses remain
+non-`Send`, non-`'static`, and cannot be captured across `.await`. The future
+may carry retained authority such as `Cap<T>` and other role-shaped handles, but
+not observation evidence tied to a step guard. A future that cannot satisfy
+`Send` is a local-executor-only shape, not the production cross-hart reactor
+contract.
+
 ### Polling
 <!-- txdoc:REACTOR-POLLING -->
 
@@ -260,6 +268,12 @@ AST belongs to the reactor because only the reactor observes the "between two po
 Some operations require a synchronous rendezvous across CPUs — the canonical case is TLB shootdown, where the initiating CPU must block until remote CPUs have acknowledged invalidation. Per EXC-2, cross-core barriers are **not signals**; they are synchronous coordination events.
 
 The reactor provides a synchronous coordination primitive for these cases. Its exact shape (issuing, awaiting completion, completion reporting) is implementation-layer detail. The contract point is that such coordination is reactor-owned, not bus-owned, not subsystem-owned.
+
+The reactor also owns cross-hart runqueue materialization. A reschedule IPI is
+only a notification mechanism: the receiving hart consumes reactor-owned
+`need_resched` state and drains its selected runqueue through the reactor. An
+implementation may serialize a first shared reactor behind a lock or later shard
+state per hart, but it must not let HAL or the bus own scheduler policy.
 
 ---
 
@@ -408,7 +422,7 @@ pub struct Waker(/* opaque */);
 /// Minimal reactor surface.
 pub trait Reactor {
     /// Submit a new task carrying an author-supplied future.
-    fn submit(&self, task: TaskHandle);
+    fn submit(&self, task: impl Future<Output = ()> + Send + 'static) -> TaskHandle;
 
     /// Wait for a condition on a channel, under a script-chosen protocol.
     /// Invoked by scripts on Blocked* step outcomes; never by steps directly.
@@ -437,6 +451,45 @@ pub trait Reactor {
     // but are named as carve-outs, not specified in v0.
 }
 ```
+
+The current Rust checkpoint keeps `Channel` / `Mask` as the raw compatibility
+path for reactor-owned completion and sync-coordinate internals, and adds
+`DeclaredChannel<E>` for subsystem-facing port-shaped waits over
+`DeclaredPort<E>` plus `DeclaredReadinessChannel<E>` for readiness waits over
+`DeclaredQueue<E>`. Both declared channels preserve the `wait_event(...,
+condition)` contract while carrying the bus declaration's event/readiness type
+through subscription and wake registration. Typed graph helpers, concrete
+subsystem migrations, and fd/epoll policy remain later implementation layers.
+
+The checkpoint also has two platform-independent runtime-dispatch shells:
+`tx_reactor::userspace` models a single in-flight userspace-run wait that only
+resolves on an interesting trap, while timer preemption stays reactor-internal;
+`tx_reactor::hart_loop` models one bounded per-hart reactor step and reports
+work, timer wakes, consumed reschedule markers, next deadline, and whether the
+outer runtime should idle. `Reactor::request_userspace_run` now exposes the
+current single-slot userspace-run shell through the main reactor facade, and
+the reactor provides driver methods for dispatch, timer preemption, interesting
+trap completion, and status. The userspace shell also exposes a policy-neutral
+`checkpoint_userspace_entry` helper, and `Reactor` has the task-keyed
+`checkpoint_task_userspace_entry` adapter over real task AST storage: it
+validates the active userspace-run request, drains the task-local AST batch
+before entry, and applies only one of three reactor-visible continuations:
+enter userspace, preserve the task for re-poll, or resolve the wait with a
+caller-supplied interesting trap. These are not signal selection, VM fault
+policy, trap-frame restore, `ThreadRuntime` integration, multi-thread
+userspace-run state, or the permanent production idle loop.
+
+`tx_kernel::CoreInit` now has a bounded boot-reactor adapter over the hart-loop
+step for AP wake-loop progress and the BSP smoke path; the permanent runtime
+loop remains a later boot-policy change. RV64 QEMU also has a bounded
+timer-idle smoke over this adapter: the platform timer wakes from WFI, the trap
+vector returns to kernel code, and the next hart-loop step resolves the reactor
+timeout. The timer/IPI path now goes through a first saved-register
+`KernelTrapSink` dispatch spine, and RV64 trap-frame writeback can now rewrite
+saved PC/SP/syscall return/TLS state before trap return. The permanent
+scheduler tick policy, external IRQ/device dispatch, ThreadRuntime
+userspace-run integration, VM/signal policy, and complete userspace return path
+are still later work.
 
 These shapes are contract-level. A particular implementation may split `wait` into separate services per protocol, may inline `TaskHandle` / `TaskId`, may expose `wake_task` only through `Waker`, and so on. What it may not do is add semantic concerns to these types (no subsystem-owned state on `Task`, no policy on `WaitOutcome`).
 
