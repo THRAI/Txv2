@@ -1,9 +1,15 @@
 # txKernel Status
 
-**Updated:** 2026-04-30
+**Updated:** 2026-05-01
 
 ## Current Shape
 
+- 2026-05-01 checkpoint: the current dirty workspace has been intentionally
+  consolidated into a clean-start checkpoint covering reactor/bus/trap/SMP,
+  progress memory, and docs alignment changes. Verification for the catch-up:
+  `cargo xtask progress validate`. Next step: resume bounded subsystem fanout
+  from isolated worktrees or a rendezvous commit; blocker at checkpoint time:
+  overlapping uncommitted edits across multiple lanes.
 - Rust workspace skeleton exists with `cargo xtask` as the developer command
   surface.
 - QEMU RV64, LA64, and RV64 M1 Dock mock target wiring exists as compile-first
@@ -21,10 +27,12 @@
 - `xtask` is split by command family under `xtask/src/`, with a local module
   map in `xtask/README.md`.
 - `cargo xtask fault-decode` now exists as a host-side RV64 trap/address
-  decoder. It parses `scause`/`sepc`/`stval` logs, detects low-linked versus
-  high-VMA ELF layouts, classifies direct-map and firmware-gap addresses,
-  symbolizes through Rust-native ELF/DWARF readers, and conservatively reports
-  data code-pointer candidates without changing the kernel trap path.
+  decoder. It parses legacy `scause`/`sepc`/`stval` logs and the richer RV64
+  QEMU `trapframe:` dump emitted by the terminating trap path, detects
+  low-linked versus high-VMA ELF layouts, classifies direct-map and
+  firmware-gap addresses, symbolizes through Rust-native ELF/DWARF readers,
+  and conservatively reports data code-pointer candidates without changing the
+  kernel trap path.
   `AGENTS.md` and the HAL/trap skill now point future debugging sessions at
   this command before manual `nm`/`addr2line` work.
   Verification: `cargo fmt --check`, `cargo test -p xtask`,
@@ -33,7 +41,13 @@
   `codex/fault-decode-tool-impl` worktree. Next step: wire QEMU failure
   auto-annotation later if desired; no blocker. Post-merge high-VMA smoke
   coverage also fixed high-kernel alias classification and added regression
-  coverage so those addresses are not reported as direct-map addresses.
+  coverage so those addresses are not reported as direct-map addresses. The
+  2026-05-01 trapframe parser refresh keeps old one-line logs compatible while
+  attaching saved `x0..x31`/CSR dumps to the decoded trap report. The QEMU
+  sentinel runner now treats RV64 `scause`/`sepc`/`stval` trap summaries as an
+  immediate trap failure and appends `fault-decode --serial` output to the
+  error, avoiding a second manual decode step; the embedded annotation path has
+  direct unit coverage for successful and failed decoder runs.
 - HumanLayer `.claude` workflow references are available as a sparse submodule
   at `external/humanlayer-reference`.
 - Agent cooperation framework research now records both the local HumanLayer
@@ -455,8 +469,8 @@
   `run_until_idle_with_clock` / `RunIdleReport` for HAL-shaped timer driving.
   Verification: `cargo fmt --check`, `cargo test -p tx-reactor` (43 tests),
   `cargo test -p tx-substrate`, RV64 kernel target check, `cargo xtask lint
-  arch`, `cargo xtask lint unused`, `cargo xtask lint docs` (31
-  stale-vocabulary warnings only), `cargo xtask progress validate`,
+  arch`, `cargo xtask lint unused`, `cargo xtask lint docs`,
+  `cargo xtask progress validate`,
   `cargo xtask ci` (11 passed), and `git diff --check`. Next step: continue
   through the second-wave reactor audit and wire CoreInit once the `init.rs`
   lease clears. See
@@ -474,7 +488,7 @@
   `cargo test -p tx-reactor --test sync_coord`, and
   `cargo test -p tx-reactor` (65 tests), `cargo test -p tx-substrate`, RV64
   kernel target check, `cargo xtask lint arch`, `cargo xtask lint unused`,
-  `cargo xtask lint docs` (31 stale-vocabulary warnings only),
+  `cargo xtask lint docs`,
   `cargo xtask progress validate`, `cargo xtask ci` (11 passed), and
   `git diff --check`. Next step: move to userspace-run/CoreInit only after the
   active leases clear.
@@ -491,12 +505,409 @@
   `cargo test -p tx-reactor --test wait_bus`, `cargo test -p tx-substrate`,
   `cargo test -p tx-reactor` (71 tests), RV64 kernel target check,
   `cargo fmt --check`, `cargo xtask lint arch`, `cargo xtask lint unused`,
-  `cargo xtask lint docs` (31 stale-vocabulary warnings only),
+  `cargo xtask lint docs`,
   `cargo xtask progress validate`, `cargo xtask ci` (11 passed), and
-  `git diff --check`. Next step: decide between the trap/thread-runtime
-  userspace-run prerequisite slice and a bus typed-declaration/SMP-storage
-  hardening slice. See
+  `git diff --check`. Boundary: this is enough for prototype reactor/mock
+  device completions that update owner truth and fire a wake, but not for a
+  production VFS/device/block runtime or real IRQ-driven block I/O across
+  harts. Next dispatcher preference is the bus typed-declaration and
+  wire-destruction hardening slice before treating VFS/block runtime as ready;
+  trap/thread-runtime userspace-run remains a separate prerequisite. See
   `docs/progress/research/2026-04-30-reactor-third-wave-audit.md`.
+- `SmpIf` is now the first real low-level SMP boundary, and RV64 QEMU now
+  boots APs under `-smp 4`. `tx-hal` exposes `CpuMask`,
+  `SecondaryEntry`, `IpiKind`, possible/online masks, AP online publication,
+  AP boot, parking, and IPI send/ack hooks; `PlatformInfo` carries
+  `possible_cpu_count`. RV64 QEMU parses DTB CPU nodes, uses SBI HSM to start
+  APs through a retained low trampoline, allocates per-hart temporary boot
+  stack slots for both BSP and APs, installs AP per-CPU state/trap vectors, and
+  hands APs to a kernel-owned AP loop after initializing AP-local epoch/zone
+  substrate state and marking them online. `tx_substrate::init_on_ap(cpu)` is
+  now the generic AP-local substrate entrypoint, and RV64
+  `install_early_percpu` no longer publishes online as a side effect.
+  Reactor/bus wait storage was hardened at the raw
+  storage layer by replacing remaining `Rc<RefCell<...>>` state in raw bus
+  wires, timers, and sync rendezvous with `Arc` plus spin-locked storage. RV64
+  QEMU pmap shootdown now also performs local `sfence.vma` plus SBI RFENCE to
+  online remote harts, and CoreInit emits
+  `txkernel:qemu-riscv64-virt:smp:shootdown:ok` after APs are online. APs now
+  arm supervisor software wakeups, wait in `wfi`, poll and acknowledge
+  pending SSIP as `IpiKind::Reschedule`, and CoreInit emits
+  `txkernel:qemu-riscv64-virt:smp:ipi:ok` after online APs acknowledge the
+  smoke IPI. `Phase1Scheduler` now also honors initial affinity masks for
+  per-hart queues, keeps wakes on the last allowed hart when possible, and
+  reports `RunnablePlacement { target_hart, wake_remote }`. `tx-reactor` now has
+  `DispatchState`, `RescheduleSignal`, and `Reactor::drain_wakes_for_hart` so a
+  wake can mark the target hart `need_resched` and request a remote reschedule
+  IPI without making scheduler policy depend on HAL. `tx-kernel` wires that
+  signal to `SmpIf::send_ipi(..., IpiKind::Reschedule)` through
+  `SmpRescheduleSignal<P>`, and RV64 QEMU now prints
+  `txkernel:qemu-riscv64-virt:reactor:dispatch:ipi:ok` after a wait-channel
+  wake is dispatched to an AP, and
+  `txkernel:qemu-riscv64-virt:reactor:ap-loop:ok` after that AP loop consumes
+  the reschedule wake. `tx-reactor` now also requires submitted task futures to
+  be `Send + 'static`, exposes `SharedReactor`, and has
+  `Reactor::run_rescheduled_on_hart_with_reschedule()` to consume
+  `need_resched` before draining a hart's runqueue. The boot smoke uses that
+  shared reactor so the AP polls the remote-affinity task itself, then prints
+  `txkernel:qemu-riscv64-virt:reactor:ap-runqueue:ok`.
+  Verification: focused bus/reactor timer/rendezvous tests, scheduler affinity
+  placement tests, RV64 HAL tests, RV64 kernel target check/build, ELF
+  trampoline inspection, and RV64 QEMU smoke showing `Platform HART Count : 4`,
+  `txkernel:qemu-riscv64-virt:smp:aps:online`,
+  `txkernel:qemu-riscv64-virt:smp:shootdown:ok`,
+  `txkernel:qemu-riscv64-virt:smp:ipi:ok`,
+  `txkernel:qemu-riscv64-virt:reactor:dispatch:ipi:ok`,
+  `txkernel:qemu-riscv64-virt:reactor:ap-loop:ok`,
+  `txkernel:qemu-riscv64-virt:reactor:ap-runqueue:ok`,
+  `txkernel:qemu-riscv64-virt:reactor:task:ok`, and
+  `txkernel:qemu-riscv64-virt:boot:ok`. Boundary: this proves AP boot with
+  AP-local substrate initialization and RFENCE-backed remote pmap invalidation
+  plus low-level AP IPI acknowledgement on QEMU/OpenSBI, plus scheduler-owned
+  wake placement and reactor-to-`SmpIf` reschedule IPI dispatch into a
+  kernel-owned AP wake loop that drains real shared-reactor runqueue work. It
+  is still serialized behind one boot-reactor lock, and it is not
+  kernel-managed IPI/ack shootdown fallback, full trace/owner bus declaration
+  macro coverage, concrete VFS/device owner implementations over embedded wire
+  reclamation, final per-hart reactor sharding, or a production idle/timer
+  loop. See
+  `docs/progress/decisions/2026-04-30-smpif-parked-ap-boot.md` and
+  `docs/progress/decisions/2026-04-30-rv64-smp-rfence-shootdown.md` and
+  `docs/progress/decisions/2026-04-30-ap-substrate-before-online.md` and
+  `docs/progress/decisions/2026-04-30-rv64-ipi-ack-smoke.md` and
+  `docs/progress/decisions/2026-04-30-reactor-affinity-wake-placement.md` and
+  `docs/progress/decisions/2026-04-30-reactor-reschedule-dispatch-bridge.md`
+  and `docs/progress/decisions/2026-04-30-ap-reactor-loop-wfi-smoke.md` and
+  `docs/progress/decisions/2026-04-30-ap-reactor-shared-runqueue-smoke.md`.
+- `tx_substrate::bus` now has the first typed declaration surface over the
+  raw queue/port carriers. `WireEventSet`, `WireDeclaration<E>`,
+  `DeclaredQueue<E>`, and `DeclaredPort<E>` give subsystem-facing code a
+  declared carrier name/kind/bit-set and validate fired bits plus subscription
+  interests before delegating to the raw terminal/unsubscribed machinery.
+  Verification: `cargo test -p tx-substrate --test bus`,
+  `cargo test -p tx-substrate`, `cargo test -p tx-reactor --test wait_bus`,
+  `cargo test -p tx-reactor`, RV64 kernel target check, fmt/progress/docs/
+  arch/unused lints, `cargo xtask ci`, and `git diff --check`. Boundary:
+  current reactor waits still use raw masks internally. Follow-up declaration
+  macro work now covers queue/port bit-set newtypes, but production bus work
+  still needs concrete zone/device owner manifests, final global epoll graph
+  policy, and broader validation. A later trace slice added typed `RawTrace`
+  payloads. See
+  `docs/progress/decisions/2026-04-30-bus-typed-declaration-surface.md`.
+- `tx_substrate::bus` now also has an epoch-fenced retire handshake for
+  queue/port wire destruction. `RawQueue`, `RawPort`, `DeclaredQueue<E>`, and
+  `DeclaredPort<E>` expose `retire(..., &epoch::Guard)` and
+  `retire_silently(&epoch::Guard)`, terminate/drain subscribers, and return a
+  `WireRetirement` record with carrier kind, terminal bits, wake count, guard
+  epoch, guard CPU, and whether this call performed the terminal transition.
+  Verification: `cargo test -p tx-substrate --test bus`,
+  `cargo test -p tx-substrate`, `cargo test -p tx-reactor`, RV64 kernel target
+  check, fmt/progress/docs/arch/unused lints, `cargo xtask ci`, and
+  `git diff --check`. Follow-up owner-fence work now connects wire retirement
+  records to EBR-delayed owner-storage reclaim. See
+  `docs/progress/decisions/2026-04-30-bus-epoch-retire-handshake.md`.
+- Static device/block wire backing storage now exists. `StaticRawQueue` and
+  `StaticRawPort` are const-constructible storage objects; `raw()` plus
+  `RawQueue::from_static` / `RawPort::from_static` create cloneable raw handles
+  without allocating `Arc`, so device tables can be static-backed while keeping
+  the hot raw fire/subscribe API unchanged. `DeclaredQueue<E>::from_static`
+  and `DeclaredPort<E>::from_static` add typed declaration validation over the
+  same static storage. `DEVICE.md` now describes this storage/handle split
+  instead of an impossible zero-argument
+  `RawQueue::new_const()` shape. Verification:
+  `cargo test -p tx-substrate --test bus`, `cargo test -p tx-substrate`,
+  `cargo test -p tx-reactor`, RV64 kernel target check, fmt/progress/docs/
+  arch/unused lints, `cargo xtask ci`, and `git diff --check`. Boundary:
+  concrete VFS/device owner implementations remain later. Later macro slices
+  added typed `RawTrace` payloads and generated owner-manifest boilerplate. See
+  `docs/progress/decisions/2026-04-30-bus-static-wire-storage.md`.
+- The bus implementation is now split into smaller modules under
+  `crates/tx-substrate/src/bus/`: `common.rs` for shared declaration/error/
+  storage vocabulary, `queue.rs` for raw/static/declared queue carriers,
+  `port.rs` for raw/static/declared port carriers, `graph.rs` for the bounded
+  long-lived subscription owner, `trace.rs` for typed trace declarations, and
+  `mod.rs` as the facade.
+  This is a behavior-preserving reorganization so the next bus slices do not
+  push one authored source file past the 1,500-line arch lint cap.
+  Verification: `cargo test -p tx-substrate --test bus`,
+  `cargo test -p tx-substrate`, `cargo test -p tx-reactor --test wait_bus`,
+  `cargo test -p tx-reactor`, RV64 kernel target check, fmt/progress/docs/
+  arch/unused lints, `cargo xtask ci`, and `git diff --check`. See
+  `docs/progress/decisions/2026-04-30-bus-module-split.md`.
+- `tx_substrate::bus` now has a bounded long-lived subscription graph slice.
+  `SubscriptionGraph<N>` owns raw queue/port subscription tokens, returns
+  generation-checked `SubscriptionGraphKey` handles, rejects stale/wrong-kind/
+  empty-interest operations, supports update/remove/kind/state/take-ready, and
+  is `Send + Sync` when shared behind an owner lock. This gives epoll-style
+  code a durable subscription-token owner without making the raw carriers know
+  about fd tables or tasks. Verification: `cargo test -p tx-substrate --test
+  bus`, `cargo test -p tx-substrate`, `cargo test -p tx-reactor --test
+  wait_bus`, `cargo test -p tx-reactor`, RV64 kernel target check, fmt/
+  progress/docs/arch/unused lints, `cargo xtask ci`, and `git diff --check`.
+  Boundary: final production work still needs target-fd reverse-index
+  teardown, global epoll table integration, spill/fanout policy, and concrete
+  VFS/device owner implementations. See
+  `docs/progress/decisions/2026-04-30-bus-subscription-graph-slice.md`.
+- `tx_substrate::bus` now has typed declared helpers over the bounded
+  subscription graph. `DeclaredSubscriptionGraphKey<E>` wraps the raw
+  generation-checked key, and `subscribe_declared_{queue,port}`,
+  `update_declared_{queue,port}`, `remove_declared`, `kind_declared`,
+  `state_declared`, and `take_declared_ready` validate interests against
+  `DeclaredQueue<E>` / `DeclaredPort<E>` declarations before delegating to the
+  raw graph. Focused tests cover declared queue/port registration, typed
+  update, stale-key rejection after removal, undeclared-bit rejection, and
+  `Send + Sync` for typed graph keys. Verification: `cargo fmt --check`,
+  `cargo test -p tx-substrate --test bus`, `cargo test -p tx-substrate`,
+  `cargo test -p tx-reactor --test wait_bus`, `cargo test -p tx-reactor`, RV64
+  kernel target check, progress/docs/arch/unused lints, `cargo xtask ci`, and
+  `git diff --check`. Boundary: this is not the final target-fd reverse-index
+  teardown, global epoll table integration, spill/fanout policy, concrete
+  VFS/device owner implementation, trace subscriber/nop-patching runtime, or
+  production IRQ/timer integration. See
+  `docs/progress/decisions/2026-05-01-bus-declared-subscription-graph-helpers.md`.
+- `tx_substrate::bus` now has a first owner-storage EBR bridge for embedded
+  wires. `WireOwnerRetireFence` is built from one or more `WireRetirement`
+  records, requires every embedded wire retirement to be newly terminal and
+  captured under the same guard epoch/CPU, aggregates wake/wire counts, and
+  enqueues the containing owner storage through the epoch domain with an
+  owner-provided reclaim callback. Verification: `cargo test -p tx-substrate
+  --test bus`, `cargo test -p tx-substrate`, `cargo test -p tx-reactor --test
+  wait_bus`, `cargo test -p tx-reactor`, RV64 kernel target check, fmt/
+  progress/docs/arch/unused lints, `cargo xtask ci`, and `git diff --check`.
+  A follow-up typed owner hook now adds `WireOwnerManifest` and
+  `retire_wire_owner<T>()`, so a containing owner type supplies the complete
+  embedded-wire retire sequence plus typed reclaim callback and call sites no
+  longer pass erased reclaim functions directly. Boundary: concrete VFS/device
+  owner implementations, trace subscriber/nop-patching runtime, target-fd
+  reverse-index teardown, global epoll table integration, and production IRQ/
+  timer lost-wake integration remain later. A later macro slice added generated
+  owner-manifest boilerplate.
+  See
+  `docs/progress/decisions/2026-04-30-bus-owner-storage-ebr-fence.md`.
+- `tx_substrate::bus` now has the generic typed owner-manifest hook over the
+  owner-storage fence. `WireOwnerManifest` records the owner type's complete
+  embedded-wire retire sequence and typed reclaim callback, and
+  `retire_wire_owner<T>()` retires the owner by calling that manifest before
+  queueing EBR-delayed storage reclaim. Verification: `cargo test -p
+  tx-substrate --test bus`, `cargo test -p tx-substrate`, `cargo test -p
+  tx-reactor --test wait_bus`, `cargo test -p tx-reactor`, RV64 kernel target
+  check, fmt/progress/docs/arch/unused lints, `cargo xtask ci`, and
+  `git diff --check`. Boundary: actual device/VFS owner types still need
+  concrete manifests; target-fd reverse-index teardown, global epoll table
+  integration, trace subscriber/nop-patching runtime, and production IRQ/timer
+  integration remain later. Later macro slices added typed `RawTrace` payloads and generated
+  owner-manifest boilerplate.
+  See
+  `docs/progress/decisions/2026-04-30-bus-typed-owner-manifest-hook.md`.
+- `tx_substrate::bus` now has the first declaration macro slice.
+  `bus_event_set!` generates typed `WireEventSet` bit newtypes with
+  declared-bit unions, `from_bits`, `bits`, `contains`, and bitwise
+  composition; `bus_readiness!` and `bus_lifecycle!` are queue/port-oriented
+  aliases re-exported through `tx_substrate::bus`. Focused bus tests cover
+  macro-generated `DeclaredQueue<E>` and `DeclaredPort<E>` integration plus
+  undeclared-bit rejection. Verification: `cargo fmt --check`, `cargo test -p
+  tx-substrate --test bus`, `cargo test -p tx-substrate`, `cargo test -p
+  tx-reactor --test wait_bus`, `cargo test -p tx-reactor`, RV64 kernel target
+  check, progress/docs/arch/unused lints, `cargo xtask ci`, and
+  `git diff --check`. Boundary: this is not target-fd reverse-index teardown,
+  global epoll table integration, or spill/fanout policy. Later macro slices
+  added typed tracepoint payload structs and generated owner-manifest
+  boilerplate. See
+  `docs/progress/decisions/2026-04-30-bus-declaration-macro-slice.md`.
+- `tx_substrate::bus` now has typed `RawTrace<P>` payload declarations.
+  `TracePayload`, `TraceDeclaration<P>`, and `RawTrace<P>` preserve tracepoint
+  payload types and declaration names at call sites; `bus_tracepoint!`
+  generates copyable payload structs plus the marker implementation. Focused
+  tests cover manual and macro-generated payloads, no-op emit, explicit empty
+  payload trace emit, and `Send + Sync` for the trace declaration/carrier.
+  Verification:
+  `cargo fmt --check`, `cargo test -p tx-substrate --test bus`,
+  `cargo test -p tx-substrate`, `cargo test -p tx-reactor --test wait_bus`,
+  `cargo test -p tx-reactor`, RV64 kernel target check, progress/docs/arch/
+  unused lints, `cargo xtask ci`, and `git diff --check`. Boundary: this is
+  not trace subscriber registration, nop-patching, ftrace/perf/BPF delivery,
+  target-fd reverse-index teardown, global epoll table integration, or
+  spill/fanout policy. Later graph and macro slices added ready scans,
+  explicit graph teardown, and generated owner-manifest boilerplate. See
+  `docs/progress/decisions/2026-05-01-bus-typed-rawtrace-payloads.md`.
+- `tx_substrate::bus` now has a first epoll-style readiness scan and explicit
+  graph teardown API. `SubscriptionGraphReady` reports the generation-checked
+  key, wire kind, and subscribed/terminal state for each entry returned by
+  `SubscriptionGraph::collect_ready(&mut [..])`; the scan consumes ordinary
+  readiness but keeps terminal subscriptions visible until policy code removes
+  them. `SubscriptionGraph::clear()` explicitly drops every owned subscription
+  token for epoll-fd close and stales the old keys. Focused tests cover bounded
+  scans that leave unread ready entries intact, terminal wire destruction
+  reporting, and full graph teardown unsubscribing raw queue/port carriers.
+  Verification: `cargo fmt --check`, `cargo test -p tx-substrate --test bus`,
+  `cargo test -p tx-substrate`, `cargo test -p tx-reactor --test wait_bus`,
+  `cargo test -p tx-reactor`, RV64 kernel target check, progress/docs/arch/
+  unused lints, `cargo xtask ci`, and `git diff --check`. Boundary: this is
+  not the final global epoll table, target-fd reverse index, spill/fanout
+  policy, trace subscriber/nop-patching runtime, or concrete VFS/device/fs/
+  block owner implementation. See
+  `docs/progress/decisions/2026-05-01-bus-graph-ready-scan-teardown.md`.
+- `tx_substrate::bus` now has generated owner-manifest boilerplate for simple
+  embedded-wire owners. `bus_wire_owner_manifest!` emits the unsafe
+  `WireOwnerManifest` impl from a field-retire list, builds the retire fence
+  under one epoch guard, and wires the typed reclaim callback through the
+  existing `retire_wire_owner<T>()` path. Focused tests cover a declared
+  queue/port owner, terminal wake delivery, fence accounting, and EBR-delayed
+  reclaim. Verification: `cargo fmt --check`, `cargo test -p tx-substrate
+  --test bus`, `cargo test -p tx-substrate`, `cargo test -p tx-reactor --test
+  wait_bus`, `cargo test -p tx-reactor`, RV64 kernel target check,
+  progress/docs/arch/unused lints, `cargo xtask ci`, and `git diff --check`.
+  Boundary: concrete VFS/device/fs/block owner types still need to exist; this
+  is not trace subscriber/nop-patching runtime, target-fd reverse-index
+  teardown, global epoll table integration, spill/fanout policy, or production
+  IRQ/timer integration. See
+  `docs/progress/decisions/2026-05-01-bus-owner-manifest-macro.md`.
+- `tx_reactor::wait` now has first-class typed declared-port wait consumption.
+  `DeclaredChannel<E>` wraps an existing `DeclaredPort<E>` or creates one from
+  `WireDeclaration<E>`, `DeclaredWaitFuture<E>` and
+  `DeclaredWaitEventFuture<E, C, I>` subscribe with typed event interests, and
+  `Reactor::declared_channel*` attaches declared channels to the reactor timer
+  queue. The raw `Channel` / `Mask` path remains for existing completion and
+  sync coordination internals, but subsystem-facing code can now wait on a
+  declared bus port without erasing its event type to a raw mask. Verification:
+  `cargo fmt --check`, `cargo test -p tx-reactor --test wait_bus`,
+  `cargo test -p tx-reactor`, `cargo test -p tx-substrate --test bus`,
+  `cargo test -p tx-substrate`, RV64 kernel target check, progress/docs/
+  arch/unused lints, `cargo xtask ci`, and `git diff --check`. Boundary:
+  typed queue/readiness wait adapters now live in the readiness-channel slice;
+  concrete subsystem migrations, target-fd reverse-index teardown, global
+  epoll table integration, owner manifests, and the production per-hart loop
+  remain later. Later graph and trace slices added explicit graph teardown and
+  typed `RawTrace` payloads. See
+  `docs/progress/decisions/2026-04-30-reactor-declared-wait-channel.md`.
+- `tx_reactor::wait` now also has typed declared-readiness waits over
+  `DeclaredQueue<E>`. `DeclaredReadinessChannel<E>` wraps an existing
+  `DeclaredQueue<E>` or creates one from `WireDeclaration<E>`, typed readiness
+  wait futures subscribe with declared readiness interests, and
+  `Reactor::declared_readiness_channel*` attaches them to the reactor timer
+  queue. Focused tests cover existing declared-queue integration, undeclared
+  interest rejection, raw-compatible empty direct waits, and timeout waits.
+  Verification: `cargo fmt --check`, `cargo test -p tx-reactor --test
+  wait_bus`, `cargo test -p tx-reactor`, `cargo test -p tx-substrate --test
+  bus`, `cargo test -p tx-substrate`, RV64 kernel target check,
+  progress/docs/arch/unused lints, `cargo xtask ci`, and `git diff --check`.
+  Boundary: concrete subsystem migration to declared waits, target-fd
+  reverse-index teardown, global epoll table integration, owner manifests, and
+  the production per-hart loop remain later. Later graph and trace slices added
+  explicit graph teardown and typed `RawTrace` payloads. See
+  `docs/progress/decisions/2026-04-30-reactor-declared-readiness-channel.md`.
+- Reactor/bus/substrate is now prototype-ready for subsystem development where
+  mock devices or reactor tasks update owner truth and fire wakes, but it is
+  not production-complete for the full VFS/device/block runtime. Remaining
+  spine gaps are: real subsystem migration to declared waits is not done;
+  concrete VFS/device/fs/block owners and owner manifests do not exist yet;
+  target-fd reverse-index teardown and the global epoll/fd policy are not
+  implemented; trace subscriber
+  registration and nop-patching are not implemented; AP/shared-reactor behavior
+  is still not the final per-hart production loop; and VM/user/trap integration
+  is still mock or partial.
+- `tx_reactor` now has the first runtime-dispatch seams from the 2026-05-01
+  parallel pass: `userspace` provides a host-testable single-slot
+  userspace-run wait that resolves only on syscall/page-fault/fatal trap
+  outcomes, and `hart_loop` provides a platform-independent per-hart step
+  report over timer advancement, wake dispatch, reschedule markers, ready-task
+  polling, and deadline selection. The full CoreInit runtime loop and AST
+  return-to-user integration remain adjacent-owner work: CoreInit/HAL binds
+  WFI, timer, and IPI mechanics to the per-hart step, while
+  ThreadRuntime/signal/trap owners define userspace-entry AST policy and real
+  trap-frame return. Verification: `cargo fmt --check`, `cargo test -p
+  tx-reactor --test userspace_run`, `cargo test -p tx-reactor --test
+  hart_loop`, `cargo test -p tx-reactor`, RV64 kernel target check,
+  progress/docs/arch/unused lints, `cargo xtask ci`, and `git diff --check`.
+  Boundary: this is still a runtime-dispatch shell around the current
+  single-slot userspace-run facade, not ThreadRuntime-backed per-task
+  userspace state, saved-register trap shell, or permanent BSP/AP production
+  loop. See
+  `docs/progress/research/2026-05-01-reactor-runtime-dispatch-audit.md`.
+- `tx_reactor::userspace` now has a public reactor facade for the single-slot
+  userspace-run shell. `Reactor::request_userspace_run` starts the current
+  wait, and `Reactor::{dispatch_userspace_run,record_userspace_timer_preemption,
+  complete_userspace_run,userspace_run_status}` expose the reactor-owned driver
+  side without pulling in `ThreadPayload` or HAL return mechanics.
+  `UserspaceRunSlot::checkpoint_userspace_entry` validates the active
+  userspace-run request, drains a caller-supplied task-local `AstSlot`, and
+  applies a policy-neutral decision to enter userspace, preserve the task for
+  re-poll, or resolve the wait with a caller-supplied interesting trap.
+  `Reactor::checkpoint_task_userspace_entry` wires that checkpoint to the real
+  task table behind a generation-checked `TaskKey`, validating the
+  userspace-run request before draining task AST so stale requests do not
+  consume pending markers.
+  Verification: `cargo test -p tx-reactor --test userspace_run`. Boundary:
+  this is not POSIX signal delivery, VM fault policy, `ThreadPayload`
+  mutation, multi-thread userspace-run state, or final HAL `return_to_userspace`. See
+  `docs/progress/decisions/2026-05-01-reactor-userspace-entry-ast-checkpoint.md`.
+- `tx_kernel::CoreInit` now binds the boot reactor to
+  `tx_reactor::hart_loop` through a private HAL adapter. The adapter supplies
+  current hart identity, `TimeIf::read_ns()`, deadline programming through
+  `TimeIf::{set_deadline_ns,cancel_deadline}`, and remote reschedule delivery
+  through the existing `SmpRescheduleSignal<P>`. APs now step the shared boot
+  reactor through the hart-loop API before entering WFI, and the BSP
+  `:reactor:task:ok` smoke now runs on `BOOT_REACTOR` through the same bounded
+  adapter, followed by `:reactor:runtime-loop:ok`. Verification: `cargo fmt
+  --check`, RV64 kernel target check, `cargo xtask build --target rv64-qemu`,
+  RV64 QEMU smoke sentinel with the new runtime-loop serial marker,
+  `cargo xtask progress validate`, docs lint, `cargo xtask ci`, and
+  `git diff --check`. Boundary: this is still a bounded boot/runtime smoke,
+  not the permanent BSP root runtime loop, full timer-trap dispatch,
+  external-IRQ/device completion loop, final per-hart reactor sharding, or
+  userspace return path. See
+  `docs/progress/decisions/2026-05-01-coreinit-hart-loop-adapter.md`.
+- RV64 QEMU now has the first timer-trap return path needed by the reactor
+  runtime loop. `TimeIf::enable_timer_wakeups()` prepares the current hart for
+  timer wakeups, the RV64 direct-mode trap vector handles supervisor timer
+  interrupts beside reschedule IPIs, and the timer handler cancels the expired
+  SBI deadline before returning to kernel code. CoreInit adds a bounded
+  deadline-driven idle smoke: a `BOOT_REACTOR` timeout waiter arms a platform
+  deadline, the BSP waits with WFI, the timer trap returns, and the next
+  hart-loop step observes the timer wake and emits
+  `txkernel:qemu-riscv64-virt:reactor:timer-idle:ok`. Verification:
+  `cargo fmt --check`, RV64 kernel target check, `cargo test -p
+  tx-hal-riscv64-qemu-virt`, `cargo xtask build --target rv64-qemu`, RV64 QEMU
+  smoke sentinel with the new timer-idle marker, progress/docs validation,
+  `cargo xtask ci`, and `git diff --check`. Boundary: this is not the full
+  saved-register `KernelTrapSink`, external IRQ/device dispatch, production
+  scheduler tick/preemption policy, final per-hart sharding, or user-mode trap
+  return. See
+  `docs/progress/decisions/2026-05-01-rv64-timer-trap-idle-smoke.md`.
+- RV64 QEMU now routes traps through a first saved-register dispatch spine.
+  The trap vector saves all integer registers plus `scause`, `sepc`, `stval`,
+  and `sstatus` into `Rv64TrapFrame`, calls the board binary's named
+  `tx_kernel_riscv64_qemu_trap_dispatch` symbol, and restores the frame before
+  `sret`. `tx-hal` now exposes the first executable `TrapAction`,
+  `FaultInfo`, `TrapFrameView`, `TrapFrameMut`, and `KernelTrapSink<P>`
+  contract; `tx-kernel::trap::KernelTrapDispatcher` handles timer and IPI
+  traps by cancelling deadlines or acknowledging reschedule IPIs, resumes
+  external IRQs as a stub, and terminates unimplemented sync/syscall/user
+  traps. Verification: `cargo fmt --check`, `cargo test -p
+  tx-hal-riscv64-qemu-virt` with host dispatcher routing tests, RV64 kernel
+  target check, `cargo xtask build --target rv64-qemu`, RV64 QEMU smoke
+  sentinel preserving AP IPI and timer-idle markers, progress/docs validation,
+  `cargo xtask ci`, and `git diff --check`. Boundary: this is a trap dispatch
+  spine, not mutable syscall return writeback, VM page-fault handling,
+  external IRQ/device dispatch, signal policy, userspace trampoline, or
+  `return_to_userspace`. See
+  `docs/progress/decisions/2026-05-01-rv64-saved-trap-dispatch.md`.
+- RV64 QEMU trap frames now support real saved-frame writeback. `TrapFrameMut`
+  carries a platform vtable for PC, SP, syscall return/error, and user TLS
+  writes; `Rv64TrapFrame::view_mut()` backs that handle with the live saved
+  frame; syscall dispatch tests prove the sink can rewrite `a0`; and the trap
+  vector writes saved `sepc`/`sstatus` back before `sret`. RV64 also has
+  `prepare_user_return()` and an unsafe `return_to_userspace` register-restore
+  skeleton for the future trampoline. Terminating traps now print the full
+  saved frame after the scalar `scause`/`sepc`/`stval` summary, and
+  `fault-decode --serial` parses that block without double-counting it as a
+  second trap. Verification: `cargo test -p
+  tx-hal-riscv64-qemu-virt`, RV64 kernel target check, RV64 build/QEMU smoke,
+  progress/docs validation, `cargo xtask ci`, and `git diff --check`.
+  Boundary: this is writeback/trampoline substrate, not syscall dispatch,
+  VM page-fault handling, signal delivery, user trap stack switching,
+  external IRQ/device dispatch, or ThreadRuntime userspace-run integration.
+  See `docs/progress/decisions/2026-05-01-rv64-trap-frame-writeback.md`.
 - `tx_kernel::vm` now has a pure/mock VM foundation: `UserVirtAddr`,
   `UserPage`, `UserRange`, protection/access flags, draft `VmEntry`
   split/rewrite helpers for `munmap`/`mprotect`-like value behavior, and a
@@ -569,8 +980,40 @@
 - BusyBox images require `TX_BUSYBOX`; dynamic musl layouts also require
   `TX_MUSL_LIBC`.
 
+## Latest Research
+
+- `docs/progress/research/2026-05-01-reactor-runtime-dispatch-audit.md`
+- `docs/progress/research/2026-05-01-coreinit-runtime-loop-scout.md`
+- `docs/progress/research/2026-05-01-ast-return-to-user-scout.md`
+
 ## Latest Decisions
 
+- `docs/progress/decisions/2026-05-01-reactor-userspace-entry-ast-checkpoint.md`
+- `docs/progress/decisions/2026-05-01-rv64-saved-trap-dispatch.md`
+- `docs/progress/decisions/2026-05-01-rv64-timer-trap-idle-smoke.md`
+- `docs/progress/decisions/2026-05-01-coreinit-hart-loop-adapter.md`
+- `docs/progress/decisions/2026-05-01-bus-graph-ready-scan-teardown.md`
+- `docs/progress/decisions/2026-05-01-bus-owner-manifest-macro.md`
+- `docs/progress/decisions/2026-05-01-bus-typed-rawtrace-payloads.md`
+- `docs/progress/decisions/2026-05-01-bus-declared-subscription-graph-helpers.md`
+- `docs/progress/decisions/2026-04-30-reactor-declared-readiness-channel.md`
+- `docs/progress/decisions/2026-04-30-reactor-declared-wait-channel.md`
+- `docs/progress/decisions/2026-04-30-bus-declaration-macro-slice.md`
+- `docs/progress/decisions/2026-04-30-bus-typed-owner-manifest-hook.md`
+- `docs/progress/decisions/2026-04-30-bus-owner-storage-ebr-fence.md`
+- `docs/progress/decisions/2026-04-30-bus-subscription-graph-slice.md`
+- `docs/progress/decisions/2026-04-30-bus-module-split.md`
+- `docs/progress/decisions/2026-04-30-bus-static-wire-storage.md`
+- `docs/progress/decisions/2026-04-30-bus-epoch-retire-handshake.md`
+- `docs/progress/decisions/2026-04-30-bus-typed-declaration-surface.md`
+- `docs/progress/decisions/2026-04-30-ap-reactor-shared-runqueue-smoke.md`
+- `docs/progress/decisions/2026-04-30-ap-reactor-loop-wfi-smoke.md`
+- `docs/progress/decisions/2026-04-30-reactor-reschedule-dispatch-bridge.md`
+- `docs/progress/decisions/2026-04-30-reactor-affinity-wake-placement.md`
+- `docs/progress/decisions/2026-04-30-rv64-ipi-ack-smoke.md`
+- `docs/progress/decisions/2026-04-30-ap-substrate-before-online.md`
+- `docs/progress/decisions/2026-04-30-rv64-smp-rfence-shootdown.md`
+- `docs/progress/decisions/2026-04-30-smpif-parked-ap-boot.md`
 - `docs/progress/decisions/2026-04-29-m1dock-mock-high-half-boot.md`
 - `docs/progress/decisions/2026-04-29-m1dock-mock-process-root-asid.md`
 - `docs/progress/decisions/2026-04-29-m1dock-mock-pmap-module-split.md`

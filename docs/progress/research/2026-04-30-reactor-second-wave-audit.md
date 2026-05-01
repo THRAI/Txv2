@@ -40,9 +40,13 @@
   return-to-userspace delivery.
 - Userspace-run remains deferred because it crosses saved-register trap
   handling, ThreadPayload, HAL return, and CoreInit reactor-loop wiring.
-- `RawQueue` / `RawPort` remain first-slice host-testable primitives without
-  typed declarations, SMP-safe subscriber storage, epoch-protected destruction,
-  or epoll-style long-lived subscriptions.
+- `RawQueue` / `RawPort` were first-slice host-testable primitives during this
+  audit. Follow-up bus slices have since added typed declarations, SMP-safe
+  subscriber storage, epoch-protected destruction, static backing, and a
+  bounded `SubscriptionGraph<N>` owner. Follow-up work also added
+  `WireOwnerRetireFence` for EBR-delayed owner-storage reclaim. Remaining bus
+  work is concrete VFS/device owner implementations plus target-fd reverse-index
+  teardown, global epoll table integration, and spill/fanout policy.
 - Sync coordination is not a real SMP shootdown protocol yet; it is the
   reactor-local rendezvous shape that the future substrate/HAL path can call.
 - CoreInit reactor-loop wiring still waits for the `init.rs` lease to clear.
@@ -60,7 +64,7 @@ Fresh verification after coordinator audit:
 - `cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`
 - `cargo xtask lint arch`
 - `cargo xtask lint unused`
-- `cargo xtask lint docs` (31 stale-vocabulary warnings only)
+- `cargo xtask lint docs`
 - `cargo xtask progress validate`
 - `cargo xtask ci` (11 passed, 0 skipped, 0 failed)
 - `git diff --check`

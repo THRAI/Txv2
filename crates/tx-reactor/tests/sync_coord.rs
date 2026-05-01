@@ -10,6 +10,13 @@ fn target(raw: u32) -> SyncTargetToken {
     SyncTargetToken::new(raw)
 }
 
+fn assert_send_sync<T: Send + Sync>() {}
+
+#[test]
+fn sync_rendezvous_is_send_sync_for_cross_hart_acks() {
+    assert_send_sync::<SyncRendezvous>();
+}
+
 #[test]
 fn rendezvous_completes_after_all_targets_ack() {
     let rendezvous = SyncRendezvous::new([target(10), target(20)]);

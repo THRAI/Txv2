@@ -15,6 +15,16 @@ fn submit_kernel(scheduler: &mut Phase1Scheduler, raw: usize) -> TaskId {
     task
 }
 
+fn submit_fair_affinity(scheduler: &mut Phase1Scheduler, raw: usize, affinity: u64) -> TaskId {
+    let task = TaskId(raw);
+    scheduler.task_submitted(
+        task,
+        TaskHandle::new(task),
+        InitialSchedMeta::fair().with_affinity(affinity),
+    );
+    task
+}
+
 fn pick_id_and_slice(
     scheduler: &mut Phase1Scheduler,
     hart: HartId,
@@ -54,6 +64,61 @@ fn submitted_fair_task_enters_new_queue_once() {
     );
     assert_eq!(scheduler.total_runtime_ns(task), Some(0));
     assert_eq!(pick_id_and_slice(&mut scheduler, HartId(0)), None);
+}
+
+#[test]
+fn submitted_task_uses_first_allowed_affinity_hart() {
+    let mut scheduler = Phase1Scheduler::new();
+    let task = submit_fair_affinity(&mut scheduler, 20, 0b0100);
+
+    assert_eq!(scheduler.queue_depths(HartId(0)).new, 0);
+    assert_eq!(scheduler.queue_depths(HartId(2)).new, 1);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(2)),
+        Some((
+            task,
+            SliceConfig::Preemptive {
+                slice_ns: Phase1Scheduler::NEW_QUEUE_SLICE_NS,
+            },
+        ))
+    );
+}
+
+#[test]
+fn blocked_task_wakes_on_last_allowed_hart_and_reports_remote_target() {
+    let mut scheduler = Phase1Scheduler::new();
+    let task = submit_fair_affinity(&mut scheduler, 21, 0b0110);
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(1)).map(|x| x.0),
+        Some(task)
+    );
+    scheduler.task_stopped(task, StopReason::Blocked, 10, HartId(1));
+
+    let placement = scheduler
+        .task_runnable_from(task, WakeHint::Normal, HartId(0))
+        .expect("wake placement");
+
+    assert_eq!(placement.target_hart, HartId(1));
+    assert!(placement.wake_remote);
+    assert_eq!(scheduler.queue_depths(HartId(1)).preempted, 1);
+    assert_eq!(pick_id_and_slice(&mut scheduler, HartId(0)), None);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(1)).map(|x| x.0),
+        Some(task)
+    );
+}
+
+#[test]
+fn zero_affinity_normalizes_to_boot_hart() {
+    let mut scheduler = Phase1Scheduler::new();
+    let task = submit_fair_affinity(&mut scheduler, 22, 0);
+
+    assert_eq!(scheduler.queue_depths(HartId(0)).new, 1);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(task)
+    );
 }
 
 #[test]

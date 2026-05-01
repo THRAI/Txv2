@@ -9,7 +9,7 @@ use crate::{
     waker::{task_waker, TaskWakeState},
 };
 
-pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
+pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TaskId(pub usize);
@@ -100,7 +100,7 @@ pub(crate) struct Task {
 impl Task {
     fn new_for_handle<F>(handle: TaskKey, future: F) -> Self
     where
-        F: Future<Output = ()> + 'static,
+        F: Future<Output = ()> + Send + 'static,
     {
         Self {
             id: handle.id,
@@ -145,7 +145,7 @@ impl TaskTable {
 
     pub fn submit<F>(&mut self, future: F) -> TaskKey
     where
-        F: Future<Output = ()> + 'static,
+        F: Future<Output = ()> + Send + 'static,
     {
         let (id, generation) = self
             .take_reusable_slot()

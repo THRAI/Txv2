@@ -119,6 +119,7 @@ static PLATFORM_INFO: PlatformInfo = PlatformInfo {
     spi_sd: None,
     mmio_regions: MMIO_REGIONS,
     timebase_frequency_hz: 0,
+    possible_cpu_count: 1,
 };
 
 impl PlatformConfig for Platform {

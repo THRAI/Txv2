@@ -1,18 +1,18 @@
 //! Host-drivable timer queue used by reactor wait timeouts.
 
-use alloc::{rc::Rc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::{
-    cell::RefCell,
     future::Future,
     pin::Pin,
     task::{Context, Poll, Waker},
 };
 
+use crate::spin_lock::SpinLock;
 use crate::wait::WaitOutcome;
 
 #[derive(Clone)]
 pub(crate) struct TimerQueue {
-    state: Rc<RefCell<TimerQueueState>>,
+    state: Arc<SpinLock<TimerQueueState>>,
 }
 
 struct TimerQueueState {
@@ -39,7 +39,7 @@ pub(crate) struct DeadlineFuture {
 impl TimerQueue {
     pub(crate) fn new() -> Self {
         Self {
-            state: Rc::new(RefCell::new(TimerQueueState {
+            state: Arc::new(SpinLock::new(TimerQueueState {
                 now_ns: 0,
                 next_timer: 0,
                 timers: Vec::new(),
@@ -50,7 +50,7 @@ impl TimerQueue {
     pub(crate) fn advance_time_to(&self, now_ns: u64) -> usize {
         let mut wakers = Vec::new();
         {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.state.lock();
             state.now_ns = state.now_ns.max(now_ns);
             let mut index = 0;
             while index < state.timers.len() {
@@ -72,7 +72,7 @@ impl TimerQueue {
 
     pub(crate) fn next_deadline_ns(&self) -> Option<u64> {
         self.state
-            .borrow()
+            .lock()
             .timers
             .iter()
             .map(|waiter| waiter.deadline_ns)
@@ -88,7 +88,7 @@ impl TimerQueue {
     }
 
     fn unregister(&self, token: TimerToken) {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock();
         if let Some(index) = state.timers.iter().position(|waiter| waiter.token == token) {
             state.timers.swap_remove(index);
         }
@@ -100,7 +100,7 @@ impl Future for DeadlineFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let mut state = this.timers.state.borrow_mut();
+        let mut state = this.timers.state.lock();
         if state.now_ns >= this.deadline_ns {
             this.token = None;
             return Poll::Ready(WaitOutcome::TimedOut);

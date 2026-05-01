@@ -20,7 +20,7 @@ Use this skill for cleanup walks across active docs. Keep the parent context sma
 
 - Active docs override archived and source-trace docs.
 - Do not rewrite archived docs unless asked.
-- Do not let active docs depend on `OBJECT_MODEL_v3`, v11, old OSTD HAL manager, or stale unversioned names.
+- Do not let active docs depend on `OBJECT_MODEL_v3`, retired architecture drafts, old dynamic HAL manager wording, or stale unversioned names.
 - Link labels should match current filenames unless the text is explicitly historical.
 - Active design docs must keep unique `txdoc:` tags, with at least one
   section-level tag beyond the file-level tag.
@@ -29,7 +29,7 @@ Use this skill for cleanup walks across active docs. Keep the parent context sma
 ## Common Scans
 
 ```sh
-rg -n "CONCEPTS_v3|INVARIANTS_v3_3|OBJECT_MODEL_v3|tx-kernel-architecture-v11|HalSignalHooks|HalManager|__ostd_main|VFS_CHECKS_V2_1|PAGE_BACKED_v1__1_" \
+rg -n "CONCEPTS_v3|INVARIANTS_v3_3|OBJECT_MODEL_v3|tx-kernel-architecture-v[0-9]+|HalSignalHooks|HAL-manager|__ostd_main|VFS_CHECKS_V2_1|PAGE_BACKED_v1__1_" \
   docs/design docs/ebr-zone \
   --glob '!docs/design/00_meta-framework/archived/**' --glob '!docs/design/00_meta-framework/FRAMEWORK_HARVEST_v1.md' --glob '!docs/design/00_meta-framework/INVARIANT_LEDGER_v1.md'
 ```

@@ -1,6 +1,8 @@
 #![no_std]
 
-use tx_hal::TxPlatform;
+extern crate alloc;
+
+use tx_hal::{CpuId, TxPlatform};
 
 #[doc(hidden)]
 pub mod boot_memory;
@@ -36,6 +38,24 @@ pub mod page {
 pub mod reservation {
     pub struct ReservationToken {
         _private: (),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApInitError {
+    Epoch(epoch::EpochError),
+    Zone(zone::ZoneError),
+}
+
+impl From<epoch::EpochError> for ApInitError {
+    fn from(value: epoch::EpochError) -> Self {
+        Self::Epoch(value)
+    }
+}
+
+impl From<zone::ZoneError> for ApInitError {
+    fn from(value: zone::ZoneError) -> Self {
+        Self::Zone(value)
     }
 }
 
@@ -383,4 +403,10 @@ pub fn init<P: TxPlatform>() {
     zone::init_on_bsp::<P>().expect("tx_substrate::init zone initialization failed");
     slab::init::<P>().expect("tx_substrate::init slab heap initialization failed");
     slab::allocation_smoke().expect("tx_substrate::init slab allocation smoke failed");
+}
+
+pub fn init_on_ap(cpu: CpuId) -> Result<(), ApInitError> {
+    epoch::init_on_ap(cpu)?;
+    zone::init_on_ap(cpu)?;
+    Ok(())
 }

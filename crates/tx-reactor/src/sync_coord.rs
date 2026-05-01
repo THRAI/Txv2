@@ -1,13 +1,13 @@
 //! Reactor-local synchronous coordination primitives.
 
-use alloc::{rc::Rc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::{
-    cell::RefCell,
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
 
+use crate::spin_lock::SpinLock;
 use crate::wait::{Channel, Mask, WaitFuture, WaitOutcome};
 
 const COMPLETE_MASK: Mask = Mask::from_bits(0x1);
@@ -56,7 +56,7 @@ pub struct AckResult {
 /// intentionally outside this type.
 #[derive(Clone)]
 pub struct SyncRendezvous {
-    state: Rc<RefCell<RendezvousState>>,
+    state: Arc<SpinLock<RendezvousState>>,
     completion: Channel,
 }
 
@@ -87,17 +87,17 @@ impl SyncRendezvous {
         I: IntoIterator<Item = SyncTargetToken>,
     {
         Self {
-            state: Rc::new(RefCell::new(RendezvousState::new(targets))),
+            state: Arc::new(SpinLock::new(RendezvousState::new(targets))),
             completion: Channel::new(),
         }
     }
 
     pub fn target_count(&self) -> usize {
-        self.state.borrow().targets.len()
+        self.state.lock().targets.len()
     }
 
     pub fn remaining(&self) -> usize {
-        self.state.borrow().remaining
+        self.state.lock().remaining
     }
 
     pub fn is_complete(&self) -> bool {
@@ -106,7 +106,7 @@ impl SyncRendezvous {
 
     pub fn is_acknowledged(&self, target: SyncTargetToken) -> Option<bool> {
         self.state
-            .borrow()
+            .lock()
             .targets
             .iter()
             .find(|entry| entry.target == target)
@@ -121,7 +121,7 @@ impl SyncRendezvous {
     pub fn ack(&self, target: SyncTargetToken) -> AckResult {
         let mut fire_completion = false;
         let result = {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.state.lock();
             let Some(index) = state
                 .targets
                 .iter()
