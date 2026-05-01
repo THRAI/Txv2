@@ -1,9 +1,15 @@
 # txKernel Status
 
-**Updated:** 2026-05-01
+**Updated:** 2026-05-02
 
 ## Current Shape
 
+- 2026-05-02 skill refresh: added subsystem-specific operational skills for
+  VM/PageBacked, VFS/filesystem, and Process/ThreadRuntime work so future
+  agents load the canonical subsystem docs before implementation and preserve
+  the correct harness boundaries. Verification: `cargo xtask progress
+  validate`, `cargo xtask lint docs`, and `git diff --check`. Next step: use
+  these skills in future subsystem worktree prompts; no blocker.
 - 2026-05-01 checkpoint: the current dirty workspace has been intentionally
   consolidated into a clean-start checkpoint covering reactor/bus/trap/SMP,
   progress memory, and docs alignment changes. Verification for the catch-up:
