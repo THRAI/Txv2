@@ -1,12 +1,15 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod init;
 pub mod page_backed;
 pub mod trap;
 pub mod vm;
 
+mod sync;
 mod zones;
 
 use tx_hal::{BootHandoff, TxPlatform};

@@ -222,4 +222,8 @@ pub mod testing {
         super::registry::reset_for_test();
         super::runtime::reset_for_test();
     }
+
+    pub fn init_for_test(page_size: usize, direct_map_base: usize) -> Result<(), super::ZoneError> {
+        super::runtime::init_for_test(page_size, direct_map_base)
+    }
 }

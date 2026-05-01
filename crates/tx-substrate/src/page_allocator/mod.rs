@@ -227,6 +227,19 @@ pub fn reserve_frame(
     installed_bitmap_allocator()?.reserve_frame(policy)
 }
 
+/// Acquire pmap/PTE role evidence for an already-live frame.
+///
+/// Page cache code uses this after observing a cached PPN and before handing a
+/// frame to VM/pmap publication. The returned token owns the `map_count`
+/// contribution and releases it on drop.
+pub fn acquire_map_pin(
+    ppn: Ppn,
+) -> Result<MapPin<'static, BitmapPageAllocator<'static>>, AllocError> {
+    let allocator = installed_bitmap_allocator()?;
+    allocator.acquire_map_pin(ppn)?;
+    Ok(MapPin::new(allocator, ppn))
+}
+
 /// Reserve a contiguous frame run from the installed backend.
 pub fn reserve_run(
     count: usize,
@@ -314,4 +327,56 @@ unsafe fn release_page_table_node(phys: PhysAddr) {
 /// Backend diagnostics from the installed allocator.
 pub fn backend_diagnostics() -> Result<AllocatorDiagnostics, AllocError> {
     Ok(installed_bitmap_allocator()?.backend_diagnostics())
+}
+
+#[doc(hidden)]
+pub mod testing {
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    use tx_hal::Ppn;
+
+    use super::{install_bitmap_allocator, AllocError, BitmapPageAllocator, FrameMeta};
+
+    const TEST_FRAME_COUNT: usize = 256;
+    const TEST_BITMAP_WORDS: usize = TEST_FRAME_COUNT / 64;
+
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+    static TEST_METAS: [FrameMeta; TEST_FRAME_COUNT] =
+        [const { FrameMeta::new() }; TEST_FRAME_COUNT];
+    static TEST_BITMAP: [AtomicU64; TEST_BITMAP_WORDS] =
+        [const { AtomicU64::new(0) }; TEST_BITMAP_WORDS];
+    static TEST_ALLOCATOR: BitmapPageAllocator<'static> = BitmapPageAllocator::new_with_zeroer(
+        &TEST_METAS,
+        &TEST_BITMAP,
+        TEST_FRAME_COUNT,
+        zero_for_test,
+    );
+
+    unsafe fn zero_for_test(_ppn: Ppn) {}
+
+    pub fn install_test_allocator_once() -> Result<(), AllocError> {
+        if INITIALIZED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            for ppn in 0..TEST_FRAME_COUNT {
+                TEST_ALLOCATOR.mark_free_for_test(Ppn(ppn));
+            }
+            return install_bitmap_allocator(&TEST_ALLOCATOR);
+        }
+
+        Ok(())
+    }
+
+    pub fn direct_map_base_for_test() -> usize {
+        TEST_DIRECT_MAP.0.get() as *mut u8 as usize
+    }
+
+    #[repr(align(4096))]
+    struct DirectMap(UnsafeCell<[u8; TEST_FRAME_COUNT * 4096]>);
+
+    unsafe impl Sync for DirectMap {}
+
+    static TEST_DIRECT_MAP: DirectMap = DirectMap(UnsafeCell::new([0; TEST_FRAME_COUNT * 4096]));
 }

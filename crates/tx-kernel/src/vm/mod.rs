@@ -1,18 +1,30 @@
 //! VM foundation values and the first bounded AddressSpace recipe core.
 //!
-//! This module intentionally stops before zone-owned `AddressSpace` evidence,
-//! persistent epoch snapshots, page-backed content, or pmap materialization.
-//! The types here are host-testable arithmetic, coordination, and recipe-index
-//! building blocks for those later layers.
+//! This module now carries zone-owned `AddressSpace` identity and cap-backed
+//! `PageContainer` recipe evidence. Persistent epoch recipe snapshots and real
+//! HAL pmap roots are still staged seams.
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::page_backed::{
-    MaterializeAccess, MaterializedPage, PageCacheError, PageContainer, PageFrame, PageIndex,
+    MaterializeAccess, MaterializedPage, PageCacheError, PageContainer, PageIndex,
 };
+use crate::sync::SpinMutex;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use tx_hal::Ppn;
+use tx_substrate::{
+    page_allocator::{BitmapPageAllocator, MapPin},
+    zone::{self, Cap, Zone, ZoneAllocated, ZoneError},
+};
+
+static ADDRESS_SPACE_ZONE: Zone<AddressSpace> = Zone::const_new();
+
+unsafe impl ZoneAllocated for AddressSpace {
+    fn zone() -> &'static Zone<Self> {
+        &ADDRESS_SPACE_ZONE
+    }
+}
 
 pub const USER_PAGE_SIZE: usize = 4096;
 
@@ -236,57 +248,39 @@ impl VmEntryFlags {
     }
 }
 
-/// Draft/test backing value. This is not a real PageContainer or VM authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum VmBackingDraft {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VmBacking {
     None,
     PrivateAnon,
-    PageBacked { container_id: u64, offset: u64 },
-    MockPage { id: u64, offset: u64 },
+    Page { pc: Cap<PageContainer>, offset: u64 },
 }
 
-impl VmBackingDraft {
-    fn at_range_offset(self, delta: usize) -> Result<Self, VmEntryError> {
+impl VmBacking {
+    fn at_range_offset(&self, delta: usize) -> Result<Self, VmEntryError> {
         match self {
-            Self::PageBacked {
-                container_id,
-                offset,
-            } => Ok(Self::PageBacked {
-                container_id,
+            Self::Page { pc, offset } => Ok(Self::Page {
+                pc: pc.clone(),
                 offset: offset
                     .checked_add(
                         u64::try_from(delta).map_err(|_| VmEntryError::BackingOffsetOverflow)?,
                     )
                     .ok_or(VmEntryError::BackingOffsetOverflow)?,
             }),
-            Self::MockPage { id, offset } => Ok(Self::MockPage {
-                id,
-                offset: offset
-                    .checked_add(
-                        u64::try_from(delta).map_err(|_| VmEntryError::BackingOffsetOverflow)?,
-                    )
-                    .ok_or(VmEntryError::BackingOffsetOverflow)?,
-            }),
-            other => Ok(other),
+            other => Ok(other.clone()),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmEntry {
     pub range: UserRange,
     pub prot: Prot,
     pub flags: VmEntryFlags,
-    pub backing: VmBackingDraft,
+    pub backing: VmBacking,
 }
 
 impl VmEntry {
-    pub const fn new(
-        range: UserRange,
-        prot: Prot,
-        flags: VmEntryFlags,
-        backing: VmBackingDraft,
-    ) -> Self {
+    pub fn new(range: UserRange, prot: Prot, flags: VmEntryFlags, backing: VmBacking) -> Self {
         Self {
             range,
             prot,
@@ -295,12 +289,12 @@ impl VmEntry {
         }
     }
 
-    pub fn split_for_unmap(self, hole: UserRange) -> Result<VmEntryRewrite, VmEntryError> {
+    pub fn split_for_unmap(&self, hole: UserRange) -> Result<VmEntryRewrite, VmEntryError> {
         self.split_rewrite(hole, None)
     }
 
     pub fn split_for_protect(
-        self,
+        &self,
         target: UserRange,
         prot: Prot,
     ) -> Result<VmEntryRewrite, VmEntryError> {
@@ -308,7 +302,7 @@ impl VmEntry {
     }
 
     fn split_rewrite(
-        self,
+        &self,
         target: UserRange,
         target_prot: Option<Prot>,
     ) -> Result<VmEntryRewrite, VmEntryError> {
@@ -339,7 +333,7 @@ impl VmEntry {
     }
 
     fn sub_entry(
-        self,
+        &self,
         start: UserVirtAddr,
         end: UserVirtAddr,
         prot: Prot,
@@ -359,7 +353,7 @@ impl VmEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmEntryRewrite {
     pub before: Option<VmEntry>,
     pub target: Option<VmEntry>,
@@ -385,9 +379,33 @@ pub struct AddressSpaceStats {
     pub vm_size: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct PmapMapping {
-    pub frame: PageFrame,
+    pub ppn: Ppn,
+    pub prot: Prot,
+    _map_pin: MapPin<'static, BitmapPageAllocator<'static>>,
+}
+
+impl PmapMapping {
+    fn new(ppn: Ppn, prot: Prot, map_pin: MapPin<'static, BitmapPageAllocator<'static>>) -> Self {
+        Self {
+            ppn,
+            prot,
+            _map_pin: map_pin,
+        }
+    }
+
+    fn snapshot(&self) -> PmapMappingSnapshot {
+        PmapMappingSnapshot {
+            ppn: self.ppn,
+            prot: self.prot,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PmapMappingSnapshot {
+    pub ppn: Ppn,
     pub prot: Prot,
 }
 
@@ -417,8 +435,12 @@ impl PmapSeam {
         self.materialization_deferred
     }
 
-    pub fn lookup(&self, page: UserPage) -> Option<PmapMapping> {
-        self.state.lock().mappings.get(&page).copied()
+    pub fn lookup(&self, page: UserPage) -> Option<PmapMappingSnapshot> {
+        self.state
+            .lock()
+            .mappings
+            .get(&page)
+            .map(PmapMapping::snapshot)
     }
 
     pub fn stats(&self) -> PmapStats {
@@ -441,16 +463,33 @@ impl PmapSeam {
         Ok(PmapReservationSeam {
             pmap: self,
             page,
-            mapping,
+            mapping: Some(mapping),
             committed: false,
         })
     }
 
-    fn commit_page(&self, page: UserPage, mapping: PmapMapping) -> PmapPublishOutcome {
+    fn commit_page(
+        &self,
+        page: UserPage,
+        mapping: PmapMapping,
+    ) -> Result<PmapPublishOutcome, VmFaultError> {
         let mut state = self.state.lock();
-        let replaced = state.mappings.insert(page, mapping).is_some();
+        if let Some(existing) = state.mappings.get(&page) {
+            if existing.ppn == mapping.ppn && existing.prot == mapping.prot {
+                return Ok(PmapPublishOutcome {
+                    page,
+                    replaced: false,
+                });
+            }
+            return Err(VmFaultError::StaleRecipe);
+        }
+
+        state.mappings.insert(page, mapping);
         state.commits += 1;
-        PmapPublishOutcome { page, replaced }
+        Ok(PmapPublishOutcome {
+            page,
+            replaced: false,
+        })
     }
 
     fn rollback_page(&self) {
@@ -496,7 +535,7 @@ impl PmapState {
 pub struct PmapReservationSeam<'a> {
     pmap: &'a PmapSeam,
     page: UserPage,
-    mapping: PmapMapping,
+    mapping: Option<PmapMapping>,
     committed: bool,
 }
 
@@ -505,9 +544,10 @@ impl PmapReservationSeam<'_> {
         self.page
     }
 
-    fn commit(mut self) -> PmapPublishOutcome {
+    fn commit(mut self) -> Result<PmapPublishOutcome, VmFaultError> {
         self.committed = true;
-        self.pmap.commit_page(self.page, self.mapping)
+        let mapping = self.mapping.take().ok_or(VmFaultError::StaleRecipe)?;
+        self.pmap.commit_page(self.page, mapping)
     }
 }
 
@@ -546,21 +586,21 @@ pub enum VmMapTarget {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmMapRequest {
     pub target: VmMapTarget,
     pub prot: Prot,
     pub flags: VmEntryFlags,
-    pub backing: VmBackingDraft,
+    pub backing: VmBacking,
 }
 
 impl VmMapRequest {
-    pub const fn anywhere(
+    pub fn anywhere(
         window: UserRange,
         page_count: usize,
         prot: Prot,
         flags: VmEntryFlags,
-        backing: VmBackingDraft,
+        backing: VmBacking,
     ) -> Self {
         Self {
             target: VmMapTarget::Anywhere { window, page_count },
@@ -570,12 +610,12 @@ impl VmMapRequest {
         }
     }
 
-    pub const fn fixed(
+    pub fn fixed(
         range: UserRange,
         placement: MapPlacement,
         prot: Prot,
         flags: VmEntryFlags,
-        backing: VmBackingDraft,
+        backing: VmBacking,
     ) -> Self {
         Self {
             target: VmMapTarget::Fixed { range, placement },
@@ -626,7 +666,7 @@ impl VmFault {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmFaultOutcome {
     pub page_range: UserRange,
     pub entry: VmEntry,
@@ -635,14 +675,14 @@ pub struct VmFaultOutcome {
 }
 
 impl VmFaultOutcome {
-    pub fn materialize_pagebacked_anon(
-        self,
-        pc: &mut PageContainer,
-    ) -> Result<VmFaultMaterialization, VmFaultError> {
+    pub fn materialize_pagebacked_anon(&self) -> Result<VmFaultMaterialization, VmFaultError> {
         let page_index = self.backing_page_index()?;
         let access = match self.access {
             AccessMode::Write => MaterializeAccess::Write,
             AccessMode::Read | AccessMode::Execute => MaterializeAccess::Read,
+        };
+        let VmBacking::Page { pc, .. } = &self.entry.backing else {
+            return Err(VmFaultError::BackingMismatch);
         };
         let page = pc
             .materialize_anon(page_index, access)
@@ -654,8 +694,8 @@ impl VmFaultOutcome {
         })
     }
 
-    fn backing_page_index(self) -> Result<PageIndex, VmFaultError> {
-        let VmBackingDraft::PageBacked { offset, .. } = self.entry.backing else {
+    fn backing_page_index(&self) -> Result<PageIndex, VmFaultError> {
+        let VmBacking::Page { offset, .. } = &self.entry.backing else {
             return Err(VmFaultError::BackingMismatch);
         };
         let delta = self
@@ -664,7 +704,7 @@ impl VmFaultOutcome {
             .as_usize()
             .checked_sub(self.entry.range.start().as_usize())
             .ok_or(VmFaultError::BackingOffsetOverflow)?;
-        let byte_offset = offset
+        let byte_offset = (*offset)
             .checked_add(u64::try_from(delta).map_err(|_| VmFaultError::BackingOffsetOverflow)?)
             .ok_or(VmFaultError::BackingOffsetOverflow)?;
         if !byte_offset.is_multiple_of(USER_PAGE_SIZE as u64) {
@@ -674,7 +714,7 @@ impl VmFaultOutcome {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct VmFaultMaterialization {
     pub page_index: PageIndex,
     pub page: MaterializedPage,
@@ -714,6 +754,11 @@ impl AddressSpace {
             range_lock: RangeLock::new(),
             stats: AddressSpaceStatsCell::new(),
         }
+    }
+
+    pub fn new_cap() -> Result<Cap<AddressSpace>, ZoneError> {
+        let reservation = zone::reserve_for::<AddressSpace>()?;
+        Ok(zone::sign_for(reservation, Self::new()))
     }
 
     pub const fn pmap(&self) -> &PmapSeam {
@@ -789,12 +834,13 @@ impl AddressSpace {
 
         let reservation = self.pmap.reserve_page(
             outcome.page_range.start().containing_page(),
-            PmapMapping {
-                frame: materialization.page.frame,
-                prot: entry.prot,
-            },
+            PmapMapping::new(
+                materialization.page.ppn,
+                entry.prot,
+                materialization.page.map_pin,
+            ),
         )?;
-        Ok(reservation.commit())
+        reservation.commit()
     }
 
     pub fn map_script(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
@@ -854,7 +900,7 @@ impl AddressSpace {
             AcquireResult::WouldBlock(blocked) => return MapReserveResult::WouldBlock(blocked),
         };
 
-        if let Err(error) = self.recipes.validate_map(entry, placement) {
+        if let Err(error) = self.recipes.validate_map(&entry, placement) {
             return MapReserveResult::Err(error);
         }
 
@@ -894,9 +940,10 @@ impl AddressSpace {
         entry: VmEntry,
         placement: MapPlacement,
     ) -> Result<VmMapCommit, VmMapError> {
+        let range = entry.range;
         let commit = self.recipes.commit_map(entry, placement)?;
         if placement == MapPlacement::FixedReplace {
-            self.pmap.teardown_range(entry.range);
+            self.pmap.teardown_range(range);
         }
         self.stats.store(self.recipes.stats());
         Ok(commit)
@@ -934,7 +981,7 @@ pub struct MapReservation<'a> {
 
 impl MapReservation<'_> {
     pub fn entry(&self) -> VmEntry {
-        self.entry
+        self.entry.clone()
     }
 
     pub fn placement(&self) -> MapPlacement {
@@ -982,7 +1029,7 @@ impl RecipeIndex {
         overlapping_in(&entries, range)
     }
 
-    fn validate_map(&self, entry: VmEntry, placement: MapPlacement) -> Result<(), VmMapError> {
+    fn validate_map(&self, entry: &VmEntry, placement: MapPlacement) -> Result<(), VmMapError> {
         let entries = self.entries.lock();
         match placement {
             MapPlacement::RequireFree => validate_insert_free(&entries, entry),
@@ -998,14 +1045,13 @@ impl RecipeIndex {
         let mut entries = self.entries.lock();
         match placement {
             MapPlacement::RequireFree => {
-                validate_insert_free(&entries, entry)?;
+                validate_insert_free(&entries, &entry)?;
+                let changed_pages = entry.range.page_count();
                 push_entry(&mut entries, entry);
-                Ok(VmMapCommit {
-                    changed_pages: entry.range.page_count(),
-                })
+                Ok(VmMapCommit { changed_pages })
             }
             MapPlacement::FixedReplace => {
-                let (rewritten, changed_pages) = rewrite_fixed(&entries, entry)?;
+                let (rewritten, changed_pages) = rewrite_fixed(&entries, &entry)?;
                 *entries = rewritten;
                 Ok(VmMapCommit { changed_pages })
             }
@@ -1067,7 +1113,7 @@ impl AddressSpaceStatsCell {
 
 fn validate_insert_free(
     entries: &BTreeMap<UserVirtAddr, VmEntry>,
-    entry: VmEntry,
+    entry: &VmEntry,
 ) -> Result<(), VmMapError> {
     if entries
         .values()
@@ -1081,12 +1127,12 @@ fn validate_insert_free(
 
 fn rewrite_fixed(
     entries: &BTreeMap<UserVirtAddr, VmEntry>,
-    replacement: VmEntry,
+    replacement: &VmEntry,
 ) -> Result<(BTreeMap<UserVirtAddr, VmEntry>, usize), VmMapError> {
     let mut rewritten = BTreeMap::new();
     let mut replaced_pages = 0;
 
-    for existing in entries.values().copied() {
+    for existing in entries.values().cloned() {
         let Some(overlap) = range_intersection(existing.range, replacement.range) else {
             push_entry(&mut rewritten, existing);
             continue;
@@ -1102,7 +1148,7 @@ fn rewrite_fixed(
         }
     }
 
-    push_entry(&mut rewritten, replacement);
+    push_entry(&mut rewritten, replacement.clone());
     Ok((rewritten, replaced_pages + replacement.range.page_count()))
 }
 
@@ -1113,7 +1159,7 @@ fn rewrite_unmap(
     let mut rewritten = BTreeMap::new();
     let mut changed_pages = 0;
 
-    for existing in entries.values().copied() {
+    for existing in entries.values().cloned() {
         let Some(overlap) = range_intersection(existing.range, range) else {
             push_entry(&mut rewritten, existing);
             continue;
@@ -1144,7 +1190,7 @@ fn rewrite_protect(
     let mut rewritten = BTreeMap::new();
     let mut changed_pages = 0;
 
-    for existing in entries.values().copied() {
+    for existing in entries.values().cloned() {
         let Some(overlap) = range_intersection(existing.range, range) else {
             push_entry(&mut rewritten, existing);
             continue;
@@ -1181,18 +1227,18 @@ fn rewrite_remap_disjoint(
     }
     validate_insert_free(
         entries,
-        VmEntry::new(
+        &VmEntry::new(
             new_range,
             Prot::NONE,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::None,
+            VmBacking::None,
         ),
     )?;
 
     let mut rewritten = BTreeMap::new();
     let mut moved = Vec::new();
 
-    for existing in entries.values().copied() {
+    for existing in entries.values().cloned() {
         let Some(overlap) = range_intersection(existing.range, old_range) else {
             push_entry(&mut rewritten, existing);
             continue;
@@ -1258,7 +1304,7 @@ fn lookup_in(entries: &BTreeMap<UserVirtAddr, VmEntry>, addr: UserVirtAddr) -> O
     entries
         .range(..=addr)
         .next_back()
-        .map(|(_, entry)| *entry)
+        .map(|(_, entry)| entry.clone())
         .filter(|entry| entry.range.contains_addr(addr))
 }
 
@@ -1284,7 +1330,7 @@ fn find_gap_in(
     let mut cursor = window.start().as_usize();
     let window_end = window.end().as_usize();
 
-    for entry in entries.values().copied() {
+    for entry in entries.values() {
         if entry.range.end().as_usize() <= cursor {
             continue;
         }
@@ -1319,7 +1365,7 @@ fn find_gap_in(
 fn overlapping_in(entries: &BTreeMap<UserVirtAddr, VmEntry>, range: UserRange) -> Vec<VmEntry> {
     entries
         .values()
-        .copied()
+        .cloned()
         .filter(|entry| entry.range.overlaps(range))
         .collect()
 }
@@ -1988,60 +2034,50 @@ fn min_option_id(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-struct SpinMutex<T> {
-    locked: AtomicBool,
-    value: UnsafeCell<T>,
-}
-
-unsafe impl<T: Send> Sync for SpinMutex<T> {}
-
-impl<T> SpinMutex<T> {
-    const fn new(value: T) -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-            value: UnsafeCell::new(value),
-        }
-    }
-
-    fn lock(&self) -> SpinMutexGuard<'_, T> {
-        while self
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        SpinMutexGuard { mutex: self }
-    }
-}
-
-struct SpinMutexGuard<'a, T> {
-    mutex: &'a SpinMutex<T>,
-}
-
-impl<T> core::ops::Deref for SpinMutexGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.mutex.value.get() }
-    }
-}
-
-impl<T> core::ops::DerefMut for SpinMutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.mutex.value.get() }
-    }
-}
-
-impl<T> Drop for SpinMutexGuard<'_, T> {
-    fn drop(&mut self) {
-        self.mutex.locked.store(false, Ordering::Release);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn setup_host_substrate() {
+        tx_substrate::testing::init_host_for_test_once();
+    }
+
+    fn page_backing(offset: u64) -> VmBacking {
+        setup_host_substrate();
+        VmBacking::Page {
+            pc: PageContainer::new_cap(
+                crate::page_backed::PageContainerKind::Anon {
+                    swap_policy: crate::page_backed::AnonSwapPolicy::Reclaimable,
+                },
+                16,
+            )
+            .expect("page container cap"),
+            offset,
+        }
+    }
+
+    fn page_backing_like(backing: &VmBacking, offset: u64) -> VmBacking {
+        let VmBacking::Page { pc, .. } = backing else {
+            panic!("expected page backing");
+        };
+        VmBacking::Page {
+            pc: pc.clone(),
+            offset,
+        }
+    }
+
+    fn pmap_mapping_for_test(prot: Prot) -> PmapMapping {
+        setup_host_substrate();
+        let frame = tx_substrate::page_allocator::reserve_frame(
+            tx_substrate::page_allocator::ZeroPolicy::Zeroed,
+        )
+        .expect("frame reservation")
+        .commit();
+        let ppn = frame.ppn();
+        let map_pin = frame.try_map_pin().expect("map pin");
+        drop(frame);
+        PmapMapping::new(ppn, prot, map_pin)
+    }
 
     fn range(start: usize, pages: usize) -> UserRange {
         UserRange::new_aligned(UserVirtAddr(start), pages * USER_PAGE_SIZE).expect("valid range")
@@ -2327,7 +2363,7 @@ mod tests {
             range(0x1000, 4),
             Prot::READ_WRITE,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::MockPage { id: 7, offset: 10 },
+            page_backing(10),
         );
 
         let rewrite = entry
@@ -2340,7 +2376,7 @@ mod tests {
                 range(0x1000, 1),
                 Prot::READ_WRITE,
                 VmEntryFlags::PRIVATE,
-                VmBackingDraft::MockPage { id: 7, offset: 10 },
+                page_backing_like(&entry.backing, 10),
             )
         );
         assert_eq!(
@@ -2349,10 +2385,7 @@ mod tests {
                 range(0x4000, 1),
                 Prot::READ_WRITE,
                 VmEntryFlags::PRIVATE,
-                VmBackingDraft::MockPage {
-                    id: 7,
-                    offset: 10 + (3 * USER_PAGE_SIZE) as u64,
-                },
+                page_backing_like(&entry.backing, 10 + (3 * USER_PAGE_SIZE) as u64),
             )
         );
         assert_eq!(rewrite.target, None);
@@ -2364,7 +2397,7 @@ mod tests {
             range(0x1000, 3),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
 
         let rewrite = entry
@@ -2387,17 +2420,18 @@ mod tests {
             range(0x4000, 2),
             Prot::READ_WRITE,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
 
-        let reservation = map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree));
+        let reservation =
+            map_reserved(aspace.reserve_map(entry.clone(), MapPlacement::RequireFree));
         assert_eq!(aspace.lookup(UserVirtAddr(0x4000)), None);
         assert_eq!(aspace.stats(), AddressSpaceStats::default());
 
         let commit = reservation.commit().expect("map commit");
 
         assert_eq!(commit.changed_pages, 2);
-        assert_eq!(aspace.lookup(UserVirtAddr(0x4000)), Some(entry));
+        assert_eq!(aspace.lookup(UserVirtAddr(0x4000)), Some(entry.clone()));
         assert_eq!(aspace.lookup(UserVirtAddr(0x5fff)), Some(entry));
         assert_eq!(aspace.lookup(UserVirtAddr(0x6000)), None);
         assert_eq!(
@@ -2416,7 +2450,7 @@ mod tests {
             range(0x8000, 1),
             Prot::READ,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::None,
+            VmBacking::None,
         );
 
         let reservation = map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree));
@@ -2433,9 +2467,9 @@ mod tests {
             range(0x1000, 2),
             Prot::READ,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
-        map_reserved(aspace.reserve_map(first, MapPlacement::RequireFree))
+        map_reserved(aspace.reserve_map(first.clone(), MapPlacement::RequireFree))
             .commit()
             .expect("initial map");
 
@@ -2443,7 +2477,7 @@ mod tests {
             range(0x2000, 1),
             Prot::READ_WRITE,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
 
         assert_eq!(
@@ -2460,9 +2494,9 @@ mod tests {
             range(0x1000, 4),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
-            VmBackingDraft::MockPage { id: 9, offset: 0 },
+            page_backing(0),
         );
-        map_reserved(aspace.reserve_map(original, MapPlacement::RequireFree))
+        map_reserved(aspace.reserve_map(original.clone(), MapPlacement::RequireFree))
             .commit()
             .expect("initial map");
 
@@ -2470,11 +2504,12 @@ mod tests {
             range(0x2000, 2),
             Prot::READ,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
-        let commit = map_reserved(aspace.reserve_map(replacement, MapPlacement::FixedReplace))
-            .commit()
-            .expect("fixed replace");
+        let commit =
+            map_reserved(aspace.reserve_map(replacement.clone(), MapPlacement::FixedReplace))
+                .commit()
+                .expect("fixed replace");
 
         assert_eq!(commit.changed_pages, 4);
         assert_eq!(
@@ -2483,7 +2518,7 @@ mod tests {
                 range(0x1000, 1),
                 Prot::READ_WRITE,
                 VmEntryFlags::SHARED,
-                VmBackingDraft::MockPage { id: 9, offset: 0 },
+                page_backing_like(&original.backing, 0),
             ))
         );
         assert_eq!(aspace.lookup(UserVirtAddr(0x2000)), Some(replacement));
@@ -2493,10 +2528,7 @@ mod tests {
                 range(0x4000, 1),
                 Prot::READ_WRITE,
                 VmEntryFlags::SHARED,
-                VmBackingDraft::MockPage {
-                    id: 9,
-                    offset: (3 * USER_PAGE_SIZE) as u64,
-                },
+                page_backing_like(&original.backing, (3 * USER_PAGE_SIZE) as u64),
             ))
         );
         assert_eq!(
@@ -2515,7 +2547,7 @@ mod tests {
             range(0x1000, 4),
             Prot::READ_WRITE,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
         map_reserved(aspace.reserve_map(original, MapPlacement::RequireFree))
             .commit()
@@ -2550,7 +2582,7 @@ mod tests {
             range(0x1000, 3),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
-            VmBackingDraft::MockPage { id: 11, offset: 0 },
+            page_backing(0),
         );
         map_reserved(aspace.reserve_map(original, MapPlacement::RequireFree))
             .commit()
@@ -2586,13 +2618,13 @@ mod tests {
             range(0x1000, 2),
             Prot::READ,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
         let second = VmEntry::new(
             range(0x5000, 1),
             Prot::READ,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
         map_reserved(aspace.reserve_map(first, MapPlacement::RequireFree))
             .commit()
@@ -2615,18 +2647,18 @@ mod tests {
             range(0x1000, 1),
             Prot::READ,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
         let right = VmEntry::new(
             range(0x3000, 2),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
-            VmBackingDraft::MockPage { id: 5, offset: 0 },
+            page_backing(0),
         );
-        map_reserved(aspace.reserve_map(left, MapPlacement::RequireFree))
+        map_reserved(aspace.reserve_map(left.clone(), MapPlacement::RequireFree))
             .commit()
             .expect("left map");
-        map_reserved(aspace.reserve_map(right, MapPlacement::RequireFree))
+        map_reserved(aspace.reserve_map(right.clone(), MapPlacement::RequireFree))
             .commit()
             .expect("right map");
 
@@ -2643,9 +2675,9 @@ mod tests {
             range(0x4000, 1),
             Prot::READ,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
-        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+        map_reserved(aspace.reserve_map(entry.clone(), MapPlacement::RequireFree))
             .commit()
             .expect("map");
 
@@ -2673,7 +2705,7 @@ mod tests {
             range(0x1000, 1),
             Prot::READ,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
         map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
             .commit()
@@ -2697,26 +2729,16 @@ mod tests {
             range(0x2000, 2),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
-            VmBackingDraft::PageBacked {
-                container_id: 7,
-                offset: USER_PAGE_SIZE as u64,
-            },
+            page_backing(USER_PAGE_SIZE as u64),
         );
         map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
             .commit()
             .expect("map");
-        let mut pc = crate::page_backed::PageContainer::new(
-            crate::page_backed::PageContainerKind::Anon {
-                swap_policy: crate::page_backed::AnonSwapPolicy::Reclaimable,
-            },
-            4,
-        );
-
         let outcome = aspace
             .resolve_fault(VmFault::new(UserVirtAddr(0x3000), AccessMode::Write))
             .expect("fault resolves");
         let materialized = outcome
-            .materialize_pagebacked_anon(&mut pc)
+            .materialize_pagebacked_anon()
             .expect("pagebacked materialization");
 
         assert_eq!(
@@ -2725,10 +2747,40 @@ mod tests {
         );
         assert!(materialized.page.newly_installed);
         assert!(materialized.page.dirty);
-        assert_eq!(
-            pc.lookup(crate::page_backed::PageIndex::new(2)),
-            Some(materialized.page.frame)
-        );
+    }
+
+    #[test]
+    fn address_space_cap_maps_cap_backed_page_container() {
+        setup_host_substrate();
+        let aspace = AddressSpace::new_cap().expect("address space cap");
+        let pc = crate::page_backed::PageContainer::new_cap(
+            crate::page_backed::PageContainerKind::Anon {
+                swap_policy: crate::page_backed::AnonSwapPolicy::Reclaimable,
+            },
+            8,
+        )
+        .expect("page container cap");
+        let range = range(0x41_0000, 1);
+
+        let outcome = aspace
+            .map_script(VmMapRequest::fixed(
+                range,
+                MapPlacement::RequireFree,
+                Prot::READ_WRITE,
+                VmEntryFlags::SHARED,
+                VmBacking::Page {
+                    pc: pc.clone(),
+                    offset: USER_PAGE_SIZE as u64,
+                },
+            ))
+            .expect("map cap-backed page container");
+
+        assert_eq!(outcome.range, range);
+        let entry = aspace.lookup(range.start()).expect("mapped recipe");
+        assert!(matches!(
+            entry.backing,
+            VmBacking::Page { offset, .. } if offset == USER_PAGE_SIZE as u64
+        ));
     }
 
     #[test]
@@ -2738,24 +2790,17 @@ mod tests {
             range(0x4000, 1),
             Prot::READ,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
         map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
             .commit()
             .expect("map");
-        let mut pc = crate::page_backed::PageContainer::new(
-            crate::page_backed::PageContainerKind::Anon {
-                swap_policy: crate::page_backed::AnonSwapPolicy::Reclaimable,
-            },
-            1,
-        );
-
         let outcome = aspace
             .resolve_fault(VmFault::new(UserVirtAddr(0x4000), AccessMode::Read))
             .expect("fault resolves");
 
         assert_eq!(
-            outcome.materialize_pagebacked_anon(&mut pc),
+            outcome.materialize_pagebacked_anon().map(|_| ()),
             Err(VmFaultError::BackingMismatch)
         );
     }
@@ -2767,26 +2812,15 @@ mod tests {
             range(0x2000, 1),
             Prot::READ,
             VmEntryFlags::SHARED,
-            VmBackingDraft::PageBacked {
-                container_id: 1,
-                offset: 0,
-            },
+            page_backing(0),
         );
         map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
             .commit()
             .expect("map");
-        let mut pc = crate::page_backed::PageContainer::new(
-            crate::page_backed::PageContainerKind::Anon {
-                swap_policy: crate::page_backed::AnonSwapPolicy::Reclaimable,
-            },
-            1,
-        );
         let outcome = aspace
             .resolve_fault(VmFault::new(UserVirtAddr(0x2000), AccessMode::Read))
             .expect("fault resolves");
-        let materialized = outcome
-            .materialize_pagebacked_anon(&mut pc)
-            .expect("materialize");
+        let materialized = outcome.materialize_pagebacked_anon().expect("materialize");
 
         aspace.unmap(range(0x2000, 1)).expect("stale recipe");
 
@@ -2804,27 +2838,16 @@ mod tests {
             range(0x3000, 1),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
-            VmBackingDraft::PageBacked {
-                container_id: 2,
-                offset: 0,
-            },
+            page_backing(0),
         );
         map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
             .commit()
             .expect("map");
-        let mut pc = crate::page_backed::PageContainer::new(
-            crate::page_backed::PageContainerKind::Anon {
-                swap_policy: crate::page_backed::AnonSwapPolicy::Reclaimable,
-            },
-            1,
-        );
         let outcome = aspace
             .resolve_fault(VmFault::new(UserVirtAddr(0x3000), AccessMode::Write))
             .expect("fault resolves");
-        let materialized = outcome
-            .materialize_pagebacked_anon(&mut pc)
-            .expect("materialize");
-        let frame = materialized.page.frame;
+        let materialized = outcome.materialize_pagebacked_anon().expect("materialize");
+        let ppn = materialized.page.ppn;
 
         let publish = aspace
             .publish_fault_materialization(outcome, materialized)
@@ -2833,8 +2856,8 @@ mod tests {
         assert_eq!(publish.page, UserPage(3));
         assert_eq!(
             aspace.pmap().lookup(UserPage(3)),
-            Some(PmapMapping {
-                frame,
+            Some(PmapMappingSnapshot {
+                ppn,
                 prot: Prot::READ_WRITE,
             })
         );
@@ -2859,13 +2882,7 @@ mod tests {
     fn vm_pmap_staging_reservation_rolls_back_when_abandoned() {
         let pmap = PmapSeam::new_deferred();
         let reservation = pmap
-            .reserve_page(
-                UserPage(9),
-                PmapMapping {
-                    frame: crate::page_backed::PageFrame::new(900),
-                    prot: Prot::READ,
-                },
-            )
+            .reserve_page(UserPage(9), pmap_mapping_for_test(Prot::READ))
             .expect("reserve");
 
         assert_eq!(reservation.page(), UserPage(9));
@@ -2891,26 +2908,15 @@ mod tests {
             range(0x9000, 1),
             Prot::READ,
             VmEntryFlags::SHARED,
-            VmBackingDraft::PageBacked {
-                container_id: 9,
-                offset: 0,
-            },
+            page_backing(0),
         );
         map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
             .commit()
             .expect("map");
-        let mut pc = crate::page_backed::PageContainer::new(
-            crate::page_backed::PageContainerKind::Anon {
-                swap_policy: crate::page_backed::AnonSwapPolicy::Reclaimable,
-            },
-            1,
-        );
         let outcome = aspace
             .resolve_fault(VmFault::new(UserVirtAddr(0x9000), AccessMode::Read))
             .expect("fault resolves");
-        let materialized = outcome
-            .materialize_pagebacked_anon(&mut pc)
-            .expect("materialize");
+        let materialized = outcome.materialize_pagebacked_anon().expect("materialize");
 
         aspace
             .publish_fault_materialization(outcome, materialized)
@@ -2935,26 +2941,15 @@ mod tests {
             range(0x5000, 1),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
-            VmBackingDraft::PageBacked {
-                container_id: 3,
-                offset: 0,
-            },
+            page_backing(0),
         );
         map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
             .commit()
             .expect("map");
-        let mut pc = crate::page_backed::PageContainer::new(
-            crate::page_backed::PageContainerKind::Anon {
-                swap_policy: crate::page_backed::AnonSwapPolicy::Reclaimable,
-            },
-            1,
-        );
         let outcome = aspace
             .resolve_fault(VmFault::new(UserVirtAddr(0x5000), AccessMode::Read))
             .expect("fault resolves");
-        let materialized = outcome
-            .materialize_pagebacked_anon(&mut pc)
-            .expect("materialize");
+        let materialized = outcome.materialize_pagebacked_anon().expect("materialize");
         aspace
             .publish_fault_materialization(outcome, materialized)
             .expect("publish");
@@ -2975,7 +2970,7 @@ mod tests {
                 range(0x1000, 1),
                 Prot::READ,
                 VmEntryFlags::PRIVATE,
-                VmBackingDraft::PrivateAnon,
+                VmBacking::PrivateAnon,
             ),
             MapPlacement::RequireFree,
         ))
@@ -2986,7 +2981,7 @@ mod tests {
                 range(0x4000, 1),
                 Prot::READ,
                 VmEntryFlags::PRIVATE,
-                VmBackingDraft::PrivateAnon,
+                VmBacking::PrivateAnon,
             ),
             MapPlacement::RequireFree,
         ))
@@ -2999,7 +2994,7 @@ mod tests {
                 2,
                 Prot::READ_WRITE,
                 VmEntryFlags::PRIVATE,
-                VmBackingDraft::PrivateAnon,
+                VmBacking::PrivateAnon,
             ))
             .expect("map into gap");
 
@@ -3015,7 +3010,7 @@ mod tests {
                 2,
                 Prot::READ,
                 VmEntryFlags::PRIVATE,
-                VmBackingDraft::PrivateAnon,
+                VmBacking::PrivateAnon,
             )),
             Err(VmMapError::NoFreeRange)
         );
@@ -3028,9 +3023,9 @@ mod tests {
             range(0x1000, 3),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
-            VmBackingDraft::MockPage { id: 33, offset: 0 },
+            page_backing(0),
         );
-        map_reserved(aspace.reserve_map(original, MapPlacement::RequireFree))
+        map_reserved(aspace.reserve_map(original.clone(), MapPlacement::RequireFree))
             .commit()
             .expect("seed");
 
@@ -3039,7 +3034,7 @@ mod tests {
             MapPlacement::FixedReplace,
             Prot::READ,
             VmEntryFlags::PRIVATE,
-            VmBackingDraft::PrivateAnon,
+            VmBacking::PrivateAnon,
         );
         let outcome = aspace.map_script(replacement).expect("fixed replace");
 
@@ -3069,9 +3064,9 @@ mod tests {
             range(0x1000, 4),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
-            VmBackingDraft::MockPage { id: 44, offset: 0 },
+            page_backing(0),
         );
-        map_reserved(aspace.reserve_map(original, MapPlacement::RequireFree))
+        map_reserved(aspace.reserve_map(original.clone(), MapPlacement::RequireFree))
             .commit()
             .expect("seed");
 
@@ -3097,10 +3092,7 @@ mod tests {
                 range(0x8000, 2),
                 Prot::READ_WRITE,
                 VmEntryFlags::SHARED,
-                VmBackingDraft::MockPage {
-                    id: 44,
-                    offset: USER_PAGE_SIZE as u64,
-                },
+                page_backing_like(&original.backing, USER_PAGE_SIZE as u64),
             ))
         );
     }
@@ -3113,7 +3105,7 @@ mod tests {
                 range(0x1000, 4),
                 Prot::READ,
                 VmEntryFlags::PRIVATE,
-                VmBackingDraft::PrivateAnon,
+                VmBacking::PrivateAnon,
             ),
             MapPlacement::RequireFree,
         ))
@@ -3124,7 +3116,7 @@ mod tests {
                 range(0x8000, 1),
                 Prot::READ,
                 VmEntryFlags::PRIVATE,
-                VmBackingDraft::PrivateAnon,
+                VmBacking::PrivateAnon,
             ),
             MapPlacement::RequireFree,
         ))
