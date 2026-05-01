@@ -1,0 +1,383 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-04-30-reactor-parallel-shards",
+  "title": "Reactor parallel development sharding",
+  "status": "complete",
+  "created": "2026-04-30",
+  "updated": "2026-04-30",
+  "owner": "codex",
+  "summary": "Shard the remaining reactor work into isolated worker lanes while keeping the main context responsible for API decisions and final integration. Serial API decisions, module split, first-wave worker merge, and second-wave worker merge are complete. Deferred userspace-run, CoreInit wiring, and bus hardening remain outside this plan.",
+  "scope": {
+    "in": [
+      "crates/tx-reactor",
+      "crates/tx-reactor/tests",
+      "crates/tx-reactor/src/completion.rs",
+      "crates/tx-substrate/src/bus",
+      "crates/tx-kernel/src/reactor",
+      "docs/design/02_execution/REACTOR_v0.md",
+      "docs/design/02_execution/SCHEDULER_v0.md",
+      "docs/design/02_execution/COMPLETION_v1.md",
+      "docs/design/01_substrate/BUS_v1.md"
+    ],
+    "out": [
+      "non-goals/full-userspace-return-path",
+      "non-goals/process-threadruntime-entities",
+      "non-goals/full-smp-load-balancing",
+      "non-goals/full-posix-signal-subsystem",
+      "non-goals/vm-vfs-subsystem-implementation"
+    ],
+    "write_sets": [
+      {
+        "owner": "coordinator",
+        "paths": [
+          "crates/tx-reactor/src/lib.rs",
+          "docs/design/02_execution/REACTOR_v0.md",
+          "docs/design/02_execution/COMPLETION_v1.md",
+          "docs/design/01_substrate/BUS_v1.md"
+        ],
+        "notes": "Own the serial API decisions, module facade, progress records, second-wave facade prep, and final integration."
+      },
+      {
+        "owner": "worker-wait-interrupt-classification",
+        "paths": [
+          "crates/tx-reactor/src/interrupt.rs",
+          "crates/tx-reactor/src/wait.rs",
+          "crates/tx-reactor/tests/wait_interrupt.rs"
+        ],
+        "notes": "Own the reactor-local InterruptSource seam and Interrupted/Killed wait_event classification. Does not implement POSIX signal routing or AST delivery."
+      },
+      {
+        "owner": "worker-ast-preempt",
+        "paths": [
+          "crates/tx-reactor/src/ast.rs",
+          "crates/tx-reactor/src/preempt.rs",
+          "crates/tx-reactor/tests/ast_preempt.rs"
+        ],
+        "notes": "Own task-local AST/preemption markers consumed between polls. Avoid wait.rs and signal policy."
+      },
+      {
+        "owner": "worker-completion-middleware",
+        "paths": [
+          "crates/tx-reactor/src/completion.rs",
+          "crates/tx-reactor/tests/completion.rs"
+        ],
+        "notes": "Own counted Completion and closed-set CountdownCompletion over Channel::wait_event. Coordinator adds the module facade before dispatch."
+      },
+      {
+        "owner": "worker-sync-coord",
+        "paths": [
+          "crates/tx-reactor/src/sync_coord.rs",
+          "crates/tx-reactor/tests/sync_coord.rs"
+        ],
+        "notes": "Own synchronous coordination shape for shootdown-style rendezvous. Keep this reactor-local while the substrate lib.rs lease remains active."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/02_execution/REACTOR_v0.md",
+      "docs/design/02_execution/SCHEDULER_v0.md",
+      "docs/design/02_execution/THREAD_RUNTIME_v1.md",
+      "docs/design/02_execution/COMPLETION_v1.md",
+      "docs/design/01_substrate/BUS_v1.md",
+      "docs/design/00_meta-framework/INVARIANTS_v4.md"
+    ],
+      "progress_refs": [
+      "docs/progress/research/2026-04-30-reactor-readiness-for-subsystems.md",
+      "docs/progress/research/2026-04-30-reactor-first-wave-audit.md",
+      "docs/progress/research/2026-04-30-reactor-second-wave-scout.md",
+      "docs/progress/research/2026-04-30-reactor-second-wave-audit.md",
+      "docs/progress/worktrees/2026-04-29-reactor-task-aware.json",
+      "docs/progress/worktrees/2026-04-29-reactor-timer-queue.json",
+      "docs/progress/worktrees/2026-04-29-reactor-scheduler-shell.json"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "serial-api-decision",
+      "title": "Close reactor API decisions before worker fanout",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/design/02_execution/REACTOR_v0.md",
+        "docs/design/02_execution/COMPLETION_v1.md",
+        "docs/design/01_substrate/BUS_v1.md"
+      ],
+      "verification": [
+        "cargo xtask lint docs"
+      ],
+      "notes": "Completed in docs/progress/decisions/2026-04-30-reactor-serial-api-prework.md and aligned active wait/bus/reactor/completion docs. Canonical shape: wait_event(channel, mask, protocol, condition), check/register/recheck/park, credit-consuming Completion by default, cancel_task/drain_completed/drain_cancelled, and yield_now."
+    },
+    {
+      "id": "serial-module-split",
+      "title": "Split tx-reactor lib.rs into worker-owned modules without behavior changes",
+      "status": "complete",
+      "depends_on": [
+        "serial-api-decision"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/lib.rs",
+        "crates/tx-reactor/src/task.rs",
+        "crates/tx-reactor/src/waker.rs",
+        "crates/tx-reactor/src/scheduler.rs",
+        "crates/tx-reactor/src/wait.rs",
+        "crates/tx-reactor/src/timer.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/src/interrupt.rs",
+        "crates/tx-reactor/src/ast.rs",
+        "crates/tx-reactor/src/preempt.rs",
+        "crates/tx-reactor/src/sync_coord.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor"
+      ],
+      "notes": "Completed as a behavior-preserving split into facade, task, waker, scheduler, wait, timer, runtime, ast, preempt, interrupt, and sync_coord modules. cargo test -p tx-reactor passed with 17 tests."
+    },
+    {
+      "id": "parallel-task-lifecycle",
+      "title": "Implement generation-safe task handles and task drain/cancel",
+      "status": "complete",
+      "depends_on": [
+        "serial-module-split"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/task.rs",
+        "crates/tx-reactor/src/waker.rs",
+        "crates/tx-reactor/tests/task_lifecycle.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test task_lifecycle"
+      ],
+      "notes": "Dispatched to subagent 019ddd2f-11e2-7d62-b7d6-38d255174e4e, then coordinator-integrated into runtime. Reactor now exposes submit_task, cancel_task, drain_completed, and drain_cancelled over generation-safe TaskKey while preserving submit -> TaskId for smoke compatibility."
+    },
+    {
+      "id": "parallel-scheduler",
+      "title": "Harden Phase1Scheduler and scheduling lifecycle semantics",
+      "status": "complete",
+      "depends_on": [
+        "serial-module-split"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/scheduler.rs",
+        "crates/tx-reactor/tests/scheduler.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test scheduler"
+      ],
+      "notes": "Dispatched to subagent 019ddd2f-1202-7702-b1d1-399926c93cb0 and merged. Scheduler now has direct query helpers/tests and tightened Yielded/budget behavior."
+    },
+    {
+      "id": "parallel-wait-bus",
+      "title": "Implement bus-backed wait_event and lost-wake-safe subscription",
+      "status": "complete",
+      "depends_on": [
+        "serial-module-split"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/wait.rs",
+        "crates/tx-substrate/src/bus",
+        "crates/tx-reactor/tests/wait_bus.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test wait_bus",
+        "cargo test -p tx-substrate"
+      ],
+      "notes": "Dispatched to subagent 019ddd2f-1225-7961-9cf0-a227cc1499e0 and coordinator-wired through tx_substrate::bus. wait_event now uses check/register/recheck before parking and rechecks after wakes."
+    },
+    {
+      "id": "parallel-timer-idle",
+      "title": "Implement HAL-driven timer adapter and long-running idle loop",
+      "status": "complete",
+      "depends_on": [
+        "serial-module-split"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/timer.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-kernel/src/reactor",
+        "crates/tx-reactor/tests/timer_idle.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test timer_idle",
+        "cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf"
+      ],
+      "notes": "Dispatched to subagent 019ddd2f-1246-7c60-889c-d04bf2b2a53c and merged. run_until_idle_with_clock preserves host tests and provides a HAL TimeIf-shaped adapter. CoreInit wiring waits until the init.rs lease clears."
+    },
+    {
+      "id": "parallel-wait-interrupt-classification",
+      "title": "Add interrupt source classification to wait_event",
+      "status": "complete",
+      "depends_on": [
+        "parallel-task-lifecycle",
+        "parallel-wait-bus"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/interrupt.rs",
+        "crates/tx-reactor/src/wait.rs",
+        "crates/tx-reactor/tests/wait_interrupt.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test wait_interrupt"
+      ],
+      "notes": "Dispatched to subagent 019ddd4d-1d01-79f3-a3c6-f83ddf144832 and merged. Adds the THREAD_RUNTIME_v1 InterruptSource seam and wait_event_with_interrupts classification without signal queues, dispositions, thread entities, or AST delivery."
+    },
+    {
+      "id": "parallel-ast-preempt",
+      "title": "Add AST and preemption marker surfaces with tests",
+      "status": "complete",
+      "depends_on": [
+        "parallel-task-lifecycle",
+        "parallel-scheduler"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/ast.rs",
+        "crates/tx-reactor/src/preempt.rs",
+        "crates/tx-reactor/tests/ast_preempt.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test ast_preempt"
+      ],
+      "notes": "Dispatched to subagent 019ddd4d-1d2a-79e2-a921-6b6a718150b2 and merged. Adds task-local AST marker batching and atomic preemption markers, leaving delivery policy and wait classification outside this lane."
+    },
+    {
+      "id": "parallel-completion-middleware",
+      "title": "Implement counted and countdown completion middleware",
+      "status": "complete",
+      "depends_on": [
+        "parallel-wait-bus"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/completion.rs",
+        "crates/tx-reactor/tests/completion.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test completion"
+      ],
+      "notes": "Dispatched to subagent 019ddd4d-1d67-7c50-ba64-53e837abb863 and merged. Adds credit-consuming Completion and CountdownCompletion over Channel::wait_event; coordinator tightened CountdownCompletion construction to NonZeroU32 per COMPLETION_v1."
+    },
+    {
+      "id": "parallel-sync-coord",
+      "title": "Shape synchronous coordination for shootdown-style rendezvous",
+      "status": "complete",
+      "depends_on": [
+        "serial-module-split"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/sync_coord.rs",
+        "crates/tx-reactor/tests/sync_coord.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test sync_coord"
+      ],
+      "notes": "Dispatched to subagent 019ddd4d-1d3f-7f83-9f17-81e520673b25 and merged. Adds a reactor-local SyncRendezvous shape for shootdown-style acknowledgments; substrate shootdown wiring waits until the active tx-substrate lib.rs lease clears."
+    },
+    {
+      "id": "coordinator-second-wave-integration",
+      "title": "Integrate second-wave reactor lanes and run full verification",
+      "status": "complete",
+      "depends_on": [
+        "parallel-wait-interrupt-classification",
+        "parallel-ast-preempt",
+        "parallel-completion-middleware",
+        "parallel-sync-coord"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/lib.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/tests"
+      ],
+      "verification": [
+        "cargo fmt --check",
+        "cargo test -p tx-reactor",
+        "cargo xtask progress validate",
+        "cargo xtask ci",
+        "git diff --check"
+      ],
+      "notes": "Coordinator audited worker APIs against REACTOR_v0, THREAD_RUNTIME_v1, and COMPLETION_v1; accepted mechanism-only AST/sync surfaces; tightened CountdownCompletion to NonZeroU32; and recorded docs/progress/research/2026-04-30-reactor-second-wave-audit.md."
+    },
+    {
+      "id": "coordinator-integration",
+      "title": "Integrate worker lanes and run full reactor verification",
+      "status": "complete",
+      "depends_on": [
+        "parallel-task-lifecycle",
+        "parallel-scheduler",
+        "parallel-wait-bus",
+        "parallel-timer-idle"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/lib.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/tests"
+      ],
+      "verification": [
+        "cargo fmt --check",
+        "cargo test -p tx-reactor",
+        "cargo test -p tx-substrate",
+        "cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf",
+        "cargo xtask progress validate",
+        "cargo xtask lint docs",
+        "git diff --check"
+      ],
+      "notes": "Coordinator integrated runtime onto TaskTable, wired public tx_substrate::bus, added reactor-level lifecycle tests, and ran the full ci gate. See docs/progress/research/2026-04-30-reactor-first-wave-audit.md."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test -p tx-reactor",
+      "status": "passed",
+      "notes": "Passed after second-wave merge: 65 reactor tests."
+    },
+    {
+      "command": "cargo test -p tx-substrate",
+      "status": "passed",
+      "notes": "Passed after second-wave merge; bus-backed wait integration remains intact."
+    },
+    {
+      "command": "cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf",
+      "status": "passed",
+      "notes": "Passed after second-wave reactor integration."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed after marking the second-wave plan complete and adding the audit record."
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed",
+      "notes": "Passed after second-wave integration."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Passed after second-wave integration; stale-vocabulary findings remain warnings."
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "notes": "Passed after second-wave integration."
+    },
+    {
+      "command": "cargo xtask ci",
+      "status": "passed",
+      "notes": "Passed after second-wave worker merge: 11 passed, 0 skipped, 0 failed."
+    }
+  ],
+  "risks": [
+    "RawQueue/RawPort now have first typed declaration wrappers, typed readiness/lifecycle bit-set declaration macros, typed RawTrace payload declarations, generated owner-manifest boilerplate, SMP-safe raw subscriber storage, an epoch-fenced terminal/drain retire handshake, static raw backing storage, typed static wrappers, a bounded SubscriptionGraph<N> owner for long-lived raw subscriptions, ready/terminal graph scans, explicit graph clear teardown, a WireOwnerRetireFence bridge into EBR-delayed owner-storage reclaim, and a generic WireOwnerManifest typed owner hook, but still lack trace subscriber/nop-patching runtime, target-fd reverse-index teardown, final global epoll table integration, spill/fanout policy, and concrete VFS/device owner implementations.",
+    "timer-idle work depends on HAL TimeIf integration but must preserve host-driven tests.",
+    "completion-middleware and wait-interrupt both exercise wait_event behavior; collision is avoided by keeping completion on the existing public wait API and reserving wait.rs edits for the wait-interrupt worker.",
+    "userspace-run should not be dispatched yet because ThreadRuntime, saved-register trap return, AST delivery policy, and CoreInit reactor-loop wiring are not isolated enough."
+  ],
+  "blockers": [
+    "crates/tx-kernel/src/init.rs remains outside worker write scopes until the existing active lease clears.",
+    "crates/tx-substrate/src/lib.rs remains outside second-wave worker write scopes until the active zone/EBR lease clears.",
+    "docs/progress/STATUS.md catch-up for the scout is deferred because the active zone/EBR worktree record still owns that file."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

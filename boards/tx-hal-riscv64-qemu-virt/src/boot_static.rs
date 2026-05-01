@@ -119,6 +119,7 @@ struct MemoryRegionsCell(UnsafeCell<[MemoryRegion; MAX_MEMORY_REGIONS]>);
 struct PlatformInfoCell(UnsafeCell<PlatformInfo>);
 struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; 4]>);
 struct TimebaseFrequencyCell(UnsafeCell<u64>);
+struct PossibleCpuCountCell(UnsafeCell<usize>);
 struct ReservedPageTablesCell(UnsafeCell<[PhysRange; BOOTSTRAP_PMAP_RESERVED_RANGES]>);
 struct PageTableCell(UnsafeCell<PageTable>);
 struct KernelAliasL0TablesCell(UnsafeCell<[PageTable; KERNEL_ALIAS_L0_TABLES]>);
@@ -132,6 +133,7 @@ unsafe impl Sync for MemoryRegionsCell {}
 unsafe impl Sync for PlatformInfoCell {}
 unsafe impl Sync for PlatformMmioRegionsCell {}
 unsafe impl Sync for TimebaseFrequencyCell {}
+unsafe impl Sync for PossibleCpuCountCell {}
 unsafe impl Sync for ReservedPageTablesCell {}
 unsafe impl Sync for PageTableCell {}
 unsafe impl Sync for KernelAliasL0TablesCell {}
@@ -148,11 +150,13 @@ static PLATFORM_INFO: PlatformInfoCell = PlatformInfoCell(UnsafeCell::new(Platfo
     spi_sd: None,
     mmio_regions: &[],
     timebase_frequency_hz: QEMU_VIRT_FALLBACK_TIMEBASE_HZ,
+    possible_cpu_count: 1,
 }));
 static PLATFORM_MMIO_REGIONS: PlatformMmioRegionsCell =
     PlatformMmioRegionsCell(UnsafeCell::new([empty_mmio_region(); 4]));
 static TIMEBASE_FREQUENCY_HZ: TimebaseFrequencyCell =
     TimebaseFrequencyCell(UnsafeCell::new(QEMU_VIRT_FALLBACK_TIMEBASE_HZ));
+static POSSIBLE_CPU_COUNT: PossibleCpuCountCell = PossibleCpuCountCell(UnsafeCell::new(1));
 static RESERVED_PAGE_TABLES: ReservedPageTablesCell = ReservedPageTablesCell(UnsafeCell::new(
     [PhysRange::empty(); BOOTSTRAP_PMAP_RESERVED_RANGES],
 ));
@@ -181,6 +185,15 @@ static PT_NODE_POOL: PtNodePoolCell =
     PtNodePoolCell(UnsafeCell::new([PageTable([0; 512]); PT_NODE_POOL_ENTRIES]));
 static STORED_BOOT_STATIC_BAG: StoredBootStaticBagCell =
     StoredBootStaticBagCell(UnsafeCell::new(StoredBootStaticBag::Uninit));
+
+#[cfg(target_arch = "riscv64")]
+unsafe extern "C" {
+    fn tx_rv64_qemu_secondary_start();
+}
+
+#[cfg(target_arch = "riscv64")]
+#[used]
+static SECONDARY_START_ENTRY: unsafe extern "C" fn() = tx_rv64_qemu_secondary_start;
 
 const MMIO_RW_DEVICE: MmioFlags = MmioFlags::DEVICE_NGNRNE
     .union(MmioFlags::READ)
@@ -246,6 +259,12 @@ fn qemu_mmio_regions() -> [MmioRegion; 4] {
             flags: MMIO_RW_DEVICE,
         },
     ]
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn secondary_start_entry() -> usize {
+    let entry = unsafe { core::ptr::addr_of!(SECONDARY_START_ENTRY).read_volatile() };
+    entry as *const () as usize
 }
 
 enum StoredBootStaticBag {
@@ -379,6 +398,7 @@ impl BootStaticBag<IdentityLive> {
         unsafe {
             *STORED_BOOT_STATIC_BAG.0.get() = StoredBootStaticBag::Uninit;
             *TIMEBASE_FREQUENCY_HZ.0.get() = QEMU_VIRT_FALLBACK_TIMEBASE_HZ;
+            *POSSIBLE_CPU_COUNT.0.get() = 1;
         }
     }
 
@@ -601,6 +621,7 @@ impl<State> BootStaticBag<State> {
                 spi_sd: None,
                 mmio_regions: &mmio_regions[..],
                 timebase_frequency_hz: *TIMEBASE_FREQUENCY_HZ.0.get(),
+                possible_cpu_count: *POSSIBLE_CPU_COUNT.0.get(),
             };
             platform_info
         }
@@ -609,6 +630,12 @@ impl<State> BootStaticBag<State> {
     pub(crate) fn publish_timebase_frequency_hz(&self, frequency_hz: u64) {
         unsafe {
             *TIMEBASE_FREQUENCY_HZ.0.get() = frequency_hz;
+        }
+    }
+
+    pub(crate) fn publish_possible_cpu_count(&self, possible_cpu_count: usize) {
+        unsafe {
+            *POSSIBLE_CPU_COUNT.0.get() = possible_cpu_count.max(1);
         }
     }
 
@@ -682,6 +709,10 @@ impl<State> BootStaticBag<State> {
             size: PT_NODE_POOL_ENTRIES * PAGE_SIZE,
         }
     }
+}
+
+pub(crate) fn current_trap_vector_kernel_alias() -> VirtAddr {
+    BootStaticBag::<IdentityLive>::current_trap_vector_kernel_alias()
 }
 
 fn linked_trap_vector_kernel_alias() -> VirtAddr {

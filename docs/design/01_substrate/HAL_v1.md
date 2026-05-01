@@ -17,7 +17,7 @@
 - [`00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — HAL is *not* a subsystem; it predates the four-module discipline and has its own organization.
 - [`00_meta-framework/INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — MAP and HAL/foundation invariants; TLB shootdown ordering is realized by `PmapIf::shootdown` plus the substrate-side post-shootdown accounting.
 
-**Interface status.** This document is the axHal-style replacement for the older OSTD-style HAL management notes. "axHal-style" means: one statically selected platform family, compile/link-time platform choice, no runtime HAL manager, no `Box<dyn Hal>`, no HAL-owned semantic objects, and no subsystem callbacks into HAL initialization order. txKernel still gives the surface typed names (`TxPlatform`, `PmapIf`, `TrapIf`, etc.) because upper documents need proof objects and trap-frame views, but those traits describe a static platform module family rather than a managed HAL service.
+**Interface status.** This document is the axHal-style replacement for the older OSTD-style HAL management notes. "axHal-style" means: one statically selected platform family, compile/link-time platform choice, no runtime HAL manager, no boxed dynamic HAL trait object, no HAL-owned semantic objects, and no subsystem callbacks into HAL initialization order. txKernel still gives the surface typed names (`TxPlatform`, `PmapIf`, `TrapIf`, etc.) because upper documents need proof objects and trap-frame views, but those traits describe a static platform module family rather than a managed HAL service.
 
 ---
 
@@ -493,7 +493,8 @@ H0 obligations on the platform crate:
 - Implement `BootPlatformIf::BOOT_PROTOCOL` and, if needed, override
   `boot_handoff(cpu_id, firmware_arg)` to normalize the platform's raw
   registers into `BootHandoff`.
-- Park or not-yet-start secondary CPUs. v1 assumes only the BSP runs through H0–H3.
+- Park or not-yet-start secondary CPUs. The BSP is the only hart that runs the
+  generic H0-H3 path; its firmware hart id is not assumed to be zero.
 
 ### 5.2 Stage H1 — pre-Rust bootstrap
 <!-- txdoc:HAL-THE-BOOT-SEQUENCE-STAGE-H1-PRE-RUST-BOOTSTRAP-1 -->
@@ -502,7 +503,12 @@ H1 runs in the platform crate's `__start` and any helper assembly it calls. It e
 
 H1 obligations, in order:
 
-1. **Set the BSP stack pointer** to a temporary stack of at least one page in `.bss.stack` or an equivalent platform-owned boot-stack section. The temporary stack is sufficient through H1 and H2; per-hart kernel stacks are installed later (in `init_early` or during AP bring-up).
+1. **Set the BSP stack pointer** to a temporary per-hart stack slot of at least
+   one page in `.bss.stack` or an equivalent platform-owned boot-stack section.
+   The slot must be selected from the firmware CPU id when the platform can
+   boot on a nonzero hart. The temporary stack is sufficient through H1 and H2;
+   steady per-hart kernel stacks are installed later (in `init_early` or during
+   AP bring-up).
 
 2. **Clear the BSS section.** Linker symbols `_bss_start` and `_bss_end` bound the region.
 
@@ -582,24 +588,21 @@ where
     P: TxPlatform,
     K: KernelMain<P>,
 {
+    P::install_minimal_trap_vector();
     let handoff = P::boot_handoff(cpu_id, firmware_arg);
 
-    // 1. Validate role. v1 expects BSP only; APs trap if they reach here.
-    if handoff.cpu_id.0 != 0 {
-        panic!("AP entry not supported in v1");
-    }
-
-    // 2. Finalize BootInfo. The platform's __start built a skeleton;
+    // 1. Finalize BootInfo. The platform's __start built a skeleton;
     //    this is where any cross-platform validation happens
     //    (memory regions sane, kernel_image bounds in range, etc.).
     let _bi = P::boot_info();
     debug_assert!(!_bi.memory_regions.is_empty());
 
-    // 3. Install early per-CPU pointer. This makes per-cpu reads
+    // 2. Install early per-CPU pointer. This makes per-cpu reads
     //    legal everywhere from this point on.
     P::install_early_percpu(handoff.cpu_id);
+    P::mark_cpu_online(handoff.cpu_id);
 
-    // 4. Hand off to the kernel continuation.
+    // 3. Hand off to the kernel continuation.
     K::kernel_main(handoff)
 }
 ```
@@ -632,20 +635,25 @@ pub fn kernel_main<P: TxPlatform>(handoff: BootHandoff) -> ! {
     // 4. Install full trap vectors. The minimal H1 vector is replaced
     //    by the full kernel trap path that dispatches to KernelTrapSink.
     P::install_kernel_trap_vector();
-    P::install_user_trap_vector();
 
-    // 5. Reactor and scheduler init. Reactor needs heap (for queues),
+    // 5. Start APs after substrate and the full kernel trap vector are live.
+    //    Early APs install per-cpu state, run secondary init hooks, initialize
+    //    substrate-local epoch/zone state, install their trap vector, mark
+    //    themselves online, then park until SMP_v1 assigns scheduler work.
+    P::boot_secondary_cpus(secondary_cpu_entry::<P>);
+
+    // 6. Reactor and scheduler init. Reactor needs heap (for queues),
     //    needs HAL (for timer) — heap is up, HAL is up.
     reactor::init::<P>();
     scheduler::init::<P>();
 
-    // 6. Downstream subsystems. See H4.
+    // 7. Downstream subsystems. See H4.
     vfs::init::<P>();
     device::init::<P>();
     process::init::<P>();
     // ... etc.
 
-    // 7. exec the init userspace. Does not return.
+    // 8. exec the init userspace. Does not return.
     exec::init_userspace::<P>()
 }
 ```
@@ -688,13 +696,14 @@ pub trait InitIf {
     /// any platform state that needed heap allocation.
     fn init_later(handoff: BootHandoff);
 
-    /// Called once on each AP after its H1 + H2 equivalent completes.
-    /// v1: not called (single-CPU).
-    fn init_early_secondary(cpu_id: CpuId);
+    /// Called once on each AP after its low trampoline and early per-CPU
+    /// register setup complete. Single-CPU platform impls may keep the
+    /// default no-op.
+    fn init_early_secondary(cpu_id: CpuId) {}
 
     /// Called once on each AP after substrate is up on the BSP.
-    /// v1: not called.
-    fn init_later_secondary(cpu_id: CpuId);
+    /// Single-CPU platform impls may keep the default no-op.
+    fn init_later_secondary(cpu_id: CpuId) {}
 }
 ```
 
@@ -833,6 +842,8 @@ pub struct PlatformInfo {
     /// platform devices the board has at fixed addresses (e.g.,
     /// virtio-mmio range on qemu-virt).
     pub mmio_regions: &'static [MmioRegion],
+    pub timebase_frequency_hz: u64,
+    pub possible_cpu_count: usize,
 }
 
 pub struct MmioRegion {
@@ -1007,8 +1018,9 @@ granularity for platform MMIO.
 Abandoned 2 MiB / 4 KiB reservations can be rolled back, releasing any
 `PT_NODE_POOL` intermediates allocated while reserving. Kernel 2 MiB / 4 KiB
 mappings can also be unmapped into a `PmapUnmapResult`, whose invalidation is
-then passed to `shootdown_kernel_mapping()`; on the current single-hart RV64
-QEMU path this is a local `sfence.vma`. Safe same-granularity kernel
+then passed to `shootdown_kernel_mapping()`; RV64 QEMU now does the local
+`sfence.vma` and, once APs are online, uses SBI RFENCE to issue matching remote
+`sfence.vma` calls on the other harts. Safe same-granularity kernel
 permission changes use `protect_kernel_mapping()` to update an existing leaf in
 place and return an invalidation; absent mappings are left alone for the later
 VM/fault path, and unsafe cases such as split-required superpages return
@@ -1028,8 +1040,9 @@ rematerialize later. `tx_hal::pmap` provides the generic no-alloc page-range
 session API over those single mapping operations; the board still owns the
 actual PTE walk and mutation. Substrate has an ASID-scoped page shootdown batch
 that holds `MapPin`s until after `PmapIf::shootdown_mapping()`.
-Superpage/multi-frame accounting and real remote-hart shootdown coordination
-remain before userspace work.
+Superpage/multi-frame accounting remains before userspace work; the current
+remote shootdown implementation is RV64 QEMU SBI RFENCE rather than a full
+kernel-managed IPI/ack protocol.
 
 The full planned trait surface is:
 
@@ -1222,8 +1235,9 @@ The current executable kernel-only subset is smaller: `PmapUnmapResult` names
 one cleared mapping and its `PmapInvalidation`, while
 `KernelShootdownBatch` in PAGE_SUBSTRATE §7.2 owns the matching `MapPin`.
 It calls `P::shootdown_kernel_mapping()` first and drops the `MapPin` only
-afterward. That gives the same map-count ordering without requiring HAL to know
-about `FrameMeta`.
+afterward. On RV64 QEMU, that HAL call includes local `sfence.vma` plus SBI
+remote RFENCE for online remote harts. That gives the same map-count ordering
+without requiring HAL to know about `FrameMeta`.
 
 ### 10.5 The direct-map invariant
 <!-- txdoc:HAL-PMAPIF-PMAP-MATERIALIZATION-PROOF-OBJECTS-THE-DIRECT-MAP-INVARIANT-1 -->
@@ -1259,15 +1273,27 @@ The substrate, VM, and any other consumer knows:
 
 **Cross-reference.** Trap-cause dispatch from HAL is direct and named, not via linkme. See §21 for the registration discipline; this section covers the trap-frame view surface and the shell-to-sink contract.
 
-The current executable RV64 QEMU subset installs a minimal direct-mode `stvec`
-panic vector before `BootPlatformIf::boot_handoff()` and reinstalls it from
-`kernel_main` after `init_later()`. That vector prints `scause`, `sepc`, and
-`stval` through the SBI console, then spins. `TrapIf` also exposes a typed
+The current executable RV64 QEMU subset installs a direct-mode `stvec` before
+`BootPlatformIf::boot_handoff()` and reinstalls it from `kernel_main` after
+`init_later()`. That vector now saves a full integer-register frame plus
+`scause`/`sepc`/`stval`/`sstatus`, calls a board-binary dispatch symbol, and
+routes the frame through a first `KernelTrapSink` implementation in
+`tx-kernel`. Timer and IPI traps resume through the sink; external IRQ traps
+resume as a stub; synchronous faults, syscalls, and user-facing traps terminate
+through the panic path until their owners exist. `TrapIf` also exposes a typed
 snapshot/classification API; RV64 QEMU decodes `scause` into page-fault,
 illegal-instruction, breakpoint, user-ecall, supervisor-timer, and
-supervisor-external classes. The full saved-register `RawTrapFrame`,
-`KernelTrapSink`, syscall dispatch, signal/user-return path, and user-access
-recovery remain before user execution is enabled.
+supervisor-external classes. `TrapFrameMut` now has executable writeback
+methods for PC, SP, syscall return/error, and user TLS, and the RV64 trap
+return path writes saved `sepc`/`sstatus` back before `sret`. RV64 also has a
+first unsafe `return_to_userspace` restore skeleton plus `sstatus` preparation
+for user `sret`, but user execution is still not enabled: syscall dispatch,
+VM page-fault policy, user trap stack switching, signal/user-return policy,
+external IRQ device dispatch, and user-access recovery remain later slices.
+When this executable trap path terminates on RV64 QEMU, the panic log prints
+the legacy `scause`/`sepc`/`stval` summary and a full saved `trapframe:` dump;
+`cargo xtask fault-decode --serial` understands both the old summary-only logs
+and the richer trapframe block.
 
 ### 11.1 Trait surface
 <!-- txdoc:HAL-TRAPIF-TRAP-FRAME-DISCIPLINE-AND-RETURN-BOUNDARY-TRAIT-SURFACE-1 -->
@@ -1904,6 +1930,10 @@ pub trait TimeIf {
     /// Cancel any pending timer on the current hart.
     fn cancel_deadline();
 
+    /// Prepare the current hart so a programmed timer deadline can wake or
+    /// trap out of the platform idle path.
+    fn enable_timer_wakeups();
+
     /// Read the timer-interrupt frequency, used for converting
     /// between cycles and nanoseconds during early init.
     fn frequency_hz() -> u64;
@@ -2146,9 +2176,17 @@ This is portable across coherent/non-coherent boards and across boards with/with
 ## 18. SmpIf — low-level mechanics
 <!-- txdoc:HAL-SMPIF-LOW-LEVEL-MECHANICS-1 -->
 
-`SmpIf` exposes the low-level mechanics needed to start and control secondary CPUs. It does not specify the kernel-level SMP protocol. The AP online state machine, AP init phases, scheduler handoff, reschedule IPI, TLB shootdown protocol, and stop-the-world protocol all belong to `SMP_v1`.
+`SmpIf` exposes the low-level mechanics needed to start and control secondary CPUs. It does not specify the kernel-level SMP protocol. The scheduler handoff, reschedule IPI policy, TLB shootdown protocol, and stop-the-world protocol all belong to `SMP_v1`.
 
-Until `SMP_v1` exists, PAGE_SUBSTRATE keeps the rule: APs are not executing substrate consumers while substrate initialization is in progress. In v1 uniprocessor builds, all `SmpIf` methods except `current_cpu_id` and `possible_cpus` may be no-ops or unsupported.
+Until `SMP_v1` exists, PAGE_SUBSTRATE keeps the rule: APs are not executing
+substrate consumers while substrate initialization is in progress. A platform
+may start APs only after BSP substrate init and full trap-vector installation;
+those APs must publish early per-CPU state, run `tx_substrate::init_on_ap(cpu)`,
+install their kernel trap vector, mark online, and then enter a kernel-owned AP
+runtime loop or a permanent park path. The runtime loop may use HAL wait and IPI
+observation primitives, but queue policy and work selection stay above HAL. In
+uniprocessor builds, all `SmpIf` methods except `current_cpu_id` and
+`possible_cpus` may be no-ops or unsupported.
 
 ```rust
 pub trait SmpIf {
@@ -2157,15 +2195,35 @@ pub trait SmpIf {
     fn current_cpu_id() -> CpuId;
 
     /// Set of CPUs that exist on this platform.
-    /// v1: always returns just CPU 0.
-    /// SMP_v1: returns the cpumask discovered from BootInfo.
+    /// Returns the cpumask discovered from PlatformInfo/firmware facts.
     fn possible_cpus() -> CpuMask;
 
-    /// Boot all secondary CPUs, jumping each to `entry` once it has
-    /// completed its arch-specific bootstrap.
-    /// v1: no-op.
-    /// SMP_v1: SBI HSM start (RV64) or IPI-mediated startup (LA64).
-    fn boot_secondary_cpus(entry: SecondaryEntry);
+    /// Set of CPUs that have completed early per-CPU setup, AP-local substrate
+    /// initialization, trap-vector installation, and online publication.
+    fn online_cpus() -> CpuMask;
+
+    fn possible_cpu_count() -> usize;
+    fn online_cpu_count() -> usize;
+    fn is_cpu_online(cpu: CpuId) -> bool;
+    fn mark_cpu_online(cpu: CpuId);
+
+    /// Boot all secondary CPUs, jumping each to `entry` after its
+    /// arch-specific low trampoline. Returns the number that actually reached
+    /// the online mask before the platform wait window closed.
+    fn boot_secondary_cpus(entry: SecondaryEntry) -> usize;
+
+    /// Prepare the current hart so an IPI can wake a low-power wait.
+    /// This is a local hardware primitive; it does not dispatch scheduler work.
+    fn enable_ipi_wakeups();
+
+    /// Wait once for an interrupt or platform wake event. The caller owns the
+    /// surrounding condition check and lost-wake discipline.
+    fn wait_for_interrupt_once();
+
+    /// Report whether an IPI of this kind is pending on the current hart.
+    /// Used by kernel-owned AP loops that poll/ack low-level IPI state instead
+    /// of handing scheduler policy to the trap vector.
+    fn pending_ipi(kind: IpiKind) -> bool;
 
     /// Park the current hart indefinitely. Used for AP entry on
     /// uniprocessor builds (APs that get woken anyway) and for
@@ -2173,17 +2231,29 @@ pub trait SmpIf {
     fn park_this_cpu() -> !;
 
     /// Send an IPI to the given target CPU.
-    /// v1: panic if target != current.
+    /// Uniprocessor defaults assert if target != current.
     fn send_ipi(target: CpuId, kind: IpiKind);
 
     /// Send an IPI to all CPUs in the mask.
-    /// v1: panic if mask contains anything other than current.
+    /// Uniprocessor defaults assert if the mask cannot be handled locally.
     fn broadcast_ipi(mask: CpuMask, kind: IpiKind);
 
     /// Acknowledge a received IPI. Called from KernelTrapSink's
     /// IPI dispatch. May be a no-op on architectures where IPI
     /// acknowledgment is implicit in trap return.
     fn ack_ipi(kind: IpiKind);
+
+    /// Clear observed IPI acknowledgements for a target mask before a
+    /// low-level probe or kernel-managed handshake.
+    fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask);
+
+    /// Return CPUs that have acknowledged the given IPI kind since the last
+    /// clear. Platforms may keep this as a debug/protocol bitmap; scheduler
+    /// policy does not live here.
+    fn ipi_ack_cpus(kind: IpiKind) -> CpuMask;
+
+    /// Bounded wait for the target acknowledgement mask.
+    fn wait_for_ipi_ack_cpus(mask: CpuMask, kind: IpiKind) -> usize;
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -2210,19 +2280,31 @@ pub struct CpuMask(pub u64);  // v1: 64 CPU max
 <!-- txdoc:HAL-SMPIF-LOW-LEVEL-MECHANICS-WHAT-HAL-SPECIFIES-1 -->
 
 - BSP entry, AP low-level entry shape.
-- Secondary stack installation (via `PercpuIf::install_kernel_stack`).
+- Temporary per-hart stack selection for BSP and AP low entry.
 - Per-CPU pointer setup on APs (via `PercpuIf::install_early_percpu`).
 - Trap-vector installation on APs (via `TrapIf::install_kernel_trap_vector`).
-- IPI send/receive primitives.
+- Possible/online CPU masks and the low-level online publication bit. The
+  generic kernel publishes AP online only after AP-local substrate init.
+- IPI send/receive primitives, pending-state observation, wake-from-wait
+  enablement, and low-level acknowledgement observation.
+- A single low-power wait primitive that a kernel-owned AP loop can compose
+  with its own condition checks.
 - CPU parking primitive.
+- Platform remote-TLB primitive when firmware provides one. RV64 QEMU uses SBI
+  RFENCE behind `PmapIf::shootdown_*`; this is not exposed as a scheduler
+  policy hook.
 
 ### 18.2 What HAL does not specify (deferred to SMP_v1)
 <!-- txdoc:HAL-SMPIF-LOW-LEVEL-MECHANICS-WHAT-HAL-DOES-NOT-SPECIFY-DEFERRED-TO-SMP-V1-1 -->
 
-- CPU online/offline state machine.
-- AP init phases (when can substrate be called from an AP? When can the scheduler enqueue work to an AP?).
-- Reschedule IPI protocol (who sends, when, how the receiver responds).
-- TLB shootdown protocol details (the originator/recipient handshake).
+- CPU offline state machine and scheduler admission.
+- Full AP runtime policy after the generic AP-local substrate/trap/online
+  sequence (which queues to drain, which work to run, and when scheduler
+  admission begins).
+- Reschedule IPI protocol above low-level send/pending/ack mechanics (who sends,
+  when, and how the receiver maps the wake to reactor or scheduler work).
+- Kernel-managed TLB shootdown protocol details when a platform cannot rely on
+  firmware RFENCE (the originator/recipient handshake).
 - Stop-the-world protocol.
 - Scheduler integration with IPIs.
 - Reactor integration with IPIs.
@@ -2235,12 +2317,16 @@ pub struct CpuMask(pub u64);  // v1: 64 CPU max
 In v1 single-CPU builds:
 
 - `possible_cpus()` returns `CpuMask(0b1)`.
-- `boot_secondary_cpus()` is a no-op.
-- `send_ipi(target, _)` panics if `target != current_cpu_id()`.
-- `broadcast_ipi(mask, _)` panics if `mask` has more than the current CPU bit set.
+- `online_cpus()` returns `CpuMask(0b1)` after the BSP calls `mark_cpu_online`.
+- `boot_secondary_cpus()` is a no-op and returns `0`.
+- `enable_ipi_wakeups()` is a no-op.
+- `wait_for_interrupt_once()` may be a spin-loop fallback.
+- `pending_ipi(_)` returns `false`.
+- `send_ipi(target, _)` asserts if `target != current_cpu_id()`.
+- `broadcast_ipi(mask, _)` asserts if `mask` has more than the current CPU bit set.
 - `park_this_cpu()` enters a low-power wait loop.
 
-This is enough to make the rest of the kernel work without conditional compilation around SMP-vs-uniprocessor. When SMP lands, only the platform crate's `SmpIf` impls change.
+This is enough to make the rest of the kernel work without conditional compilation around SMP-vs-uniprocessor. RV64 QEMU now exercises the SMP shape with `-smp 4`: DTB CPU discovery publishes `PlatformInfo.possible_cpu_count`, the platform starts APs through SBI HSM into a low trampoline, each AP installs early per-CPU state, initializes AP-local substrate epoch/zone state, installs the kernel trap vector, marks online, and enters a kernel-owned AP loop. That loop arms SSIP wakeup, waits with `wfi`, polls and acknowledges pending reschedule IPIs, and hands reschedule work back to reactor-owned runqueue draining. The pmap path can issue SBI RFENCE to those online APs, but final scheduler policy and kernel-managed IPI/ack shootdown remain deferred.
 
 ---
 
@@ -2418,7 +2504,7 @@ The platform crate (e.g., `tx-hal-riscv64-qemu-virt`, `tx-hal-riscv64-visionfive
 
 - **Expose satp/asid discipline through PmapIf.** Each `AddressSpace` gets a `PmapRoot` that owns its top-level page-table page and an ASID. ASID assignment is platform-internal; the kernel sees only `Asid: Copy + Eq`.
 
-- **Implement sfence.vma in `PmapIf::shootdown`.** Single-hart: `sfence.vma vaddr, asid` for each invalidation. `shootdown_global` uses `sfence.vma vaddr, x0` for cross-ASID invalidation. SMP (deferred to SMP_v1): SBI `remote_sfence_vma`.
+- **Implement sfence.vma in `PmapIf::shootdown`.** Single-hart: `sfence.vma vaddr, asid` for each invalidation. Global shootdown uses `sfence.vma vaddr, x0` for cross-ASID invalidation. RV64 QEMU SMP additionally issues SBI `remote_sfence_vma` / `remote_sfence_vma_asid` to online remote harts; later `SMP_v1` owns any kernel-managed IPI/ack fallback.
 
 - **Use sscratch for trap scratch.** The kernel's per-hart kernel stack pointer lives in sscratch during user-mode execution; trap entry swaps tp ↔ sscratch.
 
@@ -2462,7 +2548,7 @@ What this document does *not* specify:
 
 - **Hot-add memory.** Same reasoning. Memory map is parsed once at boot; HAL has no add-region / remove-region surface.
 
-- **Kernel-mode preemption.** v11 commits to cooperative async/await in kernelspace. HAL does not provide a "kernel preempt" primitive.
+- **Kernel-mode preemption.** The retired execution draft committed to cooperative async/await in kernelspace. HAL does not provide a "kernel preempt" primitive.
 
 - **IOMMU surface.** v1 platforms have no IOMMU. `DmaIf::phys_to_dma` is identity. When an IOMMU-equipped platform lands, the trait stays the same; the impl changes.
 
@@ -2513,6 +2599,6 @@ PAGE_SUBSTRATE_v1 §2 listed seven HAL deliverables. With HAL_v1, those are real
 | Trap infrastructure | `TrapIf::install_kernel_trap_vector` (§11) called from kernel_main after init_later; minimal vector installed in H1 for panic |
 | `PmapReservation` / `PmapCommitBatch` / `ShootdownBatch` (substrate-side) | `PmapIf::reserve` / `commit` / `shootdown` (HAL surface, §10.1) plus the proof-object types (§10.2–10.4); the substrate-side `ShootdownBatch` aggregator wraps HAL's `shootdown` per PAGE_SUBSTRATE §7.2 |
 
-PAGE_SUBSTRATE §2's old ordering chain (`early_arch_init → ... → __ostd_main`) is replaced by the H0–H4 sequence in §5. `__ostd_main` is no longer named; the OSTD-style entry point was an artifact of v8/v11 thinking.
+PAGE_SUBSTRATE §2's old ordering chain (`early_arch_init → ... → __ostd_main`) is replaced by the H0–H4 sequence in §5. `__ostd_main` is no longer named; the OSTD-style entry point was an artifact of the retired boot drafts.
 
 PAGE_SUBSTRATE_v1 §2 has been rewritten as "HAL_v1 obligations consumed by substrate." Keep future substrate edits in that direction: substrate owns frame accounting and allocation; HAL owns only static platform facts and pmap/trap mechanics.

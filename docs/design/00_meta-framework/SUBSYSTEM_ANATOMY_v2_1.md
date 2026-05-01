@@ -4,7 +4,7 @@
 
 **Status.** v2.1 (2026-04-19).
 
-**Supersedes.** v2. Substantive changes aligning with [`MODULE_MAP_v1.md`](MODULE_MAP_v1.md): §6 dependency graph updated (bus and reactor consolidated under substrate; `dispatcher/` and `pipeline/` boxes retired in favor of `scripts/`); §7 import rules rewritten (substrate expanded to `{zone, index, credit, mutation, bus, reactor, epoch, shootdown}`; new §7.5 script import rules enforcing SCRIPT-2 / SCRIPT-6); §5.1 heading "Dispatch Entry" → "Script Entry"; §9 renamed "Cross-Subsystem Pipelines" → "Cross-Subsystem Scripts" with the fork example rewritten to drop the separate `sig::` subsystem (sig objects are process-attached and owned by `proc/` per `MODULE_MAP §5.1`); §10 testing-boundaries "pipeline/ tests" → "script tests"; §11 checklist steps 9 and 10 updated (`dispatch/route.rs` → `scripts/route/syscall_table.rs`; "pipeline scripts" → "cross-subsystem scripts"); checklist step 13 added for signal attachments. The five-phase discipline, four-module layout, and substrate machinery are unchanged.
+**Supersedes.** v2. Substantive changes aligning with [`MODULE_MAP_v1.md`](MODULE_MAP_v1.md): §6 dependency graph updated (bus and reactor consolidated under substrate; legacy dispatcher and pipeline boxes retired in favor of `scripts/`); §7 import rules rewritten (substrate expanded to `{zone, index, credit, mutation, bus, reactor, epoch, shootdown}`; new §7.5 script import rules enforcing SCRIPT-2 / SCRIPT-6); §5.1 heading "Dispatch Entry" → "Script Entry"; §9 renamed "Cross-Subsystem Pipelines" → "Cross-Subsystem Scripts" with the fork example rewritten to drop the separate `sig::` subsystem (sig objects are process-attached and owned by `proc/` per `MODULE_MAP §5.1`); §10 testing-boundaries "pipeline tests" → "script tests"; §11 checklist steps 9 and 10 updated (legacy dispatch route module → `scripts/route/syscall_table.rs`; "pipeline scripts" → "cross-subsystem scripts"); checklist step 13 added for signal attachments. The five-phase discipline, four-module layout, and substrate machinery are unchanged.
 
 **Supersedes (v2 → v1).** Aligned with the step model (STEP-4, five-phase discipline). `*_prepare` + `*_commit` function pairs retired per STEP-6; sub-phase structure preserved.
 
@@ -720,7 +720,7 @@ scripts/                 ← per-syscall programs (users of the runtime)
     never reads subsystem structure/ directly (SCRIPT-2 / SCRIPT-6)
 ```
 
-No cycles. Each module depends only on strictly lower-level concerns. The prior `dispatcher/` and `pipeline/` boxes are retired: the drive class lives inside per-syscall scripts, and cross-subsystem coordination is a script concern (§9), not a separate layer.
+No cycles. Each module depends only on strictly lower-level concerns. The prior dispatcher and pipeline boxes are retired: the drive class lives inside per-syscall scripts, and cross-subsystem coordination is a script concern (§9), not a separate layer.
 
 ---
 
@@ -839,7 +839,7 @@ Service subsystems are called *by* full subsystems. `pipe::execution::step_pipe`
 
 <!-- txdoc:SUBSYSTEM-ANATOMY-CROSS-SUBSYSTEM-SCRIPTS-1 -->
 
-Some operations span multiple semantic subsystems. Per [`MODULE_MAP_v1.md §1.3`](MODULE_MAP_v1.md), the prior `pipeline/` classification has been retired: every syscall is a **script**, and scripts vary in which semantic subsystems they touch — `close(fd)` touches one, `execve(path)` touches many. The shape is uniform; the scope varies. Scripts live under `scripts/`:
+Some operations span multiple semantic subsystems. Per [`MODULE_MAP_v1.md §1.3`](MODULE_MAP_v1.md), the prior pipeline classification has been retired: every syscall is a **script**, and scripts vary in which semantic subsystems they touch — `close(fd)` touches one, `execve(path)` touches many. The shape is uniform; the scope varies. Scripts live under `scripts/`:
 
 ```
 scripts/
@@ -947,7 +947,7 @@ Checklist:
    - Publish: fire declared signal attachments for each commit point.
 8. **If projections are user-visible, write project.rs.**
 9. **Register in `scripts/route/syscall_table.rs`** for syscalls that land directly in this subsystem. (Formerly `dispatch/route.rs`; the routing table moved under `scripts/` per [`MODULE_MAP_v1.md §8`](MODULE_MAP_v1.md).)
-10. **Add the subsystem to any cross-subsystem scripts** it participates in (§9). Cross-subsystem scripts live under `scripts/`; the prior `pipeline/` classification is retired.
+10. **Add the subsystem to any cross-subsystem scripts** it participates in (§9). Cross-subsystem scripts live under `scripts/`; the prior pipeline classification is retired.
 11. **Audit cross-subsystem registrations for stable identity keys** (per `object_model_v2.md` §6.4).
 12. **Document projection rows in the owning subsystem spec; use archived `LIVENESS_v2.1.md` only as source material for older catalog shape.**
 13. **Declare signal attachments** in [`SIGNAL_ATTACHMENTS_v1.md`](../04_process-signals/SIGNAL_ATTACHMENTS_v1.md) if any commit points publish externally.

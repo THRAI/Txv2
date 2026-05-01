@@ -5,13 +5,13 @@
 ## Status
 <!-- txdoc:SCHED-STATUS -->
 
-Draft v0.2.
+Draft v0.4.
 
 This document pins the **scheduler policy boundary** that REACTOR_v0 explicitly defers and THREAD_RUNTIME_v1 / PROCESS_v1 implicitly depend on. It is a policy-and-interface document, not an exhaustive algorithmic specification:
 
 - It names the `SchedulerPolicy` trait the reactor consults for task selection and slice decisions.
 - It pins the data structures that hold per-task scheduling state.
-- It specifies a Phase 1 MVP scheduler (round-robin, fixed slice, two-queue dispatch) that suffices for Phase 1 targets (busybox, gcc, nginx, top, gdb).
+- It specifies a Phase 1 MVP scheduler (round-robin, fixed slice, two-queue dispatch, initial affinity placement) that suffices for Phase 1 targets (busybox, gcc, nginx, top, gdb).
 - It sketches Phase 2 extension points (priority classes, cgroup CPU quotas, fair-share, RT classes, deadline).
 
 It does **not** specify algorithmic details of Phase 2+ policies (full fair-share weight mathematics, EDF admission control, cross-hart load balancing). Those are later specs that cite this one.
@@ -33,7 +33,7 @@ Companion documents:
 - `HartSched` — per-hart scheduling state (internal to reactor+scheduler).
 - `SliceConfig` — how the reactor programs the preemption timer.
 - `StopReason` — how the reactor tells the scheduler why a task stopped.
-- Phase 1 scheduler: round-robin with fixed 10ms slice, cooperative for kernel tasks, two-queue (new vs preempted) heuristic.
+- Phase 1 scheduler: round-robin with fixed 10ms slice, cooperative for kernel tasks, two-queue (new vs preempted) heuristic, and initial affinity-aware queue placement.
 - Budget placement decision: per-task metadata, travels across sleep/wake (Zircon-style).
 - Extension contract for Phase 2 additions without interface breakage.
 
@@ -61,7 +61,7 @@ subsystem whose task is running.
 - **Cgroup CPU controller.** Weight-based, quota-based. Phase 2.
 - **Cross-hart load balancing.** Work stealing, per-hart run-queue imbalance detection. Phase 2.
 - **NUMA awareness.** Phase 3+ (RISC-V NUMA is uncommon in Phase 1 target hardware).
-- **CPU affinity.** `sched_setaffinity` syscall, affinity masks. Phase 2.
+- **Dynamic CPU affinity.** `sched_setaffinity` syscall, live affinity-mask updates, and forced migration. Phase 2. Phase 1 consumes an initial affinity mask for queue placement and wake homing.
 - **Priority inheritance.** PI futex, rtmutex-style inheritance. Needs RT classes first.
 - **Group scheduling.** Scheduling whole process groups or cgroups as units.
 - **Energy-aware scheduling.** Big.little, P-state coordination. Phase 3+.
@@ -276,7 +276,7 @@ pub struct InitialSchedMeta {
     pub class: SchedClass,
     pub nice: i8,               // -20..+19, ignored in Phase 1
     pub rt_priority: u8,        // 1..99 for RT classes; ignored in non-RT
-    pub affinity: AffinityMask, // set of allowed harts; ignored in Phase 1
+    pub affinity: AffinityMask, // set of allowed harts for initial placement/wake homing
 }
 
 pub enum SchedClass {
@@ -297,7 +297,10 @@ pub enum SchedClass {
 }
 ```
 
-Phase 1 treats all tasks as `SchedClass::Fair` with nice=0. Phase 2 expands the class space.
+Phase 1 treats all tasks as `SchedClass::Fair` with nice=0, but it does
+honor the initial affinity mask for per-hart queue placement. A zero mask is
+normalized to the boot hart. Phase 2 expands the class space and adds dynamic
+affinity updates.
 
 ### 2.6 TaskSchedMeta (internal to scheduler)
 <!-- txdoc:SCHED-2-6-TASKSCHEDMETA-INTERNAL-TO-SCHEDULER -->
@@ -441,10 +444,18 @@ When a waker fires:
 5. If this hart was running a lower-priority task: set need_resched; next poll boundary will reschedule.
 6. If this hart was running a higher-priority or same-priority task: no immediate action; the task waits for a slot.
 
-### 3.5 Cross-hart reschedule hints (Phase 2)
-<!-- txdoc:SCHED-3-5-CROSS-HART-RESCHEDULE-HINTS-PHASE-2 -->
+### 3.5 Cross-hart reschedule dispatch
+<!-- txdoc:SCHED-3-5-CROSS-HART-RESCHEDULE-DISPATCH -->
 
-In multi-hart systems, waking a task on hart H' that's higher-priority than hart H''s current task motivates a cross-hart IPI. Phase 2 feature; Phase 1 ignores (each hart schedules independently).
+In multi-hart systems, waking a task onto hart H' can require a reschedule IPI
+from the current hart. The scheduler still does not send IPIs. Phase 1 reports
+the selected runqueue through `RunnablePlacement`; reactor dispatch state marks
+the target hart `need_resched`, and a kernel runtime adapter translates remote
+wakes into `SmpIf::send_ipi(..., IpiKind::Reschedule)`. The current RV64 QEMU
+runtime can wake an AP-side kernel loop, consume the target hart's
+`need_resched` marker, and drain a real shared-reactor runqueue under a
+temporary reactor lock. Per-hart reactor shards, lock-free dispatch, full
+priority-aware cross-hart preemption, and load balancing remain Phase 2 policy.
 
 ---
 
@@ -605,8 +616,10 @@ fn task_stopped(
 fn task_runnable(&self, task: TaskId, _hint: WakeHint) {
     let meta = self.task_meta.get(&task).unwrap();
 
-    // Phase 1: no migration; always use last_hart, or pick arbitrarily.
-    let hart = meta.last_hart.unwrap_or_else(|| pick_any_hart());
+    // Phase 1: no load-balancing migration. Prefer the last hart if it is
+    // still allowed by the task's initial affinity; otherwise use the first
+    // allowed hart. A zero affinity mask is normalized to the boot hart.
+    let hart = home_hart_for_meta(meta);
     let local = &self.per_hart[hart as usize];
 
     match meta.class {
@@ -626,6 +639,29 @@ fn task_runnable(&self, task: TaskId, _hint: WakeHint) {
     }
 }
 ```
+
+The concrete Phase 1 implementation also exposes a placement-returning helper
+for the multi-hart reactor dispatcher:
+
+```rust
+pub struct RunnablePlacement {
+    pub target_hart: HartId,
+    pub wake_remote: bool,
+}
+
+fn task_runnable_from(
+    &mut self,
+    task: TaskId,
+    hint: WakeHint,
+    current_hart: HartId,
+) -> Option<RunnablePlacement>;
+```
+
+`None` means the task was not newly enqueued (for example, duplicate wake
+coalescing). `Some` reports the selected runqueue and whether the current hart
+must notify a remote hart. The scheduler does not send IPIs itself; reactor
+dispatch state records `need_resched`, and kernel runtime code translates remote
+placement into the platform `SmpIf`.
 
 ### 4.7 task_submitted and task_dropped
 <!-- txdoc:SCHED-4-7-TASK-SUBMITTED-AND-TASK-DROPPED -->
@@ -647,8 +683,8 @@ fn task_submitted(&self, task: TaskId, handle: TaskHandle, initial: InitialSched
 
     self.task_meta.insert(task, meta);
 
-    // Enqueue as new task.
-    let hart = pick_initial_hart();  // Phase 1: round-robin across harts
+    // Enqueue as new task on the first allowed hart.
+    let hart = first_hart_in_mask(initial.affinity);
     let local = &self.per_hart[hart as usize];
     local.new_queue.push_back(task);
 }
@@ -685,6 +721,7 @@ pub struct InitialSchedMeta {
 - **I/O-bound threads get fast dispatch.** Thanks to new-queue's short slice, a thread that typically blocks quickly gets low-latency dispatch on wake.
 - **Kernel work runs cooperatively.** Kernel tasks never preempted; matches REACTOR_v0's preempt-at-poll-boundary discipline.
 - **Budget travels across sleep/wake.** A thread that uses 3ms of its 10ms slice before blocking will, on wake, get the 7ms remainder at front of preempted queue. Incentivizes good I/O behavior.
+- **Initial affinity is honored.** Task submission and wake placement choose an allowed hart from the task's initial mask. There is no load-balancing migration.
 
 ### 4.10 What Phase 1 MVP does not do
 <!-- txdoc:SCHED-4-10-WHAT-PHASE-1-MVP-DOES-NOT-DO -->
@@ -693,7 +730,7 @@ pub struct InitialSchedMeta {
 - **No cgroups.** No quota or weight logic.
 - **No cross-hart load balancing.** Tasks stay on the hart they were last on; imbalance is possible and accepted.
 - **No RT classes.** All tasks are fair.
-- **No affinity enforcement.** `AffinityMask` is stored but not consulted (Phase 2 respects it).
+- **No dynamic affinity syscall semantics.** Initial `AffinityMask` is consulted for queue placement and wake homing, but `sched_setaffinity`-style live updates, forced migration, and load-balancing movement are Phase 2.
 
 ---
 
@@ -743,7 +780,11 @@ Linux's CFS has this; Fuchsia has a simpler version. Phase 2 can start with "mig
 ### 5.5 Affinity enforcement
 <!-- txdoc:SCHED-5-5-AFFINITY-ENFORCEMENT -->
 
-`sched_setaffinity` and `pthread_setaffinity_np` set AffinityMask. Scheduler honors it: `pick_next` only returns tasks whose affinity includes the calling hart. Migration respects affinity.
+Phase 1 already honors the initial `AffinityMask` for queue placement. Phase 2
+adds `sched_setaffinity` and `pthread_setaffinity_np` live updates: `pick_next`
+only returns tasks whose affinity includes the calling hart, migration respects
+affinity, and any now-disallowed queued/running task is moved or preempted at a
+defined boundary.
 
 ### 5.6 Backward compatibility
 <!-- txdoc:SCHED-5-6-BACKWARD-COMPATIBILITY -->
@@ -780,7 +821,10 @@ PROCESS_v1 defers `nice`, `setpriority`, `sched_setscheduler`, `sched_setaffinit
 - `sched_setscheduler(pid, policy, param)` changes `TaskSchedMeta.class` and rt_priority.
 - `sched_setaffinity(pid, cpuset)` sets affinity.
 
-Phase 1 syscalls may accept these calls and return success, but have no effect (nice stored but ignored). Phase 2 makes them effective.
+Phase 1 syscalls may accept these calls and return success, but dynamic
+updates have no effect beyond initial scheduler metadata: nice is stored but
+ignored, scheduler class changes are ignored, and affinity is only consumed at
+submission/wake placement. Phase 2 makes the syscalls effective.
 
 ### 7.2 THREAD_RUNTIME
 <!-- txdoc:SCHED-7-2-THREAD-RUNTIME -->
@@ -809,7 +853,7 @@ Scheduler events (dispatch, preempt, block, wake) are natural tracepoints. The o
 - **How does `task_submitted` get called for the initial thread of a newly-forked process?** PROCESS_v1 §7.1.2's step_clone_process phase 4 "submit child thread's future to reactor" implies the reactor calls something. That something should route through `task_submitted` with appropriate InitialSchedMeta. For Phase 1, InitialSchedMeta inherits the parent's scheduling class and nice; fresh budget.
 - **Where does InitialSchedMeta come from?** For fork/clone: inherited from parent. For kernel tasks: provided by the submitting subsystem. For initial boot tasks (init, pid 1): hard-coded defaults.
 - **How does the idle task fit in?** Conceptually one idle task per hart, always runnable, SchedClass::Idle, never reaps. When pick_next returns None, reactor runs the idle task (which typically does WFI / halt until interrupt). Could also be modeled as "reactor's default idle path" without being a real task.
-- **When does the scheduler trigger a reschedule IPI to another hart?** Phase 2 concern; needs IPI infrastructure (cross-core bus carriers per BUS_v1).
+- **When does the scheduler trigger a reschedule IPI to another hart?** It never does so directly. The low-level SMP IPI surface exists, Phase 1 reports remote wake placement, and the reactor/kernel dispatch bridge translates that placement into `SmpIf::send_ipi`. Priority-aware preemption policy remains later.
 - **Should `task_stopped` be synchronous with the stop event, or can it be batched?** Phase 1: synchronous (simpler to reason about). Phase 2 may batch for performance.
 - **How to handle `sched_yield`?** Userspace syscall; script calls `reactor::yield_now`. Task state = Yielded; scheduler requeues at back. Phase 1 fine.
 - **Should `defer_kernel_work` be reactor-controlled or scheduler-controlled?** Tock puts it in the scheduler trait; we follow suit. But Phase 1 scheduler can just return false and the reactor handles kernel work eagerly.
@@ -822,7 +866,7 @@ Scheduler events (dispatch, preempt, block, wake) are natural tracepoints. The o
 - **Full fair-share mathematics.** Weight tables, vruntime formulas, periodic virtual-time rebasing. Phase 2.
 - **RT class admission.** SCHED_DEADLINE admission control. Phase 3.
 - **Cgroup hierarchy mechanics.** Weight propagation, quota enforcement. Phase 2 cgroup spec.
-- **Cross-hart IPI for reschedule.** Needs multi-hart bus primitives. Phase 2.
+- **Full cross-hart preemption policy.** Low-level SMP IPI, the initial reactor dispatch bridge, and serialized AP runqueue draining exist. This spec does not define priority-aware remote preemption, load balancing, or final per-hart reactor sharding.
 - **Idle task behavior.** WFI / halt semantics. HAL concern.
 - **Exact HAL timer programming.** RISC-V stimecmp interface. HAL spec.
 - **Implementation data structures.** Red-black trees vs linked lists vs arrays. Implementation choice for each policy.
@@ -840,4 +884,4 @@ None. SCHEDULER_v0 is additive relative to REACTOR_v0 and PROCESS_v1. It pins wh
 ## 11. Short version
 <!-- txdoc:SCHED-11-SHORT-VERSION -->
 
-> The scheduler is a policy consulted by the reactor via the `SchedulerPolicy` trait. It owns per-task scheduling metadata (class, priority, remaining budget, runtime accounting) and per-hart runqueues. It decides task selection and slice configuration; the reactor mechanizes dispatch, preemption, and context save/restore. Phase 1 is round-robin with fixed 10ms slice, two-queue dispatch (new vs preempted — Aspen-KB insight), cooperative for kernel tasks. Budget travels across sleep/wake (Zircon-style), incentivizing I/O-bound threads. Phase 2 adds priority classes (RT FIFO/RR), fair-share (weighted vruntime), cgroup CPU controller, and affinity. The trait interface is stable across phases; new policies plug in without reactor changes.
+> The scheduler is a policy consulted by the reactor via the `SchedulerPolicy` trait. It owns per-task scheduling metadata (class, priority, affinity, remaining budget, runtime accounting) and per-hart runqueues. It decides task selection and slice configuration; the reactor mechanizes dispatch, preemption, wake-to-IPI bridging, and context save/restore. Phase 1 is round-robin with fixed 10ms slice, two-queue dispatch (new vs preempted), cooperative for kernel tasks, initial affinity-aware placement, and placement-reported remote wake dispatch. Budget travels across sleep/wake (Zircon-style), incentivizing I/O-bound threads. Phase 2 adds priority classes (RT FIFO/RR), fair-share (weighted vruntime), cgroup CPU controller, dynamic affinity, priority-aware remote preemption, and load balancing. The trait interface is stable across phases; new policies plug in without reactor changes.

@@ -12,6 +12,11 @@ use crate::Result;
 const RV64_KERNEL_WINDOW_SIZE: u64 = 512 * 1024 * 1024;
 const RV64_USER_TOP: u64 = 0x0000_0040_0000_0000;
 const RV64_SV39_BITS: u32 = 39;
+const RV64_REG_NAMES: [&str; 32] = [
+    "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4",
+    "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4",
+    "t5", "t6",
+];
 
 pub(crate) fn fault_decode(root: &Path, args: Vec<String>) -> Result<()> {
     let config = FaultDecodeConfig::parse(root, &args)?;
@@ -44,7 +49,7 @@ pub(crate) fn fault_decode(root: &Path, args: Vec<String>) -> Result<()> {
             let selected = if all {
                 traps
             } else {
-                vec![*traps.last().expect("checked non-empty")]
+                vec![traps.last().expect("checked non-empty").clone()]
             };
             for (index, trap) in selected.iter().enumerate() {
                 print_trap_block(index + 1, trap, &image, &spec);
@@ -96,6 +101,7 @@ impl FaultDecodeConfig {
                     scause: parse_u64_value(&scause)?,
                     sepc: parse_u64_value(&sepc)?,
                     stval: parse_u64_value(&stval)?,
+                    frame: None,
                 }),
                 (None, None, None) => {
                     return Err("provide --serial, --addr, or --scause/--sepc/--stval".into())
@@ -112,11 +118,21 @@ impl FaultDecodeConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct TrapRecord {
     scause: u64,
     sepc: u64,
     stval: u64,
+    frame: Option<Box<TrapFrameDump>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrapFrameDump {
+    x: [u64; 32],
+    scause: u64,
+    sepc: u64,
+    stval: u64,
+    sstatus: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -526,26 +542,99 @@ impl ElfImage {
 }
 
 fn parse_traps(serial: &str) -> Vec<TrapRecord> {
-    serial
-        .lines()
-        .filter_map(|line| {
-            Some(TrapRecord {
-                scause: parse_value_after_key(line, "scause")?,
-                sepc: parse_value_after_key(line, "sepc")?,
-                stval: parse_value_after_key(line, "stval")?,
-            })
-        })
-        .collect()
+    let lines = serial.lines().collect::<Vec<_>>();
+    let mut traps = Vec::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let Some(mut trap) = parse_trap_summary(lines[index]) else {
+            index += 1;
+            continue;
+        };
+
+        let mut next = index + 1;
+        while next < lines.len() && lines[next].trim().is_empty() {
+            next += 1;
+        }
+
+        if next < lines.len() && lines[next].trim() == "trapframe:" {
+            let (frame, consumed) = parse_trapframe_block(&lines[next + 1..]);
+            trap.frame = frame;
+            index = next + 1 + consumed;
+        } else {
+            index += 1;
+        }
+
+        traps.push(trap);
+    }
+
+    traps
+}
+
+fn parse_trap_summary(line: &str) -> Option<TrapRecord> {
+    Some(TrapRecord {
+        scause: parse_value_after_key(line, "scause")?,
+        sepc: parse_value_after_key(line, "sepc")?,
+        stval: parse_value_after_key(line, "stval")?,
+        frame: None,
+    })
+}
+
+fn parse_trapframe_block(lines: &[&str]) -> (Option<Box<TrapFrameDump>>, usize) {
+    let mut regs = [None; 32];
+    let mut scause = None;
+    let mut sepc = None;
+    let mut stval = None;
+    let mut sstatus = None;
+    let mut consumed = 0;
+
+    for line in lines {
+        if line.trim().is_empty() || !(line.starts_with(' ') || line.starts_with('\t')) {
+            break;
+        }
+        consumed += 1;
+
+        for (reg, slot) in regs.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = parse_value_after_key(line, &format!("x{reg}"));
+            }
+        }
+        scause = scause.or_else(|| parse_value_after_key(line, "scause"));
+        sepc = sepc.or_else(|| parse_value_after_key(line, "sepc"));
+        stval = stval.or_else(|| parse_value_after_key(line, "stval"));
+        sstatus = sstatus.or_else(|| parse_value_after_key(line, "sstatus"));
+    }
+
+    let frame = match (
+        regs.iter().all(Option::is_some),
+        scause,
+        sepc,
+        stval,
+        sstatus,
+    ) {
+        (true, Some(scause), Some(sepc), Some(stval), Some(sstatus)) => {
+            Some(Box::new(TrapFrameDump {
+                x: regs.map(|reg| reg.expect("checked complete")),
+                scause,
+                sepc,
+                stval,
+                sstatus,
+            }))
+        }
+        _ => None,
+    };
+
+    (frame, consumed)
 }
 
 fn parse_value_after_key(line: &str, key: &str) -> Option<u64> {
-    let start = line.find(key)?;
-    let after_key = &line[start + key.len()..];
-    let after_equals = after_key.strip_prefix('=')?;
-    let value = after_equals
-        .split(|ch: char| ch.is_ascii_whitespace() || ch == ',' || ch == ';')
-        .next()?;
-    parse_u64_value(value).ok()
+    line.split(|ch: char| ch.is_ascii_whitespace() || ch == ',' || ch == ';')
+        .filter_map(|token| token.split_once('='))
+        .find_map(|(candidate_key, value)| {
+            (candidate_key == key)
+                .then(|| parse_u64_value(value).ok())
+                .flatten()
+        })
 }
 
 fn parse_u64_value(value: &str) -> Result<u64> {
@@ -840,9 +929,29 @@ fn print_trap_block(index: usize, trap: &TrapRecord, image: &ElfImage, spec: &Ta
     print_address_details(trap.stval, image, spec, Some(stval_interpretation(&scause)));
     println!();
 
+    if let Some(frame) = &trap.frame {
+        print_trapframe_dump(frame);
+        println!();
+    }
+
     println!("candidate trace:");
     print_candidate_trace("sepc", trap.sepc, image, spec);
     print_candidate_trace("stval", trap.stval, image, spec);
+}
+
+fn print_trapframe_dump(frame: &TrapFrameDump) {
+    println!("trapframe:");
+    for (index, value) in frame.x.iter().enumerate() {
+        println!(
+            "  x{index:02} ({:>4}): {}",
+            RV64_REG_NAMES[index],
+            format_hex(*value)
+        );
+    }
+    println!("  scause: {}", format_hex(frame.scause));
+    println!("  sepc: {}", format_hex(frame.sepc));
+    println!("  stval: {}", format_hex(frame.stval));
+    println!("  sstatus: {}", format_hex(frame.sstatus));
 }
 
 fn print_address_block(label: &str, addr: u64, image: &ElfImage, spec: &TargetSpec) {
@@ -966,14 +1075,63 @@ txkernel:qemu-riscv64-virt:trap scause=0xf sepc=0x80219096 stval=0x0
                     scause: 7,
                     sepc: 0xffff_ffff_8021_9096,
                     stval: 0xffff_ffc0_8000_0000,
+                    frame: None,
                 },
                 TrapRecord {
                     scause: 15,
                     sepc: 0x8021_9096,
                     stval: 0,
+                    frame: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parses_rich_trapframe_dump_without_duplicate_trap() {
+        let mut serial = String::from(
+            "\
+txkernel:qemu-riscv64-virt:trap
+scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0000004000001000
+trapframe:
+",
+        );
+        for base in (0..32).step_by(4) {
+            serial.push_str(&format!(
+                "  x{}=0x{:016x} x{}=0x{:016x} x{}=0x{:016x} x{}=0x{:016x}\n",
+                base,
+                base,
+                base + 1,
+                base + 1,
+                base + 2,
+                base + 2,
+                base + 3,
+                base + 3
+            ));
+        }
+        serial.push_str(
+            "  scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0000004000001000 sstatus=0x0000000000000100\n",
+        );
+
+        let traps = parse_traps(&serial);
+
+        assert_eq!(traps.len(), 1);
+        let trap = &traps[0];
+        assert_eq!(trap.scause, 13);
+        assert_eq!(trap.sepc, 0xffff_ffff_8020_1234);
+        assert_eq!(trap.stval, 0x0000_0040_0000_1000);
+
+        let frame = trap
+            .frame
+            .as_deref()
+            .expect("trapframe dump should be attached");
+        assert_eq!(frame.x[0], 0);
+        assert_eq!(frame.x[2], 2);
+        assert_eq!(frame.x[31], 31);
+        assert_eq!(frame.scause, trap.scause);
+        assert_eq!(frame.sepc, trap.sepc);
+        assert_eq!(frame.stval, trap.stval);
+        assert_eq!(frame.sstatus, 0x100);
     }
 
     #[test]

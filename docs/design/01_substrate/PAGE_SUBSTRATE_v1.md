@@ -85,7 +85,10 @@ This substrate does not require:
 
 - Heap. BootInfo is `'static`-referenced; substrate initialization before slab bring-up (§5) uses stack locals and static storage only.
 - Reactor. Substrate bring-up is synchronous; every operation runs to completion on the BSP before returning.
-- SMP. APs are not yet booted when the substrate begins. Stage 3 (§4.3) occurs before AP bring-up; APs come online after the substrate is fully live.
+- SMP. APs are not yet booted when BSP substrate initialization begins. Stage
+  3 (§4.3) occurs before AP bring-up; each AP must call
+  `tx_substrate::init_on_ap(cpu)` before publishing itself online so epoch and
+  zone per-CPU state exists before scheduler admission.
 
 **Ordering constraint.** The axHal-style HAL boot mainline is the H0-H4 sequence from HAL_v1 §5. Substrate begins inside H3:
 
@@ -166,11 +169,13 @@ create-destroy for VM-owned roots, ASID-scoped page shootdown batches,
 no-alloc VM-facing page-range reserve/commit, unmap, and protect wrappers,
 permanent anchors for boot metadata and bootstrap page tables, the permanent
 zero frame, the slab heap, and an RV64 panic/spin trap vector plus typed trap
-classification installed at HAL entry and after `init_later`. The remaining
+classification installed at HAL entry and after `init_later`. RV64 QEMU also
+initializes AP-local epoch/zone state before online publication and uses SBI
+RFENCE for remote pmap shootdown once APs are online. The remaining
 PAGE_SUBSTRATE_v1 exit criteria are:
 
 - superpage/multi-frame shootdown accounting beyond page-sized pins;
-- remote-hart SMP shootdown coordination beyond the current local `sfence.vma`;
+- kernel-managed SMP shootdown protocol if firmware RFENCE is unavailable;
 - the full trap shell/user-return path before user/VM faults are enabled.
 
 ### 2.2 Address and pointer boundary
@@ -366,8 +371,9 @@ The current executable API is still boot-oriented: substrate commits
 reservations in the same loop, but abandoned reservations now have an explicit
 rollback path that clears newly-created branch PTEs and returns `PT_NODE_POOL`
 intermediates. Kernel unmap returns a `PmapUnmapResult` with an invalidation
-token; the current RV64 path uses local `sfence.vma`, while SMP/global
-aggregation remains a later substrate/VM slice.
+token; the current RV64 QEMU path uses local `sfence.vma` plus SBI RFENCE to
+online remote harts, while higher-level SMP/global aggregation remains a later
+substrate/VM slice.
 
 After phase 3, the kernel can access any registered MMIO region through a known virtual address.
 

@@ -495,6 +495,6 @@ Binding designers:
 <!-- txdoc:OBJECT-MODEL-OPEN-QUESTIONS-1 -->
 
 - Exact guard-registration implementation (per-CPU tables, drain budgets, debug nesting checks) belongs to EBR/Zone implementation, with architecture-facing rules already pinned by `EBR_ZONE_INTERFACE_v1.md` and `INVARIANTS_v4.md`.
-- COW payload slots such as fd tables, signal-action tables, fs-context, and VM roots should be modeled as identity-retaining payload evidence or explicit service-owned shared payloads. Do not resurrect v11 `Shared<T>` as an untyped escape hatch.
+- COW payload slots such as fd tables, signal-action tables, fs-context, and VM roots should be modeled as identity-retaining payload evidence or explicit service-owned shared payloads. Do not resurrect the retired draft's `Shared<T>` as an untyped escape hatch.
 - Weak back-references for future rmap (Frame → VmEntries) are a natural extension; not required before Phase 2.
 - Name-cache eviction and staleness discipline for resolution-only bindings is implementation choice; framework accommodates both lazy and eager strategies.

@@ -18,8 +18,8 @@ Use this skill for HAL/substrate boundary work.
 
 - HAL is an axHal-style static platform family.
 - One platform is selected at compile/link time.
-- No runtime `HalManager`.
-- No `Box<dyn Hal>`.
+- No runtime HAL-manager type.
+- No boxed dynamic HAL trait object.
 - No `__ostd_main`.
 - No HAL-owned semantic entities.
 - No HAL callback slot for subsystem policy.

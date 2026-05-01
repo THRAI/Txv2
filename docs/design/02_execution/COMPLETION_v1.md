@@ -4,7 +4,7 @@
 
 **Status.** Draft v1 companion to the reactor, bus, and script middleware model.
 
-**Purpose.** Specify the txKernel completion object: a Linux-inspired, reactor-facing wait protocol object for one-shot or counted internal rendezvous. A completion is not semantic truth, not a bus primitive, and not a subsystem entity. It is a specialized middleware object that packages a simple condition with a private wake carrier.
+**Purpose.** Specify the txKernel completion object: a Linux-inspired, reactor-facing wait protocol object for counted internal rendezvous. A completion is not semantic truth, not a bus primitive, and not a subsystem entity. It is a specialized middleware object that packages a simple condition with a private wake carrier.
 
 **Audience.** Authors of reactor wait code, syscall scripts, process/thread coordination code, and reviewers deciding whether a new "wait until X finishes" mechanism should be a completion, a bus signal, or a subsystem-specific handoff.
 
@@ -65,24 +65,24 @@ It is middleware because it supplies waiting protocol while the caller supplies 
 
 Two shapes are admitted in v1.
 
-### 2.1 One-Shot Completion
-<!-- txdoc:COMP-2-1-ONE-SHOT-COMPLETION -->
+### 2.1 Counted Completion
+<!-- txdoc:COMP-2-1-COUNTED-COMPLETION -->
 
-A one-shot completion starts incomplete and transitions complete at most once.
+A counted completion starts with zero available completion credits.
 
 ```rust
 struct Completion {
-    done: AtomicBool,
+    done_count: AtomicU32,
     channel: Channel,
 }
 ```
 
 Rules:
 
-- `complete()` transitions `done: false -> true` and wakes waiters.
-- `wait(protocol)` returns when `done == true`, or returns `Interrupted`, `Killed`, or `TimedOut` per `WaitProtocol`.
-- repeated `complete()` calls are idempotent unless a caller explicitly needs debug assertions.
-- completion does not reset unless the type is explicitly `ReusableCompletion`.
+- `complete()` adds one completion credit and wakes at least one waiter.
+- `wait(protocol)` returns when it can consume one completion credit, or returns `Interrupted`, `Killed`, or `TimedOut` per `WaitProtocol`.
+- repeated `complete()` calls add repeated credits.
+- default completion is not broadcast. Broadcast or latch semantics require a distinct type name such as `BroadcastCompletion` or `LatchCompletion`.
 
 ### 2.2 Countdown Completion
 <!-- txdoc:COMP-2-2-COUNTDOWN-COMPLETION -->
@@ -117,8 +117,8 @@ Waiters must re-read the completion condition after wake:
 
 ```rust
 loop {
-    if completion.is_done(Ordering::Acquire) {
-        return WaitOutcome::ConditionTrue;
+    if completion.try_consume(Ordering::Acquire) {
+        return WaitOutcome::Ready;
     }
 
     reactor::wait(
@@ -161,12 +161,12 @@ The wake may be coalesced, delayed, or spurious. The acquire read of the conditi
 Exact Rust spelling is implementation-layer, but these roles are load-bearing:
 
 ```rust
-pub struct Completion { /* opaque */ }
+    pub struct Completion { /* opaque */ }
 
 impl Completion {
-    pub fn new_incomplete() -> Self;
+    pub fn new() -> Self;
     pub fn complete(&self);
-    pub fn is_complete(&self, guard: Option<&Guard>) -> bool;
+    pub fn try_consume(&self) -> bool;
     pub async fn wait(&self, protocol: WaitProtocol) -> WaitOutcome;
 }
 
@@ -246,15 +246,19 @@ LINT: completion modules may import reactor wait and bus carrier types; they mus
 
 LINT: completion wait APIs must contain or call a condition recheck loop.
 
-**COMP-3.** Producer data is release-published before completion is made observable; waiters acquire-observe completion before reading producer data.
+**COMP-3.** Counted completion consumes one credit per successful waiter unless the type is explicitly named as broadcast/latch.
+
+LINT: default completion waits must use a consuming check; broadcast-style APIs require a distinct type/name.
+
+**COMP-4.** Producer data is release-published before completion is made observable; waiters acquire-observe completion before reading producer data.
 
 LINT: completion state transitions require release/acquire ordering or a stronger reviewed synchronization primitive.
 
-**COMP-4.** Countdown completions have a closed participant count after construction.
+**COMP-5.** Countdown completions have a closed participant count after construction.
 
 LINT: no public `add_participant` on `CountdownCompletion` in v1.
 
-**COMP-5.** Completion is not handoff. Any mechanism selecting a single waiter for ownership transfer is outside completion and falls under `EXC-3`.
+**COMP-6.** Completion is not handoff. Any mechanism selecting a single waiter for ownership transfer is outside completion and falls under `EXC-3`.
 
 LINT: completion APIs cannot expose selected-waiter identity, priority donation, or lock ownership transfer.
 
