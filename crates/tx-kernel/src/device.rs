@@ -242,6 +242,9 @@ mod tests {
     #[test]
     fn block_device_handle_translates_partition_relative_lbas() {
         tx_substrate::testing::init_host_for_test_once();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
         let guard = tx_substrate::epoch::guard();
         let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 4);
         let mut frames = [Frame::new(Ppn(0))];

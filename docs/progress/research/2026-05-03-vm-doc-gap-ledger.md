@@ -129,8 +129,12 @@ ownership.
   `step_write` now materialize ranges, advance `OpenFile` offsets, propagate
   wait outcomes, mark written pages dirty, and reject Device writes, but they
   are intentionally copyless until Tx exposes direct-map/user-buffer copying.
-  `step_truncate`, `step_fsync`, dynamic `PC.size`, dirty iteration, writeback,
-  bounds withdrawal, and reclaim integration remain future PageBacked-owned
+  `step_truncate` and `step_fsync` are now staged over fixed page-count
+  capacity: truncate asks File backing first and withdraws cached pages at or
+  beyond the new boundary, while fsync flushes dirty File pages and then calls
+  backing metadata sync. Final dynamic `PC.size`, truncate-up growth,
+  byte-accurate partial-page truncate handling, production writeback,
+  reclaim integration, and real backend behavior remain future PageBacked-owned
   work under `txdoc:PAGE-BACKED-5-RANGE-OPERATIONS`.
 - VM syscall-script surfaces are missing for `fault_script`, `mmap_script`,
   `munmap_script`, `mprotect_script`, `mremap_script`, `brk_script`,
@@ -175,8 +179,9 @@ slices because the active docs already defer them or mark them as v1 debt:
    page-backed read-only shared installs and CoW replacement writes.
 4. Complete PageBacked v1 core before filesystem backends: keep
    `PageContainer::materialize_page` as the Anon/File/Device dispatch boundary,
-   keep copyless `step_read`/`step_write` as staged range-progress scripts,
-   then add truncate/fsync tests with mock backends.
+   keep copyless `step_read`/`step_write` as staged range-progress scripts, and
+   keep `step_truncate`/`step_fsync` as fixed-capacity mock-backed lifecycle
+   scripts until dynamic `PC.size` and byte-copy helpers exist.
 5. Add VM-owned syscall-script surfaces over the synchronous compatibility
    helpers, returning wait-aware outcomes where the docs require retry/yield.
 6. Plan runtime integration last: fork after snapshot recipes and CoW demotion,
