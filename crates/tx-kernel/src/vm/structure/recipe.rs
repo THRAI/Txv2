@@ -1,7 +1,6 @@
 //! Authoritative staged recipe range index.
 
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -18,17 +17,17 @@ type RecipeTree = BTreeMap<UserVirtAddr, VmEntry>;
 ///
 /// This wrapper is backed by `BTreeMap` keyed by mapping start address, so it
 /// is no longer the artificial fixed-capacity array from the first slice.
-/// Readers clone an immutable tree snapshot; writers publish a whole replacement
+/// Readers clone an owned tree snapshot; writers publish a whole replacement
 /// tree after validating and rewriting the old one. This gives observers a
 /// complete pre- or post-mutation recipe set while still stopping short of the
 /// final VM_v1_2 persistent/epoch range index.
 pub(in crate::vm) struct RecipeIndex {
-    published: SpinMutex<Arc<RecipeTree>>,
+    published: SpinMutex<RecipeTree>,
 }
 
 #[derive(Clone)]
 pub(in crate::vm) struct RecipeSnapshot {
-    entries: Arc<RecipeTree>,
+    entries: RecipeTree,
 }
 
 impl RecipeSnapshot {
@@ -60,14 +59,14 @@ impl RecipeSnapshot {
 impl RecipeIndex {
     pub(in crate::vm) fn new() -> Self {
         Self {
-            published: SpinMutex::new(Arc::new(BTreeMap::new())),
+            published: SpinMutex::new(BTreeMap::new()),
         }
     }
 
     pub(in crate::vm) fn snapshot_reader(&self) -> RecipeSnapshot {
         let published = self.published.lock();
         RecipeSnapshot {
-            entries: Arc::clone(&*published),
+            entries: RecipeTree::clone(&published),
         }
     }
 
@@ -119,12 +118,12 @@ impl RecipeIndex {
                 let changed_pages = entry.range.page_count();
                 let mut rewritten = RecipeTree::clone(&published);
                 push_entry(&mut rewritten, entry);
-                *published = Arc::new(rewritten);
+                *published = rewritten;
                 Ok(VmMapCommit { changed_pages })
             }
             MapPlacement::FixedReplace => {
                 let (rewritten, changed_pages) = rewrite_fixed(&published, &entry)?;
-                *published = Arc::new(rewritten);
+                *published = rewritten;
                 Ok(VmMapCommit { changed_pages })
             }
         }
@@ -133,7 +132,7 @@ impl RecipeIndex {
     pub(in crate::vm) fn unmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
         let mut published = self.published.lock();
         let (rewritten, changed_pages) = rewrite_unmap(&published, range)?;
-        *published = Arc::new(rewritten);
+        *published = rewritten;
         Ok(VmMapCommit { changed_pages })
     }
 
@@ -144,7 +143,7 @@ impl RecipeIndex {
     ) -> Result<VmMapCommit, VmMapError> {
         let mut published = self.published.lock();
         let (rewritten, changed_pages) = rewrite_protect(&published, range, prot)?;
-        *published = Arc::new(rewritten);
+        *published = rewritten;
         Ok(VmMapCommit { changed_pages })
     }
 
@@ -155,7 +154,7 @@ impl RecipeIndex {
     ) -> Result<VmMapCommit, VmMapError> {
         let mut published = self.published.lock();
         let (rewritten, changed_pages) = rewrite_remap_disjoint(&published, old_range, new_range)?;
-        *published = Arc::new(rewritten);
+        *published = rewritten;
         Ok(VmMapCommit { changed_pages })
     }
 }
