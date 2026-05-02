@@ -11,7 +11,7 @@ use alloc::collections::BTreeMap;
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::mount::MountPayload;
 use crate::sync::SpinMutex;
-use crate::vfs::FsObjectId;
+use crate::vfs::{FsObjectId, OpenFile};
 use tx_hal::Ppn;
 use tx_substrate::{
     page_allocator::{
@@ -225,6 +225,12 @@ pub enum PageContainerKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaterializeAccess {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageBackedIoKind {
     Read,
     Write,
 }
@@ -519,6 +525,105 @@ impl PageContainer {
         }
         Ok(())
     }
+
+    fn byte_capacity(&self) -> Option<u64> {
+        self.page_count
+            .checked_mul(crate::vm::USER_PAGE_SIZE as u64)
+    }
+}
+
+pub fn step_read(
+    pc: &PageContainer,
+    of: &mut OpenFile,
+    len: usize,
+    guard: &Guard<'_>,
+) -> StepOutcome<usize> {
+    if len == 0 {
+        return StepOutcome::Done(0);
+    }
+    let Some(capacity) = pc.byte_capacity() else {
+        return StepOutcome::Err(Errno::EINVAL);
+    };
+    let start = of.offset();
+    if start >= capacity {
+        return StepOutcome::Done(0);
+    }
+    let effective_len = core::cmp::min(len as u64, capacity - start) as usize;
+    step_range(pc, of, effective_len, PageBackedIoKind::Read, guard)
+}
+
+pub fn step_write(
+    pc: &PageContainer,
+    of: &mut OpenFile,
+    len: usize,
+    guard: &Guard<'_>,
+) -> StepOutcome<usize> {
+    if len == 0 {
+        return StepOutcome::Done(0);
+    }
+    if matches!(pc.kind(), PageContainerKind::Device { .. }) {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+    let Some(capacity) = pc.byte_capacity() else {
+        return StepOutcome::Err(Errno::EINVAL);
+    };
+    let Some(end) = of.offset().checked_add(len as u64) else {
+        return StepOutcome::Err(Errno::EINVAL);
+    };
+    if end > capacity {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+    step_range(pc, of, len, PageBackedIoKind::Write, guard)
+}
+
+fn step_range(
+    pc: &PageContainer,
+    of: &mut OpenFile,
+    len: usize,
+    kind: PageBackedIoKind,
+    guard: &Guard<'_>,
+) -> StepOutcome<usize> {
+    let mut advanced = 0usize;
+    let mut offset = of.offset();
+    while advanced < len {
+        let page_index = PageIndex::new(offset / crate::vm::USER_PAGE_SIZE as u64);
+        let within_page = (offset % crate::vm::USER_PAGE_SIZE as u64) as usize;
+        let chunk = core::cmp::min(len - advanced, crate::vm::USER_PAGE_SIZE - within_page);
+        let access = match kind {
+            PageBackedIoKind::Read => MaterializeAccess::Read,
+            PageBackedIoKind::Write => MaterializeAccess::Write,
+        };
+
+        match pc.materialize_page(page_index, access, guard) {
+            StepOutcome::Done(_) | StepOutcome::Advanced(_) => {
+                advanced += chunk;
+                offset += chunk as u64;
+            }
+            StepOutcome::AdvancedThenBlocked(_, token) => {
+                advanced += chunk;
+                offset += chunk as u64;
+                of.set_offset(offset);
+                return StepOutcome::AdvancedThenBlocked(advanced, token);
+            }
+            StepOutcome::Blocked(token) => {
+                if advanced == 0 {
+                    return StepOutcome::Blocked(token);
+                }
+                of.set_offset(offset);
+                return StepOutcome::AdvancedThenBlocked(advanced, token);
+            }
+            StepOutcome::Err(errno) => {
+                if advanced == 0 {
+                    return StepOutcome::Err(errno);
+                }
+                of.set_offset(offset);
+                return StepOutcome::Done(advanced);
+            }
+        }
+    }
+
+    of.set_offset(offset);
+    StepOutcome::Done(advanced)
 }
 
 fn allocate_cached_frame() -> Result<CachedFrame, PageCacheError> {
@@ -585,12 +690,22 @@ mod tests {
     use super::*;
     use crate::execution::{Errno, StepOutcome, WaitToken};
     use crate::mount::{DevId, MountOptions, MountPayload, SourceLabel};
-    use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta};
+    use crate::vfs::{
+        Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
+        OpenFileFlags, RNode, RNodeBacking,
+    };
     use alloc::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    static PAGE_BACKED_EPOCH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn setup_host_substrate() {
         tx_substrate::testing::init_host_for_test_once();
+        match tx_substrate::page_allocator::claim_zero_frame() {
+            Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+            Err(error) => panic!("claim zero frame for PageBacked tests: {error:?}"),
+        }
     }
 
     fn cached_frame_for_test() -> CachedFrame {
@@ -740,12 +855,9 @@ mod tests {
             self.last_object
                 .store(fs_object_id.as_u64(), Ordering::Release);
             self.last_offset.store(offset, Ordering::Release);
-            let frame = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
-                .expect("fs frame reservation")
-                .commit();
-            let ppn = frame.ppn();
-            core::mem::forget(frame);
-            StepOutcome::Done(Frame::new(ppn))
+            StepOutcome::Done(Frame::new(
+                page_allocator::zero_frame_ppn().expect("zero frame"),
+            ))
         }
 
         fn flush_page(
@@ -948,6 +1060,25 @@ mod tests {
         )
     }
 
+    fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
+        let pc = PageContainer::new_cap(pc.kind().clone(), pc.page_count())
+            .expect("page container cap for open file");
+        let rnode = RNode::new_cap(
+            FsObjectId::new(700),
+            InodeMeta::new(InodeKind::Regular, 0o100644),
+            RNodeBacking::PageBacked { pc },
+        )
+        .expect("rnode cap");
+        OpenFile::new(
+            rnode,
+            OpenFileFlags {
+                read: true,
+                write: true,
+                append: false,
+            },
+        )
+    }
+
     #[test]
     fn page_cache_index_install_if_absent_linearizes_sparse_offsets() {
         let mut index = PageCacheIndex::new();
@@ -1051,6 +1182,9 @@ mod tests {
 
     #[test]
     fn page_container_materialize_page_dispatches_anon() {
+        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let pc = PageContainer::new(
@@ -1072,6 +1206,9 @@ mod tests {
 
     #[test]
     fn page_container_materialize_page_dispatches_file_fetch_once() {
+        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let fs = Arc::new(RecordingFs::new());
@@ -1103,6 +1240,9 @@ mod tests {
 
     #[test]
     fn page_container_materialize_page_propagates_file_block() {
+        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let fs = Arc::new(BlockingFs);
@@ -1123,6 +1263,9 @@ mod tests {
 
     #[test]
     fn page_container_materialize_page_wraps_device_ppns() {
+        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let pc = PageContainer::new(
@@ -1152,5 +1295,122 @@ mod tests {
             },
             StepOutcome::Err(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn pagebacked_step_read_materializes_pages_and_advances_offset() {
+        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed epoch test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            3,
+        );
+        let mut of = open_file_for_pc(&pc);
+        of.set_offset((crate::vm::USER_PAGE_SIZE - 8) as u64);
+
+        assert_eq!(step_read(&pc, &mut of, 32, &guard), StepOutcome::Done(32));
+
+        assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE - 8 + 32) as u64);
+        assert_eq!(pc.resident_pages(), 2);
+        assert!(!pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
+        assert!(!pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
+    }
+
+    #[test]
+    fn pagebacked_step_read_eof_does_not_materialize() {
+        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed epoch test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        );
+        let mut of = open_file_for_pc(&pc);
+        of.set_offset(crate::vm::USER_PAGE_SIZE as u64);
+
+        assert_eq!(step_read(&pc, &mut of, 16, &guard), StepOutcome::Done(0));
+        assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64);
+        assert_eq!(pc.resident_pages(), 0);
+    }
+
+    #[test]
+    fn pagebacked_step_write_marks_dirty_and_advances_offset() {
+        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed epoch test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            2,
+        );
+        let mut of = open_file_for_pc(&pc);
+
+        assert_eq!(
+            step_write(&pc, &mut of, crate::vm::USER_PAGE_SIZE + 17, &guard),
+            StepOutcome::Done(crate::vm::USER_PAGE_SIZE + 17)
+        );
+
+        assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE + 17) as u64);
+        assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
+        assert!(pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
+    }
+
+    #[test]
+    fn pagebacked_step_read_returns_advanced_then_blocked_after_progress() {
+        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed epoch test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let fs = Arc::new(BlockingFs);
+        let pc = file_page_container(fs.clone(), fs, FsObjectId::new(88), 2);
+        let mut of = open_file_for_pc(&pc);
+        pc.state
+            .lock()
+            .pages
+            .install_if_absent(PageIndex::new(0), cached_frame_for_test())
+            .expect("seed cached page");
+
+        assert_eq!(
+            step_read(&pc, &mut of, crate::vm::USER_PAGE_SIZE + 1, &guard),
+            StepOutcome::AdvancedThenBlocked(crate::vm::USER_PAGE_SIZE, WaitToken::new(9, 0x44))
+        );
+        assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64);
+    }
+
+    #[test]
+    fn pagebacked_step_write_rejects_device_backing() {
+        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed epoch test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Device {
+                base_ppn: Ppn(0xface_0000),
+                page_count: 1,
+            },
+            1,
+        );
+        let mut of = open_file_for_pc(&pc);
+
+        assert_eq!(
+            step_write(&pc, &mut of, 8, &guard),
+            StepOutcome::Err(Errno::EINVAL)
+        );
+        assert_eq!(of.offset(), 0);
+        assert_eq!(pc.resident_pages(), 0);
     }
 }
