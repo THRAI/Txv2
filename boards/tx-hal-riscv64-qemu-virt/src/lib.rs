@@ -10,6 +10,7 @@ mod dtb;
 mod pmap;
 mod time;
 mod trap;
+mod user_access;
 pub use trap::{dispatch_trap_frame, return_to_userspace, Rv64TrapFrame};
 
 use boot_static::{
@@ -23,7 +24,7 @@ use tx_hal::{
     IrqIf, MemoryRegion, MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
     PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry,
-    SignalFrameIf, SmpIf, TimeIf, UserAccessIf,
+    SignalFrameIf, SmpIf, TimeIf,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -398,7 +399,6 @@ impl PmapIf for Platform {
         remote_sfence_vma_asid(asid, invalidation);
     }
 }
-impl UserAccessIf for Platform {}
 impl SignalFrameIf for Platform {}
 impl IrqIf for Platform {}
 impl TimeIf for Platform {
