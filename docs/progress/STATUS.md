@@ -4,6 +4,17 @@
 
 ## Current Shape
 
+- 2026-05-03 PR #14 unused-lint fix kept the PageBacked production surface
+  thin by gating the private `PageCacheIndex::install_if_match` replacement /
+  withdrawal helper to tests. The helper was only exercised by unit tests, so a
+  normal test build hid the warning while `RUSTFLAGS=-Dunused cargo check -p
+  tx-kernel` and GitHub's lint path rejected the non-test library build.
+  Verification: `cargo fmt --check`, `RUSTFLAGS=-Dunused cargo check -p
+  tx-kernel`, `cargo test -p tx-kernel --lib`, `cargo xtask progress
+  validate`, `cargo xtask lint unused`, `cargo xtask lint docs`, and `git diff
+  --check`. Next step: reintroduce production replacement / withdrawal only
+  when a real file-backed truncation, writeback, or eviction path consumes it;
+  no blocker.
 - 2026-05-03 PR #14 conflict resolution merged remote `origin/main` into
   `codex/vm-pagebacked-impl`. Resolution kept the base branch's current
   reactor/trap/core progress notes, kept the VM/PageBacked branch's kernel
