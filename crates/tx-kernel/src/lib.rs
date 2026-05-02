@@ -4,9 +4,13 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod device;
+pub mod execution;
 pub mod init;
+pub mod mount;
 pub mod page_backed;
 pub mod trap;
+pub mod vfs;
 pub mod vm;
 
 mod sync;

@@ -8,7 +8,10 @@
 
 use alloc::collections::BTreeMap;
 
+use crate::execution::{Guard, StepOutcome};
+use crate::mount::MountPayload;
 use crate::sync::SpinMutex;
+use crate::vfs::FsObjectId;
 use tx_hal::Ppn;
 use tx_substrate::{
     page_allocator::{self, AllocError, BitmapPageAllocator, CachePin, MapPin, ZeroPolicy},
@@ -33,6 +36,21 @@ impl PageIndex {
 
     pub const fn as_u64(self) -> u64 {
         self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Frame {
+    ppn: Ppn,
+}
+
+impl Frame {
+    pub const fn new(ppn: Ppn) -> Self {
+        Self { ppn }
+    }
+
+    pub const fn ppn(self) -> Ppn {
+        self.ppn
     }
 }
 
@@ -181,17 +199,55 @@ pub enum AnonSwapPolicy {
     Persistent,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PageContainerKind {
-    Anon { swap_policy: AnonSwapPolicy },
-    File { fs_object_id: u64 },
-    Device { base_ppn: u64, page_count: u64 },
+    Anon {
+        swap_policy: AnonSwapPolicy,
+    },
+    File {
+        mount: Cap<MountPayload>,
+        fs_object_id: FsObjectId,
+    },
+    Device {
+        base_ppn: Ppn,
+        page_count: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaterializeAccess {
     Read,
     Write,
+}
+
+pub trait FsPageBacking: Send + Sync + 'static {
+    fn fetch_page<'g>(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        guard: &'g Guard<'_>,
+    ) -> StepOutcome<Frame>;
+
+    fn flush_page<'g>(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        frame: &Frame,
+        guard: &'g Guard<'_>,
+    ) -> StepOutcome<()>;
+
+    fn truncate<'g>(
+        &self,
+        fs_object_id: FsObjectId,
+        new_size: u64,
+        guard: &'g Guard<'_>,
+    ) -> StepOutcome<()>;
+
+    fn fsync<'g>(&self, fs_object_id: FsObjectId, guard: &'g Guard<'_>) -> StepOutcome<()>;
+
+    fn supports_reflink(&self, _other: &PageContainer) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -233,8 +289,8 @@ impl PageContainer {
         Ok(zone::sign_for(reservation, Self::new(kind, page_count)))
     }
 
-    pub const fn kind(&self) -> PageContainerKind {
-        self.kind
+    pub const fn kind(&self) -> &PageContainerKind {
+        &self.kind
     }
 
     pub const fn page_count(&self) -> u64 {
@@ -258,7 +314,7 @@ impl PageContainer {
         page: PageIndex,
         access: MaterializeAccess,
     ) -> Result<MaterializedPage, PageCacheError> {
-        if !matches!(self.kind, PageContainerKind::Anon { .. }) {
+        if !matches!(&self.kind, PageContainerKind::Anon { .. }) {
             return Err(PageCacheError::UnsupportedKind);
         }
         self.check_bounds(page)?;
@@ -312,7 +368,6 @@ fn allocate_cached_frame() -> Result<CachedFrame, PageCacheError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tx_substrate::epoch;
 
     fn setup_host_substrate() {
         tx_substrate::testing::init_host_for_test_once();
@@ -408,10 +463,7 @@ mod tests {
             4,
         )
         .expect("page container cap");
-        let weak = pc.downgrade();
-        let guard = epoch::guard();
-        let ident = weak.observe(&guard).expect("live page container");
-        assert_eq!(ident.page_count(), 4);
+        assert_eq!(pc.page_count(), 4);
 
         let first = pc
             .materialize_anon(PageIndex::new(1), MaterializeAccess::Read)

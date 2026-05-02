@@ -4,6 +4,41 @@
 
 ## Current Shape
 
+- 2026-05-02 VM checks/projections completion slice has landed on top of the
+  subsystem-anatomy reorg. `vm::checks` now exposes staged observation helpers
+  for fault recipe admission, fault-publication revalidation, map admission,
+  and disjoint-remap shape checks; `execution.rs` still owns RangeLock
+  acquisition, recipe mutation, and pmap publication. `vm::project` now exposes
+  read-only `AddressSpaceProjection` / `VmMappingProjection` rows backed by a
+  deterministic recipe snapshot, with page-backed mappings reduced to
+  non-authoritative offsets rather than leaking `Cap<PageContainer>`. Focused
+  red/green checks so far: `cargo test -p tx-kernel vm_checks --
+  --test-threads=1` and `cargo test -p tx-kernel vm_project --
+  --test-threads=1`. Verification: `cargo fmt --check`, `cargo test -p
+  tx-kernel vm -- --test-threads=1`, `cargo test -p tx-kernel --lib`,
+  `cargo xtask progress validate`, `cargo xtask lint docs`, and `git diff
+  --check`. Next step: have future syscall/trap-facing VM scripts consume
+  these check and projection surfaces instead of direct helper calls. Blockers
+  remain persistent/epoch recipe snapshots and trap/process/runtime
+  integration.
+- 2026-05-02 VFS/Mount/PageBacked interface seam landed from the
+  `codex/vfs-interface-scout` readiness note. `tx-kernel` now exposes shared
+  interface shells for `Errno` / `StepOutcome`, device and block handles,
+  VFS live-node names (`DEntry`, `RNode`, `RNodeBacking`, `OpenFile`,
+  `ResolveCtx` / `RootCtx`, witnesses), mount names (`MountIdentity`,
+  `MountPayload`, `MountNamespace`, `MountPayloadPin`, `MountInitContext`,
+  `MetadataPcFactory`, `MountOutput`), and the backend traits
+  `FsOps` / `FsPageBacking`. `PageContainerKind::File` now carries the
+  canonical `Cap<MountPayload>` plus `FsObjectId` boundary so future VFS,
+  PageBacked, bdev-fs, devfs, and kernel-facing ext4 lanes do not invent local
+  spellings. The finish pass also made two existing VM/PageBacked tests robust
+  under parallel `cargo test`: the pmap-drop test now waits boundedly for the
+  EBR-delayed destructor, and the PageBacked cap test no longer enters an
+  incidental epoch guard. Verification: `cargo fmt --check`, `cargo test -p
+  tx-kernel --lib`, `cargo xtask progress validate`, `cargo xtask lint docs`,
+  and `git diff --check`. Next step: build real VFS/PageBacked file-device
+  behavior on these shells; blockers remain trap/process/runtime integration
+  and concrete backend implementations.
 - 2026-05-02 VM/PageBacked implementation lane now lives on
   `codex/vm-pagebacked-impl`. It brought in the corrected AddressSpace
   range-index core, mmap-style gap placement, v1 disjoint-only `mremap`, and
