@@ -642,6 +642,56 @@ fn vm_address_space_fixed_map_replaces_overlap_and_preserves_survivors() {
 }
 
 #[test]
+fn vm_recipe_snapshot_reader_survives_split_rewrite_publication() {
+    let aspace = AddressSpace::new();
+    let original = VmEntry::new(
+        range(0x1000, 4),
+        Prot::READ_WRITE,
+        VmEntryFlags::SHARED,
+        page_backing(0),
+    );
+    map_reserved(aspace.reserve_map(original.clone(), MapPlacement::RequireFree))
+        .commit()
+        .expect("initial map");
+
+    let before = aspace.recipes.snapshot_reader();
+
+    let replacement = VmEntry::new(
+        range(0x2000, 2),
+        Prot::READ,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(replacement.clone(), MapPlacement::FixedReplace))
+        .commit()
+        .expect("fixed replace");
+
+    assert_eq!(before.snapshot(), alloc::vec![original.clone()]);
+    assert_eq!(
+        before.lookup(UserVirtAddr(0x2000)).expect("old view").prot,
+        Prot::READ_WRITE
+    );
+    assert_eq!(
+        aspace.recipes_snapshot(),
+        alloc::vec![
+            VmEntry::new(
+                range(0x1000, 1),
+                Prot::READ_WRITE,
+                VmEntryFlags::SHARED,
+                page_backing_like(&original.backing, 0),
+            ),
+            replacement,
+            VmEntry::new(
+                range(0x4000, 1),
+                Prot::READ_WRITE,
+                VmEntryFlags::SHARED,
+                page_backing_like(&original.backing, (3 * USER_PAGE_SIZE) as u64),
+            ),
+        ]
+    );
+}
+
+#[test]
 fn vm_address_space_unmap_splits_recipe_and_updates_stats() {
     let aspace = AddressSpace::new();
     let original = VmEntry::new(

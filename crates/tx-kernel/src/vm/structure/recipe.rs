@@ -1,6 +1,7 @@
 //! Authoritative staged recipe range index.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,30 +12,32 @@ use super::{
     VmEntryError, VmEntryFlags, VmMapCommit, VmMapError, USER_PAGE_SIZE,
 };
 
+type RecipeTree = BTreeMap<UserVirtAddr, VmEntry>;
+
 /// Authoritative recipe range index.
 ///
 /// This wrapper is backed by `BTreeMap` keyed by mapping start address, so it
-/// is no longer the artificial fixed-capacity array from the first slice. It
-/// still deliberately stops short of VM_v1_2's persistent/epoch snapshot
-/// contract until the substrate exposes a fitting persistent range index.
+/// is no longer the artificial fixed-capacity array from the first slice.
+/// Readers clone an immutable tree snapshot; writers publish a whole replacement
+/// tree after validating and rewriting the old one. This gives observers a
+/// complete pre- or post-mutation recipe set while still stopping short of the
+/// final VM_v1_2 persistent/epoch range index.
 pub(in crate::vm) struct RecipeIndex {
-    entries: SpinMutex<BTreeMap<UserVirtAddr, VmEntry>>,
+    published: SpinMutex<Arc<RecipeTree>>,
 }
 
-impl RecipeIndex {
-    pub(in crate::vm) fn new() -> Self {
-        Self {
-            entries: SpinMutex::new(BTreeMap::new()),
-        }
-    }
+#[derive(Clone)]
+pub(in crate::vm) struct RecipeSnapshot {
+    entries: Arc<RecipeTree>,
+}
 
+impl RecipeSnapshot {
     pub(in crate::vm) fn lookup(&self, addr: UserVirtAddr) -> Option<VmEntry> {
-        lookup_in(&self.entries.lock(), addr)
+        lookup_in(&self.entries, addr)
     }
 
     pub(in crate::vm) fn stats(&self) -> AddressSpaceStats {
-        let entries = self.entries.lock();
-        stats_for(&entries)
+        stats_for(&self.entries)
     }
 
     pub(in crate::vm) fn find_free_range(
@@ -42,18 +45,54 @@ impl RecipeIndex {
         window: UserRange,
         page_count: usize,
     ) -> Option<UserRange> {
-        let entries = self.entries.lock();
-        find_gap_in(&entries, window, page_count)
+        find_gap_in(&self.entries, window, page_count)
     }
 
     pub(in crate::vm) fn overlapping(&self, range: UserRange) -> Vec<VmEntry> {
-        let entries = self.entries.lock();
-        overlapping_in(&entries, range)
+        overlapping_in(&self.entries, range)
     }
 
     pub(in crate::vm) fn snapshot(&self) -> Vec<VmEntry> {
-        let entries = self.entries.lock();
-        entries.values().cloned().collect()
+        self.entries.values().cloned().collect()
+    }
+}
+
+impl RecipeIndex {
+    pub(in crate::vm) fn new() -> Self {
+        Self {
+            published: SpinMutex::new(Arc::new(BTreeMap::new())),
+        }
+    }
+
+    pub(in crate::vm) fn snapshot_reader(&self) -> RecipeSnapshot {
+        let published = self.published.lock();
+        RecipeSnapshot {
+            entries: Arc::clone(&*published),
+        }
+    }
+
+    pub(in crate::vm) fn lookup(&self, addr: UserVirtAddr) -> Option<VmEntry> {
+        self.snapshot_reader().lookup(addr)
+    }
+
+    pub(in crate::vm) fn stats(&self) -> AddressSpaceStats {
+        self.snapshot_reader().stats()
+    }
+
+    pub(in crate::vm) fn find_free_range(
+        &self,
+        window: UserRange,
+        page_count: usize,
+    ) -> Option<UserRange> {
+        self.snapshot_reader().find_free_range(window, page_count)
+    }
+
+    pub(in crate::vm) fn overlapping(&self, range: UserRange) -> Vec<VmEntry> {
+        self.snapshot_reader().overlapping(range)
+    }
+
+    pub(in crate::vm) fn snapshot(&self) -> Vec<VmEntry> {
+        self.snapshot_reader().snapshot()
     }
 
     pub(in crate::vm) fn validate_map(
@@ -61,10 +100,10 @@ impl RecipeIndex {
         entry: &VmEntry,
         placement: MapPlacement,
     ) -> Result<(), VmMapError> {
-        let entries = self.entries.lock();
+        let snapshot = self.snapshot_reader();
         match placement {
-            MapPlacement::RequireFree => validate_insert_free(&entries, entry),
-            MapPlacement::FixedReplace => rewrite_fixed(&entries, entry).map(|_| ()),
+            MapPlacement::RequireFree => validate_insert_free(&snapshot.entries, entry),
+            MapPlacement::FixedReplace => rewrite_fixed(&snapshot.entries, entry).map(|_| ()),
         }
     }
 
@@ -73,26 +112,28 @@ impl RecipeIndex {
         entry: VmEntry,
         placement: MapPlacement,
     ) -> Result<VmMapCommit, VmMapError> {
-        let mut entries = self.entries.lock();
+        let mut published = self.published.lock();
         match placement {
             MapPlacement::RequireFree => {
-                validate_insert_free(&entries, &entry)?;
+                validate_insert_free(&published, &entry)?;
                 let changed_pages = entry.range.page_count();
-                push_entry(&mut entries, entry);
+                let mut rewritten = RecipeTree::clone(&published);
+                push_entry(&mut rewritten, entry);
+                *published = Arc::new(rewritten);
                 Ok(VmMapCommit { changed_pages })
             }
             MapPlacement::FixedReplace => {
-                let (rewritten, changed_pages) = rewrite_fixed(&entries, &entry)?;
-                *entries = rewritten;
+                let (rewritten, changed_pages) = rewrite_fixed(&published, &entry)?;
+                *published = Arc::new(rewritten);
                 Ok(VmMapCommit { changed_pages })
             }
         }
     }
 
     pub(in crate::vm) fn unmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
-        let mut entries = self.entries.lock();
-        let (rewritten, changed_pages) = rewrite_unmap(&entries, range)?;
-        *entries = rewritten;
+        let mut published = self.published.lock();
+        let (rewritten, changed_pages) = rewrite_unmap(&published, range)?;
+        *published = Arc::new(rewritten);
         Ok(VmMapCommit { changed_pages })
     }
 
@@ -101,9 +142,9 @@ impl RecipeIndex {
         range: UserRange,
         prot: Prot,
     ) -> Result<VmMapCommit, VmMapError> {
-        let mut entries = self.entries.lock();
-        let (rewritten, changed_pages) = rewrite_protect(&entries, range, prot)?;
-        *entries = rewritten;
+        let mut published = self.published.lock();
+        let (rewritten, changed_pages) = rewrite_protect(&published, range, prot)?;
+        *published = Arc::new(rewritten);
         Ok(VmMapCommit { changed_pages })
     }
 
@@ -112,9 +153,9 @@ impl RecipeIndex {
         old_range: UserRange,
         new_range: UserRange,
     ) -> Result<VmMapCommit, VmMapError> {
-        let mut entries = self.entries.lock();
-        let (rewritten, changed_pages) = rewrite_remap_disjoint(&entries, old_range, new_range)?;
-        *entries = rewritten;
+        let mut published = self.published.lock();
+        let (rewritten, changed_pages) = rewrite_remap_disjoint(&published, old_range, new_range)?;
+        *published = Arc::new(rewritten);
         Ok(VmMapCommit { changed_pages })
     }
 }
@@ -146,10 +187,7 @@ impl AddressSpaceStatsCell {
     }
 }
 
-fn validate_insert_free(
-    entries: &BTreeMap<UserVirtAddr, VmEntry>,
-    entry: &VmEntry,
-) -> Result<(), VmMapError> {
+fn validate_insert_free(entries: &RecipeTree, entry: &VmEntry) -> Result<(), VmMapError> {
     if entries
         .values()
         .any(|existing| existing.range.overlaps(entry.range))
@@ -161,10 +199,10 @@ fn validate_insert_free(
 }
 
 fn rewrite_fixed(
-    entries: &BTreeMap<UserVirtAddr, VmEntry>,
+    entries: &RecipeTree,
     replacement: &VmEntry,
-) -> Result<(BTreeMap<UserVirtAddr, VmEntry>, usize), VmMapError> {
-    let mut rewritten = BTreeMap::new();
+) -> Result<(RecipeTree, usize), VmMapError> {
+    let mut rewritten = RecipeTree::new();
     let mut replaced_pages = 0;
 
     for existing in entries.values().cloned() {
@@ -188,10 +226,10 @@ fn rewrite_fixed(
 }
 
 fn rewrite_unmap(
-    entries: &BTreeMap<UserVirtAddr, VmEntry>,
+    entries: &RecipeTree,
     range: UserRange,
-) -> Result<(BTreeMap<UserVirtAddr, VmEntry>, usize), VmMapError> {
-    let mut rewritten = BTreeMap::new();
+) -> Result<(RecipeTree, usize), VmMapError> {
+    let mut rewritten = RecipeTree::new();
     let mut changed_pages = 0;
 
     for existing in entries.values().cloned() {
@@ -214,15 +252,15 @@ fn rewrite_unmap(
 }
 
 fn rewrite_protect(
-    entries: &BTreeMap<UserVirtAddr, VmEntry>,
+    entries: &RecipeTree,
     range: UserRange,
     prot: Prot,
-) -> Result<(BTreeMap<UserVirtAddr, VmEntry>, usize), VmMapError> {
+) -> Result<(RecipeTree, usize), VmMapError> {
     if !range_is_fully_mapped(entries, range) {
         return Err(VmMapError::MissingMapping);
     }
 
-    let mut rewritten = BTreeMap::new();
+    let mut rewritten = RecipeTree::new();
     let mut changed_pages = 0;
 
     for existing in entries.values().cloned() {
@@ -250,10 +288,10 @@ fn rewrite_protect(
 }
 
 fn rewrite_remap_disjoint(
-    entries: &BTreeMap<UserVirtAddr, VmEntry>,
+    entries: &RecipeTree,
     old_range: UserRange,
     new_range: UserRange,
-) -> Result<(BTreeMap<UserVirtAddr, VmEntry>, usize), VmMapError> {
+) -> Result<(RecipeTree, usize), VmMapError> {
     if old_range.overlaps(new_range) || old_range.len() != new_range.len() {
         return Err(VmMapError::InvalidRange);
     }
@@ -270,7 +308,7 @@ fn rewrite_remap_disjoint(
         ),
     )?;
 
-    let mut rewritten = BTreeMap::new();
+    let mut rewritten = RecipeTree::new();
     let mut moved = Vec::new();
 
     for existing in entries.values().cloned() {
@@ -317,7 +355,7 @@ fn rewrite_remap_disjoint(
     Ok((rewritten, old_range.page_count() + new_range.page_count()))
 }
 
-fn range_is_fully_mapped(entries: &BTreeMap<UserVirtAddr, VmEntry>, range: UserRange) -> bool {
+fn range_is_fully_mapped(entries: &RecipeTree, range: UserRange) -> bool {
     let mut cursor = range.start().as_usize();
     let end = range.end().as_usize();
 
@@ -331,11 +369,11 @@ fn range_is_fully_mapped(entries: &BTreeMap<UserVirtAddr, VmEntry>, range: UserR
     true
 }
 
-fn push_entry(entries: &mut BTreeMap<UserVirtAddr, VmEntry>, entry: VmEntry) {
+fn push_entry(entries: &mut RecipeTree, entry: VmEntry) {
     entries.insert(entry.range.start(), entry);
 }
 
-fn lookup_in(entries: &BTreeMap<UserVirtAddr, VmEntry>, addr: UserVirtAddr) -> Option<VmEntry> {
+fn lookup_in(entries: &RecipeTree, addr: UserVirtAddr) -> Option<VmEntry> {
     entries
         .range(..=addr)
         .next_back()
@@ -343,7 +381,7 @@ fn lookup_in(entries: &BTreeMap<UserVirtAddr, VmEntry>, addr: UserVirtAddr) -> O
         .filter(|entry| entry.range.contains_addr(addr))
 }
 
-fn stats_for(entries: &BTreeMap<UserVirtAddr, VmEntry>) -> AddressSpaceStats {
+fn stats_for(entries: &RecipeTree) -> AddressSpaceStats {
     let mut stats = AddressSpaceStats::default();
     for entry in entries.values() {
         stats.recipe_count += 1;
@@ -352,11 +390,7 @@ fn stats_for(entries: &BTreeMap<UserVirtAddr, VmEntry>) -> AddressSpaceStats {
     stats
 }
 
-fn find_gap_in(
-    entries: &BTreeMap<UserVirtAddr, VmEntry>,
-    window: UserRange,
-    page_count: usize,
-) -> Option<UserRange> {
+fn find_gap_in(entries: &RecipeTree, window: UserRange, page_count: usize) -> Option<UserRange> {
     let len = page_count.checked_mul(USER_PAGE_SIZE)?;
     if len == 0 || len > window.len() {
         return None;
@@ -397,7 +431,7 @@ fn find_gap_in(
     }
 }
 
-fn overlapping_in(entries: &BTreeMap<UserVirtAddr, VmEntry>, range: UserRange) -> Vec<VmEntry> {
+fn overlapping_in(entries: &RecipeTree, range: UserRange) -> Vec<VmEntry> {
     entries
         .values()
         .filter(|entry| entry.range.overlaps(range))
