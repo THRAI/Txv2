@@ -10,5 +10,4 @@ tx-hal = { path = "../../crates/tx-hal" }
 
 [lib]
 path = "src/lib.rs"
-test = false
 doctest = false

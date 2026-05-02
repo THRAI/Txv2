@@ -108,6 +108,24 @@ impl EpochDomain {
         self.init_cpu(<P as PercpuIf>::current_cpu_id())
     }
 
+    fn init_for_test(&'static self) {
+        self.initialized.store(true, Ordering::Release);
+        self.global_epoch.store(INITIAL_EPOCH, Ordering::Release);
+        self.active_guards.store(0, Ordering::Release);
+        self.possible_cpus.store(1, Ordering::Release);
+
+        let _guard = self.lock.lock();
+        unsafe {
+            *self.hooks.get() = PlatformHooks::default();
+            (*self.state.get()).reset();
+        }
+
+        for cpu in 0..MAX_EPOCH_CPUS {
+            self.cpu_states[cpu].reset();
+        }
+        self.cpu_states[0].init();
+    }
+
     fn init_on_ap(&'static self, cpu: CpuId) -> Result<(), EpochError> {
         if !self.initialized.load(Ordering::Acquire) {
             return Err(EpochError::NotInitialized);
@@ -506,4 +524,9 @@ pub fn try_drain(budget: usize) -> DrainStats {
 #[doc(hidden)]
 pub unsafe fn reset_for_test() {
     GLOBAL_DOMAIN.reset_for_test();
+}
+
+#[doc(hidden)]
+pub fn init_for_test() {
+    GLOBAL_DOMAIN.init_for_test();
 }
