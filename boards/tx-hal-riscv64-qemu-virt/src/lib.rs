@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 mod boot_static;
 mod dtb;
 mod pmap;
+mod signal_frame;
 mod time;
 mod trap;
 mod user_access;
@@ -24,7 +25,7 @@ use tx_hal::{
     IrqIf, MemoryRegion, MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
     PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry,
-    SignalFrameIf, SmpIf, TimeIf,
+    SmpIf, TimeIf,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -399,7 +400,6 @@ impl PmapIf for Platform {
         remote_sfence_vma_asid(asid, invalidation);
     }
 }
-impl SignalFrameIf for Platform {}
 impl IrqIf for Platform {}
 impl TimeIf for Platform {
     fn read_ns() -> u64 {
@@ -1098,6 +1098,63 @@ mod tests {
         assert_eq!(frame.x[2], 0x2222);
         assert_eq!(frame.x[10], 7);
         assert_eq!(frame.x[4], 0x3333);
+    }
+
+    #[test]
+    fn trap_frame_signal_context_round_trips_user_registers() {
+        let mut frame = test_trap_frame(8, 0x1000, 0);
+        for (idx, reg) in frame.x.iter_mut().enumerate() {
+            *reg = 0x1000 + idx;
+        }
+        frame.x[0] = 0;
+        frame.x[2] = 0x8000;
+        frame.sstatus &= !(1 << 8);
+
+        let saved = frame.view_mut().capture_user_context();
+
+        frame.x[1] = 0xaaaa;
+        frame.x[2] = 0xbbbb;
+        frame.sepc = 0xcccc;
+        frame.sstatus |= 1 << 8;
+
+        frame.view_mut().restore_user_context(&saved);
+
+        assert_eq!(frame.x, saved.regs);
+        assert_eq!(frame.sepc, 0x1000);
+        assert_eq!(frame.x[2], 0x8000);
+        assert_eq!(frame.sstatus & (1 << 8), 0);
+        assert_ne!(frame.sstatus & (1 << 5), 0);
+    }
+
+    #[test]
+    fn trap_frame_signal_handler_regs_write_entry_arguments() {
+        let mut frame = test_trap_frame(8, 0x4000, 0);
+
+        {
+            let mut view = frame.view_mut();
+            view.set_signal_handler_regs(tx_hal::SignalHandlerRegs {
+                return_pc: VirtAddr(0x7000),
+                args: [9, 0x7100, 0x7200],
+            });
+            view.set_pc(VirtAddr(0x6000));
+            view.set_sp(VirtAddr(0x5ff0));
+        }
+
+        assert_eq!(frame.sepc, 0x6000);
+        assert_eq!(frame.x[1], 0x7000);
+        assert_eq!(frame.x[2], 0x5ff0);
+        assert_eq!(frame.x[10], 9);
+        assert_eq!(frame.x[11], 0x7100);
+        assert_eq!(frame.x[12], 0x7200);
+    }
+
+    #[test]
+    fn trap_frame_rewind_pc_steps_back_one_rv64_instruction() {
+        let mut frame = test_trap_frame(8, 0x4004, 0);
+
+        frame.view_mut().rewind_pc(4);
+
+        assert_eq!(frame.sepc, 0x4000);
     }
 
     #[test]
