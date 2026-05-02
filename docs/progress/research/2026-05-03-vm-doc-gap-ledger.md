@@ -98,9 +98,11 @@ ownership.
   production truncate, writeback, eviction, or CoW path consumes replacement or
   withdrawal yet.
 - `materialize_pagebacked_anon` remains as a compatibility wrapper. The new
-  `materialize_pagebacked` path still dispatches PageBacked materialization
-  through the Anon-only `PageContainer::materialize_anon` helper; File and
-  Device dispatch remain pending.
+  `materialize_pagebacked` path covers PrivateAnon and PageBacked recipes.
+  PageContainer now has a uniform `materialize_page` dispatcher for Anon, File,
+  and Device variants, but VM fault publication still consumes the older
+  synchronous compatibility shape until `fault_script` can carry wait-aware
+  `StepOutcome` values.
 - MAP_PRIVATE CoW currently proves pmap replacement and private-frame
   ownership, but source frame byte copying is still deferred until Tx exposes a
   VM-safe frame-copy primitive over the direct map.
@@ -123,10 +125,6 @@ ownership.
   and replaces read-only shared mappings for PrivateAnon and MAP_PRIVATE
   PageBacked faults, but it does not yet copy bytes from the source frame into
   the private frame.
-- File and device PageBacked materialization is missing. `PageContainerKind`
-  has File and Device variants, but File does not call `FsPageBacking::fetch_page`
-  and Device does not wrap stable device PPNs as described by
-  `txdoc:PAGE-BACKED-5-1-READ`.
 - PageBacked range operations are missing. `step_read`, `step_write`,
   `step_truncate`, `step_fsync`, dirty iteration, bounds handling, writeback,
   and withdrawal remain future PageBacked-owned work under
@@ -172,10 +170,9 @@ slices because the active docs already defer them or mark them as v1 debt:
 3. Generalize fault materialization: add `materialize_pagebacked`, implement
    `PrivateAnon` zero-frame reads and private writes, then add MAP_PRIVATE
    page-backed read-only shared installs and CoW replacement writes.
-4. Complete PageBacked v1 core before filesystem backends: add
-   `PageContainer::materialize_page`, File dispatch through mock
-   `FsPageBacking`, Device PPN wrapping, and minimal read/write/truncate/fsync
-   tests with mock backends.
+4. Complete PageBacked v1 core before filesystem backends: keep
+   `PageContainer::materialize_page` as the Anon/File/Device dispatch boundary,
+   then add minimal read/write/truncate/fsync tests with mock backends.
 5. Add VM-owned syscall-script surfaces over the synchronous compatibility
    helpers, returning wait-aware outcomes where the docs require retry/yield.
 6. Plan runtime integration last: fork after snapshot recipes and CoW demotion,

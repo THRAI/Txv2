@@ -15,6 +15,7 @@ pub enum Errno {
     EISDIR,
     ENAMETOOLONG,
     ENODEV,
+    ENOMEM,
     ENOENT,
     ENOSYS,
     ENOTDIR,

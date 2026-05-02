@@ -240,6 +240,18 @@ pub fn acquire_map_pin(
     Ok(MapPin::new(allocator, ppn))
 }
 
+/// Acquire page-cache role evidence for an already-live frame.
+///
+/// Filesystem page fetchers can return a populated frame by PPN; PageBacked
+/// uses this helper when it installs that frame into a `PageContainer` index.
+pub fn acquire_cache_pin(
+    ppn: Ppn,
+) -> Result<CachePin<'static, BitmapPageAllocator<'static>>, AllocError> {
+    let allocator = installed_bitmap_allocator()?;
+    allocator.acquire_cache_pin(ppn)?;
+    Ok(CachePin::new(allocator, ppn))
+}
+
 /// Reserve a contiguous frame run from the installed backend.
 pub fn reserve_run(
     count: usize,
