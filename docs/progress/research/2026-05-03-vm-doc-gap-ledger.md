@@ -21,15 +21,15 @@ contract and roughly 20-25% of the full behavior contract.
 
 Implemented or mostly staged: `AddressSpace`, snapshot-published range-indexed
 recipes, `RangeLock`, map/unmap/protect/disjoint-remap primitives, fault recipe
-checks, pmap publication and teardown, anonymous `PageContainer`
-materialization, VFS/Mount/PageBacked interface shells, and read-only VM
-projections.
+checks, generalized PrivateAnon/PageBacked fault materialization, pmap
+publication/replacement and teardown, anonymous `PageContainer` materialization,
+VFS/Mount/PageBacked interface shells, and read-only VM projections.
 
 Major gaps: final persistent/epoch recipe snapshots, async syscall/trap
-integration, real `fault_script` retry semantics, `PrivateAnon` zero-frame and
-MAP_PRIVATE CoW, file/device PageBacked materialization, PageBacked read/write/
-truncate/fsync/reclaim, fork/exec/brk/madvise/msync/mincore, and
-Process/ThreadRuntime ownership.
+integration, real `fault_script` retry semantics, full CoW byte-copy fidelity,
+file/device PageBacked materialization, PageBacked read/write/truncate/fsync/
+reclaim, fork/exec/brk/madvise/msync/mincore, and Process/ThreadRuntime
+ownership.
 
 ## Implemented
 
@@ -56,6 +56,12 @@ Process/ThreadRuntime ownership.
   anonymous PageBacked pages, revalidates publication, and publishes through
   the VM-owned pmap surface. This stages the consistency rule in
   `txdoc:VM-5-1-FAULT-HANDLER`, but it is not yet the async script.
+- `VmFaultOutcome::materialize_pagebacked` now covers PrivateAnon and
+  PageBacked recipes. PrivateAnon read faults materialize the permanent zero
+  frame read-only; PrivateAnon writes allocate fresh private frames. MAP_PRIVATE
+  PageBacked reads publish the shared source page read-only, and writes replace
+  that mapping with a private frame without inserting it into the
+  `PageContainer`.
 - `vm::checks` owns value-based observation helpers for fault recipe admission,
   fault-publication revalidation, map admission, and disjoint-remap shape
   checks. These helpers deliberately stop short of final guard-scoped
@@ -91,9 +97,13 @@ Process/ThreadRuntime ownership.
 - `PageCacheIndex::install_if_match` exists only under tests because no
   production truncate, writeback, eviction, or CoW path consumes replacement or
   withdrawal yet.
-- `materialize_pagebacked_anon` proves the PageBacked-to-VM fault handoff for
-  anonymous containers, but the general `materialize_pagebacked` dispatch path
-  for Anon/File/Device is still pending.
+- `materialize_pagebacked_anon` remains as a compatibility wrapper. The new
+  `materialize_pagebacked` path still dispatches PageBacked materialization
+  through the Anon-only `PageContainer::materialize_anon` helper; File and
+  Device dispatch remain pending.
+- MAP_PRIVATE CoW currently proves pmap replacement and private-frame
+  ownership, but source frame byte copying is still deferred until Tx exposes a
+  VM-safe frame-copy primitive over the direct map.
 - The VFS/Mount/PageBacked types are intentionally thin interface shells. They
   preserve names and boundaries, but they do not implement ext4/devfs/bdev-fs
   behavior or real file/device mmap backing.
@@ -109,14 +119,10 @@ Process/ThreadRuntime ownership.
   return wait-aware `StepOutcome` values as required by
   `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE` and
   `txdoc:VM-5-1-FAULT-HANDLER`.
-- `VmBacking::PrivateAnon` is not complete. Read faults do not install the
-  shared zero frame, and write faults do not allocate fresh private frames as
-  described by `txdoc:VM-4-1-SPECIAL-CASE-SHARED-ZERO-FRAME` and
-  `txdoc:VM-7-MAP-PRIVATE-COW-DETAILS`.
-- MAP_PRIVATE page-backed CoW is missing. Read faults must install read-only
-  shared PTEs, while write faults must allocate private frames without
-  inserting them into the source `PageContainer`, as required by
-  `txdoc:PAGE-BACKED-10-3-MAP-PRIVATE-AND-COW`.
+- Full CoW byte-copy fidelity is missing. The VM now allocates private frames
+  and replaces read-only shared mappings for PrivateAnon and MAP_PRIVATE
+  PageBacked faults, but it does not yet copy bytes from the source frame into
+  the private frame.
 - File and device PageBacked materialization is missing. `PageContainerKind`
   has File and Device variants, but File does not call `FsPageBacking::fetch_page`
   and Device does not wrap stable device PPNs as described by
@@ -165,7 +171,7 @@ slices because the active docs already defer them or mark them as v1 debt:
    public helper names.
 3. Generalize fault materialization: add `materialize_pagebacked`, implement
    `PrivateAnon` zero-frame reads and private writes, then add MAP_PRIVATE
-   page-backed read-only shared installs and CoW writes.
+   page-backed read-only shared installs and CoW replacement writes.
 4. Complete PageBacked v1 core before filesystem backends: add
    `PageContainer::materialize_page`, File dispatch through mock
    `FsPageBacking`, Device PPN wrapping, and minimal read/write/truncate/fsync

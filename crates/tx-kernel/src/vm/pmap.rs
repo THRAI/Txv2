@@ -160,12 +160,24 @@ impl VmPmap {
         prot: Prot,
         map_pin: MapPin<'static, BitmapPageAllocator<'static>>,
     ) -> Result<PmapPublishOutcome, VmPmapError> {
+        self.publish_page_with_replacement(page, ppn, prot, map_pin, false)
+    }
+
+    pub fn publish_page_with_replacement(
+        &self,
+        page: UserPage,
+        ppn: Ppn,
+        prot: Prot,
+        map_pin: MapPin<'static, BitmapPageAllocator<'static>>,
+        replace_existing: bool,
+    ) -> Result<PmapPublishOutcome, VmPmapError> {
         let virt = virt_for_page(page)?;
         let phys = phys_for_ppn(ppn)?;
         let permissions = permissions_for_prot(prot);
         let root = self.root();
         let mut state = self.state.lock();
 
+        let mut replaced = false;
         if let Some(existing) = state.mappings.get(&page) {
             if existing.ppn == ppn && existing.prot == prot {
                 return Ok(PmapPublishOutcome {
@@ -173,7 +185,32 @@ impl VmPmap {
                     replaced: false,
                 });
             }
-            return Err(VmPmapError::MappingMismatch);
+            if !replace_existing {
+                return Err(VmPmapError::MappingMismatch);
+            }
+            let existing = state.mappings.remove(&page).expect("existing mapping");
+            let result = match self.unmap_tracked_page(page, existing.ppn) {
+                Ok(result) => result,
+                Err(error) => {
+                    state.mappings.insert(page, existing);
+                    return Err(error);
+                }
+            };
+            let mut batch = AddressSpaceShootdownBatch::<
+                BitmapPageAllocator<'static>,
+                TEARDOWN_BATCH_PAGES,
+            >::new(self.asid());
+            match batch.push_page_unmap_result(result, existing.into_map_pin()) {
+                Ok(()) => {}
+                Err(error) => {
+                    let reason = error.reason();
+                    core::mem::forget(error.into_map_pin());
+                    return Err(VmPmapError::ShootdownAccounting(reason));
+                }
+            }
+            batch.issue_and_release_with(self.ops.shootdown_mappings);
+            state.shootdowns += 1;
+            replaced = true;
         }
 
         state.reservations += 1;
@@ -190,10 +227,7 @@ impl VmPmap {
             .mappings
             .insert(page, PmapMapping::new(ppn, prot, map_pin));
         state.commits += 1;
-        Ok(PmapPublishOutcome {
-            page,
-            replaced: false,
-        })
+        Ok(PmapPublishOutcome { page, replaced })
     }
 
     pub fn teardown_range(&self, range: UserRange) -> Result<usize, VmPmapError> {

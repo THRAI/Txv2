@@ -4,6 +4,28 @@
 
 ## Current Shape
 
+- 2026-05-03 VM generalized fault-materialization slice added the
+  `VmFaultOutcome::materialize_pagebacked` path and kept
+  `materialize_pagebacked_anon` as a compatibility wrapper. PrivateAnon read
+  faults now materialize the permanent zero frame read-only; PrivateAnon write
+  faults allocate fresh zeroed private frames and replace an existing zero-frame
+  PTE when present. MAP_PRIVATE PageBacked read faults install the shared source
+  page read-only, and write faults allocate a private frame and replace the
+  read-only mapping without inserting the private frame into the source
+  `PageContainer`. `VmPmap` now has replacement publication for these staged
+  CoW faults. Tests added zero-frame read, PrivateAnon write replacement, and
+  MAP_PRIVATE read/write CoW coverage. Verification: `cargo fmt --check`,
+  `cargo test -p tx-kernel vm -- --test-threads=1`, `cargo test -p tx-kernel
+  --lib`, `cargo clippy --workspace --all-targets --exclude
+  tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock
+  --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings`, and `cargo xtask
+  lint unused`, `cargo xtask progress validate`, `cargo xtask lint docs`, and
+  `git diff --check`.
+  Next step: PageBacked v1 core `PageContainer::materialize_page` with mock
+  File/Device dispatch. Blockers remain byte-copying source frame contents for
+  full CoW fidelity, async fault-script retry/yield behavior,
+  Process/ThreadRuntime/trap authority wiring, and concrete VFS/backend
+  implementations.
 - 2026-05-03 VM recipe snapshot slice replaced the recipe index's mutable
   in-place map publication with owned whole-tree `RecipeSnapshot` clones.
   Public helpers such as `lookup`, `recipes_overlapping`, `recipes_snapshot`,

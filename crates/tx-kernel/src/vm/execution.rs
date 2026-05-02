@@ -38,14 +38,15 @@ impl AddressSpace {
             AcquireResult::WouldBlock(_) => return Err(VmFaultError::WouldBlock),
         };
 
-        let entry = require_fault_publication(self, &outcome, materialization.page_index)?;
+        let _entry = require_fault_publication(self, &outcome, &materialization)?;
 
         self.pmap
-            .publish_page(
+            .publish_page_with_replacement(
                 outcome.page_range.start().containing_page(),
                 materialization.page.ppn,
-                entry.prot,
+                materialization.publish_prot,
                 materialization.page.map_pin,
+                materialization.replace_existing,
             )
             .map_err(VmFaultError::Pmap)
     }
