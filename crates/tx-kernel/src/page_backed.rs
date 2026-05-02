@@ -158,6 +158,7 @@ impl PageCacheIndex {
         Ok(())
     }
 
+    #[cfg(test)]
     fn install_if_match(
         &mut self,
         page: PageIndex,
