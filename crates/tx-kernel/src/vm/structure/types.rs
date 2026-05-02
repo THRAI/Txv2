@@ -516,11 +516,11 @@ impl VmFaultOutcome {
         let private_mapping = !self.entry.flags.shared;
         let write_fault = self.access == AccessMode::Write;
         let (page, publish_prot, replace_existing) = if private_mapping && write_fault {
-            let _source = pc
+            let source = pc
                 .materialize_anon(page_index, MaterializeAccess::Read)
                 .map_err(VmFaultError::PageCache)?;
             (
-                allocate_private_materialized_page(true)?,
+                allocate_private_materialized_page_from_source(source.ppn, true)?,
                 self.entry.prot,
                 true,
             )
@@ -662,6 +662,25 @@ fn allocate_private_materialized_page(dirty: bool) -> Result<MaterializedPage, V
     let frame = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
         .map_err(page_alloc_error)?
         .commit();
+    let ppn = frame.ppn();
+    let map_pin = frame.try_map_pin().map_err(page_alloc_error)?;
+    drop(frame);
+    Ok(MaterializedPage {
+        ppn,
+        map_pin: MaterializedPagePin::Allocated(map_pin),
+        newly_installed: true,
+        dirty,
+    })
+}
+
+fn allocate_private_materialized_page_from_source(
+    source: tx_hal::Ppn,
+    dirty: bool,
+) -> Result<MaterializedPage, VmFaultError> {
+    let reservation =
+        page_allocator::reserve_frame(ZeroPolicy::UninitFullOverwrite).map_err(page_alloc_error)?;
+    page_allocator::copy_frame_contents(source, reservation.ppn()).map_err(page_alloc_error)?;
+    let frame = reservation.commit();
     let ppn = frame.ppn();
     let map_pin = frame.try_map_pin().map_err(page_alloc_error)?;
     drop(frame);
