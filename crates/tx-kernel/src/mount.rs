@@ -305,11 +305,11 @@ mod tests {
     struct MockFs;
 
     impl FsOps for MockFs {
-        fn lookup<'g>(
+        fn lookup(
             &self,
             _parent: FsObjectId,
             name: &[u8],
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<FsObjectId> {
             if name == b"root" {
                 StepOutcome::Done(FsObjectId::ROOT)
@@ -318,145 +318,141 @@ mod tests {
             }
         }
 
-        fn load_inode_meta<'g>(
+        fn load_inode_meta(
             &self,
             _fs_object_id: FsObjectId,
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<InodeMeta> {
             StepOutcome::Done(InodeMeta::new(InodeKind::Directory, 0o040755))
         }
 
-        fn serialize_inode_meta<'g>(
+        fn serialize_inode_meta(
             &self,
             _fs_object_id: FsObjectId,
             _meta: &InodeMeta,
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<()> {
             StepOutcome::Done(())
         }
 
-        fn create_inode<'g>(
+        fn create_inode(
             &self,
             _parent: FsObjectId,
             _name: &[u8],
             _mode: u16,
             _cred: &Credential,
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<(FsObjectId, InodeMeta)> {
             StepOutcome::Err(Errno::EROFS)
         }
 
-        fn unlink<'g>(
+        fn unlink(
             &self,
             _parent: FsObjectId,
             _name: &[u8],
             _target: FsObjectId,
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<()> {
             StepOutcome::Err(Errno::EROFS)
         }
 
-        fn rename<'g>(
+        fn rename(
             &self,
             _old_parent: FsObjectId,
             _old_name: &[u8],
             _new_parent: FsObjectId,
             _new_name: &[u8],
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<()> {
             StepOutcome::Err(Errno::EROFS)
         }
 
-        fn link<'g>(
+        fn link(
             &self,
             _parent: FsObjectId,
             _name: &[u8],
             _target: FsObjectId,
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<()> {
             StepOutcome::Err(Errno::EROFS)
         }
 
-        fn mkdir<'g>(
+        fn mkdir(
             &self,
             _parent: FsObjectId,
             _name: &[u8],
             _mode: u16,
             _cred: &Credential,
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<(FsObjectId, InodeMeta)> {
             StepOutcome::Err(Errno::EROFS)
         }
 
-        fn rmdir<'g>(
+        fn rmdir(
             &self,
             _parent: FsObjectId,
             _name: &[u8],
             _target: FsObjectId,
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<()> {
             StepOutcome::Err(Errno::EROFS)
         }
 
-        fn symlink<'g>(
+        fn symlink(
             &self,
             _parent: FsObjectId,
             _name: &[u8],
             _link_target: &[u8],
             _cred: &Credential,
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<(FsObjectId, InodeMeta)> {
             StepOutcome::Err(Errno::EROFS)
         }
 
-        fn readdir<'g>(
+        fn readdir(
             &self,
             _fs_object_id: FsObjectId,
             _cursor: DirCursor,
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
             StepOutcome::Done(None)
         }
 
-        fn destroy_inode<'g>(
-            &self,
-            _fs_object_id: FsObjectId,
-            _guard: &'g Guard<'_>,
-        ) -> StepOutcome<()> {
+        fn destroy_inode(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
             StepOutcome::Done(())
         }
     }
 
     impl FsPageBacking for MockFs {
-        fn fetch_page<'g>(
+        fn fetch_page(
             &self,
             _fs_object_id: FsObjectId,
             _offset: u64,
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<Frame> {
             StepOutcome::Err(Errno::ENOSYS)
         }
 
-        fn flush_page<'g>(
+        fn flush_page(
             &self,
             _fs_object_id: FsObjectId,
             _offset: u64,
             _frame: &Frame,
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<()> {
             StepOutcome::Err(Errno::EROFS)
         }
 
-        fn truncate<'g>(
+        fn truncate(
             &self,
             _fs_object_id: FsObjectId,
             _new_size: u64,
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<()> {
             StepOutcome::Err(Errno::EROFS)
         }
 
-        fn fsync<'g>(&self, _fs_object_id: FsObjectId, _guard: &'g Guard<'_>) -> StepOutcome<()> {
+        fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
             StepOutcome::Done(())
         }
     }

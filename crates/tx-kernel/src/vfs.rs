@@ -1,5 +1,6 @@
 //! VFS live-node shells and filesystem namespace backend trait.
 
+use alloc::boxed::Box;
 use core::fmt;
 
 use crate::device::CharDeviceBinding;
@@ -112,8 +113,7 @@ pub struct InlineName {
 
 impl InlineName {
     pub fn new(bytes: &[u8]) -> Result<Self, Errno> {
-        if bytes.is_empty() || bytes.len() > VFS_NAME_MAX || bytes.iter().any(|byte| *byte == b'/')
-        {
+        if bytes.is_empty() || bytes.len() > VFS_NAME_MAX || bytes.contains(&b'/') {
             return Err(Errno::ENAMETOOLONG);
         }
 
@@ -179,94 +179,90 @@ impl DirEntry {
 }
 
 pub trait FsOps: Send + Sync + 'static {
-    fn lookup<'g>(
-        &self,
-        parent: FsObjectId,
-        name: &[u8],
-        guard: &'g Guard<'_>,
-    ) -> StepOutcome<FsObjectId>;
+    fn lookup(&self, parent: FsObjectId, name: &[u8], guard: &Guard<'_>)
+        -> StepOutcome<FsObjectId>;
 
-    fn load_inode_meta<'g>(
+    fn load_inode_meta(
         &self,
         fs_object_id: FsObjectId,
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<InodeMeta>;
 
-    fn serialize_inode_meta<'g>(
+    fn serialize_inode_meta(
         &self,
         fs_object_id: FsObjectId,
         meta: &InodeMeta,
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<()>;
 
-    fn create_inode<'g>(
+    fn create_inode(
         &self,
         parent: FsObjectId,
         name: &[u8],
         mode: u16,
         cred: &Credential,
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta)>;
 
-    fn unlink<'g>(
+    fn unlink(
         &self,
         parent: FsObjectId,
         name: &[u8],
         target: FsObjectId,
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<()>;
 
-    fn rename<'g>(
+    fn rename(
         &self,
         old_parent: FsObjectId,
         old_name: &[u8],
         new_parent: FsObjectId,
         new_name: &[u8],
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<()>;
 
-    fn link<'g>(
+    fn link(
         &self,
         parent: FsObjectId,
         name: &[u8],
         target: FsObjectId,
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<()>;
 
-    fn mkdir<'g>(
+    fn mkdir(
         &self,
         parent: FsObjectId,
         name: &[u8],
         mode: u16,
         cred: &Credential,
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta)>;
 
-    fn rmdir<'g>(
+    fn rmdir(
         &self,
         parent: FsObjectId,
         name: &[u8],
         target: FsObjectId,
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<()>;
 
-    fn symlink<'g>(
+    fn symlink(
         &self,
         parent: FsObjectId,
         name: &[u8],
         link_target: &[u8],
         cred: &Credential,
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta)>;
 
-    fn readdir<'g>(
+    fn readdir(
         &self,
         fs_object_id: FsObjectId,
         cursor: DirCursor,
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<Option<(DirEntry, DirCursor)>>;
 
-    fn destroy_inode<'g>(&self, fs_object_id: FsObjectId, guard: &'g Guard<'_>) -> StepOutcome<()>;
+    fn destroy_inode(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<()>;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -280,7 +276,7 @@ pub struct OpenFileFlags {
 pub enum RNodeBacking {
     PageBacked { pc: Cap<PageContainer> },
     Directory,
-    Symlink { target: InlineName },
+    Symlink { target: Box<InlineName> },
     StructBackedChar { binding: &'static CharDeviceBinding },
     Projected,
 }

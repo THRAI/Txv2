@@ -4,6 +4,21 @@
 
 ## Current Shape
 
+- 2026-05-03 PR #14 CI check fix cleared the GitHub `check` failures after
+  inspecting Actions logs. The patch removes clippy warnings from the
+  VM/PageBacked/VFS interface lane by eliding needless guard lifetimes,
+  shrinking `RNodeBacking::Symlink` through boxed inline names, factoring VM
+  pmap operation function-pointer types, collapsing a RangeLock predicate, and
+  cloning recipe overlap rows only after filtering. It also removes the
+  forbidden pmap dead-code allowance by dropping the unused staged rollback
+  op slot, and splits VM execution-script tests into
+  `vm/tests/execution_scripts.rs` so `vm/tests.rs` stays below the 1,500-line
+  arch-lint cap. Verification: `cargo clippy --workspace --all-targets
+  --exclude tx-kernel-riscv64-qemu-virt --exclude
+  tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt --
+  -D warnings`, `cargo xtask lint arch`, and `cargo xtask ci` with 11 passed,
+  0 skipped, 0 failed. Next step: push and let PR #14's GitHub check rerun; no
+  blocker.
 - 2026-05-03 PR #14 unused-lint fix kept the PageBacked production surface
   thin by gating the private `PageCacheIndex::install_if_match` replacement /
   withdrawal helper to tests. The helper was only exercised by unit tests, so a

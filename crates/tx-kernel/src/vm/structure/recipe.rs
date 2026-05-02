@@ -400,8 +400,8 @@ fn find_gap_in(
 fn overlapping_in(entries: &BTreeMap<UserVirtAddr, VmEntry>, range: UserRange) -> Vec<VmEntry> {
     entries
         .values()
-        .cloned()
         .filter(|entry| entry.range.overlaps(range))
+        .cloned()
         .collect()
 }
 

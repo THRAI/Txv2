@@ -40,8 +40,8 @@ impl PhysicalBlockNumber {
 }
 
 pub trait CharDeviceOps: Send + Sync + 'static {
-    fn read<'g>(&self, out: &mut [u8], guard: &'g Guard<'_>) -> StepOutcome<usize>;
-    fn write<'g>(&self, bytes: &[u8], guard: &'g Guard<'_>) -> StepOutcome<usize>;
+    fn read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize>;
+    fn write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize>;
 }
 
 #[derive(Clone, Copy)]
@@ -61,21 +61,21 @@ impl fmt::Debug for CharDeviceBinding {
 }
 
 pub trait BlockDeviceOps: Send + Sync + 'static {
-    fn read_blocks<'g>(
+    fn read_blocks(
         &self,
         block_id: PhysicalBlockNumber,
         target: &mut [Frame],
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<()>;
 
-    fn write_blocks<'g>(
+    fn write_blocks(
         &self,
         block_id: PhysicalBlockNumber,
         source: &[Frame],
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<()>;
 
-    fn barrier<'g>(&self, guard: &'g Guard<'_>) -> StepOutcome<()>;
+    fn barrier(&self, guard: &Guard<'_>) -> StepOutcome<()>;
 }
 
 pub trait BlockDevice: BlockDeviceOps {
@@ -141,11 +141,11 @@ impl BlockDeviceHandle {
         self.len_lba
     }
 
-    pub fn read_blocks<'g>(
+    pub fn read_blocks(
         self,
         lba_offset: u64,
         target: &mut [Frame],
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<()> {
         let Some(block_id) = self.block_id_for(lba_offset, target.len() as u64) else {
             return StepOutcome::Err(Errno::EINVAL);
@@ -153,11 +153,11 @@ impl BlockDeviceHandle {
         self.reg.ops.read_blocks(block_id, target, guard)
     }
 
-    pub fn write_blocks<'g>(
+    pub fn write_blocks(
         self,
         lba_offset: u64,
         source: &[Frame],
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<()> {
         let Some(block_id) = self.block_id_for(lba_offset, source.len() as u64) else {
             return StepOutcome::Err(Errno::EINVAL);
@@ -165,7 +165,7 @@ impl BlockDeviceHandle {
         self.reg.ops.write_blocks(block_id, source, guard)
     }
 
-    pub fn barrier<'g>(self, guard: &'g Guard<'_>) -> StepOutcome<()> {
+    pub fn barrier(self, guard: &Guard<'_>) -> StepOutcome<()> {
         self.reg.ops.barrier(guard)
     }
 
@@ -198,26 +198,26 @@ mod tests {
     struct RecordingBlockDevice;
 
     impl BlockDeviceOps for RecordingBlockDevice {
-        fn read_blocks<'g>(
+        fn read_blocks(
             &self,
             block_id: PhysicalBlockNumber,
             target: &mut [Frame],
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<()> {
             target[0] = Frame::new(Ppn(block_id.as_u64() as usize));
             StepOutcome::Done(())
         }
 
-        fn write_blocks<'g>(
+        fn write_blocks(
             &self,
             _block_id: PhysicalBlockNumber,
             _source: &[Frame],
-            _guard: &'g Guard<'_>,
+            _guard: &Guard<'_>,
         ) -> StepOutcome<()> {
             StepOutcome::Done(())
         }
 
-        fn barrier<'g>(&self, _guard: &'g Guard<'_>) -> StepOutcome<()> {
+        fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<()> {
             StepOutcome::Done(())
         }
     }
