@@ -713,8 +713,9 @@ pub trait PmapIf {
 pub mod pmap;
 pub mod trap;
 pub use trap::{
-    FaultInfo, KernelTrapSink, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable,
-    TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, TrapSnapshot,
+    FaultInfo, KernelTrapSink, SignalHandlerRegs, TrapAction, TrapClass, TrapFrameMut,
+    TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, TrapSnapshot,
+    UserTrapContext,
 };
 
 // ---------------------------------------------------------------------------
@@ -742,6 +743,8 @@ unsafe impl Pod for i64 {}
 unsafe impl Pod for i128 {}
 unsafe impl Pod for usize {}
 unsafe impl Pod for isize {}
+unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
+unsafe impl Pod for UserTrapContext {}
 
 // ---------------------------------------------------------------------------
 // KernelPtr<T> and UserPtr<T> — typed address-space wrappers
@@ -811,6 +814,20 @@ impl<T> Clone for UserPtr<T> {
         *self
     }
 }
+
+impl<T> core::fmt::Debug for UserPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("UserPtr").field(&(self.0 as usize)).finish()
+    }
+}
+
+impl<T> PartialEq for UserPtr<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<T> Eq for UserPtr<T> {}
 
 unsafe impl<T: Send> Send for UserPtr<T> {}
 unsafe impl<T: Sync> Sync for UserPtr<T> {}
@@ -937,7 +954,103 @@ pub trait UserAccessIf {
         }
     }
 }
-pub trait SignalFrameIf {}
+
+// ---------------------------------------------------------------------------
+// SignalFrameIf
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserSigInfoAbi {
+    pub bytes: [u8; 128],
+}
+
+impl UserSigInfoAbi {
+    pub const ZERO: Self = Self { bytes: [0; 128] };
+}
+
+unsafe impl Pod for UserSigInfoAbi {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserSignalMaskAbi {
+    pub bits: u64,
+}
+
+impl UserSignalMaskAbi {
+    pub const EMPTY: Self = Self { bits: 0 };
+}
+
+unsafe impl Pod for UserSignalMaskAbi {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserSaFlagsAbi {
+    pub bits: u64,
+}
+
+impl UserSaFlagsAbi {
+    pub const EMPTY: Self = Self { bits: 0 };
+}
+
+unsafe impl Pod for UserSaFlagsAbi {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalFrameWrite {
+    pub stack_top: UserPtr<u8>,
+    pub sig_no: u32,
+    pub siginfo: UserSigInfoAbi,
+    pub old_mask: UserSignalMaskAbi,
+    pub flags: UserSaFlagsAbi,
+    pub handler_pc: UserPtr<()>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalFramePlacement {
+    pub frame_addr: UserPtr<()>,
+    pub trampoline_pc: UserPtr<()>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SavedSignalFrame {
+    pub saved_mask: UserSignalMaskAbi,
+    pub user_context: UserTrapContext,
+}
+
+unsafe impl Pod for SavedSignalFrame {}
+
+pub trait SignalFrameIf: TrapIf + UserAccessIf {
+    fn write_signal_frame(
+        tf: TrapFrameMut<'_>,
+        setup: SignalFrameWrite,
+    ) -> Result<SignalFramePlacement, FaultInfo> {
+        let _ = tf;
+        Err(FaultInfo {
+            address: VirtAddr(setup.stack_top.addr()),
+            write: true,
+            instruction: false,
+            from_user: false,
+        })
+    }
+
+    fn read_signal_frame(user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
+        Err(FaultInfo {
+            address: VirtAddr(user_sp.addr()),
+            write: false,
+            instruction: false,
+            from_user: false,
+        })
+    }
+
+    fn restore_signal_frame(_tf: TrapFrameMut<'_>, _frame: &SavedSignalFrame) {}
+
+    fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {
+        tf.rewind_pc(4);
+    }
+}
 pub trait IrqIf {
     fn in_irq_context() -> bool {
         false

@@ -2,8 +2,9 @@ use core::ptr::NonNull;
 
 use crate::{boot_static, user_access, Platform};
 use tx_hal::{
-    FaultInfo, KernelTrapSink, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable,
-    TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, VirtAddr,
+    FaultInfo, KernelTrapSink, SignalHandlerRegs, TrapAction, TrapClass, TrapFrameMut,
+    TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode,
+    UserTrapContext, VirtAddr,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -140,6 +141,7 @@ tx_rv64_qemu_minimal_trap_vector:
 const RV64_SSTATUS_SPP: usize = 1 << 8;
 const RV64_SSTATUS_SPIE: usize = 1 << 5;
 const X_SP: usize = 2;
+const X_RA: usize = 1;
 const X_TP: usize = 4;
 const X_A0: usize = 10;
 const X_A1: usize = 11;
@@ -234,6 +236,33 @@ impl Rv64TrapFrame {
         self.x[X_TP] = value as usize;
     }
 
+    fn capture_user_context(&self) -> UserTrapContext {
+        UserTrapContext {
+            regs: self.x,
+            pc: self.sepc,
+            status: self.sstatus,
+        }
+    }
+
+    fn restore_user_context(&mut self, context: &UserTrapContext) {
+        self.x = context.regs;
+        self.x[0] = 0;
+        self.sepc = context.pc;
+        self.sstatus = context.status;
+        self.prepare_user_return();
+    }
+
+    fn set_signal_handler_regs(&mut self, regs: SignalHandlerRegs) {
+        self.x[X_RA] = regs.return_pc.0;
+        self.x[X_A0] = regs.args[0];
+        self.x[X_A1] = regs.args[1];
+        self.x[X_A2] = regs.args[2];
+    }
+
+    fn rewind_pc(&mut self, bytes: usize) {
+        self.sepc = self.sepc.saturating_sub(bytes);
+    }
+
     pub fn prepare_user_return(&mut self) {
         self.sstatus &= !RV64_SSTATUS_SPP;
         self.sstatus |= RV64_SSTATUS_SPIE;
@@ -246,6 +275,10 @@ static RV64_TRAP_FRAME_MUT_VTABLE: TrapFrameMutVtable = TrapFrameMutVtable {
     set_syscall_return: rv64_set_syscall_return,
     set_syscall_error: rv64_set_syscall_error,
     set_user_tls_register: rv64_set_user_tls_register,
+    capture_user_context: rv64_capture_user_context,
+    restore_user_context: rv64_restore_user_context,
+    set_signal_handler_regs: rv64_set_signal_handler_regs,
+    rewind_pc: rv64_rewind_pc,
 };
 
 fn rv64_frame_ptr(raw: NonNull<()>) -> *mut Rv64TrapFrame {
@@ -270,6 +303,22 @@ fn rv64_set_syscall_error(raw: NonNull<()>, errno: i32) {
 
 fn rv64_set_user_tls_register(raw: NonNull<()>, value: u64) {
     unsafe { (*rv64_frame_ptr(raw)).set_user_tls_register(value) };
+}
+
+fn rv64_capture_user_context(raw: NonNull<()>) -> UserTrapContext {
+    unsafe { (*rv64_frame_ptr(raw)).capture_user_context() }
+}
+
+fn rv64_restore_user_context(raw: NonNull<()>, context: &UserTrapContext) {
+    unsafe { (*rv64_frame_ptr(raw)).restore_user_context(context) };
+}
+
+fn rv64_set_signal_handler_regs(raw: NonNull<()>, regs: SignalHandlerRegs) {
+    unsafe { (*rv64_frame_ptr(raw)).set_signal_handler_regs(regs) };
+}
+
+fn rv64_rewind_pc(raw: NonNull<()>, bytes: usize) {
+    unsafe { (*rv64_frame_ptr(raw)).rewind_pc(bytes) };
 }
 
 impl TrapIf for Platform {
