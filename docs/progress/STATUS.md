@@ -5,16 +5,19 @@
 ## Current Shape
 
 - 2026-05-03 VM recipe snapshot slice replaced the recipe index's mutable
-  in-place map publication with whole-tree `Arc<BTreeMap<...>>` snapshots.
+  in-place map publication with owned whole-tree `RecipeSnapshot` clones.
   Public helpers such as `lookup`, `recipes_overlapping`, `recipes_snapshot`,
   map/unmap/protect, fixed replace, and disjoint remap keep their existing
-  behavior, while readers can now hold an immutable pre-mutation recipe view
+  behavior, while readers can now hold an owned pre-mutation recipe view
   across split/rewrite publication. Tests added
   `vm_recipe_snapshot_reader_survives_split_rewrite_publication`. Verification:
   red check for the new test, then `cargo fmt --check`, `cargo test -p
   tx-kernel vm -- --test-threads=1`, `cargo test -p tx-kernel --lib`,
-  `cargo xtask lint unused`, `cargo xtask progress validate`, `cargo xtask
-  lint docs`, and `git diff --check`. Next step: generalize fault
+  `cargo clippy --workspace --all-targets --exclude
+  tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock
+  --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings`, `cargo xtask
+  lint unused`, `cargo xtask progress validate`, `cargo xtask lint docs`, and
+  `git diff --check`. Next step: generalize fault
   materialization for PrivateAnon zero-frame reads, private writes, and
   MAP_PRIVATE CoW. Blockers remain final epoch/guard-shaped recipe witnesses,
   Process/ThreadRuntime/trap authority wiring, and concrete VFS/backend

@@ -39,10 +39,10 @@ Process/ThreadRuntime ownership.
 - VM recipes are authoritative range bindings over `VmEntry` values, and pmap
   PTEs are treated as derived materializations, matching
   `txdoc:VM-1-AUTHORITATIVE-BINDINGS-AND-MATERIALIZATIONS-IN-VM`.
-- `RecipeIndex` now publishes whole immutable `Arc<BTreeMap<...>>` recipe
-  trees. Readers clone a `RecipeSnapshot`, and writers replace the tree only
-  after building a complete rewrite, so observers see a complete pre- or
-  post-mutation recipe set during split rewrites.
+- `RecipeIndex` now publishes owned `BTreeMap<...>` recipe snapshots. Readers
+  clone a `RecipeSnapshot`, and writers replace the tree only after building a
+  complete rewrite, so observers see a complete pre- or post-mutation recipe
+  set during split rewrites.
 - `RangeLock` exists as a VM-local coordination primitive with materializer and
   exclusive-writer modes, declared-range behavior, RAII guards, and overlap
   exclusion tests for the v1 range-mutation cases described by
@@ -74,9 +74,10 @@ Process/ThreadRuntime ownership.
 
 ## Staged
 
-- The recipe index is snapshot-published, but it is still an `Arc<BTreeMap<...>>`
-  staging structure under a small publication mutex. It is not yet the final
-  persistent/epoch range index with guard-scoped lifetime evidence.
+- The recipe index is snapshot-published, but it is still a cloned
+  `BTreeMap<...>` staging structure under a small publication mutex. It is not
+  yet the final persistent/epoch range index with guard-scoped lifetime
+  evidence.
 - `RangeLock` is a bounded v1 reservation set. It proves the declared-range
   discipline and writer/materializer exclusion, but it is not an optimized
   concurrent interval index.
@@ -100,7 +101,7 @@ Process/ThreadRuntime ownership.
 ## Blocked Or Not Implemented
 
 - Final persistent/epoch recipe snapshots are missing. The current
-  `Arc<BTreeMap<...>>` snapshot publication closes the partial-rewrite
+  owned `BTreeMap<...>` snapshot publication closes the partial-rewrite
   visibility gap for readers, but it does not yet provide the final epoch range
   index or guard-scoped witness shape.
 - Async `fault_script` retry/yield behavior is missing. Current fault handling
