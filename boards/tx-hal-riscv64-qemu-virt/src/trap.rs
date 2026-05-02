@@ -1,6 +1,6 @@
 use core::ptr::NonNull;
 
-use crate::{boot_static, Platform};
+use crate::{boot_static, user_access, Platform};
 use tx_hal::{
     FaultInfo, KernelTrapSink, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable,
     TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, VirtAddr,
@@ -295,6 +295,14 @@ where
 
     match class {
         TrapClass::PageFault { write, instruction } => {
+            if !from_user {
+                if let Some(recovery_pc) = user_access::fixup_lookup(frame.sepc) {
+                    frame.sepc = recovery_pc;
+                    frame.x[X_A0] = frame.stval;
+                    return TrapAction::Resume;
+                }
+            }
+
             let fault = FaultInfo {
                 address: VirtAddr(frame.stval),
                 write,

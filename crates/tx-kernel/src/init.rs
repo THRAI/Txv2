@@ -357,7 +357,6 @@ impl<P: TxPlatform> CoreInit<P> {
 
         P::enable_timer_wakeups();
         for _ in 0..AP_REACTOR_WAIT_SPINS {
-            P::wait_for_interrupt_once();
             let step = Self::step_boot_reactor_once(current_cpu)
                 .expect("boot reactor timer idle step failed");
             if Self::bsp_timer_smoke_done(cpu_bit) {
@@ -366,6 +365,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 tx_hal::console_write_str::<P>(":reactor:timer-idle:ok\n");
                 return;
             }
+            P::wait_for_interrupt_once();
         }
 
         panic!("BSP reactor timer idle smoke did not complete");
