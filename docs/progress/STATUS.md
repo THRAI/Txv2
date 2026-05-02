@@ -12,8 +12,9 @@
   tx-kernel vm -- --test-threads=1`, `cargo test -p tx-kernel --lib`,
   `cargo test -p tx-substrate epoch`, `cargo xtask progress validate`, `cargo
   xtask lint docs`, `git diff --check`, and an anchored conflict-marker scan.
-  Next step: push the merge commit so the draft PR leaves GitHub's `DIRTY`
-  merge state.
+  The merge resolution was pushed; GitHub now reports PR #14 as `UNSTABLE`
+  while the `check` workflow runs, instead of the prior `DIRTY` conflict state.
+  Next step: wait for CI to finish and address any check failure if it appears.
 - 2026-05-02 VM checks/projections completion slice has landed on top of the
   subsystem-anatomy reorg. `vm::checks` now exposes staged observation helpers
   for fault recipe admission, fault-publication revalidation, map admission,
