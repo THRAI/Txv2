@@ -4,6 +4,15 @@
 
 ## Current Shape
 
+- 2026-05-03 local CI catch-up for PR #15 split VM fault
+  materialization tests out of `crates/tx-kernel/src/vm/tests.rs` into
+  `crates/tx-kernel/src/vm/tests/fault_materialization.rs` after GitHub
+  Actions reported `cargo xtask lint arch` failing on the 1500-line authored
+  Rust guardrail. The parent VM test harness is now 1340 lines and the new
+  focused fault-materialization test module is 267 lines. Verification so far:
+  `cargo fmt --check`, `cargo xtask lint arch`, and `cargo test -p tx-kernel
+  vm -- --test-threads=1`, plus `cargo xtask ci` with 11 passed, 0 skipped, 0
+  failed. This fix is intentionally local-only until the next requested push.
 - 2026-05-03 VM generalized fault-materialization slice added the
   `VmFaultOutcome::materialize_pagebacked` path and kept
   `materialize_pagebacked_anon` as a compatibility wrapper. PrivateAnon read
