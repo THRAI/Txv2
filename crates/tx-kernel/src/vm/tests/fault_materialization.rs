@@ -245,6 +245,69 @@ fn vm_fault_map_private_page_read_is_read_only_and_write_cows() {
 }
 
 #[test]
+fn vm_fault_map_private_write_copies_source_page_contents() {
+    let aspace = AddressSpace::new();
+    let backing = page_backing(0);
+    let pc = match &backing {
+        VmBacking::Page { pc, .. } => pc.clone(),
+        _ => unreachable!("page_backing returns page backing"),
+    };
+    let entry = VmEntry::new(
+        range(0x8000, 1),
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        backing,
+    );
+    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+        .commit()
+        .expect("map");
+
+    let read_outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x8000), AccessMode::Read))
+        .expect("read fault resolves");
+    let read_materialized = read_outcome
+        .materialize_pagebacked()
+        .expect("read materializes shared page");
+    let shared_ppn = read_materialized.page.ppn;
+    let source_pattern = [0x41, 0x42, 0x43, 0x44, 0xd0, 0xd1, 0xd2, 0xd3];
+    tx_substrate::page_allocator::testing::write_frame_bytes_for_test(
+        shared_ppn,
+        128,
+        &source_pattern,
+    );
+    aspace
+        .publish_fault_materialization(read_outcome, read_materialized)
+        .expect("publish shared read page");
+
+    let write_outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x8000), AccessMode::Write))
+        .expect("write fault resolves");
+    let write_materialized = write_outcome
+        .materialize_pagebacked()
+        .expect("write CoW materializes private page");
+    let private_ppn = write_materialized.page.ppn;
+    let mut copied = [0u8; 8];
+    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(private_ppn, 128, &mut copied);
+
+    assert_ne!(private_ppn, shared_ppn);
+    assert_eq!(copied, source_pattern);
+
+    tx_substrate::page_allocator::testing::write_frame_bytes_for_test(private_ppn, 128, &[0x55; 8]);
+    let mut source_after_private_write = [0u8; 8];
+    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(
+        shared_ppn,
+        128,
+        &mut source_after_private_write,
+    );
+    assert_eq!(source_after_private_write, source_pattern);
+
+    assert_eq!(
+        pc.lookup(crate::page_backed::PageIndex::new(0)),
+        Some(shared_ppn)
+    );
+}
+
+#[test]
 fn vm_fault_materialization_rejects_non_pagebacked_recipe() {
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(

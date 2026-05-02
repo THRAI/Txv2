@@ -4,6 +4,38 @@
 
 ## Current Shape
 
+- 2026-05-03 source-frame byte-copy slice added a substrate-owned
+  `FrameCopier` hook, `install_frame_copier`, and
+  `page_allocator::copy_frame_contents(source, dest)` as the direct-map
+  full-frame copy primitive for VM CoW and future PageBacked byte movement. Boot
+  now installs the hook beside the existing direct-map zeroer, host tests use
+  the test direct-map backing for byte-level assertions, and repeated
+  `claim_zero_frame` calls no longer leak extra permanent frames after the zero
+  frame is already installed. MAP_PRIVATE PageBacked write faults now
+  materialize the shared source page and copy its bytes into the private frame
+  before publishing the writable replacement; the source `PageContainer` page
+  remains cached and unchanged. Full user-buffer `step_read`/`step_write`
+  byte copying is still deferred because `UserAccessIf`/copyin-copyout is not
+  wired. Parallel `tx-kernel --lib` also exposed that mount tests allocate
+  zone-backed payloads on the shared host pseudo-CPU, so they now share the
+  crate-level test serializer with PageBacked/Device epoch tests. Focused
+  verification so far: red compile checks for missing copy/test helpers, then
+  `cargo test -p tx-substrate --test page_allocator
+  installed_frame_copy_hook_copies_test_direct_map_bytes`, `cargo test -p
+  tx-kernel vm_fault_map_private_write_copies_source_page_contents --
+  --test-threads=1`, `cargo test -p tx-substrate --test page_allocator`, `cargo
+  test -p tx-kernel vm -- --test-threads=1`, `cargo test -p tx-kernel --lib`,
+  `cargo test -p tx-substrate --lib`, and `cargo clippy --workspace
+  --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude
+  tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt --
+  -D warnings`, followed by `cargo xtask lint unused`, `cargo xtask lint arch`,
+  `cargo xtask progress validate`, `cargo xtask lint docs`, `git diff --check`,
+  and `cargo xtask ci` with 11 passed, 0 skipped, 0 failed. Next step: dynamic
+  `PC.size` growth/truncate semantics and byte-accurate PageBacked range I/O
+  once user-buffer copy gates exist.
+  Blockers remain async fault-script retry/yield behavior,
+  Process/ThreadRuntime/trap authority wiring, and concrete VFS/backend
+  implementations.
 - 2026-05-03 PageBacked lifecycle-script slice added
   `page_backed::step_truncate` and `page_backed::step_fsync` in a new
   `crates/tx-kernel/src/page_backed/` submodule so the main PageBacked file

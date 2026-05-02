@@ -121,10 +121,13 @@ ownership.
   return wait-aware `StepOutcome` values as required by
   `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE` and
   `txdoc:VM-5-1-FAULT-HANDLER`.
-- Full CoW byte-copy fidelity is missing. The VM now allocates private frames
-  and replaces read-only shared mappings for PrivateAnon and MAP_PRIVATE
-  PageBacked faults, but it does not yet copy bytes from the source frame into
-  the private frame.
+- Full CoW byte-copy fidelity is partially staged. The substrate now exposes a
+  direct-map `FrameCopier` hook and `copy_frame_contents(source, dest)`, and
+  MAP_PRIVATE PageBacked write faults copy the shared source page into the
+  private frame before publishing the writable replacement. PrivateAnon
+  zero-frame writes are still satisfied by zeroed fresh frames. Remaining byte
+  fidelity work is user-buffer `step_read`/`step_write`, byte-accurate
+  partial-page truncate/growth, and concrete backend byte transfer.
 - PageBacked range operations are partially staged. `step_read` and
   `step_write` now materialize ranges, advance `OpenFile` offsets, propagate
   wait outcomes, mark written pages dirty, and reject Device writes, but they
@@ -176,12 +179,13 @@ slices because the active docs already defer them or mark them as v1 debt:
    public helper names.
 3. Generalize fault materialization: add `materialize_pagebacked`, implement
    `PrivateAnon` zero-frame reads and private writes, then add MAP_PRIVATE
-   page-backed read-only shared installs and CoW replacement writes.
+   page-backed read-only shared installs and CoW replacement writes with
+   full-frame source copy.
 4. Complete PageBacked v1 core before filesystem backends: keep
    `PageContainer::materialize_page` as the Anon/File/Device dispatch boundary,
    keep copyless `step_read`/`step_write` as staged range-progress scripts, and
    keep `step_truncate`/`step_fsync` as fixed-capacity mock-backed lifecycle
-   scripts until dynamic `PC.size` and byte-copy helpers exist.
+   scripts until dynamic `PC.size` and user-buffer copy helpers exist.
 5. Add VM-owned syscall-script surfaces over the synchronous compatibility
    helpers, returning wait-aware outcomes where the docs require retry/yield.
 6. Plan runtime integration last: fork after snapshot recipes and CoW demotion,
