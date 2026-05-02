@@ -4,6 +4,27 @@
 
 ## Current Shape
 
+- 2026-05-03 PageBacked v1 core materialization slice added
+  `PageContainer::materialize_page` as the uniform PageBacked dispatcher over
+  Anon, File, and Device variants. Anon keeps the existing zeroed-frame
+  behavior, File calls the mounted `FsPageBacking::fetch_page` and propagates
+  blocked/errored `StepOutcome` results, and Device wraps stable PPNs without
+  allocator ownership. `MaterializedPage` now carries allocator-backed or
+  device-backed publication evidence, and VM pmap tracking can retain either
+  kind while preserving allocator shootdown release for normal RAM pages.
+  Focused verification so far: red check for the missing
+  `materialize_page`, then `cargo test -p tx-kernel
+  page_container_materialize_page -- --test-threads=1`, `cargo test -p
+  tx-kernel page_backed -- --test-threads=1`, `cargo test -p tx-kernel vm
+  -- --test-threads=1`, `cargo test -p tx-kernel --lib`, `cargo clippy
+  --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude
+  tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt --
+  -D warnings`, `cargo xtask lint unused`, `cargo xtask progress validate`,
+  `cargo xtask lint docs`, `git diff --check`, and `cargo xtask ci` with 11
+  passed, 0 skipped, 0 failed. Next step: minimal PageBacked read/write scripts
+  with mock backends. Blockers remain source-frame byte-copy fidelity for full
+  CoW, async fault-script retry/yield behavior, Process/ThreadRuntime/trap
+  authority wiring, and concrete VFS/backend implementations.
 - 2026-05-03 local CI catch-up for PR #15 split VM fault
   materialization tests out of `crates/tx-kernel/src/vm/tests.rs` into
   `crates/tx-kernel/src/vm/tests/fault_materialization.rs` after GitHub

@@ -1,7 +1,8 @@
 //! VM public value vocabulary.
 
 use crate::page_backed::{
-    MaterializeAccess, MaterializedPage, PageCacheError, PageContainer, PageIndex,
+    MaterializeAccess, MaterializedPage, MaterializedPagePin, PageCacheError, PageContainer,
+    PageIndex,
 };
 use tx_substrate::page_allocator::{self, ZeroPolicy};
 use tx_substrate::zone::Cap;
@@ -651,7 +652,7 @@ fn materialize_zero_frame() -> Result<MaterializedPage, VmFaultError> {
     let map_pin = page_allocator::acquire_map_pin(ppn).map_err(page_alloc_error)?;
     Ok(MaterializedPage {
         ppn,
-        map_pin,
+        map_pin: MaterializedPagePin::Allocated(map_pin),
         newly_installed: false,
         dirty: false,
     })
@@ -666,7 +667,7 @@ fn allocate_private_materialized_page(dirty: bool) -> Result<MaterializedPage, V
     drop(frame);
     Ok(MaterializedPage {
         ppn,
-        map_pin,
+        map_pin: MaterializedPagePin::Allocated(map_pin),
         newly_installed: true,
         dirty,
     })

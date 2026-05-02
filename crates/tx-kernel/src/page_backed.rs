@@ -8,13 +8,15 @@
 
 use alloc::collections::BTreeMap;
 
-use crate::execution::{Guard, StepOutcome};
+use crate::execution::{Errno, Guard, StepOutcome};
 use crate::mount::MountPayload;
 use crate::sync::SpinMutex;
 use crate::vfs::FsObjectId;
 use tx_hal::Ppn;
 use tx_substrate::{
-    page_allocator::{self, AllocError, BitmapPageAllocator, CachePin, MapPin, ZeroPolicy},
+    page_allocator::{
+        self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,
+    },
     zone::{self, Cap, Zone, ZoneAllocated, ZoneError},
 };
 
@@ -64,7 +66,7 @@ pub struct PageMarks {
 
 struct PageCacheEntry {
     ppn: Ppn,
-    cache_pin: CachePin<'static, BitmapPageAllocator<'static>>,
+    pin: PageCachePin,
     marks: PageMarks,
 }
 
@@ -72,7 +74,7 @@ impl PageCacheEntry {
     fn new(frame: CachedFrame) -> Self {
         Self {
             ppn: frame.ppn,
-            cache_pin: frame.cache_pin,
+            pin: frame.pin,
             marks: PageMarks {
                 referenced: true,
                 ..PageMarks::new()
@@ -85,7 +87,7 @@ impl core::fmt::Debug for PageCacheEntry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PageCacheEntry")
             .field("ppn", &self.ppn)
-            .field("cache_pin", &self.cache_pin)
+            .field("pin", &self.pin)
             .field("marks", &self.marks)
             .finish()
     }
@@ -93,7 +95,13 @@ impl core::fmt::Debug for PageCacheEntry {
 
 struct CachedFrame {
     ppn: Ppn,
-    cache_pin: CachePin<'static, BitmapPageAllocator<'static>>,
+    pin: PageCachePin,
+}
+
+#[derive(Debug)]
+enum PageCachePin {
+    Allocated(CachePin<'static, BitmapPageAllocator<'static>>),
+    Device(DeviceFrame),
 }
 
 impl PageMarks {
@@ -254,9 +262,15 @@ pub trait FsPageBacking: Send + Sync + 'static {
 #[derive(Debug)]
 pub struct MaterializedPage {
     pub ppn: Ppn,
-    pub map_pin: MapPin<'static, BitmapPageAllocator<'static>>,
+    pub map_pin: MaterializedPagePin,
     pub newly_installed: bool,
     pub dirty: bool,
+}
+
+#[derive(Debug)]
+pub enum MaterializedPagePin {
+    Allocated(MapPin<'static, BitmapPageAllocator<'static>>),
+    Device(DeviceFrame),
 }
 
 #[derive(Debug)]
@@ -342,10 +356,161 @@ impl PageContainer {
         let marks = state.pages.marks(page).ok_or(PageCacheError::MissingPage)?;
         Ok(MaterializedPage {
             ppn,
-            map_pin,
+            map_pin: MaterializedPagePin::Allocated(map_pin),
             newly_installed,
             dirty: marks.dirty,
         })
+    }
+
+    pub fn materialize_page(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<MaterializedPage> {
+        if let Err(error) = self.check_bounds(page) {
+            return StepOutcome::Err(page_cache_error_to_errno(error));
+        }
+
+        match &self.kind {
+            PageContainerKind::Anon { .. } => match self.materialize_anon(page, access) {
+                Ok(page) => StepOutcome::Done(page),
+                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
+            },
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            } => self.materialize_file_page(page, access, mount, *fs_object_id, guard),
+            PageContainerKind::Device {
+                base_ppn,
+                page_count,
+            } => self.materialize_device_page(page, *base_ppn, *page_count),
+        }
+    }
+
+    fn materialize_file_page(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+        mount: &Cap<MountPayload>,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<MaterializedPage> {
+        if let Some(materialized) = self.materialize_cached_page(page, access) {
+            return match materialized {
+                Ok(page) => StepOutcome::Done(page),
+                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
+            };
+        }
+
+        let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
+            return StepOutcome::Err(Errno::EINVAL);
+        };
+        match mount
+            .fs_page_backing
+            .fetch_page(fs_object_id, offset, guard)
+        {
+            StepOutcome::Done(frame) => self.install_fetched_file_page(page, access, frame, false),
+            StepOutcome::Advanced(frame) => {
+                match self.install_fetched_file_page(page, access, frame, false) {
+                    StepOutcome::Done(page) => StepOutcome::Advanced(page),
+                    other => other,
+                }
+            }
+            StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
+            StepOutcome::AdvancedThenBlocked(frame, token) => {
+                match self.install_fetched_file_page(page, access, frame, false) {
+                    StepOutcome::Done(page) => StepOutcome::AdvancedThenBlocked(page, token),
+                    other => other,
+                }
+            }
+            StepOutcome::Err(errno) => StepOutcome::Err(errno),
+        }
+    }
+
+    fn install_fetched_file_page(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+        frame: Frame,
+        newly_installed: bool,
+    ) -> StepOutcome<MaterializedPage> {
+        let frame = match cached_frame_from_frame(frame) {
+            Ok(frame) => frame,
+            Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error)),
+        };
+        let mut state = self.state.lock();
+        let installed = match state.pages.lookup(page) {
+            Some(_) => false,
+            None => match state.pages.install_if_absent(page, frame) {
+                Ok(()) => true,
+                Err(PageCacheError::AlreadyPresent { .. }) => false,
+                Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error)),
+            },
+        };
+        if access == MaterializeAccess::Write {
+            if let Err(error) = state.pages.mark_dirty(page) {
+                return StepOutcome::Err(page_cache_error_to_errno(error));
+            }
+        }
+        match materialized_from_state(&state, page, newly_installed || installed) {
+            Ok(page) => StepOutcome::Done(page),
+            Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
+        }
+    }
+
+    fn materialize_device_page(
+        &self,
+        page: PageIndex,
+        base_ppn: Ppn,
+        page_count: u64,
+    ) -> StepOutcome<MaterializedPage> {
+        if page.as_u64() >= page_count {
+            return StepOutcome::Err(Errno::EINVAL);
+        }
+        let Ok(delta) = usize::try_from(page.as_u64()) else {
+            return StepOutcome::Err(Errno::EINVAL);
+        };
+        let Some(ppn) = base_ppn.0.checked_add(delta).map(Ppn) else {
+            return StepOutcome::Err(Errno::EINVAL);
+        };
+
+        let mut state = self.state.lock();
+        let newly_installed = match state.pages.lookup(page) {
+            Some(_) => false,
+            None => {
+                let frame = CachedFrame {
+                    ppn,
+                    pin: PageCachePin::Device(DeviceFrame::new(ppn)),
+                };
+                match state.pages.install_if_absent(page, frame) {
+                    Ok(()) => true,
+                    Err(PageCacheError::AlreadyPresent { .. }) => false,
+                    Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error)),
+                }
+            }
+        };
+        match materialized_from_state(&state, page, newly_installed) {
+            Ok(page) => StepOutcome::Done(page),
+            Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
+        }
+    }
+
+    fn materialize_cached_page(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+    ) -> Option<Result<MaterializedPage, PageCacheError>> {
+        let mut state = self.state.lock();
+        state.pages.lookup(page)?;
+        if access == MaterializeAccess::Write
+            && !matches!(self.kind, PageContainerKind::Device { .. })
+        {
+            if let Err(error) = state.pages.mark_dirty(page) {
+                return Some(Err(error));
+            }
+        }
+        Some(materialized_from_state(&state, page, false))
     }
 
     fn check_bounds(&self, page: PageIndex) -> Result<(), PageCacheError> {
@@ -363,12 +528,66 @@ fn allocate_cached_frame() -> Result<CachedFrame, PageCacheError> {
     let ppn = frame.ppn();
     let cache_pin = frame.try_cache_pin().map_err(PageCacheError::Alloc)?;
     drop(frame);
-    Ok(CachedFrame { ppn, cache_pin })
+    Ok(CachedFrame {
+        ppn,
+        pin: PageCachePin::Allocated(cache_pin),
+    })
+}
+
+fn cached_frame_from_frame(frame: Frame) -> Result<CachedFrame, PageCacheError> {
+    let ppn = frame.ppn();
+    let cache_pin = page_allocator::acquire_cache_pin(ppn).map_err(PageCacheError::Alloc)?;
+    Ok(CachedFrame {
+        ppn,
+        pin: PageCachePin::Allocated(cache_pin),
+    })
+}
+
+fn materialized_from_state(
+    state: &PageContainerState,
+    page: PageIndex,
+    newly_installed: bool,
+) -> Result<MaterializedPage, PageCacheError> {
+    let entry = state
+        .pages
+        .pages
+        .get(&page)
+        .ok_or(PageCacheError::MissingPage)?;
+    let map_pin = match &entry.pin {
+        PageCachePin::Allocated(cache_pin) => {
+            debug_assert_eq!(cache_pin.ppn(), entry.ppn);
+            MaterializedPagePin::Allocated(
+                page_allocator::acquire_map_pin(entry.ppn).map_err(PageCacheError::Alloc)?,
+            )
+        }
+        PageCachePin::Device(device) => MaterializedPagePin::Device(*device),
+    };
+    Ok(MaterializedPage {
+        ppn: entry.ppn,
+        map_pin,
+        newly_installed,
+        dirty: entry.marks.dirty,
+    })
+}
+
+const fn page_cache_error_to_errno(error: PageCacheError) -> Errno {
+    match error {
+        PageCacheError::AlreadyPresent { .. }
+        | PageCacheError::MissingPage
+        | PageCacheError::MismatchedFrame { .. } => Errno::ESTALE,
+        PageCacheError::OutOfBounds | PageCacheError::UnsupportedKind => Errno::EINVAL,
+        PageCacheError::Alloc(_) => Errno::ENOMEM,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::{Errno, StepOutcome, WaitToken};
+    use crate::mount::{DevId, MountOptions, MountPayload, SourceLabel};
+    use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta};
+    use alloc::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     fn setup_host_substrate() {
         tx_substrate::testing::init_host_for_test_once();
@@ -377,6 +596,356 @@ mod tests {
     fn cached_frame_for_test() -> CachedFrame {
         setup_host_substrate();
         allocate_cached_frame().expect("cached frame")
+    }
+
+    struct RecordingFs {
+        fetches: AtomicUsize,
+        last_object: AtomicU64,
+        last_offset: AtomicU64,
+    }
+
+    impl RecordingFs {
+        fn new() -> Self {
+            Self {
+                fetches: AtomicUsize::new(0),
+                last_object: AtomicU64::new(0),
+                last_offset: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl FsOps for RecordingFs {
+        fn lookup(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<FsObjectId> {
+            StepOutcome::Err(Errno::ENOSYS)
+        }
+
+        fn load_inode_meta(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<InodeMeta> {
+            StepOutcome::Done(InodeMeta::new(InodeKind::Regular, 0o100644))
+        }
+
+        fn serialize_inode_meta(
+            &self,
+            _fs_object_id: FsObjectId,
+            _meta: &InodeMeta,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Done(())
+        }
+
+        fn create_inode(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _mode: u16,
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn unlink(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn rename(
+            &self,
+            _old_parent: FsObjectId,
+            _old_name: &[u8],
+            _new_parent: FsObjectId,
+            _new_name: &[u8],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn link(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn mkdir(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _mode: u16,
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn rmdir(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn symlink(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _link_target: &[u8],
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn readdir(
+            &self,
+            _fs_object_id: FsObjectId,
+            _cursor: DirCursor,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
+            StepOutcome::Done(None)
+        }
+
+        fn destroy_inode(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
+            StepOutcome::Done(())
+        }
+    }
+
+    impl FsPageBacking for RecordingFs {
+        fn fetch_page(
+            &self,
+            fs_object_id: FsObjectId,
+            offset: u64,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<Frame> {
+            self.fetches.fetch_add(1, Ordering::AcqRel);
+            self.last_object
+                .store(fs_object_id.as_u64(), Ordering::Release);
+            self.last_offset.store(offset, Ordering::Release);
+            let frame = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
+                .expect("fs frame reservation")
+                .commit();
+            let ppn = frame.ppn();
+            core::mem::forget(frame);
+            StepOutcome::Done(Frame::new(ppn))
+        }
+
+        fn flush_page(
+            &self,
+            _fs_object_id: FsObjectId,
+            _offset: u64,
+            _frame: &Frame,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Done(())
+        }
+
+        fn truncate(
+            &self,
+            _fs_object_id: FsObjectId,
+            _new_size: u64,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Done(())
+        }
+
+        fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
+            StepOutcome::Done(())
+        }
+    }
+
+    struct BlockingFs;
+
+    impl FsPageBacking for BlockingFs {
+        fn fetch_page(
+            &self,
+            _fs_object_id: FsObjectId,
+            _offset: u64,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<Frame> {
+            StepOutcome::Blocked(WaitToken::new(9, 0x44))
+        }
+
+        fn flush_page(
+            &self,
+            _fs_object_id: FsObjectId,
+            _offset: u64,
+            _frame: &Frame,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Done(())
+        }
+
+        fn truncate(
+            &self,
+            _fs_object_id: FsObjectId,
+            _new_size: u64,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Done(())
+        }
+
+        fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
+            StepOutcome::Done(())
+        }
+    }
+
+    impl FsOps for BlockingFs {
+        fn lookup(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<FsObjectId> {
+            StepOutcome::Err(Errno::ENOSYS)
+        }
+
+        fn load_inode_meta(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<InodeMeta> {
+            StepOutcome::Err(Errno::ENOSYS)
+        }
+
+        fn serialize_inode_meta(
+            &self,
+            _fs_object_id: FsObjectId,
+            _meta: &InodeMeta,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Done(())
+        }
+
+        fn create_inode(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _mode: u16,
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn unlink(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn rename(
+            &self,
+            _old_parent: FsObjectId,
+            _old_name: &[u8],
+            _new_parent: FsObjectId,
+            _new_name: &[u8],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn link(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn mkdir(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _mode: u16,
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn rmdir(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<()> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn symlink(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _link_target: &[u8],
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
+            StepOutcome::Err(Errno::EROFS)
+        }
+
+        fn readdir(
+            &self,
+            _fs_object_id: FsObjectId,
+            _cursor: DirCursor,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
+            StepOutcome::Done(None)
+        }
+
+        fn destroy_inode(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
+            StepOutcome::Done(())
+        }
+    }
+
+    fn file_page_container(
+        fs: Arc<dyn FsOps + Send + Sync>,
+        page_backing: Arc<dyn FsPageBacking + Send + Sync>,
+        fs_object_id: FsObjectId,
+        page_count: u64,
+    ) -> PageContainer {
+        let mount = MountPayload::new_cap(
+            fs,
+            page_backing,
+            None,
+            DevId::new(8),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("mock"),
+        )
+        .expect("mount payload");
+        PageContainer::new(
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            },
+            page_count,
+        )
     }
 
     #[test]
@@ -478,5 +1047,110 @@ mod tests {
         assert!(!second.newly_installed);
         assert!(second.dirty);
         assert_eq!(pc.resident_pages(), 1);
+    }
+
+    #[test]
+    fn page_container_materialize_page_dispatches_anon() {
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            4,
+        );
+
+        let page = match pc.materialize_page(PageIndex::new(1), MaterializeAccess::Write, &guard) {
+            StepOutcome::Done(page) => page,
+            other => panic!("unexpected materialize outcome: {other:?}"),
+        };
+
+        assert!(page.newly_installed);
+        assert!(page.dirty);
+        assert_eq!(pc.lookup(PageIndex::new(1)), Some(page.ppn));
+    }
+
+    #[test]
+    fn page_container_materialize_page_dispatches_file_fetch_once() {
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let fs = Arc::new(RecordingFs::new());
+        let pc = file_page_container(fs.clone(), fs.clone(), FsObjectId::new(55), 4);
+
+        let first = match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Read, &guard) {
+            StepOutcome::Done(page) => page,
+            other => panic!("unexpected materialize outcome: {other:?}"),
+        };
+        let second = match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Write, &guard)
+        {
+            StepOutcome::Done(page) => page,
+            other => panic!("unexpected rematerialize outcome: {other:?}"),
+        };
+
+        assert!(first.newly_installed);
+        assert!(!first.dirty);
+        assert_eq!(second.ppn, first.ppn);
+        assert!(!second.newly_installed);
+        assert!(second.dirty);
+        assert_eq!(fs.fetches.load(Ordering::Acquire), 1);
+        assert_eq!(fs.last_object.load(Ordering::Acquire), 55);
+        assert_eq!(
+            fs.last_offset.load(Ordering::Acquire),
+            2 * crate::vm::USER_PAGE_SIZE as u64
+        );
+        assert_eq!(pc.resident_pages(), 1);
+    }
+
+    #[test]
+    fn page_container_materialize_page_propagates_file_block() {
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let fs = Arc::new(BlockingFs);
+        let pc = file_page_container(fs.clone(), fs, FsObjectId::new(77), 4);
+
+        assert_eq!(
+            match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
+                StepOutcome::Blocked(token) => StepOutcome::<()>::Blocked(token),
+                StepOutcome::Done(_)
+                | StepOutcome::Advanced(_)
+                | StepOutcome::AdvancedThenBlocked(_, _)
+                | StepOutcome::Err(_) => panic!("expected blocked file fetch"),
+            },
+            StepOutcome::Blocked(WaitToken::new(9, 0x44))
+        );
+        assert_eq!(pc.resident_pages(), 0);
+    }
+
+    #[test]
+    fn page_container_materialize_page_wraps_device_ppns() {
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Device {
+                base_ppn: Ppn(0xfeed_0000),
+                page_count: 2,
+            },
+            2,
+        );
+
+        let page = match pc.materialize_page(PageIndex::new(1), MaterializeAccess::Write, &guard) {
+            StepOutcome::Done(page) => page,
+            other => panic!("unexpected materialize outcome: {other:?}"),
+        };
+
+        assert_eq!(page.ppn, Ppn(0xfeed_0001));
+        assert!(page.newly_installed);
+        assert!(!page.dirty);
+        assert_eq!(pc.lookup(PageIndex::new(1)), Some(Ppn(0xfeed_0001)));
+        assert_eq!(
+            match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Read, &guard) {
+                StepOutcome::Err(errno) => StepOutcome::<()>::Err(errno),
+                StepOutcome::Done(_)
+                | StepOutcome::Advanced(_)
+                | StepOutcome::AdvancedThenBlocked(_, _)
+                | StepOutcome::Blocked(_) => panic!("expected out-of-bounds error"),
+            },
+            StepOutcome::Err(Errno::EINVAL)
+        );
     }
 }
