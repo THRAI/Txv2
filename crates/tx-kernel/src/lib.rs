@@ -14,6 +14,10 @@ pub mod vfs;
 pub mod vm;
 
 mod sync;
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
 mod zones;
 
 use tx_hal::{BootHandoff, TxPlatform};

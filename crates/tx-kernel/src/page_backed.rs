@@ -20,6 +20,12 @@ use tx_substrate::{
     zone::{self, Cap, Zone, ZoneAllocated, ZoneError},
 };
 
+mod lifecycle;
+pub use lifecycle::{step_fsync, step_truncate};
+
+#[cfg(test)]
+use crate::test_support::EPOCH_TEST_LOCK;
+
 static PAGE_CONTAINER_ZONE: Zone<PageContainer> = Zone::const_new();
 
 unsafe impl ZoneAllocated for PageContainer {
@@ -696,9 +702,6 @@ mod tests {
     };
     use alloc::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::sync::Mutex;
-
-    static PAGE_BACKED_EPOCH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn setup_host_substrate() {
         tx_substrate::testing::init_host_for_test_once();
@@ -1182,9 +1185,7 @@ mod tests {
 
     #[test]
     fn page_container_materialize_page_dispatches_anon() {
-        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
-            .lock()
-            .expect("page-backed epoch test lock");
+        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let pc = PageContainer::new(
@@ -1206,9 +1207,7 @@ mod tests {
 
     #[test]
     fn page_container_materialize_page_dispatches_file_fetch_once() {
-        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
-            .lock()
-            .expect("page-backed epoch test lock");
+        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let fs = Arc::new(RecordingFs::new());
@@ -1240,9 +1239,7 @@ mod tests {
 
     #[test]
     fn page_container_materialize_page_propagates_file_block() {
-        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
-            .lock()
-            .expect("page-backed epoch test lock");
+        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let fs = Arc::new(BlockingFs);
@@ -1263,9 +1260,7 @@ mod tests {
 
     #[test]
     fn page_container_materialize_page_wraps_device_ppns() {
-        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
-            .lock()
-            .expect("page-backed epoch test lock");
+        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let pc = PageContainer::new(
@@ -1299,9 +1294,7 @@ mod tests {
 
     #[test]
     fn pagebacked_step_read_materializes_pages_and_advances_offset() {
-        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
-            .lock()
-            .expect("page-backed epoch test lock");
+        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let pc = PageContainer::new(
@@ -1323,9 +1316,7 @@ mod tests {
 
     #[test]
     fn pagebacked_step_read_eof_does_not_materialize() {
-        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
-            .lock()
-            .expect("page-backed epoch test lock");
+        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let pc = PageContainer::new(
@@ -1344,9 +1335,7 @@ mod tests {
 
     #[test]
     fn pagebacked_step_write_marks_dirty_and_advances_offset() {
-        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
-            .lock()
-            .expect("page-backed epoch test lock");
+        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let pc = PageContainer::new(
@@ -1369,9 +1358,7 @@ mod tests {
 
     #[test]
     fn pagebacked_step_read_returns_advanced_then_blocked_after_progress() {
-        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
-            .lock()
-            .expect("page-backed epoch test lock");
+        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let fs = Arc::new(BlockingFs);
@@ -1392,9 +1379,7 @@ mod tests {
 
     #[test]
     fn pagebacked_step_write_rejects_device_backing() {
-        let _lock = PAGE_BACKED_EPOCH_TEST_LOCK
-            .lock()
-            .expect("page-backed epoch test lock");
+        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
         setup_host_substrate();
         let guard = tx_substrate::epoch::guard();
         let pc = PageContainer::new(
@@ -1414,3 +1399,6 @@ mod tests {
         assert_eq!(pc.resident_pages(), 0);
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests;

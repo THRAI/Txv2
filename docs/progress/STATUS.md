@@ -4,6 +4,37 @@
 
 ## Current Shape
 
+- 2026-05-03 PageBacked lifecycle-script slice added
+  `page_backed::step_truncate` and `page_backed::step_fsync` in a new
+  `crates/tx-kernel/src/page_backed/` submodule so the main PageBacked file
+  stays below the 1500-line guard. `step_truncate` rejects Device backing,
+  asks File `FsPageBacking::truncate` before mutating cache state, and withdraws
+  cached pages at or beyond the new staged size boundary. Because
+  `PageContainer` still stores fixed `page_count` capacity rather than final
+  dynamic `PC.size`, truncate-up beyond current capacity remains `EINVAL` and
+  read/write EOF still uses page capacity. `step_fsync` is a no-op for Anon and
+  Device, flushes dirty File pages through `FsPageBacking::flush_page` in
+  deterministic page-index order, clears dirty marks after successful flushes,
+  propagates waits with `AdvancedThenBlocked` after flush progress, then calls
+  filesystem `fsync` for metadata. Focused verification so far: red compile
+  check for missing lifecycle surface, then `cargo fmt --check`, `cargo test -p
+  tx-kernel pagebacked_step_truncate -- --test-threads=1`, `cargo test -p
+  tx-kernel pagebacked_step_fsync -- --test-threads=1`, and `cargo test -p
+  tx-kernel page_backed -- --test-threads=1`. Full lib verification initially
+  exposed that Device and PageBacked tests shared the host epoch guard without a
+  common serializer; the slice added a crate-level test-only `EPOCH_TEST_LOCK`
+  and reran `cargo test -p tx-kernel --lib` with 73 passed, 0 failed, plus
+  `cargo test -p tx-kernel vm -- --test-threads=1` with 48 passed. Full
+  verification completed with `cargo clippy --workspace --all-targets --exclude
+  tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock
+  --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings`, `cargo xtask lint
+  unused`, `cargo xtask lint arch`, `cargo xtask progress validate`, `cargo
+  xtask lint docs`, and `cargo xtask ci` with 11 passed, 0 skipped, 0 failed.
+  Next step: source-frame /
+  direct-map byte-copy helper for full CoW and real read/write contents, then
+  dynamic `PC.size` growth/truncate semantics. Blockers remain byte-copy
+  fidelity, async fault-script retry/yield behavior, Process/ThreadRuntime/trap
+  authority wiring, and concrete VFS/backend implementations.
 - 2026-05-03 PageBacked range-script slice added copyless staged
   `page_backed::step_read` and `page_backed::step_write` helpers over
   `PageContainer::materialize_page` plus an `OpenFile::set_offset` compatibility
