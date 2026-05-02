@@ -222,29 +222,29 @@ pub enum MaterializeAccess {
 }
 
 pub trait FsPageBacking: Send + Sync + 'static {
-    fn fetch_page<'g>(
+    fn fetch_page(
         &self,
         fs_object_id: FsObjectId,
         offset: u64,
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<Frame>;
 
-    fn flush_page<'g>(
+    fn flush_page(
         &self,
         fs_object_id: FsObjectId,
         offset: u64,
         frame: &Frame,
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<()>;
 
-    fn truncate<'g>(
+    fn truncate(
         &self,
         fs_object_id: FsObjectId,
         new_size: u64,
-        guard: &'g Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<()>;
 
-    fn fsync<'g>(&self, fs_object_id: FsObjectId, guard: &'g Guard<'_>) -> StepOutcome<()>;
+    fn fsync(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<()>;
 
     fn supports_reflink(&self, _other: &PageContainer) -> bool {
         false

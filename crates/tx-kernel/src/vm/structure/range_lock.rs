@@ -508,10 +508,10 @@ impl<const N: usize> ReservationIntervalTree<N> {
         let node = &self.nodes[root];
         let reservation = node.reservation.expect("tree node is populated");
 
-        if self.subtree_may_overlap(node.left, range) {
-            if self.any_overlap_from(node.left, range, predicate) {
-                return true;
-            }
+        if self.subtree_may_overlap(node.left, range)
+            && self.any_overlap_from(node.left, range, predicate)
+        {
+            return true;
         }
 
         if reservation.range.overlaps(range) && predicate(reservation) {

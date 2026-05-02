@@ -17,23 +17,21 @@ use super::{Prot, UserPage, UserRange, USER_PAGE_SIZE};
 
 const TEARDOWN_BATCH_PAGES: usize = 64;
 
+type ReserveMappingFn = fn(
+    &PmapRoot,
+    VirtAddr,
+    PhysAddr,
+    PmapReserveKind,
+) -> Result<Option<PmapReservation>, PmapError>;
+type UnmapMappingFn =
+    fn(&PmapRoot, VirtAddr, PmapReserveKind) -> Result<Option<tx_hal::PmapUnmapResult>, PmapError>;
+
 #[derive(Clone, Copy)]
 struct VmPmapOps {
     destroy_root: fn(PmapRoot),
-    reserve_mapping: fn(
-        &PmapRoot,
-        VirtAddr,
-        PhysAddr,
-        PmapReserveKind,
-    ) -> Result<Option<PmapReservation>, PmapError>,
-    #[allow(dead_code)]
-    rollback_mapping: fn(&PmapRoot, PmapReservation),
+    reserve_mapping: ReserveMappingFn,
     commit_mapping: fn(&PmapRoot, PmapReservation, PmapPermissions),
-    unmap_mapping: fn(
-        &PmapRoot,
-        VirtAddr,
-        PmapReserveKind,
-    ) -> Result<Option<tx_hal::PmapUnmapResult>, PmapError>,
+    unmap_mapping: UnmapMappingFn,
     shootdown_mappings: fn(Asid, &[tx_hal::PmapInvalidation]),
 }
 
@@ -42,7 +40,6 @@ impl VmPmapOps {
         Self {
             destroy_root: P::destroy_pmap_root,
             reserve_mapping: P::reserve_mapping,
-            rollback_mapping: P::rollback_mapping,
             commit_mapping: P::commit_mapping,
             unmap_mapping: P::unmap_mapping,
             shootdown_mappings: P::shootdown_mappings,
