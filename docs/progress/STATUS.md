@@ -4,6 +4,29 @@
 
 ## Current Shape
 
+- 2026-05-03 PageBacked range-script slice added copyless staged
+  `page_backed::step_read` and `page_backed::step_write` helpers over
+  `PageContainer::materialize_page` plus an `OpenFile::set_offset` compatibility
+  hook. The scripts materialize page ranges, advance offsets only after
+  progress, return EOF at the current page-capacity boundary, propagate
+  `Blocked` / `AdvancedThenBlocked` for file fetch waits, mark written pages
+  dirty for Anon/File, and reject Device writes with `EINVAL`. Actual byte
+  movement through direct-map/user-buffer helpers, dynamic `PC.size` growth,
+  truncate, fsync, writeback, and withdrawal remain deferred. Focused
+  verification so far: red check for missing `set_offset` / `step_read` /
+  `step_write`, then `cargo test -p tx-kernel pagebacked_step_ --
+  --test-threads=1`, `cargo test -p tx-kernel page_backed --
+  --test-threads=1`, `cargo test -p tx-kernel --lib`, `cargo clippy
+  --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude
+  tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt --
+  -D warnings`, `cargo xtask lint unused`, `cargo xtask lint arch`, `cargo
+  xtask progress validate`, `cargo xtask lint docs`, `git diff --check`, and
+  `cargo xtask ci` with 11 passed, 0 skipped, 0 failed. Next step:
+  `step_truncate` / `step_fsync` with mock backends, then real byte-copy
+  helpers. Blockers remain source-frame/direct-map byte-copy fidelity, dynamic
+  size/truncate semantics, async fault-script retry/yield behavior,
+  Process/ThreadRuntime/trap authority wiring, and concrete VFS/backend
+  implementations.
 - 2026-05-03 PageBacked v1 core materialization slice added
   `PageContainer::materialize_page` as the uniform PageBacked dispatcher over
   Anon, File, and Device variants. Anon keeps the existing zeroed-frame

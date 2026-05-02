@@ -125,10 +125,13 @@ ownership.
   and replaces read-only shared mappings for PrivateAnon and MAP_PRIVATE
   PageBacked faults, but it does not yet copy bytes from the source frame into
   the private frame.
-- PageBacked range operations are missing. `step_read`, `step_write`,
-  `step_truncate`, `step_fsync`, dirty iteration, bounds handling, writeback,
-  and withdrawal remain future PageBacked-owned work under
-  `txdoc:PAGE-BACKED-5-RANGE-OPERATIONS`.
+- PageBacked range operations are partially staged. `step_read` and
+  `step_write` now materialize ranges, advance `OpenFile` offsets, propagate
+  wait outcomes, mark written pages dirty, and reject Device writes, but they
+  are intentionally copyless until Tx exposes direct-map/user-buffer copying.
+  `step_truncate`, `step_fsync`, dynamic `PC.size`, dirty iteration, writeback,
+  bounds withdrawal, and reclaim integration remain future PageBacked-owned
+  work under `txdoc:PAGE-BACKED-5-RANGE-OPERATIONS`.
 - VM syscall-script surfaces are missing for `fault_script`, `mmap_script`,
   `munmap_script`, `mprotect_script`, `mremap_script`, `brk_script`,
   `madvise`, `msync`, and `mincore`. Existing synchronous methods should remain
@@ -172,7 +175,8 @@ slices because the active docs already defer them or mark them as v1 debt:
    page-backed read-only shared installs and CoW replacement writes.
 4. Complete PageBacked v1 core before filesystem backends: keep
    `PageContainer::materialize_page` as the Anon/File/Device dispatch boundary,
-   then add minimal read/write/truncate/fsync tests with mock backends.
+   keep copyless `step_read`/`step_write` as staged range-progress scripts,
+   then add truncate/fsync tests with mock backends.
 5. Add VM-owned syscall-script surfaces over the synchronous compatibility
    helpers, returning wait-aware outcomes where the docs require retry/yield.
 6. Plan runtime integration last: fork after snapshot recipes and CoW demotion,
