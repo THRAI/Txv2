@@ -29,7 +29,13 @@ Current orientation skills:
 - `tx-implementation-readiness` audits whether a doc area is ready to implement
   from.
 - `tx-meta-alignment` covers edits under `docs/design/00_meta-framework/`.
+- `tx-process-threadruntime` covers Process, ThreadRuntime, signal, syscall,
+  exec, first-userspace, and runtime integration seams.
 - `tx-progress-memory` records or resumes durable decisions, plans, handoffs,
   research, status, and task-finish catch-ups.
 - `tx-subsystem-manifest` covers subsystem specs and zone-derived type policy
   tables.
+- `tx-vfs-filesystem` covers VFS, Mount, PageBacked filesystem interfaces,
+  bdev-fs, devfs, and kernel-facing filesystem backend work.
+- `tx-vm-pagebacked` covers VM `AddressSpace`, recipes, `RangeLock`,
+  PageBacked, page-cache, and VM fault-materialization work.

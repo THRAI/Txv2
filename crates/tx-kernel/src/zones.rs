@@ -4,6 +4,8 @@ use tx_substrate::{
     zone::{self, Zone, ZoneAllocated, ZoneError},
 };
 
+use crate::{page_backed::PageContainer, vm::AddressSpace};
+
 pub(crate) struct ZoneSmokeObj {
     pub(crate) value: usize,
 }
@@ -20,6 +22,8 @@ pub(crate) fn register_all() -> Result<(), ZoneError> {
     smoke::register_zones()?;
     process::register_zones()?;
     thread::register_zones()?;
+    vm::register_zones()?;
+    page_backed::register_zones()?;
     mount::register_zones()?;
     vfs::register_zones()?;
     Ok(())
@@ -73,6 +77,24 @@ mod thread {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
+        Ok(())
+    }
+}
+
+mod vm {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        zone::register_zone_for::<AddressSpace>()?;
+        Ok(())
+    }
+}
+
+mod page_backed {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        zone::register_zone_for::<PageContainer>()?;
         Ok(())
     }
 }

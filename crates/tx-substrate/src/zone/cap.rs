@@ -156,6 +156,14 @@ impl<T: 'static> Clone for Cap<T> {
     }
 }
 
+impl<T: 'static> PartialEq for Cap<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl<T: 'static> Eq for Cap<T> {}
+
 impl<T: 'static> Drop for Cap<T> {
     fn drop(&mut self) {
         let Some(slot) = self.slot() else {

@@ -347,7 +347,7 @@ macro_rules! role_pin {
         }
 
         impl<'a, A: PageAllocator> $name<'a, A> {
-            fn new(allocator: &'a A, ppn: Ppn) -> Self {
+            pub(crate) fn new(allocator: &'a A, ppn: Ppn) -> Self {
                 Self {
                     allocator,
                     ppn,

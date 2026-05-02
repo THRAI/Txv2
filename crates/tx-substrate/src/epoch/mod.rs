@@ -21,6 +21,10 @@ pub mod testing {
         super::domain::reset_for_test();
     }
 
+    pub fn init_for_test() {
+        super::domain::init_for_test();
+    }
+
     pub unsafe fn retire_raw_for_test(
         ptr: *mut u8,
         reclaim_fn: unsafe fn(*mut u8),

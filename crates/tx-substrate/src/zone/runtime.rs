@@ -58,6 +58,22 @@ pub fn init_on_bsp<P: TxPlatform>() -> Result<(), ZoneError> {
     Ok(())
 }
 
+#[doc(hidden)]
+pub fn init_for_test(page_size: usize, direct_map_base: usize) -> Result<(), ZoneError> {
+    ZONE_RUNTIME_INITIALIZED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| ZoneError::AlreadyInitialized)?;
+
+    POSSIBLE_CPUS.store(1, Ordering::Release);
+    PAGE_SIZE.store(page_size, Ordering::Release);
+    DIRECT_MAP_BASE.store(direct_map_base, Ordering::Release);
+    unsafe {
+        *HOOKS.get() = RuntimeHooks::default();
+    }
+    super::registry::init_registry();
+    Ok(())
+}
+
 pub fn init_on_ap(cpu: CpuId) -> Result<(), ZoneError> {
     ensure_initialized()?;
     if cpu.0 >= POSSIBLE_CPUS.load(Ordering::Acquire) {
