@@ -4,6 +4,19 @@
 
 ## Current Shape
 
+- 2026-05-03 VM doc gap ledger recorded the current
+  `codex/vm-pagebacked-impl` delta against `VM_v1_2` and `PAGE_BACKED_v1` in
+  `docs/progress/research/2026-05-03-vm-doc-gap-ledger.md`. The ledger
+  classifies obligations as implemented, staged, blocked/not implemented, or
+  deferred by active docs, and fixes the next mitigation order: snapshot-stable
+  recipes, generalized fault materialization and CoW, PageBacked core with mock
+  File/Device backing, syscall-script surfaces, then Process/ThreadRuntime/trap
+  integration. Verification: `cargo fmt --check`, `cargo xtask progress
+  validate`, `cargo xtask lint docs`, and `git diff --check`. Next step:
+  start the recipe snapshot slice while preserving current helper names and
+  error behavior. Blockers
+  remain Process/ThreadRuntime/trap authority wiring and concrete VFS/backend
+  implementations.
 - 2026-05-03 PR #14 CI check fix cleared the GitHub `check` failures after
   inspecting Actions logs. The patch removes clippy warnings from the
   VM/PageBacked/VFS interface lane by eliding needless guard lifetimes,
