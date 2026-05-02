@@ -19,16 +19,17 @@ The current implementation is a strong structural staging slice, not the full
 `VM_v1_2` / `PAGE_BACKED_v1` system. It covers roughly 40% of the VM structure
 contract and roughly 20-25% of the full behavior contract.
 
-Implemented or mostly staged: `AddressSpace`, range-indexed recipes,
-`RangeLock`, map/unmap/protect/disjoint-remap primitives, fault recipe checks,
-pmap publication and teardown, anonymous `PageContainer` materialization,
-VFS/Mount/PageBacked interface shells, and read-only VM projections.
+Implemented or mostly staged: `AddressSpace`, snapshot-published range-indexed
+recipes, `RangeLock`, map/unmap/protect/disjoint-remap primitives, fault recipe
+checks, pmap publication and teardown, anonymous `PageContainer`
+materialization, VFS/Mount/PageBacked interface shells, and read-only VM
+projections.
 
-Major gaps: persistent epoch recipe snapshots, async syscall/trap integration,
-real `fault_script` retry semantics, `PrivateAnon` zero-frame and MAP_PRIVATE
-CoW, file/device PageBacked materialization, PageBacked read/write/truncate/
-fsync/reclaim, fork/exec/brk/madvise/msync/mincore, and Process/ThreadRuntime
-ownership.
+Major gaps: final persistent/epoch recipe snapshots, async syscall/trap
+integration, real `fault_script` retry semantics, `PrivateAnon` zero-frame and
+MAP_PRIVATE CoW, file/device PageBacked materialization, PageBacked read/write/
+truncate/fsync/reclaim, fork/exec/brk/madvise/msync/mincore, and
+Process/ThreadRuntime ownership.
 
 ## Implemented
 
@@ -38,6 +39,10 @@ ownership.
 - VM recipes are authoritative range bindings over `VmEntry` values, and pmap
   PTEs are treated as derived materializations, matching
   `txdoc:VM-1-AUTHORITATIVE-BINDINGS-AND-MATERIALIZATIONS-IN-VM`.
+- `RecipeIndex` now publishes whole immutable `Arc<BTreeMap<...>>` recipe
+  trees. Readers clone a `RecipeSnapshot`, and writers replace the tree only
+  after building a complete rewrite, so observers see a complete pre- or
+  post-mutation recipe set during split rewrites.
 - `RangeLock` exists as a VM-local coordination primitive with materializer and
   exclusive-writer modes, declared-range behavior, RAII guards, and overlap
   exclusion tests for the v1 range-mutation cases described by
@@ -69,10 +74,9 @@ ownership.
 
 ## Staged
 
-- The recipe index is a `SpinMutex<BTreeMap<...>>` wrapper. It gives
-  deterministic order and compatibility helpers, but it is not yet a
-  persistent/epoch snapshot tree that lets readers observe a complete pre- or
-  post-mutation recipe set during split rewrites.
+- The recipe index is snapshot-published, but it is still an `Arc<BTreeMap<...>>`
+  staging structure under a small publication mutex. It is not yet the final
+  persistent/epoch range index with guard-scoped lifetime evidence.
 - `RangeLock` is a bounded v1 reservation set. It proves the declared-range
   discipline and writer/materializer exclusion, but it is not an optimized
   concurrent interval index.
@@ -95,9 +99,10 @@ ownership.
 
 ## Blocked Or Not Implemented
 
-- Persistent epoch recipe snapshots are missing. This is the first VM-owned
-  behavior gap to close because it improves projections, checks, and future
-  fork/script readers without requiring Process or trap wiring.
+- Final persistent/epoch recipe snapshots are missing. The current
+  `Arc<BTreeMap<...>>` snapshot publication closes the partial-rewrite
+  visibility gap for readers, but it does not yet provide the final epoch range
+  index or guard-scoped witness shape.
 - Async `fault_script` retry/yield behavior is missing. Current fault handling
   is a synchronous helper; it does not drop reservations across I/O waits or
   return wait-aware `StepOutcome` values as required by
@@ -154,8 +159,9 @@ slices because the active docs already defer them or mark them as v1 debt:
 ## Mitigation Order
 
 1. Record this gap ledger and keep the worktree/status records aligned.
-2. Close the recipe snapshot gap with a snapshot-stable recipe index while
-   preserving current map/unmap/protect/remap behavior and public helper names.
+2. Close the partial-rewrite recipe visibility gap with a snapshot-published
+   recipe index while preserving current map/unmap/protect/remap behavior and
+   public helper names.
 3. Generalize fault materialization: add `materialize_pagebacked`, implement
    `PrivateAnon` zero-frame reads and private writes, then add MAP_PRIVATE
    page-backed read-only shared installs and CoW writes.

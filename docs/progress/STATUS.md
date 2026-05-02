@@ -4,6 +4,21 @@
 
 ## Current Shape
 
+- 2026-05-03 VM recipe snapshot slice replaced the recipe index's mutable
+  in-place map publication with whole-tree `Arc<BTreeMap<...>>` snapshots.
+  Public helpers such as `lookup`, `recipes_overlapping`, `recipes_snapshot`,
+  map/unmap/protect, fixed replace, and disjoint remap keep their existing
+  behavior, while readers can now hold an immutable pre-mutation recipe view
+  across split/rewrite publication. Tests added
+  `vm_recipe_snapshot_reader_survives_split_rewrite_publication`. Verification:
+  red check for the new test, then `cargo fmt --check`, `cargo test -p
+  tx-kernel vm -- --test-threads=1`, `cargo test -p tx-kernel --lib`,
+  `cargo xtask lint unused`, `cargo xtask progress validate`, `cargo xtask
+  lint docs`, and `git diff --check`. Next step: generalize fault
+  materialization for PrivateAnon zero-frame reads, private writes, and
+  MAP_PRIVATE CoW. Blockers remain final epoch/guard-shaped recipe witnesses,
+  Process/ThreadRuntime/trap authority wiring, and concrete VFS/backend
+  implementations.
 - 2026-05-03 VM doc gap ledger recorded the current
   `codex/vm-pagebacked-impl` delta against `VM_v1_2` and `PAGE_BACKED_v1` in
   `docs/progress/research/2026-05-03-vm-doc-gap-ledger.md`. The ledger
