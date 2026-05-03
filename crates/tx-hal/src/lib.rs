@@ -255,7 +255,7 @@ impl ArchAuxvFacts {
     }
 }
 
-pub const RISCV_HWCAP_ISA_A: u64 = 1 << (b'A' - b'A');
+pub const RISCV_HWCAP_ISA_A: u64 = 1 << 0;
 pub const RISCV_HWCAP_ISA_C: u64 = 1 << (b'C' - b'A');
 pub const RISCV_HWCAP_ISA_D: u64 = 1 << (b'D' - b'A');
 pub const RISCV_HWCAP_ISA_F: u64 = 1 << (b'F' - b'A');

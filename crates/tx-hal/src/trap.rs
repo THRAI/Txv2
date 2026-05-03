@@ -96,6 +96,7 @@ pub struct TrapFrameView<'a> {
 }
 
 impl<'a> TrapFrameView<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         pc: VirtAddr,
         sp: VirtAddr,

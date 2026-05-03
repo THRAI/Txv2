@@ -537,7 +537,7 @@ fn dmw_covers_phys_range(start: PhysAddr, len: usize) -> bool {
     start
         .0
         .checked_add(len)
-        .is_some_and(|end| start.0 >= QEMU_LA64_RAM_BASE && end <= (LA64_PHYS_ADDR_MASK + 1))
+        .is_some_and(|end| end <= (LA64_PHYS_ADDR_MASK + 1))
 }
 
 fn la64_invtlb_global(virt: VirtAddr) {
