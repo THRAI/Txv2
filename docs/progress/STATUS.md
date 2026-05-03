@@ -4,6 +4,35 @@
 
 ## Current Shape
 
+- 2026-05-03 PageBacked dynamic `PC.size` slice added a visible byte-size
+  field to `PageContainer` while preserving the existing fixed `page_count`
+  capacity as the upper bound. `PageContainer::size_bytes()` is now the compact
+  observation helper; `step_read` clamps EOF to visible size rather than
+  capacity; `step_write` rejects growth beyond capacity but grows visible size
+  after byte progress for Anon/File; and `step_truncate` publishes the new size
+  only after File `FsPageBacking::truncate` succeeds, withdrawing cached pages
+  on shrink and materializing nothing on grow. Size-focused tests moved into
+  `crates/tx-kernel/src/page_backed/size_tests.rs` so the PageBacked facade
+  stays under the 1500-line architecture guard. Verification: initial red
+  compile check for missing `size_bytes`, then `cargo test -p tx-kernel
+  pagebacked_step_write_extends_visible_size_within_capacity --
+  --test-threads=1`, `cargo test -p tx-kernel
+  page_container_size_starts_at_fixed_capacity -- --test-threads=1`, `cargo
+  test -p tx-kernel pagebacked_step_read_uses_visible_size_not_capacity --
+  --test-threads=1`, `cargo test -p tx-kernel pagebacked_step_truncate --
+  --test-threads=1`, `cargo test -p tx-kernel page_backed --
+  --test-threads=1`; regression gates with `cargo fmt --check`, `cargo test -p
+  tx-kernel vm -- --test-threads=1`, `cargo test -p tx-kernel --lib`, `cargo
+  clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt
+  --exclude tx-kernel-riscv64-m1dock-mock --exclude
+  tx-kernel-loongarch64-qemu-virt -- -D warnings`, `cargo xtask lint unused`,
+  `cargo xtask lint arch`, `cargo xtask progress validate`, `cargo xtask lint
+  docs`, `git diff --check`; and `cargo xtask ci` with 11 passed, 0 skipped, 0
+  failed. Next step: connect `PC.size` to VM fault SIGBUS-style checks for
+  page-backed mappings and then add byte-accurate user-buffer read/write once
+  copyin/copyout gates exist. Blockers remain async fault-script retry/yield
+  behavior, Process/ThreadRuntime/trap authority wiring, concrete VFS/backend
+  implementations, and final user-buffer copy plumbing.
 - 2026-05-03 source-frame byte-copy slice added a substrate-owned
   `FrameCopier` hook, `install_frame_copier`, and
   `page_allocator::copy_frame_contents(source, dest)` as the direct-map
