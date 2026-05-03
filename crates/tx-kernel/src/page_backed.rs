@@ -7,6 +7,7 @@
 //! typed page-substrate contributors.
 
 use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::mount::MountPayload;
@@ -289,6 +290,7 @@ pub enum MaterializedPagePin {
 pub struct PageContainer {
     kind: PageContainerKind,
     page_count: u64,
+    size_bytes: AtomicU64,
     state: SpinMutex<PageContainerState>,
 }
 
@@ -299,9 +301,11 @@ struct PageContainerState {
 
 impl PageContainer {
     pub fn new(kind: PageContainerKind, page_count: u64) -> Self {
+        let capacity = page_count.saturating_mul(crate::vm::USER_PAGE_SIZE as u64);
         Self {
             kind,
             page_count,
+            size_bytes: AtomicU64::new(capacity),
             state: SpinMutex::new(PageContainerState {
                 pages: PageCacheIndex::new(),
             }),
@@ -322,6 +326,10 @@ impl PageContainer {
 
     pub const fn page_count(&self) -> u64 {
         self.page_count
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes.load(Ordering::Acquire)
     }
 
     pub fn resident_pages(&self) -> usize {
@@ -536,6 +544,25 @@ impl PageContainer {
         self.page_count
             .checked_mul(crate::vm::USER_PAGE_SIZE as u64)
     }
+
+    fn set_size_bytes(&self, size: u64) {
+        self.size_bytes.store(size, Ordering::Release);
+    }
+
+    fn grow_size_to(&self, new_size: u64) {
+        let mut observed = self.size_bytes();
+        while new_size > observed {
+            match self.size_bytes.compare_exchange_weak(
+                observed,
+                new_size,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(current) => observed = current,
+            }
+        }
+    }
 }
 
 pub fn step_read(
@@ -551,10 +578,11 @@ pub fn step_read(
         return StepOutcome::Err(Errno::EINVAL);
     };
     let start = of.offset();
-    if start >= capacity {
+    let valid_end = core::cmp::min(pc.size_bytes(), capacity);
+    if start >= valid_end {
         return StepOutcome::Done(0);
     }
-    let effective_len = core::cmp::min(len as u64, capacity - start) as usize;
+    let effective_len = core::cmp::min(len as u64, valid_end - start) as usize;
     step_range(pc, of, effective_len, PageBackedIoKind::Read, guard)
 }
 
@@ -579,7 +607,23 @@ pub fn step_write(
     if end > capacity {
         return StepOutcome::Err(Errno::EINVAL);
     }
-    step_range(pc, of, len, PageBackedIoKind::Write, guard)
+    let start = of.offset();
+    let outcome = step_range(pc, of, len, PageBackedIoKind::Write, guard);
+    match &outcome {
+        StepOutcome::Done(advanced)
+        | StepOutcome::Advanced(advanced)
+        | StepOutcome::AdvancedThenBlocked(advanced, _)
+            if *advanced > 0 =>
+        {
+            pc.grow_size_to(start + *advanced as u64);
+        }
+        StepOutcome::Done(_)
+        | StepOutcome::Advanced(_)
+        | StepOutcome::AdvancedThenBlocked(_, _)
+        | StepOutcome::Blocked(_)
+        | StepOutcome::Err(_) => {}
+    }
+    outcome
 }
 
 fn step_range(
@@ -1402,3 +1446,5 @@ mod tests {
 
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod size_tests;

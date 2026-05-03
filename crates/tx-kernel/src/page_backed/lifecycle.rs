@@ -70,7 +70,10 @@ pub fn step_truncate(pc: &PageContainer, new_size: u64, guard: &Guard<'_>) -> St
         PageContainerKind::Device { .. } => unreachable!(),
     };
 
-    if new_size < capacity {
+    let old_size = pc.size_bytes();
+    pc.set_size_bytes(new_size);
+
+    if new_size < old_size {
         let Some(first_drop) = first_page_after_size(new_size) else {
             return StepOutcome::Err(Errno::EINVAL);
         };

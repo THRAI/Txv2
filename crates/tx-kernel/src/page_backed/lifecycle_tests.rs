@@ -21,6 +21,7 @@ struct LifecycleFs {
     last_offset: AtomicU64,
     last_truncate_size: AtomicU64,
     block_flush_after: Option<usize>,
+    truncate_outcome: StepOutcome<()>,
 }
 
 impl LifecycleFs {
@@ -33,12 +34,20 @@ impl LifecycleFs {
             last_offset: AtomicU64::new(0),
             last_truncate_size: AtomicU64::new(0),
             block_flush_after: None,
+            truncate_outcome: StepOutcome::Done(()),
         }
     }
 
     fn blocking_after(first_done_count: usize) -> Self {
         Self {
             block_flush_after: Some(first_done_count),
+            ..Self::new()
+        }
+    }
+
+    fn failing_truncate(errno: Errno) -> Self {
+        Self {
+            truncate_outcome: StepOutcome::Err(errno),
             ..Self::new()
         }
     }
@@ -84,7 +93,7 @@ impl FsPageBacking for LifecycleFs {
         self.last_object
             .store(fs_object_id.as_u64(), Ordering::Release);
         self.last_truncate_size.store(new_size, Ordering::Release);
-        StepOutcome::Done(())
+        self.truncate_outcome.clone()
     }
 
     fn fsync(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
@@ -261,10 +270,35 @@ fn pagebacked_step_truncate_withdraws_pages_at_or_beyond_new_size() {
         StepOutcome::Done(())
     );
 
+    assert_eq!(pc.size_bytes(), crate::vm::USER_PAGE_SIZE as u64 + 1);
     assert!(pc.lookup(PageIndex::new(0)).is_some());
     assert!(pc.lookup(PageIndex::new(1)).is_some());
     assert_eq!(pc.lookup(PageIndex::new(2)), None);
     assert_eq!(pc.lookup(PageIndex::new(3)), None);
+}
+
+#[test]
+fn pagebacked_step_truncate_can_grow_visible_size_without_materializing_pages() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        4,
+    );
+    assert_eq!(step_truncate(&pc, 8, &guard), StepOutcome::Done(()));
+
+    assert_eq!(
+        step_truncate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64 + 11, &guard),
+        StepOutcome::Done(())
+    );
+
+    assert_eq!(pc.size_bytes(), 2 * crate::vm::USER_PAGE_SIZE as u64 + 11);
+    assert_eq!(pc.resident_pages(), 0);
 }
 
 #[test]
@@ -294,6 +328,32 @@ fn pagebacked_step_truncate_asks_file_backing_before_withdrawal() {
         2 * crate::vm::USER_PAGE_SIZE as u64
     );
     assert_eq!(pc.lookup(PageIndex::new(3)), None);
+}
+
+#[test]
+fn pagebacked_step_truncate_leaves_state_unchanged_when_file_backing_fails() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let fs = Arc::new(LifecycleFs::failing_truncate(Errno::EROFS));
+    let pc = file_page_container(fs.clone(), FsObjectId::new(45));
+    pc.state
+        .lock()
+        .pages
+        .install_if_absent(PageIndex::new(3), cached_frame_for_test())
+        .expect("seed page");
+    let original_size = pc.size_bytes();
+
+    assert_eq!(
+        step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
+        StepOutcome::Err(Errno::EROFS)
+    );
+
+    assert_eq!(pc.size_bytes(), original_size);
+    assert!(pc.lookup(PageIndex::new(3)).is_some());
+    assert_eq!(fs.truncates.load(Ordering::Acquire), 1);
 }
 
 #[test]
