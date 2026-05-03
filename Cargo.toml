@@ -11,6 +11,8 @@ members = [
     "crates/tx-subsystems",
     "crates/tx-services",
     "crates/tx-fs",
+    "crates/tx-ext4",
+    "crates/tx-ext4-format",
     "crates/tx-scripts",
     "crates/tx-shims",
     "boards/tx-hal-riscv64-qemu-virt",

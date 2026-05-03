@@ -2,8 +2,8 @@
   "schema": "tx.progress.worktree.v1",
   "id": "2026-04-29-zone-ebr-integration",
   "created": "2026-04-29",
-  "updated": "2026-04-29",
-  "status": "active",
+  "updated": "2026-04-30",
+  "status": "merged",
   "branch": "codex/zone-ebr-integration",
   "path": "/private/tmp/Tx-worktrees/codex-zone-ebr-integration",
   "base": "codex/reactor-task-aware@3017a30",
@@ -36,5 +36,5 @@
     "grep -a 'txkernel' target/qemu-rv64-qemu-smoke.serial.log",
     "git diff --check"
   ],
-  "notes": "Conflict-resolution worktree for merging remote origin/zone (e53956e) into the reactor-task-aware line. Resolution keeps the newer HAL TimeIf/trap/pmap surface, replaces old flat substrate epoch/zone placeholders with the remote directory modules, wires the kernel zone smoke into CoreInit, updates stale host tests for the static-zone API, repairs an existing README docs-lint link, and makes reactor smoke counters per-test so workspace CI is deterministic."
+  "notes": "Conflict-resolution worktree for merging remote origin/zone (e53956e) into the reactor-task-aware line. Resolution keeps the newer HAL TimeIf/trap/pmap surface, replaces old flat substrate epoch/zone placeholders with the remote directory modules, wires the kernel zone smoke into CoreInit, updates stale host tests for the static-zone API, repairs an existing README docs-lint link, and makes reactor smoke counters per-test so workspace CI is deterministic. Closed on 2026-04-30 after the recorded worktree path no longer existed and the main checkout progress/status already recorded the merge verification."
 }
