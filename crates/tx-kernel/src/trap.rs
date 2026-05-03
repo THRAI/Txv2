@@ -1,4 +1,6 @@
-use tx_hal::{CpuId, FaultInfo, IpiKind, KernelTrapSink, TrapAction, TrapFrameMut, TxPlatform};
+use tx_hal::{
+    CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, TrapAction, TrapFrameMut, TxPlatform,
+};
 
 pub struct KernelTrapDispatcher;
 
@@ -17,7 +19,18 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
     }
 
     fn on_external_irq(_cpu: CpuId) -> TrapAction {
-        TrapAction::Resume
+        let irq = P::claim();
+        if irq == 0 {
+            return TrapAction::Resume;
+        }
+
+        let handled = P::dispatch_irq(irq);
+        P::complete(irq);
+
+        match handled {
+            IrqHandled::Wake => TrapAction::Reschedule,
+            IrqHandled::Done | IrqHandled::NotMine => TrapAction::Resume,
+        }
     }
 
     fn on_ipi(_cpu: CpuId) -> TrapAction {

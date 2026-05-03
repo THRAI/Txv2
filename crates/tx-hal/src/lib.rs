@@ -85,6 +85,16 @@ pub struct BootArg(pub usize);
 pub struct PhysAddr(pub usize);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaAddr(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DmaDirection {
+    ToDevice,
+    FromDevice,
+    Bidirectional,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ppn(pub usize);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,6 +236,38 @@ pub struct PlatformInfo {
     pub possible_cpu_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArchAuxvFacts {
+    pub page_size: usize,
+    pub hwcap: u64,
+    pub hwcap2: u64,
+    pub platform: &'static str,
+}
+
+impl ArchAuxvFacts {
+    pub const fn new(page_size: usize, hwcap: u64, hwcap2: u64, platform: &'static str) -> Self {
+        Self {
+            page_size,
+            hwcap,
+            hwcap2,
+            platform,
+        }
+    }
+}
+
+pub const RISCV_HWCAP_ISA_A: u64 = 1 << 0;
+pub const RISCV_HWCAP_ISA_C: u64 = 1 << (b'C' - b'A');
+pub const RISCV_HWCAP_ISA_D: u64 = 1 << (b'D' - b'A');
+pub const RISCV_HWCAP_ISA_F: u64 = 1 << (b'F' - b'A');
+pub const RISCV_HWCAP_ISA_I: u64 = 1 << (b'I' - b'A');
+pub const RISCV_HWCAP_ISA_M: u64 = 1 << (b'M' - b'A');
+pub const RISCV_HWCAP_IMAFDC: u64 = RISCV_HWCAP_ISA_I
+    | RISCV_HWCAP_ISA_M
+    | RISCV_HWCAP_ISA_A
+    | RISCV_HWCAP_ISA_F
+    | RISCV_HWCAP_ISA_D
+    | RISCV_HWCAP_ISA_C;
+
 pub trait PlatformConfig {
     const ARCH: Arch;
     const BOARD: &'static str;
@@ -277,9 +319,22 @@ pub trait PlatformInfoIf {
     fn platform_info() -> &'static PlatformInfo;
 }
 
-pub trait AuxvIf {}
+pub trait AuxvIf: PlatformConfig {
+    fn arch_auxv_facts() -> ArchAuxvFacts {
+        let platform = match Self::ARCH {
+            Arch::Riscv64 => "riscv64",
+            Arch::LoongArch64 => "loongarch64",
+        };
+
+        ArchAuxvFacts::new(Self::PAGE_SIZE, 0, 0, platform)
+    }
+}
 pub trait ConsoleIf {
     fn write_bytes(bytes: &[u8]);
+
+    fn read_bytes(_buf: &mut [u8]) -> usize {
+        0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -713,18 +768,402 @@ pub trait PmapIf {
 pub mod pmap;
 pub mod trap;
 pub use trap::{
-    FaultInfo, KernelTrapSink, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable,
-    TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, TrapSnapshot,
+    FaultInfo, KernelTrapSink, SignalHandlerRegs, TrapAction, TrapClass, TrapFrameMut,
+    TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, TrapSnapshot,
+    UserTrapContext,
 };
-pub trait UserAccessIf {}
-pub trait SignalFrameIf {}
+
+// ---------------------------------------------------------------------------
+// Pod — plain-old-data marker trait
+// ---------------------------------------------------------------------------
+
+/// Marker trait for types that are safe to read/write as raw bytes.
+///
+/// # Safety
+///
+/// Any bit pattern must be a valid, initialized value of `Self`.  This is
+/// required so the byte-level `copy_from_user` / `copy_to_user` paths can
+/// produce a well-formed `T` after copying raw bytes from user space.
+pub unsafe trait Pod: Copy + 'static {}
+
+unsafe impl Pod for u8 {}
+unsafe impl Pod for u16 {}
+unsafe impl Pod for u32 {}
+unsafe impl Pod for u64 {}
+unsafe impl Pod for u128 {}
+unsafe impl Pod for i8 {}
+unsafe impl Pod for i16 {}
+unsafe impl Pod for i32 {}
+unsafe impl Pod for i64 {}
+unsafe impl Pod for i128 {}
+unsafe impl Pod for usize {}
+unsafe impl Pod for isize {}
+unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
+unsafe impl Pod for UserTrapContext {}
+
+// ---------------------------------------------------------------------------
+// KernelPtr<T> and UserPtr<T> — typed address-space wrappers
+// ---------------------------------------------------------------------------
+
+/// A typed pointer into kernel virtual address space.
+///
+/// Prevents accidental use of user-space addresses where kernel addresses
+/// are expected. Constructing a `KernelPtr<T>` is `unsafe` because the
+/// caller must ensure the underlying pointer is valid kernel memory.
+#[repr(transparent)]
+pub struct KernelPtr<T>(*mut T);
+
+impl<T> KernelPtr<T> {
+    /// Wrap a raw kernel pointer.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a valid kernel virtual address that remains live for the
+    /// duration of its use through this `KernelPtr`.
+    pub unsafe fn new(ptr: *mut T) -> Self {
+        Self(ptr)
+    }
+
+    pub fn as_ptr(self) -> *mut T {
+        self.0
+    }
+}
+
+impl<T> Copy for KernelPtr<T> {}
+impl<T> Clone for KernelPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+// SAFETY: same restrictions as *mut T — use is guarded by the caller.
+unsafe impl<T: Send> Send for KernelPtr<T> {}
+unsafe impl<T: Sync> Sync for KernelPtr<T> {}
+
+/// A typed pointer into the current process's user virtual address space.
+///
+/// Prevents accidental use of kernel addresses where user addresses are
+/// expected.  The contained address is interpreted against the currently
+/// installed user page table.
+#[repr(transparent)]
+pub struct UserPtr<T>(*mut T);
+
+impl<T> UserPtr<T> {
+    /// Construct a `UserPtr` from a raw user virtual address.
+    pub fn new(addr: usize) -> Self {
+        Self(addr as *mut T)
+    }
+
+    pub fn addr(self) -> usize {
+        self.0 as usize
+    }
+
+    pub fn as_ptr(self) -> *mut T {
+        self.0
+    }
+}
+
+impl<T> Copy for UserPtr<T> {}
+impl<T> Clone for UserPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> core::fmt::Debug for UserPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("UserPtr").field(&(self.0 as usize)).finish()
+    }
+}
+
+impl<T> PartialEq for UserPtr<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<T> Eq for UserPtr<T> {}
+
+unsafe impl<T: Send> Send for UserPtr<T> {}
+unsafe impl<T: Sync> Sync for UserPtr<T> {}
+
+// ---------------------------------------------------------------------------
+// FixupEntry — describes one faulting-PC range and its recovery label
+// ---------------------------------------------------------------------------
+
+/// Describes a kernel-mode user-access PC range and its recovery stub.
+///
+/// When the trap shell sees a kernel-mode page fault whose `sepc` falls in
+/// `[pc_start, pc_end)`, it redirects execution to `recovery_pc` and places
+/// the fault address in the platform's agreed error register so the recovery
+/// stub can return an `Err(FaultInfo)` to its caller.
+#[repr(C)]
+pub struct FixupEntry {
+    /// First PC (inclusive) of the faulting instruction range.
+    pub pc_start: VirtAddr,
+    /// First PC (exclusive) past the faulting instruction range.
+    pub pc_end: VirtAddr,
+    /// PC of the recovery stub to jump to on fault.
+    pub recovery_pc: VirtAddr,
+}
+
+// ---------------------------------------------------------------------------
+// UserAccessIf
+// ---------------------------------------------------------------------------
+
+pub trait UserAccessIf {
+    /// Copy `len` bytes from user-space address `src` to kernel address `dst`.
+    ///
+    /// Returns `Ok(())` on success, or `Err(FaultInfo)` describing the
+    /// kernel-mode page fault that occurred (callers should propagate as
+    /// `EFAULT`).  The default implementation always returns `Err` for any
+    /// non-zero `len`; platforms override it with architecture-specific
+    /// assembly backed by a fixup table.
+    ///
+    /// # Safety
+    ///
+    /// * `dst` must be a valid, writable kernel pointer for `len` bytes.
+    /// * `src` is interpreted in the currently installed user page table.
+    /// * The platform's fixup table must be fully populated before this is
+    ///   called (guaranteed after `init_early` returns).
+    unsafe fn copy_from_user(
+        dst: KernelPtr<u8>,
+        src: UserPtr<u8>,
+        len: usize,
+    ) -> Result<(), FaultInfo> {
+        let _ = dst;
+        if len == 0 {
+            return Ok(());
+        }
+        Err(FaultInfo {
+            address: VirtAddr(src.addr()),
+            write: false,
+            instruction: false,
+            from_user: false,
+        })
+    }
+
+    /// Copy `len` bytes from kernel address `src` to user-space address `dst`.
+    ///
+    /// Returns `Ok(())` on success, or `Err(FaultInfo)` on kernel-mode fault.
+    ///
+    /// # Safety
+    ///
+    /// * `src` must be a valid, readable kernel pointer for `len` bytes.
+    /// * `dst` is interpreted in the currently installed user page table.
+    unsafe fn copy_to_user(
+        dst: UserPtr<u8>,
+        src: KernelPtr<u8>,
+        len: usize,
+    ) -> Result<(), FaultInfo> {
+        let _ = src;
+        if len == 0 {
+            return Ok(());
+        }
+        Err(FaultInfo {
+            address: VirtAddr(dst.addr()),
+            write: true,
+            instruction: false,
+            from_user: false,
+        })
+    }
+
+    /// Read a `Pod` value from user space.
+    ///
+    /// Implemented via [`copy_from_user`](UserAccessIf::copy_from_user) by
+    /// default; platforms may override for optimized single-instruction paths.
+    ///
+    /// # Safety
+    ///
+    /// `src` is interpreted in the currently installed user page table.
+    unsafe fn read_user<T: Pod>(src: UserPtr<T>) -> Result<T, FaultInfo> {
+        let mut val = core::mem::MaybeUninit::<T>::uninit();
+        // SAFETY: val is valid kernel stack memory; copy_from_user reads into it.
+        unsafe {
+            Self::copy_from_user(
+                KernelPtr::new(val.as_mut_ptr().cast::<u8>()),
+                UserPtr::new(src.addr()),
+                core::mem::size_of::<T>(),
+            )?;
+            Ok(val.assume_init())
+        }
+    }
+
+    /// Write a `Pod` value to user space.
+    ///
+    /// Implemented via [`copy_to_user`](UserAccessIf::copy_to_user) by default.
+    ///
+    /// # Safety
+    ///
+    /// `dst` is interpreted in the currently installed user page table.
+    unsafe fn write_user<T: Pod>(dst: UserPtr<T>, value: T) -> Result<(), FaultInfo> {
+        // SAFETY: value is on the kernel stack and lives for the duration of
+        // copy_to_user; cast_mut is safe because copy_to_user only reads from
+        // the kernel source pointer.
+        unsafe {
+            Self::copy_to_user(
+                UserPtr::new(dst.addr()),
+                KernelPtr::new(core::ptr::addr_of!(value).cast_mut().cast::<u8>()),
+                core::mem::size_of::<T>(),
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SignalFrameIf
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserSigInfoAbi {
+    pub bytes: [u8; 128],
+}
+
+impl UserSigInfoAbi {
+    pub const ZERO: Self = Self { bytes: [0; 128] };
+}
+
+unsafe impl Pod for UserSigInfoAbi {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserSignalMaskAbi {
+    pub bits: u64,
+}
+
+impl UserSignalMaskAbi {
+    pub const EMPTY: Self = Self { bits: 0 };
+}
+
+unsafe impl Pod for UserSignalMaskAbi {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserSaFlagsAbi {
+    pub bits: u64,
+}
+
+impl UserSaFlagsAbi {
+    pub const EMPTY: Self = Self { bits: 0 };
+}
+
+unsafe impl Pod for UserSaFlagsAbi {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalFrameWrite {
+    pub stack_top: UserPtr<u8>,
+    pub sig_no: u32,
+    pub siginfo: UserSigInfoAbi,
+    pub old_mask: UserSignalMaskAbi,
+    pub flags: UserSaFlagsAbi,
+    pub handler_pc: UserPtr<()>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalFramePlacement {
+    pub frame_addr: UserPtr<()>,
+    pub trampoline_pc: UserPtr<()>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SavedSignalFrame {
+    pub saved_mask: UserSignalMaskAbi,
+    pub user_context: UserTrapContext,
+}
+
+unsafe impl Pod for SavedSignalFrame {}
+
+pub trait SignalFrameIf: TrapIf + UserAccessIf {
+    fn write_signal_frame(
+        tf: TrapFrameMut<'_>,
+        setup: SignalFrameWrite,
+    ) -> Result<SignalFramePlacement, FaultInfo> {
+        let _ = tf;
+        Err(FaultInfo {
+            address: VirtAddr(setup.stack_top.addr()),
+            write: true,
+            instruction: false,
+            from_user: false,
+        })
+    }
+
+    fn read_signal_frame(user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
+        Err(FaultInfo {
+            address: VirtAddr(user_sp.addr()),
+            write: false,
+            instruction: false,
+            from_user: false,
+        })
+    }
+
+    fn restore_signal_frame(_tf: TrapFrameMut<'_>, _frame: &SavedSignalFrame) {}
+
+    fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {
+        tf.rewind_pc(4);
+    }
+}
 pub trait IrqIf {
+    const MAX_IRQ: u32 = 0;
+
     fn in_irq_context() -> bool {
         false
     }
 
     fn interrupts_enabled() -> bool {
         true
+    }
+
+    fn claim() -> u32 {
+        0
+    }
+
+    fn complete(_irq: u32) {}
+
+    fn mask(_irq: u32) {}
+
+    fn unmask(_irq: u32) {}
+
+    fn set_priority(_irq: u32, _priority: u8) {}
+
+    fn install_dispatch_table(_table: &'static IrqDispatchTable) {}
+
+    fn dispatch_irq(_irq: u32) -> IrqHandled {
+        IrqHandled::Done
+    }
+}
+
+pub const IRQ_DISPATCH_TABLE_SIZE: usize = 1024;
+
+pub type IrqHandlerFn = fn(irq: u32) -> IrqHandled;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrqHandled {
+    Done,
+    Wake,
+    NotMine,
+}
+
+pub struct IrqDispatchTable {
+    pub entries: [Option<IrqHandlerFn>; IRQ_DISPATCH_TABLE_SIZE],
+}
+
+impl IrqDispatchTable {
+    pub const SIZE: usize = IRQ_DISPATCH_TABLE_SIZE;
+
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; IRQ_DISPATCH_TABLE_SIZE],
+        }
+    }
+}
+
+impl Default for IrqDispatchTable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -761,12 +1200,59 @@ pub trait PercpuIf {
 
     fn install_early_percpu(_cpu_id: CpuId) {}
 
+    fn read_kernel_tls() -> u64 {
+        0
+    }
+
+    fn write_kernel_tls(_value: u64) {}
+
+    /// Install a new kernel stack pointer for the current hart.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `top` points to a valid kernel stack and that no
+    /// live stack references from the old stack are used after this call.
+    unsafe fn install_kernel_stack(_top: VirtAddr) {}
+
     fn pin_current_cpu() -> CpuPinGuard {
         CpuPinGuard::new(Self::current_cpu_id())
     }
 }
-pub trait CacheIf {}
-pub trait DmaIf {}
+pub trait CacheIf {
+    fn fence_all() {}
+
+    fn fence_i_local() {}
+
+    fn fence_i_all() {
+        Self::fence_i_local();
+    }
+
+    fn flush_icache_range(_start: VirtAddr, _len: usize) {
+        Self::fence_i_local();
+    }
+
+    fn dcache_clean_range(_start: PhysAddr, _len: usize) {}
+
+    fn dcache_invalidate_range(_start: PhysAddr, _len: usize) {}
+
+    fn dcache_clean_invalidate_range(_start: PhysAddr, _len: usize) {}
+}
+
+pub trait DmaIf: PlatformConfig {
+    const DMA_COHERENT: bool = <Self as PlatformConfig>::DMA_COHERENT;
+
+    fn phys_to_dma(paddr: PhysAddr) -> DmaAddr {
+        DmaAddr(paddr.0 as u64)
+    }
+
+    fn dma_to_phys(daddr: DmaAddr) -> PhysAddr {
+        PhysAddr(daddr.0 as usize)
+    }
+
+    fn sync_for_device(_paddr: PhysAddr, _len: usize, _dir: DmaDirection) {}
+
+    fn sync_for_cpu(_paddr: PhysAddr, _len: usize, _dir: DmaDirection) {}
+}
 
 pub type SecondaryEntry = unsafe extern "C" fn(cpu_id: usize) -> !;
 
@@ -909,6 +1395,10 @@ pub trait KernelMain<P: TxPlatform> {
 
 pub fn console_write_bytes<P: ConsoleIf>(bytes: &[u8]) {
     P::write_bytes(bytes);
+}
+
+pub fn console_read_bytes<P: ConsoleIf>(buf: &mut [u8]) -> usize {
+    P::read_bytes(buf)
 }
 
 pub fn console_write_str<P: ConsoleIf>(message: &str) {

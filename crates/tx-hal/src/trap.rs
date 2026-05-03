@@ -88,18 +88,25 @@ pub struct TrapFrameView<'a> {
     pub syscall_number: u64,
     pub syscall_args: [u64; 6],
     pub fault_address: Option<VirtAddr>,
+    pub faulting_instruction: Option<VirtAddr>,
     pub previous_mode: TrapPreviousMode,
+    pub interrupts_enabled_before: bool,
+    pub user_tls_register: u64,
     _frame: PhantomData<&'a ()>,
 }
 
 impl<'a> TrapFrameView<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         pc: VirtAddr,
         sp: VirtAddr,
         syscall_number: u64,
         syscall_args: [u64; 6],
         fault_address: Option<VirtAddr>,
+        faulting_instruction: Option<VirtAddr>,
         previous_mode: TrapPreviousMode,
+        interrupts_enabled_before: bool,
+        user_tls_register: u64,
     ) -> Self {
         Self {
             pc,
@@ -107,10 +114,32 @@ impl<'a> TrapFrameView<'a> {
             syscall_number,
             syscall_args,
             fault_address,
+            faulting_instruction,
             previous_mode,
+            interrupts_enabled_before,
+            user_tls_register,
             _frame: PhantomData,
         }
     }
+}
+
+/// Architecture-sized user register image used by signal-frame restore.
+///
+/// The exact meaning of `regs` and `status` is platform-owned. Portable
+/// signal code treats this as an opaque saved context and passes it back to
+/// the selected platform through `SignalFrameIf::restore_signal_frame`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserTrapContext {
+    pub regs: [usize; 32],
+    pub pc: usize,
+    pub status: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalHandlerRegs {
+    pub return_pc: VirtAddr,
+    pub args: [usize; 3],
 }
 
 #[derive(Debug)]
@@ -128,6 +157,10 @@ pub struct TrapFrameMutVtable {
     pub set_syscall_return: fn(NonNull<()>, i64),
     pub set_syscall_error: fn(NonNull<()>, i32),
     pub set_user_tls_register: fn(NonNull<()>, u64),
+    pub capture_user_context: fn(NonNull<()>) -> UserTrapContext,
+    pub restore_user_context: fn(NonNull<()>, &UserTrapContext),
+    pub set_signal_handler_regs: fn(NonNull<()>, SignalHandlerRegs),
+    pub rewind_pc: fn(NonNull<()>, usize),
 }
 
 impl<'a> TrapFrameMut<'a> {
@@ -178,6 +211,39 @@ impl<'a> TrapFrameMut<'a> {
 
     pub fn set_user_tls_register(&mut self, value: u64) {
         (self.vtable.set_user_tls_register)(self.raw, value);
+        self.view.user_tls_register = value;
+    }
+
+    pub fn capture_user_context(&self) -> UserTrapContext {
+        (self.vtable.capture_user_context)(self.raw)
+    }
+
+    pub fn restore_user_context(&mut self, context: &UserTrapContext) {
+        (self.vtable.restore_user_context)(self.raw, context);
+        self.view.pc = VirtAddr(context.pc);
+        self.view.sp = VirtAddr(context.regs[2]);
+        self.view.syscall_number = context.regs[17] as u64;
+        self.view.syscall_args = [
+            context.regs[10] as u64,
+            context.regs[11] as u64,
+            context.regs[12] as u64,
+            context.regs[13] as u64,
+            context.regs[14] as u64,
+            context.regs[15] as u64,
+        ];
+        self.view.user_tls_register = context.regs[4] as u64;
+    }
+
+    pub fn set_signal_handler_regs(&mut self, regs: SignalHandlerRegs) {
+        (self.vtable.set_signal_handler_regs)(self.raw, regs);
+        self.view.syscall_args[0] = regs.args[0] as u64;
+        self.view.syscall_args[1] = regs.args[1] as u64;
+        self.view.syscall_args[2] = regs.args[2] as u64;
+    }
+
+    pub fn rewind_pc(&mut self, bytes: usize) {
+        (self.vtable.rewind_pc)(self.raw, bytes);
+        self.view.pc = VirtAddr(self.view.pc.0.saturating_sub(bytes));
     }
 }
 
@@ -216,6 +282,10 @@ pub trait TrapIf {
     fn install_minimal_trap_vector() {}
 
     fn install_kernel_trap_vector() {}
+
+    fn install_user_trap_vector() {
+        Self::install_kernel_trap_vector();
+    }
 
     fn classify_trap(_snapshot: TrapFrameSnapshot) -> TrapClass {
         TrapClass::UnknownSync
