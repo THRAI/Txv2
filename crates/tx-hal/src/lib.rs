@@ -85,6 +85,16 @@ pub struct BootArg(pub usize);
 pub struct PhysAddr(pub usize);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaAddr(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DmaDirection {
+    ToDevice,
+    FromDevice,
+    Bidirectional,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ppn(pub usize);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,6 +236,38 @@ pub struct PlatformInfo {
     pub possible_cpu_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArchAuxvFacts {
+    pub page_size: usize,
+    pub hwcap: u64,
+    pub hwcap2: u64,
+    pub platform: &'static str,
+}
+
+impl ArchAuxvFacts {
+    pub const fn new(page_size: usize, hwcap: u64, hwcap2: u64, platform: &'static str) -> Self {
+        Self {
+            page_size,
+            hwcap,
+            hwcap2,
+            platform,
+        }
+    }
+}
+
+pub const RISCV_HWCAP_ISA_A: u64 = 1 << (b'A' - b'A');
+pub const RISCV_HWCAP_ISA_C: u64 = 1 << (b'C' - b'A');
+pub const RISCV_HWCAP_ISA_D: u64 = 1 << (b'D' - b'A');
+pub const RISCV_HWCAP_ISA_F: u64 = 1 << (b'F' - b'A');
+pub const RISCV_HWCAP_ISA_I: u64 = 1 << (b'I' - b'A');
+pub const RISCV_HWCAP_ISA_M: u64 = 1 << (b'M' - b'A');
+pub const RISCV_HWCAP_IMAFDC: u64 = RISCV_HWCAP_ISA_I
+    | RISCV_HWCAP_ISA_M
+    | RISCV_HWCAP_ISA_A
+    | RISCV_HWCAP_ISA_F
+    | RISCV_HWCAP_ISA_D
+    | RISCV_HWCAP_ISA_C;
+
 pub trait PlatformConfig {
     const ARCH: Arch;
     const BOARD: &'static str;
@@ -277,9 +319,22 @@ pub trait PlatformInfoIf {
     fn platform_info() -> &'static PlatformInfo;
 }
 
-pub trait AuxvIf {}
+pub trait AuxvIf: PlatformConfig {
+    fn arch_auxv_facts() -> ArchAuxvFacts {
+        let platform = match Self::ARCH {
+            Arch::Riscv64 => "riscv64",
+            Arch::LoongArch64 => "loongarch64",
+        };
+
+        ArchAuxvFacts::new(Self::PAGE_SIZE, 0, 0, platform)
+    }
+}
 pub trait ConsoleIf {
     fn write_bytes(bytes: &[u8]);
+
+    fn read_bytes(_buf: &mut [u8]) -> usize {
+        0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1052,12 +1107,63 @@ pub trait SignalFrameIf: TrapIf + UserAccessIf {
     }
 }
 pub trait IrqIf {
+    const MAX_IRQ: u32 = 0;
+
     fn in_irq_context() -> bool {
         false
     }
 
     fn interrupts_enabled() -> bool {
         true
+    }
+
+    fn claim() -> u32 {
+        0
+    }
+
+    fn complete(_irq: u32) {}
+
+    fn mask(_irq: u32) {}
+
+    fn unmask(_irq: u32) {}
+
+    fn set_priority(_irq: u32, _priority: u8) {}
+
+    fn install_dispatch_table(_table: &'static IrqDispatchTable) {}
+
+    fn dispatch_irq(_irq: u32) -> IrqHandled {
+        IrqHandled::Done
+    }
+}
+
+pub const IRQ_DISPATCH_TABLE_SIZE: usize = 1024;
+
+pub type IrqHandlerFn = fn(irq: u32) -> IrqHandled;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrqHandled {
+    Done,
+    Wake,
+    NotMine,
+}
+
+pub struct IrqDispatchTable {
+    pub entries: [Option<IrqHandlerFn>; IRQ_DISPATCH_TABLE_SIZE],
+}
+
+impl IrqDispatchTable {
+    pub const SIZE: usize = IRQ_DISPATCH_TABLE_SIZE;
+
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; IRQ_DISPATCH_TABLE_SIZE],
+        }
+    }
+}
+
+impl Default for IrqDispatchTable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1094,12 +1200,59 @@ pub trait PercpuIf {
 
     fn install_early_percpu(_cpu_id: CpuId) {}
 
+    fn read_kernel_tls() -> u64 {
+        0
+    }
+
+    fn write_kernel_tls(_value: u64) {}
+
+    /// Install a new kernel stack pointer for the current hart.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `top` points to a valid kernel stack and that no
+    /// live stack references from the old stack are used after this call.
+    unsafe fn install_kernel_stack(_top: VirtAddr) {}
+
     fn pin_current_cpu() -> CpuPinGuard {
         CpuPinGuard::new(Self::current_cpu_id())
     }
 }
-pub trait CacheIf {}
-pub trait DmaIf {}
+pub trait CacheIf {
+    fn fence_all() {}
+
+    fn fence_i_local() {}
+
+    fn fence_i_all() {
+        Self::fence_i_local();
+    }
+
+    fn flush_icache_range(_start: VirtAddr, _len: usize) {
+        Self::fence_i_local();
+    }
+
+    fn dcache_clean_range(_start: PhysAddr, _len: usize) {}
+
+    fn dcache_invalidate_range(_start: PhysAddr, _len: usize) {}
+
+    fn dcache_clean_invalidate_range(_start: PhysAddr, _len: usize) {}
+}
+
+pub trait DmaIf: PlatformConfig {
+    const DMA_COHERENT: bool = <Self as PlatformConfig>::DMA_COHERENT;
+
+    fn phys_to_dma(paddr: PhysAddr) -> DmaAddr {
+        DmaAddr(paddr.0 as u64)
+    }
+
+    fn dma_to_phys(daddr: DmaAddr) -> PhysAddr {
+        PhysAddr(daddr.0 as usize)
+    }
+
+    fn sync_for_device(_paddr: PhysAddr, _len: usize, _dir: DmaDirection) {}
+
+    fn sync_for_cpu(_paddr: PhysAddr, _len: usize, _dir: DmaDirection) {}
+}
 
 pub type SecondaryEntry = unsafe extern "C" fn(cpu_id: usize) -> !;
 
@@ -1242,6 +1395,10 @@ pub trait KernelMain<P: TxPlatform> {
 
 pub fn console_write_bytes<P: ConsoleIf>(bytes: &[u8]) {
     P::write_bytes(bytes);
+}
+
+pub fn console_read_bytes<P: ConsoleIf>(buf: &mut [u8]) -> usize {
+    P::read_bytes(buf)
 }
 
 pub fn console_write_str<P: ConsoleIf>(message: &str) {

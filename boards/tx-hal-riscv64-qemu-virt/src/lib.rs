@@ -3,7 +3,8 @@
 #[cfg(test)]
 extern crate std;
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 mod boot_static;
 mod dtb;
@@ -20,12 +21,12 @@ use boot_static::{
 use dtb::parse_boot_info_from_fdt;
 use pmap::topology as pmap_topology;
 use tx_hal::{
-    AllocError, Arch, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf, BootPlatformIf,
-    BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaIf, InitIf, IpiKind,
-    IrqIf, MemoryRegion, MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
-    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry,
-    SmpIf, TimeIf,
+    AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
+    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaAddr,
+    DmaDirection, DmaIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, MemoryRegion,
+    MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError,
+    PmapIf, PmapInvalidation, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
+    PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry, SmpIf, TimeIf, VirtAddr,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -202,6 +203,13 @@ tx_rv64_qemu_secondary_start:
     j 9b
     .size tx_rv64_qemu_secondary_start, . - tx_rv64_qemu_secondary_start
 
+    .globl tx_rv64_qemu_install_kernel_stack
+    .type tx_rv64_qemu_install_kernel_stack, @function
+tx_rv64_qemu_install_kernel_stack:
+    mv sp, a0
+    ret
+    .size tx_rv64_qemu_install_kernel_stack, . - tx_rv64_qemu_install_kernel_stack
+
 7:
     wfi
     j 7b
@@ -214,8 +222,64 @@ pub struct Platform;
 const QEMU_VIRT_RAM_BASE: usize = 0x8000_0000;
 const QEMU_VIRT_FALLBACK_RAM_SIZE: usize = 256 * 1024 * 1024;
 const MAX_BOOT_CPUS: usize = 4;
+#[cfg(target_arch = "riscv64")]
+const PLIC_PHYS_BASE: usize = 0x0c00_0000;
+#[cfg(target_arch = "riscv64")]
+const PLIC_BASE: usize = pmap_topology::DIRECT_MAP_BASE + PLIC_PHYS_BASE;
+const PLIC_MAX_IRQ: u32 = tx_hal::IRQ_DISPATCH_TABLE_SIZE as u32;
+#[cfg(all(not(target_arch = "riscv64"), test))]
+const PLIC_IRQ_SOURCES: usize = tx_hal::IRQ_DISPATCH_TABLE_SIZE;
+#[cfg(all(not(target_arch = "riscv64"), test))]
+const PLIC_ENABLE_WORDS: usize = PLIC_IRQ_SOURCES / u32::BITS as usize;
+const PLIC_PRIORITY_BASE: usize = 0x0;
+const PLIC_ENABLE_BASE: usize = 0x2000;
+const PLIC_ENABLE_CONTEXT_STRIDE: usize = 0x80;
+const PLIC_CONTEXT_BASE: usize = 0x20_0000;
+const PLIC_CONTEXT_STRIDE: usize = 0x1000;
+const PLIC_CLAIM_COMPLETE: usize = 0x4;
 static ONLINE_CPUS: AtomicU64 = AtomicU64::new(0);
 static IPI_ACKED_CPUS: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_IRQ_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static INSTALLED_IRQ_TABLE: AtomicPtr<IrqDispatchTable> = AtomicPtr::new(core::ptr::null_mut());
+
+#[repr(C, align(64))]
+pub struct Rv64PerCpuArea {
+    cpu_id: usize,
+    kernel_stack_top: AtomicUsize,
+    irq_depth: AtomicUsize,
+}
+
+impl Rv64PerCpuArea {
+    pub const fn new(cpu_id: usize) -> Self {
+        Self {
+            cpu_id,
+            kernel_stack_top: AtomicUsize::new(0),
+            irq_depth: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn cpu_id(&self) -> CpuId {
+        CpuId(self.cpu_id)
+    }
+
+    pub fn kernel_stack_top(&self) -> VirtAddr {
+        VirtAddr(self.kernel_stack_top.load(Ordering::Acquire))
+    }
+
+    pub fn irq_depth(&self) -> usize {
+        self.irq_depth.load(Ordering::Acquire)
+    }
+}
+
+static RV64_PERCPU_AREAS: [Rv64PerCpuArea; MAX_BOOT_CPUS] = [
+    Rv64PerCpuArea::new(0),
+    Rv64PerCpuArea::new(1),
+    Rv64PerCpuArea::new(2),
+    Rv64PerCpuArea::new(3),
+];
+
+#[cfg(not(target_arch = "riscv64"))]
+static HOST_KERNEL_TLS: AtomicUsize = AtomicUsize::new(0);
 
 impl PlatformConfig for Platform {
     const ARCH: Arch = Arch::Riscv64;
@@ -274,7 +338,11 @@ impl PlatformInfoIf for Platform {
     }
 }
 
-impl AuxvIf for Platform {}
+impl AuxvIf for Platform {
+    fn arch_auxv_facts() -> ArchAuxvFacts {
+        ArchAuxvFacts::new(Self::PAGE_SIZE, tx_hal::RISCV_HWCAP_IMAFDC, 0, "riscv64")
+    }
+}
 impl ConsoleIf for Platform {
     fn write_bytes(bytes: &[u8]) {
         #[cfg(target_arch = "riscv64")]
@@ -286,6 +354,10 @@ impl ConsoleIf for Platform {
 
         #[cfg(not(target_arch = "riscv64"))]
         let _ = bytes;
+    }
+
+    fn read_bytes(buf: &mut [u8]) -> usize {
+        read_sbi_console_bytes(buf)
     }
 }
 impl PmapIf for Platform {
@@ -400,7 +472,67 @@ impl PmapIf for Platform {
         remote_sfence_vma_asid(asid, invalidation);
     }
 }
-impl IrqIf for Platform {}
+impl IrqIf for Platform {
+    const MAX_IRQ: u32 = PLIC_MAX_IRQ;
+
+    fn in_irq_context() -> bool {
+        irq_context_depth() != 0
+    }
+
+    fn interrupts_enabled() -> bool {
+        supervisor_interrupts_enabled()
+    }
+
+    fn claim() -> u32 {
+        plic_claim(current_plic_context())
+    }
+
+    fn complete(irq: u32) {
+        if valid_plic_irq(irq) {
+            plic_complete(current_plic_context(), irq);
+        }
+    }
+
+    fn mask(irq: u32) {
+        if valid_plic_irq(irq) {
+            plic_set_enabled(current_plic_context(), irq, false);
+        }
+    }
+
+    fn unmask(irq: u32) {
+        if valid_plic_irq(irq) {
+            plic_set_enabled(current_plic_context(), irq, true);
+        }
+    }
+
+    fn set_priority(irq: u32, priority: u8) {
+        if valid_plic_irq(irq) {
+            plic_set_priority(irq, priority);
+        }
+    }
+
+    fn install_dispatch_table(table: &'static IrqDispatchTable) {
+        INSTALLED_IRQ_TABLE.store(
+            table as *const IrqDispatchTable as *mut _,
+            Ordering::Release,
+        );
+    }
+
+    fn dispatch_irq(irq: u32) -> IrqHandled {
+        if !valid_plic_irq(irq) {
+            return IrqHandled::Done;
+        }
+
+        if let Some(table) = installed_irq_table() {
+            if let Some(handler) = table.entries[irq as usize] {
+                return handler(irq);
+            }
+        }
+
+        Self::mask(irq);
+        IrqHandled::Done
+    }
+}
 impl TimeIf for Platform {
     fn read_ns() -> u64 {
         time::read_ns(Self::frequency_hz())
@@ -430,9 +562,58 @@ impl PercpuIf for Platform {
     fn install_early_percpu(cpu_id: CpuId) {
         install_early_percpu(cpu_id);
     }
+
+    fn read_kernel_tls() -> u64 {
+        read_kernel_tls() as u64
+    }
+
+    fn write_kernel_tls(value: u64) {
+        write_kernel_tls(value as usize);
+    }
+
+    unsafe fn install_kernel_stack(top: VirtAddr) {
+        unsafe { install_kernel_stack(top) };
+    }
 }
-impl CacheIf for Platform {}
-impl DmaIf for Platform {}
+impl CacheIf for Platform {
+    fn fence_all() {
+        rv64_fence_all();
+    }
+
+    fn fence_i_local() {
+        rv64_fence_i();
+    }
+
+    fn fence_i_all() {
+        rv64_remote_fence_i();
+    }
+
+    fn flush_icache_range(_start: VirtAddr, _len: usize) {
+        rv64_fence_i();
+    }
+
+    fn dcache_clean_range(_start: PhysAddr, _len: usize) {}
+
+    fn dcache_invalidate_range(_start: PhysAddr, _len: usize) {}
+
+    fn dcache_clean_invalidate_range(_start: PhysAddr, _len: usize) {}
+}
+
+impl DmaIf for Platform {
+    const DMA_COHERENT: bool = true;
+
+    fn phys_to_dma(paddr: PhysAddr) -> DmaAddr {
+        DmaAddr(paddr.0 as u64)
+    }
+
+    fn dma_to_phys(daddr: DmaAddr) -> PhysAddr {
+        PhysAddr(daddr.0 as usize)
+    }
+
+    fn sync_for_device(_paddr: PhysAddr, _len: usize, _dir: DmaDirection) {}
+
+    fn sync_for_cpu(_paddr: PhysAddr, _len: usize, _dir: DmaDirection) {}
+}
 impl SmpIf for Platform {
     fn current_cpu_id() -> CpuId {
         current_cpu_id()
@@ -537,29 +718,334 @@ impl PowerIf for Platform {
 }
 
 fn current_cpu_id() -> CpuId {
-    #[cfg(target_arch = "riscv64")]
-    {
-        let cpu_id: usize;
-        unsafe {
-            core::arch::asm!("mv {cpu_id}, tp", cpu_id = out(reg) cpu_id, options(nomem, nostack));
+    let kernel_tls = read_kernel_tls();
+    cpu_id_from_kernel_tls(kernel_tls).unwrap_or_else(|| {
+        if kernel_tls < MAX_BOOT_CPUS {
+            CpuId(kernel_tls)
+        } else {
+            CpuId(0)
         }
-        CpuId(cpu_id)
-    }
-
-    #[cfg(not(target_arch = "riscv64"))]
-    {
-        CpuId(0)
-    }
+    })
 }
 
 fn install_early_percpu(cpu_id: CpuId) {
+    let kernel_tls = percpu_tls_for_cpu(cpu_id).unwrap_or(cpu_id.0);
+    write_kernel_tls(kernel_tls);
+}
+
+fn read_kernel_tls() -> usize {
     #[cfg(target_arch = "riscv64")]
-    unsafe {
-        core::arch::asm!("mv tp, {cpu_id}", cpu_id = in(reg) cpu_id.0, options(nomem, nostack));
+    {
+        let kernel_tls: usize;
+        unsafe {
+            core::arch::asm!(
+                "mv {kernel_tls}, tp",
+                kernel_tls = out(reg) kernel_tls,
+                options(nomem, nostack)
+            );
+        }
+        kernel_tls
     }
 
     #[cfg(not(target_arch = "riscv64"))]
-    let _ = cpu_id;
+    {
+        HOST_KERNEL_TLS.load(Ordering::Acquire)
+    }
+}
+
+fn write_kernel_tls(value: usize) {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("mv tp, {value}", value = in(reg) value, options(nomem, nostack));
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        HOST_KERNEL_TLS.store(value, Ordering::Release);
+    }
+}
+
+unsafe fn install_kernel_stack(top: VirtAddr) {
+    record_kernel_stack_top(top);
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        tx_rv64_qemu_install_kernel_stack(top.0);
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = top;
+}
+
+#[cfg(target_arch = "riscv64")]
+extern "C" {
+    fn tx_rv64_qemu_install_kernel_stack(top: usize);
+}
+
+fn record_kernel_stack_top(top: VirtAddr) {
+    if let Some(cpu) = cpu_id_from_kernel_tls(read_kernel_tls()) {
+        RV64_PERCPU_AREAS[cpu.0]
+            .kernel_stack_top
+            .store(top.0, Ordering::Release);
+    }
+}
+
+fn percpu_tls_for_cpu(cpu_id: CpuId) -> Option<usize> {
+    RV64_PERCPU_AREAS
+        .get(cpu_id.0)
+        .map(|area| area as *const Rv64PerCpuArea as usize)
+}
+
+fn cpu_id_from_kernel_tls(kernel_tls: usize) -> Option<CpuId> {
+    let base = RV64_PERCPU_AREAS.as_ptr() as usize;
+    let stride = core::mem::size_of::<Rv64PerCpuArea>();
+    let end = base.checked_add(stride.checked_mul(RV64_PERCPU_AREAS.len())?)?;
+
+    if kernel_tls < base || kernel_tls >= end {
+        return None;
+    }
+
+    let offset = kernel_tls - base;
+    if offset % stride != 0 {
+        return None;
+    }
+
+    let cpu = offset / stride;
+    Some(RV64_PERCPU_AREAS[cpu].cpu_id())
+}
+
+fn installed_irq_table() -> Option<&'static IrqDispatchTable> {
+    let ptr = INSTALLED_IRQ_TABLE.load(Ordering::Acquire);
+    NonNull::new(ptr).map(|ptr| unsafe { ptr.as_ref() })
+}
+
+fn valid_plic_irq(irq: u32) -> bool {
+    irq != 0 && irq < PLIC_MAX_IRQ
+}
+
+fn current_plic_context() -> usize {
+    plic_context_for_cpu(current_cpu_id())
+}
+
+fn plic_context_for_cpu(cpu: CpuId) -> usize {
+    cpu.0.saturating_mul(2).saturating_add(1)
+}
+
+fn plic_priority_offset(irq: u32) -> usize {
+    PLIC_PRIORITY_BASE + irq as usize * core::mem::size_of::<u32>()
+}
+
+fn plic_enable_word_offset(context: usize, word: usize) -> usize {
+    PLIC_ENABLE_BASE + context * PLIC_ENABLE_CONTEXT_STRIDE + word * core::mem::size_of::<u32>()
+}
+
+fn plic_claim_complete_offset(context: usize) -> usize {
+    PLIC_CONTEXT_BASE + context * PLIC_CONTEXT_STRIDE + PLIC_CLAIM_COMPLETE
+}
+
+fn plic_set_priority(irq: u32, priority: u8) {
+    plic_write_u32(plic_priority_offset(irq), u32::from(priority));
+}
+
+fn plic_claim(context: usize) -> u32 {
+    plic_read_u32(plic_claim_complete_offset(context))
+}
+
+fn plic_complete(context: usize, irq: u32) {
+    plic_write_u32(plic_claim_complete_offset(context), irq);
+}
+
+fn plic_set_enabled(context: usize, irq: u32, enabled: bool) {
+    let word = irq as usize / u32::BITS as usize;
+    let bit = irq as usize % u32::BITS as usize;
+    let offset = plic_enable_word_offset(context, word);
+    let mask = 1u32 << bit;
+    let current = plic_read_u32(offset);
+    let next = if enabled {
+        current | mask
+    } else {
+        current & !mask
+    };
+    plic_write_u32(offset, next);
+}
+
+#[cfg(target_arch = "riscv64")]
+fn plic_read_u32(offset: usize) -> u32 {
+    unsafe { ((PLIC_BASE + offset) as *const u32).read_volatile() }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn plic_write_u32(offset: usize, value: u32) {
+    unsafe { ((PLIC_BASE + offset) as *mut u32).write_volatile(value) };
+}
+
+#[cfg(all(not(target_arch = "riscv64"), not(test)))]
+fn plic_read_u32(_offset: usize) -> u32 {
+    0
+}
+
+#[cfg(all(not(target_arch = "riscv64"), not(test)))]
+fn plic_write_u32(_offset: usize, _value: u32) {}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+fn plic_read_u32(offset: usize) -> u32 {
+    HOST_PLIC_STATE
+        .lock()
+        .expect("host plic state")
+        .read_u32(offset)
+}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+fn plic_write_u32(offset: usize, value: u32) {
+    HOST_PLIC_STATE
+        .lock()
+        .expect("host plic state")
+        .write_u32(offset, value);
+}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+struct HostPlicState {
+    priorities: [u32; PLIC_IRQ_SOURCES],
+    enables: [[u32; PLIC_ENABLE_WORDS]; MAX_BOOT_CPUS * 2],
+    claim_complete: [u32; MAX_BOOT_CPUS * 2],
+}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+impl HostPlicState {
+    const fn new() -> Self {
+        Self {
+            priorities: [0; PLIC_IRQ_SOURCES],
+            enables: [[0; PLIC_ENABLE_WORDS]; MAX_BOOT_CPUS * 2],
+            claim_complete: [0; MAX_BOOT_CPUS * 2],
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn read_u32(&self, offset: usize) -> u32 {
+        if offset < PLIC_ENABLE_BASE {
+            let irq = (offset - PLIC_PRIORITY_BASE) / core::mem::size_of::<u32>();
+            return self.priorities.get(irq).copied().unwrap_or(0);
+        }
+
+        if (PLIC_ENABLE_BASE..PLIC_CONTEXT_BASE).contains(&offset) {
+            let rel = offset - PLIC_ENABLE_BASE;
+            let context = rel / PLIC_ENABLE_CONTEXT_STRIDE;
+            let word = (rel % PLIC_ENABLE_CONTEXT_STRIDE) / core::mem::size_of::<u32>();
+            return self
+                .enables
+                .get(context)
+                .and_then(|words| words.get(word))
+                .copied()
+                .unwrap_or(0);
+        }
+
+        if offset >= PLIC_CONTEXT_BASE {
+            let rel = offset - PLIC_CONTEXT_BASE;
+            let context = rel / PLIC_CONTEXT_STRIDE;
+            let context_offset = rel % PLIC_CONTEXT_STRIDE;
+            if context_offset == PLIC_CLAIM_COMPLETE {
+                return self.claim_complete.get(context).copied().unwrap_or(0);
+            }
+        }
+
+        0
+    }
+
+    fn write_u32(&mut self, offset: usize, value: u32) {
+        if offset < PLIC_ENABLE_BASE {
+            let irq = (offset - PLIC_PRIORITY_BASE) / core::mem::size_of::<u32>();
+            if let Some(priority) = self.priorities.get_mut(irq) {
+                *priority = value;
+            }
+            return;
+        }
+
+        if (PLIC_ENABLE_BASE..PLIC_CONTEXT_BASE).contains(&offset) {
+            let rel = offset - PLIC_ENABLE_BASE;
+            let context = rel / PLIC_ENABLE_CONTEXT_STRIDE;
+            let word = (rel % PLIC_ENABLE_CONTEXT_STRIDE) / core::mem::size_of::<u32>();
+            if let Some(enable_word) = self
+                .enables
+                .get_mut(context)
+                .and_then(|words| words.get_mut(word))
+            {
+                *enable_word = value;
+            }
+            return;
+        }
+
+        if offset >= PLIC_CONTEXT_BASE {
+            let rel = offset - PLIC_CONTEXT_BASE;
+            let context = rel / PLIC_CONTEXT_STRIDE;
+            let context_offset = rel % PLIC_CONTEXT_STRIDE;
+            if context_offset == PLIC_CLAIM_COMPLETE {
+                if let Some(claim_complete) = self.claim_complete.get_mut(context) {
+                    *claim_complete = value;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+static HOST_PLIC_STATE: std::sync::Mutex<HostPlicState> =
+    std::sync::Mutex::new(HostPlicState::new());
+
+pub(crate) struct IrqContextGuard {
+    depth: &'static AtomicUsize,
+}
+
+impl Drop for IrqContextGuard {
+    fn drop(&mut self) {
+        let previous = self
+            .depth
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+                Some(depth.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        debug_assert!(previous > 0);
+    }
+}
+
+pub(crate) fn enter_irq_context() -> IrqContextGuard {
+    let depth = current_irq_depth_cell();
+    depth.fetch_add(1, Ordering::AcqRel);
+    IrqContextGuard { depth }
+}
+
+fn irq_context_depth() -> usize {
+    current_irq_depth_cell().load(Ordering::Acquire)
+}
+
+fn current_irq_depth_cell() -> &'static AtomicUsize {
+    current_percpu_area()
+        .map(|area| &area.irq_depth)
+        .unwrap_or(&FALLBACK_IRQ_DEPTH)
+}
+
+fn current_percpu_area() -> Option<&'static Rv64PerCpuArea> {
+    let cpu = cpu_id_from_kernel_tls(read_kernel_tls())?;
+    RV64_PERCPU_AREAS.get(cpu.0)
+}
+
+fn supervisor_interrupts_enabled() -> bool {
+    #[cfg(target_arch = "riscv64")]
+    {
+        const RV64_SSTATUS_SIE: usize = 1 << 1;
+        let sstatus: usize;
+        unsafe {
+            core::arch::asm!("csrr {sstatus}, sstatus", sstatus = out(reg) sstatus, options(nomem, nostack));
+        }
+        sstatus & RV64_SSTATUS_SIE != 0
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        true
+    }
 }
 
 fn enable_supervisor_software_interrupts() {
@@ -694,6 +1180,35 @@ fn send_sbi_ipi(mask: CpuMask) {
     let _ = mask;
 }
 
+fn rv64_fence_all() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", "fence.i", options(nostack));
+    }
+}
+
+fn rv64_fence_i() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence.i", options(nomem, nostack));
+    }
+}
+
+fn rv64_remote_fence_i() {
+    rv64_fence_i();
+
+    let targets = remote_sfence_targets();
+    if targets.is_empty() {
+        return;
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let error = sbi_remote_fence_i(targets.bits(), 0);
+        assert_eq!(error, 0, "SBI remote fence.i failed");
+    }
+}
+
 fn clear_supervisor_software_interrupt() {
     #[cfg(target_arch = "riscv64")]
     unsafe {
@@ -711,6 +1226,42 @@ fn sbi_console_putchar(byte: u8) {
             options(nostack)
         );
     }
+}
+
+fn read_sbi_console_bytes(buf: &mut [u8]) -> usize {
+    let mut read = 0;
+    for byte in buf {
+        let Some(next) = sbi_console_getchar() else {
+            break;
+        };
+        *byte = next;
+        read += 1;
+    }
+    read
+}
+
+#[cfg(target_arch = "riscv64")]
+fn sbi_console_getchar() -> Option<u8> {
+    let value: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            lateout("a0") value,
+            in("a7") 2usize,
+            options(nostack)
+        );
+    }
+
+    if value < 0 {
+        None
+    } else {
+        Some(value as u8)
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn sbi_console_getchar() -> Option<u8> {
+    None
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -741,6 +1292,23 @@ fn sbi_send_ipi(hart_mask: u64, hart_mask_base: usize) -> isize {
             in("a1") hart_mask_base,
             in("a6") 0usize,
             in("a7") 0x735049usize,
+            lateout("a1") _,
+            options(nostack)
+        );
+    }
+    error
+}
+
+#[cfg(target_arch = "riscv64")]
+fn sbi_remote_fence_i(hart_mask: u64, hart_mask_base: usize) -> isize {
+    let error: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") hart_mask as usize => error,
+            in("a1") hart_mask_base,
+            in("a6") 0usize,
+            in("a7") 0x52464e43usize,
             lateout("a1") _,
             options(nostack)
         );
@@ -885,20 +1453,34 @@ fn reserve_firmware_loader_region(
 #[cfg(test)]
 mod tests {
     use tx_hal::{
-        CpuId, CpuMask, FaultInfo, IpiKind, KernelTrapSink, SmpIf, TrapAction, TrapClass,
-        TrapFrameMut, TrapFrameSnapshot, TrapIf, TrapPreviousMode, VirtAddr,
+        AuxvIf, CacheIf, ConsoleIf, CpuId, CpuMask, DmaAddr, DmaDirection, DmaIf, FaultInfo,
+        IpiKind, IrqDispatchTable, IrqHandled, IrqIf, KernelTrapSink, PercpuIf, PhysAddr, SmpIf,
+        TrapAction, TrapClass, TrapFrameMut, TrapFrameSnapshot, TrapIf, TrapPreviousMode, VirtAddr,
     };
 
     use crate::{
-        dispatch_trap_frame, mark_ipi_ack, remote_sfence_targets_from, trap::classify_rv64_trap,
-        Platform, Rv64TrapFrame,
+        dispatch_trap_frame, enter_irq_context, mark_ipi_ack, percpu_tls_for_cpu,
+        remote_sfence_targets_from, trap::classify_rv64_trap, Platform, Rv64TrapFrame,
+        RV64_PERCPU_AREAS,
     };
+
+    static RV64_HAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static IRQ_HANDLER_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn wake_irq_handler(irq: u32) -> IrqHandled {
+        assert_eq!(irq, 8);
+        IRQ_HANDLER_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        IrqHandled::Wake
+    }
 
     struct RecordingTrapSink;
 
     impl KernelTrapSink<Platform> for RecordingTrapSink {
         fn on_page_fault(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction {
             assert_eq!(view.view().previous_mode, TrapPreviousMode::User);
+            assert_eq!(view.view().fault_address, Some(VirtAddr(0xfeed_cafe)));
+            assert_eq!(view.view().faulting_instruction, Some(VirtAddr(0x3000)));
             assert_eq!(fault.address, VirtAddr(0xfeed_cafe));
             assert!(fault.write);
             assert!(!fault.instruction);
@@ -914,14 +1496,17 @@ mod tests {
         }
 
         fn on_timer_interrupt(_cpu: CpuId) -> TrapAction {
+            assert!(<Platform as IrqIf>::in_irq_context());
             TrapAction::Reschedule
         }
 
         fn on_external_irq(_cpu: CpuId) -> TrapAction {
+            assert!(<Platform as IrqIf>::in_irq_context());
             TrapAction::Resume
         }
 
         fn on_ipi(_cpu: CpuId) -> TrapAction {
+            assert!(<Platform as IrqIf>::in_irq_context());
             TrapAction::Resume
         }
 
@@ -1062,6 +1647,268 @@ mod tests {
     }
 
     #[test]
+    fn percpu_install_sets_kernel_tls_pointer_and_current_cpu() {
+        let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+        let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+
+        <Platform as PercpuIf>::install_early_percpu(CpuId(2));
+
+        let kernel_tls = <Platform as PercpuIf>::read_kernel_tls() as usize;
+        assert_eq!(Some(kernel_tls), percpu_tls_for_cpu(CpuId(2)));
+        assert_eq!(<Platform as PercpuIf>::current_cpu_id(), CpuId(2));
+        assert_eq!(<Platform as SmpIf>::current_cpu_id(), CpuId(2));
+
+        <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "riscv64"))]
+    fn percpu_install_kernel_stack_records_stack_top() {
+        let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+        let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+
+        <Platform as PercpuIf>::install_early_percpu(CpuId(1));
+        unsafe {
+            <Platform as PercpuIf>::install_kernel_stack(VirtAddr(0x8000_4000));
+        }
+
+        assert_eq!(
+            RV64_PERCPU_AREAS[1].kernel_stack_top(),
+            VirtAddr(0x8000_4000)
+        );
+
+        <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+    }
+
+    #[test]
+    fn irq_context_guard_tracks_nested_interrupt_depth() {
+        let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+        let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+
+        <Platform as PercpuIf>::install_early_percpu(CpuId(3));
+        assert!(!<Platform as IrqIf>::in_irq_context());
+
+        {
+            let _outer = enter_irq_context();
+            assert!(<Platform as IrqIf>::in_irq_context());
+            assert_eq!(RV64_PERCPU_AREAS[3].irq_depth(), 1);
+
+            {
+                let _inner = enter_irq_context();
+                assert!(<Platform as IrqIf>::in_irq_context());
+                assert_eq!(RV64_PERCPU_AREAS[3].irq_depth(), 2);
+            }
+
+            assert!(<Platform as IrqIf>::in_irq_context());
+            assert_eq!(RV64_PERCPU_AREAS[3].irq_depth(), 1);
+        }
+
+        assert!(!<Platform as IrqIf>::in_irq_context());
+        assert_eq!(RV64_PERCPU_AREAS[3].irq_depth(), 0);
+
+        <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "riscv64"))]
+    fn plic_priority_enable_claim_and_complete_use_current_context() {
+        let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+        let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+        super::HOST_PLIC_STATE
+            .lock()
+            .expect("host plic state")
+            .reset();
+
+        <Platform as PercpuIf>::install_early_percpu(CpuId(1));
+        let context = super::plic_context_for_cpu(CpuId(1));
+
+        <Platform as IrqIf>::set_priority(8, 3);
+        assert_eq!(
+            super::HOST_PLIC_STATE
+                .lock()
+                .expect("host plic state")
+                .read_u32(super::plic_priority_offset(8)),
+            3
+        );
+
+        <Platform as IrqIf>::unmask(8);
+        let enable_offset = super::plic_enable_word_offset(context, 0);
+        assert_ne!(
+            super::HOST_PLIC_STATE
+                .lock()
+                .expect("host plic state")
+                .read_u32(enable_offset)
+                & (1 << 8),
+            0
+        );
+
+        super::HOST_PLIC_STATE
+            .lock()
+            .expect("host plic state")
+            .write_u32(super::plic_claim_complete_offset(context), 8);
+        assert_eq!(<Platform as IrqIf>::claim(), 8);
+
+        <Platform as IrqIf>::complete(8);
+        assert_eq!(
+            super::HOST_PLIC_STATE
+                .lock()
+                .expect("host plic state")
+                .read_u32(super::plic_claim_complete_offset(context)),
+            8
+        );
+
+        <Platform as IrqIf>::mask(8);
+        assert_eq!(
+            super::HOST_PLIC_STATE
+                .lock()
+                .expect("host plic state")
+                .read_u32(enable_offset)
+                & (1 << 8),
+            0
+        );
+
+        <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "riscv64"))]
+    fn plic_dispatch_table_invokes_handler_and_masks_unhandled_irq() {
+        let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+        let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+        super::HOST_PLIC_STATE
+            .lock()
+            .expect("host plic state")
+            .reset();
+        IRQ_HANDLER_COUNT.store(0, std::sync::atomic::Ordering::Release);
+
+        <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+        let context = super::plic_context_for_cpu(CpuId(0));
+        let mut table = IrqDispatchTable::new();
+        table.entries[8] = Some(wake_irq_handler);
+        let table = std::boxed::Box::leak(std::boxed::Box::new(table));
+        <Platform as IrqIf>::install_dispatch_table(table);
+
+        assert_eq!(<Platform as IrqIf>::dispatch_irq(8), IrqHandled::Wake);
+        assert_eq!(
+            IRQ_HANDLER_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+
+        <Platform as IrqIf>::unmask(9);
+        let enable_offset = super::plic_enable_word_offset(context, 0);
+        assert_ne!(
+            super::HOST_PLIC_STATE
+                .lock()
+                .expect("host plic state")
+                .read_u32(enable_offset)
+                & (1 << 9),
+            0
+        );
+
+        assert_eq!(<Platform as IrqIf>::dispatch_irq(9), IrqHandled::Done);
+        assert_eq!(
+            super::HOST_PLIC_STATE
+                .lock()
+                .expect("host plic state")
+                .read_u32(enable_offset)
+                & (1 << 9),
+            0
+        );
+
+        <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+    }
+
+    #[test]
+    fn cache_methods_are_callable_on_qemu_coherent_platform() {
+        <Platform as CacheIf>::fence_all();
+        <Platform as CacheIf>::fence_i_local();
+        <Platform as CacheIf>::fence_i_all();
+        <Platform as CacheIf>::flush_icache_range(VirtAddr(0x8020_0000), 4096);
+        <Platform as CacheIf>::dcache_clean_range(PhysAddr(0x8020_0000), 4096);
+        <Platform as CacheIf>::dcache_invalidate_range(PhysAddr(0x8020_0000), 4096);
+        <Platform as CacheIf>::dcache_clean_invalidate_range(PhysAddr(0x8020_0000), 4096);
+    }
+
+    #[test]
+    fn dma_identity_mapping_and_sync_are_qemu_coherent() {
+        assert!(<Platform as DmaIf>::DMA_COHERENT);
+        assert_eq!(
+            <Platform as DmaIf>::phys_to_dma(PhysAddr(0x8020_1000)),
+            DmaAddr(0x8020_1000)
+        );
+        assert_eq!(
+            <Platform as DmaIf>::dma_to_phys(DmaAddr(0x8020_2000)),
+            PhysAddr(0x8020_2000)
+        );
+
+        <Platform as DmaIf>::sync_for_device(PhysAddr(0x8020_3000), 512, DmaDirection::ToDevice);
+        <Platform as DmaIf>::sync_for_cpu(PhysAddr(0x8020_3000), 512, DmaDirection::FromDevice);
+        <Platform as DmaIf>::sync_for_device(
+            PhysAddr(0x8020_3000),
+            512,
+            DmaDirection::Bidirectional,
+        );
+        <Platform as DmaIf>::sync_for_cpu(PhysAddr(0x8020_3000), 512, DmaDirection::Bidirectional);
+    }
+
+    #[test]
+    fn auxv_facts_publish_riscv64_platform_and_hwcap() {
+        let facts = <Platform as AuxvIf>::arch_auxv_facts();
+
+        assert_eq!(
+            facts.page_size,
+            <Platform as tx_hal::PlatformConfig>::PAGE_SIZE
+        );
+        assert_eq!(facts.hwcap, tx_hal::RISCV_HWCAP_IMAFDC);
+        assert_eq!(facts.hwcap2, 0);
+        assert_eq!(facts.platform, "riscv64");
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "riscv64"))]
+    fn console_read_bytes_is_nonblocking_when_host_has_no_sbi_input() {
+        let mut buf = [0xaa; 4];
+
+        assert_eq!(<Platform as ConsoleIf>::read_bytes(&mut buf), 0);
+        assert_eq!(tx_hal::console_read_bytes::<Platform>(&mut buf), 0);
+        assert_eq!(buf, [0xaa; 4]);
+    }
+
+    #[test]
+    fn trap_frame_view_projects_rv64_trap_metadata() {
+        let mut frame = test_trap_frame(15, 0x3000, 0xfeed_cafe);
+        frame.sstatus &= !(1 << 8);
+        frame.sstatus |= 1 << 5;
+        frame.x[2] = 0x7000;
+        frame.x[4] = 0x1234_5678;
+
+        let view = frame.view();
+
+        assert_eq!(view.pc, VirtAddr(0x3000));
+        assert_eq!(view.sp, VirtAddr(0x7000));
+        assert_eq!(view.fault_address, Some(VirtAddr(0xfeed_cafe)));
+        assert_eq!(view.faulting_instruction, Some(VirtAddr(0x3000)));
+        assert_eq!(view.previous_mode, TrapPreviousMode::User);
+        assert!(view.interrupts_enabled_before);
+        assert_eq!(view.user_tls_register, 0x1234_5678);
+    }
+
+    #[test]
+    fn trap_frame_view_omits_fault_fields_for_interrupts_and_syscalls() {
+        let interrupt_bit = 1usize << (usize::BITS as usize - 1);
+
+        let syscall = test_trap_frame(8, 0x1000, 0xaaaa);
+        let syscall_view = syscall.view();
+        assert_eq!(syscall_view.fault_address, None);
+        assert_eq!(syscall_view.faulting_instruction, Some(VirtAddr(0x1000)));
+
+        let interrupt = test_trap_frame(interrupt_bit | 5, 0x2000, 0xbbbb);
+        let interrupt_view = interrupt.view();
+        assert_eq!(interrupt_view.fault_address, None);
+        assert_eq!(interrupt_view.faulting_instruction, None);
+    }
+
+    #[test]
     fn trap_frame_view_projects_syscall_fields() {
         let mut frame = test_trap_frame(8, 0x1000, 0);
         frame.x[10] = 1;
@@ -1092,6 +1939,7 @@ mod tests {
             assert_eq!(view.view().pc, VirtAddr(0x1111));
             assert_eq!(view.view().sp, VirtAddr(0x2222));
             assert_eq!(view.view().syscall_args[0], 7);
+            assert_eq!(view.view().user_tls_register, 0x3333);
         }
 
         assert_eq!(frame.sepc, 0x1111);
@@ -1179,12 +2027,37 @@ mod tests {
 
     #[test]
     fn trap_dispatch_routes_timer_to_sink_action() {
+        let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+        let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+        <Platform as PercpuIf>::install_early_percpu(CpuId(0));
         let interrupt_bit = 1usize << (usize::BITS as usize - 1);
         let mut frame = test_trap_frame(interrupt_bit | 5, 0x2000, 0);
 
         let action = dispatch_trap_frame::<RecordingTrapSink>(&mut frame);
 
         assert_eq!(action, TrapAction::Reschedule);
+        assert!(!<Platform as IrqIf>::in_irq_context());
+        <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+    }
+
+    #[test]
+    fn trap_dispatch_marks_external_and_ipi_as_irq_context() {
+        let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+        let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+        <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+        let interrupt_bit = 1usize << (usize::BITS as usize - 1);
+
+        let mut external = test_trap_frame(interrupt_bit | 9, 0x2000, 0);
+        let action = dispatch_trap_frame::<RecordingTrapSink>(&mut external);
+        assert_eq!(action, TrapAction::Resume);
+        assert!(!<Platform as IrqIf>::in_irq_context());
+
+        let mut ipi = test_trap_frame(interrupt_bit | 1, 0x2000, 0);
+        let action = dispatch_trap_frame::<RecordingTrapSink>(&mut ipi);
+        assert_eq!(action, TrapAction::Resume);
+        assert!(!<Platform as IrqIf>::in_irq_context());
+
+        <Platform as PercpuIf>::write_kernel_tls(saved_tls);
     }
 
     #[test]
