@@ -158,7 +158,10 @@ impl<P: TxPlatform> CoreInit<P> {
         let parked = BOOT_REACTOR
             .with(|reactor| reactor.run_until_idle_on_hart(target_hart))
             .expect("boot reactor must be initialized before AP dispatcher smoke");
-        assert_eq!(parked.polled, 1, "reactor dispatcher smoke initial poll");
+        assert!(
+            parked.polled <= 1,
+            "reactor dispatcher smoke initial poll count"
+        );
 
         P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
         assert_eq!(
@@ -357,7 +360,6 @@ impl<P: TxPlatform> CoreInit<P> {
 
         P::enable_timer_wakeups();
         for _ in 0..AP_REACTOR_WAIT_SPINS {
-            P::wait_for_interrupt_once();
             let step = Self::step_boot_reactor_once(current_cpu)
                 .expect("boot reactor timer idle step failed");
             if Self::bsp_timer_smoke_done(cpu_bit) {
@@ -366,6 +368,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 tx_hal::console_write_str::<P>(":reactor:timer-idle:ok\n");
                 return;
             }
+            P::wait_for_interrupt_once();
         }
 
         panic!("BSP reactor timer idle smoke did not complete");

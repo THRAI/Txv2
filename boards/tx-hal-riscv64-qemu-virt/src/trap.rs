@@ -1,9 +1,10 @@
 use core::ptr::NonNull;
 
-use crate::{boot_static, Platform};
+use crate::{boot_static, user_access, Platform};
 use tx_hal::{
-    FaultInfo, KernelTrapSink, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable,
-    TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, VirtAddr,
+    FaultInfo, KernelTrapSink, SignalHandlerRegs, TrapAction, TrapClass, TrapFrameMut,
+    TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode,
+    UserTrapContext, VirtAddr,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -140,6 +141,7 @@ tx_rv64_qemu_minimal_trap_vector:
 const RV64_SSTATUS_SPP: usize = 1 << 8;
 const RV64_SSTATUS_SPIE: usize = 1 << 5;
 const X_SP: usize = 2;
+const X_RA: usize = 1;
 const X_TP: usize = 4;
 const X_A0: usize = 10;
 const X_A1: usize = 11;
@@ -176,6 +178,27 @@ impl Rv64TrapFrame {
         }
     }
 
+    pub const fn fault_address(&self) -> Option<VirtAddr> {
+        match classify_rv64_trap(self.scause) {
+            TrapClass::PageFault { .. } | TrapClass::AlignmentFault { .. } => {
+                Some(VirtAddr(self.stval))
+            }
+            _ => None,
+        }
+    }
+
+    pub const fn faulting_instruction(&self) -> Option<VirtAddr> {
+        if rv64_scause_is_interrupt(self.scause) {
+            None
+        } else {
+            Some(VirtAddr(self.sepc))
+        }
+    }
+
+    pub const fn interrupts_enabled_before(&self) -> bool {
+        self.sstatus & RV64_SSTATUS_SPIE != 0
+    }
+
     pub const fn view(&self) -> TrapFrameView<'_> {
         TrapFrameView::new(
             VirtAddr(self.sepc),
@@ -189,8 +212,11 @@ impl Rv64TrapFrame {
                 self.x[X_A4] as u64,
                 self.x[X_A5] as u64,
             ],
-            Some(VirtAddr(self.stval)),
+            self.fault_address(),
+            self.faulting_instruction(),
             self.previous_mode(),
+            self.interrupts_enabled_before(),
+            self.x[X_TP] as u64,
         )
     }
 
@@ -207,8 +233,11 @@ impl Rv64TrapFrame {
                 self.x[X_A4] as u64,
                 self.x[X_A5] as u64,
             ],
-            Some(VirtAddr(self.stval)),
+            self.fault_address(),
+            self.faulting_instruction(),
             self.previous_mode(),
+            self.interrupts_enabled_before(),
+            self.x[X_TP] as u64,
         );
         let raw = NonNull::from(&mut *self).cast::<()>();
         unsafe { TrapFrameMut::from_raw_parts(view, raw, &RV64_TRAP_FRAME_MUT_VTABLE) }
@@ -234,6 +263,33 @@ impl Rv64TrapFrame {
         self.x[X_TP] = value as usize;
     }
 
+    fn capture_user_context(&self) -> UserTrapContext {
+        UserTrapContext {
+            regs: self.x,
+            pc: self.sepc,
+            status: self.sstatus,
+        }
+    }
+
+    fn restore_user_context(&mut self, context: &UserTrapContext) {
+        self.x = context.regs;
+        self.x[0] = 0;
+        self.sepc = context.pc;
+        self.sstatus = context.status;
+        self.prepare_user_return();
+    }
+
+    fn set_signal_handler_regs(&mut self, regs: SignalHandlerRegs) {
+        self.x[X_RA] = regs.return_pc.0;
+        self.x[X_A0] = regs.args[0];
+        self.x[X_A1] = regs.args[1];
+        self.x[X_A2] = regs.args[2];
+    }
+
+    fn rewind_pc(&mut self, bytes: usize) {
+        self.sepc = self.sepc.saturating_sub(bytes);
+    }
+
     pub fn prepare_user_return(&mut self) {
         self.sstatus &= !RV64_SSTATUS_SPP;
         self.sstatus |= RV64_SSTATUS_SPIE;
@@ -246,6 +302,10 @@ static RV64_TRAP_FRAME_MUT_VTABLE: TrapFrameMutVtable = TrapFrameMutVtable {
     set_syscall_return: rv64_set_syscall_return,
     set_syscall_error: rv64_set_syscall_error,
     set_user_tls_register: rv64_set_user_tls_register,
+    capture_user_context: rv64_capture_user_context,
+    restore_user_context: rv64_restore_user_context,
+    set_signal_handler_regs: rv64_set_signal_handler_regs,
+    rewind_pc: rv64_rewind_pc,
 };
 
 fn rv64_frame_ptr(raw: NonNull<()>) -> *mut Rv64TrapFrame {
@@ -272,12 +332,32 @@ fn rv64_set_user_tls_register(raw: NonNull<()>, value: u64) {
     unsafe { (*rv64_frame_ptr(raw)).set_user_tls_register(value) };
 }
 
+fn rv64_capture_user_context(raw: NonNull<()>) -> UserTrapContext {
+    unsafe { (*rv64_frame_ptr(raw)).capture_user_context() }
+}
+
+fn rv64_restore_user_context(raw: NonNull<()>, context: &UserTrapContext) {
+    unsafe { (*rv64_frame_ptr(raw)).restore_user_context(context) };
+}
+
+fn rv64_set_signal_handler_regs(raw: NonNull<()>, regs: SignalHandlerRegs) {
+    unsafe { (*rv64_frame_ptr(raw)).set_signal_handler_regs(regs) };
+}
+
+fn rv64_rewind_pc(raw: NonNull<()>, bytes: usize) {
+    unsafe { (*rv64_frame_ptr(raw)).rewind_pc(bytes) };
+}
+
 impl TrapIf for Platform {
     fn install_minimal_trap_vector() {
         install_rv64_trap_vector();
     }
 
     fn install_kernel_trap_vector() {
+        install_rv64_trap_vector();
+    }
+
+    fn install_user_trap_vector() {
         install_rv64_trap_vector();
     }
 
@@ -295,6 +375,14 @@ where
 
     match class {
         TrapClass::PageFault { write, instruction } => {
+            if !from_user {
+                if let Some(recovery_pc) = user_access::fixup_lookup(frame.sepc) {
+                    frame.sepc = recovery_pc;
+                    frame.x[X_A0] = frame.stval;
+                    return TrapAction::Resume;
+                }
+            }
+
             let fault = FaultInfo {
                 address: VirtAddr(frame.stval),
                 write,
@@ -305,12 +393,15 @@ where
         }
         TrapClass::Syscall => K::on_syscall(frame.view_mut()),
         TrapClass::TimerInterrupt => {
+            let _irq_context = crate::enter_irq_context();
             K::on_timer_interrupt(<Platform as tx_hal::SmpIf>::current_cpu_id())
         }
         TrapClass::ExternalInterrupt => {
+            let _irq_context = crate::enter_irq_context();
             K::on_external_irq(<Platform as tx_hal::SmpIf>::current_cpu_id())
         }
         TrapClass::InterprocessorInterrupt => {
+            let _irq_context = crate::enter_irq_context();
             K::on_ipi(<Platform as tx_hal::SmpIf>::current_cpu_id())
         }
         TrapClass::IllegalInstruction
@@ -329,10 +420,9 @@ where
     }
 }
 
-pub(crate) fn classify_rv64_trap(scause: usize) -> TrapClass {
-    let interrupt_bit = 1usize << (usize::BITS as usize - 1);
-    let is_interrupt = scause & interrupt_bit != 0;
-    let code = scause & !interrupt_bit;
+pub(crate) const fn classify_rv64_trap(scause: usize) -> TrapClass {
+    let is_interrupt = rv64_scause_is_interrupt(scause);
+    let code = scause & !rv64_scause_interrupt_bit();
 
     match (is_interrupt, code) {
         (false, 0) => TrapClass::AlignmentFault {
@@ -368,6 +458,14 @@ pub(crate) fn classify_rv64_trap(scause: usize) -> TrapClass {
         (false, _) => TrapClass::UnknownSync,
         (true, _) => TrapClass::UnknownInterrupt,
     }
+}
+
+const fn rv64_scause_interrupt_bit() -> usize {
+    1usize << (usize::BITS as usize - 1)
+}
+
+const fn rv64_scause_is_interrupt(scause: usize) -> bool {
+    scause & rv64_scause_interrupt_bit() != 0
 }
 
 fn install_rv64_trap_vector() {
