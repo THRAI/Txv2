@@ -1,9 +1,86 @@
 # txKernel Status
 
-**Updated:** 2026-05-01
+**Updated:** 2026-05-03
 
 ## Current Shape
 
+- 2026-05-03 PR #14 CI check fix cleared the GitHub `check` failures after
+  inspecting Actions logs. The patch removes clippy warnings from the
+  VM/PageBacked/VFS interface lane by eliding needless guard lifetimes,
+  shrinking `RNodeBacking::Symlink` through boxed inline names, factoring VM
+  pmap operation function-pointer types, collapsing a RangeLock predicate, and
+  cloning recipe overlap rows only after filtering. It also removes the
+  forbidden pmap dead-code allowance by dropping the unused staged rollback
+  op slot, and splits VM execution-script tests into
+  `vm/tests/execution_scripts.rs` so `vm/tests.rs` stays below the 1,500-line
+  arch-lint cap. Verification: `cargo clippy --workspace --all-targets
+  --exclude tx-kernel-riscv64-qemu-virt --exclude
+  tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt --
+  -D warnings`, `cargo xtask lint arch`, and `cargo xtask ci` with 11 passed,
+  0 skipped, 0 failed. Next step: push and let PR #14's GitHub check rerun; no
+  blocker.
+- 2026-05-03 PR #14 unused-lint fix kept the PageBacked production surface
+  thin by gating the private `PageCacheIndex::install_if_match` replacement /
+  withdrawal helper to tests. The helper was only exercised by unit tests, so a
+  normal test build hid the warning while `RUSTFLAGS=-Dunused cargo check -p
+  tx-kernel` and GitHub's lint path rejected the non-test library build.
+  Verification: `cargo fmt --check`, `RUSTFLAGS=-Dunused cargo check -p
+  tx-kernel`, `cargo test -p tx-kernel --lib`, `cargo xtask progress
+  validate`, `cargo xtask lint unused`, `cargo xtask lint docs`, and `git diff
+  --check`. Next step: reintroduce production replacement / withdrawal only
+  when a real file-backed truncation, writeback, or eviction path consumes it;
+  no blocker.
+- 2026-05-03 PR #14 conflict resolution merged remote `origin/main` into
+  `codex/vm-pagebacked-impl`. Resolution kept the base branch's current
+  reactor/trap/core progress notes, kept the VM/PageBacked branch's kernel
+  module exports and epoch test bootstrap hook, and restored the VM/VFS
+  interface catch-up below. Verification: `cargo fmt --check`, `cargo test -p
+  tx-kernel vm -- --test-threads=1`, `cargo test -p tx-kernel --lib`,
+  `cargo test -p tx-substrate epoch`, `cargo xtask progress validate`, `cargo
+  xtask lint docs`, `git diff --check`, and an anchored conflict-marker scan.
+  The merge resolution was pushed; GitHub now reports PR #14 as `UNSTABLE`
+  while the `check` workflow runs, instead of the prior `DIRTY` conflict state.
+  Next step: wait for CI to finish and address any check failure if it appears.
+- 2026-05-02 VM checks/projections completion slice has landed on top of the
+  subsystem-anatomy reorg. `vm::checks` now exposes staged observation helpers
+  for fault recipe admission, fault-publication revalidation, map admission,
+  and disjoint-remap shape checks; `execution.rs` still owns RangeLock
+  acquisition, recipe mutation, and pmap publication. `vm::project` now exposes
+  read-only `AddressSpaceProjection` / `VmMappingProjection` rows backed by a
+  deterministic recipe snapshot, with page-backed mappings reduced to
+  non-authoritative offsets rather than leaking `Cap<PageContainer>`.
+  Verification before PR publication: `cargo fmt --check`, `cargo test -p
+  tx-kernel vm -- --test-threads=1`, `cargo test -p tx-kernel --lib`,
+  `cargo xtask progress validate`, `cargo xtask lint docs`, and `git diff
+  --check`. Next step: have future syscall/trap-facing VM scripts consume
+  these check and projection surfaces instead of direct helper calls. Blockers
+  remain persistent/epoch recipe snapshots and trap/process/runtime
+  integration.
+- 2026-05-02 VFS/Mount/PageBacked interface seam landed from the
+  `codex/vfs-interface-scout` readiness note. `tx-kernel` now exposes shared
+  interface shells for `Errno` / `StepOutcome`, device and block handles,
+  VFS live-node names (`DEntry`, `RNode`, `RNodeBacking`, `OpenFile`,
+  `ResolveCtx` / `RootCtx`, witnesses), mount names (`MountIdentity`,
+  `MountPayload`, `MountNamespace`, `MountPayloadPin`, `MountInitContext`,
+  `MetadataPcFactory`, `MountOutput`), and the backend traits
+  `FsOps` / `FsPageBacking`. `PageContainerKind::File` now carries the
+  canonical `Cap<MountPayload>` plus `FsObjectId` boundary so future VFS,
+  PageBacked, bdev-fs, devfs, and kernel-facing ext4 lanes do not invent local
+  spellings. Next step: build real VFS/PageBacked file-device behavior on
+  these shells; blockers remain trap/process/runtime integration and concrete
+  backend implementations.
+- 2026-05-02 VM/PageBacked implementation lane now lives on
+  `codex/vm-pagebacked-impl`. It brought in the corrected AddressSpace
+  range-index core, mmap-style gap placement, v1 disjoint-only `mremap`, and
+  fault resolution over authoritative recipes. The lane now also has
+  zone-backed `Cap<AddressSpace>` and `Cap<PageContainer>` constructors,
+  registered VM/PageBacked zones, recipes carrying `VmBacking::Page { pc:
+  Cap<PageContainer>, offset }`, PageBacked-owned `PageCacheIndex` entries
+  backed by real PPN plus `CachePin`, fault materialization that returns
+  `MapPin` evidence for pmap publication, and a VM-owned `VmPmap` over HAL
+  `PmapIf` roots. Next step: connect VFS `FsPageBacking` and later trap /
+  Process / ThreadRuntime fault dispatch; blockers remain persistent epoch
+  recipe snapshots, trap/process/runtime integration, and file/device backing.
 - Rust workspace skeleton exists with `cargo xtask` as the developer command
   surface.
 - QEMU RV64, LA64, and RV64 M1 Dock mock target wiring exists as compile-first
