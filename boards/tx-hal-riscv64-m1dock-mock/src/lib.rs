@@ -6,12 +6,12 @@ extern crate std;
 mod pmap;
 
 use tx_hal::{
-    AllocError, Arch, Asid, AuxvIf, BootHandoff, BootInfo, BootInfoIf, BootPlatformIf,
-    BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, DmaIf, InitIf, IrqIf, MmioFlags,
-    MmioRegion, PercpuIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf,
-    PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation, PmapReserveKind,
-    PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SignalFrameIf, SmpIf, SpiSdInfo,
-    TimeIf, TrapIf, UserAccessIf, VirtAddr, VirtRange,
+    AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootHandoff, BootInfo, BootInfoIf,
+    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, DmaIf, InitIf, IrqIf,
+    MmioFlags, MmioRegion, PercpuIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo,
+    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SignalFrameIf,
+    SmpIf, SpiSdInfo, TimeIf, TrapIf, UserAccessIf, VirtAddr, VirtRange,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -222,7 +222,11 @@ impl PlatformInfoIf for Platform {
     }
 }
 
-impl AuxvIf for Platform {}
+impl AuxvIf for Platform {
+    fn arch_auxv_facts() -> ArchAuxvFacts {
+        ArchAuxvFacts::new(Self::PAGE_SIZE, tx_hal::RISCV_HWCAP_IMAFDC, 0, "riscv64")
+    }
+}
 impl ConsoleIf for Platform {
     fn write_bytes(bytes: &[u8]) {
         #[cfg(target_arch = "riscv64")]
@@ -234,6 +238,10 @@ impl ConsoleIf for Platform {
 
         #[cfg(not(target_arch = "riscv64"))]
         let _ = bytes;
+    }
+
+    fn read_bytes(buf: &mut [u8]) -> usize {
+        read_sbi_console_bytes(buf)
     }
 }
 
@@ -379,6 +387,42 @@ fn sbi_console_putchar(byte: u8) {
             options(nostack)
         );
     }
+}
+
+fn read_sbi_console_bytes(buf: &mut [u8]) -> usize {
+    let mut read = 0;
+    for byte in buf {
+        let Some(next) = sbi_console_getchar() else {
+            break;
+        };
+        *byte = next;
+        read += 1;
+    }
+    read
+}
+
+#[cfg(target_arch = "riscv64")]
+fn sbi_console_getchar() -> Option<u8> {
+    let value: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            lateout("a0") value,
+            in("a7") 2usize,
+            options(nostack)
+        );
+    }
+
+    if value < 0 {
+        None
+    } else {
+        Some(value as u8)
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn sbi_console_getchar() -> Option<u8> {
+    None
 }
 
 #[cfg(target_arch = "riscv64")]
