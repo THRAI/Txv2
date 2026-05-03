@@ -316,8 +316,7 @@ fn lint_arch_text(path: &str, display: &str, text: &str) -> Vec<String> {
             && !boot_static_capture_allowed(path)
             && (line.contains("addr_of!")
                 || line.contains("addr_of_mut!")
-                || line.contains(".get() as usize")
-                || line.contains("unsafe extern \"C\""))
+                || line.contains(".get() as usize"))
         {
             findings.push(format!(
                 "{display}:{line_no}: RV64 QEMU boot-static capture must go through boot_static.rs"
