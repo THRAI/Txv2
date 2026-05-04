@@ -1,22 +1,26 @@
 use tx_substrate::epoch::Guard;
 
+use alloc::boxed::Box;
+
 use crate::vfs::checks::predicates;
 use crate::vfs::checks::resolution::error::WalkCause;
-use crate::vfs::checks::resolution::state::{
-    FinalSymlinkPolicy, ResumeToken, TrailEntry, WalkState,
-};
+#[cfg(any(test, feature = "vfs-read-test-support"))]
+use crate::vfs::checks::resolution::state::ResumeToken;
+use crate::vfs::checks::resolution::state::{FinalSymlinkPolicy, TrailEntry, WalkState};
 use crate::vfs::structure::{DEntryChildLookup, NameOwned};
 
 pub(crate) enum KernelStep<'a, 'g> {
-    Continue(WalkState<'a, 'g>),
-    NeedIO(IORequest, ResumeToken),
+    Continue(Box<WalkState<'a, 'g>>),
+    #[cfg(any(test, feature = "vfs-read-test-support"))]
+    NeedIO(Box<IORequest>, Box<ResumeToken>),
+    #[cfg(not(any(test, feature = "vfs-read-test-support")))]
+    NeedIO,
     Error(WalkCause),
 }
 
+#[cfg(any(test, feature = "vfs-read-test-support"))]
 pub(crate) enum IORequest {
-    LookupChild { parent_name: NameOwned },
-    ReadSymlink,
-    ProbeFinal { name: NameOwned },
+    LookupChild { _parent_name: NameOwned },
 }
 
 pub(crate) fn kernel_step<'a, 'g>(
@@ -35,7 +39,7 @@ pub(crate) fn kernel_step<'a, 'g>(
     };
 
     if component == b"." {
-        return KernelStep::Continue(state);
+        return KernelStep::Continue(Box::new(state));
     }
 
     if component == b".." {
@@ -53,7 +57,7 @@ pub(crate) fn kernel_step<'a, 'g>(
                 }
             }
         }
-        return KernelStep::Continue(state);
+        return KernelStep::Continue(Box::new(state));
     }
 
     let name = match NameOwned::from_component(component) {
@@ -63,7 +67,7 @@ pub(crate) fn kernel_step<'a, 'g>(
 
     match state.cursor.children.lookup(&name, guard) {
         DEntryChildLookup::Found(child) => {
-            let child_ref = child.into_ident_ref();
+            let child_ref = (*child).into_ident_ref();
             if !predicates::namespace_live(&child_ref, &state.root_ctx) {
                 return KernelStep::Error(WalkCause::DetachedNamespace);
             }
@@ -81,28 +85,37 @@ pub(crate) fn kernel_step<'a, 'g>(
                 return KernelStep::Error(WalkCause::NameTooLong);
             }
             state.cursor = child_ref;
-            KernelStep::Continue(state)
+            KernelStep::Continue(Box::new(state))
         }
         DEntryChildLookup::Missing => {
-            let suspended = match state.suspend() {
-                Ok(suspended) => suspended,
-                Err(_) => return KernelStep::Error(WalkCause::StaleObservation),
-            };
-            let parent = match state.cursor.to_cap() {
-                Ok(parent) => parent,
-                Err(_) => return KernelStep::Error(WalkCause::StaleObservation),
-            };
+            #[cfg(not(any(test, feature = "vfs-read-test-support")))]
+            {
+                let _ = name;
+                KernelStep::NeedIO
+            }
 
-            KernelStep::NeedIO(
-                IORequest::LookupChild {
-                    parent_name: name.clone(),
-                },
-                ResumeToken::LookupChild {
-                    suspended,
-                    parent,
-                    name,
-                },
-            )
+            #[cfg(any(test, feature = "vfs-read-test-support"))]
+            {
+                let suspended = match state.suspend() {
+                    Ok(suspended) => suspended,
+                    Err(_) => return KernelStep::Error(WalkCause::StaleObservation),
+                };
+                let parent = match state.cursor.to_cap() {
+                    Ok(parent) => parent,
+                    Err(_) => return KernelStep::Error(WalkCause::StaleObservation),
+                };
+
+                KernelStep::NeedIO(
+                    Box::new(IORequest::LookupChild {
+                        _parent_name: name.clone(),
+                    }),
+                    Box::new(ResumeToken::LookupChild {
+                        suspended,
+                        parent,
+                        name,
+                    }),
+                )
+            }
         }
     }
 }

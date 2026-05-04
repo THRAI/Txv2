@@ -16,7 +16,7 @@ where
         offset: u64,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<Frame> {
-        if offset % BLOCK_SIZE as u64 != 0 {
+        if !offset.is_multiple_of(BLOCK_SIZE as u64) {
             return StepOutcome::Err(Errno::Invalid);
         }
         let inode = match inode_no(fs_object_id) {

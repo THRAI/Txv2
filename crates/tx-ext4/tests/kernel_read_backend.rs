@@ -1,3 +1,4 @@
+use core::sync::atomic::{AtomicBool, Ordering};
 use tx_ext4::mount::mount_ext4_read_only;
 use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
@@ -6,6 +7,28 @@ use tx_subsystems::page_backed::FRAME_CAPACITY;
 use tx_subsystems::step::StepOutcome;
 use tx_subsystems::vfs::fs_ops::DirCursor;
 use tx_subsystems::vfs::structure::FsObjectId;
+
+static TEST_LOCK: AtomicBool = AtomicBool::new(false);
+
+struct TestSerialGuard;
+
+impl TestSerialGuard {
+    fn acquire() -> Self {
+        while TEST_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+
+impl Drop for TestSerialGuard {
+    fn drop(&mut self) {
+        TEST_LOCK.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Clone)]
 struct MockImage {
@@ -50,6 +73,7 @@ impl BlockImage for MockImage {
 #[test]
 fn read_only_mount_output_reports_ext4_root() {
     setup();
+    let _serial = TestSerialGuard::acquire();
 
     let output = mount_ext4_read_only(mock_image()).expect("mount ext4");
 
@@ -61,6 +85,7 @@ fn read_only_mount_output_reports_ext4_root() {
 #[test]
 fn lookup_readdir_and_metadata_use_kernel_facing_backend() {
     setup();
+    let _serial = TestSerialGuard::acquire();
     let output = mount_ext4_read_only(mock_image()).expect("mount ext4");
     let guard = tx_substrate::epoch::guard();
 
@@ -92,6 +117,7 @@ fn lookup_readdir_and_metadata_use_kernel_facing_backend() {
 #[test]
 fn fetch_page_reads_ext4_data_blocks_without_tokio_adapter() {
     setup();
+    let _serial = TestSerialGuard::acquire();
     let output = mount_ext4_read_only(mock_image()).expect("mount ext4");
     let guard = tx_substrate::epoch::guard();
 

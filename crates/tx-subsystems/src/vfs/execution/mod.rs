@@ -1,19 +1,32 @@
+#![cfg(any(test, feature = "vfs-read-test-support"))]
+
+use alloc::boxed::Box;
+
 use tx_substrate::zone::Cap;
 
 use crate::mount::structure::MountIdentity;
 use crate::page_backed::{create_file_page_container, Frame};
 use crate::step::{Errno, Progress, StepOutcome};
 use crate::vfs::checks::require::ResolveCtx;
-use crate::vfs::checks::witness::{ParentAndName, ParentAndNamedChild};
-use crate::vfs::fs_ops::{CapSet, Credential, RNodeBackingInit};
+#[cfg(test)]
+use crate::vfs::checks::witness::ParentAndName;
+use crate::vfs::checks::witness::ParentAndNamedChild;
+use crate::vfs::fs_ops::RNodeBackingInit;
+#[cfg(test)]
+use crate::vfs::fs_ops::{CapSet, Credential};
+#[cfg(test)]
+use crate::vfs::structure::DEntryChildrenInsertReservation;
+#[cfg(test)]
+use crate::vfs::structure::RNode;
 use crate::vfs::structure::{
     create_dentry_for_create_lane, create_open_file_for_create_lane, create_rnode_for_create_lane,
-    DEntry, DEntryChildrenInsertReservation, FsObjectId, InodeMeta, NameOwned, NewDEntrySpec,
-    NewOpenFileSpec, NewRNodeSpec, OpenFile, OpenFileKey, OpenFlags, ProjectionKey,
-    ProjectionReadCtx, ProjectionSchema, RNode, RNodeBacking, RenderBuffer, StructPayload,
+    DEntry, FsObjectId, InodeMeta, NameOwned, NewDEntrySpec, NewOpenFileSpec, NewRNodeSpec,
+    OpenFile, OpenFileKey, OpenFlags, ProjectionKey, ProjectionReadCtx, ProjectionSchema,
+    RNodeBacking, RenderBuffer, StructPayload,
 };
 
 #[derive(Clone)]
+#[cfg(test)]
 struct OpenCreateInsertReady {
     parent: Cap<DEntry>,
     parent_mount: Cap<MountIdentity>,
@@ -21,15 +34,18 @@ struct OpenCreateInsertReady {
     name: NameOwned,
 }
 
+#[cfg(test)]
 struct OpenCreatePrepared {
     child_rnode: Cap<RNode>,
     child_dentry: Cap<DEntry>,
 }
 
+#[cfg(test)]
 enum OpenCreateResume {
     BackendCreateInFlight(OpenCreateInsertReady),
 }
 
+#[cfg(test)]
 pub(crate) struct OpenCreateOperation {
     path: NameOwnedPath,
     resume: Option<OpenCreateResume>,
@@ -59,6 +75,7 @@ impl NameOwnedPath {
     }
 }
 
+#[cfg(test)]
 impl OpenCreateOperation {
     pub(crate) fn new(path: &[u8]) -> Result<Self, Errno> {
         Ok(Self {
@@ -72,6 +89,7 @@ impl OpenCreateOperation {
     }
 }
 
+#[cfg(test)]
 fn default_create_lane_credential() -> Credential {
     Credential {
         uid: 0,
@@ -83,6 +101,7 @@ fn default_create_lane_credential() -> Credential {
     }
 }
 
+#[cfg(test)]
 fn upgrade_open_create_parent<'g>(
     target: ParentAndName<'g>,
 ) -> Result<OpenCreateInsertReady, Errno> {
@@ -98,6 +117,7 @@ fn upgrade_open_create_parent<'g>(
     })
 }
 
+#[cfg(test)]
 fn upgrade_open_create_parent_for_resume<'g>(
     target: ParentAndName<'g>,
     resume: &mut Option<OpenCreateResume>,
@@ -119,6 +139,7 @@ fn upgrade_open_create_parent_for_resume<'g>(
     Ok(ready)
 }
 
+#[cfg(test)]
 fn with_open_create_insert_reservation<R>(
     ready: &OpenCreateInsertReady,
     f: impl FnOnce(&OpenCreateInsertReady, DEntryChildrenInsertReservation<'_>) -> StepOutcome<R>,
@@ -137,6 +158,7 @@ fn with_open_create_insert_reservation<R>(
     f(ready, reservation)
 }
 
+#[cfg(test)]
 fn map_children_insert_error(err: crate::vfs::structure::DEntryChildrenInstallError) -> Errno {
     match err {
         crate::vfs::structure::DEntryChildrenInstallError::AlreadyPresent => Errno::Busy,
@@ -150,10 +172,12 @@ fn map_zone_error(_err: tx_substrate::zone::ZoneError) -> Errno {
     Errno::Busy
 }
 
+#[cfg(test)]
 fn derive_create_lane_rnode_key(object_id: FsObjectId) -> crate::vfs::structure::RNodeKey {
     crate::vfs::structure::RNodeKey(object_id.0)
 }
 
+#[cfg(test)]
 fn derive_create_lane_dentry_key(
     ready: &OpenCreateInsertReady,
     object_id: FsObjectId,
@@ -161,6 +185,7 @@ fn derive_create_lane_dentry_key(
     crate::vfs::structure::DEntryKey(object_id.0 ^ u64::from(ready.name.len))
 }
 
+#[cfg(test)]
 fn derive_create_lane_open_file_key(object_id: FsObjectId) -> OpenFileKey {
     OpenFileKey(object_id.0 ^ 0x0f0f_0f0f_0f0f_0f0f)
 }
@@ -183,6 +208,7 @@ fn derive_read_lane_open_file_key(object_id: FsObjectId) -> OpenFileKey {
     OpenFileKey(object_id.0 ^ 0xa5a5_5a5a_1111_eeee)
 }
 
+#[cfg(test)]
 fn request_backend_create_inode(
     ready: &OpenCreateInsertReady,
     reservation: &DEntryChildrenInsertReservation<'_>,
@@ -203,6 +229,7 @@ fn request_backend_create_inode(
     )
 }
 
+#[cfg(test)]
 fn prepare_create_lane_objects(
     ready: &OpenCreateInsertReady,
     reservation: &DEntryChildrenInsertReservation<'_>,
@@ -231,6 +258,7 @@ fn prepare_create_lane_objects(
     })
 }
 
+#[cfg(test)]
 fn publish_open_file_for_create_lane(
     ready: &OpenCreateInsertReady,
     prepared: OpenCreatePrepared,
@@ -365,6 +393,7 @@ fn publish_open_file_for_read_lane(
     .map_err(map_zone_error)
 }
 
+#[cfg(test)]
 fn step_open_create<'g>(
     target: ParentAndName<'g>,
     guard: &'g tx_substrate::epoch::Guard<'g>,
@@ -413,6 +442,7 @@ fn step_open_create<'g>(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn drive_open_create(
     op: &mut OpenCreateOperation,
     ctx: &ResolveCtx,
@@ -428,6 +458,7 @@ pub(crate) fn drive_open_create(
     step_open_create(witness, &guard, &mut op.resume)
 }
 
+#[cfg(test)]
 pub(crate) fn drive_open_create_until_boundary(
     op: &mut OpenCreateOperation,
     ctx: &ResolveCtx,
@@ -559,7 +590,7 @@ enum ReadFetchState {
 }
 
 enum ReadFetchBoundary {
-    Ready(Frame),
+    Ready(Box<Frame>),
     Blocked {
         target: ReadFetchTarget,
         _carry_progress: usize,
@@ -605,7 +636,7 @@ fn ensure_resolved_entity<'g>(
             loop {
                 match step {
                     crate::vfs::checks::resolution::driver::DriverStep::Accept(witness) => {
-                        return match witness {
+                        return match *witness {
                             crate::vfs::checks::witness::WalkWitness::Entity(entity) => Ok(entity),
                             _ => Err(Errno::Invalid),
                         };
@@ -614,17 +645,13 @@ fn ensure_resolved_entity<'g>(
                         return Err(errno)
                     }
                     crate::vfs::checks::resolution::driver::DriverStep::NeedIO(request, token) => {
-                        match request {
+                        match request.as_ref() {
                             crate::vfs::checks::resolution::step::IORequest::LookupChild {
-                                parent_name: _,
+                                _parent_name: _,
                             } => {}
-                            crate::vfs::checks::resolution::step::IORequest::ReadSymlink
-                            | crate::vfs::checks::resolution::step::IORequest::ProbeFinal {
-                                ..
-                            } => return Err(Errno::NotImplemented),
                         }
 
-                        let (parent, name, current_mount) = match &token {
+                        let (parent, name, current_mount) = match token.as_ref() {
                             crate::vfs::checks::resolution::state::ResumeToken::LookupChild {
                                 suspended,
                                 parent,
@@ -635,7 +662,6 @@ fn ensure_resolved_entity<'g>(
                                 name.clone(),
                                 suspended.current_mount.clone(),
                             ),
-                            _ => return Err(Errno::NotImplemented),
                         };
 
                         let parent_ref = parent.ident_ref(guard);
@@ -676,7 +702,7 @@ fn ensure_resolved_entity<'g>(
                         )?;
                         step = crate::vfs::checks::resolution::driver::resume_walker(
                             crate::vfs::checks::resolution::state::WalkMode::Entity,
-                            token,
+                            *token,
                             crate::vfs::checks::resolution::driver::IOResult::ChildFound(child),
                             guard,
                         );
@@ -703,6 +729,7 @@ fn ensure_open_for_read(
     Ok(open)
 }
 
+#[cfg(test)]
 pub(crate) fn drive_open_read_first_page(
     op: &mut OpenReadOperation<'_>,
     ctx: &ResolveCtx,
@@ -761,7 +788,7 @@ fn fetch_page_until_boundary(
 
     loop {
         match backing.fetch_page(fs_object_id, target.page_base, guard) {
-            StepOutcome::Done(frame) => return ReadFetchBoundary::Ready(frame),
+            StepOutcome::Done(frame) => return ReadFetchBoundary::Ready(Box::new(frame)),
             StepOutcome::Blocked(carrier, interests) => {
                 return ReadFetchBoundary::Blocked {
                     target,
@@ -1015,7 +1042,7 @@ pub mod read_harness {
                 let name = NameOwned::from_component(&path[start..cursor])?;
                 let current_ref = current.ident_ref(&guard);
                 let child = match current_ref.children.lookup(&name, &guard) {
-                    DEntryChildLookup::Found(child) => child.into_ident_ref(),
+                    DEntryChildLookup::Found(child) => (*child).into_ident_ref(),
                     DEntryChildLookup::Missing => return Ok(None),
                 };
 

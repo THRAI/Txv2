@@ -185,6 +185,7 @@ unsafe impl ZoneAllocated for MountPayload {
 }
 
 impl MountPayloadBinding {
+    #[cfg(any(test, feature = "vfs-read-test-support"))]
     pub(crate) fn attached_cap(&self) -> Option<Cap<MountPayload>> {
         match self {
             Self::Attached(payload) => Some(payload.clone().into_cap()),
@@ -241,15 +242,19 @@ impl MountpointIndex {
 #[cfg(any(test, feature = "vfs-read-test-support"))]
 pub(crate) mod testing {
     use super::*;
+    use crate::vfs::structure::DEntry;
+    #[cfg(test)]
     use crate::vfs::structure::{
-        DEntry, DEntryChildren, DEntryKey, FsObjectId, InodeMeta, NameOwned, RNode, RNodeBacking,
-        RNodeKey, StructPayload,
+        DEntryChildren, DEntryKey, FsObjectId, InodeMeta, NameOwned, RNode, RNodeBacking, RNodeKey,
+        StructPayload,
     };
     use alloc::sync::Arc;
     use tx_substrate::zone;
 
+    #[cfg(test)]
     struct DummyFs;
 
+    #[cfg(test)]
     impl crate::vfs::fs_ops::FsOps for DummyFs {
         fn lookup<'g>(
             &self,
@@ -371,6 +376,7 @@ pub(crate) mod testing {
         }
     }
 
+    #[cfg(test)]
     impl crate::page_backed::FsPageBacking for DummyFs {
         fn fetch_page<'g>(
             &self,
@@ -429,16 +435,19 @@ pub(crate) mod testing {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn make_payload_with_fs_ops_for_test(
         fs_ops: Arc<dyn crate::vfs::fs_ops::FsOps>,
     ) -> Cap<MountPayload> {
         make_payload_with_backing_for_test(fs_ops, Arc::new(DummyFs))
     }
 
+    #[cfg(test)]
     pub(crate) fn make_payload_for_test() -> Cap<MountPayload> {
         make_payload_with_fs_ops_for_test(Arc::new(DummyFs))
     }
 
+    #[cfg(test)]
     pub(crate) fn make_bootstrap_pair_with_payload_for_test(
         root: Cap<DEntry>,
     ) -> (Cap<MountIdentity>, Cap<MountNamespace>, Cap<MountPayload>) {
@@ -450,6 +459,7 @@ pub(crate) mod testing {
         (mi_cap, ns_cap, payload)
     }
 
+    #[cfg(test)]
     pub(crate) fn make_bootstrap_pair_with_fs_ops_for_test(
         root: Cap<DEntry>,
         fs_ops: Arc<dyn crate::vfs::fs_ops::FsOps>,
@@ -488,6 +498,7 @@ pub(crate) mod testing {
     /// Neither of the returned caps may be dereferenced inside a field that forms
     /// the cycle (`MountNamespace::root_mount`, `MountIdentity::mnt_ns`) until
     /// after this function returns.
+    #[cfg(test)]
     pub(crate) fn make_bootstrap_pair_for_test(
         root: Cap<DEntry>,
     ) -> (Cap<MountIdentity>, Cap<MountNamespace>) {
@@ -541,6 +552,7 @@ pub(crate) mod testing {
         (mi_cap, ns_cap)
     }
 
+    #[cfg(test)]
     pub(crate) fn make_rnode_for_test(key: u64, mode: u16) -> Cap<RNode> {
         let res = zone::reserve_for::<RNode>().expect("RNode reservation");
         zone::sign_for(
@@ -567,6 +579,7 @@ pub(crate) mod testing {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn make_dentry_for_test(key: u64, name: &[u8], rnode: Cap<RNode>) -> Cap<DEntry> {
         let res = zone::reserve_for::<DEntry>().expect("DEntry reservation");
         zone::sign_for(
