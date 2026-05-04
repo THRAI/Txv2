@@ -3,7 +3,7 @@ use tx_substrate::zone::{Cap, IdentRef};
 
 use crate::mount::structure::{MountIdentity, MountNamespace};
 use crate::step::Errno;
-use crate::vfs::structure::{DEntry, NameOwned, RNode};
+use crate::vfs::structure::{DEntry, NameOwned};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WalkMode {
@@ -47,6 +47,7 @@ pub struct WalkState<'a, 'g> {
 }
 
 impl<'a, 'g> WalkState<'a, 'g> {
+    #[cfg(any(test, feature = "vfs-read-test-support"))]
     pub(crate) fn suspend(&self) -> Result<SuspendedState, Errno> {
         Ok(SuspendedState {
             cursor: self.cursor.to_cap().map_err(|_| Errno::Stale)?,
@@ -69,6 +70,7 @@ pub struct RootCtxRef<'g> {
 }
 
 impl<'g> RootCtxRef<'g> {
+    #[cfg(any(test, feature = "vfs-read-test-support"))]
     fn to_caps(&self) -> Result<RootCtxCaps, Errno> {
         Ok(RootCtxCaps {
             mnt_ns: self.mnt_ns.to_cap().map_err(|_| Errno::Stale)?,
@@ -185,6 +187,7 @@ impl<'g> WalkTrail<'g> {
         self.entries[self.len].take()
     }
 
+    #[cfg(any(test, feature = "vfs-read-test-support"))]
     fn to_caps(&self) -> Result<WalkTrailCaps, Errno> {
         let mut caps = WalkTrailCaps::new();
         let mut index = 0;
@@ -234,15 +237,6 @@ pub enum ResumeToken {
         parent: Cap<DEntry>,
         name: NameOwned,
     },
-    ReadSymlink {
-        suspended: SuspendedState,
-        link_rnode: Cap<RNode>,
-    },
-    ProbeFinal {
-        suspended: SuspendedState,
-        parent: Cap<DEntry>,
-        name: NameOwned,
-    },
 }
 
 pub struct SuspendedState {
@@ -255,6 +249,7 @@ pub struct SuspendedState {
 }
 
 impl SuspendedState {
+    #[cfg(any(test, feature = "vfs-read-test-support"))]
     pub(crate) fn resume<'s, 'g>(&'s self, guard: &'g Guard<'_>) -> WalkState<'s, 'g> {
         WalkState {
             cursor: self.cursor.ident_ref(guard),
@@ -386,6 +381,10 @@ impl WalkTrailCaps {
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn push(&mut self, entry: TrailEntryCap) -> Result<(), Errno> {
         if self.len == Self::CAPACITY {
             return Err(Errno::NameTooLong);
@@ -395,6 +394,7 @@ impl WalkTrailCaps {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "vfs-read-test-support"))]
     fn resume<'g>(&self, guard: &'g Guard<'_>) -> WalkTrail<'g> {
         let mut trail = WalkTrail::new();
         let mut index = 0;
@@ -499,6 +499,6 @@ mod tests {
 
         assert_static::<ResumeToken>();
         assert_static::<SuspendedState>();
-        assert_eq!(core::mem::size_of::<ResumeToken>() > 0, true);
+        assert!(core::mem::size_of::<ResumeToken>() > 0);
     }
 }

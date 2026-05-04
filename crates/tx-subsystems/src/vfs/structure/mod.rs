@@ -1,8 +1,12 @@
 use alloc::boxed::Box;
 
 use tx_substrate::epoch::Guard;
-use tx_substrate::index::{Index, IndexError};
-use tx_substrate::zone::{Cap, IdentRef, Zone, ZoneAllocated, ZoneError};
+use tx_substrate::index::Index;
+#[cfg(any(test, feature = "vfs-read-test-support"))]
+use tx_substrate::index::IndexError;
+#[cfg(any(test, feature = "vfs-read-test-support"))]
+use tx_substrate::zone::ZoneError;
+use tx_substrate::zone::{Cap, IdentRef, Zone, ZoneAllocated};
 
 use crate::mount::structure::{MountIdentity, MountPayloadPin};
 use crate::page_backed::PageContainer;
@@ -147,6 +151,7 @@ pub struct ProjectionReadCtx<'g> {
 }
 
 impl<'g> ProjectionReadCtx<'g> {
+    #[cfg(any(test, feature = "vfs-read-test-support"))]
     pub(crate) fn new(_guard: &'g Guard<'g>) -> Self {
         Self {
             _guard: core::marker::PhantomData,
@@ -211,6 +216,7 @@ pub struct OpenFlags {
     pub nonblock: bool,
 }
 
+#[cfg(any(test, feature = "vfs-read-test-support"))]
 pub(crate) struct NewRNodeSpec {
     pub key: RNodeKey,
     pub fs_object_id: FsObjectId,
@@ -218,12 +224,14 @@ pub(crate) struct NewRNodeSpec {
     pub backing: RNodeBacking,
 }
 
+#[cfg(any(test, feature = "vfs-read-test-support"))]
 pub(crate) struct NewDEntrySpec {
     pub key: DEntryKey,
     pub name: NameOwned,
     pub rnode: Cap<RNode>,
 }
 
+#[cfg(any(test, feature = "vfs-read-test-support"))]
 pub(crate) struct NewOpenFileSpec {
     pub key: OpenFileKey,
     pub rnode: Cap<RNode>,
@@ -256,16 +264,17 @@ impl DEntryChildren {
 
     pub fn lookup<'g>(&self, name: &NameOwned, guard: &'g Guard<'_>) -> DEntryChildLookup<'g> {
         match self.state.index.lookup(name, guard) {
-            Some(entry) => DEntryChildLookup::Found(DEntryChildRef {
+            Some(entry) => DEntryChildLookup::Found(Box::new(DEntryChildRef {
                 name: entry.key().clone(),
                 child: entry.value().ident_ref(guard),
-            }),
+            })),
             None => DEntryChildLookup::Missing,
         }
     }
 
     // RFX-VFS-P2-001: Replace this bootstrap/test helper with vfs::execution
     // reserve/commit helpers once create/mkdir/link/rename/unlink steps exist.
+    #[cfg(test)]
     pub(crate) fn install_committed_for_test_or_bootstrap(
         &self,
         name: NameOwned,
@@ -276,6 +285,7 @@ impl DEntryChildren {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "vfs-read-test-support"))]
     pub(crate) fn reserve_insert(
         &self,
         name: NameOwned,
@@ -290,12 +300,15 @@ impl DEntryChildren {
     }
 }
 
+#[cfg(any(test, feature = "vfs-read-test-support"))]
 pub(crate) struct DEntryChildrenInsertReservation<'a> {
     reservation:
         tx_substrate::index::IndexReservation<'a, NameOwned, Cap<DEntry>, DENTRY_CHILDREN_CAPACITY>,
 }
 
+#[cfg(any(test, feature = "vfs-read-test-support"))]
 impl DEntryChildrenInsertReservation<'_> {
+    #[cfg(test)]
     pub(crate) fn key(&self) -> &NameOwned {
         self.reservation.key()
     }
@@ -320,7 +333,7 @@ impl Default for DEntryChildren {
 }
 
 pub enum DEntryChildLookup<'g> {
-    Found(DEntryChildRef<'g>),
+    Found(Box<DEntryChildRef<'g>>),
     Missing,
 }
 
@@ -377,6 +390,7 @@ pub struct ProjectionKey {
     pub file_type: u32,
 }
 
+#[cfg(any(test, feature = "vfs-read-test-support"))]
 pub(crate) fn create_rnode_for_create_lane(spec: NewRNodeSpec) -> Result<Cap<RNode>, ZoneError> {
     let reservation = tx_substrate::zone::reserve_for::<RNode>()?;
     Ok(tx_substrate::zone::sign_for(
@@ -390,6 +404,7 @@ pub(crate) fn create_rnode_for_create_lane(spec: NewRNodeSpec) -> Result<Cap<RNo
     ))
 }
 
+#[cfg(any(test, feature = "vfs-read-test-support"))]
 pub(crate) fn create_dentry_for_create_lane(spec: NewDEntrySpec) -> Result<Cap<DEntry>, ZoneError> {
     let reservation = tx_substrate::zone::reserve_for::<DEntry>()?;
     Ok(tx_substrate::zone::sign_for(
@@ -403,6 +418,7 @@ pub(crate) fn create_dentry_for_create_lane(spec: NewDEntrySpec) -> Result<Cap<D
     ))
 }
 
+#[cfg(any(test, feature = "vfs-read-test-support"))]
 pub(crate) fn create_open_file_for_create_lane(
     spec: NewOpenFileSpec,
 ) -> Result<Cap<OpenFile>, ZoneError> {

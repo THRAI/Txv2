@@ -1,8 +1,10 @@
 //! VM public value vocabulary.
 
 use crate::page_backed::{
-    MaterializeAccess, MaterializedPage, PageCacheError, PageContainer, PageIndex,
+    MaterializeAccess, MaterializedPage, MaterializedPagePin, PageCacheError, PageContainer,
+    PageIndex,
 };
+use tx_substrate::page_allocator::{self, ZeroPolicy};
 use tx_substrate::zone::Cap;
 
 use crate::vm::VmPmapError;
@@ -59,7 +61,21 @@ pub struct UserRange {
     end: UserVirtAddr,
 }
 
+/// V1 conservative user-space top used by VM operations that must
+/// serialize against all other VM operations on an `AddressSpace` (fork,
+/// exec). Sized at 256 GiB which fits inside Sv39's 256 GiB user-space
+/// half and inside Sv48's 128 TiB user-space half. Revisit when the
+/// per-platform user VA cap is finalized.
+pub const FULL_USER_V1_TOP: usize = 1 << 38;
+
 impl UserRange {
+    /// Full user-space range covering `[0, FULL_USER_V1_TOP)` for
+    /// operations that must serialize against every concurrent VM
+    /// operation on an AddressSpace (fork, exec).
+    pub fn full_user_v1() -> Self {
+        Self::new_aligned(UserVirtAddr(0), FULL_USER_V1_TOP).expect("full user v1 range")
+    }
+
     pub fn new_aligned(start: UserVirtAddr, len: usize) -> Result<Self, UserRangeError> {
         if len == 0 {
             return Err(UserRangeError::ZeroLength);
@@ -198,6 +214,14 @@ impl Prot {
             AccessMode::Read => self.read,
             AccessMode::Write => self.write,
             AccessMode::Execute => self.execute,
+        }
+    }
+
+    pub const fn without_write(self) -> Self {
+        Self {
+            read: self.read,
+            write: false,
+            execute: self.execute,
         }
     }
 }
@@ -484,20 +508,91 @@ pub struct VmFaultOutcome {
 
 impl VmFaultOutcome {
     pub fn materialize_pagebacked_anon(&self) -> Result<VmFaultMaterialization, VmFaultError> {
-        let page_index = self.backing_page_index()?;
-        let access = match self.access {
-            AccessMode::Write => MaterializeAccess::Write,
-            AccessMode::Read | AccessMode::Execute => MaterializeAccess::Read,
-        };
-        let VmBacking::Page { pc, .. } = &self.entry.backing else {
+        if !matches!(self.entry.backing, VmBacking::Page { .. }) {
             return Err(VmFaultError::BackingMismatch);
+        }
+        self.materialize_pagebacked()
+    }
+
+    pub fn materialize_pagebacked(&self) -> Result<VmFaultMaterialization, VmFaultError> {
+        match &self.entry.backing {
+            VmBacking::Page { pc, .. } => self.materialize_page_recipe(pc),
+            VmBacking::PrivateAnon => self.materialize_private_anon(),
+            VmBacking::None => Err(VmFaultError::BackingMismatch),
+        }
+    }
+
+    fn materialize_page_recipe(
+        &self,
+        pc: &Cap<PageContainer>,
+    ) -> Result<VmFaultMaterialization, VmFaultError> {
+        let page_index = self.backing_page_index()?;
+        let access_byte = page_index
+            .as_u64()
+            .checked_mul(USER_PAGE_SIZE as u64)
+            .ok_or(VmFaultError::BackingOffsetOverflow)?;
+        if access_byte >= pc.size_bytes() {
+            return Err(VmFaultError::PageBeyondSize);
+        }
+        let private_mapping = !self.entry.flags.shared;
+        let write_fault = self.access == AccessMode::Write;
+        let (page, publish_prot, replace_existing) = if private_mapping && write_fault {
+            let source = pc
+                .materialize_anon(page_index, MaterializeAccess::Read)
+                .map_err(VmFaultError::PageCache)?;
+            (
+                allocate_private_materialized_page_from_source(source.ppn, true)?,
+                self.entry.prot,
+                true,
+            )
+        } else {
+            let access = if write_fault {
+                MaterializeAccess::Write
+            } else {
+                MaterializeAccess::Read
+            };
+            let page = pc
+                .materialize_anon(page_index, access)
+                .map_err(VmFaultError::PageCache)?;
+            let publish_prot = if private_mapping {
+                self.entry.prot.without_write()
+            } else {
+                self.entry.prot
+            };
+            (page, publish_prot, false)
         };
-        let page = pc
-            .materialize_anon(page_index, access)
-            .map_err(VmFaultError::PageCache)?;
         Ok(VmFaultMaterialization {
+            backing: VmFaultMaterializationBacking::PageBacked,
             page_index,
             page,
+            publish_prot,
+            replace_existing,
+            pmap_materialization_deferred: self.pmap_materialization_deferred,
+        })
+    }
+
+    fn materialize_private_anon(&self) -> Result<VmFaultMaterialization, VmFaultError> {
+        let page_index = self.private_anon_page_index()?;
+        let write_fault = self.access == AccessMode::Write;
+        let (page, publish_prot, replace_existing) = if write_fault {
+            (
+                allocate_private_materialized_page(true)?,
+                self.entry.prot,
+                true,
+            )
+        } else {
+            (
+                materialize_zero_frame()?,
+                self.entry.prot.without_write(),
+                false,
+            )
+        };
+        Ok(VmFaultMaterialization {
+            backing: VmFaultMaterializationBacking::PrivateAnon,
+            page_index,
+            page,
+            publish_prot,
+            replace_existing,
             pmap_materialization_deferred: self.pmap_materialization_deferred,
         })
     }
@@ -506,12 +601,7 @@ impl VmFaultOutcome {
         let VmBacking::Page { offset, .. } = &self.entry.backing else {
             return Err(VmFaultError::BackingMismatch);
         };
-        let delta = self
-            .page_range
-            .start()
-            .as_usize()
-            .checked_sub(self.entry.range.start().as_usize())
-            .ok_or(VmFaultError::BackingOffsetOverflow)?;
+        let delta = self.recipe_page_delta()?;
         let byte_offset = (*offset)
             .checked_add(u64::try_from(delta).map_err(|_| VmFaultError::BackingOffsetOverflow)?)
             .ok_or(VmFaultError::BackingOffsetOverflow)?;
@@ -520,12 +610,42 @@ impl VmFaultOutcome {
         }
         Ok(PageIndex::new(byte_offset / USER_PAGE_SIZE as u64))
     }
+
+    pub(in crate::vm) fn private_anon_page_index(&self) -> Result<PageIndex, VmFaultError> {
+        if !matches!(self.entry.backing, VmBacking::PrivateAnon) {
+            return Err(VmFaultError::BackingMismatch);
+        }
+        let delta = self.recipe_page_delta()?;
+        if !delta.is_multiple_of(USER_PAGE_SIZE) {
+            return Err(VmFaultError::BackingOffsetOverflow);
+        }
+        Ok(PageIndex::new((delta / USER_PAGE_SIZE) as u64))
+    }
+
+    fn recipe_page_delta(&self) -> Result<usize, VmFaultError> {
+        let delta = self
+            .page_range
+            .start()
+            .as_usize()
+            .checked_sub(self.entry.range.start().as_usize())
+            .ok_or(VmFaultError::BackingOffsetOverflow)?;
+        Ok(delta)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmFaultMaterializationBacking {
+    PageBacked,
+    PrivateAnon,
 }
 
 #[derive(Debug)]
 pub struct VmFaultMaterialization {
+    pub backing: VmFaultMaterializationBacking,
     pub page_index: PageIndex,
     pub page: MaterializedPage,
+    pub publish_prot: Prot,
+    pub replace_existing: bool,
     pub pmap_materialization_deferred: bool,
 }
 
@@ -537,6 +657,7 @@ pub enum VmFaultError {
     WouldBlock,
     BackingMismatch,
     BackingOffsetOverflow,
+    PageBeyondSize,
     PageCache(PageCacheError),
     StaleRecipe,
     Pmap(VmPmapError),
@@ -546,4 +667,53 @@ impl From<VmPmapError> for VmFaultError {
     fn from(value: VmPmapError) -> Self {
         Self::Pmap(value)
     }
+}
+
+fn materialize_zero_frame() -> Result<MaterializedPage, VmFaultError> {
+    let ppn = page_allocator::zero_frame_ppn().map_err(page_alloc_error)?;
+    let map_pin = page_allocator::acquire_map_pin(ppn).map_err(page_alloc_error)?;
+    Ok(MaterializedPage {
+        ppn,
+        map_pin: MaterializedPagePin::Allocated(map_pin),
+        newly_installed: false,
+        dirty: false,
+    })
+}
+
+fn allocate_private_materialized_page(dirty: bool) -> Result<MaterializedPage, VmFaultError> {
+    let frame = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
+        .map_err(page_alloc_error)?
+        .commit();
+    let ppn = frame.ppn();
+    let map_pin = frame.try_map_pin().map_err(page_alloc_error)?;
+    drop(frame);
+    Ok(MaterializedPage {
+        ppn,
+        map_pin: MaterializedPagePin::Allocated(map_pin),
+        newly_installed: true,
+        dirty,
+    })
+}
+
+fn allocate_private_materialized_page_from_source(
+    source: tx_hal::Ppn,
+    dirty: bool,
+) -> Result<MaterializedPage, VmFaultError> {
+    let reservation =
+        page_allocator::reserve_frame(ZeroPolicy::UninitFullOverwrite).map_err(page_alloc_error)?;
+    page_allocator::copy_frame_contents(source, reservation.ppn()).map_err(page_alloc_error)?;
+    let frame = reservation.commit();
+    let ppn = frame.ppn();
+    let map_pin = frame.try_map_pin().map_err(page_alloc_error)?;
+    drop(frame);
+    Ok(MaterializedPage {
+        ppn,
+        map_pin: MaterializedPagePin::Allocated(map_pin),
+        newly_installed: true,
+        dirty,
+    })
+}
+
+const fn page_alloc_error(error: tx_substrate::page_allocator::AllocError) -> VmFaultError {
+    VmFaultError::PageCache(PageCacheError::Alloc(error))
 }
