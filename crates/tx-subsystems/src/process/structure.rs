@@ -30,6 +30,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use tx_substrate::zone::{Cap, PayloadCap, Weak, Zone, ZoneAllocated};
 
+use crate::cred::Cred;
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::sync::SpinMutex;
 use crate::thread_runtime::ThreadIdentity;
@@ -123,6 +124,9 @@ pub struct ProcessPayload {
     /// whose mask permits the signal will sweep it on its next
     /// delivery point.
     pub(crate) group_pending: PendingSignalQueue,
+    /// Per-process credential snapshot. Mutated via `cred::step_setuid`
+    /// / `cred::step_setgid`; readers clone via `cred()` accessor.
+    pub(crate) cred: SpinMutex<Cred>,
 }
 
 impl ProcessPayload {
@@ -134,6 +138,13 @@ impl ProcessPayload {
     /// Borrow the per-process group-pending queue.
     pub fn group_pending(&self) -> &PendingSignalQueue {
         &self.group_pending
+    }
+
+    /// Snapshot the current credential. Returns a `Copy` so callers
+    /// don't have to retain the lock; permissioned mutators
+    /// (`cred::step_setuid` etc.) take the lock internally.
+    pub fn cred(&self) -> Cred {
+        *self.cred.lock()
     }
 }
 

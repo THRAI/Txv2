@@ -4,6 +4,18 @@
 
 ## Current Shape
 
+- 2026-05-05 Cred service stub layered on top of signal day-1 (branch
+  `process-topology`). Adds `crates/tx-subsystems/src/cred.rs` with
+  POSIX cred types (`Uid`, `Gid`, `Capability`, `CapabilitySet`,
+  `Cred`) and the `step_setuid` / `step_setgid` shims. `ProcessPayload`
+  gains `cred: SpinMutex<Cred>`; `bootstrap_init_process` initializes
+  with `Cred::root()`; `step_fork` inherits the parent's cred unchanged.
+  Privilege model: root or `CAP_SETUID`/`CAP_SETGID` allows arbitrary
+  id changes; non-privileged callers may only swap among existing
+  `(uid, euid)` / `(gid, egid)` pairs. Saved-set IDs, `fsuid`/`fsgid`,
+  supplementary groups, capability bounding/inheritable/ambient sets
+  all deferred — extend rather than reshape. 11 new tests; total
+  suite 227. Full `cargo xtask ci` green (11/11 gates).
 - 2026-05-05 Signal day-1 layered on top of the topology branch
   `process-topology`. Adds `crates/tx-subsystems/src/signal.rs` with
   the POSIX-shim types (`Signum`, `SignalMask`, `PendingSignalQueue`,
