@@ -26,7 +26,7 @@ where
 
         match self.with_pager(|pager| pager.lookup(parent, name)) {
             Ok(Some(inode)) => StepOutcome::Done(inode_fs_object_id(inode)),
-            Ok(None) => StepOutcome::Err(Errno::NoEntry),
+            Ok(None) => StepOutcome::Err(Errno::ENOENT),
             Err(err) => StepOutcome::Err(err),
         }
     }
@@ -53,7 +53,7 @@ where
         _meta: &InodeMeta,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn create_inode<'g>(
@@ -64,7 +64,7 @@ where
         _cred: &Credential,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn unlink<'g>(
@@ -74,7 +74,7 @@ where
         _target: FsObjectId,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn rename<'g>(
@@ -85,7 +85,7 @@ where
         _new_name: &[u8],
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn link<'g>(
@@ -95,7 +95,7 @@ where
         _target: FsObjectId,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn mkdir<'g>(
@@ -106,7 +106,7 @@ where
         _cred: &Credential,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn rmdir<'g>(
@@ -116,7 +116,7 @@ where
         _target: FsObjectId,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn symlink<'g>(
@@ -127,7 +127,7 @@ where
         _cred: &Credential,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn readdir<'g>(
@@ -145,7 +145,7 @@ where
             Err(err) => return StepOutcome::Err(err),
         };
         if index >= READDIR_WINDOW_ENTRIES {
-            return StepOutcome::Err(Errno::NotImplemented);
+            return StepOutcome::Err(Errno::ENOSYS);
         }
 
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
@@ -177,6 +177,6 @@ where
         _fs_object_id: FsObjectId,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 }

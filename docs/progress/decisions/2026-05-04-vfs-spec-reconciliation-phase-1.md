@@ -20,7 +20,7 @@ plan closes the working-side drift.
 | `InodeMeta` fields | `{kind, mode, uid, gid, size, nlink, rdev}` (no timestamps; doc-absent `kind`/`rdev`) | `{mode, uid, gid, size, atime, mtime, ctime, nlinks, blocks, flags}` per [`TX_EXT4_PLAN_v1_2.md:433`](../../design/05_filesystem/TX_EXT4_PLAN_v1_2.md) | matches doc; `kind()` is now a `mode & S_IFMT` derivation method; `rdev` removed |
 | `DirCursor` shape | `pub struct DirCursor(u64)` | `pub struct DirCursor(pub [u8; 16])` per [`TX_EXT4_PLAN_v1_2.md:448`](../../design/05_filesystem/TX_EXT4_PLAN_v1_2.md) | matches doc; `from_u64`/`as_u64` helpers preserve the u64-encoded common case |
 | `Timespec` type | absent | required by InodeMeta atime/mtime/ctime | added with `EPOCH` const |
-| `MountOutput` type | absent | defined in [`TX_EXT4_PLAN_v1_2.md:541`](../../design/05_filesystem/TX_EXT4_PLAN_v1_2.md) and [`bringup_fs_specs_v_1:240`](../../design/05_filesystem/bringup_fs_specs_v_1%20%281%29.md) | added |
+| `MountOutput` type | absent | defined in [`TX_EXT4_PLAN_v1_2.md:541`](../../design/05_filesystem/TX_EXT4_PLAN_v1_2.md) and [`bringup_fs_specs_v_1:240`](<../../design/05_filesystem/bringup_fs_specs_v_1 (1).md>) | added |
 | Subsystem layout | flat 753-line `vfs.rs` | `structure/` + `checks/` + `execution/` per [`SUBSYSTEM_ANATOMY_v2_1.md:35`](../../design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) | decomposed into `vfs/{mod,structure,checks,execution,tests}.rs` |
 
 ## Sub-step ledger
