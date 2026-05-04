@@ -106,6 +106,147 @@ fn map_script_async_yields_on_writer_conflict_and_completes_after_release() {
 }
 
 #[test]
+fn unmap_async_yields_on_writer_conflict_and_completes_after_release() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target_range = range(0x6000, 1);
+
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target_range,
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("baseline map");
+
+    let holder = match aspace
+        .range_lock()
+        .acquire(target_range, crate::vm::LockMode::ExclusiveWriter)
+    {
+        crate::vm::AcquireResult::Acquired(guard) => guard,
+        _ => panic!("baseline acquire should succeed"),
+    };
+
+    let mut future = Box::pin(aspace.unmap_async(target_range));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+
+    drop(holder);
+
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(_)) => {}
+        Poll::Ready(Err(error)) => panic!("post-release unmap errored: {error:?}"),
+        Poll::Pending => panic!("expected Ready after holder release"),
+    }
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(0x6000)).is_none());
+}
+
+#[test]
+fn protect_async_yields_on_writer_conflict_and_completes_after_release() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target_range = range(0x7000, 1);
+
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target_range,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("baseline map");
+
+    let holder = match aspace
+        .range_lock()
+        .acquire(target_range, crate::vm::LockMode::ExclusiveWriter)
+    {
+        crate::vm::AcquireResult::Acquired(guard) => guard,
+        _ => panic!("baseline acquire should succeed"),
+    };
+
+    let mut future = Box::pin(aspace.protect_async(target_range, Prot::READ));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+
+    drop(holder);
+
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(_)) => {}
+        Poll::Ready(Err(error)) => panic!("post-release protect errored: {error:?}"),
+        Poll::Pending => panic!("expected Ready after holder release"),
+    }
+    assert_eq!(
+        aspace
+            .lookup(crate::vm::UserVirtAddr(0x7000))
+            .expect("entry exists")
+            .prot,
+        Prot::READ
+    );
+}
+
+#[test]
+fn remap_async_yields_on_pair_conflict_and_completes_after_release() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let old_range = range(0x8000, 1);
+    let new_range = range(0xa000, 1);
+
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            old_range,
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("baseline map");
+
+    let holder = match aspace
+        .range_lock()
+        .acquire(new_range, crate::vm::LockMode::ExclusiveWriter)
+    {
+        crate::vm::AcquireResult::Acquired(guard) => guard,
+        _ => panic!("baseline acquire should succeed"),
+    };
+
+    let request = VmRemapRequest {
+        old_range,
+        new_range,
+    };
+    let mut future = Box::pin(aspace.remap_async(request));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+
+    drop(holder);
+
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(outcome)) => {
+            assert_eq!(outcome.old_range, old_range);
+            assert_eq!(outcome.new_range, new_range);
+        }
+        Poll::Ready(Err(error)) => panic!("post-release remap errored: {error:?}"),
+        Poll::Pending => panic!("expected Ready after holder release"),
+    }
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(0x8000)).is_none());
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(0xa000)).is_some());
+}
+
+#[test]
 fn range_lock_release_fires_registered_channel_for_external_subscribers() {
     let aspace = AddressSpace::new();
     let range = range(0x4000, 1);
