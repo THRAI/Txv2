@@ -4,6 +4,24 @@
 
 ## Current Shape
 
+- 2026-05-04 PageBacked fallocate slice landed (plan step
+  pagebacked-fallocate). `FsPageBacking` gained a default-impl
+  `fallocate(fs_object_id, new_size, guard)` so existing backings keep
+  compiling. `page_backed::step_fallocate` rejects Device with `EINVAL`,
+  rejects `new_size` beyond fixed `page_count` capacity with `EINVAL`,
+  treats `new_size <= pc.size_bytes()` as `Done(())` no-op, calls
+  `FsPageBacking::fallocate` first for File backings and only publishes
+  `pc.size_bytes` on backing success, and bumps `pc.size_bytes` for Anon
+  backings without materializing pages. Five new tests in
+  `page_backed/lifecycle_tests.rs`; `LifecycleFs` extended with
+  `fallocates`/`last_fallocate_size` counters and a `failing_fallocate`
+  constructor. Verification: `cargo fmt --check` clean, `cargo test -p
+  tx-kernel page_backed -- --test-threads=1` (34 ok), `cargo test -p
+  tx-kernel vm -- --test-threads=1` (60 ok), `cargo test -p tx-kernel --lib
+  -- --test-threads=1` (100 ok), workspace clippy clean, `cargo xtask lint
+  arch/unused/docs` ok, `cargo xtask progress validate` 24 ok. The
+  `mock-fs-pagebacking` dependency was retired in this slice: existing
+  `LifecycleFs` was sufficient.
 - 2026-05-04 madvise / msync / mincore observation surface landed (plan
   step madvise-msync-mincore). `AddressSpace::mincore(range)` returns
   range-page-count booleans against the new `VmPmap::walk_range`;

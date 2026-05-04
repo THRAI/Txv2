@@ -23,7 +23,7 @@ use tx_substrate::{
 
 mod lifecycle;
 mod user_buffer;
-pub use lifecycle::{step_fsync, step_truncate};
+pub use lifecycle::{step_fallocate, step_fsync, step_truncate};
 pub use user_buffer::{step_read_to_user, step_write_from_user};
 
 #[cfg(test)]
@@ -268,6 +268,18 @@ pub trait FsPageBacking: Send + Sync + 'static {
     ) -> StepOutcome<()>;
 
     fn fsync(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<()>;
+
+    /// Reserve space for future writes up to `new_size`. The default
+    /// implementation is `Done(())`: most filesystems can treat fallocate as
+    /// a hint. Backends that pre-allocate on-disk blocks override this.
+    fn fallocate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        StepOutcome::Done(())
+    }
 
     fn supports_reflink(&self, _other: &PageContainer) -> bool {
         false

@@ -127,18 +127,25 @@
     {
       "id": "pagebacked-fallocate",
       "title": "Add step_fallocate for File variant",
-      "status": "pending",
-      "depends_on": [
-        "mock-fs-pagebacking"
-      ],
+      "status": "complete",
+      "depends_on": [],
       "paths": [
+        "crates/tx-kernel/src/page_backed.rs",
         "crates/tx-kernel/src/page_backed/lifecycle.rs",
         "crates/tx-kernel/src/page_backed/lifecycle_tests.rs"
       ],
       "verification": [
-        "cargo test -p tx-kernel page_backed -- --test-threads=1"
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
       ],
-      "notes": "PAGE_BACKED §5.5. Reject for Anon/Device per spec. Grow PC.size without pre-materializing pages. Backing-first commit, then publish visible size."
+      "notes": "PAGE_BACKED §5.5. FsPageBacking gained a default-impl fallocate(fs_object_id, new_size, guard) so existing backings (RecordingFs, BlockingFs, LifecycleFs) keep compiling. step_fallocate rejects Device with EINVAL, rejects new_size beyond fixed page_count capacity with EINVAL, treats new_size <= current size as Done(()) no-op, calls FsPageBacking::fallocate first for File backings and only publishes pc.size_bytes on backing success, and bumps pc.size_bytes for Anon backings without materializing pages. Did not need a new mock-fs-pagebacking module: extending LifecycleFs with fallocates/last_fallocate_size counters and a failing_fallocate constructor was sufficient, so the original mock-fs-pagebacking prerequisite was dropped from depends_on. Five new tests cover Anon grow, File backing-first publication, File backing failure leaves state intact, Device + capacity-overflow EINVAL, and shrink/equal no-op."
     },
     {
       "id": "vm-fault-pc-size-checks",
