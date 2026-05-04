@@ -1,0 +1,421 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-05-04-vm-pagebacked-v1-completion",
+  "title": "VM/PageBacked v1 completion",
+  "status": "active",
+  "created": "2026-05-04",
+  "updated": "2026-05-04",
+  "owner": "claude/objective-davinci-37d55d",
+  "summary": "Bridge VM/PageBacked from current ~45% structure / ~30% behavior toward ~85% on both, leaving only items that the active design docs explicitly defer (rmap, hugetlb, userfaultfd, in-place mprotect, reclaim policy, writeback scheduling) or that depend on Process/ThreadRuntime ownership (fork_aspace, exec_aspace, trap page-fault dispatch).",
+  "scope": {
+    "in": [
+      "crates/tx-kernel/src/vm",
+      "crates/tx-kernel/src/page_backed.rs",
+      "crates/tx-kernel/src/page_backed/",
+      "crates/tx-substrate/src/page_allocator",
+      "crates/tx-hal/src",
+      "boards/tx-hal-riscv64-qemu-virt/src/user_access.rs",
+      "docs/progress/research/2026-05-03-vm-doc-gap-ledger.md",
+      "docs/progress/STATUS.md",
+      "docs/progress/decisions/",
+      "docs/progress/worktrees/2026-05-02-vm-pagebacked-impl.json"
+    ],
+    "out": [
+      "crates/tx-kernel/src/process",
+      "crates/tx-kernel/src/thread_runtime",
+      "crates/tx-kernel/src/trap/syscall-fault-dispatch",
+      "vfs-backends/ext4-devfs-bdev-fs-concrete",
+      "vm-deferred/rmap",
+      "vm-deferred/hugetlb",
+      "vm-deferred/userfaultfd",
+      "vm-deferred/mlock-as-observation",
+      "vm-deferred/in-place-mprotect-retag",
+      "vm-deferred/fairness-tuning",
+      "page-backed-deferred/reclaim-policy",
+      "page-backed-deferred/writeback-scheduling",
+      "page-backed-deferred/open-questions"
+    ],
+    "write_sets": [
+      {
+        "owner": "claude/objective-davinci-37d55d",
+        "paths": [
+          "docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json",
+          "crates/tx-kernel/src/vm",
+          "crates/tx-kernel/src/page_backed.rs",
+          "crates/tx-kernel/src/page_backed",
+          "docs/progress/research/2026-05-03-vm-doc-gap-ledger.md",
+          "docs/progress/STATUS.md",
+          "docs/progress/decisions"
+        ],
+        "notes": "Single-owner during initial implementation. When parallel slices fan out, each worker claims a disjoint subset (vm/structure vs vm/execution vs page_backed core vs page_backed lifecycle) via its own worktree record."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/03_memory-vm/VM_v1_2.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/01_substrate/PAGE_SUBSTRATE_v1.md",
+      "docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md",
+      "docs/design/02_execution/STEP_MODEL_v1.md",
+      "docs/design/00_meta-framework/INVARIANTS_v4.md",
+      "docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/STATUS.md",
+      "docs/progress/research/2026-05-03-vm-doc-gap-ledger.md",
+      "docs/progress/worktrees/2026-05-02-vm-pagebacked-impl.json",
+      "docs/progress/decisions/2026-05-02-vm-pmapif-root-owner.md",
+      "docs/progress/decisions/2026-05-04-claude-harness-parallel-and-main-resync.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "gap-ledger-refresh",
+      "title": "Refresh vm-doc-gap-ledger to post-resync state",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/progress/research/2026-05-04-vm-pagebacked-gap-update.md"
+      ],
+      "verification": [
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Captured as a dated follow-up note (2026-05-04-vm-pagebacked-gap-update.md) rather than mutating the prior 2026-05-03 ledger snapshot. Notes new useraccessif/irqif HAL surfaces and points at this plan as the new active mitigation order."
+    },
+    {
+      "id": "user-buffer-byte-copy",
+      "title": "Wire useraccessif into step_read/step_write byte transfer",
+      "status": "pending",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/page_backed.rs",
+        "crates/tx-hal/src",
+        "boards/tx-hal-riscv64-qemu-virt/src/user_access.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings"
+      ],
+      "notes": "PAGE_BACKED §5.1/5.2 byte-accurate transfer. Use newly-merged useraccessif HAL trait. Add host-test backing so step_read/step_write tests can assert byte equality without QEMU. Keep copyless fast path for in-kernel ranges; user-buffer path goes through useraccessif."
+    },
+    {
+      "id": "mock-fs-pagebacking",
+      "title": "Implement mock FsPageBacking covering File-variant materialize_page",
+      "status": "pending",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/page_backed.rs",
+        "crates/tx-kernel/src/vfs.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed -- --test-threads=1"
+      ],
+      "notes": "PAGE_BACKED §6 is currently an interface shell. Provide a mock backing that supports fetch/flush/truncate/metadata so File-variant tests exercise the dispatcher end-to-end. No ext4/devfs/bdev-fs work in this step."
+    },
+    {
+      "id": "pagebacked-fallocate",
+      "title": "Add step_fallocate for File variant",
+      "status": "pending",
+      "depends_on": [
+        "mock-fs-pagebacking"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/page_backed/lifecycle.rs",
+        "crates/tx-kernel/src/page_backed/lifecycle_tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed -- --test-threads=1"
+      ],
+      "notes": "PAGE_BACKED §5.5. Reject for Anon/Device per spec. Grow PC.size without pre-materializing pages. Backing-first commit, then publish visible size."
+    },
+    {
+      "id": "vm-fault-pc-size-checks",
+      "title": "Wire PC.size into VM fault SIGBUS-style checks",
+      "status": "pending",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/vm/checks.rs",
+        "crates/tx-kernel/src/vm/structure/types.rs",
+        "crates/tx-kernel/src/vm/tests/fault_materialization.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm -- --test-threads=1"
+      ],
+      "notes": "Currently called out as the next step in STATUS.md. Reject faults beyond visible PC.size with the documented SIGBUS shape; keep capacity-bound check separate."
+    },
+    {
+      "id": "partial-page-byte-fidelity",
+      "title": "Byte-accurate partial-page truncate and growth",
+      "status": "pending",
+      "depends_on": [
+        "user-buffer-byte-copy",
+        "vm-fault-pc-size-checks",
+        "pagebacked-fallocate"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/page_backed.rs",
+        "crates/tx-kernel/src/page_backed/lifecycle.rs",
+        "crates/tx-kernel/src/page_backed/lifecycle_tests.rs",
+        "crates/tx-kernel/src/page_backed/size_tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed -- --test-threads=1"
+      ],
+      "notes": "PAGE_BACKED §5.1/5.2/5.3 partial-page byte handling. Zero past-EOF tail on truncate-grow inside last page; partial reads/writes at the EOF page; no full-page materialization for purely metadata growth."
+    },
+    {
+      "id": "wait-aware-step-outcome",
+      "title": "Confirm StepOutcome carries wait tokens fault paths can yield through",
+      "status": "pending",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-substrate/src",
+        "crates/tx-kernel/src/vm/structure/types.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate --lib"
+      ],
+      "notes": "STEP_MODEL_v1 wait-aware StepOutcome contract. Audit current shape; if missing, extend with Wait(WaitToken)/Blocked variants the script wrappers can observe. No behavior change for existing callers."
+    },
+    {
+      "id": "fault-script-async",
+      "title": "Wrap resolve_fault as async fault_script with reservation drop on wait",
+      "status": "pending",
+      "depends_on": [
+        "wait-aware-step-outcome",
+        "user-buffer-byte-copy",
+        "vm-fault-pc-size-checks"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/structure/range_lock.rs",
+        "crates/tx-kernel/src/vm/tests/fault_materialization.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm -- --test-threads=1"
+      ],
+      "notes": "VM §5.1 + §3.6 cross-async-wait discipline. Drop the Materializer reservation across PageBacked wait, re-acquire on resume, revalidate recipe before publication. Synchronous resolve_fault stays as the inner step."
+    },
+    {
+      "id": "mmap-script-async",
+      "title": "Wrap mmap helpers as async mmap_script",
+      "status": "pending",
+      "depends_on": [
+        "wait-aware-step-outcome"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/tests/execution_scripts.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm -- --test-threads=1"
+      ],
+      "notes": "VM §5.2. ExclusiveWriter reservation, recipe insert/replace, pmap reserve_map. No semantic change; the inner sync helpers stay as compatibility surface."
+    },
+    {
+      "id": "munmap-mprotect-mremap-scripts",
+      "title": "Async wrappers for munmap, mprotect, mremap",
+      "status": "pending",
+      "depends_on": [
+        "wait-aware-step-outcome"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/tests/execution_scripts.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm -- --test-threads=1"
+      ],
+      "notes": "VM §5.3/5.4/5.5. Same shape as mmap_script. Mremap stays in disjoint-only mode for v1; overlapping is documented v1 debt."
+    },
+    {
+      "id": "brk-script",
+      "title": "brk_script over the existing AddressSpace mapping primitives",
+      "status": "pending",
+      "depends_on": [
+        "mmap-script-async"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/tests/execution_scripts.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm -- --test-threads=1"
+      ],
+      "notes": "VM §5.8. Models the brk region as an Anon mapping that the script grows/shrinks; no Process dependency for the in-VM portion."
+    },
+    {
+      "id": "madvise-msync-mincore",
+      "title": "Observation-only scripts: madvise, msync, mincore",
+      "status": "pending",
+      "depends_on": [
+        "wait-aware-step-outcome"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/tests/execution_scripts.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm -- --test-threads=1"
+      ],
+      "notes": "VM §5.9. madvise treats MADV_WILLNEED as no-op per §9.7; msync delegates to PageBacked step_fsync where applicable; mincore reads the pmap walk surface (which §10 below extends)."
+    },
+    {
+      "id": "vm-pmap-walk-protect-surface",
+      "title": "Extend VmPmap with walk and protect-without-teardown for mincore + future fork CoW demotion",
+      "status": "pending",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/vm/pmap.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm -- --test-threads=1"
+      ],
+      "notes": "Adds the bare pmap walk needed by mincore and the protect-without-teardown surface required by fork CoW demotion later. Does not implement in-place retag (§9.8 deferred); demotion is via tear-down then refault per §3.4 of the existing design."
+    },
+    {
+      "id": "persistent-epoch-recipes",
+      "title": "Replace BTreeMap snapshot publication with persistent/epoch range index",
+      "status": "pending",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/vm/structure/recipe.rs",
+        "crates/tx-kernel/src/vm/structure/range_lock.rs",
+        "crates/tx-kernel/src/vm/checks.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm -- --test-threads=1"
+      ],
+      "notes": "VM §1.2 publication rule + INVARIANTS_v4 ARCH-5. Replace cloned BTreeMap publication under a small mutex with a persistent epoch-snapshot range index, expose IdentRef-shaped guard-scoped witnesses to vm::checks, retire vm::checks staged-witness shims. Largest single structural step; can be parallelized with the script wrappers above."
+    },
+    {
+      "id": "cross-variant-scripts",
+      "title": "splice / sendfile / copy_file_range over PageBacked variants",
+      "status": "pending",
+      "depends_on": [
+        "mock-fs-pagebacking",
+        "user-buffer-byte-copy"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/page_backed.rs",
+        "crates/tx-kernel/src/vfs.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed -- --test-threads=1"
+      ],
+      "notes": "PAGE_BACKED §9. Match-on-both-ends dispatch over Anon/File/Device. File-File path uses mock backing for tests; Device path documents zero-copy intent."
+    },
+    {
+      "id": "reflink-cow-scaffold",
+      "title": "Reflink + CoW-on-write scaffolding inside PageContainer share rules",
+      "status": "pending",
+      "depends_on": [
+        "mock-fs-pagebacking",
+        "persistent-epoch-recipes"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/page_backed.rs",
+        "crates/tx-kernel/src/page_backed/lifecycle.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed -- --test-threads=1"
+      ],
+      "notes": "PAGE_BACKED §7. Wire share/CoW counters on the PageContainer side; full reflink across two RNodes still waits on a real backend with refcount support. Document the §12.4 reflink-vs-truncate race as deferred."
+    },
+    {
+      "id": "ledger-and-status-final",
+      "title": "Final ledger + STATUS update; verify completion bar",
+      "status": "pending",
+      "depends_on": [
+        "user-buffer-byte-copy",
+        "fault-script-async",
+        "mmap-script-async",
+        "munmap-mprotect-mremap-scripts",
+        "brk-script",
+        "madvise-msync-mincore",
+        "vm-pmap-walk-protect-surface",
+        "persistent-epoch-recipes",
+        "cross-variant-scripts",
+        "reflink-cow-scaffold",
+        "partial-page-byte-fidelity"
+      ],
+      "paths": [
+        "docs/progress/research/2026-05-03-vm-doc-gap-ledger.md",
+        "docs/progress/STATUS.md",
+        "docs/progress/decisions/"
+      ],
+      "verification": [
+        "cargo xtask ci",
+        "cargo xtask progress validate",
+        "cargo xtask lint docs"
+      ],
+      "notes": "Restate completion at >=85% on structure and behavior. Name remaining gaps explicitly: fork_aspace/exec_aspace/trap-dispatch (Process-blocked), reclaim policy and writeback scheduling (v1-deferred), reverse mapping/hugetlb/userfaultfd/in-place-mprotect/mlock optimization (deferred). Add a dated decision note that closes this plan."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo fmt --check",
+      "status": "not-run",
+      "notes": "Per tx-vm-pagebacked skill checklist"
+    },
+    {
+      "command": "cargo test -p tx-kernel vm -- --test-threads=1",
+      "status": "not-run",
+      "notes": "VM-focused test gate"
+    },
+    {
+      "command": "cargo test -p tx-kernel page_backed -- --test-threads=1",
+      "status": "not-run",
+      "notes": "PageBacked-focused test gate"
+    },
+    {
+      "command": "cargo test -p tx-kernel --lib",
+      "status": "not-run",
+      "notes": "Crate-level regression"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+      "status": "not-run",
+      "notes": "Workspace lint gate"
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "not-run",
+      "notes": "Docs/grep-stable txdoc anchor checks"
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "not-run",
+      "notes": "Progress JSON validity"
+    },
+    {
+      "command": "cargo xtask ci",
+      "status": "not-run",
+      "notes": "Run before closing the plan"
+    },
+    {
+      "command": "git diff --check",
+      "status": "not-run",
+      "notes": "Whitespace/conflict markers"
+    }
+  ],
+  "risks": [
+    "wait-aware-step-outcome may force StepOutcome shape changes that ripple into reactor and other subsystems; keep the change narrow and additive.",
+    "persistent-epoch-recipes is a foundational rewrite; it can land in parallel with script wrappers but conflicts with vm/checks staged witnesses must be resolved deliberately.",
+    "user-buffer-byte-copy depends on the host-test side of useraccessif; if the host harness lacks a usable mock, add one before tightening byte-equality assertions.",
+    "Each script wrapper risks duplicating reservation/revalidation logic; factor a shared helper once two wrappers exist."
+  ],
+  "blockers": [
+    "fork_aspace, exec_aspace, and trap page-fault dispatch are explicitly out of scope: they require Process ownership of Cap<AddressSpace> and ThreadRuntime authority paths.",
+    "Concrete VFS backends (ext4, devfs, bdev-fs) are out of scope; mock FsPageBacking is the substitute.",
+    "PAGE_BACKED §8 reclaim policy and §12 open questions are deferred by the design docs."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}
