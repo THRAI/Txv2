@@ -233,15 +233,27 @@ impl RangeLock {
 }
 ```
 
-**Implementation note.** The current implementation realizes the
-`StepOutcome<RangeGuard>` return as a richer enum `AcquireResult` whose
-`WouldBlock` variant carries an internal `PendingWriter` slot used to
-implement writer-preference (a pending writer in the AVL-backed
-reservation tree pushes back on subsequent `Materializer` acquires).
-Async script wrappers project `AcquireResult` to the conceptual
-`StepOutcome` shape by extracting `WouldBlock::wait_token()` and
-dropping the rich carrier. The pair variant uses an analogous
-`AcquirePairResult`. Both are pub re-exports of `vm::structure::range_lock`.
+**Implementation note.** `RangeLock` exposes both the canonical
+spec-shaped surface and a richer dual API for tests and future
+writer-preference clients:
+
+- `acquire_step(range, mode) -> StepOutcome<RangeGuard<'_>>` is the
+  canonical surface used by all production scripts (`mmap_script`,
+  `munmap_script`, `mprotect_script`, `mremap_script`,
+  `fault_script`, `brk_script`). It produces `Done(guard)` on
+  immediate acquisition and `Blocked(WaitToken)` on contention; async
+  callers feed the token to `wait_carrier::wait_on_token` and retry.
+- `acquire_step_rich(range, mode) -> AcquireResult<'_>` is the
+  underlying rich variant whose `WouldBlock` carrier holds an internal
+  `PendingWriter` slot. The slot pushes back on subsequent
+  `Materializer` acquires inside the AVL-backed reservation tree
+  (writer-preference). Production callers do not need this; the
+  writer-preference unit tests in `vm/tests.rs` consume it via
+  `WouldBlock::pending_writer()` and `PendingWriter::try_acquire()`.
+
+`acquire_pair_step` and `acquire_pair_step_rich` follow the same
+shape. The canonical method is a thin projection over the rich one
+and never produces `Advanced`/`AdvancedThenBlocked`/`Err`.
 
 ```rust
 

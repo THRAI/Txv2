@@ -11,7 +11,7 @@
 
 use tx_reactor::wait::{Channel, Mask};
 
-use crate::execution::WaitToken;
+use crate::execution::{StepOutcome, WaitToken};
 use crate::sync::SpinMutex;
 use crate::wait_carrier;
 
@@ -134,7 +134,40 @@ impl RangeLock {
         self.wait_carrier_id
     }
 
-    pub fn acquire_step(&self, range: UserRange, mode: LockMode) -> AcquireResult<'_> {
+    /// Canonical step-shaped acquire per VM_v1_2 §3.1. Done = the
+    /// reservation is held; Blocked = the caller should await
+    /// `WaitToken` and retry. The internal `PendingWriter` slot used
+    /// for writer-preference is not exposed here; production scripts
+    /// (which drop the rich `WouldBlock` carrier immediately on
+    /// blocking anyway) compose against this surface. Tests that probe
+    /// the rich pending-writer machinery use `acquire_step_rich`.
+    pub fn acquire_step(&self, range: UserRange, mode: LockMode) -> StepOutcome<RangeGuard<'_>> {
+        match self.acquire_step_rich(range, mode) {
+            AcquireResult::Acquired(guard) => StepOutcome::Done(guard),
+            AcquireResult::WouldBlock(blocked) => StepOutcome::Blocked(blocked.wait_token()),
+        }
+    }
+
+    /// Canonical step-shaped pair-acquire per VM_v1_2 §3.1.
+    pub fn acquire_pair_step(
+        &self,
+        a: (UserRange, LockMode),
+        b: (UserRange, LockMode),
+    ) -> StepOutcome<RangeGuardPair<'_>> {
+        match self.acquire_pair_step_rich(a, b) {
+            AcquirePairResult::Acquired(pair) => StepOutcome::Done(pair),
+            AcquirePairResult::WouldBlock(blocked) => StepOutcome::Blocked(blocked.wait_token()),
+        }
+    }
+
+    /// Rich variant exposing the `AcquireResult` carrier so callers can
+    /// inspect (and, for `ExclusiveWriter`, retain) the internal
+    /// `PendingWriter` slot used to implement writer-preference. Spec-
+    /// shaped callers should prefer [`Self::acquire_step`]; this
+    /// variant exists for the writer-preference test machinery and
+    /// future producers that want to retain a pending-writer slot
+    /// across an await.
+    pub fn acquire_step_rich(&self, range: UserRange, mode: LockMode) -> AcquireResult<'_> {
         let mut state = self.state.lock();
         match mode {
             LockMode::Materializer => {
@@ -157,7 +190,8 @@ impl RangeLock {
         }
     }
 
-    pub fn acquire_pair_step(
+    /// Rich variant of [`Self::acquire_pair_step`].
+    pub fn acquire_pair_step_rich(
         &self,
         a: (UserRange, LockMode),
         b: (UserRange, LockMode),
