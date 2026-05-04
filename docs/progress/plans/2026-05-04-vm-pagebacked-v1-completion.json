@@ -252,18 +252,31 @@
     {
       "id": "mmap-script-async",
       "title": "Wrap mmap helpers as async mmap_script",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
-        "wait-aware-step-outcome"
+        "wait-aware-step-outcome",
+        "waittoken-channel-resolver"
       ],
       "paths": [
         "crates/tx-kernel/src/vm/execution.rs",
-        "crates/tx-kernel/src/vm/tests/execution_scripts.rs"
+        "crates/tx-kernel/src/vm/structure/range_lock.rs",
+        "crates/tx-kernel/src/vm/structure/mod.rs",
+        "crates/tx-kernel/src/vm/mod.rs",
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
       ],
       "verification": [
-        "cargo test -p tx-kernel vm -- --test-threads=1"
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
       ],
-      "notes": "VM §5.2. ExclusiveWriter reservation, recipe insert/replace, pmap reserve_map. No semantic change; the inner sync helpers stay as compatibility surface."
+      "notes": "VM_v1_2 §5.2 + §3.6 cross-async-wait discipline, end-to-end. RangeLock now owns a tx_reactor::wait::Channel registered with wait_carrier under a non-zero carrier id (pub const RANGE_LOCK_RELEASE_MASK is the mask bit fired on every release). RangeLock::release_active and release_pending_writer now fire the channel; WouldBlock<'a> carries a &'a RangeLock reference and exposes wait_token() returning a WaitToken whose carrier resolves to the lock's release channel. Drop on RangeLock releases the wait_carrier registration. AddressSpace::map_script_async is the first async script wrapper: it loops calling reserve_map; on WouldBlock, it extracts the wait_token, drops the blocked guard (releasing any pending-writer slot), awaits via wait_carrier::wait_on_token, and retries. Inner sync helpers stay as compatibility surface. Four tests in vm/tests/script_async.rs cover wait_token shape, uncontended one-poll success, blocked-then-release-wakes-and-completes, and external-subscriber wake on RangeLock release."
     },
     {
       "id": "munmap-mprotect-mremap-scripts",

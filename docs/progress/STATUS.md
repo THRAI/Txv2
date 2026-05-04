@@ -4,6 +4,22 @@
 
 ## Current Shape
 
+- 2026-05-04 mmap-script-async landed end-to-end as the working template
+  for the async script wave (plan step mmap-script-async). RangeLock now
+  owns a `tx_reactor::wait::Channel` registered with `wait_carrier`;
+  release fires `RANGE_LOCK_RELEASE_MASK` so blocked acquirers can wake.
+  `WouldBlock<'a>` carries a `&'a RangeLock` and exposes
+  `wait_token() -> WaitToken`. `Drop for RangeLock` releases the carrier
+  registration. `AddressSpace::map_script_async` loops calling
+  `reserve_map`, drops the blocked guard, awaits
+  `wait_carrier::wait_on_token`, and retries — honoring VM_v1_2 §3.6
+  cross-async-wait discipline. Four tests in `vm/tests/script_async.rs`
+  cover wait_token shape, uncontended one-poll success, blocked-then-
+  release wakes the future, and external Channel subscribers see the
+  release fire. Verification: `cargo fmt --check` clean, vm 64 ok (was
+  60, +4 script_async), page_backed 49 ok, lib 125 ok, workspace clippy
+  clean, `cargo xtask lint arch/unused/docs` ok, `cargo xtask progress
+  validate` 24 ok.
 - 2026-05-04 WaitToken → Channel resolver landed (plan-extension step
   waittoken-channel-resolver, prerequisite for the four async script
   wrappers). New `tx_kernel::wait_carrier` module holds a

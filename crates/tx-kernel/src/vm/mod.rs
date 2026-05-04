@@ -24,5 +24,6 @@ pub use structure::{
     UserPageIter, UserRange, UserRangeError, UserVirtAddr, VmBacking, VmEntry, VmEntryError,
     VmEntryFlags, VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization,
     VmFaultMaterializationBacking, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
-    VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest, WouldBlock, USER_PAGE_SIZE,
+    VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest, WouldBlock, RANGE_LOCK_RELEASE_MASK,
+    USER_PAGE_SIZE,
 };
