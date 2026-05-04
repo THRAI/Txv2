@@ -2,7 +2,14 @@
 
 **Date:** 2026-05-04
 **Branch:** `vm-compliance-fixup`
-**Status:** Complete. CI green (11 gates). 79/79 vm:: tests pass.
+**Status:** Complete (revised). CI green (11 gates). 79/79 vm:: tests pass.
+
+**Revision note.** Initial branch landed only a doc note for the
+`AcquireResult` → `StepOutcome` structural drift (item B4). Reviewer
+flagged the pivot; B4 was re-opened and a follow-up commit (`b9c7c38`)
+made the canonical change with a dual-API split. Spec is now realized
+literally on the public surface; the rich variant is retained as a
+`_rich`-suffixed method for writer-preference tests.
 
 ## Context
 
@@ -94,6 +101,23 @@ VM lib tests: 79/79 pass with `--test-threads=1` (was 77).
 
 Two doc-comment-trigger formatting deltas from the rename pass.
 
+### 5. RangeLock canonical StepOutcome surface (commit `b9c7c38`)
+
+Closes audit item B4. Public method
+`RangeLock::acquire_step(range, mode) -> StepOutcome<RangeGuard<'_>>`
+matches the spec literally; the rich `AcquireResult` is retained as
+`acquire_step_rich` for writer-preference tests. Same shape for
+`acquire_pair_step` / `acquire_pair_step_rich`. Production callers
+(scripts, sync helpers, `reserve_map`, `acquire_writer`) all use the
+canonical surface. Two private helpers in `execution.rs`
+(`await_range_lock`, `unreachable_acquire_step`) centralise the
+await-and-retry and unreachable-arm patterns.
+
+`MapReserveResult::WouldBlock(WouldBlock<'a>)` simplified to
+`MapReserveResult::Blocked(WaitToken)` — the rich carrier was only
+reached by the async script and the new canonical surface returns the
+token directly.
+
 ## What was deferred (not drift)
 
 - **`exec_aspace` rebuild half.** Doc says
@@ -119,6 +143,8 @@ Two doc-comment-trigger formatting deltas from the rename pass.
 - `63e72fc` — `docs(vm): reconcile VM_v1_2 with implementation surface`
 - `83a3903` — `vm: implement MADV_DONTNEED + MADV_FREE per VM_v1_2 §5.9`
 - `a4ef976` — `vm: cargo fmt`
+- `0ba9fea` — `docs(progress): record VM compliance fixup completion`
+- `b9c7c38` — `vm: align RangeLock acquire_step with canonical StepOutcome surface`
 
 ## Next step
 
