@@ -325,6 +325,78 @@ fn brk_script_async_rejects_below_brk_base_with_invalid_range() {
 }
 
 #[test]
+fn fault_script_async_succeeds_in_one_poll_when_uncontended() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target = range(0x18000, 1);
+
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target,
+            Prot::READ_WRITE,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("baseline map");
+
+    let fault = VmFault::new(crate::vm::UserVirtAddr(0x18000), AccessMode::Write);
+    let mut future = Box::pin(aspace.fault_script_async(fault));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(_)) => {}
+        Poll::Ready(Err(error)) => panic!("uncontended fault errored: {error:?}"),
+        Poll::Pending => panic!("uncontended fault should not yield"),
+    }
+}
+
+#[test]
+fn fault_script_async_yields_on_writer_conflict_and_completes_after_release() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target = range(0x1a000, 1);
+
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target,
+            Prot::READ_WRITE,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("baseline map");
+
+    let holder = match aspace
+        .range_lock()
+        .acquire(target, crate::vm::LockMode::ExclusiveWriter)
+    {
+        crate::vm::AcquireResult::Acquired(guard) => guard,
+        _ => panic!("baseline acquire should succeed"),
+    };
+
+    let fault = VmFault::new(crate::vm::UserVirtAddr(0x1a000), AccessMode::Write);
+    let mut future = Box::pin(aspace.fault_script_async(fault));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+
+    drop(holder);
+
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(_)) => {}
+        Poll::Ready(Err(error)) => panic!("post-release fault errored: {error:?}"),
+        Poll::Pending => panic!("expected Ready after holder release"),
+    }
+}
+
+#[test]
 fn range_lock_release_fires_registered_channel_for_external_subscribers() {
     let aspace = AddressSpace::new();
     let range = range(0x4000, 1);

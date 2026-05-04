@@ -56,6 +56,76 @@ impl AddressSpace {
             .map_err(VmFaultError::Pmap)
     }
 
+    /// Async wrapper around `resolve_fault` + `materialize_pagebacked` +
+    /// `publish_fault_materialization` that yields on `RangeLock`
+    /// `WouldBlock` and retries after a release wakes the lock's wait
+    /// channel.
+    ///
+    /// VM_v1_2 §5.1 + §3.6 cross-async-wait discipline. Each iteration:
+    ///
+    /// 1. Acquires a Materializer reservation, observes the recipe, and
+    ///    drops the reservation. On WouldBlock the future awaits on the
+    ///    `RangeLock`'s wait channel and retries.
+    /// 2. Materializes the page through `materialize_pagebacked`. PC-side
+    ///    Blocked outcomes (File-variant `step_fsync` / FsPageBacking)
+    ///    are not yet exposed through this script — they remain a
+    ///    follow-up that requires per-`PageContainer` wait channels.
+    /// 3. Re-acquires the Materializer reservation and publishes the
+    ///    materialization through the pmap. WouldBlock here drops the
+    ///    materialization (releasing the MapPin) and retries from
+    ///    step 1, re-observing the recipe afresh.
+    pub async fn fault_script_async(
+        &self,
+        fault: VmFault,
+    ) -> Result<PmapPublishOutcome, VmFaultError> {
+        let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
+        loop {
+            let outcome = {
+                let _guard = match self.range_lock.acquire(page_range, LockMode::Materializer) {
+                    AcquireResult::Acquired(guard) => guard,
+                    AcquireResult::WouldBlock(blocked) => {
+                        let token = blocked.wait_token();
+                        drop(blocked);
+                        if let Some(future) = crate::wait_carrier::wait_on_token(token) {
+                            let _ = future.await;
+                        }
+                        continue;
+                    }
+                };
+                require_fault_recipe(self, fault)?
+            };
+
+            let materialization = outcome.materialize_pagebacked()?;
+
+            let _guard = match self
+                .range_lock
+                .acquire(outcome.page_range, LockMode::Materializer)
+            {
+                AcquireResult::Acquired(guard) => guard,
+                AcquireResult::WouldBlock(blocked) => {
+                    let token = blocked.wait_token();
+                    drop(blocked);
+                    drop(materialization);
+                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
+                        let _ = future.await;
+                    }
+                    continue;
+                }
+            };
+            let _entry = require_fault_publication(self, &outcome, &materialization)?;
+            return self
+                .pmap
+                .publish_page_with_replacement(
+                    outcome.page_range.start().containing_page(),
+                    materialization.page.ppn,
+                    materialization.publish_prot,
+                    materialization.page.map_pin,
+                    materialization.replace_existing,
+                )
+                .map_err(VmFaultError::Pmap);
+        }
+    }
+
     pub fn map_script(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
         let (range, placement) = match request.target {
             VmMapTarget::Anywhere { window, page_count } => {
