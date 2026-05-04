@@ -9,6 +9,10 @@ pub enum ZoneError {
     AlreadyInitialized,
     /// Zone runtime was used before BSP initialization.
     NotInitialized,
+    /// Zone runtime has been frozen for shutdown/panic diagnostics.
+    FrozenForShutdown,
+    /// The target zone has not been registered during boot-time zone setup.
+    NotRegistered,
     /// No slab/frame/slot resource was available.
     AllocationFailed,
     /// A slot or runtime state violated the expected lifecycle.

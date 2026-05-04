@@ -15,6 +15,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
 
     fn on_timer_interrupt(_cpu: CpuId) -> TrapAction {
         P::cancel_deadline();
+        crate::zones::try_bounded_maintenance_tick();
         TrapAction::Resume
     }
 

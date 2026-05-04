@@ -33,10 +33,13 @@ pub use meta::{SlotState, SlotWord};
 pub use payload::{CoLocatedEntity, Entity, PayloadBinding};
 pub use policy::{ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy};
 pub use registry::{
-    lookup, register_static_zone, registered_zone_count, snapshot, SlotKey, ZoneId, ZoneInfo,
+    lookup, register_static_zone, registered_zone_count, retry_retire_pending_slots, snapshot,
+    EmptySlabTrimStats, SlotKey, ZoneId, ZoneInfo,
 };
 pub use reservation::{reserve, sign, ZoneReservation};
-pub use runtime::{init_on_ap, init_on_bsp, is_initialized};
+pub use runtime::{
+    freeze_for_shutdown, init_on_ap, init_on_bsp, is_initialized, state, ZoneRuntimeState,
+};
 pub use slab::ZoneSlab;
 
 const ZONE_ID_INITIALIZING: usize = usize::MAX;
@@ -108,6 +111,7 @@ impl<T: 'static> Zone<T> {
             type_id: TypeId::of::<T>(),
             allocated_slots: self.allocated_slots(),
             slab_count: self.slab_count(),
+            empty_slab_count: self.empty_slab_count(),
         }
     }
 
@@ -117,6 +121,10 @@ impl<T: 'static> Zone<T> {
 
     pub fn slab_count(&self) -> usize {
         self.keg.slab_count()
+    }
+
+    pub fn empty_slab_count(&self) -> usize {
+        self.keg.empty_slab_count()
     }
 
     pub(crate) fn note_allocated_slots(&self, count: usize) {
@@ -145,6 +153,17 @@ impl<T: 'static> Zone<T> {
 
     pub(crate) fn return_slot_from_reclaim(&self, slot: core::ptr::NonNull<slot::Slot<T>>) {
         self.keg.return_slot_without_slab_retire(slot);
+    }
+
+    pub(crate) fn trim_empty_slabs(&self, limit: usize) -> usize {
+        self.keg.trim_empty_slabs(limit)
+    }
+
+    pub(crate) fn flush_current_cpu_bucket(&'static self) -> Result<(), ZoneError> {
+        let cpu_pin = runtime::pin_current_cpu()?;
+        let bucket = unsafe { &mut *self.buckets[cpu_pin.cpu_id().0].get() };
+        self.drain_bucket_to_keg(bucket);
+        Ok(())
     }
 
     pub(crate) fn slot_from_key(&self, key: SlotKey) -> Option<core::ptr::NonNull<slot::Slot<T>>> {
@@ -214,6 +233,32 @@ pub fn init_ap_for_current_stage(cpu: CpuId) -> Result<(), ZoneError> {
 
 pub fn init_bsp_for_current_stage<P: TxPlatform>() -> Result<(), ZoneError> {
     init_on_bsp::<P>()
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ZoneMaintenanceBudget {
+    pub epoch_reclaim_budget: usize,
+    pub empty_slab_budget: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ZoneMaintenanceStats {
+    pub epoch: crate::epoch::DrainStats,
+    pub retried_pending_slots: usize,
+    pub empty_slabs: EmptySlabTrimStats,
+}
+
+pub fn return_empty_slabs(limit: usize) -> EmptySlabTrimStats {
+    registry::trim_empty_slabs(limit)
+}
+
+pub fn maintenance_tick(budget: ZoneMaintenanceBudget) -> ZoneMaintenanceStats {
+    let _ = registry::flush_current_cpu_buckets();
+    ZoneMaintenanceStats {
+        epoch: crate::epoch::try_drain(budget.epoch_reclaim_budget),
+        retried_pending_slots: registry::retry_retire_pending_slots(budget.empty_slab_budget),
+        empty_slabs: return_empty_slabs(budget.empty_slab_budget),
+    }
 }
 
 #[doc(hidden)]

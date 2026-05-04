@@ -154,6 +154,7 @@ impl PmapIf for CountingPmap {
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
+    crate::zones::register_all().expect("kernel zones");
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
 }

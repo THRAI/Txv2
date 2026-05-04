@@ -14,6 +14,7 @@ use crate::page_allocator::{self, ZeroPolicy};
 use super::registry::SlotKey;
 use super::slot::Slot;
 use super::{runtime, Zone, ZoneError};
+use super::{Cap, SlotState};
 
 const MAX_SLAB_SLOTS: usize = 64;
 
@@ -220,6 +221,24 @@ impl<T: 'static> ZoneSlab<T> {
 
     pub fn zone_id(&self) -> super::ZoneId {
         self.zone.id()
+    }
+
+    pub(crate) fn retry_retire_pending_slots(&self, limit: usize) -> usize {
+        let mut progressed = 0usize;
+        for index in 0..self.slot_count {
+            if progressed >= limit {
+                break;
+            }
+            let Some(slot) = self.slot_at(index) else {
+                break;
+            };
+            let meta = unsafe { slot.as_ref().meta() };
+            let cur = meta.load(core::sync::atomic::Ordering::Acquire);
+            if cur.state() == SlotState::RetirePending && Cap::<T>::try_retire_pending(slot) {
+                progressed += 1;
+            }
+        }
+        progressed
     }
 
     unsafe fn slot_base(&self) -> *mut Slot<T> {

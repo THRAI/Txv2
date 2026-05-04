@@ -46,7 +46,7 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::init_early(handoff);
         Self::init_substrate_if_ready(handoff);
         Self::boot_sentinel();
-        P::system_off()
+        crate::zones::shutdown_with_zone_cleanup::<P>()
     }
 
     fn init_early(handoff: BootHandoff) {
@@ -56,6 +56,7 @@ impl<P: TxPlatform> CoreInit<P> {
     fn init_substrate_if_ready(handoff: BootHandoff) {
         if P::SUBSTRATE_BOOT_READY {
             tx_substrate::init::<P>();
+            crate::zones::register_all().expect("tx_kernel zone registration failed");
             Self::init_later(handoff);
             Self::install_kernel_trap_vector();
             Self::init_boot_reactor();
@@ -223,6 +224,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 continue;
             }
 
+            crate::zones::try_bounded_maintenance_tick();
             P::wait_for_interrupt_once();
             if P::pending_ipi(IpiKind::Reschedule) {
                 P::ack_ipi(IpiKind::Reschedule);
@@ -368,6 +370,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 tx_hal::console_write_str::<P>(":reactor:timer-idle:ok\n");
                 return;
             }
+            crate::zones::try_bounded_maintenance_tick();
             P::wait_for_interrupt_once();
         }
 

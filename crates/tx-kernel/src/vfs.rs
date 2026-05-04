@@ -515,7 +515,7 @@ mod tests {
 
     fn init_tty_zones() {
         tx_substrate::testing::init_host_for_test_once();
-        crate::tty::structure::registry::register_zones().expect("tty zones");
+        crate::zones::register_all().expect("kernel zones");
     }
 
     fn alloc_tty(kind: TtyKind, index: u32, name: &str, payload: TtyPayload) -> Cap<TtyIdentity> {
