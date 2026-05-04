@@ -143,17 +143,22 @@
     {
       "id": "vm-fault-pc-size-checks",
       "title": "Wire PC.size into VM fault SIGBUS-style checks",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [],
       "paths": [
-        "crates/tx-kernel/src/vm/checks.rs",
         "crates/tx-kernel/src/vm/structure/types.rs",
         "crates/tx-kernel/src/vm/tests/fault_materialization.rs"
       ],
       "verification": [
-        "cargo test -p tx-kernel vm -- --test-threads=1"
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask progress validate"
       ],
-      "notes": "Currently called out as the next step in STATUS.md. Reject faults beyond visible PC.size with the documented SIGBUS shape; keep capacity-bound check separate."
+      "notes": "VmFaultError gained PageBeyondSize. VmFaultOutcome::materialize_page_recipe checks (page_index * USER_PAGE_SIZE) >= pc.size_bytes() before calling pc.materialize_anon and returns PageBeyondSize when the access is beyond the visible PC.size, leaving the capacity-bound BackingOffsetOverflow check intact. Three tests cover SHARED past-EOF read rejection, MAP_PRIVATE past-EOF write rejection (before CoW replacement), and admission of a page whose first byte is just below PC.size. Closes the STATUS.md 'connect PC.size to VM fault SIGBUS-style checks' next-step item."
     },
     {
       "id": "partial-page-byte-fidelity",
