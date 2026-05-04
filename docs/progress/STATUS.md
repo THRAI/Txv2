@@ -1,9 +1,30 @@
 # txKernel Status
 
-**Updated:** 2026-05-03
+**Updated:** 2026-05-04
 
 ## Current Shape
 
+- 2026-05-04 Claude harness parallel and main resync. `CLAUDE.md` symlinked to
+  `AGENTS.md` and `.claude/settings.json` SessionStart hook wired to inject
+  `AGENTS.md` as additionalContext at session start; misleading
+  `.claude/skills`/`.claude/commands` symlinks dropped after probes confirmed
+  the harness does not scan them. Branch resynced onto `origin/main` (HAL +
+  useraccessif + irqif work) by `git reset --hard origin/main` then
+  `git cherry-pick origin/main..backup/pre-main-resync-2026-05-04`; all ten
+  PageBacked/VM commits replayed clean with zero conflicts. Verification:
+  `cargo xtask progress validate` 23 ok, `cargo check --workspace
+  --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude
+  tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt`
+  green, `cargo test -p tx-kernel vm -- --test-threads=1` 49 ok, `cargo test
+  -p tx-kernel page_backed -- --test-threads=1` 25 ok. Decision note:
+  `docs/progress/decisions/2026-05-04-claude-harness-parallel-and-main-resync.md`.
+  Backup ref `backup/pre-main-resync-2026-05-04` retains pre-resync history.
+  Next step: connect `PC.size` to VM fault SIGBUS-style checks for page-backed
+  mappings and add byte-accurate user-buffer read/write once copyin/copyout
+  gates exist; subagents still need txKernel rules pasted into spawn prompts
+  because no harness-level pass-through exists. Blockers: async fault-script
+  retry/yield behavior, Process/ThreadRuntime/trap authority wiring, concrete
+  VFS/backend implementations, final user-buffer copy plumbing.
 - 2026-05-03 PageBacked dynamic `PC.size` slice added a visible byte-size
   field to `PageContainer` while preserving the existing fixed `page_count`
   capacity as the upper bound. `PageContainer::size_bytes()` is now the compact
