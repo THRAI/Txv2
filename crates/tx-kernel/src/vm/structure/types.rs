@@ -61,7 +61,21 @@ pub struct UserRange {
     end: UserVirtAddr,
 }
 
+/// V1 conservative user-space top used by VM operations that must
+/// serialize against all other VM operations on an `AddressSpace` (fork,
+/// exec). Sized at 256 GiB which fits inside Sv39's 256 GiB user-space
+/// half and inside Sv48's 128 TiB user-space half. Revisit when the
+/// per-platform user VA cap is finalized.
+pub const FULL_USER_V1_TOP: usize = 1 << 38;
+
 impl UserRange {
+    /// Full user-space range covering `[0, FULL_USER_V1_TOP)` for
+    /// operations that must serialize against every concurrent VM
+    /// operation on an AddressSpace (fork, exec).
+    pub fn full_user_v1() -> Self {
+        Self::new_aligned(UserVirtAddr(0), FULL_USER_V1_TOP).expect("full user v1 range")
+    }
+
     pub fn new_aligned(start: UserVirtAddr, len: usize) -> Result<Self, UserRangeError> {
         if len == 0 {
             return Err(UserRangeError::ZeroLength);

@@ -134,7 +134,7 @@ impl RangeLock {
         self.wait_carrier_id
     }
 
-    pub fn acquire(&self, range: UserRange, mode: LockMode) -> AcquireResult<'_> {
+    pub fn acquire_step(&self, range: UserRange, mode: LockMode) -> AcquireResult<'_> {
         let mut state = self.state.lock();
         match mode {
             LockMode::Materializer => {
@@ -157,7 +157,7 @@ impl RangeLock {
         }
     }
 
-    pub fn acquire_pair(
+    pub fn acquire_pair_step(
         &self,
         a: (UserRange, LockMode),
         b: (UserRange, LockMode),

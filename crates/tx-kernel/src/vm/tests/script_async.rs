@@ -23,7 +23,7 @@ fn range_lock_would_block_wait_token_carrier_matches_lock() {
     let range = range(0x1000, 1);
     let _holder = match aspace
         .range_lock()
-        .acquire(range, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step(range, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("first acquire should succeed"),
@@ -31,7 +31,7 @@ fn range_lock_would_block_wait_token_carrier_matches_lock() {
 
     let blocked = match aspace
         .range_lock()
-        .acquire(range, crate::vm::LockMode::Materializer)
+        .acquire_step(range, crate::vm::LockMode::Materializer)
     {
         crate::vm::AcquireResult::WouldBlock(blocked) => blocked,
         _ => panic!("expected WouldBlock for overlapping materializer"),
@@ -75,7 +75,7 @@ fn map_script_async_yields_on_writer_conflict_and_completes_after_release() {
 
     let holder = match aspace
         .range_lock()
-        .acquire(target_range, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step(target_range, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("baseline acquire should succeed"),
@@ -125,7 +125,7 @@ fn unmap_async_yields_on_writer_conflict_and_completes_after_release() {
 
     let holder = match aspace
         .range_lock()
-        .acquire(target_range, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step(target_range, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("baseline acquire should succeed"),
@@ -167,7 +167,7 @@ fn protect_async_yields_on_writer_conflict_and_completes_after_release() {
 
     let holder = match aspace
         .range_lock()
-        .acquire(target_range, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step(target_range, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("baseline acquire should succeed"),
@@ -216,7 +216,7 @@ fn remap_async_yields_on_pair_conflict_and_completes_after_release() {
 
     let holder = match aspace
         .range_lock()
-        .acquire(new_range, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step(new_range, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("baseline acquire should succeed"),
@@ -374,7 +374,7 @@ fn fault_script_async_yields_on_writer_conflict_and_completes_after_release() {
 
     let holder = match aspace
         .range_lock()
-        .acquire(target, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step(target, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("baseline acquire should succeed"),
@@ -516,6 +516,22 @@ fn fork_aspace_demotes_parent_pmap_for_private_entries_only() {
 }
 
 #[test]
+fn fork_aspace_returns_would_block_when_parent_full_user_range_already_held() {
+    setup_host_substrate();
+    let parent = AddressSpace::new();
+    let _holder = match parent
+        .range_lock()
+        .acquire_step(range(0x40000, 1), crate::vm::LockMode::ExclusiveWriter)
+    {
+        crate::vm::AcquireResult::Acquired(guard) => guard,
+        _ => panic!("baseline acquire should succeed"),
+    };
+
+    let result = crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent);
+    assert!(matches!(result, Err(crate::vm::VmMapError::WouldBlock)));
+}
+
+#[test]
 fn exec_aspace_tears_down_all_resident_ptes() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
@@ -561,7 +577,7 @@ fn range_lock_release_fires_registered_channel_for_external_subscribers() {
     let range = range(0x4000, 1);
     let holder = match aspace
         .range_lock()
-        .acquire(range, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step(range, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("acquire should succeed"),
