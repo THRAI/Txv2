@@ -3,6 +3,8 @@ use tx_substrate::zone::{
     self, registered_zone_count, Zone, ZoneAllocated, ZoneError, ZoneId, ZoneMaintenanceBudget,
 };
 
+static ZONE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug, Eq, PartialEq)]
 struct Object {
     id: u32,
@@ -31,12 +33,27 @@ unsafe impl ZoneAllocated for LargeObject {
 
 fn reset_zone_registry() {
     unsafe {
+        epoch::testing::reset_for_test();
         zone::testing::reset_for_test();
     }
 }
 
+fn reset_zone_and_epoch() -> std::sync::MutexGuard<'static, ()> {
+    let guard = ZONE_TEST_LOCK.lock().expect("zone test lock");
+    tx_substrate::testing::init_host_for_test_once();
+    reset_zone_registry();
+    epoch::testing::init_for_test();
+    zone::testing::init_for_test(
+        4096,
+        tx_substrate::page_allocator::testing::direct_map_base_for_test(),
+    )
+    .expect("test zone runtime init");
+    guard
+}
+
 #[test]
 fn static_zone_registration_is_idempotent() {
+    let _guard = ZONE_TEST_LOCK.lock().expect("zone test lock");
     reset_zone_registry();
 
     let first = zone::register_zone_for::<Object>().expect("first registration");
@@ -49,6 +66,7 @@ fn static_zone_registration_is_idempotent() {
 
 #[test]
 fn reserve_requires_zone_runtime_initialization() {
+    let _guard = ZONE_TEST_LOCK.lock().expect("zone test lock");
     reset_zone_registry();
 
     let err = match zone::reserve_for::<Object>() {
@@ -61,16 +79,7 @@ fn reserve_requires_zone_runtime_initialization() {
 
 #[test]
 fn reserve_requires_boot_time_registration_after_runtime_init() {
-    reset_zone_registry();
-    tx_substrate::testing::init_host_for_test_once();
-    unsafe {
-        zone::testing::reset_for_test();
-    }
-    zone::testing::init_for_test(
-        4096,
-        tx_substrate::page_allocator::testing::direct_map_base_for_test(),
-    )
-    .expect("test zone runtime init");
+    let _guard = reset_zone_and_epoch();
 
     let err = match zone::reserve_for::<Object>() {
         Ok(_) => panic!("reserve before zone registration must fail"),
@@ -82,16 +91,7 @@ fn reserve_requires_boot_time_registration_after_runtime_init() {
 
 #[test]
 fn maintenance_tick_retires_surplus_empty_slabs() {
-    reset_zone_registry();
-    tx_substrate::testing::init_host_for_test_once();
-    unsafe {
-        zone::testing::reset_for_test();
-    }
-    zone::testing::init_for_test(
-        4096,
-        tx_substrate::page_allocator::testing::direct_map_base_for_test(),
-    )
-    .expect("test zone runtime init");
+    let _guard = reset_zone_and_epoch();
     zone::register_zone_for::<LargeObject>().expect("large zone registration");
 
     let mut caps = Vec::new();
@@ -134,16 +134,7 @@ fn maintenance_tick_retires_surplus_empty_slabs() {
 
 #[test]
 fn reserve_is_rejected_after_shutdown_freeze() {
-    reset_zone_registry();
-    tx_substrate::testing::init_host_for_test_once();
-    unsafe {
-        zone::testing::reset_for_test();
-    }
-    zone::testing::init_for_test(
-        4096,
-        tx_substrate::page_allocator::testing::direct_map_base_for_test(),
-    )
-    .expect("test zone runtime init");
+    let _guard = reset_zone_and_epoch();
     zone::register_zone_for::<Object>().expect("object zone registration");
 
     assert_eq!(zone::state(), zone::ZoneRuntimeState::Running);
@@ -159,16 +150,7 @@ fn reserve_is_rejected_after_shutdown_freeze() {
 
 #[test]
 fn zone_and_epoch_summary_report_registered_state() {
-    reset_zone_registry();
-    tx_substrate::testing::init_host_for_test_once();
-    unsafe {
-        zone::testing::reset_for_test();
-    }
-    zone::testing::init_for_test(
-        4096,
-        tx_substrate::page_allocator::testing::direct_map_base_for_test(),
-    )
-    .expect("test zone runtime init");
+    let _guard = reset_zone_and_epoch();
     zone::register_zone_for::<Object>().expect("object zone registration");
 
     let epoch_summary = epoch::summary();
@@ -193,16 +175,7 @@ fn zone_and_epoch_summary_report_registered_state() {
 
 #[test]
 fn maintenance_retries_pending_slot_retirement_after_epoch_pool_pressure() {
-    reset_zone_registry();
-    tx_substrate::testing::init_host_for_test_once();
-    unsafe {
-        zone::testing::reset_for_test();
-    }
-    zone::testing::init_for_test(
-        4096,
-        tx_substrate::page_allocator::testing::direct_map_base_for_test(),
-    )
-    .expect("test zone runtime init");
+    let _guard = reset_zone_and_epoch();
     zone::register_zone_for::<Object>().expect("object zone registration");
 
     let guard = epoch::guard();
