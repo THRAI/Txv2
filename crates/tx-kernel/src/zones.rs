@@ -26,6 +26,7 @@ pub(crate) fn register_all() -> Result<(), ZoneError> {
     page_backed::register_zones()?;
     mount::register_zones()?;
     vfs::register_zones()?;
+    tty::register_zones()?;
     Ok(())
 }
 
@@ -112,5 +113,13 @@ mod vfs {
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
         Ok(())
+    }
+}
+
+mod tty {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::tty::structure::registry::register_zones()
     }
 }

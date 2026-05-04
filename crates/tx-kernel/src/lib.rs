@@ -10,6 +10,7 @@ pub mod init;
 pub mod mount;
 pub mod page_backed;
 pub mod trap;
+pub mod tty;
 pub mod vfs;
 pub mod vm;
 pub mod wait_carrier;
