@@ -4,6 +4,22 @@
 
 ## Current Shape
 
+- 2026-05-05 Signal day-1 layered on top of the topology branch
+  `process-topology`. Adds `crates/tx-subsystems/src/signal.rs` with
+  the POSIX-shim types (`Signum`, `SignalMask`, `PendingSignalQueue`,
+  `SigDisposition`, `SigActionTable`) and the kill / sigaction shim
+  entry points (`step_kill_process`, `step_kill_pgrp`,
+  `step_sigaction`). `ProcessPayload` now carries `sig_actions` and
+  `group_pending`; `ThreadPayload` carries `signal_mask` and
+  `thread_pending`. `thread_runtime::execution` gains `post_signal`
+  and `step_sigprocmask` (with `SigmaskHow::SetMask/Block/Unblock`).
+  Day-1 deliberately stops at "post + observe": no SigInfo payload,
+  no realtime per-occurrence queue, no default-disposition resolution
+  (`Default → terminate / stop / continue / ignore`), no AST
+  delivery. SIGKILL/SIGSTOP are uncatchable at the type layer
+  (`SignalMask::block` strips them; `step_sigaction` returns
+  `Uncatchable`). 13 new tests bring the suite to 216; full
+  `cargo xtask ci` green (11/11 gates).
 - 2026-05-05 Process / Thread topology pass started on branch
   `process-topology`. Lands the entity graph for the upcoming β bundle
   without signal state, credentials, rlimits, or fd-table coupling —

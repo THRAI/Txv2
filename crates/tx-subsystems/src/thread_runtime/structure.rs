@@ -2,16 +2,17 @@
 //!
 //! Per `THREAD_RUNTIME_v1`, the thread is the unit of execution: each
 //! thread owns its own future + reactor task. This module realizes the
-//! identity/payload split. Signal-related fields (`signal_mask`,
-//! `signal_summary`, `thread_pending`) land in the signal pass and are
-//! intentionally absent here.
+//! identity/payload split, including the per-thread signal mask and
+//! pending queue. The realtime per-occurrence queue and `signal_summary`
+//! fast-check atomic land alongside the delivery pass.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use tx_reactor::TaskKey;
 use tx_substrate::zone::{PayloadCap, Weak, Zone, ZoneAllocated};
 
 use crate::process::ProcessIdentity;
+use crate::signal::{PendingSignalQueue, SignalMask};
 use crate::sync::SpinMutex;
 
 /// Thread identifier. TID 0 is reserved.
@@ -64,6 +65,12 @@ impl ThreadIdentity {
 /// paths leave it `None` and tests do not exercise reactor wiring.
 pub struct ThreadPayload {
     pub(crate) task: SpinMutex<Option<TaskKey>>,
+    /// Blocked-signal mask. Stored as an atomic so single-bit
+    /// updates from the same thread don't need the spin mutex.
+    pub(crate) signal_mask: AtomicU64,
+    /// Per-thread pending-signal bitset. Sweepable by the delivery
+    /// step (which doesn't yet exist).
+    pub(crate) thread_pending: PendingSignalQueue,
 }
 
 impl ThreadPayload {
@@ -71,6 +78,16 @@ impl ThreadPayload {
     /// `None` until the reactor coupling lands.
     pub fn task(&self) -> Option<TaskKey> {
         *self.task.lock()
+    }
+
+    /// Read the current signal mask.
+    pub fn signal_mask(&self) -> SignalMask {
+        SignalMask::new(self.signal_mask.load(Ordering::Acquire))
+    }
+
+    /// Borrow the per-thread pending-signal queue.
+    pub fn pending(&self) -> &PendingSignalQueue {
+        &self.thread_pending
     }
 }
 

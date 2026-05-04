@@ -10,10 +10,13 @@ use tx_substrate::zone::{self, Cap, ZoneError};
 use crate::process::structure::{
     allocate_pid, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,
 };
+use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::sync::SpinMutex;
 use crate::thread_runtime::execution::set_thread_zombie;
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload};
 use crate::vm::{AddressSpace, VmMapError};
+
+use core::sync::atomic::AtomicU64;
 
 /// Errors from `step_fork`.
 #[derive(Debug)]
@@ -250,6 +253,8 @@ fn sign_process_payload(
         ProcessPayload {
             aspace,
             threads: SpinMutex::new(threads),
+            sig_actions: SigActionTable::new(),
+            group_pending: PendingSignalQueue::new(),
         },
     );
     Ok(tx_substrate::zone::PayloadCap::from_cap(cap))
@@ -265,6 +270,8 @@ fn sign_thread(
         payload_res,
         ThreadPayload {
             task: SpinMutex::new(None),
+            signal_mask: AtomicU64::new(0),
+            thread_pending: PendingSignalQueue::new(),
         },
     );
     let payload = tx_substrate::zone::PayloadCap::from_cap(payload_cap);

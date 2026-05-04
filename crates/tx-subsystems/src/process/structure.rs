@@ -30,6 +30,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use tx_substrate::zone::{Cap, PayloadCap, Weak, Zone, ZoneAllocated};
 
+use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::sync::SpinMutex;
 use crate::thread_runtime::ThreadIdentity;
 use crate::tty::structure::identity::TtyIdentity;
@@ -113,6 +114,27 @@ impl ProcessIdentity {
 pub struct ProcessPayload {
     pub(crate) aspace: Cap<AddressSpace>,
     pub(crate) threads: SpinMutex<Vec<Cap<ThreadIdentity>>>,
+    /// Per-process signal-action table. Day-1 records dispositions
+    /// installed via `step_sigaction`; the delivery step that consults
+    /// these lands with the AST/scripts pass.
+    pub(crate) sig_actions: SigActionTable,
+    /// Process-group-targeted pending signals. Day-1 collapses
+    /// repeated posts (bitset, no per-occurrence queueing); a thread
+    /// whose mask permits the signal will sweep it on its next
+    /// delivery point.
+    pub(crate) group_pending: PendingSignalQueue,
+}
+
+impl ProcessPayload {
+    /// Borrow the per-process action table.
+    pub fn sig_actions(&self) -> &SigActionTable {
+        &self.sig_actions
+    }
+
+    /// Borrow the per-process group-pending queue.
+    pub fn group_pending(&self) -> &PendingSignalQueue {
+        &self.group_pending
+    }
 }
 
 /// Process group: the unit of `setpgid`/`getpgid` and the eventual unit
