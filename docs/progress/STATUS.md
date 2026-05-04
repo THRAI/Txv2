@@ -4,6 +4,25 @@
 
 ## Current Shape
 
+- 2026-05-04 VFS spec-reconciliation Phases 1-4 complete on branch
+  `vfs-spec-reconciliation`. The four-phase plan that started after
+  the deferred-move investigation is now fully landed: Phase 1 brought
+  `tx-kernel/src/vfs.rs` into doc-canonical shape (full POSIX
+  `InodeMeta`, opaque `[u8; 16]` `DirCursor`, `Timespec`, `MountOutput`,
+  four-module `vfs/{structure,checks,execution}/` layout); Phase 2
+  brought the tx-subsystems skeleton into spec (POSIX `Errno`
+  spelling, substrate-owned PPN-handle `Frame`); Phase 3 ported
+  tx-ext4 onto the canonical surface (rewrote `pager::fetch_page` to
+  allocate via `page_allocator::reserve_frame` + permanent-frame token,
+  copy bytes through the test direct-map; deleted the byte-buffer-
+  Frame-dependent `vfs_full_read` and `kernel_read_backend` test
+  files); Phase 4 deleted the now-redundant skeleton and `git mv`-ed
+  the working subsystems from tx-kernel to tx-subsystems. tx-kernel
+  collapsed to `init.rs + trap.rs + lib.rs`. Verification: workspace
+  builds clean, 522 tests pass with `--test-threads=1`,
+  `cargo xtask lint arch/unused/docs` ok, `cargo xtask progress
+  validate` 24 records ok. The vm/tty move blocker recorded in
+  `2026-05-04-vm-tty-subsystems-move-deferred.md` is resolved.
 - 2026-05-04 VFS spec-reconciliation Phase 1 complete on branch
   `vfs-spec-reconciliation`. Brings `tx-kernel/src/vfs.rs` into
   doc-canonical shape per `TX_EXT4_PLAN_v1_2.md`,
