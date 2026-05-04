@@ -152,10 +152,7 @@ impl AddressSpace {
     ///    materialization through the pmap. WouldBlock here drops the
     ///    materialization (releasing the MapPin) and retries from
     ///    step 1, re-observing the recipe afresh.
-    pub async fn fault_script(
-        &self,
-        fault: VmFault,
-    ) -> Result<PmapPublishOutcome, VmFaultError> {
+    pub async fn fault_script(&self, fault: VmFault) -> Result<PmapPublishOutcome, VmFaultError> {
         let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
         loop {
             let outcome = {
@@ -233,10 +230,7 @@ impl AddressSpace {
     /// `WouldBlock` and retries after a release wakes the lock's wait
     /// channel. Honors VM_v1_2 §3.6 cross-async-wait discipline by dropping
     /// every reservation and observation before each `.await`.
-    pub async fn mmap_script(
-        &self,
-        request: VmMapRequest,
-    ) -> Result<VmMapOutcome, VmMapError> {
+    pub async fn mmap_script(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
         loop {
             let (range, placement) = match request.target {
                 VmMapTarget::Anywhere { window, page_count } => {
@@ -328,7 +322,10 @@ impl AddressSpace {
     /// Canonical async mremap script per VM_v1_2 §5.5. Yields on `RangeLock`
     /// pair `WouldBlock` and retries after either covered range's release
     /// wakes the lock's wait channel.
-    pub async fn mremap_script(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
+    pub async fn mremap_script(
+        &self,
+        request: VmRemapRequest,
+    ) -> Result<VmRemapOutcome, VmMapError> {
         require_disjoint_remap(request.old_range, request.new_range)?;
         loop {
             let _guard_pair = match self.range_lock.acquire_pair_step(
