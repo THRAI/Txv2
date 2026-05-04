@@ -7,3 +7,4 @@ __pycache__/
 .DS_Store
 /docs/ljs
 .claude/settings.local.json
+.claude/scheduled_tasks.lock

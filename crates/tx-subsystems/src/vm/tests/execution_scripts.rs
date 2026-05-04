@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn vm_map_script_places_nonfixed_mapping_in_first_recipe_gap() {
+fn vm_try_mmap_places_nonfixed_mapping_in_first_recipe_gap() {
     let aspace = AddressSpace::new();
     map_reserved(aspace.reserve_map(
         VmEntry::new(
@@ -27,7 +27,7 @@ fn vm_map_script_places_nonfixed_mapping_in_first_recipe_gap() {
     .expect("seed right");
 
     let outcome = aspace
-        .map_script(VmMapRequest::anywhere(
+        .try_mmap(VmMapRequest::anywhere(
             range(0x1000, 5),
             2,
             Prot::READ_WRITE,
@@ -43,7 +43,7 @@ fn vm_map_script_places_nonfixed_mapping_in_first_recipe_gap() {
         Prot::READ_WRITE
     );
     assert_eq!(
-        aspace.map_script(VmMapRequest::anywhere(
+        aspace.try_mmap(VmMapRequest::anywhere(
             range(0x1000, 5),
             2,
             Prot::READ,
@@ -55,7 +55,7 @@ fn vm_map_script_places_nonfixed_mapping_in_first_recipe_gap() {
 }
 
 #[test]
-fn vm_map_script_fixed_replace_uses_declared_range() {
+fn vm_try_mmap_fixed_replace_uses_declared_range() {
     let aspace = AddressSpace::new();
     let original = VmEntry::new(
         range(0x1000, 3),
@@ -74,7 +74,7 @@ fn vm_map_script_fixed_replace_uses_declared_range() {
         VmEntryFlags::PRIVATE,
         VmBacking::PrivateAnon,
     );
-    let outcome = aspace.map_script(replacement).expect("fixed replace");
+    let outcome = aspace.try_mmap(replacement).expect("fixed replace");
 
     assert_eq!(outcome.range, range(0x2000, 1));
     assert_eq!(outcome.commit.changed_pages, 2);
@@ -96,7 +96,7 @@ fn vm_map_script_fixed_replace_uses_declared_range() {
 }
 
 #[test]
-fn vm_remap_script_moves_disjoint_range_and_preserves_source_survivors() {
+fn vm_try_mremap_moves_disjoint_range_and_preserves_source_survivors() {
     let aspace = AddressSpace::new();
     let original = VmEntry::new(
         range(0x1000, 4),
@@ -109,7 +109,7 @@ fn vm_remap_script_moves_disjoint_range_and_preserves_source_survivors() {
         .expect("seed");
 
     let outcome = aspace
-        .remap_script(VmRemapRequest::new(range(0x2000, 2), range(0x8000, 2)))
+        .try_mremap(VmRemapRequest::new(range(0x2000, 2), range(0x8000, 2)))
         .expect("remap");
 
     assert_eq!(outcome.old_range, range(0x2000, 2));
@@ -136,7 +136,7 @@ fn vm_remap_script_moves_disjoint_range_and_preserves_source_survivors() {
 }
 
 #[test]
-fn vm_remap_script_rejects_overlapping_or_occupied_destination() {
+fn vm_try_mremap_rejects_overlapping_or_occupied_destination() {
     let aspace = AddressSpace::new();
     map_reserved(aspace.reserve_map(
         VmEntry::new(
@@ -162,11 +162,11 @@ fn vm_remap_script_rejects_overlapping_or_occupied_destination() {
     .expect("seed dest");
 
     assert_eq!(
-        aspace.remap_script(VmRemapRequest::new(range(0x1000, 2), range(0x2000, 2))),
+        aspace.try_mremap(VmRemapRequest::new(range(0x1000, 2), range(0x2000, 2))),
         Err(VmMapError::InvalidRange)
     );
     assert_eq!(
-        aspace.remap_script(VmRemapRequest::new(range(0x1000, 1), range(0x8000, 1))),
+        aspace.try_mremap(VmRemapRequest::new(range(0x1000, 1), range(0x8000, 1))),
         Err(VmMapError::AlreadyMapped)
     );
 }

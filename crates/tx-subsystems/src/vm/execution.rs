@@ -9,27 +9,26 @@ use alloc::vec::Vec;
 
 use tx_hal::PmapIf;
 
+use crate::execution::WaitToken;
 use crate::execution::{Guard, StepOutcome};
 use crate::page_backed::{step_fsync, PageContainerKind};
 use crate::vm::checks::{
     require_disjoint_remap, require_fault_publication, require_fault_recipe, require_map_admission,
 };
 use crate::vm::{
-    AcquirePairResult, AcquireResult, AddressSpace, LockMode, MapPlacement, PmapPublishOutcome,
-    Prot, RangeGuard, UserRange, VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization,
-    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget,
-    VmRemapOutcome, VmRemapRequest, WouldBlock,
+    AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard, UserRange,
+    VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization, VmFaultOutcome, VmMapCommit,
+    VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest,
 };
 
 impl AddressSpace {
     pub fn resolve_fault(&self, fault: VmFault) -> Result<VmFaultOutcome, VmFaultError> {
         let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
-        let _guard = match self
+        let StepOutcome::Done(_guard) = self
             .range_lock
             .acquire_step(page_range, LockMode::Materializer)
-        {
-            AcquireResult::Acquired(guard) => guard,
-            AcquireResult::WouldBlock(_) => return Err(VmFaultError::WouldBlock),
+        else {
+            return Err(VmFaultError::WouldBlock);
         };
 
         require_fault_recipe(self, fault)
@@ -40,12 +39,11 @@ impl AddressSpace {
         outcome: VmFaultOutcome,
         materialization: VmFaultMaterialization,
     ) -> Result<PmapPublishOutcome, VmFaultError> {
-        let _guard = match self
+        let StepOutcome::Done(_guard) = self
             .range_lock
             .acquire_step(outcome.page_range, LockMode::Materializer)
-        {
-            AcquireResult::Acquired(guard) => guard,
-            AcquireResult::WouldBlock(_) => return Err(VmFaultError::WouldBlock),
+        else {
+            return Err(VmFaultError::WouldBlock);
         };
 
         let _entry = require_fault_publication(self, &outcome, &materialization)?;
@@ -87,12 +85,11 @@ impl AddressSpace {
     /// retry is built in at the VM layer because the Process subsystem
     /// orchestrates fork above this function.
     pub fn fork_aspace<P: PmapIf>(parent: &AddressSpace) -> Result<AddressSpace, VmMapError> {
-        let _full_guard = match parent
+        let StepOutcome::Done(_full_guard) = parent
             .range_lock
             .acquire_step(UserRange::full_user_v1(), LockMode::ExclusiveWriter)
-        {
-            AcquireResult::Acquired(guard) => guard,
-            AcquireResult::WouldBlock(_) => return Err(VmMapError::WouldBlock),
+        else {
+            return Err(VmMapError::WouldBlock);
         };
 
         let parent_recipes = parent.recipes_snapshot();
@@ -152,10 +149,7 @@ impl AddressSpace {
     ///    materialization through the pmap. WouldBlock here drops the
     ///    materialization (releasing the MapPin) and retries from
     ///    step 1, re-observing the recipe afresh.
-    pub async fn fault_script_async(
-        &self,
-        fault: VmFault,
-    ) -> Result<PmapPublishOutcome, VmFaultError> {
+    pub async fn fault_script(&self, fault: VmFault) -> Result<PmapPublishOutcome, VmFaultError> {
         let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
         loop {
             let outcome = {
@@ -163,15 +157,12 @@ impl AddressSpace {
                     .range_lock
                     .acquire_step(page_range, LockMode::Materializer)
                 {
-                    AcquireResult::Acquired(guard) => guard,
-                    AcquireResult::WouldBlock(blocked) => {
-                        let token = blocked.wait_token();
-                        drop(blocked);
-                        if let Some(future) = crate::wait_carrier::wait_on_token(token) {
-                            let _ = future.await;
-                        }
+                    StepOutcome::Done(guard) => guard,
+                    StepOutcome::Blocked(token) => {
+                        await_range_lock(token).await;
                         continue;
                     }
+                    _ => unreachable_acquire_step(),
                 };
                 require_fault_recipe(self, fault)?
             };
@@ -182,16 +173,13 @@ impl AddressSpace {
                 .range_lock
                 .acquire_step(outcome.page_range, LockMode::Materializer)
             {
-                AcquireResult::Acquired(guard) => guard,
-                AcquireResult::WouldBlock(blocked) => {
-                    let token = blocked.wait_token();
-                    drop(blocked);
+                StepOutcome::Done(guard) => guard,
+                StepOutcome::Blocked(token) => {
                     drop(materialization);
-                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
-                        let _ = future.await;
-                    }
+                    await_range_lock(token).await;
                     continue;
                 }
+                _ => unreachable_acquire_step(),
             };
             let _entry = require_fault_publication(self, &outcome, &materialization)?;
             return self
@@ -207,7 +195,7 @@ impl AddressSpace {
         }
     }
 
-    pub fn map_script(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
+    pub fn try_mmap(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
         let (range, placement) = match request.target {
             VmMapTarget::Anywhere { window, page_count } => {
                 let range = self
@@ -224,19 +212,16 @@ impl AddressSpace {
                 let commit = reservation.commit()?;
                 Ok(VmMapOutcome { range, commit })
             }
-            MapReserveResult::WouldBlock(_) => Err(VmMapError::WouldBlock),
+            MapReserveResult::Blocked(_) => Err(VmMapError::WouldBlock),
             MapReserveResult::Err(error) => Err(error),
         }
     }
 
-    /// Async wrapper around `map_script` that yields on `RangeLock`
+    /// Canonical async mmap script per VM_v1_2 §5.2. Yields on `RangeLock`
     /// `WouldBlock` and retries after a release wakes the lock's wait
     /// channel. Honors VM_v1_2 §3.6 cross-async-wait discipline by dropping
     /// every reservation and observation before each `.await`.
-    pub async fn map_script_async(
-        &self,
-        request: VmMapRequest,
-    ) -> Result<VmMapOutcome, VmMapError> {
+    pub async fn mmap_script(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
         loop {
             let (range, placement) = match request.target {
                 VmMapTarget::Anywhere { window, page_count } => {
@@ -254,12 +239,8 @@ impl AddressSpace {
                     let commit = reservation.commit()?;
                     return Ok(VmMapOutcome { range, commit });
                 }
-                MapReserveResult::WouldBlock(blocked) => {
-                    let token = blocked.wait_token();
-                    drop(blocked);
-                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
-                        let _ = future.await;
-                    }
+                MapReserveResult::Blocked(token) => {
+                    await_range_lock(token).await;
                     // continue loop to retry
                 }
                 MapReserveResult::Err(error) => return Err(error),
@@ -267,24 +248,22 @@ impl AddressSpace {
         }
     }
 
-    /// Async wrapper around `unmap` that yields on `RangeLock` `WouldBlock`
-    /// and retries after a release wakes the lock's wait channel. Honors
-    /// VM_v1_2 §3.6 by dropping the blocked guard before each `.await`.
-    pub async fn unmap_async(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
+    /// Canonical async munmap script per VM_v1_2 §5.3. Yields on `RangeLock`
+    /// `WouldBlock` and retries after a release wakes the lock's wait
+    /// channel. Honors VM_v1_2 §3.6 by dropping the blocked guard before
+    /// each `.await`.
+    pub async fn munmap_script(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
         loop {
             let _guard = match self
                 .range_lock
                 .acquire_step(range, LockMode::ExclusiveWriter)
             {
-                AcquireResult::Acquired(guard) => guard,
-                AcquireResult::WouldBlock(blocked) => {
-                    let token = blocked.wait_token();
-                    drop(blocked);
-                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
-                        let _ = future.await;
-                    }
+                StepOutcome::Done(guard) => guard,
+                StepOutcome::Blocked(token) => {
+                    await_range_lock(token).await;
                     continue;
                 }
+                _ => unreachable_acquire_step(),
             };
             let commit = self.recipes.unmap(range)?;
             self.pmap.teardown_range(range)?;
@@ -294,10 +273,9 @@ impl AddressSpace {
         }
     }
 
-    /// Async wrapper around `protect` that yields on `RangeLock`
-    /// `WouldBlock` and retries after a release wakes the lock's wait
-    /// channel.
-    pub async fn protect_async(
+    /// Canonical async mprotect script per VM_v1_2 §5.4. Yields on `RangeLock`
+    /// `WouldBlock` and retries after a release wakes the lock's wait channel.
+    pub async fn mprotect_script(
         &self,
         range: UserRange,
         prot: Prot,
@@ -307,15 +285,12 @@ impl AddressSpace {
                 .range_lock
                 .acquire_step(range, LockMode::ExclusiveWriter)
             {
-                AcquireResult::Acquired(guard) => guard,
-                AcquireResult::WouldBlock(blocked) => {
-                    let token = blocked.wait_token();
-                    drop(blocked);
-                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
-                        let _ = future.await;
-                    }
+                StepOutcome::Done(guard) => guard,
+                StepOutcome::Blocked(token) => {
+                    await_range_lock(token).await;
                     continue;
                 }
+                _ => unreachable_acquire_step(),
             };
             let commit = self.recipes.protect(range, prot)?;
             self.pmap.teardown_range(range)?;
@@ -325,25 +300,25 @@ impl AddressSpace {
         }
     }
 
-    /// Async wrapper around `remap_script` that yields on `RangeLock`
+    /// Canonical async mremap script per VM_v1_2 §5.5. Yields on `RangeLock`
     /// pair `WouldBlock` and retries after either covered range's release
     /// wakes the lock's wait channel.
-    pub async fn remap_async(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
+    pub async fn mremap_script(
+        &self,
+        request: VmRemapRequest,
+    ) -> Result<VmRemapOutcome, VmMapError> {
         require_disjoint_remap(request.old_range, request.new_range)?;
         loop {
             let _guard_pair = match self.range_lock.acquire_pair_step(
                 (request.old_range, LockMode::ExclusiveWriter),
                 (request.new_range, LockMode::ExclusiveWriter),
             ) {
-                AcquirePairResult::Acquired(pair) => pair,
-                AcquirePairResult::WouldBlock(blocked) => {
-                    let token = blocked.wait_token();
-                    drop(blocked);
-                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
-                        let _ = future.await;
-                    }
+                StepOutcome::Done(pair) => pair,
+                StepOutcome::Blocked(token) => {
+                    await_range_lock(token).await;
                     continue;
                 }
+                _ => unreachable_acquire_step(),
             };
             let commit = self
                 .recipes
@@ -368,15 +343,15 @@ impl AddressSpace {
     ///
     /// - returns `Ok(current_brk)` when `requested_brk == current_brk`.
     /// - rejects with `InvalidRange` when `requested_brk < brk_base`.
-    /// - on grow, calls `map_script_async` to map the page-aligned range
+    /// - on grow, calls `mmap_script` to map the page-aligned range
     ///   `[current_brk, requested_brk)`.
-    /// - on shrink, calls `unmap_async` on `[requested_brk, current_brk)`.
+    /// - on shrink, calls `munmap_script` on `[requested_brk, current_brk)`.
     ///
     /// All three of `brk_base`, `current_brk`, and `requested_brk` must be
     /// page-aligned. Process-level tracking of the brk value (which hart
     /// holds it, exec-time base, fork inheritance) lives in the Process
     /// subsystem and is out of scope for VM.
-    pub async fn brk_script_async(
+    pub async fn brk_script(
         &self,
         brk_base: crate::vm::UserVirtAddr,
         current_brk: crate::vm::UserVirtAddr,
@@ -399,25 +374,26 @@ impl AddressSpace {
                 crate::vm::VmEntryFlags::PRIVATE,
                 VmBacking::PrivateAnon,
             );
-            self.map_script_async(request).await?;
+            self.mmap_script(request).await?;
         } else {
             let len = current_brk.0 - requested_brk.0;
             let range =
                 UserRange::new_aligned(requested_brk, len).map_err(|_| VmMapError::InvalidRange)?;
-            self.unmap_async(range).await?;
+            self.munmap_script(range).await?;
         }
         Ok(requested_brk)
     }
 
-    pub fn remap_script(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
+    pub fn try_mremap(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
         require_disjoint_remap(request.old_range, request.new_range)?;
 
         let _guard_pair = match self.range_lock.acquire_pair_step(
             (request.old_range, LockMode::ExclusiveWriter),
             (request.new_range, LockMode::ExclusiveWriter),
         ) {
-            AcquirePairResult::Acquired(pair) => pair,
-            AcquirePairResult::WouldBlock(_) => return Err(VmMapError::WouldBlock),
+            StepOutcome::Done(pair) => pair,
+            StepOutcome::Blocked(_) => return Err(VmMapError::WouldBlock),
+            _ => unreachable_acquire_step(),
         };
         let commit = self
             .recipes
@@ -437,8 +413,9 @@ impl AddressSpace {
             .range_lock
             .acquire_step(entry.range, LockMode::ExclusiveWriter)
         {
-            AcquireResult::Acquired(guard) => guard,
-            AcquireResult::WouldBlock(blocked) => return MapReserveResult::WouldBlock(blocked),
+            StepOutcome::Done(guard) => guard,
+            StepOutcome::Blocked(token) => return MapReserveResult::Blocked(token),
+            _ => unreachable_acquire_step(),
         };
 
         if let Err(error) = require_map_admission(self, &entry, placement) {
@@ -453,7 +430,7 @@ impl AddressSpace {
         })
     }
 
-    pub fn unmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
+    pub fn try_munmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
         let _guard = self.acquire_writer(range)?;
         let commit = self.recipes.unmap(range)?;
         self.pmap.teardown_range(range)?;
@@ -462,7 +439,7 @@ impl AddressSpace {
         Ok(commit)
     }
 
-    pub fn protect(&self, range: UserRange, prot: Prot) -> Result<VmMapCommit, VmMapError> {
+    pub fn try_mprotect(&self, range: UserRange, prot: Prot) -> Result<VmMapCommit, VmMapError> {
         let _guard = self.acquire_writer(range)?;
         let commit = self.recipes.protect(range, prot)?;
         self.pmap.teardown_range(range)?;
@@ -476,8 +453,9 @@ impl AddressSpace {
             .range_lock
             .acquire_step(range, LockMode::ExclusiveWriter)
         {
-            AcquireResult::Acquired(guard) => Ok(guard),
-            AcquireResult::WouldBlock(_) => Err(VmMapError::WouldBlock),
+            StepOutcome::Done(guard) => Ok(guard),
+            StepOutcome::Blocked(_) => Err(VmMapError::WouldBlock),
+            _ => unreachable_acquire_step(),
         }
     }
 
@@ -499,7 +477,7 @@ impl AddressSpace {
 
 pub enum MapReserveResult<'a> {
     Reserved(MapReservation<'a>),
-    WouldBlock(WouldBlock<'a>),
+    Blocked(WaitToken),
     Err(VmMapError),
 }
 
@@ -507,7 +485,7 @@ impl core::fmt::Debug for MapReserveResult<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Reserved(_) => f.write_str("Reserved(..)"),
-            Self::WouldBlock(_) => f.write_str("WouldBlock(..)"),
+            Self::Blocked(token) => f.debug_tuple("Blocked").field(token).finish(),
             Self::Err(error) => f.debug_tuple("Err").field(error).finish(),
         }
     }
@@ -515,11 +493,10 @@ impl core::fmt::Debug for MapReserveResult<'_> {
 
 /// Hint values passed to `AddressSpace::madvise`.
 ///
-/// V1 keeps madvise observation-only. `WillNeed` is a no-op per VM_v1_2 §9.7;
-/// `DontNeed` is a no-op while reclaim is deferred (PAGE_BACKED_v1 §8); the
-/// remaining advice values are accepted without behavior changes. The
-/// surface exists so callers and future syscall wrappers can compile against
-/// the documented spelling.
+/// Per VM_v1_2 §5.9: `WillNeed`, `Normal`, `Random`, `Sequential` are
+/// observation-only no-ops (§9.7). `DontNeed` and `Free` perform a
+/// range-scoped pmap teardown (mini-munmap that preserves recipes) so the
+/// next access refaults clean.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MadviseAdvice {
     Normal,
@@ -527,6 +504,7 @@ pub enum MadviseAdvice {
     Sequential,
     WillNeed,
     DontNeed,
+    Free,
 }
 
 impl AddressSpace {
@@ -551,12 +529,29 @@ impl AddressSpace {
             .collect()
     }
 
-    /// Records madvise advice for `range`. V1 is observation-only per VM_v1_2
-    /// §9.7; the advice does not yet drive readahead, eviction, or layout
-    /// changes. Returns `Ok(())` for any well-formed `range`.
+    /// Apply `advice` to `range`. V1 implements:
+    ///
+    /// - `DontNeed` / `Free` — range-scoped pmap teardown plus shootdown,
+    ///   preserving recipes (next access refaults clean). Acquires an
+    ///   `ExclusiveWriter` reservation per VM_v1_2 §5.9. Returns
+    ///   `VmMapError::WouldBlock` on contention; callers should retry on
+    ///   the wait channel.
+    /// - `WillNeed`, `Normal`, `Random`, `Sequential` — observation-only
+    ///   no-ops per §9.7; readahead and layout hints are deferred.
     pub fn madvise(&self, range: UserRange, advice: MadviseAdvice) -> Result<(), VmMapError> {
-        let _ = (range, advice);
-        Ok(())
+        match advice {
+            MadviseAdvice::DontNeed | MadviseAdvice::Free => {
+                let _guard = self.acquire_writer(range)?;
+                self.pmap.teardown_range(range)?;
+                let guard = tx_substrate::epoch::guard();
+                self.stats.store(self.recipes.stats(&guard));
+                Ok(())
+            }
+            MadviseAdvice::Normal
+            | MadviseAdvice::Random
+            | MadviseAdvice::Sequential
+            | MadviseAdvice::WillNeed => Ok(()),
+        }
     }
 
     /// Synchronously flushes dirty pages of any File-backed `PageContainer`
@@ -608,4 +603,26 @@ impl MapReservation<'_> {
     pub fn commit(self) -> Result<VmMapCommit, VmMapError> {
         self.aspace.commit_reserved_map(self.entry, self.placement)
     }
+}
+
+/// Await a `RangeLock` release after the canonical `acquire_step` returned
+/// `StepOutcome::Blocked(token)`. Resolved through the global wait-carrier
+/// registry; if the token's channel has been retired the await is a no-op
+/// and the caller's retry loop runs immediately.
+async fn await_range_lock(token: WaitToken) {
+    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
+        let _ = future.await;
+    }
+}
+
+/// `RangeLock::acquire_step{,_pair}` only ever produce `StepOutcome::Done`
+/// or `StepOutcome::Blocked`. Other variants are unreachable by
+/// construction; this helper centralises the panic message so the asserts
+/// stay terse at the call sites.
+#[inline(always)]
+fn unreachable_acquire_step() -> ! {
+    unreachable!(
+        "RangeLock::acquire_step / acquire_pair_step never produce \
+         Advanced / AdvancedThenBlocked / Err"
+    );
 }
