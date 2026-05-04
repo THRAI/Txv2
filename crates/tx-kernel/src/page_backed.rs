@@ -21,8 +21,10 @@ use tx_substrate::{
     zone::{self, Cap, Zone, ZoneAllocated, ZoneError},
 };
 
+mod cross_variant;
 mod lifecycle;
 mod user_buffer;
+pub use cross_variant::step_copy_file_range;
 pub use lifecycle::{step_fallocate, step_fsync, step_truncate};
 pub use user_buffer::{step_read_to_user, step_write_from_user};
 
@@ -1458,6 +1460,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod cross_variant_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

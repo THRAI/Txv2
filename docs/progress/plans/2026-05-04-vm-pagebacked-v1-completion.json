@@ -113,16 +113,16 @@
     {
       "id": "mock-fs-pagebacking",
       "title": "Implement mock FsPageBacking covering File-variant materialize_page",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [],
       "paths": [
         "crates/tx-kernel/src/page_backed.rs",
-        "crates/tx-kernel/src/vfs.rs"
+        "crates/tx-kernel/src/page_backed/lifecycle_tests.rs"
       ],
       "verification": [
         "cargo test -p tx-kernel page_backed -- --test-threads=1"
       ],
-      "notes": "PAGE_BACKED §6 is currently an interface shell. Provide a mock backing that supports fetch/flush/truncate/metadata so File-variant tests exercise the dispatcher end-to-end. No ext4/devfs/bdev-fs work in this step."
+      "notes": "Closed as redundant. The pre-existing test mocks already cover File-variant materialize_page end-to-end: RecordingFs (page_backed.rs tests, fetch counter), BlockingFs (page_backed.rs tests, blocked outcome), and LifecycleFs (page_backed/lifecycle_tests.rs, full fetch/flush/truncate/fsync/fallocate). The fallocate slice extended LifecycleFs further. No new mock-fs-pagebacking module was needed; existing per-test mocks are sufficient for the downstream pagebacked-fallocate, partial-page-byte-fidelity, and cross-variant-scripts slices."
     },
     {
       "id": "pagebacked-fallocate",
@@ -337,19 +337,28 @@
     {
       "id": "cross-variant-scripts",
       "title": "splice / sendfile / copy_file_range over PageBacked variants",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "mock-fs-pagebacking",
         "user-buffer-byte-copy"
       ],
       "paths": [
         "crates/tx-kernel/src/page_backed.rs",
-        "crates/tx-kernel/src/vfs.rs"
+        "crates/tx-kernel/src/page_backed/cross_variant.rs",
+        "crates/tx-kernel/src/page_backed/cross_variant_tests.rs"
       ],
       "verification": [
-        "cargo test -p tx-kernel page_backed -- --test-threads=1"
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
       ],
-      "notes": "PAGE_BACKED §9. Match-on-both-ends dispatch over Anon/File/Device. File-File path uses mock backing for tests; Device path documents zero-copy intent."
+      "notes": "PAGE_BACKED §9.3 copy_file_range covered by step_copy_file_range in a new sibling page_backed/cross_variant.rs module. Page-by-page copy via materialize_page on each side and the substrate FrameKernelAddr hook for direct-map byte movement. Output Device rejects EINVAL; out_offset+len beyond capacity rejects EINVAL; in_offset >= source EOF returns Done(0); the copy is clamped to in_pc.size_bytes() - in_offset; pc.size_bytes is bumped on dst only after byte progress; dirty marking is handled by materialize_page(Write) for Anon/File output. Six tests cover Anon-to-Anon within-page, page-boundary-crossing at different alignments, source-EOF-clamps-the-copy, source-at-EOF returns Done(0), Device-destination EINVAL, and dst-capacity-overflow EINVAL. Splice (§9.1) and sendfile (§9.2) are explicitly deferred: they require Pipe StructBacked which is not yet implemented; the cross_variant.rs rustdoc records this. Reflink path (§9.3 same-fs eligibility) is deferred to the reflink-cow-scaffold slice."
     },
     {
       "id": "reflink-cow-scaffold",
