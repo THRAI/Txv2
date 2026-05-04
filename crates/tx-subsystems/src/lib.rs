@@ -1,39 +1,25 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
+pub mod device;
+pub mod execution;
 pub mod mount;
 pub mod page_backed;
-pub mod process {}
-pub mod step;
-pub mod thread_runtime {}
-pub mod tty {}
+pub mod tty;
 pub mod vfs;
-pub mod vm {}
+pub mod vm;
+pub mod wait_carrier;
+pub mod zones;
+
+mod sync;
+
+pub mod process {}
+pub mod thread_runtime {}
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use core::sync::atomic::{AtomicBool, Ordering};
-
-    static EPOCH_TEST_LOCK: AtomicBool = AtomicBool::new(false);
-
-    pub(crate) struct EpochTestGuard;
-
-    impl EpochTestGuard {
-        pub(crate) fn acquire() -> Self {
-            while EPOCH_TEST_LOCK
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
-            Self
-        }
-    }
-
-    impl Drop for EpochTestGuard {
-        fn drop(&mut self) {
-            EPOCH_TEST_LOCK.store(false, Ordering::Release);
-        }
-    }
+    pub(crate) static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

@@ -6,8 +6,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::sync::Arc;
 use tx_ext4_format::pager::{BlockImage, Ext4Pager, InodeMetaLite, InodeNo};
 use tx_ext4_format::Ext4FormatError;
-use tx_subsystems::step::Errno;
-use tx_subsystems::vfs::fs_ops::DirCursor;
+use tx_subsystems::execution::Errno;
+use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
 pub(crate) const EXT4_ROOT_INODE: u32 = 2;
@@ -85,7 +85,7 @@ impl<I> Drop for Ext4PagerGuard<'_, I> {
 }
 
 pub(crate) fn inode_no(fs_object_id: FsObjectId) -> Result<InodeNo, Errno> {
-    let raw = u32::try_from(fs_object_id.0).map_err(|_| Errno::ENOENT)?;
+    let raw = u32::try_from(fs_object_id.as_u64()).map_err(|_| Errno::ENOENT)?;
     if raw == 0 {
         return Err(Errno::ENOENT);
     }
@@ -93,7 +93,7 @@ pub(crate) fn inode_no(fs_object_id: FsObjectId) -> Result<InodeNo, Errno> {
 }
 
 pub(crate) fn fs_object_id(inode: InodeNo) -> FsObjectId {
-    FsObjectId(inode.get() as u64)
+    FsObjectId::new(inode.get() as u64)
 }
 
 pub(crate) fn map_inode_meta(meta: InodeMetaLite) -> InodeMeta {
