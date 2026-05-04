@@ -263,18 +263,27 @@
     {
       "id": "madvise-msync-mincore",
       "title": "Observation-only scripts: madvise, msync, mincore",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "wait-aware-step-outcome"
       ],
       "paths": [
         "crates/tx-kernel/src/vm/execution.rs",
-        "crates/tx-kernel/src/vm/tests/execution_scripts.rs"
+        "crates/tx-kernel/src/vm/mod.rs",
+        "crates/tx-kernel/src/vm/tests/observation.rs",
+        "crates/tx-kernel/src/vm/tests.rs"
       ],
       "verification": [
-        "cargo test -p tx-kernel vm -- --test-threads=1"
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
       ],
-      "notes": "VM §5.9. madvise treats MADV_WILLNEED as no-op per §9.7; msync delegates to PageBacked step_fsync where applicable; mincore reads the pmap walk surface (which §10 below extends)."
+      "notes": "VM §5.9 observation surface. AddressSpace::mincore(range) returns range-page-count booleans against the pmap walk; AddressSpace::madvise(range, MadviseAdvice) is no-op per VM §9.7 with MadviseAdvice spelling so callers and future syscall wrappers compile against the documented enum; AddressSpace::msync(range, guard) iterates recipes overlapping range, dedups File-backed PageContainers by Cap key, and calls page_backed::step_fsync per unique PC, returning the first non-Done outcome or Done(()) if all succeed. Anon/PrivateAnon/Device backings are no-op for msync. Eight new tests in vm/tests/observation.rs cover walk_range ascending/exclusion/empty, mincore resident/absent and all-absent, madvise advice round-trip, and msync done-for-anon plus skip-anon-PC. vm/tests.rs split: observation tests moved into vm/tests/observation.rs to keep parent under the 1500-line guard."
     },
     {
       "id": "vm-pmap-walk-protect-surface",

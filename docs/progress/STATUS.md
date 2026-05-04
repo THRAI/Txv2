@@ -4,6 +4,22 @@
 
 ## Current Shape
 
+- 2026-05-04 madvise / msync / mincore observation surface landed (plan
+  step madvise-msync-mincore). `AddressSpace::mincore(range)` returns
+  range-page-count booleans against the new `VmPmap::walk_range`;
+  `AddressSpace::madvise(range, MadviseAdvice)` is no-op per VM §9.7 with the
+  documented enum so callers and future syscall wrappers can compile against
+  the spelling; `AddressSpace::msync(range, guard)` iterates recipes
+  overlapping `range`, deduplicates File-backed `PageContainer`s by Cap key,
+  and calls `page_backed::step_fsync` per unique PC. Anon/PrivateAnon/Device
+  backings are no-op for `msync`. Eight new tests in
+  `vm/tests/observation.rs`; `vm/tests.rs` split to keep the parent under
+  the 1500-line guard. Verification: `cargo test -p tx-kernel vm --
+  --test-threads=1` (60 ok), `cargo test -p tx-kernel page_backed --
+  --test-threads=1` (29 ok), `cargo test -p tx-kernel --lib --
+  --test-threads=1` (95 ok), `cargo fmt --check` clean, workspace clippy
+  clean, `cargo xtask lint arch/unused/docs` ok, `cargo xtask progress
+  validate` 24 ok.
 - 2026-05-04 VmPmap walk surface and wait-aware StepOutcome audit landed
   (plan steps vm-pmap-walk-protect-surface and wait-aware-step-outcome).
   `VmPmap::walk_range(range)` returns ascending-order `(UserPage,

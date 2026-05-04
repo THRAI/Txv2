@@ -16,7 +16,7 @@ mod structure;
 #[cfg(test)]
 mod tests;
 
-pub use execution::{MapReservation, MapReserveResult};
+pub use execution::{MadviseAdvice, MapReservation, MapReserveResult};
 pub use pmap::{PmapMappingSnapshot, PmapPublishOutcome, PmapStats, VmPmapError};
 pub use structure::{
     AccessMode, AcquirePairResult, AcquireResult, AddressSpace, AddressSpaceStats, LockMode,
