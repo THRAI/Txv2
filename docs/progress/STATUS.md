@@ -329,6 +329,19 @@
   because no harness-level pass-through exists. Blockers: async fault-script
   retry/yield behavior, Process/ThreadRuntime/trap authority wiring, concrete
   VFS/backend implementations, final user-buffer copy plumbing.
+- 2026-05-04 VFS/ext4 CI fix landed after GitHub `check` failed on
+  `merge vfs work`. The fix boxes large VFS resolution/read-boundary enum
+  payloads, keeps VFS cold-read test-support code behind real cfg boundaries
+  instead of dead-code allowances, splits the oversized
+  `vfs/execution/tests.rs` into responsibility modules, and serializes the
+  ext4 kernel-read backend tests so host epoch guards are not nested by
+  parallel tests. It also updates the ext4 page offset check for the current
+  nightly clippy lint. Verification: `cargo test -p tx-subsystems
+  vfs::execution::tests -- --test-threads=1`, `cargo test -p tx-ext4 --test
+  kernel_read_backend`, `cargo test -p tx-ext4 --test vfs_full_read`, `cargo
+  xtask lint unused`, `cargo xtask lint arch`, and `cargo xtask ci` with 10
+  passed, 1 skipped la64 target, 0 failed. Next step: commit and push this CI
+  repair so GitHub Actions reruns green; no blocker.
 - 2026-05-04 TTY progress memory now has a durable status note at
   `docs/progress/research/2026-05-04-tty-implementation-status.md`, and
   `.agents/skills/tx-tty-subsystem/SKILL.md` now points future work at the
