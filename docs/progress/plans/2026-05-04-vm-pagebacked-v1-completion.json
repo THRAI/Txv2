@@ -375,19 +375,28 @@
     {
       "id": "reflink-cow-scaffold",
       "title": "Reflink + CoW-on-write scaffolding inside PageContainer share rules",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "mock-fs-pagebacking",
         "persistent-epoch-recipes"
       ],
       "paths": [
         "crates/tx-kernel/src/page_backed.rs",
-        "crates/tx-kernel/src/page_backed/lifecycle.rs"
+        "crates/tx-kernel/src/page_backed/reflink.rs",
+        "crates/tx-kernel/src/page_backed/reflink_tests.rs"
       ],
       "verification": [
-        "cargo test -p tx-kernel page_backed -- --test-threads=1"
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
       ],
-      "notes": "PAGE_BACKED §7. Wire share/CoW counters on the PageContainer side; full reflink across two RNodes still waits on a real backend with refcount support. Document the §12.4 reflink-vs-truncate race as deferred."
+      "notes": "PAGE_BACKED §7.1/§7.2. New page_backed::install_shared_page(pc, page, source_ppn) and page_backed::cow_replace_into_private(pc, page) live in a new sibling page_backed/reflink.rs module. install_shared_page acquires a fresh CachePin on source_ppn (incrementing cache_ref so the source frame stays live) and installs the entry via install_if_absent; rejects Device backings and pre-existing entries. cow_replace_into_private allocates a fresh zeroed frame, copies the cached frame's bytes via the substrate FrameCopier hook, and swaps the page-cache entry through install_if_match (which is now non-test so concurrent CoW can linearize). Existing CachePin on the old shared frame is dropped on success, decrementing its cache_ref. Six tests cover share-attaches, share-rejects-already-present, share-rejects-Device, CoW-replaces-with-matching-bytes-and-leaves-source-intact, CoW-on-missing-page errors, and CoW-rejects-Device. PageCacheIndex::install_if_match is now non-test (was cfg(test) only). Real reflink across two RNodes (filesystem-side) and the §12.4 reflink-vs-truncate race remain deferred to backends and follow-up slices."
     },
     {
       "id": "ledger-and-status-final",

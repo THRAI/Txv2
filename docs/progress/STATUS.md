@@ -4,6 +4,23 @@
 
 ## Current Shape
 
+- 2026-05-04 Reflink + CoW-on-write scaffolding landed (plan step
+  reflink-cow-scaffold). New `page_backed::install_shared_page(pc, page,
+  source_ppn)` and `page_backed::cow_replace_into_private(pc, page)` in a
+  new sibling `page_backed/reflink.rs` module. `install_shared_page`
+  acquires a fresh `CachePin` on the source PPN and inserts via
+  `install_if_absent` (cache_ref bumps so source stays live); rejects
+  Device backings and pre-existing entries. `cow_replace_into_private`
+  allocates a fresh zeroed frame, copies bytes through the substrate
+  `FrameCopier`, and swaps the page-cache entry via `install_if_match`
+  (now production code so concurrent CoW linearizes); old `CachePin`
+  drops on success, decrementing the source's cache_ref. Six tests in
+  `reflink_tests.rs`. Real reflink across two RNodes (filesystem-side
+  refcount accounting) and the §12.4 reflink-vs-truncate race remain
+  deferred. Verification: `cargo fmt --check` clean, vm 60 ok,
+  page_backed 49 ok (43 + 6 reflink), lib 115 ok, workspace clippy clean,
+  `cargo xtask lint arch/unused/docs` ok, `cargo xtask progress validate`
+  24 ok.
 - 2026-05-04 Persistent EBR-backed recipe publication landed (plan step
   persistent-epoch-recipes). `RecipeIndex` now publishes via
   `AtomicPtr<RecipeTree>` for lock-free reads under `epoch::Guard`, with a
