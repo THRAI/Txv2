@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 use tx_hal::PmapIf;
 use tx_substrate::zone::{self, Cap, ZoneError};
 
+use crate::cred::Cred;
 use crate::process::structure::{
     allocate_pid, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,
 };
@@ -85,7 +86,7 @@ pub fn bootstrap_init_process(
     pgrp.session.groups.lock().push(pgrp.downgrade());
 
     let leader = sign_thread(proc_cap.downgrade())?;
-    let payload = sign_process_payload(aspace, vec![leader])?;
+    let payload = sign_process_payload(aspace, vec![leader], Cred::root())?;
     *proc_cap.payload.lock() = Some(payload);
 
     Ok(proc_cap)
@@ -98,10 +99,10 @@ pub fn step_fork<P: PmapIf>(
     parent: &Cap<ProcessIdentity>,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
     // Snapshot parent state under its payload lock.
-    let parent_aspace = {
+    let (parent_aspace, parent_cred) = {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
-        payload.aspace.clone()
+        (payload.aspace.clone(), payload.cred())
     };
     let parent_pgrp = parent.pgrp.lock().clone();
 
@@ -119,8 +120,9 @@ pub fn step_fork<P: PmapIf>(
     // Leader thread.
     let leader = sign_thread(child_proc.downgrade()).map_err(ForkError::Zone)?;
 
-    // Wire up payload.
-    let payload = sign_process_payload(child_aspace_cap, vec![leader]).map_err(ForkError::Zone)?;
+    // Wire up payload — child inherits parent credentials.
+    let payload = sign_process_payload(child_aspace_cap, vec![leader], parent_cred)
+        .map_err(ForkError::Zone)?;
     *child_proc.payload.lock() = Some(payload);
 
     // Register child in parent's pgrp.
@@ -246,6 +248,7 @@ fn sign_process_identity(
 fn sign_process_payload(
     aspace: Cap<AddressSpace>,
     threads: Vec<Cap<ThreadIdentity>>,
+    cred: Cred,
 ) -> Result<tx_substrate::zone::PayloadCap<ProcessPayload>, ZoneError> {
     let res = zone::reserve_for::<ProcessPayload>()?;
     let cap = zone::sign_for(
@@ -255,6 +258,7 @@ fn sign_process_payload(
             threads: SpinMutex::new(threads),
             sig_actions: SigActionTable::new(),
             group_pending: PendingSignalQueue::new(),
+            cred: SpinMutex::new(cred),
         },
     );
     Ok(tx_substrate::zone::PayloadCap::from_cap(cap))
