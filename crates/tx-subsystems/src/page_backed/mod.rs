@@ -1,63 +1,36 @@
+use tx_hal::Ppn;
 use tx_substrate::epoch::Guard;
 use tx_substrate::zone::{Zone, ZoneAllocated};
 
 use crate::mount::structure::MountPayloadPin;
-use crate::step::Errno;
 use crate::step::StepOutcome;
 use crate::vfs::structure::FsObjectId;
 
+// Page size constant. Distinct from `Frame`'s surface — a Frame is now a
+// PPN handle whose underlying storage is a 4 KiB physical page. Callers
+// that compute byte offsets within a page use this constant directly.
 pub const FRAME_CAPACITY: usize = 4096;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+// Frame is a thin substrate-owned page handle per
+// `docs/design/03_memory-vm/PAGE_BACKED_v1.md` §53-91. Liveness lives on
+// FrameMeta in the page substrate (cache_ref / map_count / pin_count
+// disjunction); the Frame value itself is just the address of the live
+// physical page. Filesystem backends that need to materialize a frame
+// for `fetch_page` allocate via `tx_substrate::page_allocator` and copy
+// disk content through the kernel direct map; the returned `Frame`
+// references the resulting PPN.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Frame {
-    len: u16,
-    bytes: [u8; FRAME_CAPACITY],
+    ppn: Ppn,
 }
 
 impl Frame {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Errno> {
-        if bytes.len() > FRAME_CAPACITY {
-            return Err(Errno::Busy);
-        }
-
-        let mut frame = Self::zeroed();
-        frame.bytes[..bytes.len()].copy_from_slice(bytes);
-        frame.len = bytes.len() as u16;
-        Ok(frame)
+    pub const fn new(ppn: Ppn) -> Self {
+        Self { ppn }
     }
 
-    pub const fn zeroed() -> Self {
-        Self {
-            len: 0,
-            bytes: [0; FRAME_CAPACITY],
-        }
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len as usize]
-    }
-
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn slice(&self, offset: usize, max_len: usize) -> &[u8] {
-        if offset >= self.len() {
-            return &[];
-        }
-
-        let end = core::cmp::min(self.len(), offset.saturating_add(max_len));
-        &self.as_bytes()[offset..end]
-    }
-}
-
-impl Default for Frame {
-    fn default() -> Self {
-        Self::zeroed()
+    pub const fn ppn(self) -> Ppn {
+        self.ppn
     }
 }
 
@@ -145,22 +118,6 @@ mod tests {
         tx_substrate::testing::init_host_for_test_once();
         let _ = zone::register_zone_for::<PageContainer>();
         let _ = zone::register_zone_for::<MountPayload>();
-    }
-
-    #[test]
-    fn frame_copies_returned_bytes() {
-        let frame = Frame::from_bytes(b"hello").expect("frame");
-
-        assert_eq!(frame.len(), 5);
-        assert_eq!(frame.as_bytes(), b"hello");
-    }
-
-    #[test]
-    fn frame_slice_clamps_to_available_bytes() {
-        let frame = Frame::from_bytes(b"abcdef").expect("frame");
-
-        assert_eq!(frame.slice(2, 10), b"cdef");
-        assert_eq!(frame.slice(6, 1), b"");
     }
 
     #[test]

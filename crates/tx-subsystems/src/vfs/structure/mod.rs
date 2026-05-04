@@ -59,7 +59,7 @@ impl NameOwned {
 
     pub fn from_component(component: &[u8]) -> Result<Self, Errno> {
         if component.len() > Self::MAX_LEN {
-            return Err(Errno::NameTooLong);
+            return Err(Errno::ENAMETOOLONG);
         }
 
         let mut bytes = [0; Self::MAX_LEN];
@@ -175,9 +175,9 @@ impl RenderBuffer {
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), Errno> {
-        let end = self.len.checked_add(bytes.len()).ok_or(Errno::Busy)?;
+        let end = self.len.checked_add(bytes.len()).ok_or(Errno::EBUSY)?;
         if end > Self::CAPACITY {
-            return Err(Errno::Busy);
+            return Err(Errno::EBUSY);
         }
 
         self.bytes[self.len..end].copy_from_slice(bytes);
@@ -380,7 +380,7 @@ pub trait ProjectionSchema: Send + Sync {
         guard: &'g Guard<'g>,
     ) -> Result<(), Errno> {
         let _ = (key, ctx, out, guard);
-        Err(Errno::NotImplemented)
+        Err(Errno::ENOSYS)
     }
 }
 
@@ -541,7 +541,7 @@ mod tests {
     fn name_owned_rejects_overlong_component() {
         let bytes = [b'a'; NameOwned::MAX_LEN + 1];
 
-        assert_eq!(NameOwned::from_component(&bytes), Err(Errno::NameTooLong));
+        assert_eq!(NameOwned::from_component(&bytes), Err(Errno::ENAMETOOLONG));
     }
 
     #[test]

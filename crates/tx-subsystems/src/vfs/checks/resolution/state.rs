@@ -50,12 +50,12 @@ impl<'a, 'g> WalkState<'a, 'g> {
     #[cfg(any(test, feature = "vfs-read-test-support"))]
     pub(crate) fn suspend(&self) -> Result<SuspendedState, Errno> {
         Ok(SuspendedState {
-            cursor: self.cursor.to_cap().map_err(|_| Errno::Stale)?,
+            cursor: self.cursor.to_cap().map_err(|_| Errno::ESTALE)?,
             remaining: OwnedComponents::from_components(self.remaining)?,
             symlink_budget: self.symlink_budget,
             root_ctx: self.root_ctx.to_caps()?,
             trail: self.trail.to_caps()?,
-            current_mount: self.current_mount.to_cap().map_err(|_| Errno::Stale)?,
+            current_mount: self.current_mount.to_cap().map_err(|_| Errno::ESTALE)?,
         })
     }
 }
@@ -73,15 +73,15 @@ impl<'g> RootCtxRef<'g> {
     #[cfg(any(test, feature = "vfs-read-test-support"))]
     fn to_caps(&self) -> Result<RootCtxCaps, Errno> {
         Ok(RootCtxCaps {
-            mnt_ns: self.mnt_ns.to_cap().map_err(|_| Errno::Stale)?,
-            mnt_ns_root: self.mnt_ns_root.to_cap().map_err(|_| Errno::Stale)?,
+            mnt_ns: self.mnt_ns.to_cap().map_err(|_| Errno::ESTALE)?,
+            mnt_ns_root: self.mnt_ns_root.to_cap().map_err(|_| Errno::ESTALE)?,
             chroot: match &self.chroot {
-                Some(chroot) => Some(chroot.to_cap().map_err(|_| Errno::Stale)?),
+                Some(chroot) => Some(chroot.to_cap().map_err(|_| Errno::ESTALE)?),
                 None => None,
             },
-            cwd: self.cwd.to_cap().map_err(|_| Errno::Stale)?,
-            root_mount: self.root_mount.to_cap().map_err(|_| Errno::Stale)?,
-            cwd_mount: self.cwd_mount.to_cap().map_err(|_| Errno::Stale)?,
+            cwd: self.cwd.to_cap().map_err(|_| Errno::ESTALE)?,
+            root_mount: self.root_mount.to_cap().map_err(|_| Errno::ESTALE)?,
+            cwd_mount: self.cwd_mount.to_cap().map_err(|_| Errno::ESTALE)?,
         })
     }
 }
@@ -132,7 +132,7 @@ impl<'a> Components<'a> {
         }
         let component = &self.buf[start..self.cursor];
         if component.len() > NameOwned::MAX_LEN {
-            return Err(Errno::NameTooLong);
+            return Err(Errno::ENAMETOOLONG);
         }
         Ok(Some(component))
     }
@@ -172,7 +172,7 @@ impl<'g> WalkTrail<'g> {
 
     pub fn push(&mut self, entry: TrailEntry<'g>) -> Result<(), Errno> {
         if self.len == Self::CAPACITY {
-            return Err(Errno::NameTooLong);
+            return Err(Errno::ENAMETOOLONG);
         }
         self.entries[self.len] = Some(entry);
         self.len += 1;
@@ -198,7 +198,7 @@ impl<'g> WalkTrail<'g> {
             {
                 TrailEntry::DEntry(dentry) => {
                     caps.push(TrailEntryCap::DEntry(
-                        dentry.to_cap().map_err(|_| Errno::Stale)?,
+                        dentry.to_cap().map_err(|_| Errno::ESTALE)?,
                     ))?;
                 }
                 TrailEntry::MountBoundary {
@@ -206,8 +206,8 @@ impl<'g> WalkTrail<'g> {
                     was_in_mount,
                 } => {
                     caps.push(TrailEntryCap::MountBoundary {
-                        was_at: was_at.to_cap().map_err(|_| Errno::Stale)?,
-                        was_in_mount: was_in_mount.to_cap().map_err(|_| Errno::Stale)?,
+                        was_at: was_at.to_cap().map_err(|_| Errno::ESTALE)?,
+                        was_in_mount: was_in_mount.to_cap().map_err(|_| Errno::ESTALE)?,
                     })?;
                 }
             }
@@ -308,7 +308,7 @@ pub(crate) fn make_initial_walk_state<'a, 'g>(
     guard: &'g Guard<'_>,
 ) -> Result<WalkState<'a, 'g>, Errno> {
     if path.is_empty() {
-        return Err(Errno::NoEntry);
+        return Err(Errno::ENOENT);
     }
     let root_ctx = root_ctx_caps.resume(guard);
     let (cursor, current_mount) = if path.first() == Some(&b'/') {
@@ -343,7 +343,7 @@ impl OwnedComponents {
 
     pub fn from_components(components: Components<'_>) -> Result<Self, Errno> {
         if components.buf.len() > Self::MAX_LEN {
-            return Err(Errno::NameTooLong);
+            return Err(Errno::ENAMETOOLONG);
         }
         let mut bytes = [0; Self::MAX_LEN];
         bytes[..components.buf.len()].copy_from_slice(components.buf);
@@ -387,7 +387,7 @@ impl WalkTrailCaps {
 
     pub fn push(&mut self, entry: TrailEntryCap) -> Result<(), Errno> {
         if self.len == Self::CAPACITY {
-            return Err(Errno::NameTooLong);
+            return Err(Errno::ENAMETOOLONG);
         }
         self.entries[self.len] = Some(entry);
         self.len += 1;
@@ -490,7 +490,7 @@ mod tests {
         let bytes = [b'a'; NameOwned::MAX_LEN + 1];
         let mut components = Components::new(&bytes);
 
-        assert_eq!(components.next_component(), Err(Errno::NameTooLong));
+        assert_eq!(components.next_component(), Err(Errno::ENAMETOOLONG));
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub(crate) fn build_witness<'a, 'g>(
                 // RFX-VFS-P2-004: Follow terminal symlink once symlink payload
                 // read is available. Entity mode cannot resolve a path whose
                 // final component is a symlink.
-                return Err(Errno::NotImplemented);
+                return Err(Errno::ENOSYS);
             }
             Ok(WalkWitness::Entity(EntityAtPath::new(
                 state.cursor,
@@ -83,7 +83,7 @@ pub(crate) fn build_penultimate_witness<'a, 'g>(
     let name = state
         .remaining
         .peek_last_component()?
-        .ok_or(Errno::NoEntry)
+        .ok_or(Errno::ENOENT)
         .and_then(NameOwned::from_component)?;
 
     match mode {
@@ -100,7 +100,7 @@ pub(crate) fn build_penultimate_witness<'a, 'g>(
                 // forward crossing is wired into final child resolution. The
                 // temporary Cap only duplicates the same guard-scoped mount
                 // observation while IdentRef itself is intentionally non-Copy.
-                let mount_cap = state.current_mount.to_cap().map_err(|_| Errno::Stale)?;
+                let mount_cap = state.current_mount.to_cap().map_err(|_| Errno::ESTALE)?;
                 let parent_mount = mount_cap.ident_ref(guard);
                 let child_mount = mount_cap.ident_ref(guard);
                 Ok(WalkWitness::ParentAndNamedChild(ParentAndNamedChild::new(
@@ -112,7 +112,7 @@ pub(crate) fn build_penultimate_witness<'a, 'g>(
                     name,
                 )))
             }
-            DEntryChildLookup::Missing => Err(Errno::NoEntry),
+            DEntryChildLookup::Missing => Err(Errno::ENOENT),
         },
         WalkMode::EntityOrParentAndName => match state.cursor.children.lookup(&name, guard) {
             DEntryChildLookup::Found(child) => {
@@ -131,6 +131,6 @@ pub(crate) fn build_penultimate_witness<'a, 'g>(
                 )))
             }
         },
-        WalkMode::Entity | WalkMode::EntityUnfollowed | WalkMode::MountPoint => Err(Errno::Invalid),
+        WalkMode::Entity | WalkMode::EntityUnfollowed | WalkMode::MountPoint => Err(Errno::EINVAL),
     }
 }

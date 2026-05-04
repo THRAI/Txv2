@@ -262,7 +262,7 @@ pub(crate) mod testing {
             _name: &[u8],
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<FsObjectId> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn load_inode_meta<'g>(
@@ -270,7 +270,7 @@ pub(crate) mod testing {
             _fs_object_id: FsObjectId,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<InodeMeta> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn serialize_inode_meta<'g>(
@@ -279,7 +279,7 @@ pub(crate) mod testing {
             _meta: &InodeMeta,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<()> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn create_inode<'g>(
@@ -290,7 +290,7 @@ pub(crate) mod testing {
             _cred: &crate::vfs::fs_ops::Credential,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<(FsObjectId, InodeMeta)> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn unlink<'g>(
@@ -300,7 +300,7 @@ pub(crate) mod testing {
             _target: FsObjectId,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<()> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn rename<'g>(
@@ -311,7 +311,7 @@ pub(crate) mod testing {
             _new_name: &[u8],
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<()> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn link<'g>(
@@ -321,7 +321,7 @@ pub(crate) mod testing {
             _target: FsObjectId,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<()> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn mkdir<'g>(
@@ -332,7 +332,7 @@ pub(crate) mod testing {
             _cred: &crate::vfs::fs_ops::Credential,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<(FsObjectId, InodeMeta)> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn rmdir<'g>(
@@ -342,7 +342,7 @@ pub(crate) mod testing {
             _target: FsObjectId,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<()> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn symlink<'g>(
@@ -353,7 +353,7 @@ pub(crate) mod testing {
             _cred: &crate::vfs::fs_ops::Credential,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<(FsObjectId, InodeMeta)> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn readdir<'g>(
@@ -364,7 +364,7 @@ pub(crate) mod testing {
         ) -> crate::step::StepOutcome<
             Option<(crate::vfs::fs_ops::DirEntry, crate::vfs::fs_ops::DirCursor)>,
         > {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn destroy_inode<'g>(
@@ -372,7 +372,7 @@ pub(crate) mod testing {
             _fs_object_id: FsObjectId,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<()> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
     }
 
@@ -384,7 +384,7 @@ pub(crate) mod testing {
             _offset: u64,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<crate::page_backed::Frame> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn flush_page<'g>(
@@ -394,7 +394,7 @@ pub(crate) mod testing {
             _frame: &crate::page_backed::Frame,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<()> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn truncate<'g>(
@@ -403,7 +403,7 @@ pub(crate) mod testing {
             _new_size: u64,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<()> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
 
         fn fsync<'g>(
@@ -411,7 +411,7 @@ pub(crate) mod testing {
             _fs_object_id: FsObjectId,
             _guard: &'g Guard<'g>,
         ) -> crate::step::StepOutcome<()> {
-            crate::step::StepOutcome::Err(crate::step::Errno::NotImplemented)
+            crate::step::StepOutcome::Err(crate::step::Errno::ENOSYS)
         }
     }
 
