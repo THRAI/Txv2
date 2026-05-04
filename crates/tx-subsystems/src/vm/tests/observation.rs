@@ -103,7 +103,8 @@ fn vm_mincore_reports_all_absent_for_unmapped_range() {
 }
 
 #[test]
-fn vm_madvise_accepts_documented_advice_without_state_change() {
+fn vm_madvise_noop_advice_preserves_recipes_and_pmap() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x12000, 2),
@@ -120,7 +121,6 @@ fn vm_madvise_accepts_documented_advice_without_state_change() {
         crate::vm::MadviseAdvice::Random,
         crate::vm::MadviseAdvice::Sequential,
         crate::vm::MadviseAdvice::WillNeed,
-        crate::vm::MadviseAdvice::DontNeed,
     ] {
         assert!(aspace.madvise(range(0x12000, 2), advice).is_ok());
     }
@@ -134,6 +134,72 @@ fn vm_madvise_accepts_documented_advice_without_state_change() {
             VmBacking::PrivateAnon,
         ))
     );
+}
+
+#[test]
+fn vm_madvise_dontneed_tears_down_ptes_and_preserves_recipe() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let mapped = range(0x14000, 2);
+    let entry = VmEntry::new(
+        mapped,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(entry.clone(), MapPlacement::RequireFree))
+        .commit()
+        .expect("map");
+
+    for fault_addr in [0x14000_usize, 0x15000] {
+        let outcome = aspace
+            .resolve_fault(VmFault::new(UserVirtAddr(fault_addr), AccessMode::Write))
+            .expect("fault");
+        let materialized = outcome.materialize_pagebacked().expect("materialize");
+        aspace
+            .publish_fault_materialization(outcome, materialized)
+            .expect("publish");
+    }
+    assert_eq!(aspace.mincore(mapped), alloc::vec![true, true]);
+
+    aspace
+        .madvise(mapped, crate::vm::MadviseAdvice::DontNeed)
+        .expect("dontneed");
+
+    assert_eq!(aspace.mincore(mapped), alloc::vec![false, false]);
+    assert_eq!(aspace.lookup(UserVirtAddr(0x14000)), Some(entry.clone()));
+    assert_eq!(aspace.lookup(UserVirtAddr(0x15000)), Some(entry));
+}
+
+#[test]
+fn vm_madvise_free_acts_as_dontneed_for_anon() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let mapped = range(0x16000, 1);
+    let entry = VmEntry::new(
+        mapped,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(entry.clone(), MapPlacement::RequireFree))
+        .commit()
+        .expect("map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x16000), AccessMode::Write))
+        .expect("fault");
+    let materialized = outcome.materialize_pagebacked().expect("materialize");
+    aspace
+        .publish_fault_materialization(outcome, materialized)
+        .expect("publish");
+    assert_eq!(aspace.mincore(mapped), alloc::vec![true]);
+
+    aspace
+        .madvise(mapped, crate::vm::MadviseAdvice::Free)
+        .expect("free");
+
+    assert_eq!(aspace.mincore(mapped), alloc::vec![false]);
+    assert_eq!(aspace.lookup(UserVirtAddr(0x16000)), Some(entry));
 }
 
 #[test]
