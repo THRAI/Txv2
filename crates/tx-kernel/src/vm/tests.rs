@@ -1338,3 +1338,70 @@ fn vm_pmap_protect_tears_down_for_refault_not_in_place_retag() {
     assert_eq!(aspace.pmap().lookup(UserPage(5)), None);
     assert_eq!(aspace.pmap().stats().shootdowns, 1);
 }
+
+#[test]
+fn vm_pmap_walk_range_returns_only_mapped_pages_in_ascending_order() {
+    let aspace = AddressSpace::new();
+    let entry = VmEntry::new(
+        range(0x6000, 4),
+        Prot::READ_WRITE,
+        VmEntryFlags::SHARED,
+        page_backing(0),
+    );
+    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+        .commit()
+        .expect("map");
+
+    for fault_addr in [0x6000, 0x8000] {
+        let outcome = aspace
+            .resolve_fault(VmFault::new(UserVirtAddr(fault_addr), AccessMode::Write))
+            .expect("fault resolves");
+        let materialized = outcome.materialize_pagebacked_anon().expect("materialize");
+        aspace
+            .publish_fault_materialization(outcome, materialized)
+            .expect("publish");
+    }
+
+    let walked = aspace.pmap().walk_range(range(0x6000, 4));
+
+    assert_eq!(walked.len(), 2);
+    assert_eq!(walked[0].0, UserPage(6));
+    assert_eq!(walked[1].0, UserPage(8));
+    assert!(walked[0].1.prot == Prot::READ_WRITE);
+}
+
+#[test]
+fn vm_pmap_walk_range_excludes_pages_outside_the_query_range() {
+    let aspace = AddressSpace::new();
+    let entry = VmEntry::new(
+        range(0xa000, 3),
+        Prot::READ_WRITE,
+        VmEntryFlags::SHARED,
+        page_backing(0),
+    );
+    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+        .commit()
+        .expect("map");
+
+    for fault_addr in [0xa000, 0xb000, 0xc000] {
+        let outcome = aspace
+            .resolve_fault(VmFault::new(UserVirtAddr(fault_addr), AccessMode::Write))
+            .expect("fault resolves");
+        let materialized = outcome.materialize_pagebacked_anon().expect("materialize");
+        aspace
+            .publish_fault_materialization(outcome, materialized)
+            .expect("publish");
+    }
+
+    let walked_middle = aspace.pmap().walk_range(range(0xb000, 1));
+
+    assert_eq!(walked_middle.len(), 1);
+    assert_eq!(walked_middle[0].0, UserPage(11));
+}
+
+#[test]
+fn vm_pmap_walk_range_returns_empty_when_no_mappings_exist() {
+    let aspace = AddressSpace::new();
+    let walked = aspace.pmap().walk_range(range(0x4000, 4));
+    assert!(walked.is_empty());
+}

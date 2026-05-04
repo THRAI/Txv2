@@ -1,4 +1,5 @@
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 use tx_hal::{
@@ -143,6 +144,21 @@ impl VmPmap {
             .map(PmapMapping::snapshot)
     }
 
+    /// Returns mapped `(page, snapshot)` tuples for every page in `range`
+    /// that currently has a published pmap entry, in ascending page order.
+    ///
+    /// This is the read-only walk surface used by `mincore`-style enumeration
+    /// and by future fork CoW demotion to discover which pages need
+    /// teardown. The lock is held only for the duration of the walk; concurrent
+    /// publishes after the call returns are the caller's concern.
+    pub fn walk_range(&self, range: UserRange) -> Vec<(UserPage, PmapMappingSnapshot)> {
+        let state = self.state.lock();
+        range
+            .iter_pages()
+            .filter_map(|page| state.mappings.get(&page).map(|m| (page, m.snapshot())))
+            .collect()
+    }
+
     pub fn stats(&self) -> PmapStats {
         let state = self.state.lock();
         PmapStats {
@@ -238,6 +254,14 @@ impl VmPmap {
         Ok(PmapPublishOutcome { page, replaced })
     }
 
+    /// Tears down every published pmap entry in `range`, releasing the
+    /// associated `MapPin` and issuing the ASID-scoped shootdown.
+    ///
+    /// Used by `unmap` to remove mappings entirely, and by `mprotect` /
+    /// fork CoW demotion to demote permissions through tear-down + refault
+    /// (per VM_v1_2 §9.8: in-place PTE permission patching is deferred). The
+    /// next access to the affected pages refaults, observes the new recipe
+    /// protection, and republishes with the demoted permissions.
     pub fn teardown_range(&self, range: UserRange) -> Result<usize, VmPmapError> {
         let mut batch = AddressSpaceShootdownBatch::<
             BitmapPageAllocator<'static>,
