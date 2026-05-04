@@ -202,6 +202,56 @@ impl AddressSpace {
         }
     }
 
+    /// Async brk script: grow or shrink the program break of an Anon
+    /// mapping anchored at `brk_base`.
+    ///
+    /// VM_v1_2 §5.8. The current implementation models brk as a single
+    /// `VmBacking::PrivateAnon` mapping whose extent is
+    /// `[brk_base, current_brk)`. The script:
+    ///
+    /// - returns `Ok(current_brk)` when `requested_brk == current_brk`.
+    /// - rejects with `InvalidRange` when `requested_brk < brk_base`.
+    /// - on grow, calls `map_script_async` to map the page-aligned range
+    ///   `[current_brk, requested_brk)`.
+    /// - on shrink, calls `unmap_async` on `[requested_brk, current_brk)`.
+    ///
+    /// All three of `brk_base`, `current_brk`, and `requested_brk` must be
+    /// page-aligned. Process-level tracking of the brk value (which hart
+    /// holds it, exec-time base, fork inheritance) lives in the Process
+    /// subsystem and is out of scope for VM.
+    pub async fn brk_script_async(
+        &self,
+        brk_base: crate::vm::UserVirtAddr,
+        current_brk: crate::vm::UserVirtAddr,
+        requested_brk: crate::vm::UserVirtAddr,
+    ) -> Result<crate::vm::UserVirtAddr, VmMapError> {
+        if requested_brk.0 < brk_base.0 {
+            return Err(VmMapError::InvalidRange);
+        }
+        if requested_brk.0 == current_brk.0 {
+            return Ok(current_brk);
+        }
+        if requested_brk.0 > current_brk.0 {
+            let len = requested_brk.0 - current_brk.0;
+            let range =
+                UserRange::new_aligned(current_brk, len).map_err(|_| VmMapError::InvalidRange)?;
+            let request = VmMapRequest::fixed(
+                range,
+                MapPlacement::RequireFree,
+                Prot::READ_WRITE,
+                crate::vm::VmEntryFlags::PRIVATE,
+                VmBacking::PrivateAnon,
+            );
+            self.map_script_async(request).await?;
+        } else {
+            let len = current_brk.0 - requested_brk.0;
+            let range =
+                UserRange::new_aligned(requested_brk, len).map_err(|_| VmMapError::InvalidRange)?;
+            self.unmap_async(range).await?;
+        }
+        Ok(requested_brk)
+    }
+
     pub fn remap_script(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
         require_disjoint_remap(request.old_range, request.new_range)?;
 

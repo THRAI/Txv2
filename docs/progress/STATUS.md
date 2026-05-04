@@ -4,6 +4,15 @@
 
 ## Current Shape
 
+- 2026-05-04 brk_script_async landed (plan step brk-script). Models the
+  program break as an Anon PrivateAnon mapping covering
+  `[brk_base, current_brk)`. Grow calls `map_script_async` on the new
+  range; shrink calls `unmap_async`; equal returns current; below
+  `brk_base` rejects `InvalidRange`. Process-level brk tracking is out
+  of scope for VM. Four new tests in `vm/tests/script_async.rs`.
+  Verification: `cargo fmt --check` clean, vm 71 ok (was 67, +4),
+  page_backed 49 ok, lib 132 ok, workspace clippy clean, `cargo xtask
+  lint arch/unused/docs` ok, `cargo xtask progress validate` 24 ok.
 - 2026-05-04 unmap/protect/remap async wrappers landed (plan step
   munmap-mprotect-mremap-scripts), each following the
   `map_script_async` template. `AddressSpace::unmap_async`,
