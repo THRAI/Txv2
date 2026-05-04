@@ -7,6 +7,8 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
+use tx_hal::PmapIf;
+
 use crate::execution::{Guard, StepOutcome};
 use crate::page_backed::{step_fsync, PageContainerKind};
 use crate::vm::checks::{
@@ -54,6 +56,67 @@ impl AddressSpace {
                 materialization.replace_existing,
             )
             .map_err(VmFaultError::Pmap)
+    }
+
+    /// Duplicate `parent`'s recipes into a fresh child `AddressSpace` and
+    /// demote `parent`'s MAP_PRIVATE PTEs so subsequent writes refault and
+    /// CoW.
+    ///
+    /// VM_v1_2 §5.6. The child is constructed via the same platform pmap
+    /// type as `parent`. Each parent recipe is cloned (a `Cap<PageContainer>`
+    /// clone is a refcount bump) and committed into the child's recipe
+    /// index via `RecipeIndex::commit_map(_, RequireFree)`. For every
+    /// MAP_PRIVATE entry, the parent's pmap range is torn down so the
+    /// next access on either side refaults and the existing
+    /// `materialize_page_recipe` CoW path produces a private frame for the
+    /// writer. MAP_SHARED entries leave the parent's PTEs intact; the
+    /// child's pmap starts empty and rebuilds via refault.
+    ///
+    /// V1 caller invariant (per VM_v1_2 §9.5): no other VM operation runs
+    /// against `parent` for the duration of the call. The VM-level fork
+    /// does not yet acquire an ExclusiveWriter on the full user range
+    /// because `UserRange::full_user_v1` is not yet defined; the Process
+    /// subsystem is expected to serialize parent VM activity around fork.
+    /// The fork-vs-VM race is a known v1 gap recorded in the v1 plan
+    /// closure decision.
+    pub fn fork_aspace<P: PmapIf>(parent: &AddressSpace) -> Result<AddressSpace, VmMapError> {
+        let parent_recipes = parent.recipes_snapshot();
+        let child = AddressSpace::new_for_platform::<P>()?;
+
+        for entry in parent_recipes {
+            let private = !entry.flags.shared;
+            let range = entry.range;
+            child.recipes.commit_map(entry, MapPlacement::RequireFree)?;
+            if private {
+                let _ = parent.pmap.teardown_range(range);
+            }
+        }
+
+        let guard = tx_substrate::epoch::guard();
+        child.stats.store(child.recipes.stats(&guard));
+        Ok(child)
+    }
+
+    /// Reset `old_aspace` for exec by tearing down every materialized PTE
+    /// across all current recipes.
+    ///
+    /// VM_v1_2 §5.7. Caller is responsible for replacing the recipes (and
+    /// for choosing whether to drop and recreate the `AddressSpace` or
+    /// reuse the same instance with new content). This function only
+    /// performs the pmap teardown step; recipe management belongs to the
+    /// caller because the new image's recipe shape is determined by the
+    /// exec image loader, which is Process-side and not yet implemented.
+    /// V1 callers typically follow with `aspace.recipes` modifications
+    /// that withdraw old entries and install the new image's mappings, or
+    /// drop `old_aspace` entirely and use a fresh AddressSpace.
+    ///
+    /// Caller invariant (per VM §5.7 prologue): exec has already reduced
+    /// the thread group to one and no concurrent VM operations exist on
+    /// `old_aspace`.
+    ///
+    /// Returns the count of pages torn down for observability.
+    pub fn exec_aspace(old_aspace: &AddressSpace) -> usize {
+        old_aspace.teardown_all_pmap()
     }
 
     /// Async wrapper around `resolve_fault` + `materialize_pagebacked` +

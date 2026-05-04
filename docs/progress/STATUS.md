@@ -4,6 +4,22 @@
 
 ## Current Shape
 
+- 2026-05-04 fork_aspace + exec_aspace landed (plan-extension steps
+  fork-aspace and exec-aspace, closing VM_v1_2 §5.6 / §5.7 gaps the
+  audit caught after the plan's first closure). `AddressSpace::fork_aspace::<P>(parent)`
+  snapshots parent recipes, builds a fresh child AddressSpace, commits each
+  recipe into the child (Cap refcount bumps share PageContainers), and
+  tears down parent's pmap on MAP_PRIVATE entries so subsequent writes
+  refault and CoW. MAP_SHARED PTEs in parent stay intact; child's pmap
+  starts empty and rebuilds via refault. `AddressSpace::exec_aspace(old)`
+  tears down every materialized PTE across all current recipes via the
+  new `AddressSpace::teardown_all_pmap` helper; recipe tree management
+  remains caller-side because the new image's shape comes from the
+  Process-side exec image loader. Three new tests cover recipe-clone
+  shape, MAP_PRIVATE-only PTE demotion, and exec teardown of all PTEs.
+  Verification: `cargo fmt --check` clean, vm 76 ok (was 73, +3),
+  page_backed 49 ok, lib 137 ok, workspace clippy clean, `cargo xtask
+  lint arch/unused/docs` ok, `cargo xtask progress validate` 24 ok.
 - 2026-05-04 VM/PageBacked v1 completion plan closed. All 17 plan steps
   (16 original + 1 plan-extension prerequisite) complete; plan status
   flipped from active to complete. VM/PageBacked has moved from the

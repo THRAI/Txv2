@@ -86,6 +86,26 @@ impl AddressSpace {
         let guard = epoch::guard();
         self.recipes.snapshot(&guard)
     }
+
+    /// Drop every materialized PTE in the AddressSpace by tearing down each
+    /// recipe range through `VmPmap::teardown_range`. Used by exec to
+    /// reset the AS before the new image's mappings install. Returns the
+    /// total number of pages torn down across all entries.
+    ///
+    /// Recipe entries are not removed; the caller is expected to discard
+    /// the AddressSpace (Drop frees the recipe tree) or follow up with
+    /// recipe withdrawals. Self is borrowed `&` because the pmap mutation
+    /// takes its own internal lock.
+    pub fn teardown_all_pmap(&self) -> usize {
+        let entries = self.recipes_snapshot();
+        let mut torn = 0usize;
+        for entry in entries {
+            if let Ok(count) = self.pmap.teardown_range(entry.range) {
+                torn += count;
+            }
+        }
+        torn
+    }
 }
 
 #[cfg(test)]

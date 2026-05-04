@@ -466,6 +466,56 @@
       "notes": "PAGE_BACKED §7.1/§7.2. New page_backed::install_shared_page(pc, page, source_ppn) and page_backed::cow_replace_into_private(pc, page) live in a new sibling page_backed/reflink.rs module. install_shared_page acquires a fresh CachePin on source_ppn (incrementing cache_ref so the source frame stays live) and installs the entry via install_if_absent; rejects Device backings and pre-existing entries. cow_replace_into_private allocates a fresh zeroed frame, copies the cached frame's bytes via the substrate FrameCopier hook, and swaps the page-cache entry through install_if_match (which is now non-test so concurrent CoW can linearize). Existing CachePin on the old shared frame is dropped on success, decrementing its cache_ref. Six tests cover share-attaches, share-rejects-already-present, share-rejects-Device, CoW-replaces-with-matching-bytes-and-leaves-source-intact, CoW-on-missing-page errors, and CoW-rejects-Device. PageCacheIndex::install_if_match is now non-test (was cfg(test) only). Real reflink across two RNodes (filesystem-side) and the §12.4 reflink-vs-truncate race remain deferred to backends and follow-up slices."
     },
     {
+      "id": "fork-aspace",
+      "title": "Implement AddressSpace::fork_aspace per VM_v1_2 §5.6",
+      "status": "complete",
+      "depends_on": [
+        "persistent-epoch-recipes"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/structure/address_space.rs",
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Plan-extension closing the VM_v1_2 §5.6 gap missed in the original plan. AddressSpace::fork_aspace<P: PmapIf>(parent) -> Result<AddressSpace, VmMapError> snapshots parent's recipes (cheap clone via Cap refcount bumps for VmBacking::Page entries), constructs a fresh child AddressSpace via new_for_platform::<P>, commits each parent recipe into the child via RecipeIndex::commit_map(_, RequireFree), and tears down parent's pmap on every MAP_PRIVATE entry so subsequent writes refault and the existing materialize_page_recipe CoW path produces a private frame. MAP_SHARED PTEs in parent are left intact; child's pmap starts empty and rebuilds via refault. V1 caller invariant per §9.5: no other VM operation runs against parent during fork (Process subsystem serializes externally). Two tests cover recipe-clone-shape parity and MAP_PRIVATE-only PTE demotion."
+    },
+    {
+      "id": "exec-aspace",
+      "title": "Implement AddressSpace::exec_aspace teardown per VM_v1_2 §5.7",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/structure/address_space.rs",
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Plan-extension closing the VM_v1_2 §5.7 gap missed in the original plan. AddressSpace::teardown_all_pmap iterates every recipe range and calls VmPmap::teardown_range, returning the page count. AddressSpace::exec_aspace is the script-side wrapper. Recipe-tree management remains caller-side because the new image's recipe shape comes from the exec image loader (Process-side, not yet implemented); v1 callers either drop the AddressSpace entirely or follow with explicit recipe modifications. Caller invariant per §5.7 prologue: exec has reduced the thread group to one; no concurrent VM operations exist on old_aspace. One test covers all-PTEs-torn-down on an Anon mapping after baseline fault publication."
+    },
+    {
       "id": "ledger-and-status-final",
       "title": "Final ledger + STATUS update; verify completion bar",
       "status": "complete",

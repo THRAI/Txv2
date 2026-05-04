@@ -397,6 +397,165 @@ fn fault_script_async_yields_on_writer_conflict_and_completes_after_release() {
 }
 
 #[test]
+fn fork_aspace_clones_parent_recipes_into_fresh_child() {
+    setup_host_substrate();
+    let parent = AddressSpace::new();
+    let private_range = range(0x20000, 1);
+    let shared_range = range(0x22000, 1);
+
+    map_reserved(parent.reserve_map(
+        VmEntry::new(
+            private_range,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("private map");
+
+    map_reserved(parent.reserve_map(
+        VmEntry::new(
+            shared_range,
+            Prot::READ_WRITE,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("shared map");
+
+    let child =
+        crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
+
+    assert_eq!(
+        child
+            .lookup(crate::vm::UserVirtAddr(0x20000))
+            .map(|e| e.flags),
+        Some(VmEntryFlags::PRIVATE)
+    );
+    assert_eq!(
+        child
+            .lookup(crate::vm::UserVirtAddr(0x22000))
+            .map(|e| e.flags),
+        Some(VmEntryFlags::SHARED)
+    );
+}
+
+#[test]
+fn fork_aspace_demotes_parent_pmap_for_private_entries_only() {
+    setup_host_substrate();
+    let parent = AddressSpace::new();
+    let private_range = range(0x24000, 1);
+    let shared_range = range(0x26000, 1);
+
+    map_reserved(parent.reserve_map(
+        VmEntry::new(
+            private_range,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("private map");
+    map_reserved(parent.reserve_map(
+        VmEntry::new(
+            shared_range,
+            Prot::READ_WRITE,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("shared map");
+
+    for fault_addr in [0x24000_usize, 0x26000] {
+        let outcome = parent
+            .resolve_fault(VmFault::new(
+                crate::vm::UserVirtAddr(fault_addr),
+                AccessMode::Read,
+            ))
+            .expect("fault resolves");
+        let materialized = outcome.materialize_pagebacked().expect("materialize");
+        parent
+            .publish_fault_materialization(outcome, materialized)
+            .expect("publish");
+    }
+
+    assert!(parent
+        .pmap()
+        .lookup(crate::vm::UserVirtAddr(0x24000).containing_page())
+        .is_some());
+    assert!(parent
+        .pmap()
+        .lookup(crate::vm::UserVirtAddr(0x26000).containing_page())
+        .is_some());
+
+    let _child =
+        crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
+
+    assert!(
+        parent
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x24000).containing_page())
+            .is_none(),
+        "MAP_PRIVATE PTE should be torn down on fork"
+    );
+    assert!(
+        parent
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x26000).containing_page())
+            .is_some(),
+        "MAP_SHARED PTE should remain mapped"
+    );
+}
+
+#[test]
+fn exec_aspace_tears_down_all_resident_ptes() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x28000, 1),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+
+    let outcome = aspace
+        .resolve_fault(VmFault::new(
+            crate::vm::UserVirtAddr(0x28000),
+            AccessMode::Read,
+        ))
+        .expect("fault resolves");
+    let materialized = outcome.materialize_pagebacked().expect("materialize");
+    aspace
+        .publish_fault_materialization(outcome, materialized)
+        .expect("publish");
+    assert!(aspace
+        .pmap()
+        .lookup(crate::vm::UserVirtAddr(0x28000).containing_page())
+        .is_some());
+
+    let torn = crate::vm::AddressSpace::exec_aspace(&aspace);
+
+    assert_eq!(torn, 1);
+    assert!(aspace
+        .pmap()
+        .lookup(crate::vm::UserVirtAddr(0x28000).containing_page())
+        .is_none());
+}
+
+#[test]
 fn range_lock_release_fires_registered_channel_for_external_subscribers() {
     let aspace = AddressSpace::new();
     let range = range(0x4000, 1);
