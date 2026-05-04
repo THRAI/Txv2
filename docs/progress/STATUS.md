@@ -4,6 +4,20 @@
 
 ## Current Shape
 
+- 2026-05-04 VM doc-spelling polish + fork full-user serialization (plan-
+  extension step vm-doc-polish-and-full-user-range). `RangeLock::acquire`
+  and `acquire_pair` renamed to `acquire_step` / `acquire_pair_step` to
+  match VM_v1_2 §3.1; `AcquireResult` / `AcquirePairResult` retained as
+  the 2-variant Result shape because StepOutcome integration is a
+  separate concern. New `types::FULL_USER_V1_TOP = 1 << 38` constant and
+  `UserRange::full_user_v1()` method (sized for Sv39 and Sv48 user
+  halves). `AddressSpace::fork_aspace` now acquires ExclusiveWriter on
+  full_user_v1 before snapshotting parent recipes per VM_v1_2 §9.5;
+  WouldBlock surfaces as `VmMapError::WouldBlock`. One new test confirms
+  the fork lock fires. Verification: `cargo fmt --check` clean, vm 77 ok
+  (was 76, +1), page_backed 49 ok, lib 138 ok, workspace clippy clean,
+  `cargo xtask lint arch/unused/docs` ok, `cargo xtask progress validate`
+  24 ok.
 - 2026-05-04 fork_aspace + exec_aspace landed (plan-extension steps
   fork-aspace and exec-aspace, closing VM_v1_2 §5.6 / §5.7 gaps the
   audit caught after the plan's first closure). `AddressSpace::fork_aspace::<P>(parent)`

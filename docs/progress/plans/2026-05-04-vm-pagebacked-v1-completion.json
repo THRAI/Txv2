@@ -516,6 +516,36 @@
       "notes": "Plan-extension closing the VM_v1_2 §5.7 gap missed in the original plan. AddressSpace::teardown_all_pmap iterates every recipe range and calls VmPmap::teardown_range, returning the page count. AddressSpace::exec_aspace is the script-side wrapper. Recipe-tree management remains caller-side because the new image's recipe shape comes from the exec image loader (Process-side, not yet implemented); v1 callers either drop the AddressSpace entirely or follow with explicit recipe modifications. Caller invariant per §5.7 prologue: exec has reduced the thread group to one; no concurrent VM operations exist on old_aspace. One test covers all-PTEs-torn-down on an Anon mapping after baseline fault publication."
     },
     {
+      "id": "vm-doc-polish-and-full-user-range",
+      "title": "Polish: rename acquire to acquire_step + add UserRange::full_user_v1 + fork serializes via full_user lock",
+      "status": "complete",
+      "depends_on": [
+        "fork-aspace"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/structure/range_lock.rs",
+        "crates/tx-kernel/src/vm/structure/types.rs",
+        "crates/tx-kernel/src/vm/structure/mod.rs",
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/tests.rs",
+        "crates/tx-kernel/src/vm/tests/fault_materialization.rs",
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Audit follow-up. (1) RangeLock::acquire and acquire_pair renamed to acquire_step and acquire_pair_step to match VM_v1_2 §3.1 spelling. AcquireResult / AcquirePairResult retained as a 2-variant Result-shaped enum because the doc's StepOutcome<RangeGuard> is semantically equivalent and the rename to StepOutcome would ripple into the broader StepOutcome integration which is its own concern. All callers updated mechanically (vm/execution.rs, vm/tests.rs, vm/tests/fault_materialization.rs, vm/tests/script_async.rs). (2) New constant types::FULL_USER_V1_TOP = 1 << 38 and method UserRange::full_user_v1() returning the [0, FULL_USER_V1_TOP) range. Sized to fit inside Sv39 (256 GiB user) and Sv48 (128 TiB user) user-space halves. (3) AddressSpace::fork_aspace now acquires ExclusiveWriter on full_user_v1 before snapshotting parent recipes, satisfying VM_v1_2 §9.5 fork-serializes-parent. WouldBlock returns VmMapError::WouldBlock; callers retry. One new test fork_aspace_returns_would_block_when_parent_full_user_range_already_held confirms the lock fires."
+    },
+    {
       "id": "ledger-and-status-final",
       "title": "Final ledger + STATUS update; verify completion bar",
       "status": "complete",

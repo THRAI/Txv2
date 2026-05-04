@@ -24,7 +24,10 @@ use crate::vm::{
 impl AddressSpace {
     pub fn resolve_fault(&self, fault: VmFault) -> Result<VmFaultOutcome, VmFaultError> {
         let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
-        let _guard = match self.range_lock.acquire(page_range, LockMode::Materializer) {
+        let _guard = match self
+            .range_lock
+            .acquire_step(page_range, LockMode::Materializer)
+        {
             AcquireResult::Acquired(guard) => guard,
             AcquireResult::WouldBlock(_) => return Err(VmFaultError::WouldBlock),
         };
@@ -39,7 +42,7 @@ impl AddressSpace {
     ) -> Result<PmapPublishOutcome, VmFaultError> {
         let _guard = match self
             .range_lock
-            .acquire(outcome.page_range, LockMode::Materializer)
+            .acquire_step(outcome.page_range, LockMode::Materializer)
         {
             AcquireResult::Acquired(guard) => guard,
             AcquireResult::WouldBlock(_) => return Err(VmFaultError::WouldBlock),
@@ -72,14 +75,26 @@ impl AddressSpace {
     /// writer. MAP_SHARED entries leave the parent's PTEs intact; the
     /// child's pmap starts empty and rebuilds via refault.
     ///
-    /// V1 caller invariant (per VM_v1_2 §9.5): no other VM operation runs
-    /// against `parent` for the duration of the call. The VM-level fork
-    /// does not yet acquire an ExclusiveWriter on the full user range
-    /// because `UserRange::full_user_v1` is not yet defined; the Process
-    /// subsystem is expected to serialize parent VM activity around fork.
-    /// The fork-vs-VM race is a known v1 gap recorded in the v1 plan
-    /// closure decision.
+    /// Per VM_v1_2 §9.5, fork acquires an `ExclusiveWriter` reservation on
+    /// the full user range (`UserRange::full_user_v1()`) so no concurrent
+    /// VM operation runs against `parent` for the duration of the call.
+    /// V1 fork is intentionally serialized end to end with respect to
+    /// every parent VM operation; range-by-range pmap walks are a
+    /// potential v2 optimization.
+    ///
+    /// Returns `VmMapError::WouldBlock` if a concurrent operation already
+    /// holds an overlapping reservation. Callers may retry; no async
+    /// retry is built in at the VM layer because the Process subsystem
+    /// orchestrates fork above this function.
     pub fn fork_aspace<P: PmapIf>(parent: &AddressSpace) -> Result<AddressSpace, VmMapError> {
+        let _full_guard = match parent
+            .range_lock
+            .acquire_step(UserRange::full_user_v1(), LockMode::ExclusiveWriter)
+        {
+            AcquireResult::Acquired(guard) => guard,
+            AcquireResult::WouldBlock(_) => return Err(VmMapError::WouldBlock),
+        };
+
         let parent_recipes = parent.recipes_snapshot();
         let child = AddressSpace::new_for_platform::<P>()?;
 
@@ -144,7 +159,10 @@ impl AddressSpace {
         let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
         loop {
             let outcome = {
-                let _guard = match self.range_lock.acquire(page_range, LockMode::Materializer) {
+                let _guard = match self
+                    .range_lock
+                    .acquire_step(page_range, LockMode::Materializer)
+                {
                     AcquireResult::Acquired(guard) => guard,
                     AcquireResult::WouldBlock(blocked) => {
                         let token = blocked.wait_token();
@@ -162,7 +180,7 @@ impl AddressSpace {
 
             let _guard = match self
                 .range_lock
-                .acquire(outcome.page_range, LockMode::Materializer)
+                .acquire_step(outcome.page_range, LockMode::Materializer)
             {
                 AcquireResult::Acquired(guard) => guard,
                 AcquireResult::WouldBlock(blocked) => {
@@ -254,7 +272,10 @@ impl AddressSpace {
     /// VM_v1_2 §3.6 by dropping the blocked guard before each `.await`.
     pub async fn unmap_async(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
         loop {
-            let _guard = match self.range_lock.acquire(range, LockMode::ExclusiveWriter) {
+            let _guard = match self
+                .range_lock
+                .acquire_step(range, LockMode::ExclusiveWriter)
+            {
                 AcquireResult::Acquired(guard) => guard,
                 AcquireResult::WouldBlock(blocked) => {
                     let token = blocked.wait_token();
@@ -282,7 +303,10 @@ impl AddressSpace {
         prot: Prot,
     ) -> Result<VmMapCommit, VmMapError> {
         loop {
-            let _guard = match self.range_lock.acquire(range, LockMode::ExclusiveWriter) {
+            let _guard = match self
+                .range_lock
+                .acquire_step(range, LockMode::ExclusiveWriter)
+            {
                 AcquireResult::Acquired(guard) => guard,
                 AcquireResult::WouldBlock(blocked) => {
                     let token = blocked.wait_token();
@@ -307,7 +331,7 @@ impl AddressSpace {
     pub async fn remap_async(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
         require_disjoint_remap(request.old_range, request.new_range)?;
         loop {
-            let _guard_pair = match self.range_lock.acquire_pair(
+            let _guard_pair = match self.range_lock.acquire_pair_step(
                 (request.old_range, LockMode::ExclusiveWriter),
                 (request.new_range, LockMode::ExclusiveWriter),
             ) {
@@ -388,7 +412,7 @@ impl AddressSpace {
     pub fn remap_script(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
         require_disjoint_remap(request.old_range, request.new_range)?;
 
-        let _guard_pair = match self.range_lock.acquire_pair(
+        let _guard_pair = match self.range_lock.acquire_pair_step(
             (request.old_range, LockMode::ExclusiveWriter),
             (request.new_range, LockMode::ExclusiveWriter),
         ) {
@@ -411,7 +435,7 @@ impl AddressSpace {
     pub fn reserve_map(&self, entry: VmEntry, placement: MapPlacement) -> MapReserveResult<'_> {
         let guard = match self
             .range_lock
-            .acquire(entry.range, LockMode::ExclusiveWriter)
+            .acquire_step(entry.range, LockMode::ExclusiveWriter)
         {
             AcquireResult::Acquired(guard) => guard,
             AcquireResult::WouldBlock(blocked) => return MapReserveResult::WouldBlock(blocked),
@@ -448,7 +472,10 @@ impl AddressSpace {
     }
 
     fn acquire_writer(&self, range: UserRange) -> Result<RangeGuard<'_>, VmMapError> {
-        match self.range_lock.acquire(range, LockMode::ExclusiveWriter) {
+        match self
+            .range_lock
+            .acquire_step(range, LockMode::ExclusiveWriter)
+        {
             AcquireResult::Acquired(guard) => Ok(guard),
             AcquireResult::WouldBlock(_) => Err(VmMapError::WouldBlock),
         }

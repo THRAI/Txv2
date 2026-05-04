@@ -280,16 +280,16 @@ fn vm_range_lock_conflict_matrix_matches_modes() {
     let overlap = range(0x2000, 1);
     let disjoint = range(0x8000, 1);
 
-    let writer = acquired(lock.acquire(first, LockMode::ExclusiveWriter));
-    would_block(lock.acquire(overlap, LockMode::ExclusiveWriter));
-    would_block(lock.acquire(overlap, LockMode::Materializer));
-    let disjoint_writer = acquired(lock.acquire(disjoint, LockMode::ExclusiveWriter));
+    let writer = acquired(lock.acquire_step(first, LockMode::ExclusiveWriter));
+    would_block(lock.acquire_step(overlap, LockMode::ExclusiveWriter));
+    would_block(lock.acquire_step(overlap, LockMode::Materializer));
+    let disjoint_writer = acquired(lock.acquire_step(disjoint, LockMode::ExclusiveWriter));
     drop(disjoint_writer);
     drop(writer);
 
-    let materializer_a = acquired(lock.acquire(first, LockMode::Materializer));
-    let materializer_b = acquired(lock.acquire(overlap, LockMode::Materializer));
-    would_block(lock.acquire(overlap, LockMode::ExclusiveWriter));
+    let materializer_a = acquired(lock.acquire_step(first, LockMode::Materializer));
+    let materializer_b = acquired(lock.acquire_step(overlap, LockMode::Materializer));
+    would_block(lock.acquire_step(overlap, LockMode::ExclusiveWriter));
     drop(materializer_b);
     drop(materializer_a);
 }
@@ -299,19 +299,19 @@ fn vm_range_lock_pending_writer_blocks_new_materializers() {
     let lock = RangeLock::new();
     let first = range(0x1000, 1);
 
-    let materializer = acquired(lock.acquire(first, LockMode::Materializer));
-    let pending = would_block(lock.acquire(first, LockMode::ExclusiveWriter))
+    let materializer = acquired(lock.acquire_step(first, LockMode::Materializer));
+    let pending = would_block(lock.acquire_step(first, LockMode::ExclusiveWriter))
         .pending_writer()
         .expect("blocked writer should declare pending range");
 
-    would_block(lock.acquire(first, LockMode::Materializer));
+    would_block(lock.acquire_step(first, LockMode::Materializer));
     drop(materializer);
 
     let writer = acquired(pending.try_acquire());
-    would_block(lock.acquire(first, LockMode::Materializer));
+    would_block(lock.acquire_step(first, LockMode::Materializer));
     drop(writer);
 
-    let materializer_after_drop = acquired(lock.acquire(first, LockMode::Materializer));
+    let materializer_after_drop = acquired(lock.acquire_step(first, LockMode::Materializer));
     drop(materializer_after_drop);
 }
 
@@ -320,11 +320,11 @@ fn vm_range_lock_overlapping_pending_writers_are_fifo() {
     let lock = RangeLock::new();
     let first = range(0x1000, 1);
 
-    let materializer = acquired(lock.acquire(first, LockMode::Materializer));
-    let pending_a = would_block(lock.acquire(first, LockMode::ExclusiveWriter))
+    let materializer = acquired(lock.acquire_step(first, LockMode::Materializer));
+    let pending_a = would_block(lock.acquire_step(first, LockMode::ExclusiveWriter))
         .pending_writer()
         .expect("first writer queues");
-    let pending_b = would_block(lock.acquire(first, LockMode::ExclusiveWriter))
+    let pending_b = would_block(lock.acquire_step(first, LockMode::ExclusiveWriter))
         .pending_writer()
         .expect("second writer queues");
     drop(materializer);
@@ -348,12 +348,12 @@ fn vm_range_guard_drop_releases_reservation() {
     let first = range(0x1000, 1);
 
     {
-        let writer = acquired(lock.acquire(first, LockMode::ExclusiveWriter));
-        would_block(lock.acquire(first, LockMode::Materializer));
+        let writer = acquired(lock.acquire_step(first, LockMode::ExclusiveWriter));
+        would_block(lock.acquire_step(first, LockMode::Materializer));
         drop(writer);
     }
 
-    let materializer = acquired(lock.acquire(first, LockMode::Materializer));
+    let materializer = acquired(lock.acquire_step(first, LockMode::Materializer));
     drop(materializer);
 }
 
@@ -363,15 +363,15 @@ fn vm_range_lock_acquires_two_ranges_atomically() {
     let a = range(0x1000, 1);
     let b = range(0x4000, 1);
 
-    let pair = pair_acquired(lock.acquire_pair(
+    let pair = pair_acquired(lock.acquire_pair_step(
         (a, LockMode::ExclusiveWriter),
         (b, LockMode::ExclusiveWriter),
     ));
-    would_block(lock.acquire(a, LockMode::Materializer));
-    would_block(lock.acquire(b, LockMode::Materializer));
+    would_block(lock.acquire_step(a, LockMode::Materializer));
+    would_block(lock.acquire_step(b, LockMode::Materializer));
     drop(pair);
 
-    let after = acquired(lock.acquire(a, LockMode::Materializer));
+    let after = acquired(lock.acquire_step(a, LockMode::Materializer));
     drop(after);
 }
 
@@ -382,16 +382,16 @@ fn vm_range_lock_tree_removal_clears_only_removed_overlap() {
     let middle = range(0x5000, 1);
     let high = range(0x9000, 1);
 
-    let low_writer = acquired(lock.acquire(low, LockMode::ExclusiveWriter));
-    let middle_writer = acquired(lock.acquire(middle, LockMode::ExclusiveWriter));
-    let high_writer = acquired(lock.acquire(high, LockMode::ExclusiveWriter));
+    let low_writer = acquired(lock.acquire_step(low, LockMode::ExclusiveWriter));
+    let middle_writer = acquired(lock.acquire_step(middle, LockMode::ExclusiveWriter));
+    let high_writer = acquired(lock.acquire_step(high, LockMode::ExclusiveWriter));
 
-    would_block(lock.acquire(middle, LockMode::Materializer));
+    would_block(lock.acquire_step(middle, LockMode::Materializer));
     drop(middle_writer);
 
-    let middle_materializer = acquired(lock.acquire(middle, LockMode::Materializer));
-    would_block(lock.acquire(low, LockMode::Materializer));
-    would_block(lock.acquire(high, LockMode::Materializer));
+    let middle_materializer = acquired(lock.acquire_step(middle, LockMode::Materializer));
+    would_block(lock.acquire_step(low, LockMode::Materializer));
+    would_block(lock.acquire_step(high, LockMode::Materializer));
 
     drop(middle_materializer);
     drop(low_writer);
@@ -405,13 +405,13 @@ fn vm_range_lock_tree_keeps_disjoint_reservations_independent() {
     let b = range(0x8000, 1);
     let c = range(0x10000, 1);
 
-    let writer_a = acquired(lock.acquire(a, LockMode::ExclusiveWriter));
-    let writer_b = acquired(lock.acquire(b, LockMode::ExclusiveWriter));
-    let materializer_c = acquired(lock.acquire(c, LockMode::Materializer));
+    let writer_a = acquired(lock.acquire_step(a, LockMode::ExclusiveWriter));
+    let writer_b = acquired(lock.acquire_step(b, LockMode::ExclusiveWriter));
+    let materializer_c = acquired(lock.acquire_step(c, LockMode::Materializer));
 
-    would_block(lock.acquire(a, LockMode::Materializer));
-    would_block(lock.acquire(b, LockMode::Materializer));
-    let second_materializer_c = acquired(lock.acquire(c, LockMode::Materializer));
+    would_block(lock.acquire_step(a, LockMode::Materializer));
+    would_block(lock.acquire_step(b, LockMode::Materializer));
+    let second_materializer_c = acquired(lock.acquire_step(c, LockMode::Materializer));
 
     drop(second_materializer_c);
     drop(materializer_c);
@@ -425,12 +425,12 @@ fn vm_range_lock_tree_pending_fifo_is_range_scoped() {
     let first = range(0x2000, 1);
     let disjoint = range(0xa000, 1);
 
-    let materializer = acquired(lock.acquire(first, LockMode::Materializer));
-    let pending_a = would_block(lock.acquire(first, LockMode::ExclusiveWriter))
+    let materializer = acquired(lock.acquire_step(first, LockMode::Materializer));
+    let pending_a = would_block(lock.acquire_step(first, LockMode::ExclusiveWriter))
         .pending_writer()
         .expect("first overlapping writer queues");
-    let disjoint_writer = acquired(lock.acquire(disjoint, LockMode::ExclusiveWriter));
-    let pending_b = would_block(lock.acquire(first, LockMode::ExclusiveWriter))
+    let disjoint_writer = acquired(lock.acquire_step(disjoint, LockMode::ExclusiveWriter));
+    let pending_b = would_block(lock.acquire_step(first, LockMode::ExclusiveWriter))
         .pending_writer()
         .expect("second overlapping writer queues");
 
@@ -458,10 +458,10 @@ fn vm_range_lock_tree_active_writer_blocks_materializer_overlap_only() {
     let overlap = range(0x8000, 1);
     let disjoint = range(0xb000, 1);
 
-    let writer = acquired(lock.acquire(writer_range, LockMode::ExclusiveWriter));
+    let writer = acquired(lock.acquire_step(writer_range, LockMode::ExclusiveWriter));
 
-    would_block(lock.acquire(overlap, LockMode::Materializer));
-    let disjoint_materializer = acquired(lock.acquire(disjoint, LockMode::Materializer));
+    would_block(lock.acquire_step(overlap, LockMode::Materializer));
+    let disjoint_materializer = acquired(lock.acquire_step(disjoint, LockMode::Materializer));
 
     drop(disjoint_materializer);
     drop(writer);
