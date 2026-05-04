@@ -13,7 +13,7 @@ use crate::execution::{Errno, Guard, StepOutcome};
 use crate::mount::MountPayload;
 use crate::sync::SpinMutex;
 use crate::vfs::{FsObjectId, OpenFile};
-use tx_hal::Ppn;
+use tx_hal::{KernelPtr, Ppn, UserAccessIf, UserPtr};
 use tx_substrate::{
     page_allocator::{
         self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,
@@ -22,7 +22,9 @@ use tx_substrate::{
 };
 
 mod lifecycle;
+mod user_buffer;
 pub use lifecycle::{step_fsync, step_truncate};
+pub use user_buffer::{step_read_to_user, step_write_from_user};
 
 #[cfg(test)]
 use crate::test_support::EPOCH_TEST_LOCK;
@@ -1448,3 +1450,5 @@ mod tests {
 mod lifecycle_tests;
 #[cfg(test)]
 mod size_tests;
+#[cfg(test)]
+mod user_buffer_tests;

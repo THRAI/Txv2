@@ -73,6 +73,8 @@ pub enum AllocError {
     ZeroScrubUnavailable,
     /// Frame content copy was requested before a direct-map copy hook existed.
     FrameCopyUnavailable,
+    /// Frame kernel address lookup was requested before a direct-map hook existed.
+    FrameKernelAddrUnavailable,
     /// A caller tried to claim a reserved frame through the normal path.
     ReservedFrame,
     /// A packed `FrameMeta` counter would overflow.
@@ -109,6 +111,21 @@ pub type FrameZeroer = unsafe fn(Ppn);
 /// It must copy exactly one page from `source` to `dest` and must tolerate no
 /// allocator-owned Rust aliases.
 pub type FrameCopier = unsafe fn(source: Ppn, dest: Ppn);
+
+/// Direct-map kernel-address lookup hook used by PageBacked user-buffer copy.
+///
+/// Returns the kernel virtual address of the start of the frame addressed by
+/// `ppn`. Callers who need a pointer at a non-zero offset within the frame add
+/// the offset themselves.
+///
+/// # Safety
+///
+/// The function must be installed only after the direct map covers the frame
+/// range represented by this allocator. The returned pointer is read/write for
+/// `PAGE_SIZE` bytes for as long as the frame remains live; callers are
+/// responsible for respecting cache and aliasing rules and must not retain the
+/// pointer past the frame's lifetime.
+pub type FrameKernelAddr = unsafe fn(ppn: Ppn) -> *mut u8;
 
 /// Non-dynamic page allocator backend interface.
 ///
@@ -202,6 +219,8 @@ static INSTALLED_BITMAP_ALLOCATOR: AtomicPtr<BitmapPageAllocator<'static>> =
     AtomicPtr::new(ptr::null_mut());
 const NO_FRAME_COPIER: usize = 0;
 static FRAME_COPIER: AtomicUsize = AtomicUsize::new(NO_FRAME_COPIER);
+const NO_FRAME_KERNEL_ADDR: usize = 0;
+static FRAME_KERNEL_ADDR: AtomicUsize = AtomicUsize::new(NO_FRAME_KERNEL_ADDR);
 const NO_ZERO_FRAME: usize = usize::MAX;
 static ZERO_FRAME_PPN: AtomicUsize = AtomicUsize::new(NO_ZERO_FRAME);
 
@@ -229,6 +248,19 @@ pub fn install_frame_copier(copier: FrameCopier) -> Result<(), AllocError> {
         .compare_exchange(
             NO_FRAME_COPIER,
             copier as usize,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|_| AllocError::AlreadyInstalled)
+}
+
+/// Install the direct-map kernel-address lookup used by user-buffer copy paths.
+pub fn install_frame_kernel_addr(lookup: FrameKernelAddr) -> Result<(), AllocError> {
+    FRAME_KERNEL_ADDR
+        .compare_exchange(
+            NO_FRAME_KERNEL_ADDR,
+            lookup as usize,
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -287,6 +319,20 @@ pub fn copy_frame_contents(source: Ppn, dest: Ppn) -> Result<(), AllocError> {
     let copier: FrameCopier = unsafe { core::mem::transmute(copier) };
     unsafe { copier(source, dest) };
     Ok(())
+}
+
+/// Look up the direct-map kernel virtual address of `ppn`.
+///
+/// Returns a pointer to the start of the frame. Callers add their own offset.
+/// The pointer is valid for the lifetime of the frame; the caller is
+/// responsible for not retaining it past frame teardown.
+pub fn frame_kernel_addr(ppn: Ppn) -> Result<*mut u8, AllocError> {
+    let lookup = FRAME_KERNEL_ADDR.load(Ordering::Acquire);
+    if lookup == NO_FRAME_KERNEL_ADDR {
+        return Err(AllocError::FrameKernelAddrUnavailable);
+    }
+    let lookup: FrameKernelAddr = unsafe { core::mem::transmute(lookup) };
+    Ok(unsafe { lookup(ppn) })
 }
 
 /// Reserve a contiguous frame run from the installed backend.
@@ -395,7 +441,8 @@ pub mod testing {
     use tx_hal::Ppn;
 
     use super::{
-        install_bitmap_allocator, install_frame_copier, AllocError, BitmapPageAllocator, FrameMeta,
+        install_bitmap_allocator, install_frame_copier, install_frame_kernel_addr, AllocError,
+        BitmapPageAllocator, FrameMeta,
     };
 
     const TEST_FRAME_COUNT: usize = 1024;
@@ -429,6 +476,10 @@ pub mod testing {
         }
     }
 
+    unsafe fn kernel_addr_for_test(ppn: Ppn) -> *mut u8 {
+        unsafe { test_frame_ptr(ppn, 0) }
+    }
+
     pub fn install_test_allocator_once() -> Result<(), AllocError> {
         if INITIALIZED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -439,6 +490,7 @@ pub mod testing {
             }
             install_bitmap_allocator(&TEST_ALLOCATOR)?;
             install_frame_copier(copy_for_test)?;
+            install_frame_kernel_addr(kernel_addr_for_test)?;
             return Ok(());
         }
 

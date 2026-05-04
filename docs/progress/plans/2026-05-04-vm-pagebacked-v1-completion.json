@@ -88,19 +88,27 @@
     {
       "id": "user-buffer-byte-copy",
       "title": "Wire useraccessif into step_read/step_write byte transfer",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [],
       "paths": [
         "crates/tx-kernel/src/page_backed.rs",
-        "crates/tx-hal/src",
-        "boards/tx-hal-riscv64-qemu-virt/src/user_access.rs"
+        "crates/tx-kernel/src/page_backed/user_buffer.rs",
+        "crates/tx-kernel/src/page_backed/user_buffer_tests.rs",
+        "crates/tx-kernel/src/execution.rs",
+        "crates/tx-substrate/src/page_allocator/mod.rs",
+        "crates/tx-substrate/src/boot_memory.rs"
       ],
       "verification": [
         "cargo test -p tx-kernel page_backed -- --test-threads=1",
         "cargo test -p tx-kernel vm -- --test-threads=1",
-        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings"
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo fmt --check"
       ],
-      "notes": "PAGE_BACKED §5.1/5.2 byte-accurate transfer. Use newly-merged useraccessif HAL trait. Add host-test backing so step_read/step_write tests can assert byte equality without QEMU. Keep copyless fast path for in-kernel ranges; user-buffer path goes through useraccessif."
+      "notes": "PAGE_BACKED §5.1/5.2 byte-accurate transfer. Substrate gained a FrameKernelAddr hook (production points at the direct-map base; tests at the test direct map). Errno gained EFAULT. PageBacked exposes step_read_to_user<H: UserAccessIf> and step_write_from_user<H: UserAccessIf> in a new sibling module page_backed/user_buffer.rs (kept under the 1500-line guard) plus user_buffer_tests.rs covering single-page round trip, cross-page round trip, EFAULT propagation on read, and EFAULT propagation on write. Copyless step_read/step_write retained as the in-kernel staging surface for splice/sendfile/copy_file_range; user-buffer path routes through UserAccessIf::copy_to_user/copy_from_user."
     },
     {
       "id": "mock-fs-pagebacking",

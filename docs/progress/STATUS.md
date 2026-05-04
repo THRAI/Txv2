@@ -4,6 +4,20 @@
 
 ## Current Shape
 
+- 2026-05-04 PageBacked user-buffer byte copy slice landed (plan step
+  user-buffer-byte-copy). Substrate gained a `FrameKernelAddr` hook installed
+  at boot (direct-map) and in host tests (test direct map). `Errno` gained
+  `EFAULT`. PageBacked now exposes `step_read_to_user<H: UserAccessIf>` and
+  `step_write_from_user<H: UserAccessIf>` in a new sibling module
+  `page_backed/user_buffer.rs`; copyless `step_read`/`step_write` remain as
+  the in-kernel staging surface. Four host tests cover single-page round trip,
+  cross-page round trip, and EFAULT propagation in both directions.
+  Verification: `cargo fmt --check`, `cargo test -p tx-kernel page_backed --
+  --test-threads=1` (29 ok), `cargo test -p tx-kernel vm -- --test-threads=1`
+  (49 ok), `cargo test -p tx-kernel --lib -- --test-threads=1` (84 ok),
+  `cargo clippy --workspace --all-targets ...` clean, `cargo xtask lint arch`
+  ok, `cargo xtask lint unused` ok, `cargo xtask lint docs` ok,
+  `cargo xtask progress validate` 24 ok.
 - 2026-05-04 VM/PageBacked v1 completion plan activated. Active roadmap is
   `docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json` (17 steps),
   bridging VM/PageBacked from ~45% structure / ~30% behavior toward ~85% on
