@@ -1,12 +1,13 @@
 //! VFS live-node shells and filesystem namespace backend trait.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::fmt;
 
 use crate::device::CharDeviceBinding;
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::mount::{MountIdentity, MountNamespace, MountPayload};
-use crate::page_backed::PageContainer;
+use crate::page_backed::{FsPageBacking, PageContainer};
 use crate::tty::{self, structure::TtyIdentity};
 use tx_substrate::zone::{self, Cap, Weak, Zone, ZoneAllocated, ZoneError};
 
@@ -346,6 +347,16 @@ pub trait FsOps: Send + Sync + 'static {
     ) -> StepOutcome<Option<(DirEntry, DirCursor)>>;
 
     fn destroy_inode(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<()>;
+}
+
+// Filesystem driver output produced at mount time and consumed by Mount to
+// build the mount payload. Per `TX_EXT4_PLAN_v1_2.md` §pub-types and
+// `bringup_fs_specs_v_1` §root-output.
+pub struct MountOutput {
+    pub fs_ops: Arc<dyn FsOps>,
+    pub fs_page_backing: Arc<dyn FsPageBacking>,
+    pub root_fs_object_id: FsObjectId,
+    pub root_inode_meta: InodeMeta,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
