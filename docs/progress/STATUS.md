@@ -4,6 +4,30 @@
 
 ## Current Shape
 
+- 2026-05-04 Cross-variant copy_file_range slice landed (plan steps
+  cross-variant-scripts and mock-fs-pagebacking). New
+  `page_backed::step_copy_file_range(in_pc, in_offset, out_pc, out_offset,
+  len, guard)` lives in a new sibling module
+  `page_backed/cross_variant.rs`. Page-by-page copy via `materialize_page`
+  on each side and the substrate `FrameKernelAddr` hook for direct-map
+  byte movement. Output Device rejects `EINVAL`; out offset+len beyond
+  capacity rejects `EINVAL`; in offset at or past source EOF returns
+  `Done(0)`; copy clamps to `in_pc.size_bytes() - in_offset`;
+  `pc.size_bytes` is bumped on dst only after byte progress; dirty marking
+  handled by `materialize_page(Write)` for Anon/File output. Six tests in
+  `cross_variant_tests.rs` cover within-page copy, page-boundary-crossing
+  at different alignments, source-EOF clamping, source-at-EOF returns
+  `Done(0)`, Device-destination `EINVAL`, and dst-capacity-overflow
+  `EINVAL`. Splice (§9.1) and sendfile (§9.2) are explicitly deferred (no
+  Pipe StructBacked yet); reflink path is deferred to the reflink slice.
+  `mock-fs-pagebacking` plan step is closed-as-redundant: existing
+  RecordingFs / BlockingFs / LifecycleFs cover File-variant
+  `materialize_page` end-to-end. Verification: `cargo fmt --check` clean,
+  `cargo test -p tx-kernel page_backed -- --test-threads=1` (43 ok),
+  `cargo test -p tx-kernel vm -- --test-threads=1` (60 ok), `cargo test -p
+  tx-kernel --lib -- --test-threads=1` (109 ok), workspace clippy clean,
+  `cargo xtask lint arch/unused/docs` ok, `cargo xtask progress validate`
+  24 ok.
 - 2026-05-04 Partial-page byte fidelity slice landed (plan step
   partial-page-byte-fidelity). `step_truncate` now zeroes the cached
   partial-EOF page tail (bytes `[new_size mod PAGE, PAGE_END)`) after
