@@ -308,18 +308,28 @@
     {
       "id": "brk-script",
       "title": "brk_script over the existing AddressSpace mapping primitives",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
-        "mmap-script-async"
+        "mmap-script-async",
+        "munmap-mprotect-mremap-scripts"
       ],
       "paths": [
         "crates/tx-kernel/src/vm/execution.rs",
-        "crates/tx-kernel/src/vm/tests/execution_scripts.rs"
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
       ],
       "verification": [
-        "cargo test -p tx-kernel vm -- --test-threads=1"
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
       ],
-      "notes": "VM §5.8. Models the brk region as an Anon mapping that the script grows/shrinks; no Process dependency for the in-VM portion."
+      "notes": "VM_v1_2 §5.8. AddressSpace::brk_script_async(brk_base, current_brk, requested_brk) models the program break as an Anon PrivateAnon mapping covering [brk_base, current_brk). On grow, calls map_script_async on [current_brk, requested_brk) with READ_WRITE / PRIVATE / PrivateAnon. On shrink, calls unmap_async on [requested_brk, current_brk). No-op when requested == current; rejects requested < brk_base with InvalidRange. Process-level tracking of the brk value (which hart holds it, exec-time base, fork inheritance) lives in Process and is out of scope for VM. Four tests cover grow, shrink, no-op, and below-base rejection."
     },
     {
       "id": "madvise-msync-mincore",

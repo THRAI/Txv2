@@ -247,6 +247,84 @@ fn remap_async_yields_on_pair_conflict_and_completes_after_release() {
 }
 
 #[test]
+fn brk_script_async_grows_anon_mapping_when_requested_above_current() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let brk_base = crate::vm::UserVirtAddr(0xb000);
+    let current_brk = crate::vm::UserVirtAddr(0xb000);
+    let requested_brk = crate::vm::UserVirtAddr(0xd000);
+
+    let mut future = Box::pin(aspace.brk_script_async(brk_base, current_brk, requested_brk));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(new_brk)) => assert_eq!(new_brk, requested_brk),
+        other => panic!("brk grow expected Ready(Ok), got {other:?}"),
+    }
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(0xb000)).is_some());
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(0xc000)).is_some());
+}
+
+#[test]
+fn brk_script_async_shrinks_anon_mapping_when_requested_below_current() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let brk_base = crate::vm::UserVirtAddr(0xe000);
+    let initial_top = crate::vm::UserVirtAddr(0x10000);
+
+    let mut grow_future = Box::pin(aspace.brk_script_async(brk_base, brk_base, initial_top));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    match grow_future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(_)) => {}
+        other => panic!("baseline grow expected Ready(Ok), got {other:?}"),
+    }
+
+    let shrunk = crate::vm::UserVirtAddr(0xf000);
+    let mut shrink_future = Box::pin(aspace.brk_script_async(brk_base, initial_top, shrunk));
+    match shrink_future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(new_brk)) => assert_eq!(new_brk, shrunk),
+        other => panic!("brk shrink expected Ready(Ok), got {other:?}"),
+    }
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(0xe000)).is_some());
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(0xf000)).is_none());
+}
+
+#[test]
+fn brk_script_async_returns_current_when_requested_equal() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let brk_base = crate::vm::UserVirtAddr(0x14000);
+    let current = crate::vm::UserVirtAddr(0x14000);
+
+    let mut future = Box::pin(aspace.brk_script_async(brk_base, current, current));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(brk)) => assert_eq!(brk, current),
+        other => panic!("brk no-op expected Ready(Ok), got {other:?}"),
+    }
+}
+
+#[test]
+fn brk_script_async_rejects_below_brk_base_with_invalid_range() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let brk_base = crate::vm::UserVirtAddr(0x16000);
+    let current = crate::vm::UserVirtAddr(0x18000);
+    let below_base = crate::vm::UserVirtAddr(0x15000);
+
+    let mut future = Box::pin(aspace.brk_script_async(brk_base, current, below_base));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Err(crate::vm::VmMapError::InvalidRange)) => {}
+        other => panic!("expected InvalidRange, got {other:?}"),
+    }
+}
+
+#[test]
 fn range_lock_release_fires_registered_channel_for_external_subscribers() {
     let aspace = AddressSpace::new();
     let range = range(0x4000, 1);
