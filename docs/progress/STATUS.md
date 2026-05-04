@@ -329,6 +329,20 @@
   because no harness-level pass-through exists. Blockers: async fault-script
   retry/yield behavior, Process/ThreadRuntime/trap authority wiring, concrete
   VFS/backend implementations, final user-buffer copy plumbing.
+- 2026-05-04 TTY progress memory now has a durable status note at
+  `docs/progress/research/2026-05-04-tty-implementation-status.md`, and
+  `.agents/skills/tx-tty-subsystem/SKILL.md` now points future work at the
+  canonical TTY docs, current code map, and known staging seams. This records
+  that the tty-only implementation slice is present under
+  `crates/tx-kernel/src/tty/`, while final Process/Signal/VFS convergence still
+  needs follow-up replacements for staged session/pgrp ids, signal delivery
+  wiring, termios publication shape, and full controlling-tty lifecycle hooks.
+  Verification for the code slice referenced by the note had already covered
+  `cargo test -p tx-kernel tty -- --test-threads=1`, `cargo test -p tx-kernel
+  --lib -- --test-threads=1`, `cargo fmt --check`, `git diff --check`, and the
+  user's RV64 boot smoke. Next step: when Process, Signal, or VFS work reaches
+  tty integration, start from the new skill and progress note before widening
+  TTY changes; no blocker.
 - 2026-05-03 PageBacked dynamic `PC.size` slice added a visible byte-size
   field to `PageContainer` while preserving the existing fixed `page_count`
   capacity as the upper bound. `PageContainer::size_bytes()` is now the compact

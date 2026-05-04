@@ -144,6 +144,15 @@ skills:
       - docs/design/03_memory-vm/VM_v1_2.md
     purpose: Guide VFS, Mount, PageBacked filesystem interfaces, bdev-fs, devfs, and filesystem backend fanout.
 
+  tx-tty-subsystem:
+    sources:
+      - docs/design/06_devices/TTY.md
+      - docs/design/06_devices/DEVICE.md
+      - docs/design/03_memory-vm/PAGE_BACKED_v1.md
+      - docs/ljs/TTY_DESIGN_PLAN.md
+      - docs/progress/research/2026-05-04-tty-implementation-status.md
+    purpose: Guide TTY implementation and integration work, including the canonical design docs, current tty code layout, and staged follow-up seams.
+
   tx-process-threadruntime:
     sources:
       - docs/design/04_process-signals/PROCESS_v1.md
