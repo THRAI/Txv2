@@ -45,7 +45,7 @@ fn vm_fault_resolution_waits_behind_overlapping_writer() {
     let _writer = acquired(
         aspace
             .range_lock()
-            .acquire_step(range(0x1000, 1), LockMode::ExclusiveWriter),
+            .acquire_step_rich(range(0x1000, 1), LockMode::ExclusiveWriter),
     );
 
     assert_eq!(

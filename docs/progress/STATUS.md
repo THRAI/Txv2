@@ -4,6 +4,27 @@
 
 ## Current Shape
 
+- 2026-05-04 VM compliance fixup landed on branch `vm-compliance-fixup`.
+  Closes the drift items identified in the post-merge VM audit against
+  `VM_v1_2.md`: (1) renamed VM scripts to spec names — `mmap_script` /
+  `munmap_script` / `mprotect_script` / `mremap_script` / `fault_script`
+  / `brk_script`; sync helpers became `try_mmap` / `try_munmap` /
+  `try_mprotect` / `try_mremap`. (2) Doc reconciled to match impl —
+  `VAddrRange` → `UserRange`, `UserRange::full_user_v1` / `new_aligned`
+  constructor names; mincore signature clarified as per-page
+  `Vec<bool>` (matches POSIX); §2 recipes carry an implementation note
+  for the COW-`BTreeMap` shape. (3) `MADV_DONTNEED` and `MADV_FREE`
+  implemented per §5.9 (range-scoped pmap teardown + shootdown, recipes
+  preserved); was a no-op. (4) `RangeLock::acquire_step` /
+  `acquire_pair_step` now return canonical `StepOutcome<RangeGuard>` as
+  the spec specifies; the rich `AcquireResult` is retained as
+  `acquire_step_rich` for writer-preference tests. Production scripts,
+  `reserve_map`, `acquire_writer`, and `MapReserveResult::Blocked` are
+  all on the canonical surface. Two new behavior tests for
+  DONTNEED/Free; 79/79 vm:: tests pass; all 11 CI gates green.
+  `exec_aspace` rebuild half and the `BTreeMap` → persistent-BTree
+  optimization remain deferred (need `ExecImage` / process subsystem;
+  tracked outside the fixup).
 - 2026-05-04 VFS spec-reconciliation Phases 1-4 complete on branch
   `vfs-spec-reconciliation`. The four-phase plan that started after
   the deferred-move investigation is now fully landed: Phase 1 brought

@@ -23,7 +23,7 @@ fn range_lock_would_block_wait_token_carrier_matches_lock() {
     let range = range(0x1000, 1);
     let _holder = match aspace
         .range_lock()
-        .acquire_step(range, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step_rich(range, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("first acquire should succeed"),
@@ -31,7 +31,7 @@ fn range_lock_would_block_wait_token_carrier_matches_lock() {
 
     let blocked = match aspace
         .range_lock()
-        .acquire_step(range, crate::vm::LockMode::Materializer)
+        .acquire_step_rich(range, crate::vm::LockMode::Materializer)
     {
         crate::vm::AcquireResult::WouldBlock(blocked) => blocked,
         _ => panic!("expected WouldBlock for overlapping materializer"),
@@ -43,7 +43,7 @@ fn range_lock_would_block_wait_token_carrier_matches_lock() {
 }
 
 #[test]
-fn map_script_async_succeeds_in_one_poll_when_uncontended() {
+fn mmap_script_succeeds_in_one_poll_when_uncontended() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let request = VmMapRequest::fixed(
@@ -54,7 +54,7 @@ fn map_script_async_succeeds_in_one_poll_when_uncontended() {
         VmBacking::PrivateAnon,
     );
 
-    let mut future = Box::pin(aspace.map_script_async(request));
+    let mut future = Box::pin(aspace.mmap_script(request));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -68,14 +68,14 @@ fn map_script_async_succeeds_in_one_poll_when_uncontended() {
 }
 
 #[test]
-fn map_script_async_yields_on_writer_conflict_and_completes_after_release() {
+fn mmap_script_yields_on_writer_conflict_and_completes_after_release() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let target_range = range(0x2000, 1);
 
     let holder = match aspace
         .range_lock()
-        .acquire_step(target_range, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step_rich(target_range, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("baseline acquire should succeed"),
@@ -88,7 +88,7 @@ fn map_script_async_yields_on_writer_conflict_and_completes_after_release() {
         VmEntryFlags::PRIVATE,
         VmBacking::PrivateAnon,
     );
-    let mut future = Box::pin(aspace.map_script_async(request));
+    let mut future = Box::pin(aspace.mmap_script(request));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -106,7 +106,7 @@ fn map_script_async_yields_on_writer_conflict_and_completes_after_release() {
 }
 
 #[test]
-fn unmap_async_yields_on_writer_conflict_and_completes_after_release() {
+fn munmap_script_yields_on_writer_conflict_and_completes_after_release() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let target_range = range(0x6000, 1);
@@ -125,13 +125,13 @@ fn unmap_async_yields_on_writer_conflict_and_completes_after_release() {
 
     let holder = match aspace
         .range_lock()
-        .acquire_step(target_range, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step_rich(target_range, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("baseline acquire should succeed"),
     };
 
-    let mut future = Box::pin(aspace.unmap_async(target_range));
+    let mut future = Box::pin(aspace.munmap_script(target_range));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -148,7 +148,7 @@ fn unmap_async_yields_on_writer_conflict_and_completes_after_release() {
 }
 
 #[test]
-fn protect_async_yields_on_writer_conflict_and_completes_after_release() {
+fn mprotect_script_yields_on_writer_conflict_and_completes_after_release() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let target_range = range(0x7000, 1);
@@ -167,13 +167,13 @@ fn protect_async_yields_on_writer_conflict_and_completes_after_release() {
 
     let holder = match aspace
         .range_lock()
-        .acquire_step(target_range, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step_rich(target_range, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("baseline acquire should succeed"),
     };
 
-    let mut future = Box::pin(aspace.protect_async(target_range, Prot::READ));
+    let mut future = Box::pin(aspace.mprotect_script(target_range, Prot::READ));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -196,7 +196,7 @@ fn protect_async_yields_on_writer_conflict_and_completes_after_release() {
 }
 
 #[test]
-fn remap_async_yields_on_pair_conflict_and_completes_after_release() {
+fn mremap_script_yields_on_pair_conflict_and_completes_after_release() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let old_range = range(0x8000, 1);
@@ -216,7 +216,7 @@ fn remap_async_yields_on_pair_conflict_and_completes_after_release() {
 
     let holder = match aspace
         .range_lock()
-        .acquire_step(new_range, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step_rich(new_range, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("baseline acquire should succeed"),
@@ -226,7 +226,7 @@ fn remap_async_yields_on_pair_conflict_and_completes_after_release() {
         old_range,
         new_range,
     };
-    let mut future = Box::pin(aspace.remap_async(request));
+    let mut future = Box::pin(aspace.mremap_script(request));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -247,14 +247,14 @@ fn remap_async_yields_on_pair_conflict_and_completes_after_release() {
 }
 
 #[test]
-fn brk_script_async_grows_anon_mapping_when_requested_above_current() {
+fn brk_script_grows_anon_mapping_when_requested_above_current() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let brk_base = crate::vm::UserVirtAddr(0xb000);
     let current_brk = crate::vm::UserVirtAddr(0xb000);
     let requested_brk = crate::vm::UserVirtAddr(0xd000);
 
-    let mut future = Box::pin(aspace.brk_script_async(brk_base, current_brk, requested_brk));
+    let mut future = Box::pin(aspace.brk_script(brk_base, current_brk, requested_brk));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -267,13 +267,13 @@ fn brk_script_async_grows_anon_mapping_when_requested_above_current() {
 }
 
 #[test]
-fn brk_script_async_shrinks_anon_mapping_when_requested_below_current() {
+fn brk_script_shrinks_anon_mapping_when_requested_below_current() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let brk_base = crate::vm::UserVirtAddr(0xe000);
     let initial_top = crate::vm::UserVirtAddr(0x10000);
 
-    let mut grow_future = Box::pin(aspace.brk_script_async(brk_base, brk_base, initial_top));
+    let mut grow_future = Box::pin(aspace.brk_script(brk_base, brk_base, initial_top));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     match grow_future.as_mut().poll(&mut cx) {
@@ -282,7 +282,7 @@ fn brk_script_async_shrinks_anon_mapping_when_requested_below_current() {
     }
 
     let shrunk = crate::vm::UserVirtAddr(0xf000);
-    let mut shrink_future = Box::pin(aspace.brk_script_async(brk_base, initial_top, shrunk));
+    let mut shrink_future = Box::pin(aspace.brk_script(brk_base, initial_top, shrunk));
     match shrink_future.as_mut().poll(&mut cx) {
         Poll::Ready(Ok(new_brk)) => assert_eq!(new_brk, shrunk),
         other => panic!("brk shrink expected Ready(Ok), got {other:?}"),
@@ -292,13 +292,13 @@ fn brk_script_async_shrinks_anon_mapping_when_requested_below_current() {
 }
 
 #[test]
-fn brk_script_async_returns_current_when_requested_equal() {
+fn brk_script_returns_current_when_requested_equal() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let brk_base = crate::vm::UserVirtAddr(0x14000);
     let current = crate::vm::UserVirtAddr(0x14000);
 
-    let mut future = Box::pin(aspace.brk_script_async(brk_base, current, current));
+    let mut future = Box::pin(aspace.brk_script(brk_base, current, current));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     match future.as_mut().poll(&mut cx) {
@@ -308,14 +308,14 @@ fn brk_script_async_returns_current_when_requested_equal() {
 }
 
 #[test]
-fn brk_script_async_rejects_below_brk_base_with_invalid_range() {
+fn brk_script_rejects_below_brk_base_with_invalid_range() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let brk_base = crate::vm::UserVirtAddr(0x16000);
     let current = crate::vm::UserVirtAddr(0x18000);
     let below_base = crate::vm::UserVirtAddr(0x15000);
 
-    let mut future = Box::pin(aspace.brk_script_async(brk_base, current, below_base));
+    let mut future = Box::pin(aspace.brk_script(brk_base, current, below_base));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     match future.as_mut().poll(&mut cx) {
@@ -325,7 +325,7 @@ fn brk_script_async_rejects_below_brk_base_with_invalid_range() {
 }
 
 #[test]
-fn fault_script_async_succeeds_in_one_poll_when_uncontended() {
+fn fault_script_succeeds_in_one_poll_when_uncontended() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let target = range(0x18000, 1);
@@ -343,7 +343,7 @@ fn fault_script_async_succeeds_in_one_poll_when_uncontended() {
     .expect("baseline map");
 
     let fault = VmFault::new(crate::vm::UserVirtAddr(0x18000), AccessMode::Write);
-    let mut future = Box::pin(aspace.fault_script_async(fault));
+    let mut future = Box::pin(aspace.fault_script(fault));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -355,7 +355,7 @@ fn fault_script_async_succeeds_in_one_poll_when_uncontended() {
 }
 
 #[test]
-fn fault_script_async_yields_on_writer_conflict_and_completes_after_release() {
+fn fault_script_yields_on_writer_conflict_and_completes_after_release() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let target = range(0x1a000, 1);
@@ -374,14 +374,14 @@ fn fault_script_async_yields_on_writer_conflict_and_completes_after_release() {
 
     let holder = match aspace
         .range_lock()
-        .acquire_step(target, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step_rich(target, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("baseline acquire should succeed"),
     };
 
     let fault = VmFault::new(crate::vm::UserVirtAddr(0x1a000), AccessMode::Write);
-    let mut future = Box::pin(aspace.fault_script_async(fault));
+    let mut future = Box::pin(aspace.fault_script(fault));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -521,7 +521,7 @@ fn fork_aspace_returns_would_block_when_parent_full_user_range_already_held() {
     let parent = AddressSpace::new();
     let _holder = match parent
         .range_lock()
-        .acquire_step(range(0x40000, 1), crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step_rich(range(0x40000, 1), crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("baseline acquire should succeed"),
@@ -577,7 +577,7 @@ fn range_lock_release_fires_registered_channel_for_external_subscribers() {
     let range = range(0x4000, 1);
     let holder = match aspace
         .range_lock()
-        .acquire_step(range, crate::vm::LockMode::ExclusiveWriter)
+        .acquire_step_rich(range, crate::vm::LockMode::ExclusiveWriter)
     {
         crate::vm::AcquireResult::Acquired(guard) => guard,
         _ => panic!("acquire should succeed"),
