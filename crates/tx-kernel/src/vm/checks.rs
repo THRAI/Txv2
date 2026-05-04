@@ -62,7 +62,8 @@ pub fn require_map_admission(
     entry: &VmEntry,
     placement: MapPlacement,
 ) -> Result<(), VmMapError> {
-    aspace.recipes.validate_map(entry, placement)
+    let guard = tx_substrate::epoch::guard();
+    aspace.recipes.validate_map(entry, placement, &guard)
 }
 
 pub const fn require_disjoint_remap(

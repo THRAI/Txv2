@@ -660,7 +660,10 @@ fn vm_recipe_snapshot_reader_survives_split_rewrite_publication() {
         .commit()
         .expect("initial map");
 
-    let before = aspace.recipes.snapshot_reader();
+    let before = {
+        let guard = tx_substrate::epoch::guard();
+        aspace.recipes.snapshot_reader(&guard)
+    };
 
     let replacement = VmEntry::new(
         range(0x2000, 2),

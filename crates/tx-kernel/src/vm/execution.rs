@@ -92,7 +92,8 @@ impl AddressSpace {
             .recipes
             .remap_disjoint(request.old_range, request.new_range)?;
         self.pmap.teardown_range(request.old_range)?;
-        self.stats.store(self.recipes.stats());
+        let guard = tx_substrate::epoch::guard();
+        self.stats.store(self.recipes.stats(&guard));
         Ok(VmRemapOutcome {
             old_range: request.old_range,
             new_range: request.new_range,
@@ -125,7 +126,8 @@ impl AddressSpace {
         let _guard = self.acquire_writer(range)?;
         let commit = self.recipes.unmap(range)?;
         self.pmap.teardown_range(range)?;
-        self.stats.store(self.recipes.stats());
+        let guard = tx_substrate::epoch::guard();
+        self.stats.store(self.recipes.stats(&guard));
         Ok(commit)
     }
 
@@ -133,7 +135,8 @@ impl AddressSpace {
         let _guard = self.acquire_writer(range)?;
         let commit = self.recipes.protect(range, prot)?;
         self.pmap.teardown_range(range)?;
-        self.stats.store(self.recipes.stats());
+        let guard = tx_substrate::epoch::guard();
+        self.stats.store(self.recipes.stats(&guard));
         Ok(commit)
     }
 
@@ -154,7 +157,8 @@ impl AddressSpace {
         if placement == MapPlacement::FixedReplace {
             self.pmap.teardown_range(range)?;
         }
-        self.stats.store(self.recipes.stats());
+        let guard = tx_substrate::epoch::guard();
+        self.stats.store(self.recipes.stats(&guard));
         Ok(commit)
     }
 }
@@ -227,7 +231,7 @@ impl AddressSpace {
     /// the first non-`Done` outcome from any underlying fsync; `Done(())` if
     /// every visited PC flushed cleanly.
     pub fn msync(&self, range: UserRange, guard: &Guard<'_>) -> StepOutcome<()> {
-        let entries = self.recipes_snapshot();
+        let entries = self.recipes.snapshot(guard);
         let mut visited: BTreeSet<u32> = BTreeSet::new();
         for entry in entries {
             if !entry.range.overlaps(range) {

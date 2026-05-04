@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 use tx_hal::PmapIf;
+use tx_substrate::epoch;
 use tx_substrate::zone::{self, Cap, Zone, ZoneAllocated};
 
 #[cfg(test)]
@@ -67,19 +68,23 @@ impl AddressSpace {
     }
 
     pub fn lookup(&self, addr: UserVirtAddr) -> Option<VmEntry> {
-        self.recipes.lookup(addr)
+        let guard = epoch::guard();
+        self.recipes.lookup(addr, &guard)
     }
 
     pub fn find_free_range(&self, window: UserRange, page_count: usize) -> Option<UserRange> {
-        self.recipes.find_free_range(window, page_count)
+        let guard = epoch::guard();
+        self.recipes.find_free_range(window, page_count, &guard)
     }
 
     pub fn recipes_overlapping(&self, range: UserRange) -> Vec<VmEntry> {
-        self.recipes.overlapping(range)
+        let guard = epoch::guard();
+        self.recipes.overlapping(range, &guard)
     }
 
     pub fn recipes_snapshot(&self) -> Vec<VmEntry> {
-        self.recipes.snapshot()
+        let guard = epoch::guard();
+        self.recipes.snapshot(&guard)
     }
 }
 

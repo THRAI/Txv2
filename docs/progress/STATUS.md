@@ -4,6 +4,24 @@
 
 ## Current Shape
 
+- 2026-05-04 Persistent EBR-backed recipe publication landed (plan step
+  persistent-epoch-recipes). `RecipeIndex` now publishes via
+  `AtomicPtr<RecipeTree>` for lock-free reads under `epoch::Guard`, with a
+  separate writer mutation `SpinMutex` serializing mutators. Writers
+  atomically swap and retire the old tree through
+  `tx_substrate::epoch::retire_raw`, which is now public so upper-layer
+  publication paths can opt into EBR-managed reclamation. Internal read
+  methods take `&Guard<'_>` and load via a `pinned()` helper that performs
+  an Acquire load and relies on the caller's guard for soundness.
+  `AddressSpace` public read methods keep their existing signatures by
+  creating a short-lived internal `epoch::guard()`; `msync` threads its
+  caller-supplied guard directly. `RecipeSnapshot` is now `cfg(test)`
+  (only the publication-rule test still consumes it). `Drop` on
+  `RecipeIndex` frees the final tree. Satisfies VM_v1_2 §1.2 publication
+  rule with guard-scoped reader lifetimes. Verification: `cargo fmt
+  --check` clean, vm 60 ok, page_backed 43 ok, lib 109 ok, substrate
+  page_allocator 18 ok, workspace clippy clean, `cargo xtask lint
+  arch/unused/docs` ok, `cargo xtask progress validate` 24 ok.
 - 2026-05-04 Midway checkpoint: 10 of 17
   vm-pagebacked-v1-completion plan steps complete (~60% structure / ~55%
   behavior against VM_v1_2 / PAGE_BACKED_v1). Catch-up note at
