@@ -513,6 +513,13 @@ impl VmFaultOutcome {
         pc: &Cap<PageContainer>,
     ) -> Result<VmFaultMaterialization, VmFaultError> {
         let page_index = self.backing_page_index()?;
+        let access_byte = page_index
+            .as_u64()
+            .checked_mul(USER_PAGE_SIZE as u64)
+            .ok_or(VmFaultError::BackingOffsetOverflow)?;
+        if access_byte >= pc.size_bytes() {
+            return Err(VmFaultError::PageBeyondSize);
+        }
         let private_mapping = !self.entry.flags.shared;
         let write_fault = self.access == AccessMode::Write;
         let (page, publish_prot, replace_existing) = if private_mapping && write_fault {
@@ -636,6 +643,7 @@ pub enum VmFaultError {
     WouldBlock,
     BackingMismatch,
     BackingOffsetOverflow,
+    PageBeyondSize,
     PageCache(PageCacheError),
     StaleRecipe,
     Pmap(VmPmapError),

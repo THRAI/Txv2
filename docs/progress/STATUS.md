@@ -4,6 +4,21 @@
 
 ## Current Shape
 
+- 2026-05-04 VM fault PC.size SIGBUS check slice landed (plan step
+  vm-fault-pc-size-checks). `VmFaultError` gained `PageBeyondSize`.
+  `VmFaultOutcome::materialize_page_recipe` rejects faults whose
+  `page_index * USER_PAGE_SIZE >= pc.size_bytes()` before calling
+  `materialize_anon`, leaving `BackingOffsetOverflow` for capacity violations.
+  Three new tests in `vm/tests/fault_materialization.rs` cover SHARED past-EOF
+  read rejection, MAP_PRIVATE past-EOF write rejection (before CoW
+  replacement), and admission of a page whose first byte is just below
+  `PC.size`. Verification: `cargo test -p tx-kernel vm -- --test-threads=1`
+  (52 ok), `cargo test -p tx-kernel page_backed -- --test-threads=1` (29 ok),
+  `cargo test -p tx-kernel --lib -- --test-threads=1` (87 ok), `cargo fmt
+  --check` clean, workspace clippy clean, `cargo xtask lint arch/unused/docs`
+  ok, `cargo xtask progress validate` 24 ok. Closes the prior STATUS "next
+  step: connect PC.size to VM fault SIGBUS-style checks for page-backed
+  mappings" item.
 - 2026-05-04 PageBacked user-buffer byte copy slice landed (plan step
   user-buffer-byte-copy). Substrate gained a `FrameKernelAddr` hook installed
   at boot (direct-map) and in host tests (test direct map). `Errno` gained

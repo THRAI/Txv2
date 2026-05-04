@@ -328,3 +328,117 @@ fn vm_fault_materialization_rejects_non_pagebacked_recipe() {
         Err(VmFaultError::BackingMismatch)
     );
 }
+
+#[test]
+fn vm_fault_pagebacked_rejects_access_past_pc_size_with_sigbus_shape() {
+    setup_host_substrate();
+    let backing = page_backing(0);
+    let pc_cap = match &backing {
+        VmBacking::Page { pc, .. } => pc.clone(),
+        _ => unreachable!("page_backing returns VmBacking::Page"),
+    };
+
+    let truncate_guard = tx_substrate::epoch::guard();
+    assert_eq!(
+        crate::page_backed::step_truncate(&pc_cap, USER_PAGE_SIZE as u64, &truncate_guard),
+        crate::execution::StepOutcome::Done(())
+    );
+    drop(truncate_guard);
+
+    let aspace = AddressSpace::new();
+    let entry = VmEntry::new(
+        range(0x4000, 2),
+        Prot::READ_WRITE,
+        VmEntryFlags::SHARED,
+        backing,
+    );
+    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+        .commit()
+        .expect("map");
+
+    let in_bounds = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x4000), AccessMode::Read))
+        .expect("in-bounds fault resolves to outcome");
+    in_bounds
+        .materialize_pagebacked()
+        .expect("first page within PC.size materializes");
+
+    let past_eof = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x5000), AccessMode::Read))
+        .expect("past-EOF fault resolves to outcome");
+    assert_eq!(
+        past_eof.materialize_pagebacked().map(|_| ()),
+        Err(VmFaultError::PageBeyondSize)
+    );
+}
+
+#[test]
+fn vm_fault_pagebacked_rejects_write_past_pc_size_before_cow_replacement() {
+    setup_host_substrate();
+    let backing = page_backing(0);
+    let pc_cap = match &backing {
+        VmBacking::Page { pc, .. } => pc.clone(),
+        _ => unreachable!("page_backing returns VmBacking::Page"),
+    };
+
+    let truncate_guard = tx_substrate::epoch::guard();
+    assert_eq!(
+        crate::page_backed::step_truncate(&pc_cap, USER_PAGE_SIZE as u64, &truncate_guard),
+        crate::execution::StepOutcome::Done(())
+    );
+    drop(truncate_guard);
+
+    let aspace = AddressSpace::new();
+    let entry = VmEntry::new(
+        range(0x4000, 2),
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        backing,
+    );
+    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+        .commit()
+        .expect("map");
+
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x5000), AccessMode::Write))
+        .expect("past-EOF write fault resolves to outcome");
+    assert_eq!(
+        outcome.materialize_pagebacked().map(|_| ()),
+        Err(VmFaultError::PageBeyondSize)
+    );
+}
+
+#[test]
+fn vm_fault_pagebacked_admits_first_byte_of_partially_filled_page() {
+    setup_host_substrate();
+    let backing = page_backing(0);
+    let pc_cap = match &backing {
+        VmBacking::Page { pc, .. } => pc.clone(),
+        _ => unreachable!("page_backing returns VmBacking::Page"),
+    };
+
+    let truncate_guard = tx_substrate::epoch::guard();
+    assert_eq!(
+        crate::page_backed::step_truncate(&pc_cap, USER_PAGE_SIZE as u64 + 1, &truncate_guard),
+        crate::execution::StepOutcome::Done(())
+    );
+    drop(truncate_guard);
+
+    let aspace = AddressSpace::new();
+    let entry = VmEntry::new(
+        range(0x4000, 2),
+        Prot::READ_WRITE,
+        VmEntryFlags::SHARED,
+        backing,
+    );
+    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+        .commit()
+        .expect("map");
+
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x5000), AccessMode::Read))
+        .expect("partial-page fault resolves to outcome");
+    outcome
+        .materialize_pagebacked()
+        .expect("page whose first byte is below PC.size still materializes");
+}
