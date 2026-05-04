@@ -14,6 +14,9 @@ pub mod project;
 mod structure;
 
 #[cfg(test)]
+pub(crate) use pmap::TestPmap;
+
+#[cfg(test)]
 mod tests;
 
 pub use execution::{MadviseAdvice, MapReservation, MapReserveResult};
