@@ -714,7 +714,7 @@ fn vm_address_space_unmap_splits_recipe_and_updates_stats() {
         .commit()
         .expect("initial map");
 
-    let commit = aspace.unmap(range(0x2000, 2)).expect("unmap commit");
+    let commit = aspace.try_munmap(range(0x2000, 2)).expect("unmap commit");
 
     assert_eq!(commit.changed_pages, 2);
     assert_eq!(
@@ -750,7 +750,7 @@ fn vm_address_space_protect_rewrites_only_declared_range() {
         .expect("initial map");
 
     let commit = aspace
-        .protect(range(0x2000, 1), Prot::READ)
+        .try_mprotect(range(0x2000, 1), Prot::READ)
         .expect("protect commit");
 
     assert_eq!(commit.changed_pages, 1);
@@ -767,7 +767,7 @@ fn vm_address_space_protect_rewrites_only_declared_range() {
         Prot::READ_WRITE
     );
     assert_eq!(
-        aspace.protect(range(0x8000, 1), Prot::READ),
+        aspace.try_mprotect(range(0x8000, 1), Prot::READ),
         Err(VmMapError::MissingMapping)
     );
 }
@@ -913,14 +913,14 @@ fn vm_checks_require_fault_publication_rejects_stale_recipe_and_page() {
     );
 
     aspace
-        .protect(range(0x2000, 1), Prot::NONE)
+        .try_mprotect(range(0x2000, 1), Prot::NONE)
         .expect("stale permission");
     assert_eq!(
         super::checks::require_fault_publication(&aspace, &outcome, &materialized),
         Err(VmFaultError::StaleRecipe)
     );
 
-    aspace.unmap(range(0x2000, 1)).expect("stale recipe");
+    aspace.try_munmap(range(0x2000, 1)).expect("stale recipe");
     assert_eq!(
         super::checks::require_fault_publication(&aspace, &outcome, &materialized),
         Err(VmFaultError::StaleRecipe)
@@ -1077,7 +1077,7 @@ fn address_space_cap_maps_cap_backed_page_container() {
     let range = range(0x41_0000, 1);
 
     let outcome = aspace
-        .map_script(VmMapRequest::fixed(
+        .try_mmap(VmMapRequest::fixed(
             range,
             MapPlacement::RequireFree,
             Prot::READ_WRITE,
@@ -1114,7 +1114,7 @@ fn vm_pmap_publish_revalidates_recipe_before_install() {
         .expect("fault resolves");
     let materialized = outcome.materialize_pagebacked_anon().expect("materialize");
 
-    aspace.unmap(range(0x2000, 1)).expect("stale recipe");
+    aspace.try_munmap(range(0x2000, 1)).expect("stale recipe");
 
     assert_eq!(
         aspace.publish_fault_materialization(outcome, materialized),
@@ -1155,7 +1155,7 @@ fn vm_pmap_publish_installs_materialized_mapping_then_unmap_shoots_down() {
     );
     assert_eq!(aspace.pmap().stats().mapped_pages, 1);
 
-    aspace.unmap(range(0x3000, 1)).expect("unmap");
+    aspace.try_munmap(range(0x3000, 1)).expect("unmap");
 
     assert_eq!(aspace.pmap().lookup(UserPage(3)), None);
     assert_eq!(
@@ -1337,7 +1337,7 @@ fn vm_pmap_protect_tears_down_for_refault_not_in_place_retag() {
         .expect("publish");
 
     aspace
-        .protect(range(0x5000, 1), Prot::READ)
+        .try_mprotect(range(0x5000, 1), Prot::READ)
         .expect("protect");
 
     assert_eq!(aspace.pmap().lookup(UserPage(5)), None);
