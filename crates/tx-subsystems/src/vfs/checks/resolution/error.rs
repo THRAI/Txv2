@@ -5,11 +5,11 @@ use crate::vfs::checks::resolution::state::WalkMode;
 pub enum WalkCause {
     MissingComponent,
     NonDirectoryIntermediate,
+    #[cfg(test)]
     SymlinkBudgetExceeded,
-    TraverseDenied,
     NameTooLong,
     DetachedNamespace,
-    NeedIoUnavailable,
+    #[cfg(any(test, feature = "vfs-read-test-support"))]
     StaleObservation,
 }
 
@@ -17,11 +17,11 @@ pub(crate) fn classify(_mode: WalkMode, cause: WalkCause) -> Errno {
     match cause {
         WalkCause::MissingComponent => Errno::NoEntry,
         WalkCause::NonDirectoryIntermediate => Errno::NotDirectory,
+        #[cfg(test)]
         WalkCause::SymlinkBudgetExceeded => Errno::TooManySymlinks,
-        WalkCause::TraverseDenied => Errno::PermissionDenied,
         WalkCause::NameTooLong => Errno::NameTooLong,
         WalkCause::DetachedNamespace => Errno::NoEntry,
-        WalkCause::NeedIoUnavailable => Errno::NotImplemented,
+        #[cfg(any(test, feature = "vfs-read-test-support"))]
         WalkCause::StaleObservation => Errno::Stale,
     }
 }
