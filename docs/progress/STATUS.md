@@ -4,6 +4,23 @@
 
 ## Current Shape
 
+- 2026-05-04 VmPmap walk surface and wait-aware StepOutcome audit landed
+  (plan steps vm-pmap-walk-protect-surface and wait-aware-step-outcome).
+  `VmPmap::walk_range(range)` returns ascending-order `(UserPage,
+  PmapMappingSnapshot)` tuples for mincore-style enumeration and for future
+  fork CoW demotion to discover affected pages. `teardown_range` rustdoc now
+  documents its dual role as the protect-via-refault path per VM_v1_2 §9.8
+  (in-place PTE permission patching deferred). Three new vm tests cover
+  ascending order, range exclusion, and empty results. Wait-aware
+  `StepOutcome` audit confirms the existing five-variant algebra and
+  `WaitToken(carrier, interest)` shape already match STEP_MODEL_v1 §2/§2.3 —
+  no code change needed; downstream script wrappers can call the existing
+  variants directly. Verification: `cargo test -p tx-kernel vm --
+  --test-threads=1` (55 ok), `cargo test -p tx-kernel page_backed --
+  --test-threads=1` (29 ok), `cargo test -p tx-kernel --lib --
+  --test-threads=1` (90 ok), `cargo fmt --check` clean, workspace clippy
+  clean, `cargo xtask lint arch/unused/docs` ok, `cargo xtask progress
+  validate` 24 ok.
 - 2026-05-04 VM fault PC.size SIGBUS check slice landed (plan step
   vm-fault-pc-size-checks). `VmFaultError` gained `PageBeyondSize`.
   `VmFaultOutcome::materialize_page_recipe` rejects faults whose

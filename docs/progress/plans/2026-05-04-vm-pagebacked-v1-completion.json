@@ -183,16 +183,15 @@
     {
       "id": "wait-aware-step-outcome",
       "title": "Confirm StepOutcome carries wait tokens fault paths can yield through",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [],
       "paths": [
-        "crates/tx-substrate/src",
-        "crates/tx-kernel/src/vm/structure/types.rs"
+        "crates/tx-kernel/src/execution.rs"
       ],
       "verification": [
-        "cargo test -p tx-substrate --lib"
+        "audit-only: cargo test -p tx-kernel --lib -- --test-threads=1"
       ],
-      "notes": "STEP_MODEL_v1 wait-aware StepOutcome contract. Audit current shape; if missing, extend with Wait(WaitToken)/Blocked variants the script wrappers can observe. No behavior change for existing callers."
+      "notes": "Audit complete. StepOutcome already carries Done(T), Advanced(T), Blocked(WaitToken), AdvancedThenBlocked(T, WaitToken), and Err(Errno) per STEP_MODEL_v1 §2 five-variant algebra. WaitToken carries (carrier, interest) per §2.3 (WakeCarrier × InterestConditions). No code changes required. Convenience extractors (e.g., wait_token() helper) are deferred until the first concrete script wrapper has a real consumer; adding them now would be premature abstraction."
     },
     {
       "id": "fault-script-async",
@@ -280,15 +279,22 @@
     {
       "id": "vm-pmap-walk-protect-surface",
       "title": "Extend VmPmap with walk and protect-without-teardown for mincore + future fork CoW demotion",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [],
       "paths": [
-        "crates/tx-kernel/src/vm/pmap.rs"
+        "crates/tx-kernel/src/vm/pmap.rs",
+        "crates/tx-kernel/src/vm/tests.rs"
       ],
       "verification": [
-        "cargo test -p tx-kernel vm -- --test-threads=1"
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask progress validate"
       ],
-      "notes": "Adds the bare pmap walk needed by mincore and the protect-without-teardown surface required by fork CoW demotion later. Does not implement in-place retag (§9.8 deferred); demotion is via tear-down then refault per §3.4 of the existing design."
+      "notes": "Added VmPmap::walk_range(range) -> Vec<(UserPage, PmapMappingSnapshot)> for read-only enumeration used by mincore-style queries and by future fork CoW demotion to discover affected pages. Did not add a separate protect-without-teardown method; teardown_range already serves the protect-via-refault discipline per VM_v1_2 §9.8 (in-place PTE permission patching deferred). Documented teardown_range's dual role in its rustdoc. Three tests cover the walk surface: ascending order, range exclusion, and the empty case."
     },
     {
       "id": "persistent-epoch-recipes",
