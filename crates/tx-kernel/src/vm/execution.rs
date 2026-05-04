@@ -116,6 +116,92 @@ impl AddressSpace {
         }
     }
 
+    /// Async wrapper around `unmap` that yields on `RangeLock` `WouldBlock`
+    /// and retries after a release wakes the lock's wait channel. Honors
+    /// VM_v1_2 §3.6 by dropping the blocked guard before each `.await`.
+    pub async fn unmap_async(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
+        loop {
+            let _guard = match self.range_lock.acquire(range, LockMode::ExclusiveWriter) {
+                AcquireResult::Acquired(guard) => guard,
+                AcquireResult::WouldBlock(blocked) => {
+                    let token = blocked.wait_token();
+                    drop(blocked);
+                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
+                        let _ = future.await;
+                    }
+                    continue;
+                }
+            };
+            let commit = self.recipes.unmap(range)?;
+            self.pmap.teardown_range(range)?;
+            let guard = tx_substrate::epoch::guard();
+            self.stats.store(self.recipes.stats(&guard));
+            return Ok(commit);
+        }
+    }
+
+    /// Async wrapper around `protect` that yields on `RangeLock`
+    /// `WouldBlock` and retries after a release wakes the lock's wait
+    /// channel.
+    pub async fn protect_async(
+        &self,
+        range: UserRange,
+        prot: Prot,
+    ) -> Result<VmMapCommit, VmMapError> {
+        loop {
+            let _guard = match self.range_lock.acquire(range, LockMode::ExclusiveWriter) {
+                AcquireResult::Acquired(guard) => guard,
+                AcquireResult::WouldBlock(blocked) => {
+                    let token = blocked.wait_token();
+                    drop(blocked);
+                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
+                        let _ = future.await;
+                    }
+                    continue;
+                }
+            };
+            let commit = self.recipes.protect(range, prot)?;
+            self.pmap.teardown_range(range)?;
+            let guard = tx_substrate::epoch::guard();
+            self.stats.store(self.recipes.stats(&guard));
+            return Ok(commit);
+        }
+    }
+
+    /// Async wrapper around `remap_script` that yields on `RangeLock`
+    /// pair `WouldBlock` and retries after either covered range's release
+    /// wakes the lock's wait channel.
+    pub async fn remap_async(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
+        require_disjoint_remap(request.old_range, request.new_range)?;
+        loop {
+            let _guard_pair = match self.range_lock.acquire_pair(
+                (request.old_range, LockMode::ExclusiveWriter),
+                (request.new_range, LockMode::ExclusiveWriter),
+            ) {
+                AcquirePairResult::Acquired(pair) => pair,
+                AcquirePairResult::WouldBlock(blocked) => {
+                    let token = blocked.wait_token();
+                    drop(blocked);
+                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
+                        let _ = future.await;
+                    }
+                    continue;
+                }
+            };
+            let commit = self
+                .recipes
+                .remap_disjoint(request.old_range, request.new_range)?;
+            self.pmap.teardown_range(request.old_range)?;
+            let guard = tx_substrate::epoch::guard();
+            self.stats.store(self.recipes.stats(&guard));
+            return Ok(VmRemapOutcome {
+                old_range: request.old_range,
+                new_range: request.new_range,
+                commit,
+            });
+        }
+    }
+
     pub fn remap_script(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
         require_disjoint_remap(request.old_range, request.new_range)?;
 

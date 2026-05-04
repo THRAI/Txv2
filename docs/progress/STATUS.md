@@ -4,6 +4,18 @@
 
 ## Current Shape
 
+- 2026-05-04 unmap/protect/remap async wrappers landed (plan step
+  munmap-mprotect-mremap-scripts), each following the
+  `map_script_async` template. `AddressSpace::unmap_async`,
+  `AddressSpace::protect_async`, `AddressSpace::remap_async` loop on
+  their inner sync helper, drop the blocked guard on WouldBlock, await
+  `wait_carrier::wait_on_token`, retry. Inner sync helpers preserved.
+  `remap_async` stays in disjoint-only mode for v1. Three new tests
+  exercise blocked-then-release-wakes-and-completes for each wrapper.
+  Verification: `cargo fmt --check` clean, vm 67 ok (was 64, +3
+  script_async), page_backed 49 ok, lib 128 ok, workspace clippy clean,
+  `cargo xtask lint arch/unused/docs` ok, `cargo xtask progress
+  validate` 24 ok.
 - 2026-05-04 mmap-script-async landed end-to-end as the working template
   for the async script wave (plan step mmap-script-async). RangeLock now
   owns a `tx_reactor::wait::Channel` registered with `wait_carrier`;
