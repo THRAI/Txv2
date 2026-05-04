@@ -1,7 +1,7 @@
 use tx_substrate::epoch::Guard;
-use tx_substrate::zone::{Cap, Zone, ZoneAllocated, ZoneError};
+use tx_substrate::zone::{Zone, ZoneAllocated};
 
-use crate::mount::structure::{MountPayload, MountPayloadPin};
+use crate::mount::structure::MountPayloadPin;
 use crate::step::Errno;
 use crate::step::StepOutcome;
 use crate::vfs::structure::FsObjectId;
@@ -76,10 +76,11 @@ impl PageContainer {
     }
 }
 
+#[cfg(any(test, feature = "vfs-read-test-support"))]
 pub(crate) fn create_file_page_container(
-    payload: Cap<MountPayload>,
+    payload: tx_substrate::zone::Cap<crate::mount::structure::MountPayload>,
     fs_object_id: FsObjectId,
-) -> Result<Cap<PageContainer>, ZoneError> {
+) -> Result<tx_substrate::zone::Cap<PageContainer>, tx_substrate::zone::ZoneError> {
     let reservation = tx_substrate::zone::reserve_for::<PageContainer>()?;
     let pin = MountPayloadPin::acquire(&payload);
     Ok(tx_substrate::zone::sign_for(
@@ -134,7 +135,7 @@ unsafe impl ZoneAllocated for PageContainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mount::structure::testing::make_payload_for_test;
+    use crate::mount::structure::{testing::make_payload_for_test, MountPayload};
     use crate::test_support::EpochTestGuard;
     use core::sync::atomic::Ordering;
     use tx_substrate::epoch;

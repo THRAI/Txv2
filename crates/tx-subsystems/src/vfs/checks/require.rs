@@ -24,25 +24,29 @@ impl ResolveCtx {
         Self { caps }
     }
 
+    #[cfg(any(test, feature = "vfs-read-test-support"))]
     pub(crate) fn root_ctx_caps(&self) -> &RootCtxCaps {
         &self.caps
     }
 }
 
 /// Internal helper: build initial state, run walker, map NeedIO to NotImplemented.
-fn run_require<'a, 'g>(
-    path: &'a [u8],
+fn run_require<'g>(
+    path: &[u8],
     ctx: &ResolveCtx,
     guard: &'g Guard<'_>,
     mode: WalkMode,
 ) -> Result<WalkWitness<'g>, VfsError> {
     let state = make_initial_walk_state(path, &ctx.caps, guard)?;
     match driver::run_walker(mode, state, guard) {
-        DriverStep::Accept(witness) => Ok(witness),
+        DriverStep::Accept(witness) => Ok(*witness),
         DriverStep::Error(e) => Err(e),
         // RFX-VFS-P3-003: Replace with async IO dispatch once cold IO path
         // and dcache population are implemented.
+        #[cfg(any(test, feature = "vfs-read-test-support"))]
         DriverStep::NeedIO(_, _) => Err(Errno::NotImplemented),
+        #[cfg(not(any(test, feature = "vfs-read-test-support")))]
+        DriverStep::NeedIO => Err(Errno::NotImplemented),
     }
 }
 
@@ -106,16 +110,14 @@ pub fn require_entity_or_parent_and_name<'g>(
 }
 
 pub fn require_mount_point<'g>(
-    _path: &[u8],
-    _ctx: &ResolveCtx,
-    _guard: &'g Guard<'_>,
+    path: &[u8],
+    ctx: &ResolveCtx,
+    guard: &'g Guard<'_>,
 ) -> Result<MountPointAtPath<'g>, VfsError> {
-    // RFX-VFS-P3-004: Wire to run_require(WalkMode::MountPoint) once
-    // mount::checks::is_mount_root returns real topology truth. Current MOUNT
-    // checks stub always returns false so the walker never accepts and
-    // terminates with Errno::NoEntry — kept as NotImplemented to avoid
-    // misleading callers.
-    Err(Errno::NotImplemented)
+    match run_require(path, ctx, guard, WalkMode::MountPoint)? {
+        WalkWitness::MountPoint(m) => Ok(*m),
+        _ => Err(Errno::Invalid),
+    }
 }
 
 pub fn require_real_path<'g>(

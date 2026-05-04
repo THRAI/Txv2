@@ -8,6 +8,9 @@ use tx_hal::{
 };
 
 mod execution_scripts;
+mod fault_materialization;
+mod observation;
+mod script_async;
 
 static COUNTING_PMAP_TEST_LOCK: Mutex<()> = Mutex::new(());
 static COUNTING_PMAP_STATE: LazyLock<Mutex<CountingPmapState>> =
@@ -155,6 +158,10 @@ impl PmapIf for CountingPmap {
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
     crate::zones::register_all().expect("kernel zones");
+    match tx_substrate::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+        Err(error) => panic!("claim zero frame for VM tests: {error:?}"),
+    }
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
 }
@@ -274,16 +281,16 @@ fn vm_range_lock_conflict_matrix_matches_modes() {
     let overlap = range(0x2000, 1);
     let disjoint = range(0x8000, 1);
 
-    let writer = acquired(lock.acquire(first, LockMode::ExclusiveWriter));
-    would_block(lock.acquire(overlap, LockMode::ExclusiveWriter));
-    would_block(lock.acquire(overlap, LockMode::Materializer));
-    let disjoint_writer = acquired(lock.acquire(disjoint, LockMode::ExclusiveWriter));
+    let writer = acquired(lock.acquire_step(first, LockMode::ExclusiveWriter));
+    would_block(lock.acquire_step(overlap, LockMode::ExclusiveWriter));
+    would_block(lock.acquire_step(overlap, LockMode::Materializer));
+    let disjoint_writer = acquired(lock.acquire_step(disjoint, LockMode::ExclusiveWriter));
     drop(disjoint_writer);
     drop(writer);
 
-    let materializer_a = acquired(lock.acquire(first, LockMode::Materializer));
-    let materializer_b = acquired(lock.acquire(overlap, LockMode::Materializer));
-    would_block(lock.acquire(overlap, LockMode::ExclusiveWriter));
+    let materializer_a = acquired(lock.acquire_step(first, LockMode::Materializer));
+    let materializer_b = acquired(lock.acquire_step(overlap, LockMode::Materializer));
+    would_block(lock.acquire_step(overlap, LockMode::ExclusiveWriter));
     drop(materializer_b);
     drop(materializer_a);
 }
@@ -293,19 +300,19 @@ fn vm_range_lock_pending_writer_blocks_new_materializers() {
     let lock = RangeLock::new();
     let first = range(0x1000, 1);
 
-    let materializer = acquired(lock.acquire(first, LockMode::Materializer));
-    let pending = would_block(lock.acquire(first, LockMode::ExclusiveWriter))
+    let materializer = acquired(lock.acquire_step(first, LockMode::Materializer));
+    let pending = would_block(lock.acquire_step(first, LockMode::ExclusiveWriter))
         .pending_writer()
         .expect("blocked writer should declare pending range");
 
-    would_block(lock.acquire(first, LockMode::Materializer));
+    would_block(lock.acquire_step(first, LockMode::Materializer));
     drop(materializer);
 
     let writer = acquired(pending.try_acquire());
-    would_block(lock.acquire(first, LockMode::Materializer));
+    would_block(lock.acquire_step(first, LockMode::Materializer));
     drop(writer);
 
-    let materializer_after_drop = acquired(lock.acquire(first, LockMode::Materializer));
+    let materializer_after_drop = acquired(lock.acquire_step(first, LockMode::Materializer));
     drop(materializer_after_drop);
 }
 
@@ -314,11 +321,11 @@ fn vm_range_lock_overlapping_pending_writers_are_fifo() {
     let lock = RangeLock::new();
     let first = range(0x1000, 1);
 
-    let materializer = acquired(lock.acquire(first, LockMode::Materializer));
-    let pending_a = would_block(lock.acquire(first, LockMode::ExclusiveWriter))
+    let materializer = acquired(lock.acquire_step(first, LockMode::Materializer));
+    let pending_a = would_block(lock.acquire_step(first, LockMode::ExclusiveWriter))
         .pending_writer()
         .expect("first writer queues");
-    let pending_b = would_block(lock.acquire(first, LockMode::ExclusiveWriter))
+    let pending_b = would_block(lock.acquire_step(first, LockMode::ExclusiveWriter))
         .pending_writer()
         .expect("second writer queues");
     drop(materializer);
@@ -342,12 +349,12 @@ fn vm_range_guard_drop_releases_reservation() {
     let first = range(0x1000, 1);
 
     {
-        let writer = acquired(lock.acquire(first, LockMode::ExclusiveWriter));
-        would_block(lock.acquire(first, LockMode::Materializer));
+        let writer = acquired(lock.acquire_step(first, LockMode::ExclusiveWriter));
+        would_block(lock.acquire_step(first, LockMode::Materializer));
         drop(writer);
     }
 
-    let materializer = acquired(lock.acquire(first, LockMode::Materializer));
+    let materializer = acquired(lock.acquire_step(first, LockMode::Materializer));
     drop(materializer);
 }
 
@@ -357,15 +364,15 @@ fn vm_range_lock_acquires_two_ranges_atomically() {
     let a = range(0x1000, 1);
     let b = range(0x4000, 1);
 
-    let pair = pair_acquired(lock.acquire_pair(
+    let pair = pair_acquired(lock.acquire_pair_step(
         (a, LockMode::ExclusiveWriter),
         (b, LockMode::ExclusiveWriter),
     ));
-    would_block(lock.acquire(a, LockMode::Materializer));
-    would_block(lock.acquire(b, LockMode::Materializer));
+    would_block(lock.acquire_step(a, LockMode::Materializer));
+    would_block(lock.acquire_step(b, LockMode::Materializer));
     drop(pair);
 
-    let after = acquired(lock.acquire(a, LockMode::Materializer));
+    let after = acquired(lock.acquire_step(a, LockMode::Materializer));
     drop(after);
 }
 
@@ -376,16 +383,16 @@ fn vm_range_lock_tree_removal_clears_only_removed_overlap() {
     let middle = range(0x5000, 1);
     let high = range(0x9000, 1);
 
-    let low_writer = acquired(lock.acquire(low, LockMode::ExclusiveWriter));
-    let middle_writer = acquired(lock.acquire(middle, LockMode::ExclusiveWriter));
-    let high_writer = acquired(lock.acquire(high, LockMode::ExclusiveWriter));
+    let low_writer = acquired(lock.acquire_step(low, LockMode::ExclusiveWriter));
+    let middle_writer = acquired(lock.acquire_step(middle, LockMode::ExclusiveWriter));
+    let high_writer = acquired(lock.acquire_step(high, LockMode::ExclusiveWriter));
 
-    would_block(lock.acquire(middle, LockMode::Materializer));
+    would_block(lock.acquire_step(middle, LockMode::Materializer));
     drop(middle_writer);
 
-    let middle_materializer = acquired(lock.acquire(middle, LockMode::Materializer));
-    would_block(lock.acquire(low, LockMode::Materializer));
-    would_block(lock.acquire(high, LockMode::Materializer));
+    let middle_materializer = acquired(lock.acquire_step(middle, LockMode::Materializer));
+    would_block(lock.acquire_step(low, LockMode::Materializer));
+    would_block(lock.acquire_step(high, LockMode::Materializer));
 
     drop(middle_materializer);
     drop(low_writer);
@@ -399,13 +406,13 @@ fn vm_range_lock_tree_keeps_disjoint_reservations_independent() {
     let b = range(0x8000, 1);
     let c = range(0x10000, 1);
 
-    let writer_a = acquired(lock.acquire(a, LockMode::ExclusiveWriter));
-    let writer_b = acquired(lock.acquire(b, LockMode::ExclusiveWriter));
-    let materializer_c = acquired(lock.acquire(c, LockMode::Materializer));
+    let writer_a = acquired(lock.acquire_step(a, LockMode::ExclusiveWriter));
+    let writer_b = acquired(lock.acquire_step(b, LockMode::ExclusiveWriter));
+    let materializer_c = acquired(lock.acquire_step(c, LockMode::Materializer));
 
-    would_block(lock.acquire(a, LockMode::Materializer));
-    would_block(lock.acquire(b, LockMode::Materializer));
-    let second_materializer_c = acquired(lock.acquire(c, LockMode::Materializer));
+    would_block(lock.acquire_step(a, LockMode::Materializer));
+    would_block(lock.acquire_step(b, LockMode::Materializer));
+    let second_materializer_c = acquired(lock.acquire_step(c, LockMode::Materializer));
 
     drop(second_materializer_c);
     drop(materializer_c);
@@ -419,12 +426,12 @@ fn vm_range_lock_tree_pending_fifo_is_range_scoped() {
     let first = range(0x2000, 1);
     let disjoint = range(0xa000, 1);
 
-    let materializer = acquired(lock.acquire(first, LockMode::Materializer));
-    let pending_a = would_block(lock.acquire(first, LockMode::ExclusiveWriter))
+    let materializer = acquired(lock.acquire_step(first, LockMode::Materializer));
+    let pending_a = would_block(lock.acquire_step(first, LockMode::ExclusiveWriter))
         .pending_writer()
         .expect("first overlapping writer queues");
-    let disjoint_writer = acquired(lock.acquire(disjoint, LockMode::ExclusiveWriter));
-    let pending_b = would_block(lock.acquire(first, LockMode::ExclusiveWriter))
+    let disjoint_writer = acquired(lock.acquire_step(disjoint, LockMode::ExclusiveWriter));
+    let pending_b = would_block(lock.acquire_step(first, LockMode::ExclusiveWriter))
         .pending_writer()
         .expect("second overlapping writer queues");
 
@@ -452,10 +459,10 @@ fn vm_range_lock_tree_active_writer_blocks_materializer_overlap_only() {
     let overlap = range(0x8000, 1);
     let disjoint = range(0xb000, 1);
 
-    let writer = acquired(lock.acquire(writer_range, LockMode::ExclusiveWriter));
+    let writer = acquired(lock.acquire_step(writer_range, LockMode::ExclusiveWriter));
 
-    would_block(lock.acquire(overlap, LockMode::Materializer));
-    let disjoint_materializer = acquired(lock.acquire(disjoint, LockMode::Materializer));
+    would_block(lock.acquire_step(overlap, LockMode::Materializer));
+    let disjoint_materializer = acquired(lock.acquire_step(disjoint, LockMode::Materializer));
 
     drop(disjoint_materializer);
     drop(writer);
@@ -639,6 +646,59 @@ fn vm_address_space_fixed_map_replaces_overlap_and_preserves_survivors() {
             recipe_count: 3,
             vm_size: 4 * USER_PAGE_SIZE,
         }
+    );
+}
+
+#[test]
+fn vm_recipe_snapshot_reader_survives_split_rewrite_publication() {
+    let aspace = AddressSpace::new();
+    let original = VmEntry::new(
+        range(0x1000, 4),
+        Prot::READ_WRITE,
+        VmEntryFlags::SHARED,
+        page_backing(0),
+    );
+    map_reserved(aspace.reserve_map(original.clone(), MapPlacement::RequireFree))
+        .commit()
+        .expect("initial map");
+
+    let before = {
+        let guard = tx_substrate::epoch::guard();
+        aspace.recipes.snapshot_reader(&guard)
+    };
+
+    let replacement = VmEntry::new(
+        range(0x2000, 2),
+        Prot::READ,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(replacement.clone(), MapPlacement::FixedReplace))
+        .commit()
+        .expect("fixed replace");
+
+    assert_eq!(before.snapshot(), alloc::vec![original.clone()]);
+    assert_eq!(
+        before.lookup(UserVirtAddr(0x2000)).expect("old view").prot,
+        Prot::READ_WRITE
+    );
+    assert_eq!(
+        aspace.recipes_snapshot(),
+        alloc::vec![
+            VmEntry::new(
+                range(0x1000, 1),
+                Prot::READ_WRITE,
+                VmEntryFlags::SHARED,
+                page_backing_like(&original.backing, 0),
+            ),
+            replacement,
+            VmEntry::new(
+                range(0x4000, 1),
+                Prot::READ_WRITE,
+                VmEntryFlags::SHARED,
+                page_backing_like(&original.backing, (3 * USER_PAGE_SIZE) as u64),
+            ),
+        ]
     );
 }
 
@@ -836,21 +896,20 @@ fn vm_checks_require_fault_publication_rejects_stale_recipe_and_page() {
     let outcome = aspace
         .resolve_fault(VmFault::new(UserVirtAddr(0x2000), AccessMode::Read))
         .expect("fault resolves");
+    let mut wrong_page = outcome
+        .materialize_pagebacked_anon()
+        .expect("wrong page materialization");
+    wrong_page.page_index = crate::page_backed::PageIndex::new(99);
+    let materialized = outcome
+        .materialize_pagebacked_anon()
+        .expect("materialization");
 
     assert_eq!(
-        super::checks::require_fault_publication(
-            &aspace,
-            &outcome,
-            crate::page_backed::PageIndex::new(99),
-        ),
+        super::checks::require_fault_publication(&aspace, &outcome, &wrong_page),
         Err(VmFaultError::StaleRecipe)
     );
     assert_eq!(
-        super::checks::require_fault_publication(
-            &aspace,
-            &outcome,
-            crate::page_backed::PageIndex::new(0),
-        ),
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
         Ok(entry)
     );
 
@@ -858,21 +917,13 @@ fn vm_checks_require_fault_publication_rejects_stale_recipe_and_page() {
         .protect(range(0x2000, 1), Prot::NONE)
         .expect("stale permission");
     assert_eq!(
-        super::checks::require_fault_publication(
-            &aspace,
-            &outcome,
-            crate::page_backed::PageIndex::new(0),
-        ),
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
         Err(VmFaultError::StaleRecipe)
     );
 
     aspace.unmap(range(0x2000, 1)).expect("stale recipe");
     assert_eq!(
-        super::checks::require_fault_publication(
-            &aspace,
-            &outcome,
-            crate::page_backed::PageIndex::new(0),
-        ),
+        super::checks::require_fault_publication(&aspace, &outcome, &materialized),
         Err(VmFaultError::StaleRecipe)
     );
 }
@@ -1014,87 +1065,6 @@ fn vm_project_address_space_lists_mappings_in_start_order_and_hides_caps() {
 }
 
 #[test]
-fn vm_fault_resolution_requires_authoritative_recipe_and_permissions() {
-    let aspace = AddressSpace::new();
-    let entry = VmEntry::new(
-        range(0x4000, 1),
-        Prot::READ,
-        VmEntryFlags::PRIVATE,
-        VmBacking::PrivateAnon,
-    );
-    map_reserved(aspace.reserve_map(entry.clone(), MapPlacement::RequireFree))
-        .commit()
-        .expect("map");
-
-    let outcome = aspace
-        .resolve_fault(VmFault::new(UserVirtAddr(0x4008), AccessMode::Read))
-        .expect("read fault resolves");
-
-    assert_eq!(outcome.page_range, range(0x4000, 1));
-    assert_eq!(outcome.entry, entry);
-    assert!(!outcome.pmap_materialization_deferred);
-    assert_eq!(
-        aspace.resolve_fault(VmFault::new(UserVirtAddr(0x4008), AccessMode::Write)),
-        Err(VmFaultError::ProtectionViolation)
-    );
-    assert_eq!(
-        aspace.resolve_fault(VmFault::new(UserVirtAddr(0x8000), AccessMode::Read)),
-        Err(VmFaultError::NoRecipe)
-    );
-}
-
-#[test]
-fn vm_fault_resolution_waits_behind_overlapping_writer() {
-    let aspace = AddressSpace::new();
-    let entry = VmEntry::new(
-        range(0x1000, 1),
-        Prot::READ,
-        VmEntryFlags::PRIVATE,
-        VmBacking::PrivateAnon,
-    );
-    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
-        .commit()
-        .expect("map");
-    let _writer = acquired(
-        aspace
-            .range_lock()
-            .acquire(range(0x1000, 1), LockMode::ExclusiveWriter),
-    );
-
-    assert_eq!(
-        aspace.resolve_fault(VmFault::new(UserVirtAddr(0x1000), AccessMode::Read)),
-        Err(VmFaultError::WouldBlock)
-    );
-}
-
-#[test]
-fn vm_fault_materializes_pagebacked_anon_page_from_recipe_offset() {
-    let aspace = AddressSpace::new();
-    let entry = VmEntry::new(
-        range(0x2000, 2),
-        Prot::READ_WRITE,
-        VmEntryFlags::SHARED,
-        page_backing(USER_PAGE_SIZE as u64),
-    );
-    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
-        .commit()
-        .expect("map");
-    let outcome = aspace
-        .resolve_fault(VmFault::new(UserVirtAddr(0x3000), AccessMode::Write))
-        .expect("fault resolves");
-    let materialized = outcome
-        .materialize_pagebacked_anon()
-        .expect("pagebacked materialization");
-
-    assert_eq!(
-        materialized.page_index,
-        crate::page_backed::PageIndex::new(2)
-    );
-    assert!(materialized.page.newly_installed);
-    assert!(materialized.page.dirty);
-}
-
-#[test]
 fn address_space_cap_maps_cap_backed_page_container() {
     setup_host_substrate();
     let aspace = AddressSpace::new_cap().expect("address space cap");
@@ -1126,28 +1096,6 @@ fn address_space_cap_maps_cap_backed_page_container() {
         entry.backing,
         VmBacking::Page { offset, .. } if offset == USER_PAGE_SIZE as u64
     ));
-}
-
-#[test]
-fn vm_fault_materialization_rejects_non_pagebacked_recipe() {
-    let aspace = AddressSpace::new();
-    let entry = VmEntry::new(
-        range(0x4000, 1),
-        Prot::READ,
-        VmEntryFlags::PRIVATE,
-        VmBacking::PrivateAnon,
-    );
-    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
-        .commit()
-        .expect("map");
-    let outcome = aspace
-        .resolve_fault(VmFault::new(UserVirtAddr(0x4000), AccessMode::Read))
-        .expect("fault resolves");
-
-    assert_eq!(
-        outcome.materialize_pagebacked_anon().map(|_| ()),
-        Err(VmFaultError::BackingMismatch)
-    );
 }
 
 #[test]

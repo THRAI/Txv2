@@ -1,3 +1,5 @@
+use alloc::boxed::Box;
+
 use tx_substrate::epoch::Guard;
 
 use crate::step::Errno;
@@ -61,11 +63,11 @@ pub(crate) fn build_witness<'a, 'g>(
         }
         WalkMode::MountPoint => {
             let rnode = state.cursor.rnode.ident_ref(guard);
-            Ok(WalkWitness::MountPoint(MountPointAtPath::new(
+            Ok(WalkWitness::MountPoint(Box::new(MountPointAtPath::new(
                 state.cursor,
                 rnode,
                 state.current_mount,
-            )))
+            ))))
         }
         WalkMode::ParentAndName
         | WalkMode::ParentAndNamedChild
@@ -92,7 +94,7 @@ pub(crate) fn build_penultimate_witness<'a, 'g>(
         ))),
         WalkMode::ParentAndNamedChild => match state.cursor.children.lookup(&name, guard) {
             DEntryChildLookup::Found(child) => {
-                let child_ref = child.into_ident_ref();
+                let child_ref = (*child).into_ident_ref();
                 let child_rnode = child_ref.rnode.ident_ref(guard);
                 // RFX-VFS-P2-006: child_mount remains current_mount until MOUNT
                 // forward crossing is wired into final child resolution. The
@@ -114,7 +116,7 @@ pub(crate) fn build_penultimate_witness<'a, 'g>(
         },
         WalkMode::EntityOrParentAndName => match state.cursor.children.lookup(&name, guard) {
             DEntryChildLookup::Found(child) => {
-                let child_ref = child.into_ident_ref();
+                let child_ref = (*child).into_ident_ref();
                 let child_rnode = child_ref.rnode.ident_ref(guard);
                 Ok(WalkWitness::EntityOrParent(EntityOrParentAndName::Present(
                     EntityAtPath::new(child_ref, child_rnode, state.current_mount),
@@ -125,7 +127,7 @@ pub(crate) fn build_penultimate_witness<'a, 'g>(
                 // children index"; split Found/Negative/Unknown when dcache
                 // negative entries and backend probe policy are implemented.
                 Ok(WalkWitness::EntityOrParent(EntityOrParentAndName::Absent(
-                    ParentAndName::new(state.cursor, state.current_mount, name),
+                    Box::new(ParentAndName::new(state.cursor, state.current_mount, name)),
                 )))
             }
         },

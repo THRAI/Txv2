@@ -6,3 +6,4 @@ __pycache__/
 *.log
 .DS_Store
 /docs/ljs
+.claude/settings.local.json

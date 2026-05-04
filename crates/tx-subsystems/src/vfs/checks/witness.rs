@@ -1,3 +1,5 @@
+use alloc::boxed::Box;
+
 use core::marker::PhantomData;
 
 use tx_substrate::zone::IdentRef;
@@ -121,10 +123,6 @@ impl<'g> UnlinkableNonDirChild<'g> {
 }
 
 impl<'g> RmdirableDirChild<'g> {
-    pub(in crate::vfs::checks) fn new(child: ParentAndNamedChild<'g>) -> Self {
-        Self(child)
-    }
-
     pub fn child(&self) -> &ParentAndNamedChild<'g> {
         &self.0
     }
@@ -132,7 +130,7 @@ impl<'g> RmdirableDirChild<'g> {
 
 pub enum EntityOrParentAndName<'g> {
     Present(EntityAtPath<'g>),
-    Absent(ParentAndName<'g>),
+    Absent(Box<ParentAndName<'g>>),
 }
 
 impl<'g> EntityOrParentAndName<'g> {
@@ -174,21 +172,6 @@ pub struct RealPath<'g> {
     _not_send_sync: PhantomData<*mut ()>,
 }
 
-impl<'g> RealPath<'g> {
-    pub(in crate::vfs::checks) fn new(
-        dentry: IdentRef<'g, DEntry>,
-        mount: IdentRef<'g, MountIdentity>,
-        path: CanonicalPath,
-    ) -> Self {
-        Self {
-            dentry,
-            mount,
-            path,
-            _not_send_sync: PhantomData,
-        }
-    }
-}
-
 pub struct CanonicalPath {
     pub len: u16,
     pub bytes: [u8; 4096],
@@ -200,8 +183,7 @@ pub(crate) enum WalkWitness<'g> {
     ParentAndName(ParentAndName<'g>),
     ParentAndNamedChild(ParentAndNamedChild<'g>),
     EntityOrParent(EntityOrParentAndName<'g>),
-    MountPoint(MountPointAtPath<'g>),
-    RealPath(RealPath<'g>),
+    MountPoint(Box<MountPointAtPath<'g>>),
 }
 
 #[cfg(test)]

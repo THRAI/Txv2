@@ -3,10 +3,23 @@
 //! This is the bounded VM_v1 interval-reservation set. It preserves the
 //! declared overlap semantics and writer preference while leaving the final
 //! persistent/concurrent interval index for a later substrate fit.
+//!
+//! Each `RangeLock` owns a `tx_reactor::wait::Channel` registered with
+//! `wait_carrier`. On every release the channel fires the
+//! `RANGE_LOCK_RELEASE_MASK` bit so async script wrappers can convert a
+//! `WouldBlock` outcome into an awaitable wait via `WouldBlock::wait_token`.
 
+use tx_reactor::wait::{Channel, Mask};
+
+use crate::execution::WaitToken;
 use crate::sync::SpinMutex;
+use crate::wait_carrier;
 
 use super::UserRange;
+
+/// Channel mask bit fired whenever a RangeLock acquirer releases its
+/// reservation. Async waiters subscribe to this bit and re-acquire on wake.
+pub const RANGE_LOCK_RELEASE_MASK: u64 = 0x1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LockMode {
@@ -25,6 +38,7 @@ pub enum AcquirePairResult<'a> {
 }
 
 pub struct WouldBlock<'a> {
+    lock: &'a RangeLock,
     pending_writer: Option<PendingWriter<'a>>,
 }
 
@@ -35,6 +49,14 @@ impl<'a> WouldBlock<'a> {
 
     pub fn has_pending_writer(&self) -> bool {
         self.pending_writer.is_some()
+    }
+
+    /// `WaitToken` whose carrier resolves to the underlying `RangeLock`'s
+    /// release channel. Async wrappers feed this into
+    /// `wait_carrier::wait_on_token` to await the next release before
+    /// retrying their try-acquire.
+    pub fn wait_token(&self) -> WaitToken {
+        WaitToken::new(self.lock.wait_carrier_id, RANGE_LOCK_RELEASE_MASK)
     }
 }
 
@@ -90,21 +112,35 @@ impl Drop for PendingWriter<'_> {
 /// but it is not the final optimized segment tree/concurrent interval index.
 pub struct RangeLock {
     state: SpinMutex<RangeLockState>,
+    wait_channel: Channel,
+    wait_carrier_id: u64,
 }
 
 impl RangeLock {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        let wait_channel = Channel::new();
+        let wait_carrier_id = wait_carrier::register_wait_channel(wait_channel.clone());
         Self {
             state: SpinMutex::new(RangeLockState::new()),
+            wait_channel,
+            wait_carrier_id,
         }
     }
 
-    pub fn acquire(&self, range: UserRange, mode: LockMode) -> AcquireResult<'_> {
+    /// Carrier id under which this `RangeLock`'s release channel is
+    /// registered with the global wait-carrier resolver. Exposed for async
+    /// wrappers that hand-build their own `WaitToken` values.
+    pub fn wait_carrier_id(&self) -> u64 {
+        self.wait_carrier_id
+    }
+
+    pub fn acquire_step(&self, range: UserRange, mode: LockMode) -> AcquireResult<'_> {
         let mut state = self.state.lock();
         match mode {
             LockMode::Materializer => {
                 if state.materializer_blocked(range) {
                     AcquireResult::WouldBlock(WouldBlock {
+                        lock: self,
                         pending_writer: None,
                     })
                 } else {
@@ -121,7 +157,7 @@ impl RangeLock {
         }
     }
 
-    pub fn acquire_pair(
+    pub fn acquire_pair_step(
         &self,
         a: (UserRange, LockMode),
         b: (UserRange, LockMode),
@@ -129,6 +165,7 @@ impl RangeLock {
         let mut state = self.state.lock();
         if state.pair_blocked(a, b) {
             return AcquirePairResult::WouldBlock(WouldBlock {
+                lock: self,
                 pending_writer: None,
             });
         }
@@ -151,10 +188,12 @@ impl RangeLock {
             (Some(first_id), None) => {
                 state.release_active(first_id, a.0);
                 AcquirePairResult::WouldBlock(WouldBlock {
+                    lock: self,
                     pending_writer: None,
                 })
             }
             _ => AcquirePairResult::WouldBlock(WouldBlock {
+                lock: self,
                 pending_writer: None,
             }),
         }
@@ -165,6 +204,7 @@ impl RangeLock {
         let range = pending.range;
         if state.writer_blocked(range, Some(pending.id)) {
             return AcquireResult::WouldBlock(WouldBlock {
+                lock: self,
                 pending_writer: Some(pending),
             });
         }
@@ -176,11 +216,15 @@ impl RangeLock {
 
     fn release_active(&self, id: u64, range: UserRange) {
         self.state.lock().release_active(id, range);
+        self.wait_channel
+            .fire(Mask::from_bits(RANGE_LOCK_RELEASE_MASK));
     }
 
     fn release_pending_writer(&self, id: u64, range: UserRange) {
         if id != 0 {
             self.state.lock().release_pending_writer(id, range);
+            self.wait_channel
+                .fire(Mask::from_bits(RANGE_LOCK_RELEASE_MASK));
         }
     }
 }
@@ -188,6 +232,12 @@ impl RangeLock {
 impl Default for RangeLock {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for RangeLock {
+    fn drop(&mut self) {
+        wait_carrier::release_wait_channel(self.wait_carrier_id);
     }
 }
 
@@ -265,6 +315,7 @@ impl RangeLockState {
         match self.reserve_active_slot(range, mode) {
             Some(id) => AcquireResult::Acquired(RangeGuard { lock, id, range }),
             None => AcquireResult::WouldBlock(WouldBlock {
+                lock,
                 pending_writer: None,
             }),
         }
@@ -291,10 +342,12 @@ impl RangeLockState {
             mode: LockMode::ExclusiveWriter,
         }) {
             return AcquireResult::WouldBlock(WouldBlock {
+                lock,
                 pending_writer: None,
             });
         }
         AcquireResult::WouldBlock(WouldBlock {
+            lock,
             pending_writer: Some(PendingWriter { lock, id, range }),
         })
     }

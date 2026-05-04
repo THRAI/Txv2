@@ -1,4 +1,5 @@
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 use tx_hal::{
@@ -6,11 +7,12 @@ use tx_hal::{
     Ppn, VirtAddr,
 };
 use tx_substrate::{
-    page_allocator::{BitmapPageAllocator, MapPin},
+    page_allocator::BitmapPageAllocator,
     shootdown::{AddressSpaceShootdownBatch, ShootdownError},
     zone::ZoneError,
 };
 
+use crate::page_backed::MaterializedPagePin;
 use crate::sync::SpinMutex;
 
 use super::{Prot, UserPage, UserRange, USER_PAGE_SIZE};
@@ -51,12 +53,12 @@ impl VmPmapOps {
 pub struct PmapMapping {
     pub ppn: Ppn,
     pub prot: Prot,
-    map_pin: MapPin<'static, BitmapPageAllocator<'static>>,
+    pin: MaterializedPagePin,
 }
 
 impl PmapMapping {
-    fn new(ppn: Ppn, prot: Prot, map_pin: MapPin<'static, BitmapPageAllocator<'static>>) -> Self {
-        Self { ppn, prot, map_pin }
+    fn new(ppn: Ppn, prot: Prot, pin: MaterializedPagePin) -> Self {
+        Self { ppn, prot, pin }
     }
 
     fn snapshot(&self) -> PmapMappingSnapshot {
@@ -66,8 +68,8 @@ impl PmapMapping {
         }
     }
 
-    fn into_map_pin(self) -> MapPin<'static, BitmapPageAllocator<'static>> {
-        self.map_pin
+    fn into_pin(self) -> MaterializedPagePin {
+        self.pin
     }
 }
 
@@ -142,6 +144,21 @@ impl VmPmap {
             .map(PmapMapping::snapshot)
     }
 
+    /// Returns mapped `(page, snapshot)` tuples for every page in `range`
+    /// that currently has a published pmap entry, in ascending page order.
+    ///
+    /// This is the read-only walk surface used by `mincore`-style enumeration
+    /// and by future fork CoW demotion to discover which pages need
+    /// teardown. The lock is held only for the duration of the walk; concurrent
+    /// publishes after the call returns are the caller's concern.
+    pub fn walk_range(&self, range: UserRange) -> Vec<(UserPage, PmapMappingSnapshot)> {
+        let state = self.state.lock();
+        range
+            .iter_pages()
+            .filter_map(|page| state.mappings.get(&page).map(|m| (page, m.snapshot())))
+            .collect()
+    }
+
     pub fn stats(&self) -> PmapStats {
         let state = self.state.lock();
         PmapStats {
@@ -158,7 +175,18 @@ impl VmPmap {
         page: UserPage,
         ppn: Ppn,
         prot: Prot,
-        map_pin: MapPin<'static, BitmapPageAllocator<'static>>,
+        map_pin: MaterializedPagePin,
+    ) -> Result<PmapPublishOutcome, VmPmapError> {
+        self.publish_page_with_replacement(page, ppn, prot, map_pin, false)
+    }
+
+    pub fn publish_page_with_replacement(
+        &self,
+        page: UserPage,
+        ppn: Ppn,
+        prot: Prot,
+        map_pin: MaterializedPagePin,
+        replace_existing: bool,
     ) -> Result<PmapPublishOutcome, VmPmapError> {
         let virt = virt_for_page(page)?;
         let phys = phys_for_ppn(ppn)?;
@@ -166,6 +194,7 @@ impl VmPmap {
         let root = self.root();
         let mut state = self.state.lock();
 
+        let mut replaced = false;
         if let Some(existing) = state.mappings.get(&page) {
             if existing.ppn == ppn && existing.prot == prot {
                 return Ok(PmapPublishOutcome {
@@ -173,7 +202,39 @@ impl VmPmap {
                     replaced: false,
                 });
             }
-            return Err(VmPmapError::MappingMismatch);
+            if !replace_existing {
+                return Err(VmPmapError::MappingMismatch);
+            }
+            let existing = state.mappings.remove(&page).expect("existing mapping");
+            let result = match self.unmap_tracked_page(page, existing.ppn) {
+                Ok(result) => result,
+                Err(error) => {
+                    state.mappings.insert(page, existing);
+                    return Err(error);
+                }
+            };
+            let mut batch = AddressSpaceShootdownBatch::<
+                BitmapPageAllocator<'static>,
+                TEARDOWN_BATCH_PAGES,
+            >::new(self.asid());
+            match existing.into_pin() {
+                MaterializedPagePin::Allocated(map_pin) => {
+                    match batch.push_page_unmap_result(result, map_pin) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            let reason = error.reason();
+                            core::mem::forget(error.into_map_pin());
+                            return Err(VmPmapError::ShootdownAccounting(reason));
+                        }
+                    }
+                    batch.issue_and_release_with(self.ops.shootdown_mappings);
+                }
+                MaterializedPagePin::Device(_) => {
+                    (self.ops.shootdown_mappings)(self.asid(), &[result.invalidation()]);
+                }
+            }
+            state.shootdowns += 1;
+            replaced = true;
         }
 
         state.reservations += 1;
@@ -190,12 +251,17 @@ impl VmPmap {
             .mappings
             .insert(page, PmapMapping::new(ppn, prot, map_pin));
         state.commits += 1;
-        Ok(PmapPublishOutcome {
-            page,
-            replaced: false,
-        })
+        Ok(PmapPublishOutcome { page, replaced })
     }
 
+    /// Tears down every published pmap entry in `range`, releasing the
+    /// associated `MapPin` and issuing the ASID-scoped shootdown.
+    ///
+    /// Used by `unmap` to remove mappings entirely, and by `mprotect` /
+    /// fork CoW demotion to demote permissions through tear-down + refault
+    /// (per VM_v1_2 §9.8: in-place PTE permission patching is deferred). The
+    /// next access to the affected pages refaults, observes the new recipe
+    /// protection, and republishes with the demoted permissions.
     pub fn teardown_range(&self, range: UserRange) -> Result<usize, VmPmapError> {
         let mut batch = AddressSpaceShootdownBatch::<
             BitmapPageAllocator<'static>,
@@ -218,23 +284,32 @@ impl VmPmap {
                     return Err(error);
                 }
             };
-            let map_pin = mapping.into_map_pin();
-
-            match batch.push_page_unmap_result(result, map_pin) {
-                Ok(()) => {}
-                Err(error) if error.reason() == ShootdownError::Full => {
-                    let map_pin = error.into_map_pin();
-                    batch = self.issue_batch(batch);
-                    if let Err(error) = batch.push_page_unmap_result(result, map_pin) {
-                        let reason = error.reason();
-                        core::mem::forget(error.into_map_pin());
-                        return Err(VmPmapError::ShootdownAccounting(reason));
+            match mapping.into_pin() {
+                MaterializedPagePin::Allocated(map_pin) => {
+                    match batch.push_page_unmap_result(result, map_pin) {
+                        Ok(()) => {}
+                        Err(error) if error.reason() == ShootdownError::Full => {
+                            let map_pin = error.into_map_pin();
+                            batch = self.issue_batch(batch);
+                            if let Err(error) = batch.push_page_unmap_result(result, map_pin) {
+                                let reason = error.reason();
+                                core::mem::forget(error.into_map_pin());
+                                return Err(VmPmapError::ShootdownAccounting(reason));
+                            }
+                        }
+                        Err(error) => {
+                            let reason = error.reason();
+                            core::mem::forget(error.into_map_pin());
+                            return Err(VmPmapError::ShootdownAccounting(reason));
+                        }
                     }
                 }
-                Err(error) => {
-                    let reason = error.reason();
-                    core::mem::forget(error.into_map_pin());
-                    return Err(VmPmapError::ShootdownAccounting(reason));
+                MaterializedPagePin::Device(_) => {
+                    if !batch.is_empty() {
+                        batch = self.issue_batch(batch);
+                    }
+                    (self.ops.shootdown_mappings)(self.asid(), &[result.invalidation()]);
+                    self.state.lock().shootdowns += 1;
                 }
             }
             removed += 1;

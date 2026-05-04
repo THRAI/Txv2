@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 use tx_hal::PmapIf;
+use tx_substrate::epoch;
 use tx_substrate::zone::{self, Cap, Zone, ZoneAllocated};
 
 #[cfg(test)]
@@ -67,19 +68,43 @@ impl AddressSpace {
     }
 
     pub fn lookup(&self, addr: UserVirtAddr) -> Option<VmEntry> {
-        self.recipes.lookup(addr)
+        let guard = epoch::guard();
+        self.recipes.lookup(addr, &guard)
     }
 
     pub fn find_free_range(&self, window: UserRange, page_count: usize) -> Option<UserRange> {
-        self.recipes.find_free_range(window, page_count)
+        let guard = epoch::guard();
+        self.recipes.find_free_range(window, page_count, &guard)
     }
 
     pub fn recipes_overlapping(&self, range: UserRange) -> Vec<VmEntry> {
-        self.recipes.overlapping(range)
+        let guard = epoch::guard();
+        self.recipes.overlapping(range, &guard)
     }
 
     pub fn recipes_snapshot(&self) -> Vec<VmEntry> {
-        self.recipes.snapshot()
+        let guard = epoch::guard();
+        self.recipes.snapshot(&guard)
+    }
+
+    /// Drop every materialized PTE in the AddressSpace by tearing down each
+    /// recipe range through `VmPmap::teardown_range`. Used by exec to
+    /// reset the AS before the new image's mappings install. Returns the
+    /// total number of pages torn down across all entries.
+    ///
+    /// Recipe entries are not removed; the caller is expected to discard
+    /// the AddressSpace (Drop frees the recipe tree) or follow up with
+    /// recipe withdrawals. Self is borrowed `&` because the pmap mutation
+    /// takes its own internal lock.
+    pub fn teardown_all_pmap(&self) -> usize {
+        let entries = self.recipes_snapshot();
+        let mut torn = 0usize;
+        for entry in entries {
+            if let Ok(count) = self.pmap.teardown_range(entry.range) {
+                torn += count;
+            }
+        }
+        torn
     }
 }
 
