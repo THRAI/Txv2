@@ -169,7 +169,7 @@ impl FsOps for DevptsInstance {
         let Some(entry) = entries.get(index).copied() else {
             return StepOutcome::Done(None);
         };
-        StepOutcome::Done(Some((entry, DirCursor::new(cursor.as_u64() + 1))))
+        StepOutcome::Done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
     }
 
     fn destroy_inode(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {

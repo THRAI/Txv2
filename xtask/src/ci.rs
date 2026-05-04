@@ -71,6 +71,13 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
                 "tx-kernel-riscv64-m1dock-mock",
                 "--exclude",
                 "tx-kernel-loongarch64-qemu-virt",
+                // Tests that touch zone-allocated entities serialize on the
+                // shared `test_support::EPOCH_TEST_LOCK` (std::sync::Mutex);
+                // running them in parallel races on zone registration and
+                // reset_for_tests state. Match the local-dev `--test-threads=1`
+                // pattern. Tracked in the Phase 2-4 decision note.
+                "--",
+                "--test-threads=1",
             ],
             "txdoc:CI-GATE-UNIT-TESTS",
         ),
