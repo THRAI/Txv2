@@ -65,10 +65,11 @@ impl<T: 'static> Drop for ZoneReservation<T> {
 }
 
 pub fn reserve<T: 'static>(zone: &'static Zone<T>) -> Result<ZoneReservation<T>, ZoneError> {
-    runtime::ensure_initialized()?;
-    // Lazy registration lets early placeholder zones work even before a final
-    // linker-section based static registry exists.
-    registry::register_static_zone(zone)?;
+    runtime::ensure_running()?;
+    let zone_id = zone.id();
+    if registry::lookup(zone_id).is_none() {
+        return Err(ZoneError::NotRegistered);
+    }
     let slot = zone.pop_free_slot()?;
     let meta = unsafe { slot.as_ref().meta() };
     loop {

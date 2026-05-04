@@ -460,6 +460,7 @@ mod tests {
     #[test]
     fn mount_payload_stores_backend_traits_and_pins_are_explicit() {
         tx_substrate::testing::init_host_for_test_once();
+        crate::zones::register_all().expect("kernel zones");
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
             fs.clone(),
@@ -484,6 +485,7 @@ mod tests {
     #[test]
     fn file_page_container_kind_carries_mount_payload_and_object_id() {
         tx_substrate::testing::init_host_for_test_once();
+        crate::zones::register_all().expect("kernel zones");
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
             fs.clone(),

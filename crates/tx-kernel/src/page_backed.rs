@@ -372,6 +372,7 @@ mod tests {
 
     fn setup_host_substrate() {
         tx_substrate::testing::init_host_for_test_once();
+        crate::zones::register_all().expect("kernel zones");
     }
 
     fn cached_frame_for_test() -> CachedFrame {

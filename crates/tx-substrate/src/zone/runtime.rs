@@ -13,7 +13,15 @@ use super::ZoneError;
 
 pub const MAX_ZONE_CPUS: usize = 64;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ZoneRuntimeState {
+    NotReady = 0,
+    Running = 1,
+    FrozenForShutdown = 2,
+}
+
 static ZONE_RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static ZONE_RUNTIME_STATE: AtomicUsize = AtomicUsize::new(ZoneRuntimeState::NotReady as usize);
 /// Number of CPUs that may access per-CPU buckets.
 static POSSIBLE_CPUS: AtomicUsize = AtomicUsize::new(1);
 /// Runtime page size used for slab layout and page-base recovery.
@@ -55,6 +63,7 @@ pub fn init_on_bsp<P: TxPlatform>() -> Result<(), ZoneError> {
     // The registry is a boot-time directory; reset it whenever the zone runtime
     // is initialized from a clean BSP boot.
     super::registry::init_registry();
+    ZONE_RUNTIME_STATE.store(ZoneRuntimeState::Running as usize, Ordering::Release);
     Ok(())
 }
 
@@ -71,6 +80,7 @@ pub fn init_for_test(page_size: usize, direct_map_base: usize) -> Result<(), Zon
         *HOOKS.get() = RuntimeHooks::default();
     }
     super::registry::init_registry();
+    ZONE_RUNTIME_STATE.store(ZoneRuntimeState::Running as usize, Ordering::Release);
     Ok(())
 }
 
@@ -92,12 +102,54 @@ pub fn ensure_initialized() -> Result<(), ZoneError> {
     }
 }
 
+pub fn ensure_running() -> Result<(), ZoneError> {
+    ensure_initialized()?;
+    match state() {
+        ZoneRuntimeState::Running => Ok(()),
+        ZoneRuntimeState::FrozenForShutdown => Err(ZoneError::FrozenForShutdown),
+        ZoneRuntimeState::NotReady => Err(ZoneError::NotInitialized),
+    }
+}
+
 pub fn is_initialized() -> bool {
     ZONE_RUNTIME_INITIALIZED.load(Ordering::Acquire)
 }
 
-pub fn pin_current_cpu() -> Result<CpuPinGuard, ZoneError> {
+pub fn state() -> ZoneRuntimeState {
+    match ZONE_RUNTIME_STATE.load(Ordering::Acquire) {
+        x if x == ZoneRuntimeState::Running as usize => ZoneRuntimeState::Running,
+        x if x == ZoneRuntimeState::FrozenForShutdown as usize => {
+            ZoneRuntimeState::FrozenForShutdown
+        }
+        _ => ZoneRuntimeState::NotReady,
+    }
+}
+
+pub fn freeze_for_shutdown() -> Result<(), ZoneError> {
     ensure_initialized()?;
+    loop {
+        match state() {
+            ZoneRuntimeState::NotReady => return Err(ZoneError::NotInitialized),
+            ZoneRuntimeState::FrozenForShutdown => return Ok(()),
+            ZoneRuntimeState::Running => {
+                if ZONE_RUNTIME_STATE
+                    .compare_exchange(
+                        ZoneRuntimeState::Running as usize,
+                        ZoneRuntimeState::FrozenForShutdown as usize,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+pub fn pin_current_cpu() -> Result<CpuPinGuard, ZoneError> {
+    ensure_running()?;
     let guard = unsafe { ((*HOOKS.get()).pin_current_cpu)() };
     if guard.cpu_id().0 < POSSIBLE_CPUS.load(Ordering::Acquire) {
         Ok(guard)
@@ -124,6 +176,7 @@ pub fn direct_map_ptr(phys: PhysAddr) -> Result<*mut u8, ZoneError> {
 #[doc(hidden)]
 pub unsafe fn reset_for_test() {
     ZONE_RUNTIME_INITIALIZED.store(false, Ordering::Release);
+    ZONE_RUNTIME_STATE.store(ZoneRuntimeState::NotReady as usize, Ordering::Release);
     POSSIBLE_CPUS.store(1, Ordering::Release);
     PAGE_SIZE.store(4096, Ordering::Release);
     DIRECT_MAP_BASE.store(0, Ordering::Release);

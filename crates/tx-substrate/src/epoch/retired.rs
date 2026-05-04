@@ -37,6 +37,47 @@ impl RetiredNode {
 
 unsafe fn noop_reclaim(_ptr: *mut u8) {}
 
+#[repr(align(64))]
+pub(crate) struct PerCpuRetiredPool {
+    pub(crate) nodes: [RetiredNode; RETIRED_NODE_POOL_CAPACITY],
+    pub(crate) free_head: Option<usize>,
+}
+
+impl PerCpuRetiredPool {
+    pub(crate) const fn new() -> Self {
+        Self {
+            nodes: [const { RetiredNode::empty() }; RETIRED_NODE_POOL_CAPACITY],
+            free_head: None,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        for index in 0..RETIRED_NODE_POOL_CAPACITY {
+            self.nodes[index].reset();
+            self.nodes[index].next = if index + 1 < RETIRED_NODE_POOL_CAPACITY {
+                Some(index + 1)
+            } else {
+                None
+            };
+        }
+        self.free_head = Some(0);
+    }
+
+    pub(crate) fn alloc_node(&mut self) -> Option<usize> {
+        let index = self.free_head?;
+        self.free_head = self.nodes[index].next;
+        self.nodes[index].reset();
+        Some(index)
+    }
+
+    pub(crate) fn free_node(&mut self, index: usize) {
+        debug_assert!(index < RETIRED_NODE_POOL_CAPACITY);
+        self.nodes[index].reset();
+        self.nodes[index].next = self.free_head;
+        self.free_head = Some(index);
+    }
+}
+
 pub(crate) struct RetiredList {
     /// Head index in the domain node array.
     pub(crate) head: Option<usize>,

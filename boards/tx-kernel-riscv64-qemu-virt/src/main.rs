@@ -32,7 +32,5 @@ pub extern "C" fn tx_kernel_riscv64_qemu_trap_dispatch(
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    loop {
-        core::hint::spin_loop();
-    }
+    tx_kernel::panic_shutdown::<ActivePlatform>()
 }

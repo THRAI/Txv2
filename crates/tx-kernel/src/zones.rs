@@ -4,7 +4,12 @@ use tx_substrate::{
     zone::{self, Zone, ZoneAllocated, ZoneError},
 };
 
-use crate::{page_backed::PageContainer, vm::AddressSpace};
+use crate::{
+    mount::{MountIdentity, MountNamespace, MountPayload},
+    page_backed::PageContainer,
+    vfs::{DEntry, OpenFile, RNode},
+    vm::AddressSpace,
+};
 
 pub(crate) struct ZoneSmokeObj {
     pub(crate) value: usize,
@@ -31,8 +36,6 @@ pub(crate) fn register_all() -> Result<(), ZoneError> {
 }
 
 pub(crate) fn run_smoke<P: TxPlatform>() -> Result<(), ZoneError> {
-    register_all()?;
-
     let reservation = zone::reserve_for::<ZoneSmokeObj>()?;
     let cap = zone::sign_for(reservation, ZoneSmokeObj { value: 7 });
     let weak = cap.downgrade();
@@ -55,6 +58,101 @@ pub(crate) fn run_smoke<P: TxPlatform>() -> Result<(), ZoneError> {
 
     console_write_str::<P>("txkernel:zone:smoke:ok\n");
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KernelZoneSummary {
+    pub epoch: tx_substrate::epoch::EpochSummary,
+    pub zone_count: usize,
+    pub zones: [Option<tx_substrate::zone::ZoneInfo>; 32],
+}
+
+pub(crate) fn summary() -> KernelZoneSummary {
+    let mut zones = [const { None }; 32];
+    let zone_count = zone::snapshot(&mut zones);
+    KernelZoneSummary {
+        epoch: epoch::summary(),
+        zone_count,
+        zones,
+    }
+}
+
+pub(crate) fn freeze_for_shutdown() -> Result<(), ZoneError> {
+    zone::freeze_for_shutdown()
+}
+
+pub(crate) fn best_effort_maintenance_tick() -> zone::ZoneMaintenanceStats {
+    zone::maintenance_tick(zone::ZoneMaintenanceBudget {
+        epoch_reclaim_budget: usize::MAX,
+        empty_slab_budget: usize::MAX,
+    })
+}
+
+pub(crate) fn bounded_maintenance_tick() -> zone::ZoneMaintenanceStats {
+    zone::maintenance_tick(zone::ZoneMaintenanceBudget {
+        epoch_reclaim_budget: 32,
+        empty_slab_budget: 4,
+    })
+}
+
+pub(crate) fn try_bounded_maintenance_tick() {
+    if !zone::is_initialized() {
+        return;
+    }
+    let _ = bounded_maintenance_tick();
+}
+
+pub(crate) fn try_best_effort_maintenance_tick() {
+    if !zone::is_initialized() {
+        return;
+    }
+    let _ = best_effort_maintenance_tick();
+}
+
+pub(crate) fn panic_shutdown<P: TxPlatform>() -> ! {
+    let _ = freeze_for_shutdown();
+    dump_summary::<P>();
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+pub(crate) fn shutdown_with_zone_cleanup<P: TxPlatform>() -> ! {
+    let _ = freeze_for_shutdown();
+    try_best_effort_maintenance_tick();
+    dump_summary::<P>();
+    P::system_off()
+}
+
+pub(crate) fn dump_summary<P: TxPlatform>() {
+    let summary = summary();
+    console_write_str::<P>("txkernel:zone:summary:epoch=");
+    write_usize::<P>(summary.epoch.global_epoch as usize);
+    console_write_str::<P>(":guards=");
+    write_usize::<P>(summary.epoch.active_guards);
+    console_write_str::<P>(":zones=");
+    write_usize::<P>(summary.zone_count);
+    console_write_str::<P>("\n");
+}
+
+fn write_usize<P: TxPlatform>(value: usize) {
+    let mut digits = [0u8; 20];
+    let mut len = 0usize;
+    let mut n = value;
+    loop {
+        digits[len] = b'0' + (n % 10) as u8;
+        len += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+
+    let mut out = [0u8; 20];
+    for (dst, src) in out[..len].iter_mut().zip(digits[..len].iter().rev()) {
+        *dst = *src;
+    }
+    console_write_str::<P>(core::str::from_utf8(&out[..len]).unwrap_or("?"));
 }
 
 mod smoke {
@@ -104,6 +202,9 @@ mod mount {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
+        zone::register_zone_for::<MountIdentity>()?;
+        zone::register_zone_for::<MountPayload>()?;
+        zone::register_zone_for::<MountNamespace>()?;
         Ok(())
     }
 }
@@ -112,6 +213,9 @@ mod vfs {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
+        zone::register_zone_for::<DEntry>()?;
+        zone::register_zone_for::<RNode>()?;
+        zone::register_zone_for::<OpenFile>()?;
         Ok(())
     }
 }

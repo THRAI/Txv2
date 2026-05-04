@@ -99,6 +99,13 @@ pub struct ZoneInfo {
     pub type_id: TypeId,
     pub allocated_slots: usize,
     pub slab_count: usize,
+    pub empty_slab_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmptySlabTrimStats {
+    pub scanned_zones: usize,
+    pub retired_slabs: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +120,12 @@ struct RegisteredZone {
     refresh_info: fn(*const ()) -> ZoneInfo,
     /// Initialize this zone's per-CPU bucket for one CPU.
     init_cpu_bucket: fn(*const (), CpuId) -> Result<(), ZoneError>,
+    /// Flush the current CPU bucket back into the central keg.
+    flush_current_cpu_bucket: fn(*const ()) -> Result<(), ZoneError>,
+    /// Retire surplus empty slabs for runtime maintenance.
+    trim_empty_slabs: fn(*const (), usize) -> usize,
+    /// Retry handing pending dead slots to EBR under bounded maintenance work.
+    retry_retire_pending_slots: fn(*const (), usize) -> usize,
     /// Resolve a logical key to a typed slot pointer, erased for storage.
     slot_from_key: fn(*const (), SlotKey) -> Option<*mut ()>,
 }
@@ -134,6 +147,9 @@ pub fn register_static_zone<T: 'static>(zone: &'static Zone<T>) -> Result<ZoneIn
         erased: zone as *const Zone<T> as *const (),
         refresh_info: refresh_info::<T>,
         init_cpu_bucket: init_cpu_bucket::<T>,
+        flush_current_cpu_bucket: flush_current_cpu_bucket::<T>,
+        trim_empty_slabs: trim_empty_slabs_for::<T>,
+        retry_retire_pending_slots: retry_retire_pending_slots_for::<T>,
         slot_from_key: slot_from_key::<T>,
     };
     REGISTRY.register(entry)?;
@@ -150,6 +166,18 @@ pub fn registered_zone_count() -> usize {
 
 pub fn snapshot(out: &mut [Option<ZoneInfo>]) -> usize {
     REGISTRY.snapshot(out)
+}
+
+pub fn trim_empty_slabs(limit: usize) -> EmptySlabTrimStats {
+    REGISTRY.trim_empty_slabs(limit)
+}
+
+pub fn retry_retire_pending_slots(limit: usize) -> usize {
+    REGISTRY.retry_retire_pending_slots(limit)
+}
+
+pub fn flush_current_cpu_buckets() -> Result<(), ZoneError> {
+    REGISTRY.flush_current_cpu_buckets()
 }
 
 pub(crate) fn init_cpu_buckets(cpu: CpuId) -> Result<(), ZoneError> {
@@ -177,6 +205,21 @@ fn refresh_info<T: 'static>(erased: *const ()) -> ZoneInfo {
 fn init_cpu_bucket<T: 'static>(erased: *const (), cpu: CpuId) -> Result<(), ZoneError> {
     let zone = unsafe { &*(erased as *const Zone<T>) };
     zone.init_cpu_bucket(cpu)
+}
+
+fn flush_current_cpu_bucket<T: 'static>(erased: *const ()) -> Result<(), ZoneError> {
+    let zone = unsafe { &*(erased as *const Zone<T>) };
+    zone.flush_current_cpu_bucket()
+}
+
+fn trim_empty_slabs_for<T: 'static>(erased: *const (), limit: usize) -> usize {
+    let zone = unsafe { &*(erased as *const Zone<T>) };
+    zone.trim_empty_slabs(limit)
+}
+
+fn retry_retire_pending_slots_for<T: 'static>(erased: *const (), limit: usize) -> usize {
+    let zone = unsafe { &*(erased as *const Zone<T>) };
+    zone.keg.retry_retire_pending_slots(limit)
 }
 
 fn slot_from_key<T: 'static>(erased: *const (), key: SlotKey) -> Option<*mut ()> {
@@ -267,6 +310,58 @@ impl ZoneRegistry {
             (entry.init_cpu_bucket)(entry.erased, cpu)?;
         }
         Ok(())
+    }
+
+    fn flush_current_cpu_buckets(&self) -> Result<(), ZoneError> {
+        let _guard = self.lock.lock();
+        for entry in &self.entries {
+            let Some(entry) = (unsafe { *entry.get() }) else {
+                continue;
+            };
+            (entry.flush_current_cpu_bucket)(entry.erased)?;
+        }
+        Ok(())
+    }
+
+    fn trim_empty_slabs(&self, limit: usize) -> EmptySlabTrimStats {
+        let _guard = self.lock.lock();
+        let mut stats = EmptySlabTrimStats::default();
+        let mut remaining = limit;
+
+        for entry in &self.entries {
+            let Some(entry) = (unsafe { *entry.get() }) else {
+                continue;
+            };
+            stats.scanned_zones += 1;
+            if remaining == 0 {
+                continue;
+            }
+            let retired = (entry.trim_empty_slabs)(entry.erased, remaining);
+            stats.retired_slabs += retired;
+            remaining = remaining.saturating_sub(retired);
+        }
+
+        stats
+    }
+
+    fn retry_retire_pending_slots(&self, limit: usize) -> usize {
+        let _guard = self.lock.lock();
+        let mut progressed = 0usize;
+        let mut remaining = limit;
+
+        for entry in &self.entries {
+            if remaining == 0 {
+                break;
+            }
+            let Some(entry) = (unsafe { *entry.get() }) else {
+                continue;
+            };
+            let done = (entry.retry_retire_pending_slots)(entry.erased, remaining);
+            progressed += done;
+            remaining = remaining.saturating_sub(done);
+        }
+
+        progressed
     }
 
     fn slot_for<T: 'static>(&self, key: SlotKey) -> Option<NonNull<Slot<T>>> {

@@ -1,21 +1,26 @@
 //! Epoch-based reclamation substrate.
 //!
-//! This is the first executable EBR slice. It preserves the public shape the
-//! zone layer needs (`guard`, delayed raw retirement, bounded drain), while the
-//! internals intentionally stay single-hart friendly until the scheduler,
-//! CpuLocal, and migration-pin machinery exist.
+//! This executable EBR substrate preserves the public shape the zone layer
+//! needs (`guard`, delayed raw retirement, bounded drain) and already supports
+//! explicit BSP/AP initialization, per-CPU retired pools, and SMP-aware guard
+//! publication. Runtime trigger wiring such as timer/idle/OOM hooks still
+//! belongs to higher layers rather than this module.
 
 mod domain;
 mod guard;
 mod local;
 mod retired;
 
-pub use domain::{init_on_ap, init_on_bsp, try_drain, DrainStats, EpochError};
+pub use domain::{
+    cpu_summary, init_on_ap, init_on_bsp, summary, try_drain, CpuEpochSummary, DrainStats,
+    EpochError, EpochSummary,
+};
 pub use guard::Guard;
+pub use retired::RETIRED_NODE_POOL_CAPACITY;
 
 #[doc(hidden)]
 pub mod testing {
-    pub use super::domain::RETIRED_NODE_POOL_CAPACITY;
+    pub use super::retired::RETIRED_NODE_POOL_CAPACITY;
 
     pub unsafe fn reset_for_test() {
         super::domain::reset_for_test();

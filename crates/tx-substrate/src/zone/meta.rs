@@ -26,8 +26,11 @@ pub enum SlotState {
     Live = 2,
     /// Semantic death has happened; upgrades are blocked, but EBR has not run.
     Dead = 3,
+    /// Semantic death has happened and retirement enqueue should be retried by
+    /// a later maintenance pass.
+    RetirePending = 4,
     /// Slot has been queued to EBR and awaits the reclaim callback.
-    Retiring = 4,
+    Retiring = 5,
 }
 
 impl SlotState {
@@ -37,7 +40,8 @@ impl SlotState {
             1 => Some(Self::Reserved),
             2 => Some(Self::Live),
             3 => Some(Self::Dead),
-            4 => Some(Self::Retiring),
+            4 => Some(Self::RetirePending),
+            5 => Some(Self::Retiring),
             _ => None,
         }
     }
