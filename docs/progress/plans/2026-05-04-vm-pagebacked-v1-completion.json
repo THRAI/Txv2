@@ -322,17 +322,29 @@
     {
       "id": "persistent-epoch-recipes",
       "title": "Replace BTreeMap snapshot publication with persistent/epoch range index",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [],
       "paths": [
         "crates/tx-kernel/src/vm/structure/recipe.rs",
-        "crates/tx-kernel/src/vm/structure/range_lock.rs",
-        "crates/tx-kernel/src/vm/checks.rs"
+        "crates/tx-kernel/src/vm/structure/address_space.rs",
+        "crates/tx-kernel/src/vm/checks.rs",
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/tests.rs",
+        "crates/tx-substrate/src/epoch/mod.rs"
       ],
       "verification": [
-        "cargo test -p tx-kernel vm -- --test-threads=1"
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo test -p tx-substrate --test page_allocator",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
       ],
-      "notes": "VM §1.2 publication rule + INVARIANTS_v4 ARCH-5. Replace cloned BTreeMap publication under a small mutex with a persistent epoch-snapshot range index, expose IdentRef-shaped guard-scoped witnesses to vm::checks, retire vm::checks staged-witness shims. Largest single structural step; can be parallelized with the script wrappers above."
+      "notes": "VM_v1_2 §1.2 publication rule + INVARIANTS_v4 ARCH-5. RecipeIndex now publishes via AtomicPtr<RecipeTree> for lock-free reads under epoch::Guard, plus a separate writer mutation SpinMutex that serializes mutators. Writers atomically swap and retire the old tree through tx_substrate::epoch::retire_raw (now exposed publicly so upper-layer publication mechanisms can opt into EBR-managed reclamation). RecipeIndex internal read methods (lookup, stats, find_free_range, overlapping, snapshot, validate_map) take &Guard<'_> and load the tree via an internal pinned() helper that performs an Acquire load and asserts soundness via the caller's epoch guard. AddressSpace public read methods (lookup, find_free_range, recipes_overlapping, recipes_snapshot) keep their existing signatures but internally create a short-lived epoch::guard() to hand to RecipeIndex; AddressSpace::msync passes its caller-supplied guard through directly. require_map_admission grows an internal guard for validate_map. RecipeSnapshot is now cfg(test) since the publication-rule test (vm_recipe_snapshot_reader_survives_split_rewrite_publication) is its only consumer; production code reads through the borrow-under-guard path directly. Drop on RecipeIndex frees the final tree via Box::from_raw on the AtomicPtr value. Verification: 60 vm tests, 43 page_backed tests, 109 lib tests, 18 substrate page_allocator tests, fmt clean, clippy clean, all xtask lints ok, progress validate 24 ok."
     },
     {
       "id": "cross-variant-scripts",
