@@ -4,12 +4,17 @@
 //! ranges, commit recipe changes, and publish pmap materializations. The
 //! broader syscall scripts still live outside the VM subsystem.
 
+use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
+
+use crate::execution::{Guard, StepOutcome};
+use crate::page_backed::{step_fsync, PageContainerKind};
 use crate::vm::checks::{
     require_disjoint_remap, require_fault_publication, require_fault_recipe, require_map_admission,
 };
 use crate::vm::{
     AcquirePairResult, AcquireResult, AddressSpace, LockMode, MapPlacement, PmapPublishOutcome,
-    Prot, RangeGuard, UserRange, VmEntry, VmFault, VmFaultError, VmFaultMaterialization,
+    Prot, RangeGuard, UserRange, VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization,
     VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget,
     VmRemapOutcome, VmRemapRequest, WouldBlock,
 };
@@ -167,6 +172,82 @@ impl core::fmt::Debug for MapReserveResult<'_> {
             Self::WouldBlock(_) => f.write_str("WouldBlock(..)"),
             Self::Err(error) => f.debug_tuple("Err").field(error).finish(),
         }
+    }
+}
+
+/// Hint values passed to `AddressSpace::madvise`.
+///
+/// V1 keeps madvise observation-only. `WillNeed` is a no-op per VM_v1_2 §9.7;
+/// `DontNeed` is a no-op while reclaim is deferred (PAGE_BACKED_v1 §8); the
+/// remaining advice values are accepted without behavior changes. The
+/// surface exists so callers and future syscall wrappers can compile against
+/// the documented spelling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MadviseAdvice {
+    Normal,
+    Random,
+    Sequential,
+    WillNeed,
+    DontNeed,
+}
+
+impl AddressSpace {
+    /// Returns one boolean per page in `range`: `true` if the page currently
+    /// has a published pmap entry, `false` otherwise. The boolean at index
+    /// `i` corresponds to `range`'s page at offset `i`.
+    ///
+    /// V1 implementation reads the snapshot returned by `VmPmap::walk_range`;
+    /// concurrent publishes after the call returns are not reflected.
+    pub fn mincore(&self, range: UserRange) -> Vec<bool> {
+        let walked = self.pmap().walk_range(range);
+        let mut walked_iter = walked.into_iter().peekable();
+        range
+            .iter_pages()
+            .map(|page| match walked_iter.peek() {
+                Some((p, _)) if *p == page => {
+                    walked_iter.next();
+                    true
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Records madvise advice for `range`. V1 is observation-only per VM_v1_2
+    /// §9.7; the advice does not yet drive readahead, eviction, or layout
+    /// changes. Returns `Ok(())` for any well-formed `range`.
+    pub fn madvise(&self, range: UserRange, advice: MadviseAdvice) -> Result<(), VmMapError> {
+        let _ = (range, advice);
+        Ok(())
+    }
+
+    /// Synchronously flushes dirty pages of any File-backed `PageContainer`
+    /// intersecting `range` by calling `page_backed::step_fsync` per unique
+    /// PC. Anon, PrivateAnon, Device, and `None` backings are no-op. Returns
+    /// the first non-`Done` outcome from any underlying fsync; `Done(())` if
+    /// every visited PC flushed cleanly.
+    pub fn msync(&self, range: UserRange, guard: &Guard<'_>) -> StepOutcome<()> {
+        let entries = self.recipes_snapshot();
+        let mut visited: BTreeSet<u32> = BTreeSet::new();
+        for entry in entries {
+            if !entry.range.overlaps(range) {
+                continue;
+            }
+            let VmBacking::Page { pc, .. } = &entry.backing else {
+                continue;
+            };
+            if !matches!(pc.kind(), PageContainerKind::File { .. }) {
+                continue;
+            }
+            if !visited.insert(pc.raw()) {
+                continue;
+            }
+            match step_fsync(pc, guard) {
+                StepOutcome::Done(()) => continue,
+                other => return other,
+            }
+        }
+        StepOutcome::Done(())
     }
 }
 
