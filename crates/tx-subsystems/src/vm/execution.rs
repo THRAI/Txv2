@@ -515,11 +515,10 @@ impl core::fmt::Debug for MapReserveResult<'_> {
 
 /// Hint values passed to `AddressSpace::madvise`.
 ///
-/// V1 keeps madvise observation-only. `WillNeed` is a no-op per VM_v1_2 §9.7;
-/// `DontNeed` is a no-op while reclaim is deferred (PAGE_BACKED_v1 §8); the
-/// remaining advice values are accepted without behavior changes. The
-/// surface exists so callers and future syscall wrappers can compile against
-/// the documented spelling.
+/// Per VM_v1_2 §5.9: `WillNeed`, `Normal`, `Random`, `Sequential` are
+/// observation-only no-ops (§9.7). `DontNeed` and `Free` perform a
+/// range-scoped pmap teardown (mini-munmap that preserves recipes) so the
+/// next access refaults clean.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MadviseAdvice {
     Normal,
@@ -527,6 +526,7 @@ pub enum MadviseAdvice {
     Sequential,
     WillNeed,
     DontNeed,
+    Free,
 }
 
 impl AddressSpace {
@@ -551,12 +551,29 @@ impl AddressSpace {
             .collect()
     }
 
-    /// Records madvise advice for `range`. V1 is observation-only per VM_v1_2
-    /// §9.7; the advice does not yet drive readahead, eviction, or layout
-    /// changes. Returns `Ok(())` for any well-formed `range`.
+    /// Apply `advice` to `range`. V1 implements:
+    ///
+    /// - `DontNeed` / `Free` — range-scoped pmap teardown plus shootdown,
+    ///   preserving recipes (next access refaults clean). Acquires an
+    ///   `ExclusiveWriter` reservation per VM_v1_2 §5.9. Returns
+    ///   `VmMapError::WouldBlock` on contention; callers should retry on
+    ///   the wait channel.
+    /// - `WillNeed`, `Normal`, `Random`, `Sequential` — observation-only
+    ///   no-ops per §9.7; readahead and layout hints are deferred.
     pub fn madvise(&self, range: UserRange, advice: MadviseAdvice) -> Result<(), VmMapError> {
-        let _ = (range, advice);
-        Ok(())
+        match advice {
+            MadviseAdvice::DontNeed | MadviseAdvice::Free => {
+                let _guard = self.acquire_writer(range)?;
+                self.pmap.teardown_range(range)?;
+                let guard = tx_substrate::epoch::guard();
+                self.stats.store(self.recipes.stats(&guard));
+                Ok(())
+            }
+            MadviseAdvice::Normal
+            | MadviseAdvice::Random
+            | MadviseAdvice::Sequential
+            | MadviseAdvice::WillNeed => Ok(()),
+        }
     }
 
     /// Synchronously flushes dirty pages of any File-backed `PageContainer`
