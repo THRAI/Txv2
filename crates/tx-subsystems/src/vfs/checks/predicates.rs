@@ -66,5 +66,5 @@ pub fn is_empty_directory<'g>(
     _dentry: &IdentRef<'g, DEntry>,
     _guard: &'g Guard<'_>,
 ) -> Result<bool, Errno> {
-    Err(Errno::NotImplemented)
+    Err(Errno::ENOSYS)
 }

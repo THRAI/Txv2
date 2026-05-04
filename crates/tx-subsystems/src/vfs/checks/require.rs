@@ -44,9 +44,9 @@ fn run_require<'g>(
         // RFX-VFS-P3-003: Replace with async IO dispatch once cold IO path
         // and dcache population are implemented.
         #[cfg(any(test, feature = "vfs-read-test-support"))]
-        DriverStep::NeedIO(_, _) => Err(Errno::NotImplemented),
+        DriverStep::NeedIO(_, _) => Err(Errno::ENOSYS),
         #[cfg(not(any(test, feature = "vfs-read-test-support")))]
-        DriverStep::NeedIO => Err(Errno::NotImplemented),
+        DriverStep::NeedIO => Err(Errno::ENOSYS),
     }
 }
 
@@ -61,7 +61,7 @@ pub fn require_entity<'g>(
         WalkWitness::Entity(e) => Ok(e),
         // Mode/witness invariant: driver only produces Entity witness for
         // Entity mode. Reaching here would be a driver bug.
-        _ => Err(Errno::Invalid),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -72,7 +72,7 @@ pub fn require_entity_unfollowed<'g>(
 ) -> Result<EntityAtPath<'g>, VfsError> {
     match run_require(path, ctx, guard, WalkMode::EntityUnfollowed)? {
         WalkWitness::EntityUnfollowed(e) => Ok(e),
-        _ => Err(Errno::Invalid),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -83,7 +83,7 @@ pub fn require_parent_and_name<'g>(
 ) -> Result<ParentAndName<'g>, VfsError> {
     match run_require(path, ctx, guard, WalkMode::ParentAndName)? {
         WalkWitness::ParentAndName(p) => Ok(p),
-        _ => Err(Errno::Invalid),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -94,7 +94,7 @@ pub fn require_parent_and_named_child<'g>(
 ) -> Result<ParentAndNamedChild<'g>, VfsError> {
     match run_require(path, ctx, guard, WalkMode::ParentAndNamedChild)? {
         WalkWitness::ParentAndNamedChild(p) => Ok(p),
-        _ => Err(Errno::Invalid),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -105,7 +105,7 @@ pub fn require_entity_or_parent_and_name<'g>(
 ) -> Result<EntityOrParentAndName<'g>, VfsError> {
     match run_require(path, ctx, guard, WalkMode::EntityOrParentAndName)? {
         WalkWitness::EntityOrParent(e) => Ok(e),
-        _ => Err(Errno::Invalid),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -116,7 +116,7 @@ pub fn require_mount_point<'g>(
 ) -> Result<MountPointAtPath<'g>, VfsError> {
     match run_require(path, ctx, guard, WalkMode::MountPoint)? {
         WalkWitness::MountPoint(m) => Ok(*m),
-        _ => Err(Errno::Invalid),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -127,7 +127,7 @@ pub fn require_real_path<'g>(
 ) -> Result<RealPath<'g>, VfsError> {
     // RFX-VFS-P3-005: Implement path reconstruction once DEntry carries a
     // parent pointer or trail-based reverse walk is available.
-    Err(Errno::NotImplemented)
+    Err(Errno::ENOSYS)
 }
 
 // ── Refinement wrappers ───────────────────────────────────────────────────────
@@ -139,7 +139,7 @@ pub fn require_directory<'g>(
 ) -> Result<DirectoryAtPath<'g>, VfsError> {
     let entity = require_entity(path, ctx, guard)?;
     if !predicates::is_directory(&entity.rnode) {
-        return Err(Errno::NotDirectory);
+        return Err(Errno::ENOTDIR);
     }
     Ok(DirectoryAtPath::new(entity))
 }
@@ -151,7 +151,7 @@ pub fn require_symlink_for_readlink<'g>(
 ) -> Result<SymlinkAtPath<'g>, VfsError> {
     let entity = require_entity_unfollowed(path, ctx, guard)?;
     if !predicates::is_symlink(&entity.rnode) {
-        return Err(Errno::Invalid);
+        return Err(Errno::EINVAL);
     }
     Ok(SymlinkAtPath::new(entity))
 }
@@ -163,7 +163,7 @@ pub fn require_unlinkable_non_dir_child<'g>(
 ) -> Result<UnlinkableNonDirChild<'g>, VfsError> {
     let child = require_parent_and_named_child(path, ctx, guard)?;
     if predicates::is_directory(child.child_rnode()) {
-        return Err(Errno::IsDirectory);
+        return Err(Errno::EISDIR);
     }
     Ok(UnlinkableNonDirChild::new(child))
 }
@@ -175,10 +175,10 @@ pub fn require_rmdirable_dir_child<'g>(
 ) -> Result<RmdirableDirChild<'g>, VfsError> {
     let child = require_parent_and_named_child(path, ctx, guard)?;
     if !predicates::is_directory(child.child_rnode()) {
-        return Err(Errno::NotDirectory);
+        return Err(Errno::ENOTDIR);
     }
     // RFX-VFS-P1-004: Directory emptiness requires backend/readdir IO.
-    Err(Errno::NotImplemented)
+    Err(Errno::ENOSYS)
 }
 
 #[cfg(test)]

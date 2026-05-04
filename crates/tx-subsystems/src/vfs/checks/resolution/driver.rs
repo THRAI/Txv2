@@ -99,7 +99,7 @@ pub(crate) fn apply_io_result<'t, 'g>(
                     resumed
                         .trail
                         .push(TrailEntry::DEntry(resumed.cursor))
-                        .map_err(|_| Errno::NameTooLong)?;
+                        .map_err(|_| Errno::ENAMETOOLONG)?;
                     resumed.cursor = (*existing).into_ident_ref();
                     Ok(resumed)
                 }
@@ -111,12 +111,12 @@ pub(crate) fn apply_io_result<'t, 'g>(
                     reservation.commit(child);
                     let installed = match parent_ref.children.lookup(name, guard) {
                         DEntryChildLookup::Found(installed) => (*installed).into_ident_ref(),
-                        DEntryChildLookup::Missing => return Err(Errno::Stale),
+                        DEntryChildLookup::Missing => return Err(Errno::ESTALE),
                     };
                     resumed
                         .trail
                         .push(TrailEntry::DEntry(resumed.cursor))
-                        .map_err(|_| Errno::NameTooLong)?;
+                        .map_err(|_| Errno::ENAMETOOLONG)?;
                     resumed.cursor = installed;
                     Ok(resumed)
                 }
@@ -128,9 +128,9 @@ pub(crate) fn apply_io_result<'t, 'g>(
 #[cfg(any(test, feature = "vfs-read-test-support"))]
 fn map_children_insert_error(err: crate::vfs::structure::DEntryChildrenInstallError) -> Errno {
     match err {
-        crate::vfs::structure::DEntryChildrenInstallError::AlreadyPresent => Errno::Busy,
-        crate::vfs::structure::DEntryChildrenInstallError::Full => Errno::Busy,
-        crate::vfs::structure::DEntryChildrenInstallError::Busy => Errno::Busy,
-        crate::vfs::structure::DEntryChildrenInstallError::Missing => Errno::Stale,
+        crate::vfs::structure::DEntryChildrenInstallError::AlreadyPresent => Errno::EBUSY,
+        crate::vfs::structure::DEntryChildrenInstallError::Full => Errno::EBUSY,
+        crate::vfs::structure::DEntryChildrenInstallError::Busy => Errno::EBUSY,
+        crate::vfs::structure::DEntryChildrenInstallError::Missing => Errno::ESTALE,
     }
 }

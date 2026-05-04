@@ -15,8 +15,8 @@ default = []
 vfs-read-test-support = []
 
 [dependencies]
+tx-hal = { path = "../tx-hal" }
 tx-substrate = { path = "../tx-substrate" }
 
 [dev-dependencies]
-tx-hal = { path = "../tx-hal" }
 tx-ext4-format = { path = "../tx-ext4-format" }

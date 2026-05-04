@@ -66,7 +66,7 @@ pub trait FsOps: Send + Sync + 'static {
         guard: &'g Guard<'g>,
     ) -> StepOutcome<RNodeBackingInit> {
         let _ = (fs_object_id, guard);
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn serialize_inode_meta<'g>(
