@@ -4,6 +4,16 @@
 
 ## Current Shape
 
+- 2026-05-04 Final ledger revised post-audit. The
+  `2026-05-04-vm-pagebacked-final-ledger.md` and the closure decision
+  note now reflect 20 plan steps complete (17 original + 3 audit
+  follow-ups), revised completion ~92% structure / ~88% behavior, and
+  fix the prior mis-classification of fork_aspace / exec_aspace as
+  Process-blocked. Both are landed VM-side primitives. Residual gaps
+  recorded as stylistic / optimization (StepOutcome return type, true
+  persistent BTree, hidden rewrite_range primitive) and out-of-scope
+  (concrete VFS backends, ThreadRuntime trap dispatch, PageBacked
+  PC-side wait channels).
 - 2026-05-04 VM doc-spelling polish + fork full-user serialization (plan-
   extension step vm-doc-polish-and-full-user-range). `RangeLock::acquire`
   and `acquire_pair` renamed to `acquire_step` / `acquire_pair_step` to

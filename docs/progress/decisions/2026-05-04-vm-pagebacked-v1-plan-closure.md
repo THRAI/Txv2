@@ -82,3 +82,36 @@
   Anon path today and the File-variant fault path needs a concrete
   backend before PC-side blocking is meaningfully exercised. Recorded
   as a follow-up in the final ledger.
+
+## Addendum: post-closure audit and follow-ups
+
+After the initial closure landed at `f8181c1`, a re-audit of VM_v1_2
+caught three gaps the plan and the initial ledger had missed:
+
+1. **§5.6 `fork_aspace` and §5.7 `exec_aspace`** were mis-classified
+   as Process-blocked. Both functions operate entirely on
+   `AddressSpace` primitives; the Process subsystem only orchestrates
+   *which* AddressSpace is bound to *which* threads. Both landed in
+   `a70f4a0` as plan-extension steps `fork-aspace` and `exec-aspace`.
+2. **§3.1 spelling**: `RangeLock::acquire` / `acquire_pair` did not
+   match the doc's `acquire_step` / `acquire_pair_step` names. Renamed
+   in `e8ed0a4` (mechanical, all callers updated).
+3. **§9.5 fork serialization**: fork did not acquire an
+   `ExclusiveWriter` on the full user range; it depended on the
+   Process subsystem to externally serialize parent VM activity. New
+   `UserRange::full_user_v1()` (a v1 conservative `[0, 1 << 38)`
+   range) plus an `acquire_step` call at the top of `fork_aspace`
+   close this gap, also in `e8ed0a4`. Sized for Sv39 / Sv48 user
+   halves; the per-platform user-VA cap is expected to replace this
+   constant when finalized.
+
+The audit also documented residual stylistic / optimization gaps that
+are semantically equivalent to the doc and not load-bearing for v1:
+`acquire_step` returning `AcquireResult` vs `StepOutcome<RangeGuard>`,
+the `AtomicPtr<BTreeMap>` recipe publication doing per-write tree
+clones (reads match the doc; writes don't), and the per-op recipe
+rewriters not exposing a unified `rewrite_range(range, list)`
+substrate primitive.
+
+Revised completion estimate after the audit follow-ups: **~92%
+structure / ~88% behavior** against VM_v1_2 / PAGE_BACKED_v1.
