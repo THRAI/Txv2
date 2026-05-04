@@ -4,6 +4,22 @@
 
 ## Current Shape
 
+- 2026-05-04 Midway checkpoint: 10 of 17
+  vm-pagebacked-v1-completion plan steps complete (~60% structure / ~55%
+  behavior against VM_v1_2 / PAGE_BACKED_v1). Catch-up note at
+  `docs/progress/research/2026-05-04-vm-pagebacked-midway-checkpoint.md`.
+  Remaining seven slices: `persistent-epoch-recipes` is a lock-free
+  architecture upgrade (correctness-equivalent to today; multi-session
+  rewrite warranting its own sub-plan); the four async script wrappers
+  (`mmap-script-async`, `munmap-mprotect-mremap-scripts`, `brk-script`,
+  `fault-script-async`) need a tx-reactor `WaitToken → Channel` resolver
+  plus `RangeLock` async-wait integration before they can honor
+  VM_v1_2 §3.6 cross-async-wait discipline; `reflink-cow-scaffold`
+  depends on `persistent-epoch-recipes`; `ledger-and-status-final` closes
+  the plan once those land. Recommended next moves: push branch, spawn a
+  focused resolver slice, then a dedicated `persistent-epoch-recipes`
+  slice. Verification for the checkpoint: `cargo xtask progress validate`
+  24 ok, `cargo xtask lint docs` ok.
 - 2026-05-04 Cross-variant copy_file_range slice landed (plan steps
   cross-variant-scripts and mock-fs-pagebacking). New
   `page_backed::step_copy_file_range(in_pc, in_offset, out_pc, out_offset,
