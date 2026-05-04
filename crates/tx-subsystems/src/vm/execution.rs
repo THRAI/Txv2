@@ -9,27 +9,26 @@ use alloc::vec::Vec;
 
 use tx_hal::PmapIf;
 
+use crate::execution::WaitToken;
 use crate::execution::{Guard, StepOutcome};
 use crate::page_backed::{step_fsync, PageContainerKind};
 use crate::vm::checks::{
     require_disjoint_remap, require_fault_publication, require_fault_recipe, require_map_admission,
 };
 use crate::vm::{
-    AcquirePairResult, AcquireResult, AddressSpace, LockMode, MapPlacement, PmapPublishOutcome,
-    Prot, RangeGuard, UserRange, VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization,
-    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget,
-    VmRemapOutcome, VmRemapRequest, WouldBlock,
+    AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard, UserRange,
+    VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization, VmFaultOutcome, VmMapCommit,
+    VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest,
 };
 
 impl AddressSpace {
     pub fn resolve_fault(&self, fault: VmFault) -> Result<VmFaultOutcome, VmFaultError> {
         let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
-        let _guard = match self
+        let StepOutcome::Done(_guard) = self
             .range_lock
             .acquire_step(page_range, LockMode::Materializer)
-        {
-            AcquireResult::Acquired(guard) => guard,
-            AcquireResult::WouldBlock(_) => return Err(VmFaultError::WouldBlock),
+        else {
+            return Err(VmFaultError::WouldBlock);
         };
 
         require_fault_recipe(self, fault)
@@ -40,12 +39,11 @@ impl AddressSpace {
         outcome: VmFaultOutcome,
         materialization: VmFaultMaterialization,
     ) -> Result<PmapPublishOutcome, VmFaultError> {
-        let _guard = match self
+        let StepOutcome::Done(_guard) = self
             .range_lock
             .acquire_step(outcome.page_range, LockMode::Materializer)
-        {
-            AcquireResult::Acquired(guard) => guard,
-            AcquireResult::WouldBlock(_) => return Err(VmFaultError::WouldBlock),
+        else {
+            return Err(VmFaultError::WouldBlock);
         };
 
         let _entry = require_fault_publication(self, &outcome, &materialization)?;
@@ -87,12 +85,11 @@ impl AddressSpace {
     /// retry is built in at the VM layer because the Process subsystem
     /// orchestrates fork above this function.
     pub fn fork_aspace<P: PmapIf>(parent: &AddressSpace) -> Result<AddressSpace, VmMapError> {
-        let _full_guard = match parent
+        let StepOutcome::Done(_full_guard) = parent
             .range_lock
             .acquire_step(UserRange::full_user_v1(), LockMode::ExclusiveWriter)
-        {
-            AcquireResult::Acquired(guard) => guard,
-            AcquireResult::WouldBlock(_) => return Err(VmMapError::WouldBlock),
+        else {
+            return Err(VmMapError::WouldBlock);
         };
 
         let parent_recipes = parent.recipes_snapshot();
@@ -160,15 +157,12 @@ impl AddressSpace {
                     .range_lock
                     .acquire_step(page_range, LockMode::Materializer)
                 {
-                    AcquireResult::Acquired(guard) => guard,
-                    AcquireResult::WouldBlock(blocked) => {
-                        let token = blocked.wait_token();
-                        drop(blocked);
-                        if let Some(future) = crate::wait_carrier::wait_on_token(token) {
-                            let _ = future.await;
-                        }
+                    StepOutcome::Done(guard) => guard,
+                    StepOutcome::Blocked(token) => {
+                        await_range_lock(token).await;
                         continue;
                     }
+                    _ => unreachable_acquire_step(),
                 };
                 require_fault_recipe(self, fault)?
             };
@@ -179,16 +173,13 @@ impl AddressSpace {
                 .range_lock
                 .acquire_step(outcome.page_range, LockMode::Materializer)
             {
-                AcquireResult::Acquired(guard) => guard,
-                AcquireResult::WouldBlock(blocked) => {
-                    let token = blocked.wait_token();
-                    drop(blocked);
+                StepOutcome::Done(guard) => guard,
+                StepOutcome::Blocked(token) => {
                     drop(materialization);
-                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
-                        let _ = future.await;
-                    }
+                    await_range_lock(token).await;
                     continue;
                 }
+                _ => unreachable_acquire_step(),
             };
             let _entry = require_fault_publication(self, &outcome, &materialization)?;
             return self
@@ -221,7 +212,7 @@ impl AddressSpace {
                 let commit = reservation.commit()?;
                 Ok(VmMapOutcome { range, commit })
             }
-            MapReserveResult::WouldBlock(_) => Err(VmMapError::WouldBlock),
+            MapReserveResult::Blocked(_) => Err(VmMapError::WouldBlock),
             MapReserveResult::Err(error) => Err(error),
         }
     }
@@ -248,12 +239,8 @@ impl AddressSpace {
                     let commit = reservation.commit()?;
                     return Ok(VmMapOutcome { range, commit });
                 }
-                MapReserveResult::WouldBlock(blocked) => {
-                    let token = blocked.wait_token();
-                    drop(blocked);
-                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
-                        let _ = future.await;
-                    }
+                MapReserveResult::Blocked(token) => {
+                    await_range_lock(token).await;
                     // continue loop to retry
                 }
                 MapReserveResult::Err(error) => return Err(error),
@@ -271,15 +258,12 @@ impl AddressSpace {
                 .range_lock
                 .acquire_step(range, LockMode::ExclusiveWriter)
             {
-                AcquireResult::Acquired(guard) => guard,
-                AcquireResult::WouldBlock(blocked) => {
-                    let token = blocked.wait_token();
-                    drop(blocked);
-                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
-                        let _ = future.await;
-                    }
+                StepOutcome::Done(guard) => guard,
+                StepOutcome::Blocked(token) => {
+                    await_range_lock(token).await;
                     continue;
                 }
+                _ => unreachable_acquire_step(),
             };
             let commit = self.recipes.unmap(range)?;
             self.pmap.teardown_range(range)?;
@@ -301,15 +285,12 @@ impl AddressSpace {
                 .range_lock
                 .acquire_step(range, LockMode::ExclusiveWriter)
             {
-                AcquireResult::Acquired(guard) => guard,
-                AcquireResult::WouldBlock(blocked) => {
-                    let token = blocked.wait_token();
-                    drop(blocked);
-                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
-                        let _ = future.await;
-                    }
+                StepOutcome::Done(guard) => guard,
+                StepOutcome::Blocked(token) => {
+                    await_range_lock(token).await;
                     continue;
                 }
+                _ => unreachable_acquire_step(),
             };
             let commit = self.recipes.protect(range, prot)?;
             self.pmap.teardown_range(range)?;
@@ -332,15 +313,12 @@ impl AddressSpace {
                 (request.old_range, LockMode::ExclusiveWriter),
                 (request.new_range, LockMode::ExclusiveWriter),
             ) {
-                AcquirePairResult::Acquired(pair) => pair,
-                AcquirePairResult::WouldBlock(blocked) => {
-                    let token = blocked.wait_token();
-                    drop(blocked);
-                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
-                        let _ = future.await;
-                    }
+                StepOutcome::Done(pair) => pair,
+                StepOutcome::Blocked(token) => {
+                    await_range_lock(token).await;
                     continue;
                 }
+                _ => unreachable_acquire_step(),
             };
             let commit = self
                 .recipes
@@ -413,8 +391,9 @@ impl AddressSpace {
             (request.old_range, LockMode::ExclusiveWriter),
             (request.new_range, LockMode::ExclusiveWriter),
         ) {
-            AcquirePairResult::Acquired(pair) => pair,
-            AcquirePairResult::WouldBlock(_) => return Err(VmMapError::WouldBlock),
+            StepOutcome::Done(pair) => pair,
+            StepOutcome::Blocked(_) => return Err(VmMapError::WouldBlock),
+            _ => unreachable_acquire_step(),
         };
         let commit = self
             .recipes
@@ -434,8 +413,9 @@ impl AddressSpace {
             .range_lock
             .acquire_step(entry.range, LockMode::ExclusiveWriter)
         {
-            AcquireResult::Acquired(guard) => guard,
-            AcquireResult::WouldBlock(blocked) => return MapReserveResult::WouldBlock(blocked),
+            StepOutcome::Done(guard) => guard,
+            StepOutcome::Blocked(token) => return MapReserveResult::Blocked(token),
+            _ => unreachable_acquire_step(),
         };
 
         if let Err(error) = require_map_admission(self, &entry, placement) {
@@ -473,8 +453,9 @@ impl AddressSpace {
             .range_lock
             .acquire_step(range, LockMode::ExclusiveWriter)
         {
-            AcquireResult::Acquired(guard) => Ok(guard),
-            AcquireResult::WouldBlock(_) => Err(VmMapError::WouldBlock),
+            StepOutcome::Done(guard) => Ok(guard),
+            StepOutcome::Blocked(_) => Err(VmMapError::WouldBlock),
+            _ => unreachable_acquire_step(),
         }
     }
 
@@ -496,7 +477,7 @@ impl AddressSpace {
 
 pub enum MapReserveResult<'a> {
     Reserved(MapReservation<'a>),
-    WouldBlock(WouldBlock<'a>),
+    Blocked(WaitToken),
     Err(VmMapError),
 }
 
@@ -504,7 +485,7 @@ impl core::fmt::Debug for MapReserveResult<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Reserved(_) => f.write_str("Reserved(..)"),
-            Self::WouldBlock(_) => f.write_str("WouldBlock(..)"),
+            Self::Blocked(token) => f.debug_tuple("Blocked").field(token).finish(),
             Self::Err(error) => f.debug_tuple("Err").field(error).finish(),
         }
     }
@@ -622,4 +603,26 @@ impl MapReservation<'_> {
     pub fn commit(self) -> Result<VmMapCommit, VmMapError> {
         self.aspace.commit_reserved_map(self.entry, self.placement)
     }
+}
+
+/// Await a `RangeLock` release after the canonical `acquire_step` returned
+/// `StepOutcome::Blocked(token)`. Resolved through the global wait-carrier
+/// registry; if the token's channel has been retired the await is a no-op
+/// and the caller's retry loop runs immediately.
+async fn await_range_lock(token: WaitToken) {
+    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
+        let _ = future.await;
+    }
+}
+
+/// `RangeLock::acquire_step{,_pair}` only ever produce `StepOutcome::Done`
+/// or `StepOutcome::Blocked`. Other variants are unreachable by
+/// construction; this helper centralises the panic message so the asserts
+/// stay terse at the call sites.
+#[inline(always)]
+fn unreachable_acquire_step() -> ! {
+    unreachable!(
+        "RangeLock::acquire_step / acquire_pair_step never produce \
+         Advanced / AdvancedThenBlocked / Err"
+    );
 }
