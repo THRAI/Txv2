@@ -4,6 +4,25 @@
 
 ## Current Shape
 
+- 2026-05-04 VM/PageBacked v1 completion plan closed. All 17 plan steps
+  (16 original + 1 plan-extension prerequisite) complete; plan status
+  flipped from active to complete. VM/PageBacked has moved from the
+  post-resync ~45% structure / ~30% behavior to roughly ~85% structure /
+  ~80% behavior against VM_v1_2 / PAGE_BACKED_v1. Final ledger:
+  `docs/progress/research/2026-05-04-vm-pagebacked-final-ledger.md`.
+  Closure decision:
+  `docs/progress/decisions/2026-05-04-vm-pagebacked-v1-plan-closure.md`.
+  Remaining 15-20% of contract surface is exactly what the active design
+  docs already mark deferred-by-v1 or what depends on a Process subsystem
+  that does not yet exist (fork_aspace, exec_aspace, trap page-fault
+  dispatch). Recommended next milestones: Process / ThreadRuntime
+  integration (unblocks fork/exec/trap dispatch), concrete VFS backends
+  (ext4 / devfs / bdev-fs replace the FsPageBacking mocks), per-
+  PageContainer wait channels so fault_script_async honors File-variant
+  PC-side blocking. Final verification: cargo fmt --check clean, vm 73
+  ok, page_backed 49 ok, lib 134 ok, substrate page_allocator 18 ok,
+  workspace clippy clean, cargo xtask lint arch/unused/docs ok, cargo
+  xtask progress validate 24 ok.
 - 2026-05-04 fault_script_async landed (plan step fault-script-async).
   Loops the three-step fault sequence: acquire Materializer + observe
   recipe + drop, materialize, re-acquire Materializer + publish.

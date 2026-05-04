@@ -2,7 +2,7 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-05-04-vm-pagebacked-v1-completion",
   "title": "VM/PageBacked v1 completion",
-  "status": "active",
+  "status": "complete",
   "created": "2026-05-04",
   "updated": "2026-05-04",
   "owner": "claude/objective-davinci-37d55d",
@@ -468,7 +468,7 @@
     {
       "id": "ledger-and-status-final",
       "title": "Final ledger + STATUS update; verify completion bar",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "user-buffer-byte-copy",
         "fault-script-async",
