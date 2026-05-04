@@ -152,7 +152,7 @@ impl AddressSpace {
     ///    materialization through the pmap. WouldBlock here drops the
     ///    materialization (releasing the MapPin) and retries from
     ///    step 1, re-observing the recipe afresh.
-    pub async fn fault_script_async(
+    pub async fn fault_script(
         &self,
         fault: VmFault,
     ) -> Result<PmapPublishOutcome, VmFaultError> {
@@ -207,7 +207,7 @@ impl AddressSpace {
         }
     }
 
-    pub fn map_script(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
+    pub fn try_mmap(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
         let (range, placement) = match request.target {
             VmMapTarget::Anywhere { window, page_count } => {
                 let range = self
@@ -229,11 +229,11 @@ impl AddressSpace {
         }
     }
 
-    /// Async wrapper around `map_script` that yields on `RangeLock`
+    /// Canonical async mmap script per VM_v1_2 §5.2. Yields on `RangeLock`
     /// `WouldBlock` and retries after a release wakes the lock's wait
     /// channel. Honors VM_v1_2 §3.6 cross-async-wait discipline by dropping
     /// every reservation and observation before each `.await`.
-    pub async fn map_script_async(
+    pub async fn mmap_script(
         &self,
         request: VmMapRequest,
     ) -> Result<VmMapOutcome, VmMapError> {
@@ -267,10 +267,11 @@ impl AddressSpace {
         }
     }
 
-    /// Async wrapper around `unmap` that yields on `RangeLock` `WouldBlock`
-    /// and retries after a release wakes the lock's wait channel. Honors
-    /// VM_v1_2 §3.6 by dropping the blocked guard before each `.await`.
-    pub async fn unmap_async(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
+    /// Canonical async munmap script per VM_v1_2 §5.3. Yields on `RangeLock`
+    /// `WouldBlock` and retries after a release wakes the lock's wait
+    /// channel. Honors VM_v1_2 §3.6 by dropping the blocked guard before
+    /// each `.await`.
+    pub async fn munmap_script(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
         loop {
             let _guard = match self
                 .range_lock
@@ -294,10 +295,9 @@ impl AddressSpace {
         }
     }
 
-    /// Async wrapper around `protect` that yields on `RangeLock`
-    /// `WouldBlock` and retries after a release wakes the lock's wait
-    /// channel.
-    pub async fn protect_async(
+    /// Canonical async mprotect script per VM_v1_2 §5.4. Yields on `RangeLock`
+    /// `WouldBlock` and retries after a release wakes the lock's wait channel.
+    pub async fn mprotect_script(
         &self,
         range: UserRange,
         prot: Prot,
@@ -325,10 +325,10 @@ impl AddressSpace {
         }
     }
 
-    /// Async wrapper around `remap_script` that yields on `RangeLock`
+    /// Canonical async mremap script per VM_v1_2 §5.5. Yields on `RangeLock`
     /// pair `WouldBlock` and retries after either covered range's release
     /// wakes the lock's wait channel.
-    pub async fn remap_async(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
+    pub async fn mremap_script(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
         require_disjoint_remap(request.old_range, request.new_range)?;
         loop {
             let _guard_pair = match self.range_lock.acquire_pair_step(
@@ -368,15 +368,15 @@ impl AddressSpace {
     ///
     /// - returns `Ok(current_brk)` when `requested_brk == current_brk`.
     /// - rejects with `InvalidRange` when `requested_brk < brk_base`.
-    /// - on grow, calls `map_script_async` to map the page-aligned range
+    /// - on grow, calls `mmap_script` to map the page-aligned range
     ///   `[current_brk, requested_brk)`.
-    /// - on shrink, calls `unmap_async` on `[requested_brk, current_brk)`.
+    /// - on shrink, calls `munmap_script` on `[requested_brk, current_brk)`.
     ///
     /// All three of `brk_base`, `current_brk`, and `requested_brk` must be
     /// page-aligned. Process-level tracking of the brk value (which hart
     /// holds it, exec-time base, fork inheritance) lives in the Process
     /// subsystem and is out of scope for VM.
-    pub async fn brk_script_async(
+    pub async fn brk_script(
         &self,
         brk_base: crate::vm::UserVirtAddr,
         current_brk: crate::vm::UserVirtAddr,
@@ -399,17 +399,17 @@ impl AddressSpace {
                 crate::vm::VmEntryFlags::PRIVATE,
                 VmBacking::PrivateAnon,
             );
-            self.map_script_async(request).await?;
+            self.mmap_script(request).await?;
         } else {
             let len = current_brk.0 - requested_brk.0;
             let range =
                 UserRange::new_aligned(requested_brk, len).map_err(|_| VmMapError::InvalidRange)?;
-            self.unmap_async(range).await?;
+            self.munmap_script(range).await?;
         }
         Ok(requested_brk)
     }
 
-    pub fn remap_script(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
+    pub fn try_mremap(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
         require_disjoint_remap(request.old_range, request.new_range)?;
 
         let _guard_pair = match self.range_lock.acquire_pair_step(
@@ -453,7 +453,7 @@ impl AddressSpace {
         })
     }
 
-    pub fn unmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
+    pub fn try_munmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
         let _guard = self.acquire_writer(range)?;
         let commit = self.recipes.unmap(range)?;
         self.pmap.teardown_range(range)?;
@@ -462,7 +462,7 @@ impl AddressSpace {
         Ok(commit)
     }
 
-    pub fn protect(&self, range: UserRange, prot: Prot) -> Result<VmMapCommit, VmMapError> {
+    pub fn try_mprotect(&self, range: UserRange, prot: Prot) -> Result<VmMapCommit, VmMapError> {
         let _guard = self.acquire_writer(range)?;
         let commit = self.recipes.protect(range, prot)?;
         self.pmap.teardown_range(range)?;
