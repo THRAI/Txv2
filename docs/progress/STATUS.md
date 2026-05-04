@@ -4,6 +4,13 @@
 
 ## Current Shape
 
+- 2026-05-04 VM/PageBacked v1 completion plan activated. Active roadmap is
+  `docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json` (17 steps),
+  bridging VM/PageBacked from ~45% structure / ~30% behavior toward ~85% on
+  both, leaving only items the active design docs explicitly defer or items
+  that depend on Process/ThreadRuntime ownership. Prior worktree
+  `2026-05-02-vm-pagebacked-impl` closed as merged (PR #14 on main); follow-on
+  work continues on this branch.
 - 2026-05-04 Claude harness parallel and main resync. `CLAUDE.md` symlinked to
   `AGENTS.md` and `.claude/settings.json` SessionStart hook wired to inject
   `AGENTS.md` as additionalContext at session start; misleading
