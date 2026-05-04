@@ -170,22 +170,29 @@
     {
       "id": "partial-page-byte-fidelity",
       "title": "Byte-accurate partial-page truncate and growth",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "user-buffer-byte-copy",
         "vm-fault-pc-size-checks",
         "pagebacked-fallocate"
       ],
       "paths": [
-        "crates/tx-kernel/src/page_backed.rs",
         "crates/tx-kernel/src/page_backed/lifecycle.rs",
         "crates/tx-kernel/src/page_backed/lifecycle_tests.rs",
-        "crates/tx-kernel/src/page_backed/size_tests.rs"
+        "crates/tx-kernel/src/page_backed/user_buffer_tests.rs"
       ],
       "verification": [
-        "cargo test -p tx-kernel page_backed -- --test-threads=1"
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
       ],
-      "notes": "PAGE_BACKED §5.1/5.2/5.3 partial-page byte handling. Zero past-EOF tail on truncate-grow inside last page; partial reads/writes at the EOF page; no full-page materialization for purely metadata growth."
+      "notes": "PAGE_BACKED §5.3 partial-page tail-zero on truncate-shrink. step_truncate now zeroes the cached partial-EOF page tail (bytes [new_size mod PAGE, PAGE_END)) after withdrawing higher pages, so a subsequent truncate-grow exposes zeros for the previously-stale region. Helper zero_partial_eof_tail uses the substrate FrameKernelAddr hook (already public from user-buffer-byte-copy slice) and is no-op when new_size is page-aligned, when the EOF page is not cached, or when the hook is missing. Read at EOF returns short count via step_read_to_user (already correct via len-clamp from user-buffer-byte-copy slice; not changed). Write at EOF grows pc.size_bytes via existing grow_size_to (also unchanged). Three tests: (1) shrink past mid-page zeroes the tail and preserves the head; (2) page-aligned shrink does not touch the surviving page; (3) end-to-end shrink-then-grow round-trip via step_read_to_user reads zeros for the post-EOF region. No full-page materialization for purely metadata growth was already the existing behavior of step_truncate-grow and step_fallocate."
     },
     {
       "id": "wait-aware-step-outcome",

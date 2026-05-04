@@ -220,6 +220,64 @@ fn pagebacked_step_read_to_user_grows_offset_only_after_copy_progress() {
 }
 
 #[test]
+fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed user-buffer test lock");
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        2,
+    );
+
+    let pattern: Vec<u8> = (0..(crate::vm::USER_PAGE_SIZE + 32))
+        .map(|i| ((i & 0xff) | 0x20) as u8)
+        .collect();
+    let mut writer = open_file_for_pc(&pc);
+    let outcome = step_write_from_user::<PassthroughHal>(
+        &pc,
+        &mut writer,
+        UserPtr::<u8>::new(pattern.as_ptr() as usize),
+        pattern.len(),
+        &guard,
+    );
+    assert_eq!(outcome, StepOutcome::Done(pattern.len()));
+
+    let shrink_size = crate::vm::USER_PAGE_SIZE as u64 + 4;
+    assert_eq!(
+        step_truncate(&pc, shrink_size, &guard),
+        StepOutcome::Done(())
+    );
+
+    let grow_size = crate::vm::USER_PAGE_SIZE as u64 + 32;
+    assert_eq!(step_truncate(&pc, grow_size, &guard), StepOutcome::Done(()));
+
+    let mut reader = open_file_for_pc(&pc);
+    reader.set_offset(crate::vm::USER_PAGE_SIZE as u64);
+    let mut received = vec![0xCCu8; 32];
+    let outcome = step_read_to_user::<PassthroughHal>(
+        &pc,
+        &mut reader,
+        UserPtr::<u8>::new(received.as_mut_ptr() as usize),
+        received.len(),
+        &guard,
+    );
+    assert_eq!(outcome, StepOutcome::Done(32));
+    assert_eq!(
+        &received[..4],
+        &pattern[crate::vm::USER_PAGE_SIZE..crate::vm::USER_PAGE_SIZE + 4]
+    );
+    assert!(
+        received[4..].iter().all(|b| *b == 0),
+        "post-EOF region must read as zeros after shrink-then-grow, got {:?}",
+        &received[4..]
+    );
+}
+
+#[test]
 fn pagebacked_step_write_from_user_propagates_efault_without_advance() {
     let _lock = EPOCH_TEST_LOCK
         .lock()

@@ -4,6 +4,22 @@
 
 ## Current Shape
 
+- 2026-05-04 Partial-page byte fidelity slice landed (plan step
+  partial-page-byte-fidelity). `step_truncate` now zeroes the cached
+  partial-EOF page tail (bytes `[new_size mod PAGE, PAGE_END)`) after
+  withdrawing higher pages, so a subsequent truncate-grow exposes zeros for
+  the previously-stale region. The new `zero_partial_eof_tail` helper uses
+  the substrate `FrameKernelAddr` hook and is no-op when `new_size` is
+  page-aligned, when the EOF page is not cached, or when the hook is
+  missing. Three tests added: shrink-past-mid-page zeros the tail and
+  preserves the head, page-aligned shrink does not touch the surviving
+  page, and end-to-end shrink-then-grow round-trip via `step_read_to_user`
+  reads zeros for the post-EOF region. Verification: `cargo fmt --check`
+  clean, `cargo test -p tx-kernel page_backed -- --test-threads=1`
+  (37 ok), `cargo test -p tx-kernel vm -- --test-threads=1` (60 ok),
+  `cargo test -p tx-kernel --lib -- --test-threads=1` (103 ok), workspace
+  clippy clean, `cargo xtask lint arch/unused/docs` ok, `cargo xtask
+  progress validate` 24 ok.
 - 2026-05-04 PageBacked fallocate slice landed (plan step
   pagebacked-fallocate). `FsPageBacking` gained a default-impl
   `fallocate(fs_object_id, new_size, guard)` so existing backings keep

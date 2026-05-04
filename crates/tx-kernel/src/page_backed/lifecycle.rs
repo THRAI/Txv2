@@ -78,12 +78,38 @@ pub fn step_truncate(pc: &PageContainer, new_size: u64, guard: &Guard<'_>) -> St
             return StepOutcome::Err(Errno::EINVAL);
         };
         pc.withdraw_cached_pages_from(first_drop);
+        zero_partial_eof_tail(pc, new_size);
     }
 
     if fs_advanced {
         StepOutcome::Advanced(())
     } else {
         StepOutcome::Done(())
+    }
+}
+
+/// Zero the bytes in the cached page containing the new EOF, from the
+/// in-page byte offset of `new_size` up to the page end. After
+/// truncate-shrink past a non-aligned size, the partial last page must not
+/// expose stale post-EOF bytes when later grown back into. No-op when
+/// `new_size` falls on a page boundary, when the EOF page is not currently
+/// cached, or when the substrate kernel-address hook is not installed.
+fn zero_partial_eof_tail(pc: &PageContainer, new_size: u64) {
+    let page_size = crate::vm::USER_PAGE_SIZE as u64;
+    let within_page = (new_size % page_size) as usize;
+    if within_page == 0 || new_size == 0 {
+        return;
+    }
+    let page_index = PageIndex::new(new_size / page_size);
+    let Some(ppn) = pc.lookup(page_index) else {
+        return;
+    };
+    let Ok(frame_base) = page_allocator::frame_kernel_addr(ppn) else {
+        return;
+    };
+    let tail_len = (page_size as usize) - within_page;
+    unsafe {
+        core::ptr::write_bytes(frame_base.add(within_page), 0, tail_len);
     }
 }
 
