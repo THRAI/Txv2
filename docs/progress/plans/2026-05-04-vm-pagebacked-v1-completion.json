@@ -233,21 +233,31 @@
     {
       "id": "fault-script-async",
       "title": "Wrap resolve_fault as async fault_script with reservation drop on wait",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "wait-aware-step-outcome",
+        "waittoken-channel-resolver",
         "user-buffer-byte-copy",
-        "vm-fault-pc-size-checks"
+        "vm-fault-pc-size-checks",
+        "mmap-script-async"
       ],
       "paths": [
         "crates/tx-kernel/src/vm/execution.rs",
-        "crates/tx-kernel/src/vm/structure/range_lock.rs",
-        "crates/tx-kernel/src/vm/tests/fault_materialization.rs"
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
       ],
       "verification": [
-        "cargo test -p tx-kernel vm -- --test-threads=1"
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
       ],
-      "notes": "VM §5.1 + §3.6 cross-async-wait discipline. Drop the Materializer reservation across PageBacked wait, re-acquire on resume, revalidate recipe before publication. Synchronous resolve_fault stays as the inner step."
+      "notes": "VM_v1_2 §5.1 + §3.6 cross-async-wait discipline. AddressSpace::fault_script_async loops the three-step fault sequence: (1) acquire Materializer + observe recipe, drop reservation; (2) materialize_pagebacked (synchronous, errors propagate); (3) re-acquire Materializer + publish_fault_materialization. WouldBlock at step 1 or step 3 drops the relevant guard (and any held materialization), awaits wait_carrier::wait_on_token on the RangeLock's release token, and retries from step 1 with a fresh recipe observation. Inner sync helpers (resolve_fault, publish_fault_materialization, materialize_pagebacked) stay as the compatibility surface. Two new tests cover uncontended-one-poll-success and writer-conflict-yields-and-completes-after-release. PC-side blocking on File-variant materialize_page (FsPageBacking fetch/flush) is not yet routed through this script — that remains a follow-up requiring per-PageContainer wait channels analogous to the RangeLock channel; for v1 the script handles only the RangeLock-side blocking signal."
     },
     {
       "id": "mmap-script-async",

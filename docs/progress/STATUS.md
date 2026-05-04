@@ -4,6 +4,21 @@
 
 ## Current Shape
 
+- 2026-05-04 fault_script_async landed (plan step fault-script-async).
+  Loops the three-step fault sequence: acquire Materializer + observe
+  recipe + drop, materialize, re-acquire Materializer + publish.
+  RangeLock WouldBlock at step 1 or step 3 drops the guard (and any held
+  materialization), awaits `wait_carrier::wait_on_token`, retries from
+  step 1 with fresh recipe observation. Inner sync helpers preserved.
+  PC-side blocking on File-variant `materialize_page` (FsPageBacking
+  fetch/flush) is not yet routed through this script — that remains a
+  follow-up requiring per-PageContainer wait channels analogous to the
+  RangeLock channel. Two new tests in `vm/tests/script_async.rs` cover
+  uncontended-one-poll-success and writer-conflict-yields-and-completes-
+  after-release. Verification: `cargo fmt --check` clean, vm 73 ok (was
+  71, +2), page_backed 49 ok, lib 134 ok, workspace clippy clean,
+  `cargo xtask lint arch/unused/docs` ok, `cargo xtask progress
+  validate` 24 ok.
 - 2026-05-04 brk_script_async landed (plan step brk-script). Models the
   program break as an Anon PrivateAnon mapping covering
   `[brk_base, current_brk)`. Grow calls `map_script_async` on the new
