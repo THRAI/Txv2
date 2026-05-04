@@ -12,6 +12,7 @@ pub mod page_backed;
 pub mod trap;
 pub mod vfs;
 pub mod vm;
+pub mod wait_carrier;
 
 mod sync;
 #[cfg(test)]

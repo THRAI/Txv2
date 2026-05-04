@@ -4,6 +4,21 @@
 
 ## Current Shape
 
+- 2026-05-04 WaitToken → Channel resolver landed (plan-extension step
+  waittoken-channel-resolver, prerequisite for the four async script
+  wrappers). New `tx_kernel::wait_carrier` module holds a
+  `SpinMutex<BTreeMap<u64, tx_reactor::wait::Channel>>` registry plus an
+  `AtomicU64` carrier id allocator. `register_wait_channel(channel)`,
+  `release_wait_channel(id)`, `lookup_wait_channel(id)`, and
+  `wait_on_token(token)` round-trip a `WaitToken` whose carrier is a
+  registered id into a `WaitFuture`. Test placeholder tokens (e.g.
+  `BlockingFs`/`LifecycleFs` returning `WaitToken::new(13, 0x55)`)
+  unregistered carriers return `None` from `wait_on_token` rather than
+  panicking, so existing test mocks keep working. Six tests cover the
+  register/lookup/release shape and the placeholder-token case.
+  Verification: `cargo fmt --check` clean, page_backed 49 ok, vm 60 ok,
+  lib 121 ok (was 115, +6), workspace clippy clean, `cargo xtask lint
+  arch/unused/docs` ok, `cargo xtask progress validate` 24 ok.
 - 2026-05-04 Reflink + CoW-on-write scaffolding landed (plan step
   reflink-cow-scaffold). New `page_backed::install_shared_page(pc, page,
   source_ppn)` and `page_backed::cow_replace_into_private(pc, page)` in a
