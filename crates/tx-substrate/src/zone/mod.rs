@@ -226,4 +226,17 @@ pub mod testing {
     pub fn init_for_test(page_size: usize, direct_map_base: usize) -> Result<(), super::ZoneError> {
         super::runtime::init_for_test(page_size, direct_map_base)
     }
+
+    /// Return a `Cap` pointing at the reserved (not yet live) slot.
+    ///
+    /// # Safety
+    ///
+    /// The returned `Cap` must not be dereferenced until after `sign_for` completes
+    /// for this reservation. Use only to break mutual-reference cycles during test
+    /// fixture construction where neither side will be accessed before both are live.
+    pub unsafe fn peek_reservation_cap<T: super::ZoneAllocated>(
+        res: &super::ZoneReservation<T>,
+    ) -> super::Cap<T> {
+        unsafe { super::cap::Cap::from_slot(res.slot) }
+    }
 }

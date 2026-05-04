@@ -275,6 +275,8 @@ version = "0.1.0"
 dependencies = [
  "tokio",
  "tx-ext4-format",
+ "tx-substrate",
+ "tx-subsystems",
 ]
 
 [[package]]
@@ -387,6 +389,11 @@ dependencies = [
 [[package]]
 name = "tx-subsystems"
 version = "0.1.0"
+dependencies = [
+ "tx-ext4-format",
+ "tx-hal",
+ "tx-substrate",
+]
 
 [[package]]
 name = "typed-arena"
