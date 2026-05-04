@@ -78,6 +78,44 @@ impl AddressSpace {
         }
     }
 
+    /// Async wrapper around `map_script` that yields on `RangeLock`
+    /// `WouldBlock` and retries after a release wakes the lock's wait
+    /// channel. Honors VM_v1_2 §3.6 cross-async-wait discipline by dropping
+    /// every reservation and observation before each `.await`.
+    pub async fn map_script_async(
+        &self,
+        request: VmMapRequest,
+    ) -> Result<VmMapOutcome, VmMapError> {
+        loop {
+            let (range, placement) = match request.target {
+                VmMapTarget::Anywhere { window, page_count } => {
+                    let range = self
+                        .find_free_range(window, page_count)
+                        .ok_or(VmMapError::NoFreeRange)?;
+                    (range, MapPlacement::RequireFree)
+                }
+                VmMapTarget::Fixed { range, placement } => (range, placement),
+            };
+            let entry = VmEntry::new(range, request.prot, request.flags, request.backing.clone());
+
+            match self.reserve_map(entry, placement) {
+                MapReserveResult::Reserved(reservation) => {
+                    let commit = reservation.commit()?;
+                    return Ok(VmMapOutcome { range, commit });
+                }
+                MapReserveResult::WouldBlock(blocked) => {
+                    let token = blocked.wait_token();
+                    drop(blocked);
+                    if let Some(future) = crate::wait_carrier::wait_on_token(token) {
+                        let _ = future.await;
+                    }
+                    // continue loop to retry
+                }
+                MapReserveResult::Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub fn remap_script(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
         require_disjoint_remap(request.old_range, request.new_range)?;
 

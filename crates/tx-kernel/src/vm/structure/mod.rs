@@ -13,7 +13,7 @@ mod types;
 pub use address_space::AddressSpace;
 pub use range_lock::{
     AcquirePairResult, AcquireResult, LockMode, PendingWriter, RangeGuard, RangeGuardPair,
-    RangeLock, WouldBlock,
+    RangeLock, WouldBlock, RANGE_LOCK_RELEASE_MASK,
 };
 pub use types::{
     AccessMode, AddressSpaceStats, MapPlacement, Prot, UserPage, UserPageIter, UserRange,

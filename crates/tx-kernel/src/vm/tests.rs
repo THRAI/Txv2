@@ -10,6 +10,7 @@ use tx_hal::{
 mod execution_scripts;
 mod fault_materialization;
 mod observation;
+mod script_async;
 
 static COUNTING_PMAP_TEST_LOCK: Mutex<()> = Mutex::new(());
 static COUNTING_PMAP_STATE: LazyLock<Mutex<CountingPmapState>> =
