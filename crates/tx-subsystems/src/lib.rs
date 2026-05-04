@@ -8,6 +8,8 @@ pub mod device;
 pub mod execution;
 pub mod mount;
 pub mod page_backed;
+pub mod process;
+pub mod thread_runtime;
 pub mod tty;
 pub mod vfs;
 pub mod vm;
@@ -15,9 +17,6 @@ pub mod wait_carrier;
 pub mod zones;
 
 mod sync;
-
-pub mod process {}
-pub mod thread_runtime {}
 
 #[cfg(test)]
 pub(crate) mod test_support {

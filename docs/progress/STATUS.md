@@ -1,9 +1,29 @@
 # txKernel Status
 
-**Updated:** 2026-05-04
+**Updated:** 2026-05-05
 
 ## Current Shape
 
+- 2026-05-05 Process / Thread topology pass started on branch
+  `process-topology`. Lands the entity graph for the upcoming β bundle
+  without signal state, credentials, rlimits, or fd-table coupling —
+  topology first, signals second so the entity shapes do not have to
+  compromise for signal semantics later. Four new zone-allocated
+  entities: `ProcessIdentity` ↔ `ProcessPayload` (identity-payload
+  split, zombies retain identity), `ThreadIdentity` ↔ `ThreadPayload`
+  (same), `ProcessGroup`, `Session`. Step set: `bootstrap_init_process`,
+  `step_fork` (clones aspace via `AddressSpace::fork_aspace`, creates
+  leader thread, inherits parent pgrp), `step_exit_group`,
+  `step_thread_exit` (last-thread zombifies parent), `step_setpgid`
+  (day-1 only supports `pgid == target.pid`; existing-group join is a
+  follow-up), `step_setsid`. 18 topology tests pass; full
+  `cargo xtask ci` green (11/11 gates). `tx-subsystems::lib.rs` empty
+  stubs `pub mod process {}` / `pub mod thread_runtime {}` removed.
+  Reactor `TaskKey` slot on `ThreadPayload` is `None` until β4 wires
+  the runtime; signal mask / summary / pending queues land in the
+  signal pass. TTY `session_pgrp` triplet still holds raw IDs — typed
+  `Weak<Session>` / `Weak<ProcessGroup>` rebinding is a small follow-up
+  before β3.
 - 2026-05-04 VM compliance fixup landed on branch `vm-compliance-fixup`.
   Closes the drift items identified in the post-merge VM audit against
   `VM_v1_2.md`: (1) renamed VM scripts to spec names — `mmap_script` /
