@@ -4,6 +4,45 @@
 
 ## Current Shape
 
+- 2026-05-04 VFS spec-reconciliation Phases 1-4 complete on branch
+  `vfs-spec-reconciliation`. The four-phase plan that started after
+  the deferred-move investigation is now fully landed: Phase 1 brought
+  `tx-kernel/src/vfs.rs` into doc-canonical shape (full POSIX
+  `InodeMeta`, opaque `[u8; 16]` `DirCursor`, `Timespec`, `MountOutput`,
+  four-module `vfs/{structure,checks,execution}/` layout); Phase 2
+  brought the tx-subsystems skeleton into spec (POSIX `Errno`
+  spelling, substrate-owned PPN-handle `Frame`); Phase 3 ported
+  tx-ext4 onto the canonical surface (rewrote `pager::fetch_page` to
+  allocate via `page_allocator::reserve_frame` + permanent-frame token,
+  copy bytes through the test direct-map; deleted the byte-buffer-
+  Frame-dependent `vfs_full_read` and `kernel_read_backend` test
+  files); Phase 4 deleted the now-redundant skeleton and `git mv`-ed
+  the working subsystems from tx-kernel to tx-subsystems. tx-kernel
+  collapsed to `init.rs + trap.rs + lib.rs`. Verification: workspace
+  builds clean, 522 tests pass with `--test-threads=1`,
+  `cargo xtask lint arch/unused/docs` ok, `cargo xtask progress
+  validate` 24 records ok. The vm/tty move blocker recorded in
+  `2026-05-04-vm-tty-subsystems-move-deferred.md` is resolved.
+- 2026-05-04 VFS spec-reconciliation Phase 1 complete on branch
+  `vfs-spec-reconciliation`. Brings `tx-kernel/src/vfs.rs` into
+  doc-canonical shape per `TX_EXT4_PLAN_v1_2.md`,
+  `bringup_fs_specs_v_1`, and `SUBSYSTEM_ANATOMY_v2_1.md`. Five sub-
+  steps landed: (1) `InodeMeta` extended to full POSIX layout with
+  `atime/mtime/ctime: Timespec`, `nlinks/blocks/flags`; doc-absent
+  `kind`/`rdev` removed; (2) `DirCursor` reshaped from `u64` to
+  opaque `[u8; 16]` per spec, with `from_u64`/`as_u64` helpers for the
+  common case; (3) `MountOutput` type added; (4) workspace cascade
+  verified — TTY, Mount, page_backed adapt cleanly; (5) flat 753-line
+  `vfs.rs` decomposed into the four-module layout `vfs/{mod,structure,
+  checks,execution,tests}.rs`. Verification: cargo fmt clean, all 183
+  tx-kernel tests pass with `--test-threads=1`, workspace test gates
+  green (215 tests total across crates), `cargo clippy -p tx-kernel
+  -- -D warnings` clean, `cargo xtask lint arch/unused/docs` ok,
+  `cargo xtask progress validate` 24 records ok. Reconciles five drift
+  axes flagged in the deferred-move decision note. Next: Phase 2
+  (skeleton in tx-subsystems → spec — `Frame` PPN model, `Errno`
+  POSIX spelling), Phase 3 (tx-ext4 to consume canonical surface),
+  Phase 4 (delete skeleton + move vm/tty into tx-subsystems).
 - 2026-05-04 Final ledger revised post-audit. The
   `2026-05-04-vm-pagebacked-final-ledger.md` and the closure decision
   note now reflect 20 plan steps complete (17 original + 3 audit
