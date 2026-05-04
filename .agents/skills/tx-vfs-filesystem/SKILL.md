@@ -42,6 +42,11 @@ spellings.
 
 - First produce or read an interface-readiness note naming canonical type/trait
   spellings and lane boundaries.
+- Before planning or implementing any new VFS/filesystem type, enum variant,
+  trait method, struct field, or module path, write a Canonical Gate table.
+  Each proposed item must cite an active `docs/design/` source, an existing
+  code path, or an explicit current user instruction. If no source exists,
+  mark it "needs design update" and do not implement it in that phase.
 - Split future workers by owner: VFS walker/RNode, Mount, PageBacked, bdev-fs,
   devfs/device, kernel-facing ext4, and ext4 host-format.
 - Do not let two workers edit shared traits or `docs/progress/STATUS.md`.

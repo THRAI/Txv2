@@ -7,6 +7,9 @@ repository.workspace = true
 
 [dependencies]
 tx-ext4-format = { path = "../tx-ext4-format" }
+tx-substrate = { path = "../tx-substrate" }
+tx-subsystems = { path = "../tx-subsystems" }
 
 [dev-dependencies]
+tx-subsystems = { path = "../tx-subsystems", features = ["vfs-read-test-support"] }
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
