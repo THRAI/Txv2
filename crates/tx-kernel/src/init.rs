@@ -286,7 +286,7 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn run_zone_smoke() {
-        crate::zones::run_smoke::<P>().expect("tx_kernel zone smoke failed");
+        tx_subsystems::zones::run_smoke::<P>().expect("tx_kernel zone smoke failed");
     }
 
     fn run_bsp_reactor_runtime_smoke() {

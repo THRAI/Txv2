@@ -18,7 +18,7 @@ unsafe impl ZoneAllocated for ZoneSmokeObj {
     }
 }
 
-pub(crate) fn register_all() -> Result<(), ZoneError> {
+pub fn register_all() -> Result<(), ZoneError> {
     smoke::register_zones()?;
     process::register_zones()?;
     thread::register_zones()?;
@@ -30,7 +30,7 @@ pub(crate) fn register_all() -> Result<(), ZoneError> {
     Ok(())
 }
 
-pub(crate) fn run_smoke<P: TxPlatform>() -> Result<(), ZoneError> {
+pub fn run_smoke<P: TxPlatform>() -> Result<(), ZoneError> {
     register_all()?;
 
     let reservation = zone::reserve_for::<ZoneSmokeObj>()?;
