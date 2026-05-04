@@ -1,9 +1,23 @@
 # txKernel Status
 
-**Updated:** 2026-05-03
+**Updated:** 2026-05-04
 
 ## Current Shape
 
+- 2026-05-04 TTY progress memory now has a durable status note at
+  `docs/progress/research/2026-05-04-tty-implementation-status.md`, and
+  `.agents/skills/tx-tty-subsystem/SKILL.md` now points future work at the
+  canonical TTY docs, current code map, and known staging seams. This records
+  that the tty-only implementation slice is present under
+  `crates/tx-kernel/src/tty/`, while final Process/Signal/VFS convergence still
+  needs follow-up replacements for staged session/pgrp ids, signal delivery
+  wiring, termios publication shape, and full controlling-tty lifecycle hooks.
+  Verification for the code slice referenced by the note had already covered
+  `cargo test -p tx-kernel tty -- --test-threads=1`, `cargo test -p tx-kernel
+  --lib -- --test-threads=1`, `cargo fmt --check`, `git diff --check`, and the
+  user's RV64 boot smoke. Next step: when Process, Signal, or VFS work reaches
+  tty integration, start from the new skill and progress note before widening
+  TTY changes; no blocker.
 - 2026-05-03 PR #14 CI check fix cleared the GitHub `check` failures after
   inspecting Actions logs. The patch removes clippy warnings from the
   VM/PageBacked/VFS interface lane by eliding needless guard lifetimes,
