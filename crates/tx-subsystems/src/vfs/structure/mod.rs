@@ -484,6 +484,10 @@ mod tests {
         tx_substrate::testing::init_host_for_test_once();
         let _ = zone::register_zone_for::<RNode>();
         let _ = zone::register_zone_for::<DEntry>();
+        let _ = zone::register_zone_for::<OpenFile>();
+        let _ = zone::register_zone_for::<crate::mount::structure::MountIdentity>();
+        let _ = zone::register_zone_for::<crate::mount::structure::MountNamespace>();
+        let _ = zone::register_zone_for::<crate::mount::structure::MountPayload>();
     }
 
     fn make_rnode_for_test(key: u64, mode: u16) -> Cap<RNode> {

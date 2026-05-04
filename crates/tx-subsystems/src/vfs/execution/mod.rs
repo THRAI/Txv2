@@ -1062,6 +1062,7 @@ pub mod read_harness {
         tx_substrate::testing::init_host_for_test_once();
         let _ = tx_substrate::zone::register_zone_for::<crate::vfs::structure::RNode>();
         let _ = tx_substrate::zone::register_zone_for::<crate::vfs::structure::DEntry>();
+        let _ = tx_substrate::zone::register_zone_for::<crate::vfs::structure::OpenFile>();
         let _ = tx_substrate::zone::register_zone_for::<crate::mount::structure::MountIdentity>();
         let _ = tx_substrate::zone::register_zone_for::<crate::mount::structure::MountNamespace>();
         let _ = tx_substrate::zone::register_zone_for::<crate::mount::structure::MountPayload>();
