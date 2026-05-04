@@ -504,6 +504,82 @@ fn pagebacked_step_fsync_is_noop_for_anon_and_device() {
 }
 
 #[test]
+fn pagebacked_step_truncate_zeros_partial_eof_tail_in_cached_page() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        4,
+    );
+    for page in 0..4 {
+        pc.state
+            .lock()
+            .pages
+            .install_if_absent(PageIndex::new(page), cached_frame_for_test())
+            .expect("seed page");
+    }
+    let ppn_page1 = pc.lookup(PageIndex::new(1)).expect("page 1 cached");
+
+    let pattern: alloc::vec::Vec<u8> = (0..crate::vm::USER_PAGE_SIZE)
+        .map(|i| ((i & 0xff) | 0x40) as u8)
+        .collect();
+    tx_substrate::page_allocator::testing::write_frame_bytes_for_test(ppn_page1, 0, &pattern);
+
+    let new_size = crate::vm::USER_PAGE_SIZE as u64 + 4;
+    assert_eq!(step_truncate(&pc, new_size, &guard), StepOutcome::Done(()));
+
+    let mut head = [0u8; 4];
+    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(ppn_page1, 0, &mut head);
+    assert_eq!(&head, &pattern[..4]);
+
+    let mut tail = alloc::vec![0xCCu8; crate::vm::USER_PAGE_SIZE - 4];
+    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(ppn_page1, 4, &mut tail);
+    assert!(
+        tail.iter().all(|b| *b == 0),
+        "tail bytes must be zeroed after truncate-shrink past mid-page"
+    );
+}
+
+#[test]
+fn pagebacked_step_truncate_does_not_touch_surviving_pages_at_page_aligned_shrink() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        4,
+    );
+    for page in 0..4 {
+        pc.state
+            .lock()
+            .pages
+            .install_if_absent(PageIndex::new(page), cached_frame_for_test())
+            .expect("seed page");
+    }
+    let ppn_page0 = pc.lookup(PageIndex::new(0)).expect("page 0 cached");
+    let pattern = alloc::vec![0xAFu8; crate::vm::USER_PAGE_SIZE];
+    tx_substrate::page_allocator::testing::write_frame_bytes_for_test(ppn_page0, 0, &pattern);
+
+    assert_eq!(
+        step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
+        StepOutcome::Done(())
+    );
+
+    let mut readback = alloc::vec![0u8; crate::vm::USER_PAGE_SIZE];
+    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(ppn_page0, 0, &mut readback);
+    assert_eq!(readback, pattern);
+}
+
+#[test]
 fn pagebacked_step_fallocate_grows_anon_visible_size_without_materializing_pages() {
     let _lock = EPOCH_TEST_LOCK
         .lock()
