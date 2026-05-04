@@ -8,8 +8,8 @@ use tx_hal::{
 };
 
 use crate::page_allocator::{
-    claim_permanent_frame, claim_zero_frame, install_bitmap_allocator, AllocError,
-    BitmapPageAllocator, FrameMeta,
+    claim_permanent_frame, claim_zero_frame, install_bitmap_allocator, install_frame_copier,
+    install_frame_kernel_addr, AllocError, BitmapPageAllocator, FrameMeta,
 };
 
 pub const PAGE_SIZE_4K: usize = 4096;
@@ -586,7 +586,9 @@ unsafe fn install_allocator_from_plan<P: TxPlatform>(
             }
         }
 
-        install_bitmap_allocator(allocator)
+        install_bitmap_allocator(allocator)?;
+        install_frame_copier(copy_frame_direct_map::<P>)?;
+        install_frame_kernel_addr(frame_kernel_addr_direct_map::<P>)
     }
 }
 
@@ -604,6 +606,32 @@ unsafe fn zero_frame_direct_map<P: TxPlatform>(ppn: Ppn) {
     unsafe {
         core::ptr::write_bytes(direct_map_ptr::<P, u8>(PhysAddr(phys)), 0, P::PAGE_SIZE);
     }
+}
+
+unsafe fn copy_frame_direct_map<P: TxPlatform>(source: Ppn, dest: Ppn) {
+    let source_phys = source
+        .0
+        .checked_mul(P::PAGE_SIZE)
+        .expect("source PPN physical address overflow");
+    let dest_phys = dest
+        .0
+        .checked_mul(P::PAGE_SIZE)
+        .expect("dest PPN physical address overflow");
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            direct_map_ptr::<P, u8>(PhysAddr(source_phys)),
+            direct_map_ptr::<P, u8>(PhysAddr(dest_phys)),
+            P::PAGE_SIZE,
+        );
+    }
+}
+
+unsafe fn frame_kernel_addr_direct_map<P: TxPlatform>(ppn: Ppn) -> *mut u8 {
+    let phys = ppn
+        .0
+        .checked_mul(P::PAGE_SIZE)
+        .expect("PPN physical address overflow");
+    direct_map_ptr::<P, u8>(PhysAddr(phys))
 }
 
 fn direct_map_ptr<P: TxPlatform, T>(phys: PhysAddr) -> *mut T {

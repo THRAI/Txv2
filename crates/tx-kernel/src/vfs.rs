@@ -405,6 +405,10 @@ impl OpenFile {
         self.offset
     }
 
+    pub fn set_offset(&mut self, offset: u64) {
+        self.offset = offset;
+    }
+
     pub const fn flags(&self) -> OpenFileFlags {
         self.flags
     }

@@ -71,6 +71,10 @@ pub enum AllocError {
     AlreadyInstalled,
     /// `ZeroPolicy::Zeroed` was requested before a direct-map scrubber existed.
     ZeroScrubUnavailable,
+    /// Frame content copy was requested before a direct-map copy hook existed.
+    FrameCopyUnavailable,
+    /// Frame kernel address lookup was requested before a direct-map hook existed.
+    FrameKernelAddrUnavailable,
     /// A caller tried to claim a reserved frame through the normal path.
     ReservedFrame,
     /// A packed `FrameMeta` counter would overflow.
@@ -98,6 +102,30 @@ pub enum ZeroPolicy {
 /// range represented by this allocator. It must zero exactly the frame
 /// addressed by the `Ppn` and must not rely on allocator-owned Rust aliases.
 pub type FrameZeroer = unsafe fn(Ppn);
+
+/// Direct-map frame copy hook used for CoW and staged PageBacked byte movement.
+///
+/// # Safety
+///
+/// The function must be installed only after the direct map covers both frames.
+/// It must copy exactly one page from `source` to `dest` and must tolerate no
+/// allocator-owned Rust aliases.
+pub type FrameCopier = unsafe fn(source: Ppn, dest: Ppn);
+
+/// Direct-map kernel-address lookup hook used by PageBacked user-buffer copy.
+///
+/// Returns the kernel virtual address of the start of the frame addressed by
+/// `ppn`. Callers who need a pointer at a non-zero offset within the frame add
+/// the offset themselves.
+///
+/// # Safety
+///
+/// The function must be installed only after the direct map covers the frame
+/// range represented by this allocator. The returned pointer is read/write for
+/// `PAGE_SIZE` bytes for as long as the frame remains live; callers are
+/// responsible for respecting cache and aliasing rules and must not retain the
+/// pointer past the frame's lifetime.
+pub type FrameKernelAddr = unsafe fn(ppn: Ppn) -> *mut u8;
 
 /// Non-dynamic page allocator backend interface.
 ///
@@ -189,6 +217,10 @@ pub trait PageAllocator: Sized {
 
 static INSTALLED_BITMAP_ALLOCATOR: AtomicPtr<BitmapPageAllocator<'static>> =
     AtomicPtr::new(ptr::null_mut());
+const NO_FRAME_COPIER: usize = 0;
+static FRAME_COPIER: AtomicUsize = AtomicUsize::new(NO_FRAME_COPIER);
+const NO_FRAME_KERNEL_ADDR: usize = 0;
+static FRAME_KERNEL_ADDR: AtomicUsize = AtomicUsize::new(NO_FRAME_KERNEL_ADDR);
 const NO_ZERO_FRAME: usize = usize::MAX;
 static ZERO_FRAME_PPN: AtomicUsize = AtomicUsize::new(NO_ZERO_FRAME);
 
@@ -203,6 +235,32 @@ pub fn install_bitmap_allocator(
         .compare_exchange(
             ptr::null_mut(),
             allocator as *const BitmapPageAllocator<'static> as *mut BitmapPageAllocator<'static>,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|_| AllocError::AlreadyInstalled)
+}
+
+/// Install the frame-copy hook used by page-backed CoW and future byte-copy paths.
+pub fn install_frame_copier(copier: FrameCopier) -> Result<(), AllocError> {
+    FRAME_COPIER
+        .compare_exchange(
+            NO_FRAME_COPIER,
+            copier as usize,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|_| AllocError::AlreadyInstalled)
+}
+
+/// Install the direct-map kernel-address lookup used by user-buffer copy paths.
+pub fn install_frame_kernel_addr(lookup: FrameKernelAddr) -> Result<(), AllocError> {
+    FRAME_KERNEL_ADDR
+        .compare_exchange(
+            NO_FRAME_KERNEL_ADDR,
+            lookup as usize,
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -238,6 +296,43 @@ pub fn acquire_map_pin(
     let allocator = installed_bitmap_allocator()?;
     allocator.acquire_map_pin(ppn)?;
     Ok(MapPin::new(allocator, ppn))
+}
+
+/// Acquire page-cache role evidence for an already-live frame.
+///
+/// Filesystem page fetchers can return a populated frame by PPN; PageBacked
+/// uses this helper when it installs that frame into a `PageContainer` index.
+pub fn acquire_cache_pin(
+    ppn: Ppn,
+) -> Result<CachePin<'static, BitmapPageAllocator<'static>>, AllocError> {
+    let allocator = installed_bitmap_allocator()?;
+    allocator.acquire_cache_pin(ppn)?;
+    Ok(CachePin::new(allocator, ppn))
+}
+
+/// Copy the full contents of one frame to another through the installed direct-map hook.
+pub fn copy_frame_contents(source: Ppn, dest: Ppn) -> Result<(), AllocError> {
+    let copier = FRAME_COPIER.load(Ordering::Acquire);
+    if copier == NO_FRAME_COPIER {
+        return Err(AllocError::FrameCopyUnavailable);
+    }
+    let copier: FrameCopier = unsafe { core::mem::transmute(copier) };
+    unsafe { copier(source, dest) };
+    Ok(())
+}
+
+/// Look up the direct-map kernel virtual address of `ppn`.
+///
+/// Returns a pointer to the start of the frame. Callers add their own offset.
+/// The pointer is valid for the lifetime of the frame; the caller is
+/// responsible for not retaining it past frame teardown.
+pub fn frame_kernel_addr(ppn: Ppn) -> Result<*mut u8, AllocError> {
+    let lookup = FRAME_KERNEL_ADDR.load(Ordering::Acquire);
+    if lookup == NO_FRAME_KERNEL_ADDR {
+        return Err(AllocError::FrameKernelAddrUnavailable);
+    }
+    let lookup: FrameKernelAddr = unsafe { core::mem::transmute(lookup) };
+    Ok(unsafe { lookup(ppn) })
 }
 
 /// Reserve a contiguous frame run from the installed backend.
@@ -290,13 +385,22 @@ pub fn reserve_page_table_node() -> Result<PtNode, tx_hal::AllocError> {
 /// The frame is returned as a permanent anchor and intentionally never re-enters
 /// the normal allocator pool.
 pub fn claim_zero_frame() -> Result<Ppn, AllocError> {
+    if ZERO_FRAME_PPN.load(Ordering::Acquire) != NO_ZERO_FRAME {
+        return Err(AllocError::AlreadyInstalled);
+    }
     let frame = reserve_frame(ZeroPolicy::Zeroed)?.commit();
     let ppn = frame.ppn();
-    let _anchor = frame.into_permanent_frame();
-    ZERO_FRAME_PPN
-        .compare_exchange(NO_ZERO_FRAME, ppn.0, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| AllocError::AlreadyInstalled)?;
-    Ok(ppn)
+    match ZERO_FRAME_PPN.compare_exchange(NO_ZERO_FRAME, ppn.0, Ordering::AcqRel, Ordering::Acquire)
+    {
+        Ok(_) => {
+            let _anchor = frame.into_permanent_frame();
+            Ok(ppn)
+        }
+        Err(_) => {
+            drop(frame);
+            Err(AllocError::AlreadyInstalled)
+        }
+    }
 }
 
 /// Return the permanent zero-frame PPN after boot has claimed it.
@@ -336,9 +440,12 @@ pub mod testing {
 
     use tx_hal::Ppn;
 
-    use super::{install_bitmap_allocator, AllocError, BitmapPageAllocator, FrameMeta};
+    use super::{
+        install_bitmap_allocator, install_frame_copier, install_frame_kernel_addr, AllocError,
+        BitmapPageAllocator, FrameMeta,
+    };
 
-    const TEST_FRAME_COUNT: usize = 256;
+    const TEST_FRAME_COUNT: usize = 1024;
     const TEST_BITMAP_WORDS: usize = TEST_FRAME_COUNT / 64;
 
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -353,7 +460,25 @@ pub mod testing {
         zero_for_test,
     );
 
-    unsafe fn zero_for_test(_ppn: Ppn) {}
+    unsafe fn zero_for_test(ppn: Ppn) {
+        unsafe {
+            core::ptr::write_bytes(test_frame_ptr(ppn, 0), 0, 4096);
+        }
+    }
+
+    unsafe fn copy_for_test(source: Ppn, dest: Ppn) {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                test_frame_ptr(source, 0),
+                test_frame_ptr(dest, 0),
+                4096,
+            );
+        }
+    }
+
+    unsafe fn kernel_addr_for_test(ppn: Ppn) -> *mut u8 {
+        unsafe { test_frame_ptr(ppn, 0) }
+    }
 
     pub fn install_test_allocator_once() -> Result<(), AllocError> {
         if INITIALIZED
@@ -363,7 +488,10 @@ pub mod testing {
             for ppn in 0..TEST_FRAME_COUNT {
                 TEST_ALLOCATOR.mark_free_for_test(Ppn(ppn));
             }
-            return install_bitmap_allocator(&TEST_ALLOCATOR);
+            install_bitmap_allocator(&TEST_ALLOCATOR)?;
+            install_frame_copier(copy_for_test)?;
+            install_frame_kernel_addr(kernel_addr_for_test)?;
+            return Ok(());
         }
 
         Ok(())
@@ -371,6 +499,40 @@ pub mod testing {
 
     pub fn direct_map_base_for_test() -> usize {
         TEST_DIRECT_MAP.0.get() as *mut u8 as usize
+    }
+
+    pub fn write_frame_bytes_for_test(ppn: Ppn, offset: usize, bytes: &[u8]) {
+        assert!(offset <= 4096);
+        assert!(bytes.len() <= 4096 - offset);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                test_frame_ptr(ppn, offset),
+                bytes.len(),
+            );
+        }
+    }
+
+    pub fn read_frame_bytes_for_test(ppn: Ppn, offset: usize, dest: &mut [u8]) {
+        assert!(offset <= 4096);
+        assert!(dest.len() <= 4096 - offset);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                test_frame_ptr(ppn, offset),
+                dest.as_mut_ptr(),
+                dest.len(),
+            );
+        }
+    }
+
+    unsafe fn test_frame_ptr(ppn: Ppn, offset: usize) -> *mut u8 {
+        assert!(ppn.0 < TEST_FRAME_COUNT);
+        assert!(offset <= 4096);
+        unsafe {
+            (*TEST_DIRECT_MAP.0.get())
+                .as_mut_ptr()
+                .add(ppn.0 * 4096 + offset)
+        }
     }
 
     #[repr(align(4096))]

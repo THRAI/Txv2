@@ -1,0 +1,640 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-05-04-vm-pagebacked-v1-completion",
+  "title": "VM/PageBacked v1 completion",
+  "status": "complete",
+  "created": "2026-05-04",
+  "updated": "2026-05-04",
+  "owner": "claude/objective-davinci-37d55d",
+  "summary": "Bridge VM/PageBacked from current ~45% structure / ~30% behavior toward ~85% on both, leaving only items that the active design docs explicitly defer (rmap, hugetlb, userfaultfd, in-place mprotect, reclaim policy, writeback scheduling) or that depend on Process/ThreadRuntime ownership (fork_aspace, exec_aspace, trap page-fault dispatch).",
+  "scope": {
+    "in": [
+      "crates/tx-kernel/src/vm",
+      "crates/tx-kernel/src/page_backed.rs",
+      "crates/tx-kernel/src/page_backed/",
+      "crates/tx-substrate/src/page_allocator",
+      "crates/tx-hal/src",
+      "boards/tx-hal-riscv64-qemu-virt/src/user_access.rs",
+      "docs/progress/research/2026-05-03-vm-doc-gap-ledger.md",
+      "docs/progress/STATUS.md",
+      "docs/progress/decisions/",
+      "docs/progress/worktrees/2026-05-02-vm-pagebacked-impl.json"
+    ],
+    "out": [
+      "crates/tx-kernel/src/process",
+      "crates/tx-kernel/src/thread_runtime",
+      "crates/tx-kernel/src/trap/syscall-fault-dispatch",
+      "vfs-backends/ext4-devfs-bdev-fs-concrete",
+      "vm-deferred/rmap",
+      "vm-deferred/hugetlb",
+      "vm-deferred/userfaultfd",
+      "vm-deferred/mlock-as-observation",
+      "vm-deferred/in-place-mprotect-retag",
+      "vm-deferred/fairness-tuning",
+      "page-backed-deferred/reclaim-policy",
+      "page-backed-deferred/writeback-scheduling",
+      "page-backed-deferred/open-questions"
+    ],
+    "write_sets": [
+      {
+        "owner": "claude/objective-davinci-37d55d",
+        "paths": [
+          "docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json",
+          "crates/tx-kernel/src/vm",
+          "crates/tx-kernel/src/page_backed.rs",
+          "crates/tx-kernel/src/page_backed",
+          "docs/progress/research/2026-05-03-vm-doc-gap-ledger.md",
+          "docs/progress/STATUS.md",
+          "docs/progress/decisions"
+        ],
+        "notes": "Single-owner during initial implementation. When parallel slices fan out, each worker claims a disjoint subset (vm/structure vs vm/execution vs page_backed core vs page_backed lifecycle) via its own worktree record."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/03_memory-vm/VM_v1_2.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/01_substrate/PAGE_SUBSTRATE_v1.md",
+      "docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md",
+      "docs/design/02_execution/STEP_MODEL_v1.md",
+      "docs/design/00_meta-framework/INVARIANTS_v4.md",
+      "docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/STATUS.md",
+      "docs/progress/research/2026-05-03-vm-doc-gap-ledger.md",
+      "docs/progress/worktrees/2026-05-02-vm-pagebacked-impl.json",
+      "docs/progress/decisions/2026-05-02-vm-pmapif-root-owner.md",
+      "docs/progress/decisions/2026-05-04-claude-harness-parallel-and-main-resync.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "gap-ledger-refresh",
+      "title": "Refresh vm-doc-gap-ledger to post-resync state",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/progress/research/2026-05-04-vm-pagebacked-gap-update.md"
+      ],
+      "verification": [
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Captured as a dated follow-up note (2026-05-04-vm-pagebacked-gap-update.md) rather than mutating the prior 2026-05-03 ledger snapshot. Notes new useraccessif/irqif HAL surfaces and points at this plan as the new active mitigation order."
+    },
+    {
+      "id": "user-buffer-byte-copy",
+      "title": "Wire useraccessif into step_read/step_write byte transfer",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/page_backed.rs",
+        "crates/tx-kernel/src/page_backed/user_buffer.rs",
+        "crates/tx-kernel/src/page_backed/user_buffer_tests.rs",
+        "crates/tx-kernel/src/execution.rs",
+        "crates/tx-substrate/src/page_allocator/mod.rs",
+        "crates/tx-substrate/src/boot_memory.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo fmt --check"
+      ],
+      "notes": "PAGE_BACKED §5.1/5.2 byte-accurate transfer. Substrate gained a FrameKernelAddr hook (production points at the direct-map base; tests at the test direct map). Errno gained EFAULT. PageBacked exposes step_read_to_user<H: UserAccessIf> and step_write_from_user<H: UserAccessIf> in a new sibling module page_backed/user_buffer.rs (kept under the 1500-line guard) plus user_buffer_tests.rs covering single-page round trip, cross-page round trip, EFAULT propagation on read, and EFAULT propagation on write. Copyless step_read/step_write retained as the in-kernel staging surface for splice/sendfile/copy_file_range; user-buffer path routes through UserAccessIf::copy_to_user/copy_from_user."
+    },
+    {
+      "id": "mock-fs-pagebacking",
+      "title": "Implement mock FsPageBacking covering File-variant materialize_page",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/page_backed.rs",
+        "crates/tx-kernel/src/page_backed/lifecycle_tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed -- --test-threads=1"
+      ],
+      "notes": "Closed as redundant. The pre-existing test mocks already cover File-variant materialize_page end-to-end: RecordingFs (page_backed.rs tests, fetch counter), BlockingFs (page_backed.rs tests, blocked outcome), and LifecycleFs (page_backed/lifecycle_tests.rs, full fetch/flush/truncate/fsync/fallocate). The fallocate slice extended LifecycleFs further. No new mock-fs-pagebacking module was needed; existing per-test mocks are sufficient for the downstream pagebacked-fallocate, partial-page-byte-fidelity, and cross-variant-scripts slices."
+    },
+    {
+      "id": "pagebacked-fallocate",
+      "title": "Add step_fallocate for File variant",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/page_backed.rs",
+        "crates/tx-kernel/src/page_backed/lifecycle.rs",
+        "crates/tx-kernel/src/page_backed/lifecycle_tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "PAGE_BACKED §5.5. FsPageBacking gained a default-impl fallocate(fs_object_id, new_size, guard) so existing backings (RecordingFs, BlockingFs, LifecycleFs) keep compiling. step_fallocate rejects Device with EINVAL, rejects new_size beyond fixed page_count capacity with EINVAL, treats new_size <= current size as Done(()) no-op, calls FsPageBacking::fallocate first for File backings and only publishes pc.size_bytes on backing success, and bumps pc.size_bytes for Anon backings without materializing pages. Did not need a new mock-fs-pagebacking module: extending LifecycleFs with fallocates/last_fallocate_size counters and a failing_fallocate constructor was sufficient, so the original mock-fs-pagebacking prerequisite was dropped from depends_on. Five new tests cover Anon grow, File backing-first publication, File backing failure leaves state intact, Device + capacity-overflow EINVAL, and shrink/equal no-op."
+    },
+    {
+      "id": "vm-fault-pc-size-checks",
+      "title": "Wire PC.size into VM fault SIGBUS-style checks",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/vm/structure/types.rs",
+        "crates/tx-kernel/src/vm/tests/fault_materialization.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask progress validate"
+      ],
+      "notes": "VmFaultError gained PageBeyondSize. VmFaultOutcome::materialize_page_recipe checks (page_index * USER_PAGE_SIZE) >= pc.size_bytes() before calling pc.materialize_anon and returns PageBeyondSize when the access is beyond the visible PC.size, leaving the capacity-bound BackingOffsetOverflow check intact. Three tests cover SHARED past-EOF read rejection, MAP_PRIVATE past-EOF write rejection (before CoW replacement), and admission of a page whose first byte is just below PC.size. Closes the STATUS.md 'connect PC.size to VM fault SIGBUS-style checks' next-step item."
+    },
+    {
+      "id": "partial-page-byte-fidelity",
+      "title": "Byte-accurate partial-page truncate and growth",
+      "status": "complete",
+      "depends_on": [
+        "user-buffer-byte-copy",
+        "vm-fault-pc-size-checks",
+        "pagebacked-fallocate"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/page_backed/lifecycle.rs",
+        "crates/tx-kernel/src/page_backed/lifecycle_tests.rs",
+        "crates/tx-kernel/src/page_backed/user_buffer_tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "PAGE_BACKED §5.3 partial-page tail-zero on truncate-shrink. step_truncate now zeroes the cached partial-EOF page tail (bytes [new_size mod PAGE, PAGE_END)) after withdrawing higher pages, so a subsequent truncate-grow exposes zeros for the previously-stale region. Helper zero_partial_eof_tail uses the substrate FrameKernelAddr hook (already public from user-buffer-byte-copy slice) and is no-op when new_size is page-aligned, when the EOF page is not cached, or when the hook is missing. Read at EOF returns short count via step_read_to_user (already correct via len-clamp from user-buffer-byte-copy slice; not changed). Write at EOF grows pc.size_bytes via existing grow_size_to (also unchanged). Three tests: (1) shrink past mid-page zeroes the tail and preserves the head; (2) page-aligned shrink does not touch the surviving page; (3) end-to-end shrink-then-grow round-trip via step_read_to_user reads zeros for the post-EOF region. No full-page materialization for purely metadata growth was already the existing behavior of step_truncate-grow and step_fallocate."
+    },
+    {
+      "id": "waittoken-channel-resolver",
+      "title": "Add WaitToken → reactor::Channel resolver registry",
+      "status": "complete",
+      "depends_on": [
+        "wait-aware-step-outcome"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/wait_carrier.rs",
+        "crates/tx-kernel/src/lib.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel wait_carrier -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Plan-extension slice. Prerequisite for the four async script wrappers (mmap-script-async, munmap-mprotect-mremap-scripts, brk-script, fault-script-async). New crate-public module crates/tx-kernel/src/wait_carrier.rs holds a SpinMutex<BTreeMap<u64, tx_reactor::wait::Channel>> registry plus an AtomicU64 carrier id allocator. register_wait_channel(channel) returns a non-zero monotonically-increasing id; release_wait_channel(id) drops the registry's clone; lookup_wait_channel(id) returns Some(Channel) if registered; wait_on_token(token) returns Some(WaitFuture) when the token's carrier is registered, None otherwise. Test placeholder tokens constructed via raw WaitToken::new(13, 0x55) safely return None from wait_on_token rather than panicking, so existing test mocks (BlockingFs, LifecycleFs) keep working unchanged. Six tests cover register/lookup/release roundtrip, distinct-ids, lookup-of-unregistered, wait_on_token round-trip, wait_on_token rejects placeholders, and wait_on_token returns None after release."
+    },
+    {
+      "id": "wait-aware-step-outcome",
+      "title": "Confirm StepOutcome carries wait tokens fault paths can yield through",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/execution.rs"
+      ],
+      "verification": [
+        "audit-only: cargo test -p tx-kernel --lib -- --test-threads=1"
+      ],
+      "notes": "Audit complete. StepOutcome already carries Done(T), Advanced(T), Blocked(WaitToken), AdvancedThenBlocked(T, WaitToken), and Err(Errno) per STEP_MODEL_v1 §2 five-variant algebra. WaitToken carries (carrier, interest) per §2.3 (WakeCarrier × InterestConditions). No code changes required. Convenience extractors (e.g., wait_token() helper) are deferred until the first concrete script wrapper has a real consumer; adding them now would be premature abstraction."
+    },
+    {
+      "id": "fault-script-async",
+      "title": "Wrap resolve_fault as async fault_script with reservation drop on wait",
+      "status": "complete",
+      "depends_on": [
+        "wait-aware-step-outcome",
+        "waittoken-channel-resolver",
+        "user-buffer-byte-copy",
+        "vm-fault-pc-size-checks",
+        "mmap-script-async"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "VM_v1_2 §5.1 + §3.6 cross-async-wait discipline. AddressSpace::fault_script_async loops the three-step fault sequence: (1) acquire Materializer + observe recipe, drop reservation; (2) materialize_pagebacked (synchronous, errors propagate); (3) re-acquire Materializer + publish_fault_materialization. WouldBlock at step 1 or step 3 drops the relevant guard (and any held materialization), awaits wait_carrier::wait_on_token on the RangeLock's release token, and retries from step 1 with a fresh recipe observation. Inner sync helpers (resolve_fault, publish_fault_materialization, materialize_pagebacked) stay as the compatibility surface. Two new tests cover uncontended-one-poll-success and writer-conflict-yields-and-completes-after-release. PC-side blocking on File-variant materialize_page (FsPageBacking fetch/flush) is not yet routed through this script — that remains a follow-up requiring per-PageContainer wait channels analogous to the RangeLock channel; for v1 the script handles only the RangeLock-side blocking signal."
+    },
+    {
+      "id": "mmap-script-async",
+      "title": "Wrap mmap helpers as async mmap_script",
+      "status": "complete",
+      "depends_on": [
+        "wait-aware-step-outcome",
+        "waittoken-channel-resolver"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/structure/range_lock.rs",
+        "crates/tx-kernel/src/vm/structure/mod.rs",
+        "crates/tx-kernel/src/vm/mod.rs",
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "VM_v1_2 §5.2 + §3.6 cross-async-wait discipline, end-to-end. RangeLock now owns a tx_reactor::wait::Channel registered with wait_carrier under a non-zero carrier id (pub const RANGE_LOCK_RELEASE_MASK is the mask bit fired on every release). RangeLock::release_active and release_pending_writer now fire the channel; WouldBlock<'a> carries a &'a RangeLock reference and exposes wait_token() returning a WaitToken whose carrier resolves to the lock's release channel. Drop on RangeLock releases the wait_carrier registration. AddressSpace::map_script_async is the first async script wrapper: it loops calling reserve_map; on WouldBlock, it extracts the wait_token, drops the blocked guard (releasing any pending-writer slot), awaits via wait_carrier::wait_on_token, and retries. Inner sync helpers stay as compatibility surface. Four tests in vm/tests/script_async.rs cover wait_token shape, uncontended one-poll success, blocked-then-release-wakes-and-completes, and external-subscriber wake on RangeLock release."
+    },
+    {
+      "id": "munmap-mprotect-mremap-scripts",
+      "title": "Async wrappers for munmap, mprotect, mremap",
+      "status": "complete",
+      "depends_on": [
+        "wait-aware-step-outcome",
+        "waittoken-channel-resolver",
+        "mmap-script-async"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "VM_v1_2 §5.3/5.4/5.5 + §3.6 cross-async-wait discipline, applied via the mmap-script-async template. AddressSpace::unmap_async, AddressSpace::protect_async, and AddressSpace::remap_async each loop on their inner sync helper, drop the blocked guard on WouldBlock, await wait_carrier::wait_on_token, and retry. Inner sync helpers (unmap, protect, remap_script) stay as compatibility surface. remap_async stays in disjoint-only mode for v1 (overlapping mremap is documented v1 debt). Three new tests in vm/tests/script_async.rs cover unmap/protect/remap blocked-then-release-wakes-and-completes."
+    },
+    {
+      "id": "brk-script",
+      "title": "brk_script over the existing AddressSpace mapping primitives",
+      "status": "complete",
+      "depends_on": [
+        "mmap-script-async",
+        "munmap-mprotect-mremap-scripts"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "VM_v1_2 §5.8. AddressSpace::brk_script_async(brk_base, current_brk, requested_brk) models the program break as an Anon PrivateAnon mapping covering [brk_base, current_brk). On grow, calls map_script_async on [current_brk, requested_brk) with READ_WRITE / PRIVATE / PrivateAnon. On shrink, calls unmap_async on [requested_brk, current_brk). No-op when requested == current; rejects requested < brk_base with InvalidRange. Process-level tracking of the brk value (which hart holds it, exec-time base, fork inheritance) lives in Process and is out of scope for VM. Four tests cover grow, shrink, no-op, and below-base rejection."
+    },
+    {
+      "id": "madvise-msync-mincore",
+      "title": "Observation-only scripts: madvise, msync, mincore",
+      "status": "complete",
+      "depends_on": [
+        "wait-aware-step-outcome"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/mod.rs",
+        "crates/tx-kernel/src/vm/tests/observation.rs",
+        "crates/tx-kernel/src/vm/tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "VM §5.9 observation surface. AddressSpace::mincore(range) returns range-page-count booleans against the pmap walk; AddressSpace::madvise(range, MadviseAdvice) is no-op per VM §9.7 with MadviseAdvice spelling so callers and future syscall wrappers compile against the documented enum; AddressSpace::msync(range, guard) iterates recipes overlapping range, dedups File-backed PageContainers by Cap key, and calls page_backed::step_fsync per unique PC, returning the first non-Done outcome or Done(()) if all succeed. Anon/PrivateAnon/Device backings are no-op for msync. Eight new tests in vm/tests/observation.rs cover walk_range ascending/exclusion/empty, mincore resident/absent and all-absent, madvise advice round-trip, and msync done-for-anon plus skip-anon-PC. vm/tests.rs split: observation tests moved into vm/tests/observation.rs to keep parent under the 1500-line guard."
+    },
+    {
+      "id": "vm-pmap-walk-protect-surface",
+      "title": "Extend VmPmap with walk and protect-without-teardown for mincore + future fork CoW demotion",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/vm/pmap.rs",
+        "crates/tx-kernel/src/vm/tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Added VmPmap::walk_range(range) -> Vec<(UserPage, PmapMappingSnapshot)> for read-only enumeration used by mincore-style queries and by future fork CoW demotion to discover affected pages. Did not add a separate protect-without-teardown method; teardown_range already serves the protect-via-refault discipline per VM_v1_2 §9.8 (in-place PTE permission patching deferred). Documented teardown_range's dual role in its rustdoc. Three tests cover the walk surface: ascending order, range exclusion, and the empty case."
+    },
+    {
+      "id": "persistent-epoch-recipes",
+      "title": "Replace BTreeMap snapshot publication with persistent/epoch range index",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/vm/structure/recipe.rs",
+        "crates/tx-kernel/src/vm/structure/address_space.rs",
+        "crates/tx-kernel/src/vm/checks.rs",
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/tests.rs",
+        "crates/tx-substrate/src/epoch/mod.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo test -p tx-substrate --test page_allocator",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "VM_v1_2 §1.2 publication rule + INVARIANTS_v4 ARCH-5. RecipeIndex now publishes via AtomicPtr<RecipeTree> for lock-free reads under epoch::Guard, plus a separate writer mutation SpinMutex that serializes mutators. Writers atomically swap and retire the old tree through tx_substrate::epoch::retire_raw (now exposed publicly so upper-layer publication mechanisms can opt into EBR-managed reclamation). RecipeIndex internal read methods (lookup, stats, find_free_range, overlapping, snapshot, validate_map) take &Guard<'_> and load the tree via an internal pinned() helper that performs an Acquire load and asserts soundness via the caller's epoch guard. AddressSpace public read methods (lookup, find_free_range, recipes_overlapping, recipes_snapshot) keep their existing signatures but internally create a short-lived epoch::guard() to hand to RecipeIndex; AddressSpace::msync passes its caller-supplied guard through directly. require_map_admission grows an internal guard for validate_map. RecipeSnapshot is now cfg(test) since the publication-rule test (vm_recipe_snapshot_reader_survives_split_rewrite_publication) is its only consumer; production code reads through the borrow-under-guard path directly. Drop on RecipeIndex frees the final tree via Box::from_raw on the AtomicPtr value. Verification: 60 vm tests, 43 page_backed tests, 109 lib tests, 18 substrate page_allocator tests, fmt clean, clippy clean, all xtask lints ok, progress validate 24 ok."
+    },
+    {
+      "id": "cross-variant-scripts",
+      "title": "splice / sendfile / copy_file_range over PageBacked variants",
+      "status": "complete",
+      "depends_on": [
+        "mock-fs-pagebacking",
+        "user-buffer-byte-copy"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/page_backed.rs",
+        "crates/tx-kernel/src/page_backed/cross_variant.rs",
+        "crates/tx-kernel/src/page_backed/cross_variant_tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "PAGE_BACKED §9.3 copy_file_range covered by step_copy_file_range in a new sibling page_backed/cross_variant.rs module. Page-by-page copy via materialize_page on each side and the substrate FrameKernelAddr hook for direct-map byte movement. Output Device rejects EINVAL; out_offset+len beyond capacity rejects EINVAL; in_offset >= source EOF returns Done(0); the copy is clamped to in_pc.size_bytes() - in_offset; pc.size_bytes is bumped on dst only after byte progress; dirty marking is handled by materialize_page(Write) for Anon/File output. Six tests cover Anon-to-Anon within-page, page-boundary-crossing at different alignments, source-EOF-clamps-the-copy, source-at-EOF returns Done(0), Device-destination EINVAL, and dst-capacity-overflow EINVAL. Splice (§9.1) and sendfile (§9.2) are explicitly deferred: they require Pipe StructBacked which is not yet implemented; the cross_variant.rs rustdoc records this. Reflink path (§9.3 same-fs eligibility) is deferred to the reflink-cow-scaffold slice."
+    },
+    {
+      "id": "reflink-cow-scaffold",
+      "title": "Reflink + CoW-on-write scaffolding inside PageContainer share rules",
+      "status": "complete",
+      "depends_on": [
+        "mock-fs-pagebacking",
+        "persistent-epoch-recipes"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/page_backed.rs",
+        "crates/tx-kernel/src/page_backed/reflink.rs",
+        "crates/tx-kernel/src/page_backed/reflink_tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "PAGE_BACKED §7.1/§7.2. New page_backed::install_shared_page(pc, page, source_ppn) and page_backed::cow_replace_into_private(pc, page) live in a new sibling page_backed/reflink.rs module. install_shared_page acquires a fresh CachePin on source_ppn (incrementing cache_ref so the source frame stays live) and installs the entry via install_if_absent; rejects Device backings and pre-existing entries. cow_replace_into_private allocates a fresh zeroed frame, copies the cached frame's bytes via the substrate FrameCopier hook, and swaps the page-cache entry through install_if_match (which is now non-test so concurrent CoW can linearize). Existing CachePin on the old shared frame is dropped on success, decrementing its cache_ref. Six tests cover share-attaches, share-rejects-already-present, share-rejects-Device, CoW-replaces-with-matching-bytes-and-leaves-source-intact, CoW-on-missing-page errors, and CoW-rejects-Device. PageCacheIndex::install_if_match is now non-test (was cfg(test) only). Real reflink across two RNodes (filesystem-side) and the §12.4 reflink-vs-truncate race remain deferred to backends and follow-up slices."
+    },
+    {
+      "id": "fork-aspace",
+      "title": "Implement AddressSpace::fork_aspace per VM_v1_2 §5.6",
+      "status": "complete",
+      "depends_on": [
+        "persistent-epoch-recipes"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/structure/address_space.rs",
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Plan-extension closing the VM_v1_2 §5.6 gap missed in the original plan. AddressSpace::fork_aspace<P: PmapIf>(parent) -> Result<AddressSpace, VmMapError> snapshots parent's recipes (cheap clone via Cap refcount bumps for VmBacking::Page entries), constructs a fresh child AddressSpace via new_for_platform::<P>, commits each parent recipe into the child via RecipeIndex::commit_map(_, RequireFree), and tears down parent's pmap on every MAP_PRIVATE entry so subsequent writes refault and the existing materialize_page_recipe CoW path produces a private frame. MAP_SHARED PTEs in parent are left intact; child's pmap starts empty and rebuilds via refault. V1 caller invariant per §9.5: no other VM operation runs against parent during fork (Process subsystem serializes externally). Two tests cover recipe-clone-shape parity and MAP_PRIVATE-only PTE demotion."
+    },
+    {
+      "id": "exec-aspace",
+      "title": "Implement AddressSpace::exec_aspace teardown per VM_v1_2 §5.7",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/structure/address_space.rs",
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Plan-extension closing the VM_v1_2 §5.7 gap missed in the original plan. AddressSpace::teardown_all_pmap iterates every recipe range and calls VmPmap::teardown_range, returning the page count. AddressSpace::exec_aspace is the script-side wrapper. Recipe-tree management remains caller-side because the new image's recipe shape comes from the exec image loader (Process-side, not yet implemented); v1 callers either drop the AddressSpace entirely or follow with explicit recipe modifications. Caller invariant per §5.7 prologue: exec has reduced the thread group to one; no concurrent VM operations exist on old_aspace. One test covers all-PTEs-torn-down on an Anon mapping after baseline fault publication."
+    },
+    {
+      "id": "vm-doc-polish-and-full-user-range",
+      "title": "Polish: rename acquire to acquire_step + add UserRange::full_user_v1 + fork serializes via full_user lock",
+      "status": "complete",
+      "depends_on": [
+        "fork-aspace"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/vm/structure/range_lock.rs",
+        "crates/tx-kernel/src/vm/structure/types.rs",
+        "crates/tx-kernel/src/vm/structure/mod.rs",
+        "crates/tx-kernel/src/vm/execution.rs",
+        "crates/tx-kernel/src/vm/tests.rs",
+        "crates/tx-kernel/src/vm/tests/fault_materialization.rs",
+        "crates/tx-kernel/src/vm/tests/script_async.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel script_async -- --test-threads=1",
+        "cargo test -p tx-kernel vm -- --test-threads=1",
+        "cargo test -p tx-kernel page_backed -- --test-threads=1",
+        "cargo test -p tx-kernel --lib -- --test-threads=1",
+        "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+        "cargo fmt --check",
+        "cargo xtask lint arch",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Audit follow-up. (1) RangeLock::acquire and acquire_pair renamed to acquire_step and acquire_pair_step to match VM_v1_2 §3.1 spelling. AcquireResult / AcquirePairResult retained as a 2-variant Result-shaped enum because the doc's StepOutcome<RangeGuard> is semantically equivalent and the rename to StepOutcome would ripple into the broader StepOutcome integration which is its own concern. All callers updated mechanically (vm/execution.rs, vm/tests.rs, vm/tests/fault_materialization.rs, vm/tests/script_async.rs). (2) New constant types::FULL_USER_V1_TOP = 1 << 38 and method UserRange::full_user_v1() returning the [0, FULL_USER_V1_TOP) range. Sized to fit inside Sv39 (256 GiB user) and Sv48 (128 TiB user) user-space halves. (3) AddressSpace::fork_aspace now acquires ExclusiveWriter on full_user_v1 before snapshotting parent recipes, satisfying VM_v1_2 §9.5 fork-serializes-parent. WouldBlock returns VmMapError::WouldBlock; callers retry. One new test fork_aspace_returns_would_block_when_parent_full_user_range_already_held confirms the lock fires."
+    },
+    {
+      "id": "ledger-and-status-final",
+      "title": "Final ledger + STATUS update; verify completion bar",
+      "status": "complete",
+      "depends_on": [
+        "user-buffer-byte-copy",
+        "fault-script-async",
+        "mmap-script-async",
+        "munmap-mprotect-mremap-scripts",
+        "brk-script",
+        "madvise-msync-mincore",
+        "vm-pmap-walk-protect-surface",
+        "persistent-epoch-recipes",
+        "cross-variant-scripts",
+        "reflink-cow-scaffold",
+        "partial-page-byte-fidelity"
+      ],
+      "paths": [
+        "docs/progress/research/2026-05-03-vm-doc-gap-ledger.md",
+        "docs/progress/STATUS.md",
+        "docs/progress/decisions/"
+      ],
+      "verification": [
+        "cargo xtask ci",
+        "cargo xtask progress validate",
+        "cargo xtask lint docs"
+      ],
+      "notes": "Restate completion at >=85% on structure and behavior. Name remaining gaps explicitly: fork_aspace/exec_aspace/trap-dispatch (Process-blocked), reclaim policy and writeback scheduling (v1-deferred), reverse mapping/hugetlb/userfaultfd/in-place-mprotect/mlock optimization (deferred). Add a dated decision note that closes this plan."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo fmt --check",
+      "status": "not-run",
+      "notes": "Per tx-vm-pagebacked skill checklist"
+    },
+    {
+      "command": "cargo test -p tx-kernel vm -- --test-threads=1",
+      "status": "not-run",
+      "notes": "VM-focused test gate"
+    },
+    {
+      "command": "cargo test -p tx-kernel page_backed -- --test-threads=1",
+      "status": "not-run",
+      "notes": "PageBacked-focused test gate"
+    },
+    {
+      "command": "cargo test -p tx-kernel --lib",
+      "status": "not-run",
+      "notes": "Crate-level regression"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --exclude tx-kernel-riscv64-qemu-virt --exclude tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt -- -D warnings",
+      "status": "not-run",
+      "notes": "Workspace lint gate"
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "not-run",
+      "notes": "Docs/grep-stable txdoc anchor checks"
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "not-run",
+      "notes": "Progress JSON validity"
+    },
+    {
+      "command": "cargo xtask ci",
+      "status": "not-run",
+      "notes": "Run before closing the plan"
+    },
+    {
+      "command": "git diff --check",
+      "status": "not-run",
+      "notes": "Whitespace/conflict markers"
+    }
+  ],
+  "risks": [
+    "wait-aware-step-outcome may force StepOutcome shape changes that ripple into reactor and other subsystems; keep the change narrow and additive.",
+    "persistent-epoch-recipes is a foundational rewrite; it can land in parallel with script wrappers but conflicts with vm/checks staged witnesses must be resolved deliberately.",
+    "user-buffer-byte-copy depends on the host-test side of useraccessif; if the host harness lacks a usable mock, add one before tightening byte-equality assertions.",
+    "Each script wrapper risks duplicating reservation/revalidation logic; factor a shared helper once two wrappers exist."
+  ],
+  "blockers": [
+    "fork_aspace, exec_aspace, and trap page-fault dispatch are explicitly out of scope: they require Process ownership of Cap<AddressSpace> and ThreadRuntime authority paths.",
+    "Concrete VFS backends (ext4, devfs, bdev-fs) are out of scope; mock FsPageBacking is the substitute.",
+    "PAGE_BACKED §8 reclaim policy and §12 open questions are deferred by the design docs."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}
