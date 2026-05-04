@@ -10,6 +10,7 @@ pub use tx_substrate::epoch::Guard;
 pub enum Errno {
     EBUSY,
     EDQUOT,
+    EFAULT,
     EINVAL,
     EIO,
     EISDIR,
