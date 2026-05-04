@@ -66,28 +66,93 @@ pub enum InodeKind {
     Socket,
 }
 
+// POSIX S_IFMT mode-bit constants. Mode carries the file kind in its upper
+// nibble; `InodeMeta::kind()` derives `InodeKind` from these bits.
+pub const S_IFMT: u16 = 0o170000;
+pub const S_IFREG: u16 = 0o100000;
+pub const S_IFDIR: u16 = 0o040000;
+pub const S_IFLNK: u16 = 0o120000;
+pub const S_IFCHR: u16 = 0o020000;
+pub const S_IFBLK: u16 = 0o060000;
+pub const S_IFIFO: u16 = 0o010000;
+pub const S_IFSOCK: u16 = 0o140000;
+
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Timespec {
+    pub sec: i64,
+    pub nsec: i32,
+}
+
+impl Timespec {
+    pub const EPOCH: Self = Self { sec: 0, nsec: 0 };
+
+    pub const fn new(sec: i64, nsec: i32) -> Self {
+        Self { sec, nsec }
+    }
+}
+
+// Per `docs/design/05_filesystem/TX_EXT4_PLAN_v1_2.md` §pub-types and
+// `bringup_fs_specs_v_1` §load_inode_meta. `mode` carries S_IFMT bits;
+// `kind()` derives `InodeKind` from them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InodeMeta {
-    pub kind: InodeKind,
     pub mode: u16,
     pub uid: u32,
     pub gid: u32,
     pub size: u64,
-    pub nlink: u32,
-    pub rdev: Option<u64>,
+    pub atime: Timespec,
+    pub mtime: Timespec,
+    pub ctime: Timespec,
+    pub nlinks: u32,
+    pub blocks: u64,
+    pub flags: u32,
 }
 
 impl InodeMeta {
+    /// Construct a fresh inode meta. `kind` is asserted into the mode's
+    /// S_IFMT bits if not already present; the mode is otherwise preserved.
     pub const fn new(kind: InodeKind, mode: u16) -> Self {
+        let mode = if mode & S_IFMT == 0 {
+            mode | kind_to_ifmt(kind)
+        } else {
+            mode
+        };
         Self {
-            kind,
             mode,
             uid: 0,
             gid: 0,
             size: 0,
-            nlink: 1,
-            rdev: None,
+            atime: Timespec::EPOCH,
+            mtime: Timespec::EPOCH,
+            ctime: Timespec::EPOCH,
+            nlinks: 1,
+            blocks: 0,
+            flags: 0,
         }
+    }
+
+    pub const fn kind(&self) -> InodeKind {
+        match self.mode & S_IFMT {
+            S_IFDIR => InodeKind::Directory,
+            S_IFLNK => InodeKind::Symlink,
+            S_IFCHR => InodeKind::CharDevice,
+            S_IFBLK => InodeKind::BlockDevice,
+            S_IFIFO => InodeKind::Fifo,
+            S_IFSOCK => InodeKind::Socket,
+            _ => InodeKind::Regular,
+        }
+    }
+}
+
+const fn kind_to_ifmt(kind: InodeKind) -> u16 {
+    match kind {
+        InodeKind::Regular => S_IFREG,
+        InodeKind::Directory => S_IFDIR,
+        InodeKind::Symlink => S_IFLNK,
+        InodeKind::CharDevice => S_IFCHR,
+        InodeKind::BlockDevice => S_IFBLK,
+        InodeKind::Fifo => S_IFIFO,
+        InodeKind::Socket => S_IFSOCK,
     }
 }
 
