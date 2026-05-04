@@ -156,17 +156,34 @@ const fn kind_to_ifmt(kind: InodeKind) -> u16 {
     }
 }
 
+// Opaque directory iteration cursor per
+// `docs/design/05_filesystem/TX_EXT4_PLAN_v1_2.md` §pub-types: filesystem
+// implementations define the internal byte layout. Helpers below cover the
+// common case of a u64-shaped cursor stored in the leading 8 bytes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DirCursor(u64);
+pub struct DirCursor(pub [u8; 16]);
 
 impl DirCursor {
-    pub const START: Self = Self(0);
+    pub const START: Self = Self([0; 16]);
 
-    pub const fn new(value: u64) -> Self {
-        Self(value)
+    pub const fn new(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn from_u64(value: u64) -> Self {
+        let v = value.to_le_bytes();
+        Self([
+            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
     }
 
     pub const fn as_u64(self) -> u64 {
+        u64::from_le_bytes([
+            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5], self.0[6], self.0[7],
+        ])
+    }
+
+    pub const fn bytes(self) -> [u8; 16] {
         self.0
     }
 }
