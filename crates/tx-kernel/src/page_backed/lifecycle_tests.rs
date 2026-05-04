@@ -17,11 +17,14 @@ struct LifecycleFs {
     flushes: AtomicUsize,
     fsyncs: AtomicUsize,
     truncates: AtomicUsize,
+    fallocates: AtomicUsize,
     last_object: AtomicU64,
     last_offset: AtomicU64,
     last_truncate_size: AtomicU64,
+    last_fallocate_size: AtomicU64,
     block_flush_after: Option<usize>,
     truncate_outcome: StepOutcome<()>,
+    fallocate_outcome: StepOutcome<()>,
 }
 
 impl LifecycleFs {
@@ -30,11 +33,21 @@ impl LifecycleFs {
             flushes: AtomicUsize::new(0),
             fsyncs: AtomicUsize::new(0),
             truncates: AtomicUsize::new(0),
+            fallocates: AtomicUsize::new(0),
             last_object: AtomicU64::new(0),
             last_offset: AtomicU64::new(0),
             last_truncate_size: AtomicU64::new(0),
+            last_fallocate_size: AtomicU64::new(0),
             block_flush_after: None,
             truncate_outcome: StepOutcome::Done(()),
+            fallocate_outcome: StepOutcome::Done(()),
+        }
+    }
+
+    fn failing_fallocate(errno: Errno) -> Self {
+        Self {
+            fallocate_outcome: StepOutcome::Err(errno),
+            ..Self::new()
         }
     }
 
@@ -101,6 +114,19 @@ impl FsPageBacking for LifecycleFs {
         self.last_object
             .store(fs_object_id.as_u64(), Ordering::Release);
         StepOutcome::Done(())
+    }
+
+    fn fallocate(
+        &self,
+        fs_object_id: FsObjectId,
+        new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        self.fallocates.fetch_add(1, Ordering::AcqRel);
+        self.last_object
+            .store(fs_object_id.as_u64(), Ordering::Release);
+        self.last_fallocate_size.store(new_size, Ordering::Release);
+        self.fallocate_outcome.clone()
     }
 }
 
@@ -475,4 +501,134 @@ fn pagebacked_step_fsync_is_noop_for_anon_and_device() {
 
     assert_eq!(step_fsync(&anon, &guard), StepOutcome::Done(()));
     assert_eq!(step_fsync(&device, &guard), StepOutcome::Done(()));
+}
+
+#[test]
+fn pagebacked_step_fallocate_grows_anon_visible_size_without_materializing_pages() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        4,
+    );
+    assert_eq!(step_truncate(&pc, 8, &guard), StepOutcome::Done(()));
+    assert_eq!(pc.size_bytes(), 8);
+
+    assert_eq!(
+        step_fallocate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64 + 17, &guard),
+        StepOutcome::Done(())
+    );
+
+    assert_eq!(pc.size_bytes(), 2 * crate::vm::USER_PAGE_SIZE as u64 + 17);
+    assert_eq!(pc.resident_pages(), 0);
+}
+
+#[test]
+fn pagebacked_step_fallocate_calls_file_backing_before_publishing_size() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let fs = Arc::new(LifecycleFs::new());
+    let pc = file_page_container(fs.clone(), FsObjectId::new(91));
+    assert_eq!(step_truncate(&pc, 16, &guard), StepOutcome::Done(()));
+    assert_eq!(fs.truncates.load(Ordering::Acquire), 1);
+
+    let new_size = 3 * crate::vm::USER_PAGE_SIZE as u64;
+    assert_eq!(step_fallocate(&pc, new_size, &guard), StepOutcome::Done(()));
+
+    assert_eq!(fs.fallocates.load(Ordering::Acquire), 1);
+    assert_eq!(fs.last_fallocate_size.load(Ordering::Acquire), new_size);
+    assert_eq!(fs.last_object.load(Ordering::Acquire), 91);
+    assert_eq!(pc.size_bytes(), new_size);
+    assert_eq!(pc.resident_pages(), 0);
+}
+
+#[test]
+fn pagebacked_step_fallocate_leaves_state_unchanged_when_file_backing_fails() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let fs = Arc::new(LifecycleFs::failing_fallocate(Errno::EDQUOT));
+    let pc = file_page_container(fs.clone(), FsObjectId::new(92));
+    assert_eq!(step_truncate(&pc, 16, &guard), StepOutcome::Done(()));
+    let baseline_size = pc.size_bytes();
+
+    assert_eq!(
+        step_fallocate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
+        StepOutcome::Err(Errno::EDQUOT)
+    );
+
+    assert_eq!(fs.fallocates.load(Ordering::Acquire), 1);
+    assert_eq!(pc.size_bytes(), baseline_size);
+}
+
+#[test]
+fn pagebacked_step_fallocate_rejects_device_and_capacity_growth() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let device = PageContainer::new(
+        PageContainerKind::Device {
+            base_ppn: Ppn(0xface_3000),
+            page_count: 1,
+        },
+        1,
+    );
+
+    assert_eq!(
+        step_fallocate(&device, 16, &guard),
+        StepOutcome::Err(Errno::EINVAL)
+    );
+
+    let anon = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        2,
+    );
+    let beyond = 3 * crate::vm::USER_PAGE_SIZE as u64;
+    assert_eq!(
+        step_fallocate(&anon, beyond, &guard),
+        StepOutcome::Err(Errno::EINVAL)
+    );
+    assert_eq!(anon.size_bytes(), 2 * crate::vm::USER_PAGE_SIZE as u64);
+}
+
+#[test]
+fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let fs = Arc::new(LifecycleFs::new());
+    let pc = file_page_container(fs.clone(), FsObjectId::new(93));
+    assert_eq!(
+        step_truncate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
+        StepOutcome::Done(())
+    );
+    let stable_size = pc.size_bytes();
+
+    assert_eq!(
+        step_fallocate(&pc, stable_size, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_fallocate(&pc, stable_size - 1, &guard),
+        StepOutcome::Done(())
+    );
+
+    assert_eq!(fs.fallocates.load(Ordering::Acquire), 0);
+    assert_eq!(pc.size_bytes(), stable_size);
 }

@@ -130,6 +130,62 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<()> {
     }
 }
 
+/// Reserve space up to `new_size` for future writes per PAGE_BACKED §5.5.
+///
+/// - Device backings reject with `EINVAL` (the device aperture is fixed).
+/// - `new_size` beyond the fixed `page_count` capacity rejects with
+///   `EINVAL`; the capacity bound is preserved.
+/// - `new_size <= pc.size_bytes()` is a `Done(())` no-op (fallocate cannot
+///   shrink; that is the truncate path).
+/// - File backings call `FsPageBacking::fallocate` first; on backing
+///   success, `pc.size_bytes` is published. Pages are not materialized.
+/// - Anon backings simply publish the new visible size; per spec this is
+///   "mostly a hint".
+pub fn step_fallocate(pc: &PageContainer, new_size: u64, guard: &Guard<'_>) -> StepOutcome<()> {
+    if matches!(pc.kind(), PageContainerKind::Device { .. }) {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+
+    let Some(capacity) = pc.byte_capacity() else {
+        return StepOutcome::Err(Errno::EINVAL);
+    };
+    if new_size > capacity {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+
+    if new_size <= pc.size_bytes() {
+        return StepOutcome::Done(());
+    }
+
+    let fs_advanced = match pc.kind() {
+        PageContainerKind::File {
+            mount,
+            fs_object_id,
+        } => match mount
+            .fs_page_backing
+            .fallocate(*fs_object_id, new_size, guard)
+        {
+            StepOutcome::Done(()) => false,
+            StepOutcome::Advanced(()) => true,
+            StepOutcome::Blocked(token) => return StepOutcome::Blocked(token),
+            StepOutcome::AdvancedThenBlocked((), token) => {
+                return StepOutcome::AdvancedThenBlocked((), token);
+            }
+            StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+        },
+        PageContainerKind::Anon { .. } => false,
+        PageContainerKind::Device { .. } => unreachable!(),
+    };
+
+    pc.set_size_bytes(new_size);
+
+    if fs_advanced {
+        StepOutcome::Advanced(())
+    } else {
+        StepOutcome::Done(())
+    }
+}
+
 fn first_page_after_size(size: u64) -> Option<PageIndex> {
     let page_size = crate::vm::USER_PAGE_SIZE as u64;
     if size == 0 {
