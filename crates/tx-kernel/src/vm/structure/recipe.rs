@@ -1,71 +1,154 @@
-//! Authoritative staged recipe range index.
+//! Authoritative recipe range index, published lock-free under EBR.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
+use crate::execution::Guard;
 use crate::sync::SpinMutex;
+use tx_substrate::epoch;
 
 use super::{
     AddressSpaceStats, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry,
     VmEntryError, VmEntryFlags, VmMapCommit, VmMapError, USER_PAGE_SIZE,
 };
 
+type RecipeTree = BTreeMap<UserVirtAddr, VmEntry>;
+
 /// Authoritative recipe range index.
 ///
-/// This wrapper is backed by `BTreeMap` keyed by mapping start address, so it
-/// is no longer the artificial fixed-capacity array from the first slice. It
-/// still deliberately stops short of VM_v1_2's persistent/epoch snapshot
-/// contract until the substrate exposes a fitting persistent range index.
+/// The published tree is owned by an `AtomicPtr<RecipeTree>` and reachable via
+/// EBR (`tx_substrate::epoch`): readers under a `Guard<'_>` perform a single
+/// `Acquire` load and observe the immutable tree without holding a lock. A
+/// separate writer `mutation` mutex serializes mutators so they can build a
+/// replacement tree, atomically swap it in, and retire the old one through
+/// `epoch::retire_raw`. Old trees are freed by EBR once every reader past has
+/// drained, satisfying VM_v1_2 §1.2 publication rule with guard-scoped reader
+/// lifetimes.
 pub(in crate::vm) struct RecipeIndex {
-    entries: SpinMutex<BTreeMap<UserVirtAddr, VmEntry>>,
+    current: AtomicPtr<RecipeTree>,
+    mutation: SpinMutex<()>,
+}
+
+impl Drop for RecipeIndex {
+    fn drop(&mut self) {
+        let raw = self.current.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !raw.is_null() {
+            // SAFETY: `current` was last published from `Box::into_raw`.
+            unsafe { drop(Box::from_raw(raw)) };
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(in crate::vm) struct RecipeSnapshot {
+    entries: RecipeTree,
+}
+
+#[cfg(test)]
+impl RecipeSnapshot {
+    pub(in crate::vm) fn lookup(&self, addr: UserVirtAddr) -> Option<VmEntry> {
+        lookup_in(&self.entries, addr)
+    }
+
+    pub(in crate::vm) fn snapshot(&self) -> Vec<VmEntry> {
+        self.entries.values().cloned().collect()
+    }
 }
 
 impl RecipeIndex {
     pub(in crate::vm) fn new() -> Self {
+        let initial = Box::into_raw(Box::new(RecipeTree::new()));
         Self {
-            entries: SpinMutex::new(BTreeMap::new()),
+            current: AtomicPtr::new(initial),
+            mutation: SpinMutex::new(()),
         }
     }
 
-    pub(in crate::vm) fn lookup(&self, addr: UserVirtAddr) -> Option<VmEntry> {
-        lookup_in(&self.entries.lock(), addr)
+    /// Borrow the published tree under the caller-supplied epoch guard. The
+    /// returned reference is valid for the guard's lifetime.
+    fn pinned<'g>(&self, guard: &'g Guard<'_>) -> &'g RecipeTree {
+        let _ = guard;
+        let raw = self.current.load(Ordering::Acquire);
+        // SAFETY: the guard pins this CPU at the publication epoch, so the
+        // tree behind `raw` is not yet reclaimed. Writers retire the old
+        // pointer only after swap, and EBR guarantees no pinned reader can be
+        // observing a stale pointer issued before its guard.
+        unsafe { &*raw }
     }
 
-    pub(in crate::vm) fn stats(&self) -> AddressSpaceStats {
-        let entries = self.entries.lock();
-        stats_for(&entries)
+    #[cfg(test)]
+    pub(in crate::vm) fn snapshot_reader(&self, guard: &Guard<'_>) -> RecipeSnapshot {
+        RecipeSnapshot {
+            entries: RecipeTree::clone(self.pinned(guard)),
+        }
+    }
+
+    pub(in crate::vm) fn lookup(&self, addr: UserVirtAddr, guard: &Guard<'_>) -> Option<VmEntry> {
+        lookup_in(self.pinned(guard), addr)
+    }
+
+    pub(in crate::vm) fn stats(&self, guard: &Guard<'_>) -> AddressSpaceStats {
+        stats_for(self.pinned(guard))
     }
 
     pub(in crate::vm) fn find_free_range(
         &self,
         window: UserRange,
         page_count: usize,
+        guard: &Guard<'_>,
     ) -> Option<UserRange> {
-        let entries = self.entries.lock();
-        find_gap_in(&entries, window, page_count)
+        find_gap_in(self.pinned(guard), window, page_count)
     }
 
-    pub(in crate::vm) fn overlapping(&self, range: UserRange) -> Vec<VmEntry> {
-        let entries = self.entries.lock();
-        overlapping_in(&entries, range)
+    pub(in crate::vm) fn overlapping(&self, range: UserRange, guard: &Guard<'_>) -> Vec<VmEntry> {
+        overlapping_in(self.pinned(guard), range)
     }
 
-    pub(in crate::vm) fn snapshot(&self) -> Vec<VmEntry> {
-        let entries = self.entries.lock();
-        entries.values().cloned().collect()
+    pub(in crate::vm) fn snapshot(&self, guard: &Guard<'_>) -> Vec<VmEntry> {
+        self.pinned(guard).values().cloned().collect()
     }
 
     pub(in crate::vm) fn validate_map(
         &self,
         entry: &VmEntry,
         placement: MapPlacement,
+        guard: &Guard<'_>,
     ) -> Result<(), VmMapError> {
-        let entries = self.entries.lock();
+        let entries = self.pinned(guard);
         match placement {
-            MapPlacement::RequireFree => validate_insert_free(&entries, entry),
-            MapPlacement::FixedReplace => rewrite_fixed(&entries, entry).map(|_| ()),
+            MapPlacement::RequireFree => validate_insert_free(entries, entry),
+            MapPlacement::FixedReplace => rewrite_fixed(entries, entry).map(|_| ()),
         }
+    }
+
+    /// Replace the published tree with `next` and retire the old one through
+    /// EBR. Requires the writer mutation lock to already be held.
+    fn publish(&self, next: RecipeTree) {
+        let new_ptr = Box::into_raw(Box::new(next));
+        let old_ptr = self.current.swap(new_ptr, Ordering::AcqRel);
+        if !old_ptr.is_null() {
+            // SAFETY: every reader holds an epoch guard issued before its
+            // load; EBR delays reclamation until those guards drop. Once
+            // drained, `reclaim_recipe_tree` runs and frees the box.
+            let _ = unsafe { epoch::retire_raw(old_ptr as *mut u8, reclaim_recipe_tree) };
+        }
+    }
+
+    /// Borrow the published tree behind the writer mutation lock. The
+    /// returned reference is valid until the lock is released.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called while `self.mutation` is held by the caller; the
+    /// caller is responsible for not retaining the borrow past the swap.
+    unsafe fn under_writer_lock(&self) -> &RecipeTree {
+        let raw = self.current.load(Ordering::Acquire);
+        // SAFETY: the writer mutation lock prevents concurrent writers from
+        // swapping or retiring; readers are EBR-protected separately.
+        unsafe { &*raw }
     }
 
     pub(in crate::vm) fn commit_map(
@@ -73,26 +156,31 @@ impl RecipeIndex {
         entry: VmEntry,
         placement: MapPlacement,
     ) -> Result<VmMapCommit, VmMapError> {
-        let mut entries = self.entries.lock();
+        let _writer = self.mutation.lock();
+        // SAFETY: writer lock held, so under_writer_lock's borrow is sound.
+        let current = unsafe { self.under_writer_lock() };
         match placement {
             MapPlacement::RequireFree => {
-                validate_insert_free(&entries, &entry)?;
+                validate_insert_free(current, &entry)?;
                 let changed_pages = entry.range.page_count();
-                push_entry(&mut entries, entry);
+                let mut rewritten = RecipeTree::clone(current);
+                push_entry(&mut rewritten, entry);
+                self.publish(rewritten);
                 Ok(VmMapCommit { changed_pages })
             }
             MapPlacement::FixedReplace => {
-                let (rewritten, changed_pages) = rewrite_fixed(&entries, &entry)?;
-                *entries = rewritten;
+                let (rewritten, changed_pages) = rewrite_fixed(current, &entry)?;
+                self.publish(rewritten);
                 Ok(VmMapCommit { changed_pages })
             }
         }
     }
 
     pub(in crate::vm) fn unmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
-        let mut entries = self.entries.lock();
-        let (rewritten, changed_pages) = rewrite_unmap(&entries, range)?;
-        *entries = rewritten;
+        let _writer = self.mutation.lock();
+        let current = unsafe { self.under_writer_lock() };
+        let (rewritten, changed_pages) = rewrite_unmap(current, range)?;
+        self.publish(rewritten);
         Ok(VmMapCommit { changed_pages })
     }
 
@@ -101,9 +189,10 @@ impl RecipeIndex {
         range: UserRange,
         prot: Prot,
     ) -> Result<VmMapCommit, VmMapError> {
-        let mut entries = self.entries.lock();
-        let (rewritten, changed_pages) = rewrite_protect(&entries, range, prot)?;
-        *entries = rewritten;
+        let _writer = self.mutation.lock();
+        let current = unsafe { self.under_writer_lock() };
+        let (rewritten, changed_pages) = rewrite_protect(current, range, prot)?;
+        self.publish(rewritten);
         Ok(VmMapCommit { changed_pages })
     }
 
@@ -112,11 +201,17 @@ impl RecipeIndex {
         old_range: UserRange,
         new_range: UserRange,
     ) -> Result<VmMapCommit, VmMapError> {
-        let mut entries = self.entries.lock();
-        let (rewritten, changed_pages) = rewrite_remap_disjoint(&entries, old_range, new_range)?;
-        *entries = rewritten;
+        let _writer = self.mutation.lock();
+        let current = unsafe { self.under_writer_lock() };
+        let (rewritten, changed_pages) = rewrite_remap_disjoint(current, old_range, new_range)?;
+        self.publish(rewritten);
         Ok(VmMapCommit { changed_pages })
     }
+}
+
+unsafe fn reclaim_recipe_tree(ptr: *mut u8) {
+    // SAFETY: `ptr` was last published from `Box::into_raw(Box::new(_))`.
+    let _ = unsafe { Box::from_raw(ptr as *mut RecipeTree) };
 }
 
 pub(in crate::vm) struct AddressSpaceStatsCell {
@@ -146,10 +241,7 @@ impl AddressSpaceStatsCell {
     }
 }
 
-fn validate_insert_free(
-    entries: &BTreeMap<UserVirtAddr, VmEntry>,
-    entry: &VmEntry,
-) -> Result<(), VmMapError> {
+fn validate_insert_free(entries: &RecipeTree, entry: &VmEntry) -> Result<(), VmMapError> {
     if entries
         .values()
         .any(|existing| existing.range.overlaps(entry.range))
@@ -161,10 +253,10 @@ fn validate_insert_free(
 }
 
 fn rewrite_fixed(
-    entries: &BTreeMap<UserVirtAddr, VmEntry>,
+    entries: &RecipeTree,
     replacement: &VmEntry,
-) -> Result<(BTreeMap<UserVirtAddr, VmEntry>, usize), VmMapError> {
-    let mut rewritten = BTreeMap::new();
+) -> Result<(RecipeTree, usize), VmMapError> {
+    let mut rewritten = RecipeTree::new();
     let mut replaced_pages = 0;
 
     for existing in entries.values().cloned() {
@@ -188,10 +280,10 @@ fn rewrite_fixed(
 }
 
 fn rewrite_unmap(
-    entries: &BTreeMap<UserVirtAddr, VmEntry>,
+    entries: &RecipeTree,
     range: UserRange,
-) -> Result<(BTreeMap<UserVirtAddr, VmEntry>, usize), VmMapError> {
-    let mut rewritten = BTreeMap::new();
+) -> Result<(RecipeTree, usize), VmMapError> {
+    let mut rewritten = RecipeTree::new();
     let mut changed_pages = 0;
 
     for existing in entries.values().cloned() {
@@ -214,15 +306,15 @@ fn rewrite_unmap(
 }
 
 fn rewrite_protect(
-    entries: &BTreeMap<UserVirtAddr, VmEntry>,
+    entries: &RecipeTree,
     range: UserRange,
     prot: Prot,
-) -> Result<(BTreeMap<UserVirtAddr, VmEntry>, usize), VmMapError> {
+) -> Result<(RecipeTree, usize), VmMapError> {
     if !range_is_fully_mapped(entries, range) {
         return Err(VmMapError::MissingMapping);
     }
 
-    let mut rewritten = BTreeMap::new();
+    let mut rewritten = RecipeTree::new();
     let mut changed_pages = 0;
 
     for existing in entries.values().cloned() {
@@ -250,10 +342,10 @@ fn rewrite_protect(
 }
 
 fn rewrite_remap_disjoint(
-    entries: &BTreeMap<UserVirtAddr, VmEntry>,
+    entries: &RecipeTree,
     old_range: UserRange,
     new_range: UserRange,
-) -> Result<(BTreeMap<UserVirtAddr, VmEntry>, usize), VmMapError> {
+) -> Result<(RecipeTree, usize), VmMapError> {
     if old_range.overlaps(new_range) || old_range.len() != new_range.len() {
         return Err(VmMapError::InvalidRange);
     }
@@ -270,7 +362,7 @@ fn rewrite_remap_disjoint(
         ),
     )?;
 
-    let mut rewritten = BTreeMap::new();
+    let mut rewritten = RecipeTree::new();
     let mut moved = Vec::new();
 
     for existing in entries.values().cloned() {
@@ -317,7 +409,7 @@ fn rewrite_remap_disjoint(
     Ok((rewritten, old_range.page_count() + new_range.page_count()))
 }
 
-fn range_is_fully_mapped(entries: &BTreeMap<UserVirtAddr, VmEntry>, range: UserRange) -> bool {
+fn range_is_fully_mapped(entries: &RecipeTree, range: UserRange) -> bool {
     let mut cursor = range.start().as_usize();
     let end = range.end().as_usize();
 
@@ -331,11 +423,11 @@ fn range_is_fully_mapped(entries: &BTreeMap<UserVirtAddr, VmEntry>, range: UserR
     true
 }
 
-fn push_entry(entries: &mut BTreeMap<UserVirtAddr, VmEntry>, entry: VmEntry) {
+fn push_entry(entries: &mut RecipeTree, entry: VmEntry) {
     entries.insert(entry.range.start(), entry);
 }
 
-fn lookup_in(entries: &BTreeMap<UserVirtAddr, VmEntry>, addr: UserVirtAddr) -> Option<VmEntry> {
+fn lookup_in(entries: &RecipeTree, addr: UserVirtAddr) -> Option<VmEntry> {
     entries
         .range(..=addr)
         .next_back()
@@ -343,7 +435,7 @@ fn lookup_in(entries: &BTreeMap<UserVirtAddr, VmEntry>, addr: UserVirtAddr) -> O
         .filter(|entry| entry.range.contains_addr(addr))
 }
 
-fn stats_for(entries: &BTreeMap<UserVirtAddr, VmEntry>) -> AddressSpaceStats {
+fn stats_for(entries: &RecipeTree) -> AddressSpaceStats {
     let mut stats = AddressSpaceStats::default();
     for entry in entries.values() {
         stats.recipe_count += 1;
@@ -352,11 +444,7 @@ fn stats_for(entries: &BTreeMap<UserVirtAddr, VmEntry>) -> AddressSpaceStats {
     stats
 }
 
-fn find_gap_in(
-    entries: &BTreeMap<UserVirtAddr, VmEntry>,
-    window: UserRange,
-    page_count: usize,
-) -> Option<UserRange> {
+fn find_gap_in(entries: &RecipeTree, window: UserRange, page_count: usize) -> Option<UserRange> {
     let len = page_count.checked_mul(USER_PAGE_SIZE)?;
     if len == 0 || len > window.len() {
         return None;
@@ -397,7 +485,7 @@ fn find_gap_in(
     }
 }
 
-fn overlapping_in(entries: &BTreeMap<UserVirtAddr, VmEntry>, range: UserRange) -> Vec<VmEntry> {
+fn overlapping_in(entries: &RecipeTree, range: UserRange) -> Vec<VmEntry> {
     entries
         .values()
         .filter(|entry| entry.range.overlaps(range))

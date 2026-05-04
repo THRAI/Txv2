@@ -16,13 +16,14 @@ mod structure;
 #[cfg(test)]
 mod tests;
 
-pub use execution::{MapReservation, MapReserveResult};
+pub use execution::{MadviseAdvice, MapReservation, MapReserveResult};
 pub use pmap::{PmapMappingSnapshot, PmapPublishOutcome, PmapStats, VmPmapError};
 pub use structure::{
     AccessMode, AcquirePairResult, AcquireResult, AddressSpace, AddressSpaceStats, LockMode,
     MapPlacement, PendingWriter, Prot, RangeGuard, RangeGuardPair, RangeLock, UserPage,
     UserPageIter, UserRange, UserRangeError, UserVirtAddr, VmBacking, VmEntry, VmEntryError,
-    VmEntryFlags, VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization, VmFaultOutcome,
-    VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome,
-    VmRemapRequest, WouldBlock, USER_PAGE_SIZE,
+    VmEntryFlags, VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization,
+    VmFaultMaterializationBacking, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
+    VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest, WouldBlock, RANGE_LOCK_RELEASE_MASK,
+    USER_PAGE_SIZE,
 };

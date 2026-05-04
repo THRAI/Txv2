@@ -5,10 +5,9 @@
 //! and return the evidence execution needs, while reservation and mutation stay
 //! in `execution.rs`.
 
-use crate::page_backed::PageIndex;
 use crate::vm::{
     AccessMode, AddressSpace, MapPlacement, UserRange, VmEntry, VmFault, VmFaultError,
-    VmFaultOutcome, VmMapError,
+    VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultOutcome, VmMapError,
 };
 
 pub fn require_fault_recipe(
@@ -32,7 +31,7 @@ pub fn require_fault_recipe(
 pub fn require_fault_publication(
     aspace: &AddressSpace,
     outcome: &VmFaultOutcome,
-    materialized_page: PageIndex,
+    materialization: &VmFaultMaterialization,
 ) -> Result<VmEntry, VmFaultError> {
     let entry = aspace
         .lookup(outcome.page_range.start())
@@ -40,8 +39,19 @@ pub fn require_fault_publication(
     if entry != outcome.entry || !permits_fault(&entry, outcome.access) {
         return Err(VmFaultError::StaleRecipe);
     }
-    if outcome.backing_page_index()? != materialized_page {
-        return Err(VmFaultError::StaleRecipe);
+
+    match (&entry.backing, materialization.backing) {
+        (crate::vm::VmBacking::Page { .. }, VmFaultMaterializationBacking::PageBacked) => {
+            if outcome.backing_page_index()? != materialization.page_index {
+                return Err(VmFaultError::StaleRecipe);
+            }
+        }
+        (crate::vm::VmBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
+            if outcome.private_anon_page_index()? != materialization.page_index {
+                return Err(VmFaultError::StaleRecipe);
+            }
+        }
+        _ => return Err(VmFaultError::StaleRecipe),
     }
 
     Ok(entry)
@@ -52,7 +62,8 @@ pub fn require_map_admission(
     entry: &VmEntry,
     placement: MapPlacement,
 ) -> Result<(), VmMapError> {
-    aspace.recipes.validate_map(entry, placement)
+    let guard = tx_substrate::epoch::guard();
+    aspace.recipes.validate_map(entry, placement, &guard)
 }
 
 pub const fn require_disjoint_remap(

@@ -226,6 +226,28 @@ fn zeroed_allocation_uses_installed_scrubber() {
 }
 
 #[test]
+fn installed_frame_copy_hook_copies_test_direct_map_bytes() {
+    tx_substrate::testing::init_host_for_test_once();
+    let source = tx_substrate::page_allocator::reserve_frame(ZeroPolicy::UninitFullOverwrite)
+        .expect("source frame")
+        .commit();
+    let dest = tx_substrate::page_allocator::reserve_frame(ZeroPolicy::UninitFullOverwrite)
+        .expect("dest frame")
+        .commit();
+    let pattern = [0x11, 0x22, 0x33, 0x44, 0xaa, 0xbb, 0xcc, 0xdd];
+    let mut observed = [0u8; 8];
+
+    tx_substrate::page_allocator::testing::write_frame_bytes_for_test(source.ppn(), 64, &pattern);
+    tx_substrate::page_allocator::testing::write_frame_bytes_for_test(dest.ppn(), 64, &[0u8; 8]);
+
+    tx_substrate::page_allocator::copy_frame_contents(source.ppn(), dest.ppn())
+        .expect("copy frame contents through installed hook");
+    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(dest.ppn(), 64, &mut observed);
+
+    assert_eq!(observed, pattern);
+}
+
+#[test]
 fn permanent_frame_anchor_never_returns_to_free_pool() {
     let metas = [FrameMeta::new()];
     let bitmap = [AtomicU64::new(0)];
