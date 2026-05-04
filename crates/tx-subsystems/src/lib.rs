@@ -9,6 +9,7 @@ pub mod execution;
 pub mod mount;
 pub mod page_backed;
 pub mod process;
+pub mod signal;
 pub mod thread_runtime;
 pub mod tty;
 pub mod vfs;
