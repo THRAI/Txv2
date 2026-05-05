@@ -4,6 +4,33 @@
 
 ## Current Shape
 
+- 2026-05-05 Signal delivery sweep day-1 lands on top of TTY → signal
+  end-to-end (branch `process-topology`). Realises the day-1 subset
+  of `SIGNAL_v1` §14 (selection algorithm) and §15.1 (ast_check) plus
+  `THREAD_RUNTIME_v1` §5.2 (interrupt summary). New types in
+  `signal.rs`: `InterruptSummary { deliverable_signal, termination,
+  stop_requested }` with atomic-packing helpers; `DefaultAction
+  { Term, Core, Ignore, Stop, Cont }` + `default_action(sig)`
+  table; `PendingSource { Thread, Group }`; `AstOutcome` with 6
+  variants (Continue, InitiateTermination, DefaultTerminate,
+  DefaultStop, DefaultContinue, DeliverHandler). New
+  `signal_summary: AtomicU8` on `ThreadPayload` with `interrupt_summary()`
+  accessor + crate-internal `update_summary` CAS-loop helper.
+  `post_signal` now keeps the summary current: unmasked posts set
+  `deliverable_signal`; SIGKILL sets `termination` and
+  `deliverable_signal` (uncatchable, bypasses mask); SIGSTOP-family
+  sets `stop_requested`; SIGCONT clears `stop_requested`.
+  `step_sigprocmask` recomputes `deliverable_signal` against the new
+  mask. `select_next_signal(thread)` returns the lowest deliverable
+  signum + source-queue tag, scanning `thread_pending` first then
+  `group_pending`. `ast_check(thread)` runs the SIGNAL_v1 §15.1 loop:
+  termination → InitiateTermination, else dequeue + consult
+  `sig_actions` + map `Default` via `default_action`, with Ignore /
+  Default-Ignore re-looping. 21 new tests bring suite to 272; full
+  `cargo xtask ci` green (11/11 gates). Site-A wait-adapt
+  integration, signal-frame construction, and group-exit-with-signal
+  invocation remain deferred (need reactor / scripts / HAL trap-
+  return wiring).
 - 2026-05-05 TTY → signal end-to-end typed dispatch lands on top of
   the kill-permission check (branch `process-topology`). Closes the
   last raw-id seam in TTY's job-control flow: `SignalTarget`

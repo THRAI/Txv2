@@ -218,7 +218,255 @@ impl SigActionTable {
     }
 }
 
-// ----- POSIX-shim entry points -----
+// ----- Delivery-side types (selection + AST) -----
+
+/// Per-thread interrupt summary per `THREAD_RUNTIME_v1` §5.2.
+///
+/// Cheap atomic snapshot of "is there a deliverable signal / is the
+/// thread being terminated / is a stop pending". The authoritative
+/// state lives in `thread_pending`, `group_pending`, the current mask,
+/// and `step_thread_exit`'s commit; `signal_summary` is a denormalised
+/// view kept current by `post_signal`, `step_sigprocmask`, and the
+/// SIGKILL routing path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InterruptSummary {
+    pub deliverable_signal: bool,
+    pub termination: bool,
+    pub stop_requested: bool,
+}
+
+impl InterruptSummary {
+    pub const EMPTY: Self = Self {
+        deliverable_signal: false,
+        termination: false,
+        stop_requested: false,
+    };
+
+    const DELIVERABLE_BIT: u8 = 1 << 0;
+    const TERMINATION_BIT: u8 = 1 << 1;
+    const STOP_REQUESTED_BIT: u8 = 1 << 2;
+
+    pub const fn pack(self) -> u8 {
+        let mut bits = 0u8;
+        if self.deliverable_signal {
+            bits |= Self::DELIVERABLE_BIT;
+        }
+        if self.termination {
+            bits |= Self::TERMINATION_BIT;
+        }
+        if self.stop_requested {
+            bits |= Self::STOP_REQUESTED_BIT;
+        }
+        bits
+    }
+
+    pub const fn unpack(bits: u8) -> Self {
+        Self {
+            deliverable_signal: (bits & Self::DELIVERABLE_BIT) != 0,
+            termination: (bits & Self::TERMINATION_BIT) != 0,
+            stop_requested: (bits & Self::STOP_REQUESTED_BIT) != 0,
+        }
+    }
+}
+
+/// Default action for a signal whose disposition is `SIG_DFL` per
+/// POSIX + Linux. `select_next_signal` + `ast_check` consult this when
+/// they encounter `Disposition::Default`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DefaultAction {
+    /// Terminate the process.
+    Term,
+    /// Terminate the process and dump core (for our purposes,
+    /// indistinguishable from `Term`).
+    Core,
+    /// Drop the signal silently.
+    Ignore,
+    /// Stop the process (job-control).
+    Stop,
+    /// Continue a stopped process.
+    Cont,
+}
+
+/// POSIX/Linux default-action table. Day-1 covers the subset used by
+/// the existing tests + producer catalog; signums outside the table
+/// default to `Term` (matches Linux's policy for unknown realtime
+/// signals).
+pub fn default_action(sig: Signum) -> DefaultAction {
+    match sig.raw() {
+        // Term: SIGHUP, SIGINT, SIGKILL, SIGPIPE, SIGTERM
+        1 | 2 | 9 | 13 | 15 => DefaultAction::Term,
+        // Core: SIGQUIT, SIGILL, SIGABRT, SIGSEGV
+        3 | 4 | 6 | 11 => DefaultAction::Core,
+        // Ignore: SIGCHLD, SIGWINCH (28), SIGURG (23, when wired)
+        17 | 23 | 28 => DefaultAction::Ignore,
+        // Stop: SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU
+        19..=22 => DefaultAction::Stop,
+        // Cont: SIGCONT
+        18 => DefaultAction::Cont,
+        // Realtime + unknown: terminate by default per Linux.
+        _ => DefaultAction::Term,
+    }
+}
+
+/// Source queue from which `select_next_signal` chose the signum.
+/// Used by `ast_check` to dequeue from the right queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingSource {
+    Thread,
+    Group,
+}
+
+/// Lowest deliverable signum on a thread per `SIGNAL_v1` §14.
+///
+/// Selection order: thread-directed pending first (lowest signum),
+/// then group-directed pending (lowest signum). Both intersected with
+/// `!signal_mask`. Returns the chosen signum + the source queue
+/// without dequeuing — the caller (`ast_check`) dequeues only after
+/// consulting `sig_actions`, since some dispositions (Ignore,
+/// Default-Ignore) drop the signal and the loop re-selects.
+pub fn select_next_signal(
+    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+) -> Option<(Signum, PendingSource)> {
+    let payload_guard = thread.payload.lock();
+    let payload = payload_guard.as_ref()?;
+    let mask = payload.signal_mask();
+
+    // Thread-directed pending first.
+    let t_deliverable = payload.pending().deliverable_bits(mask);
+    if let Some(sig) = lowest_signum_bit(t_deliverable) {
+        return Some((sig, PendingSource::Thread));
+    }
+    drop(payload_guard);
+
+    // Group-directed pending next.
+    let guard = tx_substrate::epoch::guard();
+    let proc = thread.owner_proc.upgrade(&guard)?;
+    drop(guard);
+
+    let proc_payload_guard = proc.payload.lock();
+    let proc_payload = proc_payload_guard.as_ref()?;
+
+    // Mask check uses the same per-thread mask (re-read in case it
+    // changed between blocks; cheap).
+    let mask = thread
+        .payload
+        .lock()
+        .as_ref()
+        .map(|p| p.signal_mask())
+        .unwrap_or(SignalMask::EMPTY);
+
+    let g_deliverable = proc_payload.group_pending().deliverable_bits(mask);
+    lowest_signum_bit(g_deliverable).map(|sig| (sig, PendingSource::Group))
+}
+
+fn lowest_signum_bit(bits: u64) -> Option<Signum> {
+    if bits == 0 {
+        return None;
+    }
+    let pos = bits.trailing_zeros() as u8 + 1; // bit 0 = signum 1
+    Signum::new(pos)
+}
+
+/// Outcome of `ast_check` per `SIGNAL_v1` §15.1, projected to the
+/// day-1 surface that does not yet build signal frames or invoke
+/// group-exit machinery. Each variant captures a *recognised intent*;
+/// future work materialises it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AstOutcome {
+    /// No deliverable signal; trap return proceeds to userspace.
+    Continue,
+    /// `summary.termination` is set (SIGKILL or fatal signal already
+    /// escalated). Thread should exit; the trap return must not enter
+    /// userspace.
+    InitiateTermination,
+    /// Default action for `sig` is `Term`/`Core` — process group
+    /// should exit with this signal. Future work hooks this into
+    /// `process::step_exit_group` with an exit-status that encodes
+    /// "killed by sig".
+    DefaultTerminate { sig: Signum },
+    /// Default action is `Stop` (SIGSTOP-family). Thread should park
+    /// on the stop channel; `THREAD_RUNTIME_v1` §6 owns the state
+    /// machine. Day-1 just recognises the intent.
+    DefaultStop { sig: Signum },
+    /// Default action is `Cont` (SIGCONT). Continue control op.
+    DefaultContinue { sig: Signum },
+    /// User-installed handler. Day-1 records the intent + handler
+    /// address; signal-frame construction lands with the AST trap-
+    /// return wiring.
+    DeliverHandler { sig: Signum, handler: usize },
+}
+
+/// Site-B delivery decision per `SIGNAL_v1` §15.1.
+///
+/// Selection priority:
+/// 1. `summary.termination` → `InitiateTermination` (no signal pop).
+/// 2. Loop: pick lowest deliverable signum, dequeue from its source
+///    queue, consult `sig_actions`. `Ignore` and `Default::Ignore`
+///    drop the signal and re-loop. Any other disposition returns
+///    its corresponding outcome.
+/// 3. If the loop exhausts deliverable signals, return `Continue`
+///    (so a `stop_requested` summary bit is observed by
+///    `thread_future`'s next poll, per the spec).
+///
+/// Thread must be live (`payload.is_some()`); calling on a zombie
+/// thread returns `Continue`. Owner process must also be live; if
+/// gone, returns `Continue` (no group_pending or sig_actions to
+/// consult).
+pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutcome {
+    let summary = match thread.payload.lock().as_ref() {
+        Some(p) => p.interrupt_summary(),
+        None => return AstOutcome::Continue,
+    };
+
+    if summary.termination {
+        return AstOutcome::InitiateTermination;
+    }
+
+    let guard = tx_substrate::epoch::guard();
+    let Some(proc) = thread.owner_proc.upgrade(&guard) else {
+        return AstOutcome::Continue;
+    };
+    drop(guard);
+
+    loop {
+        let Some((sig, source)) = select_next_signal(thread) else {
+            return AstOutcome::Continue;
+        };
+
+        // Dequeue from the source queue before consulting disposition,
+        // so an `Ignore` drops the signal cleanly and the loop re-selects.
+        match source {
+            PendingSource::Thread => {
+                if let Some(p) = thread.payload.lock().as_ref() {
+                    p.pending().clear(sig);
+                }
+            }
+            PendingSource::Group => {
+                if let Some(p) = proc.payload.lock().as_ref() {
+                    p.group_pending().clear(sig);
+                }
+            }
+        }
+
+        let disposition = match proc.payload.lock().as_ref() {
+            Some(p) => p.sig_actions().get(sig),
+            None => return AstOutcome::Continue,
+        };
+
+        match disposition {
+            SigDisposition::Ignore => continue,
+            SigDisposition::Default => match default_action(sig) {
+                DefaultAction::Ignore => continue,
+                DefaultAction::Term | DefaultAction::Core => {
+                    return AstOutcome::DefaultTerminate { sig };
+                }
+                DefaultAction::Stop => return AstOutcome::DefaultStop { sig },
+                DefaultAction::Cont => return AstOutcome::DefaultContinue { sig },
+            },
+            SigDisposition::Handler(handler) => return AstOutcome::DeliverHandler { sig, handler },
+        }
+    }
+}
 
 /// Result of a kill-style shim. `Delivered` if at least one thread
 /// received the post; `NoLiveThread` if the target is a zombie or its

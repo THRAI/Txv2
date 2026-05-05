@@ -67,6 +67,8 @@ pub enum SigmaskHow {
 
 /// Update the per-thread signal mask. Uncatchable signals
 /// (`SIGKILL`, `SIGSTOP`) are stripped automatically by [`SignalMask`].
+/// Per `THREAD_RUNTIME_v1` §5.2, also recomputes `signal_summary.deliverable_signal`
+/// against the new mask.
 pub fn step_sigprocmask(
     thread: &Cap<ThreadIdentity>,
     how: SigmaskHow,
@@ -85,15 +87,44 @@ pub fn step_sigprocmask(
     };
     let new = SignalMask::new(new_bits);
     payload.signal_mask.store(new.raw_bits(), Ordering::Release);
+
+    let any_deliverable = payload.pending().deliverable_bits(new) != 0;
+    payload.update_summary(|s| s.deliverable_signal = any_deliverable);
+
     SigprocmaskChange::Replaced { prev, new }
 }
 
 /// Post a single signal to a thread's pending queue. No-op if the
 /// thread is a zombie. Used by the kill shim and any future
-/// thread-targeted enqueue path.
+/// thread-targeted enqueue path. Updates `signal_summary.deliverable_signal`
+/// when the posted signal is unmasked, per `THREAD_RUNTIME_v1` §5.2.
+/// SIGKILL additionally sets `signal_summary.termination`; SIGSTOP-family
+/// sets `signal_summary.stop_requested`; SIGCONT clears `stop_requested`.
 pub fn post_signal(thread: &Cap<ThreadIdentity>, sig: Signum) {
     let payload_guard = thread.payload.lock();
-    if let Some(payload) = payload_guard.as_ref() {
-        payload.pending().post(sig);
-    }
+    let Some(payload) = payload_guard.as_ref() else {
+        return;
+    };
+    payload.pending().post(sig);
+
+    let mask = payload.signal_mask();
+    let unmasked = !mask.is_blocked(sig);
+
+    payload.update_summary(|s| {
+        if unmasked {
+            s.deliverable_signal = true;
+        }
+        if sig == Signum::SIGKILL {
+            s.termination = true;
+        }
+        if matches!(
+            sig,
+            Signum::SIGSTOP | Signum::SIGTSTP | Signum::SIGTTIN | Signum::SIGTTOU
+        ) {
+            s.stop_requested = true;
+        }
+        if sig == Signum::SIGCONT {
+            s.stop_requested = false;
+        }
+    });
 }

@@ -17,7 +17,7 @@ use crate::thread_runtime::execution::set_thread_zombie;
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload};
 use crate::vm::{AddressSpace, VmMapError};
 
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU64, AtomicU8};
 
 /// Errors from `step_fork`.
 #[derive(Debug)]
@@ -276,6 +276,7 @@ fn sign_thread(
             task: SpinMutex::new(None),
             signal_mask: AtomicU64::new(0),
             thread_pending: PendingSignalQueue::new(),
+            signal_summary: AtomicU8::new(0),
         },
     );
     let payload = tx_substrate::zone::PayloadCap::from_cap(payload_cap);

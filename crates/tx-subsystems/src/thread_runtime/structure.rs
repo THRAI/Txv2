@@ -6,13 +6,13 @@
 //! pending queue. The realtime per-occurrence queue and `signal_summary`
 //! fast-check atomic land alongside the delivery pass.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use tx_reactor::TaskKey;
 use tx_substrate::zone::{PayloadCap, Weak, Zone, ZoneAllocated};
 
 use crate::process::ProcessIdentity;
-use crate::signal::{PendingSignalQueue, SignalMask};
+use crate::signal::{InterruptSummary, PendingSignalQueue, SignalMask};
 use crate::sync::SpinMutex;
 
 /// Thread identifier. TID 0 is reserved.
@@ -68,9 +68,13 @@ pub struct ThreadPayload {
     /// Blocked-signal mask. Stored as an atomic so single-bit
     /// updates from the same thread don't need the spin mutex.
     pub(crate) signal_mask: AtomicU64,
-    /// Per-thread pending-signal bitset. Sweepable by the delivery
-    /// step (which doesn't yet exist).
+    /// Per-thread pending-signal bitset.
     pub(crate) thread_pending: PendingSignalQueue,
+    /// `InterruptSummary` packed into 8 bits, kept current by
+    /// `post_signal`, `step_sigprocmask`, `step_thread_exit`, and the
+    /// SIGKILL routing path. Read by `select_next_signal` /
+    /// `ast_check`. Per `THREAD_RUNTIME_v1` §5.2.
+    pub(crate) signal_summary: AtomicU8,
 }
 
 impl ThreadPayload {
@@ -88,6 +92,33 @@ impl ThreadPayload {
     /// Borrow the per-thread pending-signal queue.
     pub fn pending(&self) -> &PendingSignalQueue {
         &self.thread_pending
+    }
+
+    /// Snapshot the current interrupt summary.
+    pub fn interrupt_summary(&self) -> InterruptSummary {
+        InterruptSummary::unpack(self.signal_summary.load(Ordering::Acquire))
+    }
+
+    /// Atomic read-modify-write on the packed summary bits. Used by
+    /// `post_signal`, `step_sigprocmask`, etc., to keep the summary
+    /// in sync with the underlying state. The mutator is `Fn` because
+    /// the CAS loop may retry on contention.
+    pub(crate) fn update_summary(&self, f: impl Fn(&mut InterruptSummary)) {
+        let mut cur = self.signal_summary.load(Ordering::Acquire);
+        loop {
+            let mut summary = InterruptSummary::unpack(cur);
+            f(&mut summary);
+            let new = summary.pack();
+            match self.signal_summary.compare_exchange_weak(
+                cur,
+                new,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 }
 
