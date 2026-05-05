@@ -402,11 +402,11 @@ mod kill_permission {
         guard
     }
 
-    fn fresh_aspace() -> tx_substrate::zone::Cap<crate::vm::AddressSpace> {
+    fn fresh_aspace() -> Cap<crate::vm::AddressSpace> {
         crate::vm::AddressSpace::new_cap_for_platform::<crate::vm::TestPmap>().expect("aspace")
     }
 
-    fn fresh_init() -> tx_substrate::zone::Cap<crate::process::ProcessIdentity> {
+    fn fresh_init() -> Cap<crate::process::ProcessIdentity> {
         crate::process::bootstrap_init_process(fresh_aspace()).expect("init")
     }
 
@@ -575,12 +575,12 @@ mod tty_bridge {
         g
     }
 
-    fn fresh_init() -> tx_substrate::zone::Cap<ProcessIdentity> {
+    fn fresh_init() -> Cap<ProcessIdentity> {
         bootstrap_init_process(AddressSpace::new_cap_for_platform::<TestPmap>().expect("aspace"))
             .expect("init")
     }
 
-    fn fresh_tty(name: &str) -> tx_substrate::zone::Cap<TtyIdentity> {
+    fn fresh_tty(name: &str) -> Cap<TtyIdentity> {
         let id = TtyIdentity::new(TtyKind::SerialHardware, 0, name);
         let res = zone::reserve_for::<TtyIdentity>().expect("identity");
         let cap = zone::sign_for(res, id);
