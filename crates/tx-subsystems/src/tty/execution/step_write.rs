@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
-use crate::tty::checks::{require_fg_pgrp, require_live_tty};
+use crate::tty::checks::{background_write_signal, require_fg_pgrp, require_live_tty};
 use crate::tty::execution::{step_ingest, TTY_WRITABLE};
 use crate::tty::ldisc::process_output;
 use crate::tty::structure::{termios::TOSTOP, TtyIdentity, TtyTransport};
@@ -68,6 +68,40 @@ pub fn step_write_for_caller(
         .session_pgrp()
         .is_some_and(|binding| !caller.in_foreground && caller.pgrp_id != binding.foreground_pgid);
     if background && payload.with_termios(|termios| termios.c_lflag & TOSTOP != 0) {
+        return StepOutcome::Err(Errno::EIO);
+    }
+
+    step_write(tty, bytes, guard)
+}
+
+pub fn step_write_for_process(
+    tty: &Cap<TtyIdentity>,
+    bytes: &[u8],
+    caller: &Cap<crate::process::structure::ProcessIdentity>,
+    guard: &Guard<'_>,
+) -> StepOutcome<usize> {
+    let caller_info = match super::IoctlCaller::from_process_with_guard(caller, guard) {
+        Ok(caller_info) => caller_info,
+        Err(err) => return StepOutcome::Err(err),
+    };
+
+    if bytes.is_empty() {
+        return StepOutcome::Done(0);
+    }
+
+    let payload = match require_live_tty(tty, guard) {
+        Ok(payload) => payload,
+        Err(err) => return StepOutcome::Err(err),
+    };
+
+    let background = tty.session_pgrp().is_some_and(|binding| {
+        !caller_info.in_foreground && caller_info.pgrp_id != binding.foreground_pgid
+    });
+    if background && payload.with_termios(|termios| termios.c_lflag & TOSTOP != 0) {
+        let dispatch = background_write_signal(tty, caller_info);
+        let _ = super::step_ioctl::deliver_signal_dispatch_for_process_with_guard(
+            caller, dispatch, guard,
+        );
         return StepOutcome::Err(Errno::EIO);
     }
 

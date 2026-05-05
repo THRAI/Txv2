@@ -769,26 +769,35 @@ pub fn script_kill_pgrp(
     pgrp: &Cap<ProcessGroup>,
     sig: Signum,
 ) -> Result<u32, Errno> {
+    let guard = tx_substrate::epoch::guard();
+    script_kill_pgrp_with_guard(source, pgrp, sig, &guard)
+}
+
+pub(crate) fn script_kill_pgrp_with_guard(
+    source: &Cap<ProcessIdentity>,
+    pgrp: &Cap<ProcessGroup>,
+    sig: Signum,
+    guard: &tx_substrate::epoch::Guard<'_>,
+) -> Result<u32, Errno> {
     let source_cred = {
         let payload_guard = source.payload.lock();
         let payload = payload_guard.as_ref().ok_or(Errno::ESRCH)?;
         payload.cred()
     };
 
-    let guard = tx_substrate::epoch::guard();
     let mut delivered = 0u32;
     let members: alloc::vec::Vec<Cap<ProcessIdentity>> = pgrp
         .members
         .lock()
         .iter()
-        .filter_map(|w| w.upgrade(&guard))
+        .filter_map(|w| w.upgrade(guard))
         .collect();
 
     for member in &members {
         let Some(facts) = member.target_proc_cred_for(source) else {
             continue;
         };
-        if crate::cred::require_signal_send(source_cred, &facts, sig, &guard).is_err() {
+        if crate::cred::require_signal_send(source_cred, &facts, sig, guard).is_err() {
             continue;
         }
         if step_kill_process(member, sig) == KillOutcome::Delivered {
@@ -858,18 +867,25 @@ pub fn deliver_tty_dispatch(
     source: &Cap<ProcessIdentity>,
     dispatch: crate::tty::execution::SignalDispatch,
 ) -> Result<DispatchOutcome, Errno> {
+    let guard = tx_substrate::epoch::guard();
+    deliver_tty_dispatch_with_guard(source, dispatch, &guard)
+}
+
+pub fn deliver_tty_dispatch_with_guard(
+    source: &Cap<ProcessIdentity>,
+    dispatch: crate::tty::execution::SignalDispatch,
+    guard: &tx_substrate::epoch::Guard<'_>,
+) -> Result<DispatchOutcome, Errno> {
     let Some(weak) = dispatch.target.pgrp_weak() else {
         return Ok(DispatchOutcome::NoTypedPgrp);
     };
 
-    let guard = tx_substrate::epoch::guard();
-    let Some(pgrp_cap) = weak.upgrade(&guard) else {
+    let Some(pgrp_cap) = weak.upgrade(guard) else {
         return Ok(DispatchOutcome::PgrpDropped);
     };
-    drop(guard);
 
     let signum = signum_for_job_control(dispatch.signal);
-    let count = script_kill_pgrp(source, &pgrp_cap, signum)?;
+    let count = script_kill_pgrp_with_guard(source, &pgrp_cap, signum, guard)?;
     Ok(DispatchOutcome::Delivered { count })
 }
 

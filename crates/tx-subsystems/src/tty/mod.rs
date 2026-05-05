@@ -1,20 +1,23 @@
 //! TTY subsystem.
 //!
-//! # Phase A (this module)
+//! Current surface:
 //!
-//! Pure semantic core: termios flags, N_TTY line discipline state machine,
-//! and ring buffers. No VFS, no process/session, no hardware wiring.
+//! - N_TTY line discipline, termios, winsize, and queue state
+//! - zone-backed `TtyIdentity` / `TtyPayload` factoring
+//! - tty execution steps for read/write/ioctl/ingest/hangup/openpty
+//! - process-aware controlling-tty and foreground-pgrp helpers
+//! - VFS-facing dispatch through `OpenFile::{step_read, step_write, step_ioctl}`
 //!
-//! # Implementation order
+//! Still staged:
 //!
-//! - **Phase A** (current): `structure/` + `ldisc/` — no external deps.
-//! - **Phase B**: `structure/identity.rs`, `structure/payload.rs`,
-//!   `structure/registry.rs` — zone-backed entity types.
-//! - **Phase C**: `execution/step_read.rs`, `step_write.rs`,
-//!   `step_ingest.rs` — real I/O dispatch.
-//! - **Phase D+**: VFS integration, pty, hardware console, job control.
+//! - full syscall/fd-table integration remains outside this module
+//! - non-canonical `VTIME` and full Linux job-control blocking semantics
+//!   are not implemented yet
+//! - reactor/IRQ-native hardware ingest wiring is still bridged by
+//!   `step_poll_hardware_input`
 //!
-//! See `docs/ljs/TTY_DESIGN_PLAN.md` for the full staged roadmap.
+//! See `docs/design/06_devices/TTY.md` for the design target and
+//! `docs/progress/decisions/` for staged deviations that have landed.
 
 pub mod checks;
 pub mod execution;

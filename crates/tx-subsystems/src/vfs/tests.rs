@@ -4,7 +4,15 @@ use super::*;
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
-use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
+use crate::process::execution::reset_init_process_for_test;
+use crate::process::structure::{reset_pid_counter_for_test, Pgid};
+use crate::process::{bootstrap_init_process, step_fork, step_setpgid, ProcessIdentity};
+use crate::test_support::EPOCH_TEST_LOCK;
+use crate::thread_runtime::structure::reset_tid_counter_for_test;
+use crate::tty::execution::IoctlSideEffect;
+use crate::tty::structure::{Termios, TtyIdentity, TtyKind, TtyPayload, Winsize};
+use crate::vm::{AddressSpace, TestPmap};
+use crate::zones;
 use tx_substrate::zone::{self, Cap, PayloadCap};
 
 struct EchoCharOps;
@@ -33,6 +41,23 @@ static ECHO_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
 fn init_tty_zones() {
     tx_substrate::testing::init_host_for_test_once();
     crate::tty::structure::registry::register_zones().expect("tty zones");
+}
+
+fn setup_process_world() -> std::sync::MutexGuard<'static, ()> {
+    let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tx_substrate::testing::init_host_for_test_once();
+    let _ = zones::register_all();
+    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    reset_pid_counter_for_test();
+    reset_tid_counter_for_test();
+    reset_init_process_for_test();
+    guard
+}
+
+fn fresh_init() -> Cap<ProcessIdentity> {
+    bootstrap_init_process(AddressSpace::new_cap_for_platform::<TestPmap>().expect("aspace"))
+        .expect("init")
 }
 
 fn alloc_tty(kind: TtyKind, index: u32, name: &str, payload: TtyPayload) -> Cap<TtyIdentity> {
@@ -169,4 +194,208 @@ fn open_file_dispatches_struct_payload_read_write() {
     );
     assert_eq!(char_out, [b'R']);
     assert_eq!(char_file.step_write(b"abc", &guard), StepOutcome::Done(3));
+}
+
+#[test]
+fn open_file_step_ioctl_dispatches_basic_tty_requests() {
+    let _g = setup_process_world();
+    let init = fresh_init();
+    let tty = alloc_tty(
+        TtyKind::SerialHardware,
+        2,
+        "ttyS2",
+        TtyPayload::new_hardware(&ECHO_CHAR_BINDING),
+    );
+    let tty_rnode = RNode::new_cap(
+        FsObjectId::new(46),
+        InodeMeta::new(InodeKind::CharDevice, 0o020600),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty.clone()),
+        },
+    )
+    .expect("tty rnode");
+    let tty_file = OpenFile::new(
+        tty_rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+        },
+    );
+    let caller = OpenFileIoctlCaller::from_process(&init);
+
+    assert_eq!(
+        tty_file.step_ioctl(caller, OpenFileIoctl::Tcgets, &tx_substrate::epoch::guard()),
+        StepOutcome::Done(OpenFileIoctlResult::Termios(Termios::default_cooked()))
+    );
+
+    let raw = Termios::zeroed();
+    assert_eq!(
+        tty_file.step_ioctl(
+            caller,
+            OpenFileIoctl::Tcsets { termios: raw },
+            &tx_substrate::epoch::guard()
+        ),
+        StepOutcome::Done(OpenFileIoctlResult::SideEffect(Default::default()))
+    );
+    assert_eq!(
+        tty_file.step_ioctl(caller, OpenFileIoctl::Tcgets, &tx_substrate::epoch::guard()),
+        StepOutcome::Done(OpenFileIoctlResult::Termios(raw))
+    );
+
+    let winsize = Winsize::new(40, 100);
+    assert_eq!(
+        tty_file.step_ioctl(
+            caller,
+            OpenFileIoctl::Tiocswinsz { winsize },
+            &tx_substrate::epoch::guard()
+        ),
+        StepOutcome::Done(OpenFileIoctlResult::SideEffect(IoctlSideEffect {
+            session_ctl_fired: true,
+            signal: None,
+        }))
+    );
+    assert_eq!(
+        tty_file.step_ioctl(
+            caller,
+            OpenFileIoctl::Tiocgwinsz,
+            &tx_substrate::epoch::guard()
+        ),
+        StepOutcome::Done(OpenFileIoctlResult::Winsize(winsize))
+    );
+}
+
+#[test]
+fn open_file_step_ioctl_dispatches_process_aware_tty_session_ops() {
+    let _g = setup_process_world();
+    let init = fresh_init();
+    let peer = step_fork::<TestPmap>(&init).expect("fork");
+    let tty = alloc_tty(
+        TtyKind::SerialHardware,
+        3,
+        "ttyS3",
+        TtyPayload::new_hardware(&ECHO_CHAR_BINDING),
+    );
+    let tty_rnode = RNode::new_cap(
+        FsObjectId::new(47),
+        InodeMeta::new(InodeKind::CharDevice, 0o020600),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty.clone()),
+        },
+    )
+    .expect("tty rnode");
+    let tty_file = OpenFile::new(
+        tty_rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+        },
+    );
+    let init_caller = OpenFileIoctlCaller::from_process(&init);
+
+    assert_eq!(
+        tty_file.step_ioctl(
+            init_caller,
+            OpenFileIoctl::Tiocsctty,
+            &tx_substrate::epoch::guard()
+        ),
+        StepOutcome::Done(OpenFileIoctlResult::SideEffect(IoctlSideEffect {
+            session_ctl_fired: true,
+            signal: None,
+        }))
+    );
+    assert_eq!(
+        tty_file.step_ioctl(
+            init_caller,
+            OpenFileIoctl::Tiocgpgrp,
+            &tx_substrate::epoch::guard()
+        ),
+        StepOutcome::Done(OpenFileIoctlResult::Pgrp(init.pgrp_cap().pgid.0))
+    );
+    assert!(init.pgrp_cap().session_cap().has_controlling_tty());
+
+    step_setpgid(&peer, Pgid(peer.pid.0)).expect("peer gets own pgrp");
+    let peer_pgrp = peer.pgrp_cap();
+    assert_eq!(
+        tty_file.step_ioctl(
+            init_caller,
+            OpenFileIoctl::Tiocspgrp {
+                new_pgrp: &peer_pgrp
+            },
+            &tx_substrate::epoch::guard()
+        ),
+        StepOutcome::Done(OpenFileIoctlResult::SideEffect(IoctlSideEffect {
+            session_ctl_fired: true,
+            signal: None,
+        }))
+    );
+    assert_eq!(
+        tty_file.step_ioctl(
+            init_caller,
+            OpenFileIoctl::Tiocgpgrp,
+            &tx_substrate::epoch::guard()
+        ),
+        StepOutcome::Done(OpenFileIoctlResult::Pgrp(peer_pgrp.pgid.0))
+    );
+
+    assert_eq!(
+        tty_file.step_ioctl(
+            init_caller,
+            OpenFileIoctl::Tiocnotty,
+            &tx_substrate::epoch::guard()
+        ),
+        StepOutcome::Done(OpenFileIoctlResult::SideEffect(IoctlSideEffect {
+            session_ctl_fired: true,
+            signal: None,
+        }))
+    );
+    assert!(!init.pgrp_cap().session_cap().has_controlling_tty());
+}
+
+#[test]
+fn open_file_step_ioctl_rejects_non_tty_backings() {
+    let _g = setup_process_world();
+    let init = fresh_init();
+    let caller = OpenFileIoctlCaller::from_process(&init);
+
+    let char_rnode = RNode::new_cap(
+        FsObjectId::new(48),
+        InodeMeta::new(InodeKind::CharDevice, 0o020600),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::CharDevice(&ECHO_CHAR_BINDING),
+        },
+    )
+    .expect("char rnode");
+    let char_file = OpenFile::new(
+        char_rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+        },
+    );
+    assert_eq!(
+        char_file.step_ioctl(caller, OpenFileIoctl::Tcgets, &tx_substrate::epoch::guard()),
+        StepOutcome::Err(Errno::ENOSYS)
+    );
+
+    let dir_rnode = RNode::new_cap(
+        FsObjectId::new(49),
+        InodeMeta::new(InodeKind::Directory, 0o040755),
+        RNodeBacking::Directory,
+    )
+    .expect("dir rnode");
+    let dir_file = OpenFile::new(
+        dir_rnode,
+        OpenFileFlags {
+            read: true,
+            write: false,
+            append: false,
+        },
+    );
+    assert_eq!(
+        dir_file.step_ioctl(caller, OpenFileIoctl::Tcgets, &tx_substrate::epoch::guard()),
+        StepOutcome::Err(Errno::EISDIR)
+    );
 }
