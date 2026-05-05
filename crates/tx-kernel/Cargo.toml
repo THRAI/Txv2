@@ -13,5 +13,5 @@ tx-subsystems = { path = "../tx-subsystems" }
 
 [lib]
 path = "src/lib.rs"
-test = false
+test = true
 doctest = false

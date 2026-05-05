@@ -3,14 +3,25 @@
 //! Focus on the thread-side half of the identity/payload split and the
 //! parent-bookkeeping that `step_thread_exit` performs.
 
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::Wake;
+
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
 use crate::process::{bootstrap_init_process, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::step_thread_exit;
-use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentity};
+use crate::thread_runtime::structure::{
+    drain_pending_syscall_return, reset_tid_counter_for_test, ThreadIdentity,
+};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
+use tx_reactor::userspace::{SyscallRequest, UserspaceTrapInfo};
 use tx_substrate::testing::init_host_for_test_once;
 use tx_substrate::zone::Cap;
 
@@ -146,4 +157,90 @@ fn fork_assigns_distinct_tids_to_parent_and_child_leader_threads() {
         child_leader.upgrade_owner_proc().expect("alive").pid,
         child.pid
     );
+}
+
+// ---------------------------------------------------------------------------
+// Trap-handoff payload extension tests (Trio Phase 1)
+// ---------------------------------------------------------------------------
+
+struct CountWake {
+    wakes: Arc<AtomicUsize>,
+}
+
+impl Wake for CountWake {
+    fn wake(self: Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn counting_waker(wakes: Arc<AtomicUsize>) -> Waker {
+    Waker::from(Arc::new(CountWake { wakes }))
+}
+
+/// Round-trip the trap-shell handoff against a `ThreadPayload`'s
+/// `userspace_slot`: start a request, post a `Syscall` trap via the
+/// slot, drive the wait future to readiness, and observe the
+/// `UserspaceTrapInfo::Syscall` outcome. Mirrors what the trap shell
+/// does when it resolves the wait via `complete_interesting_trap`
+/// per `txdoc:REACTOR-USERSPACE-RUN-AS-A-WAIT`.
+#[test]
+fn userspace_slot_round_trip_resolves_with_syscall() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+
+    let payload_guard = leader.payload.lock();
+    let payload = payload_guard.as_ref().expect("alive");
+
+    let slot = payload.userspace_slot().clone();
+    let mut wait = slot.start_request().expect("start userspace wait");
+    let request = wait.request();
+    payload.set_active_userspace_request(Some(request));
+
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = counting_waker(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+
+    // Until the trap resolves the wait, the future stays pending.
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+    assert_eq!(wakes.load(Ordering::SeqCst), 0);
+
+    let req = SyscallRequest::new(64, [1, 2, 3, 4, 5, 6]);
+    let trap = UserspaceTrapInfo::Syscall(req);
+    slot.complete_interesting_trap(request, trap)
+        .expect("trap-shell resolves wait");
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(trap));
+}
+
+/// `pending_syscall_return` is a one-shot slot drained by the
+/// userspace-entry shim. Plan B writeback discipline: the trap shell
+/// never writes the return; the shim drains and writes it into the
+/// fresh trap frame before `enter_userspace`.
+#[test]
+fn pending_syscall_return_drains_at_userspace_entry() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+
+    let payload_guard = leader.payload.lock();
+    let payload = payload_guard.as_ref().expect("alive");
+
+    // Empty by default.
+    assert!(drain_pending_syscall_return(payload).is_none());
+
+    // Successful syscall (e.g. write returning 6 bytes).
+    payload.store_pending_syscall_return(Some(Ok(6)));
+    assert_eq!(drain_pending_syscall_return(payload), Some(Ok(6)));
+    // Drain leaves the slot empty; second drain yields None.
+    assert!(drain_pending_syscall_return(payload).is_none());
+
+    // Errno path (e.g. -ENOSYS = -38 encoded as Err(38)).
+    payload.store_pending_syscall_return(Some(Err(38)));
+    assert_eq!(drain_pending_syscall_return(payload), Some(Err(38)));
+    assert!(drain_pending_syscall_return(payload).is_none());
 }

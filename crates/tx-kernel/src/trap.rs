@@ -1,16 +1,42 @@
 use tx_hal::{
-    CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, TrapAction, TrapFrameMut, TxPlatform,
+    CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, PercpuIf, TrapAction, TrapFrameMut,
+    TxPlatform,
 };
+
+use crate::trap_handoff;
 
 pub struct KernelTrapDispatcher;
 
 impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
-    fn on_page_fault(_view: TrapFrameMut<'_>, _fault: FaultInfo) -> TrapAction {
-        TrapAction::Terminate
+    fn on_page_fault(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction {
+        // Kernel-mode page faults: keep the existing terminate
+        // policy; only user-mode faults can be handed off to a
+        // userspace-run wait.
+        if !fault.from_user {
+            return TrapAction::Terminate;
+        }
+
+        // Phase 1: snapshot context, resolve the userspace-run
+        // wait, and reschedule. Per the Trio plan's "Cross-cutting
+        // risks #1" Plan B writeback discipline, no trap-frame
+        // mutation happens here.
+        let info = trap_handoff::translate_user_pf::<P>(&view.view(), &fault);
+        let hart = <P as PercpuIf>::current_cpu_id().0;
+        let outcome = trap_handoff::hand_off_user_pf(hart, &view, info);
+        trap_handoff::outcome_to_trap_action(&outcome)
     }
 
-    fn on_syscall(_view: TrapFrameMut<'_>) -> TrapAction {
-        TrapAction::Terminate
+    fn on_syscall(view: TrapFrameMut<'_>) -> TrapAction {
+        // Phase 1: translate, snapshot context into the active
+        // payload, resolve the userspace-run wait, and reschedule.
+        // No trap-frame writeback (Plan B); the userspace-entry
+        // shim drains `pending_syscall_return` and writes
+        // `set_syscall_return` / `set_syscall_error` into the
+        // *fresh* trap frame before `enter_userspace`.
+        let req = trap_handoff::translate_syscall::<P>(&view.view());
+        let hart = <P as PercpuIf>::current_cpu_id().0;
+        let outcome = trap_handoff::hand_off_syscall(hart, &view, req);
+        trap_handoff::outcome_to_trap_action(&outcome)
     }
 
     fn on_timer_interrupt(_cpu: CpuId) -> TrapAction {
