@@ -18,6 +18,11 @@ tx-subsystems = { path = "../tx-subsystems" }
 # slot (and pid/tid counters) between runs. The same mechanism is
 # already used by Phase 2a's syscall-dispatch tests in `tx-shims`.
 tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }
+# Trio Phase 6 end-to-end smoke test consumes
+# `tx_shims::linux_syscall::dispatch` to drive the syscall table; tx-shims
+# itself is not a runtime dependency of tx-kernel (the dispatch entry
+# is consumed only from the smoke test).
+tx-shims = { path = "../tx-shims" }
 
 [lib]
 path = "src/lib.rs"
