@@ -376,6 +376,13 @@ version = "0.1.0"
 [[package]]
 name = "tx-shims"
 version = "0.1.0"
+dependencies = [
+ "tx-fs",
+ "tx-hal",
+ "tx-reactor",
+ "tx-substrate",
+ "tx-subsystems",
+]
 
 [[package]]
 name = "tx-substrate"

@@ -35,8 +35,17 @@ use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::sync::SpinMutex;
 use crate::thread_runtime::ThreadIdentity;
 use crate::tty::structure::identity::TtyIdentity;
-use crate::vfs::DEntry;
+use crate::vfs::{DEntry, OpenFile};
 use crate::vm::AddressSpace;
+
+/// Number of slots in the day-1 fixed-size fd table on `ProcessPayload`.
+///
+/// Per Trio plan §"Cross-cutting risks #6" and §"Open questions #3": a
+/// fixed 8-slot vec is sufficient for the bootstrap smoke path
+/// (fds 0/1/2 preopened via `open_console_for_init`). Growable
+/// `BTreeMap`-shaped fd tables (full POSIX `dup3`/`fcntl(F_DUPFD)`)
+/// are a follow-up beyond the trio.
+pub const FD_TABLE_SIZE: usize = 8;
 
 /// Per-process exit disposition, populated by `step_exit_group` /
 /// `step_exit_group_with_signal` / the last-thread cascade. Spec
@@ -204,6 +213,37 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().map(|p| p.aspace.clone())
     }
 
+    /// Snapshot the `Cap<OpenFile>` registered at fd `idx` on this
+    /// process's payload. Returns `None` if the process is a zombie
+    /// (no payload), `idx` is out of range for the day-1 fixed-size
+    /// fd table, or the slot is empty.
+    ///
+    /// Used by the syscall dispatcher (`tx-shims::linux_syscall`) to
+    /// resolve fds without holding the payload lock across a step's
+    /// `.await`.
+    pub fn fd(&self, idx: usize) -> Option<Cap<crate::vfs::OpenFile>> {
+        self.payload.lock().as_ref().and_then(|p| p.fd(idx))
+    }
+
+    /// Install `file` at fd `idx` on this process's payload, returning
+    /// the previously installed `Cap<OpenFile>` if any. No-op (returns
+    /// `None`) for zombies and for indices outside the fixed-size
+    /// table.
+    ///
+    /// Used by the syscall dispatcher's tests and (Phase 3b)
+    /// `init.rs` to preopen fds 0/1/2 against
+    /// `tx_fs::devfs::open_console_for_init()`.
+    pub fn set_fd(
+        &self,
+        idx: usize,
+        file: Option<Cap<crate::vfs::OpenFile>>,
+    ) -> Option<Cap<crate::vfs::OpenFile>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .and_then(|p| p.set_fd(idx, file))
+    }
+
     /// Number of currently-live threads owned by this process.
     /// Returns `0` for zombies.
     pub fn live_thread_count(&self) -> usize {
@@ -212,6 +252,23 @@ impl ProcessIdentity {
             .as_ref()
             .map(|p| p.threads.lock().len())
             .unwrap_or(0)
+    }
+
+    /// Snapshot the `Cap<ThreadIdentity>` of the thread at slot `idx`
+    /// in this process's thread list. Returns `None` for zombies and
+    /// for indices outside the live thread count.
+    ///
+    /// Used by the syscall dispatcher's tests (and the future Phase 6
+    /// userspace-entry shim) to grab the leader thread without
+    /// reaching into the `pub(crate)` payload field directly. Index 0
+    /// is always the leader for processes constructed by
+    /// `bootstrap_init_process` / `step_fork`; multi-threaded
+    /// processes (post-`clone`) extend the list.
+    pub fn nth_thread(&self, idx: usize) -> Option<Cap<ThreadIdentity>> {
+        let payload_guard = self.payload.lock();
+        let payload = payload_guard.as_ref()?;
+        let result = payload.threads.lock().get(idx).cloned();
+        result
     }
 
     /// Build the process-exported value type that `cred::require_signal_send`
@@ -296,6 +353,21 @@ pub struct ProcessPayload {
     /// empty; `step_getcwd` returns `None` for a process with no
     /// cwd installed.
     pub(crate) cwd: SpinMutex<Option<Cap<DEntry>>>,
+    /// Day-1 fixed-size fd table (`FD_TABLE_SIZE` slots).
+    ///
+    /// Per Trio plan §"Cross-cutting risks #6": a stub fd table on
+    /// `ProcessPayload` is needed by the Phase 2a syscall dispatcher
+    /// (`write` resolves `fd → Cap<OpenFile>` against this slice). Phase
+    /// 3b's `init.rs` preopens fds 0/1/2 via
+    /// `tx_fs::devfs::open_console_for_init()`; `bootstrap_init_process`
+    /// itself leaves every slot `None` because the devfs alias is not
+    /// yet registered when the kernel reaches process bootstrap.
+    ///
+    /// `step_fork` clones the slice; each `Cap<OpenFile>` is `.clone()`
+    /// so parent and child share the same `OpenFile` (no full POSIX
+    /// `dup`-shape sharing). Per the same risk note: full
+    /// `dup3`/`fcntl(F_DUPFD)` semantics are a follow-up.
+    pub(crate) fds: SpinMutex<[Option<Cap<OpenFile>>; FD_TABLE_SIZE]>,
 }
 
 impl ProcessPayload {
@@ -321,6 +393,44 @@ impl ProcessPayload {
     /// set (init pre-rootfs).
     pub fn cwd(&self) -> Option<Cap<DEntry>> {
         self.cwd.lock().clone()
+    }
+
+    /// Snapshot the `Cap<OpenFile>` registered at fd `idx`, if any.
+    ///
+    /// Returns `None` for fd indices outside the day-1 fixed-size
+    /// table (≥ `FD_TABLE_SIZE`) and for empty slots. Per Trio plan
+    /// §"Cross-cutting risks #6", the fd table is a stub: callers that
+    /// need full POSIX semantics will land beyond the trio.
+    pub fn fd(&self, idx: usize) -> Option<Cap<OpenFile>> {
+        if idx >= FD_TABLE_SIZE {
+            return None;
+        }
+        self.fds.lock()[idx].clone()
+    }
+
+    /// Install `file` at fd `idx`, returning the previously installed
+    /// `Cap<OpenFile>` if any. Returns `None` (and ignores the install)
+    /// for fd indices outside the day-1 fixed-size table.
+    ///
+    /// Used by Phase 2a tests to manually wire the console as fd 1
+    /// before dispatching `NR_WRITE`. Phase 3b's `init.rs` will use the
+    /// same accessor to preopen fds 0/1/2.
+    pub fn set_fd(&self, idx: usize, file: Option<Cap<OpenFile>>) -> Option<Cap<OpenFile>> {
+        if idx >= FD_TABLE_SIZE {
+            return None;
+        }
+        let mut slot = self.fds.lock();
+        core::mem::replace(&mut slot[idx], file)
+    }
+
+    /// Snapshot the entire fd table as a fresh array. Each populated
+    /// slot's `Cap<OpenFile>` is `.clone()`'d so the snapshot does not
+    /// borrow the lock; callers can drop the result freely without
+    /// touching the payload's storage. Used by `step_fork` to clone
+    /// the parent's fd table into the child.
+    pub(crate) fn snapshot_fds(&self) -> [Option<Cap<OpenFile>>; FD_TABLE_SIZE] {
+        let slot = self.fds.lock();
+        core::array::from_fn(|i| slot[i].clone())
     }
 }
 
@@ -438,7 +548,7 @@ pub fn allocate_pid() -> Pid {
     Pid(NEXT_PID.fetch_add(1, Ordering::Relaxed))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reset_pid_counter_for_test() {
     NEXT_PID.store(2, Ordering::Relaxed);
 }

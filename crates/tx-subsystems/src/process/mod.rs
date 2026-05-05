@@ -18,5 +18,5 @@ pub use execution::{
 };
 pub use structure::{
     allocate_pid, ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,
-    Sid,
+    Sid, FD_TABLE_SIZE,
 };

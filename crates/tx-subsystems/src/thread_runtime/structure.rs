@@ -331,7 +331,7 @@ pub fn allocate_tid() -> Tid {
     Tid(NEXT_TID.fetch_add(1, Ordering::Relaxed))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reset_tid_counter_for_test() {
     NEXT_TID.store(2, Ordering::Relaxed);
 }

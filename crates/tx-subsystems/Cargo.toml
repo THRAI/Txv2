@@ -13,6 +13,10 @@ doctest = false
 [features]
 default = []
 vfs-read-test-support = []
+# Cross-crate test helpers (zone reset / pid counter reset / init slot
+# reset). Off by default; enabled by sibling crates' `[dev-dependencies]`
+# entries (e.g. `tx-shims`'s Phase 2a syscall-dispatch tests).
+test-support = []
 
 [dependencies]
 tx-hal = { path = "../tx-hal" }
