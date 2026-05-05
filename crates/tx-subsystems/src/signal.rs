@@ -477,11 +477,21 @@ pub enum KillOutcome {
     NoLiveThread,
 }
 
-/// Deliver `sig` to a single process by routing it to a live leader
-/// thread. Zombies are skipped. Day-1 routes to *the first live
-/// thread*; later passes select per process-shared/per-thread signal
-/// semantics.
+/// Deliver `sig` to a single process. Per `SIGNAL_v1` §1, §12.1
+/// dispatches by category:
+///
+/// - **Gewalt** signums (SIGKILL, SIGSTOP, SIGCONT) bypass the
+///   pending queue entirely and route through [`route_gewalt`],
+///   which updates each thread's `signal_summary` in place.
+/// - **Event** signums (catchable) route to the first live thread's
+///   `thread_pending` via [`post_signal`].
+///
+/// Zombies are skipped.
 pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
+    if is_gewalt(sig) {
+        return route_gewalt(target, sig);
+    }
+
     let payload_guard = target.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
         return KillOutcome::NoLiveThread;
@@ -497,23 +507,92 @@ pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutc
     KillOutcome::Delivered
 }
 
-/// Deliver `sig` to every live process in `pgrp`. Each delivered
-/// member also gets the bit set on its `group_pending` queue so the
-/// (future) delivery step can distinguish thread-targeted from
-/// group-targeted signals when consulting per-process action tables.
+/// `true` for the three Gewalt signums per `SIGNAL_v1` §1: SIGKILL,
+/// SIGSTOP, SIGCONT. These bypass the catchable pending queues and
+/// are routed by [`route_gewalt`].
+pub const fn is_gewalt(sig: Signum) -> bool {
+    matches!(
+        sig.raw(),
+        9  /* SIGKILL */ | 19 /* SIGSTOP */ | 18 /* SIGCONT */
+    )
+}
+
+/// Apply a Gewalt signal to every live thread of `target`. Per
+/// `SIGNAL_v1` §12.3, Gewalt signals do not enter pending queues —
+/// they directly transform the target's interrupt-summary state, and
+/// (in fully-realised form) invoke control ops (group exit, group
+/// stop, group continue). Day-1 records the summary updates only;
+/// the control-op invocations land with `step_exit_group_with_signal`,
+/// stop-state machinery, and continue-state machinery.
+///
+/// - SIGKILL → every thread gets `summary.termination` set, plus
+///   `summary.deliverable_signal` so any interruptible wait wakes.
+/// - SIGSTOP → every thread gets `summary.stop_requested` set.
+/// - SIGCONT → every thread gets `summary.stop_requested` cleared.
+///
+/// Returns `Delivered` if the target has at least one live thread,
+/// `NoLiveThread` otherwise.
+pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
+    debug_assert!(is_gewalt(sig), "route_gewalt called with non-Gewalt signum");
+
+    let payload_guard = target.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return KillOutcome::NoLiveThread;
+    };
+    let threads: alloc::vec::Vec<Cap<crate::thread_runtime::ThreadIdentity>> =
+        payload.threads.lock().iter().cloned().collect();
+    drop(payload_guard);
+
+    let mut touched = false;
+    for thread in &threads {
+        let payload_guard = thread.payload.lock();
+        let Some(thread_payload) = payload_guard.as_ref() else {
+            continue;
+        };
+        thread_payload.update_summary(|s| match sig.raw() {
+            9 => {
+                s.termination = true;
+                s.deliverable_signal = true;
+            }
+            19 => s.stop_requested = true,
+            18 => s.stop_requested = false,
+            _ => unreachable!("is_gewalt guarantees one of these signums"),
+        });
+        touched = true;
+    }
+
+    if touched {
+        KillOutcome::Delivered
+    } else {
+        KillOutcome::NoLiveThread
+    }
+}
+
+/// Deliver `sig` to every live process in `pgrp`. Catchable signals
+/// also get the bit set on each delivered member's `group_pending`
+/// queue so the (future) delivery step can distinguish thread-
+/// targeted from group-targeted posts. Gewalt signals bypass the
+/// pending queues entirely per `SIGNAL_v1` §2 Consequence 2 — they
+/// route through [`route_gewalt`] which directly updates each
+/// thread's `signal_summary`.
+///
 /// Returns the count of processes that received the post.
 pub fn step_kill_pgrp(pgrp: &Cap<ProcessGroup>, sig: Signum) -> usize {
     let guard = tx_substrate::epoch::guard();
     let mut delivered = 0usize;
+    let catchable = !is_gewalt(sig);
     for weak in pgrp.members.lock().iter() {
         let Some(member) = weak.upgrade(&guard) else {
             continue;
         };
         if step_kill_process(&member, sig) == KillOutcome::Delivered {
-            // Mirror onto the per-process group_pending queue so
-            // delivery code can recognise group-targeted posts.
-            if let Some(payload) = member.payload.lock().as_ref() {
-                payload.group_pending().post(sig);
+            // Catchable only: mirror onto group_pending so the
+            // delivery step can recognise group-targeted posts.
+            // Gewalt bypasses pending queues entirely.
+            if catchable {
+                if let Some(payload) = member.payload.lock().as_ref() {
+                    payload.group_pending().post(sig);
+                }
             }
             delivered += 1;
         }
@@ -675,10 +754,13 @@ pub fn script_kill_pgrp(
             continue;
         }
         if step_kill_process(member, sig) == KillOutcome::Delivered {
-            // Mirror onto the per-process group_pending so future
-            // delivery code can recognise group-targeted posts.
-            if let Some(payload) = member.payload.lock().as_ref() {
-                payload.group_pending().post(sig);
+            // Catchable only: mirror onto group_pending. Gewalt
+            // signals (SIGKILL/SIGSTOP/SIGCONT) bypass pending
+            // queues entirely per SIGNAL_v1 §2 Consequence 2.
+            if !is_gewalt(sig) {
+                if let Some(payload) = member.payload.lock().as_ref() {
+                    payload.group_pending().post(sig);
+                }
             }
             delivered += 1;
         }

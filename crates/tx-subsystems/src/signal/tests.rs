@@ -1013,20 +1013,13 @@ mod delivery {
         );
     }
 
-    #[test]
-    fn ast_check_default_continue_for_sigcont() {
-        let _g = setup();
-        let proc_cap = fresh_init();
-        let leader = leader(&proc_cap);
-
-        post_signal(&leader, Signum::SIGCONT);
-        assert_eq!(
-            ast_check(&leader),
-            AstOutcome::DefaultContinue {
-                sig: Signum::SIGCONT
-            }
-        );
-    }
+    // SIGCONT is Gewalt: route_gewalt clears stop_requested directly
+    // and does not enqueue to thread_pending. The AstOutcome::DefaultContinue
+    // variant remains in the enum for the future case where SIGCONT
+    // is enqueued to group_pending for handler delivery (per SIGNAL_v1
+    // §12.3 route_sigcont's handler half), but day-1 doesn't enqueue
+    // from route_gewalt at all. Test removed; sigcont_does_not_enter_thread_pending
+    // covers the bypass.
 
     #[test]
     fn ast_check_deliver_handler_when_handler_installed() {
@@ -1148,24 +1141,27 @@ mod delivery {
     }
 
     #[test]
-    fn sigstop_post_sets_summary_stop_requested() {
+    fn sigstop_routed_via_step_kill_sets_summary_stop_requested() {
         let _g = setup();
         let proc_cap = fresh_init();
         let leader = leader(&proc_cap);
 
-        post_signal(&leader, Signum::SIGSTOP);
+        // SIGSTOP is Gewalt — must go through step_kill_process which
+        // dispatches to route_gewalt; calling post_signal directly
+        // would debug_assert.
+        let _ = step_kill_process(&proc_cap, Signum::SIGSTOP);
 
         let summary = leader.payload.lock().as_ref().unwrap().interrupt_summary();
         assert!(summary.stop_requested);
     }
 
     #[test]
-    fn sigcont_post_clears_stop_requested() {
+    fn sigcont_routed_via_step_kill_clears_stop_requested() {
         let _g = setup();
         let proc_cap = fresh_init();
         let leader = leader(&proc_cap);
 
-        post_signal(&leader, Signum::SIGTSTP);
+        let _ = step_kill_process(&proc_cap, Signum::SIGSTOP);
         assert!(
             leader
                 .payload
@@ -1176,7 +1172,7 @@ mod delivery {
                 .stop_requested
         );
 
-        post_signal(&leader, Signum::SIGCONT);
+        let _ = step_kill_process(&proc_cap, Signum::SIGCONT);
         assert!(
             !leader
                 .payload
@@ -1185,6 +1181,138 @@ mod delivery {
                 .unwrap()
                 .interrupt_summary()
                 .stop_requested
+        );
+    }
+
+    // ----- Gewalt vs event factoring (SIGNAL_v1 §1, §2 Consequence 2) -----
+
+    #[test]
+    fn sigkill_does_not_enter_thread_pending() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        let _ = step_kill_process(&proc_cap, Signum::SIGKILL);
+
+        let pending = leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .pending()
+            .is_pending(Signum::SIGKILL);
+        assert!(
+            !pending,
+            "SIGKILL is Gewalt: must bypass thread_pending per SIGNAL_v1 §2 Consequence 2"
+        );
+        assert!(
+            leader
+                .payload
+                .lock()
+                .as_ref()
+                .unwrap()
+                .interrupt_summary()
+                .termination
+        );
+    }
+
+    #[test]
+    fn sigstop_does_not_enter_thread_pending() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        let _ = step_kill_process(&proc_cap, Signum::SIGSTOP);
+
+        assert!(!leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .pending()
+            .is_pending(Signum::SIGSTOP));
+        assert!(
+            leader
+                .payload
+                .lock()
+                .as_ref()
+                .unwrap()
+                .interrupt_summary()
+                .stop_requested
+        );
+    }
+
+    #[test]
+    fn sigcont_does_not_enter_thread_pending() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        let _ = step_kill_process(&proc_cap, Signum::SIGCONT);
+
+        assert!(!leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .pending()
+            .is_pending(Signum::SIGCONT));
+    }
+
+    #[test]
+    fn route_gewalt_marks_target_threads_only() {
+        let _g = setup();
+        let parent = fresh_init();
+        let child = crate::process::step_fork::<TestPmap>(&parent).expect("fork");
+
+        // SIGKILL on the parent sweeps only the parent's threads —
+        // fork doesn't share threads. The unrelated child is untouched.
+        let _ = crate::signal::route_gewalt(&parent, Signum::SIGKILL);
+
+        let parent_leader = leader(&parent);
+        let child_leader = leader(&child);
+
+        assert!(
+            parent_leader
+                .payload
+                .lock()
+                .as_ref()
+                .unwrap()
+                .interrupt_summary()
+                .termination
+        );
+        assert!(
+            !child_leader
+                .payload
+                .lock()
+                .as_ref()
+                .unwrap()
+                .interrupt_summary()
+                .termination
+        );
+    }
+
+    #[test]
+    fn step_kill_pgrp_does_not_mirror_gewalt_to_group_pending() {
+        let _g = setup();
+        let parent = fresh_init();
+        let _child = crate::process::step_fork::<TestPmap>(&parent).expect("fork");
+        let pgrp = parent.pgrp_cap();
+
+        let _ = crate::signal::step_kill_pgrp(&pgrp, Signum::SIGSTOP);
+
+        // group_pending must NOT have SIGSTOP set: Gewalt bypasses
+        // pending queues entirely per SIGNAL_v1 §2 Consequence 2.
+        let parent_group_pending = parent
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .group_pending()
+            .is_pending(Signum::SIGSTOP);
+        assert!(
+            !parent_group_pending,
+            "Gewalt must not be mirrored onto group_pending"
         );
     }
 }

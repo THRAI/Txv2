@@ -94,13 +94,31 @@ pub fn step_sigprocmask(
     SigprocmaskChange::Replaced { prev, new }
 }
 
-/// Post a single signal to a thread's pending queue. No-op if the
-/// thread is a zombie. Used by the kill shim and any future
-/// thread-targeted enqueue path. Updates `signal_summary.deliverable_signal`
-/// when the posted signal is unmasked, per `THREAD_RUNTIME_v1` §5.2.
-/// SIGKILL additionally sets `signal_summary.termination`; SIGSTOP-family
-/// sets `signal_summary.stop_requested`; SIGCONT clears `stop_requested`.
+/// Post a single catchable signal to a thread's pending queue.
+/// No-op if the thread is a zombie.
+///
+/// **Precondition**: `sig` is *not* a Gewalt signum
+/// (SIGKILL/SIGSTOP/SIGCONT) — those bypass pending queues entirely
+/// per `SIGNAL_v1` §1, §2 Consequence 2 and route through
+/// `signal::route_gewalt` which updates `signal_summary` directly
+/// without enqueueing.
+///
+/// Sets `signal_summary.deliverable_signal` when the posted signal
+/// is unmasked, per `THREAD_RUNTIME_v1` §5.2. SIGTSTP-family
+/// (SIGTSTP, SIGTTIN, SIGTTOU) is *catchable* and goes through this
+/// path; the default action is `Stop` which `ast_check` recognises,
+/// but the bit only sets `summary.stop_requested` once a real
+/// stop-state machine consumes it (deferred). For now SIGTSTP-family
+/// posts behave exactly like any other catchable signal at this
+/// layer — the stop intent is materialised by `ast_check` returning
+/// `DefaultStop`, not by a summary bit set here.
 pub fn post_signal(thread: &Cap<ThreadIdentity>, sig: Signum) {
+    debug_assert!(
+        !matches!(sig, Signum::SIGKILL | Signum::SIGSTOP | Signum::SIGCONT),
+        "post_signal must not be called with Gewalt signums (SIGKILL/SIGSTOP/SIGCONT); \
+         use signal::route_gewalt or signal::step_kill_process which dispatches"
+    );
+
     let payload_guard = thread.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
         return;
@@ -108,23 +126,7 @@ pub fn post_signal(thread: &Cap<ThreadIdentity>, sig: Signum) {
     payload.pending().post(sig);
 
     let mask = payload.signal_mask();
-    let unmasked = !mask.is_blocked(sig);
-
-    payload.update_summary(|s| {
-        if unmasked {
-            s.deliverable_signal = true;
-        }
-        if sig == Signum::SIGKILL {
-            s.termination = true;
-        }
-        if matches!(
-            sig,
-            Signum::SIGSTOP | Signum::SIGTSTP | Signum::SIGTTIN | Signum::SIGTTOU
-        ) {
-            s.stop_requested = true;
-        }
-        if sig == Signum::SIGCONT {
-            s.stop_requested = false;
-        }
-    });
+    if !mask.is_blocked(sig) {
+        payload.update_summary(|s| s.deliverable_signal = true);
+    }
 }
