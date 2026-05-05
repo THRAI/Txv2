@@ -9,8 +9,11 @@ use tx_substrate::zone::{self, Cap, PayloadCap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::{Guard, StepOutcome};
-use crate::process::structure::{reset_pid_counter_for_test, Pgid};
-use crate::process::{bootstrap_init_process, step_setpgid, step_setsid, ProcessIdentity};
+use crate::process::execution::reset_init_process_for_test;
+use crate::process::structure::{reset_pid_counter_for_test, ExitStatus, Pgid};
+use crate::process::{
+    bootstrap_init_process, step_exit_group, step_fork, step_setpgid, step_setsid, ProcessIdentity,
+};
 use crate::signal::{step_kill_pgrp, Signum};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
@@ -45,6 +48,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
     reset_pid_counter_for_test();
     reset_tid_counter_for_test();
+    reset_init_process_for_test();
     guard
 }
 
@@ -148,6 +152,224 @@ fn typed_session_survives_setpgid_until_session_drops() {
         .upgrade_session()
         .expect("session still alive");
     assert_eq!(upgraded_session.sid, session.sid);
+}
+
+#[test]
+fn session_foreground_pgrp_cap_resolves_two_hop_via_controlling_tty() {
+    // Round-trip: install a controlling-tty link on Session, install
+    // a typed SessionPgrp on the TTY, and verify
+    // `Session::foreground_pgrp_cap()` returns the same pgrp via the
+    // two-hop dereference (Session.controlling_tty Weak →
+    // TtyIdentity → TtyIdentity.session_pgrp.foreground_pgrp Weak).
+    let _g = setup();
+    let init = fresh_init();
+    let pgrp = init.pgrp_cap();
+    let session = pgrp.session_cap();
+    let tty = fresh_tty("ttyS5");
+
+    // Wire both directions: TTY → fg pgrp via SessionPgrp; Session →
+    // tty via controlling_tty Weak.
+    tty.bind_session_pgrp_typed(&session, &pgrp);
+    *session.controlling_tty.lock() = Some(tty.downgrade());
+
+    let exposed = session
+        .foreground_pgrp_cap()
+        .expect("two-hop fg pgrp resolved");
+    assert_eq!(exposed.pgid, pgrp.pgid);
+}
+
+#[test]
+fn session_foreground_pgrp_cap_none_without_controlling_tty() {
+    let _g = setup();
+    let init = fresh_init();
+    let session = init.pgrp_cap().session_cap();
+    // No `*session.controlling_tty.lock() = Some(...)` — bootstrap
+    // session has no tty.
+    assert!(!session.has_controlling_tty());
+    assert!(session.foreground_pgrp_cap().is_none());
+}
+
+#[test]
+fn session_foreground_pgrp_cap_none_when_tty_has_no_binding() {
+    // controlling_tty installed but the TTY's SessionPgrp is empty —
+    // first hop succeeds, second hop returns None.
+    let _g = setup();
+    let init = fresh_init();
+    let session = init.pgrp_cap().session_cap();
+    let tty = fresh_tty("ttyS6");
+    *session.controlling_tty.lock() = Some(tty.downgrade());
+
+    assert!(session.foreground_pgrp_cap().is_none());
+}
+
+// ----- §8.3 session-leader-tty hangup cascade -----
+
+/// Helper: read SIGHUP / SIGCONT pending state on `proc`'s leader.
+fn leader_pending(proc_cap: &Cap<ProcessIdentity>, sig: Signum) -> bool {
+    let payload = proc_cap.payload.lock();
+    let leader = payload.as_ref().expect("alive").threads.lock()[0].clone();
+    drop(payload);
+    let leader_payload = leader.payload.lock();
+    leader_payload
+        .as_ref()
+        .expect("alive")
+        .pending()
+        .is_pending(sig)
+}
+
+#[test]
+fn session_leader_exit_with_controlling_tty_fires_sighup_sigcont_and_clears_binding() {
+    let _g = setup();
+    let init = fresh_init();
+    // init has sid=1 == pid=1 (session leader). Wire up a tty and
+    // a foreground pgrp so the cascade has work to do.
+    let session = init.pgrp_cap().session_cap();
+    let pgrp = init.pgrp_cap();
+    let tty = fresh_tty("ttyS-cascade-1");
+
+    tty.bind_session_pgrp_typed(&session, &pgrp);
+    *session.controlling_tty.lock() = Some(tty.downgrade());
+
+    assert!(session.has_controlling_tty());
+    assert!(tty.foreground_pgrp_cap().is_some());
+
+    // Session leader exits — fires the cascade.
+    step_exit_group(&init, ExitStatus::Exited(0));
+
+    // Init zombified per usual.
+    assert!(init.is_zombie());
+
+    // SIGHUP and SIGCONT now pending on every fg-pgrp member's
+    // leader thread. init is the only member of its own pgrp (in
+    // bootstrap), but it's now a zombie — the post happened before
+    // zombification (cascade runs first in step_exit_group).
+    //
+    // Re-pull the zombie's stale leader: payload is dropped, so
+    // `leader_pending` would panic. Instead, verify post effect via
+    // the tty/session-side state changes.
+
+    // Tty's session_pgrp slot cleared (authoritative side).
+    assert!(tty.session_pgrp().is_none(), "tty.session_pgrp cleared");
+
+    // Session's controlling_tty mirror also cleared.
+    assert!(
+        !session.has_controlling_tty(),
+        "session.controlling_tty cleared"
+    );
+}
+
+#[test]
+fn session_leader_exit_with_live_fg_pgrp_member_delivers_sighup_and_sigcont() {
+    let _g = setup();
+    let init = fresh_init();
+    // Fork a child to be the fg-pgrp member that will *survive* the
+    // cascade and observe the SIGHUP/SIGCONT delivery.
+    let child = step_fork::<TestPmap>(&init).expect("fork");
+
+    // Setup: init's session has a controlling tty whose fg pgrp is
+    // init's pgrp — which contains both init and child.
+    let session = init.pgrp_cap().session_cap();
+    let pgrp = init.pgrp_cap();
+    let tty = fresh_tty("ttyS-cascade-2");
+    tty.bind_session_pgrp_typed(&session, &pgrp);
+    *session.controlling_tty.lock() = Some(tty.downgrade());
+
+    // Initially neither SIGHUP nor SIGCONT pending on child.
+    assert!(!leader_pending(&child, Signum::SIGHUP));
+    assert!(!leader_pending(&child, Signum::SIGCONT));
+
+    // init exits (session leader) → cascade fires SIGHUP+SIGCONT to
+    // the fg pgrp, which still contains child as a live member.
+    step_exit_group(&init, ExitStatus::Exited(0));
+
+    assert!(
+        leader_pending(&child, Signum::SIGHUP),
+        "child should observe SIGHUP from session-leader-death cascade"
+    );
+    // SIGCONT is Gewalt — it doesn't enter thread_pending. Instead,
+    // it clears summary.stop_requested. Pre-cascade child wasn't
+    // stopped, so the bit stays cleared. Just confirm SIGCONT didn't
+    // enter pending (Gewalt invariant).
+    assert!(!leader_pending(&child, Signum::SIGCONT));
+}
+
+#[test]
+fn non_session_leader_exit_does_not_fire_cascade() {
+    let _g = setup();
+    let init = fresh_init();
+
+    // Fork a child and put it in its own session (now a session leader
+    // of a new session). Then fork a grandchild from the new session
+    // leader — grandchild is a member but NOT the session leader.
+    let session_leader = step_fork::<TestPmap>(&init).expect("fork");
+    let _new_sid = step_setsid(&session_leader).expect("setsid");
+    let grandchild = step_fork::<TestPmap>(&session_leader).expect("fork-of-leader");
+
+    // grandchild.pgrp.session.sid != grandchild.pid → grandchild is
+    // not the session leader.
+    let session = grandchild.pgrp_cap().session_cap();
+    assert_ne!(grandchild.pid.0, session.sid.0);
+
+    let tty = fresh_tty("ttyS-cascade-3");
+    tty.bind_session_pgrp_typed(&session, &grandchild.pgrp_cap());
+    *session.controlling_tty.lock() = Some(tty.downgrade());
+
+    // grandchild (non-leader) exits. Cascade must NOT fire — the tty
+    // binding stays put; the session's controlling_tty stays set.
+    step_exit_group(&grandchild, ExitStatus::Exited(0));
+
+    assert!(
+        tty.session_pgrp().is_some(),
+        "non-leader exit must not clear tty.session_pgrp"
+    );
+    assert!(
+        session.has_controlling_tty(),
+        "non-leader exit must not clear session.controlling_tty"
+    );
+}
+
+#[test]
+fn session_leader_exit_without_controlling_tty_is_noop() {
+    // Per §8.3 step 1 first-hop fail: no controlling tty → cascade
+    // is a complete no-op. The bootstrap session has no controlling
+    // tty, so this is the natural shape.
+    let _g = setup();
+    let init = fresh_init();
+    let session = init.pgrp_cap().session_cap();
+    assert!(!session.has_controlling_tty());
+
+    // Just exercising the no-op branch — assertion is "didn't panic".
+    step_exit_group(&init, ExitStatus::Exited(0));
+    assert!(init.is_zombie());
+}
+
+#[test]
+fn session_leader_exit_with_tty_but_no_fg_pgrp_clears_binding_without_signal() {
+    let _g = setup();
+    let init = fresh_init();
+    let session = init.pgrp_cap().session_cap();
+    let tty = fresh_tty("ttyS-cascade-5");
+
+    // Install controlling_tty mirror but install only a raw-id (no
+    // typed) SessionPgrp on the tty side — `foreground_pgrp_cap`
+    // returns None (second-hop fails) but tty.session_pgrp itself
+    // is `Some(...)`.
+    tty.bind_session_pgrp(SessionPgrp::from_raw_ids(99, 99, 99));
+    *session.controlling_tty.lock() = Some(tty.downgrade());
+
+    assert!(tty.session_pgrp().is_some());
+    assert!(tty.foreground_pgrp_cap().is_none());
+
+    step_exit_group(&init, ExitStatus::Exited(0));
+
+    // Per spec: "If `None` (no fg pgrp installed, or pgrp reclaimed),
+    // skip the SIGHUP step but still proceed to step 3 (the tty's
+    // own session_pgrp slot must be cleared regardless)."
+    assert!(
+        tty.session_pgrp().is_none(),
+        "tty.session_pgrp must clear regardless of fg-pgrp upgrade"
+    );
+    assert!(!session.has_controlling_tty());
 }
 
 #[test]

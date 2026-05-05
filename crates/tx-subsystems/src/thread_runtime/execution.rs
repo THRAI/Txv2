@@ -42,7 +42,15 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     drop(payload_guard);
 
     if was_last {
-        crate::process::execution::step_zombie(&parent, status);
+        // Thread side carries `i32` per `THREAD_RUNTIME_v1` §7.2;
+        // the cascade promotes that to `ExitStatus::Exited` because
+        // signal-driven termination doesn't reach this path (it goes
+        // through `step_exit_group_with_signal` which records
+        // `ExitStatus::Signaled` directly before zombifying threads).
+        crate::process::execution::step_process_exit(
+            &parent,
+            crate::process::structure::ExitStatus::Exited(status),
+        );
     }
 }
 

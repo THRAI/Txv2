@@ -36,7 +36,7 @@ pub fn step_hangup(tty: &Cap<TtyIdentity>, _guard: &Guard<'_>) -> StepOutcome<Ha
         // SessionLeaderProcessGroup's typed pgrp is left None: the
         // SessionPgrp binding carries only a Weak<Session> and
         // Weak<ProcessGroup> for the *foreground* pgrp. The session-
-        // leader's pgrp would require walking session.groups for
+        // leader's pgrp would require walking session.members for
         // pgid == session_leader_pgid; that lookup lands when the
         // session→leader-pgrp index is wired.
         hup_signal: binding.map(|binding| SignalDispatch {

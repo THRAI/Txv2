@@ -7,8 +7,9 @@
 use crate::cred::{
     step_setgid, step_setuid, Capability, CapabilitySet, Cred, CredChange, Gid, Uid,
 };
+use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
-use crate::process::{bootstrap_init_process, step_exit_group, step_fork};
+use crate::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
 use crate::vm::{AddressSpace, TestPmap};
@@ -24,6 +25,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
     reset_pid_counter_for_test();
     reset_tid_counter_for_test();
+    reset_init_process_for_test();
     guard
 }
 
@@ -157,7 +159,7 @@ fn setuid_unprivileged_can_swap_among_existing_ids_only() {
 fn setuid_on_zombie_returns_zombie() {
     let _g = setup();
     let proc_cap = bootstrap();
-    step_exit_group(&proc_cap, 0);
+    step_exit_group(&proc_cap, ExitStatus::Exited(0));
     let outcome = step_setuid(&proc_cap, Uid(1000));
     assert_eq!(outcome, CredChange::Zombie);
 }

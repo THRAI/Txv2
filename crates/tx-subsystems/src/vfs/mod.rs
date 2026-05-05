@@ -20,7 +20,7 @@ mod tests;
 pub use checks::{DirectoryAtPath, EntityAtPath, ParentAndName, ResolveCtx, RootCtx};
 pub use execution::{FsOps, MountOutput};
 pub use structure::{
-    Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
-    OpenFile, OpenFileFlags, RNode, RNodeBacking, StructPayload, Timespec, VfsName, S_IFBLK,
-    S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VFS_NAME_MAX,
+    render_dentry_path, Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind,
+    InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking, StructPayload, Timespec, VfsName,
+    S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VFS_NAME_MAX,
 };
