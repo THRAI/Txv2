@@ -286,6 +286,10 @@ version = "0.1.0"
 [[package]]
 name = "tx-fs"
 version = "0.1.0"
+dependencies = [
+ "tx-substrate",
+ "tx-subsystems",
+]
 
 [[package]]
 name = "tx-hal"
