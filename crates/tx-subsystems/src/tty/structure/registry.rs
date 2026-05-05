@@ -202,6 +202,21 @@ pub fn devfs_alias(name: &[u8]) -> Option<Cap<TtyIdentity>> {
     DEVFS_ALIASES.lock().get(name)
 }
 
+/// Snapshot the currently-registered devfs alias entries.
+///
+/// Returned in registry-storage order, with each entry cloned out (the
+/// alias table itself is not exposed). Used by the devfs `FsOps::readdir`
+/// implementation in `tx-fs` to enumerate `/dev` without coupling to the
+/// alias-slot storage type.
+pub fn devfs_alias_snapshot() -> alloc::vec::Vec<TtyAliasEntry> {
+    let guard = DEVFS_ALIASES.lock();
+    let mut out = alloc::vec::Vec::new();
+    for entry in guard.entries.iter().flatten() {
+        out.push(entry.clone());
+    }
+    out
+}
+
 pub fn allocate_pty_index() -> Result<u32, RegistryError> {
     for _ in 0..MAX_PTYS {
         let index = {

@@ -204,6 +204,63 @@ pub fn devfs_tty_by_name(name: &[u8], _guard: &Guard<'_>) -> StepOutcome<Cap<Tty
     StepOutcome::Err(Errno::ENOENT)
 }
 
+/// Snapshot of one devfs alias entry, surfaced to consumers that want to
+/// enumerate `/dev` without poking the registry's internal storage type.
+///
+/// Returned by [`devfs_alias_entries`]; each entry is a clone of the live
+/// `Cap<TtyIdentity>` and the `name` bytes the alias was registered under.
+#[derive(Clone)]
+pub struct DevfsAliasEntry {
+    pub name: Vec<u8>,
+    pub tty: Cap<TtyIdentity>,
+}
+
+/// Snapshot the currently-registered devfs alias entries (per
+/// `txdoc:TTY-LOOKUP-1` / `txdoc:TTY-RNODE-MATERIALIZATION-1`). Used by
+/// `tx-fs::devfs::FsOps::readdir` to enumerate `/dev` without coupling to
+/// the registry's slot storage.
+pub fn devfs_alias_entries() -> Vec<DevfsAliasEntry> {
+    let mut out = Vec::new();
+    for entry in registry::devfs_alias_snapshot() {
+        let mut name = Vec::new();
+        name.extend_from_slice(entry.name.as_bytes());
+        out.push(DevfsAliasEntry {
+            name,
+            tty: entry.tty,
+        });
+    }
+    out
+}
+
+/// Thin wrapper around the devfs alias and hardware-TTY tables, exposing a
+/// single `Option<Cap<TtyIdentity>>` indirection for `tx-fs::devfs` (and any
+/// other consumer that wants alias-shape lookup without depending on the
+/// registry's internal storage type or the `StepOutcome` ladder).
+///
+/// Resolution order matches `devfs_tty_by_name` (per
+/// `txdoc:TTY-THE-HARDWARE-CONSOLE-PATH-1`):
+///
+/// 1. `ttyS<N>` parses as a hardware index and resolves to the registered
+///    hardware TTY when present.
+/// 2. Otherwise, the devfs alias table is consulted (this is where
+///    `register_console_alias("console", ...)` publishes).
+///
+/// `ptmx` is intentionally not exposed here — it materialises through the
+/// devpts projection schema, not as a static alias.
+pub fn resolve_devfs_alias(name: &[u8]) -> Option<Cap<TtyIdentity>> {
+    if name == b"ptmx" {
+        return None;
+    }
+
+    if let Some(index) = parse_tty_s_index(name) {
+        if let Some(tty) = registry::hardware_tty(index) {
+            return Some(tty);
+        }
+    }
+
+    registry::devfs_alias(name)
+}
+
 /// Materialize a devfs RNode for `ttyS<N>` or `console`.
 pub fn devfs_rnode_by_name(name: &[u8], guard: &Guard<'_>) -> StepOutcome<Cap<RNode>> {
     let tty = match devfs_tty_by_name(name, guard) {

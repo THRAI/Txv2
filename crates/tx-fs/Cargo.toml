@@ -7,5 +7,9 @@ repository.workspace = true
 
 [lib]
 path = "src/lib.rs"
-test = false
+test = true
 doctest = false
+
+[dependencies]
+tx-subsystems = { path = "../tx-subsystems" }
+tx-substrate = { path = "../tx-substrate" }
