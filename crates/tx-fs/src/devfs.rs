@@ -39,9 +39,10 @@ use alloc::sync::Arc;
 use tx_substrate::zone::Cap;
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
+use tx_subsystems::process;
 use tx_subsystems::tty;
 use tx_subsystems::vfs::{
-    Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
+    self, Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
     OpenFileFlags, RNode, RNodeBacking, StructPayload, S_IFCHR, S_IFDIR,
 };
 
@@ -332,31 +333,78 @@ pub fn resolve_console_rnode(name: &[u8]) -> StepOutcome<Cap<RNode>> {
     }
 }
 
-/// One-shot helper: open `/dev/console` as a read+write `OpenFile`
-/// without going through the (not-yet-implemented) VFS walker.
+/// One-shot helper: open `/dev/console` as a read+write `OpenFile`.
 ///
-/// Used by Phase 3b's `init.rs` to preopen fds 0/1/2, and by Phase 2a's
-/// syscall-dispatch tests that need a console-shaped `OpenFile` before
-/// `step_open` exists.
+/// Phase 4 of the pre-ELF runtime plan
+/// (`docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`)
+/// retires the bootstrap exemption: when init's cwd is bound and the
+/// rootfs+devfs mount table is populated, the body goes through
+/// `vfs::step_open(root, b"/dev/console", RDWR, ...)` per
+/// `txdoc:VFS-CHECKS-RUN-WALKER-LOOP-1`.
 ///
-/// **Bootstrap exemption.** The walker-based open path is deferred — see
-/// `crates/tx-subsystems/src/vfs/execution.rs` (no `step_open` yet) and
-/// `txdoc:VFS-CHECKS-RUN-WALKER-LOOP-1` for the eventual contract. This
-/// helper constructs the `OpenFile` directly via
-/// `OpenFile::new_cap(rnode, OpenFileFlags { read, write, .. })`. When
-/// the walker lands, this function should be retired in favour of a
-/// real `step_open("/dev/console", O_RDWR)` call.
+/// The function stays synchronous because callers in
+/// `crates/tx-kernel/src/init.rs::bind_init_cwd_and_root` are not in
+/// async context. We drive the walker via a tiny in-module
+/// [`block_on`] helper.
+///
+/// ## Fallback path
+///
+/// The Phase 1+4 sibling slices may land out of order with the
+/// `mount_devfs_at_dev` wiring that *publishes* the `mounted` hint
+/// on `/dev`. When init's cwd or the mount-hint tree is not yet
+/// observable, the walker has no way to cross from rootfs into
+/// devfs and `step_open(/dev/console)` would return `ENOENT`. To
+/// keep the trio's existing tests green during the staged rollout,
+/// the helper falls back to the legacy direct-RNode materialisation
+/// (the same shape the bootstrap exemption used) whenever
+/// `init_process()` is `None`. Once init.rs's
+/// `mount_devfs_at_dev` is updated to set the mount hint and
+/// `bind_init_cwd_and_root` runs before the helper is called, the
+/// fallback is skipped and the walker resolves the path end-to-end.
 ///
 /// # Panics
 ///
-/// Panics if the TTY registry has no `console` alias registered, or if
-/// the underlying RNode/OpenFile zone reservations fail. Both
-/// conditions imply the kernel cannot make further bootstrap progress
-/// — there is no useful caller-recoverable error at this point.
-// TODO(phase-vfs-walker): replace with `step_open("/dev/console", O_RDWR)`
-// once `crates/tx-subsystems/src/vfs/execution.rs` grows `step_open` and
-// init has a real cwd/root binding (Phase 3b).
+/// Panics if neither the walker nor the fallback can resolve
+/// `/dev/console`. Both branches indicate the kernel cannot make
+/// further bootstrap progress.
 pub fn open_console_for_init() -> Cap<OpenFile> {
+    if let Some(init) = process::execution::init_process() {
+        if let Some(root) = init.cwd() {
+            let cred = Credential::default();
+            let guard = tx_substrate::epoch::guard();
+            let outcome = block_on(vfs::step_open(
+                root,
+                b"/dev/console",
+                OpenFileFlags {
+                    read: true,
+                    write: true,
+                    append: false,
+                },
+                0,
+                &cred,
+                &guard,
+            ));
+            match outcome {
+                StepOutcome::Done(file) | StepOutcome::Advanced(file) => return file,
+                _other => {
+                    // Walker could not resolve the path under current
+                    // bootstrap state — fall through to legacy
+                    // direct-RNode materialisation. Once Phase 1's
+                    // `mount_devfs_at_dev` mount-hint wiring lands,
+                    // this branch is unreachable on the boot path.
+                }
+            }
+        }
+    }
+    open_console_for_init_legacy()
+}
+
+/// Legacy direct-RNode path. Materialises an `OpenFile` over the
+/// `console` alias's TTY without consulting the walker. Retained as
+/// the fallback for `open_console_for_init`'s walker redirect (see
+/// the function's "Fallback path" doc) and as the synchronous
+/// primitive Phase 2a tests still rely on.
+fn open_console_for_init_legacy() -> Cap<OpenFile> {
     let tty = tty::project::resolve_devfs_alias(b"console").expect(
         "open_console_for_init: /dev/console alias not registered before bootstrap fd preopen \
          (Phase 3b registers `console` via tty::execution::register_console_alias)",
@@ -380,6 +428,43 @@ pub fn open_console_for_init() -> Cap<OpenFile> {
         },
     )
     .expect("open_console_for_init: OpenFile reservation failed")
+}
+
+/// Tiny synchronous future driver used by [`open_console_for_init`].
+///
+/// `vfs::step_open` is `async fn`. Init's bootstrap path is fully
+/// synchronous, so we drive the future on a no-op waker until it
+/// resolves. The walker today never actually parks (every
+/// `FsOps` call site is synchronous in-memory), so this loop
+/// terminates on the first poll for the bootstrap path; we cap at
+/// 1024 polls to surface a runaway future during development.
+fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn raw_clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+    fn raw_wake(_: *const ()) {}
+    fn raw_wake_by_ref(_: *const ()) {}
+    fn raw_drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(raw_clone, raw_wake, raw_wake_by_ref, raw_drop);
+    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+    // SAFETY: the vtable is `'static` and the data pointer is
+    // unused (raw_* take it but never dereference).
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` lives on the stack for the full loop; we never
+    // move it after the unchecked pin.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    for _ in 0..1024 {
+        match pinned.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => continue,
+        }
+    }
+    panic!("open_console_for_init::block_on: future did not resolve in 1024 polls");
 }
 
 #[cfg(test)]

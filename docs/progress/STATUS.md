@@ -1,8 +1,70 @@
 # txKernel Status
 
-**Updated:** 2026-05-05
+**Updated:** 2026-05-06
 
 ## Current Shape
+
+- 2026-05-06 Pre-ELF Wave 1 (Phase 1 minor cleanups + Phase 4 VFS
+  walker) landed on branch `feat/pre-elf-runtime` (worktree
+  `funny-hugle-06199b`). Per
+  `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`.
+  Phase 1 covers Part 5 §"tx-substrate public SpinMutex / Errno
+  EEXIST+ENOTEMPTY / InlineName: Ord"; Phase 4 covers Part 3
+  ("VFS walker / step_open"). Substrate-vs-subsystems layering fix per Open
+  Q #5: `tx_subsystems::sync::SpinMutex` (`pub(crate)`) relocated to
+  `tx_substrate::SpinMutex` (`pub`, re-exported at crate root). The
+  two duplicate inline TAS shims retired:
+  `crates/tx-kernel/src/init.rs::BootSpinMutex` and
+  `crates/tx-fs/src/tmpfs.rs::SpinMutex` both deleted; their slots
+  (`ROOT_MOUNT`, `DEV_MOUNT`, `CONSOLE_TTY`, `CONSOLE_OPS` serial,
+  tmpfs `state` lock) re-pointed to `tx_substrate::SpinMutex`. 13
+  in-tree `use crate::sync::SpinMutex` import sites in tx-subsystems
+  (`signal`, `page_backed`, `wait_carrier`, `tty/structure/{registry,
+  identity, payload}`, `vm/pmap`, `vm/structure/{recipe, range_lock}`,
+  `thread_runtime/structure`, `process/{structure, execution}`)
+  rewritten to `use tx_substrate::SpinMutex`. `Errno` extended with
+  `EEXIST` (POSIX 17) and `ENOTEMPTY` (POSIX 39); `errno_to_i32`
+  in `tx-shims/src/linux_syscall/mod.rs` extended in lockstep.
+  tmpfs `create_inode`/`mkdir`/`symlink` flipped from `EINVAL` to
+  `EEXIST` for name collisions; `rmdir` flipped from `EBUSY` to
+  `ENOTEMPTY`; their `TODO(phase-vfs-errno-{eexist,enotempty})`
+  comments deleted. `InlineName` grew a manual `Ord`/`PartialOrd`
+  impl that compares `as_bytes()` (a derive would compare `len`
+  first then include the trailing zero pad — wrong); tmpfs's
+  per-directory `BTreeMap<TmpfsName=Vec<u8>, FsObjectId>` flipped
+  to `BTreeMap<InlineName, FsObjectId>` and the `TmpfsName` newtype
+  dropped. New tx-substrate integration test
+  `tests/sync.rs::{spinmutex_lock_unlock_round_trip, spinmutex_holds_send_payload}`.
+  Two new tx-fs tests: `tmpfs_create_existing_returns_eexist` and
+  `tmpfs_rmdir_nonempty_returns_enotempty`. Phase 4 ships
+  `crates/tx-subsystems/src/vfs/walker.rs` with `pub async
+  step_walk` + `step_open`; mount-point crossing via the new
+  `mount::register_mount` + `mount_for` registry (Phase 6 sibling
+  will wire the registry calls into init.rs's `mount_devfs_at_dev`
+  so production resolves `/dev/console` end-to-end without the
+  walker fallback path); `RNodeBacking::Symlink { target:
+  Box<[u8]> }` (changed from `Box<InlineName>` because InlineName
+  rejects `/` in multi-component targets); new
+  `FsOps::read_link` trait method default-`ENOSYS` with tmpfs
+  override; `Errno::ELOOP` (POSIX 40) added; symlink chasing
+  implements absolute-target restart vs relative-target splice
+  with hop-budget `SYMLOOP_MAX = 40`. `open_console_for_init`
+  redirected through `step_open(b"/dev/console", RDWR, 0, ...)`
+  with a synchronous `block_on` shim and a fallback to the
+  legacy direct-RNode path until init.rs registers the mount in
+  the new registry. Two phases bundled in one commit because they
+  share files (vfs/structure.rs, execution.rs::Errno,
+  process/structure.rs, tmpfs.rs, linux_syscall/mod.rs). 10 new
+  walker tests pass (relative path, absolute path, ENOENT,
+  ENOTDIR-trailing-slash, ENOTDIR-mid-path, relative symlink,
+  absolute symlink, ELOOP at 41 hops, mount crossing, step_open
+  round-trip). tx-fs suite 10 → 13 (13/13); tx-kernel 8/8,
+  tx-shims 12/12, tx-subsystems 331 → 341 (341/341), all
+  tx-substrate integration tests green (incl. 2 new sync tests).
+  `cargo check --workspace`, `cargo fmt --check`, `cargo xtask
+  progress validate` all clean. Next: Phase 6 (mount/dev id
+  allocators + register_mount wire-up in init.rs); then Phase 2
+  reactor task wrapper + userspace-entry shim. Blocker: none.
 
 - 2026-05-05 Trio Phase 6 (end-to-end userspace round-trip smoke) on
   branch `feat/trio-trap-syscall-tmpfs-devfs`. New host test

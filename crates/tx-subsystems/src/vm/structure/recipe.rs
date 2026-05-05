@@ -5,9 +5,10 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crate::execution::Guard;
-use crate::sync::SpinMutex;
 use tx_substrate::epoch;
+use tx_substrate::SpinMutex;
+
+use crate::execution::Guard;
 
 use super::{
     AddressSpaceStats, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry,

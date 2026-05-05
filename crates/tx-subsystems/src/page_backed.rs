@@ -11,9 +11,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::mount::MountPayload;
-use crate::sync::SpinMutex;
 use crate::vfs::{FsObjectId, OpenFile};
 use tx_hal::{KernelPtr, Ppn, UserAccessIf, UserPtr};
+use tx_substrate::SpinMutex;
 use tx_substrate::{
     page_allocator::{
         self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,

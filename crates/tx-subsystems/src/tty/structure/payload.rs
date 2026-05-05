@@ -15,9 +15,9 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU64;
 
 use tx_substrate::zone::Cap;
+use tx_substrate::SpinMutex;
 
 use crate::device::CharDeviceBinding;
-use crate::sync::SpinMutex;
 use crate::tty::ldisc::on_termios_changed;
 use crate::tty::ldisc::state::LdiscState;
 use crate::tty::structure::ring::TtyRing;

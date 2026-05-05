@@ -10,9 +10,9 @@
 //! `WouldBlock` outcome into an awaitable wait via `WouldBlock::wait_token`.
 
 use tx_reactor::wait::{Channel, Mask};
+use tx_substrate::SpinMutex;
 
 use crate::execution::{StepOutcome, WaitToken};
-use crate::sync::SpinMutex;
 use crate::wait_carrier;
 
 use super::UserRange;

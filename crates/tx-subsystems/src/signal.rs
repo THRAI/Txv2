@@ -34,8 +34,8 @@ use tx_substrate::zone::Cap;
 
 use crate::execution::Errno;
 use crate::process::structure::{ProcessGroup, ProcessIdentity};
-use crate::sync::SpinMutex;
 use crate::thread_runtime::execution::post_signal;
+use tx_substrate::SpinMutex;
 
 /// POSIX signal number, 1..=64.
 ///

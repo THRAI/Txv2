@@ -1,12 +1,11 @@
 use core::{
-    cell::UnsafeCell,
     marker::PhantomData,
-    ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
 use tx_substrate::zone::Cap;
+use tx_substrate::SpinMutex;
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::{Guard, StepOutcome};
 use tx_subsystems::mount::{
@@ -26,17 +25,17 @@ static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 /// the process subsystem has bootstrapped. The slot retains a strong
 /// `Cap<MountIdentity>` for the kernel lifetime, mirroring
 /// `tx_subsystems::process::execution::INIT_PROCESS`.
-static ROOT_MOUNT: BootSpinMutex<Option<Cap<MountIdentity>>> = BootSpinMutex::new(None);
+static ROOT_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 
 /// Global devfs-mount slot. Populated by `mount_devfs_at_dev`.
 /// Retained alongside `ROOT_MOUNT` so the mount table remains live
 /// after `init_substrate_if_ready` returns.
-static DEV_MOUNT: BootSpinMutex<Option<Cap<MountIdentity>>> = BootSpinMutex::new(None);
+static DEV_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 
 /// Global TTY identity for the boot console hardware. Populated by
 /// `register_console_hardware`; consulted by
 /// `register_devfs_console_alias` to publish `/dev/console`.
-static CONSOLE_TTY: BootSpinMutex<Option<Cap<TtyIdentity>>> = BootSpinMutex::new(None);
+static CONSOLE_TTY: SpinMutex<Option<Cap<TtyIdentity>>> = SpinMutex::new(None);
 
 /// Snapshot the boot-time root mount cap. Returns `None` until
 /// `mount_rootfs_tmpfs` has run (test pre-bootstrap or boot-time
@@ -64,65 +63,6 @@ pub fn reset_boot_state_for_test() {
     *ROOT_MOUNT.lock() = None;
     *DEV_MOUNT.lock() = None;
     *CONSOLE_TTY.lock() = None;
-}
-
-/// Minimal spin-mutex for boot-time global slots. Mirrors the
-/// `tx_subsystems::sync::SpinMutex` shape that `INIT_PROCESS` uses;
-/// we cannot reach the subsystems' version because it's `pub(crate)`,
-/// and the substrate crate does not yet expose a public mutex
-/// primitive. Boot code never `.await`s while holding the lock and
-/// mutates each slot at most twice (set during init, optionally
-/// cleared by `reset_boot_state_for_test`), so a tiny TAS spinlock is
-/// adequate.
-struct BootSpinMutex<T> {
-    locked: AtomicBool,
-    value: UnsafeCell<T>,
-}
-
-unsafe impl<T: Send> Send for BootSpinMutex<T> {}
-unsafe impl<T: Send> Sync for BootSpinMutex<T> {}
-
-impl<T> BootSpinMutex<T> {
-    const fn new(value: T) -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-            value: UnsafeCell::new(value),
-        }
-    }
-
-    fn lock(&self) -> BootSpinMutexGuard<'_, T> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        BootSpinMutexGuard { mutex: self }
-    }
-}
-
-struct BootSpinMutexGuard<'a, T> {
-    mutex: &'a BootSpinMutex<T>,
-}
-
-impl<T> Deref for BootSpinMutexGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        unsafe { &*self.mutex.value.get() }
-    }
-}
-
-impl<T> DerefMut for BootSpinMutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.mutex.value.get() }
-    }
-}
-
-impl<T> Drop for BootSpinMutexGuard<'_, T> {
-    fn drop(&mut self) {
-        self.mutex.locked.store(false, Ordering::Release);
-    }
 }
 
 /// Static `CharDeviceOps` impl that forwards `write` to
@@ -296,7 +236,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // single static binding per platform via a function-local
         // `static` (each `CoreInit::<P>` instantiation gets its own
         // copy at codegen time).
-        static CONSOLE_OPS: BootSpinMutex<()> = BootSpinMutex::new(());
+        static CONSOLE_OPS: SpinMutex<()> = SpinMutex::new(());
         let _serial = CONSOLE_OPS.lock();
 
         // Allocate the ops + binding once and leak. `register_hardware`

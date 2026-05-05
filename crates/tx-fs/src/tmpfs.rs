@@ -21,11 +21,10 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
-use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use tx_substrate::zone::Cap;
+use tx_substrate::SpinMutex;
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::page_backed::{
     step_truncate, AnonSwapPolicy, Frame, FsPageBacking, MaterializeAccess, PageContainer,
@@ -35,65 +34,6 @@ use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, FsOps, InlineName, InodeKind, InodeMeta,
     MountOutput, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, VFS_NAME_MAX,
 };
-
-/// Minimal spin-mutex for tmpfs's in-memory state. Mirrors the shape
-/// of `tx_subsystems::sync::SpinMutex` but is local to tx-fs because
-/// the subsystems' version is `pub(crate)` (it gates internal lock
-/// discipline and is not part of the cross-crate vocabulary). The
-/// substrate crate does not yet expose a public mutex primitive; once
-/// it does, tmpfs should migrate to that and this shim should go
-/// away. tmpfs's call sites are short and never `.await` while the
-/// lock is held, so a tiny TAS spinlock is sufficient.
-struct SpinMutex<T> {
-    locked: AtomicBool,
-    value: UnsafeCell<T>,
-}
-
-unsafe impl<T: Send> Send for SpinMutex<T> {}
-unsafe impl<T: Send> Sync for SpinMutex<T> {}
-
-impl<T> SpinMutex<T> {
-    const fn new(value: T) -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-            value: UnsafeCell::new(value),
-        }
-    }
-
-    fn lock(&self) -> SpinMutexGuard<'_, T> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        SpinMutexGuard { mutex: self }
-    }
-}
-
-struct SpinMutexGuard<'a, T> {
-    mutex: &'a SpinMutex<T>,
-}
-
-impl<T> Deref for SpinMutexGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        unsafe { &*self.mutex.value.get() }
-    }
-}
-
-impl<T> DerefMut for SpinMutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.mutex.value.get() }
-    }
-}
-
-impl<T> Drop for SpinMutexGuard<'_, T> {
-    fn drop(&mut self) {
-        self.mutex.locked.store(false, Ordering::Release);
-    }
-}
 
 /// Mode for the tmpfs root directory.
 pub const TMPFS_ROOT_MODE: u16 = S_IFDIR | 0o755;
@@ -125,26 +65,12 @@ const TMPFS_FILE_PAGE_CAP: u64 = 1024;
 /// component anyway. Per the plan §"FsOps::symlink".
 pub const TMPFS_SYMLINK_MAX: usize = VFS_NAME_MAX;
 
-/// Owned name key for tmpfs's directory BTreeMap.
-///
-/// `InlineName` lacks `Ord` (it's a fixed-size buffer with no obvious
-/// canonical ordering), so tmpfs keys directories by an owned `Vec<u8>`
-/// of the name's bytes. Lookups round-trip through `InlineName::new`
-/// for validation and then drop into the byte-vector key. Once
-/// `InlineName` grows `Ord` upstream, this can flip back to the
-/// inline shape without changing the public surface.
-type TmpfsName = Vec<u8>;
-
-fn tmpfs_name_from(name: &[u8]) -> TmpfsName {
-    name.to_vec()
-}
-
 /// Per-inode payload. Variants line up with the inode kinds tmpfs
 /// supports today. Block-device, fifo, and socket variants are not
 /// yet in scope; `create_inode` rejects those modes with `EINVAL`.
 enum TmpfsPayload {
     /// Directory: child name → inode id.
-    Directory(BTreeMap<TmpfsName, FsObjectId>),
+    Directory(BTreeMap<InlineName, FsObjectId>),
     /// Regular file: anon `PageContainer` plus the visible byte size.
     /// `size` tracks the externally-visible size (POSIX `st_size`),
     /// which is what `serialize_inode_meta` and `truncate` mutate.
@@ -256,13 +182,13 @@ impl FsOps for Tmpfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<FsObjectId> {
         // `InlineName::new` is the canonical name-validity check
-        // (rejects empty, oversized, or `/` -bearing names). We
-        // discard the returned inline value and key the directory
-        // BTreeMap by the underlying byte vector — see `TmpfsName`.
-        if let Err(err) = InlineName::new(name) {
-            return StepOutcome::Err(err);
-        }
-        let inline = tmpfs_name_from(name);
+        // (rejects empty, oversized, or `/` -bearing names). The
+        // inline name is also the directory BTreeMap key now that
+        // `InlineName: Ord` is upstream.
+        let inline = match InlineName::new(name) {
+            Ok(n) => n,
+            Err(err) => return StepOutcome::Err(err),
+        };
         let state = self.state.lock();
         let Some(parent_inode) = state.inodes.get(&parent) else {
             return StepOutcome::Err(Errno::ENOENT);
@@ -328,13 +254,13 @@ impl FsOps for Tmpfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta)> {
         // `InlineName::new` is the canonical name-validity check
-        // (rejects empty, oversized, or `/` -bearing names). We
-        // discard the returned inline value and key the directory
-        // BTreeMap by the underlying byte vector — see `TmpfsName`.
-        if let Err(err) = InlineName::new(name) {
-            return StepOutcome::Err(err);
-        }
-        let inline = tmpfs_name_from(name);
+        // (rejects empty, oversized, or `/` -bearing names). The
+        // inline name is also the directory BTreeMap key now that
+        // `InlineName: Ord` is upstream.
+        let inline = match InlineName::new(name) {
+            Ok(n) => n,
+            Err(err) => return StepOutcome::Err(err),
+        };
         // Day-1 tmpfs only handles regular files via `create_inode`.
         // Directories arrive through `mkdir`, symlinks through
         // `symlink`. Reject anything else with `EINVAL`.
@@ -368,13 +294,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::Err(Errno::ENOTDIR);
         };
         if children.contains_key(&inline) {
-            // POSIX `EEXIST`. The day-1 `Errno` enum (see
-            // `crates/tx-subsystems/src/execution.rs`) doesn't yet
-            // have a dedicated `EEXIST`; `EINVAL` is the closest
-            // mapping that the syscall driver can normalise later.
-            // TODO(phase-vfs-errno-eexist): widen `Errno` so name
-            // collisions surface their real POSIX errno.
-            return StepOutcome::Err(Errno::EINVAL);
+            return StepOutcome::Err(Errno::EEXIST);
         }
         children.insert(inline, new_id);
 
@@ -397,13 +317,13 @@ impl FsOps for Tmpfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<()> {
         // `InlineName::new` is the canonical name-validity check
-        // (rejects empty, oversized, or `/` -bearing names). We
-        // discard the returned inline value and key the directory
-        // BTreeMap by the underlying byte vector — see `TmpfsName`.
-        if let Err(err) = InlineName::new(name) {
-            return StepOutcome::Err(err);
-        }
-        let inline = tmpfs_name_from(name);
+        // (rejects empty, oversized, or `/` -bearing names). The
+        // inline name is also the directory BTreeMap key now that
+        // `InlineName: Ord` is upstream.
+        let inline = match InlineName::new(name) {
+            Ok(n) => n,
+            Err(err) => return StepOutcome::Err(err),
+        };
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
             return StepOutcome::Err(Errno::ENOENT);
@@ -448,14 +368,14 @@ impl FsOps for Tmpfs {
         if old_parent != new_parent {
             return StepOutcome::Err(Errno::ENOSYS);
         }
-        if let Err(err) = InlineName::new(old_name) {
-            return StepOutcome::Err(err);
-        }
-        if let Err(err) = InlineName::new(new_name) {
-            return StepOutcome::Err(err);
-        }
-        let old_key = tmpfs_name_from(old_name);
-        let new_key = tmpfs_name_from(new_name);
+        let old_key = match InlineName::new(old_name) {
+            Ok(n) => n,
+            Err(err) => return StepOutcome::Err(err),
+        };
+        let new_key = match InlineName::new(new_name) {
+            Ok(n) => n,
+            Err(err) => return StepOutcome::Err(err),
+        };
         if old_key == new_key {
             return StepOutcome::Done(());
         }
@@ -505,13 +425,13 @@ impl FsOps for Tmpfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta)> {
         // `InlineName::new` is the canonical name-validity check
-        // (rejects empty, oversized, or `/` -bearing names). We
-        // discard the returned inline value and key the directory
-        // BTreeMap by the underlying byte vector — see `TmpfsName`.
-        if let Err(err) = InlineName::new(name) {
-            return StepOutcome::Err(err);
-        }
-        let inline = tmpfs_name_from(name);
+        // (rejects empty, oversized, or `/` -bearing names). The
+        // inline name is also the directory BTreeMap key now that
+        // `InlineName: Ord` is upstream.
+        let inline = match InlineName::new(name) {
+            Ok(n) => n,
+            Err(err) => return StepOutcome::Err(err),
+        };
         let mode = (mode & !S_IFMT) | S_IFDIR;
         let new_id = self.alloc_object_id();
         let mut meta = InodeMeta::new(InodeKind::Directory, mode);
@@ -526,9 +446,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::Err(Errno::ENOTDIR);
         };
         if children.contains_key(&inline) {
-            // See `create_inode`: `EINVAL` is the day-1 mapping for
-            // POSIX `EEXIST` until `Errno` gains the variant.
-            return StepOutcome::Err(Errno::EINVAL);
+            return StepOutcome::Err(Errno::EEXIST);
         }
         children.insert(inline, new_id);
 
@@ -551,13 +469,13 @@ impl FsOps for Tmpfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<()> {
         // `InlineName::new` is the canonical name-validity check
-        // (rejects empty, oversized, or `/` -bearing names). We
-        // discard the returned inline value and key the directory
-        // BTreeMap by the underlying byte vector — see `TmpfsName`.
-        if let Err(err) = InlineName::new(name) {
-            return StepOutcome::Err(err);
-        }
-        let inline = tmpfs_name_from(name);
+        // (rejects empty, oversized, or `/` -bearing names). The
+        // inline name is also the directory BTreeMap key now that
+        // `InlineName: Ord` is upstream.
+        let inline = match InlineName::new(name) {
+            Ok(n) => n,
+            Err(err) => return StepOutcome::Err(err),
+        };
         let mut state = self.state.lock();
         let Some(target_inode) = state.inodes.get(&target) else {
             return StepOutcome::Err(Errno::ENOENT);
@@ -566,12 +484,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::Err(Errno::ENOTDIR);
         };
         if !target_children.is_empty() {
-            // POSIX `ENOTEMPTY`. The day-1 `Errno` enum lacks the
-            // variant; `EBUSY` is the closest substitute (the
-            // directory is "busy" with children). TODO(phase-vfs
-            // -errno-enotempty): map to a real `ENOTEMPTY` once
-            // `Errno` widens.
-            return StepOutcome::Err(Errno::EBUSY);
+            return StepOutcome::Err(Errno::ENOTEMPTY);
         }
 
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
@@ -603,13 +516,13 @@ impl FsOps for Tmpfs {
             return StepOutcome::Err(Errno::ENAMETOOLONG);
         }
         // `InlineName::new` is the canonical name-validity check
-        // (rejects empty, oversized, or `/` -bearing names). We
-        // discard the returned inline value and key the directory
-        // BTreeMap by the underlying byte vector — see `TmpfsName`.
-        if let Err(err) = InlineName::new(name) {
-            return StepOutcome::Err(err);
-        }
-        let inline = tmpfs_name_from(name);
+        // (rejects empty, oversized, or `/` -bearing names). The
+        // inline name is also the directory BTreeMap key now that
+        // `InlineName: Ord` is upstream.
+        let inline = match InlineName::new(name) {
+            Ok(n) => n,
+            Err(err) => return StepOutcome::Err(err),
+        };
         let new_id = self.alloc_object_id();
         let mut meta = InodeMeta::new(InodeKind::Symlink, S_IFLNK | 0o777);
         meta.uid = cred.uid;
@@ -624,9 +537,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::Err(Errno::ENOTDIR);
         };
         if children.contains_key(&inline) {
-            // See `create_inode`: `EINVAL` stands in for POSIX
-            // `EEXIST` until `Errno` widens.
-            return StepOutcome::Err(Errno::EINVAL);
+            return StepOutcome::Err(Errno::EEXIST);
         }
         children.insert(inline, new_id);
 
@@ -668,7 +579,7 @@ impl FsOps for Tmpfs {
             .get(child_id)
             .map(|child| child.meta.kind())
             .unwrap_or(InodeKind::Regular);
-        let entry = match DirEntry::new(*child_id, kind, name.as_slice()) {
+        let entry = match DirEntry::new(*child_id, kind, name.as_bytes()) {
             Ok(e) => e,
             Err(err) => return StepOutcome::Err(err),
         };
@@ -688,6 +599,28 @@ impl FsOps for Tmpfs {
         let mut state = self.state.lock();
         state.inodes.remove(&fs_object_id);
         StepOutcome::Done(())
+    }
+
+    /// Read the inline symlink target bytes for a tmpfs symlink inode.
+    ///
+    /// Used by the VFS walker to materialise an
+    /// `RNodeBacking::Symlink { target }` so the resolution loop can
+    /// substitute the target into the remaining component stream
+    /// (`txdoc:VFS-CHECKS-RUN-WALKER-LOOP-1`). Returns `EINVAL` when
+    /// invoked against a non-symlink inode (POSIX `readlink(2)` shape).
+    fn read_link(
+        &self,
+        fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<alloc::boxed::Box<[u8]>> {
+        let state = self.state.lock();
+        let Some(inode) = state.inodes.get(&fs_object_id) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        match &inode.payload {
+            TmpfsPayload::Symlink(bytes) => StepOutcome::Done(bytes.clone().into_boxed_slice()),
+            _ => StepOutcome::Err(Errno::EINVAL),
+        }
     }
 }
 

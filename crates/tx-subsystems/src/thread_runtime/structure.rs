@@ -12,10 +12,10 @@ use tx_hal::UserTrapContext;
 use tx_reactor::userspace::{UserspaceRunRequest, UserspaceRunSlot};
 use tx_reactor::TaskKey;
 use tx_substrate::zone::{PayloadCap, Weak, Zone, ZoneAllocated};
+use tx_substrate::SpinMutex;
 
 use crate::process::ProcessIdentity;
 use crate::signal::{InterruptSummary, PendingSignalQueue, SignalMask};
-use crate::sync::SpinMutex;
 
 /// Thread identifier. TID 0 is reserved.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]

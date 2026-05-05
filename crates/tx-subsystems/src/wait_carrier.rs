@@ -14,8 +14,9 @@ use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 use tx_reactor::wait::{Channel, Mask, WaitFuture};
 
+use tx_substrate::SpinMutex;
+
 use crate::execution::WaitToken;
-use crate::sync::SpinMutex;
 
 static REGISTRY: SpinMutex<BTreeMap<u64, Channel>> = SpinMutex::new(BTreeMap::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);

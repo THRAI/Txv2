@@ -29,10 +29,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use tx_substrate::zone::{Cap, PayloadCap, Weak, Zone, ZoneAllocated};
+use tx_substrate::SpinMutex;
 
 use crate::cred::{Cred, Gid, Uid};
 use crate::signal::{PendingSignalQueue, SigActionTable};
-use crate::sync::SpinMutex;
 use crate::thread_runtime::ThreadIdentity;
 use crate::tty::structure::identity::TtyIdentity;
 use crate::vfs::{DEntry, OpenFile};
@@ -223,6 +223,16 @@ impl ProcessIdentity {
     /// `.await`.
     pub fn fd(&self, idx: usize) -> Option<Cap<crate::vfs::OpenFile>> {
         self.payload.lock().as_ref().and_then(|p| p.fd(idx))
+    }
+
+    /// Snapshot the current working-directory `Cap<DEntry>` if one is
+    /// installed on the payload. Returns `None` for zombies or
+    /// processes whose cwd has never been bound (init pre-rootfs).
+    ///
+    /// Used by `tx_fs::devfs::open_console_for_init` (the walker
+    /// redirect) to pick the search root for `step_open(/dev/console)`.
+    pub fn cwd(&self) -> Option<Cap<DEntry>> {
+        self.payload.lock().as_ref().and_then(|p| p.cwd())
     }
 
     /// Install `file` at fd `idx` on this process's payload, returning
