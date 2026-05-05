@@ -4,6 +4,46 @@
 
 ## Current Shape
 
+- 2026-05-06 Pre-ELF Phase 6 (mount/dev id allocators + Phase-4
+  deferred `register_mount` wire-up) on branch `feat/pre-elf-runtime`.
+  Per `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`
+  Part 5 §"MountId / DevId allocators (item 10)" + Phasing item 6.
+  `crates/tx-subsystems/src/mount.rs` grows `static NEXT_MOUNT_ID:
+  AtomicU64 = AtomicU64::new(1)`, `static NEXT_DEV_ID: AtomicU32 =
+  AtomicU32::new(1)`, `pub fn allocate_mount_id() -> MountId`, `pub
+  fn allocate_dev_id() -> DevId`, plus
+  `reset_mount_id_counter_for_test` / `reset_dev_id_counter_for_test`
+  test-only helpers (gated on `cfg(any(test, feature =
+  "test-support"))`). The allocators are deterministic from cold
+  start: rootfs's first call returns `MountId(1)` / `DevId(1)`,
+  devfs's second call returns `(2)`/`(2)`, so existing trio
+  boot-smoke assertions on the literal ids stay valid. New
+  cross-crate test-support shims `reset_mount_table`,
+  `reset_mount_id_counter`, `reset_dev_id_counter` in
+  `tx-subsystems/src/lib.rs::cross_crate_test_support`; tx-kernel's
+  `init/tests.rs::setup` calls them between runs. `init.rs`
+  `mount_rootfs_tmpfs` and `mount_devfs_at_dev` flipped from
+  `MountId::new(N)` / `DevId::new(N)` to the allocator helpers; the
+  rootfs and devfs root rnodes now also carry
+  `with_containing_mount` pointers (without these the walker emitted
+  `ENODEV` because `fs_ops_for` returned `None`). After building the
+  dev mount cap but before publishing to the `DEV_MOUNT` slot,
+  init.rs calls `mount::register_mount(&rootfs_payload,
+  dev_object_id, dev_mount.clone())` so the Phase 4 walker resolves
+  `/dev/console` end-to-end without the legacy direct-RNode
+  fallback. `tx-fs` devfs grew an `FsOps::materialise_rnode`
+  override: the walker's terminal `CharDevice` arm now wraps the
+  alias's TTY as `RNodeBacking::StructBacked { Tty }` instead of
+  returning `ENOSYS`. New tx-kernel boot smoke
+  `boot_smoke_walker_resolves_dev_console_after_mount_registration`
+  asserts the walker's terminal DEntry's RNode is a `StructBacked
+  Tty` matching the registered console. tx-kernel 8 → 9 (9/9);
+  tx-subsystems 341/341, tx-fs 13/13, tx-shims 12/12, tx-substrate
+  sync 2/2. `cargo check --workspace`, `cargo fmt --check`, `cargo
+  xtask progress validate` all clean. Next: Phase 2 (reactor task
+  wrapper + userspace-entry shim) → Phase 3 (page-fault async
+  dispatch) → Phase 5 (IRQ dispatch + UART RX). Blocker: none.
+
 - 2026-05-06 Pre-ELF Wave 1 (Phase 1 minor cleanups + Phase 4 VFS
   walker) landed on branch `feat/pre-elf-runtime` (worktree
   `funny-hugle-06199b`). Per

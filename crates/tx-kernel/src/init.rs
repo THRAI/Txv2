@@ -9,7 +9,7 @@ use tx_substrate::SpinMutex;
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::{Guard, StepOutcome};
 use tx_subsystems::mount::{
-    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
+    self, MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::tty::structure::TtyIdentity;
@@ -289,13 +289,18 @@ impl<P: TxPlatform> CoreInit<P> {
     /// rootfs supplies the directory `/dev` is mounted on top of.
     pub(crate) fn mount_rootfs_tmpfs() {
         let (_tmpfs, mount_output) = tx_fs::tmpfs::Tmpfs::new_root();
+        // Allocate ids through the centralised allocators
+        // (`txdoc:MOUNT-MOUNTPAYLOAD-1`,
+        // `txdoc:MOUNT-STEP-MOUNT-COMMIT-ORDERING-1`). The
+        // allocators are deterministic from cold start: rootfs claims
+        // `MountId(1)` / `DevId(1)`; `mount_devfs_at_dev` then claims
+        // `MountId(2)` / `DevId(2)`. Existing trio boot-smoke
+        // assertions on the literal ids stay valid.
         let payload = MountPayload::new_cap(
             mount_output.fs_ops.clone(),
             mount_output.fs_page_backing.clone(),
             None,
-            // dev_id picks an arbitrary stable id for the rootfs
-            // mount; full DevId allocation is a follow-up.
-            DevId::new(1),
+            mount::allocate_dev_id(),
             MountOptions::default(),
             "tmpfs",
             SourceLabel::Static("rootfs"),
@@ -306,21 +311,28 @@ impl<P: TxPlatform> CoreInit<P> {
         // carries `InlineName::ROOT` per
         // `crates/tx-subsystems/src/vfs/structure.rs`'s root marker
         // contract (path render emits a single `/` for empty-name
-        // dentries).
-        let root_rnode = RNode::new_cap(
-            mount_output.root_fs_object_id,
-            mount_output.root_inode_meta,
-            RNodeBacking::Directory,
-        )
-        .expect("mount_rootfs_tmpfs: root rnode reservation");
+        // dentries). The root rnode also carries a
+        // `containing_mount` weak pointing at the rootfs payload so
+        // the VFS walker (`crate::vfs::walker::step_walk`) can resolve
+        // the in-scope `FsOps` from any dentry rooted on this rnode.
+        // Without the hint the walker emits `ENODEV` on the first
+        // interior component (per `fs_ops_for` in `walker.rs`).
+        let root_rnode = {
+            let raw = RNode::new(
+                mount_output.root_fs_object_id,
+                mount_output.root_inode_meta,
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&payload);
+            let res = tx_substrate::zone::reserve_for::<RNode>()
+                .expect("mount_rootfs_tmpfs: root rnode reservation");
+            tx_substrate::zone::sign_for(res, raw)
+        };
         let _root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone())
             .expect("mount_rootfs_tmpfs: root dentry reservation");
 
         let mount = MountIdentity::new_cap(
-            // mount_id is opaque; pick a stable id for the rootfs
-            // (`MountId(1)`). Full mount-id allocation is a
-            // follow-up that does not affect the trio surface.
-            MountId::new(1),
+            mount::allocate_mount_id(),
             None,
             root_rnode,
             None,
@@ -379,33 +391,48 @@ impl<P: TxPlatform> CoreInit<P> {
         )
         .expect("mount_devfs_at_dev: /dev dentry-on-rootfs reservation");
 
-        // Build the devfs root RNode. devfs is stateless / static;
-        // its root meta is `S_IFDIR | 0o755` per Phase 3a.
+        // Build the devfs payload before its root RNode so the rnode
+        // can carry a `containing_mount` weak — same reason as the
+        // rootfs root rnode above (the walker's `fs_ops_for` returns
+        // `None` and falls through to `ENODEV` if the hint is
+        // missing).
         let devfs_fs_ops = tx_fs::devfs::Devfs::fs_ops_arc();
         let devfs_fs_page_backing = tx_fs::devfs::Devfs::fs_page_backing_arc();
-        let devfs_root_rnode = RNode::new_cap(
-            tx_fs::devfs::DEVFS_ROOT_OBJECT_ID,
-            InodeMeta::new(
-                tx_subsystems::vfs::InodeKind::Directory,
-                tx_fs::devfs::DEVFS_ROOT_MODE,
-            ),
-            RNodeBacking::Directory,
-        )
-        .expect("mount_devfs_at_dev: devfs root rnode reservation");
 
         let devfs_payload = MountPayload::new_cap(
             devfs_fs_ops,
             devfs_fs_page_backing,
             None,
-            DevId::new(2),
+            mount::allocate_dev_id(),
             MountOptions::default(),
             "devfs",
             SourceLabel::Static("devfs"),
         )
         .expect("mount_devfs_at_dev: payload reservation");
 
+        let devfs_root_rnode = {
+            let raw = RNode::new(
+                tx_fs::devfs::DEVFS_ROOT_OBJECT_ID,
+                InodeMeta::new(
+                    tx_subsystems::vfs::InodeKind::Directory,
+                    tx_fs::devfs::DEVFS_ROOT_MODE,
+                ),
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&devfs_payload);
+            let res = tx_substrate::zone::reserve_for::<RNode>()
+                .expect("mount_devfs_at_dev: devfs root rnode reservation");
+            tx_substrate::zone::sign_for(res, raw)
+        };
+
+        // Snapshot the rootfs's payload before consuming `root_mount`
+        // into the new mount's `parent` slot. The mount-table
+        // registration below keys on the rootfs payload + `/dev`'s
+        // FsObjectId on rootfs.
+        let rootfs_payload = root_mount.payload().clone();
+
         let dev_mount = MountIdentity::new_cap(
-            MountId::new(2),
+            mount::allocate_mount_id(),
             Some(dev_dentry_on_root),
             devfs_root_rnode,
             Some(root_mount),
@@ -413,6 +440,16 @@ impl<P: TxPlatform> CoreInit<P> {
             MountFlags::empty(),
         )
         .expect("mount_devfs_at_dev: mount identity reservation");
+
+        // Publish the mount in the kernel's mount-point registry so
+        // the VFS walker (`crate::vfs::walker::step_walk`) can cross
+        // from rootfs into devfs at `/dev`. Per
+        // `txdoc:MOUNT-STEP-MOUNT-COMMIT-ORDERING-1`: register *after*
+        // the mount's payload is signed and *before* the slot
+        // publishes, so any walker observation that races us either
+        // sees the registered mount or no mount at all (never a
+        // half-built one).
+        mount::register_mount(&rootfs_payload, dev_object_id, dev_mount.clone());
 
         *DEV_MOUNT.lock() = Some(dev_mount);
 

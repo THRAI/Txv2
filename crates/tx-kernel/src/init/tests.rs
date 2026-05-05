@@ -188,6 +188,9 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_init_process();
     tx_subsystems::cross_crate_test_support::reset_pid_counter();
     tx_subsystems::cross_crate_test_support::reset_tid_counter();
+    tx_subsystems::cross_crate_test_support::reset_mount_table();
+    tx_subsystems::cross_crate_test_support::reset_mount_id_counter();
+    tx_subsystems::cross_crate_test_support::reset_dev_id_counter();
     crate::init::reset_boot_state_for_test();
     CONSOLE_CAPTURED_LEN.store(0, Ordering::Release);
     CONSOLE_CAPTURED_BYTES
@@ -264,6 +267,53 @@ fn boot_smoke_mounts_root_and_dev_and_resolves_console() {
         .expect("console alias must resolve");
     let registered = console_tty().expect("CONSOLE_TTY must be populated");
     assert_eq!(resolved, registered);
+}
+
+/// Phase 6: assert that the VFS walker resolves `/dev/console`
+/// end-to-end after `mount_devfs_at_dev` registers the mount via
+/// `mount::register_mount`. Pre-Phase-6 the walker would fail at the
+/// rootfs→devfs crossing (no entry in the mount-point registry) and
+/// `open_console_for_init` would fall back to its legacy direct-RNode
+/// path. With the registration wired the walker now succeeds, the
+/// fallback is unreachable on the boot path, and the terminal DEntry's
+/// RNode is a `StructBacked { Tty(...) }` for the boot console.
+#[test]
+fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
+    use tx_subsystems::execution::StepOutcome;
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking, StructPayload};
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let cwd = init.cwd().expect("init cwd must be bound");
+    let cred = Credential::default();
+    let guard = tx_substrate::epoch::guard();
+    let outcome = block_on(walker::step_walk(cwd, b"/dev/console", &cred, &guard));
+    drop(guard);
+
+    let dentry = match outcome {
+        StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
+        other => {
+            panic!("step_walk(/dev/console) must succeed after mount registration, got {other:?}",)
+        }
+    };
+    assert_eq!(dentry.name().as_bytes(), b"console");
+
+    // The terminal RNode must be a StructBacked Tty matching the
+    // registered console TTY — proving the walker materialised
+    // through devfs's `materialise_rnode` hook and not via the
+    // legacy direct-RNode bootstrap path.
+    let registered = console_tty().expect("CONSOLE_TTY must be populated");
+    match dentry.rnode().backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty),
+        } => {
+            assert_eq!(*tty, registered);
+        }
+        other => panic!("expected StructBacked Tty backing, got {other:?}"),
+    }
 }
 
 #[test]

@@ -252,6 +252,55 @@ impl FsOps for Devfs {
         // can drop its `RNode` without seeing a backend error.
         StepOutcome::Done(())
     }
+
+    /// Materialise an `RNode` for a character-device alias.
+    ///
+    /// Per `txdoc:TTY-RNODE-MATERIALIZATION-1`
+    /// (`docs/design/06_devices/TTY.md` §6.3): char-device entries on
+    /// devfs project the registered TTY as
+    /// `RNodeBacking::StructBacked { payload: StructPayload::Tty(...) }`,
+    /// which routes `OpenFile::step_read` / `step_write` through the
+    /// TTY subsystem. The walker invokes this hook after `lookup` /
+    /// `load_inode_meta` resolve a char-device inode; without it, the
+    /// walker falls through to the trait default (`ENOSYS`) and the
+    /// path resolution fails at the terminal component.
+    ///
+    /// Mirrors the standalone `resolve_console_rnode` helper above —
+    /// the latter is retained for the bootstrap-fallback path
+    /// (`open_console_for_init_legacy`); this hook is the production
+    /// walker site.
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>> {
+        if meta.kind() != InodeKind::CharDevice {
+            // devfs only publishes the root directory and
+            // char-device aliases. Directories are handled by the
+            // walker's inline `Directory` arm; anything else is a
+            // backend bug.
+            return StepOutcome::Err(Errno::ENOSYS);
+        }
+        let Some(idx) = entry_index_from_object_id(fs_object_id) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let entries = tty::project::devfs_alias_entries();
+        let Some(entry) = entries.into_iter().nth(idx) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let tty = entry.tty;
+        match RNode::new_cap(
+            fs_object_id,
+            meta,
+            RNodeBacking::StructBacked {
+                payload: StructPayload::Tty(tty),
+            },
+        ) {
+            Ok(rnode) => StepOutcome::Done(rnode),
+            Err(_) => StepOutcome::Err(Errno::EIO),
+        }
+    }
 }
 
 impl FsPageBacking for Devfs {
