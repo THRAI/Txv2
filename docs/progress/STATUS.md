@@ -1494,58 +1494,26 @@
 
 ## Latest Decisions
 
-- `docs/progress/decisions/2026-05-01-reactor-userspace-entry-ast-checkpoint.md`
-- `docs/progress/decisions/2026-05-01-rv64-trapframe-fault-decode.md`
-- `docs/progress/decisions/2026-05-01-rv64-trap-frame-writeback.md`
-- `docs/progress/decisions/2026-05-01-rv64-timer-trap-idle-smoke.md`
-- `docs/progress/decisions/2026-05-01-rv64-saved-trap-dispatch.md`
-- `docs/progress/decisions/2026-05-01-coreinit-hart-loop-adapter.md`
-- `docs/progress/decisions/2026-04-30-ap-reactor-shared-runqueue-smoke.md`
-- `docs/progress/decisions/2026-04-30-ap-reactor-loop-wfi-smoke.md`
-- `docs/progress/decisions/2026-04-30-rv64-ipi-ack-smoke.md`
-- `docs/progress/decisions/2026-04-30-ap-substrate-before-online.md`
-- `docs/progress/decisions/2026-04-30-rv64-smp-rfence-shootdown.md`
-- `docs/progress/decisions/2026-04-30-smpif-parked-ap-boot.md`
-- `docs/progress/decisions/2026-04-30-reactor-reschedule-dispatch-bridge.md`
-- `docs/progress/decisions/2026-04-30-reactor-affinity-wake-placement.md`
-- `docs/progress/decisions/2026-04-30-reactor-declared-readiness-channel.md`
-- `docs/progress/decisions/2026-04-30-reactor-declared-wait-channel.md`
-- `docs/progress/decisions/2026-04-29-ebr-zone-first-executable-slice.md`
-- `docs/progress/decisions/2026-04-29-rv64-high-vma-low-lma-linker.md`
-- `docs/progress/decisions/2026-04-29-rv64-low-linked-identity-retention.md`
-- `docs/progress/decisions/2026-04-28-pageallocator-token-interface.md`
-- `docs/progress/decisions/2026-04-29-code-reorganization-skill-and-line-limit.md`
-- `docs/progress/decisions/2026-04-29-substrate-slab-heap-zero-frame.md`
-- `docs/progress/decisions/2026-04-29-rv64-pmap-helper-extraction.md`
-- `docs/progress/decisions/2026-04-29-rv64-pmap-module-extraction.md`
-- `docs/progress/decisions/2026-04-29-pmap-kernel-protect-in-place.md`
-- `docs/progress/decisions/2026-04-29-rv64-minimal-trap-vector.md`
-- `docs/progress/decisions/2026-04-28-substrate-init-frameallocator-handoff.md`
-- `docs/progress/decisions/2026-04-29-kernel-shootdown-map-accounting.md`
-- `docs/progress/decisions/2026-04-29-pmap-typed-intermediate-source.md`
-- `docs/progress/decisions/2026-04-29-pmap-rollback-unmap-vocabulary.md`
-- `docs/progress/decisions/2026-04-28-rv64-mmio-pmap-reserve-commit.md`
-- `docs/progress/decisions/2026-04-28-rv64-direct-map-extension.md`
-- `docs/progress/decisions/2026-04-28-unused-lint-gate.md`
-- `docs/progress/decisions/2026-04-28-rv64-identity-teardown-sentinel.md`
-- `docs/progress/decisions/2026-04-28-rv64-high-half-entry.md`
-- `docs/progress/decisions/2026-04-28-rv64-boot-static-bag.md`
-- `docs/progress/decisions/2026-04-28-address-boundary-policy.md`
-- `docs/progress/decisions/2026-04-28-rv64-high-half-alias-bootstrap.md`
-- `docs/progress/decisions/2026-04-28-finish-catchup-progress-memory.md`
-- `docs/progress/decisions/2026-04-28-arceos-aligned-portable-boot.md`
-- `docs/progress/decisions/2026-04-27-fine-grained-txdoc-anchors.md`
-- `docs/progress/decisions/2026-04-27-xtask-module-split.md`
-- `docs/progress/decisions/2026-04-27-xtask-progress-command-surface.md`
-- `docs/progress/decisions/2026-04-27-ci-reporting-and-txdoc-tags.md`
-- `docs/progress/decisions/2026-04-27-json-agent-operational-records.md`
-- `docs/progress/decisions/2026-04-27-humanlayer-reference-and-agentic-workflow.md`
-- `docs/progress/decisions/2026-04-27-doc-layout-and-progress-memory.md`
+- `docs/progress/decisions/2026-05-05-tty-signal-end-to-end-typed-dispatch.md`
+- `docs/progress/decisions/2026-05-05-tty-pgrp-typed-rebinding.md`
+- `docs/progress/decisions/2026-05-05-step-waitpid-nohang.md`
+- `docs/progress/decisions/2026-05-05-step-exit-group-with-signal.md`
+- `docs/progress/decisions/2026-05-05-signal-gewalt-event-factoring.md`
+- `docs/progress/decisions/2026-05-05-signal-delivery-sweep-day1.md`
+- `docs/progress/decisions/2026-05-05-signal-day1.md`
+- `docs/progress/decisions/2026-05-05-sigchld-edge.md`
+- `docs/progress/decisions/2026-05-05-session-leader-hangup.md`
+- `docs/progress/decisions/2026-05-05-process-topology-day1.md`
 
 ## Latest Research
 
+- `docs/progress/research/2026-05-04-vm-pagebacked-midway-checkpoint.md`
+- `docs/progress/research/2026-05-04-vm-pagebacked-gap-update.md`
+- `docs/progress/research/2026-05-04-vm-pagebacked-final-ledger.md`
+- `docs/progress/research/2026-05-04-tty-implementation-status.md`
+- `docs/progress/research/2026-05-03-vm-doc-gap-ledger.md`
 - `docs/progress/research/2026-05-01-reactor-runtime-dispatch-audit.md`
-- `docs/progress/research/2026-05-01-ast-return-to-user-scout.md`
 - `docs/progress/research/2026-05-01-coreinit-runtime-loop-scout.md`
-- `docs/progress/research/2026-04-30-reactor-readiness-for-subsystems.md`
-- `docs/progress/research/2026-04-27-humanlayer-progress-memory.md`
+- `docs/progress/research/2026-05-01-ast-return-to-user-scout.md`
+- `docs/progress/research/2026-04-30-reactor-third-wave-scout.md`
+- `docs/progress/research/2026-04-30-reactor-third-wave-audit.md`
