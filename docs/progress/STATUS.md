@@ -4,6 +4,30 @@
 
 ## Current Shape
 
+- 2026-05-05 Gewalt/event factoring restored on top of signal delivery
+  sweep (branch `process-topology`). Audit found day-1 collapsed the
+  spec's two signal categories into one `post_signal` pipeline:
+  SIGKILL/SIGSTOP/SIGCONT entered `thread_pending` alongside
+  catchable signals, with summary special-cases on top. Per
+  `SIGNAL_v1` §1 + §2 Consequence 2 the Gewalt signums must bypass
+  pending queues entirely. Refactor: new `signal::route_gewalt(target,
+  sig)` walks every live thread of the target process and updates
+  `signal_summary` directly (SIGKILL → termination, SIGSTOP →
+  stop_requested, SIGCONT → clear stop_requested) without touching
+  pending queues. `signal::step_kill_process` dispatches by signum:
+  Gewalt → `route_gewalt`, catchable → `post_signal` to leader
+  thread. `signal::is_gewalt(sig)` is the public predicate. Pgrp
+  shims (`step_kill_pgrp`, `script_kill_pgrp`) skip the
+  `group_pending` mirror for Gewalt members. `post_signal` contract
+  tightens with a `debug_assert!` rejecting Gewalt signums; its
+  body strips the SIGKILL/SIGSTOP/SIGCONT special-cases and only
+  handles catchable signals (sets `summary.deliverable_signal` when
+  unmasked). Existing 2 SIGSTOP/SIGCONT tests ported to
+  `step_kill_process` route; 5 new tests cover pending-queue bypass
+  per Gewalt signum and pgrp non-mirroring; `ast_check_default_continue_for_sigcont`
+  removed (SIGCONT is Gewalt → never visits AST in day-1; its
+  enqueue-for-handler half lands when SIGCONT-with-handler is wired).
+  Suite at 277; full `cargo xtask ci` green (11/11 gates).
 - 2026-05-05 Signal delivery sweep day-1 lands on top of TTY → signal
   end-to-end (branch `process-topology`). Realises the day-1 subset
   of `SIGNAL_v1` §14 (selection algorithm) and §15.1 (ast_check) plus
