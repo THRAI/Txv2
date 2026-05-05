@@ -67,6 +67,12 @@ pub struct ProcessIdentity {
     pub parent_pid: Pid,
     pub(crate) pgrp: SpinMutex<Cap<ProcessGroup>>,
     pub(crate) exit_status: SpinMutex<Option<i32>>,
+    /// `Some(sig)` if the process was killed by a signal (set by
+    /// `step_exit_group_with_signal`). `None` for explicit
+    /// `step_exit_group(int)` exits and live processes. Future
+    /// `wait(2)` consults both this slot and `exit_status` to build
+    /// the POSIX status word (WIFEXITED vs WIFSIGNALED).
+    pub(crate) terminating_signal: SpinMutex<Option<crate::signal::Signum>>,
     pub(crate) payload: SpinMutex<Option<PayloadCap<ProcessPayload>>>,
 }
 
@@ -82,6 +88,13 @@ impl ProcessIdentity {
     /// (or last-thread `step_thread_exit`) has run; otherwise `None`.
     pub fn exit_status(&self) -> Option<i32> {
         *self.exit_status.lock()
+    }
+
+    /// Read the terminating signal, if any. `Some(sig)` after
+    /// `step_exit_group_with_signal`; `None` for explicit-int exits
+    /// and live processes.
+    pub fn terminating_signal(&self) -> Option<crate::signal::Signum> {
+        *self.terminating_signal.lock()
     }
 
     /// Whether the process is a zombie (payload dropped, identity

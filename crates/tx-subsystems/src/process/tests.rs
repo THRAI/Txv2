@@ -7,11 +7,13 @@
 //! identity/payload split is the primary subject under test: zombies
 //! retain identity but drop payload.
 
+use crate::process::execution::step_exit_group_with_signal;
 use crate::process::structure::{reset_pid_counter_for_test, Pgid, Pid, ProcessIdentity};
 use crate::process::{
     bootstrap_init_process, step_exit_group, step_fork, step_setpgid, step_setsid, ForkError,
     SetpgidError,
 };
+use crate::signal::Signum;
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentity};
@@ -233,4 +235,50 @@ fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
         .count();
     drop(guard);
     assert_eq!(live_after, 1);
+}
+
+#[test]
+fn step_exit_group_with_signal_records_signum_and_status_encoding() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    step_exit_group_with_signal(&proc_cap, Signum::SIGTERM);
+
+    assert!(proc_cap.is_zombie());
+    assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGTERM));
+    // Day-1 shell-convention status: 128 + signum.
+    assert_eq!(
+        proc_cap.exit_status(),
+        Some(128 + Signum::SIGTERM.raw() as i32)
+    );
+    assert_eq!(proc_cap.live_thread_count(), 0);
+}
+
+#[test]
+fn step_exit_group_with_signal_overrides_terminating_signal_on_double_call() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    // First call sets terminating_signal=SIGTERM and zombifies.
+    step_exit_group_with_signal(&proc_cap, Signum::SIGTERM);
+    assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGTERM));
+
+    // Second call on the same identity should be a no-op for the
+    // payload (already None) but still updates the recorded signal —
+    // demonstrates idempotent slot semantics. Defensive coverage of
+    // the double-zombify path.
+    step_exit_group_with_signal(&proc_cap, Signum::SIGKILL);
+    assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGKILL));
+}
+
+#[test]
+fn step_exit_group_does_not_set_terminating_signal() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    step_exit_group(&proc_cap, 7);
+
+    assert!(proc_cap.is_zombie());
+    assert_eq!(proc_cap.exit_status(), Some(7));
+    assert_eq!(proc_cap.terminating_signal(), None);
 }

@@ -958,9 +958,19 @@ mod delivery {
         let proc_cap = fresh_init();
         let leader = leader(&proc_cap);
 
-        // Posting SIGKILL sets summary.termination via post_signal's
-        // contract; ast_check observes and returns InitiateTermination.
-        let _ = step_kill_process(&proc_cap, Signum::SIGKILL);
+        // SIGKILL no longer takes the summary.termination route — it
+        // invokes step_exit_group_with_signal directly per spec
+        // §12.3. The AST priority-1 path is for OTHER fatal scenarios
+        // (synchronous fault default-Term, ptrace fatal, etc.) that
+        // set the bit on a still-live thread. Manually set it via the
+        // crate-internal update_summary helper to exercise the path
+        // without depending on a not-yet-wired producer.
+        leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .update_summary(|s| s.termination = true);
         assert_eq!(ast_check(&leader), AstOutcome::InitiateTermination);
     }
 
@@ -1126,18 +1136,23 @@ mod delivery {
     }
 
     #[test]
-    fn sigkill_post_sets_summary_termination() {
+    fn sigkill_via_step_kill_zombifies_process_with_status_encoding() {
         let _g = setup();
         let proc_cap = fresh_init();
-        let leader = leader(&proc_cap);
 
-        let _ = step_kill_process(&proc_cap, Signum::SIGKILL);
+        let outcome = step_kill_process(&proc_cap, Signum::SIGKILL);
+        assert_eq!(outcome, KillOutcome::Delivered);
 
-        let summary = leader.payload.lock().as_ref().unwrap().interrupt_summary();
-        assert!(summary.termination, "SIGKILL must set termination");
-        // SIGKILL is uncatchable so the mask doesn't apply; deliverable
-        // is also set to mark "wake any interruptible waits".
-        assert!(summary.deliverable_signal);
+        // Per SIGNAL_v1 §12.3 route_sigkill, SIGKILL invokes
+        // step_exit_group_with_signal directly: the target is now a
+        // zombie carrying terminating_signal=Some(SIGKILL) and
+        // exit_status=Some(128 + SIGKILL).
+        assert!(proc_cap.is_zombie());
+        assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGKILL));
+        assert_eq!(
+            proc_cap.exit_status(),
+            Some(128 + Signum::SIGKILL.raw() as i32)
+        );
     }
 
     #[test]
@@ -1186,35 +1201,13 @@ mod delivery {
 
     // ----- Gewalt vs event factoring (SIGNAL_v1 §1, §2 Consequence 2) -----
 
-    #[test]
-    fn sigkill_does_not_enter_thread_pending() {
-        let _g = setup();
-        let proc_cap = fresh_init();
-        let leader = leader(&proc_cap);
-
-        let _ = step_kill_process(&proc_cap, Signum::SIGKILL);
-
-        let pending = leader
-            .payload
-            .lock()
-            .as_ref()
-            .unwrap()
-            .pending()
-            .is_pending(Signum::SIGKILL);
-        assert!(
-            !pending,
-            "SIGKILL is Gewalt: must bypass thread_pending per SIGNAL_v1 §2 Consequence 2"
-        );
-        assert!(
-            leader
-                .payload
-                .lock()
-                .as_ref()
-                .unwrap()
-                .interrupt_summary()
-                .termination
-        );
-    }
+    // SIGKILL's pending-queue bypass is covered by the
+    // `sigkill_via_step_kill_zombifies_process_with_status_encoding`
+    // test above: after SIGKILL the process is a zombie, the leader
+    // thread's payload is dropped, and there's literally no
+    // `thread_pending` queue to inspect. The structural separation
+    // is realised by the spec-correct `step_exit_group_with_signal`
+    // path, not by leaving a live leader with an empty bitset.
 
     #[test]
     fn sigstop_does_not_enter_thread_pending() {
@@ -1260,36 +1253,19 @@ mod delivery {
     }
 
     #[test]
-    fn route_gewalt_marks_target_threads_only() {
+    fn route_gewalt_sigkill_zombifies_target_only() {
         let _g = setup();
         let parent = fresh_init();
         let child = crate::process::step_fork::<TestPmap>(&parent).expect("fork");
 
-        // SIGKILL on the parent sweeps only the parent's threads —
-        // fork doesn't share threads. The unrelated child is untouched.
+        // SIGKILL on the parent zombifies only the parent — fork's
+        // threads are owned by the child process and are independent.
         let _ = crate::signal::route_gewalt(&parent, Signum::SIGKILL);
 
-        let parent_leader = leader(&parent);
-        let child_leader = leader(&child);
-
-        assert!(
-            parent_leader
-                .payload
-                .lock()
-                .as_ref()
-                .unwrap()
-                .interrupt_summary()
-                .termination
-        );
-        assert!(
-            !child_leader
-                .payload
-                .lock()
-                .as_ref()
-                .unwrap()
-                .interrupt_summary()
-                .termination
-        );
+        assert!(parent.is_zombie());
+        assert!(!child.is_zombie());
+        assert_eq!(parent.terminating_signal(), Some(Signum::SIGKILL));
+        assert_eq!(child.terminating_signal(), None);
     }
 
     #[test]
