@@ -23,6 +23,19 @@ unsafe impl ZoneAllocated for AddressSpace {
     }
 }
 
+// AddressSpace contains substrate `MapPin` tokens (via `VmPmap` →
+// `PmapMapping` → `MaterializedPagePin`) that are deliberately !Send
+// to enforce per-CPU pinning at the page-allocator level. The
+// AddressSpace as a whole is still safe to share across CPUs under
+// the kernel's epoch + pmap discipline: external access goes through
+// the zone slot via `Cap<AddressSpace>` and is guarded by
+// `tx_substrate::epoch::guard`. The Send/Sync impls here lift the
+// stricter token-level !Send into a kernel-level shared-by-discipline
+// shape so `Cap<AddressSpace>` can flow through `ProcessPayload`,
+// which is itself shared by `Cap<ProcessIdentity>` references.
+unsafe impl Send for AddressSpace {}
+unsafe impl Sync for AddressSpace {}
+
 pub struct AddressSpace {
     pub(in crate::vm) recipes: RecipeIndex,
     pub(in crate::vm) pmap: VmPmap,
