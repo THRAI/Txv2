@@ -14,7 +14,7 @@
 //! ```text
 //! ProcessIdentity ──Cap──▶ ProcessGroup ──Cap──▶ Session
 //!     │  ▲                       │ ▲                  │ ▲
-//!     │  └──Weak (members)───────┘ └──Weak (groups)───┘ │
+//!     │  └──Weak (members)───────┘ └──Weak (members)──┘ │
 //!     │                                                  │
 //!     └──PayloadCap──▶ ProcessPayload                    │
 //!                          │  ▲                          │
@@ -35,7 +35,46 @@ use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::sync::SpinMutex;
 use crate::thread_runtime::ThreadIdentity;
 use crate::tty::structure::identity::TtyIdentity;
+use crate::vfs::DEntry;
 use crate::vm::AddressSpace;
+
+/// Per-process exit disposition, populated by `step_exit_group` /
+/// `step_exit_group_with_signal` / the last-thread cascade. Spec
+/// counterpart in `PROCESS_v1` §6.2 ("priority of process exit
+/// status"): both shapes feed into the future `wait(2)` status word.
+///
+/// Day-1 deliberately omits the core-dump bit — `Signaled` carries
+/// only the signum until the fatal-Core action lands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitStatus {
+    /// Explicit `step_exit_group(int)` exit.
+    Exited(i32),
+    /// Terminated by a fatal signal (default `Term` action or SIGKILL).
+    Signaled(crate::signal::Signum),
+}
+
+impl ExitStatus {
+    /// Day-1 numeric status word, shell-convention: raw int for
+    /// explicit exits, `128 + signum` for signal exits. POSIX
+    /// `wait(2)` will replace this with the proper
+    /// WIFEXITED / WIFSIGNALED encoding when the decoder lands.
+    pub fn wait_status_word(self) -> i32 {
+        match self {
+            ExitStatus::Exited(s) => s,
+            ExitStatus::Signaled(sig) => 128 + sig.raw() as i32,
+        }
+    }
+
+    /// `Some(sig)` iff this is a `Signaled` exit. Convenience for
+    /// callers that only care about the signum (kept-shape accessor
+    /// from before the unification).
+    pub fn terminating_signal(self) -> Option<crate::signal::Signum> {
+        match self {
+            ExitStatus::Exited(_) => None,
+            ExitStatus::Signaled(sig) => Some(sig),
+        }
+    }
+}
 
 /// Process identifier. PID 0 is reserved (no-parent / pre-init); init = 1.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
@@ -64,15 +103,37 @@ pub struct Sid(pub u32);
 /// in their pgrp until reaped.
 pub struct ProcessIdentity {
     pub pid: Pid,
-    pub parent_pid: Pid,
+    /// Authoritative upward binding to the parent process. `None` only
+    /// for `pid=1` init (no parent) and for processes whose parent has
+    /// exited (severed at parent's `step_process_exit` per §8.1).
+    /// Held weakly so a parent's exit does not pin children — children
+    /// may outlive their parent. Per `PROCESS_v1` §2.1 the spec wants
+    /// `Binding<ProcessIdentity>`; day-1 uses `SpinMutex<Option<Weak<...>>>`
+    /// (same retention story; CAS-rebind arrives with the substrate
+    /// `Binding<T>` primitive).
+    pub(crate) parent: SpinMutex<Option<Weak<ProcessIdentity>>>,
+    /// Downward materialization of children: processes whose `parent`
+    /// binding names this process. Per `PROCESS_v1` §2.1 the spec
+    /// shape is `DllContainer<ProcessIdentity>`; day-1 uses
+    /// `SpinMutex<Vec<Cap<ProcessIdentity>>>` because children must
+    /// be observable here until reaped (§8.5: "zombies stay in
+    /// pgrp.members and session.members until reap. Withdrawn at
+    /// reap, not at exit." — same retention story for parent.children:
+    /// the children container is the **retainer** that keeps zombie
+    /// children alive for `waitpid` even after every other strong
+    /// reference has dropped).
+    ///
+    /// Pushed by `step_fork`; walked by `step_process_exit` (sever
+    /// child's parent slot) and `step_waitpid_nohang` (reap —
+    /// withdraws the Cap, releasing retention).
+    pub(crate) children: SpinMutex<Vec<Cap<ProcessIdentity>>>,
     pub(crate) pgrp: SpinMutex<Cap<ProcessGroup>>,
-    pub(crate) exit_status: SpinMutex<Option<i32>>,
-    /// `Some(sig)` if the process was killed by a signal (set by
-    /// `step_exit_group_with_signal`). `None` for explicit
-    /// `step_exit_group(int)` exits and live processes. Future
-    /// `wait(2)` consults both this slot and `exit_status` to build
-    /// the POSIX status word (WIFEXITED vs WIFSIGNALED).
-    pub(crate) terminating_signal: SpinMutex<Option<crate::signal::Signum>>,
+    /// Process-visible exit disposition. `Some` once the process has
+    /// run `step_exit_group` / `step_exit_group_with_signal` (or the
+    /// last-thread cascade has fired); otherwise `None`. Discriminates
+    /// explicit-int exits from signal-driven termination per
+    /// `PROCESS_v1` §6.2.
+    pub(crate) exit_status: SpinMutex<Option<ExitStatus>>,
     pub(crate) payload: SpinMutex<Option<PayloadCap<ProcessPayload>>>,
 }
 
@@ -84,17 +145,50 @@ impl ProcessIdentity {
         self.pgrp.lock().clone()
     }
 
+    /// Snapshot the parent's `Cap` if the parent identity is still
+    /// retained somewhere. Returns `None` for `pid=1` init (no parent)
+    /// and after the parent identity has been fully reclaimed.
+    pub fn parent_cap(&self) -> Option<Cap<ProcessIdentity>> {
+        let weak = (*self.parent.lock())?;
+        let guard = tx_substrate::epoch::guard();
+        weak.upgrade(&guard)
+    }
+
+    /// Render the parent's pid for `getppid` and tracing. Returns
+    /// `Pid::RESERVED` when there's no parent (init) or the parent
+    /// has been reclaimed. Day-1 single-namespace; namespace-aware
+    /// rendering arrives with `PidName` / `nsproxy`.
+    pub fn parent_pid(&self) -> Pid {
+        self.parent_cap().map(|p| p.pid).unwrap_or(Pid::RESERVED)
+    }
+
+    /// Number of children currently retained by this process. All
+    /// entries are valid `Cap`s — zombies and live children alike.
+    /// Children leave this list only via `step_waitpid_nohang`'s
+    /// reap step or when this process itself reclaims.
+    pub fn child_count(&self) -> usize {
+        self.children.lock().len()
+    }
+
+    /// Snapshot the children list as owned `Cap`s. The returned
+    /// vec is independent of the locked container; the lock is
+    /// released before return. Includes zombie children (callers
+    /// that need to skip zombies should `is_zombie()`-filter).
+    pub fn children(&self) -> alloc::vec::Vec<Cap<ProcessIdentity>> {
+        self.children.lock().clone()
+    }
+
     /// Read the recorded exit status. `Some` once `step_exit_group`
     /// (or last-thread `step_thread_exit`) has run; otherwise `None`.
-    pub fn exit_status(&self) -> Option<i32> {
+    pub fn exit_status(&self) -> Option<ExitStatus> {
         *self.exit_status.lock()
     }
 
-    /// Read the terminating signal, if any. `Some(sig)` after
-    /// `step_exit_group_with_signal`; `None` for explicit-int exits
-    /// and live processes.
+    /// Read the terminating signal, if any. `Some(sig)` if the recorded
+    /// exit status is `ExitStatus::Signaled`; `None` for explicit-int
+    /// exits and live processes.
     pub fn terminating_signal(&self) -> Option<crate::signal::Signum> {
-        *self.terminating_signal.lock()
+        self.exit_status.lock().and_then(|s| s.terminating_signal())
     }
 
     /// Whether the process is a zombie (payload dropped, identity
@@ -171,8 +265,8 @@ pub struct TargetProcCred {
 
 /// Process payload. Dropped when the last thread exits (zombie state).
 /// Holds the address space and the live thread list. Future fields
-/// (`cred`, `rlimits`, `fd_table`, `sig_actions`, `group_pending`) land
-/// in follow-up passes without changing the existing surface.
+/// (`rlimits`, `fd_table`) land in follow-up passes without changing
+/// the existing surface.
 pub struct ProcessPayload {
     pub(crate) aspace: Cap<AddressSpace>,
     pub(crate) threads: SpinMutex<Vec<Cap<ThreadIdentity>>>,
@@ -188,6 +282,20 @@ pub struct ProcessPayload {
     /// Per-process credential snapshot. Mutated via `cred::step_setuid`
     /// / `cred::step_setgid`; readers clone via `cred()` accessor.
     pub(crate) cred: SpinMutex<Cred>,
+    /// Current working directory as a `DEntry` `Cap`.
+    ///
+    /// Spec note: `PROCESS_v1` §3 declares this as `Cap<RNode>` on a
+    /// `Frame` container. The impl uses `Cap<DEntry>` because VFS's
+    /// `ResolveCtx` already takes a `Cap<DEntry>` for cwd-bound
+    /// path resolution, and `DEntry` carries the named-path edge
+    /// needed to render `getcwd(2)` (walk `parent_hint` chain). The
+    /// spec is amended in this pass to match the impl.
+    ///
+    /// `None` until a rootfs is mounted and `step_chdir` installs an
+    /// initial cwd. Day-1 `bootstrap_init_process` leaves this slot
+    /// empty; `step_getcwd` returns `None` for a process with no
+    /// cwd installed.
+    pub(crate) cwd: SpinMutex<Option<Cap<DEntry>>>,
 }
 
 impl ProcessPayload {
@@ -206,6 +314,13 @@ impl ProcessPayload {
     /// (`cred::step_setuid` etc.) take the lock internally.
     pub fn cred(&self) -> Cred {
         *self.cred.lock()
+    }
+
+    /// Snapshot the current working-directory `Cap<DEntry>` if one
+    /// is installed. `None` for processes that haven't had a cwd
+    /// set (init pre-rootfs).
+    pub fn cwd(&self) -> Option<Cap<DEntry>> {
+        self.cwd.lock().clone()
     }
 }
 
@@ -239,7 +354,11 @@ impl ProcessGroup {
 pub struct Session {
     pub sid: Sid,
     pub(crate) controlling_tty: SpinMutex<Option<Weak<TtyIdentity>>>,
-    pub(crate) groups: SpinMutex<Vec<Weak<ProcessGroup>>>,
+    /// Process groups whose `session` binding names this session.
+    /// Per `PROCESS_v1` §2.4 (the spec calls this DLL `members`); we
+    /// hold weak refs because retention is held by each pgrp's
+    /// session binding.
+    pub(crate) members: SpinMutex<Vec<Weak<ProcessGroup>>>,
 }
 
 impl Session {
@@ -248,10 +367,37 @@ impl Session {
         self.controlling_tty.lock().is_some()
     }
 
-    /// Number of `Weak` group slots currently held. Includes stale
-    /// entries pointing to dropped groups.
-    pub fn group_slot_count(&self) -> usize {
-        self.groups.lock().len()
+    /// Number of `Weak` member-pgrp slots currently held. Includes
+    /// stale entries pointing to dropped groups.
+    pub fn member_slot_count(&self) -> usize {
+        self.members.lock().len()
+    }
+
+    /// Snapshot the controlling TTY's `Cap` if it's still live. `None`
+    /// if the session has no controlling TTY (TIOCNOTTY / hangup ran)
+    /// or the TTY identity has been reclaimed.
+    pub fn controlling_tty_cap(&self) -> Option<Cap<TtyIdentity>> {
+        let weak = (*self.controlling_tty.lock())?;
+        let guard = tx_substrate::epoch::guard();
+        weak.upgrade(&guard)
+    }
+
+    /// Snapshot the foreground process group for this session.
+    ///
+    /// Per `OBJECT_PATTERN_FIXES_v1.md` OPA-3 (TTY-CTL-1) the
+    /// authoritative foreground-pgrp slot lives on `TtyIdentity`'s
+    /// `SessionPgrp`, not on `Session`. This helper hides the two-hop
+    /// dereference (`Session.controlling_tty` Weak → `TtyIdentity` →
+    /// `tty.foreground_pgrp_cap()` Weak) so process-side callers
+    /// (session-leader-death SIGHUP cascade, orphan-pgrp detection,
+    /// `tcgetpgrp`-style queries that come in via the process side)
+    /// don't open-code the chain.
+    ///
+    /// Returns `None` if the session has no controlling tty, or the
+    /// tty has no foreground pgrp installed, or either weak ref has
+    /// been reclaimed.
+    pub fn foreground_pgrp_cap(&self) -> Option<Cap<ProcessGroup>> {
+        self.controlling_tty_cap()?.foreground_pgrp_cap()
     }
 }
 

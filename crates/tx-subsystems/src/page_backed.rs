@@ -311,6 +311,16 @@ pub struct PageContainer {
     state: SpinMutex<PageContainerState>,
 }
 
+// `PageCacheIndex` (inside `PageContainerState`) is a `BTreeMap<PageIndex,
+// PageCacheEntry>` whose values carry an internal `*const ()` cache pin
+// for fast page-table dereferences. The pointer is treated as borrow-style
+// evidence covered by the surrounding `SpinMutex`. Like `AddressSpace`,
+// `PageContainer` is a zone-allocated entity whose `Cap` is meant to be
+// shareable across hart boundaries; the pointer-shaped internal state
+// does not preclude that.
+unsafe impl Send for PageContainer {}
+unsafe impl Sync for PageContainer {}
+
 #[derive(Debug)]
 struct PageContainerState {
     pages: PageCacheIndex,

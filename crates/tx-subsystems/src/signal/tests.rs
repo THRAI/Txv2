@@ -4,8 +4,9 @@
 //! (process and pgrp), sigaction installation, sigprocmask updates,
 //! and zombie-ignored cases.
 
+use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
-use crate::process::{bootstrap_init_process, step_exit_group, step_fork};
+use crate::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
 use crate::signal::{
     step_kill_pgrp, step_kill_process, step_sigaction, KillOutcome, PendingSignalQueue,
     SigDisposition, SigDispositionChange, SignalMask, Signum,
@@ -26,6 +27,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
     reset_pid_counter_for_test();
     reset_tid_counter_for_test();
+    reset_init_process_for_test();
     guard
 }
 
@@ -114,7 +116,7 @@ fn kill_process_routes_signal_to_first_live_thread() {
 fn kill_zombie_process_returns_no_live_thread() {
     let _g = setup();
     let proc_cap = bootstrap();
-    step_exit_group(&proc_cap, 0);
+    step_exit_group(&proc_cap, ExitStatus::Exited(0));
 
     let outcome = step_kill_process(&proc_cap, Signum::SIGTERM);
     assert_eq!(outcome, KillOutcome::NoLiveThread);
@@ -147,7 +149,7 @@ fn kill_pgrp_skips_zombie_members_in_count() {
     let _g = setup();
     let parent = bootstrap();
     let child = step_fork::<TestPmap>(&parent).expect("fork");
-    step_exit_group(&child, 0);
+    step_exit_group(&child, ExitStatus::Exited(0));
 
     let pgrp = parent.pgrp_cap();
     let delivered = step_kill_pgrp(&pgrp, Signum::SIGTERM);
@@ -204,7 +206,7 @@ fn sigaction_refuses_to_change_uncatchable_disposition() {
 fn sigaction_on_zombie_process_is_zombie_ignored() {
     let _g = setup();
     let proc_cap = bootstrap();
-    step_exit_group(&proc_cap, 0);
+    step_exit_group(&proc_cap, ExitStatus::Exited(0));
 
     let outcome = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Ignore);
     assert_eq!(outcome, SigDispositionChange::ZombieIgnored);
@@ -396,6 +398,7 @@ mod kill_permission {
         let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
         reset_pid_counter_for_test();
         reset_tid_counter_for_test();
+        reset_init_process_for_test();
         guard
     }
 
@@ -441,7 +444,7 @@ mod kill_permission {
         let _g = setup();
         let parent = fresh_init();
         let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent).expect("fork");
-        crate::process::step_exit_group(&child, 0);
+        crate::process::step_exit_group(&child, ExitStatus::Exited(0));
 
         // Even without permission, target_proc_cred returns None for
         // a zombie, short-circuiting before the cred check.
@@ -454,7 +457,7 @@ mod kill_permission {
         let _g = setup();
         let parent = fresh_init();
         let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent).expect("fork");
-        crate::process::step_exit_group(&parent, 0);
+        crate::process::step_exit_group(&parent, ExitStatus::Exited(0));
 
         let outcome = script_kill_process(&parent, &child, Signum::SIGTERM);
         assert_eq!(outcome, Err(Errno::ESRCH));
@@ -568,6 +571,7 @@ mod tty_bridge {
         let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
         reset_pid_counter_for_test();
         reset_tid_counter_for_test();
+        reset_init_process_for_test();
         g
     }
 
@@ -758,7 +762,7 @@ mod tty_bridge {
             signal: JobControlSignal::Cont,
         };
 
-        crate::process::step_exit_group(&parent, 0);
+        crate::process::step_exit_group(&parent, ExitStatus::Exited(0));
 
         assert_eq!(deliver_tty_dispatch(&parent, dispatch), Err(Errno::ESRCH));
     }
@@ -788,6 +792,7 @@ mod delivery {
         let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
         reset_pid_counter_for_test();
         reset_tid_counter_for_test();
+        reset_init_process_for_test();
         g
     }
 
@@ -1145,13 +1150,16 @@ mod delivery {
 
         // Per SIGNAL_v1 §12.3 route_sigkill, SIGKILL invokes
         // step_exit_group_with_signal directly: the target is now a
-        // zombie carrying terminating_signal=Some(SIGKILL) and
-        // exit_status=Some(128 + SIGKILL).
+        // zombie carrying ExitStatus::Signaled(SIGKILL).
         assert!(proc_cap.is_zombie());
-        assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGKILL));
         assert_eq!(
             proc_cap.exit_status(),
-            Some(128 + Signum::SIGKILL.raw() as i32)
+            Some(crate::process::ExitStatus::Signaled(Signum::SIGKILL))
+        );
+        assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGKILL));
+        assert_eq!(
+            proc_cap.exit_status().unwrap().wait_status_word(),
+            128 + Signum::SIGKILL.raw() as i32
         );
     }
 
@@ -1289,10 +1297,14 @@ mod delivery {
             }
         );
         assert!(proc_cap.is_zombie());
-        assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGTERM));
         assert_eq!(
             proc_cap.exit_status(),
-            Some(128 + Signum::SIGTERM.raw() as i32)
+            Some(crate::process::ExitStatus::Signaled(Signum::SIGTERM))
+        );
+        assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGTERM));
+        assert_eq!(
+            proc_cap.exit_status().unwrap().wait_status_word(),
+            128 + Signum::SIGTERM.raw() as i32
         );
     }
 

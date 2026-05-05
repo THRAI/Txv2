@@ -4,6 +4,274 @@
 
 ## Current Shape
 
+- 2026-05-05 cwd / chdir / getcwd VFS integration on branch
+  `process-topology`. First VFS↔process seam: processes now carry a
+  `Cap<DEntry>` cwd. New `step_chdir(target, new_cwd)` (returns
+  `ChdirOutcome::Replaced { prev } | ZombieIgnored`) and
+  `step_getcwd(target) -> Option<Vec<u8>>` (renders absolute path
+  by walking DEntry parent_hint chain to root). Path-render helper
+  lives in vfs (`vfs::render_dentry_path`); process delegates. New
+  `InlineName::ROOT` constant (empty-name marker for root dentry,
+  bypasses `InlineName::new`'s empty-rejection); new
+  `DEntry::parent_hint()` accessor. `cwd: SpinMutex<Option<Cap<DEntry>>>`
+  field on `ProcessPayload`; bootstrap leaves it None until rootfs
+  lands. `step_fork` snapshots parent.cwd alongside aspace + cred
+  and threads through to the new payload — POSIX semantics: child
+  inherits the cwd Cap; subsequent parent chdir doesn't affect child.
+  PROCESS_v1 §3 amended (v1.2 note): `cwd: Cap<RNode>` →
+  `cwd: Cap<DEntry>` with `root: Cap<RNode>` → `root: Cap<DEntry>`,
+  matching VFS's ResolveCtx shape and enabling getcwd path-render
+  via the named-path edge that DEntry carries. Send/Sync chain
+  fix: Cap<DEntry> → Cap<RNode> → Cap<PageContainer> → BTreeMap
+  with `*const ()` cache pin broke INIT_PROCESS static; resolved
+  with `unsafe impl Send + Sync for PageContainer` mirroring the
+  AddressSpace / TtyPayload precedent. 7 new tests using synthetic
+  DEntry chains: getcwd-on-no-cwd → None, chdir-then-getcwd-root,
+  chdir-then-getcwd-nested (`/usr/bin`), chdir-returns-prev,
+  chdir-on-zombie, fork-inherits-cwd, parent-chdir-after-fork-doesnt-
+  affect-child. Deliberately deferred: full Frame container (needs
+  Shared<T> for CLONE_FS/VM/FILES/SIGHAND), Frame.root chroot
+  boundary, path-string resolution (syscall driver), bootstrapped
+  rootfs, fchdir, symlink-aware path render, CLONE_FS sharing. Suite
+  at 329 (322 + 7 new); full `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 Pgrp selectors for `step_waitpid_nohang` (branch
+  `process-topology`). Completes POSIX `waitpid(2)`'s pid-argument
+  coverage: signed `pid_t` now maps fully to (`pid > 0` → `Pid`,
+  `pid == 0` → `CallerPgrp`, `pid == -1` → `Any`, `pid < -1` →
+  `Pgrp(-pid)`). Two new `WaitTarget` variants: `Pgrp(Pgid)`
+  matches children whose `pgrp_cap().pgid` equals the target;
+  `CallerPgrp` is resolved to a concrete `Pgrp(parent.pgrp_cap().pgid)`
+  at the start of `step_waitpid_nohang` so the children walk only
+  ever sees concrete selectors. The `WaitTarget::matches` helper
+  panics-by-default on `CallerPgrp` (returns false) — programmer
+  error if it reaches the walk. 5 new tests cover: caller-pgrp reaps
+  same-pgrp zombie, caller-pgrp skips a child that has setpgid'd
+  out, pgrp selector reaps child in specific pgrp, pgrp selector with
+  no matching pgid → NoChildren, pgrp selector with live match →
+  NoneReady. The day-1 `step_waitpid_nohang` surface is now
+  fully POSIX-pid-coverage complete; only blocking variant remains
+  deferred (needs reactor wait integration). Suite at 322 (317 + 5
+  new); full `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 Session-leader-tty hangup cascade per `PROCESS_v1` §8.3
+  (branch `process-topology`). Materialises the cascade doc-spelled
+  in the P3 ratification pass, now buildable on top of
+  `Session::foreground_pgrp_cap()` (added in P3) and the kernel-static
+  init handle (added in boot wiring). New
+  `session_leader_hangup_cascade(process)` helper detects "exiting
+  process is session leader" via `process.pid.0 == session.sid.0`,
+  then runs the four-step cascade: (1) two-hop weak deref to resolve
+  fg pgrp via `session.controlling_tty_cap()` →
+  `tty.foreground_pgrp_cap()`; (2) SIGHUP + SIGCONT to fg pgrp via
+  `signal::step_kill_pgrp` (POSIX §11.1.3 — SIGCONT wakes any stopped
+  members so they observe SIGHUP); (3) clear tty's `session_pgrp`
+  slot (authoritative side per OPA-3); (4) clear
+  `session.controlling_tty` mirror. Steps 3+4 fire even when step 1's
+  fg-pgrp resolution returns None — the tty/session linkage must be
+  severed regardless of pgrp upgrade success. Five short-circuit
+  cases: non-leader exit (skip), no controlling tty (skip), full
+  cascade, no fg pgrp (skip SIGHUP, still clear), init exit (full
+  cascade fires when applicable). Wired into both
+  `step_exit_group` and `step_process_exit` *before*
+  `sever_children` and payload drop so signal-state infrastructure
+  on the exiting process is still observable. 5 new cascade tests
+  in `tty/tests/typed_session_pgrp.rs` (natural home — needs both
+  TTY constructors and process surfaces): full happy path verifying
+  binding clears; SIGHUP delivery to a *surviving* fg-pgrp member
+  (forked child; init zombifies before assertion); non-leader exit
+  preserves bindings; no-controlling-tty no-op; tty-with-no-fg-pgrp
+  still clears tty.session_pgrp per spec. All 27 pre-existing process
+  tests stay green: bootstrap sessions have no controlling tty, so
+  the cascade short-circuits at the first hop in every existing
+  topology test. Deliberately deferred: SigInfo carrier for
+  SIGHUP/SIGCONT, atomic batching of the four substeps (POSIX
+  permits class-3 compositional), §8.2 orphan-pgrp SIGHUP cascade
+  (needs stop-state machinery). Suite at 317 (312 + 5 net); full
+  `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 Boot wiring — pid=1 globally addressable + kernel boot
+  path creates init (branch `process-topology`). Closes the largest
+  remaining process-subsystem gap: `PROCESS_v1` §8.1's reparent-to-init
+  arm, deferred since the children-container pass landed as
+  sever-only because no globally-addressable init handle existed.
+  New `static INIT_PROCESS: SpinMutex<Option<Cap<ProcessIdentity>>>`
+  in `process/execution.rs` with `init_process()` accessor and
+  `reset_init_process_for_test()` reset gate. New `BootstrapError`
+  enum (`Zone(ZoneError)` / `AlreadyBootstrapped`); `bootstrap_init_process`
+  return type changes from `Result<.., ZoneError>` to
+  `Result<.., BootstrapError>` and now registers the resulting Cap
+  in `INIT_PROCESS` (rejects second-bootstrap to prevent test
+  leakage). `sever_children` upgraded from sever-only stub to
+  three-case logic per §8.1: (1) init handle present and `init !=
+  exiting process` → move children Caps from `process.children` into
+  `init.children`, set each child's `parent` slot to `Weak<init>`;
+  (2) init is the one exiting → sever-only (no higher-level reaper);
+  (3) no init handle (test pre-bootstrap, pre-process-init at boot)
+  → sever-only. `mem::take` drains `process.children` in all cases.
+  tx-kernel boot path: new `init_process_subsystem()` step in
+  `init_substrate_if_ready` after the reactor smoke tests; allocates
+  init's `AddressSpace` via `new_cap_for_platform::<P>()`, calls
+  `bootstrap_init_process`, drops the local Cap (INIT_PROCESS
+  retains for kernel lifetime), writes
+  `txkernel:<board>:process:init:ok` sentinel. `P: TxPlatform`
+  already implies `PmapIf` per the supertrait chain so no new
+  bound. Test isolation: `reset_init_process_for_test()` wired into
+  setup() across 5 test files (process / signal — 4 inner-module
+  setup() sites — / cred / thread_runtime / tty/typed_session_pgrp);
+  one test (`weak_owner_proc_flips_dead_after_identity_drop`)
+  manually releases INIT_PROCESS mid-test before drain. 5 new
+  process tests cover bootstrap registration semantics, double-bootstrap
+  rejection, init reparenting (init→middle→leaf chain, exit middle,
+  assert leaf reparents to init + init.child_count grows + middle
+  drained), and init-exit-without-reparent-target. Existing
+  parent-exit tests stay green: every one uses `parent = bootstrap()`
+  so parent IS init, hitting the "init is the exiting process"
+  branch ⇒ same observable behavior. Suite at 312 (307 + 5 net);
+  full `cargo xtask ci` green (11/11 gates) including the rv64
+  qemu / m1dock mock / la64 qemu board targets compiling against
+  the new boot path.
+- 2026-05-05 `step_waitpid_nohang` reaps zombie children + retention
+  fix for parent.children (branch `process-topology`). Materialises
+  the WNOHANG path of `PROCESS_v1` §7.4 `script_waitpid`. New
+  `step_waitpid_nohang(parent, target) -> Result<(Pid, ExitStatus),
+  WaitError>` walks parent's children, finds a zombie matching
+  `WaitTarget::Any` or `WaitTarget::Pid(p)`, reaps by withdrawing
+  from `parent.children` and `child.pgrp.members`, drops the local
+  Cap so identity reclaims after epoch drain. `WaitError` distinguishes
+  `NoChildren` (POSIX ECHILD — no matching children) from `NoneReady`
+  (WNOHANG no-zombie — POSIX returns 0). Implementing waitpid
+  surfaced a real bug: `parent.children` was `Vec<Weak>`, so zombie
+  children whose only retainer was the parent reclaimed before reap
+  per §8.5's "zombies stay until reap" invariant. Switched to
+  `Vec<Cap<ProcessIdentity>>` — children container now retains, only
+  releasing at reap or parent reclaim. Asymmetry preserved with
+  `pgrp.members` which stays `Vec<Weak>` (per §2.3, pgrp's retention
+  is via `session.members` and `member.pgrp`, not via
+  `pgrp.members`). Accessor renames: `child_slot_count` → `child_count`,
+  `live_children` → `children` (no stale entries to filter under
+  Cap retention). 10 new waitpid tests cover all four selector ×
+  state combinations (any/specific × no-children/live/zombie),
+  reap withdrawals on both sides (parent.children + pgrp.members),
+  Signaled exit status round-trip, second-reap-after-exhaustion.
+  Two pre-existing tests rewritten to match new retention model:
+  `live_children_drops_stale_weak` → asserts test-Cap-drop is *not*
+  enough to reclaim (parent retains); `pgrp_member_weak_observation`
+  uses waitpid reap to fully release the child before asserting
+  Weak goes stale. The day-1 process subsystem now closes the full
+  reap cycle: fork → exit → SIGCHLD-to-parent → waitpid → reap.
+  Deferred: blocking `waitpid` (reactor wait integration), pgrp
+  selectors, WCONTINUED/WUNTRACED, siginfo carrier, auto-reap on
+  SIGCHLD-Ignore. Suite at 307 (297 + 10 net); full `cargo xtask ci`
+  green (11/11 gates).
+- 2026-05-05 SIGCHLD edge in `step_process_exit` / `step_exit_group`
+  on branch `process-topology`. Materialises the catchable producer
+  half of `PROCESS_v1` §7.3.3 phase 5 — when a process zombifies,
+  its parent's leader thread now receives a `SIGCHLD` post via
+  `signal::step_kill_process`. New `post_sigchld_to_parent(process)`
+  helper resolves the parent via `process.parent_cap()` (added in
+  the prior drift cleanup); short-circuits if `None` (init / orphan
+  / reclaimed parent), discards `KillOutcome::NoLiveThread` if the
+  parent is itself a zombie. Wired into both exit paths after the
+  zombification commit (post-`sever_children`, post-payload-drop,
+  post-exit_status-write) so the parent observes a complete zombie
+  when it acts on the SIGCHLD. Default mask is empty so the post
+  populates the parent leader's `thread_pending` and updates
+  `signal_summary.deliverable_signal`. Default action is Ignore so
+  AST consult is a no-op; bits accumulate until the parent installs
+  a handler or `wait(2)` reaps. 5 new tests cover happy path on both
+  exit routes (step_exit_group + last-thread cascade), bootstrap-init
+  no-parent skip, orphaned-child no-parent skip, and pathological
+  zombie-parent NoLiveThread discard. Existing 292 tests verified
+  green pre-add (no regression from the new producer). Deliberately
+  deferred: `SigInfo` carrier (`si_pid` / `si_code` / `si_status`)
+  pending the day-1 signal-surface extension; `exit_port` wake
+  pending port machinery; SIGCHLD↔wait(2) auto-reap pending
+  `script_waitpid`. Suite at 297 (292 + 5 new); full `cargo xtask
+  ci` green (11/11 gates).
+- 2026-05-05 `children` container on `ProcessIdentity` (branch
+  `process-topology`). Pairs the `parent: Weak<ProcessIdentity>`
+  field added in the prior drift-cleanup pass with the matching
+  downward materialization per `PROCESS_v1` §2.1. New
+  `children: SpinMutex<Vec<Weak<ProcessIdentity>>>` slot (same shape
+  as `pgrp.members` and `session.members`); members held weakly so
+  the parent does not pin children. Two new accessors:
+  `child_slot_count()` (raw count incl. stale entries) and
+  `live_children()` (snapshot + epoch-guarded upgrade + stale
+  filter, returns owned Caps). `step_fork` now pushes the child's
+  Weak into `parent.children` alongside the pgrp registration —
+  bidirectional binding wired at fork time. New
+  `sever_children(process)` helper materialises §8.1's day-1 stub:
+  walks the children list under an epoch guard and clears each
+  live child's `parent` slot to None. Wired into both
+  `step_exit_group` (explicit group-exit) and `step_process_exit`
+  (last-thread cascade) before payload drop; sever is shallow
+  (direct children only — grandchildren keep their parent).
+  Reparent-to-init lands with boot wiring (no globally-addressable
+  init handle yet); after sever, a child's `parent_pid()` returns
+  `Pid::RESERVED` (same shape as init itself). 7 new tests cover
+  bootstrap-empty, single/multi fork accumulation, stale-Weak
+  filtering after child drop, sever via both exit paths, and the
+  shallow-sever invariant. Structurally unblocks `script_waitpid`,
+  §7.3.3 phase-5 SIGCHLD edge, §8.2 orphan-pgrp SIGHUP detection,
+  and §8.3 session-leader-tty hangup cascade. Suite at 292 (285 +
+  7 new); full `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 Foreground-pgrp homing ratified TTY-owned (P3) on branch
+  `process-topology`. Process audit had surfaced a spec/spec
+  contradiction: `PROCESS_v1` §2.4 declared `Session.foreground_pgrp`
+  while `OBJECT_PATTERN_FIXES_v1.md` OPA-3 (recommended) and the impl
+  put the slot on `TtyIdentity.session_pgrp`. Architectural analysis
+  picked TTY-owned for four reasons (subsystem encapsulation, hangup
+  atomicity, bundled-pair invariant, lifecycle alignment). This pass
+  closes the loop in code, docs, and lint. (1) New
+  `Session::foreground_pgrp_cap()` + `controlling_tty_cap()` helpers
+  hide the two-hop weak dereference (`Session.controlling_tty` →
+  `TtyIdentity` → `tty.foreground_pgrp_cap()`); 3 new tests cover the
+  happy path and both `None` failure modes. (2) `PROCESS_v1` §2.4
+  removes the stale `foreground_pgrp` field from `Session`, restates
+  `controlling_tty` as the mirror of the authoritative
+  `TtyIdentity.session_pgrp`, and adds an explicit "fg pgrp not stored
+  on Session" paragraph with the two-hop diagram. (3) `PROCESS_v1`
+  §8.3 rewrites the session-leader-death cascade as 4 None-tolerant
+  steps (resolve via helper → SIGHUP cascade → clear tty's
+  session_pgrp → clear session's mirror) with an explicit class-3
+  compositional atomicity note. (4) `OPA-3` flips "Recommended" →
+  "Decided", drops the "two valid choices" preamble, expands the
+  rationale into the four-leg argument, and adds new invariant
+  **TTY-CTL-1a** ("no `foreground_pgrp` field on Session"). (5) Two
+  new `cargo xtask lint arch` rules enforce TTY-CTL-1 (rejects
+  `Cap<ProcessIdentity>` in `tty/structure/identity.rs`) and
+  TTY-CTL-1a (rejects `foreground_pgrp:` field decl in
+  `process/structure.rs`, with comment-line escapes); 6 new xtask
+  unit tests cover rejection + allowance cases. Suite at 285 (282 +
+  3 new); xtask at 43 (37 + 6 new); full `cargo xtask ci` green
+  (11/11 gates).
+- 2026-05-05 Process subsystem drift cleanup against `PROCESS_v1`
+  (branch `process-topology`). Doc/impl coherence audit identified
+  four mechanism-level drift items the spec already pins; this pass
+  closes all four without touching deferred features. (1) Renamed
+  `step_zombie` → `step_process_exit` per §7.3.3 (last-thread cascade
+  named for the verb, not the side-effect; full §7.3.3 phase-5
+  cascade still future). (2) Renamed `Session.groups` →
+  `Session.members` per §2.4 (matches `ProcessGroup.members` already-
+  correct shape; accessor `group_slot_count` →
+  `member_slot_count`). (3) Unified the parallel
+  `exit_status: SpinMutex<Option<i32>>` and
+  `terminating_signal: SpinMutex<Option<Signum>>` slots into single
+  `exit_status: SpinMutex<Option<ExitStatus>>` with
+  `enum ExitStatus { Exited(i32), Signaled(Signum) }` per §6.2. The
+  `128 + sig` shell-convention encoding moves into
+  `ExitStatus::wait_status_word()`; `terminating_signal()` accessor
+  derives from the enum. `step_exit_group` signature now takes
+  `ExitStatus`; `step_exit_group_with_signal` is the thin
+  `Signaled(sig)` wrapper. (4) Replaced bare `parent_pid: Pid` with
+  `parent: SpinMutex<Option<Weak<ProcessIdentity>>>` per §2.1 — same
+  retention story as spec's `Binding<ProcessIdentity>` (no retention),
+  uses the substrate primitives we have today. New `parent_cap()` /
+  `parent_pid()` accessors; init has `parent = None`, fork sets
+  `Some(parent.downgrade())`. Unblocks the future children-DLL pass.
+  Out of scope: children container, `step_process_exit` SIGCHLD/
+  exit_port/reparent, GroupExit, leader_exit_status, Frame, nsproxy,
+  Session.foreground_pgrp homing — all roadmap items the audit
+  flagged separately. Suite at 282; full `cargo xtask ci` green
+  (11/11 gates).
 - 2026-05-05 `signal::ast_dispatch` closes the AstOutcome →
   step_exit_group_with_signal loop on branch `process-topology`.
   Thin wrapper over `ast_check` that materialises the day-1

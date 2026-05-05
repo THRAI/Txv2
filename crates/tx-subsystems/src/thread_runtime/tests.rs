@@ -3,8 +3,9 @@
 //! Focus on the thread-side half of the identity/payload split and the
 //! parent-bookkeeping that `step_thread_exit` performs.
 
+use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
-use crate::process::{bootstrap_init_process, step_fork};
+use crate::process::{bootstrap_init_process, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentity};
@@ -21,6 +22,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
     reset_pid_counter_for_test();
     reset_tid_counter_for_test();
+    reset_init_process_for_test();
     guard
 }
 
@@ -61,7 +63,7 @@ fn last_thread_exit_zombifies_owner_process() {
     step_thread_exit(leader, 99);
 
     assert!(proc_cap.is_zombie());
-    assert_eq!(proc_cap.exit_status(), Some(99));
+    assert_eq!(proc_cap.exit_status(), Some(ExitStatus::Exited(99)));
     assert_eq!(proc_cap.live_thread_count(), 0);
 }
 
@@ -86,7 +88,7 @@ fn weak_owner_proc_survives_payload_drop() {
     let leader = first_thread(&proc_cap);
 
     // Zombify by exit_group; identity persists, payload gone.
-    crate::process::step_exit_group(&proc_cap, 0);
+    crate::process::step_exit_group(&proc_cap, ExitStatus::Exited(0));
     assert!(proc_cap.is_zombie());
 
     // Weak still resolves to the (zombie) identity.
@@ -105,12 +107,17 @@ fn weak_owner_proc_flips_dead_after_identity_drop() {
 
     // Zombify so the process payload is gone but the identity is still
     // retained by `proc_cap`.
-    crate::process::step_exit_group(&proc_cap, 0);
+    crate::process::step_exit_group(&proc_cap, ExitStatus::Exited(0));
     assert!(leader.upgrade_owner_proc().is_some());
 
-    // Drop the strong handle. Weak observers should no longer find it
-    // after epoch drain.
+    // Drop the strong handles. Weak observers should no longer find
+    // it after epoch drain. Releasing the test's local Cap is not
+    // sufficient: bootstrap_init_process registers the init Cap in
+    // the global INIT_PROCESS slot, which is the second strong
+    // retainer. Tests release it explicitly via
+    // reset_init_process_for_test.
     drop(proc_cap);
+    reset_init_process_for_test();
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
 
