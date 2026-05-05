@@ -10,12 +10,13 @@ use tx_substrate::zone::{self, Cap, ZoneError};
 use crate::cred::Cred;
 use crate::process::structure::{
     allocate_pid, ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,
-    Sid,
+    Sid, FD_TABLE_SIZE,
 };
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::sync::SpinMutex;
 use crate::thread_runtime::execution::set_thread_zombie;
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload};
+use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
 
 /// Global init (`pid=1`) process handle. `None` until
@@ -37,7 +38,7 @@ pub fn init_process() -> Option<Cap<ProcessIdentity>> {
     INIT_PROCESS.lock().clone()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reset_init_process_for_test() {
     *INIT_PROCESS.lock() = None;
 }
@@ -195,7 +196,12 @@ pub fn bootstrap_init_process(
     // Day-1: init has no cwd until a rootfs is mounted and an
     // initial chdir runs. Future EXEC_v1 / first-userspace lands
     // a synthesized "/" DEntry and threads it through here.
-    let payload = sign_process_payload(aspace, vec![leader], Cred::root(), None)?;
+    // Bootstrap-time fd table is empty: the devfs `console` alias is
+    // not yet registered when the kernel reaches process bootstrap.
+    // Phase 3b's `init.rs` calls `tx_fs::devfs::open_console_for_init()`
+    // *after* registering the console hardware and stuffs the result
+    // into fds 0/1/2 via `payload.set_fd`.
+    let payload = sign_process_payload(aspace, vec![leader], Cred::root(), None, empty_fd_table())?;
     *proc_cap.payload.lock() = Some(payload);
 
     // Register globally. The slot retains a strong Cap so init
@@ -211,11 +217,19 @@ pub fn bootstrap_init_process(
 pub fn step_fork<P: PmapIf>(
     parent: &Cap<ProcessIdentity>,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
-    // Snapshot parent state under its payload lock.
-    let (parent_aspace, parent_cred, parent_cwd) = {
+    // Snapshot parent state under its payload lock. Fd table is
+    // cloned slot-by-slot so parent and child share the same
+    // `Cap<OpenFile>` per slot, matching the Trio plan §"Cross-cutting
+    // risks #6" (full `dup`-shape sharing is deferred).
+    let (parent_aspace, parent_cred, parent_cwd, parent_fds) = {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
-        (payload.aspace.clone(), payload.cred(), payload.cwd())
+        (
+            payload.aspace.clone(),
+            payload.cred(),
+            payload.cwd(),
+            payload.snapshot_fds(),
+        )
     };
     let parent_pgrp = parent.pgrp.lock().clone();
 
@@ -234,11 +248,18 @@ pub fn step_fork<P: PmapIf>(
     // Leader thread.
     let leader = sign_thread(child_proc.downgrade()).map_err(ForkError::Zone)?;
 
-    // Wire up payload — child inherits parent credentials and cwd.
-    // POSIX: fork copies the cwd reference (same DEntry); CLONE_FS
-    // (sharing) is a Phase-2 concern.
-    let payload = sign_process_payload(child_aspace_cap, vec![leader], parent_cred, parent_cwd)
-        .map_err(ForkError::Zone)?;
+    // Wire up payload — child inherits parent credentials, cwd, and
+    // a per-slot clone of the parent's fd table. POSIX: fork copies
+    // the cwd reference (same DEntry); CLONE_FS (sharing) is a
+    // Phase-2 concern.
+    let payload = sign_process_payload(
+        child_aspace_cap,
+        vec![leader],
+        parent_cred,
+        parent_cwd,
+        parent_fds,
+    )
+    .map_err(ForkError::Zone)?;
     *child_proc.payload.lock() = Some(payload);
 
     // Register child in parent's pgrp.
@@ -653,6 +674,7 @@ fn sign_process_payload(
     threads: Vec<Cap<ThreadIdentity>>,
     cred: Cred,
     cwd: Option<Cap<crate::vfs::DEntry>>,
+    fds: [Option<Cap<OpenFile>>; FD_TABLE_SIZE],
 ) -> Result<tx_substrate::zone::PayloadCap<ProcessPayload>, ZoneError> {
     let res = zone::reserve_for::<ProcessPayload>()?;
     let cap = zone::sign_for(
@@ -664,9 +686,16 @@ fn sign_process_payload(
             group_pending: PendingSignalQueue::new(),
             cred: SpinMutex::new(cred),
             cwd: SpinMutex::new(cwd),
+            fds: SpinMutex::new(fds),
         },
     );
     Ok(tx_substrate::zone::PayloadCap::from_cap(cap))
+}
+
+/// All-`None` initial fd table for processes that have no preopens at
+/// payload-construction time (bootstrap init pre-Phase-3b; tests).
+fn empty_fd_table() -> [Option<Cap<OpenFile>>; FD_TABLE_SIZE] {
+    core::array::from_fn(|_| None)
 }
 
 fn sign_thread(

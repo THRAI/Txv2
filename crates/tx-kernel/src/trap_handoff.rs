@@ -33,9 +33,18 @@
 
 use tx_hal::{FaultInfo, TrapAction, TrapFrameMut, TrapFrameView, TxPlatform};
 use tx_reactor::userspace::{
-    PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, SyscallRequest, UserAddr,
-    UserspaceRunError, UserspaceRunSlot, UserspaceTrapInfo,
+    PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserAddr, UserspaceRunError,
+    UserspaceRunSlot, UserspaceTrapInfo,
 };
+
+/// Re-export of the reactor's `SyscallRequest` so downstream crates
+/// (notably `tx-shims::linux_syscall::dispatch`) consume it through
+/// the kernel-level seam rather than reaching into the reactor crate
+/// directly. The `nr` / `args` ABI shape is fixed by
+/// `txdoc:REACTOR-USERSPACE-RUN-AS-A-WAIT`; this re-export is the
+/// trio plan's "Phase 1 surface" reference for everyone above the
+/// reactor.
+pub use tx_reactor::userspace::SyscallRequest;
 use tx_substrate::zone::PayloadCap;
 use tx_subsystems::thread_runtime::{current_thread_payload, ThreadPayload};
 

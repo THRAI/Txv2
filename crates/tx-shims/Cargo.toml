@@ -7,5 +7,20 @@ repository.workspace = true
 
 [lib]
 path = "src/lib.rs"
-test = false
+test = true
 doctest = false
+
+[dependencies]
+# `SyscallRequest` is re-exported from `tx_kernel::trap_handoff` per
+# the Trio plan's Phase 1 surface; tx-shims pulls it through the
+# reactor-level seam instead so the kernel's `HostCheckAllocator`
+# (a `not(test)` global allocator that always returns null) does not
+# pollute test binaries that link tx-shims.
+tx-reactor = { path = "../tx-reactor" }
+tx-substrate = { path = "../tx-substrate" }
+tx-subsystems = { path = "../tx-subsystems" }
+
+[dev-dependencies]
+tx-fs = { path = "../tx-fs" }
+tx-hal = { path = "../tx-hal" }
+tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }

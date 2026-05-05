@@ -1,4 +1,8 @@
 #![no_std]
 
-pub mod linux_syscall {}
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
+
+pub mod linux_syscall;
 pub mod posix_signal {}
