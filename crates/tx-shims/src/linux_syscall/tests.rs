@@ -38,7 +38,10 @@ use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
-use super::{dispatch, SyscallCtx, SyscallResult, NR_EXIT, NR_EXIT_GROUP, NR_GETPID, NR_WRITE};
+use super::{
+    dispatch, SyscallCtx, SyscallResult, NR_BRK, NR_EXIT, NR_EXIT_GROUP, NR_GETPID, NR_READ,
+    NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_WRITE,
+};
 
 // ---------------------------------------------------------------------------
 // Test platform — minimal `PmapIf` impl for `AddressSpace` construction.
@@ -367,7 +370,7 @@ fn dispatch_getpid_returns_init_pid_for_init_process() {
     assert_eq!(result, SyscallResult::Return(1));
 }
 
-/// Any nr not in the Phase 2a table returns `-ENOSYS` (positive
+/// Any nr not in the Phase 2a/2b table returns `-ENOSYS` (positive
 /// magnitude 38; the userspace-entry shim negates before writing).
 #[test]
 fn dispatch_unknown_nr_returns_neg_enosys() {
@@ -381,4 +384,245 @@ fn dispatch_unknown_nr_returns_neg_enosys() {
     let result = block_on(dispatch(req, &ctx));
 
     assert_eq!(result, SyscallResult::Error(38));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b — read / brk / rt_sigprocmask / rt_sigaction.
+// ---------------------------------------------------------------------------
+
+/// `read(0, buf, 64)` against a console with no buffered input
+/// resolves through `tty::execution::step_read`'s `Blocked` shape,
+/// which the dispatcher translates to `Done(0)` per the Trio plan
+/// §"Open questions #5" non-blocking-slice semantic.
+#[test]
+fn dispatch_read_zero_when_console_empty_returns_zero() {
+    let _setup = setup();
+    let _ops = install_capturing_console();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+
+    let console: Cap<OpenFile> = tx_fs::devfs::open_console_for_init();
+    proc_cap.set_fd(0, Some(console));
+
+    let ctx = make_ctx(proc_cap, thread);
+    let mut buf = [0u8; 64];
+    let req = SyscallRequest::new(NR_READ, [0, buf.as_mut_ptr() as u64, 64, 0, 0, 0]);
+
+    let result = block_on(dispatch(req, &ctx));
+
+    assert_eq!(
+        result,
+        SyscallResult::Return(0),
+        "empty TTY input queue should surface as Done(0) per non-blocking slice"
+    );
+}
+
+/// `brk(0)` reports the current break, then `brk(>current)` grows,
+/// then `brk(<current)` shrinks. Bootstrap init's break starts at
+/// `BOOTSTRAP_BRK_BASE = 0x6000_0000`. Page granularity: arguments
+/// must be page-aligned (4 KiB on RV64) for `brk_script` to accept
+/// them per `txdoc:VM-5-8-BRK`.
+#[test]
+fn dispatch_brk_grow_then_shrink_round_trip() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    // brk(0) → reports current break (== brk_base for init).
+    let r0 = block_on(dispatch(
+        SyscallRequest::new(NR_BRK, [0, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r0, SyscallResult::Return(0x6000_0000));
+
+    // brk(grow) → returns new break.
+    let grow_target = 0x6000_1000u64;
+    let r1 = block_on(dispatch(
+        SyscallRequest::new(NR_BRK, [grow_target, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r1, SyscallResult::Return(grow_target as i64));
+    assert_eq!(proc_cap.current_brk(), grow_target);
+
+    // brk(shrink back to base) → returns base.
+    let r2 = block_on(dispatch(
+        SyscallRequest::new(NR_BRK, [0x6000_0000, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r2, SyscallResult::Return(0x6000_0000));
+    assert_eq!(proc_cap.current_brk(), 0x6000_0000);
+}
+
+/// brk(addr) for `addr < brk_base` is `InvalidRange` from
+/// `brk_script`; per Linux semantics the dispatcher returns the
+/// **unchanged** current break, never a negative errno.
+#[test]
+fn dispatch_brk_invalid_range_returns_unchanged_current() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    // brk(very-low) — below brk_base. Linux: no errno, just report
+    // the unchanged current break.
+    let r = block_on(dispatch(
+        SyscallRequest::new(NR_BRK, [0x1000, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0x6000_0000));
+    assert_eq!(
+        proc_cap.current_brk(),
+        0x6000_0000,
+        "invalid brk must not have moved the break"
+    );
+}
+
+/// `rt_sigprocmask(SIG_BLOCK, set, oldset, 8)` round-trip:
+/// SIG_BLOCK installs SIGUSR1, then SIG_UNBLOCK removes it. Each call
+/// observes the previous mask through `oldset_ptr`.
+///
+/// SIGUSR1 is signum 10 in Linux generic ABI (bit 9 in the 64-bit
+/// bitset). Day-1 `Signum` constants don't include SIGUSR1, but we
+/// emit raw bits directly — `step_sigprocmask` consumes a `SignalMask`
+/// regardless of which signum produced the bit.
+#[test]
+fn dispatch_rt_sigprocmask_block_then_unblock_round_trip() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    const SIG_BLOCK: u64 = 0;
+    const SIG_UNBLOCK: u64 = 1;
+    const SIGUSR1_BIT: u64 = 1u64 << 9; // signum 10 → bit 9
+
+    let mut set: u64 = SIGUSR1_BIT;
+    let mut oldset: u64 = 0xdead_beefu64;
+
+    // SIG_BLOCK SIGUSR1; oldset should be 0 (init starts with empty mask).
+    let r1 = block_on(dispatch(
+        SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [
+                SIG_BLOCK,
+                &mut set as *mut u64 as u64,
+                &mut oldset as *mut u64 as u64,
+                8,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r1, SyscallResult::Return(0));
+    assert_eq!(oldset, 0, "initial mask was empty");
+
+    // SIG_UNBLOCK SIGUSR1; oldset should observe the previously-set bit.
+    let mut oldset2: u64 = 0xdead_beefu64;
+    let r2 = block_on(dispatch(
+        SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [
+                SIG_UNBLOCK,
+                &mut set as *mut u64 as u64,
+                &mut oldset2 as *mut u64 as u64,
+                8,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r2, SyscallResult::Return(0));
+    assert_eq!(
+        oldset2, SIGUSR1_BIT,
+        "second call should observe SIGUSR1 still in the mask"
+    );
+}
+
+/// `rt_sigprocmask` with `sigsetsize != 8` is rejected with `-EINVAL`
+/// per Linux generic ABI / `SIGNAL_v1` §3 (sigset is always 64 bits
+/// on RV64).
+#[test]
+fn dispatch_rt_sigprocmask_rejects_wrong_sigsetsize() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let r = block_on(dispatch(
+        SyscallRequest::new(NR_RT_SIGPROCMASK, [0, 0, 0, 16, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(22));
+}
+
+/// `rt_sigaction(SIGUSR1, act, oldact, 8)` round-trip: install a
+/// custom handler for SIGUSR1 (signum 10), then query it back via
+/// oldact in a follow-up call. The handler value is preserved
+/// across the read.
+#[test]
+fn dispatch_rt_sigaction_install_then_query_round_trip() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    const HANDLER_ADDR: u64 = 0xCAFE_F00D_DEAD_BEEFu64;
+    let act: [u64; 4] = [HANDLER_ADDR, 0, 0, 0]; // handler/flags/restorer/mask
+    let mut oldact: [u64; 4] = [0xDEADu64; 4];
+
+    // Install: oldact reports prev (Default == 0).
+    let r1 = block_on(dispatch(
+        SyscallRequest::new(
+            NR_RT_SIGACTION,
+            [
+                10, // SIGUSR1
+                act.as_ptr() as u64,
+                oldact.as_mut_ptr() as u64,
+                8,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r1, SyscallResult::Return(0));
+    assert_eq!(
+        oldact[0], 0,
+        "previous disposition was Default (== SIG_DFL == 0)"
+    );
+
+    // Query (act == NULL): oldact reports the just-installed handler.
+    let mut oldact2: [u64; 4] = [0xDEADu64; 4];
+    let r2 = block_on(dispatch(
+        SyscallRequest::new(
+            NR_RT_SIGACTION,
+            [10, 0, oldact2.as_mut_ptr() as u64, 8, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r2, SyscallResult::Return(0));
+    assert_eq!(
+        oldact2[0], HANDLER_ADDR,
+        "query should observe the previously-installed handler"
+    );
+}
+
+/// `rt_sigaction` with `sigsetsize != 8` is rejected with `-EINVAL`
+/// per Linux generic ABI / `SIGNAL_v1` §15.1.
+#[test]
+fn dispatch_rt_sigaction_rejects_wrong_sigsetsize() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let r = block_on(dispatch(
+        SyscallRequest::new(NR_RT_SIGACTION, [10, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(22));
 }

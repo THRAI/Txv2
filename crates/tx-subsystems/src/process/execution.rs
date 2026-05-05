@@ -19,6 +19,15 @@ use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPaylo
 use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
 
+/// Bootstrap value for the program-break base, per the Trio plan
+/// §"Cross-cutting risks #7". Used by `bootstrap_init_process` to
+/// seed init's brk region before the ELF loader lands; the syscall
+/// dispatcher's `brk(2)` arm then operates against this base.
+///
+/// TODO(phase-elf-loader): replace with binary-derived value once
+/// `step_exec` materialises an image.
+pub const BOOTSTRAP_BRK_BASE: u64 = 0x6000_0000;
+
 /// Global init (`pid=1`) process handle. `None` until
 /// `bootstrap_init_process` runs, after which it holds a strong `Cap`
 /// retainer for the entire process lifetime. Per `PROCESS_v1` §8.1
@@ -201,7 +210,23 @@ pub fn bootstrap_init_process(
     // Phase 3b's `init.rs` calls `tx_fs::devfs::open_console_for_init()`
     // *after* registering the console hardware and stuffs the result
     // into fds 0/1/2 via `payload.set_fd`.
-    let payload = sign_process_payload(aspace, vec![leader], Cred::root(), None, empty_fd_table())?;
+    //
+    // brk: Trio plan §"Cross-cutting risks #7" pins a temporary
+    // bootstrap base of `0x6000_0000` until the ELF loader lands and
+    // can derive the real `brk_base` from the executable's `_end`
+    // symbol (or `PT_LOAD` segment max). `current_brk == brk_base`
+    // at exec time per VM_v1_2 §5.8.
+    // TODO(phase-elf-loader): replace bootstrap brk_base with
+    // binary-derived value once `step_exec` materialises an image.
+    let payload = sign_process_payload(
+        aspace,
+        vec![leader],
+        Cred::root(),
+        None,
+        empty_fd_table(),
+        BOOTSTRAP_BRK_BASE,
+        BOOTSTRAP_BRK_BASE,
+    )?;
     *proc_cap.payload.lock() = Some(payload);
 
     // Register globally. The slot retains a strong Cap so init
@@ -220,8 +245,11 @@ pub fn step_fork<P: PmapIf>(
     // Snapshot parent state under its payload lock. Fd table is
     // cloned slot-by-slot so parent and child share the same
     // `Cap<OpenFile>` per slot, matching the Trio plan §"Cross-cutting
-    // risks #6" (full `dup`-shape sharing is deferred).
-    let (parent_aspace, parent_cred, parent_cwd, parent_fds) = {
+    // risks #6" (full `dup`-shape sharing is deferred). brk values
+    // are cloned per the Trio plan §"Cross-cutting risks #7": each
+    // child gets its own brk_base/current_brk pair, while the underlying
+    // VM mappings are cloned through `AddressSpace::fork_aspace` below.
+    let (parent_aspace, parent_cred, parent_cwd, parent_fds, parent_brk_base, parent_current_brk) = {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
         (
@@ -229,6 +257,8 @@ pub fn step_fork<P: PmapIf>(
             payload.cred(),
             payload.cwd(),
             payload.snapshot_fds(),
+            payload.brk_base(),
+            payload.current_brk(),
         )
     };
     let parent_pgrp = parent.pgrp.lock().clone();
@@ -258,6 +288,8 @@ pub fn step_fork<P: PmapIf>(
         parent_cred,
         parent_cwd,
         parent_fds,
+        parent_brk_base,
+        parent_current_brk,
     )
     .map_err(ForkError::Zone)?;
     *child_proc.payload.lock() = Some(payload);
@@ -675,6 +707,8 @@ fn sign_process_payload(
     cred: Cred,
     cwd: Option<Cap<crate::vfs::DEntry>>,
     fds: [Option<Cap<OpenFile>>; FD_TABLE_SIZE],
+    brk_base: u64,
+    current_brk: u64,
 ) -> Result<tx_substrate::zone::PayloadCap<ProcessPayload>, ZoneError> {
     let res = zone::reserve_for::<ProcessPayload>()?;
     let cap = zone::sign_for(
@@ -687,6 +721,8 @@ fn sign_process_payload(
             cred: SpinMutex::new(cred),
             cwd: SpinMutex::new(cwd),
             fds: SpinMutex::new(fds),
+            brk_base: core::sync::atomic::AtomicU64::new(brk_base),
+            current_brk: core::sync::atomic::AtomicU64::new(current_brk),
         },
     );
     Ok(tx_substrate::zone::PayloadCap::from_cap(cap))
