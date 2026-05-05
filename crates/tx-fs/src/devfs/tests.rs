@@ -134,6 +134,37 @@ fn devfs_lookup_console_after_register_hardware_returns_tty_rnode() {
 }
 
 #[test]
+fn open_console_for_init_now_routes_through_walker_with_legacy_fallback() {
+    // Phase 4 retires the bootstrap exemption: when the walker can
+    // resolve `/dev/console` (init_process bound, mount table
+    // populated, dentry tree wired), `open_console_for_init` returns
+    // through `vfs::step_open`. When those preconditions aren't yet
+    // met (e.g. these tx-fs tests don't bootstrap init), the helper
+    // falls back to the legacy direct-RNode path.
+    //
+    // The fallback path is exercised by every existing devfs test
+    // here that calls `open_console_for_init` (no INIT_PROCESS in
+    // scope → walker not consulted → legacy direct-RNode path runs).
+    // This test asserts the OpenFile shape end-to-end through the
+    // legacy fallback so a regression in that branch shows up.
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+
+    let _ops = install_capturing_console();
+    let console = open_console_for_init();
+    let registered = tx_subsystems::tty::project::resolve_devfs_alias(b"console")
+        .expect("console alias should be registered");
+    match console.rnode().backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty),
+        } => assert_eq!(*tty, registered),
+        other => panic!("expected StructBacked::Tty, got {other:?}"),
+    }
+}
+
+#[test]
 fn devfs_write_through_openfile_reaches_tty_step_write() {
     let _serial = crate::test_support::FS_TEST_LOCK
         .lock()

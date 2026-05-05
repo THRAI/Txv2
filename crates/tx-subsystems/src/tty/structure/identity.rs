@@ -17,8 +17,7 @@
 
 use tx_substrate::bus::{RawPort, RawQueue};
 use tx_substrate::zone::PayloadCap;
-
-use crate::sync::SpinMutex;
+use tx_substrate::SpinMutex;
 
 use super::payload::TtyPayload;
 

@@ -1,7 +1,18 @@
+//! Public spin-mutex primitive.
+//!
+//! Per `CONCEPTS_v4.md` ("substrate provides zone, index, epoch, mutation,
+//! bus, page, and reservation primitives") a synchronization primitive
+//! with no semantic content and no entity ownership belongs in the
+//! substrate. Subsystems and the `tx-fs` / `tx-kernel` crates consume it
+//! as `tx_substrate::SpinMutex` (re-exported at the crate root).
+//!
+//! No poisoning: the kernel does not unwind. Acquire/release is a plain
+//! atomic compare-exchange with `core::hint::spin_loop` between attempts.
+
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-pub(crate) struct SpinMutex<T> {
+pub struct SpinMutex<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
 }
@@ -9,14 +20,14 @@ pub(crate) struct SpinMutex<T> {
 unsafe impl<T: Send> Sync for SpinMutex<T> {}
 
 impl<T> SpinMutex<T> {
-    pub(crate) const fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
             value: UnsafeCell::new(value),
         }
     }
 
-    pub(crate) fn lock(&self) -> SpinMutexGuard<'_, T> {
+    pub fn lock(&self) -> SpinMutexGuard<'_, T> {
         while self
             .locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -34,7 +45,7 @@ impl<T: core::fmt::Debug> core::fmt::Debug for SpinMutex<T> {
     }
 }
 
-pub(crate) struct SpinMutexGuard<'a, T> {
+pub struct SpinMutexGuard<'a, T> {
     mutex: &'a SpinMutex<T>,
 }
 

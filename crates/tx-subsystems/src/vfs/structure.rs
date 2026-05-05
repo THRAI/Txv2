@@ -257,6 +257,23 @@ impl core::fmt::Debug for InlineName {
     }
 }
 
+// Lexicographic ordering on the active-prefix slice. A derive would
+// compare `len` first and then the full inline buffer, which would
+// (a) order shorter names before all longer ones regardless of bytes,
+// and (b) include trailing zero padding. Hand-written `cmp` over
+// `as_bytes()` is the intended `BTreeMap<InlineName, _>` key shape.
+impl Ord for InlineName {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
+impl PartialOrd for InlineName {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VfsName<'a>(&'a [u8]);
 
@@ -301,10 +318,22 @@ pub struct OpenFileFlags {
 
 #[derive(Clone, Debug)]
 pub enum RNodeBacking {
-    PageBacked { pc: Cap<PageContainer> },
+    PageBacked {
+        pc: Cap<PageContainer>,
+    },
     Directory,
-    Symlink { target: Box<InlineName> },
-    StructBacked { payload: StructPayload },
+    /// Symlink target stored as raw bytes. Targets may contain `/`
+    /// (multi-component) or be absolute (leading `/`), so the bytes
+    /// cannot fit through `InlineName::new`'s slash-rejecting
+    /// constructor; the walker substitutes the bytes directly into
+    /// the remaining component stream per
+    /// `txdoc:VFS-CHECKS-RUN-WALKER-LOOP-1`.
+    Symlink {
+        target: Box<[u8]>,
+    },
+    StructBacked {
+        payload: StructPayload,
+    },
     Projected,
 }
 
@@ -362,6 +391,19 @@ impl RNode {
         self.containing_mount = Some(mount.downgrade());
         self
     }
+
+    /// Snapshot the containing-mount `Weak<MountPayload>`. Used by the
+    /// VFS walker (`crate::vfs::walker::step_walk`) to resolve the
+    /// in-scope `FsOps` for a dentry's RNode, and by the page cache
+    /// when materialising file-backed RNodes.
+    ///
+    /// Returns `None` when the RNode was constructed without
+    /// `with_containing_mount` (the trio's bootstrap rootfs root
+    /// rnode falls into this category today; a follow-up wires the
+    /// hint at mount-publication time).
+    pub fn containing_mount_weak(&self) -> Option<Weak<MountPayload>> {
+        self.containing_mount
+    }
 }
 
 #[derive(Debug)]
@@ -409,6 +451,16 @@ impl DEntry {
     /// or for dentries that haven't had `set_parent_hint` called.
     pub fn parent_hint(&self) -> Option<Weak<DEntry>> {
         self.parent
+    }
+
+    /// Snapshot the `mounted` weak hint. Used by the VFS walker
+    /// (`crate::vfs::walker::step_walk`) for mount-point boundary
+    /// crossing per
+    /// `txdoc:VFS-CHECKS-MOUNT-BOUNDARY-DISCIPLINE-1` and
+    /// `txdoc:MOUNT-STEP-MOUNT-COMMIT-ORDERING-1`. Returns `None`
+    /// for dentries that have not been published as a mount point.
+    pub fn mounted_hint(&self) -> Option<Weak<MountIdentity>> {
+        self.mounted
     }
 }
 

@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 
 use tx_hal::PmapIf;
 use tx_substrate::zone::{self, Cap, ZoneError};
+use tx_substrate::SpinMutex;
 
 use crate::cred::Cred;
 use crate::process::structure::{
@@ -13,7 +14,6 @@ use crate::process::structure::{
     Sid, FD_TABLE_SIZE,
 };
 use crate::signal::{PendingSignalQueue, SigActionTable};
-use crate::sync::SpinMutex;
 use crate::thread_runtime::execution::set_thread_zombie;
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload};
 use crate::vfs::OpenFile;

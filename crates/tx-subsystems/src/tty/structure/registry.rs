@@ -4,9 +4,9 @@
 //! initialisation.  Both zones must be registered before any TTY allocation
 //! can succeed.
 
-use crate::sync::SpinMutex;
 use crate::tty::structure::identity::FixedName;
 use tx_substrate::zone::{register_zone_for, Cap, Zone, ZoneAllocated, ZoneError};
+use tx_substrate::SpinMutex;
 
 use super::identity::TtyIdentity;
 use super::payload::TtyPayload;

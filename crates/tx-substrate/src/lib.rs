@@ -23,7 +23,10 @@ pub mod pmap {
 
 pub mod page_allocator;
 pub mod slab;
+pub mod sync;
 pub mod zone;
+
+pub use sync::{SpinMutex, SpinMutexGuard};
 
 #[doc(hidden)]
 pub mod testing {

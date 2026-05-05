@@ -102,6 +102,57 @@ pub trait FsOps: Send + Sync + 'static {
     ) -> StepOutcome<Option<(DirEntry, DirCursor)>>;
 
     fn destroy_inode(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<()>;
+
+    /// Read a symlink's target bytes.
+    ///
+    /// The walker calls this when materialising an `RNode` for an
+    /// inode whose `load_inode_meta(...).kind() == InodeKind::Symlink`.
+    /// Returned bytes are substituted into the remaining path
+    /// component stream per `txdoc:VFS-CHECKS-RUN-WALKER-LOOP-1`.
+    ///
+    /// Default returns `Errno::ENOSYS` so backends that do not yet
+    /// support symlinks (devfs, devpts, projection-only filesystems)
+    /// inherit the right error without forcing a method-by-method
+    /// flood. tmpfs and ext4 override.
+    fn read_link(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<alloc::boxed::Box<[u8]>> {
+        let _ = (fs_object_id, guard);
+        StepOutcome::Err(Errno::ENOSYS)
+    }
+
+    /// Backend hook for materialising an `RNode` for a non-directory,
+    /// non-symlink inode.
+    ///
+    /// The walker handles `Directory` (always
+    /// `RNodeBacking::Directory`) and `Symlink` (via [`read_link`])
+    /// inline; everything else (regular files, char/block devices,
+    /// fifos, sockets) needs backend-specific materialisation
+    /// because the right backing depends on the filesystem:
+    ///
+    /// - tmpfs `Regular` → `RNodeBacking::PageBacked { pc }` over
+    ///   the inode's `Cap<PageContainer>`.
+    /// - devfs `CharDevice` → `RNodeBacking::StructBacked { Tty }`
+    ///   resolved through the TTY registry.
+    /// - ext4 `Regular` → `RNodeBacking::PageBacked { pc }` over a
+    ///   per-inode `Cap<PageContainer>` keyed by `(mount, fs_object_id)`.
+    ///
+    /// Default returns `Errno::ENOSYS` so backends that don't grow
+    /// the hook fall through cleanly.
+    ///
+    /// `meta` is the freshly-loaded inode meta. The walker passes
+    /// it so the backend can decide based on `meta.kind()`.
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<tx_substrate::zone::Cap<crate::vfs::structure::RNode>> {
+        let _ = (fs_object_id, meta, guard);
+        StepOutcome::Err(Errno::ENOSYS)
+    }
 }
 
 /// Filesystem driver output produced at mount time and consumed by Mount

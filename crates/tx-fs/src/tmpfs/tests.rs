@@ -61,11 +61,10 @@ fn tmpfs_create_then_lookup_round_trip() {
         other => panic!("load_inode_meta failed: {other:?}"),
     }
 
-    // Re-creating the same name collides (POSIX EEXIST mapped to
-    // EINVAL until `Errno` widens — see `create_inode`).
+    // Re-creating the same name collides with POSIX EEXIST.
     assert_eq!(
         tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"hello", 0o100644, &cred, &guard),
-        StepOutcome::Err(Errno::EINVAL)
+        StepOutcome::Err(Errno::EEXIST)
     );
 }
 
@@ -266,5 +265,83 @@ fn tmpfs_truncate_zeroes_size_and_reflects_in_meta() {
     assert_eq!(
         FsPageBacking::truncate(&*tmpfs, FsObjectId::new(0xdead_beef), 0, &guard),
         StepOutcome::Err(Errno::ENOENT)
+    );
+}
+
+#[test]
+fn tmpfs_create_existing_returns_eexist() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let cred = Credential::default();
+
+    // First create succeeds.
+    let _ = match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"dup", 0o100644, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode failed: {other:?}"),
+    };
+
+    // Second create at the same name surfaces POSIX EEXIST. mkdir
+    // and symlink share the same collision path; assert all three
+    // for completeness.
+    assert_eq!(
+        tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"dup", 0o100644, &cred, &guard),
+        StepOutcome::Err(Errno::EEXIST)
+    );
+    assert_eq!(
+        tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"dup", 0o755, &cred, &guard),
+        StepOutcome::Err(Errno::EEXIST)
+    );
+    assert_eq!(
+        tmpfs.symlink(TMPFS_ROOT_OBJECT_ID, b"dup", b"target", &cred, &guard),
+        StepOutcome::Err(Errno::EEXIST)
+    );
+}
+
+#[test]
+fn tmpfs_rmdir_nonempty_returns_enotempty() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let cred = Credential::default();
+
+    let (dir_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"d", 0o755, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("mkdir failed: {other:?}"),
+    };
+
+    // Populate the directory with a child so the rmdir attempt
+    // observes a non-empty target.
+    let _ = match tmpfs.create_inode(dir_id, b"child", 0o100644, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode in subdir failed: {other:?}"),
+    };
+
+    // rmdir must surface POSIX ENOTEMPTY.
+    assert_eq!(
+        tmpfs.rmdir(TMPFS_ROOT_OBJECT_ID, b"d", dir_id, &guard),
+        StepOutcome::Err(Errno::ENOTEMPTY)
+    );
+
+    // After unlinking the child, rmdir succeeds.
+    let child_id = match tmpfs.lookup(dir_id, b"child", &guard) {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup of child failed: {other:?}"),
+    };
+    assert_eq!(
+        tmpfs.unlink(dir_id, b"child", child_id, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        tmpfs.rmdir(TMPFS_ROOT_OBJECT_ID, b"d", dir_id, &guard),
+        StepOutcome::Done(())
     );
 }

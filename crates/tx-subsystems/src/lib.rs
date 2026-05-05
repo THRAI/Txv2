@@ -18,8 +18,6 @@ pub mod vm;
 pub mod wait_carrier;
 pub mod zones;
 
-mod sync;
-
 #[cfg(test)]
 pub(crate) mod test_support {
     pub(crate) static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

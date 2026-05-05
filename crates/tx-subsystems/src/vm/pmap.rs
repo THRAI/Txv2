@@ -12,8 +12,9 @@ use tx_substrate::{
     zone::ZoneError,
 };
 
+use tx_substrate::SpinMutex;
+
 use crate::page_backed::MaterializedPagePin;
-use crate::sync::SpinMutex;
 
 use super::{Prot, UserPage, UserRange, USER_PAGE_SIZE};
 

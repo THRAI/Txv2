@@ -1,7 +1,10 @@
 //! Mount identity, payload, and backend bootstrap shells.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
+
+use tx_substrate::SpinMutex;
 
 use crate::device::BlockDevice;
 use crate::execution::KernelResult;
@@ -293,6 +296,141 @@ pub struct MountOutput {
     pub fs_page_backing: Arc<dyn FsPageBacking>,
     pub root_fs_object_id: FsObjectId,
     pub root_inode_meta: InodeMeta,
+}
+
+// === mount-point registry ============================================
+//
+// Day-1 dentry materialisation is fresh-on-each-lookup: the walker
+// materialises a new `Cap<DEntry>` for every interior component
+// rather than consulting a dentry cache. Mount hints stored on
+// individual dentries (`DEntry::mounted`) therefore survive only as
+// long as the dentry that carries them — which is "as long as a
+// downstream caller holds a strong cap to the mountpoint dentry".
+// Walks through `step_walk` *don't* hold one (the walker holds
+// caps to the chain of dentries it materialised, none of which
+// inherit the mountpoint dentry's hint).
+//
+// To bridge that gap without growing a full dentry cache, the
+// kernel maintains a small mount-point table keyed by
+// `(parent_mount_payload_ptr, child_fs_object_id)`: when the walker
+// materialises a child dentry whose `(mount_payload_ptr,
+// fs_object_id)` pair matches a registered entry, the walker
+// upgrades into the registered `MountIdentity` and crosses the
+// boundary. Init's `mount_devfs_at_dev` (and any future mount
+// publication) registers an entry; tests can populate the table
+// directly via [`register_mount`].
+//
+// Concurrency: a single `SpinMutex<Vec<...>>` is sufficient for the
+// boot path's mount count (a handful) and matches the trio's
+// existing `BootSpinMutex`-protected slots in `init.rs`. A future
+// hot-path RCU dance is a follow-up if mount churn becomes a
+// concern.
+
+/// Registered mount entry. Keyed by the `(parent_mount_payload_ptr,
+/// child_fs_object_id)` pair that uniquely identifies the
+/// mount-point dentry on its parent filesystem. The
+/// `mount_payload_ptr` is the raw pointer of the parent mount's
+/// `MountPayload` `Cap`'s underlying allocation — sound to use as a
+/// stable id because mount payloads are zone-allocated and never
+/// reused while live caps exist.
+struct MountTableEntry {
+    parent_payload_ptr: usize,
+    child_fs_object_id: FsObjectId,
+    mount: Cap<MountIdentity>,
+}
+
+static MOUNT_TABLE: SpinMutex<Vec<MountTableEntry>> = SpinMutex::new(Vec::new());
+
+/// Register a mount-point in the kernel's mount table.
+///
+/// `parent_payload` is the `Cap<MountPayload>` of the parent
+/// filesystem (the one the mount-point dentry lives on);
+/// `mountpoint_fs_object_id` is the inode id of that dentry on the
+/// parent. `mount` is the `Cap<MountIdentity>` of the child mount
+/// being registered.
+///
+/// The walker (`crate::vfs::walker::step_walk`) consults this table
+/// when materialising a child dentry: a hit causes the walker to
+/// upgrade the registered mount and continue from the mount's root
+/// rnode + a fresh DEntry for it. Cite
+/// `txdoc:MOUNT-STEP-MOUNT-COMMIT-ORDERING-1` for the publication
+/// ordering: register *after* the mount's payload is signed and
+/// before any walk-time observation could miss it.
+pub fn register_mount(
+    parent_payload: &Cap<MountPayload>,
+    mountpoint_fs_object_id: FsObjectId,
+    mount: Cap<MountIdentity>,
+) {
+    let parent_payload_ptr = cap_payload_ptr(parent_payload);
+    let mut table = MOUNT_TABLE.lock();
+    // Idempotent on identical parent + child_fs_object_id: if a
+    // pre-existing entry matches, replace it with the new mount.
+    // This matches `register_console_alias`'s upsert shape.
+    for entry in table.iter_mut() {
+        if entry.parent_payload_ptr == parent_payload_ptr
+            && entry.child_fs_object_id == mountpoint_fs_object_id
+        {
+            entry.mount = mount;
+            return;
+        }
+    }
+    table.push(MountTableEntry {
+        parent_payload_ptr,
+        child_fs_object_id: mountpoint_fs_object_id,
+        mount,
+    });
+}
+
+/// Look up a registered mount by (parent_payload, child_fs_object_id).
+///
+/// Returns `None` if no mount is registered for the given pair.
+/// Used by the VFS walker.
+pub fn mount_for(
+    parent_payload: &Cap<MountPayload>,
+    child_fs_object_id: FsObjectId,
+) -> Option<Cap<MountIdentity>> {
+    let parent_payload_ptr = cap_payload_ptr(parent_payload);
+    let table = MOUNT_TABLE.lock();
+    for entry in table.iter() {
+        if entry.parent_payload_ptr == parent_payload_ptr
+            && entry.child_fs_object_id == child_fs_object_id
+        {
+            return Some(entry.mount.clone());
+        }
+    }
+    None
+}
+
+/// Reset the mount table. Test-only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_mount_table_for_test() {
+    MOUNT_TABLE.lock().clear();
+}
+
+/// Reach inside a `Cap<MountPayload>` for its underlying allocation
+/// pointer. Used as a stable identity for the mount-table key. The
+/// pointer is sound to use as a key because zone allocations never
+/// reuse a slot while any cap is live; two caps to the same payload
+/// produce identical pointers.
+fn cap_payload_ptr(cap: &Cap<MountPayload>) -> usize {
+    // `Cap::raw_addr_for_eq` returns the underlying zone slot's
+    // address. Use it for the pointer-equality key. (`Cap` doesn't
+    // implement `Eq` by-pointer publicly; we go through the public
+    // accessor via a private helper here so the conversion is
+    // contained.)
+    cap_raw_addr(cap)
+}
+
+#[inline(always)]
+fn cap_raw_addr<T>(cap: &Cap<T>) -> usize {
+    // The walker treats the pointer as an opaque id; the actual
+    // value is meaningless beyond equality. `Cap`'s `Debug`
+    // formats the pointer, so we leverage `as_ptr_for_eq` if
+    // available; otherwise we fall back to `&*cap` deref'd.
+    //
+    // tx_substrate's `Cap<T>` implements `Deref<Target = T>` —
+    // the deref target's address is stable per cap.
+    (&**cap as *const T) as usize
 }
 
 #[cfg(test)]
