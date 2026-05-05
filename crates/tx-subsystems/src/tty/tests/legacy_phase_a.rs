@@ -712,7 +712,10 @@ fn ioctl_binding_and_termios_roundtrip_work() {
         StepOutcome::Done(crate::tty::execution::IoctlSideEffect {
             session_ctl_fired: true,
             signal: Some(SignalDispatch {
-                target: SignalTarget::ForegroundProcessGroup(33),
+                target: SignalTarget::ForegroundProcessGroup {
+                    pgid: 33,
+                    pgrp: None
+                },
                 signal: JobControlSignal::Winch,
             }),
         })
@@ -815,7 +818,10 @@ fn step_ingest_reports_foreground_signal_dispatch_when_bound() {
                 signal: SignalKind::Int,
             }),
             signal_dispatch: Some(SignalDispatch {
-                target: SignalTarget::ForegroundProcessGroup(9),
+                target: SignalTarget::ForegroundProcessGroup {
+                    pgid: 9,
+                    pgrp: None
+                },
                 signal: JobControlSignal::Int,
             }),
             flow_control: None,
@@ -873,7 +879,10 @@ fn step_ingest_reports_sigquit_and_sigtstp_dispatch_when_bound() {
                 signal: SignalKind::Quit,
             }),
             signal_dispatch: Some(SignalDispatch {
-                target: SignalTarget::ForegroundProcessGroup(121),
+                target: SignalTarget::ForegroundProcessGroup {
+                    pgid: 121,
+                    pgrp: None
+                },
                 signal: JobControlSignal::Quit,
             }),
             flow_control: None,
@@ -890,7 +899,10 @@ fn step_ingest_reports_sigquit_and_sigtstp_dispatch_when_bound() {
                 signal: SignalKind::Tstp,
             }),
             signal_dispatch: Some(SignalDispatch {
-                target: SignalTarget::ForegroundProcessGroup(121),
+                target: SignalTarget::ForegroundProcessGroup {
+                    pgid: 121,
+                    pgrp: None
+                },
                 signal: JobControlSignal::Tstp,
             }),
             flow_control: None,
@@ -1023,11 +1035,17 @@ fn step_hangup_and_master_close_drop_payload_and_emit_signals() {
             hangup_fired: true,
             session_ctl_fired: true,
             hup_signal: Some(SignalDispatch {
-                target: SignalTarget::SessionLeaderProcessGroup(51),
+                target: SignalTarget::SessionLeaderProcessGroup {
+                    pgid: 51,
+                    pgrp: None
+                },
                 signal: JobControlSignal::Hup,
             }),
             cont_signal: Some(SignalDispatch {
-                target: SignalTarget::ForegroundProcessGroup(50),
+                target: SignalTarget::ForegroundProcessGroup {
+                    pgid: 50,
+                    pgrp: None
+                },
                 signal: JobControlSignal::Cont,
             }),
         })

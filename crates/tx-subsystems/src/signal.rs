@@ -439,5 +439,71 @@ pub fn script_kill_pgrp(
     Ok(delivered)
 }
 
+// ----- TTY job-control bridge -----
+
+/// Map a TTY [`JobControlSignal`](crate::tty::execution::JobControlSignal)
+/// to the POSIX `Signum`. Centralised here so the signal shim is the
+/// canonical authority on which numeric signal each control event
+/// produces; TTY emits intent (`Int`/`Quit`/...) and signal materialises
+/// it.
+pub fn signum_for_job_control(sig: crate::tty::execution::JobControlSignal) -> Signum {
+    use crate::tty::execution::JobControlSignal as J;
+    match sig {
+        J::Int => Signum::SIGINT,
+        J::Quit => Signum::SIGQUIT,
+        J::Tstp => Signum::SIGTSTP,
+        J::Ttin => Signum::SIGTTIN,
+        J::Ttou => Signum::SIGTTOU,
+        J::Hup => Signum::SIGHUP,
+        J::Cont => Signum::SIGCONT,
+        // SIGWINCH is signum 28 on Linux. Day-1 Signum exposes a small
+        // POSIX subset; we synthesise the value here. The downstream
+        // route is the same as any other signal.
+        J::Winch => Signum::new(28).expect("SIGWINCH"),
+    }
+}
+
+/// Outcome of [`deliver_tty_dispatch`]. Mirrors `KillScriptOutcome`'s
+/// shape but adds `NoTypedPgrp` for the legacy-binding case where the
+/// dispatch carried no typed `Weak<ProcessGroup>` — the caller (the
+/// TTY ioctl driver) has nothing to upgrade.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchOutcome {
+    /// Posted to N processes in the target pgrp.
+    Delivered { count: u32 },
+    /// The target pgrp's `Weak` upgraded to a dropped slot.
+    PgrpDropped,
+    /// The dispatch carried no typed pgrp ref — caller must fall back
+    /// to a numeric-pgid lookup path.
+    NoTypedPgrp,
+}
+
+/// Bridge from a TTY-emitted [`SignalDispatch`](crate::tty::execution::SignalDispatch)
+/// to a real signal post via [`script_kill_pgrp`]. Upgrades the
+/// dispatch's typed `Weak<ProcessGroup>` and runs the cred-checked
+/// pgrp fanout against `source`'s cred.
+///
+/// Returns `Err(Errno::ESRCH)` if `source` is a zombie (per
+/// `script_kill_pgrp`); other per-member denials are absorbed into
+/// the count (the SIGNAL_v1 §12.2 "members independent" rule).
+pub fn deliver_tty_dispatch(
+    source: &Cap<ProcessIdentity>,
+    dispatch: crate::tty::execution::SignalDispatch,
+) -> Result<DispatchOutcome, Errno> {
+    let Some(weak) = dispatch.target.pgrp_weak() else {
+        return Ok(DispatchOutcome::NoTypedPgrp);
+    };
+
+    let guard = tx_substrate::epoch::guard();
+    let Some(pgrp_cap) = weak.upgrade(&guard) else {
+        return Ok(DispatchOutcome::PgrpDropped);
+    };
+    drop(guard);
+
+    let signum = signum_for_job_control(dispatch.signal);
+    let count = script_kill_pgrp(source, &pgrp_cap, signum)?;
+    Ok(DispatchOutcome::Delivered { count })
+}
+
 #[cfg(test)]
 mod tests;

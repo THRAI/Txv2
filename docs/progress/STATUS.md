@@ -4,6 +4,24 @@
 
 ## Current Shape
 
+- 2026-05-05 TTY → signal end-to-end typed dispatch lands on top of
+  the kill-permission check (branch `process-topology`). Closes the
+  last raw-id seam in TTY's job-control flow: `SignalTarget`
+  variants become struct-shaped `{ pgid: u32, pgrp:
+  Option<Weak<ProcessGroup>> }`, `IoctlCaller` gains a `pgrp:
+  Option<Weak<ProcessGroup>>` field with a `with_pgrp_weak()`
+  builder, and the ioctl/hangup steps populate the typed Weak from
+  `tty.session_pgrp().foreground_pgrp` (already typed since the TTY
+  pgrp rebinding pass). New `signal::deliver_tty_dispatch(source,
+  dispatch)` upgrades the Weak under one epoch guard, maps
+  `JobControlSignal` to `Signum`, and calls the cred-checked
+  `script_kill_pgrp`. End-to-end test demonstrates VINTR-style
+  dispatch posting SIGINT to every member of the typed foreground
+  pgrp; partial-permission and zombie-source cases covered. Hybrid
+  preserved: legacy raw-id binders still work (typed slot stays
+  `None` and the bridge returns `DispatchOutcome::NoTypedPgrp`). 5
+  new tests bring suite to 251; full `cargo xtask ci` green
+  (11/11 gates).
 - 2026-05-05 Kill permission check lands on top of TTY pgrp typed
   rebind (branch `process-topology`). Wires `cred` into the `signal`
   shim per `SIGNAL_v1` §32 and `cred_service_v_1`. New
