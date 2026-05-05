@@ -18,8 +18,6 @@ use crate::thread_runtime::execution::set_thread_zombie;
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload};
 use crate::vm::{AddressSpace, VmMapError};
 
-use core::sync::atomic::{AtomicU64, AtomicU8};
-
 /// Global init (`pid=1`) process handle. `None` until
 /// `bootstrap_init_process` runs, after which it holds a strong `Cap`
 /// retainer for the entire process lifetime. Per `PROCESS_v1` §8.1
@@ -677,15 +675,7 @@ fn sign_thread(
     let tid = allocate_tid();
 
     let payload_res = zone::reserve_for::<ThreadPayload>()?;
-    let payload_cap = zone::sign_for(
-        payload_res,
-        ThreadPayload {
-            task: SpinMutex::new(None),
-            signal_mask: AtomicU64::new(0),
-            thread_pending: PendingSignalQueue::new(),
-            signal_summary: AtomicU8::new(0),
-        },
-    );
+    let payload_cap = zone::sign_for(payload_res, ThreadPayload::fresh());
     let payload = tx_substrate::zone::PayloadCap::from_cap(payload_cap);
 
     let identity_res = zone::reserve_for::<ThreadIdentity>()?;

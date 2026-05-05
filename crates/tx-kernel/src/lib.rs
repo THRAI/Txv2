@@ -2,6 +2,7 @@
 
 pub mod init;
 pub mod trap;
+pub mod trap_handoff;
 
 use tx_hal::{BootHandoff, TxPlatform};
 
