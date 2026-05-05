@@ -4,6 +4,22 @@
 
 ## Current Shape
 
+- 2026-05-05 `signal::ast_dispatch` closes the AstOutcome →
+  step_exit_group_with_signal loop on branch `process-topology`.
+  Thin wrapper over `ast_check` that materialises the day-1
+  side-effects we have wired: `AstOutcome::DefaultTerminate { sig }`
+  invokes `step_exit_group_with_signal(owner_proc, sig)` so the
+  catchable-fatal-default path now actually terminates the process
+  instead of just being a recognised intent. Other variants
+  (`Continue`, `InitiateTermination`, `DefaultStop`, `DefaultContinue`,
+  `DeliverHandler`) flow through unchanged — their materialisation
+  still needs the future thread_future poll, stop/continue
+  control ops, and signal-frame construction. 4 new tests cover
+  default-terminate-zombifies-with-signum, continue no-op,
+  recognised-but-unrealised stop and handler. Full end-to-end
+  testable: `post_signal(SIGTERM)` → `ast_dispatch` →
+  `is_zombie() && terminating_signal == Some(SIGTERM)`. Suite at
+  284; full `cargo xtask ci` green (11/11 gates).
 - 2026-05-05 `step_exit_group_with_signal` lands on top of Gewalt/event
   factoring (branch `process-topology`). Materialises the SIGKILL
   control-op invocation that `SIGNAL_v1` §12.3 `route_sigkill`

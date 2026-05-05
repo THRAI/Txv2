@@ -468,6 +468,36 @@ pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutc
     }
 }
 
+/// Run `ast_check` and materialise its outcome with the day-1
+/// side-effects we have wired:
+///
+/// - `DefaultTerminate { sig }` invokes
+///   [`process::step_exit_group_with_signal`] on the thread's owner
+///   process. The process zombifies with `terminating_signal =
+///   Some(sig)` and the day-1 status encoding.
+/// - All other variants are returned unchanged. `DefaultStop`,
+///   `DefaultContinue`, `DeliverHandler` are recognised intents;
+///   their materialisation needs machinery (stop-state, continue
+///   control op, signal-frame construction) that doesn't exist yet.
+///   `InitiateTermination` is observed at the future `thread_future`'s
+///   poll boundary (per `SIGNAL_v1` §15.1); the caller of this
+///   helper is the place to take the future-exit hint.
+///
+/// Returns the same `AstOutcome` `ast_check` produced, so callers
+/// can dispatch on the variant after the side-effect (if any) has
+/// run.
+pub fn ast_dispatch(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutcome {
+    let outcome = ast_check(thread);
+    if let AstOutcome::DefaultTerminate { sig } = outcome {
+        let guard = tx_substrate::epoch::guard();
+        if let Some(proc) = thread.owner_proc.upgrade(&guard) {
+            drop(guard);
+            crate::process::execution::step_exit_group_with_signal(&proc, sig);
+        }
+    }
+    outcome
+}
+
 /// Result of a kill-style shim. `Delivered` if at least one thread
 /// received the post; `NoLiveThread` if the target is a zombie or its
 /// thread list is empty.

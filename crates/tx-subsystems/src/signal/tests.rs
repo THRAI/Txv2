@@ -1268,6 +1268,89 @@ mod delivery {
         assert_eq!(child.terminating_signal(), None);
     }
 
+    // ----- ast_dispatch: AstOutcome → step_exit_group_with_signal bridge -----
+
+    #[test]
+    fn ast_dispatch_default_terminate_zombifies_owner_with_signum() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        // SIGTERM with default disposition → AstOutcome::DefaultTerminate.
+        // ast_dispatch should invoke step_exit_group_with_signal so
+        // the process zombifies with terminating_signal=Some(SIGTERM).
+        post_signal(&leader, Signum::SIGTERM);
+        let outcome = crate::signal::ast_dispatch(&leader);
+
+        assert_eq!(
+            outcome,
+            AstOutcome::DefaultTerminate {
+                sig: Signum::SIGTERM
+            }
+        );
+        assert!(proc_cap.is_zombie());
+        assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGTERM));
+        assert_eq!(
+            proc_cap.exit_status(),
+            Some(128 + Signum::SIGTERM.raw() as i32)
+        );
+    }
+
+    #[test]
+    fn ast_dispatch_continue_has_no_side_effects() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        let outcome = crate::signal::ast_dispatch(&leader);
+        assert_eq!(outcome, AstOutcome::Continue);
+        assert!(!proc_cap.is_zombie());
+        assert_eq!(proc_cap.terminating_signal(), None);
+    }
+
+    #[test]
+    fn ast_dispatch_default_stop_recognised_but_unrealised() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        // SIGTSTP is catchable; default action is Stop.
+        post_signal(&leader, Signum::SIGTSTP);
+        let outcome = crate::signal::ast_dispatch(&leader);
+
+        assert_eq!(
+            outcome,
+            AstOutcome::DefaultStop {
+                sig: Signum::SIGTSTP
+            }
+        );
+        // Stop-state machinery is deferred — the process stays alive.
+        assert!(!proc_cap.is_zombie());
+        assert_eq!(proc_cap.terminating_signal(), None);
+    }
+
+    #[test]
+    fn ast_dispatch_deliver_handler_recognised_but_unrealised() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xFEED));
+        post_signal(&leader, Signum::SIGTERM);
+
+        let outcome = crate::signal::ast_dispatch(&leader);
+        assert_eq!(
+            outcome,
+            AstOutcome::DeliverHandler {
+                sig: Signum::SIGTERM,
+                handler: 0xFEED
+            }
+        );
+        // Handler installation overrides the default-Term path; the
+        // process is NOT terminated. Frame construction lands later.
+        assert!(!proc_cap.is_zombie());
+    }
+
     #[test]
     fn step_kill_pgrp_does_not_mirror_gewalt_to_group_pending() {
         let _g = setup();
