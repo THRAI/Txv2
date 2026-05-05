@@ -102,18 +102,102 @@ impl<T> AtomicSlot<T> {
 }
 
 // ---------------------------------------------------------------------------
-// SessionPgrp staging
+// SessionPgrp
 // ---------------------------------------------------------------------------
 
-/// Staging placeholder for the session + foreground-pgrp binding.
+/// Session + foreground-pgrp binding for a TTY.
 ///
-/// TODO(Phase G): replace with `SessionPgrp { session: Cap<Session>,
-/// foreground_pgrp: Cap<ProcessGroup> }` once Process/Session land.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Carries both raw IDs (for fast comparison without an epoch guard)
+/// and typed `Weak` references to the owning process subsystem
+/// entities. Typed refs are populated by [`SessionPgrp::from_typed`]
+/// (used once a real `Cap<Session>` / `Cap<ProcessGroup>` is in hand)
+/// and left `None` for the legacy [`SessionPgrp::from_raw_ids`] path
+/// that the TTY tests exercise.
+///
+/// Typed refs unlock pgrp-targeted signal delivery: callers can
+/// upgrade via [`SessionPgrp::upgrade_foreground_pgrp`] and pass the
+/// resulting `Cap<ProcessGroup>` to `signal::step_kill_pgrp`.
+#[derive(Clone, Copy, Debug)]
 pub struct SessionPgrp {
     pub session_id: u32,
     pub session_leader_pgid: u32,
     pub foreground_pgid: u32,
+    pub session: Option<tx_substrate::zone::Weak<crate::process::structure::Session>>,
+    pub foreground_pgrp: Option<tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>>,
+}
+
+impl PartialEq for SessionPgrp {
+    fn eq(&self, other: &Self) -> bool {
+        // Typed Weak refs intentionally not compared: tests construct
+        // bindings via from_raw_ids (no typed refs) and assert equality
+        // on the id triplet. Two bindings with the same ids but
+        // different (or missing) Weak refs are operationally
+        // equivalent for the day-1 surface.
+        self.session_id == other.session_id
+            && self.session_leader_pgid == other.session_leader_pgid
+            && self.foreground_pgid == other.foreground_pgid
+    }
+}
+
+impl Eq for SessionPgrp {}
+
+impl SessionPgrp {
+    /// Construct a binding from raw POSIX ids only. Typed `Weak` refs
+    /// are left `None`; callers that need pgrp-targeted signal
+    /// delivery must use [`Self::from_typed`] or migrate later.
+    pub const fn from_raw_ids(
+        session_id: u32,
+        session_leader_pgid: u32,
+        foreground_pgid: u32,
+    ) -> Self {
+        Self {
+            session_id,
+            session_leader_pgid,
+            foreground_pgid,
+            session: None,
+            foreground_pgrp: None,
+        }
+    }
+
+    /// Construct a binding from real process-subsystem caps. Caches
+    /// the ids out of `session.sid` and `foreground_pgrp.pgid`, then
+    /// downgrades to `Weak` refs so the TTY does not retain the
+    /// session or pgrp itself.
+    pub fn from_typed(
+        session: &tx_substrate::zone::Cap<crate::process::structure::Session>,
+        foreground_pgrp: &tx_substrate::zone::Cap<crate::process::structure::ProcessGroup>,
+    ) -> Self {
+        Self {
+            session_id: session.sid.0,
+            session_leader_pgid: session.sid.0,
+            foreground_pgid: foreground_pgrp.pgid.0,
+            session: Some(session.downgrade()),
+            foreground_pgrp: Some(foreground_pgrp.downgrade()),
+        }
+    }
+
+    /// Upgrade the typed `Weak<Session>` to a strong `Cap<Session>` if
+    /// the binding was constructed from a real session and that
+    /// session is still alive. Returns `None` for legacy raw-id
+    /// bindings or when the session has been dropped.
+    pub fn upgrade_session(
+        &self,
+    ) -> Option<tx_substrate::zone::Cap<crate::process::structure::Session>> {
+        let weak = self.session.as_ref()?;
+        let guard = tx_substrate::epoch::guard();
+        weak.upgrade(&guard)
+    }
+
+    /// Upgrade the typed `Weak<ProcessGroup>` for the foreground pgrp
+    /// to a strong `Cap<ProcessGroup>` if alive. Returns `None` for
+    /// legacy raw-id bindings or when the pgrp has been dropped.
+    pub fn upgrade_foreground_pgrp(
+        &self,
+    ) -> Option<tx_substrate::zone::Cap<crate::process::structure::ProcessGroup>> {
+        let weak = self.foreground_pgrp.as_ref()?;
+        let guard = tx_substrate::epoch::guard();
+        weak.upgrade(&guard)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +307,30 @@ impl TtyIdentity {
 
     pub fn bind_session_pgrp(&self, binding: SessionPgrp) -> Option<SessionPgrp> {
         self.session_pgrp.swap(Some(binding))
+    }
+
+    /// Convenience: build a typed binding from real process-subsystem
+    /// caps and install it. Equivalent to
+    /// `bind_session_pgrp(SessionPgrp::from_typed(session, fg))`.
+    pub fn bind_session_pgrp_typed(
+        &self,
+        session: &tx_substrate::zone::Cap<crate::process::structure::Session>,
+        foreground_pgrp: &tx_substrate::zone::Cap<crate::process::structure::ProcessGroup>,
+    ) -> Option<SessionPgrp> {
+        self.bind_session_pgrp(SessionPgrp::from_typed(session, foreground_pgrp))
+    }
+
+    /// If the current binding carries a typed foreground-pgrp `Weak`,
+    /// upgrade it to a `Cap<ProcessGroup>`. Returns `None` for legacy
+    /// raw-id bindings, when no binding is installed, or when the
+    /// pgrp has been dropped.
+    ///
+    /// Used by signal-fanout paths that want to call
+    /// `signal::step_kill_pgrp` against the foreground pgrp.
+    pub fn foreground_pgrp_cap(
+        &self,
+    ) -> Option<tx_substrate::zone::Cap<crate::process::structure::ProcessGroup>> {
+        self.session_pgrp.snapshot()?.upgrade_foreground_pgrp()
     }
 
     pub fn clear_session_pgrp(&self) -> Option<SessionPgrp> {

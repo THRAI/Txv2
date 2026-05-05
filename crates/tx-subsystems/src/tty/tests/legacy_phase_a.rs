@@ -691,11 +691,7 @@ fn ioctl_binding_and_termios_roundtrip_work() {
     );
     assert_eq!(
         tty.session_pgrp(),
-        Some(SessionPgrp {
-            session_id: 11,
-            session_leader_pgid: 22,
-            foreground_pgid: 22,
-        })
+        Some(SessionPgrp::from_raw_ids(11, 22, 22))
     );
     assert_eq!(step_ioctl_tiocgpgrp(&tty, &guard), StepOutcome::Done(22));
     assert_eq!(
@@ -716,7 +712,10 @@ fn ioctl_binding_and_termios_roundtrip_work() {
         StepOutcome::Done(crate::tty::execution::IoctlSideEffect {
             session_ctl_fired: true,
             signal: Some(SignalDispatch {
-                target: SignalTarget::ForegroundProcessGroup(33),
+                target: SignalTarget::ForegroundProcessGroup {
+                    pgid: 33,
+                    pgrp: None
+                },
                 signal: JobControlSignal::Winch,
             }),
         })
@@ -807,11 +806,7 @@ fn step_ingest_reports_foreground_signal_dispatch_when_bound() {
         "pts/3",
         TtyPayload::new_hardware(&NOOP_BINDING),
     );
-    tty.bind_session_pgrp(SessionPgrp {
-        session_id: 7,
-        session_leader_pgid: 9,
-        foreground_pgid: 9,
-    });
+    tty.bind_session_pgrp(SessionPgrp::from_raw_ids(7, 9, 9));
 
     assert_eq!(
         step_ingest(&tty, &[0x03], &guard),
@@ -823,7 +818,10 @@ fn step_ingest_reports_foreground_signal_dispatch_when_bound() {
                 signal: SignalKind::Int,
             }),
             signal_dispatch: Some(SignalDispatch {
-                target: SignalTarget::ForegroundProcessGroup(9),
+                target: SignalTarget::ForegroundProcessGroup {
+                    pgid: 9,
+                    pgrp: None
+                },
                 signal: JobControlSignal::Int,
             }),
             flow_control: None,
@@ -869,11 +867,7 @@ fn step_ingest_reports_sigquit_and_sigtstp_dispatch_when_bound() {
         "pts/12",
         TtyPayload::new_hardware(&NOOP_BINDING),
     );
-    tty.bind_session_pgrp(SessionPgrp {
-        session_id: 12,
-        session_leader_pgid: 120,
-        foreground_pgid: 121,
-    });
+    tty.bind_session_pgrp(SessionPgrp::from_raw_ids(12, 120, 121));
 
     assert_eq!(
         step_ingest(&tty, &[0x1c], &guard),
@@ -885,7 +879,10 @@ fn step_ingest_reports_sigquit_and_sigtstp_dispatch_when_bound() {
                 signal: SignalKind::Quit,
             }),
             signal_dispatch: Some(SignalDispatch {
-                target: SignalTarget::ForegroundProcessGroup(121),
+                target: SignalTarget::ForegroundProcessGroup {
+                    pgid: 121,
+                    pgrp: None
+                },
                 signal: JobControlSignal::Quit,
             }),
             flow_control: None,
@@ -902,7 +899,10 @@ fn step_ingest_reports_sigquit_and_sigtstp_dispatch_when_bound() {
                 signal: SignalKind::Tstp,
             }),
             signal_dispatch: Some(SignalDispatch {
-                target: SignalTarget::ForegroundProcessGroup(121),
+                target: SignalTarget::ForegroundProcessGroup {
+                    pgid: 121,
+                    pgrp: None
+                },
                 signal: JobControlSignal::Tstp,
             }),
             flow_control: None,
@@ -921,11 +921,7 @@ fn background_write_with_tostop_returns_eio() {
         "ttyS4",
         TtyPayload::new_hardware(&NOOP_BINDING),
     );
-    tty.bind_session_pgrp(SessionPgrp {
-        session_id: 1,
-        session_leader_pgid: 10,
-        foreground_pgid: 10,
-    });
+    tty.bind_session_pgrp(SessionPgrp::from_raw_ids(1, 10, 10));
     let mut termios = match step_ioctl_tcgets(&tty, &guard) {
         StepOutcome::Done(termios) => termios,
         other => panic!("tcgets failed: {other:?}"),
@@ -960,11 +956,7 @@ fn background_read_returns_eio_in_staging_path() {
         "ttyS6",
         TtyPayload::new_hardware(&NOOP_BINDING),
     );
-    tty.bind_session_pgrp(SessionPgrp {
-        session_id: 2,
-        session_leader_pgid: 20,
-        foreground_pgid: 20,
-    });
+    tty.bind_session_pgrp(SessionPgrp::from_raw_ids(2, 20, 20));
 
     let mut out = [0u8; 8];
     let bg = IoctlCaller::new(2, 21).background();
@@ -1035,11 +1027,7 @@ fn step_hangup_and_master_close_drop_payload_and_emit_signals() {
         "ttyS5",
         TtyPayload::new_hardware(&NOOP_BINDING),
     );
-    tty.bind_session_pgrp(SessionPgrp {
-        session_id: 5,
-        session_leader_pgid: 51,
-        foreground_pgid: 50,
-    });
+    tty.bind_session_pgrp(SessionPgrp::from_raw_ids(5, 51, 50));
     assert_eq!(
         step_hangup(&tty, &guard),
         StepOutcome::Done(crate::tty::execution::HangupOutcome {
@@ -1047,11 +1035,17 @@ fn step_hangup_and_master_close_drop_payload_and_emit_signals() {
             hangup_fired: true,
             session_ctl_fired: true,
             hup_signal: Some(SignalDispatch {
-                target: SignalTarget::SessionLeaderProcessGroup(51),
+                target: SignalTarget::SessionLeaderProcessGroup {
+                    pgid: 51,
+                    pgrp: None
+                },
                 signal: JobControlSignal::Hup,
             }),
             cont_signal: Some(SignalDispatch {
-                target: SignalTarget::ForegroundProcessGroup(50),
+                target: SignalTarget::ForegroundProcessGroup {
+                    pgid: 50,
+                    pgrp: None
+                },
                 signal: JobControlSignal::Cont,
             }),
         })
@@ -1063,11 +1057,8 @@ fn step_hangup_and_master_close_drop_payload_and_emit_signals() {
         StepOutcome::Done(pty) => pty,
         other => panic!("open_ptmx failed: {other:?}"),
     };
-    pty.slave.bind_session_pgrp(SessionPgrp {
-        session_id: 6,
-        session_leader_pgid: 61,
-        foreground_pgid: 60,
-    });
+    pty.slave
+        .bind_session_pgrp(SessionPgrp::from_raw_ids(6, 61, 60));
     let close = step_master_close_last(&pty.master, &guard);
     assert!(matches!(
         close,

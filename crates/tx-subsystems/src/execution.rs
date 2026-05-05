@@ -20,7 +20,9 @@ pub enum Errno {
     ENOENT,
     ENOSYS,
     ENOTDIR,
+    EPERM,
     EROFS,
+    ESRCH,
     ESTALE,
 }
 

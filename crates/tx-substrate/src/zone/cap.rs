@@ -250,7 +250,6 @@ impl<T: 'static> Deref for PayloadCap<T> {
 unsafe impl<T: Send + Sync> Send for PayloadCap<T> {}
 unsafe impl<T: Send + Sync> Sync for PayloadCap<T> {}
 
-#[derive(Clone, Copy)]
 pub struct Weak<T: 'static> {
     /// Compact logical slot identity. Stale keys are harmless because
     /// `generation` is checked under an epoch guard before exposing data.
@@ -259,6 +258,18 @@ pub struct Weak<T: 'static> {
     pub(crate) generation: u16,
     _marker: PhantomData<T>,
 }
+
+// Manual Clone/Copy impls — the derives would synthesise
+// `where T: Clone` bounds (the standard derive quirk for types
+// containing `PhantomData<T>`), which prevents `Weak<NonClone>`
+// from being Clone even though it's just an integer pair.
+impl<T: 'static> Clone for Weak<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: 'static> Copy for Weak<T> {}
 
 const _: () = {
     assert!(core::mem::size_of::<Cap<()>>() == 4);

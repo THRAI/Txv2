@@ -10,10 +10,14 @@ use crate::tty::execution::{TTY_READABLE, TTY_WRITABLE};
 use crate::tty::ldisc::SignalKind;
 use crate::tty::structure::{SessionPgrp, Termios, TtyIdentity, Winsize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct IoctlCaller {
     pub session_id: u32,
     pub pgrp_id: u32,
+    /// Typed `Weak<ProcessGroup>` for the caller's pgrp. `None` for
+    /// legacy raw-id callers; populated by [`Self::with_pgrp_weak`]
+    /// once the syscall driver carries a real `Cap<ProcessIdentity>`.
+    pub pgrp: Option<tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>>,
     pub is_session_leader: bool,
     pub has_controlling_tty: bool,
     pub in_foreground: bool,
@@ -21,17 +25,51 @@ pub struct IoctlCaller {
     pub sigttou_ignored: bool,
 }
 
+impl PartialEq for IoctlCaller {
+    fn eq(&self, other: &Self) -> bool {
+        // Typed pgrp Weak intentionally not compared: tests construct
+        // callers via `IoctlCaller::new(...)` (no typed ref) and assert
+        // equality on the legacy field set. Two callers with the same
+        // ids but different (or missing) Weak refs are operationally
+        // equivalent for the day-1 surface — same authority, same
+        // dispatch shape.
+        self.session_id == other.session_id
+            && self.pgrp_id == other.pgrp_id
+            && self.is_session_leader == other.is_session_leader
+            && self.has_controlling_tty == other.has_controlling_tty
+            && self.in_foreground == other.in_foreground
+            && self.sigttin_ignored == other.sigttin_ignored
+            && self.sigttou_ignored == other.sigttou_ignored
+    }
+}
+
+impl Eq for IoctlCaller {}
+
 impl IoctlCaller {
     pub const fn new(session_id: u32, pgrp_id: u32) -> Self {
         Self {
             session_id,
             pgrp_id,
+            pgrp: None,
             is_session_leader: false,
             has_controlling_tty: false,
             in_foreground: true,
             sigttin_ignored: false,
             sigttou_ignored: false,
         }
+    }
+
+    /// Attach a typed `Weak<ProcessGroup>` to the caller. Used by the
+    /// (forthcoming) syscall driver that already holds the caller's
+    /// `Cap<ProcessIdentity>`. Lets dispatched signals route through
+    /// `signal::script_kill_pgrp` against a real pgrp instead of
+    /// resolving from the raw `pgrp_id` later.
+    pub fn with_pgrp_weak(
+        mut self,
+        pgrp: tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>,
+    ) -> Self {
+        self.pgrp = Some(pgrp);
+        self
     }
 
     pub const fn as_session_leader(mut self) -> Self {
@@ -82,11 +120,76 @@ impl From<SignalKind> for JobControlSignal {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Where a TTY-emitted signal should be delivered. Each variant carries
+/// the legacy raw `pgid: u32` and a typed `pgrp: Option<Weak<ProcessGroup>>`
+/// — populated when the upstream binding (TTY's `SessionPgrp` or the
+/// `IoctlCaller`) was constructed from real process-subsystem caps.
+/// Typed refs let `signal::deliver_tty_dispatch` upgrade and route the
+/// post through `signal::script_kill_pgrp` directly.
+#[derive(Clone, Copy, Debug)]
 pub enum SignalTarget {
-    ForegroundProcessGroup(u32),
-    SessionLeaderProcessGroup(u32),
-    CallerProcessGroup(u32),
+    /// TTY's bound foreground pgrp (TIOCSCTTY-installed, ioctl-emitted).
+    ForegroundProcessGroup {
+        pgid: u32,
+        pgrp: Option<tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>>,
+    },
+    /// Session leader's pgrp (used by hangup → SIGHUP fanout).
+    SessionLeaderProcessGroup {
+        pgid: u32,
+        pgrp: Option<tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>>,
+    },
+    /// Caller's own pgrp (used by background-IO SIGTTIN/SIGTTOU).
+    CallerProcessGroup {
+        pgid: u32,
+        pgrp: Option<tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>>,
+    },
+}
+
+impl PartialEq for SignalTarget {
+    fn eq(&self, other: &Self) -> bool {
+        // Typed Weak refs intentionally not compared (same rationale as
+        // `IoctlCaller`/`SessionPgrp`).
+        match (self, other) {
+            (
+                SignalTarget::ForegroundProcessGroup { pgid: a, .. },
+                SignalTarget::ForegroundProcessGroup { pgid: b, .. },
+            ) => a == b,
+            (
+                SignalTarget::SessionLeaderProcessGroup { pgid: a, .. },
+                SignalTarget::SessionLeaderProcessGroup { pgid: b, .. },
+            ) => a == b,
+            (
+                SignalTarget::CallerProcessGroup { pgid: a, .. },
+                SignalTarget::CallerProcessGroup { pgid: b, .. },
+            ) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SignalTarget {}
+
+impl SignalTarget {
+    /// Pgid of the targeted pgrp, regardless of typed-ref population.
+    pub const fn pgid(&self) -> u32 {
+        match *self {
+            SignalTarget::ForegroundProcessGroup { pgid, .. }
+            | SignalTarget::SessionLeaderProcessGroup { pgid, .. }
+            | SignalTarget::CallerProcessGroup { pgid, .. } => pgid,
+        }
+    }
+
+    /// Borrow the optional typed pgrp Weak (consumed by
+    /// `signal::deliver_tty_dispatch` for upgrade-and-route).
+    pub fn pgrp_weak(
+        &self,
+    ) -> Option<&tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>> {
+        match self {
+            SignalTarget::ForegroundProcessGroup { pgrp, .. }
+            | SignalTarget::SessionLeaderProcessGroup { pgrp, .. }
+            | SignalTarget::CallerProcessGroup { pgrp, .. } => pgrp.as_ref(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,11 +231,11 @@ pub fn step_ioctl_tiocsctty(
         return StepOutcome::Err(Errno::EBUSY);
     }
 
-    tty.bind_session_pgrp(SessionPgrp {
-        session_id: caller.session_id,
-        session_leader_pgid: caller.pgrp_id,
-        foreground_pgid: caller.pgrp_id,
-    });
+    tty.bind_session_pgrp(SessionPgrp::from_raw_ids(
+        caller.session_id,
+        caller.pgrp_id,
+        caller.pgrp_id,
+    ));
     tty.session_ctl_port.fire(SessionCtlEvent::Bound as u64);
 
     StepOutcome::Done(IoctlSideEffect {
@@ -234,7 +337,10 @@ pub fn step_ioctl_tiocswinsz(
     StepOutcome::Done(IoctlSideEffect {
         session_ctl_fired: true,
         signal: tty.session_pgrp().map(|binding| SignalDispatch {
-            target: SignalTarget::ForegroundProcessGroup(binding.foreground_pgid),
+            target: SignalTarget::ForegroundProcessGroup {
+                pgid: binding.foreground_pgid,
+                pgrp: binding.foreground_pgrp,
+            },
             signal: JobControlSignal::Winch,
         }),
     })
@@ -278,7 +384,10 @@ pub fn deferred_signal_for_tty(
     signal: SignalKind,
 ) -> Option<SignalDispatch> {
     tty.session_pgrp().map(|binding| SignalDispatch {
-        target: SignalTarget::ForegroundProcessGroup(binding.foreground_pgid),
+        target: SignalTarget::ForegroundProcessGroup {
+            pgid: binding.foreground_pgid,
+            pgrp: binding.foreground_pgrp,
+        },
         signal: signal.into(),
     })
 }
