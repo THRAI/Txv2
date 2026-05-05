@@ -4,6 +4,37 @@
 
 ## Current Shape
 
+- 2026-05-05 Trio Phase 6 (end-to-end userspace round-trip smoke) on
+  branch `feat/trio-trap-syscall-tmpfs-devfs`. New host test
+  `tx_kernel::init::tests::boot_smoke_userspace_round_trip_writes_console_then_exits`
+  stitches the full chain together: fake userspace queue
+  (`Syscall(write(1, "hi\n", 3))` then `Syscall(exit_group(0))`) →
+  `UserspaceRunSlot::start_request` + `complete_interesting_trap` →
+  `linux_syscall::dispatch` → `OpenFile::step_write` → TTY ldisc OPOST
+  → `ConsoleIf::write_bytes` capture (asserts `b"hi\r\n"` post-OPOST)
+  → Plan B writeback into `pending_syscall_return` → fake
+  userspace-entry shim drains the slot into a test-local log
+  (`Some(Ok(3))`, then `None` for the no-return exit). Loop terminates
+  on `SyscallResult::NoReturn`; init transitions to zombie with
+  `ExitStatus::Exited(0)`. The synthesised driver replaces the not-yet-
+  existent reactor task wrapper + userspace-entry shim called out in
+  the plan's "Cross-cutting risks #1": per-hart slot is staged
+  manually via `set_current_thread_payload(0, _)` /
+  `clear_current_thread_payload(0)` and the writeback path is host-
+  side only (no `TrapFrameMut`). One additive seam introduced —
+  `ThreadIdentity::payload_cap_for_test()` gated on `cfg(any(test,
+  feature = "test-support"))`, mirroring the existing
+  `cross_crate_test_support` pattern. tx-kernel suite at 8 (7 prior +
+  1 new); tx-fs / tx-shims / tx-subsystems unchanged (10 / 12 / 331).
+  Verified: `cargo check -p tx-kernel`, `cargo test -p tx-kernel
+  --lib`, `cargo test -p tx-fs --lib -- --test-threads=1`,
+  `cargo test -p tx-shims --lib`, `cargo test -p tx-subsystems --lib
+  -- --test-threads=1`, `cargo check --workspace`, `cargo fmt
+  --check`, `cargo xtask progress validate` all green. Next: lay down
+  the production reactor task wrapper + real userspace-entry shim so
+  the Phase 6 fake driver can be deleted. Blocker: none for the
+  follow-up; ELF loading + first userspace binary remain explicitly
+  out of scope per the trio plan.
 - 2026-05-05 cwd / chdir / getcwd VFS integration on branch
   `process-topology`. First VFS↔process seam: processes now carry a
   `Cap<DEntry>` cwd. New `step_chdir(target, new_cwd)` (returns

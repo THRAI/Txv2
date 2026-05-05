@@ -89,9 +89,19 @@ impl tx_hal::AuxvIf for TestPlatform {}
 /// `ConsoleIf::write_bytes`.
 static CONSOLE_CAPTURED_LEN: AtomicUsize = AtomicUsize::new(0);
 
+/// Byte-level capture of every `ConsoleIf::write_bytes` call.
+/// Phase 6's end-to-end smoke asserts the post-OPOST byte stream
+/// (`b"hi\r\n"`); the `len`-only counter above is kept for the
+/// existing Phase 3b test which doesn't pin the exact bytes.
+static CONSOLE_CAPTURED_BYTES: Mutex<std::vec::Vec<u8>> = Mutex::new(std::vec::Vec::new());
+
 impl ConsoleIf for TestPlatform {
     fn write_bytes(bytes: &[u8]) {
         CONSOLE_CAPTURED_LEN.fetch_add(bytes.len(), Ordering::AcqRel);
+        CONSOLE_CAPTURED_BYTES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(bytes);
     }
 }
 
@@ -180,6 +190,10 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_tid_counter();
     crate::init::reset_boot_state_for_test();
     CONSOLE_CAPTURED_LEN.store(0, Ordering::Release);
+    CONSOLE_CAPTURED_BYTES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     guard
 }
 
@@ -307,4 +321,289 @@ fn boot_smoke_init_fds_preopened_to_console() {
         cwd_bytes, b"/",
         "init's rendered cwd path is the namespace root"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — end-to-end userspace round-trip smoke
+// ---------------------------------------------------------------------------
+//
+// The Trio plan §"Phasing" item 6 (lines 505-509) calls for a single
+// `cargo test -p tx-kernel` test that simulates a fake userspace
+// returning two traps in sequence — `Syscall(write(1, "hi\n", 3))` and
+// `Syscall(exit_group(0))` — and asserts that the bytes reach the
+// platform console (post-OPOST) and the init process zombifies with
+// `ExitStatus::Exited(0)`.
+//
+// Because no real RV64 trap shell or `enter_userspace` shim exists in
+// host-test mode, this test synthesises the per-iteration loop the
+// reactor task wrapper *would* drive:
+//
+//   1. Install `init.leader.payload` in the per-hart slot via
+//      `set_current_thread_payload(0, _)`. This mirrors the call the
+//      future reactor task wrapper makes before each `Future::poll` of
+//      a thread future (`txdoc:THREAD-5-1-STATE-PLACEMENT`).
+//   2. Pop the next `UserspaceTrapInfo` from a Vec representing the
+//      program's syscall sequence (the "fake userspace closure").
+//   3. `slot.start_request()` opens the userspace-run wait;
+//      `slot.complete_interesting_trap(req, info)` resolves it. We
+//      do not actually `.await` the wait future inside this loop —
+//      after `complete_interesting_trap` succeeds we know which
+//      `SyscallRequest` was produced, and we feed it directly into
+//      `linux_syscall::dispatch`.
+//   4. The dispatcher's return is encoded into
+//      `pending_syscall_return` (Plan B writeback discipline,
+//      `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`).
+//   5. The **fake entry shim** drains `pending_syscall_return` into a
+//      test-local log. It does NOT touch a real `TrapFrameMut` — host
+//      tests have no platform trap frame. This is the explicit
+//      Phase-6 synthesis called out in the plan's "Cross-cutting risks
+//      #1": the userspace-entry shim that would write `set_syscall_return`
+//      into a fresh trap frame does not yet exist in production code,
+//      so the test stages a host-side facsimile.
+//   6. The loop terminates when (a) the queue is empty or (b) the
+//      dispatcher returned `SyscallResult::NoReturn` (exit_group's
+//      "thread does not return to userspace" outcome).
+//
+// The test is gated by `INIT_TEST_LOCK` (shared with the Phase 3b
+// boot-wiring tests) because it bootstraps and tears down the same
+// global `INIT_PROCESS` / mount / TTY slots.
+
+/// Phase 6 deliverable. The full chain from a synthesised userspace
+/// trap through to console capture and zombie exit-status.
+#[test]
+fn boot_smoke_userspace_round_trip_writes_console_then_exits() {
+    use tx_reactor::userspace::{SyscallRequest, UserspaceTrapInfo};
+    use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult, NR_EXIT_GROUP, NR_WRITE};
+    use tx_subsystems::process::ExitStatus;
+    use tx_subsystems::thread_runtime::{
+        clear_current_thread_payload, drain_pending_syscall_return, set_current_thread_payload,
+    };
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    // Resolve init + leader thread + leader payload. After
+    // `drive_boot_wiring` the leader's payload is alive (no exit has
+    // run); `payload_cap_for_test` is a `cfg(any(test, feature =
+    // "test-support"))` accessor on `ThreadIdentity` introduced as the
+    // minimal additive seam this Phase 6 test needs.
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let leader = init
+        .nth_thread(0)
+        .expect("init has a leader thread post-bootstrap");
+    let payload = leader
+        .payload_cap_for_test()
+        .expect("leader payload must be alive before any exit");
+
+    // Stage the per-hart slot the way a reactor task wrapper would.
+    // The Trio plan's "Cross-cutting risks #1" notes that the
+    // production reactor wrapper does not yet exist; this test stages
+    // it manually. `set_current_thread_payload` returns the previous
+    // slot; we expect None on a fresh test.
+    assert!(
+        set_current_thread_payload(0, payload.clone()).is_none(),
+        "per-hart slot must be empty before installing the leader payload"
+    );
+
+    // Snapshot console bytes captured before the loop so we can assert
+    // the new bytes belong to this test's syscalls and not a leftover.
+    let baseline_bytes_len = CONSOLE_CAPTURED_BYTES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
+
+    // Dispatch context. `aspace_cap` is `Some` for the live init.
+    let aspace = init
+        .aspace_cap()
+        .expect("init aspace must be alive pre-exit");
+    let ctx = SyscallCtx::new(init.clone(), leader.clone(), aspace);
+
+    // Synthesise the userspace trap queue. The `write` syscall takes a
+    // kernel-side buffer per Phase 2a's bootstrap exemption (TODO
+    // copy_from_user lane); `b"hi\n".as_ptr() as u64` is the kernel VA
+    // of the static byte slice.
+    let write_buf: &[u8] = b"hi\n";
+    let queue: std::vec::Vec<UserspaceTrapInfo> = std::vec![
+        UserspaceTrapInfo::Syscall(SyscallRequest::new(
+            NR_WRITE,
+            [1, write_buf.as_ptr() as u64, 3, 0, 0, 0],
+        )),
+        UserspaceTrapInfo::Syscall(SyscallRequest::new(NR_EXIT_GROUP, [0, 0, 0, 0, 0, 0])),
+    ];
+
+    // Per-iteration log of what the fake entry shim drained from
+    // `pending_syscall_return`. Phase 6's assertion: index 0 is
+    // `Some(Ok(3))` (write returned 3 bytes); index 1 is `None` (the
+    // exit_group dispatch returned `NoReturn`, never wrote a value).
+    let mut drained_log: std::vec::Vec<Option<Result<i64, i32>>> = std::vec::Vec::new();
+
+    for trap in queue {
+        // (1) Open the userspace-run wait, mirroring what the thread
+        // future would do at re-entry.
+        let wait = payload
+            .userspace_slot()
+            .start_request()
+            .expect("start userspace-run wait");
+        let req_token = wait.request();
+        payload.set_active_userspace_request(Some(req_token));
+
+        // (2) Resolve the wait with the synthesised trap. This is
+        // exactly what `trap_handoff::hand_off_syscall` would do on a
+        // real syscall trap. The wait future itself is dropped on the
+        // next `start_request`; we pull the inner `SyscallRequest`
+        // out of `trap` directly because the host loop has no
+        // executor running the wait.
+        let _ = payload
+            .userspace_slot()
+            .complete_interesting_trap(req_token, trap)
+            .expect("complete_interesting_trap on freshly-started request");
+        // The thread future would now consume the resolution and
+        // clear `active_request`; mirror that here so a re-entry
+        // doesn't panic with `Busy`.
+        payload.set_active_userspace_request(None);
+        // Drop the wait future explicitly; its `Drop` impl clears
+        // any leftover `active` state.
+        drop(wait);
+
+        // (3) Drive the dispatcher with the request that was inside
+        // the trap. `block_on` is local to this module — see helper
+        // below.
+        let req = match trap {
+            UserspaceTrapInfo::Syscall(r) => r,
+            other => panic!("Phase 6 queue must only carry syscall traps; saw {other:?}",),
+        };
+        let result = block_on(dispatch(req, &ctx));
+
+        // (4) Plan B writeback: store the dispatcher's outcome into
+        // `pending_syscall_return`. `NoReturn` does not write the
+        // slot (the thread never re-enters userspace).
+        match result {
+            SyscallResult::Return(v) => payload.store_pending_syscall_return(Some(Ok(v))),
+            SyscallResult::Error(e) => payload.store_pending_syscall_return(Some(Err(e))),
+            SyscallResult::NoReturn => {
+                // No writeback. Loop will terminate on the
+                // post-iteration `NoReturn` check.
+            }
+        }
+
+        // (5) Fake userspace-entry shim. In a real RV64 boot, this is
+        // where the platform `enter_userspace` path would
+        // `set_syscall_return` / `set_syscall_error` on a *fresh*
+        // trap frame before `sret`. Host tests have no trap frame, so
+        // we drain the slot and stash it in `drained_log`; the
+        // post-loop assertions verify the values match Plan B
+        // expectations.
+        let drained = drain_pending_syscall_return(&payload);
+        drained_log.push(drained);
+
+        // (6) Terminate the loop on `NoReturn` — the dispatcher will
+        // never produce a value to drain, and the next iteration
+        // would observe a zombie process (no payload, no fds).
+        if matches!(result, SyscallResult::NoReturn) {
+            break;
+        }
+    }
+
+    // Tidy the per-hart slot. A real reactor wrapper would call this
+    // after each poll completes (paired with the
+    // `set_current_thread_payload` at poll start, per
+    // `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`).
+    let cleared = clear_current_thread_payload(0);
+    assert!(
+        cleared.is_some(),
+        "per-hart slot must still hold the leader payload at end-of-loop \
+         (cleared exactly once)"
+    );
+
+    // ---- Assertions ----
+    //
+    // (a) Console capture: TTY's N_TTY ldisc applies OPOST/ONLCR
+    //     before the bytes hit the platform transport, so `b"hi\n"`
+    //     becomes `b"hi\r\n"` at the device boundary. We compare the
+    //     **trailing** capture (post-baseline) so any pre-loop console
+    //     output from `drive_boot_wiring` (the boot sentinel writes
+    //     etc.) doesn't pollute the assertion.
+    let captured = CONSOLE_CAPTURED_BYTES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert!(
+        captured.len() >= baseline_bytes_len,
+        "console byte buffer must not shrink during the loop"
+    );
+    let new_bytes = &captured[baseline_bytes_len..];
+    assert!(
+        new_bytes.windows(b"hi\r\n".len()).any(|w| w == b"hi\r\n"),
+        "post-OPOST console bytes must contain b\"hi\\r\\n\"; got {:?}",
+        new_bytes,
+    );
+
+    // (b) Drained syscall returns. The `write(1, "hi\n", 3)` arm
+    //     returns `Ok(3)` — three input bytes consumed, regardless of
+    //     OPOST expansion at the device transport (Linux semantics:
+    //     `write(2)` reports the count of *input* bytes accepted).
+    //     The `exit_group(0)` arm yields `NoReturn`, which the fake
+    //     shim never drains, so the slot read returns `None`.
+    assert_eq!(
+        drained_log.len(),
+        2,
+        "loop must run exactly two iterations (write, exit_group)",
+    );
+    assert_eq!(
+        drained_log[0],
+        Some(Ok(3)),
+        "first syscall (write) returns Ok(3) bytes",
+    );
+    assert_eq!(
+        drained_log[1], None,
+        "second syscall (exit_group) returns NoReturn — nothing to drain",
+    );
+
+    // (c) Process state: init must be a zombie with
+    //     `ExitStatus::Exited(0)`. Mirrors the assertion shape used
+    //     by tx-shims's `dispatch_exit_group_marks_process_zombie`.
+    assert!(init.is_zombie(), "exit_group must zombify init",);
+    assert_eq!(
+        init.exit_status(),
+        Some(ExitStatus::Exited(0)),
+        "exit_group(0) records ExitStatus::Exited(0)",
+    );
+    assert_eq!(
+        init.live_thread_count(),
+        0,
+        "init's thread group must drain to zero on exit_group",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Local async-future driver. Mirrors `tx-shims/src/linux_syscall/tests.rs`'s
+// `block_on` because the dispatcher is `async` and Phase 2b's `brk` arm
+// `.await`s; the Phase 6 queue only triggers the synchronous arms today
+// but we keep the spin-poll shape so later additions to the queue do not
+// silently skip pending futures.
+// ---------------------------------------------------------------------------
+
+struct NoopWake;
+
+impl std::task::Wake for NoopWake {
+    fn wake(self: std::sync::Arc<Self>) {}
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {}
+}
+
+fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, Waker};
+    let waker = Waker::from(std::sync::Arc::new(NoopWake));
+    let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` lives on the stack for the duration of the loop;
+    // we never move it after `Pin::new_unchecked`.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    for _ in 0..1024 {
+        match pinned.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => continue,
+        }
+    }
+    panic!("block_on: future did not resolve in 1024 polls");
 }

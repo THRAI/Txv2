@@ -58,6 +58,26 @@ impl ThreadIdentity {
         let guard = tx_substrate::epoch::guard();
         self.owner_proc.upgrade(&guard)
     }
+
+    /// Snapshot the live `PayloadCap<ThreadPayload>` if the thread is
+    /// not yet a zombie. Returns `None` once `step_thread_exit` has
+    /// dropped the payload.
+    ///
+    /// **Test-support only.** The Trio Phase 6 end-to-end smoke test
+    /// (`crates/tx-kernel/src/init/tests.rs`) needs to install the
+    /// leader thread's payload in the per-hart slot via
+    /// `set_current_thread_payload`, write `pending_syscall_return`
+    /// after each dispatched syscall, and drain it from the fake
+    /// userspace-entry shim. Production code reaches the payload
+    /// through other seams (the trap shell looks it up off the
+    /// per-hart slot; `step_thread_exit` mutates it via the
+    /// crate-private field). Gated behind `cfg(any(test, feature =
+    /// "test-support"))` so the surface is invisible in release
+    /// builds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn payload_cap_for_test(&self) -> Option<PayloadCap<ThreadPayload>> {
+        self.payload.lock().clone()
+    }
 }
 
 /// Thread payload. Dropped on `step_thread_exit`.
