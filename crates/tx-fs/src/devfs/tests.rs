@@ -18,11 +18,6 @@ use tx_subsystems::vfs::{Credential, DirCursor, FsObjectId, FsOps, RNodeBacking,
 
 use super::{open_console_for_init, Devfs, DEVFS_ROOT_OBJECT_ID};
 
-/// Serialise zone-init/reset across all tx-fs devfs tests. The TTY
-/// registry is a process-wide singleton, so concurrent tests that
-/// register/clear hardware aliases would race without this lock.
-static DEVFS_TEST_LOCK: Mutex<()> = Mutex::new(());
-
 fn init_tty_zones() {
     // Idempotent: `tx_subsystems::zones::register_all()` calls
     // `register_zone_for::<T>()` per subsystem, and the underlying
@@ -99,7 +94,9 @@ fn install_capturing_console() -> &'static CapturingOps {
 
 #[test]
 fn devfs_lookup_console_after_register_hardware_returns_tty_rnode() {
-    let _serial = DEVFS_TEST_LOCK.lock().expect("devfs test lock");
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
     let _ops = install_capturing_console();
@@ -138,7 +135,9 @@ fn devfs_lookup_console_after_register_hardware_returns_tty_rnode() {
 
 #[test]
 fn devfs_write_through_openfile_reaches_tty_step_write() {
-    let _serial = DEVFS_TEST_LOCK.lock().expect("devfs test lock");
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
     let ops = install_capturing_console();
@@ -167,7 +166,9 @@ fn devfs_write_through_openfile_reaches_tty_step_write() {
 
 #[test]
 fn devfs_create_returns_erofs() {
-    let _serial = DEVFS_TEST_LOCK.lock().expect("devfs test lock");
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
     let guard = tx_substrate::epoch::guard();
@@ -199,7 +200,9 @@ fn devfs_create_returns_erofs() {
 
 #[test]
 fn devfs_lookup_unknown_returns_enoent() {
-    let _serial = DEVFS_TEST_LOCK.lock().expect("devfs test lock");
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
     // Register `console` so the registry is populated but
@@ -223,7 +226,9 @@ fn devfs_lookup_unknown_returns_enoent() {
 
 #[test]
 fn devfs_readdir_yields_registered_aliases_and_terminates() {
-    let _serial = DEVFS_TEST_LOCK.lock().expect("devfs test lock");
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
     let _ops = install_capturing_console();
