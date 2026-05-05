@@ -27,11 +27,15 @@
 //!   `step_setfsuid` — land when the syscall script driver consumes
 //!   them.
 
+use core::marker::PhantomData;
 use core::sync::atomic::Ordering;
 
+use tx_substrate::epoch::Guard;
 use tx_substrate::zone::Cap;
 
-use crate::process::structure::ProcessIdentity;
+use crate::execution::Errno;
+use crate::process::structure::{ProcessIdentity, TargetProcCred};
+use crate::signal::Signum;
 
 /// POSIX user identifier. `Uid::ROOT` (0) carries privilege.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
@@ -233,6 +237,74 @@ pub fn step_setgid(target: &Cap<ProcessIdentity>, new_gid: Gid) -> CredChange {
     core::sync::atomic::fence(Ordering::SeqCst);
 
     CredChange::Replaced { prev, new }
+}
+
+// ----- Authorization checks -----
+
+/// Zero-sized provenance witness produced by [`require_signal_send`].
+///
+/// Per `cred_service_v_1` §"Cred witnesses": cred witnesses carry no
+/// retention or live references — they are guard-phantom-typed proof
+/// that the authorization check ran successfully under `'g`.
+#[must_use = "the witness is the authorization receipt — drop it explicitly only if you really intend to throw away the proof"]
+pub struct SignalAuthorized<'g> {
+    _guard: PhantomData<&'g ()>,
+    _priv: (),
+}
+
+impl SignalAuthorized<'_> {
+    fn new() -> Self {
+        Self {
+            _guard: PhantomData,
+            _priv: (),
+        }
+    }
+}
+
+/// Pure permission rule: may a caller with `source` cred send `sig` to
+/// a target whose facts are `target`? Implements the day-1 simplified
+/// shape of `SIGNAL_v1` §32:
+///
+/// - `SIGCONT` to a target in the same session is always allowed
+///   (POSIX SIGCONT bypass).
+/// - Privileged callers (`CAP_KILL` or `euid == 0`) bypass the uid
+///   check.
+/// - Otherwise, at least one of `(source.uid, source.euid)` must match
+///   one of `(target.uid, target.euid)`.
+///
+/// Day-1 simplification: Cred has no `suid`/`ruid` distinction yet, so
+/// the Linux 4-way `(uid,euid) × (uid,suid,ruid)` match collapses to
+/// `(uid,euid) × (uid,euid)`. Extends without reshaping callers when
+/// saved-set IDs land.
+pub fn signal_permitted(source: Cred, target: &TargetProcCred, sig: Signum) -> bool {
+    if sig == Signum::SIGCONT && target.same_session {
+        return true;
+    }
+    if source.is_privileged_for(Capability::KILL) {
+        return true;
+    }
+    source.uid == target.uid
+        || source.euid == target.euid
+        || source.uid == target.euid
+        || source.euid == target.uid
+}
+
+/// Authorization check for `kill` / `tkill` / `tgkill`. Returns a
+/// `SignalAuthorized` witness on success, `Errno::EPERM` on denial.
+/// Live-checked per `cred_service_v_1` §"Not every operation is
+/// tokenized" — kill mints no reusable grant.
+pub fn require_signal_send<'g>(
+    source: Cred,
+    target: &TargetProcCred,
+    sig: Signum,
+    guard: &'g Guard<'_>,
+) -> Result<SignalAuthorized<'g>, Errno> {
+    let _ = guard;
+    if signal_permitted(source, target, sig) {
+        Ok(SignalAuthorized::new())
+    } else {
+        Err(Errno::EPERM)
+    }
 }
 
 #[cfg(test)]

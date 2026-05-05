@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use tx_substrate::zone::{Cap, PayloadCap, Weak, Zone, ZoneAllocated};
 
-use crate::cred::Cred;
+use crate::cred::{Cred, Gid, Uid};
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::sync::SpinMutex;
 use crate::thread_runtime::ThreadIdentity;
@@ -106,6 +106,54 @@ impl ProcessIdentity {
             .map(|p| p.threads.lock().len())
             .unwrap_or(0)
     }
+
+    /// Build the process-exported value type that `cred::require_signal_send`
+    /// consumes. Per `cred_service_v_1` §"Foreign value types from
+    /// subsystems", the target side of a signal-permission check is a
+    /// small value, not a `Cap` — cred consumes only the facts it needs.
+    ///
+    /// `same_session` is `true` iff `source` and `self` resolve to the
+    /// same `Session` `Cap` via their pgrps' `Weak<Session>` refs (under
+    /// a fresh epoch guard). Both sides must be live; either one zombie
+    /// returns `false`.
+    ///
+    /// Returns `None` if `self` has no payload (cred unobservable).
+    pub fn target_proc_cred_for(&self, source: &ProcessIdentity) -> Option<TargetProcCred> {
+        let target_payload_guard = self.payload.lock();
+        let target_payload = target_payload_guard.as_ref()?;
+        let target_cred = target_payload.cred();
+        drop(target_payload_guard);
+
+        let target_pgrp = self.pgrp.lock().clone();
+        let source_pgrp = source.pgrp.lock().clone();
+        let same_session = target_pgrp.session_cap().key() == source_pgrp.session_cap().key();
+
+        Some(TargetProcCred {
+            uid: target_cred.uid,
+            euid: target_cred.euid,
+            gid: target_cred.gid,
+            egid: target_cred.egid,
+            same_session,
+        })
+    }
+}
+
+/// Target-side facts consumed by `cred::require_signal_send`.
+///
+/// Day-1 subset of the illustrative `TargetProcCred` shape in
+/// [`cred_service_v_1`]: only the fields the day-1 permission rule
+/// reads. `suid`/`sgid` arrive with saved-set IDs, `dumpable` arrives
+/// with ptrace.
+///
+/// [`cred_service_v_1`]:
+/// `docs/design/02_execution/cred_service_v_1_draft (2).md`
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TargetProcCred {
+    pub uid: Uid,
+    pub euid: Uid,
+    pub gid: Gid,
+    pub egid: Gid,
+    pub same_session: bool,
 }
 
 /// Process payload. Dropped when the last thread exits (zombie state).
