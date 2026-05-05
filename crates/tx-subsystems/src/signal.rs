@@ -517,23 +517,35 @@ pub const fn is_gewalt(sig: Signum) -> bool {
     )
 }
 
-/// Apply a Gewalt signal to every live thread of `target`. Per
-/// `SIGNAL_v1` §12.3, Gewalt signals do not enter pending queues —
-/// they directly transform the target's interrupt-summary state, and
-/// (in fully-realised form) invoke control ops (group exit, group
-/// stop, group continue). Day-1 records the summary updates only;
-/// the control-op invocations land with `step_exit_group_with_signal`,
-/// stop-state machinery, and continue-state machinery.
+/// Apply a Gewalt signal to `target`. Per `SIGNAL_v1` §12.3, Gewalt
+/// signals do not enter pending queues — they directly invoke control
+/// ops (group exit, group stop, group continue):
 ///
-/// - SIGKILL → every thread gets `summary.termination` set, plus
-///   `summary.deliverable_signal` so any interruptible wait wakes.
-/// - SIGSTOP → every thread gets `summary.stop_requested` set.
-/// - SIGCONT → every thread gets `summary.stop_requested` cleared.
+/// - **SIGKILL** → invokes [`process::step_exit_group_with_signal`]
+///   immediately. The target becomes a zombie with
+///   `terminating_signal = Some(SIGKILL)` and
+///   `exit_status = Some(128 + SIGKILL)`. Per spec
+///   "exit_status encodes 'killed by SIGKILL'".
+/// - **SIGSTOP** → sets `summary.stop_requested` on every live
+///   thread. Day-1 has no stop-state machine; the bit is observable
+///   for a future `thread_future` to park on.
+/// - **SIGCONT** → clears `summary.stop_requested` on every live
+///   thread. The (also-future) handler-half of `route_sigcont` —
+///   enqueueing on `group_pending` if a SIGCONT handler is installed
+///   — is deferred.
 ///
-/// Returns `Delivered` if the target has at least one live thread,
-/// `NoLiveThread` otherwise.
+/// Returns `Delivered` if the target was live and at least one
+/// transition was applied, `NoLiveThread` otherwise.
 pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
     debug_assert!(is_gewalt(sig), "route_gewalt called with non-Gewalt signum");
+
+    if sig == Signum::SIGKILL {
+        if target.is_zombie() {
+            return KillOutcome::NoLiveThread;
+        }
+        crate::process::execution::step_exit_group_with_signal(target, sig);
+        return KillOutcome::Delivered;
+    }
 
     let payload_guard = target.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
@@ -550,13 +562,9 @@ pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
             continue;
         };
         thread_payload.update_summary(|s| match sig.raw() {
-            9 => {
-                s.termination = true;
-                s.deliverable_signal = true;
-            }
             19 => s.stop_requested = true,
             18 => s.stop_requested = false,
-            _ => unreachable!("is_gewalt guarantees one of these signums"),
+            _ => unreachable!("SIGKILL handled above; is_gewalt guarantees the rest"),
         });
         touched = true;
     }

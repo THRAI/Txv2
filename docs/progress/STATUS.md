@@ -4,6 +4,24 @@
 
 ## Current Shape
 
+- 2026-05-05 `step_exit_group_with_signal` lands on top of Gewalt/event
+  factoring (branch `process-topology`). Materialises the SIGKILL
+  control-op invocation that `SIGNAL_v1` §12.3 `route_sigkill`
+  prescribes. New `ProcessIdentity.terminating_signal: SpinMutex<Option<Signum>>`
+  field with `terminating_signal()` accessor; new
+  `process::step_exit_group_with_signal(proc, sig)` sets the slot
+  and calls `step_exit_group(proc, 128 + sig.raw())` (shell-
+  convention status until `wait(2)` lands and switches to Linux
+  encoding). `signal::route_gewalt(SIGKILL)` now invokes
+  `step_exit_group_with_signal` directly instead of setting
+  `summary.termination` — the target zombifies on the spot per spec
+  ("exit_status encodes 'killed by SIGKILL'"). The
+  `summary.termination` AST priority-1 path remains for the future
+  fatal-synchronous-fault and ptrace-fatal producers; the matching
+  test now sets the bit explicitly via `update_summary`. SIGSTOP /
+  SIGCONT routes unchanged: still update `stop_requested` since
+  there's no stop-state machine yet. 3 new tests + 2 reshaped tests;
+  suite at 280; full `cargo xtask ci` green (11/11 gates).
 - 2026-05-05 Gewalt/event factoring restored on top of signal delivery
   sweep (branch `process-topology`). Audit found day-1 collapsed the
   spec's two signal categories into one `post_signal` pipeline:

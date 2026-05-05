@@ -155,6 +155,30 @@ pub(crate) fn step_zombie(process: &Cap<ProcessIdentity>, status: i32) {
     *process.payload.lock() = None;
 }
 
+/// Day-1 status convention for "killed by signal" exits. POSIX `wait(2)`
+/// encodes this as `(sig & 0x7f)`; shells expose it as `128 + sig`.
+/// Day-1 picks the shell convention so the value is unambiguously
+/// "fatal signal X" without needing `WIFSIGNALED`/`WTERMSIG` decoders.
+/// Migrates to Linux encoding when `wait(2)` lands and the encoder is
+/// authoritative.
+const fn signal_exit_status(sig: crate::signal::Signum) -> i32 {
+    128 + sig.raw() as i32
+}
+
+/// Exit the entire thread group due to a fatal signal. Like
+/// `step_exit_group` but additionally records the terminating signum
+/// and encodes the exit status from it.
+///
+/// Materialises `route_sigkill`'s `invoke_group_exit_with_signal`
+/// per `SIGNAL_v1` §12.3. Any caller of `route_gewalt(SIGKILL)`,
+/// `ast_check`'s `DefaultTerminate` outcome, or a (future) fatal
+/// synchronous-fault path goes through this to actually take the
+/// process down.
+pub fn step_exit_group_with_signal(process: &Cap<ProcessIdentity>, sig: crate::signal::Signum) {
+    *process.terminating_signal.lock() = Some(sig);
+    step_exit_group(process, signal_exit_status(sig));
+}
+
 /// Day-1 setpgid: only supports `new_pgid == target.pid`, which
 /// creates a fresh process group inside the target's current session
 /// and rebinds the target into it. Joining an existing group requires
@@ -240,6 +264,7 @@ fn sign_process_identity(
             parent_pid,
             pgrp: SpinMutex::new(pgrp),
             exit_status: SpinMutex::new(None),
+            terminating_signal: SpinMutex::new(None),
             payload: SpinMutex::new(None),
         },
     ))
