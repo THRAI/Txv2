@@ -763,3 +763,428 @@ mod tty_bridge {
         assert_eq!(deliver_tty_dispatch(&parent, dispatch), Err(Errno::ESRCH));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Delivery sweep: select_next_signal + ast_check + summary maintenance
+// ---------------------------------------------------------------------------
+
+mod delivery {
+    use super::*;
+    use crate::process::{bootstrap_init_process, ProcessIdentity};
+    use crate::signal::{
+        ast_check, default_action, select_next_signal, step_kill_process, step_sigaction,
+        AstOutcome, DefaultAction, InterruptSummary, PendingSource, SigDisposition,
+    };
+    use crate::thread_runtime::execution::{post_signal, step_sigprocmask, SigmaskHow};
+    use crate::thread_runtime::structure::ThreadIdentity;
+    use crate::vm::{AddressSpace, TestPmap};
+    use tx_substrate::zone::Cap;
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let g = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        init_host_for_test_once();
+        let _ = zones::register_all();
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        reset_pid_counter_for_test();
+        reset_tid_counter_for_test();
+        g
+    }
+
+    fn fresh_init() -> Cap<ProcessIdentity> {
+        bootstrap_init_process(AddressSpace::new_cap_for_platform::<TestPmap>().expect("aspace"))
+            .expect("init")
+    }
+
+    fn leader(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
+        let payload = proc_cap.payload.lock();
+        let payload = payload.as_ref().expect("alive");
+        let threads = payload.threads.lock();
+        threads[0].clone()
+    }
+
+    // ----- pure: default_action + summary packing -----
+
+    #[test]
+    fn default_action_table_matches_spec() {
+        assert_eq!(default_action(Signum::SIGTERM), DefaultAction::Term);
+        assert_eq!(default_action(Signum::SIGINT), DefaultAction::Term);
+        assert_eq!(default_action(Signum::SIGKILL), DefaultAction::Term);
+        assert_eq!(default_action(Signum::SIGQUIT), DefaultAction::Core);
+        assert_eq!(default_action(Signum::SIGSEGV), DefaultAction::Core);
+        assert_eq!(default_action(Signum::SIGCHLD), DefaultAction::Ignore);
+        assert_eq!(default_action(Signum::SIGSTOP), DefaultAction::Stop);
+        assert_eq!(default_action(Signum::SIGTSTP), DefaultAction::Stop);
+        assert_eq!(default_action(Signum::SIGCONT), DefaultAction::Cont);
+    }
+
+    #[test]
+    fn interrupt_summary_pack_unpack_round_trip() {
+        let cases = [
+            InterruptSummary::EMPTY,
+            InterruptSummary {
+                deliverable_signal: true,
+                ..InterruptSummary::EMPTY
+            },
+            InterruptSummary {
+                termination: true,
+                ..InterruptSummary::EMPTY
+            },
+            InterruptSummary {
+                stop_requested: true,
+                ..InterruptSummary::EMPTY
+            },
+            InterruptSummary {
+                deliverable_signal: true,
+                termination: true,
+                stop_requested: true,
+            },
+        ];
+        for case in cases {
+            assert_eq!(InterruptSummary::unpack(case.pack()), case);
+        }
+    }
+
+    // ----- select_next_signal -----
+
+    #[test]
+    fn select_picks_lowest_signum_from_thread_pending() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+        post_signal(&leader, Signum::SIGTERM);
+        post_signal(&leader, Signum::SIGINT);
+        post_signal(&leader, Signum::SIGCHLD);
+
+        // SIGINT (2) beats SIGTERM (15) and SIGCHLD (17).
+        assert_eq!(
+            select_next_signal(&leader),
+            Some((Signum::SIGINT, PendingSource::Thread))
+        );
+    }
+
+    #[test]
+    fn select_skips_masked_signals() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+        post_signal(&leader, Signum::SIGINT);
+        post_signal(&leader, Signum::SIGTERM);
+
+        let mut block = SignalMask::EMPTY;
+        block.block(Signum::SIGINT);
+        let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
+
+        // SIGINT is now masked; SIGTERM is the next deliverable.
+        assert_eq!(
+            select_next_signal(&leader),
+            Some((Signum::SIGTERM, PendingSource::Thread))
+        );
+    }
+
+    #[test]
+    fn select_prefers_thread_pending_over_group_pending() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        // SIGTERM on thread queue, SIGINT on group queue. Thread
+        // priority means SIGTERM wins despite higher signum.
+        post_signal(&leader, Signum::SIGTERM);
+        proc_cap
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .group_pending()
+            .post(Signum::SIGINT);
+
+        assert_eq!(
+            select_next_signal(&leader),
+            Some((Signum::SIGTERM, PendingSource::Thread))
+        );
+    }
+
+    #[test]
+    fn select_returns_none_when_all_masked_or_empty() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        // Empty: None.
+        assert_eq!(select_next_signal(&leader), None);
+
+        // All masked: None.
+        post_signal(&leader, Signum::SIGINT);
+        let mut block = SignalMask::EMPTY;
+        block.block(Signum::SIGINT);
+        let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
+        assert_eq!(select_next_signal(&leader), None);
+    }
+
+    #[test]
+    fn select_falls_through_to_group_pending_when_thread_empty() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        proc_cap
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .group_pending()
+            .post(Signum::SIGTERM);
+
+        assert_eq!(
+            select_next_signal(&leader),
+            Some((Signum::SIGTERM, PendingSource::Group))
+        );
+    }
+
+    // ----- ast_check matrix -----
+
+    #[test]
+    fn ast_check_continue_when_no_pending() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+        assert_eq!(ast_check(&leader), AstOutcome::Continue);
+    }
+
+    #[test]
+    fn ast_check_initiate_termination_for_summary_termination_bit() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        // Posting SIGKILL sets summary.termination via post_signal's
+        // contract; ast_check observes and returns InitiateTermination.
+        let _ = step_kill_process(&proc_cap, Signum::SIGKILL);
+        assert_eq!(ast_check(&leader), AstOutcome::InitiateTermination);
+    }
+
+    #[test]
+    fn ast_check_default_terminate_for_sigterm() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        post_signal(&leader, Signum::SIGTERM);
+        assert_eq!(
+            ast_check(&leader),
+            AstOutcome::DefaultTerminate {
+                sig: Signum::SIGTERM
+            }
+        );
+    }
+
+    #[test]
+    fn ast_check_default_ignore_for_sigchld_drops_and_continues() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        post_signal(&leader, Signum::SIGCHLD);
+        assert_eq!(ast_check(&leader), AstOutcome::Continue);
+        // SIGCHLD was dequeued during the loop, even though dropped.
+        let pending = leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .pending()
+            .is_pending(Signum::SIGCHLD);
+        assert!(!pending);
+    }
+
+    #[test]
+    fn ast_check_default_stop_for_sigtstp() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        post_signal(&leader, Signum::SIGTSTP);
+        assert_eq!(
+            ast_check(&leader),
+            AstOutcome::DefaultStop {
+                sig: Signum::SIGTSTP
+            }
+        );
+    }
+
+    #[test]
+    fn ast_check_default_continue_for_sigcont() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        post_signal(&leader, Signum::SIGCONT);
+        assert_eq!(
+            ast_check(&leader),
+            AstOutcome::DefaultContinue {
+                sig: Signum::SIGCONT
+            }
+        );
+    }
+
+    #[test]
+    fn ast_check_deliver_handler_when_handler_installed() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xCAFE));
+        post_signal(&leader, Signum::SIGTERM);
+
+        assert_eq!(
+            ast_check(&leader),
+            AstOutcome::DeliverHandler {
+                sig: Signum::SIGTERM,
+                handler: 0xCAFE,
+            }
+        );
+    }
+
+    #[test]
+    fn ast_check_silent_ignore_disposition_drops_and_continues() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Ignore);
+        post_signal(&leader, Signum::SIGTERM);
+
+        // Ignore disposition: the loop dequeues + drops, then sees an
+        // empty queue and returns Continue.
+        assert_eq!(ast_check(&leader), AstOutcome::Continue);
+    }
+
+    // ----- summary maintenance -----
+
+    #[test]
+    fn post_signal_marks_deliverable_when_unmasked() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        let summary_before = leader.payload.lock().as_ref().unwrap().interrupt_summary();
+        assert!(!summary_before.deliverable_signal);
+
+        post_signal(&leader, Signum::SIGINT);
+
+        let summary_after = leader.payload.lock().as_ref().unwrap().interrupt_summary();
+        assert!(summary_after.deliverable_signal);
+    }
+
+    #[test]
+    fn post_signal_skips_summary_deliverable_when_masked() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        // Block SIGINT first.
+        let mut block = SignalMask::EMPTY;
+        block.block(Signum::SIGINT);
+        let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
+
+        post_signal(&leader, Signum::SIGINT);
+
+        let summary = leader.payload.lock().as_ref().unwrap().interrupt_summary();
+        assert!(
+            !summary.deliverable_signal,
+            "masked signals must not set deliverable bit"
+        );
+    }
+
+    #[test]
+    fn sigprocmask_unblock_sets_deliverable_for_already_pending() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        // Block SIGINT, post it (deliverable stays false), then
+        // unblock — sigprocmask should re-set deliverable.
+        let mut block = SignalMask::EMPTY;
+        block.block(Signum::SIGINT);
+        let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
+        post_signal(&leader, Signum::SIGINT);
+        assert!(
+            !leader
+                .payload
+                .lock()
+                .as_ref()
+                .unwrap()
+                .interrupt_summary()
+                .deliverable_signal
+        );
+
+        let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, SignalMask::EMPTY);
+
+        assert!(
+            leader
+                .payload
+                .lock()
+                .as_ref()
+                .unwrap()
+                .interrupt_summary()
+                .deliverable_signal
+        );
+    }
+
+    #[test]
+    fn sigkill_post_sets_summary_termination() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        let _ = step_kill_process(&proc_cap, Signum::SIGKILL);
+
+        let summary = leader.payload.lock().as_ref().unwrap().interrupt_summary();
+        assert!(summary.termination, "SIGKILL must set termination");
+        // SIGKILL is uncatchable so the mask doesn't apply; deliverable
+        // is also set to mark "wake any interruptible waits".
+        assert!(summary.deliverable_signal);
+    }
+
+    #[test]
+    fn sigstop_post_sets_summary_stop_requested() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        post_signal(&leader, Signum::SIGSTOP);
+
+        let summary = leader.payload.lock().as_ref().unwrap().interrupt_summary();
+        assert!(summary.stop_requested);
+    }
+
+    #[test]
+    fn sigcont_post_clears_stop_requested() {
+        let _g = setup();
+        let proc_cap = fresh_init();
+        let leader = leader(&proc_cap);
+
+        post_signal(&leader, Signum::SIGTSTP);
+        assert!(
+            leader
+                .payload
+                .lock()
+                .as_ref()
+                .unwrap()
+                .interrupt_summary()
+                .stop_requested
+        );
+
+        post_signal(&leader, Signum::SIGCONT);
+        assert!(
+            !leader
+                .payload
+                .lock()
+                .as_ref()
+                .unwrap()
+                .interrupt_summary()
+                .stop_requested
+        );
+    }
+}
