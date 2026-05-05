@@ -8,5 +8,5 @@ Active replacements:
 
 - `CONCEPTS_v3.md` -> [`../CONCEPTS_v4.md`](../CONCEPTS_v4.md)
 - `INVARIANTS_v3_3.md` -> [`../INVARIANTS_v4.md`](../INVARIANTS_v4.md)
-- `ADR-resolution-half_v2.md` -> future `OBJECT_MODEL_v3.md`; current source material remains [`../object_model_v2.md`](../object_model_v2.md)
+- `ADR-resolution-half_v2.md` -> No successor planned; `object_model_v2.md` remains current. Source material remains [`../object_model_v2.md`](../object_model_v2.md)
 - `LIVENESS_v2.1.md` -> future `PROJECTION_CATALOG_v1.md`; projection rules are currently enforced by [`../INVARIANTS_v4.md`](../INVARIANTS_v4.md)
