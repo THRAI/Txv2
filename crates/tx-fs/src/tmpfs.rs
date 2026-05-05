@@ -1,0 +1,796 @@
+//! tmpfs — in-memory filesystem backed by anonymous PageContainers.
+//!
+//! Phase 3b deliverable. Provides the rootfs over which devfs is
+//! mounted at `/dev` and the surface every subsequent VFS workload
+//! lands on before a real on-disk filesystem exists.
+//!
+//! Active-doc anchors:
+//! - `txdoc:VFS-CHECKS-MOUNT-BOUNDARY-DISCIPLINE-1`
+//!   (`docs/design/05_filesystem/VFS_CHECKS_V2.1.md`) — tmpfs is a
+//!   distinct `FsOps` instance, never aliasing another mount's
+//!   namespace.
+//! - `txdoc:MOUNT-MOUNTPAYLOAD-1`,
+//!   `txdoc:MOUNT-STEP-MOUNT-COMMIT-ORDERING-1`
+//!   (`docs/design/05_filesystem/MOUNT_v1.md`) — `MountOutput` shape
+//!   tmpfs hands to `MountIdentity::new_cap`.
+//! - `txdoc:PAGE-BACKED-ANON-1`
+//!   (`docs/design/03_memory-vm/PAGE_BACKED_v1.md`) — regular files
+//!   use `PageContainerKind::Anon { swap_policy: Reclaimable }`,
+//!   reclaim-eligible per spec.
+
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use tx_substrate::zone::Cap;
+use tx_subsystems::execution::{Errno, Guard, StepOutcome};
+use tx_subsystems::page_backed::{
+    step_truncate, AnonSwapPolicy, Frame, FsPageBacking, MaterializeAccess, PageContainer,
+    PageContainerKind, PageIndex,
+};
+use tx_subsystems::vfs::{
+    Credential, DirCursor, DirEntry, FsObjectId, FsOps, InlineName, InodeKind, InodeMeta,
+    MountOutput, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, VFS_NAME_MAX,
+};
+
+/// Minimal spin-mutex for tmpfs's in-memory state. Mirrors the shape
+/// of `tx_subsystems::sync::SpinMutex` but is local to tx-fs because
+/// the subsystems' version is `pub(crate)` (it gates internal lock
+/// discipline and is not part of the cross-crate vocabulary). The
+/// substrate crate does not yet expose a public mutex primitive; once
+/// it does, tmpfs should migrate to that and this shim should go
+/// away. tmpfs's call sites are short and never `.await` while the
+/// lock is held, so a tiny TAS spinlock is sufficient.
+struct SpinMutex<T> {
+    locked: AtomicBool,
+    value: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for SpinMutex<T> {}
+unsafe impl<T: Send> Sync for SpinMutex<T> {}
+
+impl<T> SpinMutex<T> {
+    const fn new(value: T) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    fn lock(&self) -> SpinMutexGuard<'_, T> {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        SpinMutexGuard { mutex: self }
+    }
+}
+
+struct SpinMutexGuard<'a, T> {
+    mutex: &'a SpinMutex<T>,
+}
+
+impl<T> Deref for SpinMutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.mutex.value.get() }
+    }
+}
+
+impl<T> DerefMut for SpinMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.mutex.value.get() }
+    }
+}
+
+impl<T> Drop for SpinMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.mutex.locked.store(false, Ordering::Release);
+    }
+}
+
+/// Mode for the tmpfs root directory.
+pub const TMPFS_ROOT_MODE: u16 = S_IFDIR | 0o755;
+
+/// `FsObjectId::ROOT == 1` is the reserved sentinel; tmpfs hands out
+/// 2 onward (root inode is 2). See plan §"tmpfs FsOps surface".
+pub const TMPFS_ROOT_OBJECT_ID: FsObjectId = FsObjectId::new(2);
+
+/// First object-id available for non-root tmpfs allocations.
+const TMPFS_FIRST_FREE_OBJECT_ID: u64 = 3;
+
+/// Maximum page count a tmpfs regular file can grow to. Phase 3b's
+/// `PageContainer::new` requires a fixed `page_count` capacity at
+/// allocation time (see `PageContainer::check_bounds`); tmpfs files
+/// are created with this cap and `size_bytes` grows lazily through
+/// `step_write` / `step_truncate`. 4 MiB ÷ 4 KiB pages is enough for
+/// every Phase 3b workload (init's preopened fds plus the test fixtures);
+/// raising the cap is a backward-compatible follow-up once a sparse
+/// page-count growth shape lands.
+// TODO(phase-vfs-tmpfs-grow): teach `PageContainer` to grow `page_count`
+// on demand so tmpfs files are bounded only by global swap pressure
+// rather than by this static cap.
+const TMPFS_FILE_PAGE_CAP: u64 = 1024;
+
+/// Maximum length of an inline symlink target, in bytes.
+///
+/// tmpfs stores symlink targets inline; the cap matches `VFS_NAME_MAX`
+/// since any longer target would not fit through `lookup`'s `&[u8]`
+/// component anyway. Per the plan §"FsOps::symlink".
+pub const TMPFS_SYMLINK_MAX: usize = VFS_NAME_MAX;
+
+/// Owned name key for tmpfs's directory BTreeMap.
+///
+/// `InlineName` lacks `Ord` (it's a fixed-size buffer with no obvious
+/// canonical ordering), so tmpfs keys directories by an owned `Vec<u8>`
+/// of the name's bytes. Lookups round-trip through `InlineName::new`
+/// for validation and then drop into the byte-vector key. Once
+/// `InlineName` grows `Ord` upstream, this can flip back to the
+/// inline shape without changing the public surface.
+type TmpfsName = Vec<u8>;
+
+fn tmpfs_name_from(name: &[u8]) -> TmpfsName {
+    name.to_vec()
+}
+
+/// Per-inode payload. Variants line up with the inode kinds tmpfs
+/// supports today. Block-device, fifo, and socket variants are not
+/// yet in scope; `create_inode` rejects those modes with `EINVAL`.
+enum TmpfsPayload {
+    /// Directory: child name → inode id.
+    Directory(BTreeMap<TmpfsName, FsObjectId>),
+    /// Regular file: anon `PageContainer` plus the visible byte size.
+    /// `size` tracks the externally-visible size (POSIX `st_size`),
+    /// which is what `serialize_inode_meta` and `truncate` mutate.
+    RegularFile {
+        container: Cap<PageContainer>,
+        size: u64,
+    },
+    /// Symlink: target bytes stored inline. The bytes are observed
+    /// through `readlink`-style paths (deferred — Phase 3b only
+    /// surfaces creation), so the variant currently appears unread.
+    #[allow(dead_code)]
+    Symlink(Vec<u8>),
+}
+
+/// One inode entry. Stored inside `TmpfsState::inodes`, keyed by id.
+struct TmpfsInode {
+    meta: InodeMeta,
+    payload: TmpfsPayload,
+}
+
+struct TmpfsState {
+    inodes: BTreeMap<FsObjectId, TmpfsInode>,
+}
+
+impl TmpfsState {
+    fn new() -> Self {
+        let mut inodes = BTreeMap::new();
+        inodes.insert(
+            TMPFS_ROOT_OBJECT_ID,
+            TmpfsInode {
+                meta: InodeMeta::new(InodeKind::Directory, TMPFS_ROOT_MODE),
+                payload: TmpfsPayload::Directory(BTreeMap::new()),
+            },
+        );
+        Self { inodes }
+    }
+}
+
+/// In-memory tmpfs backend.
+///
+/// Holds the inode table plus a monotonic id allocator. One instance
+/// per mount; the `ROOT_MOUNT` slot in `tx-kernel`'s init keeps a
+/// strong `Arc<dyn FsOps>` and `Arc<dyn FsPageBacking>` against the
+/// same `Tmpfs` so both trait objects observe the same state.
+pub struct Tmpfs {
+    state: SpinMutex<TmpfsState>,
+    next_object_id: AtomicU64,
+}
+
+impl Tmpfs {
+    pub fn new() -> Self {
+        Self {
+            state: SpinMutex::new(TmpfsState::new()),
+            next_object_id: AtomicU64::new(TMPFS_FIRST_FREE_OBJECT_ID),
+        }
+    }
+
+    /// Convenience factory matching the `MountOutput` shape Phase 3b
+    /// hands to `MountIdentity::new_cap`. Two factories rather than
+    /// one `Arc<Self>` + two `Arc::clone` calls so the call site at
+    /// `init.rs` reads identically to devfs's pattern.
+    pub fn fs_ops_arc(self: Arc<Self>) -> Arc<dyn FsOps> {
+        self
+    }
+
+    pub fn fs_page_backing_arc(self: Arc<Self>) -> Arc<dyn FsPageBacking> {
+        self
+    }
+
+    /// Materialise the tmpfs root and return the `MountOutput` ready
+    /// for `MountIdentity::new_cap`. Per the plan §"tmpfs root
+    /// materialisation": `root_fs_object_id = FsObjectId::new(2)`,
+    /// `root_inode_meta = <S_IFDIR | 0o755>`.
+    ///
+    /// Returns `(tmpfs, mount_output)` so the caller retains an
+    /// `Arc<Tmpfs>` if it wants to consult the backend directly
+    /// (tx-kernel uses this to `mkdir("/dev")` against the same
+    /// instance the mount payload exposes).
+    pub fn new_root() -> (Arc<Self>, MountOutput) {
+        let tmpfs: Arc<Self> = Arc::new(Self::new());
+        let fs_ops: Arc<dyn FsOps> = tmpfs.clone();
+        let fs_page_backing: Arc<dyn FsPageBacking> = tmpfs.clone();
+        let output = MountOutput {
+            fs_ops,
+            fs_page_backing,
+            root_fs_object_id: TMPFS_ROOT_OBJECT_ID,
+            root_inode_meta: InodeMeta::new(InodeKind::Directory, TMPFS_ROOT_MODE),
+        };
+        (tmpfs, output)
+    }
+
+    fn alloc_object_id(&self) -> FsObjectId {
+        let raw = self.next_object_id.fetch_add(1, Ordering::AcqRel);
+        FsObjectId::new(raw)
+    }
+}
+
+impl Default for Tmpfs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FsOps for Tmpfs {
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<FsObjectId> {
+        // `InlineName::new` is the canonical name-validity check
+        // (rejects empty, oversized, or `/` -bearing names). We
+        // discard the returned inline value and key the directory
+        // BTreeMap by the underlying byte vector — see `TmpfsName`.
+        if let Err(err) = InlineName::new(name) {
+            return StepOutcome::Err(err);
+        }
+        let inline = tmpfs_name_from(name);
+        let state = self.state.lock();
+        let Some(parent_inode) = state.inodes.get(&parent) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let TmpfsPayload::Directory(children) = &parent_inode.payload else {
+            return StepOutcome::Err(Errno::ENOTDIR);
+        };
+        match children.get(&inline) {
+            Some(id) => StepOutcome::Done(*id),
+            None => StepOutcome::Err(Errno::ENOENT),
+        }
+    }
+
+    fn load_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<InodeMeta> {
+        let state = self.state.lock();
+        match state.inodes.get(&fs_object_id) {
+            Some(inode) => {
+                let mut meta = inode.meta;
+                if let TmpfsPayload::RegularFile { size, .. } = &inode.payload {
+                    meta.size = *size;
+                }
+                StepOutcome::Done(meta)
+            }
+            None => StepOutcome::Err(Errno::ENOENT),
+        }
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: &InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        let mut state = self.state.lock();
+        let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        // Preserve the IFMT bits from the existing meta — the kind is
+        // determined at create time and must not be mutated through
+        // chmod/serialize. The spec rule
+        // (`docs/design/05_filesystem/VFS_CHECKS_V2.1.md` §inode-meta)
+        // is that mode bits below S_IFMT are caller-mutable, but the
+        // type bits are immutable.
+        let existing_kind_bits = inode.meta.mode & S_IFMT;
+        let new_meta = InodeMeta {
+            mode: (meta.mode & !S_IFMT) | existing_kind_bits,
+            ..*meta
+        };
+        inode.meta = new_meta;
+        StepOutcome::Done(())
+    }
+
+    fn create_inode(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
+        // `InlineName::new` is the canonical name-validity check
+        // (rejects empty, oversized, or `/` -bearing names). We
+        // discard the returned inline value and key the directory
+        // BTreeMap by the underlying byte vector — see `TmpfsName`.
+        if let Err(err) = InlineName::new(name) {
+            return StepOutcome::Err(err);
+        }
+        let inline = tmpfs_name_from(name);
+        // Day-1 tmpfs only handles regular files via `create_inode`.
+        // Directories arrive through `mkdir`, symlinks through
+        // `symlink`. Reject anything else with `EINVAL`.
+        let kind_bits = mode & S_IFMT;
+        if kind_bits != 0 && kind_bits != S_IFREG {
+            return StepOutcome::Err(Errno::EINVAL);
+        }
+        let mode = (mode & !S_IFMT) | S_IFREG;
+
+        let container = match PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            TMPFS_FILE_PAGE_CAP,
+        ) {
+            Ok(cap) => cap,
+            Err(_) => return StepOutcome::Err(Errno::ENOMEM),
+        };
+
+        let new_id = self.alloc_object_id();
+        let mut meta = InodeMeta::new(InodeKind::Regular, mode);
+        meta.uid = cred.uid;
+        meta.gid = cred.gid;
+        meta.size = 0;
+
+        let mut state = self.state.lock();
+        let Some(parent_inode) = state.inodes.get_mut(&parent) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
+            return StepOutcome::Err(Errno::ENOTDIR);
+        };
+        if children.contains_key(&inline) {
+            // POSIX `EEXIST`. The day-1 `Errno` enum (see
+            // `crates/tx-subsystems/src/execution.rs`) doesn't yet
+            // have a dedicated `EEXIST`; `EINVAL` is the closest
+            // mapping that the syscall driver can normalise later.
+            // TODO(phase-vfs-errno-eexist): widen `Errno` so name
+            // collisions surface their real POSIX errno.
+            return StepOutcome::Err(Errno::EINVAL);
+        }
+        children.insert(inline, new_id);
+
+        state.inodes.insert(
+            new_id,
+            TmpfsInode {
+                meta,
+                payload: TmpfsPayload::RegularFile { container, size: 0 },
+            },
+        );
+
+        StepOutcome::Done((new_id, meta))
+    }
+
+    fn unlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        // `InlineName::new` is the canonical name-validity check
+        // (rejects empty, oversized, or `/` -bearing names). We
+        // discard the returned inline value and key the directory
+        // BTreeMap by the underlying byte vector — see `TmpfsName`.
+        if let Err(err) = InlineName::new(name) {
+            return StepOutcome::Err(err);
+        }
+        let inline = tmpfs_name_from(name);
+        let mut state = self.state.lock();
+        let Some(parent_inode) = state.inodes.get_mut(&parent) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
+            return StepOutcome::Err(Errno::ENOTDIR);
+        };
+        let Some(found_id) = children.get(&inline).copied() else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        if found_id != target {
+            return StepOutcome::Err(Errno::ENOENT);
+        }
+        // Reject directory targets — those go through `rmdir`.
+        if let Some(target_inode) = state.inodes.get(&found_id) {
+            if matches!(target_inode.payload, TmpfsPayload::Directory(_)) {
+                return StepOutcome::Err(Errno::EISDIR);
+            }
+        }
+        let parent_inode = state
+            .inodes
+            .get_mut(&parent)
+            .expect("parent inode disappeared mid-unlink");
+        if let TmpfsPayload::Directory(children) = &mut parent_inode.payload {
+            children.remove(&inline);
+        }
+        state.inodes.remove(&found_id);
+        StepOutcome::Done(())
+    }
+
+    fn rename(
+        &self,
+        old_parent: FsObjectId,
+        old_name: &[u8],
+        new_parent: FsObjectId,
+        new_name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        // TODO(phase-vfs-rename-xdir): cross-directory rename. Day-1
+        // ships same-directory rename; cross-directory needs the
+        // walker + dentry rebinding seam to land first.
+        if old_parent != new_parent {
+            return StepOutcome::Err(Errno::ENOSYS);
+        }
+        if let Err(err) = InlineName::new(old_name) {
+            return StepOutcome::Err(err);
+        }
+        if let Err(err) = InlineName::new(new_name) {
+            return StepOutcome::Err(err);
+        }
+        let old_key = tmpfs_name_from(old_name);
+        let new_key = tmpfs_name_from(new_name);
+        if old_key == new_key {
+            return StepOutcome::Done(());
+        }
+
+        let mut state = self.state.lock();
+        let Some(parent_inode) = state.inodes.get_mut(&old_parent) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
+            return StepOutcome::Err(Errno::ENOTDIR);
+        };
+        let Some(target_id) = children.remove(&old_key) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        // If a file exists at the destination, replace it (POSIX
+        // rename semantics for same-type-collision; cross-type
+        // collision is left as a follow-up alongside cross-dir).
+        let displaced = children.insert(new_key, target_id);
+        if let Some(displaced_id) = displaced {
+            state.inodes.remove(&displaced_id);
+        }
+        StepOutcome::Done(())
+    }
+
+    fn link(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        // Hard links are out of scope for Phase 3b; tmpfs day-1 maps
+        // each child name to a single owning inode and refcounts via
+        // the parent's BTreeMap. Adding `link` requires a full nlink
+        // counter pass on `unlink`/`rmdir`/`destroy_inode`.
+        // TODO(phase-vfs-tmpfs-link): implement when nlink semantics
+        // land in the broader VFS layer.
+        StepOutcome::Err(Errno::ENOSYS)
+    }
+
+    fn mkdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
+        // `InlineName::new` is the canonical name-validity check
+        // (rejects empty, oversized, or `/` -bearing names). We
+        // discard the returned inline value and key the directory
+        // BTreeMap by the underlying byte vector — see `TmpfsName`.
+        if let Err(err) = InlineName::new(name) {
+            return StepOutcome::Err(err);
+        }
+        let inline = tmpfs_name_from(name);
+        let mode = (mode & !S_IFMT) | S_IFDIR;
+        let new_id = self.alloc_object_id();
+        let mut meta = InodeMeta::new(InodeKind::Directory, mode);
+        meta.uid = cred.uid;
+        meta.gid = cred.gid;
+
+        let mut state = self.state.lock();
+        let Some(parent_inode) = state.inodes.get_mut(&parent) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
+            return StepOutcome::Err(Errno::ENOTDIR);
+        };
+        if children.contains_key(&inline) {
+            // See `create_inode`: `EINVAL` is the day-1 mapping for
+            // POSIX `EEXIST` until `Errno` gains the variant.
+            return StepOutcome::Err(Errno::EINVAL);
+        }
+        children.insert(inline, new_id);
+
+        state.inodes.insert(
+            new_id,
+            TmpfsInode {
+                meta,
+                payload: TmpfsPayload::Directory(BTreeMap::new()),
+            },
+        );
+
+        StepOutcome::Done((new_id, meta))
+    }
+
+    fn rmdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        // `InlineName::new` is the canonical name-validity check
+        // (rejects empty, oversized, or `/` -bearing names). We
+        // discard the returned inline value and key the directory
+        // BTreeMap by the underlying byte vector — see `TmpfsName`.
+        if let Err(err) = InlineName::new(name) {
+            return StepOutcome::Err(err);
+        }
+        let inline = tmpfs_name_from(name);
+        let mut state = self.state.lock();
+        let Some(target_inode) = state.inodes.get(&target) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let TmpfsPayload::Directory(target_children) = &target_inode.payload else {
+            return StepOutcome::Err(Errno::ENOTDIR);
+        };
+        if !target_children.is_empty() {
+            // POSIX `ENOTEMPTY`. The day-1 `Errno` enum lacks the
+            // variant; `EBUSY` is the closest substitute (the
+            // directory is "busy" with children). TODO(phase-vfs
+            // -errno-enotempty): map to a real `ENOTEMPTY` once
+            // `Errno` widens.
+            return StepOutcome::Err(Errno::EBUSY);
+        }
+
+        let Some(parent_inode) = state.inodes.get_mut(&parent) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
+            return StepOutcome::Err(Errno::ENOTDIR);
+        };
+        let Some(found_id) = children.get(&inline).copied() else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        if found_id != target {
+            return StepOutcome::Err(Errno::ENOENT);
+        }
+        children.remove(&inline);
+        state.inodes.remove(&found_id);
+        StepOutcome::Done(())
+    }
+
+    fn symlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        link_target: &[u8],
+        cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
+        if link_target.is_empty() || link_target.len() > TMPFS_SYMLINK_MAX {
+            return StepOutcome::Err(Errno::ENAMETOOLONG);
+        }
+        // `InlineName::new` is the canonical name-validity check
+        // (rejects empty, oversized, or `/` -bearing names). We
+        // discard the returned inline value and key the directory
+        // BTreeMap by the underlying byte vector — see `TmpfsName`.
+        if let Err(err) = InlineName::new(name) {
+            return StepOutcome::Err(err);
+        }
+        let inline = tmpfs_name_from(name);
+        let new_id = self.alloc_object_id();
+        let mut meta = InodeMeta::new(InodeKind::Symlink, S_IFLNK | 0o777);
+        meta.uid = cred.uid;
+        meta.gid = cred.gid;
+        meta.size = link_target.len() as u64;
+
+        let mut state = self.state.lock();
+        let Some(parent_inode) = state.inodes.get_mut(&parent) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
+            return StepOutcome::Err(Errno::ENOTDIR);
+        };
+        if children.contains_key(&inline) {
+            // See `create_inode`: `EINVAL` stands in for POSIX
+            // `EEXIST` until `Errno` widens.
+            return StepOutcome::Err(Errno::EINVAL);
+        }
+        children.insert(inline, new_id);
+
+        let mut target = Vec::with_capacity(link_target.len());
+        target.extend_from_slice(link_target);
+        state.inodes.insert(
+            new_id,
+            TmpfsInode {
+                meta,
+                payload: TmpfsPayload::Symlink(target),
+            },
+        );
+
+        StepOutcome::Done((new_id, meta))
+    }
+
+    fn readdir(
+        &self,
+        fs_object_id: FsObjectId,
+        cursor: DirCursor,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
+        let state = self.state.lock();
+        let Some(parent_inode) = state.inodes.get(&fs_object_id) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let TmpfsPayload::Directory(children) = &parent_inode.payload else {
+            return StepOutcome::Err(Errno::ENOTDIR);
+        };
+        let index = cursor.as_u64() as usize;
+        let Some((name, child_id)) = children.iter().nth(index) else {
+            return StepOutcome::Done(None);
+        };
+        // Resolve child kind for the DirEntry by peeking the child
+        // inode's meta. Falls back to Regular if the child is missing
+        // (a state inconsistency we shouldn't observe in practice).
+        let kind = state
+            .inodes
+            .get(child_id)
+            .map(|child| child.meta.kind())
+            .unwrap_or(InodeKind::Regular);
+        let entry = match DirEntry::new(*child_id, kind, name.as_slice()) {
+            Ok(e) => e,
+            Err(err) => return StepOutcome::Err(err),
+        };
+        StepOutcome::Done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
+    }
+
+    fn destroy_inode(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
+        // The plan calls for `destroy_inode` to drop the inode entry;
+        // the regular-file `Cap<PageContainer>` falls when the
+        // owning `TmpfsInode` is dropped, releasing all anon pages
+        // through the standard PageContainer drop path. `unlink` /
+        // `rmdir` already remove the inode in the same step they
+        // unhook the dentry; the VFS layer also calls `destroy_inode`
+        // when the last RNode reference falls. Treat a missing entry
+        // as a successful no-op so the upper layer can drop without
+        // observing an error.
+        let mut state = self.state.lock();
+        state.inodes.remove(&fs_object_id);
+        StepOutcome::Done(())
+    }
+}
+
+impl FsPageBacking for Tmpfs {
+    fn fetch_page(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<Frame> {
+        let state = self.state.lock();
+        let Some(inode) = state.inodes.get(&fs_object_id) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let container = match &inode.payload {
+            TmpfsPayload::RegularFile { container, .. } => container.clone(),
+            TmpfsPayload::Directory(_) => return StepOutcome::Err(Errno::EISDIR),
+            TmpfsPayload::Symlink(_) => return StepOutcome::Err(Errno::EINVAL),
+        };
+        drop(state);
+
+        let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+        if offset % page_size != 0 {
+            return StepOutcome::Err(Errno::EINVAL);
+        }
+        let page_index = PageIndex::new(offset / page_size);
+        match container.materialize_page(page_index, MaterializeAccess::Read, guard) {
+            StepOutcome::Done(materialized) => StepOutcome::Done(Frame::new(materialized.ppn)),
+            StepOutcome::Advanced(materialized) => {
+                StepOutcome::Advanced(Frame::new(materialized.ppn))
+            }
+            StepOutcome::AdvancedThenBlocked(materialized, token) => {
+                StepOutcome::AdvancedThenBlocked(Frame::new(materialized.ppn), token)
+            }
+            StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
+            StepOutcome::Err(errno) => StepOutcome::Err(errno),
+        }
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _frame: &Frame,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        // tmpfs is in-memory: there is no underlying durable store to
+        // sync. Returning `Done(())` short-circuits `step_fsync`'s
+        // dirty-page walk to a no-op, per the plan §"FsPageBacking".
+        StepOutcome::Done(())
+    }
+
+    fn truncate(
+        &self,
+        fs_object_id: FsObjectId,
+        new_size: u64,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        // Snapshot the container under the state lock, then call
+        // `step_truncate` outside it: the page-backed lifecycle path
+        // takes its own internal lock, and we must not stack lock
+        // domains.
+        let container = {
+            let state = self.state.lock();
+            let Some(inode) = state.inodes.get(&fs_object_id) else {
+                return StepOutcome::Err(Errno::ENOENT);
+            };
+            match &inode.payload {
+                TmpfsPayload::RegularFile { container, .. } => container.clone(),
+                TmpfsPayload::Directory(_) => return StepOutcome::Err(Errno::EISDIR),
+                TmpfsPayload::Symlink(_) => return StepOutcome::Err(Errno::EINVAL),
+            }
+        };
+
+        match step_truncate(&container, new_size, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+            StepOutcome::Blocked(token) => return StepOutcome::Blocked(token),
+            StepOutcome::AdvancedThenBlocked((), token) => {
+                return StepOutcome::AdvancedThenBlocked((), token);
+            }
+            StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+        }
+
+        // Update the visible size in the inode payload + meta. The
+        // `meta.size` field is recomputed from `payload.size` on every
+        // `load_inode_meta`, so updating the payload is sufficient,
+        // but we also normalize the cached meta for any caller that
+        // reads `inode.meta` directly.
+        let mut state = self.state.lock();
+        if let Some(inode) = state.inodes.get_mut(&fs_object_id) {
+            if let TmpfsPayload::RegularFile { size, .. } = &mut inode.payload {
+                *size = new_size;
+            }
+            inode.meta.size = new_size;
+        }
+        StepOutcome::Done(())
+    }
+
+    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
+        // In-memory; durability is trivially satisfied.
+        StepOutcome::Done(())
+    }
+}
+
+#[cfg(test)]
+mod tests;

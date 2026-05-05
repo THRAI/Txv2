@@ -6,10 +6,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+tx-fs = { path = "../tx-fs" }
 tx-hal = { path = "../tx-hal" }
 tx-reactor = { path = "../tx-reactor" }
 tx-substrate = { path = "../tx-substrate" }
 tx-subsystems = { path = "../tx-subsystems" }
+
+[dev-dependencies]
+# `test-support` opens `tx_subsystems::cross_crate_test_support`, which
+# the Phase 3b boot-wiring tests use to reset the global `INIT_PROCESS`
+# slot (and pid/tid counters) between runs. The same mechanism is
+# already used by Phase 2a's syscall-dispatch tests in `tx-shims`.
+tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }
 
 [lib]
 path = "src/lib.rs"

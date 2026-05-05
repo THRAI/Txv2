@@ -1,15 +1,170 @@
 use core::{
+    cell::UnsafeCell,
     marker::PhantomData,
-    sync::atomic::{AtomicU64, Ordering},
+    ops::{Deref, DerefMut},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
+use tx_substrate::zone::Cap;
+use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
+use tx_subsystems::execution::{Guard, StepOutcome};
+use tx_subsystems::mount::{
+    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
+};
+use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
+use tx_subsystems::tty::structure::TtyIdentity;
+use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNodeBacking};
 
 const AP_REACTOR_WAIT_SPINS: usize = 100_000;
 
 static BOOT_REACTOR: tx_reactor::SharedReactor = tx_reactor::SharedReactor::empty();
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
+
+/// Global root-mount slot. Populated by `mount_rootfs_tmpfs` after
+/// the process subsystem has bootstrapped. The slot retains a strong
+/// `Cap<MountIdentity>` for the kernel lifetime, mirroring
+/// `tx_subsystems::process::execution::INIT_PROCESS`.
+static ROOT_MOUNT: BootSpinMutex<Option<Cap<MountIdentity>>> = BootSpinMutex::new(None);
+
+/// Global devfs-mount slot. Populated by `mount_devfs_at_dev`.
+/// Retained alongside `ROOT_MOUNT` so the mount table remains live
+/// after `init_substrate_if_ready` returns.
+static DEV_MOUNT: BootSpinMutex<Option<Cap<MountIdentity>>> = BootSpinMutex::new(None);
+
+/// Global TTY identity for the boot console hardware. Populated by
+/// `register_console_hardware`; consulted by
+/// `register_devfs_console_alias` to publish `/dev/console`.
+static CONSOLE_TTY: BootSpinMutex<Option<Cap<TtyIdentity>>> = BootSpinMutex::new(None);
+
+/// Snapshot the boot-time root mount cap. Returns `None` until
+/// `mount_rootfs_tmpfs` has run (test pre-bootstrap or boot-time
+/// pre-mount). Pairs with `ROOT_MOUNT`'s strong-retainer slot so
+/// integration tests can observe the mount-table contents without
+/// reaching inside `init.rs`.
+pub fn root_mount() -> Option<Cap<MountIdentity>> {
+    ROOT_MOUNT.lock().clone()
+}
+
+/// Snapshot the boot-time devfs mount cap. Returns `None` until
+/// `mount_devfs_at_dev` has run.
+pub fn dev_mount() -> Option<Cap<MountIdentity>> {
+    DEV_MOUNT.lock().clone()
+}
+
+/// Snapshot the boot-time console TTY cap. Returns `None` until
+/// `register_console_hardware` has run.
+pub fn console_tty() -> Option<Cap<TtyIdentity>> {
+    CONSOLE_TTY.lock().clone()
+}
+
+#[cfg(test)]
+pub fn reset_boot_state_for_test() {
+    *ROOT_MOUNT.lock() = None;
+    *DEV_MOUNT.lock() = None;
+    *CONSOLE_TTY.lock() = None;
+}
+
+/// Minimal spin-mutex for boot-time global slots. Mirrors the
+/// `tx_subsystems::sync::SpinMutex` shape that `INIT_PROCESS` uses;
+/// we cannot reach the subsystems' version because it's `pub(crate)`,
+/// and the substrate crate does not yet expose a public mutex
+/// primitive. Boot code never `.await`s while holding the lock and
+/// mutates each slot at most twice (set during init, optionally
+/// cleared by `reset_boot_state_for_test`), so a tiny TAS spinlock is
+/// adequate.
+struct BootSpinMutex<T> {
+    locked: AtomicBool,
+    value: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for BootSpinMutex<T> {}
+unsafe impl<T: Send> Sync for BootSpinMutex<T> {}
+
+impl<T> BootSpinMutex<T> {
+    const fn new(value: T) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    fn lock(&self) -> BootSpinMutexGuard<'_, T> {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        BootSpinMutexGuard { mutex: self }
+    }
+}
+
+struct BootSpinMutexGuard<'a, T> {
+    mutex: &'a BootSpinMutex<T>,
+}
+
+impl<T> Deref for BootSpinMutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.mutex.value.get() }
+    }
+}
+
+impl<T> DerefMut for BootSpinMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.mutex.value.get() }
+    }
+}
+
+impl<T> Drop for BootSpinMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.mutex.locked.store(false, Ordering::Release);
+    }
+}
+
+/// Static `CharDeviceOps` impl that forwards `write` to
+/// `tx_hal::console_write_str::<P>` and `read` to a zero-byte stub.
+///
+/// `register_hardware` requires the binding's ops to live for
+/// `'static`, so the impl is a zero-sized type and we instantiate it
+/// once per platform via the `CONSOLE_BINDING` static below. The
+/// `read` arm returns `Done(0)` per the Phase 3b plan: the boot
+/// console is write-driven during the trio slice, and a real
+/// blocking read shape lands with input-driver work post-trio.
+struct ConsoleCharOps<P: TxPlatform> {
+    _platform: PhantomData<fn() -> P>,
+}
+
+impl<P: TxPlatform> ConsoleCharOps<P> {
+    const fn new() -> Self {
+        Self {
+            _platform: PhantomData,
+        }
+    }
+}
+
+// `ConsoleCharOps<P>` is always `Send + Sync` regardless of `P` because
+// `PhantomData<fn() -> P>` is a zero-sized fn-pointer marker that the
+// compiler treats as thread-safe. The impl therefore only needs the
+// `TxPlatform + 'static` bounds the binding actually consumes.
+impl<P: TxPlatform> CharDeviceOps for ConsoleCharOps<P> {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+        StepOutcome::Done(0)
+    }
+
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+        // The HAL exposes byte-oriented console writes; tx-kernel's
+        // existing init code uses `console_write_str` which calls
+        // `P::write_bytes` under the hood. We bypass the str
+        // adapter so non-UTF-8 bytes (e.g., raw control sequences)
+        // round-trip unchanged.
+        <P as tx_hal::ConsoleIf>::write_bytes(bytes);
+        StepOutcome::Done(bytes.len())
+    }
+}
 
 struct SmpRescheduleSignal<P: TxPlatform> {
     _platform: PhantomData<P>,
@@ -68,9 +223,36 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::run_bsp_reactor_timer_idle_smoke();
             Self::init_process_subsystem();
 
+            // ---- Phase 3b boot wiring ----
+            //
+            // Order invariants (per the trio plan §"Mount wiring at
+            // boot"):
+            // 1. `init_process_subsystem` runs first — every step
+            //    below assumes `INIT_PROCESS` is populated.
+            // 2. TTY hardware register **must** precede devfs mount
+            //    so the alias is visible at devfs lookup time.
+            // 3. Rootfs mount **must** precede devfs mount: devfs
+            //    needs a `/dev` directory entry on the rootfs to
+            //    mount onto.
+            // 4. The console alias must be re-published after devfs
+            //    is mounted (`mount_devfs_at_dev` enters a fresh
+            //    devfs registry observation window).
+            // 5. Init's cwd + fds 0/1/2 are bound last because they
+            //    consume the root dentry and the registered console
+            //    alias.
+            //
+            // Future moves of this block must preserve the order.
+            Self::register_console_hardware();
+            Self::mount_rootfs_tmpfs();
+            Self::mount_devfs_at_dev();
+            Self::register_devfs_console_alias();
+            Self::bind_init_cwd_and_root();
+
             // Deferred H4 spine slots:
             // - post-substrate init hooks
-            // - VFS before device init
+            // - VFS before device init (now partially landed via
+            //   tmpfs+devfs mount wiring above; full step_open / VFS
+            //   walker is deferred).
             // - post-device init hooks
             // - scheduler/userspace init
             //
@@ -96,6 +278,278 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":process:init:ok\n");
+    }
+
+    /// Register the boot console as a hardware TTY and stash its cap
+    /// in `CONSOLE_TTY` so subsequent steps can publish it under the
+    /// `/dev/console` devfs alias. Per `txdoc:TTY-THE-HARDWARE-
+    /// CONSOLE-PATH-1` (`docs/design/06_devices/TTY.md` §7).
+    ///
+    /// **Order invariant:** must precede `mount_devfs_at_dev`.
+    /// devfs's `lookup` resolves through `tty::project::resolve_devfs
+    /// _alias`, which only sees aliases that `register_hardware` has
+    /// already published into the TTY registry.
+    pub(crate) fn register_console_hardware() {
+        // The binding's `ops` need a `'static` lifetime; the platform-
+        // typed wrapper is itself `'static` because `P: 'static`.
+        // `CharDeviceBinding` is `Copy + 'static`, so we publish a
+        // single static binding per platform via a function-local
+        // `static` (each `CoreInit::<P>` instantiation gets its own
+        // copy at codegen time).
+        static CONSOLE_OPS: BootSpinMutex<()> = BootSpinMutex::new(());
+        let _serial = CONSOLE_OPS.lock();
+
+        // Allocate the ops + binding once and leak. `register_hardware`
+        // expects a `&'static CharDeviceBinding`; we must not free
+        // either the ops or the binding for the kernel lifetime.
+        // SAFETY: the `Box::leak` shape is the standard tx-fs pattern
+        // (see `crates/tx-fs/src/devfs/tests.rs` for the equivalent),
+        // and tx-kernel boots are one-shot (no re-entry).
+        // NB: tx-kernel is `no_std`, but we use `alloc::boxed::Box`
+        // because the global allocator is initialised by the time
+        // `init_process_subsystem` returns.
+        use alloc::boxed::Box;
+        let ops_static: &'static ConsoleCharOps<P> =
+            Box::leak(Box::new(ConsoleCharOps::<P>::new()));
+        let binding: &'static CharDeviceBinding = Box::leak(Box::new(CharDeviceBinding {
+            // Major 5 / minor 1 mirrors Linux's
+            // `/dev/console`. Nothing in the trio depends on the
+            // exact devt; pick a stable pair.
+            devt: DevT::new(5, 1),
+            name: "console",
+            ops: ops_static,
+        }));
+
+        let guard = tx_substrate::epoch::guard();
+        let tty = match register_hardware("console", 0, binding, &guard) {
+            StepOutcome::Done(tty) => tty,
+            other => panic!("register_console_hardware: register_hardware failed: {other:?}"),
+        };
+        drop(guard);
+
+        *CONSOLE_TTY.lock() = Some(tty);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":tty:console:ok\n");
+    }
+
+    /// Mount tmpfs as the rootfs.
+    ///
+    /// Builds a fresh `Tmpfs` instance, hands it to `MountPayload`
+    /// + `MountIdentity::new_cap` (per
+    /// `txdoc:MOUNT-MOUNTPAYLOAD-1` /
+    /// `txdoc:MOUNT-STEP-MOUNT-COMMIT-ORDERING-1`,
+    /// `docs/design/05_filesystem/MOUNT_v1.md`), and stores the
+    /// resulting cap in `ROOT_MOUNT`. The mount has no parent and
+    /// no mountpoint dentry (it *is* the namespace root), per the
+    /// `MountIdentity::new_cap` shape that already accepts
+    /// `mountpoint: None` / `parent: None`.
+    ///
+    /// **Order invariant:** must precede `mount_devfs_at_dev`. The
+    /// rootfs supplies the directory `/dev` is mounted on top of.
+    pub(crate) fn mount_rootfs_tmpfs() {
+        let (_tmpfs, mount_output) = tx_fs::tmpfs::Tmpfs::new_root();
+        let payload = MountPayload::new_cap(
+            mount_output.fs_ops.clone(),
+            mount_output.fs_page_backing.clone(),
+            None,
+            // dev_id picks an arbitrary stable id for the rootfs
+            // mount; full DevId allocation is a follow-up.
+            DevId::new(1),
+            MountOptions::default(),
+            "tmpfs",
+            SourceLabel::Static("rootfs"),
+        )
+        .expect("mount_rootfs_tmpfs: payload reservation");
+
+        // Materialise the root RNode + DEntry. The root dentry
+        // carries `InlineName::ROOT` per
+        // `crates/tx-subsystems/src/vfs/structure.rs`'s root marker
+        // contract (path render emits a single `/` for empty-name
+        // dentries).
+        let root_rnode = RNode::new_cap(
+            mount_output.root_fs_object_id,
+            mount_output.root_inode_meta,
+            RNodeBacking::Directory,
+        )
+        .expect("mount_rootfs_tmpfs: root rnode reservation");
+        let _root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone())
+            .expect("mount_rootfs_tmpfs: root dentry reservation");
+
+        let mount = MountIdentity::new_cap(
+            // mount_id is opaque; pick a stable id for the rootfs
+            // (`MountId(1)`). Full mount-id allocation is a
+            // follow-up that does not affect the trio surface.
+            MountId::new(1),
+            None,
+            root_rnode,
+            None,
+            payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_rootfs_tmpfs: mount identity reservation");
+
+        *ROOT_MOUNT.lock() = Some(mount);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:rootfs:tmpfs:ok\n");
+    }
+
+    /// Mount devfs at `/dev`.
+    ///
+    /// Looks up the rootfs's `Tmpfs` backend through
+    /// `ROOT_MOUNT`'s `MountPayload::fs_ops` and calls `mkdir("/dev")`
+    /// against the root inode (`tmpfs.root_fs_object_id ==
+    /// FsObjectId::new(2)`). The resulting directory inode then
+    /// serves as the mountpoint for devfs.
+    ///
+    /// **Order invariant:** must follow `mount_rootfs_tmpfs` (needs
+    /// the rootfs DEntry) and precede `register_devfs_console_alias`
+    /// (the alias is republished after the mount publication so its
+    /// observation window matches devfs's).
+    pub(crate) fn mount_devfs_at_dev() {
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_devfs_at_dev: ROOT_MOUNT must be populated");
+
+        // mkdir("/dev") on the rootfs. The rootfs's fs_ops is the
+        // tmpfs instance whose `FsOps::mkdir` actually mutates the
+        // tmpfs directory map.
+        let guard = tx_substrate::epoch::guard();
+        let cred = Credential::default();
+        let (dev_object_id, dev_meta) = match root_mount.payload().fs_ops.mkdir(
+            tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+            b"dev",
+            0o755,
+            &cred,
+            &guard,
+        ) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mount_devfs_at_dev: tmpfs mkdir(/dev) failed: {other:?}"),
+        };
+        drop(guard);
+
+        // Build the `/dev` mountpoint DEntry on the rootfs.
+        let dev_rnode_in_root = RNode::new_cap(dev_object_id, dev_meta, RNodeBacking::Directory)
+            .expect("mount_devfs_at_dev: /dev rnode-on-rootfs reservation");
+        let dev_dentry_on_root = DEntry::new_cap(
+            InlineName::new(b"dev").expect("mount_devfs_at_dev: /dev inline name"),
+            dev_rnode_in_root,
+        )
+        .expect("mount_devfs_at_dev: /dev dentry-on-rootfs reservation");
+
+        // Build the devfs root RNode. devfs is stateless / static;
+        // its root meta is `S_IFDIR | 0o755` per Phase 3a.
+        let devfs_fs_ops = tx_fs::devfs::Devfs::fs_ops_arc();
+        let devfs_fs_page_backing = tx_fs::devfs::Devfs::fs_page_backing_arc();
+        let devfs_root_rnode = RNode::new_cap(
+            tx_fs::devfs::DEVFS_ROOT_OBJECT_ID,
+            InodeMeta::new(
+                tx_subsystems::vfs::InodeKind::Directory,
+                tx_fs::devfs::DEVFS_ROOT_MODE,
+            ),
+            RNodeBacking::Directory,
+        )
+        .expect("mount_devfs_at_dev: devfs root rnode reservation");
+
+        let devfs_payload = MountPayload::new_cap(
+            devfs_fs_ops,
+            devfs_fs_page_backing,
+            None,
+            DevId::new(2),
+            MountOptions::default(),
+            "devfs",
+            SourceLabel::Static("devfs"),
+        )
+        .expect("mount_devfs_at_dev: payload reservation");
+
+        let dev_mount = MountIdentity::new_cap(
+            MountId::new(2),
+            Some(dev_dentry_on_root),
+            devfs_root_rnode,
+            Some(root_mount),
+            devfs_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_devfs_at_dev: mount identity reservation");
+
+        *DEV_MOUNT.lock() = Some(dev_mount);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:devfs:ok\n");
+    }
+
+    /// Re-publish `console` under devfs's alias table.
+    ///
+    /// `register_hardware("console", ...)` already published the
+    /// alias once (see `register_console_hardware` and
+    /// `tty::structure::registry::register_devfs_alias`). Calling
+    /// `register_console_alias` here lets the trio plan's spec read
+    /// — devfs's `lookup` is what resolves `/dev/console`, and the
+    /// alias must be visible **after** `mount_devfs_at_dev` so any
+    /// follow-up code that re-binds the registry sees the same
+    /// snapshot devfs's lookup walks.
+    ///
+    /// **Order invariant:** runs after `mount_devfs_at_dev` and
+    /// before `bind_init_cwd_and_root` (which preopens
+    /// `/dev/console` for fds 0/1/2).
+    pub(crate) fn register_devfs_console_alias() {
+        let tty =
+            console_tty().expect("register_devfs_console_alias: console TTY must be registered");
+        match register_console_alias("console", tty) {
+            StepOutcome::Done(()) => {}
+            other => {
+                panic!("register_devfs_console_alias: register_console_alias failed: {other:?}")
+            }
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":devfs:alias:console:ok\n");
+    }
+
+    /// Install init's initial cwd at the rootfs root and preopen
+    /// fds 0/1/2 against `/dev/console`.
+    ///
+    /// Until VFS's `step_open` exists, the bootstrap helper
+    /// `tx_fs::devfs::open_console_for_init()` materialises an
+    /// `OpenFile` directly from the registered TTY (see
+    /// `crates/tx-fs/src/devfs.rs`'s docstring). Once the walker
+    /// lands, this becomes
+    /// `step_open("/dev/console", O_RDWR)` invoked from the same
+    /// helper.
+    ///
+    /// **Order invariant:** must run last; consumes the root
+    /// dentry, the `/dev/console` alias, and the `INIT_PROCESS`
+    /// slot all populated by earlier steps.
+    pub(crate) fn bind_init_cwd_and_root() {
+        let init = tx_subsystems::process::execution::init_process()
+            .expect("bind_init_cwd_and_root: INIT_PROCESS must be populated");
+
+        // Re-derive the root dentry from `ROOT_MOUNT.root` so the
+        // chdir target shares the same RNode the mount table
+        // exposes. We could have stashed the dentry from
+        // `mount_rootfs_tmpfs` directly, but going through the
+        // mount keeps the boot wiring spec-shaped: cwd is always
+        // a DEntry over a mount's root rnode.
+        let root_mount =
+            root_mount().expect("bind_init_cwd_and_root: ROOT_MOUNT must be populated");
+        let root_rnode = root_mount.root().clone();
+        let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode)
+            .expect("bind_init_cwd_and_root: cwd dentry reservation");
+        let _outcome = tx_subsystems::process::execution::step_chdir(&init, root_dentry);
+
+        // Preopen fds 0/1/2. Each call materialises a fresh
+        // `OpenFile` over the same console TTY; the kernel's fd
+        // table holds three independent `Cap<OpenFile>` capability
+        // instances. POSIX-shape dup3 sharing is a follow-up.
+        for fd in 0..3 {
+            let console = tx_fs::devfs::open_console_for_init();
+            let _prev = init.set_fd(fd, Some(console));
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":init:cwd-fds:ok\n");
     }
 
     fn init_later(handoff: BootHandoff) {
@@ -408,3 +862,6 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(P::BOARD);
     }
 }
+
+#[cfg(test)]
+mod tests;
