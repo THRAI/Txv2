@@ -26,7 +26,7 @@
 //! ```
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use tx_substrate::zone::{Cap, PayloadCap, Weak, Zone, ZoneAllocated};
 
@@ -244,6 +244,51 @@ impl ProcessIdentity {
             .and_then(|p| p.set_fd(idx, file))
     }
 
+    /// Snapshot the current `SigDisposition` for `sig` from this
+    /// process's per-process action table. Returns `None` for zombies
+    /// (no payload). Used by the `rt_sigaction(2)` syscall dispatcher
+    /// to read the live disposition without going through
+    /// `step_sigaction` (which would mutate). Per `SIGNAL_v1` §15.1.
+    pub fn sig_disposition(
+        &self,
+        sig: crate::signal::Signum,
+    ) -> Option<crate::signal::SigDisposition> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.sig_actions().get(sig))
+    }
+
+    /// Snapshot the program-break base for this process. Returns `0`
+    /// for zombies and for processes with no brk region configured.
+    /// Used by the `brk(2)` syscall dispatcher to compute the
+    /// `brk_script` arguments per `txdoc:VM-5-8-BRK`.
+    pub fn brk_base(&self) -> u64 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.brk_base())
+            .unwrap_or(0)
+    }
+
+    /// Snapshot the current program break for this process. Returns
+    /// `0` for zombies and for processes with no brk region.
+    pub fn current_brk(&self) -> u64 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.current_brk())
+            .unwrap_or(0)
+    }
+
+    /// Update the current program break. No-op for zombies. Used by
+    /// the `brk(2)` syscall dispatcher.
+    pub fn set_current_brk(&self, value: u64) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.set_current_brk(value);
+        }
+    }
+
     /// Number of currently-live threads owned by this process.
     /// Returns `0` for zombies.
     pub fn live_thread_count(&self) -> usize {
@@ -368,6 +413,31 @@ pub struct ProcessPayload {
     /// `dup`-shape sharing). Per the same risk note: full
     /// `dup3`/`fcntl(F_DUPFD)` semantics are a follow-up.
     pub(crate) fds: SpinMutex<[Option<Cap<OpenFile>>; FD_TABLE_SIZE]>,
+    /// Base of the program-break (heap) region for this process.
+    ///
+    /// Set once at exec time (per `txdoc:VM-5-8-BRK`); never changes
+    /// after that — `brk(2)` only moves `current_brk`. Default `0`
+    /// indicates an unconfigured brk region (the syscall dispatcher
+    /// treats this the same as "no brk available"). Bootstrap init's
+    /// brk base is materialised by `bootstrap_init_process` per the
+    /// Trio plan §"Cross-cutting risks #7".
+    ///
+    /// Stored as `AtomicU64` (not `SpinMutex<u64>`) because the field
+    /// is effectively immutable after construction: only `bootstrap_
+    /// init_process` and (eventually) `step_exec` assign it, and only
+    /// once each. Readers (`brk` syscall) snapshot it under no
+    /// coupling against `current_brk`.
+    pub(crate) brk_base: AtomicU64,
+    /// Current program break for this process.
+    ///
+    /// Mutated by every successful `brk(2)` syscall via
+    /// `AddressSpace::brk_script` returning the new break. Bootstrap
+    /// init starts at `current_brk == brk_base`. `step_fork` clones
+    /// the value (each child has its own break point); the underlying
+    /// VM mappings are cloned by the existing `AddressSpace::fork_aspace`
+    /// path, so the child's brk region is materialised without
+    /// re-running `brk_script`.
+    pub(crate) current_brk: AtomicU64,
 }
 
 impl ProcessPayload {
@@ -431,6 +501,27 @@ impl ProcessPayload {
     pub(crate) fn snapshot_fds(&self) -> [Option<Cap<OpenFile>>; FD_TABLE_SIZE] {
         let slot = self.fds.lock();
         core::array::from_fn(|i| slot[i].clone())
+    }
+
+    /// Read the program-break base address for this process. Returns
+    /// `0` when no brk region is configured; bootstrap init seeds this
+    /// per the Trio plan §"Cross-cutting risks #7".
+    pub fn brk_base(&self) -> u64 {
+        self.brk_base.load(Ordering::Acquire)
+    }
+
+    /// Read the current program break for this process. Returns `0`
+    /// when no brk region is configured.
+    pub fn current_brk(&self) -> u64 {
+        self.current_brk.load(Ordering::Acquire)
+    }
+
+    /// Update the current program break. Called by the `brk(2)` syscall
+    /// dispatcher after `AddressSpace::brk_script` returns the new
+    /// break. The underlying mapping has already been materialised by
+    /// `brk_script`; this just records the new top-of-heap.
+    pub fn set_current_brk(&self, value: u64) {
+        self.current_brk.store(value, Ordering::Release);
     }
 }
 

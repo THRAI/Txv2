@@ -1,9 +1,11 @@
-//! Linux syscall dispatch table — Phase 2a slice.
+//! Linux syscall dispatch table — Phase 2a + 2b slice.
 //!
 //! Phase 2a deliverable per the Trio plan
 //! (`docs/progress/plans/2026-05-05-trio-trap-syscall-tmpfs-devfs.md`
-//! §"Phasing" item 2): only `NR_WRITE`, `NR_EXIT`, `NR_EXIT_GROUP`,
-//! `NR_GETPID` are implemented; everything else returns `-ENOSYS`.
+//! §"Phasing" item 2): `NR_WRITE`, `NR_EXIT`, `NR_EXIT_GROUP`,
+//! `NR_GETPID`. Phase 2b (§"Phasing" item 4) extends with `NR_READ`,
+//! `NR_BRK`, `NR_RT_SIGPROCMASK`, `NR_RT_SIGACTION`. Everything else
+//! still returns `-ENOSYS`.
 //!
 //! ## Plan B writeback discipline
 //!
@@ -43,9 +45,13 @@ use tx_reactor::userspace::SyscallRequest;
 use tx_substrate::zone::Cap;
 use tx_subsystems::execution::{Errno, StepOutcome};
 use tx_subsystems::process::{step_exit_group, ExitStatus, ProcessIdentity};
+use tx_subsystems::signal::{
+    step_sigaction, SigDisposition, SigDispositionChange, SignalMask, Signum,
+};
+use tx_subsystems::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
 use tx_subsystems::thread_runtime::{step_thread_exit, ThreadIdentity};
 use tx_subsystems::vfs::OpenFile;
-use tx_subsystems::vm::AddressSpace;
+use tx_subsystems::vm::{AddressSpace, UserVirtAddr, VmMapError};
 use tx_subsystems::wait_carrier;
 
 pub mod numbers;
@@ -53,7 +59,10 @@ pub mod numbers;
 #[cfg(test)]
 mod tests;
 
-pub use numbers::{NR_EXIT, NR_EXIT_GROUP, NR_GETPID, NR_WRITE};
+pub use numbers::{
+    NR_BRK, NR_EXIT, NR_EXIT_GROUP, NR_GETPID, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK,
+    NR_WRITE,
+};
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
 /// in a single call. The dispatcher copies `[buf_ptr, buf_ptr+len)` into
@@ -65,7 +74,7 @@ pub const TTY_WRITE_MAX_INLINE: usize = 4096;
 
 /// Linux generic ABI errno value for "function not implemented" (`ENOSYS`).
 /// Used as the `-ENOSYS` magnitude returned from `dispatch` for every
-/// syscall number not handled by Phase 2a.
+/// syscall number not handled by Phase 2a / 2b.
 const ENOSYS_VALUE: i32 = 38;
 /// Linux generic ABI errno value for "bad file descriptor" (`EBADF`).
 const EBADF_VALUE: i32 = 9;
@@ -73,6 +82,51 @@ const EBADF_VALUE: i32 = 9;
 /// Used when a syscall argument violates a Phase 2a slice bound (e.g.
 /// `write(len > TTY_WRITE_MAX_INLINE)`).
 const E2BIG_VALUE: i32 = 7;
+/// Linux generic ABI errno value for "invalid argument" (`EINVAL`).
+/// Used by Phase 2b's `rt_sigprocmask` / `rt_sigaction` for the
+/// `sigsetsize != 8` rejection per `SIGNAL_v1` §3 / §15.1, and for
+/// any signum out of the 1..=64 range.
+const EINVAL_VALUE: i32 = 22;
+/// Linux generic ABI errno value for "no such process" (`ESRCH`).
+/// Used by `rt_sigprocmask` / `rt_sigaction` when the target thread /
+/// process is a zombie (no payload to install state on).
+const ESRCH_VALUE: i32 = 3;
+/// Required sigsetsize per Linux RV64 generic ABI: 8 bytes (a single
+/// `u64` bitset matching `tx_subsystems::signal::SignalMask`'s
+/// internal representation). `rt_sigprocmask` / `rt_sigaction`
+/// reject any other value with `-EINVAL`.
+const SIGSETSIZE_BYTES: u64 = 8;
+/// Size of the kernel `struct sigaction` exchanged via `rt_sigaction`
+/// on RV64 generic ABI.
+///
+/// Layout decision: Linux's `arch/riscv/include/uapi/asm/signal.h`
+/// pulls in `asm-generic/signal.h`, which defines the kernel
+/// (uapi) `struct sigaction` as four 64-bit fields:
+///
+/// ```text
+/// struct sigaction {
+///     __sighandler_t  sa_handler;   // 8B
+///     unsigned long   sa_flags;     // 8B
+///     __sigrestore_t  sa_restorer;  // 8B  (present under SA_RESTORER)
+///     sigset_t        sa_mask;      // 8B  (single u64 bitset, sigsetsize=8)
+/// };
+/// ```
+///
+/// So the rt_sigaction syscall takes a 32-byte buffer. The plan's
+/// "16 bytes" hint applied to the legacy `__OLD_SIGACTION` shape used
+/// by the (deprecated) `sigaction()` syscall — the modern
+/// `rt_sigaction` syscall uses the 32-byte form. We pin the modern
+/// shape because (a) Linux RV64 has no `sigaction()` syscall at all
+/// (it only ships `rt_sigaction`, NR_134) and (b) `__sa_restorer` is
+/// part of the ABI even when SA_RESTORER is unset (kernel reads all
+/// four words and ignores the restorer bits unless the flag is set).
+///
+/// Citation: linux/include/uapi/asm-generic/signal.h
+/// `struct sigaction { __sighandler_t sa_handler; unsigned long
+///  sa_flags; __ARCH_HAS_SA_RESTORER ? __sigrestore_t sa_restorer;
+///  sigset_t sa_mask; };` — RV64 enables `__ARCH_HAS_SA_RESTORER`
+/// transitively (the field is always emitted at the ABI level).
+const SIGACTION_BYTES: usize = 32;
 
 /// Per-syscall context resolved by the trap-shell wrapper: the calling
 /// process / thread, the bound address space, and the bookkeeping the
@@ -146,9 +200,13 @@ pub enum SyscallResult {
 pub async fn dispatch<'a>(req: SyscallRequest, ctx: &SyscallCtx<'a>) -> SyscallResult {
     match req.nr {
         NR_WRITE => sys_write(req.args, ctx).await,
+        NR_READ => sys_read(req.args, ctx).await,
         NR_EXIT => sys_exit(req.args, ctx),
         NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
         NR_GETPID => sys_getpid(ctx),
+        NR_BRK => sys_brk(req.args, ctx).await,
+        NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
+        NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -276,6 +334,338 @@ fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// construction).
 fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.process.pid.0 as i64)
+}
+
+/// `read(fd, buf, count)`.
+///
+/// Mirrors `sys_write`'s structure: resolve fd → `Cap<OpenFile>`,
+/// treat `args[1]` as a kernel pointer (TODO(phase-userva) bootstrap
+/// exemption — same as `write`), loop on the wait-carrier discipline.
+///
+/// **Non-blocking semantic for the slice.** Per the Trio plan §"Open
+/// questions #5", console `read` returns `0` bytes when no input is
+/// buffered. `tty::execution::step_read` returns `Blocked(token)` on
+/// an empty input queue (the canonical wait-on-readable shape used by
+/// blocking-read futures). For Phase 2b — which has no userspace
+/// stdin source — translating an initial `Blocked` into `Done(0)`
+/// preserves Linux's "non-blocking read of /dev/tty returns 0" idiom
+/// and keeps the dispatcher synchronous against tests with no input
+/// driver. Once the trap-shell drives a real `enter_userspace` loop,
+/// this arm should switch to actually awaiting the wait-carrier (see
+/// the matching TODO inline).
+async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i32;
+    let buf_ptr = args[1] as usize;
+    let len = args[2] as usize;
+
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if len > TTY_WRITE_MAX_INLINE {
+        return SyscallResult::Error(E2BIG_VALUE);
+    }
+
+    let file = match resolve_fd(&ctx.process, fd as usize) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    if len == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    // SAFETY: Phase 2b accepts kernel-side buffers only (matching the
+    // Phase 2a `write` exemption — see `sys_write`'s SAFETY comment).
+    // TODO(phase-userva): replace with `ctx.aspace.copy_to_user(...)`
+    // once the userspace-VA copy lane lands.
+    let out: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
+
+    let mut total: usize = 0;
+    let mut cursor: usize = 0;
+    loop {
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            file.step_read(&mut out[cursor..], &guard)
+        };
+        match outcome {
+            StepOutcome::Done(read) | StepOutcome::Advanced(read) => {
+                total += read;
+                let stop = read == 0 || cursor + read >= len;
+                if stop {
+                    return SyscallResult::Return(total as i64);
+                }
+                cursor += read;
+            }
+            StepOutcome::AdvancedThenBlocked(read, _token) => {
+                total += read;
+                if total > 0 {
+                    // Partial-success policy: same as `write`. Return
+                    // what we got rather than blocking; userspace
+                    // re-issues the syscall to drain more.
+                    return SyscallResult::Return(total as i64);
+                }
+                // total == 0 here is unreachable in practice (Advanced
+                // implies progress) but fall through defensively to
+                // the `Blocked` arm below.
+                return SyscallResult::Return(0);
+            }
+            StepOutcome::Blocked(_token) => {
+                // No input buffered. Per the Trio plan §"Open
+                // questions #5", return whatever we have (zero on the
+                // first iteration). Once a real wait carrier is wired
+                // for non-test reads this should `wait_on_token` and
+                // re-poll; for the slice we surface non-blocking
+                // semantics.
+                // TODO(phase-blocking-read): await the wait carrier
+                // instead of returning 0 once the kernel has a real
+                // input source feeding the TTY ldisc.
+                return SyscallResult::Return(total as i64);
+            }
+            StepOutcome::Err(errno) => {
+                if total > 0 {
+                    return SyscallResult::Return(total as i64);
+                }
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+    }
+}
+
+/// `brk(requested)` per `txdoc:VM-5-8-BRK`.
+///
+/// - `requested == 0`: report the current break (Linux's "brk(0)
+///   returns current_brk" idiom; matches glibc's `__sbrk(0)` probe).
+/// - On any error from `brk_script` (including `InvalidRange` for
+///   `requested < brk_base`): return the *unchanged* current break.
+///   Linux's brk(2) **never** returns a negative errno; on failure
+///   userspace observes "the break didn't move" and is responsible
+///   for noticing.
+async fn sys_brk<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let requested = args[0];
+
+    let brk_base = ctx.process.brk_base();
+    let current_brk = ctx.process.current_brk();
+
+    // Requested == 0 is the "report current" idiom; never call into
+    // the script (which would treat zero as `requested < brk_base`
+    // and return InvalidRange).
+    if requested == 0 {
+        return SyscallResult::Return(current_brk as i64);
+    }
+
+    let base = UserVirtAddr(brk_base as usize);
+    let cur = UserVirtAddr(current_brk as usize);
+    let req = UserVirtAddr(requested as usize);
+
+    match ctx.aspace.brk_script(base, cur, req).await {
+        Ok(new_brk) => {
+            ctx.process.set_current_brk(new_brk.0 as u64);
+            SyscallResult::Return(new_brk.0 as i64)
+        }
+        Err(VmMapError::InvalidRange) | Err(_) => {
+            // Linux: brk(2) never returns -errno. On failure (range
+            // below brk_base, OOM, mapping conflict) report the
+            // unchanged current break. Userspace detects "no
+            // movement" by comparing against the prior break.
+            SyscallResult::Return(current_brk as i64)
+        }
+    }
+}
+
+/// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
+///
+/// `sigsetsize` is rejected with `-EINVAL` for any value other than
+/// `8` (the kernel's only supported sigset width on RV64 — a single
+/// `u64` bitset). `set_ptr == 0` means "query only"; `oldset_ptr == 0`
+/// means "don't return the previous mask".
+fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let how_raw = args[0] as i32;
+    let set_ptr = args[1] as usize;
+    let oldset_ptr = args[2] as usize;
+    let sigsetsize = args[3];
+
+    if sigsetsize != SIGSETSIZE_BYTES {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    // Decode `how` per Linux generic ABI: 0 = SIG_BLOCK, 1 = SIG_UNBLOCK,
+    // 2 = SIG_SETMASK. `set_ptr == 0` short-circuits to a query-only
+    // path — `step_sigprocmask` doesn't need to run because the mask
+    // doesn't change; we only need to read the current value out for
+    // `oldset_ptr` writeback.
+    let how = match (how_raw, set_ptr) {
+        (_, 0) => None,
+        (0, _) => Some(SigmaskHow::Block),
+        (1, _) => Some(SigmaskHow::Unblock),
+        (2, _) => Some(SigmaskHow::SetMask),
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    // Read the user-supplied set bitset. SAFETY: Phase 2b accepts
+    // kernel-side buffers only (TODO(phase-userva) bootstrap
+    // exemption — same as Phase 2a's `write`).
+    let next_mask = if set_ptr == 0 {
+        SignalMask::EMPTY
+    } else {
+        // SAFETY: see SAFETY comment in `sys_write`.
+        let bits = unsafe { core::ptr::read_unaligned(set_ptr as *const u64) };
+        SignalMask::new(bits)
+    };
+
+    // If `set` is null we still need the previous mask to satisfy
+    // `oldset_ptr`. `step_sigprocmask` returns `prev` from the
+    // change record, so call it with `SetMask` of the *current* bits
+    // (a no-op, plus it uniformly produces a `Replaced` record). The
+    // simpler approach: skip the call and read the mask directly via
+    // `step_sigprocmask` invoked with a no-op `SetMask` of `prev`...
+    // but the cleanest shape is to call `step_sigprocmask` always
+    // when `how` is Some, and for the query-only branch bypass it.
+    let prev_mask: SignalMask = match how {
+        Some(how) => match step_sigprocmask(&ctx.thread, how, next_mask) {
+            SigprocmaskChange::Replaced { prev, .. } => prev,
+            SigprocmaskChange::ZombieIgnored => {
+                return SyscallResult::Error(ESRCH_VALUE);
+            }
+        },
+        None => {
+            // Query-only path. Use `Block` of EMPTY (a no-op) to
+            // pull the current mask out without changing it. SIG_BLOCK
+            // with empty `next` cannot alter the mask: `new = prev | 0`.
+            match step_sigprocmask(&ctx.thread, SigmaskHow::Block, SignalMask::EMPTY) {
+                SigprocmaskChange::Replaced { prev, .. } => prev,
+                SigprocmaskChange::ZombieIgnored => {
+                    return SyscallResult::Error(ESRCH_VALUE);
+                }
+            }
+        }
+    };
+
+    if oldset_ptr != 0 {
+        // SAFETY: see SAFETY comment in `sys_write`.
+        unsafe {
+            core::ptr::write_unaligned(oldset_ptr as *mut u64, prev_mask.raw_bits());
+        }
+    }
+
+    SyscallResult::Return(0)
+}
+
+/// `rt_sigaction(signum, act, oldact, sigsetsize)` per `SIGNAL_v1`
+/// §15.1.
+///
+/// Decodes a 32-byte kernel `struct sigaction` (see `SIGACTION_BYTES`
+/// for the layout citation). `act_ptr == 0` queries the current
+/// disposition without changing it; `oldact_ptr == 0` discards the
+/// previous disposition.
+fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let signum_raw = args[0] as u32;
+    let act_ptr = args[1] as usize;
+    let oldact_ptr = args[2] as usize;
+    let sigsetsize = args[3];
+
+    if sigsetsize != SIGSETSIZE_BYTES {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let Some(sig) = (if signum_raw <= u8::MAX as u32 {
+        Signum::new(signum_raw as u8)
+    } else {
+        None
+    }) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+
+    // Decode the new action (if any). SAFETY: Phase 2b kernel-side
+    // buffer exemption applies — TODO(phase-userva) for the real
+    // copy-from-user lane.
+    let new_disposition: Option<SigDisposition> = if act_ptr == 0 {
+        None
+    } else {
+        // SAFETY: see SAFETY comment in `sys_write`.
+        let bytes = unsafe { core::slice::from_raw_parts(act_ptr as *const u8, SIGACTION_BYTES) };
+        let handler = read_u64_le(&bytes[0..8]);
+        // sa_flags / sa_restorer / sa_mask are decoded but unused at
+        // this layer — `SigDisposition` only stores the handler shape.
+        // Once SA_SIGINFO / SA_RESTORER / per-handler mask wiring
+        // lands these fields will materialise on `SigDisposition`.
+        let _flags = read_u64_le(&bytes[8..16]);
+        let _restorer = read_u64_le(&bytes[16..24]);
+        let _mask = read_u64_le(&bytes[24..32]);
+
+        // SIG_DFL == 0, SIG_IGN == 1 per Linux generic ABI; everything
+        // else is a userspace function-pointer handler.
+        let disp = match handler {
+            0 => SigDisposition::Default,
+            1 => SigDisposition::Ignore,
+            other => SigDisposition::Handler(other as usize),
+        };
+        Some(disp)
+    };
+
+    // If the caller wants the previous disposition, snapshot it
+    // *before* installing the new one. `step_sigaction` returns the
+    // prev as part of `SigDispositionChange`, so a single call suffices
+    // for both install and query — but `act_ptr == 0` is "query only",
+    // and we must not mutate. Read the live disposition through the
+    // process's `sig_actions` table accessor in that case.
+    let prev_disposition: SigDisposition = match new_disposition {
+        Some(disp) => match step_sigaction(&ctx.process, sig, disp) {
+            SigDispositionChange::Replaced { prev } => prev,
+            SigDispositionChange::Uncatchable(prev) => {
+                // SIGKILL/SIGSTOP — `step_sigaction` silently keeps
+                // them at default. Treat the call as a successful
+                // query: return the (unchanged) prev to oldact, and
+                // the syscall returns 0. Linux allows installing
+                // SIG_DFL on these; installing handlers fails. For
+                // simplicity (and matching `step_sigaction`'s shape)
+                // we report success either way.
+                prev
+            }
+            SigDispositionChange::ZombieIgnored => {
+                return SyscallResult::Error(ESRCH_VALUE);
+            }
+        },
+        None => {
+            // Query-only: read directly via the process's
+            // `sig_disposition` accessor. Returns `None` for zombies
+            // — surface as `-ESRCH`.
+            match ctx.process.sig_disposition(sig) {
+                Some(d) => d,
+                None => {
+                    return SyscallResult::Error(ESRCH_VALUE);
+                }
+            }
+        }
+    };
+
+    if oldact_ptr != 0 {
+        let handler_value: u64 = match prev_disposition {
+            SigDisposition::Default => 0, // SIG_DFL
+            SigDisposition::Ignore => 1,  // SIG_IGN
+            SigDisposition::Handler(addr) => addr as u64,
+        };
+        // SAFETY: see SAFETY comment in `sys_write`. Write each 8-byte
+        // field individually to avoid any host-side struct-layout
+        // assumption.
+        unsafe {
+            let base = oldact_ptr as *mut u64;
+            core::ptr::write_unaligned(base, handler_value); // sa_handler
+            core::ptr::write_unaligned(base.add(1), 0); // sa_flags (unused)
+            core::ptr::write_unaligned(base.add(2), 0); // sa_restorer (unused)
+            core::ptr::write_unaligned(base.add(3), 0); // sa_mask (unused)
+        }
+    }
+
+    SyscallResult::Return(0)
+}
+
+/// Read 8 little-endian bytes from a slice as a `u64`. Used by
+/// `sys_rt_sigaction`'s `struct sigaction` decode.
+fn read_u64_le(bytes: &[u8]) -> u64 {
+    debug_assert!(bytes.len() >= 8);
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(buf)
 }
 
 /// Resolve fd `idx` against the process payload's day-1 stub fd table.
