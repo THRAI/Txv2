@@ -33,12 +33,24 @@ pub fn step_hangup(tty: &Cap<TtyIdentity>, _guard: &Guard<'_>) -> StepOutcome<Ha
         had_payload,
         hangup_fired: true,
         session_ctl_fired: true,
+        // SessionLeaderProcessGroup's typed pgrp is left None: the
+        // SessionPgrp binding carries only a Weak<Session> and
+        // Weak<ProcessGroup> for the *foreground* pgrp. The session-
+        // leader's pgrp would require walking session.groups for
+        // pgid == session_leader_pgid; that lookup lands when the
+        // session→leader-pgrp index is wired.
         hup_signal: binding.map(|binding| SignalDispatch {
-            target: SignalTarget::SessionLeaderProcessGroup(binding.session_leader_pgid),
+            target: SignalTarget::SessionLeaderProcessGroup {
+                pgid: binding.session_leader_pgid,
+                pgrp: None,
+            },
             signal: JobControlSignal::Hup,
         }),
         cont_signal: binding.map(|binding| SignalDispatch {
-            target: SignalTarget::ForegroundProcessGroup(binding.foreground_pgid),
+            target: SignalTarget::ForegroundProcessGroup {
+                pgid: binding.foreground_pgid,
+                pgrp: binding.foreground_pgrp,
+            },
             signal: JobControlSignal::Cont,
         }),
     })
