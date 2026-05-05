@@ -128,11 +128,11 @@ pub fn step_ioctl_tiocsctty(
         return StepOutcome::Err(Errno::EBUSY);
     }
 
-    tty.bind_session_pgrp(SessionPgrp {
-        session_id: caller.session_id,
-        session_leader_pgid: caller.pgrp_id,
-        foreground_pgid: caller.pgrp_id,
-    });
+    tty.bind_session_pgrp(SessionPgrp::from_raw_ids(
+        caller.session_id,
+        caller.pgrp_id,
+        caller.pgrp_id,
+    ));
     tty.session_ctl_port.fire(SessionCtlEvent::Bound as u64);
 
     StepOutcome::Done(IoctlSideEffect {

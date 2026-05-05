@@ -4,6 +4,26 @@
 
 ## Current Shape
 
+- 2026-05-05 TTY pgrp typed-rebinding lands on top of cred day-1
+  (branch `process-topology`). `TtyIdentity.session_pgrp` now carries
+  both raw POSIX IDs (legacy fast path) and typed
+  `Weak<Session>` / `Weak<ProcessGroup>` references. New constructors:
+  `SessionPgrp::from_raw_ids(...)` (no typed refs, used by all
+  existing TTY tests) and `SessionPgrp::from_typed(&session, &pgrp)`
+  which caches the IDs from the caps and downgrades to Weak refs.
+  `TtyIdentity` gains `bind_session_pgrp_typed(...)` and
+  `foreground_pgrp_cap()` so signal-fanout callers can hand the
+  foreground pgrp Cap directly to `signal::step_kill_pgrp`. Required
+  bumps: `tx-substrate::zone::Weak<T>` Clone/Copy made unconditional
+  (manual impls — derive was emitting spurious `T: Clone` bounds);
+  `unsafe impl Send + Sync for AddressSpace` to lift the
+  page-allocator MapPin's intentionally-!Send into the
+  shared-by-discipline shape that lets `Cap<AddressSpace>` flow
+  through `ProcessPayload` and transitively through `Weak<Session>`
+  inside `SessionPgrp`. tty/tests.rs at 1500-line ceiling so split
+  into `tty/tests/legacy_phase_a.rs` + `tty/tests/typed_session_pgrp.rs`.
+  7 new tests bring suite to 234; full `cargo xtask ci` green
+  (11/11 gates).
 - 2026-05-05 Cred service stub layered on top of signal day-1 (branch
   `process-topology`). Adds `crates/tx-subsystems/src/cred.rs` with
   POSIX cred types (`Uid`, `Gid`, `Capability`, `CapabilitySet`,
