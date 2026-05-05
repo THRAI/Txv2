@@ -399,6 +399,33 @@ impl Session {
     pub fn foreground_pgrp_cap(&self) -> Option<Cap<ProcessGroup>> {
         self.controlling_tty_cap()?.foreground_pgrp_cap()
     }
+
+    /// Snapshot the session leader's process group, if still live.
+    ///
+    /// Day-1 `setsid` creates the leader pgrp with `pgid == sid`; this
+    /// helper walks `session.members` to resolve that canonical group.
+    /// Used by TTY hangup producers that need a typed session-leader pgrp
+    /// target for SIGHUP fanout.
+    pub fn leader_pgrp_cap(&self) -> Option<Cap<ProcessGroup>> {
+        let guard = tx_substrate::epoch::guard();
+        self.leader_pgrp_cap_with_guard(&guard)
+    }
+
+    pub(crate) fn leader_pgrp_cap_with_guard(
+        &self,
+        guard: &tx_substrate::epoch::Guard<'_>,
+    ) -> Option<Cap<ProcessGroup>> {
+        let leader_pgid = Pgid(self.sid.0);
+        for weak in self.members.lock().iter() {
+            let Some(pgrp) = weak.upgrade(guard) else {
+                continue;
+            };
+            if pgrp.pgid == leader_pgid {
+                return Some(pgrp);
+            }
+        }
+        None
+    }
 }
 
 static PROCESS_IDENTITY_ZONE: Zone<ProcessIdentity> = Zone::const_new();

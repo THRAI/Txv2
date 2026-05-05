@@ -13,7 +13,10 @@ use crate::device::CharDeviceBinding;
 use crate::execution::Errno;
 use crate::mount::{MountIdentity, MountPayload};
 use crate::page_backed::PageContainer;
+use crate::process::{ProcessGroup, ProcessIdentity};
+use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::TtyIdentity;
+use crate::tty::structure::{Termios, Winsize};
 use tx_substrate::zone::{self, Cap, Weak, Zone, ZoneAllocated, ZoneError};
 
 pub const VFS_NAME_MAX: usize = 255;
@@ -299,6 +302,27 @@ pub struct OpenFileFlags {
     pub append: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenFileIoctl<'a> {
+    Tcgets,
+    Tcsets { termios: Termios },
+    Tiocgpgrp,
+    Tiocspgrp { new_pgrp: &'a Cap<ProcessGroup> },
+    Tiocgwinsz,
+    Tiocswinsz { winsize: Winsize },
+    Tiocsctty,
+    Tiocnotty,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenFileIoctlResult {
+    None,
+    Termios(Termios),
+    Pgrp(u32),
+    Winsize(Winsize),
+    SideEffect(IoctlSideEffect),
+}
+
 #[derive(Clone, Debug)]
 pub enum RNodeBacking {
     PageBacked { pc: Cap<PageContainer> },
@@ -500,5 +524,20 @@ impl OpenFile {
 
     pub const fn flags(&self) -> OpenFileFlags {
         self.flags
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct OpenFileIoctlCaller<'a> {
+    process: &'a Cap<ProcessIdentity>,
+}
+
+impl<'a> OpenFileIoctlCaller<'a> {
+    pub const fn from_process(process: &'a Cap<ProcessIdentity>) -> Self {
+        Self { process }
+    }
+
+    pub const fn process(self) -> &'a Cap<ProcessIdentity> {
+        self.process
     }
 }

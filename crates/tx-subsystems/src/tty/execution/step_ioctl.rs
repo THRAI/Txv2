@@ -5,6 +5,7 @@ use core::sync::atomic::Ordering;
 use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard, StepOutcome};
+use crate::signal::{self, DispatchOutcome, SigDisposition, Signum};
 use crate::tty::checks::{require_live_tty, require_session_leader};
 use crate::tty::execution::{TTY_READABLE, TTY_WRITABLE};
 use crate::tty::ldisc::SignalKind;
@@ -57,6 +58,52 @@ impl IoctlCaller {
             sigttin_ignored: false,
             sigttou_ignored: false,
         }
+    }
+
+    /// Build a caller snapshot from a live process identity.
+    ///
+    /// This is the process-aware bridge for TTY helpers: it lifts the
+    /// canonical process/session/pgrp topology into the existing TTY-side
+    /// caller value, including typed `Weak<ProcessGroup>` retention for
+    /// signal fanout.
+    pub fn from_process(
+        process: &Cap<crate::process::structure::ProcessIdentity>,
+    ) -> Result<Self, Errno> {
+        let guard = tx_substrate::epoch::guard();
+        Self::from_process_with_guard(process, &guard)
+    }
+
+    pub(crate) fn from_process_with_guard(
+        process: &Cap<crate::process::structure::ProcessIdentity>,
+        guard: &tx_substrate::epoch::Guard<'_>,
+    ) -> Result<Self, Errno> {
+        let payload_guard = process.payload.lock();
+        let payload = payload_guard.as_ref().ok_or(Errno::ESRCH)?;
+
+        let pgrp = process.pgrp_cap();
+        let session = pgrp.session_cap();
+        let in_foreground = (*session.controlling_tty.lock())
+            .and_then(|weak| weak.upgrade(guard))
+            .and_then(|tty| tty.session_pgrp())
+            .map(|binding| binding.foreground_pgid == pgrp.pgid.0)
+            .unwrap_or(true);
+
+        Ok(Self {
+            session_id: session.sid.0,
+            pgrp_id: pgrp.pgid.0,
+            pgrp: Some(pgrp.downgrade()),
+            is_session_leader: process.pid.0 == session.sid.0,
+            has_controlling_tty: session.has_controlling_tty(),
+            in_foreground,
+            sigttin_ignored: matches!(
+                payload.sig_actions().get(Signum::SIGTTIN),
+                SigDisposition::Ignore
+            ),
+            sigttou_ignored: matches!(
+                payload.sig_actions().get(Signum::SIGTTOU),
+                SigDisposition::Ignore
+            ),
+        })
     }
 
     /// Attach a typed `Weak<ProcessGroup>` to the caller. Used by the
@@ -214,6 +261,36 @@ pub struct IoctlSideEffect {
     pub signal: Option<SignalDispatch>,
 }
 
+/// Deliver an optional TTY-emitted signal dispatch on behalf of `source`.
+///
+/// This is the small glue layer between TTY producers and the signal shim's
+/// typed pgrp bridge. `None` means "no signal side effect happened".
+pub fn deliver_signal_dispatch_for_process(
+    source: &Cap<crate::process::structure::ProcessIdentity>,
+    dispatch: Option<SignalDispatch>,
+) -> Result<Option<DispatchOutcome>, Errno> {
+    let guard = tx_substrate::epoch::guard();
+    match dispatch {
+        Some(dispatch) => {
+            signal::deliver_tty_dispatch_with_guard(source, dispatch, &guard).map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn deliver_signal_dispatch_for_process_with_guard(
+    source: &Cap<crate::process::structure::ProcessIdentity>,
+    dispatch: Option<SignalDispatch>,
+    guard: &tx_substrate::epoch::Guard<'_>,
+) -> Result<Option<DispatchOutcome>, Errno> {
+    match dispatch {
+        Some(dispatch) => {
+            signal::deliver_tty_dispatch_with_guard(source, dispatch, guard).map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
 pub fn step_ioctl_tiocsctty(
     tty: &Cap<TtyIdentity>,
     caller: IoctlCaller,
@@ -236,6 +313,42 @@ pub fn step_ioctl_tiocsctty(
         caller.pgrp_id,
         caller.pgrp_id,
     ));
+    tty.session_ctl_port.fire(SessionCtlEvent::Bound as u64);
+
+    StepOutcome::Done(IoctlSideEffect {
+        session_ctl_fired: true,
+        signal: None,
+    })
+}
+
+/// Process-aware TIOCSCTTY helper. Binds the tty to the caller's canonical
+/// session/pgrp and installs the process-side controlling-tty mirror.
+pub fn step_ioctl_tiocsctty_for_process(
+    tty: &Cap<TtyIdentity>,
+    caller: &Cap<crate::process::structure::ProcessIdentity>,
+    guard: &Guard<'_>,
+) -> StepOutcome<IoctlSideEffect> {
+    let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
+        Ok(caller_info) => caller_info,
+        Err(err) => return StepOutcome::Err(err),
+    };
+
+    let _payload = match require_live_tty(tty, guard) {
+        Ok(payload) => payload,
+        Err(err) => return StepOutcome::Err(err),
+    };
+
+    if let Err(err) = require_session_leader(caller_info) {
+        return StepOutcome::Err(err);
+    }
+    if tty.session_pgrp().is_some() {
+        return StepOutcome::Err(Errno::EBUSY);
+    }
+
+    let pgrp = caller.pgrp_cap();
+    let session = pgrp.session_cap();
+    tty.bind_session_pgrp_typed(&session, &pgrp);
+    *session.controlling_tty.lock() = Some(tty.downgrade());
     tty.session_ctl_port.fire(SessionCtlEvent::Bound as u64);
 
     StepOutcome::Done(IoctlSideEffect {
@@ -269,6 +382,41 @@ pub fn step_ioctl_tiocnotty(
     })
 }
 
+/// Process-aware TIOCNOTTY helper. Clears both the tty's authoritative
+/// session/pgrp slot and the session-side controlling-tty mirror.
+pub fn step_ioctl_tiocnotty_for_process(
+    tty: &Cap<TtyIdentity>,
+    caller: &Cap<crate::process::structure::ProcessIdentity>,
+    guard: &Guard<'_>,
+) -> StepOutcome<IoctlSideEffect> {
+    let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
+        Ok(caller_info) => caller_info,
+        Err(err) => return StepOutcome::Err(err),
+    };
+
+    let _payload = match require_live_tty(tty, guard) {
+        Ok(payload) => payload,
+        Err(err) => return StepOutcome::Err(err),
+    };
+
+    let pgrp = caller.pgrp_cap();
+    let session = pgrp.session_cap();
+    let Some(binding) = tty.session_pgrp() else {
+        return StepOutcome::Err(Errno::EINVAL);
+    };
+    if binding.session_id != caller_info.session_id {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+
+    tty.clear_session_pgrp();
+    *session.controlling_tty.lock() = None;
+    tty.session_ctl_port.fire(SessionCtlEvent::Detached as u64);
+    StepOutcome::Done(IoctlSideEffect {
+        session_ctl_fired: true,
+        signal: None,
+    })
+}
+
 pub fn step_ioctl_tiocspgrp(
     tty: &Cap<TtyIdentity>,
     caller: IoctlCaller,
@@ -289,6 +437,45 @@ pub fn step_ioctl_tiocspgrp(
 
     binding.foreground_pgid = new_pgrp;
     tty.bind_session_pgrp(binding);
+    tty.session_ctl_port
+        .fire(SessionCtlEvent::ForegroundChanged as u64);
+    StepOutcome::Done(IoctlSideEffect {
+        session_ctl_fired: true,
+        signal: None,
+    })
+}
+
+/// Process-aware `tcsetpgrp` / `TIOCSPGRP` helper for callers that already
+/// resolved the target process group to a canonical `Cap<ProcessGroup>`.
+pub fn step_ioctl_tiocspgrp_for_process(
+    tty: &Cap<TtyIdentity>,
+    caller: &Cap<crate::process::structure::ProcessIdentity>,
+    new_pgrp: &Cap<crate::process::structure::ProcessGroup>,
+    guard: &Guard<'_>,
+) -> StepOutcome<IoctlSideEffect> {
+    let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
+        Ok(caller_info) => caller_info,
+        Err(err) => return StepOutcome::Err(err),
+    };
+
+    let _payload = match require_live_tty(tty, guard) {
+        Ok(payload) => payload,
+        Err(err) => return StepOutcome::Err(err),
+    };
+
+    let caller_session = caller.pgrp_cap().session_cap();
+    if new_pgrp.session_cap().key() != caller_session.key() {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+
+    let Some(binding) = tty.session_pgrp() else {
+        return StepOutcome::Err(Errno::EINVAL);
+    };
+    if binding.session_id != caller_info.session_id {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+
+    tty.bind_session_pgrp_typed(&caller_session, new_pgrp);
     tty.session_ctl_port
         .fire(SessionCtlEvent::ForegroundChanged as u64);
     StepOutcome::Done(IoctlSideEffect {

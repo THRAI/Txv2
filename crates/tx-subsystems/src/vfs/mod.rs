@@ -21,6 +21,7 @@ pub use checks::{DirectoryAtPath, EntityAtPath, ParentAndName, ResolveCtx, RootC
 pub use execution::{FsOps, MountOutput};
 pub use structure::{
     render_dentry_path, Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind,
-    InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking, StructPayload, Timespec, VfsName,
-    S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VFS_NAME_MAX,
+    InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult,
+    RNode, RNodeBacking, StructPayload, Timespec, VfsName, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
+    S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VFS_NAME_MAX,
 };
