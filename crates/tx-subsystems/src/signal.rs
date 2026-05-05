@@ -32,6 +32,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use tx_substrate::zone::Cap;
 
+use crate::execution::Errno;
 use crate::process::structure::{ProcessGroup, ProcessIdentity};
 use crate::sync::SpinMutex;
 use crate::thread_runtime::execution::post_signal;
@@ -300,6 +301,142 @@ pub enum SigDispositionChange {
     Replaced { prev: SigDisposition },
     Uncatchable(SigDisposition),
     ZombieIgnored,
+}
+
+// ----- Script-level (permission-checked) entry points -----
+
+/// Outcome of [`script_kill_process`]. `Delivered` is the normal path;
+/// `NoLiveThread` means the target had no payload (zombie); permission
+/// denial is reported as `Err(Errno::EPERM)` per POSIX `kill(2)`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KillScriptOutcome {
+    Delivered,
+    NoLiveThread,
+    /// Posted permission was OK (e.g. signal 0 probe), no actual
+    /// delivery happened.
+    Probed,
+}
+
+/// POSIX-shaped `kill(target_pid, sig)` modulo pid lookup. Composes
+/// the `cred::require_signal_send` permission check with
+/// [`step_kill_process`] per `SIGNAL_v1` §32's `script_kill`. The
+/// guard-bound witness is consumed in the same step; the underlying
+/// post is the existing producer-internal mechanism.
+///
+/// Returns:
+/// - `Ok(Delivered)` — permission granted, signal posted to a live thread.
+/// - `Ok(NoLiveThread)` — permission granted, target has no live thread.
+/// - `Ok(Probed)` — `sig` was the null signal (`Signum::new(0)` is not
+///   constructible via the public API; this branch is reachable only
+///   via the explicit signal-0 probe shape — see `script_kill_probe`).
+/// - `Err(Errno::ESRCH)` — `source` is a zombie (no cred to consult).
+/// - `Err(Errno::EPERM)` — cred check denied per
+///   `cred::signal_permitted`.
+pub fn script_kill_process(
+    source: &Cap<ProcessIdentity>,
+    target: &Cap<ProcessIdentity>,
+    sig: Signum,
+) -> Result<KillScriptOutcome, Errno> {
+    let guard = tx_substrate::epoch::guard();
+
+    let source_cred = {
+        let payload_guard = source.payload.lock();
+        let payload = payload_guard.as_ref().ok_or(Errno::ESRCH)?;
+        payload.cred()
+    };
+
+    let Some(target_facts) = target.target_proc_cred_for(source) else {
+        return Ok(KillScriptOutcome::NoLiveThread);
+    };
+
+    let _auth = crate::cred::require_signal_send(source_cred, &target_facts, sig, &guard)?;
+
+    Ok(match step_kill_process(target, sig) {
+        KillOutcome::Delivered => KillScriptOutcome::Delivered,
+        KillOutcome::NoLiveThread => KillScriptOutcome::NoLiveThread,
+    })
+}
+
+/// Permission probe equivalent to POSIX `kill(pid, 0)`. Runs the cred
+/// check but does not deliver. Returns `Ok(Probed)` on permitted,
+/// `Err(EPERM)` otherwise.
+pub fn script_kill_probe(
+    source: &Cap<ProcessIdentity>,
+    target: &Cap<ProcessIdentity>,
+) -> Result<KillScriptOutcome, Errno> {
+    let guard = tx_substrate::epoch::guard();
+
+    let source_cred = {
+        let payload_guard = source.payload.lock();
+        let payload = payload_guard.as_ref().ok_or(Errno::ESRCH)?;
+        payload.cred()
+    };
+
+    let Some(target_facts) = target.target_proc_cred_for(source) else {
+        return Ok(KillScriptOutcome::NoLiveThread);
+    };
+
+    // Use SIGTERM as the rule's signum input — the no-deliver probe
+    // applies the same rule POSIX kill(pid, 0) does, which is
+    // signum-independent except for SIGCONT-same-session. We pass a
+    // signum that doesn't trigger the SIGCONT bypass to keep the
+    // probe consistent with how userspace expects kill(pid, 0) to
+    // behave.
+    let _auth =
+        crate::cred::require_signal_send(source_cred, &target_facts, Signum::SIGTERM, &guard)?;
+
+    Ok(KillScriptOutcome::Probed)
+}
+
+/// Permission-checked process-group fanout per `SIGNAL_v1` §12.2.
+/// Iterates `pgrp.members`, builds a `TargetProcCred` per live member,
+/// runs the cred check, and posts on permitted members via
+/// [`step_kill_process`]. Returns the count of members the call
+/// successfully delivered to. Per-member denials and zombies are
+/// independent — they don't fail the whole call.
+///
+/// Returns `Err(ESRCH)` if `source` is a zombie. Returns `Ok(0)` if
+/// no member was permitted *and* live; userspace shims may translate
+/// this to `Errno::EPERM` (POSIX `kill` to a pgrp returns EPERM iff
+/// no member was reachable).
+pub fn script_kill_pgrp(
+    source: &Cap<ProcessIdentity>,
+    pgrp: &Cap<ProcessGroup>,
+    sig: Signum,
+) -> Result<u32, Errno> {
+    let source_cred = {
+        let payload_guard = source.payload.lock();
+        let payload = payload_guard.as_ref().ok_or(Errno::ESRCH)?;
+        payload.cred()
+    };
+
+    let guard = tx_substrate::epoch::guard();
+    let mut delivered = 0u32;
+    let members: alloc::vec::Vec<Cap<ProcessIdentity>> = pgrp
+        .members
+        .lock()
+        .iter()
+        .filter_map(|w| w.upgrade(&guard))
+        .collect();
+
+    for member in &members {
+        let Some(facts) = member.target_proc_cred_for(source) else {
+            continue;
+        };
+        if crate::cred::require_signal_send(source_cred, &facts, sig, &guard).is_err() {
+            continue;
+        }
+        if step_kill_process(member, sig) == KillOutcome::Delivered {
+            // Mirror onto the per-process group_pending so future
+            // delivery code can recognise group-targeted posts.
+            if let Some(payload) = member.payload.lock().as_ref() {
+                payload.group_pending().post(sig);
+            }
+            delivered += 1;
+        }
+    }
+
+    Ok(delivered)
 }
 
 #[cfg(test)]

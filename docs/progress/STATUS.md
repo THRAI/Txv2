@@ -4,6 +4,28 @@
 
 ## Current Shape
 
+- 2026-05-05 Kill permission check lands on top of TTY pgrp typed
+  rebind (branch `process-topology`). Wires `cred` into the `signal`
+  shim per `SIGNAL_v1` §32 and `cred_service_v_1`. New
+  `cred::require_signal_send(source: Cred, target: &TargetProcCred,
+  sig, &Guard) -> Result<SignalAuthorized<'g>, Errno>` runs the
+  permission rule and emits a zero-sized witness. New
+  `process::structure::TargetProcCred` is the day-1 subset of the
+  illustrative `{ruid, euid, suid, ..., same_session, dumpable}`
+  shape from the cred doc — `{uid, euid, gid, egid, same_session}`.
+  `ProcessIdentity::target_proc_cred_for(&source)` builds it,
+  computing `same_session` by comparing the source's and target's
+  pgrp `Cap<Session>` keys. New `signal::script_kill_process`,
+  `signal::script_kill_pgrp`, and `signal::script_kill_probe` compose
+  the cred check with the existing `step_kill_*` posters; the latter
+  is the POSIX `kill(pid, 0)` permission probe. Day-1 rule:
+  `(source.uid, source.euid) × (target.uid, target.euid)` match,
+  `CAP_KILL`/root bypass, SIGCONT-same-session bypass — Linux's full
+  4-way `(uid,euid) × (uid,suid,ruid)` is the saved-set extension
+  that lands when Cred grows `suid`/`ruid`. `Errno` gains `EPERM` and
+  `ESRCH` (POSIX kill returns EPERM on permission deny, ESRCH on
+  zombie source). 12 new tests bring the suite to 246; full
+  `cargo xtask ci` green (11/11 gates).
 - 2026-05-05 TTY pgrp typed-rebinding lands on top of cred day-1
   (branch `process-topology`). `TtyIdentity.session_pgrp` now carries
   both raw POSIX IDs (legacy fast path) and typed
