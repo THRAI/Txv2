@@ -211,6 +211,17 @@ pub struct InlineName {
 }
 
 impl InlineName {
+    /// Empty-name sentinel for root-of-filesystem `DEntry`. The root
+    /// dentry has no namable parent component; path-render code
+    /// recognises `is_empty() == true` as "this is the root marker"
+    /// and emits a leading `/` instead of a name component. The
+    /// public `new` constructor rejects empty bytes — only `ROOT`
+    /// produces an empty `InlineName`.
+    pub const ROOT: Self = Self {
+        len: 0,
+        bytes: [0; VFS_NAME_MAX],
+    };
+
     pub fn new(bytes: &[u8]) -> Result<Self, Errno> {
         if bytes.is_empty() || bytes.len() > VFS_NAME_MAX || bytes.contains(&b'/') {
             return Err(Errno::ENAMETOOLONG);
@@ -391,6 +402,67 @@ impl DEntry {
     pub fn set_mounted_hint(&mut self, mount: &Cap<MountIdentity>) {
         self.mounted = Some(mount.downgrade());
     }
+
+    /// Snapshot the parent-hint `Weak<DEntry>` if installed. Used by
+    /// path-render walks (`render_dentry_path`) and (future) by
+    /// chroot-bounded resolution. Returns `None` for root dentries
+    /// or for dentries that haven't had `set_parent_hint` called.
+    pub fn parent_hint(&self) -> Option<Weak<DEntry>> {
+        self.parent
+    }
+}
+
+/// Render an absolute path string for a `DEntry` by walking its
+/// `parent_hint` chain up to the root. Each component contributes
+/// its `name()` bytes; the chain terminates at a dentry whose
+/// `parent_hint` is `None` (the root marker).
+///
+/// Returns `None` if any intermediate `parent_hint` Weak fails to
+/// upgrade — the chain is broken and we cannot assemble the full
+/// path. POSIX `getcwd(2)` returns `ENOENT` in this case (cwd has
+/// been unlinked); the syscall driver maps the `None` to the right
+/// errno.
+///
+/// Conventions:
+/// - The root `DEntry` carries `InlineName::ROOT` (empty); the
+///   render emits a single `/` for it.
+/// - Non-root components are joined by `/`. Output starts with `/`.
+/// - Output bytes are not validated as UTF-8 — POSIX paths are
+///   byte sequences with `/` and `\0` reserved.
+pub fn render_dentry_path(dentry: &Cap<DEntry>) -> Option<alloc::vec::Vec<u8>> {
+    let mut components: alloc::vec::Vec<InlineName> = alloc::vec::Vec::new();
+    components.push(dentry.name());
+
+    let mut current = dentry.parent_hint();
+    let guard = tx_substrate::epoch::guard();
+    while let Some(parent_weak) = current {
+        let Some(parent_cap) = parent_weak.upgrade(&guard) else {
+            // Chain broken — a parent identity has been reclaimed.
+            return None;
+        };
+        components.push(parent_cap.name());
+        current = parent_cap.parent_hint();
+    }
+    drop(guard);
+
+    // components collected leaf → root; reverse for root → leaf rendering.
+    components.reverse();
+
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    out.push(b'/');
+    let mut first_named = true;
+    for name in &components {
+        if name.is_empty() {
+            // Root marker — leading slash already pushed.
+            continue;
+        }
+        if !first_named {
+            out.push(b'/');
+        }
+        out.extend_from_slice(name.as_bytes());
+        first_named = false;
+    }
+    Some(out)
 }
 
 #[derive(Debug)]

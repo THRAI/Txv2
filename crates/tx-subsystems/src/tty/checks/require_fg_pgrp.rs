@@ -36,7 +36,10 @@ pub fn background_read_signal(tty: &TtyIdentity, caller: IoctlCaller) -> Option<
         return None;
     }
     Some(SignalDispatch {
-        target: SignalTarget::CallerProcessGroup(caller.pgrp_id),
+        target: SignalTarget::CallerProcessGroup {
+            pgid: caller.pgrp_id,
+            pgrp: caller.pgrp,
+        },
         signal: JobControlSignal::Ttin,
     })
 }
@@ -50,7 +53,10 @@ pub fn background_write_signal(tty: &TtyIdentity, caller: IoctlCaller) -> Option
         return None;
     }
     Some(SignalDispatch {
-        target: SignalTarget::CallerProcessGroup(caller.pgrp_id),
+        target: SignalTarget::CallerProcessGroup {
+            pgid: caller.pgrp_id,
+            pgrp: caller.pgrp,
+        },
         signal: JobControlSignal::Ttou,
     })
 }

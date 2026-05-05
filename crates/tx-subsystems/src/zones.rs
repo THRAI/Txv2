@@ -68,16 +68,24 @@ mod smoke {
 
 mod process {
     use super::*;
+    use crate::process::structure::{ProcessGroup, ProcessIdentity, ProcessPayload, Session};
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
+        zone::register_zone_for::<ProcessIdentity>()?;
+        zone::register_zone_for::<ProcessPayload>()?;
+        zone::register_zone_for::<ProcessGroup>()?;
+        zone::register_zone_for::<Session>()?;
         Ok(())
     }
 }
 
 mod thread {
     use super::*;
+    use crate::thread_runtime::structure::{ThreadIdentity, ThreadPayload};
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
+        zone::register_zone_for::<ThreadIdentity>()?;
+        zone::register_zone_for::<ThreadPayload>()?;
         Ok(())
     }
 }
