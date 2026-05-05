@@ -2,7 +2,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use tx_substrate::SpinMutex;
 
@@ -405,6 +405,58 @@ pub fn mount_for(
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_mount_table_for_test() {
     MOUNT_TABLE.lock().clear();
+}
+
+// === MountId / DevId allocators ======================================
+//
+// Per `txdoc:MOUNT-MOUNTPAYLOAD-1`,
+// `txdoc:MOUNT-STEP-MOUNT-COMMIT-ORDERING-1`
+// (`docs/design/05_filesystem/MOUNT_v1.md`): every mount commits a
+// fresh id at publication time. Day-1 boot wiring used hardcoded
+// values (`MountId(1)` / `MountId(2)` for rootfs/devfs); centralising
+// the allocation here lets follow-up mounts (extra tmpfs, future
+// procfs, devpts) participate without each call site picking its own
+// constant.
+//
+// Bootstrap-stability: the allocators are deterministic from cold
+// start. `allocate_mount_id()` returns 1 on its first call, 2 on its
+// second, etc.; same shape for `allocate_dev_id()`. The trio's
+// `boot_smoke_*` tests assert on the literal MountId(1) / MountId(2)
+// boot values; preserving the deterministic-from-cold-start guarantee
+// keeps those assertions valid without churn.
+//
+// The `0` value is reserved for "unset / sentinel" so a default-
+// constructed id never aliases a real mount.
+
+static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_DEV_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Allocate a fresh `MountId`. Deterministic from cold start: the
+/// first call returns `MountId(1)`, the second `MountId(2)`, etc.
+/// Mirrors the `allocate_tid` shape in
+/// `crate::thread_runtime::structure`.
+pub fn allocate_mount_id() -> MountId {
+    MountId(NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Allocate a fresh `DevId`. Deterministic from cold start: the first
+/// call returns `DevId(1)`, the second `DevId(2)`, etc.
+pub fn allocate_dev_id() -> DevId {
+    DevId(NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Reset the mount-id counter to its post-boot starting value (1).
+/// Test-only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_mount_id_counter_for_test() {
+    NEXT_MOUNT_ID.store(1, Ordering::Relaxed);
+}
+
+/// Reset the dev-id counter to its post-boot starting value (1).
+/// Test-only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_dev_id_counter_for_test() {
+    NEXT_DEV_ID.store(1, Ordering::Relaxed);
 }
 
 /// Reach inside a `Cap<MountPayload>` for its underlying allocation

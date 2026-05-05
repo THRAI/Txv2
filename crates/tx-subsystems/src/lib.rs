@@ -56,4 +56,27 @@ pub mod cross_crate_test_support {
     pub fn reset_tid_counter() {
         crate::thread_runtime::structure::reset_tid_counter_for_test();
     }
+
+    /// Reset the mount-table registry. Pairs with the
+    /// `mount::register_mount` / `mount::mount_for` table populated
+    /// by `init.rs::mount_devfs_at_dev`; tests that re-drive boot
+    /// wiring (e.g. `tx-kernel/src/init/tests.rs`) must clear the
+    /// table between runs.
+    pub fn reset_mount_table() {
+        crate::mount::reset_mount_table_for_test();
+    }
+
+    /// Reset the monotonic mount-id counter to its post-boot starting
+    /// value (1). Pairs with `mount::allocate_mount_id`; tests that
+    /// re-drive boot wiring rely on the deterministic sequence
+    /// `MountId(1)` (rootfs) → `MountId(2)` (devfs).
+    pub fn reset_mount_id_counter() {
+        crate::mount::reset_mount_id_counter_for_test();
+    }
+
+    /// Reset the monotonic dev-id counter to its post-boot starting
+    /// value (1). Pairs with `mount::allocate_dev_id`.
+    pub fn reset_dev_id_counter() {
+        crate::mount::reset_dev_id_counter_for_test();
+    }
 }
