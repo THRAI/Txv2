@@ -4,6 +4,66 @@
 
 ## Current Shape
 
+- 2026-05-06 ELF loader Phase 5 (`exec_script` orchestration) on branch
+  `feat/elf-loader-and-execve`. Per
+  `docs/progress/plans/2026-05-06-elf-loader-and-execve.md` Part 5.
+  Realises the EXEC_v1 eight-phase protocol against the seams shipped
+  by Wave 1 (build_aspace_from_image / populate_detached_user_range /
+  read_exact_at) and Wave 2 (step_close_cloexec_fds /
+  step_reset_signal_dispositions_for_exec / step_install_brk_for_exec).
+  Deliverables: (1) `tx-scripts::process::exec::script::exec_script::<P>(
+  process, thread, path, argv, envp, cred)` returning
+  `Result<(), ExecError>` (note: shape differs from the plan's
+  `Result<Infallible, ExecError>` sketch — the syscall-arm "do not
+  write a return value" decision is structural, made by Phase 6 of
+  the loader plan rather than encoded in the type). Eight-phase body:
+  walker `step_open` → snapshot `Cap<PageContainer>` from
+  `RNodeBacking::PageBacked` → 4 KiB `read_exact_at` → goblin parse →
+  bridge to `vm::scripts::ImagePlan` (every LOAD shares the file's
+  Cap<PC>) → V1 `build_aspace_from_image::<P>` → V2
+  `populate_detached_user_range` with stack image from
+  `build_initial_user_stack` → Phase-6 atomic
+  `replace_aspace` + `store_saved_user_context(UserTrapContext{ pc:
+  e_entry, regs[2]: initial_sp, .. })` → Phase-7 infallible commits
+  (CLOEXEC sweep, sig disposition reset, brk install at
+  `page_round_up(highest_load.vaddr + memsz)`). PoNR enforced
+  structurally: phases 1-5 use `?` and `.await` freely; phases 6-7 are
+  a straight-line synchronous block of atomic stores + Wave 2
+  helpers. (2) Cross-doc edit P-SIG-RESET: new
+  `tx_subsystems::process::execution::step_reset_signal_dispositions_for_exec`
+  thin wrapper around Wave 2's `SigActionTable::step_reset_for_exec`
+  so `tx-scripts` doesn't need to reach into the `pub(crate)` payload
+  field. (3) `tx-scripts/Cargo.toml` gains `tx-hal`, `tx-substrate`,
+  `tx-subsystems` deps + dev-dep on `tx-subsystems` with `test-support`.
+  Tests: 6 new (loads-minimal-elf-seeds-saved-user-context;
+  resets-brk-base-from-image-plan; invalid-elf-returns-not-executable;
+  path-not-found-returns-path-not-found;
+  resets-signal-dispositions-to-sig-dfl; closes-cloexec-fds-keeps-others)
+  driven via host block_on against an in-test `ExecTestFs` that
+  overrides `materialise_rnode` to produce
+  `RNodeBacking::PageBacked { pc }` over a kernel-built PageContainer
+  pre-populated with hand-crafted RV64 ET_EXEC fixture bytes via
+  `materialize_anon` + direct map. Verification: `cargo check
+  --workspace` clean; `cargo check -p tx-kernel-riscv64-qemu-virt
+  --target riscv64gc-unknown-none-elf` clean; `cargo test -p tx-scripts
+  --lib` 23 → 29; `cargo test -p tx-subsystems --lib --
+  --test-threads=1` 364/364 preserved; `cargo test -p tx-shims --lib`
+  17/17; `cargo test -p tx-fs --lib -- --test-threads=1` 13/13;
+  `cargo test -p tx-kernel --lib` 19/19; `cargo fmt --check` +
+  `cargo xtask progress validate` clean. Next: Phase 6 (NR_EXECVE
+  syscall arm in `tx-shims::linux_syscall`) which decodes user
+  argv/envp pointers, calls `exec_script::<P>`, and emits a new
+  `SyscallResult::ExecCommitted` shape so the thread future skips
+  the syscall-return writeback. Note for Phase 6: tmpfs's production
+  surface today does NOT override `materialise_rnode`, so a real
+  `step_open` against a regular file in tmpfs returns ENOSYS — the
+  test fixture works around it with an in-test FsOps override; tmpfs
+  needs a small `materialise_rnode` impl (cited
+  `bringup_fs_specs_v_1` §"tmpfs `Regular` →
+  `RNodeBacking::PageBacked { pc }` over the inode's
+  `Cap<PageContainer>`") before Phase 7's bootstrap exec path is
+  end-to-end-runnable from real init. Blocker: none.
+
 - 2026-05-06 ELF loader Wave 2 (Phase 2 CLOEXEC plumbing + Phase 1B
   P1/P2/P3 process-side helpers) on branch `feat/elf-loader-and-execve`.
   Per `docs/progress/plans/2026-05-06-elf-loader-and-execve.md` Part 2
