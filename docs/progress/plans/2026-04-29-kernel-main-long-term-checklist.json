@@ -77,7 +77,10 @@
       "docs/progress/plans/2026-05-06-elf-loader-and-execve.md",
       "docs/progress/research/2026-05-06-execve-and-elf-loader-scaffolding.md",
       "docs/progress/research/2026-05-06-musl-ltp-execve-coverage.md",
-      "docs/progress/decisions/2026-05-06-elf-loader-and-execve.md"
+      "docs/progress/decisions/2026-05-06-elf-loader-and-execve.md",
+      "docs/progress/plans/2026-05-06-fork-clone-wait4.md",
+      "docs/progress/research/2026-05-06-fork-clone-wait4-scaffolding.md",
+      "docs/progress/decisions/2026-05-06-fork-clone-wait4.md"
     ],
     "external_refs": []
   },
@@ -419,7 +422,7 @@
     {
       "command": "cargo xtask progress validate",
       "status": "passed",
-      "notes": "Re-run on 2026-05-06 after the ELF loader + execve slice landed in 7 phase commits on feat/elf-loader-and-execve (c67c970 wave 1 VM surface+stack+goblin; 5bdfc63 wave 2 CLOEXEC+P1/P2/P3; ecc1a86 wave 3 exec_script EXEC_v1 8 phases; b6fd6aa wave 4 NR_EXECVE+ExecCommitted; d9548b8 wave 5 bootstrap exec+fixture+smoke). Two more long-term steps promoted to complete: exec-loader-and-detached-aspace, first-userspace-entry. Cumulative steps complete after the ELF slice: baseline-h3-sentinel-kernel-main, coreinit-spine, zone-epoch-bus-foundation, reactor-and-round-robin-scheduler, vm-address-space-core, page-backed-and-reclaim, process-and-thread-runtime-core, syscall-dispatch-and-ast-loop, vfs-device-and-tty-init, exec-loader-and-detached-aspace, first-userspace-entry — 11 of 16. 24+ ok."
+      "notes": "Re-run on 2026-05-06 after the fork/clone/wait4 slice landed in 4 phase commits on feat/fork-clone-wait4 (e697631 wave 1 kernel prereqs: seed_child_leader_context + exit_port Channel + reactor_submit fn-pointer seam + POSIX wait_status_word migration; 2af7011 wave 2 tx-shims arms: NR_CLONE=220 + 5+1 introspection arms + musl-startup stubs; 45bd7d4 wave 3 NR_WAIT4=260 with blocking via wait_carrier on exit_port; 2f7b250 wave 4 fork+wait+exit fixture extension + Layer A smoke). No long-term-checklist step promotion — fork/clone is bundled into process-and-thread-runtime-core which was already complete after pre-ELF. Cumulative complete steps unchanged at 11 of 16. 24+ ok."
     },
     {
       "command": "cargo xtask lint docs",
@@ -441,9 +444,10 @@
   "blockers": [
     "Pre-ELF Phase 2 (commit abc9fb8) added TrapIf::enter_userspace_with_context as the portable HAL entry hook; RawTrapFrame as a portable HAL surface and TrapFrameMut direct-write are still not exposed at the trait level (they live as RV64 board internals).",
     "ELF Loader Wave 5 (commit d9548b8) wired the full bootstrap exec; kernel_main now drives a static-musl-shape ELF fixture through write+exit_group end-to-end. First userspace entry delivered.",
-    "tx-shims linux_syscall::dispatch covers 9 entries (the trio's 8 + NR_EXECVE=221) plus NR_FCNTL=25 with F_GETFD/F_SETFD (Wave 2 of ELF). LTP execve* day-1 MVP passes 3/6 outright + 4/6 sub-cases of execve03; remaining execve02/03/04/05 need DAC + setuid + ETXTBSY + fork. Real per-task AST plumbing (signal-handler frame setup) is the remaining piece for SIGNAL_v1 §15.2's full surface; uses empty-batch AstBatch::default() shortcut today.",
-    "tx-scripts now ships exec_script + goblin parser + stack/auxv builder; future filesystems and dynamic-linking surface (PT_INTERP, ET_DYN/PIE, fork/clone/wait4 chains) are the next-slice surface.",
-    "tmpfs/devfs mounted at boot + walker resolves /dev/console + tmpfs's FsOps::materialise_rnode produces PageBacked rnodes for regular files (commit d9548b8) — the canonical surface for executing a tmpfs-backed binary."
+    "fork/clone/wait4 slice (commits e697631, 2af7011, 45bd7d4, 2f7b250) added NR_CLONE=220 (bare-SIGCHLD only), NR_WAIT4=260 (blocking via wait_carrier on exit_port), 5+1 introspection arms (getppid/setpgid/getpgid/getsid/setsid; getpgrp=-ENOSYS), and 2 musl-startup stubs (set_tid_address/set_robust_list). LTP execve05 (concurrent exec stress) is unblocked. Remaining LTP gaps for full coverage: execve02 needs DAC+setuid; per-task AST plumbing for signal-handler frame setup; CLONE_VFORK / CLONE_THREAD / CLONE_VM (posix_spawn + pthread_create); NR_WAITID + siginfo plumbing.",
+    "tx-shims linux_syscall::dispatch covers 17 entries (trio's 8 + NR_EXECVE + NR_FCNTL + NR_CLONE + NR_WAIT4 + 5 introspection arms + 2 stubs).",
+    "tx-scripts ships exec_script + goblin parser + stack/auxv builder; ET_DYN/PIE + PT_INTERP / dynamic linking are the next-slice surface beyond fork.",
+    "tmpfs/devfs mounted at boot + walker resolves /dev/console + tmpfs's FsOps::materialise_rnode produces PageBacked rnodes for regular files — the canonical surface for executing a tmpfs-backed binary. Forking a process inherits the parent's fd table (Wave 2 cloned bits via step_fork's snapshot_fds; CLONE_FILES sharing remains deferred)."
   ],
   "handoff": {
     "needed": false,
