@@ -231,7 +231,7 @@ pub async fn run_thread<P: TxPlatform>(
                     thread.clone(),
                     aspace,
                 );
-                let result = tx_shims::linux_syscall::dispatch(req, &ctx).await;
+                let result = tx_shims::linux_syscall::dispatch::<P>(req, &ctx).await;
 
                 match result {
                     tx_shims::linux_syscall::SyscallResult::Return(v) => {
@@ -244,6 +244,33 @@ pub async fn run_thread<P: TxPlatform>(
                         // Thread/process exited inside dispatch; do not
                         // re-enter userspace.
                         return;
+                    }
+                    tx_shims::linux_syscall::SyscallResult::ExecCommitted => {
+                        // Wave 4 / Phase 6 of the ELF-loader plan:
+                        // `execve` replaced the process's
+                        // `AddressSpace` and seeded the thread's
+                        // `saved_user_context` with the new image's
+                        // entry pc / initial sp. Per Plan B
+                        // writeback discipline (and
+                        // `txdoc:EXEC-12-1-INSTALL-USER-TRAP-CONTEXT`)
+                        // we MUST NOT drain
+                        // `pending_syscall_return` for this
+                        // iteration — the new image's `_start`
+                        // expects a fresh stack and zero-initialised
+                        // gprs (System V psABI). The previous trap
+                        // frame's `a0` is effectively discarded.
+                        //
+                        // No early return: fall through to AST drain
+                        // + `prepare_userspace_entry_payload` +
+                        // `enter_userspace_with_context`. Since the
+                        // dispatcher did not write the pending-return
+                        // slot, `drain_pending_syscall_return` reads
+                        // `None` and the merged context's `a0`
+                        // defaults to whatever
+                        // `saved_user_context.regs[10]` already
+                        // carries (zero from the script's fresh
+                        // `UserTrapContext`, per
+                        // `make_initial_user_trap_context`).
                     }
                 }
             }
