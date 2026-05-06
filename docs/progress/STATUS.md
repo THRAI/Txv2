@@ -4,6 +4,55 @@
 
 ## Current Shape
 
+- 2026-05-06 Pre-ELF Phase 7 (end-to-end production smoke +
+  `kernel_main` reactor-loop wiring) on branch `feat/pre-elf-runtime`.
+  Per `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`
+  §"Phasing" item 7 ("End-to-end host smoke. A single tx-kernel test
+  that exercises trap shell → reactor task wrapper → thread future →
+  linux_syscall::dispatch → tty + devfs through real walker → real RX
+  path, with no synthesised driver."). Three production-code
+  deliverables landed: (1) `CoreInit::boot` now calls a new
+  `run_userspace_reactor_loop` after `boot_sentinel` — fetches init's
+  leader thread + payload, builds
+  `PerHartSlotted<P, run_thread::<P>(thread, payload)>`, submits via
+  `BOOT_REACTOR.with(|r| r.submit_task(...))`, then drives the BSP
+  hart loop using the same `step_hart_loop_at` shape the secondary
+  CPUs already use; loop exits on `init.is_zombie()` and emits
+  `:userspace:exited:N` (where N = `ExitStatus::wait_status_word()`)
+  before `system_off`. (2) `ThreadIdentity::payload_cap_for_test` was
+  promoted to a production `payload_cap()` accessor (kept as alias for
+  test-support) so `kernel_main` can reach the leader's payload
+  without the `pub(crate)` field. (3) `run_thread`'s loop body
+  restructured: AST checkpoint runs on a *fresh* `start_request`
+  (entry_token) instead of the just-resolved one
+  (`req_token`), fixing the `NoActiveRequest` failure surfaced by the
+  end-to-end drive. The trio's Phase 6 fake-driver smoke
+  (`boot_smoke_userspace_round_trip_writes_console_then_exits`) is
+  deleted; replaced by `boot_smoke_production_userspace_loop_writes_
+  console_then_exits` in `crates/tx-kernel/src/init/tests.rs`. The new
+  smoke uses Option C (pragmatic limit-to-divergence per the Phase 7
+  brief): a `TestPlatform`'s `TrapIf::enter_userspace_with_context`
+  override captures the merged `UserTrapContext` into a static and
+  panics with `SMOKE_YIELD_PANIC`; the smoke wraps each `Future::poll`
+  in `std::panic::catch_unwind` and runs a fresh `run_thread` per
+  scripted syscall. Two iterations: (i) `write(1, "hi\n", 3)` drives
+  the production walker → tty → ConsoleIf::write_bytes path, asserts
+  `b"hi\r\n"` post-OPOST capture and `regs[10] == 3` (Plan B writeback
+  discipline); (ii) `exit_group(0)` returns `SyscallResult::NoReturn`,
+  the future resolves Ready cleanly, init zombifies with
+  `ExitStatus::Exited(0)`. tx-kernel 19 → 19 (one deleted, one new;
+  test_count unchanged); tx-subsystems 344/344 serial, tx-shims 12/12,
+  tx-fs 13/13 serial, tx-substrate sync 2/2. `cargo check --workspace`,
+  `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`, `cargo fmt --check`,
+  `cargo xtask progress validate` all clean. Next: ELF loader (out of
+  scope for pre-ELF wave); the production reactor loop is wired and
+  ready to drive a real userspace binary as soon as one can be
+  loaded. Blocker: none; the smoke's "limit-to-divergence" choice
+  matches the brief's recommendation, and the
+  `enter_userspace_with_context` divergent path is exercised
+  end-to-end on the RV64 board target (verified by `cargo check`).
+
 - 2026-05-06 Pre-ELF Phase 2 (reactor task wrapper + userspace-entry
   shim) on branch `feat/pre-elf-runtime`. Per
   `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md` Part 1.

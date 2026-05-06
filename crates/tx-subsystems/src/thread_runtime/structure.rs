@@ -63,20 +63,29 @@ impl ThreadIdentity {
     /// not yet a zombie. Returns `None` once `step_thread_exit` has
     /// dropped the payload.
     ///
-    /// **Test-support only.** The Trio Phase 6 end-to-end smoke test
-    /// (`crates/tx-kernel/src/init/tests.rs`) needs to install the
-    /// leader thread's payload in the per-hart slot via
-    /// `set_current_thread_payload`, write `pending_syscall_return`
-    /// after each dispatched syscall, and drain it from the fake
-    /// userspace-entry shim. Production code reaches the payload
-    /// through other seams (the trap shell looks it up off the
-    /// per-hart slot; `step_thread_exit` mutates it via the
-    /// crate-private field). Gated behind `cfg(any(test, feature =
-    /// "test-support"))` so the surface is invisible in release
-    /// builds.
+    /// Production callers: `tx-kernel`'s `kernel_main` reactor-loop
+    /// wiring (Pre-ELF Phase 7) needs the leader's payload to build
+    /// `PerHartSlotted::new(payload, run_thread::<P>(thread, payload))`
+    /// before submitting it to the reactor. The trap shell still
+    /// reaches the payload via the per-hart slot
+    /// (`current_thread_payload(hart)`); `step_thread_exit` still
+    /// mutates the payload via the crate-private field. This accessor
+    /// exists so the bootstrap site can build the future without
+    /// reaching into the `pub(crate)` slot directly.
+    ///
+    /// Test callers: the per-hart slot can be installed manually for
+    /// targeted unit tests (see
+    /// `crates/tx-kernel/src/thread_future/tests.rs`).
+    pub fn payload_cap(&self) -> Option<PayloadCap<ThreadPayload>> {
+        self.payload.lock().clone()
+    }
+
+    /// Backwards-compatible alias for [`Self::payload_cap`]. Kept so
+    /// existing `cfg(test)`-gated call sites compile unchanged while
+    /// the production accessor takes over the canonical name.
     #[cfg(any(test, feature = "test-support"))]
     pub fn payload_cap_for_test(&self) -> Option<PayloadCap<ThreadPayload>> {
-        self.payload.lock().clone()
+        self.payload_cap()
     }
 }
 
