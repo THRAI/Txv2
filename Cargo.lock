@@ -415,6 +415,9 @@ name = "tx-scripts"
 version = "0.1.0"
 dependencies = [
  "goblin",
+ "tx-hal",
+ "tx-substrate",
+ "tx-subsystems",
 ]
 
 [[package]]

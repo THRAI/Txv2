@@ -22,3 +22,17 @@ doctest = false
 # dyn32 / Header::new gating (track via a goblin issue / version
 # bump in a follow-up).
 goblin = { version = "0.10", default-features = false, features = ["alloc", "endian_fd", "elf64", "elf32"] }
+# Phase 5 (exec script) integrates the loader with the kernel-side
+# subsystems: VFS walker, page-backed targeted reads, vm scripts,
+# process / thread runtime, and signal table reset. The substrate
+# pulls in zone / cap / epoch primitives transitively via tx-subsystems
+# but the exec script also calls `tx_substrate::epoch::guard()`
+# directly so we declare the dep explicitly.
+tx-hal = { path = "../tx-hal" }
+tx-substrate = { path = "../tx-substrate" }
+tx-subsystems = { path = "../tx-subsystems" }
+
+[dev-dependencies]
+# Cross-crate test helpers (zone reset / pid counter reset / init slot
+# reset) for the Phase 5 exec_script tests.
+tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }

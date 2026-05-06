@@ -729,6 +729,25 @@ pub fn step_close_cloexec_fds(process: &Cap<ProcessIdentity>) {
     }
 }
 
+/// Reset every user-installed signal disposition on `process` to
+/// `SigDisposition::Default`, preserving `Default` and `Ignore` slots.
+///
+/// Thin Phase-5 wrapper around
+/// [`crate::signal::SigActionTable::step_reset_for_exec`] (Wave 2 P2)
+/// that lets the exec script (`tx-scripts::process::exec`) reach the
+/// per-process action table without touching the `pub(crate)` payload
+/// field on [`ProcessIdentity`]. Per
+/// `txdoc:EXEC-12-3-RESET-SIGNAL-DISPOSITIONS` and `SIGNAL_v1` §15.2:
+/// exec resets handlers but does NOT clear pending signals or
+/// SIG_IGN dispositions.
+///
+/// Infallible — by EXEC-PONR. No-op for zombies (no payload).
+pub fn step_reset_signal_dispositions_for_exec(process: &Cap<ProcessIdentity>) {
+    if let Some(payload) = process.payload.lock().as_ref() {
+        payload.sig_actions().step_reset_for_exec();
+    }
+}
+
 /// Install `new_brk_base` as both the brk base and the current brk
 /// for `process`. Per `txdoc:EXEC-12-4-INSTALL-BRK` and the Wave 2
 /// plan's Part 1 P3 sub-item.
