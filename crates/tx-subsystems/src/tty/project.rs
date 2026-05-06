@@ -1,0 +1,378 @@
+//! TTY-facing devfs/devpts materialization helpers.
+//!
+//! These helpers are intentionally below a full filesystem implementation.
+//! They let devfs/devpts or tests materialize the RNode/OpenFile shape that
+//! PAGE_BACKED/DEVICE/TTY specify without needing path-walk or fd tables yet.
+
+use alloc::vec::Vec;
+
+use tx_substrate::zone::Cap;
+
+use crate::execution::{Errno, Guard, StepOutcome};
+use crate::tty::execution;
+use crate::tty::structure::registry;
+use crate::tty::structure::TtyIdentity;
+use crate::vfs::{
+    Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
+    OpenFileFlags, RNode, RNodeBacking, StructPayload,
+};
+
+const DEVFS_TTY_OBJECT_BASE: u64 = 0x7474_7900;
+pub const DEVPTS_ROOT_OBJECT_ID: FsObjectId = FsObjectId::new(0x7074_7300);
+pub const DEVPTS_PTMX_OBJECT_ID: FsObjectId = FsObjectId::new(0x7074_7301);
+const DEVPTS_SLAVE_OBJECT_BASE: u64 = 0x7074_7400;
+
+pub struct DevptsInstance;
+
+impl FsOps for DevptsInstance {
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<FsObjectId> {
+        if parent != DEVPTS_ROOT_OBJECT_ID {
+            return StepOutcome::Err(Errno::ENOENT);
+        }
+
+        if name == b"ptmx" {
+            return StepOutcome::Done(DEVPTS_PTMX_OBJECT_ID);
+        }
+
+        let Some(index) = parse_u32_decimal(name) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        if registry::contains_pty_slave(index) {
+            return StepOutcome::Done(devpts_object_id_for_index(index));
+        }
+
+        StepOutcome::Err(Errno::ENOENT)
+    }
+
+    fn load_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<InodeMeta> {
+        if fs_object_id == DEVPTS_ROOT_OBJECT_ID {
+            return StepOutcome::Done(InodeMeta::new(InodeKind::Directory, 0o040755));
+        }
+        if fs_object_id == DEVPTS_PTMX_OBJECT_ID {
+            return StepOutcome::Done(InodeMeta::new(InodeKind::CharDevice, 0o020666));
+        }
+        if let Some(index) = pty_index_from_devpts_object_id(fs_object_id) {
+            if registry::contains_pty_slave(index) {
+                return StepOutcome::Done(InodeMeta::new(InodeKind::CharDevice, 0o020620));
+            }
+        }
+        StepOutcome::Err(Errno::ENOENT)
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _meta: &InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        StepOutcome::Err(Errno::EROFS)
+    }
+
+    fn create_inode(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
+        StepOutcome::Err(Errno::EROFS)
+    }
+
+    fn unlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        StepOutcome::Err(Errno::EROFS)
+    }
+
+    fn rename(
+        &self,
+        _old_parent: FsObjectId,
+        _old_name: &[u8],
+        _new_parent: FsObjectId,
+        _new_name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        StepOutcome::Err(Errno::EROFS)
+    }
+
+    fn link(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        StepOutcome::Err(Errno::EROFS)
+    }
+
+    fn mkdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
+        StepOutcome::Err(Errno::EROFS)
+    }
+
+    fn rmdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        StepOutcome::Err(Errno::EROFS)
+    }
+
+    fn symlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _link_target: &[u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
+        StepOutcome::Err(Errno::EROFS)
+    }
+
+    fn readdir(
+        &self,
+        fs_object_id: FsObjectId,
+        cursor: DirCursor,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
+        if fs_object_id != DEVPTS_ROOT_OBJECT_ID {
+            return StepOutcome::Err(Errno::ENOTDIR);
+        }
+
+        let entries = match devpts_dir_entries() {
+            Ok(entries) => entries,
+            Err(err) => return StepOutcome::Err(err),
+        };
+        let index = cursor.as_u64() as usize;
+        let Some(entry) = entries.get(index).copied() else {
+            return StepOutcome::Done(None);
+        };
+        StepOutcome::Done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
+    }
+
+    fn destroy_inode(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
+        if fs_object_id == DEVPTS_ROOT_OBJECT_ID
+            || fs_object_id == DEVPTS_PTMX_OBJECT_ID
+            || pty_index_from_devpts_object_id(fs_object_id)
+                .is_some_and(registry::contains_pty_slave)
+        {
+            return StepOutcome::Done(());
+        }
+
+        StepOutcome::Err(Errno::ENOENT)
+    }
+}
+
+/// Resolve a devfs TTY entry such as `ttyS0` or `console`.
+pub fn devfs_tty_by_name(name: &[u8], _guard: &Guard<'_>) -> StepOutcome<Cap<TtyIdentity>> {
+    if name == b"ptmx" {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+
+    if let Some(index) = parse_tty_s_index(name) {
+        if let Some(tty) = registry::hardware_tty(index) {
+            return StepOutcome::Done(tty);
+        }
+    }
+
+    if let Some(alias) = registry::devfs_alias(name) {
+        return StepOutcome::Done(alias);
+    }
+
+    StepOutcome::Err(Errno::ENOENT)
+}
+
+/// Materialize a devfs RNode for `ttyS<N>` or `console`.
+pub fn devfs_rnode_by_name(name: &[u8], guard: &Guard<'_>) -> StepOutcome<Cap<RNode>> {
+    let tty = match devfs_tty_by_name(name, guard) {
+        StepOutcome::Done(tty) => tty,
+        StepOutcome::Err(err) => return StepOutcome::Err(err),
+        _ => return StepOutcome::Err(Errno::EIO),
+    };
+    let index = tty.index;
+    rnode_for_tty(tty, FsObjectId::new(DEVFS_TTY_OBJECT_BASE + index as u64))
+}
+
+/// Open `/dev/ptmx`-shaped pty master. Full path-walk/fd-table layers can wrap
+/// this and install `master_file` into the caller's fd table.
+pub fn open_ptmx(guard: &Guard<'_>) -> StepOutcome<execution::OpenPtyOutcome> {
+    execution::step_openpty(guard)
+}
+
+/// Open a devfs hardware/alias TTY entry such as `/dev/ttyS0` or `/dev/console`.
+pub fn open_devfs_tty_by_name(name: &[u8], guard: &Guard<'_>) -> StepOutcome<Cap<OpenFile>> {
+    let tty = match devfs_tty_by_name(name, guard) {
+        StepOutcome::Done(tty) => tty,
+        StepOutcome::Err(err) => return StepOutcome::Err(err),
+        _ => return StepOutcome::Err(Errno::EIO),
+    };
+    open_file_for_tty(tty, guard)
+}
+
+/// Resolve a devpts numeric slave entry.
+pub fn devpts_slave_by_index(index: u32, _guard: &Guard<'_>) -> StepOutcome<Cap<TtyIdentity>> {
+    match registry::pty_slave(index) {
+        Some(slave) => StepOutcome::Done(slave),
+        None => StepOutcome::Err(Errno::ENOENT),
+    }
+}
+
+/// Materialize `/dev/pts/<N>` as `StructBacked::Tty(slave)`.
+pub fn devpts_rnode_by_index(index: u32, guard: &Guard<'_>) -> StepOutcome<Cap<RNode>> {
+    let slave = match devpts_slave_by_index(index, guard) {
+        StepOutcome::Done(slave) => slave,
+        StepOutcome::Err(err) => return StepOutcome::Err(err),
+        _ => return StepOutcome::Err(Errno::EIO),
+    };
+    rnode_for_tty(slave, devpts_object_id_for_index(index))
+}
+
+/// Build an OpenFile over a fresh StructBacked TTY RNode.
+pub fn open_file_for_tty(tty: Cap<TtyIdentity>, _guard: &Guard<'_>) -> StepOutcome<Cap<OpenFile>> {
+    let object_id = FsObjectId::new(DEVFS_TTY_OBJECT_BASE + tty.raw() as u64);
+    let rnode = match rnode_for_tty(tty, object_id) {
+        StepOutcome::Done(rnode) => rnode,
+        StepOutcome::Err(err) => return StepOutcome::Err(err),
+        _ => return StepOutcome::Err(Errno::EIO),
+    };
+
+    match OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+        },
+    ) {
+        Ok(file) => StepOutcome::Done(file),
+        Err(_) => StepOutcome::Err(Errno::EIO),
+    }
+}
+
+fn rnode_for_tty(tty: Cap<TtyIdentity>, object_id: FsObjectId) -> StepOutcome<Cap<RNode>> {
+    match RNode::new_cap(
+        object_id,
+        InodeMeta::new(InodeKind::CharDevice, 0o020600),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty),
+        },
+    ) {
+        Ok(rnode) => StepOutcome::Done(rnode),
+        Err(_) => StepOutcome::Err(Errno::EIO),
+    }
+}
+
+fn devpts_dir_entries() -> Result<Vec<DirEntry>, Errno> {
+    let mut entries = Vec::with_capacity(registry::MAX_PTY_SLAVES + 1);
+    entries.push(DirEntry::new(
+        DEVPTS_PTMX_OBJECT_ID,
+        InodeKind::CharDevice,
+        b"ptmx",
+    )?);
+
+    let (indices, len) = registry::list_pty_slave_indices();
+    for index in indices.into_iter().take(len) {
+        let name = PtyIndexName::new(index);
+        entries.push(DirEntry::new(
+            devpts_object_id_for_index(index),
+            InodeKind::CharDevice,
+            name.as_bytes(),
+        )?);
+    }
+
+    Ok(entries)
+}
+
+fn devpts_object_id_for_index(index: u32) -> FsObjectId {
+    FsObjectId::new(DEVPTS_SLAVE_OBJECT_BASE + index as u64)
+}
+
+fn pty_index_from_devpts_object_id(fs_object_id: FsObjectId) -> Option<u32> {
+    let raw = fs_object_id.as_u64();
+    if raw < DEVPTS_SLAVE_OBJECT_BASE {
+        return None;
+    }
+    u32::try_from(raw - DEVPTS_SLAVE_OBJECT_BASE).ok()
+}
+
+fn parse_tty_s_index(name: &[u8]) -> Option<u32> {
+    let digits = name.strip_prefix(b"ttyS")?;
+    parse_u32_decimal(digits)
+}
+
+fn parse_u32_decimal(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut value = 0u32;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add((byte - b'0') as u32)?;
+    }
+    Some(value)
+}
+
+struct PtyIndexName {
+    buf: [u8; 10],
+    len: usize,
+}
+
+impl PtyIndexName {
+    fn new(value: u32) -> Self {
+        let mut out = Self {
+            buf: [0; 10],
+            len: 0,
+        };
+        out.push_u32(value);
+        out
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    fn push_u32(&mut self, value: u32) {
+        let mut digits = [0u8; 10];
+        let mut n = value;
+        let mut len = 0;
+        loop {
+            digits[len] = b'0' + (n % 10) as u8;
+            len += 1;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        for digit in digits[..len].iter().rev() {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = *digit;
+                self.len += 1;
+            }
+        }
+    }
+}

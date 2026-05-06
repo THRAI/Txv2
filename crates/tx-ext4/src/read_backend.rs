@@ -6,8 +6,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::sync::Arc;
 use tx_ext4_format::pager::{BlockImage, Ext4Pager, InodeMetaLite, InodeNo};
 use tx_ext4_format::Ext4FormatError;
-use tx_subsystems::step::Errno;
-use tx_subsystems::vfs::fs_ops::DirCursor;
+use tx_subsystems::execution::Errno;
+use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
 pub(crate) const EXT4_ROOT_INODE: u32 = 2;
@@ -85,15 +85,15 @@ impl<I> Drop for Ext4PagerGuard<'_, I> {
 }
 
 pub(crate) fn inode_no(fs_object_id: FsObjectId) -> Result<InodeNo, Errno> {
-    let raw = u32::try_from(fs_object_id.0).map_err(|_| Errno::NoEntry)?;
+    let raw = u32::try_from(fs_object_id.as_u64()).map_err(|_| Errno::ENOENT)?;
     if raw == 0 {
-        return Err(Errno::NoEntry);
+        return Err(Errno::ENOENT);
     }
     Ok(InodeNo::new(raw))
 }
 
 pub(crate) fn fs_object_id(inode: InodeNo) -> FsObjectId {
-    FsObjectId(inode.get() as u64)
+    FsObjectId::new(inode.get() as u64)
 }
 
 pub(crate) fn map_inode_meta(meta: InodeMetaLite) -> InodeMeta {
@@ -113,11 +113,11 @@ pub(crate) fn map_inode_meta(meta: InodeMetaLite) -> InodeMeta {
 
 pub(crate) fn cursor_index(cursor: DirCursor) -> Result<usize, Errno> {
     if cursor.0[8..].iter().any(|byte| *byte != 0) {
-        return Err(Errno::Invalid);
+        return Err(Errno::EINVAL);
     }
     let mut raw = [0u8; 8];
     raw.copy_from_slice(&cursor.0[..8]);
-    usize::try_from(u64::from_le_bytes(raw)).map_err(|_| Errno::Invalid)
+    usize::try_from(u64::from_le_bytes(raw)).map_err(|_| Errno::EINVAL)
 }
 
 pub(crate) fn cursor_from_index(index: usize) -> DirCursor {
@@ -129,10 +129,10 @@ pub(crate) fn cursor_from_index(index: usize) -> DirCursor {
 pub(crate) fn map_format_error(err: Ext4FormatError) -> Errno {
     match err {
         Ext4FormatError::BadMagic | Ext4FormatError::Corrupt | Ext4FormatError::Truncated => {
-            Errno::Invalid
+            Errno::EINVAL
         }
-        Ext4FormatError::OutOfBounds => Errno::NoEntry,
-        Ext4FormatError::Unsupported => Errno::NotImplemented,
+        Ext4FormatError::OutOfBounds => Errno::ENOENT,
+        Ext4FormatError::Unsupported => Errno::ENOSYS,
     }
 }
 

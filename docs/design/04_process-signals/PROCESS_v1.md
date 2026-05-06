@@ -309,17 +309,25 @@ pub struct Session {
     // Informational
     pub leader_pid: Pid,
 
-    // Controlling tty (optional)
+    // Controlling tty (optional). Foreground-pgrp lives on TtyIdentity
+    // per OPA-3 (see below).
     pub controlling_tty: Binding<Tty>,
-    pub foreground_pgrp: AtomicSlot<Option<Binding<ProcessGroup>>>,
 }
 ```
 
 - `sid_name` — non-retaining snapshot of the session's namespace-visible number(s). The authoritative sid binding lives in `PidNamespace.numbers -> PidName`.
 - `members` — downward materialization of pgroups.
 - `leader_pid` — informational; the original leader's pid when setsid was called.
-- `controlling_tty` — authoritative binding to the tty (if any). Set by the session leader opening a tty without `O_NOCTTY`; cleared by TIOCNOTTY or tty hangup.
-- `foreground_pgrp` — the canonical foreground pgroup for the session's tty. `tcsetpgrp(3)` resolves the caller-supplied pgid through the caller's pid namespace, then binds this field to the canonical `ProcessGroup`.
+- `controlling_tty` — derived peer reference to the tty (if any). The authoritative slot is `TtyIdentity.session_pgrp` per OPA-3 (TTY-owned control binding); `Session.controlling_tty` is the matching mirror so process-side callers can find their tty without walking the device registry. Set when the session leader opens a tty without `O_NOCTTY` (TIOCSCTTY publishes both halves); cleared by TIOCNOTTY or tty hangup.
+
+**Foreground process group — not stored on Session.** Per [`OBJECT_PATTERN_FIXES_v1.md`](../00_meta-framework/OBJECT_PATTERN_FIXES_v1.md) OPA-3 (TTY-CTL-1), the authoritative foreground-pgrp slot lives on `TtyIdentity.session_pgrp`, bundled with the controlling-session reference as a single `SessionPgrp { session, foreground_pgrp }` atomic-swap unit. Process-side callers that need the foreground pgrp use the `Session::foreground_pgrp_cap()` helper, which performs the two-hop weak dereference:
+
+```text
+Session ─ controlling_tty ──Weak──▶ TtyIdentity
+                                       └ session_pgrp ──Weak──▶ ProcessGroup
+```
+
+Either upgrade may return `None` (no controlling tty installed; tty has been reclaimed; tty has no foreground pgrp; pgrp has been reclaimed). Callers must handle the `None` case explicitly — e.g. session-leader death (§8.3) skips the SIGHUP cascade if the helper returns `None`. `tcsetpgrp(3)` is a tty operation that publishes a new `SessionPgrp` via `swap_commit` on the tty, not on the session.
 
 **Lifetime:**
 - Created via setsid.
@@ -345,14 +353,27 @@ pub struct Frame {
     pub sig_actions: Shared<SigActionTable>,   // CLONE_SIGHAND
     pub fs_context: Shared<FsContext>,         // CLONE_FS
 
-    // Inline scalars
-    pub cwd: Cap<RNode>,                       // (fs_context may override; belongs here for speed)
-    pub root: Cap<RNode>,                      // chroot boundary
+    // Inline slots — DEntry-shaped because path resolution and
+    // `getcwd(2)` rendering both need the named-path edge that
+    // `RNode` alone doesn't carry. VFS's `ResolveCtx` takes
+    // `Cap<DEntry>` for cwd-bound lookups; the same shape lives here.
+    pub cwd: Cap<DEntry>,                      // (fs_context may override; belongs here for speed)
+    pub root: Cap<DEntry>,                     // chroot boundary
     pub umask: AtomicU16,
 
     // Namespace pointers live in ProcessPayload.nsproxy.
 }
 ```
+
+**v1.2 amendment.** Earlier drafts spelled `cwd: Cap<RNode>` and
+`root: Cap<RNode>`. This was a simplification that lost the
+named-path edge needed to render absolute paths (POSIX `getcwd(2)`
+walks the parent-name chain back to the root). VFS's
+[`ResolveCtx`](../05_filesystem/VFS_CHECKS_V2.1.md) already takes
+a `Cap<DEntry>` for cwd-bound resolution; PROCESS aligns with that
+shape. The DEntry's contained `Cap<RNode>` is reachable via
+`dentry.rnode()` for code paths that only care about the inode
+identity.
 
 ### 3.1 Shared<T> semantics
 
@@ -1145,14 +1166,16 @@ This is a cascade of `deliver_posix_signal(SignalTarget::Process(member), SIGHUP
 
 <!-- txdoc:PROCESS-SESSION-LEADER-DEATH-1 -->
 
-When a session leader process exits:
+When a session leader process exits, `step_process_exit` runs the controlling-tty severance cascade in its commit phase. The foreground-pgrp slot is on `TtyIdentity` (OPA-3, §2.4), so the cascade is a **two-hop weak dereference** with `None`-tolerant handling at each hop:
 
-1. **Detach controlling tty.** `session.controlling_tty.take()` — session no longer has a tty.
-2. **Hang up tty.** For the tty that was controlling, severance means: tty sends SIGHUP to its (former) foreground pgroup, then clears its own foreground-pgrp binding.
-3. **Clear controlling-tty references in other session members.** Each session member that was using the tty as its controlling tty now has no controlling tty. (In practice, tracked via session.controlling_tty; individual processes don't cache this.)
-4. **SIGHUP cascade.** All processes in the session's foreground pgroup receive SIGHUP.
+1. **Resolve foreground pgrp via the controlling tty.** Walk `session.foreground_pgrp_cap()` (defined in §2.4):
+   - First hop: upgrade `session.controlling_tty: Weak<TtyIdentity>`. If `None` (TIOCNOTTY already ran, or tty already reclaimed), the cascade is a no-op — the session had no controlling tty at exit time.
+   - Second hop: read `tty.session_pgrp` and upgrade its `foreground_pgrp: Weak<ProcessGroup>`. If `None` (no fg pgrp installed, or pgrp reclaimed), skip the SIGHUP step but still proceed to step 3 (the tty's own session_pgrp slot must be cleared regardless).
+2. **SIGHUP cascade.** If both upgrades succeeded, `deliver_posix_signal(SignalTarget::ProcessGroup(fg_pgrp), SIGHUP, siginfo)`. POSIX §11.1.3 also requires SIGCONT to wake any stopped processes in the fg pgrp; that follows the SIGHUP per `TTY.md` §11.
+3. **Clear the tty's session-pgrp binding.** `tty.clear_session_pgrp()` — the tty no longer has a controlling session. This severs the binding on the authoritative side (TTY); subsequent `session.foreground_pgrp_cap()` calls will short-circuit at the second hop.
+4. **Clear `session.controlling_tty`.** The mirror on the session side. After this, the session continues to exist (still retained by its pgrps) but has no tty linkage — the leader-exit-with-survivors window (§6) keeps the session reapable.
 
-This is a cascade running in step_process_exit's commit phase.
+**Atomicity note.** Steps 1–4 are not a single atomic publication; the cascade is class-3 compositional per `BINDING_v1`. A concurrent reader on another hart can observe the SIGHUP delivered while the tty's `session_pgrp` is still set, or vice versa. POSIX does not constrain intermediate-state visibility for session-leader death; the observed behavior is internally consistent with each individual atomic publication.
 
 **Observable effect:** terminal-connected sessions see SIGHUP when the shell exits. Standard Unix behavior (the "logout hangs up running jobs" behavior).
 

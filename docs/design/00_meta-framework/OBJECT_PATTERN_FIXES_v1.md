@@ -180,26 +180,32 @@ pub struct ProcessGroup {
 }
 ```
 
-There are two valid ownership choices. Pick one and make it explicit:
+**Decided: TTY-owned control binding for the terminal relationship, PROCESS-owned membership for sessions/pgrps.**
 
-| Choice | Authoritative owner | Derived materialization |
+| | Authoritative owner | Derived materialization |
 |---|---|---|
-| TTY-owned control binding | `TtyIdentity.controlling_session` and `foreground_pgrp` | `Session.controlling_tty` |
-| PROCESS-owned control binding | `Session.controlling_tty` and `foreground_pgrp` | `TtyIdentity.session_ctl` snapshot |
+| controlling-session / foreground-pgrp | `TtyIdentity.session_pgrp` (bundled `SessionPgrp { session, foreground_pgrp }`, single atomic-swap unit) | `Session.controlling_tty: Weak<TtyIdentity>` mirror |
+| session / pgrp / process membership | PROCESS subsystem (`Session.members`, `ProcessGroup.members`, …) | TTY revalidates via `Weak` upgrade when dispatching |
 
-Recommended: **TTY-owned control binding for the terminal relationship, PROCESS-owned membership for sessions/pgrps.**
+Why TTY-owned beats Session-owned for the terminal binding:
 
-Why:
+- **Subsystem encapsulation.** TIOCSCTTY, TIOCSPGRP, tcsetpgrp, hangup, and VINTR-routes-SIGINT-to-fg-pgrp are all TTY-side operations. Putting the slot on TTY localizes the writes; putting it on Session forces every TTY job-control op to reach across into Session and mutate "Session's" state.
+- **Hangup atomicity.** Hangup must `clear(controlling_session) + SIGHUP-to-fg-pgrp + fire(hangup_port)` as one visibility boundary. TTY-owned makes that one subsystem's commit phase. Session-owned makes it span two subsystems' atomic publications, with a window where SIGHUP has fired but the session still claims a tty.
+- **Bundled-pair invariant.** `(controlling_session, fg_pgrp)` are a unit — fg_pgrp is meaningless without controlling_session. As fields of one `SessionPgrp` struct atomic-swapped together, the invariant is structural; as two separate `AtomicSlot`s on Session it would be a runtime obligation enforced by every writer.
+- **Lifecycle alignment.** A controlling-terminal binding's natural death is "the terminal goes away" — a TTY-internal event (hardware loss, pty master close). Local clear on TTY; the mirror Weak on Session goes stale on its next upgrade.
+- **Cross-subsystem write happens once either way.** Session-leader-death has to clear the tty's binding regardless of which side is authoritative; TTY-owned just means *every other* operation stays local.
 
-- The controlling terminal is a property of a terminal endpoint.
-- Hangup is a TTY transition; clearing the control binding and firing `hangup_port` are naturally one visibility boundary.
-- Session/pgrp membership remains PROCESS-owned and is revalidated when TTY dispatches to a pgrp.
+Session/pgrp membership remains PROCESS-owned: TTY holds `Weak<Session>` / `Weak<ProcessGroup>` and revalidates on dispatch. PROCESS does not need to know about TTYs to manage its own topology.
 
-Required invariant:
+Required invariants (enforced by `cargo xtask lint arch`):
 
 **TTY-CTL-1.** A controlling-terminal binding names a `Session` identity and a foreground `ProcessGroup` identity. TTY never stores leader-process caps as a substitute for session/pgrp truth.
 
-LINT: reject `SessionPgrp { session_leader: Cap<ProcessIdentity>, fg_pgrp_leader: Cap<ProcessIdentity> }` in TTY structure.
+LINT: reject `SessionPgrp { session_leader: Cap<ProcessIdentity>, fg_pgrp_leader: Cap<ProcessIdentity> }` (or any `Cap<ProcessIdentity>` field on `SessionPgrp`) in TTY structure.
+
+**TTY-CTL-1a.** No `foreground_pgrp` field on `Session` — the authoritative slot lives on `TtyIdentity.session_pgrp`. Process-side callers use `Session::foreground_pgrp_cap()` to perform the two-hop weak dereference (Session.controlling_tty → TtyIdentity → tty.foreground_pgrp_cap()).
+
+LINT: reject `foreground_pgrp` field on `Session` in process structure.
 
 **TTY-CTL-2.** For ptys, only the slave `TtyIdentity` owns controlling-session and foreground-pgrp bindings. Master control operations mutate the slave through its peer cap.
 

@@ -1,26 +1,7 @@
 #![no_std]
 
-extern crate alloc;
-#[cfg(test)]
-extern crate std;
-
-pub mod device;
-pub mod execution;
 pub mod init;
-pub mod mount;
-pub mod page_backed;
 pub mod trap;
-pub mod tty;
-pub mod vfs;
-pub mod vm;
-pub mod wait_carrier;
-
-mod sync;
-#[cfg(test)]
-pub(crate) mod test_support {
-    pub(crate) static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-}
-mod zones;
 
 use tx_hal::{BootHandoff, TxPlatform};
 

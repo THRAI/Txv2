@@ -67,16 +67,36 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::run_zone_smoke();
             Self::run_bsp_reactor_runtime_smoke();
             Self::run_bsp_reactor_timer_idle_smoke();
+            Self::init_process_subsystem();
 
             // Deferred H4 spine slots:
             // - post-substrate init hooks
             // - VFS before device init
             // - post-device init hooks
-            // - scheduler/process/userspace init
+            // - scheduler/userspace init
             //
             // Keep these as explicit placeholders until the named subsystems
             // have concrete no_std initialization contracts.
         }
+    }
+
+    fn init_process_subsystem() {
+        // Allocates an `AddressSpace` for init using the boot platform's
+        // pmap, constructs pid=1 via `bootstrap_init_process`, and
+        // registers the resulting `Cap` in the global `INIT_PROCESS`
+        // slot. Subsequent `step_process_exit` / `sever_children` calls
+        // resolve "the kernel's init process" through this slot for
+        // reparenting (per `PROCESS_v1` §8.1).
+        //
+        // The local `Cap` returned by `bootstrap_init_process` is
+        // dropped at end-of-scope; `INIT_PROCESS` retains the strong
+        // reference for the entire kernel lifetime.
+        let aspace =
+            tx_subsystems::vm::AddressSpace::new_cap_for_platform::<P>().expect("init aspace");
+        let _init = tx_subsystems::process::bootstrap_init_process(aspace).expect("bootstrap init");
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":process:init:ok\n");
     }
 
     fn init_later(handoff: BootHandoff) {
@@ -288,7 +308,7 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn run_zone_smoke() {
-        crate::zones::run_smoke::<P>().expect("tx_kernel zone smoke failed");
+        tx_subsystems::zones::run_smoke::<P>().expect("tx_kernel zone smoke failed");
     }
 
     fn run_bsp_reactor_runtime_smoke() {

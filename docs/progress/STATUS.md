@@ -1,9 +1,530 @@
 # txKernel Status
 
-**Updated:** 2026-05-04
+**Updated:** 2026-05-05
 
 ## Current Shape
 
+- 2026-05-05 cwd / chdir / getcwd VFS integration on branch
+  `process-topology`. First VFS↔process seam: processes now carry a
+  `Cap<DEntry>` cwd. New `step_chdir(target, new_cwd)` (returns
+  `ChdirOutcome::Replaced { prev } | ZombieIgnored`) and
+  `step_getcwd(target) -> Option<Vec<u8>>` (renders absolute path
+  by walking DEntry parent_hint chain to root). Path-render helper
+  lives in vfs (`vfs::render_dentry_path`); process delegates. New
+  `InlineName::ROOT` constant (empty-name marker for root dentry,
+  bypasses `InlineName::new`'s empty-rejection); new
+  `DEntry::parent_hint()` accessor. `cwd: SpinMutex<Option<Cap<DEntry>>>`
+  field on `ProcessPayload`; bootstrap leaves it None until rootfs
+  lands. `step_fork` snapshots parent.cwd alongside aspace + cred
+  and threads through to the new payload — POSIX semantics: child
+  inherits the cwd Cap; subsequent parent chdir doesn't affect child.
+  PROCESS_v1 §3 amended (v1.2 note): `cwd: Cap<RNode>` →
+  `cwd: Cap<DEntry>` with `root: Cap<RNode>` → `root: Cap<DEntry>`,
+  matching VFS's ResolveCtx shape and enabling getcwd path-render
+  via the named-path edge that DEntry carries. Send/Sync chain
+  fix: Cap<DEntry> → Cap<RNode> → Cap<PageContainer> → BTreeMap
+  with `*const ()` cache pin broke INIT_PROCESS static; resolved
+  with `unsafe impl Send + Sync for PageContainer` mirroring the
+  AddressSpace / TtyPayload precedent. 7 new tests using synthetic
+  DEntry chains: getcwd-on-no-cwd → None, chdir-then-getcwd-root,
+  chdir-then-getcwd-nested (`/usr/bin`), chdir-returns-prev,
+  chdir-on-zombie, fork-inherits-cwd, parent-chdir-after-fork-doesnt-
+  affect-child. Deliberately deferred: full Frame container (needs
+  Shared<T> for CLONE_FS/VM/FILES/SIGHAND), Frame.root chroot
+  boundary, path-string resolution (syscall driver), bootstrapped
+  rootfs, fchdir, symlink-aware path render, CLONE_FS sharing. Suite
+  at 329 (322 + 7 new); full `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 Pgrp selectors for `step_waitpid_nohang` (branch
+  `process-topology`). Completes POSIX `waitpid(2)`'s pid-argument
+  coverage: signed `pid_t` now maps fully to (`pid > 0` → `Pid`,
+  `pid == 0` → `CallerPgrp`, `pid == -1` → `Any`, `pid < -1` →
+  `Pgrp(-pid)`). Two new `WaitTarget` variants: `Pgrp(Pgid)`
+  matches children whose `pgrp_cap().pgid` equals the target;
+  `CallerPgrp` is resolved to a concrete `Pgrp(parent.pgrp_cap().pgid)`
+  at the start of `step_waitpid_nohang` so the children walk only
+  ever sees concrete selectors. The `WaitTarget::matches` helper
+  panics-by-default on `CallerPgrp` (returns false) — programmer
+  error if it reaches the walk. 5 new tests cover: caller-pgrp reaps
+  same-pgrp zombie, caller-pgrp skips a child that has setpgid'd
+  out, pgrp selector reaps child in specific pgrp, pgrp selector with
+  no matching pgid → NoChildren, pgrp selector with live match →
+  NoneReady. The day-1 `step_waitpid_nohang` surface is now
+  fully POSIX-pid-coverage complete; only blocking variant remains
+  deferred (needs reactor wait integration). Suite at 322 (317 + 5
+  new); full `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 Session-leader-tty hangup cascade per `PROCESS_v1` §8.3
+  (branch `process-topology`). Materialises the cascade doc-spelled
+  in the P3 ratification pass, now buildable on top of
+  `Session::foreground_pgrp_cap()` (added in P3) and the kernel-static
+  init handle (added in boot wiring). New
+  `session_leader_hangup_cascade(process)` helper detects "exiting
+  process is session leader" via `process.pid.0 == session.sid.0`,
+  then runs the four-step cascade: (1) two-hop weak deref to resolve
+  fg pgrp via `session.controlling_tty_cap()` →
+  `tty.foreground_pgrp_cap()`; (2) SIGHUP + SIGCONT to fg pgrp via
+  `signal::step_kill_pgrp` (POSIX §11.1.3 — SIGCONT wakes any stopped
+  members so they observe SIGHUP); (3) clear tty's `session_pgrp`
+  slot (authoritative side per OPA-3); (4) clear
+  `session.controlling_tty` mirror. Steps 3+4 fire even when step 1's
+  fg-pgrp resolution returns None — the tty/session linkage must be
+  severed regardless of pgrp upgrade success. Five short-circuit
+  cases: non-leader exit (skip), no controlling tty (skip), full
+  cascade, no fg pgrp (skip SIGHUP, still clear), init exit (full
+  cascade fires when applicable). Wired into both
+  `step_exit_group` and `step_process_exit` *before*
+  `sever_children` and payload drop so signal-state infrastructure
+  on the exiting process is still observable. 5 new cascade tests
+  in `tty/tests/typed_session_pgrp.rs` (natural home — needs both
+  TTY constructors and process surfaces): full happy path verifying
+  binding clears; SIGHUP delivery to a *surviving* fg-pgrp member
+  (forked child; init zombifies before assertion); non-leader exit
+  preserves bindings; no-controlling-tty no-op; tty-with-no-fg-pgrp
+  still clears tty.session_pgrp per spec. All 27 pre-existing process
+  tests stay green: bootstrap sessions have no controlling tty, so
+  the cascade short-circuits at the first hop in every existing
+  topology test. Deliberately deferred: SigInfo carrier for
+  SIGHUP/SIGCONT, atomic batching of the four substeps (POSIX
+  permits class-3 compositional), §8.2 orphan-pgrp SIGHUP cascade
+  (needs stop-state machinery). Suite at 317 (312 + 5 net); full
+  `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 Boot wiring — pid=1 globally addressable + kernel boot
+  path creates init (branch `process-topology`). Closes the largest
+  remaining process-subsystem gap: `PROCESS_v1` §8.1's reparent-to-init
+  arm, deferred since the children-container pass landed as
+  sever-only because no globally-addressable init handle existed.
+  New `static INIT_PROCESS: SpinMutex<Option<Cap<ProcessIdentity>>>`
+  in `process/execution.rs` with `init_process()` accessor and
+  `reset_init_process_for_test()` reset gate. New `BootstrapError`
+  enum (`Zone(ZoneError)` / `AlreadyBootstrapped`); `bootstrap_init_process`
+  return type changes from `Result<.., ZoneError>` to
+  `Result<.., BootstrapError>` and now registers the resulting Cap
+  in `INIT_PROCESS` (rejects second-bootstrap to prevent test
+  leakage). `sever_children` upgraded from sever-only stub to
+  three-case logic per §8.1: (1) init handle present and `init !=
+  exiting process` → move children Caps from `process.children` into
+  `init.children`, set each child's `parent` slot to `Weak<init>`;
+  (2) init is the one exiting → sever-only (no higher-level reaper);
+  (3) no init handle (test pre-bootstrap, pre-process-init at boot)
+  → sever-only. `mem::take` drains `process.children` in all cases.
+  tx-kernel boot path: new `init_process_subsystem()` step in
+  `init_substrate_if_ready` after the reactor smoke tests; allocates
+  init's `AddressSpace` via `new_cap_for_platform::<P>()`, calls
+  `bootstrap_init_process`, drops the local Cap (INIT_PROCESS
+  retains for kernel lifetime), writes
+  `txkernel:<board>:process:init:ok` sentinel. `P: TxPlatform`
+  already implies `PmapIf` per the supertrait chain so no new
+  bound. Test isolation: `reset_init_process_for_test()` wired into
+  setup() across 5 test files (process / signal — 4 inner-module
+  setup() sites — / cred / thread_runtime / tty/typed_session_pgrp);
+  one test (`weak_owner_proc_flips_dead_after_identity_drop`)
+  manually releases INIT_PROCESS mid-test before drain. 5 new
+  process tests cover bootstrap registration semantics, double-bootstrap
+  rejection, init reparenting (init→middle→leaf chain, exit middle,
+  assert leaf reparents to init + init.child_count grows + middle
+  drained), and init-exit-without-reparent-target. Existing
+  parent-exit tests stay green: every one uses `parent = bootstrap()`
+  so parent IS init, hitting the "init is the exiting process"
+  branch ⇒ same observable behavior. Suite at 312 (307 + 5 net);
+  full `cargo xtask ci` green (11/11 gates) including the rv64
+  qemu / m1dock mock / la64 qemu board targets compiling against
+  the new boot path.
+- 2026-05-05 `step_waitpid_nohang` reaps zombie children + retention
+  fix for parent.children (branch `process-topology`). Materialises
+  the WNOHANG path of `PROCESS_v1` §7.4 `script_waitpid`. New
+  `step_waitpid_nohang(parent, target) -> Result<(Pid, ExitStatus),
+  WaitError>` walks parent's children, finds a zombie matching
+  `WaitTarget::Any` or `WaitTarget::Pid(p)`, reaps by withdrawing
+  from `parent.children` and `child.pgrp.members`, drops the local
+  Cap so identity reclaims after epoch drain. `WaitError` distinguishes
+  `NoChildren` (POSIX ECHILD — no matching children) from `NoneReady`
+  (WNOHANG no-zombie — POSIX returns 0). Implementing waitpid
+  surfaced a real bug: `parent.children` was `Vec<Weak>`, so zombie
+  children whose only retainer was the parent reclaimed before reap
+  per §8.5's "zombies stay until reap" invariant. Switched to
+  `Vec<Cap<ProcessIdentity>>` — children container now retains, only
+  releasing at reap or parent reclaim. Asymmetry preserved with
+  `pgrp.members` which stays `Vec<Weak>` (per §2.3, pgrp's retention
+  is via `session.members` and `member.pgrp`, not via
+  `pgrp.members`). Accessor renames: `child_slot_count` → `child_count`,
+  `live_children` → `children` (no stale entries to filter under
+  Cap retention). 10 new waitpid tests cover all four selector ×
+  state combinations (any/specific × no-children/live/zombie),
+  reap withdrawals on both sides (parent.children + pgrp.members),
+  Signaled exit status round-trip, second-reap-after-exhaustion.
+  Two pre-existing tests rewritten to match new retention model:
+  `live_children_drops_stale_weak` → asserts test-Cap-drop is *not*
+  enough to reclaim (parent retains); `pgrp_member_weak_observation`
+  uses waitpid reap to fully release the child before asserting
+  Weak goes stale. The day-1 process subsystem now closes the full
+  reap cycle: fork → exit → SIGCHLD-to-parent → waitpid → reap.
+  Deferred: blocking `waitpid` (reactor wait integration), pgrp
+  selectors, WCONTINUED/WUNTRACED, siginfo carrier, auto-reap on
+  SIGCHLD-Ignore. Suite at 307 (297 + 10 net); full `cargo xtask ci`
+  green (11/11 gates).
+- 2026-05-05 SIGCHLD edge in `step_process_exit` / `step_exit_group`
+  on branch `process-topology`. Materialises the catchable producer
+  half of `PROCESS_v1` §7.3.3 phase 5 — when a process zombifies,
+  its parent's leader thread now receives a `SIGCHLD` post via
+  `signal::step_kill_process`. New `post_sigchld_to_parent(process)`
+  helper resolves the parent via `process.parent_cap()` (added in
+  the prior drift cleanup); short-circuits if `None` (init / orphan
+  / reclaimed parent), discards `KillOutcome::NoLiveThread` if the
+  parent is itself a zombie. Wired into both exit paths after the
+  zombification commit (post-`sever_children`, post-payload-drop,
+  post-exit_status-write) so the parent observes a complete zombie
+  when it acts on the SIGCHLD. Default mask is empty so the post
+  populates the parent leader's `thread_pending` and updates
+  `signal_summary.deliverable_signal`. Default action is Ignore so
+  AST consult is a no-op; bits accumulate until the parent installs
+  a handler or `wait(2)` reaps. 5 new tests cover happy path on both
+  exit routes (step_exit_group + last-thread cascade), bootstrap-init
+  no-parent skip, orphaned-child no-parent skip, and pathological
+  zombie-parent NoLiveThread discard. Existing 292 tests verified
+  green pre-add (no regression from the new producer). Deliberately
+  deferred: `SigInfo` carrier (`si_pid` / `si_code` / `si_status`)
+  pending the day-1 signal-surface extension; `exit_port` wake
+  pending port machinery; SIGCHLD↔wait(2) auto-reap pending
+  `script_waitpid`. Suite at 297 (292 + 5 new); full `cargo xtask
+  ci` green (11/11 gates).
+- 2026-05-05 `children` container on `ProcessIdentity` (branch
+  `process-topology`). Pairs the `parent: Weak<ProcessIdentity>`
+  field added in the prior drift-cleanup pass with the matching
+  downward materialization per `PROCESS_v1` §2.1. New
+  `children: SpinMutex<Vec<Weak<ProcessIdentity>>>` slot (same shape
+  as `pgrp.members` and `session.members`); members held weakly so
+  the parent does not pin children. Two new accessors:
+  `child_slot_count()` (raw count incl. stale entries) and
+  `live_children()` (snapshot + epoch-guarded upgrade + stale
+  filter, returns owned Caps). `step_fork` now pushes the child's
+  Weak into `parent.children` alongside the pgrp registration —
+  bidirectional binding wired at fork time. New
+  `sever_children(process)` helper materialises §8.1's day-1 stub:
+  walks the children list under an epoch guard and clears each
+  live child's `parent` slot to None. Wired into both
+  `step_exit_group` (explicit group-exit) and `step_process_exit`
+  (last-thread cascade) before payload drop; sever is shallow
+  (direct children only — grandchildren keep their parent).
+  Reparent-to-init lands with boot wiring (no globally-addressable
+  init handle yet); after sever, a child's `parent_pid()` returns
+  `Pid::RESERVED` (same shape as init itself). 7 new tests cover
+  bootstrap-empty, single/multi fork accumulation, stale-Weak
+  filtering after child drop, sever via both exit paths, and the
+  shallow-sever invariant. Structurally unblocks `script_waitpid`,
+  §7.3.3 phase-5 SIGCHLD edge, §8.2 orphan-pgrp SIGHUP detection,
+  and §8.3 session-leader-tty hangup cascade. Suite at 292 (285 +
+  7 new); full `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 Foreground-pgrp homing ratified TTY-owned (P3) on branch
+  `process-topology`. Process audit had surfaced a spec/spec
+  contradiction: `PROCESS_v1` §2.4 declared `Session.foreground_pgrp`
+  while `OBJECT_PATTERN_FIXES_v1.md` OPA-3 (recommended) and the impl
+  put the slot on `TtyIdentity.session_pgrp`. Architectural analysis
+  picked TTY-owned for four reasons (subsystem encapsulation, hangup
+  atomicity, bundled-pair invariant, lifecycle alignment). This pass
+  closes the loop in code, docs, and lint. (1) New
+  `Session::foreground_pgrp_cap()` + `controlling_tty_cap()` helpers
+  hide the two-hop weak dereference (`Session.controlling_tty` →
+  `TtyIdentity` → `tty.foreground_pgrp_cap()`); 3 new tests cover the
+  happy path and both `None` failure modes. (2) `PROCESS_v1` §2.4
+  removes the stale `foreground_pgrp` field from `Session`, restates
+  `controlling_tty` as the mirror of the authoritative
+  `TtyIdentity.session_pgrp`, and adds an explicit "fg pgrp not stored
+  on Session" paragraph with the two-hop diagram. (3) `PROCESS_v1`
+  §8.3 rewrites the session-leader-death cascade as 4 None-tolerant
+  steps (resolve via helper → SIGHUP cascade → clear tty's
+  session_pgrp → clear session's mirror) with an explicit class-3
+  compositional atomicity note. (4) `OPA-3` flips "Recommended" →
+  "Decided", drops the "two valid choices" preamble, expands the
+  rationale into the four-leg argument, and adds new invariant
+  **TTY-CTL-1a** ("no `foreground_pgrp` field on Session"). (5) Two
+  new `cargo xtask lint arch` rules enforce TTY-CTL-1 (rejects
+  `Cap<ProcessIdentity>` in `tty/structure/identity.rs`) and
+  TTY-CTL-1a (rejects `foreground_pgrp:` field decl in
+  `process/structure.rs`, with comment-line escapes); 6 new xtask
+  unit tests cover rejection + allowance cases. Suite at 285 (282 +
+  3 new); xtask at 43 (37 + 6 new); full `cargo xtask ci` green
+  (11/11 gates).
+- 2026-05-05 Process subsystem drift cleanup against `PROCESS_v1`
+  (branch `process-topology`). Doc/impl coherence audit identified
+  four mechanism-level drift items the spec already pins; this pass
+  closes all four without touching deferred features. (1) Renamed
+  `step_zombie` → `step_process_exit` per §7.3.3 (last-thread cascade
+  named for the verb, not the side-effect; full §7.3.3 phase-5
+  cascade still future). (2) Renamed `Session.groups` →
+  `Session.members` per §2.4 (matches `ProcessGroup.members` already-
+  correct shape; accessor `group_slot_count` →
+  `member_slot_count`). (3) Unified the parallel
+  `exit_status: SpinMutex<Option<i32>>` and
+  `terminating_signal: SpinMutex<Option<Signum>>` slots into single
+  `exit_status: SpinMutex<Option<ExitStatus>>` with
+  `enum ExitStatus { Exited(i32), Signaled(Signum) }` per §6.2. The
+  `128 + sig` shell-convention encoding moves into
+  `ExitStatus::wait_status_word()`; `terminating_signal()` accessor
+  derives from the enum. `step_exit_group` signature now takes
+  `ExitStatus`; `step_exit_group_with_signal` is the thin
+  `Signaled(sig)` wrapper. (4) Replaced bare `parent_pid: Pid` with
+  `parent: SpinMutex<Option<Weak<ProcessIdentity>>>` per §2.1 — same
+  retention story as spec's `Binding<ProcessIdentity>` (no retention),
+  uses the substrate primitives we have today. New `parent_cap()` /
+  `parent_pid()` accessors; init has `parent = None`, fork sets
+  `Some(parent.downgrade())`. Unblocks the future children-DLL pass.
+  Out of scope: children container, `step_process_exit` SIGCHLD/
+  exit_port/reparent, GroupExit, leader_exit_status, Frame, nsproxy,
+  Session.foreground_pgrp homing — all roadmap items the audit
+  flagged separately. Suite at 282; full `cargo xtask ci` green
+  (11/11 gates).
+- 2026-05-05 `signal::ast_dispatch` closes the AstOutcome →
+  step_exit_group_with_signal loop on branch `process-topology`.
+  Thin wrapper over `ast_check` that materialises the day-1
+  side-effects we have wired: `AstOutcome::DefaultTerminate { sig }`
+  invokes `step_exit_group_with_signal(owner_proc, sig)` so the
+  catchable-fatal-default path now actually terminates the process
+  instead of just being a recognised intent. Other variants
+  (`Continue`, `InitiateTermination`, `DefaultStop`, `DefaultContinue`,
+  `DeliverHandler`) flow through unchanged — their materialisation
+  still needs the future thread_future poll, stop/continue
+  control ops, and signal-frame construction. 4 new tests cover
+  default-terminate-zombifies-with-signum, continue no-op,
+  recognised-but-unrealised stop and handler. Full end-to-end
+  testable: `post_signal(SIGTERM)` → `ast_dispatch` →
+  `is_zombie() && terminating_signal == Some(SIGTERM)`. Suite at
+  284; full `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 `step_exit_group_with_signal` lands on top of Gewalt/event
+  factoring (branch `process-topology`). Materialises the SIGKILL
+  control-op invocation that `SIGNAL_v1` §12.3 `route_sigkill`
+  prescribes. New `ProcessIdentity.terminating_signal: SpinMutex<Option<Signum>>`
+  field with `terminating_signal()` accessor; new
+  `process::step_exit_group_with_signal(proc, sig)` sets the slot
+  and calls `step_exit_group(proc, 128 + sig.raw())` (shell-
+  convention status until `wait(2)` lands and switches to Linux
+  encoding). `signal::route_gewalt(SIGKILL)` now invokes
+  `step_exit_group_with_signal` directly instead of setting
+  `summary.termination` — the target zombifies on the spot per spec
+  ("exit_status encodes 'killed by SIGKILL'"). The
+  `summary.termination` AST priority-1 path remains for the future
+  fatal-synchronous-fault and ptrace-fatal producers; the matching
+  test now sets the bit explicitly via `update_summary`. SIGSTOP /
+  SIGCONT routes unchanged: still update `stop_requested` since
+  there's no stop-state machine yet. 3 new tests + 2 reshaped tests;
+  suite at 280; full `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 Gewalt/event factoring restored on top of signal delivery
+  sweep (branch `process-topology`). Audit found day-1 collapsed the
+  spec's two signal categories into one `post_signal` pipeline:
+  SIGKILL/SIGSTOP/SIGCONT entered `thread_pending` alongside
+  catchable signals, with summary special-cases on top. Per
+  `SIGNAL_v1` §1 + §2 Consequence 2 the Gewalt signums must bypass
+  pending queues entirely. Refactor: new `signal::route_gewalt(target,
+  sig)` walks every live thread of the target process and updates
+  `signal_summary` directly (SIGKILL → termination, SIGSTOP →
+  stop_requested, SIGCONT → clear stop_requested) without touching
+  pending queues. `signal::step_kill_process` dispatches by signum:
+  Gewalt → `route_gewalt`, catchable → `post_signal` to leader
+  thread. `signal::is_gewalt(sig)` is the public predicate. Pgrp
+  shims (`step_kill_pgrp`, `script_kill_pgrp`) skip the
+  `group_pending` mirror for Gewalt members. `post_signal` contract
+  tightens with a `debug_assert!` rejecting Gewalt signums; its
+  body strips the SIGKILL/SIGSTOP/SIGCONT special-cases and only
+  handles catchable signals (sets `summary.deliverable_signal` when
+  unmasked). Existing 2 SIGSTOP/SIGCONT tests ported to
+  `step_kill_process` route; 5 new tests cover pending-queue bypass
+  per Gewalt signum and pgrp non-mirroring; `ast_check_default_continue_for_sigcont`
+  removed (SIGCONT is Gewalt → never visits AST in day-1; its
+  enqueue-for-handler half lands when SIGCONT-with-handler is wired).
+  Suite at 277; full `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 Signal delivery sweep day-1 lands on top of TTY → signal
+  end-to-end (branch `process-topology`). Realises the day-1 subset
+  of `SIGNAL_v1` §14 (selection algorithm) and §15.1 (ast_check) plus
+  `THREAD_RUNTIME_v1` §5.2 (interrupt summary). New types in
+  `signal.rs`: `InterruptSummary { deliverable_signal, termination,
+  stop_requested }` with atomic-packing helpers; `DefaultAction
+  { Term, Core, Ignore, Stop, Cont }` + `default_action(sig)`
+  table; `PendingSource { Thread, Group }`; `AstOutcome` with 6
+  variants (Continue, InitiateTermination, DefaultTerminate,
+  DefaultStop, DefaultContinue, DeliverHandler). New
+  `signal_summary: AtomicU8` on `ThreadPayload` with `interrupt_summary()`
+  accessor + crate-internal `update_summary` CAS-loop helper.
+  `post_signal` now keeps the summary current: unmasked posts set
+  `deliverable_signal`; SIGKILL sets `termination` and
+  `deliverable_signal` (uncatchable, bypasses mask); SIGSTOP-family
+  sets `stop_requested`; SIGCONT clears `stop_requested`.
+  `step_sigprocmask` recomputes `deliverable_signal` against the new
+  mask. `select_next_signal(thread)` returns the lowest deliverable
+  signum + source-queue tag, scanning `thread_pending` first then
+  `group_pending`. `ast_check(thread)` runs the SIGNAL_v1 §15.1 loop:
+  termination → InitiateTermination, else dequeue + consult
+  `sig_actions` + map `Default` via `default_action`, with Ignore /
+  Default-Ignore re-looping. 21 new tests bring suite to 272; full
+  `cargo xtask ci` green (11/11 gates). Site-A wait-adapt
+  integration, signal-frame construction, and group-exit-with-signal
+  invocation remain deferred (need reactor / scripts / HAL trap-
+  return wiring).
+- 2026-05-05 TTY → signal end-to-end typed dispatch lands on top of
+  the kill-permission check (branch `process-topology`). Closes the
+  last raw-id seam in TTY's job-control flow: `SignalTarget`
+  variants become struct-shaped `{ pgid: u32, pgrp:
+  Option<Weak<ProcessGroup>> }`, `IoctlCaller` gains a `pgrp:
+  Option<Weak<ProcessGroup>>` field with a `with_pgrp_weak()`
+  builder, and the ioctl/hangup steps populate the typed Weak from
+  `tty.session_pgrp().foreground_pgrp` (already typed since the TTY
+  pgrp rebinding pass). New `signal::deliver_tty_dispatch(source,
+  dispatch)` upgrades the Weak under one epoch guard, maps
+  `JobControlSignal` to `Signum`, and calls the cred-checked
+  `script_kill_pgrp`. End-to-end test demonstrates VINTR-style
+  dispatch posting SIGINT to every member of the typed foreground
+  pgrp; partial-permission and zombie-source cases covered. Hybrid
+  preserved: legacy raw-id binders still work (typed slot stays
+  `None` and the bridge returns `DispatchOutcome::NoTypedPgrp`). 5
+  new tests bring suite to 251; full `cargo xtask ci` green
+  (11/11 gates).
+- 2026-05-05 Kill permission check lands on top of TTY pgrp typed
+  rebind (branch `process-topology`). Wires `cred` into the `signal`
+  shim per `SIGNAL_v1` §32 and `cred_service_v_1`. New
+  `cred::require_signal_send(source: Cred, target: &TargetProcCred,
+  sig, &Guard) -> Result<SignalAuthorized<'g>, Errno>` runs the
+  permission rule and emits a zero-sized witness. New
+  `process::structure::TargetProcCred` is the day-1 subset of the
+  illustrative `{ruid, euid, suid, ..., same_session, dumpable}`
+  shape from the cred doc — `{uid, euid, gid, egid, same_session}`.
+  `ProcessIdentity::target_proc_cred_for(&source)` builds it,
+  computing `same_session` by comparing the source's and target's
+  pgrp `Cap<Session>` keys. New `signal::script_kill_process`,
+  `signal::script_kill_pgrp`, and `signal::script_kill_probe` compose
+  the cred check with the existing `step_kill_*` posters; the latter
+  is the POSIX `kill(pid, 0)` permission probe. Day-1 rule:
+  `(source.uid, source.euid) × (target.uid, target.euid)` match,
+  `CAP_KILL`/root bypass, SIGCONT-same-session bypass — Linux's full
+  4-way `(uid,euid) × (uid,suid,ruid)` is the saved-set extension
+  that lands when Cred grows `suid`/`ruid`. `Errno` gains `EPERM` and
+  `ESRCH` (POSIX kill returns EPERM on permission deny, ESRCH on
+  zombie source). 12 new tests bring the suite to 246; full
+  `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 TTY pgrp typed-rebinding lands on top of cred day-1
+  (branch `process-topology`). `TtyIdentity.session_pgrp` now carries
+  both raw POSIX IDs (legacy fast path) and typed
+  `Weak<Session>` / `Weak<ProcessGroup>` references. New constructors:
+  `SessionPgrp::from_raw_ids(...)` (no typed refs, used by all
+  existing TTY tests) and `SessionPgrp::from_typed(&session, &pgrp)`
+  which caches the IDs from the caps and downgrades to Weak refs.
+  `TtyIdentity` gains `bind_session_pgrp_typed(...)` and
+  `foreground_pgrp_cap()` so signal-fanout callers can hand the
+  foreground pgrp Cap directly to `signal::step_kill_pgrp`. Required
+  bumps: `tx-substrate::zone::Weak<T>` Clone/Copy made unconditional
+  (manual impls — derive was emitting spurious `T: Clone` bounds);
+  `unsafe impl Send + Sync for AddressSpace` to lift the
+  page-allocator MapPin's intentionally-!Send into the
+  shared-by-discipline shape that lets `Cap<AddressSpace>` flow
+  through `ProcessPayload` and transitively through `Weak<Session>`
+  inside `SessionPgrp`. tty/tests.rs at 1500-line ceiling so split
+  into `tty/tests/legacy_phase_a.rs` + `tty/tests/typed_session_pgrp.rs`.
+  7 new tests bring suite to 234; full `cargo xtask ci` green
+  (11/11 gates).
+- 2026-05-05 Cred service stub layered on top of signal day-1 (branch
+  `process-topology`). Adds `crates/tx-subsystems/src/cred.rs` with
+  POSIX cred types (`Uid`, `Gid`, `Capability`, `CapabilitySet`,
+  `Cred`) and the `step_setuid` / `step_setgid` shims. `ProcessPayload`
+  gains `cred: SpinMutex<Cred>`; `bootstrap_init_process` initializes
+  with `Cred::root()`; `step_fork` inherits the parent's cred unchanged.
+  Privilege model: root or `CAP_SETUID`/`CAP_SETGID` allows arbitrary
+  id changes; non-privileged callers may only swap among existing
+  `(uid, euid)` / `(gid, egid)` pairs. Saved-set IDs, `fsuid`/`fsgid`,
+  supplementary groups, capability bounding/inheritable/ambient sets
+  all deferred — extend rather than reshape. 11 new tests; total
+  suite 227. Full `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 Signal day-1 layered on top of the topology branch
+  `process-topology`. Adds `crates/tx-subsystems/src/signal.rs` with
+  the POSIX-shim types (`Signum`, `SignalMask`, `PendingSignalQueue`,
+  `SigDisposition`, `SigActionTable`) and the kill / sigaction shim
+  entry points (`step_kill_process`, `step_kill_pgrp`,
+  `step_sigaction`). `ProcessPayload` now carries `sig_actions` and
+  `group_pending`; `ThreadPayload` carries `signal_mask` and
+  `thread_pending`. `thread_runtime::execution` gains `post_signal`
+  and `step_sigprocmask` (with `SigmaskHow::SetMask/Block/Unblock`).
+  Day-1 deliberately stops at "post + observe": no SigInfo payload,
+  no realtime per-occurrence queue, no default-disposition resolution
+  (`Default → terminate / stop / continue / ignore`), no AST
+  delivery. SIGKILL/SIGSTOP are uncatchable at the type layer
+  (`SignalMask::block` strips them; `step_sigaction` returns
+  `Uncatchable`). 13 new tests bring the suite to 216; full
+  `cargo xtask ci` green (11/11 gates).
+- 2026-05-05 Process / Thread topology pass started on branch
+  `process-topology`. Lands the entity graph for the upcoming β bundle
+  without signal state, credentials, rlimits, or fd-table coupling —
+  topology first, signals second so the entity shapes do not have to
+  compromise for signal semantics later. Four new zone-allocated
+  entities: `ProcessIdentity` ↔ `ProcessPayload` (identity-payload
+  split, zombies retain identity), `ThreadIdentity` ↔ `ThreadPayload`
+  (same), `ProcessGroup`, `Session`. Step set: `bootstrap_init_process`,
+  `step_fork` (clones aspace via `AddressSpace::fork_aspace`, creates
+  leader thread, inherits parent pgrp), `step_exit_group`,
+  `step_thread_exit` (last-thread zombifies parent), `step_setpgid`
+  (day-1 only supports `pgid == target.pid`; existing-group join is a
+  follow-up), `step_setsid`. 18 topology tests pass; full
+  `cargo xtask ci` green (11/11 gates). `tx-subsystems::lib.rs` empty
+  stubs `pub mod process {}` / `pub mod thread_runtime {}` removed.
+  Reactor `TaskKey` slot on `ThreadPayload` is `None` until β4 wires
+  the runtime; signal mask / summary / pending queues land in the
+  signal pass. TTY `session_pgrp` triplet still holds raw IDs — typed
+  `Weak<Session>` / `Weak<ProcessGroup>` rebinding is a small follow-up
+  before β3.
+- 2026-05-04 VM compliance fixup landed on branch `vm-compliance-fixup`.
+  Closes the drift items identified in the post-merge VM audit against
+  `VM_v1_2.md`: (1) renamed VM scripts to spec names — `mmap_script` /
+  `munmap_script` / `mprotect_script` / `mremap_script` / `fault_script`
+  / `brk_script`; sync helpers became `try_mmap` / `try_munmap` /
+  `try_mprotect` / `try_mremap`. (2) Doc reconciled to match impl —
+  `VAddrRange` → `UserRange`, `UserRange::full_user_v1` / `new_aligned`
+  constructor names; mincore signature clarified as per-page
+  `Vec<bool>` (matches POSIX); §2 recipes carry an implementation note
+  for the COW-`BTreeMap` shape. (3) `MADV_DONTNEED` and `MADV_FREE`
+  implemented per §5.9 (range-scoped pmap teardown + shootdown, recipes
+  preserved); was a no-op. (4) `RangeLock::acquire_step` /
+  `acquire_pair_step` now return canonical `StepOutcome<RangeGuard>` as
+  the spec specifies; the rich `AcquireResult` is retained as
+  `acquire_step_rich` for writer-preference tests. Production scripts,
+  `reserve_map`, `acquire_writer`, and `MapReserveResult::Blocked` are
+  all on the canonical surface. Two new behavior tests for
+  DONTNEED/Free; 79/79 vm:: tests pass; all 11 CI gates green.
+  `exec_aspace` rebuild half and the `BTreeMap` → persistent-BTree
+  optimization remain deferred (need `ExecImage` / process subsystem;
+  tracked outside the fixup).
+- 2026-05-04 VFS spec-reconciliation Phases 1-4 complete on branch
+  `vfs-spec-reconciliation`. The four-phase plan that started after
+  the deferred-move investigation is now fully landed: Phase 1 brought
+  `tx-kernel/src/vfs.rs` into doc-canonical shape (full POSIX
+  `InodeMeta`, opaque `[u8; 16]` `DirCursor`, `Timespec`, `MountOutput`,
+  four-module `vfs/{structure,checks,execution}/` layout); Phase 2
+  brought the tx-subsystems skeleton into spec (POSIX `Errno`
+  spelling, substrate-owned PPN-handle `Frame`); Phase 3 ported
+  tx-ext4 onto the canonical surface (rewrote `pager::fetch_page` to
+  allocate via `page_allocator::reserve_frame` + permanent-frame token,
+  copy bytes through the test direct-map; deleted the byte-buffer-
+  Frame-dependent `vfs_full_read` and `kernel_read_backend` test
+  files); Phase 4 deleted the now-redundant skeleton and `git mv`-ed
+  the working subsystems from tx-kernel to tx-subsystems. tx-kernel
+  collapsed to `init.rs + trap.rs + lib.rs`. Verification: workspace
+  builds clean, 522 tests pass with `--test-threads=1`,
+  `cargo xtask lint arch/unused/docs` ok, `cargo xtask progress
+  validate` 24 records ok. The vm/tty move blocker recorded in
+  `2026-05-04-vm-tty-subsystems-move-deferred.md` is resolved.
+- 2026-05-04 VFS spec-reconciliation Phase 1 complete on branch
+  `vfs-spec-reconciliation`. Brings `tx-kernel/src/vfs.rs` into
+  doc-canonical shape per `TX_EXT4_PLAN_v1_2.md`,
+  `bringup_fs_specs_v_1`, and `SUBSYSTEM_ANATOMY_v2_1.md`. Five sub-
+  steps landed: (1) `InodeMeta` extended to full POSIX layout with
+  `atime/mtime/ctime: Timespec`, `nlinks/blocks/flags`; doc-absent
+  `kind`/`rdev` removed; (2) `DirCursor` reshaped from `u64` to
+  opaque `[u8; 16]` per spec, with `from_u64`/`as_u64` helpers for the
+  common case; (3) `MountOutput` type added; (4) workspace cascade
+  verified — TTY, Mount, page_backed adapt cleanly; (5) flat 753-line
+  `vfs.rs` decomposed into the four-module layout `vfs/{mod,structure,
+  checks,execution,tests}.rs`. Verification: cargo fmt clean, all 183
+  tx-kernel tests pass with `--test-threads=1`, workspace test gates
+  green (215 tests total across crates), `cargo clippy -p tx-kernel
+  -- -D warnings` clean, `cargo xtask lint arch/unused/docs` ok,
+  `cargo xtask progress validate` 24 records ok. Reconciles five drift
+  axes flagged in the deferred-move decision note. Next: Phase 2
+  (skeleton in tx-subsystems → spec — `Frame` PPN model, `Errno`
+  POSIX spelling), Phase 3 (tx-ext4 to consume canonical surface),
+  Phase 4 (delete skeleton + move vm/tty into tx-subsystems).
 - 2026-05-04 Final ledger revised post-audit. The
   `2026-05-04-vm-pagebacked-final-ledger.md` and the closure decision
   note now reflect 20 plan steps complete (17 original + 3 audit
@@ -973,58 +1494,26 @@
 
 ## Latest Decisions
 
-- `docs/progress/decisions/2026-05-01-reactor-userspace-entry-ast-checkpoint.md`
-- `docs/progress/decisions/2026-05-01-rv64-trapframe-fault-decode.md`
-- `docs/progress/decisions/2026-05-01-rv64-trap-frame-writeback.md`
-- `docs/progress/decisions/2026-05-01-rv64-timer-trap-idle-smoke.md`
-- `docs/progress/decisions/2026-05-01-rv64-saved-trap-dispatch.md`
-- `docs/progress/decisions/2026-05-01-coreinit-hart-loop-adapter.md`
-- `docs/progress/decisions/2026-04-30-ap-reactor-shared-runqueue-smoke.md`
-- `docs/progress/decisions/2026-04-30-ap-reactor-loop-wfi-smoke.md`
-- `docs/progress/decisions/2026-04-30-rv64-ipi-ack-smoke.md`
-- `docs/progress/decisions/2026-04-30-ap-substrate-before-online.md`
-- `docs/progress/decisions/2026-04-30-rv64-smp-rfence-shootdown.md`
-- `docs/progress/decisions/2026-04-30-smpif-parked-ap-boot.md`
-- `docs/progress/decisions/2026-04-30-reactor-reschedule-dispatch-bridge.md`
-- `docs/progress/decisions/2026-04-30-reactor-affinity-wake-placement.md`
-- `docs/progress/decisions/2026-04-30-reactor-declared-readiness-channel.md`
-- `docs/progress/decisions/2026-04-30-reactor-declared-wait-channel.md`
-- `docs/progress/decisions/2026-04-29-ebr-zone-first-executable-slice.md`
-- `docs/progress/decisions/2026-04-29-rv64-high-vma-low-lma-linker.md`
-- `docs/progress/decisions/2026-04-29-rv64-low-linked-identity-retention.md`
-- `docs/progress/decisions/2026-04-28-pageallocator-token-interface.md`
-- `docs/progress/decisions/2026-04-29-code-reorganization-skill-and-line-limit.md`
-- `docs/progress/decisions/2026-04-29-substrate-slab-heap-zero-frame.md`
-- `docs/progress/decisions/2026-04-29-rv64-pmap-helper-extraction.md`
-- `docs/progress/decisions/2026-04-29-rv64-pmap-module-extraction.md`
-- `docs/progress/decisions/2026-04-29-pmap-kernel-protect-in-place.md`
-- `docs/progress/decisions/2026-04-29-rv64-minimal-trap-vector.md`
-- `docs/progress/decisions/2026-04-28-substrate-init-frameallocator-handoff.md`
-- `docs/progress/decisions/2026-04-29-kernel-shootdown-map-accounting.md`
-- `docs/progress/decisions/2026-04-29-pmap-typed-intermediate-source.md`
-- `docs/progress/decisions/2026-04-29-pmap-rollback-unmap-vocabulary.md`
-- `docs/progress/decisions/2026-04-28-rv64-mmio-pmap-reserve-commit.md`
-- `docs/progress/decisions/2026-04-28-rv64-direct-map-extension.md`
-- `docs/progress/decisions/2026-04-28-unused-lint-gate.md`
-- `docs/progress/decisions/2026-04-28-rv64-identity-teardown-sentinel.md`
-- `docs/progress/decisions/2026-04-28-rv64-high-half-entry.md`
-- `docs/progress/decisions/2026-04-28-rv64-boot-static-bag.md`
-- `docs/progress/decisions/2026-04-28-address-boundary-policy.md`
-- `docs/progress/decisions/2026-04-28-rv64-high-half-alias-bootstrap.md`
-- `docs/progress/decisions/2026-04-28-finish-catchup-progress-memory.md`
-- `docs/progress/decisions/2026-04-28-arceos-aligned-portable-boot.md`
-- `docs/progress/decisions/2026-04-27-fine-grained-txdoc-anchors.md`
-- `docs/progress/decisions/2026-04-27-xtask-module-split.md`
-- `docs/progress/decisions/2026-04-27-xtask-progress-command-surface.md`
-- `docs/progress/decisions/2026-04-27-ci-reporting-and-txdoc-tags.md`
-- `docs/progress/decisions/2026-04-27-json-agent-operational-records.md`
-- `docs/progress/decisions/2026-04-27-humanlayer-reference-and-agentic-workflow.md`
-- `docs/progress/decisions/2026-04-27-doc-layout-and-progress-memory.md`
+- `docs/progress/decisions/2026-05-05-tty-signal-end-to-end-typed-dispatch.md`
+- `docs/progress/decisions/2026-05-05-tty-pgrp-typed-rebinding.md`
+- `docs/progress/decisions/2026-05-05-step-waitpid-nohang.md`
+- `docs/progress/decisions/2026-05-05-step-exit-group-with-signal.md`
+- `docs/progress/decisions/2026-05-05-signal-gewalt-event-factoring.md`
+- `docs/progress/decisions/2026-05-05-signal-delivery-sweep-day1.md`
+- `docs/progress/decisions/2026-05-05-signal-day1.md`
+- `docs/progress/decisions/2026-05-05-sigchld-edge.md`
+- `docs/progress/decisions/2026-05-05-session-leader-hangup.md`
+- `docs/progress/decisions/2026-05-05-process-topology-day1.md`
 
 ## Latest Research
 
+- `docs/progress/research/2026-05-04-vm-pagebacked-midway-checkpoint.md`
+- `docs/progress/research/2026-05-04-vm-pagebacked-gap-update.md`
+- `docs/progress/research/2026-05-04-vm-pagebacked-final-ledger.md`
+- `docs/progress/research/2026-05-04-tty-implementation-status.md`
+- `docs/progress/research/2026-05-03-vm-doc-gap-ledger.md`
 - `docs/progress/research/2026-05-01-reactor-runtime-dispatch-audit.md`
-- `docs/progress/research/2026-05-01-ast-return-to-user-scout.md`
 - `docs/progress/research/2026-05-01-coreinit-runtime-loop-scout.md`
-- `docs/progress/research/2026-04-30-reactor-readiness-for-subsystems.md`
-- `docs/progress/research/2026-04-27-humanlayer-progress-memory.md`
+- `docs/progress/research/2026-05-01-ast-return-to-user-scout.md`
+- `docs/progress/research/2026-04-30-reactor-third-wave-scout.md`
+- `docs/progress/research/2026-04-30-reactor-third-wave-audit.md`

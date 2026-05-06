@@ -147,7 +147,7 @@ This rule is enforced by construction:
 pub struct AddressSpace {
     /// Authoritative binding from VA range to VmEntry.
     /// Persistent BTree; snapshot-consistent reads; atomic substrate mutations.
-    recipes: PersistentBTree<VAddrRange, VmEntry>,
+    recipes: PersistentBTree<UserRange, VmEntry>,
 
     /// Derived materialization: the hardware page table.
     /// Per-leaf atomicity provided by HAL's PmapReservation primitives.
@@ -165,6 +165,17 @@ pub struct AddressSpace {
 ```
 
 **Stats consistency.** `stats` are derived and **not required to be strongly consistent** with `recipes` or `pmap` at all times. They are updated on commit paths of binding and materialization mutations, but observers may see stats that lag behind the authoritative state by some bounded amount. For observability-grade use (`/proc/<pid>/status`, rlimit enforcement approximations); not suitable for correctness checks.
+
+**Recipes implementation note.** The current implementation realizes
+the `PersistentBTree<UserRange, VmEntry>` semantic as a copy-on-write
+`BTreeMap<UserVirtAddr, VmEntry>` published behind an `AtomicPtr` with
+EBR for snapshot-consistent reads. Each mutation rebuilds the tree
+under a `SpinMutex` and atomically swaps the published root. The key
+is the start address of the entry's `UserRange`; range-overlap queries
+walk predecessor/successor entries explicitly. This satisfies the
+snapshot-consistency property the spec requires; replacing the COW
+`BTreeMap` with a structurally-shared persistent BTree is a future
+optimization tracked outside v1.2.
 
 **Fields are non-negotiable in v1.** Every AddressSpace has exactly these. There is no per-AddressSpace mutex; coordination is through the RangeLock.
 
@@ -207,7 +218,7 @@ impl RangeLock {
     ///   catastrophic internal failure (structure corruption).
     pub fn acquire_step(
         &self,
-        range: VAddrRange,
+        range: UserRange,
         mode: LockMode,
     ) -> StepOutcome<RangeGuard>;
 
@@ -216,15 +227,40 @@ impl RangeLock {
     /// both are acquired or the operation blocks.
     pub fn acquire_pair_step(
         &self,
-        a: (VAddrRange, LockMode),
-        b: (VAddrRange, LockMode),
+        a: (UserRange, LockMode),
+        b: (UserRange, LockMode),
     ) -> StepOutcome<(RangeGuard, RangeGuard)>;
 }
+```
+
+**Implementation note.** `RangeLock` exposes both the canonical
+spec-shaped surface and a richer dual API for tests and future
+writer-preference clients:
+
+- `acquire_step(range, mode) -> StepOutcome<RangeGuard<'_>>` is the
+  canonical surface used by all production scripts (`mmap_script`,
+  `munmap_script`, `mprotect_script`, `mremap_script`,
+  `fault_script`, `brk_script`). It produces `Done(guard)` on
+  immediate acquisition and `Blocked(WaitToken)` on contention; async
+  callers feed the token to `wait_carrier::wait_on_token` and retry.
+- `acquire_step_rich(range, mode) -> AcquireResult<'_>` is the
+  underlying rich variant whose `WouldBlock` carrier holds an internal
+  `PendingWriter` slot. The slot pushes back on subsequent
+  `Materializer` acquires inside the AVL-backed reservation tree
+  (writer-preference). Production callers do not need this; the
+  writer-preference unit tests in `vm/tests.rs` consume it via
+  `WouldBlock::pending_writer()` and `PendingWriter::try_acquire()`.
+
+`acquire_pair_step` and `acquire_pair_step_rich` follow the same
+shape. The canonical method is a thin projection over the rich one
+and never produces `Advanced`/`AdvancedThenBlocked`/`Err`.
+
+```rust
 
 #[must_use]
 pub struct RangeGuard<'a> {
     lock: &'a RangeLock,
-    range: VAddrRange,
+    range: UserRange,
     mode: LockMode,
     // internal handle for O(1) release
 }
@@ -322,7 +358,7 @@ The authoritative binding value in the recipes BTree.
 ```rust
 pub struct VmEntry {
     /// VA range. Exact bounds of the mapping. Always page-aligned.
-    range: VAddrRange,
+    range: UserRange,
 
     /// Permissions: birth protection bits. Current effective permissions
     /// for access control. Hardware PTEs installed for this VmEntry must
@@ -408,7 +444,7 @@ async fn fault_script(
     va: VAddr,
     access: AccessMode,
 ) -> Result<(), SigInfo> {
-    let page_range = VAddrRange::containing_page(va);
+    let page_range = UserRange::containing_page(va);
 
     loop {
         // Phase: acquire Materializer reservation on the faulted page.
@@ -577,7 +613,7 @@ async fn munmap_script(
     addr: VAddr,
     len: usize,
 ) -> Result<(), Errno> {
-    let range = VAddrRange::new(addr, len)?;
+    let range = UserRange::new_aligned(addr, len)?;
 
     let guard = loop {
         match ctx.aspace.range_lock.acquire_step(
@@ -625,7 +661,7 @@ async fn mprotect_script(
     len: usize,
     new_prot: Prot,
 ) -> Result<(), Errno> {
-    let range = VAddrRange::new(addr, len)?;
+    let range = UserRange::new_aligned(addr, len)?;
 
     let guard = loop {
         match ctx.aspace.range_lock.acquire_step(
@@ -675,7 +711,7 @@ async fn mremap_script(
     new_len: usize,
     flags: MremapFlags,
 ) -> Result<VAddr, Errno> {
-    let old_range = VAddrRange::new(old_addr, old_len)?;
+    let old_range = UserRange::new_aligned(old_addr, old_len)?;
     let new_range = resolve_new_range(&ctx.aspace, new_addr, new_len, flags)?;
 
     // v1: reject overlap.
@@ -736,7 +772,7 @@ async fn fork_aspace(
     // Acquire ExclusiveWriter on full parent AS.
     let guard = loop {
         match parent.range_lock.acquire_step(
-            VAddrRange::full_user(),
+            UserRange::full_user_v1(),
             LockMode::ExclusiveWriter,
         ) {
             Done(g) => break g,
@@ -788,7 +824,7 @@ async fn exec_aspace(
     // But we acquire one for pattern uniformity, which is cheap since
     // uncontended.
     let guard = match old_aspace.range_lock.acquire_step(
-        VAddrRange::full_user(),
+        UserRange::full_user_v1(),
         LockMode::ExclusiveWriter,
     ) {
         Done(g) => g,
@@ -858,7 +894,7 @@ These are mostly thin wrappers around existing primitives.
 
 **msync** with MS_SYNC forces writeback of dirty File-variant PC pages in the range. Uses PageContainer's step_fsync machinery. Acquires ExclusiveWriter because writeback may race with concurrent writes (and we want to capture a consistent snapshot).
 
-**mincore** is a pure read operation under epoch: walk the pmap in the range, report per-page presence. **v1 policy: `mincore` does not acquire a reservation.** It observes pmap state under best-effort consistency: the result reflects some interleaving of concurrent VM operations but is not a strongly-consistent snapshot. POSIX permits this. Callers who need tight consistency should serialize externally with the operations they care about.
+**mincore** is a pure read operation under epoch: walk the pmap in the range, report per-page presence as a `Vec<bool>` whose `i`-th entry is `true` iff the page at offset `i` of the requested range has a published pmap entry at the moment it is read. **v1 policy: `mincore` does not acquire a reservation.** It observes pmap state under best-effort consistency: the result reflects some interleaving of concurrent VM operations but is not a strongly-consistent snapshot. POSIX permits this. Callers who need tight consistency should serialize externally with the operations they care about. The `Vec<bool>` shape matches POSIX `mincore(2)`'s per-page residency vector; per-syscall scripts copy it into the user buffer.
 
 ---
 

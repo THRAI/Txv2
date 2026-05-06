@@ -317,14 +317,8 @@ dependencies = [
 name = "tx-kernel"
 version = "0.1.0"
 dependencies = [
- "tx-drivers",
- "tx-fs",
  "tx-hal",
- "tx-policy",
  "tx-reactor",
- "tx-scripts",
- "tx-services",
- "tx-shims",
  "tx-substrate",
  "tx-subsystems",
 ]
@@ -392,6 +386,7 @@ version = "0.1.0"
 dependencies = [
  "tx-ext4-format",
  "tx-hal",
+ "tx-reactor",
  "tx-substrate",
 ]
 

@@ -6,14 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tx-fs = { path = "../tx-fs" }
 tx-hal = { path = "../tx-hal" }
-tx-drivers = { path = "../tx-drivers" }
-tx-policy = { path = "../tx-policy" }
 tx-reactor = { path = "../tx-reactor" }
-tx-scripts = { path = "../tx-scripts" }
-tx-services = { path = "../tx-services" }
-tx-shims = { path = "../tx-shims" }
 tx-substrate = { path = "../tx-substrate" }
 tx-subsystems = { path = "../tx-subsystems" }
 
