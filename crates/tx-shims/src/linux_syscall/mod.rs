@@ -41,7 +41,11 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+
+use tx_hal::PmapIf;
 use tx_reactor::userspace::SyscallRequest;
+use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_substrate::zone::Cap;
 use tx_subsystems::execution::{Errno, StepOutcome};
 use tx_subsystems::process::{step_exit_group, ExitStatus, ProcessIdentity};
@@ -50,6 +54,7 @@ use tx_subsystems::signal::{
 };
 use tx_subsystems::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
 use tx_subsystems::thread_runtime::{step_thread_exit, ThreadIdentity};
+use tx_subsystems::vfs::structure::Credential;
 use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::vm::{AddressSpace, UserVirtAddr, VmMapError};
 use tx_subsystems::wait_carrier;
@@ -60,8 +65,8 @@ pub mod numbers;
 mod tests;
 
 pub use numbers::{
-    FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPID, NR_READ,
-    NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_WRITE, O_CLOEXEC,
+    FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPID,
+    NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_WRITE, O_CLOEXEC,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -71,6 +76,30 @@ pub use numbers::{
 /// scope". 4 KiB matches a single page; values above that should batch
 /// across multiple write calls until the userspace-VA copy lane lands.
 pub const TTY_WRITE_MAX_INLINE: usize = 4096;
+
+/// Maximum path-name length accepted by `execve(2)` (Linux's
+/// `PATH_MAX`). Mirrors the `TTY_WRITE_MAX_INLINE = 4096` discipline
+/// for inline buffer copies. A longer path returns `-ENAMETOOLONG`
+/// per the Phase 6 plan.
+///
+/// TODO(phase-userva): lift to platform `PATH_MAX` once the general
+/// `copy_from_user` lane lands.
+pub const EXECVE_PATH_MAX: usize = 4096;
+
+/// Maximum total argv + envp byte budget per `execve(2)` call.
+///
+/// Linux's `ARG_MAX` is 128 KiB but the Phase 6 plan caps the inline
+/// buffer at 8 KiB to keep the same discipline as the `write` /
+/// `sigaction` arms. Overflow returns `-E2BIG`.
+///
+/// TODO(phase-userva): lift to 128 KiB once general `copy_from_user`
+/// lands.
+pub const EXECVE_ARG_MAX_INLINE: usize = 8192;
+
+/// Maximum number of pointer slots walked through `argv` / `envp`
+/// before we give up. The Phase 6 plan caps at 256; in practice the
+/// total-byte cap (`EXECVE_ARG_MAX_INLINE`) bounds well below this.
+pub const EXECVE_VEC_MAX: usize = 256;
 
 /// Linux generic ABI errno value for "function not implemented" (`ENOSYS`).
 /// Used as the `-ENOSYS` magnitude returned from `dispatch` for every
@@ -82,6 +111,10 @@ const EBADF_VALUE: i32 = 9;
 /// Used when a syscall argument violates a Phase 2a slice bound (e.g.
 /// `write(len > TTY_WRITE_MAX_INLINE)`).
 const E2BIG_VALUE: i32 = 7;
+/// Linux generic ABI errno value for "filename too long" (`ENAMETOOLONG`).
+/// Used by Phase 6's `execve(path)` arm when the path overflows
+/// `EXECVE_PATH_MAX`.
+const ENAMETOOLONG_VALUE: i32 = 36;
 /// Linux generic ABI errno value for "invalid argument" (`EINVAL`).
 /// Used by Phase 2b's `rt_sigprocmask` / `rt_sigaction` for the
 /// `sigsetsize != 8` rejection per `SIGNAL_v1` §3 / §15.1, and for
@@ -184,6 +217,17 @@ pub enum SyscallResult {
     /// Thread (or process) ended; the future driving this syscall does
     /// not return to userspace. Used by `NR_EXIT` and `NR_EXIT_GROUP`.
     NoReturn,
+    /// `execve` succeeded and the process's `AddressSpace` plus the
+    /// thread's `saved_user_context` have been replaced. The syscall
+    /// arm returned this; the thread future MUST NOT drain
+    /// `pending_syscall_return` for this iteration — the next
+    /// userspace re-entry runs the new image via the new
+    /// `saved_user_context`. The previous trap frame's `a0` is
+    /// effectively discarded (the new image's `_start` expects a
+    /// fresh stack and zero-initialised gprs).
+    ///
+    /// Cites: `txdoc:EXEC-12-1-INSTALL-USER-TRAP-CONTEXT`.
+    ExecCommitted,
 }
 
 /// Dispatch a Phase 2a syscall.
@@ -197,7 +241,7 @@ pub enum SyscallResult {
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a>(req: SyscallRequest, ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub async fn dispatch<'a, P: PmapIf>(req: SyscallRequest, ctx: &SyscallCtx<'a>) -> SyscallResult {
     match req.nr {
         NR_WRITE => sys_write(req.args, ctx).await,
         NR_READ => sys_read(req.args, ctx).await,
@@ -208,6 +252,7 @@ pub async fn dispatch<'a>(req: SyscallRequest, ctx: &SyscallCtx<'a>) -> SyscallR
         NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
         NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
         NR_FCNTL => sys_fcntl(req.args, ctx),
+        nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -716,6 +761,201 @@ fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
         // TODO(phase-fcntl-extension): F_DUPFD, F_GETFL, F_SETFL, ...
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
+}
+
+/// `execve(path, argv, envp)` — Wave 4 / Phase 6 of the ELF-loader
+/// plan.
+///
+/// Bounded user-buffer copy discipline (matches the existing
+/// `TTY_WRITE_MAX_INLINE = 4096` / Phase 2a "kernel-side `from_raw_parts`"
+/// pattern, with an explicit `EXECVE_PATH_MAX` / `EXECVE_ARG_MAX_INLINE`
+/// cap):
+///
+/// 1. `path_uaddr` — read up to `EXECVE_PATH_MAX = 4096` bytes,
+///    stopping at the first NUL byte. No NUL within budget →
+///    `-ENAMETOOLONG`.
+/// 2. `argv_uaddr` / `envp_uaddr` — each is a NULL-terminated array
+///    of `*const u8` pointers (8 bytes each on RV64). Walk up to
+///    `EXECVE_VEC_MAX = 256` slots; for each non-NULL pointer, read
+///    a NUL-terminated string. Total string bytes across argv + envp
+///    are bounded by `EXECVE_ARG_MAX_INLINE = 8192`. Overflow →
+///    `-E2BIG`.
+///
+/// On `Ok(())` from `exec_script`, return `SyscallResult::ExecCommitted`.
+/// The thread future MUST NOT drain `pending_syscall_return` for this
+/// iteration — the new image's `_start` reads from a fresh
+/// `saved_user_context` (entry pc / initial sp) and zero-initialised
+/// gprs (System V psABI). On `Err(_)` map to a Linux negative errno
+/// via `ExecError::to_errno_i32`.
+///
+/// SAFETY (kernel-buffer exemption): same Phase 2a discipline as
+/// `sys_write` / `sys_read` — the userspace VAs (`path_uaddr`,
+/// `argv_uaddr`, `envp_uaddr`) are read through `from_raw_parts`
+/// without an `aspace.copy_from_user` indirection. Test scaffolding
+/// passes kernel-side pointers directly. Once the userspace-VA copy
+/// lane lands the bounded-read helpers below switch over.
+/// TODO(phase-userva): replace with `ctx.aspace.copy_from_user(...)`.
+async fn sys_execve<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let path_uaddr = args[0];
+    let argv_uaddr = args[1];
+    let envp_uaddr = args[2];
+
+    // ----- Step 1: bounded read of the path -----
+    let path_buf = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+        Ok(buf) => buf,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+
+    // ----- Step 2 + 3: bounded reads of argv and envp -----
+    //
+    // The byte budget is shared across argv and envp per Linux's
+    // ARG_MAX semantics. Track `remaining` across both vector reads so
+    // an oversized envp following a normal argv still triggers
+    // `-E2BIG`.
+    let mut remaining: usize = EXECVE_ARG_MAX_INLINE;
+    let argv_buf = match read_user_cstr_vec(argv_uaddr, EXECVE_VEC_MAX, &mut remaining) {
+        Ok(v) => v,
+        Err(ReadVecError::TooBig) => return SyscallResult::Error(E2BIG_VALUE),
+    };
+    let envp_buf = match read_user_cstr_vec(envp_uaddr, EXECVE_VEC_MAX, &mut remaining) {
+        Ok(v) => v,
+        Err(ReadVecError::TooBig) => return SyscallResult::Error(E2BIG_VALUE),
+    };
+
+    // ----- Build kernel-side `&[&[u8]]` slices for `exec_script`. -----
+    //
+    // The owned `Vec<Vec<u8>>` outlives the `&[&[u8]]` snapshot
+    // — both are local to this function so the lifetimes are
+    // straightforward. `exec_script` only reads from the slices
+    // during the stack-image build, well before any aspace swap.
+    let argv_slices: Vec<&[u8]> = argv_buf.iter().map(|s| s.as_slice()).collect();
+    let envp_slices: Vec<&[u8]> = envp_buf.iter().map(|s| s.as_slice()).collect();
+
+    // Default-credential path — Phase 6 reads cred from the syscall
+    // context once a `cred` field is plumbed onto `SyscallCtx`.
+    // For now `Credential::default()` matches the bootstrap process
+    // (uid=0, gid=0).
+    // TODO(phase-cred-on-ctx): consume cred from ctx once the field
+    // lands.
+    let cred = Credential::default();
+
+    let outcome = exec_script::<P>(
+        &ctx.process,
+        &ctx.thread,
+        &path_buf,
+        &argv_slices,
+        &envp_slices,
+        &cred,
+    )
+    .await;
+
+    match outcome {
+        Ok(()) => SyscallResult::ExecCommitted,
+        Err(e) => SyscallResult::Error(execve_errno_magnitude(e)),
+    }
+}
+
+/// Outcome of `read_user_cstr` — distinguishes "no NUL within budget"
+/// from a successful copy. The successful arm yields the bytes up to
+/// (not including) the NUL terminator, allocated as a kernel-owned
+/// `Vec<u8>`.
+enum ReadCStrError {
+    /// No NUL within `max_len` — surface as `-ENAMETOOLONG`.
+    TooLong,
+}
+
+/// Outcome of `read_user_cstr_vec`. `TooBig` covers both
+/// pointer-array overflow and aggregate-byte overflow; both surface
+/// as `-E2BIG` per the Phase 6 plan.
+enum ReadVecError {
+    TooBig,
+}
+
+/// Bounded copy of a NUL-terminated user string into a kernel-owned
+/// `Vec<u8>` (NUL terminator stripped). `uaddr == 0` produces an empty
+/// vector — matches Linux's "execve(NULL, ...)" lenience for path =
+/// NULL (which would actually surface as `EFAULT` in real Linux; the
+/// trio Phase 2a bootstrap exemption pre-dates the EFAULT plumbing,
+/// so we treat NULL as "empty").
+///
+/// SAFETY: see the SAFETY comment in `sys_write` — kernel-buffer
+/// bootstrap exemption applies.
+fn read_user_cstr(uaddr: u64, max_len: usize) -> Result<Vec<u8>, ReadCStrError> {
+    if uaddr == 0 || max_len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<u8> = Vec::new();
+    out.reserve(core::cmp::min(max_len, 256));
+    for offset in 0..max_len {
+        // SAFETY: bootstrap kernel-buffer exemption (TODO: phase-userva).
+        let byte = unsafe { core::ptr::read_volatile((uaddr as usize + offset) as *const u8) };
+        if byte == 0 {
+            return Ok(out);
+        }
+        out.push(byte);
+    }
+    // Walked the full budget without seeing a NUL — too long.
+    Err(ReadCStrError::TooLong)
+}
+
+/// Bounded copy of a NULL-terminated array of `*const u8` user
+/// pointers into a kernel-owned `Vec<Vec<u8>>`. Each non-NULL entry
+/// resolves to its own NUL-terminated string. The aggregate-byte
+/// budget shared across argv + envp is passed in through
+/// `byte_budget` (decremented in place).
+///
+/// `uaddr == 0` produces an empty vector — matches Linux's lenience
+/// for `execve(path, NULL, NULL)` per the Phase 6 plan.
+///
+/// SAFETY: see the SAFETY comment in `sys_write`.
+fn read_user_cstr_vec(
+    uaddr: u64,
+    max_slots: usize,
+    byte_budget: &mut usize,
+) -> Result<Vec<Vec<u8>>, ReadVecError> {
+    if uaddr == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for slot in 0..max_slots {
+        let slot_addr = uaddr as usize + slot * core::mem::size_of::<u64>();
+        // SAFETY: bootstrap kernel-buffer exemption (TODO: phase-userva).
+        let ptr = unsafe { core::ptr::read_volatile(slot_addr as *const u64) };
+        if ptr == 0 {
+            return Ok(out);
+        }
+        // Read the string at `ptr`, capped at the remaining byte
+        // budget. We need at least one byte for the NUL terminator;
+        // when `*byte_budget == 0` any non-empty string is `TooBig`.
+        let cap = *byte_budget;
+        let s = match read_user_cstr(ptr, cap) {
+            Ok(s) => s,
+            Err(ReadCStrError::TooLong) => return Err(ReadVecError::TooBig),
+        };
+        // Account `s.len() + 1` for the implicit NUL byte we read but
+        // did not store, matching Linux's `ARG_MAX` accounting.
+        let charged = s.len().saturating_add(1);
+        if charged > *byte_budget {
+            return Err(ReadVecError::TooBig);
+        }
+        *byte_budget -= charged;
+        out.push(s);
+    }
+    // Hit the slot cap without observing a NULL terminator — treat
+    // as oversized argv per the plan.
+    Err(ReadVecError::TooBig)
+}
+
+/// Translate `ExecError` to the dispatched `-errno` magnitude the
+/// Phase 6 syscall arm hands back through `SyscallResult::Error`.
+///
+/// `ExecError::to_errno_i32` returns the *signed* `-errno`
+/// (`-2` for `ENOENT`); `SyscallResult::Error` carries the *positive*
+/// magnitude (the userspace-entry shim negates before writing). We
+/// flip the sign here so the existing `Error(i32)` discipline is
+/// unchanged.
+fn execve_errno_magnitude(e: ExecError) -> i32 {
+    -e.to_errno_i32()
 }
 
 /// Read 8 little-endian bytes from a slice as a `u64`. Used by

@@ -160,6 +160,39 @@ impl ExecError {
             vm_scripts::ScriptError::Map(_) | vm_scripts::ScriptError::Pmap(_) => Self::OutOfMemory,
         }
     }
+
+    /// Map an `ExecError` to the Linux RV64 generic-ABI `-errno` value
+    /// the syscall arm writes back into the userspace `a0` register.
+    /// Linux returns errors as negative magnitudes (e.g. `ENOENT = 2`
+    /// becomes `-2`). Used by the Phase 6 NR_EXECVE arm in
+    /// `tx_shims::linux_syscall::sys_execve`.
+    ///
+    /// The values match `tx_shims::linux_syscall::errno_to_i32` for
+    /// consistency across the syscall surface.
+    pub fn to_errno_i32(self) -> i32 {
+        match self {
+            // ENAMETOOLONG
+            ExecError::PathTooLong => -36,
+            // ENOENT
+            ExecError::PathNotFound => -2,
+            // ENOTDIR
+            ExecError::NotADirectory => -20,
+            // EACCES
+            ExecError::PermissionDenied => -13,
+            // ELOOP
+            ExecError::SymlinkLoop => -40,
+            // ENOEXEC
+            ExecError::NotExecutable => -8,
+            // EINVAL
+            ExecError::InvalidArgument => -22,
+            // ENOMEM
+            ExecError::OutOfMemory => -12,
+            // EBUSY
+            ExecError::Busy => -16,
+            // EIO
+            ExecError::IoError => -5,
+        }
+    }
 }
 
 /// Replace `process`'s active address space with a fresh image loaded
@@ -199,10 +232,23 @@ pub async fn exec_script<P: PmapIf>(
     // any subsequent `.await` site (V1 / V2 take fresh guards
     // internally; nesting would violate
     // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
+    //
+    // Walker discipline today: `step_walk` / `step_open` are `async fn`
+    // but never reach an `.await` point internally — every backend in
+    // tree resolves synchronously (the no-op `.await` comments at the
+    // top of `vfs::walker` document this). To keep the resulting
+    // `exec_script` future `Send` (the production thread future
+    // submits it to the reactor's Send-bound `submit_task`) we poll
+    // the walker future once with a noop waker rather than awaiting
+    // it. The borrowed `&Guard` then only lives across the
+    // synchronous poll, never across a suspension point. When ext4 /
+    // page-cache backends grow real waits, this site shifts to the
+    // canonical `take a fresh guard inside an await_*` shape per
+    // `vm::execution::fault_script`.
     let openfile = {
         let guard = tx_substrate::epoch::guard();
         let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
-        let outcome = step_open(
+        let outcome = poll_walker_synchronously(step_open(
             rooted_at,
             path,
             OpenFileFlags {
@@ -214,8 +260,7 @@ pub async fn exec_script<P: PmapIf>(
             0,
             cred,
             &guard,
-        )
-        .await;
+        ));
         let result = match outcome {
             StepOutcome::Done(file) | StepOutcome::Advanced(file) => Ok(file),
             StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
@@ -498,6 +543,52 @@ const fn page_round_up(value: u64) -> Option<u64> {
     match value.checked_add(mask) {
         Some(rounded) => Some(rounded & !mask),
         None => None,
+    }
+}
+
+/// Poll an `async` walker future synchronously, panicking if it
+/// returns `Pending`.
+///
+/// `step_walk` and `step_open` are `async fn` but never reach an
+/// `.await` point in the in-tree backends today (the walker module
+/// docs at `crates/tx-subsystems/src/vfs/walker.rs:23` say "every
+/// `.await` is a no-op today"). Driving them through `.await` from
+/// `exec_script` would capture the borrowed `&Guard` across the
+/// suspension point — making the resulting `exec_script` future
+/// `!Send` because `Guard` is deliberately `!Send + !Sync`.
+///
+/// Polling once with a noop waker resolves immediately for every
+/// in-tree walker path, and the borrowed `&Guard` only lives across
+/// the synchronous poll body — not across any suspension point. When
+/// ext4 / page-cache backends grow real waits (and `step_walk`
+/// actually returns `Pending`), this helper's `panic!` arm fires
+/// and the call site must shift to the canonical "fresh guard inside
+/// `await_*`" shape per `vm::execution::fault_script`.
+fn poll_walker_synchronously<F: core::future::Future>(future: F) -> F::Output {
+    use core::pin::pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    // Noop waker: cloning yields another noop waker; wake / wake_by_ref
+    // are no-ops; drop is a no-op.
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+    // SAFETY: the vtable above never dereferences the data pointer.
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = Context::from_waker(&waker);
+    let mut pinned = pin!(future);
+    match pinned.as_mut().poll(&mut cx) {
+        Poll::Ready(value) => value,
+        Poll::Pending => panic!(
+            "poll_walker_synchronously: walker returned Pending; in-tree walker \
+             backends never await today (cite: vfs::walker module docs). When \
+             real-await backends land this site must use the fresh-guard-inside-\
+             await_* pattern instead."
+        ),
     }
 }
 

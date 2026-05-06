@@ -4,6 +4,74 @@
 
 ## Current Shape
 
+- 2026-05-06 ELF loader Phase 6 (NR_EXECVE syscall arm) on branch
+  `feat/elf-loader-and-execve`. Per
+  `docs/progress/plans/2026-05-06-elf-loader-and-execve.md` Part 6.
+  Wires the userspace-visible entry point to Phase 5's `exec_script`.
+  Deliverables: (1) `tx-shims/Cargo.toml` adds `tx-scripts` + `tx-hal`
+  as runtime deps (one-directional — tx-scripts does NOT pull
+  tx-shims, no cycle). (2) `SyscallResult::ExecCommitted` enum
+  variant on `tx_shims::linux_syscall::SyscallResult` — the
+  thread future treats this as "do NOT drain
+  `pending_syscall_return` for this iteration" (cite
+  `txdoc:EXEC-12-1-INSTALL-USER-TRAP-CONTEXT`). (3) `NR_EXECVE = 221`
+  in `numbers.rs` (Linux RV64 generic ABI). (4) `dispatch::<P: PmapIf>`
+  signature change — generic over the platform's `PmapIf` so
+  `sys_execve::<P>` can call `exec_script::<P>`. All existing
+  callers updated (3 in tx-shims tests, 2 in tx-kernel
+  thread_future + tests). (5) `sys_execve` arm: bounded
+  user-buffer copies via `read_user_cstr` / `read_user_cstr_vec`
+  helpers (kernel-side `read_volatile` per the Phase 2a bootstrap
+  exemption); caps `EXECVE_PATH_MAX = 4096` (NUL-terminator-or-
+  ENAMETOOLONG), `EXECVE_ARG_MAX_INLINE = 8192` (shared argv +
+  envp byte budget — overflow → E2BIG), `EXECVE_VEC_MAX = 256`
+  pointer slots. (6) `ExecError::to_errno_i32` impl on tx-scripts'
+  `ExecError`: returns negative magnitudes (`PathNotFound = -2`,
+  `NotExecutable = -8`, `PathTooLong = -36`, `OutOfMemory = -12`,
+  ...) consistent with `tx-shims::linux_syscall::errno_to_i32`.
+  Helper `execve_errno_magnitude` flips sign so
+  `SyscallResult::Error(positive)` is preserved. (7) Thread future
+  match-arm refactor in `crates/tx-kernel/src/thread_future.rs`:
+  the `UserspaceTrapInfo::Syscall` arm now matches all four
+  `SyscallResult` variants explicitly; on `ExecCommitted` it
+  falls through (no early return, no pending-return write) so the
+  AST drain + `prepare_userspace_entry_payload` +
+  `enter_userspace_with_context` tail re-uses the
+  freshly-seeded `saved_user_context` from the Phase-6 swap. (8)
+  Send-fix in `tx-scripts::process::exec::script::exec_script` —
+  the walker `step_open(...).await` was capturing `&Guard` across
+  the suspension point, making the resulting future `!Send` (Guard
+  is deliberately `!Send + !Sync`). Replaced with a synchronous
+  poll via a noop-waker helper `poll_walker_synchronously`; the
+  in-tree walker backends never `.await` today (per
+  `vfs::walker` module docs), so a single `poll` returns Ready
+  every time. When real-await backends land, the `Pending` arm's
+  panic message points to the canonical fresh-guard-inside-await_*
+  shape. Tests: 5 new in `tx-shims` (path-not-found-returns-
+  neg-enoent; invalid-elf-returns-neg-enoexec; too-long-path-
+  returns-neg-enametoolong; argv-overflow-returns-neg-e2big;
+  success-returns-exec-committed) + 1 new in `tx-kernel`
+  (execve-continues-loop-without-writing-pending-return — scripts
+  the dispatcher's outcome with `ExecCommitted` and asserts the
+  match-arm semantics directly, mirroring the existing
+  PageFault-Ok test pattern). The new `execve` tests reuse the
+  tx-scripts `ExecTestFs` shape inline (FsOps + FsPageBacking
+  fixture with `materialise_rnode` over a hand-crafted RV64 ET_EXEC
+  binary). Verification: `cargo check --workspace` clean; `cargo
+  check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf` clean; `cargo test -p tx-shims --lib`
+  17 → 22; `cargo test -p tx-kernel --lib` 19 → 20; `cargo test
+  -p tx-scripts --lib` 29/29 unchanged; `cargo test -p
+  tx-subsystems --lib -- --test-threads=1` 364/364 unchanged;
+  `cargo test -p tx-fs --lib -- --test-threads=1` 13/13 unchanged;
+  `cargo fmt --check` + `cargo xtask progress validate` clean.
+  Next: Phase 7 (bootstrap exec of `/init` from `init.rs`). Note
+  for Phase 7: `sys_execve` reads `Credential::default()` (uid=0,
+  gid=0) — once `SyscallCtx` grows a `cred` field plumbed from
+  the per-thread payload, switch the arm to `ctx.cred()`. Also,
+  `dispatch` is now `dispatch::<P: PmapIf>` so any new caller
+  must thread the platform type. Blocker: none.
+
 - 2026-05-06 ELF loader Phase 5 (`exec_script` orchestration) on branch
   `feat/elf-loader-and-execve`. Per
   `docs/progress/plans/2026-05-06-elf-loader-and-execve.md` Part 5.

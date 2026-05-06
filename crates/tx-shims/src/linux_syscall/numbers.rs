@@ -46,6 +46,16 @@ pub const NR_RT_SIGPROCMASK: u64 = 135;
 /// `F_GETFL`, `F_SETFL`, etc.) return `-ENOSYS` until the relevant
 /// follow-up phases (`fcntl-extension`) wire them up.
 pub const NR_FCNTL: u64 = 25;
+/// `execve(path, argv, envp)`. Linux generic ABI `__NR_execve` = 221.
+///
+/// Wave 4 (Phase 6 of the ELF-loader plan) wires the syscall arm to
+/// `tx_scripts::process::exec::exec_script`. On `Ok(())` the dispatch
+/// returns `SyscallResult::ExecCommitted` — the thread future MUST NOT
+/// drain `pending_syscall_return` for this iteration (the new image's
+/// `_start` expects fresh GPRs; the previous trap frame's `a0` is
+/// discarded). On `Err(_)` the standard `ExecError → -errno` mapping
+/// applies (cite: `txdoc:EXEC-12-1-INSTALL-USER-TRAP-CONTEXT`).
+pub const NR_EXECVE: u64 = 221;
 
 // ---------------------------------------------------------------------
 // fcntl command numbers + flag bits.
