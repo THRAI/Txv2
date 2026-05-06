@@ -49,8 +49,9 @@ use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_substrate::zone::Cap;
 use tx_subsystems::execution::{Errno, StepOutcome};
 use tx_subsystems::process::{
-    seed_child_leader_context, step_exit_group, step_fork, step_setpgid, step_setsid, ExitStatus,
-    Pgid, ProcessIdentity, SetpgidError, SetsidError,
+    seed_child_leader_context, step_exit_group, step_fork, step_setpgid, step_setsid,
+    step_waitpid_nohang, ExitStatus, Pgid, Pid, ProcessIdentity, SetpgidError, SetsidError,
+    WaitError, WaitTarget,
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
@@ -71,8 +72,8 @@ mod tests;
 pub use numbers::{
     FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL,
     NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETSID, NR_READ, NR_RT_SIGACTION,
-    NR_RT_SIGPROCMASK, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WRITE,
-    O_CLOEXEC, SIGCHLD,
+    NR_RT_SIGPROCMASK, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WAIT4,
+    NR_WRITE, O_CLOEXEC, SIGCHLD, WNOHANG,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -147,6 +148,10 @@ const ENOMEM_VALUE: i32 = 12;
 /// `Zone(_)` / `ParentZombie`, but EAGAIN is the canonical Linux
 /// errno for fork's transient-failure case.
 const EAGAIN_VALUE: i32 = 11;
+/// Linux generic ABI errno value for "no child processes" (`ECHILD`).
+/// Used by `sys_wait4` when the caller has no children matching the
+/// requested selector (Wave 3 of the fork/clone/wait4 slice).
+const ECHILD_VALUE: i32 = 10;
 /// Required sigsetsize per Linux RV64 generic ABI: 8 bytes (a single
 /// `u64` bitset matching `tx_subsystems::signal::SignalMask`'s
 /// internal representation). `rt_sigprocmask` / `rt_sigaction`
@@ -277,6 +282,7 @@ pub async fn dispatch<'a, P: PmapIf>(req: SyscallRequest, ctx: &SyscallCtx<'a>) 
         NR_FCNTL => sys_fcntl(req.args, ctx),
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
         nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx),
+        nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
         nr if nr == NR_GETPPID => sys_getppid(ctx),
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_GETPGID => sys_getpgid(req.args, ctx),
@@ -1155,6 +1161,135 @@ fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     // `pending_syscall_return` into the parent's fresh trap frame's
     // a0 before re-entry per Plan B.
     SyscallResult::Return(child.pid.0 as i64)
+}
+
+/// `wait4(pid, status, options, rusage)` — Wave 3 of the fork/clone/wait4
+/// slice. The blocking variant: when no zombie matches and `WNOHANG`
+/// is unset, the arm parks on the caller's per-process `exit_port`
+/// carrier (registered at payload sign time per Wave 1) until any
+/// child of this process zombifies, then re-polls.
+///
+/// ## pid → `WaitTarget`
+///
+/// Per the existing comment at `process/execution.rs:123-145`:
+///
+/// - `pid > 0` → [`WaitTarget::Pid`]
+/// - `pid == 0` → [`WaitTarget::CallerPgrp`]
+/// - `pid == -1` → [`WaitTarget::Any`]
+/// - `pid < -1` → [`WaitTarget::Pgrp`] with `Pgid(-pid as u32)`
+/// - `pid == i32::MIN` → `-EINVAL` (overflow on negate; matches Linux
+///   per LTP `wait403`).
+///
+/// ## Options
+///
+/// - `WNOHANG = 0x1` — short-circuit: if no zombie ready, return `0`
+///   instead of blocking. Acted on.
+/// - `WUNTRACED = 0x2` / `WCONTINUED = 0x8` — Linux ignores unknown
+///   bits silently for `wait4`; we mirror that behaviour. Stop/cont
+///   surface needs the stop/cont signal slice (deferred).
+///
+/// ## rusage
+///
+/// Wave 3 rejects non-NULL `rusage` with `-EINVAL` per the slice
+/// plan. txKernel doesn't track per-process resource usage today;
+/// zero-fill is busy-work that doesn't unblock anything LTP exercises.
+/// `TODO(phase-rusage)`: zero-fill or populate once rusage state lands.
+///
+/// ## wstatus write
+///
+/// If `wstatus_uaddr != 0`, the wait-status word
+/// ([`ExitStatus::wait_status_word`]) is written as a little-endian
+/// `i32` to the user address. Same kernel-buffer bootstrap exemption
+/// as `sys_write` / `sys_read` — `core::ptr::write_volatile` over
+/// `wstatus_uaddr` directly. `TODO(phase-userva)`: replace with
+/// `ctx.aspace.copy_to_user(...)` once the userspace-VA copy lane lands.
+///
+/// ## Blocking shape
+///
+/// The loop pattern matches `sys_read` / `vm::execution::fault_script`:
+/// each iteration calls the synchronous `step_waitpid_nohang` walker
+/// (no guard parameter — it takes its own snapshot internally). On
+/// `Err(WaitError::NoneReady)` without `WNOHANG`, build a `WaitToken`
+/// from `ctx.process.exit_port_wait_token()` and `wait_carrier::wait_on_token`
+/// it. Post-wake, loop and re-poll: a third party may have reaped the
+/// same zombie (e.g. another wait4 caller in the same process; or the
+/// shared `INIT_PROCESS` reaper if init wakes first), so the second
+/// poll may still return `NoneReady` — re-park.
+///
+/// Cites: `txdoc:PROCESS-WAIT-FAMILY-1`
+/// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4).
+async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let pid = args[0] as i64 as i32;
+    let wstatus_uaddr = args[1];
+    let options = args[2] as i32;
+    let rusage_uaddr = args[3];
+
+    // rusage: Wave 3 rejects non-NULL with -EINVAL. txKernel doesn't
+    // track rusage today.
+    if rusage_uaddr != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    // pid → WaitTarget. i32::MIN's negate overflows; reject upfront.
+    let target = match pid {
+        i32::MIN => return SyscallResult::Error(EINVAL_VALUE),
+        p if p == -1 => WaitTarget::Any,
+        0 => WaitTarget::CallerPgrp,
+        p if p > 0 => WaitTarget::Pid(Pid(p as u32)),
+        p => {
+            // p < -1: any child whose pgid matches `-p`.
+            let pgid = (-p) as u32;
+            WaitTarget::Pgrp(Pgid(pgid))
+        }
+    };
+
+    let wnohang = (options & WNOHANG) != 0;
+
+    // Polling loop with the canonical async-wait double-check shape.
+    // Each iteration: poll → if Done(zombie) reap+return; if NoneReady
+    // and WNOHANG return 0; else build a WaitToken and await.
+    loop {
+        let outcome = step_waitpid_nohang(&ctx.process, target);
+        match outcome {
+            Ok((child_pid, status)) => {
+                if wstatus_uaddr != 0 {
+                    let word = status.wait_status_word();
+                    // SAFETY: kernel-buffer bootstrap exemption per the
+                    // Phase 2a / Wave-3-slice plan. Writes a 4-byte
+                    // little-endian (RV64-native) i32. TODO(phase-userva):
+                    // replace with `ctx.aspace.copy_to_user(...)`.
+                    unsafe {
+                        core::ptr::write_volatile(wstatus_uaddr as *mut i32, word);
+                    }
+                }
+                return SyscallResult::Return(child_pid.0 as i64);
+            }
+            Err(WaitError::NoChildren) => {
+                return SyscallResult::Error(ECHILD_VALUE);
+            }
+            Err(WaitError::NoneReady) => {
+                if wnohang {
+                    return SyscallResult::Return(0);
+                }
+                // Build the WaitToken from the parent's exit_port
+                // carrier id (registered at payload-sign time, Wave 1).
+                // `None` means the calling process is itself a zombie
+                // — race against our own exit; surface as -ECHILD per
+                // POSIX (no children to wait for from a dead process).
+                let Some(token) = ctx.process.exit_port_wait_token() else {
+                    return SyscallResult::Error(ECHILD_VALUE);
+                };
+                if let Some(future) = wait_carrier::wait_on_token(token) {
+                    let _ = future.await;
+                }
+                // Either `wait_on_token` returned None (test placeholder
+                // carrier; should be `Some` for the live process payload)
+                // or the future resolved. Loop and re-poll. The wake
+                // races a third party reaping the same zombie, so the
+                // re-poll may still observe NoneReady — fine, we re-park.
+            }
+        }
+    }
 }
 
 /// `getppid()` — return the parent's pid, or `0` (`Pid::RESERVED`)

@@ -161,3 +161,28 @@ pub const NR_SET_TID_ADDRESS: u64 = 96;
 /// (futex robust-list registration) is deferred to the futex slice
 /// (`TODO(phase-futex)`).
 pub const NR_SET_ROBUST_LIST: u64 = 99;
+
+// ---------------------------------------------------------------------
+// Wave 3 of the fork/clone/wait4 slice — Part 3 (NR_WAIT4 syscall arm
+// with blocking-wait via the per-process `exit_port` carrier wired in
+// Wave 1). NR_WAITID is intentionally absent — deferred per the slice
+// plan's Open Q #2 (DECIDED 2026-05-06: NR_WAITID deferred).
+// ---------------------------------------------------------------------
+
+/// `wait4(pid, status, options, rusage)`. Linux RV64 generic ABI
+/// `__NR_wait4`.
+///
+/// Wave 3 of the fork/clone/wait4 slice ships the blocking variant —
+/// when no zombie matches and `WNOHANG` is unset, the arm parks on the
+/// caller's per-process `exit_port` carrier (registered at payload
+/// sign time per Wave 1) via
+/// [`tx_subsystems::wait_carrier::wait_on_token`], waking when any
+/// child of this process zombifies. See
+/// `txdoc:PROCESS-WAIT-FAMILY-1`.
+pub const NR_WAIT4: u64 = 260;
+
+/// `WNOHANG` — only options bit Wave 3 acts on. Other defined bits
+/// (`WUNTRACED = 0x2`, `WCONTINUED = 0x8`) are accepted but ignored;
+/// they need stop/cont signal infrastructure to surface
+/// `Stopped`/`Continued` `ExitStatus` values, which is a deferred slice.
+pub const WNOHANG: i32 = 0x1;
