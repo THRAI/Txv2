@@ -3,10 +3,13 @@
 
 use core::sync::atomic::Ordering;
 
-use tx_substrate::zone::Cap;
+use tx_hal::UserTrapContext;
+use tx_substrate::zone::{Cap, PayloadCap};
 
 use crate::signal::{SignalMask, Signum};
-use crate::thread_runtime::structure::ThreadIdentity;
+use crate::thread_runtime::structure::{
+    drain_pending_syscall_return, ThreadIdentity, ThreadPayload,
+};
 
 /// Mark a thread zombie: set its exit status, drop its payload. Does
 /// not touch the parent process's thread list — callers that need
@@ -137,4 +140,60 @@ pub fn post_signal(thread: &Cap<ThreadIdentity>, sig: Signum) {
     if !mask.is_blocked(sig) {
         payload.update_summary(|s| s.deliverable_signal = true);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Userspace-entry shim (Plan B writeback discipline)
+// ---------------------------------------------------------------------------
+
+/// RV64 register index of the `a0` argument/return register inside
+/// [`UserTrapContext::regs`]. The HAL stores user GPRs at the same
+/// indices the architecture uses (`x10` is `a0`); other arches will
+/// surface their own equivalent before they ship a TrapIf override.
+const USER_CONTEXT_A0_INDEX: usize = 10;
+
+/// Build the merged [`UserTrapContext`] the HAL's
+/// `TrapIf::enter_userspace_with_context` consumes on the next userspace
+/// re-entry.
+///
+/// Per Plan B writeback discipline pinned by
+/// `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`
+/// (`docs/design/02_execution/THREAD_RUNTIME_v1.md`) this function is
+/// the **only** site that drains `pending_syscall_return` and the
+/// **only** site that produces the merged context for userspace
+/// re-entry. The trap shell never writes to the trapping frame. The
+/// platform's `enter_userspace_with_context` then materialises a fresh
+/// trap frame from the returned `UserTrapContext` before `sret`.
+///
+/// Behaviour:
+/// 1. Snapshots `payload.saved_user_context` (set by the trap shell
+///    via `view.capture_user_context()` on entry).
+/// 2. Drains `pending_syscall_return` exactly once. `Ok(v)` encodes as
+///    `v as u64`; `Err(errno)` encodes as `(-errno as i64) as u64`
+///    (Linux ABI: negative errno for failure).
+/// 3. Overlays the encoded value into the context's `a0`-equivalent
+///    register slot.
+/// 4. Clears `payload.active_userspace_request` (the wait was resolved
+///    on the previous trap; the next iteration re-issues
+///    `start_request`).
+///
+/// **Panics** if no `saved_user_context` is recorded — that means
+/// userspace re-entry was attempted before any trap captured a baseline
+/// context, which is a thread-future invariant violation.
+pub fn prepare_userspace_entry_payload(payload: &PayloadCap<ThreadPayload>) -> UserTrapContext {
+    let mut ctx = payload
+        .saved_user_context()
+        .expect("prepare_userspace_entry_payload: no saved_user_context recorded");
+
+    if let Some(result) = drain_pending_syscall_return(payload) {
+        let encoded = match result {
+            Ok(v) => v as u64,
+            Err(errno) => (-i64::from(errno)) as u64,
+        };
+        ctx.regs[USER_CONTEXT_A0_INDEX] = encoded as usize;
+    }
+
+    payload.set_active_userspace_request(None);
+
+    ctx
 }

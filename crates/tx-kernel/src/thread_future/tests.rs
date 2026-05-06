@@ -1,0 +1,400 @@
+//! Tests for the production thread future + per-hart slot adapter.
+//!
+//! Strategy: drive `prepare_userspace_entry_payload` and
+//! `linux_syscall::dispatch` separately rather than reaching the
+//! `enter_userspace_with_context` divergent call site (which would
+//! either panic via the host TestPlatform's default TrapIf impl or
+//! require a divergent test-only override). The two pieces under test
+//! here are the per-hart slot adapter (`PerHartSlotted`) and the slot
+//! semantics around `start_request` / `complete_interesting_trap` that
+//! the future relies on.
+
+use core::future::Future;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use core::task::{Context, Poll, Waker};
+
+use std::sync::Arc;
+
+use tx_hal::{
+    AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
+    PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions, PmapReservation,
+    PmapReserveKind, PmapRoot, PtNode,
+};
+use tx_reactor::userspace::{SyscallRequest, UserspaceTrapInfo};
+use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult, NR_EXIT_GROUP, NR_WRITE};
+use tx_substrate::zone::PayloadCap;
+use tx_subsystems::process::ExitStatus;
+use tx_subsystems::thread_runtime::{
+    clear_current_thread_payload, current_thread_payload, drain_pending_syscall_return,
+    ThreadPayload,
+};
+
+use crate::thread_future::PerHartSlotted;
+
+const TEST_PAGE_SIZE: usize = 4096;
+
+/// Serialise against every other tx-kernel host test that touches
+/// global INIT_PROCESS, the per-hart slot table, and the epoch
+/// domain. The shared lock lives in `crate::test_serialise`.
+use crate::test_serialise::KERNEL_TEST_LOCK as THREAD_FUTURE_TEST_LOCK;
+
+struct TestPlatform;
+
+impl PlatformConfig for TestPlatform {
+    const ARCH: Arch = Arch::Riscv64;
+    const BOARD: &'static str = "tx-kernel-thread-future-test";
+}
+
+impl BootPlatformIf for TestPlatform {
+    const BOOT_PROTOCOL: BootProtocol = BootProtocol::RiscvDirect;
+}
+
+impl InitIf for TestPlatform {
+    fn init_early(_handoff: BootHandoff) {}
+    fn init_later(_handoff: BootHandoff) {}
+}
+
+static EMPTY_BOOT_INFO: BootInfo = BootInfo::empty();
+static TEST_PLATFORM_INFO: PlatformInfo = PlatformInfo {
+    board: TestPlatform::BOARD,
+    spi_sd: None,
+    mmio_regions: &[],
+    timebase_frequency_hz: 0,
+    possible_cpu_count: 1,
+};
+
+impl tx_hal::BootInfoIf for TestPlatform {
+    fn boot_info() -> &'static BootInfo {
+        &EMPTY_BOOT_INFO
+    }
+}
+
+impl tx_hal::PlatformInfoIf for TestPlatform {
+    fn platform_info() -> &'static PlatformInfo {
+        &TEST_PLATFORM_INFO
+    }
+}
+
+impl tx_hal::AuxvIf for TestPlatform {}
+
+impl ConsoleIf for TestPlatform {
+    fn write_bytes(_bytes: &[u8]) {}
+}
+
+impl tx_hal::TrapIf for TestPlatform {}
+impl tx_hal::UserAccessIf for TestPlatform {}
+impl tx_hal::SignalFrameIf for TestPlatform {}
+impl tx_hal::IrqIf for TestPlatform {}
+
+impl tx_hal::TimeIf for TestPlatform {
+    fn read_ns() -> u64 {
+        0
+    }
+    fn set_deadline_ns(_deadline: u64) {}
+    fn cancel_deadline() {}
+    fn frequency_hz() -> u64 {
+        1_000_000_000
+    }
+}
+
+impl tx_hal::PercpuIf for TestPlatform {}
+impl tx_hal::CacheIf for TestPlatform {}
+impl tx_hal::DmaIf for TestPlatform {}
+impl tx_hal::SmpIf for TestPlatform {}
+
+impl tx_hal::PowerIf for TestPlatform {
+    fn system_off() -> ! {
+        loop {}
+    }
+}
+
+static TEST_PMAP_NEXT_ROOT: AtomicUsize = AtomicUsize::new(1);
+
+impl tx_hal::PmapIf for TestPlatform {
+    fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+        let root_id = TEST_PMAP_NEXT_ROOT.fetch_add(1, Ordering::AcqRel);
+        Ok(PmapRoot::new(
+            PtNode::boot_pool(PhysAddr(root_id * TEST_PAGE_SIZE)),
+            Asid(root_id as u16),
+        ))
+    }
+
+    fn destroy_pmap_root(_root: PmapRoot) {}
+
+    fn reserve_mapping(
+        _root: &PmapRoot,
+        virt: tx_hal::VirtAddr,
+        phys: PhysAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapReservation>, PmapError> {
+        Ok(Some(PmapReservation::new(virt, phys, kind)))
+    }
+
+    fn rollback_mapping(_root: &PmapRoot, _reservation: PmapReservation) {}
+
+    fn commit_mapping(
+        _root: &PmapRoot,
+        _reservation: PmapReservation,
+        _permissions: PmapPermissions,
+    ) {
+    }
+
+    fn alloc_pt_node() -> Result<PtNode, AllocError> {
+        Err(AllocError::Exhausted)
+    }
+}
+
+fn setup() -> std::sync::MutexGuard<'static, ()> {
+    let guard = THREAD_FUTURE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    tx_substrate::testing::init_host_for_test_once();
+    let _ = tx_subsystems::zones::register_all();
+    tx_subsystems::cross_crate_test_support::reset_init_process();
+    tx_subsystems::cross_crate_test_support::reset_pid_counter();
+    tx_subsystems::cross_crate_test_support::reset_tid_counter();
+    // Ensure the per-hart slot is empty across tests.
+    let _ = clear_current_thread_payload(0);
+    guard
+}
+
+fn bootstrap_payload() -> PayloadCap<ThreadPayload> {
+    let aspace = tx_subsystems::vm::AddressSpace::new_cap_for_platform::<TestPlatform>()
+        .expect("test aspace");
+    let init = tx_subsystems::process::bootstrap_init_process(aspace).expect("bootstrap init");
+    let leader = init.nth_thread(0).expect("leader thread post-bootstrap");
+    leader.payload_cap_for_test().expect("leader payload alive")
+}
+
+struct NoopWake;
+
+impl std::task::Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+    fn wake_by_ref(self: &Arc<Self>) {}
+}
+
+fn noop_waker() -> Waker {
+    Waker::from(Arc::new(NoopWake))
+}
+
+/// Drive `fut` to completion via a spin-poll loop. Mirrors the
+/// `block_on` shape used in `crates/tx-kernel/src/init/tests.rs` so
+/// the dispatcher's `async` shape is exercised even on its
+/// synchronous arms.
+fn block_on<F: Future>(mut fut: F) -> F::Output {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` lives on the stack for the duration of the loop;
+    // we never move it after `Pin::new_unchecked`.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    for _ in 0..1024 {
+        match pinned.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => continue,
+        }
+    }
+    panic!("block_on: future did not resolve in 1024 polls");
+}
+
+/// `PerHartSlotted` sets the per-hart slot before delegating to the
+/// inner future, and clears it after the inner poll returns. The
+/// inner future asserts the slot is `Some` mid-poll; we then assert
+/// the slot is `None` after the wrapper's poll returns.
+#[test]
+fn per_hart_slotted_sets_and_clears_slot_around_poll() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+
+    let payload_for_inner = payload.clone();
+    let inner = async move {
+        // The wrapper installed `payload_for_inner` on hart 0 before
+        // entering this future; the slot must reflect it.
+        let slot = current_thread_payload(0).expect("slot installed during poll");
+        assert_eq!(
+            slot.key(),
+            payload_for_inner.key(),
+            "slot must hold the wrapper's payload"
+        );
+    };
+
+    let mut wrapped = PerHartSlotted::<TestPlatform, _>::new(payload.clone(), inner);
+
+    // Pre-poll: slot empty.
+    assert!(
+        current_thread_payload(0).is_none(),
+        "slot empty before any poll"
+    );
+
+    // SAFETY: `wrapped` lives on the stack for the duration of the
+    // single poll call; we never move it after pinning.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut wrapped) };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let out = pinned.as_mut().poll(&mut cx);
+    assert!(
+        matches!(out, Poll::Ready(())),
+        "trivial inner future must complete in one poll"
+    );
+
+    // Post-poll: slot cleared.
+    assert!(
+        current_thread_payload(0).is_none(),
+        "slot cleared after wrapper poll exit"
+    );
+}
+
+/// `PerHartSlotted` clears the slot on `Pending` exit too — the
+/// per-hart slot must not leak across yields.
+#[test]
+fn per_hart_slotted_clears_slot_on_pending_exit() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+
+    // Inner future that returns Pending the first time it's polled.
+    struct PendOnce {
+        polled: bool,
+    }
+    impl Future for PendOnce {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            let this = self.get_mut();
+            if !this.polled {
+                this.polled = true;
+                // Verify the wrapper installed the slot.
+                assert!(
+                    current_thread_payload(0).is_some(),
+                    "slot must be set during inner poll"
+                );
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }
+    }
+
+    let mut wrapped =
+        PerHartSlotted::<TestPlatform, _>::new(payload.clone(), PendOnce { polled: false });
+    // SAFETY: stack-pinned for the call.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut wrapped) };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let out = pinned.as_mut().poll(&mut cx);
+    assert!(matches!(out, Poll::Pending), "inner returned Pending");
+
+    // Slot cleared even on Pending exit.
+    assert!(
+        current_thread_payload(0).is_none(),
+        "slot cleared after Pending poll exit",
+    );
+}
+
+/// End-to-end host-driven slice that mirrors what the production
+/// thread future does for a `Syscall(write)` resolution: open the
+/// slot, resolve it with a `Syscall` trap, drive `linux_syscall::dispatch`,
+/// stash the return into `pending_syscall_return`. Asserts the
+/// dispatcher round-trips correctly. We do **not** drive
+/// `prepare_userspace_entry_payload` + `enter_userspace_with_context`
+/// here because the latter would diverge into TestPlatform's
+/// default-panic impl; that path is exercised in
+/// `tx-subsystems/src/thread_runtime/tests.rs` separately.
+#[test]
+fn thread_future_dispatches_syscall_then_yields_for_userspace_entry() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+    let aspace = init.aspace_cap().expect("aspace alive");
+
+    // Open the slot the way the future does.
+    let wait = payload
+        .userspace_slot()
+        .start_request()
+        .expect("start_request");
+    let req_token = wait.request();
+    payload.set_active_userspace_request(Some(req_token));
+
+    // Synthesise a `getpid` syscall (no buffers required, no console
+    // wiring needed) — it returns the process pid.
+    let req = SyscallRequest::new(tx_shims::linux_syscall::NR_GETPID, [0, 0, 0, 0, 0, 0]);
+    payload
+        .userspace_slot()
+        .complete_interesting_trap(req_token, UserspaceTrapInfo::Syscall(req))
+        .expect("resolve wait");
+
+    // Drain the wait future to consume the resolution. Mirrors the
+    // `wait.await` step inside `run_thread`.
+    drop(wait);
+    payload.set_active_userspace_request(None);
+
+    // Drive the dispatcher (NR_GETPID is sync but the dispatcher is
+    // `async`, so wrap in `block_on`).
+    let ctx = SyscallCtx::new(init.clone(), leader.clone(), aspace);
+    let result = block_on(dispatch(req, &ctx));
+    drop(ctx);
+
+    let v = match result {
+        SyscallResult::Return(v) => v,
+        other => panic!("expected Return; got {other:?}"),
+    };
+    payload.store_pending_syscall_return(Some(Ok(v)));
+
+    let drained = drain_pending_syscall_return(&payload);
+    assert_eq!(
+        drained,
+        Some(Ok(init.pid.0 as i64)),
+        "getpid result lands in pending_syscall_return"
+    );
+}
+
+/// `exit_group` returns `SyscallResult::NoReturn` and zombifies the
+/// process. Mirrors the `NoReturn` arm of `run_thread`'s match.
+#[test]
+fn thread_future_terminates_on_exit_group() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+    let aspace = init.aspace_cap().expect("aspace alive");
+
+    let wait = payload
+        .userspace_slot()
+        .start_request()
+        .expect("start_request");
+    let req_token = wait.request();
+    payload.set_active_userspace_request(Some(req_token));
+    let req = SyscallRequest::new(NR_EXIT_GROUP, [0, 0, 0, 0, 0, 0]);
+    payload
+        .userspace_slot()
+        .complete_interesting_trap(req_token, UserspaceTrapInfo::Syscall(req))
+        .expect("resolve wait");
+    drop(wait);
+    payload.set_active_userspace_request(None);
+
+    let ctx = SyscallCtx::new(init.clone(), leader.clone(), aspace);
+    let result = block_on(dispatch(req, &ctx));
+    drop(ctx);
+
+    assert!(
+        matches!(result, SyscallResult::NoReturn),
+        "exit_group → NoReturn"
+    );
+    assert!(init.is_zombie(), "exit_group zombifies init");
+    assert_eq!(
+        init.exit_status(),
+        Some(ExitStatus::Exited(0)),
+        "exit_group(0) records Exited(0)"
+    );
+
+    // No pending_syscall_return write happened.
+    assert!(
+        drain_pending_syscall_return(&payload).is_none(),
+        "NoReturn does not write pending_syscall_return"
+    );
+
+    // Touch NR_WRITE so the import is exercised by some test in this
+    // file (silences dead-code lint from the use list above).
+    let _ = NR_WRITE;
+}

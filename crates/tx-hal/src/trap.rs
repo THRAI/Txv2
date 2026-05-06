@@ -294,4 +294,22 @@ pub trait TrapIf {
     fn snapshot_trap(snapshot: TrapFrameSnapshot) -> TrapSnapshot {
         snapshot.portable(Self::classify_trap(snapshot))
     }
+
+    /// Enter userspace with the given context, applying the optional
+    /// pending syscall return into the architecture's `a0`-equivalent
+    /// register before the platform's `sret`/`ertn`/equivalent.
+    ///
+    /// Diverges; control returns through the trap vector, **not**
+    /// through this call site. This is the single platform-side site
+    /// that mutates user-visible registers per the Plan B writeback
+    /// discipline pinned by `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`
+    /// (`docs/design/02_execution/THREAD_RUNTIME_v1.md`).
+    ///
+    /// The default implementation panics; platforms that ship a
+    /// production userspace-entry path override it. Host-test
+    /// platforms (no real `sret`) can also override with an infinite
+    /// loop or a panic spelling the configuration error.
+    fn enter_userspace_with_context(_ctx: UserTrapContext) -> ! {
+        panic!("TrapIf::enter_userspace_with_context: platform has no userspace-entry shim");
+    }
 }

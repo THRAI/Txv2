@@ -15,12 +15,14 @@ use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
 use crate::process::{bootstrap_init_process, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
+use crate::thread_runtime::execution::prepare_userspace_entry_payload;
 use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{
     drain_pending_syscall_return, reset_tid_counter_for_test, ThreadIdentity,
 };
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
+use tx_hal::UserTrapContext;
 use tx_reactor::userspace::{SyscallRequest, UserspaceTrapInfo};
 use tx_substrate::testing::init_host_for_test_once;
 use tx_substrate::zone::Cap;
@@ -243,4 +245,94 @@ fn pending_syscall_return_drains_at_userspace_entry() {
     payload.store_pending_syscall_return(Some(Err(38)));
     assert_eq!(drain_pending_syscall_return(payload), Some(Err(38)));
     assert!(drain_pending_syscall_return(payload).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Userspace-entry shim tests (Pre-ELF Phase 2 Part 1)
+//
+// `prepare_userspace_entry_payload` is the single Plan-B writeback site
+// that drains `pending_syscall_return`, overlays the encoded value into
+// the `a0`-equivalent register of the saved user context, clears
+// `active_userspace_request`, and returns the merged `UserTrapContext`
+// to the platform's `enter_userspace_with_context` shim.
+// ---------------------------------------------------------------------------
+
+/// RV64 register index of `a0` inside `UserTrapContext::regs`. Mirrors
+/// the constant used internally by `prepare_userspace_entry_payload`.
+const A0_INDEX: usize = 10;
+
+fn install_saved_context(
+    payload: &tx_substrate::zone::PayloadCap<crate::thread_runtime::ThreadPayload>,
+) -> UserTrapContext {
+    let mut ctx = UserTrapContext {
+        regs: [0; 32],
+        pc: 0xCAFE_F00D,
+        status: 0,
+    };
+    // Plant a recognisable value in a0 so we can prove pre-existing
+    // contents are overwritten only when a syscall return is drained.
+    ctx.regs[A0_INDEX] = 0xDEAD;
+    payload.store_saved_user_context(Some(ctx));
+    ctx
+}
+
+#[test]
+fn prepare_userspace_entry_payload_drains_pending_return_into_a0() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let payload = leader.payload_cap_for_test().expect("alive");
+
+    install_saved_context(&payload);
+    payload.store_pending_syscall_return(Some(Ok(42)));
+
+    let ctx = prepare_userspace_entry_payload(&payload);
+
+    assert_eq!(ctx.regs[A0_INDEX], 42, "pending Ok(42) lands in a0");
+    assert_eq!(ctx.pc, 0xCAFE_F00D, "non-a0 context preserved");
+    assert!(
+        drain_pending_syscall_return(&payload).is_none(),
+        "shim drains pending_syscall_return exactly once"
+    );
+    assert!(
+        payload.active_userspace_request().is_none(),
+        "shim clears active_userspace_request",
+    );
+}
+
+#[test]
+fn prepare_userspace_entry_payload_negative_errno_encodes_as_minus_errno() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let payload = leader.payload_cap_for_test().expect("alive");
+
+    install_saved_context(&payload);
+    // EINVAL = 22 → a0 = (-22 as i64) as u64
+    payload.store_pending_syscall_return(Some(Err(22)));
+
+    let ctx = prepare_userspace_entry_payload(&payload);
+
+    let expected = (-22i64) as u64 as usize;
+    assert_eq!(ctx.regs[A0_INDEX], expected, "Err(22) encodes as -22");
+    assert!(drain_pending_syscall_return(&payload).is_none());
+}
+
+#[test]
+fn prepare_userspace_entry_payload_no_pending_preserves_saved_a0() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let payload = leader.payload_cap_for_test().expect("alive");
+
+    install_saved_context(&payload);
+    // Leave pending_syscall_return empty.
+    assert!(drain_pending_syscall_return(&payload).is_none());
+
+    let ctx = prepare_userspace_entry_payload(&payload);
+
+    assert_eq!(
+        ctx.regs[A0_INDEX], 0xDEAD,
+        "with no drain the saved a0 is preserved verbatim"
+    );
 }

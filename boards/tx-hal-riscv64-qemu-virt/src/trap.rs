@@ -364,6 +364,35 @@ impl TrapIf for Platform {
     fn classify_trap(snapshot: TrapFrameSnapshot) -> TrapClass {
         classify_rv64_trap(snapshot.scause)
     }
+
+    /// RV64 implementation of the portable userspace-entry hook.
+    ///
+    /// Materialises a fresh `Rv64TrapFrame` from `ctx`, prepares it
+    /// for the user-mode `sret`, and hands it to the existing
+    /// `return_to_userspace` low-level primitive. This is the second
+    /// site of the two-site discipline pinned by
+    /// `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`
+    /// (`docs/design/02_execution/THREAD_RUNTIME_v1.md`): the
+    /// userspace-entry shim that produces the `UserTrapContext`
+    /// (in `tx_subsystems::thread_runtime::execution::
+    /// prepare_userspace_entry_payload`) merges any pending syscall
+    /// return into the context's `a0` slot before this call; the
+    /// platform's writeback is the `restore_user_context` shape
+    /// already used by `Rv64TrapFrame::restore_user_context`.
+    fn enter_userspace_with_context(ctx: UserTrapContext) -> ! {
+        let mut frame = Rv64TrapFrame {
+            x: [0; 32],
+            scause: 0,
+            sepc: 0,
+            stval: 0,
+            sstatus: 0,
+        };
+        frame.restore_user_context(&ctx);
+        // `restore_user_context` already calls `prepare_user_return`,
+        // which clears SPP and sets SPIE so `sret` lands in user mode
+        // with interrupts enabled.
+        unsafe { return_to_userspace(&frame) }
+    }
 }
 
 pub fn dispatch_trap_frame<K>(frame: &mut Rv64TrapFrame) -> TrapAction
