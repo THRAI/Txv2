@@ -1025,3 +1025,129 @@ fn reactor_submission_seam_submits_child_thread_smoke() {
     // the fn-pointer routing; production reactor-side coupling is
     // exercised once the BSP reactor loop runs at boot.
 }
+
+// ---------------------------------------------------------------------------
+// Wave 4 fork/clone/wait4 slice — Part 7 end-to-end smoke (Layer A).
+// ---------------------------------------------------------------------------
+//
+// **Layer choice: A (production-paths-up-to-divergence).** The brief
+// recommended Layer A unless Layer B (full reactor-driven fork+wait
+// round trip with an instruction-stream simulator) was a clean
+// extension of ELF loader Wave 5's smoke. Wave 5 only scripts a
+// single linear program (write+exit_group) without branching or
+// inter-thread coordination; Layer B for fork+wait would require:
+//   - decoding the actual `bnez` from the saved-context PC + reading
+//     fixture bytes via the post-exec AddressSpace (cross-task
+//     iteration over both parent and child threads),
+//   - extending TestPlatform/PerHartSlotted to switch which
+//     ThreadPayload's userspace_slot the simulator drives between
+//     iterations,
+//   - simulating the kernel-side `post_sigchld_to_parent` resolution
+//     that wakes the parent's NR_WAIT4 wait,
+//     and
+//   - capturing/coordinating the `pending_syscall_return` snapshots
+//     across both processes.
+// That is well past 200 lines of simulator-decoder-of-actual-instructions
+// without TestPlatform extensions. Per the brief: "fall back to Layer A
+// and document Layer B as a follow-up."
+//
+// **What Layer A pins.** Together with Wave 3's tx-shims arm tests
+// (which independently prove NR_CLONE/NR_WAIT4/NR_WRITE/NR_EXIT_GROUP
+// dispatch on isolated payloads) and the ELF loader's Wave 5 smoke
+// (which proves the bootstrap-exec → reactor-driven write+exit
+// pipeline against the original hello-world fixture), Layer A's
+// assertion that the new fixture's bootstrap-exec seeds the right
+// entry-point with `li a7, 220` (NR_CLONE) at PC closes the wiring
+// loop end-to-end without an integration smoke.
+//
+// **Layer B follow-up.** Tracked as a deferral note; the recommended
+// shape is a follow-up smoke that uses the panic-as-yield TestPlatform
+// pattern with an instruction-stream simulator that decodes the
+// fixture's RV64 byte stream as it walks PC, runs syscall args
+// through `linux_syscall::dispatch`, and coordinates the parent's
+// blocking wait against the child's exit-port post.
+
+/// Wave 4 Part 7 — Layer A. Drives boot wiring + bootstrap exec
+/// against the new fork+wait+exit fixture; asserts that
+/// `saved_user_context.pc` lands on the fixture entry-point AND
+/// that the fixture's first instruction at that entry decodes to
+/// `li a7, 220` (NR_CLONE).
+///
+/// This is the missing exec-front-end → fixture-content
+/// alignment pin: combined with the Wave 1+2+3 tx-shims tests
+/// (which exercise dispatch arms in isolation) and the Wave 5
+/// hello-world smoke (which exercises the reactor-driven loop on
+/// a simpler program), the fork+wait pipeline is end-to-end
+/// pinned without a heavyweight integration simulator.
+///
+/// Cites: `txdoc:EXEC-19-BOOTSTRAP`,
+/// `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`.
+#[test]
+fn boot_smoke_fork_wait_seeds_init_for_clone_at_entry() {
+    use crate::init::init_fixture::{INIT_FIXTURE_BYTES, INIT_FIXTURE_ENTRY_VADDR};
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let leader = init
+        .nth_thread(0)
+        .expect("init has a leader thread post-bootstrap");
+    let payload = leader
+        .payload_cap()
+        .expect("leader payload must be alive pre-exec");
+
+    // Pre-exec: snapshot the bootstrap aspace for the
+    // atomic-replace assertion below.
+    let aspace_before = init
+        .aspace_cap()
+        .expect("init aspace populated by bootstrap");
+    assert!(
+        payload.saved_user_context().is_none(),
+        "saved_user_context starts None pre-exec"
+    );
+
+    // Drive the bootstrap exec: registers /init = INIT_FIXTURE_BYTES
+    // into tmpfs, then drives exec_script via block_on. Failure
+    // panics with `:bootstrap-exec:fail` per Open Q #3 DECIDED.
+    CoreInit::<TestPlatform>::run_bootstrap_exec_for_init();
+
+    // EXEC-PONR boundary crossed: aspace atomically replaced.
+    let aspace_after = init.aspace_cap().expect("init aspace populated post-exec");
+    assert_ne!(
+        aspace_before.key(),
+        aspace_after.key(),
+        "Phase 6 atomic replace_aspace produced a fresh Cap"
+    );
+
+    let saved = payload
+        .saved_user_context()
+        .expect("saved_user_context seeded by Phase 6");
+    assert_eq!(
+        saved.pc as u64, INIT_FIXTURE_ENTRY_VADDR,
+        "saved pc matches fixture's hand-encoded e_entry — the \
+         bootstrap front-end planted the new fork+wait entry-point",
+    );
+
+    // Wave 4's distinguishing assertion (vs the hello-world
+    // smoke): the fixture's first instruction at the seeded PC
+    // must be `li a7, 220` (NR_CLONE) — not the hello-world's
+    // `li a7, 64` (NR_WRITE). The fixture's byte stream is the
+    // source of truth; the seeded PC must point at byte offset 176
+    // (the `_start` label).
+    let first_insn = u32::from_le_bytes(INIT_FIXTURE_BYTES[176..180].try_into().unwrap());
+    assert_eq!(
+        first_insn, 0x0dc00893,
+        "fixture's first instruction at INIT_FIXTURE_ENTRY_VADDR \
+         must be `li a7, 220` (NR_CLONE) — Wave 4 fork+wait+exit \
+         shape, not the hello-world predecessor",
+    );
+
+    // Init must not be zombie post-bootstrap-exec — the reactor
+    // loop hasn't run; only the exec front-end has executed.
+    assert!(
+        !init.is_zombie(),
+        "init is still alive post-bootstrap-exec; reactor hasn't run"
+    );
+}
