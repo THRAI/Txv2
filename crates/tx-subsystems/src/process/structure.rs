@@ -28,7 +28,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use tx_substrate::zone::{Cap, PayloadCap, Weak, Zone, ZoneAllocated};
+use tx_substrate::zone::{Cap, Dead, Entity, PayloadCap, Weak, Zone, ZoneAllocated};
 
 use crate::cred::{Cred, Gid, Uid};
 use crate::signal::{PendingSignalQueue, SigActionTable};
@@ -242,6 +242,16 @@ impl ProcessIdentity {
             egid: target_cred.egid,
             same_session,
         })
+    }
+}
+
+impl Entity for ProcessIdentity {
+    type OperationalEvidence = PayloadCap<ProcessPayload>;
+
+    fn upgrade_operational(
+        identity: &tx_substrate::zone::Cap<Self>,
+    ) -> Result<Self::OperationalEvidence, Dead> {
+        identity.payload.lock().as_ref().cloned().ok_or(Dead)
     }
 }
 

@@ -30,11 +30,11 @@ pub use bucket::{ZoneBucket, DEFAULT_BUCKET_CAPACITY};
 pub use cap::{Cap, IdentRef, PayloadCap, Weak};
 pub use error::{Dead, ZoneError};
 pub use meta::{SlotState, SlotWord};
-pub use payload::{CoLocatedEntity, Entity, PayloadBinding};
+pub use payload::{CoLocatedEntity, Entity, OperationalCapExt, OperationalRefExt, PayloadBinding};
 pub use policy::{ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy};
 pub use registry::{
-    lookup, register_static_zone, registered_zone_count, retry_retire_pending_slots, snapshot,
-    EmptySlabTrimStats, SlotKey, ZoneId, ZoneInfo,
+    lookup, register_static_zone, registered_zone_count, snapshot, EmptySlabTrimStats, SlotKey,
+    ZoneId, ZoneInfo,
 };
 pub use reservation::{reserve, sign, ZoneReservation};
 pub use runtime::{
@@ -244,7 +244,6 @@ pub struct ZoneMaintenanceBudget {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ZoneMaintenanceStats {
     pub epoch: crate::epoch::DrainStats,
-    pub retried_pending_slots: usize,
     pub empty_slabs: EmptySlabTrimStats,
 }
 
@@ -256,7 +255,6 @@ pub fn maintenance_tick(budget: ZoneMaintenanceBudget) -> ZoneMaintenanceStats {
     let _ = registry::flush_current_cpu_buckets();
     ZoneMaintenanceStats {
         epoch: crate::epoch::try_drain(budget.epoch_reclaim_budget),
-        retried_pending_slots: registry::retry_retire_pending_slots(budget.empty_slab_budget),
         empty_slabs: return_empty_slabs(budget.empty_slab_budget),
     }
 }

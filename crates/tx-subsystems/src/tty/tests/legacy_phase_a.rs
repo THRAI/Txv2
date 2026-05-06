@@ -9,6 +9,7 @@ use tx_substrate::zone::{self, Cap, PayloadCap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::{Errno, Guard, StepOutcome};
+use crate::test_support::EPOCH_TEST_LOCK as TTY_ZONE_TEST_LOCK;
 use crate::tty::execution::{
     register_console_alias, register_hardware, step_hangup, step_ingest, step_ioctl_tcgets,
     step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz, step_ioctl_tiocnotty,
@@ -79,9 +80,6 @@ impl CharDeviceOps for ScriptedReadOps {
         StepOutcome::Done(bytes.len())
     }
 }
-
-#[cfg(test)]
-static TTY_ZONE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // Helpers

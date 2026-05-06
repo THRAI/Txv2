@@ -1,6 +1,7 @@
 use tx_substrate::epoch;
 use tx_substrate::zone::{
-    self, registered_zone_count, Zone, ZoneAllocated, ZoneError, ZoneId, ZoneMaintenanceBudget,
+    self, registered_zone_count, CoLocatedEntity, OperationalCapExt, OperationalRefExt, Zone,
+    ZoneAllocated, ZoneError, ZoneId, ZoneMaintenanceBudget,
 };
 
 static ZONE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -30,6 +31,8 @@ unsafe impl ZoneAllocated for LargeObject {
         &LARGE_ZONE
     }
 }
+
+impl CoLocatedEntity for Object {}
 
 fn reset_zone_registry() {
     unsafe {
@@ -174,62 +177,22 @@ fn zone_and_epoch_summary_report_registered_state() {
 }
 
 #[test]
-fn maintenance_retries_pending_slot_retirement_after_epoch_pool_pressure() {
+fn colocated_entity_operational_upgrade_matches_identity_cap() {
     let _guard = reset_zone_and_epoch();
     zone::register_zone_for::<Object>().expect("object zone registration");
 
+    let reservation = zone::reserve_for::<Object>().expect("object reservation");
+    let cap = zone::sign_for(reservation, Object { id: 7 });
     let guard = epoch::guard();
-    let mut caps = Vec::new();
-    let mut weaks = Vec::new();
+    let ident = cap.ident_ref(&guard);
 
-    for id in 0..tx_substrate::epoch::RETIRED_NODE_POOL_CAPACITY {
-        let reservation = zone::reserve_for::<Object>().expect("object reservation");
-        let cap = zone::sign_for(reservation, Object { id: id as u32 });
-        weaks.push(cap.downgrade());
-        caps.push(cap);
-    }
+    let op_from_cap = cap.upgrade_operational().expect("cap operational upgrade");
+    let op_from_ref = ident
+        .upgrade_operational()
+        .expect("ident operational upgrade");
 
-    for cap in caps.drain(..) {
-        drop(cap);
-    }
-
-    let stuck_reservation = zone::reserve_for::<Object>().expect("stuck reservation");
-    let stuck = zone::sign_for(stuck_reservation, Object { id: 9999 });
-    let stuck_weak = stuck.downgrade();
-    drop(stuck);
-
-    assert!(
-        stuck_weak.observe(&guard).is_none(),
-        "pending-retire slot must already be non-upgradeable"
-    );
-
-    drop(guard);
-    let first = zone::maintenance_tick(ZoneMaintenanceBudget {
-        epoch_reclaim_budget: usize::MAX,
-        empty_slab_budget: usize::MAX,
-    });
-    let second = zone::maintenance_tick(ZoneMaintenanceBudget {
-        epoch_reclaim_budget: usize::MAX,
-        empty_slab_budget: usize::MAX,
-    });
-
-    assert!(
-        first.retried_pending_slots + second.retried_pending_slots >= 1,
-        "maintenance should retry at least one pending retirement"
-    );
-
-    let post_guard = epoch::guard();
-    assert!(
-        stuck_weak.observe(&post_guard).is_none(),
-        "reclaimed slot must stay dead to the old weak handle"
-    );
-
-    let still_dead = weaks
-        .iter()
-        .filter(|weak| weak.observe(&post_guard).is_none())
-        .count();
-    assert!(
-        still_dead >= tx_substrate::epoch::RETIRED_NODE_POOL_CAPACITY,
-        "all saturated retirements should remain dead to old weak handles"
-    );
+    assert_eq!(op_from_cap.id, 7);
+    assert_eq!(op_from_ref.id, 7);
+    assert_eq!(op_from_cap.key(), cap.key());
+    assert_eq!(op_from_ref.key(), cap.key());
 }

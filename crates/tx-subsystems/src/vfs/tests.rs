@@ -40,7 +40,8 @@ static ECHO_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
 
 fn init_tty_zones() {
     tx_substrate::testing::init_host_for_test_once();
-    crate::tty::structure::registry::register_zones().expect("tty zones");
+    let _ = zones::register_all();
+    crate::tty::structure::registry::reset_for_tests();
 }
 
 fn setup_process_world() -> std::sync::MutexGuard<'static, ()> {
@@ -49,6 +50,7 @@ fn setup_process_world() -> std::sync::MutexGuard<'static, ()> {
     let _ = zones::register_all();
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    crate::tty::structure::registry::reset_for_tests();
     reset_pid_counter_for_test();
     reset_tid_counter_for_test();
     reset_init_process_for_test();
@@ -82,7 +84,7 @@ fn inline_name_rejects_empty_slash_and_oversized_names() {
 
 #[test]
 fn rnode_backing_uses_page_container_cap_without_backend_live_nodes() {
-    tx_substrate::testing::init_host_for_test_once();
+    let _g = setup_process_world();
     let pc = PageContainer::new_cap(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Persistent,
@@ -102,6 +104,7 @@ fn rnode_backing_uses_page_container_cap_without_backend_live_nodes() {
 
 #[test]
 fn rnode_backing_carries_tty_identity_payload() {
+    let _g = setup_process_world();
     init_tty_zones();
     let tty = alloc_tty(
         TtyKind::SerialHardware,
@@ -127,6 +130,7 @@ fn rnode_backing_carries_tty_identity_payload() {
 
 #[test]
 fn open_file_dispatches_struct_payload_read_write() {
+    let _g = setup_process_world();
     init_tty_zones();
     let guard = tx_substrate::epoch::guard();
     let tty = alloc_tty(

@@ -35,15 +35,15 @@ unsafe impl<T: Send + Sync> Send for Cap<T> {}
 unsafe impl<T: Send + Sync> Sync for Cap<T> {}
 
 impl<T: 'static> Cap<T> {
-    pub(crate) fn try_retire_pending(slot: NonNull<Slot<T>>) -> bool {
+    pub(crate) fn try_retire_slot(slot: NonNull<Slot<T>>) {
         let meta = unsafe { slot.as_ref().meta() };
         loop {
             let cur = meta.load(Ordering::Acquire);
             if cur.retain() != RETAIN_SENTINEL_DEAD {
-                return false;
+                return;
             }
-            if cur.state() != SlotState::Dead && cur.state() != SlotState::RetirePending {
-                return false;
+            if cur.state() != SlotState::Dead {
+                return;
             }
 
             // The sentinel blocks new upgrades. Moving to Retiring hands the
@@ -55,39 +55,16 @@ impl<T: 'static> Cap<T> {
                     let retire_result =
                         unsafe { epoch::retire_raw(slot.as_ptr() as *mut u8, reclaim_slot::<T>) };
                     if retire_result.is_ok() {
-                        return true;
+                        return;
                     }
 
                     let _ = epoch::drain_with_budget(64);
-                    let retry_result =
-                        unsafe { epoch::retire_raw(slot.as_ptr() as *mut u8, reclaim_slot::<T>) };
-                    if retry_result.is_ok() {
-                        return true;
-                    }
-
-                    // Keep the slot permanently non-upgradeable but leave it
-                    // discoverable to future maintenance passes. This avoids
-                    // panicking the whole kernel on transient retire-pool
-                    // pressure while still preserving safety.
-                    loop {
-                        let retiring = meta.load(Ordering::Acquire);
-                        debug_assert_eq!(retiring.state(), SlotState::Retiring);
-                        debug_assert_eq!(retiring.retain(), 0);
-                        let pending = retiring
-                            .with_retain(RETAIN_SENTINEL_DEAD)
-                            .with_state(SlotState::RetirePending);
-                        if meta
-                            .compare_exchange(
-                                retiring,
-                                pending,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
-                        {
-                            return false;
-                        }
-                    }
+                    unsafe { epoch::retire_raw(slot.as_ptr() as *mut u8, reclaim_slot::<T>) }
+                        .expect(
+                            "zone slot retire enqueue failed after bounded drain; \
+                             five-state zone design fail-fasts on retired-node pool exhaustion",
+                        );
+                    return;
                 }
                 Err(_) => continue,
             }
@@ -153,7 +130,7 @@ impl<T: 'static> Cap<T> {
     }
 
     fn try_retire(slot: NonNull<Slot<T>>) {
-        let _ = Self::try_retire_pending(slot);
+        Self::try_retire_slot(slot);
     }
 }
 

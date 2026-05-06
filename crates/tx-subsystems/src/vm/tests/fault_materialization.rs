@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 fn vm_fault_resolution_requires_authoritative_recipe_and_permissions() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x4000, 1),
@@ -32,6 +33,7 @@ fn vm_fault_resolution_requires_authoritative_recipe_and_permissions() {
 
 #[test]
 fn vm_fault_resolution_waits_behind_overlapping_writer() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x1000, 1),
@@ -56,6 +58,7 @@ fn vm_fault_resolution_waits_behind_overlapping_writer() {
 
 #[test]
 fn vm_fault_materializes_pagebacked_anon_page_from_recipe_offset() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x2000, 2),

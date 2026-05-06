@@ -124,8 +124,6 @@ struct RegisteredZone {
     flush_current_cpu_bucket: fn(*const ()) -> Result<(), ZoneError>,
     /// Retire surplus empty slabs for runtime maintenance.
     trim_empty_slabs: fn(*const (), usize) -> usize,
-    /// Retry handing pending dead slots to EBR under bounded maintenance work.
-    retry_retire_pending_slots: fn(*const (), usize) -> usize,
     /// Resolve a logical key to a typed slot pointer, erased for storage.
     slot_from_key: fn(*const (), SlotKey) -> Option<*mut ()>,
 }
@@ -149,7 +147,6 @@ pub fn register_static_zone<T: 'static>(zone: &'static Zone<T>) -> Result<ZoneIn
         init_cpu_bucket: init_cpu_bucket::<T>,
         flush_current_cpu_bucket: flush_current_cpu_bucket::<T>,
         trim_empty_slabs: trim_empty_slabs_for::<T>,
-        retry_retire_pending_slots: retry_retire_pending_slots_for::<T>,
         slot_from_key: slot_from_key::<T>,
     };
     REGISTRY.register(entry)?;
@@ -170,10 +167,6 @@ pub fn snapshot(out: &mut [Option<ZoneInfo>]) -> usize {
 
 pub fn trim_empty_slabs(limit: usize) -> EmptySlabTrimStats {
     REGISTRY.trim_empty_slabs(limit)
-}
-
-pub fn retry_retire_pending_slots(limit: usize) -> usize {
-    REGISTRY.retry_retire_pending_slots(limit)
 }
 
 pub fn flush_current_cpu_buckets() -> Result<(), ZoneError> {
@@ -215,11 +208,6 @@ fn flush_current_cpu_bucket<T: 'static>(erased: *const ()) -> Result<(), ZoneErr
 fn trim_empty_slabs_for<T: 'static>(erased: *const (), limit: usize) -> usize {
     let zone = unsafe { &*(erased as *const Zone<T>) };
     zone.trim_empty_slabs(limit)
-}
-
-fn retry_retire_pending_slots_for<T: 'static>(erased: *const (), limit: usize) -> usize {
-    let zone = unsafe { &*(erased as *const Zone<T>) };
-    zone.keg.retry_retire_pending_slots(limit)
 }
 
 fn slot_from_key<T: 'static>(erased: *const (), key: SlotKey) -> Option<*mut ()> {
@@ -342,26 +330,6 @@ impl ZoneRegistry {
         }
 
         stats
-    }
-
-    fn retry_retire_pending_slots(&self, limit: usize) -> usize {
-        let _guard = self.lock.lock();
-        let mut progressed = 0usize;
-        let mut remaining = limit;
-
-        for entry in &self.entries {
-            if remaining == 0 {
-                break;
-            }
-            let Some(entry) = (unsafe { *entry.get() }) else {
-                continue;
-            };
-            let done = (entry.retry_retire_pending_slots)(entry.erased, remaining);
-            progressed += done;
-            remaining = remaining.saturating_sub(done);
-        }
-
-        progressed
     }
 
     fn slot_for<T: 'static>(&self, key: SlotKey) -> Option<NonNull<Slot<T>>> {

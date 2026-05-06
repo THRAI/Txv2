@@ -9,7 +9,7 @@ use super::support::{alloc_tty, init_zones, NOOP_BINDING, TTY_ZONE_TEST_LOCK};
 
 #[test]
 fn noncanonical_vmin_blocks_until_threshold_is_met() {
-    let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
+    let _serial = TTY_ZONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_zones();
     let guard = tx_substrate::epoch::guard();
     let tty = alloc_tty(
@@ -61,7 +61,7 @@ fn noncanonical_vmin_blocks_until_threshold_is_met() {
 
 #[test]
 fn noncanonical_vmin_zero_allows_empty_read() {
-    let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
+    let _serial = TTY_ZONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_zones();
     let guard = tx_substrate::epoch::guard();
     let tty = alloc_tty(

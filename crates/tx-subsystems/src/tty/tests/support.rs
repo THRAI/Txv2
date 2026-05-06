@@ -6,6 +6,8 @@ use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::{Guard, StepOutcome};
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
 
+pub(super) use crate::test_support::EPOCH_TEST_LOCK as TTY_ZONE_TEST_LOCK;
+
 struct NoopOps;
 
 impl CharDeviceOps for NoopOps {
@@ -25,8 +27,6 @@ pub(super) static NOOP_BINDING: CharDeviceBinding = CharDeviceBinding {
     name: "tty-test",
     ops: &NOOP_OPS,
 };
-
-pub(super) static TTY_ZONE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(super) fn init_zones() {
     tx_substrate::testing::init_host_for_test_once();

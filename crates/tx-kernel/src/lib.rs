@@ -1,5 +1,7 @@
 #![no_std]
 
+mod zones;
+
 pub mod init;
 pub mod trap;
 
