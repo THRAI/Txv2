@@ -21,16 +21,23 @@ use tx_hal::{
     PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PtNode,
 };
-use tx_reactor::userspace::{SyscallRequest, UserspaceTrapInfo};
+use tx_reactor::userspace::{
+    PageFaultAccess, PageFaultInfo, SyscallRequest, UserAddr, UserspaceTrapInfo,
+};
 use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult, NR_EXIT_GROUP, NR_WRITE};
 use tx_substrate::zone::PayloadCap;
 use tx_subsystems::process::ExitStatus;
+use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, current_thread_payload, drain_pending_syscall_return,
     ThreadPayload,
 };
+use tx_subsystems::vm::{
+    AccessMode, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmFault,
+    VmFaultError, VmMapRequest,
+};
 
-use crate::thread_future::PerHartSlotted;
+use crate::thread_future::{pf_access_to_vm_access, PerHartSlotted};
 
 const TEST_PAGE_SIZE: usize = 4096;
 
@@ -397,4 +404,200 @@ fn thread_future_terminates_on_exit_group() {
     // Touch NR_WRITE so the import is exercised by some test in this
     // file (silences dead-code lint from the use list above).
     let _ = NR_WRITE;
+}
+
+// ----- Page-fault dispatch (Phase 3) -----
+
+/// Unit-coverage for the local `pf_access_to_vm_access` helper that
+/// translates the reactor's `PageFaultAccess` into the VM subsystem's
+/// `AccessMode`. The two enums do not converge today; the mapping
+/// must collapse `Unknown` to `Read` (defensive, since the canonical
+/// fault script re-derives the protection requirement from the
+/// recipe).
+#[test]
+fn pf_access_translates_to_vm_access_mode() {
+    assert_eq!(
+        pf_access_to_vm_access(PageFaultAccess::Read),
+        AccessMode::Read
+    );
+    assert_eq!(
+        pf_access_to_vm_access(PageFaultAccess::Write),
+        AccessMode::Write
+    );
+    assert_eq!(
+        pf_access_to_vm_access(PageFaultAccess::Execute),
+        AccessMode::Execute
+    );
+    // Defensive collapse: `Unknown` falls to `Read` so the recipe
+    // lookup still runs without falsely upgrading a load to a store.
+    assert_eq!(
+        pf_access_to_vm_access(PageFaultAccess::Unknown),
+        AccessMode::Read
+    );
+}
+
+/// Initialise the host page allocator's zero frame so
+/// `materialize_pagebacked` (private-anon read fault) can publish
+/// the global zero PPN. Idempotent across tests.
+fn ensure_zero_frame_claimed() {
+    match tx_substrate::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+        Err(error) => panic!("claim zero frame for thread-future tests: {error:?}"),
+    }
+}
+
+/// `PageFault` Ok path: the fault script publishes a recipe and the
+/// loop body falls through to AST drain + entry without writing any
+/// `pending_syscall_return`. The merged-context `a0` would come from
+/// `saved_user_context` (Plan B writeback discipline for fault
+/// returns).
+///
+/// Mirrors the run_thread loop iteration step-by-step rather than
+/// invoking `run_thread` (which would diverge into the host
+/// TestPlatform's default `enter_userspace_with_context` panic). The
+/// test asserts:
+///
+/// 1. The slot resolves with `PageFault(...)`.
+/// 2. `aspace.fault_script(VmFault).await` returns `Ok(_)`.
+/// 3. `pending_syscall_return` is unchanged (no write on Ok).
+/// 4. The next iteration's `start_request` succeeds (slot is back to
+///    idle), demonstrating the loop is ready to continue.
+#[test]
+fn thread_future_pf_ok_loops_back_to_userspace_entry() {
+    let _g = setup();
+    ensure_zero_frame_claimed();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let aspace = init.aspace_cap().expect("aspace alive");
+
+    // Seed a private-anon mapping so the fault at FAULT_ADDR has a
+    // recipe and the script's first poll publishes via the test pmap
+    // (which accepts every reservation).
+    const FAULT_ADDR: usize = 0x1000;
+    aspace
+        .try_mmap(VmMapRequest::fixed(
+            UserRange::new_aligned(UserVirtAddr(FAULT_ADDR), TEST_PAGE_SIZE).expect("range"),
+            MapPlacement::RequireFree,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ))
+        .expect("seed recipe");
+
+    // Open the userspace-run wait the way `run_thread` does.
+    let wait = payload
+        .userspace_slot()
+        .start_request()
+        .expect("start_request");
+    let req_token = wait.request();
+    payload.set_active_userspace_request(Some(req_token));
+
+    // Resolve the wait with a from-user PageFault for FAULT_ADDR
+    // (Read access — exercises the zero-frame materialisation path).
+    let pf = PageFaultInfo {
+        addr: UserAddr::new(FAULT_ADDR as u64),
+        access: PageFaultAccess::Read,
+        present: false,
+    };
+    payload
+        .userspace_slot()
+        .complete_interesting_trap(req_token, UserspaceTrapInfo::PageFault(pf))
+        .expect("resolve wait with PageFault");
+    drop(wait);
+    payload.set_active_userspace_request(None);
+
+    // Drive the canonical fault script — what run_thread's PageFault
+    // arm awaits.
+    let fault = VmFault::new(
+        UserVirtAddr::new(pf.addr.raw() as usize),
+        pf_access_to_vm_access(pf.access),
+    );
+    let result = block_on(aspace.fault_script(fault));
+    assert!(
+        matches!(result, Ok(_)),
+        "fault_script(Read on private-anon) must succeed; got {result:?}"
+    );
+
+    // Ok path does NOT write pending_syscall_return.
+    assert!(
+        drain_pending_syscall_return(&payload).is_none(),
+        "PageFault Ok must not write pending_syscall_return — Plan B \
+         writeback discipline reuses saved_user_context.a0"
+    );
+
+    // The loop is ready to continue: a fresh start_request succeeds
+    // (slot returned to idle when the wait was dropped above).
+    let next_wait = payload
+        .userspace_slot()
+        .start_request()
+        .expect("loop continues — next iteration starts a fresh request");
+    drop(next_wait);
+
+    // Process is still live; no SIGSEGV was routed.
+    assert!(!init.is_zombie(), "Ok path must leave process live");
+}
+
+/// `PageFault` Err path: the fault script returns `VmFaultError`
+/// (here: `NoRecipe` for an address with no mapping) and the future
+/// routes default-action SIGSEGV per `SIGNAL_v1` §15.1.
+#[test]
+fn thread_future_pf_err_routes_sigsegv_and_zombifies() {
+    let _g = setup();
+    ensure_zero_frame_claimed();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let aspace = init.aspace_cap().expect("aspace alive");
+
+    // No mapping installed at FAULT_ADDR — fault_script must return
+    // VmFaultError::NoRecipe.
+    const FAULT_ADDR: usize = 0xdead_0000;
+
+    let wait = payload
+        .userspace_slot()
+        .start_request()
+        .expect("start_request");
+    let req_token = wait.request();
+    payload.set_active_userspace_request(Some(req_token));
+
+    let pf = PageFaultInfo {
+        addr: UserAddr::new(FAULT_ADDR as u64),
+        access: PageFaultAccess::Write,
+        present: false,
+    };
+    payload
+        .userspace_slot()
+        .complete_interesting_trap(req_token, UserspaceTrapInfo::PageFault(pf))
+        .expect("resolve wait with PageFault");
+    drop(wait);
+    payload.set_active_userspace_request(None);
+
+    let fault = VmFault::new(
+        UserVirtAddr::new(pf.addr.raw() as usize),
+        pf_access_to_vm_access(pf.access),
+    );
+    let result = block_on(aspace.fault_script(fault));
+    assert_eq!(
+        result,
+        Err(VmFaultError::NoRecipe),
+        "fault on unmapped address must surface NoRecipe"
+    );
+
+    // What run_thread does on Err: route default-action SIGSEGV and
+    // return.
+    tx_subsystems::process::execution::step_exit_group_with_signal(&init, Signum::SIGSEGV);
+
+    assert!(init.is_zombie(), "SIGSEGV routing zombifies process");
+    assert_eq!(
+        init.exit_status(),
+        Some(ExitStatus::Signaled(Signum::SIGSEGV)),
+        "SIGSEGV records Signaled(SIGSEGV)"
+    );
+
+    // No pending_syscall_return write on Err either.
+    assert!(
+        drain_pending_syscall_return(&payload).is_none(),
+        "PageFault Err must not write pending_syscall_return"
+    );
 }
