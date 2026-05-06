@@ -4,6 +4,60 @@
 
 ## Current Shape
 
+- 2026-05-06 fork/clone/wait4 Wave 3 (NR_WAIT4 syscall arm with
+  blocking-wait) on branch `feat/fork-clone-wait4`. Per
+  `docs/progress/plans/2026-05-06-fork-clone-wait4.md` Part 3.
+  Adds the Linux RV64 `wait4(2)` syscall arm against the
+  `step_waitpid_nohang` walker (synchronous, no guard parameter —
+  takes a fresh internal snapshot of `parent.children`) plus the
+  blocking variant via `wait_carrier::wait_on_token` over the
+  parent's per-process `exit_port` carrier (registered at
+  payload-sign time per Wave 1; fired from
+  `post_sigchld_to_parent` when any child zombifies).
+  Deliverables: (1) `crates/tx-shims/src/linux_syscall/numbers.rs`
+  adds `NR_WAIT4 = 260` and `WNOHANG = 0x1` constants. (2)
+  `crates/tx-shims/src/linux_syscall/mod.rs` adds `ECHILD_VALUE = 10`
+  errno + `sys_wait4` async function — full POSIX `pid` selector
+  coverage (`pid > 0` → `Pid`, `pid == 0` → `CallerPgrp`,
+  `pid == -1` → `Any`, `pid < -1` → `Pgrp(Pgid(-pid))`,
+  `pid == i32::MIN` → `-EINVAL` per LTP `wait403`); WNOHANG-only
+  options bit acted on (WUNTRACED/WCONTINUED accepted but ignored
+  per Linux's silent-unknown-bits behaviour); non-NULL `rusage`
+  rejected with `-EINVAL` (`TODO(phase-rusage)` — txKernel
+  doesn't track rusage today). On `Done(child_pid, status)` the
+  arm encodes the wait-status word via the existing POSIX
+  `ExitStatus::wait_status_word` (Wave 1's migration from the
+  shell `128+sig` shape) and writes a 4-byte little-endian `i32`
+  to `wstatus_uaddr` if non-zero, mirroring the `sys_write`
+  bootstrap-buffer exemption (`core::ptr::write_volatile` with
+  `TODO(phase-userva)`). On `Err(NoneReady)` without WNOHANG,
+  the arm builds a `WaitToken` from
+  `ctx.process.exit_port_wait_token()` (returns `None` for
+  zombies, surfaced as `-ECHILD`) and awaits
+  `wait_carrier::wait_on_token`, looping post-wake (standard
+  double-check pattern: a third party may have reaped first).
+  Dispatch arm wires under the existing `nr if nr == NR_*`
+  guard pattern alongside `NR_CLONE`, `NR_EXECVE`. (3) 10 new
+  tests in `crates/tx-shims/src/linux_syscall/tests.rs`'s
+  `fork_clone_wait4_wave3` mod: ECHILD on no-children,
+  WNOHANG-no-zombies returns 0 (child preserved alive),
+  WNOHANG-zombie reaps and returns pid, WNOHANG writes wstatus
+  word (Exited(42) → 0x2a00), specific-pid skips other-pgrp
+  zombies, blocking-wait load-bearing test (manually polls the
+  future to Pending, calls `step_exit_group` on the child to
+  fire the parent's exit_port via `post_sigchld_to_parent`,
+  re-polls to Ready), rusage-non-NULL → -EINVAL,
+  WUNTRACED/WCONTINUED bits silently ignored, i32::MIN pid →
+  -EINVAL, pgid selector picks grouped zombie. Verification:
+  tx-shims 48/48 (38 baseline + 10 new); tx-substrate sync
+  2/2 + integration 2/2 ; tx-fs 16/16; tx-scripts 29/29;
+  tx-subsystems 377/377; tx-kernel 29/29; `cargo check
+  --workspace` clean; `cargo check -p
+  tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf` clean; `cargo fmt --check`
+  clean; `cargo xtask progress validate` ok (24 file(s)).
+  Wave 4 (RV64 fixture v2 + end-to-end smoke) is the next
+  step.
 - 2026-05-06 ELF loader Phase 6 (NR_EXECVE syscall arm) on branch
   `feat/elf-loader-and-execve`. Per
   `docs/progress/plans/2026-05-06-elf-loader-and-execve.md` Part 6.
