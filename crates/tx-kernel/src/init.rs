@@ -141,6 +141,23 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::init_early(handoff);
         Self::init_substrate_if_ready(handoff);
         Self::boot_sentinel();
+        // Pre-ELF Phase 7: wrap the init leader's thread future as a
+        // reactor task and enter the BSP reactor loop. Returns when
+        // init zombifies (`run_thread` resolves), at which point we
+        // emit `:userspace:exited:N` and shut down. Today that exit
+        // can only fire after a real userspace `exit_group(N)`
+        // travels through the trap shell → reactor task wrapper →
+        // thread future → `linux_syscall::dispatch`. On RV64 boards
+        // that have no userspace binary loaded yet the loop simply
+        // parks: the reactor stays in WFI until the first userspace
+        // trap arrives (which it cannot, pre-ELF), so the loop
+        // remains idle. That is the intended Phase 7 shape: the
+        // production loop is wired even though no init binary exists
+        // yet. The next slice (ELF loader) drops a real binary into
+        // the address space; the loop already in place picks it up.
+        if P::SUBSTRATE_BOOT_READY {
+            Self::run_userspace_reactor_loop();
+        }
         P::system_off()
     }
 
@@ -867,6 +884,122 @@ impl<P: TxPlatform> CoreInit<P> {
     fn boot_sentinel() {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":boot:ok\n");
+    }
+
+    /// Pre-ELF Phase 7: submit init's leader thread future as a
+    /// reactor task, then drive the BSP hart-loop until the future
+    /// resolves. Resolution happens when `run_thread` returns — the
+    /// only `return` paths inside the future today are
+    /// `SyscallResult::NoReturn` (i.e. `exit_group` zombified the
+    /// process), the page-fault `Err` SIGSEGV route, and the
+    /// `Fatal` trap arm. All three end with a zombified init.
+    ///
+    /// On exit, emits `:userspace:exited:N` where `N` is init's
+    /// recorded `ExitStatus::wait_status_word()`, then returns to
+    /// the caller, which calls `system_off`.
+    ///
+    /// **Wiring choice.** The Phase 7 plan considered both
+    /// `Reactor::run_until_idle_on_hart_with_reschedule` and
+    /// `Reactor::run_forever_on_hart`. Neither exists in tree today.
+    /// The board crate's secondary harts already drive the boot
+    /// reactor through `step_hart_loop_at` (see
+    /// `secondary_reactor_loop`), so the BSP uses the same shape:
+    /// each iteration advances time, runs ready tasks, programs the
+    /// next deadline, and idles via `wait_for_interrupt_once` if
+    /// the loop went idle. This is the closest seam to the plan's
+    /// guesses and keeps the BSP and APs symmetric.
+    fn run_userspace_reactor_loop() {
+        let Some(init) = tx_subsystems::process::execution::init_process() else {
+            // No init process — nothing to drive. Skip cleanly.
+            return;
+        };
+        let Some(thread) = init.nth_thread(0) else {
+            return;
+        };
+        let Some(payload) = thread.payload_cap() else {
+            return;
+        };
+
+        let task_payload = payload.clone();
+        let submit_thread = thread.clone();
+        let submitted = BOOT_REACTOR.with(|reactor| {
+            reactor.submit_task(crate::thread_future::PerHartSlotted::<P, _>::new(
+                task_payload.clone(),
+                crate::thread_future::run_thread::<P>(submit_thread, task_payload),
+            ));
+        });
+        if submitted.is_none() {
+            // Boot reactor not initialised; nothing to drive.
+            return;
+        }
+
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        P::enable_timer_wakeups();
+
+        // Drive the BSP reactor loop until init zombifies. Each
+        // iteration is a `step_hart_loop_at` step: advance time, run
+        // ready tasks, program the next deadline. Block on WFI when
+        // the step reports idle so we don't spin-wait for the next
+        // userspace trap (which is the only event that resolves the
+        // thread future's pending wait).
+        loop {
+            if init.is_zombie() {
+                break;
+            }
+
+            let step = match Self::step_boot_reactor_once(current_cpu) {
+                Some(step) => step,
+                None => break,
+            };
+
+            if step.should_idle() && !init.is_zombie() {
+                P::wait_for_interrupt_once();
+                if P::pending_ipi(IpiKind::Reschedule) {
+                    P::ack_ipi(IpiKind::Reschedule);
+                }
+            }
+        }
+
+        // init zombified — emit the exit sentinel.
+        let status_word = init
+            .exit_status()
+            .map(|s| s.wait_status_word())
+            .unwrap_or(0);
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":userspace:exited:");
+        Self::write_signed_decimal(status_word);
+        tx_hal::console_write_str::<P>("\n");
+    }
+
+    /// Render a signed decimal int into the platform console without
+    /// allocating. `tx_hal::console_write_str` is byte-oriented so
+    /// the formatter writes one chunk per call. Stack-bounded:
+    /// `i32::MIN` produces 11 bytes (`-2147483648`).
+    fn write_signed_decimal(value: i32) {
+        let mut buf = [0u8; 11];
+        let mut idx = buf.len();
+        let mut v: i64 = value as i64;
+        let negative = v < 0;
+        if negative {
+            v = -v;
+        }
+        if v == 0 {
+            idx -= 1;
+            buf[idx] = b'0';
+        } else {
+            while v > 0 {
+                idx -= 1;
+                buf[idx] = b'0' + (v % 10) as u8;
+                v /= 10;
+            }
+        }
+        if negative {
+            idx -= 1;
+            buf[idx] = b'-';
+        }
+        let s = core::str::from_utf8(&buf[idx..])
+            .expect("write_signed_decimal: ASCII digits are always UTF-8");
+        tx_hal::console_write_str::<P>(s);
     }
 
     fn write_board_sentinel_prefix() {
