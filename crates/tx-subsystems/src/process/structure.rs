@@ -28,15 +28,26 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use tx_reactor::wait::{Channel, Mask};
 use tx_substrate::zone::{Cap, PayloadCap, Weak, Zone, ZoneAllocated};
 use tx_substrate::SpinMutex;
 
 use crate::cred::{Cred, Gid, Uid};
+use crate::execution::WaitToken;
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::ThreadIdentity;
 use crate::tty::structure::identity::{AtomicSlot, TtyIdentity};
 use crate::vfs::{DEntry, OpenFile};
 use crate::vm::AddressSpace;
+
+/// Bit-mask for the "child has zombified" event on the per-process
+/// `exit_port`. Future events (stop, continue) get their own bits
+/// alongside their wakers; the slice carves out only this single bit.
+///
+/// Cites: `txdoc:PROCESS-WAIT-FAMILY-1`
+/// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4); plan
+/// `docs/progress/plans/2026-05-06-fork-clone-wait4.md` Open Q #1.
+pub const EXIT_PORT_CHILD_ZOMBIFIED: u64 = 0x1;
 
 /// Number of slots in the day-1 fixed-size fd table on `ProcessPayload`.
 ///
@@ -63,14 +74,30 @@ pub enum ExitStatus {
 }
 
 impl ExitStatus {
-    /// Day-1 numeric status word, shell-convention: raw int for
-    /// explicit exits, `128 + signum` for signal exits. POSIX
-    /// `wait(2)` will replace this with the proper
-    /// WIFEXITED / WIFSIGNALED encoding when the decoder lands.
+    /// POSIX `<sys/wait.h>` status word as `wait4(2)` returns it via
+    /// `wstatus`. The encoding matches Linux's generic ABI:
+    ///
+    /// - `Exited(code)` → `(code & 0xff) << 8` — `WIFEXITED(s)` is
+    ///   `(s & 0x7f) == 0` and `WEXITSTATUS(s) == (s >> 8) & 0xff`.
+    /// - `Signaled(sig)` → `sig.raw() & 0x7f` — `WIFSIGNALED(s)` is
+    ///   `(((s & 0x7f) + 1) >> 1) > 0` and `WTERMSIG(s) == s & 0x7f`.
+    ///
+    /// Out of slice: the core-dump bit (`s & 0x80`) is not computed —
+    /// txKernel doesn't track core-dump state. Stop/continue encoding
+    /// (`(sig << 8) | 0x7f` / `0xffff`) lands with the stop/cont
+    /// signal infrastructure slice.
+    ///
+    /// **Migration note (fork/clone/wait4 slice, 2026-05-06).**
+    /// Previously this returned the day-1 shell-convention `128 + sig`
+    /// shape. The shell encoding is the *userspace shell* (bash-style
+    /// program-exit-code) convention; the kernel↔userspace `wait4` ABI
+    /// uses the POSIX encoding above. Migrated to POSIX in tree per
+    /// the slice plan's Open Q #3 (DECIDED 2026-05-06: replace and
+    /// migrate the trio's smoke assertions).
     pub fn wait_status_word(self) -> i32 {
         match self {
-            ExitStatus::Exited(s) => s,
-            ExitStatus::Signaled(sig) => 128 + sig.raw() as i32,
+            ExitStatus::Exited(code) => (code & 0xff) << 8,
+            ExitStatus::Signaled(sig) => (sig.raw() as i32) & 0x7f,
         }
     }
 
@@ -388,6 +415,50 @@ impl ProcessIdentity {
         result
     }
 
+    /// Carrier id under which this process's `exit_port` channel is
+    /// registered with the global wait-carrier resolver. Returns
+    /// `None` for zombies (no payload — the channel is unreachable
+    /// once the payload has been dropped).
+    ///
+    /// Wave 2's `sys_wait4` blocking arm pairs this with
+    /// [`EXIT_PORT_CHILD_ZOMBIFIED`] to build the `WaitToken` it
+    /// awaits via [`crate::wait_carrier::wait_on_token`].
+    pub fn exit_port_carrier_id(&self) -> Option<u64> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.exit_port_carrier_id())
+    }
+
+    /// Build the `WaitToken` an awaiter parks on while waiting for any
+    /// child of this process to zombify. Returns `None` for zombies
+    /// (no payload).
+    ///
+    /// The returned token's interest mask is
+    /// [`EXIT_PORT_CHILD_ZOMBIFIED`] — Wave 1 carves out only the
+    /// child-zombified bit; future stop/cont events get separate bits
+    /// alongside their own wakers.
+    pub fn exit_port_wait_token(&self) -> Option<WaitToken> {
+        self.exit_port_carrier_id()
+            .map(|id| WaitToken::new(id, EXIT_PORT_CHILD_ZOMBIFIED))
+    }
+
+    /// Fire the `exit_port` channel with `mask`, returning the number
+    /// of awaiters released by [`Channel::fire`]. No-op (returns `0`)
+    /// for zombies.
+    ///
+    /// The fire site is
+    /// [`crate::process::execution::post_sigchld_to_parent`]: every
+    /// time SIGCHLD posts, the parent's `exit_port` fires the
+    /// `EXIT_PORT_CHILD_ZOMBIFIED` bit.
+    pub fn fire_exit_port(&self, mask: Mask) -> usize {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.exit_port().fire(mask))
+            .unwrap_or(0)
+    }
+
     /// Build the process-exported value type that `cred::require_signal_send`
     /// consumes. Per `cred_service_v_1` §"Foreign value types from
     /// subsystems", the target side of a signal-permission check is a
@@ -539,6 +610,38 @@ pub struct ProcessPayload {
     /// path, so the child's brk region is materialised without
     /// re-running `brk_script`.
     pub(crate) current_brk: AtomicU64,
+    /// Reactor wait carrier that fires when **any** child of this
+    /// process zombifies (per `txdoc:PROCESS-WAIT-FAMILY-1`'s
+    /// `children_state_channel` notion). Created at payload-sign time
+    /// and registered with [`crate::wait_carrier::register_wait_channel`]
+    /// so async script wrappers can `wait_on_token` against the
+    /// returned id without holding a `Cap<ProcessIdentity>`.
+    ///
+    /// Pattern mirrors `TtyIdentity.wait_channel` /
+    /// `wait_carrier_id` (see
+    /// `crates/tx-subsystems/src/tty/structure/identity.rs`'s
+    /// `TtyIdentity::new`) — the only other in-tree wait carrier
+    /// today.
+    ///
+    /// Fire site: [`crate::process::execution::post_sigchld_to_parent`]
+    /// fires this immediately after the SIGCHLD post once a child
+    /// zombifies. Wave 1 of the fork/clone/wait4 slice wires the
+    /// fire; the matching `sys_wait4` blocking-wait await arrives in
+    /// Wave 2.
+    ///
+    /// Bit allocation: see [`EXIT_PORT_CHILD_ZOMBIFIED`].
+    pub(crate) exit_port: Channel,
+    /// Carrier id under which `exit_port` is registered with the
+    /// global [`crate::wait_carrier`] resolver. Embedded in the
+    /// `WaitToken` returned by
+    /// [`ProcessIdentity::exit_port_wait_token`] so the syscall arm
+    /// can park on the carrier without reaching the channel directly.
+    ///
+    /// Carrier-lifetime cleanup (release on payload drop) is tracked
+    /// as Cross-cutting Risk #1 in the slice plan and not addressed
+    /// in Wave 1; see plan §"Cross-cutting risks #1" for the
+    /// follow-up.
+    pub(crate) exit_port_carrier_id: u64,
 }
 
 impl ProcessPayload {
@@ -675,6 +778,26 @@ impl ProcessPayload {
     /// `brk_script`; this just records the new top-of-heap.
     pub fn set_current_brk(&self, value: u64) {
         self.current_brk.store(value, Ordering::Release);
+    }
+
+    /// Borrow the per-process `exit_port` wait channel.
+    ///
+    /// Fired by [`crate::process::execution::post_sigchld_to_parent`]
+    /// after the SIGCHLD producer post when a child zombifies. The
+    /// matching syscall-side awaiter (Wave 2's `sys_wait4` blocking
+    /// arm) parks on
+    /// [`ProcessIdentity::exit_port_wait_token`] via
+    /// [`crate::wait_carrier::wait_on_token`] rather than borrowing
+    /// the channel directly.
+    pub fn exit_port(&self) -> &Channel {
+        &self.exit_port
+    }
+
+    /// Carrier id under which [`Self::exit_port`] is registered with
+    /// the global wait-carrier resolver. Embedded in the
+    /// `WaitToken` callers use to park.
+    pub fn exit_port_carrier_id(&self) -> u64 {
+        self.exit_port_carrier_id
     }
 }
 

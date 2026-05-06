@@ -12,12 +12,12 @@ pub mod structure;
 mod tests;
 
 pub use execution::{
-    bootstrap_init_process, step_chdir, step_close_cloexec_fds, step_exit_group, step_fork,
-    step_getcwd, step_install_brk_for_exec, step_reset_signal_dispositions_for_exec, step_setpgid,
-    step_setsid, step_waitpid_nohang, ChdirOutcome, ForkError, SetpgidError, SetsidError,
-    WaitError, WaitTarget,
+    bootstrap_init_process, seed_child_leader_context, step_chdir, step_close_cloexec_fds,
+    step_exit_group, step_fork, step_getcwd, step_install_brk_for_exec,
+    step_reset_signal_dispositions_for_exec, step_setpgid, step_setsid, step_waitpid_nohang,
+    ChdirOutcome, ForkError, SetpgidError, SetsidError, WaitError, WaitTarget,
 };
 pub use structure::{
     allocate_pid, ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,
-    Sid, FD_TABLE_SIZE,
+    Sid, EXIT_PORT_CHILD_ZOMBIFIED, FD_TABLE_SIZE,
 };

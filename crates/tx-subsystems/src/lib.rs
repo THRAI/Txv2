@@ -10,6 +10,7 @@ pub mod execution;
 pub mod mount;
 pub mod page_backed;
 pub mod process;
+pub mod reactor_submit;
 pub mod signal;
 pub mod thread_runtime;
 pub mod tty;
@@ -78,5 +79,13 @@ pub mod cross_crate_test_support {
     /// value (1). Pairs with `mount::allocate_dev_id`.
     pub fn reset_dev_id_counter() {
         crate::mount::reset_dev_id_counter_for_test();
+    }
+
+    /// Clear the reactor-submission seam slot so a subsequent
+    /// `install_submit_child_thread` call sees an empty slot. Used
+    /// by `tx-kernel`'s init tests to verify the install seam end-
+    /// to-end (Wave 1 of the fork/clone/wait4 slice).
+    pub fn reset_reactor_submit_seam() {
+        crate::reactor_submit::reset_for_test();
     }
 }
