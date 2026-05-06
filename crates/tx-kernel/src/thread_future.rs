@@ -15,11 +15,15 @@
 //! 3. Match on the resolved `UserspaceTrapInfo`:
 //!    - `Syscall(req)` → drive `tx_shims::linux_syscall::dispatch`,
 //!      stash the outcome in `pending_syscall_return`.
-//!    - `PageFault(_)` → Phase 2 placeholder: route SIGSEGV
-//!      unconditionally via `step_exit_group_with_signal` and
-//!      terminate the future. Phase 3 replaces this with
-//!      `aspace.fault_script(...).await` plus an `Err`-routes-SIGSEGV
-//!      branch.
+//!    - `PageFault(info)` → drive `aspace.fault_script(VmFault).await`
+//!      per `txdoc:VM-5-1-FAULT-HANDLER` /
+//!      `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`. On `Ok` the
+//!      mapping was published; the loop body falls through to AST
+//!      drain + userspace-entry without writing
+//!      `pending_syscall_return` (the merged context's `a0` comes
+//!      from `saved_user_context`, matching Plan B writeback
+//!      discipline for fault returns). On `Err` route SIGSEGV per
+//!      `SIGNAL_v1` §15.1 default action.
 //!    - other variants → unreachable in the slice; panic.
 //! 4. Drain ASTs **before** preparing the entry payload (Plan B
 //!    Cross-cutting risk #3 — AST drain ordering). Per Open Q #2 only
@@ -76,7 +80,10 @@ use core::task::{Context, Poll};
 
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
 use tx_reactor::ast::AstBatch;
-use tx_reactor::userspace::{UserspaceEntryDecision, UserspaceTrapInfo};
+use tx_reactor::userspace::{
+    PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserspaceEntryDecision,
+    UserspaceTrapInfo,
+};
 use tx_substrate::zone::PayloadCap;
 use tx_subsystems::process::execution::step_exit_group_with_signal;
 use tx_subsystems::signal::Signum;
@@ -84,6 +91,39 @@ use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload;
 use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, set_current_thread_payload, ThreadIdentity, ThreadPayload,
 };
+use tx_subsystems::vm::{AccessMode, UserVirtAddr, VmFault};
+
+/// Translate the reactor's `PageFaultAccess` into the VM subsystem's
+/// `AccessMode`, which is what `VmFault` consumes. The two enums do
+/// not converge today: the reactor's `PageFaultAccess::Unknown`
+/// variant has no VM analogue (the VM layer expects a definite
+/// access class for protection / CoW decisions). Phase 3 maps
+/// `Unknown` to `Read` defensively — the canonical fault script
+/// (`txdoc:VM-5-1-FAULT-HANDLER`) re-derives the protection
+/// requirement from the recipe rather than trusting the trap, so a
+/// conservative `Read` lookup will still catch genuine no-recipe and
+/// protection-violation cases without falsely upgrading a load to a
+/// store.
+pub(crate) const fn pf_access_to_vm_access(access: PageFaultAccess) -> AccessMode {
+    match access {
+        PageFaultAccess::Read | PageFaultAccess::Unknown => AccessMode::Read,
+        PageFaultAccess::Write => AccessMode::Write,
+        PageFaultAccess::Execute => AccessMode::Execute,
+    }
+}
+
+/// Sanity hook for the from-user invariant: the reactor's
+/// `PageFaultInfo` has no `from_user` field because the trap shell
+/// only resolves a userspace-run wait with `PageFault(...)` for
+/// from-user faults (`crate::trap_handoff::hand_off_user_pf` carries
+/// the explicit `debug_assert!`). Reaching this match arm therefore
+/// implies the original trap was from-user. The function exists so
+/// the assertion site stays close to the dispatch and so any future
+/// reactor-side `from_user` field can be checked here without
+/// re-plumbing.
+const fn pf_info_implies_from_user(_info: ReactorPageFaultInfo) -> bool {
+    true
+}
 
 /// Per-hart slot adapter for the production thread future.
 ///
@@ -142,8 +182,9 @@ impl<P: TxPlatform, F: Future> Future for PerHartSlotted<P, F> {
 /// Production per-thread reactor future.
 ///
 /// Drives the userspace round-trip described in the module docs.
-/// Returns when the thread terminates (`exit_group`,
-/// `exit`, page-fault SIGSEGV placeholder).
+/// Returns when the thread terminates (`exit_group`, `exit`, or a
+/// page-fault that the canonical fault script could not satisfy and
+/// is routed to default-action SIGSEGV per `SIGNAL_v1` §15.1).
 ///
 /// The `Cap<ThreadIdentity>` is held across `.await` per
 /// `txdoc:THREAD-4-2-OWNERSHIP`; epoch-managed `Cap` is safe across
@@ -206,14 +247,46 @@ pub async fn run_thread<P: TxPlatform>(
                     }
                 }
             }
-            UserspaceTrapInfo::PageFault(_info) => {
-                // PHASE 3 PLACEHOLDER: route SIGSEGV unconditionally.
-                // Phase 3 replaces this with `aspace.fault_script(fault).await`
-                // plus an Err-routes-SIGSEGV branch (see plan Part 2).
-                if let Some(process) = thread.upgrade_owner_proc() {
-                    step_exit_group_with_signal(&process, Signum::SIGSEGV);
+            UserspaceTrapInfo::PageFault(info) => {
+                // Per `txdoc:VM-5-1-FAULT-HANDLER` and
+                // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`: drive
+                // the canonical async fault script. On Ok the recipe
+                // is materialised + published; loop body falls
+                // through to the AST-drain + userspace-entry tail
+                // (no `pending_syscall_return` write — the merged
+                // context's `a0` comes from `saved_user_context`,
+                // matching Plan B writeback discipline for
+                // fault returns). On Err route SIGSEGV per
+                // `SIGNAL_v1` §15.1 default action.
+                debug_assert!(
+                    pf_info_implies_from_user(info),
+                    "thread future only sees PageFault for from-user faults; \
+                     trap shell terminates non-user faults at the shell"
+                );
+                let Some(process) = thread.upgrade_owner_proc() else {
+                    // Owning process gone; thread is detached. Stop.
+                    return;
+                };
+                let Some(aspace) = process.aspace_cap() else {
+                    // Process zombified concurrently; stop.
+                    return;
+                };
+                let fault = VmFault::new(
+                    UserVirtAddr::new(info.addr.raw() as usize),
+                    pf_access_to_vm_access(info.access),
+                );
+                match aspace.fault_script(fault).await {
+                    Ok(_) => {
+                        // Mapping was published; fall through to AST
+                        // drain + entry-prep tail (same path as a
+                        // successful syscall, minus the
+                        // `pending_syscall_return` write).
+                    }
+                    Err(_e) => {
+                        step_exit_group_with_signal(&process, Signum::SIGSEGV);
+                        return;
+                    }
                 }
-                return;
             }
             UserspaceTrapInfo::Fatal(_info) => {
                 // Out-of-scope for Phase 2; terminate the future
