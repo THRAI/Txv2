@@ -18,6 +18,7 @@ pub enum Errno {
     ELOOP,
     ENAMETOOLONG,
     ENODEV,
+    ENOEXEC,
     ENOMEM,
     ENOENT,
     ENOSYS,

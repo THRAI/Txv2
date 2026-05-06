@@ -705,6 +705,7 @@ fn errno_to_i32(errno: Errno) -> i32 {
         Errno::ELOOP => 40,
         Errno::ENAMETOOLONG => 36,
         Errno::ENODEV => 19,
+        Errno::ENOEXEC => 8,
         Errno::ENOMEM => 12,
         Errno::ENOENT => 2,
         Errno::ENOSYS => ENOSYS_VALUE,

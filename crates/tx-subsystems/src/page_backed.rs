@@ -24,10 +24,12 @@ use tx_substrate::{
 mod cross_variant;
 mod lifecycle;
 mod reflink;
+mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
 pub use lifecycle::{step_fallocate, step_fsync, step_truncate};
 pub use reflink::{cow_replace_into_private, install_shared_page};
+pub use targeted_read::read_exact_at;
 pub use user_buffer::{step_read_to_user, step_write_from_user};
 
 #[cfg(test)]
@@ -1479,5 +1481,7 @@ mod lifecycle_tests;
 mod reflink_tests;
 #[cfg(test)]
 mod size_tests;
+#[cfg(test)]
+mod targeted_read_tests;
 #[cfg(test)]
 mod user_buffer_tests;
