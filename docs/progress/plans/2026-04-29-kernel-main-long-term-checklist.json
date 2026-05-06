@@ -71,7 +71,9 @@
       "docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json",
       "docs/progress/decisions/2026-05-04-vm-pagebacked-v1-plan-closure.md",
       "docs/progress/plans/2026-05-05-trio-trap-syscall-tmpfs-devfs.md",
-      "docs/progress/decisions/2026-05-06-trio-trap-syscall-tmpfs-devfs.md"
+      "docs/progress/decisions/2026-05-06-trio-trap-syscall-tmpfs-devfs.md",
+      "docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md",
+      "docs/progress/decisions/2026-05-06-pre-elf-runtime-completion.md"
     ],
     "external_refs": []
   },
@@ -146,7 +148,7 @@
         "cargo test -p tx-hal-riscv64-qemu-virt",
         "cargo xtask ci"
       ],
-      "notes": "Implement RawTrapFrame, TrapFrameView, TrapFrameMut, classify-from-frame, user and kernel vector installation, return_to_userspace, and direct named KernelTrapSink methods for page fault, syscall, timer, external IRQ, IPI, and sync fault. Keep trap dispatch out of linkme. Trio Phase 1 (commit f2d84b7) replaced the on_syscall/on_page_fault Terminate stubs with a UserspaceRunSlot handoff via the new trap_handoff module: SyscallRequest/PageFaultInfo translators, hand_off_syscall/hand_off_user_pf, current_thread_payload per-hart slot. Plan B for syscall-return writeback is locked in (the trap shell never writes the trap frame; userspace-entry shim drains pending_syscall_return and writes a0 against a fresh frame). Still pending: RawTrapFrame, TrapFrameMut, return_to_userspace, kernel vector installation, and the named KernelTrapSink methods for timer/external-IRQ/IPI/sync. Page-fault async dispatch in the thread future is also still TODO(phase-2)."
+      "notes": "Implement RawTrapFrame, TrapFrameView, TrapFrameMut, classify-from-frame, user and kernel vector installation, return_to_userspace, and direct named KernelTrapSink methods for page fault, syscall, timer, external IRQ, IPI, and sync fault. Keep trap dispatch out of linkme. Trio Phase 1 (commit f2d84b7) replaced the on_syscall/on_page_fault Terminate stubs with a UserspaceRunSlot handoff via the new trap_handoff module: SyscallRequest/PageFaultInfo translators, hand_off_syscall/hand_off_user_pf, current_thread_payload per-hart slot. Pre-ELF Phase 2 (commit abc9fb8) added TrapIf::enter_userspace_with_context as the portable HAL entry hook (default-panic; RV64 board override at boards/tx-hal-riscv64-qemu-virt/src/trap.rs builds Rv64TrapFrame from UserTrapContext via existing restore_user_context+return_to_userspace). Pre-ELF Phase 5 (commit 3cb95d6) added IRQ dispatch table walked at boot via the new explicit register_irq_handler / install_irq_handlers boot step (no linkme — Open Q #4). Plan B for syscall-return writeback is locked in (the trap shell never writes the trap frame; userspace-entry shim drains pending_syscall_return and writes a0 against a fresh frame). Still pending: RawTrapFrame as a portable HAL surface, TrapFrameMut writeback (Plan B is implemented but the legacy direct-write path is not exposed), kernel vector installation, the named KernelTrapSink methods for timer/IPI/sync, and KERNEL_FIXUP_TABLE-style kernel-mode fault recovery."
     },
     {
       "id": "user-access-fixups",
@@ -269,7 +271,7 @@
     {
       "id": "process-and-thread-runtime-core",
       "title": "Implement Process, ThreadIdentity/ThreadPayload, and thread_future skeleton",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "reactor-and-round-robin-scheduler",
         "vm-address-space-core",
@@ -284,12 +286,12 @@
         "cargo test -p tx-kernel thread_runtime",
         "cargo xtask ci"
       ],
-      "notes": "Process / ProcessGroup / Session / Thread topology, signal post-and-observe, default-terminate route via step_exit_group_with_signal, cred + kill permission check, cwd/chdir/getcwd VFS seam, and INIT_PROCESS bootstrap have all landed (commits 3652bd1, c982b81, 51d0b2a, c2bce56, 362b22a, 1f09e2a, 531c783; decisions 2026-05-05-process-topology-day1.md, signal-day1.md, cred-day1.md, ast-dispatch.md, step-exit-group-with-signal.md, cwd-vfs-integration.md). Trio Phase 1 (commit f2d84b7) added ThreadPayload's saved-user-trap-frame storage and signal-state slots (userspace_slot, active_request, saved_user_context, pending_syscall_return) plus the per-hart current_thread_payload registry. Phase 2a (abefad4) added the stub fd table on ProcessPayload with step_fork cloning. Phase 2b (119602b) added brk_base/current_brk on ProcessPayload and bootstrap_init_process seeding. Remaining: the thread_future poll loop (the reactor task wrapper that drives a thread future and stages the per-hart slot around Future::poll) is still TBD; trap-frame writeback at userspace re-entry depends on trap-shell-and-kernel-sink exposing return_to_userspace."
+      "notes": "Process / ProcessGroup / Session / Thread topology, signal post-and-observe, default-terminate route via step_exit_group_with_signal, cred + kill permission check, cwd/chdir/getcwd VFS seam, and INIT_PROCESS bootstrap have all landed (commits 3652bd1, c982b81, 51d0b2a, c2bce56, 362b22a, 1f09e2a, 531c783; decisions 2026-05-05-process-topology-day1.md, signal-day1.md, cred-day1.md, ast-dispatch.md, step-exit-group-with-signal.md, cwd-vfs-integration.md). Trio Phase 1 (commit f2d84b7) added ThreadPayload's saved-user-trap-frame storage and signal-state slots (userspace_slot, active_request, saved_user_context, pending_syscall_return) plus the per-hart current_thread_payload registry. Phase 2a (abefad4) added the stub fd table on ProcessPayload with step_fork cloning. Phase 2b (119602b) added brk_base/current_brk on ProcessPayload and bootstrap_init_process seeding. Pre-ELF Phase 2 (commit abc9fb8) shipped the production thread_future skeleton: pub async fn run_thread<P>(payload) loops dispatch -> AST -> entry-shim -> divergent enter_userspace_with_context; pub struct PerHartSlotted<F> stages the per-hart slot around Future::poll; pub fn prepare_userspace_entry_payload(payload) -> UserTrapContext drains pending_syscall_return into a0 (Plan B); pub fn ThreadIdentity::payload_cap() (Phase 7 promotion from payload_cap_for_test). Pre-ELF Phase 7 (commit 69a3efd) restructured run_thread's two-request lifecycle (resolution + entry) so the AST checkpoint subject lives across the divergent call. Step delivered. Remaining for downstream: real per-task AST plumbing so checkpoint_userspace_entry (not _batch with empty AstBatch::default()) can wire signal-handler frames; this is signal-attachments / sigreturn territory."
     },
     {
       "id": "syscall-dispatch-and-ast-loop",
       "title": "Add syscall dispatch, page-fault dispatch, and AST return-to-user loop",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "process-and-thread-runtime-core",
         "user-access-fixups",
@@ -304,12 +306,12 @@
         "cargo test -p tx-kernel syscall",
         "cargo xtask ci"
       ],
-      "notes": "Implement fixed syscall table dispatch, VM page-fault materializer dispatch, error/return-value writes through TrapFrameMut, and Site B AST handling before user re-entry. Timer preemption should not advance thread_future; interesting traps do. Trio Phase 2a (commit abefad4) and Phase 2b (commit 119602b) populated tx-shims with linux_syscall::dispatch covering 8 entries: NR_WRITE, NR_READ, NR_EXIT, NR_EXIT_GROUP, NR_GETPID, NR_BRK, NR_RT_SIGPROCMASK, NR_RT_SIGACTION. Each entry calls existing step_* functions; partial-success Linux semantics for write/read; brk-never-returns-negative semantics; rt_sigaction decodes the 32-byte modern struct (RV64 has no legacy sigaction). Phase 6 (commit 6828b00) end-to-end smoke verifies the dispatch path through OPOST and zombie transition. Still pending: VM page-fault materializer dispatch in the thread future, real TrapFrameMut writeback (Plan B's userspace-entry shim), and Site B AST handling before user re-entry. Phase 6 stages these via a host-side fake driver."
+      "notes": "Implement fixed syscall table dispatch, VM page-fault materializer dispatch, error/return-value writes through TrapFrameMut, and Site B AST handling before user re-entry. Timer preemption should not advance thread_future; interesting traps do. Trio Phase 2a (commit abefad4) and Phase 2b (commit 119602b) populated tx-shims with linux_syscall::dispatch covering 8 entries: NR_WRITE, NR_READ, NR_EXIT, NR_EXIT_GROUP, NR_GETPID, NR_BRK, NR_RT_SIGPROCMASK, NR_RT_SIGACTION. Each entry calls existing step_* functions; partial-success Linux semantics for write/read; brk-never-returns-negative semantics; rt_sigaction decodes the 32-byte modern struct (RV64 has no legacy sigaction). Trio Phase 6 (commit 6828b00) end-to-end fake-driver smoke verified the dispatch path through OPOST and zombie transition. Pre-ELF Phase 3 (commit b49b302) added VM page-fault async dispatch in the thread future: aspace.fault_script(VmFault).await with Ok loops back through the userspace-entry checkpoint and Err routes default-action SIGSEGV via step_exit_group_with_signal (txdoc:VM-5-1-FAULT-HANDLER + SIGNAL_v1 §15.1). Pre-ELF Phase 5 (commit 3cb95d6) added the blocking read carrier path: sys_read awaits on tx_subsystems::wait_carrier::wait_on_token, woken by the UART RX IRQ handler -> tty::execution::step_ingest -> tty.input_readable.fire(TTY_READABLE). Pre-ELF Phase 2 (commit abc9fb8) added Plan B writeback discipline (TrapIf::enter_userspace_with_context is the only site that writes a0; trap shell never writes the trap frame). Pre-ELF Phase 7 (commit 69a3efd) end-to-end production smoke (no synthesised driver) exercises the full chain: PerHartSlotted -> run_thread -> dispatch -> walker -> tty -> ConsoleIf, asserts merged regs[10]==dispatcher's encoded return. Step delivered. Remaining for downstream: real per-task AST plumbing (signal-handler frame setup beyond EnterUserspace). Empty-batch AstBatch::default() shortcut is correct for this slice because only EnterUserspace is valid; signal attachments / sigreturn is the next piece."
     },
     {
       "id": "vfs-device-and-tty-init",
       "title": "Initialize VFS, tier-1/tier-2 devices, IRQ dispatch, devfs, and console/TTY",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "coreinit-spine",
         "zone-epoch-bus-foundation",
@@ -326,7 +328,7 @@
         "cargo test -p tx-kernel vfs",
         "cargo xtask ci"
       ],
-      "notes": "VFS spec-reconciliation Phases 2-4 collapsed VFS/VM/TTY/page_backed into tx-subsystems and the canonical VFS surface (commits d0b2ab6, 1b91e5d; decision 2026-05-04-vfs-spec-reconciliation-phase-2-3-4.md). TTY now publishes typed Cap<Session>/Cap<ProcessGroup> and a deliver_tty_dispatch signal bridge (commits 4b68570, a50320c). Trio Phase 3a (commit 91f2175) populated tx-fs::devfs with a read-only FsOps backend that resolves /dev/console through the existing TTY alias registry (StructBacked { Tty }) and exposes open_console_for_init() for fd preopen. Phase 3b (commit ffc098c) populated tx-fs::tmpfs with a full FsOps + FsPageBacking backend over PageContainerKind::Anon { Reclaimable } and added the 5-step boot wiring in init.rs (register_console_hardware -> mount_rootfs_tmpfs -> mount_devfs_at_dev -> register_devfs_console_alias -> bind_init_cwd_and_root). ROOT_MOUNT, DEV_MOUNT, CONSOLE_TTY globals are populated; init.fd(0/1/2) are preopened to /dev/console. Still pending: IRQ_HANDLERS walked once into an installed dispatch table; full step_open through the VFS walker so /dev/console can be reached by path lookup."
+      "notes": "VFS spec-reconciliation Phases 2-4 collapsed VFS/VM/TTY/page_backed into tx-subsystems and the canonical VFS surface (commits d0b2ab6, 1b91e5d; decision 2026-05-04-vfs-spec-reconciliation-phase-2-3-4.md). TTY now publishes typed Cap<Session>/Cap<ProcessGroup> and a deliver_tty_dispatch signal bridge (commits 4b68570, a50320c). Trio Phase 3a (commit 91f2175) populated tx-fs::devfs with a read-only FsOps backend that resolves /dev/console through the existing TTY alias registry (StructBacked { Tty }) and exposes open_console_for_init() for fd preopen. Phase 3b (commit ffc098c) populated tx-fs::tmpfs with a full FsOps + FsPageBacking backend over PageContainerKind::Anon { Reclaimable } and added the 5-step boot wiring in init.rs (register_console_hardware -> mount_rootfs_tmpfs -> mount_devfs_at_dev -> register_devfs_console_alias -> bind_init_cwd_and_root). ROOT_MOUNT, DEV_MOUNT, CONSOLE_TTY globals are populated; init.fd(0/1/2) are preopened to /dev/console. Pre-ELF Phase 4 (commit 04edaa6) shipped the VFS walker (step_walk + step_open with SYMLOOP_MAX=40 hop ELOOP). Pre-ELF Phase 6 (commit e757bc0) added MountId/DevId allocators, wired mount::register_mount(&rootfs_payload, dev_object_id, dev_mount) into mount_devfs_at_dev, and added FsOps::materialise_rnode override on devfs so the walker resolves /dev/console end-to-end (boot smoke boot_smoke_walker_resolves_dev_console_after_mount_registration). Pre-ELF Phase 5 (commit 3cb95d6) added the IRQ dispatch table walked at boot via crates/tx-kernel/src/irq.rs::install_irq_handlers, registers UART RX handler under <P as IrqIf>::UART_IRQ, drains via ConsoleIf::read_bytes, calls tty::execution::step_ingest. Boot trace: :process:init:ok -> :tty:console:ok -> :irq:install:ok -> :mount:rootfs:tmpfs:ok -> :mount:devfs:ok -> :devfs:console:alias:ok -> :init:cwd:ok -> :boot:ok. Step delivered."
     },
     {
       "id": "exec-loader-and-detached-aspace",
@@ -366,7 +368,7 @@
         "cargo xtask qemu --target rv64-qemu --profile busybox --expect-sentinel",
         "cargo xtask ci"
       ],
-      "notes": "Boot wiring already calls bootstrap_init_process and emits a process:init:ok sentinel (commit b50a472, decision 2026-05-05-boot-wiring.md), but kernel_main still shuts down rather than entering the reactor loop and dispatching to userspace. Real return_to_userspace is blocked on trap-shell-and-kernel-sink and exec-loader-and-detached-aspace."
+      "notes": "Boot wiring already calls bootstrap_init_process and emits a process:init:ok sentinel (commit b50a472, decision 2026-05-05-boot-wiring.md). Pre-ELF Phase 7 (commit 69a3efd) replaced kernel_main's shutdown path with run_userspace_reactor_loop: builds PerHartSlotted::<P, _>::new(payload, run_thread::<P>(thread, payload)), submits via BOOT_REACTOR.with(|r| r.submit_task(...)), drives the BSP hart-loop via step_boot_reactor_once until init.is_zombie(), then emits :userspace:exited:N (where N is ExitStatus::wait_status_word()) before system_off. :boot:ok still emits unchanged from boot_sentinel. Production loop is wired and ready; on RV64 boards with no userspace binary loaded yet the loop parks in WFI. Remaining for this step: load a real ELF into init's address space and seed payload.saved_user_context with the binary's entry point + sp — that is exec-loader-and-detached-aspace's responsibility (next slice). Once the loader lands, the loop will pick up the binary on the first enter_userspace_with_context call."
     },
     {
       "id": "smp-runtime-and-remote-coordination",
@@ -413,7 +415,7 @@
     {
       "command": "cargo xtask progress validate",
       "status": "passed",
-      "notes": "Re-run on 2026-05-06 after the trio (trap-shell + linux_syscall + tmpfs/devfs) landed in 6 phase commits on feat/trio-trap-syscall-tmpfs-devfs (f2d84b7, 91f2175, abefad4, 119602b, ffc098c, 6828b00); 24+ ok."
+      "notes": "Re-run on 2026-05-06 after pre-ELF wave 1-5 landed in 7 phase commits on feat/pre-elf-runtime (04edaa6 wave 1 minors+walker; e757bc0 wave 2 id allocators+register_mount; abc9fb8 wave 3 task wrapper+entry shim+HAL hook; b49b302 wave 4 page-fault async; 3cb95d6 wave 4 IRQ dispatch+UART RX; 69a3efd wave 5 production smoke+kernel_main reactor loop). Three long-term steps promoted to complete: process-and-thread-runtime-core, syscall-dispatch-and-ast-loop, vfs-device-and-tty-init. 24+ ok."
     },
     {
       "command": "cargo xtask lint docs",
@@ -433,10 +435,11 @@
     "Design docs reference many future subsystems; individual implementation slices should refresh readiness before coding from them."
   ],
   "blockers": [
-    "Trap shell handoff lands in trio Phase 1 (commit f2d84b7); RawTrapFrame, TrapFrameMut writeback, and return_to_userspace are still missing.",
-    "ThreadPayload saved-trap-frame slots land in trio Phase 1; the thread_future poll loop / reactor task wrapper that drives them and stages the per-hart current_thread_payload slot is still TBD.",
-    "tx-shims linux_syscall::dispatch covers 8 entries after trio Phase 2a/2b (commits abefad4, 119602b); tx-scripts (exec loader) is still an empty stub.",
-    "tmpfs + devfs are mounted at boot after trio Phase 3a/3b (commits 91f2175, ffc098c) and init.fd(0/1/2) are preopened to /dev/console; full VFS step_open walker remains pending so /dev/console can be reached by path lookup."
+    "Pre-ELF Phase 2 (commit abc9fb8) added TrapIf::enter_userspace_with_context as the portable HAL entry hook; RawTrapFrame as a portable HAL surface and TrapFrameMut direct-write are still not exposed at the trait level (they live as RV64 board internals).",
+    "Pre-ELF Phase 2 shipped the production thread_future skeleton (run_thread + PerHartSlotted + prepare_userspace_entry_payload) and Phase 7 wired kernel_main into the production reactor loop; with no ELF loader, the loop parks in WFI on real boards.",
+    "tx-shims linux_syscall::dispatch covers 8 entries (trio Phase 2a/2b); page-fault async dispatch landed in pre-ELF Phase 3; IRQ-driven blocking read landed in pre-ELF Phase 5. Real per-task AST plumbing (signal-handler frame setup beyond EnterUserspace) is the remaining piece; uses empty-batch AstBatch::default() shortcut today.",
+    "tx-scripts (exec loader) is still an empty stub — this is the immediate next slice that unlocks first userspace.",
+    "tmpfs + devfs mounted at boot via the trio + walker via pre-ELF Phase 4 + register_mount + materialise_rnode wire-up via pre-ELF Phase 6; /dev/console resolves end-to-end through the walker now."
   ],
   "handoff": {
     "needed": false,
