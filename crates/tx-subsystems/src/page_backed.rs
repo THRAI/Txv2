@@ -10,7 +10,7 @@ use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::execution::{Errno, Guard, StepOutcome};
-use crate::mount::MountPayload;
+use crate::mount::MountPayloadPin;
 use crate::sync::SpinMutex;
 use crate::vfs::{FsObjectId, OpenFile};
 use tx_hal::{KernelPtr, Ppn, UserAccessIf, UserPtr};
@@ -226,7 +226,7 @@ pub enum PageContainerKind {
         swap_policy: AnonSwapPolicy,
     },
     File {
-        mount: Cap<MountPayload>,
+        mount: MountPayloadPin,
         fs_object_id: FsObjectId,
     },
     Device {
@@ -439,7 +439,7 @@ impl PageContainer {
         &self,
         page: PageIndex,
         access: MaterializeAccess,
-        mount: &Cap<MountPayload>,
+        mount: &MountPayloadPin,
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
     ) -> StepOutcome<MaterializedPage> {
@@ -454,6 +454,7 @@ impl PageContainer {
             return StepOutcome::Err(Errno::EINVAL);
         };
         match mount
+            .payload()
             .fs_page_backing
             .fetch_page(fs_object_id, offset, guard)
         {
@@ -1128,7 +1129,7 @@ mod tests {
         .expect("mount payload");
         PageContainer::new(
             PageContainerKind::File {
-                mount,
+                mount: MountPayloadPin::acquire(&tx_substrate::zone::PayloadCap::from_cap(mount)),
                 fs_object_id,
             },
             page_count,

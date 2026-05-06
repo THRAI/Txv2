@@ -236,23 +236,6 @@ impl<T: 'static> Keg<T> {
         retired
     }
 
-    pub(crate) fn retry_retire_pending_slots(&self, limit: usize) -> usize {
-        if limit == 0 {
-            return 0;
-        }
-
-        let _guard = self.lock.lock();
-        let mut progressed = 0usize;
-        unsafe {
-            progressed += self.retry_retire_pending_in_list(*self.partial_head.get(), limit);
-            if progressed < limit {
-                progressed +=
-                    self.retry_retire_pending_in_list(*self.full_head.get(), limit - progressed);
-            }
-        }
-        progressed
-    }
-
     unsafe fn allocate_slab_locked(
         &self,
         zone: &'static Zone<T>,
@@ -369,23 +352,5 @@ impl<T: 'static> Keg<T> {
             }
         }
         None
-    }
-
-    unsafe fn retry_retire_pending_in_list(
-        &self,
-        mut current: *mut ZoneSlab<T>,
-        limit: usize,
-    ) -> usize {
-        let mut progressed = 0usize;
-        unsafe {
-            while !current.is_null() && progressed < limit {
-                let slab = NonNull::new_unchecked(current);
-                progressed += slab
-                    .as_ref()
-                    .retry_retire_pending_slots(limit.saturating_sub(progressed));
-                current = (*current).next();
-            }
-        }
-        progressed
     }
 }

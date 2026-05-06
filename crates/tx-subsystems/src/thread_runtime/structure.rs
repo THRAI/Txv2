@@ -9,7 +9,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use tx_reactor::TaskKey;
-use tx_substrate::zone::{PayloadCap, Weak, Zone, ZoneAllocated};
+use tx_substrate::zone::{Dead, Entity, PayloadCap, Weak, Zone, ZoneAllocated};
 
 use crate::process::ProcessIdentity;
 use crate::signal::{InterruptSummary, PendingSignalQueue, SignalMask};
@@ -55,6 +55,16 @@ impl ThreadIdentity {
     pub fn upgrade_owner_proc(&self) -> Option<tx_substrate::zone::Cap<ProcessIdentity>> {
         let guard = tx_substrate::epoch::guard();
         self.owner_proc.upgrade(&guard)
+    }
+}
+
+impl Entity for ThreadIdentity {
+    type OperationalEvidence = PayloadCap<ThreadPayload>;
+
+    fn upgrade_operational(
+        identity: &tx_substrate::zone::Cap<Self>,
+    ) -> Result<Self::OperationalEvidence, Dead> {
+        identity.payload.lock().as_ref().cloned().ok_or(Dead)
     }
 }
 

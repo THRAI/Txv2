@@ -25,7 +25,7 @@ static BLOCKING_READ_OPS: BlockingReadOps = BlockingReadOps;
 
 #[test]
 fn step_poll_hardware_input_rejects_pty_transport() {
-    let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
+    let _serial = TTY_ZONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_zones();
     let guard = tx_substrate::epoch::guard();
 
@@ -50,7 +50,7 @@ fn step_poll_hardware_input_rejects_pty_transport() {
 
 #[test]
 fn step_poll_hardware_input_propagates_blocked_driver_read() {
-    let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
+    let _serial = TTY_ZONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_zones();
     let guard = tx_substrate::epoch::guard();
 

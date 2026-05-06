@@ -97,7 +97,7 @@ pub(crate) fn bounded_maintenance_tick() -> zone::ZoneMaintenanceStats {
     })
 }
 
-pub(crate) fn try_bounded_maintenance_tick() {
+pub fn try_bounded_maintenance_tick() {
     if !zone::is_initialized() {
         return;
     }
@@ -111,7 +111,7 @@ pub(crate) fn try_best_effort_maintenance_tick() {
     let _ = best_effort_maintenance_tick();
 }
 
-pub(crate) fn panic_shutdown<P: TxPlatform>() -> ! {
+pub fn panic_shutdown<P: TxPlatform>() -> ! {
     let _ = freeze_for_shutdown();
     dump_summary::<P>();
     loop {
@@ -119,7 +119,7 @@ pub(crate) fn panic_shutdown<P: TxPlatform>() -> ! {
     }
 }
 
-pub(crate) fn shutdown_with_zone_cleanup<P: TxPlatform>() -> ! {
+pub fn shutdown_with_zone_cleanup<P: TxPlatform>() -> ! {
     let _ = freeze_for_shutdown();
     try_best_effort_maintenance_tick();
     dump_summary::<P>();

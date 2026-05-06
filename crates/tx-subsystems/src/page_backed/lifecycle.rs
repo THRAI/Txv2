@@ -55,6 +55,7 @@ pub fn step_truncate(pc: &PageContainer, new_size: u64, guard: &Guard<'_>) -> St
             mount,
             fs_object_id,
         } => match mount
+            .payload()
             .fs_page_backing
             .truncate(*fs_object_id, new_size, guard)
         {
@@ -127,10 +128,12 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<()> {
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
             return StepOutcome::Err(Errno::EINVAL);
         };
-        match mount
-            .fs_page_backing
-            .flush_page(*fs_object_id, offset, &Frame::new(ppn), guard)
-        {
+        match mount.payload().fs_page_backing.flush_page(
+            *fs_object_id,
+            offset,
+            &Frame::new(ppn),
+            guard,
+        ) {
             StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
                 pc.clear_dirty_if_match(page, ppn);
                 progressed = true;
@@ -150,7 +153,7 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<()> {
         }
     }
 
-    match mount.fs_page_backing.fsync(*fs_object_id, guard) {
+    match mount.payload().fs_page_backing.fsync(*fs_object_id, guard) {
         StepOutcome::Blocked(token) if progressed => StepOutcome::AdvancedThenBlocked((), token),
         other => other,
     }
@@ -188,6 +191,7 @@ pub fn step_fallocate(pc: &PageContainer, new_size: u64, guard: &Guard<'_>) -> S
             mount,
             fs_object_id,
         } => match mount
+            .payload()
             .fs_page_backing
             .fallocate(*fs_object_id, new_size, guard)
         {
