@@ -342,17 +342,15 @@ fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// treat `args[1]` as a kernel pointer (TODO(phase-userva) bootstrap
 /// exemption — same as `write`), loop on the wait-carrier discipline.
 ///
-/// **Non-blocking semantic for the slice.** Per the Trio plan §"Open
-/// questions #5", console `read` returns `0` bytes when no input is
-/// buffered. `tty::execution::step_read` returns `Blocked(token)` on
-/// an empty input queue (the canonical wait-on-readable shape used by
-/// blocking-read futures). For Phase 2b — which has no userspace
-/// stdin source — translating an initial `Blocked` into `Done(0)`
-/// preserves Linux's "non-blocking read of /dev/tty returns 0" idiom
-/// and keeps the dispatcher synchronous against tests with no input
-/// driver. Once the trap-shell drives a real `enter_userspace` loop,
-/// this arm should switch to actually awaiting the wait-carrier (see
-/// the matching TODO inline).
+/// **Blocking semantic.** Pre-ELF Phase 5 (item 9) wires the UART RX
+/// path so a blocked `read(0, ...)` actually parks until bytes arrive:
+/// `tty::execution::step_read` returns `Blocked(token)` on an empty
+/// input queue, the dispatcher awaits `wait_carrier::wait_on_token`,
+/// and `tx_kernel::irq::uart_rx_irq_handler` drives
+/// `tty::execution::step_ingest` from the IRQ side, which fires the
+/// TTY's wait `Channel`. On any partial progress (`total > 0`)
+/// the dispatcher returns what it has rather than block again,
+/// matching `sys_write`'s partial-success policy.
 async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let buf_ptr = args[1] as usize;
@@ -409,17 +407,31 @@ async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
                 // the `Blocked` arm below.
                 return SyscallResult::Return(0);
             }
-            StepOutcome::Blocked(_token) => {
-                // No input buffered. Per the Trio plan §"Open
-                // questions #5", return whatever we have (zero on the
-                // first iteration). Once a real wait carrier is wired
-                // for non-test reads this should `wait_on_token` and
-                // re-poll; for the slice we surface non-blocking
-                // semantics.
-                // TODO(phase-blocking-read): await the wait carrier
-                // instead of returning 0 once the kernel has a real
-                // input source feeding the TTY ldisc.
-                return SyscallResult::Return(total as i64);
+            StepOutcome::Blocked(token) => {
+                // Pre-ELF Phase 5 (item 9): no input buffered yet.
+                // Park on the registered TTY wait carrier (fired
+                // from `tty::execution::step_ingest` after UART RX
+                // bytes land via `irq::uart_rx_irq_handler`), then
+                // re-poll. Mirrors the canonical async wait
+                // discipline pattern from
+                // `vm::execution::fault_script` /
+                // `RangeLock::WouldBlock`.
+                //
+                // `wait_on_token` returns `None` for test
+                // placeholder tokens (carrier id not registered);
+                // in that case fall through and re-poll
+                // immediately. Production carriers are always
+                // registered (see `TtyIdentity::new`). If a partial
+                // read already happened on a prior iteration
+                // (`total > 0`) we return what we have rather than
+                // block, matching `sys_write`'s partial-success
+                // policy.
+                if total > 0 {
+                    return SyscallResult::Return(total as i64);
+                }
+                if let Some(future) = wait_carrier::wait_on_token(token) {
+                    let _ = future.await;
+                }
             }
             StepOutcome::Err(errno) => {
                 if total > 0 {

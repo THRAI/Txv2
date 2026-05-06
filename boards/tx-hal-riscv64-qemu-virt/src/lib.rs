@@ -475,6 +475,10 @@ impl PmapIf for Platform {
 impl IrqIf for Platform {
     const MAX_IRQ: u32 = PLIC_MAX_IRQ;
 
+    /// QEMU `virt` machine's 16550 UART is wired at PLIC IRQ 10.
+    /// Source: `qemu/hw/riscv/virt.c::UART0_IRQ`.
+    const UART_IRQ: u32 = 10;
+
     fn in_irq_context() -> bool {
         irq_context_depth() != 0
     }

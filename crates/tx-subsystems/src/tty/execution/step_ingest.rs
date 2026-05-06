@@ -2,6 +2,7 @@
 
 use core::sync::atomic::Ordering;
 
+use tx_reactor::wait::Mask;
 use tx_substrate::zone::Cap;
 
 use crate::execution::{Guard, StepOutcome};
@@ -47,6 +48,13 @@ pub fn step_ingest(
     let linearized = payload.apply_ingest_linearizer();
     if linearized.readable_fired {
         tty.input_readable.fire(TTY_READABLE);
+        // Pre-ELF Phase 5 (item 9): the BIF-5 readiness wire is
+        // RawQueue-shaped and only wakes RawQueue subscribers; the
+        // wait-carrier registry that `sys_read`'s `wait_on_token`
+        // loop drives is `Channel`-shaped, so we fire both. The
+        // Channel is registered at TTY construction; see
+        // `TtyIdentity::new`.
+        tty.wait_channel().fire(Mask::from_bits(TTY_READABLE));
         outcome.readable_fired = true;
     }
     if linearized.writable_fired {
@@ -80,6 +88,11 @@ pub fn step_ingest(
                                 payload.eof_pending.store(true, Ordering::Release);
                             }
                             tty.input_readable.fire(TTY_READABLE);
+                            // Pre-ELF Phase 5 (item 9): see the
+                            // companion comment near the linearizer
+                            // fire above. The wait-carrier `Channel`
+                            // wakes `sys_read`'s blocking-read loop.
+                            tty.wait_channel().fire(Mask::from_bits(TTY_READABLE));
                             outcome.readable_fired = true;
                         }
                         LdiscInputEffect::SignalFgPgrp(signal) => {

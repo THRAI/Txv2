@@ -390,12 +390,19 @@ fn dispatch_unknown_nr_returns_neg_enosys() {
 // Phase 2b — read / brk / rt_sigprocmask / rt_sigaction.
 // ---------------------------------------------------------------------------
 
-/// `read(0, buf, 64)` against a console with no buffered input
-/// resolves through `tty::execution::step_read`'s `Blocked` shape,
-/// which the dispatcher translates to `Done(0)` per the Trio plan
-/// §"Open questions #5" non-blocking-slice semantic.
+/// `read(0, buf, len)` against a console with no buffered input
+/// blocks until `tty::execution::step_ingest` queues a byte and fires
+/// the registered `wait_carrier` channel, then returns the byte.
+///
+/// Pre-ELF Phase 5 (item 9): the dispatcher used to short-circuit
+/// `Blocked` to `Done(0)` per the trio's non-blocking slice. With the
+/// IRQ-driven UART RX path landed, the dispatcher actually awaits
+/// the wait carrier and re-polls. The test models the IRQ side by
+/// calling `step_ingest` directly between manual `Future::poll`
+/// invocations — same effect a real `uart_rx_irq_handler` call has
+/// from inside the trap shell.
 #[test]
-fn dispatch_read_zero_when_console_empty_returns_zero() {
+fn dispatch_read_blocks_until_tty_input_then_returns_byte() {
     let _setup = setup();
     let _ops = install_capturing_console();
 
@@ -405,17 +412,66 @@ fn dispatch_read_zero_when_console_empty_returns_zero() {
     let console: Cap<OpenFile> = tx_fs::devfs::open_console_for_init();
     proc_cap.set_fd(0, Some(console));
 
+    // Resolve the registered console TTY so the test can drive
+    // step_ingest directly. `tty::project::resolve_devfs_alias` keeps
+    // the alias-to-cap mapping that `register_console_alias`
+    // populated.
+    let console_tty = tx_subsystems::tty::project::resolve_devfs_alias(b"console")
+        .expect("console alias must resolve after install_capturing_console");
+
     let ctx = make_ctx(proc_cap, thread);
     let mut buf = [0u8; 64];
     let req = SyscallRequest::new(NR_READ, [0, buf.as_mut_ptr() as u64, 64, 0, 0, 0]);
 
-    let result = block_on(dispatch(req, &ctx));
+    // Manually drive the future: first poll should observe an empty
+    // TTY input queue and return Pending after registering a waker
+    // on the wait-carrier `Channel`.
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut cx = Context::from_waker(&waker);
+    let fut = dispatch(req, &ctx);
+    let mut pinned = Box::pin(fut);
 
-    assert_eq!(
-        result,
-        SyscallResult::Return(0),
-        "empty TTY input queue should surface as Done(0) per non-blocking slice"
+    let first = pinned.as_mut().poll(&mut cx);
+    assert!(
+        matches!(first, Poll::Pending),
+        "blocked read on empty TTY should park; got {first:?}"
     );
+
+    // Now drive the IRQ side: ingest a complete line. The boot
+    // console TTY runs in cooked mode (ICANON), so a newline is
+    // required to flush bytes into the user-visible input queue.
+    // step_ingest fires both the BIF-5 readiness wire AND the
+    // registered wait-carrier channel, so the next poll should
+    // observe the bytes and complete.
+    {
+        let guard = tx_substrate::epoch::guard();
+        let outcome = tx_subsystems::tty::execution::step_ingest(&console_tty, b"X\n", &guard);
+        assert!(
+            matches!(outcome, StepOutcome::Done(_)),
+            "step_ingest should accept the bytes; got {outcome:?}"
+        );
+    }
+
+    // Spin-poll a bounded number of times so a stuck future fails
+    // fast rather than hanging the test runner.
+    let mut result = Poll::Pending;
+    for _ in 0..256 {
+        result = pinned.as_mut().poll(&mut cx);
+        if let Poll::Ready(value) = result {
+            assert_eq!(
+                value,
+                SyscallResult::Return(2),
+                "read should return the ingested line (X + LF)",
+            );
+            assert_eq!(
+                &buf[..2],
+                b"X\n",
+                "the ingested bytes should land in the user buffer",
+            );
+            return;
+        }
+    }
+    panic!("dispatch did not resolve after step_ingest woke the carrier; last poll = {result:?}");
 }
 
 /// `brk(0)` reports the current break, then `brk(>current)` grows,

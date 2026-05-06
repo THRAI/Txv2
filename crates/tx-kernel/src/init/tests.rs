@@ -193,6 +193,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_mount_id_counter();
     tx_subsystems::cross_crate_test_support::reset_dev_id_counter();
     crate::init::reset_boot_state_for_test();
+    crate::irq::reset_dispatch_table_for_test();
     CONSOLE_CAPTURED_LEN.store(0, Ordering::Release);
     CONSOLE_CAPTURED_BYTES
         .lock()
@@ -213,6 +214,13 @@ fn bootstrap_init() {
 fn drive_boot_wiring() {
     bootstrap_init();
     CoreInit::<TestPlatform>::register_console_hardware();
+    // Pre-ELF Phase 5 (item 9): mirrors the production boot order.
+    // `TestPlatform`'s `IrqIf` impl uses the trait-default
+    // `UART_IRQ = 0`, which `install_irq_handlers` accepts without
+    // wiring an actual unmask (TestPlatform's `unmask` is a no-op).
+    // The dispatch table still gets published, exercising the
+    // platform-publication path in the boot-wiring smoke.
+    CoreInit::<TestPlatform>::install_irq_handlers();
     CoreInit::<TestPlatform>::mount_rootfs_tmpfs();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();

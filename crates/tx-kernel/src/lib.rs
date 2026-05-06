@@ -5,6 +5,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod init;
+pub mod irq;
 pub mod thread_future;
 pub mod trap;
 pub mod trap_handoff;
