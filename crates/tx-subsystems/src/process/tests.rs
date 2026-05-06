@@ -994,3 +994,33 @@ fn step_exit_group_does_not_set_terminating_signal() {
     assert_eq!(proc_cap.exit_status(), Some(ExitStatus::Exited(7)));
     assert_eq!(proc_cap.terminating_signal(), None);
 }
+
+#[test]
+fn process_payload_aspace_atomic_replace_returns_previous_cap() {
+    // Per `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`,
+    // exec swaps `ProcessPayload.aspace` atomically and the previous
+    // `Cap<AddressSpace>` is returned for EBR-deferred drop. Verify
+    // the slot semantics: after `replace_aspace(new)`, `aspace_cap`
+    // returns the new `Cap`, and the previous `Cap` is the value we
+    // started with.
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let initial = proc_cap.aspace_cap().expect("alive aspace");
+    let initial_key = initial.key();
+
+    let replacement = fresh_aspace();
+    let replacement_key = replacement.key();
+
+    let prev = proc_cap
+        .replace_aspace(replacement)
+        .expect("replace returns previous");
+
+    assert_eq!(prev.key(), initial_key, "replace returns the original");
+    let post = proc_cap.aspace_cap().expect("still alive");
+    assert_eq!(
+        post.key(),
+        replacement_key,
+        "live aspace is the replacement"
+    );
+    assert_ne!(post.key(), initial_key);
+}

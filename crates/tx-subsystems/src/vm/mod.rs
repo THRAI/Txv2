@@ -11,6 +11,7 @@ pub mod checks;
 mod execution;
 mod pmap;
 pub mod project;
+pub mod scripts;
 mod structure;
 
 #[cfg(test)]
@@ -21,6 +22,10 @@ mod tests;
 
 pub use execution::{MadviseAdvice, MapReservation, MapReserveResult};
 pub use pmap::{PmapMappingSnapshot, PmapPublishOutcome, PmapStats, VmPmapError};
+pub use scripts::{
+    build_aspace_from_image, populate_detached_user_range, BssTail, ImagePlan, LoadSegment,
+    ScriptError, SegmentFlags, USER_STACK_INITIAL_RESERVATION, USER_STACK_TOP_DEFAULT,
+};
 pub use structure::{
     AccessMode, AcquirePairResult, AcquireResult, AddressSpace, AddressSpaceStats, LockMode,
     MapPlacement, PendingWriter, Prot, RangeGuard, RangeGuardPair, RangeLock, UserPage,

@@ -101,6 +101,20 @@ impl<T> AtomicSlot<T> {
     {
         self.inner.lock().clone()
     }
+
+    /// Borrow-style snapshot: clone the slot's current value if any.
+    /// Equivalent to [`Self::snapshot`] but named to match the canonical
+    /// `AtomicSlot::load(&guard)` shape that future zone-aware slots
+    /// will expose. The guard is unused today (the staging
+    /// implementation is `SpinMutex`-backed) but reserved so callers
+    /// already pass it through; that lets the future swap to a real
+    /// EBR-aware slot drop the staging body without source changes.
+    pub fn load(&self) -> Option<T>
+    where
+        T: Clone,
+    {
+        self.snapshot()
+    }
 }
 
 // ---------------------------------------------------------------------------

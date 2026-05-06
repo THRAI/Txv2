@@ -34,7 +34,7 @@ use tx_substrate::SpinMutex;
 use crate::cred::{Cred, Gid, Uid};
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::ThreadIdentity;
-use crate::tty::structure::identity::TtyIdentity;
+use crate::tty::structure::identity::{AtomicSlot, TtyIdentity};
 use crate::vfs::{DEntry, OpenFile};
 use crate::vm::AddressSpace;
 
@@ -209,8 +209,29 @@ impl ProcessIdentity {
 
     /// Snapshot the current address space `Cap`, if the process is
     /// alive. Returns `None` for zombies.
+    ///
+    /// Loads from the per-payload `AtomicSlot<Cap<AddressSpace>>`
+    /// (`txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`). The
+    /// slot is always populated for live payloads — initial state is
+    /// installed by `bootstrap_init_process` / `step_fork`, and exec's
+    /// phase 6 store keeps the slot inhabited at all times. A `None`
+    /// here therefore strictly means "the payload itself is gone"
+    /// (zombie), never "the slot is empty on a live payload".
     pub fn aspace_cap(&self) -> Option<Cap<AddressSpace>> {
-        self.payload.lock().as_ref().map(|p| p.aspace.clone())
+        self.payload.lock().as_ref().map(|p| p.aspace_cap())
+    }
+
+    /// Replace this process's address space with `new` and return the
+    /// previous `Cap` so the caller can defer-drop it via EBR. Per
+    /// `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY` this
+    /// is the single irreversible exec store: the new aspace becomes
+    /// observable to every concurrent fault / VM lookup the moment
+    /// this returns. Returns `None` for zombies (no payload — caller
+    /// drops `new` itself).
+    pub fn replace_aspace(&self, new: Cap<AddressSpace>) -> Option<Cap<AddressSpace>> {
+        let payload_guard = self.payload.lock();
+        let payload = payload_guard.as_ref()?;
+        payload.aspace.swap(Some(new))
     }
 
     /// Snapshot the `Cap<OpenFile>` registered at fd `idx` on this
@@ -380,7 +401,19 @@ pub struct TargetProcCred {
 /// (`rlimits`, `fd_table`) land in follow-up passes without changing
 /// the existing surface.
 pub struct ProcessPayload {
-    pub(crate) aspace: Cap<AddressSpace>,
+    /// Authoritative address-space slot for this process. Per Open Q #2
+    /// (DECIDED 2026-05-06, `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`),
+    /// exec swaps this slot atomically: phase 6 stores the freshly built
+    /// detached `Cap<AddressSpace>` while every other thread of the
+    /// process group has already been zombified, and the previous
+    /// `Cap` is returned for EBR-deferred drop. The `AtomicSlot`
+    /// shape mirrors `cwd` and `current_payload` (the staging slot
+    /// idiom). Initial state is always populated by
+    /// `bootstrap_init_process` / `step_fork`; readers (the syscall
+    /// dispatcher, the trap-shell aspace resolution, the page-fault
+    /// driver) snapshot via `process.aspace_cap()` which clones the
+    /// inner `Cap` out of the slot.
+    pub(crate) aspace: AtomicSlot<Cap<AddressSpace>>,
     pub(crate) threads: SpinMutex<Vec<Cap<ThreadIdentity>>>,
     /// Per-process signal-action table. Day-1 records dispositions
     /// installed via `step_sigaction`; the delivery step that consults
@@ -451,6 +484,18 @@ pub struct ProcessPayload {
 }
 
 impl ProcessPayload {
+    /// Snapshot the current address-space `Cap` out of the
+    /// `AtomicSlot<Cap<AddressSpace>>` slot. Panics if the slot is
+    /// empty — by construction the initial state is always populated
+    /// (`bootstrap_init_process` / `step_fork`) and the only mutator
+    /// is exec's phase 6 store, which atomically swaps to a fresh
+    /// `Cap` and never leaves the slot empty.
+    pub fn aspace_cap(&self) -> Cap<AddressSpace> {
+        self.aspace
+            .load()
+            .expect("ProcessPayload.aspace slot is always populated")
+    }
+
     /// Borrow the per-process action table.
     pub fn sig_actions(&self) -> &SigActionTable {
         &self.sig_actions

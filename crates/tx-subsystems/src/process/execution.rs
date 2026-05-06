@@ -253,7 +253,7 @@ pub fn step_fork<P: PmapIf>(
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
         (
-            payload.aspace.clone(),
+            payload.aspace_cap(),
             payload.cred(),
             payload.cwd(),
             payload.snapshot_fds(),
@@ -710,11 +710,14 @@ fn sign_process_payload(
     brk_base: u64,
     current_brk: u64,
 ) -> Result<tx_substrate::zone::PayloadCap<ProcessPayload>, ZoneError> {
+    use crate::tty::structure::AtomicSlot;
+    let aspace_slot: AtomicSlot<Cap<AddressSpace>> = AtomicSlot::empty();
+    aspace_slot.store(Some(aspace));
     let res = zone::reserve_for::<ProcessPayload>()?;
     let cap = zone::sign_for(
         res,
         ProcessPayload {
-            aspace,
+            aspace: aspace_slot,
             threads: SpinMutex::new(threads),
             sig_actions: SigActionTable::new(),
             group_pending: PendingSignalQueue::new(),
