@@ -73,7 +73,11 @@
       "docs/progress/plans/2026-05-05-trio-trap-syscall-tmpfs-devfs.md",
       "docs/progress/decisions/2026-05-06-trio-trap-syscall-tmpfs-devfs.md",
       "docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md",
-      "docs/progress/decisions/2026-05-06-pre-elf-runtime-completion.md"
+      "docs/progress/decisions/2026-05-06-pre-elf-runtime-completion.md",
+      "docs/progress/plans/2026-05-06-elf-loader-and-execve.md",
+      "docs/progress/research/2026-05-06-execve-and-elf-loader-scaffolding.md",
+      "docs/progress/research/2026-05-06-musl-ltp-execve-coverage.md",
+      "docs/progress/decisions/2026-05-06-elf-loader-and-execve.md"
     ],
     "external_refs": []
   },
@@ -333,7 +337,7 @@
     {
       "id": "exec-loader-and-detached-aspace",
       "title": "Build exec loader and detached AddressSpace construction",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "vfs-device-and-tty-init",
         "page-backed-and-reclaim",
@@ -348,12 +352,12 @@
         "cargo test -p tx-kernel exec",
         "cargo xtask ci"
       ],
-      "notes": "AddressSpace::exec_aspace teardown landed under VM/PageBacked v1 (exec-aspace step), but the exec loader itself is unbuilt: crates/tx-scripts/src/lib.rs is still an 8-line stub. Implement static-ELF image planning, targeted file reads, detached AddressSpace construction, stack/auxv population, process Frame vm replacement at the point of no return, and ThreadRuntime trap-context install. Keep fallible work before exec's PoNR."
+      "notes": "AddressSpace::exec_aspace teardown landed under VM/PageBacked v1. The full exec loader landed across 7 commits on feat/elf-loader-and-execve (3709750/6167898 chores; c67c970 Wave 1 = page_backed::read_exact_at + vm::scripts::build_aspace_from_image + vm::scripts::populate_detached_user_range + ImagePlan/LoadSegment/BssTail + ProcessPayload.aspace flip to AtomicSlot + build_initial_user_stack with 6-entry musl auxv + goblin parser binding; 5bdfc63 Wave 2 = CLOEXEC bitmap + fcntl(F_SETFD) arm + step_close_cloexec_fds/step_reset_signal_dispositions_for_exec/step_install_brk_for_exec; ecc1a86 Wave 3 = exec_script orchestrating EXEC_v1's 8 phases with EXEC-PONR enforced; b6fd6aa Wave 4 = NR_EXECVE=221 syscall arm + SyscallResult::ExecCommitted + thread_future handling; d9548b8 Wave 5 = tmpfs FsOps::materialise_rnode override + hand-encoded RV64 ELF fixture (218 bytes) + run_bootstrap_exec_for_init wired into init.rs). Plan B writeback discipline preserved throughout. Step delivered. Remaining for downstream: ET_DYN/PIE binaries, PT_INTERP/dynamic linking, real PT_TLS handling beyond what musl self-installs, setuid/setgid + DAC, shebang #!, ETXTBSY, fork/clone/wait4 chains, real initramfs unpack, VDSO. All explicitly out of scope for this slice."
     },
     {
       "id": "first-userspace-entry",
       "title": "Replace kernel_main shutdown with init process spawn and first return_to_userspace",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "syscall-dispatch-and-ast-loop",
         "exec-loader-and-detached-aspace",
@@ -368,7 +372,7 @@
         "cargo xtask qemu --target rv64-qemu --profile busybox --expect-sentinel",
         "cargo xtask ci"
       ],
-      "notes": "Boot wiring already calls bootstrap_init_process and emits a process:init:ok sentinel (commit b50a472, decision 2026-05-05-boot-wiring.md). Pre-ELF Phase 7 (commit 69a3efd) replaced kernel_main's shutdown path with run_userspace_reactor_loop: builds PerHartSlotted::<P, _>::new(payload, run_thread::<P>(thread, payload)), submits via BOOT_REACTOR.with(|r| r.submit_task(...)), drives the BSP hart-loop via step_boot_reactor_once until init.is_zombie(), then emits :userspace:exited:N (where N is ExitStatus::wait_status_word()) before system_off. :boot:ok still emits unchanged from boot_sentinel. Production loop is wired and ready; on RV64 boards with no userspace binary loaded yet the loop parks in WFI. Remaining for this step: load a real ELF into init's address space and seed payload.saved_user_context with the binary's entry point + sp — that is exec-loader-and-detached-aspace's responsibility (next slice). Once the loader lands, the loop will pick up the binary on the first enter_userspace_with_context call."
+      "notes": "Boot wiring already calls bootstrap_init_process and emits a process:init:ok sentinel (commit b50a472, decision 2026-05-05-boot-wiring.md). Pre-ELF Phase 7 (commit 69a3efd) replaced kernel_main's shutdown path with run_userspace_reactor_loop: builds PerHartSlotted::<P, _>::new(payload, run_thread::<P>(thread, payload)), submits via BOOT_REACTOR.with(|r| r.submit_task(...)), drives the BSP hart-loop via step_boot_reactor_once until init.is_zombie(), then emits :userspace:exited:N before system_off. ELF Loader Wave 5 (commit d9548b8) added run_bootstrap_exec_for_init between bind_init_cwd_and_root and boot_sentinel: registers a built-in static RV64 ELF fixture into tmpfs at /init, drives exec_script via block_on, panics with :bootstrap-exec:fail board sentinel on failure (Open Q #3 DECIDED). On Ok the production loop picks up the new image on the first enter_userspace_with_context call; the fixture issues write(1, \"hello\\n\", 6) + exit_group(0) and the kernel emits :userspace:exited:0 before system_off. Boot trace order: :process:init:ok -> :tty:console:ok -> :irq:install:ok -> :mount:rootfs:tmpfs:ok -> :mount:devfs:ok -> :devfs:console:alias:ok -> :init:cwd:ok -> [bootstrap-exec runs] -> :boot:ok -> :userspace:exited:0. Step delivered. Future work: replace the hand-encoded fixture with a real initramfs cpio unpack + a real init binary loaded from disk."
     },
     {
       "id": "smp-runtime-and-remote-coordination",
@@ -415,7 +419,7 @@
     {
       "command": "cargo xtask progress validate",
       "status": "passed",
-      "notes": "Re-run on 2026-05-06 after pre-ELF wave 1-5 landed in 7 phase commits on feat/pre-elf-runtime (04edaa6 wave 1 minors+walker; e757bc0 wave 2 id allocators+register_mount; abc9fb8 wave 3 task wrapper+entry shim+HAL hook; b49b302 wave 4 page-fault async; 3cb95d6 wave 4 IRQ dispatch+UART RX; 69a3efd wave 5 production smoke+kernel_main reactor loop). Three long-term steps promoted to complete: process-and-thread-runtime-core, syscall-dispatch-and-ast-loop, vfs-device-and-tty-init. 24+ ok."
+      "notes": "Re-run on 2026-05-06 after the ELF loader + execve slice landed in 7 phase commits on feat/elf-loader-and-execve (c67c970 wave 1 VM surface+stack+goblin; 5bdfc63 wave 2 CLOEXEC+P1/P2/P3; ecc1a86 wave 3 exec_script EXEC_v1 8 phases; b6fd6aa wave 4 NR_EXECVE+ExecCommitted; d9548b8 wave 5 bootstrap exec+fixture+smoke). Two more long-term steps promoted to complete: exec-loader-and-detached-aspace, first-userspace-entry. Cumulative steps complete after the ELF slice: baseline-h3-sentinel-kernel-main, coreinit-spine, zone-epoch-bus-foundation, reactor-and-round-robin-scheduler, vm-address-space-core, page-backed-and-reclaim, process-and-thread-runtime-core, syscall-dispatch-and-ast-loop, vfs-device-and-tty-init, exec-loader-and-detached-aspace, first-userspace-entry — 11 of 16. 24+ ok."
     },
     {
       "command": "cargo xtask lint docs",
@@ -436,10 +440,10 @@
   ],
   "blockers": [
     "Pre-ELF Phase 2 (commit abc9fb8) added TrapIf::enter_userspace_with_context as the portable HAL entry hook; RawTrapFrame as a portable HAL surface and TrapFrameMut direct-write are still not exposed at the trait level (they live as RV64 board internals).",
-    "Pre-ELF Phase 2 shipped the production thread_future skeleton (run_thread + PerHartSlotted + prepare_userspace_entry_payload) and Phase 7 wired kernel_main into the production reactor loop; with no ELF loader, the loop parks in WFI on real boards.",
-    "tx-shims linux_syscall::dispatch covers 8 entries (trio Phase 2a/2b); page-fault async dispatch landed in pre-ELF Phase 3; IRQ-driven blocking read landed in pre-ELF Phase 5. Real per-task AST plumbing (signal-handler frame setup beyond EnterUserspace) is the remaining piece; uses empty-batch AstBatch::default() shortcut today.",
-    "tx-scripts (exec loader) is still an empty stub — this is the immediate next slice that unlocks first userspace.",
-    "tmpfs + devfs mounted at boot via the trio + walker via pre-ELF Phase 4 + register_mount + materialise_rnode wire-up via pre-ELF Phase 6; /dev/console resolves end-to-end through the walker now."
+    "ELF Loader Wave 5 (commit d9548b8) wired the full bootstrap exec; kernel_main now drives a static-musl-shape ELF fixture through write+exit_group end-to-end. First userspace entry delivered.",
+    "tx-shims linux_syscall::dispatch covers 9 entries (the trio's 8 + NR_EXECVE=221) plus NR_FCNTL=25 with F_GETFD/F_SETFD (Wave 2 of ELF). LTP execve* day-1 MVP passes 3/6 outright + 4/6 sub-cases of execve03; remaining execve02/03/04/05 need DAC + setuid + ETXTBSY + fork. Real per-task AST plumbing (signal-handler frame setup) is the remaining piece for SIGNAL_v1 §15.2's full surface; uses empty-batch AstBatch::default() shortcut today.",
+    "tx-scripts now ships exec_script + goblin parser + stack/auxv builder; future filesystems and dynamic-linking surface (PT_INTERP, ET_DYN/PIE, fork/clone/wait4 chains) are the next-slice surface.",
+    "tmpfs/devfs mounted at boot + walker resolves /dev/console + tmpfs's FsOps::materialise_rnode produces PageBacked rnodes for regular files (commit d9548b8) — the canonical surface for executing a tmpfs-backed binary."
   ],
   "handoff": {
     "needed": false,
