@@ -32,7 +32,7 @@ use tx_subsystems::page_backed::{
 };
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, FsOps, InlineName, InodeKind, InodeMeta,
-    MountOutput, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, VFS_NAME_MAX,
+    MountOutput, RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, VFS_NAME_MAX,
 };
 
 /// Mode for the tmpfs root directory.
@@ -620,6 +620,66 @@ impl FsOps for Tmpfs {
         match &inode.payload {
             TmpfsPayload::Symlink(bytes) => StepOutcome::Done(bytes.clone().into_boxed_slice()),
             _ => StepOutcome::Err(Errno::EINVAL),
+        }
+    }
+
+    /// Materialise a `Cap<RNode>` for a non-directory, non-symlink
+    /// tmpfs inode.
+    ///
+    /// Pre-ELF Phase 6 (item 7) introduced the
+    /// `FsOps::materialise_rnode` hook with a default `ENOSYS`
+    /// implementation; devfs already overrides for `CharDevice →
+    /// StructBacked { Tty }`. Phase 7 of the ELF-loader plan adds the
+    /// tmpfs override so the VFS walker can resolve regular files
+    /// (e.g. `/init`) to a `RNodeBacking::PageBacked { pc }` over the
+    /// inode's existing `Cap<PageContainer>`. Without this override
+    /// the walker emits `ENOSYS` at the terminal regular-file
+    /// component, and `exec_script` cannot reach a page-backed view
+    /// of the file's bytes.
+    ///
+    /// Backing returned per inode kind:
+    /// - `Regular` → `RNodeBacking::PageBacked { pc: container.clone() }`.
+    ///   The container is the same `Cap<PageContainer>` constructed
+    ///   in `create_inode`; cloning the Cap shares the page-backing
+    ///   between the file's RNode and its inode payload, so writes
+    ///   through the FsPageBacking surface and reads through
+    ///   `OpenFile::step_read` (or `read_exact_at` from
+    ///   `exec_script`) observe the same pages.
+    /// - `Directory` and `Symlink` are handled inline by the walker
+    ///   (`materialise_child_rnode` in
+    ///   `crates/tx-subsystems/src/vfs/walker.rs`); reaching this
+    ///   arm with one of those kinds is a backend bug. Return
+    ///   `EISDIR` / `EINVAL` respectively to mirror the Linux
+    ///   `inode_operations.lookup` shape.
+    /// - Block / FIFO / Socket: not supported by tmpfs today; return
+    ///   `ENOSYS` so callers fall through cleanly until those kinds
+    ///   acquire concrete materialisers.
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>> {
+        let state = self.state.lock();
+        let Some(inode) = state.inodes.get(&fs_object_id) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let backing = match &inode.payload {
+            TmpfsPayload::RegularFile { container, .. } => RNodeBacking::PageBacked {
+                pc: container.clone(),
+            },
+            // The walker handles Directory and Symlink inline; this
+            // arm should not be reached for those kinds. Return a
+            // POSIX-shaped errno rather than panicking so a backend
+            // misroute surfaces as a recoverable error.
+            TmpfsPayload::Directory(_) => return StepOutcome::Err(Errno::EISDIR),
+            TmpfsPayload::Symlink(_) => return StepOutcome::Err(Errno::EINVAL),
+        };
+        drop(state);
+
+        match RNode::new_cap(fs_object_id, meta, backing) {
+            Ok(rnode) => StepOutcome::Done(rnode),
+            Err(_) => StepOutcome::Err(Errno::ENOMEM),
         }
     }
 }

@@ -8,7 +8,9 @@ use alloc::sync::Arc;
 
 use tx_subsystems::execution::{Errno, StepOutcome};
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::vfs::{Credential, DirCursor, FsObjectId, FsOps, InodeKind, S_IFMT};
+use tx_subsystems::vfs::{
+    Credential, DirCursor, FsObjectId, FsOps, InodeKind, RNodeBacking, S_IFMT,
+};
 
 use super::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 
@@ -343,5 +345,113 @@ fn tmpfs_rmdir_nonempty_returns_enotempty() {
     assert_eq!(
         tmpfs.rmdir(TMPFS_ROOT_OBJECT_ID, b"d", dir_id, &guard),
         StepOutcome::Done(())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `materialise_rnode` override tests (Phase 7 of the ELF-loader plan).
+//
+// The override produces an `RNodeBacking::PageBacked { pc }` for
+// regular files so the VFS walker can resolve `/init` to a
+// page-backed RNode the exec script accepts. The default `ENOSYS`
+// would otherwise break the walker → exec_script bridge for tmpfs's
+// regular files.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let cred = Credential::default();
+
+    let (file_id, file_meta) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"init", 0o100755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode failed: {other:?}"),
+        };
+
+    // The override must produce a Cap<RNode> whose backing is the
+    // file's `Cap<PageContainer>`. We assert through the variant
+    // discriminant; the `Cap<PageContainer>::key` (or any other
+    // identity check) would suffice but the variant alone is the
+    // contract Phase 7 needs.
+    let rnode = match FsOps::materialise_rnode(&*tmpfs, file_id, file_meta, &guard) {
+        StepOutcome::Done(rnode) => rnode,
+        other => panic!("materialise_rnode for regular file: {other:?}"),
+    };
+    match rnode.backing() {
+        RNodeBacking::PageBacked { pc } => {
+            // Sanity: the container's `page_count` matches tmpfs's
+            // static cap (`TMPFS_FILE_PAGE_CAP = 1024`). `size_bytes`
+            // initialises to `page_count * USER_PAGE_SIZE` (the
+            // PageContainer's capacity); inode-visible size lives on
+            // `InodeMeta::size`, not the container, so we don't pin
+            // the byte-size here. The shared-Cap contract is the
+            // important part: cloning the inode's container into the
+            // RNode means writes via `FsPageBacking` and reads via
+            // `OpenFile::step_read` / `read_exact_at` see the same
+            // underlying pages.
+            assert_eq!(pc.page_count(), 1024, "tmpfs file page-cap shape");
+        }
+        other => panic!("expected PageBacked backing for regular file, got {other:?}"),
+    }
+    // RNode meta round-trips the input meta.
+    assert_eq!(rnode.fs_object_id(), file_id);
+    assert_eq!(rnode.meta().kind(), InodeKind::Regular);
+}
+
+#[test]
+fn tmpfs_materialise_rnode_for_directory_returns_eisdir() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+
+    // The walker handles Directory inline; reaching the override
+    // with a directory inode is a backend bug. The override returns
+    // `EISDIR` rather than panicking so a misroute surfaces as a
+    // recoverable error.
+    let meta = match tmpfs.load_inode_meta(TMPFS_ROOT_OBJECT_ID, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load_inode_meta(root): {other:?}"),
+    };
+    assert_eq!(
+        FsOps::materialise_rnode(&*tmpfs, TMPFS_ROOT_OBJECT_ID, meta, &guard),
+        StepOutcome::Err(tx_subsystems::execution::Errno::EISDIR)
+    );
+}
+
+#[test]
+fn tmpfs_materialise_rnode_for_symlink_returns_einval() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let cred = Credential::default();
+
+    let (link_id, link_meta) =
+        match tmpfs.symlink(TMPFS_ROOT_OBJECT_ID, b"alias", b"target", &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("symlink failed: {other:?}"),
+        };
+
+    // Walker resolves Symlink inline via `read_link`; the override
+    // surface returns `EINVAL` on the unexpected re-entry path,
+    // mirroring the Linux `inode_operations.lookup` shape for non-
+    // page-backed kinds tmpfs intentionally rejects here.
+    assert_eq!(
+        FsOps::materialise_rnode(&*tmpfs, link_id, link_meta, &guard),
+        StepOutcome::Err(tx_subsystems::execution::Errno::EINVAL)
     );
 }
