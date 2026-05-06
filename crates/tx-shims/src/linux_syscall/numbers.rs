@@ -82,3 +82,82 @@ pub const FD_CLOEXEC: i32 = 1;
 /// `OpenFileFlags { cloexec: true, ... }` from the user-visible bit
 /// can share one canonical constant.
 pub const O_CLOEXEC: u32 = 0o2000000;
+
+// ---------------------------------------------------------------------
+// Wave 2 of the fork/clone/wait4 slice — Part 2 (NR_CLONE) +
+// Part 4 (process-tree introspection arms) + Part 5 (musl-startup
+// stubs). NR_WAIT4 is intentionally absent — it lives in Wave 3 with
+// the blocking-wait scaffolding. See
+// `docs/progress/plans/2026-05-06-fork-clone-wait4.md`.
+// ---------------------------------------------------------------------
+
+/// `clone(flags, stack, parent_tidptr, tls, child_tidptr)`.
+/// Linux RV64 generic ABI `__NR_clone`.
+///
+/// Wave 2 of the fork/clone/wait4 slice ships only the bare-`SIGCHLD`
+/// shape that musl's `_Fork.c:35` issues
+/// (`__syscall(SYS_clone, SIGCHLD, 0)`). Anything else (`CLONE_VM`,
+/// `CLONE_VFORK`, the pthread_create flag set, non-zero stack)
+/// returns `-EINVAL`. See `txdoc:PROCESS-CLONE-FLAGS` /
+/// `txdoc:PROCESS-CLONE-FLAG-SUPPORT-V1-1`.
+pub const NR_CLONE: u64 = 220;
+
+/// Linux signal number for `SIGCHLD` (matches the trio's
+/// `signal::Signum::SIGCHLD` encoding). Used as the termination-signal
+/// low-byte of `clone()`'s `flags` argument; bare-`SIGCHLD` is the
+/// only flag combination Wave 2's `sys_clone` accepts.
+pub const SIGCHLD: u64 = 17;
+
+/// `getppid()`. Linux generic ABI `__NR_getppid`. Wraps
+/// `ProcessIdentity::parent_pid()`. Returns `0` (`Pid::RESERVED`)
+/// for orphans (init's pid 1 has no parent). Real Linux returns
+/// init's pid for orphans; the trio's `sever_children` reparents to
+/// init when init is registered, so under normal flows the difference
+/// is invisible.
+pub const NR_GETPPID: u64 = 173;
+
+/// `setpgid(pid, pgid)`. Linux generic ABI `__NR_setpgid`. Wraps
+/// `step_setpgid`. The trio's day-1 step only supports
+/// `pid == self` and `pgid == self.pid` (creates a fresh process
+/// group inside the caller's session); cross-process and joining an
+/// existing pgid return `-EPERM` per Linux semantics.
+pub const NR_SETPGID: u64 = 154;
+
+/// `getpgid(pid)`. Linux generic ABI `__NR_getpgid`. Returns the
+/// process group id of the process with pid `pid`, or the caller's
+/// pgid if `pid == 0`. Day-1 only supports `pid == 0` /
+/// `pid == self.pid`; cross-pid lookup is deferred (no pid → Cap
+/// resolver yet).
+pub const NR_GETPGID: u64 = 155;
+
+/// `getpgrp()`. Linux **legacy** glibc-only call; the RV64 generic
+/// ABI does not ship this number, but glibc emulates `getpgrp()` as
+/// `getpgid(0)`. We carve out the constant for grep-stability and
+/// dispatch returns `-ENOSYS` deliberately. musl uses `getpgid(0)`
+/// directly and never issues this number.
+pub const NR_GETPGRP: u64 = 81;
+
+/// `getsid(pid)`. Linux generic ABI `__NR_getsid`. Returns the session
+/// id of the process with pid `pid`, or the caller's sid if
+/// `pid == 0`. Day-1 only supports `pid == 0` / `pid == self.pid`.
+pub const NR_GETSID: u64 = 156;
+
+/// `setsid()`. Linux generic ABI `__NR_setsid`. Wraps `step_setsid` —
+/// creates a fresh `Session` + leader `ProcessGroup` rooted at the
+/// caller's pid. Day-1 does not enforce Linux's "already a process
+/// group leader → -EPERM" rule (follow-up).
+pub const NR_SETSID: u64 = 157;
+
+/// `set_tid_address(tidptr)`. Linux generic ABI
+/// `__NR_set_tid_address`. Wave 2 ships a stub-success arm that
+/// returns the calling thread's tid and ignores `tidptr` — the real
+/// semantic (futex wakeup on thread exit via `clear_child_tid`) is
+/// deferred to the pthread/futex slice (`TODO(phase-tls)`).
+pub const NR_SET_TID_ADDRESS: u64 = 96;
+
+/// `set_robust_list(head, len)`. Linux generic ABI
+/// `__NR_set_robust_list`. Wave 2 ships a stub-success arm that
+/// returns `0` and ignores `head`/`len` — the real semantic
+/// (futex robust-list registration) is deferred to the futex slice
+/// (`TODO(phase-futex)`).
+pub const NR_SET_ROBUST_LIST: u64 = 99;

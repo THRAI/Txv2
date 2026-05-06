@@ -48,7 +48,11 @@ use tx_reactor::userspace::SyscallRequest;
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_substrate::zone::Cap;
 use tx_subsystems::execution::{Errno, StepOutcome};
-use tx_subsystems::process::{step_exit_group, ExitStatus, ProcessIdentity};
+use tx_subsystems::process::{
+    seed_child_leader_context, step_exit_group, step_fork, step_setpgid, step_setsid, ExitStatus,
+    Pgid, ProcessIdentity, SetpgidError, SetsidError,
+};
+use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
     step_sigaction, SigDisposition, SigDispositionChange, SignalMask, Signum,
 };
@@ -65,8 +69,10 @@ pub mod numbers;
 mod tests;
 
 pub use numbers::{
-    FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPID,
-    NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_WRITE, O_CLOEXEC,
+    FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL,
+    NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETSID, NR_READ, NR_RT_SIGACTION,
+    NR_RT_SIGPROCMASK, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WRITE,
+    O_CLOEXEC, SIGCHLD,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -124,6 +130,23 @@ const EINVAL_VALUE: i32 = 22;
 /// Used by `rt_sigprocmask` / `rt_sigaction` when the target thread /
 /// process is a zombie (no payload to install state on).
 const ESRCH_VALUE: i32 = 3;
+/// Linux generic ABI errno value for "operation not permitted" (`EPERM`).
+/// Used by `setpgid` / `setsid` when the caller is not allowed to
+/// perform the requested process-group / session change (Wave 2's
+/// day-1 surface only supports the self-pid / self-pgid form;
+/// cross-process and join-existing-pgid map to `-EPERM`).
+const EPERM_VALUE: i32 = 1;
+/// Linux generic ABI errno value for "out of memory" (`ENOMEM`).
+/// Used by `setpgid` / `setsid` when zone allocation fails minting a
+/// fresh `ProcessGroup` / `Session`.
+const ENOMEM_VALUE: i32 = 12;
+/// Linux generic ABI errno value for "resource temporarily
+/// unavailable" (`EAGAIN`). Reserved for `sys_clone` to surface
+/// retriable allocator failures from `step_fork`'s VM-side clone path
+/// (`fork_aspace`'s `WouldBlock`); current `step_fork` only surfaces
+/// `Zone(_)` / `ParentZombie`, but EAGAIN is the canonical Linux
+/// errno for fork's transient-failure case.
+const EAGAIN_VALUE: i32 = 11;
 /// Required sigsetsize per Linux RV64 generic ABI: 8 bytes (a single
 /// `u64` bitset matching `tx_subsystems::signal::SignalMask`'s
 /// internal representation). `rt_sigprocmask` / `rt_sigaction`
@@ -253,6 +276,15 @@ pub async fn dispatch<'a, P: PmapIf>(req: SyscallRequest, ctx: &SyscallCtx<'a>) 
         NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
         NR_FCNTL => sys_fcntl(req.args, ctx),
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
+        nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx),
+        nr if nr == NR_GETPPID => sys_getppid(ctx),
+        nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
+        nr if nr == NR_GETPGID => sys_getpgid(req.args, ctx),
+        nr if nr == NR_GETPGRP => SyscallResult::Error(ENOSYS_VALUE),
+        nr if nr == NR_GETSID => sys_getsid(req.args, ctx),
+        nr if nr == NR_SETSID => sys_setsid(ctx),
+        nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
+        nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -1003,4 +1035,245 @@ fn errno_to_i32(errno: Errno) -> i32 {
         Errno::ESRCH => 3,
         Errno::ESTALE => 116,
     }
+}
+
+// =====================================================================
+// Wave 2 of the fork/clone/wait4 slice — Part 2 (NR_CLONE) +
+// Part 4 (process-tree introspection arms) + Part 5 (musl-startup
+// stubs).
+//
+// NR_WAIT4 is intentionally absent — it lives in Wave 3 with the
+// blocking-wait scaffolding (`exit_port` `WaitToken` await loop). See
+// `docs/progress/plans/2026-05-06-fork-clone-wait4.md`.
+// =====================================================================
+
+/// `clone(flags, stack, parent_tidptr, tls, child_tidptr)`.
+///
+/// Wave 2 of the fork/clone/wait4 slice ships only the bare-`SIGCHLD`
+/// shape musl's `_Fork.c:35` issues
+/// (`__syscall(SYS_clone, SIGCHLD, 0)`):
+///
+/// - `args[0]` (`flags`) **must** equal [`SIGCHLD`] — anything else
+///   (including `SIGCHLD | CLONE_VM`, `CLONE_VFORK`, the
+///   pthread_create flag set, or zero flags) returns `-EINVAL`.
+/// - `args[1]` (`stack`) **must** be `0` — non-zero stack is the
+///   posix_spawn / pthread_create path, deferred.
+/// - `args[2..5]` (`parent_tidptr`, `tls`, `child_tidptr`) are
+///   ignored (they're only meaningful with the CLONE flags we
+///   reject).
+///
+/// On success:
+/// 1. The parent's `saved_user_context` is read off the calling
+///    thread's payload (a kernel invariant — the trap shell stored it
+///    at trap entry per Plan B). `None` here is a kernel-bug panic
+///    with the stable `:clone:no-context` sentinel (decided 2026-05-06
+///    open Q #2).
+/// 2. `step_fork::<P>` mints a child `Cap<ProcessIdentity>` and a
+///    leader `Cap<ThreadIdentity>` (the leader is at index 0 of the
+///    new process's thread list per `step_fork`'s post-condition).
+/// 3. `seed_child_leader_context` stamps the child leader's
+///    `saved_user_context` with the parent's GPRs except
+///    `regs[10] = 0` (RV64 a0) and `pc + 4` (skip past `ecall`).
+/// 4. `reactor_submit::submit_child_thread` hands the child's
+///    leader-thread future to the kernel-side reactor seam (installed
+///    at boot by `tx-kernel`'s `CoreInit::install_reactor_submit_seam`).
+///    Reaching the seam without an installer is a kernel-invariant
+///    violation — the seam panics with `:clone:no-reactor-seam`.
+/// 5. The parent's syscall return is the child's pid (the trap-shell
+///    writeback drains `pending_syscall_return` into the parent's
+///    fresh trap frame's `a0`); the child re-enters userspace with
+///    `a0 == 0` from the seed.
+///
+/// Synchronous (no `.await`): `step_fork` is itself synchronous in
+/// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
+/// v1's single-thread-per-process model). The function is non-`async`
+/// to keep the seam minimal.
+fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let flags = args[0];
+    let stack = args[1];
+
+    // Validation: bare-SIGCHLD only. Reject any other flag combo
+    // (CLONE_VM, CLONE_VFORK, pthread_create OR-set, zero, etc.) and
+    // any non-zero stack.
+    if flags != SIGCHLD {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if stack != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    // Snapshot parent's saved trap context. Plan B discipline: the
+    // trap shell stored this at trap entry. `None` here means the
+    // shell never stored it — a kernel-invariant violation. Panic
+    // with the stable `:clone:no-context` sentinel (matches the ELF
+    // loader's `:bootstrap-exec:fail` precedent — decision recorded
+    // 2026-05-06 in the Wave 2 plan, Open Q #2).
+    let parent_user_ctx = ctx
+        .thread
+        .payload_cap()
+        .expect(":clone:no-payload: kernel-invariant violation, calling thread had no payload")
+        .saved_user_context()
+        .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
+
+    // step_fork: mint a child ProcessIdentity + leader ThreadIdentity
+    // + payload + parent.children/pgrp wiring.
+    let child = match step_fork::<P>(&ctx.process) {
+        Ok(c) => c,
+        Err(tx_subsystems::process::ForkError::ParentZombie) => {
+            // Impossible by construction — the calling process is the
+            // parent and is alive (we're servicing its syscall). Map
+            // to ESRCH defensively.
+            return SyscallResult::Error(ESRCH_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::Vm(_)) => {
+            // VmMapError (e.g. a transient WouldBlock or OOM during
+            // fork_aspace). Map to EAGAIN — Linux's canonical
+            // transient-fork-failure errno.
+            return SyscallResult::Error(EAGAIN_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::Zone(_)) => {
+            return SyscallResult::Error(ENOMEM_VALUE);
+        }
+    };
+
+    // Resolve the child's leader thread (always at slot 0 by
+    // `step_fork`'s post-condition).
+    let child_thread = child
+        .nth_thread(0)
+        .expect(":clone:no-leader: kernel-invariant violation, fresh child has no leader thread");
+
+    // Seed the child's leader trap context with the parent's GPRs
+    // (a0 := 0, pc := pc + 4). Infallible.
+    seed_child_leader_context(&child_thread, &parent_user_ctx);
+
+    // Hand the child's leader thread to the reactor. Panics with
+    // `:clone:no-reactor-seam` if the boot path didn't install the
+    // seam — that's a boot-time invariant violation.
+    reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
+
+    // Parent observes the child's pid. The trap shell drains
+    // `pending_syscall_return` into the parent's fresh trap frame's
+    // a0 before re-entry per Plan B.
+    SyscallResult::Return(child.pid.0 as i64)
+}
+
+/// `getppid()` — return the parent's pid, or `0` (`Pid::RESERVED`)
+/// for orphans.
+///
+/// Wraps `ProcessIdentity::parent_pid()` — see
+/// `crates/tx-subsystems/src/process/structure.rs:197`. Returns `0`
+/// for init (no parent) and for processes whose parent has been
+/// reclaimed. Real Linux returns init's pid for orphans; the trio's
+/// `sever_children` reparents to init when init is registered, so
+/// under normal flows the difference is invisible.
+fn sys_getppid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SyscallResult::Return(ctx.process.parent_pid().0 as i64)
+}
+
+/// `setpgid(pid, pgid)`.
+///
+/// Wraps `step_setpgid` (`process/execution.rs:721`). Day-1 only
+/// supports `pid == 0` / `pid == self.pid` (setpgid on self) and
+/// `pgid == 0` / `pgid == self.pid` (create a fresh process group
+/// rooted at the caller's pid inside the caller's session). Anything
+/// else returns `-EPERM` (matches Linux's errno for cross-pgrp
+/// setpgid). Cross-process setpgid needs a pid → `Cap<ProcessIdentity>`
+/// resolver that day-1 doesn't ship.
+fn sys_setpgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let pid = args[0] as i32;
+    let pgid = args[1] as i32;
+
+    // Day-1: only "self" target supported (cross-process setpgid is
+    // deferred). pid == 0 means "self" per Linux convention.
+    if pid != 0 && (pid as u32) != ctx.process.pid.0 {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+
+    // pgid == 0 means "use the caller's pid" — exactly what the trio's
+    // step_setpgid supports.
+    let new_pgid_raw = if pgid == 0 {
+        ctx.process.pid.0
+    } else {
+        pgid as u32
+    };
+
+    match step_setpgid(&ctx.process, Pgid(new_pgid_raw)) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(SetpgidError::Unimplemented) => SyscallResult::Error(EPERM_VALUE),
+        Err(SetpgidError::Zone(_)) => SyscallResult::Error(ENOMEM_VALUE),
+    }
+}
+
+/// `getpgid(pid)`.
+///
+/// Day-1 only supports `pid == 0` (self) and `pid == self.pid`.
+/// Cross-pid lookup needs a pid → `Cap<ProcessIdentity>` resolver
+/// that day-1 doesn't ship; cross-pid queries return `-ESRCH`.
+///
+/// Reads through `ProcessIdentity::pgrp_cap` (already used by the
+/// trio's signal-permission machinery).
+fn sys_getpgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let pid = args[0] as i32;
+    if pid != 0 && (pid as u32) != ctx.process.pid.0 {
+        // TODO(phase-pid-resolver): cross-pid getpgid once a global
+        // pid → Cap<ProcessIdentity> table is wired.
+        return SyscallResult::Error(ESRCH_VALUE);
+    }
+    SyscallResult::Return(ctx.process.pgrp_cap().pgid.0 as i64)
+}
+
+/// `getsid(pid)`.
+///
+/// Same shape as `getpgid` but reports the session id. Day-1 only
+/// supports `pid == 0` / `pid == self.pid`; cross-pid queries return
+/// `-ESRCH`.
+fn sys_getsid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let pid = args[0] as i32;
+    if pid != 0 && (pid as u32) != ctx.process.pid.0 {
+        // TODO(phase-pid-resolver): cross-pid getsid once a global
+        // pid → Cap<ProcessIdentity> table is wired.
+        return SyscallResult::Error(ESRCH_VALUE);
+    }
+    SyscallResult::Return(ctx.process.pgrp_cap().session_cap().sid.0 as i64)
+}
+
+/// `setsid()` — create a new session rooted at the caller.
+///
+/// Wraps `step_setsid` (`process/execution.rs:746`). Returns the new
+/// session id on success, `-ENOMEM` on zone-allocation failure.
+///
+/// Note: real Linux returns `-EPERM` if the caller is already a
+/// process-group leader. The trio's `step_setsid` doesn't enforce
+/// this and the slice ships the trio's behaviour. Flagged as a
+/// follow-up (`TODO(phase-process-topology)`).
+fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
+    match step_setsid(&ctx.process) {
+        Ok(sid) => SyscallResult::Return(sid.0 as i64),
+        Err(SetsidError::Zone(_)) => SyscallResult::Error(ENOMEM_VALUE),
+    }
+}
+
+/// `set_tid_address(tidptr)` — Wave 2 stub.
+///
+/// Returns the calling thread's tid (Linux's documented return for
+/// this syscall). Ignores `tidptr` — the real semantic
+/// (`clear_child_tid` slot + futex wakeup on thread exit) is deferred
+/// to the pthread/futex slice.
+///
+/// TODO(phase-tls): wire `tidptr` through to a per-thread
+/// `clear_child_tid` slot per `THREAD_RUNTIME_v1` §2.6.
+fn sys_set_tid_address<'a>(_args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SyscallResult::Return(ctx.thread.tid.0 as i64)
+}
+
+/// `set_robust_list(head, len)` — Wave 2 stub.
+///
+/// Returns `0` unconditionally. Ignores `head`/`len` — the real
+/// semantic (futex robust-list registration + walk on thread exit)
+/// is deferred to the futex slice.
+///
+/// TODO(phase-futex): register the robust-list head per-thread once
+/// futex infrastructure lands.
+fn sys_set_robust_list(_args: [u64; 6]) -> SyscallResult {
+    SyscallResult::Return(0)
 }
