@@ -9,6 +9,12 @@ repository.workspace = true
 tx-fs = { path = "../tx-fs" }
 tx-hal = { path = "../tx-hal" }
 tx-reactor = { path = "../tx-reactor" }
+# Phase 7 of the ELF-loader plan: `init.rs::run_bootstrap_exec_for_init`
+# drives `tx_scripts::process::exec::exec_script` synchronously to
+# load the embedded `/init` fixture binary into init's address space
+# before entering the BSP reactor loop. Mirrors `tx-shims`'s use of
+# `tx-scripts` for the NR_EXECVE arm.
+tx-scripts = { path = "../tx-scripts" }
 # Pre-ELF Phase 2: the production thread future in
 # `crates/tx-kernel/src/thread_future.rs` calls
 # `tx_shims::linux_syscall::dispatch` to drive the syscall table from

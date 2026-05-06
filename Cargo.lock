@@ -367,6 +367,7 @@ dependencies = [
  "tx-fs",
  "tx-hal",
  "tx-reactor",
+ "tx-scripts",
  "tx-shims",
  "tx-substrate",
  "tx-subsystems",

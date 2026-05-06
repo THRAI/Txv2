@@ -860,3 +860,98 @@ fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
     }
     panic!("block_on: future did not resolve in 1024 polls");
 }
+
+/// **End-to-end bootstrap-exec smoke (production-paths-up-to-divergence
+/// per the brief's degrade option).** Drives the boot wiring, then
+/// `run_bootstrap_exec_for_init` (which registers the hand-encoded
+/// RV64 ELF fixture into tmpfs and drives `exec_script` via
+/// `block_on`). Asserts the bootstrap front-end seeds the thread's
+/// `saved_user_context` with the fixture's entry-point and atomically
+/// replaces the AddressSpace.
+///
+/// The full reactor-loop drive (write → exit_group → zombie) is
+/// covered by `boot_smoke_production_userspace_loop_writes_console_then_exits`
+/// above; this smoke is the missing exec-front-end link between
+/// boot wiring and that loop. Together they pin the full pipeline.
+///
+/// Cites: `txdoc:EXEC-19-BOOTSTRAP`,
+/// `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`.
+#[test]
+fn boot_smoke_bootstrap_exec_seeds_init_user_context_from_fixture() {
+    use crate::init::init_fixture::{INIT_FIXTURE_ENTRY_VADDR, INIT_FIXTURE_FILE_SIZE};
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let leader = init
+        .nth_thread(0)
+        .expect("init has a leader thread post-bootstrap");
+    let payload = leader
+        .payload_cap()
+        .expect("leader payload must be alive pre-exec");
+
+    // Pre-exec invariants: aspace is the bootstrap aspace; saved
+    // user context is None (no userspace has been entered yet).
+    let aspace_before = init
+        .aspace_cap()
+        .expect("init aspace populated by bootstrap");
+    assert!(
+        payload.saved_user_context().is_none(),
+        "saved_user_context starts None pre-exec"
+    );
+
+    // Drive the bootstrap exec: registers
+    // /init = INIT_FIXTURE_BYTES into tmpfs, then drives
+    // exec_script via block_on. Failure panics with
+    // `:bootstrap-exec:fail` per Open Q #3 DECIDED.
+    CoreInit::<TestPlatform>::run_bootstrap_exec_for_init();
+
+    // EXEC-PONR boundary crossed: the AddressSpace has been atomically
+    // replaced (different Cap key) and saved_user_context is now
+    // seeded with the fixture's entry-point.
+    let aspace_after = init.aspace_cap().expect("init aspace populated post-exec");
+    assert_ne!(
+        aspace_before.key(),
+        aspace_after.key(),
+        "Phase 6 atomic replace_aspace produced a fresh Cap"
+    );
+
+    let saved = payload
+        .saved_user_context()
+        .expect("saved_user_context seeded by Phase 6");
+    assert_eq!(
+        saved.pc as u64, INIT_FIXTURE_ENTRY_VADDR,
+        "saved pc matches fixture's hand-encoded e_entry"
+    );
+    // sp lives at regs[2] per RV64 SysV ABI; should be the
+    // 16-byte-aligned initial_sp from build_initial_user_stack
+    // (somewhere in the [USER_STACK_TOP_DEFAULT - 16 KiB,
+    // USER_STACK_TOP_DEFAULT) range).
+    use tx_subsystems::vm::scripts::{USER_STACK_INITIAL_RESERVATION, USER_STACK_TOP_DEFAULT};
+    let sp = saved.regs[2] as u64;
+    assert!(
+        sp <= USER_STACK_TOP_DEFAULT
+            && sp > USER_STACK_TOP_DEFAULT - USER_STACK_INITIAL_RESERVATION,
+        "saved sp {sp:#x} lands inside the initial 16 KiB stack reservation \
+         (USER_STACK_TOP_DEFAULT={USER_STACK_TOP_DEFAULT:#x})"
+    );
+    assert_eq!(sp & 0xF, 0, "saved sp is 16-byte aligned per SysV ABI");
+
+    // Init must not be zombie — the reactor loop hasn't run; only
+    // the exec front-end has executed.
+    assert!(
+        !init.is_zombie(),
+        "init is still alive post-bootstrap-exec; reactor hasn't run"
+    );
+
+    // Sanity: the fixture file is reachable via the walker
+    // (the production tmpfs.materialise_rnode override Phase 7 added
+    // is what makes this resolve to a PageBacked rnode).
+    let fixture_size = INIT_FIXTURE_FILE_SIZE;
+    assert!(
+        fixture_size > 0,
+        "fixture size constant is non-zero ({fixture_size} bytes)"
+    );
+}

@@ -140,21 +140,41 @@ impl<P: TxPlatform> CoreInit<P> {
     pub fn boot(handoff: BootHandoff) -> ! {
         Self::init_early(handoff);
         Self::init_substrate_if_ready(handoff);
+        // ELF-loader Phase 7: register the embedded `/init` fixture
+        // into the rootfs tmpfs and drive `exec_script` synchronously
+        // so the init leader's `saved_user_context` is seeded with
+        // the new image's entry-point + initial stack pointer. The
+        // BSP reactor loop below then picks up the seeded context
+        // on its first poll and re-enters userspace through the
+        // production trap return path.
+        //
+        // Open Q #3 (DECIDED 2026-05-06) — bootstrap exec failure
+        // is a boot-time invariant violation. The helper panics
+        // with the `:bootstrap-exec:fail` board sentinel on `Err`;
+        // CI catches the panic loudly and we never reach
+        // `boot_sentinel` (`:boot:ok`). No fallback to the trio's
+        // hand-built userspace path: that path is retired by the
+        // Phase 7 dual-codepath cleanup, and reintroducing it
+        // would re-create the dual code path the trio just
+        // collapsed.
+        //
+        // Order (per Phase 7 plan): runs after
+        // `bind_init_cwd_and_root` (init has cwd + fds 0/1/2) and
+        // before `boot_sentinel` so the panic-sentinel discipline
+        // is unambiguous.
+        if P::SUBSTRATE_BOOT_READY {
+            Self::run_bootstrap_exec_for_init();
+        }
         Self::boot_sentinel();
         // Pre-ELF Phase 7: wrap the init leader's thread future as a
         // reactor task and enter the BSP reactor loop. Returns when
         // init zombifies (`run_thread` resolves), at which point we
-        // emit `:userspace:exited:N` and shut down. Today that exit
-        // can only fire after a real userspace `exit_group(N)`
-        // travels through the trap shell → reactor task wrapper →
-        // thread future → `linux_syscall::dispatch`. On RV64 boards
-        // that have no userspace binary loaded yet the loop simply
-        // parks: the reactor stays in WFI until the first userspace
-        // trap arrives (which it cannot, pre-ELF), so the loop
-        // remains idle. That is the intended Phase 7 shape: the
-        // production loop is wired even though no init binary exists
-        // yet. The next slice (ELF loader) drops a real binary into
-        // the address space; the loop already in place picks it up.
+        // emit `:userspace:exited:N` and shut down. With Phase 7 of
+        // the ELF-loader plan, the leader's `saved_user_context` was
+        // seeded by `run_bootstrap_exec_for_init` above; the first
+        // iteration of `run_thread` re-enters userspace at the
+        // fixture's `_start` and the eventual `exit_group(0)` syscall
+        // zombifies init.
         if P::SUBSTRATE_BOOT_READY {
             Self::run_userspace_reactor_loop();
         }
@@ -579,6 +599,170 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":init:cwd-fds:ok\n");
+    }
+
+    /// ELF-loader Phase 7: register the embedded `/init` fixture into
+    /// the rootfs tmpfs and synchronously drive `exec_script` against
+    /// init. On `Err` panics with `:bootstrap-exec:fail` (Open Q #3
+    /// DECIDED 2026-05-06).
+    ///
+    /// Two sub-steps:
+    /// 1. `register_init_fixture_into_tmpfs` — call
+    ///    `FsOps::create_inode` on the rootfs to allocate `/init`,
+    ///    materialise its RNode (through tmpfs's Phase-7
+    ///    `materialise_rnode` override) so we can reach the inode's
+    ///    `Cap<PageContainer>`, copy the fixture bytes into the
+    ///    container's anon pages via the kernel direct map, and
+    ///    update the inode's visible size via `step_truncate`.
+    /// 2. `drive_bootstrap_exec` — `block_on(exec_script::<P>(...))`
+    ///    against init; on `Ok(())` the eight-phase EXEC_v1 protocol
+    ///    has seeded `process.aspace` with the new aspace and
+    ///    `thread.payload().saved_user_context` with the fixture's
+    ///    entry-point + initial stack pointer.
+    pub(crate) fn run_bootstrap_exec_for_init() {
+        Self::register_init_fixture_into_tmpfs();
+        Self::drive_bootstrap_exec();
+    }
+
+    /// Sub-step 1 of `run_bootstrap_exec_for_init`: copy
+    /// `init_fixture::INIT_FIXTURE_BYTES` into a fresh tmpfs file at
+    /// `/init`.
+    ///
+    /// Uses the production `FsOps` surface end-to-end:
+    /// `create_inode` to allocate the inode + name binding,
+    /// `materialise_rnode` to grab the inode's `Cap<PageContainer>`
+    /// (Phase 7 of the ELF-loader plan added the tmpfs override),
+    /// `materialize_anon` per page + direct-map memcpy to populate
+    /// the page contents, and `FsPageBacking::truncate` to set the
+    /// visible size.
+    pub(crate) fn register_init_fixture_into_tmpfs() {
+        use tx_subsystems::execution::StepOutcome;
+        use tx_subsystems::vfs::{Credential, RNodeBacking};
+
+        let root_mount =
+            root_mount().expect("register_init_fixture_into_tmpfs: ROOT_MOUNT must be populated");
+        let fs_ops = root_mount.payload().fs_ops.clone();
+        let fs_page_backing = root_mount.payload().fs_page_backing.clone();
+        let root_object_id = root_mount.root().fs_object_id();
+
+        let bytes = &init_fixture::INIT_FIXTURE_BYTES[..];
+
+        // Allocate the inode.
+        let cred = Credential::default();
+        let (file_id, file_meta) = {
+            let guard = tx_substrate::epoch::guard();
+            let outcome = fs_ops.create_inode(root_object_id, b"init", 0o100755, &cred, &guard);
+            match outcome {
+                StepOutcome::Done(out) => out,
+                other => panic!("register_init_fixture_into_tmpfs: create_inode(/init): {other:?}"),
+            }
+        };
+
+        // Materialise the inode's RNode so we can reach the
+        // `Cap<PageContainer>`. Tmpfs's Phase-7 override returns
+        // `RNodeBacking::PageBacked { pc }` for regular files.
+        let pc = {
+            let guard = tx_substrate::epoch::guard();
+            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
+            let rnode = match outcome {
+                StepOutcome::Done(rnode) => rnode,
+                other => panic!("register_init_fixture_into_tmpfs: materialise_rnode: {other:?}"),
+            };
+            match rnode.backing() {
+                RNodeBacking::PageBacked { pc } => pc.clone(),
+                other => panic!(
+                    "register_init_fixture_into_tmpfs: tmpfs materialise_rnode \
+                     returned non-PageBacked backing: {other:?}"
+                ),
+            }
+        };
+
+        // Populate every page covered by the fixture bytes via
+        // `materialize_anon` + direct-map memcpy. Mirrors
+        // `tx_scripts::process::exec::script::tests::ExecTestFs::add_regular_with_bytes`'s
+        // pattern, but against the production tmpfs surface.
+        let page_size = tx_subsystems::vm::USER_PAGE_SIZE;
+        for (idx, chunk) in bytes.chunks(page_size).enumerate() {
+            let materialised = pc
+                .materialize_anon(
+                    tx_subsystems::page_backed::PageIndex::new(idx as u64),
+                    tx_subsystems::page_backed::MaterializeAccess::Write,
+                )
+                .expect("register_init_fixture_into_tmpfs: materialize_anon");
+            let frame_base = tx_substrate::page_allocator::frame_kernel_addr(materialised.ppn)
+                .expect("register_init_fixture_into_tmpfs: direct-map view");
+            // SAFETY: `materialised.map_pin` keeps the page resident
+            // for the duration of this scope; the destination region
+            // covers exactly `chunk.len()` bytes from the freshly
+            // materialised anon frame; source and destination do not
+            // overlap.
+            unsafe {
+                core::ptr::copy_nonoverlapping(chunk.as_ptr(), frame_base, chunk.len());
+            }
+        }
+
+        // Set the visible byte-size on both the PageContainer (so
+        // `read_exact_at` in `exec_script::<P>` knows the file's
+        // length) and the inode meta (so subsequent `load_inode_meta`
+        // reports the right `meta.size`).
+        let size = bytes.len() as u64;
+        {
+            let guard = tx_substrate::epoch::guard();
+            match fs_page_backing.truncate(file_id, size, &guard) {
+                StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+                other => panic!("register_init_fixture_into_tmpfs: truncate({size}): {other:?}"),
+            }
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":init:fixture:ok\n");
+    }
+
+    /// Sub-step 2 of `run_bootstrap_exec_for_init`: drive
+    /// `exec_script` synchronously and panic with
+    /// `:bootstrap-exec:fail` on `Err`.
+    ///
+    /// `exec_script` is `async`, but the only `.await` points it
+    /// reaches today are `read_exact_at` against the file's
+    /// `Cap<PageContainer>` (immediate under tmpfs, since every page
+    /// is anon and resident after `register_init_fixture_into_tmpfs`)
+    /// and `populate_detached_user_range` (also immediate against
+    /// detached anon segments). A noop-waker `block_on` poll loop
+    /// resolves the future without going through the reactor.
+    fn drive_bootstrap_exec() {
+        use tx_subsystems::vfs::Credential;
+
+        let init = tx_subsystems::process::execution::init_process()
+            .expect("drive_bootstrap_exec: INIT_PROCESS must be populated");
+        let thread = init
+            .nth_thread(0)
+            .expect("drive_bootstrap_exec: init has a leader thread post-bootstrap");
+
+        let cred = Credential::default();
+        let argv: &[&[u8]] = &[b"init" as &[u8]];
+        let envp: &[&[u8]] = &[];
+
+        // `exec_script` opens its own fresh epoch guards inside V1
+        // (`build_aspace_from_image`) and V2
+        // (`populate_detached_user_range`); the caller must NOT hold
+        // a guard at the call site (per
+        // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
+        let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+            &init, &thread, b"/init", argv, envp, &cred,
+        ));
+        match outcome {
+            Ok(()) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
+            }
+            Err(e) => {
+                // Open Q #3 (DECIDED 2026-05-06): panic loudly with
+                // the `:bootstrap-exec:fail` board sentinel.
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:fail\n");
+                panic!("bootstrap exec for /init failed: {e:?}");
+            }
+        }
     }
 
     fn init_later(handoff: BootHandoff) {
@@ -1007,6 +1191,54 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(P::BOARD);
     }
 }
+
+/// Synchronously poll a future to completion using a noop waker.
+///
+/// Used by `CoreInit::drive_bootstrap_exec` to drive `exec_script`'s
+/// future without spinning up the reactor: the boot path runs before
+/// the BSP reactor loop is entered, and `exec_script` only awaits on
+/// page-pull operations that resolve immediately under tmpfs.
+///
+/// The bound `1024` polls is chosen to mirror the matching pattern in
+/// `tx-shims`'s and `tx-scripts`'s test suites; reaching the cap
+/// signals a logic bug (a never-resolving future inside the
+/// boot-time exec path) and triggers a panic.
+fn bootstrap_block_on<F: core::future::Future>(future: F) -> F::Output {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    // Build a no-op waker without `alloc::sync::Arc`'s `Wake` trait,
+    // because tx-kernel's runtime allocator at boot does not have
+    // `Arc::new` plumbing wired by the time `bootstrap_block_on` is
+    // called. The raw-waker shape is a stable `core` API that
+    // sidesteps the `alloc` requirement entirely.
+    fn raw_waker() -> RawWaker {
+        fn no_op(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+
+    // SAFETY: the raw waker's vtable functions are all no-op or
+    // re-construction; the data pointer is never dereferenced.
+    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut future = future;
+    // SAFETY: `future` lives on this stack frame for the duration of
+    // the loop and is never moved after pinning.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut future) };
+    for _ in 0..1024 {
+        match pinned.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => continue,
+        }
+    }
+    panic!("bootstrap_block_on: future did not resolve in 1024 polls");
+}
+
+mod init_fixture;
 
 #[cfg(test)]
 mod tests;
