@@ -43,7 +43,13 @@ pub fn step_read(tty: &Cap<TtyIdentity>, out: &mut [u8], guard: &Guard<'_>) -> S
     });
 
     if copied == 0 {
-        StepOutcome::Blocked(WaitToken::new(tty.raw() as u64, TTY_READABLE))
+        // Pre-ELF Phase 5 (item 9): the wait carrier is the TTY
+        // identity's `wait_channel`, registered with the global
+        // `wait_carrier` resolver at construction. `step_ingest`
+        // fires it after any byte ingest, so `sys_read`'s
+        // `wait_on_token(token).await` actually parks until UART RX
+        // bytes arrive.
+        StepOutcome::Blocked(WaitToken::new(tty.wait_carrier_id(), TTY_READABLE))
     } else {
         StepOutcome::Done(copied)
     }

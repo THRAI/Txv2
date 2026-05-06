@@ -182,7 +182,19 @@ impl<P: TxPlatform> CoreInit<P> {
             //    alias.
             //
             // Future moves of this block must preserve the order.
+            //
+            // Pre-ELF Phase 5 (item 9) inserts `install_irq_handlers`
+            // between `register_console_hardware` and
+            // `mount_rootfs_tmpfs`: the UART RX handler reads the
+            // boot console TTY from `CONSOLE_TTY` (populated by
+            // `register_console_hardware`); registration must follow
+            // that slot being populated. The PLIC's enable bits are
+            // zero until `unmask` runs inside
+            // `install_irq_handlers`, so a stray pre-registration
+            // trap is structurally impossible (Cross-cutting risk
+            // #4 in the pre-ELF plan).
             Self::register_console_hardware();
+            Self::install_irq_handlers();
             Self::mount_rootfs_tmpfs();
             Self::mount_devfs_at_dev();
             Self::register_devfs_console_alias();
@@ -271,6 +283,29 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":tty:console:ok\n");
+    }
+
+    /// Pre-ELF Phase 5 (item 9): install the kernel's IRQ dispatch
+    /// table and unmask the platform's UART IRQ.
+    ///
+    /// Delegates to `crate::irq::install_irq_handlers::<P>` which
+    /// registers the UART RX handler under
+    /// `<P as IrqIf>::UART_IRQ`, publishes
+    /// `IRQ_DISPATCH_TABLE` to the platform via
+    /// `<P as IrqIf>::install_dispatch_table`, then unmasks. The
+    /// UART RX handler reads the boot console TTY from `CONSOLE_TTY`,
+    /// so this step must follow `register_console_hardware`.
+    ///
+    /// **Order invariant:** runs after `register_console_hardware`
+    /// (the handler reads `console_tty()`) and before
+    /// `mount_rootfs_tmpfs` (no transitive dependency, but the
+    /// existing trio order has been preserved verbatim except for
+    /// this insertion).
+    pub(crate) fn install_irq_handlers() {
+        crate::irq::install_irq_handlers::<P>();
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":irq:install:ok\n");
     }
 
     /// Mount tmpfs as the rootfs.

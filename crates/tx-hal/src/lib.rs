@@ -1109,6 +1109,17 @@ pub trait SignalFrameIf: TrapIf + UserAccessIf {
 pub trait IrqIf {
     const MAX_IRQ: u32 = 0;
 
+    /// Platform-specific IRQ number for the boot console UART.
+    ///
+    /// The kernel's `install_irq_handlers` reads this through
+    /// `<P as IrqIf>::UART_IRQ` to register the UART RX dispatcher
+    /// without naming a board constant directly. Boards that have no
+    /// dedicated UART IRQ (or run on a host-only test platform) keep
+    /// the `0` sentinel default; production boards override.
+    /// See `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`
+    /// §"Open questions #6".
+    const UART_IRQ: u32 = 0;
+
     fn in_irq_context() -> bool {
         false
     }
