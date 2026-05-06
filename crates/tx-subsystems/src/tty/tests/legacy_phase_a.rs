@@ -62,6 +62,20 @@ impl ScriptedReadOps {
     }
 }
 
+struct BlockingReadOps;
+
+impl CharDeviceOps for BlockingReadOps {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+        StepOutcome::Blocked(crate::execution::WaitToken::new(0x55, 0x0f))
+    }
+
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+        StepOutcome::Done(bytes.len())
+    }
+}
+
+static BLOCKING_READ_OPS: BlockingReadOps = BlockingReadOps;
+
 impl CharDeviceOps for ScriptedReadOps {
     fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
         let mut script = self.script.lock().expect("script lock");
@@ -750,6 +764,53 @@ fn step_poll_hardware_input_ingests_uart_bytes_into_registered_console_tty() {
 }
 
 #[test]
+fn step_poll_hardware_input_rejects_pty_transport() {
+    let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
+    init_zones();
+    let guard = tx_substrate::epoch::guard();
+
+    let slave = alloc_tty(
+        TtyKind::PtySlave,
+        2,
+        "pts/2",
+        TtyPayload::new_hardware(&NOOP_BINDING),
+    );
+    let master = alloc_tty(
+        TtyKind::PtyMaster,
+        2,
+        "ptmx2",
+        TtyPayload::new_pty_master(slave),
+    );
+
+    assert_eq!(
+        step_poll_hardware_input(&master, 16, &guard),
+        StepOutcome::Err(Errno::EINVAL)
+    );
+}
+
+#[test]
+fn step_poll_hardware_input_propagates_blocked_driver_read() {
+    let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
+    init_zones();
+    let guard = tx_substrate::epoch::guard();
+
+    let binding = Box::leak(Box::new(CharDeviceBinding {
+        devt: DevT::new(4, 66),
+        name: "ttySblocked",
+        ops: &BLOCKING_READ_OPS,
+    }));
+    let tty = match register_hardware("ttySblocked", 2, binding, &guard) {
+        StepOutcome::Done(tty) => tty,
+        other => panic!("register_hardware failed: {other:?}"),
+    };
+
+    assert_eq!(
+        step_poll_hardware_input(&tty, 16, &guard),
+        StepOutcome::Blocked(crate::execution::WaitToken::new(0x55, 0x0f))
+    );
+}
+
+#[test]
 fn ioctl_binding_and_termios_roundtrip_work() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
@@ -1086,6 +1147,8 @@ fn tcsets_flushes_pending_cooked_buffer_into_read_queue() {
         other => panic!("tcgets failed: {other:?}"),
     };
     raw_mode.c_lflag &= !ICANON;
+    raw_mode.c_cc[crate::tty::structure::termios::VMIN] = 0;
+    raw_mode.c_cc[crate::tty::structure::termios::VTIME] = 0;
     assert_eq!(
         step_ioctl_tcsets(&tty, raw_mode, &guard),
         StepOutcome::Done(crate::tty::execution::IoctlSideEffect::default())
@@ -1093,6 +1156,35 @@ fn tcsets_flushes_pending_cooked_buffer_into_read_queue() {
     assert_eq!(tty.input_readable.peek() & TTY_READABLE, TTY_READABLE);
     assert_eq!(step_read(&tty, &mut out, &guard), StepOutcome::Done(8));
     assert_eq!(&out[..8], b"flush-me");
+}
+
+#[test]
+fn tcsets_without_pending_canonical_bytes_leaves_read_side_quiet() {
+    let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
+    init_zones();
+    let guard = tx_substrate::epoch::guard();
+    let tty = alloc_tty(
+        TtyKind::SerialHardware,
+        14,
+        "ttyS14",
+        TtyPayload::new_hardware(&NOOP_BINDING),
+    );
+
+    let mut raw_mode = match step_ioctl_tcgets(&tty, &guard) {
+        StepOutcome::Done(termios) => termios,
+        other => panic!("tcgets failed: {other:?}"),
+    };
+    raw_mode.c_lflag &= !ICANON;
+    raw_mode.c_cc[crate::tty::structure::termios::VMIN] = 0;
+    raw_mode.c_cc[crate::tty::structure::termios::VTIME] = 0;
+    assert_eq!(
+        step_ioctl_tcsets(&tty, raw_mode, &guard),
+        StepOutcome::Done(crate::tty::execution::IoctlSideEffect::default())
+    );
+    assert_eq!(tty.input_readable.peek() & TTY_READABLE, 0);
+
+    let mut out = [0u8; 8];
+    assert_eq!(step_read(&tty, &mut out, &guard), StepOutcome::Done(0));
 }
 
 #[test]
