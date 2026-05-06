@@ -1024,3 +1024,169 @@ fn process_payload_aspace_atomic_replace_returns_previous_cap() {
     );
     assert_ne!(post.key(), initial_key);
 }
+
+// ----- Wave 2 ELF loader plan: per-fd CLOEXEC bitmap + exec phase-7 -----
+//
+// Process-side tests for the Wave 2 deliverables:
+// - `ProcessPayload.fd_cloexec` storage (default 0; set/clear round trip).
+// - `step_fork` clones parent's CLOEXEC bits (Linux semantics).
+// - `step_close_cloexec_fds` (P1) closes only marked fds and clears the
+//   bitmap.
+// - `step_install_brk_for_exec` (P3) overwrites both `brk_base` and
+//   `current_brk`.
+
+/// Helper: synthesise an `OpenFile` `Cap` over a regular-file RNode so
+/// fd-table tests can install slots without standing up a TTY/devfs.
+fn fresh_open_file() -> Cap<crate::vfs::OpenFile> {
+    use crate::vfs::OpenFileFlags;
+    let rnode = fresh_rnode(7777);
+    crate::vfs::OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+        },
+    )
+    .expect("open file cap")
+}
+
+#[test]
+fn process_payload_fd_cloexec_default_zero() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    // Every fd defaults to "not CLOEXEC" — bootstrap_init_process
+    // initialises the bitmap to 0 per the Wave 2 plan (init's stdio
+    // is not close-on-exec by Linux convention).
+    for fd in 0..crate::process::FD_TABLE_SIZE as u32 {
+        assert!(!proc_cap.fd_cloexec(fd), "fd {fd} should default to false");
+    }
+    // Out-of-range queries also return false (the day-1 AtomicU32
+    // bitmap covers fds 0..31; queries above 31 return false).
+    assert!(!proc_cap.fd_cloexec(31));
+    assert!(!proc_cap.fd_cloexec(32));
+    assert!(!proc_cap.fd_cloexec(64));
+}
+
+#[test]
+fn process_payload_set_fd_cloexec_round_trip() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    proc_cap.set_fd_cloexec(3, true);
+    assert!(proc_cap.fd_cloexec(3));
+    assert!(!proc_cap.fd_cloexec(2));
+    assert!(!proc_cap.fd_cloexec(4));
+
+    // Toggling another bit must not perturb the first.
+    proc_cap.set_fd_cloexec(5, true);
+    assert!(proc_cap.fd_cloexec(3));
+    assert!(proc_cap.fd_cloexec(5));
+
+    // Clearing fd 3 leaves fd 5 alone.
+    proc_cap.set_fd_cloexec(3, false);
+    assert!(!proc_cap.fd_cloexec(3));
+    assert!(proc_cap.fd_cloexec(5));
+}
+
+#[test]
+fn step_fork_clones_fd_cloexec_bits() {
+    let _g = setup();
+    let parent = bootstrap();
+    parent.set_fd_cloexec(1, true);
+    parent.set_fd_cloexec(4, true);
+
+    let child = step_fork::<TestPmap>(&parent).expect("fork");
+
+    // Child inherits parent's snapshot at fork time.
+    assert!(child.fd_cloexec(1));
+    assert!(child.fd_cloexec(4));
+    assert!(!child.fd_cloexec(0));
+    assert!(!child.fd_cloexec(2));
+
+    // Mutating the child must not bleed back into the parent.
+    child.set_fd_cloexec(2, true);
+    assert!(child.fd_cloexec(2));
+    assert!(!parent.fd_cloexec(2));
+
+    // Mutating the parent post-fork must not bleed into the child.
+    parent.set_fd_cloexec(0, true);
+    assert!(parent.fd_cloexec(0));
+    assert!(!child.fd_cloexec(0));
+}
+
+#[test]
+fn step_close_cloexec_fds_closes_marked_fds_clears_others() {
+    use crate::process::execution::step_close_cloexec_fds;
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    // Install three open files at fds 0, 1, 2; mark only fd 1 as
+    // CLOEXEC.
+    proc_cap.set_fd(0, Some(fresh_open_file()));
+    proc_cap.set_fd(1, Some(fresh_open_file()));
+    proc_cap.set_fd(2, Some(fresh_open_file()));
+    proc_cap.set_fd_cloexec(1, true);
+
+    step_close_cloexec_fds(&proc_cap);
+
+    // Only fd 1 should be closed; the others remain.
+    assert!(proc_cap.fd(0).is_some(), "fd 0 was not marked; survives");
+    assert!(
+        proc_cap.fd(1).is_none(),
+        "fd 1 was marked CLOEXEC; should be closed"
+    );
+    assert!(proc_cap.fd(2).is_some(), "fd 2 was not marked; survives");
+}
+
+#[test]
+fn step_close_cloexec_fds_clears_bitmap_after() {
+    use crate::process::execution::step_close_cloexec_fds;
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    proc_cap.set_fd(2, Some(fresh_open_file()));
+    proc_cap.set_fd_cloexec(2, true);
+    assert!(proc_cap.fd_cloexec(2));
+
+    step_close_cloexec_fds(&proc_cap);
+
+    // The sweep clears the bitmap wholesale: future fcntl(F_SETFD)
+    // calls start from a zeroed word.
+    assert!(
+        !proc_cap.fd_cloexec(2),
+        "post-sweep, the CLOEXEC bit must be cleared"
+    );
+    for fd in 0..crate::process::FD_TABLE_SIZE as u32 {
+        assert!(!proc_cap.fd_cloexec(fd), "every bit must be 0 post-sweep");
+    }
+}
+
+#[test]
+fn step_install_brk_for_exec_resets_both_brk_base_and_current() {
+    use crate::process::execution::{step_install_brk_for_exec, BOOTSTRAP_BRK_BASE};
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    // Bootstrap state: both brk_base and current_brk seeded to the
+    // same bootstrap value (per the existing
+    // `bootstrap_init_process` contract).
+    assert_eq!(proc_cap.brk_base(), BOOTSTRAP_BRK_BASE);
+    assert_eq!(proc_cap.current_brk(), BOOTSTRAP_BRK_BASE);
+
+    // Simulate a userspace brk(2) advance so current_brk diverges
+    // from brk_base — this is the "running process" state exec
+    // takes over.
+    proc_cap.set_current_brk(BOOTSTRAP_BRK_BASE + 0x1000);
+    assert_eq!(proc_cap.current_brk(), BOOTSTRAP_BRK_BASE + 0x1000);
+    assert_eq!(proc_cap.brk_base(), BOOTSTRAP_BRK_BASE);
+
+    // Install fresh exec-image brk: both fields rewritten to the
+    // same new value (per `txdoc:EXEC-12-4-INSTALL-BRK`).
+    let new_brk: u64 = 0xb000_0000;
+    step_install_brk_for_exec(&proc_cap, new_brk);
+
+    assert_eq!(proc_cap.brk_base(), new_brk);
+    assert_eq!(proc_cap.current_brk(), new_brk);
+}

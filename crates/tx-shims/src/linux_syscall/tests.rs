@@ -39,8 +39,8 @@ use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 use super::{
-    dispatch, SyscallCtx, SyscallResult, NR_BRK, NR_EXIT, NR_EXIT_GROUP, NR_GETPID, NR_READ,
-    NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_WRITE,
+    dispatch, SyscallCtx, SyscallResult, FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_EXIT,
+    NR_EXIT_GROUP, NR_FCNTL, NR_GETPID, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_WRITE,
 };
 
 // ---------------------------------------------------------------------------
@@ -681,4 +681,134 @@ fn dispatch_rt_sigaction_rejects_wrong_sigsetsize() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Error(22));
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2 ELF-loader plan: fcntl(F_GETFD/F_SETFD) against the per-process
+// CLOEXEC bitmap (`ProcessPayload.fd_cloexec`).
+// ---------------------------------------------------------------------------
+
+/// `fcntl(fd, F_GETFD, _)` returns `0` for an fd whose CLOEXEC bit is
+/// unset (the bootstrap default — `bootstrap_init_process` initialises
+/// every bit to 0).
+#[test]
+fn dispatch_fcntl_getfd_returns_zero_for_unset_bit() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let r = block_on(dispatch(
+        SyscallRequest::new(NR_FCNTL, [3, F_GETFD as u64, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0));
+}
+
+/// `fcntl(fd, F_SETFD, FD_CLOEXEC)` then `fcntl(fd, F_GETFD, _)`
+/// observes `FD_CLOEXEC` — the bitmap round-trips through the syscall
+/// surface.
+#[test]
+fn dispatch_fcntl_setfd_then_getfd_round_trip() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    // F_SETFD with FD_CLOEXEC.
+    let set = block_on(dispatch(
+        SyscallRequest::new(NR_FCNTL, [3, F_SETFD as u64, FD_CLOEXEC as u64, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(set, SyscallResult::Return(0));
+    assert!(
+        proc_cap.fd_cloexec(3),
+        "F_SETFD must set the per-process CLOEXEC bit"
+    );
+
+    // F_GETFD reads it back as FD_CLOEXEC.
+    let get = block_on(dispatch(
+        SyscallRequest::new(NR_FCNTL, [3, F_GETFD as u64, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(get, SyscallResult::Return(FD_CLOEXEC as i64));
+
+    // F_SETFD with `arg == 0` clears the bit again (POSIX: any arg
+    // value missing FD_CLOEXEC clears).
+    let clear = block_on(dispatch(
+        SyscallRequest::new(NR_FCNTL, [3, F_SETFD as u64, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(clear, SyscallResult::Return(0));
+    assert!(!proc_cap.fd_cloexec(3));
+}
+
+/// `F_SETFD` on one fd does not perturb other fds' CLOEXEC bits.
+#[test]
+fn dispatch_fcntl_setfd_clears_other_bits() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    // Pre-mark fd 5 CLOEXEC at the API level so we can confirm
+    // F_SETFD on fd 3 does not touch it.
+    proc_cap.set_fd_cloexec(5, true);
+    assert!(proc_cap.fd_cloexec(5));
+
+    // Set CLOEXEC on fd 3.
+    let r = block_on(dispatch(
+        SyscallRequest::new(NR_FCNTL, [3, F_SETFD as u64, FD_CLOEXEC as u64, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0));
+
+    // Both bits independent.
+    assert!(proc_cap.fd_cloexec(3));
+    assert!(proc_cap.fd_cloexec(5));
+    assert!(!proc_cap.fd_cloexec(4));
+    assert!(!proc_cap.fd_cloexec(0));
+    assert!(!proc_cap.fd_cloexec(2));
+}
+
+/// Unknown `cmd` values return `-ENOSYS` per the Wave 2 plan
+/// (`F_DUPFD`, `F_GETFL`, `F_SETFL`, etc. are
+/// `TODO(phase-fcntl-extension)`).
+#[test]
+fn dispatch_fcntl_unknown_cmd_returns_neg_enosys() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    // F_DUPFD = 0 is not in the Wave 2 surface.
+    let r = block_on(dispatch(
+        SyscallRequest::new(NR_FCNTL, [3, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(38));
+}
+
+/// fd outside the day-1 fixed-size fd table (`FD_TABLE_SIZE = 8`)
+/// returns `-EBADF`.
+#[test]
+fn dispatch_fcntl_invalid_fd_returns_neg_ebadf() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    // FD_TABLE_SIZE = 8: fd 8 is out of range.
+    let r = block_on(dispatch(
+        SyscallRequest::new(NR_FCNTL, [8, F_GETFD as u64, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(9));
+
+    // Same for F_SETFD.
+    let r2 = block_on(dispatch(
+        SyscallRequest::new(NR_FCNTL, [99, F_SETFD as u64, FD_CLOEXEC as u64, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r2, SyscallResult::Error(9));
 }

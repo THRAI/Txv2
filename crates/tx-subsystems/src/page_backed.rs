@@ -1151,6 +1151,7 @@ mod tests {
                 read: true,
                 write: true,
                 append: false,
+                cloexec: false,
             },
         )
     }

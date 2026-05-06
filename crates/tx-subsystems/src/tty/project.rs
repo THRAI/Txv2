@@ -321,6 +321,7 @@ pub fn open_file_for_tty(tty: Cap<TtyIdentity>, _guard: &Guard<'_>) -> StepOutco
             read: true,
             write: true,
             append: false,
+            cloexec: false,
         },
     ) {
         Ok(file) => StepOutcome::Done(file),

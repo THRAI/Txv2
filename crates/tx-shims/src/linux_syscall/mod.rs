@@ -60,8 +60,8 @@ pub mod numbers;
 mod tests;
 
 pub use numbers::{
-    NR_BRK, NR_EXIT, NR_EXIT_GROUP, NR_GETPID, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK,
-    NR_WRITE,
+    FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL, NR_GETPID, NR_READ,
+    NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_WRITE, O_CLOEXEC,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -207,6 +207,7 @@ pub async fn dispatch<'a>(req: SyscallRequest, ctx: &SyscallCtx<'a>) -> SyscallR
         NR_BRK => sys_brk(req.args, ctx).await,
         NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
         NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
+        NR_FCNTL => sys_fcntl(req.args, ctx),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -669,6 +670,52 @@ fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     }
 
     SyscallResult::Return(0)
+}
+
+/// `fcntl(fd, cmd, arg)` per the Wave 2 ELF-loader plan §"Part 2 —
+/// Per-fd CLOEXEC bitmap + fcntl(F_SETFD) + O_CLOEXEC".
+///
+/// Day-1 covers only `F_GETFD` / `F_SETFD` against the per-process
+/// `ProcessPayload.fd_cloexec` bitmap. Other commands return
+/// `-ENOSYS` until the relevant follow-up phase
+/// (`TODO(phase-fcntl-extension)`) extends the surface — `F_DUPFD`,
+/// `F_GETFL`, `F_SETFL`, etc. are out of scope for Wave 2.
+///
+/// Validation:
+/// - `fd >= FD_TABLE_SIZE` (today's day-1 fixed table size, also a
+///   strict subset of the 32-bit CLOEXEC bitmap range) → `-EBADF`.
+/// - Unknown `cmd` → `-ENOSYS`.
+fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as u32;
+    let cmd = args[1] as i32;
+    let arg = args[2];
+
+    if (fd as usize) >= tx_subsystems::process::FD_TABLE_SIZE {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+
+    match cmd {
+        F_GETFD => {
+            // POSIX: return `FD_CLOEXEC` if bit set, `0` otherwise.
+            let value = if ctx.process.fd_cloexec(fd) {
+                FD_CLOEXEC as i64
+            } else {
+                0
+            };
+            SyscallResult::Return(value)
+        }
+        F_SETFD => {
+            // POSIX: set the close-on-exec bit from `arg & FD_CLOEXEC`.
+            // Other bits in `arg` are silently ignored (this matches
+            // Linux's behaviour — `FD_CLOEXEC` is the only bit
+            // defined on this command's `arg`).
+            let on = (arg & FD_CLOEXEC as u64) != 0;
+            ctx.process.set_fd_cloexec(fd, on);
+            SyscallResult::Return(0)
+        }
+        // TODO(phase-fcntl-extension): F_DUPFD, F_GETFL, F_SETFL, ...
+        _ => SyscallResult::Error(ENOSYS_VALUE),
+    }
 }
 
 /// Read 8 little-endian bytes from a slice as a `u64`. Used by

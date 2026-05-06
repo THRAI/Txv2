@@ -4,6 +4,62 @@
 
 ## Current Shape
 
+- 2026-05-06 ELF loader Wave 2 (Phase 2 CLOEXEC plumbing + Phase 1B
+  P1/P2/P3 process-side helpers) on branch `feat/elf-loader-and-execve`.
+  Per `docs/progress/plans/2026-05-06-elf-loader-and-execve.md` Part 2
+  + Part 1 sub-items P1/P2/P3. Open Q #4 DECIDED 2026-05-06: per-fd
+  CLOEXEC bitmap stored as `AtomicU32` on `ProcessPayload` (covers fds
+  0..31). Deliverables: (1) `ProcessPayload.fd_cloexec: AtomicU32`
+  next to existing `fds`; `step_fork` clones the parent's word; init
+  defaults to `0` per Linux convention (stdio NOT close-on-exec).
+  Public accessors `ProcessIdentity::fd_cloexec(fd)` /
+  `set_fd_cloexec(fd, value)` + crate-internal `fd_cloexec_word`.
+  (2) `OpenFileFlags.cloexec: bool` flag added (sibling to `read` /
+  `write` / `append`); all in-tree call sites updated for source-compat
+  (`tx-fs::devfs`, `tx-subsystems::tty::project`, vfs/page_backed
+  tests). (3) `NR_FCNTL = 25` arm with `F_GETFD` / `F_SETFD` /
+  `FD_CLOEXEC = 1` + `O_CLOEXEC = 0o2000000` in
+  `tx-shims::linux_syscall::numbers`; `sys_fcntl` validates
+  `fd < FD_TABLE_SIZE` else `-EBADF`, returns `-ENOSYS` for unknown
+  cmd (`TODO(phase-fcntl-extension)`). (4) Exec phase-7 helpers in
+  `tx-subsystems::process::execution` (per
+  `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC` /
+  `txdoc:EXEC-12-4-INSTALL-BRK`): `step_close_cloexec_fds(process)`
+  closes every marked fd then clears the bitmap; both NOT async — the
+  drop runs through EBR-deferred `Cap<OpenFile>::Drop`, no flush
+  await. `step_install_brk_for_exec(process, new_brk_base)` overwrites
+  both `brk_base` and `current_brk` atomically. (5)
+  `SigActionTable::step_reset_for_exec(&self)` on the existing
+  per-payload table (per `txdoc:EXEC-12-3-RESET-SIGNAL-DISPOSITIONS` +
+  `SIGNAL_v1` §15.2): walks 1..=64, replaces every `Handler(_)` slot
+  with `Default`, preserves `Default` and `Ignore`; pending signals
+  NOT cleared (POSIX). Scope reduction: `sys_open` is not in the
+  trio's syscall surface, so Wave 2's `O_CLOEXEC` plumbing is the
+  bitmap + fcntl arm only — when `sys_open` lands (post-ELF-loader
+  slice), threading `O_CLOEXEC` through it is mechanical (decode
+  `args[1] & 0o2000000`, set the matching bit on
+  `ProcessPayload.fd_cloexec` after `set_fd`). Verification:
+  `cargo check --workspace` + `cargo check -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`
+  clean; `cargo test -p tx-subsystems --lib -- --test-threads=1`
+  355 → 364 (+6 process tests covering default/round-trip/fork-clone
+  + close-cloexec marked-only / bitmap-clear / install-brk; +3 signal
+  tests covering reset to `SIG_DFL` / preserves `SIG_IGN` / preserves
+  pending); `cargo test -p tx-shims --lib` 12 → 17 (+5 fcntl tests:
+  getfd-zero / setfd-then-getfd / setfd-no-spillover / unknown-cmd
+  ENOSYS / invalid-fd EBADF); `tx-scripts` 23/23, `tx-kernel` 19/19,
+  `tx-fs` 13/13 unchanged; `cargo fmt --check` + `cargo xtask
+  progress validate` clean. Next: Phase 5 (the exec script itself in
+  `tx-scripts/src/process/exec/`) which composes the V1 (build aspace),
+  V2 (populate stack), Phase-3 stack builder, and these Phase-7
+  helpers into the eight-phase script per
+  `txdoc:EXEC-4-THE-EIGHT-PHASES`. Note for Phase 5: the three
+  phase-7 helpers (`step_close_cloexec_fds`,
+  `step_install_brk_for_exec`, `SigActionTable::step_reset_for_exec`)
+  are NOT async — phase 7 is a synchronous block per EXEC-PONR;
+  earlier exec phases that touch I/O (open binary; populate stack)
+  are async. Blocker: none.
+
 - 2026-05-06 Pre-ELF Phase 7 (end-to-end production smoke +
   `kernel_main` reactor-loop wiring) on branch `feat/pre-elf-runtime`.
   Per `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`
