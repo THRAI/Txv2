@@ -258,6 +258,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_mount_table();
     tx_subsystems::cross_crate_test_support::reset_mount_id_counter();
     tx_subsystems::cross_crate_test_support::reset_dev_id_counter();
+    tx_subsystems::cross_crate_test_support::reset_reactor_submit_seam();
     crate::init::reset_boot_state_for_test();
     crate::irq::reset_dispatch_table_for_test();
     CONSOLE_CAPTURED_LEN.store(0, Ordering::Release);
@@ -954,4 +955,73 @@ fn boot_smoke_bootstrap_exec_seeds_init_user_context_from_fixture() {
         fixture_size > 0,
         "fixture size constant is non-zero ({fixture_size} bytes)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Wave 1 fork/clone/wait4 slice — reactor-submission seam smoke
+// ---------------------------------------------------------------------------
+//
+// The seam lives in `tx_subsystems::reactor_submit`: a function-pointer
+// slot that `tx-kernel`'s init populates with a closure binding the
+// boot reactor and the platform parameter `P`. Wave 2's `sys_clone`
+// arm in `tx-shims` reads the slot to submit a freshly-cloned child
+// thread to the reactor without taking a circular dependency back
+// into `tx-kernel`.
+//
+// This smoke verifies the install seam end-to-end:
+//   - Before any boot wiring, `submit_child_thread_fn()` reports
+//     `None` (slot empty, fresh from `reset_reactor_submit_seam`).
+//   - After `install_reactor_submit_seam`, the slot resolves to a
+//     non-null fn pointer that is `submit_child_thread_into_boot_reactor`.
+//   - Calling the routed fn with a dummy live ProcessIdentity +
+//     ThreadIdentity is a clean no-op (the boot reactor is not
+//     initialised in the test scaffolding so `BOOT_REACTOR.with`
+//     short-circuits via its `init` check).
+
+#[test]
+fn reactor_submission_seam_submits_child_thread_smoke() {
+    use tx_subsystems::reactor_submit;
+
+    let _serial = setup();
+    bootstrap_init();
+
+    // Pre-condition: the seam slot is empty (setup() resets it).
+    assert!(
+        reactor_submit::submit_child_thread_fn().is_none(),
+        "fresh setup must leave the reactor-submit seam slot empty",
+    );
+
+    // Install. The hook captures `TestPlatform` as the platform
+    // parameter `P` so the resulting fn pointer is parameter-free.
+    crate::init::CoreInit::<TestPlatform>::install_reactor_submit_seam();
+
+    // Post-condition: the slot now resolves.
+    let installed = reactor_submit::submit_child_thread_fn()
+        .expect("install_reactor_submit_seam populates the slot");
+
+    // Fn-pointer identity must equal the platform-typed
+    // `submit_child_thread_into_boot_reactor` we asked for.
+    let expected = crate::init::CoreInit::<TestPlatform>::submit_child_thread_into_boot_reactor
+        as reactor_submit::SubmitChildThreadFn;
+    assert_eq!(
+        installed as usize, expected as usize,
+        "installed fn pointer must equal the platform-typed routing helper",
+    );
+
+    // Drive the routed call once with a freshly forked init child.
+    // The boot reactor is not initialised in this scaffolding, so
+    // `BOOT_REACTOR.with` returns `None` inside the routed body —
+    // the call is a clean no-op (no panic, no submission).
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated by bootstrap_init");
+    let child = tx_subsystems::process::step_fork::<TestPlatform>(&init).expect("fork");
+    let leader = child
+        .nth_thread(0)
+        .expect("fresh child has a leader thread");
+    reactor_submit::submit_child_thread(child.clone(), leader);
+    // No assertion on reactor side-effects — the BOOT_REACTOR slot
+    // is not initialised in the test scaffolding (init_boot_reactor
+    // is gated behind init_substrate_if_ready). The smoke covers
+    // the fn-pointer routing; production reactor-side coupling is
+    // exercised once the BSP reactor loop runs at boot.
 }

@@ -1070,6 +1070,55 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":boot:ok\n");
     }
 
+    /// Wave 1 of the fork/clone/wait4 slice: install the reactor-
+    /// submission hook in `tx_subsystems::reactor_submit` so a
+    /// future `sys_clone` arm in `tx-shims` (Wave 2) can submit
+    /// freshly-forked child threads to the BSP boot reactor without
+    /// taking a circular dependency back into `tx-kernel`.
+    ///
+    /// The installed function pointer routes through
+    /// [`Self::submit_child_thread_into_boot_reactor`], which
+    /// captures the platform parameter `P` so the seam can stay
+    /// parameter-free at the read site.
+    pub(crate) fn install_reactor_submit_seam() {
+        tx_subsystems::reactor_submit::install_submit_child_thread(
+            Self::submit_child_thread_into_boot_reactor,
+        );
+    }
+
+    /// Reactor-submission hook body. Captured by
+    /// [`Self::install_reactor_submit_seam`] as a plain `fn` pointer
+    /// (the platform parameter `P` is monomorphised at install time
+    /// so the resulting fn pointer is parameter-free).
+    ///
+    /// Builds `PerHartSlotted::<P, _>::new(payload,
+    /// run_thread::<P>(child_thread, payload))` and submits via
+    /// `BOOT_REACTOR.submit_task`. `child_thread.payload_cap()`
+    /// returning `None` would indicate the child is already a
+    /// zombie, which violates `step_fork`'s post-condition and
+    /// `seed_child_leader_context`'s precondition; we treat it as a
+    /// silent no-op rather than panicking because the syscall arm
+    /// has its own error reporting path.
+    fn submit_child_thread_into_boot_reactor(
+        _child_process: tx_substrate::zone::Cap<tx_subsystems::process::ProcessIdentity>,
+        child_thread: tx_substrate::zone::Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
+    ) {
+        let Some(payload) = child_thread.payload_cap() else {
+            // Kernel-invariant violation: a freshly-cloned child
+            // thread should always be live-with-payload. Wave 2's
+            // sys_clone has its own error reporting path; we don't
+            // panic here so the caller sees the error surface.
+            return;
+        };
+        let task_payload = payload.clone();
+        let _ = BOOT_REACTOR.with(|reactor| {
+            reactor.submit_task(crate::thread_future::PerHartSlotted::<P, _>::new(
+                task_payload.clone(),
+                crate::thread_future::run_thread::<P>(child_thread, task_payload),
+            ));
+        });
+    }
+
     /// Pre-ELF Phase 7: submit init's leader thread future as a
     /// reactor task, then drive the BSP hart-loop until the future
     /// resolves. Resolution happens when `run_thread` returns — the
@@ -1093,6 +1142,16 @@ impl<P: TxPlatform> CoreInit<P> {
     /// the loop went idle. This is the closest seam to the plan's
     /// guesses and keeps the BSP and APs symmetric.
     fn run_userspace_reactor_loop() {
+        // Wave 1 of the fork/clone/wait4 slice (2026-05-06): install
+        // the reactor-submission seam so a future `sys_clone` arm
+        // (Wave 2) can route freshly-forked child threads through
+        // the BSP boot reactor without taking a circular crate
+        // dependency back into `tx-kernel`. The seam lives in
+        // `tx_subsystems::reactor_submit` (a function-pointer slot);
+        // the platform parameter `P` is captured at install time
+        // here so the seam stays parameter-free at the call site.
+        Self::install_reactor_submit_seam();
+
         let Some(init) = tx_subsystems::process::execution::init_process() else {
             // No init process — nothing to drive. Skip cleanly.
             return;

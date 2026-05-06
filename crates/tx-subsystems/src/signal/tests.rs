@@ -1157,9 +1157,12 @@ mod delivery {
             Some(crate::process::ExitStatus::Signaled(Signum::SIGKILL))
         );
         assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGKILL));
+        // POSIX <sys/wait.h> signaled-exit encoding: signum in low 7
+        // bits. Migrated from `128 + sig` by Wave 1 of the
+        // fork/clone/wait4 slice — Open Q #3 DECIDED.
         assert_eq!(
             proc_cap.exit_status().unwrap().wait_status_word(),
-            128 + Signum::SIGKILL.raw() as i32
+            Signum::SIGKILL.raw() as i32 & 0x7f
         );
     }
 
@@ -1302,9 +1305,12 @@ mod delivery {
             Some(crate::process::ExitStatus::Signaled(Signum::SIGTERM))
         );
         assert_eq!(proc_cap.terminating_signal(), Some(Signum::SIGTERM));
+        // POSIX <sys/wait.h> signaled-exit encoding: signum in low 7
+        // bits. Migrated from `128 + sig` by Wave 1 of the
+        // fork/clone/wait4 slice — Open Q #3 DECIDED.
         assert_eq!(
             proc_cap.exit_status().unwrap().wait_status_word(),
-            128 + Signum::SIGTERM.raw() as i32
+            Signum::SIGTERM.raw() as i32 & 0x7f
         );
     }
 

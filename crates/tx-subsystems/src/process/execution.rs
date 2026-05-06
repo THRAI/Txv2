@@ -4,7 +4,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use tx_hal::PmapIf;
+use tx_hal::{PmapIf, UserTrapContext};
 use tx_substrate::zone::{self, Cap, ZoneError};
 use tx_substrate::SpinMutex;
 
@@ -325,13 +325,83 @@ pub fn step_fork<P: PmapIf>(
     Ok(child_proc)
 }
 
+/// Seed the child leader thread's `saved_user_context` from the
+/// parent's snapshot at clone time.
+///
+/// Linux fork/clone ABI: the child returns from the clone syscall
+/// with the parent's GPRs *except* `a0 = 0`, and resumes at the
+/// instruction *after* the trapping `ecall`. RV64-specific:
+///
+/// - `a0` lives in `regs[10]` (RV64 ABI),
+/// - `ecall` is exactly 4 bytes (RV32I/RV64I base ISA — there is no
+///   `c.ecall` compressed form), so the child's resume address is
+///   `parent_user_ctx.pc + 4`.
+///
+/// The parent thread is intentionally **not** modified here: the
+/// syscall arm encodes the child's pid into the parent's
+/// `pending_syscall_return` separately, and the trap-shell writeback
+/// discipline drains that into the parent's fresh trap frame's `a0`
+/// before re-entry per `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`.
+///
+/// Behaviour:
+///
+/// 1. Clone `parent_user_ctx` into a fresh `UserTrapContext`.
+/// 2. Overwrite `regs[10] = 0` (RV64 a0).
+/// 3. Overwrite `pc = parent_user_ctx.pc + 4` (skip past `ecall`).
+/// 4. `store_saved_user_context(Some(child_ctx))` on the child
+///    thread's payload.
+///
+/// `payload_cap()` returning `None` is a kernel-invariant
+/// violation: a fresh child thread minted by [`step_fork`] is
+/// always live-with-payload at the moment the syscall arm calls
+/// this helper. We panic loudly with a stable sentinel string
+/// (matches the precedent set by the ELF loader's
+/// `:bootstrap-exec:fail`).
+///
+/// Sibling helper, not a method on [`ProcessIdentity`]: keeps the
+/// RV64-ABI knowledge (the `+ 4` skip and the `regs[10]` index)
+/// local to a single grep target so a future ARM64 / x86_64 port
+/// has one place to extract per-arch constants.
+///
+/// Cites:
+/// - `txdoc:PROCESS-FORK-FAMILY` /
+///   `txdoc:PROCESS-STEP-CLONE-PROCESS-NEW-PROCESS-PATH-CLONE-THREAD-1`
+///   (`docs/design/04_process-signals/PROCESS_v1.md` §7.1).
+/// - `txdoc:THREAD-5-1-STATE-PLACEMENT`
+///   (`docs/design/02_execution/THREAD_RUNTIME_v1.md`) — the
+///   child's `saved_user_context` lives on the child's leader
+///   thread payload.
+pub fn seed_child_leader_context(
+    child_thread: &Cap<ThreadIdentity>,
+    parent_user_ctx: &UserTrapContext,
+) {
+    // (1) Clone the parent context.
+    let mut child_ctx = *parent_user_ctx;
+    // (2) RV64 a0 = 0: child's clone-syscall return value.
+    child_ctx.regs[10] = 0;
+    // (3) Skip past ecall: child resumes after, not retries.
+    child_ctx.pc = parent_user_ctx.pc.wrapping_add(4);
+
+    // (4) Store on the leader thread's payload. payload_cap == None
+    // here means a freshly forked thread already lost its payload,
+    // which is a kernel-invariant violation: step_fork's post-condition
+    // is exactly that the child leader is live-with-payload.
+    let payload = child_thread
+        .payload_cap()
+        .expect("seed_child_leader_context: fresh child thread missing payload");
+    payload.store_saved_user_context(Some(child_ctx));
+}
+
 /// Exit the entire thread group: zombify every thread, drop the
 /// process payload, set the process exit status. Identity persists.
 ///
 /// Threads zombify with the `wait_status_word` projection of `status`
-/// — day-1's `128 + sig` shell encoding for `Signaled`, the raw int
-/// for `Exited` — preserving the "thread-side exit_status is an int"
-/// shape that `THREAD_RUNTIME_v1` §7.2 carries.
+/// — POSIX `<sys/wait.h>` encoding (`(code & 0xff) << 8` for explicit
+/// exits, `sig & 0x7f` for signal exits) — preserving the
+/// "thread-side exit_status is an int" shape that `THREAD_RUNTIME_v1`
+/// §7.2 carries. (Migrated to POSIX from the day-1 shell-convention
+/// `128 + sig` encoding by Wave 1 of the fork/clone/wait4 slice;
+/// Open Q #3 DECIDED 2026-05-06.)
 pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     session_leader_hangup_cascade(process);
     sever_children(process);
@@ -361,9 +431,10 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
 /// the process-visible exit status, drops the `ProcessPayload`. The
 /// remaining §7.3.3 phase-5 cascade (SIGCHLD to parent, `exit_port`
 /// wake, full reparenting-into-init, orphan-pgrp SIGHUP,
-/// session-leader controlling-tty hangup per §8.3) lands when an
-/// init handle is globally addressable and `exit_port` machinery
-/// arrives.
+/// session-leader controlling-tty hangup per §8.3) lands incrementally:
+/// SIGCHLD post is wired via `post_sigchld_to_parent`, and the Wave 1
+/// fork/clone/wait4 slice (2026-05-06) added the `exit_port` fire
+/// alongside the SIGCHLD post for parent-side wake.
 pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     session_leader_hangup_cascade(process);
     sever_children(process);
@@ -475,10 +546,19 @@ fn session_leader_hangup_cascade(process: &Cap<ProcessIdentity>) {
 /// `Ignore`, so without a handler the bit just accumulates in the
 /// parent's leader-thread `thread_pending` until reaped or masked).
 ///
+/// Wave 1 of the fork/clone/wait4 slice (2026-05-06): also fires the
+/// parent's per-process `exit_port` wait channel
+/// (`EXIT_PORT_CHILD_ZOMBIFIED` bit) so a parent parked on
+/// `sys_wait4` (Wave 2) wakes when any child zombifies. Per
+/// `txdoc:PROCESS-WAIT-FAMILY-1` and the spec's
+/// "Block until a child's state changes" arm.
+///
 /// No-op for processes with no parent: bootstrap init (never had one)
 /// and orphans whose parent has already exited and severed them.
 /// Also no-op if the parent is itself a zombie — `step_kill_process`
-/// returns `NoLiveThread` and we discard.
+/// returns `NoLiveThread` and `fire_exit_port` returns `0` (no
+/// payload to fire through). The `exit_port` fire is harmless when
+/// no awaiter is parked (Channel::fire returns 0).
 ///
 /// `siginfo` is not yet wired (no `SigInfo` type in day-1 signal
 /// surface); spec §7.3.3 phase 5 will populate `si_pid`, `si_uid`,
@@ -487,6 +567,11 @@ fn session_leader_hangup_cascade(process: &Cap<ProcessIdentity>) {
 fn post_sigchld_to_parent(process: &Cap<ProcessIdentity>) {
     if let Some(parent) = process.parent_cap() {
         let _ = crate::signal::step_kill_process(&parent, crate::signal::Signum::SIGCHLD);
+        // Fire the parent's exit_port. A zombie parent has no payload
+        // and `fire_exit_port` returns 0 — no panic, no double-fire.
+        let _ = parent.fire_exit_port(tx_reactor::wait::Mask::from_bits(
+            crate::process::structure::EXIT_PORT_CHILD_ZOMBIFIED,
+        ));
     }
 }
 
@@ -826,8 +911,23 @@ fn sign_process_payload(
     current_brk: u64,
 ) -> Result<tx_substrate::zone::PayloadCap<ProcessPayload>, ZoneError> {
     use crate::tty::structure::AtomicSlot;
+    use tx_reactor::wait::Channel;
     let aspace_slot: AtomicSlot<Cap<AddressSpace>> = AtomicSlot::empty();
     aspace_slot.store(Some(aspace));
+
+    // Allocate a fresh `exit_port` Channel per `ProcessPayload` and
+    // register it with the global wait-carrier resolver so async
+    // awaiters can `wait_on_token` against the returned id without
+    // holding a `Cap<ProcessIdentity>`. Pattern mirrors
+    // `TtyIdentity::new` — the only other in-tree wait carrier today
+    // (`crates/tx-subsystems/src/tty/structure/identity.rs`).
+    //
+    // Carrier-lifetime cleanup (release on payload drop) is tracked
+    // as Cross-cutting Risk #1 in the slice plan and is deferred
+    // beyond Wave 1.
+    let exit_port = Channel::new();
+    let exit_port_carrier_id = crate::wait_carrier::register_wait_channel(exit_port.clone());
+
     let res = zone::reserve_for::<ProcessPayload>()?;
     let cap = zone::sign_for(
         res,
@@ -842,6 +942,8 @@ fn sign_process_payload(
             fd_cloexec: core::sync::atomic::AtomicU32::new(fd_cloexec),
             brk_base: core::sync::atomic::AtomicU64::new(brk_base),
             current_brk: core::sync::atomic::AtomicU64::new(current_brk),
+            exit_port,
+            exit_port_carrier_id,
         },
     );
     Ok(tx_substrate::zone::PayloadCap::from_cap(cap))
