@@ -782,6 +782,7 @@ fn step_open_round_trips_to_directory_dentry() {
             read: true,
             write: false,
             append: false,
+            cloexec: false,
         },
         0,
         &cred,

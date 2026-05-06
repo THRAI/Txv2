@@ -38,3 +38,37 @@ pub const NR_RT_SIGACTION: u64 = 134;
 /// `thread_runtime::execution::step_sigprocmask`. Rejects
 /// `sigsetsize != 8`.
 pub const NR_RT_SIGPROCMASK: u64 = 135;
+/// `fcntl(fd, cmd, arg)`. Linux generic ABI `__NR_fcntl` (= `__NR3264_fcntl`).
+///
+/// Wave 2 of the ELF loader plan ships a minimal subset:
+/// `F_GETFD` / `F_SETFD` against the per-process CLOEXEC bitmap
+/// (`ProcessPayload.fd_cloexec`). Other commands (`F_DUPFD`,
+/// `F_GETFL`, `F_SETFL`, etc.) return `-ENOSYS` until the relevant
+/// follow-up phases (`fcntl-extension`) wire them up.
+pub const NR_FCNTL: u64 = 25;
+
+// ---------------------------------------------------------------------
+// fcntl command numbers + flag bits.
+//
+// Source: Linux generic uapi `include/uapi/asm-generic/fcntl.h`
+// (`F_DUPFD = 0` ... `F_GETFD = 1`, `F_SETFD = 2`, ...). `FD_CLOEXEC`
+// is the only bit defined for the `arg` of `F_SETFD` / the return of
+// `F_GETFD` per POSIX.
+// ---------------------------------------------------------------------
+
+/// `F_GETFD` cmd: read the close-on-exec bit for the given fd.
+/// Returns `FD_CLOEXEC` if set, `0` otherwise.
+pub const F_GETFD: i32 = 1;
+/// `F_SETFD` cmd: set the close-on-exec bit for the given fd from
+/// `arg & FD_CLOEXEC`.
+pub const F_SETFD: i32 = 2;
+/// `FD_CLOEXEC` flag: the (only) bit defined for the `arg` of
+/// `F_SETFD` / the return of `F_GETFD`.
+pub const FD_CLOEXEC: i32 = 1;
+
+/// `O_CLOEXEC` flag for `open(2)` / future `openat(2)`. Linux generic
+/// ABI: `0o2000000` (`0x80000`). Defined here so the (yet-to-land)
+/// `sys_open` arm and any test that wants to construct an
+/// `OpenFileFlags { cloexec: true, ... }` from the user-visible bit
+/// can share one canonical constant.
+pub const O_CLOEXEC: u32 = 0o2000000;

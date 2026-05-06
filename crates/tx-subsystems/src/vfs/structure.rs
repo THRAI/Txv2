@@ -314,6 +314,17 @@ pub struct OpenFileFlags {
     pub read: bool,
     pub write: bool,
     pub append: bool,
+    /// `O_CLOEXEC` (Linux generic ABI bit `0o2000000` = `0x80000`):
+    /// the resulting fd is marked close-on-exec so the next exec
+    /// silently closes it. The walker itself does not look at this
+    /// bit — it threads through to the syscall arm (`sys_open` once
+    /// it lands; today only the per-process bitmap is exposed via
+    /// `fcntl(F_SETFD)`), which is responsible for setting the
+    /// matching bit in `ProcessPayload.fd_cloexec` after the fd
+    /// table install completes. The flag stays on `OpenFileFlags`
+    /// itself so a future `dup3(F_DUPFD_CLOEXEC)` / `pipe2` can
+    /// observe it without re-decoding the open flags.
+    pub cloexec: bool,
 }
 
 #[derive(Clone, Debug)]

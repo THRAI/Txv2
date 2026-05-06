@@ -218,12 +218,18 @@ pub fn bootstrap_init_process(
     // at exec time per VM_v1_2 §5.8.
     // TODO(phase-elf-loader): replace bootstrap brk_base with
     // binary-derived value once `step_exec` materialises an image.
+    // Bootstrap-time CLOEXEC bitmap is `0`: init's stdio (fds 0/1/2,
+    // installed by Phase 3b's `init.rs::bind_init_cwd_and_root`) is
+    // NOT close-on-exec by Linux convention. Per the Wave 2 plan,
+    // until `sys_open` exists in the trio's syscall surface, the
+    // bitmap is mutated only by `fcntl(F_SETFD)`.
     let payload = sign_process_payload(
         aspace,
         vec![leader],
         Cred::root(),
         None,
         empty_fd_table(),
+        0,
         BOOTSTRAP_BRK_BASE,
         BOOTSTRAP_BRK_BASE,
     )?;
@@ -249,7 +255,15 @@ pub fn step_fork<P: PmapIf>(
     // are cloned per the Trio plan §"Cross-cutting risks #7": each
     // child gets its own brk_base/current_brk pair, while the underlying
     // VM mappings are cloned through `AddressSpace::fork_aspace` below.
-    let (parent_aspace, parent_cred, parent_cwd, parent_fds, parent_brk_base, parent_current_brk) = {
+    let (
+        parent_aspace,
+        parent_cred,
+        parent_cwd,
+        parent_fds,
+        parent_fd_cloexec,
+        parent_brk_base,
+        parent_current_brk,
+    ) = {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
         (
@@ -257,6 +271,7 @@ pub fn step_fork<P: PmapIf>(
             payload.cred(),
             payload.cwd(),
             payload.snapshot_fds(),
+            payload.fd_cloexec_word(),
             payload.brk_base(),
             payload.current_brk(),
         )
@@ -281,13 +296,17 @@ pub fn step_fork<P: PmapIf>(
     // Wire up payload — child inherits parent credentials, cwd, and
     // a per-slot clone of the parent's fd table. POSIX: fork copies
     // the cwd reference (same DEntry); CLONE_FS (sharing) is a
-    // Phase-2 concern.
+    // Phase-2 concern. Per Linux semantics CLOEXEC is per-fd and
+    // copied across fork — the child sees the parent's snapshot at
+    // fork time; subsequent `fcntl(F_SETFD)` calls in either parent
+    // or child do not affect the other.
     let payload = sign_process_payload(
         child_aspace_cap,
         vec![leader],
         parent_cred,
         parent_cwd,
         parent_fds,
+        parent_fd_cloexec,
         parent_brk_base,
         parent_current_brk,
     )
@@ -656,6 +675,82 @@ pub fn step_setsid(target: &Cap<ProcessIdentity>) -> Result<Sid, SetsidError> {
     Ok(new_sid)
 }
 
+// --- exec phase-7 commit helpers (post-PoNR, infallible) -------------
+//
+// The three steps below materialise the per-process commits exec phase 7
+// applies after `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`
+// has stored the new aspace. Each is **infallible** and **synchronous**
+// per `txdoc:EXEC-15-THE-EXEC-PONR-INVARIANT` — no allocation, no I/O,
+// no fallible computation past phase 6. The exec script (Part 5) calls
+// these in sequence; they are also unit-testable in isolation.
+//
+// Note for Phase 5 (the exec script itself): these are NOT async. Other
+// `step_*` functions in this crate that perform I/O (`step_open`,
+// `vm::scripts::populate_detached_user_range`) are async, but the
+// phase-7 commits act on already-resolved Caps and atomic words —
+// nothing to await. The script's phase 7 is therefore a sequential
+// block of synchronous calls.
+
+/// Close every fd whose CLOEXEC bit is set on `process`, then clear
+/// the close-on-exec bitmap.
+///
+/// Per `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC` and the Wave 2 plan's
+/// Part 1 P1 sub-item. Walks bits 0..`FD_TABLE_SIZE` of the per-process
+/// `fd_cloexec` word; for each set bit, drops the fd via the existing
+/// `set_fd(i, None)` accessor — the resulting `Cap<OpenFile>` `Drop`
+/// runs the close per `txdoc:VFS-CHECKS-WALKER-MODES-1`. Any
+/// `OpenFile::Drop` side-effects (eventual file-flush etc.) are NOT
+/// awaited here: the EBR machinery handles deferred drop, and exec's
+/// post-PoNR commit cannot await.
+///
+/// Infallible — by EXEC-PONR. No-op for zombies (no payload to sweep).
+/// Out-of-range bits (≥ `FD_TABLE_SIZE`) are ignored: today's bitmap
+/// reserves bits 0..31, but the fd table only carries 8 slots.
+pub fn step_close_cloexec_fds(process: &Cap<ProcessIdentity>) {
+    let word = process.fd_cloexec_word();
+    if word == 0 {
+        return;
+    }
+    // Walk only fds in the existing fixed-size table; reserved bits
+    // above the table are unreachable from `set_fd` and would be a
+    // no-op anyway.
+    for fd in 0..FD_TABLE_SIZE as u32 {
+        if (word & (1u32 << fd)) != 0 {
+            // Drop via the existing accessor; the previous `Cap` (if
+            // any) is returned for EBR-deferred drop. We discard it
+            // here — the slot is now empty, the fd is closed.
+            let _ = process.set_fd(fd as usize, None);
+        }
+    }
+    // Clear the bitmap wholesale: every previously-marked fd is now
+    // closed; future fcntl(F_SETFD) calls start from a zeroed word.
+    if let Some(payload) = process.payload.lock().as_ref() {
+        payload.store_fd_cloexec_word(0);
+    }
+}
+
+/// Install `new_brk_base` as both the brk base and the current brk
+/// for `process`. Per `txdoc:EXEC-12-4-INSTALL-BRK` and the Wave 2
+/// plan's Part 1 P3 sub-item.
+///
+/// The exec script (Part 5) computes `new_brk_base` from the image
+/// plan: typically the highest LOAD segment's `vaddr + memsz`,
+/// page-rounded up. Storing the same value into both fields seeds the
+/// process at "no heap allocated yet" — `brk(2)` with a request above
+/// `current_brk` then grows the heap on demand.
+///
+/// Infallible — by EXEC-PONR. No-op for zombies (no payload to seed).
+pub fn step_install_brk_for_exec(process: &Cap<ProcessIdentity>, new_brk_base: u64) {
+    if let Some(payload) = process.payload.lock().as_ref() {
+        payload
+            .brk_base
+            .store(new_brk_base, core::sync::atomic::Ordering::Release);
+        payload
+            .current_brk
+            .store(new_brk_base, core::sync::atomic::Ordering::Release);
+    }
+}
+
 // --- internal sign-and-publish helpers ---
 
 fn sign_session(sid: Sid) -> Result<Cap<Session>, ZoneError> {
@@ -707,6 +802,7 @@ fn sign_process_payload(
     cred: Cred,
     cwd: Option<Cap<crate::vfs::DEntry>>,
     fds: [Option<Cap<OpenFile>>; FD_TABLE_SIZE],
+    fd_cloexec: u32,
     brk_base: u64,
     current_brk: u64,
 ) -> Result<tx_substrate::zone::PayloadCap<ProcessPayload>, ZoneError> {
@@ -724,6 +820,7 @@ fn sign_process_payload(
             cred: SpinMutex::new(cred),
             cwd: SpinMutex::new(cwd),
             fds: SpinMutex::new(fds),
+            fd_cloexec: core::sync::atomic::AtomicU32::new(fd_cloexec),
             brk_base: core::sync::atomic::AtomicU64::new(brk_base),
             current_brk: core::sync::atomic::AtomicU64::new(current_brk),
         },

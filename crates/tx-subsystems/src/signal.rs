@@ -216,6 +216,33 @@ impl SigActionTable {
         }
         self.entries.lock()[(sig.raw() - 1) as usize] = disposition;
     }
+
+    /// Reset every user-installed handler to `SigDisposition::Default`,
+    /// preserving `Default` and `Ignore` slots.
+    ///
+    /// Per `txdoc:EXEC-12-3-RESET-SIGNAL-DISPOSITIONS`,
+    /// `txdoc:EXEC-16-SIGNAL-RESET-SEMANTICS`, and `SIGNAL_v1` §15.2:
+    /// exec resets only handlers — `SIG_IGN` dispositions survive
+    /// across exec (POSIX), and pending signals are NOT cleared (a
+    /// SIGTERM sent moments before exec is still delivered after the
+    /// new image starts).
+    ///
+    /// `SigDisposition` today carries only the handler shape
+    /// (`Default` / `Ignore` / `Handler(usize)`); when SA_FLAGS,
+    /// SA_RESTORER, and per-handler SA_MASK are added, those fields
+    /// will be zeroed in the same sweep (a `Default` slot has no
+    /// handler frame storage by definition).
+    ///
+    /// Phase 7 — infallible. Called by the exec script after
+    /// `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`.
+    pub fn step_reset_for_exec(&self) {
+        let mut entries = self.entries.lock();
+        for slot in entries.iter_mut() {
+            if matches!(slot, SigDisposition::Handler(_)) {
+                *slot = SigDisposition::Default;
+            }
+        }
+    }
 }
 
 // ----- Delivery-side types (selection + AST) -----

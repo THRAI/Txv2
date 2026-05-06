@@ -30,6 +30,7 @@ fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
             read: true,
             write: true,
             append: false,
+            cloexec: false,
         },
     )
 }

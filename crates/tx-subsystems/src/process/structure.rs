@@ -275,6 +275,47 @@ impl ProcessIdentity {
             .and_then(|p| p.set_fd(idx, file))
     }
 
+    /// Read the close-on-exec bit for fd `fd` on this process's
+    /// payload. Returns `false` for zombies (no payload), for fd
+    /// indices outside the day-1 `AtomicU32` bitmap (≥ 32), and for
+    /// unmarked fds.
+    ///
+    /// Used by `tx-shims::linux_syscall::sys_fcntl` to service
+    /// `F_GETFD`, and by future `sys_open` plumbing once `O_CLOEXEC`
+    /// is threaded through the open arm.
+    pub fn fd_cloexec(&self, fd: u32) -> bool {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.fd_cloexec_get(fd))
+            .unwrap_or(false)
+    }
+
+    /// Set or clear the close-on-exec bit for fd `fd` on this
+    /// process's payload. No-op for zombies and for fd indices outside
+    /// the day-1 `AtomicU32` bitmap (≥ 32).
+    ///
+    /// Used by `tx-shims::linux_syscall::sys_fcntl` to service
+    /// `F_SETFD`, and by future `sys_open` plumbing once `O_CLOEXEC`
+    /// is threaded through.
+    pub fn set_fd_cloexec(&self, fd: u32, value: bool) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.set_fd_cloexec(fd, value);
+        }
+    }
+
+    /// Internal: snapshot the full close-on-exec bitmap word. Returns
+    /// `0` for zombies. Used by
+    /// [`crate::process::execution::step_close_cloexec_fds`] during
+    /// exec phase 7 to walk every set bit.
+    pub(crate) fn fd_cloexec_word(&self) -> u32 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.fd_cloexec_word())
+            .unwrap_or(0)
+    }
+
     /// Snapshot the current `SigDisposition` for `sig` from this
     /// process's per-process action table. Returns `None` for zombies
     /// (no payload). Used by the `rt_sigaction(2)` syscall dispatcher
@@ -456,6 +497,23 @@ pub struct ProcessPayload {
     /// `dup`-shape sharing). Per the same risk note: full
     /// `dup3`/`fcntl(F_DUPFD)` semantics are a follow-up.
     pub(crate) fds: SpinMutex<[Option<Cap<OpenFile>>; FD_TABLE_SIZE]>,
+    /// Per-fd close-on-exec bitmap. Bit `i` set means fd `i` will be
+    /// closed by [`crate::process::execution::step_close_cloexec_fds`]
+    /// during exec phase 7 (per `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC`).
+    ///
+    /// Per Open Q #4 (DECIDED 2026-05-06) the storage is `AtomicU32`,
+    /// covering up to fd 31 — well above today's `FD_TABLE_SIZE = 8`
+    /// and leaving headroom for the next-phase fd-table grow without
+    /// reshaping the field. Once the fd table grows beyond 32 the
+    /// natural upgrade is `[AtomicU64; N]`.
+    ///
+    /// Default `0` (no fds CLOEXEC at process creation). `step_fork`
+    /// clones the parent's bits per Linux semantics (CLOEXEC is per-fd,
+    /// copied across fork). Mutated via [`ProcessPayload::set_fd_cloexec`]
+    /// from the syscall dispatcher's `fcntl(F_SETFD)` arm and from
+    /// `sys_open` once `O_CLOEXEC` plumbing lands (see Wave 2 scope
+    /// reduction note in [`crate::process::execution::step_close_cloexec_fds`]).
+    pub(crate) fd_cloexec: AtomicU32,
     /// Base of the program-break (heap) region for this process.
     ///
     /// Set once at exec time (per `txdoc:VM-5-8-BRK`); never changes
@@ -556,6 +614,46 @@ impl ProcessPayload {
     pub(crate) fn snapshot_fds(&self) -> [Option<Cap<OpenFile>>; FD_TABLE_SIZE] {
         let slot = self.fds.lock();
         core::array::from_fn(|i| slot[i].clone())
+    }
+
+    /// Read the close-on-exec bit for fd `idx`. Out-of-range indices
+    /// (≥ 32) return `false` — they cannot be marked under the day-1
+    /// `AtomicU32` bitmap.
+    pub fn fd_cloexec_get(&self, idx: u32) -> bool {
+        if idx >= 32 {
+            return false;
+        }
+        (self.fd_cloexec.load(Ordering::Acquire) & (1u32 << idx)) != 0
+    }
+
+    /// Set or clear the close-on-exec bit for fd `idx`. Out-of-range
+    /// indices (≥ 32) are silently ignored — the day-1 `AtomicU32`
+    /// bitmap covers fds 0..31.
+    pub fn set_fd_cloexec(&self, idx: u32, value: bool) {
+        if idx >= 32 {
+            return;
+        }
+        let mask = 1u32 << idx;
+        if value {
+            self.fd_cloexec.fetch_or(mask, Ordering::AcqRel);
+        } else {
+            self.fd_cloexec.fetch_and(!mask, Ordering::AcqRel);
+        }
+    }
+
+    /// Snapshot the entire close-on-exec bitmap as a `u32`. Used by
+    /// [`crate::process::execution::step_close_cloexec_fds`] to walk
+    /// every set bit during exec phase 7.
+    pub(crate) fn fd_cloexec_word(&self) -> u32 {
+        self.fd_cloexec.load(Ordering::Acquire)
+    }
+
+    /// Replace the entire close-on-exec bitmap. Used by `step_fork`
+    /// to inherit the parent's CLOEXEC bits into the child, and by
+    /// [`crate::process::execution::step_close_cloexec_fds`] to clear
+    /// the bitmap after the close sweep.
+    pub(crate) fn store_fd_cloexec_word(&self, word: u32) {
+        self.fd_cloexec.store(word, Ordering::Release);
     }
 
     /// Read the program-break base address for this process. Returns

@@ -428,6 +428,7 @@ pub fn open_console_for_init() -> Cap<OpenFile> {
                     read: true,
                     write: true,
                     append: false,
+                    cloexec: false,
                 },
                 0,
                 &cred,
@@ -474,6 +475,7 @@ fn open_console_for_init_legacy() -> Cap<OpenFile> {
             read: true,
             write: true,
             append: false,
+            cloexec: false,
         },
     )
     .expect("open_console_for_init: OpenFile reservation failed")
