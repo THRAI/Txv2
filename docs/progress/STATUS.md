@@ -4,6 +4,59 @@
 
 ## Current Shape
 
+- 2026-05-06 Pre-ELF Phase 2 (reactor task wrapper + userspace-entry
+  shim) on branch `feat/pre-elf-runtime`. Per
+  `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md` Part 1.
+  HAL grows a default-panic `TrapIf::enter_userspace_with_context(ctx:
+  UserTrapContext) -> !` (`crates/tx-hal/src/trap.rs`); RV64 board
+  override builds an `Rv64TrapFrame`, calls the existing
+  `restore_user_context`, then `return_to_userspace`
+  (`boards/tx-hal-riscv64-qemu-virt/src/trap.rs`). New userspace-entry
+  shim `pub fn prepare_userspace_entry_payload(payload:
+  &PayloadCap<ThreadPayload>) -> UserTrapContext` in
+  `crates/tx-subsystems/src/thread_runtime/execution.rs`: snapshots
+  `saved_user_context`, drains `pending_syscall_return` (Ok(v) → a0 =
+  v as u64; Err(errno) → a0 = -errno as i64 as u64) into
+  `regs[10]`, clears `active_userspace_request`. Plan B writeback
+  discipline pinned by `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE` —
+  this is the only site that drains pending_syscall_return. New
+  `crates/tx-kernel/src/thread_future.rs` ships `PerHartSlotted<P, F>`
+  (sets/clears the per-hart slot around each `Future::poll`,
+  unconditional clear on `Pending` exit too) and the production
+  `pub async fn run_thread<P>(thread, payload)` driver. Sequencing:
+  `start_request` → `wait.await` (yields Pending) →
+  `linux_syscall::dispatch` for Syscall arms /
+  `step_exit_group_with_signal(SIGSEGV)` for PageFault (Phase 3
+  placeholder) → `checkpoint_userspace_entry_batch(req,
+  AstBatch::default(), |_| EnterUserspace)` (AST drain ordering before
+  prepare, per Cross-cutting risk #3) →
+  `prepare_userspace_entry_payload` →
+  `<P as TrapIf>::enter_userspace_with_context` (divergent). Init
+  wiring deferred to Phase 7 per the brief — `run_thread` is exported
+  but `kernel_main` still uses the trio's shutdown path; an end-to-end
+  smoke that demonstrates the reactor loop replaces the Phase 6 fake
+  driver in Phase 7. Tx-kernel grew a shared
+  `crate::test_serialise::KERNEL_TEST_LOCK` so the new thread_future
+  tests serialise against the existing init tests (both bootstrap
+  INIT_PROCESS). tx-subsystems 341 → 344 (3 new shim tests:
+  `prepare_userspace_entry_payload_drains_pending_return_into_a0`,
+  `prepare_userspace_entry_payload_negative_errno_encodes_as_minus_errno`,
+  `prepare_userspace_entry_payload_no_pending_preserves_saved_a0`);
+  tx-kernel 9 → 13 (4 new: `per_hart_slotted_sets_and_clears_slot_around_poll`,
+  `per_hart_slotted_clears_slot_on_pending_exit`,
+  `thread_future_dispatches_syscall_then_yields_for_userspace_entry`,
+  `thread_future_terminates_on_exit_group`); tx-fs 13/13, tx-shims 12/12,
+  tx-substrate sync 2/2. `cargo check --workspace`,
+  `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`, `cargo fmt --check`,
+  `cargo xtask progress validate` all clean. Next: Phase 3
+  (page-fault async dispatch via `aspace.fault_script`) → Phase 5 (IRQ
+  dispatch + UART RX) → Phase 7 (end-to-end smoke + retire trio fake
+  driver). Blocker: none; the page-fault arm currently routes SIGSEGV
+  unconditionally as a Phase 3 placeholder, and the AST checkpoint
+  uses an empty batch because the reactor's per-task `AstSlot` is not
+  yet exposed as a public surface to the thread future.
+
 - 2026-05-06 Pre-ELF Phase 6 (mount/dev id allocators + Phase-4
   deferred `register_mount` wire-up) on branch `feat/pre-elf-runtime`.
   Per `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`

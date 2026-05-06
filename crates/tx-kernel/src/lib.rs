@@ -5,8 +5,23 @@ extern crate alloc;
 extern crate std;
 
 pub mod init;
+pub mod thread_future;
 pub mod trap;
 pub mod trap_handoff;
+
+#[cfg(test)]
+mod test_serialise {
+    //! Process-wide serialisation lock for every tx-kernel host test
+    //! that bootstraps the global `INIT_PROCESS` slot, the per-hart
+    //! payload table, or the mount/console singletons. The init tests
+    //! and the thread_future tests both touch these slots; running
+    //! them concurrently breaks bootstrap re-init. One Mutex serialises
+    //! the whole tx-kernel test set so the default
+    //! `cargo test -p tx-kernel --lib` invocation stays green without
+    //! requiring `--test-threads=1`.
+    use std::sync::Mutex;
+    pub(crate) static KERNEL_TEST_LOCK: Mutex<()> = Mutex::new(());
+}
 
 use tx_hal::{BootHandoff, TxPlatform};
 

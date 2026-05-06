@@ -32,11 +32,12 @@ const TEST_PAGE_SIZE: usize = 4096;
 
 use crate::init::{console_tty, dev_mount, root_mount, CoreInit};
 
-/// Serialise every test in this module: they all touch the global
-/// `INIT_PROCESS` / mount / TTY slots plus the per-CPU epoch domain
-/// (which forbids guard nesting on the same CPU). One lock keeps the
-/// test set deterministic; same shape `tx-fs` uses.
-static INIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+/// Serialise every test in this module against the rest of tx-kernel's
+/// test set: they all touch the global `INIT_PROCESS` / mount / TTY
+/// slots plus the per-CPU epoch domain (which forbids guard nesting
+/// on the same CPU). One lock keeps the kernel test set
+/// deterministic; same shape `tx-fs` uses.
+use crate::test_serialise::KERNEL_TEST_LOCK as INIT_TEST_LOCK;
 
 /// Test-only platform satisfying every `TxPlatform` super-trait. The
 /// pmap surface uses a host-side `Mutex`-guarded `BTreeMap` mirroring
