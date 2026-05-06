@@ -2,9 +2,9 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-04-29-kernel-main-long-term-checklist",
   "title": "Long-term kernel_main checklist",
-  "status": "proposed",
+  "status": "active",
   "created": "2026-04-29",
-  "updated": "2026-04-29",
+  "updated": "2026-05-05",
   "owner": "codex",
   "summary": "Track the path from the current sentinel-and-shutdown kernel_main to the design-doc target: CoreInit, trap shell, reactor/scheduler, VM, subsystem init, and first userspace.",
   "scope": {
@@ -64,7 +64,12 @@
       "docs/progress/decisions/2026-04-29-substrate-slab-heap-zero-frame.md",
       "docs/progress/decisions/2026-04-29-process-root-asid-shootdown-anchors.md",
       "docs/progress/decisions/2026-04-29-rv64-minimal-trap-vector.md",
-      "docs/progress/decisions/2026-04-29-substrate-pmap-range-wrappers.md"
+      "docs/progress/decisions/2026-04-29-substrate-pmap-range-wrappers.md",
+      "docs/progress/plans/2026-04-30-reactor-parallel-shards.json",
+      "docs/progress/plans/2026-04-30-reactor-third-wave-dispatch.json",
+      "docs/progress/plans/2026-05-01-reactor-runtime-dispatch.json",
+      "docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json",
+      "docs/progress/decisions/2026-05-04-vm-pagebacked-v1-plan-closure.md"
     ],
     "external_refs": []
   },
@@ -84,7 +89,7 @@
         "cargo xtask ci",
         "cargo xtask ci-slow --target rv64-qemu --profile smoke --expect-sentinel"
       ],
-      "notes": "Current kernel_main reaches P::init_early, tx_substrate::init::<P>(), P::init_later, P::install_kernel_trap_vector, prints txkernel:qemu-riscv64-virt:boot:ok, then powers off. Preserve this while replacing the tail with runtime init."
+      "notes": "Current kernel_main reaches P::init_early, tx_substrate::init::<P>(), P::init_later, P::install_kernel_trap_vector, prints txkernel:qemu-riscv64-virt:boot:ok, then powers off. Preserve this while replacing the tail with runtime init. Evidence: baseline maintained through subsequent slices; see docs/progress/worktrees/2026-04-29-coreinit-spine.json."
     },
     {
       "id": "coreinit-spine",
@@ -102,12 +107,12 @@
         "cargo test -p tx-kernel",
         "cargo xtask ci"
       ],
-      "notes": "Complete in docs/progress/worktrees/2026-04-29-coreinit-spine.json. tx_kernel::kernel_main now delegates to init::CoreInit<P>::boot, which encodes the current H3 order directly while preserving the reactor task and boot sentinels. H4 slots for post-substrate hooks, VFS/device ordering, scheduler/process/userspace init remain explicit deferred placeholders."
+      "notes": "Complete in docs/progress/worktrees/2026-04-29-coreinit-spine.json. tx_kernel::kernel_main now delegates to init::CoreInit<P>::boot, which encodes the current H3 order directly while preserving the reactor task and boot sentinels. H4 slots for post-substrate hooks, VFS/device ordering, scheduler/process/userspace init remain explicit deferred placeholders. Evidence: docs/progress/worktrees/2026-04-29-coreinit-spine.json; CoreInit smoke later upgraded to run_until_idle_with_clock under docs/progress/plans/2026-04-30-reactor-third-wave-dispatch.json (parallel-kernel-coreinit-hal-clock) and init_process_subsystem now runs in init_substrate_if_ready (commit b50a472 boot wiring; decision 2026-05-05-boot-wiring.md)."
     },
     {
       "id": "zone-epoch-bus-foundation",
       "title": "Bring up zone, epoch, index, mutation, and bus foundations before semantic subsystems",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "coreinit-spine"
       ],
@@ -120,7 +125,7 @@
         "cargo xtask lint arch",
         "cargo xtask ci"
       ],
-      "notes": "Implement the substrate pieces upper subsystems assume: epoch::guard, zone::reserve/sign, Weak/IdentRef/Cap/PayloadCap mechanics, persistent index mutation primitives, and RawQueue/RawPort/RawTrace bus carriers with reactor-owned wakers. These must remain substrate mechanisms, not semantic subsystem owners."
+      "notes": "Substrate ships epoch::guard / retire_raw, zone Cap/PayloadCap/Weak/IdentRef mechanics, persistent index mutation (RecipeIndex AtomicPtr+writer mutex), and RawQueue/RawPort/RawTrace bus carriers with reactor-owned wakers. Bus wire hardening landed under the third-wave dispatch. Evidence: docs/progress/plans/2026-04-30-reactor-parallel-shards.json (parallel-wait-bus, complete) + docs/progress/plans/2026-04-30-reactor-third-wave-dispatch.json (parallel-substrate-bus-wire-hardening, complete) + docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json persistent-epoch-recipes step which exposes tx_substrate::epoch::retire_raw publicly. Tests: cargo test -p tx-substrate (50 tests) and cargo test -p tx-reactor passing under each plan's verification gate."
     },
     {
       "id": "trap-shell-and-kernel-sink",
@@ -139,7 +144,7 @@
         "cargo test -p tx-hal-riscv64-qemu-virt",
         "cargo xtask ci"
       ],
-      "notes": "Implement RawTrapFrame, TrapFrameView, TrapFrameMut, classify-from-frame, user and kernel vector installation, return_to_userspace, and direct named KernelTrapSink methods for page fault, syscall, timer, external IRQ, IPI, and sync fault. Keep trap dispatch out of linkme."
+      "notes": "Implement RawTrapFrame, TrapFrameView, TrapFrameMut, classify-from-frame, user and kernel vector installation, return_to_userspace, and direct named KernelTrapSink methods for page fault, syscall, timer, external IRQ, IPI, and sync fault. Keep trap dispatch out of linkme. Audit confirms crates/tx-kernel/src/trap.rs is still a 44-line KernelTrapDispatcher stub returning TrapAction::Terminate for page-fault/syscall/sync paths and that tx-hal does not yet expose RawTrapFrame/return_to_userspace."
     },
     {
       "id": "user-access-fixups",
@@ -158,7 +163,7 @@
         "cargo test -p tx-hal",
         "cargo xtask ci"
       ],
-      "notes": "Implement UserAccessIf copyin/copyout and the KERNEL_FIXUP_TABLE path for kernel-mode faults. User bytes cross only through this boundary or VM's detached population helper; typed addresses are never raw dereference authority."
+      "notes": "UserAccessIf copyin/copyout exists and is used by page_backed::step_read_to_user / step_write_from_user (PageBacked v1 user-buffer-byte-copy slice). The KERNEL_FIXUP_TABLE kernel-mode-fault recovery path is still pending and depends on the full trap shell to install fixups before kernel-mode dereferences run."
     },
     {
       "id": "percpu-smp-gates",
@@ -183,7 +188,7 @@
     {
       "id": "reactor-and-round-robin-scheduler",
       "title": "Implement reactor task table, wait-adapt, wakers, idle, and MVP scheduler",
-      "status": "in-progress",
+      "status": "complete",
       "depends_on": [
         "zone-epoch-bus-foundation",
         "percpu-smp-gates"
@@ -198,12 +203,12 @@
         "cargo test -p tx-kernel",
         "cargo xtask ci"
       ],
-      "notes": "In progress via docs/progress/worktrees/2026-04-29-reactor-task-aware.json, docs/progress/worktrees/2026-04-29-reactor-timer-queue.json, and docs/progress/worktrees/2026-04-29-reactor-scheduler-shell.json. The current slices implement task-local wakers, task status, parked/runnable state, duplicate wake coalescing, wait-channel/wait-adapt mechanics, host-driven timeout waits, Reactor::next_deadline_ns(), scheduler-facing task/hart/slice/stop/wake/meta types, SchedulerPolicy, and Phase1Scheduler. Plain Reactor::submit futures remain kernel-only cooperative tasks. Remaining pieces still follow REACTOR_v0 and SCHEDULER_v0: signal classification hooks, AST/preemption slots, long-running idle loop, and later trap-driven timer delivery."
+      "notes": "Three reactor dispatch plans landed the task table, wait/bus subscription, timer queue, scheduler shell, AST poll-boundary consumption, cooperative yield, userspace-run shell, and per-hart loop API. Evidence: docs/progress/plans/2026-04-30-reactor-parallel-shards.json (complete; 65 reactor tests, ci green) + docs/progress/plans/2026-04-30-reactor-third-wave-dispatch.json (complete; 71 reactor tests, ci green) + docs/progress/plans/2026-05-01-reactor-runtime-dispatch.json (complete; userspace-run + per-hart loop merged, ci green). Per-hart loop and userspace-run remain reactor-local shells; trap-side return_to_userspace and AST signal policy are owned by trap-shell-and-kernel-sink and process-and-thread-runtime-core."
     },
     {
       "id": "vm-address-space-core",
       "title": "Implement VM AddressSpace, recipes, RangeLock, and pmap materialization",
-      "status": "in-progress",
+      "status": "complete",
       "depends_on": [
         "zone-epoch-bus-foundation",
         "baseline-h3-sentinel-kernel-main"
@@ -218,7 +223,7 @@
         "cargo test -p tx-substrate",
         "cargo xtask ci"
       ],
-      "notes": "Pure/mock foundation complete in docs/progress/worktrees/2026-04-29-vm-range-foundation.json: tx_kernel::vm now has user VA/page/range arithmetic, protection/access flags, draft VmEntry split/rewrite helpers, and a bounded no-alloc RangeLock. Real AddressSpace remains pending on zone/epoch/index/cap ownership, recipes BTree integration, pmap materialization, shootdown retention, and the user-access/trap path."
+      "notes": "AddressSpace ships with persistent (AtomicPtr+writer-mutex, EBR-retired) RecipeIndex per VM_v1_2 §1.2, ExclusiveWriter/SharedReader RangeLock acquire_step/acquire_pair_step, pmap materialization through PmapIf, fault_script_async, map/unmap/protect/remap/brk async scripts, fork_aspace + exec_aspace, mincore/madvise/msync, and a wait_carrier-backed RangeLock release channel. Trap page-fault dispatch and Process ownership of Cap<AddressSpace> remain owned by downstream steps. Evidence: docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json (complete) + docs/progress/decisions/2026-05-04-vm-pagebacked-v1-plan-closure.md + commits cb35a62 (rename scripts to VM_v1_2 spec names), 63e72fc (reconcile VM_v1_2 with implementation surface), 83a3903 (MADV_DONTNEED + MADV_FREE), b9c7c38 (RangeLock acquire_step canonical surface)."
     },
     {
       "id": "pmap-shootdown-completion",
@@ -243,7 +248,7 @@
     {
       "id": "page-backed-and-reclaim",
       "title": "Implement PageContainer, RNodeBacking, materialize_page, and reclaim policy hooks",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "vm-address-space-core",
         "reactor-and-round-robin-scheduler"
@@ -257,7 +262,7 @@
         "cargo test -p tx-kernel page_backed",
         "cargo xtask ci"
       ],
-      "notes": "Supply VM's backing model: anonymous zero-fill, file-backed PageContainer materialization, RNodeBacking, cache refs, and reclaim retry policy for non-urgent allocations. Substrate continues to return Exhausted; VM/page-backed decides reclaim and retry."
+      "notes": "PageContainer, FsPageBacking/RNodeBacking, materialize_page, install_shared_page + cow_replace_into_private (reflink/CoW scaffold), step_read/step_write/step_read_to_user/step_write_from_user, step_truncate (with byte-accurate partial-EOF zero), step_fallocate, step_fsync, and step_copy_file_range all shipped under PAGE_BACKED_v1. PAGE_BACKED §8 reclaim policy and §12 writeback scheduling hooks remain explicitly deferred by the design docs. Evidence: docs/progress/plans/2026-05-04-vm-pagebacked-v1-completion.json (complete) + docs/progress/decisions/2026-05-04-vm-pagebacked-v1-plan-closure.md. 43 page_backed tests + 60 vm tests pass under that plan's verification gate."
     },
     {
       "id": "process-and-thread-runtime-core",
@@ -277,7 +282,7 @@
         "cargo test -p tx-kernel thread_runtime",
         "cargo xtask ci"
       ],
-      "notes": "Create the object-model entities and the long-lived thread future. ThreadPayload owns saved user regs, signal mask/summary, pending queues, stop state, child_tid_clear, and TaskHandle; the reactor owns the future, which holds Cap<ThreadPayload>. No per-thread kernel stacks."
+      "notes": "Process / ProcessGroup / Session / Thread topology, signal post-and-observe, default-terminate route via step_exit_group_with_signal, cred + kill permission check, cwd/chdir/getcwd VFS seam, and INIT_PROCESS bootstrap have all landed (commits 3652bd1, c982b81, 51d0b2a, c2bce56, 362b22a, 1f09e2a, 531c783; decisions 2026-05-05-process-topology-day1.md, signal-day1.md, cred-day1.md, ast-dispatch.md, step-exit-group-with-signal.md, cwd-vfs-integration.md). The remaining critical-path piece is ThreadPayload's saved user trap-frame storage and the thread_future poll loop that consumes it; that is blocked on trap-shell-and-kernel-sink exposing RawTrapFrame and return_to_userspace."
     },
     {
       "id": "syscall-dispatch-and-ast-loop",
@@ -297,7 +302,7 @@
         "cargo test -p tx-kernel syscall",
         "cargo xtask ci"
       ],
-      "notes": "Implement fixed syscall table dispatch, VM page-fault materializer dispatch, error/return-value writes through TrapFrameMut, and Site B AST handling before user re-entry. Timer preemption should not advance thread_future; interesting traps do."
+      "notes": "Implement fixed syscall table dispatch, VM page-fault materializer dispatch, error/return-value writes through TrapFrameMut, and Site B AST handling before user re-entry. Timer preemption should not advance thread_future; interesting traps do. Audit confirms crates/tx-shims/src/lib.rs is still a 4-line stub and trap.rs's on_syscall returns TrapAction::Terminate."
     },
     {
       "id": "vfs-device-and-tty-init",
@@ -319,7 +324,7 @@
         "cargo test -p tx-kernel vfs",
         "cargo xtask ci"
       ],
-      "notes": "Follow DEVICE.md: HAL tier-1 devices remain platform statics; tier-2 static device bindings are enumerated during init; IRQ_HANDLERS are walked once to build an installed dispatch table; devfs exposes device RNodes; console/TTY gets a real userspace-visible path."
+      "notes": "VFS spec-reconciliation Phases 2-4 collapsed VFS/VM/TTY/page_backed into tx-subsystems and the canonical VFS surface (commits d0b2ab6, 1b91e5d; decision 2026-05-04-vfs-spec-reconciliation-phase-2-3-4.md). TTY now publishes typed Cap<Session>/Cap<ProcessGroup> and a deliver_tty_dispatch signal bridge (commits 4b68570, a50320c). Still pending: a real tmpfs/devfs backend mounted at boot, IRQ_HANDLERS walked once into an installed dispatch table, devfs device RNodes, and a userspace-visible console/TTY path."
     },
     {
       "id": "exec-loader-and-detached-aspace",
@@ -339,7 +344,7 @@
         "cargo test -p tx-kernel exec",
         "cargo xtask ci"
       ],
-      "notes": "Implement static-ELF image planning, targeted file reads, detached AddressSpace construction, stack/auxv population, process Frame vm replacement at the point of no return, and ThreadRuntime trap-context install. Keep fallible work before exec's PoNR."
+      "notes": "AddressSpace::exec_aspace teardown landed under VM/PageBacked v1 (exec-aspace step), but the exec loader itself is unbuilt: crates/tx-scripts/src/lib.rs is still an 8-line stub. Implement static-ELF image planning, targeted file reads, detached AddressSpace construction, stack/auxv population, process Frame vm replacement at the point of no return, and ThreadRuntime trap-context install. Keep fallible work before exec's PoNR."
     },
     {
       "id": "first-userspace-entry",
@@ -359,7 +364,7 @@
         "cargo xtask qemu --target rv64-qemu --profile busybox --expect-sentinel",
         "cargo xtask ci"
       ],
-      "notes": "kernel_main should spawn the init thread task, enter the reactor loop, dispatch to userspace through return_to_userspace, and keep the kernel alive until init exits. The old boot sentinel may stay as an early milestone, but successful runtime boot should be a distinct userspace/init sentinel."
+      "notes": "Boot wiring already calls bootstrap_init_process and emits a process:init:ok sentinel (commit b50a472, decision 2026-05-05-boot-wiring.md), but kernel_main still shuts down rather than entering the reactor loop and dispatching to userspace. Real return_to_userspace is blocked on trap-shell-and-kernel-sink and exec-loader-and-detached-aspace."
     },
     {
       "id": "smp-runtime-and-remote-coordination",
@@ -405,8 +410,8 @@
   "verification": [
     {
       "command": "cargo xtask progress validate",
-      "status": "not-run",
-      "notes": "Validates this plan's JSON shape."
+      "status": "passed",
+      "notes": "Re-run on 2026-05-05 after marking the four reactor/VM/PageBacked/zone-bus steps complete; 25 ok."
     },
     {
       "command": "cargo xtask lint docs",
@@ -426,10 +431,10 @@
     "Design docs reference many future subsystems; individual implementation slices should refresh readiness before coding from them."
   ],
   "blockers": [
-    "No implemented reactor/task table yet.",
-    "No implemented zone/entity substrate for upper semantic subsystems yet.",
-    "No full RawTrapFrame/user-return path yet.",
-    "No VM AddressSpace/recipes/RangeLock implementation yet."
+    "Trap shell / RawTrapFrame / return_to_userspace not yet implemented; trap.rs is still a Terminate-only stub.",
+    "ThreadPayload saved-trap-frame and thread_future poll loop pending; blocks syscall dispatch and AST return-to-user.",
+    "tx-shims (syscall dispatch table) and tx-scripts (exec loader) crates are still empty stubs.",
+    "No tmpfs/devfs backend mounted at boot; VFS canonical surface is in place but rootfs is not."
   ],
   "handoff": {
     "needed": false,

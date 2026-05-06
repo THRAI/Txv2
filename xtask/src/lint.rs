@@ -322,6 +322,33 @@ fn lint_arch_text(path: &str, display: &str, text: &str) -> Vec<String> {
                 "{display}:{line_no}: RV64 QEMU boot-static capture must go through boot_static.rs"
             ));
         }
+        // TTY-CTL-1 (OBJECT_PATTERN_FIXES_v1.md OPA-3): TTY identity
+        // structure must not store leader-process caps as a substitute
+        // for session/pgrp truth. The controlling-terminal binding
+        // names a Session and a foreground ProcessGroup, both held as
+        // Weak refs (no retention).
+        if path == "crates/tx-subsystems/src/tty/structure/identity.rs"
+            && line.contains("Cap<ProcessIdentity>")
+        {
+            findings.push(format!(
+                "{display}:{line_no}: TTY-CTL-1 violation — TTY identity structure must not store Cap<ProcessIdentity>; use Weak<Session>/Weak<ProcessGroup> for the controlling-terminal binding"
+            ));
+        }
+        // TTY-CTL-1a (OBJECT_PATTERN_FIXES_v1.md OPA-3): the
+        // foreground-pgrp slot is TTY-owned (TtyIdentity.session_pgrp).
+        // Process-side structs must not declare their own
+        // foreground_pgrp field; readers use Session::foreground_pgrp_cap()
+        // for the two-hop dereference.
+        if path == "crates/tx-subsystems/src/process/structure.rs"
+            && line.contains("foreground_pgrp:")
+            && !line.trim_start().starts_with("///")
+            && !line.trim_start().starts_with("//!")
+            && !line.trim_start().starts_with("//")
+        {
+            findings.push(format!(
+                "{display}:{line_no}: TTY-CTL-1a violation — process-side structs must not declare a `foreground_pgrp` field (authoritative slot lives on TtyIdentity.session_pgrp; use Session::foreground_pgrp_cap() for the two-hop weak dereference)"
+            ));
+        }
     }
     findings
 }
@@ -557,6 +584,74 @@ fn sym() -> usize {
         assert!(findings
             .iter()
             .any(|finding| finding.contains("unused/dead-code allowances")));
+    }
+
+    #[test]
+    fn arch_lint_rejects_cap_processidentity_in_tty_identity() {
+        let findings = lint_arch_text(
+            "crates/tx-subsystems/src/tty/structure/identity.rs",
+            "crates/tx-subsystems/src/tty/structure/identity.rs",
+            "pub struct SessionPgrp { pub session_leader: Cap<ProcessIdentity> }",
+        );
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("TTY-CTL-1 violation")));
+    }
+
+    #[test]
+    fn arch_lint_allows_weak_refs_in_tty_identity() {
+        let findings = lint_arch_text(
+            "crates/tx-subsystems/src/tty/structure/identity.rs",
+            "crates/tx-subsystems/src/tty/structure/identity.rs",
+            "pub session: Option<Weak<Session>>,\npub foreground_pgrp: Option<Weak<ProcessGroup>>,",
+        );
+
+        assert!(findings
+            .iter()
+            .all(|finding| !finding.contains("TTY-CTL-1")));
+    }
+
+    #[test]
+    fn arch_lint_rejects_foreground_pgrp_field_in_process_structure() {
+        let findings = lint_arch_text(
+            "crates/tx-subsystems/src/process/structure.rs",
+            "crates/tx-subsystems/src/process/structure.rs",
+            "pub struct Session { pub foreground_pgrp: AtomicSlot<Option<Weak<ProcessGroup>>> }",
+        );
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("TTY-CTL-1a violation")));
+    }
+
+    #[test]
+    fn arch_lint_allows_foreground_pgrp_cap_method_in_process_structure() {
+        // The accessor that hides the two-hop dereference is allowed —
+        // it's a method, not a field. The lint should distinguish
+        // `foreground_pgrp_cap(` from `foreground_pgrp:`.
+        let findings = lint_arch_text(
+            "crates/tx-subsystems/src/process/structure.rs",
+            "crates/tx-subsystems/src/process/structure.rs",
+            "pub fn foreground_pgrp_cap(&self) -> Option<Cap<ProcessGroup>> { None }",
+        );
+
+        assert!(findings
+            .iter()
+            .all(|finding| !finding.contains("TTY-CTL-1a")));
+    }
+
+    #[test]
+    fn arch_lint_allows_foreground_pgrp_in_doc_comments_in_process_structure() {
+        let findings = lint_arch_text(
+            "crates/tx-subsystems/src/process/structure.rs",
+            "crates/tx-subsystems/src/process/structure.rs",
+            "/// The `foreground_pgrp:` field on TtyIdentity.SessionPgrp is the home.",
+        );
+
+        assert!(findings
+            .iter()
+            .all(|finding| !finding.contains("TTY-CTL-1a")));
     }
 
     #[test]

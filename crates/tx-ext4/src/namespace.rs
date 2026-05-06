@@ -1,8 +1,10 @@
 use tx_ext4_format::pager::{BlockImage, DirEntryLite};
 use tx_substrate::epoch::Guard;
-use tx_subsystems::step::{Errno, StepOutcome};
-use tx_subsystems::vfs::fs_ops::{Credential, DirCursor, DirEntry, FsOps};
-use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, NameOwned};
+use tx_subsystems::execution::{Errno, StepOutcome};
+use tx_subsystems::vfs::execution::FsOps;
+use tx_subsystems::vfs::structure::{
+    Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
+};
 
 use crate::read_backend::{
     cursor_from_index, cursor_index, fs_object_id as inode_fs_object_id, inode_no, map_inode_meta,
@@ -26,7 +28,7 @@ where
 
         match self.with_pager(|pager| pager.lookup(parent, name)) {
             Ok(Some(inode)) => StepOutcome::Done(inode_fs_object_id(inode)),
-            Ok(None) => StepOutcome::Err(Errno::NoEntry),
+            Ok(None) => StepOutcome::Err(Errno::ENOENT),
             Err(err) => StepOutcome::Err(err),
         }
     }
@@ -53,7 +55,7 @@ where
         _meta: &InodeMeta,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn create_inode<'g>(
@@ -64,7 +66,7 @@ where
         _cred: &Credential,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn unlink<'g>(
@@ -74,7 +76,7 @@ where
         _target: FsObjectId,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn rename<'g>(
@@ -85,7 +87,7 @@ where
         _new_name: &[u8],
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn link<'g>(
@@ -95,7 +97,7 @@ where
         _target: FsObjectId,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn mkdir<'g>(
@@ -106,7 +108,7 @@ where
         _cred: &Credential,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn rmdir<'g>(
@@ -116,7 +118,7 @@ where
         _target: FsObjectId,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn symlink<'g>(
@@ -127,7 +129,7 @@ where
         _cred: &Credential,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
     }
 
     fn readdir<'g>(
@@ -145,7 +147,7 @@ where
             Err(err) => return StepOutcome::Err(err),
         };
         if index >= READDIR_WINDOW_ENTRIES {
-            return StepOutcome::Err(Errno::NotImplemented);
+            return StepOutcome::Err(Errno::ENOSYS);
         }
 
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
@@ -158,7 +160,7 @@ where
         }
 
         let entry = entries[index];
-        let name = match NameOwned::from_component(entry.name()) {
+        let name = match InlineName::new(entry.name()) {
             Ok(name) => name,
             Err(err) => return StepOutcome::Err(err),
         };
@@ -166,7 +168,7 @@ where
             DirEntry {
                 name,
                 fs_object_id: inode_fs_object_id(entry.inode),
-                d_type: entry.file_type,
+                kind: ext4_file_type_to_kind(entry.file_type),
             },
             cursor_from_index(index + 1),
         )))
@@ -177,6 +179,20 @@ where
         _fs_object_id: FsObjectId,
         _guard: &'g Guard<'g>,
     ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::NotImplemented)
+        StepOutcome::Err(Errno::ENOSYS)
+    }
+}
+
+// ext4 dir-entry file_type codes (POSIX-shaped). Maps the on-disk byte
+// code into the canonical `InodeKind` enum surfaced by `tx-subsystems`.
+fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
+    match file_type {
+        2 => InodeKind::Directory,
+        3 => InodeKind::CharDevice,
+        4 => InodeKind::BlockDevice,
+        5 => InodeKind::Fifo,
+        6 => InodeKind::Socket,
+        7 => InodeKind::Symlink,
+        _ => InodeKind::Regular,
     }
 }
