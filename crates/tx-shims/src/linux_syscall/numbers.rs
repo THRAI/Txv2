@@ -653,3 +653,94 @@ pub const FUTEX_CLOCK_REALTIME: u32 = 0x100;
 /// Mask applied to the `op` argument before matching the op
 /// selector — strips `FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME`.
 pub const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+
+// ---------------------------------------------------------------------
+// Slice 4 of the shell-prompt roadmap — time syscalls
+// (`clock_gettime` / `gettimeofday` / `nanosleep` / `clock_nanosleep` /
+// `times`).
+//
+// Numbers verified against Linux's RV64 generic ABI
+// (`include/uapi/asm-generic/unistd.h`). All arms read the platform
+// monotonic clock via `<P as TimeIf>::read_ns()`. Day-1 clock-id
+// surface aliases all four POSIX clocks to the platform monotonic
+// (CLOCK_REALTIME has no boot-time RTC offset yet; CPU-time clocks
+// have no per-process accounting yet — both are TODOs documented at
+// the syscall arms). See
+// `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 4.
+// ---------------------------------------------------------------------
+
+/// `nanosleep(req, rem)`. Linux RV64 generic ABI `__NR_nanosleep = 101`.
+///
+/// Slice 4 ships the zero-duration short-circuit only: if `*req` is
+/// already past (`tv_sec == 0 && tv_nsec == 0`, or the deadline has
+/// already elapsed by the time we sample `read_ns()`), the arm returns
+/// `0` immediately. Real-duration nanosleep needs a per-task timer-fire
+/// wait carrier (so the parked task wakes on the next BSP reactor tick
+/// after `read_ns() >= deadline`); that wiring is deferred — Slice 4's
+/// timer-channel infrastructure lands in a follow-up slice. Real
+/// non-zero durations currently return `-ENOSYS`. busybox sh barely
+/// uses `nanosleep` so the deferral does not block Slice 11's QEMU
+/// shell smoke.
+pub const NR_NANOSLEEP: u64 = 101;
+/// `clock_gettime(clk_id, ts)`. Linux RV64 generic ABI
+/// `__NR_clock_gettime = 113`.
+pub const NR_CLOCK_GETTIME: u64 = 113;
+/// `clock_nanosleep(clk_id, flags, req, rem)`. Linux RV64 generic ABI
+/// `__NR_clock_nanosleep = 115`. Same deferral as `nanosleep` — only
+/// the zero-duration / past-deadline short-circuit ships in Slice 4.
+pub const NR_CLOCK_NANOSLEEP: u64 = 115;
+/// `times(buf)`. Linux RV64 generic ABI `__NR_times = 153`. Returns
+/// the monotonic tick count (100Hz — `_SC_CLK_TCK` per Linux's RV64
+/// uapi); writes a `struct tms` to `buf` (zero `stime`/`cutime`/`cstime`
+/// since CPU-time accounting is not yet wired). Null `buf` is OK per
+/// Linux semantics — only the return value matters.
+pub const NR_TIMES: u64 = 153;
+/// `gettimeofday(tv, tz)`. Linux RV64 generic ABI
+/// `__NR_gettimeofday = 169`. The `tz` argument is deprecated on Linux
+/// and the arm ignores it.
+pub const NR_GETTIMEOFDAY: u64 = 169;
+
+/// `clock_gettime` clock id: `CLOCK_REALTIME = 0`. Day-1 surface
+/// aliases this to the platform monotonic clock — no boot-time RTC
+/// offset yet (`TODO(phase-rtc)`).
+pub const CLOCK_REALTIME: u32 = 0;
+/// `clock_gettime` clock id: `CLOCK_MONOTONIC = 1`. Maps directly to
+/// `<P as TimeIf>::read_ns()`.
+pub const CLOCK_MONOTONIC: u32 = 1;
+/// `clock_gettime` clock id: `CLOCK_PROCESS_CPUTIME_ID = 2`. Day-1
+/// surface aliases this to the platform monotonic clock — no
+/// per-process CPU-time accounting yet (`TODO(phase-cputime)`).
+pub const CLOCK_PROCESS_CPUTIME_ID: u32 = 2;
+/// `clock_gettime` clock id: `CLOCK_THREAD_CPUTIME_ID = 3`. Same
+/// per-process aliasing as `CLOCK_PROCESS_CPUTIME_ID` — no per-thread
+/// CPU-time accounting yet.
+pub const CLOCK_THREAD_CPUTIME_ID: u32 = 3;
+/// `clock_gettime` clock id: `CLOCK_MONOTONIC_RAW = 4`. Same as
+/// `CLOCK_MONOTONIC` for v1 (txKernel doesn't NTP-discipline the
+/// monotonic clock).
+pub const CLOCK_MONOTONIC_RAW: u32 = 4;
+/// `clock_gettime` clock id: `CLOCK_REALTIME_COARSE = 5`. Same as
+/// `CLOCK_REALTIME`.
+pub const CLOCK_REALTIME_COARSE: u32 = 5;
+/// `clock_gettime` clock id: `CLOCK_MONOTONIC_COARSE = 6`. Same as
+/// `CLOCK_MONOTONIC`.
+pub const CLOCK_MONOTONIC_COARSE: u32 = 6;
+/// `clock_gettime` clock id: `CLOCK_BOOTTIME = 7`. Same as
+/// `CLOCK_MONOTONIC` — txKernel's monotonic clock starts at boot, so
+/// "boot time" and "monotonic" are equivalent.
+pub const CLOCK_BOOTTIME: u32 = 7;
+
+/// `clock_nanosleep` flag bit: `TIMER_ABSTIME = 0x1`. When set, the
+/// `req` value is interpreted as an absolute deadline (against the
+/// selected clock) rather than a relative duration. Slice 4 honours
+/// the bit for the zero-duration / past-deadline short-circuit
+/// (which is independent of relative-vs-absolute interpretation —
+/// already-past deadlines short-circuit either way).
+pub const TIMER_ABSTIME: u32 = 0x1;
+
+/// Tick frequency for `times(2)`'s return value (Linux's
+/// `_SC_CLK_TCK`). Linux's RV64 generic ABI ships this as 100Hz —
+/// `times` returns ticks-since-boot at this granularity.
+pub const TIMES_TICK_HZ: u64 = 100;
+/// Number of nanoseconds per `times(2)` tick (10ms at 100Hz).
+pub const TIMES_NS_PER_TICK: u64 = 1_000_000_000 / TIMES_TICK_HZ;
