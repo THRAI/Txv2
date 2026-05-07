@@ -5,7 +5,7 @@
 **Scope:** Enumerate the gap between today's `feat/fd-ops` HEAD and
 typing into a shell prompt over QEMU stdio.
 
-## Progress (2026-05-07 end-of-day)
+## Progress (2026-05-08 end-of-session)
 
 | Slice | Title | Status | Branch | Workspace tests after |
 |---|---|---|---|---|
@@ -17,14 +17,40 @@ typing into a shell prompt over QEMU stdio.
 | 6 | Stat family | **landed** | `feat/stat-family` (4b7fd12) | 1066 |
 | 7 | fcntl extension + day-1 misc | **landed** | `feat/fcntl-misc` (f09e358) | 1086 |
 | 8 | File-mutation syscalls | **landed** | `feat/file-mutation` (2b7768c) | 1111 |
-| 9 | User-VA sweep + RV64 UserAccessIf | **deferred** (f2961bc — see below) | n/a | n/a |
-| 10 | Busybox bake-in + boot wire | **deferred** (depends on external deps) | n/a | n/a |
-| 11 | QEMU shell smoke | **deferred** (depends on Slice 10 + cross-toolchain) | n/a | n/a |
+| 9 | User-VA sweep + RV64 UserAccessIf | **deferred** (f2961bc — infrastructure work) | n/a | n/a |
+| 10 | Busybox bake-in scaffolding | **landed** (208f6f2 — kernel-side ready) | `feat/busybox-bake-in` | 1111 |
+| 11 | QEMU shell-smoke scaffolding | **landed** (208f6f2 — xtask cmd ready) | `feat/busybox-bake-in` | 1111 |
 
 Total landed: **8 slices, 8 branches, ~125 net new tests**, workspace
 988 → 1111 over the session (baseline pre-Slice-1 was 984).
 
-## Slice 10 + 11 deferral rationale
+## Slices 10 + 11 — scaffolding shipped (2026-05-08)
+
+The kernel-side and xtask-side scaffolding for the final two
+slices landed in commit `208f6f2`:
+
+- `crates/tx-kernel/build.rs` (new) — when `TX_BUSYBOX` is set,
+  copies the binary to `$OUT_DIR/busybox.bin` and emits
+  `cargo:rustc-cfg=busybox_baked`.
+- `crates/tx-kernel/src/init.rs` — new `mod busybox_fixture`
+  (cfg-gated) + `register_busybox_into_tmpfs()` helper that
+  mirrors the init-fixture's tmpfs-write shape but at `/bin/sh`.
+- `xtask/src/shell_smoke.rs` (new) — `cargo xtask shell-smoke`
+  command. Validates the three external prerequisites (TX_BUSYBOX,
+  riscv64gc-unknown-none-elf, qemu-system-riscv64) up-front; on
+  prereq-success returns an explicit carryover error noting the
+  build-and-drive runtime is the follow-up integration step.
+
+The carryover (the runtime steps in `shell_smoke::shell_smoke`)
+spawn QEMU with stdio pipes, send `echo hello\n` + `exit\n`, and
+watch serial for `hello` + the userspace-exited sentinel. That
+runtime needs the external deps in place at validation time.
+
+Workspace tests remain at 1111/1111 because both new pieces are
+cfg-gated or external-dep-gated and don't run under standard
+`cargo test --workspace`.
+
+## Original deferral rationale (slices 10 + 11 pre-2026-05-08)
 
 These slices require external prerequisites that can't be satisfied
 inside the kernel codebase alone:
