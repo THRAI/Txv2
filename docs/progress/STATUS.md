@@ -4,6 +4,36 @@
 
 ## Current Shape
 
+- 2026-05-07 shell-prompt slice 8 (file-mutation syscalls) on branch
+  `feat/file-mutation`. Per
+  `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 8.
+  Wires nine new arms — `NR_MKDIRAT = 34`, `NR_UNLINKAT = 35`,
+  `NR_SYMLINKAT = 36`, `NR_LINKAT = 37`, `NR_TRUNCATE = 45`,
+  `NR_FTRUNCATE = 46`, `NR_READLINKAT = 78`, `NR_UTIMENSAT = 88`
+  (`-ENOSYS` carryover), `NR_RENAMEAT2 = 276`. Each path-relative arm
+  walks the parent directory via `step_walk` (synchronous through
+  `poll_walker_synchronously` for Send-future discipline) and
+  dispatches through `FsOps::{mkdir,unlink,rmdir,symlink,link,rename,
+  read_link}` plus `page_backed::step_truncate` for the truncate
+  pair. `unlinkat` decodes `AT_REMOVEDIR` to choose `unlink` vs
+  `rmdir`; `renameat2` honours `RENAME_NOREPLACE` via a pre-walk
+  existence check; `RENAME_EXCHANGE` returns `-ENOSYS` and
+  `RENAME_WHITEOUT` returns `-EINVAL`. `readlinkat` walks the
+  parent dir and calls `FsOps::lookup` + `read_link` directly so the
+  symlink itself (not its resolved target) is what gets read — the
+  in-tree walker follows symlinks unconditionally so a standard
+  `step_walk` to the link path would resolve through the link.
+  Verification: `cargo build --workspace --lib --tests` clean (no
+  warnings), `cargo test --workspace --lib --tests --
+  --test-threads=1` 1111/1111 passed (1086 baseline + 25 new
+  `file_mutation::*` dispatch tests covering each arm's success and
+  canonical-error shapes). Carryovers: `utimensat` deferred under
+  `TODO(phase-vfs-utimens)` (no `FsOps::set_times` hook); `linkat`
+  surfaces tmpfs's existing `-ENOSYS` for `link` (Phase 3b
+  carryover, hard-links not yet supported); `renameat2`
+  cross-directory rename surfaces tmpfs's same-dir-only `-ENOSYS`
+  (Phase 3b carryover). Next step: Slice 9 (user-VA migration) or
+  shell-bringup integration smoke.
 - 2026-05-07 fd-ops slice (Waves 1–4) + drift cleanup chore + CSPRNG
   prerequisite chore on branch `feat/fd-ops`. Per
   `docs/progress/plans/2026-05-07-fd-ops-and-drift-cleanup.md` +
