@@ -254,6 +254,106 @@ pub struct ProcessPayload {
 - structural — some PayloadCap<ProcessPayload> extant.
 - payload — same as structural; ProcessPayload has no sub-projections.
 
+#### 2.2.1 v2 amendment — flat ProcessPayload as ratified shape
+<!-- txdoc:PROCESS-PROCESSPAYLOAD-V2-AMENDMENT-1 -->
+
+**Status:** v1 spec preserved above for reference. The implementation
+shipped a flat shape across five slices and the v2 amendment ratifies
+that flat shape. `Frame` / `Shared<T>` / `ProcessPolicy` / `nsproxy`
+are deferred to **v3**; see "Deferred to v3" below.
+
+**Why a v2 amendment, not a code refactor.** Five slices built on the
+flat shape, in this order:
+
+- trio Phase 2a (commit `abefad4`): added `fds:
+  SpinMutex<[Option<Cap<OpenFile>>; FD_TABLE_SIZE]>` and the syscall
+  dispatcher's fd-resolving arms (`write`, `exit`, `exit_group`,
+  `getpid`).
+- trio Phase 2b (commit `119602b`): added `brk_base` /
+  `current_brk` as `AtomicU64` for the `brk(2)` syscall; added the
+  `read` / `rt_sigprocmask` / `rt_sigaction` arms.
+- pre-ELF Wave 3 (commit `abc9fb8`): added the saved-trap-frame +
+  thread-future state on `ThreadPayload` (touched the
+  `ProcessPayload` shape only indirectly through the threads
+  vector).
+- ELF loader Wave 1 (commit `c67c970`): flipped `aspace` to
+  `AtomicSlot<Cap<AddressSpace>>` so exec Phase 6's atomic store
+  could swap the address space without a sibling-thread quiesce.
+- fork/clone/wait4 Wave 1 (commit `e697631`): added `exit_port:
+  Channel` and `exit_port_carrier_id: u64` so `sys_wait4` could
+  park on the carrier without holding the parent's `Cap`.
+- DAC + setuid Wave 2 (commit `fcd9639`): added `cred:
+  SpinMutex<Cred>` (a per-process credential snapshot) and the
+  twelve cred-aware syscall arms.
+- DAC + setuid Wave 4 (commit `b9ae7a0`): added `fd_cloexec:
+  AtomicU32` for `step_close_cloexec_fds` to consult during exec
+  Phase 7.
+
+The flat shape is correct, well-tested, and load-bearing. Refactoring
+to `Frame { Shared<T> }` would require refactoring every step
+function that touches the payload, every test that constructs one,
+and every existing slice's accessor (`process.aspace_cap()`,
+`process.fds_lock()`, `process.cred()`). The only feature that
+**strictly** requires `Shared<T>` is `CLONE_FILES` / `CLONE_VM` /
+`CLONE_SIGHAND` (the share-vs-copy clone variants); all of those are
+deferred beyond bare-fork in `THREAD_RUNTIME_v1` and the
+fork/clone/wait4 plan.
+
+**Implemented flat shape (canonical for v2):**
+
+```rust
+pub struct ProcessPayload {
+    /// Address-space slot. Atomically swapped at exec Phase 6.
+    /// (ELF loader Wave 1.)
+    pub(crate) aspace: AtomicSlot<Cap<AddressSpace>>,
+    pub(crate) threads: SpinMutex<Vec<Cap<ThreadIdentity>>>,
+    pub(crate) sig_actions: SigActionTable,
+    pub(crate) group_pending: PendingSignalQueue,
+    /// Per-process credential snapshot. (DAC + setuid Wave 2.)
+    pub(crate) cred: SpinMutex<Cred>,
+    pub(crate) cwd: SpinMutex<Option<Cap<DEntry>>>,
+    /// Fixed-size fd table. About to flip to
+    /// `BTreeMap<u32, Cap<OpenFile>>` in fd-ops Wave 1.
+    /// (Trio Phase 2a.)
+    pub(crate) fds: SpinMutex<[Option<Cap<OpenFile>>; FD_TABLE_SIZE]>,
+    /// Per-fd close-on-exec bitmap. About to flip alongside
+    /// `fds` in fd-ops Wave 1. (DAC + setuid Wave 4.)
+    pub(crate) fd_cloexec: AtomicU32,
+    /// Heap region anchors. (Trio Phase 2b.)
+    pub(crate) brk_base: AtomicU64,
+    pub(crate) current_brk: AtomicU64,
+    /// Reactor wait carrier for child-zombify events.
+    /// (Fork/clone/wait4 Wave 1.)
+    pub(crate) exit_port: Channel,
+    pub(crate) exit_port_carrier_id: u64,
+    /// Identity back-pointer.
+    pub(crate) identity: tx_substrate::zone::Weak<ProcessIdentity>,
+}
+```
+
+**Deferred to v3:**
+
+- `Frame { Shared<T> }`. Currently the payload owns `aspace`,
+  `fds`, `cwd`, `cred` directly (no `Shared<T>` indirection). v3
+  introduces the share-vs-copy split when CLONE_FILES / CLONE_VM /
+  CLONE_SIGHAND land.
+- `ProcessPolicy`. Currently rlimits and policy hooks live in
+  per-call check sites; the cred snapshot does not yet carry the
+  rlimit bundle. v3 introduces an explicit `policy: ProcessPolicy`
+  field with the rlimit + scheduling-policy bundle.
+- `nsproxy: Cap<NsProxy>`. Not yet present; namespaces are flat
+  ("everyone shares the same root namespace"). v3 introduces the
+  nsproxy bundle when mount/pid/user namespaces land.
+- `group_exit: GroupExit` and `leader_exit_status: AtomicOption<ExitStatus>`.
+  Currently exit_group collapse is handled inline by
+  `step_exit_group` without a dedicated coordination struct;
+  leader-exit-with-survivors is not implemented. v3 adds both when
+  the wait4 surface grows beyond bare-zombie reaping.
+
+The v2 amendment **does not** weaken the v3 target. The flat shape
+is a load-bearing v2 stable surface; v3 is the refactor pass once
+the share-vs-copy clone surface lands.
+
 ### 2.3 ProcessGroup
 
 <!-- txdoc:PROCESS-PROCESSGROUP-1 -->

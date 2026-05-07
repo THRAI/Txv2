@@ -23,9 +23,11 @@ pub mod pmap {
 
 pub mod page_allocator;
 pub mod slab;
+pub mod slot;
 pub mod sync;
 pub mod zone;
 
+pub use slot::AtomicSlot;
 pub use sync::{SpinMutex, SpinMutexGuard};
 
 #[doc(hidden)]

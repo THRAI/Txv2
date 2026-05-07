@@ -36,9 +36,10 @@ use crate::cred::{Cred, Gid, Uid};
 use crate::execution::WaitToken;
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::ThreadIdentity;
-use crate::tty::structure::identity::{AtomicSlot, TtyIdentity};
+use crate::tty::structure::identity::TtyIdentity;
 use crate::vfs::{DEntry, OpenFile};
 use crate::vm::AddressSpace;
+use tx_substrate::AtomicSlot;
 
 /// Bit-mask for the "child has zombified" event on the per-process
 /// `exit_port`. Future events (stop, continue) get their own bits

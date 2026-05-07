@@ -910,8 +910,8 @@ fn sign_process_payload(
     brk_base: u64,
     current_brk: u64,
 ) -> Result<tx_substrate::zone::PayloadCap<ProcessPayload>, ZoneError> {
-    use crate::tty::structure::AtomicSlot;
     use tx_reactor::wait::Channel;
+    use tx_substrate::AtomicSlot;
     let aspace_slot: AtomicSlot<Cap<AddressSpace>> = AtomicSlot::empty();
     aspace_slot.store(Some(aspace));
 

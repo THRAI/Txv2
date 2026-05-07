@@ -4,6 +4,49 @@
 
 ## Current Shape
 
+- 2026-05-07 drift cleanup chore (5 items, ~200 LOC) on branch
+  `chore/drift-cleanup`. Per
+  `docs/progress/plans/2026-05-07-fd-ops-and-drift-cleanup.md`
+  §"Drift cleanup batch" + audit
+  `docs/progress/research/2026-05-07-interface-drift-audit.md`. Lands
+  before fd-ops Wave 1 because the `AtomicSlot` move makes the
+  upcoming fd-table BTreeMap migration cleaner, and `AT_ENTRY` /
+  `AT_BASE` should be added once not again. Item-by-item:
+  (1) `AtomicSlot<T>` moved from
+  `crates/tx-subsystems/src/tty/structure/identity.rs:72-115` to
+  `crates/tx-substrate/src/slot.rs` and re-exported at
+  `tx_substrate::AtomicSlot`. Audit Tier-2 #1 closed. Touched 5
+  call sites (process/structure.rs, process/execution.rs (test
+  builder), tty/structure/mod.rs, tty/structure/payload.rs,
+  identity.rs). (2) `AT_ENTRY = 9` and `AT_BASE = 7` added to
+  `AuxvFacts` and the stack builder; `AUXV_PAIR_COUNT` 11 → 13;
+  total auxv contribution 176 → 208 bytes. New tests pin
+  `AT_ENTRY` carries `image_plan.entry`, `AT_BASE = 0` for
+  static-EXEC; existing eleven-entries test renamed to
+  thirteen-entries; AT_UID/AT_SECURE/AT_RANDOM index pins shifted.
+  Audit Tier-1 #5 (partial) closed. (3) `HAL_v1.md` §13 amended:
+  added `IrqIf::UART_IRQ` to the trait surface, replaced the
+  linkme-distributed-slice example with the explicit
+  `register_irq_handler` shape, added §13.2.1 documenting the
+  seven-point case against linkme, removed `IRQ_HANDLERS` from
+  §21.2 approved slices. Audit Tier-2 #6 + Tier-1 #4 closed.
+  (4) `HAL_v1.md` §13A added: new section documenting `EntropyIf`
+  trait surface, default xorshift impl, RV64 rdtime impl, trust
+  model, and upgrade path. Audit Tier-1 #3 closed. (5)
+  `PROCESS_v1.md` §2.2.1 v2 amendment added: ratifies the flat
+  `ProcessPayload` shape that 7 commits built (trio Phase 2a/b,
+  pre-ELF Wave 3, ELF loader Wave 1, fork/clone/wait4 Wave 1, DAC
+  Wave 2, DAC Wave 4); `Frame { Shared<T> }` / `ProcessPolicy` /
+  `nsproxy` / `group_exit` / `leader_exit_status` deferred to v3
+  with rationale. Audit Tier-1 #6 closed. Verification:
+  `cargo check --workspace` clean; `cargo check --workspace --tests`
+  clean; `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf` clean; tx-substrate sync 2/2 +
+  integration suites preserved; tx-subsystems 405/405 serial;
+  tx-scripts 42/42 (40 baseline + 2 new auxv tests); tx-kernel
+  37/37; tx-fs 24/24 serial; tx-shims 78/78; `cargo fmt --check`
+  clean; `cargo xtask progress validate` ok. Next step: ship as
+  separate PR; fd-ops Wave 1 follows with the cleaner seam.
 - 2026-05-07 DAC + setuid Wave 5 (Part 8 end-to-end smoke + sibling
   setuid fixture) on branch `feat/dac-and-setuid`. Per
   `docs/progress/plans/2026-05-06-dac-and-setuid.md` Part 8.

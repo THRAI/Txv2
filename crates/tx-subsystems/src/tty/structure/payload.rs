@@ -23,7 +23,8 @@ use crate::tty::ldisc::state::LdiscState;
 use crate::tty::structure::ring::TtyRing;
 use crate::tty::structure::termios::Termios;
 
-use super::identity::{AtomicSlot, TtyIdentity};
+use super::identity::TtyIdentity;
+use tx_substrate::AtomicSlot;
 
 // ---------------------------------------------------------------------------
 // Ring capacities
