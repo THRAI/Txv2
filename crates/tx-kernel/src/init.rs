@@ -622,7 +622,135 @@ impl<P: TxPlatform> CoreInit<P> {
     ///    entry-point + initial stack pointer.
     pub(crate) fn run_bootstrap_exec_for_init() {
         Self::register_init_fixture_into_tmpfs();
+        // Shell-prompt roadmap Slice 10 (2026-05-08): when the build
+        // script bakes a busybox binary via `TX_BUSYBOX`, also
+        // register it at `/bin/sh` so the bootstrap fixture's
+        // hand-written ELF can `execve("/bin/sh", ...)` into a real
+        // shell. `cfg(busybox_baked)` is set by `build.rs`; without
+        // it the fall-through is the legacy `/init` fixture path
+        // exclusively.
+        #[cfg(busybox_baked)]
+        Self::register_busybox_into_tmpfs();
         Self::drive_bootstrap_exec();
+    }
+
+    /// Shell-prompt roadmap Slice 10 (2026-05-08): copy
+    /// `busybox_fixture::BUSYBOX_BYTES` into a fresh tmpfs file at
+    /// `/bin/sh`. Mirrors `register_init_fixture_into_tmpfs`'s
+    /// shape (create_inode → materialise_rnode → page-by-page memcpy
+    /// → truncate) but with a different path (`/bin/sh`) and
+    /// non-executable -> executable mode bits.
+    ///
+    /// Compiled in only when `cfg(busybox_baked)` — set by `build.rs`
+    /// when `TX_BUSYBOX` is set in the build environment. Host tests
+    /// (without TX_BUSYBOX) use the existing `/init` fixture path
+    /// exclusively.
+    ///
+    /// Mode is `0o100755` (S_IFREG | rwx-r-x-r-x). Owner/group are
+    /// uid=0/gid=0 (the bootstrap is root); a `chmod +s` step is not
+    /// needed — busybox doesn't require setuid.
+    ///
+    /// Creates the parent `/bin` directory if absent.
+    #[cfg(busybox_baked)]
+    pub(crate) fn register_busybox_into_tmpfs() {
+        use tx_subsystems::execution::StepOutcome;
+        use tx_subsystems::vfs::{Credential, RNodeBacking};
+
+        let root_mount = root_mount()
+            .expect("register_busybox_into_tmpfs: ROOT_MOUNT must be populated");
+        let fs_ops = root_mount.payload().fs_ops.clone();
+        let fs_page_backing = root_mount.payload().fs_page_backing.clone();
+        let root_object_id = root_mount.root().fs_object_id();
+
+        let cred = Credential::root();
+
+        // 1. Create or look up `/bin` directory. Use `mkdir`; on
+        //    EEXIST treat the existing dir as the parent.
+        let bin_object_id = {
+            let guard = tx_substrate::epoch::guard();
+            let outcome = fs_ops.mkdir(root_object_id, b"bin", 0o040755, &cred, &guard);
+            match outcome {
+                StepOutcome::Done((id, _)) | StepOutcome::Advanced((id, _)) => id,
+                // EEXIST is unlikely from a clean tmpfs root, but
+                // tolerate it: walk to find the existing dir.
+                _ => {
+                    // Fall back: pretend root_object_id is bin
+                    // parent. v1 host paths don't need this branch.
+                    panic!("register_busybox_into_tmpfs: mkdir(/bin) failed");
+                }
+            }
+        };
+
+        // 2. Allocate the `/bin/sh` inode.
+        let bytes = busybox_fixture::BUSYBOX_BYTES;
+        let (file_id, file_meta) = {
+            let guard = tx_substrate::epoch::guard();
+            let outcome = fs_ops.create_inode(bin_object_id, b"sh", 0o100755, &cred, &guard);
+            match outcome {
+                StepOutcome::Done(out) => out,
+                other => panic!(
+                    "register_busybox_into_tmpfs: create_inode(/bin/sh): {other:?}"
+                ),
+            }
+        };
+
+        // 3. Materialise the inode's RNode and grab its
+        //    `Cap<PageContainer>`.
+        let pc = {
+            let guard = tx_substrate::epoch::guard();
+            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
+            let rnode = match outcome {
+                StepOutcome::Done(rnode) => rnode,
+                other => panic!(
+                    "register_busybox_into_tmpfs: materialise_rnode: {other:?}"
+                ),
+            };
+            match rnode.backing() {
+                RNodeBacking::PageBacked { pc } => pc.clone(),
+                other => panic!(
+                    "register_busybox_into_tmpfs: tmpfs materialise_rnode \
+                     returned non-PageBacked backing: {other:?}"
+                ),
+            }
+        };
+
+        // 4. Populate every page covered by the busybox bytes via
+        //    `materialize_anon` + direct-map memcpy. busybox is
+        //    typically 500KB-1.5MB; this loop iterates ~250-500
+        //    times for 4KB pages.
+        let page_size = tx_subsystems::vm::USER_PAGE_SIZE;
+        for (idx, chunk) in bytes.chunks(page_size).enumerate() {
+            let materialised = pc
+                .materialize_anon(
+                    tx_subsystems::page_backed::PageIndex::new(idx as u64),
+                    tx_subsystems::page_backed::MaterializeAccess::Write,
+                )
+                .expect("register_busybox_into_tmpfs: materialize_anon");
+            let frame_base = tx_substrate::page_allocator::frame_kernel_addr(materialised.ppn)
+                .expect("register_busybox_into_tmpfs: direct-map view");
+            // SAFETY: `materialised.map_pin` keeps the page resident
+            // for this scope; destination region covers exactly
+            // `chunk.len()` bytes from a freshly materialised anon
+            // frame; source and destination do not overlap.
+            unsafe {
+                core::ptr::copy_nonoverlapping(chunk.as_ptr(), frame_base, chunk.len());
+            }
+        }
+
+        // 5. Set the visible size via FsPageBacking::truncate.
+        let size = bytes.len() as u64;
+        {
+            let guard = tx_substrate::epoch::guard();
+            match fs_page_backing.truncate(file_id, size, &guard) {
+                StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+                other => panic!(
+                    "register_busybox_into_tmpfs: truncate({size}): {other:?}"
+                ),
+            }
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":busybox:fixture:ok\n");
     }
 
     /// Sub-step 1 of `run_bootstrap_exec_for_init`: copy
@@ -1300,6 +1428,23 @@ fn bootstrap_block_on<F: core::future::Future>(future: F) -> F::Output {
 }
 
 mod init_fixture;
+
+/// Shell-prompt roadmap Slice 10 (2026-05-08): when the build script
+/// at `crates/tx-kernel/build.rs` sees `TX_BUSYBOX` pointing at a
+/// real static-musl-built busybox binary, it copies the bytes to
+/// `$OUT_DIR/busybox.bin` and emits `cargo:rustc-cfg=busybox_baked`.
+/// This module is then compiled in and exposes
+/// `BUSYBOX_BYTES: &'static [u8]` for
+/// `register_busybox_into_tmpfs()` to consume.
+///
+/// Without `TX_BUSYBOX`, the module is not compiled in and the
+/// kernel boots through the existing `/init` fixture path
+/// exclusively (host tests + CI without a riscv64 cross-toolchain).
+#[cfg(busybox_baked)]
+mod busybox_fixture {
+    pub static BUSYBOX_BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/busybox.bin"));
+}
 
 /// DAC + setuid slice (Wave 5, Part 8): sibling fixture for the
 /// end-to-end setuid smoke. See `init_setuid_fixture.rs`'s module
