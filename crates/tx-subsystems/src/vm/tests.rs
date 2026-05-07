@@ -1,4 +1,5 @@
 use super::*;
+use crate::execution::StepOutcome;
 use crate::page_backed::PageContainer;
 use alloc::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
@@ -1342,4 +1343,160 @@ fn vm_pmap_protect_tears_down_for_refault_not_in_place_retag() {
 
     assert_eq!(aspace.pmap().lookup(UserPage(5)), None);
     assert_eq!(aspace.pmap().stats().shootdowns, 1);
+}
+
+// =====================================================================
+// Part A — `reserve_user_range_for_access` and PrivateAnon
+// cross-call consistency. The eager-walk path must publish each
+// materialised page through the pmap so subsequent `copy_*_user`
+// calls find the same frame; without that publish, a brk-backed
+// `PrivateAnon` page would re-zero on every read and writes would
+// be invisible to subsequent reads. See `vm/user_access.rs`'s
+// module header for the design.
+// =====================================================================
+
+#[test]
+fn vm_aspace_reserve_user_range_for_access_publishes_private_anon_pages() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x10000, 3),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+
+    let outcome = aspace.reserve_user_range_for_access(
+        range(0x10000, 3),
+        crate::vm::UserAccessKind::Write,
+    );
+    assert!(matches!(outcome, StepOutcome::Done(())));
+    for page in [UserPage(0x10), UserPage(0x11), UserPage(0x12)] {
+        let snap = aspace
+            .pmap()
+            .lookup(page)
+            .expect("page published after reserve");
+        assert!(snap.prot.write, "write reserve publishes writable mapping");
+    }
+}
+
+#[test]
+fn vm_aspace_reserve_user_range_for_access_skips_already_published() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x20000, 2),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+
+    let _ = aspace.reserve_user_range_for_access(
+        range(0x20000, 2),
+        crate::vm::UserAccessKind::Write,
+    );
+    let mapped_after_first = aspace.pmap().stats().mapped_pages;
+    assert_eq!(mapped_after_first, 2);
+    let commits_after_first = aspace.pmap().stats().commits;
+
+    // Second call: every page already permits Write; no new commits.
+    let _ = aspace.reserve_user_range_for_access(
+        range(0x20000, 2),
+        crate::vm::UserAccessKind::Write,
+    );
+    assert_eq!(aspace.pmap().stats().mapped_pages, 2);
+    assert_eq!(aspace.pmap().stats().commits, commits_after_first);
+}
+
+#[test]
+fn vm_aspace_reserve_user_range_for_access_returns_efault_for_unmapped() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+
+    let outcome = aspace.reserve_user_range_for_access(
+        range(0x30000, 1),
+        crate::vm::UserAccessKind::Read,
+    );
+    assert_eq!(outcome, StepOutcome::Err(crate::execution::Errno::EFAULT));
+    assert_eq!(aspace.pmap().stats().mapped_pages, 0);
+}
+
+#[test]
+fn vm_aspace_reserve_user_range_for_access_propagates_prot_mismatch_efault() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x40000, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("read-only map");
+
+    let outcome = aspace.reserve_user_range_for_access(
+        range(0x40000, 1),
+        crate::vm::UserAccessKind::Write,
+    );
+    assert_eq!(outcome, StepOutcome::Err(crate::execution::Errno::EFAULT));
+}
+
+#[test]
+fn vm_aspace_copy_from_user_consistent_with_prior_copy_to_user_for_private_anon() {
+    // Regression test for the PrivateAnon zero-frame consistency bug.
+    // Without the pmap-first probe + publish in `resolve_user_page_addr`,
+    // each call to `copy_*_user` on an unpublished anon page allocated a
+    // fresh zero frame, so `copy_to_user` writes were invisible to a
+    // subsequent `copy_from_user` read on the same page.
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let user_va = 0x50_0000usize;
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(user_va, 1),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+
+    let guard = tx_substrate::epoch::guard();
+    let dst = tx_hal::UserPtr::<u8>::new(user_va);
+    let payload: alloc::vec::Vec<u8> = (0u8..200).collect();
+    match aspace.copy_to_user(dst, &payload, &guard) {
+        StepOutcome::Done(n) => assert_eq!(n, payload.len()),
+        other => panic!("copy_to_user expected Done, got {other:?}"),
+    }
+
+    // The pmap must now have a published mapping for this page —
+    // otherwise the readback below would observe a fresh zero frame.
+    let user_page = UserVirtAddr(user_va).containing_page();
+    assert!(
+        aspace.pmap().lookup(user_page).is_some(),
+        "copy_to_user must publish the materialised frame"
+    );
+
+    let mut readback = alloc::vec![0u8; payload.len()];
+    let src = tx_hal::UserPtr::<u8>::new(user_va);
+    match aspace.copy_from_user(&mut readback, src, &guard) {
+        StepOutcome::Done(n) => assert_eq!(n, payload.len()),
+        other => panic!("copy_from_user expected Done, got {other:?}"),
+    }
+    assert_eq!(readback, payload, "readback must match prior write");
 }

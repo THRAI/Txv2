@@ -14,6 +14,26 @@
 //! every materialisation yields either a frame or `Err`/`Blocked`,
 //! both of which surface to the syscall caller without relying on
 //! kernel-mode fault recovery.
+//!
+//! ## PrivateAnon consistency via pmap
+//!
+//! Per VM_v1_2 §"No rmap": private anon frames are tracked only via
+//! published pmap PTEs (no per-VmEntry rmap). `resolve_user_page_addr`
+//! therefore consults `aspace.pmap.lookup(page)` first; on hit it
+//! reuses the cached `(ppn, prot)`, on miss it falls through to the
+//! VmFault materialisation path. Without the pmap-first probe a
+//! `PrivateAnon` page would be re-zeroed on every read (each call
+//! allocates a fresh zero frame), so a write through `copy_to_user`
+//! would not be visible to a subsequent `copy_from_user`. brk-backed
+//! heap (musl malloc / argv strings / env strings) requires
+//! cross-call consistency, hence the pmap-first lane.
+//!
+//! `reserve_user_range_for_access` populates pmap eagerly for a
+//! whole user range so a subsequent multi-step copy sequence
+//! (struct + string, struct + buffer, etc.) sees each page exactly
+//! once, mirrors the canonical `fault_script` lane synchronously, and
+//! returns `Blocked`/`Err` to its caller for any page whose
+//! materialisation cannot complete inline.
 
 use alloc::vec::Vec;
 use tx_hal::UserPtr;
@@ -23,7 +43,8 @@ use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
 use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
 
 use super::structure::{
-    AccessMode, AddressSpace, UserVirtAddr, VmBacking, VmEntry, USER_PAGE_SIZE,
+    AccessMode, AddressSpace, UserRange, UserVirtAddr, VmBacking, VmEntry, VmFault,
+    VmFaultOutcome, USER_PAGE_SIZE,
 };
 
 /// Whether a user-access primitive is reading from or writing to
@@ -36,7 +57,7 @@ pub enum UserAccessKind {
 }
 
 impl UserAccessKind {
-    fn required_prot(self) -> AccessMode {
+    pub fn required_prot(self) -> AccessMode {
         match self {
             Self::Read => AccessMode::Read,
             Self::Write => AccessMode::Write,
@@ -125,6 +146,95 @@ impl AddressSpace {
             }
             StepOutcome::Err(e) => StepOutcome::Err(e),
         }
+    }
+
+    /// Eagerly fault-in every page in `range` for access of `kind` and
+    /// publish each page through the pmap. After a successful `Done(())`
+    /// every page in `range` has a published pmap entry whose
+    /// `Prot.permits(kind.required_prot())` holds; subsequent
+    /// `copy_*_user` calls find the page through `pmap.lookup` and do
+    /// not re-materialise.
+    ///
+    /// Implementation mirrors `vm::execution::fault_script`'s tail
+    /// synchronously: for each page, observe the recipe through
+    /// `resolve_fault`, materialise via `materialize_pagebacked`, and
+    /// publish through `pmap.publish_page_with_replacement`. Already-
+    /// published pages whose protection already permits the access
+    /// are skipped, so calling this twice on the same range is cheap.
+    ///
+    /// Errors and Blocked propagate to the caller:
+    ///
+    /// - `Err(Errno::EFAULT)` for unmapped pages (no recipe), for
+    ///   prot-mismatch (recipe rejects the access), and for
+    ///   materialisation / publication failures from the underlying
+    ///   subsystems (`VmFault` / pmap surface them as opaque internal
+    ///   shapes; the user-VA contract collapses every one to EFAULT).
+    /// - `Blocked(token)` if a page-cache fetch needs to await; the
+    ///   caller awaits the carrier and retries.
+    ///
+    /// Per VM_v1_2 §"No rmap": private anon frames are tracked only
+    /// via published PTEs, so the pmap is the canonical authoritative
+    /// store consulted by `copy_*_user`. Reserving up-front guarantees
+    /// every page lands once and stays observable.
+    ///
+    /// Does **not** take a `&Guard<'_>` parameter — internal
+    /// observation paths (`resolve_fault` → `require_fault_recipe` →
+    /// `aspace.lookup`) take their own fresh epoch guards. Callers
+    /// holding an outer guard must drop it before invoking this method
+    /// to avoid `epoch guards cannot be nested on the same CPU`.
+    pub fn reserve_user_range_for_access(
+        &self,
+        range: UserRange,
+        kind: UserAccessKind,
+    ) -> StepOutcome<()> {
+        for page in range.iter_pages() {
+            // Skip pages already published with sufficient protection.
+            // We only avoid re-materialisation when the cached entry
+            // already permits the requested access.
+            if let Some(snapshot) = self.pmap.lookup(page) {
+                if snapshot.prot.permits(kind.required_prot()) {
+                    continue;
+                }
+                // Insufficient protection on the existing mapping.
+                // The caller's intent (Read/Write) cannot be satisfied
+                // by the cached frame; surface as EFAULT (matches the
+                // recipe-permission fast path in `resolve_user_page_addr`).
+                return StepOutcome::Err(Errno::EFAULT);
+            }
+            // Build a synthetic fault, observe the recipe, materialise,
+            // and publish synchronously.
+            let page_addr = match page.checked_start_addr() {
+                Ok(a) => a,
+                Err(_) => return StepOutcome::Err(Errno::EFAULT),
+            };
+            let fault = VmFault::new(page_addr, kind.required_prot());
+            let outcome: VmFaultOutcome = match self.resolve_fault(fault) {
+                Ok(o) => o,
+                Err(_) => return StepOutcome::Err(Errno::EFAULT),
+            };
+            let materialization = match outcome.materialize_pagebacked() {
+                Ok(m) => m,
+                Err(_) => return StepOutcome::Err(Errno::EFAULT),
+            };
+            // Publish the materialisation. `replace_existing` honours
+            // the materialisation's own intent (private CoW path sets
+            // it; otherwise false). The page-key derives from the
+            // outcome's page_range, mirroring `fault_script`.
+            if self
+                .pmap
+                .publish_page_with_replacement(
+                    outcome.page_range.start().containing_page(),
+                    materialization.page.ppn,
+                    materialization.publish_prot,
+                    materialization.page.map_pin,
+                    materialization.replace_existing,
+                )
+                .is_err()
+            {
+                return StepOutcome::Err(Errno::EFAULT);
+            }
+        }
+        StepOutcome::Done(())
     }
 
     /// Read a NUL-terminated byte string starting at `src`, capped at
@@ -310,6 +420,23 @@ enum ResolveOutcome {
 /// Look up the `VmEntry` covering `page_addr`, validate the access
 /// against its `Prot`, materialise the page through its backing, and
 /// translate the resulting `Ppn` into a kernel direct-map address.
+///
+/// Pmap-first probe (per VM_v1_2 §"No rmap"): if the page already has
+/// a published pmap entry whose `Prot` permits the access, return the
+/// cached frame's kernel direct-map address directly. The frame is
+/// kept resident by the existing pmap entry's `MapPin`; the caller
+/// only borrows the pointer for the synchronous remainder of the
+/// containing tool-step (matching the existing `ResolveOutcome::Done`
+/// contract — the pin is **not** plumbed through). On miss (or
+/// insufficient cached prot), fall through to the per-call materialise
+/// path which preserves the original eager-walk semantics.
+///
+/// Without the pmap-first probe, `VmBacking::PrivateAnon` would
+/// allocate a fresh zero frame on every call, breaking cross-call
+/// consistency: a `copy_to_user` write would not be visible to a
+/// subsequent `copy_from_user` read on the same page. brk-backed
+/// userspace heap (musl malloc / argv strings) requires this
+/// consistency.
 fn resolve_user_page_addr(
     aspace: &AddressSpace,
     page_addr: usize,
@@ -327,11 +454,61 @@ fn resolve_user_page_addr(
     if !entry.prot.permits(kind.required_prot()) {
         return ResolveOutcome::Err(Errno::EFAULT);
     }
+
+    // Pmap-first lookup. The published mapping pins the frame; we
+    // borrow the kernel direct-map pointer for the synchronous copy
+    // and release it before returning, matching `ResolveOutcome::Done`'s
+    // existing contract (no MapPin threaded out).
+    let user_page = UserVirtAddr(page_addr).containing_page();
+    if let Some(snapshot) = aspace.pmap.lookup(user_page) {
+        if snapshot.prot.permits(kind.required_prot()) {
+            return match page_allocator::frame_kernel_addr(snapshot.ppn) {
+                Ok(p) => ResolveOutcome::Done(p),
+                Err(_) => ResolveOutcome::Err(Errno::EFAULT),
+            };
+        }
+        // Cached mapping rejects this access. The recipe permits it
+        // (we checked above), so the cached prot must be a stricter
+        // demotion (e.g. read-only PTE published for a private-anon
+        // first-touch read; the next write fault would refault and
+        // republish). Fall through to materialise + publish.
+    }
+
+    // Pmap miss (or insufficient cached prot). Materialise via the
+    // backing path. We then synchronously publish the result to the
+    // pmap so a subsequent `copy_*_user` over the same page lands the
+    // pmap-first probe above and observes the same frame.
+    //
+    // Without the publish, `VmBacking::PrivateAnon` would re-zero on
+    // every call (each materialisation allocates a fresh frame),
+    // breaking write-then-read consistency of brk-backed heap pages.
     let materialised = match resolve_user_page(&entry, page_addr, kind, guard) {
         ResolvePageOutcome::Done(m) => m,
         ResolvePageOutcome::Err(e) => return ResolveOutcome::Err(e),
         ResolvePageOutcome::Blocked(t) => return ResolveOutcome::Blocked(t),
     };
+    // Publish via pmap so the next call hits the cache. The
+    // `publish_prot` mirrors `fault_script`: read access on a
+    // private-anon page publishes a read-only mapping (the next write
+    // would refault and republish writable); write access publishes
+    // the entry's full prot. Failure to publish is non-fatal — we
+    // still have the materialised frame in hand for *this* call. The
+    // next call will re-materialise (correct but slower).
+    let publish_prot = match (&entry.backing, kind) {
+        (VmBacking::PrivateAnon, UserAccessKind::Read) => entry.prot.without_write(),
+        (VmBacking::Page { .. }, UserAccessKind::Read) if !entry.flags.shared => {
+            entry.prot.without_write()
+        }
+        _ => entry.prot,
+    };
+    let user_page = UserVirtAddr(page_addr).containing_page();
+    let _ = aspace.pmap.publish_page_with_replacement(
+        user_page,
+        materialised.ppn,
+        publish_prot,
+        materialised.map_pin,
+        true,
+    );
     match page_allocator::frame_kernel_addr(materialised.ppn) {
         Ok(p) => ResolveOutcome::Done(p),
         Err(_) => ResolveOutcome::Err(Errno::EFAULT),
