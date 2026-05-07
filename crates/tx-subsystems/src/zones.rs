@@ -27,6 +27,7 @@ pub fn register_all() -> Result<(), ZoneError> {
     mount::register_zones()?;
     vfs::register_zones()?;
     tty::register_zones()?;
+    pipe::register_zones()?;
     Ok(())
 }
 
@@ -129,5 +130,13 @@ mod tty {
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
         crate::tty::structure::registry::register_zones()
+    }
+}
+
+mod pipe {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::pipe::register_zones()
     }
 }

@@ -164,6 +164,31 @@ pub const NR_OPENAT: u64 = 56;
 /// fires the OpenFile's `Drop`) and clears the cloexec bit. `-EBADF`
 /// for closed fds.
 pub const NR_CLOSE: u64 = 57;
+/// `pipe2(int pipefd[2], int flags)`. Linux RV64 generic ABI
+/// `__NR_pipe2 = 59`.
+///
+/// Wave 3 of the fd-ops slice. Builds a (reader, writer) `OpenFile`
+/// pair sharing a single `Cap<PipePayload>` via
+/// `tx_subsystems::pipe::step_pipe2`, allocates two `(reader_fd,
+/// writer_fd)` slots via `process.allocate_fd()`, installs them in
+/// the BTreeMap, and writes the pair back to userspace at
+/// `pipefd_uaddr` as `[u32; 2]` little-endian.
+///
+/// Recognised `flags`: `O_CLOEXEC | O_NONBLOCK`. `O_DIRECT`
+/// (packet-mode pipes) is recognised but returns `-ENOSYS`. Any
+/// other bits return `-EINVAL`.
+///
+/// **SIGPIPE delivery.** Q2 DECIDED 2026-05-07: `OpenFile::step_write`
+/// returns `Err(EPIPE)` when all readers have closed. The
+/// `sys_write` arm intercepts `Errno::EPIPE` and dispatches SIGPIPE
+/// to the calling process via `signal::step_kill_process` before
+/// returning `-EPIPE` to userspace. The pipe module itself has no
+/// process Cap and so cannot deliver the signal.
+pub const NR_PIPE2: u64 = 59;
+/// `O_DIRECT` flag bit (`0o40000`). Recognised by `sys_pipe2` but
+/// not implemented (packet-mode pipes are out of scope). Any other
+/// open arm currently ignores this bit.
+pub const O_DIRECT: u32 = 0o40000;
 
 // ---------------------------------------------------------------------
 // Wave 2 of the fork/clone/wait4 slice — Part 2 (NR_CLONE) +

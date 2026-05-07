@@ -931,6 +931,7 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
                 write: false,
                 append: false,
                 cloexec: false,
+                nonblocking: false,
             },
             0,
             &cred,

@@ -1049,6 +1049,7 @@ fn fresh_open_file() -> Cap<crate::vfs::OpenFile> {
             write: true,
             append: false,
             cloexec: false,
+            nonblocking: false,
         },
     )
     .expect("open file cap")

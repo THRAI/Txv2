@@ -1152,6 +1152,7 @@ mod tests {
                 write: true,
                 append: false,
                 cloexec: false,
+                nonblocking: false,
             },
         )
     }

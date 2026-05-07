@@ -9,6 +9,18 @@ pub use tx_substrate::epoch::Guard;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Errno {
     EACCES,
+    /// Resource temporarily unavailable. Surfaced by `O_NONBLOCK` I/O
+    /// paths (e.g. fd-ops Wave 3 `pipe::step_read` / `step_write` with
+    /// `nonblocking = true` and no progress yet).
+    EAGAIN,
+    /// Bad file descriptor. Today only surfaced by fd-ops Wave 3
+    /// pipe dispatch when a wrong-side `step_read` / `step_write`
+    /// reaches the dispatcher despite the OpenFileFlags read/write
+    /// guard (defence in depth — the flag check at the top of
+    /// `OpenFile::step_read/step_write` returns `EINVAL` first for
+    /// the common case). Linux semantic: `read(2)` on a writer-end
+    /// fd is `-EBADF`, not `-EPIPE`.
+    EBADF,
     EBUSY,
     EDQUOT,
     EEXIST,
@@ -26,6 +38,10 @@ pub enum Errno {
     ENOTDIR,
     ENOTEMPTY,
     EPERM,
+    /// Broken pipe: write to a pipe with all readers closed. The
+    /// caller is responsible for delivering SIGPIPE before returning
+    /// `-EPIPE` to userspace (fd-ops Wave 3, Q2 DECIDED 2026-05-07).
+    EPIPE,
     EROFS,
     ESRCH,
     ESTALE,

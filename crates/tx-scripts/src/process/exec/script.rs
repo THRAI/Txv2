@@ -262,6 +262,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
                 write: false,
                 append: false,
                 cloexec: false,
+                nonblocking: false,
             },
             0,
             cred,

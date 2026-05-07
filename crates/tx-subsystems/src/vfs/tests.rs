@@ -125,6 +125,7 @@ fn open_file_dispatches_struct_payload_read_write() {
             write: true,
             append: false,
             cloexec: false,
+            nonblocking: false,
         },
     );
     let mut out = [0u8; 8];
@@ -161,6 +162,7 @@ fn open_file_dispatches_struct_payload_read_write() {
             write: true,
             append: false,
             cloexec: false,
+            nonblocking: false,
         },
     );
     let mut char_out = [0u8; 1];

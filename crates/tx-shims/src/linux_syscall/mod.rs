@@ -79,10 +79,11 @@ pub use numbers::{
     NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT,
     NR_FACCESSAT2, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_GETEGID, NR_GETEUID, NR_GETGID,
     NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRESGID, NR_GETRESUID, NR_GETSID,
-    NR_GETUID, NR_OPENAT, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SETGID, NR_SETPGID,
-    NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
-    NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_EXCL,
-    O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, R_OK, SIGCHLD, WNOHANG, W_OK, X_OK,
+    NR_GETUID, NR_OPENAT, NR_PIPE2, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SETGID,
+    NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID,
+    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND, O_CLOEXEC,
+    O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, R_OK, SIGCHLD,
+    WNOHANG, W_OK, X_OK,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -422,6 +423,8 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf>(
             req.args[2] as u32,
             ctx,
         ),
+        // fd-ops Wave 3 — anonymous pipe.
+        nr if nr == NR_PIPE2 => sys_pipe2(req.args[0], req.args[1] as u32, ctx),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -510,6 +513,17 @@ async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
             StepOutcome::Err(errno) => {
                 if total > 0 {
                     return SyscallResult::Return(total as i64);
+                }
+                // fd-ops Wave 3 — Q2 DECIDED 2026-05-07. SIGPIPE is
+                // delivered to the calling process before returning
+                // `-EPIPE` to userspace. The pipe `step_write` cannot
+                // do this itself (no process Cap); the syscall arm
+                // is the right boundary because it has `ctx.process`.
+                if errno == Errno::EPIPE {
+                    let _ = tx_subsystems::signal::step_kill_process(
+                        &ctx.process,
+                        tx_subsystems::signal::Signum::SIGPIPE,
+                    );
                 }
                 return SyscallResult::Error(errno_to_i32(errno));
             }
@@ -1163,6 +1177,8 @@ fn resolve_fd(process: &Cap<ProcessIdentity>, idx: u32) -> Option<Cap<OpenFile>>
 fn errno_to_i32(errno: Errno) -> i32 {
     match errno {
         Errno::EACCES => 13,
+        Errno::EAGAIN => EAGAIN_VALUE,
+        Errno::EBADF => EBADF_VALUE,
         Errno::EBUSY => 16,
         Errno::EDQUOT => 122,
         Errno::EEXIST => 17,
@@ -1180,6 +1196,7 @@ fn errno_to_i32(errno: Errno) -> i32 {
         Errno::ENOTDIR => 20,
         Errno::ENOTEMPTY => 39,
         Errno::EPERM => 1,
+        Errno::EPIPE => 32,
         Errno::EROFS => 30,
         Errno::ESRCH => 3,
         Errno::ESTALE => 116,
@@ -2296,6 +2313,7 @@ async fn sys_openat<'a, P: PmapIf>(
         write: want_write,
         append: want_append,
         cloexec: want_cloexec,
+        nonblocking: flags & O_NONBLOCK != 0,
     };
 
     // Resolve the cwd anchor. Zombies + uninitialised init pre-rootfs
@@ -2624,4 +2642,72 @@ fn sys_dup3<'a>(oldfd: u32, newfd: u32, flags: u32, ctx: &SyscallCtx<'a>) -> Sys
     let want_cloexec = flags & O_CLOEXEC != 0;
     ctx.process.set_fd_cloexec(newfd, want_cloexec);
     SyscallResult::Return(newfd as i64)
+}
+
+/// `pipe2(int pipefd[2], int flags)`. Linux RV64 generic ABI
+/// `__NR_pipe2 = 59`.
+///
+/// fd-ops Wave 3. Builds a (reader, writer) pair via
+/// `tx_subsystems::pipe::step_pipe2`, allocates two fds via
+/// `process.allocate_fd()`, installs both, and writes the pair back
+/// to userspace at `pipefd_uaddr` as `[u32; 2]` little-endian.
+///
+/// Recognised flag bits: `O_CLOEXEC` (sets cloexec on both fds) and
+/// `O_NONBLOCK` (sets the per-OpenFile nonblocking flag, threaded
+/// through `OpenFileFlags.nonblocking` so reader/writer-side
+/// `step_read`/`step_write` short-circuit `Blocked` to `EAGAIN`).
+/// `O_DIRECT` (packet-mode pipes) is recognised but unsupported and
+/// returns `-ENOSYS`. Any other bits return `-EINVAL`.
+///
+/// Userspace writeback: like the bootstrap `getresuid` / `getresgid`
+/// arms, the `pipefd_uaddr` is treated as a kernel-side pointer via
+/// inline `write_volatile`. Real user-VA validation lives behind
+/// `TODO(phase-userva)`.
+fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+    // Validate flags. Recognised: O_CLOEXEC | O_NONBLOCK | O_DIRECT.
+    // O_DIRECT is recognised but unsupported (packet-mode pipes are
+    // out of scope) → `-ENOSYS`.
+    let recognised = O_CLOEXEC | O_NONBLOCK | O_DIRECT;
+    if flags & !recognised != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if flags & O_DIRECT != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+
+    let pipe_flags = tx_subsystems::pipe::PipeFlags {
+        cloexec: flags & O_CLOEXEC != 0,
+        nonblocking: flags & O_NONBLOCK != 0,
+    };
+    let (reader_cap, writer_cap) = match tx_subsystems::pipe::step_pipe2(pipe_flags) {
+        Ok(pair) => pair,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+
+    // Install at the lowest two unused fds. `allocate_fd()` returns
+    // the lowest unused slot; install_fd() commits. Allocate the
+    // reader first so on a fresh process it lands at 0 and the
+    // writer at 1, matching Linux's user-visible (3, 4) pattern
+    // post-stdin/out/err.
+    let reader_fd = ctx.process.allocate_fd();
+    let _ = ctx.process.install_fd(reader_fd, reader_cap);
+    let writer_fd = ctx.process.allocate_fd();
+    let _ = ctx.process.install_fd(writer_fd, writer_cap);
+
+    if pipe_flags.cloexec {
+        ctx.process.set_fd_cloexec(reader_fd, true);
+        ctx.process.set_fd_cloexec(writer_fd, true);
+    }
+
+    // Write the (reader_fd, writer_fd) pair back to userspace.
+    // SAFETY: TODO(phase-userva) bootstrap exemption — we treat
+    // `pipefd_uaddr` as a kernel-readable pointer to an `[u32; 2]`
+    // slot, mirroring the existing `getresuid` / `getresgid`
+    // writeback path. Real user-VA validation lives behind
+    // `phase-userva`.
+    unsafe {
+        core::ptr::write_volatile(pipefd_uaddr as *mut [u32; 2], [reader_fd, writer_fd]);
+    }
+
+    SyscallResult::Return(0)
 }
