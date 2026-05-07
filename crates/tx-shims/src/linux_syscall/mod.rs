@@ -1076,6 +1076,7 @@ fn resolve_fd(process: &Cap<ProcessIdentity>, idx: usize) -> Option<Cap<OpenFile
 /// phases extend the table in lockstep with the syscall arms.
 fn errno_to_i32(errno: Errno) -> i32 {
     match errno {
+        Errno::EACCES => 13,
         Errno::EBUSY => 16,
         Errno::EDQUOT => 122,
         Errno::EEXIST => 17,

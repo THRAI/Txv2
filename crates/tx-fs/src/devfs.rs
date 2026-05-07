@@ -269,6 +269,29 @@ impl FsOps for Devfs {
     /// the latter is retained for the bootstrap-fallback path
     /// (`open_console_for_init_legacy`); this hook is the production
     /// walker site.
+    fn step_chmod(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        // devfs is a read-only projection-shaped backend; mode-bit
+        // mutation is not supported.
+        StepOutcome::Err(Errno::EROFS)
+    }
+
+    fn step_chown(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_uid: Option<u32>,
+        _new_gid: Option<u32>,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        StepOutcome::Err(Errno::EROFS)
+    }
+
     fn materialise_rnode(
         &self,
         fs_object_id: FsObjectId,

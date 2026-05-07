@@ -140,6 +140,14 @@ pub const S_IFBLK: u16 = 0o060000;
 pub const S_IFIFO: u16 = 0o010000;
 pub const S_IFSOCK: u16 = 0o140000;
 
+// POSIX special-mode bits: setuid, setgid, sticky. Live above the
+// standard `rwxrwxrwx` triplets but below `S_IFMT`. Used by the DAC +
+// setuid slice's chmod/chown bookkeeping (e.g. `step_chown` silently
+// clears `S_ISUID`/`S_ISGID` for non-privileged callers).
+pub const S_ISUID: u16 = 0o4000;
+pub const S_ISGID: u16 = 0o2000;
+pub const S_ISVTX: u16 = 0o1000;
+
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Timespec {
     pub sec: i64,

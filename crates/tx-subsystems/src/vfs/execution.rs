@@ -153,6 +153,60 @@ pub trait FsOps: Send + Sync + 'static {
         let _ = (fs_object_id, meta, guard);
         StepOutcome::Err(Errno::ENOSYS)
     }
+
+    /// Update the inode's mode bits. Backend enforces the POSIX
+    /// chmod-permission rule (caller must be the file owner OR carry
+    /// `CAP_FOWNER`); the walker has already validated the path.
+    /// `new_mode` carries the post-change mode bits *below* `S_IFMT`
+    /// (callers cannot mutate the file kind via chmod). The setuid /
+    /// setgid / sticky bits (`S_ISUID`, `S_ISGID`, `S_ISVTX`) are
+    /// part of `new_mode` and the backend preserves them per the
+    /// caller's request — Linux's silent-clear-`S_ISGID` semantic on
+    /// non-owner-group chmod is **out of scope** for this slice (see
+    /// the DAC + setuid plan §"chmod silent-clear"). Permission
+    /// failures return `Errno::EPERM`; not-found returns
+    /// `Errno::ENOENT`; read-only filesystems return `Errno::EROFS`.
+    ///
+    /// Default returns `Errno::ENOSYS` so backends that don't grow
+    /// the hook (e.g. projection-only backends) fall through cleanly.
+    /// Cites: `txdoc:VFS-CHECKS-PERMISSIONS-1`.
+    fn step_chmod(
+        &self,
+        fs_object_id: FsObjectId,
+        new_mode: u16,
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        let _ = (fs_object_id, new_mode, cred, guard);
+        StepOutcome::Err(Errno::ENOSYS)
+    }
+
+    /// Update the inode's `(uid, gid)`. `new_uid` / `new_gid` of
+    /// `None` mean "leave unchanged" (the syscall arm decodes
+    /// Linux's `(u32) -1` sentinel into `None`). Backend enforces
+    /// the POSIX chown rule: only `CAP_FOWNER` grants arbitrary
+    /// `(uid, gid)` changes; non-privileged callers may chown only
+    /// to their own `(uid, gid)`. The slice uses `CAP_FOWNER` rather
+    /// than `CAP_CHOWN` for symmetry with `step_chmod` and because
+    /// the trio's cap surface is intentionally lean. Linux's
+    /// silent-clear-`S_ISUID`/`S_ISGID` on chown by non-privileged
+    /// callers is honoured by the backend (matches LTP `chown03`).
+    /// Permission failures return `Errno::EPERM`; not-found returns
+    /// `Errno::ENOENT`; read-only filesystems return `Errno::EROFS`.
+    ///
+    /// Default returns `Errno::ENOSYS`.
+    /// Cites: `txdoc:VFS-CHECKS-PERMISSIONS-1`.
+    fn step_chown(
+        &self,
+        fs_object_id: FsObjectId,
+        new_uid: Option<u32>,
+        new_gid: Option<u32>,
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        let _ = (fs_object_id, new_uid, new_gid, cred, guard);
+        StepOutcome::Err(Errno::ENOSYS)
+    }
 }
 
 /// Filesystem driver output produced at mount time and consumed by Mount

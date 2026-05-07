@@ -356,11 +356,28 @@ pub async fn exec_script<P: PmapIf>(
     // argv/envp/auxv image (pure kernel buffer; no aspace coupling
     // yet) and write it into the freshly built detached aspace's
     // anonymous-private stack range via V2's pre-publish lane.
+    // Snapshot the caller's cred so musl's `__init_security` can read
+    // `at_uid` / `at_euid` / `at_gid` / `at_egid` straight off the
+    // auxv stack image. `process.cred()` returns `None` only for a
+    // zombie target; the exec front-end keeps us alive through this
+    // point, so the `Cred::root()` fallback is purely defensive.
+    let cred = process
+        .cred()
+        .unwrap_or_else(tx_subsystems::cred::Cred::root);
     let auxv_facts = AuxvFacts {
         at_phdr: parsed.at_phdr,
         at_phent: ELF64_PHENT,
         at_phnum: parsed.at_phnum,
         at_pagesz: USER_PAGE_SIZE,
+        at_uid: cred.uid.raw() as u64,
+        at_euid: cred.euid.raw() as u64,
+        at_gid: cred.gid.raw() as u64,
+        at_egid: cred.egid.raw() as u64,
+        // TODO(wave-4): compute from step_apply_suid_for_exec; non-zero
+        // when the binary's S_ISUID/S_ISGID bit caused an effective-id
+        // change at exec time. Wave 3 hardcodes this to 0 so the auxv
+        // shape ships ahead of the setuid recompute helper.
+        at_secure: 0,
     };
     let stack_image = build_initial_user_stack(USER_STACK_TOP_DEFAULT, argv, envp, &auxv_facts);
 

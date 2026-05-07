@@ -205,6 +205,9 @@ fn devfs_create_returns_erofs() {
     let guard = tx_substrate::epoch::guard();
     let devfs = Devfs::new();
 
+    // Devfs always returns EROFS for mutators, so cred privilege does
+    // not affect the assertion; leaving as `Credential::default()`
+    // documents that this test is not gated on DAC behaviour.
     let cred = Credential::default();
     let outcome = devfs.create_inode(DEVFS_ROOT_OBJECT_ID, b"new-thing", 0o100644, &cred, &guard);
     assert_eq!(outcome, StepOutcome::Err(Errno::EROFS));
@@ -223,6 +226,50 @@ fn devfs_create_returns_erofs() {
         devfs.serialize_inode_meta(
             DEVFS_ROOT_OBJECT_ID,
             &tx_subsystems::vfs::InodeMeta::new(tx_subsystems::vfs::InodeKind::Directory, 0o755),
+            &guard,
+        ),
+        StepOutcome::Err(Errno::EROFS)
+    );
+}
+
+#[test]
+fn devfs_chmod_returns_erofs() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+
+    let guard = tx_substrate::epoch::guard();
+    let devfs = Devfs::new();
+    let cred = Credential::root();
+
+    // devfs nodes are kernel-owned; mode-bit mutation is not
+    // supported. The override returns EROFS regardless of
+    // privilege.
+    assert_eq!(
+        FsOps::step_chmod(&devfs, DEVFS_ROOT_OBJECT_ID, 0o700, &cred, &guard),
+        StepOutcome::Err(Errno::EROFS)
+    );
+}
+
+#[test]
+fn devfs_chown_returns_erofs() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+
+    let guard = tx_substrate::epoch::guard();
+    let devfs = Devfs::new();
+    let cred = Credential::root();
+
+    assert_eq!(
+        FsOps::step_chown(
+            &devfs,
+            DEVFS_ROOT_OBJECT_ID,
+            Some(1000),
+            Some(1000),
+            &cred,
             &guard,
         ),
         StepOutcome::Err(Errno::EROFS)
