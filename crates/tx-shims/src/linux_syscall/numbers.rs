@@ -744,3 +744,52 @@ pub const TIMER_ABSTIME: u32 = 0x1;
 pub const TIMES_TICK_HZ: u64 = 100;
 /// Number of nanoseconds per `times(2)` tick (10ms at 100Hz).
 pub const TIMES_NS_PER_TICK: u64 = 1_000_000_000 / TIMES_TICK_HZ;
+
+// ---------------------------------------------------------------------
+// Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY routing.
+//
+// Without `ioctl`, musl's `isatty(STDIN_FILENO)` returns false, the
+// shell starts in non-interactive mode and never prints a prompt. The
+// arm decodes `request` against the eight TTY ioctls v1 supports; non-
+// TTY fds and unknown request codes return `-ENOTTY` per Linux's
+// `man ioctl_tty`. See
+// `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 5.
+//
+// Authoritative source: Linux generic uapi `<asm-generic/ioctls.h>` —
+// musl's `<sys/ioctl.h>` for `riscv64-linux-musl` resolves to the same
+// hex values.
+// ---------------------------------------------------------------------
+
+/// `ioctl(fd, request, argp)`. Linux RV64 generic ABI `__NR_ioctl = 29`.
+pub const NR_IOCTL: u64 = 29;
+
+/// `TCGETS = 0x5401` — read termios (`struct termios *argp`).
+pub const TCGETS: u32 = 0x5401;
+/// `TCSETS = 0x5402` — install termios immediately
+/// (`struct termios *argp`).
+pub const TCSETS: u32 = 0x5402;
+/// `TCSETSW = 0x5403` — install termios after draining the output
+/// queue. v1 aliases to `TCSETS` (drain semantics not yet implemented).
+pub const TCSETSW: u32 = 0x5403;
+/// `TCSETSF = 0x5404` — install termios after draining the output
+/// queue and flushing the input queue. v1 aliases to `TCSETS`.
+pub const TCSETSF: u32 = 0x5404;
+/// `TIOCSCTTY = 0x540E` — make the calling process's session use this
+/// TTY as its controlling terminal. Caller must be a session leader
+/// without an existing controlling TTY.
+pub const TIOCSCTTY: u32 = 0x540E;
+/// `TIOCGPGRP = 0x540F` — read the foreground process-group id of
+/// this TTY (`u32 *argp`).
+pub const TIOCGPGRP: u32 = 0x540F;
+/// `TIOCSPGRP = 0x5410` — set the foreground process-group id of this
+/// TTY (`u32 *argp`).
+pub const TIOCSPGRP: u32 = 0x5410;
+/// `TIOCGWINSZ = 0x5413` — read the TTY's window size
+/// (`struct winsize *argp`).
+pub const TIOCGWINSZ: u32 = 0x5413;
+/// `TIOCSWINSZ = 0x5414` — set the TTY's window size
+/// (`struct winsize *argp`). Fires SIGWINCH at the foreground pgrp.
+pub const TIOCSWINSZ: u32 = 0x5414;
+/// `TIOCNOTTY = 0x5422` — detach this TTY as the calling session's
+/// controlling terminal.
+pub const TIOCNOTTY: u32 = 0x5422;
