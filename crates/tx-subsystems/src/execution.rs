@@ -48,6 +48,10 @@ pub enum Errno {
     /// caller is responsible for delivering SIGPIPE before returning
     /// `-EPIPE` to userspace (fd-ops Wave 3, Q2 DECIDED 2026-05-07).
     EPIPE,
+    /// Numerical result out of range. Surfaced by Slice 6's
+    /// `getcwd(2)` arm when the user buffer is smaller than the
+    /// rendered path (NUL terminator inclusive). Linux value: 34.
+    ERANGE,
     EROFS,
     /// Illegal seek. Surfaced by `lseek(2)` when called against a
     /// non-seekable file (pipe / TTY / chardev / socket). fd-ops

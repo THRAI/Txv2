@@ -233,6 +233,10 @@ pub fn bootstrap_init_process(
         BTreeSet::new(),
         BOOTSTRAP_BRK_BASE,
         BOOTSTRAP_BRK_BASE,
+        // Slice 6 of the shell-prompt roadmap. init's file-creation
+        // mask defaults to `0o022` per Linux convention; children
+        // inherit through `step_fork`'s umask thread-through.
+        0o022,
     )?;
     *proc_cap.payload.lock() = Some(payload);
 
@@ -267,6 +271,7 @@ pub fn step_fork<P: PmapIf>(
         parent_fd_cloexec,
         parent_brk_base,
         parent_current_brk,
+        parent_umask,
     ) = {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
@@ -278,6 +283,7 @@ pub fn step_fork<P: PmapIf>(
             payload.fd_cloexec_snapshot(),
             payload.brk_base(),
             payload.current_brk(),
+            payload.umask(),
         )
     };
     let parent_pgrp = parent.pgrp.lock().clone();
@@ -313,6 +319,7 @@ pub fn step_fork<P: PmapIf>(
         parent_fd_cloexec,
         parent_brk_base,
         parent_current_brk,
+        parent_umask,
     )
     .map_err(ForkError::Zone)?;
     *child_proc.payload.lock() = Some(payload);
@@ -907,6 +914,7 @@ fn sign_process_payload(
     fd_cloexec: BTreeSet<u32>,
     brk_base: u64,
     current_brk: u64,
+    umask: u16,
 ) -> Result<tx_substrate::zone::PayloadCap<ProcessPayload>, ZoneError> {
     use tx_reactor::wait::Channel;
     use tx_substrate::AtomicSlot;
@@ -940,6 +948,14 @@ fn sign_process_payload(
             fd_cloexec: SpinMutex::new(fd_cloexec),
             brk_base: core::sync::atomic::AtomicU64::new(brk_base),
             current_brk: core::sync::atomic::AtomicU64::new(current_brk),
+            // Slice 6 of the shell-prompt roadmap. Per-process
+            // file-creation mask. `bootstrap_init_process` seeds with
+            // the Linux default `0o022` (owner keeps full perms,
+            // group/other lose write); `step_fork` propagates the
+            // parent's umask through this argument (umask is
+            // per-process, copied across fork). `step_exec` preserves
+            // the umask (umask survives `exec` per POSIX).
+            umask: core::sync::atomic::AtomicU16::new(umask & 0o777),
             exit_port,
             exit_port_carrier_id,
         },
