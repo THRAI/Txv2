@@ -103,4 +103,40 @@ pub mod cross_crate_test_support {
     pub fn clear_caps_for_test(process: &tx_substrate::zone::Cap<crate::process::ProcessIdentity>) {
         crate::cred::clear_caps_for_test(process);
     }
+
+    /// Install the given `caps` as both `effective_caps` and
+    /// `permitted_caps` on the named process. Pairs with
+    /// `clear_caps_for_test`: tests calling
+    /// `clear_caps_for_test(p); install_caps_for_test(p, narrow);`
+    /// land in a "non-root + narrow cap set" state the file-cap /
+    /// `prctl` flows the slice doesn't ship would otherwise be needed
+    /// to assemble. Used by tx-shims' DAC + setuid Wave 4 tests for
+    /// the `CAP_DAC_OVERRIDE`-only access checks.
+    pub fn install_caps_for_test(
+        process: &tx_substrate::zone::Cap<crate::process::ProcessIdentity>,
+        caps: crate::cred::CapabilitySet,
+    ) {
+        crate::cred::install_caps_for_test(process, caps);
+    }
+
+    /// Overwrite the `(uid, euid, suid, gid, egid, sgid)` six-tuple
+    /// on the named process's credential. Bypasses the privilege
+    /// checks every shipping `cred::step_set*` mutator enforces — use
+    /// only to set up a starting state that requires real ≠ effective
+    /// (e.g. for AT_EACCESS tests). Tests should reach for the
+    /// shipping mutators when possible; this helper exists for the
+    /// AT_EACCESS path where the shipping mutators can't reach the
+    /// target state in one shot from `bootstrap_init_process`'s root
+    /// starting point.
+    pub fn set_cred_ids_for_test(
+        process: &tx_substrate::zone::Cap<crate::process::ProcessIdentity>,
+        uid: u32,
+        euid: u32,
+        suid: u32,
+        gid: u32,
+        egid: u32,
+        sgid: u32,
+    ) {
+        crate::cred::set_cred_ids_for_test(process, uid, euid, suid, gid, egid, sgid);
+    }
 }

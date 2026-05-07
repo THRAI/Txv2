@@ -5,14 +5,15 @@
 //! and zombie ignoring.
 
 use crate::cred::{
-    step_setgid, step_setregid, step_setresgid, step_setresuid, step_setreuid, step_setuid,
-    Capability, CapabilitySet, Cred, CredChange, Gid, Uid,
+    step_apply_suid_for_exec, step_setgid, step_setregid, step_setresgid, step_setresuid,
+    step_setreuid, step_setuid, Capability, CapabilitySet, Cred, CredChange, Gid, Uid,
 };
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
 use crate::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
+use crate::vfs::structure::{S_ISGID, S_ISUID};
 use crate::vfs::Credential;
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
@@ -481,4 +482,129 @@ fn cred_to_walker_credential_drops_permitted_keeps_effective() {
     // permitted_caps is not represented on Credential at all
     // (compile-time guarantee — if the field grew, the test wouldn't
     // compile).
+}
+
+// ============================================================
+// DAC + setuid Wave 4 Part 5: step_apply_suid_for_exec
+// ============================================================
+
+#[test]
+fn step_apply_suid_for_exec_no_setuid_bit_unchanged() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1001, 1001, 1001);
+    let prev = cred_of(&proc_cap);
+
+    // mode 0o755 has no setuid/setgid bits.
+    let outcome =
+        step_apply_suid_for_exec(&proc_cap, Uid(1000), Gid(1000), 0o755).expect("alive process");
+    assert!(!outcome.at_secure);
+    assert_eq!(outcome.previous_cred, prev);
+    assert_eq!(cred_of(&proc_cap), prev);
+}
+
+#[test]
+fn step_apply_suid_for_exec_setuid_bit_sets_euid_and_suid() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1001, 1001, 1001);
+
+    // S_ISUID | 0o755 → file owned by uid 1000 should produce
+    // post-recompute euid=1000, suid=1000; real uid stays at 1001.
+    let outcome = step_apply_suid_for_exec(&proc_cap, Uid(1000), Gid(0), S_ISUID | 0o755)
+        .expect("alive process");
+    assert!(outcome.at_secure);
+    assert_eq!(outcome.previous_cred.euid, Uid(1001));
+
+    let new = cred_of(&proc_cap);
+    assert_eq!(new.uid, Uid(1001));
+    assert_eq!(new.euid, Uid(1000));
+    assert_eq!(new.suid, Uid(1000));
+}
+
+#[test]
+fn step_apply_suid_for_exec_setgid_with_group_x_sets_egid_and_sgid() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let cred = Cred {
+        uid: Uid(1001),
+        euid: Uid(1001),
+        suid: Uid(1001),
+        gid: Gid(2001),
+        egid: Gid(2001),
+        sgid: Gid(2001),
+        effective_caps: CapabilitySet::EMPTY,
+        permitted_caps: CapabilitySet::EMPTY,
+    };
+    set_cred(&proc_cap, cred);
+
+    // S_ISGID | 0o2755 → has S_ISGID and group-X (0o010). File owned
+    // by gid 2000.
+    let outcome = step_apply_suid_for_exec(&proc_cap, Uid(0), Gid(2000), S_ISGID | 0o755)
+        .expect("alive process");
+    assert!(outcome.at_secure);
+
+    let new = cred_of(&proc_cap);
+    assert_eq!(new.gid, Gid(2001), "real gid preserved");
+    assert_eq!(new.egid, Gid(2000));
+    assert_eq!(new.sgid, Gid(2000));
+}
+
+#[test]
+fn step_apply_suid_for_exec_setgid_without_group_x_unchanged() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let cred = Cred {
+        uid: Uid(1001),
+        euid: Uid(1001),
+        suid: Uid(1001),
+        gid: Gid(2001),
+        egid: Gid(2001),
+        sgid: Gid(2001),
+        effective_caps: CapabilitySet::EMPTY,
+        permitted_caps: CapabilitySet::EMPTY,
+    };
+    set_cred(&proc_cap, cred);
+    let prev = cred_of(&proc_cap);
+
+    // S_ISGID | 0o4744 → has S_ISGID but NO group-X bit (group is r--).
+    // Linux's mandatory-locking semantic: cred is untouched.
+    let mode = S_ISGID | 0o744;
+    assert_eq!(mode & 0o010, 0, "fixture must lack group-X");
+
+    let outcome =
+        step_apply_suid_for_exec(&proc_cap, Uid(0), Gid(2000), mode).expect("alive process");
+    assert!(!outcome.at_secure);
+    assert_eq!(cred_of(&proc_cap), prev);
+}
+
+#[test]
+fn step_apply_suid_for_exec_at_secure_true_when_euid_changes() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1001, 1001, 1001);
+
+    // file_uid (1000) differs from caller's euid (1001) → at_secure.
+    let outcome = step_apply_suid_for_exec(&proc_cap, Uid(1000), Gid(0), S_ISUID | 0o755)
+        .expect("alive process");
+    assert!(outcome.at_secure);
+}
+
+#[test]
+fn step_apply_suid_for_exec_at_secure_false_when_no_change() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1000, 1000, 1000);
+
+    // Setuid bit set, but file_uid (1000) matches caller's euid (1000).
+    // No effective-uid delta → at_secure stays false.
+    let outcome = step_apply_suid_for_exec(&proc_cap, Uid(1000), Gid(0), S_ISUID | 0o755)
+        .expect("alive process");
+    assert!(!outcome.at_secure);
+
+    // suid is still rewritten to track the new euid (which equals
+    // prev.euid here, so it's a no-op write — pin the equality).
+    let new = cred_of(&proc_cap);
+    assert_eq!(new.euid, Uid(1000));
+    assert_eq!(new.suid, Uid(1000));
 }
