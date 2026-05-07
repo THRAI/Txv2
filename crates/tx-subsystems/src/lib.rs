@@ -7,6 +7,7 @@ extern crate std;
 pub mod cred;
 pub mod device;
 pub mod execution;
+pub mod futex;
 pub mod mount;
 pub mod page_backed;
 pub mod pipe;
