@@ -9,6 +9,7 @@ pub mod device;
 pub mod execution;
 pub mod mount;
 pub mod page_backed;
+pub mod pipe;
 pub mod process;
 pub mod reactor_submit;
 pub mod signal;

@@ -384,6 +384,13 @@ pub struct OpenFileFlags {
     /// itself so a future `dup3(F_DUPFD_CLOEXEC)` / `pipe2` can
     /// observe it without re-decoding the open flags.
     pub cloexec: bool,
+    /// `O_NONBLOCK` (Linux generic ABI bit `0o4000`): I/O against
+    /// this fd never blocks — paths that would `Blocked(token)` for a
+    /// blocking fd surface `Errno::EAGAIN` instead. fd-ops Wave 3
+    /// honours this for `pipe2(2)` reader/writer ends; other backings
+    /// (page-backed regular files, TTY) ignore it today and
+    /// re-honour it once the per-backing nonblock plumbing lands.
+    pub nonblocking: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -411,6 +418,13 @@ pub enum RNodeBacking {
 pub enum StructPayload {
     Tty(Cap<TtyIdentity>),
     CharDevice(&'static CharDeviceBinding),
+    /// Anonymous pipe — `pipe2(2)`. `side` distinguishes the
+    /// reader-end RNode from the writer-end RNode; both share a
+    /// single `Cap<PipePayload>`. fd-ops Wave 3.
+    Pipe {
+        payload: Cap<crate::pipe::PipePayload>,
+        side: crate::pipe::PipeSide,
+    },
 }
 
 // === live-node entities ===============================================

@@ -237,6 +237,18 @@ impl OpenFile {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => tty::execution::step_read(tty, out, guard),
                 StructPayload::CharDevice(binding) => binding.ops.read(out, guard),
+                StructPayload::Pipe {
+                    payload,
+                    side: crate::pipe::PipeSide::Reader,
+                } => crate::pipe::step_read(payload, out, guard, self.flags.nonblocking),
+                // Wrong-side read against a writer-end RNode. The
+                // OpenFileFlags.read=false guard above handles the
+                // common case (writer-end OpenFiles never set read);
+                // this arm guards against a misconstructed RNode.
+                StructPayload::Pipe {
+                    side: crate::pipe::PipeSide::Writer,
+                    ..
+                } => StepOutcome::Err(Errno::EBADF),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             RNodeBacking::PageBacked { .. }
@@ -255,6 +267,15 @@ impl OpenFile {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => tty::execution::step_write(tty, bytes, guard),
                 StructPayload::CharDevice(binding) => binding.ops.write(bytes, guard),
+                StructPayload::Pipe {
+                    payload,
+                    side: crate::pipe::PipeSide::Writer,
+                } => crate::pipe::step_write(payload, bytes, guard, self.flags.nonblocking),
+                // Wrong-side write against a reader-end RNode.
+                StructPayload::Pipe {
+                    side: crate::pipe::PipeSide::Reader,
+                    ..
+                } => StepOutcome::Err(Errno::EBADF),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             RNodeBacking::PageBacked { .. }
