@@ -54,9 +54,9 @@ use tx_subsystems::cred::{
 };
 use tx_subsystems::execution::{Errno, StepOutcome};
 use tx_subsystems::process::{
-    seed_child_leader_context, step_exit_group, step_fork, step_setpgid, step_setsid,
-    step_waitpid_nohang, ExitStatus, Pgid, Pid, ProcessIdentity, SetpgidError, SetsidError,
-    WaitError, WaitTarget,
+    seed_child_leader_context, step_chdir, step_exit_group, step_fork, step_getcwd, step_setpgid,
+    step_setsid, step_waitpid_nohang, ChdirOutcome, ExitStatus, Pgid, Pid, ProcessIdentity,
+    SetpgidError, SetsidError, WaitError, WaitTarget,
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
@@ -70,7 +70,9 @@ use tx_subsystems::tty::execution::{
     IoctlCaller,
 };
 use tx_subsystems::tty::structure::{Termios, Winsize};
-use tx_subsystems::vfs::structure::{Credential, OpenFileFlags, RNodeBacking, StructPayload};
+use tx_subsystems::vfs::structure::{
+    Credential, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking, StructPayload,
+};
 use tx_subsystems::vfs::{step_open, step_walk, DEntry, OpenFile};
 use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserRangeError, UserVirtAddr,
@@ -84,27 +86,28 @@ pub mod numbers;
 mod tests;
 
 pub use numbers::{
-    AT_EACCESS, AT_FDCWD, AT_SYMLINK_NOFOLLOW, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
-    CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
-    CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID, FD_CLOEXEC, FUTEX_CLOCK_REALTIME,
-    FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE,
-    FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE,
-    FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, F_GETFD, F_OK, F_SETFD, MADV_DONTNEED, MADV_FREE,
-    MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE,
-    MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED,
-    MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK, MAP_SYNC, NR_BRK,
-    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT,
-    NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FUTEX,
-    NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRESGID,
-    NR_GETRESUID, NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_LSEEK, NR_MADVISE, NR_MMAP,
-    NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP, NR_OPENAT, NR_PIPE2, NR_READ,
-    NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID,
-    NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
-    NR_TIMES, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL,
-    O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP,
-    PROT_NONE, PROT_READ, PROT_WRITE, R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS,
-    TCSETSF, TCSETSW, TIMER_ABSTIME, TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY,
-    TIOCSPGRP, TIOCSWINSZ, WNOHANG, W_OK, X_OK,
+    AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW, CLOCK_BOOTTIME,
+    CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID,
+    CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID, DT_BLK, DT_CHR, DT_DIR,
+    DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
+    FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI,
+    FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP,
+    F_GETFD, F_OK, F_SETFD, MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL,
+    MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE,
+    MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE,
+    MAP_SHARED, MAP_STACK, MAP_SYNC, NR_BRK, NR_CHDIR, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP,
+    NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT,
+    NR_FACCESSAT2, NR_FCHDIR, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FSTAT, NR_FUTEX, NR_GETCWD,
+    NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID,
+    NR_GETRESGID, NR_GETRESUID, NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_LSEEK,
+    NR_MADVISE, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
+    NR_OPENAT, NR_PIPE2, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SETGID, NR_SETPGID,
+    NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
+    NR_SET_TID_ADDRESS, NR_TIMES, NR_UMASK, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND, O_CLOEXEC,
+    O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC,
+    PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, R_OK, SEEK_CUR, SEEK_END,
+    SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME, TIMES_NS_PER_TICK,
+    TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ, WNOHANG, W_OK, X_OK,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -501,6 +504,17 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         // dispatches. Non-TTY fds and unknown request codes return
         // `-ENOTTY` per Linux's `man ioctl_tty`.
         nr if nr == NR_IOCTL => sys_ioctl(req.args, ctx),
+        // Slice 6 of the shell-prompt roadmap — stat family
+        // (`fstat` / `newfstatat` / `getdents64` / `getcwd` / `chdir`
+        // / `umask`). `fchdir` returns `-ENOSYS` (carryover; OpenFile
+        // has no DEntry hint to install via step_chdir).
+        nr if nr == NR_FSTAT => sys_fstat(req.args, ctx),
+        nr if nr == NR_NEWFSTATAT => sys_newfstatat(req.args, ctx).await,
+        nr if nr == NR_GETCWD => sys_getcwd(req.args, ctx),
+        nr if nr == NR_CHDIR => sys_chdir(req.args, ctx).await,
+        nr if nr == NR_FCHDIR => SyscallResult::Error(ENOSYS_VALUE),
+        nr if nr == NR_GETDENTS64 => sys_getdents64(req.args, ctx).await,
+        nr if nr == NR_UMASK => sys_umask(req.args, ctx),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -1274,6 +1288,7 @@ fn errno_to_i32(errno: Errno) -> i32 {
         Errno::ENOTTY => 25,
         Errno::EPERM => 1,
         Errno::EPIPE => 32,
+        Errno::ERANGE => 34,
         Errno::EROFS => 30,
         Errno::ESPIPE => 29,
         Errno::ESRCH => 3,
@@ -2272,6 +2287,14 @@ const EEXIST_VALUE: i32 = 17;
 /// Used by `sys_openat` when `O_TRUNC` is requested against a
 /// directory inode.
 const EISDIR_VALUE: i32 = 21;
+/// Linux generic ABI errno value for "not a directory" (`ENOTDIR`).
+/// Used by Slice 6's `sys_chdir` when the resolved path is not a
+/// directory and by `sys_getdents64` for a non-directory fd.
+const ENOTDIR_VALUE: i32 = 20;
+/// Linux generic ABI errno value for "result out of range" (`ERANGE`).
+/// Used by Slice 6's `sys_getcwd` when the user buffer is too small
+/// for the rendered cwd path (NUL terminator inclusive).
+const ERANGE_VALUE: i32 = 34;
 
 /// Decode the access-mode bits (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) of an
 /// `openat(2)` `flags` argument into the `(read, write)` pair. Linux's
@@ -3866,4 +3889,543 @@ fn sys_clock_nanosleep<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> 
     }
     // Real-duration sleeps deferred — see `sys_nanosleep`.
     SyscallResult::Error(ENOSYS_VALUE)
+}
+
+// =====================================================================
+// Slice 6 of the shell-prompt roadmap — stat family
+// (`fstat` / `newfstatat` / `getdents64` / `getcwd` / `chdir` /
+// `fchdir` / `umask`).
+//
+// These arms unblock four shell-startup-blocking surfaces:
+//   - `ls` calls `getdents64(fd)` to enumerate directory contents.
+//   - `pwd` calls `getcwd(buf, size)` to render the cwd.
+//   - `cd` calls `chdir(path)` to change the cwd.
+//   - musl's shell startup calls `fstat(0)` / `fstat(1)` / `fstat(2)`
+//     to decide interactive mode.
+//
+// Carryovers documented at the constants in `numbers.rs`:
+//   - `fchdir` returns `-ENOSYS` (OpenFile carries `Cap<RNode>`, not
+//     `Cap<DEntry>` — no path-edge to install via `step_chdir`).
+//   - `AT_SYMLINK_NOFOLLOW` accepted but ignored (the walker always
+//     follows symlinks at resolution time today).
+//
+// User-VA discipline: Slice 6 predates the Slice 9 user-VA sweep.
+// Buffer pointers are treated as kernel-side via inline
+// `read_volatile` / `write_volatile`. Real EFAULT on invalid user VA
+// is `TODO(phase-userva)`. See
+// `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 6.
+// =====================================================================
+
+/// Linux RV64 generic ABI `struct stat` layout (matches `struct stat64`
+/// — the RV64 generic ABI ships one shape for both `stat` and
+/// `fstat64`). Source of truth: `arch/riscv/include/uapi/asm/stat.h`
+/// pulls in `asm-generic/stat.h`. Field order and padding are
+/// load-bearing; the dispatcher writes the byte image into the user
+/// buffer via `write_volatile`.
+#[repr(C)]
+struct StatLayout {
+    st_dev: u64,
+    st_ino: u64,
+    st_mode: u32,
+    st_nlink: u32,
+    st_uid: u32,
+    st_gid: u32,
+    st_rdev: u64,
+    __pad1: u64,
+    st_size: i64,
+    st_blksize: i32,
+    __pad2: i32,
+    st_blocks: i64,
+    st_atime_sec: i64,
+    st_atime_nsec: u64,
+    st_mtime_sec: i64,
+    st_mtime_nsec: u64,
+    st_ctime_sec: i64,
+    st_ctime_nsec: u64,
+    __unused: [u32; 2],
+}
+
+/// Fixed header of the Linux `linux_dirent64` record produced by
+/// `getdents64(2)`. The record is followed by a NUL-terminated `d_name`
+/// byte string and zero padding to align the next record on an 8-byte
+/// boundary.
+///
+/// Header size = `8 + 8 + 2 + 1 = 19` bytes; total record =
+/// `align_up(19 + name_len + 1, 8)`. Source: linux uapi
+/// `include/uapi/linux/dirent.h`.
+#[repr(C)]
+struct LinuxDirent64Header {
+    d_ino: u64,
+    d_off: i64,
+    d_reclen: u16,
+    d_type: u8,
+}
+
+/// Fixed header byte size of `linux_dirent64`. Used by `sys_getdents64`
+/// to compute the trailing name-and-pad offset.
+const LINUX_DIRENT64_HEADER_BYTES: usize = 19;
+
+/// Default `st_blksize` reported by Slice 6's stat arms. Linux's
+/// page-backed filesystems all report 4096; txKernel has no
+/// per-FS blocksize hint to override this with today.
+const STAT_BLKSIZE: i32 = 4096;
+
+/// Round `x` up to the nearest multiple of 8. Used by `getdents64` to
+/// pad records to the 8-byte boundary the ABI requires.
+const fn align_up_8(x: usize) -> usize {
+    (x + 7) & !7
+}
+
+/// Project an `InodeKind` onto the `linux_dirent64` `d_type` byte. The
+/// match exhausts every variant of the enum (verified from
+/// `vfs::structure::InodeKind`).
+const fn inode_kind_to_dt(kind: InodeKind) -> u8 {
+    match kind {
+        InodeKind::Regular => DT_REG,
+        InodeKind::Directory => DT_DIR,
+        InodeKind::Symlink => DT_LNK,
+        InodeKind::CharDevice => DT_CHR,
+        InodeKind::BlockDevice => DT_BLK,
+        InodeKind::Fifo => DT_FIFO,
+        InodeKind::Socket => DT_SOCK,
+    }
+}
+
+/// Map an `InodeMeta` + (`fs_object_id`, `rdev`) pair onto the Linux
+/// `struct stat` byte image. Single-device kernel today
+/// (`st_dev = 0`); `st_blksize = 4096` is the universal page size on
+/// the platforms txKernel supports. `rdev` is `0` for non-device
+/// inodes; future device-fs work can plumb the major/minor encoding
+/// through this argument.
+fn inode_meta_to_stat(meta: &InodeMeta, ino: u64, rdev: u64) -> StatLayout {
+    StatLayout {
+        st_dev: 0,
+        st_ino: ino,
+        st_mode: meta.mode as u32,
+        st_nlink: meta.nlinks,
+        st_uid: meta.uid,
+        st_gid: meta.gid,
+        st_rdev: rdev,
+        __pad1: 0,
+        st_size: meta.size as i64,
+        st_blksize: STAT_BLKSIZE,
+        __pad2: 0,
+        st_blocks: meta.blocks as i64,
+        st_atime_sec: meta.atime.sec,
+        st_atime_nsec: meta.atime.nsec as u64,
+        st_mtime_sec: meta.mtime.sec,
+        st_mtime_nsec: meta.mtime.nsec as u64,
+        st_ctime_sec: meta.ctime.sec,
+        st_ctime_nsec: meta.ctime.nsec as u64,
+        __unused: [0, 0],
+    }
+}
+
+/// `fstat(fd, statbuf)`. Linux RV64 generic ABI `__NR_fstat = 80`.
+///
+/// Reads `OpenFile.rnode().meta()` for the fd and writes the Linux
+/// `struct stat` layout into the user buffer. Synchronous (no walker
+/// path; the inode meta is already cached in the rnode).
+///
+/// - `fd < 0` → `-EBADF`.
+/// - Unknown / closed fd → `-EBADF`.
+/// - `statbuf == 0` (NULL) → `-EFAULT`.
+/// - All other paths return `0` after writing the buffer.
+fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i32;
+    let statbuf_uaddr = args[1];
+
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if statbuf_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    let rnode = file.rnode();
+    let meta = rnode.meta();
+    let ino = rnode.fs_object_id().as_u64();
+    let stat = inode_meta_to_stat(&meta, ino, 0);
+
+    // SAFETY: bootstrap kernel-buffer exemption (TODO: phase-userva).
+    // `write_volatile` of a `#[repr(C)]` POD is well-defined; the
+    // alignment requirement (8 bytes for `u64` fields) is satisfied
+    // by the `write_volatile<StatLayout>` form because the userspace
+    // ABI guarantees `statbuf` is `__alignof(struct stat)`-aligned
+    // and that alignment matches the `repr(C)` layout we built.
+    unsafe {
+        core::ptr::write_volatile(statbuf_uaddr as usize as *mut StatLayout, stat);
+    }
+    SyscallResult::Return(0)
+}
+
+/// `newfstatat(dirfd, path, statbuf, flags)`. Linux RV64 generic ABI
+/// `__NR_newfstatat = 79`.
+///
+/// Slice 6 surface:
+/// - `dirfd == AT_FDCWD` only; non-cwd dirfds → `-EBADF`.
+/// - `flags & AT_EMPTY_PATH` paired with empty path stats the cwd
+///   directly (no walker invocation).
+/// - `flags & AT_SYMLINK_NOFOLLOW` is accepted but ignored (the
+///   walker always follows symlinks today; documented carryover).
+/// - `flags & AT_NO_AUTOMOUNT` is accepted but ignored (no
+///   automount machinery — matches Linux's lenience).
+/// - Other flag bits → `-EINVAL`.
+///
+/// Path resolution mirrors `resolve_path_at`'s shape (using
+/// `step_walk` from cwd with `walker_cred`).
+async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let statbuf_uaddr = args[2];
+    let flags = args[3] as u32;
+
+    if dirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if statbuf_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    // Slice 6 honours: AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW (ignored)
+    // | AT_NO_AUTOMOUNT (ignored). Other bits are rejected so a
+    // future caller passing an unrecognised flag (`AT_STATX_*`,
+    // `AT_RECURSIVE`, etc.) sees `-EINVAL` rather than silent
+    // misbehaviour. Note: AT_SYMLINK_NOFOLLOW is `i32` in numbers.rs
+    // (file-mode arms convention); cast to u32 for the bit-OR.
+    let known_mask = AT_EMPTY_PATH | AT_NO_AUTOMOUNT | (AT_SYMLINK_NOFOLLOW as u32);
+    if flags & !known_mask != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+
+    let walker_cred = ctx.walker_cred();
+
+    // AT_EMPTY_PATH + empty path: stat the cwd itself. No walker
+    // invocation — the cwd dentry's rnode meta is the answer.
+    let dentry: Cap<DEntry> = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
+        match ctx.process.cwd() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOENT_VALUE),
+        }
+    } else {
+        let cwd = match ctx.process.cwd() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOENT_VALUE),
+        };
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard))
+        };
+        match outcome {
+            StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
+            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    };
+
+    let rnode = dentry.rnode();
+    let meta = rnode.meta();
+    let ino = rnode.fs_object_id().as_u64();
+    let stat = inode_meta_to_stat(&meta, ino, 0);
+
+    // SAFETY: bootstrap kernel-buffer exemption — see sys_fstat.
+    unsafe {
+        core::ptr::write_volatile(statbuf_uaddr as usize as *mut StatLayout, stat);
+    }
+    SyscallResult::Return(0)
+}
+
+/// `chdir(path)`. Linux RV64 generic ABI `__NR_chdir = 49`.
+///
+/// Walks `path` from the caller's cwd, asserts the result is a
+/// directory (`InodeKind::Directory`), then installs it via
+/// `step_chdir`. Returns `0` on success.
+///
+/// - Empty path → `-ENOENT` (lets the walker surface the canonical
+///   "no such directory" shape).
+/// - Resolved path is a non-directory → `-ENOTDIR`.
+/// - Walker errors forward through `errno_to_i32`.
+async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let path_uaddr = args[0];
+
+    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if path.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let walker_cred = ctx.walker_cred();
+    let dentry: Cap<DEntry> = {
+        let guard = tx_substrate::epoch::guard();
+        let outcome = poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard));
+        drop(guard);
+        match outcome {
+            StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
+            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    };
+
+    if dentry.rnode().meta().kind() != InodeKind::Directory {
+        return SyscallResult::Error(ENOTDIR_VALUE);
+    }
+
+    match step_chdir(&ctx.process, dentry) {
+        ChdirOutcome::Replaced { .. } => SyscallResult::Return(0),
+        ChdirOutcome::ZombieIgnored => SyscallResult::Error(ESRCH_VALUE),
+    }
+}
+
+/// `getcwd(buf, size)`. Linux RV64 generic ABI `__NR_getcwd = 17`.
+///
+/// Renders the cwd dentry's parent-hint chain into an absolute POSIX
+/// path via `step_getcwd`, copies it (NUL terminator inclusive) into
+/// the user buffer, and returns the byte count written.
+///
+/// - `size == 0` with `buf != NULL` → `-EINVAL` (Linux semantic).
+/// - `buf == NULL` with `size != 0` → `-EFAULT`.
+/// - rendered path + 1 (NUL) > size → `-ERANGE`.
+/// - cwd unset / chain broken → `-ENOENT`.
+fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let buf_uaddr = args[0];
+    let size = args[1] as usize;
+
+    if buf_uaddr == 0 {
+        if size == 0 {
+            // Linux returns -EINVAL for `getcwd(NULL, 0)` on the
+            // syscall path; the glibc-side allocate-on-zero behaviour
+            // is in libc, not the kernel.
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if size == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let path = match step_getcwd(&ctx.process) {
+        Some(p) => p,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    // `path` is the rendered absolute path bytes (no NUL terminator);
+    // `size` must accommodate `path.len() + 1` to fit the terminator.
+    let needed = path.len().saturating_add(1);
+    if needed > size {
+        return SyscallResult::Error(ERANGE_VALUE);
+    }
+
+    // SAFETY: bootstrap kernel-buffer exemption (TODO: phase-userva).
+    // The byte-by-byte loop matches the discipline used by sys_pipe2's
+    // pipefd writeback / sys_getresuid's uaddr writes.
+    unsafe {
+        let dst = buf_uaddr as usize as *mut u8;
+        for (i, b) in path.iter().enumerate() {
+            core::ptr::write_volatile(dst.add(i), *b);
+        }
+        core::ptr::write_volatile(dst.add(path.len()), 0);
+    }
+    SyscallResult::Return(needed as i64)
+}
+
+/// `umask(mask)`. Linux RV64 generic ABI `__NR_umask = 166`.
+///
+/// Atomically swaps the per-process file-creation mask, returning the
+/// previous value. Argument is silently truncated to `0o777` (the
+/// bottom 9 bits — `rwxrwxrwx` only) per Linux semantics; the kernel
+/// `umask(2)` ignores the kind / setuid / setgid / sticky bits.
+///
+/// Synchronous; never returns `-errno` (Linux's `umask(2)` always
+/// succeeds in the live caller — zombies aren't reachable from a live
+/// syscall arm).
+fn sys_umask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let new_mask = args[0] as u16;
+    let old = ctx.process.swap_umask(new_mask);
+    SyscallResult::Return(old as i64)
+}
+
+/// `getdents64(fd, dirp, count)`. Linux RV64 generic ABI
+/// `__NR_getdents64 = 61`.
+///
+/// Encodes successive `DirEntry` records produced by `FsOps::readdir`
+/// into the user buffer as `linux_dirent64` records. The per-fd
+/// `OpenFile.readdir_cursor()` holds the cursor across calls so each
+/// invocation resumes where the previous one left off. Returns the
+/// number of bytes written; `0` at end-of-directory; `-EINVAL` if even
+/// the first record won't fit; `-ENOTDIR` for a non-directory fd.
+///
+/// Synchronous: every in-tree FS backend (`tmpfs`, `devfs`) resolves
+/// readdir without `.await`. A future async-aware backend would
+/// require shifting to the `wait_carrier::wait_on_token` pattern; the
+/// arm panics defensively on `Blocked` / `AdvancedThenBlocked` per the
+/// `Guard` send-future discipline (`txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
+async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i32;
+    let buf_uaddr = args[1];
+    let buf_len = args[2] as usize;
+
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if buf_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    // Only directory backings produce dirents. Pipes, regular files,
+    // TTYs, and chardevs surface `-ENOTDIR` per Linux's
+    // `man getdents64`.
+    let dir_fs_object_id = match file.rnode().backing() {
+        RNodeBacking::Directory => file.rnode().fs_object_id(),
+        _ => return SyscallResult::Error(ENOTDIR_VALUE),
+    };
+
+    // Resolve the FsOps for this directory's mount. The OpenFile's
+    // rnode is the same `Cap<RNode>` that the walker installed via
+    // step_open against a mount-published dentry — we can't pull the
+    // mount payload directly off the rnode (`materialise_child_rnode`
+    // doesn't carry the mount weak), so reuse the dentry-side
+    // `fs_ops_for_dentry` shape via a synthetic dentry. In practice
+    // every directory rnode this path sees is the mount root or a
+    // descendant materialised through step_open, and the rnode
+    // itself carries `containing_mount_weak()` only when it *is* the
+    // mount root. For descendants we fall through to `None` below
+    // and the call surfaces -ENOSYS defensively. tmpfs's directory
+    // tree uses a single rnode-per-inode with the mount weak set
+    // only at the root, so this is the practical limit today.
+    //
+    // TODO(phase-readdir-mount): teach `materialise_child_rnode` to
+    // forward the mount weak so descendants don't hit the fallback.
+    // Until then, every test fixture uses the mount-root directory.
+    let fs_ops = match fs_ops_for_rnode(file.rnode()) {
+        Some(o) => o,
+        None => return SyscallResult::Error(ENOSYS_VALUE),
+    };
+
+    let mut cursor = file.readdir_cursor();
+    let mut written: usize = 0;
+    let buf_ptr = buf_uaddr as usize as *mut u8;
+
+    loop {
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            fs_ops.readdir(dir_fs_object_id, cursor, &guard)
+        };
+        match outcome {
+            StepOutcome::Done(Some((entry, next_cursor)))
+            | StepOutcome::Advanced(Some((entry, next_cursor))) => {
+                let name_bytes = entry.name.as_bytes();
+                let raw_len = LINUX_DIRENT64_HEADER_BYTES + name_bytes.len() + 1;
+                let total_len = align_up_8(raw_len);
+                if written + total_len > buf_len {
+                    if written == 0 {
+                        // Even the first record didn't fit — caller's
+                        // buffer is too small. Linux's
+                        // `man getdents64` returns EINVAL here.
+                        return SyscallResult::Error(EINVAL_VALUE);
+                    }
+                    // Stop short; the cursor points at this entry so
+                    // the next call resumes here.
+                    file.set_readdir_cursor(cursor);
+                    break;
+                }
+                let header = LinuxDirent64Header {
+                    d_ino: entry.fs_object_id.as_u64(),
+                    d_off: next_cursor.as_u64() as i64,
+                    d_reclen: total_len as u16,
+                    d_type: inode_kind_to_dt(entry.kind),
+                };
+                // SAFETY: bootstrap kernel-buffer exemption
+                // (TODO: phase-userva). The header is `repr(C)` and
+                // the platform ABI guarantees the buffer alignment
+                // satisfies the header's u64-alignment requirement.
+                unsafe {
+                    core::ptr::write_volatile(
+                        buf_ptr.add(written) as *mut LinuxDirent64Header,
+                        header,
+                    );
+                    let name_ptr = buf_ptr.add(written + LINUX_DIRENT64_HEADER_BYTES);
+                    for (i, b) in name_bytes.iter().enumerate() {
+                        core::ptr::write_volatile(name_ptr.add(i), *b);
+                    }
+                    // NUL terminator after name bytes.
+                    core::ptr::write_volatile(name_ptr.add(name_bytes.len()), 0);
+                    // Zero the alignment padding (raw_len .. total_len).
+                    for i in raw_len..total_len {
+                        core::ptr::write_volatile(buf_ptr.add(written + i), 0);
+                    }
+                }
+                written += total_len;
+                cursor = next_cursor;
+                file.set_readdir_cursor(cursor);
+            }
+            StepOutcome::Done(None) | StepOutcome::Advanced(None) => {
+                // End of directory — durable cursor advance is
+                // unnecessary (the readdir backend's cursor is
+                // self-terminating).
+                break;
+            }
+            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                // No in-tree backend produces these. Surface as
+                // `-EIO` defensively if the partial-progress shape
+                // ever fires.
+                if written > 0 {
+                    return SyscallResult::Return(written as i64);
+                }
+                return SyscallResult::Error(EIO_VALUE);
+            }
+            StepOutcome::Err(errno) => {
+                if written > 0 {
+                    return SyscallResult::Return(written as i64);
+                }
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+    }
+
+    SyscallResult::Return(written as i64)
+}
+
+/// Resolve the `Arc<dyn FsOps>` in scope for a directory rnode.
+/// Mirrors `fs_ops_for_dentry`'s shape but operates on the rnode
+/// directly (the OpenFile carries `Cap<RNode>`, not `Cap<DEntry>`).
+///
+/// Returns `None` if the rnode does not carry a `containing_mount`
+/// weak (descendant rnodes minted by `materialise_child_rnode` don't
+/// — only mount-root rnodes do). The Slice 6 `getdents64` arm
+/// surfaces this as `-ENOSYS` defensively (no FsOps to dispatch
+/// through). In practice every tested directory is the mount root,
+/// matching tmpfs's day-1 surface.
+///
+/// TODO(phase-readdir-mount): forward the mount weak to descendants
+/// during `materialise_child_rnode` so this fallback is unnecessary.
+fn fs_ops_for_rnode(
+    rnode: &Cap<tx_subsystems::vfs::structure::RNode>,
+) -> Option<Arc<dyn tx_subsystems::vfs::FsOps>> {
+    let guard = tx_substrate::epoch::guard();
+    let weak = rnode.containing_mount_weak()?;
+    let payload = weak.upgrade(&guard)?;
+    Some(payload.fs_ops.clone())
 }

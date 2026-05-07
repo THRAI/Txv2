@@ -27,7 +27,7 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use tx_reactor::wait::{Channel, Mask};
 use tx_substrate::zone::{Cap, PayloadCap, Weak, Zone, ZoneAllocated};
@@ -478,6 +478,31 @@ impl ProcessIdentity {
         }
     }
 
+    /// Snapshot the per-process file-creation mask. Returns `0` for
+    /// zombies (no payload — defensively, the alive caller of
+    /// `umask(2)` always has a payload). Slice 6 of the shell-prompt
+    /// roadmap.
+    pub fn umask(&self) -> u16 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.umask())
+            .unwrap_or(0)
+    }
+
+    /// Atomically replace the per-process file-creation mask, returning
+    /// the previous value. No-op (returns `0`) for zombies. The
+    /// argument is silently truncated to `0o777` per Linux semantics
+    /// (`umask(2)` ignores bits above the `rwxrwxrwx` triplets).
+    /// Used by the Slice 6 `sys_umask` arm.
+    pub fn swap_umask(&self, new: u16) -> u16 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.swap_umask(new))
+            .unwrap_or(0)
+    }
+
     /// Number of currently-live threads owned by this process.
     /// Returns `0` for zombies.
     pub fn live_thread_count(&self) -> usize {
@@ -705,6 +730,20 @@ pub struct ProcessPayload {
     /// path, so the child's brk region is materialised without
     /// re-running `brk_script`.
     pub(crate) current_brk: AtomicU64,
+    /// Per-process file-creation mask (`umask(2)`).
+    ///
+    /// Slice 6 of the shell-prompt roadmap. Bits set in `umask` are
+    /// **cleared** from the mode of newly created files / directories
+    /// (POSIX `(mode & ~umask)`). Default `0o022` (matches Linux's
+    /// `init`-inherited default — owner keeps full perms, group/other
+    /// lose write). The kernel only honours the bottom 9 bits
+    /// (`rwxrwxrwx`); `umask(2)` silently truncates the argument.
+    ///
+    /// Stored as `AtomicU16` because the value is mutated on every
+    /// `umask(2)` syscall and read on every file-create path; a
+    /// `SpinMutex<u16>` would be heavier than necessary for a 16-bit
+    /// scalar with swap semantics.
+    pub(crate) umask: AtomicU16,
     /// Reactor wait carrier that fires when **any** child of this
     /// process zombifies (per `txdoc:PROCESS-WAIT-FAMILY-1`'s
     /// `children_state_channel` notion). Created at payload-sign time
@@ -894,6 +933,20 @@ impl ProcessPayload {
     /// `brk_script`; this just records the new top-of-heap.
     pub fn set_current_brk(&self, value: u64) {
         self.current_brk.store(value, Ordering::Release);
+    }
+
+    /// Read the per-process file-creation mask. Slice 6 of the
+    /// shell-prompt roadmap.
+    pub fn umask(&self) -> u16 {
+        self.umask.load(Ordering::Acquire)
+    }
+
+    /// Atomically replace the per-process file-creation mask, returning
+    /// the previous value. Argument is silently truncated to `0o777`
+    /// (the bottom 9 bits — `rwxrwxrwx`); `umask(2)` ignores the
+    /// kind / setuid / setgid / sticky bits per Linux semantics.
+    pub fn swap_umask(&self, new: u16) -> u16 {
+        self.umask.swap(new & 0o777, Ordering::AcqRel)
     }
 
     /// Borrow the per-process `exit_port` wait channel.

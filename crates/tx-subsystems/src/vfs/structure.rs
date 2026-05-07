@@ -614,6 +614,18 @@ pub fn render_dentry_path(dentry: &Cap<DEntry>) -> Option<alloc::vec::Vec<u8>> {
 pub struct OpenFile {
     pub(crate) rnode: Cap<RNode>,
     offset: AtomicU64,
+    /// Per-fd readdir cursor. Slice 6 of the shell-prompt roadmap
+    /// added this so `getdents64(2)` can resume across calls without
+    /// rewinding the directory each time.
+    ///
+    /// Stored as an `AtomicU64` round-tripped through
+    /// [`DirCursor::from_u64`] / [`DirCursor::as_u64`] — every in-tree
+    /// FsOps backend (tmpfs, devfs) emits a u64-shaped cursor, so the
+    /// 16-byte `DirCursor` pads with zeros above the lower u64 word.
+    /// `Cap` clone (`dup` / `fork`) shares the cell, matching Linux's
+    /// "shared file description across `dup` / `fork`" semantic for
+    /// directory streams.
+    readdir_cursor: AtomicU64,
     pub(crate) flags: OpenFileFlags,
 }
 
@@ -622,6 +634,7 @@ impl OpenFile {
         Self {
             rnode,
             offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
             flags,
         }
     }
@@ -665,6 +678,29 @@ impl OpenFile {
 
     pub const fn flags(&self) -> OpenFileFlags {
         self.flags
+    }
+
+    /// Snapshot the per-fd readdir cursor.
+    ///
+    /// Slice 6: `getdents64(2)` consumes this at the start of each
+    /// call and writes the post-batch value back via
+    /// [`Self::set_readdir_cursor`] so the next call resumes where the
+    /// previous one left off. `Acquire` paired with the `Release`
+    /// store in `set_readdir_cursor` matches the offset/lseek
+    /// discipline.
+    pub fn readdir_cursor(&self) -> DirCursor {
+        DirCursor::from_u64(self.readdir_cursor.load(Ordering::Acquire))
+    }
+
+    /// Replace the readdir cursor with `cursor`.
+    ///
+    /// Cap clone (`dup` / `fork`) shares the cell, so concurrent
+    /// `getdents64` against the same OpenFile via different fds
+    /// observes the shared "file description" cursor — matches
+    /// Linux's per-file-description directory stream semantic.
+    pub fn set_readdir_cursor(&self, cursor: DirCursor) {
+        self.readdir_cursor
+            .store(cursor.as_u64(), Ordering::Release);
     }
 }
 

@@ -793,3 +793,109 @@ pub const TIOCSWINSZ: u32 = 0x5414;
 /// `TIOCNOTTY = 0x5422` — detach this TTY as the calling session's
 /// controlling terminal.
 pub const TIOCNOTTY: u32 = 0x5422;
+
+// ---------------------------------------------------------------------
+// Slice 6 of the shell-prompt roadmap — stat family syscalls.
+//
+// Without these arms `ls` cannot enumerate (`getdents64`), `pwd`
+// cannot render (`getcwd`), `cd` cannot change cwd (`chdir`), and the
+// shell's `fstat(0)`/`fstat(1)`/`fstat(2)` startup probes (used to
+// decide interactive mode) all fail. Numbers verified against Linux's
+// RV64 generic ABI (`include/uapi/asm-generic/unistd.h`). See
+// `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 6.
+// ---------------------------------------------------------------------
+
+/// `getcwd(buf, size)`. Linux RV64 generic ABI `__NR_getcwd = 17`.
+/// Renders the calling process's cwd `Cap<DEntry>` as an absolute
+/// POSIX path via `step_getcwd` and copies the bytes (NUL terminator
+/// included) into the user buffer. Returns the byte count written
+/// on success; `-ERANGE` if `size` is too small for the rendered
+/// path; `-ENOENT` if the cwd dentry chain is broken.
+pub const NR_GETCWD: u64 = 17;
+/// `chdir(path)`. Linux RV64 generic ABI `__NR_chdir = 49`. Walks
+/// `path` from the caller's cwd, asserts the result is a directory,
+/// then installs it via `step_chdir`. Returns `0` on success.
+pub const NR_CHDIR: u64 = 49;
+/// `fchdir(fd)`. Linux RV64 generic ABI `__NR_fchdir = 50`.
+///
+/// **Slice 6 carryover.** Returns `-ENOSYS` for now: `OpenFile` only
+/// carries `Cap<RNode>`, not `Cap<DEntry>`, so we have no way to
+/// recover the named-path edge `step_chdir` consumes from a directory
+/// fd alone. Wiring the dentry hint onto OpenFile (or on a separate
+/// per-fd metadata sidecar) is a follow-up slice — `fchdir` is rarely
+/// used by shells, so the carryover does not block Slice 11's QEMU
+/// shell smoke.
+pub const NR_FCHDIR: u64 = 50;
+/// `getdents64(fd, dirp, count)`. Linux RV64 generic ABI
+/// `__NR_getdents64 = 61`. Calls `FsOps::readdir` with the per-fd
+/// readdir cursor and encodes each `DirEntry` into the user buffer
+/// as a `linux_dirent64` record. Returns the number of bytes
+/// written; `0` at end-of-directory; `-EINVAL` if even the first
+/// record won't fit in the supplied buffer; `-ENOTDIR` if the fd
+/// refers to a non-directory backing.
+pub const NR_GETDENTS64: u64 = 61;
+/// `newfstatat(dirfd, path, statbuf, flags)`. Linux RV64 generic ABI
+/// `__NR_newfstatat = 79`.
+///
+/// Slice 6's surface: `dirfd == AT_FDCWD` only (non-cwd dirfds return
+/// `-EBADF`). `AT_EMPTY_PATH` paired with an empty path stats the
+/// caller's cwd directly. `AT_SYMLINK_NOFOLLOW` is **deferred** —
+/// the walker always follows symlinks at resolution time today
+/// (Wave 3's symlink budget guards cycles, but a "stop on terminal
+/// symlink" flag isn't plumbed yet). Documented carryover.
+pub const NR_NEWFSTATAT: u64 = 79;
+/// `fstat(fd, statbuf)`. Linux RV64 generic ABI `__NR_fstat = 80`.
+/// On RV64 generic the `fstat` syscall's struct layout is identical
+/// to `fstat64` (one shape, no 32/64 split). Reads the inode meta
+/// from `OpenFile.rnode().meta()` and writes the Linux `struct stat`
+/// layout into the user buffer.
+pub const NR_FSTAT: u64 = 80;
+/// `umask(mask)`. Linux RV64 generic ABI `__NR_umask = 166`. Atomic
+/// swap of the per-process file-creation mask, returning the
+/// previous value. Mask is silently truncated to the bottom 9 bits
+/// (`rwxrwxrwx` only — kernel ignores the kind / setuid / setgid /
+/// sticky bits per Linux semantics).
+pub const NR_UMASK: u64 = 166;
+
+// AT_* flag bits used by the stat-family arms. `AT_FDCWD = -100` and
+// `AT_SYMLINK_NOFOLLOW = 0x100` are defined earlier in this file
+// (DAC + setuid Wave 4 Part 4 introduced them for the file-mode
+// arms). Slice 6 only needs the additional `AT_EMPTY_PATH` /
+// `AT_NO_AUTOMOUNT` bits below.
+
+/// `AT_EMPTY_PATH = 0x1000` flag bit (4th arg of `newfstatat`). When
+/// set with an empty path, the syscall operates on the dirfd itself
+/// (or, for `AT_FDCWD`, the caller's cwd). Slice 6 honours this only
+/// for `AT_FDCWD + ""`; non-cwd dirfds with `AT_EMPTY_PATH` return
+/// `-EBADF` (same as the dirfd-rejection path).
+pub const AT_EMPTY_PATH: u32 = 0x1000;
+/// `AT_NO_AUTOMOUNT = 0x800` flag bit (4th arg of `newfstatat`).
+/// Slice 6 has no automount machinery — the bit is recognised but
+/// ignored. Documented carryover; matches Linux's
+/// "ignored-when-no-automount" lenience.
+pub const AT_NO_AUTOMOUNT: u32 = 0x800;
+
+// `linux_dirent64` `d_type` byte values per
+// `include/uapi/linux/dirent.h`. Encoded into each record's
+// `d_type` byte by `sys_getdents64` after mapping the
+// `vfs::structure::InodeKind` enum.
+
+/// `DT_UNKNOWN = 0` — backend has no kind information for the entry.
+/// Not produced by the in-tree backends (tmpfs / devfs always know
+/// the kind from the inode meta), but the constant exists for ABI
+/// completeness.
+pub const DT_UNKNOWN: u8 = 0;
+/// `DT_FIFO = 1` — `InodeKind::Fifo`.
+pub const DT_FIFO: u8 = 1;
+/// `DT_CHR = 2` — `InodeKind::CharDevice`.
+pub const DT_CHR: u8 = 2;
+/// `DT_DIR = 4` — `InodeKind::Directory`.
+pub const DT_DIR: u8 = 4;
+/// `DT_BLK = 6` — `InodeKind::BlockDevice`.
+pub const DT_BLK: u8 = 6;
+/// `DT_REG = 8` — `InodeKind::Regular`.
+pub const DT_REG: u8 = 8;
+/// `DT_LNK = 10` — `InodeKind::Symlink`.
+pub const DT_LNK: u8 = 10;
+/// `DT_SOCK = 12` — `InodeKind::Socket`.
+pub const DT_SOCK: u8 = 12;
