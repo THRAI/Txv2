@@ -12,8 +12,8 @@ pub mod structure;
 mod tests;
 
 pub use execution::{
-    bootstrap_init_process, seed_child_leader_context, step_chdir, step_close_cloexec_fds,
-    step_exit_group, step_fork, step_getcwd, step_install_brk_for_exec,
+    bootstrap_init_process, init_process, process_by_pid, seed_child_leader_context, step_chdir,
+    step_close_cloexec_fds, step_exit_group, step_fork, step_getcwd, step_install_brk_for_exec,
     step_reset_signal_dispositions_for_exec, step_setpgid, step_setsid, step_waitpid_nohang,
     ChdirOutcome, ForkError, SetpgidError, SetsidError, WaitError, WaitTarget,
 };

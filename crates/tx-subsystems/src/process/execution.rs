@@ -48,6 +48,51 @@ pub fn init_process() -> Option<Cap<ProcessIdentity>> {
     INIT_PROCESS.lock().clone()
 }
 
+/// Resolve `pid` to a `Cap<ProcessIdentity>` by walking the
+/// process tree rooted at init.
+///
+/// Slice 7 of the shell-prompt roadmap (2026-05-07) introduces this
+/// resolver to back `kill(pid, sig)`. Day-1 has no global pid →
+/// Cap<ProcessIdentity> registry — every process is reachable from
+/// init via the `children` vectors that `step_fork` pushes onto the
+/// parent. The walk visits the init root then recurses through each
+/// `payload.children` snapshot until either the matching pid is found
+/// or every node has been visited.
+///
+/// Live and zombie processes alike are visited (zombies remain in
+/// `parent.children` until reaped per §8.5). Returns `None` if no
+/// process in the tree carries `pid`. Returns `None` before
+/// `bootstrap_init_process` has run.
+///
+/// The walk takes per-process `payload.children` snapshots (`.clone()`
+/// of the `Vec<Cap<ProcessIdentity>>` under the `SpinMutex`), so the
+/// children lock is released before recursion and never held across
+/// callees.
+///
+/// O(n) in the number of live + zombie processes — acceptable for
+/// day-1 where process counts stay small. A future global pid table
+/// (`TODO(phase-pid-resolver)`) would replace this with O(1) lookup.
+pub fn process_by_pid(pid: Pid) -> Option<Cap<ProcessIdentity>> {
+    let init = init_process()?;
+    walk_process_tree(&init, pid)
+}
+
+fn walk_process_tree(
+    node: &Cap<ProcessIdentity>,
+    pid: Pid,
+) -> Option<Cap<ProcessIdentity>> {
+    if node.pid == pid {
+        return Some(node.clone());
+    }
+    let children = node.children.lock().clone();
+    for child in children {
+        if let Some(found) = walk_process_tree(&child, pid) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reset_init_process_for_test() {
     *INIT_PROCESS.lock() = None;

@@ -899,3 +899,183 @@ pub const DT_REG: u8 = 8;
 pub const DT_LNK: u8 = 10;
 /// `DT_SOCK = 12` — `InodeKind::Socket`.
 pub const DT_SOCK: u8 = 12;
+
+// ---------------------------------------------------------------------
+// Slice 7 of the shell-prompt roadmap — fcntl extension + day-1 misc.
+//
+// Numbers verified against Linux's RV64 generic ABI
+// (`include/uapi/asm-generic/unistd.h`). This slice ships a grab-bag
+// of small day-1-blocking syscalls — none individually heavy; each
+// unblocks a specific shell-startup path. See
+// `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 7.
+// ---------------------------------------------------------------------
+
+/// `kill(pid, sig)`. Linux RV64 generic ABI `__NR_kill = 129`. Routes
+/// through `tx_subsystems::signal::step_kill_process` after resolving
+/// the target via the init-rooted process tree walk
+/// (`process::execution::process_by_pid`).
+///
+/// Slice 7 v1 surface: only `pid > 0` is supported. Negative / zero
+/// pids (process-group / all-process targets) return `-ENOSYS` —
+/// pgrp-targeted kills need a global pid-to-pgrp lookup the slice
+/// does not yet wire. `sig == 0` is the existence-probe shape: the
+/// arm returns `0` for live targets, `-ESRCH` for unknown / zombie
+/// targets.
+pub const NR_KILL: u64 = 129;
+/// `tkill(tid, sig)`. Linux RV64 generic ABI `__NR_tkill = 130`.
+///
+/// Slice 7 v1 aliases this to [`NR_KILL`]: txKernel has no per-thread
+/// signal state machine yet, so `tkill(tid, sig)` is treated as
+/// `kill(tid, sig)` (the tid is interpreted as a pid). Real per-thread
+/// signal posting is `TODO(phase-thread-signals)`.
+pub const NR_TKILL: u64 = 130;
+/// `tgkill(tgid, tid, sig)`. Linux RV64 generic ABI `__NR_tgkill = 131`.
+///
+/// Slice 7 v1 aliases this to [`NR_KILL`]: `tgid` is interpreted as a
+/// pid, `tid` is ignored. Real tgid+tid resolution is
+/// `TODO(phase-thread-signals)`.
+pub const NR_TGKILL: u64 = 131;
+/// `rt_sigreturn(...)`. Linux RV64 generic ABI `__NR_rt_sigreturn = 139`.
+///
+/// **Slice 7 carryover.** Returns `-ENOSYS` for now. The
+/// `SignalFrameIf::restore_signal_frame` surface in `tx-hal` requires
+/// a `TrapFrameMut<'_>` on the live trap frame and the user-stack
+/// pointer the kernel parked at signal-frame setup time; the
+/// `SyscallCtx` shape does not yet expose the trap frame to the
+/// dispatcher. Wiring rt_sigreturn end-to-end requires the trap-shell
+/// to either invoke the SignalFrameIf method directly (bypassing the
+/// dispatcher) or pass the trap-frame pointer through the syscall
+/// context — both are out of scope for Slice 7. Real signal handlers
+/// are not yet wired anyway (no userspace handler trampoline path),
+/// so the carryover does not block any day-1 shell flow.
+/// `TODO(phase-signal-frame)`.
+pub const NR_RT_SIGRETURN: u64 = 139;
+/// `uname(buf)`. Linux RV64 generic ABI `__NR_uname = 160`. Writes
+/// the static utsname (`sysname` / `nodename` / `release` / `version`
+/// / `machine` / `domainname`, each `[u8; 65]`) to `buf`. Slice 7
+/// pins `release = "6.1.0-txkernel"` so musl's runtime version probes
+/// see a Linux 2.6.16+ kernel.
+pub const NR_UNAME: u64 = 160;
+/// `prlimit64(pid, resource, new_rlim, old_rlim)`. Linux RV64 generic
+/// ABI `__NR_prlimit64 = 261`.
+///
+/// Slice 7 v1 ships a read-only static rlimit table for the calling
+/// process only (`pid == 0` or `pid == self.pid`); cross-pid queries
+/// return `-EPERM`. `new_rlim` is silently ignored — limits are not
+/// actually enforced by any in-tree subsystem yet
+/// (`TODO(phase-rlimit-enforcement)`). The static table is generous
+/// (`RLIMIT_NOFILE = 1024 / 4096`, `RLIMIT_STACK = 8 MiB`, the rest
+/// `RLIM_INFINITY`) — matches the values musl probes and accepts as
+/// non-restrictive.
+pub const NR_PRLIMIT64: u64 = 261;
+/// `getrandom(buf, buflen, flags)`. Linux RV64 generic ABI
+/// `__NR_getrandom = 278`. Fills `buf` with `buflen` bytes from the
+/// platform entropy source via `<P as EntropyIf>::fill_random`.
+///
+/// Slice 7 v1: `flags` (`GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE`)
+/// are recognised but ignored — the in-tree EntropyIf default is
+/// already deterministic + non-blocking. Returns the number of bytes
+/// written (always equals `buflen`); never short-reads on the v1
+/// surface. Null `buf` with non-zero `buflen` returns `-EFAULT`.
+pub const NR_GETRANDOM: u64 = 278;
+
+// ---------------------------------------------------------------------
+// fcntl command numbers — Slice 7 extension. F_GETFD / F_SETFD live
+// earlier in this file (Wave 2 of the ELF-loader plan); Slice 7 adds
+// F_DUPFD / F_DUPFD_CLOEXEC / F_GETFL / F_SETFL.
+// ---------------------------------------------------------------------
+
+/// `F_DUPFD` cmd: duplicate `fd` into the lowest-numbered slot
+/// `≥ arg`. Returns the new fd. The new fd has the close-on-exec bit
+/// **cleared** per POSIX (only `F_DUPFD_CLOEXEC` sets it).
+pub const F_DUPFD: i32 = 0;
+/// `F_GETFL` cmd: read the per-OpenFile access mode + open-flag bits.
+/// Returns the bits as a non-negative `i32`; never errors on a valid
+/// open fd.
+///
+/// Slice 7 surface: composes the access mode (`O_RDONLY` / `O_WRONLY`
+/// / `O_RDWR`) from `OpenFileFlags::{read,write}`, OR's `O_APPEND`
+/// from `OpenFileFlags::append`, OR's `O_NONBLOCK` from
+/// `OpenFileFlags::nonblocking`. `O_CLOEXEC` is **not** included
+/// (Linux semantic: cloexec is per-fd, queried via `F_GETFD`, not
+/// per-OpenFile).
+pub const F_GETFL: i32 = 3;
+/// `F_SETFL` cmd: replace the per-OpenFile open-flag bits.
+///
+/// **Slice 7 carryover.** Returns `-ENOSYS` for now. The
+/// `OpenFileFlags` struct in `vfs::structure` is a plain `Copy`-struct
+/// field on `OpenFile` (not behind an atomic / mutex), so the
+/// "replace flags atomically" semantic F_SETFL needs is not safe under
+/// the current shape. Wiring interior mutability onto OpenFileFlags is
+/// the gating change; once it lands, this command moves to the
+/// mutator side. `TODO(phase-fcntl-setfl)`.
+pub const F_SETFL: i32 = 4;
+/// `F_DUPFD_CLOEXEC` cmd: like [`F_DUPFD`] but the new fd is marked
+/// close-on-exec (the per-fd CLOEXEC bit is set on the result).
+pub const F_DUPFD_CLOEXEC: i32 = 1030;
+
+// ---------------------------------------------------------------------
+// `RLIMIT_*` resource ids — Linux generic uapi `<sys/resource.h>`.
+// Used by [`NR_PRLIMIT64`] to index a read-only static table of
+// `(rlim_cur, rlim_max)` pairs.
+// ---------------------------------------------------------------------
+
+/// `RLIMIT_CPU = 0` — CPU-time limit in seconds.
+pub const RLIMIT_CPU: u32 = 0;
+/// `RLIMIT_FSIZE = 1` — maximum file size.
+pub const RLIMIT_FSIZE: u32 = 1;
+/// `RLIMIT_DATA = 2` — maximum data segment size.
+pub const RLIMIT_DATA: u32 = 2;
+/// `RLIMIT_STACK = 3` — maximum stack size. Slice 7 reports 8 MiB
+/// (musl's startup probe accepts this as non-restrictive).
+pub const RLIMIT_STACK: u32 = 3;
+/// `RLIMIT_CORE = 4` — maximum core-file size.
+pub const RLIMIT_CORE: u32 = 4;
+/// `RLIMIT_RSS = 5` — maximum resident set size.
+pub const RLIMIT_RSS: u32 = 5;
+/// `RLIMIT_NPROC = 6` — maximum number of processes per real uid.
+pub const RLIMIT_NPROC: u32 = 6;
+/// `RLIMIT_NOFILE = 7` — maximum open file descriptors. Slice 7
+/// reports `(1024, 4096)`.
+pub const RLIMIT_NOFILE: u32 = 7;
+/// `RLIMIT_MEMLOCK = 8` — maximum locked-in-memory bytes.
+pub const RLIMIT_MEMLOCK: u32 = 8;
+/// `RLIMIT_AS = 9` — maximum address-space size.
+pub const RLIMIT_AS: u32 = 9;
+/// `RLIMIT_LOCKS = 10` — maximum file locks held.
+pub const RLIMIT_LOCKS: u32 = 10;
+/// `RLIMIT_SIGPENDING = 11` — maximum queued signals.
+pub const RLIMIT_SIGPENDING: u32 = 11;
+/// `RLIMIT_MSGQUEUE = 12` — maximum POSIX message-queue bytes.
+pub const RLIMIT_MSGQUEUE: u32 = 12;
+/// `RLIMIT_NICE = 13` — ceiling on nice value (offset by 20).
+pub const RLIMIT_NICE: u32 = 13;
+/// `RLIMIT_RTPRIO = 14` — ceiling on real-time scheduling priority.
+pub const RLIMIT_RTPRIO: u32 = 14;
+/// `RLIMIT_RTTIME = 15` — maximum realtime-priority CPU time without
+/// blocking.
+pub const RLIMIT_RTTIME: u32 = 15;
+
+/// `RLIM_INFINITY` sentinel — `u64::MAX`. Linux uapi
+/// `<sys/resource.h>` `RLIM_INFINITY = (~0UL)`. Used in the static
+/// table for limits txKernel does not enforce.
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+// ---------------------------------------------------------------------
+// `getrandom(2)` flag bits — Linux uapi `<sys/random.h>`. All three
+// are recognised and silently ignored by Slice 7's arm; the in-tree
+// EntropyIf default is already deterministic + non-blocking, so
+// `GRND_NONBLOCK` is implicit and `GRND_RANDOM` (urandom vs random
+// pool) has no meaning when there is no urandom pool.
+// ---------------------------------------------------------------------
+
+/// `GRND_NONBLOCK = 0x1` — return `-EAGAIN` rather than blocking when
+/// the entropy pool is uninitialised. Slice 7: ignored (the default
+/// EntropyIf never blocks).
+pub const GRND_NONBLOCK: u32 = 0x1;
+/// `GRND_RANDOM = 0x2` — read from the random pool instead of urandom.
+/// Slice 7: ignored (single entropy source).
+pub const GRND_RANDOM: u32 = 0x2;
+/// `GRND_INSECURE = 0x4` — return whatever bytes the kernel has even
+/// if the pool is not yet seeded. Slice 7: ignored.
+pub const GRND_INSECURE: u32 = 0x4;
