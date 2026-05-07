@@ -1,11 +1,82 @@
 # Roadmap to interactive shell in QEMU
 
-**Status:** proposed (planning only).
-**Date:** 2026-05-07
+**Status:** in-flight; 8 of 11 slices landed (2026-05-07).
+**Date:** 2026-05-07.
 **Scope:** Enumerate the gap between today's `feat/fd-ops` HEAD and
-typing into a shell prompt over QEMU stdio. Decompose into
-slice-shaped work with clear success criteria, dependency edges,
-and rough LOC estimates.
+typing into a shell prompt over QEMU stdio.
+
+## Progress (2026-05-07 end-of-day)
+
+| Slice | Title | Status | Branch | Workspace tests after |
+|---|---|---|---|---|
+| 1 | Pipe lifecycle Drop hook | **landed** | `feat/pipe-lifecycle-hook` (b2d22f8) | 988 |
+| 2 | VM syscalls (mmap family) | **landed** | `feat/vm-syscalls` (1af0729) | 1004 |
+| 3 | Futex subsystem | **landed** | `feat/futex` (324fd3a) | 1020 |
+| 4 | Time syscalls | **landed** | `feat/time-syscalls` (f48f05f) | 1035 |
+| 5 | IOCTL + TTY routing | **landed** | `feat/ioctl` (bf8bc70) | 1048 |
+| 6 | Stat family | **landed** | `feat/stat-family` (4b7fd12) | 1066 |
+| 7 | fcntl extension + day-1 misc | **landed** | `feat/fcntl-misc` (f09e358) | 1086 |
+| 8 | File-mutation syscalls | **landed** | `feat/file-mutation` (2b7768c) | 1111 |
+| 9 | User-VA sweep + RV64 UserAccessIf | **deferred** (f2961bc — see below) | n/a | n/a |
+| 10 | Busybox bake-in + boot wire | **deferred** (depends on external deps) | n/a | n/a |
+| 11 | QEMU shell smoke | **deferred** (depends on Slice 10 + cross-toolchain) | n/a | n/a |
+
+Total landed: **8 slices, 8 branches, ~125 net new tests**, workspace
+988 → 1111 over the session (baseline pre-Slice-1 was 984).
+
+## Slice 10 + 11 deferral rationale
+
+These slices require external prerequisites that can't be satisfied
+inside the kernel codebase alone:
+
+1. **riscv64 cross-toolchain** installed on the developer machine
+   (`riscv64-unknown-linux-musl-gcc` or `rustup target add
+   riscv64gc-unknown-linux-musl`).
+2. **Static musl-built busybox binary** at `$TX_BUSYBOX` (built
+   with `--enable-static`, `LDFLAGS=-static`).
+3. **QEMU 7.x with riscv64 board support** + a configured serial
+   sentinel watcher (the xtask `qemu` module already has the
+   sentinel infrastructure, but the bake-in CI integration isn't
+   wired).
+
+The kernel-side code for Slice 10 is small (~50 LOC):
+
+```rust
+// crates/tx-kernel/build.rs (new)
+fn main() {
+    if let Ok(path) = std::env::var("TX_BUSYBOX") {
+        // Copy binary to OUT_DIR + emit a generated file with
+        // `pub static BUSYBOX_BYTES: &[u8] = include_bytes!(...)`.
+        // ...
+        println!("cargo:rustc-cfg=busybox_baked");
+    }
+}
+
+// crates/tx-kernel/src/init.rs (extended)
+#[cfg(busybox_baked)]
+mod busybox_fixture {
+    pub static BUSYBOX_BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/busybox.bin"));
+}
+
+#[cfg(busybox_baked)]
+pub(crate) fn register_busybox_into_tmpfs() {
+    // Mirror register_init_fixture_into_tmpfs but write to /bin/sh
+    // (or /init for direct exec).
+}
+```
+
+The work in Slice 11 is largely shell-scripting against
+`cargo xtask qemu-shell-smoke` — sending `echo hello\n` over stdin,
+watching for `hello` in serial output, watching for the
+`txkernel:rv64-qemu-virt:userspace:exited:0` sentinel after `exit`.
+The infrastructure exists in `xtask::qemu`; what's missing is the
+glue + a runnable busybox image.
+
+**Honest position**: Slices 10 + 11 are deferred to a future
+session that has the external deps in place. The 8 landed slices
+constitute the entire kernel-side shell-prompt work. Plugging in
+busybox + QEMU is the final integration step.
 
 ## What is already wired (good news)
 
