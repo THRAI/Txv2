@@ -4,6 +4,60 @@
 
 ## Current Shape
 
+- 2026-05-07 fd-ops slice (Waves 1–4) + drift cleanup chore + CSPRNG
+  prerequisite chore on branch `feat/fd-ops`. Per
+  `docs/progress/plans/2026-05-07-fd-ops-and-drift-cleanup.md` +
+  decision `docs/progress/decisions/2026-05-07-fd-ops-and-drift-cleanup.md`.
+  Closes the biggest day-1 blocker before booting a real shell. LTP
+  unlock estimate ~30–50 tests across `open*` / `close*` / `dup*` /
+  `pipe*` / `lseek*` plus shell-style fd-redirect tests scattered
+  across `fs/` and `pty/`. 7 commits on top of dac-and-setuid:
+  `f2d8a67` (CSPRNG via HAL `EntropyIf` trait + per-exec `AT_RANDOM`
+  fill — audit Tier-1 #3), `b7a15fb` (interface drift audit + slice
+  plan; Q1/Q2/Q3 defaults accepted), `0516911` (drift cleanup batch
+  — `AtomicSlot` move to `tx_substrate::slot`, `AT_ENTRY`/`AT_BASE`
+  added to `AuxvFacts`, 3 doc amendments closing audit Tier-1
+  #3/#4/#5/#6 + Tier-2 #1/#6), `203e0fe` (Wave 1: fd-table
+  `BTreeMap<u32, Cap<OpenFile>>` migration + sparse `BTreeSet<u32>`
+  cloexec replacing the fd-31-ceiling `AtomicU32` bitmap; new
+  `allocate_fd` / `install_fd` accessors), `302bab9` (Wave 2:
+  `NR_OPENAT = 56` + `NR_CLOSE = 57` + `NR_DUP = 23` + `NR_DUP3 = 24`
+  — bundled because they share helpers; `O_CREAT + O_EXCL` via
+  syscall-arm `create_then_walk` helper since `step_open` is
+  resolve-only; `dup3` same-fd `-EINVAL`; `NR_DUP2` absent on RV64
+  generic — musl emits `dup3(_, _, 0)`), `28b21f2` (Wave 3:
+  `NR_PIPE2 = 59` + new `tx_subsystems::pipe` module — 4 KiB ring
+  with reader-side and writer-side wait carriers; matches Linux
+  blocking semantics exactly per Q2; `Errno::EAGAIN`/`EBADF`/`EPIPE`
+  added; `OpenFileFlags.nonblocking` field; SIGPIPE-on-EPIPE
+  delivered from `sys_write` arm), `bd0e9ea` (Wave 4: `NR_LSEEK = 62`
+  + per-fd `OpenFile.offset: AtomicU64` — replaces `u64` so `step_*`
+  can run against `&Cap<OpenFile>` without `&mut`; `Errno::ESPIPE`;
+  TTY/CharDevice/Pipe → ESPIPE; PageBacked uses
+  `PageContainer::size_bytes()` for SEEK_END; sibling
+  `init_lseek_fixture.rs` for `openat → write → lseek → read →
+  close → exit_group` Layer A byte-pin smoke). Plan Part 8
+  deviation: sibling fixture (matches DAC slice precedent) instead
+  of extending `init_fixture.rs` — preserves the existing
+  fork+wait+exit byte pins. **Q1 DECIDED 2026-05-07:** fd-table is
+  BTreeMap (sparse-fd case is real). **Q2 DECIDED 2026-05-07:**
+  pipe blocking matches Linux exactly (writer-side carrier).
+  **Q3 DECIDED 2026-05-07:** NR_GETDENTS64 deferred to a sibling
+  directory-ops mini-slice. Verification: `cargo build --workspace
+  --lib --tests` clean (no warnings); `cargo test --workspace --lib
+  --tests -- --test-threads=1` 984/984 passed; per-crate deltas:
+  tx-subsystems 405 → 420, tx-shims 78 → 109, tx-kernel 37 → 43,
+  tx-scripts 39 → 42; tx-substrate sync + integration preserved;
+  tx-fs unchanged. Pre-existing conditions (verified Wave 2 vs
+  baseline before any Wave 3 change): cross-compiled board
+  binaries (`tx-kernel-*-qemu-virt`) fail to link on host without
+  cross-toolchains; tx-subsystems lib tests need
+  `--test-threads=1` for green. Carryovers: pipe lifecycle Drop
+  hook (`Cap<OpenFile>` Drop → `decr_reader` / `decr_writer` so
+  `close(reader_fd)` flips reader_count); reactor-driven Layer B
+  end-to-end execution of `init_lseek_fixture` (deferred per slice
+  norm). Next step: directory-ops mini-slice (NR_GETDENTS64) or
+  pipe lifecycle hook — both are small isolated follow-ups.
 - 2026-05-07 drift cleanup chore (5 items, ~200 LOC) on branch
   `chore/drift-cleanup`. Per
   `docs/progress/plans/2026-05-07-fd-ops-and-drift-cleanup.md`
@@ -2063,6 +2117,12 @@
 
 ## Latest Decisions
 
+- `docs/progress/decisions/2026-05-07-fd-ops-and-drift-cleanup.md`
+- `docs/progress/decisions/2026-05-06-dac-and-setuid.md`
+- `docs/progress/decisions/2026-05-06-elf-loader-and-execve.md`
+- `docs/progress/decisions/2026-05-06-fork-clone-wait4.md`
+- `docs/progress/decisions/2026-05-06-pre-elf-runtime-completion.md`
+- `docs/progress/decisions/2026-05-06-trio-trap-syscall-tmpfs-devfs.md`
 - `docs/progress/decisions/2026-05-05-tty-signal-end-to-end-typed-dispatch.md`
 - `docs/progress/decisions/2026-05-05-tty-pgrp-typed-rebinding.md`
 - `docs/progress/decisions/2026-05-05-step-waitpid-nohang.md`
@@ -2076,6 +2136,7 @@
 
 ## Latest Research
 
+- `docs/progress/research/2026-05-07-interface-drift-audit.md`
 - `docs/progress/research/2026-05-04-vm-pagebacked-midway-checkpoint.md`
 - `docs/progress/research/2026-05-04-vm-pagebacked-gap-update.md`
 - `docs/progress/research/2026-05-04-vm-pagebacked-final-ledger.md`
