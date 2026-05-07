@@ -1151,3 +1151,355 @@ fn boot_smoke_fork_wait_seeds_init_for_clone_at_entry() {
         "init is still alive post-bootstrap-exec; reactor hasn't run"
     );
 }
+
+// ---------------------------------------------------------------------------
+// DAC + setuid Wave 5 — Part 8 end-to-end smoke (Layer A).
+// ---------------------------------------------------------------------------
+//
+// **Layer choice: A (production-paths-up-to-divergence).** Mirrors the
+// fork/clone/wait4 Wave 4 smoke's choice: drive the production exec
+// front-end with the new sibling fixture, assert on cred state and
+// `saved_user_context.pc` post-exec; defer the reactor-driven
+// instruction-level execution to a future integration smoke. Per the
+// Wave 5 brief: "Wave 5 doesn't need to drive the reactor loop; the
+// assertions are on cred state + saved_user_context post-exec."
+//
+// **What this smoke pins.** Together with the Wave 4 Part 5 unit
+// tests (which prove `step_apply_suid_for_exec` in isolation against
+// synthesized cred + file-meta inputs) and the Wave 3 walker DAC
+// tests (which prove the EACCES branch on a non-executable binary),
+// this smoke closes the end-to-end pipeline:
+//
+//   - Production `exec_script::<P>` resolves the path through the
+//     real walker (against a real tmpfs mount populated via the
+//     real `create_inode` / `materialise_rnode` / `step_chmod` /
+//     `step_chown` surfaces).
+//   - Phase 1 execute-perm check passes (the file's mode bits and
+//     the caller's effective uid/gid line up).
+//   - Phase 3.5 cred recompute fires: the binary's `S_ISUID` bit
+//     plus file owner uid=1000 changes `cred.euid` from 1001 to
+//     1000 and copies through to `cred.suid`. Real uid stays 1001
+//     (Linux preserves it).
+//   - Phase 6 atomic AddressSpace replace + saved_user_context
+//     seeding still happens with the new cred installed.
+//
+// **Sibling fixture (`init_setuid_fixture.rs`).** The Plan's Q4 was
+// authored before the fork/clone/wait4 slice rewrote
+// `init_fixture.rs` into a fork+wait+exit binary. Extending it
+// further into a third behaviour (drop-privs → execve → observe
+// euid) would invalidate the existing fork+wait pin tests. The
+// sibling-fixture path keeps both smokes independently pinned;
+// see `init_setuid_fixture.rs`'s module header for the deviation.
+
+/// Wave 5 Part 8 — Layer A. Drives boot wiring + bootstrap exec
+/// against a sibling setuid fixture; asserts that Phase 3.5's cred
+/// recompute installs the file owner's uid as the new effective
+/// uid AND that `saved_user_context.pc` lands on the fixture's
+/// entry-point.
+///
+/// Setup steps (all against production surfaces):
+///   1. `drive_boot_wiring` — bootstraps init with root cred + full
+///      caps (per `bootstrap_init_process`).
+///   2. `register_setuid_fixture_into_tmpfs(uid=1000, gid=1000)` —
+///      creates `/setuid-target` in the rootfs tmpfs, copies the
+///      sibling fixture bytes, then `step_chown`s the file owner
+///      to 1000:1000 and `step_chmod`s the mode to
+///      `S_ISUID | 0o755`. Both mutations run as root (CAP_FOWNER)
+///      so non-privileged-clears don't fire.
+///   3. `clear_caps_for_test` + `set_cred_ids_for_test(1001, ...)`
+///      — drops init's cred to a non-privileged uid 1001 so the
+///      slice's DAC enforcement actually fires on the
+///      `step_apply_suid_for_exec` recompute.
+///   4. `block_on(exec_script(/setuid-target, ...))` with a
+///      walker-side `Credential { uid: 1001, gid: 1001, no caps }`.
+///
+/// Post-exec assertions (the load-bearing setuid checks):
+///   - `init.cred().uid == 1001` (real uid unchanged at exec).
+///   - `init.cred().euid == 1000` (S_ISUID bit set effective uid
+///     to file owner — Phase 3.5 recompute correctness check).
+///   - `init.cred().suid == 1000` (saved-set tracks new euid per
+///     Linux semantics).
+///   - `init.cred().gid == 1001` (no S_ISGID bit, so gid family
+///     unchanged).
+///   - `saved_user_context.pc == INIT_SETUID_FIXTURE_ENTRY_VADDR`
+///     (Phase 6 still seeded the entry-point with the new cred).
+///   - The detached AddressSpace was atomically replaced (PoNR
+///     boundary crossed).
+///
+/// Cites: `txdoc:EXEC-3-3-CRED-AUTHORIZES-EXECUTE-COMPUTES-NEW-CREDENTIALS`,
+/// `txdoc:EXEC-12-3-INSTALL-NEW-CREDENTIAL`,
+/// `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`.
+#[test]
+fn boot_smoke_setuid_exec_seeds_post_setuid_euid_and_at_secure() {
+    use crate::init::init_setuid_fixture::{
+        INIT_SETUID_FIXTURE_ENTRY_VADDR, INIT_SETUID_FIXTURE_LOAD_VADDR,
+    };
+    use tx_subsystems::cred::CapabilitySet;
+    use tx_subsystems::vfs::Credential;
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let leader = init
+        .nth_thread(0)
+        .expect("init has a leader thread post-bootstrap");
+    let payload = leader
+        .payload_cap()
+        .expect("leader payload must be alive pre-exec");
+
+    // Step 2: register the setuid fixture as /setuid-target with
+    // owner uid=1000, gid=1000, mode = S_ISUID | 0o755.
+    register_setuid_fixture_into_tmpfs(1000, 1000);
+
+    // Step 3: drop init's cred to non-root + clear caps. Done in
+    // this order so that bootstrap-aspace-creation and the file
+    // registration both run as root (CAP_FOWNER for the chmod /
+    // chown), and only the subsequent exec runs as 1001.
+    tx_subsystems::cross_crate_test_support::clear_caps_for_test(&init);
+    tx_subsystems::cross_crate_test_support::set_cred_ids_for_test(
+        &init, 1001, 1001, 1001, 1001, 1001, 1001,
+    );
+
+    // Pre-exec sanity: the cred-drop produced what we expect.
+    let pre = init.cred().expect("init cred pre-exec");
+    assert_eq!(pre.uid.raw(), 1001);
+    assert_eq!(pre.euid.raw(), 1001);
+    assert_eq!(pre.suid.raw(), 1001);
+    assert_eq!(
+        pre.effective_caps,
+        CapabilitySet::EMPTY,
+        "clear_caps_for_test must zero effective_caps so the slice's \
+         DAC checks aren't short-circuited by CAP_DAC_OVERRIDE",
+    );
+
+    let aspace_before = init
+        .aspace_cap()
+        .expect("init aspace populated by bootstrap");
+    assert!(
+        payload.saved_user_context().is_none(),
+        "saved_user_context starts None pre-exec"
+    );
+
+    // Step 4: drive exec_script with the post-drop walker cred.
+    // The cred's effective_caps is empty so CAP_DAC_OVERRIDE
+    // doesn't bypass the execute-bit check; the file's mode is
+    // S_ISUID | 0o755 so the world-X bit allows uid 1001 to
+    // execute.
+    let walker_cred = Credential {
+        uid: 1001,
+        gid: 1001,
+        effective_caps: CapabilitySet::EMPTY,
+    };
+    let argv: &[&[u8]] = &[b"setuid-target" as &[u8]];
+    let envp: &[&[u8]] = &[];
+
+    let result = block_on(tx_scripts::process::exec::exec_script::<TestPlatform>(
+        &init,
+        &leader,
+        b"/setuid-target",
+        argv,
+        envp,
+        &walker_cred,
+    ));
+    assert!(
+        result.is_ok(),
+        "exec_script(/setuid-target) must succeed for a 0o4755 \
+         binary executed by uid 1001 — got {:?}",
+        result,
+    );
+
+    // ----- Post-exec invariants ---------------------------------
+
+    // EXEC-PONR boundary crossed: aspace atomically replaced.
+    let aspace_after = init.aspace_cap().expect("init aspace populated post-exec");
+    assert_ne!(
+        aspace_before.key(),
+        aspace_after.key(),
+        "Phase 6 atomic replace_aspace produced a fresh Cap"
+    );
+
+    // The load-bearing setuid assertions: Phase 3.5's cred
+    // recompute installed the file owner's uid as the new
+    // effective uid + saved-set, while leaving the real uid
+    // untouched.
+    let post = init.cred().expect("init still alive post-exec");
+    assert_eq!(
+        post.uid.raw(),
+        1001,
+        "real uid unchanged at exec (Linux preserves it across \
+         setuid binary execution)",
+    );
+    assert_eq!(
+        post.euid.raw(),
+        1000,
+        "S_ISUID bit set effective uid to file owner (1000)",
+    );
+    assert_eq!(
+        post.suid.raw(),
+        1000,
+        "saved-set uid copied from new effective uid per Linux \
+         setuid-on-exec semantics",
+    );
+    // gid family stays untouched: the fixture's mode is
+    // `S_ISUID | 0o755` (no S_ISGID), so no setgid recompute.
+    assert_eq!(
+        post.gid.raw(),
+        1001,
+        "real gid unchanged (no S_ISGID on fixture)",
+    );
+    assert_eq!(
+        post.egid.raw(),
+        1001,
+        "effective gid unchanged (no S_ISGID on fixture)",
+    );
+    assert_eq!(
+        post.sgid.raw(),
+        1001,
+        "saved-set gid unchanged (no S_ISGID on fixture)",
+    );
+
+    // saved_user_context.pc landed on the fixture's hand-encoded
+    // entry-point. Combined with the cred assertions above, this
+    // pins that the new cred is installed *before* Phase 6
+    // re-seeds the user context (Phase 3.5 ordering).
+    let saved = payload
+        .saved_user_context()
+        .expect("saved_user_context seeded by Phase 6");
+    assert_eq!(
+        saved.pc as u64, INIT_SETUID_FIXTURE_ENTRY_VADDR,
+        "saved pc matches the sibling fixture's hand-encoded e_entry",
+    );
+
+    // Sanity: the load vaddr constant matches the fixture's
+    // PT_LOAD `p_vaddr` (defends against a future drift in the
+    // fixture's hand-encoded headers).
+    assert_eq!(INIT_SETUID_FIXTURE_LOAD_VADDR, 0x10000);
+
+    // Init must not be zombie post-bootstrap-exec — the reactor
+    // loop hasn't run; only the exec front-end has executed.
+    assert!(
+        !init.is_zombie(),
+        "init is still alive post-setuid-exec; reactor hasn't run"
+    );
+}
+
+/// Test helper: register the setuid fixture as `/setuid-target` in
+/// the rootfs tmpfs with mode `S_ISUID | 0o755`, owner `(uid, gid)`.
+///
+/// The rootfs tmpfs's `create_inode` records the caller's uid/gid
+/// (always root in the bootstrap path) — there is no `mode +
+/// uid + gid` overload on the production `create_inode` surface, so
+/// the helper writes the bytes with default owner first, then
+/// `step_chown`s + `step_chmod`s as root (which carries CAP_FOWNER
+/// after `drive_boot_wiring`). This avoids the silent-clear-S_ISUID
+/// rule that fires on non-privileged chowns.
+///
+/// Mirrors the production `register_init_fixture_into_tmpfs`
+/// shape; the only differences are (a) the path (`/setuid-target`
+/// vs `/init`) and (b) the post-creation chown + chmod to install
+/// the setuid mode + non-root owner.
+fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
+    use tx_subsystems::execution::StepOutcome;
+    use tx_subsystems::vfs::{Credential, RNodeBacking, S_ISUID};
+
+    let root_mount =
+        crate::init::root_mount().expect("register_setuid_fixture: ROOT_MOUNT must be populated");
+    let fs_ops = root_mount.payload().fs_ops.clone();
+    let fs_page_backing = root_mount.payload().fs_page_backing.clone();
+    let root_object_id = root_mount.root().fs_object_id();
+
+    let bytes = &crate::init::init_setuid_fixture::INIT_SETUID_FIXTURE_BYTES[..];
+
+    // Allocate the inode as root. `0o100755` = S_IFREG | 0755.
+    // (We chmod to S_ISUID below; doing it here would still be
+    // valid, but splitting create + chmod exercises the slice's
+    // step_chmod path under privileged cred.)
+    let cred = Credential::root();
+    let (file_id, file_meta) = {
+        let guard = tx_substrate::epoch::guard();
+        let outcome =
+            fs_ops.create_inode(root_object_id, b"setuid-target", 0o100755, &cred, &guard);
+        match outcome {
+            StepOutcome::Done(out) => out,
+            other => panic!("register_setuid_fixture: create_inode(/setuid-target): {other:?}"),
+        }
+    };
+
+    // Materialise the inode's RNode so we can populate page
+    // contents — same shape as register_init_fixture_into_tmpfs.
+    let pc = {
+        let guard = tx_substrate::epoch::guard();
+        let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
+        let rnode = match outcome {
+            StepOutcome::Done(rnode) => rnode,
+            other => panic!("register_setuid_fixture: materialise_rnode: {other:?}"),
+        };
+        match rnode.backing() {
+            RNodeBacking::PageBacked { pc } => pc.clone(),
+            other => panic!(
+                "register_setuid_fixture: tmpfs materialise_rnode \
+                 returned non-PageBacked backing: {other:?}"
+            ),
+        }
+    };
+
+    // Copy the fixture bytes into the file's pages — direct-map
+    // memcpy, same shape as register_init_fixture_into_tmpfs.
+    let page_size = tx_subsystems::vm::USER_PAGE_SIZE;
+    for (idx, chunk) in bytes.chunks(page_size).enumerate() {
+        let materialised = pc
+            .materialize_anon(
+                tx_subsystems::page_backed::PageIndex::new(idx as u64),
+                tx_subsystems::page_backed::MaterializeAccess::Write,
+            )
+            .expect("register_setuid_fixture: materialize_anon");
+        let frame_base = tx_substrate::page_allocator::frame_kernel_addr(materialised.ppn)
+            .expect("register_setuid_fixture: direct-map view");
+        // SAFETY: the materialised frame is held resident for the
+        // duration of this scope; the destination region covers
+        // exactly `chunk.len()` bytes; source/dest don't overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(chunk.as_ptr(), frame_base, chunk.len());
+        }
+    }
+
+    // Set the visible byte-size so `read_exact_at` knows the file
+    // length during exec.
+    let size = bytes.len() as u64;
+    {
+        let guard = tx_substrate::epoch::guard();
+        match fs_page_backing.truncate(file_id, size, &guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+            other => panic!("register_setuid_fixture: truncate({size}): {other:?}"),
+        }
+    }
+
+    // Step_chown to set the file's owner uid/gid to the requested
+    // values. Cred is root (CAP_FOWNER), so the chown is privileged
+    // and the silent-clear-S_ISUID rule does NOT fire.
+    {
+        let guard = tx_substrate::epoch::guard();
+        match fs_ops.step_chown(file_id, Some(file_uid), Some(file_gid), &cred, &guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+            other => {
+                panic!("register_setuid_fixture: step_chown({file_uid}, {file_gid}): {other:?}")
+            }
+        }
+    }
+
+    // Step_chmod to install S_ISUID. Cred is root (CAP_FOWNER) so
+    // the owner-or-CAP_FOWNER permission gate passes. The new mode
+    // bits are masked to `& 0o7777` by the tmpfs backend; the
+    // caller's `0o4755` is preserved (S_ISUID = 0o4000, plus 0o755
+    // for owner-rwx + group/world rx).
+    let new_mode = S_ISUID | 0o755;
+    {
+        let guard = tx_substrate::epoch::guard();
+        match fs_ops.step_chmod(file_id, new_mode, &cred, &guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+            other => panic!("register_setuid_fixture: step_chmod({new_mode:#o}): {other:?}"),
+        }
+    }
+}
