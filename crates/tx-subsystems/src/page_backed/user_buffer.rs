@@ -9,7 +9,7 @@ use super::*;
 /// first chunk, or as `Done(advanced)` when prior chunks succeeded.
 pub fn step_read_to_user<H: UserAccessIf>(
     pc: &PageContainer,
-    of: &mut OpenFile,
+    of: &OpenFile,
     dst: UserPtr<u8>,
     len: usize,
     guard: &Guard<'_>,
@@ -39,7 +39,7 @@ pub fn step_read_to_user<H: UserAccessIf>(
 /// `Done(advanced)` when prior chunks succeeded.
 pub fn step_write_from_user<H: UserAccessIf>(
     pc: &PageContainer,
-    of: &mut OpenFile,
+    of: &OpenFile,
     src: UserPtr<u8>,
     len: usize,
     guard: &Guard<'_>,
@@ -95,7 +95,7 @@ impl UserBuffer {
 
 fn step_range_with_user_buffer<H: UserAccessIf>(
     pc: &PageContainer,
-    of: &mut OpenFile,
+    of: &OpenFile,
     len: usize,
     buffer: UserBuffer,
     guard: &Guard<'_>,

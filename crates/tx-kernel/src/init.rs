@@ -1310,5 +1310,13 @@ mod init_fixture;
 #[cfg(test)]
 mod init_setuid_fixture;
 
+/// fd-ops slice (Wave 4, Part 8): sibling fixture for the
+/// `openat → write → lseek → read → close → exit_group` byte-pin
+/// smoke. See `init_lseek_fixture.rs`'s module header for the
+/// sibling-vs-extend rationale (mirrors the setuid sibling
+/// decision so each fd-ops/DAC/fork test owns its own pinned ABI).
+#[cfg(test)]
+mod init_lseek_fixture;
+
 #[cfg(test)]
 mod tests;

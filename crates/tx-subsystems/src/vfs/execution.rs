@@ -257,6 +257,90 @@ impl OpenFile {
         }
     }
 
+    /// Reposition the per-fd offset.
+    ///
+    /// fd-ops Wave 4. Linux semantics:
+    ///
+    /// - `whence == SEEK_SET (0)`: new offset = `offset`.
+    /// - `whence == SEEK_CUR (1)`: new offset = current + `offset`.
+    /// - `whence == SEEK_END (2)`: new offset = file size + `offset`.
+    ///   Only `RNodeBacking::PageBacked` carries a meaningful size;
+    ///   other backings short-circuit before consulting size.
+    ///
+    /// Errors:
+    /// - `EINVAL` for unknown `whence`, negative resulting offset,
+    ///   or arithmetic overflow.
+    /// - `ESPIPE` for non-seekable backings (`StructPayload::Tty`,
+    ///   `CharDevice`, `Pipe`).
+    /// - `EISDIR` for directory backings.
+    /// - `ENOSYS` for symlink / projected backings (Wave 4 doesn't
+    ///   expose those through any open path; defence in depth).
+    ///
+    /// `lseek` is a non-async, non-blocking step — no `Blocked` /
+    /// `AdvancedThenBlocked` outcomes are reachable. The `Guard` is
+    /// accepted for symmetry with the other `OpenFile::step_*`
+    /// methods even though the body never crosses an EBR boundary.
+    pub fn step_lseek(
+        &self,
+        offset: i64,
+        whence: u32,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<u64> {
+        // Backing-driven dispatch: short-circuit non-seekable
+        // backings before any arithmetic. Pipes / TTY / chardev are
+        // ESPIPE regardless of whence (Linux's `lseek(2)` man page:
+        // "lseek() may, but need not, return -1 with errno set to
+        // ESPIPE when offset is 0; portable code must treat any
+        // result other than the requested offset as an error").
+        match self.rnode.backing() {
+            RNodeBacking::StructBacked { payload } => match payload {
+                StructPayload::Tty(_)
+                | StructPayload::CharDevice(_)
+                | StructPayload::Pipe { .. } => return StepOutcome::Err(Errno::ESPIPE),
+            },
+            RNodeBacking::Directory => return StepOutcome::Err(Errno::EISDIR),
+            RNodeBacking::Symlink { .. } | RNodeBacking::Projected => {
+                return StepOutcome::Err(Errno::ENOSYS)
+            }
+            RNodeBacking::PageBacked { .. } => {}
+        }
+
+        // PageBacked branch: compute the new offset based on whence.
+        let new_offset: i64 = match whence {
+            // SEEK_SET
+            0 => offset,
+            // SEEK_CUR
+            1 => match (self.offset() as i64).checked_add(offset) {
+                Some(o) => o,
+                None => return StepOutcome::Err(Errno::EINVAL),
+            },
+            // SEEK_END
+            2 => {
+                let size = match self.rnode.backing() {
+                    RNodeBacking::PageBacked { pc } => pc.size_bytes() as i64,
+                    // The outer match above already short-circuited
+                    // every non-PageBacked backing; this arm is
+                    // unreachable. Keep it as a defence-in-depth
+                    // EINVAL rather than a panic.
+                    _ => return StepOutcome::Err(Errno::EINVAL),
+                };
+                match size.checked_add(offset) {
+                    Some(o) => o,
+                    None => return StepOutcome::Err(Errno::EINVAL),
+                }
+            }
+            _ => return StepOutcome::Err(Errno::EINVAL),
+        };
+
+        if new_offset < 0 {
+            return StepOutcome::Err(Errno::EINVAL);
+        }
+
+        let new_offset_u64 = new_offset as u64;
+        self.set_offset(new_offset_u64);
+        StepOutcome::Done(new_offset_u64)
+    }
+
     /// Dispatch a write against this file's RNode backing.
     pub fn step_write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize> {
         if !self.flags.write {

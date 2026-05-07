@@ -76,10 +76,10 @@ impl UserAccessIf for PassthroughHal {
 /// `step_write_from_user::<PassthroughHal>` and grow `pc.size_bytes` to
 /// match. Returns once the write has fully advanced.
 fn seed_anon_pc_with_bytes(pc: &PageContainer, bytes: &[u8], guard: &Guard<'_>) {
-    let mut writer = open_file_for_pc(pc);
+    let writer = open_file_for_pc(pc);
     let outcome = step_write_from_user::<PassthroughHal>(
         pc,
-        &mut writer,
+        &writer,
         UserPtr::<u8>::new(bytes.as_ptr() as usize),
         bytes.len(),
         guard,

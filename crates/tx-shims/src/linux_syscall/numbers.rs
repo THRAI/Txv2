@@ -191,6 +191,31 @@ pub const NR_PIPE2: u64 = 59;
 pub const O_DIRECT: u32 = 0o40000;
 
 // ---------------------------------------------------------------------
+// Wave 4 of the fd-ops slice — `lseek(2)`.
+//
+// Linux RV64 generic ABI `__NR_lseek = 62`. The `_llseek` 32-bit ABI
+// (`__NR__llseek = 140` on legacy archs) is not defined for RV64 and
+// is intentionally absent here. Non-seekable backings (TTY, chardev,
+// pipe) return `-ESPIPE`; directories return `-EISDIR`. See
+// `docs/progress/plans/2026-05-07-fd-ops-and-drift-cleanup.md` Part 6.
+// ---------------------------------------------------------------------
+
+/// `lseek(fd, offset, whence)`. Linux RV64 generic ABI `__NR_lseek = 62`.
+/// Returns the resulting absolute offset on success, or `-errno`.
+pub const NR_LSEEK: u64 = 62;
+
+/// `lseek` whence: set the offset to the absolute value `offset`.
+/// Linux uapi `<unistd.h>` `SEEK_SET`.
+pub const SEEK_SET: u32 = 0;
+/// `lseek` whence: add `offset` to the current per-fd offset. Linux
+/// uapi `<unistd.h>` `SEEK_CUR`.
+pub const SEEK_CUR: u32 = 1;
+/// `lseek` whence: add `offset` to the file's current size (only
+/// meaningful for `RNodeBacking::PageBacked`). Linux uapi
+/// `<unistd.h>` `SEEK_END`.
+pub const SEEK_END: u32 = 2;
+
+// ---------------------------------------------------------------------
 // Wave 2 of the fork/clone/wait4 slice — Part 2 (NR_CLONE) +
 // Part 4 (process-tree introspection arms) + Part 5 (musl-startup
 // stubs). NR_WAIT4 is intentionally absent — it lives in Wave 3 with

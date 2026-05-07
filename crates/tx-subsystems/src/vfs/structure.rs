@@ -8,6 +8,7 @@
 //! pure observation helpers belong here.
 
 use alloc::boxed::Box;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cred::{CapabilitySet, Cred};
 use crate::device::CharDeviceBinding;
@@ -601,10 +602,18 @@ pub fn render_dentry_path(dentry: &Cap<DEntry>) -> Option<alloc::vec::Vec<u8>> {
     Some(out)
 }
 
+/// Per-fd file-position carrier.
+///
+/// fd-ops Wave 4 made `offset` interior-mutable (`AtomicU64`) so
+/// `OpenFile::step_lseek` and the page-backed `step_read` /
+/// `step_write` lanes can mutate the position through `&self`. This
+/// matches Linux's "shared file description across `dup`/`fork` →
+/// shared offset" semantic without bolting an extra lock onto every
+/// fd-table read.
 #[derive(Debug)]
 pub struct OpenFile {
     pub(crate) rnode: Cap<RNode>,
-    offset: u64,
+    offset: AtomicU64,
     pub(crate) flags: OpenFileFlags,
 }
 
@@ -612,7 +621,7 @@ impl OpenFile {
     pub fn new(rnode: Cap<RNode>, flags: OpenFileFlags) -> Self {
         Self {
             rnode,
-            offset: 0,
+            offset: AtomicU64::new(0),
             flags,
         }
     }
@@ -626,12 +635,32 @@ impl OpenFile {
         &self.rnode
     }
 
-    pub const fn offset(&self) -> u64 {
-        self.offset
+    /// Load the current per-fd offset.
+    ///
+    /// `Acquire` paired with the `Release` store in `set_offset` /
+    /// `advance_offset` so a thread that sees a fresh offset value
+    /// also sees any page-cache state writes the previous I/O step
+    /// committed before bumping the offset.
+    pub fn offset(&self) -> u64 {
+        self.offset.load(Ordering::Acquire)
     }
 
-    pub fn set_offset(&mut self, offset: u64) {
-        self.offset = offset;
+    /// Replace the offset with `offset`. Used by `lseek(2)` and by
+    /// the page-backed I/O lanes' `step_range` finaliser when the
+    /// step ran to completion or stopped early on a partial blocked /
+    /// errored result.
+    pub fn set_offset(&self, offset: u64) {
+        self.offset.store(offset, Ordering::Release);
+    }
+
+    /// Bump the offset by `delta`, returning the **new** value.
+    ///
+    /// Wraps `AtomicU64::fetch_add` (which yields the *old* value);
+    /// the page-backed step bodies never need the old value, only
+    /// the post-bump cursor.
+    pub fn advance_offset(&self, delta: u64) -> u64 {
+        // fetch_add returns old; the new value is `old + delta`.
+        self.offset.fetch_add(delta, Ordering::AcqRel) + delta
     }
 
     pub const fn flags(&self) -> OpenFileFlags {
