@@ -6,8 +6,8 @@ extern crate std;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaIf,
-    InitIf, IpiKind, IrqIf, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, PercpuIf,
-    PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf,
+    EntropyIf, InitIf, IpiKind, IrqIf, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion,
+    PercpuIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf,
     PmapInvalidation, PmapReservation, PmapReserveKind, PowerIf, PtNode, PtNodeAllocator,
     SecondaryEntry, SignalFrameIf, SmpIf, TimeIf, TrapClass, TrapFrameSnapshot, TrapIf,
     UserAccessIf, VirtAddr, VirtRange,
@@ -492,6 +492,13 @@ impl PowerIf for Platform {
         }
     }
 }
+
+/// LoongArch64 entropy: relies on the trait default
+/// (deterministic xorshift-counter seed). LoongArch lacks a
+/// portable unprivileged hardware RNG CSR equivalent to RV64's
+/// Zkr; a future virtio-rng (or platform-specific RNG MMIO) impl
+/// can override this without touching callers.
+impl EntropyIf for Platform {}
 
 fn uart_put_byte(byte: u8) {
     let base = QEMU_LA64_UART0_BASE as *mut u8;

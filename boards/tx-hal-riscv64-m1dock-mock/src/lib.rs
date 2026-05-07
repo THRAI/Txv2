@@ -7,8 +7,8 @@ mod pmap;
 
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootHandoff, BootInfo, BootInfoIf,
-    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, DmaIf, InitIf, IrqIf,
-    MmioFlags, MmioRegion, PercpuIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo,
+    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, DmaIf, EntropyIf, InitIf,
+    IrqIf, MmioFlags, MmioRegion, PercpuIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo,
     PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SignalFrameIf,
     SmpIf, SpiSdInfo, TimeIf, TrapIf, UserAccessIf, VirtAddr, VirtRange,
@@ -376,6 +376,12 @@ impl PowerIf for Platform {
         }
     }
 }
+
+/// m1dock-mock entropy: relies on the trait default
+/// (deterministic xorshift-counter seed). The mock board has no
+/// hardware RNG; production m1dock can override with a board-
+/// specific RNG when one is wired.
+impl EntropyIf for Platform {}
 
 #[cfg(target_arch = "riscv64")]
 fn sbi_console_putchar(byte: u8) {

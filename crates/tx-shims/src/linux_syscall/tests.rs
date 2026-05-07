@@ -58,8 +58,8 @@ use super::{
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use tx_hal::{
-    Asid, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
-    PmapUnmapResult, PtNode, VirtAddr,
+    Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
+    PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
 use tx_subsystems::vm::USER_PAGE_SIZE;
 
@@ -137,6 +137,13 @@ impl PmapIf for ShimsTestPmap {
         Ok(Some(PmapUnmapResult::new(virt, phys, kind)))
     }
 }
+
+// `dispatch::<P>` requires `P: PmapIf + EntropyIf` (added by the
+// CSPRNG chore so the execve path can pull AT_RANDOM bytes).
+// Trait default fills bytes from the deterministic boot-counter
+// xorshift, which is what test sites want — non-zero,
+// reproducible, no hardware dependency.
+impl EntropyIf for ShimsTestPmap {}
 
 // ---------------------------------------------------------------------------
 // Shared per-test setup.

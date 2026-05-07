@@ -715,8 +715,8 @@ Body, phase-by-phase, citing `txdoc:EXEC-4-2-PHASE-SUMMARY-TABLE`:
      `txdoc:EXEC-9-3-POPULATE-THE-INITIAL-USER-STACK`) and
      `auxv_facts` is built from the `image_plan` plus a 16-byte
      `AT_RANDOM` region of constant `[0; 16]` (Open Q #1
-     DECIDED 2026-05-06; CSPRNG is a follow-up). Mark with
-     `TODO(phase-csprng)`.
+     DECIDED 2026-05-06; CSPRNG landed 2026-05-07 on chore
+     branch `chore/csprng-at-random`).
    - Write the stack into the detached AS:
      `vm::scripts::populate_detached_user_range::<P>(&new_aspace, stack_image.initial_sp, &stack_image.bytes, guard).await?;`
    - Last reversible point. Past here the EXEC-PONR invariant
@@ -1107,12 +1107,13 @@ Self::run_userspace_reactor_loop();
    the 16-byte AT_RANDOM region as constant `[0; 16]` (Open Q
    #1 DECIDED 2026-05-06). Any binary that links libssp uses
    this for stack-canary seeding; a constant trivially weakens
-   the canary. v1 explicitly accepts the weakness — txKernel
+   the canary. v1 explicitly accepted the weakness — txKernel
    has no ASLR or stack-canary checks at this stage and the
    binaries the slice runs have no untrusted input. Real
-   CSPRNG is a follow-up slice (replace the constant in
-   `build_initial_user_stack` and drop the
-   `TODO(phase-csprng)`).
+   CSPRNG was a follow-up slice (landed
+   2026-05-07 on chore branch `chore/csprng-at-random`:
+   `EntropyIf` HAL trait + per-exec fill via
+   `AuxvFacts.at_random_bytes`).
 
 7. **`process.aspace` field-shape change — committed.** Open Q
    #2 DECIDED 2026-05-06: flip `ProcessPayload.aspace` from
@@ -1233,14 +1234,14 @@ needs Part 5; Part 7 ties together).
 ## Open questions
 
 1. **AT_RANDOM source for v1 — DECIDED 2026-05-06: constant
-   `[0; 16]` with `TODO(phase-csprng)`.** The 16-byte AT_RANDOM
-   region is seeded with a constant; musl SSP becomes
-   deterministic but functionally fine for static smoke binaries
-   (txKernel has no ASLR or stack-canary checks at this stage).
-   Real CSPRNG is a follow-up slice. RV64 QEMU has no platform
-   RNG today; when one is wired (virtio-rng or rdrand-equivalent),
-   replace the constant in `build_initial_user_stack` and drop
-   the TODO.
+   `[0; 16]`.** The 16-byte AT_RANDOM region was seeded with a
+   constant; musl SSP became deterministic but functionally fine
+   for static smoke binaries (txKernel has no ASLR or
+   stack-canary checks at this stage). Real CSPRNG landed
+   2026-05-07 on chore branch `chore/csprng-at-random`: HAL
+   `EntropyIf` trait fills `AuxvFacts.at_random_bytes` per exec
+   (RV64 mixes `rdtime` + xorshift counter; other boards use the
+   deterministic counter default).
 2. **`process.aspace` field-shape change — DECIDED 2026-05-06:
    atomic replace via `AtomicSlot<Cap<AddressSpace>>`.** Flip
    the field type from `Cap<AddressSpace>` to

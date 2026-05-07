@@ -23,10 +23,11 @@ use pmap::topology as pmap_topology;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaAddr,
-    DmaDirection, DmaIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, MemoryRegion,
-    MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError,
-    PmapIf, PmapInvalidation, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
-    PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry, SmpIf, TimeIf, VirtAddr,
+    DmaDirection, DmaIf, EntropyIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf,
+    MemoryRegion, MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
+    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry,
+    SmpIf, TimeIf, VirtAddr,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -719,6 +720,63 @@ impl PowerIf for Platform {
             core::hint::spin_loop();
         }
     }
+}
+
+impl EntropyIf for Platform {
+    /// RV64 QEMU virt entropy: mix the unprivileged `rdtime` CSR
+    /// (always available, sub-µs resolution on the QEMU virt
+    /// timebase) into the trait-default xorshift counter. This is
+    /// not a CSPRNG, but for txKernel's current trust model — no
+    /// ASLR, no untrusted input, musl SSP only — it is materially
+    /// stronger than the static `[0; 16]` it replaces.
+    ///
+    /// The Zkr `seed` CSR (CSR 0x015) was considered but skipped:
+    /// `riscv64gc` does not include Zkr, and a runtime probe would
+    /// hook the trap shell. `rdtime` ships cleanly today; a Zkr
+    /// upgrade can land later behind a board-config flag.
+    fn fill_random(out: &mut [u8]) {
+        // Mix rdtime ticks (per-exec varying) with a per-call
+        // xorshift counter so back-to-back execs at the same tick
+        // still diverge.
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0xA5A5_5A5A_DEAD_BEEF);
+
+        let ticks: u64 = read_rdtime_ticks();
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut s = ticks ^ counter.rotate_left(13);
+        // Avoid the all-zero xorshift fixed point.
+        if s == 0 {
+            s = 0xDEADBEEF_CAFE_F00D;
+        }
+        for byte in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *byte = (s & 0xff) as u8;
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn read_rdtime_ticks() -> u64 {
+    let ticks: u64;
+    unsafe {
+        core::arch::asm!(
+            "rdtime {ticks}",
+            ticks = out(reg) ticks,
+            options(nomem, nostack)
+        );
+    }
+    ticks
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn read_rdtime_ticks() -> u64 {
+    // Host-test fallback: return 0 so the trait default counter
+    // alone provides variance. The host test
+    // `entropy_fill_random_distinct_calls_diverge` exercises this
+    // path.
+    0
 }
 
 fn current_cpu_id() -> CpuId {

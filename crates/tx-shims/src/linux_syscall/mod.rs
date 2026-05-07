@@ -44,7 +44,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use tx_hal::PmapIf;
+use tx_hal::{EntropyIf, PmapIf};
 use tx_reactor::userspace::SyscallRequest;
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_substrate::zone::Cap;
@@ -329,7 +329,10 @@ pub enum SyscallResult {
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P: PmapIf>(req: SyscallRequest, ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub async fn dispatch<'a, P: PmapIf + EntropyIf>(
+    req: SyscallRequest,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     match req.nr {
         NR_WRITE => sys_write(req.args, ctx).await,
         NR_READ => sys_read(req.args, ctx).await,
@@ -937,7 +940,10 @@ fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// passes kernel-side pointers directly. Once the userspace-VA copy
 /// lane lands the bounded-read helpers below switch over.
 /// TODO(phase-userva): replace with `ctx.aspace.copy_from_user(...)`.
-async fn sys_execve<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+async fn sys_execve<'a, P: PmapIf + EntropyIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let path_uaddr = args[0];
     let argv_uaddr = args[1];
     let envp_uaddr = args[2];

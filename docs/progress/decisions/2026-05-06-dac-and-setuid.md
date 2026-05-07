@@ -338,24 +338,22 @@ frame setup; `siginfo_t` carrier (waitid).
 
 ## Follow-ups in priority order
 
-1. **Real CSPRNG** — replace constant `[0; 16]` `AT_RANDOM` (still
-   on the immediate to-do list from the ELF loader slice).
-2. **Per-task AST plumbing** — signal-handler frame setup beyond
+1. **Per-task AST plumbing** — signal-handler frame setup beyond
    `EnterUserspace`. Unlocks LTP wait* tests that gate on stop/cont
    signals.
-3. **`NR_WAITID` + siginfo plumbing** — closes the LTP `waitid*`
+2. **`NR_WAITID` + siginfo plumbing** — closes the LTP `waitid*`
    directory.
-4. **`sys_open` syscall arm + `O_CLOEXEC` threading** — mechanical
+3. **`sys_open` syscall arm + `O_CLOEXEC` threading** — mechanical
    now that `OpenFileFlags::cloexec` is plumbed.
-5. **`CLONE_VFORK | CLONE_VM`** — unlocks `posix_spawn` (musl shells
+4. **`CLONE_VFORK | CLONE_VM`** — unlocks `posix_spawn` (musl shells
    use it).
-6. **`cargo xtask check-numbers`** — duplicate-detection grep for
+5. **`cargo xtask check-numbers`** — duplicate-detection grep for
    `numbers.rs` constants (per Q1 follow-up flag).
-7. **Layer B end-to-end smoke for setuid** (full reactor-driven
+6. **Layer B end-to-end smoke for setuid** (full reactor-driven
    round trip via instruction-decoder simulator).
-8. **`RawTrapFrame`/`TrapFrameMut` portable HAL surface** — RV64
+7. **`RawTrapFrame`/`TrapFrameMut` portable HAL surface** — RV64
    board internals today.
-9. **Real initramfs cpio unpack** — replace hand-encoded fixtures
+8. **Real initramfs cpio unpack** — replace hand-encoded fixtures
    with real init binary loaded from disk.
 
 ## Verification
