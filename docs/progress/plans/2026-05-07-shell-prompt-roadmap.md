@@ -244,16 +244,26 @@ existing test transition logic stops needing the explicit
 `decr_*` calls; one new test
 `pipe_close_last_reader_fd_wakes_writer_for_sigpipe`.
 
-### Slice 2 — User-VA sweep (~3–5 days)
+### ~~Slice 2 — User-VA sweep~~ — **deferred to Slice 10** (re-ordered 2026-05-07)
 
-Foundation for everything else. Every subsequent syscall arm
-should call the new helpers from day one.
+**Original framing:** "Foundation for everything else."
 
-**Success:** Zero `TODO(phase-userva)` markers in
-`linux_syscall/mod.rs`. New tests: each existing arm's
-"-EFAULT on unmapped user pointer" path.
+**Why deferred:** investigation during Slice 1 commit showed there
+is **no production `UserAccessIf` impl for RV64** — only the
+default-trait EFAULT stub plus test-only impls in
+`page_backed/user_buffer_tests.rs`. Migrating the 18
+`TODO(phase-userva)` sites today would just turn every
+user-pointer-using syscall into a hard EFAULT against the bake-in
+fixture, which is actively kernel-VA mapped via the bootstrap
+exemption.
 
-### Slice 3 — VM syscalls (~2–3 days)
+**New shape:** the user-VA sweep happens as a single slice later in
+the roadmap (Slice 10, formerly Slice 2), bundled with the
+production RV64 `UserAccessIf` impl. Slices 2–9 continue the
+existing `TODO(phase-userva)` pattern; one PR migrates them all
+at once.
+
+### Slice 2 — VM syscalls (~2–3 days) [was Slice 3]
 
 `mmap`, `munmap`, `mprotect`, `madvise`, `mremap`, `msync`. All
 pure plumbing — primitives exist. Unblocks musl libc startup
@@ -263,7 +273,7 @@ pure plumbing — primitives exist. Unblocks musl libc startup
 test. File-mmap of a tmpfs file dispatch test (read-back via
 direct user-VA after the mapping installs).
 
-### Slice 4 — Futex (~4–7 days)
+### Slice 3 — Futex (~4–7 days) [was Slice 4]
 
 The largest single piece in the roadmap. Without it, musl
 panics at libc init. Mirrors fd-ops Wave 3's pipe pattern:
@@ -275,7 +285,7 @@ recognised. Single-thread musl-init smoke (a hand-built fixture
 that does the libc-startup futex dance) reaches `_start`'s first
 `write(2)`.
 
-### Slice 5 — Time syscalls (~2 days)
+### Slice 4 — Time syscalls (~2 days) [was Slice 5]
 
 `clock_gettime`, `gettimeofday`, `nanosleep`,
 `clock_nanosleep`. Quick. `nanosleep` reuses futex's wait-carrier
@@ -285,7 +295,7 @@ pattern.
 values; `nanosleep(100ms)` parks for ≥100ms; nightly LTP
 `nanosleep01` passes.
 
-### Slice 6 — IOCTL + TTY routing (~2 days)
+### Slice 5 — IOCTL + TTY routing (~2 days) [was Slice 6]
 
 Pure plumbing. Eight TTY ioctl arms exist as step functions; one
 syscall arm decodes `request` and routes. Without this, **musl's
@@ -296,7 +306,7 @@ non-interactive mode, no prompt is printed.
 TIOCGWINSZ, &winsize)` returns 0; `isatty(0)` is true; bash/dash
 prints a prompt over QEMU stdio.
 
-### Slice 7 — Stat family (~3 days)
+### Slice 6 — Stat family (~3 days) [was Slice 7]
 
 `fstat`, `newfstatat`, `getdents64`, `getcwd`, `chdir`,
 `fchdir`, `umask`. Mostly mechanical given existing primitives.
@@ -304,7 +314,7 @@ prints a prompt over QEMU stdio.
 **Success:** `ls -l /` works; `cd /tmp; pwd` works; `getdents64`
 returns entries for tmpfs root.
 
-### Slice 8 — fcntl extension + remaining day-1 misc (~2 days)
+### Slice 7 — fcntl extension + remaining day-1 misc (~2 days) [was Slice 8]
 
 `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFL`, `F_SETFL`. Plus
 `uname`, `prlimit64`, `getrandom`, `getpgrp`-fix, `kill`,
@@ -313,7 +323,7 @@ returns entries for tmpfs root.
 **Success:** Each LTP `fcntl*` test that's not behind an unrelated
 gap passes.
 
-### Slice 9 — File-mutation syscalls (~4 days)
+### Slice 8 — File-mutation syscalls (~4 days) [was Slice 9]
 
 `unlinkat`, `mkdirat`, `renameat2`, `symlinkat`, `linkat`,
 `readlinkat`, `truncate`, `ftruncate`, `utimensat`. Larger because
@@ -321,6 +331,31 @@ each needs a new `FsOps` step on the tmpfs side.
 
 **Success:** Shell can `rm -r /tmp/x; mkdir /tmp/x; cp /etc/hosts
 /tmp/x/`. Each LTP file-mutation cluster passes its day-1 sub-set.
+
+### Slice 9 — User-VA sweep + RV64 UserAccessIf (~5–7 days) [was Slice 2]
+
+The deferred foundation. Now lands as a unified slice with three
+parts:
+
+**Part A — RV64 production `UserAccessIf` impl.** Set `mstatus.SUM
+= 1` around the copy. Use a fixup-table approach:
+`copy_from_user` / `copy_to_user` are short asm sequences whose
+fault-PC range is registered with the kernel trap handler; on a
+kernel-mode page fault inside that range, the handler resumes at
+the fixup PC with EFAULT in the result register instead of
+panicking. ~400–500 LOC including the fault-handler integration.
+
+**Part B — Migrate the 18 `TODO(phase-userva)` sites + any added
+by slices 2–8.** ~300 LOC.
+
+**Part C — EFAULT contract test per arm.** Each migrated arm gets
+a "-EFAULT on unmapped user pointer" test using a `FaultingHal`
+stand-in.
+
+**Success:** Zero `TODO(phase-userva)` markers in
+`linux_syscall/mod.rs`. Workspace tests prove EFAULT is propagated
+through every arm. RV64 `UserAccessIf` impl passes a host-level
+unit test against a synthetic page-table.
 
 ### Slice 10 — Busybox bake-in + boot wire (~2 days)
 
