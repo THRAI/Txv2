@@ -248,6 +248,25 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().map(|p| p.aspace_cap())
     }
 
+    /// Snapshot the per-process credential. Returns `None` for zombies
+    /// (payload dropped — cred is unobservable).
+    ///
+    /// `Cred` is `Copy`; the snapshot is independent of the lock and
+    /// safe to hold across `.await` points. Mutators
+    /// (`cred::step_setuid` / `step_setgid` / `step_setres{u,g}id` /
+    /// `step_setre{u,g}id`) acquire the lock internally; readers that
+    /// only need a coherent point-in-time view should use this
+    /// accessor rather than reaching into the `pub(crate)` payload
+    /// field directly.
+    ///
+    /// Used by the DAC + setuid slice's `SyscallCtx::cred()` accessor
+    /// (`tx-shims::linux_syscall`) so every cred-mutation /
+    /// cred-reading syscall arm can read through one snapshot under
+    /// one lock acquisition.
+    pub fn cred(&self) -> Option<Cred> {
+        self.payload.lock().as_ref().map(|p| p.cred())
+    }
+
     /// Replace this process's address space with `new` and return the
     /// previous `Cap` so the caller can defer-drop it via EBR. Per
     /// `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY` this

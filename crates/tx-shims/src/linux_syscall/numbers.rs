@@ -186,3 +186,68 @@ pub const NR_WAIT4: u64 = 260;
 /// they need stop/cont signal infrastructure to surface
 /// `Stopped`/`Continued` `ExitStatus` values, which is a deferred slice.
 pub const WNOHANG: i32 = 0x1;
+
+// ---------------------------------------------------------------------
+// Wave 2 of the DAC + setuid slice — Part 7 (`SyscallCtx::cred()`
+// accessor) + Part 3 (process-side cred-mutation / cred-reading
+// syscall arms). Numbers verified against Linux's RV64 generic ABI
+// (`include/uapi/asm-generic/unistd.h`); each one cites the shipping
+// `tx_subsystems::cred::step_*` helper landed in Wave 1
+// (`txdoc:PROCESS-CREDENTIAL-SERVICE-DRAFT-1`). See
+// `docs/progress/plans/2026-05-06-dac-and-setuid.md` Part 3.
+// ---------------------------------------------------------------------
+
+/// `setgid(gid)`. Linux RV64 generic ABI `__NR_setgid = 144`. Wraps
+/// `cred::step_setgid`. LTP cluster: `setgid01..03`,
+/// `setregid01..04` (regression cross-check).
+pub const NR_SETGID: u64 = 144;
+/// `setregid(rgid, egid)`. Linux RV64 generic ABI
+/// `__NR_setregid = 143`. Wraps `cred::step_setregid` (Wave 1).
+/// `(u32) -1` (== `u32::MAX` after the i32→u32 cast) means "leave
+/// unchanged" per Linux's sentinel convention. LTP cluster:
+/// `setregid01..04`.
+pub const NR_SETREGID: u64 = 143;
+/// `setreuid(ruid, euid)`. Linux RV64 generic ABI
+/// `__NR_setreuid = 145`. Wraps `cred::step_setreuid` (Wave 1).
+/// `(u32) -1` sentinel as above. LTP cluster: `setreuid01..05`.
+pub const NR_SETREUID: u64 = 145;
+/// `setuid(uid)`. Linux RV64 generic ABI `__NR_setuid = 146`. Wraps
+/// `cred::step_setuid`. LTP cluster: `setuid01..04`.
+pub const NR_SETUID: u64 = 146;
+/// `setresuid(ruid, euid, suid)`. Linux RV64 generic ABI
+/// `__NR_setresuid = 147`. Wraps `cred::step_setresuid` (Wave 1).
+/// `(u32) -1` sentinel decodes to `None` in each of the three
+/// argument slots. LTP cluster: `setresuid01..05`.
+pub const NR_SETRESUID: u64 = 147;
+/// `getresuid(ruid_uaddr, euid_uaddr, suid_uaddr)`. Linux RV64
+/// generic ABI `__NR_getresuid = 148`. Writes
+/// `(uid.raw(), euid.raw(), suid.raw())` to the three user
+/// pointers. LTP cluster: `getresuid01..03`.
+///
+/// Wave 2 bootstrap exemption: the three uaddrs are treated as
+/// kernel-side via inline `write_volatile` (mirrors `sys_wait4`'s
+/// `wstatus` writeback). Linux's real semantics return `-EFAULT` on
+/// any invalid pointer; user-VA validation is `TODO(phase-userva)`.
+pub const NR_GETRESUID: u64 = 148;
+/// `setresgid(rgid, egid, sgid)`. Linux RV64 generic ABI
+/// `__NR_setresgid = 149`. Wraps `cred::step_setresgid` (Wave 1).
+/// `(u32) -1` sentinel as for `setresuid`. LTP cluster:
+/// `setresgid01..04`.
+pub const NR_SETRESGID: u64 = 149;
+/// `getresgid(rgid_uaddr, egid_uaddr, sgid_uaddr)`. Linux RV64
+/// generic ABI `__NR_getresgid = 150`. Companion of `getresuid`;
+/// writes the three gids to user pointers. Same Wave 2 bootstrap
+/// exemption applies. LTP cluster: `getresgid01..02`.
+pub const NR_GETRESGID: u64 = 150;
+/// `getuid()`. Linux RV64 generic ABI `__NR_getuid = 174`. Reads
+/// `cred.uid`. LTP cluster: `getuid01..03`.
+pub const NR_GETUID: u64 = 174;
+/// `geteuid()`. Linux RV64 generic ABI `__NR_geteuid = 175`. Reads
+/// `cred.euid`. LTP cluster: `geteuid01..02`.
+pub const NR_GETEUID: u64 = 175;
+/// `getgid()`. Linux RV64 generic ABI `__NR_getgid = 176`. Reads
+/// `cred.gid`. LTP cluster: `getgid01..03`.
+pub const NR_GETGID: u64 = 176;
+/// `getegid()`. Linux RV64 generic ABI `__NR_getegid = 177`. Reads
+/// `cred.egid`. LTP cluster: `getegid01..02`.
+pub const NR_GETEGID: u64 = 177;
