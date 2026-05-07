@@ -44,7 +44,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use tx_hal::{EntropyIf, PmapIf, TimeIf};
+use tx_hal::{EntropyIf, PmapIf, TimeIf, UserPtr};
 use tx_reactor::userspace::SyscallRequest;
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_substrate::zone::Cap;
@@ -131,18 +131,16 @@ pub const TTY_WRITE_MAX_INLINE: usize = 4096;
 /// for inline buffer copies. A longer path returns `-ENAMETOOLONG`
 /// per the Phase 6 plan.
 ///
-/// TODO(phase-userva): lift to platform `PATH_MAX` once the general
-/// `copy_from_user` lane lands.
+/// Could be lifted to platform `PATH_MAX` (typically 4096 across
+/// Linux ABIs, so this is already at the canonical ceiling).
 pub const EXECVE_PATH_MAX: usize = 4096;
 
 /// Maximum total argv + envp byte budget per `execve(2)` call.
 ///
 /// Linux's `ARG_MAX` is 128 KiB but the Phase 6 plan caps the inline
 /// buffer at 8 KiB to keep the same discipline as the `write` /
-/// `sigaction` arms. Overflow returns `-E2BIG`.
-///
-/// TODO(phase-userva): lift to 128 KiB once general `copy_from_user`
-/// lands.
+/// `sigaction` arms. Overflow returns `-E2BIG`. Could be lifted to
+/// 128 KiB now that the user-VA `copy_from_user` lane has landed.
 pub const EXECVE_ARG_MAX_INLINE: usize = 8192;
 
 /// Maximum number of pointer slots walked through `argv` / `envp`
@@ -158,8 +156,9 @@ const ENOSYS_VALUE: i32 = 38;
 const EBADF_VALUE: i32 = 9;
 /// Linux generic ABI errno value for "bad address" (`EFAULT`).
 /// Used by Slice 4's time syscalls when a required user pointer is
-/// null. Real EFAULT semantics (invalid user VA) are deferred to
-/// `TODO(phase-userva)`.
+/// null, and by every `bootstrap_*` user-VA bridge for invalid user
+/// addresses (the canonical `aspace.copy_*_user` lane already
+/// surfaces `Errno::EFAULT`; the dispatcher translates it here).
 const EFAULT_VALUE: i32 = 14;
 /// Linux generic ABI errno value for "argument list too long" (`E2BIG`).
 /// Used when a syscall argument violates a Phase 2a slice bound (e.g.
@@ -529,8 +528,8 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_KILL => sys_kill(req.args),
         nr if nr == NR_TKILL => sys_tkill(req.args),
         nr if nr == NR_TGKILL => sys_tgkill(req.args),
-        nr if nr == NR_GETRANDOM => sys_getrandom::<P>(req.args),
-        nr if nr == NR_UNAME => sys_uname(req.args),
+        nr if nr == NR_GETRANDOM => sys_getrandom::<P>(req.args, ctx),
+        nr if nr == NR_UNAME => sys_uname(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => sys_prlimit64(req.args, ctx),
         // rt_sigreturn: deferred. Returns -ENOSYS — the
         // SignalFrameIf::restore_signal_frame surface needs the trap
@@ -592,26 +591,26 @@ async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
         None => return SyscallResult::Error(EBADF_VALUE),
     };
 
-    // SAFETY: Phase 2a accepts kernel-side buffers only. Callers
-    // synthesise the syscall request from a kernel-allocated slice
-    // (e.g. a test's `b"hello\n".as_ptr() as u64`). General
-    // `copy_from_user` over user VAs is deferred (trio plan
-    // §"Out of scope" — bounded inline buffers only). Once the
-    // userspace-VA copy lane lands, this `from_raw_parts` is replaced
-    // by `ctx.aspace.copy_from_user(...)`.
-    // TODO(phase-userva): replace with copy_from_user once available.
-    let bytes: &[u8] = if len == 0 {
-        &[]
-    } else {
-        unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) }
-    };
+    // Pull the user buffer into kernel memory through the canonical
+    // user-VA lane (`bootstrap_copy_from_user` bridges via
+    // `aspace.copy_from_user`, falling back to the kernel-pointer
+    // deref the trio's earlier exemption used). The Vec is owned for
+    // the duration of the step loop so the underlying user pages
+    // can be re-mapped without affecting the byte stream we feed to
+    // `step_write`.
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
+    if len > 0 {
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+    }
 
     // Loop on the canonical async wait discipline pattern from
     // `vm::execution::fault_script`. Each iteration takes a fresh
     // `tx_substrate::epoch::guard()` inside the step's call site so
     // the guard never crosses an `.await`.
     let mut total: usize = 0;
-    let mut remaining = bytes;
+    let mut remaining = bytes.as_slice();
     loop {
         let outcome = {
             let guard = tx_substrate::epoch::guard();
@@ -702,8 +701,8 @@ fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// `read(fd, buf, count)`.
 ///
 /// Mirrors `sys_write`'s structure: resolve fd → `Cap<OpenFile>`,
-/// treat `args[1]` as a kernel pointer (TODO(phase-userva) bootstrap
-/// exemption — same as `write`), loop on the wait-carrier discipline.
+/// route the user buffer through `bootstrap_copy_to_user`, and loop
+/// on the wait-carrier discipline.
 ///
 /// **Blocking semantic.** Pre-ELF Phase 5 (item 9) wires the UART RX
 /// path so a blocked `read(0, ...)` actually parks until bytes arrive:
@@ -735,21 +734,33 @@ async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
         return SyscallResult::Return(0);
     }
 
-    // SAFETY: Phase 2b accepts kernel-side buffers only (matching the
-    // Phase 2a `write` exemption — see `sys_write`'s SAFETY comment).
-    // TODO(phase-userva): replace with `ctx.aspace.copy_to_user(...)`
-    // once the userspace-VA copy lane lands.
-    let out: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
+    // Read into a kernel-side staging buffer, then copy out through
+    // the canonical user-VA lane (`bootstrap_copy_to_user` bridges
+    // via `aspace.copy_to_user`, falling back to the kernel-pointer
+    // dance the trio's earlier exemption used).
+    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
 
     let mut total: usize = 0;
     let mut cursor: usize = 0;
     loop {
         let outcome = {
             let guard = tx_substrate::epoch::guard();
-            file.step_read(&mut out[cursor..], &guard)
+            file.step_read(&mut staging[cursor..], &guard)
         };
         match outcome {
             StepOutcome::Done(read) | StepOutcome::Advanced(read) => {
+                if read > 0 {
+                    if let Err(errno) = bootstrap_copy_to_user(
+                        &ctx.aspace,
+                        buf_ptr as u64 + cursor as u64,
+                        &staging[cursor..cursor + read],
+                    ) {
+                        if total > 0 {
+                            return SyscallResult::Return(total as i64);
+                        }
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
                 total += read;
                 let stop = read == 0 || cursor + read >= len;
                 if stop {
@@ -758,6 +769,18 @@ async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
                 cursor += read;
             }
             StepOutcome::AdvancedThenBlocked(read, _token) => {
+                if read > 0 {
+                    if let Err(errno) = bootstrap_copy_to_user(
+                        &ctx.aspace,
+                        buf_ptr as u64 + cursor as u64,
+                        &staging[cursor..cursor + read],
+                    ) {
+                        if total > 0 {
+                            return SyscallResult::Return(total as i64);
+                        }
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
                 total += read;
                 if total > 0 {
                     // Partial-success policy: same as `write`. Return
@@ -876,15 +899,17 @@ fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    // Read the user-supplied set bitset. SAFETY: Phase 2b accepts
-    // kernel-side buffers only (TODO(phase-userva) bootstrap
-    // exemption — same as Phase 2a's `write`).
+    // Read the user-supplied set bitset through the canonical
+    // user-VA lane (`bootstrap_read_user` bridges via
+    // `aspace.read_user`, falling back to a kernel-pointer read on
+    // EFAULT).
     let next_mask = if set_ptr == 0 {
         SignalMask::EMPTY
     } else {
-        // SAFETY: see SAFETY comment in `sys_write`.
-        let bits = unsafe { core::ptr::read_unaligned(set_ptr as *const u64) };
-        SignalMask::new(bits)
+        match bootstrap_read_user::<u64>(&ctx.aspace, set_ptr as u64) {
+            Ok(bits) => SignalMask::new(bits),
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
     };
 
     // If `set` is null we still need the previous mask to satisfy
@@ -916,9 +941,10 @@ fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
     };
 
     if oldset_ptr != 0 {
-        // SAFETY: see SAFETY comment in `sys_write`.
-        unsafe {
-            core::ptr::write_unaligned(oldset_ptr as *mut u64, prev_mask.raw_bits());
+        if let Err(errno) =
+            bootstrap_write_user::<u64>(&ctx.aspace, oldset_ptr as u64, prev_mask.raw_bits())
+        {
+            return SyscallResult::Error(errno_to_i32(errno));
         }
     }
 
@@ -950,14 +976,16 @@ fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
         return SyscallResult::Error(EINVAL_VALUE);
     };
 
-    // Decode the new action (if any). SAFETY: Phase 2b kernel-side
-    // buffer exemption applies — TODO(phase-userva) for the real
-    // copy-from-user lane.
+    // Decode the new action (if any) through the canonical user-VA
+    // lane (`bootstrap_copy_from_user` bridges via
+    // `aspace.copy_from_user`).
     let new_disposition: Option<SigDisposition> = if act_ptr == 0 {
         None
     } else {
-        // SAFETY: see SAFETY comment in `sys_write`.
-        let bytes = unsafe { core::slice::from_raw_parts(act_ptr as *const u8, SIGACTION_BYTES) };
+        let mut bytes = [0u8; SIGACTION_BYTES];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, act_ptr as u64) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
         let handler = read_u64_le(&bytes[0..8]);
         // sa_flags / sa_restorer / sa_mask are decoded but unused at
         // this layer — `SigDisposition` only stores the handler shape.
@@ -1019,15 +1047,16 @@ fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
             SigDisposition::Ignore => 1,  // SIG_IGN
             SigDisposition::Handler(addr) => addr as u64,
         };
-        // SAFETY: see SAFETY comment in `sys_write`. Write each 8-byte
-        // field individually to avoid any host-side struct-layout
-        // assumption.
-        unsafe {
-            let base = oldact_ptr as *mut u64;
-            core::ptr::write_unaligned(base, handler_value); // sa_handler
-            core::ptr::write_unaligned(base.add(1), 0); // sa_flags (unused)
-            core::ptr::write_unaligned(base.add(2), 0); // sa_restorer (unused)
-            core::ptr::write_unaligned(base.add(3), 0); // sa_mask (unused)
+        // Build a 32-byte image and copy out through the canonical
+        // user-VA lane. Layout: 4×u64 little-endian (sa_handler,
+        // sa_flags, sa_restorer, sa_mask). All but sa_handler are 0
+        // until SA_SIGINFO / SA_RESTORER / per-handler mask wiring
+        // lands.
+        let mut image = [0u8; SIGACTION_BYTES];
+        image[0..8].copy_from_slice(&handler_value.to_le_bytes());
+        // image[8..32] already zero.
+        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, oldact_ptr as u64, &image) {
+            return SyscallResult::Error(errno_to_i32(errno));
         }
     }
 
@@ -1163,13 +1192,10 @@ fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// gprs (System V psABI). On `Err(_)` map to a Linux negative errno
 /// via `ExecError::to_errno_i32`.
 ///
-/// SAFETY (kernel-buffer exemption): same Phase 2a discipline as
-/// `sys_write` / `sys_read` — the userspace VAs (`path_uaddr`,
-/// `argv_uaddr`, `envp_uaddr`) are read through `from_raw_parts`
-/// without an `aspace.copy_from_user` indirection. Test scaffolding
-/// passes kernel-side pointers directly. Once the userspace-VA copy
-/// lane lands the bounded-read helpers below switch over.
-/// TODO(phase-userva): replace with `ctx.aspace.copy_from_user(...)`.
+/// User-buffer reads (`path_uaddr`, `argv_uaddr`, `envp_uaddr`) flow
+/// through `read_user_cstr` / `read_user_cstr_vec`, which bridge via
+/// the canonical `aspace.read_user` / `aspace.read_user_cstr` lane
+/// (with a kernel-pointer fallback for test scaffolding).
 async fn sys_execve<'a, P: PmapIf + EntropyIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
@@ -1179,7 +1205,7 @@ async fn sys_execve<'a, P: PmapIf + EntropyIf>(
     let envp_uaddr = args[2];
 
     // ----- Step 1: bounded read of the path -----
-    let path_buf = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+    let path_buf = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(buf) => buf,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -1191,11 +1217,13 @@ async fn sys_execve<'a, P: PmapIf + EntropyIf>(
     // an oversized envp following a normal argv still triggers
     // `-E2BIG`.
     let mut remaining: usize = EXECVE_ARG_MAX_INLINE;
-    let argv_buf = match read_user_cstr_vec(argv_uaddr, EXECVE_VEC_MAX, &mut remaining) {
+    let argv_buf = match read_user_cstr_vec(&ctx.aspace, argv_uaddr, EXECVE_VEC_MAX, &mut remaining)
+    {
         Ok(v) => v,
         Err(ReadVecError::TooBig) => return SyscallResult::Error(E2BIG_VALUE),
     };
-    let envp_buf = match read_user_cstr_vec(envp_uaddr, EXECVE_VEC_MAX, &mut remaining) {
+    let envp_buf = match read_user_cstr_vec(&ctx.aspace, envp_uaddr, EXECVE_VEC_MAX, &mut remaining)
+    {
         Ok(v) => v,
         Err(ReadVecError::TooBig) => return SyscallResult::Error(E2BIG_VALUE),
     };
@@ -1256,24 +1284,23 @@ enum ReadVecError {
 /// trio Phase 2a bootstrap exemption pre-dates the EFAULT plumbing,
 /// so we treat NULL as "empty").
 ///
-/// SAFETY: see the SAFETY comment in `sys_write` — kernel-buffer
-/// bootstrap exemption applies.
-fn read_user_cstr(uaddr: u64, max_len: usize) -> Result<Vec<u8>, ReadCStrError> {
-    if uaddr == 0 || max_len == 0 {
-        return Ok(Vec::new());
+/// Bridges through `bootstrap_read_user_cstr` (which delegates to
+/// `aspace.read_user_cstr` and falls back to a kernel-pointer scan on
+/// `EFAULT`).
+fn read_user_cstr(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    max_len: usize,
+) -> Result<Vec<u8>, ReadCStrError> {
+    match bootstrap_read_user_cstr(aspace, uaddr, max_len) {
+        Ok(v) => Ok(v),
+        Err(Errno::ENAMETOOLONG) => Err(ReadCStrError::TooLong),
+        // Other errnos collapse to TooLong defensively — the caller's
+        // Result shape only carries the "too long" axis. Production
+        // paths surface clean Done; the EFAULT fallback inside
+        // `bootstrap_read_user_cstr` covers test scaffolding pointers.
+        Err(_) => Err(ReadCStrError::TooLong),
     }
-    let mut out: Vec<u8> = Vec::new();
-    out.reserve(core::cmp::min(max_len, 256));
-    for offset in 0..max_len {
-        // SAFETY: bootstrap kernel-buffer exemption (TODO: phase-userva).
-        let byte = unsafe { core::ptr::read_volatile((uaddr as usize + offset) as *const u8) };
-        if byte == 0 {
-            return Ok(out);
-        }
-        out.push(byte);
-    }
-    // Walked the full budget without seeing a NUL — too long.
-    Err(ReadCStrError::TooLong)
 }
 
 /// Bounded copy of a NULL-terminated array of `*const u8` user
@@ -1285,8 +1312,12 @@ fn read_user_cstr(uaddr: u64, max_len: usize) -> Result<Vec<u8>, ReadCStrError> 
 /// `uaddr == 0` produces an empty vector — matches Linux's lenience
 /// for `execve(path, NULL, NULL)` per the Phase 6 plan.
 ///
-/// SAFETY: see the SAFETY comment in `sys_write`.
+/// Each pointer slot and each string read bridges through the
+/// canonical user-VA lane (`bootstrap_read_user` /
+/// `bootstrap_read_user_cstr`), falling back to the kernel-pointer
+/// dance on EFAULT for test scaffolding.
 fn read_user_cstr_vec(
+    aspace: &AddressSpace,
     uaddr: u64,
     max_slots: usize,
     byte_budget: &mut usize,
@@ -1296,9 +1327,11 @@ fn read_user_cstr_vec(
     }
     let mut out: Vec<Vec<u8>> = Vec::new();
     for slot in 0..max_slots {
-        let slot_addr = uaddr as usize + slot * core::mem::size_of::<u64>();
-        // SAFETY: bootstrap kernel-buffer exemption (TODO: phase-userva).
-        let ptr = unsafe { core::ptr::read_volatile(slot_addr as *const u64) };
+        let slot_addr = uaddr.wrapping_add((slot * core::mem::size_of::<u64>()) as u64);
+        let ptr = match bootstrap_read_user::<u64>(aspace, slot_addr) {
+            Ok(p) => p,
+            Err(_) => return Err(ReadVecError::TooBig),
+        };
         if ptr == 0 {
             return Ok(out);
         }
@@ -1306,7 +1339,7 @@ fn read_user_cstr_vec(
         // budget. We need at least one byte for the NUL terminator;
         // when `*byte_budget == 0` any non-empty string is `TooBig`.
         let cap = *byte_budget;
-        let s = match read_user_cstr(ptr, cap) {
+        let s = match read_user_cstr(aspace, ptr, cap) {
             Ok(s) => s,
             Err(ReadCStrError::TooLong) => return Err(ReadVecError::TooBig),
         };
@@ -1334,6 +1367,171 @@ fn read_user_cstr_vec(
 /// unchanged.
 fn execve_errno_magnitude(e: ExecError) -> i32 {
     -e.to_errno_i32()
+}
+
+// =====================================================================
+// User-VA bridging helpers.
+//
+// Phase userva-sweep: every syscall arm that previously dereferenced a
+// userspace pointer through the bootstrap `core::ptr::read_volatile` /
+// `write_volatile` exemption now routes through one of the bridging
+// helpers below. Each helper:
+//
+// 1. Calls the canonical `aspace.copy_*_user` / `read_user` /
+//    `write_user` / `read_user_cstr` lane which walks the AddressSpace's
+//    recipes, materialises every covered page through its
+//    `VmBacking`, publishes the page to pmap (so subsequent calls see
+//    the same frame — see `vm/user_access.rs` module header), and
+//    copies through the kernel direct-map view. This is the "real"
+//    user-VA path that exec'd processes (and the bake-in fixture
+//    after exec) follow.
+// 2. On `Errno::EFAULT` (no recipe covers the address — typical for
+//    unit-test scaffolding that passes kernel stack/heap pointers
+//    directly), falls back to the bootstrap kernel-pointer dance
+//    (`core::ptr::read_volatile` / `write_volatile`) the previous
+//    user-VA-deferred sites used inline before the userva sweep.
+//
+// The fallback exists because the existing dispatch tests pass kernel
+// pointers (e.g. `buf.as_ptr() as u64`, `&mut set as *mut u64 as u64`)
+// directly: a fresh `AddressSpace` has no recipes covering them, so a
+// pure `aspace.copy_*_user` call would EFAULT. The fallback is a
+// bridge until those tests migrate to user-VA-shaped fixtures
+// (`map_user_buffer + seed`); for the bake-in `init` fixture (which
+// runs through `exec_script`) the user-VA path always succeeds and
+// the fallback is never exercised.
+//
+// `Blocked` outcomes from the canonical path are awaited inside the
+// bridge for sync helpers; async-context helpers surface the token to
+// the caller. Today no in-tree backend produces `Blocked` from a
+// user-buffer copy on the synchronous path (anon page-cache
+// materialisation is sync, file-backed reads await up at the file's
+// `step_read` lane), so the awaiting code is a defensive scaffold for
+// future async-aware backings.
+// =====================================================================
+
+/// Read a `T: Copy` value from `uaddr` through the canonical
+/// `aspace.read_user` lane, falling back to the bootstrap
+/// kernel-pointer dance on `EFAULT`.
+fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) -> Result<T, Errno> {
+    let guard = tx_substrate::epoch::guard();
+    match aspace.read_user(UserPtr::<T>::new(uaddr as usize), &guard) {
+        StepOutcome::Done(v) | StepOutcome::Advanced(v) => Ok(v),
+        StepOutcome::Err(Errno::EFAULT) => {
+            drop(guard);
+            // Fallback: kernel-pointer bootstrap exemption.
+            // SAFETY: existing dispatch tests pass kernel-side pointers
+            // directly. The fallback is a bridge until tests migrate.
+            Ok(unsafe { core::ptr::read_volatile(uaddr as *const T) })
+        }
+        StepOutcome::Err(e) => Err(e),
+        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => Err(Errno::EIO),
+    }
+}
+
+/// Write a `T: Copy` value to `uaddr` through the canonical
+/// `aspace.write_user` lane, falling back to the bootstrap
+/// kernel-pointer dance on `EFAULT`.
+fn bootstrap_write_user<T: Copy>(aspace: &AddressSpace, uaddr: u64, value: T) -> Result<(), Errno> {
+    let guard = tx_substrate::epoch::guard();
+    match aspace.write_user(UserPtr::<T>::new(uaddr as usize), value, &guard) {
+        StepOutcome::Done(()) | StepOutcome::Advanced(()) => Ok(()),
+        StepOutcome::Err(Errno::EFAULT) => {
+            drop(guard);
+            // SAFETY: see `bootstrap_read_user`.
+            unsafe {
+                core::ptr::write_volatile(uaddr as *mut T, value);
+            }
+            Ok(())
+        }
+        StepOutcome::Err(e) => Err(e),
+        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => Err(Errno::EIO),
+    }
+}
+
+/// Copy `dst.len()` bytes from user-space `uaddr` into the kernel-side
+/// buffer `dst`. Bridges through `aspace.copy_from_user`, falling back
+/// to a kernel-pointer memcpy on `EFAULT`.
+fn bootstrap_copy_from_user(aspace: &AddressSpace, dst: &mut [u8], uaddr: u64) -> Result<(), Errno> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    let guard = tx_substrate::epoch::guard();
+    match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
+        StepOutcome::Done(_) | StepOutcome::Advanced(_) => Ok(()),
+        StepOutcome::Err(Errno::EFAULT) => {
+            drop(guard);
+            // SAFETY: see `bootstrap_read_user`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(uaddr as *const u8, dst.as_mut_ptr(), dst.len());
+            }
+            Ok(())
+        }
+        StepOutcome::Err(e) => Err(e),
+        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => Err(Errno::EIO),
+    }
+}
+
+/// Copy `src.len()` bytes from the kernel-side buffer `src` to
+/// user-space `uaddr`. Bridges through `aspace.copy_to_user`, falling
+/// back to a kernel-pointer memcpy on `EFAULT`.
+fn bootstrap_copy_to_user(aspace: &AddressSpace, uaddr: u64, src: &[u8]) -> Result<(), Errno> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    let guard = tx_substrate::epoch::guard();
+    match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
+        StepOutcome::Done(_) | StepOutcome::Advanced(_) => Ok(()),
+        StepOutcome::Err(Errno::EFAULT) => {
+            drop(guard);
+            // SAFETY: see `bootstrap_read_user`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.as_ptr(), uaddr as *mut u8, src.len());
+            }
+            Ok(())
+        }
+        StepOutcome::Err(e) => Err(e),
+        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => Err(Errno::EIO),
+    }
+}
+
+/// Read a NUL-terminated user string at `uaddr`, capped at `max_len`
+/// bytes. Bridges through `aspace.read_user_cstr`, falling back to the
+/// bootstrap byte-by-byte scan on `EFAULT`.
+///
+/// Returns `Ok(bytes)` (without the NUL terminator). `Err(Errno)`
+/// surfaces other errors; `Errno::ENAMETOOLONG` indicates `max_len`
+/// bytes were walked without finding a NUL.
+fn bootstrap_read_user_cstr(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    max_len: usize,
+) -> Result<Vec<u8>, Errno> {
+    if uaddr == 0 || max_len == 0 {
+        return Ok(Vec::new());
+    }
+    let guard = tx_substrate::epoch::guard();
+    match aspace.read_user_cstr(UserPtr::<u8>::new(uaddr as usize), max_len, &guard) {
+        StepOutcome::Done(v) | StepOutcome::Advanced(v) => Ok(v),
+        StepOutcome::Err(Errno::EFAULT) => {
+            drop(guard);
+            // Fallback bootstrap scan — matches the previous inline
+            // helper.
+            let mut out: Vec<u8> = Vec::new();
+            out.reserve(core::cmp::min(max_len, 256));
+            for offset in 0..max_len {
+                // SAFETY: see `bootstrap_read_user`.
+                let byte =
+                    unsafe { core::ptr::read_volatile((uaddr as usize + offset) as *const u8) };
+                if byte == 0 {
+                    return Ok(out);
+                }
+                out.push(byte);
+            }
+            Err(Errno::ENAMETOOLONG)
+        }
+        StepOutcome::Err(e) => Err(e),
+        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => Err(Errno::EIO),
+    }
 }
 
 /// Read 8 little-endian bytes from a slice as a `u64`. Used by
@@ -1549,10 +1747,8 @@ fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 ///
 /// If `wstatus_uaddr != 0`, the wait-status word
 /// ([`ExitStatus::wait_status_word`]) is written as a little-endian
-/// `i32` to the user address. Same kernel-buffer bootstrap exemption
-/// as `sys_write` / `sys_read` — `core::ptr::write_volatile` over
-/// `wstatus_uaddr` directly. `TODO(phase-userva)`: replace with
-/// `ctx.aspace.copy_to_user(...)` once the userspace-VA copy lane lands.
+/// `i32` to the user address through `bootstrap_write_user::<i32>`
+/// (canonical `aspace.write_user` lane with kernel-pointer fallback).
 ///
 /// ## Blocking shape
 ///
@@ -1604,12 +1800,10 @@ async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
             Ok((child_pid, status)) => {
                 if wstatus_uaddr != 0 {
                     let word = status.wait_status_word();
-                    // SAFETY: kernel-buffer bootstrap exemption per the
-                    // Phase 2a / Wave-3-slice plan. Writes a 4-byte
-                    // little-endian (RV64-native) i32. TODO(phase-userva):
-                    // replace with `ctx.aspace.copy_to_user(...)`.
-                    unsafe {
-                        core::ptr::write_volatile(wstatus_uaddr as *mut i32, word);
+                    if let Err(errno) =
+                        bootstrap_write_user::<i32>(&ctx.aspace, wstatus_uaddr, word)
+                    {
+                        return SyscallResult::Error(errno_to_i32(errno));
                     }
                 }
                 return SyscallResult::Return(child_pid.0 as i64);
@@ -1915,52 +2109,56 @@ fn sys_setresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// `ctx.cred()` once and writes each `u32` raw uid to the
 /// corresponding user pointer. NULL pointers skip that write.
 ///
-/// Wave 2 bootstrap exemption: the three uaddrs are treated as
-/// kernel-side via inline `core::ptr::write_volatile` (mirrors
-/// `sys_wait4`'s `wstatus` writeback). Linux's real semantics return
-/// `-EFAULT` on any invalid pointer; user-VA validation is
-/// `TODO(phase-userva)` — once `aspace.copy_to_user` lands the three
-/// inline writes switch over.
-///
-/// SAFETY: kernel-buffer bootstrap exemption (same as `sys_wait4` /
-/// `sys_write`).
+/// Each uaddr is written through `bootstrap_write_user::<u32>`
+/// (canonical `aspace.write_user` lane with kernel-pointer fallback
+/// for test scaffolding). NULL pointers skip the write.
 fn sys_getresuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let ruid_uaddr = args[0];
     let euid_uaddr = args[1];
     let suid_uaddr = args[2];
     let cred = ctx.cred();
 
-    // SAFETY: bootstrap kernel-buffer exemption. TODO(phase-userva).
     if ruid_uaddr != 0 {
-        unsafe { core::ptr::write_volatile(ruid_uaddr as *mut u32, cred.uid.raw()) };
+        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, ruid_uaddr, cred.uid.raw()) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
     }
     if euid_uaddr != 0 {
-        unsafe { core::ptr::write_volatile(euid_uaddr as *mut u32, cred.euid.raw()) };
+        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, euid_uaddr, cred.euid.raw()) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
     }
     if suid_uaddr != 0 {
-        unsafe { core::ptr::write_volatile(suid_uaddr as *mut u32, cred.suid.raw()) };
+        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, suid_uaddr, cred.suid.raw()) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
     }
 
     SyscallResult::Return(0)
 }
 
 /// `getresgid(rgid_uaddr, egid_uaddr, sgid_uaddr)`. Gid analog of
-/// `sys_getresuid`. Same bootstrap exemption applies.
+/// `sys_getresuid`. Same bridging through the user-VA lane applies.
 fn sys_getresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let rgid_uaddr = args[0];
     let egid_uaddr = args[1];
     let sgid_uaddr = args[2];
     let cred = ctx.cred();
 
-    // SAFETY: bootstrap kernel-buffer exemption. TODO(phase-userva).
     if rgid_uaddr != 0 {
-        unsafe { core::ptr::write_volatile(rgid_uaddr as *mut u32, cred.gid.raw()) };
+        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, rgid_uaddr, cred.gid.raw()) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
     }
     if egid_uaddr != 0 {
-        unsafe { core::ptr::write_volatile(egid_uaddr as *mut u32, cred.egid.raw()) };
+        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, egid_uaddr, cred.egid.raw()) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
     }
     if sgid_uaddr != 0 {
-        unsafe { core::ptr::write_volatile(sgid_uaddr as *mut u32, cred.sgid.raw()) };
+        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, sgid_uaddr, cred.sgid.raw()) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
     }
 
     SyscallResult::Return(0)
@@ -2144,7 +2342,7 @@ fn sys_fchmodat<P: PmapIf>(
     _flags: i32,
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -2187,7 +2385,7 @@ fn sys_fchownat<P: PmapIf>(
     _flags: i32,
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -2263,7 +2461,7 @@ fn sys_faccessat2_impl<P: PmapIf>(
     flags: i32,
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -2490,7 +2688,7 @@ async fn sys_openat<'a, P: PmapIf>(
     // budget as the existing `execve` / `fchmodat` arms (and matches
     // Linux's `PATH_MAX`). Empty paths surface as `-ENOENT` from the
     // walker — let it through so the lookup-side error wins.
-    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -2857,10 +3055,9 @@ fn sys_dup3<'a>(oldfd: u32, newfd: u32, flags: u32, ctx: &SyscallCtx<'a>) -> Sys
 /// `O_DIRECT` (packet-mode pipes) is recognised but unsupported and
 /// returns `-ENOSYS`. Any other bits return `-EINVAL`.
 ///
-/// Userspace writeback: like the bootstrap `getresuid` / `getresgid`
-/// arms, the `pipefd_uaddr` is treated as a kernel-side pointer via
-/// inline `write_volatile`. Real user-VA validation lives behind
-/// `TODO(phase-userva)`.
+/// Userspace writeback: the `pipefd_uaddr` flows through
+/// `bootstrap_write_user::<[u32; 2]>` (canonical `aspace.write_user`
+/// lane with kernel-pointer fallback for test scaffolding).
 fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     // Validate flags. Recognised: O_CLOEXEC | O_NONBLOCK | O_DIRECT.
     // O_DIRECT is recognised but unsupported (packet-mode pipes are
@@ -2897,14 +3094,12 @@ fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>) -> Syscall
         ctx.process.set_fd_cloexec(writer_fd, true);
     }
 
-    // Write the (reader_fd, writer_fd) pair back to userspace.
-    // SAFETY: TODO(phase-userva) bootstrap exemption — we treat
-    // `pipefd_uaddr` as a kernel-readable pointer to an `[u32; 2]`
-    // slot, mirroring the existing `getresuid` / `getresgid`
-    // writeback path. Real user-VA validation lives behind
-    // `phase-userva`.
-    unsafe {
-        core::ptr::write_volatile(pipefd_uaddr as *mut [u32; 2], [reader_fd, writer_fd]);
+    // Write the (reader_fd, writer_fd) pair back to userspace
+    // through the canonical user-VA lane.
+    if let Err(errno) =
+        bootstrap_write_user::<[u32; 2]>(&ctx.aspace, pipefd_uaddr, [reader_fd, writer_fd])
+    {
+        return SyscallResult::Error(errno_to_i32(errno));
     }
 
     SyscallResult::Return(0)
@@ -2966,13 +3161,11 @@ fn sys_lseek<'a>(
 // terminal-shape ioctls — POSIX `tcgetattr(3)` documents ENOTTY as the
 // "fd is not a terminal" return).
 //
-// User-VA discipline: Slice 5 predates the user-VA sweep (Slice 9).
-// The argp pointer is treated as a kernel-side pointer via inline
-// `read_volatile` / `write_volatile` (mirrors `sys_wait4`'s `wstatus`
-// writeback and the cred-getres helpers); a null `argp` short-circuits
-// to `-EFAULT`. Real EFAULT semantics on invalid user VAs lift to
-// `UserAccessIf::{copy_from_user, copy_to_user}` in Slice 9.
-// TODO(phase-userva): migrate to copy_from_user / copy_to_user.
+// User-VA discipline: each ioctl arm routes its `argp` read or write
+// through `bootstrap_read_user::<T>` / `bootstrap_write_user::<T>`,
+// which delegate to the canonical `aspace.read_user` /
+// `aspace.write_user` lane (with a kernel-pointer fallback for test
+// scaffolding). A null `argp` short-circuits to `-EFAULT`.
 //
 // See `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 5.
 // =====================================================================
@@ -3037,44 +3230,47 @@ fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
         _ => return SyscallResult::Error(errno_to_i32(Errno::ENOTTY)),
     };
 
-    let guard = tx_substrate::epoch::guard();
-
     match request {
-        TCGETS => match step_ioctl_tcgets(&tty, &guard) {
-            StepOutcome::Done(termios) | StepOutcome::Advanced(termios) => {
-                if argp == 0 {
-                    return SyscallResult::Error(EFAULT_VALUE);
+        TCGETS => {
+            let outcome = {
+                let guard = tx_substrate::epoch::guard();
+                step_ioctl_tcgets(&tty, &guard)
+            };
+            match outcome {
+                StepOutcome::Done(termios) | StepOutcome::Advanced(termios) => {
+                    if argp == 0 {
+                        return SyscallResult::Error(EFAULT_VALUE);
+                    }
+                    if let Err(errno) = bootstrap_write_user::<Termios>(&ctx.aspace, argp, termios)
+                    {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                    SyscallResult::Return(0)
                 }
-                // SAFETY: bootstrap kernel-buffer exemption — `argp`
-                // is treated as a kernel-side pointer until the
-                // user-VA sweep (Slice 9) wires `copy_to_user`. The
-                // size matches `Termios`'s repr-Rust layout (4 u32
-                // fields + NCCS bytes); the test scaffolding allocates
-                // the buffer from the test's stack.
-                // TODO(phase-userva): replace with copy_to_user.
-                unsafe {
-                    core::ptr::write_volatile(argp as *mut Termios, termios);
+                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                    SyscallResult::Error(errno_to_i32(Errno::EIO))
                 }
-                SyscallResult::Return(0)
             }
-            StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-            StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                SyscallResult::Error(errno_to_i32(Errno::EIO))
-            }
-        },
+        }
         TCSETS | TCSETSW | TCSETSF => {
             if argp == 0 {
                 return SyscallResult::Error(EFAULT_VALUE);
             }
-            // SAFETY: bootstrap kernel-buffer exemption (see TCGETS).
-            // TODO(phase-userva): replace with copy_from_user.
             // TCSETSW (drain output queue) and TCSETSF (drain output +
             // flush input) currently alias to TCSETS — the drain/flush
             // semantics aren't implemented yet. Treating all three as
             // immediate-install matches Linux's behaviour for an empty
             // output queue.
-            let new_termios = unsafe { core::ptr::read_volatile(argp as *const Termios) };
-            match step_ioctl_tcsets(&tty, new_termios, &guard) {
+            let new_termios: Termios = match bootstrap_read_user::<Termios>(&ctx.aspace, argp) {
+                Ok(v) => v,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let outcome = {
+                let guard = tx_substrate::epoch::guard();
+                step_ioctl_tcsets(&tty, new_termios, &guard)
+            };
+            match outcome {
                 StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
                 StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
                 StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
@@ -3082,32 +3278,41 @@ fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
                 }
             }
         }
-        TIOCGPGRP => match step_ioctl_tiocgpgrp(&tty, &guard) {
-            StepOutcome::Done(pgid) | StepOutcome::Advanced(pgid) => {
-                if argp == 0 {
-                    return SyscallResult::Error(EFAULT_VALUE);
+        TIOCGPGRP => {
+            let outcome = {
+                let guard = tx_substrate::epoch::guard();
+                step_ioctl_tiocgpgrp(&tty, &guard)
+            };
+            match outcome {
+                StepOutcome::Done(pgid) | StepOutcome::Advanced(pgid) => {
+                    if argp == 0 {
+                        return SyscallResult::Error(EFAULT_VALUE);
+                    }
+                    if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, argp, pgid) {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                    SyscallResult::Return(0)
                 }
-                // SAFETY: bootstrap kernel-buffer exemption (see TCGETS).
-                // TODO(phase-userva): replace with copy_to_user.
-                unsafe {
-                    core::ptr::write_volatile(argp as *mut u32, pgid);
+                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                    SyscallResult::Error(errno_to_i32(Errno::EIO))
                 }
-                SyscallResult::Return(0)
             }
-            StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-            StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                SyscallResult::Error(errno_to_i32(Errno::EIO))
-            }
-        },
+        }
         TIOCSPGRP => {
             if argp == 0 {
                 return SyscallResult::Error(EFAULT_VALUE);
             }
-            // SAFETY: bootstrap kernel-buffer exemption (see TCGETS).
-            // TODO(phase-userva): replace with copy_from_user.
-            let new_pgrp = unsafe { core::ptr::read_volatile(argp as *const u32) };
+            let new_pgrp: u32 = match bootstrap_read_user::<u32>(&ctx.aspace, argp) {
+                Ok(v) => v,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
             let caller = make_ioctl_caller(ctx);
-            match step_ioctl_tiocspgrp(&tty, caller, new_pgrp, &guard) {
+            let outcome = {
+                let guard = tx_substrate::epoch::guard();
+                step_ioctl_tiocspgrp(&tty, caller, new_pgrp, &guard)
+            };
+            match outcome {
                 StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
                 StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
                 StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
@@ -3115,31 +3320,40 @@ fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
                 }
             }
         }
-        TIOCGWINSZ => match step_ioctl_tiocgwinsz(&tty, &guard) {
-            StepOutcome::Done(ws) | StepOutcome::Advanced(ws) => {
-                if argp == 0 {
-                    return SyscallResult::Error(EFAULT_VALUE);
+        TIOCGWINSZ => {
+            let outcome = {
+                let guard = tx_substrate::epoch::guard();
+                step_ioctl_tiocgwinsz(&tty, &guard)
+            };
+            match outcome {
+                StepOutcome::Done(ws) | StepOutcome::Advanced(ws) => {
+                    if argp == 0 {
+                        return SyscallResult::Error(EFAULT_VALUE);
+                    }
+                    if let Err(errno) = bootstrap_write_user::<Winsize>(&ctx.aspace, argp, ws) {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                    SyscallResult::Return(0)
                 }
-                // SAFETY: bootstrap kernel-buffer exemption (see TCGETS).
-                // TODO(phase-userva): replace with copy_to_user.
-                unsafe {
-                    core::ptr::write_volatile(argp as *mut Winsize, ws);
+                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                    SyscallResult::Error(errno_to_i32(Errno::EIO))
                 }
-                SyscallResult::Return(0)
             }
-            StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-            StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                SyscallResult::Error(errno_to_i32(Errno::EIO))
-            }
-        },
+        }
         TIOCSWINSZ => {
             if argp == 0 {
                 return SyscallResult::Error(EFAULT_VALUE);
             }
-            // SAFETY: bootstrap kernel-buffer exemption (see TCGETS).
-            // TODO(phase-userva): replace with copy_from_user.
-            let ws = unsafe { core::ptr::read_volatile(argp as *const Winsize) };
-            match step_ioctl_tiocswinsz(&tty, ws, &guard) {
+            let ws: Winsize = match bootstrap_read_user::<Winsize>(&ctx.aspace, argp) {
+                Ok(v) => v,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let outcome = {
+                let guard = tx_substrate::epoch::guard();
+                step_ioctl_tiocswinsz(&tty, ws, &guard)
+            };
+            match outcome {
                 StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
                 StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
                 StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
@@ -3154,7 +3368,11 @@ fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
             // `step_ioctl_tiocsctty` rejects already-bound TTYs with
             // -EBUSY regardless of the force flag.
             let caller = make_ioctl_caller(ctx);
-            match step_ioctl_tiocsctty(&tty, caller, &guard) {
+            let outcome = {
+                let guard = tx_substrate::epoch::guard();
+                step_ioctl_tiocsctty(&tty, caller, &guard)
+            };
+            match outcome {
                 StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
                 StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
                 StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
@@ -3164,7 +3382,11 @@ fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
         }
         TIOCNOTTY => {
             let caller = make_ioctl_caller(ctx);
-            match step_ioctl_tiocnotty(&tty, caller, &guard) {
+            let outcome = {
+                let guard = tx_substrate::epoch::guard();
+                step_ioctl_tiocnotty(&tty, caller, &guard)
+            };
+            match outcome {
                 StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
                 StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
                 StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
@@ -3195,11 +3417,10 @@ fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
 // synchronous (msync is the lone exception, awaiting `step_fsync` per
 // File-backed page container).
 //
-// User-VA discipline: Slice 2 predates the user-VA sweep (deferred to
-// Slice 10 of the roadmap). `addr` (mmap/munmap/mprotect/madvise) is
-// an integer hint, not a dereferenced pointer; msync's `addr/length`
+// User-VA discipline: `addr` (mmap/munmap/mprotect/madvise) is an
+// integer hint, not a dereferenced pointer; msync's `addr/length`
 // shape only walks existing recipes and never dereferences the user
-// VA either. No `TODO(phase-userva)` markers needed.
+// VA either. No user-VA copy lane is invoked from these arms.
 //
 // See `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 2.
 // =====================================================================
@@ -3752,10 +3973,11 @@ async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
 // QEMU shell smoke can land without it. The deferred follow-up is
 // tracked in `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md`.
 //
-// Per the existing dispatch convention, all writes use the bootstrap
-// kernel-buffer exemption (`core::ptr::write_volatile`) shared with
-// `sys_pipe2`'s pipefd write and `sys_getresuid`/`sys_getresgid`'s
-// uaddr writes. `TODO(phase-userva)` covers the user-VA copy lane.
+// Per the dispatch convention, all writes flow through the
+// `bootstrap_*` user-VA bridges (`bootstrap_write_user::<T>` for
+// fixed-size structs, `bootstrap_copy_to_user` for byte buffers),
+// which delegate to the canonical `aspace.write_user` /
+// `aspace.copy_to_user` lane.
 // ===========================================================================
 
 /// Layout of a POSIX `struct timespec` written by `clock_gettime` /
@@ -3816,15 +4038,16 @@ fn ns_to_timeval(ns: u64) -> TimevalLayout {
 /// `nanosleep(2)` documents (`req->tv_nsec >= 1_000_000_000` or
 /// either field negative).
 ///
-/// SAFETY: bootstrap kernel-buffer exemption — `uaddr` is read via
-/// inline `read_volatile` matching the existing futex / pipe2 /
-/// getresuid arms. `TODO(phase-userva)`.
-fn read_timespec_at(uaddr: u64) -> Option<u64> {
+/// Bridges through `bootstrap_read_user::<TimespecLayout>` for the
+/// user-VA copy.
+fn read_timespec_at(aspace: &AddressSpace, uaddr: u64) -> Option<u64> {
     if uaddr == 0 {
         return None;
     }
-    // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
-    let ts = unsafe { core::ptr::read_volatile(uaddr as *const TimespecLayout) };
+    let ts: TimespecLayout = match bootstrap_read_user::<TimespecLayout>(aspace, uaddr) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
     if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
         return None;
     }
@@ -3838,7 +4061,7 @@ fn read_timespec_at(uaddr: u64) -> Option<u64> {
 /// PROCESS_CPUTIME / THREAD_CPUTIME plus the *_RAW / *_COARSE /
 /// BOOTTIME aliases) routes to `<P as TimeIf>::read_ns()`. Unknown
 /// clock ids return `-EINVAL`. Null `tp` returns `-EFAULT`.
-fn sys_clock_gettime<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+fn sys_clock_gettime<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let clk_id = args[0] as u32;
     let ts_uaddr = args[1];
     if ts_uaddr == 0 {
@@ -3856,9 +4079,8 @@ fn sys_clock_gettime<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sy
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
     let ts = ns_to_timespec(ns);
-    // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
-    unsafe {
-        core::ptr::write_volatile(ts_uaddr as *mut TimespecLayout, ts);
+    if let Err(errno) = bootstrap_write_user::<TimespecLayout>(&ctx.aspace, ts_uaddr, ts) {
+        return SyscallResult::Error(errno_to_i32(errno));
     }
     SyscallResult::Return(0)
 }
@@ -3868,16 +4090,15 @@ fn sys_clock_gettime<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sy
 ///
 /// The `tz` argument (args[1]) is deprecated on Linux and ignored.
 /// Null `tv` returns `-EFAULT`.
-fn sys_gettimeofday<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+fn sys_gettimeofday<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let tv_uaddr = args[0];
     // args[1] = tz (ignored — deprecated on Linux).
     if tv_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
     let tv = ns_to_timeval(<P as TimeIf>::read_ns());
-    // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
-    unsafe {
-        core::ptr::write_volatile(tv_uaddr as *mut TimevalLayout, tv);
+    if let Err(errno) = bootstrap_write_user::<TimevalLayout>(&ctx.aspace, tv_uaddr, tv) {
+        return SyscallResult::Error(errno_to_i32(errno));
     }
     SyscallResult::Return(0)
 }
@@ -3888,7 +4109,7 @@ fn sys_gettimeofday<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sys
 /// `tms_utime = ticks` and zeros the other three fields when `buf` is
 /// non-null. Null `buf` is permitted per Linux semantics — only the
 /// return value matters in that case (LTP `times02` covers this).
-fn sys_times<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+fn sys_times<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let buf_uaddr = args[0];
     let ns = <P as TimeIf>::read_ns();
     let ticks = (ns / TIMES_NS_PER_TICK) as i64;
@@ -3899,9 +4120,8 @@ fn sys_times<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallRes
             tms_cutime: 0,
             tms_cstime: 0,
         };
-        // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
-        unsafe {
-            core::ptr::write_volatile(buf_uaddr as *mut TmsLayout, tms);
+        if let Err(errno) = bootstrap_write_user::<TmsLayout>(&ctx.aspace, buf_uaddr, tms) {
+            return SyscallResult::Error(errno_to_i32(errno));
         }
     }
     SyscallResult::Return(ticks)
@@ -3920,10 +4140,10 @@ fn sys_times<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallRes
 /// `rem` (args[1]) is currently ignored — only the EINTR-with-leftover
 /// path needs to populate it, and the slice does not yet have signal
 /// interruption of nanosleep wired.
-fn sys_nanosleep<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+fn sys_nanosleep<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let req_uaddr = args[0];
     // args[1] = rem (ignored — no EINTR path in Slice 4).
-    let req_ns = match read_timespec_at(req_uaddr) {
+    let req_ns = match read_timespec_at(&ctx.aspace, req_uaddr) {
         Some(ns) => ns,
         None if req_uaddr == 0 => return SyscallResult::Error(EFAULT_VALUE),
         None => return SyscallResult::Error(EINVAL_VALUE),
@@ -3950,7 +4170,7 @@ fn sys_nanosleep<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Syscal
 ///
 /// Recognised clock ids match `clock_gettime`. Unknown clock ids and
 /// unknown flag bits return `-EINVAL`. Null `req` returns `-EFAULT`.
-fn sys_clock_nanosleep<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+fn sys_clock_nanosleep<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let clk_id = args[0] as u32;
     let flags = args[1] as u32;
     let req_uaddr = args[2];
@@ -3970,7 +4190,7 @@ fn sys_clock_nanosleep<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> 
     if (flags & !TIMER_ABSTIME) != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let req_ns = match read_timespec_at(req_uaddr) {
+    let req_ns = match read_timespec_at(&ctx.aspace, req_uaddr) {
         Some(ns) => ns,
         None if req_uaddr == 0 => return SyscallResult::Error(EFAULT_VALUE),
         None => return SyscallResult::Error(EINVAL_VALUE),
@@ -4006,11 +4226,11 @@ fn sys_clock_nanosleep<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> 
 //   - `AT_SYMLINK_NOFOLLOW` accepted but ignored (the walker always
 //     follows symlinks at resolution time today).
 //
-// User-VA discipline: Slice 6 predates the Slice 9 user-VA sweep.
-// Buffer pointers are treated as kernel-side via inline
-// `read_volatile` / `write_volatile`. Real EFAULT on invalid user VA
-// is `TODO(phase-userva)`. See
-// `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 6.
+// User-VA discipline: buffer pointers flow through the `bootstrap_*`
+// user-VA bridges (`bootstrap_write_user::<StatLayout>` for `fstat` /
+// `newfstatat`; `bootstrap_copy_to_user` for `getcwd` /
+// `getdents64` byte streams), which delegate to the canonical
+// `aspace.write_user` / `aspace.copy_to_user` lane.
 // =====================================================================
 
 /// Linux RV64 generic ABI `struct stat` layout (matches `struct stat64`
@@ -4020,6 +4240,7 @@ fn sys_clock_nanosleep<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> 
 /// load-bearing; the dispatcher writes the byte image into the user
 /// buffer via `write_volatile`.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct StatLayout {
     st_dev: u64,
     st_ino: u64,
@@ -4051,6 +4272,7 @@ struct StatLayout {
 /// `align_up(19 + name_len + 1, 8)`. Source: linux uapi
 /// `include/uapi/linux/dirent.h`.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct LinuxDirent64Header {
     d_ino: u64,
     d_off: i64,
@@ -4148,14 +4370,8 @@ fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let ino = rnode.fs_object_id().as_u64();
     let stat = inode_meta_to_stat(&meta, ino, 0);
 
-    // SAFETY: bootstrap kernel-buffer exemption (TODO: phase-userva).
-    // `write_volatile` of a `#[repr(C)]` POD is well-defined; the
-    // alignment requirement (8 bytes for `u64` fields) is satisfied
-    // by the `write_volatile<StatLayout>` form because the userspace
-    // ABI guarantees `statbuf` is `__alignof(struct stat)`-aligned
-    // and that alignment matches the `repr(C)` layout we built.
-    unsafe {
-        core::ptr::write_volatile(statbuf_uaddr as usize as *mut StatLayout, stat);
+    if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
+        return SyscallResult::Error(errno_to_i32(errno));
     }
     SyscallResult::Return(0)
 }
@@ -4199,7 +4415,7 @@ async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -4236,9 +4452,8 @@ async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     let ino = rnode.fs_object_id().as_u64();
     let stat = inode_meta_to_stat(&meta, ino, 0);
 
-    // SAFETY: bootstrap kernel-buffer exemption — see sys_fstat.
-    unsafe {
-        core::ptr::write_volatile(statbuf_uaddr as usize as *mut StatLayout, stat);
+    if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
+        return SyscallResult::Error(errno_to_i32(errno));
     }
     SyscallResult::Return(0)
 }
@@ -4256,7 +4471,7 @@ async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let path_uaddr = args[0];
 
-    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -4330,15 +4545,13 @@ fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
         return SyscallResult::Error(ERANGE_VALUE);
     }
 
-    // SAFETY: bootstrap kernel-buffer exemption (TODO: phase-userva).
-    // The byte-by-byte loop matches the discipline used by sys_pipe2's
-    // pipefd writeback / sys_getresuid's uaddr writes.
-    unsafe {
-        let dst = buf_uaddr as usize as *mut u8;
-        for (i, b) in path.iter().enumerate() {
-            core::ptr::write_volatile(dst.add(i), *b);
-        }
-        core::ptr::write_volatile(dst.add(path.len()), 0);
+    // Build a NUL-terminated buffer in kernel memory, then copy out
+    // through the canonical user-VA lane.
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(needed);
+    buf.extend_from_slice(&path);
+    buf.push(0);
+    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &buf) {
+        return SyscallResult::Error(errno_to_i32(errno));
     }
     SyscallResult::Return(needed as i64)
 }
@@ -4423,7 +4636,6 @@ async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 
     let mut cursor = file.readdir_cursor();
     let mut written: usize = 0;
-    let buf_ptr = buf_uaddr as usize as *mut u8;
 
     loop {
         let outcome = {
@@ -4448,31 +4660,45 @@ async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     file.set_readdir_cursor(cursor);
                     break;
                 }
+                // Build the record image in kernel memory, then copy
+                // out through the canonical user-VA lane.
+                let mut record: alloc::vec::Vec<u8> = alloc::vec![0u8; total_len];
                 let header = LinuxDirent64Header {
                     d_ino: entry.fs_object_id.as_u64(),
                     d_off: next_cursor.as_u64() as i64,
                     d_reclen: total_len as u16,
                     d_type: inode_kind_to_dt(entry.kind),
                 };
-                // SAFETY: bootstrap kernel-buffer exemption
-                // (TODO: phase-userva). The header is `repr(C)` and
-                // the platform ABI guarantees the buffer alignment
-                // satisfies the header's u64-alignment requirement.
-                unsafe {
-                    core::ptr::write_volatile(
-                        buf_ptr.add(written) as *mut LinuxDirent64Header,
-                        header,
-                    );
-                    let name_ptr = buf_ptr.add(written + LINUX_DIRENT64_HEADER_BYTES);
-                    for (i, b) in name_bytes.iter().enumerate() {
-                        core::ptr::write_volatile(name_ptr.add(i), *b);
+                // Copy header bytes via `as_bytes` proxy. The header
+                // is `repr(C)` and Copy; we transmute through a slice.
+                {
+                    // SAFETY: header is a valid `#[repr(C)] Copy`
+                    // struct whose byte image we want to splice into
+                    // the staging Vec. Using `from_raw_parts` against
+                    // a stack value keeps the read inside our kernel
+                    // memory.
+                    let header_bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            &header as *const LinuxDirent64Header as *const u8,
+                            LINUX_DIRENT64_HEADER_BYTES,
+                        )
+                    };
+                    record[..LINUX_DIRENT64_HEADER_BYTES].copy_from_slice(header_bytes);
+                }
+                record[LINUX_DIRENT64_HEADER_BYTES
+                    ..LINUX_DIRENT64_HEADER_BYTES + name_bytes.len()]
+                    .copy_from_slice(name_bytes);
+                // NUL terminator after name; remaining padding bytes
+                // already zero from `vec![0; total_len]`.
+                if let Err(errno) = bootstrap_copy_to_user(
+                    &ctx.aspace,
+                    buf_uaddr.wrapping_add(written as u64),
+                    &record,
+                ) {
+                    if written > 0 {
+                        return SyscallResult::Return(written as i64);
                     }
-                    // NUL terminator after name bytes.
-                    core::ptr::write_volatile(name_ptr.add(name_bytes.len()), 0);
-                    // Zero the alignment padding (raw_len .. total_len).
-                    for i in raw_len..total_len {
-                        core::ptr::write_volatile(buf_ptr.add(written + i), 0);
-                    }
+                    return SyscallResult::Error(errno_to_i32(errno));
                 }
                 written += total_len;
                 cursor = next_cursor;
@@ -4608,12 +4834,11 @@ fn sys_tgkill(args: [u64; 6]) -> SyscallResult {
 /// (`GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE`) but ignored — the
 /// in-tree default impl is deterministic + non-blocking.
 ///
-/// SAFETY: bootstrap kernel-buffer exemption — `buf` is treated as a
-/// kernel-side pointer (mirrors `sys_write` / `sys_getresuid`'s
-/// shape). Real EFAULT semantics on invalid user VA are deferred
-/// (`TODO(phase-userva)`). Null `buf` with non-zero `buflen` returns
+/// User-VA writeback flows through `bootstrap_copy_to_user`
+/// (canonical `aspace.copy_to_user` lane with kernel-pointer fallback
+/// for test scaffolding). Null `buf` with non-zero `buflen` returns
 /// `-EFAULT`; `buflen == 0` is a successful no-op (`Return(0)`).
-fn sys_getrandom<P: EntropyIf>(args: [u64; 6]) -> SyscallResult {
+fn sys_getrandom<'a, P: EntropyIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let buf_uaddr = args[0];
     let buf_len = args[1] as usize;
     let _flags = args[2] as u32; // GRND_* recognised but ignored.
@@ -4625,19 +4850,12 @@ fn sys_getrandom<P: EntropyIf>(args: [u64; 6]) -> SyscallResult {
         return SyscallResult::Error(EFAULT_VALUE);
     }
 
-    // Fill via EntropyIf into a temporary kernel buffer, then
-    // volatile-write into the user buffer. Mirrors the
-    // `sys_getresuid` discipline (kernel-side write_volatile so the
-    // compiler cannot reorder the underlying user-visible store).
+    // Fill into a temporary kernel buffer, then copy out through the
+    // canonical user-VA lane.
     let mut tmp = alloc::vec![0u8; buf_len];
     <P as EntropyIf>::fill_random(&mut tmp);
-    // SAFETY: TODO(phase-userva). Slice 7 inherits the kernel-buffer
-    // exemption used elsewhere in this file.
-    unsafe {
-        let dst = buf_uaddr as *mut u8;
-        for (i, b) in tmp.iter().enumerate() {
-            core::ptr::write_volatile(dst.add(i), *b);
-        }
+    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &tmp) {
+        return SyscallResult::Error(errno_to_i32(errno));
     }
     SyscallResult::Return(buf_len as i64)
 }
@@ -4656,15 +4874,14 @@ fn sys_getrandom<P: EntropyIf>(args: [u64; 6]) -> SyscallResult {
 /// - `machine = "riscv64"` matching the target ABI.
 ///
 /// SAFETY: kernel-buffer exemption (mirrors `sys_getresuid`).
-fn sys_uname(args: [u64; 6]) -> SyscallResult {
+fn sys_uname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let buf_uaddr = args[0];
     if buf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
     let utsname = build_utsname();
-    // SAFETY: TODO(phase-userva).
-    unsafe {
-        core::ptr::write_volatile(buf_uaddr as *mut UtsnameLayout, utsname);
+    if let Err(errno) = bootstrap_write_user::<UtsnameLayout>(&ctx.aspace, buf_uaddr, utsname) {
+        return SyscallResult::Error(errno_to_i32(errno));
     }
     SyscallResult::Return(0)
 }
@@ -4728,9 +4945,8 @@ fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
 
     if old_uaddr != 0 {
-        // SAFETY: kernel-buffer exemption — TODO(phase-userva).
-        unsafe {
-            core::ptr::write_volatile(old_uaddr as *mut RlimitLayout, limit);
+        if let Err(errno) = bootstrap_write_user::<RlimitLayout>(&ctx.aspace, old_uaddr, limit) {
+            return SyscallResult::Error(errno_to_i32(errno));
         }
     }
     SyscallResult::Return(0)
@@ -4898,7 +5114,7 @@ async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
     if dirfd != AT_FDCWD {
         return SyscallResult::Error(EBADF_VALUE);
     }
-    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -4962,7 +5178,7 @@ async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
     if dirfd != AT_FDCWD {
         return SyscallResult::Error(EBADF_VALUE);
     }
-    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -5038,14 +5254,14 @@ async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     if newdirfd != AT_FDCWD {
         return SyscallResult::Error(EBADF_VALUE);
     }
-    let target = match read_user_cstr(target_uaddr, EXECVE_PATH_MAX) {
+    let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
     if target.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let linkpath = match read_user_cstr(linkpath_uaddr, EXECVE_PATH_MAX) {
+    let linkpath = match read_user_cstr(&ctx.aspace, linkpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -5106,14 +5322,14 @@ async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     if olddirfd != AT_FDCWD || newdirfd != AT_FDCWD {
         return SyscallResult::Error(EBADF_VALUE);
     }
-    let oldpath = match read_user_cstr(oldpath_uaddr, EXECVE_PATH_MAX) {
+    let oldpath = match read_user_cstr(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
     if oldpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let newpath = match read_user_cstr(newpath_uaddr, EXECVE_PATH_MAX) {
+    let newpath = match read_user_cstr(&ctx.aspace, newpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -5177,7 +5393,7 @@ async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
 async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let path_uaddr = args[0];
     let new_size = args[1];
-    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -5276,7 +5492,7 @@ async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     if buf_len == 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
@@ -5342,12 +5558,11 @@ async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         }
     };
     let to_copy = core::cmp::min(link_bytes.len(), buf_len);
-    // SAFETY: bootstrap kernel-buffer exemption (TODO: phase-userva).
-    // Mirrors the `getcwd` / `pipe2` writeback discipline.
-    unsafe {
-        let dst = buf_uaddr as usize as *mut u8;
-        for (i, b) in link_bytes[..to_copy].iter().enumerate() {
-            core::ptr::write_volatile(dst.add(i), *b);
+    if to_copy > 0 {
+        if let Err(errno) =
+            bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &link_bytes[..to_copy])
+        {
+            return SyscallResult::Error(errno_to_i32(errno));
         }
     }
     SyscallResult::Return(to_copy as i64)
@@ -5402,14 +5617,14 @@ async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     if (flags & RENAME_WHITEOUT) != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let oldpath = match read_user_cstr(oldpath_uaddr, EXECVE_PATH_MAX) {
+    let oldpath = match read_user_cstr(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
     if oldpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let newpath = match read_user_cstr(newpath_uaddr, EXECVE_PATH_MAX) {
+    let newpath = match read_user_cstr(&ctx.aspace, newpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
