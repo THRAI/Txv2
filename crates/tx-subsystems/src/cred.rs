@@ -38,6 +38,7 @@ use tx_substrate::zone::Cap;
 use crate::execution::Errno;
 use crate::process::structure::{ProcessIdentity, TargetProcCred};
 use crate::signal::Signum;
+use crate::vfs::structure::{S_ISGID, S_ISUID};
 
 /// POSIX user identifier. `Uid::ROOT` (0) carries privilege.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
@@ -483,6 +484,113 @@ pub fn step_setregid(
     CredChange::Replaced { prev, new }
 }
 
+// ----- Exec-time setuid/setgid recompute -----
+
+/// Outcome of [`step_apply_suid_for_exec`].
+///
+/// Surfaces the post-recompute facts the exec script needs at Phase 5
+/// (for the auxv `AT_SECURE` slot) and the pre-recompute snapshot a
+/// caller can use to roll back if a later pre-PoNR phase fails.
+///
+/// Cites: `txdoc:EXEC-3-3-CRED-AUTHORIZES-EXECUTE-COMPUTES-NEW-CREDENTIALS`
+/// and `txdoc:EXEC-12-3-INSTALL-NEW-CREDENTIAL`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecCredOutcome {
+    /// `true` iff the binary's `S_ISUID` bit triggered an effective-uid
+    /// change, **or** the binary's `S_ISGID` bit (in the presence of a
+    /// group-X bit) triggered an effective-gid change. Maps to
+    /// `AT_SECURE = 1` in the auxv table when `true`. Per Q5
+    /// (DECIDED 2026-05-06): short-form rule — the slice does not yet
+    /// model file capabilities or `nosuid` mounts, so the effective-id
+    /// delta is the only signal.
+    pub at_secure: bool,
+    /// Snapshot of the cred BEFORE the recompute. Callers may use this
+    /// to roll back via `step_setresuid` / `step_setresgid` if a later
+    /// pre-PoNR phase fails. Production exec_script does not roll back
+    /// (Linux's exec failure modes between Phase 3.5 and Phase 6 leave
+    /// the new cred installed; see the slice plan's risk #5), but
+    /// tests and future stricter ordering choices may.
+    pub previous_cred: Cred,
+}
+
+/// Apply the binary's `S_ISUID` / `S_ISGID` mode bits to `target`'s
+/// effective and saved-set IDs at exec time. Per Linux semantics:
+///
+/// - If `file_mode & S_ISUID` is set: `cred.euid := file_uid` and
+///   `cred.suid := cred.euid` (post-recompute saved-set tracks the new
+///   effective uid).
+/// - If `file_mode & S_ISGID` is set **AND** the binary has a group-X
+///   bit (`S_IXGRP = 0o010`) set: `cred.egid := file_gid` and
+///   `cred.sgid := cred.egid`. Linux's quirk: `S_ISGID` without
+///   group-X means mandatory locking, not setgid; the slice honours
+///   only the standard meaning.
+/// - The real `cred.uid` / `cred.gid` are NEVER changed at exec time
+///   (Linux preserves them so `getuid()` returns the calling user's
+///   real id even when running a setuid binary).
+/// - `cred.effective_caps` / `cred.permitted_caps` are NOT modified —
+///   the slice does not yet model file capabilities (`xattr`-driven
+///   `CAP_FILE_CAP_*` discipline lands in a future capabilities slice).
+///
+/// Returns [`ExecCredOutcome`] carrying the `at_secure` flag (per the
+/// short-form rule documented on the field) and the pre-recompute cred
+/// snapshot. Returns `None` if `target` is a zombie (no payload — cred
+/// unobservable); callers reaching this branch from inside `exec_script`
+/// have already opened the binary on the caller's behalf, so the
+/// process is alive by definition and `None` is purely defensive.
+///
+/// Infallible at runtime under normal conditions. The cred mutation is
+/// a single lock acquisition + bitwise update + fence; the operation
+/// completes before any post-Phase-3.5 fallible call (Phase 4
+/// `build_aspace`, Phase 5 stack-populate). The caller is responsible
+/// for any rollback if a later pre-PoNR phase fails (`previous_cred`
+/// in the outcome supports this).
+///
+/// Cites: `txdoc:EXEC-3-3-CRED-AUTHORIZES-EXECUTE-COMPUTES-NEW-CREDENTIALS`,
+/// `txdoc:EXEC-12-3-INSTALL-NEW-CREDENTIAL`,
+/// `txdoc:EXEC-12-PHASE-7-INFALLIBLE-POST-SWAP-COMMITS`.
+pub fn step_apply_suid_for_exec(
+    target: &Cap<ProcessIdentity>,
+    file_uid: Uid,
+    file_gid: Gid,
+    file_mode: u16,
+) -> Option<ExecCredOutcome> {
+    let payload_guard = target.payload.lock();
+    let payload = payload_guard.as_ref()?;
+    let mut cred_guard = payload.cred.lock();
+    let prev = *cred_guard;
+    let mut new = prev;
+
+    let setuid = (file_mode & S_ISUID) != 0;
+    // Linux's setgid-on-exec rule honours `S_ISGID` only when at least
+    // one of the group-X bits is also set; `S_ISGID` without group-X
+    // means mandatory locking on Linux file systems that support it.
+    // For exec-time cred recompute the standard meaning is the only
+    // one in scope.
+    let setgid = (file_mode & S_ISGID) != 0 && (file_mode & 0o010) != 0;
+
+    if setuid {
+        new.euid = file_uid;
+        // Saved-set tracks the new effective uid post-exec.
+        new.suid = new.euid;
+    }
+    if setgid {
+        new.egid = file_gid;
+        new.sgid = new.egid;
+    }
+
+    let at_secure = (setuid && new.euid != prev.euid) || (setgid && new.egid != prev.egid);
+
+    *cred_guard = new;
+    drop(cred_guard);
+    drop(payload_guard);
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    Some(ExecCredOutcome {
+        at_secure,
+        previous_cred: prev,
+    })
+}
+
 // ----- Authorization checks -----
 
 /// Zero-sized provenance witness produced by [`require_signal_send`].
@@ -570,6 +678,60 @@ pub(crate) fn clear_caps_for_test(target: &Cap<ProcessIdentity>) {
     let mut cred_guard = payload.cred.lock();
     cred_guard.effective_caps = CapabilitySet::EMPTY;
     cred_guard.permitted_caps = CapabilitySet::EMPTY;
+}
+
+/// Test-only: install the given `caps` as both `effective_caps` and
+/// `permitted_caps` on a process. Used by tx-shims' DAC + setuid
+/// slice tests (Wave 4) to set up a non-root caller carrying
+/// **just** `CAP_DAC_OVERRIDE` (or some other narrow cap) without
+/// going through a file-cap exec or `prctl` flow that the slice
+/// doesn't ship.
+///
+/// Hidden behind `cfg(any(test, feature = "test-support"))` so it
+/// never reaches release builds; re-exported through
+/// `crate::cross_crate_test_support` for cross-crate consumers.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn install_caps_for_test(target: &Cap<ProcessIdentity>, caps: CapabilitySet) {
+    let payload_guard = target.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return;
+    };
+    let mut cred_guard = payload.cred.lock();
+    cred_guard.effective_caps = caps;
+    cred_guard.permitted_caps = caps;
+}
+
+/// Test-only: overwrite the (uid, gid, euid, egid, suid, sgid)
+/// fields on a process's credential. Used by tx-shims' DAC + setuid
+/// slice tests (Wave 4) to set up the AT_EACCESS test where the
+/// caller's **real** uid differs from its **effective** uid (a state
+/// the shipping `step_set*` family cannot assemble in one shot
+/// without an unrelated chain of calls).
+///
+/// Hidden behind `cfg(any(test, feature = "test-support"))` so it
+/// never reaches release builds; re-exported through
+/// `crate::cross_crate_test_support` for cross-crate consumers.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn set_cred_ids_for_test(
+    target: &Cap<ProcessIdentity>,
+    uid: u32,
+    euid: u32,
+    suid: u32,
+    gid: u32,
+    egid: u32,
+    sgid: u32,
+) {
+    let payload_guard = target.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return;
+    };
+    let mut cred_guard = payload.cred.lock();
+    cred_guard.uid = Uid(uid);
+    cred_guard.euid = Uid(euid);
+    cred_guard.suid = Uid(suid);
+    cred_guard.gid = Gid(gid);
+    cred_guard.egid = Gid(egid);
+    cred_guard.sgid = Gid(sgid);
 }
 
 #[cfg(test)]

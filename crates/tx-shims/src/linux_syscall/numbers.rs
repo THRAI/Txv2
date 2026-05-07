@@ -251,3 +251,76 @@ pub const NR_GETGID: u64 = 176;
 /// `getegid()`. Linux RV64 generic ABI `__NR_getegid = 177`. Reads
 /// `cred.egid`. LTP cluster: `getegid01..02`.
 pub const NR_GETEGID: u64 = 177;
+
+// ---------------------------------------------------------------------
+// Wave 4 Part 4 of the DAC + setuid slice — file-mode syscall arms
+// (`fchmodat`, `fchownat`, `faccessat`, `faccessat2`). Each wraps the
+// `FsOps::step_chmod` / `step_chown` trait method Wave 3 Part 2 landed
+// (tmpfs has the real impl; devfs returns EROFS) plus a walker-side
+// `access(2)` predicate over the inode meta. Only the `AT_FDCWD`
+// dirfd shape is supported in this slice — real dirfd-relative
+// resolution requires directory file descriptors which the slice's
+// fd table does not yet carry.
+//
+// See `docs/progress/plans/2026-05-06-dac-and-setuid.md` Part 4 and
+// `txdoc:VFS-CHECKS-PERMISSIONS-1`.
+// ---------------------------------------------------------------------
+
+/// `faccessat(dirfd, path, mode)`. Linux RV64 generic ABI
+/// `__NR_faccessat = 48`. POSIX `access(2)` semantics: the requested
+/// permission bits in `mode` are checked against the inode using the
+/// caller's **real** uid/gid (not effective), unless paired with
+/// `AT_EACCESS` via `faccessat2`. LTP cluster: `access01..04`,
+/// `faccessat01..02`.
+pub const NR_FACCESSAT: u64 = 48;
+/// `fchmodat(dirfd, path, mode, flags)`. Linux RV64 generic ABI
+/// `__NR_fchmodat = 53`. Wraps `FsOps::step_chmod` (Wave 3 Part 2).
+/// `flags` (`AT_SYMLINK_NOFOLLOW`) is accepted but ignored — the slice
+/// doesn't follow symlinks at chmod time anyway. LTP cluster:
+/// `fchmodat01..02`.
+pub const NR_FCHMODAT: u64 = 53;
+/// `fchownat(dirfd, path, uid, gid, flags)`. Linux RV64 generic ABI
+/// `__NR_fchownat = 54`. Wraps `FsOps::step_chown` (Wave 3 Part 2).
+/// Each of `uid` / `gid` decodes the `(u32) -1 == u32::MAX` "leave
+/// unchanged" sentinel to `Option::None` (same convention as
+/// `setre{u,g}id` / `setres{u,g}id`). LTP cluster: `fchownat01..02`.
+pub const NR_FCHOWNAT: u64 = 54;
+/// `faccessat2(dirfd, path, mode, flags)`. Linux RV64 generic ABI
+/// `__NR_faccessat2 = 439`. Same as `faccessat` plus the `flags`
+/// argument — `AT_EACCESS` switches the check from real uid/gid to
+/// effective uid/gid. LTP cluster: `faccessat201..03`.
+pub const NR_FACCESSAT2: u64 = 439;
+
+/// `AT_FDCWD = -100` cast to i32. Kernel-side sentinel for "interpret
+/// `path` relative to the caller's cwd"; musl passes this as the first
+/// arg to `fchmodat` / `fchownat` / `faccessat` / `faccessat2` when the
+/// caller wants the cwd-relative shape (`chmod` / `chown` / `access`).
+pub const AT_FDCWD: i32 = -100;
+
+/// `access(2)` mode bits — passed through `faccessat` / `faccessat2`'s
+/// `mode` argument.
+///
+/// `F_OK = 0` is the existence-only check; the syscall arm short-
+/// circuits to `Return(0)` after path resolution succeeds (no
+/// permission-bit check). `R_OK` / `W_OK` / `X_OK` correspond to the
+/// POSIX read / write / execute permission checks; the syscall arm
+/// translates them to the matching octal triplet bits (`0o4` / `0o2`
+/// / `0o1`).
+pub const F_OK: i32 = 0;
+pub const R_OK: i32 = 4;
+pub const W_OK: i32 = 2;
+pub const X_OK: i32 = 1;
+
+/// `AT_EACCESS = 0x200` flag bit (4th arg of `faccessat2`). When set,
+/// the access check uses the caller's **effective** uid/gid; when
+/// clear (the POSIX `access(2)` default) the check uses the **real**
+/// uid/gid. Linux's `faccessat(2)` (no flags) is fixed to the real-id
+/// path; only `faccessat2` exposes this knob.
+pub const AT_EACCESS: i32 = 0x200;
+/// `AT_SYMLINK_NOFOLLOW = 0x100` flag bit (4th arg of `fchmodat` /
+/// `fchownat` / `faccessat2`). The slice accepts this bit silently —
+/// chmod/chown don't follow symlinks anyway in the current tmpfs
+/// surface, and the walker's symlink budget already guards against
+/// cycles at resolution time. Plumbing the bit through the walker
+/// is `TODO(phase-symlink-flag)`.
+pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;

@@ -45,6 +45,7 @@ use alloc::vec::Vec;
 
 use tx_hal::{PmapIf, UserTrapContext};
 use tx_substrate::zone::Cap;
+use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
 use tx_subsystems::execution::{Errno, StepOutcome};
 use tx_subsystems::page_backed::{read_exact_at, PageContainer};
 use tx_subsystems::process::{
@@ -52,7 +53,7 @@ use tx_subsystems::process::{
     ProcessIdentity,
 };
 use tx_subsystems::thread_runtime::ThreadIdentity;
-use tx_subsystems::vfs::structure::{Credential, OpenFileFlags, RNodeBacking};
+use tx_subsystems::vfs::structure::{Credential, InodeMeta, OpenFileFlags, RNodeBacking};
 use tx_subsystems::vfs::walker::step_open;
 use tx_subsystems::vm::scripts::{
     self as vm_scripts, BssTail as VmBssTail, ImagePlan as VmImagePlan,
@@ -115,7 +116,12 @@ impl ExecError {
             Errno::ENOTDIR => Self::NotADirectory,
             Errno::ENAMETOOLONG => Self::PathTooLong,
             Errno::ELOOP => Self::SymlinkLoop,
-            Errno::EPERM => Self::PermissionDenied,
+            // Wave 3 walker DAC predicate emits EACCES on
+            // `WalkCause::TraverseDenied` and on `step_open` mode
+            // checks; Wave 4 Part 5's pre-Phase-6 X-bit auth uses
+            // EPERM-shape errors. Both map to the same exec-side
+            // variant (Linux returns -EACCES for either).
+            Errno::EACCES | Errno::EPERM => Self::PermissionDenied,
             Errno::ENOMEM => Self::OutOfMemory,
             Errno::EIO => Self::IoError,
             Errno::ENODEV | Errno::ENOSYS => Self::NotExecutable,
@@ -287,6 +293,19 @@ pub async fn exec_script<P: PmapIf>(
     };
     let file_size = file_pc.size_bytes();
 
+    // ----- Phase 1 (cont) — execute-bit authorisation ----------------
+    //
+    // `txdoc:EXEC-3-3-CRED-AUTHORIZES-EXECUTE-COMPUTES-NEW-CREDENTIALS`.
+    // Wave 3's `step_open` enforced the R/W bits implied by
+    // `OpenFileFlags`; the *execute* check is exec-specific and was
+    // deferred to here. The check mirrors Linux's `inode_permission(.,
+    // MAY_EXEC)`: any-X-bit short-circuit for `CAP_DAC_OVERRIDE`
+    // callers, otherwise the standard owner/group/other triplet on the
+    // X bits. Closes LTP `execve02` (non-root cannot execute a 0o600
+    // root-owned binary) and the EACCES sub-cases of `execve03`.
+    let exec_meta = openfile.rnode().meta();
+    check_exec_perm(&exec_meta, cred)?;
+
     // ===== Phase 2 — read header + program headers ===================
     //
     // `txdoc:EXEC-8-3-PARSE-AND-VALIDATE`. One bounded targeted read
@@ -333,6 +352,31 @@ pub async fn exec_script<P: PmapIf>(
     // is a pure infallible store.
     let new_brk_base = compute_brk_base(&parsed.load_segments)?;
 
+    // ===== Phase 3.5 — apply S_ISUID / S_ISGID =======================
+    //
+    // `txdoc:EXEC-3-3-CRED-AUTHORIZES-EXECUTE-COMPUTES-NEW-CREDENTIALS`.
+    // Per Open Q #2 (DECIDED 2026-05-06): the cred recompute lands
+    // BETWEEN parse (Phase 3) and `build_aspace` (Phase 4). Cred
+    // mutation is reversible (the helper returns `previous_cred` so a
+    // caller could roll back via `step_setresuid` / `step_setresgid`
+    // if a later pre-PoNR phase fails). Production exec_script does
+    // not roll back — Linux's exec failure modes between Phase 3.5 and
+    // Phase 6's `replace_aspace` PoNR leave the new cred installed
+    // (see the slice plan's risk #5: `replace_aspace` is documented
+    // infallible, so the only failure modes here are `OutOfMemory` /
+    // `Busy` from Phase 4-5, which are equivalent to fork-then-fail
+    // and not user-observable per LTP).
+    //
+    // The recompute MUST run before Phase 5's auxv build so the
+    // `AT_SECURE` slot reflects the post-recompute effective-id delta.
+    let exec_outcome = step_apply_suid_for_exec(
+        process,
+        Uid(exec_meta.uid),
+        Gid(exec_meta.gid),
+        exec_meta.mode,
+    );
+    let at_secure = exec_outcome.map_or(false, |o| o.at_secure);
+
     // ===== Phase 4 — build detached AddressSpace =====================
     //
     // `txdoc:EXEC-9-2-CREATE-DETACHED-ADDRESS-SPACE`. Bridge the
@@ -373,11 +417,13 @@ pub async fn exec_script<P: PmapIf>(
         at_euid: cred.euid.raw() as u64,
         at_gid: cred.gid.raw() as u64,
         at_egid: cred.egid.raw() as u64,
-        // TODO(wave-4): compute from step_apply_suid_for_exec; non-zero
-        // when the binary's S_ISUID/S_ISGID bit caused an effective-id
-        // change at exec time. Wave 3 hardcodes this to 0 so the auxv
-        // shape ships ahead of the setuid recompute helper.
-        at_secure: 0,
+        // Wave 4 Part 5: post-Phase-3.5 effective-id delta. `1` when
+        // the binary's S_ISUID bit changed the effective uid, or its
+        // S_ISGID-with-group-X bit changed the effective gid. Per Q5
+        // (DECIDED 2026-05-06) the rule is short-form — file
+        // capabilities and `nosuid` mounts (future slices) will
+        // refine.
+        at_secure: if at_secure { 1 } else { 0 },
     };
     let stack_image = build_initial_user_stack(USER_STACK_TOP_DEFAULT, argv, envp, &auxv_facts);
 
@@ -607,6 +653,38 @@ fn poll_walker_synchronously<F: core::future::Future>(future: F) -> F::Output {
              await_* pattern instead."
         ),
     }
+}
+
+/// Pre-Phase-6 execute-bit authorisation. Mirrors Linux's
+/// `inode_permission(., MAY_EXEC)`: callers with `CAP_DAC_OVERRIDE`
+/// short-circuit IF the binary has at least one X bit set anywhere
+/// (the POSIX exception that root cannot execute a file with no X bits
+/// — Linux honours this; LTP `execve03` checks). Otherwise the
+/// standard owner / group / other triplet on the X bits decides.
+///
+/// Returns `Err(ExecError::PermissionDenied)` (→ `-EACCES` at the
+/// syscall arm) on denial. The slice does not yet model
+/// `CAP_DAC_READ_SEARCH` (no LTP test gates on it).
+///
+/// Cites: `txdoc:EXEC-3-3-CRED-AUTHORIZES-EXECUTE-COMPUTES-NEW-CREDENTIALS`,
+/// `txdoc:VFS-CHECKS-PERMISSIONS-1`.
+fn check_exec_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), ExecError> {
+    let mode = meta.mode as u32;
+    let any_x = (mode & 0o111) != 0;
+    if cred.effective_caps.contains(Capability::DAC_OVERRIDE) && any_x {
+        return Ok(());
+    }
+    let bits = if cred.uid == meta.uid {
+        (mode >> 6) & 0o7
+    } else if cred.gid == meta.gid {
+        (mode >> 3) & 0o7
+    } else {
+        mode & 0o7
+    };
+    if bits & 0o1 == 0 {
+        return Err(ExecError::PermissionDenied);
+    }
+    Ok(())
 }
 
 // Note: the original plan sketched `Result<core::convert::Infallible,

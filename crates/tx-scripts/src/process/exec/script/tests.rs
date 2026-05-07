@@ -164,6 +164,14 @@ enum ExecTestInode {
     Regular {
         container: Cap<PageContainer>,
         size: u64,
+        /// Mode bits (without S_IFMT). Wave 4 Part 5 tests vary this
+        /// to exercise the X-bit and S_ISUID/S_ISGID paths.
+        mode_bits: u16,
+        /// Owner uid stored on the inode meta. Lets tests register a
+        /// setuid binary owned by uid 1000 distinct from the caller.
+        uid: u32,
+        /// Owner gid stored on the inode meta.
+        gid: u32,
     },
 }
 
@@ -191,6 +199,24 @@ impl ExecTestFs {
     /// Create a regular-file inode whose page-backed contents are
     /// pre-populated with `bytes`. Returns the file's FsObjectId.
     fn add_regular_with_bytes(&self, parent: FsObjectId, name: &[u8], bytes: &[u8]) -> FsObjectId {
+        // Default mode/uid/gid match the pre-Wave-4 fixture: 0o755,
+        // root-owned. Wave 4 Part 5 tests use
+        // `add_regular_with_bytes_meta` to override.
+        self.add_regular_with_bytes_meta(parent, name, bytes, 0o755, 0, 0)
+    }
+
+    /// Create a regular-file inode with explicit mode bits (without
+    /// `S_IFMT`) and uid/gid. Used by Wave 4 Part 5 tests to drive
+    /// the X-bit and `S_ISUID` / `S_ISGID` paths.
+    fn add_regular_with_bytes_meta(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        bytes: &[u8],
+        mode_bits: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsObjectId {
         let pages = ((bytes.len() as u64) + USER_PAGE_SIZE as u64 - 1) / USER_PAGE_SIZE as u64;
         let pages = core::cmp::max(pages, 1);
         let pc = PageContainer::new_cap(
@@ -237,6 +263,9 @@ impl ExecTestFs {
             ExecTestInode::Regular {
                 container: pc,
                 size,
+                mode_bits,
+                uid,
+                gid,
             },
         );
         id
@@ -271,9 +300,17 @@ impl FsOps for ExecTestFs {
         };
         let meta = match inode {
             ExecTestInode::Directory => InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
-            ExecTestInode::Regular { size, .. } => {
-                let mut meta = InodeMeta::new(InodeKind::Regular, S_IFREG | 0o755);
+            ExecTestInode::Regular {
+                size,
+                mode_bits,
+                uid,
+                gid,
+                ..
+            } => {
+                let mut meta = InodeMeta::new(InodeKind::Regular, S_IFREG | *mode_bits);
                 meta.size = *size;
+                meta.uid = *uid;
+                meta.gid = *gid;
                 meta
             }
         };
@@ -927,4 +964,203 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
     // The CLOEXEC bitmap is cleared wholesale.
     assert!(!process.fd_cloexec(3));
     assert!(!process.fd_cloexec(4));
+}
+
+// ---------------------------------------------------------------------------
+// Wave 4 Part 5: pre-Phase-6 X-bit auth + Phase 3.5 setuid recompute.
+// ---------------------------------------------------------------------------
+
+/// Bootstrap an init process with a fixture file at `/<name>` whose
+/// inode mode bits (without S_IFMT) and uid/gid are configurable. Used
+/// by the Wave 4 Part 5 tests to drive the X-bit and setuid paths.
+fn bootstrap_with_file_meta(
+    name: &[u8],
+    bytes: &[u8],
+    mode_bits: u16,
+    uid: u32,
+    gid: u32,
+) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>, Arc<ExecTestFs>) {
+    let (root_dentry, fs) = build_fs_root();
+    let _ = fs.add_regular_with_bytes_meta(FsObjectId::new(2), name, bytes, mode_bits, uid, gid);
+
+    let aspace = fresh_aspace();
+    let process = bootstrap_init_process(aspace).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+
+    match step_chdir(&process, root_dentry) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
+    }
+
+    (process, thread, fs)
+}
+
+/// Drop the bootstrap process from "root + FULL caps" to a chosen
+/// non-root cred. Step 1: clear effective/permitted caps via the
+/// cross-crate test seam (otherwise `is_privileged_for(CAP_SETUID)`
+/// short-circuits even after the uid swap). Step 2: drive the
+/// privileged `step_setresuid` while still root to install the new
+/// real/effective/saved uid set. Mirrors the cred/tests.rs
+/// `drop_to` helper but routed through public mutators since
+/// `payload` is `pub(crate)` to tx-scripts.
+fn set_non_root_cred(process: &Cap<ProcessIdentity>, uid: u32) {
+    use tx_subsystems::cred::{step_setresuid, CredChange, Uid as CredUid};
+    let outcome = step_setresuid(
+        process,
+        Some(CredUid(uid)),
+        Some(CredUid(uid)),
+        Some(CredUid(uid)),
+    );
+    assert!(matches!(outcome, CredChange::Replaced { .. }));
+    tx_subsystems::cross_crate_test_support::clear_caps_for_test(process);
+}
+
+/// Build a `Credential` for the walker step matching the process's
+/// post-drop cred. Used so the walker DAC checks (Wave 3) and the
+/// Wave 4 X-bit check both see the same caller identity.
+fn walker_cred_for(uid: u32, gid: u32) -> Credential {
+    Credential {
+        uid,
+        gid,
+        effective_caps: tx_subsystems::cred::CapabilitySet::EMPTY,
+    }
+}
+
+#[test]
+fn exec_script_eacces_for_non_executable_binary() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    // mode 0o600 — no X bit anywhere. Owned by uid 0; caller is root
+    // by default. CAP_DAC_OVERRIDE alone does NOT bypass when no X
+    // bit is set anywhere on the file (POSIX exception that LTP
+    // `execve03` checks).
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o600, 0, 0);
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Err(ExecError::PermissionDenied));
+}
+
+#[test]
+fn exec_script_eacces_for_other_user_when_no_other_x_bit() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    // mode 0o710: rwx-/--x/--- — owner+group can X, other cannot.
+    // File owned by uid 0; caller is uid 1001 (non-root, no caps),
+    // which falls through to the "other" triplet → no X → EACCES.
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o710, 0, 0);
+    set_non_root_cred(&process, 1001);
+
+    let cred = walker_cred_for(1001, 1001);
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Err(ExecError::PermissionDenied));
+}
+
+#[test]
+fn exec_script_dac_override_bypasses_with_x_bit_set() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    // mode 0o711: any X bit is set, so CAP_DAC_OVERRIDE bypasses the
+    // ownership/triplet check. File owned by uid 0; caller is root
+    // (effective_caps = FULL).
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o711, 0, 0);
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn exec_script_dac_override_does_not_bypass_with_no_x_bit() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    // mode 0o600 — no X bits anywhere. CAP_DAC_OVERRIDE callers
+    // still hit EACCES per the Linux POSIX exception.
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o600, 0, 0);
+
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Err(ExecError::PermissionDenied));
+}
+
+#[test]
+fn exec_script_setuid_binary_changes_euid() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    // S_ISUID | 0o755, owned by uid 1000. Caller is uid 1001 (non-
+    // root). After exec the effective uid should be 1000 and the
+    // saved-set uid should also be 1000.
+    let mode_bits = 0o4755; // S_ISUID | rwxr-xr-x
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, mode_bits, 1000, 0);
+    set_non_root_cred(&process, 1001);
+
+    let cred = walker_cred_for(1001, 1001);
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    let post = process.cred().expect("alive process");
+    assert_eq!(post.uid.raw(), 1001, "real uid preserved by exec");
+    assert_eq!(post.euid.raw(), 1000, "S_ISUID applied");
+    assert_eq!(post.suid.raw(), 1000, "saved-set tracks new euid");
+}
+
+#[test]
+fn exec_script_no_setuid_at_secure_zero() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    // mode 0o755, owned by uid 0. Caller is root (default). No setuid
+    // bit → cred unchanged → at_secure should be 0 in the auxv.
+    let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o755, 0, 0);
+
+    let pre = process.cred().expect("alive process");
+    let cred = Credential::root();
+    let result = block_on(exec_script::<ScriptsTestPmap>(
+        &process,
+        &thread,
+        b"/init",
+        &[],
+        &[],
+        &cred,
+    ));
+    assert_eq!(result, Ok(()));
+
+    let post = process.cred().expect("alive process");
+    assert_eq!(post.uid, pre.uid);
+    assert_eq!(post.euid, pre.euid);
+    assert_eq!(post.suid, pre.suid);
 }
