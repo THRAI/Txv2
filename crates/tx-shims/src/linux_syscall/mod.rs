@@ -64,8 +64,8 @@ use tx_subsystems::signal::{
 };
 use tx_subsystems::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
 use tx_subsystems::thread_runtime::{step_thread_exit, ThreadIdentity};
-use tx_subsystems::vfs::structure::Credential;
-use tx_subsystems::vfs::{step_walk, DEntry, OpenFile};
+use tx_subsystems::vfs::structure::{Credential, OpenFileFlags};
+use tx_subsystems::vfs::{step_open, step_walk, DEntry, OpenFile};
 use tx_subsystems::vm::{AddressSpace, UserVirtAddr, VmMapError};
 use tx_subsystems::wait_carrier;
 
@@ -76,12 +76,13 @@ mod tests;
 
 pub use numbers::{
     AT_EACCESS, AT_FDCWD, AT_SYMLINK_NOFOLLOW, FD_CLOEXEC, F_GETFD, F_OK, F_SETFD, NR_BRK,
-    NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHMODAT,
-    NR_FCHOWNAT, NR_FCNTL, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID,
-    NR_GETPPID, NR_GETRESGID, NR_GETRESUID, NR_GETSID, NR_GETUID, NR_READ, NR_RT_SIGACTION,
-    NR_RT_SIGPROCMASK, NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID,
-    NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, O_CLOEXEC,
-    R_OK, SIGCHLD, WNOHANG, W_OK, X_OK,
+    NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT,
+    NR_FACCESSAT2, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_GETEGID, NR_GETEUID, NR_GETGID,
+    NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRESGID, NR_GETRESUID, NR_GETSID,
+    NR_GETUID, NR_OPENAT, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SETGID, NR_SETPGID,
+    NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
+    NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_EXCL,
+    O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, R_OK, SIGCHLD, WNOHANG, W_OK, X_OK,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -396,6 +397,29 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf>(
             req.args[1],
             req.args[2] as i32,
             req.args[3] as i32,
+            ctx,
+        ),
+        // Wave 2 of the fd-ops slice — fd-management arms
+        // (`openat` / `close` / `dup` / `dup3`). `sys_openat` needs
+        // `<P>` because the walker's `resolve_path_at` is generic over
+        // `PmapIf`; the others operate purely on the fd table and the
+        // `Cap<OpenFile>` slot it carries.
+        nr if nr == NR_OPENAT => {
+            sys_openat::<P>(
+                req.args[0] as i32,
+                req.args[1],
+                req.args[2] as u32,
+                req.args[3] as u32,
+                ctx,
+            )
+            .await
+        }
+        nr if nr == NR_CLOSE => sys_close(req.args[0] as u32, ctx),
+        nr if nr == NR_DUP => sys_dup(req.args[0] as u32, ctx),
+        nr if nr == NR_DUP3 => sys_dup3(
+            req.args[0] as u32,
+            req.args[1] as u32,
+            req.args[2] as u32,
             ctx,
         ),
         _ => SyscallResult::Error(ENOSYS_VALUE),
@@ -2115,4 +2139,489 @@ fn sys_faccessat2_impl<P: PmapIf>(
     } else {
         SyscallResult::Error(EACCES_VALUE)
     }
+}
+
+// =====================================================================
+// Wave 2 of the fd-ops slice — fd-management syscall arms.
+//
+// Coverage:
+//   - `sys_openat` (NR_OPENAT = 56). Wave 2's slice surface only
+//     supports `dirfd == AT_FDCWD`; non-cwd dirfds map to `-EBADF`. The
+//     walker resolves the path via `vfs::step_open` using the caller's
+//     `walker_cred()` (effective ids per POSIX). On `O_CREAT` against a
+//     missing file, the syscall arm walks to the parent directory,
+//     calls `FsOps::create_inode`, and re-runs `step_open` (the
+//     create-on-open path is implemented at the syscall arm rather
+//     than baked into the walker — keeps the walker resolve-only per
+//     the slice plan §"Cross-cutting risks #6").
+//   - `sys_close` (NR_CLOSE = 57). Removes the `Cap<OpenFile>` from
+//     the fd table; EBR-deferred reclamation fires the `OpenFile`'s
+//     `Drop`.
+//   - `sys_dup` (NR_DUP = 23) and `sys_dup3` (NR_DUP3 = 24). `NR_DUP2`
+//     is absent on the RV64 generic ABI; musl emits `dup3(.., 0)` for
+//     the legacy `dup2(oldfd, newfd)` shape.
+//
+// See `docs/progress/plans/2026-05-07-fd-ops-and-drift-cleanup.md`
+// Parts 2–4 and `txdoc:VFS-CHECKS-OPEN-FLAGS-1`.
+// =====================================================================
+
+/// Linux generic ABI errno value for "no such file or directory"
+/// (`ENOENT`). Used by `sys_openat` when the walker reports the file
+/// is missing and `O_CREAT` is unset.
+const ENOENT_VALUE: i32 = 2;
+/// Linux generic ABI errno value for "file exists" (`EEXIST`). Used by
+/// `sys_openat` when `O_CREAT | O_EXCL` is set and the file already
+/// exists.
+const EEXIST_VALUE: i32 = 17;
+/// Linux generic ABI errno value for "is a directory" (`EISDIR`).
+/// Used by `sys_openat` when `O_TRUNC` is requested against a
+/// directory inode.
+const EISDIR_VALUE: i32 = 21;
+
+/// Decode the access-mode bits (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) of an
+/// `openat(2)` `flags` argument into the `(read, write)` pair. Linux's
+/// `O_RDONLY = 0` reads as "read", `O_WRONLY = 1` as "write",
+/// `O_RDWR = 2` as both. The historical `0o3` ("search") shape is
+/// silently treated as `O_RDONLY` (we map it to `(true, false)`); no
+/// shipping userspace emits it, but Linux historically tolerates it.
+fn decode_access_mode(flags: u32) -> (bool, bool) {
+    match flags & numbers::O_ACCMODE {
+        numbers::O_WRONLY => (false, true),
+        numbers::O_RDWR => (true, true),
+        // O_RDONLY (0) and the legacy "search" shape (0o3) both fall here.
+        _ => (true, false),
+    }
+}
+
+/// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
+/// re-walk. `path` is a slash-separated sequence; trailing slashes
+/// before the basename are dropped. Returns `(b"", path)` for a
+/// single-component name (no slash) — the caller treats `parent ==
+/// b""` as "current directory" and walks the cwd.
+///
+/// Examples:
+/// - `b"foo"` → `(b"", b"foo")`
+/// - `b"a/b"` → `(b"a", b"b")`
+/// - `b"/x/y/z"` → `(b"/x/y", b"z")`
+/// - `b"/"` → `(b"/", b"")` (degenerate; the create call would fail
+///   with `EINVAL` anyway because `InlineName::new(b"")` rejects
+///   the empty basename)
+fn split_path(path: &[u8]) -> (&[u8], &[u8]) {
+    match path.iter().rposition(|b| *b == b'/') {
+        None => (&[], path),
+        Some(idx) => {
+            // The slash itself stays with the parent so an absolute
+            // path like `/x/y/z` keeps its leading `/` on `parent`
+            // (the walker treats a path starting with `/` as
+            // "restart from mount root").
+            let parent = &path[..=idx];
+            let basename = &path[idx + 1..];
+            (parent, basename)
+        }
+    }
+}
+
+/// `openat(dirfd, path, flags, mode)`. Linux RV64 generic ABI
+/// `__NR_openat = 56`.
+///
+/// Wave 2's surface: `dirfd == AT_FDCWD` only (non-cwd dirfds return
+/// `-EBADF` because the slice's fd table doesn't carry directory-fd
+/// semantics yet — `TODO(phase-dirfd)` matches Wave 4 Part 4's
+/// `resolve_path_at`). Path resolution goes through `vfs::step_open`
+/// using the caller's `walker_cred()` (effective ids per POSIX DAC
+/// rule).
+///
+/// Flag decoding mirrors Linux's `man 2 open` (`O_RDONLY`/`O_WRONLY`/
+/// `O_RDWR` access mode + `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND`/
+/// `O_CLOEXEC`/`O_NONBLOCK`). Unrecognised bits are accept-and-ignore
+/// (matches Linux's lenient open-flag policy). `O_NONBLOCK` itself is
+/// accepted but ignored — `OpenFile` doesn't carry a non-blocking
+/// state today (`TODO(phase-nonblock)`).
+///
+/// `O_CREAT` semantic: `step_open` is resolve-only by contract (the
+/// slice plan §"Cross-cutting risks #6"), so the syscall arm
+/// implements create-on-missing at this layer. On the first
+/// `step_open` returning `Errno::ENOENT` with `O_CREAT` set, the arm
+/// walks to the parent directory via `step_walk`, calls
+/// `FsOps::create_inode(parent, basename, mode, &cred, &guard)`, then
+/// re-runs `step_open` against the now-existing inode. `O_CREAT |
+/// O_EXCL` against an existing file fast-fails with `-EEXIST`.
+///
+/// `O_TRUNC` semantic: applied **after** the file has been resolved
+/// or created. Targets the in-scope `MountPayload.fs_page_backing`'s
+/// `truncate(fs_object_id, 0, &guard)` hook. Backends without
+/// page-backed regular files surface `Errno::ENOSYS`. Truncate on a
+/// directory returns `-EISDIR` matching Linux. The DAC permission
+/// check on the truncate-implies-write Linux policy is **deferred**
+/// per the DAC + setuid plan Open Q #6 — the `O_TRUNC` request is
+/// honoured iff the open mode itself was permitted (which already
+/// went through `check_open_perm` inside `step_open`).
+async fn sys_openat<'a, P: PmapIf>(
+    dirfd: i32,
+    path_uaddr: u64,
+    flags: u32,
+    mode: u32,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    // Wave 2 slice: AT_FDCWD only. Real dirfd-relative resolution
+    // requires directory file descriptors — the slice's fd table
+    // doesn't carry them yet. (TODO(phase-dirfd): mirror Wave 4
+    // Part 4's `resolve_path_at` once dirfds land.)
+    if dirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+
+    // Bounded inline copy of the user path. Same `EXECVE_PATH_MAX = 4096`
+    // budget as the existing `execve` / `fchmodat` arms (and matches
+    // Linux's `PATH_MAX`). Empty paths surface as `-ENOENT` from the
+    // walker — let it through so the lookup-side error wins.
+    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+
+    // Decode the open flags. Access-mode picks the read/write pair;
+    // O_APPEND / O_CLOEXEC thread through to OpenFileFlags. O_NONBLOCK
+    // is accepted but ignored (no blocking state on OpenFile yet).
+    let (want_read, want_write) = decode_access_mode(flags);
+    let want_append = flags & O_APPEND != 0;
+    let want_cloexec = flags & O_CLOEXEC != 0;
+    let want_create = flags & O_CREAT != 0;
+    let want_excl = flags & O_EXCL != 0;
+    let want_trunc = flags & O_TRUNC != 0;
+    // O_NONBLOCK and other unrecognised bits: silently dropped.
+
+    let open_flags = OpenFileFlags {
+        read: want_read,
+        write: want_write,
+        append: want_append,
+        cloexec: want_cloexec,
+    };
+
+    // Resolve the cwd anchor. Zombies + uninitialised init pre-rootfs
+    // both surface `cwd() == None`; the alive caller of `openat` always
+    // has a cwd installed by `step_chdir` / bootstrap. No-cwd is a
+    // defensive `-ENOENT` (matches Linux's "no such directory" shape
+    // for an unreachable cwd).
+    let cwd: Cap<DEntry> = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+
+    let walker_cred = ctx.walker_cred();
+
+    // Step 1: walk the path to a terminal dentry. Three outcomes:
+    //   - success: the file exists. Handle O_EXCL collision; otherwise
+    //     fall through to the open + (optional) truncate phase.
+    //   - ENOENT + O_CREAT: split into (parent_path, basename), walk
+    //     the parent, call `FsOps::create_inode`, then re-walk to
+    //     materialise the dentry over the freshly-created inode.
+    //   - other errno: forward.
+    //
+    // We use the dentry (not the OpenFile) as the truncate-anchor so
+    // `fs_ops_for_dentry`'s parent-hint ascend can find the in-scope
+    // mount payload (freshly-resolved child rnodes don't carry the
+    // mount weak; only mount-root rnodes do, per the walker's
+    // `current_fs_ops` discipline).
+    //
+    // Send-future discipline (`txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`):
+    // `Guard` is `!Send + !Sync` so we cannot hold one across this
+    // function's `.await`s — the `dispatch` future feeds
+    // `Reactor::submit_task` which requires `Send`. Use the
+    // `poll_walker_synchronously` helper that the Wave 4 file-mode
+    // arms also use; every in-tree walker backend resolves
+    // immediately so the noop-waker poll always returns `Ready`.
+    let walk_first = {
+        let guard = tx_substrate::epoch::guard();
+        let outcome =
+            poll_walker_synchronously(step_walk(cwd.clone(), &path, &walker_cred, &guard));
+        drop(guard);
+        outcome
+    };
+
+    let dentry: Cap<DEntry> = match walk_first {
+        StepOutcome::Done(d) | StepOutcome::Advanced(d) => {
+            if want_create && want_excl {
+                return SyscallResult::Error(EEXIST_VALUE);
+            }
+            d
+        }
+        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            return SyscallResult::Error(EIO_VALUE);
+        }
+        StepOutcome::Err(Errno::ENOENT) if want_create => {
+            match create_then_walk::<P>(&cwd, &path, mode as u16, &walker_cred) {
+                Ok(d) => d,
+                Err(e) => return SyscallResult::Error(e),
+            }
+        }
+        StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+
+    // Step 2: O_TRUNC. Apply *before* materialising the OpenFile so
+    // any future `step_read` against the resulting fd observes the
+    // truncated state. Directories → -EISDIR; backends without
+    // truncate support → -ENOSYS.
+    if want_trunc {
+        let meta = dentry.rnode().meta();
+        if meta.kind() == tx_subsystems::vfs::structure::InodeKind::Directory {
+            return SyscallResult::Error(EISDIR_VALUE);
+        }
+        if meta.size != 0 {
+            let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
+                Some(b) => b,
+                None => return SyscallResult::Error(ENOSYS_VALUE),
+            };
+            let fs_object_id = dentry.rnode().fs_object_id();
+            let guard = tx_substrate::epoch::guard();
+            match fs_page_backing.truncate(fs_object_id, 0, &guard) {
+                StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+                StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                    return SyscallResult::Error(EIO_VALUE);
+                }
+                StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+    }
+
+    // Step 3: materialise the OpenFile cap by re-running step_open
+    // against the path. step_open consumes step_walk internally + adds
+    // the terminal-component R/W permission check (cite:
+    // `txdoc:VFS-CHECKS-PERMISSIONS-1`). Errors here surface the DAC
+    // EACCES the walker guards against; we cannot bypass it because
+    // the walker-side check_open_perm runs against the inode's mode
+    // bits, and tmpfs's create_inode honoured those bits at create
+    // time, so the perms apply equally to the just-created file.
+    //
+    // Same Send-future discipline as Step 1: poll_walker_synchronously.
+    let openfile: Cap<OpenFile> = {
+        let guard = tx_substrate::epoch::guard();
+        let outcome = poll_walker_synchronously(step_open(
+            cwd,
+            &path,
+            open_flags,
+            mode as u16,
+            &walker_cred,
+            &guard,
+        ));
+        drop(guard);
+        match outcome {
+            StepOutcome::Done(file) | StepOutcome::Advanced(file) => file,
+            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    };
+
+    // Step 4: install at the lowest unused fd ≥ 0. Per fd-ops Wave 1
+    // the fd table is a sparse `BTreeMap<u32, Cap<OpenFile>>`;
+    // `allocate_fd()` scans for the lowest unused key.
+    let fd = ctx.process.allocate_fd();
+    let _ = ctx.process.set_fd(fd, Some(openfile));
+    if want_cloexec {
+        ctx.process.set_fd_cloexec(fd, true);
+    }
+
+    SyscallResult::Return(fd as i64)
+}
+
+/// Helper for the `O_CREAT`-on-missing path inside `sys_openat`.
+/// Walks to the parent of `path`, calls `FsOps::create_inode` for the
+/// basename, then re-walks the full path to return a dentry over the
+/// freshly-installed RNode. The dentry (not the OpenFile) is the
+/// return shape because the syscall arm needs to apply `O_TRUNC`
+/// against `FsPageBacking` *before* materialising the OpenFile, and
+/// the dentry's parent-hint chain is what `fs_ops_for_dentry` /
+/// `fs_page_backing_for_dentry` consume to find the in-scope mount.
+///
+/// Synchronous — uses `poll_walker_synchronously` for the same
+/// Send-future reason `resolve_path_at` does (the `Guard` argument is
+/// `!Send + !Sync`, so cross-`.await` holds break the dispatch
+/// future's `Send` bound). Returns the positive-magnitude `-errno`
+/// on failure.
+fn create_then_walk<P: PmapIf>(
+    cwd: &Cap<DEntry>,
+    path: &[u8],
+    mode: u16,
+    cred: &Credential,
+) -> Result<Cap<DEntry>, i32> {
+    let _ = core::marker::PhantomData::<P>;
+    let (parent_path, basename) = split_path(path);
+    if basename.is_empty() {
+        // A path like `/` or `foo/` has an empty basename — can't
+        // create. Surface as -EISDIR (matches Linux's behaviour for
+        // `open("/", O_CREAT, ...)`).
+        return Err(EISDIR_VALUE);
+    }
+
+    // Walk to the parent. Empty `parent_path` means "use the cwd as
+    // the parent" (the basename was a single component with no
+    // slash). step_walk handles a leading `/` as "restart from mount
+    // root" and `b""` as "stay at rooted_at".
+    let parent_dentry: Cap<DEntry> = if parent_path.is_empty() {
+        cwd.clone()
+    } else {
+        let guard = tx_substrate::epoch::guard();
+        let outcome = poll_walker_synchronously(step_walk(cwd.clone(), parent_path, cred, &guard));
+        drop(guard);
+        match outcome {
+            StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
+            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                return Err(EIO_VALUE);
+            }
+            StepOutcome::Err(errno) => return Err(errno_to_i32(errno)),
+        }
+    };
+
+    // Resolve the FsOps in scope at `parent_dentry`. Mirrors the
+    // existing `fs_ops_for_dentry` shape used by the file-mode arms.
+    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
+        Some(ops) => ops,
+        None => return Err(EROFS_VALUE),
+    };
+
+    // Mint the new inode under the parent. The mode arrives from
+    // userspace as the bottom 12 bits (`rwxrwxrwx | S_ISUID/S_ISGID/
+    // S_ISVTX`); umask plumbing is deferred to a future slice
+    // (TODO(phase-umask)).
+    let parent_fs_object_id = parent_dentry.rnode().fs_object_id();
+    let new_mode = mode & 0o7777;
+    {
+        let guard = tx_substrate::epoch::guard();
+        let outcome = fs_ops.create_inode(parent_fs_object_id, basename, new_mode, cred, &guard);
+        match outcome {
+            StepOutcome::Done(_) | StepOutcome::Advanced(_) => {}
+            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                return Err(EIO_VALUE);
+            }
+            StepOutcome::Err(errno) => return Err(errno_to_i32(errno)),
+        }
+    }
+
+    // Re-walk the full path. Lookup now resolves the freshly-created
+    // inode; the resulting dentry carries the proper parent-hint
+    // chain back to the mount root.
+    let guard = tx_substrate::epoch::guard();
+    let outcome = poll_walker_synchronously(step_walk(cwd.clone(), path, cred, &guard));
+    drop(guard);
+    match outcome {
+        StepOutcome::Done(d) | StepOutcome::Advanced(d) => Ok(d),
+        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => Err(EIO_VALUE),
+        StepOutcome::Err(errno) => Err(errno_to_i32(errno)),
+    }
+}
+
+/// Resolve the `Arc<dyn FsPageBacking>` in scope for a dentry by
+/// ascending its parent-hint chain to find an rnode that carries
+/// `with_containing_mount`. Mirrors `fs_ops_for_dentry`'s shape but
+/// reads the mount payload's `fs_page_backing` field instead of
+/// `fs_ops`. Used by `sys_openat`'s O_TRUNC arm to call
+/// `FsPageBacking::truncate(0)` on the resolved file.
+///
+/// Returns `None` for orphan dentries (no parent-hint chain reaches
+/// a rnode with a mount weak); the `O_TRUNC` arm surfaces that as
+/// `-ENOSYS` (no backing → no truncate).
+fn fs_page_backing_for_dentry(
+    dentry: &Cap<DEntry>,
+) -> Option<Arc<dyn tx_subsystems::page_backed::FsPageBacking>> {
+    let guard = tx_substrate::epoch::guard();
+    let mut cursor: Cap<DEntry> = dentry.clone();
+    loop {
+        if let Some(weak) = cursor.rnode().containing_mount_weak() {
+            if let Some(payload) = weak.upgrade(&guard) {
+                return Some(payload.fs_page_backing.clone());
+            }
+        }
+        let next = cursor.parent_hint().and_then(|w| w.upgrade(&guard));
+        match next {
+            Some(p) => cursor = p,
+            None => return None,
+        }
+    }
+}
+
+/// `close(fd)`. Linux RV64 generic ABI `__NR_close = 57`.
+///
+/// Removes the `Cap<OpenFile>` from the fd table; EBR-deferred
+/// reclamation drops the cap (the `OpenFile`'s `Drop` body — TTY
+/// reference releases, page-backing teardown — fires there).
+/// Also clears the cloexec bit so future `fcntl(F_GETFD)` against the
+/// same fd number reports a clean state if it gets reused.
+///
+/// Returns `0` on success, `-EBADF` if the fd was already closed.
+fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if ctx.process.fd(fd).is_none() {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let _previous = ctx.process.set_fd(fd, None);
+    // Clear the cloexec bit defensively. The bitmap is a sibling of
+    // the fd-table BTreeMap (not folded into OpenFile.flags), so the
+    // close arm explicitly clears it even though the fd-table entry
+    // is gone — matches Linux's `close(2)` "cloexec disposition is
+    // forgotten" semantic.
+    ctx.process.set_fd_cloexec(fd, false);
+    SyscallResult::Return(0)
+}
+
+/// `dup(oldfd)`. Linux RV64 generic ABI `__NR_dup = 23`.
+///
+/// Returns the lowest unused fd ≥ 0 referring to the same `OpenFile`
+/// as `oldfd`. The new fd's cloexec bit is **clear** per POSIX —
+/// `dup` never inherits the cloexec disposition; only
+/// `dup3(.., O_CLOEXEC)` sets it. The underlying `OpenFile` is shared
+/// (we clone the `Cap<OpenFile>`); both fds reference the same
+/// epoch-managed identity.
+fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let file = match ctx.process.fd(oldfd) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let newfd = ctx.process.allocate_fd();
+    let _ = ctx.process.set_fd(newfd, Some(file));
+    // POSIX: the duplicate fd has its cloexec bit cleared. Defensively
+    // clear it (allocate_fd returned an unused slot, so the bit
+    // should already be clear, but `BTreeSet<u32>::remove` is cheap
+    // and guards against a stale bit from a previous lifecycle).
+    ctx.process.set_fd_cloexec(newfd, false);
+    SyscallResult::Return(newfd as i64)
+}
+
+/// `dup3(oldfd, newfd, flags)`. Linux RV64 generic ABI
+/// `__NR_dup3 = 24`.
+///
+/// The atomic-replace form: any existing `newfd` is silently closed
+/// and `newfd` is bound to the same `OpenFile` as `oldfd`. Returns
+/// `newfd` on success.
+///
+/// - `oldfd == newfd` → `-EINVAL` per Linux (musl's `dup2` shim emits
+///   `dup3(oldfd, newfd, 0)`; the legacy `dup2` no-op-on-same-fd
+///   shape does not apply here).
+/// - `flags & ~O_CLOEXEC != 0` → `-EINVAL` (only `O_CLOEXEC` is
+///   defined for this argument).
+/// - `oldfd` not open → `-EBADF`.
+/// - Otherwise: `install_fd(newfd, file.clone())` — the previous
+///   occupant cap is dropped immediately (its EBR-deferred `Drop`
+///   fires once the next epoch reclamation runs).
+fn sys_dup3<'a>(oldfd: u32, newfd: u32, flags: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if oldfd == newfd {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    // Validate flags: only O_CLOEXEC is meaningful. Other bits =
+    // -EINVAL. (Linux dup3 specifically rejects junk flags rather
+    // than ignoring them, unlike open().)
+    if flags & !O_CLOEXEC != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let file = match ctx.process.fd(oldfd) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    // install_fd returns the previous occupant. We drop it
+    // immediately — the Cap goes through EBR-deferred reclamation,
+    // matching `sys_close`'s semantic.
+    let _previous = ctx.process.install_fd(newfd, file);
+    let want_cloexec = flags & O_CLOEXEC != 0;
+    ctx.process.set_fd_cloexec(newfd, want_cloexec);
+    SyscallResult::Return(newfd as i64)
 }

@@ -84,6 +84,88 @@ pub const FD_CLOEXEC: i32 = 1;
 pub const O_CLOEXEC: u32 = 0o2000000;
 
 // ---------------------------------------------------------------------
+// Wave 2 of the fd-ops slice — `openat(2)` flag bits.
+//
+// Authoritative source: Linux generic uapi `include/uapi/asm-generic/fcntl.h`.
+// Only the bit set Wave 2 acts on is named here; `O_DIRECTORY`,
+// `O_DSYNC`, `O_SYNC`, `O_DIRECT`, etc. are out of scope for the slice
+// (the existing `OpenFileFlags` shape only carries read/write/append/
+// cloexec; growing the surface lives with `pipe2` / `getdents64` slices
+// when those flags are exercised). Unrecognised bits are accept-and-ignore
+// matching Linux's lenient open-flag policy. See
+// `docs/progress/plans/2026-05-07-fd-ops-and-drift-cleanup.md` Part 2.
+// ---------------------------------------------------------------------
+
+/// Access-mode mask for `openat(2)` flags. The bottom two bits encode
+/// the access mode — `O_RDONLY` / `O_WRONLY` / `O_RDWR` — with `0o3`
+/// being the historical "search-only" shape Linux ignores. Decoders
+/// extract this via `flags & O_ACCMODE` per `man 2 open`.
+pub const O_ACCMODE: u32 = 0o3;
+/// `openat(2)` access mode: read-only (`O_RDONLY = 0`).
+pub const O_RDONLY: u32 = 0o0;
+/// `openat(2)` access mode: write-only (`O_WRONLY = 1`).
+pub const O_WRONLY: u32 = 0o1;
+/// `openat(2)` access mode: read-write (`O_RDWR = 2`).
+pub const O_RDWR: u32 = 0o2;
+/// `openat(2)` flag bit: create the file if missing. With `O_EXCL`,
+/// fail with `-EEXIST` when the file already exists.
+pub const O_CREAT: u32 = 0o100;
+/// `openat(2)` flag bit: when paired with `O_CREAT`, fail with
+/// `-EEXIST` if the target file already exists. The combination is the
+/// canonical lock-file primitive.
+pub const O_EXCL: u32 = 0o200;
+/// `openat(2)` flag bit: truncate the file to size 0 on open. Wave 2
+/// supports it for tmpfs-backed regular files via the in-scope
+/// `FsPageBacking::truncate` hook; backends without truncate support
+/// surface `-ENOSYS`.
+pub const O_TRUNC: u32 = 0o1000;
+/// `openat(2)` flag bit: open with append-only semantics — every write
+/// is positioned at end-of-file regardless of the per-fd offset.
+/// Threads through to `OpenFileFlags::append`.
+pub const O_APPEND: u32 = 0o2000;
+/// `openat(2)` flag bit: non-blocking open + non-blocking I/O on the
+/// resulting fd. Wave 2 accepts but ignores this bit — there is no
+/// blocking-flag plumbing on `OpenFile` yet (`TODO(phase-nonblock)`).
+pub const O_NONBLOCK: u32 = 0o4000;
+
+// ---------------------------------------------------------------------
+// Wave 2 of the fd-ops slice — fd-management syscall numbers.
+//
+// `NR_OPENAT = 56`, `NR_CLOSE = 57`, `NR_DUP = 23`, `NR_DUP3 = 24`.
+// `NR_DUP2` is **absent** on the Linux RV64 generic ABI — musl emits
+// `dup3(oldfd, newfd, 0)` for the legacy `dup2(oldfd, newfd)` shape
+// per its `src/unistd/dup2.c` arch-generic shim. See
+// `docs/progress/plans/2026-05-07-fd-ops-and-drift-cleanup.md` Parts 2–4.
+// ---------------------------------------------------------------------
+
+/// `dup(oldfd)`. Linux RV64 generic ABI `__NR_dup = 23`. Returns the
+/// lowest unused fd ≥ 0 referring to the same `OpenFile` as `oldfd`.
+/// The returned fd has `cloexec` cleared per POSIX — `dup` never
+/// inherits the cloexec bit; only `dup3(.., O_CLOEXEC)` sets it.
+pub const NR_DUP: u64 = 23;
+/// `dup3(oldfd, newfd, flags)`. Linux RV64 generic ABI
+/// `__NR_dup3 = 24`. The atomic-replace form: any existing `newfd`
+/// is silently closed and `newfd` is bound to the same `OpenFile` as
+/// `oldfd`. `oldfd == newfd` is `-EINVAL` (Linux dup3 rejects the
+/// no-op shape that legacy dup2 accepts). `flags` accepts only
+/// `O_CLOEXEC`; other bits return `-EINVAL`.
+pub const NR_DUP3: u64 = 24;
+/// `openat(dirfd, path, flags, mode)`. Linux RV64 generic ABI
+/// `__NR_openat = 56`. Wave 2's slice surface only supports
+/// `dirfd == AT_FDCWD`; non-cwd dirfds return `-EBADF` (the slice's
+/// fd table doesn't carry directory-fd semantics yet). The walker
+/// resolves the path via `vfs::step_open` using the caller's
+/// `walker_cred()` (effective ids per POSIX). On `O_CREAT` against a
+/// missing file, the syscall arm walks the parent dir and calls
+/// `FsOps::create_inode` before re-running `step_open`.
+pub const NR_OPENAT: u64 = 56;
+/// `close(fd)`. Linux RV64 generic ABI `__NR_close = 57`. Removes
+/// the `OpenFile` cap from the fd table (EBR-deferred reclamation
+/// fires the OpenFile's `Drop`) and clears the cloexec bit. `-EBADF`
+/// for closed fds.
+pub const NR_CLOSE: u64 = 57;
+
+// ---------------------------------------------------------------------
 // Wave 2 of the fork/clone/wait4 slice — Part 2 (NR_CLONE) +
 // Part 4 (process-tree introspection arms) + Part 5 (musl-startup
 // stubs). NR_WAIT4 is intentionally absent — it lives in Wave 3 with
