@@ -27,13 +27,20 @@
 //! (`StructPayload::Pipe { side, .. }`). The shared `Cap<PipePayload>`
 //! refcount cannot tell us how many readers vs writers remain, so the
 //! payload carries explicit `reader_count` / `writer_count`
-//! `AtomicU32`s. Higher-level fd-table primitives (`dup`, `fork`,
-//! `close`) are responsible for calling `incr_reader` / `decr_reader`
-//! / `incr_writer` / `decr_writer` whenever an `OpenFile` referencing
-//! the pipe is duplicated or dropped. fd-ops Wave 3 ships only the
-//! `step_pipe2` constructor (which sets each count to 1) and the
-//! `decr_*` hooks; the dup/close hooks land in the follow-up
-//! "pipe lifecycle" slice.
+//! `AtomicU32`s.
+//!
+//! **Lifecycle (shell-prompt roadmap Slice 1, 2026-05-07).** The
+//! `decr_reader` / `decr_writer` hooks are called from
+//! `vfs::structure::OpenFile`'s `Drop` impl, fired exactly once per
+//! `Cap<OpenFile>` chain when EBR retires the slot. `Cap` clone
+//! shares the same `OpenFile` (the count tracks distinct OpenFiles,
+//! not fds), so `dup`/`fork`/`dup3`-replace need no explicit
+//! increment. `step_pipe2` sets each count to 1 — one reader
+//! OpenFile, one writer OpenFile — and the count strictly
+//! decreases from there via Drop. The last-reader-close transition
+//! fires the writer-side wait channel for SIGPIPE/EPIPE; the
+//! last-writer-close transition fires the reader-side wait channel
+//! for EOF.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -216,23 +223,20 @@ impl PipePayload {
         self.writer_wait_carrier_id
     }
 
-    /// Reader-end ref bump. Call when an `OpenFile` referring to the
-    /// reader side is duplicated (`dup`, `fork`, `dup3`).
-    pub fn incr_reader(&self) {
-        self.reader_count.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Writer-end ref bump. Companion of `incr_reader`.
-    pub fn incr_writer(&self) {
-        self.writer_count.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Reader-end ref drop. Call when an `OpenFile` referring to the
-    /// reader side is closed. On the last-reader-close transition,
+    /// Reader-end ref drop. Called from `Drop for OpenFile` when the
+    /// last `Cap<OpenFile>` referencing the reader side is released
+    /// and EBR retires the slot. On the last-reader-close transition,
     /// fires the writer-side wait channel so any blocked writer
     /// observes the closed-reader state on its next iteration and
     /// surfaces `EPIPE`.
-    pub fn decr_reader(&self) {
+    ///
+    /// `pub(crate)` because the only legitimate caller is
+    /// `vfs::structure::OpenFile`'s Drop impl. `Cap` clone semantics
+    /// (one OpenFile shared by `dup` / `fork`-cloned fds) mean
+    /// `incr_reader` is never needed — the count tracks distinct
+    /// OpenFiles, not fds, and Cap clone doesn't create a new
+    /// OpenFile.
+    pub(crate) fn decr_reader(&self) {
         let prev = self.reader_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             self.writer_wait_channel.fire(Mask::from_bits(PIPE_WRITABLE));
@@ -243,7 +247,7 @@ impl PipePayload {
     /// last-writer-close transition, fires the reader-side wait
     /// channel so any blocked reader observes the closed-writer
     /// state on its next iteration and surfaces `Done(0)` (EOF).
-    pub fn decr_writer(&self) {
+    pub(crate) fn decr_writer(&self) {
         let prev = self.writer_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             self.reader_wait_channel.fire(Mask::from_bits(PIPE_READABLE));
@@ -461,9 +465,29 @@ mod tests {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         init_host_for_test_once();
         let _ = zones::register_all();
-        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        drain_to_quiescence();
         guard
+    }
+
+    /// Loop `drain_with_budget(usize::MAX)` until two consecutive
+    /// drains reclaim zero nodes. Each individual drain advances the
+    /// global epoch at most once and only reclaims nodes whose
+    /// retirement epoch is at least 2 behind the current epoch, so a
+    /// single call is insufficient to flush a freshly-dropped
+    /// `Cap<OpenFile>` chain (the OpenFile drop queues its inner
+    /// `Cap<RNode>` / `Cap<PipePayload>` retirements, which need
+    /// further advances). This helper hides that bookkeeping behind
+    /// a single call so the lifecycle assertions read cleanly.
+    fn drain_to_quiescence() {
+        let mut quiet = 0u32;
+        while quiet < 2 {
+            let stats = tx_substrate::epoch::drain_with_budget(usize::MAX);
+            if stats.reclaimed == 0 {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+        }
     }
 
     /// Pull the shared `Cap<PipePayload>` back out of an OpenFile so
@@ -526,10 +550,15 @@ mod tests {
     #[test]
     fn pipe_step_read_on_empty_returns_done_zero_when_writer_closed() {
         let _setup = setup();
-        let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        // Simulate the last writer closing.
-        payload.decr_writer();
+        // Simulate the last writer closing through the production path:
+        // dropping the writer's `Cap<OpenFile>` releases the last retain,
+        // EBR retires the slot, and `Drop for OpenFile` calls
+        // `decr_writer` exactly once. `drain_with_budget` forces the
+        // reclamation callback to run synchronously inside the test.
+        drop(writer);
+        drain_to_quiescence();
         assert_eq!(payload.writer_count_snapshot(), 0);
         let mut buf = [0u8; 4];
         let guard = tx_substrate::epoch::guard();
@@ -593,15 +622,22 @@ mod tests {
     #[test]
     fn pipe_step_write_with_no_readers_returns_epipe() {
         let _setup = setup();
-        let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        // Simulate the last reader closing.
-        payload.decr_reader();
+        // Production-path simulate of last-reader-close: drop the
+        // reader's `Cap<OpenFile>`. `Drop for OpenFile` fires from
+        // EBR reclamation and calls `decr_reader` exactly once.
+        drop(reader);
+        drain_to_quiescence();
         assert_eq!(payload.reader_count_snapshot(), 0);
         let guard = tx_substrate::epoch::guard();
         let outcome = step_write(&payload, b"x", &guard, false);
         drop(guard);
         assert_eq!(outcome, StepOutcome::Err(Errno::EPIPE));
+        // Hold writer to PIPE_BUF lifetime so its drop happens after
+        // the assertion (and naturally drives writer_count to 0 too).
+        drop(writer);
+        drain_to_quiescence();
     }
 
     #[test]
@@ -642,5 +678,80 @@ mod tests {
         let outcome = step_read(&payload, &mut buf, &guard, true);
         drop(guard);
         assert_eq!(outcome, StepOutcome::Err(Errno::EAGAIN));
+    }
+
+    // === shell-prompt roadmap Slice 1 — Drop-driven lifecycle ===========
+    //
+    // The four tests below exercise the production close path: dropping
+    // the last `Cap<OpenFile>` for a side fires `Drop for OpenFile`
+    // through EBR reclamation, which in turn calls `decr_reader` /
+    // `decr_writer` exactly once. Each `drain_with_budget(usize::MAX)`
+    // forces the reclamation callback to run synchronously inside the
+    // test instead of being deferred to whatever future drain happens
+    // to flush the queue.
+
+    #[test]
+    fn pipe_drop_last_writer_cap_flips_writer_count_via_open_file_drop() {
+        let _setup = setup();
+        let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        assert_eq!(payload.writer_count_snapshot(), 1);
+        drop(writer);
+        drain_to_quiescence();
+        assert_eq!(payload.writer_count_snapshot(), 0);
+        // Reader still alive; reader_count untouched.
+        assert_eq!(payload.reader_count_snapshot(), 1);
+    }
+
+    #[test]
+    fn pipe_drop_last_reader_cap_flips_reader_count_via_open_file_drop() {
+        let _setup = setup();
+        let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        assert_eq!(payload.reader_count_snapshot(), 1);
+        drop(reader);
+        drain_to_quiescence();
+        assert_eq!(payload.reader_count_snapshot(), 0);
+        assert_eq!(payload.writer_count_snapshot(), 1);
+        drop(writer);
+        drain_to_quiescence();
+    }
+
+    #[test]
+    fn pipe_drop_last_reader_cap_makes_pending_writer_surface_epipe() {
+        let _setup = setup();
+        let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        // Close the reader side via the production path.
+        drop(reader);
+        drain_to_quiescence();
+        // A subsequent writer-side step must surface EPIPE; the
+        // syscall arm in tx-shims pairs this with SIGPIPE delivery
+        // before returning -EPIPE to userspace.
+        let guard = tx_substrate::epoch::guard();
+        let outcome = step_write(&payload, b"x", &guard, false);
+        drop(guard);
+        assert_eq!(outcome, StepOutcome::Err(Errno::EPIPE));
+        drop(writer);
+        drain_to_quiescence();
+    }
+
+    #[test]
+    fn pipe_drop_last_writer_cap_makes_pending_reader_surface_eof() {
+        let _setup = setup();
+        let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        // Close the writer side via the production path.
+        drop(writer);
+        drain_to_quiescence();
+        // Reader on empty + writers closed must observe EOF (Done(0))
+        // rather than parking forever.
+        let mut buf = [0u8; 8];
+        let guard = tx_substrate::epoch::guard();
+        let outcome = step_read(&payload, &mut buf, &guard, false);
+        drop(guard);
+        assert_eq!(outcome, StepOutcome::Done(0));
+        drop(reader);
+        drain_to_quiescence();
     }
 }
