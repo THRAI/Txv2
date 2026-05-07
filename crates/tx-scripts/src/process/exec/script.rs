@@ -424,6 +424,14 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         at_phent: ELF64_PHENT,
         at_phnum: parsed.at_phnum,
         at_pagesz: USER_PAGE_SIZE,
+        // Drift-cleanup chore (2026-05-07): `AT_BASE = 0` for the
+        // v1 static-`ET_EXEC` contract (no PT_INTERP per
+        // `EXEC_v1.md`'s static-only pin); a future dynamic-link
+        // slice flips this to the interpreter's load bias.
+        // `AT_ENTRY` carries the parsed ELF entry through to musl's
+        // `__libc_start_main`.
+        at_base: 0,
+        at_entry: parsed.entry,
         at_uid: cred.uid.raw() as u64,
         at_euid: cred.euid.raw() as u64,
         at_gid: cred.gid.raw() as u64,

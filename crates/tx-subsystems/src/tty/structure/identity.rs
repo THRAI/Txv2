@@ -6,19 +6,18 @@
 //!
 //! # Staging types
 //!
-//! Two types below are staging replacements for final interfaces:
+//! One type below is a staging replacement for a final interface:
 //!
 //! * [`FixedName`] — replace with the global `FixedName<N>` type once it lands
 //!   in `tx-substrate` or a shared utility crate.
-//! * [`AtomicSlot`] — replace with the real `AtomicSlot<T>` once the session/
-//!   pgrp subsystem exports one.  The current implementation is a
-//!   `SpinMutex<Option<T>>` which has identical observable semantics but worse
-//!   scalability under high contention.
+//!
+//! `AtomicSlot<T>` previously lived here as a staging primitive; it now lives
+//! at `tx_substrate::AtomicSlot` and is consumed via the crate-root re-export.
 
 use tx_reactor::wait::Channel;
 use tx_substrate::bus::{RawPort, RawQueue};
 use tx_substrate::zone::PayloadCap;
-use tx_substrate::SpinMutex;
+use tx_substrate::{AtomicSlot, SpinMutex};
 
 use crate::wait_carrier;
 
@@ -57,63 +56,6 @@ impl<const N: usize> FixedName<N> {
     /// Return the stored bytes as a slice.
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len as usize]
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Staging: AtomicSlot<T>
-// ---------------------------------------------------------------------------
-
-/// Single-slot atomic container for an optional value.
-///
-/// TODO(Phase G): replace with the real `AtomicSlot<T>` once the session/pgrp
-/// subsystem defines one.  Current implementation wraps `SpinMutex<Option<T>>`
-/// which is correct but not lock-free.
-pub struct AtomicSlot<T> {
-    inner: SpinMutex<Option<T>>,
-}
-
-impl<T> AtomicSlot<T> {
-    pub const fn empty() -> Self {
-        Self {
-            inner: SpinMutex::new(None),
-        }
-    }
-
-    pub fn store(&self, value: Option<T>) {
-        *self.inner.lock() = value;
-    }
-
-    pub fn swap(&self, value: Option<T>) -> Option<T> {
-        let mut slot = self.inner.lock();
-        let old = slot.take();
-        *slot = value;
-        old
-    }
-
-    pub fn with<R, F: FnOnce(Option<&T>) -> R>(&self, f: F) -> R {
-        f(self.inner.lock().as_ref())
-    }
-
-    pub fn snapshot(&self) -> Option<T>
-    where
-        T: Clone,
-    {
-        self.inner.lock().clone()
-    }
-
-    /// Borrow-style snapshot: clone the slot's current value if any.
-    /// Equivalent to [`Self::snapshot`] but named to match the canonical
-    /// `AtomicSlot::load(&guard)` shape that future zone-aware slots
-    /// will expose. The guard is unused today (the staging
-    /// implementation is `SpinMutex`-backed) but reserved so callers
-    /// already pass it through; that lets the future swap to a real
-    /// EBR-aware slot drop the staging body without source changes.
-    pub fn load(&self) -> Option<T>
-    where
-        T: Clone,
-    {
-        self.snapshot()
     }
 }
 
