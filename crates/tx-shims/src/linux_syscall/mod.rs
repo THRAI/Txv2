@@ -54,13 +54,14 @@ use tx_subsystems::cred::{
 };
 use tx_subsystems::execution::{Errno, StepOutcome};
 use tx_subsystems::process::{
-    seed_child_leader_context, step_chdir, step_exit_group, step_fork, step_getcwd, step_setpgid,
-    step_setsid, step_waitpid_nohang, ChdirOutcome, ExitStatus, Pgid, Pid, ProcessIdentity,
-    SetpgidError, SetsidError, WaitError, WaitTarget,
+    process_by_pid, seed_child_leader_context, step_chdir, step_exit_group, step_fork,
+    step_getcwd, step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome, ExitStatus, Pgid,
+    Pid, ProcessIdentity, SetpgidError, SetsidError, WaitError, WaitTarget,
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
-    step_sigaction, SigDisposition, SigDispositionChange, SignalMask, Signum,
+    step_kill_process, step_sigaction, KillOutcome, SigDisposition, SigDispositionChange,
+    SignalMask, Signum,
 };
 use tx_subsystems::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
 use tx_subsystems::thread_runtime::{step_thread_exit, ThreadIdentity};
@@ -92,22 +93,27 @@ pub use numbers::{
     DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
     FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI,
     FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP,
-    F_GETFD, F_OK, F_SETFD, MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL,
-    MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE,
-    MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE,
-    MAP_SHARED, MAP_STACK, MAP_SYNC, NR_BRK, NR_CHDIR, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP,
-    NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT,
-    NR_FACCESSAT2, NR_FCHDIR, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FSTAT, NR_FUTEX, NR_GETCWD,
-    NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID,
-    NR_GETRESGID, NR_GETRESUID, NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_LSEEK,
-    NR_MADVISE, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
-    NR_OPENAT, NR_PIPE2, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SETGID, NR_SETPGID,
-    NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
-    NR_SET_TID_ADDRESS, NR_TIMES, NR_UMASK, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND, O_CLOEXEC,
-    O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC,
-    PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, R_OK, SEEK_CUR, SEEK_END,
-    SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME, TIMES_NS_PER_TICK,
-    TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ, WNOHANG, W_OK, X_OK,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_OK, F_SETFD, F_SETFL, GRND_INSECURE, GRND_NONBLOCK,
+    GRND_RANDOM, MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
+    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN,
+    MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
+    MAP_STACK, MAP_SYNC, NR_BRK, NR_CHDIR, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE,
+    NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHDIR,
+    NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FSTAT, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID,
+    NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID,
+    NR_GETRESUID, NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_KILL, NR_LSEEK, NR_MADVISE,
+    NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT, NR_OPENAT,
+    NR_PIPE2, NR_PRLIMIT64, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGRETURN,
+    NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID,
+    NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_TGKILL, NR_TIMES, NR_TKILL, NR_UMASK,
+    NR_UNAME, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL,
+    O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP,
+    PROT_NONE, PROT_READ, PROT_WRITE, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA,
+    RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE,
+    RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK,
+    RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW,
+    TIMER_ABSTIME, TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP,
+    TIOCSWINSZ, WNOHANG, W_OK, X_OK,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -380,7 +386,7 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_GETPPID => sys_getppid(ctx),
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_GETPGID => sys_getpgid(req.args, ctx),
-        nr if nr == NR_GETPGRP => SyscallResult::Error(ENOSYS_VALUE),
+        nr if nr == NR_GETPGRP => sys_getpgrp(ctx),
         nr if nr == NR_GETSID => sys_getsid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
@@ -515,6 +521,21 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_FCHDIR => SyscallResult::Error(ENOSYS_VALUE),
         nr if nr == NR_GETDENTS64 => sys_getdents64(req.args, ctx).await,
         nr if nr == NR_UMASK => sys_umask(req.args, ctx),
+        // Slice 7 of the shell-prompt roadmap — fcntl extension +
+        // day-1 misc syscalls. None individually heavy; each unblocks
+        // a specific shell-startup path.
+        nr if nr == NR_KILL => sys_kill(req.args),
+        nr if nr == NR_TKILL => sys_tkill(req.args),
+        nr if nr == NR_TGKILL => sys_tgkill(req.args),
+        nr if nr == NR_GETRANDOM => sys_getrandom::<P>(req.args),
+        nr if nr == NR_UNAME => sys_uname(req.args),
+        nr if nr == NR_PRLIMIT64 => sys_prlimit64(req.args, ctx),
+        // rt_sigreturn: deferred. Returns -ENOSYS — the
+        // SignalFrameIf::restore_signal_frame surface needs the trap
+        // frame which the dispatcher does not yet pass through. The
+        // dispatcher ENOSYS path matches; arm explicitly written for
+        // grep-stability and future wiring.
+        nr if nr == NR_RT_SIGRETURN => sys_rt_sigreturn(),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -991,13 +1012,17 @@ fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
 }
 
 /// `fcntl(fd, cmd, arg)` per the Wave 2 ELF-loader plan §"Part 2 —
-/// Per-fd CLOEXEC bitmap + fcntl(F_SETFD) + O_CLOEXEC".
+/// Per-fd CLOEXEC bitmap + fcntl(F_SETFD) + O_CLOEXEC" plus Slice 7 of
+/// the shell-prompt roadmap (fcntl extension).
 ///
-/// Day-1 covers only `F_GETFD` / `F_SETFD` against the per-process
-/// CLOEXEC set. Other commands return `-ENOSYS` until the relevant
-/// follow-up phase (`TODO(phase-fcntl-extension)`) extends the
-/// surface — `F_DUPFD`, `F_GETFL`, `F_SETFL`, etc. are out of scope
-/// for Wave 2.
+/// Wave 2 surface: `F_GETFD` / `F_SETFD` against the per-process
+/// CLOEXEC set.
+///
+/// Slice 7 surface adds `F_DUPFD` / `F_DUPFD_CLOEXEC` / `F_GETFL`.
+/// `F_SETFL` returns `-ENOSYS` (carryover — `OpenFileFlags` is a
+/// plain `Copy`-struct field on `OpenFile`, not behind an atomic /
+/// mutex, so the "replace flags atomically" semantic is unsafe under
+/// the current shape; `TODO(phase-fcntl-setfl)`).
 ///
 /// Validation (fd-ops Wave 1: `EBADF` is now driven by "is this fd
 /// open?" rather than the retired `FD_TABLE_SIZE = 8` ceiling — Linux
@@ -1013,9 +1038,10 @@ fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     // `FD_TABLE_SIZE` ceiling — the fd table is now a sparse
     // `BTreeMap<u32, Cap<OpenFile>>`, so any `u32` could be a key;
     // openness is the only meaningful EBADF discriminant.
-    if ctx.process.fd(fd).is_none() {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
+    let file = match ctx.process.fd(fd) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
 
     match cmd {
         F_GETFD => {
@@ -1036,7 +1062,55 @@ fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
             ctx.process.set_fd_cloexec(fd, on);
             SyscallResult::Return(0)
         }
-        // TODO(phase-fcntl-extension): F_DUPFD, F_GETFL, F_SETFL, ...
+        F_DUPFD => {
+            // Duplicate `fd` into the lowest-numbered slot ≥ `arg`.
+            // Per POSIX: the result clears the cloexec bit
+            // (`F_DUPFD_CLOEXEC` is the variant that sets it).
+            let min = arg as u32;
+            let new_fd = ctx.process.allocate_fd_at_least(min);
+            // install_fd returns the previous occupant, if any (in
+            // practice always None because allocate_fd_at_least
+            // returns the lowest *unused* slot). Drop it under the
+            // caller's EBR if it surfaces.
+            let _previous = ctx.process.install_fd(new_fd, file);
+            ctx.process.set_fd_cloexec(new_fd, false);
+            SyscallResult::Return(new_fd as i64)
+        }
+        F_DUPFD_CLOEXEC => {
+            // Like F_DUPFD but sets the cloexec bit on the new fd.
+            let min = arg as u32;
+            let new_fd = ctx.process.allocate_fd_at_least(min);
+            let _previous = ctx.process.install_fd(new_fd, file);
+            ctx.process.set_fd_cloexec(new_fd, true);
+            SyscallResult::Return(new_fd as i64)
+        }
+        F_GETFL => {
+            // Compose access-mode + per-OpenFile open-flag bits.
+            // `O_CLOEXEC` is **not** included — Linux's F_GETFL only
+            // reports the per-OpenFile bits, while CLOEXEC is per-fd
+            // (read via F_GETFD).
+            let f = file.flags();
+            let mut bits: u64 = match (f.read, f.write) {
+                (true, false) => O_RDONLY as u64,
+                (false, true) => O_WRONLY as u64,
+                (true, true) => O_RDWR as u64,
+                (false, false) => O_RDONLY as u64,
+            };
+            if f.append {
+                bits |= O_APPEND as u64;
+            }
+            if f.nonblocking {
+                bits |= O_NONBLOCK as u64;
+            }
+            SyscallResult::Return(bits as i64)
+        }
+        F_SETFL => {
+            // TODO(phase-fcntl-setfl): F_SETFL needs interior-mutable
+            // OpenFileFlags. Future slice owns this — the plain
+            // `Copy`-struct field on OpenFile cannot be mutated
+            // atomically without a structural change.
+            SyscallResult::Error(ENOSYS_VALUE)
+        }
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -4406,6 +4480,308 @@ async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     }
 
     SyscallResult::Return(written as i64)
+}
+
+// =====================================================================
+// Slice 7 of the shell-prompt roadmap — fcntl extension + day-1 misc
+// syscalls (`getpgrp` / `kill` / `tkill` / `tgkill` / `getrandom` /
+// `uname` / `prlimit64` / `rt_sigreturn`). Each is a small, isolated
+// arm that unblocks a specific shell-startup path. F_DUPFD /
+// F_DUPFD_CLOEXEC / F_GETFL extensions to fcntl live inside `sys_fcntl`
+// itself (see above). See
+// `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 7.
+// =====================================================================
+
+/// `getpgrp()` — Linux RV64 generic ABI `__NR_getpgrp = 81`.
+///
+/// glibc-only legacy call: glibc emulates `getpgrp()` as `getpgid(0)`.
+/// musl uses `getpgid(0)` directly and never issues this number, but
+/// shipping a real implementation is cheap and removes a startup
+/// `-ENOSYS` from any glibc-built binary that lands later.
+fn sys_getpgrp<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SyscallResult::Return(ctx.process.pgrp_cap().pgid.0 as i64)
+}
+
+/// `kill(pid, sig)` — Linux RV64 generic ABI `__NR_kill = 129`.
+///
+/// Slice 7 v1 surface:
+/// - `pid > 0`: deliver `sig` to the matching process via
+///   `tx_subsystems::signal::step_kill_process`. Resolved through
+///   `process_by_pid`'s init-rooted tree walk.
+/// - `pid <= 0`: pgrp / all-processes targets — out of scope for v1
+///   (`-ENOSYS`; needs a global pid-to-pgrp lookup the slice does
+///   not yet wire).
+/// - `sig == 0`: existence probe — return `0` if the target exists
+///   (live or zombie), `-ESRCH` otherwise. Linux semantic.
+/// - Unknown signum (outside 1..=64): `-EINVAL`.
+/// - Target zombie / no live thread: `-ESRCH` (matches Linux's
+///   "kill returns ESRCH if no signal could be delivered").
+fn sys_kill(args: [u64; 6]) -> SyscallResult {
+    let pid = args[0] as i32;
+    let sig = args[1] as u32;
+
+    if pid <= 0 {
+        // TODO(phase-pgrp-kill): pgrp-targeted (`pid < 0` /
+        // `pid == 0` / `pid == -1`) kills need a global pid-to-pgrp
+        // lookup the slice does not yet wire.
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+
+    let target = match process_by_pid(Pid(pid as u32)) {
+        Some(t) => t,
+        None => return SyscallResult::Error(ESRCH_VALUE),
+    };
+
+    if sig == 0 {
+        // Existence probe: 0 for live or zombie targets, -ESRCH for
+        // missing (handled above by the `process_by_pid` None branch).
+        return SyscallResult::Return(0);
+    }
+
+    // Bound check: Linux signums are 1..=64 (the realtime range
+    // shares the same encoding as `Signum`). Anything outside that
+    // is `-EINVAL`.
+    let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+        Some(s) => s,
+        None => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    match step_kill_process(&target, signum) {
+        KillOutcome::Delivered => SyscallResult::Return(0),
+        KillOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+    }
+}
+
+/// `tkill(tid, sig)` — Linux RV64 generic ABI `__NR_tkill = 130`.
+///
+/// Slice 7 v1 aliases this to [`sys_kill`]: txKernel has no
+/// per-thread signal state machine yet, so `tkill(tid, sig)` is
+/// treated as `kill(tid, sig)` (the tid is interpreted as a pid).
+/// `TODO(phase-thread-signals)`.
+fn sys_tkill(args: [u64; 6]) -> SyscallResult {
+    sys_kill(args)
+}
+
+/// `tgkill(tgid, tid, sig)` — Linux RV64 generic ABI
+/// `__NR_tgkill = 131`.
+///
+/// Slice 7 v1 aliases this to [`sys_kill`]: `tgid` (args[0]) is
+/// interpreted as a pid, `tid` (args[1]) is ignored, and `sig`
+/// (args[2]) is shifted to the kill arg slot.
+/// `TODO(phase-thread-signals)`.
+fn sys_tgkill(args: [u64; 6]) -> SyscallResult {
+    let mut k_args = args;
+    // sys_kill expects (pid, sig) at args[0]/args[1]. tgkill places
+    // sig at args[2]; shift it down for the alias.
+    k_args[1] = args[2];
+    sys_kill(k_args)
+}
+
+/// `getrandom(buf, buflen, flags)` — Linux RV64 generic ABI
+/// `__NR_getrandom = 278`.
+///
+/// Slice 7 v1: fills `buflen` bytes at `buf` from
+/// `<P as EntropyIf>::fill_random`. The `flags` arg is recognised
+/// (`GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE`) but ignored — the
+/// in-tree default impl is deterministic + non-blocking.
+///
+/// SAFETY: bootstrap kernel-buffer exemption — `buf` is treated as a
+/// kernel-side pointer (mirrors `sys_write` / `sys_getresuid`'s
+/// shape). Real EFAULT semantics on invalid user VA are deferred
+/// (`TODO(phase-userva)`). Null `buf` with non-zero `buflen` returns
+/// `-EFAULT`; `buflen == 0` is a successful no-op (`Return(0)`).
+fn sys_getrandom<P: EntropyIf>(args: [u64; 6]) -> SyscallResult {
+    let buf_uaddr = args[0];
+    let buf_len = args[1] as usize;
+    let _flags = args[2] as u32; // GRND_* recognised but ignored.
+
+    if buf_len == 0 {
+        return SyscallResult::Return(0);
+    }
+    if buf_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    // Fill via EntropyIf into a temporary kernel buffer, then
+    // volatile-write into the user buffer. Mirrors the
+    // `sys_getresuid` discipline (kernel-side write_volatile so the
+    // compiler cannot reorder the underlying user-visible store).
+    let mut tmp = alloc::vec![0u8; buf_len];
+    <P as EntropyIf>::fill_random(&mut tmp);
+    // SAFETY: TODO(phase-userva). Slice 7 inherits the kernel-buffer
+    // exemption used elsewhere in this file.
+    unsafe {
+        let dst = buf_uaddr as *mut u8;
+        for (i, b) in tmp.iter().enumerate() {
+            core::ptr::write_volatile(dst.add(i), *b);
+        }
+    }
+    SyscallResult::Return(buf_len as i64)
+}
+
+/// `uname(buf)` — Linux RV64 generic ABI `__NR_uname = 160`.
+///
+/// Writes a static utsname (`sysname` / `nodename` / `release` /
+/// `version` / `machine` / `domainname`) to `buf`. Each field is a
+/// `[u8; 65]` NUL-padded string. Slice 7 pins:
+///
+/// - `sysname = "Linux"` so musl's runtime "is this Linux?" probe
+///   succeeds.
+/// - `release = "6.1.0-txkernel"` so the version-triple parser at the
+///   front of the string sees a Linux 2.6.16+ kernel (musl's
+///   kernel-feature gating reads only the leading digits).
+/// - `machine = "riscv64"` matching the target ABI.
+///
+/// SAFETY: kernel-buffer exemption (mirrors `sys_getresuid`).
+fn sys_uname(args: [u64; 6]) -> SyscallResult {
+    let buf_uaddr = args[0];
+    if buf_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let utsname = build_utsname();
+    // SAFETY: TODO(phase-userva).
+    unsafe {
+        core::ptr::write_volatile(buf_uaddr as *mut UtsnameLayout, utsname);
+    }
+    SyscallResult::Return(0)
+}
+
+/// `prlimit64(pid, resource, new_rlim, old_rlim)` — Linux RV64
+/// generic ABI `__NR_prlimit64 = 261`.
+///
+/// Slice 7 v1: read-only static rlimit table for the calling process.
+/// `pid == 0` or `pid == self.pid` is the only supported target;
+/// cross-pid queries return `-EPERM`. `new_rlim` is silently ignored
+/// — limits are not actually enforced by any in-tree subsystem yet
+/// (`TODO(phase-rlimit-enforcement)`). The static table is generous
+/// (`RLIMIT_NOFILE = (1024, 4096)`, `RLIMIT_STACK = 8 MiB`, the rest
+/// `RLIM_INFINITY`).
+///
+/// Unknown resource ids return `-EINVAL`. Null `old_rlim` is OK (the
+/// arm just reports back via the return value) — Linux only requires
+/// the writeback when `old_rlim` is non-null.
+fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let pid = args[0] as u32;
+    let resource = args[1] as u32;
+    let _new_uaddr = args[2]; // ignored — limits not enforced today.
+    let old_uaddr = args[3];
+
+    if pid != 0 && pid != ctx.process.pid.0 {
+        // TODO(phase-pid-resolver): cross-pid prlimit64 once a global
+        // pid → Cap<ProcessIdentity> table is wired.
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+
+    let limit = match resource {
+        RLIMIT_NOFILE => RlimitLayout {
+            rlim_cur: 1024,
+            rlim_max: 4096,
+        },
+        RLIMIT_STACK => RlimitLayout {
+            rlim_cur: 8 * 1024 * 1024,
+            rlim_max: RLIM_INFINITY,
+        },
+        RLIMIT_CORE => RlimitLayout {
+            rlim_cur: 0,
+            rlim_max: RLIM_INFINITY,
+        },
+        RLIMIT_CPU
+        | RLIMIT_FSIZE
+        | RLIMIT_DATA
+        | RLIMIT_RSS
+        | RLIMIT_NPROC
+        | RLIMIT_MEMLOCK
+        | RLIMIT_AS
+        | RLIMIT_LOCKS
+        | RLIMIT_SIGPENDING
+        | RLIMIT_MSGQUEUE
+        | RLIMIT_NICE
+        | RLIMIT_RTPRIO
+        | RLIMIT_RTTIME => RlimitLayout {
+            rlim_cur: RLIM_INFINITY,
+            rlim_max: RLIM_INFINITY,
+        },
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    if old_uaddr != 0 {
+        // SAFETY: kernel-buffer exemption — TODO(phase-userva).
+        unsafe {
+            core::ptr::write_volatile(old_uaddr as *mut RlimitLayout, limit);
+        }
+    }
+    SyscallResult::Return(0)
+}
+
+/// `rt_sigreturn(...)` — Linux RV64 generic ABI
+/// `__NR_rt_sigreturn = 139`.
+///
+/// **Slice 7 carryover.** Returns `-ENOSYS` for now. The
+/// `SignalFrameIf::restore_signal_frame` / `read_signal_frame`
+/// surface in `tx-hal` requires a `TrapFrameMut<'_>` on the live
+/// trap frame and the user-stack pointer the kernel parked at
+/// signal-frame setup time; the `SyscallCtx` shape does not yet
+/// expose either. End-to-end wiring requires the trap-shell to invoke
+/// `SignalFrameIf` directly (bypassing this dispatcher) or pass the
+/// trap-frame pointer through the syscall context — both are out of
+/// scope for Slice 7. Real signal handlers are also not yet wired
+/// (no userspace handler trampoline path), so the carryover does not
+/// block any day-1 shell flow. `TODO(phase-signal-frame)`.
+fn sys_rt_sigreturn() -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+// ---------------------------------------------------------------------
+// Layout structs for Slice 7 syscall arms.
+// ---------------------------------------------------------------------
+
+/// Linux uapi `struct utsname` field width (`__NEW_UTS_LEN + 1 = 65`).
+const UTSNAME_FIELD: usize = 65;
+
+/// Linux RV64 generic ABI `struct utsname` layout — six fields,
+/// each `[u8; 65]` NUL-padded. The field count and width are fixed
+/// across architectures (Linux's `<sys/utsname.h>`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UtsnameLayout {
+    sysname: [u8; UTSNAME_FIELD],
+    nodename: [u8; UTSNAME_FIELD],
+    release: [u8; UTSNAME_FIELD],
+    version: [u8; UTSNAME_FIELD],
+    machine: [u8; UTSNAME_FIELD],
+    domainname: [u8; UTSNAME_FIELD],
+}
+
+fn build_utsname() -> UtsnameLayout {
+    fn pad(s: &str) -> [u8; UTSNAME_FIELD] {
+        let mut out = [0u8; UTSNAME_FIELD];
+        let bytes = s.as_bytes();
+        // Reserve the trailing NUL byte. `min(len, 64)` clamps the
+        // copy so `out[64] = 0` always.
+        let n = core::cmp::min(bytes.len(), UTSNAME_FIELD - 1);
+        let (head, _) = out.split_at_mut(n);
+        head.copy_from_slice(&bytes[..n]);
+        out
+    }
+    UtsnameLayout {
+        sysname: pad("Linux"),
+        nodename: pad("txkernel"),
+        // Linux 6.1.0 is the LTS line musl 1.2.x runtime probes treat
+        // as fully featured.
+        release: pad("6.1.0-txkernel"),
+        version: pad("#1 SMP txkernel"),
+        machine: pad("riscv64"),
+        domainname: pad("(none)"),
+    }
+}
+
+/// Linux uapi `struct rlimit64` layout — two `u64` fields. Used as
+/// the writeback shape for `sys_prlimit64`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RlimitLayout {
+    rlim_cur: u64,
+    rlim_max: u64,
 }
 
 /// Resolve the `Arc<dyn FsOps>` in scope for a directory rnode.
