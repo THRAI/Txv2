@@ -705,7 +705,7 @@ fn exec_script_loads_minimal_elf_seeds_saved_user_context() {
     let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
 
     let aspace_before = process.aspace_cap().expect("alive aspace");
-    let cred = Credential::default();
+    let cred = Credential::root();
 
     let result = block_on(exec_script::<ScriptsTestPmap>(
         &process,
@@ -747,7 +747,7 @@ fn exec_script_resets_brk_base_from_image_plan() {
     let bytes = minimal_elf_bytes();
     let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let result = block_on(exec_script::<ScriptsTestPmap>(
         &process,
         &thread,
@@ -774,7 +774,7 @@ fn exec_script_invalid_elf_returns_not_executable() {
     let (process, thread, _fs) = bootstrap_with_file(b"bad", &bytes);
 
     let aspace_before = process.aspace_cap().expect("alive aspace");
-    let cred = Credential::default();
+    let cred = Credential::root();
     let result = block_on(exec_script::<ScriptsTestPmap>(
         &process,
         &thread,
@@ -803,7 +803,7 @@ fn exec_script_path_not_found_returns_path_not_found() {
     let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
 
     let aspace_before = process.aspace_cap().expect("alive aspace");
-    let cred = Credential::default();
+    let cred = Credential::root();
     let result = block_on(exec_script::<ScriptsTestPmap>(
         &process,
         &thread,
@@ -836,7 +836,7 @@ fn exec_script_resets_signal_dispositions_to_sig_dfl() {
         SigDisposition::Handler(0xdead),
     );
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let result = block_on(exec_script::<ScriptsTestPmap>(
         &process,
         &thread,
@@ -874,8 +874,10 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
     // public.
     let open_for = |name: &[u8]| -> Cap<OpenFile> {
         // Resolve through the walker; it will go through
-        // materialise_rnode and produce a PageBacked RNode.
-        let cred = Credential::default();
+        // materialise_rnode and produce a PageBacked RNode. Use the
+        // root walker cred so the test isn't gated on tmpfs's mode
+        // bits — the slice's DAC test coverage lives elsewhere.
+        let cred = Credential::root();
         let cwd = process.cwd().expect("cwd bound");
         let guard = tx_substrate::epoch::guard();
         let outcome = block_on(tx_subsystems::vfs::walker::step_open(
@@ -907,7 +909,7 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
     assert!(process.fd(3).is_some());
     assert!(process.fd(4).is_some());
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let result = block_on(exec_script::<ScriptsTestPmap>(
         &process,
         &thread,

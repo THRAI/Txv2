@@ -78,6 +78,10 @@ impl Capability {
     pub const CHOWN: Self = Self(0);
     /// `CAP_DAC_OVERRIDE` — bypass discretionary access control.
     pub const DAC_OVERRIDE: Self = Self(1);
+    /// `CAP_FOWNER` — bypass file-owner-only checks (chmod, chown,
+    /// utimes, etc.) for files the caller does not own. Per Linux's
+    /// POSIX cap-FOWNER number (3).
+    pub const FOWNER: Self = Self(3);
     /// `CAP_KILL` — send signals to processes with different uids.
     pub const KILL: Self = Self(5);
     /// `CAP_SETGID` — arbitrary `setgid` family ops.

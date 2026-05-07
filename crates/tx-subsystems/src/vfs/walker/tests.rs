@@ -19,7 +19,7 @@ use crate::tty::execution::{register_console_alias, register_hardware};
 use crate::tty::structure::TtyIdentity;
 use crate::vfs::structure::{
     Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
-    OpenFileFlags, RNode, RNodeBacking, S_IFDIR, S_IFLNK,
+    OpenFileFlags, RNode, RNodeBacking, S_IFDIR,
 };
 use crate::vfs::FsOps;
 
@@ -93,10 +93,26 @@ struct TestFsInner {
         FsObjectId,
         alloc::collections::BTreeMap<alloc::vec::Vec<u8>, FsObjectId>,
     >,
-    /// fs_object_id → (kind, optional symlink target).
-    inodes: alloc::collections::BTreeMap<FsObjectId, (InodeKind, Option<alloc::vec::Vec<u8>>)>,
+    /// fs_object_id → (kind, optional symlink target, mode-low-bits,
+    /// uid, gid). The walker DAC predicate consults the
+    /// owner-triplet/group-triplet/other-triplet selection on the
+    /// inode meta; tests parameterise the per-inode mode/uid/gid
+    /// here so the assertions can drive the predicate down each
+    /// triplet branch.
+    inodes: alloc::collections::BTreeMap<
+        FsObjectId,
+        (InodeKind, Option<alloc::vec::Vec<u8>>, u16, u32, u32),
+    >,
     next_id: u64,
 }
+
+// Default mode-low-bits for the legacy `add_*` helpers. The DAC slice
+// uses 0o755 for directories so the walker's descent X-bit check
+// passes for `Credential::root()` (the default in test paths post-
+// Wave-3).
+const TEST_DEFAULT_DIR_MODE: u16 = 0o755;
+const TEST_DEFAULT_REGULAR_MODE: u16 = 0o644;
+const TEST_DEFAULT_SYMLINK_MODE: u16 = 0o777;
 
 impl TestFs {
     fn new(root_id: FsObjectId) -> Arc<Self> {
@@ -108,7 +124,10 @@ impl TestFs {
         inner
             .children
             .insert(root_id, alloc::collections::BTreeMap::new());
-        inner.inodes.insert(root_id, (InodeKind::Directory, None));
+        inner.inodes.insert(
+            root_id,
+            (InodeKind::Directory, None, TEST_DEFAULT_DIR_MODE, 0, 0),
+        );
         Arc::new(Self {
             inner: tx_substrate::SpinMutex::new(inner),
         })
@@ -132,7 +151,36 @@ impl TestFs {
         inner
             .children
             .insert(id, alloc::collections::BTreeMap::new());
-        inner.inodes.insert(id, (InodeKind::Directory, None));
+        inner.inodes.insert(
+            id,
+            (InodeKind::Directory, None, TEST_DEFAULT_DIR_MODE, 0, 0),
+        );
+        id
+    }
+
+    /// Add a directory with a custom mode (low bits)/uid/gid, used by
+    /// the DAC predicate tests to drive each triplet branch.
+    fn add_dir_with_perm(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode_low: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsObjectId {
+        let id = self.alloc();
+        let mut inner = self.inner.lock();
+        inner
+            .children
+            .entry(parent)
+            .or_default()
+            .insert(name.to_vec(), id);
+        inner
+            .children
+            .insert(id, alloc::collections::BTreeMap::new());
+        inner
+            .inodes
+            .insert(id, (InodeKind::Directory, None, mode_low, uid, gid));
         id
     }
 
@@ -144,9 +192,16 @@ impl TestFs {
             .entry(parent)
             .or_default()
             .insert(name.to_vec(), id);
-        inner
-            .inodes
-            .insert(id, (InodeKind::Symlink, Some(target.to_vec())));
+        inner.inodes.insert(
+            id,
+            (
+                InodeKind::Symlink,
+                Some(target.to_vec()),
+                TEST_DEFAULT_SYMLINK_MODE,
+                0,
+                0,
+            ),
+        );
         id
     }
 
@@ -166,8 +221,26 @@ impl TestFs {
             .entry(parent)
             .or_default()
             .insert(name.to_vec(), id);
-        inner.inodes.insert(id, (InodeKind::Regular, None));
+        inner.inodes.insert(
+            id,
+            (InodeKind::Regular, None, TEST_DEFAULT_REGULAR_MODE, 0, 0),
+        );
         id
+    }
+
+    /// Set per-inode (mode-low-bits, uid, gid) directly. Used by the
+    /// step_open mode-validation tests to flip the mode after a child
+    /// has been created. The slice's `step_open` consults the inode's
+    /// mode bits at terminal-component open time; the walker's
+    /// `load_inode_meta` call site sees the latest value.
+    #[allow(dead_code)]
+    fn set_inode_perm(&self, id: FsObjectId, mode_low: u16, uid: u32, gid: u32) {
+        let mut inner = self.inner.lock();
+        if let Some((_, _, m, u, g)) = inner.inodes.get_mut(&id) {
+            *m = mode_low;
+            *u = uid;
+            *g = gid;
+        }
     }
 }
 
@@ -194,15 +267,16 @@ impl FsOps for TestFs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<InodeMeta> {
         let inner = self.inner.lock();
-        let Some((kind, _)) = inner.inodes.get(&fs_object_id) else {
+        let Some((kind, _, mode_low, uid, gid)) = inner.inodes.get(&fs_object_id) else {
             return StepOutcome::Err(Errno::ENOENT);
         };
-        let mode = match kind {
-            InodeKind::Directory => S_IFDIR | 0o755,
-            InodeKind::Symlink => S_IFLNK | 0o777,
-            _ => 0o644,
-        };
-        StepOutcome::Done(InodeMeta::new(*kind, mode))
+        // S_IFMT bits get OR-ed in by InodeMeta::new based on `kind`;
+        // the per-inode mode_low covers the rwx triplets + setuid/
+        // setgid bits the DAC slice tests exercise.
+        let mut meta = InodeMeta::new(*kind, *mode_low);
+        meta.uid = *uid;
+        meta.gid = *gid;
+        StepOutcome::Done(meta)
     }
 
     fn serialize_inode_meta(
@@ -304,7 +378,7 @@ impl FsOps for TestFs {
     fn read_link(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<Box<[u8]>> {
         let inner = self.inner.lock();
         match inner.inodes.get(&fs_object_id) {
-            Some((InodeKind::Symlink, Some(target))) => {
+            Some((InodeKind::Symlink, Some(target), _, _, _)) => {
                 StepOutcome::Done(target.clone().into_boxed_slice())
             }
             Some(_) => StepOutcome::Err(Errno::EINVAL),
@@ -512,7 +586,7 @@ fn step_walk_resolves_relative_path_within_rootfs() {
     let bar_id = topo.rootfs.add_dir(foo_id, b"bar");
     let _ = bar_id;
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
@@ -541,7 +615,7 @@ fn step_walk_resolves_absolute_path_from_root() {
     let bar_id = topo.rootfs.add_dir(foo_id, b"bar");
     let _ = (foo_id, bar_id);
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
@@ -564,7 +638,7 @@ fn step_walk_returns_enoent_on_missing() {
     init_zones();
     let topo = build_rootfs();
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/nope", &cred, &guard));
     drop(guard);
@@ -581,7 +655,7 @@ fn step_walk_returns_enotdir_on_trailing_slash_after_file() {
 
     let _file_id = topo.rootfs.add_regular(FsObjectId::new(2), b"thing");
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
@@ -603,7 +677,7 @@ fn step_walk_returns_enotdir_when_traversing_through_file() {
 
     let _file_id = topo.rootfs.add_regular(FsObjectId::new(2), b"thing");
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
@@ -628,7 +702,7 @@ fn step_walk_chases_relative_symlink_to_target() {
     topo.rootfs
         .add_symlink(FsObjectId::new(2), b"alias", b"realdir");
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
@@ -660,7 +734,7 @@ fn step_walk_chases_absolute_symlink_from_root() {
     topo.rootfs
         .add_symlink(FsObjectId::new(2), b"jump", b"/foo/bar");
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/jump", &cred, &guard));
     drop(guard);
@@ -698,7 +772,7 @@ fn step_walk_returns_eloop_after_41_hops() {
     topo.rootfs
         .add_dir(FsObjectId::new(2), final_name.as_bytes());
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/s0", &cred, &guard));
     drop(guard);
@@ -738,7 +812,7 @@ fn step_walk_crosses_mount_point_at_dev() {
     // then crosses on lookup.
     crate::mount::register_mount(&rootfs_payload, root_dev_id, dev_mount.clone());
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
@@ -763,6 +837,301 @@ fn step_walk_crosses_mount_point_at_dev() {
     }
 }
 
+// === DAC predicate tests (Wave 3 Part 2) ==============================
+//
+// These exercise the walker's `check_descend_perm` (intermediate
+// directory traversal) and `step_open`'s `check_open_perm`
+// (terminal-component R/W validation). Each test builds a single
+// child directory under the rootfs root with an explicit
+// (mode, uid, gid) and walks/opens against it with a
+// non-root `Credential`.
+
+fn unprivileged_cred(uid: u32, gid: u32) -> Credential {
+    Credential {
+        uid,
+        gid,
+        effective_caps: crate::cred::CapabilitySet::EMPTY,
+    }
+}
+
+#[test]
+fn step_walk_owner_can_traverse_dir_with_owner_x_bit() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs();
+
+    // Owner-only X (0o100): owner = uid 1000 has search.
+    let _dir = topo
+        .rootfs
+        .add_dir_with_perm(FsObjectId::new(2), b"ownerdir", 0o100, 1000, 0);
+    topo.rootfs.add_dir(_dir, b"leaf");
+
+    let cred = unprivileged_cred(1000, 0);
+    let guard = tx_substrate::epoch::guard();
+    let outcome = block_on(step_walk(
+        topo.root_dentry.clone(),
+        b"/ownerdir/leaf",
+        &cred,
+        &guard,
+    ));
+    drop(guard);
+    match outcome {
+        StepOutcome::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
+        other => panic!("expected Done(leaf), got {other:?}"),
+    }
+}
+
+#[test]
+fn step_walk_other_cannot_traverse_dir_without_other_x_bit() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs();
+
+    // Mode 0o700: owner = (rwx), group = 0, other = 0. uid 9999 falls
+    // through owner/group and lands on the empty "other" triplet, so
+    // descent must fail with EACCES.
+    let dir = topo
+        .rootfs
+        .add_dir_with_perm(FsObjectId::new(2), b"ownerdir", 0o700, 1000, 1000);
+    topo.rootfs.add_dir(dir, b"leaf");
+
+    let cred = unprivileged_cred(9999, 9999);
+    let guard = tx_substrate::epoch::guard();
+    let outcome = block_on(step_walk(
+        topo.root_dentry.clone(),
+        b"/ownerdir/leaf",
+        &cred,
+        &guard,
+    ));
+    drop(guard);
+    assert_eq!(outcome, StepOutcome::Err(Errno::EACCES));
+}
+
+#[test]
+fn step_walk_dac_override_short_circuits_perm_check() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs();
+
+    // Mode 0o000 — every triplet is empty. Without DAC_OVERRIDE the
+    // walker can't descend; with it the descent succeeds.
+    let dir = topo
+        .rootfs
+        .add_dir_with_perm(FsObjectId::new(2), b"locked", 0o000, 1000, 1000);
+    topo.rootfs.add_dir(dir, b"leaf");
+
+    let mut caps = crate::cred::CapabilitySet::EMPTY;
+    caps.add(crate::cred::Capability::DAC_OVERRIDE);
+    let cred = Credential {
+        uid: 9999,
+        gid: 9999,
+        effective_caps: caps,
+    };
+    let guard = tx_substrate::epoch::guard();
+    let outcome = block_on(step_walk(
+        topo.root_dentry.clone(),
+        b"/locked/leaf",
+        &cred,
+        &guard,
+    ));
+    drop(guard);
+    match outcome {
+        StepOutcome::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
+        other => panic!("expected Done(leaf) under DAC_OVERRIDE, got {other:?}"),
+    }
+}
+
+#[test]
+fn step_walk_group_match_uses_group_triplet() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs();
+
+    // Owner = 1000, group = 500, mode = 0o010 (group-only X). A
+    // caller in group 500 (uid != owner) lands on the group triplet
+    // and gets X.
+    let dir = topo
+        .rootfs
+        .add_dir_with_perm(FsObjectId::new(2), b"groupdir", 0o010, 1000, 500);
+    topo.rootfs.add_dir(dir, b"leaf");
+
+    let cred = unprivileged_cred(2000, 500);
+    let guard = tx_substrate::epoch::guard();
+    let outcome = block_on(step_walk(
+        topo.root_dentry.clone(),
+        b"/groupdir/leaf",
+        &cred,
+        &guard,
+    ));
+    drop(guard);
+    match outcome {
+        StepOutcome::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
+        other => panic!("expected Done(leaf), got {other:?}"),
+    }
+}
+
+#[test]
+fn step_open_caller_with_read_bit_succeeds() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs();
+
+    // Terminal directory the open targets has owner-rwx. step_open
+    // returns ENOSYS for non-directory PageBacked materialisation in
+    // this test fixture, so we open against a directory (the dispatch
+    // returns Done(OpenFile) for directories, then EISDIR happens
+    // only when step_read is called).
+    let dir = topo
+        .rootfs
+        .add_dir_with_perm(FsObjectId::new(2), b"readdir", 0o400, 1000, 0);
+    let _ = dir;
+
+    let cred = unprivileged_cred(1000, 0);
+    let guard = tx_substrate::epoch::guard();
+    let outcome = block_on(step_open(
+        topo.root_dentry.clone(),
+        b"/readdir",
+        OpenFileFlags {
+            read: true,
+            write: false,
+            append: false,
+            cloexec: false,
+        },
+        0,
+        &cred,
+        &guard,
+    ));
+    drop(guard);
+    match outcome {
+        StepOutcome::Done(_) => {}
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn step_open_no_read_bit_returns_eacces() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs();
+
+    // Owner = 1000, mode = 0o100 (X only, no R). The descent succeeds
+    // (X bit grants search) but the open-mode check fails because R
+    // is not set.
+    let _dir = topo
+        .rootfs
+        .add_dir_with_perm(FsObjectId::new(2), b"locked", 0o100, 1000, 0);
+
+    let cred = unprivileged_cred(1000, 0);
+    let guard = tx_substrate::epoch::guard();
+    let outcome = block_on(step_open(
+        topo.root_dentry.clone(),
+        b"/locked",
+        OpenFileFlags {
+            read: true,
+            write: false,
+            append: false,
+            cloexec: false,
+        },
+        0,
+        &cred,
+        &guard,
+    ));
+    drop(guard);
+    assert_eq!(outcome, StepOutcome::Err(Errno::EACCES));
+}
+
+#[test]
+fn step_open_caller_with_write_bit_succeeds() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs();
+
+    // Owner = 1000, mode = 0o600 (rw, no X). For the descent to even
+    // reach this dentry, the parent (rootfs root, mode 0o755) must
+    // have other-X set — it does.
+    let _dir = topo
+        .rootfs
+        .add_dir_with_perm(FsObjectId::new(2), b"rwdir", 0o600, 1000, 0);
+
+    let cred = unprivileged_cred(1000, 0);
+    let guard = tx_substrate::epoch::guard();
+    let outcome = block_on(step_open(
+        topo.root_dentry.clone(),
+        b"/rwdir",
+        OpenFileFlags {
+            read: false,
+            write: true,
+            append: false,
+            cloexec: false,
+        },
+        0,
+        &cred,
+        &guard,
+    ));
+    drop(guard);
+    match outcome {
+        StepOutcome::Done(_) => {}
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn step_open_dac_override_short_circuits() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs();
+
+    // Owner = 1000, mode = 0o000. Without DAC_OVERRIDE step_open
+    // would EACCES (no R bit on any triplet); with it the open
+    // succeeds.
+    let _dir = topo
+        .rootfs
+        .add_dir_with_perm(FsObjectId::new(2), b"locked", 0o000, 1000, 0);
+
+    let mut caps = crate::cred::CapabilitySet::EMPTY;
+    caps.add(crate::cred::Capability::DAC_OVERRIDE);
+    let cred = Credential {
+        uid: 9999,
+        gid: 9999,
+        effective_caps: caps,
+    };
+    let guard = tx_substrate::epoch::guard();
+    let outcome = block_on(step_open(
+        topo.root_dentry.clone(),
+        b"/locked",
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+        },
+        0,
+        &cred,
+        &guard,
+    ));
+    drop(guard);
+    match outcome {
+        StepOutcome::Done(_) => {}
+        other => panic!("expected Done under DAC_OVERRIDE, got {other:?}"),
+    }
+}
+
 #[test]
 fn step_open_round_trips_to_directory_dentry() {
     let _serial = crate::test_support::EPOCH_TEST_LOCK
@@ -773,7 +1142,7 @@ fn step_open_round_trips_to_directory_dentry() {
 
     let _dir_id = topo.rootfs.add_dir(FsObjectId::new(2), b"opendir");
 
-    let cred = Credential::default();
+    let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(step_open(
         topo.root_dentry.clone(),

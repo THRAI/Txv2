@@ -8,6 +8,7 @@ pub use tx_substrate::epoch::Guard;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Errno {
+    EACCES,
     EBUSY,
     EDQUOT,
     EEXIST,

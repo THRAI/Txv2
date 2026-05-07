@@ -54,15 +54,35 @@
 //!
 //! ## Permissions
 //!
-//! `Credential` is threaded through but the slice defers mode-bit
-//! checking; matches the existing `bind_init_cwd_and_root` "always
-//! allow for init" surface.
+//! Per `txdoc:VFS-CHECKS-PERMISSIONS-1`
+//! (`docs/design/05_filesystem/VFS_CHECKS_V2.1.md`):
+//!
+//! - At each *intermediate* directory component the walker enforces
+//!   POSIX search (`X`) permission via [`check_descend_perm`]. A
+//!   caller without the relevant `X` bit on the parent inode's mode
+//!   triplet receives `Errno::EACCES` (mapping to `WalkCause::
+//!   TraverseDenied` for spec-trace consumers); `CAP_DAC_OVERRIDE`
+//!   short-circuits.
+//! - At terminal-component open ([`step_open`]), [`check_open_perm`]
+//!   validates the requested `OpenFileFlags { read, write }` against
+//!   the inode's mode bits using the same triplet selection rule.
+//!   Execute permission for `exec_script` is enforced separately at
+//!   exec time (Wave 4); `step_open` only enforces R/W.
+//!
+//! Both checks consult the **effective** uid/gid (the
+//! `Credential` projection of `Cred` already does this — see
+//! `Credential::from(&Cred)` in `crate::vfs::structure`).
+//! `Credential::default()` carries `effective_caps =
+//! CapabilitySet::EMPTY`, so a default-constructed credential is a
+//! fully unprivileged uid-0 caller. Production bootstrap paths use
+//! [`Credential::root`] when the caller is root by construction.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use tx_substrate::zone::{Cap, Weak};
 
+use crate::cred::Capability;
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::mount::{self, MountIdentity, MountPayload};
 use crate::vfs::structure::{
@@ -96,15 +116,12 @@ pub async fn step_walk<'g>(
     cred: &Credential,
     guard: &Guard<'g>,
 ) -> StepOutcome<Cap<DEntry>> {
-    // TODO(phase-vfs-perms): implement DAC mode check via cred and
-    // inode meta. The slice always allows; the parameter stays in
-    // the signature so the future check has a place to land.
-    let _ = cred;
-    walk_inner(rooted_at, path, guard)
+    walk_inner(rooted_at, path, cred, guard)
 }
 
-/// Open a path by name. Resolves via [`step_walk`], then materialises
-/// an `OpenFile` over the terminal RNode.
+/// Open a path by name. Resolves via [`step_walk`], validates the
+/// requested mode against the inode's permission bits, then
+/// materialises an `OpenFile` over the terminal RNode.
 pub async fn step_open<'g>(
     rooted_at: Cap<DEntry>,
     path: &[u8],
@@ -129,11 +146,78 @@ pub async fn step_open<'g>(
         StepOutcome::Err(err) => return StepOutcome::Err(err),
     };
 
+    // Validate the requested open mode against the terminal inode's
+    // R/W permission bits. Execute is enforced at exec_script time
+    // (Wave 4), not here. Per `txdoc:VFS-CHECKS-PERMISSIONS-1`.
+    let terminal_meta = dentry.rnode().meta();
+    if let Err(err) = check_open_perm(&terminal_meta, flags, cred) {
+        return StepOutcome::Err(err);
+    }
+
     let rnode = dentry.rnode().clone();
     match OpenFile::new_cap(rnode, flags) {
         Ok(open) => StepOutcome::Done(open),
         Err(_) => StepOutcome::Err(Errno::EIO),
     }
+}
+
+// === DAC predicates ===================================================
+
+/// Pick the relevant POSIX mode-triplet bits for `cred` against the
+/// inode's owner/group: owner (`>> 6`) > group (`>> 3`) > other.
+/// Returns the bottom 3 bits — `(rwx)` for the chosen triplet.
+fn select_perm_triplet(meta: &InodeMeta, cred: &Credential) -> u32 {
+    let mode = meta.mode as u32;
+    if cred.uid == meta.uid {
+        (mode >> 6) & 0o7
+    } else if cred.gid == meta.gid {
+        (mode >> 3) & 0o7
+    } else {
+        mode & 0o7
+    }
+}
+
+/// DAC search/traversal check for an interior directory component.
+/// Walker invokes this from [`walk_inner`] before descending into a
+/// resolved child directory's `lookup`. POSIX rule: the appropriate
+/// triplet must have the `X` (execute = search) bit set, unless the
+/// caller carries `CAP_DAC_OVERRIDE`.
+///
+/// Slice simplification: directories with at least one X bit also
+/// satisfy `CAP_DAC_OVERRIDE`'s execute-bit constraint by definition,
+/// so the override branch returns success unconditionally for
+/// directories. Per `txdoc:VFS-CHECKS-PERMISSIONS-1`.
+fn check_descend_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), Errno> {
+    if cred.effective_caps.contains(Capability::DAC_OVERRIDE) {
+        return Ok(());
+    }
+    let bits = select_perm_triplet(meta, cred);
+    if bits & 0o1 == 0 {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
+}
+
+/// DAC R/W check for terminal-component open. Validates
+/// `OpenFileFlags::{read, write}` against the inode's owner/group
+/// permission triplet. `CAP_DAC_OVERRIDE` short-circuits.
+///
+/// Slice simplification: full DAC override (real Linux's
+/// `CAP_DAC_OVERRIDE` does not grant exec on regular files unless an
+/// X bit is set, but `step_open` does not enforce exec — that lives
+/// in `exec_script` in Wave 4). Per `txdoc:VFS-CHECKS-PERMISSIONS-1`.
+fn check_open_perm(meta: &InodeMeta, flags: OpenFileFlags, cred: &Credential) -> Result<(), Errno> {
+    if cred.effective_caps.contains(Capability::DAC_OVERRIDE) {
+        return Ok(());
+    }
+    let bits = select_perm_triplet(meta, cred);
+    if flags.read && bits & 0o4 == 0 {
+        return Err(Errno::EACCES);
+    }
+    if flags.write && bits & 0o2 == 0 {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
 }
 
 // === walker internals =================================================
@@ -147,6 +231,7 @@ pub async fn step_open<'g>(
 fn walk_inner<'g>(
     rooted_at: Cap<DEntry>,
     path: &[u8],
+    cred: &Credential,
     guard: &Guard<'g>,
 ) -> StepOutcome<Cap<DEntry>> {
     let mount_root = mount_root_dentry(&rooted_at, guard);
@@ -214,6 +299,15 @@ fn walk_inner<'g>(
         // Interior components require the current to be a directory.
         if current.rnode().meta().kind() != InodeKind::Directory {
             return StepOutcome::Err(Errno::ENOTDIR);
+        }
+
+        // POSIX search permission: the parent directory must grant
+        // X (search) to the caller before its `lookup` is consulted.
+        // `CAP_DAC_OVERRIDE` short-circuits via `check_descend_perm`.
+        // Per `txdoc:VFS-CHECKS-PERMISSIONS-1`.
+        let parent_meta = current.rnode().meta();
+        if let Err(err) = check_descend_perm(&parent_meta, cred) {
+            return StepOutcome::Err(err);
         }
 
         let parent_fs_object_id = current.rnode().fs_object_id();

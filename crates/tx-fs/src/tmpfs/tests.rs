@@ -6,10 +6,11 @@
 
 use alloc::sync::Arc;
 
+use tx_subsystems::cred::{Capability, CapabilitySet};
 use tx_subsystems::execution::{Errno, StepOutcome};
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::{
-    Credential, DirCursor, FsObjectId, FsOps, InodeKind, RNodeBacking, S_IFMT,
+    Credential, DirCursor, FsObjectId, FsOps, InodeKind, RNodeBacking, S_IFMT, S_ISGID, S_ISUID,
 };
 
 use super::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
@@ -36,7 +37,7 @@ fn tmpfs_create_then_lookup_round_trip() {
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
-    let cred = Credential::default();
+    let cred = Credential::root();
 
     let (file_id, file_meta) =
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"hello", 0o100644, &cred, &guard) {
@@ -79,7 +80,7 @@ fn tmpfs_mkdir_then_readdir_yields_dir_entry() {
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
-    let cred = Credential::default();
+    let cred = Credential::root();
 
     let (dev_id, dev_meta) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"dev", 0o755, &cred, &guard) {
         StepOutcome::Done(out) => out,
@@ -127,7 +128,7 @@ fn tmpfs_unlink_drops_inode() {
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
-    let cred = Credential::default();
+    let cred = Credential::root();
 
     let (file_id, _) =
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"victim", 0o100644, &cred, &guard) {
@@ -171,7 +172,7 @@ fn tmpfs_fetch_page_materialises_anon_then_flush_noop() {
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
-    let cred = Credential::default();
+    let cred = Credential::root();
 
     let (file_id, _) =
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"page-test", 0o100644, &cred, &guard) {
@@ -226,7 +227,7 @@ fn tmpfs_truncate_zeroes_size_and_reflects_in_meta() {
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
-    let cred = Credential::default();
+    let cred = Credential::root();
 
     let (file_id, _) =
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"trunc", 0o100644, &cred, &guard) {
@@ -279,7 +280,7 @@ fn tmpfs_create_existing_returns_eexist() {
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
-    let cred = Credential::default();
+    let cred = Credential::root();
 
     // First create succeeds.
     let _ = match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"dup", 0o100644, &cred, &guard) {
@@ -313,7 +314,7 @@ fn tmpfs_rmdir_nonempty_returns_enotempty() {
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
-    let cred = Credential::default();
+    let cred = Credential::root();
 
     let (dir_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"d", 0o755, &cred, &guard) {
         StepOutcome::Done(out) => out,
@@ -367,7 +368,7 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
-    let cred = Credential::default();
+    let cred = Credential::root();
 
     let (file_id, file_meta) =
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"init", 0o100755, &cred, &guard) {
@@ -438,7 +439,7 @@ fn tmpfs_materialise_rnode_for_symlink_returns_einval() {
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
-    let cred = Credential::default();
+    let cred = Credential::root();
 
     let (link_id, link_meta) =
         match tmpfs.symlink(TMPFS_ROOT_OBJECT_ID, b"alias", b"target", &cred, &guard) {
@@ -453,5 +454,228 @@ fn tmpfs_materialise_rnode_for_symlink_returns_einval() {
     assert_eq!(
         FsOps::materialise_rnode(&*tmpfs, link_id, link_meta, &guard),
         StepOutcome::Err(tx_subsystems::execution::Errno::EINVAL)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `step_chmod` / `step_chown` tests (Wave 3 Part 2 of the DAC + setuid
+// slice). Validate the POSIX permission rules tmpfs enforces:
+//
+// - chmod: caller must be the inode owner OR carry `CAP_FOWNER`;
+//   otherwise EPERM.
+// - chown: only `CAP_FOWNER` grants arbitrary changes; non-privileged
+//   callers may chown only to their own uid/gid; setuid/setgid bits
+//   are silently cleared on non-privileged chown (Linux's
+//   anti-escalation rule).
+// ---------------------------------------------------------------------------
+
+fn cred_with_caps(uid: u32, gid: u32, caps: CapabilitySet) -> Credential {
+    Credential {
+        uid,
+        gid,
+        effective_caps: caps,
+    }
+}
+
+#[test]
+fn tmpfs_chmod_owner_succeeds() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let owner = cred_with_caps(1000, 0, CapabilitySet::EMPTY);
+
+    // Create a file owned by uid 1000 with mode 0o644.
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode: {other:?}"),
+        };
+    assert_eq!(
+        FsOps::step_chmod(&*tmpfs, file_id, 0o600, &owner, &guard),
+        StepOutcome::Done(())
+    );
+
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta: {other:?}"),
+    };
+    assert_eq!(meta.mode & !S_IFMT, 0o600);
+}
+
+#[test]
+fn tmpfs_chmod_non_owner_returns_eperm() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let owner = cred_with_caps(1000, 0, CapabilitySet::EMPTY);
+    let stranger = cred_with_caps(2000, 0, CapabilitySet::EMPTY);
+
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode: {other:?}"),
+        };
+    assert_eq!(
+        FsOps::step_chmod(&*tmpfs, file_id, 0o600, &stranger, &guard),
+        StepOutcome::Err(Errno::EPERM)
+    );
+}
+
+#[test]
+fn tmpfs_chmod_with_fowner_cap_succeeds() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let owner = cred_with_caps(1000, 0, CapabilitySet::EMPTY);
+    let mut admin_caps = CapabilitySet::EMPTY;
+    admin_caps.add(Capability::FOWNER);
+    let admin = cred_with_caps(2000, 0, admin_caps);
+
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode: {other:?}"),
+        };
+    assert_eq!(
+        FsOps::step_chmod(&*tmpfs, file_id, 0o755, &admin, &guard),
+        StepOutcome::Done(())
+    );
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta: {other:?}"),
+    };
+    assert_eq!(meta.mode & !S_IFMT, 0o755);
+}
+
+#[test]
+fn tmpfs_chown_unprivileged_to_self_succeeds() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let owner = cred_with_caps(1000, 200, CapabilitySet::EMPTY);
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode: {other:?}"),
+        };
+
+    // Chown to current uid/gid (no-op-shaped success).
+    assert_eq!(
+        FsOps::step_chown(&*tmpfs, file_id, Some(1000), Some(200), &owner, &guard),
+        StepOutcome::Done(())
+    );
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta: {other:?}"),
+    };
+    assert_eq!(meta.uid, 1000);
+    assert_eq!(meta.gid, 200);
+}
+
+#[test]
+fn tmpfs_chown_unprivileged_to_other_returns_eperm() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let owner = cred_with_caps(1000, 200, CapabilitySet::EMPTY);
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode: {other:?}"),
+        };
+
+    // Try to chown to a foreign uid; non-privileged callers can only
+    // chown to their own uid.
+    assert_eq!(
+        FsOps::step_chown(&*tmpfs, file_id, Some(2000), None, &owner, &guard),
+        StepOutcome::Err(Errno::EPERM)
+    );
+    // Same for gid.
+    assert_eq!(
+        FsOps::step_chown(&*tmpfs, file_id, None, Some(999), &owner, &guard),
+        StepOutcome::Err(Errno::EPERM)
+    );
+}
+
+#[test]
+fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let mut admin_caps = CapabilitySet::EMPTY;
+    admin_caps.add(Capability::FOWNER);
+    let admin = cred_with_caps(0, 0, admin_caps);
+
+    // Create a setuid+setgid file owned by uid 1000.
+    let owner = cred_with_caps(1000, 200, CapabilitySet::EMPTY);
+    let mode = (S_ISUID | S_ISGID | 0o755) | tx_subsystems::vfs::S_IFREG;
+    let (file_id, _) = match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", mode, &owner, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode: {other:?}"),
+    };
+    // Sanity: setuid/setgid should be set on the freshly-created
+    // inode (the mode passed in is preserved by `create_inode`).
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta: {other:?}"),
+    };
+    assert_eq!(meta.mode & S_ISUID, S_ISUID);
+    assert_eq!(meta.mode & S_ISGID, S_ISGID);
+
+    // Non-privileged owner self-chown clears the setuid + setgid
+    // bits. Use the owner cred (no CAP_FOWNER).
+    assert_eq!(
+        FsOps::step_chown(&*tmpfs, file_id, Some(1000), Some(200), &owner, &guard),
+        StepOutcome::Done(())
+    );
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta: {other:?}"),
+    };
+    assert_eq!(meta.mode & S_ISUID, 0);
+    assert_eq!(meta.mode & S_ISGID, 0);
+
+    // Privileged callers preserve the setuid bit on chown — set
+    // it again, then chown via admin and verify it survives.
+    assert_eq!(
+        FsOps::step_chmod(&*tmpfs, file_id, S_ISUID | 0o755, &admin, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        FsOps::step_chown(&*tmpfs, file_id, Some(1000), None, &admin, &guard),
+        StepOutcome::Done(())
+    );
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta: {other:?}"),
+    };
+    assert_eq!(
+        meta.mode & S_ISUID,
+        S_ISUID,
+        "privileged chown should preserve S_ISUID"
     );
 }

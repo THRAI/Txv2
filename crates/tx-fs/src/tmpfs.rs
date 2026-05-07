@@ -25,6 +25,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use tx_substrate::zone::Cap;
 use tx_substrate::SpinMutex;
+use tx_subsystems::cred::Capability;
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::page_backed::{
     step_truncate, AnonSwapPolicy, Frame, FsPageBacking, MaterializeAccess, PageContainer,
@@ -32,7 +33,8 @@ use tx_subsystems::page_backed::{
 };
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, FsOps, InlineName, InodeKind, InodeMeta,
-    MountOutput, RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, VFS_NAME_MAX,
+    MountOutput, RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
+    VFS_NAME_MAX,
 };
 
 /// Mode for the tmpfs root directory.
@@ -681,6 +683,82 @@ impl FsOps for Tmpfs {
             Ok(rnode) => StepOutcome::Done(rnode),
             Err(_) => StepOutcome::Err(Errno::ENOMEM),
         }
+    }
+
+    /// Update the inode's mode bits. Caller must be the inode owner
+    /// or carry `CAP_FOWNER`. Preserves `S_IFMT` (file kind is set
+    /// at creation and immutable through chmod). Per the DAC +
+    /// setuid plan §"FsOps::step_chmod / step_chown".
+    fn step_chmod(
+        &self,
+        fs_object_id: FsObjectId,
+        new_mode: u16,
+        cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        let mut state = self.state.lock();
+        let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        // Permission: owner or CAP_FOWNER.
+        if !cred.effective_caps.contains(Capability::FOWNER) && cred.uid != inode.meta.uid {
+            return StepOutcome::Err(Errno::EPERM);
+        }
+        // Preserve the IFMT bits from the existing meta — kind is
+        // immutable through chmod (matches `serialize_inode_meta`).
+        // Mask the request to the file mode bits the slice supports
+        // (S_ISUID | S_ISGID | S_ISVTX | rwxrwxrwx = 0o7777).
+        let masked = new_mode & 0o7777;
+        let kind_bits = inode.meta.mode & S_IFMT;
+        inode.meta.mode = kind_bits | masked;
+        StepOutcome::Done(())
+    }
+
+    /// Update the inode's `(uid, gid)`. `None` for either field
+    /// leaves it unchanged. Privilege rule: only `CAP_FOWNER` grants
+    /// arbitrary changes; non-privileged callers may chown only to
+    /// their own uid/gid. Linux's silent-clear-`S_ISUID`/`S_ISGID`
+    /// rule applies for non-privileged callers (matches LTP
+    /// `chown03`). Per the DAC + setuid plan §"FsOps::step_chmod /
+    /// step_chown".
+    fn step_chown(
+        &self,
+        fs_object_id: FsObjectId,
+        new_uid: Option<u32>,
+        new_gid: Option<u32>,
+        cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        let mut state = self.state.lock();
+        let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
+            return StepOutcome::Err(Errno::ENOENT);
+        };
+        let privileged = cred.effective_caps.contains(Capability::FOWNER);
+        if !privileged {
+            if let Some(u) = new_uid {
+                if u != cred.uid {
+                    return StepOutcome::Err(Errno::EPERM);
+                }
+            }
+            if let Some(g) = new_gid {
+                if g != cred.gid {
+                    return StepOutcome::Err(Errno::EPERM);
+                }
+            }
+        }
+        if let Some(u) = new_uid {
+            inode.meta.uid = u;
+        }
+        if let Some(g) = new_gid {
+            inode.meta.gid = g;
+        }
+        // Linux clears S_ISUID / S_ISGID on chown by non-privileged
+        // callers to prevent privilege-escalation via setuid binary
+        // ownership shifts. Slice mirrors LTP `chown03`'s rule.
+        if !privileged {
+            inode.meta.mode &= !(S_ISUID | S_ISGID);
+        }
+        StepOutcome::Done(())
     }
 }
 

@@ -19,9 +19,12 @@
 //!
 //! The musl static path reads the stack at `_start` per the System V
 //! psABI for RV64 (musl `crt/crt1.c` and `src/env/__libc_start_main.c`
-//! and `src/env/__init_tls.c`). v1 emits exactly the six entries
-//! musl actually requires: `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`,
-//! `AT_PAGESZ`, `AT_RANDOM`, `AT_NULL`.
+//! and `src/env/__init_tls.c`). The DAC + setuid slice's Part 6 grew
+//! the emitted auxv table from six entries to eleven so musl's
+//! `__init_security` runtime can read the cred + setuid-binary signal
+//! straight off the stack: `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`,
+//! `AT_PAGESZ`, `AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID`, `AT_SECURE`,
+//! `AT_RANDOM`, `AT_NULL`.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -41,6 +44,11 @@ const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
+const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
+const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
+const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 
 /// Auxv pair size in bytes (`a_type: u64, a_val: u64`).
@@ -56,8 +64,14 @@ const AT_RANDOM_REGION_SIZE: usize = 16;
 /// SysV RV64 psABI mandates 16-byte stack alignment at `_start`.
 const STACK_ALIGN: usize = 16;
 
-/// Number of auxv pairs we emit (5 facts + AT_NULL terminator).
-const AUXV_PAIR_COUNT: usize = 6;
+/// Number of auxv pairs we emit (10 facts + AT_NULL terminator).
+///
+/// Part 6 of the DAC + setuid slice grew this from 6 to 11 by adding
+/// `AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID`, and `AT_SECURE`. Each new
+/// pair is 16 bytes, so the upper-table region grew by 5 × 16 = 80
+/// bytes; the existing alignment helper handles the size change
+/// automatically.
+const AUXV_PAIR_COUNT: usize = 11;
 
 /// Composed stack image ready to write into a detached `AddressSpace`.
 pub struct UserStackImage {
@@ -77,7 +91,13 @@ pub struct UserStackImage {
 /// (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`) come from the ELF header and
 /// the `PT_PHDR` phdr (or the loader's fallback computation per
 /// `txdoc:EXEC-8-6-AT-PHDR-COMPUTATION`); `AT_PAGESZ` is the
-/// platform's user page size (4096 on RV64 today).
+/// platform's user page size (4096 on RV64 today). The cred-derived
+/// fields (`at_uid`, `at_euid`, `at_gid`, `at_egid`, `at_secure`)
+/// land in Wave 3 Part 6 of the DAC + setuid slice; the `at_secure`
+/// flag is hardcoded to `0` until Wave 4's setuid recompute helper
+/// (`step_apply_suid_for_exec`) ships and toggles it on when the
+/// binary's `S_ISUID` / `S_ISGID` bit caused the effective uid or
+/// gid to change at exec time.
 pub struct AuxvFacts {
     /// Virtual address of the program-header table (after load bias,
     /// which is zero for static-`ET_EXEC` v1).
@@ -88,6 +108,27 @@ pub struct AuxvFacts {
     pub at_phnum: u64,
     /// Page size. 4096 on RV64.
     pub at_pagesz: u64,
+    /// Real user id at exec time (caller's `cred.uid`). Read by musl's
+    /// `__init_security` to populate `__libc.secure` alongside
+    /// `at_secure`.
+    pub at_uid: u64,
+    /// Effective user id at exec time (`cred.euid`). Differs from
+    /// `at_uid` when the binary's `S_ISUID` bit took effect; Wave 4
+    /// computes the post-recompute value before this struct is built.
+    pub at_euid: u64,
+    /// Real group id at exec time (`cred.gid`).
+    pub at_gid: u64,
+    /// Effective group id at exec time (`cred.egid`). Differs from
+    /// `at_gid` when the binary's `S_ISGID` bit took effect.
+    pub at_egid: u64,
+    /// `1` when the binary executed at exec time was setuid or setgid
+    /// (i.e. the effective uid or gid changed at exec); `0` otherwise.
+    /// Used by libssp / musl to harden the runtime: clear
+    /// `LD_PRELOAD`-equivalent env, force allocator hardening, etc.
+    /// Wave 3 ships this hardcoded to `0`; Wave 4's
+    /// `step_apply_suid_for_exec` is what sets it to `1` when the
+    /// recompute changed the effective ids.
+    pub at_secure: u64,
 }
 
 /// Build the initial userspace stack image for execve.
@@ -124,6 +165,11 @@ pub struct AuxvFacts {
 ///   ├──────────────────────────────────┤
 ///   │   auxv terminator: AT_NULL = 0   │
 ///   │   auxv: AT_RANDOM ptr -> region  │
+///   │   auxv: AT_SECURE                │
+///   │   auxv: AT_EGID                  │
+///   │   auxv: AT_GID                   │
+///   │   auxv: AT_EUID                  │
+///   │   auxv: AT_UID                   │
 ///   │   auxv: AT_PAGESZ                │
 ///   │   auxv: AT_PHNUM                 │
 ///   │   auxv: AT_PHENT                 │
@@ -176,9 +222,10 @@ pub fn build_initial_user_stack(
 
     // ---- 3. Compute the upper-table size --------------------------------
     //
-    //   argc (8) + (argc+1) argv ptrs + (envc+1) envp ptrs + 6 auxv pairs
+    //   argc (8) + (argc+1) argv ptrs + (envc+1) envp ptrs + 11 auxv pairs
     //
-    // The auxv pair count is fixed at 6 (5 facts + AT_NULL).
+    // The auxv pair count is fixed at `AUXV_PAIR_COUNT` (10 facts +
+    // AT_NULL). DAC + setuid slice Part 6 grew this from 6 to 11.
     let upper_table_size = WORD_SIZE                   // argc
         + (argc + 1) * WORD_SIZE                       // argv ptrs + NULL
         + (envc + 1) * WORD_SIZE                       // envp ptrs + NULL
@@ -300,13 +347,19 @@ pub fn build_initial_user_stack(
     off += WORD_SIZE;
     debug_assert!(envp_string_cursor == envp_pool_top);
 
-    // auxv (fixed order: AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ,
-    // AT_RANDOM, AT_NULL).
+    // auxv (fixed order matching Linux `fs/binfmt_elf.c::create_elf_tables`
+    // for the slice's surface: AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ,
+    // AT_UID, AT_EUID, AT_GID, AT_EGID, AT_SECURE, AT_RANDOM, AT_NULL).
     let auxv_entries: [(u64, u64); AUXV_PAIR_COUNT] = [
         (AT_PHDR, auxv_facts.at_phdr),
         (AT_PHENT, auxv_facts.at_phent),
         (AT_PHNUM, auxv_facts.at_phnum),
         (AT_PAGESZ, auxv_facts.at_pagesz),
+        (AT_UID, auxv_facts.at_uid),
+        (AT_EUID, auxv_facts.at_euid),
+        (AT_GID, auxv_facts.at_gid),
+        (AT_EGID, auxv_facts.at_egid),
+        (AT_SECURE, auxv_facts.at_secure),
         (AT_RANDOM, at_random_base),
         (AT_NULL, 0),
     ];
@@ -368,13 +421,21 @@ mod tests {
     use super::*;
 
     /// Compose a default `AuxvFacts` whose values are easy to spot in
-    /// hex dumps when debugging a layout regression.
+    /// hex dumps when debugging a layout regression. The cred-derived
+    /// fields default to the bootstrap-init shape (`uid = euid = 0`)
+    /// with `at_secure = 0`; tests that need a setuid-binary
+    /// signature override `at_secure` (and the eid fields) inline.
     fn facts() -> AuxvFacts {
         AuxvFacts {
             at_phdr: 0x4000_0040,
             at_phent: 56,
             at_phnum: 7,
             at_pagesz: 4096,
+            at_uid: 0,
+            at_euid: 0,
+            at_gid: 0,
+            at_egid: 0,
+            at_secure: 0,
         }
     }
 
@@ -436,11 +497,14 @@ mod tests {
         // envp NULL terminator at offset 24 (argc + argv[0] + argv NULL).
         assert_eq!(read_u64(&image.bytes, 24), 0);
 
-        // auxv table starts at offset 32. Six 16-byte pairs.
+        // auxv table starts at offset 32. Eleven 16-byte pairs (10
+        // facts + AT_NULL terminator) per Part 6 of the DAC + setuid
+        // slice; the pre-Part-6 baseline was six.
         let auxv_off = WORD_SIZE                // argc
             + 2 * WORD_SIZE                     // argv[0] + NULL
             + WORD_SIZE; // envp NULL
-                         // Pair order: PHDR, PHENT, PHNUM, PAGESZ, RANDOM, NULL.
+                         // Pair order: PHDR, PHENT, PHNUM, PAGESZ,
+                         // UID, EUID, GID, EGID, SECURE, RANDOM, NULL.
         let pair = |i: usize| {
             let base = auxv_off + i * AUXV_PAIR_SIZE;
             (
@@ -452,11 +516,16 @@ mod tests {
         assert_eq!(pair(1), (AT_PHENT, 56));
         assert_eq!(pair(2), (AT_PHNUM, 7));
         assert_eq!(pair(3), (AT_PAGESZ, 4096));
-        assert_eq!(pair(4).0, AT_RANDOM);
-        assert_eq!(pair(5), (AT_NULL, 0));
+        assert_eq!(pair(4), (AT_UID, 0));
+        assert_eq!(pair(5), (AT_EUID, 0));
+        assert_eq!(pair(6), (AT_GID, 0));
+        assert_eq!(pair(7), (AT_EGID, 0));
+        assert_eq!(pair(8), (AT_SECURE, 0));
+        assert_eq!(pair(9).0, AT_RANDOM);
+        assert_eq!(pair(10), (AT_NULL, 0));
 
         // AT_RANDOM region is 16 bytes of zero in the image.
-        let at_random_ptr = pair(4).1;
+        let at_random_ptr = pair(9).1;
         let at_random_off = ptr_to_off(&image, at_random_ptr);
         for i in 0..AT_RANDOM_REGION_SIZE {
             assert_eq!(image.bytes[at_random_off + i], 0);
@@ -540,9 +609,11 @@ mod tests {
             + 2 * WORD_SIZE                   // argv[0] + NULL
             + WORD_SIZE; // envp NULL
 
-        // AT_RANDOM is the 5th pair (index 4) in fixed order.
-        let at_random_ptr = read_u64(&image.bytes, auxv_off + 4 * AUXV_PAIR_SIZE + 8);
-        let at_random_type = read_u64(&image.bytes, auxv_off + 4 * AUXV_PAIR_SIZE);
+        // AT_RANDOM is the 10th pair (index 9) in fixed order
+        // post-Part-6: PHDR, PHENT, PHNUM, PAGESZ, UID, EUID, GID,
+        // EGID, SECURE, RANDOM, NULL.
+        let at_random_ptr = read_u64(&image.bytes, auxv_off + 9 * AUXV_PAIR_SIZE + 8);
+        let at_random_type = read_u64(&image.bytes, auxv_off + 9 * AUXV_PAIR_SIZE);
         assert_eq!(at_random_type, AT_RANDOM);
 
         let off = ptr_to_off(&image, at_random_ptr);
@@ -570,5 +641,111 @@ mod tests {
             image.bytes[off], 0,
             "synthetic argv[0] must be empty C string"
         );
+    }
+
+    /// Walk a freshly built stack and round-trip-decode every auxv
+    /// entry, verifying the eleven-pair shape introduced in Part 6 of
+    /// the DAC + setuid slice. Pre-Part-6 the table was six pairs
+    /// (PHDR, PHENT, PHNUM, PAGESZ, RANDOM, NULL); Part 6 inserts UID,
+    /// EUID, GID, EGID, and SECURE between PAGESZ and RANDOM.
+    #[test]
+    fn build_initial_user_stack_emits_eleven_auxv_entries() {
+        let stack_top = 0x4000_0000u64;
+        let image = build_initial_user_stack(stack_top, &[], &[], &facts());
+
+        let auxv_off = WORD_SIZE                // argc
+            + 2 * WORD_SIZE                     // argv[0] + NULL
+            + WORD_SIZE; // envp NULL
+        let pair = |i: usize| {
+            let base = auxv_off + i * AUXV_PAIR_SIZE;
+            (
+                read_u64(&image.bytes, base),
+                read_u64(&image.bytes, base + 8),
+            )
+        };
+
+        // Eleven entries (10 facts + AT_NULL terminator).
+        assert_eq!(AUXV_PAIR_COUNT, 11);
+        assert_eq!(pair(0).0, AT_PHDR);
+        assert_eq!(pair(1).0, AT_PHENT);
+        assert_eq!(pair(2).0, AT_PHNUM);
+        assert_eq!(pair(3).0, AT_PAGESZ);
+        assert_eq!(pair(4).0, AT_UID);
+        assert_eq!(pair(5).0, AT_EUID);
+        assert_eq!(pair(6).0, AT_GID);
+        assert_eq!(pair(7).0, AT_EGID);
+        assert_eq!(pair(8).0, AT_SECURE);
+        assert_eq!(pair(9).0, AT_RANDOM);
+        assert_eq!(pair(10), (AT_NULL, 0));
+    }
+
+    /// AT_UID lives at index 4 of the auxv table — the first cred-
+    /// derived entry, sitting immediately after AT_PAGESZ. Pin the
+    /// position so a future refactor that reorders entries breaks
+    /// loudly here rather than silently in musl's
+    /// `__init_security`.
+    #[test]
+    fn build_initial_user_stack_emits_at_uid_at_index_4() {
+        let stack_top = 0x4000_0000u64;
+        let auxv_facts = AuxvFacts {
+            at_uid: 1001,
+            at_euid: 1000,
+            at_gid: 1001,
+            at_egid: 1000,
+            at_secure: 1,
+            ..facts()
+        };
+        let image = build_initial_user_stack(stack_top, &[], &[], &auxv_facts);
+
+        let auxv_off = WORD_SIZE                // argc
+            + 2 * WORD_SIZE                     // argv[0] + NULL
+            + WORD_SIZE; // envp NULL
+        let pair_at = |i: usize| {
+            let base = auxv_off + i * AUXV_PAIR_SIZE;
+            (
+                read_u64(&image.bytes, base),
+                read_u64(&image.bytes, base + 8),
+            )
+        };
+        assert_eq!(pair_at(4), (AT_UID, 1001));
+        assert_eq!(pair_at(5), (AT_EUID, 1000));
+        assert_eq!(pair_at(6), (AT_GID, 1001));
+        assert_eq!(pair_at(7), (AT_EGID, 1000));
+    }
+
+    /// `at_secure = 1` round-trips into the auxv slot at index 8.
+    /// Wave 4's `step_apply_suid_for_exec` sets this when the
+    /// binary's setuid/setgid bit caused an effective-id change at
+    /// exec; libssp/musl reads it to harden the runtime.
+    #[test]
+    fn build_initial_user_stack_emits_at_secure_when_facts_set_to_1() {
+        let stack_top = 0x4000_0000u64;
+        let auxv_facts = AuxvFacts {
+            at_secure: 1,
+            ..facts()
+        };
+        let image = build_initial_user_stack(stack_top, &[], &[], &auxv_facts);
+
+        let auxv_off = WORD_SIZE                // argc
+            + 2 * WORD_SIZE                     // argv[0] + NULL
+            + WORD_SIZE; // envp NULL
+        let secure_base = auxv_off + 8 * AUXV_PAIR_SIZE;
+        assert_eq!(read_u64(&image.bytes, secure_base), AT_SECURE);
+        assert_eq!(read_u64(&image.bytes, secure_base + 8), 1);
+    }
+
+    /// `at_secure = 0` (the Wave 3 hardcoded value, and the post-Wave-4
+    /// value for non-setuid binaries) round-trips faithfully.
+    #[test]
+    fn build_initial_user_stack_emits_at_secure_zero_when_facts_set_to_0() {
+        let stack_top = 0x4000_0000u64;
+        let image = build_initial_user_stack(stack_top, &[], &[], &facts());
+
+        let auxv_off = WORD_SIZE                // argc
+            + 2 * WORD_SIZE                     // argv[0] + NULL
+            + WORD_SIZE; // envp NULL
+        let secure_base = auxv_off + 8 * AUXV_PAIR_SIZE;
+        assert_eq!(read_u64(&image.bytes, secure_base), AT_SECURE);
+        assert_eq!(read_u64(&image.bytes, secure_base + 8), 0);
     }
 }
