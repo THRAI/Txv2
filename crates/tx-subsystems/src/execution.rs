@@ -43,6 +43,10 @@ pub enum Errno {
     /// `-EPIPE` to userspace (fd-ops Wave 3, Q2 DECIDED 2026-05-07).
     EPIPE,
     EROFS,
+    /// Illegal seek. Surfaced by `lseek(2)` when called against a
+    /// non-seekable file (pipe / TTY / chardev / socket). fd-ops
+    /// Wave 4. Linux value: 29.
+    ESPIPE,
     ESRCH,
     ESTALE,
 }

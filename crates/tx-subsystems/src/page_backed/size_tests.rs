@@ -58,10 +58,10 @@ fn pagebacked_step_read_uses_visible_size_not_capacity() {
         step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
         StepOutcome::Done(())
     );
-    let mut of = open_file_for_pc(&pc);
+    let of = open_file_for_pc(&pc);
     of.set_offset(crate::vm::USER_PAGE_SIZE as u64);
 
-    assert_eq!(step_read(&pc, &mut of, 16, &guard), StepOutcome::Done(0));
+    assert_eq!(step_read(&pc, &of, 16, &guard), StepOutcome::Done(0));
     assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64);
     assert_eq!(pc.resident_pages(), 0);
 }
@@ -78,10 +78,10 @@ fn pagebacked_step_write_extends_visible_size_within_capacity() {
         2,
     );
     assert_eq!(step_truncate(&pc, 8, &guard), StepOutcome::Done(()));
-    let mut of = open_file_for_pc(&pc);
+    let of = open_file_for_pc(&pc);
     of.set_offset((crate::vm::USER_PAGE_SIZE + 9) as u64);
 
-    assert_eq!(step_write(&pc, &mut of, 7, &guard), StepOutcome::Done(7));
+    assert_eq!(step_write(&pc, &of, 7, &guard), StepOutcome::Done(7));
 
     assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE + 16) as u64);
     assert_eq!(pc.size_bytes(), (crate::vm::USER_PAGE_SIZE + 16) as u64);
@@ -100,11 +100,11 @@ fn pagebacked_step_write_rejects_growth_beyond_capacity_without_size_change() {
         1,
     );
     assert_eq!(step_truncate(&pc, 8, &guard), StepOutcome::Done(()));
-    let mut of = open_file_for_pc(&pc);
+    let of = open_file_for_pc(&pc);
     of.set_offset(crate::vm::USER_PAGE_SIZE as u64 - 4);
 
     assert_eq!(
-        step_write(&pc, &mut of, 8, &guard),
+        step_write(&pc, &of, 8, &guard),
         StepOutcome::Err(Errno::EINVAL)
     );
 

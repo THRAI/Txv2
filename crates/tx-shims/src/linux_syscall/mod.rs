@@ -79,11 +79,11 @@ pub use numbers::{
     NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT,
     NR_FACCESSAT2, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_GETEGID, NR_GETEUID, NR_GETGID,
     NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRESGID, NR_GETRESUID, NR_GETSID,
-    NR_GETUID, NR_OPENAT, NR_PIPE2, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SETGID,
-    NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID,
-    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND, O_CLOEXEC,
-    O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, R_OK, SIGCHLD,
-    WNOHANG, W_OK, X_OK,
+    NR_GETUID, NR_LSEEK, NR_OPENAT, NR_PIPE2, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK,
+    NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID,
+    NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND,
+    O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, R_OK,
+    SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, WNOHANG, W_OK, X_OK,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -425,6 +425,16 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf>(
         ),
         // fd-ops Wave 3 — anonymous pipe.
         nr if nr == NR_PIPE2 => sys_pipe2(req.args[0], req.args[1] as u32, ctx),
+        // fd-ops Wave 4 — `lseek(2)`. Non-async; pure offset compute
+        // through `OpenFile::step_lseek`. ESPIPE for non-seekable
+        // backings (TTY / chardev / pipe), EISDIR for directories,
+        // EINVAL for negative result / overflow / unknown whence.
+        nr if nr == NR_LSEEK => sys_lseek(
+            req.args[0] as u32,
+            req.args[1] as i64,
+            req.args[2] as u32,
+            ctx,
+        ),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -1198,6 +1208,7 @@ fn errno_to_i32(errno: Errno) -> i32 {
         Errno::EPERM => 1,
         Errno::EPIPE => 32,
         Errno::EROFS => 30,
+        Errno::ESPIPE => 29,
         Errno::ESRCH => 3,
         Errno::ESTALE => 116,
     }
@@ -2710,4 +2721,42 @@ fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>) -> Syscall
     }
 
     SyscallResult::Return(0)
+}
+
+/// `lseek(fd, offset, whence)`. Linux RV64 generic ABI
+/// `__NR_lseek = 62`.
+///
+/// fd-ops Wave 4. Resolves `fd` against the per-process fd-table
+/// `BTreeMap<u32, Cap<OpenFile>>` (fd-ops Wave 1) and dispatches
+/// through `OpenFile::step_lseek`, which handles the
+/// SEEK_SET/SEEK_CUR/SEEK_END whence cases plus the non-seekable-
+/// backing → `-ESPIPE` short-circuit.
+///
+/// `lseek` is a non-blocking step — `Blocked`/`AdvancedThenBlocked`
+/// outcomes are unreachable from `OpenFile::step_lseek`, but the
+/// match below maps them to `-EIO` for symmetry with the other fd
+/// arms (the alternative would be a panic which makes the syscall
+/// surface fragile).
+fn sys_lseek<'a>(
+    fd: u32,
+    offset: i64,
+    whence: u32,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let file = match resolve_fd(&ctx.process, fd) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let guard = tx_substrate::epoch::guard();
+    match file.step_lseek(offset, whence, &guard) {
+        StepOutcome::Done(new_offset) | StepOutcome::Advanced(new_offset) => {
+            SyscallResult::Return(new_offset as i64)
+        }
+        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+            // Unreachable in practice — see the comment on the
+            // function header.
+            SyscallResult::Error(errno_to_i32(Errno::EIO))
+        }
+        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
 }

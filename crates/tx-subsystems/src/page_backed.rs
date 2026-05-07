@@ -596,7 +596,7 @@ impl PageContainer {
 
 pub fn step_read(
     pc: &PageContainer,
-    of: &mut OpenFile,
+    of: &OpenFile,
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize> {
@@ -617,7 +617,7 @@ pub fn step_read(
 
 pub fn step_write(
     pc: &PageContainer,
-    of: &mut OpenFile,
+    of: &OpenFile,
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize> {
@@ -657,7 +657,7 @@ pub fn step_write(
 
 fn step_range(
     pc: &PageContainer,
-    of: &mut OpenFile,
+    of: &OpenFile,
     len: usize,
     kind: PageBackedIoKind,
     guard: &Guard<'_>,
@@ -1378,10 +1378,10 @@ mod tests {
             },
             3,
         );
-        let mut of = open_file_for_pc(&pc);
+        let of = open_file_for_pc(&pc);
         of.set_offset((crate::vm::USER_PAGE_SIZE - 8) as u64);
 
-        assert_eq!(step_read(&pc, &mut of, 32, &guard), StepOutcome::Done(32));
+        assert_eq!(step_read(&pc, &of, 32, &guard), StepOutcome::Done(32));
 
         assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE - 8 + 32) as u64);
         assert_eq!(pc.resident_pages(), 2);
@@ -1400,10 +1400,10 @@ mod tests {
             },
             1,
         );
-        let mut of = open_file_for_pc(&pc);
+        let of = open_file_for_pc(&pc);
         of.set_offset(crate::vm::USER_PAGE_SIZE as u64);
 
-        assert_eq!(step_read(&pc, &mut of, 16, &guard), StepOutcome::Done(0));
+        assert_eq!(step_read(&pc, &of, 16, &guard), StepOutcome::Done(0));
         assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64);
         assert_eq!(pc.resident_pages(), 0);
     }
@@ -1419,10 +1419,10 @@ mod tests {
             },
             2,
         );
-        let mut of = open_file_for_pc(&pc);
+        let of = open_file_for_pc(&pc);
 
         assert_eq!(
-            step_write(&pc, &mut of, crate::vm::USER_PAGE_SIZE + 17, &guard),
+            step_write(&pc, &of, crate::vm::USER_PAGE_SIZE + 17, &guard),
             StepOutcome::Done(crate::vm::USER_PAGE_SIZE + 17)
         );
 
@@ -1438,7 +1438,7 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let fs = Arc::new(BlockingFs);
         let pc = file_page_container(fs.clone(), fs, FsObjectId::new(88), 2);
-        let mut of = open_file_for_pc(&pc);
+        let of = open_file_for_pc(&pc);
         pc.state
             .lock()
             .pages
@@ -1446,7 +1446,7 @@ mod tests {
             .expect("seed cached page");
 
         assert_eq!(
-            step_read(&pc, &mut of, crate::vm::USER_PAGE_SIZE + 1, &guard),
+            step_read(&pc, &of, crate::vm::USER_PAGE_SIZE + 1, &guard),
             StepOutcome::AdvancedThenBlocked(crate::vm::USER_PAGE_SIZE, WaitToken::new(9, 0x44))
         );
         assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64);
@@ -1464,10 +1464,10 @@ mod tests {
             },
             1,
         );
-        let mut of = open_file_for_pc(&pc);
+        let of = open_file_for_pc(&pc);
 
         assert_eq!(
-            step_write(&pc, &mut of, 8, &guard),
+            step_write(&pc, &of, 8, &guard),
             StepOutcome::Err(Errno::EINVAL)
         );
         assert_eq!(of.offset(), 0);

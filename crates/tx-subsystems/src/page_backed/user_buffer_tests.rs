@@ -117,10 +117,10 @@ fn pagebacked_round_trip_through_user_buffer_preserves_bytes_in_one_page() {
     );
 
     let payload: Vec<u8> = (0u8..200).collect();
-    let mut writer = open_file_for_pc(&pc);
+    let writer = open_file_for_pc(&pc);
     let outcome = step_write_from_user::<PassthroughHal>(
         &pc,
-        &mut writer,
+        &writer,
         UserPtr::<u8>::new(payload.as_ptr() as usize),
         payload.len(),
         &guard,
@@ -128,11 +128,11 @@ fn pagebacked_round_trip_through_user_buffer_preserves_bytes_in_one_page() {
     assert_eq!(outcome, StepOutcome::Done(payload.len()));
     assert_eq!(writer.offset(), payload.len() as u64);
 
-    let mut reader = open_file_for_pc(&pc);
+    let reader = open_file_for_pc(&pc);
     let mut received = vec![0u8; payload.len()];
     let outcome = step_read_to_user::<PassthroughHal>(
         &pc,
-        &mut reader,
+        &reader,
         UserPtr::<u8>::new(received.as_mut_ptr() as usize),
         received.len(),
         &guard,
@@ -159,10 +159,10 @@ fn pagebacked_round_trip_through_user_buffer_crosses_page_boundary() {
     let payload: Vec<u8> = (0..(crate::vm::USER_PAGE_SIZE + 23))
         .map(|i| (i & 0xff) as u8)
         .collect();
-    let mut writer = open_file_for_pc(&pc);
+    let writer = open_file_for_pc(&pc);
     let outcome = step_write_from_user::<PassthroughHal>(
         &pc,
-        &mut writer,
+        &writer,
         UserPtr::<u8>::new(payload.as_ptr() as usize),
         payload.len(),
         &guard,
@@ -171,11 +171,11 @@ fn pagebacked_round_trip_through_user_buffer_crosses_page_boundary() {
     assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
     assert!(pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
 
-    let mut reader = open_file_for_pc(&pc);
+    let reader = open_file_for_pc(&pc);
     let mut received = vec![0u8; payload.len()];
     let outcome = step_read_to_user::<PassthroughHal>(
         &pc,
-        &mut reader,
+        &reader,
         UserPtr::<u8>::new(received.as_mut_ptr() as usize),
         received.len(),
         &guard,
@@ -198,21 +198,21 @@ fn pagebacked_step_read_to_user_grows_offset_only_after_copy_progress() {
         1,
     );
     let payload: Vec<u8> = (0u8..32).collect();
-    let mut writer = open_file_for_pc(&pc);
+    let writer = open_file_for_pc(&pc);
     let outcome = step_write_from_user::<PassthroughHal>(
         &pc,
-        &mut writer,
+        &writer,
         UserPtr::<u8>::new(payload.as_ptr() as usize),
         payload.len(),
         &guard,
     );
     assert_eq!(outcome, StepOutcome::Done(payload.len()));
 
-    let mut reader = open_file_for_pc(&pc);
+    let reader = open_file_for_pc(&pc);
     let mut sink = vec![0u8; 16];
     let outcome = step_read_to_user::<FaultingHal>(
         &pc,
-        &mut reader,
+        &reader,
         UserPtr::<u8>::new(sink.as_mut_ptr() as usize),
         sink.len(),
         &guard,
@@ -238,10 +238,10 @@ fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
     let pattern: Vec<u8> = (0..(crate::vm::USER_PAGE_SIZE + 32))
         .map(|i| ((i & 0xff) | 0x20) as u8)
         .collect();
-    let mut writer = open_file_for_pc(&pc);
+    let writer = open_file_for_pc(&pc);
     let outcome = step_write_from_user::<PassthroughHal>(
         &pc,
-        &mut writer,
+        &writer,
         UserPtr::<u8>::new(pattern.as_ptr() as usize),
         pattern.len(),
         &guard,
@@ -257,12 +257,12 @@ fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
     let grow_size = crate::vm::USER_PAGE_SIZE as u64 + 32;
     assert_eq!(step_truncate(&pc, grow_size, &guard), StepOutcome::Done(()));
 
-    let mut reader = open_file_for_pc(&pc);
+    let reader = open_file_for_pc(&pc);
     reader.set_offset(crate::vm::USER_PAGE_SIZE as u64);
     let mut received = vec![0xCCu8; 32];
     let outcome = step_read_to_user::<PassthroughHal>(
         &pc,
-        &mut reader,
+        &reader,
         UserPtr::<u8>::new(received.as_mut_ptr() as usize),
         received.len(),
         &guard,
@@ -293,10 +293,10 @@ fn pagebacked_step_write_from_user_propagates_efault_without_advance() {
         1,
     );
     let scratch: Vec<u8> = vec![0xab; 8];
-    let mut writer = open_file_for_pc(&pc);
+    let writer = open_file_for_pc(&pc);
     let outcome = step_write_from_user::<FaultingHal>(
         &pc,
-        &mut writer,
+        &writer,
         UserPtr::<u8>::new(scratch.as_ptr() as usize),
         scratch.len(),
         &guard,
