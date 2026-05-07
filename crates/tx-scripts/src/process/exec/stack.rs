@@ -129,6 +129,14 @@ pub struct AuxvFacts {
     /// `step_apply_suid_for_exec` is what sets it to `1` when the
     /// recompute changed the effective ids.
     pub at_secure: u64,
+    /// 16 random bytes for the AT_RANDOM auxv slot. musl's
+    /// `__init_ssp` reads exactly 16 bytes through this pointer to
+    /// seed the stack canary; glibc additionally uses them as
+    /// per-process key material. The exec front-end fills these
+    /// from the platform's `EntropyIf::fill_random` impl; tests
+    /// pass deterministic values (`[0; 16]` or test-chosen bytes)
+    /// to keep image-layout assertions stable.
+    pub at_random_bytes: [u8; 16],
 }
 
 /// Build the initial userspace stack image for execve.
@@ -376,15 +384,17 @@ pub fn build_initial_user_stack(
     off += pad;
     debug_assert!(off == upper_table_size + pad);
 
-    // ---- 9. AT_RANDOM region: 16 bytes of constant zero ----------------
+    // ---- 9. AT_RANDOM region: 16 bytes from auxv_facts -----------------
     //
-    // TODO(phase-csprng): replace with bytes from a real CSPRNG once
-    // the entropy subsystem ships. v1 accepts the SSP-canary
-    // weakness per Open Q #1 DECIDED 2026-05-06; txKernel has no
-    // ASLR and no stack-canary checks at this stage.
+    // The exec front-end fills `at_random_bytes` from the platform's
+    // `EntropyIf::fill_random` (RV64: rdtime + xorshift counter;
+    // other boards: deterministic counter default). Tests pass
+    // explicit bytes (often `[0; 16]`) to keep layout-pin
+    // assertions stable.
     let at_random_off = upper_table_size + pad;
     debug_assert!(at_random_off + AT_RANDOM_REGION_SIZE <= total);
-    // bytes[at_random_off..at_random_off+16] is already zero.
+    bytes[at_random_off..at_random_off + AT_RANDOM_REGION_SIZE]
+        .copy_from_slice(&auxv_facts.at_random_bytes);
 
     // ---- 10. argv string pool ------------------------------------------
     //
@@ -436,6 +446,7 @@ mod tests {
             at_gid: 0,
             at_egid: 0,
             at_secure: 0,
+            at_random_bytes: [0u8; 16],
         }
     }
 
@@ -747,5 +758,43 @@ mod tests {
         let secure_base = auxv_off + 8 * AUXV_PAIR_SIZE;
         assert_eq!(read_u64(&image.bytes, secure_base), AT_SECURE);
         assert_eq!(read_u64(&image.bytes, secure_base + 8), 0);
+    }
+
+    /// The 16 bytes the auxv table's AT_RANDOM pointer points at
+    /// must be exactly the bytes the caller passed in
+    /// `AuxvFacts.at_random_bytes`. The CSPRNG slice (chore branch
+    /// `chore/csprng-at-random`) replaces the prior constant
+    /// `[0; 16]` with bytes the exec front-end pulls from
+    /// `EntropyIf::fill_random`; this test pins the plumbing so a
+    /// future regression that drops the copy lands here.
+    #[test]
+    fn build_initial_user_stack_uses_at_random_bytes_from_auxv_facts() {
+        let stack_top = 0x4000_0000u64;
+        let auxv_facts = AuxvFacts {
+            at_random_bytes: [0xab; 16],
+            ..facts()
+        };
+        let image = build_initial_user_stack(stack_top, &[], &[], &auxv_facts);
+
+        let auxv_off = WORD_SIZE                // argc
+            + 2 * WORD_SIZE                     // argv[0] + NULL
+            + WORD_SIZE; // envp NULL
+
+        // AT_RANDOM is the 10th pair (index 9) in the post-Part-6
+        // ordering: PHDR, PHENT, PHNUM, PAGESZ, UID, EUID, GID,
+        // EGID, SECURE, RANDOM, NULL.
+        let at_random_type = read_u64(&image.bytes, auxv_off + 9 * AUXV_PAIR_SIZE);
+        let at_random_ptr = read_u64(&image.bytes, auxv_off + 9 * AUXV_PAIR_SIZE + 8);
+        assert_eq!(at_random_type, AT_RANDOM);
+
+        let off = ptr_to_off(&image, at_random_ptr);
+        for i in 0..AT_RANDOM_REGION_SIZE {
+            assert_eq!(
+                image.bytes[off + i],
+                0xab,
+                "AT_RANDOM byte {} did not round-trip from auxv_facts",
+                i
+            );
+        }
     }
 }

@@ -43,7 +43,7 @@
 
 use alloc::vec::Vec;
 
-use tx_hal::{PmapIf, UserTrapContext};
+use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
 use tx_substrate::zone::Cap;
 use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
 use tx_subsystems::execution::{Errno, StepOutcome};
@@ -223,7 +223,7 @@ impl ExecError {
 ///
 /// Cites: `txdoc:EXEC-7-EIGHT-PHASES`,
 /// `txdoc:EXEC-15-THE-EXEC-PONR-INVARIANT`.
-pub async fn exec_script<P: PmapIf>(
+pub async fn exec_script<P: PmapIf + EntropyIf>(
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
     path: &[u8],
@@ -408,6 +408,17 @@ pub async fn exec_script<P: PmapIf>(
     let cred = process
         .cred()
         .unwrap_or_else(tx_subsystems::cred::Cred::root);
+
+    // CSPRNG chore (chore/csprng-at-random): pull 16 bytes from
+    // the platform's `EntropyIf` impl (RV64: rdtime + xorshift
+    // counter; other boards: deterministic counter default) to
+    // seed musl's stack canary via the AT_RANDOM auxv slot. Not a
+    // real CSPRNG, but materially stronger than the previous
+    // static `[0; 16]` and adequate for txKernel's current trust
+    // model (no ASLR, no untrusted input).
+    let mut at_random_bytes = [0u8; 16];
+    <P as EntropyIf>::fill_random(&mut at_random_bytes);
+
     let auxv_facts = AuxvFacts {
         at_phdr: parsed.at_phdr,
         at_phent: ELF64_PHENT,
@@ -424,6 +435,7 @@ pub async fn exec_script<P: PmapIf>(
         // capabilities and `nosuid` mounts (future slices) will
         // refine.
         at_secure: if at_secure { 1 } else { 0 },
+        at_random_bytes,
     };
     let stack_image = build_initial_user_stack(USER_STACK_TOP_DEFAULT, argv, envp, &auxv_facts);
 

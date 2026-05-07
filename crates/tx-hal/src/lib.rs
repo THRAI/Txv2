@@ -1106,6 +1106,48 @@ pub trait SignalFrameIf: TrapIf + UserAccessIf {
         tf.rewind_pc(4);
     }
 }
+/// Platform-supplied entropy. Used to seed the AT_RANDOM auxv
+/// region at exec time (`build_initial_user_stack` consumes
+/// `AuxvFacts.at_random_bytes`; the exec front-end fills it via
+/// `<P as EntropyIf>::fill_random`).
+///
+/// The default impl produces a deterministic boot-counter seed —
+/// safe for txKernel's current trust model (no untrusted input,
+/// no ASLR, no userspace-visible PRF stretching). Real platforms
+/// override with hardware entropy: RV64 boards may use the Zkr
+/// `seed` CSR or `mtime`; future platforms may use virtio-rng or
+/// platform-specific RNG MMIO.
+///
+/// The contract is "always succeed". Implementations that talk to
+/// hardware must fall back to the deterministic counter when the
+/// entropy source is unavailable.
+///
+/// Cites: `txdoc:HAL-V1`.
+pub trait EntropyIf {
+    /// Fill `out` with random bytes. Must always succeed; on
+    /// hardware-entropy unavailability, fall back to the
+    /// deterministic counter seed.
+    fn fill_random(out: &mut [u8]) {
+        // Default: deterministic boot-counter seed. Mix the
+        // counter through a tiny xorshift64 to spread bits.
+        // Safe for the current trust model — no ASLR, no
+        // stack-canary checks, no untrusted input.
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0xDEADBEEF_CAFE_F00D);
+        let mut s = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Avoid the all-zero xorshift fixed point.
+        if s == 0 {
+            s = 0xDEADBEEF_CAFE_F00D;
+        }
+        for byte in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *byte = (s & 0xff) as u8;
+        }
+    }
+}
+
 pub trait IrqIf {
     const MAX_IRQ: u32 = 0;
 
@@ -1373,6 +1415,7 @@ pub trait TxPlatform:
     + DmaIf
     + SmpIf
     + PowerIf
+    + EntropyIf
     + 'static
 {
 }
@@ -1396,6 +1439,7 @@ impl<T> TxPlatform for T where
         + DmaIf
         + SmpIf
         + PowerIf
+        + EntropyIf
         + 'static
 {
 }

@@ -93,6 +93,8 @@ impl tx_hal::DmaIf for TestPlatform {}
 
 impl tx_hal::SmpIf for TestPlatform {}
 
+impl tx_hal::EntropyIf for TestPlatform {}
+
 impl tx_hal::PowerIf for TestPlatform {
     fn system_off() -> ! {
         loop {}

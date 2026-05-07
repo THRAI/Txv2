@@ -148,6 +148,8 @@ impl tx_hal::CacheIf for IrqTestPlatform {}
 impl tx_hal::DmaIf for IrqTestPlatform {}
 impl tx_hal::SmpIf for IrqTestPlatform {}
 
+impl tx_hal::EntropyIf for IrqTestPlatform {}
+
 impl tx_hal::PowerIf for IrqTestPlatform {
     fn system_off() -> ! {
         loop {}

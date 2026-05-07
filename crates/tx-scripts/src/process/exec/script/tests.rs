@@ -24,8 +24,8 @@ use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use tx_hal::{
-    Asid, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
-    PmapUnmapResult, PtNode, VirtAddr,
+    Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
+    PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
 use tx_substrate::page_allocator;
 use tx_substrate::zone::{self, Cap};
@@ -138,6 +138,12 @@ impl PmapIf for ScriptsTestPmap {
         Ok(Some(PmapUnmapResult::new(virt, phys, kind)))
     }
 }
+
+// `exec_script::<P>` requires `P: PmapIf + EntropyIf`. The trait
+// default fills bytes from the deterministic boot-counter
+// xorshift, which is exactly what test sites want — non-zero,
+// reproducible, no hardware dependency.
+impl EntropyIf for ScriptsTestPmap {}
 
 // ---------------------------------------------------------------------------
 // Minimal in-test FS that knows how to materialise regular files as

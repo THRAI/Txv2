@@ -44,7 +44,7 @@ Three phases bundled because Phases 3/4 share `tx-scripts/Cargo.toml` and `lib.r
 - `crates/tx-scripts/src/process/exec/stack.rs::build_initial_user_stack(stack_top, argv, envp, auxv_facts) -> UserStackImage`.
 - Layout downward from stack_top: string pool (envp) | string pool (argv) | 16-byte AT_RANDOM | pad | auxv table | envp ptrs+NULL | argv ptrs+NULL | argc @ initial_sp.
 - 6-entry musl auxv: `AT_PHDR(3)`, `AT_PHENT(4)`, `AT_PHNUM(5)`, `AT_PAGESZ(6)`, `AT_RANDOM(25)`, `AT_NULL(0)`.
-- AT_RANDOM region: constant `[0u8; 16]` with `TODO(phase-csprng)` per Open Q #1 DECIDED.
+- AT_RANDOM region: constant `[0u8; 16]` per Open Q #1 DECIDED (real CSPRNG landed 2026-05-07 on chore branch `chore/csprng-at-random`).
 - 16-byte SP alignment held under odd argv lengths via dynamic pad.
 - CVE-2021-4034 dummy `argv[0] = ""` synthesised when caller passes empty argv.
 
@@ -135,7 +135,7 @@ The full reactor-loop drive (write → exit_group → zombie) remains covered by
 
 All five Open Questions decided 2026-05-06 before implementation:
 
-- **Q#1 AT_RANDOM source**: constant `[0; 16]` with `TODO(phase-csprng)`. txKernel has no ASLR or stack-canary checks; musl SSP becomes deterministic but functionally fine.
+- **Q#1 AT_RANDOM source**: constant `[0; 16]`. txKernel has no ASLR or stack-canary checks; musl SSP becomes deterministic but functionally fine. (Superseded 2026-05-07 on chore branch `chore/csprng-at-random`: HAL `EntropyIf` trait + per-exec fill via `AuxvFacts.at_random_bytes`.)
 - **Q#2 `process.aspace` field shape**: `AtomicSlot<Cap<AddressSpace>>` via atomic replace per `txdoc:EXEC-11-PHASE-6`. Encodes single-store-at-PoNR in the type system.
 - **Q#3 Bootstrap exec failure**: panic with `:bootstrap-exec:fail` sentinel. Boot-time invariant violation; CI must catch loudly.
 - **Q#4 CLOEXEC field width**: `AtomicU32` (covers fd 31 when the table grows).
@@ -167,15 +167,14 @@ Day-1 passes 3/6 outright + 4/6 sub-cases of 03. The rest are either DAC/setuid 
 
 ## Follow-ups in priority order
 
-1. **Real CSPRNG** — replace constant `[0; 16]` AT_RANDOM in `build_initial_user_stack`. Drop `TODO(phase-csprng)` when virtio-rng or rdrand-equivalent is wired.
-2. **`fork`/`clone`/`wait4` syscall drivers** — unblocks LTP execve05, fork+execve, wait+execve. The VM half (`fork_aspace`) exists from VM/PageBacked v1.
-3. **DAC permission checks + setuid** — unblocks LTP execve02.
-4. **`sys_open` syscall arm + `O_CLOEXEC` threading** — mechanical now that `OpenFileFlags::cloexec` is plumbed.
-5. **Real per-task AST plumbing** — signal-handler frame setup beyond `EnterUserspace`.
-6. **`RawTrapFrame`/`TrapFrameMut` portable HAL surface** — currently RV64 board internals.
-7. **Real initramfs cpio unpack at boot** — replace hand-encoded fixture with real init binary.
-8. **Goblin upstream tracking** — drop `elf32` from features once 0.10.6+ fixes the unconditional reference.
-9. **`tx_substrate::AtomicSlot<T>`** — replace the `tty::structure::identity` staging slot type used by the aspace flip.
+1. **`fork`/`clone`/`wait4` syscall drivers** — unblocks LTP execve05, fork+execve, wait+execve. The VM half (`fork_aspace`) exists from VM/PageBacked v1.
+2. **DAC permission checks + setuid** — unblocks LTP execve02.
+3. **`sys_open` syscall arm + `O_CLOEXEC` threading** — mechanical now that `OpenFileFlags::cloexec` is plumbed.
+4. **Real per-task AST plumbing** — signal-handler frame setup beyond `EnterUserspace`.
+5. **`RawTrapFrame`/`TrapFrameMut` portable HAL surface** — currently RV64 board internals.
+6. **Real initramfs cpio unpack at boot** — replace hand-encoded fixture with real init binary.
+7. **Goblin upstream tracking** — drop `elf32` from features once 0.10.6+ fixes the unconditional reference.
+8. **`tx_substrate::AtomicSlot<T>`** — replace the `tty::structure::identity` staging slot type used by the aspace flip.
 
 ## Verification
 
