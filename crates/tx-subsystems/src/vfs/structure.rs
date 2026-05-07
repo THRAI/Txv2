@@ -667,3 +667,39 @@ impl OpenFile {
         self.flags
     }
 }
+
+/// Pipe-side lifecycle hook (shell-prompt roadmap Slice 1).
+///
+/// `Cap<OpenFile>` is refcounted via the zone-substrate machinery; the
+/// inner `OpenFile` value drops exactly once, when the last `Cap`
+/// referencing it is released and EBR fires the slot reclamation
+/// callback. That single-shot guarantee is what makes a per-side
+/// reader/writer count against `PipePayload` correct without an
+/// explicit hook on every `sys_close` / `sys_dup3`-replace / fork-CLOEXEC
+/// / exit-cleanup path: each fd-slot drop releases one `Cap`, and only
+/// the *last* such drop reaches this destructor.
+///
+/// The behaviour is keyed on `RNodeBacking::StructBacked { payload:
+/// StructPayload::Pipe { side, .. } }`; non-pipe backings have no
+/// per-OpenFile lifecycle (page-backed inodes own their own page
+/// containers; tty/chardev RNodes outlive any OpenFile referencing
+/// them).
+///
+/// On the *last-reader-close* transition `decr_reader` fires the
+/// writer-side wait channel so any blocked writer surfaces SIGPIPE/
+/// EPIPE. On the *last-writer-close* transition `decr_writer` fires
+/// the reader-side wait channel so any blocked reader surfaces EOF
+/// (`Done(0)`). Both transitions are owned by `pipe::PipePayload`'s
+/// `decr_*` helpers.
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        if let RNodeBacking::StructBacked { payload } = self.rnode.backing() {
+            if let StructPayload::Pipe { payload, side } = payload {
+                match side {
+                    crate::pipe::PipeSide::Reader => payload.decr_reader(),
+                    crate::pipe::PipeSide::Writer => payload.decr_writer(),
+                }
+            }
+        }
+    }
+}
