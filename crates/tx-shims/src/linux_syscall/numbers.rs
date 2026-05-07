@@ -599,3 +599,57 @@ pub const MADV_DONTNEED: u64 = 4;
 /// (Linux distinguishes lazy vs. eager release; we treat both as
 /// eager).
 pub const MADV_FREE: u64 = 8;
+
+// ---------------------------------------------------------------------
+// Slice 3 of the shell-prompt roadmap — `futex(2)`.
+//
+// musl's libc init issues `FUTEX_WAIT` / `FUTEX_WAKE` for its
+// `pthread_once`-style guards even in single-threaded programs, so
+// without this number wired the busybox shell can't get past
+// `__init_libc`. v1 supports `FUTEX_WAIT` / `FUTEX_WAKE` only; other
+// op selectors return `-ENOSYS`. The `FUTEX_PRIVATE_FLAG` and
+// `FUTEX_CLOCK_REALTIME` flag bits are recognised but ignored
+// (per-process isolation is implicit from the per-aspace user word;
+// timeout support is deferred to Slice 4 with the timer-wait carrier).
+// See `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 3.
+// ---------------------------------------------------------------------
+
+/// `futex(uaddr, op, val, timeout, uaddr2, val3)`. Linux RV64 generic
+/// ABI `__NR_futex = 98`. Wraps `tx_subsystems::futex::step_futex_wait`
+/// / `step_futex_wake`.
+pub const NR_FUTEX: u64 = 98;
+
+/// `FUTEX_WAIT = 0` op selector. Park if `*uaddr == val`, otherwise
+/// return `-EAGAIN` immediately.
+pub const FUTEX_WAIT: u32 = 0;
+/// `FUTEX_WAKE = 1` op selector. Wake up to `val` waiters parked on
+/// `uaddr`'s bucket. Returns the (best-effort) number woken.
+pub const FUTEX_WAKE: u32 = 1;
+/// `FUTEX_REQUEUE = 3`. Out of scope for v1 — returns `-ENOSYS`.
+pub const FUTEX_REQUEUE: u32 = 3;
+/// `FUTEX_CMP_REQUEUE = 4`. Out of scope for v1 — returns `-ENOSYS`.
+pub const FUTEX_CMP_REQUEUE: u32 = 4;
+/// `FUTEX_WAKE_OP = 5`. Out of scope for v1 — returns `-ENOSYS`.
+pub const FUTEX_WAKE_OP: u32 = 5;
+/// `FUTEX_LOCK_PI = 6`. Out of scope for v1 — returns `-ENOSYS`.
+pub const FUTEX_LOCK_PI: u32 = 6;
+/// `FUTEX_UNLOCK_PI = 7`. Out of scope for v1 — returns `-ENOSYS`.
+pub const FUTEX_UNLOCK_PI: u32 = 7;
+/// `FUTEX_TRYLOCK_PI = 8`. Out of scope for v1 — returns `-ENOSYS`.
+pub const FUTEX_TRYLOCK_PI: u32 = 8;
+/// `FUTEX_WAIT_BITSET = 9`. Out of scope for v1 — returns `-ENOSYS`.
+pub const FUTEX_WAIT_BITSET: u32 = 9;
+/// `FUTEX_WAKE_BITSET = 10`. Out of scope for v1 — returns `-ENOSYS`.
+pub const FUTEX_WAKE_BITSET: u32 = 10;
+
+/// `FUTEX_PRIVATE_FLAG = 0x80` flag bit OR'd into the op word.
+/// Recognised but ignored — per-process isolation falls out of the
+/// per-aspace user word naturally. musl emits `FUTEX_WAIT_PRIVATE`
+/// (`= FUTEX_WAIT | FUTEX_PRIVATE_FLAG`) for in-process guards.
+pub const FUTEX_PRIVATE_FLAG: u32 = 0x80;
+/// `FUTEX_CLOCK_REALTIME = 0x100` flag bit OR'd into the op word.
+/// Recognised but ignored (timeout support is deferred to Slice 4).
+pub const FUTEX_CLOCK_REALTIME: u32 = 0x100;
+/// Mask applied to the `op` argument before matching the op
+/// selector — strips `FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME`.
+pub const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);

@@ -78,20 +78,22 @@ pub mod numbers;
 mod tests;
 
 pub use numbers::{
-    AT_EACCESS, AT_FDCWD, AT_SYMLINK_NOFOLLOW, FD_CLOEXEC, F_GETFD, F_OK, F_SETFD, MADV_DONTNEED,
-    MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS,
-    MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGETLB,
-    MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK,
-    MAP_SYNC, NR_BRK, NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP,
-    NR_FACCESSAT, NR_FACCESSAT2, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_GETEGID, NR_GETEUID,
-    NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRESGID, NR_GETRESUID, NR_GETSID,
-    NR_GETUID, NR_LSEEK, NR_MADVISE, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP,
-    NR_OPENAT, NR_PIPE2, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SETGID, NR_SETPGID,
-    NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
-    NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT,
-    O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN,
-    PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD,
-    WNOHANG, W_OK, X_OK,
+    AT_EACCESS, AT_FDCWD, AT_SYMLINK_NOFOLLOW, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
+    FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI,
+    FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP,
+    F_GETFD, F_OK, F_SETFD, MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL,
+    MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE,
+    MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE,
+    MAP_SHARED, MAP_STACK, MAP_SYNC, NR_BRK, NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE,
+    NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL,
+    NR_FUTEX, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID,
+    NR_GETRESGID, NR_GETRESUID, NR_GETSID, NR_GETUID, NR_LSEEK, NR_MADVISE, NR_MMAP, NR_MPROTECT,
+    NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_OPENAT, NR_PIPE2, NR_READ, NR_RT_SIGACTION,
+    NR_RT_SIGPROCMASK, NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID,
+    NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, O_ACCMODE,
+    O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC,
+    O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, R_OK,
+    SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, WNOHANG, W_OK, X_OK,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -455,6 +457,12 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf>(
         nr if nr == NR_MREMAP => sys_mremap(req.args, ctx),
         nr if nr == NR_MADVISE => sys_madvise(req.args, ctx),
         nr if nr == NR_MSYNC => sys_msync(req.args, ctx).await,
+        // Slice 3 of the shell-prompt roadmap — `futex(2)`. v1 honours
+        // `FUTEX_WAIT` / `FUTEX_WAKE` against a 256-bucket hash table;
+        // other op selectors return `-ENOSYS`. `FUTEX_PRIVATE_FLAG` /
+        // `FUTEX_CLOCK_REALTIME` are recognised but ignored. Required
+        // for musl libc init.
+        nr if nr == NR_FUTEX => sys_futex(req.args, ctx).await,
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -3209,4 +3217,121 @@ fn vmmap_error_to_i32(error: VmMapError) -> i32 {
 #[allow(dead_code)]
 fn user_range_error_to_i32(_error: UserRangeError) -> i32 {
     EINVAL_VALUE
+}
+
+/// `futex(uaddr, op, val, timeout, uaddr2, val3)` — Linux RV64
+/// generic syscall #98.
+///
+/// Slice 3 of the shell-prompt roadmap (2026-05-07). Required for
+/// musl libc init: musl uses futex internally for `pthread_once`-
+/// style guards even in single-threaded programs, and would otherwise
+/// trip on `-ENOSYS` within the first few thousand instructions of
+/// `__init_libc`.
+///
+/// v1 supports `FUTEX_WAIT` and `FUTEX_WAKE` only; other ops
+/// (`REQUEUE`, `CMP_REQUEUE`, `WAKE_OP`, `LOCK_PI`, `WAIT_BITSET`
+/// etc.) return `-ENOSYS`. `FUTEX_PRIVATE_FLAG` and
+/// `FUTEX_CLOCK_REALTIME` flag bits are accepted but ignored —
+/// per-process isolation is implicit (each process has its own
+/// aspace and the user word at `uaddr` lives in that aspace), and
+/// timeout support is deferred to Slice 4 with the timer-wait
+/// carrier. The `timeout` (args[3]), `uaddr2` (args[4]), and
+/// `val3` (args[5]) arguments are ignored in v1.
+///
+/// **`FUTEX_WAIT` semantics.** Loops on the canonical wait-carrier
+/// discipline:
+///
+/// 1. Take a fresh `epoch::guard()` and call `step_futex_wait`.
+/// 2. `Blocked(token)` → set `parked = true`, `await` the wait
+///    future, loop back to (1).
+/// 3. `Done(())` / `Advanced(())` → return `0`.
+/// 4. `Err(EAGAIN)` → distinguishes "first-call mismatch" (return
+///    `-EAGAIN` to userspace per Linux) from "post-wake re-check
+///    showed the word changed" (return `0` per the WAIT contract)
+///    via the `parked` flag tracked across loop iterations.
+/// 5. Other `Err(errno)` → return `-errno`.
+async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let uaddr = args[0];
+    let op_full = args[1] as u32;
+    let val = args[2] as u32;
+    // args[3] = timeout pointer (ignored — Slice 4 carryover).
+    // args[4] = uaddr2 (REQUEUE-family only).
+    // args[5] = val3 (BITSET-family only).
+
+    let op = op_full & FUTEX_CMD_MASK;
+
+    match op {
+        FUTEX_WAIT => {
+            // Track whether we've parked at least once. EAGAIN
+            // from `step_futex_wait` means "user word != val". If
+            // parked is false, this is the first-call mismatch
+            // (return -EAGAIN). If parked is true, this is a
+            // post-wake re-check showing the word changed (the
+            // wake was meaningful — return 0).
+            let mut parked = false;
+            loop {
+                let outcome = {
+                    let guard = tx_substrate::epoch::guard();
+                    tx_subsystems::futex::step_futex_wait(uaddr, val, &guard)
+                };
+                match outcome {
+                    StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                        return SyscallResult::Return(0);
+                    }
+                    StepOutcome::AdvancedThenBlocked((), token)
+                    | StepOutcome::Blocked(token) => {
+                        parked = true;
+                        if let Some(future) = wait_carrier::wait_on_token(token) {
+                            let _ = future.await;
+                        }
+                        // Otherwise re-poll immediately (no
+                        // registered carrier — should not happen
+                        // for production-built tokens).
+                        continue;
+                    }
+                    StepOutcome::Err(Errno::EAGAIN) => {
+                        return if parked {
+                            // Post-wake re-check showed the word
+                            // changed; the wake was meaningful.
+                            SyscallResult::Return(0)
+                        } else {
+                            // First-call mismatch — return -EAGAIN
+                            // to userspace per Linux.
+                            SyscallResult::Error(errno_to_i32(Errno::EAGAIN))
+                        };
+                    }
+                    StepOutcome::Err(errno) => {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
+            }
+        }
+        FUTEX_WAKE => {
+            let n = val;
+            let outcome = {
+                let guard = tx_substrate::epoch::guard();
+                tx_subsystems::futex::step_futex_wake(uaddr, n, &guard)
+            };
+            match outcome {
+                StepOutcome::Done(woken) | StepOutcome::Advanced(woken) => {
+                    SyscallResult::Return(woken as i64)
+                }
+                StepOutcome::AdvancedThenBlocked(woken, _) => {
+                    SyscallResult::Return(woken as i64)
+                }
+                StepOutcome::Blocked(_) => {
+                    // FUTEX_WAKE is not a blocking op. The step
+                    // never returns `Blocked` in practice; map to
+                    // `EIO` defensively rather than panic.
+                    SyscallResult::Error(EIO_VALUE)
+                }
+                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        // FUTEX_REQUEUE / CMP_REQUEUE / WAKE_OP / LOCK_PI /
+        // UNLOCK_PI / TRYLOCK_PI / WAIT_BITSET / WAKE_BITSET — out
+        // of scope for v1. musl's libc init only emits FUTEX_WAIT
+        // and FUTEX_WAKE so these are not on the critical path.
+        _ => SyscallResult::Error(ENOSYS_VALUE),
+    }
 }

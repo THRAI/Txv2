@@ -28,6 +28,7 @@ pub fn register_all() -> Result<(), ZoneError> {
     vfs::register_zones()?;
     tty::register_zones()?;
     pipe::register_zones()?;
+    futex::register_zones()?;
     Ok(())
 }
 
@@ -138,5 +139,13 @@ mod pipe {
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
         crate::pipe::register_zones()
+    }
+}
+
+mod futex {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::futex::register_zones()
     }
 }
