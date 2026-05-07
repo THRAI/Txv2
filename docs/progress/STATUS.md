@@ -4,6 +4,37 @@
 
 ## Current Shape
 
+- 2026-05-07 shell-prompt roadmap **8 of 11 slices landed** in a
+  single session. Per
+  `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` +
+  decision
+  `docs/progress/decisions/2026-05-07-shell-prompt-roadmap-progress.md`.
+  Workspace 984 → **1111 lib+tests passing**, 0 failed
+  (`--test-threads=1`); 8 sequential branches on top of fd-ops.
+  Net new: ~52 syscall arms, 1 new subsystem (`tx_subsystems::futex`),
+  ~127 new tests. Slices: pipe-lifecycle-Drop (b2d22f8), VM-mmap
+  family (1af0729), futex (324fd3a — required for musl libc init),
+  time syscalls (f48f05f), ioctl + TTY (bf8bc70 — required for
+  isatty), stat family (4b7fd12 — fstat/getcwd/chdir/getdents64/
+  umask; OpenFile gains readdir_cursor; ProcessPayload gains
+  umask), fcntl extension + day-1 misc (f09e358 — F_DUPFD/F_GETFL/
+  kill/getrandom/uname/prlimit64; F_SETFL + rt_sigreturn deferred),
+  file-mutation (2b7768c — unlinkat/mkdirat/renameat2/symlinkat/
+  linkat/truncate/readlinkat). Slice 9 (user-VA sweep) deferred
+  (f2961bc) — needs production RV64 `UserAccessIf` impl + populated
+  FixupEntry table + trap-shell fault redirect; HAL surface exists
+  but no consumer wires it. Slices 10 (busybox bake-in) + 11 (QEMU
+  shell smoke) deferred to a session with external deps (riscv64
+  cross-toolchain, `$TX_BUSYBOX`, QEMU 7.x sentinel-watch). Per-slice
+  carryovers tracked in commit messages: nanosleep timer-fire,
+  fchdir DEntry hint, F_SETFL interior mutability, rt_sigreturn +
+  signal-handler delivery, utimensat FsOps::set_times,
+  AT_SYMLINK_NOFOLLOW walker semantic, RENAME_EXCHANGE atomicity.
+  Verification: `cargo build --workspace --lib --tests` clean (no
+  warnings); `cargo test --workspace --lib --tests --
+  --test-threads=1` 1111/1111; `cargo xtask progress validate` ok.
+  Next steps: Slices 10 + 11 in a follow-up session, or proper
+  Slice 9 RV64 `UserAccessIf` for non-bake-in userspace correctness.
 - 2026-05-07 shell-prompt slice 8 (file-mutation syscalls) on branch
   `feat/file-mutation`. Per
   `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 8.
@@ -2147,6 +2178,7 @@
 
 ## Latest Decisions
 
+- `docs/progress/decisions/2026-05-07-shell-prompt-roadmap-progress.md`
 - `docs/progress/decisions/2026-05-07-fd-ops-and-drift-cleanup.md`
 - `docs/progress/decisions/2026-05-06-dac-and-setuid.md`
 - `docs/progress/decisions/2026-05-06-elf-loader-and-execve.md`
