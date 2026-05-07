@@ -64,7 +64,13 @@ use tx_subsystems::signal::{
 };
 use tx_subsystems::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
 use tx_subsystems::thread_runtime::{step_thread_exit, ThreadIdentity};
-use tx_subsystems::vfs::structure::{Credential, OpenFileFlags};
+use tx_subsystems::tty::execution::{
+    step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
+    step_ioctl_tiocnotty, step_ioctl_tiocsctty, step_ioctl_tiocspgrp, step_ioctl_tiocswinsz,
+    IoctlCaller,
+};
+use tx_subsystems::tty::structure::{Termios, Winsize};
+use tx_subsystems::vfs::structure::{Credential, OpenFileFlags, RNodeBacking, StructPayload};
 use tx_subsystems::vfs::{step_open, step_walk, DEntry, OpenFile};
 use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserRangeError, UserVirtAddr,
@@ -90,14 +96,15 @@ pub use numbers::{
     NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT,
     NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FUTEX,
     NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRESGID,
-    NR_GETRESUID, NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_LSEEK, NR_MADVISE, NR_MMAP, NR_MPROTECT,
-    NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP, NR_OPENAT, NR_PIPE2, NR_READ, NR_RT_SIGACTION,
-    NR_RT_SIGPROCMASK, NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID,
-    NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_TIMES, NR_WAIT4, NR_WRITE,
-    O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR,
-    O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE,
-    R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, TIMER_ABSTIME, TIMES_NS_PER_TICK, WNOHANG, W_OK,
-    X_OK,
+    NR_GETRESUID, NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_LSEEK, NR_MADVISE, NR_MMAP,
+    NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP, NR_OPENAT, NR_PIPE2, NR_READ,
+    NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID,
+    NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
+    NR_TIMES, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL,
+    O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP,
+    PROT_NONE, PROT_READ, PROT_WRITE, R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS,
+    TCSETSF, TCSETSW, TIMER_ABSTIME, TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY,
+    TIOCSPGRP, TIOCSWINSZ, WNOHANG, W_OK, X_OK,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -486,6 +493,14 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_TIMES => sys_times::<P>(req.args, ctx),
         nr if nr == NR_NANOSLEEP => sys_nanosleep::<P>(req.args, ctx),
         nr if nr == NR_CLOCK_NANOSLEEP => sys_clock_nanosleep::<P>(req.args, ctx),
+        // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY
+        // routing. Without this, musl's `isatty(STDIN_FILENO)` check
+        // returns false, the shell starts in non-interactive mode, no
+        // prompt is printed. Pure plumbing — all eight TTY ioctl
+        // step functions exist; the arm decodes `request` and
+        // dispatches. Non-TTY fds and unknown request codes return
+        // `-ENOTTY` per Linux's `man ioctl_tty`.
+        nr if nr == NR_IOCTL => sys_ioctl(req.args, ctx),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -1256,6 +1271,7 @@ fn errno_to_i32(errno: Errno) -> i32 {
         Errno::ENOSYS => ENOSYS_VALUE,
         Errno::ENOTDIR => 20,
         Errno::ENOTEMPTY => 39,
+        Errno::ENOTTY => 25,
         Errno::EPERM => 1,
         Errno::EPIPE => 32,
         Errno::EROFS => 30,
@@ -2809,6 +2825,239 @@ fn sys_lseek<'a>(
             SyscallResult::Error(errno_to_i32(Errno::EIO))
         }
         StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+// =====================================================================
+// Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY routing.
+//
+// Eight TTY ioctl arms are implemented:
+//
+// - TCGETS / TCSETS / TCSETSW / TCSETSF — termios get/set. The W/F
+//   variants currently alias to `step_ioctl_tcsets` (drain semantics
+//   are not yet implemented).
+// - TIOCGPGRP / TIOCSPGRP — foreground process-group id get/set.
+// - TIOCGWINSZ / TIOCSWINSZ — window size get/set.
+// - TIOCSCTTY / TIOCNOTTY — controlling-terminal acquire/release.
+//
+// Non-TTY fds (pipes, regular files, dirs, etc.) and unknown request
+// codes return `-ENOTTY` per Linux's `man ioctl_tty` (some systems use
+// `ENOSYS` for unknown ioctls; ENOTTY is the standard for the
+// terminal-shape ioctls — POSIX `tcgetattr(3)` documents ENOTTY as the
+// "fd is not a terminal" return).
+//
+// User-VA discipline: Slice 5 predates the user-VA sweep (Slice 9).
+// The argp pointer is treated as a kernel-side pointer via inline
+// `read_volatile` / `write_volatile` (mirrors `sys_wait4`'s `wstatus`
+// writeback and the cred-getres helpers); a null `argp` short-circuits
+// to `-EFAULT`. Real EFAULT semantics on invalid user VAs lift to
+// `UserAccessIf::{copy_from_user, copy_to_user}` in Slice 9.
+// TODO(phase-userva): migrate to copy_from_user / copy_to_user.
+//
+// See `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 5.
+// =====================================================================
+
+/// Build an [`IoctlCaller`] from `ctx.process` for a session-control
+/// ioctl (TIOCSCTTY / TIOCNOTTY / TIOCSPGRP). Pulls the caller's
+/// session id and process-group id from the process's `pgrp_cap()` and
+/// derives the session-leader bit from `pid == sid` (per
+/// `PROCESS_v1` §2.4 the session leader's pid equals the session id).
+///
+/// `has_controlling_tty` is set from the session's
+/// `has_controlling_tty()` accessor; this is consumed by
+/// `require_session_leader` for TIOCSCTTY (the check rejects callers
+/// who already have a controlling TTY).
+fn make_ioctl_caller(ctx: &SyscallCtx<'_>) -> IoctlCaller {
+    let pgrp = ctx.process.pgrp_cap();
+    let pgid = pgrp.pgid.0;
+    let session = pgrp.session_cap();
+    let sid = session.sid.0;
+    let pid = ctx.process.pid.0;
+    let mut caller = IoctlCaller::new(sid, pgid);
+    if pid == sid {
+        caller = caller.as_session_leader();
+    }
+    if session.has_controlling_tty() {
+        caller = caller.with_controlling_tty();
+    }
+    caller
+}
+
+/// `ioctl(fd, request, argp)`. Linux RV64 generic syscall #29.
+///
+/// Decodes `request` against the eight TTY ioctls v1 supports and
+/// dispatches to the matching `tty::execution::step_ioctl_*` helper.
+/// Non-TTY fds and unknown request codes return `-ENOTTY`.
+///
+/// All eight TTY step functions are non-blocking (they operate on
+/// `AtomicSlot` / `SpinMutex` state inside the TTY identity), so the
+/// arm itself is non-async; `Blocked` / `AdvancedThenBlocked` outcomes
+/// are unreachable in practice and surface as `-EIO` for symmetry with
+/// the other fd arms.
+fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i32;
+    let request = args[1] as u32;
+    let argp = args[2];
+
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    // Resolve to a TTY. Non-TTY fds → -ENOTTY for terminal-shape ioctls
+    // (Linux semantic — even pipes / regular files return ENOTTY for
+    // these requests, per `man ioctl_tty`).
+    let tty = match file.rnode().backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty),
+        } => tty.clone(),
+        _ => return SyscallResult::Error(errno_to_i32(Errno::ENOTTY)),
+    };
+
+    let guard = tx_substrate::epoch::guard();
+
+    match request {
+        TCGETS => match step_ioctl_tcgets(&tty, &guard) {
+            StepOutcome::Done(termios) | StepOutcome::Advanced(termios) => {
+                if argp == 0 {
+                    return SyscallResult::Error(EFAULT_VALUE);
+                }
+                // SAFETY: bootstrap kernel-buffer exemption — `argp`
+                // is treated as a kernel-side pointer until the
+                // user-VA sweep (Slice 9) wires `copy_to_user`. The
+                // size matches `Termios`'s repr-Rust layout (4 u32
+                // fields + NCCS bytes); the test scaffolding allocates
+                // the buffer from the test's stack.
+                // TODO(phase-userva): replace with copy_to_user.
+                unsafe {
+                    core::ptr::write_volatile(argp as *mut Termios, termios);
+                }
+                SyscallResult::Return(0)
+            }
+            StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                SyscallResult::Error(errno_to_i32(Errno::EIO))
+            }
+        },
+        TCSETS | TCSETSW | TCSETSF => {
+            if argp == 0 {
+                return SyscallResult::Error(EFAULT_VALUE);
+            }
+            // SAFETY: bootstrap kernel-buffer exemption (see TCGETS).
+            // TODO(phase-userva): replace with copy_from_user.
+            // TCSETSW (drain output queue) and TCSETSF (drain output +
+            // flush input) currently alias to TCSETS — the drain/flush
+            // semantics aren't implemented yet. Treating all three as
+            // immediate-install matches Linux's behaviour for an empty
+            // output queue.
+            let new_termios = unsafe { core::ptr::read_volatile(argp as *const Termios) };
+            match step_ioctl_tcsets(&tty, new_termios, &guard) {
+                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
+                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                    SyscallResult::Error(errno_to_i32(Errno::EIO))
+                }
+            }
+        }
+        TIOCGPGRP => match step_ioctl_tiocgpgrp(&tty, &guard) {
+            StepOutcome::Done(pgid) | StepOutcome::Advanced(pgid) => {
+                if argp == 0 {
+                    return SyscallResult::Error(EFAULT_VALUE);
+                }
+                // SAFETY: bootstrap kernel-buffer exemption (see TCGETS).
+                // TODO(phase-userva): replace with copy_to_user.
+                unsafe {
+                    core::ptr::write_volatile(argp as *mut u32, pgid);
+                }
+                SyscallResult::Return(0)
+            }
+            StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                SyscallResult::Error(errno_to_i32(Errno::EIO))
+            }
+        },
+        TIOCSPGRP => {
+            if argp == 0 {
+                return SyscallResult::Error(EFAULT_VALUE);
+            }
+            // SAFETY: bootstrap kernel-buffer exemption (see TCGETS).
+            // TODO(phase-userva): replace with copy_from_user.
+            let new_pgrp = unsafe { core::ptr::read_volatile(argp as *const u32) };
+            let caller = make_ioctl_caller(ctx);
+            match step_ioctl_tiocspgrp(&tty, caller, new_pgrp, &guard) {
+                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
+                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                    SyscallResult::Error(errno_to_i32(Errno::EIO))
+                }
+            }
+        }
+        TIOCGWINSZ => match step_ioctl_tiocgwinsz(&tty, &guard) {
+            StepOutcome::Done(ws) | StepOutcome::Advanced(ws) => {
+                if argp == 0 {
+                    return SyscallResult::Error(EFAULT_VALUE);
+                }
+                // SAFETY: bootstrap kernel-buffer exemption (see TCGETS).
+                // TODO(phase-userva): replace with copy_to_user.
+                unsafe {
+                    core::ptr::write_volatile(argp as *mut Winsize, ws);
+                }
+                SyscallResult::Return(0)
+            }
+            StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                SyscallResult::Error(errno_to_i32(Errno::EIO))
+            }
+        },
+        TIOCSWINSZ => {
+            if argp == 0 {
+                return SyscallResult::Error(EFAULT_VALUE);
+            }
+            // SAFETY: bootstrap kernel-buffer exemption (see TCGETS).
+            // TODO(phase-userva): replace with copy_from_user.
+            let ws = unsafe { core::ptr::read_volatile(argp as *const Winsize) };
+            match step_ioctl_tiocswinsz(&tty, ws, &guard) {
+                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
+                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                    SyscallResult::Error(errno_to_i32(Errno::EIO))
+                }
+            }
+        }
+        TIOCSCTTY => {
+            // The `argp` for TIOCSCTTY is a "force" bit (0 or 1) on
+            // Linux, used to steal the TTY from another session when
+            // the caller is root. v1 ignores it — the underlying
+            // `step_ioctl_tiocsctty` rejects already-bound TTYs with
+            // -EBUSY regardless of the force flag.
+            let caller = make_ioctl_caller(ctx);
+            match step_ioctl_tiocsctty(&tty, caller, &guard) {
+                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
+                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                    SyscallResult::Error(errno_to_i32(Errno::EIO))
+                }
+            }
+        }
+        TIOCNOTTY => {
+            let caller = make_ioctl_caller(ctx);
+            match step_ioctl_tiocnotty(&tty, caller, &guard) {
+                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
+                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                    SyscallResult::Error(errno_to_i32(Errno::EIO))
+                }
+            }
+        }
+        // Unknown ioctl request → -ENOTTY (the POSIX `man ioctl_tty`
+        // semantic). musl's `isatty(3)` resolves to TCGETS so it never
+        // hits this arm, but other libc paths (or buggy userspace)
+        // observing -ENOTTY here is the canonical Linux signal that
+        // the request is not a terminal ioctl on this fd.
+        _ => SyscallResult::Error(errno_to_i32(Errno::ENOTTY)),
     }
 }
 

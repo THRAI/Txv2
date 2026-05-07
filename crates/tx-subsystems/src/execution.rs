@@ -37,6 +37,12 @@ pub enum Errno {
     ENOSYS,
     ENOTDIR,
     ENOTEMPTY,
+    /// Inappropriate ioctl for device. Surfaced by Slice 5 of the
+    /// shell-prompt roadmap (`ioctl(2)` arm) when the target fd is not
+    /// a TTY (terminal-shape ioctl on a pipe / regular file / dir / etc.)
+    /// or the request code is not one of the eight TTY ioctls v1
+    /// implements. Linux value: 25.
+    ENOTTY,
     EPERM,
     /// Broken pipe: write to a pipe with all readers closed. The
     /// caller is responsible for delivering SIGPIPE before returning
