@@ -1,9 +1,62 @@
 # txKernel Status
 
-**Updated:** 2026-05-06
+**Updated:** 2026-05-07
 
 ## Current Shape
 
+- 2026-05-07 DAC + setuid Wave 5 (Part 8 end-to-end smoke + sibling
+  setuid fixture) on branch `feat/dac-and-setuid`. Per
+  `docs/progress/plans/2026-05-06-dac-and-setuid.md` Part 8.
+  Climax wave — proves the DAC + setuid pipeline end-to-end.
+  Deliverables: (1) `crates/tx-kernel/src/init/init_setuid_fixture.rs`
+  — 204-byte hand-encoded RV64 ET_EXEC ELF fixture; 7-instruction
+  body (`li a7, 174` (NR_GETUID) → ecall → `li a7, 175` (NR_GETEUID)
+  → ecall → `li a7, 94` (NR_EXIT_GROUP) → `li a0, 0` → ecall);
+  same `LOAD_VADDR = 0x10000` as the fork+wait fixture (the two
+  fixtures are not co-resident in any single AddressSpace);
+  entry-vaddr `0x100B0`. **Plan Q4 deviation:** Q4 was authored
+  before the fork/clone/wait4 slice rewrote `init_fixture.rs` into
+  a 317-byte fork+wait+exit binary with ~7 pinned byte tests;
+  extending it again into a third behaviour would invalidate the
+  existing pin tests. Sibling fixture matches the plan's Part 8
+  section heading and keeps both smokes independently pinned.
+  (2) 5 pin tests in `init_setuid_fixture/tests`:
+  size-matches-constant (204 bytes), elf-magic, e_machine=EM_RISCV,
+  e_entry-matches-constant, first-instruction-is-li-a7-174.
+  (3) End-to-end Layer A smoke
+  `boot_smoke_setuid_exec_seeds_post_setuid_euid_and_at_secure`
+  in `crates/tx-kernel/src/init/tests.rs`. Drives boot wiring,
+  registers `/setuid-target` with mode `S_ISUID | 0o755` owned
+  by uid=1000/gid=1000 (via the new `register_setuid_fixture_into_tmpfs`
+  helper that uses production `step_chown` + `step_chmod` under
+  CAP_FOWNER root cred to avoid the silent-clear-S_ISUID rule),
+  drops init's cred to uid=euid=suid=1001 + clears caps via
+  `cross_crate_test_support::clear_caps_for_test` +
+  `set_cred_ids_for_test`, then `block_on(exec_script::<TestPlatform>)`.
+  Post-exec assertions: `init.cred().uid == 1001` (real uid
+  preserved), `init.cred().euid == 1000` (S_ISUID recompute set
+  effective uid to file owner), `init.cred().suid == 1000`
+  (saved-set tracks new euid), `init.cred().gid/egid/sgid == 1001`
+  (no S_ISGID on fixture so gid family unchanged),
+  `saved_user_context.pc == INIT_SETUID_FIXTURE_ENTRY_VADDR`
+  (Phase 6 still seeded entry-point with new cred), AddressSpace
+  Cap key changed (PoNR boundary crossed). (4) Same
+  `register_setuid_fixture_into_tmpfs` helper added inline to
+  the test module — mirrors `register_init_fixture_into_tmpfs`'s
+  shape (create_inode → materialise_rnode → page-by-page memcpy
+  → truncate) plus post-creation `step_chown` + `step_chmod`
+  under root cred. **Layer A choice:** matches the fork/clone/wait4
+  Wave 4 smoke's choice (production-paths-up-to-divergence;
+  reactor-driven instruction-level execution deferred to a
+  future integration smoke). Verification: tx-kernel 37/37
+  (31 baseline + 6 new); tx-substrate sync 2/2 + integration 2/2;
+  tx-fs 24/24 serial; tx-shims 78/78; tx-scripts 39/39;
+  tx-subsystems 405/405 serial; `cargo check --workspace` clean;
+  `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf` clean; `cargo fmt --check` clean;
+  `cargo xtask progress validate` ok (24 file(s)). Closes the
+  DAC + setuid slice (Waves 1–5 all landed). Next step: progress
+  catch-up + decision note for the slice.
 - 2026-05-06 fork/clone/wait4 Wave 3 (NR_WAIT4 syscall arm with
   blocking-wait) on branch `feat/fork-clone-wait4`. Per
   `docs/progress/plans/2026-05-06-fork-clone-wait4.md` Part 3.

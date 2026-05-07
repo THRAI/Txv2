@@ -1301,5 +1301,14 @@ fn bootstrap_block_on<F: core::future::Future>(future: F) -> F::Output {
 
 mod init_fixture;
 
+/// DAC + setuid slice (Wave 5, Part 8): sibling fixture for the
+/// end-to-end setuid smoke. See `init_setuid_fixture.rs`'s module
+/// header for the deviation from Plan Q4 (extend-in-place was
+/// authored before the fork/clone/wait4 slice rewrote the existing
+/// fixture into a fork+wait+exit binary; sibling fixture keeps both
+/// smokes independently pinned).
+#[cfg(test)]
+mod init_setuid_fixture;
+
 #[cfg(test)]
 mod tests;
