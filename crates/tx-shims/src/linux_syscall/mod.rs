@@ -44,7 +44,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use tx_hal::{EntropyIf, PmapIf};
+use tx_hal::{EntropyIf, PmapIf, TimeIf};
 use tx_reactor::userspace::SyscallRequest;
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_substrate::zone::Cap;
@@ -78,22 +78,26 @@ pub mod numbers;
 mod tests;
 
 pub use numbers::{
-    AT_EACCESS, AT_FDCWD, AT_SYMLINK_NOFOLLOW, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
-    FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI,
-    FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP,
-    F_GETFD, F_OK, F_SETFD, MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL,
-    MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE,
-    MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE,
-    MAP_SHARED, MAP_STACK, MAP_SYNC, NR_BRK, NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE,
-    NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL,
-    NR_FUTEX, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID,
-    NR_GETRESGID, NR_GETRESUID, NR_GETSID, NR_GETUID, NR_LSEEK, NR_MADVISE, NR_MMAP, NR_MPROTECT,
-    NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_OPENAT, NR_PIPE2, NR_READ, NR_RT_SIGACTION,
+    AT_EACCESS, AT_FDCWD, AT_SYMLINK_NOFOLLOW, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
+    CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
+    CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID, FD_CLOEXEC, FUTEX_CLOCK_REALTIME,
+    FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE,
+    FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE,
+    FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, F_GETFD, F_OK, F_SETFD, MADV_DONTNEED, MADV_FREE,
+    MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE,
+    MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED,
+    MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK, MAP_SYNC, NR_BRK,
+    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT,
+    NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FUTEX,
+    NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRESGID,
+    NR_GETRESUID, NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_LSEEK, NR_MADVISE, NR_MMAP, NR_MPROTECT,
+    NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP, NR_OPENAT, NR_PIPE2, NR_READ, NR_RT_SIGACTION,
     NR_RT_SIGPROCMASK, NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID,
-    NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, O_ACCMODE,
-    O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC,
-    O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, R_OK,
-    SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, WNOHANG, W_OK, X_OK,
+    NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_TIMES, NR_WAIT4, NR_WRITE,
+    O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR,
+    O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE,
+    R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, TIMER_ABSTIME, TIMES_NS_PER_TICK, WNOHANG, W_OK,
+    X_OK,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -134,6 +138,11 @@ pub const EXECVE_VEC_MAX: usize = 256;
 const ENOSYS_VALUE: i32 = 38;
 /// Linux generic ABI errno value for "bad file descriptor" (`EBADF`).
 const EBADF_VALUE: i32 = 9;
+/// Linux generic ABI errno value for "bad address" (`EFAULT`).
+/// Used by Slice 4's time syscalls when a required user pointer is
+/// null. Real EFAULT semantics (invalid user VA) are deferred to
+/// `TODO(phase-userva)`.
+const EFAULT_VALUE: i32 = 14;
 /// Linux generic ABI errno value for "argument list too long" (`E2BIG`).
 /// Used when a syscall argument violates a Phase 2a slice bound (e.g.
 /// `write(len > TTY_WRITE_MAX_INLINE)`).
@@ -341,7 +350,7 @@ pub enum SyscallResult {
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P: PmapIf + EntropyIf>(
+pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -463,6 +472,20 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf>(
         // `FUTEX_CLOCK_REALTIME` are recognised but ignored. Required
         // for musl libc init.
         nr if nr == NR_FUTEX => sys_futex(req.args, ctx).await,
+        // Slice 4 of the shell-prompt roadmap — time syscalls. The
+        // four POSIX clock ids alias to the platform monotonic clock
+        // for v1 (CLOCK_REALTIME has no boot-time RTC offset yet;
+        // CPU-time clocks have no per-process accounting yet —
+        // documented at the constant declarations in `numbers.rs`).
+        // `nanosleep` / `clock_nanosleep` ship the zero-duration /
+        // past-deadline short-circuit only; non-zero durations return
+        // `-ENOSYS` (deferred — needs a per-task timer-fire wait
+        // carrier the slice does not yet wire).
+        nr if nr == NR_CLOCK_GETTIME => sys_clock_gettime::<P>(req.args, ctx),
+        nr if nr == NR_GETTIMEOFDAY => sys_gettimeofday::<P>(req.args, ctx),
+        nr if nr == NR_TIMES => sys_times::<P>(req.args, ctx),
+        nr if nr == NR_NANOSLEEP => sys_nanosleep::<P>(req.args, ctx),
+        nr if nr == NR_CLOCK_NANOSLEEP => sys_clock_nanosleep::<P>(req.args, ctx),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -3334,4 +3357,264 @@ async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
         // and FUTEX_WAKE so these are not on the critical path.
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
+}
+
+// ===========================================================================
+// Slice 4 of the shell-prompt roadmap (2026-05-07) — time syscalls.
+//
+// `clock_gettime`, `gettimeofday`, `times` ship the read-side surface
+// against `<P as TimeIf>::read_ns()`. All four POSIX clocks
+// (`CLOCK_REALTIME` / `CLOCK_MONOTONIC` / `CLOCK_PROCESS_CPUTIME_ID`
+// / `CLOCK_THREAD_CPUTIME_ID`) and their `*_RAW` / `*_COARSE` /
+// `BOOTTIME` aliases route to the platform monotonic — no boot-time
+// RTC offset and no per-process CPU-time accounting yet (TODOs at the
+// constant declarations).
+//
+// `nanosleep` / `clock_nanosleep` ship the zero-duration / past-
+// deadline short-circuit only. Real-duration sleeps need a per-task
+// timer-fire wait carrier (i.e. a Channel attached to the reactor's
+// TimerQueue, fired when `step_hart_loop_at`'s `advance_time_to` walks
+// past the parked deadline). That wiring requires either exposing
+// `Reactor::channel()` through `wait_carrier` (a tx-kernel ↔
+// tx-subsystems plumbing change, since the BSP reactor lives in
+// tx-kernel) or adding a global timer queue to tx-subsystems and
+// driving it from the BSP loop. Both are out of scope for Slice 4 —
+// busybox sh's syscall trace barely uses `nanosleep` and Slice 11's
+// QEMU shell smoke can land without it. The deferred follow-up is
+// tracked in `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md`.
+//
+// Per the existing dispatch convention, all writes use the bootstrap
+// kernel-buffer exemption (`core::ptr::write_volatile`) shared with
+// `sys_pipe2`'s pipefd write and `sys_getresuid`/`sys_getresgid`'s
+// uaddr writes. `TODO(phase-userva)` covers the user-VA copy lane.
+// ===========================================================================
+
+/// Layout of a POSIX `struct timespec` written by `clock_gettime` /
+/// read by `nanosleep` / `clock_nanosleep`. Field order and widths
+/// match Linux's RV64 generic ABI (`include/uapi/linux/time.h`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TimespecLayout {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// Layout of a POSIX `struct timeval` written by `gettimeofday`. Field
+/// order and widths match Linux's RV64 generic ABI.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TimevalLayout {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+/// Layout of a POSIX `struct tms` written by `times(2)`. Slice 4
+/// populates `tms_utime` with the monotonic tick count and zeros the
+/// other three fields (no per-process system / child-time accounting
+/// in v1 — `TODO(phase-cputime)`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TmsLayout {
+    tms_utime: i64,
+    tms_stime: i64,
+    tms_cutime: i64,
+    tms_cstime: i64,
+}
+
+/// Convert a nanosecond count to a Linux-shaped `(tv_sec, tv_nsec)`
+/// pair. Both fields are signed 64-bit per the uapi.
+fn ns_to_timespec(ns: u64) -> TimespecLayout {
+    TimespecLayout {
+        tv_sec: (ns / 1_000_000_000) as i64,
+        tv_nsec: (ns % 1_000_000_000) as i64,
+    }
+}
+
+/// Convert a nanosecond count to a Linux-shaped `(tv_sec, tv_usec)`
+/// pair (microsecond resolution — `gettimeofday` truncates the
+/// sub-microsecond residue).
+fn ns_to_timeval(ns: u64) -> TimevalLayout {
+    TimevalLayout {
+        tv_sec: (ns / 1_000_000_000) as i64,
+        tv_usec: ((ns % 1_000_000_000) / 1_000) as i64,
+    }
+}
+
+/// Read a Linux-shaped `(tv_sec, tv_nsec)` pair from user memory and
+/// fold it back into a nanosecond count. Returns `None` if either
+/// field is negative or `tv_nsec` overflows the canonical
+/// `[0, 1_000_000_000)` range — those are the two `-EINVAL` cases
+/// `nanosleep(2)` documents (`req->tv_nsec >= 1_000_000_000` or
+/// either field negative).
+///
+/// SAFETY: bootstrap kernel-buffer exemption — `uaddr` is read via
+/// inline `read_volatile` matching the existing futex / pipe2 /
+/// getresuid arms. `TODO(phase-userva)`.
+fn read_timespec_at(uaddr: u64) -> Option<u64> {
+    if uaddr == 0 {
+        return None;
+    }
+    // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
+    let ts = unsafe { core::ptr::read_volatile(uaddr as *const TimespecLayout) };
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return None;
+    }
+    Some((ts.tv_sec as u64).saturating_mul(1_000_000_000) + (ts.tv_nsec as u64))
+}
+
+/// `clock_gettime(clk_id, tp)`. Linux RV64 generic ABI
+/// `__NR_clock_gettime = 113`.
+///
+/// Day-1 surface: every recognised clock id (REALTIME / MONOTONIC /
+/// PROCESS_CPUTIME / THREAD_CPUTIME plus the *_RAW / *_COARSE /
+/// BOOTTIME aliases) routes to `<P as TimeIf>::read_ns()`. Unknown
+/// clock ids return `-EINVAL`. Null `tp` returns `-EFAULT`.
+fn sys_clock_gettime<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let clk_id = args[0] as u32;
+    let ts_uaddr = args[1];
+    if ts_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let ns = match clk_id {
+        CLOCK_REALTIME
+        | CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME => <P as TimeIf>::read_ns(),
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let ts = ns_to_timespec(ns);
+    // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
+    unsafe {
+        core::ptr::write_volatile(ts_uaddr as *mut TimespecLayout, ts);
+    }
+    SyscallResult::Return(0)
+}
+
+/// `gettimeofday(tv, tz)`. Linux RV64 generic ABI
+/// `__NR_gettimeofday = 169`.
+///
+/// The `tz` argument (args[1]) is deprecated on Linux and ignored.
+/// Null `tv` returns `-EFAULT`.
+fn sys_gettimeofday<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let tv_uaddr = args[0];
+    // args[1] = tz (ignored — deprecated on Linux).
+    if tv_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let tv = ns_to_timeval(<P as TimeIf>::read_ns());
+    // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
+    unsafe {
+        core::ptr::write_volatile(tv_uaddr as *mut TimevalLayout, tv);
+    }
+    SyscallResult::Return(0)
+}
+
+/// `times(buf)`. Linux RV64 generic ABI `__NR_times = 153`.
+///
+/// Returns the monotonic tick count at `_SC_CLK_TCK = 100Hz`. Writes
+/// `tms_utime = ticks` and zeros the other three fields when `buf` is
+/// non-null. Null `buf` is permitted per Linux semantics — only the
+/// return value matters in that case (LTP `times02` covers this).
+fn sys_times<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let buf_uaddr = args[0];
+    let ns = <P as TimeIf>::read_ns();
+    let ticks = (ns / TIMES_NS_PER_TICK) as i64;
+    if buf_uaddr != 0 {
+        let tms = TmsLayout {
+            tms_utime: ticks,
+            tms_stime: 0,
+            tms_cutime: 0,
+            tms_cstime: 0,
+        };
+        // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
+        unsafe {
+            core::ptr::write_volatile(buf_uaddr as *mut TmsLayout, tms);
+        }
+    }
+    SyscallResult::Return(ticks)
+}
+
+/// `nanosleep(req, rem)`. Linux RV64 generic ABI
+/// `__NR_nanosleep = 101`.
+///
+/// **Slice 4 surface.** Validates `*req` (returns `-EINVAL` on
+/// negative fields or `tv_nsec >= 1_000_000_000`); short-circuits to
+/// `Return(0)` on a zero-duration request. Real non-zero durations
+/// return `-ENOSYS` — the per-task timer-fire wait carrier needed for
+/// proper park-until-deadline semantics is deferred (see the slice
+/// header comment). Null `req` returns `-EFAULT`.
+///
+/// `rem` (args[1]) is currently ignored — only the EINTR-with-leftover
+/// path needs to populate it, and the slice does not yet have signal
+/// interruption of nanosleep wired.
+fn sys_nanosleep<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let req_uaddr = args[0];
+    // args[1] = rem (ignored — no EINTR path in Slice 4).
+    let req_ns = match read_timespec_at(req_uaddr) {
+        Some(ns) => ns,
+        None if req_uaddr == 0 => return SyscallResult::Error(EFAULT_VALUE),
+        None => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    if req_ns == 0 {
+        return SyscallResult::Return(0);
+    }
+    // Real-duration sleeps deferred — see slice header. busybox sh
+    // does not exercise this on the critical path, so returning
+    // -ENOSYS keeps the contract honest while the timer-channel
+    // wiring lands in a follow-up slice.
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+/// `clock_nanosleep(clk_id, flags, req, rem)`. Linux RV64 generic ABI
+/// `__NR_clock_nanosleep = 115`.
+///
+/// **Slice 4 surface.** Same deferral as `nanosleep`: the
+/// zero-duration / past-deadline short-circuit ships, real
+/// non-zero-future deadlines return `-ENOSYS`. Honours
+/// `TIMER_ABSTIME` for the past-deadline check (when set, `req`
+/// is interpreted as an absolute deadline — past deadlines short-
+/// circuit immediately to `Return(0)`).
+///
+/// Recognised clock ids match `clock_gettime`. Unknown clock ids and
+/// unknown flag bits return `-EINVAL`. Null `req` returns `-EFAULT`.
+fn sys_clock_nanosleep<'a, P: TimeIf>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let clk_id = args[0] as u32;
+    let flags = args[1] as u32;
+    let req_uaddr = args[2];
+    // args[3] = rem (ignored — no EINTR path in Slice 4).
+
+    match clk_id {
+        CLOCK_REALTIME
+        | CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME => {}
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    }
+    if (flags & !TIMER_ABSTIME) != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let req_ns = match read_timespec_at(req_uaddr) {
+        Some(ns) => ns,
+        None if req_uaddr == 0 => return SyscallResult::Error(EFAULT_VALUE),
+        None => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let now = <P as TimeIf>::read_ns();
+    let deadline_ns = if (flags & TIMER_ABSTIME) != 0 {
+        req_ns
+    } else {
+        now.saturating_add(req_ns)
+    };
+    if now >= deadline_ns {
+        return SyscallResult::Return(0);
+    }
+    // Real-duration sleeps deferred — see `sys_nanosleep`.
+    SyscallResult::Error(ENOSYS_VALUE)
 }
