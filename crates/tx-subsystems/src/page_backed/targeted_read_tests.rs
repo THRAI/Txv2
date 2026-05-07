@@ -2,10 +2,9 @@
 
 use super::*;
 use crate::execution::{Errno, StepOutcome};
-use crate::vfs::{FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking};
 use alloc::vec;
 use alloc::vec::Vec;
-use tx_hal::{KernelPtr, UserAccessIf, UserPtr};
+use tx_substrate::page_allocator;
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
@@ -15,76 +14,40 @@ fn setup_host_substrate() {
     }
 }
 
-fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
-    let pc = PageContainer::new_cap(pc.kind().clone(), pc.page_count())
-        .expect("page container cap for open file");
-    let rnode = RNode::new_cap(
-        FsObjectId::new(901),
-        InodeMeta::new(InodeKind::Regular, 0o100644),
-        RNodeBacking::PageBacked { pc },
-    )
-    .expect("rnode cap");
-    OpenFile::new(
-        rnode,
-        OpenFileFlags {
-            read: true,
-            write: true,
-            append: false,
-            cloexec: false,
-            nonblocking: false,
-        },
-    )
-}
-
-/// `UserAccessIf` whose user-space pointer is just a host pointer into a
-/// `Vec<u8>`. Used to seed an Anon `PageContainer` with known bytes via
-/// `step_write_from_user` before reading them back through
-/// `read_exact_at`.
-struct PassthroughHal;
-
-impl UserAccessIf for PassthroughHal {
-    unsafe fn copy_from_user(
-        dst: KernelPtr<u8>,
-        src: UserPtr<u8>,
-        len: usize,
-    ) -> Result<(), tx_hal::FaultInfo> {
-        if len == 0 {
-            return Ok(());
-        }
+/// Seed `pc` with the bytes of `bytes` starting at offset 0 by
+/// materialising each anon page and writing through the kernel
+/// direct-map view. Equivalent to the previous
+/// `step_write_from_user::<PassthroughHal>` seed but without going
+/// through the user-VA path — `read_exact_at`'s contract is
+/// kernel-buffer-only, so seeding via the kernel direct-map directly
+/// is the natural shape now that `UserAccessIf` is retired.
+fn seed_anon_pc_with_bytes(pc: &PageContainer, bytes: &[u8]) {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let page_index = PageIndex::new((written / crate::vm::USER_PAGE_SIZE) as u64);
+        let within = written % crate::vm::USER_PAGE_SIZE;
+        let chunk = core::cmp::min(bytes.len() - written, crate::vm::USER_PAGE_SIZE - within);
+        let page = pc
+            .materialize_anon(page_index, MaterializeAccess::Write)
+            .expect("materialise anon page for seeding");
+        let frame_base = page_allocator::frame_kernel_addr(page.ppn)
+            .expect("kernel direct-map for materialised page");
+        // SAFETY: frame_base is a valid kernel direct-map pointer for
+        // USER_PAGE_SIZE bytes; within + chunk <= USER_PAGE_SIZE; the
+        // source slice has at least `chunk` bytes remaining.
         unsafe {
-            core::ptr::copy_nonoverlapping(src.addr() as *const u8, dst.as_ptr(), len);
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().add(written),
+                frame_base.add(within),
+                chunk,
+            );
         }
-        Ok(())
+        written += chunk;
     }
-
-    unsafe fn copy_to_user(
-        dst: UserPtr<u8>,
-        src: KernelPtr<u8>,
-        len: usize,
-    ) -> Result<(), tx_hal::FaultInfo> {
-        if len == 0 {
-            return Ok(());
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), dst.addr() as *mut u8, len);
-        }
-        Ok(())
-    }
-}
-
-/// Seed `pc` with the bytes of `bytes` starting at offset 0 via
-/// `step_write_from_user::<PassthroughHal>` and grow `pc.size_bytes` to
-/// match. Returns once the write has fully advanced.
-fn seed_anon_pc_with_bytes(pc: &PageContainer, bytes: &[u8], guard: &Guard<'_>) {
-    let writer = open_file_for_pc(pc);
-    let outcome = step_write_from_user::<PassthroughHal>(
-        pc,
-        &writer,
-        UserPtr::<u8>::new(bytes.as_ptr() as usize),
-        bytes.len(),
-        guard,
-    );
-    assert_eq!(outcome, StepOutcome::Done(bytes.len()));
+    // Match the post-condition `step_write_from_user` provided: grow
+    // the visible size to the seeded length so EOF / size_bytes
+    // semantics in subsequent reads are unchanged.
+    pc.grow_size_to(bytes.len() as u64);
 }
 
 #[test]
@@ -102,7 +65,7 @@ fn read_exact_at_within_single_page_returns_bytes() {
     );
 
     let payload: Vec<u8> = (0u8..200).collect();
-    seed_anon_pc_with_bytes(&pc, &payload, &guard);
+    seed_anon_pc_with_bytes(&pc, &payload);
 
     let mut out = vec![0u8; 64];
     let outcome = read_exact_at(&pc, 16, &mut out, &guard);
@@ -128,7 +91,7 @@ fn read_exact_at_across_page_boundary_returns_full_buffer() {
     // 5000 bytes seeded at offset 1024 — guaranteed to span two pages.
     let total = crate::vm::USER_PAGE_SIZE * 2;
     let payload: Vec<u8> = (0..total).map(|i| (i & 0xff) as u8).collect();
-    seed_anon_pc_with_bytes(&pc, &payload, &guard);
+    seed_anon_pc_with_bytes(&pc, &payload);
 
     let mut out = vec![0u8; 5000];
     let outcome = read_exact_at(&pc, 1024, &mut out, &guard);
@@ -159,8 +122,8 @@ fn read_exact_at_short_read_returns_err() {
         StepOutcome::Done(())
     );
     let payload: Vec<u8> = (0u8..120).collect();
-    seed_anon_pc_with_bytes(&pc, &payload, &guard);
-    // step_write_from_user grows size_bytes to 120 — confirm.
+    seed_anon_pc_with_bytes(&pc, &payload);
+    // seed_anon_pc_with_bytes grew size_bytes to 120 — confirm.
     assert_eq!(pc.size_bytes(), 120);
 
     // Request 64 bytes starting at offset 100; size_bytes = 120, so the

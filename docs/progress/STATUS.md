@@ -1,9 +1,33 @@
 # txKernel Status
 
-**Updated:** 2026-05-07
+**Updated:** 2026-05-08
 
 ## Current Shape
 
+- 2026-05-08 retire `UserAccessIf` slice on branch
+  `feat/retire-user-access-if`. Replaced the trait-based fixup-recovery
+  user-access path with eager-walk methods on `AddressSpace`.
+  Workspace 1111/1111 lib+tests passing (no count delta — 5 user-buffer
+  tests refactored, 4 targeted-read tests now seed via
+  `materialize_anon` direct-map writes instead of going through the
+  retired user-access trait). Net: deleted `tx_hal::UserAccessIf`,
+  `tx_hal::KernelPtr<T>`, `tx_hal::FixupEntry` (and the supertrait
+  bound on `SignalFrameIf` / `TxPlatform`); added
+  `crates/tx-subsystems/src/vm/user_access.rs` with
+  `AddressSpace::{copy_from_user, copy_to_user, read_user, write_user,
+  read_user_cstr}`. The two production `page_backed` consumers
+  (`step_read_to_user`, `step_write_from_user`) now take
+  `aspace: &AddressSpace` instead of `H: UserAccessIf`. RV64 board's
+  signal-frame asm/SUM primitive moved from a `UserAccessIf` impl
+  into board-internal `board_copy_from_user` / `board_copy_to_user`
+  free fns called by `signal_frame.rs`. HAL_v1.md §12 retired in
+  favour of a forward to PAGE_BACKED §5.1 + VM §3.6/§6 + the new
+  vm/user_access.rs implementation. Out of scope and deferred:
+  the 18 `TODO(phase-userva)` syscall-arm sweep in tx-shims —
+  separate slice. Verification: `cargo build --workspace --lib
+  --tests` clean (no warnings); `cargo test --workspace --lib
+  --tests -- --test-threads=1` 1111/1111; `cargo xtask progress
+  validate` ok.
 - 2026-05-07 shell-prompt roadmap **8 of 11 slices landed** in a
   single session. Per
   `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` +

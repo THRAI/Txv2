@@ -13,6 +13,7 @@ mod pmap;
 pub mod project;
 pub mod scripts;
 mod structure;
+mod user_access;
 
 #[cfg(test)]
 pub(crate) use pmap::TestPmap;
@@ -35,3 +36,4 @@ pub use structure::{
     VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest, WouldBlock, RANGE_LOCK_RELEASE_MASK,
     USER_PAGE_SIZE,
 };
+pub use user_access::UserAccessKind;

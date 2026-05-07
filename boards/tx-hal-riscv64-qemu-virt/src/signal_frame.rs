@@ -7,11 +7,11 @@
 
 use core::mem::{offset_of, size_of};
 
+use crate::user_access::{board_copy_from_user, board_copy_to_user};
 use crate::Platform;
 use tx_hal::{
     FaultInfo, Pod, SavedSignalFrame, SignalFrameIf, SignalFramePlacement, SignalFrameWrite,
-    SignalHandlerRegs, TrapFrameMut, UserAccessIf, UserPtr, UserSignalMaskAbi, UserTrapContext,
-    VirtAddr,
+    SignalHandlerRegs, TrapFrameMut, UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr,
 };
 
 const RV64_SIGFRAME_ALIGN: usize = 16;
@@ -100,10 +100,15 @@ impl SignalFrameIf for Platform {
         let user_frame = UserPtr::<Rv64SignalFrame>::new(frame_addr);
 
         // SAFETY: the stack address was selected by signal delivery policy as
-        // a user stack. UserAccessIf performs the actual user copy and converts
-        // faults into FaultInfo.
+        // a user stack. `board_copy_to_user` performs the actual user copy
+        // through the SUM/fixup-table primitive and converts faults into
+        // FaultInfo.
         unsafe {
-            <Platform as UserAccessIf>::write_user(user_frame, frame)?;
+            let bytes = core::slice::from_raw_parts(
+                core::ptr::addr_of!(frame).cast::<u8>(),
+                size_of::<Rv64SignalFrame>(),
+            );
+            board_copy_to_user(UserPtr::<u8>::new(user_frame.addr()), bytes)?;
         }
 
         let siginfo_addr = frame_addr + offset_of!(Rv64SignalFrame, siginfo);
@@ -124,10 +129,18 @@ impl SignalFrameIf for Platform {
     }
 
     fn read_signal_frame(user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
-        let frame_ptr = UserPtr::<Rv64SignalFrame>::new(user_sp.addr());
-        // SAFETY: sigreturn supplies the current user SP. UserAccessIf performs
-        // the checked copy from userspace and reports any bad frame pointer.
-        let frame = unsafe { <Platform as UserAccessIf>::read_user(frame_ptr)? };
+        // SAFETY: sigreturn supplies the current user SP.
+        // `board_copy_from_user` performs the checked copy through the
+        // SUM/fixup-table primitive and reports any bad frame pointer.
+        let mut frame = core::mem::MaybeUninit::<Rv64SignalFrame>::uninit();
+        let frame = unsafe {
+            let dst = core::slice::from_raw_parts_mut(
+                frame.as_mut_ptr().cast::<u8>(),
+                size_of::<Rv64SignalFrame>(),
+            );
+            board_copy_from_user(dst, UserPtr::<u8>::new(user_sp.addr()))?;
+            frame.assume_init()
+        };
 
         frame.validate(user_sp)?;
         Ok(SavedSignalFrame {

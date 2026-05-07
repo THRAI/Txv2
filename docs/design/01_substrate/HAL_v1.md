@@ -191,7 +191,6 @@ pub trait TxPlatform:
     + ConsoleIf
     + PmapIf
     + TrapIf
-    + UserAccessIf
     + SignalFrameIf
     + IrqIf
     + TimeIf
@@ -374,7 +373,7 @@ Once a conversion has produced a valid high-kernel `&T`, `&mut T`, `NonNull<T>`,
 or raw pointer for a narrow unsafe operation, normal Rust pointer/reference
 rules apply. User memory is the exception: user virtual addresses stay as
 `UserPtr<T>`/`UserRange`-style values and are accessed only through
-`UserAccessIf`/copyin/copyout paths.
+the eager-walk `AddressSpace::copy_*_user` family (§12).
 
 ### 4.3 What does *not* belong in `PlatformConfig`
 <!-- txdoc:HAL-PLATFORMCONFIG-ASSOCIATED-CONSTANTS-WHAT-DOES-NOT-BELONG-IN-PLATFORMCONFIG-1 -->
@@ -1599,125 +1598,56 @@ No subsystem code references `sepc`, `sstatus`, `sscratch`, `era`, `prmd`, `badv
 
 ---
 
-## 12. UserAccessIf — kernel-mode user access and fixup recovery
+## 12. User-mode access — retired by axhal adoption
 <!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-1 -->
 
-`UserAccessIf` is logically distinct from `TrapIf`. `TrapIf` answers "what happened at trap entry, and how do we return?" `UserAccessIf` answers "how does a kernel-mode user-memory access fail safely and become a syscall-level error?"
+> **Retired.** The `UserAccessIf` trait, the `KernelPtr<T>` typed wrapper,
+> the `FixupEntry` struct, and the kernel-mode fault-fixup recovery
+> mechanism described in earlier revisions of this section have been
+> retired. Eager-walk user access is now the only path:
+>
+> - The kernel walks the user range against the AddressSpace's recipes
+>   BTree page-by-page, materialises each page through its
+>   `VmEntry.backing` (PrivateAnon → anon allocator; `Page { pc, offset }`
+>   → `pc.materialize_page`), translates the resulting frame's PPN to a
+>   kernel direct-map address, and does plain
+>   `core::ptr::copy_nonoverlapping`.
+> - There is no fixup table, no SUM / SMAP dance in subsystem-side
+>   user access, and no asm. Every materialisation either yields a
+>   frame, returns `Errno::EFAULT`, or returns
+>   `StepOutcome::Blocked(WaitToken)`; the syscall caller surfaces all
+>   three without relying on kernel-mode fault recovery.
+>
+> The implementation lives at
+> `crates/tx-subsystems/src/vm/user_access.rs` as inherent methods on
+> `AddressSpace`: `copy_from_user`, `copy_to_user`, `read_user`,
+> `write_user`, `read_user_cstr`. The corresponding `tx-shims`
+> syscall arms call `ctx.aspace.<method>()`.
+>
+> See:
+>
+> - PAGE_BACKED_v1 §5.1 — "the user buffer is materialised through its
+>   `VmEntry.backing` and copied through the kernel direct-map view".
+> - VM_v1_2 §3.6 — cross-async-wait discipline (eager walks return
+>   `Blocked` when a file-backed page is being fetched; the syscall
+>   carrier rewinds and retries).
+> - VM_v1_2 §6 — address-boundary policy (the recipe lookup is the only
+>   user-mode boundary; the eager-walk path never crosses kernel-mode
+>   page faults).
+>
+> The narrow exception is signal-frame writes (§12.1 below). They are
+> kernel-side writes into a user-stack page selected synchronously by
+> the trap shell; they still use a board-internal SUM/asm primitive
+> because they happen with the user image suspended at trap entry,
+> before the resolve-side machinery is reachable.
 
-This split matters because:
-
-- The fixup table is a build-time artifact (linker-section metadata).
-- The recovery mechanism is a kernel-mode-fault-only path; it does not interact with user trap entry.
-- Subsystems that copy to/from user (every syscall that takes a pointer) need a clean error-channel surface, not direct access to the trap path.
-
-### 12.1 Trait surface
-<!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-TRAIT-SURFACE-1 -->
-
-```rust
-pub trait UserAccessIf {
-    /// Copy `len` bytes from user space `src` to kernel space `dst`.
-    /// Returns Ok(()) on success, Err(FaultInfo) on user-side fault.
-    /// Safety: caller must ensure dst is a valid kernel pointer of
-    /// at least `len` bytes; src is interpreted in the current
-    /// AddressSpace's user mapping.
-    unsafe fn copy_from_user(
-        dst: KernelPtr<u8>,
-        src: UserPtr<u8>,
-        len: usize,
-    ) -> Result<(), FaultInfo>;
-
-    /// Mirror of copy_from_user with direction reversed.
-    unsafe fn copy_to_user(
-        dst: UserPtr<u8>,
-        src: KernelPtr<u8>,
-        len: usize,
-    ) -> Result<(), FaultInfo>;
-
-    /// Read a primitive value from user space.
-    /// Specialized for compiler-friendly small types.
-    unsafe fn read_user<T: Pod>(src: UserPtr<T>) -> Result<T, FaultInfo>;
-
-    /// Write a primitive value to user space.
-    unsafe fn write_user<T: Pod>(dst: UserPtr<T>, value: T) -> Result<(), FaultInfo>;
-}
-```
-
-`KernelPtr<T>` and `UserPtr<T>` are typed pointer wrappers defined in the meta-framework primitives crate. They make kernel-vs-user pointer confusion a type error at the call site:
-
-```rust
-// In meta-framework primitives:
-#[repr(transparent)]
-pub struct KernelPtr<T>(*mut T);
-
-#[repr(transparent)]
-pub struct UserPtr<T>(*mut T);
-```
-
-A syscall that takes a user pointer receives `UserPtr<T>` from the syscall pipeline; it cannot accidentally pass it to a kernel-pointer-only function (the type is wrong). Conversion is explicit and goes through `UserAccessIf` — there is no `as_kernel_ptr()` method on `UserPtr<T>`.
-
-### 12.2 The fixup table
-<!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-THE-FIXUP-TABLE-1 -->
-
-Kernel-mode user accesses use a special trap-recovery mechanism. Each `copy_*_user` macro emits a fixup entry into a linker section:
-
-```rust
-// In tx-hal:
-#[repr(C)]
-pub struct FixupEntry {
-    /// Range of kernel PCs covered by this fixup.
-    pub pc_start: VirtAddr,
-    pub pc_end: VirtAddr,
-    /// Where to jump on fault.
-    pub recovery_pc: VirtAddr,
-}
-
-#[linkme::distributed_slice]
-pub static KERNEL_FIXUP_TABLE: [FixupEntry] = [..];
-```
-
-Each platform's `copy_from_user` impl emits a fixup entry through `linkme::distributed_slice(KERNEL_FIXUP_TABLE)`. The trap shell, when it sees a kernel-mode fault, consults `KERNEL_FIXUP_TABLE` (binary search by `pc_start`) and jumps to `recovery_pc` if a match exists.
-
-**Cross-reference.** This is one of the three approved linkme uses. See §21.
-
-### 12.3 The primary path is direct, not fixup
-<!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-THE-PRIMARY-PATH-IS-DIRECT-NOT-FIXUP-1 -->
-
-The substrate-time `direct_map` and the resolve-side syscall surface (PAGE_SUBSTRATE handoff) make most user accesses *not* hit the fixup path. The primary path is:
-
-1. Resolve the user pointer to a PPN via the address space's pmap.
-2. Translate PPN to direct-map kernel virtual address.
-3. Copy via the direct map.
-
-The fixup path catches the residual cases: speculative reads of nominally-mapped pages that turn out to fault (e.g., a `PROT_NONE` page in the middle of a copy that the resolve step didn't pre-walk), and architecture-level corner cases where the trap fires despite the resolve.
-
-### 12.4 FaultInfo in the user-access context
-<!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-FAULTINFO-IN-THE-USER-ACCESS-CONTEXT-1 -->
-
-```rust
-pub struct FaultInfo {
-    pub address: VirtAddr,
-    pub write: bool,
-    pub instruction: bool,
-    pub from_user: bool,
-}
-```
-
-For user-access faults, `from_user` is false (the fault is in kernel mode), but `address` is the user address that faulted. This is what `EFAULT` becomes — the syscall returns `-EFAULT` and the `address` is what `siginfo` would carry if a SIGSEGV were appropriate.
-
-### 12.5 Why this is a separate trait
-<!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-WHY-THIS-IS-A-SEPARATE-TRAIT-1 -->
-
-If `UserAccessIf` lived inside `TrapIf`, then changes to copy-to-user semantics (e.g., adding `copy_from_user_atomic` for non-blocking contexts) would force the trap-frame view surface to change. Splitting the traits keeps the rate of change in each trait independent.
-
-The platform crate impls them together — they share the assembly-level fault-recovery mechanism — but the kernel-side type surface is two traits.
-
-### 12.6 SignalFrameIf — userspace signal-frame ABI
+### 12.1 SignalFrameIf — userspace signal-frame ABI
 <!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-SIGNALFRAMEIF-USERSPACE-SIGNAL-FRAME-ABI-1 -->
 
 `SignalFrameIf` is the architecture ABI helper used by the signal subsystem. It does **not** install a HAL-owned signal hook table. The trap path reaches signal logic through `KernelTrapSink<P>` and named signal functions; the platform only supplies the per-arch frame layout and register rewrites needed to enter and leave a user signal handler.
 
 ```rust
-pub trait SignalFrameIf: TrapIf + UserAccessIf {
+pub trait SignalFrameIf: TrapIf {
     /// Write siginfo/ucontext/trampoline state to the selected user stack
     /// and rewrite the trap frame so return_to_userspace enters the handler.
     fn write_signal_frame(

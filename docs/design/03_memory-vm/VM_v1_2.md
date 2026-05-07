@@ -90,9 +90,11 @@ The authority split is:
   AddressSpace>`) and process/thread witnesses;
 - `VmEntry` values are authoritative mapping bindings in the recipes BTree;
 - pmap PTEs are derived materializations justified by recipes and RangeLock;
-- user bytes cross the boundary only through `UserAccessIf`/copyin/copyout or
-  through a fault-script materialization path that re-reads recipes before PTE
-  publication.
+- user bytes cross the boundary only through the eager-walk
+  `AddressSpace::copy_*_user` methods (which walk recipes page-by-page,
+  materialise each page through its `VmEntry.backing`, and copy through
+  the kernel direct-map view) or through a fault-script materialization
+  path that re-reads recipes before PTE publication.
 
 No VM caller should receive a raw kernel pointer to user memory, a freeing
 authority encoded as a PPN, or a permission decision encoded only in address

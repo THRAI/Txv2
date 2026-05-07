@@ -68,8 +68,6 @@ impl tx_hal::PmapIf for TestPlatform {}
 
 impl tx_hal::TrapIf for TestPlatform {}
 
-impl tx_hal::UserAccessIf for TestPlatform {}
-
 impl tx_hal::SignalFrameIf for TestPlatform {}
 
 impl tx_hal::IrqIf for TestPlatform {}
