@@ -18,6 +18,7 @@ pub mod walker;
 #[cfg(test)]
 mod tests;
 
+pub use crate::cred::CapabilitySet;
 pub use checks::{DirectoryAtPath, EntityAtPath, ParentAndName, ResolveCtx, RootCtx};
 pub use execution::{FsOps, MountOutput};
 pub use structure::{

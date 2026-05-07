@@ -419,7 +419,8 @@ pub fn resolve_console_rnode(name: &[u8]) -> StepOutcome<Cap<RNode>> {
 pub fn open_console_for_init() -> Cap<OpenFile> {
     if let Some(init) = process::execution::init_process() {
         if let Some(root) = init.cwd() {
-            let cred = Credential::default();
+            // Bootstrap path: init opens /dev/console as root.
+            let cred = Credential::root();
             let guard = tx_substrate::epoch::guard();
             let outcome = block_on(vfs::step_open(
                 root,

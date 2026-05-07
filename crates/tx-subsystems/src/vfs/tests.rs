@@ -172,3 +172,25 @@ fn open_file_dispatches_struct_payload_read_write() {
     assert_eq!(char_out, [b'R']);
     assert_eq!(char_file.step_write(b"abc", &guard), StepOutcome::Done(3));
 }
+
+// ============================================================
+// DAC + setuid Wave 1: Credential type extension
+// ============================================================
+
+#[test]
+fn credential_default_is_non_root_unprivileged() {
+    let cred = Credential::default();
+    // uid happens to be 0 (the u32 Default), but the unprivileged
+    // semantic is encoded in the empty capability set.
+    assert_eq!(cred.uid, 0);
+    assert_eq!(cred.gid, 0);
+    assert_eq!(cred.effective_caps, CapabilitySet::EMPTY);
+}
+
+#[test]
+fn credential_root_has_all_caps() {
+    let cred = Credential::root();
+    assert_eq!(cred.uid, 0);
+    assert_eq!(cred.gid, 0);
+    assert_eq!(cred.effective_caps, CapabilitySet::FULL);
+}

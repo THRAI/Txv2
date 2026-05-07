@@ -371,7 +371,7 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
     let init = tx_subsystems::process::execution::init_process()
         .expect("INIT_PROCESS must be populated post-bootstrap");
     let cwd = init.cwd().expect("init cwd must be bound");
-    let cred = Credential::default();
+    let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(walker::step_walk(cwd, b"/dev/console", &cred, &guard));
     drop(guard);

@@ -869,13 +869,13 @@ async fn sys_execve<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let argv_slices: Vec<&[u8]> = argv_buf.iter().map(|s| s.as_slice()).collect();
     let envp_slices: Vec<&[u8]> = envp_buf.iter().map(|s| s.as_slice()).collect();
 
-    // Default-credential path — Phase 6 reads cred from the syscall
-    // context once a `cred` field is plumbed onto `SyscallCtx`.
-    // For now `Credential::default()` matches the bootstrap process
-    // (uid=0, gid=0).
-    // TODO(phase-cred-on-ctx): consume cred from ctx once the field
-    // lands.
-    let cred = Credential::default();
+    // Wave 2 (cred-on-ctx) replaces this with `ctx.walker_cred()`.
+    // For Wave 1, the bootstrap process is `init` (root), so a
+    // root-equivalent walker cred preserves the trio + post-trio
+    // smoke baselines through the `Credential::default()` semantic
+    // flip in Wave 1.
+    // TODO(wave-2-cred-on-ctx): consume cred from ctx.
+    let cred = Credential::root();
 
     let outcome = exec_script::<P>(
         &ctx.process,

@@ -303,8 +303,10 @@ mod kill_permission {
         Cred {
             uid: Uid(uid),
             euid: Uid(uid),
+            suid: Uid(uid),
             gid: Gid(uid),
             egid: Gid(uid),
+            sgid: Gid(uid),
             effective_caps: CapabilitySet::EMPTY,
             permitted_caps: CapabilitySet::EMPTY,
         }
@@ -328,8 +330,10 @@ mod kill_permission {
         Cred {
             uid: Uid(uid),
             euid: Uid(euid),
+            suid: Uid(euid),
             gid: crate::cred::Gid(1),
             egid: crate::cred::Gid(1),
+            sgid: crate::cred::Gid(1),
             effective_caps,
             permitted_caps: CapabilitySet::EMPTY,
         }
@@ -358,8 +362,10 @@ mod kill_permission {
         let src = Cred {
             uid: Uid(1000),
             euid: Uid(1000),
+            suid: Uid(1000),
             gid: crate::cred::Gid(0),
             egid: crate::cred::Gid(0),
+            sgid: crate::cred::Gid(0),
             effective_caps,
             permitted_caps: CapabilitySet::EMPTY,
         };
@@ -699,8 +705,10 @@ mod tty_bridge {
             *p.as_ref().unwrap().cred.lock() = crate::cred::Cred {
                 uid: Uid(1000),
                 euid: Uid(1000),
+                suid: Uid(1000),
                 gid: crate::cred::Gid(0),
                 egid: crate::cred::Gid(0),
+                sgid: crate::cred::Gid(0),
                 effective_caps: crate::cred::CapabilitySet::EMPTY,
                 permitted_caps: crate::cred::CapabilitySet::EMPTY,
             };

@@ -18,14 +18,16 @@
 //!   `Vec<Gid>` per POSIX; day-1 elides it.
 //! - `fsuid` / `fsgid`. Linux-specific filesystem-uid distinction; not
 //!   required for the day-1 surface.
-//! - Saved-set IDs (`suid`, `sgid`). Used by `setresuid`-family;
-//!   inferable from current uid/euid via the day-1 simplified rule
-//!   "non-privileged setuid only swaps among (uid, euid)".
 //! - Capability bounding set, inheritable set, ambient set. Day-1
 //!   models only `effective_caps` and `permitted_caps`.
-//! - `step_setresuid`, `step_setreuid`, `step_capset`, `step_seteuid`,
-//!   `step_setfsuid` — land when the syscall script driver consumes
-//!   them.
+//! - `step_capset`, `step_seteuid`, `step_setfsuid` — land when the
+//!   syscall script driver consumes them.
+//!
+//! Landed in the DAC + setuid slice (Wave 1):
+//!
+//! - Saved-set IDs (`suid`, `sgid`). Used by `setresuid`-family.
+//! - `step_setresuid`, `step_setresgid`, `step_setreuid`,
+//!   `step_setregid` helpers covering the full Linux privilege rule.
 
 use core::marker::PhantomData;
 use core::sync::atomic::Ordering;
@@ -136,8 +138,15 @@ impl CapabilitySet {
 pub struct Cred {
     pub uid: Uid,
     pub euid: Uid,
+    /// Saved-set UID. Per Linux semantics, copied from `euid` at
+    /// `fork`/`exec` and only updated by privileged callers via
+    /// [`step_setuid`] (or explicitly via [`step_setresuid`] /
+    /// [`step_setreuid`]).
+    pub suid: Uid,
     pub gid: Gid,
     pub egid: Gid,
+    /// Saved-set GID. Mirror of `suid` for the gid family.
+    pub sgid: Gid,
     pub effective_caps: CapabilitySet,
     pub permitted_caps: CapabilitySet,
 }
@@ -148,8 +157,10 @@ impl Cred {
         Self {
             uid: Uid::ROOT,
             euid: Uid::ROOT,
+            suid: Uid::ROOT,
             gid: Gid::ROOT,
             egid: Gid::ROOT,
+            sgid: Gid::ROOT,
             effective_caps: CapabilitySet::FULL,
             permitted_caps: CapabilitySet::FULL,
         }
@@ -177,10 +188,11 @@ pub enum CredChange {
 }
 
 /// `setuid`-family update. Privileged callers (root or `CAP_SETUID`)
-/// can set arbitrary `uid` and have all three of `uid`, `euid`,
-/// `(saved)` change. Non-privileged callers may only swap among
-/// `(uid, euid)`; any other target value returns
-/// `PermissionDenied`.
+/// can set arbitrary `uid` and have all four of `uid`, `euid`, `suid`
+/// change to `new_uid`. Non-privileged callers may only swap `euid`
+/// among `(uid, euid, suid)`; any other target value returns
+/// `PermissionDenied`. Non-privileged calls preserve `suid` (Linux
+/// semantics: only privileged callers update the saved-set).
 pub fn step_setuid(target: &Cap<ProcessIdentity>, new_uid: Uid) -> CredChange {
     let payload_guard = target.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
@@ -193,8 +205,10 @@ pub fn step_setuid(target: &Cap<ProcessIdentity>, new_uid: Uid) -> CredChange {
     if prev.is_privileged_for(Capability::SETUID) {
         new.uid = new_uid;
         new.euid = new_uid;
-    } else if new_uid == prev.uid || new_uid == prev.euid {
+        new.suid = new_uid;
+    } else if new_uid == prev.uid || new_uid == prev.euid || new_uid == prev.suid {
         // Non-privileged: allowed to swap effective among existing IDs.
+        // `suid` is preserved per Linux semantics.
         new.euid = new_uid;
     } else {
         return CredChange::PermissionDenied;
@@ -211,7 +225,9 @@ pub fn step_setuid(target: &Cap<ProcessIdentity>, new_uid: Uid) -> CredChange {
 }
 
 /// `setgid`-family update with the same privilege rules as
-/// [`step_setuid`].
+/// [`step_setuid`]. Privileged callers update `gid`, `egid`, and
+/// `sgid` to `new_gid`. Non-privileged callers may swap `egid`
+/// among `(gid, egid, sgid)`; `sgid` is preserved.
 pub fn step_setgid(target: &Cap<ProcessIdentity>, new_gid: Gid) -> CredChange {
     let payload_guard = target.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
@@ -224,7 +240,8 @@ pub fn step_setgid(target: &Cap<ProcessIdentity>, new_gid: Gid) -> CredChange {
     if prev.is_privileged_for(Capability::SETGID) {
         new.gid = new_gid;
         new.egid = new_gid;
-    } else if new_gid == prev.gid || new_gid == prev.egid {
+        new.sgid = new_gid;
+    } else if new_gid == prev.gid || new_gid == prev.egid || new_gid == prev.sgid {
         new.egid = new_gid;
     } else {
         return CredChange::PermissionDenied;
@@ -234,6 +251,229 @@ pub fn step_setgid(target: &Cap<ProcessIdentity>, new_gid: Gid) -> CredChange {
     drop(cred_guard);
     drop(payload_guard);
 
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    CredChange::Replaced { prev, new }
+}
+
+/// `setresuid`-family update. `(ruid, euid, suid)` triple, each `None`
+/// meaning "leave alone". Privileged callers (root or `CAP_SETUID`)
+/// may set any combination. Non-privileged callers may only set each
+/// non-`None` argument to a value that currently equals one of
+/// `(uid, euid, suid)` — atomically: if any one of the three fails the
+/// rule, no field changes and the call returns
+/// `CredChange::PermissionDenied`.
+pub fn step_setresuid(
+    target: &Cap<ProcessIdentity>,
+    ruid: Option<Uid>,
+    euid: Option<Uid>,
+    suid: Option<Uid>,
+) -> CredChange {
+    let payload_guard = target.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return CredChange::Zombie;
+    };
+    let mut cred_guard = payload.cred.lock();
+    let prev = *cred_guard;
+
+    if !prev.is_privileged_for(Capability::SETUID) {
+        let allowed = |candidate: Uid| -> bool {
+            candidate == prev.uid || candidate == prev.euid || candidate == prev.suid
+        };
+        if let Some(r) = ruid {
+            if !allowed(r) {
+                return CredChange::PermissionDenied;
+            }
+        }
+        if let Some(e) = euid {
+            if !allowed(e) {
+                return CredChange::PermissionDenied;
+            }
+        }
+        if let Some(s) = suid {
+            if !allowed(s) {
+                return CredChange::PermissionDenied;
+            }
+        }
+    }
+
+    let mut new = prev;
+    if let Some(r) = ruid {
+        new.uid = r;
+    }
+    if let Some(e) = euid {
+        new.euid = e;
+    }
+    if let Some(s) = suid {
+        new.suid = s;
+    }
+
+    *cred_guard = new;
+    drop(cred_guard);
+    drop(payload_guard);
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    CredChange::Replaced { prev, new }
+}
+
+/// `setresgid`-family analog of [`step_setresuid`]. Same rule applied
+/// to `(gid, egid, sgid)` with `CAP_SETGID`.
+pub fn step_setresgid(
+    target: &Cap<ProcessIdentity>,
+    rgid: Option<Gid>,
+    egid: Option<Gid>,
+    sgid: Option<Gid>,
+) -> CredChange {
+    let payload_guard = target.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return CredChange::Zombie;
+    };
+    let mut cred_guard = payload.cred.lock();
+    let prev = *cred_guard;
+
+    if !prev.is_privileged_for(Capability::SETGID) {
+        let allowed = |candidate: Gid| -> bool {
+            candidate == prev.gid || candidate == prev.egid || candidate == prev.sgid
+        };
+        if let Some(r) = rgid {
+            if !allowed(r) {
+                return CredChange::PermissionDenied;
+            }
+        }
+        if let Some(e) = egid {
+            if !allowed(e) {
+                return CredChange::PermissionDenied;
+            }
+        }
+        if let Some(s) = sgid {
+            if !allowed(s) {
+                return CredChange::PermissionDenied;
+            }
+        }
+    }
+
+    let mut new = prev;
+    if let Some(r) = rgid {
+        new.gid = r;
+    }
+    if let Some(e) = egid {
+        new.egid = e;
+    }
+    if let Some(s) = sgid {
+        new.sgid = s;
+    }
+
+    *cred_guard = new;
+    drop(cred_guard);
+    drop(payload_guard);
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    CredChange::Replaced { prev, new }
+}
+
+/// `setreuid`-family update. `(ruid, euid)` pair, each `None` meaning
+/// "leave alone". Privileged callers may set any value. Non-privileged
+/// callers must each (when `Some`) supply a value currently in
+/// `{uid, euid, suid}`.
+///
+/// Linux quirk: when `ruid` is `Some` (i.e. real uid is being changed)
+/// **or** the new `euid` differs from the old `prev.uid`, the
+/// saved-set `suid` is updated to the post-call effective uid.
+pub fn step_setreuid(
+    target: &Cap<ProcessIdentity>,
+    ruid: Option<Uid>,
+    euid: Option<Uid>,
+) -> CredChange {
+    let payload_guard = target.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return CredChange::Zombie;
+    };
+    let mut cred_guard = payload.cred.lock();
+    let prev = *cred_guard;
+
+    if !prev.is_privileged_for(Capability::SETUID) {
+        let allowed = |candidate: Uid| -> bool {
+            candidate == prev.uid || candidate == prev.euid || candidate == prev.suid
+        };
+        if let Some(r) = ruid {
+            if !allowed(r) {
+                return CredChange::PermissionDenied;
+            }
+        }
+        if let Some(e) = euid {
+            if !allowed(e) {
+                return CredChange::PermissionDenied;
+            }
+        }
+    }
+
+    let mut new = prev;
+    if let Some(r) = ruid {
+        new.uid = r;
+    }
+    if let Some(e) = euid {
+        new.euid = e;
+    }
+
+    // Linux quirk: if ruid was set OR the post-call euid differs from
+    // the pre-call real uid, the saved-set is bumped to post-call euid.
+    if ruid.is_some() || new.euid != prev.uid {
+        new.suid = new.euid;
+    }
+
+    *cred_guard = new;
+    drop(cred_guard);
+    drop(payload_guard);
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    CredChange::Replaced { prev, new }
+}
+
+/// `setregid`-family analog of [`step_setreuid`]. Same rule applied to
+/// `(gid, egid, sgid)` with `CAP_SETGID`.
+pub fn step_setregid(
+    target: &Cap<ProcessIdentity>,
+    rgid: Option<Gid>,
+    egid: Option<Gid>,
+) -> CredChange {
+    let payload_guard = target.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return CredChange::Zombie;
+    };
+    let mut cred_guard = payload.cred.lock();
+    let prev = *cred_guard;
+
+    if !prev.is_privileged_for(Capability::SETGID) {
+        let allowed = |candidate: Gid| -> bool {
+            candidate == prev.gid || candidate == prev.egid || candidate == prev.sgid
+        };
+        if let Some(r) = rgid {
+            if !allowed(r) {
+                return CredChange::PermissionDenied;
+            }
+        }
+        if let Some(e) = egid {
+            if !allowed(e) {
+                return CredChange::PermissionDenied;
+            }
+        }
+    }
+
+    let mut new = prev;
+    if let Some(r) = rgid {
+        new.gid = r;
+    }
+    if let Some(e) = egid {
+        new.egid = e;
+    }
+
+    if rgid.is_some() || new.egid != prev.gid {
+        new.sgid = new.egid;
+    }
+
+    *cred_guard = new;
+    drop(cred_guard);
+    drop(payload_guard);
     core::sync::atomic::fence(Ordering::SeqCst);
 
     CredChange::Replaced { prev, new }
