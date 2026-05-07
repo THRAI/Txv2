@@ -332,7 +332,36 @@ each needs a new `FsOps` step on the tmpfs side.
 **Success:** Shell can `rm -r /tmp/x; mkdir /tmp/x; cp /etc/hosts
 /tmp/x/`. Each LTP file-mutation cluster passes its day-1 sub-set.
 
-### Slice 9 — User-VA sweep + RV64 UserAccessIf (~5–7 days) [was Slice 2]
+### Slice 9 — User-VA sweep + RV64 UserAccessIf — **deferred to a follow-up slice** (re-deferred 2026-05-07)
+
+After investigation: the slice as originally scoped is multi-day
+infrastructure work that's bigger than this roadmap's per-slice
+budget. The HAL surface (`FixupEntry`, `UserAccessIf` default
+impl) exists, but **no consumer wires it**: there's no `FIXUP_TABLE`
+populated by the kernel, no trap-shell code that consults it on
+kernel-mode faults, and no production RV64 `copy_from_user` /
+`copy_to_user` asm.
+
+The bake-in path (init fixture, bake-in busybox via Slice 10)
+maps the binary's bytes via the kernel direct-map, so user-VA
+syscall pointers under that path are simultaneously valid as
+kernel pointers — the bootstrap kernel-buffer exemption pattern
+(18 `TODO(phase-userva)` markers + ones added in slices 2–8)
+remains correct for the QEMU shell smoke deliverable.
+
+**Future Slice 9 (proper)**:
+- Part A: RV64 `UserAccessIf` asm with PC-known fault points,
+  populated `FIXUP_TABLE`, trap-shell fault redirect.
+- Part B: migrate every `TODO(phase-userva)` site.
+- Part C: per-arm `-EFAULT on unmapped pointer` test using
+  `FaultingHal`-style stand-in.
+
+**For now**: Slice 9 marked as deferred. The roadmap's success
+criterion (typing into a shell prompt) is reachable without it
+because the bake-in busybox shares the kernel's direct-map for
+its binary pages and small pointer-data buffers.
+
+### Slice 9 (was Slice 2 / Slice 9) — was: full user-VA sweep
 
 The deferred foundation. Now lands as a unified slice with three
 parts:
