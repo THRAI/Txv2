@@ -456,3 +456,146 @@ pub const AT_EACCESS: i32 = 0x200;
 /// cycles at resolution time. Plumbing the bit through the walker
 /// is `TODO(phase-symlink-flag)`.
 pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+
+// ---------------------------------------------------------------------
+// Slice 2 of the shell-prompt roadmap — VM syscalls
+// (`mmap` / `munmap` / `mprotect` / `mremap` / `madvise` / `msync`).
+//
+// Numbers verified against Linux's RV64 generic ABI
+// (`include/uapi/asm-generic/unistd.h`). Each one wraps a pre-existing
+// `vm::execution::*` primitive (`AddressSpace::try_mmap`,
+// `try_munmap`, `try_mprotect`, `try_mremap`, `madvise`, `msync`)
+// landed earlier; the slice is pure plumbing — flag decode + errno
+// mapping. See `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md`
+// Slice 2.
+// ---------------------------------------------------------------------
+
+/// `munmap(addr, length)`. Linux RV64 generic ABI `__NR_munmap = 215`.
+/// Wraps `AddressSpace::try_munmap` over a page-aligned `[addr,
+/// addr+length)` window.
+pub const NR_MUNMAP: u64 = 215;
+/// `mremap(old_addr, old_size, new_size, flags, new_addr)`. Linux RV64
+/// generic ABI `__NR_mremap = 216`. Slice 2 only honours the
+/// `MREMAP_FIXED | MREMAP_MAYMOVE` shape musl emits — pure-grow without
+/// `MAYMOVE` returns `-ENOMEM` if the new size doesn't fit in place
+/// (which `try_mremap`'s disjoint-only contract always reports).
+pub const NR_MREMAP: u64 = 216;
+/// `mmap(addr, length, prot, flags, fd, offset)`. Linux RV64 generic
+/// ABI `__NR_mmap = 222`.
+pub const NR_MMAP: u64 = 222;
+/// `mprotect(addr, length, prot)`. Linux RV64 generic ABI
+/// `__NR_mprotect = 226`. Wraps `AddressSpace::try_mprotect`.
+pub const NR_MPROTECT: u64 = 226;
+/// `msync(addr, length, flags)`. Linux RV64 generic ABI
+/// `__NR_msync = 227`. Wraps `AddressSpace::msync` (the StepOutcome
+/// shape — async over the `step_fsync` blocking lane).
+pub const NR_MSYNC: u64 = 227;
+/// `madvise(addr, length, advice)`. Linux RV64 generic ABI
+/// `__NR_madvise = 233`. Wraps `AddressSpace::madvise`.
+pub const NR_MADVISE: u64 = 233;
+
+// ---------------------------------------------------------------------
+// `PROT_*` flag bits — Linux generic uapi `<sys/mman.h>`. Slice 2 acts
+// on the three-permission-bit set (`READ`/`WRITE`/`EXEC`); `PROT_NONE`
+// is the zero pattern. `PROT_GROWSDOWN`/`PROT_GROWSUP` are recognised
+// (so the high bits don't trip the unknown-bit `-EINVAL` reject) but
+// return `-ENOSYS` because the underlying `Prot` shape has no
+// equivalent.
+// ---------------------------------------------------------------------
+
+/// `PROT_NONE` — page is inaccessible. Equivalent to `Prot::NONE`.
+pub const PROT_NONE: u64 = 0x0;
+/// `PROT_READ` — page may be read.
+pub const PROT_READ: u64 = 0x1;
+/// `PROT_WRITE` — page may be written.
+pub const PROT_WRITE: u64 = 0x2;
+/// `PROT_EXEC` — page may be executed.
+pub const PROT_EXEC: u64 = 0x4;
+/// `PROT_GROWSDOWN` — apply the `prot` to one page below the
+/// `VmEntry::grows_down` mapping. Slice 2 returns `-ENOSYS`.
+pub const PROT_GROWSDOWN: u64 = 0x0100_0000;
+/// `PROT_GROWSUP` — symmetrical extension to the `grows_down`
+/// counterpart. Slice 2 returns `-ENOSYS`.
+pub const PROT_GROWSUP: u64 = 0x0200_0000;
+
+// ---------------------------------------------------------------------
+// `MAP_*` flag bits — Linux generic uapi `<sys/mman.h>`. Slice 2 acts
+// on `SHARED`/`PRIVATE` (mutual exclusion enforced — exactly one
+// required), `FIXED` (FixedReplace placement), `FIXED_NOREPLACE`
+// (RequireFree placement at the requested addr), `ANONYMOUS`
+// (`VmBacking::PrivateAnon`), `GROWSDOWN`/`LOCKED` (threaded into
+// `VmEntryFlags`). The remaining bits are recognised but ignored
+// (best-effort hints) so userspace builds that pass them through
+// don't trip `-EINVAL`.
+// ---------------------------------------------------------------------
+
+/// `MAP_SHARED` — share modifications with other mappings of the same
+/// backing.
+pub const MAP_SHARED: u64 = 0x01;
+/// `MAP_PRIVATE` — copy-on-write: modifications never propagate to the
+/// backing. Mutually exclusive with `MAP_SHARED`.
+pub const MAP_PRIVATE: u64 = 0x02;
+/// `MAP_FIXED` — interpret `addr` as the exact placement; any existing
+/// mapping in the requested range is silently replaced
+/// (`MapPlacement::FixedReplace`).
+pub const MAP_FIXED: u64 = 0x10;
+/// `MAP_ANONYMOUS` — mapping is not file-backed; `fd` and `offset` are
+/// ignored. Routes to `VmBacking::PrivateAnon` (or
+/// `VmBacking::None`-shaped Shared, which Slice 2 does not yet wire —
+/// shared anon is treated like private anon for now).
+pub const MAP_ANONYMOUS: u64 = 0x20;
+/// `MAP_GROWSDOWN` — stack-style mapping, threads through to
+/// `VmEntryFlags.grows_down`.
+pub const MAP_GROWSDOWN: u64 = 0x0100;
+/// `MAP_DENYWRITE` — historical no-op on Linux since 2.0; recognised so
+/// userspace builds that still pass it don't trip `-EINVAL`.
+pub const MAP_DENYWRITE: u64 = 0x0800;
+/// `MAP_EXECUTABLE` — historical no-op on Linux; recognised but
+/// ignored.
+pub const MAP_EXECUTABLE: u64 = 0x1000;
+/// `MAP_LOCKED` — mlock the mapping (best-effort hint).
+pub const MAP_LOCKED: u64 = 0x2000;
+/// `MAP_NORESERVE` — don't reserve swap space (best-effort hint;
+/// txKernel doesn't model swap reservations).
+pub const MAP_NORESERVE: u64 = 0x4000;
+/// `MAP_POPULATE` — pre-fault the pages (best-effort hint; Slice 2
+/// installs the recipe without forcing materialisation).
+pub const MAP_POPULATE: u64 = 0x8000;
+/// `MAP_NONBLOCK` — only meaningful with `MAP_POPULATE`; silently
+/// ignored.
+pub const MAP_NONBLOCK: u64 = 0x1_0000;
+/// `MAP_STACK` — historical no-op on Linux; recognised but ignored.
+pub const MAP_STACK: u64 = 0x2_0000;
+/// `MAP_HUGETLB` — request hugepages. Slice 2 honours the bit by
+/// accepting it (no `-EINVAL`) but does not allocate hugepages.
+pub const MAP_HUGETLB: u64 = 0x4_0000;
+/// `MAP_SYNC` — for `MAP_SHARED_VALIDATE` against a DAX-backed file;
+/// recognised but ignored (txKernel has no DAX backing yet).
+pub const MAP_SYNC: u64 = 0x8_0000;
+/// `MAP_FIXED_NOREPLACE` — like `MAP_FIXED` but error with `-EEXIST`
+/// on overlap rather than silently replace
+/// (`MapPlacement::RequireFree`).
+pub const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+
+// ---------------------------------------------------------------------
+// `MADV_*` advice values — Linux generic uapi `<sys/mman.h>`. Slice 2
+// recognises the subset `AddressSpace::madvise` consumes (`Normal`,
+// `Random`, `Sequential`, `WillNeed`, `DontNeed`, `Free`); other
+// values return `-ENOSYS`.
+// ---------------------------------------------------------------------
+
+/// `MADV_NORMAL = 0` — no special treatment (default).
+pub const MADV_NORMAL: u64 = 0;
+/// `MADV_RANDOM = 1` — expect random access.
+pub const MADV_RANDOM: u64 = 1;
+/// `MADV_SEQUENTIAL = 2` — expect sequential access.
+pub const MADV_SEQUENTIAL: u64 = 2;
+/// `MADV_WILLNEED = 3` — readahead hint.
+pub const MADV_WILLNEED: u64 = 3;
+/// `MADV_DONTNEED = 4` — release pages (mini-munmap; recipes preserved
+/// so next access refaults clean).
+pub const MADV_DONTNEED: u64 = 4;
+/// `MADV_FREE = 8` — same as `DONTNEED` for txKernel's day-1 surface
+/// (Linux distinguishes lazy vs. eager release; we treat both as
+/// eager).
+pub const MADV_FREE: u64 = 8;
