@@ -426,7 +426,7 @@ async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     // fd table. Holding the payload guard across the lookup is fine —
     // the resulting Cap is independent and the lock is released before
     // any `.await`.
-    let file = match resolve_fd(&ctx.process, fd as usize) {
+    let file = match resolve_fd(&ctx.process, fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -554,7 +554,7 @@ async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
         return SyscallResult::Error(E2BIG_VALUE);
     }
 
-    let file = match resolve_fd(&ctx.process, fd as usize) {
+    let file = match resolve_fd(&ctx.process, fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -866,21 +866,26 @@ fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// Per-fd CLOEXEC bitmap + fcntl(F_SETFD) + O_CLOEXEC".
 ///
 /// Day-1 covers only `F_GETFD` / `F_SETFD` against the per-process
-/// `ProcessPayload.fd_cloexec` bitmap. Other commands return
-/// `-ENOSYS` until the relevant follow-up phase
-/// (`TODO(phase-fcntl-extension)`) extends the surface — `F_DUPFD`,
-/// `F_GETFL`, `F_SETFL`, etc. are out of scope for Wave 2.
+/// CLOEXEC set. Other commands return `-ENOSYS` until the relevant
+/// follow-up phase (`TODO(phase-fcntl-extension)`) extends the
+/// surface — `F_DUPFD`, `F_GETFL`, `F_SETFL`, etc. are out of scope
+/// for Wave 2.
 ///
-/// Validation:
-/// - `fd >= FD_TABLE_SIZE` (today's day-1 fixed table size, also a
-///   strict subset of the 32-bit CLOEXEC bitmap range) → `-EBADF`.
+/// Validation (fd-ops Wave 1: `EBADF` is now driven by "is this fd
+/// open?" rather than the retired `FD_TABLE_SIZE = 8` ceiling — Linux
+/// returns `-EBADF` for `F_GETFD`/`F_SETFD` against a closed fd):
+/// - fd not currently open → `-EBADF`.
 /// - Unknown `cmd` → `-ENOSYS`.
 fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as u32;
     let cmd = args[1] as i32;
     let arg = args[2];
 
-    if (fd as usize) >= tx_subsystems::process::FD_TABLE_SIZE {
+    // EBADF if the fd is not open. fd-ops Wave 1 retires the static
+    // `FD_TABLE_SIZE` ceiling — the fd table is now a sparse
+    // `BTreeMap<u32, Cap<OpenFile>>`, so any `u32` could be a key;
+    // openness is the only meaningful EBADF discriminant.
+    if ctx.process.fd(fd).is_none() {
         return SyscallResult::Error(EBADF_VALUE);
     }
 
@@ -1115,9 +1120,12 @@ fn read_u64_le(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// Resolve fd `idx` against the process payload's day-1 stub fd table.
-/// Returns `None` if the process is a zombie or the slot is empty.
-fn resolve_fd(process: &Cap<ProcessIdentity>, idx: usize) -> Option<Cap<OpenFile>> {
+/// Resolve fd `idx` against the process payload's fd table. Returns
+/// `None` if the process is a zombie or the slot is empty.
+///
+/// Per fd-ops Wave 1 the table is a sparse `BTreeMap<u32, Cap<OpenFile>>`;
+/// any `u32` fd value is a valid key.
+fn resolve_fd(process: &Cap<ProcessIdentity>, idx: u32) -> Option<Cap<OpenFile>> {
     process.fd(idx)
 }
 

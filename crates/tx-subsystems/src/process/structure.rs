@@ -25,6 +25,7 @@
 //!                                          └──Weak──▶ ProcessIdentity
 //! ```
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -49,15 +50,6 @@ use tx_substrate::AtomicSlot;
 /// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4); plan
 /// `docs/progress/plans/2026-05-06-fork-clone-wait4.md` Open Q #1.
 pub const EXIT_PORT_CHILD_ZOMBIFIED: u64 = 0x1;
-
-/// Number of slots in the day-1 fixed-size fd table on `ProcessPayload`.
-///
-/// Per Trio plan §"Cross-cutting risks #6" and §"Open questions #3": a
-/// fixed 8-slot vec is sufficient for the bootstrap smoke path
-/// (fds 0/1/2 preopened via `open_console_for_init`). Growable
-/// `BTreeMap`-shaped fd tables (full POSIX `dup3`/`fcntl(F_DUPFD)`)
-/// are a follow-up beyond the trio.
-pub const FD_TABLE_SIZE: usize = 8;
 
 /// Per-process exit disposition, populated by `step_exit_group` /
 /// `step_exit_group_with_signal` / the last-thread cascade. Spec
@@ -283,13 +275,16 @@ impl ProcessIdentity {
 
     /// Snapshot the `Cap<OpenFile>` registered at fd `idx` on this
     /// process's payload. Returns `None` if the process is a zombie
-    /// (no payload), `idx` is out of range for the day-1 fixed-size
-    /// fd table, or the slot is empty.
+    /// (no payload) or the slot is empty.
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeMap<u32, Cap<OpenFile>>`; any `u32` fd value is valid as
+    /// a key and an absent key reads back as `None`.
     ///
     /// Used by the syscall dispatcher (`tx-shims::linux_syscall`) to
     /// resolve fds without holding the payload lock across a step's
     /// `.await`.
-    pub fn fd(&self, idx: usize) -> Option<Cap<crate::vfs::OpenFile>> {
+    pub fn fd(&self, idx: u32) -> Option<Cap<crate::vfs::OpenFile>> {
         self.payload.lock().as_ref().and_then(|p| p.fd(idx))
     }
 
@@ -305,15 +300,19 @@ impl ProcessIdentity {
 
     /// Install `file` at fd `idx` on this process's payload, returning
     /// the previously installed `Cap<OpenFile>` if any. No-op (returns
-    /// `None`) for zombies and for indices outside the fixed-size
-    /// table.
+    /// `None`) for zombies. Passing `file = None` removes the fd from
+    /// the table.
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeMap<u32, Cap<OpenFile>>`; any `u32` fd value is valid as
+    /// a key.
     ///
     /// Used by the syscall dispatcher's tests and (Phase 3b)
     /// `init.rs` to preopen fds 0/1/2 against
     /// `tx_fs::devfs::open_console_for_init()`.
     pub fn set_fd(
         &self,
-        idx: usize,
+        idx: u32,
         file: Option<Cap<crate::vfs::OpenFile>>,
     ) -> Option<Cap<crate::vfs::OpenFile>> {
         self.payload
@@ -322,10 +321,68 @@ impl ProcessIdentity {
             .and_then(|p| p.set_fd(idx, file))
     }
 
+    /// Allocate the lowest unused fd ≥ 0 without installing anything.
+    /// Returns `0` for zombies (no payload) — the caller must not
+    /// install against a zombie regardless.
+    ///
+    /// Per fd-ops Wave 1 plan §C: needed by `sys_openat` (Wave 2),
+    /// `sys_dup` (Wave 4), and `sys_pipe2` (Wave 5) to mimic Linux's
+    /// "lowest unused fd" semantic.
+    pub fn allocate_fd(&self) -> u32 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.allocate_fd_at_least(0))
+            .unwrap_or(0)
+    }
+
+    /// Allocate the lowest unused fd ≥ `min`. Returns `min` for
+    /// zombies. Used by the future `F_DUPFD`-shape arms (lowest fd
+    /// ≥ N) and shells doing `>&5`-style redirection — the
+    /// `dup3(oldfd, newfd, 0)` arm with a specific `newfd` target
+    /// uses [`Self::install_fd`] instead.
+    pub fn allocate_fd_at_least(&self, min: u32) -> u32 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.allocate_fd_at_least(min))
+            .unwrap_or(min)
+    }
+
+    /// Return the lowest unused fd ≥ `min` without installing
+    /// anything. Returns `min` for zombies. Differs from
+    /// [`Self::allocate_fd_at_least`] only by intent: callers that
+    /// want to peek at the next free fd without committing to install
+    /// use this; both methods share the same underlying scan.
+    pub fn next_fd_above(&self, min: u32) -> u32 {
+        self.allocate_fd_at_least(min)
+    }
+
+    /// Install `file` at the specific fd `fd`, returning the
+    /// previously installed `Cap<OpenFile>` if any so the caller can
+    /// drop it under their own EBR guard. Returns `None` for zombies
+    /// (the install is a no-op).
+    ///
+    /// Convenience over [`Self::set_fd`] when callers always want to
+    /// install a `Some(file)` (matches the `dup2`/`dup3` shape: if
+    /// the target slot was occupied the previous occupant must be
+    /// closed). Identical effect to
+    /// `set_fd(fd, Some(file))` modulo the explicit `Cap` parameter.
+    pub fn install_fd(
+        &self,
+        fd: u32,
+        file: Cap<crate::vfs::OpenFile>,
+    ) -> Option<Cap<crate::vfs::OpenFile>> {
+        self.set_fd(fd, Some(file))
+    }
+
     /// Read the close-on-exec bit for fd `fd` on this process's
-    /// payload. Returns `false` for zombies (no payload), for fd
-    /// indices outside the day-1 `AtomicU32` bitmap (≥ 32), and for
+    /// payload. Returns `false` for zombies (no payload) and for
     /// unmarked fds.
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeSet<u32>`; any `u32` fd value is valid (no fd-31
+    /// ceiling).
     ///
     /// Used by `tx-shims::linux_syscall::sys_fcntl` to service
     /// `F_GETFD`, and by future `sys_open` plumbing once `O_CLOEXEC`
@@ -339,8 +396,11 @@ impl ProcessIdentity {
     }
 
     /// Set or clear the close-on-exec bit for fd `fd` on this
-    /// process's payload. No-op for zombies and for fd indices outside
-    /// the day-1 `AtomicU32` bitmap (≥ 32).
+    /// process's payload. No-op for zombies.
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeSet<u32>`; any `u32` fd value is valid (no fd-31
+    /// ceiling).
     ///
     /// Used by `tx-shims::linux_syscall::sys_fcntl` to service
     /// `F_SETFD`, and by future `sys_open` plumbing once `O_CLOEXEC`
@@ -351,16 +411,26 @@ impl ProcessIdentity {
         }
     }
 
-    /// Internal: snapshot the full close-on-exec bitmap word. Returns
-    /// `0` for zombies. Used by
+    /// Internal: snapshot the full close-on-exec set as an owned
+    /// `BTreeSet<u32>`. Returns an empty set for zombies. Used by
     /// [`crate::process::execution::step_close_cloexec_fds`] during
-    /// exec phase 7 to walk every set bit.
-    pub(crate) fn fd_cloexec_word(&self) -> u32 {
+    /// exec phase 7 to walk every marked fd.
+    pub(crate) fn fd_cloexec_snapshot(&self) -> BTreeSet<u32> {
         self.payload
             .lock()
             .as_ref()
-            .map(|p| p.fd_cloexec_word())
-            .unwrap_or(0)
+            .map(|p| p.fd_cloexec_snapshot())
+            .unwrap_or_default()
+    }
+
+    /// Internal: clear the entire close-on-exec set. Used by
+    /// [`crate::process::execution::step_close_cloexec_fds`] after the
+    /// sweep so future `fcntl(F_SETFD)` calls start from a clean
+    /// state.
+    pub(crate) fn clear_fd_cloexec(&self) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.clear_fd_cloexec();
+        }
     }
 
     /// Snapshot the current `SigDisposition` for `sig` from this
@@ -573,38 +643,43 @@ pub struct ProcessPayload {
     /// empty; `step_getcwd` returns `None` for a process with no
     /// cwd installed.
     pub(crate) cwd: SpinMutex<Option<Cap<DEntry>>>,
-    /// Day-1 fixed-size fd table (`FD_TABLE_SIZE` slots).
+    /// Sparse fd table keyed by `u32` fd value.
     ///
-    /// Per Trio plan §"Cross-cutting risks #6": a stub fd table on
-    /// `ProcessPayload` is needed by the Phase 2a syscall dispatcher
-    /// (`write` resolves `fd → Cap<OpenFile>` against this slice). Phase
-    /// 3b's `init.rs` preopens fds 0/1/2 via
-    /// `tx_fs::devfs::open_console_for_init()`; `bootstrap_init_process`
-    /// itself leaves every slot `None` because the devfs alias is not
-    /// yet registered when the kernel reaches process bootstrap.
+    /// **fd-ops Wave 1 (2026-05-07):** flipped from a fixed
+    /// `[Option<Cap<OpenFile>>; FD_TABLE_SIZE]` array to a
+    /// `BTreeMap<u32, Cap<OpenFile>>`. Closes the `FD_TABLE_SIZE = 8`
+    /// ceiling that prevented shells from doing `>&100`-style fd
+    /// redirection and lifts the artificial fd-31 limit on the
+    /// CLOEXEC bitmap. The `BTreeMap` makes "lowest unused fd"
+    /// lookup straightforward (walk keys looking for the first gap),
+    /// matches `dup3(oldfd, newfd, _)`'s sparse-newfd semantic
+    /// directly, and tracks exact memory rather than worst-case fd
+    /// count. See plan §A and §"Open questions #1" (DECIDED).
     ///
-    /// `step_fork` clones the slice; each `Cap<OpenFile>` is `.clone()`
-    /// so parent and child share the same `OpenFile` (no full POSIX
-    /// `dup`-shape sharing). Per the same risk note: full
-    /// `dup3`/`fcntl(F_DUPFD)` semantics are a follow-up.
-    pub(crate) fds: SpinMutex<[Option<Cap<OpenFile>>; FD_TABLE_SIZE]>,
-    /// Per-fd close-on-exec bitmap. Bit `i` set means fd `i` will be
-    /// closed by [`crate::process::execution::step_close_cloexec_fds`]
-    /// during exec phase 7 (per `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC`).
+    /// `step_fork` clones the entire map; each `Cap<OpenFile>` is
+    /// `.clone()` so parent and child share the same `OpenFile` —
+    /// `dup`-shape sharing (separate file description per fd) is a
+    /// deferred follow-up.
+    pub(crate) fds: SpinMutex<BTreeMap<u32, Cap<OpenFile>>>,
+    /// Per-fd close-on-exec set. fd `i` is marked CLOEXEC iff
+    /// `fd_cloexec.contains(&i)`; marked fds are closed by
+    /// [`crate::process::execution::step_close_cloexec_fds`] during
+    /// exec phase 7 (per `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC`).
     ///
-    /// Per Open Q #4 (DECIDED 2026-05-06) the storage is `AtomicU32`,
-    /// covering up to fd 31 — well above today's `FD_TABLE_SIZE = 8`
-    /// and leaving headroom for the next-phase fd-table grow without
-    /// reshaping the field. Once the fd table grows beyond 32 the
-    /// natural upgrade is `[AtomicU64; N]`.
+    /// **fd-ops Wave 1 (2026-05-07):** flipped from `AtomicU32` (which
+    /// capped CLOEXEC tracking at fd 31) to `BTreeSet<u32>`. Now any
+    /// `u32` fd may be CLOEXEC-marked; per fd-ops Wave 1 §B and
+    /// §"Open questions #1" (DECIDED). The bitmap-vs-fd-table
+    /// consistency burden is unchanged in shape (two separate
+    /// containers for fd and cloexec); future migration to a single
+    /// `OpenFile.flags.cloexec` source-of-truth is tracked as Open
+    /// question #4 (deferred — `dup2`/`dup3` semantics are easier with
+    /// a per-fd bit).
     ///
-    /// Default `0` (no fds CLOEXEC at process creation). `step_fork`
-    /// clones the parent's bits per Linux semantics (CLOEXEC is per-fd,
-    /// copied across fork). Mutated via [`ProcessPayload::set_fd_cloexec`]
-    /// from the syscall dispatcher's `fcntl(F_SETFD)` arm and from
-    /// `sys_open` once `O_CLOEXEC` plumbing lands (see Wave 2 scope
-    /// reduction note in [`crate::process::execution::step_close_cloexec_fds`]).
-    pub(crate) fd_cloexec: AtomicU32,
+    /// Default empty (no fds CLOEXEC at process creation). `step_fork`
+    /// clones the parent's set per Linux semantics (CLOEXEC is per-fd,
+    /// copied across fork).
+    pub(crate) fd_cloexec: SpinMutex<BTreeSet<u32>>,
     /// Base of the program-break (heap) region for this process.
     ///
     /// Set once at exec time (per `txdoc:VM-5-8-BRK`); never changes
@@ -703,80 +778,101 @@ impl ProcessPayload {
 
     /// Snapshot the `Cap<OpenFile>` registered at fd `idx`, if any.
     ///
-    /// Returns `None` for fd indices outside the day-1 fixed-size
-    /// table (≥ `FD_TABLE_SIZE`) and for empty slots. Per Trio plan
-    /// §"Cross-cutting risks #6", the fd table is a stub: callers that
-    /// need full POSIX semantics will land beyond the trio.
-    pub fn fd(&self, idx: usize) -> Option<Cap<OpenFile>> {
-        if idx >= FD_TABLE_SIZE {
-            return None;
-        }
-        self.fds.lock()[idx].clone()
+    /// Returns `None` for empty slots. Per fd-ops Wave 1 the underlying
+    /// storage is a sparse `BTreeMap<u32, Cap<OpenFile>>`; any `u32`
+    /// fd value is valid as a key.
+    pub fn fd(&self, idx: u32) -> Option<Cap<OpenFile>> {
+        self.fds.lock().get(&idx).cloned()
     }
 
     /// Install `file` at fd `idx`, returning the previously installed
-    /// `Cap<OpenFile>` if any. Returns `None` (and ignores the install)
-    /// for fd indices outside the day-1 fixed-size table.
+    /// `Cap<OpenFile>` if any. Passing `file = None` removes the fd
+    /// from the table (returns the previous occupant, if any).
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeMap<u32, Cap<OpenFile>>`; any `u32` fd value is valid as
+    /// a key.
     ///
     /// Used by Phase 2a tests to manually wire the console as fd 1
-    /// before dispatching `NR_WRITE`. Phase 3b's `init.rs` will use the
+    /// before dispatching `NR_WRITE`. Phase 3b's `init.rs` uses the
     /// same accessor to preopen fds 0/1/2.
-    pub fn set_fd(&self, idx: usize, file: Option<Cap<OpenFile>>) -> Option<Cap<OpenFile>> {
-        if idx >= FD_TABLE_SIZE {
-            return None;
-        }
+    pub fn set_fd(&self, idx: u32, file: Option<Cap<OpenFile>>) -> Option<Cap<OpenFile>> {
         let mut slot = self.fds.lock();
-        core::mem::replace(&mut slot[idx], file)
+        match file {
+            Some(f) => slot.insert(idx, f),
+            None => slot.remove(&idx),
+        }
     }
 
-    /// Snapshot the entire fd table as a fresh array. Each populated
-    /// slot's `Cap<OpenFile>` is `.clone()`'d so the snapshot does not
-    /// borrow the lock; callers can drop the result freely without
-    /// touching the payload's storage. Used by `step_fork` to clone
-    /// the parent's fd table into the child.
-    pub(crate) fn snapshot_fds(&self) -> [Option<Cap<OpenFile>>; FD_TABLE_SIZE] {
+    /// Snapshot the entire fd table as a fresh `BTreeMap`. Each
+    /// populated entry's `Cap<OpenFile>` is `.clone()`'d so the
+    /// snapshot does not borrow the lock; callers can drop the result
+    /// freely without touching the payload's storage. Used by
+    /// `step_fork` to clone the parent's fd table into the child.
+    pub(crate) fn snapshot_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+        self.fds.lock().clone()
+    }
+
+    /// Allocate the lowest unused fd ≥ `min` without installing
+    /// anything. Walks the BTreeMap's sorted keys looking for the
+    /// first gap at or above `min`.
+    ///
+    /// Per fd-ops Wave 1 §C: the new accessor surface needed by
+    /// `sys_openat` (Wave 2), `sys_dup` / `sys_dup3` (Wave 4), and
+    /// `sys_pipe2` (Wave 5).
+    pub fn allocate_fd_at_least(&self, min: u32) -> u32 {
         let slot = self.fds.lock();
-        core::array::from_fn(|i| slot[i].clone())
+        let mut next = min;
+        for &existing in slot.keys() {
+            if existing < next {
+                continue;
+            }
+            if existing == next {
+                next = next.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        next
     }
 
-    /// Read the close-on-exec bit for fd `idx`. Out-of-range indices
-    /// (≥ 32) return `false` — they cannot be marked under the day-1
-    /// `AtomicU32` bitmap.
+    /// Read the close-on-exec bit for fd `idx`.
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeSet<u32>`; any `u32` fd value is valid (no fd-31
+    /// ceiling).
     pub fn fd_cloexec_get(&self, idx: u32) -> bool {
-        if idx >= 32 {
-            return false;
-        }
-        (self.fd_cloexec.load(Ordering::Acquire) & (1u32 << idx)) != 0
+        self.fd_cloexec.lock().contains(&idx)
     }
 
-    /// Set or clear the close-on-exec bit for fd `idx`. Out-of-range
-    /// indices (≥ 32) are silently ignored — the day-1 `AtomicU32`
-    /// bitmap covers fds 0..31.
+    /// Set or clear the close-on-exec bit for fd `idx`.
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeSet<u32>`; any `u32` fd value is valid (no fd-31
+    /// ceiling).
     pub fn set_fd_cloexec(&self, idx: u32, value: bool) {
-        if idx >= 32 {
-            return;
-        }
-        let mask = 1u32 << idx;
+        let mut set = self.fd_cloexec.lock();
         if value {
-            self.fd_cloexec.fetch_or(mask, Ordering::AcqRel);
+            set.insert(idx);
         } else {
-            self.fd_cloexec.fetch_and(!mask, Ordering::AcqRel);
+            set.remove(&idx);
         }
     }
 
-    /// Snapshot the entire close-on-exec bitmap as a `u32`. Used by
+    /// Snapshot the entire close-on-exec set as an owned
+    /// `BTreeSet<u32>`. Used by
     /// [`crate::process::execution::step_close_cloexec_fds`] to walk
-    /// every set bit during exec phase 7.
-    pub(crate) fn fd_cloexec_word(&self) -> u32 {
-        self.fd_cloexec.load(Ordering::Acquire)
+    /// every marked fd during exec phase 7.
+    pub(crate) fn fd_cloexec_snapshot(&self) -> BTreeSet<u32> {
+        self.fd_cloexec.lock().clone()
     }
 
-    /// Replace the entire close-on-exec bitmap. Used by `step_fork`
-    /// to inherit the parent's CLOEXEC bits into the child, and by
+    /// Clear the entire close-on-exec set. Used by
     /// [`crate::process::execution::step_close_cloexec_fds`] to clear
-    /// the bitmap after the close sweep.
-    pub(crate) fn store_fd_cloexec_word(&self, word: u32) {
-        self.fd_cloexec.store(word, Ordering::Release);
+    /// the set after the close sweep so future `fcntl(F_SETFD)` calls
+    /// start from a clean state.
+    pub(crate) fn clear_fd_cloexec(&self) {
+        self.fd_cloexec.lock().clear();
     }
 
     /// Read the program-break base address for this process. Returns

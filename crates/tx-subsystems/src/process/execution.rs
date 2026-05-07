@@ -1,6 +1,7 @@
 //! Process subsystem execution: fork, exit-group, setpgid, setsid, and
 //! the internal `step_process_exit` last-thread cascade.
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -11,7 +12,7 @@ use tx_substrate::SpinMutex;
 use crate::cred::Cred;
 use crate::process::structure::{
     allocate_pid, ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,
-    Sid, FD_TABLE_SIZE,
+    Sid,
 };
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::execution::set_thread_zombie;
@@ -228,8 +229,8 @@ pub fn bootstrap_init_process(
         vec![leader],
         Cred::root(),
         None,
-        empty_fd_table(),
-        0,
+        BTreeMap::new(),
+        BTreeSet::new(),
         BOOTSTRAP_BRK_BASE,
         BOOTSTRAP_BRK_BASE,
     )?;
@@ -249,12 +250,15 @@ pub fn step_fork<P: PmapIf>(
     parent: &Cap<ProcessIdentity>,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
     // Snapshot parent state under its payload lock. Fd table is
-    // cloned slot-by-slot so parent and child share the same
-    // `Cap<OpenFile>` per slot, matching the Trio plan §"Cross-cutting
-    // risks #6" (full `dup`-shape sharing is deferred). brk values
-    // are cloned per the Trio plan §"Cross-cutting risks #7": each
-    // child gets its own brk_base/current_brk pair, while the underlying
-    // VM mappings are cloned through `AddressSpace::fork_aspace` below.
+    // cloned entry-by-entry so parent and child share the same
+    // `Cap<OpenFile>` per fd, matching the Trio plan §"Cross-cutting
+    // risks #6" (full `dup`-shape sharing — separate file description
+    // per fd — is deferred). The CLOEXEC set is cloned wholesale so
+    // the child inherits parent's exec-time bits per Linux semantics.
+    // brk values are cloned per the Trio plan §"Cross-cutting risks
+    // #7": each child gets its own brk_base/current_brk pair, while
+    // the underlying VM mappings are cloned through
+    // `AddressSpace::fork_aspace` below.
     let (
         parent_aspace,
         parent_cred,
@@ -271,7 +275,7 @@ pub fn step_fork<P: PmapIf>(
             payload.cred(),
             payload.cwd(),
             payload.snapshot_fds(),
-            payload.fd_cloexec_word(),
+            payload.fd_cloexec_snapshot(),
             payload.brk_base(),
             payload.current_brk(),
         )
@@ -777,11 +781,11 @@ pub fn step_setsid(target: &Cap<ProcessIdentity>) -> Result<Sid, SetsidError> {
 // block of synchronous calls.
 
 /// Close every fd whose CLOEXEC bit is set on `process`, then clear
-/// the close-on-exec bitmap.
+/// the close-on-exec set.
 ///
 /// Per `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC` and the Wave 2 plan's
-/// Part 1 P1 sub-item. Walks bits 0..`FD_TABLE_SIZE` of the per-process
-/// `fd_cloexec` word; for each set bit, drops the fd via the existing
+/// Part 1 P1 sub-item. Walks the per-process CLOEXEC `BTreeSet<u32>`
+/// snapshot; for each marked fd, drops the fd via the existing
 /// `set_fd(i, None)` accessor — the resulting `Cap<OpenFile>` `Drop`
 /// runs the close per `txdoc:VFS-CHECKS-WALKER-MODES-1`. Any
 /// `OpenFile::Drop` side-effects (eventual file-flush etc.) are NOT
@@ -789,29 +793,23 @@ pub fn step_setsid(target: &Cap<ProcessIdentity>) -> Result<Sid, SetsidError> {
 /// post-PoNR commit cannot await.
 ///
 /// Infallible — by EXEC-PONR. No-op for zombies (no payload to sweep).
-/// Out-of-range bits (≥ `FD_TABLE_SIZE`) are ignored: today's bitmap
-/// reserves bits 0..31, but the fd table only carries 8 slots.
+/// fd-ops Wave 1 (2026-05-07): the CLOEXEC set's fd-31 ceiling has been
+/// removed alongside the fd table's 8-slot ceiling; any `u32` fd may
+/// be marked.
 pub fn step_close_cloexec_fds(process: &Cap<ProcessIdentity>) {
-    let word = process.fd_cloexec_word();
-    if word == 0 {
+    let cloexec = process.fd_cloexec_snapshot();
+    if cloexec.is_empty() {
         return;
     }
-    // Walk only fds in the existing fixed-size table; reserved bits
-    // above the table are unreachable from `set_fd` and would be a
-    // no-op anyway.
-    for fd in 0..FD_TABLE_SIZE as u32 {
-        if (word & (1u32 << fd)) != 0 {
-            // Drop via the existing accessor; the previous `Cap` (if
-            // any) is returned for EBR-deferred drop. We discard it
-            // here — the slot is now empty, the fd is closed.
-            let _ = process.set_fd(fd as usize, None);
-        }
+    for fd in cloexec {
+        // Drop via the existing accessor; the previous `Cap` (if any)
+        // is returned for EBR-deferred drop. We discard it here — the
+        // slot is now empty, the fd is closed.
+        let _ = process.set_fd(fd, None);
     }
-    // Clear the bitmap wholesale: every previously-marked fd is now
-    // closed; future fcntl(F_SETFD) calls start from a zeroed word.
-    if let Some(payload) = process.payload.lock().as_ref() {
-        payload.store_fd_cloexec_word(0);
-    }
+    // Clear the set wholesale: every previously-marked fd is now
+    // closed; future fcntl(F_SETFD) calls start from a clean state.
+    process.clear_fd_cloexec();
 }
 
 /// Reset every user-installed signal disposition on `process` to
@@ -905,8 +903,8 @@ fn sign_process_payload(
     threads: Vec<Cap<ThreadIdentity>>,
     cred: Cred,
     cwd: Option<Cap<crate::vfs::DEntry>>,
-    fds: [Option<Cap<OpenFile>>; FD_TABLE_SIZE],
-    fd_cloexec: u32,
+    fds: BTreeMap<u32, Cap<OpenFile>>,
+    fd_cloexec: BTreeSet<u32>,
     brk_base: u64,
     current_brk: u64,
 ) -> Result<tx_substrate::zone::PayloadCap<ProcessPayload>, ZoneError> {
@@ -939,7 +937,7 @@ fn sign_process_payload(
             cred: SpinMutex::new(cred),
             cwd: SpinMutex::new(cwd),
             fds: SpinMutex::new(fds),
-            fd_cloexec: core::sync::atomic::AtomicU32::new(fd_cloexec),
+            fd_cloexec: SpinMutex::new(fd_cloexec),
             brk_base: core::sync::atomic::AtomicU64::new(brk_base),
             current_brk: core::sync::atomic::AtomicU64::new(current_brk),
             exit_port,
@@ -947,12 +945,6 @@ fn sign_process_payload(
         },
     );
     Ok(tx_substrate::zone::PayloadCap::from_cap(cap))
-}
-
-/// All-`None` initial fd table for processes that have no preopens at
-/// payload-construction time (bootstrap init pre-Phase-3b; tests).
-fn empty_fd_table() -> [Option<Cap<OpenFile>>; FD_TABLE_SIZE] {
-    core::array::from_fn(|_| None)
 }
 
 fn sign_thread(

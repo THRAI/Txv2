@@ -1059,13 +1059,21 @@ fn process_payload_fd_cloexec_default_zero() {
     let _g = setup();
     let proc_cap = bootstrap();
     // Every fd defaults to "not CLOEXEC" — bootstrap_init_process
-    // initialises the bitmap to 0 per the Wave 2 plan (init's stdio
-    // is not close-on-exec by Linux convention).
-    for fd in 0..crate::process::FD_TABLE_SIZE as u32 {
+    // initialises the CLOEXEC set empty per the Wave 2 plan (init's
+    // stdio is not close-on-exec by Linux convention).
+    //
+    // fd-ops Wave 1: assert via the snapshot accessor that the set
+    // really is empty; the previous AtomicU32 word check is gone.
+    assert!(
+        proc_cap.fd_cloexec_snapshot().is_empty(),
+        "bootstrap CLOEXEC set must start empty"
+    );
+    for fd in 0u32..16 {
         assert!(!proc_cap.fd_cloexec(fd), "fd {fd} should default to false");
     }
-    // Out-of-range queries also return false (the day-1 AtomicU32
-    // bitmap covers fds 0..31; queries above 31 return false).
+    // fd-ops Wave 1: any `u32` is a valid fd key (the BTreeSet has no
+    // upper bound). Pre-Wave-1 the AtomicU32 capped at fd 31; the
+    // sparse set lifts that.
     assert!(!proc_cap.fd_cloexec(31));
     assert!(!proc_cap.fd_cloexec(32));
     assert!(!proc_cap.fd_cloexec(64));
@@ -1090,6 +1098,156 @@ fn process_payload_set_fd_cloexec_round_trip() {
     proc_cap.set_fd_cloexec(3, false);
     assert!(!proc_cap.fd_cloexec(3));
     assert!(proc_cap.fd_cloexec(5));
+
+    // fd-ops Wave 1: large fd values (> 31) are now legal — the
+    // sparse `BTreeSet<u32>` has no upper bound. Pre-Wave-1 the
+    // AtomicU32 silently dropped these.
+    proc_cap.set_fd_cloexec(100, true);
+    assert!(proc_cap.fd_cloexec(100));
+    assert!(proc_cap.fd_cloexec(5));
+    proc_cap.set_fd_cloexec(100, false);
+    assert!(!proc_cap.fd_cloexec(100));
+}
+
+// ---------------------------------------------------------------------------
+// fd-ops Wave 1 (2026-05-07): sparse `BTreeMap`/`BTreeSet` fd table.
+// ---------------------------------------------------------------------------
+
+/// fd-ops Wave 1: any `u32` fd is a valid key in the sparse
+/// `BTreeMap<u32, Cap<OpenFile>>` table. Pre-Wave-1 the table was a
+/// fixed `[Option<Cap<OpenFile>>; 8]` array and the install at fd 100
+/// would have been silently dropped.
+#[test]
+fn process_payload_fds_btreemap_supports_sparse_fd_above_31() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    let file = fresh_open_file();
+    let prev = proc_cap.set_fd(100, Some(file));
+    assert!(prev.is_none(), "fd 100 was not previously occupied");
+
+    assert!(proc_cap.fd(100).is_some(), "fd 100 must be observable");
+    // No other fds occupy.
+    for fd in [0u32, 1, 2, 3, 7, 31, 32, 99, 101, 200] {
+        assert!(
+            proc_cap.fd(fd).is_none(),
+            "fd {fd} must be empty (only fd 100 was set)"
+        );
+    }
+
+    let removed = proc_cap.set_fd(100, None);
+    assert!(removed.is_some(), "removing fd 100 returns the prior file");
+    assert!(
+        proc_cap.fd(100).is_none(),
+        "fd 100 must be empty post-remove"
+    );
+}
+
+/// fd-ops Wave 1: `allocate_fd` returns the lowest unused fd ≥ 0.
+/// Walks the BTreeMap's sorted keys looking for the first gap.
+#[test]
+fn process_payload_allocate_fd_returns_lowest_unused() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    // Empty table: lowest unused fd is 0.
+    assert_eq!(proc_cap.allocate_fd(), 0);
+
+    // Install fd 0 and fd 2 — leaving fd 1 as the gap.
+    proc_cap.set_fd(0, Some(fresh_open_file()));
+    proc_cap.set_fd(2, Some(fresh_open_file()));
+    assert_eq!(proc_cap.allocate_fd(), 1, "fd 1 is the lowest gap");
+
+    // Plug the gap; lowest unused fd shifts to 3.
+    proc_cap.set_fd(1, Some(fresh_open_file()));
+    assert_eq!(proc_cap.allocate_fd(), 3);
+
+    // `next_fd_above` is the same scan with a non-zero floor.
+    assert_eq!(proc_cap.next_fd_above(2), 3);
+    assert_eq!(proc_cap.next_fd_above(10), 10);
+}
+
+/// fd-ops Wave 1: `install_fd` returns the previous occupant so the
+/// caller can EBR-defer-drop the displaced `Cap<OpenFile>`. Matches
+/// the `dup2`/`dup3` shape (Wave 4).
+#[test]
+fn process_payload_install_fd_returns_previous_occupant() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    let first = fresh_open_file();
+    let second = fresh_open_file();
+
+    // First install: slot was empty.
+    let prev1 = proc_cap.install_fd(5, first);
+    assert!(
+        prev1.is_none(),
+        "first install at fd 5 has no prior occupant"
+    );
+
+    // Second install at the same fd: the first occupant returns.
+    let prev2 = proc_cap.install_fd(5, second);
+    assert!(
+        prev2.is_some(),
+        "second install at fd 5 must return the first occupant"
+    );
+
+    assert!(proc_cap.fd(5).is_some(), "fd 5 must remain installed");
+}
+
+/// fd-ops Wave 1: `step_fork`'s fd-table clone walks the parent's
+/// `BTreeMap` entries (sparse fds included), not a 0..8 array index
+/// loop. The child sees every parent fd, including fds > 31.
+#[test]
+fn process_payload_step_fork_clones_sparse_fd_table() {
+    let _g = setup();
+    let parent = bootstrap();
+
+    // Parent's fd table: fds 0, 1, 2 (the canonical stdio shape) plus
+    // fd 100 (the sparse case the BTreeMap migration unlocks).
+    parent.set_fd(0, Some(fresh_open_file()));
+    parent.set_fd(1, Some(fresh_open_file()));
+    parent.set_fd(2, Some(fresh_open_file()));
+    parent.set_fd(100, Some(fresh_open_file()));
+
+    let child = step_fork::<TestPmap>(&parent).expect("fork");
+
+    // Child inherits the entire sparse map.
+    assert!(child.fd(0).is_some(), "child inherits fd 0");
+    assert!(child.fd(1).is_some(), "child inherits fd 1");
+    assert!(child.fd(2).is_some(), "child inherits fd 2");
+    assert!(child.fd(100).is_some(), "child inherits sparse fd 100");
+    assert!(child.fd(3).is_none(), "fd 3 was never set; child sees None");
+
+    // Mutating the child must not bleed back into the parent.
+    child.set_fd(100, None);
+    assert!(child.fd(100).is_none());
+    assert!(
+        parent.fd(100).is_some(),
+        "parent's fd 100 survives the child's close"
+    );
+}
+
+/// fd-ops Wave 1: the CLOEXEC `BTreeSet<u32>` accepts arbitrary `u32`
+/// keys — pre-Wave-1 the `AtomicU32` silently dropped fds ≥ 32.
+#[test]
+fn process_payload_fd_cloexec_btreeset_supports_sparse_fds_above_31() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    proc_cap.set_fd_cloexec(100, true);
+    assert!(proc_cap.fd_cloexec(100));
+    assert!(!proc_cap.fd_cloexec(99));
+    assert!(!proc_cap.fd_cloexec(101));
+
+    // Snapshot reflects only the high fd.
+    let snap = proc_cap.fd_cloexec_snapshot();
+    assert_eq!(snap.len(), 1);
+    assert!(snap.contains(&100));
+
+    proc_cap.set_fd_cloexec(100, false);
+    assert!(!proc_cap.fd_cloexec(100));
+    assert!(proc_cap.fd_cloexec_snapshot().is_empty());
 }
 
 #[test]
@@ -1154,15 +1312,16 @@ fn step_close_cloexec_fds_clears_bitmap_after() {
 
     step_close_cloexec_fds(&proc_cap);
 
-    // The sweep clears the bitmap wholesale: future fcntl(F_SETFD)
-    // calls start from a zeroed word.
+    // The sweep clears the set wholesale: future fcntl(F_SETFD) calls
+    // start from a clean state.
     assert!(
         !proc_cap.fd_cloexec(2),
         "post-sweep, the CLOEXEC bit must be cleared"
     );
-    for fd in 0..crate::process::FD_TABLE_SIZE as u32 {
-        assert!(!proc_cap.fd_cloexec(fd), "every bit must be 0 post-sweep");
-    }
+    assert!(
+        proc_cap.fd_cloexec_snapshot().is_empty(),
+        "post-sweep, the CLOEXEC set must be empty"
+    );
 }
 
 #[test]

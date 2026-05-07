@@ -288,6 +288,15 @@ flat shape, in this order:
 - DAC + setuid Wave 4 (commit `b9ae7a0`): added `fd_cloexec:
   AtomicU32` for `step_close_cloexec_fds` to consult during exec
   Phase 7.
+- fd-ops Wave 1 (2026-05-07): flipped `fds` from
+  `[Option<Cap<OpenFile>>; FD_TABLE_SIZE]` to
+  `BTreeMap<u32, Cap<OpenFile>>` and `fd_cloexec` from `AtomicU32`
+  to `BTreeSet<u32>`. Closes the `FD_TABLE_SIZE = 8` ceiling and
+  the fd-31 CLOEXEC ceiling — sparse fds (e.g. shells doing
+  `>&100`-style redirection) are now first-class. New accessor
+  surface (`allocate_fd`, `allocate_fd_at_least`, `next_fd_above`,
+  `install_fd`, `fd_cloexec_snapshot`, `clear_fd_cloexec`) lands
+  alongside.
 
 The flat shape is correct, well-tested, and load-bearing. Refactoring
 to `Frame { Shared<T> }` would require refactoring every step
@@ -312,13 +321,17 @@ pub struct ProcessPayload {
     /// Per-process credential snapshot. (DAC + setuid Wave 2.)
     pub(crate) cred: SpinMutex<Cred>,
     pub(crate) cwd: SpinMutex<Option<Cap<DEntry>>>,
-    /// Fixed-size fd table. About to flip to
-    /// `BTreeMap<u32, Cap<OpenFile>>` in fd-ops Wave 1.
-    /// (Trio Phase 2a.)
-    pub(crate) fds: SpinMutex<[Option<Cap<OpenFile>>; FD_TABLE_SIZE]>,
-    /// Per-fd close-on-exec bitmap. About to flip alongside
-    /// `fds` in fd-ops Wave 1. (DAC + setuid Wave 4.)
-    pub(crate) fd_cloexec: AtomicU32,
+    /// Sparse fd table. Flipped from
+    /// `[Option<Cap<OpenFile>>; FD_TABLE_SIZE]` to
+    /// `BTreeMap<u32, Cap<OpenFile>>` in fd-ops Wave 1
+    /// (2026-05-07). Any `u32` fd is a valid key; `step_fork`
+    /// clones the entire map. (Trio Phase 2a; fd-ops Wave 1.)
+    pub(crate) fds: SpinMutex<BTreeMap<u32, Cap<OpenFile>>>,
+    /// Per-fd close-on-exec set. Flipped from `AtomicU32` to
+    /// `BTreeSet<u32>` in fd-ops Wave 1 (2026-05-07). The fd-31
+    /// ceiling has been retired alongside the fd-table ceiling.
+    /// (DAC + setuid Wave 4; fd-ops Wave 1.)
+    pub(crate) fd_cloexec: SpinMutex<BTreeSet<u32>>,
     /// Heap region anchors. (Trio Phase 2b.)
     pub(crate) brk_base: AtomicU64,
     pub(crate) current_brk: AtomicU64,

@@ -703,8 +703,13 @@ fn dispatch_rt_sigaction_rejects_wrong_sigsetsize() {
 #[test]
 fn dispatch_fcntl_getfd_returns_zero_for_unset_bit() {
     let _setup = setup();
+    let _ops = install_capturing_console();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
+    // fd-ops Wave 1: F_GETFD now requires the fd to actually be
+    // open (Linux semantic). Install a console at fd 3 so the
+    // CLOEXEC bit is observable.
+    proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
     let ctx = make_ctx(proc_cap, thread);
 
     let r = block_on(dispatch::<ShimsTestPmap>(
@@ -720,8 +725,12 @@ fn dispatch_fcntl_getfd_returns_zero_for_unset_bit() {
 #[test]
 fn dispatch_fcntl_setfd_then_getfd_round_trip() {
     let _setup = setup();
+    let _ops = install_capturing_console();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
+    // fd-ops Wave 1: install at fd 3 so the syscall arm sees an
+    // open fd (EBADF otherwise).
+    proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
     let ctx = make_ctx(proc_cap.clone(), thread);
 
     // F_SETFD with FD_CLOEXEC.
@@ -756,12 +765,17 @@ fn dispatch_fcntl_setfd_then_getfd_round_trip() {
 #[test]
 fn dispatch_fcntl_setfd_clears_other_bits() {
     let _setup = setup();
+    let _ops = install_capturing_console();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
+    // fd-ops Wave 1: install at fd 3 so the syscall arm sees an
+    // open fd (EBADF otherwise).
+    proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
     let ctx = make_ctx(proc_cap.clone(), thread);
 
     // Pre-mark fd 5 CLOEXEC at the API level so we can confirm
-    // F_SETFD on fd 3 does not touch it.
+    // F_SETFD on fd 3 does not touch it. fd 5 itself need not be
+    // open — the API-level mutation accepts any `u32`.
     proc_cap.set_fd_cloexec(5, true);
     assert!(proc_cap.fd_cloexec(5));
 
@@ -786,8 +800,12 @@ fn dispatch_fcntl_setfd_clears_other_bits() {
 #[test]
 fn dispatch_fcntl_unknown_cmd_returns_neg_enosys() {
     let _setup = setup();
+    let _ops = install_capturing_console();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
+    // fd-ops Wave 1: install at fd 3 so the EBADF gate doesn't
+    // fire before the unknown-cmd path is reached.
+    proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
     let ctx = make_ctx(proc_cap, thread);
 
     // F_DUPFD = 0 is not in the Wave 2 surface.
@@ -798,23 +816,30 @@ fn dispatch_fcntl_unknown_cmd_returns_neg_enosys() {
     assert_eq!(r, SyscallResult::Error(38));
 }
 
-/// fd outside the day-1 fixed-size fd table (`FD_TABLE_SIZE = 8`)
-/// returns `-EBADF`.
+/// `fcntl` against a closed/never-installed fd returns `-EBADF`.
+///
+/// fd-ops Wave 1 (2026-05-07): the previous `FD_TABLE_SIZE = 8`
+/// ceiling has been retired (the fd table is now a sparse
+/// `BTreeMap<u32, Cap<OpenFile>>`); the EBADF discriminant is now
+/// "is this fd actually open?", matching Linux semantics for
+/// `F_GETFD` / `F_SETFD` against a closed fd.
 #[test]
-fn dispatch_fcntl_invalid_fd_returns_neg_ebadf() {
+fn dispatch_fcntl_closed_fd_returns_neg_ebadf() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap, thread);
 
-    // FD_TABLE_SIZE = 8: fd 8 is out of range.
+    // Bootstrap leaves the fd table empty — every fd is closed.
     let r = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(NR_FCNTL, [8, F_GETFD as u64, 0, 0, 0, 0]),
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Error(9));
 
-    // Same for F_SETFD.
+    // Same for F_SETFD; the fd-ops Wave 1 sparse table allows fd 99
+    // as a key but with no installed `Cap<OpenFile>` it's still
+    // closed, so EBADF.
     let r2 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(NR_FCNTL, [99, F_SETFD as u64, FD_CLOEXEC as u64, 0, 0, 0]),
         &ctx,
