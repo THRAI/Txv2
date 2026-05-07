@@ -1079,3 +1079,72 @@ pub const GRND_RANDOM: u32 = 0x2;
 /// `GRND_INSECURE = 0x4` — return whatever bytes the kernel has even
 /// if the pool is not yet seeded. Slice 7: ignored.
 pub const GRND_INSECURE: u32 = 0x4;
+
+// ---------------------------------------------------------------------
+// Slice 8 — file-mutation syscalls. NR_MKDIRAT, NR_UNLINKAT,
+// NR_SYMLINKAT, NR_LINKAT, NR_TRUNCATE, NR_FTRUNCATE, NR_READLINKAT,
+// NR_UTIMENSAT, NR_RENAMEAT2 plus the `AT_REMOVEDIR`, `RENAME_*`,
+// `UTIME_NOW` / `UTIME_OMIT` flag constants. Each arm wraps the
+// in-tree `FsOps::*` step bodies (`unlink` / `rename` / `link` /
+// `mkdir` / `rmdir` / `symlink` / `read_link`) plus the
+// `page_backed::lifecycle::step_truncate` body for truncate /
+// ftruncate. See
+// `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 8.
+// ---------------------------------------------------------------------
+
+/// `NR_MKDIRAT = 34` — Linux RV64 generic ABI `__NR_mkdirat`.
+pub const NR_MKDIRAT: u64 = 34;
+/// `NR_UNLINKAT = 35` — Linux RV64 generic ABI `__NR_unlinkat`.
+pub const NR_UNLINKAT: u64 = 35;
+/// `NR_SYMLINKAT = 36` — Linux RV64 generic ABI `__NR_symlinkat`.
+pub const NR_SYMLINKAT: u64 = 36;
+/// `NR_LINKAT = 37` — Linux RV64 generic ABI `__NR_linkat`.
+pub const NR_LINKAT: u64 = 37;
+/// `NR_TRUNCATE = 45` — Linux RV64 generic ABI `__NR_truncate`. Slice 8
+/// wires the path-named form against `step_truncate` for PageBacked
+/// regular files.
+pub const NR_TRUNCATE: u64 = 45;
+/// `NR_FTRUNCATE = 46` — Linux RV64 generic ABI `__NR_ftruncate`.
+/// Slice 8: PageBacked fds only; non-page-backed surfaces return
+/// `-EINVAL` per `step_truncate`.
+pub const NR_FTRUNCATE: u64 = 46;
+/// `NR_READLINKAT = 78` — Linux RV64 generic ABI `__NR_readlinkat`.
+/// Slice 8 walks the link's parent directory and calls
+/// `FsOps::lookup` + `read_link` directly so the symlink's target
+/// bytes are returned without the walker following the link.
+pub const NR_READLINKAT: u64 = 78;
+/// `NR_UTIMENSAT = 88` — Linux RV64 generic ABI `__NR_utimensat`.
+/// Slice 8 returns `-ENOSYS` (no `FsOps::set_times` hook yet); see
+/// the slice plan §"Out of scope".
+pub const NR_UTIMENSAT: u64 = 88;
+/// `NR_RENAMEAT2 = 276` — Linux RV64 generic ABI `__NR_renameat2`.
+/// Slice 8: `RENAME_NOREPLACE` honoured via a pre-walk existence
+/// check; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` return `-ENOSYS`
+/// (no atomic-swap surface yet).
+pub const NR_RENAMEAT2: u64 = 276;
+
+/// `AT_REMOVEDIR = 0x200` — `unlinkat(2)` flag bit. When set the arm
+/// dispatches through `FsOps::rmdir` instead of `unlink` (matching
+/// Linux's `unlinkat(.., AT_REMOVEDIR)` shape). Without this bit a
+/// directory target surfaces `-EISDIR`.
+pub const AT_REMOVEDIR: u32 = 0x200;
+
+/// `RENAME_NOREPLACE = 1` — `renameat2(2)` flag. The kernel rejects
+/// the rename with `-EEXIST` if `newpath` already exists. Slice 8
+/// implements this via a pre-walk: if the new path resolves
+/// successfully, the arm short-circuits without touching `FsOps::rename`.
+pub const RENAME_NOREPLACE: u32 = 1;
+/// `RENAME_EXCHANGE = 2` — atomically swap two existing paths.
+/// Slice 8: returns `-ENOSYS` (no FsOps surface for atomic swap).
+pub const RENAME_EXCHANGE: u32 = 2;
+/// `RENAME_WHITEOUT = 4` — overlayfs whiteout-creating rename.
+/// Slice 8: returns `-EINVAL` (recognised but unsupported flag bit).
+pub const RENAME_WHITEOUT: u32 = 4;
+
+/// `UTIME_NOW = (1 << 30) - 1` — `utimensat(2)` "use current time"
+/// sentinel. Slice 8 carries the constant for grep-stability;
+/// `sys_utimensat` returns `-ENOSYS` regardless.
+pub const UTIME_NOW: i64 = (1 << 30) - 1;
+/// `UTIME_OMIT = (1 << 30) - 2` — `utimensat(2)` "leave unchanged"
+/// sentinel.
+pub const UTIME_OMIT: i64 = (1 << 30) - 2;

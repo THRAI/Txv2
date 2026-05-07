@@ -87,7 +87,7 @@ pub mod numbers;
 mod tests;
 
 pub use numbers::{
-    AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW, CLOCK_BOOTTIME,
+    AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, CLOCK_BOOTTIME,
     CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID,
     CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID, DT_BLK, DT_CHR, DT_DIR,
     DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
@@ -101,19 +101,21 @@ pub use numbers::{
     NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHDIR,
     NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FSTAT, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID,
     NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID,
-    NR_GETRESUID, NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_KILL, NR_LSEEK, NR_MADVISE,
-    NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT, NR_OPENAT,
-    NR_PIPE2, NR_PRLIMIT64, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGRETURN,
-    NR_SETGID, NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID,
-    NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_TGKILL, NR_TIMES, NR_TKILL, NR_UMASK,
-    NR_UNAME, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL,
-    O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP,
-    PROT_NONE, PROT_READ, PROT_WRITE, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA,
+    NR_GETRESUID, NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_KILL, NR_LINKAT, NR_LSEEK,
+    NR_MADVISE, NR_MKDIRAT, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP,
+    NR_NEWFSTATAT, NR_OPENAT, NR_PIPE2, NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_RENAMEAT2,
+    NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGRETURN, NR_SETGID, NR_SETPGID, NR_SETREGID,
+    NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
+    NR_SET_TID_ADDRESS, NR_SYMLINKAT, NR_TGKILL, NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK,
+    NR_UNAME, NR_UNLINKAT, NR_UTIMENSAT, NR_FTRUNCATE, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND,
+    O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, RENAME_EXCHANGE,
+    RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA,
     RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE,
     RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK,
     RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END, SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW,
     TIMER_ABSTIME, TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP,
-    TIOCSWINSZ, WNOHANG, W_OK, X_OK,
+    TIOCSWINSZ, UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -536,6 +538,27 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         // dispatcher ENOSYS path matches; arm explicitly written for
         // grep-stability and future wiring.
         nr if nr == NR_RT_SIGRETURN => sys_rt_sigreturn(),
+        // Slice 8 of the shell-prompt roadmap — file-mutation syscalls.
+        // Each arm wraps an in-tree `FsOps::*` step body
+        // (`mkdir`/`rmdir`/`unlink`/`rename`/`link`/`symlink`/
+        // `read_link`) plus, for the truncate pair, the
+        // `page_backed::lifecycle::step_truncate` body. The walker
+        // resolves the target path(s); the syscall arm dispatches
+        // through `fs_ops_for_dentry` against the parent's dentry to
+        // find the in-scope FS surface. `utimensat` is deferred
+        // (`-ENOSYS`); `RENAME_EXCHANGE` / `RENAME_WHITEOUT` are
+        // recognised flag bits but unsupported. See
+        // `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md`
+        // Slice 8.
+        nr if nr == NR_MKDIRAT => sys_mkdirat(req.args, ctx).await,
+        nr if nr == NR_UNLINKAT => sys_unlinkat(req.args, ctx).await,
+        nr if nr == NR_SYMLINKAT => sys_symlinkat(req.args, ctx).await,
+        nr if nr == NR_LINKAT => sys_linkat(req.args, ctx).await,
+        nr if nr == NR_TRUNCATE => sys_truncate(req.args, ctx).await,
+        nr if nr == NR_FTRUNCATE => sys_ftruncate(req.args, ctx),
+        nr if nr == NR_READLINKAT => sys_readlinkat(req.args, ctx).await,
+        nr if nr == NR_UTIMENSAT => sys_utimensat(req.args, ctx),
+        nr if nr == NR_RENAMEAT2 => sys_renameat2(req.args, ctx).await,
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -4804,4 +4827,649 @@ fn fs_ops_for_rnode(
     let weak = rnode.containing_mount_weak()?;
     let payload = weak.upgrade(&guard)?;
     Some(payload.fs_ops.clone())
+}
+
+// =====================================================================
+// Slice 8 of the shell-prompt roadmap — file-mutation syscalls.
+//
+// Coverage:
+//   - `sys_mkdirat` (NR_MKDIRAT = 34)
+//   - `sys_unlinkat` (NR_UNLINKAT = 35) — `AT_REMOVEDIR` switches
+//     between `FsOps::unlink` and `FsOps::rmdir`.
+//   - `sys_symlinkat` (NR_SYMLINKAT = 36)
+//   - `sys_linkat` (NR_LINKAT = 37) — same-FS hard link; cross-FS
+//     `EXDEV` is implicit (orphan dentries surface as `-EROFS`).
+//   - `sys_truncate` (NR_TRUNCATE = 45) — path-named PageBacked truncate.
+//   - `sys_ftruncate` (NR_FTRUNCATE = 46) — fd-named PageBacked truncate.
+//   - `sys_readlinkat` (NR_READLINKAT = 78) — walks parent directory
+//     and calls `FsOps::lookup` + `FsOps::read_link` so the symlink
+//     itself is returned (not its target).
+//   - `sys_utimensat` (NR_UTIMENSAT = 88) — returns `-ENOSYS` (no
+//     `FsOps::set_times` hook yet; deferred per slice plan).
+//   - `sys_renameat2` (NR_RENAMEAT2 = 276) — `RENAME_NOREPLACE`
+//     honoured via pre-walk; `RENAME_EXCHANGE` / `RENAME_WHITEOUT`
+//     return `-ENOSYS` / `-EINVAL`.
+//
+// Each path-relative arm restricts `dirfd` to `AT_FDCWD` (matches the
+// existing Slice 6 / Wave 4 Part 4 pattern; non-cwd dirfds map to
+// `-EBADF` until the fd table grows directory-fd semantics under
+// `TODO(phase-dirfd)`).
+//
+// Send-future discipline (`txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`):
+// `Guard` is `!Send + !Sync`. Each arm is `async` so it composes with
+// the dispatcher's `async fn`, but it never holds a `Guard` across an
+// `.await` — `step_walk` is polled synchronously through
+// `poll_walker_synchronously` (every in-tree walker resolves
+// immediately) and the `FsOps` step is invoked under a freshly-taken
+// guard inside the call site.
+//
+// See `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 8.
+// =====================================================================
+
+/// Walk `path` from `cwd` synchronously, returning the resolved
+/// dentry or a positive-magnitude `-errno`. Mirrors
+/// `resolve_path_at`'s shape but takes the cwd directly so callers
+/// that already hold it (every Slice 8 arm fetches it once for both
+/// the parent walk and the optional full walk) avoid the redundant
+/// `process.cwd()` lookup.
+fn walk_from(cwd: Cap<DEntry>, path: &[u8], cred: &Credential) -> Result<Cap<DEntry>, i32> {
+    let guard = tx_substrate::epoch::guard();
+    let outcome = poll_walker_synchronously(step_walk(cwd, path, cred, &guard));
+    drop(guard);
+    match outcome {
+        StepOutcome::Done(d) | StepOutcome::Advanced(d) => Ok(d),
+        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => Err(EIO_VALUE),
+        StepOutcome::Err(errno) => Err(errno_to_i32(errno)),
+    }
+}
+
+/// `mkdirat(dirfd, pathname, mode)`. Linux RV64 generic ABI
+/// `__NR_mkdirat = 34`.
+///
+/// Slice 8: `dirfd == AT_FDCWD` only. Walks the parent directory of
+/// `pathname` (split via [`split_path`]), then calls
+/// `FsOps::mkdir(parent, basename, mode & !umask, &cred, &guard)`.
+/// Empty paths and basenames surface as `-ENOENT` (let the FsOps
+/// surface canonicalise the error).
+async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let mode = args[2] as u16;
+    if dirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if path.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let cred = ctx.walker_cred();
+    let (parent_path, basename) = split_path(&path);
+    if basename.is_empty() {
+        // Trailing-slash-only basename, e.g. `mkdir("/")` — the FsOps
+        // layer rejects an empty `InlineName`. Linux's behaviour for
+        // `mkdir("/")` is `-EEXIST`; we surface the more conservative
+        // `-EINVAL` (matches `InlineName::new(b"")`'s rejection).
+        return SyscallResult::Error(EEXIST_VALUE);
+    }
+    let parent_dentry = if parent_path.is_empty() {
+        cwd
+    } else {
+        match walk_from(cwd, parent_path, &cred) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        }
+    };
+    let parent_id = parent_dentry.rnode().fs_object_id();
+    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
+        Some(o) => o,
+        None => return SyscallResult::Error(EROFS_VALUE),
+    };
+    // Apply umask: effective_mode = mode & !umask. Linux semantics
+    // (umask is the bottom 9 bits — `rwxrwxrwx`).
+    let umask = ctx.process.umask();
+    let effective_mode = mode & !umask & 0o7777;
+    let outcome = {
+        let guard = tx_substrate::epoch::guard();
+        fs_ops.mkdir(parent_id, basename, effective_mode, &cred, &guard)
+    };
+    match outcome {
+        StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
+        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            SyscallResult::Error(EIO_VALUE)
+        }
+        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+/// `unlinkat(dirfd, pathname, flags)`. Linux RV64 generic ABI
+/// `__NR_unlinkat = 35`.
+///
+/// Without `AT_REMOVEDIR` the arm dispatches through `FsOps::unlink`
+/// (rejects directory targets with `-EISDIR`); with `AT_REMOVEDIR` it
+/// dispatches through `FsOps::rmdir` (rejects non-directory targets
+/// with `-ENOTDIR`).
+async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let flags = args[2] as u32;
+    if dirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if path.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let cred = ctx.walker_cred();
+    let (parent_path, basename) = split_path(&path);
+    if basename.is_empty() {
+        return SyscallResult::Error(EISDIR_VALUE);
+    }
+    // Walk parent first so the parent FsOps is in scope. The full
+    // walk gives us the target's `FsObjectId` and inode kind so the
+    // arm can pick `unlink` vs `rmdir` correctly.
+    let parent_dentry = if parent_path.is_empty() {
+        cwd.clone()
+    } else {
+        match walk_from(cwd.clone(), parent_path, &cred) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        }
+    };
+    let target_dentry = match walk_from(cwd, &path, &cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
+    let parent_id = parent_dentry.rnode().fs_object_id();
+    let target_id = target_dentry.rnode().fs_object_id();
+    let target_kind = target_dentry.rnode().meta().kind();
+    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
+        Some(o) => o,
+        None => return SyscallResult::Error(EROFS_VALUE),
+    };
+    let want_rmdir = (flags & AT_REMOVEDIR) != 0;
+    if want_rmdir && target_kind != InodeKind::Directory {
+        return SyscallResult::Error(ENOTDIR_VALUE);
+    }
+    if !want_rmdir && target_kind == InodeKind::Directory {
+        return SyscallResult::Error(EISDIR_VALUE);
+    }
+    let outcome = {
+        let guard = tx_substrate::epoch::guard();
+        if want_rmdir {
+            fs_ops.rmdir(parent_id, basename, target_id, &guard)
+        } else {
+            fs_ops.unlink(parent_id, basename, target_id, &guard)
+        }
+    };
+    match outcome {
+        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
+        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            SyscallResult::Error(EIO_VALUE)
+        }
+        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+/// `symlinkat(target, newdirfd, linkpath)`. Linux RV64 generic ABI
+/// `__NR_symlinkat = 36`.
+///
+/// `target` is the symlink's textual content (no path resolution).
+/// `linkpath` is split into `(parent_path, basename)`; the parent is
+/// walked, then `FsOps::symlink(parent, basename, target, &cred,
+/// &guard)` is dispatched.
+async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let target_uaddr = args[0];
+    let newdirfd = args[1] as i32;
+    let linkpath_uaddr = args[2];
+    if newdirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let target = match read_user_cstr(target_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if target.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+    let linkpath = match read_user_cstr(linkpath_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if linkpath.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let cred = ctx.walker_cred();
+    let (parent_path, basename) = split_path(&linkpath);
+    if basename.is_empty() {
+        return SyscallResult::Error(EEXIST_VALUE);
+    }
+    let parent_dentry = if parent_path.is_empty() {
+        cwd
+    } else {
+        match walk_from(cwd, parent_path, &cred) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        }
+    };
+    let parent_id = parent_dentry.rnode().fs_object_id();
+    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
+        Some(o) => o,
+        None => return SyscallResult::Error(EROFS_VALUE),
+    };
+    let outcome = {
+        let guard = tx_substrate::epoch::guard();
+        fs_ops.symlink(parent_id, basename, &target, &cred, &guard)
+    };
+    match outcome {
+        StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
+        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            SyscallResult::Error(EIO_VALUE)
+        }
+        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+/// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)`. Linux RV64
+/// generic ABI `__NR_linkat = 37`.
+///
+/// Slice 8: same-filesystem hard link only — the existing tmpfs
+/// `FsOps::link` returns `-ENOSYS` for now (Phase 3b carryover), so
+/// this arm forwards whatever the FsOps surface produces. The
+/// `AT_SYMLINK_FOLLOW` flag bit is silently accepted; default
+/// (no-flag) Linux behaviour is "do not follow symlinks", but
+/// `step_walk` follows symlinks unconditionally — Slice 8 carries
+/// that limitation forward (deferred under `TODO(phase-linkat-nofollow)`).
+async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let olddirfd = args[0] as i32;
+    let oldpath_uaddr = args[1];
+    let newdirfd = args[2] as i32;
+    let newpath_uaddr = args[3];
+    let _flags = args[4] as u32;
+    if olddirfd != AT_FDCWD || newdirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let oldpath = match read_user_cstr(oldpath_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if oldpath.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+    let newpath = match read_user_cstr(newpath_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if newpath.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let cred = ctx.walker_cred();
+    // Walk source → target FsObjectId. Linux rejects directories
+    // here as `-EPERM` (no hard-linking directories).
+    let source_dentry = match walk_from(cwd.clone(), &oldpath, &cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
+    if source_dentry.rnode().meta().kind() == InodeKind::Directory {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+    let source_id = source_dentry.rnode().fs_object_id();
+    // Walk new path's parent directory.
+    let (new_parent_path, new_basename) = split_path(&newpath);
+    if new_basename.is_empty() {
+        return SyscallResult::Error(EEXIST_VALUE);
+    }
+    let new_parent_dentry = if new_parent_path.is_empty() {
+        cwd
+    } else {
+        match walk_from(cwd.clone(), new_parent_path, &cred) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        }
+    };
+    let new_parent_id = new_parent_dentry.rnode().fs_object_id();
+    let fs_ops = match fs_ops_for_dentry(&new_parent_dentry) {
+        Some(o) => o,
+        None => return SyscallResult::Error(EROFS_VALUE),
+    };
+    let outcome = {
+        let guard = tx_substrate::epoch::guard();
+        fs_ops.link(new_parent_id, new_basename, source_id, &guard)
+    };
+    match outcome {
+        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
+        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            SyscallResult::Error(EIO_VALUE)
+        }
+        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+/// `truncate(path, length)`. Linux RV64 generic ABI
+/// `__NR_truncate = 45`.
+///
+/// Walks the path to the regular file, validates the backing is
+/// `RNodeBacking::PageBacked`, then dispatches to
+/// [`tx_subsystems::page_backed::step_truncate`]. Non-page-backed
+/// rnodes (directories, TTYs, char devices, pipes, projected) surface
+/// as `-EINVAL` per the step body's own contract.
+async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let path_uaddr = args[0];
+    let new_size = args[1];
+    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if path.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let cred = ctx.walker_cred();
+    let dentry = match walk_from(cwd, &path, &cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
+    let pc = match dentry.rnode().backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        RNodeBacking::Directory => return SyscallResult::Error(EISDIR_VALUE),
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let outcome = {
+        let guard = tx_substrate::epoch::guard();
+        tx_subsystems::page_backed::step_truncate(&pc, new_size, &guard)
+    };
+    match outcome {
+        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
+        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            SyscallResult::Error(EIO_VALUE)
+        }
+        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+/// `ftruncate(fd, length)`. Linux RV64 generic ABI
+/// `__NR_ftruncate = 46`.
+///
+/// Resolves `fd` against the per-process fd table and dispatches to
+/// [`tx_subsystems::page_backed::step_truncate`] against
+/// the OpenFile's PageBacked container. Non-page-backed fds surface as
+/// `-EINVAL` (matches Linux for char devices, sockets, pipes); a fd
+/// pointing at a directory backing returns `-EISDIR`.
+fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i32;
+    let new_size = args[1];
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let pc = match file.rnode().backing() {
+        RNodeBacking::PageBacked { pc } => pc.clone(),
+        RNodeBacking::Directory => return SyscallResult::Error(EISDIR_VALUE),
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let outcome = {
+        let guard = tx_substrate::epoch::guard();
+        tx_subsystems::page_backed::step_truncate(&pc, new_size, &guard)
+    };
+    match outcome {
+        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
+        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            SyscallResult::Error(EIO_VALUE)
+        }
+        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+/// `readlinkat(dirfd, pathname, buf, bufsiz)`. Linux RV64 generic ABI
+/// `__NR_readlinkat = 78`.
+///
+/// `step_walk` follows symlinks unconditionally, so the arm cannot
+/// reuse the standard walker for the terminal component. Instead it
+/// walks `pathname`'s **parent** directory and consults
+/// `FsOps::lookup` against the basename to obtain the symlink's
+/// `FsObjectId` without materialising it through the walker's
+/// symlink-chase loop. The bytes returned by `FsOps::read_link` are
+/// then copied into the user buffer (capped at `bufsiz`); the
+/// non-terminator byte count is returned.
+///
+/// `bufsiz == 0` returns `-EINVAL` (Linux semantic). A null `buf`
+/// surfaces as `-EFAULT`. A non-symlink target returns `-EINVAL`
+/// (POSIX `readlink(2)` shape).
+async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let buf_uaddr = args[2];
+    let buf_len = args[3] as usize;
+    if dirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if buf_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if buf_len == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let path = match read_user_cstr(path_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if path.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let cred = ctx.walker_cred();
+    let (parent_path, basename) = split_path(&path);
+    if basename.is_empty() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let parent_dentry = if parent_path.is_empty() {
+        cwd
+    } else {
+        match walk_from(cwd, parent_path, &cred) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        }
+    };
+    let parent_id = parent_dentry.rnode().fs_object_id();
+    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
+        Some(o) => o,
+        None => return SyscallResult::Error(ENOSYS_VALUE),
+    };
+    // Resolve the basename in the parent directly via `FsOps::lookup`
+    // — bypasses the walker's symlink-chase loop so the symlink's
+    // own inode (not its target's) is what we read.
+    let target_id = {
+        let guard = tx_substrate::epoch::guard();
+        match fs_ops.lookup(parent_id, basename, &guard) {
+            StepOutcome::Done(id) | StepOutcome::Advanced(id) => id,
+            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    };
+    let target_meta = {
+        let guard = tx_substrate::epoch::guard();
+        match fs_ops.load_inode_meta(target_id, &guard) {
+            StepOutcome::Done(m) | StepOutcome::Advanced(m) => m,
+            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    };
+    if target_meta.kind() != InodeKind::Symlink {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let link_bytes = {
+        let guard = tx_substrate::epoch::guard();
+        match fs_ops.read_link(target_id, &guard) {
+            StepOutcome::Done(b) | StepOutcome::Advanced(b) => b,
+            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    };
+    let to_copy = core::cmp::min(link_bytes.len(), buf_len);
+    // SAFETY: bootstrap kernel-buffer exemption (TODO: phase-userva).
+    // Mirrors the `getcwd` / `pipe2` writeback discipline.
+    unsafe {
+        let dst = buf_uaddr as usize as *mut u8;
+        for (i, b) in link_bytes[..to_copy].iter().enumerate() {
+            core::ptr::write_volatile(dst.add(i), *b);
+        }
+    }
+    SyscallResult::Return(to_copy as i64)
+}
+
+/// `utimensat(dirfd, pathname, times, flags)`. Linux RV64 generic ABI
+/// `__NR_utimensat = 88`.
+///
+/// Slice 8: returns `-ENOSYS`. The `FsOps` surface does not yet expose
+/// a `set_times` hook (`InodeMeta` carries `atime`/`mtime`/`ctime`
+/// fields, but the backend trait has no method to mutate them).
+/// Most shells ignore `utimensat` failures — the deferred
+/// implementation is documented under
+/// `TODO(phase-vfs-utimens)` in the slice plan.
+fn sys_utimensat<'a>(_args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+/// `renameat2(olddirfd, oldpath, newdirfd, newpath, flags)`. Linux RV64
+/// generic ABI `__NR_renameat2 = 276`.
+///
+/// Slice 8 surface:
+/// - `dirfd != AT_FDCWD` → `-EBADF`.
+/// - `RENAME_EXCHANGE` → `-ENOSYS` (no atomic-swap surface yet).
+/// - `RENAME_WHITEOUT` → `-EINVAL` (recognised but unsupported).
+/// - Unknown flag bits → `-EINVAL`.
+/// - `RENAME_NOREPLACE` honoured via a pre-walk: if `newpath`
+///   resolves successfully, the arm short-circuits with `-EEXIST`.
+///
+/// The dispatch routes through `FsOps::rename(old_parent, old_name,
+/// new_parent, new_name, &guard)`. The in-tree tmpfs surface only
+/// supports same-directory rename today; cross-directory rename
+/// surfaces as `-ENOSYS` from the backend.
+async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let olddirfd = args[0] as i32;
+    let oldpath_uaddr = args[1];
+    let newdirfd = args[2] as i32;
+    let newpath_uaddr = args[3];
+    let flags = args[4] as u32;
+    if olddirfd != AT_FDCWD || newdirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    // Validate flags. RENAME_EXCHANGE → ENOSYS (atomic swap unsupported).
+    // RENAME_WHITEOUT and any unrecognised bits → EINVAL.
+    if (flags & RENAME_EXCHANGE) != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+    let recognised = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
+    if (flags & !recognised) != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if (flags & RENAME_WHITEOUT) != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let oldpath = match read_user_cstr(oldpath_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if oldpath.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+    let newpath = match read_user_cstr(newpath_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    if newpath.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let cred = ctx.walker_cred();
+    let (old_parent_path, old_basename) = split_path(&oldpath);
+    let (new_parent_path, new_basename) = split_path(&newpath);
+    if old_basename.is_empty() || new_basename.is_empty() {
+        return SyscallResult::Error(EISDIR_VALUE);
+    }
+    let old_parent_dentry = if old_parent_path.is_empty() {
+        cwd.clone()
+    } else {
+        match walk_from(cwd.clone(), old_parent_path, &cred) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        }
+    };
+    let new_parent_dentry = if new_parent_path.is_empty() {
+        cwd.clone()
+    } else {
+        match walk_from(cwd.clone(), new_parent_path, &cred) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        }
+    };
+    // RENAME_NOREPLACE pre-check: walk the full new path; if it
+    // resolves, the rename must fail with -EEXIST (Linux semantic).
+    if (flags & RENAME_NOREPLACE) != 0 {
+        if walk_from(cwd, &newpath, &cred).is_ok() {
+            return SyscallResult::Error(EEXIST_VALUE);
+        }
+    }
+    let old_parent_id = old_parent_dentry.rnode().fs_object_id();
+    let new_parent_id = new_parent_dentry.rnode().fs_object_id();
+    let fs_ops = match fs_ops_for_dentry(&old_parent_dentry) {
+        Some(o) => o,
+        None => return SyscallResult::Error(EROFS_VALUE),
+    };
+    let outcome = {
+        let guard = tx_substrate::epoch::guard();
+        fs_ops.rename(
+            old_parent_id,
+            old_basename,
+            new_parent_id,
+            new_basename,
+            &guard,
+        )
+    };
+    match outcome {
+        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
+        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            SyscallResult::Error(EIO_VALUE)
+        }
+        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
 }
