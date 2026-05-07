@@ -1,6 +1,9 @@
 # fd ops slice + drift cleanup
 
-**Status:** proposed (planning only).
+**Status:** complete (2026-05-07). Decision note:
+[`docs/progress/decisions/2026-05-07-fd-ops-and-drift-cleanup.md`](../decisions/2026-05-07-fd-ops-and-drift-cleanup.md).
+4 fd-ops waves + drift cleanup chore + CSPRNG prerequisite chore
+shipped on `feat/fd-ops`. Workspace 984 / 984 lib+tests green.
 
 Closes the biggest remaining unblock for booting a real shell — the
 trio's fixed 8-slot `[Option<Cap<OpenFile>>; 8]` fd table plus the
