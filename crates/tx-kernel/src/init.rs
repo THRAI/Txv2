@@ -441,7 +441,8 @@ impl<P: TxPlatform> CoreInit<P> {
         // tmpfs instance whose `FsOps::mkdir` actually mutates the
         // tmpfs directory map.
         let guard = tx_substrate::epoch::guard();
-        let cred = Credential::default();
+        // Bootstrap path runs as root by construction.
+        let cred = Credential::root();
         let (dev_object_id, dev_meta) = match root_mount.payload().fs_ops.mkdir(
             tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
             b"dev",
@@ -647,8 +648,8 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let bytes = &init_fixture::INIT_FIXTURE_BYTES[..];
 
-        // Allocate the inode.
-        let cred = Credential::default();
+        // Allocate the inode. Bootstrap process is root by construction.
+        let cred = Credential::root();
         let (file_id, file_meta) = {
             let guard = tx_substrate::epoch::guard();
             let outcome = fs_ops.create_inode(root_object_id, b"init", 0o100755, &cred, &guard);
@@ -738,7 +739,8 @@ impl<P: TxPlatform> CoreInit<P> {
             .nth_thread(0)
             .expect("drive_bootstrap_exec: init has a leader thread post-bootstrap");
 
-        let cred = Credential::default();
+        // Bootstrap exec runs as init (root) by construction.
+        let cred = Credential::root();
         let argv: &[&[u8]] = &[b"init" as &[u8]];
         let envp: &[&[u8]] = &[];
 

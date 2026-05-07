@@ -9,6 +9,7 @@
 
 use alloc::boxed::Box;
 
+use crate::cred::{CapabilitySet, Cred};
 use crate::device::CharDeviceBinding;
 use crate::execution::Errno;
 use crate::mount::{MountIdentity, MountPayload};
@@ -59,10 +60,60 @@ impl FsObjectId {
     }
 }
 
+/// Walker-side projection of a process's credential. Carries only the
+/// fields VFS permission checks need: the **effective** uid/gid and
+/// the effective capability set (`CAP_DAC_OVERRIDE` short-circuit).
+///
+/// `Credential::default()` is no longer "root"-equivalent: it produces
+/// `{ uid: 0, gid: 0, effective_caps: CapabilitySet::EMPTY }`. The
+/// uid happens to be 0 because that is the `Default::default()` for
+/// `u32`, but with no capabilities the walker treats this as an
+/// unprivileged caller (Wave 3, when the DAC predicate lands; today
+/// the walker still allows everything, but the field is in place so
+/// Wave 3 has a stable seam). Production paths that *do* want a
+/// root-equivalent walker cred must call [`Credential::root`].
+///
+/// See `txdoc:VFS-CHECKS-PERMISSIONS-1` for the walker-side
+/// permission contract.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Credential {
     pub uid: u32,
     pub gid: u32,
+    /// Effective capability set. The walker consults
+    /// `CAP_DAC_OVERRIDE` here (Wave 3) without re-locking the
+    /// per-process `Cred`.
+    pub effective_caps: CapabilitySet,
+}
+
+impl Credential {
+    /// Root walker credential: uid 0, gid 0, all capabilities. Use in
+    /// bootstrap paths where the caller is root by construction
+    /// (e.g. `init`'s pre-userspace bring-up). Distinct from
+    /// `Credential::default()`, which post-Wave-1 is no longer
+    /// root-equivalent.
+    pub const fn root() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            effective_caps: CapabilitySet::FULL,
+        }
+    }
+}
+
+/// Project a full `Cred` onto the walker-side `Credential`. Per the
+/// POSIX path-resolution rule, DAC checks consult the **effective**
+/// uid/gid (not the real uid/gid); see `man 2 path_resolution` and
+/// `man 2 chmod`. The `permitted_caps` set is intentionally dropped:
+/// it has no walker-side use today, and the bridge keeps the walker
+/// type lean.
+impl From<&Cred> for Credential {
+    fn from(cred: &Cred) -> Self {
+        Self {
+            uid: cred.euid.raw(),
+            gid: cred.egid.raw(),
+            effective_caps: cred.effective_caps,
+        }
+    }
 }
 
 // === inode metadata + POSIX mode constants ============================
