@@ -107,7 +107,6 @@ impl ConsoleIf for IrqTestPlatform {
 }
 
 impl tx_hal::TrapIf for IrqTestPlatform {}
-impl tx_hal::UserAccessIf for IrqTestPlatform {}
 impl tx_hal::SignalFrameIf for IrqTestPlatform {}
 
 impl IrqIf for IrqTestPlatform {

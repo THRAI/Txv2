@@ -5,8 +5,8 @@
 //! pull a small, kernel-side-bounded byte slice (the ELF header, the
 //! program-header table) out of a file-backed `PageContainer` *before* an
 //! `AddressSpace` exists for the new image. `step_read_to_user` and
-//! `step_write_from_user` go through `UserAccessIf`; this primitive is
-//! their kernel-buffer cousin.
+//! `step_write_from_user` go through `AddressSpace::copy_*_user`; this
+//! primitive is their kernel-buffer cousin.
 //!
 //! The function walks page-rounded chunks of `out`, materialises each
 //! page on demand through the existing `PageContainer::materialize_page`

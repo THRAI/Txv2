@@ -173,7 +173,6 @@ impl tx_hal::TrapIf for TestPlatform {
         std::panic::panic_any(SMOKE_YIELD_PANIC);
     }
 }
-impl tx_hal::UserAccessIf for TestPlatform {}
 impl tx_hal::SignalFrameIf for TestPlatform {}
 impl tx_hal::IrqIf for TestPlatform {}
 

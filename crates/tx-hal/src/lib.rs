@@ -802,43 +802,8 @@ unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
 unsafe impl Pod for UserTrapContext {}
 
 // ---------------------------------------------------------------------------
-// KernelPtr<T> and UserPtr<T> — typed address-space wrappers
+// UserPtr<T> — typed user-VA wrapper
 // ---------------------------------------------------------------------------
-
-/// A typed pointer into kernel virtual address space.
-///
-/// Prevents accidental use of user-space addresses where kernel addresses
-/// are expected. Constructing a `KernelPtr<T>` is `unsafe` because the
-/// caller must ensure the underlying pointer is valid kernel memory.
-#[repr(transparent)]
-pub struct KernelPtr<T>(*mut T);
-
-impl<T> KernelPtr<T> {
-    /// Wrap a raw kernel pointer.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must be a valid kernel virtual address that remains live for the
-    /// duration of its use through this `KernelPtr`.
-    pub unsafe fn new(ptr: *mut T) -> Self {
-        Self(ptr)
-    }
-
-    pub fn as_ptr(self) -> *mut T {
-        self.0
-    }
-}
-
-impl<T> Copy for KernelPtr<T> {}
-impl<T> Clone for KernelPtr<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-// SAFETY: same restrictions as *mut T — use is guarded by the caller.
-unsafe impl<T: Send> Send for KernelPtr<T> {}
-unsafe impl<T: Sync> Sync for KernelPtr<T> {}
 
 /// A typed pointer into the current process's user virtual address space.
 ///
@@ -886,129 +851,6 @@ impl<T> Eq for UserPtr<T> {}
 
 unsafe impl<T: Send> Send for UserPtr<T> {}
 unsafe impl<T: Sync> Sync for UserPtr<T> {}
-
-// ---------------------------------------------------------------------------
-// FixupEntry — describes one faulting-PC range and its recovery label
-// ---------------------------------------------------------------------------
-
-/// Describes a kernel-mode user-access PC range and its recovery stub.
-///
-/// When the trap shell sees a kernel-mode page fault whose `sepc` falls in
-/// `[pc_start, pc_end)`, it redirects execution to `recovery_pc` and places
-/// the fault address in the platform's agreed error register so the recovery
-/// stub can return an `Err(FaultInfo)` to its caller.
-#[repr(C)]
-pub struct FixupEntry {
-    /// First PC (inclusive) of the faulting instruction range.
-    pub pc_start: VirtAddr,
-    /// First PC (exclusive) past the faulting instruction range.
-    pub pc_end: VirtAddr,
-    /// PC of the recovery stub to jump to on fault.
-    pub recovery_pc: VirtAddr,
-}
-
-// ---------------------------------------------------------------------------
-// UserAccessIf
-// ---------------------------------------------------------------------------
-
-pub trait UserAccessIf {
-    /// Copy `len` bytes from user-space address `src` to kernel address `dst`.
-    ///
-    /// Returns `Ok(())` on success, or `Err(FaultInfo)` describing the
-    /// kernel-mode page fault that occurred (callers should propagate as
-    /// `EFAULT`).  The default implementation always returns `Err` for any
-    /// non-zero `len`; platforms override it with architecture-specific
-    /// assembly backed by a fixup table.
-    ///
-    /// # Safety
-    ///
-    /// * `dst` must be a valid, writable kernel pointer for `len` bytes.
-    /// * `src` is interpreted in the currently installed user page table.
-    /// * The platform's fixup table must be fully populated before this is
-    ///   called (guaranteed after `init_early` returns).
-    unsafe fn copy_from_user(
-        dst: KernelPtr<u8>,
-        src: UserPtr<u8>,
-        len: usize,
-    ) -> Result<(), FaultInfo> {
-        let _ = dst;
-        if len == 0 {
-            return Ok(());
-        }
-        Err(FaultInfo {
-            address: VirtAddr(src.addr()),
-            write: false,
-            instruction: false,
-            from_user: false,
-        })
-    }
-
-    /// Copy `len` bytes from kernel address `src` to user-space address `dst`.
-    ///
-    /// Returns `Ok(())` on success, or `Err(FaultInfo)` on kernel-mode fault.
-    ///
-    /// # Safety
-    ///
-    /// * `src` must be a valid, readable kernel pointer for `len` bytes.
-    /// * `dst` is interpreted in the currently installed user page table.
-    unsafe fn copy_to_user(
-        dst: UserPtr<u8>,
-        src: KernelPtr<u8>,
-        len: usize,
-    ) -> Result<(), FaultInfo> {
-        let _ = src;
-        if len == 0 {
-            return Ok(());
-        }
-        Err(FaultInfo {
-            address: VirtAddr(dst.addr()),
-            write: true,
-            instruction: false,
-            from_user: false,
-        })
-    }
-
-    /// Read a `Pod` value from user space.
-    ///
-    /// Implemented via [`copy_from_user`](UserAccessIf::copy_from_user) by
-    /// default; platforms may override for optimized single-instruction paths.
-    ///
-    /// # Safety
-    ///
-    /// `src` is interpreted in the currently installed user page table.
-    unsafe fn read_user<T: Pod>(src: UserPtr<T>) -> Result<T, FaultInfo> {
-        let mut val = core::mem::MaybeUninit::<T>::uninit();
-        // SAFETY: val is valid kernel stack memory; copy_from_user reads into it.
-        unsafe {
-            Self::copy_from_user(
-                KernelPtr::new(val.as_mut_ptr().cast::<u8>()),
-                UserPtr::new(src.addr()),
-                core::mem::size_of::<T>(),
-            )?;
-            Ok(val.assume_init())
-        }
-    }
-
-    /// Write a `Pod` value to user space.
-    ///
-    /// Implemented via [`copy_to_user`](UserAccessIf::copy_to_user) by default.
-    ///
-    /// # Safety
-    ///
-    /// `dst` is interpreted in the currently installed user page table.
-    unsafe fn write_user<T: Pod>(dst: UserPtr<T>, value: T) -> Result<(), FaultInfo> {
-        // SAFETY: value is on the kernel stack and lives for the duration of
-        // copy_to_user; cast_mut is safe because copy_to_user only reads from
-        // the kernel source pointer.
-        unsafe {
-            Self::copy_to_user(
-                UserPtr::new(dst.addr()),
-                KernelPtr::new(core::ptr::addr_of!(value).cast_mut().cast::<u8>()),
-                core::mem::size_of::<T>(),
-            )
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // SignalFrameIf
@@ -1077,7 +919,7 @@ pub struct SavedSignalFrame {
 
 unsafe impl Pod for SavedSignalFrame {}
 
-pub trait SignalFrameIf: TrapIf + UserAccessIf {
+pub trait SignalFrameIf: TrapIf {
     fn write_signal_frame(
         tf: TrapFrameMut<'_>,
         setup: SignalFrameWrite,
@@ -1406,7 +1248,6 @@ pub trait TxPlatform:
     + ConsoleIf
     + PmapIf
     + TrapIf
-    + UserAccessIf
     + SignalFrameIf
     + IrqIf
     + TimeIf
@@ -1430,7 +1271,6 @@ impl<T> TxPlatform for T where
         + ConsoleIf
         + PmapIf
         + TrapIf
-        + UserAccessIf
         + SignalFrameIf
         + IrqIf
         + TimeIf

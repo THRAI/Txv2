@@ -80,7 +80,10 @@ inline, or treat user buffers as ordinary Rust references.
 When bytes move:
 
 - user buffers arrive as typed user-buffer/user-pointer values owned by the
-  syscall and `UserAccessIf` discipline;
+  syscall, then move through the eager-walk
+  `AddressSpace::copy_*_user` methods (which materialise each user
+  page through its `VmEntry.backing` and copy through the kernel
+  direct-map view);
 - page content is reached by asking PAGE_SUBSTRATE/VM helpers for a direct-map
   copy source/destination or by materializing a Frame for pmap installation;
 - device-backed page containers may carry device `Ppn` facts, but those facts

@@ -9,8 +9,8 @@ use tx_hal::{
     EntropyIf, InitIf, IpiKind, IrqIf, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion,
     PercpuIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf,
     PmapInvalidation, PmapReservation, PmapReserveKind, PowerIf, PtNode, PtNodeAllocator,
-    SecondaryEntry, SignalFrameIf, SmpIf, TimeIf, TrapClass, TrapFrameSnapshot, TrapIf,
-    UserAccessIf, VirtAddr, VirtRange,
+    SecondaryEntry, SignalFrameIf, SmpIf, TimeIf, TrapClass, TrapFrameSnapshot, TrapIf, VirtAddr,
+    VirtRange,
 };
 
 use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -360,7 +360,6 @@ impl TrapIf for Platform {
         classify_la64_trap(snapshot.scause)
     }
 }
-impl UserAccessIf for Platform {}
 impl SignalFrameIf for Platform {}
 impl IrqIf for Platform {}
 impl TimeIf for Platform {
