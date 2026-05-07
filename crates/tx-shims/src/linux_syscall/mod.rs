@@ -47,6 +47,10 @@ use tx_hal::PmapIf;
 use tx_reactor::userspace::SyscallRequest;
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_substrate::zone::Cap;
+use tx_subsystems::cred::{
+    step_setgid, step_setregid, step_setresgid, step_setresuid, step_setreuid, step_setuid, Cred,
+    CredChange, Gid, Uid,
+};
 use tx_subsystems::execution::{Errno, StepOutcome};
 use tx_subsystems::process::{
     seed_child_leader_context, step_exit_group, step_fork, step_setpgid, step_setsid,
@@ -71,9 +75,10 @@ mod tests;
 
 pub use numbers::{
     FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FCNTL,
-    NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETSID, NR_READ, NR_RT_SIGACTION,
-    NR_RT_SIGPROCMASK, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WAIT4,
-    NR_WRITE, O_CLOEXEC, SIGCHLD, WNOHANG,
+    NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRESGID,
+    NR_GETRESUID, NR_GETSID, NR_GETUID, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SETGID,
+    NR_SETPGID, NR_SETREGID, NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID,
+    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_WAIT4, NR_WRITE, O_CLOEXEC, SIGCHLD, WNOHANG,
 };
 
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
@@ -224,6 +229,42 @@ impl<'a> SyscallCtx<'a> {
             _lifetime: core::marker::PhantomData,
         }
     }
+
+    /// Snapshot the current process's full credential.
+    ///
+    /// Returns a fresh [`Cred`] value (`Copy`); the payload's
+    /// `SpinMutex<Cred>` is acquired once and released before return,
+    /// so the snapshot is independent of the lock and safe to hold
+    /// across `.await` points. Holding a reference into the lock
+    /// would be unsound — `step_setuid` / `step_setresuid` etc. can
+    /// mutate the cred while a syscall arm is `.await`-ing.
+    ///
+    /// Falls back to [`Cred::root`] for zombies (impossible in
+    /// practice from inside a live syscall arm — the caller is by
+    /// definition alive). The defensive default keeps every
+    /// downstream arm's signature noise-free; callers that need to
+    /// distinguish zombie vs. alive use `ctx.process.is_zombie()`
+    /// directly.
+    ///
+    /// Companion to [`Self::walker_cred`] (the walker-side
+    /// projection consumed by VFS path resolution).
+    pub fn cred(&self) -> Cred {
+        self.process.cred().unwrap_or_else(Cred::root)
+    }
+
+    /// Walker-side projection of the current cred. Builds a fresh
+    /// [`Credential`] from `self.cred()` via the
+    /// `From<&Cred> for Credential` bridge (Wave 1) — uses **euid**
+    /// and **egid** (the POSIX rule for DAC checks), and forwards
+    /// `effective_caps` so the walker can short-circuit on
+    /// `CAP_DAC_OVERRIDE` without re-locking the per-process cred.
+    ///
+    /// Returned by value (never as a reference into the lock) so the
+    /// snapshot can be held across `.await` points in callers like
+    /// `sys_execve` that drive the multi-phase `exec_script`.
+    pub fn walker_cred(&self) -> Credential {
+        Credential::from(&self.cred())
+    }
 }
 
 /// Outcome of a syscall dispatch.
@@ -291,6 +332,21 @@ pub async fn dispatch<'a, P: PmapIf>(req: SyscallRequest, ctx: &SyscallCtx<'a>) 
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args),
+        // Wave 2 of the DAC + setuid slice — Part 3 (cred-mutation /
+        // cred-reading arms). Each wraps a Wave 1 `cred::step_*`
+        // helper through the new `ctx.cred()` accessor.
+        nr if nr == NR_GETUID => sys_getuid(ctx),
+        nr if nr == NR_GETEUID => sys_geteuid(ctx),
+        nr if nr == NR_GETGID => sys_getgid(ctx),
+        nr if nr == NR_GETEGID => sys_getegid(ctx),
+        nr if nr == NR_SETUID => sys_setuid(req.args, ctx),
+        nr if nr == NR_SETGID => sys_setgid(req.args, ctx),
+        nr if nr == NR_SETREUID => sys_setreuid(req.args, ctx),
+        nr if nr == NR_SETREGID => sys_setregid(req.args, ctx),
+        nr if nr == NR_SETRESUID => sys_setresuid(req.args, ctx),
+        nr if nr == NR_SETRESGID => sys_setresgid(req.args, ctx),
+        nr if nr == NR_GETRESUID => sys_getresuid(req.args, ctx),
+        nr if nr == NR_GETRESGID => sys_getresgid(req.args, ctx),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -869,13 +925,13 @@ async fn sys_execve<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let argv_slices: Vec<&[u8]> = argv_buf.iter().map(|s| s.as_slice()).collect();
     let envp_slices: Vec<&[u8]> = envp_buf.iter().map(|s| s.as_slice()).collect();
 
-    // Wave 2 (cred-on-ctx) replaces this with `ctx.walker_cred()`.
-    // For Wave 1, the bootstrap process is `init` (root), so a
-    // root-equivalent walker cred preserves the trio + post-trio
-    // smoke baselines through the `Credential::default()` semantic
-    // flip in Wave 1.
-    // TODO(wave-2-cred-on-ctx): consume cred from ctx.
-    let cred = Credential::root();
+    // Wave 2 (cred-on-ctx): consume the caller's cred through
+    // `ctx.walker_cred()`. The walker projection uses euid/egid +
+    // effective_caps per the POSIX DAC rule (Wave 1's
+    // `From<&Cred> for Credential` bridge). `init.rs`'s bootstrap
+    // exec stays on `Credential::root()` because it runs outside a
+    // `SyscallCtx` (kernel-side bootstrap path).
+    let cred = ctx.walker_cred();
 
     let outcome = exec_script::<P>(
         &ctx.process,
@@ -1410,5 +1466,208 @@ fn sys_set_tid_address<'a>(_args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 /// TODO(phase-futex): register the robust-list head per-thread once
 /// futex infrastructure lands.
 fn sys_set_robust_list(_args: [u64; 6]) -> SyscallResult {
+    SyscallResult::Return(0)
+}
+
+// =====================================================================
+// Wave 2 of the DAC + setuid slice — Part 3 (process-side cred-mutation
+// / cred-reading syscall arms). Each arm reads the caller's cred via
+// `ctx.cred()` (Part 7) for the privilege check; setters wrap the
+// already-shipping `tx_subsystems::cred::step_set*` family (Wave 1) and
+// translate the Linux `(u32) -1` ("leave unchanged") sentinel to
+// `Option::None` before calling.
+//
+// The translation `u32::MAX → None` is overflow-safe: userspace passes
+// a `uid_t` (`u32`) sign-extended from the i32 sentinel, so `(u32) -1`
+// arrives in our `args[i]` as `u32::MAX = 0xFFFF_FFFF`. The pattern
+// `if v == u32::MAX { None } else { Some(Uid::new(v)) }` never reaches
+// `Uid::new(u32::MAX)` for the sentinel branch and never wraps.
+//
+// See `docs/progress/plans/2026-05-06-dac-and-setuid.md` Part 3 and
+// `txdoc:PROCESS-CREDENTIAL-SERVICE-DRAFT-1`.
+// =====================================================================
+
+/// Translate the Linux `(u32) -1 == u32::MAX` "leave unchanged"
+/// sentinel into `Option::None`. Used by every two- and three-arg
+/// setter (`setre{u,g}id`, `setres{u,g}id`).
+///
+/// Userspace passes `uid_t` (an unsigned 32-bit type), so the
+/// `setresuid(-1, -1, -1)` call shape arrives in the kernel with each
+/// arg holding `0xFFFF_FFFF`. Decoding to `Option::None` lets the
+/// `cred::step_set*` family receive a clean "leave the corresponding
+/// field alone" signal without any further sign-extension dance.
+const UID_LEAVE_UNCHANGED: u32 = u32::MAX;
+
+#[inline]
+fn decode_uid_arg(raw: u32) -> Option<Uid> {
+    if raw == UID_LEAVE_UNCHANGED {
+        None
+    } else {
+        Some(Uid(raw))
+    }
+}
+
+#[inline]
+fn decode_gid_arg(raw: u32) -> Option<Gid> {
+    if raw == UID_LEAVE_UNCHANGED {
+        None
+    } else {
+        Some(Gid(raw))
+    }
+}
+
+/// Map a `CredChange` outcome from a setter helper to the dispatched
+/// `SyscallResult`. `Replaced` → `Return(0)`; `PermissionDenied` →
+/// `-EPERM`; `Zombie` → `-ESRCH` (impossible in practice — the caller
+/// is by definition alive — but defensive).
+fn cred_change_to_result(change: CredChange) -> SyscallResult {
+    match change {
+        CredChange::Replaced { .. } => SyscallResult::Return(0),
+        CredChange::PermissionDenied => SyscallResult::Error(EPERM_VALUE),
+        CredChange::Zombie => SyscallResult::Error(ESRCH_VALUE),
+    }
+}
+
+/// `getuid()`. Linux RV64 generic ABI `__NR_getuid`. Returns the
+/// caller's real uid. Reads `ctx.cred()` once; no `.await`, no
+/// privilege check (everyone can read their own uid).
+fn sys_getuid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SyscallResult::Return(ctx.cred().uid.raw() as i64)
+}
+
+/// `geteuid()`. Linux RV64 generic ABI `__NR_geteuid`. Returns the
+/// caller's effective uid.
+fn sys_geteuid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SyscallResult::Return(ctx.cred().euid.raw() as i64)
+}
+
+/// `getgid()`. Linux RV64 generic ABI `__NR_getgid`. Returns the
+/// caller's real gid.
+fn sys_getgid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SyscallResult::Return(ctx.cred().gid.raw() as i64)
+}
+
+/// `getegid()`. Linux RV64 generic ABI `__NR_getegid`. Returns the
+/// caller's effective gid.
+fn sys_getegid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SyscallResult::Return(ctx.cred().egid.raw() as i64)
+}
+
+/// `setuid(uid)`. Wraps `cred::step_setuid` (Wave 1).
+///
+/// Privileged callers (`euid == 0` or `CAP_SETUID`) get all four of
+/// `uid`, `euid`, `suid` set to `uid`. Non-privileged callers may
+/// only swap `euid` among `(uid, euid, suid)`; any other target
+/// returns `-EPERM`.
+fn sys_setuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let target = Uid(args[0] as u32);
+    cred_change_to_result(step_setuid(&ctx.process, target))
+}
+
+/// `setgid(gid)`. Wraps `cred::step_setgid` (Wave 1). Same privilege
+/// rules as `setuid` applied to the gid family.
+fn sys_setgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let target = Gid(args[0] as u32);
+    cred_change_to_result(step_setgid(&ctx.process, target))
+}
+
+/// `setreuid(ruid, euid)`. Wraps `cred::step_setreuid` (Wave 1).
+///
+/// Each argument: `(u32) -1` (= `u32::MAX`) means "leave unchanged".
+/// Privileged callers may set arbitrary values. Non-privileged
+/// callers must each (when not the sentinel) supply a value
+/// currently in `{uid, euid, suid}`. Linux quirk: when `ruid` is
+/// supplied OR the post-call `euid` differs from the pre-call real
+/// uid, the saved-set `suid` is bumped to the post-call effective
+/// uid (the rule that distinguishes `setreuid` from `setresuid`).
+fn sys_setreuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let ruid = decode_uid_arg(args[0] as u32);
+    let euid = decode_uid_arg(args[1] as u32);
+    cred_change_to_result(step_setreuid(&ctx.process, ruid, euid))
+}
+
+/// `setregid(rgid, egid)`. Gid analog of `sys_setreuid`. Wraps
+/// `cred::step_setregid` (Wave 1).
+fn sys_setregid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let rgid = decode_gid_arg(args[0] as u32);
+    let egid = decode_gid_arg(args[1] as u32);
+    cred_change_to_result(step_setregid(&ctx.process, rgid, egid))
+}
+
+/// `setresuid(ruid, euid, suid)`. Wraps `cred::step_setresuid`
+/// (Wave 1). Each argument decodes the `(u32) -1` sentinel to
+/// `Option::None` ("leave unchanged"). Privileged callers may set
+/// any combination. Non-privileged callers must each (when not the
+/// sentinel) supply a value currently in `{uid, euid, suid}`; if any
+/// one fails the rule, no field changes and the call returns
+/// `-EPERM` (atomic per `step_setresuid`'s contract).
+fn sys_setresuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let ruid = decode_uid_arg(args[0] as u32);
+    let euid = decode_uid_arg(args[1] as u32);
+    let suid = decode_uid_arg(args[2] as u32);
+    cred_change_to_result(step_setresuid(&ctx.process, ruid, euid, suid))
+}
+
+/// `setresgid(rgid, egid, sgid)`. Gid analog of `sys_setresuid`.
+/// Wraps `cred::step_setresgid` (Wave 1).
+fn sys_setresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let rgid = decode_gid_arg(args[0] as u32);
+    let egid = decode_gid_arg(args[1] as u32);
+    let sgid = decode_gid_arg(args[2] as u32);
+    cred_change_to_result(step_setresgid(&ctx.process, rgid, egid, sgid))
+}
+
+/// `getresuid(ruid_uaddr, euid_uaddr, suid_uaddr)`. Reads
+/// `ctx.cred()` once and writes each `u32` raw uid to the
+/// corresponding user pointer. NULL pointers skip that write.
+///
+/// Wave 2 bootstrap exemption: the three uaddrs are treated as
+/// kernel-side via inline `core::ptr::write_volatile` (mirrors
+/// `sys_wait4`'s `wstatus` writeback). Linux's real semantics return
+/// `-EFAULT` on any invalid pointer; user-VA validation is
+/// `TODO(phase-userva)` — once `aspace.copy_to_user` lands the three
+/// inline writes switch over.
+///
+/// SAFETY: kernel-buffer bootstrap exemption (same as `sys_wait4` /
+/// `sys_write`).
+fn sys_getresuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let ruid_uaddr = args[0];
+    let euid_uaddr = args[1];
+    let suid_uaddr = args[2];
+    let cred = ctx.cred();
+
+    // SAFETY: bootstrap kernel-buffer exemption. TODO(phase-userva).
+    if ruid_uaddr != 0 {
+        unsafe { core::ptr::write_volatile(ruid_uaddr as *mut u32, cred.uid.raw()) };
+    }
+    if euid_uaddr != 0 {
+        unsafe { core::ptr::write_volatile(euid_uaddr as *mut u32, cred.euid.raw()) };
+    }
+    if suid_uaddr != 0 {
+        unsafe { core::ptr::write_volatile(suid_uaddr as *mut u32, cred.suid.raw()) };
+    }
+
+    SyscallResult::Return(0)
+}
+
+/// `getresgid(rgid_uaddr, egid_uaddr, sgid_uaddr)`. Gid analog of
+/// `sys_getresuid`. Same bootstrap exemption applies.
+fn sys_getresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let rgid_uaddr = args[0];
+    let egid_uaddr = args[1];
+    let sgid_uaddr = args[2];
+    let cred = ctx.cred();
+
+    // SAFETY: bootstrap kernel-buffer exemption. TODO(phase-userva).
+    if rgid_uaddr != 0 {
+        unsafe { core::ptr::write_volatile(rgid_uaddr as *mut u32, cred.gid.raw()) };
+    }
+    if egid_uaddr != 0 {
+        unsafe { core::ptr::write_volatile(egid_uaddr as *mut u32, cred.egid.raw()) };
+    }
+    if sgid_uaddr != 0 {
+        unsafe { core::ptr::write_volatile(sgid_uaddr as *mut u32, cred.sgid.raw()) };
+    }
+
     SyscallResult::Return(0)
 }

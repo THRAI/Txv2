@@ -547,5 +547,26 @@ pub fn require_signal_send<'g>(
     }
 }
 
+/// Test-only: zero out `effective_caps` and `permitted_caps` on a
+/// process. Used by tx-shims' DAC + setuid slice tests (Wave 2) to
+/// take a `bootstrap_init_process`-minted process from "root with
+/// `CapabilitySet::FULL`" to "fully unprivileged" without forging a
+/// chain of `step_setresuid` calls (the shipping mutators preserve
+/// caps).
+///
+/// Hidden behind `cfg(any(test, feature = "test-support"))` so it
+/// never reaches release builds; re-exported through
+/// `crate::cross_crate_test_support` for cross-crate consumers.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn clear_caps_for_test(target: &Cap<ProcessIdentity>) {
+    let payload_guard = target.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return;
+    };
+    let mut cred_guard = payload.cred.lock();
+    cred_guard.effective_caps = CapabilitySet::EMPTY;
+    cred_guard.permitted_caps = CapabilitySet::EMPTY;
+}
+
 #[cfg(test)]
 mod tests;

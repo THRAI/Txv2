@@ -88,4 +88,19 @@ pub mod cross_crate_test_support {
     pub fn reset_reactor_submit_seam() {
         crate::reactor_submit::reset_for_test();
     }
+
+    /// Clear `effective_caps` and `permitted_caps` to
+    /// `CapabilitySet::EMPTY` on the named process. Used by the
+    /// DAC + setuid slice's tx-shims Wave 2 tests to set up an
+    /// **unprivileged** cred without going through a fork →
+    /// post-fork drop sequence: bootstrap_init_process minted a root
+    /// process with `effective_caps = CapabilitySet::FULL`, so even
+    /// after `step_setresuid` shifts uids away from 0 the
+    /// `is_privileged_for(CAP_SETUID)` short-circuit still fires.
+    /// This helper closes that gap for unit tests; production callers
+    /// drop capabilities through file-cap / `prctl` slices that the
+    /// DAC + setuid slice does not ship.
+    pub fn clear_caps_for_test(process: &tx_substrate::zone::Cap<crate::process::ProcessIdentity>) {
+        crate::cred::clear_caps_for_test(process);
+    }
 }
