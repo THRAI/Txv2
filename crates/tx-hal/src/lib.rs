@@ -763,6 +763,23 @@ pub trait PmapIf {
             Self::shootdown_mapping(asid, *invalidation);
         }
     }
+
+    /// Activate `root` as the current hart's user pmap.
+    ///
+    /// On RV64 this is `csrw satp, ((root.phys >> 12) | SV_MODE_BITS)
+    /// + sfence.vma`. On LA64 the equivalent is the user-mode page-walk
+    /// register write.
+    ///
+    /// Called by the thread runtime immediately before
+    /// `TrapIf::enter_userspace_with_context` so the MMU consults the
+    /// process's per-aspace pmap on the upcoming user fetches/loads.
+    /// Without this, satp keeps pointing at the kernel bootstrap root
+    /// (which has no user mappings), and every user-mode instruction
+    /// fetch faults.
+    fn activate_user_pmap(_root: &PmapRoot) {
+        // Default impl is a no-op so host platforms link; production
+        // boards override.
+    }
 }
 
 pub mod pmap;

@@ -593,6 +593,33 @@ impl PmapIf for Platform {
         pmap::shootdown_mapping(asid, invalidation);
         remote_sfence_vma_asid(asid, invalidation);
     }
+
+    /// Write `satp` to point at `root.phys()` with Sv39 mode bits and
+    /// the root's ASID, then issue a local `sfence.vma`.
+    ///
+    /// Called from the thread runtime right before
+    /// `TrapIf::enter_userspace_with_context` so user-mode fetches see
+    /// the per-process pmap. Without this satp would still point at the
+    /// kernel bootstrap root from the boot trampoline (which has no
+    /// user mappings), and every user-mode instruction fetch would
+    /// fault forever.
+    fn activate_user_pmap(root: &PmapRoot) {
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            const SATP_MODE_SV39: usize = 0x8 << 60;
+            let ppn = root.phys().0 >> 12;
+            let asid = root.asid().0 as usize;
+            let satp = SATP_MODE_SV39 | (asid << 44) | ppn;
+            core::arch::asm!(
+                "csrw satp, {satp}",
+                "sfence.vma",
+                satp = in(reg) satp,
+                options(nostack)
+            );
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        let _ = root;
+    }
 }
 impl IrqIf for Platform {
     const MAX_IRQ: u32 = PLIC_MAX_IRQ;

@@ -78,7 +78,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use tx_hal::{PercpuIf, TrapIf, TxPlatform};
+use tx_hal::{PercpuIf, PmapIf, TrapIf, TxPlatform};
 use tx_reactor::ast::AstBatch;
 use tx_reactor::userspace::{
     PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserspaceEntryDecision,
@@ -262,6 +262,27 @@ pub async fn run_thread<P: TxPlatform>(
         // ----------------------------------------------------------------
         let ctx = prepare_userspace_entry_payload(&payload);
         payload.set_active_userspace_request(Some(entry_token));
+
+        // Activate the user process's pmap right before sret. Without
+        // this satp keeps pointing at the kernel bootstrap root from
+        // the boot trampoline, which has no user mappings, and every
+        // user-mode instruction fetch faults forever.
+        //
+        // We re-resolve `process` and `aspace` per iteration rather
+        // than caching across the await: the owning process may
+        // exit_group between userspace round-trips, in which case
+        // bailing out cleanly here is safer than dereferencing a
+        // stale Cap.
+        if let Some(process) = thread.upgrade_owner_proc() {
+            if let Some(aspace) = process.aspace_cap() {
+                <P as PmapIf>::activate_user_pmap(aspace.pmap().root_handle());
+            } else {
+                return;
+            }
+        } else {
+            return;
+        }
+
         <P as TrapIf>::enter_userspace_with_context(ctx);
 
         // ----------------------------------------------------------------
