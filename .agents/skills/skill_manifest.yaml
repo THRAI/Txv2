@@ -165,3 +165,15 @@ skills:
       - docs/design/03_memory-vm/VM_v1_2.md
       - docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md
     purpose: Guide Process, ThreadRuntime, signal, syscall, exec, and first-userspace implementation from canonical docs.
+
+  tx-shell-syscall-fixup:
+    sources:
+      - docs/DEVELOPMENT.md
+      - boards/tx-hal-riscv64-qemu-virt/src/debug_trace.rs
+      - crates/tx-shims/src/linux_syscall/numbers.rs
+      - crates/tx-shims/src/linux_syscall/mod.rs
+      - xtask/src/trap_trace.rs
+      - xtask/src/shell_test.rs
+      - xtask/src/fault_decode.rs
+      - tools/shell-tests/busybox-prompt.txt
+    purpose: Tight observe→fix→verify loop for missing/broken syscalls when running interactive busybox or other userspace shells under QEMU. Pairs trap-trace + fault-decode + shell-test xtask tools with the syscall-stub edit pattern in tx-shims.

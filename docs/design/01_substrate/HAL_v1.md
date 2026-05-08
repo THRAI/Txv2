@@ -191,7 +191,6 @@ pub trait TxPlatform:
     + ConsoleIf
     + PmapIf
     + TrapIf
-    + UserAccessIf
     + SignalFrameIf
     + IrqIf
     + TimeIf
@@ -374,7 +373,7 @@ Once a conversion has produced a valid high-kernel `&T`, `&mut T`, `NonNull<T>`,
 or raw pointer for a narrow unsafe operation, normal Rust pointer/reference
 rules apply. User memory is the exception: user virtual addresses stay as
 `UserPtr<T>`/`UserRange`-style values and are accessed only through
-`UserAccessIf`/copyin/copyout paths.
+the eager-walk `AddressSpace::copy_*_user` family (§12).
 
 ### 4.3 What does *not* belong in `PlatformConfig`
 <!-- txdoc:HAL-PLATFORMCONFIG-ASSOCIATED-CONSTANTS-WHAT-DOES-NOT-BELONG-IN-PLATFORMCONFIG-1 -->
@@ -1331,6 +1330,35 @@ pub trait TrapIf {
     /// Diverges. Caller must have arranged for the trap frame's pc
     /// and registers to be in the desired state.
     unsafe fn return_to_userspace(tf: &Self::RawTrapFrame) -> !;
+
+    /// Enter userspace with the given merged trap context, then
+    /// **return** when the trap shell longjmps back on
+    /// `TrapAction::Reschedule`.
+    ///
+    /// Despite the `()` return type, this method's body runs to a
+    /// trap and back: the platform's userspace-entry shim stashes
+    /// the kernel-side caller's `(sp, ra, callee-saved s-regs)` into
+    /// a per-hart `KernelResumeCtx`, materialises a fresh trap frame
+    /// from `ctx`, and `sret`s into user mode. The next userspace
+    /// trap fires the trap-vector, which `csrrw`-swaps onto the
+    /// per-CPU trap-handler stack via `sscratch` (boot-primed once
+    /// per hart), runs the kernel trap entry, dispatches to
+    /// `KernelTrapSink`, and applies the resulting `TrapAction`.
+    /// `Resume` and `DeliverSignal` pop+`sret` back to userspace
+    /// (no return through this call); `Reschedule` longjmps via the
+    /// `KernelResumeCtx` and unwinds back through this call site,
+    /// returning to the caller.
+    ///
+    /// This is the single platform-side site that mutates
+    /// user-visible registers per the Plan B writeback discipline
+    /// pinned by `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`.
+    ///
+    /// The default impl panics; platforms ship their own. Host-test
+    /// platforms (no real `sret`) override with a recording no-op
+    /// or a panic spelling the configuration error.
+    fn enter_userspace_with_context(_ctx: UserTrapContext) {
+        panic!("TrapIf::enter_userspace_with_context: platform has no userspace-entry shim");
+    }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -1532,14 +1560,35 @@ pub trait KernelTrapSink<P: TxPlatform> {
 
 #[derive(Copy, Clone, Debug)]
 pub enum TrapAction {
-    /// Resume the trapped context (most syscalls, handled IRQs,
-    /// resolved page faults).
+    /// Resume the trapped context directly via the trap-vector
+    /// epilogue (pop register file, `sret`/`ertn`). Used for
+    /// handled IRQs, completed signal frames, and any path where
+    /// no kernel-side scheduling decision is needed.
     Resume,
-    /// Reschedule before resuming (timer ticks, preemption-relevant IRQs).
+    /// **Reschedule via longjmp back to the kernel-side caller of
+    /// `TrapIf::enter_userspace_with_context`.** The platform's
+    /// `apply_trap_action` does NOT pop+sret on this arm; it
+    /// restores the saved kernel sp / ra / s-regs from the per-hart
+    /// `KernelResumeCtx` (stashed by the userspace-entry shim
+    /// before its `sret`) and `ret`s. Control unwinds back into the
+    /// thread future's `run_thread` body, which awaits the
+    /// just-resolved userspace-run wait and dispatches the trap.
+    ///
+    /// This is what makes the stackless-coroutine thread model
+    /// composable with userspace: the divergent-into-userspace call
+    /// is brought back through normal function-return semantics.
+    /// Used for syscall traps, page faults the trap shell handed
+    /// off to the future, timer ticks that woke any task, and any
+    /// preemption-relevant IRQ.
     Reschedule,
-    /// Deliver a pending signal at AST.
+    /// Deliver a pending signal at AST. Resume-shaped at the
+    /// platform level (pop+sret); the trap-vector epilogue and the
+    /// AST checkpoint inside the future cooperate to redirect
+    /// userspace entry to the signal handler.
     DeliverSignal,
-    /// Terminate the current thread (unrecoverable fault).
+    /// Terminate the current thread (unrecoverable fault). The
+    /// trap-vector epilogue does not run; the platform panics or
+    /// unwinds to a kernel-side fault handler.
     Terminate,
 }
 
@@ -1599,125 +1648,56 @@ No subsystem code references `sepc`, `sstatus`, `sscratch`, `era`, `prmd`, `badv
 
 ---
 
-## 12. UserAccessIf — kernel-mode user access and fixup recovery
+## 12. User-mode access — retired by axhal adoption
 <!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-1 -->
 
-`UserAccessIf` is logically distinct from `TrapIf`. `TrapIf` answers "what happened at trap entry, and how do we return?" `UserAccessIf` answers "how does a kernel-mode user-memory access fail safely and become a syscall-level error?"
+> **Retired.** The `UserAccessIf` trait, the `KernelPtr<T>` typed wrapper,
+> the `FixupEntry` struct, and the kernel-mode fault-fixup recovery
+> mechanism described in earlier revisions of this section have been
+> retired. Eager-walk user access is now the only path:
+>
+> - The kernel walks the user range against the AddressSpace's recipes
+>   BTree page-by-page, materialises each page through its
+>   `VmEntry.backing` (PrivateAnon → anon allocator; `Page { pc, offset }`
+>   → `pc.materialize_page`), translates the resulting frame's PPN to a
+>   kernel direct-map address, and does plain
+>   `core::ptr::copy_nonoverlapping`.
+> - There is no fixup table, no SUM / SMAP dance in subsystem-side
+>   user access, and no asm. Every materialisation either yields a
+>   frame, returns `Errno::EFAULT`, or returns
+>   `StepOutcome::Blocked(WaitToken)`; the syscall caller surfaces all
+>   three without relying on kernel-mode fault recovery.
+>
+> The implementation lives at
+> `crates/tx-subsystems/src/vm/user_access.rs` as inherent methods on
+> `AddressSpace`: `copy_from_user`, `copy_to_user`, `read_user`,
+> `write_user`, `read_user_cstr`. The corresponding `tx-shims`
+> syscall arms call `ctx.aspace.<method>()`.
+>
+> See:
+>
+> - PAGE_BACKED_v1 §5.1 — "the user buffer is materialised through its
+>   `VmEntry.backing` and copied through the kernel direct-map view".
+> - VM_v1_2 §3.6 — cross-async-wait discipline (eager walks return
+>   `Blocked` when a file-backed page is being fetched; the syscall
+>   carrier rewinds and retries).
+> - VM_v1_2 §6 — address-boundary policy (the recipe lookup is the only
+>   user-mode boundary; the eager-walk path never crosses kernel-mode
+>   page faults).
+>
+> The narrow exception is signal-frame writes (§12.1 below). They are
+> kernel-side writes into a user-stack page selected synchronously by
+> the trap shell; they still use a board-internal SUM/asm primitive
+> because they happen with the user image suspended at trap entry,
+> before the resolve-side machinery is reachable.
 
-This split matters because:
-
-- The fixup table is a build-time artifact (linker-section metadata).
-- The recovery mechanism is a kernel-mode-fault-only path; it does not interact with user trap entry.
-- Subsystems that copy to/from user (every syscall that takes a pointer) need a clean error-channel surface, not direct access to the trap path.
-
-### 12.1 Trait surface
-<!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-TRAIT-SURFACE-1 -->
-
-```rust
-pub trait UserAccessIf {
-    /// Copy `len` bytes from user space `src` to kernel space `dst`.
-    /// Returns Ok(()) on success, Err(FaultInfo) on user-side fault.
-    /// Safety: caller must ensure dst is a valid kernel pointer of
-    /// at least `len` bytes; src is interpreted in the current
-    /// AddressSpace's user mapping.
-    unsafe fn copy_from_user(
-        dst: KernelPtr<u8>,
-        src: UserPtr<u8>,
-        len: usize,
-    ) -> Result<(), FaultInfo>;
-
-    /// Mirror of copy_from_user with direction reversed.
-    unsafe fn copy_to_user(
-        dst: UserPtr<u8>,
-        src: KernelPtr<u8>,
-        len: usize,
-    ) -> Result<(), FaultInfo>;
-
-    /// Read a primitive value from user space.
-    /// Specialized for compiler-friendly small types.
-    unsafe fn read_user<T: Pod>(src: UserPtr<T>) -> Result<T, FaultInfo>;
-
-    /// Write a primitive value to user space.
-    unsafe fn write_user<T: Pod>(dst: UserPtr<T>, value: T) -> Result<(), FaultInfo>;
-}
-```
-
-`KernelPtr<T>` and `UserPtr<T>` are typed pointer wrappers defined in the meta-framework primitives crate. They make kernel-vs-user pointer confusion a type error at the call site:
-
-```rust
-// In meta-framework primitives:
-#[repr(transparent)]
-pub struct KernelPtr<T>(*mut T);
-
-#[repr(transparent)]
-pub struct UserPtr<T>(*mut T);
-```
-
-A syscall that takes a user pointer receives `UserPtr<T>` from the syscall pipeline; it cannot accidentally pass it to a kernel-pointer-only function (the type is wrong). Conversion is explicit and goes through `UserAccessIf` — there is no `as_kernel_ptr()` method on `UserPtr<T>`.
-
-### 12.2 The fixup table
-<!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-THE-FIXUP-TABLE-1 -->
-
-Kernel-mode user accesses use a special trap-recovery mechanism. Each `copy_*_user` macro emits a fixup entry into a linker section:
-
-```rust
-// In tx-hal:
-#[repr(C)]
-pub struct FixupEntry {
-    /// Range of kernel PCs covered by this fixup.
-    pub pc_start: VirtAddr,
-    pub pc_end: VirtAddr,
-    /// Where to jump on fault.
-    pub recovery_pc: VirtAddr,
-}
-
-#[linkme::distributed_slice]
-pub static KERNEL_FIXUP_TABLE: [FixupEntry] = [..];
-```
-
-Each platform's `copy_from_user` impl emits a fixup entry through `linkme::distributed_slice(KERNEL_FIXUP_TABLE)`. The trap shell, when it sees a kernel-mode fault, consults `KERNEL_FIXUP_TABLE` (binary search by `pc_start`) and jumps to `recovery_pc` if a match exists.
-
-**Cross-reference.** This is one of the three approved linkme uses. See §21.
-
-### 12.3 The primary path is direct, not fixup
-<!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-THE-PRIMARY-PATH-IS-DIRECT-NOT-FIXUP-1 -->
-
-The substrate-time `direct_map` and the resolve-side syscall surface (PAGE_SUBSTRATE handoff) make most user accesses *not* hit the fixup path. The primary path is:
-
-1. Resolve the user pointer to a PPN via the address space's pmap.
-2. Translate PPN to direct-map kernel virtual address.
-3. Copy via the direct map.
-
-The fixup path catches the residual cases: speculative reads of nominally-mapped pages that turn out to fault (e.g., a `PROT_NONE` page in the middle of a copy that the resolve step didn't pre-walk), and architecture-level corner cases where the trap fires despite the resolve.
-
-### 12.4 FaultInfo in the user-access context
-<!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-FAULTINFO-IN-THE-USER-ACCESS-CONTEXT-1 -->
-
-```rust
-pub struct FaultInfo {
-    pub address: VirtAddr,
-    pub write: bool,
-    pub instruction: bool,
-    pub from_user: bool,
-}
-```
-
-For user-access faults, `from_user` is false (the fault is in kernel mode), but `address` is the user address that faulted. This is what `EFAULT` becomes — the syscall returns `-EFAULT` and the `address` is what `siginfo` would carry if a SIGSEGV were appropriate.
-
-### 12.5 Why this is a separate trait
-<!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-WHY-THIS-IS-A-SEPARATE-TRAIT-1 -->
-
-If `UserAccessIf` lived inside `TrapIf`, then changes to copy-to-user semantics (e.g., adding `copy_from_user_atomic` for non-blocking contexts) would force the trap-frame view surface to change. Splitting the traits keeps the rate of change in each trait independent.
-
-The platform crate impls them together — they share the assembly-level fault-recovery mechanism — but the kernel-side type surface is two traits.
-
-### 12.6 SignalFrameIf — userspace signal-frame ABI
+### 12.1 SignalFrameIf — userspace signal-frame ABI
 <!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-SIGNALFRAMEIF-USERSPACE-SIGNAL-FRAME-ABI-1 -->
 
 `SignalFrameIf` is the architecture ABI helper used by the signal subsystem. It does **not** install a HAL-owned signal hook table. The trap path reaches signal logic through `KernelTrapSink<P>` and named signal functions; the platform only supplies the per-arch frame layout and register rewrites needed to enter and leave a user signal handler.
 
 ```rust
-pub trait SignalFrameIf: TrapIf + UserAccessIf {
+pub trait SignalFrameIf: TrapIf {
     /// Write siginfo/ucontext/trampoline state to the selected user stack
     /// and rewrite the trap frame so return_to_userspace enters the handler.
     fn write_signal_frame(
@@ -1766,7 +1746,7 @@ pub struct SavedSignalFrame {
 
 `IrqIf` is the platform's interrupt-controller surface. It owns claim/complete cycles, masking, and per-line handler installation.
 
-**Cross-reference.** `linkme IRQ_HANDLERS` is a registration source consumed at device init time; the runtime IRQ path indexes the installed table. See §21.
+**Cross-reference.** Handler registration uses an explicit `register_irq_handler(irq, fn)` call (not a linkme slice); §13.2.1 records the seven-point case. The runtime IRQ path indexes the installed `IrqDispatchTable` directly. See §21 for the broader linkme policy.
 
 ### 13.1 Trait surface
 <!-- txdoc:HAL-IRQIF-TRAIT-SURFACE-1 -->
@@ -1776,6 +1756,17 @@ pub trait IrqIf {
     /// Maximum IRQ number this platform supports.
     /// RV64 qemu-virt PLIC: 1024. LA64 ExtIOI: 256.
     const MAX_IRQ: u32;
+
+    /// Platform-specific IRQ number for the boot console UART.
+    ///
+    /// The kernel's `install_irq_handlers::<P>` reads this through
+    /// `<P as IrqIf>::UART_IRQ` to register the UART RX dispatcher
+    /// without naming a board constant directly. Boards that have no
+    /// dedicated UART IRQ (or run on a host-only test platform) keep
+    /// the `0` sentinel default; production boards override (canonical
+    /// RV64 QEMU virt value: `10`, see
+    /// `boards/tx-hal-riscv64-qemu-virt/src/lib.rs::Platform::UART_IRQ`).
+    const UART_IRQ: u32 = 0;
 
     /// Claim the highest-priority pending IRQ on the current hart.
     /// Called from the trap shell after classify returns
@@ -1798,8 +1789,10 @@ pub trait IrqIf {
     fn set_priority(irq: u32, priority: u8);
 
     /// Install the per-line dispatch table built by device init.
-    /// Called once after device::init walks IRQ_HANDLERS.
-    /// Subsequent claim/complete cycles use this table.
+    /// Called once after `tx_kernel::irq::install_irq_handlers::<P>`
+    /// has populated the table via explicit `register_irq_handler`
+    /// calls (see §13.2). Subsequent claim/complete cycles use this
+    /// table.
     fn install_dispatch_table(table: &'static IrqDispatchTable);
 }
 
@@ -1825,24 +1818,26 @@ pub enum IrqHandled {
 ### 13.2 The registration / installation split
 <!-- txdoc:HAL-IRQIF-THE-REGISTRATION-INSTALLATION-SPLIT-1 -->
 
-Devices register their handlers at link time:
+txKernel uses **explicit registration** through a `register_irq_handler(irq, fn)` call, not a `linkme`-distributed slice. The function lives at `crates/tx-kernel/src/irq.rs` and mutates a `SpinMutex<IrqDispatchTable>` global. Boot ordering (see `tx-kernel/src/init.rs::install_irq_handlers`) is: register every handler, then publish the table to the platform via `<P as IrqIf>::install_dispatch_table`, then `unmask`. The platform never observes a half-built table.
 
 ```rust
-// In a virtio-blk driver:
-#[linkme::distributed_slice(tx_hal::IRQ_HANDLERS)]
-pub static VIRTIO_BLK0_IRQ: IrqHandlerRegistration = IrqHandlerRegistration {
-    irq: 8,                          // PLIC line 8 on qemu-virt
-    handler: virtio_blk_irq_handler,
-    name: "virtio-blk0",
-};
+// In a virtio-blk driver init:
+register_irq_handler(8 /* PLIC line 8 on qemu-virt */, virtio_blk_irq_handler);
+
+// In tx-kernel/src/init.rs::install_irq_handlers, called once at boot
+// after register_console_hardware has populated CONSOLE_TTY:
+pub(crate) fn install_irq_handlers<P: IrqIf + ConsoleIf>() {
+    let irq = <P as IrqIf>::UART_IRQ;
+    register_irq_handler(irq, uart_rx_irq_handler::<P>);
+    <P as IrqIf>::install_dispatch_table(dispatch_table_static());
+    <P as IrqIf>::set_priority(irq, 1);
+    <P as IrqIf>::unmask(irq);
+}
 ```
 
 `tx-hal` defines:
 
 ```rust
-#[linkme::distributed_slice]
-pub static IRQ_HANDLERS: [IrqHandlerRegistration] = [..];
-
 pub struct IrqHandlerRegistration {
     pub irq: u32,
     pub handler: IrqHandlerFn,
@@ -1850,23 +1845,7 @@ pub struct IrqHandlerRegistration {
 }
 ```
 
-At device init time, the kernel walks the linkme slice and builds `IrqDispatchTable`:
-
-```rust
-// In device::init
-let mut table = IrqDispatchTable::new();
-for reg in IRQ_HANDLERS {
-    if let Some(existing) = &table.entries[reg.irq as usize] {
-        panic!("IRQ {} double-registered: {} vs {}",
-               reg.irq, existing.name, reg.name);
-    }
-    table.entries[reg.irq as usize] = Some(reg.handler);
-}
-let table: &'static IrqDispatchTable = Box::leak(Box::new(table));
-P::install_dispatch_table(table);
-```
-
-After this point, the runtime path is:
+After the explicit `install_dispatch_table` call, the runtime path is:
 
 ```rust
 // In KernelTrapSink::on_external_irq:
@@ -1893,7 +1872,42 @@ fn on_external_irq(cpu: CpuId) -> TrapAction {
 }
 ```
 
-The runtime path indexes the installed table directly. It does not iterate `IRQ_HANDLERS` per interrupt. This is the rule from the revision: linkme is a registration source, not a dispatch table.
+The runtime path indexes the installed table directly.
+
+#### 13.2.1 Why explicit registration, not linkme
+
+Pre-ELF Open Q #4 (decided 2026-05-06; the planning chore commit appears
+in `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`)
+considered a `#[linkme::distributed_slice] IRQ_HANDLERS` shape and
+rejected it for seven reasons:
+
+1. **Test substitutability.** Tests can build a controlled subset of
+   handlers; a linkme slice forces every test binary to link the
+   union.
+2. **Boot ordering.** Explicit registration runs in a known order
+   from `init.rs`, so the dispatch table is fully populated before
+   `install_dispatch_table` publishes it. Linker-section ordering
+   is target-dependent and not stable.
+3. **No-std / RV64 sections.** The `linkme` machinery depends on
+   linker-section behaviour that is fragile on `riscv64gc-unknown-none-elf`
+   builds and varies between the host and target linkers used in
+   the workspace.
+4. **Discoverability.** `register_irq_handler` calls show up in `grep`
+   and in IDE call graphs; linkme statics do not.
+5. **Mutation.** A `SpinMutex<IrqDispatchTable>` accepts re-registration
+   and conflict detection at boot; a linkme slice is read-only and
+   cannot reject conflicts at registration time.
+6. **Per-platform numbering.** The same handler may attach to
+   different IRQ numbers on different boards; explicit registration
+   reads the number from `<P as IrqIf>::UART_IRQ` (or board-specific
+   constants) at install time.
+7. **txKernel's "keep trap dispatch out of linkme" rule.** §21
+   reserves linkme for tier-2 enumerations (devices, mounts) and
+   forbids it for tier-0 trap-shell paths. IRQ dispatch is the
+   trap-shell's hot path.
+
+**Verdict:** explicit registration is the v1 contract. linkme remains
+an option for tier-2 enumerations elsewhere (§21).
 
 ### 13.3 Tier-1 IRQs (PLIC, ExtIOI internals)
 <!-- txdoc:HAL-IRQIF-TIER-1-IRQS-PLIC-EXTIOI-INTERNALS-1 -->
@@ -1906,6 +1920,101 @@ The interrupt controller itself is a tier-1 device (DEVICE.md §2.1). Its regist
 External IRQs and IPIs are different on both architectures we support. RV64 has separate trap causes (`Interrupt::SupervisorSoft` for IPI vs `Interrupt::SupervisorExternal` for PLIC IRQs). LA64 distinguishes IPI from ExtIOI similarly.
 
 `IrqIf` is for external IRQs only. IPIs go through `SmpIf` (§18). The trap shell distinguishes them via `TrapClass::ExternalInterrupt` versus `TrapClass::InterprocessorInterrupt` (§11.1), routing each to a separate `KernelTrapSink` method (`on_external_irq` and `on_ipi`).
+
+---
+
+## 13A. EntropyIf
+<!-- txdoc:HAL-ENTROPYIF-1 -->
+
+`EntropyIf` is the platform's source of random bytes. It exists so the
+exec front-end can fill the `AT_RANDOM` auxv region without owning a
+kernel-side CSPRNG state. The trait was added by the CSPRNG chore
+(`chore/csprng-at-random`) and is the canonical source named by §9.4
+of `EXEC_v1`.
+
+### 13A.1 Trait surface
+<!-- txdoc:HAL-ENTROPYIF-TRAIT-SURFACE-1 -->
+
+```rust
+pub trait EntropyIf {
+    /// Fill `out` with random bytes. Must always succeed; on
+    /// hardware-entropy unavailability, fall back to the
+    /// deterministic counter seed.
+    fn fill_random(out: &mut [u8]) {
+        // Default: deterministic xorshift64 over an `AtomicU64`
+        // counter, seeded once at link time with
+        // `0xDEADBEEF_CAFE_F00D`. The counter is `fetch_add(1)` per
+        // call; the xorshift output is split byte-wise into `out`.
+    }
+}
+```
+
+The trait is added to the `TxPlatform` supertrait so every board
+materialises it. `fill_random` is infallible by contract: an entropy
+source that is offline or absent must fall back to the deterministic
+counter rather than panic.
+
+### 13A.2 Default impl semantics
+<!-- txdoc:HAL-ENTROPYIF-DEFAULT-IMPL-1 -->
+
+The default impl is a deterministic xorshift64 over an
+`AtomicU64` counter. The seed is the link-time constant
+`0xDEADBEEF_CAFE_F00D`. Each call increments the counter, mixes it
+with three xorshift rounds, and emits the low byte of the resulting
+state per output byte. This is **not** a CSPRNG — it is reproducible
+across runs and across calls. It is acceptable as the day-1 surface
+because txKernel currently ships **no** features that depend on
+unpredictable entropy:
+
+- No ASLR (every exec lays out at fixed VAs).
+- No stack-canary check on the kernel side; userspace canaries are
+  cosmetic in single-binary test fixtures.
+- No untrusted input (no network, no IPC across trust domains).
+- No userspace-visible PRF stretching (no `getrandom` syscall yet).
+
+### 13A.3 RV64 QEMU virt impl
+<!-- txdoc:HAL-ENTROPYIF-RV64-IMPL-1 -->
+
+The RV64 QEMU virt board (`boards/tx-hal-riscv64-qemu-virt/src/lib.rs`)
+overrides `fill_random` with a `rdtime`-mixed xorshift: each call
+reads the unprivileged `rdtime` CSR and folds it into the xorshift
+state. `rdtime` varies per call (ticks since boot) so consecutive
+calls in the same exec produce distinct outputs. The Zkr `seed` CSR
+(architectural HW RNG) is **deferred** to a follow-up — it requires
+trap-shell wiring for the EBUSY retry loop and is not on the day-1
+critical path.
+
+### 13A.4 Trust model and upgrade path
+<!-- txdoc:HAL-ENTROPYIF-TRUST-MODEL-1 -->
+
+The default + RV64 impls are acceptable for txKernel's day-1 trust
+model (no untrusted input, no ASLR, no canary enforcement). Upgrades
+that **must** land before exposing the kernel to network input:
+
+1. **Probe HW entropy.** RV64: trap-shell-supported Zkr `seed` CSR
+   read with the EBUSY retry. LA64: equivalent Zicntr/Zkr extension
+   when available; fall back to MMIO RNG.
+2. **virtio-rng.** A VirtIO RNG device gives a portable software
+   path independent of arch-specific extensions; the RNG subsystem
+   would consume it through a higher-level `RandomIf` over the
+   substrate, not directly through `EntropyIf`.
+3. **CSPRNG state.** Once probed entropy lands, replace the
+   xorshift output stage with a ChaCha20 stream cipher seeded from
+   probed bytes — keeps the "always succeed" contract while making
+   per-call outputs cryptographically unpredictable.
+
+The upgrade path does not change `EntropyIf`'s shape. Subsystems
+that consume entropy continue to call `<P as EntropyIf>::fill_random`;
+only the impl swaps.
+
+### 13A.5 Cross-references
+<!-- txdoc:HAL-ENTROPYIF-CROSS-REFS-1 -->
+
+- `EXEC_v1.md` §9.4: `AT_RANDOM` is filled from
+  `<P as EntropyIf>::fill_random` at the exec front-end (Phase 5).
+- `crates/tx-hal/src/lib.rs::EntropyIf` — trait definition.
+- `crates/tx-scripts/src/process/exec/script.rs` — single in-tree
+  consumer (the exec_script's auxv builder).
 
 ---
 
@@ -2427,13 +2536,6 @@ This rule has one exception: `KERNEL_FIXUP_TABLE`, which is consulted from a tra
 ```rust
 // In tx-hal:
 
-/// IRQ handler registrations. Devices register at link time;
-/// device::init walks this once to build IrqDispatchTable, then
-/// IrqIf::install_dispatch_table installs it. Runtime IRQ entry
-/// indexes the installed table, NOT this slice.
-#[linkme::distributed_slice]
-pub static IRQ_HANDLERS: [IrqHandlerRegistration] = [..];
-
 /// Init hooks. Used SPARINGLY for things that need link-time
 /// enumeration (e.g., trace-schema registration). The hook list
 /// is enumerated by kernel_main's init phase; subsystem init
@@ -2465,6 +2567,10 @@ pub enum InitPhase {
     PostDevice,
 }
 ```
+
+**Not on this list:** `IRQ_HANDLERS`. IRQ handler registration is
+explicit (`tx_kernel::irq::register_irq_handler`), not linkme; see
+§13.2.1 for the seven-point case.
 
 ### 21.3 Forbidden uses
 <!-- txdoc:HAL-LINKME-REGISTRATION-DISCIPLINE-FORBIDDEN-USES-1 -->

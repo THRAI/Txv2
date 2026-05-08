@@ -80,6 +80,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "goblin"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "983a6aafb3b12d4c41ea78d39e189af4298ce747353945ff5105b54a056e5cd9"
+dependencies = [
+ "log",
+ "plain",
+ "scroll",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -90,6 +101,12 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "log"
+version = "0.4.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "memchr"
@@ -134,6 +151,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "plain"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -164,6 +187,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5ff0cc5e135c8870a775d3320910cd9b564ec036b4dc0b8741629020be63f01"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "scroll"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1257cd4248b4132760d6524d6dda4e053bc648c9070b960929bf50cfb1e7add"
+dependencies = [
+ "scroll_derive",
+]
+
+[[package]]
+name = "scroll_derive"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed76efe62313ab6610570951494bdaa81568026e0318eaa55f167de70eeea67d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -286,6 +329,10 @@ version = "0.1.0"
 [[package]]
 name = "tx-fs"
 version = "0.1.0"
+dependencies = [
+ "tx-substrate",
+ "tx-subsystems",
+]
 
 [[package]]
 name = "tx-hal"
@@ -317,8 +364,11 @@ dependencies = [
 name = "tx-kernel"
 version = "0.1.0"
 dependencies = [
+ "tx-fs",
  "tx-hal",
  "tx-reactor",
+ "tx-scripts",
+ "tx-shims",
  "tx-substrate",
  "tx-subsystems",
 ]
@@ -364,6 +414,12 @@ dependencies = [
 [[package]]
 name = "tx-scripts"
 version = "0.1.0"
+dependencies = [
+ "goblin",
+ "tx-hal",
+ "tx-substrate",
+ "tx-subsystems",
+]
 
 [[package]]
 name = "tx-services"
@@ -372,6 +428,14 @@ version = "0.1.0"
 [[package]]
 name = "tx-shims"
 version = "0.1.0"
+dependencies = [
+ "tx-fs",
+ "tx-hal",
+ "tx-reactor",
+ "tx-scripts",
+ "tx-substrate",
+ "tx-subsystems",
+]
 
 [[package]]
 name = "tx-substrate"

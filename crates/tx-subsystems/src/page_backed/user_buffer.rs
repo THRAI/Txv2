@@ -1,15 +1,18 @@
 use super::*;
+use crate::vm::AddressSpace;
 
 /// Read up to `len` bytes from `pc` at `of.offset()` into the user buffer at
 /// `dst`, returning the number of bytes actually copied.
 ///
-/// Materializes pages on demand and copies bytes through the platform's
-/// `UserAccessIf`. Advances `of.offset()` only after a chunk has been both
-/// materialized and copied. EFAULT propagates as an `Err` outcome on the very
-/// first chunk, or as `Done(advanced)` when prior chunks succeeded.
-pub fn step_read_to_user<H: UserAccessIf>(
+/// Materializes pages on demand and copies bytes through the eager-walk
+/// `AddressSpace::copy_to_user` primitive. Advances `of.offset()` only after
+/// a chunk has been both materialized and copied. EFAULT propagates as an
+/// `Err` outcome on the very first chunk, or as `Done(advanced)` when prior
+/// chunks succeeded.
+pub fn step_read_to_user(
     pc: &PageContainer,
-    of: &mut OpenFile,
+    of: &OpenFile,
+    aspace: &AddressSpace,
     dst: UserPtr<u8>,
     len: usize,
     guard: &Guard<'_>,
@@ -26,20 +29,28 @@ pub fn step_read_to_user<H: UserAccessIf>(
         return StepOutcome::Done(0);
     }
     let effective_len = core::cmp::min(len as u64, valid_end - start) as usize;
-    step_range_with_user_buffer::<H>(pc, of, effective_len, UserBuffer::Read { dst }, guard)
+    step_range_with_user_buffer(
+        pc,
+        of,
+        aspace,
+        effective_len,
+        UserBuffer::Read { dst },
+        guard,
+    )
 }
 
 /// Write up to `len` bytes from the user buffer at `src` into `pc` at
 /// `of.offset()`, returning the number of bytes actually copied.
 ///
-/// Materializes pages on demand and copies bytes through the platform's
-/// `UserAccessIf`. Advances `of.offset()` and grows the visible `PC.size`
-/// only after a chunk has been both materialized and copied. EFAULT
-/// propagates as an `Err` outcome on the very first chunk, or as
-/// `Done(advanced)` when prior chunks succeeded.
-pub fn step_write_from_user<H: UserAccessIf>(
+/// Materializes pages on demand and copies bytes through the eager-walk
+/// `AddressSpace::copy_from_user` primitive. Advances `of.offset()` and
+/// grows the visible `PC.size` only after a chunk has been both materialized
+/// and copied. EFAULT propagates as an `Err` outcome on the very first
+/// chunk, or as `Done(advanced)` when prior chunks succeeded.
+pub fn step_write_from_user(
     pc: &PageContainer,
-    of: &mut OpenFile,
+    of: &OpenFile,
+    aspace: &AddressSpace,
     src: UserPtr<u8>,
     len: usize,
     guard: &Guard<'_>,
@@ -60,7 +71,8 @@ pub fn step_write_from_user<H: UserAccessIf>(
         return StepOutcome::Err(Errno::EINVAL);
     }
     let start = of.offset();
-    let outcome = step_range_with_user_buffer::<H>(pc, of, len, UserBuffer::Write { src }, guard);
+    let outcome =
+        step_range_with_user_buffer(pc, of, aspace, len, UserBuffer::Write { src }, guard);
     match &outcome {
         StepOutcome::Done(advanced)
         | StepOutcome::Advanced(advanced)
@@ -93,9 +105,10 @@ impl UserBuffer {
     }
 }
 
-fn step_range_with_user_buffer<H: UserAccessIf>(
+fn step_range_with_user_buffer(
     pc: &PageContainer,
-    of: &mut OpenFile,
+    of: &OpenFile,
+    aspace: &AddressSpace,
     len: usize,
     buffer: UserBuffer,
     guard: &Guard<'_>,
@@ -113,7 +126,15 @@ fn step_range_with_user_buffer<H: UserAccessIf>(
 
         match pc.materialize_page(page_index, access, guard) {
             StepOutcome::Done(materialized) | StepOutcome::Advanced(materialized) => {
-                match copy_chunk_user::<H>(materialized.ppn, within_page, chunk, buffer, advanced) {
+                match copy_chunk_user(
+                    materialized.ppn,
+                    within_page,
+                    chunk,
+                    buffer,
+                    advanced,
+                    aspace,
+                    guard,
+                ) {
                     Ok(()) => {
                         advanced += chunk;
                         offset += chunk as u64;
@@ -152,28 +173,59 @@ fn step_range_with_user_buffer<H: UserAccessIf>(
     StepOutcome::Done(advanced)
 }
 
-fn copy_chunk_user<H: UserAccessIf>(
+fn copy_chunk_user(
     ppn: Ppn,
     within_page: usize,
     chunk: usize,
     buffer: UserBuffer,
     already_advanced: usize,
+    aspace: &AddressSpace,
+    guard: &Guard<'_>,
 ) -> Result<(), Errno> {
     let frame_base = page_allocator::frame_kernel_addr(ppn).map_err(|_| Errno::EIO)?;
+    // SAFETY: frame_base is the kernel direct-map view of the
+    // materialised PC frame. We hold the materialisation pin via the
+    // caller's `MaterializedPage`. `within_page + chunk <= USER_PAGE_SIZE`
+    // by construction in `step_range_with_user_buffer`.
     let kernel_byte = unsafe { frame_base.add(within_page) };
     match buffer {
         UserBuffer::Read { dst } => {
+            // Reading from PC into user-space: PC is the kernel-side
+            // source, user buffer is the destination.
+            // SAFETY: kernel_byte is valid for `chunk` bytes (see
+            // above); we expose it as a kernel-side slice for the
+            // copy_to_user input.
+            let kernel_slice = unsafe { core::slice::from_raw_parts(kernel_byte, chunk) };
             let user_dst = UserPtr::<u8>::new(dst.addr() + already_advanced);
-            unsafe {
-                H::copy_to_user(user_dst, KernelPtr::new(kernel_byte), chunk)
-                    .map_err(|_| Errno::EFAULT)
+            match aspace.copy_to_user(user_dst, kernel_slice, guard) {
+                StepOutcome::Done(n) | StepOutcome::Advanced(n) if n == chunk => Ok(()),
+                StepOutcome::Done(_) | StepOutcome::Advanced(_) => Err(Errno::EFAULT),
+                StepOutcome::Err(e) => Err(e),
+                // For per-chunk copies we treat any block as EFAULT
+                // here — the outer step machinery already handles
+                // PC-side blocks; user-side blocks would only happen
+                // if a user-page backing itself blocks (not common
+                // for the fast paths PC ↔ user-buf serves today).
+                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                    Err(Errno::EFAULT)
+                }
             }
         }
         UserBuffer::Write { src } => {
+            // Writing from user-space into PC: user buffer is the
+            // source, PC is the destination.
+            // SAFETY: kernel_byte is valid for `chunk` mutable bytes
+            // (the materialised PC page); we expose it as a kernel-
+            // side mutable slice for the copy_from_user output.
+            let kernel_slice = unsafe { core::slice::from_raw_parts_mut(kernel_byte, chunk) };
             let user_src = UserPtr::<u8>::new(src.addr() + already_advanced);
-            unsafe {
-                H::copy_from_user(KernelPtr::new(kernel_byte), user_src, chunk)
-                    .map_err(|_| Errno::EFAULT)
+            match aspace.copy_from_user(kernel_slice, user_src, guard) {
+                StepOutcome::Done(n) | StepOutcome::Advanced(n) if n == chunk => Ok(()),
+                StepOutcome::Done(_) | StepOutcome::Advanced(_) => Err(Errno::EFAULT),
+                StepOutcome::Err(e) => Err(e),
+                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                    Err(Errno::EFAULT)
+                }
             }
         }
     }

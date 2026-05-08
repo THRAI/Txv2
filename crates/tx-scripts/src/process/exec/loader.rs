@@ -1,0 +1,399 @@
+//! ELF parser binding (Phase 4 of the ELF-loader plan).
+//!
+//! Pure parsing logic: turns a kernel-owned `&[u8]` of ELF bytes into
+//! an `ExecImagePlan` consumed by sibling Phase 1A
+//! (`vm::scripts::build_aspace_from_image`) and sibling Phase 3
+//! (`build_initial_user_stack`). No async, no I/O, no kernel state.
+//!
+//! Doc anchors:
+//!   txdoc:EXEC-8-PHASE-3-LOAD-EXECUTABLE-IMAGE-PLAN
+//!   txdoc:EXEC-8-4-HEADER-VALIDATION
+//!   txdoc:EXEC-8-5-PROGRAM-HEADER-VALIDATION
+//!   txdoc:EXEC-8-6-AT-PHDR-COMPUTATION
+//!
+//! Out of scope for the slice (per the plan):
+//!   - ET_DYN / static-PIE handling (Open Q #5 DECIDED 2026-05-06).
+//!   - PT_INTERP / dynamic linker.
+//!   - PT_DYNAMIC.
+//!   - relocations and debug info.
+//!   - elf32 (RV64 only).
+//!
+//! `goblin` types do not escape this module. The architectural contract
+//! is `parse_image_plan` and the txKernel-owned `ExecImagePlan` output.
+//! A future swap to the `elf` crate (per `EXEC-8-10`) would leave the
+//! contract unchanged.
+
+use alloc::vec::Vec;
+
+use goblin::container::{Container, Ctx, Endian};
+use goblin::elf::header::header64;
+use goblin::elf::header::{
+    Header, EI_CLASS, EI_DATA, EI_VERSION, ELFCLASS64, ELFDATA2LSB, EM_RISCV, ET_EXEC, EV_CURRENT,
+};
+use goblin::elf::program_header::{
+    ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_PHDR,
+};
+
+/// ELF64 program-header size, in bytes. (Elf64_Phdr is 56 bytes.)
+pub const ELF64_PHENT: u64 = 56;
+
+/// Page size used for LOAD-segment alignment validation. RV64 uses
+/// 4 KiB pages; the slice does not support huge pages (per
+/// `EXEC-8-5`).
+const PAGE_SIZE: u64 = 4096;
+
+/// Hard cap on the number of program headers we will accept (matches
+/// `EXEC-8-4`'s MAX_PHDRS). Keeps targeted reads bounded.
+const MAX_PHDRS: u16 = 64;
+
+/// Minimum ELF64 header size (`Elf64_Ehdr`), in bytes.
+const ELF64_EHDR_SIZE: usize = 64;
+
+/// Reasons `parse_image_plan` may reject an ELF byte slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseError {
+    /// ELF magic missing or wrong architecture class / endianness /
+    /// version.
+    Magic,
+    /// `e_machine` is not `EM_RISCV` (only RV64 is supported in the
+    /// slice).
+    Arch,
+    /// `e_type` is not `ET_EXEC`. (`ET_DYN` is out of scope per the
+    /// plan.)
+    Type,
+    /// `PT_INTERP` or `PT_DYNAMIC` was found — dynamic linking and
+    /// dynamic-section consumption are not supported in the slice.
+    HasInterp,
+    /// At least one `PT_LOAD` is required.
+    NoLoad,
+    /// Program-header table malformed: header range overflows the
+    /// byte slice, `e_phentsize` is wrong, or per-phdr decoding
+    /// failed.
+    Phdr,
+    /// `PT_LOAD` segment has invalid alignment, congruence, sizes,
+    /// overlap, or there are multiple BSS-extending LOADs.
+    LoadSegment,
+}
+
+/// Permission bits derived from a LOAD segment's `p_flags` (PF_R / PF_W
+/// / PF_X). The slice rejects W+X at parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentFlags {
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+/// One PT_LOAD segment as seen by the parser. Pure parser output —
+/// no `Cap<PageContainer>` here; Phase 5 (`exec_script`) composes
+/// ELF parsing with backing-page construction.
+#[derive(Debug, Clone)]
+pub struct LoadSegment {
+    /// Virtual address (load_bias is 0 for `ET_EXEC`, so this is
+    /// `p_vaddr` directly).
+    pub vaddr: u64,
+    /// `p_memsz` — total in-memory footprint.
+    pub memsz: u64,
+    /// `p_filesz` — bytes copied from the file (must be ≤ memsz).
+    pub filesz: u64,
+    /// `p_offset` — byte offset of segment data inside the ELF
+    /// file. Phase 5 wires this to `read_exact_at(rnode, file_offset
+    /// + k, dst, ...)` when materialising backing pages.
+    pub file_offset: u64,
+    pub flags: SegmentFlags,
+    /// `p_align` — validated to be a power of two and ≥ PAGE_SIZE.
+    pub align: u64,
+}
+
+/// Trailing BSS region. The page-rounded
+/// `[vaddr + filesz, vaddr + memsz)` of the LOAD segment that
+/// extends past file-backed bytes; backed by anonymous-private
+/// pages by sibling Phase 1A.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BssTail {
+    pub vaddr: u64,
+    pub size: u64,
+}
+
+/// txKernel-owned image plan produced from a parsed ELF. The output
+/// is pure data — no kernel handles, no caps, no async machinery.
+#[derive(Debug, Clone)]
+pub struct ExecImagePlan {
+    pub entry: u64,
+    /// AT_PHDR — virtual address where program headers will live in
+    /// the loaded image. Computed from PT_PHDR if present, else
+    /// derived from the LOAD that contains the program-header table
+    /// offset (per `EXEC-8-6`). If neither holds, parsing fails with
+    /// `ParseError::Phdr`.
+    pub at_phdr: u64,
+    /// AT_PHENT — size of one program header (always 56 for ELF64).
+    pub at_phent: u64,
+    /// AT_PHNUM.
+    pub at_phnum: u64,
+    pub load_segments: Vec<LoadSegment>,
+    /// Optional BSS extension (the last writable LOAD's
+    /// `memsz > filesz` tail).
+    pub bss_extension: Option<BssTail>,
+}
+
+/// Parse the ELF header + program headers and produce an image plan.
+///
+/// Validates: ELFCLASS64, ELFDATA2LSB, EV_CURRENT, EM_RISCV, ET_EXEC,
+/// no PT_INTERP, no PT_DYNAMIC, ≥ 1 PT_LOAD. Walks PT_LOAD segments;
+/// rejects overlap, bad alignment, congruence violations, multiple
+/// BSS-extending LOADs.
+///
+/// Cites: txdoc:EXEC-8-PHASE-3-LOAD-EXECUTABLE-IMAGE-PLAN.
+pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
+    // ----- Header --------------------------------------------------
+    if elf_bytes.len() < ELF64_EHDR_SIZE {
+        return Err(ParseError::Magic);
+    }
+    // The unified `goblin::elf::Header::parse` is gated behind a
+    // per-class macro that we don't re-export; the per-arch
+    // `header64::Header::parse` is what's actually exposed under the
+    // `endian_fd + alloc + elf64` feature set. Convert into the
+    // unified `Header` (its `From<header64::Header>` impl is
+    // unconditional under those features) so downstream paths
+    // remain class-agnostic.
+    let header64_raw = header64::Header::parse(elf_bytes).map_err(|_| ParseError::Magic)?;
+    let header: Header = header64_raw.into();
+
+    // §8.4 header validation. The unified `Header::parse` already
+    // checks the magic; we re-check class/data/version/machine/type
+    // explicitly so the failure errno surface is precise.
+    if header.e_ident[EI_CLASS] != ELFCLASS64
+        || header.e_ident[EI_DATA] != ELFDATA2LSB
+        || header.e_ident[EI_VERSION] != EV_CURRENT
+    {
+        return Err(ParseError::Magic);
+    }
+    if header.e_machine != EM_RISCV {
+        return Err(ParseError::Arch);
+    }
+    if header.e_type != ET_EXEC {
+        return Err(ParseError::Type);
+    }
+
+    // ELF64 program-header size is fixed; assert and propagate.
+    if header.e_phentsize as u64 != ELF64_PHENT {
+        return Err(ParseError::Phdr);
+    }
+    if header.e_phnum == 0 || header.e_phnum > MAX_PHDRS {
+        return Err(ParseError::Phdr);
+    }
+
+    let phoff = header.e_phoff;
+    let phnum = header.e_phnum as u64;
+    let phent = header.e_phentsize as u64;
+
+    let phdr_table_end = phoff
+        .checked_add(phnum.checked_mul(phent).ok_or(ParseError::Phdr)?)
+        .ok_or(ParseError::Phdr)?;
+    if phdr_table_end > elf_bytes.len() as u64 {
+        return Err(ParseError::Phdr);
+    }
+
+    // ----- Program headers ----------------------------------------
+    // RV64 ELF64 little-endian. The slice is a single arch.
+    let ctx = Ctx::new(Container::Big, Endian::Little);
+    let phdrs = ProgramHeader::parse(elf_bytes, phoff as usize, phnum as usize, ctx)
+        .map_err(|_| ParseError::Phdr)?;
+
+    let mut load_segments: Vec<LoadSegment> = Vec::new();
+    let mut pt_phdr_vaddr: Option<u64> = None;
+
+    for phdr in &phdrs {
+        match phdr.p_type {
+            PT_INTERP | PT_DYNAMIC => return Err(ParseError::HasInterp),
+            PT_PHDR => {
+                pt_phdr_vaddr = Some(phdr.p_vaddr);
+            }
+            PT_LOAD => {
+                load_segments.push(translate_load(phdr)?);
+            }
+            // PT_TLS, PT_NOTE, PT_GNU_STACK, PT_GNU_RELRO,
+            // PT_GNU_EH_FRAME, ... ignored at parse time. Phase 5
+            // can revisit if/when LTP coverage demands TLS or stack
+            // executability checks.
+            _ => {}
+        }
+    }
+
+    if load_segments.is_empty() {
+        return Err(ParseError::NoLoad);
+    }
+
+    // §8.5: page-rounded LOAD ranges must not overlap.
+    detect_overlap(&load_segments)?;
+
+    // §8.6: AT_PHDR computation.
+    let at_phdr = compute_at_phdr(&header, &load_segments, pt_phdr_vaddr)?;
+
+    // BSS tail: at most one LOAD may have `memsz > filesz` for the
+    // slice. (Multi-BSS LOADs are theoretically legal but unusual
+    // for static binaries; a future slice can lift this.)
+    let bss_extension = compute_bss_extension(&load_segments)?;
+
+    Ok(ExecImagePlan {
+        entry: header.e_entry,
+        at_phdr,
+        at_phent: phent,
+        at_phnum: phnum,
+        load_segments,
+        bss_extension,
+    })
+}
+
+// ----------------------------------------------------------------------
+// Helpers
+
+fn translate_load(phdr: &ProgramHeader) -> Result<LoadSegment, ParseError> {
+    // §8.5 program-header validation.
+    if phdr.p_filesz > phdr.p_memsz {
+        return Err(ParseError::LoadSegment);
+    }
+    // Overflow checks.
+    phdr.p_offset
+        .checked_add(phdr.p_filesz)
+        .ok_or(ParseError::LoadSegment)?;
+    phdr.p_vaddr
+        .checked_add(phdr.p_memsz)
+        .ok_or(ParseError::LoadSegment)?;
+
+    // Alignment: 0/1 are treated as "no alignment requirement", but
+    // for LOAD we still require ≥ PAGE_SIZE so `p_vaddr ≡ p_offset
+    // (mod PAGE_SIZE)` is a meaningful check.
+    let align = phdr.p_align;
+    if align < PAGE_SIZE || !align.is_power_of_two() {
+        return Err(ParseError::LoadSegment);
+    }
+
+    // ELF congruence: `p_vaddr % p_align == p_offset % p_align`.
+    // (Tightened at PAGE_SIZE by `EXEC-8-5`; we use the segment's
+    // own align since it is already validated ≥ PAGE_SIZE.)
+    if phdr.p_vaddr % align != phdr.p_offset % align {
+        return Err(ParseError::LoadSegment);
+    }
+
+    // Reject prot == 0 and W+X (matches `EXEC-8-5`'s policy).
+    let readable = phdr.p_flags & PF_R != 0;
+    let writable = phdr.p_flags & PF_W != 0;
+    let executable = phdr.p_flags & PF_X != 0;
+    if !(readable || writable || executable) {
+        return Err(ParseError::LoadSegment);
+    }
+    if writable && executable {
+        return Err(ParseError::LoadSegment);
+    }
+
+    Ok(LoadSegment {
+        vaddr: phdr.p_vaddr,
+        memsz: phdr.p_memsz,
+        filesz: phdr.p_filesz,
+        file_offset: phdr.p_offset,
+        flags: SegmentFlags {
+            readable,
+            writable,
+            executable,
+        },
+        align,
+    })
+}
+
+/// Page-floor / page-ceil helpers operating on `u64`.
+fn page_floor(x: u64) -> u64 {
+    x & !(PAGE_SIZE - 1)
+}
+fn page_ceil(x: u64) -> Option<u64> {
+    let mask = PAGE_SIZE - 1;
+    x.checked_add(mask).map(|v| v & !mask)
+}
+
+fn detect_overlap(segments: &[LoadSegment]) -> Result<(), ParseError> {
+    // Quadratic scan; LOAD count is tiny (≤ 16 for real binaries,
+    // ≤ MAX_PHDRS=64 by header validation).
+    for i in 0..segments.len() {
+        let a_start = page_floor(segments[i].vaddr);
+        let a_end = page_ceil(segments[i].vaddr.saturating_add(segments[i].memsz))
+            .ok_or(ParseError::LoadSegment)?;
+        if a_end <= a_start {
+            // Zero-size or wrapped — reject.
+            return Err(ParseError::LoadSegment);
+        }
+        for b in &segments[i + 1..] {
+            let b_start = page_floor(b.vaddr);
+            let b_end =
+                page_ceil(b.vaddr.saturating_add(b.memsz)).ok_or(ParseError::LoadSegment)?;
+            if a_start < b_end && b_start < a_end {
+                return Err(ParseError::LoadSegment);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compute_at_phdr(
+    header: &Header,
+    load_segments: &[LoadSegment],
+    pt_phdr_vaddr: Option<u64>,
+) -> Result<u64, ParseError> {
+    if let Some(va) = pt_phdr_vaddr {
+        return Ok(va);
+    }
+    let phoff = header.e_phoff;
+    let phdr_end = phoff
+        .checked_add(
+            (header.e_phnum as u64)
+                .checked_mul(header.e_phentsize as u64)
+                .ok_or(ParseError::Phdr)?,
+        )
+        .ok_or(ParseError::Phdr)?;
+    for seg in load_segments {
+        let seg_file_end = seg
+            .file_offset
+            .checked_add(seg.filesz)
+            .ok_or(ParseError::Phdr)?;
+        if seg.file_offset <= phoff && phdr_end <= seg_file_end {
+            // (phoff - seg.file_offset) is a within-segment delta;
+            // adding to vaddr cannot overflow because phdr_end ≤
+            // seg_file_end ≤ seg.file_offset + memsz, and
+            // vaddr + memsz was overflow-checked earlier.
+            return Ok(seg.vaddr + (phoff - seg.file_offset));
+        }
+    }
+    Err(ParseError::Phdr)
+}
+
+/// Returns the BSS extension for the unique LOAD segment whose
+/// `memsz > filesz`. Returns `Err(ParseError::LoadSegment)` if
+/// multiple LOADs have such a tail (TODO: handle multi-BSS in a
+/// future slice).
+fn compute_bss_extension(load_segments: &[LoadSegment]) -> Result<Option<BssTail>, ParseError> {
+    let mut found: Option<BssTail> = None;
+    for seg in load_segments {
+        if seg.memsz > seg.filesz {
+            // BSS spans `[vaddr + filesz, vaddr + memsz)`. The page
+            // walker will round this; here we report exact bytes.
+            let tail_vaddr = seg
+                .vaddr
+                .checked_add(seg.filesz)
+                .ok_or(ParseError::LoadSegment)?;
+            let tail_size = seg.memsz - seg.filesz;
+            if found.is_some() {
+                // TODO(multi-bss): handle multiple BSS-extending
+                // LOADs. The slice's design only needs one (the
+                // last writable LOAD for static binaries).
+                return Err(ParseError::LoadSegment);
+            }
+            found = Some(BssTail {
+                vaddr: tail_vaddr,
+                size: tail_size,
+            });
+        }
+    }
+    Ok(found)
+}
+
+#[cfg(test)]
+mod tests;

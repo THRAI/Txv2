@@ -3,14 +3,27 @@
 //! Focus on the thread-side half of the identity/payload split and the
 //! parent-bookkeeping that `step_thread_exit` performs.
 
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::Wake;
+
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
 use crate::process::{bootstrap_init_process, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
+use crate::thread_runtime::execution::prepare_userspace_entry_payload;
 use crate::thread_runtime::step_thread_exit;
-use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentity};
+use crate::thread_runtime::structure::{
+    drain_pending_syscall_return, reset_tid_counter_for_test, ThreadIdentity,
+};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
+use tx_hal::UserTrapContext;
+use tx_reactor::userspace::{SyscallRequest, UserspaceTrapInfo};
 use tx_substrate::testing::init_host_for_test_once;
 use tx_substrate::zone::Cap;
 
@@ -145,5 +158,181 @@ fn fork_assigns_distinct_tids_to_parent_and_child_leader_threads() {
     assert_eq!(
         child_leader.upgrade_owner_proc().expect("alive").pid,
         child.pid
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Trap-handoff payload extension tests (Trio Phase 1)
+// ---------------------------------------------------------------------------
+
+struct CountWake {
+    wakes: Arc<AtomicUsize>,
+}
+
+impl Wake for CountWake {
+    fn wake(self: Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn counting_waker(wakes: Arc<AtomicUsize>) -> Waker {
+    Waker::from(Arc::new(CountWake { wakes }))
+}
+
+/// Round-trip the trap-shell handoff against a `ThreadPayload`'s
+/// `userspace_slot`: start a request, post a `Syscall` trap via the
+/// slot, drive the wait future to readiness, and observe the
+/// `UserspaceTrapInfo::Syscall` outcome. Mirrors what the trap shell
+/// does when it resolves the wait via `complete_interesting_trap`
+/// per `txdoc:REACTOR-USERSPACE-RUN-AS-A-WAIT`.
+#[test]
+fn userspace_slot_round_trip_resolves_with_syscall() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+
+    let payload_guard = leader.payload.lock();
+    let payload = payload_guard.as_ref().expect("alive");
+
+    let slot = payload.userspace_slot().clone();
+    let mut wait = slot.start_request().expect("start userspace wait");
+    let request = wait.request();
+    payload.set_active_userspace_request(Some(request));
+
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = counting_waker(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+
+    // Until the trap resolves the wait, the future stays pending.
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+    assert_eq!(wakes.load(Ordering::SeqCst), 0);
+
+    let req = SyscallRequest::new(64, [1, 2, 3, 4, 5, 6]);
+    let trap = UserspaceTrapInfo::Syscall(req);
+    slot.complete_interesting_trap(request, trap)
+        .expect("trap-shell resolves wait");
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(trap));
+}
+
+/// `pending_syscall_return` is a one-shot slot drained by the
+/// userspace-entry shim. Plan B writeback discipline: the trap shell
+/// never writes the return; the shim drains and writes it into the
+/// fresh trap frame before `enter_userspace`.
+#[test]
+fn pending_syscall_return_drains_at_userspace_entry() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+
+    let payload_guard = leader.payload.lock();
+    let payload = payload_guard.as_ref().expect("alive");
+
+    // Empty by default.
+    assert!(drain_pending_syscall_return(payload).is_none());
+
+    // Successful syscall (e.g. write returning 6 bytes).
+    payload.store_pending_syscall_return(Some(Ok(6)));
+    assert_eq!(drain_pending_syscall_return(payload), Some(Ok(6)));
+    // Drain leaves the slot empty; second drain yields None.
+    assert!(drain_pending_syscall_return(payload).is_none());
+
+    // Errno path (e.g. -ENOSYS = -38 encoded as Err(38)).
+    payload.store_pending_syscall_return(Some(Err(38)));
+    assert_eq!(drain_pending_syscall_return(payload), Some(Err(38)));
+    assert!(drain_pending_syscall_return(payload).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Userspace-entry shim tests (Pre-ELF Phase 2 Part 1)
+//
+// `prepare_userspace_entry_payload` is the single Plan-B writeback site
+// that drains `pending_syscall_return`, overlays the encoded value into
+// the `a0`-equivalent register of the saved user context, clears
+// `active_userspace_request`, and returns the merged `UserTrapContext`
+// to the platform's `enter_userspace_with_context` shim.
+// ---------------------------------------------------------------------------
+
+/// RV64 register index of `a0` inside `UserTrapContext::regs`. Mirrors
+/// the constant used internally by `prepare_userspace_entry_payload`.
+const A0_INDEX: usize = 10;
+
+fn install_saved_context(
+    payload: &tx_substrate::zone::PayloadCap<crate::thread_runtime::ThreadPayload>,
+) -> UserTrapContext {
+    let mut ctx = UserTrapContext {
+        regs: [0; 32],
+        pc: 0xCAFE_F00D,
+        status: 0,
+    };
+    // Plant a recognisable value in a0 so we can prove pre-existing
+    // contents are overwritten only when a syscall return is drained.
+    ctx.regs[A0_INDEX] = 0xDEAD;
+    payload.store_saved_user_context(Some(ctx));
+    ctx
+}
+
+#[test]
+fn prepare_userspace_entry_payload_drains_pending_return_into_a0() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let payload = leader.payload_cap_for_test().expect("alive");
+
+    install_saved_context(&payload);
+    payload.store_pending_syscall_return(Some(Ok(42)));
+
+    let ctx = prepare_userspace_entry_payload(&payload);
+
+    assert_eq!(ctx.regs[A0_INDEX], 42, "pending Ok(42) lands in a0");
+    assert_eq!(ctx.pc, 0xCAFE_F00D, "non-a0 context preserved");
+    assert!(
+        drain_pending_syscall_return(&payload).is_none(),
+        "shim drains pending_syscall_return exactly once"
+    );
+    assert!(
+        payload.active_userspace_request().is_none(),
+        "shim clears active_userspace_request",
+    );
+}
+
+#[test]
+fn prepare_userspace_entry_payload_negative_errno_encodes_as_minus_errno() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let payload = leader.payload_cap_for_test().expect("alive");
+
+    install_saved_context(&payload);
+    // EINVAL = 22 → a0 = (-22 as i64) as u64
+    payload.store_pending_syscall_return(Some(Err(22)));
+
+    let ctx = prepare_userspace_entry_payload(&payload);
+
+    let expected = (-22i64) as u64 as usize;
+    assert_eq!(ctx.regs[A0_INDEX], expected, "Err(22) encodes as -22");
+    assert!(drain_pending_syscall_return(&payload).is_none());
+}
+
+#[test]
+fn prepare_userspace_entry_payload_no_pending_preserves_saved_a0() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let payload = leader.payload_cap_for_test().expect("alive");
+
+    install_saved_context(&payload);
+    // Leave pending_syscall_return empty.
+    assert!(drain_pending_syscall_return(&payload).is_none());
+
+    let ctx = prepare_userspace_entry_payload(&payload);
+
+    assert_eq!(
+        ctx.regs[A0_INDEX], 0xDEAD,
+        "with no drain the saved a0 is preserved verbatim"
     );
 }

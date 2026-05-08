@@ -81,17 +81,35 @@ fn image_ext4_busybox(root: &Path, args: &[String], output_name: &str) -> Result
     Ok(())
 }
 
-fn prepare_busybox_rootfs(root: &Path) -> Result<PathBuf> {
-    let busybox = env::var("TX_BUSYBOX").map_err(|_| {
-        "TX_BUSYBOX is not set; point it at a BusyBox binary before building images".to_string()
-    })?;
-    let busybox = PathBuf::from(busybox);
-    if !busybox.is_file() {
-        return Err(format!(
-            "TX_BUSYBOX must point at a file, got {}",
-            busybox.display()
-        ));
+/// Path of the in-tree vendored busybox binary used when `TX_BUSYBOX` is not
+/// set. Populated by `tools/images/fetch-busybox.sh`. Kept relative so the
+/// path printed in errors matches what's checked into the repo.
+pub(crate) const VENDORED_BUSYBOX_RELPATH: &str = "tools/images/vendor/busybox-riscv64-musl";
+
+fn resolve_busybox(root: &Path) -> Result<PathBuf> {
+    if let Ok(value) = env::var("TX_BUSYBOX") {
+        let busybox = PathBuf::from(value);
+        if !busybox.is_file() {
+            return Err(format!(
+                "TX_BUSYBOX must point at a file, got {}",
+                busybox.display()
+            ));
+        }
+        return Ok(busybox);
     }
+    let vendored = root.join(VENDORED_BUSYBOX_RELPATH);
+    if vendored.is_file() {
+        return Ok(vendored);
+    }
+    Err(format!(
+        "TX_BUSYBOX is not set and vendored binary missing at {}; \
+         run `tools/images/fetch-busybox.sh` or set TX_BUSYBOX",
+        VENDORED_BUSYBOX_RELPATH
+    ))
+}
+
+fn prepare_busybox_rootfs(root: &Path) -> Result<PathBuf> {
+    let busybox = resolve_busybox(root)?;
 
     let layout = root.join("target").join("rootfs").join("busybox-musl");
     if layout.exists() {
@@ -125,11 +143,6 @@ fn prepare_busybox_rootfs(root: &Path) -> Result<PathBuf> {
     }
 
     fs::write(
-        layout.join("init"),
-        "#!/bin/sh\nmount -t proc proc /proc 2>/dev/null || true\nmount -t sysfs sysfs /sys 2>/dev/null || true\n/bin/busybox --install -s /bin\nexec /bin/sh\n",
-    )
-    .map_err(|err| err.to_string())?;
-    fs::write(
         layout.join("etc").join("inittab"),
         "::sysinit:/etc/init.d/rcS\n",
     )
@@ -150,6 +163,16 @@ fn prepare_busybox_rootfs(root: &Path) -> Result<PathBuf> {
             }
             unix_fs::symlink(target, path).map_err(|err| err.to_string())?;
         }
+
+        // Initramfs slice (2026-05-08): replace the shebang `/init`
+        // wrapper with a symlink to `/bin/sh`. The kernel's exec
+        // hits busybox directly (no script-interpreter walk) and
+        // busybox sees argv[0]=sh, running the shell applet.
+        let init_path = layout.join("init");
+        if init_path.exists() {
+            fs::remove_file(&init_path).map_err(|err| err.to_string())?;
+        }
+        unix_fs::symlink("/bin/sh", &init_path).map_err(|err| err.to_string())?;
     }
 
     Ok(layout)

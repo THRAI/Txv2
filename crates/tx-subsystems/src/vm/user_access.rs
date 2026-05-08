@@ -1,0 +1,576 @@
+//! Eager-walk user-access primitives.
+//!
+//! Replaces the retired `tx_hal::UserAccessIf` trait. Per HAL_v1.md
+//! §12 ("retired by axhal adoption") and PAGE_BACKED_v1 §5.1 ("the
+//! user buffer is materialised through its `VmEntry.backing` and
+//! copied through the kernel direct-map view"), user-side copies walk
+//! the user range against the AddressSpace's recipes BTree
+//! page-by-page, materialise each page through its `VmEntry.backing`,
+//! translate the resulting frame's PPN to a kernel direct-map
+//! address, and do plain `core::ptr::copy_nonoverlapping`.
+//!
+//! No fixup table, no SUM dance, no asm. The fault-recovery
+//! mechanism the old design specified is replaced by eager walk:
+//! every materialisation yields either a frame or `Err`/`Blocked`,
+//! both of which surface to the syscall caller without relying on
+//! kernel-mode fault recovery.
+//!
+//! ## PrivateAnon consistency via pmap
+//!
+//! Per VM_v1_2 §"No rmap": private anon frames are tracked only via
+//! published pmap PTEs (no per-VmEntry rmap). `resolve_user_page_addr`
+//! therefore consults `aspace.pmap.lookup(page)` first; on hit it
+//! reuses the cached `(ppn, prot)`, on miss it falls through to the
+//! VmFault materialisation path. Without the pmap-first probe a
+//! `PrivateAnon` page would be re-zeroed on every read (each call
+//! allocates a fresh zero frame), so a write through `copy_to_user`
+//! would not be visible to a subsequent `copy_from_user`. brk-backed
+//! heap (musl malloc / argv strings / env strings) requires
+//! cross-call consistency, hence the pmap-first lane.
+//!
+//! `reserve_user_range_for_access` populates pmap eagerly for a
+//! whole user range so a subsequent multi-step copy sequence
+//! (struct + string, struct + buffer, etc.) sees each page exactly
+//! once, mirrors the canonical `fault_script` lane synchronously, and
+//! returns `Blocked`/`Err` to its caller for any page whose
+//! materialisation cannot complete inline.
+
+use alloc::vec::Vec;
+use tx_hal::UserPtr;
+use tx_substrate::page_allocator;
+
+use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
+use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
+
+use super::structure::{
+    AccessMode, AddressSpace, UserRange, UserVirtAddr, VmBacking, VmEntry, VmFault, VmFaultOutcome,
+    USER_PAGE_SIZE,
+};
+
+/// Whether a user-access primitive is reading from or writing to
+/// user-space memory. Determines both the protection check and the
+/// materialisation access mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserAccessKind {
+    Read,
+    Write,
+}
+
+impl UserAccessKind {
+    pub fn required_prot(self) -> AccessMode {
+        match self {
+            Self::Read => AccessMode::Read,
+            Self::Write => AccessMode::Write,
+        }
+    }
+
+    fn materialize_access(self) -> MaterializeAccess {
+        match self {
+            Self::Read => MaterializeAccess::Read,
+            Self::Write => MaterializeAccess::Write,
+        }
+    }
+}
+
+impl AddressSpace {
+    /// Copy `dst.len()` bytes from user-space `src` to kernel-side `dst`.
+    /// Returns the number of bytes copied (= `dst.len()` on success).
+    pub fn copy_from_user(
+        &self,
+        dst: &mut [u8],
+        src: UserPtr<u8>,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize> {
+        copy_in(self, dst, src, guard)
+    }
+
+    /// Copy `src.len()` bytes from kernel-side `src` to user-space `dst`.
+    /// Returns the number of bytes copied (= `src.len()` on success).
+    pub fn copy_to_user(
+        &self,
+        dst: UserPtr<u8>,
+        src: &[u8],
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize> {
+        copy_out(self, dst, src, guard)
+    }
+
+    /// Read a `T: Copy` value from user-space `src`. Wrapper over
+    /// `copy_from_user`.
+    pub fn read_user<T: Copy>(&self, src: UserPtr<T>, guard: &Guard<'_>) -> StepOutcome<T> {
+        let mut value = core::mem::MaybeUninit::<T>::uninit();
+        // SAFETY: value is a valid kernel-stack `MaybeUninit<T>`; we
+        // expose its bytes to copy_from_user which fills exactly
+        // `size_of::<T>()` bytes before we call `assume_init`.
+        let dst_bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                value.as_mut_ptr() as *mut u8,
+                core::mem::size_of::<T>(),
+            )
+        };
+        let src_bytes = UserPtr::<u8>::new(src.addr());
+        match self.copy_from_user(dst_bytes, src_bytes, guard) {
+            StepOutcome::Done(_) | StepOutcome::Advanced(_) => {
+                // SAFETY: copy_from_user wrote `size_of::<T>()` bytes
+                // before returning Done/Advanced.
+                StepOutcome::Done(unsafe { value.assume_init() })
+            }
+            StepOutcome::Blocked(t) => StepOutcome::Blocked(t),
+            StepOutcome::AdvancedThenBlocked(_, t) => StepOutcome::Blocked(t),
+            StepOutcome::Err(e) => StepOutcome::Err(e),
+        }
+    }
+
+    /// Write a `T: Copy` value to user-space `dst`. Wrapper over
+    /// `copy_to_user`.
+    pub fn write_user<T: Copy>(
+        &self,
+        dst: UserPtr<T>,
+        value: T,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        // SAFETY: addr_of! yields a valid kernel pointer to `value`
+        // for the lifetime of this call; the cast to *const u8 reads
+        // exactly `size_of::<T>()` bytes from a Copy value.
+        let src_bytes = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::addr_of!(value) as *const u8,
+                core::mem::size_of::<T>(),
+            )
+        };
+        let dst_bytes = UserPtr::<u8>::new(dst.addr());
+        match self.copy_to_user(dst_bytes, src_bytes, guard) {
+            StepOutcome::Done(_) | StepOutcome::Advanced(_) => StepOutcome::Done(()),
+            StepOutcome::Blocked(t) | StepOutcome::AdvancedThenBlocked(_, t) => {
+                StepOutcome::Blocked(t)
+            }
+            StepOutcome::Err(e) => StepOutcome::Err(e),
+        }
+    }
+
+    /// Eagerly fault-in every page in `range` for access of `kind` and
+    /// publish each page through the pmap. After a successful `Done(())`
+    /// every page in `range` has a published pmap entry whose
+    /// `Prot.permits(kind.required_prot())` holds; subsequent
+    /// `copy_*_user` calls find the page through `pmap.lookup` and do
+    /// not re-materialise.
+    ///
+    /// Implementation mirrors `vm::execution::fault_script`'s tail
+    /// synchronously: for each page, observe the recipe through
+    /// `resolve_fault`, materialise via `materialize_pagebacked`, and
+    /// publish through `pmap.publish_page_with_replacement`. Already-
+    /// published pages whose protection already permits the access
+    /// are skipped, so calling this twice on the same range is cheap.
+    ///
+    /// Errors and Blocked propagate to the caller:
+    ///
+    /// - `Err(Errno::EFAULT)` for unmapped pages (no recipe), for
+    ///   prot-mismatch (recipe rejects the access), and for
+    ///   materialisation / publication failures from the underlying
+    ///   subsystems (`VmFault` / pmap surface them as opaque internal
+    ///   shapes; the user-VA contract collapses every one to EFAULT).
+    /// - `Blocked(token)` if a page-cache fetch needs to await; the
+    ///   caller awaits the carrier and retries.
+    ///
+    /// Per VM_v1_2 §"No rmap": private anon frames are tracked only
+    /// via published PTEs, so the pmap is the canonical authoritative
+    /// store consulted by `copy_*_user`. Reserving up-front guarantees
+    /// every page lands once and stays observable.
+    ///
+    /// Does **not** take a `&Guard<'_>` parameter — internal
+    /// observation paths (`resolve_fault` → `require_fault_recipe` →
+    /// `aspace.lookup`) take their own fresh epoch guards. Callers
+    /// holding an outer guard must drop it before invoking this method
+    /// to avoid `epoch guards cannot be nested on the same CPU`.
+    pub fn reserve_user_range_for_access(
+        &self,
+        range: UserRange,
+        kind: UserAccessKind,
+    ) -> StepOutcome<()> {
+        for page in range.iter_pages() {
+            // Skip pages already published with sufficient protection.
+            // We only avoid re-materialisation when the cached entry
+            // already permits the requested access.
+            if let Some(snapshot) = self.pmap.lookup(page) {
+                if snapshot.prot.permits(kind.required_prot()) {
+                    continue;
+                }
+                // Insufficient protection on the existing mapping.
+                // The caller's intent (Read/Write) cannot be satisfied
+                // by the cached frame; surface as EFAULT (matches the
+                // recipe-permission fast path in `resolve_user_page_addr`).
+                return StepOutcome::Err(Errno::EFAULT);
+            }
+            // Build a synthetic fault, observe the recipe, materialise,
+            // and publish synchronously.
+            let page_addr = match page.checked_start_addr() {
+                Ok(a) => a,
+                Err(_) => return StepOutcome::Err(Errno::EFAULT),
+            };
+            let fault = VmFault::new(page_addr, kind.required_prot());
+            let outcome: VmFaultOutcome = match self.resolve_fault(fault) {
+                Ok(o) => o,
+                Err(_) => return StepOutcome::Err(Errno::EFAULT),
+            };
+            let materialization = match outcome.materialize_pagebacked() {
+                Ok(m) => m,
+                Err(_) => return StepOutcome::Err(Errno::EFAULT),
+            };
+            // Publish the materialisation. `replace_existing` honours
+            // the materialisation's own intent (private CoW path sets
+            // it; otherwise false). The page-key derives from the
+            // outcome's page_range, mirroring `fault_script`.
+            if self
+                .pmap
+                .publish_page_with_replacement(
+                    outcome.page_range.start().containing_page(),
+                    materialization.page.ppn,
+                    materialization.publish_prot,
+                    materialization.page.map_pin,
+                    materialization.replace_existing,
+                )
+                .is_err()
+            {
+                return StepOutcome::Err(Errno::EFAULT);
+            }
+        }
+        StepOutcome::Done(())
+    }
+
+    /// Read a NUL-terminated byte string starting at `src`, capped at
+    /// `max_len` bytes. Returns the bytes (NUL terminator stripped).
+    ///
+    /// `src.addr() == 0` returns `Done(empty)` — matches the
+    /// bake-in-fixture-friendly behaviour of the old shim helpers
+    /// (`tx-shims::read_user_cstr`). Callers that need a stricter
+    /// "NULL is EFAULT" rule should reject the NULL pointer before
+    /// invoking.
+    ///
+    /// `Errno::ENAMETOOLONG` if `max_len` bytes are walked without
+    /// finding a NUL.
+    pub fn read_user_cstr(
+        &self,
+        src: UserPtr<u8>,
+        max_len: usize,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<Vec<u8>> {
+        if src.addr() == 0 || max_len == 0 {
+            return StepOutcome::Done(Vec::new());
+        }
+        let mut out: Vec<u8> = Vec::with_capacity(core::cmp::min(max_len, 256));
+        let mut consumed = 0usize;
+        while consumed < max_len {
+            let user_addr = src.addr().wrapping_add(consumed);
+            let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
+            let within = user_addr - page_addr;
+            let chunk = core::cmp::min(max_len - consumed, USER_PAGE_SIZE - within);
+            let frame_base =
+                match resolve_user_page_addr(self, page_addr, UserAccessKind::Read, guard) {
+                    ResolveOutcome::Done(addr) => addr,
+                    ResolveOutcome::Err(e) => return StepOutcome::Err(e),
+                    ResolveOutcome::Blocked(t) => return StepOutcome::Blocked(t),
+                };
+            // SAFETY: frame_base.add(within) is a valid kernel
+            // direct-map pointer to the requested user byte; we read
+            // up to `chunk` bytes which fit inside `USER_PAGE_SIZE -
+            // within`. The page stayed live across this scan because
+            // we hold the materialisation pin via the resolve helper.
+            // Note: ResolveOutcome only carries the bare address — we
+            // re-resolve every page rather than threading the
+            // `MaterializedPage` through the loop because the
+            // c-string scan may exit mid-page.
+            for i in 0..chunk {
+                let byte = unsafe { core::ptr::read(frame_base.add(within + i)) };
+                if byte == 0 {
+                    return StepOutcome::Done(out);
+                }
+                out.push(byte);
+            }
+            consumed += chunk;
+        }
+        StepOutcome::Err(Errno::ENAMETOOLONG)
+    }
+}
+
+fn copy_in(
+    aspace: &AddressSpace,
+    dst: &mut [u8],
+    src: UserPtr<u8>,
+    guard: &Guard<'_>,
+) -> StepOutcome<usize> {
+    if dst.is_empty() {
+        return StepOutcome::Done(0);
+    }
+    if src.addr() == 0 {
+        return StepOutcome::Err(Errno::EFAULT);
+    }
+    let mut copied = 0usize;
+    let total = dst.len();
+    while copied < total {
+        let user_addr = src.addr().wrapping_add(copied);
+        let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
+        let within = user_addr - page_addr;
+        let chunk = core::cmp::min(total - copied, USER_PAGE_SIZE - within);
+        match resolve_user_page_addr(aspace, page_addr, UserAccessKind::Read, guard) {
+            ResolveOutcome::Done(frame_base) => {
+                // SAFETY: `frame_base.add(within)` is a valid kernel
+                // direct-map pointer to the requested user byte; we
+                // copy exactly `chunk <= USER_PAGE_SIZE - within`
+                // bytes. The destination slice has at least `chunk`
+                // bytes remaining at offset `copied`. The
+                // materialisation pin keeps the frame live until
+                // `resolve_user_page_addr` returns; the copy
+                // completes synchronously here.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        frame_base.add(within),
+                        dst.as_mut_ptr().add(copied),
+                        chunk,
+                    );
+                }
+                copied += chunk;
+            }
+            ResolveOutcome::Err(e) => {
+                if copied > 0 {
+                    return StepOutcome::Done(copied);
+                }
+                return StepOutcome::Err(e);
+            }
+            ResolveOutcome::Blocked(t) => {
+                if copied > 0 {
+                    return StepOutcome::AdvancedThenBlocked(copied, t);
+                }
+                return StepOutcome::Blocked(t);
+            }
+        }
+    }
+    StepOutcome::Done(copied)
+}
+
+fn copy_out(
+    aspace: &AddressSpace,
+    dst: UserPtr<u8>,
+    src: &[u8],
+    guard: &Guard<'_>,
+) -> StepOutcome<usize> {
+    if src.is_empty() {
+        return StepOutcome::Done(0);
+    }
+    if dst.addr() == 0 {
+        return StepOutcome::Err(Errno::EFAULT);
+    }
+    let mut copied = 0usize;
+    let total = src.len();
+    while copied < total {
+        let user_addr = dst.addr().wrapping_add(copied);
+        let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
+        let within = user_addr - page_addr;
+        let chunk = core::cmp::min(total - copied, USER_PAGE_SIZE - within);
+        match resolve_user_page_addr(aspace, page_addr, UserAccessKind::Write, guard) {
+            ResolveOutcome::Done(frame_base) => {
+                // SAFETY: same as `copy_in`, with direction reversed
+                // — frame_base is the kernel direct-map view of the
+                // user-page being written; the source slice has at
+                // least `chunk` bytes remaining at offset `copied`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src.as_ptr().add(copied),
+                        frame_base.add(within),
+                        chunk,
+                    );
+                }
+                copied += chunk;
+            }
+            ResolveOutcome::Err(e) => {
+                if copied > 0 {
+                    return StepOutcome::Done(copied);
+                }
+                return StepOutcome::Err(e);
+            }
+            ResolveOutcome::Blocked(t) => {
+                if copied > 0 {
+                    return StepOutcome::AdvancedThenBlocked(copied, t);
+                }
+                return StepOutcome::Blocked(t);
+            }
+        }
+    }
+    StepOutcome::Done(copied)
+}
+
+/// Outcome of resolving one user page to its kernel direct-map
+/// address.
+enum ResolveOutcome {
+    /// Kernel direct-map base pointer for the resolved page. The
+    /// `MaterializedPage` pin is dropped before returning, so the
+    /// pointer is only safe for the synchronous remainder of the
+    /// containing tool-step. Both `copy_in` / `copy_out` use the
+    /// pointer immediately for one `copy_nonoverlapping` and discard
+    /// it; `read_user_cstr` re-resolves per page.
+    Done(*mut u8),
+    Err(Errno),
+    Blocked(WaitToken),
+}
+
+/// Look up the `VmEntry` covering `page_addr`, validate the access
+/// against its `Prot`, materialise the page through its backing, and
+/// translate the resulting `Ppn` into a kernel direct-map address.
+///
+/// Pmap-first probe (per VM_v1_2 §"No rmap"): if the page already has
+/// a published pmap entry whose `Prot` permits the access, return the
+/// cached frame's kernel direct-map address directly. The frame is
+/// kept resident by the existing pmap entry's `MapPin`; the caller
+/// only borrows the pointer for the synchronous remainder of the
+/// containing tool-step (matching the existing `ResolveOutcome::Done`
+/// contract — the pin is **not** plumbed through). On miss (or
+/// insufficient cached prot), fall through to the per-call materialise
+/// path which preserves the original eager-walk semantics.
+///
+/// Without the pmap-first probe, `VmBacking::PrivateAnon` would
+/// allocate a fresh zero frame on every call, breaking cross-call
+/// consistency: a `copy_to_user` write would not be visible to a
+/// subsequent `copy_from_user` read on the same page. brk-backed
+/// userspace heap (musl malloc / argv strings) requires this
+/// consistency.
+fn resolve_user_page_addr(
+    aspace: &AddressSpace,
+    page_addr: usize,
+    kind: UserAccessKind,
+    guard: &Guard<'_>,
+) -> ResolveOutcome {
+    // Use the in-vm `recipes.lookup(addr, guard)` directly rather
+    // than `aspace.lookup(addr)` so the caller's existing epoch
+    // guard is reused. Allocating a nested `epoch::guard()` here
+    // panics on the host test harness.
+    let entry = match aspace.recipes.lookup(UserVirtAddr(page_addr), guard) {
+        Some(e) => e,
+        None => return ResolveOutcome::Err(Errno::EFAULT),
+    };
+    if !entry.prot.permits(kind.required_prot()) {
+        return ResolveOutcome::Err(Errno::EFAULT);
+    }
+
+    // Pmap-first lookup. The published mapping pins the frame; we
+    // borrow the kernel direct-map pointer for the synchronous copy
+    // and release it before returning, matching `ResolveOutcome::Done`'s
+    // existing contract (no MapPin threaded out).
+    let user_page = UserVirtAddr(page_addr).containing_page();
+    if let Some(snapshot) = aspace.pmap.lookup(user_page) {
+        if snapshot.prot.permits(kind.required_prot()) {
+            return match page_allocator::frame_kernel_addr(snapshot.ppn) {
+                Ok(p) => ResolveOutcome::Done(p),
+                Err(_) => ResolveOutcome::Err(Errno::EFAULT),
+            };
+        }
+        // Cached mapping rejects this access. The recipe permits it
+        // (we checked above), so the cached prot must be a stricter
+        // demotion (e.g. read-only PTE published for a private-anon
+        // first-touch read; the next write fault would refault and
+        // republish). Fall through to materialise + publish.
+    }
+
+    // Pmap miss (or insufficient cached prot). Materialise via the
+    // backing path. We then synchronously publish the result to the
+    // pmap so a subsequent `copy_*_user` over the same page lands the
+    // pmap-first probe above and observes the same frame.
+    //
+    // Without the publish, `VmBacking::PrivateAnon` would re-zero on
+    // every call (each materialisation allocates a fresh frame),
+    // breaking write-then-read consistency of brk-backed heap pages.
+    let materialised = match resolve_user_page(&entry, page_addr, kind, guard) {
+        ResolvePageOutcome::Done(m) => m,
+        ResolvePageOutcome::Err(e) => return ResolveOutcome::Err(e),
+        ResolvePageOutcome::Blocked(t) => return ResolveOutcome::Blocked(t),
+    };
+    // Publish via pmap so the next call hits the cache. The
+    // `publish_prot` mirrors `fault_script`: read access on a
+    // private-anon page publishes a read-only mapping (the next write
+    // would refault and republish writable); write access publishes
+    // the entry's full prot. Failure to publish is non-fatal — we
+    // still have the materialised frame in hand for *this* call. The
+    // next call will re-materialise (correct but slower).
+    let publish_prot = match (&entry.backing, kind) {
+        (VmBacking::PrivateAnon, UserAccessKind::Read) => entry.prot.without_write(),
+        (VmBacking::Page { .. }, UserAccessKind::Read) if !entry.flags.shared => {
+            entry.prot.without_write()
+        }
+        _ => entry.prot,
+    };
+    let user_page = UserVirtAddr(page_addr).containing_page();
+    let _ = aspace.pmap.publish_page_with_replacement(
+        user_page,
+        materialised.ppn,
+        publish_prot,
+        materialised.map_pin,
+        true,
+    );
+    match page_allocator::frame_kernel_addr(materialised.ppn) {
+        Ok(p) => ResolveOutcome::Done(p),
+        Err(_) => ResolveOutcome::Err(Errno::EFAULT),
+    }
+}
+
+enum ResolvePageOutcome {
+    Done(MaterializedPage),
+    Err(Errno),
+    Blocked(WaitToken),
+}
+
+fn resolve_user_page(
+    entry: &VmEntry,
+    page_addr: usize,
+    kind: UserAccessKind,
+    guard: &Guard<'_>,
+) -> ResolvePageOutcome {
+    match &entry.backing {
+        VmBacking::None => ResolvePageOutcome::Err(Errno::EFAULT),
+        VmBacking::PrivateAnon => {
+            // Reuse the VM fault path's private-anon materialisation
+            // for consistency: a fresh zeroed frame for read access,
+            // a private writable frame for write access. Today this
+            // does not share state with the per-thread fault path's
+            // pmap publication — eager-walk reads of an unwritten
+            // anon page may yield a different (but equally zeroed)
+            // frame than a subsequent fault would publish, which
+            // matches Linux's "unwritten anon = zero" semantics.
+            let page_range = match crate::vm::structure::UserRange::new_aligned(
+                UserVirtAddr(page_addr),
+                USER_PAGE_SIZE,
+            ) {
+                Ok(r) => r,
+                Err(_) => return ResolvePageOutcome::Err(Errno::EFAULT),
+            };
+            let outcome = crate::vm::structure::VmFaultOutcome {
+                page_range,
+                entry: entry.clone(),
+                access: kind.required_prot(),
+                pmap_materialization_deferred: true,
+            };
+            match outcome.materialize_pagebacked() {
+                Ok(materialization) => ResolvePageOutcome::Done(materialization.page),
+                Err(_) => ResolvePageOutcome::Err(Errno::EFAULT),
+            }
+        }
+        VmBacking::Page { pc, offset } => {
+            let entry_start = entry.range.start().as_usize();
+            let delta = match page_addr.checked_sub(entry_start) {
+                Some(v) => v,
+                None => return ResolvePageOutcome::Err(Errno::EFAULT),
+            };
+            let backing_offset = match (delta as u64).checked_add(*offset) {
+                Some(v) => v,
+                None => return ResolvePageOutcome::Err(Errno::EFAULT),
+            };
+            if !backing_offset.is_multiple_of(USER_PAGE_SIZE as u64) {
+                return ResolvePageOutcome::Err(Errno::EFAULT);
+            }
+            let page_index = PageIndex::new(backing_offset / USER_PAGE_SIZE as u64);
+            match pc.materialize_page(page_index, kind.materialize_access(), guard) {
+                StepOutcome::Done(m) | StepOutcome::Advanced(m) => ResolvePageOutcome::Done(m),
+                StepOutcome::Blocked(t) => ResolvePageOutcome::Blocked(t),
+                StepOutcome::AdvancedThenBlocked(m, _) => ResolvePageOutcome::Done(m),
+                StepOutcome::Err(_) => ResolvePageOutcome::Err(Errno::EFAULT),
+            }
+        }
+    }
+}

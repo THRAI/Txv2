@@ -21,9 +21,7 @@
 //! by the txKernel allocator and will never be mapped; a fault at VA 0 cannot
 //! reach this path.
 
-use tx_hal::{FaultInfo, KernelPtr, UserAccessIf, UserPtr, VirtAddr};
-
-use crate::Platform;
+use tx_hal::{FaultInfo, UserPtr, VirtAddr};
 
 #[cfg(target_arch = "riscv64")]
 const RV64_SSTATUS_SUM: usize = 1 << 18;
@@ -235,41 +233,56 @@ impl Drop for UserMemoryAccessGuard {
 }
 
 // ---------------------------------------------------------------------------
-// UserAccessIf implementation for Platform
+// Board-internal user-access primitives
 // ---------------------------------------------------------------------------
+//
+// Used by `signal_frame.rs` for the rare kernel-side "write a struct to a
+// user-stack frame" path. The general user-access flow has moved to
+// `tx_subsystems::vm::AddressSpace::copy_*_user`, which walks recipes
+// eagerly and never enters the SUM/fixup window. Signal-frame writes
+// are special: they happen synchronously while the user is suspended
+// in the trap shell, and the user mapping is implicitly trusted to
+// cover the chosen stack page.
 
-impl UserAccessIf for Platform {
-    unsafe fn copy_from_user(
-        dst: KernelPtr<u8>,
-        src: UserPtr<u8>,
-        len: usize,
-    ) -> Result<(), FaultInfo> {
+/// Copy `dst.len()` bytes from user-space `src` to kernel-side `dst`.
+///
+/// # Safety
+///
+/// * `dst` must be a valid, writable kernel slice.
+/// * `src` is interpreted in the currently installed user page table.
+/// * The fixup table must be fully populated before this is called
+///   (guaranteed after `init_early` returns).
+pub(crate) unsafe fn board_copy_from_user(
+    dst: &mut [u8],
+    src: UserPtr<u8>,
+) -> Result<(), FaultInfo> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        // SAFETY: dst is a valid kernel slice (caller); src is the
+        // user address passed by the caller; the fixup table covers
+        // the load instruction so a fault becomes an Err rather than
+        // a panic. SUM is restored when the guard drops.
+        let _sum = unsafe { UserMemoryAccessGuard::enable() };
+        let fault_va = unsafe { tx_rv64_cfu_raw(dst.as_mut_ptr(), src.as_ptr(), dst.len()) };
+        if fault_va == 0 {
+            Ok(())
+        } else {
+            Err(FaultInfo {
+                address: VirtAddr(fault_va),
+                write: false,
+                instruction: false,
+                from_user: false,
+            })
+        }
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
         let _ = dst;
-        if len == 0 {
-            return Ok(());
-        }
-
-        #[cfg(target_arch = "riscv64")]
-        {
-            // SAFETY: dst is a valid kernel pointer; src is the user address
-            // passed by the caller; the fixup table covers the load instruction
-            // so a fault becomes an Err rather than a panic. SUM is restored
-            // when the guard drops, including after a fixup recovery.
-            let _sum = unsafe { UserMemoryAccessGuard::enable() };
-            let fault_va = unsafe { tx_rv64_cfu_raw(dst.as_ptr(), src.as_ptr(), len) };
-            if fault_va == 0 {
-                Ok(())
-            } else {
-                Err(FaultInfo {
-                    address: VirtAddr(fault_va),
-                    write: false,
-                    instruction: false,
-                    from_user: false,
-                })
-            }
-        }
-
-        #[cfg(not(target_arch = "riscv64"))]
         Err(FaultInfo {
             address: VirtAddr(src.addr()),
             write: false,
@@ -277,38 +290,41 @@ impl UserAccessIf for Platform {
             from_user: false,
         })
     }
+}
 
-    unsafe fn copy_to_user(
-        dst: UserPtr<u8>,
-        src: KernelPtr<u8>,
-        len: usize,
-    ) -> Result<(), FaultInfo> {
+/// Copy `src.len()` bytes from kernel-side `src` to user-space `dst`.
+///
+/// # Safety
+///
+/// * `src` must be a valid, readable kernel slice.
+/// * `dst` is interpreted in the currently installed user page table.
+pub(crate) unsafe fn board_copy_to_user(dst: UserPtr<u8>, src: &[u8]) -> Result<(), FaultInfo> {
+    if src.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        // SAFETY: src is a valid kernel slice (caller); dst is the
+        // user address passed by the caller; the fixup table covers
+        // the store instruction. SUM is restored when the guard drops.
+        let _sum = unsafe { UserMemoryAccessGuard::enable() };
+        let fault_va = unsafe { tx_rv64_ctu_raw(dst.as_ptr(), src.as_ptr() as *mut u8, src.len()) };
+        if fault_va == 0 {
+            Ok(())
+        } else {
+            Err(FaultInfo {
+                address: VirtAddr(fault_va),
+                write: true,
+                instruction: false,
+                from_user: false,
+            })
+        }
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
         let _ = src;
-        if len == 0 {
-            return Ok(());
-        }
-
-        #[cfg(target_arch = "riscv64")]
-        {
-            // SAFETY: src is a valid kernel pointer; dst is the user address
-            // passed by the caller; the fixup table covers the store instruction.
-            // SUM is restored when the guard drops, including after a fixup
-            // recovery.
-            let _sum = unsafe { UserMemoryAccessGuard::enable() };
-            let fault_va = unsafe { tx_rv64_ctu_raw(dst.as_ptr(), src.as_ptr(), len) };
-            if fault_va == 0 {
-                Ok(())
-            } else {
-                Err(FaultInfo {
-                    address: VirtAddr(fault_va),
-                    write: true,
-                    instruction: false,
-                    from_user: false,
-                })
-            }
-        }
-
-        #[cfg(not(target_arch = "riscv64"))]
         Err(FaultInfo {
             address: VirtAddr(dst.addr()),
             write: true,

@@ -5,13 +5,16 @@
 //! and zombie ignoring.
 
 use crate::cred::{
-    step_setgid, step_setuid, Capability, CapabilitySet, Cred, CredChange, Gid, Uid,
+    step_apply_suid_for_exec, step_setgid, step_setregid, step_setresgid, step_setresuid,
+    step_setreuid, step_setuid, Capability, CapabilitySet, Cred, CredChange, Gid, Uid,
 };
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
 use crate::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
+use crate::vfs::structure::{S_ISGID, S_ISUID};
+use crate::vfs::Credential;
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
 use tx_substrate::testing::init_host_for_test_once;
@@ -97,8 +100,10 @@ fn fork_inherits_parent_cred_unchanged() {
     let custom = Cred {
         uid: Uid(1000),
         euid: Uid(1000),
+        suid: Uid(1000),
         gid: Gid(1000),
         egid: Gid(1000),
+        sgid: Gid(1000),
         effective_caps,
         permitted_caps: CapabilitySet::EMPTY,
     };
@@ -122,6 +127,8 @@ fn setuid_privileged_changes_both_uid_and_euid() {
     assert!(prev.euid.is_root());
     assert_eq!(new.uid, Uid(1000));
     assert_eq!(new.euid, Uid(1000));
+    // Privileged setuid bumps the saved-set to match.
+    assert_eq!(new.suid, Uid(1000));
 }
 
 #[test]
@@ -129,12 +136,14 @@ fn setuid_unprivileged_can_swap_among_existing_ids_only() {
     let _g = setup();
     let proc_cap = bootstrap();
 
-    // Drop privileges: uid=1000, euid=1001, no caps.
+    // Drop privileges: uid=1000, euid=1001, suid=1001, no caps.
     let limited = Cred {
         uid: Uid(1000),
         euid: Uid(1001),
+        suid: Uid(1001),
         gid: Gid(0),
         egid: Gid(0),
+        sgid: Gid(0),
         effective_caps: CapabilitySet::EMPTY,
         permitted_caps: CapabilitySet::EMPTY,
     };
@@ -147,11 +156,19 @@ fn setuid_unprivileged_can_swap_among_existing_ids_only() {
     };
     assert_eq!(new.uid, Uid(1000));
     assert_eq!(new.euid, Uid(1000));
+    // Non-privileged setuid preserves suid.
+    assert_eq!(new.suid, Uid(1001));
 
-    // Allowed: swap back to the saved euid (still 1000 currently;
-    // semantics here let us re-pick the prior euid, which is 1000
-    // since we just assigned it). Validate the rejection path next.
+    // Allowed: 1001 is still in {uid: 1000, euid: 1000, suid: 1001}.
     let outcome = step_setuid(&proc_cap, Uid(1001));
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced, got {outcome:?}");
+    };
+    assert_eq!(new.euid, Uid(1001));
+    assert_eq!(new.suid, Uid(1001));
+
+    // Disallowed: 9999 is not in {uid, euid, suid}.
+    let outcome = step_setuid(&proc_cap, Uid(9999));
     assert_eq!(outcome, CredChange::PermissionDenied);
 }
 
@@ -174,6 +191,7 @@ fn setgid_privileged_changes_both_gid_and_egid() {
     };
     assert_eq!(new.gid, Gid(2000));
     assert_eq!(new.egid, Gid(2000));
+    assert_eq!(new.sgid, Gid(2000));
 }
 
 #[test]
@@ -183,8 +201,10 @@ fn setgid_unprivileged_rejects_arbitrary_gid() {
     let limited = Cred {
         uid: Uid(1000),
         euid: Uid(1000),
+        suid: Uid(1000),
         gid: Gid(100),
         egid: Gid(100),
+        sgid: Gid(100),
         effective_caps: CapabilitySet::EMPTY,
         permitted_caps: CapabilitySet::EMPTY,
     };
@@ -193,7 +213,7 @@ fn setgid_unprivileged_rejects_arbitrary_gid() {
     let outcome = step_setgid(&proc_cap, Gid(200));
     assert_eq!(outcome, CredChange::PermissionDenied);
 
-    // But swapping among (gid, egid) is allowed.
+    // But swapping among (gid, egid, sgid) is allowed.
     let outcome = step_setgid(&proc_cap, Gid(100));
     assert!(matches!(outcome, CredChange::Replaced { .. }));
 }
@@ -203,8 +223,10 @@ fn cred_shares_euid_compares_effective_uids() {
     let make = |euid| Cred {
         uid: Uid(0),
         euid,
+        suid: Uid(0),
         gid: Gid(0),
         egid: Gid(0),
+        sgid: Gid(0),
         effective_caps: CapabilitySet::EMPTY,
         permitted_caps: CapabilitySet::EMPTY,
     };
@@ -214,4 +236,375 @@ fn cred_shares_euid_compares_effective_uids() {
 
     assert!(a.shares_euid(b));
     assert!(!a.shares_euid(c));
+}
+
+// ============================================================
+// DAC + setuid Wave 1: saved-set helpers
+// ============================================================
+
+/// Helper: drop privileges to (uid=ruid, euid=euid, suid=suid).
+fn drop_to(proc_cap: &Cap<ProcessIdentity>, ruid: u32, euid: u32, suid: u32) {
+    let cred = Cred {
+        uid: Uid(ruid),
+        euid: Uid(euid),
+        suid: Uid(suid),
+        gid: Gid(ruid),
+        egid: Gid(euid),
+        sgid: Gid(suid),
+        effective_caps: CapabilitySet::EMPTY,
+        permitted_caps: CapabilitySet::EMPTY,
+    };
+    set_cred(proc_cap, cred);
+}
+
+#[test]
+fn step_setuid_privileged_writes_suid_to_new_uid() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let outcome = step_setuid(&proc_cap, Uid(1000));
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced");
+    };
+    assert_eq!(new.uid, Uid(1000));
+    assert_eq!(new.euid, Uid(1000));
+    assert_eq!(new.suid, Uid(1000));
+}
+
+#[test]
+fn step_setuid_non_privileged_preserves_suid() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1000, 1001, 1002);
+
+    // 1002 is in {1000, 1001, 1002}, so the call is permitted.
+    let outcome = step_setuid(&proc_cap, Uid(1002));
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced");
+    };
+    assert_eq!(new.uid, Uid(1000)); // real preserved
+    assert_eq!(new.euid, Uid(1002));
+    assert_eq!(new.suid, Uid(1002)); // saved-set preserved (not changed)
+}
+
+#[test]
+fn step_setresuid_privileged_sets_all_three() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let outcome = step_setresuid(&proc_cap, Some(Uid(1000)), Some(Uid(1001)), Some(Uid(1002)));
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced");
+    };
+    assert_eq!(new.uid, Uid(1000));
+    assert_eq!(new.euid, Uid(1001));
+    assert_eq!(new.suid, Uid(1002));
+}
+
+#[test]
+fn step_setresuid_unprivileged_within_real_euid_suid_succeeds() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1000, 1001, 1002);
+
+    // All three values are in {1000, 1001, 1002}; permitted.
+    let outcome = step_setresuid(&proc_cap, Some(Uid(1001)), Some(Uid(1000)), Some(Uid(1002)));
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced");
+    };
+    assert_eq!(new.uid, Uid(1001));
+    assert_eq!(new.euid, Uid(1000));
+    assert_eq!(new.suid, Uid(1002));
+}
+
+#[test]
+fn step_setresuid_unprivileged_outside_returns_eperm() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1000, 1001, 1002);
+    let prev = cred_of(&proc_cap);
+
+    // 9999 is not in {uid, euid, suid}; the entire call must fail
+    // atomically (no field change).
+    let outcome = step_setresuid(&proc_cap, Some(Uid(1000)), Some(Uid(9999)), None);
+    assert_eq!(outcome, CredChange::PermissionDenied);
+    assert_eq!(cred_of(&proc_cap), prev);
+}
+
+#[test]
+fn step_setresuid_with_none_leaves_field_unchanged() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1000, 1001, 1002);
+
+    // Only update euid; ruid/suid stay as-is.
+    let outcome = step_setresuid(&proc_cap, None, Some(Uid(1000)), None);
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced");
+    };
+    assert_eq!(new.uid, Uid(1000));
+    assert_eq!(new.euid, Uid(1000));
+    assert_eq!(new.suid, Uid(1002));
+}
+
+#[test]
+fn step_setreuid_updates_suid_on_euid_change() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1000, 1000, 1000);
+
+    // Non-privileged, change euid to a value in the existing set
+    // (the real uid 1000 is itself in the set, so euid stays in
+    // {uid, euid, suid}). Use suid=1002 instead so the bump is
+    // visible.
+    drop_to(&proc_cap, 1000, 1001, 1002);
+
+    // Set euid to 1002 (in set). Per Linux quirk: post-call euid
+    // (1002) differs from prev.uid (1000), so suid is bumped.
+    let outcome = step_setreuid(&proc_cap, None, Some(Uid(1002)));
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced");
+    };
+    assert_eq!(new.uid, Uid(1000));
+    assert_eq!(new.euid, Uid(1002));
+    assert_eq!(new.suid, Uid(1002)); // bumped per the quirk
+}
+
+#[test]
+fn step_setreuid_does_not_bump_suid_when_euid_unchanged_and_no_ruid_change() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1000, 1000, 1002);
+
+    // Set euid back to its current value (1000). post-call euid
+    // (1000) matches prev.uid (1000), and ruid is None. Suid stays.
+    let outcome = step_setreuid(&proc_cap, None, Some(Uid(1000)));
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced");
+    };
+    assert_eq!(new.suid, Uid(1002));
+}
+
+#[test]
+fn step_setresgid_privileged_sets_all_three() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let outcome = step_setresgid(&proc_cap, Some(Gid(2000)), Some(Gid(2001)), Some(Gid(2002)));
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced");
+    };
+    assert_eq!(new.gid, Gid(2000));
+    assert_eq!(new.egid, Gid(2001));
+    assert_eq!(new.sgid, Gid(2002));
+}
+
+#[test]
+fn step_setresgid_unprivileged_outside_returns_eperm() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    // Bring caller down to non-privileged uid first so cred is
+    // unprivileged for SETGID checks.
+    drop_to(&proc_cap, 1000, 1000, 1000);
+    // Set gid context.
+    let cred = Cred {
+        uid: Uid(1000),
+        euid: Uid(1000),
+        suid: Uid(1000),
+        gid: Gid(2000),
+        egid: Gid(2001),
+        sgid: Gid(2002),
+        effective_caps: CapabilitySet::EMPTY,
+        permitted_caps: CapabilitySet::EMPTY,
+    };
+    set_cred(&proc_cap, cred);
+    let prev = cred_of(&proc_cap);
+
+    let outcome = step_setresgid(&proc_cap, None, Some(Gid(9999)), None);
+    assert_eq!(outcome, CredChange::PermissionDenied);
+    assert_eq!(cred_of(&proc_cap), prev);
+}
+
+#[test]
+fn step_setregid_updates_sgid_on_egid_change() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let cred = Cred {
+        uid: Uid(1000),
+        euid: Uid(1000),
+        suid: Uid(1000),
+        gid: Gid(2000),
+        egid: Gid(2001),
+        sgid: Gid(2002),
+        effective_caps: CapabilitySet::EMPTY,
+        permitted_caps: CapabilitySet::EMPTY,
+    };
+    set_cred(&proc_cap, cred);
+
+    // Set egid to 2002 (in {gid, egid, sgid}); since post-call egid
+    // (2002) differs from prev.gid (2000), sgid is bumped.
+    let outcome = step_setregid(&proc_cap, None, Some(Gid(2002)));
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced");
+    };
+    assert_eq!(new.egid, Gid(2002));
+    assert_eq!(new.sgid, Gid(2002));
+}
+
+#[test]
+fn cred_to_walker_credential_drops_permitted_keeps_effective() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    // Set non-trivial cred where uid != euid and effective_caps !=
+    // permitted_caps to verify the bridge: walker reads euid/egid
+    // and effective_caps; permitted_caps is dropped.
+    let mut effective = CapabilitySet::EMPTY;
+    effective.add(Capability::DAC_OVERRIDE);
+    let mut permitted = CapabilitySet::EMPTY;
+    permitted.add(Capability::DAC_OVERRIDE);
+    permitted.add(Capability::SETUID); // present in permitted but not effective
+    let cred = Cred {
+        uid: Uid(1000),
+        euid: Uid(1001),
+        suid: Uid(1001),
+        gid: Gid(2000),
+        egid: Gid(2001),
+        sgid: Gid(2001),
+        effective_caps: effective,
+        permitted_caps: permitted,
+    };
+    set_cred(&proc_cap, cred);
+    let snapshot = cred_of(&proc_cap);
+
+    let walker_cred = Credential::from(&snapshot);
+    // Linux semantics: walker uses effective uid/gid for DAC checks.
+    assert_eq!(walker_cred.uid, 1001);
+    assert_eq!(walker_cred.gid, 2001);
+    // effective_caps is preserved verbatim.
+    assert_eq!(walker_cred.effective_caps, effective);
+    // permitted_caps is not represented on Credential at all
+    // (compile-time guarantee — if the field grew, the test wouldn't
+    // compile).
+}
+
+// ============================================================
+// DAC + setuid Wave 4 Part 5: step_apply_suid_for_exec
+// ============================================================
+
+#[test]
+fn step_apply_suid_for_exec_no_setuid_bit_unchanged() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1001, 1001, 1001);
+    let prev = cred_of(&proc_cap);
+
+    // mode 0o755 has no setuid/setgid bits.
+    let outcome =
+        step_apply_suid_for_exec(&proc_cap, Uid(1000), Gid(1000), 0o755).expect("alive process");
+    assert!(!outcome.at_secure);
+    assert_eq!(outcome.previous_cred, prev);
+    assert_eq!(cred_of(&proc_cap), prev);
+}
+
+#[test]
+fn step_apply_suid_for_exec_setuid_bit_sets_euid_and_suid() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1001, 1001, 1001);
+
+    // S_ISUID | 0o755 → file owned by uid 1000 should produce
+    // post-recompute euid=1000, suid=1000; real uid stays at 1001.
+    let outcome = step_apply_suid_for_exec(&proc_cap, Uid(1000), Gid(0), S_ISUID | 0o755)
+        .expect("alive process");
+    assert!(outcome.at_secure);
+    assert_eq!(outcome.previous_cred.euid, Uid(1001));
+
+    let new = cred_of(&proc_cap);
+    assert_eq!(new.uid, Uid(1001));
+    assert_eq!(new.euid, Uid(1000));
+    assert_eq!(new.suid, Uid(1000));
+}
+
+#[test]
+fn step_apply_suid_for_exec_setgid_with_group_x_sets_egid_and_sgid() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let cred = Cred {
+        uid: Uid(1001),
+        euid: Uid(1001),
+        suid: Uid(1001),
+        gid: Gid(2001),
+        egid: Gid(2001),
+        sgid: Gid(2001),
+        effective_caps: CapabilitySet::EMPTY,
+        permitted_caps: CapabilitySet::EMPTY,
+    };
+    set_cred(&proc_cap, cred);
+
+    // S_ISGID | 0o2755 → has S_ISGID and group-X (0o010). File owned
+    // by gid 2000.
+    let outcome = step_apply_suid_for_exec(&proc_cap, Uid(0), Gid(2000), S_ISGID | 0o755)
+        .expect("alive process");
+    assert!(outcome.at_secure);
+
+    let new = cred_of(&proc_cap);
+    assert_eq!(new.gid, Gid(2001), "real gid preserved");
+    assert_eq!(new.egid, Gid(2000));
+    assert_eq!(new.sgid, Gid(2000));
+}
+
+#[test]
+fn step_apply_suid_for_exec_setgid_without_group_x_unchanged() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let cred = Cred {
+        uid: Uid(1001),
+        euid: Uid(1001),
+        suid: Uid(1001),
+        gid: Gid(2001),
+        egid: Gid(2001),
+        sgid: Gid(2001),
+        effective_caps: CapabilitySet::EMPTY,
+        permitted_caps: CapabilitySet::EMPTY,
+    };
+    set_cred(&proc_cap, cred);
+    let prev = cred_of(&proc_cap);
+
+    // S_ISGID | 0o4744 → has S_ISGID but NO group-X bit (group is r--).
+    // Linux's mandatory-locking semantic: cred is untouched.
+    let mode = S_ISGID | 0o744;
+    assert_eq!(mode & 0o010, 0, "fixture must lack group-X");
+
+    let outcome =
+        step_apply_suid_for_exec(&proc_cap, Uid(0), Gid(2000), mode).expect("alive process");
+    assert!(!outcome.at_secure);
+    assert_eq!(cred_of(&proc_cap), prev);
+}
+
+#[test]
+fn step_apply_suid_for_exec_at_secure_true_when_euid_changes() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1001, 1001, 1001);
+
+    // file_uid (1000) differs from caller's euid (1001) → at_secure.
+    let outcome = step_apply_suid_for_exec(&proc_cap, Uid(1000), Gid(0), S_ISUID | 0o755)
+        .expect("alive process");
+    assert!(outcome.at_secure);
+}
+
+#[test]
+fn step_apply_suid_for_exec_at_secure_false_when_no_change() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1000, 1000, 1000);
+
+    // Setuid bit set, but file_uid (1000) matches caller's euid (1000).
+    // No effective-uid delta → at_secure stays false.
+    let outcome = step_apply_suid_for_exec(&proc_cap, Uid(1000), Gid(0), S_ISUID | 0o755)
+        .expect("alive process");
+    assert!(!outcome.at_secure);
+
+    // suid is still rewritten to track the new euid (which equals
+    // prev.euid here, so it's a no-op write — pin the equality).
+    let new = cred_of(&proc_cap);
+    assert_eq!(new.euid, Uid(1000));
+    assert_eq!(new.suid, Uid(1000));
 }

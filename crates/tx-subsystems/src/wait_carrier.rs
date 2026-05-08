@@ -14,8 +14,9 @@ use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 use tx_reactor::wait::{Channel, Mask, WaitFuture};
 
+use tx_substrate::SpinMutex;
+
 use crate::execution::WaitToken;
-use crate::sync::SpinMutex;
 
 static REGISTRY: SpinMutex<BTreeMap<u64, Channel>> = SpinMutex::new(BTreeMap::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -90,10 +91,15 @@ mod tests {
     #[test]
     fn wait_on_token_returns_none_for_test_placeholder_token() {
         // Existing test mocks (BlockingFs, LifecycleFs) construct tokens with
-        // arbitrary numbers like (13, 0x55). Those tokens must not panic in
+        // arbitrary numbers; those tokens must not panic in
         // wait_on_token; they return None so production await sites can
         // treat them as a sentinel.
-        let token = WaitToken::new(13, 0x55);
+        //
+        // Use an obviously-out-of-range ID — Slice 3 (futex) registers
+        // 256 carriers at zone-init time, claiming IDs 1..N for some
+        // N that grows with each new wait-carrier producer. A
+        // sentinel above the entire u32 space is never collisional.
+        let token = WaitToken::new(u64::MAX - 1, 0x55);
         assert!(wait_on_token(token).is_none());
     }
 

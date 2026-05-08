@@ -25,18 +25,31 @@
 //!                                          └──Weak──▶ ProcessIdentity
 //! ```
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
+use tx_reactor::wait::{Channel, Mask};
 use tx_substrate::zone::{Cap, Dead, Entity, PayloadCap, Weak, Zone, ZoneAllocated};
+use tx_substrate::SpinMutex;
 
 use crate::cred::{Cred, Gid, Uid};
+use crate::execution::WaitToken;
 use crate::signal::{PendingSignalQueue, SigActionTable};
-use crate::sync::SpinMutex;
 use crate::thread_runtime::ThreadIdentity;
 use crate::tty::structure::identity::TtyIdentity;
-use crate::vfs::DEntry;
+use crate::vfs::{DEntry, OpenFile};
 use crate::vm::AddressSpace;
+use tx_substrate::AtomicSlot;
+
+/// Bit-mask for the "child has zombified" event on the per-process
+/// `exit_port`. Future events (stop, continue) get their own bits
+/// alongside their wakers; the slice carves out only this single bit.
+///
+/// Cites: `txdoc:PROCESS-WAIT-FAMILY-1`
+/// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4); plan
+/// `docs/progress/plans/2026-05-06-fork-clone-wait4.md` Open Q #1.
+pub const EXIT_PORT_CHILD_ZOMBIFIED: u64 = 0x1;
 
 /// Per-process exit disposition, populated by `step_exit_group` /
 /// `step_exit_group_with_signal` / the last-thread cascade. Spec
@@ -54,14 +67,30 @@ pub enum ExitStatus {
 }
 
 impl ExitStatus {
-    /// Day-1 numeric status word, shell-convention: raw int for
-    /// explicit exits, `128 + signum` for signal exits. POSIX
-    /// `wait(2)` will replace this with the proper
-    /// WIFEXITED / WIFSIGNALED encoding when the decoder lands.
+    /// POSIX `<sys/wait.h>` status word as `wait4(2)` returns it via
+    /// `wstatus`. The encoding matches Linux's generic ABI:
+    ///
+    /// - `Exited(code)` → `(code & 0xff) << 8` — `WIFEXITED(s)` is
+    ///   `(s & 0x7f) == 0` and `WEXITSTATUS(s) == (s >> 8) & 0xff`.
+    /// - `Signaled(sig)` → `sig.raw() & 0x7f` — `WIFSIGNALED(s)` is
+    ///   `(((s & 0x7f) + 1) >> 1) > 0` and `WTERMSIG(s) == s & 0x7f`.
+    ///
+    /// Out of slice: the core-dump bit (`s & 0x80`) is not computed —
+    /// txKernel doesn't track core-dump state. Stop/continue encoding
+    /// (`(sig << 8) | 0x7f` / `0xffff`) lands with the stop/cont
+    /// signal infrastructure slice.
+    ///
+    /// **Migration note (fork/clone/wait4 slice, 2026-05-06).**
+    /// Previously this returned the day-1 shell-convention `128 + sig`
+    /// shape. The shell encoding is the *userspace shell* (bash-style
+    /// program-exit-code) convention; the kernel↔userspace `wait4` ABI
+    /// uses the POSIX encoding above. Migrated to POSIX in tree per
+    /// the slice plan's Open Q #3 (DECIDED 2026-05-06: replace and
+    /// migrate the trio's smoke assertions).
     pub fn wait_status_word(self) -> i32 {
         match self {
-            ExitStatus::Exited(s) => s,
-            ExitStatus::Signaled(sig) => 128 + sig.raw() as i32,
+            ExitStatus::Exited(code) => (code & 0xff) << 8,
+            ExitStatus::Signaled(sig) => (sig.raw() as i32) & 0x7f,
         }
     }
 
@@ -200,8 +229,274 @@ impl ProcessIdentity {
 
     /// Snapshot the current address space `Cap`, if the process is
     /// alive. Returns `None` for zombies.
+    ///
+    /// Loads from the per-payload `AtomicSlot<Cap<AddressSpace>>`
+    /// (`txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`). The
+    /// slot is always populated for live payloads — initial state is
+    /// installed by `bootstrap_init_process` / `step_fork`, and exec's
+    /// phase 6 store keeps the slot inhabited at all times. A `None`
+    /// here therefore strictly means "the payload itself is gone"
+    /// (zombie), never "the slot is empty on a live payload".
     pub fn aspace_cap(&self) -> Option<Cap<AddressSpace>> {
-        self.payload.lock().as_ref().map(|p| p.aspace.clone())
+        self.payload.lock().as_ref().map(|p| p.aspace_cap())
+    }
+
+    /// Snapshot the per-process credential. Returns `None` for zombies
+    /// (payload dropped — cred is unobservable).
+    ///
+    /// `Cred` is `Copy`; the snapshot is independent of the lock and
+    /// safe to hold across `.await` points. Mutators
+    /// (`cred::step_setuid` / `step_setgid` / `step_setres{u,g}id` /
+    /// `step_setre{u,g}id`) acquire the lock internally; readers that
+    /// only need a coherent point-in-time view should use this
+    /// accessor rather than reaching into the `pub(crate)` payload
+    /// field directly.
+    ///
+    /// Used by the DAC + setuid slice's `SyscallCtx::cred()` accessor
+    /// (`tx-shims::linux_syscall`) so every cred-mutation /
+    /// cred-reading syscall arm can read through one snapshot under
+    /// one lock acquisition.
+    pub fn cred(&self) -> Option<Cred> {
+        self.payload.lock().as_ref().map(|p| p.cred())
+    }
+
+    /// Replace this process's address space with `new` and return the
+    /// previous `Cap` so the caller can defer-drop it via EBR. Per
+    /// `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY` this
+    /// is the single irreversible exec store: the new aspace becomes
+    /// observable to every concurrent fault / VM lookup the moment
+    /// this returns. Returns `None` for zombies (no payload — caller
+    /// drops `new` itself).
+    pub fn replace_aspace(&self, new: Cap<AddressSpace>) -> Option<Cap<AddressSpace>> {
+        let payload_guard = self.payload.lock();
+        let payload = payload_guard.as_ref()?;
+        payload.aspace.swap(Some(new))
+    }
+
+    /// Snapshot the `Cap<OpenFile>` registered at fd `idx` on this
+    /// process's payload. Returns `None` if the process is a zombie
+    /// (no payload) or the slot is empty.
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeMap<u32, Cap<OpenFile>>`; any `u32` fd value is valid as
+    /// a key and an absent key reads back as `None`.
+    ///
+    /// Used by the syscall dispatcher (`tx-shims::linux_syscall`) to
+    /// resolve fds without holding the payload lock across a step's
+    /// `.await`.
+    pub fn fd(&self, idx: u32) -> Option<Cap<crate::vfs::OpenFile>> {
+        self.payload.lock().as_ref().and_then(|p| p.fd(idx))
+    }
+
+    /// Snapshot the current working-directory `Cap<DEntry>` if one is
+    /// installed on the payload. Returns `None` for zombies or
+    /// processes whose cwd has never been bound (init pre-rootfs).
+    ///
+    /// Used by `tx_fs::devfs::open_console_for_init` (the walker
+    /// redirect) to pick the search root for `step_open(/dev/console)`.
+    pub fn cwd(&self) -> Option<Cap<DEntry>> {
+        self.payload.lock().as_ref().and_then(|p| p.cwd())
+    }
+
+    /// Install `file` at fd `idx` on this process's payload, returning
+    /// the previously installed `Cap<OpenFile>` if any. No-op (returns
+    /// `None`) for zombies. Passing `file = None` removes the fd from
+    /// the table.
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeMap<u32, Cap<OpenFile>>`; any `u32` fd value is valid as
+    /// a key.
+    ///
+    /// Used by the syscall dispatcher's tests and (Phase 3b)
+    /// `init.rs` to preopen fds 0/1/2 against
+    /// `tx_fs::devfs::open_console_for_init()`.
+    pub fn set_fd(
+        &self,
+        idx: u32,
+        file: Option<Cap<crate::vfs::OpenFile>>,
+    ) -> Option<Cap<crate::vfs::OpenFile>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .and_then(|p| p.set_fd(idx, file))
+    }
+
+    /// Allocate the lowest unused fd ≥ 0 without installing anything.
+    /// Returns `0` for zombies (no payload) — the caller must not
+    /// install against a zombie regardless.
+    ///
+    /// Per fd-ops Wave 1 plan §C: needed by `sys_openat` (Wave 2),
+    /// `sys_dup` (Wave 4), and `sys_pipe2` (Wave 5) to mimic Linux's
+    /// "lowest unused fd" semantic.
+    pub fn allocate_fd(&self) -> u32 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.allocate_fd_at_least(0))
+            .unwrap_or(0)
+    }
+
+    /// Allocate the lowest unused fd ≥ `min`. Returns `min` for
+    /// zombies. Used by the future `F_DUPFD`-shape arms (lowest fd
+    /// ≥ N) and shells doing `>&5`-style redirection — the
+    /// `dup3(oldfd, newfd, 0)` arm with a specific `newfd` target
+    /// uses [`Self::install_fd`] instead.
+    pub fn allocate_fd_at_least(&self, min: u32) -> u32 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.allocate_fd_at_least(min))
+            .unwrap_or(min)
+    }
+
+    /// Return the lowest unused fd ≥ `min` without installing
+    /// anything. Returns `min` for zombies. Differs from
+    /// [`Self::allocate_fd_at_least`] only by intent: callers that
+    /// want to peek at the next free fd without committing to install
+    /// use this; both methods share the same underlying scan.
+    pub fn next_fd_above(&self, min: u32) -> u32 {
+        self.allocate_fd_at_least(min)
+    }
+
+    /// Install `file` at the specific fd `fd`, returning the
+    /// previously installed `Cap<OpenFile>` if any so the caller can
+    /// drop it under their own EBR guard. Returns `None` for zombies
+    /// (the install is a no-op).
+    ///
+    /// Convenience over [`Self::set_fd`] when callers always want to
+    /// install a `Some(file)` (matches the `dup2`/`dup3` shape: if
+    /// the target slot was occupied the previous occupant must be
+    /// closed). Identical effect to
+    /// `set_fd(fd, Some(file))` modulo the explicit `Cap` parameter.
+    pub fn install_fd(
+        &self,
+        fd: u32,
+        file: Cap<crate::vfs::OpenFile>,
+    ) -> Option<Cap<crate::vfs::OpenFile>> {
+        self.set_fd(fd, Some(file))
+    }
+
+    /// Read the close-on-exec bit for fd `fd` on this process's
+    /// payload. Returns `false` for zombies (no payload) and for
+    /// unmarked fds.
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeSet<u32>`; any `u32` fd value is valid (no fd-31
+    /// ceiling).
+    ///
+    /// Used by `tx-shims::linux_syscall::sys_fcntl` to service
+    /// `F_GETFD`, and by future `sys_open` plumbing once `O_CLOEXEC`
+    /// is threaded through the open arm.
+    pub fn fd_cloexec(&self, fd: u32) -> bool {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.fd_cloexec_get(fd))
+            .unwrap_or(false)
+    }
+
+    /// Set or clear the close-on-exec bit for fd `fd` on this
+    /// process's payload. No-op for zombies.
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeSet<u32>`; any `u32` fd value is valid (no fd-31
+    /// ceiling).
+    ///
+    /// Used by `tx-shims::linux_syscall::sys_fcntl` to service
+    /// `F_SETFD`, and by future `sys_open` plumbing once `O_CLOEXEC`
+    /// is threaded through.
+    pub fn set_fd_cloexec(&self, fd: u32, value: bool) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.set_fd_cloexec(fd, value);
+        }
+    }
+
+    /// Internal: snapshot the full close-on-exec set as an owned
+    /// `BTreeSet<u32>`. Returns an empty set for zombies. Used by
+    /// [`crate::process::execution::step_close_cloexec_fds`] during
+    /// exec phase 7 to walk every marked fd.
+    pub(crate) fn fd_cloexec_snapshot(&self) -> BTreeSet<u32> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.fd_cloexec_snapshot())
+            .unwrap_or_default()
+    }
+
+    /// Internal: clear the entire close-on-exec set. Used by
+    /// [`crate::process::execution::step_close_cloexec_fds`] after the
+    /// sweep so future `fcntl(F_SETFD)` calls start from a clean
+    /// state.
+    pub(crate) fn clear_fd_cloexec(&self) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.clear_fd_cloexec();
+        }
+    }
+
+    /// Snapshot the current `SigDisposition` for `sig` from this
+    /// process's per-process action table. Returns `None` for zombies
+    /// (no payload). Used by the `rt_sigaction(2)` syscall dispatcher
+    /// to read the live disposition without going through
+    /// `step_sigaction` (which would mutate). Per `SIGNAL_v1` §15.1.
+    pub fn sig_disposition(
+        &self,
+        sig: crate::signal::Signum,
+    ) -> Option<crate::signal::SigDisposition> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.sig_actions().get(sig))
+    }
+
+    /// Snapshot the program-break base for this process. Returns `0`
+    /// for zombies and for processes with no brk region configured.
+    /// Used by the `brk(2)` syscall dispatcher to compute the
+    /// `brk_script` arguments per `txdoc:VM-5-8-BRK`.
+    pub fn brk_base(&self) -> u64 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.brk_base())
+            .unwrap_or(0)
+    }
+
+    /// Snapshot the current program break for this process. Returns
+    /// `0` for zombies and for processes with no brk region.
+    pub fn current_brk(&self) -> u64 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.current_brk())
+            .unwrap_or(0)
+    }
+
+    /// Update the current program break. No-op for zombies. Used by
+    /// the `brk(2)` syscall dispatcher.
+    pub fn set_current_brk(&self, value: u64) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.set_current_brk(value);
+        }
+    }
+
+    /// Snapshot the per-process file-creation mask. Returns `0` for
+    /// zombies (no payload — defensively, the alive caller of
+    /// `umask(2)` always has a payload). Slice 6 of the shell-prompt
+    /// roadmap.
+    pub fn umask(&self) -> u16 {
+        self.payload.lock().as_ref().map(|p| p.umask()).unwrap_or(0)
+    }
+
+    /// Atomically replace the per-process file-creation mask, returning
+    /// the previous value. No-op (returns `0`) for zombies. The
+    /// argument is silently truncated to `0o777` per Linux semantics
+    /// (`umask(2)` ignores bits above the `rwxrwxrwx` triplets).
+    /// Used by the Slice 6 `sys_umask` arm.
+    pub fn swap_umask(&self, new: u16) -> u16 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.swap_umask(new))
+            .unwrap_or(0)
     }
 
     /// Number of currently-live threads owned by this process.
@@ -211,6 +506,67 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .map(|p| p.threads.lock().len())
+            .unwrap_or(0)
+    }
+
+    /// Snapshot the `Cap<ThreadIdentity>` of the thread at slot `idx`
+    /// in this process's thread list. Returns `None` for zombies and
+    /// for indices outside the live thread count.
+    ///
+    /// Used by the syscall dispatcher's tests (and the future Phase 6
+    /// userspace-entry shim) to grab the leader thread without
+    /// reaching into the `pub(crate)` payload field directly. Index 0
+    /// is always the leader for processes constructed by
+    /// `bootstrap_init_process` / `step_fork`; multi-threaded
+    /// processes (post-`clone`) extend the list.
+    pub fn nth_thread(&self, idx: usize) -> Option<Cap<ThreadIdentity>> {
+        let payload_guard = self.payload.lock();
+        let payload = payload_guard.as_ref()?;
+        let result = payload.threads.lock().get(idx).cloned();
+        result
+    }
+
+    /// Carrier id under which this process's `exit_port` channel is
+    /// registered with the global wait-carrier resolver. Returns
+    /// `None` for zombies (no payload — the channel is unreachable
+    /// once the payload has been dropped).
+    ///
+    /// Wave 2's `sys_wait4` blocking arm pairs this with
+    /// [`EXIT_PORT_CHILD_ZOMBIFIED`] to build the `WaitToken` it
+    /// awaits via [`crate::wait_carrier::wait_on_token`].
+    pub fn exit_port_carrier_id(&self) -> Option<u64> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.exit_port_carrier_id())
+    }
+
+    /// Build the `WaitToken` an awaiter parks on while waiting for any
+    /// child of this process to zombify. Returns `None` for zombies
+    /// (no payload).
+    ///
+    /// The returned token's interest mask is
+    /// [`EXIT_PORT_CHILD_ZOMBIFIED`] — Wave 1 carves out only the
+    /// child-zombified bit; future stop/cont events get separate bits
+    /// alongside their own wakers.
+    pub fn exit_port_wait_token(&self) -> Option<WaitToken> {
+        self.exit_port_carrier_id()
+            .map(|id| WaitToken::new(id, EXIT_PORT_CHILD_ZOMBIFIED))
+    }
+
+    /// Fire the `exit_port` channel with `mask`, returning the number
+    /// of awaiters released by [`Channel::fire`]. No-op (returns `0`)
+    /// for zombies.
+    ///
+    /// The fire site is
+    /// [`crate::process::execution::post_sigchld_to_parent`]: every
+    /// time SIGCHLD posts, the parent's `exit_port` fires the
+    /// `EXIT_PORT_CHILD_ZOMBIFIED` bit.
+    pub fn fire_exit_port(&self, mask: Mask) -> usize {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.exit_port().fire(mask))
             .unwrap_or(0)
     }
 
@@ -278,7 +634,19 @@ pub struct TargetProcCred {
 /// (`rlimits`, `fd_table`) land in follow-up passes without changing
 /// the existing surface.
 pub struct ProcessPayload {
-    pub(crate) aspace: Cap<AddressSpace>,
+    /// Authoritative address-space slot for this process. Per Open Q #2
+    /// (DECIDED 2026-05-06, `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`),
+    /// exec swaps this slot atomically: phase 6 stores the freshly built
+    /// detached `Cap<AddressSpace>` while every other thread of the
+    /// process group has already been zombified, and the previous
+    /// `Cap` is returned for EBR-deferred drop. The `AtomicSlot`
+    /// shape mirrors `cwd` and `current_payload` (the staging slot
+    /// idiom). Initial state is always populated by
+    /// `bootstrap_init_process` / `step_fork`; readers (the syscall
+    /// dispatcher, the trap-shell aspace resolution, the page-fault
+    /// driver) snapshot via `process.aspace_cap()` which clones the
+    /// inner `Cap` out of the slot.
+    pub(crate) aspace: AtomicSlot<Cap<AddressSpace>>,
     pub(crate) threads: SpinMutex<Vec<Cap<ThreadIdentity>>>,
     /// Per-process signal-action table. Day-1 records dispositions
     /// installed via `step_sigaction`; the delivery step that consults
@@ -306,9 +674,129 @@ pub struct ProcessPayload {
     /// empty; `step_getcwd` returns `None` for a process with no
     /// cwd installed.
     pub(crate) cwd: SpinMutex<Option<Cap<DEntry>>>,
+    /// Sparse fd table keyed by `u32` fd value.
+    ///
+    /// **fd-ops Wave 1 (2026-05-07):** flipped from a fixed
+    /// `[Option<Cap<OpenFile>>; FD_TABLE_SIZE]` array to a
+    /// `BTreeMap<u32, Cap<OpenFile>>`. Closes the `FD_TABLE_SIZE = 8`
+    /// ceiling that prevented shells from doing `>&100`-style fd
+    /// redirection and lifts the artificial fd-31 limit on the
+    /// CLOEXEC bitmap. The `BTreeMap` makes "lowest unused fd"
+    /// lookup straightforward (walk keys looking for the first gap),
+    /// matches `dup3(oldfd, newfd, _)`'s sparse-newfd semantic
+    /// directly, and tracks exact memory rather than worst-case fd
+    /// count. See plan §A and §"Open questions #1" (DECIDED).
+    ///
+    /// `step_fork` clones the entire map; each `Cap<OpenFile>` is
+    /// `.clone()` so parent and child share the same `OpenFile` —
+    /// `dup`-shape sharing (separate file description per fd) is a
+    /// deferred follow-up.
+    pub(crate) fds: SpinMutex<BTreeMap<u32, Cap<OpenFile>>>,
+    /// Per-fd close-on-exec set. fd `i` is marked CLOEXEC iff
+    /// `fd_cloexec.contains(&i)`; marked fds are closed by
+    /// [`crate::process::execution::step_close_cloexec_fds`] during
+    /// exec phase 7 (per `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC`).
+    ///
+    /// **fd-ops Wave 1 (2026-05-07):** flipped from `AtomicU32` (which
+    /// capped CLOEXEC tracking at fd 31) to `BTreeSet<u32>`. Now any
+    /// `u32` fd may be CLOEXEC-marked; per fd-ops Wave 1 §B and
+    /// §"Open questions #1" (DECIDED). The bitmap-vs-fd-table
+    /// consistency burden is unchanged in shape (two separate
+    /// containers for fd and cloexec); future migration to a single
+    /// `OpenFile.flags.cloexec` source-of-truth is tracked as Open
+    /// question #4 (deferred — `dup2`/`dup3` semantics are easier with
+    /// a per-fd bit).
+    ///
+    /// Default empty (no fds CLOEXEC at process creation). `step_fork`
+    /// clones the parent's set per Linux semantics (CLOEXEC is per-fd,
+    /// copied across fork).
+    pub(crate) fd_cloexec: SpinMutex<BTreeSet<u32>>,
+    /// Base of the program-break (heap) region for this process.
+    ///
+    /// Set once at exec time (per `txdoc:VM-5-8-BRK`); never changes
+    /// after that — `brk(2)` only moves `current_brk`. Default `0`
+    /// indicates an unconfigured brk region (the syscall dispatcher
+    /// treats this the same as "no brk available"). Bootstrap init's
+    /// brk base is materialised by `bootstrap_init_process` per the
+    /// Trio plan §"Cross-cutting risks #7".
+    ///
+    /// Stored as `AtomicU64` (not `SpinMutex<u64>`) because the field
+    /// is effectively immutable after construction: only `bootstrap_
+    /// init_process` and (eventually) `step_exec` assign it, and only
+    /// once each. Readers (`brk` syscall) snapshot it under no
+    /// coupling against `current_brk`.
+    pub(crate) brk_base: AtomicU64,
+    /// Current program break for this process.
+    ///
+    /// Mutated by every successful `brk(2)` syscall via
+    /// `AddressSpace::brk_script` returning the new break. Bootstrap
+    /// init starts at `current_brk == brk_base`. `step_fork` clones
+    /// the value (each child has its own break point); the underlying
+    /// VM mappings are cloned by the existing `AddressSpace::fork_aspace`
+    /// path, so the child's brk region is materialised without
+    /// re-running `brk_script`.
+    pub(crate) current_brk: AtomicU64,
+    /// Per-process file-creation mask (`umask(2)`).
+    ///
+    /// Slice 6 of the shell-prompt roadmap. Bits set in `umask` are
+    /// **cleared** from the mode of newly created files / directories
+    /// (POSIX `(mode & ~umask)`). Default `0o022` (matches Linux's
+    /// `init`-inherited default — owner keeps full perms, group/other
+    /// lose write). The kernel only honours the bottom 9 bits
+    /// (`rwxrwxrwx`); `umask(2)` silently truncates the argument.
+    ///
+    /// Stored as `AtomicU16` because the value is mutated on every
+    /// `umask(2)` syscall and read on every file-create path; a
+    /// `SpinMutex<u16>` would be heavier than necessary for a 16-bit
+    /// scalar with swap semantics.
+    pub(crate) umask: AtomicU16,
+    /// Reactor wait carrier that fires when **any** child of this
+    /// process zombifies (per `txdoc:PROCESS-WAIT-FAMILY-1`'s
+    /// `children_state_channel` notion). Created at payload-sign time
+    /// and registered with [`crate::wait_carrier::register_wait_channel`]
+    /// so async script wrappers can `wait_on_token` against the
+    /// returned id without holding a `Cap<ProcessIdentity>`.
+    ///
+    /// Pattern mirrors `TtyIdentity.wait_channel` /
+    /// `wait_carrier_id` (see
+    /// `crates/tx-subsystems/src/tty/structure/identity.rs`'s
+    /// `TtyIdentity::new`) — the only other in-tree wait carrier
+    /// today.
+    ///
+    /// Fire site: [`crate::process::execution::post_sigchld_to_parent`]
+    /// fires this immediately after the SIGCHLD post once a child
+    /// zombifies. Wave 1 of the fork/clone/wait4 slice wires the
+    /// fire; the matching `sys_wait4` blocking-wait await arrives in
+    /// Wave 2.
+    ///
+    /// Bit allocation: see [`EXIT_PORT_CHILD_ZOMBIFIED`].
+    pub(crate) exit_port: Channel,
+    /// Carrier id under which `exit_port` is registered with the
+    /// global [`crate::wait_carrier`] resolver. Embedded in the
+    /// `WaitToken` returned by
+    /// [`ProcessIdentity::exit_port_wait_token`] so the syscall arm
+    /// can park on the carrier without reaching the channel directly.
+    ///
+    /// Carrier-lifetime cleanup (release on payload drop) is tracked
+    /// as Cross-cutting Risk #1 in the slice plan and not addressed
+    /// in Wave 1; see plan §"Cross-cutting risks #1" for the
+    /// follow-up.
+    pub(crate) exit_port_carrier_id: u64,
 }
 
 impl ProcessPayload {
+    /// Snapshot the current address-space `Cap` out of the
+    /// `AtomicSlot<Cap<AddressSpace>>` slot. Panics if the slot is
+    /// empty — by construction the initial state is always populated
+    /// (`bootstrap_init_process` / `step_fork`) and the only mutator
+    /// is exec's phase 6 store, which atomically swaps to a fresh
+    /// `Cap` and never leaves the slot empty.
+    pub fn aspace_cap(&self) -> Cap<AddressSpace> {
+        self.aspace
+            .load()
+            .expect("ProcessPayload.aspace slot is always populated")
+    }
+
     /// Borrow the per-process action table.
     pub fn sig_actions(&self) -> &SigActionTable {
         &self.sig_actions
@@ -331,6 +819,160 @@ impl ProcessPayload {
     /// set (init pre-rootfs).
     pub fn cwd(&self) -> Option<Cap<DEntry>> {
         self.cwd.lock().clone()
+    }
+
+    /// Snapshot the `Cap<OpenFile>` registered at fd `idx`, if any.
+    ///
+    /// Returns `None` for empty slots. Per fd-ops Wave 1 the underlying
+    /// storage is a sparse `BTreeMap<u32, Cap<OpenFile>>`; any `u32`
+    /// fd value is valid as a key.
+    pub fn fd(&self, idx: u32) -> Option<Cap<OpenFile>> {
+        self.fds.lock().get(&idx).cloned()
+    }
+
+    /// Install `file` at fd `idx`, returning the previously installed
+    /// `Cap<OpenFile>` if any. Passing `file = None` removes the fd
+    /// from the table (returns the previous occupant, if any).
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeMap<u32, Cap<OpenFile>>`; any `u32` fd value is valid as
+    /// a key.
+    ///
+    /// Used by Phase 2a tests to manually wire the console as fd 1
+    /// before dispatching `NR_WRITE`. Phase 3b's `init.rs` uses the
+    /// same accessor to preopen fds 0/1/2.
+    pub fn set_fd(&self, idx: u32, file: Option<Cap<OpenFile>>) -> Option<Cap<OpenFile>> {
+        let mut slot = self.fds.lock();
+        match file {
+            Some(f) => slot.insert(idx, f),
+            None => slot.remove(&idx),
+        }
+    }
+
+    /// Snapshot the entire fd table as a fresh `BTreeMap`. Each
+    /// populated entry's `Cap<OpenFile>` is `.clone()`'d so the
+    /// snapshot does not borrow the lock; callers can drop the result
+    /// freely without touching the payload's storage. Used by
+    /// `step_fork` to clone the parent's fd table into the child.
+    pub(crate) fn snapshot_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+        self.fds.lock().clone()
+    }
+
+    /// Allocate the lowest unused fd ≥ `min` without installing
+    /// anything. Walks the BTreeMap's sorted keys looking for the
+    /// first gap at or above `min`.
+    ///
+    /// Per fd-ops Wave 1 §C: the new accessor surface needed by
+    /// `sys_openat` (Wave 2), `sys_dup` / `sys_dup3` (Wave 4), and
+    /// `sys_pipe2` (Wave 5).
+    pub fn allocate_fd_at_least(&self, min: u32) -> u32 {
+        let slot = self.fds.lock();
+        let mut next = min;
+        for &existing in slot.keys() {
+            if existing < next {
+                continue;
+            }
+            if existing == next {
+                next = next.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        next
+    }
+
+    /// Read the close-on-exec bit for fd `idx`.
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeSet<u32>`; any `u32` fd value is valid (no fd-31
+    /// ceiling).
+    pub fn fd_cloexec_get(&self, idx: u32) -> bool {
+        self.fd_cloexec.lock().contains(&idx)
+    }
+
+    /// Set or clear the close-on-exec bit for fd `idx`.
+    ///
+    /// Per fd-ops Wave 1 the underlying storage is a sparse
+    /// `BTreeSet<u32>`; any `u32` fd value is valid (no fd-31
+    /// ceiling).
+    pub fn set_fd_cloexec(&self, idx: u32, value: bool) {
+        let mut set = self.fd_cloexec.lock();
+        if value {
+            set.insert(idx);
+        } else {
+            set.remove(&idx);
+        }
+    }
+
+    /// Snapshot the entire close-on-exec set as an owned
+    /// `BTreeSet<u32>`. Used by
+    /// [`crate::process::execution::step_close_cloexec_fds`] to walk
+    /// every marked fd during exec phase 7.
+    pub(crate) fn fd_cloexec_snapshot(&self) -> BTreeSet<u32> {
+        self.fd_cloexec.lock().clone()
+    }
+
+    /// Clear the entire close-on-exec set. Used by
+    /// [`crate::process::execution::step_close_cloexec_fds`] to clear
+    /// the set after the close sweep so future `fcntl(F_SETFD)` calls
+    /// start from a clean state.
+    pub(crate) fn clear_fd_cloexec(&self) {
+        self.fd_cloexec.lock().clear();
+    }
+
+    /// Read the program-break base address for this process. Returns
+    /// `0` when no brk region is configured; bootstrap init seeds this
+    /// per the Trio plan §"Cross-cutting risks #7".
+    pub fn brk_base(&self) -> u64 {
+        self.brk_base.load(Ordering::Acquire)
+    }
+
+    /// Read the current program break for this process. Returns `0`
+    /// when no brk region is configured.
+    pub fn current_brk(&self) -> u64 {
+        self.current_brk.load(Ordering::Acquire)
+    }
+
+    /// Update the current program break. Called by the `brk(2)` syscall
+    /// dispatcher after `AddressSpace::brk_script` returns the new
+    /// break. The underlying mapping has already been materialised by
+    /// `brk_script`; this just records the new top-of-heap.
+    pub fn set_current_brk(&self, value: u64) {
+        self.current_brk.store(value, Ordering::Release);
+    }
+
+    /// Read the per-process file-creation mask. Slice 6 of the
+    /// shell-prompt roadmap.
+    pub fn umask(&self) -> u16 {
+        self.umask.load(Ordering::Acquire)
+    }
+
+    /// Atomically replace the per-process file-creation mask, returning
+    /// the previous value. Argument is silently truncated to `0o777`
+    /// (the bottom 9 bits — `rwxrwxrwx`); `umask(2)` ignores the
+    /// kind / setuid / setgid / sticky bits per Linux semantics.
+    pub fn swap_umask(&self, new: u16) -> u16 {
+        self.umask.swap(new & 0o777, Ordering::AcqRel)
+    }
+
+    /// Borrow the per-process `exit_port` wait channel.
+    ///
+    /// Fired by [`crate::process::execution::post_sigchld_to_parent`]
+    /// after the SIGCHLD producer post when a child zombifies. The
+    /// matching syscall-side awaiter (Wave 2's `sys_wait4` blocking
+    /// arm) parks on
+    /// [`ProcessIdentity::exit_port_wait_token`] via
+    /// [`crate::wait_carrier::wait_on_token`] rather than borrowing
+    /// the channel directly.
+    pub fn exit_port(&self) -> &Channel {
+        &self.exit_port
+    }
+
+    /// Carrier id under which [`Self::exit_port`] is registered with
+    /// the global wait-carrier resolver. Embedded in the
+    /// `WaitToken` callers use to park.
+    pub fn exit_port_carrier_id(&self) -> u64 {
+        self.exit_port_carrier_id
     }
 }
 
@@ -475,7 +1117,7 @@ pub fn allocate_pid() -> Pid {
     Pid(NEXT_PID.fetch_add(1, Ordering::Relaxed))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reset_pid_counter_for_test() {
     NEXT_PID.store(2, Ordering::Relaxed);
 }

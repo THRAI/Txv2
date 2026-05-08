@@ -7,7 +7,7 @@ use std::{
     task::Wake,
 };
 
-use tx_hal::{IrqIf, PercpuIf, SmpIf};
+use tx_hal::{EntropyIf, IrqIf, PercpuIf, SmpIf};
 use tx_substrate::bus::{
     retire_wire_owner, DeclaredPort, DeclaredQueue, DeclaredSubscriptionError,
     DeclaredSubscriptionGraphKey, DeclaredWireError, RawPort, RawQueue, RawSubscriptionError,
@@ -29,6 +29,7 @@ struct TestPlatform;
 
 impl PercpuIf for TestPlatform {}
 impl IrqIf for TestPlatform {}
+impl EntropyIf for TestPlatform {}
 impl SmpIf for TestPlatform {}
 
 struct CountWake {
