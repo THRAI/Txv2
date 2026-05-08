@@ -63,9 +63,11 @@ pub(crate) fn test(root: &Path, args: Vec<String>) -> Result<()> {
 fn smoke(root: &Path, target: TxTarget, rest: &[String], with_busybox: bool) -> Result<()> {
     let timeout = optional_option_value(rest, "--timeout-ms");
     let dry_run = rest.iter().any(|arg| arg == "--dry-run");
+    let trap_trace = rest.iter().any(|arg| arg == "--trap-trace");
 
     println!("test: build {}", target.name());
-    check_build::build(root, target.name())?;
+    let features: &[&str] = if trap_trace { &["trap-trace"] } else { &[] };
+    check_build::build_with_features(root, target.name(), features)?;
 
     let profile = if with_busybox {
         println!("test: image cpio --profile busybox");

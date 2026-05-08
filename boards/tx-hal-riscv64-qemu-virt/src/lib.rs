@@ -7,6 +7,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 mod boot_static;
+mod debug_trace;
 mod dtb;
 mod pmap;
 mod signal_frame;

@@ -539,6 +539,8 @@ impl TrapIf for Platform {
     /// Returns when the trap shell chooses `TrapAction::Reschedule`
     /// and longjmps back via [`tx_rv64_resume_kernel_after_reschedule`].
     fn enter_userspace_with_context(ctx: UserTrapContext) {
+        crate::debug_trace::record_entry(&ctx);
+
         let mut frame = Rv64TrapFrame {
             x: [0; 32],
             scause: 0,
@@ -573,6 +575,9 @@ where
 {
     let class = classify_rv64_trap(frame.scause);
     let from_user = frame.previous_mode() == TrapPreviousMode::User;
+    if from_user {
+        crate::debug_trace::record_trap((frame.scause & 0xff) as u8, frame);
+    }
 
     match class {
         TrapClass::PageFault { write, instruction } => {
