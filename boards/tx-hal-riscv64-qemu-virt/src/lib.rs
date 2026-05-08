@@ -7,13 +7,23 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 mod boot_static;
+mod boot_trampoline;
+mod debug_trace;
 mod dtb;
 mod pmap;
+mod sbi;
 mod signal_frame;
 mod time;
 mod trap;
 mod user_access;
 pub use trap::{dispatch_trap_frame, return_to_userspace, Rv64TrapFrame};
+
+use sbi::read_sbi_console_bytes;
+#[cfg(target_arch = "riscv64")]
+use sbi::{
+    sbi_console_putchar, sbi_hart_start, sbi_remote_fence_i, sbi_remote_sfence_vma,
+    sbi_remote_sfence_vma_asid, sbi_send_ipi, sbi_shutdown,
+};
 
 use boot_static::{
     reserved_region, BootStaticBag, IdentityDropped, IdentityLive, CMDLINE_CAPACITY,
@@ -23,199 +33,12 @@ use pmap::topology as pmap_topology;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaAddr,
-    DmaDirection, DmaIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, MemoryRegion,
-    MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError,
-    PmapIf, PmapInvalidation, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
-    PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry, SmpIf, TimeIf, VirtAddr,
+    DmaDirection, DmaIf, EntropyIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf,
+    MemoryRegion, MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
+    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry,
+    SmpIf, TimeIf, VirtAddr,
 };
-
-#[cfg(target_arch = "riscv64")]
-core::arch::global_asm!(
-    r#"
-    .section .text.trampoline, "ax"
-    .equ TX_RV64_KERNEL_VIRT_OFFSET, 0xffffffff00000000
-    .equ TX_RV64_QEMU_RAM_BASE, 0x80000000
-    .equ TX_RV64_DIRECT_MAP_ROOT_SLOT, 258
-    .equ TX_RV64_IDENTITY_ROOT_SLOT, 2
-    .equ TX_RV64_KERNEL_ROOT_SLOT, 510
-    .equ TX_RV64_KERNEL_L1_START_SLOT, 1
-    .equ TX_RV64_KERNEL_ALIAS_L0_TABLES, 8
-    .equ TX_RV64_PAGE_SIZE, 4096
-    .equ TX_RV64_MAX_BOOT_CPUS, 4
-    .equ TX_RV64_SATP_SV39, 0x8000000000000000
-    .equ TX_RV64_PTE_V, 0x001
-    .equ TX_RV64_PTE_R, 0x002
-    .equ TX_RV64_PTE_W, 0x004
-    .equ TX_RV64_PTE_X, 0x008
-    .equ TX_RV64_PTE_G, 0x020
-    .equ TX_RV64_PTE_A, 0x040
-    .equ TX_RV64_PTE_D, 0x080
-    .equ TX_RV64_PTE_IDENTITY, TX_RV64_PTE_V | TX_RV64_PTE_R | TX_RV64_PTE_W | TX_RV64_PTE_X | TX_RV64_PTE_A | TX_RV64_PTE_D
-    .equ TX_RV64_PTE_DIRECT, TX_RV64_PTE_V | TX_RV64_PTE_R | TX_RV64_PTE_W | TX_RV64_PTE_G | TX_RV64_PTE_A | TX_RV64_PTE_D
-    .equ TX_RV64_PTE_KERNEL_BOOT, TX_RV64_PTE_V | TX_RV64_PTE_R | TX_RV64_PTE_W | TX_RV64_PTE_X | TX_RV64_PTE_G | TX_RV64_PTE_A | TX_RV64_PTE_D
-
-    .globl _start
-_start:
-    mv s0, a0
-    mv s1, a1
-    la sp, __tx_boot_stack_top_load
-    li t0, TX_RV64_MAX_BOOT_CPUS
-    bgeu s0, t0, .Ltx_bsp_stack_ready
-    slli t1, s0, 16
-    sub sp, sp, t1
-.Ltx_bsp_stack_ready:
-
-    la t0, __bss_start_load
-    la t1, __bss_end_load
-1:
-    bgeu t0, t1, 2f
-    sd zero, 0(t0)
-    addi t0, t0, 8
-    j 1b
-
-2:
-    la s2, __bootstrap_root_load
-    li t0, TX_RV64_QEMU_RAM_BASE
-    srli t1, t0, 12
-    slli t1, t1, 10
-    ori t1, t1, TX_RV64_PTE_IDENTITY
-    li t2, TX_RV64_IDENTITY_ROOT_SLOT
-    slli t2, t2, 3
-    add t3, s2, t2
-    sd t1, 0(t3)
-
-    srli t1, t0, 12
-    slli t1, t1, 10
-    ori t1, t1, TX_RV64_PTE_DIRECT
-    li t2, TX_RV64_DIRECT_MAP_ROOT_SLOT
-    slli t2, t2, 3
-    add t3, s2, t2
-    sd t1, 0(t3)
-
-    la s3, __kernel_alias_l1_load
-    srli t1, s3, 12
-    slli t1, t1, 10
-    ori t1, t1, TX_RV64_PTE_V
-    li t2, TX_RV64_KERNEL_ROOT_SLOT
-    slli t2, t2, 3
-    add t3, s2, t2
-    sd t1, 0(t3)
-
-    la s4, __kernel_alias_l0_tables_load
-    li t0, 0
-    li t1, TX_RV64_KERNEL_ALIAS_L0_TABLES
-3:
-    bgeu t0, t1, 4f
-    slli t2, t0, 12
-    add t3, s4, t2
-    srli t4, t3, 12
-    slli t4, t4, 10
-    ori t4, t4, TX_RV64_PTE_V
-    li t5, TX_RV64_KERNEL_L1_START_SLOT
-    add t5, t5, t0
-    slli t5, t5, 3
-    add t6, s3, t5
-    sd t4, 0(t6)
-    addi t0, t0, 1
-    j 3b
-
-4:
-    la s5, __kernel_start_load
-    la s6, __kernel_end_load
-    li s7, TX_RV64_PAGE_SIZE
-    mv t0, s5
-5:
-    bgeu t0, s6, 6f
-    sub t1, t0, s5
-    srli t2, t1, 21
-    slli t2, t2, 12
-    add t3, s4, t2
-    srli t4, t1, 12
-    andi t4, t4, 0x1ff
-    slli t4, t4, 3
-    add t3, t3, t4
-    srli t5, t0, 12
-    slli t5, t5, 10
-    ori t5, t5, TX_RV64_PTE_KERNEL_BOOT
-    sd t5, 0(t3)
-    add t0, t0, s7
-    j 5b
-
-6:
-    srli t0, s2, 12
-    li t1, TX_RV64_SATP_SV39
-    or a0, t0, t1
-
-    csrw satp, a0
-    sfence.vma
-
-    li t0, TX_RV64_KERNEL_VIRT_OFFSET
-    la sp, __tx_boot_stack_top_load
-    li t1, TX_RV64_MAX_BOOT_CPUS
-    bgeu s0, t1, .Ltx_bsp_high_stack_ready
-    slli t2, s0, 16
-    sub sp, sp, t2
-.Ltx_bsp_high_stack_ready:
-    add sp, sp, t0
-    .option push
-    .option norelax
-    la gp, __global_pointer_load
-    add gp, gp, t0
-    .option pop
-
-    mv a0, s0
-    mv a1, s1
-    la t1, __rust_entry_load
-    add t1, t1, t0
-    jr t1
-
-    .globl tx_rv64_qemu_secondary_start
-    .type tx_rv64_qemu_secondary_start, @function
-tx_rv64_qemu_secondary_start:
-    mv s0, a0
-    mv s1, a1
-    li t0, TX_RV64_MAX_BOOT_CPUS
-    bgeu s0, t0, 9f
-
-    la sp, __tx_boot_stack_top_load
-    slli t1, s0, 16
-    sub sp, sp, t1
-    li t0, TX_RV64_KERNEL_VIRT_OFFSET
-    add sp, sp, t0
-    .option push
-    .option norelax
-    la gp, __global_pointer_load
-    add gp, gp, t0
-    .option pop
-
-    la t0, __bootstrap_root_load
-    srli t0, t0, 12
-    li t1, TX_RV64_SATP_SV39
-    or t0, t0, t1
-    csrw satp, t0
-    sfence.vma
-
-    mv a0, s0
-    jr s1
-
-9:
-    wfi
-    j 9b
-    .size tx_rv64_qemu_secondary_start, . - tx_rv64_qemu_secondary_start
-
-    .globl tx_rv64_qemu_install_kernel_stack
-    .type tx_rv64_qemu_install_kernel_stack, @function
-tx_rv64_qemu_install_kernel_stack:
-    mv sp, a0
-    ret
-    .size tx_rv64_qemu_install_kernel_stack, . - tx_rv64_qemu_install_kernel_stack
-
-7:
-    wfi
-    j 7b
-
-"#
-);
 
 pub struct Platform;
 
@@ -226,6 +49,16 @@ const MAX_BOOT_CPUS: usize = 4;
 const PLIC_PHYS_BASE: usize = 0x0c00_0000;
 #[cfg(target_arch = "riscv64")]
 const PLIC_BASE: usize = pmap_topology::DIRECT_MAP_BASE + PLIC_PHYS_BASE;
+/// QEMU virt machine's NS16550-compatible UART. PLIC IRQ 10
+/// ([`IrqIf::UART_IRQ`]) is wired to this UART, but the device
+/// itself only raises RX-data-available IRQs when its IER (offset
+/// 1) has bit 0 set. SBI doesn't initialise the device-side IER
+/// for us, so the kernel writes it directly during boot — see
+/// `enable_uart_rx_irq`.
+#[cfg(target_arch = "riscv64")]
+const UART_PHYS_BASE: usize = 0x1000_0000;
+#[cfg(target_arch = "riscv64")]
+const UART_BASE: usize = pmap_topology::DIRECT_MAP_BASE + UART_PHYS_BASE;
 const PLIC_MAX_IRQ: u32 = tx_hal::IRQ_DISPATCH_TABLE_SIZE as u32;
 #[cfg(all(not(target_arch = "riscv64"), test))]
 const PLIC_IRQ_SOURCES: usize = tx_hal::IRQ_DISPATCH_TABLE_SIZE;
@@ -277,6 +110,122 @@ static RV64_PERCPU_AREAS: [Rv64PerCpuArea; MAX_BOOT_CPUS] = [
     Rv64PerCpuArea::new(2),
     Rv64PerCpuArea::new(3),
 ];
+
+/// Per-hart save area for the reschedule longjmp (slice 2 of the
+/// userspace-first-entry fix per
+/// `docs/progress/decisions/2026-05-08-userspace-first-entry-gap.md`).
+///
+/// The userspace-entry shim (`tx_rv64_enter_userspace_save_resume`)
+/// stashes (sp, ra, s0..s11) here before `sret`. The trap-shell
+/// longjmp helper (`tx_rv64_resume_kernel_after_reschedule`)
+/// restores them on `TrapAction::Reschedule` and `ret`s back to the
+/// kernel-side caller of `enter_userspace_with_context`.
+///
+/// Field offsets are load-bearing: the asm helpers reference them
+/// by literal byte offset. Keep `KERNEL_RESUME_CTX_*_OFFSET` in
+/// sync with the field order.
+#[repr(C, align(8))]
+pub struct KernelResumeCtx {
+    pub sp: usize,      // offset 0
+    pub ra: usize,      // offset 8
+    pub s: [usize; 12], // offset 16..112
+}
+
+// These offsets are referenced by literal byte offset in the trap-vector
+// asm (`TX_RV64_RCTX_SP`, `TX_RV64_RCTX_RA`, `TX_RV64_RCTX_S0`). The
+// Rust constants below pin the layout from the Rust side so a struct
+// reorder triggers a compile-time mismatch with the static_assert.
+const KERNEL_RESUME_CTX_SP_OFFSET: usize = 0;
+const KERNEL_RESUME_CTX_RA_OFFSET: usize = 8;
+const KERNEL_RESUME_CTX_S0_OFFSET: usize = 16;
+const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 14 * 8);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, sp) == KERNEL_RESUME_CTX_SP_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, ra) == KERNEL_RESUME_CTX_RA_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, s) == KERNEL_RESUME_CTX_S0_OFFSET);
+
+/// Per-hart cell with `Sync` because the only writer/reader is the
+/// local hart's trap-vector / userspace-entry shim. Cross-hart
+/// concurrent access would be a load-bearing invariant violation.
+#[repr(transparent)]
+pub struct PerHartCell<T>(core::cell::UnsafeCell<T>);
+
+unsafe impl<T> Sync for PerHartCell<T> {}
+
+impl<T> PerHartCell<T> {
+    pub const fn new(value: T) -> Self {
+        Self(core::cell::UnsafeCell::new(value))
+    }
+
+    pub fn as_ptr(&self) -> *mut T {
+        self.0.get()
+    }
+}
+
+static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        s: [0; 12],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        s: [0; 12],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        s: [0; 12],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        s: [0; 12],
+    }),
+];
+
+/// Per-CPU trap-handler stack. Sized 16 KiB; the trap vector
+/// `csrrw`-swaps onto its top via `sscratch` so trap-handler frames
+/// don't trample the BSP/AP runtime kernel stack (which holds the
+/// reactor + thread future frames at the moment a user trap fires).
+///
+/// Lives in `.data` (writable) rather than substrate-allocated
+/// frames because the trap stack must be ready *before* substrate
+/// is — the trap vector is installed early in boot, well before
+/// the page allocator. Wrapped in `PerHartCell<UnsafeCell<...>>`
+/// so the linker keeps it out of `.rodata` (which `pmap` maps
+/// `KERNEL_RO`); plain `static [u8; N]` lands in `.rodata` and
+/// the trap-vector's first store would fault.
+///
+/// Total static cost is `MAX_BOOT_CPUS × 16 KiB = 64 KiB`.
+const RV64_TRAP_STACK_SIZE: usize = 16 * 1024;
+
+#[repr(C, align(16))]
+pub struct Rv64TrapStack(pub [u8; RV64_TRAP_STACK_SIZE]);
+
+static RV64_TRAP_STACKS: [PerHartCell<Rv64TrapStack>; MAX_BOOT_CPUS] = [
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+];
+
+/// Per-hart trap-stack top: the value the boot primer writes into
+/// `sscratch`, and the value the reschedule longjmp restores
+/// `sscratch` to before unwinding back to the kernel caller.
+pub fn trap_stack_top_for_cpu(cpu: CpuId) -> usize {
+    let stack = RV64_TRAP_STACKS[cpu.0].as_ptr();
+    let base = stack as usize;
+    base + RV64_TRAP_STACK_SIZE
+}
+
+/// Pointer to the local hart's [`KernelResumeCtx`]. Asm helpers
+/// load/store at the documented field offsets; Rust callers in
+/// `apply_trap_action` use the pointer directly.
+pub fn current_kernel_resume_ctx_ptr() -> *mut KernelResumeCtx {
+    let cpu = current_cpu_id();
+    RV64_KERNEL_RESUME_CTX[cpu.0].as_ptr()
+}
 
 #[cfg(not(target_arch = "riscv64"))]
 static HOST_KERNEL_TLS: AtomicUsize = AtomicUsize::new(0);
@@ -471,9 +420,40 @@ impl PmapIf for Platform {
         pmap::shootdown_mapping(asid, invalidation);
         remote_sfence_vma_asid(asid, invalidation);
     }
+
+    /// Write `satp` to point at `root.phys()` with Sv39 mode bits and
+    /// the root's ASID, then issue a local `sfence.vma`.
+    ///
+    /// Called from the thread runtime right before
+    /// `TrapIf::enter_userspace_with_context` so user-mode fetches see
+    /// the per-process pmap. Without this satp would still point at the
+    /// kernel bootstrap root from the boot trampoline (which has no
+    /// user mappings), and every user-mode instruction fetch would
+    /// fault forever.
+    fn activate_user_pmap(root: &PmapRoot) {
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            const SATP_MODE_SV39: usize = 0x8 << 60;
+            let ppn = root.phys().0 >> 12;
+            let asid = root.asid().0 as usize;
+            let satp = SATP_MODE_SV39 | (asid << 44) | ppn;
+            core::arch::asm!(
+                "csrw satp, {satp}",
+                "sfence.vma",
+                satp = in(reg) satp,
+                options(nostack)
+            );
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        let _ = root;
+    }
 }
 impl IrqIf for Platform {
     const MAX_IRQ: u32 = PLIC_MAX_IRQ;
+
+    /// QEMU `virt` machine's 16550 UART is wired at PLIC IRQ 10.
+    /// Source: `qemu/hw/riscv/virt.c::UART0_IRQ`.
+    const UART_IRQ: u32 = 10;
 
     fn in_irq_context() -> bool {
         irq_context_depth() != 0
@@ -516,6 +496,13 @@ impl IrqIf for Platform {
             table as *const IrqDispatchTable as *mut _,
             Ordering::Release,
         );
+        // The PLIC routes UART IRQ 10 to us, but the 16550 UART
+        // itself only raises that IRQ when its IER (offset 1) has
+        // bit 0 set. SBI doesn't initialise the device-side IER
+        // for us. We do it here, alongside the dispatch-table
+        // install, so the same boot step that wires the kernel
+        // handler also enables the device-side trigger.
+        enable_uart_rx_irq();
     }
 
     fn dispatch_irq(irq: u32) -> IrqHandled {
@@ -717,6 +704,63 @@ impl PowerIf for Platform {
     }
 }
 
+impl EntropyIf for Platform {
+    /// RV64 QEMU virt entropy: mix the unprivileged `rdtime` CSR
+    /// (always available, sub-µs resolution on the QEMU virt
+    /// timebase) into the trait-default xorshift counter. This is
+    /// not a CSPRNG, but for txKernel's current trust model — no
+    /// ASLR, no untrusted input, musl SSP only — it is materially
+    /// stronger than the static `[0; 16]` it replaces.
+    ///
+    /// The Zkr `seed` CSR (CSR 0x015) was considered but skipped:
+    /// `riscv64gc` does not include Zkr, and a runtime probe would
+    /// hook the trap shell. `rdtime` ships cleanly today; a Zkr
+    /// upgrade can land later behind a board-config flag.
+    fn fill_random(out: &mut [u8]) {
+        // Mix rdtime ticks (per-exec varying) with a per-call
+        // xorshift counter so back-to-back execs at the same tick
+        // still diverge.
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0xA5A5_5A5A_DEAD_BEEF);
+
+        let ticks: u64 = read_rdtime_ticks();
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut s = ticks ^ counter.rotate_left(13);
+        // Avoid the all-zero xorshift fixed point.
+        if s == 0 {
+            s = 0xDEAD_BEEF_CAFE_F00D;
+        }
+        for byte in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *byte = (s & 0xff) as u8;
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn read_rdtime_ticks() -> u64 {
+    let ticks: u64;
+    unsafe {
+        core::arch::asm!(
+            "rdtime {ticks}",
+            ticks = out(reg) ticks,
+            options(nomem, nostack)
+        );
+    }
+    ticks
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn read_rdtime_ticks() -> u64 {
+    // Host-test fallback: return 0 so the trait default counter
+    // alone provides variance. The host test
+    // `entropy_fill_random_distinct_calls_diverge` exercises this
+    // path.
+    0
+}
+
 fn current_cpu_id() -> CpuId {
     let kernel_tls = read_kernel_tls();
     cpu_id_from_kernel_tls(kernel_tls).unwrap_or({
@@ -731,6 +775,26 @@ fn current_cpu_id() -> CpuId {
 fn install_early_percpu(cpu_id: CpuId) {
     let kernel_tls = percpu_tls_for_cpu(cpu_id).unwrap_or(cpu_id.0);
     write_kernel_tls(kernel_tls);
+
+    // Slice 2 boot-time sscratch primer (one-shot per hart). The
+    // trap-vector prologue does `csrrw sp, sscratch, sp` to swap
+    // onto the per-CPU trap-handler stack; sscratch must therefore
+    // be primed before any trap can fire on this hart. We are
+    // called from `tx_hal::entry()` on every hart's boot path,
+    // immediately after the trap vector is installed, which is
+    // the earliest moment we have a valid `cpu_id` and a populated
+    // trap-stack array. Subsequent traps re-prime sscratch through
+    // the CSR-swap discipline (trap-vector epilogue +
+    // userspace-entry shim + reschedule-longjmp helper); this is
+    // genuinely one-shot.
+    //
+    // Note: this also runs on the host build target via the trait
+    // impl, but the asm is gated on `target_arch = "riscv64"`.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        let trap_stack_top = trap_stack_top_for_cpu(cpu_id);
+        core::arch::asm!("csrw sscratch, {top}", top = in(reg) trap_stack_top);
+    }
 }
 
 fn read_kernel_tls() -> usize {
@@ -877,6 +941,58 @@ fn plic_read_u32(offset: usize) -> u32 {
 #[cfg(target_arch = "riscv64")]
 fn plic_write_u32(offset: usize, value: u32) {
     unsafe { ((PLIC_BASE + offset) as *mut u32).write_volatile(value) };
+}
+
+/// Enable the 16550 UART's "received-data-available" interrupt
+/// (IER bit 0) so QEMU's UART raises PLIC IRQ 10 when stdin
+/// delivers a byte; AND set `sie.SEIE` (bit 9 = supervisor
+/// external interrupt enable) + `sstatus.SIE` (global) so the
+/// PLIC IRQ actually reaches our trap vector. PLIC unmask alone
+/// is insufficient — without SEIE the IRQ pends in mip but never
+/// fires the trap.
+///
+/// `enable_timer_wakeups` (in `time.rs`) sets STIE separately for
+/// timer interrupts. We don't share a helper because the order
+/// of timer vs external IRQ enable matters for boot smoke
+/// sentinels — timers come up earlier.
+///
+/// Idempotent: writing IER and `csrs` instructions just set the
+/// same bits.
+#[cfg(target_arch = "riscv64")]
+fn enable_uart_rx_irq() {
+    // 16550 IER offset = 1; bit 0 = ERBFI (Enable Received Data
+    // Available Interrupt).
+    const UART_IER_OFFSET: usize = 1;
+    const UART_IER_ERBFI: u8 = 0x01;
+    unsafe {
+        let ier = (UART_BASE + UART_IER_OFFSET) as *mut u8;
+        ier.write_volatile(UART_IER_ERBFI);
+
+        // sie |= SEIE (bit 9) and sstatus |= SIE (bit 1).
+        let seie = 1usize << 9;
+        core::arch::asm!(
+            "csrs sie, {seie}",
+            "csrsi sstatus, 2",
+            seie = in(reg) seie,
+            options(nomem, nostack)
+        );
+    }
+
+    // Lower the PLIC threshold for the current hart's S-mode
+    // context to 0 so any priority >= 1 IRQ is delivered. QEMU's
+    // virt machine resets this register to 0, but explicit beats
+    // implicit — the same value works on hardware and avoids a
+    // surprise on platforms that don't zero it.
+    let context = plic_context_for_cpu(current_cpu_id());
+    let threshold_offset = PLIC_CONTEXT_BASE + context * PLIC_CONTEXT_STRIDE;
+    plic_write_u32(threshold_offset, 0);
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn enable_uart_rx_irq() {
+    // Host build: no UART hardware. Stubbed; the IrqIf impl on the
+    // host platform never reaches this path under test (no real
+    // dispatch-table install on host).
 }
 
 #[cfg(all(not(target_arch = "riscv64"), not(test)))]
@@ -1211,163 +1327,6 @@ fn clear_supervisor_software_interrupt() {
     #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!("csrci sip, 2", options(nomem, nostack));
-    }
-}
-
-#[cfg(target_arch = "riscv64")]
-fn sbi_console_putchar(byte: u8) {
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") byte as usize => _,
-            in("a7") 1usize,
-            options(nostack)
-        );
-    }
-}
-
-fn read_sbi_console_bytes(buf: &mut [u8]) -> usize {
-    let mut read = 0;
-    for byte in buf {
-        let Some(next) = sbi_console_getchar() else {
-            break;
-        };
-        *byte = next;
-        read += 1;
-    }
-    read
-}
-
-#[cfg(target_arch = "riscv64")]
-fn sbi_console_getchar() -> Option<u8> {
-    let value: isize;
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            lateout("a0") value,
-            in("a7") 2usize,
-            options(nostack)
-        );
-    }
-
-    if value < 0 {
-        None
-    } else {
-        Some(value as u8)
-    }
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn sbi_console_getchar() -> Option<u8> {
-    None
-}
-
-#[cfg(target_arch = "riscv64")]
-fn sbi_hart_start(hart_id: usize, start_addr: usize, opaque: usize) -> isize {
-    let error: isize;
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") hart_id => error,
-            in("a1") start_addr,
-            in("a2") opaque,
-            in("a6") 0usize,
-            in("a7") 0x48534dusize,
-            lateout("a1") _,
-            options(nostack)
-        );
-    }
-    error
-}
-
-#[cfg(target_arch = "riscv64")]
-fn sbi_send_ipi(hart_mask: u64, hart_mask_base: usize) -> isize {
-    let error: isize;
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") hart_mask as usize => error,
-            in("a1") hart_mask_base,
-            in("a6") 0usize,
-            in("a7") 0x735049usize,
-            lateout("a1") _,
-            options(nostack)
-        );
-    }
-    error
-}
-
-#[cfg(target_arch = "riscv64")]
-fn sbi_remote_fence_i(hart_mask: u64, hart_mask_base: usize) -> isize {
-    let error: isize;
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") hart_mask as usize => error,
-            in("a1") hart_mask_base,
-            in("a6") 0usize,
-            in("a7") 0x52464e43usize,
-            lateout("a1") _,
-            options(nostack)
-        );
-    }
-    error
-}
-
-#[cfg(target_arch = "riscv64")]
-fn sbi_remote_sfence_vma(
-    hart_mask: u64,
-    hart_mask_base: usize,
-    start_addr: usize,
-    size: usize,
-) -> isize {
-    let error: isize;
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") hart_mask as usize => error,
-            in("a1") hart_mask_base,
-            in("a2") start_addr,
-            in("a3") size,
-            in("a6") 1usize,
-            in("a7") 0x52464e43usize,
-            lateout("a1") _,
-            options(nostack)
-        );
-    }
-    error
-}
-
-#[cfg(target_arch = "riscv64")]
-fn sbi_remote_sfence_vma_asid(
-    hart_mask: u64,
-    hart_mask_base: usize,
-    start_addr: usize,
-    size: usize,
-    asid: usize,
-) -> isize {
-    let error: isize;
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") hart_mask as usize => error,
-            in("a1") hart_mask_base,
-            in("a2") start_addr,
-            in("a3") size,
-            in("a4") asid,
-            in("a6") 2usize,
-            in("a7") 0x52464e43usize,
-            lateout("a1") _,
-            options(nostack)
-        );
-    }
-    error
-}
-
-#[cfg(target_arch = "riscv64")]
-fn sbi_shutdown() {
-    unsafe {
-        core::arch::asm!("ecall", in("a7") 8usize, options(nostack));
     }
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::execution::StepOutcome;
 use crate::page_backed::PageContainer;
 use crate::test_support::EPOCH_TEST_LOCK;
 use alloc::collections::BTreeMap;
@@ -12,6 +13,7 @@ use tx_hal::{
 mod execution_scripts;
 mod fault_materialization;
 mod observation;
+mod range_locks;
 mod script_async;
 mod user_access;
 
@@ -253,118 +255,6 @@ fn would_block(result: AcquireResult<'_>) -> WouldBlock<'_> {
 }
 
 #[test]
-fn vm_user_range_rejects_zero_unaligned_and_overflow() {
-    assert_eq!(
-        UserRange::new_aligned(UserVirtAddr(0), 0),
-        Err(UserRangeError::ZeroLength)
-    );
-    assert_eq!(
-        UserRange::new_aligned(UserVirtAddr(1), USER_PAGE_SIZE),
-        Err(UserRangeError::Unaligned)
-    );
-    assert_eq!(
-        UserRange::new_aligned(UserVirtAddr(0), USER_PAGE_SIZE - 1),
-        Err(UserRangeError::Unaligned)
-    );
-    assert_eq!(
-        UserRange::new_aligned(UserVirtAddr(usize::MAX - 4095), USER_PAGE_SIZE),
-        Err(UserRangeError::Overflow)
-    );
-}
-
-#[test]
-fn vm_user_range_iterates_pages_and_counts_them() {
-    let pages = range(0x4000, 3);
-    assert_eq!(pages.page_count(), 3);
-    assert_eq!(pages.iter_pages().len(), 3);
-
-    let mut iter = pages.iter_pages();
-    assert_eq!(iter.next(), Some(UserPage(4)));
-    assert_eq!(iter.next(), Some(UserPage(5)));
-    assert_eq!(iter.next(), Some(UserPage(6)));
-    assert_eq!(iter.next(), None);
-
-    assert_eq!(UserVirtAddr(0x4123).containing_page(), UserPage(4));
-    assert_eq!(
-        UserRange::containing_page(UserVirtAddr(0x4123)),
-        Ok(range(0x4000, 1))
-    );
-    assert_eq!(
-        UserRange::containing_page(UserVirtAddr(usize::MAX)),
-        Err(UserRangeError::Overflow)
-    );
-}
-
-#[test]
-fn vm_range_lock_conflict_matrix_matches_modes() {
-    let lock = RangeLock::new();
-    let first = range(0x1000, 2);
-    let overlap = range(0x2000, 1);
-    let disjoint = range(0x8000, 1);
-
-    let writer = acquired(lock.acquire_step_rich(first, LockMode::ExclusiveWriter));
-    would_block(lock.acquire_step_rich(overlap, LockMode::ExclusiveWriter));
-    would_block(lock.acquire_step_rich(overlap, LockMode::Materializer));
-    let disjoint_writer = acquired(lock.acquire_step_rich(disjoint, LockMode::ExclusiveWriter));
-    drop(disjoint_writer);
-    drop(writer);
-
-    let materializer_a = acquired(lock.acquire_step_rich(first, LockMode::Materializer));
-    let materializer_b = acquired(lock.acquire_step_rich(overlap, LockMode::Materializer));
-    would_block(lock.acquire_step_rich(overlap, LockMode::ExclusiveWriter));
-    drop(materializer_b);
-    drop(materializer_a);
-}
-
-#[test]
-fn vm_range_lock_pending_writer_blocks_new_materializers() {
-    let lock = RangeLock::new();
-    let first = range(0x1000, 1);
-
-    let materializer = acquired(lock.acquire_step_rich(first, LockMode::Materializer));
-    let pending = would_block(lock.acquire_step_rich(first, LockMode::ExclusiveWriter))
-        .pending_writer()
-        .expect("blocked writer should declare pending range");
-
-    would_block(lock.acquire_step_rich(first, LockMode::Materializer));
-    drop(materializer);
-
-    let writer = acquired(pending.try_acquire());
-    would_block(lock.acquire_step_rich(first, LockMode::Materializer));
-    drop(writer);
-
-    let materializer_after_drop = acquired(lock.acquire_step_rich(first, LockMode::Materializer));
-    drop(materializer_after_drop);
-}
-
-#[test]
-fn vm_range_lock_overlapping_pending_writers_are_fifo() {
-    let lock = RangeLock::new();
-    let first = range(0x1000, 1);
-
-    let materializer = acquired(lock.acquire_step_rich(first, LockMode::Materializer));
-    let pending_a = would_block(lock.acquire_step_rich(first, LockMode::ExclusiveWriter))
-        .pending_writer()
-        .expect("first writer queues");
-    let pending_b = would_block(lock.acquire_step_rich(first, LockMode::ExclusiveWriter))
-        .pending_writer()
-        .expect("second writer queues");
-    drop(materializer);
-
-    let blocked_b = would_block(pending_b.try_acquire());
-    let writer_a = acquired(pending_a.try_acquire());
-    drop(writer_a);
-
-    let writer_b = acquired(
-        blocked_b
-            .pending_writer()
-            .expect("second writer remains queued")
-            .try_acquire(),
-    );
-    drop(writer_b);
-}
-
-#[test]
 fn vm_range_guard_drop_releases_reservation() {
     let lock = RangeLock::new();
     let first = range(0x1000, 1);
@@ -377,116 +267,6 @@ fn vm_range_guard_drop_releases_reservation() {
 
     let materializer = acquired(lock.acquire_step_rich(first, LockMode::Materializer));
     drop(materializer);
-}
-
-#[test]
-fn vm_range_lock_acquires_two_ranges_atomically() {
-    let lock = RangeLock::new();
-    let a = range(0x1000, 1);
-    let b = range(0x4000, 1);
-
-    let pair = pair_acquired(lock.acquire_pair_step_rich(
-        (a, LockMode::ExclusiveWriter),
-        (b, LockMode::ExclusiveWriter),
-    ));
-    would_block(lock.acquire_step_rich(a, LockMode::Materializer));
-    would_block(lock.acquire_step_rich(b, LockMode::Materializer));
-    drop(pair);
-
-    let after = acquired(lock.acquire_step_rich(a, LockMode::Materializer));
-    drop(after);
-}
-
-#[test]
-fn vm_range_lock_tree_removal_clears_only_removed_overlap() {
-    let lock = RangeLock::new();
-    let low = range(0x1000, 1);
-    let middle = range(0x5000, 1);
-    let high = range(0x9000, 1);
-
-    let low_writer = acquired(lock.acquire_step_rich(low, LockMode::ExclusiveWriter));
-    let middle_writer = acquired(lock.acquire_step_rich(middle, LockMode::ExclusiveWriter));
-    let high_writer = acquired(lock.acquire_step_rich(high, LockMode::ExclusiveWriter));
-
-    would_block(lock.acquire_step_rich(middle, LockMode::Materializer));
-    drop(middle_writer);
-
-    let middle_materializer = acquired(lock.acquire_step_rich(middle, LockMode::Materializer));
-    would_block(lock.acquire_step_rich(low, LockMode::Materializer));
-    would_block(lock.acquire_step_rich(high, LockMode::Materializer));
-
-    drop(middle_materializer);
-    drop(low_writer);
-    drop(high_writer);
-}
-
-#[test]
-fn vm_range_lock_tree_keeps_disjoint_reservations_independent() {
-    let lock = RangeLock::new();
-    let a = range(0x1000, 1);
-    let b = range(0x8000, 1);
-    let c = range(0x10000, 1);
-
-    let writer_a = acquired(lock.acquire_step_rich(a, LockMode::ExclusiveWriter));
-    let writer_b = acquired(lock.acquire_step_rich(b, LockMode::ExclusiveWriter));
-    let materializer_c = acquired(lock.acquire_step_rich(c, LockMode::Materializer));
-
-    would_block(lock.acquire_step_rich(a, LockMode::Materializer));
-    would_block(lock.acquire_step_rich(b, LockMode::Materializer));
-    let second_materializer_c = acquired(lock.acquire_step_rich(c, LockMode::Materializer));
-
-    drop(second_materializer_c);
-    drop(materializer_c);
-    drop(writer_b);
-    drop(writer_a);
-}
-
-#[test]
-fn vm_range_lock_tree_pending_fifo_is_range_scoped() {
-    let lock = RangeLock::new();
-    let first = range(0x2000, 1);
-    let disjoint = range(0xa000, 1);
-
-    let materializer = acquired(lock.acquire_step_rich(first, LockMode::Materializer));
-    let pending_a = would_block(lock.acquire_step_rich(first, LockMode::ExclusiveWriter))
-        .pending_writer()
-        .expect("first overlapping writer queues");
-    let disjoint_writer = acquired(lock.acquire_step_rich(disjoint, LockMode::ExclusiveWriter));
-    let pending_b = would_block(lock.acquire_step_rich(first, LockMode::ExclusiveWriter))
-        .pending_writer()
-        .expect("second overlapping writer queues");
-
-    drop(materializer);
-
-    let blocked_b = would_block(pending_b.try_acquire());
-    let writer_a = acquired(pending_a.try_acquire());
-    drop(writer_a);
-
-    let writer_b = acquired(
-        blocked_b
-            .pending_writer()
-            .expect("second overlapping writer remains queued")
-            .try_acquire(),
-    );
-
-    drop(writer_b);
-    drop(disjoint_writer);
-}
-
-#[test]
-fn vm_range_lock_tree_active_writer_blocks_materializer_overlap_only() {
-    let lock = RangeLock::new();
-    let writer_range = range(0x7000, 2);
-    let overlap = range(0x8000, 1);
-    let disjoint = range(0xb000, 1);
-
-    let writer = acquired(lock.acquire_step_rich(writer_range, LockMode::ExclusiveWriter));
-
-    would_block(lock.acquire_step_rich(overlap, LockMode::Materializer));
-    let disjoint_materializer = acquired(lock.acquire_step_rich(disjoint, LockMode::Materializer));
-
-    drop(disjoint_materializer);
-    drop(writer);
 }
 
 #[test]
@@ -1406,4 +1186,150 @@ fn vm_pmap_protect_tears_down_for_refault_not_in_place_retag() {
 
     assert_eq!(aspace.pmap().lookup(UserPage(5)), None);
     assert_eq!(aspace.pmap().stats().shootdowns, 1);
+}
+
+// =====================================================================
+// Part A — `reserve_user_range_for_access` and PrivateAnon
+// cross-call consistency. The eager-walk path must publish each
+// materialised page through the pmap so subsequent `copy_*_user`
+// calls find the same frame; without that publish, a brk-backed
+// `PrivateAnon` page would re-zero on every read and writes would
+// be invisible to subsequent reads. See `vm/user_access.rs`'s
+// module header for the design.
+// =====================================================================
+
+#[test]
+fn vm_aspace_reserve_user_range_for_access_publishes_private_anon_pages() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x10000, 3),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+
+    let outcome =
+        aspace.reserve_user_range_for_access(range(0x10000, 3), crate::vm::UserAccessKind::Write);
+    assert!(matches!(outcome, StepOutcome::Done(())));
+    for page in [UserPage(0x10), UserPage(0x11), UserPage(0x12)] {
+        let snap = aspace
+            .pmap()
+            .lookup(page)
+            .expect("page published after reserve");
+        assert!(snap.prot.write, "write reserve publishes writable mapping");
+    }
+}
+
+#[test]
+fn vm_aspace_reserve_user_range_for_access_skips_already_published() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x20000, 2),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+
+    let _ =
+        aspace.reserve_user_range_for_access(range(0x20000, 2), crate::vm::UserAccessKind::Write);
+    let mapped_after_first = aspace.pmap().stats().mapped_pages;
+    assert_eq!(mapped_after_first, 2);
+    let commits_after_first = aspace.pmap().stats().commits;
+
+    // Second call: every page already permits Write; no new commits.
+    let _ =
+        aspace.reserve_user_range_for_access(range(0x20000, 2), crate::vm::UserAccessKind::Write);
+    assert_eq!(aspace.pmap().stats().mapped_pages, 2);
+    assert_eq!(aspace.pmap().stats().commits, commits_after_first);
+}
+
+#[test]
+fn vm_aspace_reserve_user_range_for_access_returns_efault_for_unmapped() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+
+    let outcome =
+        aspace.reserve_user_range_for_access(range(0x30000, 1), crate::vm::UserAccessKind::Read);
+    assert_eq!(outcome, StepOutcome::Err(crate::execution::Errno::EFAULT));
+    assert_eq!(aspace.pmap().stats().mapped_pages, 0);
+}
+
+#[test]
+fn vm_aspace_reserve_user_range_for_access_propagates_prot_mismatch_efault() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x40000, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("read-only map");
+
+    let outcome =
+        aspace.reserve_user_range_for_access(range(0x40000, 1), crate::vm::UserAccessKind::Write);
+    assert_eq!(outcome, StepOutcome::Err(crate::execution::Errno::EFAULT));
+}
+
+#[test]
+fn vm_aspace_copy_from_user_consistent_with_prior_copy_to_user_for_private_anon() {
+    // Regression test for the PrivateAnon zero-frame consistency bug.
+    // Without the pmap-first probe + publish in `resolve_user_page_addr`,
+    // each call to `copy_*_user` on an unpublished anon page allocated a
+    // fresh zero frame, so `copy_to_user` writes were invisible to a
+    // subsequent `copy_from_user` read on the same page.
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let user_va = 0x50_0000usize;
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(user_va, 1),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("anon map");
+
+    let guard = tx_substrate::epoch::guard();
+    let dst = tx_hal::UserPtr::<u8>::new(user_va);
+    let payload: alloc::vec::Vec<u8> = (0u8..200).collect();
+    match aspace.copy_to_user(dst, &payload, &guard) {
+        StepOutcome::Done(n) => assert_eq!(n, payload.len()),
+        other => panic!("copy_to_user expected Done, got {other:?}"),
+    }
+
+    // The pmap must now have a published mapping for this page —
+    // otherwise the readback below would observe a fresh zero frame.
+    let user_page = UserVirtAddr(user_va).containing_page();
+    assert!(
+        aspace.pmap().lookup(user_page).is_some(),
+        "copy_to_user must publish the materialised frame"
+    );
+
+    let mut readback = alloc::vec![0u8; payload.len()];
+    let src = tx_hal::UserPtr::<u8>::new(user_va);
+    match aspace.copy_from_user(&mut readback, src, &guard) {
+        StepOutcome::Done(n) => assert_eq!(n, payload.len()),
+        other => panic!("copy_from_user expected Done, got {other:?}"),
+    }
+    assert_eq!(readback, payload, "readback must match prior write");
 }

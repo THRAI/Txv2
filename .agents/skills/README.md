@@ -33,6 +33,10 @@ Current orientation skills:
   exec, first-userspace, and runtime integration seams.
 - `tx-progress-memory` records or resumes durable decisions, plans, handoffs,
   research, status, and task-finish catch-ups.
+- `tx-shell-syscall-fixup` tight observe→fix→verify loop for missing or
+  broken syscalls when an interactive busybox/musl shell hangs, crashes, or
+  diverges; pairs the trap-trace + fault-decode + shell-test xtask tools with
+  the syscall-stub edit pattern in `tx-shims`.
 - `tx-subsystem-manifest` covers subsystem specs and zone-derived type policy
   tables.
 - `tx-vfs-filesystem` covers VFS, Mount, PageBacked filesystem interfaces,

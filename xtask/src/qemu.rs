@@ -14,6 +14,16 @@ const DEFAULT_SENTINEL_TIMEOUT: Duration = Duration::from_secs(10);
 struct QemuOptions {
     expect_sentinel: bool,
     timeout: Duration,
+    /// Skip the busybox-profile virtio-blk drive wiring. Used by smoke
+    /// runs that only need the initramfs to come up; it sidesteps the
+    /// `mkfs.ext4` host-tool dependency.
+    no_block: bool,
+    /// Run with `-serial mon:stdio` instead of `-serial file:...` so
+    /// stdin/stdout connect to the host terminal. Drops the per-run
+    /// serial log file and the sentinel-watcher; the user (or the
+    /// shell-test driver) sees output directly and types into stdin.
+    /// Ctrl-A C to drop into the QEMU monitor, Ctrl-A X to quit.
+    interactive: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +84,8 @@ fn qemu_options(args: &[String]) -> Result<QemuOptions> {
     Ok(QemuOptions {
         expect_sentinel: args.iter().any(|arg| arg == "--expect-sentinel"),
         timeout,
+        no_block: args.iter().any(|arg| arg == "--no-block"),
+        interactive: args.iter().any(|arg| arg == "--interactive"),
     })
 }
 
@@ -101,20 +113,40 @@ fn qemu_command(
         qemu_memory(target).to_string(),
         "-smp".to_string(),
         match target {
-            TxTarget::Rv64Qemu => "4",
+            // Interactive runs default to single-hart so multi-hart
+            // serial interleaving doesn't garble shell output. The
+            // sentinel-watch test path keeps the original SMP=4 to
+            // exercise the AP boot path.
+            TxTarget::Rv64Qemu => {
+                if options.interactive {
+                    "1"
+                } else {
+                    "4"
+                }
+            }
             TxTarget::Rv64M1DockMock | TxTarget::La64Qemu => "1",
         }
         .to_string(),
         "-display".to_string(),
         "none".to_string(),
-        "-monitor".to_string(),
-        "none".to_string(),
-        "-serial".to_string(),
-        format!("file:{}", serial_log.display()),
-        "-no-reboot".to_string(),
-        "-kernel".to_string(),
-        kernel.display().to_string(),
     ]);
+
+    if options.interactive {
+        // `-serial mon:stdio` multiplexes the QEMU monitor and the
+        // guest's UART onto the host stdio. Ctrl-A C drops into the
+        // monitor; Ctrl-A X quits. No `-monitor` here — it's already
+        // multiplexed in.
+        args.push("-serial".to_string());
+        args.push("mon:stdio".to_string());
+    } else {
+        args.push("-monitor".to_string());
+        args.push("none".to_string());
+        args.push("-serial".to_string());
+        args.push(format!("file:{}", serial_log.display()));
+    }
+    args.push("-no-reboot".to_string());
+    args.push("-kernel".to_string());
+    args.push(kernel.display().to_string());
 
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
@@ -150,7 +182,7 @@ fn qemu_command(
         }
     }
 
-    if profile == Profile::Busybox {
+    if profile == Profile::Busybox && !options.no_block {
         args.push("-device".into());
         if target == TxTarget::Rv64M1DockMock {
             args.push("virtio-blk-device,drive=m1sd,bus=virtio-mmio-bus.0".into());
@@ -529,6 +561,8 @@ mod tests {
         let options = QemuOptions {
             expect_sentinel: true,
             timeout: Duration::from_secs(10),
+            no_block: false,
+            interactive: false,
         };
         let command = qemu_command(
             Path::new("/tmp/tx"),

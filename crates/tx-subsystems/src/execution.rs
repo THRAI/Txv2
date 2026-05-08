@@ -8,20 +8,55 @@ pub use tx_substrate::epoch::Guard;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Errno {
+    EACCES,
+    /// Resource temporarily unavailable. Surfaced by `O_NONBLOCK` I/O
+    /// paths (e.g. fd-ops Wave 3 `pipe::step_read` / `step_write` with
+    /// `nonblocking = true` and no progress yet).
+    EAGAIN,
+    /// Bad file descriptor. Today only surfaced by fd-ops Wave 3
+    /// pipe dispatch when a wrong-side `step_read` / `step_write`
+    /// reaches the dispatcher despite the OpenFileFlags read/write
+    /// guard (defence in depth — the flag check at the top of
+    /// `OpenFile::step_read/step_write` returns `EINVAL` first for
+    /// the common case). Linux semantic: `read(2)` on a writer-end
+    /// fd is `-EBADF`, not `-EPIPE`.
+    EBADF,
     EBUSY,
     EDQUOT,
+    EEXIST,
     EFAULT,
     EINVAL,
     EIO,
     EISDIR,
+    ELOOP,
     ENAMETOOLONG,
     ENODEV,
+    ENOEXEC,
     ENOMEM,
     ENOENT,
     ENOSYS,
     ENOTDIR,
+    ENOTEMPTY,
+    /// Inappropriate ioctl for device. Surfaced by Slice 5 of the
+    /// shell-prompt roadmap (`ioctl(2)` arm) when the target fd is not
+    /// a TTY (terminal-shape ioctl on a pipe / regular file / dir / etc.)
+    /// or the request code is not one of the eight TTY ioctls v1
+    /// implements. Linux value: 25.
+    ENOTTY,
     EPERM,
+    /// Broken pipe: write to a pipe with all readers closed. The
+    /// caller is responsible for delivering SIGPIPE before returning
+    /// `-EPIPE` to userspace (fd-ops Wave 3, Q2 DECIDED 2026-05-07).
+    EPIPE,
+    /// Numerical result out of range. Surfaced by Slice 6's
+    /// `getcwd(2)` arm when the user buffer is smaller than the
+    /// rendered path (NUL terminator inclusive). Linux value: 34.
+    ERANGE,
     EROFS,
+    /// Illegal seek. Surfaced by `lseek(2)` when called against a
+    /// non-seekable file (pipe / TTY / chardev / socket). fd-ops
+    /// Wave 4. Linux value: 29.
+    ESPIPE,
     ESRCH,
     ESTALE,
 }

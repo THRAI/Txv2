@@ -8,7 +8,9 @@
 //! pure observation helpers belong here.
 
 use alloc::boxed::Box;
+use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::cred::{CapabilitySet, Cred};
 use crate::device::CharDeviceBinding;
 use crate::execution::Errno;
 use crate::mount::{MountIdentity, MountPayload};
@@ -62,10 +64,60 @@ impl FsObjectId {
     }
 }
 
+/// Walker-side projection of a process's credential. Carries only the
+/// fields VFS permission checks need: the **effective** uid/gid and
+/// the effective capability set (`CAP_DAC_OVERRIDE` short-circuit).
+///
+/// `Credential::default()` is no longer "root"-equivalent: it produces
+/// `{ uid: 0, gid: 0, effective_caps: CapabilitySet::EMPTY }`. The
+/// uid happens to be 0 because that is the `Default::default()` for
+/// `u32`, but with no capabilities the walker treats this as an
+/// unprivileged caller (Wave 3, when the DAC predicate lands; today
+/// the walker still allows everything, but the field is in place so
+/// Wave 3 has a stable seam). Production paths that *do* want a
+/// root-equivalent walker cred must call [`Credential::root`].
+///
+/// See `txdoc:VFS-CHECKS-PERMISSIONS-1` for the walker-side
+/// permission contract.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Credential {
     pub uid: u32,
     pub gid: u32,
+    /// Effective capability set. The walker consults
+    /// `CAP_DAC_OVERRIDE` here (Wave 3) without re-locking the
+    /// per-process `Cred`.
+    pub effective_caps: CapabilitySet,
+}
+
+impl Credential {
+    /// Root walker credential: uid 0, gid 0, all capabilities. Use in
+    /// bootstrap paths where the caller is root by construction
+    /// (e.g. `init`'s pre-userspace bring-up). Distinct from
+    /// `Credential::default()`, which post-Wave-1 is no longer
+    /// root-equivalent.
+    pub const fn root() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            effective_caps: CapabilitySet::FULL,
+        }
+    }
+}
+
+/// Project a full `Cred` onto the walker-side `Credential`. Per the
+/// POSIX path-resolution rule, DAC checks consult the **effective**
+/// uid/gid (not the real uid/gid); see `man 2 path_resolution` and
+/// `man 2 chmod`. The `permitted_caps` set is intentionally dropped:
+/// it has no walker-side use today, and the bridge keeps the walker
+/// type lean.
+impl From<&Cred> for Credential {
+    fn from(cred: &Cred) -> Self {
+        Self {
+            uid: cred.euid.raw(),
+            gid: cred.egid.raw(),
+            effective_caps: cred.effective_caps,
+        }
+    }
 }
 
 // === inode metadata + POSIX mode constants ============================
@@ -91,6 +143,14 @@ pub const S_IFCHR: u16 = 0o020000;
 pub const S_IFBLK: u16 = 0o060000;
 pub const S_IFIFO: u16 = 0o010000;
 pub const S_IFSOCK: u16 = 0o140000;
+
+// POSIX special-mode bits: setuid, setgid, sticky. Live above the
+// standard `rwxrwxrwx` triplets but below `S_IFMT`. Used by the DAC +
+// setuid slice's chmod/chown bookkeeping (e.g. `step_chown` silently
+// clears `S_ISUID`/`S_ISGID` for non-privileged callers).
+pub const S_ISUID: u16 = 0o4000;
+pub const S_ISGID: u16 = 0o2000;
+pub const S_ISVTX: u16 = 0o1000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Timespec {
@@ -260,6 +320,23 @@ impl core::fmt::Debug for InlineName {
     }
 }
 
+// Lexicographic ordering on the active-prefix slice. A derive would
+// compare `len` first and then the full inline buffer, which would
+// (a) order shorter names before all longer ones regardless of bytes,
+// and (b) include trailing zero padding. Hand-written `cmp` over
+// `as_bytes()` is the intended `BTreeMap<InlineName, _>` key shape.
+impl Ord for InlineName {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
+impl PartialOrd for InlineName {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VfsName<'a>(&'a [u8]);
 
@@ -300,6 +377,24 @@ pub struct OpenFileFlags {
     pub read: bool,
     pub write: bool,
     pub append: bool,
+    /// `O_CLOEXEC` (Linux generic ABI bit `0o2000000` = `0x80000`):
+    /// the resulting fd is marked close-on-exec so the next exec
+    /// silently closes it. The walker itself does not look at this
+    /// bit — it threads through to the syscall arm (`sys_open` once
+    /// it lands; today only the per-process bitmap is exposed via
+    /// `fcntl(F_SETFD)`), which is responsible for setting the
+    /// matching bit in `ProcessPayload.fd_cloexec` after the fd
+    /// table install completes. The flag stays on `OpenFileFlags`
+    /// itself so a future `dup3(F_DUPFD_CLOEXEC)` / `pipe2` can
+    /// observe it without re-decoding the open flags.
+    pub cloexec: bool,
+    /// `O_NONBLOCK` (Linux generic ABI bit `0o4000`): I/O against
+    /// this fd never blocks — paths that would `Blocked(token)` for a
+    /// blocking fd surface `Errno::EAGAIN` instead. fd-ops Wave 3
+    /// honours this for `pipe2(2)` reader/writer ends; other backings
+    /// (page-backed regular files, TTY) ignore it today and
+    /// re-honour it once the per-backing nonblock plumbing lands.
+    pub nonblocking: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,10 +420,22 @@ pub enum OpenFileIoctlResult {
 
 #[derive(Clone, Debug)]
 pub enum RNodeBacking {
-    PageBacked { pc: Cap<PageContainer> },
+    PageBacked {
+        pc: Cap<PageContainer>,
+    },
     Directory,
-    Symlink { target: Box<InlineName> },
-    StructBacked { payload: StructPayload },
+    /// Symlink target stored as raw bytes. Targets may contain `/`
+    /// (multi-component) or be absolute (leading `/`), so the bytes
+    /// cannot fit through `InlineName::new`'s slash-rejecting
+    /// constructor; the walker substitutes the bytes directly into
+    /// the remaining component stream per
+    /// `txdoc:VFS-CHECKS-RUN-WALKER-LOOP-1`.
+    Symlink {
+        target: Box<[u8]>,
+    },
+    StructBacked {
+        payload: StructPayload,
+    },
     Projected,
 }
 
@@ -336,6 +443,13 @@ pub enum RNodeBacking {
 pub enum StructPayload {
     Tty(Cap<TtyIdentity>),
     CharDevice(&'static CharDeviceBinding),
+    /// Anonymous pipe — `pipe2(2)`. `side` distinguishes the
+    /// reader-end RNode from the writer-end RNode; both share a
+    /// single `Cap<PipePayload>`. fd-ops Wave 3.
+    Pipe {
+        payload: Cap<crate::pipe::PipePayload>,
+        side: crate::pipe::PipeSide,
+    },
 }
 
 // === live-node entities ===============================================
@@ -386,6 +500,19 @@ impl RNode {
         self.containing_mount = Some(mount.downgrade());
         self
     }
+
+    /// Snapshot the containing-mount `Weak<MountPayload>`. Used by the
+    /// VFS walker (`crate::vfs::walker::step_walk`) to resolve the
+    /// in-scope `FsOps` for a dentry's RNode, and by the page cache
+    /// when materialising file-backed RNodes.
+    ///
+    /// Returns `None` when the RNode was constructed without
+    /// `with_containing_mount` (the trio's bootstrap rootfs root
+    /// rnode falls into this category today; a follow-up wires the
+    /// hint at mount-publication time).
+    pub fn containing_mount_weak(&self) -> Option<Weak<MountPayload>> {
+        self.containing_mount
+    }
 }
 
 #[derive(Debug)]
@@ -433,6 +560,16 @@ impl DEntry {
     /// or for dentries that haven't had `set_parent_hint` called.
     pub fn parent_hint(&self) -> Option<Weak<DEntry>> {
         self.parent
+    }
+
+    /// Snapshot the `mounted` weak hint. Used by the VFS walker
+    /// (`crate::vfs::walker::step_walk`) for mount-point boundary
+    /// crossing per
+    /// `txdoc:VFS-CHECKS-MOUNT-BOUNDARY-DISCIPLINE-1` and
+    /// `txdoc:MOUNT-STEP-MOUNT-COMMIT-ORDERING-1`. Returns `None`
+    /// for dentries that have not been published as a mount point.
+    pub fn mounted_hint(&self) -> Option<Weak<MountIdentity>> {
+        self.mounted
     }
 }
 
@@ -489,10 +626,30 @@ pub fn render_dentry_path(dentry: &Cap<DEntry>) -> Option<alloc::vec::Vec<u8>> {
     Some(out)
 }
 
+/// Per-fd file-position carrier.
+///
+/// fd-ops Wave 4 made `offset` interior-mutable (`AtomicU64`) so
+/// `OpenFile::step_lseek` and the page-backed `step_read` /
+/// `step_write` lanes can mutate the position through `&self`. This
+/// matches Linux's "shared file description across `dup`/`fork` →
+/// shared offset" semantic without bolting an extra lock onto every
+/// fd-table read.
 #[derive(Debug)]
 pub struct OpenFile {
     pub(crate) rnode: Cap<RNode>,
-    offset: u64,
+    offset: AtomicU64,
+    /// Per-fd readdir cursor. Slice 6 of the shell-prompt roadmap
+    /// added this so `getdents64(2)` can resume across calls without
+    /// rewinding the directory each time.
+    ///
+    /// Stored as an `AtomicU64` round-tripped through
+    /// [`DirCursor::from_u64`] / [`DirCursor::as_u64`] — every in-tree
+    /// FsOps backend (tmpfs, devfs) emits a u64-shaped cursor, so the
+    /// 16-byte `DirCursor` pads with zeros above the lower u64 word.
+    /// `Cap` clone (`dup` / `fork`) shares the cell, matching Linux's
+    /// "shared file description across `dup` / `fork`" semantic for
+    /// directory streams.
+    readdir_cursor: AtomicU64,
     pub(crate) flags: OpenFileFlags,
 }
 
@@ -500,7 +657,8 @@ impl OpenFile {
     pub fn new(rnode: Cap<RNode>, flags: OpenFileFlags) -> Self {
         Self {
             rnode,
-            offset: 0,
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
             flags,
         }
     }
@@ -514,16 +672,96 @@ impl OpenFile {
         &self.rnode
     }
 
-    pub const fn offset(&self) -> u64 {
-        self.offset
+    /// Load the current per-fd offset.
+    ///
+    /// `Acquire` paired with the `Release` store in `set_offset` /
+    /// `advance_offset` so a thread that sees a fresh offset value
+    /// also sees any page-cache state writes the previous I/O step
+    /// committed before bumping the offset.
+    pub fn offset(&self) -> u64 {
+        self.offset.load(Ordering::Acquire)
     }
 
-    pub fn set_offset(&mut self, offset: u64) {
-        self.offset = offset;
+    /// Replace the offset with `offset`. Used by `lseek(2)` and by
+    /// the page-backed I/O lanes' `step_range` finaliser when the
+    /// step ran to completion or stopped early on a partial blocked /
+    /// errored result.
+    pub fn set_offset(&self, offset: u64) {
+        self.offset.store(offset, Ordering::Release);
+    }
+
+    /// Bump the offset by `delta`, returning the **new** value.
+    ///
+    /// Wraps `AtomicU64::fetch_add` (which yields the *old* value);
+    /// the page-backed step bodies never need the old value, only
+    /// the post-bump cursor.
+    pub fn advance_offset(&self, delta: u64) -> u64 {
+        // fetch_add returns old; the new value is `old + delta`.
+        self.offset.fetch_add(delta, Ordering::AcqRel) + delta
     }
 
     pub const fn flags(&self) -> OpenFileFlags {
         self.flags
+    }
+
+    /// Snapshot the per-fd readdir cursor.
+    ///
+    /// Slice 6: `getdents64(2)` consumes this at the start of each
+    /// call and writes the post-batch value back via
+    /// [`Self::set_readdir_cursor`] so the next call resumes where the
+    /// previous one left off. `Acquire` paired with the `Release`
+    /// store in `set_readdir_cursor` matches the offset/lseek
+    /// discipline.
+    pub fn readdir_cursor(&self) -> DirCursor {
+        DirCursor::from_u64(self.readdir_cursor.load(Ordering::Acquire))
+    }
+
+    /// Replace the readdir cursor with `cursor`.
+    ///
+    /// Cap clone (`dup` / `fork`) shares the cell, so concurrent
+    /// `getdents64` against the same OpenFile via different fds
+    /// observes the shared "file description" cursor — matches
+    /// Linux's per-file-description directory stream semantic.
+    pub fn set_readdir_cursor(&self, cursor: DirCursor) {
+        self.readdir_cursor
+            .store(cursor.as_u64(), Ordering::Release);
+    }
+}
+
+/// Pipe-side lifecycle hook (shell-prompt roadmap Slice 1).
+///
+/// `Cap<OpenFile>` is refcounted via the zone-substrate machinery; the
+/// inner `OpenFile` value drops exactly once, when the last `Cap`
+/// referencing it is released and EBR fires the slot reclamation
+/// callback. That single-shot guarantee is what makes a per-side
+/// reader/writer count against `PipePayload` correct without an
+/// explicit hook on every `sys_close` / `sys_dup3`-replace / fork-CLOEXEC
+/// / exit-cleanup path: each fd-slot drop releases one `Cap`, and only
+/// the *last* such drop reaches this destructor.
+///
+/// The behaviour is keyed on `RNodeBacking::StructBacked { payload:
+/// StructPayload::Pipe { side, .. } }`; non-pipe backings have no
+/// per-OpenFile lifecycle (page-backed inodes own their own page
+/// containers; tty/chardev RNodes outlive any OpenFile referencing
+/// them).
+///
+/// On the *last-reader-close* transition `decr_reader` fires the
+/// writer-side wait channel so any blocked writer surfaces SIGPIPE/
+/// EPIPE. On the *last-writer-close* transition `decr_writer` fires
+/// the reader-side wait channel so any blocked reader surfaces EOF
+/// (`Done(0)`). Both transitions are owned by `pipe::PipePayload`'s
+/// `decr_*` helpers.
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        if let RNodeBacking::StructBacked {
+            payload: StructPayload::Pipe { payload, side },
+        } = self.rnode.backing()
+        {
+            match side {
+                crate::pipe::PipeSide::Reader => payload.decr_reader(),
+                crate::pipe::PipeSide::Writer => payload.decr_writer(),
+            }
+        }
     }
 }
 

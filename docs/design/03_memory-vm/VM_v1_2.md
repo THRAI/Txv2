@@ -90,46 +90,17 @@ The authority split is:
   AddressSpace>`) and process/thread witnesses;
 - `VmEntry` values are authoritative mapping bindings in the recipes BTree;
 - pmap PTEs are derived materializations justified by recipes and RangeLock;
-- user bytes cross the boundary only through VM copyin/copyout, which walks
-  `VmEntry` bindings and pmap materializations before copying through the
-  direct map, or through a fault-script materialization path that re-reads
-  recipes before PTE publication.
+- user bytes cross the boundary only through the eager-walk
+  `AddressSpace::copy_*_user` methods (which walk recipes page-by-page,
+  materialise each page through its `VmEntry.backing`, and copy through
+  the kernel direct-map view) or through a fault-script materialization
+  path that re-reads recipes before PTE publication.
 
 No VM caller should receive a raw kernel pointer to user memory, a freeing
 authority encoded as a PPN, or a permission decision encoded only in address
 arithmetic. Arithmetic on user addresses is local to VM helpers that align,
 split, and index ranges; syscall and subsystem code should consume VM results
 as semantic outcomes.
-
-### Copyin/copyout resolution policy
-<!-- txdoc:VM-COPYIN-COPYOUT-RESOLUTION-POLICY -->
-
-`copy_from_user` and `copy_to_user` are VM operations. They do not directly
-dereference a user VA and do not use a kernel-mode fault as the normal lookup
-mechanism. The copy engine walks the current `AddressSpace` explicitly:
-
-1. Check `(user_ptr, len)` as a `UserRange`: no overflow, page-aligned
-   iteration boundaries, and no crossing above `USER_TOP`.
-2. Acquire the declared range through `RangeLock`. `copy_from_user` needs a
-   read-compatible observation. `copy_to_user` needs the write/materialization
-   mode required to install writable pages or perform MAP_PRIVATE CoW.
-3. Observe `recipes.range_containing(va)` for the current VA. Missing recipes
-   or insufficient `VmEntry.prot` return `EFAULT`.
-4. For every page in the requested span, observe or materialize the pmap leaf
-   against that `VmEntry`. Missing pages use the same materialization logic as
-   a user page fault, including blocking and retrying from the top after wake.
-5. Convert each justified PPN to a direct-map kernel virtual address.
-6. Merge adjacent pages into a larger copy run when the virtual pages are
-   consecutive, the PPNs are consecutive, the access decision is unchanged,
-   and the run stays inside both the requested `UserRange` and the current
-   `VmEntry`.
-7. Copy bytes between the caller's kernel buffer and the direct-map run.
-
-This gives copyin/copyout the same authority source as page faults:
-`VmEntry` first, pmap second. The pmap can speed the path up only after the
-recipe has justified it. Architecture fixup recovery remains allowed as a
-defensive fallback around any tiny raw-copy window, but it is not the steady
-state design.
 
 ---
 

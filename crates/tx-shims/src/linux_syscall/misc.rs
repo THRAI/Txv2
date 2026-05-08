@@ -1,0 +1,166 @@
+//! Auto-extracted from `mod.rs` during the 2026-05-08 jumbo-mod
+//! split. The implementations here are unchanged; only the
+//! enclosing module changed. Helpers and constants used here live
+//! either in this submodule or in the shared parent (`super::*`).
+
+use super::*;
+
+/// `getrandom(buf, buflen, flags)` — Linux RV64 generic ABI
+/// `__NR_getrandom = 278`.
+///
+/// Slice 7 v1: fills `buflen` bytes at `buf` from
+/// `<P as EntropyIf>::fill_random`. The `flags` arg is recognised
+/// (`GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE`) but ignored — the
+/// in-tree default impl is deterministic + non-blocking.
+///
+/// User-VA writeback flows through `bootstrap_copy_to_user`
+/// (canonical `aspace.copy_to_user` lane with kernel-pointer fallback
+/// for test scaffolding). Null `buf` with non-zero `buflen` returns
+/// `-EFAULT`; `buflen == 0` is a successful no-op (`Return(0)`).
+pub(super) fn sys_getrandom<'a, P: EntropyIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let buf_uaddr = args[0];
+    let buf_len = args[1] as usize;
+    let _flags = args[2] as u32; // GRND_* recognised but ignored.
+
+    if buf_len == 0 {
+        return SyscallResult::Return(0);
+    }
+    if buf_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    // Fill into a temporary kernel buffer, then copy out through the
+    // canonical user-VA lane.
+    let mut tmp = alloc::vec![0u8; buf_len];
+    <P as EntropyIf>::fill_random(&mut tmp);
+    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &tmp) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    SyscallResult::Return(buf_len as i64)
+}
+
+/// `uname(buf)` — Linux RV64 generic ABI `__NR_uname = 160`.
+///
+/// Writes a static utsname (`sysname` / `nodename` / `release` /
+/// `version` / `machine` / `domainname`) to `buf`. Each field is a
+/// `[u8; 65]` NUL-padded string. Slice 7 pins:
+///
+/// - `sysname = "Linux"` so musl's runtime "is this Linux?" probe
+///   succeeds.
+/// - `release = "6.1.0-txkernel"` so the version-triple parser at the
+///   front of the string sees a Linux 2.6.16+ kernel (musl's
+///   kernel-feature gating reads only the leading digits).
+/// - `machine = "riscv64"` matching the target ABI.
+///
+/// SAFETY: kernel-buffer exemption (mirrors `sys_getresuid`).
+pub(super) fn sys_uname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let buf_uaddr = args[0];
+    if buf_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let utsname = build_utsname();
+    if let Err(errno) = bootstrap_write_user::<UtsnameLayout>(&ctx.aspace, buf_uaddr, utsname) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    SyscallResult::Return(0)
+}
+
+/// `prlimit64(pid, resource, new_rlim, old_rlim)` — Linux RV64
+/// generic ABI `__NR_prlimit64 = 261`.
+///
+/// Slice 7 v1: read-only static rlimit table for the calling process.
+/// `pid == 0` or `pid == self.pid` is the only supported target;
+/// cross-pid queries return `-EPERM`. `new_rlim` is silently ignored
+/// — limits are not actually enforced by any in-tree subsystem yet
+/// (`TODO(phase-rlimit-enforcement)`). The static table is generous
+/// (`RLIMIT_NOFILE = (1024, 4096)`, `RLIMIT_STACK = 8 MiB`, the rest
+/// `RLIM_INFINITY`).
+///
+/// Unknown resource ids return `-EINVAL`. Null `old_rlim` is OK (the
+/// arm just reports back via the return value) — Linux only requires
+/// the writeback when `old_rlim` is non-null.
+pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let pid = args[0] as u32;
+    let resource = args[1] as u32;
+    let _new_uaddr = args[2]; // ignored — limits not enforced today.
+    let old_uaddr = args[3];
+
+    if pid != 0 && pid != ctx.process.pid.0 {
+        // TODO(phase-pid-resolver): cross-pid prlimit64 once a global
+        // pid → Cap<ProcessIdentity> table is wired.
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+
+    let limit = match resource {
+        RLIMIT_NOFILE => RlimitLayout {
+            rlim_cur: 1024,
+            rlim_max: 4096,
+        },
+        RLIMIT_STACK => RlimitLayout {
+            rlim_cur: 8 * 1024 * 1024,
+            rlim_max: RLIM_INFINITY,
+        },
+        RLIMIT_CORE => RlimitLayout {
+            rlim_cur: 0,
+            rlim_max: RLIM_INFINITY,
+        },
+        RLIMIT_CPU | RLIMIT_FSIZE | RLIMIT_DATA | RLIMIT_RSS | RLIMIT_NPROC | RLIMIT_MEMLOCK
+        | RLIMIT_AS | RLIMIT_LOCKS | RLIMIT_SIGPENDING | RLIMIT_MSGQUEUE | RLIMIT_NICE
+        | RLIMIT_RTPRIO | RLIMIT_RTTIME => RlimitLayout {
+            rlim_cur: RLIM_INFINITY,
+            rlim_max: RLIM_INFINITY,
+        },
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    if old_uaddr != 0 {
+        if let Err(errno) = bootstrap_write_user::<RlimitLayout>(&ctx.aspace, old_uaddr, limit) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+    }
+    SyscallResult::Return(0)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct UtsnameLayout {
+    pub(super) sysname: [u8; UTSNAME_FIELD],
+    pub(super) nodename: [u8; UTSNAME_FIELD],
+    pub(super) release: [u8; UTSNAME_FIELD],
+    pub(super) version: [u8; UTSNAME_FIELD],
+    pub(super) machine: [u8; UTSNAME_FIELD],
+    pub(super) domainname: [u8; UTSNAME_FIELD],
+}
+
+pub(super) fn build_utsname() -> UtsnameLayout {
+    fn pad(s: &str) -> [u8; UTSNAME_FIELD] {
+        let mut out = [0u8; UTSNAME_FIELD];
+        let bytes = s.as_bytes();
+        // Reserve the trailing NUL byte. `min(len, 64)` clamps the
+        // copy so `out[64] = 0` always.
+        let n = core::cmp::min(bytes.len(), UTSNAME_FIELD - 1);
+        let (head, _) = out.split_at_mut(n);
+        head.copy_from_slice(&bytes[..n]);
+        out
+    }
+    UtsnameLayout {
+        sysname: pad("Linux"),
+        nodename: pad("txkernel"),
+        // Linux 6.1.0 is the LTS line musl 1.2.x runtime probes treat
+        // as fully featured.
+        release: pad("6.1.0-txkernel"),
+        version: pad("#1 SMP txkernel"),
+        machine: pad("riscv64"),
+        domainname: pad("(none)"),
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RlimitLayout {
+    rlim_cur: u64,
+    rlim_max: u64,
+}

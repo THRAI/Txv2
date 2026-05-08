@@ -1,19 +1,21 @@
 use super::*;
 use crate::execution::{Errno, StepOutcome};
 use crate::vfs::{FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking};
+use crate::vm::{
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
+    USER_PAGE_SIZE,
+};
 use alloc::vec;
 use alloc::vec::Vec;
-use tx_hal::{KernelPtr, UserPtr};
+use tx_hal::UserPtr;
+use tx_substrate::page_allocator;
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
-    crate::zones::register_all().expect("kernel zones");
     match tx_substrate::page_allocator::claim_zero_frame() {
         Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for PageBacked user-buffer tests: {error:?}"),
     }
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
 }
 
 fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
@@ -31,55 +33,132 @@ fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
             read: true,
             write: true,
             append: false,
+            cloexec: false,
+            nonblocking: false,
         },
     )
 }
 
-fn map_user_buffer(aspace: &crate::vm::AddressSpace, start: usize, len: usize) {
-    let len = align_up(len.max(1), crate::vm::USER_PAGE_SIZE);
-    let range = crate::vm::UserRange::new_aligned(crate::vm::UserVirtAddr(start), len)
-        .expect("aligned user buffer range");
-    let request = crate::vm::VmMapRequest::fixed(
-        range,
-        crate::vm::MapPlacement::RequireFree,
-        crate::vm::Prot::READ_WRITE,
-        crate::vm::VmEntryFlags::PRIVATE,
-        crate::vm::VmBacking::PrivateAnon,
-    );
-    aspace.try_mmap(request).expect("map test user buffer");
+/// User-space mapping fixture: an `AddressSpace` with a single anon
+/// `PageContainer`-backed `VmEntry` covering `[user_va, user_va +
+/// page_count * 4096)`. The `user_pc` is a kernel-side handle on the
+/// same backing pages; tests that need to seed or inspect bytes at
+/// the user VA do so by materialising user_pc pages and writing
+/// through the kernel direct-map view.
+struct UserBufferFixture {
+    aspace: AddressSpace,
+    user_pc: Cap<PageContainer>,
+    user_va: usize,
 }
 
-fn populate_user(aspace: &crate::vm::AddressSpace, addr: usize, bytes: &[u8]) {
-    let outcome = unsafe {
-        crate::vm::copy_to_user(
-            aspace,
-            UserPtr::new(addr),
-            KernelPtr::new(bytes.as_ptr().cast_mut()),
-            bytes.len(),
+impl UserBufferFixture {
+    fn new(user_va: usize, page_count: u64) -> Self {
+        let user_pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            page_count,
         )
-    };
-    assert_eq!(outcome, StepOutcome::Done(bytes.len()));
-}
-
-fn read_user(aspace: &crate::vm::AddressSpace, addr: usize, dest: &mut [u8]) {
-    let outcome = unsafe {
-        crate::vm::copy_from_user(
+        .expect("user-side page container cap");
+        let aspace = AddressSpace::new();
+        let entry = VmEntry::new(
+            UserRange::new_aligned(
+                UserVirtAddr(user_va),
+                (page_count as usize) * USER_PAGE_SIZE,
+            )
+            .expect("aligned user range"),
+            Prot::READ_WRITE,
+            VmEntryFlags::SHARED,
+            VmBacking::Page {
+                pc: user_pc.clone(),
+                offset: 0,
+            },
+        );
+        let reservation = match aspace.reserve_map(entry, MapPlacement::RequireFree) {
+            crate::vm::MapReserveResult::Reserved(r) => r,
+            other => panic!("expected reserved, got {other:?}"),
+        };
+        reservation.commit().expect("commit user mapping");
+        Self {
             aspace,
-            KernelPtr::new(dest.as_mut_ptr()),
-            UserPtr::new(addr),
-            dest.len(),
-        )
-    };
-    assert_eq!(outcome, StepOutcome::Done(dest.len()));
+            user_pc,
+            user_va,
+        }
+    }
+
+    /// Seed the user-side PC with `bytes` starting at user VA.
+    fn seed_user_bytes(&self, bytes: &[u8]) {
+        write_into_pc(&self.user_pc, 0, bytes);
+    }
+
+    /// Read `len` bytes from the user-side PC at offset 0.
+    fn read_user_bytes(&self, len: usize) -> Vec<u8> {
+        read_from_pc(&self.user_pc, 0, len)
+    }
+
+    fn user_ptr(&self) -> UserPtr<u8> {
+        UserPtr::<u8>::new(self.user_va)
+    }
 }
 
-const fn align_up(value: usize, align: usize) -> usize {
-    (value + align - 1) & !(align - 1)
+fn write_into_pc(pc: &PageContainer, byte_offset: usize, bytes: &[u8]) {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let cursor = byte_offset + written;
+        let page_index = PageIndex::new((cursor / USER_PAGE_SIZE) as u64);
+        let within = cursor % USER_PAGE_SIZE;
+        let chunk = core::cmp::min(bytes.len() - written, USER_PAGE_SIZE - within);
+        let page = pc
+            .materialize_anon(page_index, MaterializeAccess::Write)
+            .expect("materialise user-side page for seeding");
+        let frame_base = page_allocator::frame_kernel_addr(page.ppn)
+            .expect("kernel direct-map for materialised page");
+        // SAFETY: frame_base is a valid kernel direct-map pointer to
+        // the materialised page; within + chunk <= USER_PAGE_SIZE; the
+        // source slice has at least `chunk` bytes remaining.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().add(written),
+                frame_base.add(within),
+                chunk,
+            );
+        }
+        written += chunk;
+    }
+}
+
+fn read_from_pc(pc: &PageContainer, byte_offset: usize, len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    let mut read = 0usize;
+    while read < len {
+        let cursor = byte_offset + read;
+        let page_index = PageIndex::new((cursor / USER_PAGE_SIZE) as u64);
+        let within = cursor % USER_PAGE_SIZE;
+        let chunk = core::cmp::min(len - read, USER_PAGE_SIZE - within);
+        let page = pc
+            .materialize_anon(page_index, MaterializeAccess::Read)
+            .expect("materialise user-side page for read-back");
+        let frame_base = page_allocator::frame_kernel_addr(page.ppn)
+            .expect("kernel direct-map for materialised page");
+        // SAFETY: frame_base is a valid kernel direct-map pointer to
+        // the materialised page; within + chunk <= USER_PAGE_SIZE.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                frame_base.add(within),
+                out.as_mut_ptr().add(read),
+                chunk,
+            );
+        }
+        read += chunk;
+    }
+    out
 }
 
 #[test]
 fn pagebacked_round_trip_through_user_buffer_preserves_bytes_in_one_page() {
-    let _lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed user-buffer test lock");
     setup_host_substrate();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
@@ -87,48 +166,45 @@ fn pagebacked_round_trip_through_user_buffer_preserves_bytes_in_one_page() {
         },
         2,
     );
-    let aspace = crate::vm::AddressSpace::new();
-    let src_addr = 0x4000;
-    let dst_addr = 0x20_000;
+    let fixture = UserBufferFixture::new(0x10_0000, 1);
+    let guard = tx_substrate::epoch::guard();
 
     let payload: Vec<u8> = (0u8..200).collect();
-    map_user_buffer(&aspace, src_addr, payload.len());
-    map_user_buffer(&aspace, dst_addr, payload.len());
-    populate_user(&aspace, src_addr, &payload);
-
-    let guard = tx_substrate::epoch::guard();
-    let mut writer = open_file_for_pc(&pc);
+    fixture.seed_user_bytes(&payload);
+    let writer = open_file_for_pc(&pc);
     let outcome = step_write_from_user(
-        &aspace,
         &pc,
-        &mut writer,
-        UserPtr::<u8>::new(src_addr),
+        &writer,
+        &fixture.aspace,
+        fixture.user_ptr(),
         payload.len(),
         &guard,
     );
     assert_eq!(outcome, StepOutcome::Done(payload.len()));
     assert_eq!(writer.offset(), payload.len() as u64);
 
-    let mut reader = open_file_for_pc(&pc);
-    let mut received = vec![0u8; payload.len()];
+    // Clear the user buffer to prove the read genuinely re-fills it.
+    let zeros = vec![0u8; payload.len()];
+    fixture.seed_user_bytes(&zeros);
+    let reader = open_file_for_pc(&pc);
     let outcome = step_read_to_user(
-        &aspace,
         &pc,
-        &mut reader,
-        UserPtr::<u8>::new(dst_addr),
-        received.len(),
+        &reader,
+        &fixture.aspace,
+        fixture.user_ptr(),
+        payload.len(),
         &guard,
     );
     assert_eq!(outcome, StepOutcome::Done(payload.len()));
     assert_eq!(reader.offset(), payload.len() as u64);
-    drop(guard);
-    read_user(&aspace, dst_addr, &mut received);
-    assert_eq!(received, payload);
+    assert_eq!(fixture.read_user_bytes(payload.len()), payload);
 }
 
 #[test]
 fn pagebacked_round_trip_through_user_buffer_crosses_page_boundary() {
-    let _lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed user-buffer test lock");
     setup_host_substrate();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
@@ -136,24 +212,19 @@ fn pagebacked_round_trip_through_user_buffer_crosses_page_boundary() {
         },
         2,
     );
-    let aspace = crate::vm::AddressSpace::new();
-    let src_addr = 0x40_000;
-    let dst_addr = 0x80_000;
+    let fixture = UserBufferFixture::new(0x20_0000, 2);
+    let guard = tx_substrate::epoch::guard();
 
-    let payload: Vec<u8> = (0..(crate::vm::USER_PAGE_SIZE + 23))
+    let payload: Vec<u8> = (0..(USER_PAGE_SIZE + 23))
         .map(|i| (i & 0xff) as u8)
         .collect();
-    map_user_buffer(&aspace, src_addr, payload.len());
-    map_user_buffer(&aspace, dst_addr, payload.len());
-    populate_user(&aspace, src_addr, &payload);
-
-    let guard = tx_substrate::epoch::guard();
-    let mut writer = open_file_for_pc(&pc);
+    fixture.seed_user_bytes(&payload);
+    let writer = open_file_for_pc(&pc);
     let outcome = step_write_from_user(
-        &aspace,
         &pc,
-        &mut writer,
-        UserPtr::<u8>::new(src_addr),
+        &writer,
+        &fixture.aspace,
+        fixture.user_ptr(),
         payload.len(),
         &guard,
     );
@@ -161,25 +232,26 @@ fn pagebacked_round_trip_through_user_buffer_crosses_page_boundary() {
     assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
     assert!(pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
 
-    let mut reader = open_file_for_pc(&pc);
-    let mut received = vec![0u8; payload.len()];
+    let zeros = vec![0u8; payload.len()];
+    fixture.seed_user_bytes(&zeros);
+    let reader = open_file_for_pc(&pc);
     let outcome = step_read_to_user(
-        &aspace,
         &pc,
-        &mut reader,
-        UserPtr::<u8>::new(dst_addr),
-        received.len(),
+        &reader,
+        &fixture.aspace,
+        fixture.user_ptr(),
+        payload.len(),
         &guard,
     );
     assert_eq!(outcome, StepOutcome::Done(payload.len()));
-    drop(guard);
-    read_user(&aspace, dst_addr, &mut received);
-    assert_eq!(received, payload);
+    assert_eq!(fixture.read_user_bytes(payload.len()), payload);
 }
 
 #[test]
-fn pagebacked_step_read_to_user_grows_offset_only_after_copy_progress() {
-    let _lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+fn pagebacked_step_read_to_user_efault_propagates_when_user_va_unmapped() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed user-buffer test lock");
     setup_host_substrate();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
@@ -187,41 +259,39 @@ fn pagebacked_step_read_to_user_grows_offset_only_after_copy_progress() {
         },
         1,
     );
-    let aspace = crate::vm::AddressSpace::new();
-    let src_addr = 0x100_000;
-    let unmapped_dst = 0x180_000;
+    // PC has bytes; aspace does NOT cover user_va — copy_to_user will EFAULT.
     let payload: Vec<u8> = (0u8..32).collect();
-    map_user_buffer(&aspace, src_addr, payload.len());
-    populate_user(&aspace, src_addr, &payload);
-
+    let writer_fixture = UserBufferFixture::new(0x30_0000, 1);
+    let empty_aspace = AddressSpace::new();
     let guard = tx_substrate::epoch::guard();
-    let mut writer = open_file_for_pc(&pc);
-    let outcome = step_write_from_user(
-        &aspace,
-        &pc,
-        &mut writer,
-        UserPtr::<u8>::new(src_addr),
-        payload.len(),
-        &guard,
+    writer_fixture.seed_user_bytes(&payload);
+    let writer = open_file_for_pc(&pc);
+    assert_eq!(
+        step_write_from_user(
+            &pc,
+            &writer,
+            &writer_fixture.aspace,
+            writer_fixture.user_ptr(),
+            payload.len(),
+            &guard,
+        ),
+        StepOutcome::Done(payload.len())
     );
-    assert_eq!(outcome, StepOutcome::Done(payload.len()));
 
-    let mut reader = open_file_for_pc(&pc);
-    let outcome = step_read_to_user(
-        &aspace,
-        &pc,
-        &mut reader,
-        UserPtr::<u8>::new(unmapped_dst),
-        16,
-        &guard,
-    );
+    // Use a fresh aspace with NO recipe and a dangling user VA.
+    let dangling = UserPtr::<u8>::new(0x40_0000);
+
+    let reader = open_file_for_pc(&pc);
+    let outcome = step_read_to_user(&pc, &reader, &empty_aspace, dangling, 16, &guard);
     assert_eq!(outcome, StepOutcome::Err(Errno::EFAULT));
     assert_eq!(reader.offset(), 0);
 }
 
 #[test]
 fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
-    let _lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed user-buffer test lock");
     setup_host_substrate();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
@@ -229,56 +299,48 @@ fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
         },
         2,
     );
-    let aspace = crate::vm::AddressSpace::new();
-    let src_addr = 0x200_000;
-    let dst_addr = 0x240_000;
+    let fixture = UserBufferFixture::new(0x50_0000, 2);
+    let guard = tx_substrate::epoch::guard();
 
-    let pattern: Vec<u8> = (0..(crate::vm::USER_PAGE_SIZE + 32))
+    let pattern: Vec<u8> = (0..(USER_PAGE_SIZE + 32))
         .map(|i| ((i & 0xff) | 0x20) as u8)
         .collect();
-    map_user_buffer(&aspace, src_addr, pattern.len());
-    map_user_buffer(&aspace, dst_addr, 32);
-    populate_user(&aspace, src_addr, &pattern);
-
-    let guard = tx_substrate::epoch::guard();
-    let mut writer = open_file_for_pc(&pc);
+    fixture.seed_user_bytes(&pattern);
+    let writer = open_file_for_pc(&pc);
     let outcome = step_write_from_user(
-        &aspace,
         &pc,
-        &mut writer,
-        UserPtr::<u8>::new(src_addr),
+        &writer,
+        &fixture.aspace,
+        fixture.user_ptr(),
         pattern.len(),
         &guard,
     );
     assert_eq!(outcome, StepOutcome::Done(pattern.len()));
 
-    let shrink_size = crate::vm::USER_PAGE_SIZE as u64 + 4;
+    let shrink_size = USER_PAGE_SIZE as u64 + 4;
     assert_eq!(
         step_truncate(&pc, shrink_size, &guard),
         StepOutcome::Done(())
     );
 
-    let grow_size = crate::vm::USER_PAGE_SIZE as u64 + 32;
+    let grow_size = USER_PAGE_SIZE as u64 + 32;
     assert_eq!(step_truncate(&pc, grow_size, &guard), StepOutcome::Done(()));
 
-    let mut reader = open_file_for_pc(&pc);
-    reader.set_offset(crate::vm::USER_PAGE_SIZE as u64);
-    let mut received = vec![0xCCu8; 32];
+    let zeros = vec![0u8; pattern.len()];
+    fixture.seed_user_bytes(&zeros);
+    let reader = open_file_for_pc(&pc);
+    reader.set_offset(USER_PAGE_SIZE as u64);
     let outcome = step_read_to_user(
-        &aspace,
         &pc,
-        &mut reader,
-        UserPtr::<u8>::new(dst_addr),
-        received.len(),
+        &reader,
+        &fixture.aspace,
+        fixture.user_ptr(),
+        32,
         &guard,
     );
     assert_eq!(outcome, StepOutcome::Done(32));
-    drop(guard);
-    read_user(&aspace, dst_addr, &mut received);
-    assert_eq!(
-        &received[..4],
-        &pattern[crate::vm::USER_PAGE_SIZE..crate::vm::USER_PAGE_SIZE + 4]
-    );
+    let received = fixture.read_user_bytes(32);
+    assert_eq!(&received[..4], &pattern[USER_PAGE_SIZE..USER_PAGE_SIZE + 4]);
     assert!(
         received[4..].iter().all(|b| *b == 0),
         "post-EOF region must read as zeros after shrink-then-grow, got {:?}",
@@ -288,7 +350,9 @@ fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
 
 #[test]
 fn pagebacked_step_write_from_user_propagates_efault_without_advance() {
-    let _lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed user-buffer test lock");
     setup_host_substrate();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
@@ -296,22 +360,13 @@ fn pagebacked_step_write_from_user_propagates_efault_without_advance() {
         },
         1,
     );
-    let aspace = crate::vm::AddressSpace::new();
-    let unmapped_src = 0x300_000;
+    // No recipe in this aspace → user VA dereference yields EFAULT.
+    let empty_aspace = AddressSpace::new();
     let guard = tx_substrate::epoch::guard();
-    let mut writer = open_file_for_pc(&pc);
-    let outcome = step_write_from_user(
-        &aspace,
-        &pc,
-        &mut writer,
-        UserPtr::<u8>::new(unmapped_src),
-        8,
-        &guard,
-    );
+    let dangling = UserPtr::<u8>::new(0x60_0000);
+    let writer = open_file_for_pc(&pc);
+    let outcome = step_write_from_user(&pc, &writer, &empty_aspace, dangling, 8, &guard);
     assert_eq!(outcome, StepOutcome::Err(Errno::EFAULT));
     assert_eq!(writer.offset(), 0);
-    assert_eq!(
-        pc.size_bytes(),
-        pc.page_count() * crate::vm::USER_PAGE_SIZE as u64
-    );
+    assert_eq!(pc.size_bytes(), pc.page_count() * USER_PAGE_SIZE as u64);
 }

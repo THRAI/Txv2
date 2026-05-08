@@ -1,9 +1,770 @@
 # txKernel Status
 
-**Updated:** 2026-05-05
+**Updated:** 2026-05-08
 
 ## Current Shape
 
+- 2026-05-08 jumbo-mod split on branch `feat/busybox-smoke` (PR
+  #21). Mechanical refactor: every authored Rust file > 1500
+  lines has been broken into per-family submodules per
+  `docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md`.
+  Files split: `crates/tx-shims/src/linux_syscall/mod.rs`
+  (5871→1131) into 10 family files (cred, time, signal, vm, io,
+  fs_basic, fs_path, fs_mut, proc, misc); `linux_syscall/tests.rs`
+  (8216→1145) into 15 sub-test files mirroring the family
+  layout; `crates/tx-kernel/src/init.rs` (1704→1158) extracted
+  `init/exec.rs`; `crates/tx-subsystems/src/process/tests.rs`
+  (1633→1374), `signal/tests.rs` (1566→308), `vm/tests.rs`
+  (1535→1324) extracted into per-test submodules; and
+  `boards/tx-hal-riscv64-qemu-virt/src/lib.rs` (1752→1417)
+  extracted `boot_trampoline.rs` (the boot-time `global_asm!`)
+  and `sbi.rs` (the SBI ecall wrappers). All authored Rust
+  files now fit under the `MAX_AUTHORED_RUST_FILE_LINES = 1_500`
+  lint cap. Verified: `cargo build` clean on host and
+  `riscv64gc-unknown-none-elf`; `cargo xtask lint arch` improved
+  from 63 → 45 issues (pre-existing dead-code allowances in
+  files I didn't touch). Workspace tests: 1109 passed, 1
+  pre-existing flake (`vfs::walker::tests::step_walk_returns_eloop_after_41_hops`,
+  passes in isolation, fails under `--test-threads=1` when
+  preceded by a sibling that perturbs the epoch/zone state —
+  documented as the main-side cascade). Next: rebase user-facing
+  busybox-smoke work on the cleaner module tree.
+
+
+- 2026-05-08 userspace first-entry slice 2 — **functionally
+  complete**. Branch `feat/busybox-smoke`. Six commits:
+  `196a969` (model: type+loop+docs), `eb3e66a` (asm:
+  per-hart KernelResumeCtx + per-CPU trap stack + sscratch swap
+  + reschedule longjmp), `1371f1b` (catch-up), `007acca` (three
+  fixes: sscratch primer dead-code path, trap stack in rodata,
+  console_write_hex off-by-3), `82639af` (catch-up), `b543e90`
+  (two more: `PmapIf::activate_user_pmap` so satp points at the
+  user process's pmap before sret, and a +4 sepc bump in
+  `hand_off_syscall` so a returning syscall doesn't re-execute
+  the ecall). Userspace now runs end-to-end: busybox demand-pages
+  through its text segment, dispatches dozens of syscalls
+  (`set_tid_address`, `brk`, `openat`, `ioctl`, `fcntl`, `mmap`,
+  ...), and emits `:userspace:exited:N`. Currently terminating
+  with N=11 (SIGSEGV from a busybox-side issue: some syscall
+  return is misinterpreted as a pointer; `stval = 0x746f672e00617461`
+  decodes to ASCII "ata.\0got"). `cargo xtask test busybox-smoke
+  --target rv64-qemu` passes. Workspace host tests green (0
+  failed) across all six commits. See
+  `docs/progress/decisions/2026-05-08-userspace-first-entry-gap.md`
+  for the full diagnosis trail. **Next slice:** triage the
+  busybox-side SIGSEGV by extending the trap-trace to map syscall
+  numbers to the dispatcher's actual return values; suspects are
+  `openat`, `fstat`, `getdents64`, or any syscall that returns a
+  pointer/buffer to userspace.
+
+- 2026-05-08 retire `UserAccessIf` slice on branch
+  `feat/retire-user-access-if`. Replaced the trait-based fixup-recovery
+  user-access path with eager-walk methods on `AddressSpace`.
+  Workspace 1111/1111 lib+tests passing (no count delta — 5 user-buffer
+  tests refactored, 4 targeted-read tests now seed via
+  `materialize_anon` direct-map writes instead of going through the
+  retired user-access trait). Net: deleted `tx_hal::UserAccessIf`,
+  `tx_hal::KernelPtr<T>`, `tx_hal::FixupEntry` (and the supertrait
+  bound on `SignalFrameIf` / `TxPlatform`); added
+  `crates/tx-subsystems/src/vm/user_access.rs` with
+  `AddressSpace::{copy_from_user, copy_to_user, read_user, write_user,
+  read_user_cstr}`. The two production `page_backed` consumers
+  (`step_read_to_user`, `step_write_from_user`) now take
+  `aspace: &AddressSpace` instead of `H: UserAccessIf`. RV64 board's
+  signal-frame asm/SUM primitive moved from a `UserAccessIf` impl
+  into board-internal `board_copy_from_user` / `board_copy_to_user`
+  free fns called by `signal_frame.rs`. HAL_v1.md §12 retired in
+  favour of a forward to PAGE_BACKED §5.1 + VM §3.6/§6 + the new
+  vm/user_access.rs implementation. Out of scope and deferred:
+  the 18 `TODO(phase-userva)` syscall-arm sweep in tx-shims —
+  separate slice. Verification: `cargo build --workspace --lib
+  --tests` clean (no warnings); `cargo test --workspace --lib
+  --tests -- --test-threads=1` 1111/1111; `cargo xtask progress
+  validate` ok.
+- 2026-05-07 shell-prompt roadmap **8 of 11 slices landed** in a
+  single session. Per
+  `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` +
+  decision
+  `docs/progress/decisions/2026-05-07-shell-prompt-roadmap-progress.md`.
+  Workspace 984 → **1111 lib+tests passing**, 0 failed
+  (`--test-threads=1`); 8 sequential branches on top of fd-ops.
+  Net new: ~52 syscall arms, 1 new subsystem (`tx_subsystems::futex`),
+  ~127 new tests. Slices: pipe-lifecycle-Drop (b2d22f8), VM-mmap
+  family (1af0729), futex (324fd3a — required for musl libc init),
+  time syscalls (f48f05f), ioctl + TTY (bf8bc70 — required for
+  isatty), stat family (4b7fd12 — fstat/getcwd/chdir/getdents64/
+  umask; OpenFile gains readdir_cursor; ProcessPayload gains
+  umask), fcntl extension + day-1 misc (f09e358 — F_DUPFD/F_GETFL/
+  kill/getrandom/uname/prlimit64; F_SETFL + rt_sigreturn deferred),
+  file-mutation (2b7768c — unlinkat/mkdirat/renameat2/symlinkat/
+  linkat/truncate/readlinkat). Slice 9 (user-VA sweep) deferred
+  (f2961bc) — needs production RV64 `UserAccessIf` impl + populated
+  FixupEntry table + trap-shell fault redirect; HAL surface exists
+  but no consumer wires it. Slices 10 (busybox bake-in) + 11 (QEMU
+  shell smoke) deferred to a session with external deps (riscv64
+  cross-toolchain, `$TX_BUSYBOX`, QEMU 7.x sentinel-watch). Per-slice
+  carryovers tracked in commit messages: nanosleep timer-fire,
+  fchdir DEntry hint, F_SETFL interior mutability, rt_sigreturn +
+  signal-handler delivery, utimensat FsOps::set_times,
+  AT_SYMLINK_NOFOLLOW walker semantic, RENAME_EXCHANGE atomicity.
+  Verification: `cargo build --workspace --lib --tests` clean (no
+  warnings); `cargo test --workspace --lib --tests --
+  --test-threads=1` 1111/1111; `cargo xtask progress validate` ok.
+  Next steps: Slices 10 + 11 in a follow-up session, or proper
+  Slice 9 RV64 `UserAccessIf` for non-bake-in userspace correctness.
+- 2026-05-07 shell-prompt slice 8 (file-mutation syscalls) on branch
+  `feat/file-mutation`. Per
+  `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 8.
+  Wires nine new arms — `NR_MKDIRAT = 34`, `NR_UNLINKAT = 35`,
+  `NR_SYMLINKAT = 36`, `NR_LINKAT = 37`, `NR_TRUNCATE = 45`,
+  `NR_FTRUNCATE = 46`, `NR_READLINKAT = 78`, `NR_UTIMENSAT = 88`
+  (`-ENOSYS` carryover), `NR_RENAMEAT2 = 276`. Each path-relative arm
+  walks the parent directory via `step_walk` (synchronous through
+  `poll_walker_synchronously` for Send-future discipline) and
+  dispatches through `FsOps::{mkdir,unlink,rmdir,symlink,link,rename,
+  read_link}` plus `page_backed::step_truncate` for the truncate
+  pair. `unlinkat` decodes `AT_REMOVEDIR` to choose `unlink` vs
+  `rmdir`; `renameat2` honours `RENAME_NOREPLACE` via a pre-walk
+  existence check; `RENAME_EXCHANGE` returns `-ENOSYS` and
+  `RENAME_WHITEOUT` returns `-EINVAL`. `readlinkat` walks the
+  parent dir and calls `FsOps::lookup` + `read_link` directly so the
+  symlink itself (not its resolved target) is what gets read — the
+  in-tree walker follows symlinks unconditionally so a standard
+  `step_walk` to the link path would resolve through the link.
+  Verification: `cargo build --workspace --lib --tests` clean (no
+  warnings), `cargo test --workspace --lib --tests --
+  --test-threads=1` 1111/1111 passed (1086 baseline + 25 new
+  `file_mutation::*` dispatch tests covering each arm's success and
+  canonical-error shapes). Carryovers: `utimensat` deferred under
+  `TODO(phase-vfs-utimens)` (no `FsOps::set_times` hook); `linkat`
+  surfaces tmpfs's existing `-ENOSYS` for `link` (Phase 3b
+  carryover, hard-links not yet supported); `renameat2`
+  cross-directory rename surfaces tmpfs's same-dir-only `-ENOSYS`
+  (Phase 3b carryover). Next step: Slice 9 (user-VA migration) or
+  shell-bringup integration smoke.
+- 2026-05-07 fd-ops slice (Waves 1–4) + drift cleanup chore + CSPRNG
+  prerequisite chore on branch `feat/fd-ops`. Per
+  `docs/progress/plans/2026-05-07-fd-ops-and-drift-cleanup.md` +
+  decision `docs/progress/decisions/2026-05-07-fd-ops-and-drift-cleanup.md`.
+  Closes the biggest day-1 blocker before booting a real shell. LTP
+  unlock estimate ~30–50 tests across `open*` / `close*` / `dup*` /
+  `pipe*` / `lseek*` plus shell-style fd-redirect tests scattered
+  across `fs/` and `pty/`. 7 commits on top of dac-and-setuid:
+  `f2d8a67` (CSPRNG via HAL `EntropyIf` trait + per-exec `AT_RANDOM`
+  fill — audit Tier-1 #3), `b7a15fb` (interface drift audit + slice
+  plan; Q1/Q2/Q3 defaults accepted), `0516911` (drift cleanup batch
+  — `AtomicSlot` move to `tx_substrate::slot`, `AT_ENTRY`/`AT_BASE`
+  added to `AuxvFacts`, 3 doc amendments closing audit Tier-1
+  #3/#4/#5/#6 + Tier-2 #1/#6), `203e0fe` (Wave 1: fd-table
+  `BTreeMap<u32, Cap<OpenFile>>` migration + sparse `BTreeSet<u32>`
+  cloexec replacing the fd-31-ceiling `AtomicU32` bitmap; new
+  `allocate_fd` / `install_fd` accessors), `302bab9` (Wave 2:
+  `NR_OPENAT = 56` + `NR_CLOSE = 57` + `NR_DUP = 23` + `NR_DUP3 = 24`
+  — bundled because they share helpers; `O_CREAT + O_EXCL` via
+  syscall-arm `create_then_walk` helper since `step_open` is
+  resolve-only; `dup3` same-fd `-EINVAL`; `NR_DUP2` absent on RV64
+  generic — musl emits `dup3(_, _, 0)`), `28b21f2` (Wave 3:
+  `NR_PIPE2 = 59` + new `tx_subsystems::pipe` module — 4 KiB ring
+  with reader-side and writer-side wait carriers; matches Linux
+  blocking semantics exactly per Q2; `Errno::EAGAIN`/`EBADF`/`EPIPE`
+  added; `OpenFileFlags.nonblocking` field; SIGPIPE-on-EPIPE
+  delivered from `sys_write` arm), `bd0e9ea` (Wave 4: `NR_LSEEK = 62`
+  + per-fd `OpenFile.offset: AtomicU64` — replaces `u64` so `step_*`
+  can run against `&Cap<OpenFile>` without `&mut`; `Errno::ESPIPE`;
+  TTY/CharDevice/Pipe → ESPIPE; PageBacked uses
+  `PageContainer::size_bytes()` for SEEK_END; sibling
+  `init_lseek_fixture.rs` for `openat → write → lseek → read →
+  close → exit_group` Layer A byte-pin smoke). Plan Part 8
+  deviation: sibling fixture (matches DAC slice precedent) instead
+  of extending `init_fixture.rs` — preserves the existing
+  fork+wait+exit byte pins. **Q1 DECIDED 2026-05-07:** fd-table is
+  BTreeMap (sparse-fd case is real). **Q2 DECIDED 2026-05-07:**
+  pipe blocking matches Linux exactly (writer-side carrier).
+  **Q3 DECIDED 2026-05-07:** NR_GETDENTS64 deferred to a sibling
+  directory-ops mini-slice. Verification: `cargo build --workspace
+  --lib --tests` clean (no warnings); `cargo test --workspace --lib
+  --tests -- --test-threads=1` 984/984 passed; per-crate deltas:
+  tx-subsystems 405 → 420, tx-shims 78 → 109, tx-kernel 37 → 43,
+  tx-scripts 39 → 42; tx-substrate sync + integration preserved;
+  tx-fs unchanged. Pre-existing conditions (verified Wave 2 vs
+  baseline before any Wave 3 change): cross-compiled board
+  binaries (`tx-kernel-*-qemu-virt`) fail to link on host without
+  cross-toolchains; tx-subsystems lib tests need
+  `--test-threads=1` for green. Carryovers: pipe lifecycle Drop
+  hook (`Cap<OpenFile>` Drop → `decr_reader` / `decr_writer` so
+  `close(reader_fd)` flips reader_count); reactor-driven Layer B
+  end-to-end execution of `init_lseek_fixture` (deferred per slice
+  norm). Next step: directory-ops mini-slice (NR_GETDENTS64) or
+  pipe lifecycle hook — both are small isolated follow-ups.
+- 2026-05-07 drift cleanup chore (5 items, ~200 LOC) on branch
+  `chore/drift-cleanup`. Per
+  `docs/progress/plans/2026-05-07-fd-ops-and-drift-cleanup.md`
+  §"Drift cleanup batch" + audit
+  `docs/progress/research/2026-05-07-interface-drift-audit.md`. Lands
+  before fd-ops Wave 1 because the `AtomicSlot` move makes the
+  upcoming fd-table BTreeMap migration cleaner, and `AT_ENTRY` /
+  `AT_BASE` should be added once not again. Item-by-item:
+  (1) `AtomicSlot<T>` moved from
+  `crates/tx-subsystems/src/tty/structure/identity.rs:72-115` to
+  `crates/tx-substrate/src/slot.rs` and re-exported at
+  `tx_substrate::AtomicSlot`. Audit Tier-2 #1 closed. Touched 5
+  call sites (process/structure.rs, process/execution.rs (test
+  builder), tty/structure/mod.rs, tty/structure/payload.rs,
+  identity.rs). (2) `AT_ENTRY = 9` and `AT_BASE = 7` added to
+  `AuxvFacts` and the stack builder; `AUXV_PAIR_COUNT` 11 → 13;
+  total auxv contribution 176 → 208 bytes. New tests pin
+  `AT_ENTRY` carries `image_plan.entry`, `AT_BASE = 0` for
+  static-EXEC; existing eleven-entries test renamed to
+  thirteen-entries; AT_UID/AT_SECURE/AT_RANDOM index pins shifted.
+  Audit Tier-1 #5 (partial) closed. (3) `HAL_v1.md` §13 amended:
+  added `IrqIf::UART_IRQ` to the trait surface, replaced the
+  linkme-distributed-slice example with the explicit
+  `register_irq_handler` shape, added §13.2.1 documenting the
+  seven-point case against linkme, removed `IRQ_HANDLERS` from
+  §21.2 approved slices. Audit Tier-2 #6 + Tier-1 #4 closed.
+  (4) `HAL_v1.md` §13A added: new section documenting `EntropyIf`
+  trait surface, default xorshift impl, RV64 rdtime impl, trust
+  model, and upgrade path. Audit Tier-1 #3 closed. (5)
+  `PROCESS_v1.md` §2.2.1 v2 amendment added: ratifies the flat
+  `ProcessPayload` shape that 7 commits built (trio Phase 2a/b,
+  pre-ELF Wave 3, ELF loader Wave 1, fork/clone/wait4 Wave 1, DAC
+  Wave 2, DAC Wave 4); `Frame { Shared<T> }` / `ProcessPolicy` /
+  `nsproxy` / `group_exit` / `leader_exit_status` deferred to v3
+  with rationale. Audit Tier-1 #6 closed. Verification:
+  `cargo check --workspace` clean; `cargo check --workspace --tests`
+  clean; `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf` clean; tx-substrate sync 2/2 +
+  integration suites preserved; tx-subsystems 405/405 serial;
+  tx-scripts 42/42 (40 baseline + 2 new auxv tests); tx-kernel
+  37/37; tx-fs 24/24 serial; tx-shims 78/78; `cargo fmt --check`
+  clean; `cargo xtask progress validate` ok. Next step: ship as
+  separate PR; fd-ops Wave 1 follows with the cleaner seam.
+- 2026-05-07 DAC + setuid Wave 5 (Part 8 end-to-end smoke + sibling
+  setuid fixture) on branch `feat/dac-and-setuid`. Per
+  `docs/progress/plans/2026-05-06-dac-and-setuid.md` Part 8.
+  Climax wave — proves the DAC + setuid pipeline end-to-end.
+  Deliverables: (1) `crates/tx-kernel/src/init/init_setuid_fixture.rs`
+  — 204-byte hand-encoded RV64 ET_EXEC ELF fixture; 7-instruction
+  body (`li a7, 174` (NR_GETUID) → ecall → `li a7, 175` (NR_GETEUID)
+  → ecall → `li a7, 94` (NR_EXIT_GROUP) → `li a0, 0` → ecall);
+  same `LOAD_VADDR = 0x10000` as the fork+wait fixture (the two
+  fixtures are not co-resident in any single AddressSpace);
+  entry-vaddr `0x100B0`. **Plan Q4 deviation:** Q4 was authored
+  before the fork/clone/wait4 slice rewrote `init_fixture.rs` into
+  a 317-byte fork+wait+exit binary with ~7 pinned byte tests;
+  extending it again into a third behaviour would invalidate the
+  existing pin tests. Sibling fixture matches the plan's Part 8
+  section heading and keeps both smokes independently pinned.
+  (2) 5 pin tests in `init_setuid_fixture/tests`:
+  size-matches-constant (204 bytes), elf-magic, e_machine=EM_RISCV,
+  e_entry-matches-constant, first-instruction-is-li-a7-174.
+  (3) End-to-end Layer A smoke
+  `boot_smoke_setuid_exec_seeds_post_setuid_euid_and_at_secure`
+  in `crates/tx-kernel/src/init/tests.rs`. Drives boot wiring,
+  registers `/setuid-target` with mode `S_ISUID | 0o755` owned
+  by uid=1000/gid=1000 (via the new `register_setuid_fixture_into_tmpfs`
+  helper that uses production `step_chown` + `step_chmod` under
+  CAP_FOWNER root cred to avoid the silent-clear-S_ISUID rule),
+  drops init's cred to uid=euid=suid=1001 + clears caps via
+  `cross_crate_test_support::clear_caps_for_test` +
+  `set_cred_ids_for_test`, then `block_on(exec_script::<TestPlatform>)`.
+  Post-exec assertions: `init.cred().uid == 1001` (real uid
+  preserved), `init.cred().euid == 1000` (S_ISUID recompute set
+  effective uid to file owner), `init.cred().suid == 1000`
+  (saved-set tracks new euid), `init.cred().gid/egid/sgid == 1001`
+  (no S_ISGID on fixture so gid family unchanged),
+  `saved_user_context.pc == INIT_SETUID_FIXTURE_ENTRY_VADDR`
+  (Phase 6 still seeded entry-point with new cred), AddressSpace
+  Cap key changed (PoNR boundary crossed). (4) Same
+  `register_setuid_fixture_into_tmpfs` helper added inline to
+  the test module — mirrors `register_init_fixture_into_tmpfs`'s
+  shape (create_inode → materialise_rnode → page-by-page memcpy
+  → truncate) plus post-creation `step_chown` + `step_chmod`
+  under root cred. **Layer A choice:** matches the fork/clone/wait4
+  Wave 4 smoke's choice (production-paths-up-to-divergence;
+  reactor-driven instruction-level execution deferred to a
+  future integration smoke). Verification: tx-kernel 37/37
+  (31 baseline + 6 new); tx-substrate sync 2/2 + integration 2/2;
+  tx-fs 24/24 serial; tx-shims 78/78; tx-scripts 39/39;
+  tx-subsystems 405/405 serial; `cargo check --workspace` clean;
+  `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf` clean; `cargo fmt --check` clean;
+  `cargo xtask progress validate` ok (24 file(s)). Closes the
+  DAC + setuid slice (Waves 1–5 all landed). Next step: progress
+  catch-up + decision note for the slice.
+- 2026-05-06 fork/clone/wait4 Wave 3 (NR_WAIT4 syscall arm with
+  blocking-wait) on branch `feat/fork-clone-wait4`. Per
+  `docs/progress/plans/2026-05-06-fork-clone-wait4.md` Part 3.
+  Adds the Linux RV64 `wait4(2)` syscall arm against the
+  `step_waitpid_nohang` walker (synchronous, no guard parameter —
+  takes a fresh internal snapshot of `parent.children`) plus the
+  blocking variant via `wait_carrier::wait_on_token` over the
+  parent's per-process `exit_port` carrier (registered at
+  payload-sign time per Wave 1; fired from
+  `post_sigchld_to_parent` when any child zombifies).
+  Deliverables: (1) `crates/tx-shims/src/linux_syscall/numbers.rs`
+  adds `NR_WAIT4 = 260` and `WNOHANG = 0x1` constants. (2)
+  `crates/tx-shims/src/linux_syscall/mod.rs` adds `ECHILD_VALUE = 10`
+  errno + `sys_wait4` async function — full POSIX `pid` selector
+  coverage (`pid > 0` → `Pid`, `pid == 0` → `CallerPgrp`,
+  `pid == -1` → `Any`, `pid < -1` → `Pgrp(Pgid(-pid))`,
+  `pid == i32::MIN` → `-EINVAL` per LTP `wait403`); WNOHANG-only
+  options bit acted on (WUNTRACED/WCONTINUED accepted but ignored
+  per Linux's silent-unknown-bits behaviour); non-NULL `rusage`
+  rejected with `-EINVAL` (`TODO(phase-rusage)` — txKernel
+  doesn't track rusage today). On `Done(child_pid, status)` the
+  arm encodes the wait-status word via the existing POSIX
+  `ExitStatus::wait_status_word` (Wave 1's migration from the
+  shell `128+sig` shape) and writes a 4-byte little-endian `i32`
+  to `wstatus_uaddr` if non-zero, mirroring the `sys_write`
+  bootstrap-buffer exemption (`core::ptr::write_volatile` with
+  `TODO(phase-userva)`). On `Err(NoneReady)` without WNOHANG,
+  the arm builds a `WaitToken` from
+  `ctx.process.exit_port_wait_token()` (returns `None` for
+  zombies, surfaced as `-ECHILD`) and awaits
+  `wait_carrier::wait_on_token`, looping post-wake (standard
+  double-check pattern: a third party may have reaped first).
+  Dispatch arm wires under the existing `nr if nr == NR_*`
+  guard pattern alongside `NR_CLONE`, `NR_EXECVE`. (3) 10 new
+  tests in `crates/tx-shims/src/linux_syscall/tests.rs`'s
+  `fork_clone_wait4_wave3` mod: ECHILD on no-children,
+  WNOHANG-no-zombies returns 0 (child preserved alive),
+  WNOHANG-zombie reaps and returns pid, WNOHANG writes wstatus
+  word (Exited(42) → 0x2a00), specific-pid skips other-pgrp
+  zombies, blocking-wait load-bearing test (manually polls the
+  future to Pending, calls `step_exit_group` on the child to
+  fire the parent's exit_port via `post_sigchld_to_parent`,
+  re-polls to Ready), rusage-non-NULL → -EINVAL,
+  WUNTRACED/WCONTINUED bits silently ignored, i32::MIN pid →
+  -EINVAL, pgid selector picks grouped zombie. Verification:
+  tx-shims 48/48 (38 baseline + 10 new); tx-substrate sync
+  2/2 + integration 2/2 ; tx-fs 16/16; tx-scripts 29/29;
+  tx-subsystems 377/377; tx-kernel 29/29; `cargo check
+  --workspace` clean; `cargo check -p
+  tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf` clean; `cargo fmt --check`
+  clean; `cargo xtask progress validate` ok (24 file(s)).
+  Wave 4 (RV64 fixture v2 + end-to-end smoke) is the next
+  step.
+- 2026-05-06 ELF loader Phase 6 (NR_EXECVE syscall arm) on branch
+  `feat/elf-loader-and-execve`. Per
+  `docs/progress/plans/2026-05-06-elf-loader-and-execve.md` Part 6.
+  Wires the userspace-visible entry point to Phase 5's `exec_script`.
+  Deliverables: (1) `tx-shims/Cargo.toml` adds `tx-scripts` + `tx-hal`
+  as runtime deps (one-directional — tx-scripts does NOT pull
+  tx-shims, no cycle). (2) `SyscallResult::ExecCommitted` enum
+  variant on `tx_shims::linux_syscall::SyscallResult` — the
+  thread future treats this as "do NOT drain
+  `pending_syscall_return` for this iteration" (cite
+  `txdoc:EXEC-12-1-INSTALL-USER-TRAP-CONTEXT`). (3) `NR_EXECVE = 221`
+  in `numbers.rs` (Linux RV64 generic ABI). (4) `dispatch::<P: PmapIf>`
+  signature change — generic over the platform's `PmapIf` so
+  `sys_execve::<P>` can call `exec_script::<P>`. All existing
+  callers updated (3 in tx-shims tests, 2 in tx-kernel
+  thread_future + tests). (5) `sys_execve` arm: bounded
+  user-buffer copies via `read_user_cstr` / `read_user_cstr_vec`
+  helpers (kernel-side `read_volatile` per the Phase 2a bootstrap
+  exemption); caps `EXECVE_PATH_MAX = 4096` (NUL-terminator-or-
+  ENAMETOOLONG), `EXECVE_ARG_MAX_INLINE = 8192` (shared argv +
+  envp byte budget — overflow → E2BIG), `EXECVE_VEC_MAX = 256`
+  pointer slots. (6) `ExecError::to_errno_i32` impl on tx-scripts'
+  `ExecError`: returns negative magnitudes (`PathNotFound = -2`,
+  `NotExecutable = -8`, `PathTooLong = -36`, `OutOfMemory = -12`,
+  ...) consistent with `tx-shims::linux_syscall::errno_to_i32`.
+  Helper `execve_errno_magnitude` flips sign so
+  `SyscallResult::Error(positive)` is preserved. (7) Thread future
+  match-arm refactor in `crates/tx-kernel/src/thread_future.rs`:
+  the `UserspaceTrapInfo::Syscall` arm now matches all four
+  `SyscallResult` variants explicitly; on `ExecCommitted` it
+  falls through (no early return, no pending-return write) so the
+  AST drain + `prepare_userspace_entry_payload` +
+  `enter_userspace_with_context` tail re-uses the
+  freshly-seeded `saved_user_context` from the Phase-6 swap. (8)
+  Send-fix in `tx-scripts::process::exec::script::exec_script` —
+  the walker `step_open(...).await` was capturing `&Guard` across
+  the suspension point, making the resulting future `!Send` (Guard
+  is deliberately `!Send + !Sync`). Replaced with a synchronous
+  poll via a noop-waker helper `poll_walker_synchronously`; the
+  in-tree walker backends never `.await` today (per
+  `vfs::walker` module docs), so a single `poll` returns Ready
+  every time. When real-await backends land, the `Pending` arm's
+  panic message points to the canonical fresh-guard-inside-await_*
+  shape. Tests: 5 new in `tx-shims` (path-not-found-returns-
+  neg-enoent; invalid-elf-returns-neg-enoexec; too-long-path-
+  returns-neg-enametoolong; argv-overflow-returns-neg-e2big;
+  success-returns-exec-committed) + 1 new in `tx-kernel`
+  (execve-continues-loop-without-writing-pending-return — scripts
+  the dispatcher's outcome with `ExecCommitted` and asserts the
+  match-arm semantics directly, mirroring the existing
+  PageFault-Ok test pattern). The new `execve` tests reuse the
+  tx-scripts `ExecTestFs` shape inline (FsOps + FsPageBacking
+  fixture with `materialise_rnode` over a hand-crafted RV64 ET_EXEC
+  binary). Verification: `cargo check --workspace` clean; `cargo
+  check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf` clean; `cargo test -p tx-shims --lib`
+  17 → 22; `cargo test -p tx-kernel --lib` 19 → 20; `cargo test
+  -p tx-scripts --lib` 29/29 unchanged; `cargo test -p
+  tx-subsystems --lib -- --test-threads=1` 364/364 unchanged;
+  `cargo test -p tx-fs --lib -- --test-threads=1` 13/13 unchanged;
+  `cargo fmt --check` + `cargo xtask progress validate` clean.
+  Next: Phase 7 (bootstrap exec of `/init` from `init.rs`). Note
+  for Phase 7: `sys_execve` reads `Credential::default()` (uid=0,
+  gid=0) — once `SyscallCtx` grows a `cred` field plumbed from
+  the per-thread payload, switch the arm to `ctx.cred()`. Also,
+  `dispatch` is now `dispatch::<P: PmapIf>` so any new caller
+  must thread the platform type. Blocker: none.
+
+- 2026-05-06 ELF loader Phase 5 (`exec_script` orchestration) on branch
+  `feat/elf-loader-and-execve`. Per
+  `docs/progress/plans/2026-05-06-elf-loader-and-execve.md` Part 5.
+  Realises the EXEC_v1 eight-phase protocol against the seams shipped
+  by Wave 1 (build_aspace_from_image / populate_detached_user_range /
+  read_exact_at) and Wave 2 (step_close_cloexec_fds /
+  step_reset_signal_dispositions_for_exec / step_install_brk_for_exec).
+  Deliverables: (1) `tx-scripts::process::exec::script::exec_script::<P>(
+  process, thread, path, argv, envp, cred)` returning
+  `Result<(), ExecError>` (note: shape differs from the plan's
+  `Result<Infallible, ExecError>` sketch — the syscall-arm "do not
+  write a return value" decision is structural, made by Phase 6 of
+  the loader plan rather than encoded in the type). Eight-phase body:
+  walker `step_open` → snapshot `Cap<PageContainer>` from
+  `RNodeBacking::PageBacked` → 4 KiB `read_exact_at` → goblin parse →
+  bridge to `vm::scripts::ImagePlan` (every LOAD shares the file's
+  Cap<PC>) → V1 `build_aspace_from_image::<P>` → V2
+  `populate_detached_user_range` with stack image from
+  `build_initial_user_stack` → Phase-6 atomic
+  `replace_aspace` + `store_saved_user_context(UserTrapContext{ pc:
+  e_entry, regs[2]: initial_sp, .. })` → Phase-7 infallible commits
+  (CLOEXEC sweep, sig disposition reset, brk install at
+  `page_round_up(highest_load.vaddr + memsz)`). PoNR enforced
+  structurally: phases 1-5 use `?` and `.await` freely; phases 6-7 are
+  a straight-line synchronous block of atomic stores + Wave 2
+  helpers. (2) Cross-doc edit P-SIG-RESET: new
+  `tx_subsystems::process::execution::step_reset_signal_dispositions_for_exec`
+  thin wrapper around Wave 2's `SigActionTable::step_reset_for_exec`
+  so `tx-scripts` doesn't need to reach into the `pub(crate)` payload
+  field. (3) `tx-scripts/Cargo.toml` gains `tx-hal`, `tx-substrate`,
+  `tx-subsystems` deps + dev-dep on `tx-subsystems` with `test-support`.
+  Tests: 6 new (loads-minimal-elf-seeds-saved-user-context;
+  resets-brk-base-from-image-plan; invalid-elf-returns-not-executable;
+  path-not-found-returns-path-not-found;
+  resets-signal-dispositions-to-sig-dfl; closes-cloexec-fds-keeps-others)
+  driven via host block_on against an in-test `ExecTestFs` that
+  overrides `materialise_rnode` to produce
+  `RNodeBacking::PageBacked { pc }` over a kernel-built PageContainer
+  pre-populated with hand-crafted RV64 ET_EXEC fixture bytes via
+  `materialize_anon` + direct map. Verification: `cargo check
+  --workspace` clean; `cargo check -p tx-kernel-riscv64-qemu-virt
+  --target riscv64gc-unknown-none-elf` clean; `cargo test -p tx-scripts
+  --lib` 23 → 29; `cargo test -p tx-subsystems --lib --
+  --test-threads=1` 364/364 preserved; `cargo test -p tx-shims --lib`
+  17/17; `cargo test -p tx-fs --lib -- --test-threads=1` 13/13;
+  `cargo test -p tx-kernel --lib` 19/19; `cargo fmt --check` +
+  `cargo xtask progress validate` clean. Next: Phase 6 (NR_EXECVE
+  syscall arm in `tx-shims::linux_syscall`) which decodes user
+  argv/envp pointers, calls `exec_script::<P>`, and emits a new
+  `SyscallResult::ExecCommitted` shape so the thread future skips
+  the syscall-return writeback. Note for Phase 6: tmpfs's production
+  surface today does NOT override `materialise_rnode`, so a real
+  `step_open` against a regular file in tmpfs returns ENOSYS — the
+  test fixture works around it with an in-test FsOps override; tmpfs
+  needs a small `materialise_rnode` impl (cited
+  `bringup_fs_specs_v_1` §"tmpfs `Regular` →
+  `RNodeBacking::PageBacked { pc }` over the inode's
+  `Cap<PageContainer>`") before Phase 7's bootstrap exec path is
+  end-to-end-runnable from real init. Blocker: none.
+
+- 2026-05-06 ELF loader Wave 2 (Phase 2 CLOEXEC plumbing + Phase 1B
+  P1/P2/P3 process-side helpers) on branch `feat/elf-loader-and-execve`.
+  Per `docs/progress/plans/2026-05-06-elf-loader-and-execve.md` Part 2
+  + Part 1 sub-items P1/P2/P3. Open Q #4 DECIDED 2026-05-06: per-fd
+  CLOEXEC bitmap stored as `AtomicU32` on `ProcessPayload` (covers fds
+  0..31). Deliverables: (1) `ProcessPayload.fd_cloexec: AtomicU32`
+  next to existing `fds`; `step_fork` clones the parent's word; init
+  defaults to `0` per Linux convention (stdio NOT close-on-exec).
+  Public accessors `ProcessIdentity::fd_cloexec(fd)` /
+  `set_fd_cloexec(fd, value)` + crate-internal `fd_cloexec_word`.
+  (2) `OpenFileFlags.cloexec: bool` flag added (sibling to `read` /
+  `write` / `append`); all in-tree call sites updated for source-compat
+  (`tx-fs::devfs`, `tx-subsystems::tty::project`, vfs/page_backed
+  tests). (3) `NR_FCNTL = 25` arm with `F_GETFD` / `F_SETFD` /
+  `FD_CLOEXEC = 1` + `O_CLOEXEC = 0o2000000` in
+  `tx-shims::linux_syscall::numbers`; `sys_fcntl` validates
+  `fd < FD_TABLE_SIZE` else `-EBADF`, returns `-ENOSYS` for unknown
+  cmd (`TODO(phase-fcntl-extension)`). (4) Exec phase-7 helpers in
+  `tx-subsystems::process::execution` (per
+  `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC` /
+  `txdoc:EXEC-12-4-INSTALL-BRK`): `step_close_cloexec_fds(process)`
+  closes every marked fd then clears the bitmap; both NOT async — the
+  drop runs through EBR-deferred `Cap<OpenFile>::Drop`, no flush
+  await. `step_install_brk_for_exec(process, new_brk_base)` overwrites
+  both `brk_base` and `current_brk` atomically. (5)
+  `SigActionTable::step_reset_for_exec(&self)` on the existing
+  per-payload table (per `txdoc:EXEC-12-3-RESET-SIGNAL-DISPOSITIONS` +
+  `SIGNAL_v1` §15.2): walks 1..=64, replaces every `Handler(_)` slot
+  with `Default`, preserves `Default` and `Ignore`; pending signals
+  NOT cleared (POSIX). Scope reduction: `sys_open` is not in the
+  trio's syscall surface, so Wave 2's `O_CLOEXEC` plumbing is the
+  bitmap + fcntl arm only — when `sys_open` lands (post-ELF-loader
+  slice), threading `O_CLOEXEC` through it is mechanical (decode
+  `args[1] & 0o2000000`, set the matching bit on
+  `ProcessPayload.fd_cloexec` after `set_fd`). Verification:
+  `cargo check --workspace` + `cargo check -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`
+  clean; `cargo test -p tx-subsystems --lib -- --test-threads=1`
+  355 → 364 (+6 process tests covering default/round-trip/fork-clone
+  + close-cloexec marked-only / bitmap-clear / install-brk; +3 signal
+  tests covering reset to `SIG_DFL` / preserves `SIG_IGN` / preserves
+  pending); `cargo test -p tx-shims --lib` 12 → 17 (+5 fcntl tests:
+  getfd-zero / setfd-then-getfd / setfd-no-spillover / unknown-cmd
+  ENOSYS / invalid-fd EBADF); `tx-scripts` 23/23, `tx-kernel` 19/19,
+  `tx-fs` 13/13 unchanged; `cargo fmt --check` + `cargo xtask
+  progress validate` clean. Next: Phase 5 (the exec script itself in
+  `tx-scripts/src/process/exec/`) which composes the V1 (build aspace),
+  V2 (populate stack), Phase-3 stack builder, and these Phase-7
+  helpers into the eight-phase script per
+  `txdoc:EXEC-4-THE-EIGHT-PHASES`. Note for Phase 5: the three
+  phase-7 helpers (`step_close_cloexec_fds`,
+  `step_install_brk_for_exec`, `SigActionTable::step_reset_for_exec`)
+  are NOT async — phase 7 is a synchronous block per EXEC-PONR;
+  earlier exec phases that touch I/O (open binary; populate stack)
+  are async. Blocker: none.
+
+- 2026-05-06 Pre-ELF Phase 7 (end-to-end production smoke +
+  `kernel_main` reactor-loop wiring) on branch `feat/pre-elf-runtime`.
+  Per `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`
+  §"Phasing" item 7 ("End-to-end host smoke. A single tx-kernel test
+  that exercises trap shell → reactor task wrapper → thread future →
+  linux_syscall::dispatch → tty + devfs through real walker → real RX
+  path, with no synthesised driver."). Three production-code
+  deliverables landed: (1) `CoreInit::boot` now calls a new
+  `run_userspace_reactor_loop` after `boot_sentinel` — fetches init's
+  leader thread + payload, builds
+  `PerHartSlotted<P, run_thread::<P>(thread, payload)>`, submits via
+  `BOOT_REACTOR.with(|r| r.submit_task(...))`, then drives the BSP
+  hart loop using the same `step_hart_loop_at` shape the secondary
+  CPUs already use; loop exits on `init.is_zombie()` and emits
+  `:userspace:exited:N` (where N = `ExitStatus::wait_status_word()`)
+  before `system_off`. (2) `ThreadIdentity::payload_cap_for_test` was
+  promoted to a production `payload_cap()` accessor (kept as alias for
+  test-support) so `kernel_main` can reach the leader's payload
+  without the `pub(crate)` field. (3) `run_thread`'s loop body
+  restructured: AST checkpoint runs on a *fresh* `start_request`
+  (entry_token) instead of the just-resolved one
+  (`req_token`), fixing the `NoActiveRequest` failure surfaced by the
+  end-to-end drive. The trio's Phase 6 fake-driver smoke
+  (`boot_smoke_userspace_round_trip_writes_console_then_exits`) is
+  deleted; replaced by `boot_smoke_production_userspace_loop_writes_
+  console_then_exits` in `crates/tx-kernel/src/init/tests.rs`. The new
+  smoke uses Option C (pragmatic limit-to-divergence per the Phase 7
+  brief): a `TestPlatform`'s `TrapIf::enter_userspace_with_context`
+  override captures the merged `UserTrapContext` into a static and
+  panics with `SMOKE_YIELD_PANIC`; the smoke wraps each `Future::poll`
+  in `std::panic::catch_unwind` and runs a fresh `run_thread` per
+  scripted syscall. Two iterations: (i) `write(1, "hi\n", 3)` drives
+  the production walker → tty → ConsoleIf::write_bytes path, asserts
+  `b"hi\r\n"` post-OPOST capture and `regs[10] == 3` (Plan B writeback
+  discipline); (ii) `exit_group(0)` returns `SyscallResult::NoReturn`,
+  the future resolves Ready cleanly, init zombifies with
+  `ExitStatus::Exited(0)`. tx-kernel 19 → 19 (one deleted, one new;
+  test_count unchanged); tx-subsystems 344/344 serial, tx-shims 12/12,
+  tx-fs 13/13 serial, tx-substrate sync 2/2. `cargo check --workspace`,
+  `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`, `cargo fmt --check`,
+  `cargo xtask progress validate` all clean. Next: ELF loader (out of
+  scope for pre-ELF wave); the production reactor loop is wired and
+  ready to drive a real userspace binary as soon as one can be
+  loaded. Blocker: none; the smoke's "limit-to-divergence" choice
+  matches the brief's recommendation, and the
+  `enter_userspace_with_context` divergent path is exercised
+  end-to-end on the RV64 board target (verified by `cargo check`).
+
+- 2026-05-06 Pre-ELF Phase 2 (reactor task wrapper + userspace-entry
+  shim) on branch `feat/pre-elf-runtime`. Per
+  `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md` Part 1.
+  HAL grows a default-panic `TrapIf::enter_userspace_with_context(ctx:
+  UserTrapContext) -> !` (`crates/tx-hal/src/trap.rs`); RV64 board
+  override builds an `Rv64TrapFrame`, calls the existing
+  `restore_user_context`, then `return_to_userspace`
+  (`boards/tx-hal-riscv64-qemu-virt/src/trap.rs`). New userspace-entry
+  shim `pub fn prepare_userspace_entry_payload(payload:
+  &PayloadCap<ThreadPayload>) -> UserTrapContext` in
+  `crates/tx-subsystems/src/thread_runtime/execution.rs`: snapshots
+  `saved_user_context`, drains `pending_syscall_return` (Ok(v) → a0 =
+  v as u64; Err(errno) → a0 = -errno as i64 as u64) into
+  `regs[10]`, clears `active_userspace_request`. Plan B writeback
+  discipline pinned by `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE` —
+  this is the only site that drains pending_syscall_return. New
+  `crates/tx-kernel/src/thread_future.rs` ships `PerHartSlotted<P, F>`
+  (sets/clears the per-hart slot around each `Future::poll`,
+  unconditional clear on `Pending` exit too) and the production
+  `pub async fn run_thread<P>(thread, payload)` driver. Sequencing:
+  `start_request` → `wait.await` (yields Pending) →
+  `linux_syscall::dispatch` for Syscall arms /
+  `step_exit_group_with_signal(SIGSEGV)` for PageFault (Phase 3
+  placeholder) → `checkpoint_userspace_entry_batch(req,
+  AstBatch::default(), |_| EnterUserspace)` (AST drain ordering before
+  prepare, per Cross-cutting risk #3) →
+  `prepare_userspace_entry_payload` →
+  `<P as TrapIf>::enter_userspace_with_context` (divergent). Init
+  wiring deferred to Phase 7 per the brief — `run_thread` is exported
+  but `kernel_main` still uses the trio's shutdown path; an end-to-end
+  smoke that demonstrates the reactor loop replaces the Phase 6 fake
+  driver in Phase 7. Tx-kernel grew a shared
+  `crate::test_serialise::KERNEL_TEST_LOCK` so the new thread_future
+  tests serialise against the existing init tests (both bootstrap
+  INIT_PROCESS). tx-subsystems 341 → 344 (3 new shim tests:
+  `prepare_userspace_entry_payload_drains_pending_return_into_a0`,
+  `prepare_userspace_entry_payload_negative_errno_encodes_as_minus_errno`,
+  `prepare_userspace_entry_payload_no_pending_preserves_saved_a0`);
+  tx-kernel 9 → 13 (4 new: `per_hart_slotted_sets_and_clears_slot_around_poll`,
+  `per_hart_slotted_clears_slot_on_pending_exit`,
+  `thread_future_dispatches_syscall_then_yields_for_userspace_entry`,
+  `thread_future_terminates_on_exit_group`); tx-fs 13/13, tx-shims 12/12,
+  tx-substrate sync 2/2. `cargo check --workspace`,
+  `cargo check -p tx-kernel-riscv64-qemu-virt --target
+  riscv64gc-unknown-none-elf`, `cargo fmt --check`,
+  `cargo xtask progress validate` all clean. Next: Phase 3
+  (page-fault async dispatch via `aspace.fault_script`) → Phase 5 (IRQ
+  dispatch + UART RX) → Phase 7 (end-to-end smoke + retire trio fake
+  driver). Blocker: none; the page-fault arm currently routes SIGSEGV
+  unconditionally as a Phase 3 placeholder, and the AST checkpoint
+  uses an empty batch because the reactor's per-task `AstSlot` is not
+  yet exposed as a public surface to the thread future.
+
+- 2026-05-06 Pre-ELF Phase 6 (mount/dev id allocators + Phase-4
+  deferred `register_mount` wire-up) on branch `feat/pre-elf-runtime`.
+  Per `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`
+  Part 5 §"MountId / DevId allocators (item 10)" + Phasing item 6.
+  `crates/tx-subsystems/src/mount.rs` grows `static NEXT_MOUNT_ID:
+  AtomicU64 = AtomicU64::new(1)`, `static NEXT_DEV_ID: AtomicU32 =
+  AtomicU32::new(1)`, `pub fn allocate_mount_id() -> MountId`, `pub
+  fn allocate_dev_id() -> DevId`, plus
+  `reset_mount_id_counter_for_test` / `reset_dev_id_counter_for_test`
+  test-only helpers (gated on `cfg(any(test, feature =
+  "test-support"))`). The allocators are deterministic from cold
+  start: rootfs's first call returns `MountId(1)` / `DevId(1)`,
+  devfs's second call returns `(2)`/`(2)`, so existing trio
+  boot-smoke assertions on the literal ids stay valid. New
+  cross-crate test-support shims `reset_mount_table`,
+  `reset_mount_id_counter`, `reset_dev_id_counter` in
+  `tx-subsystems/src/lib.rs::cross_crate_test_support`; tx-kernel's
+  `init/tests.rs::setup` calls them between runs. `init.rs`
+  `mount_rootfs_tmpfs` and `mount_devfs_at_dev` flipped from
+  `MountId::new(N)` / `DevId::new(N)` to the allocator helpers; the
+  rootfs and devfs root rnodes now also carry
+  `with_containing_mount` pointers (without these the walker emitted
+  `ENODEV` because `fs_ops_for` returned `None`). After building the
+  dev mount cap but before publishing to the `DEV_MOUNT` slot,
+  init.rs calls `mount::register_mount(&rootfs_payload,
+  dev_object_id, dev_mount.clone())` so the Phase 4 walker resolves
+  `/dev/console` end-to-end without the legacy direct-RNode
+  fallback. `tx-fs` devfs grew an `FsOps::materialise_rnode`
+  override: the walker's terminal `CharDevice` arm now wraps the
+  alias's TTY as `RNodeBacking::StructBacked { Tty }` instead of
+  returning `ENOSYS`. New tx-kernel boot smoke
+  `boot_smoke_walker_resolves_dev_console_after_mount_registration`
+  asserts the walker's terminal DEntry's RNode is a `StructBacked
+  Tty` matching the registered console. tx-kernel 8 → 9 (9/9);
+  tx-subsystems 341/341, tx-fs 13/13, tx-shims 12/12, tx-substrate
+  sync 2/2. `cargo check --workspace`, `cargo fmt --check`, `cargo
+  xtask progress validate` all clean. Next: Phase 2 (reactor task
+  wrapper + userspace-entry shim) → Phase 3 (page-fault async
+  dispatch) → Phase 5 (IRQ dispatch + UART RX). Blocker: none.
+
+- 2026-05-06 Pre-ELF Wave 1 (Phase 1 minor cleanups + Phase 4 VFS
+  walker) landed on branch `feat/pre-elf-runtime` (worktree
+  `funny-hugle-06199b`). Per
+  `docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`.
+  Phase 1 covers Part 5 §"tx-substrate public SpinMutex / Errno
+  EEXIST+ENOTEMPTY / InlineName: Ord"; Phase 4 covers Part 3
+  ("VFS walker / step_open"). Substrate-vs-subsystems layering fix per Open
+  Q #5: `tx_subsystems::sync::SpinMutex` (`pub(crate)`) relocated to
+  `tx_substrate::SpinMutex` (`pub`, re-exported at crate root). The
+  two duplicate inline TAS shims retired:
+  `crates/tx-kernel/src/init.rs::BootSpinMutex` and
+  `crates/tx-fs/src/tmpfs.rs::SpinMutex` both deleted; their slots
+  (`ROOT_MOUNT`, `DEV_MOUNT`, `CONSOLE_TTY`, `CONSOLE_OPS` serial,
+  tmpfs `state` lock) re-pointed to `tx_substrate::SpinMutex`. 13
+  in-tree `use crate::sync::SpinMutex` import sites in tx-subsystems
+  (`signal`, `page_backed`, `wait_carrier`, `tty/structure/{registry,
+  identity, payload}`, `vm/pmap`, `vm/structure/{recipe, range_lock}`,
+  `thread_runtime/structure`, `process/{structure, execution}`)
+  rewritten to `use tx_substrate::SpinMutex`. `Errno` extended with
+  `EEXIST` (POSIX 17) and `ENOTEMPTY` (POSIX 39); `errno_to_i32`
+  in `tx-shims/src/linux_syscall/mod.rs` extended in lockstep.
+  tmpfs `create_inode`/`mkdir`/`symlink` flipped from `EINVAL` to
+  `EEXIST` for name collisions; `rmdir` flipped from `EBUSY` to
+  `ENOTEMPTY`; their `TODO(phase-vfs-errno-{eexist,enotempty})`
+  comments deleted. `InlineName` grew a manual `Ord`/`PartialOrd`
+  impl that compares `as_bytes()` (a derive would compare `len`
+  first then include the trailing zero pad — wrong); tmpfs's
+  per-directory `BTreeMap<TmpfsName=Vec<u8>, FsObjectId>` flipped
+  to `BTreeMap<InlineName, FsObjectId>` and the `TmpfsName` newtype
+  dropped. New tx-substrate integration test
+  `tests/sync.rs::{spinmutex_lock_unlock_round_trip, spinmutex_holds_send_payload}`.
+  Two new tx-fs tests: `tmpfs_create_existing_returns_eexist` and
+  `tmpfs_rmdir_nonempty_returns_enotempty`. Phase 4 ships
+  `crates/tx-subsystems/src/vfs/walker.rs` with `pub async
+  step_walk` + `step_open`; mount-point crossing via the new
+  `mount::register_mount` + `mount_for` registry (Phase 6 sibling
+  will wire the registry calls into init.rs's `mount_devfs_at_dev`
+  so production resolves `/dev/console` end-to-end without the
+  walker fallback path); `RNodeBacking::Symlink { target:
+  Box<[u8]> }` (changed from `Box<InlineName>` because InlineName
+  rejects `/` in multi-component targets); new
+  `FsOps::read_link` trait method default-`ENOSYS` with tmpfs
+  override; `Errno::ELOOP` (POSIX 40) added; symlink chasing
+  implements absolute-target restart vs relative-target splice
+  with hop-budget `SYMLOOP_MAX = 40`. `open_console_for_init`
+  redirected through `step_open(b"/dev/console", RDWR, 0, ...)`
+  with a synchronous `block_on` shim and a fallback to the
+  legacy direct-RNode path until init.rs registers the mount in
+  the new registry. Two phases bundled in one commit because they
+  share files (vfs/structure.rs, execution.rs::Errno,
+  process/structure.rs, tmpfs.rs, linux_syscall/mod.rs). 10 new
+  walker tests pass (relative path, absolute path, ENOENT,
+  ENOTDIR-trailing-slash, ENOTDIR-mid-path, relative symlink,
+  absolute symlink, ELOOP at 41 hops, mount crossing, step_open
+  round-trip). tx-fs suite 10 → 13 (13/13); tx-kernel 8/8,
+  tx-shims 12/12, tx-subsystems 331 → 341 (341/341), all
+  tx-substrate integration tests green (incl. 2 new sync tests).
+  `cargo check --workspace`, `cargo fmt --check`, `cargo xtask
+  progress validate` all clean. Next: Phase 6 (mount/dev id
+  allocators + register_mount wire-up in init.rs); then Phase 2
+  reactor task wrapper + userspace-entry shim. Blocker: none.
+
+- 2026-05-05 Trio Phase 6 (end-to-end userspace round-trip smoke) on
+  branch `feat/trio-trap-syscall-tmpfs-devfs`. New host test
+  `tx_kernel::init::tests::boot_smoke_userspace_round_trip_writes_console_then_exits`
+  stitches the full chain together: fake userspace queue
+  (`Syscall(write(1, "hi\n", 3))` then `Syscall(exit_group(0))`) →
+  `UserspaceRunSlot::start_request` + `complete_interesting_trap` →
+  `linux_syscall::dispatch` → `OpenFile::step_write` → TTY ldisc OPOST
+  → `ConsoleIf::write_bytes` capture (asserts `b"hi\r\n"` post-OPOST)
+  → Plan B writeback into `pending_syscall_return` → fake
+  userspace-entry shim drains the slot into a test-local log
+  (`Some(Ok(3))`, then `None` for the no-return exit). Loop terminates
+  on `SyscallResult::NoReturn`; init transitions to zombie with
+  `ExitStatus::Exited(0)`. The synthesised driver replaces the not-yet-
+  existent reactor task wrapper + userspace-entry shim called out in
+  the plan's "Cross-cutting risks #1": per-hart slot is staged
+  manually via `set_current_thread_payload(0, _)` /
+  `clear_current_thread_payload(0)` and the writeback path is host-
+  side only (no `TrapFrameMut`). One additive seam introduced —
+  `ThreadIdentity::payload_cap_for_test()` gated on `cfg(any(test,
+  feature = "test-support"))`, mirroring the existing
+  `cross_crate_test_support` pattern. tx-kernel suite at 8 (7 prior +
+  1 new); tx-fs / tx-shims / tx-subsystems unchanged (10 / 12 / 331).
+  Verified: `cargo check -p tx-kernel`, `cargo test -p tx-kernel
+  --lib`, `cargo test -p tx-fs --lib -- --test-threads=1`,
+  `cargo test -p tx-shims --lib`, `cargo test -p tx-subsystems --lib
+  -- --test-threads=1`, `cargo check --workspace`, `cargo fmt
+  --check`, `cargo xtask progress validate` all green. Next: lay down
+  the production reactor task wrapper + real userspace-entry shim so
+  the Phase 6 fake driver can be deleted. Blocker: none for the
+  follow-up; ELF loading + first userspace binary remain explicitly
+  out of scope per the trio plan.
 - 2026-05-06 Zone static registration policy is now explicit and BSP-owned.
   `EBR_ZONE_INTERFACE_v1` records the decision to use subsystem
   `register_zones()` hooks plus one aggregate `register_all()` manifest, and to
@@ -1509,6 +2270,13 @@
 
 ## Latest Decisions
 
+- `docs/progress/decisions/2026-05-07-shell-prompt-roadmap-progress.md`
+- `docs/progress/decisions/2026-05-07-fd-ops-and-drift-cleanup.md`
+- `docs/progress/decisions/2026-05-06-dac-and-setuid.md`
+- `docs/progress/decisions/2026-05-06-elf-loader-and-execve.md`
+- `docs/progress/decisions/2026-05-06-fork-clone-wait4.md`
+- `docs/progress/decisions/2026-05-06-pre-elf-runtime-completion.md`
+- `docs/progress/decisions/2026-05-06-trio-trap-syscall-tmpfs-devfs.md`
 - `docs/progress/decisions/2026-05-05-tty-signal-end-to-end-typed-dispatch.md`
 - `docs/progress/decisions/2026-05-05-tty-pgrp-typed-rebinding.md`
 - `docs/progress/decisions/2026-05-05-step-waitpid-nohang.md`
@@ -1522,6 +2290,7 @@
 
 ## Latest Research
 
+- `docs/progress/research/2026-05-07-interface-drift-audit.md`
 - `docs/progress/research/2026-05-04-vm-pagebacked-midway-checkpoint.md`
 - `docs/progress/research/2026-05-04-vm-pagebacked-gap-update.md`
 - `docs/progress/research/2026-05-04-vm-pagebacked-final-ledger.md`

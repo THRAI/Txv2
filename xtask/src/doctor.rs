@@ -8,7 +8,7 @@ use crate::target::{
 use crate::util::{check_version, command_exists};
 use crate::Result;
 
-pub(crate) fn doctor(_root: &Path) -> Result<()> {
+pub(crate) fn doctor(root: &Path) -> Result<()> {
     println!("txKernel doctor");
     let mut missing_required = Vec::new();
 
@@ -74,7 +74,15 @@ pub(crate) fn doctor(_root: &Path) -> Result<()> {
             println!("warn: TX_BUSYBOX points at missing file: {path}");
         }
     } else {
-        println!("warn: TX_BUSYBOX not set; busybox initramfs generation will explain this");
+        let vendored = root.join(crate::image::VENDORED_BUSYBOX_RELPATH);
+        if vendored.exists() {
+            println!("ok: vendored busybox at {}", vendored.display());
+        } else {
+            println!(
+                "warn: TX_BUSYBOX not set and {} missing; run `tools/images/fetch-busybox.sh`",
+                crate::image::VENDORED_BUSYBOX_RELPATH
+            );
+        }
     }
     if let Ok(path) = env::var("TX_MUSL_LIBC") {
         if Path::new(&path).exists() {
