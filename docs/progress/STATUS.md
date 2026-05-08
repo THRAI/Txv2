@@ -4,29 +4,34 @@
 
 ## Current Shape
 
-- 2026-05-08 userspace first-entry slice 2 — model + asm landed,
-  needs QEMU debug iteration. Branch `feat/busybox-smoke`. Two
-  commits: `196a969` ("thread future: invert run_thread loop +
-  drop -> ! from enter_userspace_with_context") flips the type
-  signature of `TrapIf::enter_userspace_with_context` to `()`,
-  inverts `run_thread`'s loop to enter-then-await per iteration,
-  rewrites the host smoke driver to use Pending-yields instead of
-  YIELD-panic, and aligns `HAL_v1.md` §11 + `THREAD_RUNTIME_v1.md`
-  §4.1. `eb3e66a` ("rv64-qemu trap shell: reschedule longjmp via
-  per-hart KernelResumeCtx + per-CPU trap stack") adds a
-  per-CPU 16 KiB trap-handler stack in `.bss`, a per-hart
-  `KernelResumeCtx`, two new asm helpers
-  (`tx_rv64_enter_userspace_save_resume` and
-  `tx_rv64_resume_kernel_after_reschedule`), restructures the
-  trap-vector with `csrrw sp, sscratch, sp` swap discipline, and
-  wires `apply_trap_action`'s Reschedule arm to longjmp. Workspace
-  host tests green (0 failed). RV64 cross-build clean.
-  **Status: `cargo xtask test busybox-smoke --target rv64-qemu`
-  hits a kernel-mode `trap-action-terminate` panic during boot
-  with corrupted multi-hart serial; needs single-hart QEMU run +
-  trap-trace instrumentation to pinpoint.** See
+- 2026-05-08 userspace first-entry slice 2 — reschedule longjmp
+  model + asm + runtime validated. Branch `feat/busybox-smoke`.
+  Four commits: `196a969` (model: type+loop+docs), `eb3e66a`
+  (asm: per-hart KernelResumeCtx + per-CPU trap stack +
+  sscratch-swap trap vector + reschedule longjmp asm helpers),
+  `1371f1b` (progress catch-up), `007acca` (three bug fixes
+  surfaced by QEMU triage: sscratch-primer dead-code path,
+  trap-stack-in-rodata, off-by-3 console_write_hex). After 007acca
+  busybox-smoke boots cleanly through `:boot:ok` and
+  `:reactor:timer-idle:ok` (timer interrupts handled by the new
+  trap vector). Temporary trap-trace instrumentation confirmed
+  the reschedule longjmp executes correctly: continuous
+  `[ENT][RSC][RTN]` cycles show userspace entering via
+  save_resume, trapping, longjmp-back through
+  `enter_userspace_with_context`'s normal return, future awaits
+  resolved wait, dispatches, loops. **The stackless-coroutine +
+  reschedule longjmp model is functional end-to-end.**
+  **New blocker (separate slice):** every userspace trap is
+  `[pi]` (instruction page fault from user) and the future's
+  PageFault arm runs `fault_script` but the page never becomes
+  executable, so we loop forever on the same `sepc`. Suspects:
+  fault_script Ok-without-publish, missing `sfence.vma`,
+  ELF-loader recipe not registered for the busybox text segment,
+  or a `:bootstrap-exec:fallback` to the bake-in fixture which
+  faults differently. Workspace host tests green (0 failed)
+  across all four commits. See
   `docs/progress/decisions/2026-05-08-userspace-first-entry-gap.md`
-  for the diagnosis trail and next iteration steps.
+  for the full diagnosis trail.
 
 - 2026-05-08 retire `UserAccessIf` slice on branch
   `feat/retire-user-access-if`. Replaced the trait-based fixup-recovery
