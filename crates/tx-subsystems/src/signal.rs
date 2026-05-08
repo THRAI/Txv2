@@ -30,7 +30,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_substrate::zone::Cap;
+use tx_substrate::zone::{Cap, OperationalCapExt};
 
 use crate::execution::Errno;
 use crate::process::structure::{ProcessGroup, ProcessIdentity};
@@ -440,10 +440,11 @@ pub enum AstOutcome {
 /// gone, returns `Continue` (no group_pending or sig_actions to
 /// consult).
 pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutcome {
-    let summary = match thread.payload.lock().as_ref() {
-        Some(p) => p.interrupt_summary(),
-        None => return AstOutcome::Continue,
+    let thread_payload = match thread.upgrade_operational() {
+        Ok(payload) => payload,
+        Err(_) => return AstOutcome::Continue,
     };
+    let summary = thread_payload.interrupt_summary();
 
     if summary.termination {
         return AstOutcome::InitiateTermination;
@@ -464,20 +465,19 @@ pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutc
         // so an `Ignore` drops the signal cleanly and the loop re-selects.
         match source {
             PendingSource::Thread => {
-                if let Some(p) = thread.payload.lock().as_ref() {
-                    p.pending().clear(sig);
-                }
+                thread_payload.pending().clear(sig);
             }
             PendingSource::Group => {
-                if let Some(p) = proc.payload.lock().as_ref() {
-                    p.group_pending().clear(sig);
-                }
+                let Ok(proc_payload) = proc.upgrade_operational() else {
+                    return AstOutcome::Continue;
+                };
+                proc_payload.group_pending().clear(sig);
             }
         }
 
-        let disposition = match proc.payload.lock().as_ref() {
-            Some(p) => p.sig_actions().get(sig),
-            None => return AstOutcome::Continue,
+        let disposition = match proc.upgrade_operational() {
+            Ok(payload) => payload.sig_actions().get(sig),
+            Err(_) => return AstOutcome::Continue,
         };
 
         match disposition {
@@ -549,8 +549,7 @@ pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutc
         return route_gewalt(target, sig);
     }
 
-    let payload_guard = target.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
+    let Ok(payload) = target.upgrade_operational() else {
         return KillOutcome::NoLiveThread;
     };
     let threads = payload.threads.lock();
@@ -558,7 +557,6 @@ pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutc
         return KillOutcome::NoLiveThread;
     };
     drop(threads);
-    drop(payload_guard);
 
     post_signal(&leader, sig);
     KillOutcome::Delivered
@@ -604,18 +602,15 @@ pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
         return KillOutcome::Delivered;
     }
 
-    let payload_guard = target.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
+    let Ok(payload) = target.upgrade_operational() else {
         return KillOutcome::NoLiveThread;
     };
     let threads: alloc::vec::Vec<Cap<crate::thread_runtime::ThreadIdentity>> =
         payload.threads.lock().iter().cloned().collect();
-    drop(payload_guard);
 
     let mut touched = false;
     for thread in &threads {
-        let payload_guard = thread.payload.lock();
-        let Some(thread_payload) = payload_guard.as_ref() else {
+        let Ok(thread_payload) = thread.upgrade_operational() else {
             continue;
         };
         thread_payload.update_summary(|s| match sig.raw() {
@@ -655,7 +650,7 @@ pub fn step_kill_pgrp(pgrp: &Cap<ProcessGroup>, sig: Signum) -> usize {
             // delivery step can recognise group-targeted posts.
             // Gewalt bypasses pending queues entirely.
             if catchable {
-                if let Some(payload) = member.payload.lock().as_ref() {
+                if let Ok(payload) = member.upgrade_operational() {
                     payload.group_pending().post(sig);
                 }
             }
@@ -673,8 +668,7 @@ pub fn step_sigaction(
     sig: Signum,
     disposition: SigDisposition,
 ) -> SigDispositionChange {
-    let payload_guard = process.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
+    let Ok(payload) = process.upgrade_operational() else {
         return SigDispositionChange::ZombieIgnored;
     };
     let prev = payload.sig_actions().get(sig);
@@ -731,11 +725,10 @@ pub fn script_kill_process(
 ) -> Result<KillScriptOutcome, Errno> {
     let guard = tx_substrate::epoch::guard();
 
-    let source_cred = {
-        let payload_guard = source.payload.lock();
-        let payload = payload_guard.as_ref().ok_or(Errno::ESRCH)?;
-        payload.cred()
-    };
+    let source_cred = source
+        .upgrade_operational()
+        .map_err(|_| Errno::ESRCH)?
+        .cred();
 
     let Some(target_facts) = target.target_proc_cred_for(source) else {
         return Ok(KillScriptOutcome::NoLiveThread);
@@ -758,11 +751,10 @@ pub fn script_kill_probe(
 ) -> Result<KillScriptOutcome, Errno> {
     let guard = tx_substrate::epoch::guard();
 
-    let source_cred = {
-        let payload_guard = source.payload.lock();
-        let payload = payload_guard.as_ref().ok_or(Errno::ESRCH)?;
-        payload.cred()
-    };
+    let source_cred = source
+        .upgrade_operational()
+        .map_err(|_| Errno::ESRCH)?
+        .cred();
 
     let Some(target_facts) = target.target_proc_cred_for(source) else {
         return Ok(KillScriptOutcome::NoLiveThread);
@@ -796,26 +788,34 @@ pub fn script_kill_pgrp(
     pgrp: &Cap<ProcessGroup>,
     sig: Signum,
 ) -> Result<u32, Errno> {
-    let source_cred = {
-        let payload_guard = source.payload.lock();
-        let payload = payload_guard.as_ref().ok_or(Errno::ESRCH)?;
-        payload.cred()
-    };
-
     let guard = tx_substrate::epoch::guard();
+    script_kill_pgrp_with_guard(source, pgrp, sig, &guard)
+}
+
+pub(crate) fn script_kill_pgrp_with_guard(
+    source: &Cap<ProcessIdentity>,
+    pgrp: &Cap<ProcessGroup>,
+    sig: Signum,
+    guard: &tx_substrate::epoch::Guard<'_>,
+) -> Result<u32, Errno> {
+    let source_cred = source
+        .upgrade_operational()
+        .map_err(|_| Errno::ESRCH)?
+        .cred();
+
     let mut delivered = 0u32;
     let members: alloc::vec::Vec<Cap<ProcessIdentity>> = pgrp
         .members
         .lock()
         .iter()
-        .filter_map(|w| w.upgrade(&guard))
+        .filter_map(|w| w.upgrade(guard))
         .collect();
 
     for member in &members {
         let Some(facts) = member.target_proc_cred_for(source) else {
             continue;
         };
-        if crate::cred::require_signal_send(source_cred, &facts, sig, &guard).is_err() {
+        if crate::cred::require_signal_send(source_cred, &facts, sig, guard).is_err() {
             continue;
         }
         if step_kill_process(member, sig) == KillOutcome::Delivered {
@@ -823,7 +823,7 @@ pub fn script_kill_pgrp(
             // signals (SIGKILL/SIGSTOP/SIGCONT) bypass pending
             // queues entirely per SIGNAL_v1 §2 Consequence 2.
             if !is_gewalt(sig) {
-                if let Some(payload) = member.payload.lock().as_ref() {
+                if let Ok(payload) = member.upgrade_operational() {
                     payload.group_pending().post(sig);
                 }
             }
@@ -885,18 +885,25 @@ pub fn deliver_tty_dispatch(
     source: &Cap<ProcessIdentity>,
     dispatch: crate::tty::execution::SignalDispatch,
 ) -> Result<DispatchOutcome, Errno> {
+    let guard = tx_substrate::epoch::guard();
+    deliver_tty_dispatch_with_guard(source, dispatch, &guard)
+}
+
+pub fn deliver_tty_dispatch_with_guard(
+    source: &Cap<ProcessIdentity>,
+    dispatch: crate::tty::execution::SignalDispatch,
+    guard: &tx_substrate::epoch::Guard<'_>,
+) -> Result<DispatchOutcome, Errno> {
     let Some(weak) = dispatch.target.pgrp_weak() else {
         return Ok(DispatchOutcome::NoTypedPgrp);
     };
 
-    let guard = tx_substrate::epoch::guard();
-    let Some(pgrp_cap) = weak.upgrade(&guard) else {
+    let Some(pgrp_cap) = weak.upgrade(guard) else {
         return Ok(DispatchOutcome::PgrpDropped);
     };
-    drop(guard);
 
     let signum = signum_for_job_control(dispatch.signal);
-    let count = script_kill_pgrp(source, &pgrp_cap, signum)?;
+    let count = script_kill_pgrp_with_guard(source, &pgrp_cap, signum, guard)?;
     Ok(DispatchOutcome::Delivered { count })
 }
 

@@ -4,7 +4,7 @@
 use core::sync::atomic::Ordering;
 
 use tx_hal::UserTrapContext;
-use tx_substrate::zone::{Cap, PayloadCap};
+use tx_substrate::zone::{Cap, OperationalCapExt, PayloadCap};
 
 use crate::signal::{SignalMask, Signum};
 use crate::thread_runtime::structure::{
@@ -85,8 +85,7 @@ pub fn step_sigprocmask(
     how: SigmaskHow,
     next: SignalMask,
 ) -> SigprocmaskChange {
-    let payload_guard = thread.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
+    let Ok(payload) = thread.upgrade_operational() else {
         return SigprocmaskChange::ZombieIgnored;
     };
     let prev_bits = payload.signal_mask.load(Ordering::Acquire);
@@ -130,8 +129,7 @@ pub fn post_signal(thread: &Cap<ThreadIdentity>, sig: Signum) {
          use signal::route_gewalt or signal::step_kill_process which dispatches"
     );
 
-    let payload_guard = thread.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
+    let Ok(payload) = thread.upgrade_operational() else {
         return;
     };
     payload.pending().post(sig);

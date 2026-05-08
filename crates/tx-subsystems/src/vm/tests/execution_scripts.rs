@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 fn vm_try_mmap_places_nonfixed_mapping_in_first_recipe_gap() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     map_reserved(aspace.reserve_map(
         VmEntry::new(
@@ -56,6 +57,7 @@ fn vm_try_mmap_places_nonfixed_mapping_in_first_recipe_gap() {
 
 #[test]
 fn vm_try_mmap_fixed_replace_uses_declared_range() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let original = VmEntry::new(
         range(0x1000, 3),
@@ -97,6 +99,7 @@ fn vm_try_mmap_fixed_replace_uses_declared_range() {
 
 #[test]
 fn vm_try_mremap_moves_disjoint_range_and_preserves_source_survivors() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let original = VmEntry::new(
         range(0x1000, 4),
@@ -137,6 +140,7 @@ fn vm_try_mremap_moves_disjoint_range_and_preserves_source_survivors() {
 
 #[test]
 fn vm_try_mremap_rejects_overlapping_or_occupied_destination() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     map_reserved(aspace.reserve_map(
         VmEntry::new(

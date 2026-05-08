@@ -15,6 +15,7 @@ pub mod pipe;
 pub mod process;
 pub mod reactor_submit;
 pub mod signal;
+mod sync;
 pub mod thread_runtime;
 pub mod tty;
 pub mod vfs;

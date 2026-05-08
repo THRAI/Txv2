@@ -4,6 +4,8 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod zones;
+
 pub mod init;
 pub mod irq;
 pub mod thread_future;
@@ -47,4 +49,8 @@ mod host_check_allocator {
 
 pub fn kernel_main<P: TxPlatform + 'static>(handoff: BootHandoff) -> ! {
     init::CoreInit::<P>::boot(handoff)
+}
+
+pub fn panic_shutdown<P: TxPlatform>() -> ! {
+    zones::panic_shutdown::<P>()
 }

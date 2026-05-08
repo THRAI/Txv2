@@ -178,7 +178,12 @@ impl<P: TxPlatform> CoreInit<P> {
         if P::SUBSTRATE_BOOT_READY {
             Self::run_userspace_reactor_loop();
         }
-        P::system_off()
+        // Drain registered zones, then power off. The
+        // zones-aware shutdown lives on the BSP shutdown lane (the
+        // 2026-05-06 zone-registration policy on main); we feed it
+        // through unconditionally because zone cleanup is a no-op
+        // when no zones were registered.
+        crate::zones::shutdown_with_zone_cleanup::<P>()
     }
 
     fn init_early(handoff: BootHandoff) {
@@ -188,6 +193,7 @@ impl<P: TxPlatform> CoreInit<P> {
     fn init_substrate_if_ready(handoff: BootHandoff) {
         if P::SUBSTRATE_BOOT_READY {
             tx_substrate::init::<P>();
+            crate::zones::register_all().expect("tx_kernel zone registration failed");
             Self::init_later(handoff);
             Self::install_kernel_trap_vector();
             Self::init_boot_reactor();
@@ -443,7 +449,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let guard = tx_substrate::epoch::guard();
         // Bootstrap path runs as root by construction.
         let cred = Credential::root();
-        let (dev_object_id, dev_meta) = match root_mount.payload().fs_ops.mkdir(
+        let (dev_object_id, dev_meta) = match root_mount.payload_cap().expect("rootfs payload alive during boot").into_cap().fs_ops.mkdir(
             tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
             b"dev",
             0o755,
@@ -502,7 +508,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // into the new mount's `parent` slot. The mount-table
         // registration below keys on the rootfs payload + `/dev`'s
         // FsObjectId on rootfs.
-        let rootfs_payload = root_mount.payload().clone();
+        let rootfs_payload = root_mount.payload_cap().expect("rootfs payload alive during boot").into_cap().clone();
 
         let dev_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
@@ -751,8 +757,8 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let root_mount = root_mount()
             .expect("register_busybox_into_tmpfs: ROOT_MOUNT must be populated");
-        let fs_ops = root_mount.payload().fs_ops.clone();
-        let fs_page_backing = root_mount.payload().fs_page_backing.clone();
+        let fs_ops = root_mount.payload_cap().expect("rootfs payload alive during boot").into_cap().fs_ops.clone();
+        let fs_page_backing = root_mount.payload_cap().expect("rootfs payload alive during boot").into_cap().fs_page_backing.clone();
         let root_object_id = root_mount.root().fs_object_id();
 
         let cred = Credential::root();
@@ -863,8 +869,8 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let root_mount =
             root_mount().expect("register_init_fixture_into_tmpfs: ROOT_MOUNT must be populated");
-        let fs_ops = root_mount.payload().fs_ops.clone();
-        let fs_page_backing = root_mount.payload().fs_page_backing.clone();
+        let fs_ops = root_mount.payload_cap().expect("rootfs payload alive during boot").into_cap().fs_ops.clone();
+        let fs_page_backing = root_mount.payload_cap().expect("rootfs payload alive during boot").into_cap().fs_page_backing.clone();
         let root_object_id = root_mount.root().fs_object_id();
 
         let bytes = &init_fixture::INIT_FIXTURE_BYTES[..];
@@ -1176,6 +1182,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 continue;
             }
 
+            crate::zones::try_bounded_maintenance_tick();
             P::wait_for_interrupt_once();
             if P::pending_ipi(IpiKind::Reschedule) {
                 P::ack_ipi(IpiKind::Reschedule);
@@ -1321,6 +1328,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 tx_hal::console_write_str::<P>(":reactor:timer-idle:ok\n");
                 return;
             }
+            crate::zones::try_bounded_maintenance_tick();
             P::wait_for_interrupt_once();
         }
 

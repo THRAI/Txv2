@@ -500,7 +500,12 @@ fn try_retire<T: ZoneAllocated>(data_ptr: *mut u8) {
         let new = cur.with_state(SlotState::Retiring);
         match meta.cas(cur, new, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {
-                unsafe { epoch::retire(data_ptr, reclaim_slot::<T>) };
+                if unsafe { epoch::retire(data_ptr, reclaim_slot::<T>) }.is_ok() {
+                    return;
+                }
+                epoch::try_drain(bounded_retry_budget);
+                unsafe { epoch::retire(data_ptr, reclaim_slot::<T>) }
+                    .expect("retire enqueue failed after bounded drain");
                 return;
             }
             Err(_) => continue,
@@ -508,6 +513,13 @@ fn try_retire<T: ZoneAllocated>(data_ptr: *mut u8) {
     }
 }
 ```
+
+The five-state slot model intentionally has no "pending retire retry" state.
+Once the CAS publishes `Retiring`, the slot must be handed to EBR. If the
+retired-node pool is temporarily full, the implementation may perform one
+bounded drain and retry. If enqueue still fails, the kernel fail-fasts: leaving
+the slot outside both the allocator and the EBR queue would create an
+unbounded leak or require a sixth lifecycle state, which this design rejects.
 
 Reclaim callback:
 

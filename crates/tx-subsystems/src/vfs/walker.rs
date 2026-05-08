@@ -442,8 +442,16 @@ fn walk_inner<'g>(
                 Ok(d) => d,
                 Err(err) => return StepOutcome::Err(err),
             };
-            current_fs_ops = Some(mount_cap.payload().fs_ops.clone());
-            current_mount_payload = Some(mount_cap.payload().clone());
+            // Mount-identity payload is now upgraded through
+            // `payload_cap()` (PayloadCap from Cap) on main; convert
+            // back to a Cap<MountPayload> via `into_cap()` to keep
+            // the walker's local-variable types unchanged.
+            let Ok(mount_payload) = mount_cap.payload_cap() else {
+                return StepOutcome::Err(Errno::EIO);
+            };
+            let mount_payload_cap = mount_payload.into_cap();
+            current_fs_ops = Some(mount_payload_cap.fs_ops.clone());
+            current_mount_payload = Some(mount_payload_cap);
             continue;
         }
 

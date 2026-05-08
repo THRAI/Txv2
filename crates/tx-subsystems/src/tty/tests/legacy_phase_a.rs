@@ -9,6 +9,7 @@ use tx_substrate::zone::{self, Cap, PayloadCap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::{Errno, Guard, StepOutcome};
+use crate::test_support::EPOCH_TEST_LOCK as TTY_ZONE_TEST_LOCK;
 use crate::tty::execution::{
     register_console_alias, register_hardware, step_hangup, step_ingest, step_ioctl_tcgets,
     step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz, step_ioctl_tiocnotty,
@@ -80,9 +81,6 @@ impl CharDeviceOps for ScriptedReadOps {
     }
 }
 
-#[cfg(test)]
-static TTY_ZONE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -126,7 +124,7 @@ fn drain(ring: &mut Ring) -> Vec<u8> {
 
 fn init_zones() {
     tx_substrate::testing::init_host_for_test_once();
-    crate::tty::structure::registry::register_zones().expect("tty zones");
+    crate::zones::register_all().expect("kernel zones");
     crate::tty::structure::registry::reset_for_tests();
 }
 
@@ -1006,6 +1004,8 @@ fn tcsets_flushes_pending_cooked_buffer_into_read_queue() {
         other => panic!("tcgets failed: {other:?}"),
     };
     raw_mode.c_lflag &= !ICANON;
+    raw_mode.c_cc[crate::tty::structure::termios::VMIN] = 0;
+    raw_mode.c_cc[crate::tty::structure::termios::VTIME] = 0;
     assert_eq!(
         step_ioctl_tcsets(&tty, raw_mode, &guard),
         StepOutcome::Done(crate::tty::execution::IoctlSideEffect::default())

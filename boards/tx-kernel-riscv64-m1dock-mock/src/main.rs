@@ -21,7 +21,5 @@ pub extern "C" fn rust_entry(cpu_id: usize, firmware_arg: usize) -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    loop {
-        core::hint::spin_loop();
-    }
+    tx_kernel::panic_shutdown::<ActivePlatform>()
 }
