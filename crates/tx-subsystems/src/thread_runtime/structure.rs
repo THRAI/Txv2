@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use tx_hal::UserTrapContext;
 use tx_reactor::userspace::{UserspaceRunRequest, UserspaceRunSlot};
 use tx_reactor::TaskKey;
-use tx_substrate::zone::{PayloadCap, Weak, Zone, ZoneAllocated};
+use tx_substrate::zone::{Dead, Entity, PayloadCap, Weak, Zone, ZoneAllocated};
 use tx_substrate::SpinMutex;
 
 use crate::process::ProcessIdentity;
@@ -86,6 +86,16 @@ impl ThreadIdentity {
     #[cfg(any(test, feature = "test-support"))]
     pub fn payload_cap_for_test(&self) -> Option<PayloadCap<ThreadPayload>> {
         self.payload_cap()
+    }
+}
+
+impl Entity for ThreadIdentity {
+    type OperationalEvidence = PayloadCap<ThreadPayload>;
+
+    fn upgrade_operational(
+        identity: &tx_substrate::zone::Cap<Self>,
+    ) -> Result<Self::OperationalEvidence, Dead> {
+        identity.payload.lock().as_ref().cloned().ok_or(Dead)
     }
 }
 

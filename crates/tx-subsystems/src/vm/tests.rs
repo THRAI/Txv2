@@ -1,8 +1,10 @@
 use super::*;
 use crate::execution::StepOutcome;
 use crate::page_backed::PageContainer;
+use crate::test_support::EPOCH_TEST_LOCK;
 use alloc::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
+use std::thread_local;
 use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
@@ -16,6 +18,10 @@ mod script_async;
 static COUNTING_PMAP_TEST_LOCK: Mutex<()> = Mutex::new(());
 static COUNTING_PMAP_STATE: LazyLock<Mutex<CountingPmapState>> =
     LazyLock::new(|| Mutex::new(CountingPmapState::new()));
+thread_local! {
+    static VM_TEST_EPOCH_GUARD: std::cell::RefCell<Option<std::sync::MutexGuard<'static, ()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 struct CountingPmap;
 
@@ -157,7 +163,14 @@ impl PmapIf for CountingPmap {
 }
 
 fn setup_host_substrate() {
+    VM_TEST_EPOCH_GUARD.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+    });
     tx_substrate::testing::init_host_for_test_once();
+    crate::zones::register_all().expect("kernel zones");
     match tx_substrate::page_allocator::claim_zero_frame() {
         Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for VM tests: {error:?}"),
@@ -526,6 +539,7 @@ fn vm_entry_split_for_protect_rewrites_middle_only() {
 
 #[test]
 fn vm_address_space_map_reservation_publishes_recipe_on_commit() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x4000, 2),
@@ -555,6 +569,7 @@ fn vm_address_space_map_reservation_publishes_recipe_on_commit() {
 
 #[test]
 fn vm_address_space_dropped_map_reservation_rolls_back() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x8000, 1),
@@ -572,6 +587,7 @@ fn vm_address_space_dropped_map_reservation_rolls_back() {
 
 #[test]
 fn vm_address_space_rejects_nonfixed_overlap() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let first = VmEntry::new(
         range(0x1000, 2),
@@ -599,6 +615,7 @@ fn vm_address_space_rejects_nonfixed_overlap() {
 
 #[test]
 fn vm_address_space_fixed_map_replaces_overlap_and_preserves_survivors() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let original = VmEntry::new(
         range(0x1000, 4),
@@ -651,6 +668,7 @@ fn vm_address_space_fixed_map_replaces_overlap_and_preserves_survivors() {
 
 #[test]
 fn vm_recipe_snapshot_reader_survives_split_rewrite_publication() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let original = VmEntry::new(
         range(0x1000, 4),
@@ -704,6 +722,7 @@ fn vm_recipe_snapshot_reader_survives_split_rewrite_publication() {
 
 #[test]
 fn vm_address_space_unmap_splits_recipe_and_updates_stats() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let original = VmEntry::new(
         range(0x1000, 4),
@@ -739,6 +758,7 @@ fn vm_address_space_unmap_splits_recipe_and_updates_stats() {
 
 #[test]
 fn vm_address_space_protect_rewrites_only_declared_range() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let original = VmEntry::new(
         range(0x1000, 3),
@@ -775,6 +795,7 @@ fn vm_address_space_protect_rewrites_only_declared_range() {
 
 #[test]
 fn vm_address_space_finds_first_gap_inside_search_window() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let first = VmEntry::new(
         range(0x1000, 2),
@@ -804,6 +825,7 @@ fn vm_address_space_finds_first_gap_inside_search_window() {
 
 #[test]
 fn vm_address_space_lists_recipes_overlapping_declared_range_in_order() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let left = VmEntry::new(
         range(0x1000, 1),
@@ -832,6 +854,7 @@ fn vm_address_space_lists_recipes_overlapping_declared_range_in_order() {
 
 #[test]
 fn vm_checks_require_fault_recipe_matches_resolve_fault_outcome() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x4000, 1),
@@ -854,6 +877,7 @@ fn vm_checks_require_fault_recipe_matches_resolve_fault_outcome() {
 
 #[test]
 fn vm_checks_require_fault_recipe_reports_missing_and_permission_errors() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x4000, 1),
@@ -883,6 +907,7 @@ fn vm_checks_require_fault_recipe_reports_missing_and_permission_errors() {
 
 #[test]
 fn vm_checks_require_fault_publication_rejects_stale_recipe_and_page() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x2000, 1),
@@ -930,6 +955,7 @@ fn vm_checks_require_fault_publication_rejects_stale_recipe_and_page() {
 
 #[test]
 fn vm_checks_require_map_admission_preserves_placement_rules() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let first = VmEntry::new(
         range(0x1000, 2),
@@ -976,6 +1002,7 @@ fn vm_checks_require_disjoint_remap_rejects_overlap_and_size_mismatch() {
 
 #[test]
 fn vm_project_empty_address_space_has_empty_mapping_projection() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
 
     assert_eq!(
@@ -989,6 +1016,7 @@ fn vm_project_empty_address_space_has_empty_mapping_projection() {
 
 #[test]
 fn vm_project_address_space_lists_mappings_in_start_order_and_hides_caps() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let high_page_backing = page_backing(2 * USER_PAGE_SIZE as u64);
     map_reserved(aspace.reserve_map(
@@ -1100,6 +1128,7 @@ fn address_space_cap_maps_cap_backed_page_container() {
 
 #[test]
 fn vm_pmap_publish_revalidates_recipe_before_install() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x2000, 1),
@@ -1126,6 +1155,7 @@ fn vm_pmap_publish_revalidates_recipe_before_install() {
 
 #[test]
 fn vm_pmap_publish_installs_materialized_mapping_then_unmap_shoots_down() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x3000, 1),
@@ -1173,6 +1203,7 @@ fn vm_pmap_publish_installs_materialized_mapping_then_unmap_shoots_down() {
 
 #[test]
 fn vm_pmap_duplicate_publish_converges_on_existing_mapping() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0xa000, 1),
@@ -1286,6 +1317,7 @@ fn address_space_cap_drop_tears_down_pmap_before_destroying_root() {
 
 #[test]
 fn vm_pmap_publish_uses_reserve_commit_sequence() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x9000, 1),
@@ -1319,6 +1351,7 @@ fn vm_pmap_publish_uses_reserve_commit_sequence() {
 
 #[test]
 fn vm_pmap_protect_tears_down_for_refault_not_in_place_retag() {
+    setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x5000, 1),

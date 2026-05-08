@@ -6,7 +6,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use tx_hal::{PmapIf, UserTrapContext};
-use tx_substrate::zone::{self, Cap, ZoneError};
+use tx_substrate::zone::{self, Cap, OperationalCapExt, ZoneError};
 use tx_substrate::SpinMutex;
 
 use crate::cred::Cred;
@@ -744,8 +744,7 @@ pub enum ChdirOutcome {
 /// pre-resolved `Cap<DEntry>`. POSIX `chdir(2)` / `fchdir(2)` and
 /// the `EACCES` / `ENOENT` resolution errors live above this layer.
 pub fn step_chdir(target: &Cap<ProcessIdentity>, new_cwd: Cap<crate::vfs::DEntry>) -> ChdirOutcome {
-    let payload_guard = target.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
+    let Ok(payload) = target.upgrade_operational() else {
         return ChdirOutcome::ZombieIgnored;
     };
     let prev = payload.cwd.lock().replace(new_cwd);
@@ -763,10 +762,8 @@ pub fn step_chdir(target: &Cap<ProcessIdentity>, new_cwd: Cap<crate::vfs::DEntry
 ///   POSIX maps this to `ENOENT` ("the cwd has been unlinked"); the
 ///   syscall driver applies the errno.
 pub fn step_getcwd(target: &Cap<ProcessIdentity>) -> Option<alloc::vec::Vec<u8>> {
-    let payload_guard = target.payload.lock();
-    let payload = payload_guard.as_ref()?;
+    let payload = target.upgrade_operational().ok()?;
     let cwd = payload.cwd.lock().clone()?;
-    drop(payload_guard);
     crate::vfs::render_dentry_path(&cwd)
 }
 

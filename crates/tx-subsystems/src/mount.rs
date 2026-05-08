@@ -10,7 +10,9 @@ use crate::device::BlockDevice;
 use crate::execution::KernelResult;
 use crate::page_backed::{FsPageBacking, PageContainer};
 use crate::vfs::{DEntry, FsObjectId, FsOps, InodeMeta, RNode};
-use tx_substrate::zone::{self, Cap, Zone, ZoneAllocated, ZoneError};
+use tx_substrate::zone::{
+    self, Cap, Dead, Entity, PayloadBinding, PayloadCap, Zone, ZoneAllocated, ZoneError,
+};
 
 static MOUNT_IDENTITY_ZONE: Zone<MountIdentity> = Zone::const_new();
 static MOUNT_PAYLOAD_ZONE: Zone<MountPayload> = Zone::const_new();
@@ -167,10 +169,10 @@ pub struct MountPayloadPin {
 }
 
 impl MountPayloadPin {
-    pub fn acquire(payload: &Cap<MountPayload>) -> Self {
+    pub fn acquire(payload: &PayloadCap<MountPayload>) -> Self {
         payload.payload_pin_count.fetch_add(1, Ordering::AcqRel);
         Self {
-            payload: payload.clone(),
+            payload: payload.clone().into_cap(),
         }
     }
 
@@ -178,6 +180,20 @@ impl MountPayloadPin {
         &self.payload
     }
 }
+
+impl Clone for MountPayloadPin {
+    fn clone(&self) -> Self {
+        Self::acquire(&PayloadCap::from_cap(self.payload.clone()))
+    }
+}
+
+impl PartialEq for MountPayloadPin {
+    fn eq(&self, other: &Self) -> bool {
+        self.payload.key() == other.payload.key()
+    }
+}
+
+impl Eq for MountPayloadPin {}
 
 impl Drop for MountPayloadPin {
     fn drop(&mut self) {
@@ -193,7 +209,7 @@ pub struct MountIdentity {
     mountpoint: Option<Cap<DEntry>>,
     root: Cap<RNode>,
     parent: Option<Cap<MountIdentity>>,
-    payload: Cap<MountPayload>,
+    payload: PayloadBinding<MountPayload>,
     flags: MountFlags,
 }
 
@@ -203,7 +219,7 @@ impl MountIdentity {
         mountpoint: Option<Cap<DEntry>>,
         root: Cap<RNode>,
         parent: Option<Cap<MountIdentity>>,
-        payload: Cap<MountPayload>,
+        payload: PayloadBinding<MountPayload>,
         flags: MountFlags,
     ) -> Self {
         Self {
@@ -225,6 +241,7 @@ impl MountIdentity {
         flags: MountFlags,
     ) -> Result<Cap<Self>, ZoneError> {
         let reservation = zone::reserve_for::<Self>()?;
+        let payload = PayloadBinding::installed(PayloadCap::from_cap(payload));
         Ok(zone::sign_for(
             reservation,
             Self::new(id, mountpoint, root, parent, payload, flags),
@@ -247,12 +264,26 @@ impl MountIdentity {
         self.parent.as_ref()
     }
 
-    pub fn payload(&self) -> &Cap<MountPayload> {
+    pub fn payload_binding(&self) -> &PayloadBinding<MountPayload> {
         &self.payload
+    }
+
+    pub fn payload_cap(&self) -> Result<PayloadCap<MountPayload>, Dead> {
+        self.payload.upgrade()
     }
 
     pub const fn flags(&self) -> MountFlags {
         self.flags
+    }
+}
+
+impl Entity for MountIdentity {
+    type OperationalEvidence = MountPayloadPin;
+
+    fn upgrade_operational(
+        identity: &tx_substrate::zone::Cap<Self>,
+    ) -> Result<Self::OperationalEvidence, Dead> {
+        Ok(MountPayloadPin::acquire(&identity.payload_cap()?))
     }
 }
 
@@ -490,7 +521,7 @@ mod tests {
     use super::*;
     use crate::execution::{Errno, Guard, StepOutcome};
     use crate::page_backed::{Frame, PageContainerKind};
-    use crate::vfs::{Credential, DirCursor, DirEntry, InodeKind};
+    use crate::vfs::{Credential, DirCursor, DirEntry, InodeKind, RNodeBacking};
 
     struct MockFs;
 
@@ -653,6 +684,7 @@ mod tests {
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
             fs.clone(),
@@ -667,7 +699,7 @@ mod tests {
 
         assert_eq!(payload.payload_pin_count(), 0);
         {
-            let pin = MountPayloadPin::acquire(&payload);
+            let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload.clone()));
             assert_eq!(pin.payload().dev_id, DevId::new(1));
             assert_eq!(payload.payload_pin_count(), 1);
         }
@@ -680,6 +712,7 @@ mod tests {
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
             fs.clone(),
@@ -692,7 +725,7 @@ mod tests {
         )
         .expect("mount payload");
         let kind = PageContainerKind::File {
-            mount: payload.clone(),
+            mount: MountPayloadPin::acquire(&PayloadCap::from_cap(payload.clone())),
             fs_object_id: FsObjectId::new(99),
         };
 
@@ -701,7 +734,63 @@ mod tests {
             PageContainerKind::File {
                 ref mount,
                 fs_object_id
-            } if *mount == payload && fs_object_id == FsObjectId::new(99)
+            } if mount.payload().key() == payload.key() && fs_object_id == FsObjectId::new(99)
         ));
+    }
+
+    #[test]
+    fn mount_identity_payload_binding_upgrades_and_operational_pin_counts_separately() {
+        tx_substrate::testing::init_host_for_test_once();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+
+        let fs = Arc::new(MockFs);
+        let payload = MountPayload::new_cap(
+            fs.clone(),
+            fs,
+            None,
+            DevId::new(3),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("mock"),
+        )
+        .expect("mount payload");
+        let root = RNode::new_cap(
+            FsObjectId::ROOT,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::PageBacked {
+                pc: PageContainer::new_cap(
+                    PageContainerKind::Anon {
+                        swap_policy: crate::page_backed::AnonSwapPolicy::Reclaimable,
+                    },
+                    1,
+                )
+                .expect("page container"),
+            },
+        )
+        .expect("root rnode");
+        let mount = MountIdentity::new_cap(
+            MountId::new(7),
+            None,
+            root,
+            None,
+            payload.clone(),
+            MountFlags::empty(),
+        )
+        .expect("mount identity");
+
+        let bound = mount.payload_cap().expect("payload binding upgrade");
+        assert_eq!(bound.key(), payload.key());
+        assert_eq!(payload.payload_pin_count(), 0);
+
+        {
+            let pin = MountPayloadPin::acquire(&bound);
+            assert_eq!(pin.payload().key(), payload.key());
+            assert_eq!(payload.payload_pin_count(), 1);
+        }
+
+        assert_eq!(payload.payload_pin_count(), 0);
     }
 }

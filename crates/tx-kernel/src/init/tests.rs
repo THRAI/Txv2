@@ -302,7 +302,13 @@ fn boot_smoke_mounts_root_and_dev_and_resolves_console() {
     // Root mount populates and points at a tmpfs payload over the
     // root rnode.
     let root = root_mount().expect("ROOT_MOUNT must be populated");
-    assert_eq!(root.payload().fstype, "tmpfs");
+    assert_eq!(
+        root.payload_cap()
+            .expect("root payload alive")
+            .into_cap()
+            .fstype,
+        "tmpfs"
+    );
     assert_eq!(
         root.root().fs_object_id(),
         tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID
@@ -314,7 +320,13 @@ fn boot_smoke_mounts_root_and_dev_and_resolves_console() {
 
     // Devfs mount populates and is parented at the rootfs.
     let dev = dev_mount().expect("DEV_MOUNT must be populated");
-    assert_eq!(dev.payload().fstype, "devfs");
+    assert_eq!(
+        dev.payload_cap()
+            .expect("dev payload alive")
+            .into_cap()
+            .fstype,
+        "devfs"
+    );
     assert_eq!(
         dev.root().fs_object_id(),
         tx_fs::devfs::DEVFS_ROOT_OBJECT_ID
@@ -1303,8 +1315,8 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
 
     let root_mount =
         crate::init::root_mount().expect("register_setuid_fixture: ROOT_MOUNT must be populated");
-    let fs_ops = root_mount.payload().fs_ops.clone();
-    let fs_page_backing = root_mount.payload().fs_page_backing.clone();
+    let fs_ops = root_mount.payload_cap().expect("rootfs payload alive in test").into_cap().fs_ops.clone();
+    let fs_page_backing = root_mount.payload_cap().expect("rootfs payload alive in test").into_cap().fs_page_backing.clone();
     let root_object_id = root_mount.root().fs_object_id();
 
     let bytes = &crate::init::init_setuid_fixture::INIT_SETUID_FIXTURE_BYTES[..];

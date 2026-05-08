@@ -60,6 +60,10 @@ impl<T: 'static> Keg<T> {
         self.slab_count.load(Ordering::Acquire)
     }
 
+    pub(crate) fn empty_slab_count(&self) -> usize {
+        self.empty_count.load(Ordering::Acquire)
+    }
+
     pub(crate) fn pop_free_slot(
         &self,
         zone: &'static Zone<T>,
@@ -169,6 +173,67 @@ impl<T: 'static> Keg<T> {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn trim_empty_slabs(&self, limit: usize) -> usize {
+        let mut retired = 0usize;
+
+        while retired < limit {
+            let retire_candidate = {
+                let _guard = self.lock.lock();
+                if self.empty_count.load(Ordering::Acquire) <= EMPTY_SLAB_LOW_WATER {
+                    None
+                } else {
+                    let head = unsafe { *self.empty_head.get() };
+                    let slab = NonNull::new(head);
+                    if let Some(slab) = slab {
+                        unsafe {
+                            self.remove_slab_locked(slab, SlabList::Empty);
+                        }
+                    }
+                    slab
+                }
+            };
+
+            let Some(slab) = retire_candidate else {
+                break;
+            };
+
+            let retire_result =
+                unsafe { epoch::retire_raw(slab.as_ptr() as *mut u8, reclaim_slab::<T>) };
+            if retire_result.is_ok() {
+                unsafe {
+                    slab.as_ref()
+                        .zone()
+                        .note_released_slots(slab.as_ref().slot_count());
+                }
+                self.slab_count.fetch_sub(1, Ordering::AcqRel);
+                retired += 1;
+                continue;
+            }
+
+            let _ = epoch::drain_with_budget(64);
+            let retry_result =
+                unsafe { epoch::retire_raw(slab.as_ptr() as *mut u8, reclaim_slab::<T>) };
+            if retry_result.is_ok() {
+                unsafe {
+                    slab.as_ref()
+                        .zone()
+                        .note_released_slots(slab.as_ref().slot_count());
+                }
+                self.slab_count.fetch_sub(1, Ordering::AcqRel);
+                retired += 1;
+                continue;
+            }
+
+            let _guard = self.lock.lock();
+            unsafe {
+                self.push_slab_locked(slab, SlabList::Empty);
+            }
+            break;
+        }
+
+        retired
     }
 
     unsafe fn allocate_slab_locked(

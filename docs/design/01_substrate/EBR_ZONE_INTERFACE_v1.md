@@ -430,6 +430,15 @@ readers may still hold `IdentRef<'g, T>`. It marks the slot dead and enqueues
 retirement. The reclaim queue runs the destructor only after the epoch-safe
 window. Large destructors split their work under bounded-work reclamation.
 
+Retire enqueue failure is fail-fast in the five-state design. After
+`Dead -> Retired/Retiring` is claimed, there is no sixth state where the slot
+can safely remain discoverable for a later retry: it is non-upgradeable and not
+allocator-free, but it is also not yet owned by the EBR queue. Therefore the
+zone implementation may run one bounded `epoch::try_drain`/retry to relieve
+transient retired-node pool pressure. If the second enqueue still fails, this is
+a substrate capacity invariant violation and the kernel panics rather than
+silently leaking or reusing the slot.
+
 ### 5.2 `PayloadSlot`
 <!-- txdoc:EBR-ZONE-ZONE-POLICIES-PAYLOADSLOT-1 -->
 
@@ -587,7 +596,64 @@ impl<'g, T> IdentRef<'g, T> {
 
 ---
 
-## 9. What To Import From The Drafts
+## 9. Static Zone Registration
+<!-- txdoc:EBR-ZONE-STATIC-ZONE-REGISTRATION-1 -->
+
+Static zone discovery is explicit. The kernel does not rely on linker-section
+collection for zone registration in the current architecture line.
+
+Each subsystem that declares static zones exposes one local registration hook:
+
+```rust
+pub(crate) fn register_zones() -> Result<(), ZoneError>;
+```
+
+The subsystem aggregate owns the single boot-time list:
+
+```rust
+pub fn register_all() -> Result<(), ZoneError> {
+    process::register_zones()?;
+    thread::register_zones()?;
+    vm::register_zones()?;
+    page_backed::register_zones()?;
+    mount::register_zones()?;
+    vfs::register_zones()?;
+    tty::register_zones()?;
+    Ok(())
+}
+```
+
+`CoreInit` calls this aggregate exactly once on the BSP after
+`tx_substrate::init::<P>()` has initialized epoch/zone runtime state and before
+any AP is started, any zone reservation is attempted by semantic subsystems, or
+any long-lived subsystem object is published. Registration is idempotent for the
+same static `Zone<T>` so tests and smoke paths may call the aggregate again,
+but production boot treats the aggregate as a fixed manifest rather than as
+dynamic discovery.
+
+AP initialization never registers zones. `tx_substrate::init_on_ap(cpu)` only
+initializes per-CPU epoch/zone local state for zones already registered by the
+BSP manifest. Adding a new static zone requires adding its type to its
+subsystem's `register_zones()` hook and, if the subsystem is new, adding that
+hook to the aggregate `register_all()` list.
+
+Late registration is not part of normal semantic operation. A zone that has not
+been registered by the BSP manifest is unavailable and `reserve_for<T>()` fails
+with `ZoneError::NotRegistered`. This keeps compact zone IDs stable, gives AP
+bucket initialization a closed set to prepare, and makes missing zone ownership
+visible during boot or tests instead of silently depending on first use.
+
+The explicit manifest is deliberately chosen over linker-section collection:
+
+| Strategy | Decision | Reason |
+|---|---|---|
+| explicit `register_all()` | accepted | reviewable boot order, no linker-script dependency, deterministic tests |
+| macro-assisted per-subsystem hook | allowed later | may reduce boilerplate while still feeding the explicit aggregate |
+| linker-section auto-registration | rejected for now | hides ownership/order and creates board/linker coupling before it is needed |
+
+---
+
+## 10. What To Import From The Drafts
 <!-- txdoc:EBR-ZONE-WHAT-TO-IMPORT-FROM-THE-DRAFTS-1 -->
 
 Keep:
@@ -621,7 +687,7 @@ Reject:
 
 ---
 
-## 10. Review Checklist
+## 11. Review Checklist
 <!-- txdoc:EBR-ZONE-REVIEW-CHECKLIST-1 -->
 
 When introducing a new zone-backed type:
@@ -635,10 +701,13 @@ When introducing a new zone-backed type:
 7. Ensure no witness or guard crosses a step, await, or thread boundary.
 8. Ensure destructor work is compatible with EBR-delayed reclamation and
    bounded-work draining.
+9. Add every static `Zone<T>` to its subsystem `register_zones()` hook and to
+   the aggregate `register_all()` manifest before any reservation path can use
+   it.
 
 ---
 
-## 11. Short Form
+## 12. Short Form
 <!-- txdoc:EBR-ZONE-SHORT-FORM-1 -->
 
 Policy-based zone is a substrate implementation technique, not an upper

@@ -14,9 +14,15 @@ use crate::process::structure::{reset_pid_counter_for_test, ExitStatus, Pgid};
 use crate::process::{
     bootstrap_init_process, step_exit_group, step_fork, step_setpgid, step_setsid, ProcessIdentity,
 };
-use crate::signal::{step_kill_pgrp, Signum};
+use crate::signal::{deliver_tty_dispatch, step_kill_pgrp, DispatchOutcome, Signum};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
+use crate::tty::execution::{
+    step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocnotty_for_process,
+    step_ioctl_tiocsctty_for_process, step_ioctl_tiocspgrp_for_process, step_read_for_process,
+    step_write_for_process, IoctlCaller, SignalTarget,
+};
+use crate::tty::structure::termios::TOSTOP;
 use crate::tty::structure::{SessionPgrp, TtyIdentity, TtyKind, TtyPayload};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
@@ -218,6 +224,151 @@ fn leader_pending(proc_cap: &Cap<ProcessIdentity>, sig: Signum) -> bool {
 }
 
 #[test]
+fn ioctl_caller_from_process_reflects_live_process_topology() {
+    let _g = setup();
+    let init = fresh_init();
+    let tty = fresh_tty("ttyS-callers");
+
+    let session = init.pgrp_cap().session_cap();
+    tty.bind_session_pgrp_typed(&session, &init.pgrp_cap());
+    *session.controlling_tty.lock() = Some(tty.downgrade());
+
+    let caller = IoctlCaller::from_process(&init).expect("live caller");
+    assert_eq!(caller.session_id, session.sid.0);
+    assert_eq!(caller.pgrp_id, init.pgrp_cap().pgid.0);
+    assert!(caller.is_session_leader);
+    assert!(caller.has_controlling_tty);
+    assert!(caller.in_foreground);
+    assert!(caller.pgrp.is_some());
+}
+
+#[test]
+fn process_aware_tiocsctty_binds_tty_and_session_mirror() {
+    let _g = setup();
+    let init = fresh_init();
+    let tty = fresh_tty("ttyS-bind-proc");
+    let guard = tx_substrate::epoch::guard();
+
+    assert_eq!(
+        step_ioctl_tiocsctty_for_process(&tty, &init, &guard),
+        StepOutcome::Done(crate::tty::execution::IoctlSideEffect {
+            session_ctl_fired: true,
+            signal: None,
+        })
+    );
+    drop(guard);
+
+    let session = init.pgrp_cap().session_cap();
+    let binding = tty.session_pgrp().expect("binding installed");
+    assert_eq!(binding.session_id, session.sid.0);
+    assert_eq!(binding.foreground_pgid, init.pgrp_cap().pgid.0);
+    assert!(session.has_controlling_tty());
+    assert_eq!(
+        session.controlling_tty_cap().expect("mirror set").key(),
+        tty.key()
+    );
+}
+
+#[test]
+fn process_aware_tiocnotty_clears_tty_and_session_links() {
+    let _g = setup();
+    let init = fresh_init();
+    let tty = fresh_tty("ttyS-detach-proc");
+    let guard = tx_substrate::epoch::guard();
+
+    let _ = step_ioctl_tiocsctty_for_process(&tty, &init, &guard);
+    assert!(tty.session_pgrp().is_some());
+    assert!(init.pgrp_cap().session_cap().has_controlling_tty());
+
+    assert_eq!(
+        step_ioctl_tiocnotty_for_process(&tty, &init, &guard),
+        StepOutcome::Done(crate::tty::execution::IoctlSideEffect {
+            session_ctl_fired: true,
+            signal: None,
+        })
+    );
+
+    assert!(tty.session_pgrp().is_none());
+    assert!(!init.pgrp_cap().session_cap().has_controlling_tty());
+}
+
+#[test]
+fn process_aware_tiocspgrp_rebinds_foreground_to_typed_target() {
+    let _g = setup();
+    let init = fresh_init();
+    let child = step_fork::<TestPmap>(&init).expect("fork");
+    step_setpgid(&child, Pgid(child.pid.0)).expect("child pgrp");
+    let child_pgrp = child.pgrp_cap();
+
+    let tty = fresh_tty("ttyS-fg-rebind");
+    let guard = tx_substrate::epoch::guard();
+    let _ = step_ioctl_tiocsctty_for_process(&tty, &init, &guard);
+
+    assert_eq!(
+        step_ioctl_tiocspgrp_for_process(&tty, &init, &child_pgrp, &guard),
+        StepOutcome::Done(crate::tty::execution::IoctlSideEffect {
+            session_ctl_fired: true,
+            signal: None,
+        })
+    );
+    drop(guard);
+
+    let rebound = tty.foreground_pgrp_cap().expect("typed fg pgrp");
+    assert_eq!(rebound.key(), child_pgrp.key());
+    assert_eq!(
+        tty.session_pgrp().expect("binding present").foreground_pgid,
+        child_pgrp.pgid.0
+    );
+}
+
+#[test]
+fn step_read_for_process_posts_sigttin_to_background_caller_pgrp() {
+    let _g = setup();
+    let init = fresh_init();
+    let child = step_fork::<TestPmap>(&init).expect("fork");
+    step_setpgid(&child, Pgid(child.pid.0)).expect("child pgrp");
+
+    let tty = fresh_tty("ttyS-bg-read");
+    let guard = tx_substrate::epoch::guard();
+    let _ = step_ioctl_tiocsctty_for_process(&tty, &init, &guard);
+
+    let mut out = [0u8; 1];
+    assert_eq!(
+        step_read_for_process(&tty, &mut out, &child, &guard),
+        StepOutcome::Err(crate::execution::Errno::EIO)
+    );
+    assert!(leader_pending(&child, Signum::SIGTTIN));
+}
+
+#[test]
+fn step_write_for_process_posts_sigttou_to_background_caller_pgrp() {
+    let _g = setup();
+    let init = fresh_init();
+    let child = step_fork::<TestPmap>(&init).expect("fork");
+    step_setpgid(&child, Pgid(child.pid.0)).expect("child pgrp");
+
+    let tty = fresh_tty("ttyS-bg-write");
+    let guard = tx_substrate::epoch::guard();
+    let _ = step_ioctl_tiocsctty_for_process(&tty, &init, &guard);
+
+    let mut termios = match step_ioctl_tcgets(&tty, &guard) {
+        StepOutcome::Done(termios) => termios,
+        other => panic!("tcgets failed: {other:?}"),
+    };
+    termios.c_lflag |= TOSTOP;
+    match step_ioctl_tcsets(&tty, termios, &guard) {
+        StepOutcome::Done(_) => {}
+        other => panic!("tcsets failed: {other:?}"),
+    }
+
+    assert_eq!(
+        step_write_for_process(&tty, b"x", &child, &guard),
+        StepOutcome::Err(crate::execution::Errno::EIO)
+    );
+    assert!(leader_pending(&child, Signum::SIGTTOU));
+}
+
+#[test]
 fn session_leader_exit_with_controlling_tty_fires_sighup_sigcont_and_clears_binding() {
     let _g = setup();
     let init = fresh_init();
@@ -370,6 +521,37 @@ fn session_leader_exit_with_tty_but_no_fg_pgrp_clears_binding_without_signal() {
         "tty.session_pgrp must clear regardless of fg-pgrp upgrade"
     );
     assert!(!session.has_controlling_tty());
+}
+
+#[test]
+fn step_hangup_exposes_typed_session_leader_pgrp_dispatch() {
+    let _g = setup();
+    let init = fresh_init();
+    let tty = fresh_tty("ttyS-hup-typed");
+    let session = init.pgrp_cap().session_cap();
+    let pgrp = init.pgrp_cap();
+    let guard = tx_substrate::epoch::guard();
+
+    tty.bind_session_pgrp_typed(&session, &pgrp);
+
+    let outcome = match crate::tty::execution::step_hangup(&tty, &guard) {
+        StepOutcome::Done(outcome) => outcome,
+        other => panic!("hangup failed: {other:?}"),
+    };
+    drop(guard);
+
+    let hup = outcome.hup_signal.expect("SIGHUP dispatch");
+    match hup.target {
+        SignalTarget::SessionLeaderProcessGroup { pgid, pgrp } => {
+            assert_eq!(pgid, session.sid.0);
+            assert!(pgrp.is_some(), "typed leader pgrp is available");
+        }
+        other => panic!("unexpected target: {other:?}"),
+    }
+
+    let delivered = deliver_tty_dispatch(&init, hup).expect("live source");
+    assert_eq!(delivered, DispatchOutcome::Delivered { count: 1 });
+    assert!(leader_pending(&init, Signum::SIGHUP));
 }
 
 #[test]

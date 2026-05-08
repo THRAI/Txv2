@@ -12,7 +12,8 @@ use crate::page_backed::FsPageBacking;
 use crate::tty;
 
 use super::structure::{
-    Credential, DirCursor, DirEntry, FsObjectId, InodeMeta, OpenFile, RNodeBacking, StructPayload,
+    Credential, DirCursor, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileIoctl,
+    OpenFileIoctlCaller, OpenFileIoctlResult, RNodeBacking, StructPayload,
 };
 
 /// Filesystem backend trait. The boundary tx-ext4, tmpfs, devfs, etc.
@@ -365,6 +366,171 @@ impl OpenFile {
             RNodeBacking::PageBacked { .. }
             | RNodeBacking::Symlink { .. }
             | RNodeBacking::Projected => StepOutcome::Err(Errno::ENOSYS),
+        }
+    }
+
+    /// Dispatch a typed ioctl against this file's RNode backing.
+    ///
+    /// This is the VFS-side bridge between future syscall request-number
+    /// decoding and the already-typed subsystem helpers. The day-1 slice
+    /// only wires TTY-backed files; other backings keep the existing
+    /// "not implemented at this seam" behavior.
+    pub fn step_ioctl(
+        &self,
+        caller: OpenFileIoctlCaller<'_>,
+        request: OpenFileIoctl<'_>,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<OpenFileIoctlResult> {
+        match self.rnode.backing() {
+            RNodeBacking::StructBacked { payload } => match payload {
+                StructPayload::Tty(tty) => step_tty_ioctl(tty, caller, request, guard),
+                StructPayload::CharDevice(_) => StepOutcome::Err(Errno::ENOSYS),
+                // Pipe was added on main; ioctl on a pipe returns
+                // ENOTTY (matches Linux behaviour).
+                StructPayload::Pipe { .. } => StepOutcome::Err(Errno::ENOTTY),
+            },
+            RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
+            RNodeBacking::PageBacked { .. }
+            | RNodeBacking::Symlink { .. }
+            | RNodeBacking::Projected => StepOutcome::Err(Errno::ENOSYS),
+        }
+    }
+}
+
+fn step_tty_ioctl(
+    tty_id: &tx_substrate::zone::Cap<crate::tty::structure::TtyIdentity>,
+    caller: OpenFileIoctlCaller<'_>,
+    request: OpenFileIoctl<'_>,
+    guard: &Guard<'_>,
+) -> StepOutcome<OpenFileIoctlResult> {
+    match request {
+        OpenFileIoctl::Tcgets => match tty::execution::step_ioctl_tcgets(tty_id, guard) {
+            StepOutcome::Done(termios) => StepOutcome::Done(OpenFileIoctlResult::Termios(termios)),
+            StepOutcome::Advanced(termios) => {
+                StepOutcome::Advanced(OpenFileIoctlResult::Termios(termios))
+            }
+            StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
+            StepOutcome::AdvancedThenBlocked(termios, token) => {
+                StepOutcome::AdvancedThenBlocked(OpenFileIoctlResult::Termios(termios), token)
+            }
+            StepOutcome::Err(err) => StepOutcome::Err(err),
+        },
+        OpenFileIoctl::Tcsets { termios } => {
+            match tty::execution::step_ioctl_tcsets(tty_id, termios, guard) {
+                StepOutcome::Done(side_effect) => {
+                    StepOutcome::Done(OpenFileIoctlResult::SideEffect(side_effect))
+                }
+                StepOutcome::Advanced(side_effect) => {
+                    StepOutcome::Advanced(OpenFileIoctlResult::SideEffect(side_effect))
+                }
+                StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
+                StepOutcome::AdvancedThenBlocked(side_effect, token) => {
+                    StepOutcome::AdvancedThenBlocked(
+                        OpenFileIoctlResult::SideEffect(side_effect),
+                        token,
+                    )
+                }
+                StepOutcome::Err(err) => StepOutcome::Err(err),
+            }
+        }
+        OpenFileIoctl::Tiocgpgrp => match tty::execution::step_ioctl_tiocgpgrp(tty_id, guard) {
+            StepOutcome::Done(pgid) => StepOutcome::Done(OpenFileIoctlResult::Pgrp(pgid)),
+            StepOutcome::Advanced(pgid) => StepOutcome::Advanced(OpenFileIoctlResult::Pgrp(pgid)),
+            StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
+            StepOutcome::AdvancedThenBlocked(pgid, token) => {
+                StepOutcome::AdvancedThenBlocked(OpenFileIoctlResult::Pgrp(pgid), token)
+            }
+            StepOutcome::Err(err) => StepOutcome::Err(err),
+        },
+        OpenFileIoctl::Tiocspgrp { new_pgrp } => {
+            match tty::execution::step_ioctl_tiocspgrp_for_process(
+                tty_id,
+                caller.process(),
+                new_pgrp,
+                guard,
+            ) {
+                StepOutcome::Done(side_effect) => {
+                    StepOutcome::Done(OpenFileIoctlResult::SideEffect(side_effect))
+                }
+                StepOutcome::Advanced(side_effect) => {
+                    StepOutcome::Advanced(OpenFileIoctlResult::SideEffect(side_effect))
+                }
+                StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
+                StepOutcome::AdvancedThenBlocked(side_effect, token) => {
+                    StepOutcome::AdvancedThenBlocked(
+                        OpenFileIoctlResult::SideEffect(side_effect),
+                        token,
+                    )
+                }
+                StepOutcome::Err(err) => StepOutcome::Err(err),
+            }
+        }
+        OpenFileIoctl::Tiocgwinsz => match tty::execution::step_ioctl_tiocgwinsz(tty_id, guard) {
+            StepOutcome::Done(winsize) => StepOutcome::Done(OpenFileIoctlResult::Winsize(winsize)),
+            StepOutcome::Advanced(winsize) => {
+                StepOutcome::Advanced(OpenFileIoctlResult::Winsize(winsize))
+            }
+            StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
+            StepOutcome::AdvancedThenBlocked(winsize, token) => {
+                StepOutcome::AdvancedThenBlocked(OpenFileIoctlResult::Winsize(winsize), token)
+            }
+            StepOutcome::Err(err) => StepOutcome::Err(err),
+        },
+        OpenFileIoctl::Tiocswinsz { winsize } => {
+            match tty::execution::step_ioctl_tiocswinsz(tty_id, winsize, guard) {
+                StepOutcome::Done(side_effect) => {
+                    StepOutcome::Done(OpenFileIoctlResult::SideEffect(side_effect))
+                }
+                StepOutcome::Advanced(side_effect) => {
+                    StepOutcome::Advanced(OpenFileIoctlResult::SideEffect(side_effect))
+                }
+                StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
+                StepOutcome::AdvancedThenBlocked(side_effect, token) => {
+                    StepOutcome::AdvancedThenBlocked(
+                        OpenFileIoctlResult::SideEffect(side_effect),
+                        token,
+                    )
+                }
+                StepOutcome::Err(err) => StepOutcome::Err(err),
+            }
+        }
+        OpenFileIoctl::Tiocsctty => {
+            match tty::execution::step_ioctl_tiocsctty_for_process(tty_id, caller.process(), guard)
+            {
+                StepOutcome::Done(side_effect) => {
+                    StepOutcome::Done(OpenFileIoctlResult::SideEffect(side_effect))
+                }
+                StepOutcome::Advanced(side_effect) => {
+                    StepOutcome::Advanced(OpenFileIoctlResult::SideEffect(side_effect))
+                }
+                StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
+                StepOutcome::AdvancedThenBlocked(side_effect, token) => {
+                    StepOutcome::AdvancedThenBlocked(
+                        OpenFileIoctlResult::SideEffect(side_effect),
+                        token,
+                    )
+                }
+                StepOutcome::Err(err) => StepOutcome::Err(err),
+            }
+        }
+        OpenFileIoctl::Tiocnotty => {
+            match tty::execution::step_ioctl_tiocnotty_for_process(tty_id, caller.process(), guard)
+            {
+                StepOutcome::Done(side_effect) => {
+                    StepOutcome::Done(OpenFileIoctlResult::SideEffect(side_effect))
+                }
+                StepOutcome::Advanced(side_effect) => {
+                    StepOutcome::Advanced(OpenFileIoctlResult::SideEffect(side_effect))
+                }
+                StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
+                StepOutcome::AdvancedThenBlocked(side_effect, token) => {
+                    StepOutcome::AdvancedThenBlocked(
+                        OpenFileIoctlResult::SideEffect(side_effect),
+                        token,
+                    )
+                }
+                StepOutcome::Err(err) => StepOutcome::Err(err),
+            }
         }
     }
 }

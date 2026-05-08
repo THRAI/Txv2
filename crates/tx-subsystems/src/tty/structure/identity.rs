@@ -16,7 +16,7 @@
 
 use tx_reactor::wait::Channel;
 use tx_substrate::bus::{RawPort, RawQueue};
-use tx_substrate::zone::PayloadCap;
+use tx_substrate::zone::{Dead, Entity, PayloadCap};
 use tx_substrate::{AtomicSlot, SpinMutex};
 
 use crate::wait_carrier;
@@ -329,5 +329,81 @@ impl TtyIdentity {
 
     pub fn clear_session_pgrp(&self) -> Option<SessionPgrp> {
         self.session_pgrp.swap(None)
+    }
+}
+
+impl Entity for TtyIdentity {
+    type OperationalEvidence = PayloadCap<TtyPayload>;
+
+    fn upgrade_operational(
+        identity: &tx_substrate::zone::Cap<Self>,
+    ) -> Result<Self::OperationalEvidence, Dead> {
+        identity.live_payload().ok_or(Dead)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
+    use crate::execution::{Guard, StepOutcome};
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use tx_substrate::zone::{self, OperationalCapExt, PayloadCap};
+
+    struct NoopOps;
+
+    impl CharDeviceOps for NoopOps {
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+            StepOutcome::Done(0)
+        }
+
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+            StepOutcome::Done(bytes.len())
+        }
+    }
+
+    static NOOP_OPS: NoopOps = NoopOps;
+    static NOOP_BINDING: CharDeviceBinding = CharDeviceBinding {
+        devt: DevT::new(4, 99),
+        name: "tty-operational-test",
+        ops: &NOOP_OPS,
+    };
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        tx_substrate::testing::init_host_for_test_once();
+        crate::zones::register_all().expect("kernel zones");
+        crate::tty::structure::registry::reset_for_tests();
+        guard
+    }
+
+    #[test]
+    fn tty_operational_upgrade_returns_live_payload_and_fails_after_hangup() {
+        let _g = setup();
+
+        let id_res = zone::reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = zone::reserve_for::<TtyPayload>().expect("tty payload reservation");
+
+        let tty = zone::sign_for(
+            id_res,
+            TtyIdentity::new(TtyKind::SerialHardware, 9, "ttyS-operational"),
+        );
+        let payload = PayloadCap::from_cap(zone::sign_for(
+            payload_res,
+            TtyPayload::new_hardware(&NOOP_BINDING),
+        ));
+        let expected_key = payload.key();
+        tty.install_payload(payload);
+
+        let operational = tty
+            .upgrade_operational()
+            .expect("live tty should upgrade to payload evidence");
+        assert_eq!(operational.key(), expected_key);
+
+        let _ = tty.take_payload();
+        assert!(
+            tty.upgrade_operational().is_err(),
+            "hangup-withdrawn tty must not yield operational evidence"
+        );
     }
 }

@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use super::retired::RetiredList;
 
 /// Per-CPU EBR state.
+#[repr(align(64))]
 pub(crate) struct CpuLocalEpochState {
     /// Set once the CPU has joined the epoch domain.
     initialized: AtomicBool,
@@ -67,6 +68,10 @@ impl CpuLocalEpochState {
 
     pub(crate) fn current(&self) -> u64 {
         self.local_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn retired_count(&self) -> usize {
+        unsafe { (*self.retired.get()).count }
     }
 
     pub(crate) fn retired_ptr(&self) -> *mut RetiredList {

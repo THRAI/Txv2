@@ -10,7 +10,7 @@ use core::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::guard::Guard;
 use super::local::CpuLocalEpochState;
-use super::retired::{append_index, RetiredNode};
+use super::retired::{append_index, PerCpuRetiredPool};
 use tx_hal::{CpuId, CpuPinGuard, IrqIf, PercpuIf, SmpIf};
 
 const INITIAL_EPOCH: u64 = 1;
@@ -41,15 +41,40 @@ pub struct DrainStats {
     pub active_guards: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuEpochSummary {
+    pub cpu_id: CpuId,
+    pub initialized: bool,
+    pub local_epoch: u64,
+    pub retired_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EpochSummary {
+    pub initialized: bool,
+    pub global_epoch: u64,
+    pub active_guards: usize,
+    pub possible_cpus: usize,
+}
+
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+impl<T> CachePadded<T> {
+    const fn new(value: T) -> Self {
+        Self(value)
+    }
+}
+
 pub(crate) struct EpochDomain {
     /// Becomes true once BSP initialization has installed platform hooks.
     initialized: AtomicBool,
     /// Monotonic epoch used to decide when retired nodes become reclaimable.
-    global_epoch: AtomicU64,
+    global_epoch: CachePadded<AtomicU64>,
     /// Debug/accounting counter for currently live guards.
-    active_guards: AtomicUsize,
+    active_guards: CachePadded<AtomicUsize>,
     /// Number of CPUs the platform says may participate in EBR.
-    possible_cpus: AtomicUsize,
+    possible_cpus: CachePadded<AtomicUsize>,
     /// Platform callbacks are installed once at BSP init and then read lock-free.
     hooks: UnsafeCell<PlatformHooks>,
     /// Per-CPU guard state and retired-node list heads.
@@ -68,9 +93,9 @@ impl EpochDomain {
     const fn new() -> Self {
         Self {
             initialized: AtomicBool::new(false),
-            global_epoch: AtomicU64::new(INITIAL_EPOCH),
-            active_guards: AtomicUsize::new(0),
-            possible_cpus: AtomicUsize::new(1),
+            global_epoch: CachePadded::new(AtomicU64::new(INITIAL_EPOCH)),
+            active_guards: CachePadded::new(AtomicUsize::new(0)),
+            possible_cpus: CachePadded::new(AtomicUsize::new(1)),
             hooks: UnsafeCell::new(PlatformHooks::default()),
             cpu_states: [const { CpuLocalEpochState::new() }; MAX_EPOCH_CPUS],
             lock: SpinLock::new(),
@@ -91,9 +116,9 @@ impl EpochDomain {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| EpochError::AlreadyInitialized)?;
 
-        self.global_epoch.store(INITIAL_EPOCH, Ordering::Release);
-        self.active_guards.store(0, Ordering::Release);
-        self.possible_cpus.store(possible_cpus, Ordering::Release);
+        self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
+        self.active_guards.0.store(0, Ordering::Release);
+        self.possible_cpus.0.store(possible_cpus, Ordering::Release);
 
         let _guard = self.lock.lock();
         unsafe {
@@ -110,9 +135,9 @@ impl EpochDomain {
 
     fn init_for_test(&'static self) {
         self.initialized.store(true, Ordering::Release);
-        self.global_epoch.store(INITIAL_EPOCH, Ordering::Release);
-        self.active_guards.store(0, Ordering::Release);
-        self.possible_cpus.store(1, Ordering::Release);
+        self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
+        self.active_guards.0.store(0, Ordering::Release);
+        self.possible_cpus.0.store(1, Ordering::Release);
 
         let _guard = self.lock.lock();
         unsafe {
@@ -134,7 +159,7 @@ impl EpochDomain {
     }
 
     fn init_cpu(&'static self, cpu: CpuId) -> Result<(), EpochError> {
-        if cpu.0 >= self.possible_cpus.load(Ordering::Acquire) {
+        if cpu.0 >= self.possible_cpus.0.load(Ordering::Acquire) {
             return Err(EpochError::InvalidCpu);
         }
         self.cpu_states[cpu.0].init();
@@ -163,9 +188,9 @@ impl EpochDomain {
             "epoch::guard current CPU has not called epoch::init_on_ap/init_on_bsp"
         );
 
-        let current_epoch = self.global_epoch.load(Ordering::Acquire);
+        let current_epoch = self.global_epoch.0.load(Ordering::Acquire);
         local.enter(current_epoch);
-        self.active_guards.fetch_add(1, Ordering::AcqRel);
+        self.active_guards.0.fetch_add(1, Ordering::AcqRel);
         // Publish the local epoch before any protected load can float above the
         // guard acquisition. This is the core EBR reader-side ordering rule.
         fence(Ordering::SeqCst);
@@ -173,7 +198,7 @@ impl EpochDomain {
     }
 
     pub(crate) fn leave_guard(&'static self) {
-        self.active_guards.fetch_sub(1, Ordering::AcqRel);
+        self.active_guards.0.fetch_sub(1, Ordering::AcqRel);
     }
 
     unsafe fn retire_raw(
@@ -196,22 +221,55 @@ impl EpochDomain {
             return Err(EpochError::CpuNotInitialized);
         }
 
-        let retired_at_epoch = self.global_epoch.load(Ordering::Relaxed);
-        let state = unsafe { &mut *self.state.get() };
+        let retired_at_epoch = self.global_epoch.0.load(Ordering::Relaxed);
+        let mut state = unsafe { &mut *self.state.get() };
         // The current CPU is pinned, so this allocation touches only the
-        // current CPU's fixed node slice.
-        let index = state
-            .alloc_node(cpu_id)
-            .ok_or(EpochError::RetiredNodePoolExhausted)?;
-        state.nodes[index].ptr = ptr;
-        state.nodes[index].reclaim_fn = reclaim_fn;
-        state.nodes[index].retired_at_epoch = retired_at_epoch;
+        // current CPU's independent retired pool.
+        let mut index = state.alloc_node(cpu_id);
+        drop(cpu_pin);
+
+        if index.is_none() {
+            let _ = self.try_drain(DEFAULT_DRAIN_BATCH);
+
+            let cpu_pin = (hooks.pin_current_cpu)();
+            let cpu_id = cpu_pin.cpu_id();
+            let local = self.cpu_state(cpu_id).ok_or(EpochError::InvalidCpu)?;
+            if !local.is_initialized() {
+                return Err(EpochError::CpuNotInitialized);
+            }
+            state = unsafe { &mut *self.state.get() };
+            index = state.alloc_node(cpu_id);
+
+            let index = index.ok_or(EpochError::RetiredNodePoolExhausted)?;
+            let pool = state
+                .pool_mut(cpu_id)
+                .expect("retire_raw CPU must have a retired pool");
+            pool.nodes[index].ptr = ptr;
+            pool.nodes[index].reclaim_fn = reclaim_fn;
+            pool.nodes[index].retired_at_epoch = retired_at_epoch;
+
+            let retired = unsafe { &mut *local.retired_ptr() };
+            retired.push(&mut pool.nodes, index);
+            let should_try_drain = retired.count > RETIRE_THRESHOLD;
+            drop(cpu_pin);
+            if should_try_drain {
+                let _ = self.try_drain(DEFAULT_DRAIN_BATCH);
+            }
+            return Ok(());
+        }
+
+        let index = index.expect("checked above");
+        let pool = state
+            .pool_mut(cpu_id)
+            .expect("retire_raw CPU must have a retired pool");
+        pool.nodes[index].ptr = ptr;
+        pool.nodes[index].reclaim_fn = reclaim_fn;
+        pool.nodes[index].retired_at_epoch = retired_at_epoch;
 
         let retired = unsafe { &mut *local.retired_ptr() };
-        retired.push(&mut state.nodes, index);
+        retired.push(&mut pool.nodes, index);
         let should_try_drain = retired.count > RETIRE_THRESHOLD;
 
-        drop(cpu_pin);
         if should_try_drain {
             let _ = self.try_drain(DEFAULT_DRAIN_BATCH);
         }
@@ -224,7 +282,7 @@ impl EpochDomain {
         }
 
         let mut stats = DrainStats {
-            active_guards: self.active_guards.load(Ordering::Acquire),
+            active_guards: self.active_guards.0.load(Ordering::Acquire),
             ..DrainStats::default()
         };
 
@@ -234,7 +292,7 @@ impl EpochDomain {
 
         // Nodes retired in epoch E are reclaimable only once the global epoch
         // reaches at least E + 2.
-        let safe_epoch = self.global_epoch.load(Ordering::Acquire);
+        let safe_epoch = self.global_epoch.0.load(Ordering::Acquire);
         let mut reclaim_head = None;
         let mut reclaim_tail = None;
         let mut reclaim_count = 0usize;
@@ -242,7 +300,7 @@ impl EpochDomain {
         let hooks = self.hooks();
         let cpu_pin = (hooks.pin_current_cpu)();
         let cpu_id = cpu_pin.cpu_id();
-        if cpu_id.0 >= self.possible_cpus.load(Ordering::Acquire)
+        if cpu_id.0 >= self.possible_cpus.0.load(Ordering::Acquire)
             || !(hooks.is_cpu_online)(cpu_id)
             || !self.cpu_states[cpu_id.0].is_initialized()
         {
@@ -251,6 +309,9 @@ impl EpochDomain {
 
         {
             let state = unsafe { &mut *self.state.get() };
+            let pool = state
+                .pool_mut(cpu_id)
+                .expect("try_drain CPU must have a retired pool");
             let retired = unsafe { &mut *self.cpu_states[cpu_id.0].retired_ptr() };
             let mut remaining_head = None;
             let mut remaining_tail = None;
@@ -258,19 +319,14 @@ impl EpochDomain {
 
             // Drain only the current CPU's retired list. Other CPUs reclaim
             // their own nodes when they hit their drain path.
-            while let Some(index) = retired.pop(&mut state.nodes) {
-                let expired = safe_epoch >= state.nodes[index].retired_at_epoch.saturating_add(2);
+            while let Some(index) = retired.pop(&mut pool.nodes) {
+                let expired = safe_epoch >= pool.nodes[index].retired_at_epoch.saturating_add(2);
                 if reclaim_count < budget && expired {
-                    append_index(
-                        &mut state.nodes,
-                        &mut reclaim_head,
-                        &mut reclaim_tail,
-                        index,
-                    );
+                    append_index(&mut pool.nodes, &mut reclaim_head, &mut reclaim_tail, index);
                     reclaim_count += 1;
                 } else {
                     append_index(
-                        &mut state.nodes,
+                        &mut pool.nodes,
                         &mut remaining_head,
                         &mut remaining_tail,
                         index,
@@ -289,12 +345,12 @@ impl EpochDomain {
     }
 
     fn try_advance_epoch(&'static self) -> bool {
-        let current = self.global_epoch.load(Ordering::Acquire);
+        let current = self.global_epoch.0.load(Ordering::Acquire);
         let hooks = self.hooks();
 
         // Epoch advance is allowed only if every online initialized CPU is
         // either outside a guard (`local == 0`) or already in the current epoch.
-        for cpu in 0..self.possible_cpus.load(Ordering::Acquire) {
+        for cpu in 0..self.possible_cpus.0.load(Ordering::Acquire) {
             let cpu_id = CpuId(cpu);
             if !(hooks.is_cpu_online)(cpu_id) || !self.cpu_states[cpu].is_initialized() {
                 continue;
@@ -307,6 +363,7 @@ impl EpochDomain {
         }
 
         self.global_epoch
+            .0
             .compare_exchange(
                 current,
                 current.saturating_add(1),
@@ -320,8 +377,11 @@ impl EpochDomain {
         let mut reclaimed = 0usize;
         while let Some(index) = head {
             let state = unsafe { &mut *self.state.get() };
-            debug_assert!(state.index_belongs_to_cpu(cpu, index));
-            let node = &mut state.nodes[index];
+            let pool = state
+                .pool_mut(cpu)
+                .expect("reclaim_list CPU must have a retired pool");
+            debug_assert!(index < RETIRED_NODE_POOL_CAPACITY);
+            let node = &mut pool.nodes[index];
             let ptr = node.ptr;
             let reclaim_fn = node.reclaim_fn;
             let next = node.next;
@@ -341,7 +401,7 @@ impl EpochDomain {
     }
 
     fn cpu_state(&'static self, cpu: CpuId) -> Option<&'static CpuLocalEpochState> {
-        if cpu.0 < self.possible_cpus.load(Ordering::Acquire) {
+        if cpu.0 < self.possible_cpus.0.load(Ordering::Acquire) {
             Some(&self.cpu_states[cpu.0])
         } else {
             None
@@ -354,15 +414,34 @@ impl EpochDomain {
 
     unsafe fn reset_for_test(&'static self) {
         self.initialized.store(false, Ordering::Release);
-        self.global_epoch.store(INITIAL_EPOCH, Ordering::Release);
-        self.active_guards.store(0, Ordering::Release);
-        self.possible_cpus.store(1, Ordering::Release);
+        self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
+        self.active_guards.0.store(0, Ordering::Release);
+        self.possible_cpus.0.store(1, Ordering::Release);
         let _guard = self.lock.lock();
         *self.hooks.get() = PlatformHooks::default();
         (*self.state.get()).reset();
         for cpu in 0..MAX_EPOCH_CPUS {
             self.cpu_states[cpu].reset();
         }
+    }
+
+    fn summary(&'static self) -> EpochSummary {
+        EpochSummary {
+            initialized: self.initialized.load(Ordering::Acquire),
+            global_epoch: self.global_epoch.0.load(Ordering::Acquire),
+            active_guards: self.active_guards.0.load(Ordering::Acquire),
+            possible_cpus: self.possible_cpus.0.load(Ordering::Acquire),
+        }
+    }
+
+    fn cpu_summary(&'static self, cpu: CpuId) -> Option<CpuEpochSummary> {
+        let state = self.cpu_state(cpu)?;
+        Some(CpuEpochSummary {
+            cpu_id: cpu,
+            initialized: state.is_initialized(),
+            local_epoch: state.current(),
+            retired_count: state.retired_count(),
+        })
     }
 }
 
@@ -407,58 +486,33 @@ fn default_is_cpu_online(cpu: CpuId) -> bool {
 }
 
 struct DomainState {
-    /// Retired-node storage split into `MAX_EPOCH_CPUS` equal ranges.
-    nodes: [RetiredNode; RETIRED_NODE_POOL_CAPACITY * MAX_EPOCH_CPUS],
-    /// One freelist head per CPU range.
-    free_heads: [Option<usize>; MAX_EPOCH_CPUS],
+    /// One independent retired-node pool per CPU.
+    pools: [PerCpuRetiredPool; MAX_EPOCH_CPUS],
 }
 
 impl DomainState {
     const fn new() -> Self {
         Self {
-            nodes: [const { RetiredNode::empty() }; RETIRED_NODE_POOL_CAPACITY * MAX_EPOCH_CPUS],
-            free_heads: [None; MAX_EPOCH_CPUS],
+            pools: [const { PerCpuRetiredPool::new() }; MAX_EPOCH_CPUS],
         }
     }
 
     fn reset(&mut self) {
         for cpu in 0..MAX_EPOCH_CPUS {
-            let start = Self::cpu_start(CpuId(cpu));
-            let end = start + RETIRED_NODE_POOL_CAPACITY;
-            for index in start..end {
-                self.nodes[index].reset();
-                self.nodes[index].next = if index + 1 < end {
-                    Some(index + 1)
-                } else {
-                    None
-                };
-            }
-            self.free_heads[cpu] = Some(start);
+            self.pools[cpu].reset();
         }
     }
 
     fn alloc_node(&mut self, cpu: CpuId) -> Option<usize> {
-        let index = self.free_heads.get(cpu.0).copied().flatten()?;
-        debug_assert!(self.index_belongs_to_cpu(cpu, index));
-        self.free_heads[cpu.0] = self.nodes[index].next;
-        self.nodes[index].reset();
-        Some(index)
+        self.pools.get_mut(cpu.0)?.alloc_node()
     }
 
     fn free_node(&mut self, cpu: CpuId, index: usize) {
-        debug_assert!(self.index_belongs_to_cpu(cpu, index));
-        self.nodes[index].reset();
-        self.nodes[index].next = self.free_heads[cpu.0];
-        self.free_heads[cpu.0] = Some(index);
+        self.pools[cpu.0].free_node(index);
     }
 
-    const fn cpu_start(cpu: CpuId) -> usize {
-        cpu.0 * RETIRED_NODE_POOL_CAPACITY
-    }
-
-    fn index_belongs_to_cpu(&self, cpu: CpuId, index: usize) -> bool {
-        let start = Self::cpu_start(cpu);
-        index >= start && index < start + RETIRED_NODE_POOL_CAPACITY
+    fn pool_mut(&mut self, cpu: CpuId) -> Option<&mut PerCpuRetiredPool> {
+        self.pools.get_mut(cpu.0)
     }
 }
 
@@ -519,6 +573,14 @@ pub(crate) unsafe fn retire_raw(
 
 pub fn try_drain(budget: usize) -> DrainStats {
     GLOBAL_DOMAIN.try_drain(budget)
+}
+
+pub fn summary() -> EpochSummary {
+    GLOBAL_DOMAIN.summary()
+}
+
+pub fn cpu_summary(cpu: CpuId) -> Option<CpuEpochSummary> {
+    GLOBAL_DOMAIN.cpu_summary(cpu)
 }
 
 #[doc(hidden)]

@@ -33,12 +33,17 @@ Process, Signal, and full VFS integration land?
   - devfs/devpts projection helpers that can be wrapped by future VFS code
 - The implementation intentionally contains staging seams where the design
   expects other subsystems that do not exist yet:
-  - `SessionPgrp` currently stores numeric ids, not `Cap<Session>` plus
-    `Cap<ProcessGroup>`
-  - tty signal paths currently produce `SignalDispatch` descriptions instead of
-    calling the final Process/Signal delivery surface
+  - full syscall/fd-table ioctl entry wiring is still missing even though the
+    VFS-local `OpenFile::step_ioctl` tty dispatch surface now exists
   - `TtyPayload.termios` is staged as a published slot over `Termios`, not yet
     the final `AtomicSlot<Arc<Termios>>` shape from `TTY.md`
+  - non-canonical read completion only partially follows the design target:
+    `VMIN` is honored for the `VTIME == 0` slice, while timer-driven `VTIME`
+    behavior remains unimplemented
+  - `tcsets` still runs the ingest linearizer inline after publication, rather
+    than waking a reactor-scheduled synthetic ingest pass
+  - hardware tty ingest still relies on `step_poll_hardware_input()` as a
+    bridge, not full IRQ/reactor auto-wiring
   - `/dev/console` currently behaves through alias registration, not a fully
     separate finalized console integration path
   - full session cleanup, controlling-tty ownership, and VFS lifecycle hooks
@@ -46,6 +51,8 @@ Process, Signal, and full VFS integration land?
 - The current external surfaces that other modules should prefer are:
   - `tty::execution::{register_hardware, register_console_alias, step_openpty, step_read, step_write, step_ingest, step_hangup, step_master_close_last, step_ioctl_*}`
   - `tty::project::{open_ptmx, open_devfs_tty_by_name, devfs_rnode_by_name, devpts_rnode_by_index, open_file_for_tty}`
+  - `vfs::{OpenFileIoctl, OpenFileIoctlCaller}` plus
+    `OpenFile::step_ioctl(...)` for tty-backed open files
 - Verified tty-local implementation state before this note:
   - `cargo test -p tx-kernel tty -- --test-threads=1`
   - `cargo test -p tx-kernel --lib -- --test-threads=1`

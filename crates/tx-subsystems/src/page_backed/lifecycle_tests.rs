@@ -1,12 +1,13 @@
 use super::*;
 use crate::execution::{Errno, StepOutcome, WaitToken};
-use crate::mount::{DevId, MountOptions, MountPayload, SourceLabel};
+use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
 use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta};
 use alloc::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
+    crate::zones::register_all().expect("kernel zones");
     match tx_substrate::page_allocator::claim_zero_frame() {
         Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for PageBacked lifecycle tests: {error:?}"),
@@ -258,7 +259,7 @@ fn file_page_container(fs: Arc<LifecycleFs>, fs_object_id: FsObjectId) -> PageCo
     .expect("mount payload");
     PageContainer::new(
         PageContainerKind::File {
-            mount,
+            mount: MountPayloadPin::acquire(&tx_substrate::zone::PayloadCap::from_cap(mount)),
             fs_object_id,
         },
         4,

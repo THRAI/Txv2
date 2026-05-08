@@ -264,7 +264,16 @@ pub fn unpack_into_root_mount(
     bytes: &[u8],
     root_mount: &Cap<MountIdentity>,
 ) -> Result<UnpackStats, UnpackError> {
-    let payload = root_mount.payload().clone();
+    // Mount-identity payload is upgraded via `payload_cap()` on the
+    // post-merge API; `into_cap()` recovers a `Cap<MountPayload>`
+    // that the unpacker's downstream code expects.
+    let payload = root_mount
+        .payload_cap()
+        .map_err(|_| UnpackError::FsOp {
+            op: "payload_cap",
+            errno: Errno::EIO,
+        })?
+        .into_cap();
     let fs_ops = payload.fs_ops.clone();
     let fs_page_backing = payload.fs_page_backing.clone();
     let root_object_id = root_mount.root().fs_object_id();

@@ -738,6 +738,21 @@
   the Phase 6 fake driver can be deleted. Blocker: none for the
   follow-up; ELF loading + first userspace binary remain explicitly
   out of scope per the trio plan.
+- 2026-05-06 Zone static registration policy is now explicit and BSP-owned.
+  `EBR_ZONE_INTERFACE_v1` records the decision to use subsystem
+  `register_zones()` hooks plus one aggregate `register_all()` manifest, and to
+  reject linker-section auto-registration for now. `tx-kernel` now has a small
+  `zones` adapter module so `CoreInit`'s existing boot call to
+  `crate::zones::register_all()` resolves to `tx_subsystems::zones::register_all()`;
+  shutdown and bounded-maintenance hooks are exported through the same adapter.
+  The current manifest covers smoke, process, thread runtime, VM, PageBacked,
+  mount, VFS, and TTY zones. AP init remains registration-free: it initializes
+  local state for the BSP-registered zone set only. Verification:
+  `cargo check -p tx-kernel --offline`, `cargo test -p tx-substrate --test zone
+  --offline`, and `cargo fmt -p tx-kernel -p tx-subsystems --check` pass. Full
+  `cargo test -p tx-subsystems --offline` still fails in parallel tests with
+  pre-existing global epoch/zone nested-guard and lock-poison cascades, not a
+  static-registration compile failure.
 - 2026-05-05 cwd / chdir / getcwd VFS integration on branch
   `process-topology`. First VFS↔process seam: processes now carry a
   `Cap<DEntry>` cwd. New `step_chdir(target, new_cwd)` (returns

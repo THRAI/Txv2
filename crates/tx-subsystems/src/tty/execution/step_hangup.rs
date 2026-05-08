@@ -15,8 +15,16 @@ pub struct HangupOutcome {
     pub cont_signal: Option<SignalDispatch>,
 }
 
-pub fn step_hangup(tty: &Cap<TtyIdentity>, _guard: &Guard<'_>) -> StepOutcome<HangupOutcome> {
+pub fn step_hangup(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<HangupOutcome> {
     let binding = tty.session_pgrp();
+    let session_leader_pgrp = binding
+        .and_then(|binding| {
+            binding
+                .session
+                .as_ref()
+                .and_then(|weak| weak.upgrade(guard))
+        })
+        .and_then(|session| session.leader_pgrp_cap_with_guard(guard));
     if !tty.is_live() {
         return StepOutcome::Err(Errno::EIO);
     }
@@ -33,16 +41,10 @@ pub fn step_hangup(tty: &Cap<TtyIdentity>, _guard: &Guard<'_>) -> StepOutcome<Ha
         had_payload,
         hangup_fired: true,
         session_ctl_fired: true,
-        // SessionLeaderProcessGroup's typed pgrp is left None: the
-        // SessionPgrp binding carries only a Weak<Session> and
-        // Weak<ProcessGroup> for the *foreground* pgrp. The session-
-        // leader's pgrp would require walking session.members for
-        // pgid == session_leader_pgid; that lookup lands when the
-        // session→leader-pgrp index is wired.
         hup_signal: binding.map(|binding| SignalDispatch {
             target: SignalTarget::SessionLeaderProcessGroup {
                 pgid: binding.session_leader_pgid,
-                pgrp: None,
+                pgrp: session_leader_pgrp.map(|pgrp| pgrp.downgrade()),
             },
             signal: JobControlSignal::Hup,
         }),

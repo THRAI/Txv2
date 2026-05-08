@@ -35,6 +35,42 @@ unsafe impl<T: Send + Sync> Send for Cap<T> {}
 unsafe impl<T: Send + Sync> Sync for Cap<T> {}
 
 impl<T: 'static> Cap<T> {
+    pub(crate) fn try_retire_slot(slot: NonNull<Slot<T>>) {
+        let meta = unsafe { slot.as_ref().meta() };
+        loop {
+            let cur = meta.load(Ordering::Acquire);
+            if cur.retain() != RETAIN_SENTINEL_DEAD {
+                return;
+            }
+            if cur.state() != SlotState::Dead {
+                return;
+            }
+
+            // The sentinel blocks new upgrades. Moving to Retiring hands the
+            // slot to EBR; only the EBR callback may run T's destructor and
+            // return the slot to the Keg.
+            let new = cur.with_retain(0).with_state(SlotState::Retiring);
+            match meta.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    let retire_result =
+                        unsafe { epoch::retire_raw(slot.as_ptr() as *mut u8, reclaim_slot::<T>) };
+                    if retire_result.is_ok() {
+                        return;
+                    }
+
+                    let _ = epoch::drain_with_budget(64);
+                    unsafe { epoch::retire_raw(slot.as_ptr() as *mut u8, reclaim_slot::<T>) }
+                        .expect(
+                            "zone slot retire enqueue failed after bounded drain; \
+                             five-state zone design fail-fasts on retired-node pool exhaustion",
+                        );
+                    return;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
     pub(crate) unsafe fn from_slot(slot: NonNull<Slot<T>>) -> Self {
         let key = unsafe { slot.as_ref().key() };
         Self {
@@ -94,40 +130,7 @@ impl<T: 'static> Cap<T> {
     }
 
     fn try_retire(slot: NonNull<Slot<T>>) {
-        let meta = unsafe { slot.as_ref().meta() };
-        loop {
-            let cur = meta.load(Ordering::Acquire);
-            if cur.retain() != RETAIN_SENTINEL_DEAD || cur.state() != SlotState::Dead {
-                return;
-            }
-
-            // The sentinel blocks new upgrades. Moving to Retiring hands the
-            // slot to EBR; only the EBR callback may run T's destructor and
-            // return the slot to the Keg.
-            let new = cur.with_retain(0).with_state(SlotState::Retiring);
-            match meta.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => {
-                    let retire_result =
-                        unsafe { epoch::retire_raw(slot.as_ptr() as *mut u8, reclaim_slot::<T>) };
-                    if retire_result.is_ok() {
-                        return;
-                    }
-
-                    let _ = epoch::drain_with_budget(64);
-                    let retry_result =
-                        unsafe { epoch::retire_raw(slot.as_ptr() as *mut u8, reclaim_slot::<T>) };
-                    if retry_result.is_ok() {
-                        return;
-                    }
-
-                    // Once the slot is Retiring there is no remaining Cap that
-                    // can safely retry later. Failing loudly is better than
-                    // silently leaking a permanently unreachable slot.
-                    panic!("zone EBR retirement failed after drain");
-                }
-                Err(_) => continue,
-            }
-        }
+        Self::try_retire_slot(slot);
     }
 }
 
