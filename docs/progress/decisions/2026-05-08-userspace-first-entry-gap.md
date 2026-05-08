@@ -234,6 +234,64 @@ validate the runtime path. Both commits are reachable on
 
 ---
 
+## 2026-05-08 final update — userspace runs end-to-end
+
+After 007acca (three runtime bugs from QEMU triage) and b543e90
+(satp activation + ecall sepc bump), busybox actually executes:
+demand-pages through its text segment, dispatches dozens of
+syscalls, and emits `:userspace:exited:N` (currently 11 = SIGSEGV
+from busybox-side issues unrelated to the kernel — some syscall
+return is misinterpreted as a pointer).
+
+**Slice 2 is functionally complete.** The reschedule longjmp,
+the inverted run_thread loop, the sscratch-swap trap vector, and
+the per-CPU trap stack all work end-to-end. The remaining work is
+busybox-side syscall stub debugging, which is a normal
+"fix syscall return value" task using the trap-trace flow
+established here.
+
+Five commits on `feat/busybox-smoke`:
+
+- `196a969` model: type+loop+docs.
+- `eb3e66a` asm: per-hart KernelResumeCtx + per-CPU trap stack +
+  sscratch swap + reschedule longjmp.
+- `1371f1b` progress catch-up.
+- `007acca` three runtime fixes from QEMU triage:
+  1. sscratch primer in dead code path → moved to
+     `install_early_percpu`.
+  2. trap stack in `.rodata` → wrapped in `PerHartCell`
+     (UnsafeCell newtype) so the linker keeps it in `.bss`.
+  3. off-by-3 in `console_write_hex` → fixed shift sequence.
+- `82639af` progress catch-up (post-runtime-validation).
+- `b543e90` two more userspace fixes:
+  1. satp never pointed at the user pmap → added
+     `PmapIf::activate_user_pmap`, called from `run_thread`
+     immediately before `enter_userspace_with_context`.
+  2. syscall path didn't advance sepc past the trapping ecall →
+     bump sepc by 4 inside `hand_off_syscall` before storing
+     `saved_user_context` (RV64 ecall is 4 bytes; the page-fault
+     path intentionally keeps sepc pointing at the faulting
+     instruction so it retries after the fault is resolved).
+
+The triage flow that found these bugs:
+
+```
+qemu-system-riscv64 -smp 1 ... -serial file:.../smp1.serial.log
+cargo xtask fault-decode --target rv64-qemu --serial .../smp1.serial.log
+```
+
+Plus a temporary first-N-user-trap dump in `dispatch_trap_frame`
+that prints `[u N TAG sepc=0x... stval=0x...]` for the first 200
+user traps. With this we can see busybox's actual syscall and
+fault stream and pinpoint stub bugs as they arise.
+
+cargo build (host + RV64) clean. Workspace host tests green.
+`cargo xtask test busybox-smoke --target rv64-qemu` passes
+(observes `:boot:ok`; the smoke watcher does NOT yet assert on
+`:userspace:exited:N`).
+
+---
+
 ## 2026-05-08 second update — runtime validated, three bugs fixed,
 ## new blocker (page-fault loop) identified
 
