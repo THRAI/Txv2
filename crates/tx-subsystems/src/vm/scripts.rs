@@ -423,7 +423,35 @@ fn register_load_segment(
     let file_end_rounded = round_up(file_end, page_size).ok_or(ScriptError::InvalidImage)?;
     let mem_end_rounded = round_up(mem_end, page_size).ok_or(ScriptError::InvalidImage)?;
 
-    let file_part_end = file_end_rounded.min(mem_end_rounded);
+    // Per the ELF spec, bytes in the LAST file-backed page that lie
+    // beyond `vaddr + filesz` must read as zero **when the segment
+    // has a BSS extension** (memsz > filesz). The previous shape
+    // mapped the partial last file-backed page directly through the
+    // PageContainer, which exposed whatever bytes happened to live
+    // past `filesz` in the file (typically section-header-string
+    // fragments for static binaries — busybox.musl crashed
+    // dereferencing ".got\0ata" via gp-relative loads into BSS).
+    //
+    // Fix: when `memsz > filesz` and `filesz` is not page-aligned,
+    // round the file-backed range DOWN to a page boundary so the
+    // partial last page lands in the anon range. `exec_script` then
+    // eagerly populates that page's file-content prefix from the
+    // PageContainer; the rest of the page stays zero (fresh anon
+    // allocation).
+    //
+    // For segments with `memsz == filesz` (no BSS), keep the
+    // original `file_end_rounded` boundary: the partial-last-page
+    // tail past `filesz` is not in any LOAD-segment vaddr range, so
+    // userspace doesn't observe it, and writing through populate
+    // would fail EINVAL on a non-writable segment (e.g. .text+RX).
+    let has_bss_extension = mem_end > file_end;
+    let file_part_end = if has_bss_extension {
+        let file_end_floor = file_end & !(page_size - 1);
+        file_end_floor.max(map_start)
+    } else {
+        file_end_rounded.min(mem_end_rounded)
+    };
+
     if file_part_end > map_start {
         let len = file_part_end - map_start;
         let range = UserRange::new_aligned(UserVirtAddr(map_start as usize), len as usize)

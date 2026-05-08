@@ -14,6 +14,13 @@
 pub const NR_WRITE: u64 = 64;
 /// `read(fd, buf, count)`. Linux generic ABI `__NR_read`.
 pub const NR_READ: u64 = 63;
+/// `writev(fd, iov, iovcnt)`. Linux generic ABI `__NR_writev`.
+/// Loops `step_write` over the iovec array. musl's stdio buffered
+/// output goes through `writev` (not `write`), so this is on the
+/// busybox-startup hot path.
+pub const NR_WRITEV: u64 = 66;
+/// `readv(fd, iov, iovcnt)`. Linux generic ABI `__NR_readv`.
+pub const NR_READV: u64 = 65;
 /// `exit(status)`. Linux generic ABI `__NR_exit`. Per-thread exit per
 /// `PROCESS_v1` §7.3.1 — for a single-threaded process, the
 /// `step_thread_exit` chain triggers `step_process_exit` internally.
