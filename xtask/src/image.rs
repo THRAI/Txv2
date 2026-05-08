@@ -143,11 +143,6 @@ fn prepare_busybox_rootfs(root: &Path) -> Result<PathBuf> {
     }
 
     fs::write(
-        layout.join("init"),
-        "#!/bin/sh\nmount -t proc proc /proc 2>/dev/null || true\nmount -t sysfs sysfs /sys 2>/dev/null || true\n/bin/busybox --install -s /bin\nexec /bin/sh\n",
-    )
-    .map_err(|err| err.to_string())?;
-    fs::write(
         layout.join("etc").join("inittab"),
         "::sysinit:/etc/init.d/rcS\n",
     )
@@ -168,6 +163,16 @@ fn prepare_busybox_rootfs(root: &Path) -> Result<PathBuf> {
             }
             unix_fs::symlink(target, path).map_err(|err| err.to_string())?;
         }
+
+        // Initramfs slice (2026-05-08): replace the shebang `/init`
+        // wrapper with a symlink to `/bin/sh`. The kernel's exec
+        // hits busybox directly (no script-interpreter walk) and
+        // busybox sees argv[0]=sh, running the shell applet.
+        let init_path = layout.join("init");
+        if init_path.exists() {
+            fs::remove_file(&init_path).map_err(|err| err.to_string())?;
+        }
+        unix_fs::symlink("/bin/sh", &init_path).map_err(|err| err.to_string())?;
     }
 
     Ok(layout)

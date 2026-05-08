@@ -631,7 +631,100 @@ impl<P: TxPlatform> CoreInit<P> {
         // exclusively.
         #[cfg(busybox_baked)]
         Self::register_busybox_into_tmpfs();
+        // Initramfs slice (2026-05-08): when the firmware (or QEMU
+        // `-initrd`) supplied a cpio archive, walk it and overlay
+        // its contents on top of the bake-in fixture. Entries that
+        // collide with bake-ins (e.g. `/init`) are left alone — the
+        // unpacker treats `EEXIST` from `create_inode` / `mkdir` /
+        // `symlink` as a non-fatal skip, so the bake-in always
+        // wins. Entries unique to the cpio (e.g. `/bin/busybox`,
+        // `/bin/sh` symlink) get added.
+        Self::register_initramfs_if_present();
         Self::drive_bootstrap_exec();
+    }
+
+    /// Initramfs slice: walk `BootInfo::initrd` if present and
+    /// reproduce its file tree inside the rootfs. Warn-and-skip on
+    /// any per-entry failure — a corrupt initramfs should not wedge
+    /// boot, which would be confusing when the user simply pointed
+    /// `-initrd` at the wrong file. The bake-in `/init` fixture
+    /// (registered above) keeps the kernel runnable in that case.
+    pub(crate) fn register_initramfs_if_present() {
+        let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+        let Some(initrd_range) = boot_info.initrd else { return };
+        if initrd_range.size == 0 {
+            return;
+        }
+
+        // Resolve the initramfs PhysRange to a kernel direct-map
+        // pointer. `boot_memory` reserved the range so nothing else
+        // mutates it; the slice is read-only for the duration of
+        // the unpack.
+        let direct_map_base = <P as tx_hal::PlatformConfig>::DIRECT_MAP_BASE.0;
+        let kernel_va = direct_map_base.wrapping_add(initrd_range.start.0);
+        // SAFETY: `boot_memory::reserve_initrd` reserves the range
+        // before `mount_rootfs_tmpfs` runs; the slice is read-only,
+        // covers `initrd_range.size` bytes from a kernel direct-map
+        // address, and the page allocator does not hand the range
+        // out for any other use during the kernel's lifetime.
+        let bytes: &[u8] =
+            unsafe { core::slice::from_raw_parts(kernel_va as *const u8, initrd_range.size) };
+
+        let Some(root_mount) = root_mount() else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":initramfs:skip:no-rootmount\n");
+            return;
+        };
+        match tx_subsystems::initramfs::unpack_into_root_mount(bytes, &root_mount) {
+            Ok(stats) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":initramfs:");
+                Self::write_decimal_unsigned(stats.files);
+                tx_hal::console_write_str::<P>("-files:");
+                Self::write_decimal_unsigned(stats.dirs);
+                tx_hal::console_write_str::<P>("-dirs:");
+                Self::write_decimal_unsigned(stats.symlinks);
+                tx_hal::console_write_str::<P>("-symlinks:");
+                Self::write_decimal_unsigned(stats.bytes_total as usize);
+                tx_hal::console_write_str::<P>("-bytes:");
+                if stats.unsupported > 0 {
+                    Self::write_decimal_unsigned(stats.unsupported);
+                    tx_hal::console_write_str::<P>("-unsupported:");
+                }
+                tx_hal::console_write_str::<P>("ok\n");
+            }
+            Err(error) => {
+                // Warn-and-skip: log the failure to the board
+                // sentinel and continue with whatever was bake-in.
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":initramfs:fail:");
+                let label: &str = match error {
+                    tx_subsystems::initramfs::UnpackError::Parse(_) => "parse",
+                    tx_subsystems::initramfs::UnpackError::FsOp { op, .. } => op,
+                    tx_subsystems::initramfs::UnpackError::UnexpectedAdvance(op) => op,
+                };
+                tx_hal::console_write_str::<P>(label);
+                tx_hal::console_write_str::<P>("\n");
+            }
+        }
+    }
+
+    /// Print an unsigned integer in base 10 to the boot console.
+    fn write_decimal_unsigned(value: usize) {
+        if value == 0 {
+            tx_hal::console_write_str::<P>("0");
+            return;
+        }
+        let mut digits = [0u8; 20];
+        let mut n = value;
+        let mut idx = digits.len();
+        while n > 0 {
+            idx -= 1;
+            digits[idx] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        let s = core::str::from_utf8(&digits[idx..]).unwrap_or("");
+        tx_hal::console_write_str::<P>(s);
     }
 
     /// Shell-prompt roadmap Slice 10 (2026-05-08): copy
@@ -869,14 +962,57 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Bootstrap exec runs as init (root) by construction.
         let cred = Credential::root();
-        let argv: &[&[u8]] = &[b"init" as &[u8]];
         let envp: &[&[u8]] = &[];
+
+        // Cmdline-driven init path (initramfs slice):
+        //   `init=/some/path` -> exec that path with argv=[basename]
+        //   `tx.profile=busybox` (no init=) -> /bin/sh argv=[sh]
+        //   default -> bake-in /init fixture, argv=[init]
+        let (init_path, argv0) = parse_init_from_cmdline::<P>();
 
         // `exec_script` opens its own fresh epoch guards inside V1
         // (`build_aspace_from_image`) and V2
         // (`populate_detached_user_range`); the caller must NOT hold
         // a guard at the call site (per
         // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
+        let argv: &[&[u8]] = &[argv0];
+        let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+            &init, &thread, init_path, argv, envp, &cred,
+        ));
+        match outcome {
+            Ok(()) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
+                return;
+            }
+            Err(ref e) if init_path != b"/init" => {
+                // Cmdline picked a non-bake-in path that the kernel
+                // can't actually load (e.g. busybox without a working
+                // ELF-loader path, or initramfs missing the file).
+                // Warn and fall back to the bake-in `/init` fixture
+                // so `boot:ok` still fires for the smoke. Production
+                // boot would surface the failure to userspace via
+                // execve()'s errno path; this is the bootstrap-only
+                // pre-userspace fallback.
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:fallback:");
+                tx_hal::console_write_str::<P>(exec_error_tag(e));
+                tx_hal::console_write_str::<P>("\n");
+            }
+            Err(e) => {
+                // Open Q #3 (DECIDED 2026-05-06): bake-in `/init`
+                // failure is a boot invariant violation; panic loudly
+                // with the `:bootstrap-exec:fail` board sentinel.
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:fail:");
+                tx_hal::console_write_str::<P>(exec_error_tag(&e));
+                tx_hal::console_write_str::<P>("\n");
+                panic!("bootstrap exec for /init failed: {e:?}");
+            }
+        }
+
+        // Fallback path: re-drive against the bake-in `/init` fixture.
+        let argv: &[&[u8]] = &[b"init" as &[u8]];
         let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
             &init, &thread, b"/init", argv, envp, &cred,
         ));
@@ -886,11 +1022,11 @@ impl<P: TxPlatform> CoreInit<P> {
                 tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
             }
             Err(e) => {
-                // Open Q #3 (DECIDED 2026-05-06): panic loudly with
-                // the `:bootstrap-exec:fail` board sentinel.
                 Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":bootstrap-exec:fail\n");
-                panic!("bootstrap exec for /init failed: {e:?}");
+                tx_hal::console_write_str::<P>(":bootstrap-exec:fail:");
+                tx_hal::console_write_str::<P>(exec_error_tag(&e));
+                tx_hal::console_write_str::<P>("\n");
+                panic!("bootstrap exec for /init fallback failed: {e:?}");
             }
         }
     }
@@ -1425,6 +1561,68 @@ fn bootstrap_block_on<F: core::future::Future>(future: F) -> F::Output {
         }
     }
     panic!("bootstrap_block_on: future did not resolve in 1024 polls");
+}
+
+/// Render an `ExecError` as a short stable label for the boot sentinel
+/// stream (helps diagnose `bootstrap-exec:fail` post-mortem).
+fn exec_error_tag(error: &tx_scripts::process::exec::ExecError) -> &'static str {
+    use tx_scripts::process::exec::ExecError as E;
+    match error {
+        E::PathTooLong => "path-too-long",
+        E::PathNotFound => "path-not-found",
+        E::NotADirectory => "not-a-directory",
+        E::PermissionDenied => "permission-denied",
+        E::SymlinkLoop => "symlink-loop",
+        E::NotExecutable => "not-executable",
+        E::InvalidArgument => "invalid-argument",
+        E::OutOfMemory => "out-of-memory",
+        E::Busy => "busy",
+        E::IoError => "io-error",
+        // Forward-compat: ExecError may grow new variants. Avoid a
+        // build break if a future variant lands without a label here.
+        #[allow(unreachable_patterns)]
+        _ => "other",
+    }
+}
+
+/// Parse the firmware command line for an `init=` token and the
+/// `tx.profile=busybox` profile flag.
+///
+/// Resolution order (matches the Linux kernel's classic ordering):
+///   1. If the cmdline contains `init=PATH`, use `PATH` (argv0 set
+///      to `PATH`'s basename).
+///   2. Otherwise, if the cmdline contains the standalone token
+///      `tx.profile=busybox`, default to `/bin/sh` argv0=`sh`.
+///   3. Otherwise, fall back to the bake-in `/init` fixture.
+///
+/// The cmdline is borrowed from `<P as BootInfoIf>::boot_info()`,
+/// which the firmware (or QEMU `-append`) populates with a
+/// `&'static str`; the returned byte slices share that lifetime.
+fn parse_init_from_cmdline<P: tx_hal::TxPlatform>() -> (&'static [u8], &'static [u8]) {
+    let cmdline = match <P as tx_hal::BootInfoIf>::boot_info().cmdline {
+        Some(s) => s,
+        None => return (b"/init", b"init"),
+    };
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(path) = token.strip_prefix("init=") {
+            let argv0 = match path.rfind('/') {
+                Some(idx) => &path[idx + 1..],
+                None => path,
+            };
+            return (path.as_bytes(), argv0.as_bytes());
+        }
+    }
+    if cmdline
+        .split_ascii_whitespace()
+        .any(|t| t == "tx.profile=busybox")
+    {
+        // Direct path to the busybox binary. /bin/sh is a symlink
+        // pointing at "busybox" (relative); the walker follows
+        // symlinks but we keep the canonical path for clearer
+        // error reporting on bootstrap-exec failure.
+        return (b"/bin/busybox", b"sh");
+    }
+    (b"/init", b"init")
 }
 
 mod init_fixture;
