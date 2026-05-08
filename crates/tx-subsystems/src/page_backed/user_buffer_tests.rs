@@ -3,14 +3,17 @@ use crate::execution::{Errno, StepOutcome};
 use crate::vfs::{FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking};
 use alloc::vec;
 use alloc::vec::Vec;
-use tx_hal::{FaultInfo, KernelPtr, UserAccessIf, UserPtr, VirtAddr};
+use tx_hal::{KernelPtr, UserPtr};
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
+    crate::zones::register_all().expect("kernel zones");
     match tx_substrate::page_allocator::claim_zero_frame() {
         Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for PageBacked user-buffer tests: {error:?}"),
     }
+    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
 }
 
 fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
@@ -32,94 +35,74 @@ fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
     )
 }
 
-/// Test `UserAccessIf` whose user-space pointer is just a host pointer into
-/// a `Vec<u8>` allocated by the test. Performs a plain
-/// `core::ptr::copy_nonoverlapping` between kernel and user sides; never
-/// reports a fault.
-struct PassthroughHal;
-
-impl UserAccessIf for PassthroughHal {
-    unsafe fn copy_from_user(
-        dst: KernelPtr<u8>,
-        src: UserPtr<u8>,
-        len: usize,
-    ) -> Result<(), FaultInfo> {
-        if len == 0 {
-            return Ok(());
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(src.addr() as *const u8, dst.as_ptr(), len);
-        }
-        Ok(())
-    }
-
-    unsafe fn copy_to_user(
-        dst: UserPtr<u8>,
-        src: KernelPtr<u8>,
-        len: usize,
-    ) -> Result<(), FaultInfo> {
-        if len == 0 {
-            return Ok(());
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), dst.addr() as *mut u8, len);
-        }
-        Ok(())
-    }
+fn map_user_buffer(aspace: &crate::vm::AddressSpace, start: usize, len: usize) {
+    let len = align_up(len.max(1), crate::vm::USER_PAGE_SIZE);
+    let range = crate::vm::UserRange::new_aligned(crate::vm::UserVirtAddr(start), len)
+        .expect("aligned user buffer range");
+    let request = crate::vm::VmMapRequest::fixed(
+        range,
+        crate::vm::MapPlacement::RequireFree,
+        crate::vm::Prot::READ_WRITE,
+        crate::vm::VmEntryFlags::PRIVATE,
+        crate::vm::VmBacking::PrivateAnon,
+    );
+    aspace.try_mmap(request).expect("map test user buffer");
 }
 
-/// Test `UserAccessIf` that always reports a fault. Used to prove EFAULT
-/// propagation through `step_*_user`.
-struct FaultingHal;
+fn populate_user(aspace: &crate::vm::AddressSpace, addr: usize, bytes: &[u8]) {
+    let outcome = unsafe {
+        crate::vm::copy_to_user(
+            aspace,
+            UserPtr::new(addr),
+            KernelPtr::new(bytes.as_ptr().cast_mut()),
+            bytes.len(),
+        )
+    };
+    assert_eq!(outcome, StepOutcome::Done(bytes.len()));
+}
 
-impl UserAccessIf for FaultingHal {
-    unsafe fn copy_from_user(
-        _dst: KernelPtr<u8>,
-        src: UserPtr<u8>,
-        _len: usize,
-    ) -> Result<(), FaultInfo> {
-        Err(FaultInfo {
-            address: VirtAddr(src.addr()),
-            write: false,
-            instruction: false,
-            from_user: true,
-        })
-    }
+fn read_user(aspace: &crate::vm::AddressSpace, addr: usize, dest: &mut [u8]) {
+    let outcome = unsafe {
+        crate::vm::copy_from_user(
+            aspace,
+            KernelPtr::new(dest.as_mut_ptr()),
+            UserPtr::new(addr),
+            dest.len(),
+        )
+    };
+    assert_eq!(outcome, StepOutcome::Done(dest.len()));
+}
 
-    unsafe fn copy_to_user(
-        dst: UserPtr<u8>,
-        _src: KernelPtr<u8>,
-        _len: usize,
-    ) -> Result<(), FaultInfo> {
-        Err(FaultInfo {
-            address: VirtAddr(dst.addr()),
-            write: true,
-            instruction: false,
-            from_user: true,
-        })
-    }
+const fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
 }
 
 #[test]
 fn pagebacked_round_trip_through_user_buffer_preserves_bytes_in_one_page() {
-    let _lock = EPOCH_TEST_LOCK
-        .lock()
-        .expect("page-backed user-buffer test lock");
+    let _lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
         },
         2,
     );
+    let aspace = crate::vm::AddressSpace::new();
+    let src_addr = 0x4000;
+    let dst_addr = 0x20_000;
 
     let payload: Vec<u8> = (0u8..200).collect();
+    map_user_buffer(&aspace, src_addr, payload.len());
+    map_user_buffer(&aspace, dst_addr, payload.len());
+    populate_user(&aspace, src_addr, &payload);
+
+    let guard = tx_substrate::epoch::guard();
     let mut writer = open_file_for_pc(&pc);
-    let outcome = step_write_from_user::<PassthroughHal>(
+    let outcome = step_write_from_user(
+        &aspace,
         &pc,
         &mut writer,
-        UserPtr::<u8>::new(payload.as_ptr() as usize),
+        UserPtr::<u8>::new(src_addr),
         payload.len(),
         &guard,
     );
@@ -128,40 +111,49 @@ fn pagebacked_round_trip_through_user_buffer_preserves_bytes_in_one_page() {
 
     let mut reader = open_file_for_pc(&pc);
     let mut received = vec![0u8; payload.len()];
-    let outcome = step_read_to_user::<PassthroughHal>(
+    let outcome = step_read_to_user(
+        &aspace,
         &pc,
         &mut reader,
-        UserPtr::<u8>::new(received.as_mut_ptr() as usize),
+        UserPtr::<u8>::new(dst_addr),
         received.len(),
         &guard,
     );
     assert_eq!(outcome, StepOutcome::Done(payload.len()));
     assert_eq!(reader.offset(), payload.len() as u64);
+    drop(guard);
+    read_user(&aspace, dst_addr, &mut received);
     assert_eq!(received, payload);
 }
 
 #[test]
 fn pagebacked_round_trip_through_user_buffer_crosses_page_boundary() {
-    let _lock = EPOCH_TEST_LOCK
-        .lock()
-        .expect("page-backed user-buffer test lock");
+    let _lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
         },
         2,
     );
+    let aspace = crate::vm::AddressSpace::new();
+    let src_addr = 0x40_000;
+    let dst_addr = 0x80_000;
 
     let payload: Vec<u8> = (0..(crate::vm::USER_PAGE_SIZE + 23))
         .map(|i| (i & 0xff) as u8)
         .collect();
+    map_user_buffer(&aspace, src_addr, payload.len());
+    map_user_buffer(&aspace, dst_addr, payload.len());
+    populate_user(&aspace, src_addr, &payload);
+
+    let guard = tx_substrate::epoch::guard();
     let mut writer = open_file_for_pc(&pc);
-    let outcome = step_write_from_user::<PassthroughHal>(
+    let outcome = step_write_from_user(
+        &aspace,
         &pc,
         &mut writer,
-        UserPtr::<u8>::new(payload.as_ptr() as usize),
+        UserPtr::<u8>::new(src_addr),
         payload.len(),
         &guard,
     );
@@ -171,48 +163,56 @@ fn pagebacked_round_trip_through_user_buffer_crosses_page_boundary() {
 
     let mut reader = open_file_for_pc(&pc);
     let mut received = vec![0u8; payload.len()];
-    let outcome = step_read_to_user::<PassthroughHal>(
+    let outcome = step_read_to_user(
+        &aspace,
         &pc,
         &mut reader,
-        UserPtr::<u8>::new(received.as_mut_ptr() as usize),
+        UserPtr::<u8>::new(dst_addr),
         received.len(),
         &guard,
     );
     assert_eq!(outcome, StepOutcome::Done(payload.len()));
+    drop(guard);
+    read_user(&aspace, dst_addr, &mut received);
     assert_eq!(received, payload);
 }
 
 #[test]
 fn pagebacked_step_read_to_user_grows_offset_only_after_copy_progress() {
-    let _lock = EPOCH_TEST_LOCK
-        .lock()
-        .expect("page-backed user-buffer test lock");
+    let _lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
         },
         1,
     );
+    let aspace = crate::vm::AddressSpace::new();
+    let src_addr = 0x100_000;
+    let unmapped_dst = 0x180_000;
     let payload: Vec<u8> = (0u8..32).collect();
+    map_user_buffer(&aspace, src_addr, payload.len());
+    populate_user(&aspace, src_addr, &payload);
+
+    let guard = tx_substrate::epoch::guard();
     let mut writer = open_file_for_pc(&pc);
-    let outcome = step_write_from_user::<PassthroughHal>(
+    let outcome = step_write_from_user(
+        &aspace,
         &pc,
         &mut writer,
-        UserPtr::<u8>::new(payload.as_ptr() as usize),
+        UserPtr::<u8>::new(src_addr),
         payload.len(),
         &guard,
     );
     assert_eq!(outcome, StepOutcome::Done(payload.len()));
 
     let mut reader = open_file_for_pc(&pc);
-    let mut sink = vec![0u8; 16];
-    let outcome = step_read_to_user::<FaultingHal>(
+    let outcome = step_read_to_user(
+        &aspace,
         &pc,
         &mut reader,
-        UserPtr::<u8>::new(sink.as_mut_ptr() as usize),
-        sink.len(),
+        UserPtr::<u8>::new(unmapped_dst),
+        16,
         &guard,
     );
     assert_eq!(outcome, StepOutcome::Err(Errno::EFAULT));
@@ -221,26 +221,32 @@ fn pagebacked_step_read_to_user_grows_offset_only_after_copy_progress() {
 
 #[test]
 fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
-    let _lock = EPOCH_TEST_LOCK
-        .lock()
-        .expect("page-backed user-buffer test lock");
+    let _lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
         },
         2,
     );
+    let aspace = crate::vm::AddressSpace::new();
+    let src_addr = 0x200_000;
+    let dst_addr = 0x240_000;
 
     let pattern: Vec<u8> = (0..(crate::vm::USER_PAGE_SIZE + 32))
         .map(|i| ((i & 0xff) | 0x20) as u8)
         .collect();
+    map_user_buffer(&aspace, src_addr, pattern.len());
+    map_user_buffer(&aspace, dst_addr, 32);
+    populate_user(&aspace, src_addr, &pattern);
+
+    let guard = tx_substrate::epoch::guard();
     let mut writer = open_file_for_pc(&pc);
-    let outcome = step_write_from_user::<PassthroughHal>(
+    let outcome = step_write_from_user(
+        &aspace,
         &pc,
         &mut writer,
-        UserPtr::<u8>::new(pattern.as_ptr() as usize),
+        UserPtr::<u8>::new(src_addr),
         pattern.len(),
         &guard,
     );
@@ -258,14 +264,17 @@ fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
     let mut reader = open_file_for_pc(&pc);
     reader.set_offset(crate::vm::USER_PAGE_SIZE as u64);
     let mut received = vec![0xCCu8; 32];
-    let outcome = step_read_to_user::<PassthroughHal>(
+    let outcome = step_read_to_user(
+        &aspace,
         &pc,
         &mut reader,
-        UserPtr::<u8>::new(received.as_mut_ptr() as usize),
+        UserPtr::<u8>::new(dst_addr),
         received.len(),
         &guard,
     );
     assert_eq!(outcome, StepOutcome::Done(32));
+    drop(guard);
+    read_user(&aspace, dst_addr, &mut received);
     assert_eq!(
         &received[..4],
         &pattern[crate::vm::USER_PAGE_SIZE..crate::vm::USER_PAGE_SIZE + 4]
@@ -279,24 +288,24 @@ fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
 
 #[test]
 fn pagebacked_step_write_from_user_propagates_efault_without_advance() {
-    let _lock = EPOCH_TEST_LOCK
-        .lock()
-        .expect("page-backed user-buffer test lock");
+    let _lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
         },
         1,
     );
-    let scratch: Vec<u8> = vec![0xab; 8];
+    let aspace = crate::vm::AddressSpace::new();
+    let unmapped_src = 0x300_000;
+    let guard = tx_substrate::epoch::guard();
     let mut writer = open_file_for_pc(&pc);
-    let outcome = step_write_from_user::<FaultingHal>(
+    let outcome = step_write_from_user(
+        &aspace,
         &pc,
         &mut writer,
-        UserPtr::<u8>::new(scratch.as_ptr() as usize),
-        scratch.len(),
+        UserPtr::<u8>::new(unmapped_src),
+        8,
         &guard,
     );
     assert_eq!(outcome, StepOutcome::Err(Errno::EFAULT));
