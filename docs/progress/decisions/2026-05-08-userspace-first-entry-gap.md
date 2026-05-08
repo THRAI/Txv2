@@ -142,3 +142,92 @@ fix landed in commit `fe9a30b` are all correct and necessary.
 None of them require userspace to actually run; they're tested
 host-side. The integration testing for the userspace path was
 just always missing.
+
+---
+
+## 2026-05-08 update — slice 2 implementation in progress
+
+Commits landed:
+
+- **`196a969`** "thread future: invert run_thread loop + drop -> !
+  from enter_userspace_with_context" — the type/loop/test/docs
+  piece. Workspace-wide host tests green (0 failed). The runtime
+  still diverges via `return_to_userspace` (the body type-changed
+  but didn't yet return at runtime); that came in the asm slice.
+
+- **`eb3e66a`** "rv64-qemu trap shell: reschedule longjmp via
+  per-hart KernelResumeCtx + per-CPU trap stack" — the asm slice.
+  Static `[Rv64TrapStack; MAX_BOOT_CPUS]` in .bss; boot-time
+  sscratch primer in `install_kernel_stack`; trap-vector prologue
+  does `csrrw sp, sscratch, sp` onto the trap stack; new asm
+  helpers `tx_rv64_enter_userspace_save_resume` and
+  `tx_rv64_resume_kernel_after_reschedule`; `apply_trap_action`'s
+  Reschedule arm re-primes sscratch and longjmps via the helper.
+  Cross-builds clean for `riscv64gc-unknown-none-elf` (full
+  kernel binary builds; asm assembles).
+
+Static-array vs substrate-allocated trap stack: chose static for
+two reasons: (1) the trap stack must exist before substrate is up
+because the trap vector is installed early in boot, and (2) at
+4 × 16 KiB = 64 KiB total it's a trivial .bss cost. Substrate
+allocation can replace the static array later if memory pressure
+becomes an issue — the asm only sees the stack-top pointer.
+
+### What QEMU validation showed (status: needs debug iteration)
+
+`cargo xtask test busybox-smoke --target rv64-qemu` after the asm
+slice landed produced multi-hart concurrent panics with corrupted
+serial. The pattern emitted from `tx_rv64_qemu_trap_panic` is
+visible:
+
+```
+txkernel:qemu-riscv64-virt:trap
+reason=trap-action-terminate
+scause=0x100001  sepc=0x1ffffff0f5a09c4  stval=0x1ffffff0f0fffe1
+```
+
+The fact that `tx_rv64_qemu_trap_panic` is reached means the
+trap-vector prologue's sscratch swap worked (we got into the Rust
+handler, dispatched, and chose Terminate). The bug is likely
+elsewhere: the `sepc` / `stval` values do not match any normal
+kernel-VMA range, so something is being dereferenced through a
+junk pointer. Suspects to investigate:
+
+1. **AP boot path** — does `secondary_start` go through
+   `install_kernel_stack` in a way that primes sscratch before any
+   trap can fire on the AP? Need to confirm the AP boot trampoline
+   sequencing.
+2. **`tx_rv64_qemu_install_kernel_stack`'s sp swap** — it does
+   `mv sp, a0; ret` which replaces the stack mid-function. Adding
+   the sscratch primer right after means the calls
+   `current_cpu_id()` and `trap_stack_top_for_cpu()` happen on the
+   newly-installed stack; that should be OK but worth verifying
+   the calling-convention contract holds.
+3. **First user trap** — even before busybox runs, init-fixture's
+   bootstrap-exec runs to seed `saved_user_context`. If the very
+   first user trap from the bake-in init fixture's first ecall
+   exposes a bug in the swap discipline, that's where to look.
+
+### Next steps for iteration
+
+- Add a transient `tx-trap-trace` feature: emit a one-character
+  serial sentinel from each phase of the asm path
+  (`csrrw`, `addi`, `csrr` for sp save) so we can pinpoint where
+  in the prologue the corruption happens.
+- Run busybox-smoke with `cargo xtask fault-decode --target
+  rv64-qemu` parsing the serial — the fault-decode tool already
+  handles low-linked + high-VMA layouts and demangling, so the
+  corrupted output may yield more signal.
+- Single-hart QEMU run (`-smp 1`) to remove the multi-hart
+  interleaving from the serial.
+- Dump `sscratch` and the per-CPU trap-stack base via the panic
+  path (extend `console_write_trap_summary`) to confirm sscratch
+  is what we expect at trap time.
+- If the first trap is from a fault-on-fault (re-entry into the
+  trap vector before it finished setup), an SPP guard in the
+  prologue may be needed after all.
+
+Status: type+loop+docs (196a969) is solid and tested; asm slice
+(eb3e66a) compiles + cross-builds but needs QEMU iteration to
+validate the runtime path. Both commits are reachable on
+`feat/busybox-smoke`.

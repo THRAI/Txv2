@@ -4,6 +4,30 @@
 
 ## Current Shape
 
+- 2026-05-08 userspace first-entry slice 2 — model + asm landed,
+  needs QEMU debug iteration. Branch `feat/busybox-smoke`. Two
+  commits: `196a969` ("thread future: invert run_thread loop +
+  drop -> ! from enter_userspace_with_context") flips the type
+  signature of `TrapIf::enter_userspace_with_context` to `()`,
+  inverts `run_thread`'s loop to enter-then-await per iteration,
+  rewrites the host smoke driver to use Pending-yields instead of
+  YIELD-panic, and aligns `HAL_v1.md` §11 + `THREAD_RUNTIME_v1.md`
+  §4.1. `eb3e66a` ("rv64-qemu trap shell: reschedule longjmp via
+  per-hart KernelResumeCtx + per-CPU trap stack") adds a
+  per-CPU 16 KiB trap-handler stack in `.bss`, a per-hart
+  `KernelResumeCtx`, two new asm helpers
+  (`tx_rv64_enter_userspace_save_resume` and
+  `tx_rv64_resume_kernel_after_reschedule`), restructures the
+  trap-vector with `csrrw sp, sscratch, sp` swap discipline, and
+  wires `apply_trap_action`'s Reschedule arm to longjmp. Workspace
+  host tests green (0 failed). RV64 cross-build clean.
+  **Status: `cargo xtask test busybox-smoke --target rv64-qemu`
+  hits a kernel-mode `trap-action-terminate` panic during boot
+  with corrupted multi-hart serial; needs single-hart QEMU run +
+  trap-trace instrumentation to pinpoint.** See
+  `docs/progress/decisions/2026-05-08-userspace-first-entry-gap.md`
+  for the diagnosis trail and next iteration steps.
+
 - 2026-05-08 retire `UserAccessIf` slice on branch
   `feat/retire-user-access-if`. Replaced the trait-based fixup-recovery
   user-access path with eager-walk methods on `AddressSpace`.
