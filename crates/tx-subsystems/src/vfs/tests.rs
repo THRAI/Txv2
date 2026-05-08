@@ -226,7 +226,6 @@ fn credential_root_has_all_caps() {
     assert_eq!(cred.effective_caps, CapabilitySet::FULL);
 }
 
-
 #[test]
 fn open_file_step_ioctl_dispatches_basic_tty_requests() {
     let _g = setup_process_world();

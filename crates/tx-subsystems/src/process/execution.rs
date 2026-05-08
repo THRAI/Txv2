@@ -77,10 +77,7 @@ pub fn process_by_pid(pid: Pid) -> Option<Cap<ProcessIdentity>> {
     walk_process_tree(&init, pid)
 }
 
-fn walk_process_tree(
-    node: &Cap<ProcessIdentity>,
-    pid: Pid,
-) -> Option<Cap<ProcessIdentity>> {
+fn walk_process_tree(node: &Cap<ProcessIdentity>, pid: Pid) -> Option<Cap<ProcessIdentity>> {
     if node.pid == pid {
         return Some(node.clone());
     }

@@ -267,8 +267,7 @@ pub(crate) unsafe fn board_copy_from_user(
         // the load instruction so a fault becomes an Err rather than
         // a panic. SUM is restored when the guard drops.
         let _sum = unsafe { UserMemoryAccessGuard::enable() };
-        let fault_va =
-            unsafe { tx_rv64_cfu_raw(dst.as_mut_ptr(), src.as_ptr(), dst.len()) };
+        let fault_va = unsafe { tx_rv64_cfu_raw(dst.as_mut_ptr(), src.as_ptr(), dst.len()) };
         if fault_va == 0 {
             Ok(())
         } else {
@@ -299,10 +298,7 @@ pub(crate) unsafe fn board_copy_from_user(
 ///
 /// * `src` must be a valid, readable kernel slice.
 /// * `dst` is interpreted in the currently installed user page table.
-pub(crate) unsafe fn board_copy_to_user(
-    dst: UserPtr<u8>,
-    src: &[u8],
-) -> Result<(), FaultInfo> {
+pub(crate) unsafe fn board_copy_to_user(dst: UserPtr<u8>, src: &[u8]) -> Result<(), FaultInfo> {
     if src.is_empty() {
         return Ok(());
     }
@@ -313,9 +309,7 @@ pub(crate) unsafe fn board_copy_to_user(
         // user address passed by the caller; the fixup table covers
         // the store instruction. SUM is restored when the guard drops.
         let _sum = unsafe { UserMemoryAccessGuard::enable() };
-        let fault_va = unsafe {
-            tx_rv64_ctu_raw(dst.as_ptr(), src.as_ptr() as *mut u8, src.len())
-        };
+        let fault_va = unsafe { tx_rv64_ctu_raw(dst.as_ptr(), src.as_ptr() as *mut u8, src.len()) };
         if fault_va == 0 {
             Ok(())
         } else {

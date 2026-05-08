@@ -483,11 +483,7 @@ impl ProcessIdentity {
     /// `umask(2)` always has a payload). Slice 6 of the shell-prompt
     /// roadmap.
     pub fn umask(&self) -> u16 {
-        self.payload
-            .lock()
-            .as_ref()
-            .map(|p| p.umask())
-            .unwrap_or(0)
+        self.payload.lock().as_ref().map(|p| p.umask()).unwrap_or(0)
     }
 
     /// Atomically replace the per-process file-creation mask, returning

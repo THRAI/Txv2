@@ -40,7 +40,6 @@ use tx_hal::{
     SmpIf, TimeIf, VirtAddr,
 };
 
-
 pub struct Platform;
 
 const QEMU_VIRT_RAM_BASE: usize = 0x8000_0000;
@@ -127,26 +126,21 @@ static RV64_PERCPU_AREAS: [Rv64PerCpuArea; MAX_BOOT_CPUS] = [
 /// sync with the field order.
 #[repr(C, align(8))]
 pub struct KernelResumeCtx {
-    pub sp: usize,        // offset 0
-    pub ra: usize,        // offset 8
-    pub s: [usize; 12],   // offset 16..112
+    pub sp: usize,      // offset 0
+    pub ra: usize,      // offset 8
+    pub s: [usize; 12], // offset 16..112
 }
 
 // These offsets are referenced by literal byte offset in the trap-vector
 // asm (`TX_RV64_RCTX_SP`, `TX_RV64_RCTX_RA`, `TX_RV64_RCTX_S0`). The
 // Rust constants below pin the layout from the Rust side so a struct
 // reorder triggers a compile-time mismatch with the static_assert.
-#[allow(dead_code)]
 const KERNEL_RESUME_CTX_SP_OFFSET: usize = 0;
-#[allow(dead_code)]
 const KERNEL_RESUME_CTX_RA_OFFSET: usize = 8;
-#[allow(dead_code)]
 const KERNEL_RESUME_CTX_S0_OFFSET: usize = 16;
 const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 14 * 8);
-const _: () =
-    assert!(core::mem::offset_of!(KernelResumeCtx, sp) == KERNEL_RESUME_CTX_SP_OFFSET);
-const _: () =
-    assert!(core::mem::offset_of!(KernelResumeCtx, ra) == KERNEL_RESUME_CTX_RA_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, sp) == KERNEL_RESUME_CTX_SP_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, ra) == KERNEL_RESUME_CTX_RA_OFFSET);
 const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, s) == KERNEL_RESUME_CTX_S0_OFFSET);
 
 /// Per-hart cell with `Sync` because the only writer/reader is the
@@ -734,7 +728,7 @@ impl EntropyIf for Platform {
         let mut s = ticks ^ counter.rotate_left(13);
         // Avoid the all-zero xorshift fixed point.
         if s == 0 {
-            s = 0xDEADBEEF_CAFE_F00D;
+            s = 0xDEAD_BEEF_CAFE_F00D;
         }
         for byte in out.iter_mut() {
             s ^= s << 13;

@@ -1315,8 +1315,18 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
 
     let root_mount =
         crate::init::root_mount().expect("register_setuid_fixture: ROOT_MOUNT must be populated");
-    let fs_ops = root_mount.payload_cap().expect("rootfs payload alive in test").into_cap().fs_ops.clone();
-    let fs_page_backing = root_mount.payload_cap().expect("rootfs payload alive in test").into_cap().fs_page_backing.clone();
+    let fs_ops = root_mount
+        .payload_cap()
+        .expect("rootfs payload alive in test")
+        .into_cap()
+        .fs_ops
+        .clone();
+    let fs_page_backing = root_mount
+        .payload_cap()
+        .expect("rootfs payload alive in test")
+        .into_cap()
+        .fs_page_backing
+        .clone();
     let root_object_id = root_mount.root().fs_object_id();
 
     let bytes = &crate::init::init_setuid_fixture::INIT_SETUID_FIXTURE_BYTES[..];

@@ -1,5 +1,5 @@
 // Auto-extracted from `crates/tx-subsystems/src/signal/tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use crate::process::{bootstrap_init_process, ProcessIdentity};
 use crate::signal::{step_sigaction, SigDisposition};

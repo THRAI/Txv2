@@ -29,7 +29,14 @@ pub fn step_read_to_user(
         return StepOutcome::Done(0);
     }
     let effective_len = core::cmp::min(len as u64, valid_end - start) as usize;
-    step_range_with_user_buffer(pc, of, aspace, effective_len, UserBuffer::Read { dst }, guard)
+    step_range_with_user_buffer(
+        pc,
+        of,
+        aspace,
+        effective_len,
+        UserBuffer::Read { dst },
+        guard,
+    )
 }
 
 /// Write up to `len` bytes from the user buffer at `src` into `pc` at
@@ -210,8 +217,7 @@ fn copy_chunk_user(
             // SAFETY: kernel_byte is valid for `chunk` mutable bytes
             // (the materialised PC page); we expose it as a kernel-
             // side mutable slice for the copy_from_user output.
-            let kernel_slice =
-                unsafe { core::slice::from_raw_parts_mut(kernel_byte, chunk) };
+            let kernel_slice = unsafe { core::slice::from_raw_parts_mut(kernel_byte, chunk) };
             let user_src = UserPtr::<u8>::new(src.addr() + already_advanced);
             match aspace.copy_from_user(kernel_slice, user_src, guard) {
                 StepOutcome::Done(n) | StepOutcome::Advanced(n) if n == chunk => Ok(()),

@@ -1,10 +1,8 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use tx_substrate::{page_allocator, zone};
-use tx_subsystems::page_backed::{
-    AnonSwapPolicy, PageContainer, PageContainerKind, step_truncate,
-};
+use tx_subsystems::page_backed::{step_truncate, AnonSwapPolicy, PageContainer, PageContainerKind};
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::vfs::structure::{
@@ -27,8 +25,7 @@ fn lseek_setup() -> TestSetup {
 }
 
 fn fresh_proc_thread() -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
-    let process =
-        bootstrap_init_process(fresh_aspace()).expect("bootstrap init for lseek tests");
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init for lseek tests");
     let thread = process.nth_thread(0).expect("leader thread");
     (process, thread)
 }

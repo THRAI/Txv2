@@ -1,4 +1,4 @@
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 
 #[test]

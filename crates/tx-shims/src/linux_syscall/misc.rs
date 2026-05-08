@@ -5,7 +5,6 @@
 
 use super::*;
 
-
 /// `getrandom(buf, buflen, flags)` — Linux RV64 generic ABI
 /// `__NR_getrandom = 278`.
 ///
@@ -18,7 +17,10 @@ use super::*;
 /// (canonical `aspace.copy_to_user` lane with kernel-pointer fallback
 /// for test scaffolding). Null `buf` with non-zero `buflen` returns
 /// `-EFAULT`; `buflen == 0` is a successful no-op (`Return(0)`).
-pub(super) fn sys_getrandom<'a, P: EntropyIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_getrandom<'a, P: EntropyIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let buf_uaddr = args[0];
     let buf_len = args[1] as usize;
     let _flags = args[2] as u32; // GRND_* recognised but ignored.
@@ -39,7 +41,6 @@ pub(super) fn sys_getrandom<'a, P: EntropyIf>(args: [u64; 6], ctx: &SyscallCtx<'
     }
     SyscallResult::Return(buf_len as i64)
 }
-
 
 /// `uname(buf)` — Linux RV64 generic ABI `__NR_uname = 160`.
 ///
@@ -66,7 +67,6 @@ pub(super) fn sys_uname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     }
     SyscallResult::Return(0)
 }
-
 
 /// `prlimit64(pid, resource, new_rlim, old_rlim)` — Linux RV64
 /// generic ABI `__NR_prlimit64 = 261`.
@@ -107,19 +107,9 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
             rlim_cur: 0,
             rlim_max: RLIM_INFINITY,
         },
-        RLIMIT_CPU
-        | RLIMIT_FSIZE
-        | RLIMIT_DATA
-        | RLIMIT_RSS
-        | RLIMIT_NPROC
-        | RLIMIT_MEMLOCK
-        | RLIMIT_AS
-        | RLIMIT_LOCKS
-        | RLIMIT_SIGPENDING
-        | RLIMIT_MSGQUEUE
-        | RLIMIT_NICE
-        | RLIMIT_RTPRIO
-        | RLIMIT_RTTIME => RlimitLayout {
+        RLIMIT_CPU | RLIMIT_FSIZE | RLIMIT_DATA | RLIMIT_RSS | RLIMIT_NPROC | RLIMIT_MEMLOCK
+        | RLIMIT_AS | RLIMIT_LOCKS | RLIMIT_SIGPENDING | RLIMIT_MSGQUEUE | RLIMIT_NICE
+        | RLIMIT_RTPRIO | RLIMIT_RTTIME => RlimitLayout {
             rlim_cur: RLIM_INFINITY,
             rlim_max: RLIM_INFINITY,
         },
@@ -136,15 +126,14 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct UtsnameLayout {
-    sysname: [u8; UTSNAME_FIELD],
-    nodename: [u8; UTSNAME_FIELD],
-    release: [u8; UTSNAME_FIELD],
-    version: [u8; UTSNAME_FIELD],
-    machine: [u8; UTSNAME_FIELD],
-    domainname: [u8; UTSNAME_FIELD],
+pub(super) struct UtsnameLayout {
+    pub(super) sysname: [u8; UTSNAME_FIELD],
+    pub(super) nodename: [u8; UTSNAME_FIELD],
+    pub(super) release: [u8; UTSNAME_FIELD],
+    pub(super) version: [u8; UTSNAME_FIELD],
+    pub(super) machine: [u8; UTSNAME_FIELD],
+    pub(super) domainname: [u8; UTSNAME_FIELD],
 }
-
 
 pub(super) fn build_utsname() -> UtsnameLayout {
     fn pad(s: &str) -> [u8; UTSNAME_FIELD] {
@@ -175,4 +164,3 @@ struct RlimitLayout {
     rlim_cur: u64,
     rlim_max: u64,
 }
-

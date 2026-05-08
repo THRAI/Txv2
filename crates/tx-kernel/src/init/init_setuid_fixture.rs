@@ -91,12 +91,12 @@
 // User-Level ISA §2.5 / §2.7.)
 
 /// LOAD virtual address (entry of the PT_LOAD segment).
-#[allow(dead_code)] // referenced from host-side tests (#[cfg(test)]).
+#[cfg(test)]
 pub const INIT_SETUID_FIXTURE_LOAD_VADDR: u64 = 0x10000;
 
 /// Entry-point virtual address (first instruction).
 /// Equal to LOAD_VADDR + 176 (header + 2 PHDRs).
-#[allow(dead_code)] // referenced from host-side tests (#[cfg(test)]).
+#[cfg(test)]
 pub const INIT_SETUID_FIXTURE_ENTRY_VADDR: u64 = INIT_SETUID_FIXTURE_LOAD_VADDR + 176;
 
 /// Total fixture size in bytes (also `p_filesz` and `p_memsz` of the

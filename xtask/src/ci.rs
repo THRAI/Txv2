@@ -146,9 +146,7 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn ci_slow(root: &Path) -> Result<()> {
-    let busybox_present = root
-        .join(crate::image::VENDORED_BUSYBOX_RELPATH)
-        .exists()
+    let busybox_present = root.join(crate::image::VENDORED_BUSYBOX_RELPATH).exists()
         || std::env::var_os("TX_BUSYBOX").is_some();
 
     let mut results = vec![
@@ -181,13 +179,7 @@ pub(crate) fn ci_slow(root: &Path) -> Result<()> {
             root,
             "rv64 qemu busybox smoke sentinel",
             "cargo",
-            &[
-                "xtask",
-                "test",
-                "busybox-smoke",
-                "--target",
-                "rv64-qemu",
-            ],
+            &["xtask", "test", "busybox-smoke", "--target", "rv64-qemu"],
             "txdoc:CI-GATE-QEMU-BUSYBOX-SMOKE",
         ));
     } else {

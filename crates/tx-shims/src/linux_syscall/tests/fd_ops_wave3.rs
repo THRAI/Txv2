@@ -1,5 +1,5 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use tx_subsystems::process::bootstrap_init_process;
 
@@ -13,8 +13,7 @@ fn pipe2_setup() -> TestSetup {
 }
 
 fn fresh_proc_thread() -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
-    let process =
-        bootstrap_init_process(fresh_aspace()).expect("bootstrap init for pipe2 tests");
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init for pipe2 tests");
     let thread = process.nth_thread(0).expect("leader thread");
     (process, thread)
 }
@@ -28,10 +27,7 @@ fn dispatch_pipe2_allocates_two_fds_and_writes_pair_to_userspace() {
     let ctx = make_ctx(proc_cap.clone(), thread);
     let mut pipefd: [u32; 2] = [u32::MAX, u32::MAX];
 
-    let req = SyscallRequest::new(
-        NR_PIPE2,
-        [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0],
-    );
+    let req = SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
     let reader_fd = pipefd[0];
@@ -114,10 +110,7 @@ fn dispatch_pipe2_with_junk_flags_returns_neg_einval() {
     // 0x80000000 is well outside the recognised set
     // (O_CLOEXEC | O_NONBLOCK | O_DIRECT).
     let junk: u64 = 0x8000_0000;
-    let req = SyscallRequest::new(
-        NR_PIPE2,
-        [pipefd.as_mut_ptr() as u64, junk, 0, 0, 0, 0],
-    );
+    let req = SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, junk, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_INVAL));
 }

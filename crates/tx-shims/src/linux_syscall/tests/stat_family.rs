@@ -1,5 +1,5 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -103,16 +103,13 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>, Cap<RNode>) {
     )
     .expect("mount identity");
 
-    let root_dentry =
-        DEntry::new_cap(InlineName::ROOT, root_rnode.clone()).expect("root dentry");
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone()).expect("root dentry");
     (root_dentry, tmpfs, root_rnode)
 }
 
 /// Bootstrap an init process whose cwd is `root_dentry`. Returns
 /// the `(process, leader-thread)` pair.
-fn bootstrap_with_cwd(
-    root_dentry: Cap<DEntry>,
-) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
+fn bootstrap_with_cwd(root_dentry: Cap<DEntry>) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
     let aspace = fresh_aspace();
     let process = bootstrap_init_process(aspace).expect("bootstrap init");
     let thread = process.nth_thread(0).expect("leader thread");
@@ -221,8 +218,10 @@ fn dispatch_fstat_on_pagebacked_fd_writes_stat_struct() {
 
     // Now call fstat(fd, &statbuf).
     let mut statbuf = vec![0u8; STAT_BYTES];
-    let req =
-        SyscallRequest::new(NR_FSTAT, [fd as u64, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0]);
+    let req = SyscallRequest::new(
+        NR_FSTAT,
+        [fd as u64, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0],
+    );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
     assert_eq!(read_u64_at(&statbuf, STAT_INO_OFF), file_id.as_u64());

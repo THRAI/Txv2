@@ -5,7 +5,6 @@
 
 use super::*;
 
-
 // =====================================================================
 // Wave 4 Part 4 of the DAC + setuid slice — file-mode syscall arms.
 //
@@ -90,7 +89,6 @@ fn resolve_path_at<P: PmapIf>(
     Ok(dentry)
 }
 
-
 /// Poll a walker future synchronously, panicking if it returns
 /// `Pending`. Mirrors `tx_scripts::process::exec::poll_walker_synchronously`
 /// (which is private to that module). The walker module's docs
@@ -124,7 +122,6 @@ pub(crate) fn poll_walker_synchronously<F: core::future::Future>(future: F) -> F
     }
 }
 
-
 /// Translate an `Errno` from `step_chmod` / `step_chown` to the
 /// dispatched `-errno` magnitude. Mirrors the existing
 /// `errno_to_i32` table; the inline match keeps the file-mode arms
@@ -141,7 +138,6 @@ pub(super) fn fs_change_errno_magnitude(errno: Errno) -> i32 {
     }
 }
 
-
 /// Resolve the in-scope `Arc<dyn FsOps>` for the given dentry.
 /// Mirrors the walker's private `fs_ops_for` helper, but ascends the
 /// `parent_hint` chain to find an rnode that carries
@@ -155,7 +151,9 @@ pub(super) fn fs_change_errno_magnitude(errno: Errno) -> i32 {
 /// Returns `None` for orphan dentries (no parent-hint chain reaches
 /// a rnode with a mount weak); the file-mode arms surface that as
 /// `-EROFS` defensively (no FS to act through).
-pub(super) fn fs_ops_for_dentry(dentry: &Cap<DEntry>) -> Option<Arc<dyn tx_subsystems::vfs::FsOps>> {
+pub(super) fn fs_ops_for_dentry(
+    dentry: &Cap<DEntry>,
+) -> Option<Arc<dyn tx_subsystems::vfs::FsOps>> {
     let guard = tx_substrate::epoch::guard();
     let mut cursor: Cap<DEntry> = dentry.clone();
     loop {
@@ -171,7 +169,6 @@ pub(super) fn fs_ops_for_dentry(dentry: &Cap<DEntry>) -> Option<Arc<dyn tx_subsy
         }
     }
 }
-
 
 /// `fchmodat(dirfd, path, mode, flags)`. Linux RV64 generic ABI.
 ///
@@ -215,7 +212,6 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     }
 }
 
-
 /// `fchownat(dirfd, path, uid, gid, flags)`. Linux RV64 generic ABI.
 ///
 /// Wraps `FsOps::step_chown` (Wave 3 Part 2). Each of `uid` / `gid`
@@ -258,7 +254,6 @@ pub(super) fn sys_fchownat<P: PmapIf>(
     }
 }
 
-
 /// `faccessat(dirfd, path, mode)`. Linux RV64 generic ABI. POSIX
 /// `access(2)` shape: the access check uses the caller's **real**
 /// uid/gid (not effective). Implemented in terms of
@@ -272,7 +267,6 @@ pub(super) fn sys_faccessat<P: PmapIf>(
     sys_faccessat2_impl::<P>(dirfd, path_uaddr, mode, 0, ctx)
 }
 
-
 /// `faccessat2(dirfd, path, mode, flags)`. Linux RV64 generic ABI.
 /// Adds the `flags` argument over `faccessat`; `AT_EACCESS` switches
 /// the check from real uid/gid to effective uid/gid.
@@ -285,7 +279,6 @@ pub(super) fn sys_faccessat2<P: PmapIf>(
 ) -> SyscallResult {
     sys_faccessat2_impl::<P>(dirfd, path_uaddr, mode, flags, ctx)
 }
-
 
 /// Shared implementation for `faccessat` / `faccessat2`. The split
 /// surface only exists for the dispatch ABI; both arms route here.
@@ -396,7 +389,6 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
     }
 }
 
-
 /// Decode the access-mode bits (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) of an
 /// `openat(2)` `flags` argument into the `(read, write)` pair. Linux's
 /// `O_RDONLY = 0` reads as "read", `O_WRONLY = 1` as "write",
@@ -411,7 +403,6 @@ pub(super) fn decode_access_mode(flags: u32) -> (bool, bool) {
         _ => (true, false),
     }
 }
-
 
 /// `chdir(path)`. Linux RV64 generic ABI `__NR_chdir = 49`.
 ///
@@ -462,7 +453,6 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     }
 }
 
-
 /// `getcwd(buf, size)`. Linux RV64 generic ABI `__NR_getcwd = 17`.
 ///
 /// Renders the cwd dentry's parent-hint chain into an absolute POSIX
@@ -512,7 +502,6 @@ pub(super) fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     SyscallResult::Return(needed as i64)
 }
 
-
 /// `umask(mask)`. Linux RV64 generic ABI `__NR_umask = 166`.
 ///
 /// Atomically swaps the per-process file-creation mask, returning the
@@ -528,7 +517,6 @@ pub(super) fn sys_umask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     let old = ctx.process.swap_umask(new_mask);
     SyscallResult::Return(old as i64)
 }
-
 
 // =====================================================================
 // Slice 8 of the shell-prompt roadmap — file-mutation syscalls.
@@ -573,7 +561,11 @@ pub(super) fn sys_umask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 /// that already hold it (every Slice 8 arm fetches it once for both
 /// the parent walk and the optional full walk) avoid the redundant
 /// `process.cwd()` lookup.
-pub(super) fn walk_from(cwd: Cap<DEntry>, path: &[u8], cred: &Credential) -> Result<Cap<DEntry>, i32> {
+pub(super) fn walk_from(
+    cwd: Cap<DEntry>,
+    path: &[u8],
+    cred: &Credential,
+) -> Result<Cap<DEntry>, i32> {
     let guard = tx_substrate::epoch::guard();
     let outcome = poll_walker_synchronously(step_walk(cwd, path, cred, &guard));
     drop(guard);
@@ -583,4 +575,3 @@ pub(super) fn walk_from(cwd: Cap<DEntry>, path: &[u8], cred: &Credential) -> Res
         StepOutcome::Err(errno) => Err(errno_to_i32(errno)),
     }
 }
-

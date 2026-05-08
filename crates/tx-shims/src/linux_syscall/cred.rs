@@ -21,7 +21,6 @@ pub(super) fn decode_gid_arg(raw: u32) -> Option<Gid> {
     }
 }
 
-
 /// Map a `CredChange` outcome from a setter helper to the dispatched
 /// `SyscallResult`. `Replaced` → `Return(0)`; `PermissionDenied` →
 /// `-EPERM`; `Zombie` → `-ESRCH` (impossible in practice — the caller
@@ -34,7 +33,6 @@ pub(super) fn cred_change_to_result(change: CredChange) -> SyscallResult {
     }
 }
 
-
 /// `getuid()`. Linux RV64 generic ABI `__NR_getuid`. Returns the
 /// caller's real uid. Reads `ctx.cred()` once; no `.await`, no
 /// privilege check (everyone can read their own uid).
@@ -42,13 +40,11 @@ pub(super) fn sys_getuid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.cred().uid.raw() as i64)
 }
 
-
 /// `geteuid()`. Linux RV64 generic ABI `__NR_geteuid`. Returns the
 /// caller's effective uid.
 pub(super) fn sys_geteuid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.cred().euid.raw() as i64)
 }
-
 
 /// `getgid()`. Linux RV64 generic ABI `__NR_getgid`. Returns the
 /// caller's real gid.
@@ -56,13 +52,11 @@ pub(super) fn sys_getgid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.cred().gid.raw() as i64)
 }
 
-
 /// `getegid()`. Linux RV64 generic ABI `__NR_getegid`. Returns the
 /// caller's effective gid.
 pub(super) fn sys_getegid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.cred().egid.raw() as i64)
 }
-
 
 /// `setuid(uid)`. Wraps `cred::step_setuid` (Wave 1).
 ///
@@ -75,14 +69,12 @@ pub(super) fn sys_setuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     cred_change_to_result(step_setuid(&ctx.process, target))
 }
 
-
 /// `setgid(gid)`. Wraps `cred::step_setgid` (Wave 1). Same privilege
 /// rules as `setuid` applied to the gid family.
 pub(super) fn sys_setgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let target = Gid(args[0] as u32);
     cred_change_to_result(step_setgid(&ctx.process, target))
 }
-
 
 /// `setreuid(ruid, euid)`. Wraps `cred::step_setreuid` (Wave 1).
 ///
@@ -99,7 +91,6 @@ pub(super) fn sys_setreuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
     cred_change_to_result(step_setreuid(&ctx.process, ruid, euid))
 }
 
-
 /// `setregid(rgid, egid)`. Gid analog of `sys_setreuid`. Wraps
 /// `cred::step_setregid` (Wave 1).
 pub(super) fn sys_setregid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -107,7 +98,6 @@ pub(super) fn sys_setregid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
     let egid = decode_gid_arg(args[1] as u32);
     cred_change_to_result(step_setregid(&ctx.process, rgid, egid))
 }
-
 
 /// `setresuid(ruid, euid, suid)`. Wraps `cred::step_setresuid`
 /// (Wave 1). Each argument decodes the `(u32) -1` sentinel to
@@ -123,7 +113,6 @@ pub(super) fn sys_setresuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     cred_change_to_result(step_setresuid(&ctx.process, ruid, euid, suid))
 }
 
-
 /// `setresgid(rgid, egid, sgid)`. Gid analog of `sys_setresuid`.
 /// Wraps `cred::step_setresgid` (Wave 1).
 pub(super) fn sys_setresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -132,7 +121,6 @@ pub(super) fn sys_setresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     let sgid = decode_gid_arg(args[2] as u32);
     cred_change_to_result(step_setresgid(&ctx.process, rgid, egid, sgid))
 }
-
 
 /// `getresuid(ruid_uaddr, euid_uaddr, suid_uaddr)`. Reads
 /// `ctx.cred()` once and writes each `u32` raw uid to the
@@ -166,7 +154,6 @@ pub(super) fn sys_getresuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     SyscallResult::Return(0)
 }
 
-
 /// `getresgid(rgid_uaddr, egid_uaddr, sgid_uaddr)`. Gid analog of
 /// `sys_getresuid`. Same bridging through the user-VA lane applies.
 pub(super) fn sys_getresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -193,4 +180,3 @@ pub(super) fn sys_getresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
 
     SyscallResult::Return(0)
 }
-

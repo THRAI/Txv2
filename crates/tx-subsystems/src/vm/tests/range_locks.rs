@@ -1,6 +1,6 @@
 // Auto-extracted from `crates/tx-subsystems/src/vm/tests.rs` (2026-05-08 jumbo split).
 // User-range / range-lock unit tests; depends on shared setup in `super`.
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 
 #[test]
@@ -224,4 +224,3 @@ fn vm_range_lock_tree_active_writer_blocks_materializer_overlap_only() {
     drop(disjoint_materializer);
     drop(writer);
 }
-

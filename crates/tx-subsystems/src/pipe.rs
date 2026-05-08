@@ -51,8 +51,8 @@ use tx_substrate::SpinMutex;
 
 use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
 use crate::vfs::structure::{
-    FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking,
-    StructPayload, S_IFIFO,
+    FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking, StructPayload,
+    S_IFIFO,
 };
 use crate::wait_carrier;
 
@@ -239,7 +239,8 @@ impl PipePayload {
     pub(crate) fn decr_reader(&self) {
         let prev = self.reader_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            self.writer_wait_channel.fire(Mask::from_bits(PIPE_WRITABLE));
+            self.writer_wait_channel
+                .fire(Mask::from_bits(PIPE_WRITABLE));
         }
     }
 
@@ -250,7 +251,8 @@ impl PipePayload {
     pub(crate) fn decr_writer(&self) {
         let prev = self.writer_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            self.reader_wait_channel.fire(Mask::from_bits(PIPE_READABLE));
+            self.reader_wait_channel
+                .fire(Mask::from_bits(PIPE_READABLE));
         }
     }
 
@@ -382,13 +384,10 @@ fn allocate_pipe_fs_object_id() -> FsObjectId {
 /// each cap at the lowest unused fd via `process.allocate_fd()` /
 /// `process.install_fd(fd, cap)` and applies `O_CLOEXEC` per the
 /// flags.
-pub fn step_pipe2(
-    flags: PipeFlags,
-) -> Result<(Cap<OpenFile>, Cap<OpenFile>), Errno> {
+pub fn step_pipe2(flags: PipeFlags) -> Result<(Cap<OpenFile>, Cap<OpenFile>), Errno> {
     // 1. Mint the shared payload + cap.
     let payload_value = PipePayload::new().map_err(|_| Errno::ENOMEM)?;
-    let payload_reservation =
-        zone::reserve_for::<PipePayload>().map_err(|_| Errno::ENOMEM)?;
+    let payload_reservation = zone::reserve_for::<PipePayload>().map_err(|_| Errno::ENOMEM)?;
     let payload_cap: Cap<PipePayload> = zone::sign_for(payload_reservation, payload_value);
 
     // 2. Build per-side RNodes. Each carries

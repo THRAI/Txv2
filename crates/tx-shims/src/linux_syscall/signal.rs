@@ -5,7 +5,6 @@
 
 use super::*;
 
-
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
 ///
 /// `sigsetsize` is rejected with `-EINVAL` for any value other than
@@ -86,7 +85,6 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
 
     SyscallResult::Return(0)
 }
-
 
 /// `rt_sigaction(signum, act, oldact, sigsetsize)` per `SIGNAL_v1`
 /// §15.1.
@@ -200,7 +198,6 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     SyscallResult::Return(0)
 }
 
-
 /// `kill(pid, sig)` — Linux RV64 generic ABI `__NR_kill = 129`.
 ///
 /// Slice 7 v1 surface:
@@ -251,7 +248,6 @@ pub(super) fn sys_kill(args: [u64; 6]) -> SyscallResult {
     }
 }
 
-
 /// `tkill(tid, sig)` — Linux RV64 generic ABI `__NR_tkill = 130`.
 ///
 /// Slice 7 v1 aliases this to [`sys_kill`]: txKernel has no
@@ -261,7 +257,6 @@ pub(super) fn sys_kill(args: [u64; 6]) -> SyscallResult {
 pub(super) fn sys_tkill(args: [u64; 6]) -> SyscallResult {
     sys_kill(args)
 }
-
 
 /// `tgkill(tgid, tid, sig)` — Linux RV64 generic ABI
 /// `__NR_tgkill = 131`.
@@ -277,7 +272,6 @@ pub(super) fn sys_tgkill(args: [u64; 6]) -> SyscallResult {
     k_args[1] = args[2];
     sys_kill(k_args)
 }
-
 
 /// `rt_sigreturn(...)` — Linux RV64 generic ABI
 /// `__NR_rt_sigreturn = 139`.
@@ -296,4 +290,3 @@ pub(super) fn sys_tgkill(args: [u64; 6]) -> SyscallResult {
 pub(super) fn sys_rt_sigreturn() -> SyscallResult {
     SyscallResult::Error(ENOSYS_VALUE)
 }
-

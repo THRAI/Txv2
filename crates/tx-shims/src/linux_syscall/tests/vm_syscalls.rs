@@ -1,10 +1,8 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use tx_substrate::{page_allocator, zone};
-use tx_subsystems::page_backed::{
-    AnonSwapPolicy, PageContainer, PageContainerKind, step_truncate,
-};
+use tx_subsystems::page_backed::{step_truncate, AnonSwapPolicy, PageContainer, PageContainerKind};
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::vfs::structure::{
@@ -13,8 +11,8 @@ use tx_subsystems::vfs::structure::{
 use tx_subsystems::vm::USER_PAGE_SIZE;
 
 use crate::linux_syscall::{
-    MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, NR_MADVISE,
-    NR_MMAP, NR_MPROTECT, NR_MUNMAP, PROT_READ, PROT_WRITE,
+    MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, NR_MADVISE, NR_MMAP,
+    NR_MPROTECT, NR_MUNMAP, PROT_READ, PROT_WRITE,
 };
 
 const E_BADF: i32 = 9;
@@ -173,14 +171,7 @@ fn dispatch_mmap_file_backed_against_pagebacked_fd_returns_va() {
 
     let req = SyscallRequest::new(
         NR_MMAP,
-        [
-            0,
-            USER_PAGE_SIZE as u64,
-            PROT_READ,
-            MAP_PRIVATE,
-            7,
-            0,
-        ],
+        [0, USER_PAGE_SIZE as u64, PROT_READ, MAP_PRIVATE, 7, 0],
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     match result {
@@ -208,14 +199,7 @@ fn dispatch_mmap_file_backed_against_tty_fd_returns_neg_enodev() {
 
     let req = SyscallRequest::new(
         NR_MMAP,
-        [
-            0,
-            USER_PAGE_SIZE as u64,
-            PROT_READ,
-            MAP_PRIVATE,
-            13,
-            0,
-        ],
+        [0, USER_PAGE_SIZE as u64, PROT_READ, MAP_PRIVATE, 13, 0],
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_NODEV));
@@ -234,14 +218,7 @@ fn dispatch_mmap_file_backed_against_pipe_fd_returns_neg_enodev() {
 
     let req = SyscallRequest::new(
         NR_MMAP,
-        [
-            0,
-            USER_PAGE_SIZE as u64,
-            PROT_READ,
-            MAP_PRIVATE,
-            11,
-            0,
-        ],
+        [0, USER_PAGE_SIZE as u64, PROT_READ, MAP_PRIVATE, 11, 0],
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_NODEV));

@@ -767,8 +767,8 @@ pub trait PmapIf {
     /// Activate `root` as the current hart's user pmap.
     ///
     /// On RV64 this is `csrw satp, ((root.phys >> 12) | SV_MODE_BITS)
-    /// + sfence.vma`. On LA64 the equivalent is the user-mode page-walk
-    /// register write.
+    ///     + sfence.vma`. On LA64 the equivalent is the user-mode page-walk
+    ///     register write.
     ///
     /// Called by the thread runtime immediately before
     /// `TrapIf::enter_userspace_with_context` so the MMU consults the
@@ -992,11 +992,11 @@ pub trait EntropyIf {
         // Safe for the current trust model — no ASLR, no
         // stack-canary checks, no untrusted input.
         use core::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0xDEADBEEF_CAFE_F00D);
+        static COUNTER: AtomicU64 = AtomicU64::new(0xDEAD_BEEF_CAFE_F00D);
         let mut s = COUNTER.fetch_add(1, Ordering::Relaxed);
         // Avoid the all-zero xorshift fixed point.
         if s == 0 {
-            s = 0xDEADBEEF_CAFE_F00D;
+            s = 0xDEAD_BEEF_CAFE_F00D;
         }
         for byte in out.iter_mut() {
             s ^= s << 13;

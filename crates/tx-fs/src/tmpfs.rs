@@ -83,7 +83,7 @@ enum TmpfsPayload {
     /// Symlink: target bytes stored inline. The bytes are observed
     /// through `readlink`-style paths (deferred — Phase 3b only
     /// surfaces creation), so the variant currently appears unread.
-    #[allow(dead_code)]
+    #[cfg_attr(test, allow(dead_code))]
     Symlink(Vec<u8>),
 }
 

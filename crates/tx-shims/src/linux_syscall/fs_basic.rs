@@ -5,7 +5,6 @@
 
 use super::*;
 
-
 /// `fcntl(fd, cmd, arg)` per the Wave 2 ELF-loader plan §"Part 2 —
 /// Per-fd CLOEXEC bitmap + fcntl(F_SETFD) + O_CLOEXEC" plus Slice 7 of
 /// the shell-prompt roadmap (fcntl extension).
@@ -109,7 +108,6 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
-
 
 /// `openat(dirfd, path, flags, mode)`. Linux RV64 generic ABI
 /// `__NR_openat = 56`.
@@ -317,7 +315,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     SyscallResult::Return(fd as i64)
 }
 
-
 /// `close(fd)`. Linux RV64 generic ABI `__NR_close = 57`.
 ///
 /// Removes the `Cap<OpenFile>` from the fd table; EBR-deferred
@@ -340,7 +337,6 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     ctx.process.set_fd_cloexec(fd, false);
     SyscallResult::Return(0)
 }
-
 
 /// `dup(oldfd)`. Linux RV64 generic ABI `__NR_dup = 23`.
 ///
@@ -365,7 +361,6 @@ pub(super) fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(newfd as i64)
 }
 
-
 /// `dup3(oldfd, newfd, flags)`. Linux RV64 generic ABI
 /// `__NR_dup3 = 24`.
 ///
@@ -382,7 +377,12 @@ pub(super) fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// - Otherwise: `install_fd(newfd, file.clone())` — the previous
 ///   occupant cap is dropped immediately (its EBR-deferred `Drop`
 ///   fires once the next epoch reclamation runs).
-pub(super) fn sys_dup3<'a>(oldfd: u32, newfd: u32, flags: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_dup3<'a>(
+    oldfd: u32,
+    newfd: u32,
+    flags: u32,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     if oldfd == newfd {
         return SyscallResult::Error(EINVAL_VALUE);
     }
@@ -404,7 +404,6 @@ pub(super) fn sys_dup3<'a>(oldfd: u32, newfd: u32, flags: u32, ctx: &SyscallCtx<
     ctx.process.set_fd_cloexec(newfd, want_cloexec);
     SyscallResult::Return(newfd as i64)
 }
-
 
 /// `pipe2(int pipefd[2], int flags)`. Linux RV64 generic ABI
 /// `__NR_pipe2 = 59`.
@@ -471,7 +470,6 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     SyscallResult::Return(0)
 }
 
-
 /// `lseek(fd, offset, whence)`. Linux RV64 generic ABI
 /// `__NR_lseek = 62`.
 ///
@@ -509,7 +507,6 @@ pub(super) fn sys_lseek<'a>(
         StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
 }
-
 
 // =====================================================================
 // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY routing.
@@ -563,7 +560,6 @@ pub(super) fn make_ioctl_caller(ctx: &SyscallCtx<'_>) -> IoctlCaller {
     }
     caller
 }
-
 
 /// `ioctl(fd, request, argp)`. Linux RV64 generic syscall #29.
 ///
@@ -774,25 +770,25 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct StatLayout {
-    st_dev: u64,
-    st_ino: u64,
-    st_mode: u32,
-    st_nlink: u32,
-    st_uid: u32,
-    st_gid: u32,
-    st_rdev: u64,
+pub(super) struct StatLayout {
+    pub(super) st_dev: u64,
+    pub(super) st_ino: u64,
+    pub(super) st_mode: u32,
+    pub(super) st_nlink: u32,
+    pub(super) st_uid: u32,
+    pub(super) st_gid: u32,
+    pub(super) st_rdev: u64,
     __pad1: u64,
-    st_size: i64,
-    st_blksize: i32,
+    pub(super) st_size: i64,
+    pub(super) st_blksize: i32,
     __pad2: i32,
-    st_blocks: i64,
-    st_atime_sec: i64,
-    st_atime_nsec: u64,
-    st_mtime_sec: i64,
-    st_mtime_nsec: u64,
-    st_ctime_sec: i64,
-    st_ctime_nsec: u64,
+    pub(super) st_blocks: i64,
+    pub(super) st_atime_sec: i64,
+    pub(super) st_atime_nsec: u64,
+    pub(super) st_mtime_sec: i64,
+    pub(super) st_mtime_nsec: u64,
+    pub(super) st_ctime_sec: i64,
+    pub(super) st_ctime_nsec: u64,
     __unused: [u32; 2],
 }
 
@@ -804,7 +800,6 @@ struct LinuxDirent64Header {
     d_reclen: u16,
     d_type: u8,
 }
-
 
 /// Map an `InodeMeta` + (`fs_object_id`, `rdev`) pair onto the Linux
 /// `struct stat` byte image. Single-device kernel today
@@ -835,7 +830,6 @@ pub(super) fn inode_meta_to_stat(meta: &InodeMeta, ino: u64, rdev: u64) -> StatL
         __unused: [0, 0],
     }
 }
-
 
 /// `fstat(fd, statbuf)`. Linux RV64 generic ABI `__NR_fstat = 80`.
 ///
@@ -872,7 +866,6 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     }
     SyscallResult::Return(0)
 }
-
 
 /// `newfstatat(dirfd, path, statbuf, flags)`. Linux RV64 generic ABI
 /// `__NR_newfstatat = 79`.
@@ -955,7 +948,6 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     }
     SyscallResult::Return(0)
 }
-
 
 /// `getdents64(fd, dirp, count)`. Linux RV64 generic ABI
 /// `__NR_getdents64 = 61`.
@@ -1070,8 +1062,7 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
                     };
                     record[..LINUX_DIRENT64_HEADER_BYTES].copy_from_slice(header_bytes);
                 }
-                record[LINUX_DIRENT64_HEADER_BYTES
-                    ..LINUX_DIRENT64_HEADER_BYTES + name_bytes.len()]
+                record[LINUX_DIRENT64_HEADER_BYTES..LINUX_DIRENT64_HEADER_BYTES + name_bytes.len()]
                     .copy_from_slice(name_bytes);
                 // NUL terminator after name; remaining padding bytes
                 // already zero from `vec![0; total_len]`.
@@ -1116,7 +1107,6 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     SyscallResult::Return(written as i64)
 }
 
-
 /// Resolve the `Arc<dyn FsOps>` in scope for a directory rnode.
 /// Mirrors `fs_ops_for_dentry`'s shape but operates on the rnode
 /// directly (the OpenFile carries `Cap<RNode>`, not `Cap<DEntry>`).
@@ -1138,4 +1128,3 @@ pub(super) fn fs_ops_for_rnode(
     let payload = weak.upgrade(&guard)?;
     Some(payload.fs_ops.clone())
 }
-

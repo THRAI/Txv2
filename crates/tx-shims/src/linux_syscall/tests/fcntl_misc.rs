@@ -1,5 +1,5 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 
 use crate::linux_syscall::{
@@ -369,10 +369,7 @@ fn dispatch_prlimit64_rlimit_nofile_returns_default() {
     let mut buf = [0u64; 2];
     let buf_uaddr = buf.as_mut_ptr() as u64;
     let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(
-            NR_PRLIMIT64,
-            [0, RLIMIT_NOFILE as u64, 0, buf_uaddr, 0, 0],
-        ),
+        SyscallRequest::new(NR_PRLIMIT64, [0, RLIMIT_NOFILE as u64, 0, buf_uaddr, 0, 0]),
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Return(0));
@@ -463,5 +460,5 @@ fn dispatch_rt_sigreturn_returns_neg_enosys() {
 // `dispatch_fcntl_closed_fd_returns_neg_ebadf` already covers the
 // shared EBADF gate that all fcntl cmds (including F_DUPFD) hit
 // before reaching the cmd switch.
-#[allow(dead_code)]
+#[cfg_attr(test, allow(dead_code))]
 const _UNUSED_E_BADF: i32 = E_BADF;

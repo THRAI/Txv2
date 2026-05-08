@@ -5,15 +5,13 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use tx_substrate::zone::Cap;
 use tx_subsystems::execution::{Errno, StepOutcome};
 use tx_subsystems::initramfs::{unpack_into_root_mount, UnpackError};
-use tx_subsystems::mount::{
-    MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel,
-};
+use tx_subsystems::mount::{MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel};
 use tx_subsystems::vfs::{
     DEntry, FsObjectId, FsOps, InlineName, InodeKind, RNode, RNodeBacking, S_IFMT,
 };
-use tx_substrate::zone::Cap;
 
 use crate::tmpfs::Tmpfs;
 
@@ -55,8 +53,7 @@ fn fresh_rootfs_mount() -> Cap<MountIdentity> {
         let res = tx_substrate::zone::reserve_for::<RNode>().expect("rnode");
         tx_substrate::zone::sign_for(res, raw)
     };
-    let _root_dentry =
-        DEntry::new_cap(InlineName::ROOT, root_rnode.clone()).expect("root dentry");
+    let _root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone()).expect("root dentry");
 
     MountIdentity::new_cap(
         tx_subsystems::mount::MountId::new(0xfeed),
@@ -121,7 +118,10 @@ fn hex8(value: u32) -> [u8; 8] {
 
 /// Walk the mount's root, look up `name`, and return the resolved id.
 fn lookup_in_root(mount: &Cap<MountIdentity>, name: &[u8]) -> StepOutcome<FsObjectId> {
-    let payload = mount.payload_cap().expect("mount payload alive in test").into_cap();
+    let payload = mount
+        .payload_cap()
+        .expect("mount payload alive in test")
+        .into_cap();
     let root_id = mount.root().fs_object_id();
     let guard = tx_substrate::epoch::guard();
     payload.fs_ops.lookup(root_id, name, &guard)
@@ -132,13 +132,21 @@ fn lookup_in(
     parent: FsObjectId,
     name: &[u8],
 ) -> StepOutcome<FsObjectId> {
-    let payload = mount.payload_cap().expect("mount payload alive in test").into_cap();
+    let payload = mount
+        .payload_cap()
+        .expect("mount payload alive in test")
+        .into_cap();
     let guard = tx_substrate::epoch::guard();
     payload.fs_ops.lookup(parent, name, &guard)
 }
 
 fn fs_ops_of(mount: &Cap<MountIdentity>) -> Arc<dyn FsOps> {
-    mount.payload_cap().expect("mount payload alive in test").into_cap().fs_ops.clone()
+    mount
+        .payload_cap()
+        .expect("mount payload alive in test")
+        .into_cap()
+        .fs_ops
+        .clone()
 }
 
 #[test]

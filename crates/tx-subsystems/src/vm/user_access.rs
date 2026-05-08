@@ -43,8 +43,8 @@ use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
 use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
 
 use super::structure::{
-    AccessMode, AddressSpace, UserRange, UserVirtAddr, VmBacking, VmEntry, VmFault,
-    VmFaultOutcome, USER_PAGE_SIZE,
+    AccessMode, AddressSpace, UserRange, UserVirtAddr, VmBacking, VmEntry, VmFault, VmFaultOutcome,
+    USER_PAGE_SIZE,
 };
 
 /// Whether a user-access primitive is reading from or writing to
@@ -265,16 +265,12 @@ impl AddressSpace {
             let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
             let within = user_addr - page_addr;
             let chunk = core::cmp::min(max_len - consumed, USER_PAGE_SIZE - within);
-            let frame_base = match resolve_user_page_addr(
-                self,
-                page_addr,
-                UserAccessKind::Read,
-                guard,
-            ) {
-                ResolveOutcome::Done(addr) => addr,
-                ResolveOutcome::Err(e) => return StepOutcome::Err(e),
-                ResolveOutcome::Blocked(t) => return StepOutcome::Blocked(t),
-            };
+            let frame_base =
+                match resolve_user_page_addr(self, page_addr, UserAccessKind::Read, guard) {
+                    ResolveOutcome::Done(addr) => addr,
+                    ResolveOutcome::Err(e) => return StepOutcome::Err(e),
+                    ResolveOutcome::Blocked(t) => return StepOutcome::Blocked(t),
+                };
             // SAFETY: frame_base.add(within) is a valid kernel
             // direct-map pointer to the requested user byte; we read
             // up to `chunk` bytes which fit inside `USER_PAGE_SIZE -

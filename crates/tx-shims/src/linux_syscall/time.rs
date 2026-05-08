@@ -7,16 +7,16 @@ use super::*;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct TimespecLayout {
-    tv_sec: i64,
-    tv_nsec: i64,
+pub(super) struct TimespecLayout {
+    pub(super) tv_sec: i64,
+    pub(super) tv_nsec: i64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct TimevalLayout {
-    tv_sec: i64,
-    tv_usec: i64,
+pub(super) struct TimevalLayout {
+    pub(super) tv_sec: i64,
+    pub(super) tv_usec: i64,
 }
 
 #[repr(C)]
@@ -28,7 +28,6 @@ struct TmsLayout {
     tms_cstime: i64,
 }
 
-
 /// Convert a nanosecond count to a Linux-shaped `(tv_sec, tv_nsec)`
 /// pair. Both fields are signed 64-bit per the uapi.
 pub(super) fn ns_to_timespec(ns: u64) -> TimespecLayout {
@@ -37,7 +36,6 @@ pub(super) fn ns_to_timespec(ns: u64) -> TimespecLayout {
         tv_nsec: (ns % 1_000_000_000) as i64,
     }
 }
-
 
 /// Convert a nanosecond count to a Linux-shaped `(tv_sec, tv_usec)`
 /// pair (microsecond resolution — `gettimeofday` truncates the
@@ -48,7 +46,6 @@ pub(super) fn ns_to_timeval(ns: u64) -> TimevalLayout {
         tv_usec: ((ns % 1_000_000_000) / 1_000) as i64,
     }
 }
-
 
 /// Read a Linux-shaped `(tv_sec, tv_nsec)` pair from user memory and
 /// fold it back into a nanosecond count. Returns `None` if either
@@ -73,7 +70,6 @@ pub(super) fn read_timespec_at(aspace: &AddressSpace, uaddr: u64) -> Option<u64>
     Some((ts.tv_sec as u64).saturating_mul(1_000_000_000) + (ts.tv_nsec as u64))
 }
 
-
 /// `clock_gettime(clk_id, tp)`. Linux RV64 generic ABI
 /// `__NR_clock_gettime = 113`.
 ///
@@ -81,7 +77,10 @@ pub(super) fn read_timespec_at(aspace: &AddressSpace, uaddr: u64) -> Option<u64>
 /// PROCESS_CPUTIME / THREAD_CPUTIME plus the *_RAW / *_COARSE /
 /// BOOTTIME aliases) routes to `<P as TimeIf>::read_ns()`. Unknown
 /// clock ids return `-EINVAL`. Null `tp` returns `-EFAULT`.
-pub(super) fn sys_clock_gettime<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_clock_gettime<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let clk_id = args[0] as u32;
     let ts_uaddr = args[1];
     if ts_uaddr == 0 {
@@ -105,13 +104,15 @@ pub(super) fn sys_clock_gettime<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<
     SyscallResult::Return(0)
 }
 
-
 /// `gettimeofday(tv, tz)`. Linux RV64 generic ABI
 /// `__NR_gettimeofday = 169`.
 ///
 /// The `tz` argument (args[1]) is deprecated on Linux and ignored.
 /// Null `tv` returns `-EFAULT`.
-pub(super) fn sys_gettimeofday<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_gettimeofday<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let tv_uaddr = args[0];
     // args[1] = tz (ignored — deprecated on Linux).
     if tv_uaddr == 0 {
@@ -123,7 +124,6 @@ pub(super) fn sys_gettimeofday<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'
     }
     SyscallResult::Return(0)
 }
-
 
 /// `times(buf)`. Linux RV64 generic ABI `__NR_times = 153`.
 ///
@@ -148,7 +148,6 @@ pub(super) fn sys_times<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     }
     SyscallResult::Return(ticks)
 }
-
 
 /// `nanosleep(req, rem)`. Linux RV64 generic ABI
 /// `__NR_nanosleep = 101`.
@@ -181,7 +180,6 @@ pub(super) fn sys_nanosleep<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>)
     SyscallResult::Error(ENOSYS_VALUE)
 }
 
-
 /// `clock_nanosleep(clk_id, flags, req, rem)`. Linux RV64 generic ABI
 /// `__NR_clock_nanosleep = 115`.
 ///
@@ -194,7 +192,10 @@ pub(super) fn sys_nanosleep<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>)
 ///
 /// Recognised clock ids match `clock_gettime`. Unknown clock ids and
 /// unknown flag bits return `-EINVAL`. Null `req` returns `-EFAULT`.
-pub(super) fn sys_clock_nanosleep<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_clock_nanosleep<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let clk_id = args[0] as u32;
     let flags = args[1] as u32;
     let req_uaddr = args[2];
@@ -231,4 +232,3 @@ pub(super) fn sys_clock_nanosleep<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCt
     // Real-duration sleeps deferred — see `sys_nanosleep`.
     SyscallResult::Error(ENOSYS_VALUE)
 }
-
