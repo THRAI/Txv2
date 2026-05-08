@@ -146,7 +146,12 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn ci_slow(root: &Path) -> Result<()> {
-    let results = vec![
+    let busybox_present = root
+        .join(crate::image::VENDORED_BUSYBOX_RELPATH)
+        .exists()
+        || std::env::var_os("TX_BUSYBOX").is_some();
+
+    let mut results = vec![
         ci_run(
             root,
             "rv64 qemu build",
@@ -170,6 +175,32 @@ pub(crate) fn ci_slow(root: &Path) -> Result<()> {
             "txdoc:CI-GATE-QEMU-SMOKE",
         ),
     ];
+
+    if busybox_present {
+        results.push(ci_run(
+            root,
+            "rv64 qemu busybox smoke sentinel",
+            "cargo",
+            &[
+                "xtask",
+                "test",
+                "busybox-smoke",
+                "--target",
+                "rv64-qemu",
+            ],
+            "txdoc:CI-GATE-QEMU-BUSYBOX-SMOKE",
+        ));
+    } else {
+        results.push(CiStepResult {
+            name: "rv64 qemu busybox smoke sentinel",
+            reference: "txdoc:CI-GATE-QEMU-BUSYBOX-SMOKE",
+            command: "cargo xtask test busybox-smoke --target rv64-qemu".to_string(),
+            outcome: CiOutcome::Skipped(format!(
+                "vendored busybox missing at {}; run tools/images/fetch-busybox.sh",
+                crate::image::VENDORED_BUSYBOX_RELPATH
+            )),
+        });
+    }
 
     print_ci_report(&results);
     let failures = results

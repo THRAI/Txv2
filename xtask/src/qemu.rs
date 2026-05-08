@@ -14,6 +14,10 @@ const DEFAULT_SENTINEL_TIMEOUT: Duration = Duration::from_secs(10);
 struct QemuOptions {
     expect_sentinel: bool,
     timeout: Duration,
+    /// Skip the busybox-profile virtio-blk drive wiring. Used by smoke
+    /// runs that only need the initramfs to come up; it sidesteps the
+    /// `mkfs.ext4` host-tool dependency.
+    no_block: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +78,7 @@ fn qemu_options(args: &[String]) -> Result<QemuOptions> {
     Ok(QemuOptions {
         expect_sentinel: args.iter().any(|arg| arg == "--expect-sentinel"),
         timeout,
+        no_block: args.iter().any(|arg| arg == "--no-block"),
     })
 }
 
@@ -142,7 +147,7 @@ fn qemu_command(
         }
     }
 
-    if profile == Profile::Busybox {
+    if profile == Profile::Busybox && !options.no_block {
         args.push("-device".into());
         if target == TxTarget::Rv64M1DockMock {
             args.push("virtio-blk-device,drive=m1sd,bus=virtio-mmio-bus.0".into());
@@ -507,6 +512,7 @@ mod tests {
         let options = QemuOptions {
             expect_sentinel: true,
             timeout: Duration::from_secs(10),
+            no_block: false,
         };
         let command = qemu_command(
             Path::new("/tmp/tx"),

@@ -81,17 +81,35 @@ fn image_ext4_busybox(root: &Path, args: &[String], output_name: &str) -> Result
     Ok(())
 }
 
-fn prepare_busybox_rootfs(root: &Path) -> Result<PathBuf> {
-    let busybox = env::var("TX_BUSYBOX").map_err(|_| {
-        "TX_BUSYBOX is not set; point it at a BusyBox binary before building images".to_string()
-    })?;
-    let busybox = PathBuf::from(busybox);
-    if !busybox.is_file() {
-        return Err(format!(
-            "TX_BUSYBOX must point at a file, got {}",
-            busybox.display()
-        ));
+/// Path of the in-tree vendored busybox binary used when `TX_BUSYBOX` is not
+/// set. Populated by `tools/images/fetch-busybox.sh`. Kept relative so the
+/// path printed in errors matches what's checked into the repo.
+pub(crate) const VENDORED_BUSYBOX_RELPATH: &str = "tools/images/vendor/busybox-riscv64-musl";
+
+fn resolve_busybox(root: &Path) -> Result<PathBuf> {
+    if let Ok(value) = env::var("TX_BUSYBOX") {
+        let busybox = PathBuf::from(value);
+        if !busybox.is_file() {
+            return Err(format!(
+                "TX_BUSYBOX must point at a file, got {}",
+                busybox.display()
+            ));
+        }
+        return Ok(busybox);
     }
+    let vendored = root.join(VENDORED_BUSYBOX_RELPATH);
+    if vendored.is_file() {
+        return Ok(vendored);
+    }
+    Err(format!(
+        "TX_BUSYBOX is not set and vendored binary missing at {}; \
+         run `tools/images/fetch-busybox.sh` or set TX_BUSYBOX",
+        VENDORED_BUSYBOX_RELPATH
+    ))
+}
+
+fn prepare_busybox_rootfs(root: &Path) -> Result<PathBuf> {
+    let busybox = resolve_busybox(root)?;
 
     let layout = root.join("target").join("rootfs").join("busybox-musl");
     if layout.exists() {

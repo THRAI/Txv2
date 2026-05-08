@@ -1,4 +1,5 @@
 /target/
+/tools/images/vendor/
 /.cache/
 **/.venv/
 __pycache__/
