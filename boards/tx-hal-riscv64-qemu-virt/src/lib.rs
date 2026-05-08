@@ -362,28 +362,33 @@ static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
 /// don't trample the BSP/AP runtime kernel stack (which holds the
 /// reactor + thread future frames at the moment a user trap fires).
 ///
-/// Lives in `.bss` rather than substrate-allocated frames because
-/// the trap stack must be ready *before* substrate is — the trap
-/// vector is installed early in boot, well before the page
-/// allocator. Total static cost is `MAX_BOOT_CPUS × 16 KiB = 64 KiB`.
+/// Lives in `.data` (writable) rather than substrate-allocated
+/// frames because the trap stack must be ready *before* substrate
+/// is — the trap vector is installed early in boot, well before
+/// the page allocator. Wrapped in `PerHartCell<UnsafeCell<...>>`
+/// so the linker keeps it out of `.rodata` (which `pmap` maps
+/// `KERNEL_RO`); plain `static [u8; N]` lands in `.rodata` and
+/// the trap-vector's first store would fault.
+///
+/// Total static cost is `MAX_BOOT_CPUS × 16 KiB = 64 KiB`.
 const RV64_TRAP_STACK_SIZE: usize = 16 * 1024;
 
 #[repr(C, align(16))]
 pub struct Rv64TrapStack(pub [u8; RV64_TRAP_STACK_SIZE]);
 
-static RV64_TRAP_STACKS: [Rv64TrapStack; MAX_BOOT_CPUS] = [
-    Rv64TrapStack([0; RV64_TRAP_STACK_SIZE]),
-    Rv64TrapStack([0; RV64_TRAP_STACK_SIZE]),
-    Rv64TrapStack([0; RV64_TRAP_STACK_SIZE]),
-    Rv64TrapStack([0; RV64_TRAP_STACK_SIZE]),
+static RV64_TRAP_STACKS: [PerHartCell<Rv64TrapStack>; MAX_BOOT_CPUS] = [
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
 ];
 
 /// Per-hart trap-stack top: the value the boot primer writes into
 /// `sscratch`, and the value the reschedule longjmp restores
 /// `sscratch` to before unwinding back to the kernel caller.
 pub fn trap_stack_top_for_cpu(cpu: CpuId) -> usize {
-    let stack = &RV64_TRAP_STACKS[cpu.0];
-    let base = stack as *const Rv64TrapStack as usize;
+    let stack = RV64_TRAP_STACKS[cpu.0].as_ptr();
+    let base = stack as usize;
     base + RV64_TRAP_STACK_SIZE
 }
 
@@ -909,6 +914,26 @@ fn current_cpu_id() -> CpuId {
 fn install_early_percpu(cpu_id: CpuId) {
     let kernel_tls = percpu_tls_for_cpu(cpu_id).unwrap_or(cpu_id.0);
     write_kernel_tls(kernel_tls);
+
+    // Slice 2 boot-time sscratch primer (one-shot per hart). The
+    // trap-vector prologue does `csrrw sp, sscratch, sp` to swap
+    // onto the per-CPU trap-handler stack; sscratch must therefore
+    // be primed before any trap can fire on this hart. We are
+    // called from `tx_hal::entry()` on every hart's boot path,
+    // immediately after the trap vector is installed, which is
+    // the earliest moment we have a valid `cpu_id` and a populated
+    // trap-stack array. Subsequent traps re-prime sscratch through
+    // the CSR-swap discipline (trap-vector epilogue +
+    // userspace-entry shim + reschedule-longjmp helper); this is
+    // genuinely one-shot.
+    //
+    // Note: this also runs on the host build target via the trait
+    // impl, but the asm is gated on `target_arch = "riscv64"`.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        let trap_stack_top = trap_stack_top_for_cpu(cpu_id);
+        core::arch::asm!("csrw sscratch, {top}", top = in(reg) trap_stack_top);
+    }
 }
 
 fn read_kernel_tls() -> usize {
@@ -949,16 +974,6 @@ unsafe fn install_kernel_stack(top: VirtAddr) {
     #[cfg(target_arch = "riscv64")]
     unsafe {
         tx_rv64_qemu_install_kernel_stack(top.0);
-        // Slice 2 boot-time sscratch primer (one-shot per hart). The
-        // trap-vector prologue does `csrrw sp, sscratch, sp` to swap
-        // onto the per-CPU trap-handler stack, so sscratch must be
-        // primed before any user trap can fire (i.e. before the first
-        // `enter_userspace_with_context`). The trap-vector epilogue
-        // and the userspace-entry shim both re-prime sscratch on
-        // every clean exit, so this is genuinely one-shot.
-        let cpu = <Platform as PercpuIf>::current_cpu_id();
-        let trap_stack_top = trap_stack_top_for_cpu(cpu);
-        core::arch::asm!("csrw sscratch, {top}", top = in(reg) trap_stack_top);
     }
 
     #[cfg(not(target_arch = "riscv64"))]

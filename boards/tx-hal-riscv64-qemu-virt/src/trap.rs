@@ -911,7 +911,13 @@ fn console_write_literal(bytes: &[u8]) {
 
 #[cfg(target_arch = "riscv64")]
 fn console_write_hex(value: usize) {
-    for shift in (0..usize::BITS).rev().step_by(4) {
+    // Print 16 hex digits MSB-first. Shifts run 60, 56, ..., 4, 0
+    // so each `(value >> shift) & 0xf` captures the correct nibble.
+    //
+    // (The previous form `(0..64).rev().step_by(4)` yielded
+    // 63, 59, ..., 3 — off by 3 bits, which made every printed
+    // address look "shifted left by 3" and broke fault triage.)
+    for shift in (0..usize::BITS).step_by(4).rev() {
         let digit = ((value >> shift) & 0xf) as u8;
         let byte = if digit < 10 {
             b'0' + digit
