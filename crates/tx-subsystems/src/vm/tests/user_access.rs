@@ -2,7 +2,7 @@ use super::*;
 use crate::execution::{Errno, StepOutcome};
 use alloc::vec;
 use alloc::vec::Vec;
-use tx_hal::{KernelPtr, UserPtr};
+use tx_hal::UserPtr;
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
@@ -39,26 +39,13 @@ fn vm_copy_to_user_then_copy_from_user_walks_recipes_and_pmap() {
         .map(|i| (i & 0xff) as u8)
         .collect();
     map_private(&aspace, user_addr, payload.len(), Prot::READ_WRITE);
+    let guard = tx_substrate::epoch::guard();
 
-    let copied = unsafe {
-        crate::vm::copy_to_user(
-            &aspace,
-            UserPtr::new(user_addr),
-            KernelPtr::new(payload.as_ptr().cast_mut()),
-            payload.len(),
-        )
-    };
+    let copied = aspace.copy_to_user(UserPtr::new(user_addr), &payload, &guard);
     assert_eq!(copied, StepOutcome::Done(payload.len()));
 
     let mut observed = vec![0u8; payload.len()];
-    let copied = unsafe {
-        crate::vm::copy_from_user(
-            &aspace,
-            KernelPtr::new(observed.as_mut_ptr()),
-            UserPtr::new(user_addr),
-            observed.len(),
-        )
-    };
+    let copied = aspace.copy_from_user(&mut observed, UserPtr::new(user_addr), &guard);
     assert_eq!(copied, StepOutcome::Done(payload.len()));
     assert_eq!(observed, payload);
     assert!(aspace
@@ -73,15 +60,9 @@ fn vm_copy_from_user_rejects_unmapped_pointer_before_kernel_copy() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let mut observed = [0xAAu8; 8];
+    let guard = tx_substrate::epoch::guard();
 
-    let copied = unsafe {
-        crate::vm::copy_from_user(
-            &aspace,
-            KernelPtr::new(observed.as_mut_ptr()),
-            UserPtr::new(0x8000),
-            observed.len(),
-        )
-    };
+    let copied = aspace.copy_from_user(&mut observed, UserPtr::new(0x8000), &guard);
 
     assert_eq!(copied, StepOutcome::Err(Errno::EFAULT));
     assert_eq!(observed, [0xAA; 8]);
@@ -95,15 +76,9 @@ fn vm_copy_to_user_rejects_read_only_recipe() {
     let user_addr = 0x10_000;
     map_private(&aspace, user_addr, 16, Prot::READ);
     let payload = [0x5Au8; 16];
+    let guard = tx_substrate::epoch::guard();
 
-    let copied = unsafe {
-        crate::vm::copy_to_user(
-            &aspace,
-            UserPtr::new(user_addr),
-            KernelPtr::new(payload.as_ptr().cast_mut()),
-            payload.len(),
-        )
-    };
+    let copied = aspace.copy_to_user(UserPtr::new(user_addr), &payload, &guard);
 
     assert_eq!(copied, StepOutcome::Err(Errno::EFAULT));
 }

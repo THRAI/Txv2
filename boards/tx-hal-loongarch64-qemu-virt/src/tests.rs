@@ -1,5 +1,6 @@
 use super::la64_irq_trap::*;
 use super::la64_pmap::*;
+use super::platform_impls::{la64_copy_from_user_raw, la64_copy_to_user_raw};
 use super::*;
 use core::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
@@ -399,27 +400,15 @@ fn la64_user_access_host_paths_report_faults_for_nonzero_copies() {
 
     unsafe {
         assert_eq!(
-            <Platform as UserAccessIf>::copy_from_user(
-                KernelPtr::new(kernel.as_mut_ptr()),
-                UserPtr::new(user.as_ptr() as usize),
-                0,
-            ),
+            la64_copy_from_user_raw(kernel.as_mut_ptr(), UserPtr::new(user.as_ptr() as usize), 0),
             Ok(())
         );
         assert_eq!(
-            <Platform as UserAccessIf>::copy_to_user(
-                UserPtr::new(user.as_ptr() as usize),
-                KernelPtr::new(kernel.as_mut_ptr()),
-                0,
-            ),
+            la64_copy_to_user_raw(UserPtr::new(user.as_ptr() as usize), kernel.as_ptr(), 0),
             Ok(())
         );
         assert_eq!(
-            <Platform as UserAccessIf>::copy_from_user(
-                KernelPtr::new(kernel.as_mut_ptr()),
-                UserPtr::new(0x1234),
-                1,
-            ),
+            la64_copy_from_user_raw(kernel.as_mut_ptr(), UserPtr::new(0x1234), 1),
             Err(FaultInfo {
                 address: VirtAddr(0x1234),
                 write: false,
@@ -428,11 +417,7 @@ fn la64_user_access_host_paths_report_faults_for_nonzero_copies() {
             })
         );
         assert_eq!(
-            <Platform as UserAccessIf>::copy_to_user(
-                UserPtr::new(0x5678),
-                KernelPtr::new(kernel.as_mut_ptr()),
-                1,
-            ),
+            la64_copy_to_user_raw(UserPtr::new(0x5678), kernel.as_ptr(), 1),
             Err(FaultInfo {
                 address: VirtAddr(0x5678),
                 write: true,
@@ -738,7 +723,7 @@ fn activate_pmap_installs_pgdl_pgdh_and_asid() {
     let second = Platform::create_pmap_root().expect("second LA64 process root");
     assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 2);
 
-    Platform::activate_pmap(&first).expect("activate first root");
+    Platform::activate_user_pmap(&first);
     let pgdh = LA64_ACTIVE_PGDH.load(Ordering::Acquire);
     assert_ne!(pgdh, 0);
     assert_eq!(LA64_ACTIVE_PGDL.load(Ordering::Acquire), first.phys().0);
@@ -751,7 +736,7 @@ fn activate_pmap_installs_pgdl_pgdh_and_asid() {
     let pgdh_page = la64_page_table_mut_from_phys(PhysAddr(pgdh));
     assert!(pgdh_page.iter().all(|entry| *entry == 0));
 
-    Platform::activate_pmap(&second).expect("activate second root");
+    Platform::activate_user_pmap(&second);
     assert_eq!(LA64_ACTIVE_PGDL.load(Ordering::Acquire), second.phys().0);
     assert_eq!(
         LA64_ACTIVE_ASID.load(Ordering::Acquire),

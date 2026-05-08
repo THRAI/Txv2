@@ -2,7 +2,7 @@ use super::la64_irq_trap::*;
 use super::la64_pmap::*;
 use super::*;
 
-unsafe fn la64_copy_from_user_raw(
+pub(crate) unsafe fn la64_copy_from_user_raw(
     _dst: *mut u8,
     src: UserPtr<u8>,
     len: usize,
@@ -35,7 +35,7 @@ unsafe fn la64_copy_from_user_raw(
     })
 }
 
-unsafe fn la64_copy_to_user_raw(
+pub(crate) unsafe fn la64_copy_to_user_raw(
     dst: UserPtr<u8>,
     _src: *const u8,
     len: usize,
@@ -70,7 +70,13 @@ unsafe fn la64_copy_to_user_raw(
 
 unsafe fn la64_write_user<T: Pod>(dst: UserPtr<T>, value: T) -> Result<(), FaultInfo> {
     let src = core::ptr::addr_of!(value) as *const u8;
-    unsafe { la64_copy_to_user_raw(UserPtr::<u8>::new(dst.addr()), src, core::mem::size_of::<T>()) }
+    unsafe {
+        la64_copy_to_user_raw(
+            UserPtr::<u8>::new(dst.addr()),
+            src,
+            core::mem::size_of::<T>(),
+        )
+    }
 }
 
 unsafe fn la64_read_user<T: Pod>(src: UserPtr<T>) -> Result<T, FaultInfo> {
@@ -265,7 +271,9 @@ impl SignalFrameIf for Platform {
         let frame_addr = align_down(unrounded_frame_addr, LA64_SIGFRAME_ALIGN);
         let frame = La64SignalFrame::new(&tf, &setup);
 
-        unsafe { la64_write_user(UserPtr::<La64SignalFrame>::new(frame_addr), frame)?; }
+        unsafe {
+            la64_write_user(UserPtr::<La64SignalFrame>::new(frame_addr), frame)?;
+        }
 
         let siginfo_addr = frame_addr + core::mem::offset_of!(La64SignalFrame, siginfo);
         let ucontext_addr = frame_addr + core::mem::offset_of!(La64SignalFrame, user_context);

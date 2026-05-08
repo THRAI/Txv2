@@ -100,7 +100,7 @@ impl tx_hal::PowerIf for TestPlatform {
     }
 }
 
-fn make_view(syscall_number: u64, syscall_args: [u64; 6]) -> TrapFrameView<'static> {
+fn make_view(syscall_number: u64, syscall_args: [u64; 6]) -> TrapFrameView {
     TrapFrameView::new(
         VirtAddr(0x1000),
         VirtAddr(0x7fff_ffff_0000),
@@ -114,7 +114,7 @@ fn make_view(syscall_number: u64, syscall_args: [u64; 6]) -> TrapFrameView<'stat
     )
 }
 
-fn make_pf_view() -> TrapFrameView<'static> {
+fn make_pf_view() -> TrapFrameView {
     TrapFrameView::new(
         VirtAddr(0x1000),
         VirtAddr(0x7fff_ffff_0000),

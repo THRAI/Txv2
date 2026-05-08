@@ -587,6 +587,8 @@ mod tests {
         let options = QemuOptions {
             expect_sentinel: true,
             timeout: Duration::from_secs(10),
+            no_block: false,
+            interactive: false,
         };
         let command = qemu_command(
             Path::new("/tmp/tx"),
