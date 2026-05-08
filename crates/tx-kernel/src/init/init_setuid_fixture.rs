@@ -1,94 +1,94 @@
-//! Sibling `/setuid-target` fixture binary for the DAC + setuid slice
-//! (Wave 5, Part 8 — end-to-end smoke).
-//!
-//! ## Decision: sibling fixture, not extend-in-place
-//!
-//! The plan's Open Q #4 (DECIDED 2026-05-06) authored before the
-//! fork/clone/wait4 fixture rewrite recommended *extending*
-//! `init_fixture.rs` to ALSO carry the setuid switcher shape. Since
-//! that decision was made, the fork/clone/wait4 slice's Wave 4 grew
-//! `init_fixture.rs` into a fork+wait+exit binary with ~7 pinned
-//! byte tests; layering a third behaviour (drop-privs → execve →
-//! observe-euid) on top of that already-load-bearing fixture would
-//! require another rewrite of the whole hand-encoding without
-//! benefiting either smoke. **Wave 5 deviation: ship the sibling
-//! fixture (`init_setuid_fixture.rs`) the plan's Part 8 section
-//! heading already named.** The fork/wait fixture stays a stable
-//! smoke target; this new fixture is purely a setuid drop-target.
-//!
-//! ## Behaviour
-//!
-//! ```text
-//! _start:
-//!     li   a7, 174       ; NR_GETUID
-//!     ecall              ; a0 ← real uid
-//!     li   a7, 175       ; NR_GETEUID
-//!     ecall              ; a0 ← effective uid
-//!     li   a7, 94        ; NR_EXIT_GROUP
-//!     li   a0, 0
-//!     ecall
-//! ```
-//!
-//! Pure cred-introspection + clean exit. No `write` to the console —
-//! the smoke asserts on cred state and `saved_user_context.pc`,
-//! not on console output. Compared to the fork/clone/wait4
-//! fixture's 32 instructions, this fixture is 7 instructions
-//! (28 bytes of code).
-//!
-//! The Linux RV64 syscall ABI is: `a7` carries the syscall number,
-//! `a0..a6` the arguments, `ecall` traps. The shim layer's
-//! `linux_syscall::dispatch` matches on `a7` and dispatches to the
-//! corresponding arm. Wave 2 of this slice wired NR_GETUID /
-//! NR_GETEUID. NR_EXIT_GROUP shipped pre-slice via the ELF loader.
-//!
-//! ## ELF layout
-//!
-//! ```text
-//! Offset | Size | Contents
-//! -------|------|------------------------------------------------
-//!   0    |  64  | ELF64 Ehdr
-//!  64    |  56  | PT_PHDR (program-header self-cover)
-//! 120    |  56  | PT_LOAD (R+X, covers the entire file)
-//! 176    |  28  | code (7 RV64 instructions × 4 bytes)
-//! -------|------|------------------------------------------------
-//! Total: 204 bytes.
-//! ```
-//!
-//! `LOAD_VADDR = 0x10000` (low userspace; matches the fork/wait
-//! fixture's load vaddr — the two fixtures are not co-resident in
-//! a single AddressSpace, so the shared vaddr is fine).
-//!
-//! Entry: `LOAD_VADDR + 176 = 0x100B0` (first instruction).
-//!
-//! ## RV64 byte map (each 32-bit instruction is little-endian)
-//!
-//! ```text
-//! Insn # | VAddr   | Hex Encoding | Mnemonic
-//! -------|---------|--------------|-------------------------------
-//!   0    | 0x100B0 | 93 08 E0 0A  | li   a7, 174       (0x0AE00893)
-//!   1    | 0x100B4 | 73 00 00 00  | ecall              (0x00000073)
-//!   2    | 0x100B8 | 93 08 F0 0A  | li   a7, 175       (0x0AF00893)
-//!   3    | 0x100BC | 73 00 00 00  | ecall              (0x00000073)
-//!   4    | 0x100C0 | 93 08 E0 05  | li   a7, 94        (0x05E00893)
-//!   5    | 0x100C4 | 13 05 00 00  | li   a0, 0         (0x00000513)
-//!   6    | 0x100C8 | 73 00 00 00  | ecall              (0x00000073)
-//! ```
-//!
-//! ## RV64 encoding cross-checks
-//!
-//! - `addi` (I-type): bits[31:20]=imm[11:0], bits[19:15]=rs1=0,
-//!   bits[14:12]=000 (funct3), bits[11:7]=rd, bits[6:0]=0010011.
-//!   `li rd, k` is `addi rd, x0, k`.
-//! - `li a7, 174`: rd=17 (a7), imm=174=0xAE → `0AE00893`.
-//! - `li a7, 175`: rd=17, imm=175=0xAF → `0AF00893`.
-//! - `li a7, 94`:  rd=17, imm=94=0x5E → `05E00893`.
-//! - `li a0, 0`:   rd=10, imm=0 → `00000513`.
-//! - `ecall` is the all-zeros encoding plus opcode `0x73`
-//!   (`0x00000073`).
-//! - All immediates are within ±2047 so no `lui` prefix is needed.
-//!
-//! (Encodings cross-checked against RV64I ABI / Volume I:
-//! User-Level ISA §2.5 / §2.7.)
+// Sibling `/setuid-target` fixture binary for the DAC + setuid slice
+// (Wave 5, Part 8 — end-to-end smoke).
+//
+// ## Decision: sibling fixture, not extend-in-place
+//
+// The plan's Open Q #4 (DECIDED 2026-05-06) authored before the
+// fork/clone/wait4 fixture rewrite recommended *extending*
+// `init_fixture.rs` to ALSO carry the setuid switcher shape. Since
+// that decision was made, the fork/clone/wait4 slice's Wave 4 grew
+// `init_fixture.rs` into a fork+wait+exit binary with ~7 pinned
+// byte tests; layering a third behaviour (drop-privs → execve →
+// observe-euid) on top of that already-load-bearing fixture would
+// require another rewrite of the whole hand-encoding without
+// benefiting either smoke. **Wave 5 deviation: ship the sibling
+// fixture (`init_setuid_fixture.rs`) the plan's Part 8 section
+// heading already named.** The fork/wait fixture stays a stable
+// smoke target; this new fixture is purely a setuid drop-target.
+//
+// ## Behaviour
+//
+// ```text
+// _start:
+//     li   a7, 174       ; NR_GETUID
+//     ecall              ; a0 ← real uid
+//     li   a7, 175       ; NR_GETEUID
+//     ecall              ; a0 ← effective uid
+//     li   a7, 94        ; NR_EXIT_GROUP
+//     li   a0, 0
+//     ecall
+// ```
+//
+// Pure cred-introspection + clean exit. No `write` to the console —
+// the smoke asserts on cred state and `saved_user_context.pc`,
+// not on console output. Compared to the fork/clone/wait4
+// fixture's 32 instructions, this fixture is 7 instructions
+// (28 bytes of code).
+//
+// The Linux RV64 syscall ABI is: `a7` carries the syscall number,
+// `a0..a6` the arguments, `ecall` traps. The shim layer's
+// `linux_syscall::dispatch` matches on `a7` and dispatches to the
+// corresponding arm. Wave 2 of this slice wired NR_GETUID /
+// NR_GETEUID. NR_EXIT_GROUP shipped pre-slice via the ELF loader.
+//
+// ## ELF layout
+//
+// ```text
+// Offset | Size | Contents
+// -------|------|------------------------------------------------
+//   0    |  64  | ELF64 Ehdr
+//  64    |  56  | PT_PHDR (program-header self-cover)
+// 120    |  56  | PT_LOAD (R+X, covers the entire file)
+// 176    |  28  | code (7 RV64 instructions × 4 bytes)
+// -------|------|------------------------------------------------
+// Total: 204 bytes.
+// ```
+//
+// `LOAD_VADDR = 0x10000` (low userspace; matches the fork/wait
+// fixture's load vaddr — the two fixtures are not co-resident in
+// a single AddressSpace, so the shared vaddr is fine).
+//
+// Entry: `LOAD_VADDR + 176 = 0x100B0` (first instruction).
+//
+// ## RV64 byte map (each 32-bit instruction is little-endian)
+//
+// ```text
+// Insn # | VAddr   | Hex Encoding | Mnemonic
+// -------|---------|--------------|-------------------------------
+//   0    | 0x100B0 | 93 08 E0 0A  | li   a7, 174       (0x0AE00893)
+//   1    | 0x100B4 | 73 00 00 00  | ecall              (0x00000073)
+//   2    | 0x100B8 | 93 08 F0 0A  | li   a7, 175       (0x0AF00893)
+//   3    | 0x100BC | 73 00 00 00  | ecall              (0x00000073)
+//   4    | 0x100C0 | 93 08 E0 05  | li   a7, 94        (0x05E00893)
+//   5    | 0x100C4 | 13 05 00 00  | li   a0, 0         (0x00000513)
+//   6    | 0x100C8 | 73 00 00 00  | ecall              (0x00000073)
+// ```
+//
+// ## RV64 encoding cross-checks
+//
+// - `addi` (I-type): bits[31:20]=imm[11:0], bits[19:15]=rs1=0,
+//   bits[14:12]=000 (funct3), bits[11:7]=rd, bits[6:0]=0010011.
+//   `li rd, k` is `addi rd, x0, k`.
+// - `li a7, 174`: rd=17 (a7), imm=174=0xAE → `0AE00893`.
+// - `li a7, 175`: rd=17, imm=175=0xAF → `0AF00893`.
+// - `li a7, 94`:  rd=17, imm=94=0x5E → `05E00893`.
+// - `li a0, 0`:   rd=10, imm=0 → `00000513`.
+// - `ecall` is the all-zeros encoding plus opcode `0x73`
+//   (`0x00000073`).
+// - All immediates are within ±2047 so no `lui` prefix is needed.
+//
+// (Encodings cross-checked against RV64I ABI / Volume I:
+// User-Level ISA §2.5 / §2.7.)
 
 /// LOAD virtual address (entry of the PT_LOAD segment).
 #[allow(dead_code)] // referenced from host-side tests (#[cfg(test)]).
