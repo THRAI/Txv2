@@ -103,11 +103,12 @@ pub use numbers::{
     NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID,
     NR_GETRESUID, NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_KILL, NR_LINKAT, NR_LSEEK,
     NR_MADVISE, NR_MKDIRAT, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP,
-    NR_NEWFSTATAT, NR_OPENAT, NR_PIPE2, NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_RENAMEAT2,
+    NR_NEWFSTATAT, NR_OPENAT, NR_PIPE2, NR_PRLIMIT64, NR_READ, NR_READV, NR_READLINKAT, NR_RENAMEAT2,
     NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGRETURN, NR_SETGID, NR_SETPGID, NR_SETREGID,
     NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
     NR_SET_TID_ADDRESS, NR_SYMLINKAT, NR_TGKILL, NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK,
-    NR_UNAME, NR_UNLINKAT, NR_UTIMENSAT, NR_FTRUNCATE, NR_WAIT4, NR_WRITE, O_ACCMODE, O_APPEND,
+    NR_UNAME, NR_UNLINKAT, NR_UTIMENSAT, NR_FTRUNCATE, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE,
+    O_APPEND,
     O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
     PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, RENAME_EXCHANGE,
     RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA,
@@ -373,7 +374,9 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
 ) -> SyscallResult {
     match req.nr {
         NR_WRITE => sys_write(req.args, ctx).await,
+        NR_WRITEV => sys_writev(req.args, ctx).await,
         NR_READ => sys_read(req.args, ctx).await,
+        NR_READV => sys_readv(req.args, ctx).await,
         NR_EXIT => sys_exit(req.args, ctx),
         NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
         NR_GETPID => sys_getpid(ctx),
@@ -570,6 +573,120 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
 /// into kernel-readable memory (the test scaffolding allocates from
 /// the test's stack/heap). General `copy_from_user` is out of scope
 /// per §"Out of scope".
+/// `writev(fd, iov, iovcnt)` — gather-write per `man 2 writev`.
+///
+/// musl's stdio (`fwrite` / `fputs` / etc.) uses `writev` rather than
+/// `write` to flush its line-buffered stdio, so this is on busybox's
+/// startup hot path: without it, every stdio write returns `-ENOSYS`,
+/// busybox treats the negative return as a fatal error and crashes
+/// while trying to print a diagnostic.
+///
+/// Implementation: walk the user's `struct iovec[iovcnt]`
+/// (`[*const u8; 8]` + `usize`, 16 bytes per entry on RV64), copy
+/// each entry into a kernel `iovec_local` and forward to `sys_write`.
+/// Returns the cumulative byte count, with Linux's standard partial-
+/// success policy: a short or failed write on entry N returns the
+/// running total if `total > 0`, or the error from entry N otherwise.
+async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let iov_ptr = args[1];
+    let iovcnt = args[2] as i32;
+
+    if iovcnt < 0 || iovcnt > 1024 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if iovcnt == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    const IOVEC_BYTES: u64 = 16;
+    let mut total: i64 = 0;
+    for i in 0..iovcnt as u64 {
+        let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
+        let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+            if total > 0 {
+                return SyscallResult::Return(total);
+            }
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
+        let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
+        if len == 0 {
+            continue;
+        }
+
+        let write_args = [args[0], base, len, 0, 0, 0];
+        match sys_write(write_args, ctx).await {
+            SyscallResult::Return(n) => {
+                total += n;
+                // Short write: stop here and return what we got. Linux
+                // does the same — writev never silently combines past
+                // a short write.
+                if (n as u64) < len {
+                    return SyscallResult::Return(total);
+                }
+            }
+            SyscallResult::Error(e) => {
+                if total > 0 {
+                    return SyscallResult::Return(total);
+                }
+                return SyscallResult::Error(e);
+            }
+            other => return other,
+        }
+    }
+    SyscallResult::Return(total)
+}
+
+/// `readv(fd, iov, iovcnt)` — scatter-read counterpart of `sys_writev`.
+async fn sys_readv<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let iov_ptr = args[1];
+    let iovcnt = args[2] as i32;
+
+    if iovcnt < 0 || iovcnt > 1024 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if iovcnt == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    const IOVEC_BYTES: u64 = 16;
+    let mut total: i64 = 0;
+    for i in 0..iovcnt as u64 {
+        let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
+        let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+            if total > 0 {
+                return SyscallResult::Return(total);
+            }
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
+        let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
+        if len == 0 {
+            continue;
+        }
+
+        let read_args = [args[0], base, len, 0, 0, 0];
+        match sys_read(read_args, ctx).await {
+            SyscallResult::Return(n) => {
+                total += n;
+                if (n as u64) < len {
+                    return SyscallResult::Return(total);
+                }
+            }
+            SyscallResult::Error(e) => {
+                if total > 0 {
+                    return SyscallResult::Return(total);
+                }
+                return SyscallResult::Error(e);
+            }
+            other => return other,
+        }
+    }
+    SyscallResult::Return(total)
+}
+
 async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let buf_ptr = args[1] as usize;

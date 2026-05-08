@@ -395,6 +395,73 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     let new_aspace = vm_scripts::build_aspace_from_image::<P>(&image_plan)
         .map_err(ExecError::from_build_aspace_error)?;
 
+    // ===== Phase 5a — eagerly populate partial-last-page bytes ========
+    //
+    // Per the ELF spec, bytes in the LAST file-backed page of a LOAD
+    // segment that lie beyond `vaddr + filesz` must read as zero.
+    // `register_load_segment` rounds the file-backed range DOWN to a
+    // page boundary so the partial last page (if any) lands in the
+    // segment's anon range. Here we eagerly populate that page's
+    // file-content prefix from the PageContainer; the rest of the
+    // page stays zero (fresh anon allocation).
+    //
+    // Without this, the partial-last-page bytes past `filesz` would
+    // be either zero (if the recipe is anon — the case we set up here)
+    // or arbitrary file bytes from the next file-offset region (the
+    // case before the fix; busybox.musl crashed dereferencing
+    // ".got\0ata" string fragments via gp-relative loads into its
+    // BSS-extension area).
+    let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+    for segment in &image_plan.load_segments {
+        if segment.filesz == 0 {
+            continue;
+        }
+        // Only segments with BSS extension (memsz > filesz) get the
+        // partial-last-page anon-with-eager-copy treatment per
+        // `register_load_segment`'s comment block. Segments without
+        // BSS keep the original Page-backed-up-to-`file_end_rounded`
+        // shape — there's no observable junk past filesz because
+        // userspace doesn't access bytes past `vaddr + memsz`.
+        if segment.memsz <= segment.filesz {
+            continue;
+        }
+        let file_end = segment
+            .vaddr
+            .checked_add(segment.filesz)
+            .ok_or(ExecError::NotExecutable)?;
+        let partial_in_page = file_end & (page_size - 1);
+        if partial_in_page == 0 {
+            continue;
+        }
+        let partial_start = file_end - partial_in_page;
+        // File offset of `partial_start`. The segment's
+        // `file_offset` corresponds to `vaddr`; offsetting by
+        // `partial_start - vaddr` gives the file offset of the
+        // partial-last-page's start.
+        let file_off = segment
+            .file_offset
+            .checked_add(partial_start - segment.vaddr)
+            .ok_or(ExecError::NotExecutable)?;
+        let mut buf = alloc::vec![0u8; partial_in_page as usize];
+        {
+            let guard = tx_substrate::epoch::guard();
+            match read_exact_at(&segment.backing, file_off, &mut buf, &guard) {
+                StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+                StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                    return Err(ExecError::Busy);
+                }
+                StepOutcome::Err(_) => return Err(ExecError::NotExecutable),
+            }
+        }
+        match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                return Err(ExecError::Busy);
+            }
+            StepOutcome::Err(err) => return Err(ExecError::from_populate_errno(err)),
+        }
+    }
+
     // ===== Phase 5 — compose + populate user stack ===================
     //
     // `txdoc:EXEC-9-3-POPULATE-THE-INITIAL-USER-STACK`. Build the
