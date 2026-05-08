@@ -194,11 +194,27 @@ pub async fn run_thread<P: TxPlatform>(
     payload: PayloadCap<ThreadPayload>,
 ) {
     loop {
-        // (1) Open a userspace-run wait so the trap shell has a token
-        // to resolve. On exit_group the previous iteration set
-        // `active_userspace_request = None`; on the very first
-        // iteration the bootstrap left it `None`.
-        let wait = match payload.userspace_slot().start_request() {
+        // ----------------------------------------------------------------
+        // (1) ENTRY-SIDE WAIT + AST CHECKPOINT.
+        //
+        // Open the userspace-run wait *before* diving into userspace.
+        // This is the resolution token the trap shell will fill in
+        // when the next userspace trap fires
+        // (`txdoc:REACTOR-USERSPACE-RUN-AS-A-WAIT`).
+        //
+        // First iteration: `saved_user_context` was seeded by
+        // `exec_script` (entry pc + initial sp), `pending_syscall_return`
+        // is empty, so the merged ctx below is the fresh user state.
+        // Subsequent iterations: the previous round-trip's trap-shell
+        // hand-off stashed `saved_user_context`; the previous arm of
+        // this loop's match wrote `pending_syscall_return` (Syscall
+        // arm) or left it empty (PageFault Ok / ExecCommitted).
+        //
+        // The AST-checkpoint's empty-batch variant is the Phase-2
+        // shape; per-task AST plumbing fills the batch in a later
+        // slice.
+        // ----------------------------------------------------------------
+        let entry_wait = match payload.userspace_slot().start_request() {
             Ok(w) => w,
             Err(_) => {
                 // Slot busy or exhausted — log via panic in the slice
@@ -207,14 +223,63 @@ pub async fn run_thread<P: TxPlatform>(
                 panic!("run_thread: userspace_slot::start_request failed");
             }
         };
-        let req_token = wait.request();
-        payload.set_active_userspace_request(Some(req_token));
+        let entry_token = entry_wait.request();
+        payload.set_active_userspace_request(Some(entry_token));
+        let decision = payload.userspace_slot().checkpoint_userspace_entry_batch(
+            entry_token,
+            AstBatch::default(),
+            |_ckpt| UserspaceEntryDecision::EnterUserspace,
+        );
+        debug_assert!(
+            decision.is_ok(),
+            "checkpoint_userspace_entry_batch must succeed with the freshly-started \
+             entry-side request"
+        );
 
-        // (2) Await the wait. Yields Pending; trap shell resolves via
-        // `complete_interesting_trap` on the next userspace trap.
-        let trap = wait.await;
+        // ----------------------------------------------------------------
+        // (2) BUILD MERGED CONTEXT AND DIVE INTO USERSPACE.
+        //
+        // `prepare_userspace_entry_payload` is the single Plan B
+        // writeback site (`txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`):
+        // drains `pending_syscall_return` and overlays it into the
+        // ctx's `a0` slot, then clears `active_userspace_request`.
+        //
+        // We re-set `active_userspace_request` after `prepare_*` to
+        // keep the trap-shell hand-off pointing at our `entry_wait`
+        // token: `prepare_*` cleared it as part of its writeback
+        // discipline; the upcoming user trap needs it published.
+        //
+        // `enter_userspace_with_context` is `()`-typed but its
+        // platform impl on a real board diverges via `sret` and
+        // returns only when the trap handler chooses
+        // `TrapAction::Reschedule` (the platform's trap-shell
+        // longjmps back to this call site, restoring the kernel sp /
+        // ra / s-regs the platform's userspace-entry shim stashed
+        // before `sret`). On host platforms the default `panic!`
+        // body remains divergent — host tests override it with a
+        // recording no-op + Pending fallthrough so `run_thread` can
+        // be exercised end-to-end.
+        // ----------------------------------------------------------------
+        let ctx = prepare_userspace_entry_payload(&payload);
+        payload.set_active_userspace_request(Some(entry_token));
+        <P as TrapIf>::enter_userspace_with_context(ctx);
 
-        // (3) Dispatch the resolved trap.
+        // ----------------------------------------------------------------
+        // (3) AWAIT THE RESOLVED WAIT.
+        //
+        // On a real platform with the reschedule longjmp wired up,
+        // the wait was resolved by the trap shell *before*
+        // `enter_userspace_with_context` returned, so this `.await`
+        // is a fast Poll::Ready pop. On host platforms with a
+        // recording-no-op override, the wait is Pending here and
+        // the test driver resolves it with the scripted trap before
+        // the next poll.
+        // ----------------------------------------------------------------
+        let trap = entry_wait.await;
+
+        // ----------------------------------------------------------------
+        // (4) DISPATCH THE RESOLVED TRAP.
+        // ----------------------------------------------------------------
         match trap {
             UserspaceTrapInfo::Syscall(req) => {
                 // Resolve the syscall context from the payload.
@@ -325,84 +390,9 @@ pub async fn run_thread<P: TxPlatform>(
                 return;
             }
         }
-
-        // (4) AST drain ordering — Cross-cutting risk #3. The AST
-        // checkpoint must run before `prepare_userspace_entry_payload`
-        // so a signal posted between syscall resolution and userspace
-        // re-entry traverses the checkpoint.
-        //
-        // **Two-phase request lifecycle.** The wait `req_token` from
-        // step (1) is the *resolution* request — it carries the
-        // trap-shell hand-off for the just-completed userspace
-        // round-trip. Once `wait.await` returned, that request was
-        // consumed and the slot returned to idle (`UserspaceRunWait::poll`
-        // clears `state.active` on the Resolved arm). The
-        // userspace-entry checkpoint runs on a *fresh* request — the
-        // one that will be resolved by the **next** userspace trap.
-        // This gives the AST policy hook a non-resolved request to
-        // gate against (`active_status` rejects `Resolved`-phase
-        // requests with `AlreadyResolved`).
-        //
-        // For Phase 2 the only valid `UserspaceEntryDecision` is
-        // `EnterUserspace`; the reactor task crate does not yet
-        // expose a per-task `AstSlot` accessor, so we drive the
-        // empty-batch variant. When the per-task AST plumbing lands
-        // the `AstBatch::default()` here is replaced by the drained
-        // slot.
-        let entry_wait = match payload.userspace_slot().start_request() {
-            Ok(w) => w,
-            Err(_) => panic!(
-                "run_thread: userspace_slot::start_request failed before \
-                 userspace re-entry"
-            ),
-        };
-        let entry_token = entry_wait.request();
-        payload.set_active_userspace_request(Some(entry_token));
-        let decision = payload.userspace_slot().checkpoint_userspace_entry_batch(
-            entry_token,
-            AstBatch::default(),
-            |_ckpt| UserspaceEntryDecision::EnterUserspace,
-        );
-        debug_assert!(
-            decision.is_ok(),
-            "checkpoint_userspace_entry_batch must succeed with the freshly-started \
-             entry-side request"
-        );
-
-        // (5) Build the merged context and dive into userspace. The
-        // call is `-> !`; control returns through the trap vector,
-        // not through this call site. The next userspace trap will
-        // resolve `entry_wait` (its `request()` is what
-        // `set_active_userspace_request` made visible to the trap
-        // shell). On the next poll of this future, the loop top
-        // calls `start_request` again expecting an idle slot — the
-        // trap shell's `complete_interesting_trap` + this future's
-        // `wait.await` (in step (2)) consumes `entry_wait` and
-        // returns the slot to idle, so the next iteration's
-        // `start_request` succeeds.
-        //
-        // Note: `prepare_userspace_entry_payload` clears
-        // `active_userspace_request` after consuming the saved
-        // context. We re-set it above (right after the entry-side
-        // `start_request`); the clear inside `prepare_*` then
-        // restores the trap shell's view to "no active request"
-        // briefly, but the entry wait is still alive and will be
-        // dispatched to the trap shell on the very next user trap
-        // because `prepare_*` runs synchronously between the
-        // checkpoint and the divergent call.
-        let ctx = prepare_userspace_entry_payload(&payload);
-        // Re-publish the entry token — `prepare_userspace_entry_payload`
-        // cleared it as part of the Plan B writeback discipline. The
-        // trap shell needs an active request to hand off the next
-        // userspace trap into.
-        payload.set_active_userspace_request(Some(entry_token));
-        // Keep `entry_wait` alive across the divergent call. The
-        // future's pinned state retains the `UserspaceRunWait` so
-        // the slot's `active` entry persists for the trap shell to
-        // resolve. `core::mem::forget` would also work but we use
-        // a held binding to keep ownership obvious.
-        let _entry_wait_guard = entry_wait;
-        <P as TrapIf>::enter_userspace_with_context(ctx);
+        // Fall through to the top of the loop — next iteration
+        // re-opens the entry-side wait, re-runs the AST checkpoint,
+        // and re-dives into userspace with the merged context.
     }
 }
 

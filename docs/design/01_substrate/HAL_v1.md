@@ -1330,6 +1330,35 @@ pub trait TrapIf {
     /// Diverges. Caller must have arranged for the trap frame's pc
     /// and registers to be in the desired state.
     unsafe fn return_to_userspace(tf: &Self::RawTrapFrame) -> !;
+
+    /// Enter userspace with the given merged trap context, then
+    /// **return** when the trap shell longjmps back on
+    /// `TrapAction::Reschedule`.
+    ///
+    /// Despite the `()` return type, this method's body runs to a
+    /// trap and back: the platform's userspace-entry shim stashes
+    /// the kernel-side caller's `(sp, ra, callee-saved s-regs)` into
+    /// a per-hart `KernelResumeCtx`, materialises a fresh trap frame
+    /// from `ctx`, and `sret`s into user mode. The next userspace
+    /// trap fires the trap-vector, which `csrrw`-swaps onto the
+    /// per-CPU trap-handler stack via `sscratch` (boot-primed once
+    /// per hart), runs the kernel trap entry, dispatches to
+    /// `KernelTrapSink`, and applies the resulting `TrapAction`.
+    /// `Resume` and `DeliverSignal` pop+`sret` back to userspace
+    /// (no return through this call); `Reschedule` longjmps via the
+    /// `KernelResumeCtx` and unwinds back through this call site,
+    /// returning to the caller.
+    ///
+    /// This is the single platform-side site that mutates
+    /// user-visible registers per the Plan B writeback discipline
+    /// pinned by `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`.
+    ///
+    /// The default impl panics; platforms ship their own. Host-test
+    /// platforms (no real `sret`) override with a recording no-op
+    /// or a panic spelling the configuration error.
+    fn enter_userspace_with_context(_ctx: UserTrapContext) {
+        panic!("TrapIf::enter_userspace_with_context: platform has no userspace-entry shim");
+    }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -1531,14 +1560,35 @@ pub trait KernelTrapSink<P: TxPlatform> {
 
 #[derive(Copy, Clone, Debug)]
 pub enum TrapAction {
-    /// Resume the trapped context (most syscalls, handled IRQs,
-    /// resolved page faults).
+    /// Resume the trapped context directly via the trap-vector
+    /// epilogue (pop register file, `sret`/`ertn`). Used for
+    /// handled IRQs, completed signal frames, and any path where
+    /// no kernel-side scheduling decision is needed.
     Resume,
-    /// Reschedule before resuming (timer ticks, preemption-relevant IRQs).
+    /// **Reschedule via longjmp back to the kernel-side caller of
+    /// `TrapIf::enter_userspace_with_context`.** The platform's
+    /// `apply_trap_action` does NOT pop+sret on this arm; it
+    /// restores the saved kernel sp / ra / s-regs from the per-hart
+    /// `KernelResumeCtx` (stashed by the userspace-entry shim
+    /// before its `sret`) and `ret`s. Control unwinds back into the
+    /// thread future's `run_thread` body, which awaits the
+    /// just-resolved userspace-run wait and dispatches the trap.
+    ///
+    /// This is what makes the stackless-coroutine thread model
+    /// composable with userspace: the divergent-into-userspace call
+    /// is brought back through normal function-return semantics.
+    /// Used for syscall traps, page faults the trap shell handed
+    /// off to the future, timer ticks that woke any task, and any
+    /// preemption-relevant IRQ.
     Reschedule,
-    /// Deliver a pending signal at AST.
+    /// Deliver a pending signal at AST. Resume-shaped at the
+    /// platform level (pop+sret); the trap-vector epilogue and the
+    /// AST checkpoint inside the future cooperate to redirect
+    /// userspace entry to the signal handler.
     DeliverSignal,
-    /// Terminate the current thread (unrecoverable fault).
+    /// Terminate the current thread (unrecoverable fault). The
+    /// trap-vector epilogue does not run; the platform panics or
+    /// unwinds to a kernel-side fault handler.
     Terminate,
 }
 

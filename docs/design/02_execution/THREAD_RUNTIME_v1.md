@@ -294,22 +294,47 @@ This matches the general projection-monotonicity discipline (PRED-5): `ThreadIde
 ### 4.1 Shape
 <!-- txdoc:THREAD-4-1-SHAPE -->
 
-A thread is realized as **one reactor task carrying a thread-runtime-authored future**. The future looks roughly like:
+A thread is realized as **one reactor task carrying a thread-runtime-authored future**. The loop is **enter-then-await** per iteration: each iteration first opens the next userspace-run wait, runs the AST/signal checkpoint, builds the merged trap-frame context, dives into userspace via the platform's `enter_userspace_with_context`, and only then awaits the (typically already-resolved) wait to receive the trap.
 
 ```rust
 async fn thread_future(payload: Cap<ThreadPayload>) -> ExitStatus {
     loop {
-        // Request userspace execution; await the next interesting trap.
-        // Timer-based preemption during userspace is transparent to this
-        // await per REACTOR_v0 §Preemption.
-        let trap_info = reactor::request_userspace_run(&payload).await;
+        // (1) Open the next userspace-run wait. The trap shell will
+        //     resolve this wait via `complete_interesting_trap` when
+        //     the upcoming user trap arrives.
+        let entry_wait = open_userspace_run_wait(&payload);
 
-        // Run the trap's handler as a script (syscall dispatch, fault handler).
-        let script_result = dispatch_trap(trap_info, &payload).await;
-
-        // Script has returned; prepare for next userspace entry.
-        // AST/signal-delivery evaluation happens here (see §5.4).
+        // (2) AST checkpoint (§5.4 site B). Signals, exit, stop are
+        //     evaluated here, before userspace entry.
         handle_pending_ast(&payload).await;
+
+        // (3) Build the merged trap-frame context (drains
+        //     pending_syscall_return into the a0 slot — Plan B
+        //     writeback discipline; this is the SINGLE site that
+        //     mutates the user-visible register file) and dive into
+        //     userspace. The platform's `enter_userspace_with_context`
+        //     sret's into user mode and *returns* to this call site
+        //     when the trap shell returns `TrapAction::Reschedule`
+        //     after resolving the wait. Timer preemption during
+        //     userspace is transparent (REACTOR_v0 §Preemption).
+        let ctx = prepare_userspace_entry_payload(&payload);
+        Hal::enter_userspace_with_context(ctx);
+
+        // (4) Await the resolved wait (Poll::Ready immediately on a
+        //     real platform; Pending in host smokes that don't
+        //     simulate the trap-shell longjmp).
+        let trap_info = entry_wait.await;
+
+        // (5) Run the trap's handler as a script (syscall dispatch,
+        //     fault handler). Side-effects land in
+        //     `pending_syscall_return` (syscall return arm) or in
+        //     the AddressSpace (fault-script arm); the next
+        //     iteration's prepare_* drains them.
+        match trap_info {
+            Syscall(req) => dispatch_syscall(req, &payload).await,
+            PageFault(info) => dispatch_fault(info, &payload).await,
+            Fatal(_) => break run_fatal_sequence(payload).await,
+        }
 
         if exit_requested(&payload) {
             break run_exit_sequence(payload).await;
@@ -321,8 +346,9 @@ async fn thread_future(payload: Cap<ThreadPayload>) -> ExitStatus {
 The exact shape is implementation detail. What matters at the architecture level:
 
 - The future's outer loop is **one iteration per interesting trap** (syscall, fault, fatal). Timer preemptions do not advance the loop.
+- The loop is **enter-then-await**, not await-then-dispatch. Iteration 1 enters userspace before any await; the wait is awaited only after `enter_userspace_with_context` returns. This shape is necessary because a stackless coroutine can never be polled to advance through the divergent userspace round-trip — the platform's reschedule longjmp brings control back through `enter_userspace_with_context`'s normal function return.
 - Each iteration invokes a trap-dispatch script (a per-syscall driver for syscall traps, a fault handler for page faults, etc.); the script composes step invocations with wait-adapt waits.
-- Between script completion and userspace re-entry, AST events are consumed.
+- Between script completion and the next userspace entry, AST events are consumed at the top of the next iteration (site B per §5.4).
 - The loop terminates when exit is requested (`exit`, `exit_group`, or fatal signal).
 
 ### 4.2 Ownership
