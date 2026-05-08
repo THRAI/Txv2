@@ -12,9 +12,9 @@ mod lint;
 mod oscomp;
 mod progress;
 mod qemu;
-mod shell_smoke;
 mod submit;
 mod target;
+mod test;
 mod util;
 
 pub fn run() -> Result<()> {
@@ -36,7 +36,7 @@ pub fn run() -> Result<()> {
             check_build::build(&root, &target)
         }
         "qemu" => qemu::qemu(&root, args.collect()),
-        "shell-smoke" => shell_smoke::shell_smoke(&root, args.collect()),
+        "test" => test::test(&root, args.collect()),
         "fault-decode" => fault_decode::fault_decode(&root, args.collect()),
         "image" => image::image(&root, args.collect()),
         "oscomp" => oscomp::oscomp(&root, args.collect()),
@@ -60,8 +60,8 @@ fn print_usage() {
            cargo xtask ci-slow\n\
            cargo xtask check\n\
            cargo xtask build --target rv64-qemu|rv64-m1dock-mock|la64-qemu|all\n\
-           cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox [--dry-run] [--expect-sentinel] [--timeout-ms N]\n\
-           cargo xtask shell-smoke   (interactive busybox-over-QEMU smoke; needs TX_BUSYBOX, riscv64gc-unknown-none-elf, qemu-system-riscv64)\n\
+           cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox [--dry-run] [--expect-sentinel] [--timeout-ms N] [--no-block]\n\
+           cargo xtask test [smoke|busybox-smoke] [--target rv64-qemu] [--timeout-ms N] [--dry-run]\n\
            cargo xtask fault-decode --target rv64-qemu [--elf PATH] [--serial PATH [--all] | --scause HEX --sepc HEX --stval HEX | --addr HEX]\n\
            cargo xtask image cpio --profile busybox\n\
            cargo xtask image ext4 --profile busybox [--size 64M]\n\
