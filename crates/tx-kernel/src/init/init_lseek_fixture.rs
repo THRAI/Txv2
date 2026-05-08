@@ -1,106 +1,106 @@
-//! Sibling `/lseek-target` fixture binary for the fd-ops slice
-//! (Wave 4, Part 6 + Part 8 — end-to-end smoke).
-//!
-//! ## Decision: sibling fixture, not extend-in-place
-//!
-//! `init_fixture.rs` is the fork+wait+exit smoke binary; its byte
-//! stream is pinned by ~7 host-side tests. Layering a third
-//! behaviour (openat → write → lseek → read → close → exit) on top
-//! of that already-load-bearing fixture would invalidate the
-//! existing pins and force a hand-rewrite of the fork/wait
-//! encoding. Following the DAC + setuid Wave 5 deviation
-//! (`init_setuid_fixture.rs`), this new fixture is a sibling — pure
-//! byte-pin shape, never wired into the bootstrap path. The
-//! meaningful coverage for `NR_LSEEK` lives in the tx-shims
-//! dispatch tests; this fixture pins the userspace ABI byte stream
-//! against accidental drift.
-//!
-//! ## Behaviour (intent — never executed end-to-end)
-//!
-//! ```text
-//! _start:
-//!     li   a7, 56        ; NR_OPENAT
-//!     ecall              ; openat(AT_FDCWD, path, O_RDWR|O_CREAT, 0644)
-//!     li   a7, 64        ; NR_WRITE
-//!     ecall              ; write(fd, "hello\n", 6)
-//!     li   a7, 62        ; NR_LSEEK
-//!     ecall              ; lseek(fd, 0, SEEK_SET)
-//!     li   a7, 63        ; NR_READ
-//!     ecall              ; read(fd, buf, 6)
-//!     li   a7, 57        ; NR_CLOSE
-//!     ecall              ; close(fd)
-//!     li   a7, 94        ; NR_EXIT_GROUP
-//!     li   a0, 0
-//!     ecall              ; exit_group(0)
-//! ```
-//!
-//! Argument GPRs (`a0..a6`) are intentionally left undefined. The
-//! Wave 4 brief is explicit that "Layer B" — actually running this
-//! through the reactor — is deferred per slice norm; the ABI byte
-//! stream is what matters here, not a working program.
-//!
-//! The Linux RV64 syscall ABI is: `a7` carries the syscall number,
-//! `a0..a6` the arguments, `ecall` traps. The shim layer's
-//! `linux_syscall::dispatch` matches on `a7` and dispatches to the
-//! corresponding arm. Wave 4 wired NR_LSEEK; the others shipped in
-//! earlier waves (`NR_OPENAT` / `NR_CLOSE` Wave 2; `NR_WRITE` /
-//! `NR_READ` / `NR_EXIT_GROUP` Phase 2a/b).
-//!
-//! ## ELF layout
-//!
-//! ```text
-//! Offset | Size | Contents
-//! -------|------|------------------------------------------------
-//!   0    |  64  | ELF64 Ehdr
-//!  64    |  56  | PT_PHDR (program-header self-cover)
-//! 120    |  56  | PT_LOAD (R+X, covers the entire file)
-//! 176    |  52  | code (13 RV64 instructions × 4 bytes)
-//! -------|------|------------------------------------------------
-//! Total: 228 bytes.
-//! ```
-//!
-//! `LOAD_VADDR = 0x10000` (low userspace; matches the fork/wait and
-//! setuid fixtures' load vaddr — the three fixtures are not
-//! co-resident in a single AddressSpace, so the shared vaddr is
-//! fine).
-//!
-//! Entry: `LOAD_VADDR + 176 = 0x100B0` (first instruction).
-//!
-//! ## RV64 byte map (each 32-bit instruction is little-endian)
-//!
-//! ```text
-//! Insn # | VAddr   | Hex Encoding | Mnemonic
-//! -------|---------|--------------|-------------------------------
-//!   0    | 0x100B0 | 93 08 80 03  | li   a7, 56        (0x03800893)
-//!   1    | 0x100B4 | 73 00 00 00  | ecall              (0x00000073)
-//!   2    | 0x100B8 | 93 08 00 04  | li   a7, 64        (0x04000893)
-//!   3    | 0x100BC | 73 00 00 00  | ecall              (0x00000073)
-//!   4    | 0x100C0 | 93 08 E0 03  | li   a7, 62        (0x03E00893)
-//!   5    | 0x100C4 | 73 00 00 00  | ecall              (0x00000073)
-//!   6    | 0x100C8 | 93 08 F0 03  | li   a7, 63        (0x03F00893)
-//!   7    | 0x100CC | 73 00 00 00  | ecall              (0x00000073)
-//!   8    | 0x100D0 | 93 08 90 03  | li   a7, 57        (0x03900893)
-//!   9    | 0x100D4 | 73 00 00 00  | ecall              (0x00000073)
-//!  10    | 0x100D8 | 93 08 E0 05  | li   a7, 94        (0x05E00893)
-//!  11    | 0x100DC | 13 05 00 00  | li   a0, 0         (0x00000513)
-//!  12    | 0x100E0 | 73 00 00 00  | ecall              (0x00000073)
-//! ```
-//!
-//! ## RV64 encoding cross-checks
-//!
-//! - `addi` (I-type): bits[31:20]=imm[11:0], bits[19:15]=rs1=0,
-//!   bits[14:12]=000 (funct3), bits[11:7]=rd, bits[6:0]=0010011.
-//!   `li rd, k` is `addi rd, x0, k`.
-//! - `li a7, 56`: rd=17 (a7), imm=56=0x038 → `0x03800893`.
-//! - `li a7, 64`: rd=17, imm=64=0x040 → `0x04000893`.
-//! - `li a7, 62`: rd=17, imm=62=0x03E → `0x03E00893`.
-//! - `li a7, 63`: rd=17, imm=63=0x03F → `0x03F00893`.
-//! - `li a7, 57`: rd=17, imm=57=0x039 → `0x03900893`.
-//! - `li a7, 94`: rd=17, imm=94=0x05E → `0x05E00893`.
-//! - `li a0, 0`:  rd=10, imm=0 → `0x00000513`.
-//! - `ecall` is the all-zeros encoding plus opcode `0x73`
-//!   (`0x00000073`).
-//! - All immediates are within ±2047 so no `lui` prefix is needed.
+// Sibling `/lseek-target` fixture binary for the fd-ops slice
+// (Wave 4, Part 6 + Part 8 — end-to-end smoke).
+//
+// ## Decision: sibling fixture, not extend-in-place
+//
+// `init_fixture.rs` is the fork+wait+exit smoke binary; its byte
+// stream is pinned by ~7 host-side tests. Layering a third
+// behaviour (openat → write → lseek → read → close → exit) on top
+// of that already-load-bearing fixture would invalidate the
+// existing pins and force a hand-rewrite of the fork/wait
+// encoding. Following the DAC + setuid Wave 5 deviation
+// (`init_setuid_fixture.rs`), this new fixture is a sibling — pure
+// byte-pin shape, never wired into the bootstrap path. The
+// meaningful coverage for `NR_LSEEK` lives in the tx-shims
+// dispatch tests; this fixture pins the userspace ABI byte stream
+// against accidental drift.
+//
+// ## Behaviour (intent — never executed end-to-end)
+//
+// ```text
+// _start:
+//     li   a7, 56        ; NR_OPENAT
+//     ecall              ; openat(AT_FDCWD, path, O_RDWR|O_CREAT, 0644)
+//     li   a7, 64        ; NR_WRITE
+//     ecall              ; write(fd, "hello\n", 6)
+//     li   a7, 62        ; NR_LSEEK
+//     ecall              ; lseek(fd, 0, SEEK_SET)
+//     li   a7, 63        ; NR_READ
+//     ecall              ; read(fd, buf, 6)
+//     li   a7, 57        ; NR_CLOSE
+//     ecall              ; close(fd)
+//     li   a7, 94        ; NR_EXIT_GROUP
+//     li   a0, 0
+//     ecall              ; exit_group(0)
+// ```
+//
+// Argument GPRs (`a0..a6`) are intentionally left undefined. The
+// Wave 4 brief is explicit that "Layer B" — actually running this
+// through the reactor — is deferred per slice norm; the ABI byte
+// stream is what matters here, not a working program.
+//
+// The Linux RV64 syscall ABI is: `a7` carries the syscall number,
+// `a0..a6` the arguments, `ecall` traps. The shim layer's
+// `linux_syscall::dispatch` matches on `a7` and dispatches to the
+// corresponding arm. Wave 4 wired NR_LSEEK; the others shipped in
+// earlier waves (`NR_OPENAT` / `NR_CLOSE` Wave 2; `NR_WRITE` /
+// `NR_READ` / `NR_EXIT_GROUP` Phase 2a/b).
+//
+// ## ELF layout
+//
+// ```text
+// Offset | Size | Contents
+// -------|------|------------------------------------------------
+//   0    |  64  | ELF64 Ehdr
+//  64    |  56  | PT_PHDR (program-header self-cover)
+// 120    |  56  | PT_LOAD (R+X, covers the entire file)
+// 176    |  52  | code (13 RV64 instructions × 4 bytes)
+// -------|------|------------------------------------------------
+// Total: 228 bytes.
+// ```
+//
+// `LOAD_VADDR = 0x10000` (low userspace; matches the fork/wait and
+// setuid fixtures' load vaddr — the three fixtures are not
+// co-resident in a single AddressSpace, so the shared vaddr is
+// fine).
+//
+// Entry: `LOAD_VADDR + 176 = 0x100B0` (first instruction).
+//
+// ## RV64 byte map (each 32-bit instruction is little-endian)
+//
+// ```text
+// Insn # | VAddr   | Hex Encoding | Mnemonic
+// -------|---------|--------------|-------------------------------
+//   0    | 0x100B0 | 93 08 80 03  | li   a7, 56        (0x03800893)
+//   1    | 0x100B4 | 73 00 00 00  | ecall              (0x00000073)
+//   2    | 0x100B8 | 93 08 00 04  | li   a7, 64        (0x04000893)
+//   3    | 0x100BC | 73 00 00 00  | ecall              (0x00000073)
+//   4    | 0x100C0 | 93 08 E0 03  | li   a7, 62        (0x03E00893)
+//   5    | 0x100C4 | 73 00 00 00  | ecall              (0x00000073)
+//   6    | 0x100C8 | 93 08 F0 03  | li   a7, 63        (0x03F00893)
+//   7    | 0x100CC | 73 00 00 00  | ecall              (0x00000073)
+//   8    | 0x100D0 | 93 08 90 03  | li   a7, 57        (0x03900893)
+//   9    | 0x100D4 | 73 00 00 00  | ecall              (0x00000073)
+//  10    | 0x100D8 | 93 08 E0 05  | li   a7, 94        (0x05E00893)
+//  11    | 0x100DC | 13 05 00 00  | li   a0, 0         (0x00000513)
+//  12    | 0x100E0 | 73 00 00 00  | ecall              (0x00000073)
+// ```
+//
+// ## RV64 encoding cross-checks
+//
+// - `addi` (I-type): bits[31:20]=imm[11:0], bits[19:15]=rs1=0,
+//   bits[14:12]=000 (funct3), bits[11:7]=rd, bits[6:0]=0010011.
+//   `li rd, k` is `addi rd, x0, k`.
+// - `li a7, 56`: rd=17 (a7), imm=56=0x038 → `0x03800893`.
+// - `li a7, 64`: rd=17, imm=64=0x040 → `0x04000893`.
+// - `li a7, 62`: rd=17, imm=62=0x03E → `0x03E00893`.
+// - `li a7, 63`: rd=17, imm=63=0x03F → `0x03F00893`.
+// - `li a7, 57`: rd=17, imm=57=0x039 → `0x03900893`.
+// - `li a7, 94`: rd=17, imm=94=0x05E → `0x05E00893`.
+// - `li a0, 0`:  rd=10, imm=0 → `0x00000513`.
+// - `ecall` is the all-zeros encoding plus opcode `0x73`
+//   (`0x00000073`).
+// - All immediates are within ±2047 so no `lui` prefix is needed.
 
 /// LOAD virtual address (entry of the PT_LOAD segment).
 #[allow(dead_code)] // referenced only from the host-side test below.

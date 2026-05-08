@@ -4,6 +4,33 @@
 
 ## Current Shape
 
+- 2026-05-08 jumbo-mod split on branch `feat/busybox-smoke` (PR
+  #21). Mechanical refactor: every authored Rust file > 1500
+  lines has been broken into per-family submodules per
+  `docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md`.
+  Files split: `crates/tx-shims/src/linux_syscall/mod.rs`
+  (5871→1131) into 10 family files (cred, time, signal, vm, io,
+  fs_basic, fs_path, fs_mut, proc, misc); `linux_syscall/tests.rs`
+  (8216→1145) into 15 sub-test files mirroring the family
+  layout; `crates/tx-kernel/src/init.rs` (1704→1158) extracted
+  `init/exec.rs`; `crates/tx-subsystems/src/process/tests.rs`
+  (1633→1374), `signal/tests.rs` (1566→308), `vm/tests.rs`
+  (1535→1324) extracted into per-test submodules; and
+  `boards/tx-hal-riscv64-qemu-virt/src/lib.rs` (1752→1417)
+  extracted `boot_trampoline.rs` (the boot-time `global_asm!`)
+  and `sbi.rs` (the SBI ecall wrappers). All authored Rust
+  files now fit under the `MAX_AUTHORED_RUST_FILE_LINES = 1_500`
+  lint cap. Verified: `cargo build` clean on host and
+  `riscv64gc-unknown-none-elf`; `cargo xtask lint arch` improved
+  from 63 → 45 issues (pre-existing dead-code allowances in
+  files I didn't touch). Workspace tests: 1109 passed, 1
+  pre-existing flake (`vfs::walker::tests::step_walk_returns_eloop_after_41_hops`,
+  passes in isolation, fails under `--test-threads=1` when
+  preceded by a sibling that perturbs the epoch/zone state —
+  documented as the main-side cascade). Next: rebase user-facing
+  busybox-smoke work on the cleaner module tree.
+
+
 - 2026-05-08 userspace first-entry slice 2 — **functionally
   complete**. Branch `feat/busybox-smoke`. Six commits:
   `196a969` (model: type+loop+docs), `eb3e66a` (asm:
