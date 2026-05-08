@@ -1599,16 +1599,19 @@ No subsystem code references `sepc`, `sstatus`, `sscratch`, `era`, `prmd`, `badv
 
 ---
 
-## 12. UserAccessIf — kernel-mode user access and fixup recovery
+## 12. UserAccessIf — VM-resolved user access and fixup recovery
 <!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-1 -->
 
-`UserAccessIf` is logically distinct from `TrapIf`. `TrapIf` answers "what happened at trap entry, and how do we return?" `UserAccessIf` answers "how does a kernel-mode user-memory access fail safely and become a syscall-level error?"
+`UserAccessIf` is logically distinct from `TrapIf`. `TrapIf` answers "what happened at trap entry, and how do we return?" The user-access boundary answers "how does kernel code copy bytes to or from a user address without treating that address as authority?"
+
+The primary design is VM-resolved, not fault-driven. Kernel copyin/copyout first walks the current `AddressSpace` recipes, observes the covering `VmEntry` values, materializes or observes the relevant pmap leaves, translates the resulting PPNs through the direct map, and then copies kernel-to-kernel through those direct-map addresses. The architecture-specific fixup path remains only a recovery fence for accidental kernel-mode faults in tiny raw-copy windows; it is not the normal authorization or translation mechanism.
 
 This split matters because:
 
-- The fixup table is a build-time artifact (linker-section metadata).
-- The recovery mechanism is a kernel-mode-fault-only path; it does not interact with user trap entry.
-- Subsystems that copy to/from user (every syscall that takes a pointer) need a clean error-channel surface, not direct access to the trap path.
+- `VmEntry` is the authoritative mapping binding; the pmap is only derived materialization.
+- VM copyin/copyout can acquire the declared user range, re-read recipes, and block/retry consistently with the fault-script model.
+- The fixup table is a build-time artifact used for defensive recovery, not a permission oracle.
+- Subsystems that copy to/from user need a clean error-channel surface, not direct access to trap entry or raw page-table state.
 
 ### 12.1 Trait surface
 <!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-TRAIT-SURFACE-1 -->
@@ -1618,8 +1621,9 @@ pub trait UserAccessIf {
     /// Copy `len` bytes from user space `src` to kernel space `dst`.
     /// Returns Ok(()) on success, Err(FaultInfo) on user-side fault.
     /// Safety: caller must ensure dst is a valid kernel pointer of
-    /// at least `len` bytes; src is interpreted in the current
-    /// AddressSpace's user mapping.
+    /// at least `len` bytes. The final implementation is reached through the
+    /// VM copyin/copyout helpers, which supply the current AddressSpace and
+    /// perform the `VmEntry`/pmap walk before any byte copy.
     unsafe fn copy_from_user(
         dst: KernelPtr<u8>,
         src: UserPtr<u8>,
@@ -1653,12 +1657,29 @@ pub struct KernelPtr<T>(*mut T);
 pub struct UserPtr<T>(*mut T);
 ```
 
-A syscall that takes a user pointer receives `UserPtr<T>` from the syscall pipeline; it cannot accidentally pass it to a kernel-pointer-only function (the type is wrong). Conversion is explicit and goes through `UserAccessIf` — there is no `as_kernel_ptr()` method on `UserPtr<T>`.
+A syscall that takes a user pointer receives `UserPtr<T>` from the syscall pipeline; it cannot accidentally pass it to a kernel-pointer-only function (the type is wrong). Conversion is explicit and goes through VM copyin/copyout — there is no `as_kernel_ptr()` method on `UserPtr<T>`.
 
-### 12.2 The fixup table
+### 12.2 VM-resolved direct-map copy
 <!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-THE-FIXUP-TABLE-1 -->
 
-Kernel-mode user accesses use a special trap-recovery mechanism. Each `copy_*_user` macro emits a fixup entry into a linker section:
+The normal copy path is owned by VM and is the same on RV64 and LA64:
+
+1. Build a checked `UserRange` from `(user_ptr, len)`. Overflow, kernel-half addresses, or addresses above `USER_TOP` return `EFAULT`.
+2. Acquire the declared range with the VM range-lock mode required by the operation: read for `copy_from_user`, write/materializer for `copy_to_user` when writable materialization or CoW may be needed.
+3. Walk `AddressSpace.recipes` from the current user VA. Every covered subrange must resolve to a `VmEntry` whose `prot` permits the requested access.
+4. For each user page, observe the pmap leaf. If no valid leaf exists, run the same materialization path as the page-fault handler, then re-observe recipes and pmap before publishing or using the page.
+5. Translate the PPN to a direct-map kernel virtual address.
+6. Coalesce adjacent pages while all of these remain true: same `VmEntry` permission decision, page offsets are consecutive, PPNs are physically consecutive, and the current chunk does not cross the requested user range.
+7. Copy one coalesced run at a time between the caller's kernel buffer and the direct-map run.
+
+This means the copy loop never treats a user VA as a dereferenceable kernel pointer. The only raw pointer used for user bytes is a direct-map pointer derived from a PPN that was justified by the observed `VmEntry`.
+
+Partial progress follows syscall byte-copy rules. If at least one run was copied and a later page fails, the caller reports the number of bytes already copied where the syscall semantics permit partial success. If the first run fails, the operation returns `EFAULT` or the materialization error.
+
+### 12.3 The fixup table is fallback only
+<!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-THE-PRIMARY-PATH-IS-DIRECT-NOT-FIXUP-1 -->
+
+Architecture-specific raw-copy helpers may still emit fixup entries into a linker section:
 
 ```rust
 // In tx-hal:
@@ -1675,20 +1696,11 @@ pub struct FixupEntry {
 pub static KERNEL_FIXUP_TABLE: [FixupEntry] = [..];
 ```
 
-Each platform's `copy_from_user` impl emits a fixup entry through `linkme::distributed_slice(KERNEL_FIXUP_TABLE)`. The trap shell, when it sees a kernel-mode fault, consults `KERNEL_FIXUP_TABLE` (binary search by `pc_start`) and jumps to `recovery_pc` if a match exists.
+The trap shell, when it sees a kernel-mode fault, may consult `KERNEL_FIXUP_TABLE` (binary search by `pc_start`) and jump to `recovery_pc` if a match exists.
 
 **Cross-reference.** This is one of the three approved linkme uses. See §21.
 
-### 12.3 The primary path is direct, not fixup
-<!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-THE-PRIMARY-PATH-IS-DIRECT-NOT-FIXUP-1 -->
-
-The substrate-time `direct_map` and the resolve-side syscall surface (PAGE_SUBSTRATE handoff) make most user accesses *not* hit the fixup path. The primary path is:
-
-1. Resolve the user pointer to a PPN via the address space's pmap.
-2. Translate PPN to direct-map kernel virtual address.
-3. Copy via the direct map.
-
-The fixup path catches the residual cases: speculative reads of nominally-mapped pages that turn out to fault (e.g., a `PROT_NONE` page in the middle of a copy that the resolve step didn't pre-walk), and architecture-level corner cases where the trap fires despite the resolve.
+The fixup path catches residual bugs or architecture-level races: a stale pmap observation after teardown, an unexpected permission fault despite the VM walk, or a small raw-copy helper used before the VM context exists. It must return a normal user-access error, never panic the kernel, but a correct steady-state copy should not depend on taking this trap.
 
 ### 12.4 FaultInfo in the user-access context
 <!-- txdoc:HAL-USERACCESSIF-KERNEL-MODE-USER-ACCESS-AND-FIXUP-RECOVERY-FAULTINFO-IN-THE-USER-ACCESS-CONTEXT-1 -->

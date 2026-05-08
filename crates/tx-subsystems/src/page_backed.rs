@@ -13,7 +13,7 @@ use crate::execution::{Errno, Guard, StepOutcome};
 use crate::mount::MountPayloadPin;
 use crate::sync::SpinMutex;
 use crate::vfs::{FsObjectId, OpenFile};
-use tx_hal::{KernelPtr, Ppn, UserAccessIf, UserPtr};
+use tx_hal::{Ppn, UserPtr};
 use tx_substrate::{
     page_allocator::{
         self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,

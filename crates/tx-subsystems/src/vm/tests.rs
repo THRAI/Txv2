@@ -13,6 +13,7 @@ mod execution_scripts;
 mod fault_materialization;
 mod observation;
 mod script_async;
+mod user_access;
 
 static COUNTING_PMAP_TEST_LOCK: Mutex<()> = Mutex::new(());
 static COUNTING_PMAP_STATE: LazyLock<Mutex<CountingPmapState>> =

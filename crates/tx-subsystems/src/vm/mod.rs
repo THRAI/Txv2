@@ -12,6 +12,7 @@ mod execution;
 mod pmap;
 pub mod project;
 mod structure;
+mod user_access;
 
 #[cfg(test)]
 pub(crate) use pmap::TestPmap;
@@ -29,4 +30,7 @@ pub use structure::{
     VmFaultMaterializationBacking, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
     VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest, WouldBlock, RANGE_LOCK_RELEASE_MASK,
     USER_PAGE_SIZE,
+};
+pub use user_access::{
+    copy_from_user, copy_from_user_with_guard, copy_to_user, copy_to_user_with_guard,
 };

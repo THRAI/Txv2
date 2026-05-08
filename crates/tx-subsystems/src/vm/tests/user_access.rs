@@ -1,0 +1,109 @@
+use super::*;
+use crate::execution::{Errno, StepOutcome};
+use alloc::vec;
+use alloc::vec::Vec;
+use tx_hal::{KernelPtr, UserPtr};
+
+fn setup_host_substrate() {
+    tx_substrate::testing::init_host_for_test_once();
+    match tx_substrate::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+        Err(error) => panic!("claim zero frame for VM user-access tests: {error:?}"),
+    }
+}
+
+fn map_private(aspace: &AddressSpace, start: usize, len: usize, prot: Prot) {
+    let len = align_up(len.max(1), USER_PAGE_SIZE);
+    let range = UserRange::new_aligned(UserVirtAddr(start), len).expect("aligned user range");
+    let request = VmMapRequest::fixed(
+        range,
+        MapPlacement::RequireFree,
+        prot,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    aspace.try_mmap(request).expect("map test user range");
+}
+
+const fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
+#[test]
+fn vm_copy_to_user_then_copy_from_user_walks_recipes_and_pmap() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let user_addr = 0x4000;
+    let payload: Vec<u8> = (0..(USER_PAGE_SIZE + 31))
+        .map(|i| (i & 0xff) as u8)
+        .collect();
+    map_private(&aspace, user_addr, payload.len(), Prot::READ_WRITE);
+
+    let copied = unsafe {
+        crate::vm::copy_to_user(
+            &aspace,
+            UserPtr::new(user_addr),
+            KernelPtr::new(payload.as_ptr().cast_mut()),
+            payload.len(),
+        )
+    };
+    assert_eq!(copied, StepOutcome::Done(payload.len()));
+
+    let mut observed = vec![0u8; payload.len()];
+    let copied = unsafe {
+        crate::vm::copy_from_user(
+            &aspace,
+            KernelPtr::new(observed.as_mut_ptr()),
+            UserPtr::new(user_addr),
+            observed.len(),
+        )
+    };
+    assert_eq!(copied, StepOutcome::Done(payload.len()));
+    assert_eq!(observed, payload);
+    assert!(aspace
+        .pmap()
+        .lookup(UserVirtAddr(user_addr).containing_page())
+        .is_some());
+}
+
+#[test]
+fn vm_copy_from_user_rejects_unmapped_pointer_before_kernel_copy() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let mut observed = [0xAAu8; 8];
+
+    let copied = unsafe {
+        crate::vm::copy_from_user(
+            &aspace,
+            KernelPtr::new(observed.as_mut_ptr()),
+            UserPtr::new(0x8000),
+            observed.len(),
+        )
+    };
+
+    assert_eq!(copied, StepOutcome::Err(Errno::EFAULT));
+    assert_eq!(observed, [0xAA; 8]);
+}
+
+#[test]
+fn vm_copy_to_user_rejects_read_only_recipe() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let user_addr = 0x10_000;
+    map_private(&aspace, user_addr, 16, Prot::READ);
+    let payload = [0x5Au8; 16];
+
+    let copied = unsafe {
+        crate::vm::copy_to_user(
+            &aspace,
+            UserPtr::new(user_addr),
+            KernelPtr::new(payload.as_ptr().cast_mut()),
+            payload.len(),
+        )
+    };
+
+    assert_eq!(copied, StepOutcome::Err(Errno::EFAULT));
+}

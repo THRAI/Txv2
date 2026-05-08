@@ -3,11 +3,12 @@ use super::*;
 /// Read up to `len` bytes from `pc` at `of.offset()` into the user buffer at
 /// `dst`, returning the number of bytes actually copied.
 ///
-/// Materializes pages on demand and copies bytes through the platform's
-/// `UserAccessIf`. Advances `of.offset()` only after a chunk has been both
+/// Materializes pages on demand and copies bytes through VM-resolved
+/// copyout. Advances `of.offset()` only after a chunk has been both
 /// materialized and copied. EFAULT propagates as an `Err` outcome on the very
 /// first chunk, or as `Done(advanced)` when prior chunks succeeded.
-pub fn step_read_to_user<H: UserAccessIf>(
+pub fn step_read_to_user(
+    aspace: &crate::vm::AddressSpace,
     pc: &PageContainer,
     of: &mut OpenFile,
     dst: UserPtr<u8>,
@@ -26,18 +27,26 @@ pub fn step_read_to_user<H: UserAccessIf>(
         return StepOutcome::Done(0);
     }
     let effective_len = core::cmp::min(len as u64, valid_end - start) as usize;
-    step_range_with_user_buffer::<H>(pc, of, effective_len, UserBuffer::Read { dst }, guard)
+    step_range_with_user_buffer(
+        aspace,
+        pc,
+        of,
+        effective_len,
+        UserBuffer::Read { dst },
+        guard,
+    )
 }
 
 /// Write up to `len` bytes from the user buffer at `src` into `pc` at
 /// `of.offset()`, returning the number of bytes actually copied.
 ///
-/// Materializes pages on demand and copies bytes through the platform's
-/// `UserAccessIf`. Advances `of.offset()` and grows the visible `PC.size`
+/// Materializes pages on demand and copies bytes through VM-resolved
+/// copyin. Advances `of.offset()` and grows the visible `PC.size`
 /// only after a chunk has been both materialized and copied. EFAULT
 /// propagates as an `Err` outcome on the very first chunk, or as
 /// `Done(advanced)` when prior chunks succeeded.
-pub fn step_write_from_user<H: UserAccessIf>(
+pub fn step_write_from_user(
+    aspace: &crate::vm::AddressSpace,
     pc: &PageContainer,
     of: &mut OpenFile,
     src: UserPtr<u8>,
@@ -60,7 +69,8 @@ pub fn step_write_from_user<H: UserAccessIf>(
         return StepOutcome::Err(Errno::EINVAL);
     }
     let start = of.offset();
-    let outcome = step_range_with_user_buffer::<H>(pc, of, len, UserBuffer::Write { src }, guard);
+    let outcome =
+        step_range_with_user_buffer(aspace, pc, of, len, UserBuffer::Write { src }, guard);
     match &outcome {
         StepOutcome::Done(advanced)
         | StepOutcome::Advanced(advanced)
@@ -93,7 +103,8 @@ impl UserBuffer {
     }
 }
 
-fn step_range_with_user_buffer<H: UserAccessIf>(
+fn step_range_with_user_buffer(
+    aspace: &crate::vm::AddressSpace,
     pc: &PageContainer,
     of: &mut OpenFile,
     len: usize,
@@ -113,7 +124,15 @@ fn step_range_with_user_buffer<H: UserAccessIf>(
 
         match pc.materialize_page(page_index, access, guard) {
             StepOutcome::Done(materialized) | StepOutcome::Advanced(materialized) => {
-                match copy_chunk_user::<H>(materialized.ppn, within_page, chunk, buffer, advanced) {
+                match copy_chunk_user(
+                    aspace,
+                    materialized.ppn,
+                    within_page,
+                    chunk,
+                    buffer,
+                    advanced,
+                    guard,
+                ) {
                     Ok(()) => {
                         advanced += chunk;
                         offset += chunk as u64;
@@ -152,12 +171,14 @@ fn step_range_with_user_buffer<H: UserAccessIf>(
     StepOutcome::Done(advanced)
 }
 
-fn copy_chunk_user<H: UserAccessIf>(
+fn copy_chunk_user(
+    aspace: &crate::vm::AddressSpace,
     ppn: Ppn,
     within_page: usize,
     chunk: usize,
     buffer: UserBuffer,
     already_advanced: usize,
+    guard: &Guard<'_>,
 ) -> Result<(), Errno> {
     let frame_base = page_allocator::frame_kernel_addr(ppn).map_err(|_| Errno::EIO)?;
     let kernel_byte = unsafe { frame_base.add(within_page) };
@@ -165,15 +186,41 @@ fn copy_chunk_user<H: UserAccessIf>(
         UserBuffer::Read { dst } => {
             let user_dst = UserPtr::<u8>::new(dst.addr() + already_advanced);
             unsafe {
-                H::copy_to_user(user_dst, KernelPtr::new(kernel_byte), chunk)
-                    .map_err(|_| Errno::EFAULT)
+                match crate::vm::copy_to_user_with_guard(
+                    aspace,
+                    guard,
+                    user_dst,
+                    tx_hal::KernelPtr::new(kernel_byte),
+                    chunk,
+                ) {
+                    StepOutcome::Done(done) if done == chunk => Ok(()),
+                    StepOutcome::Done(_) | StepOutcome::Err(Errno::EFAULT) => Err(Errno::EFAULT),
+                    StepOutcome::Err(errno) => Err(errno),
+                    StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                        Err(Errno::EBUSY)
+                    }
+                    StepOutcome::Advanced(_) => unreachable!("VM copy does not use Advanced"),
+                }
             }
         }
         UserBuffer::Write { src } => {
             let user_src = UserPtr::<u8>::new(src.addr() + already_advanced);
             unsafe {
-                H::copy_from_user(KernelPtr::new(kernel_byte), user_src, chunk)
-                    .map_err(|_| Errno::EFAULT)
+                match crate::vm::copy_from_user_with_guard(
+                    aspace,
+                    guard,
+                    tx_hal::KernelPtr::new(kernel_byte),
+                    user_src,
+                    chunk,
+                ) {
+                    StepOutcome::Done(done) if done == chunk => Ok(()),
+                    StepOutcome::Done(_) | StepOutcome::Err(Errno::EFAULT) => Err(Errno::EFAULT),
+                    StepOutcome::Err(errno) => Err(errno),
+                    StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+                        Err(Errno::EBUSY)
+                    }
+                    StepOutcome::Advanced(_) => unreachable!("VM copy does not use Advanced"),
+                }
             }
         }
     }
