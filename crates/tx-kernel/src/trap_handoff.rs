@@ -102,10 +102,7 @@ pub fn translate_syscall<P: TxPlatform>(view: &TrapFrameView) -> SyscallRequest 
 /// `PageFaultInfo`. The trap shell uses this to decide whether to
 /// hand off to the active userspace-run wait (when `from_user`) or
 /// fall through to the legacy `Terminate` policy.
-pub fn translate_user_pf<P: TxPlatform>(
-    view: &TrapFrameView,
-    fault: &FaultInfo,
-) -> PageFaultInfo {
+pub fn translate_user_pf<P: TxPlatform>(view: &TrapFrameView, fault: &FaultInfo) -> PageFaultInfo {
     let _ = view; // future use: faulting-instruction PC, sp, etc.
     let _ = core::marker::PhantomData::<P>;
 

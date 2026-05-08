@@ -13,8 +13,7 @@ use tx_hal::{
     PmapUnmapResult, Pod, PowerIf, PtNode, PtNodeAllocator, SavedSignalFrame, SecondaryEntry,
     SignalFrameIf, SignalFramePlacement, SignalFrameWrite, SignalHandlerRegs, SmpIf, TimeIf,
     TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView,
-    TrapIf, TrapPreviousMode, UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr,
-    VirtRange,
+    TrapIf, TrapPreviousMode, UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr, VirtRange,
 };
 
 use la64_irq_trap::{classify_la64_trap, ensure_static_boot_facts};
