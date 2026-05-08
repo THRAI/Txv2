@@ -1,4 +1,4 @@
-use tx_hal::{IrqIf, PercpuIf, SmpIf};
+use tx_hal::{EntropyIf, IrqIf, PercpuIf, SmpIf};
 use tx_substrate::epoch;
 use tx_substrate::index::Index;
 use tx_substrate::mutation::{self, MutationError};
@@ -9,6 +9,7 @@ struct TestPlatform;
 
 impl PercpuIf for TestPlatform {}
 impl IrqIf for TestPlatform {}
+impl EntropyIf for TestPlatform {}
 impl SmpIf for TestPlatform {}
 
 fn reset_epoch() -> std::sync::MutexGuard<'static, ()> {

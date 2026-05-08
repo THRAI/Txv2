@@ -1,7 +1,7 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use tx_hal::{IrqIf, PercpuIf, SmpIf};
+use tx_hal::{EntropyIf, IrqIf, PercpuIf, SmpIf};
 use tx_substrate::epoch::{self, testing, EpochError};
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -11,6 +11,7 @@ struct TestPlatform;
 
 impl PercpuIf for TestPlatform {}
 impl IrqIf for TestPlatform {}
+impl EntropyIf for TestPlatform {}
 impl SmpIf for TestPlatform {}
 
 unsafe fn count_reclaim(_ptr: *mut u8) {

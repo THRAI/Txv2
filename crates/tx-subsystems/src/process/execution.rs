@@ -1,11 +1,13 @@
 //! Process subsystem execution: fork, exit-group, setpgid, setsid, and
 //! the internal `step_process_exit` last-thread cascade.
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use tx_hal::PmapIf;
+use tx_hal::{PmapIf, UserTrapContext};
 use tx_substrate::zone::{self, Cap, OperationalCapExt, ZoneError};
+use tx_substrate::SpinMutex;
 
 use crate::cred::Cred;
 use crate::process::structure::{
@@ -13,12 +15,19 @@ use crate::process::structure::{
     Sid,
 };
 use crate::signal::{PendingSignalQueue, SigActionTable};
-use crate::sync::SpinMutex;
 use crate::thread_runtime::execution::set_thread_zombie;
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload};
+use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
 
-use core::sync::atomic::{AtomicU64, AtomicU8};
+/// Bootstrap value for the program-break base, per the Trio plan
+/// §"Cross-cutting risks #7". Used by `bootstrap_init_process` to
+/// seed init's brk region before the ELF loader lands; the syscall
+/// dispatcher's `brk(2)` arm then operates against this base.
+///
+/// TODO(phase-elf-loader): replace with binary-derived value once
+/// `step_exec` materialises an image.
+pub const BOOTSTRAP_BRK_BASE: u64 = 0x6000_0000;
 
 /// Global init (`pid=1`) process handle. `None` until
 /// `bootstrap_init_process` runs, after which it holds a strong `Cap`
@@ -39,7 +48,49 @@ pub fn init_process() -> Option<Cap<ProcessIdentity>> {
     INIT_PROCESS.lock().clone()
 }
 
-#[cfg(test)]
+/// Resolve `pid` to a `Cap<ProcessIdentity>` by walking the
+/// process tree rooted at init.
+///
+/// Slice 7 of the shell-prompt roadmap (2026-05-07) introduces this
+/// resolver to back `kill(pid, sig)`. Day-1 has no global pid →
+/// Cap<ProcessIdentity> registry — every process is reachable from
+/// init via the `children` vectors that `step_fork` pushes onto the
+/// parent. The walk visits the init root then recurses through each
+/// `payload.children` snapshot until either the matching pid is found
+/// or every node has been visited.
+///
+/// Live and zombie processes alike are visited (zombies remain in
+/// `parent.children` until reaped per §8.5). Returns `None` if no
+/// process in the tree carries `pid`. Returns `None` before
+/// `bootstrap_init_process` has run.
+///
+/// The walk takes per-process `payload.children` snapshots (`.clone()`
+/// of the `Vec<Cap<ProcessIdentity>>` under the `SpinMutex`), so the
+/// children lock is released before recursion and never held across
+/// callees.
+///
+/// O(n) in the number of live + zombie processes — acceptable for
+/// day-1 where process counts stay small. A future global pid table
+/// (`TODO(phase-pid-resolver)`) would replace this with O(1) lookup.
+pub fn process_by_pid(pid: Pid) -> Option<Cap<ProcessIdentity>> {
+    let init = init_process()?;
+    walk_process_tree(&init, pid)
+}
+
+fn walk_process_tree(node: &Cap<ProcessIdentity>, pid: Pid) -> Option<Cap<ProcessIdentity>> {
+    if node.pid == pid {
+        return Some(node.clone());
+    }
+    let children = node.children.lock().clone();
+    for child in children {
+        if let Some(found) = walk_process_tree(&child, pid) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reset_init_process_for_test() {
     *INIT_PROCESS.lock() = None;
 }
@@ -197,7 +248,38 @@ pub fn bootstrap_init_process(
     // Day-1: init has no cwd until a rootfs is mounted and an
     // initial chdir runs. Future EXEC_v1 / first-userspace lands
     // a synthesized "/" DEntry and threads it through here.
-    let payload = sign_process_payload(aspace, vec![leader], Cred::root(), None)?;
+    // Bootstrap-time fd table is empty: the devfs `console` alias is
+    // not yet registered when the kernel reaches process bootstrap.
+    // Phase 3b's `init.rs` calls `tx_fs::devfs::open_console_for_init()`
+    // *after* registering the console hardware and stuffs the result
+    // into fds 0/1/2 via `payload.set_fd`.
+    //
+    // brk: Trio plan §"Cross-cutting risks #7" pins a temporary
+    // bootstrap base of `0x6000_0000` until the ELF loader lands and
+    // can derive the real `brk_base` from the executable's `_end`
+    // symbol (or `PT_LOAD` segment max). `current_brk == brk_base`
+    // at exec time per VM_v1_2 §5.8.
+    // TODO(phase-elf-loader): replace bootstrap brk_base with
+    // binary-derived value once `step_exec` materialises an image.
+    // Bootstrap-time CLOEXEC bitmap is `0`: init's stdio (fds 0/1/2,
+    // installed by Phase 3b's `init.rs::bind_init_cwd_and_root`) is
+    // NOT close-on-exec by Linux convention. Per the Wave 2 plan,
+    // until `sys_open` exists in the trio's syscall surface, the
+    // bitmap is mutated only by `fcntl(F_SETFD)`.
+    let payload = sign_process_payload(
+        aspace,
+        vec![leader],
+        Cred::root(),
+        None,
+        BTreeMap::new(),
+        BTreeSet::new(),
+        BOOTSTRAP_BRK_BASE,
+        BOOTSTRAP_BRK_BASE,
+        // Slice 6 of the shell-prompt roadmap. init's file-creation
+        // mask defaults to `0o022` per Linux convention; children
+        // inherit through `step_fork`'s umask thread-through.
+        0o022,
+    )?;
     *proc_cap.payload.lock() = Some(payload);
 
     // Register globally. The slot retains a strong Cap so init
@@ -213,12 +295,39 @@ pub fn bootstrap_init_process(
 pub fn step_fork<P: PmapIf>(
     parent: &Cap<ProcessIdentity>,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
-    let parent_payload = parent
-        .upgrade_operational()
-        .map_err(|_| ForkError::ParentZombie)?;
-    let parent_aspace = parent_payload.aspace.clone();
-    let parent_cred = parent_payload.cred();
-    let parent_cwd = parent_payload.cwd();
+    // Snapshot parent state under its payload lock. Fd table is
+    // cloned entry-by-entry so parent and child share the same
+    // `Cap<OpenFile>` per fd, matching the Trio plan §"Cross-cutting
+    // risks #6" (full `dup`-shape sharing — separate file description
+    // per fd — is deferred). The CLOEXEC set is cloned wholesale so
+    // the child inherits parent's exec-time bits per Linux semantics.
+    // brk values are cloned per the Trio plan §"Cross-cutting risks
+    // #7": each child gets its own brk_base/current_brk pair, while
+    // the underlying VM mappings are cloned through
+    // `AddressSpace::fork_aspace` below.
+    let (
+        parent_aspace,
+        parent_cred,
+        parent_cwd,
+        parent_fds,
+        parent_fd_cloexec,
+        parent_brk_base,
+        parent_current_brk,
+        parent_umask,
+    ) = {
+        let payload_guard = parent.payload.lock();
+        let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
+        (
+            payload.aspace_cap(),
+            payload.cred(),
+            payload.cwd(),
+            payload.snapshot_fds(),
+            payload.fd_cloexec_snapshot(),
+            payload.brk_base(),
+            payload.current_brk(),
+            payload.umask(),
+        )
+    };
     let parent_pgrp = parent.pgrp.lock().clone();
 
     // Fork the address space, then publish into the AddressSpace zone.
@@ -236,11 +345,25 @@ pub fn step_fork<P: PmapIf>(
     // Leader thread.
     let leader = sign_thread(child_proc.downgrade()).map_err(ForkError::Zone)?;
 
-    // Wire up payload — child inherits parent credentials and cwd.
-    // POSIX: fork copies the cwd reference (same DEntry); CLONE_FS
-    // (sharing) is a Phase-2 concern.
-    let payload = sign_process_payload(child_aspace_cap, vec![leader], parent_cred, parent_cwd)
-        .map_err(ForkError::Zone)?;
+    // Wire up payload — child inherits parent credentials, cwd, and
+    // a per-slot clone of the parent's fd table. POSIX: fork copies
+    // the cwd reference (same DEntry); CLONE_FS (sharing) is a
+    // Phase-2 concern. Per Linux semantics CLOEXEC is per-fd and
+    // copied across fork — the child sees the parent's snapshot at
+    // fork time; subsequent `fcntl(F_SETFD)` calls in either parent
+    // or child do not affect the other.
+    let payload = sign_process_payload(
+        child_aspace_cap,
+        vec![leader],
+        parent_cred,
+        parent_cwd,
+        parent_fds,
+        parent_fd_cloexec,
+        parent_brk_base,
+        parent_current_brk,
+        parent_umask,
+    )
+    .map_err(ForkError::Zone)?;
     *child_proc.payload.lock() = Some(payload);
 
     // Register child in parent's pgrp.
@@ -255,13 +378,83 @@ pub fn step_fork<P: PmapIf>(
     Ok(child_proc)
 }
 
+/// Seed the child leader thread's `saved_user_context` from the
+/// parent's snapshot at clone time.
+///
+/// Linux fork/clone ABI: the child returns from the clone syscall
+/// with the parent's GPRs *except* `a0 = 0`, and resumes at the
+/// instruction *after* the trapping `ecall`. RV64-specific:
+///
+/// - `a0` lives in `regs[10]` (RV64 ABI),
+/// - `ecall` is exactly 4 bytes (RV32I/RV64I base ISA — there is no
+///   `c.ecall` compressed form), so the child's resume address is
+///   `parent_user_ctx.pc + 4`.
+///
+/// The parent thread is intentionally **not** modified here: the
+/// syscall arm encodes the child's pid into the parent's
+/// `pending_syscall_return` separately, and the trap-shell writeback
+/// discipline drains that into the parent's fresh trap frame's `a0`
+/// before re-entry per `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`.
+///
+/// Behaviour:
+///
+/// 1. Clone `parent_user_ctx` into a fresh `UserTrapContext`.
+/// 2. Overwrite `regs[10] = 0` (RV64 a0).
+/// 3. Overwrite `pc = parent_user_ctx.pc + 4` (skip past `ecall`).
+/// 4. `store_saved_user_context(Some(child_ctx))` on the child
+///    thread's payload.
+///
+/// `payload_cap()` returning `None` is a kernel-invariant
+/// violation: a fresh child thread minted by [`step_fork`] is
+/// always live-with-payload at the moment the syscall arm calls
+/// this helper. We panic loudly with a stable sentinel string
+/// (matches the precedent set by the ELF loader's
+/// `:bootstrap-exec:fail`).
+///
+/// Sibling helper, not a method on [`ProcessIdentity`]: keeps the
+/// RV64-ABI knowledge (the `+ 4` skip and the `regs[10]` index)
+/// local to a single grep target so a future ARM64 / x86_64 port
+/// has one place to extract per-arch constants.
+///
+/// Cites:
+/// - `txdoc:PROCESS-FORK-FAMILY` /
+///   `txdoc:PROCESS-STEP-CLONE-PROCESS-NEW-PROCESS-PATH-CLONE-THREAD-1`
+///   (`docs/design/04_process-signals/PROCESS_v1.md` §7.1).
+/// - `txdoc:THREAD-5-1-STATE-PLACEMENT`
+///   (`docs/design/02_execution/THREAD_RUNTIME_v1.md`) — the
+///   child's `saved_user_context` lives on the child's leader
+///   thread payload.
+pub fn seed_child_leader_context(
+    child_thread: &Cap<ThreadIdentity>,
+    parent_user_ctx: &UserTrapContext,
+) {
+    // (1) Clone the parent context.
+    let mut child_ctx = *parent_user_ctx;
+    // (2) RV64 a0 = 0: child's clone-syscall return value.
+    child_ctx.regs[10] = 0;
+    // (3) Skip past ecall: child resumes after, not retries.
+    child_ctx.pc = parent_user_ctx.pc.wrapping_add(4);
+
+    // (4) Store on the leader thread's payload. payload_cap == None
+    // here means a freshly forked thread already lost its payload,
+    // which is a kernel-invariant violation: step_fork's post-condition
+    // is exactly that the child leader is live-with-payload.
+    let payload = child_thread
+        .payload_cap()
+        .expect("seed_child_leader_context: fresh child thread missing payload");
+    payload.store_saved_user_context(Some(child_ctx));
+}
+
 /// Exit the entire thread group: zombify every thread, drop the
 /// process payload, set the process exit status. Identity persists.
 ///
 /// Threads zombify with the `wait_status_word` projection of `status`
-/// — day-1's `128 + sig` shell encoding for `Signaled`, the raw int
-/// for `Exited` — preserving the "thread-side exit_status is an int"
-/// shape that `THREAD_RUNTIME_v1` §7.2 carries.
+/// — POSIX `<sys/wait.h>` encoding (`(code & 0xff) << 8` for explicit
+/// exits, `sig & 0x7f` for signal exits) — preserving the
+/// "thread-side exit_status is an int" shape that `THREAD_RUNTIME_v1`
+/// §7.2 carries. (Migrated to POSIX from the day-1 shell-convention
+/// `128 + sig` encoding by Wave 1 of the fork/clone/wait4 slice;
+/// Open Q #3 DECIDED 2026-05-06.)
 pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     session_leader_hangup_cascade(process);
     sever_children(process);
@@ -291,9 +484,10 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
 /// the process-visible exit status, drops the `ProcessPayload`. The
 /// remaining §7.3.3 phase-5 cascade (SIGCHLD to parent, `exit_port`
 /// wake, full reparenting-into-init, orphan-pgrp SIGHUP,
-/// session-leader controlling-tty hangup per §8.3) lands when an
-/// init handle is globally addressable and `exit_port` machinery
-/// arrives.
+/// session-leader controlling-tty hangup per §8.3) lands incrementally:
+/// SIGCHLD post is wired via `post_sigchld_to_parent`, and the Wave 1
+/// fork/clone/wait4 slice (2026-05-06) added the `exit_port` fire
+/// alongside the SIGCHLD post for parent-side wake.
 pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     session_leader_hangup_cascade(process);
     sever_children(process);
@@ -405,10 +599,19 @@ fn session_leader_hangup_cascade(process: &Cap<ProcessIdentity>) {
 /// `Ignore`, so without a handler the bit just accumulates in the
 /// parent's leader-thread `thread_pending` until reaped or masked).
 ///
+/// Wave 1 of the fork/clone/wait4 slice (2026-05-06): also fires the
+/// parent's per-process `exit_port` wait channel
+/// (`EXIT_PORT_CHILD_ZOMBIFIED` bit) so a parent parked on
+/// `sys_wait4` (Wave 2) wakes when any child zombifies. Per
+/// `txdoc:PROCESS-WAIT-FAMILY-1` and the spec's
+/// "Block until a child's state changes" arm.
+///
 /// No-op for processes with no parent: bootstrap init (never had one)
 /// and orphans whose parent has already exited and severed them.
 /// Also no-op if the parent is itself a zombie — `step_kill_process`
-/// returns `NoLiveThread` and we discard.
+/// returns `NoLiveThread` and `fire_exit_port` returns `0` (no
+/// payload to fire through). The `exit_port` fire is harmless when
+/// no awaiter is parked (Channel::fire returns 0).
 ///
 /// `siginfo` is not yet wired (no `SigInfo` type in day-1 signal
 /// surface); spec §7.3.3 phase 5 will populate `si_pid`, `si_uid`,
@@ -417,6 +620,11 @@ fn session_leader_hangup_cascade(process: &Cap<ProcessIdentity>) {
 fn post_sigchld_to_parent(process: &Cap<ProcessIdentity>) {
     if let Some(parent) = process.parent_cap() {
         let _ = crate::signal::step_kill_process(&parent, crate::signal::Signum::SIGCHLD);
+        // Fire the parent's exit_port. A zombie parent has no payload
+        // and `fire_exit_port` returns 0 — no panic, no double-fire.
+        let _ = parent.fire_exit_port(tx_reactor::wait::Mask::from_bits(
+            crate::process::structure::EXIT_PORT_CHILD_ZOMBIFIED,
+        ));
     }
 }
 
@@ -602,6 +810,95 @@ pub fn step_setsid(target: &Cap<ProcessIdentity>) -> Result<Sid, SetsidError> {
     Ok(new_sid)
 }
 
+// --- exec phase-7 commit helpers (post-PoNR, infallible) -------------
+//
+// The three steps below materialise the per-process commits exec phase 7
+// applies after `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`
+// has stored the new aspace. Each is **infallible** and **synchronous**
+// per `txdoc:EXEC-15-THE-EXEC-PONR-INVARIANT` — no allocation, no I/O,
+// no fallible computation past phase 6. The exec script (Part 5) calls
+// these in sequence; they are also unit-testable in isolation.
+//
+// Note for Phase 5 (the exec script itself): these are NOT async. Other
+// `step_*` functions in this crate that perform I/O (`step_open`,
+// `vm::scripts::populate_detached_user_range`) are async, but the
+// phase-7 commits act on already-resolved Caps and atomic words —
+// nothing to await. The script's phase 7 is therefore a sequential
+// block of synchronous calls.
+
+/// Close every fd whose CLOEXEC bit is set on `process`, then clear
+/// the close-on-exec set.
+///
+/// Per `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC` and the Wave 2 plan's
+/// Part 1 P1 sub-item. Walks the per-process CLOEXEC `BTreeSet<u32>`
+/// snapshot; for each marked fd, drops the fd via the existing
+/// `set_fd(i, None)` accessor — the resulting `Cap<OpenFile>` `Drop`
+/// runs the close per `txdoc:VFS-CHECKS-WALKER-MODES-1`. Any
+/// `OpenFile::Drop` side-effects (eventual file-flush etc.) are NOT
+/// awaited here: the EBR machinery handles deferred drop, and exec's
+/// post-PoNR commit cannot await.
+///
+/// Infallible — by EXEC-PONR. No-op for zombies (no payload to sweep).
+/// fd-ops Wave 1 (2026-05-07): the CLOEXEC set's fd-31 ceiling has been
+/// removed alongside the fd table's 8-slot ceiling; any `u32` fd may
+/// be marked.
+pub fn step_close_cloexec_fds(process: &Cap<ProcessIdentity>) {
+    let cloexec = process.fd_cloexec_snapshot();
+    if cloexec.is_empty() {
+        return;
+    }
+    for fd in cloexec {
+        // Drop via the existing accessor; the previous `Cap` (if any)
+        // is returned for EBR-deferred drop. We discard it here — the
+        // slot is now empty, the fd is closed.
+        let _ = process.set_fd(fd, None);
+    }
+    // Clear the set wholesale: every previously-marked fd is now
+    // closed; future fcntl(F_SETFD) calls start from a clean state.
+    process.clear_fd_cloexec();
+}
+
+/// Reset every user-installed signal disposition on `process` to
+/// `SigDisposition::Default`, preserving `Default` and `Ignore` slots.
+///
+/// Thin Phase-5 wrapper around
+/// [`crate::signal::SigActionTable::step_reset_for_exec`] (Wave 2 P2)
+/// that lets the exec script (`tx-scripts::process::exec`) reach the
+/// per-process action table without touching the `pub(crate)` payload
+/// field on [`ProcessIdentity`]. Per
+/// `txdoc:EXEC-12-3-RESET-SIGNAL-DISPOSITIONS` and `SIGNAL_v1` §15.2:
+/// exec resets handlers but does NOT clear pending signals or
+/// SIG_IGN dispositions.
+///
+/// Infallible — by EXEC-PONR. No-op for zombies (no payload).
+pub fn step_reset_signal_dispositions_for_exec(process: &Cap<ProcessIdentity>) {
+    if let Some(payload) = process.payload.lock().as_ref() {
+        payload.sig_actions().step_reset_for_exec();
+    }
+}
+
+/// Install `new_brk_base` as both the brk base and the current brk
+/// for `process`. Per `txdoc:EXEC-12-4-INSTALL-BRK` and the Wave 2
+/// plan's Part 1 P3 sub-item.
+///
+/// The exec script (Part 5) computes `new_brk_base` from the image
+/// plan: typically the highest LOAD segment's `vaddr + memsz`,
+/// page-rounded up. Storing the same value into both fields seeds the
+/// process at "no heap allocated yet" — `brk(2)` with a request above
+/// `current_brk` then grows the heap on demand.
+///
+/// Infallible — by EXEC-PONR. No-op for zombies (no payload to seed).
+pub fn step_install_brk_for_exec(process: &Cap<ProcessIdentity>, new_brk_base: u64) {
+    if let Some(payload) = process.payload.lock().as_ref() {
+        payload
+            .brk_base
+            .store(new_brk_base, core::sync::atomic::Ordering::Release);
+        payload
+            .current_brk
+            .store(new_brk_base, core::sync::atomic::Ordering::Release);
+    }
+}
+
 // --- internal sign-and-publish helpers ---
 
 fn sign_session(sid: Sid) -> Result<Cap<Session>, ZoneError> {
@@ -647,22 +944,60 @@ fn sign_process_identity(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign_process_payload(
     aspace: Cap<AddressSpace>,
     threads: Vec<Cap<ThreadIdentity>>,
     cred: Cred,
     cwd: Option<Cap<crate::vfs::DEntry>>,
+    fds: BTreeMap<u32, Cap<OpenFile>>,
+    fd_cloexec: BTreeSet<u32>,
+    brk_base: u64,
+    current_brk: u64,
+    umask: u16,
 ) -> Result<tx_substrate::zone::PayloadCap<ProcessPayload>, ZoneError> {
+    use tx_reactor::wait::Channel;
+    use tx_substrate::AtomicSlot;
+    let aspace_slot: AtomicSlot<Cap<AddressSpace>> = AtomicSlot::empty();
+    aspace_slot.store(Some(aspace));
+
+    // Allocate a fresh `exit_port` Channel per `ProcessPayload` and
+    // register it with the global wait-carrier resolver so async
+    // awaiters can `wait_on_token` against the returned id without
+    // holding a `Cap<ProcessIdentity>`. Pattern mirrors
+    // `TtyIdentity::new` — the only other in-tree wait carrier today
+    // (`crates/tx-subsystems/src/tty/structure/identity.rs`).
+    //
+    // Carrier-lifetime cleanup (release on payload drop) is tracked
+    // as Cross-cutting Risk #1 in the slice plan and is deferred
+    // beyond Wave 1.
+    let exit_port = Channel::new();
+    let exit_port_carrier_id = crate::wait_carrier::register_wait_channel(exit_port.clone());
+
     let res = zone::reserve_for::<ProcessPayload>()?;
     let cap = zone::sign_for(
         res,
         ProcessPayload {
-            aspace,
+            aspace: aspace_slot,
             threads: SpinMutex::new(threads),
             sig_actions: SigActionTable::new(),
             group_pending: PendingSignalQueue::new(),
             cred: SpinMutex::new(cred),
             cwd: SpinMutex::new(cwd),
+            fds: SpinMutex::new(fds),
+            fd_cloexec: SpinMutex::new(fd_cloexec),
+            brk_base: core::sync::atomic::AtomicU64::new(brk_base),
+            current_brk: core::sync::atomic::AtomicU64::new(current_brk),
+            // Slice 6 of the shell-prompt roadmap. Per-process
+            // file-creation mask. `bootstrap_init_process` seeds with
+            // the Linux default `0o022` (owner keeps full perms,
+            // group/other lose write); `step_fork` propagates the
+            // parent's umask through this argument (umask is
+            // per-process, copied across fork). `step_exec` preserves
+            // the umask (umask survives `exec` per POSIX).
+            umask: core::sync::atomic::AtomicU16::new(umask & 0o777),
+            exit_port,
+            exit_port_carrier_id,
         },
     );
     Ok(tx_substrate::zone::PayloadCap::from_cap(cap))
@@ -674,15 +1009,7 @@ fn sign_thread(
     let tid = allocate_tid();
 
     let payload_res = zone::reserve_for::<ThreadPayload>()?;
-    let payload_cap = zone::sign_for(
-        payload_res,
-        ThreadPayload {
-            task: SpinMutex::new(None),
-            signal_mask: AtomicU64::new(0),
-            thread_pending: PendingSignalQueue::new(),
-            signal_summary: AtomicU8::new(0),
-        },
-    );
+    let payload_cap = zone::sign_for(payload_res, ThreadPayload::fresh());
     let payload = tx_substrate::zone::PayloadCap::from_cap(payload_cap);
 
     let identity_res = zone::reserve_for::<ThreadIdentity>()?;

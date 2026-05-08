@@ -1,0 +1,31 @@
+# busybox-prompt.txt — sanity-check the busybox sh interactive prompt.
+#
+# Run with:
+#   cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf
+#   cargo xtask image cpio --profile busybox
+#   cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-prompt.txt
+#
+# The deliberate `sleep` directives are heisenbug-catches: we don't
+# race input the instant the prompt appears, so timing-dependent
+# bugs (e.g. "what if input arrives before the read syscall
+# registers its waiter?") have a chance to surface.
+
+# Boot the kernel through to busybox sh's interactive prompt.
+wait "/ # " within 10000
+
+# Pause so any post-prompt initialisation finishes before we type.
+sleep 500
+
+# Type a no-op shell line and expect the prompt back.
+send "\n"
+expect "/ # " within 5000
+
+# Pause again, then send a builtin that doesn't exec a child binary.
+sleep 500
+send "true\n"
+expect "/ # " within 5000
+
+# Quit cleanly — closes stdin, waits for QEMU to exit within the
+# driver's grace period.
+sleep 500
+quit

@@ -24,10 +24,12 @@ use tx_substrate::{
 mod cross_variant;
 mod lifecycle;
 mod reflink;
+mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
 pub use lifecycle::{step_fallocate, step_fsync, step_truncate};
 pub use reflink::{cow_replace_into_private, install_shared_page};
+pub use targeted_read::read_exact_at;
 pub use user_buffer::{step_read_to_user, step_write_from_user};
 
 #[cfg(test)]
@@ -595,7 +597,7 @@ impl PageContainer {
 
 pub fn step_read(
     pc: &PageContainer,
-    of: &mut OpenFile,
+    of: &OpenFile,
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize> {
@@ -616,7 +618,7 @@ pub fn step_read(
 
 pub fn step_write(
     pc: &PageContainer,
-    of: &mut OpenFile,
+    of: &OpenFile,
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize> {
@@ -656,7 +658,7 @@ pub fn step_write(
 
 fn step_range(
     pc: &PageContainer,
-    of: &mut OpenFile,
+    of: &OpenFile,
     len: usize,
     kind: PageBackedIoKind,
     guard: &Guard<'_>,
@@ -1151,6 +1153,8 @@ mod tests {
                 read: true,
                 write: true,
                 append: false,
+                cloexec: false,
+                nonblocking: false,
             },
         )
     }
@@ -1376,10 +1380,10 @@ mod tests {
             },
             3,
         );
-        let mut of = open_file_for_pc(&pc);
+        let of = open_file_for_pc(&pc);
         of.set_offset((crate::vm::USER_PAGE_SIZE - 8) as u64);
 
-        assert_eq!(step_read(&pc, &mut of, 32, &guard), StepOutcome::Done(32));
+        assert_eq!(step_read(&pc, &of, 32, &guard), StepOutcome::Done(32));
 
         assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE - 8 + 32) as u64);
         assert_eq!(pc.resident_pages(), 2);
@@ -1398,10 +1402,10 @@ mod tests {
             },
             1,
         );
-        let mut of = open_file_for_pc(&pc);
+        let of = open_file_for_pc(&pc);
         of.set_offset(crate::vm::USER_PAGE_SIZE as u64);
 
-        assert_eq!(step_read(&pc, &mut of, 16, &guard), StepOutcome::Done(0));
+        assert_eq!(step_read(&pc, &of, 16, &guard), StepOutcome::Done(0));
         assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64);
         assert_eq!(pc.resident_pages(), 0);
     }
@@ -1417,10 +1421,10 @@ mod tests {
             },
             2,
         );
-        let mut of = open_file_for_pc(&pc);
+        let of = open_file_for_pc(&pc);
 
         assert_eq!(
-            step_write(&pc, &mut of, crate::vm::USER_PAGE_SIZE + 17, &guard),
+            step_write(&pc, &of, crate::vm::USER_PAGE_SIZE + 17, &guard),
             StepOutcome::Done(crate::vm::USER_PAGE_SIZE + 17)
         );
 
@@ -1436,7 +1440,7 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let fs = Arc::new(BlockingFs);
         let pc = file_page_container(fs.clone(), fs, FsObjectId::new(88), 2);
-        let mut of = open_file_for_pc(&pc);
+        let of = open_file_for_pc(&pc);
         pc.state
             .lock()
             .pages
@@ -1444,7 +1448,7 @@ mod tests {
             .expect("seed cached page");
 
         assert_eq!(
-            step_read(&pc, &mut of, crate::vm::USER_PAGE_SIZE + 1, &guard),
+            step_read(&pc, &of, crate::vm::USER_PAGE_SIZE + 1, &guard),
             StepOutcome::AdvancedThenBlocked(crate::vm::USER_PAGE_SIZE, WaitToken::new(9, 0x44))
         );
         assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64);
@@ -1462,10 +1466,10 @@ mod tests {
             },
             1,
         );
-        let mut of = open_file_for_pc(&pc);
+        let of = open_file_for_pc(&pc);
 
         assert_eq!(
-            step_write(&pc, &mut of, 8, &guard),
+            step_write(&pc, &of, 8, &guard),
             StepOutcome::Err(Errno::EINVAL)
         );
         assert_eq!(of.offset(), 0);
@@ -1481,5 +1485,7 @@ mod lifecycle_tests;
 mod reflink_tests;
 #[cfg(test)]
 mod size_tests;
+#[cfg(test)]
+mod targeted_read_tests;
 #[cfg(test)]
 mod user_buffer_tests;

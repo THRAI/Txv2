@@ -6,14 +6,14 @@ extern crate std;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaIf,
-    FaultInfo, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, KernelPtr, KernelTrapSink,
+    EntropyIf, FaultInfo, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, KernelTrapSink,
     MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, PercpuIf, PhysAddr, PhysRange,
     PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation,
     PmapPermissions, PmapReservation, PmapReservationIntermediates, PmapReserveKind, PmapRoot,
     PmapUnmapResult, Pod, PowerIf, PtNode, PtNodeAllocator, SavedSignalFrame, SecondaryEntry,
     SignalFrameIf, SignalFramePlacement, SignalFrameWrite, SignalHandlerRegs, SmpIf, TimeIf,
     TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView,
-    TrapIf, TrapPreviousMode, UserAccessIf, UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr,
+    TrapIf, TrapPreviousMode, UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr,
     VirtRange,
 };
 

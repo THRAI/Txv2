@@ -11,6 +11,7 @@ pub mod checks;
 mod execution;
 mod pmap;
 pub mod project;
+pub mod scripts;
 mod structure;
 mod user_access;
 
@@ -22,6 +23,10 @@ mod tests;
 
 pub use execution::{MadviseAdvice, MapReservation, MapReserveResult};
 pub use pmap::{PmapMappingSnapshot, PmapPublishOutcome, PmapStats, VmPmapError};
+pub use scripts::{
+    build_aspace_from_image, populate_detached_user_range, BssTail, ImagePlan, LoadSegment,
+    ScriptError, SegmentFlags, USER_STACK_INITIAL_RESERVATION, USER_STACK_TOP_DEFAULT,
+};
 pub use structure::{
     AccessMode, AcquirePairResult, AcquireResult, AddressSpace, AddressSpaceStats, LockMode,
     MapPlacement, PendingWriter, Prot, RangeGuard, RangeGuardPair, RangeLock, UserPage,
@@ -31,6 +36,4 @@ pub use structure::{
     VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest, WouldBlock, RANGE_LOCK_RELEASE_MASK,
     USER_PAGE_SIZE,
 };
-pub use user_access::{
-    copy_from_user, copy_from_user_with_guard, copy_to_user, copy_to_user_with_guard,
-};
+pub use user_access::UserAccessKind;

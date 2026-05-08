@@ -2,6 +2,89 @@ use super::la64_irq_trap::*;
 use super::la64_pmap::*;
 use super::*;
 
+unsafe fn la64_copy_from_user_raw(
+    _dst: *mut u8,
+    src: UserPtr<u8>,
+    len: usize,
+) -> Result<(), FaultInfo> {
+    if len == 0 {
+        return Ok(());
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let fault_va = unsafe { tx_la64_cfu_raw(_dst, src.as_ptr(), len) };
+        if fault_va == 0 {
+            Ok(())
+        } else {
+            Err(FaultInfo {
+                address: VirtAddr(fault_va),
+                write: false,
+                instruction: false,
+                from_user: false,
+            })
+        }
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    Err(FaultInfo {
+        address: VirtAddr(src.addr()),
+        write: false,
+        instruction: false,
+        from_user: false,
+    })
+}
+
+unsafe fn la64_copy_to_user_raw(
+    dst: UserPtr<u8>,
+    _src: *const u8,
+    len: usize,
+) -> Result<(), FaultInfo> {
+    if len == 0 {
+        return Ok(());
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let fault_va = unsafe { tx_la64_ctu_raw(dst.as_ptr(), _src as *mut u8, len) };
+        if fault_va == 0 {
+            Ok(())
+        } else {
+            Err(FaultInfo {
+                address: VirtAddr(fault_va),
+                write: true,
+                instruction: false,
+                from_user: false,
+            })
+        }
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    Err(FaultInfo {
+        address: VirtAddr(dst.addr()),
+        write: true,
+        instruction: false,
+        from_user: false,
+    })
+}
+
+unsafe fn la64_write_user<T: Pod>(dst: UserPtr<T>, value: T) -> Result<(), FaultInfo> {
+    let src = core::ptr::addr_of!(value) as *const u8;
+    unsafe { la64_copy_to_user_raw(UserPtr::<u8>::new(dst.addr()), src, core::mem::size_of::<T>()) }
+}
+
+unsafe fn la64_read_user<T: Pod>(src: UserPtr<T>) -> Result<T, FaultInfo> {
+    let mut value = core::mem::MaybeUninit::<T>::uninit();
+    unsafe {
+        la64_copy_from_user_raw(
+            value.as_mut_ptr() as *mut u8,
+            UserPtr::<u8>::new(src.addr()),
+            core::mem::size_of::<T>(),
+        )?;
+        Ok(value.assume_init())
+    }
+}
+
 impl PmapIf for Platform {
     fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo> {
         ensure_static_boot_facts();
@@ -102,8 +185,8 @@ impl PmapIf for Platform {
         Self::free_pt_node(root.into_node());
     }
 
-    fn activate_pmap(root: &PmapRoot) -> Result<(), PmapError> {
-        activate_la64_pmap(root)
+    fn activate_user_pmap(root: &PmapRoot) {
+        let _ = activate_la64_pmap(root);
     }
 
     fn reserve_mapping(
@@ -165,76 +248,6 @@ impl TrapIf for Platform {
         classify_la64_trap(snapshot.scause)
     }
 }
-impl UserAccessIf for Platform {
-    unsafe fn copy_from_user(
-        dst: KernelPtr<u8>,
-        src: UserPtr<u8>,
-        len: usize,
-    ) -> Result<(), FaultInfo> {
-        let _ = dst;
-        if len == 0 {
-            return Ok(());
-        }
-
-        #[cfg(target_arch = "loongarch64")]
-        {
-            let fault_va = unsafe { tx_la64_cfu_raw(dst.as_ptr(), src.as_ptr(), len) };
-            if fault_va == 0 {
-                Ok(())
-            } else {
-                Err(FaultInfo {
-                    address: VirtAddr(fault_va),
-                    write: false,
-                    instruction: false,
-                    from_user: false,
-                })
-            }
-        }
-
-        #[cfg(not(target_arch = "loongarch64"))]
-        Err(FaultInfo {
-            address: VirtAddr(src.addr()),
-            write: false,
-            instruction: false,
-            from_user: false,
-        })
-    }
-
-    unsafe fn copy_to_user(
-        dst: UserPtr<u8>,
-        src: KernelPtr<u8>,
-        len: usize,
-    ) -> Result<(), FaultInfo> {
-        let _ = src;
-        if len == 0 {
-            return Ok(());
-        }
-
-        #[cfg(target_arch = "loongarch64")]
-        {
-            let fault_va = unsafe { tx_la64_ctu_raw(dst.as_ptr(), src.as_ptr(), len) };
-            if fault_va == 0 {
-                Ok(())
-            } else {
-                Err(FaultInfo {
-                    address: VirtAddr(fault_va),
-                    write: true,
-                    instruction: false,
-                    from_user: false,
-                })
-            }
-        }
-
-        #[cfg(not(target_arch = "loongarch64"))]
-        Err(FaultInfo {
-            address: VirtAddr(dst.addr()),
-            write: true,
-            instruction: false,
-            from_user: false,
-        })
-    }
-}
-
 impl SignalFrameIf for Platform {
     fn write_signal_frame(
         mut tf: TrapFrameMut<'_>,
@@ -252,12 +265,7 @@ impl SignalFrameIf for Platform {
         let frame_addr = align_down(unrounded_frame_addr, LA64_SIGFRAME_ALIGN);
         let frame = La64SignalFrame::new(&tf, &setup);
 
-        unsafe {
-            <Platform as UserAccessIf>::write_user(
-                UserPtr::<La64SignalFrame>::new(frame_addr),
-                frame,
-            )?;
-        }
+        unsafe { la64_write_user(UserPtr::<La64SignalFrame>::new(frame_addr), frame)?; }
 
         let siginfo_addr = frame_addr + core::mem::offset_of!(La64SignalFrame, siginfo);
         let ucontext_addr = frame_addr + core::mem::offset_of!(La64SignalFrame, user_context);
@@ -277,9 +285,7 @@ impl SignalFrameIf for Platform {
     }
 
     fn read_signal_frame(user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
-        let frame = unsafe {
-            <Platform as UserAccessIf>::read_user(UserPtr::<La64SignalFrame>::new(user_sp.addr()))?
-        };
+        let frame = unsafe { la64_read_user(UserPtr::<La64SignalFrame>::new(user_sp.addr()))? };
         frame.validate(user_sp)?;
         Ok(SavedSignalFrame {
             saved_mask: frame.saved_mask,
@@ -488,3 +494,5 @@ impl PowerIf for Platform {
         }
     }
 }
+
+impl EntropyIf for Platform {}
