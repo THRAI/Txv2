@@ -21,6 +21,15 @@ pub const NR_READ: u64 = 63;
 pub const NR_WRITEV: u64 = 66;
 /// `readv(fd, iov, iovcnt)`. Linux generic ABI `__NR_readv`.
 pub const NR_READV: u64 = 65;
+/// `ppoll(fds, nfds, tmo_p, sigmask)`. Linux generic ABI
+/// `__NR_ppoll`. busybox sh's interactive read loop polls stdin
+/// before reading. The v1 implementation is a minimal stub: walk
+/// the pollfd array, mark each fd with the requested events as
+/// "ready" (revents = events), return nfds. The actual block
+/// happens in the subsequent `read()` if the TTY input queue is
+/// empty — busybox observes the same external behaviour as on
+/// Linux (poll says ready, read either returns bytes or blocks).
+pub const NR_PPOLL: u64 = 73;
 /// `exit(status)`. Linux generic ABI `__NR_exit`. Per-thread exit per
 /// `PROCESS_v1` §7.3.1 — for a single-threaded process, the
 /// `step_thread_exit` chain triggers `step_process_exit` internally.

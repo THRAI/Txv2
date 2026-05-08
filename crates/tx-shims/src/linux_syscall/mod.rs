@@ -103,7 +103,8 @@ pub use numbers::{
     NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID,
     NR_GETRESUID, NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_KILL, NR_LINKAT, NR_LSEEK,
     NR_MADVISE, NR_MKDIRAT, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP,
-    NR_NEWFSTATAT, NR_OPENAT, NR_PIPE2, NR_PRLIMIT64, NR_READ, NR_READV, NR_READLINKAT, NR_RENAMEAT2,
+    NR_NEWFSTATAT, NR_OPENAT, NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ, NR_READV, NR_READLINKAT,
+    NR_RENAMEAT2,
     NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGRETURN, NR_SETGID, NR_SETPGID, NR_SETREGID,
     NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
     NR_SET_TID_ADDRESS, NR_SYMLINKAT, NR_TGKILL, NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK,
@@ -377,6 +378,7 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         NR_WRITEV => sys_writev(req.args, ctx).await,
         NR_READ => sys_read(req.args, ctx).await,
         NR_READV => sys_readv(req.args, ctx).await,
+        NR_PPOLL => sys_ppoll(req.args, ctx).await,
         NR_EXIT => sys_exit(req.args, ctx),
         NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
         NR_GETPID => sys_getpid(ctx),
@@ -685,6 +687,68 @@ async fn sys_readv<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
         }
     }
     SyscallResult::Return(total)
+}
+
+/// `ppoll(fds, nfds, tmo_p, sigmask)` — minimal v1 stub for
+/// interactive `busybox sh` so its read loop doesn't trap with
+/// `-ENOSYS`.
+///
+/// `struct pollfd { int fd; short events; short revents; }`
+/// (8 bytes on RV64). For each entry with `fd >= 0`, set
+/// `revents = events` (i.e., mark every requested event "ready").
+/// Return `nfds`.
+///
+/// Why this is sufficient for busybox sh:
+///
+/// - Interactive `sh` calls `ppoll([{fd=0, events=POLLIN}], 1,
+///   NULL, NULL)` and then `read(0, ...)`. Our stub says
+///   "ready"; busybox calls `read`; our `sys_read` blocks on the
+///   TTY wait carrier until UART RX delivers bytes. End-to-end
+///   semantics match Linux.
+///
+/// - For polls with `nfds > 1`, every fd appears ready; busybox
+///   then individually reads each and observes which are actually
+///   ready (or blocks).
+///
+/// Limitations: timeout is currently ignored (we don't sleep to
+/// the deadline; we return "ready" immediately). For shell
+/// interactive use this is fine — the timeout is typically NULL
+/// (block indefinitely, which is what `read` does anyway in the
+/// follow-up). For non-blocking polls (timeout = 0) this would
+/// busy-loop in userspace; address it if/when a real workload hits
+/// it.
+async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fds_ptr = args[0];
+    let nfds = args[1];
+
+    if nfds > 1024 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if nfds == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    const POLLFD_BYTES: u64 = 8;
+    let mut ready: i64 = 0;
+    for i in 0..nfds {
+        let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
+        let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        let fd = i32::from_le_bytes(ent_bytes[0..4].try_into().unwrap());
+        let events = i16::from_le_bytes(ent_bytes[4..6].try_into().unwrap());
+        // revents = events for fd >= 0; revents = 0 for fd < 0.
+        let revents: i16 = if fd >= 0 { events } else { 0 };
+        if fd >= 0 {
+            ready += 1;
+        }
+        ent_bytes[6..8].copy_from_slice(&revents.to_le_bytes());
+        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, ent_ptr, &ent_bytes) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+    }
+    SyscallResult::Return(ready)
 }
 
 async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
