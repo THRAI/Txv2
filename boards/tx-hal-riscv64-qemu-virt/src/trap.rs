@@ -718,6 +718,7 @@ extern "C" fn tx_rv64_qemu_kernel_trap_entry(frame: &mut Rv64TrapFrame) {
 
 #[cfg(target_arch = "riscv64")]
 fn apply_trap_action(frame: &Rv64TrapFrame, action: TrapAction) {
+    let from_user = frame.previous_mode() == TrapPreviousMode::User;
     match action {
         // Resume / DeliverSignal: fall through to the trap-vector
         // epilogue, which pop+sret's back to the trap-time mode.
@@ -736,15 +737,32 @@ fn apply_trap_action(frame: &Rv64TrapFrame, action: TrapAction) {
         // and `ret`s — control unwinds back through
         // `enter_userspace_with_context` and into the future's
         // `run_thread` body.
+        //
+        // **Only valid for from-user traps.** The KernelResumeCtx is
+        // written exclusively by `enter_userspace_with_context`'s
+        // asm helper. After the most recent userspace round-trip
+        // unwinds back through the longjmp, the resume context
+        // still holds the (sp, ra, s-regs) snapshot from that
+        // entry — re-using it for an unrelated kernel-mode trap
+        // (e.g. an IRQ that fires while the BSP loop is in WFI)
+        // would time-warp execution back into a stale frame.
+        // For from-kernel traps that ask for Reschedule (typically
+        // an IRQ that woke another task), fall through to the
+        // pop+sret epilogue — the woken task will be picked up on
+        // the next reactor poll without a longjmp.
         TrapAction::Reschedule => {
-            let cpu = <Platform as SmpIf>::current_cpu_id();
-            let stack_top = trap_stack_top_for_cpu(cpu);
-            unsafe {
-                core::arch::asm!("csrw sscratch, {top}", top = in(reg) stack_top);
-                let ctx = current_kernel_resume_ctx_ptr();
-                tx_rv64_resume_kernel_after_reschedule(ctx);
+            if from_user {
+                let cpu = <Platform as SmpIf>::current_cpu_id();
+                let stack_top = trap_stack_top_for_cpu(cpu);
+                unsafe {
+                    core::arch::asm!("csrw sscratch, {top}", top = in(reg) stack_top);
+                    let ctx = current_kernel_resume_ctx_ptr();
+                    tx_rv64_resume_kernel_after_reschedule(ctx);
+                }
+                // Asm helper diverges; this path is unreachable.
             }
-            // Asm helper diverges; this path is unreachable.
+            // From-kernel: no-op; trap-vector epilogue sret's back
+            // to S-mode at the trap-time PC.
         }
 
         TrapAction::Terminate => tx_rv64_qemu_trap_panic(frame),

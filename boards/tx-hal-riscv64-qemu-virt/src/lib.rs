@@ -228,6 +228,16 @@ const MAX_BOOT_CPUS: usize = 4;
 const PLIC_PHYS_BASE: usize = 0x0c00_0000;
 #[cfg(target_arch = "riscv64")]
 const PLIC_BASE: usize = pmap_topology::DIRECT_MAP_BASE + PLIC_PHYS_BASE;
+/// QEMU virt machine's NS16550-compatible UART. PLIC IRQ 10
+/// ([`IrqIf::UART_IRQ`]) is wired to this UART, but the device
+/// itself only raises RX-data-available IRQs when its IER (offset
+/// 1) has bit 0 set. SBI doesn't initialise the device-side IER
+/// for us, so the kernel writes it directly during boot — see
+/// `enable_uart_rx_irq`.
+#[cfg(target_arch = "riscv64")]
+const UART_PHYS_BASE: usize = 0x1000_0000;
+#[cfg(target_arch = "riscv64")]
+const UART_BASE: usize = pmap_topology::DIRECT_MAP_BASE + UART_PHYS_BASE;
 const PLIC_MAX_IRQ: u32 = tx_hal::IRQ_DISPATCH_TABLE_SIZE as u32;
 #[cfg(all(not(target_arch = "riscv64"), test))]
 const PLIC_IRQ_SOURCES: usize = tx_hal::IRQ_DISPATCH_TABLE_SIZE;
@@ -670,6 +680,13 @@ impl IrqIf for Platform {
             table as *const IrqDispatchTable as *mut _,
             Ordering::Release,
         );
+        // The PLIC routes UART IRQ 10 to us, but the 16550 UART
+        // itself only raises that IRQ when its IER (offset 1) has
+        // bit 0 set. SBI doesn't initialise the device-side IER
+        // for us. We do it here, alongside the dispatch-table
+        // install, so the same boot step that wires the kernel
+        // handler also enables the device-side trigger.
+        enable_uart_rx_irq();
     }
 
     fn dispatch_irq(irq: u32) -> IrqHandled {
@@ -1108,6 +1125,58 @@ fn plic_read_u32(offset: usize) -> u32 {
 #[cfg(target_arch = "riscv64")]
 fn plic_write_u32(offset: usize, value: u32) {
     unsafe { ((PLIC_BASE + offset) as *mut u32).write_volatile(value) };
+}
+
+/// Enable the 16550 UART's "received-data-available" interrupt
+/// (IER bit 0) so QEMU's UART raises PLIC IRQ 10 when stdin
+/// delivers a byte; AND set `sie.SEIE` (bit 9 = supervisor
+/// external interrupt enable) + `sstatus.SIE` (global) so the
+/// PLIC IRQ actually reaches our trap vector. PLIC unmask alone
+/// is insufficient — without SEIE the IRQ pends in mip but never
+/// fires the trap.
+///
+/// `enable_timer_wakeups` (in `time.rs`) sets STIE separately for
+/// timer interrupts. We don't share a helper because the order
+/// of timer vs external IRQ enable matters for boot smoke
+/// sentinels — timers come up earlier.
+///
+/// Idempotent: writing IER and `csrs` instructions just set the
+/// same bits.
+#[cfg(target_arch = "riscv64")]
+fn enable_uart_rx_irq() {
+    // 16550 IER offset = 1; bit 0 = ERBFI (Enable Received Data
+    // Available Interrupt).
+    const UART_IER_OFFSET: usize = 1;
+    const UART_IER_ERBFI: u8 = 0x01;
+    unsafe {
+        let ier = (UART_BASE + UART_IER_OFFSET) as *mut u8;
+        ier.write_volatile(UART_IER_ERBFI);
+
+        // sie |= SEIE (bit 9) and sstatus |= SIE (bit 1).
+        let seie = 1usize << 9;
+        core::arch::asm!(
+            "csrs sie, {seie}",
+            "csrsi sstatus, 2",
+            seie = in(reg) seie,
+            options(nomem, nostack)
+        );
+    }
+
+    // Lower the PLIC threshold for the current hart's S-mode
+    // context to 0 so any priority >= 1 IRQ is delivered. QEMU's
+    // virt machine resets this register to 0, but explicit beats
+    // implicit — the same value works on hardware and avoids a
+    // surprise on platforms that don't zero it.
+    let context = plic_context_for_cpu(current_cpu_id());
+    let threshold_offset = PLIC_CONTEXT_BASE + context * PLIC_CONTEXT_STRIDE;
+    plic_write_u32(threshold_offset, 0);
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn enable_uart_rx_irq() {
+    // Host build: no UART hardware. Stubbed; the IrqIf impl on the
+    // host platform never reaches this path under test (no real
+    // dispatch-table install on host).
 }
 
 #[cfg(all(not(target_arch = "riscv64"), not(test)))]

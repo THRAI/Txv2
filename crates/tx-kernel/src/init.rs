@@ -1407,6 +1407,25 @@ impl<P: TxPlatform> CoreInit<P> {
     /// next deadline, and idles via `wait_for_interrupt_once` if
     /// the loop went idle. This is the closest seam to the plan's
     /// guesses and keeps the BSP and APs symmetric.
+    /// Polled SBI debug-console drain — see the call site comment
+    /// in `run_userspace_reactor_loop`. Drains any bytes the
+    /// firmware has buffered on the host stdio side and feeds them
+    /// to the boot console TTY via `step_ingest`, which fires the
+    /// TTY's wait carrier so a blocked `read` on fd 0 wakes up.
+    ///
+    /// Cheap when no bytes are pending (`read_bytes` returns 0,
+    /// the rest is skipped).
+    fn drain_sbi_console_into_tty() {
+        let mut buf = [0u8; 64];
+        let n = <P as tx_hal::ConsoleIf>::read_bytes(&mut buf);
+        if n == 0 {
+            return;
+        }
+        let Some(tty) = console_tty() else { return };
+        let guard = tx_substrate::epoch::guard();
+        let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
+    }
+
     fn run_userspace_reactor_loop() {
         // Wave 1 of the fork/clone/wait4 slice (2026-05-06): install
         // the reactor-submission seam so a future `sys_clone` arm
@@ -1466,6 +1485,18 @@ impl<P: TxPlatform> CoreInit<P> {
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
                 }
+                // Drain SBI debug-console bytes into the boot
+                // console TTY on every wake. The QEMU virt UART
+                // path *should* deliver bytes via PLIC IRQ 10
+                // (`uart_rx_irq_handler`), but in our current
+                // configuration that doesn't fire — likely OpenSBI
+                // claims the UART in M-mode for its debug-console
+                // extension. As a fallback the BSP polls SBI on
+                // each idle wake (timer ticks fire ~every 5 ms in
+                // smoke; once we get IRQ-driven RX working this
+                // becomes redundant, but it's harmless when
+                // there are no buffered bytes).
+                Self::drain_sbi_console_into_tty();
             }
         }
 
