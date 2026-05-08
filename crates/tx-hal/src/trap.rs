@@ -299,17 +299,34 @@ pub trait TrapIf {
     /// pending syscall return into the architecture's `a0`-equivalent
     /// register before the platform's `sret`/`ertn`/equivalent.
     ///
-    /// Diverges; control returns through the trap vector, **not**
-    /// through this call site. This is the single platform-side site
-    /// that mutates user-visible registers per the Plan B writeback
-    /// discipline pinned by `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`
+    /// **Returns** when the resulting userspace round-trip is
+    /// rescheduled by the trap shell (i.e. the kernel-side trap
+    /// handler returned [`TrapAction::Reschedule`] and the platform
+    /// longjmped back to the kernel context that issued this call).
+    /// Returning here is what makes the stackless-coroutine thread
+    /// future model work: control unwinds back into the future's
+    /// `poll`, which then awaits the freshly-resolved
+    /// userspace-run wait and dispatches the trap.
+    ///
+    /// Resume / DeliverSignal trap actions do NOT return here — they
+    /// re-enter userspace directly through the platform's trap-vector
+    /// exit path.
+    ///
+    /// Platforms whose trap shell does not yet implement the
+    /// reschedule longjmp may still implement this method as
+    /// divergent (the body never returns at runtime); the type is
+    /// `()` so it composes with the future-driven thread runtime.
+    ///
+    /// This is the single platform-side site that mutates user-visible
+    /// registers per the Plan B writeback discipline pinned by
+    /// `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`
     /// (`docs/design/02_execution/THREAD_RUNTIME_v1.md`).
     ///
     /// The default implementation panics; platforms that ship a
     /// production userspace-entry path override it. Host-test
     /// platforms (no real `sret`) can also override with an infinite
     /// loop or a panic spelling the configuration error.
-    fn enter_userspace_with_context(_ctx: UserTrapContext) -> ! {
+    fn enter_userspace_with_context(_ctx: UserTrapContext) {
         panic!("TrapIf::enter_userspace_with_context: platform has no userspace-entry shim");
     }
 }

@@ -379,7 +379,17 @@ impl TrapIf for Platform {
     /// return into the context's `a0` slot before this call; the
     /// platform's writeback is the `restore_user_context` shape
     /// already used by `Rv64TrapFrame::restore_user_context`.
-    fn enter_userspace_with_context(ctx: UserTrapContext) -> ! {
+    ///
+    /// **TODO(reschedule-longjmp)**: this body still calls
+    /// `return_to_userspace` which is `-> !` and never returns at
+    /// runtime. The signature change to `()` is type-level
+    /// preparation for the next slice that adds a per-hart
+    /// `KernelResumeCtx`, sscratch swap onto a per-CPU trap-handler
+    /// stack, and a longjmp-back path on `TrapAction::Reschedule`.
+    /// Once that lands, this call site will return when the trap
+    /// handler chooses Reschedule, and the future-driven
+    /// `run_thread` will see control unwind back through it.
+    fn enter_userspace_with_context(ctx: UserTrapContext) {
         let mut frame = Rv64TrapFrame {
             x: [0; 32],
             scause: 0,
