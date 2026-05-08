@@ -222,22 +222,26 @@ pub fn build_aspace_from_image<P: PmapIf>(
 
     // Register LOAD-segment recipes. Each segment yields one (file-backed)
     // recipe and optionally a second (BSS-tail private-anon) recipe.
+    //
+    // **BSS handling note (2026-05-08).** `register_load_segment` already
+    // handles per-segment BSS extension by splitting at page boundaries:
+    // file-backed range up to `file_end_rounded`, then anon range from
+    // there to `mem_end_rounded`. The loader's `image_plan.bss_extension`
+    // tracks the same BSS at byte granularity (raw `vaddr + filesz`,
+    // not page-aligned), which we'd have to re-derive into page bounds
+    // and then de-dup against the per-segment anon range. The cleaner
+    // shape is to ignore the loader's bss_extension here and rely on
+    // the per-segment split. This also removes a class of bugs where
+    // the loader's raw BSS bounds collide with `align_range`'s
+    // page-alignment requirement on real binaries (e.g. busybox's
+    // seg[1] BSS at 0x10a341 fails `align_range`).
+    //
+    // The `bss_extension` field stays on `ImagePlan` for downstream
+    // consumers (auxv, debug tooling) that care about the
+    // byte-granularity range; only the redundant register-recipe pass
+    // is removed.
     for segment in &image_plan.load_segments {
         register_load_segment(&aspace, segment)?;
-    }
-
-    // Final-segment BSS extension, if the loader handed one separately.
-    if let Some(bss) = image_plan.bss_extension {
-        if bss.size > 0 {
-            let range = align_range(bss.vaddr, bss.size).ok_or(ScriptError::InvalidImage)?;
-            let entry = VmEntry::new(
-                range,
-                Prot::READ_WRITE,
-                VmEntryFlags::PRIVATE,
-                VmBacking::PrivateAnon,
-            );
-            register_recipe(&aspace, entry)?;
-        }
     }
 
     // Stack: anonymous private, page-aligned, anchored to `stack_top`.

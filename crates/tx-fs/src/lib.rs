@@ -12,6 +12,9 @@ pub mod tmpfs;
 pub mod tx_ext4 {}
 
 #[cfg(test)]
+mod initramfs_tests;
+
+#[cfg(test)]
 pub(crate) mod test_support {
     /// Shared serialisation lock for every test in this crate's lib
     /// binary. Multiple test modules (`devfs::tests`, `tmpfs::tests`)
