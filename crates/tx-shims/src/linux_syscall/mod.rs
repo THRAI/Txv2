@@ -842,8 +842,7 @@ pub(super) fn bootstrap_read_user_cstr(
             drop(guard);
             // Fallback bootstrap scan — matches the previous inline
             // helper.
-            let mut out: Vec<u8> = Vec::new();
-            out.reserve(core::cmp::min(max_len, 256));
+            let mut out: Vec<u8> = Vec::with_capacity(core::cmp::min(max_len, 256));
             for offset in 0..max_len {
                 // SAFETY: see `bootstrap_read_user`.
                 let byte =

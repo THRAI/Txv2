@@ -285,7 +285,7 @@ pub fn build_initial_user_stack(
     let total = unpadded + pad;
 
     let initial_sp = stack_top - total as u64;
-    debug_assert!(initial_sp % STACK_ALIGN as u64 == 0);
+    debug_assert!(initial_sp.is_multiple_of(STACK_ALIGN as u64));
 
     // ---- 5. Compute key user-VA addresses --------------------------------
     //

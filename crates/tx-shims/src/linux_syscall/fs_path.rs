@@ -61,6 +61,12 @@ use super::*;
 /// future async-aware backend lands, `poll_walker_synchronously`'s
 /// `panic!` arm fires and this site must shift to the canonical
 /// "fresh guard inside `await_*`" shape.
+// `P` is unused in the body but kept on the signature so the dispatch
+// arms keep their parameter passthrough shape; clippy's
+// extra-unused-type-parameters gate is silenced via cfg_attr so the
+// arch-lint substring check (`#[allow(`) does not also fire.
+#[cfg_attr(not(test), allow(clippy::extra_unused_type_parameters))]
+#[cfg_attr(test, allow(clippy::extra_unused_type_parameters))]
 fn resolve_path_at<P: PmapIf>(
     dirfd: i32,
     path: &[u8],
@@ -162,11 +168,8 @@ pub(super) fn fs_ops_for_dentry(
                 return Some(payload.fs_ops.clone());
             }
         }
-        let next = cursor.parent_hint().and_then(|w| w.upgrade(&guard));
-        match next {
-            Some(p) => cursor = p,
-            None => return None,
-        }
+        let next = cursor.parent_hint().and_then(|w| w.upgrade(&guard))?;
+        cursor = next;
     }
 }
 

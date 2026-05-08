@@ -132,7 +132,7 @@ fn parse_one_entry(
     }
     if cursor
         .checked_add(NEWC_HEADER_LEN)
-        .map_or(true, |end| end > bytes.len())
+        .is_none_or(|end| end > bytes.len())
     {
         return Err(CpioError::Truncated);
     }

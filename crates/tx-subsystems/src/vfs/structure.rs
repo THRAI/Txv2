@@ -753,12 +753,13 @@ impl OpenFile {
 /// `decr_*` helpers.
 impl Drop for OpenFile {
     fn drop(&mut self) {
-        if let RNodeBacking::StructBacked { payload } = self.rnode.backing() {
-            if let StructPayload::Pipe { payload, side } = payload {
-                match side {
-                    crate::pipe::PipeSide::Reader => payload.decr_reader(),
-                    crate::pipe::PipeSide::Writer => payload.decr_writer(),
-                }
+        if let RNodeBacking::StructBacked {
+            payload: StructPayload::Pipe { payload, side },
+        } = self.rnode.backing()
+        {
+            match side {
+                crate::pipe::PipeSide::Reader => payload.decr_reader(),
+                crate::pipe::PipeSide::Writer => payload.decr_writer(),
             }
         }
     }

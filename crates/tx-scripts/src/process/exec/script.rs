@@ -376,7 +376,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         Gid(exec_meta.gid),
         exec_meta.mode,
     );
-    let at_secure = exec_outcome.map_or(false, |o| o.at_secure);
+    let at_secure = exec_outcome.is_some_and(|o| o.at_secure);
 
     // ===== Phase 4 — build detached AddressSpace =====================
     //

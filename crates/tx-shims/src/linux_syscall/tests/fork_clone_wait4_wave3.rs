@@ -221,7 +221,7 @@ fn dispatch_wait4_blocking_resolves_when_child_zombifies() {
     // Drive the wait4 future manually so we can interleave the
     // child's exit between polls. Same shape as
     // `dispatch_read_blocks_until_tty_input_then_returns_byte`.
-    let waker = Waker::from(Arc::new(NoopWake));
+    let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
 
     // Blocking variant — options = 0 (no WNOHANG).

@@ -333,7 +333,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // pid → WaitTarget. i32::MIN's negate overflows; reject upfront.
     let target = match pid {
         i32::MIN => return SyscallResult::Error(EINVAL_VALUE),
-        p if p == -1 => WaitTarget::Any,
+        -1 => WaitTarget::Any,
         0 => WaitTarget::CallerPgrp,
         p if p > 0 => WaitTarget::Pid(Pid(p as u32)),
         p => {

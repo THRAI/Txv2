@@ -44,10 +44,10 @@ const PF_R_BIT: u32 = 4;
 const FIX_PAGE: u64 = 4096;
 
 /// Layout for the base minimal-static-ELF fixture:
-///   - Ehdr at 0..64
-///   - PT_PHDR at 64..120  (vaddr = base_load_vaddr + 64)
-///   - PT_LOAD at 120..176 (R+X, vaddr = base_load_vaddr,
-///                          filesz = 176, memsz = 176)
+/// - Ehdr at 0..64
+/// - PT_PHDR at 64..120  (vaddr = base_load_vaddr + 64)
+/// - PT_LOAD at 120..176 (R+X, vaddr = base_load_vaddr,
+///   filesz = 176, memsz = 176)
 struct FixtureCfg {
     e_type: u16,
     e_machine: u16,

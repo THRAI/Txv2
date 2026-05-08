@@ -295,6 +295,7 @@ impl ThreadPayloadSlots {
         // `SpinMutex<Option<...>>::new(None)`. The repetition pattern
         // requires `Copy` which `SpinMutex` is not, so spell out 64
         // entries via a macro-shaped helper.
+        #[allow(clippy::declare_interior_mutable_const)]
         const NIL: SpinMutex<Option<PayloadCap<ThreadPayload>>> = SpinMutex::new(None);
         Self {
             slots: [NIL; MAX_THREAD_PAYLOAD_HARTS],

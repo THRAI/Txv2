@@ -236,19 +236,13 @@ fn walk_inner<'g>(
 ) -> StepOutcome<Cap<DEntry>> {
     let mount_root = mount_root_dentry(&rooted_at, guard);
 
-    let mut current: Cap<DEntry>;
-    let mut remaining: Vec<u8>;
-    let must_be_directory: bool;
-
-    if path.first() == Some(&b'/') {
-        current = mount_root.clone();
-        remaining = path[1..].to_vec();
+    let (mut current, mut remaining): (Cap<DEntry>, Vec<u8>) = if path.first() == Some(&b'/') {
+        (mount_root.clone(), path[1..].to_vec())
     } else {
-        current = rooted_at.clone();
-        remaining = path.to_vec();
-    }
+        (rooted_at.clone(), path.to_vec())
+    };
 
-    must_be_directory = remaining.last().copied() == Some(b'/');
+    let must_be_directory = remaining.last().copied() == Some(b'/');
 
     let mut current_fs_ops: Option<Arc<dyn FsOps>> = fs_ops_for(&current, guard);
     let mut current_mount_payload: Option<Cap<MountPayload>> = mount_payload_for(&current, guard);

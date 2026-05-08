@@ -223,7 +223,7 @@ impl ExecTestFs {
         uid: u32,
         gid: u32,
     ) -> FsObjectId {
-        let pages = ((bytes.len() as u64) + USER_PAGE_SIZE as u64 - 1) / USER_PAGE_SIZE as u64;
+        let pages = (bytes.len() as u64).div_ceil(USER_PAGE_SIZE as u64);
         let pages = core::cmp::max(pages, 1);
         let pc = PageContainer::new_cap(
             PageContainerKind::Anon {
@@ -467,7 +467,7 @@ impl FsPageBacking for ExecTestFs {
         drop(inner);
 
         let page_size = USER_PAGE_SIZE as u64;
-        if offset % page_size != 0 {
+        if !offset.is_multiple_of(page_size) {
             return StepOutcome::Err(Errno::EINVAL);
         }
         let page_index = PageIndex::new(offset / page_size);
@@ -542,6 +542,7 @@ fn minimal_elf_bytes() -> Vec<u8> {
     fn write_u64(b: &mut [u8], at: usize, v: u64) {
         b[at..at + 8].copy_from_slice(&v.to_le_bytes());
     }
+    #[allow(clippy::too_many_arguments)]
     fn write_phdr(
         b: &mut [u8],
         at: usize,
@@ -693,15 +694,8 @@ fn fresh_aspace() -> Cap<AddressSpace> {
 
 fn block_on<F: core::future::Future>(future: F) -> F::Output {
     use core::task::{Context, Poll, Waker};
-    use std::sync::Arc;
 
-    struct NoopWake;
-    impl std::task::Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-        fn wake_by_ref(self: &Arc<Self>) {}
-    }
-
-    let waker = Waker::from(Arc::new(NoopWake));
+    let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     let mut pinned = Box::pin(future);
     for _ in 0..1024 {

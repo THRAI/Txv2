@@ -356,14 +356,14 @@ impl<P: TxPlatform> CoreInit<P> {
     /// Mount tmpfs as the rootfs.
     ///
     /// Builds a fresh `Tmpfs` instance, hands it to `MountPayload`
-    /// + `MountIdentity::new_cap` (per
-    /// `txdoc:MOUNT-MOUNTPAYLOAD-1` /
+    /// and `MountIdentity::new_cap` (per
+    /// `txdoc:MOUNT-MOUNTPAYLOAD-1` and
     /// `txdoc:MOUNT-STEP-MOUNT-COMMIT-ORDERING-1`,
     /// `docs/design/05_filesystem/MOUNT_v1.md`), and stores the
     /// resulting cap in `ROOT_MOUNT`. The mount has no parent and
     /// no mountpoint dentry (it *is* the namespace root), per the
     /// `MountIdentity::new_cap` shape that already accepts
-    /// `mountpoint: None` / `parent: None`.
+    /// `mountpoint: None` and `parent: None`.
     ///
     /// **Order invariant:** must precede `mount_devfs_at_dev`. The
     /// rootfs supplies the directory `/dev` is mounted on top of.

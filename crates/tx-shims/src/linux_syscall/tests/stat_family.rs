@@ -36,7 +36,7 @@ const E_NOSYS: i32 = 38;
 const E_RANGE: i32 = 34;
 
 /// Stat field offsets (verified against Linux's `asm-generic/stat.h`
-/// + the `StatLayout` struct in `mod.rs`). Tests read directly out
+/// and the `StatLayout` struct in `mod.rs`). Tests read directly out
 /// of the kernel-side stat buffer using these offsets.
 const STAT_INO_OFF: usize = 8;
 const STAT_MODE_OFF: usize = 16;
@@ -569,7 +569,7 @@ fn dispatch_getdents64_on_directory_fd_writes_entries() {
         let d_ino = read_u64_at(&buf, off);
         let d_reclen = read_u16_at(&buf, off + 16) as usize;
         let d_type = buf[off + 18];
-        assert!(d_reclen >= DIRENT_HEADER_BYTES + 1);
+        assert!(d_reclen > DIRENT_HEADER_BYTES);
         assert!(off + d_reclen <= total);
         assert_eq!(d_type, crate::linux_syscall::DT_REG);
         if d_ino == id_a.as_u64() {

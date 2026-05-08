@@ -944,6 +944,7 @@ fn sign_process_identity(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign_process_payload(
     aspace: Cap<AddressSpace>,
     threads: Vec<Cap<ThreadIdentity>>,

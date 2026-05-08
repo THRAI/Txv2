@@ -70,7 +70,7 @@ fn build_test_cpio(entries: &[(&[u8], u32, &[u8])]) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     let mut next_ino: u32 = 1;
     for (name, mode, data) in entries {
-        emit_entry(&mut buf, *name, *mode, data, next_ino);
+        emit_entry(&mut buf, name, *mode, data, next_ino);
         next_ino = next_ino.wrapping_add(1);
     }
     emit_entry(&mut buf, b"TRAILER!!!", 0, &[], 0);
@@ -109,9 +109,9 @@ fn emit_entry(buf: &mut Vec<u8>, name: &[u8], mode: u32, data: &[u8], ino: u32) 
 fn hex8(value: u32) -> [u8; 8] {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = [0u8; 8];
-    for i in 0..8 {
+    for (i, slot) in out.iter_mut().enumerate() {
         let shift = (7 - i) * 4;
-        out[i] = HEX[((value >> shift) & 0xf) as usize];
+        *slot = HEX[((value >> shift) & 0xf) as usize];
     }
     out
 }
