@@ -903,14 +903,14 @@ fn rv64_register_key(index: usize) -> &'static [u8] {
 }
 
 #[cfg(target_arch = "riscv64")]
-fn console_write_literal(bytes: &[u8]) {
+pub(crate) fn console_write_literal(bytes: &[u8]) {
     for &byte in bytes {
         crate::sbi_console_putchar(byte);
     }
 }
 
 #[cfg(target_arch = "riscv64")]
-fn console_write_hex(value: usize) {
+pub(crate) fn console_write_hex(value: usize) {
     // Print 16 hex digits MSB-first. Shifts run 60, 56, ..., 4, 0
     // so each `(value >> shift) & 0xf` captures the correct nibble.
     //

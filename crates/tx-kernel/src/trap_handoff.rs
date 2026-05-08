@@ -192,7 +192,20 @@ pub fn hand_off_syscall(
         return HandoffOutcome::NoActiveRequest;
     };
 
-    payload.store_saved_user_context(Some(view.capture_user_context()));
+    // Capture the user context and advance pc past the trapping
+    // ecall so the eventual sret resumes at the instruction after,
+    // not at the ecall itself. RV64 ecall is 4 bytes (not
+    // compressed); other arches with a different syscall-trapping
+    // insn width need their own constant when ported.
+    //
+    // This is the canonical site for the bump on the syscall path:
+    // the trap-shell knows the trap was a syscall (page faults
+    // intentionally re-execute the faulting instruction after the
+    // fault is resolved, so that path keeps pc unchanged).
+    let mut ctx = view.capture_user_context();
+    const RV64_ECALL_INSN_BYTES: usize = 4;
+    ctx.pc = ctx.pc.wrapping_add(RV64_ECALL_INSN_BYTES);
+    payload.store_saved_user_context(Some(ctx));
 
     let slot: UserspaceRunSlot = payload.userspace_slot().clone();
     match slot.complete_interesting_trap(active, UserspaceTrapInfo::Syscall(req)) {
