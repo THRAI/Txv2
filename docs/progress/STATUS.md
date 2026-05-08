@@ -4,34 +4,31 @@
 
 ## Current Shape
 
-- 2026-05-08 userspace first-entry slice 2 — reschedule longjmp
-  model + asm + runtime validated. Branch `feat/busybox-smoke`.
-  Four commits: `196a969` (model: type+loop+docs), `eb3e66a`
-  (asm: per-hart KernelResumeCtx + per-CPU trap stack +
-  sscratch-swap trap vector + reschedule longjmp asm helpers),
-  `1371f1b` (progress catch-up), `007acca` (three bug fixes
-  surfaced by QEMU triage: sscratch-primer dead-code path,
-  trap-stack-in-rodata, off-by-3 console_write_hex). After 007acca
-  busybox-smoke boots cleanly through `:boot:ok` and
-  `:reactor:timer-idle:ok` (timer interrupts handled by the new
-  trap vector). Temporary trap-trace instrumentation confirmed
-  the reschedule longjmp executes correctly: continuous
-  `[ENT][RSC][RTN]` cycles show userspace entering via
-  save_resume, trapping, longjmp-back through
-  `enter_userspace_with_context`'s normal return, future awaits
-  resolved wait, dispatches, loops. **The stackless-coroutine +
-  reschedule longjmp model is functional end-to-end.**
-  **New blocker (separate slice):** every userspace trap is
-  `[pi]` (instruction page fault from user) and the future's
-  PageFault arm runs `fault_script` but the page never becomes
-  executable, so we loop forever on the same `sepc`. Suspects:
-  fault_script Ok-without-publish, missing `sfence.vma`,
-  ELF-loader recipe not registered for the busybox text segment,
-  or a `:bootstrap-exec:fallback` to the bake-in fixture which
-  faults differently. Workspace host tests green (0 failed)
-  across all four commits. See
+- 2026-05-08 userspace first-entry slice 2 — **functionally
+  complete**. Branch `feat/busybox-smoke`. Six commits:
+  `196a969` (model: type+loop+docs), `eb3e66a` (asm:
+  per-hart KernelResumeCtx + per-CPU trap stack + sscratch swap
+  + reschedule longjmp), `1371f1b` (catch-up), `007acca` (three
+  fixes: sscratch primer dead-code path, trap stack in rodata,
+  console_write_hex off-by-3), `82639af` (catch-up), `b543e90`
+  (two more: `PmapIf::activate_user_pmap` so satp points at the
+  user process's pmap before sret, and a +4 sepc bump in
+  `hand_off_syscall` so a returning syscall doesn't re-execute
+  the ecall). Userspace now runs end-to-end: busybox demand-pages
+  through its text segment, dispatches dozens of syscalls
+  (`set_tid_address`, `brk`, `openat`, `ioctl`, `fcntl`, `mmap`,
+  ...), and emits `:userspace:exited:N`. Currently terminating
+  with N=11 (SIGSEGV from a busybox-side issue: some syscall
+  return is misinterpreted as a pointer; `stval = 0x746f672e00617461`
+  decodes to ASCII "ata.\0got"). `cargo xtask test busybox-smoke
+  --target rv64-qemu` passes. Workspace host tests green (0
+  failed) across all six commits. See
   `docs/progress/decisions/2026-05-08-userspace-first-entry-gap.md`
-  for the full diagnosis trail.
+  for the full diagnosis trail. **Next slice:** triage the
+  busybox-side SIGSEGV by extending the trap-trace to map syscall
+  numbers to the dispatcher's actual return values; suspects are
+  `openat`, `fstat`, `getdents64`, or any syscall that returns a
+  pointer/buffer to userspace.
 
 - 2026-05-08 retire `UserAccessIf` slice on branch
   `feat/retire-user-access-if`. Replaced the trait-based fixup-recovery
