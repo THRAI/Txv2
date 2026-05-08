@@ -151,6 +151,7 @@ impl tx_hal::EntropyIf for IrqTestPlatform {}
 
 impl tx_hal::PowerIf for IrqTestPlatform {
     fn system_off() -> ! {
+        #[allow(clippy::empty_loop)]
         loop {}
     }
 }

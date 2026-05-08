@@ -31,7 +31,7 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let iov_ptr = args[1];
     let iovcnt = args[2] as i32;
 
-    if iovcnt < 0 || iovcnt > 1024 {
+    if !(0..=1024).contains(&iovcnt) {
         return SyscallResult::Error(EINVAL_VALUE);
     }
     if iovcnt == 0 {
@@ -83,7 +83,7 @@ pub(super) async fn sys_readv<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let iov_ptr = args[1];
     let iovcnt = args[2] as i32;
 
-    if iovcnt < 0 || iovcnt > 1024 {
+    if !(0..=1024).contains(&iovcnt) {
         return SyscallResult::Error(EINVAL_VALUE);
     }
     if iovcnt == 0 {

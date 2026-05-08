@@ -14,8 +14,6 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use std::sync::Arc;
-
 use tx_hal::{
     AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
     PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions, PmapReservation,
@@ -112,6 +110,7 @@ impl tx_hal::EntropyIf for TestPlatform {}
 
 impl tx_hal::PowerIf for TestPlatform {
     fn system_off() -> ! {
+        #[allow(clippy::empty_loop)]
         loop {}
     }
 }
@@ -174,15 +173,8 @@ fn bootstrap_payload() -> PayloadCap<ThreadPayload> {
     leader.payload_cap_for_test().expect("leader payload alive")
 }
 
-struct NoopWake;
-
-impl std::task::Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-    fn wake_by_ref(self: &Arc<Self>) {}
-}
-
 fn noop_waker() -> Waker {
-    Waker::from(Arc::new(NoopWake))
+    Waker::noop().clone()
 }
 
 /// Drive `fut` to completion via a spin-poll loop. Mirrors the
@@ -515,7 +507,7 @@ fn thread_future_pf_ok_loops_back_to_userspace_entry() {
     );
     let result = block_on(aspace.fault_script(fault));
     assert!(
-        matches!(result, Ok(_)),
+        result.is_ok(),
         "fault_script(Read on private-anon) must succeed; got {result:?}"
     );
 

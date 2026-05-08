@@ -257,8 +257,7 @@ impl AddressSpace {
         if src.addr() == 0 || max_len == 0 {
             return StepOutcome::Done(Vec::new());
         }
-        let mut out: Vec<u8> = Vec::new();
-        out.reserve(core::cmp::min(max_len, 256));
+        let mut out: Vec<u8> = Vec::with_capacity(core::cmp::min(max_len, 256));
         let mut consumed = 0usize;
         while consumed < max_len {
             let user_addr = src.addr().wrapping_add(consumed);

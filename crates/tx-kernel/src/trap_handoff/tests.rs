@@ -95,6 +95,7 @@ impl tx_hal::EntropyIf for TestPlatform {}
 
 impl tx_hal::PowerIf for TestPlatform {
     fn system_off() -> ! {
+        #[allow(clippy::empty_loop)]
         loop {}
     }
 }

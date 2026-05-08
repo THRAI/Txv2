@@ -725,7 +725,11 @@ fn sym() -> usize {
 
     #[test]
     fn rv64_qemu_trampoline_uses_only_low_load_symbols() {
-        let source = include_str!("../../boards/tx-hal-riscv64-qemu-virt/src/lib.rs");
+        // The trampoline `core::arch::global_asm!(...)` block lives in its
+        // own file since the 2026-05-08 jumbo-mod split (see
+        // `docs/progress/STATUS.md`); the lib.rs `mod boot_trampoline;`
+        // declaration is the only place lib.rs touches it.
+        let source = include_str!("../../boards/tx-hal-riscv64-qemu-virt/src/boot_trampoline.rs");
         let start = source
             .find(".section .text.trampoline")
             .expect("trampoline section");

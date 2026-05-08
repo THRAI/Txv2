@@ -781,7 +781,7 @@ impl FsPageBacking for Tmpfs {
         drop(state);
 
         let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
-        if offset % page_size != 0 {
+        if !offset.is_multiple_of(page_size) {
             return StepOutcome::Err(Errno::EINVAL);
         }
         let page_index = PageIndex::new(offset / page_size);

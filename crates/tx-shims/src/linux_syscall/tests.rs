@@ -21,8 +21,7 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use std::sync::{Arc, Mutex};
-use std::task::Wake;
+use std::sync::Mutex;
 
 use tx_reactor::userspace::SyscallRequest;
 use tx_substrate::zone::Cap;
@@ -283,15 +282,8 @@ fn install_capturing_console() -> &'static CapturingOps {
 // skip the await.
 // ---------------------------------------------------------------------------
 
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-    fn wake_by_ref(self: &Arc<Self>) {}
-}
-
 fn block_on<F: Future>(mut fut: F) -> F::Output {
-    let waker = Waker::from(Arc::new(NoopWake));
+    let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     // SAFETY: the future stays on the stack for the duration of the
     // poll loop; we never move it after pinning.
@@ -461,7 +453,7 @@ fn dispatch_read_blocks_until_tty_input_then_returns_byte() {
     // Manually drive the future: first poll should observe an empty
     // TTY input queue and return Pending after registering a waker
     // on the wait-carrier `Channel`.
-    let waker = Waker::from(Arc::new(NoopWake));
+    let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     let fut = dispatch::<ShimsTestPmap>(req, &ctx);
     let mut pinned = Box::pin(fut);

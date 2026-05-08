@@ -178,6 +178,7 @@ impl tx_hal::EntropyIf for TestPlatform {}
 
 impl tx_hal::PowerIf for TestPlatform {
     fn system_off() -> ! {
+        #[allow(clippy::empty_loop)]
         loop {}
     }
 }
@@ -609,7 +610,7 @@ fn boot_smoke_production_userspace_loop_writes_console_then_exits() {
         status: 0,
     }));
 
-    let waker = Waker::from(std::sync::Arc::new(NoopWake));
+    let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
 
     let future = crate::thread_future::run_thread::<TestPlatform>(leader.clone(), payload.clone());
@@ -734,7 +735,6 @@ fn boot_smoke_production_userspace_loop_writes_console_then_exits() {
          NoReturn short-circuits before a third dive",
     );
 
-    drop(pinned);
     drop(boxed);
     let _ = tx_subsystems::thread_runtime::clear_current_thread_payload(0);
 }
@@ -747,17 +747,10 @@ fn boot_smoke_production_userspace_loop_writes_console_then_exits() {
 // going through `block_on`, but `NoopWake` is shared.
 // ---------------------------------------------------------------------------
 
-struct NoopWake;
-
-impl std::task::Wake for NoopWake {
-    fn wake(self: std::sync::Arc<Self>) {}
-    fn wake_by_ref(self: &std::sync::Arc<Self>) {}
-}
-
 fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
     use core::pin::Pin;
     use core::task::{Context, Poll, Waker};
-    let waker = Waker::from(std::sync::Arc::new(NoopWake));
+    let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     // SAFETY: `fut` lives on the stack for the duration of the loop;
     // we never move it after `Pin::new_unchecked`.

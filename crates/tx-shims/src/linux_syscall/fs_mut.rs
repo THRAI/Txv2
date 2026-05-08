@@ -140,11 +140,8 @@ pub(super) fn fs_page_backing_for_dentry(
                 return Some(payload.fs_page_backing.clone());
             }
         }
-        let next = cursor.parent_hint().and_then(|w| w.upgrade(&guard));
-        match next {
-            Some(p) => cursor = p,
-            None => return None,
-        }
+        let next = cursor.parent_hint().and_then(|w| w.upgrade(&guard))?;
+        cursor = next;
     }
 }
 
@@ -706,10 +703,8 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     };
     // RENAME_NOREPLACE pre-check: walk the full new path; if it
     // resolves, the rename must fail with -EEXIST (Linux semantic).
-    if (flags & RENAME_NOREPLACE) != 0 {
-        if walk_from(cwd, &newpath, &cred).is_ok() {
-            return SyscallResult::Error(EEXIST_VALUE);
-        }
+    if (flags & RENAME_NOREPLACE) != 0 && walk_from(cwd, &newpath, &cred).is_ok() {
+        return SyscallResult::Error(EEXIST_VALUE);
     }
     let old_parent_id = old_parent_dentry.rnode().fs_object_id();
     let new_parent_id = new_parent_dentry.rnode().fs_object_id();
