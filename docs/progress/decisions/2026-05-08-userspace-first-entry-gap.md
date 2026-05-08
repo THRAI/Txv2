@@ -231,3 +231,82 @@ Status: type+loop+docs (196a969) is solid and tested; asm slice
 (eb3e66a) compiles + cross-builds but needs QEMU iteration to
 validate the runtime path. Both commits are reachable on
 `feat/busybox-smoke`.
+
+---
+
+## 2026-05-08 second update — runtime validated, three bugs fixed,
+## new blocker (page-fault loop) identified
+
+After a single-hart QEMU run + `cargo xtask fault-decode`, three
+unrelated bugs surfaced and were fixed in `007acca`:
+
+1. **sscratch primer in dead code path.** The Rust
+   `install_kernel_stack` is only invoked from a unit test; the
+   runtime boot uses an asm `tx_rv64_qemu_install_kernel_stack`
+   directly. Moved the primer to `install_early_percpu`, which
+   runs from `tx_hal::entry()` on every hart's boot path.
+
+2. **Trap stack in `.rodata`.** A plain `static [Rv64TrapStack; N]`
+   landed in `.rodata` (mapped `KERNEL_RO`); the trap-vector's
+   first store faulted. Wrapped in `PerHartCell` (UnsafeCell
+   newtype) so the linker keeps it in `.bss` (writable).
+
+3. **`console_write_hex` off-by-3 shift.** `(0..64).rev().step_by(4)`
+   yielded 63, 59, ..., 3 instead of the intended 60, 56, ..., 0.
+   Every printed address was shifted by 3 bits, breaking fault
+   triage. Fixed to `(0..64).step_by(4).rev()`.
+
+After these fixes:
+
+- Boot proceeds cleanly through `:reactor:timer-idle:ok` (timer
+  interrupts are handled correctly through the new sscratch-swap
+  trap vector — first runtime proof the asm prologue works).
+- `:bootstrap-exec:ok` and `:boot:ok` fire as expected.
+- The reschedule longjmp **works end-to-end**: a temporary trace
+  showed continuous `[ENT][RSC][RTN]` cycles — userspace enters
+  via the save_resume helper, traps, the trap shell chooses
+  Reschedule, the longjmp asm helper unwinds back through
+  `enter_userspace_with_context`'s normal return, the future
+  awaits the resolved wait, dispatches the trap, and loops back
+  to the next entry. **The entire stackless-coroutine + reschedule
+  longjmp model executes correctly.**
+
+### New blocker — userspace page-fault retry loop
+
+Trap-class tracing (also temporary, removed before commit) showed
+**every userspace trap is `[pi]` (instruction page fault from
+user)**, repeating in a tight loop. The thread future's `PageFault`
+arm calls `aspace.fault_script(VmFault).await`, falls through on
+`Ok` to the loop top, re-enters userspace at the same `sepc`, and
+takes the same fault again.
+
+This is **not** a slice-2 issue. It's a question about what the
+fault script actually does for a busybox text page that should
+already be present (the eager-walk VM model is supposed to
+materialise demand-loaded pages on first access). Suspects to
+investigate in a follow-up:
+
+- Does `aspace.fault_script` actually publish an executable PTE
+  for the faulting page? Maybe it returns `Ok` without installing
+  a leaf, or installs without `X` permission for `.text`.
+- Does the dispatch path emit `sfence.vma` for the just-mapped
+  page so the retry sees a fresh TLB? (The first map of a never-
+  cached page typically doesn't need a flush, but the elf loader
+  may be re-using a slot.)
+- Is busybox's text region actually backed by a recipe? The eager
+  ELF loader registers segments — verify the recipe is in the
+  `BTreeMap<Range, Recipe>` for the entire text segment.
+- The cmdline-init path resolves `tx.profile=busybox` →
+  `/bin/busybox` (symlinked from `/init` per `prepare_busybox_rootfs`).
+  Maybe the fallback to bake-in `/init` fired and bake-in `/init`
+  faults at `_start`. Verify which exec succeeded by capturing
+  the `:bootstrap-exec:fallback:<tag>` sentinel.
+
+### Files touched in 007acca
+
+- `boards/tx-hal-riscv64-qemu-virt/src/lib.rs`: move sscratch
+  primer; wrap RV64_TRAP_STACKS in PerHartCell.
+- `boards/tx-hal-riscv64-qemu-virt/src/trap.rs`: fix
+  console_write_hex shift sequence.
+
+cargo build (host + RV64) clean; workspace host tests green.
