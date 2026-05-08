@@ -6,19 +6,20 @@
 //!
 //! # Staging types
 //!
-//! Two types below are staging replacements for final interfaces:
+//! One type below is a staging replacement for a final interface:
 //!
 //! * [`FixedName`] — replace with the global `FixedName<N>` type once it lands
 //!   in `tx-substrate` or a shared utility crate.
-//! * [`AtomicSlot`] — replace with the real `AtomicSlot<T>` once the session/
-//!   pgrp subsystem exports one.  The current implementation is a
-//!   `SpinMutex<Option<T>>` which has identical observable semantics but worse
-//!   scalability under high contention.
+//!
+//! `AtomicSlot<T>` previously lived here as a staging primitive; it now lives
+//! at `tx_substrate::AtomicSlot` and is consumed via the crate-root re-export.
 
+use tx_reactor::wait::Channel;
 use tx_substrate::bus::{RawPort, RawQueue};
 use tx_substrate::zone::{Dead, Entity, PayloadCap};
+use tx_substrate::{AtomicSlot, SpinMutex};
 
-use crate::sync::SpinMutex;
+use crate::wait_carrier;
 
 use super::payload::TtyPayload;
 
@@ -55,49 +56,6 @@ impl<const N: usize> FixedName<N> {
     /// Return the stored bytes as a slice.
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len as usize]
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Staging: AtomicSlot<T>
-// ---------------------------------------------------------------------------
-
-/// Single-slot atomic container for an optional value.
-///
-/// TODO(Phase G): replace with the real `AtomicSlot<T>` once the session/pgrp
-/// subsystem defines one.  Current implementation wraps `SpinMutex<Option<T>>`
-/// which is correct but not lock-free.
-pub struct AtomicSlot<T> {
-    inner: SpinMutex<Option<T>>,
-}
-
-impl<T> AtomicSlot<T> {
-    pub const fn empty() -> Self {
-        Self {
-            inner: SpinMutex::new(None),
-        }
-    }
-
-    pub fn store(&self, value: Option<T>) {
-        *self.inner.lock() = value;
-    }
-
-    pub fn swap(&self, value: Option<T>) -> Option<T> {
-        let mut slot = self.inner.lock();
-        let old = slot.take();
-        *slot = value;
-        old
-    }
-
-    pub fn with<R, F: FnOnce(Option<&T>) -> R>(&self, f: F) -> R {
-        f(self.inner.lock().as_ref())
-    }
-
-    pub fn snapshot(&self) -> Option<T>
-    where
-        T: Clone,
-    {
-        self.inner.lock().clone()
     }
 }
 
@@ -260,6 +218,23 @@ pub struct TtyIdentity {
     /// identities first, then installs peer-linked payloads as commit points;
     /// hangup later clears this slot while identity wires remain observable.
     pub(crate) payload: SpinMutex<Option<PayloadCap<TtyPayload>>>,
+    /// Reactor wait channel that fires when `input_readable` transitions
+    /// non-empty. Used by `step_read`'s `Blocked(WaitToken)` carrier to
+    /// drive `wait_carrier::wait_on_token` from the syscall side; fired
+    /// from `step_ingest` after pushing bytes (alongside the existing
+    /// `RawQueue` readiness wire).
+    ///
+    /// Pre-ELF Phase 5 (item 9): bridges the existing `RawQueue` BIF-5
+    /// readiness wire to the wait-carrier registry that
+    /// `tx_subsystems::wait_carrier` uses, so blocking `read(2)` on a
+    /// console fd actually parks until UART RX bytes land.
+    wait_channel: Channel,
+    /// Carrier id that `wait_channel` is registered under in
+    /// `tx_subsystems::wait_carrier`. Embedded in any `WaitToken` this
+    /// TTY hands out so async script wrappers (`sys_read`'s
+    /// `wait_on_token` loop) can resolve the carrier without holding a
+    /// `Cap<TtyIdentity>`.
+    wait_carrier_id: u64,
 }
 
 impl TtyIdentity {
@@ -268,6 +243,8 @@ impl TtyIdentity {
     /// `payload` starts as `None`; the caller must assign it after allocating
     /// the payload zone slot.
     pub fn new(kind: TtyKind, index: u32, name: &str) -> Self {
+        let wait_channel = Channel::new();
+        let wait_carrier_id = wait_carrier::register_wait_channel(wait_channel.clone());
         Self {
             kind,
             index,
@@ -278,7 +255,24 @@ impl TtyIdentity {
             hangup_port: RawPort::new(),
             session_ctl_port: RawPort::new(),
             payload: SpinMutex::new(None),
+            wait_channel,
+            wait_carrier_id,
         }
+    }
+
+    /// Carrier id under which `wait_channel` is registered with the
+    /// global `wait_carrier` resolver. Async script wrappers embed
+    /// this in their `WaitToken` values so `wait_on_token` can resolve
+    /// the channel without holding a `Cap<TtyIdentity>`.
+    pub fn wait_carrier_id(&self) -> u64 {
+        self.wait_carrier_id
+    }
+
+    /// Reactor wait channel paired with `input_readable`. Callers that
+    /// hold a `Cap<TtyIdentity>` may fire it directly when bytes
+    /// arrive; `step_ingest` is the in-tree fire site.
+    pub fn wait_channel(&self) -> &Channel {
+        &self.wait_channel
     }
 
     /// Install or replace the live payload slot.

@@ -115,6 +115,98 @@ tools/images/build-cpio.sh
 tools/images/build-ext4.sh --size 64M
 ```
 
+## Debug tooling
+
+txKernel ships two paired debug-instrumentation surfaces. Both are
+designed for ad-hoc triage on real QEMU runs without forcing a
+production-overhead trace.
+
+### `cargo xtask fault-decode` — single-trap analysis
+
+Decodes a kernel-mode trap dump into a resolved ELF symbol +
+runtime classification. Reads `txkernel:<board>:trap` records (the
+panic-path dump emitted by `tx_rv64_qemu_trap_panic` and similar)
+or accepts raw `--scause`/`--sepc`/`--stval` triples.
+
+```sh
+# parse a panic dump from a serial log
+cargo xtask fault-decode --target rv64-qemu --serial target/qemu-rv64-qemu-busybox.serial.log
+
+# decode a single address
+cargo xtask fault-decode --target rv64-qemu --addr 0xffffffff802d32a0
+```
+
+Handles low-linked / high-VMA layouts, demangles Rust symbols, and
+classifies kernel direct-map vs ELF-text pointers.
+
+### `cargo xtask trap-trace` + `--features trap-trace`
+
+Streams every user-mode trap and every userspace re-entry as a
+single-line `txdbg:` record on the serial console. Off by default
+(zero overhead in production builds); enabled either at cargo
+build time:
+
+```sh
+cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf \
+  --features trap-trace
+```
+
+or via the test lane's flag:
+
+```sh
+cargo xtask test busybox-smoke --target rv64-qemu --trap-trace
+```
+
+Wire format (canonical, see
+`boards/tx-hal-riscv64-qemu-virt/src/debug_trace.rs`):
+
+```text
+txdbg:trap n=0x... kind=SY pc=0x... a7=0x... a0=0x... a1=0x... a2=0x...
+txdbg:trap n=0x... kind=iPF|lPF|sPF|? pc=0x... stval=0x... ra=0x... a0=0x... a1=0x...
+txdbg:ent  n=0x... pc=0x... a0=0x... sp=0x...
+```
+
+Each record is one line, prefixed `txdbg:` for grep, with
+`key=0xHEX` pairs. The trap counter is monotonic; `txdbg:trap n=K`
+is paired with the next `txdbg:ent n=K+1` to show the syscall
+return value (or fault retry pc) the kernel handed back to
+userspace.
+
+The companion parser turns the stream into a paired summary:
+
+```sh
+# full timeline (faults + syscalls)
+cargo xtask trap-trace --serial target/qemu-rv64-qemu-busybox-smp1.serial.log
+
+# syscall-only filter, with NR mnemonics + errno decoding on returns
+cargo xtask trap-trace --serial target/qemu-rv64-qemu-busybox-smp1.serial.log --syscalls
+
+# pass-through grep `txdbg:` lines
+cargo xtask trap-trace --serial target/qemu-rv64-qemu-busybox-smp1.serial.log --raw
+```
+
+For multi-syscall triage, use `-smp 1` so the records aren't
+interleaved across harts:
+
+```sh
+qemu-system-riscv64 -machine virt -m 256M -smp 1 -display none -monitor none \
+  -serial file:target/qemu.serial.log -no-reboot \
+  -kernel target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt \
+  -bios default -no-shutdown \
+  -initrd target/images/busybox-initramfs.cpio \
+  -append 'tx.profile=busybox console=ttyS0'
+cargo xtask trap-trace --serial target/qemu.serial.log --syscalls
+```
+
+Adding new trace records:
+
+1. Bump or add a record-kind tag in `debug_trace.rs` (use the
+   existing `record_trap` / `record_entry` shape).
+2. Update the parser in `xtask/src/trap_trace.rs` to recognise the
+   new kind.
+3. The record format is intentionally grep-stable; do not break
+   existing kinds without bumping a version sentinel.
+
 ## M1 Dock Mock Target
 
 `rv64-m1dock-mock` is a QEMU `virt` runner for a Sipeed M1 Dock-like board

@@ -2,8 +2,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use tx_hal::{
     Arch, AuxvIf, BootInfo, BootInfoIf, BootPlatformIf, BootProtocol, CacheIf, ConsoleIf, CpuId,
-    CpuMask, DmaIf, InitIf, IrqIf, MemoryRegion, PercpuIf, PhysRange, PlatformConfig, PlatformInfo,
-    PlatformInfoIf, PmapIf, PowerIf, SignalFrameIf, SmpIf, TimeIf, TrapIf, UserAccessIf, VirtAddr,
+    CpuMask, DmaIf, EntropyIf, InitIf, IrqIf, MemoryRegion, PercpuIf, PhysRange, PlatformConfig,
+    PlatformInfo, PlatformInfoIf, PmapIf, PowerIf, SignalFrameIf, SmpIf, TimeIf, TrapIf, VirtAddr,
 };
 use tx_substrate::{epoch, zone};
 
@@ -67,9 +67,9 @@ impl ConsoleIf for TestPlatform {
 
 impl PmapIf for TestPlatform {}
 impl TrapIf for TestPlatform {}
-impl UserAccessIf for TestPlatform {}
 impl SignalFrameIf for TestPlatform {}
 impl IrqIf for TestPlatform {}
+impl EntropyIf for TestPlatform {}
 
 impl TimeIf for TestPlatform {
     fn read_ns() -> u64 {

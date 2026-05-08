@@ -63,13 +63,20 @@ pub fn step_read(tty: &Cap<TtyIdentity>, out: &mut [u8], guard: &Guard<'_>) -> S
         copied
     });
 
+    // Pre-ELF Phase 5 (item 9): the wait carrier is the TTY
+    // identity's `wait_channel`, registered with the global
+    // `wait_carrier` resolver at construction. `step_ingest` fires
+    // it after any byte ingest, so `sys_read`'s
+    // `wait_on_token(token).await` actually parks until UART RX
+    // bytes arrive. Threshold / VMIN logic comes from main's
+    // 2026-05-06 tty work.
     if threshold_unmet {
-        StepOutcome::Blocked(WaitToken::new(tty.raw() as u64, TTY_READABLE))
+        StepOutcome::Blocked(WaitToken::new(tty.wait_carrier_id(), TTY_READABLE))
     } else if copied == 0 {
         if matches!(vmin_policy, Some(0)) {
             StepOutcome::Done(0)
         } else {
-            StepOutcome::Blocked(WaitToken::new(tty.raw() as u64, TTY_READABLE))
+            StepOutcome::Blocked(WaitToken::new(tty.wait_carrier_id(), TTY_READABLE))
         }
     } else {
         StepOutcome::Done(copied)

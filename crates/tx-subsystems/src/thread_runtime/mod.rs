@@ -11,5 +11,9 @@ pub mod structure;
 #[cfg(test)]
 mod tests;
 
-pub use execution::step_thread_exit;
-pub use structure::{allocate_tid, ThreadIdentity, ThreadPayload, Tid};
+pub use execution::{prepare_userspace_entry_payload, step_thread_exit};
+pub use structure::{
+    allocate_tid, clear_current_thread_payload, current_thread_payload,
+    drain_pending_syscall_return, set_current_thread_payload, ThreadIdentity, ThreadPayload, Tid,
+    MAX_THREAD_PAYLOAD_HARTS,
+};

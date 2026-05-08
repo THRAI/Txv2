@@ -12,8 +12,9 @@ use tx_substrate::{
     zone::ZoneError,
 };
 
+use tx_substrate::SpinMutex;
+
 use crate::page_backed::MaterializedPagePin;
-use crate::sync::SpinMutex;
 
 use super::{Prot, UserPage, UserRange, USER_PAGE_SIZE};
 
@@ -134,6 +135,14 @@ impl VmPmap {
 
     pub const fn materialization_deferred(&self) -> bool {
         false
+    }
+
+    /// Borrow the platform's `PmapRoot` handle. Used by the thread
+    /// runtime to call `PmapIf::activate_user_pmap(root)` immediately
+    /// before `enter_userspace_with_context` so the MMU consults this
+    /// process's per-aspace pmap on user-mode fetches/loads.
+    pub fn root_handle(&self) -> &PmapRoot {
+        self.root()
     }
 
     pub fn lookup(&self, page: UserPage) -> Option<PmapMappingSnapshot> {
