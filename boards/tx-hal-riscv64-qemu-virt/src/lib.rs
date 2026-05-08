@@ -279,6 +279,122 @@ static RV64_PERCPU_AREAS: [Rv64PerCpuArea; MAX_BOOT_CPUS] = [
     Rv64PerCpuArea::new(3),
 ];
 
+/// Per-hart save area for the reschedule longjmp (slice 2 of the
+/// userspace-first-entry fix per
+/// `docs/progress/decisions/2026-05-08-userspace-first-entry-gap.md`).
+///
+/// The userspace-entry shim (`tx_rv64_enter_userspace_save_resume`)
+/// stashes (sp, ra, s0..s11) here before `sret`. The trap-shell
+/// longjmp helper (`tx_rv64_resume_kernel_after_reschedule`)
+/// restores them on `TrapAction::Reschedule` and `ret`s back to the
+/// kernel-side caller of `enter_userspace_with_context`.
+///
+/// Field offsets are load-bearing: the asm helpers reference them
+/// by literal byte offset. Keep `KERNEL_RESUME_CTX_*_OFFSET` in
+/// sync with the field order.
+#[repr(C, align(8))]
+pub struct KernelResumeCtx {
+    pub sp: usize,        // offset 0
+    pub ra: usize,        // offset 8
+    pub s: [usize; 12],   // offset 16..112
+}
+
+// These offsets are referenced by literal byte offset in the trap-vector
+// asm (`TX_RV64_RCTX_SP`, `TX_RV64_RCTX_RA`, `TX_RV64_RCTX_S0`). The
+// Rust constants below pin the layout from the Rust side so a struct
+// reorder triggers a compile-time mismatch with the static_assert.
+#[allow(dead_code)]
+const KERNEL_RESUME_CTX_SP_OFFSET: usize = 0;
+#[allow(dead_code)]
+const KERNEL_RESUME_CTX_RA_OFFSET: usize = 8;
+#[allow(dead_code)]
+const KERNEL_RESUME_CTX_S0_OFFSET: usize = 16;
+const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 14 * 8);
+const _: () =
+    assert!(core::mem::offset_of!(KernelResumeCtx, sp) == KERNEL_RESUME_CTX_SP_OFFSET);
+const _: () =
+    assert!(core::mem::offset_of!(KernelResumeCtx, ra) == KERNEL_RESUME_CTX_RA_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, s) == KERNEL_RESUME_CTX_S0_OFFSET);
+
+/// Per-hart cell with `Sync` because the only writer/reader is the
+/// local hart's trap-vector / userspace-entry shim. Cross-hart
+/// concurrent access would be a load-bearing invariant violation.
+#[repr(transparent)]
+pub struct PerHartCell<T>(core::cell::UnsafeCell<T>);
+
+unsafe impl<T> Sync for PerHartCell<T> {}
+
+impl<T> PerHartCell<T> {
+    pub const fn new(value: T) -> Self {
+        Self(core::cell::UnsafeCell::new(value))
+    }
+
+    pub fn as_ptr(&self) -> *mut T {
+        self.0.get()
+    }
+}
+
+static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        s: [0; 12],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        s: [0; 12],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        s: [0; 12],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        s: [0; 12],
+    }),
+];
+
+/// Per-CPU trap-handler stack. Sized 16 KiB; the trap vector
+/// `csrrw`-swaps onto its top via `sscratch` so trap-handler frames
+/// don't trample the BSP/AP runtime kernel stack (which holds the
+/// reactor + thread future frames at the moment a user trap fires).
+///
+/// Lives in `.bss` rather than substrate-allocated frames because
+/// the trap stack must be ready *before* substrate is — the trap
+/// vector is installed early in boot, well before the page
+/// allocator. Total static cost is `MAX_BOOT_CPUS × 16 KiB = 64 KiB`.
+const RV64_TRAP_STACK_SIZE: usize = 16 * 1024;
+
+#[repr(C, align(16))]
+pub struct Rv64TrapStack(pub [u8; RV64_TRAP_STACK_SIZE]);
+
+static RV64_TRAP_STACKS: [Rv64TrapStack; MAX_BOOT_CPUS] = [
+    Rv64TrapStack([0; RV64_TRAP_STACK_SIZE]),
+    Rv64TrapStack([0; RV64_TRAP_STACK_SIZE]),
+    Rv64TrapStack([0; RV64_TRAP_STACK_SIZE]),
+    Rv64TrapStack([0; RV64_TRAP_STACK_SIZE]),
+];
+
+/// Per-hart trap-stack top: the value the boot primer writes into
+/// `sscratch`, and the value the reschedule longjmp restores
+/// `sscratch` to before unwinding back to the kernel caller.
+pub fn trap_stack_top_for_cpu(cpu: CpuId) -> usize {
+    let stack = &RV64_TRAP_STACKS[cpu.0];
+    let base = stack as *const Rv64TrapStack as usize;
+    base + RV64_TRAP_STACK_SIZE
+}
+
+/// Pointer to the local hart's [`KernelResumeCtx`]. Asm helpers
+/// load/store at the documented field offsets; Rust callers in
+/// `apply_trap_action` use the pointer directly.
+pub fn current_kernel_resume_ctx_ptr() -> *mut KernelResumeCtx {
+    let cpu = current_cpu_id();
+    RV64_KERNEL_RESUME_CTX[cpu.0].as_ptr()
+}
+
 #[cfg(not(target_arch = "riscv64"))]
 static HOST_KERNEL_TLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -833,6 +949,16 @@ unsafe fn install_kernel_stack(top: VirtAddr) {
     #[cfg(target_arch = "riscv64")]
     unsafe {
         tx_rv64_qemu_install_kernel_stack(top.0);
+        // Slice 2 boot-time sscratch primer (one-shot per hart). The
+        // trap-vector prologue does `csrrw sp, sscratch, sp` to swap
+        // onto the per-CPU trap-handler stack, so sscratch must be
+        // primed before any user trap can fire (i.e. before the first
+        // `enter_userspace_with_context`). The trap-vector epilogue
+        // and the userspace-entry shim both re-prime sscratch on
+        // every clean exit, so this is genuinely one-shot.
+        let cpu = <Platform as PercpuIf>::current_cpu_id();
+        let trap_stack_top = trap_stack_top_for_cpu(cpu);
+        core::arch::asm!("csrw sscratch, {top}", top = in(reg) trap_stack_top);
     }
 
     #[cfg(not(target_arch = "riscv64"))]

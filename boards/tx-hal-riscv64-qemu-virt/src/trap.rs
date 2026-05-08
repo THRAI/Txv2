@@ -1,11 +1,15 @@
 use core::ptr::NonNull;
 
 use crate::{boot_static, user_access, Platform};
+#[cfg(target_arch = "riscv64")]
+use crate::{current_kernel_resume_ctx_ptr, trap_stack_top_for_cpu, KernelResumeCtx};
 use tx_hal::{
     FaultInfo, KernelTrapSink, SignalHandlerRegs, TrapAction, TrapClass, TrapFrameMut,
     TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode,
     UserTrapContext, VirtAddr,
 };
+#[cfg(target_arch = "riscv64")]
+use tx_hal::SmpIf;
 
 #[cfg(target_arch = "riscv64")]
 core::arch::global_asm!(
@@ -50,13 +54,32 @@ core::arch::global_asm!(
     .equ TX_RV64_TF_SSTATUS, 280
     .equ TX_RV64_TF_SIZE, 288
 
+    # Per-hart KernelResumeCtx field offsets — must match
+    # `boards::tx_hal_riscv64_qemu_virt::KernelResumeCtx` in lib.rs.
+    .equ TX_RV64_RCTX_SP, 0
+    .equ TX_RV64_RCTX_RA, 8
+    .equ TX_RV64_RCTX_S0, 16
+    # s1..s11 follow at +8 each up to offset 104.
+
     .globl tx_rv64_qemu_minimal_trap_vector
 tx_rv64_qemu_minimal_trap_vector:
+    # Slice 2 trap-vector prologue: sscratch swap onto the per-CPU
+    # trap-handler stack. sscratch is boot-primed (and re-primed on
+    # every clean exit) to point at trap_stack_top for this hart.
+    #
+    # On entry: sp = trap-time sp (user sp for from-user, kernel sp
+    # for from-kernel); sscratch = trap_stack_top.
+    # After swap: sp = trap_stack_top; sscratch = trap-time sp.
+    csrrw sp, sscratch, sp
+
+    # Allocate the trap frame on the trap stack.
     addi sp, sp, -TX_RV64_TF_SIZE
     sd t0, TX_RV64_TF_X5(sp)
     sd zero, TX_RV64_TF_X0(sp)
     sd ra, TX_RV64_TF_X1(sp)
-    addi t0, sp, TX_RV64_TF_SIZE
+    # The trap-time sp is currently in sscratch; save it to the
+    # frame's X_SP slot. Subsystems read it via TrapFrameView.
+    csrr t0, sscratch
     sd t0, TX_RV64_TF_X2(sp)
     sd gp, TX_RV64_TF_X3(sp)
     sd tp, TX_RV64_TF_X4(sp)
@@ -97,11 +120,31 @@ tx_rv64_qemu_minimal_trap_vector:
 
     mv a0, sp
     call tx_rv64_qemu_kernel_trap_entry
+    # The Rust handler returns ONLY for Resume / DeliverSignal. On
+    # Reschedule it longjmps via tx_rv64_resume_kernel_after_reschedule
+    # (does not return); on Terminate it panics. So after this call
+    # we are always on a path that wants pop+sret.
 
+    # Epilogue: pop+sret back to trap-time mode (Resume /
+    # DeliverSignal). Reschedule longjmps and never reaches here;
+    # Terminate panics.
+    #
+    # Discipline: stash the trap-time sp into sscratch FIRST (before
+    # restoring user temporaries), so we have it for the final
+    # swap. After all user regs are restored, deallocate the frame
+    # (sp moves up to trap_stack_top), then `csrrw sp, sscratch, sp`
+    # atomically: sp = trap-time sp, sscratch = trap_stack_top
+    # (re-primed for the next trap).
     ld t0, TX_RV64_TF_SEPC(sp)
     csrw sepc, t0
     ld t0, TX_RV64_TF_SSTATUS(sp)
     csrw sstatus, t0
+
+    # Move trap-time sp into sscratch via t0. Safe to clobber t0
+    # because we'll restore the user's t0 from the frame below
+    # before we sret.
+    ld t0, TX_RV64_TF_X2(sp)
+    csrw sscratch, t0
 
     ld ra, TX_RV64_TF_X1(sp)
     ld gp, TX_RV64_TF_X3(sp)
@@ -133,8 +176,117 @@ tx_rv64_qemu_minimal_trap_vector:
     ld t4, TX_RV64_TF_X29(sp)
     ld t5, TX_RV64_TF_X30(sp)
     ld t6, TX_RV64_TF_X31(sp)
-    ld sp, TX_RV64_TF_X2(sp)
+
+    # Deallocate the frame and atomically swap sp ↔ sscratch:
+    # sp = trap-time sp, sscratch = trap_stack_top.
+    addi sp, sp, TX_RV64_TF_SIZE
+    csrrw sp, sscratch, sp
     sret
+
+    # ------------------------------------------------------------------
+    # tx_rv64_enter_userspace_save_resume:
+    #   a0 = *mut KernelResumeCtx       (per-hart save area)
+    #   a1 = *const Rv64TrapFrame       (user trap frame to load)
+    #   a2 = trap_stack_top             (boot-primed sscratch value)
+    #
+    # Stash (sp, ra, s0..s11) into *a0 so the trap-shell longjmp
+    # helper can unwind back here. Then re-prime sscratch with a2
+    # so the upcoming user trap lands on the trap stack. Then load
+    # the user frame from a1 and sret.
+    #
+    # `noreturn` from rustc's POV; control returns via
+    # tx_rv64_resume_kernel_after_reschedule, which `ret`s to the
+    # ra saved in *a0.
+    # ------------------------------------------------------------------
+    .globl tx_rv64_enter_userspace_save_resume
+    .type tx_rv64_enter_userspace_save_resume, @function
+tx_rv64_enter_userspace_save_resume:
+    sd sp,   TX_RV64_RCTX_SP(a0)
+    sd ra,   TX_RV64_RCTX_RA(a0)
+    sd s0,  (TX_RV64_RCTX_S0 +   0)(a0)
+    sd s1,  (TX_RV64_RCTX_S0 +   8)(a0)
+    sd s2,  (TX_RV64_RCTX_S0 +  16)(a0)
+    sd s3,  (TX_RV64_RCTX_S0 +  24)(a0)
+    sd s4,  (TX_RV64_RCTX_S0 +  32)(a0)
+    sd s5,  (TX_RV64_RCTX_S0 +  40)(a0)
+    sd s6,  (TX_RV64_RCTX_S0 +  48)(a0)
+    sd s7,  (TX_RV64_RCTX_S0 +  56)(a0)
+    sd s8,  (TX_RV64_RCTX_S0 +  64)(a0)
+    sd s9,  (TX_RV64_RCTX_S0 +  72)(a0)
+    sd s10, (TX_RV64_RCTX_S0 +  80)(a0)
+    sd s11, (TX_RV64_RCTX_S0 +  88)(a0)
+
+    # Re-prime sscratch with trap_stack_top so the next user trap
+    # lands on the trap stack.
+    csrw sscratch, a2
+
+    # Load user frame from a1 and sret. Mirrors `return_to_userspace`.
+    mv t6, a1
+    ld t0, TX_RV64_TF_SEPC(t6)
+    csrw sepc, t0
+    ld t0, TX_RV64_TF_SSTATUS(t6)
+    csrw sstatus, t0
+    ld ra,  TX_RV64_TF_X1(t6)
+    ld gp,  TX_RV64_TF_X3(t6)
+    ld tp,  TX_RV64_TF_X4(t6)
+    ld t0,  TX_RV64_TF_X5(t6)
+    ld t1,  TX_RV64_TF_X6(t6)
+    ld t2,  TX_RV64_TF_X7(t6)
+    ld s0,  TX_RV64_TF_X8(t6)
+    ld s1,  TX_RV64_TF_X9(t6)
+    ld a0,  TX_RV64_TF_X10(t6)
+    ld a1,  TX_RV64_TF_X11(t6)
+    ld a2,  TX_RV64_TF_X12(t6)
+    ld a3,  TX_RV64_TF_X13(t6)
+    ld a4,  TX_RV64_TF_X14(t6)
+    ld a5,  TX_RV64_TF_X15(t6)
+    ld a6,  TX_RV64_TF_X16(t6)
+    ld a7,  TX_RV64_TF_X17(t6)
+    ld s2,  TX_RV64_TF_X18(t6)
+    ld s3,  TX_RV64_TF_X19(t6)
+    ld s4,  TX_RV64_TF_X20(t6)
+    ld s5,  TX_RV64_TF_X21(t6)
+    ld s6,  TX_RV64_TF_X22(t6)
+    ld s7,  TX_RV64_TF_X23(t6)
+    ld s8,  TX_RV64_TF_X24(t6)
+    ld s9,  TX_RV64_TF_X25(t6)
+    ld s10, TX_RV64_TF_X26(t6)
+    ld s11, TX_RV64_TF_X27(t6)
+    ld t3,  TX_RV64_TF_X28(t6)
+    ld t4,  TX_RV64_TF_X29(t6)
+    ld t5,  TX_RV64_TF_X30(t6)
+    ld sp,  TX_RV64_TF_X2(t6)
+    ld t6,  TX_RV64_TF_X31(t6)
+    sret
+    .size tx_rv64_enter_userspace_save_resume, . - tx_rv64_enter_userspace_save_resume
+
+    # ------------------------------------------------------------------
+    # tx_rv64_resume_kernel_after_reschedule:
+    #   a0 = *const KernelResumeCtx
+    #
+    # Restore (sp, ra, s0..s11) from *a0 and `ret`. The caller in
+    # apply_trap_action has already re-primed sscratch with
+    # trap_stack_top.
+    # ------------------------------------------------------------------
+    .globl tx_rv64_resume_kernel_after_reschedule
+    .type tx_rv64_resume_kernel_after_reschedule, @function
+tx_rv64_resume_kernel_after_reschedule:
+    ld sp,   TX_RV64_RCTX_SP(a0)
+    ld ra,   TX_RV64_RCTX_RA(a0)
+    ld s0,  (TX_RV64_RCTX_S0 +   0)(a0)
+    ld s1,  (TX_RV64_RCTX_S0 +   8)(a0)
+    ld s2,  (TX_RV64_RCTX_S0 +  16)(a0)
+    ld s3,  (TX_RV64_RCTX_S0 +  24)(a0)
+    ld s4,  (TX_RV64_RCTX_S0 +  32)(a0)
+    ld s5,  (TX_RV64_RCTX_S0 +  40)(a0)
+    ld s6,  (TX_RV64_RCTX_S0 +  48)(a0)
+    ld s7,  (TX_RV64_RCTX_S0 +  56)(a0)
+    ld s8,  (TX_RV64_RCTX_S0 +  64)(a0)
+    ld s9,  (TX_RV64_RCTX_S0 +  72)(a0)
+    ld s10, (TX_RV64_RCTX_S0 +  80)(a0)
+    ld s11, (TX_RV64_RCTX_S0 +  88)(a0)
+    ret
+    .size tx_rv64_resume_kernel_after_reschedule, . - tx_rv64_resume_kernel_after_reschedule
 "#
 );
 
@@ -380,15 +532,12 @@ impl TrapIf for Platform {
     /// platform's writeback is the `restore_user_context` shape
     /// already used by `Rv64TrapFrame::restore_user_context`.
     ///
-    /// **TODO(reschedule-longjmp)**: this body still calls
-    /// `return_to_userspace` which is `-> !` and never returns at
-    /// runtime. The signature change to `()` is type-level
-    /// preparation for the next slice that adds a per-hart
-    /// `KernelResumeCtx`, sscratch swap onto a per-CPU trap-handler
-    /// stack, and a longjmp-back path on `TrapAction::Reschedule`.
-    /// Once that lands, this call site will return when the trap
-    /// handler chooses Reschedule, and the future-driven
-    /// `run_thread` will see control unwind back through it.
+    /// Materialises a fresh `Rv64TrapFrame` from `ctx`, stashes the
+    /// kernel-side caller's `(sp, ra, callee-saved s-regs)` into
+    /// the per-hart [`KernelResumeCtx`], re-primes `sscratch` with
+    /// the per-CPU trap-stack top, and `sret`s into user mode.
+    /// Returns when the trap shell chooses `TrapAction::Reschedule`
+    /// and longjmps back via [`tx_rv64_resume_kernel_after_reschedule`].
     fn enter_userspace_with_context(ctx: UserTrapContext) {
         let mut frame = Rv64TrapFrame {
             x: [0; 32],
@@ -401,7 +550,20 @@ impl TrapIf for Platform {
         // `restore_user_context` already calls `prepare_user_return`,
         // which clears SPP and sets SPIE so `sret` lands in user mode
         // with interrupts enabled.
-        unsafe { return_to_userspace(&frame) }
+
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            let cpu = <Platform as SmpIf>::current_cpu_id();
+            let resume_ctx = current_kernel_resume_ctx_ptr();
+            let stack_top = trap_stack_top_for_cpu(cpu);
+            tx_rv64_enter_userspace_save_resume(resume_ctx, &frame, stack_top);
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            // Host build: no userspace to enter; fall through to
+            // return_to_userspace which spins per the host stub.
+            unsafe { return_to_userspace(&frame) }
+        }
     }
 }
 
@@ -526,6 +688,20 @@ fn install_rv64_trap_vector() {
 #[cfg(target_arch = "riscv64")]
 extern "C" {
     fn tx_kernel_riscv64_qemu_trap_dispatch(frame: *mut Rv64TrapFrame) -> TrapAction;
+
+    /// Stash kernel-side `(sp, ra, s0..s11)` into `*resume_ctx`,
+    /// re-prime sscratch with `trap_stack_top`, load the user
+    /// frame from `*frame`, and `sret`. Returns only via the
+    /// reschedule longjmp helper.
+    fn tx_rv64_enter_userspace_save_resume(
+        resume_ctx: *mut KernelResumeCtx,
+        frame: *const Rv64TrapFrame,
+        trap_stack_top: usize,
+    );
+
+    /// Restore `(sp, ra, s0..s11)` from `*resume_ctx` and `ret`.
+    /// Caller must have already re-primed sscratch.
+    fn tx_rv64_resume_kernel_after_reschedule(resume_ctx: *const KernelResumeCtx) -> !;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -538,7 +714,34 @@ extern "C" fn tx_rv64_qemu_kernel_trap_entry(frame: &mut Rv64TrapFrame) {
 #[cfg(target_arch = "riscv64")]
 fn apply_trap_action(frame: &Rv64TrapFrame, action: TrapAction) {
     match action {
-        TrapAction::Resume | TrapAction::Reschedule | TrapAction::DeliverSignal => {}
+        // Resume / DeliverSignal: fall through to the trap-vector
+        // epilogue, which pop+sret's back to the trap-time mode.
+        // The asm prologue's sscratch swap is reversed in the
+        // epilogue's final `csrrw sp, sscratch, sp` which also
+        // re-primes sscratch with trap_stack_top.
+        TrapAction::Resume | TrapAction::DeliverSignal => {}
+
+        // Reschedule: longjmp back to the kernel-side caller of
+        // `enter_userspace_with_context`. Re-prime sscratch first
+        // (the longjmp doesn't go through the trap-vector epilogue,
+        // so sscratch would otherwise still hold the user's sp from
+        // the entry-side swap, leaving subsequent traps to land on
+        // the user stack again). Then call the asm helper which
+        // restores (sp, ra, s-regs) from the per-hart KernelResumeCtx
+        // and `ret`s — control unwinds back through
+        // `enter_userspace_with_context` and into the future's
+        // `run_thread` body.
+        TrapAction::Reschedule => {
+            let cpu = <Platform as SmpIf>::current_cpu_id();
+            let stack_top = trap_stack_top_for_cpu(cpu);
+            unsafe {
+                core::arch::asm!("csrw sscratch, {top}", top = in(reg) stack_top);
+                let ctx = current_kernel_resume_ctx_ptr();
+                tx_rv64_resume_kernel_after_reschedule(ctx);
+            }
+            // Asm helper diverges; this path is unreachable.
+        }
+
         TrapAction::Terminate => tx_rv64_qemu_trap_panic(frame),
     }
 }
