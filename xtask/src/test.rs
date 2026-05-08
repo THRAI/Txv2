@@ -41,8 +41,8 @@ pub(crate) fn test(root: &Path, args: Vec<String>) -> Result<()> {
     };
     let rest = &args[rest_start..];
 
-    let target_value = optional_option_value(rest, "--target")
-        .unwrap_or_else(|| DEFAULT_TARGET.to_string());
+    let target_value =
+        optional_option_value(rest, "--target").unwrap_or_else(|| DEFAULT_TARGET.to_string());
     let target = TxTarget::parse(&target_value)?;
     if target != TxTarget::Rv64Qemu {
         return Err(format!(
@@ -73,7 +73,11 @@ fn smoke(root: &Path, target: TxTarget, rest: &[String], with_busybox: bool) -> 
         println!("test: image cpio --profile busybox");
         image::image(
             root,
-            vec!["cpio".to_string(), "--profile".to_string(), "busybox".to_string()],
+            vec![
+                "cpio".to_string(),
+                "--profile".to_string(),
+                "busybox".to_string(),
+            ],
         )?;
         "busybox"
     } else {

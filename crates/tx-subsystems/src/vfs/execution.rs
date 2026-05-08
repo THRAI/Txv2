@@ -281,12 +281,7 @@ impl OpenFile {
     /// `AdvancedThenBlocked` outcomes are reachable. The `Guard` is
     /// accepted for symmetry with the other `OpenFile::step_*`
     /// methods even though the body never crosses an EBR boundary.
-    pub fn step_lseek(
-        &self,
-        offset: i64,
-        whence: u32,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<u64> {
+    pub fn step_lseek(&self, offset: i64, whence: u32, _guard: &Guard<'_>) -> StepOutcome<u64> {
         // Backing-driven dispatch: short-circuit non-seekable
         // backings before any arithmetic. Pipes / TTY / chardev are
         // ESPIPE regardless of whence (Linux's `lseek(2)` man page:

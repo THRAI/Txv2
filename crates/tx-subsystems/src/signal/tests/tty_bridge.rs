@@ -1,5 +1,5 @@
 // Auto-extracted from `crates/tx-subsystems/src/signal/tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use crate::cred::Uid;
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};

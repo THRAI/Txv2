@@ -123,11 +123,17 @@ impl<'a> Iterator for CpioReader<'a> {
     }
 }
 
-fn parse_one_entry(bytes: &[u8], cursor: usize) -> Result<Option<(CpioEntry<'_>, usize)>, CpioError> {
+fn parse_one_entry(
+    bytes: &[u8],
+    cursor: usize,
+) -> Result<Option<(CpioEntry<'_>, usize)>, CpioError> {
     if cursor >= bytes.len() {
         return Ok(None);
     }
-    if cursor.checked_add(NEWC_HEADER_LEN).map_or(true, |end| end > bytes.len()) {
+    if cursor
+        .checked_add(NEWC_HEADER_LEN)
+        .map_or(true, |end| end > bytes.len())
+    {
         return Err(CpioError::Truncated);
     }
     let header = &bytes[cursor..cursor + NEWC_HEADER_LEN];
@@ -154,8 +160,12 @@ fn parse_one_entry(bytes: &[u8], cursor: usize) -> Result<Option<(CpioEntry<'_>,
     // Name follows the 110-byte header; the (header+name) total is
     // padded up to a 4-byte boundary. The trailing NUL is included
     // in `namesize`.
-    let name_start = cursor.checked_add(NEWC_HEADER_LEN).ok_or(CpioError::Truncated)?;
-    let name_end = name_start.checked_add(namesize).ok_or(CpioError::Truncated)?;
+    let name_start = cursor
+        .checked_add(NEWC_HEADER_LEN)
+        .ok_or(CpioError::Truncated)?;
+    let name_end = name_start
+        .checked_add(namesize)
+        .ok_or(CpioError::Truncated)?;
     if name_end > bytes.len() {
         return Err(CpioError::Truncated);
     }
@@ -168,7 +178,9 @@ fn parse_one_entry(bytes: &[u8], cursor: usize) -> Result<Option<(CpioEntry<'_>,
     // 4-byte-aligned both at start (because header+name is padded) and
     // at end.
     let data_start = after_name_aligned;
-    let data_end = data_start.checked_add(filesize).ok_or(CpioError::Truncated)?;
+    let data_end = data_start
+        .checked_add(filesize)
+        .ok_or(CpioError::Truncated)?;
     if data_end > bytes.len() {
         return Err(CpioError::Truncated);
     }
@@ -302,21 +314,11 @@ pub fn unpack_into_root_mount(
         if filename.is_empty() {
             // Trailing slash — directory-only entry like "bin/".
             // Walk-or-create the parents themselves.
-            walk_or_create_dirs(
-                &fs_ops,
-                root_object_id,
-                parents,
-                &cred,
-            )?;
+            walk_or_create_dirs(&fs_ops, root_object_id, parents, &cred)?;
             stats.dirs += 1;
             continue;
         }
-        let parent_id = walk_or_create_dirs(
-            &fs_ops,
-            root_object_id,
-            parents,
-            &cred,
-        )?;
+        let parent_id = walk_or_create_dirs(&fs_ops, root_object_id, parents, &cred)?;
 
         match kind_bits {
             S_IFREG => {
@@ -505,10 +507,7 @@ fn unpack_regular(
     // empty-data case naturally (no chunks → loop is a no-op).
     for (idx, chunk) in data.chunks(USER_PAGE_SIZE).enumerate() {
         let materialised = pc
-            .materialize_anon(
-                PageIndex::new(idx as u64),
-                MaterializeAccess::Write,
-            )
+            .materialize_anon(PageIndex::new(idx as u64), MaterializeAccess::Write)
             .map_err(|_| UnpackError::FsOp {
                 op: "materialize_anon",
                 errno: Errno::ENOMEM,

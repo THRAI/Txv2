@@ -1,4 +1,4 @@
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use crate::vm::RANGE_LOCK_RELEASE_MASK;
 use alloc::boxed::Box;

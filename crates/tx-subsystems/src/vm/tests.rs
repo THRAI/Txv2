@@ -13,8 +13,8 @@ use tx_hal::{
 mod execution_scripts;
 mod fault_materialization;
 mod observation;
-mod script_async;
 mod range_locks;
+mod script_async;
 
 static COUNTING_PMAP_TEST_LOCK: Mutex<()> = Mutex::new(());
 static COUNTING_PMAP_STATE: LazyLock<Mutex<CountingPmapState>> =
@@ -245,11 +245,6 @@ fn would_block(result: AcquireResult<'_>) -> WouldBlock<'_> {
     }
 }
 
-
-
-
-
-
 #[test]
 fn vm_range_guard_drop_releases_reservation() {
     let lock = RangeLock::new();
@@ -264,11 +259,6 @@ fn vm_range_guard_drop_releases_reservation() {
     let materializer = acquired(lock.acquire_step_rich(first, LockMode::Materializer));
     drop(materializer);
 }
-
-
-
-
-
 
 #[test]
 fn vm_entry_split_for_unmap_preserves_survivors_and_offsets() {
@@ -1193,10 +1183,8 @@ fn vm_aspace_reserve_user_range_for_access_publishes_private_anon_pages() {
     .commit()
     .expect("anon map");
 
-    let outcome = aspace.reserve_user_range_for_access(
-        range(0x10000, 3),
-        crate::vm::UserAccessKind::Write,
-    );
+    let outcome =
+        aspace.reserve_user_range_for_access(range(0x10000, 3), crate::vm::UserAccessKind::Write);
     assert!(matches!(outcome, StepOutcome::Done(())));
     for page in [UserPage(0x10), UserPage(0x11), UserPage(0x12)] {
         let snap = aspace
@@ -1223,19 +1211,15 @@ fn vm_aspace_reserve_user_range_for_access_skips_already_published() {
     .commit()
     .expect("anon map");
 
-    let _ = aspace.reserve_user_range_for_access(
-        range(0x20000, 2),
-        crate::vm::UserAccessKind::Write,
-    );
+    let _ =
+        aspace.reserve_user_range_for_access(range(0x20000, 2), crate::vm::UserAccessKind::Write);
     let mapped_after_first = aspace.pmap().stats().mapped_pages;
     assert_eq!(mapped_after_first, 2);
     let commits_after_first = aspace.pmap().stats().commits;
 
     // Second call: every page already permits Write; no new commits.
-    let _ = aspace.reserve_user_range_for_access(
-        range(0x20000, 2),
-        crate::vm::UserAccessKind::Write,
-    );
+    let _ =
+        aspace.reserve_user_range_for_access(range(0x20000, 2), crate::vm::UserAccessKind::Write);
     assert_eq!(aspace.pmap().stats().mapped_pages, 2);
     assert_eq!(aspace.pmap().stats().commits, commits_after_first);
 }
@@ -1245,10 +1229,8 @@ fn vm_aspace_reserve_user_range_for_access_returns_efault_for_unmapped() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
 
-    let outcome = aspace.reserve_user_range_for_access(
-        range(0x30000, 1),
-        crate::vm::UserAccessKind::Read,
-    );
+    let outcome =
+        aspace.reserve_user_range_for_access(range(0x30000, 1), crate::vm::UserAccessKind::Read);
     assert_eq!(outcome, StepOutcome::Err(crate::execution::Errno::EFAULT));
     assert_eq!(aspace.pmap().stats().mapped_pages, 0);
 }
@@ -1269,10 +1251,8 @@ fn vm_aspace_reserve_user_range_for_access_propagates_prot_mismatch_efault() {
     .commit()
     .expect("read-only map");
 
-    let outcome = aspace.reserve_user_range_for_access(
-        range(0x40000, 1),
-        crate::vm::UserAccessKind::Write,
-    );
+    let outcome =
+        aspace.reserve_user_range_for_access(range(0x40000, 1), crate::vm::UserAccessKind::Write);
     assert_eq!(outcome, StepOutcome::Err(crate::execution::Errno::EFAULT));
 }
 

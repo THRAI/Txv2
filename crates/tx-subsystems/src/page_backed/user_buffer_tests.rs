@@ -62,8 +62,11 @@ impl UserBufferFixture {
         .expect("user-side page container cap");
         let aspace = AddressSpace::new();
         let entry = VmEntry::new(
-            UserRange::new_aligned(UserVirtAddr(user_va), (page_count as usize) * USER_PAGE_SIZE)
-                .expect("aligned user range"),
+            UserRange::new_aligned(
+                UserVirtAddr(user_va),
+                (page_count as usize) * USER_PAGE_SIZE,
+            )
+            .expect("aligned user range"),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
             VmBacking::Page {
@@ -327,13 +330,17 @@ fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
     fixture.seed_user_bytes(&zeros);
     let reader = open_file_for_pc(&pc);
     reader.set_offset(USER_PAGE_SIZE as u64);
-    let outcome = step_read_to_user(&pc, &reader, &fixture.aspace, fixture.user_ptr(), 32, &guard);
+    let outcome = step_read_to_user(
+        &pc,
+        &reader,
+        &fixture.aspace,
+        fixture.user_ptr(),
+        32,
+        &guard,
+    );
     assert_eq!(outcome, StepOutcome::Done(32));
     let received = fixture.read_user_bytes(32);
-    assert_eq!(
-        &received[..4],
-        &pattern[USER_PAGE_SIZE..USER_PAGE_SIZE + 4]
-    );
+    assert_eq!(&received[..4], &pattern[USER_PAGE_SIZE..USER_PAGE_SIZE + 4]);
     assert!(
         received[4..].iter().all(|b| *b == 0),
         "post-EOF region must read as zeros after shrink-then-grow, got {:?}",
@@ -361,8 +368,5 @@ fn pagebacked_step_write_from_user_propagates_efault_without_advance() {
     let outcome = step_write_from_user(&pc, &writer, &empty_aspace, dangling, 8, &guard);
     assert_eq!(outcome, StepOutcome::Err(Errno::EFAULT));
     assert_eq!(writer.offset(), 0);
-    assert_eq!(
-        pc.size_bytes(),
-        pc.page_count() * USER_PAGE_SIZE as u64
-    );
+    assert_eq!(pc.size_bytes(), pc.page_count() * USER_PAGE_SIZE as u64);
 }

@@ -1,5 +1,5 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -84,9 +84,7 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     (root_dentry, tmpfs)
 }
 
-fn bootstrap_with_cwd(
-    root_dentry: Cap<DEntry>,
-) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
+fn bootstrap_with_cwd(root_dentry: Cap<DEntry>) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
     let aspace = fresh_aspace();
     let process = bootstrap_init_process(aspace).expect("bootstrap init");
     let thread = process.nth_thread(0).expect("leader thread");
@@ -765,10 +763,7 @@ fn dispatch_utimensat_returns_neg_enosys() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap, thread);
 
-    let req = SyscallRequest::new(
-        NR_UTIMENSAT,
-        [AT_FDCWD as i64 as u64, 0, 0, 0, 0, 0],
-    );
+    let req = SyscallRequest::new(NR_UTIMENSAT, [AT_FDCWD as i64 as u64, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_NOSYS));
 }

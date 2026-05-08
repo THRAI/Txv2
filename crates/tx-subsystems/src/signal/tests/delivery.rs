@@ -1,10 +1,10 @@
 // Auto-extracted from `crates/tx-subsystems/src/signal/tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use crate::process::{bootstrap_init_process, ProcessIdentity};
 use crate::signal::{
-    ast_check, default_action, select_next_signal, step_kill_process, step_sigaction,
-    AstOutcome, DefaultAction, InterruptSummary, PendingSource, SigDisposition,
+    ast_check, default_action, select_next_signal, step_kill_process, step_sigaction, AstOutcome,
+    DefaultAction, InterruptSummary, PendingSource, SigDisposition,
 };
 use crate::thread_runtime::execution::{post_signal, step_sigprocmask, SigmaskHow};
 use crate::thread_runtime::structure::ThreadIdentity;

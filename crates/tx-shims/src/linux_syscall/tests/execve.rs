@@ -1,5 +1,5 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -16,8 +16,8 @@ use tx_subsystems::page_backed::{
 };
 use tx_subsystems::process::step_chdir;
 use tx_subsystems::vfs::structure::{
-    Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
-    RNode, RNodeBacking, S_IFDIR, S_IFREG,
+    Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
+    RNodeBacking, S_IFDIR, S_IFREG,
 };
 use tx_subsystems::vfs::FsOps;
 use tx_subsystems::vm::USER_PAGE_SIZE;
@@ -65,12 +65,7 @@ impl ExecveTestFs {
         FsObjectId::new(id)
     }
 
-    fn add_regular_with_bytes(
-        &self,
-        parent: FsObjectId,
-        name: &[u8],
-        bytes: &[u8],
-    ) -> FsObjectId {
+    fn add_regular_with_bytes(&self, parent: FsObjectId, name: &[u8], bytes: &[u8]) -> FsObjectId {
         let pages = ((bytes.len() as u64) + USER_PAGE_SIZE as u64 - 1) / USER_PAGE_SIZE as u64;
         let pages = core::cmp::max(pages, 1);
         let pc = PageContainer::new_cap(
@@ -252,11 +247,7 @@ impl FsOps for ExecveTestFs {
         StepOutcome::Done(())
     }
 
-    fn read_link(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<Box<[u8]>> {
+    fn read_link(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<Box<[u8]>> {
         StepOutcome::Err(Errno::EINVAL)
     }
 

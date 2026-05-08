@@ -3,13 +3,13 @@ use core::ptr::NonNull;
 use crate::{boot_static, user_access, Platform};
 #[cfg(target_arch = "riscv64")]
 use crate::{current_kernel_resume_ctx_ptr, trap_stack_top_for_cpu, KernelResumeCtx};
+#[cfg(target_arch = "riscv64")]
+use tx_hal::SmpIf;
 use tx_hal::{
     FaultInfo, KernelTrapSink, SignalHandlerRegs, TrapAction, TrapClass, TrapFrameMut,
     TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode,
     UserTrapContext, VirtAddr,
 };
-#[cfg(target_arch = "riscv64")]
-use tx_hal::SmpIf;
 
 #[cfg(target_arch = "riscv64")]
 core::arch::global_asm!(

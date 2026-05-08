@@ -5,7 +5,6 @@
 
 use super::*;
 
-
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///
 /// The implementation of `step_thread_exit` (in
@@ -23,14 +22,12 @@ pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     SyscallResult::NoReturn
 }
 
-
 /// `exit_group(status)` — per `PROCESS_v1` §7.3.2.
 pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let status = args[0] as i32;
     step_exit_group(&ctx.process, ExitStatus::Exited(status));
     SyscallResult::NoReturn
 }
-
 
 /// `getpid()` — direct read of `process.pid` per `PROCESS_v1`
 /// §"Step catalog" / `getpid` row in the trio plan.
@@ -41,7 +38,6 @@ pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
 pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.process.pid.0 as i64)
 }
-
 
 /// `execve(path, argv, envp)` — Wave 4 / Phase 6 of the ELF-loader
 /// plan.
@@ -137,7 +133,6 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf>(
     }
 }
 
-
 /// Translate `ExecError` to the dispatched `-errno` magnitude the
 /// Phase 6 syscall arm hands back through `SyscallResult::Error`.
 ///
@@ -149,7 +144,6 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf>(
 pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
     -e.to_errno_i32()
 }
-
 
 // =====================================================================
 // Wave 2 of the fork/clone/wait4 slice — Part 2 (NR_CLONE) +
@@ -270,7 +264,6 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     // a0 before re-entry per Plan B.
     SyscallResult::Return(child.pid.0 as i64)
 }
-
 
 /// `wait4(pid, status, options, rusage)` — Wave 3 of the fork/clone/wait4
 /// slice. The blocking variant: when no zombie matches and `WNOHANG`
@@ -397,7 +390,6 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     }
 }
 
-
 /// `getppid()` — return the parent's pid, or `0` (`Pid::RESERVED`)
 /// for orphans.
 ///
@@ -410,7 +402,6 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 pub(super) fn sys_getppid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.process.parent_pid().0 as i64)
 }
-
 
 /// `setpgid(pid, pgid)`.
 ///
@@ -446,7 +437,6 @@ pub(super) fn sys_setpgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
     }
 }
 
-
 /// `getpgid(pid)`.
 ///
 /// Day-1 only supports `pid == 0` (self) and `pid == self.pid`.
@@ -465,7 +455,6 @@ pub(super) fn sys_getpgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
     SyscallResult::Return(ctx.process.pgrp_cap().pgid.0 as i64)
 }
 
-
 /// `getsid(pid)`.
 ///
 /// Same shape as `getpgid` but reports the session id. Day-1 only
@@ -480,7 +469,6 @@ pub(super) fn sys_getsid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     }
     SyscallResult::Return(ctx.process.pgrp_cap().session_cap().sid.0 as i64)
 }
-
 
 /// `setsid()` — create a new session rooted at the caller.
 ///
@@ -498,7 +486,6 @@ pub(super) fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     }
 }
 
-
 /// `set_tid_address(tidptr)` — Wave 2 stub.
 ///
 /// Returns the calling thread's tid (Linux's documented return for
@@ -512,7 +499,6 @@ pub(super) fn sys_set_tid_address<'a>(_args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     SyscallResult::Return(ctx.thread.tid.0 as i64)
 }
 
-
 /// `set_robust_list(head, len)` — Wave 2 stub.
 ///
 /// Returns `0` unconditionally. Ignores `head`/`len` — the real
@@ -524,7 +510,6 @@ pub(super) fn sys_set_tid_address<'a>(_args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 pub(super) fn sys_set_robust_list(_args: [u64; 6]) -> SyscallResult {
     SyscallResult::Return(0)
 }
-
 
 // =====================================================================
 // Slice 7 of the shell-prompt roadmap — fcntl extension + day-1 misc
@@ -545,4 +530,3 @@ pub(super) fn sys_set_robust_list(_args: [u64; 6]) -> SyscallResult {
 pub(super) fn sys_getpgrp<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.process.pgrp_cap().pgid.0 as i64)
 }
-

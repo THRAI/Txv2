@@ -5,7 +5,6 @@
 
 use super::*;
 
-
 /// `brk(requested)` per `txdoc:VM-5-8-BRK`.
 ///
 /// - `requested == 0`: report the current break (Linux's "brk(0)
@@ -46,7 +45,6 @@ pub(super) async fn sys_brk<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         }
     }
 }
-
 
 // =====================================================================
 // Slice 2 of the shell-prompt roadmap — VM syscalls.
@@ -122,7 +120,8 @@ pub(super) fn sys_mmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     // else is `-EINVAL`. PROT_GROWSDOWN/GROWSUP recognised but
     // unsupported (`-ENOSYS`) — the underlying `Prot` shape has no
     // equivalent.
-    let prot_recognised = PROT_READ | PROT_WRITE | PROT_EXEC | PROT_NONE | PROT_GROWSDOWN | PROT_GROWSUP;
+    let prot_recognised =
+        PROT_READ | PROT_WRITE | PROT_EXEC | PROT_NONE | PROT_GROWSDOWN | PROT_GROWSUP;
     if prot_bits & !prot_recognised != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
@@ -145,11 +144,8 @@ pub(super) fn sys_mmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     let fixed = flags & MAP_FIXED != 0;
     let fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
     let anonymous = flags & MAP_ANONYMOUS != 0;
-    let entry_flags = VmEntryFlags::new(
-        shared,
-        flags & MAP_GROWSDOWN != 0,
-        flags & MAP_LOCKED != 0,
-    );
+    let entry_flags =
+        VmEntryFlags::new(shared, flags & MAP_GROWSDOWN != 0, flags & MAP_LOCKED != 0);
 
     // Build the backing.
     let backing = if anonymous {
@@ -206,7 +202,6 @@ pub(super) fn sys_mmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     }
 }
 
-
 /// `munmap(addr, length)` — Linux RV64 generic syscall #215.
 ///
 /// `addr` must be page-aligned and `length` is rounded up to a whole
@@ -236,7 +231,6 @@ pub(super) fn sys_munmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     }
 }
 
-
 /// `mprotect(addr, length, prot)` — Linux RV64 generic syscall #226.
 ///
 /// Wraps `AddressSpace::try_mprotect`. PROT_GROWSDOWN/GROWSUP not
@@ -257,7 +251,8 @@ pub(super) fn sys_mprotect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
     if !UserVirtAddr::new(addr as usize).is_page_aligned() {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let prot_recognised = PROT_READ | PROT_WRITE | PROT_EXEC | PROT_NONE | PROT_GROWSDOWN | PROT_GROWSUP;
+    let prot_recognised =
+        PROT_READ | PROT_WRITE | PROT_EXEC | PROT_NONE | PROT_GROWSDOWN | PROT_GROWSUP;
     if prot_bits & !prot_recognised != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
@@ -279,7 +274,6 @@ pub(super) fn sys_mprotect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
         Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
     }
 }
-
 
 /// `mremap(old_addr, old_size, new_size, flags, new_addr)` — Linux
 /// RV64 generic syscall #216.
@@ -321,12 +315,14 @@ pub(super) fn sys_mremap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    match ctx.aspace.try_mremap(VmRemapRequest::new(old_range, new_range)) {
+    match ctx
+        .aspace
+        .try_mremap(VmRemapRequest::new(old_range, new_range))
+    {
         Ok(outcome) => SyscallResult::Return(outcome.new_range.start().as_usize() as i64),
         Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
     }
 }
-
 
 /// `madvise(addr, length, advice)` — Linux RV64 generic syscall #233.
 ///
@@ -368,7 +364,6 @@ pub(super) fn sys_madvise<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
         Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
     }
 }
-
 
 /// `msync(addr, length, flags)` — Linux RV64 generic syscall #227.
 ///
@@ -425,7 +420,6 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     }
 }
 
-
 /// Resolve an `OpenFile` to its underlying `Cap<PageContainer>` if
 /// the rnode backing is `RNodeBacking::PageBacked`. TTY / pipe /
 /// chardev / directory / symlink rnodes return `None`; the caller
@@ -440,7 +434,6 @@ pub(super) fn extract_page_container(
         _ => None,
     }
 }
-
 
 /// Translate `VmMapError` into a Linux RV64 generic ABI errno
 /// magnitude. Slice 2 mapping:
@@ -476,11 +469,6 @@ pub(super) fn vmmap_error_to_i32(error: VmMapError) -> i32 {
         VmMapError::Pmap(_) => errno_to_i32(Errno::EIO),
     }
 }
-
-pub(super) fn user_range_error_to_i32(_error: UserRangeError) -> i32 {
-    EINVAL_VALUE
-}
-
 
 /// `futex(uaddr, op, val, timeout, uaddr2, val3)` — Linux RV64
 /// generic syscall #98.
@@ -541,8 +529,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sysc
                     StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
                         return SyscallResult::Return(0);
                     }
-                    StepOutcome::AdvancedThenBlocked((), token)
-                    | StepOutcome::Blocked(token) => {
+                    StepOutcome::AdvancedThenBlocked((), token) | StepOutcome::Blocked(token) => {
                         parked = true;
                         if let Some(future) = wait_carrier::wait_on_token(token) {
                             let _ = future.await;
@@ -579,9 +566,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sysc
                 StepOutcome::Done(woken) | StepOutcome::Advanced(woken) => {
                     SyscallResult::Return(woken as i64)
                 }
-                StepOutcome::AdvancedThenBlocked(woken, _) => {
-                    SyscallResult::Return(woken as i64)
-                }
+                StepOutcome::AdvancedThenBlocked(woken, _) => SyscallResult::Return(woken as i64),
                 StepOutcome::Blocked(_) => {
                     // FUTEX_WAKE is not a blocking op. The step
                     // never returns `Blocked` in practice; map to
@@ -598,4 +583,3 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sysc
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
-

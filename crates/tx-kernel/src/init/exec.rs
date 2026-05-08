@@ -18,7 +18,6 @@
 use super::*;
 
 impl<P: TxPlatform> CoreInit<P> {
-
     /// Initramfs slice: walk `BootInfo::initrd` if present and
     /// reproduce its file tree inside the rootfs. Warn-and-skip on
     /// any per-entry failure — a corrupt initramfs should not wedge
@@ -27,7 +26,9 @@ impl<P: TxPlatform> CoreInit<P> {
     /// (registered above) keeps the kernel runnable in that case.
     pub(crate) fn register_initramfs_if_present() {
         let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
-        let Some(initrd_range) = boot_info.initrd else { return };
+        let Some(initrd_range) = boot_info.initrd else {
+            return;
+        };
         if initrd_range.size == 0 {
             return;
         }
@@ -85,7 +86,6 @@ impl<P: TxPlatform> CoreInit<P> {
         }
     }
 
-
     /// Shell-prompt roadmap Slice 10 (2026-05-08): copy
     /// `busybox_fixture::BUSYBOX_BYTES` into a fresh tmpfs file at
     /// `/bin/sh`. Mirrors `register_init_fixture_into_tmpfs`'s
@@ -108,10 +108,20 @@ impl<P: TxPlatform> CoreInit<P> {
         use tx_subsystems::execution::StepOutcome;
         use tx_subsystems::vfs::{Credential, RNodeBacking};
 
-        let root_mount = root_mount()
-            .expect("register_busybox_into_tmpfs: ROOT_MOUNT must be populated");
-        let fs_ops = root_mount.payload_cap().expect("rootfs payload alive during boot").into_cap().fs_ops.clone();
-        let fs_page_backing = root_mount.payload_cap().expect("rootfs payload alive during boot").into_cap().fs_page_backing.clone();
+        let root_mount =
+            root_mount().expect("register_busybox_into_tmpfs: ROOT_MOUNT must be populated");
+        let fs_ops = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .fs_ops
+            .clone();
+        let fs_page_backing = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .fs_page_backing
+            .clone();
         let root_object_id = root_mount.root().fs_object_id();
 
         let cred = Credential::root();
@@ -140,9 +150,7 @@ impl<P: TxPlatform> CoreInit<P> {
             let outcome = fs_ops.create_inode(bin_object_id, b"sh", 0o100755, &cred, &guard);
             match outcome {
                 StepOutcome::Done(out) => out,
-                other => panic!(
-                    "register_busybox_into_tmpfs: create_inode(/bin/sh): {other:?}"
-                ),
+                other => panic!("register_busybox_into_tmpfs: create_inode(/bin/sh): {other:?}"),
             }
         };
 
@@ -153,9 +161,7 @@ impl<P: TxPlatform> CoreInit<P> {
             let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
             let rnode = match outcome {
                 StepOutcome::Done(rnode) => rnode,
-                other => panic!(
-                    "register_busybox_into_tmpfs: materialise_rnode: {other:?}"
-                ),
+                other => panic!("register_busybox_into_tmpfs: materialise_rnode: {other:?}"),
             };
             match rnode.backing() {
                 RNodeBacking::PageBacked { pc } => pc.clone(),
@@ -195,16 +201,13 @@ impl<P: TxPlatform> CoreInit<P> {
             let guard = tx_substrate::epoch::guard();
             match fs_page_backing.truncate(file_id, size, &guard) {
                 StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
-                other => panic!(
-                    "register_busybox_into_tmpfs: truncate({size}): {other:?}"
-                ),
+                other => panic!("register_busybox_into_tmpfs: truncate({size}): {other:?}"),
             }
         }
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":busybox:fixture:ok\n");
     }
-
 
     /// Sub-step 1 of `run_bootstrap_exec_for_init`: copy
     /// `init_fixture::INIT_FIXTURE_BYTES` into a fresh tmpfs file at
@@ -223,8 +226,18 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let root_mount =
             root_mount().expect("register_init_fixture_into_tmpfs: ROOT_MOUNT must be populated");
-        let fs_ops = root_mount.payload_cap().expect("rootfs payload alive during boot").into_cap().fs_ops.clone();
-        let fs_page_backing = root_mount.payload_cap().expect("rootfs payload alive during boot").into_cap().fs_page_backing.clone();
+        let fs_ops = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .fs_ops
+            .clone();
+        let fs_page_backing = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .fs_page_backing
+            .clone();
         let root_object_id = root_mount.root().fs_object_id();
 
         let bytes = &init_fixture::INIT_FIXTURE_BYTES[..];
@@ -299,7 +312,6 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":init:fixture:ok\n");
     }
-
 
     /// Sub-step 2 of `run_bootstrap_exec_for_init`: drive
     /// `exec_script` synchronously and panic with
@@ -392,7 +404,6 @@ impl<P: TxPlatform> CoreInit<P> {
         }
     }
 
-
     /// Wave 1 of the fork/clone/wait4 slice: install the reactor-
     /// submission hook in `tx_subsystems::reactor_submit` so a
     /// future `sys_clone` arm in `tx-shims` (Wave 2) can submit
@@ -408,7 +419,6 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::submit_child_thread_into_boot_reactor,
         );
     }
-
 
     /// Pre-ELF Phase 7: submit init's leader thread future as a
     /// reactor task, then drive the BSP hart-loop until the future
@@ -450,7 +460,6 @@ impl<P: TxPlatform> CoreInit<P> {
         let guard = tx_substrate::epoch::guard();
         let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
     }
-
 
     pub(super) fn run_userspace_reactor_loop() {
         // Wave 1 of the fork/clone/wait4 slice (2026-05-06): install
@@ -537,7 +546,6 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>("\n");
     }
 
-
     /// Render a signed decimal int into the platform console without
     /// allocating. `tx_hal::console_write_str` is byte-oriented so
     /// the formatter writes one chunk per call. Stack-bounded:
@@ -569,10 +577,8 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(s);
     }
 
-
     pub(super) fn write_board_sentinel_prefix() {
         tx_hal::console_write_str::<P>("txkernel:");
         tx_hal::console_write_str::<P>(P::BOARD);
     }
-
 }

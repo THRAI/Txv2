@@ -1,11 +1,11 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use tx_subsystems::process::bootstrap_init_process;
 
 use crate::linux_syscall::{
-    FUTEX_CLOCK_REALTIME, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_WAIT, FUTEX_WAKE,
-    FUTEX_WAKE_OP, NR_FUTEX,
+    FUTEX_CLOCK_REALTIME, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAKE_OP,
+    NR_FUTEX,
 };
 
 const E_INVAL: i32 = 22;
@@ -17,8 +17,7 @@ fn futex_setup() -> TestSetup {
 }
 
 fn fresh_proc_thread() -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
-    let process =
-        bootstrap_init_process(fresh_aspace()).expect("bootstrap init for futex tests");
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init for futex tests");
     let thread = process.nth_thread(0).expect("leader thread");
     (process, thread)
 }
@@ -36,10 +35,7 @@ fn dispatch_futex_wait_with_mismatched_val_returns_neg_eagain() {
     let word: u32 = 0x1234;
     let uaddr = &word as *const u32 as u64;
 
-    let req = SyscallRequest::new(
-        NR_FUTEX,
-        [uaddr, FUTEX_WAIT as u64, 0x5678, 0, 0, 0],
-    );
+    let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAIT as u64, 0x5678, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_AGAIN));
 }
@@ -68,10 +64,7 @@ fn dispatch_futex_wake_returns_n() {
     let word: u32 = 0;
     let uaddr = &word as *const u32 as u64;
 
-    let req = SyscallRequest::new(
-        NR_FUTEX,
-        [uaddr, FUTEX_WAKE as u64, 3, 0, 0, 0],
-    );
+    let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAKE as u64, 3, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(3));
 }
@@ -86,10 +79,7 @@ fn dispatch_futex_unsupported_op_returns_neg_enosys() {
     let word: u32 = 0;
     let uaddr = &word as *const u32 as u64;
 
-    let req = SyscallRequest::new(
-        NR_FUTEX,
-        [uaddr, FUTEX_REQUEUE as u64, 1, 0, 0, 0],
-    );
+    let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_REQUEUE as u64, 1, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_NOSYS));
 }
@@ -140,10 +130,7 @@ fn dispatch_futex_wake_op_returns_neg_enosys() {
     let word: u32 = 0;
     let uaddr = &word as *const u32 as u64;
 
-    let req = SyscallRequest::new(
-        NR_FUTEX,
-        [uaddr, FUTEX_WAKE_OP as u64, 1, 0, 0, 0],
-    );
+    let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAKE_OP as u64, 1, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_NOSYS));
 }

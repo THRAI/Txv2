@@ -57,8 +57,14 @@ pub(crate) fn trap_trace(root: &Path, args: Vec<String>) -> Result<()> {
         ));
     }
 
-    let traps_total = records.iter().filter(|r| matches!(r, Record::Trap(_))).count();
-    let entries_total = records.iter().filter(|r| matches!(r, Record::Entry(_))).count();
+    let traps_total = records
+        .iter()
+        .filter(|r| matches!(r, Record::Trap(_)))
+        .count();
+    let entries_total = records
+        .iter()
+        .filter(|r| matches!(r, Record::Entry(_)))
+        .count();
     println!(
         "trap-trace: {} traps, {} userspace re-entries (file: {})",
         traps_total,
@@ -73,11 +79,15 @@ pub(crate) fn trap_trace(root: &Path, args: Vec<String>) -> Result<()> {
     let mut printed = 0usize;
     for pair in &pairs {
         match pair.trap {
-            TrapRecord::Syscall { n, pc, a7, a0, a1, a2 } => {
-                let name = syscall_names
-                    .get(&a7)
-                    .copied()
-                    .unwrap_or("<unknown>");
+            TrapRecord::Syscall {
+                n,
+                pc,
+                a7,
+                a0,
+                a1,
+                a2,
+            } => {
+                let name = syscall_names.get(&a7).copied().unwrap_or("<unknown>");
                 let ret = pair
                     .entry
                     .as_ref()
@@ -88,13 +98,17 @@ pub(crate) fn trap_trace(root: &Path, args: Vec<String>) -> Result<()> {
                 );
                 printed += 1;
             }
-            TrapRecord::Fault { n, kind, pc, stval, ra } => {
+            TrapRecord::Fault {
+                n,
+                kind,
+                pc,
+                stval,
+                ra,
+            } => {
                 if syscalls_only {
                     continue;
                 }
-                println!(
-                    "[{n:#06x}] {kind:<3} pc={pc:#012x}  stval={stval:#x}  ra={ra:#x}"
-                );
+                println!("[{n:#06x}] {kind:<3} pc={pc:#012x}  stval={stval:#x}  ra={ra:#x}");
                 printed += 1;
             }
         }
@@ -164,7 +178,11 @@ fn parse_records(body: &str) -> Result<Vec<Record>> {
             let kv = parse_kv(rest);
             let n = kv.get("n").copied().unwrap_or(0);
             let pc = kv.get("pc").copied().unwrap_or(0);
-            let kind = match rest.split_whitespace().nth(1).and_then(|s| s.strip_prefix("kind=")) {
+            let kind = match rest
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.strip_prefix("kind="))
+            {
                 Some(k) => k,
                 None => continue,
             };

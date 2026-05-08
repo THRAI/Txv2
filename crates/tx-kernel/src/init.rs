@@ -451,13 +451,18 @@ impl<P: TxPlatform> CoreInit<P> {
         let guard = tx_substrate::epoch::guard();
         // Bootstrap path runs as root by construction.
         let cred = Credential::root();
-        let (dev_object_id, dev_meta) = match root_mount.payload_cap().expect("rootfs payload alive during boot").into_cap().fs_ops.mkdir(
-            tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
-            b"dev",
-            0o755,
-            &cred,
-            &guard,
-        ) {
+        let (dev_object_id, dev_meta) = match root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .fs_ops
+            .mkdir(
+                tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+                b"dev",
+                0o755,
+                &cred,
+                &guard,
+            ) {
             StepOutcome::Done(out) => out,
             other => panic!("mount_devfs_at_dev: tmpfs mkdir(/dev) failed: {other:?}"),
         };
@@ -510,7 +515,11 @@ impl<P: TxPlatform> CoreInit<P> {
         // into the new mount's `parent` slot. The mount-table
         // registration below keys on the rootfs payload + `/dev`'s
         // FsObjectId on rootfs.
-        let rootfs_payload = root_mount.payload_cap().expect("rootfs payload alive during boot").into_cap().clone();
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
 
         let dev_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
@@ -1133,8 +1142,7 @@ mod init_fixture;
 /// exclusively (host tests + CI without a riscv64 cross-toolchain).
 #[cfg(busybox_baked)]
 mod busybox_fixture {
-    pub static BUSYBOX_BYTES: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/busybox.bin"));
+    pub static BUSYBOX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox.bin"));
 }
 
 /// DAC + setuid slice (Wave 5, Part 8): sibling fixture for the

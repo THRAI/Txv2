@@ -5,7 +5,6 @@
 
 use super::*;
 
-
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
 /// re-walk. `path` is a slash-separated sequence; trailing slashes
 /// before the basename are dropped. Returns `(b"", path)` for a
@@ -33,7 +32,6 @@ pub(super) fn split_path(path: &[u8]) -> (&[u8], &[u8]) {
         }
     }
 }
-
 
 /// Helper for the `O_CREAT`-on-missing path inside `sys_openat`.
 /// Walks to the parent of `path`, calls `FsOps::create_inode` for the
@@ -121,7 +119,6 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     }
 }
 
-
 /// Resolve the `Arc<dyn FsPageBacking>` in scope for a dentry by
 /// ascending its parent-hint chain to find an rnode that carries
 /// `with_containing_mount`. Mirrors `fs_ops_for_dentry`'s shape but
@@ -150,7 +147,6 @@ pub(super) fn fs_page_backing_for_dentry(
         }
     }
 }
-
 
 /// `mkdirat(dirfd, pathname, mode)`. Linux RV64 generic ABI
 /// `__NR_mkdirat = 34`.
@@ -216,7 +212,6 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
 }
-
 
 /// `unlinkat(dirfd, pathname, flags)`. Linux RV64 generic ABI
 /// `__NR_unlinkat = 35`.
@@ -294,7 +289,6 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     }
 }
 
-
 /// `symlinkat(target, newdirfd, linkpath)`. Linux RV64 generic ABI
 /// `__NR_symlinkat = 36`.
 ///
@@ -357,7 +351,6 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
 }
-
 
 /// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)`. Linux RV64
 /// generic ABI `__NR_linkat = 37`.
@@ -438,7 +431,6 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     }
 }
 
-
 /// `truncate(path, length)`. Linux RV64 generic ABI
 /// `__NR_truncate = 45`.
 ///
@@ -484,7 +476,6 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     }
 }
 
-
 /// `ftruncate(fd, length)`. Linux RV64 generic ABI
 /// `__NR_ftruncate = 46`.
 ///
@@ -520,7 +511,6 @@ pub(super) fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
 }
-
 
 /// `readlinkat(dirfd, pathname, buf, bufsiz)`. Linux RV64 generic ABI
 /// `__NR_readlinkat = 78`.
@@ -618,15 +608,12 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     };
     let to_copy = core::cmp::min(link_bytes.len(), buf_len);
     if to_copy > 0 {
-        if let Err(errno) =
-            bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &link_bytes[..to_copy])
-        {
+        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &link_bytes[..to_copy]) {
             return SyscallResult::Error(errno_to_i32(errno));
         }
     }
     SyscallResult::Return(to_copy as i64)
 }
-
 
 /// `utimensat(dirfd, pathname, times, flags)`. Linux RV64 generic ABI
 /// `__NR_utimensat = 88`.
@@ -640,7 +627,6 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 pub(super) fn sys_utimensat<'a>(_args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Error(ENOSYS_VALUE)
 }
-
 
 /// `renameat2(olddirfd, oldpath, newdirfd, newpath, flags)`. Linux RV64
 /// generic ABI `__NR_renameat2 = 276`.
@@ -749,4 +735,3 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
 }
-

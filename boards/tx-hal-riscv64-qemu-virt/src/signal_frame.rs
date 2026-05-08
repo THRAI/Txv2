@@ -104,10 +104,9 @@ impl SignalFrameIf for Platform {
         // through the SUM/fixup-table primitive and converts faults into
         // FaultInfo.
         unsafe {
-            let bytes = core::slice::from_raw_parts(
-                core::ptr::addr_of!(frame).cast::<u8>(),
-                size_of::<Rv64SignalFrame>(),
-            );
+            let frame_ptr: *const Rv64SignalFrame = &frame;
+            let bytes =
+                core::slice::from_raw_parts(frame_ptr.cast::<u8>(), size_of::<Rv64SignalFrame>());
             board_copy_to_user(UserPtr::<u8>::new(user_frame.addr()), bytes)?;
         }
 

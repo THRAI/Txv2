@@ -66,7 +66,11 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         return Err("script is empty (no directives)".into());
     }
 
-    println!("shell-test: target={} script={}", target.name(), script_path.display());
+    println!(
+        "shell-test: target={} script={}",
+        target.name(),
+        script_path.display()
+    );
     println!("shell-test: {} directives", directives.len());
 
     let qemu_cmd = build_qemu_command(root, target)?;
@@ -99,7 +103,10 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
 
     if let Err(err) = result {
         println!();
-        println!("--- captured output ({} bytes) ---", buffer.lock().unwrap().len());
+        println!(
+            "--- captured output ({} bytes) ---",
+            buffer.lock().unwrap().len()
+        );
         println!("{}", buffer.lock().unwrap());
         return Err(err);
     }
@@ -257,8 +264,8 @@ fn parse_script(text: &str) -> Result<Vec<Directive>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let parsed = parse_line(line)
-            .map_err(|err| format!("script line {}: {err}", lineno + 1))?;
+        let parsed =
+            parse_line(line).map_err(|err| format!("script line {}: {err}", lineno + 1))?;
         out.push(parsed);
     }
     Ok(out)

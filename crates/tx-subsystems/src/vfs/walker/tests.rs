@@ -233,7 +233,7 @@ impl TestFs {
     /// has been created. The slice's `step_open` consults the inode's
     /// mode bits at terminal-component open time; the walker's
     /// `load_inode_meta` call site sees the latest value.
-    #[allow(dead_code)]
+    #[cfg_attr(test, allow(dead_code))]
     fn set_inode_perm(&self, id: FsObjectId, mode_low: u16, uid: u32, gid: u32) {
         let mut inner = self.inner.lock();
         if let Some((_, _, m, u, g)) = inner.inodes.get_mut(&id) {

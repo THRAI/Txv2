@@ -54,9 +54,9 @@ use tx_subsystems::cred::{
 };
 use tx_subsystems::execution::{Errno, StepOutcome};
 use tx_subsystems::process::{
-    process_by_pid, seed_child_leader_context, step_chdir, step_exit_group, step_fork,
-    step_getcwd, step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome, ExitStatus, Pgid,
-    Pid, ProcessIdentity, SetpgidError, SetsidError, WaitError, WaitTarget,
+    process_by_pid, seed_child_leader_context, step_chdir, step_exit_group, step_fork, step_getcwd,
+    step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome, ExitStatus, Pgid, Pid,
+    ProcessIdentity, SetpgidError, SetsidError, WaitError, WaitTarget,
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
@@ -76,61 +76,60 @@ use tx_subsystems::vfs::structure::{
 };
 use tx_subsystems::vfs::{step_open, step_walk, DEntry, OpenFile};
 use tx_subsystems::vm::{
-    AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserRangeError, UserVirtAddr,
-    VmBacking, VmEntryFlags, VmMapError, VmMapRequest, VmRemapRequest, USER_PAGE_SIZE,
+    AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
+    VmEntryFlags, VmMapError, VmMapRequest, VmRemapRequest, USER_PAGE_SIZE,
 };
 use tx_subsystems::wait_carrier;
 
 pub mod numbers;
 
 mod cred;
-pub(crate) use cred::*;
+use cred::*;
 mod time;
-pub(crate) use time::*;
+use time::*;
 mod signal;
-pub(crate) use signal::*;
+use signal::*;
 mod vm;
-pub(crate) use vm::*;
+use vm::*;
 mod io;
-pub(crate) use io::*;
+use io::*;
 mod fs_basic;
-pub(crate) use fs_basic::*;
+use fs_basic::*;
 mod fs_path;
-pub(crate) use fs_path::*;
+use fs_path::*;
 mod fs_mut;
-pub(crate) use fs_mut::*;
+use fs_mut::*;
 mod proc;
-pub(crate) use proc::*;
+use proc::*;
 mod misc;
-pub(crate) use misc::*;
+use misc::*;
 
 #[cfg(test)]
 mod tests;
 
 pub use numbers::{
-    AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, CLOCK_BOOTTIME,
-    CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID,
-    CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID, DT_BLK, DT_CHR, DT_DIR,
-    DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
-    FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI,
-    FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP,
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_OK, F_SETFD, F_SETFL, GRND_INSECURE, GRND_NONBLOCK,
-    GRND_RANDOM, MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
-    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN,
-    MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
-    MAP_STACK, MAP_SYNC, NR_BRK, NR_CHDIR, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE,
-    NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHDIR,
-    NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL, NR_FSTAT, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID,
-    NR_GETEUID, NR_GETGID, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID,
-    NR_GETRESUID, NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_KILL, NR_LINKAT, NR_LSEEK,
-    NR_MADVISE, NR_MKDIRAT, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP,
-    NR_NEWFSTATAT, NR_OPENAT, NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ, NR_READV, NR_READLINKAT,
-    NR_RENAMEAT2,
+    AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW,
+    CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,
+    CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID,
+    DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC,
+    FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG,
+    FUTEX_REQUEUE, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE,
+    FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_OK, F_SETFD,
+    F_SETFL, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, MADV_DONTNEED, MADV_FREE, MADV_NORMAL,
+    MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE,
+    MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK,
+    MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK, MAP_SYNC, NR_BRK, NR_CHDIR,
+    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT,
+    NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHDIR, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL,
+    NR_FSTAT, NR_FTRUNCATE, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID,
+    NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID, NR_GETRESUID,
+    NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_KILL, NR_LINKAT, NR_LSEEK, NR_MADVISE,
+    NR_MKDIRAT, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
+    NR_OPENAT, NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RENAMEAT2,
     NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGRETURN, NR_SETGID, NR_SETPGID, NR_SETREGID,
     NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
     NR_SET_TID_ADDRESS, NR_SYMLINKAT, NR_TGKILL, NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK,
-    NR_UNAME, NR_UNLINKAT, NR_UTIMENSAT, NR_FTRUNCATE, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE,
-    O_APPEND,
+    NR_UNAME, NR_UNLINKAT, NR_UTIMENSAT, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND,
     O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
     PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, RENAME_EXCHANGE,
     RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA,
@@ -746,7 +745,11 @@ pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) ->
 /// Write a `T: Copy` value to `uaddr` through the canonical
 /// `aspace.write_user` lane, falling back to the bootstrap
 /// kernel-pointer dance on `EFAULT`.
-pub(super) fn bootstrap_write_user<T: Copy>(aspace: &AddressSpace, uaddr: u64, value: T) -> Result<(), Errno> {
+pub(super) fn bootstrap_write_user<T: Copy>(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    value: T,
+) -> Result<(), Errno> {
     let guard = tx_substrate::epoch::guard();
     match aspace.write_user(UserPtr::<T>::new(uaddr as usize), value, &guard) {
         StepOutcome::Done(()) | StepOutcome::Advanced(()) => Ok(()),
@@ -766,7 +769,11 @@ pub(super) fn bootstrap_write_user<T: Copy>(aspace: &AddressSpace, uaddr: u64, v
 /// Copy `dst.len()` bytes from user-space `uaddr` into the kernel-side
 /// buffer `dst`. Bridges through `aspace.copy_from_user`, falling back
 /// to a kernel-pointer memcpy on `EFAULT`.
-pub(super) fn bootstrap_copy_from_user(aspace: &AddressSpace, dst: &mut [u8], uaddr: u64) -> Result<(), Errno> {
+pub(super) fn bootstrap_copy_from_user(
+    aspace: &AddressSpace,
+    dst: &mut [u8],
+    uaddr: u64,
+) -> Result<(), Errno> {
     if dst.is_empty() {
         return Ok(());
     }
@@ -789,7 +796,11 @@ pub(super) fn bootstrap_copy_from_user(aspace: &AddressSpace, dst: &mut [u8], ua
 /// Copy `src.len()` bytes from the kernel-side buffer `src` to
 /// user-space `uaddr`. Bridges through `aspace.copy_to_user`, falling
 /// back to a kernel-pointer memcpy on `EFAULT`.
-pub(super) fn bootstrap_copy_to_user(aspace: &AddressSpace, uaddr: u64, src: &[u8]) -> Result<(), Errno> {
+pub(super) fn bootstrap_copy_to_user(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    src: &[u8],
+) -> Result<(), Errno> {
     if src.is_empty() {
         return Ok(());
     }
@@ -979,10 +990,6 @@ pub(super) const ENOTDIR_VALUE: i32 = 20;
 /// Used by Slice 6's `sys_getcwd` when the user buffer is too small
 /// for the rendered cwd path (NUL terminator inclusive).
 pub(super) const ERANGE_VALUE: i32 = 34;
-
-/// Required for the `UserRangeError` side of the VM-arm error
-/// surface; centralised here so each arm doesn't repeat the match.
-#[allow(dead_code)]
 
 // ===========================================================================
 // Slice 4 of the shell-prompt roadmap (2026-05-07) — time syscalls.

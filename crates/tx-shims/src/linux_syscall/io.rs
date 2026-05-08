@@ -5,7 +5,6 @@
 
 use super::*;
 
-
 /// `write(fd, buf, count)`.
 ///
 /// Phase 2a restriction (per the trio plan §"Part 2 — Syscall table"
@@ -79,7 +78,6 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     SyscallResult::Return(total)
 }
 
-
 /// `readv(fd, iov, iovcnt)` — scatter-read counterpart of `sys_writev`.
 pub(super) async fn sys_readv<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let iov_ptr = args[1];
@@ -128,7 +126,6 @@ pub(super) async fn sys_readv<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     }
     SyscallResult::Return(total)
 }
-
 
 /// `ppoll(fds, nfds, tmo_p, sigmask)` — minimal v1 stub for
 /// interactive `busybox sh` so its read loop doesn't trap with
@@ -191,7 +188,6 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     }
     SyscallResult::Return(ready)
 }
-
 
 pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
@@ -286,7 +282,6 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         }
     }
 }
-
 
 /// `read(fd, buf, count)`.
 ///
@@ -418,4 +413,3 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         }
     }
 }
-

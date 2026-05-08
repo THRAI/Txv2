@@ -46,17 +46,17 @@ use tx_hal::UserTrapContext;
 
 use crate::trap::Rv64TrapFrame;
 
-#[allow(dead_code)]
+#[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
 const X_RA: usize = 1;
-#[allow(dead_code)]
+#[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
 const X_SP: usize = 2;
-#[allow(dead_code)]
+#[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
 const X_A0: usize = 10;
-#[allow(dead_code)]
+#[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
 const X_A1: usize = 11;
-#[allow(dead_code)]
+#[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
 const X_A2: usize = 12;
-#[allow(dead_code)]
+#[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
 const X_A7: usize = 17;
 
 #[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
@@ -74,7 +74,10 @@ static TRACE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// responsible for the `from_user` check (the macro is no-op if the
 /// trap was from kernel mode — kernel-mode traps are panics in v1).
 #[inline]
-#[allow(unused_variables)]
+#[cfg_attr(
+    not(all(target_arch = "riscv64", feature = "trap-trace")),
+    allow(unused_variables)
+)]
 pub(crate) fn record_trap(scause_low: u8, frame: &Rv64TrapFrame) {
     #[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
     {
@@ -121,7 +124,10 @@ pub(crate) fn record_trap(scause_low: u8, frame: &Rv64TrapFrame) {
 /// `txdbg:trap n=K-1` and reflects the return value the kernel is
 /// handing back to userspace for that trap.
 #[inline]
-#[allow(unused_variables)]
+#[cfg_attr(
+    not(all(target_arch = "riscv64", feature = "trap-trace")),
+    allow(unused_variables)
+)]
 pub(crate) fn record_entry(ctx: &UserTrapContext) {
     #[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
     {

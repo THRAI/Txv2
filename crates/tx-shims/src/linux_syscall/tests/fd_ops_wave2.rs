@@ -1,5 +1,5 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -19,8 +19,8 @@ use tx_subsystems::vfs::structure::{
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
-    AT_FDCWD, EXECVE_PATH_MAX, NR_CLOSE, NR_DUP, NR_DUP3, NR_OPENAT, O_CLOEXEC, O_CREAT,
-    O_EXCL, O_RDONLY, O_RDWR, O_TRUNC,
+    AT_FDCWD, EXECVE_PATH_MAX, NR_CLOSE, NR_DUP, NR_DUP3, NR_OPENAT, O_CLOEXEC, O_CREAT, O_EXCL,
+    O_RDONLY, O_RDWR, O_TRUNC,
 };
 
 /// errno magnitudes: positive Linux RV64 generic ABI values.
@@ -737,8 +737,7 @@ fn dispatch_dup3_with_o_cloexec_sets_cloexec() {
         other => panic!("openat: {other:?}"),
     };
     // dup3 to a fresh slot 100 with O_CLOEXEC.
-    let dup3_req =
-        SyscallRequest::new(NR_DUP3, [oldfd as u64, 100u64, O_CLOEXEC as u64, 0, 0, 0]);
+    let dup3_req = SyscallRequest::new(NR_DUP3, [oldfd as u64, 100u64, O_CLOEXEC as u64, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(dup3_req, &ctx));
     assert_eq!(result, SyscallResult::Return(100));
     assert!(proc_cap.fd(100).is_some());

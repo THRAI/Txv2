@@ -103,12 +103,12 @@
 // - All immediates are within ±2047 so no `lui` prefix is needed.
 
 /// LOAD virtual address (entry of the PT_LOAD segment).
-#[allow(dead_code)] // referenced only from the host-side test below.
+#[cfg(test)]
 pub const INIT_LSEEK_FIXTURE_LOAD_VADDR: u64 = 0x10000;
 
 /// Entry-point virtual address (first instruction).
 /// Equal to LOAD_VADDR + 176 (header + 2 PHDRs).
-#[allow(dead_code)] // referenced only from the host-side test below.
+#[cfg(test)]
 pub const INIT_LSEEK_FIXTURE_ENTRY_VADDR: u64 = INIT_LSEEK_FIXTURE_LOAD_VADDR + 176;
 
 /// Total fixture size in bytes (also `p_filesz` and `p_memsz` of
@@ -235,10 +235,7 @@ mod tests {
     /// edits silently shrinking or growing the fixture.
     #[test]
     fn lseek_fixture_size_matches_constant() {
-        assert_eq!(
-            INIT_LSEEK_FIXTURE_BYTES.len(),
-            INIT_LSEEK_FIXTURE_FILE_SIZE
-        );
+        assert_eq!(INIT_LSEEK_FIXTURE_BYTES.len(), INIT_LSEEK_FIXTURE_FILE_SIZE);
         assert_eq!(INIT_LSEEK_FIXTURE_FILE_SIZE, 228);
     }
 
@@ -315,6 +312,9 @@ mod tests {
         assert_eq!(i8, 0x03900893, "insn 8 should be `li a7, 57` (NR_CLOSE)");
         // Insn 10 (offset 216): NR_EXIT_GROUP (94)
         let i10 = u32::from_le_bytes(INIT_LSEEK_FIXTURE_BYTES[216..220].try_into().unwrap());
-        assert_eq!(i10, 0x05E00893, "insn 10 should be `li a7, 94` (NR_EXIT_GROUP)");
+        assert_eq!(
+            i10, 0x05E00893,
+            "insn 10 should be `li a7, 94` (NR_EXIT_GROUP)"
+        );
     }
 }

@@ -1,11 +1,11 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 
 use crate::linux_syscall::{
     CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID,
-    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_GETTIMEOFDAY, NR_NANOSLEEP, NR_TIMES,
-    TIMER_ABSTIME, TIMES_NS_PER_TICK,
+    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_GETTIMEOFDAY, NR_NANOSLEEP, NR_TIMES, TIMER_ABSTIME,
+    TIMES_NS_PER_TICK,
 };
 
 const E_INVAL: i32 = 22;
@@ -86,10 +86,7 @@ fn dispatch_clock_gettime_cputime_aliases_to_monotonic() {
         CLOCK_PROCESS_CPUTIME_ID,
         CLOCK_THREAD_CPUTIME_ID,
     ] {
-        let req = SyscallRequest::new(
-            NR_CLOCK_GETTIME,
-            [clk as u64, ts_uaddr, 0, 0, 0, 0],
-        );
+        let req = SyscallRequest::new(NR_CLOCK_GETTIME, [clk as u64, ts_uaddr, 0, 0, 0, 0]);
         let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
         assert_eq!(result, SyscallResult::Return(0), "clk_id {clk}");
     }
@@ -115,10 +112,7 @@ fn dispatch_clock_gettime_null_buffer_returns_neg_efault() {
     let (_setup, proc_cap, thread) = time_setup();
     let ctx = make_ctx(proc_cap, thread);
 
-    let req = SyscallRequest::new(
-        NR_CLOCK_GETTIME,
-        [CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0],
-    );
+    let req = SyscallRequest::new(NR_CLOCK_GETTIME, [CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_FAULT));
 }
@@ -321,10 +315,7 @@ fn dispatch_clock_nanosleep_invalid_clock_returns_neg_einval() {
     };
     let req_uaddr = &req_ts as *const TestTimespec as u64;
 
-    let req = SyscallRequest::new(
-        NR_CLOCK_NANOSLEEP,
-        [99, 0, req_uaddr, 0, 0, 0],
-    );
+    let req = SyscallRequest::new(NR_CLOCK_NANOSLEEP, [99, 0, req_uaddr, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_INVAL));
 }

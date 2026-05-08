@@ -1,13 +1,12 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::tty::structure::{Termios, Winsize};
 
 use crate::linux_syscall::{
-    NR_IOCTL, TCGETS, TCSETS, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP,
-    TIOCSWINSZ,
+    NR_IOCTL, TCGETS, TCSETS, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
 };
 
 const E_BADF: i32 = 9;
@@ -21,8 +20,7 @@ fn ioctl_setup() -> TestSetup {
 }
 
 fn fresh_proc_thread() -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
-    let process =
-        bootstrap_init_process(fresh_aspace()).expect("bootstrap init for ioctl tests");
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init for ioctl tests");
     let thread = process.nth_thread(0).expect("leader thread");
     (process, thread)
 }
