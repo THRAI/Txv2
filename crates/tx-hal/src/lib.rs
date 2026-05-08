@@ -456,6 +456,7 @@ impl PmapPermissions {
     pub const EXECUTE: Self = Self { bits: 1 << 2 };
     pub const USER: Self = Self { bits: 1 << 3 };
     pub const GLOBAL: Self = Self { bits: 1 << 4 };
+    pub const DEVICE: Self = Self { bits: 1 << 5 };
 
     pub const KERNEL_RO: Self = Self {
         bits: Self::READ.bits | Self::GLOBAL.bits,
@@ -488,13 +489,18 @@ impl PmapPermissions {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PmapReservationIntermediates {
+    pub l2: Option<PtNode>,
     pub l1: Option<PtNode>,
     pub l0: Option<PtNode>,
 }
 
 impl PmapReservationIntermediates {
     pub const fn empty() -> Self {
-        Self { l1: None, l0: None }
+        Self {
+            l2: None,
+            l1: None,
+            l0: None,
+        }
     }
 }
 
@@ -720,6 +726,10 @@ pub trait PmapIf {
     }
 
     fn destroy_pmap_root(_root: PmapRoot) {}
+
+    fn activate_pmap(_root: &PmapRoot) -> Result<(), PmapError> {
+        Err(PmapError::Unsupported)
+    }
 
     fn reserve_mapping(
         _root: &PmapRoot,

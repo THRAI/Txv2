@@ -89,8 +89,16 @@ fn qemu_command(
         target.qemu_binary().to_string(),
         "-machine".to_string(),
         target.qemu_machine().to_string(),
+    ];
+
+    if let Some(cpu) = qemu_cpu(target) {
+        args.push("-cpu".to_string());
+        args.push(cpu.to_string());
+    }
+
+    args.extend([
         "-m".to_string(),
-        "256M".to_string(),
+        qemu_memory(target).to_string(),
         "-smp".to_string(),
         match target {
             TxTarget::Rv64Qemu => "4",
@@ -106,7 +114,7 @@ fn qemu_command(
         "-no-reboot".to_string(),
         "-kernel".to_string(),
         kernel.display().to_string(),
-    ];
+    ]);
 
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
@@ -165,6 +173,20 @@ fn qemu_command(
         profile.name()
     ));
     Ok(args)
+}
+
+fn qemu_cpu(target: TxTarget) -> Option<&'static str> {
+    match target {
+        TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => None,
+        TxTarget::La64Qemu => Some("la464"),
+    }
+}
+
+fn qemu_memory(target: TxTarget) -> &'static str {
+    match target {
+        TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => "256M",
+        TxTarget::La64Qemu => "1152M",
+    }
 }
 
 fn run_with_sentinel(
@@ -524,5 +546,29 @@ mod tests {
             "-kernel /tmp/tx/target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt"
         ));
         assert!(!rendered.contains("-drive file=target/images/smoke.ext4"));
+    }
+
+    #[test]
+    fn la64_qemu_command_uses_la464_cpu_and_larger_memory() {
+        let options = QemuOptions {
+            expect_sentinel: true,
+            timeout: Duration::from_secs(10),
+        };
+        let command = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::La64Qemu,
+            Profile::Smoke,
+            &options,
+        )
+        .unwrap();
+        let rendered = command.join(" ");
+
+        assert!(rendered.contains("qemu-system-loongarch64"));
+        assert!(rendered.contains("-machine virt"));
+        assert!(rendered.contains("-cpu la464"));
+        assert!(rendered.contains("-m 1152M"));
+        assert!(rendered.contains("-smp 1"));
+        assert!(rendered.contains("-serial file:target/qemu-la64-qemu-smoke.serial.log"));
+        assert!(rendered.contains("tx-kernel-loongarch64-qemu-virt"));
     }
 }

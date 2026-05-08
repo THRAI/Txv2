@@ -156,6 +156,7 @@ pub(super) fn reserve_mapping_from_root<State>(
                         root,
                         virt,
                         PmapReservationIntermediates {
+                            l2: None,
                             l1: Some(node),
                             l0: None,
                         },
@@ -168,6 +169,7 @@ pub(super) fn reserve_mapping_from_root<State>(
                 phys,
                 kind,
                 PmapReservationIntermediates {
+                    l2: None,
                     l1: ensured_l1.node,
                     l0: None,
                 },
@@ -185,6 +187,7 @@ pub(super) fn reserve_mapping_from_root<State>(
                             root,
                             virt,
                             PmapReservationIntermediates {
+                                l2: None,
                                 l1: Some(node),
                                 l0: None,
                             },
@@ -200,6 +203,7 @@ pub(super) fn reserve_mapping_from_root<State>(
                     root,
                     virt,
                     PmapReservationIntermediates {
+                        l2: None,
                         l1: l1_node,
                         l0: ensured_l0.node,
                     },
@@ -211,6 +215,7 @@ pub(super) fn reserve_mapping_from_root<State>(
                 phys,
                 kind,
                 PmapReservationIntermediates {
+                    l2: None,
                     l1: l1_node,
                     l0: ensured_l0.node,
                 },

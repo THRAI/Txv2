@@ -178,6 +178,7 @@ pub(super) fn reserve_kernel_mapping_from_bag<State>(
             validate_aligned_mapping(virt, phys, SUPERPAGE_2M_SIZE)?;
             let l1 = ensure_l1_table_for_reservation(bag, virt)?;
             let intermediates = PmapReservationIntermediates {
+                l2: None,
                 l1: l1.node,
                 l0: None,
             };
@@ -201,6 +202,7 @@ pub(super) fn reserve_kernel_mapping_from_bag<State>(
                         bag,
                         virt,
                         PmapReservationIntermediates {
+                            l2: None,
                             l1: l1_node,
                             l0: None,
                         },
@@ -209,6 +211,7 @@ pub(super) fn reserve_kernel_mapping_from_bag<State>(
                 }
             };
             let intermediates = PmapReservationIntermediates {
+                l2: None,
                 l1: l1_node,
                 l0: l0.node,
             };
