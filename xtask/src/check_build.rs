@@ -56,6 +56,18 @@ pub(crate) fn check(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn build(root: &Path, target_value: &str) -> Result<()> {
+    build_with_features(root, target_value, &[])
+}
+
+/// Build the kernel binary for `target_value`, forwarding cargo
+/// `--features` flags to the build command. Used by the `test` lane
+/// to plumb `--trap-trace` (et al.) through to the kernel binary
+/// without requiring users to invoke cargo directly.
+pub(crate) fn build_with_features(
+    root: &Path,
+    target_value: &str,
+    features: &[&str],
+) -> Result<()> {
     let installed = installed_targets().unwrap_or_default();
     for target in TxTarget::all_for(target_value)? {
         let triple = target_triple(target)?;
@@ -67,11 +79,17 @@ pub(crate) fn build(root: &Path, target_value: &str) -> Result<()> {
                 triple
             ));
         }
-        run_cmd(
-            root,
-            "cargo",
-            &["build", "-p", target.package(), "--target", &triple],
-        )?;
+        let mut cmd: Vec<&str> = vec!["build", "-p", target.package(), "--target", &triple];
+        if !features.is_empty() {
+            cmd.push("--features");
+            for (i, f) in features.iter().enumerate() {
+                if i > 0 {
+                    return Err("multi-feature passthrough not yet supported".into());
+                }
+                cmd.push(f);
+            }
+        }
+        run_cmd(root, "cargo", &cmd)?;
     }
     Ok(())
 }
