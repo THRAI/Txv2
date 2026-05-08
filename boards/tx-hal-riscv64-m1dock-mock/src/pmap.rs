@@ -223,6 +223,7 @@ pub(crate) fn reserve_kernel_mapping(
             rollback_intermediates(
                 virt,
                 PmapReservationIntermediates {
+                    l2: None,
                     l1: l1_node,
                     l0: None,
                 },
@@ -231,6 +232,7 @@ pub(crate) fn reserve_kernel_mapping(
         }
     };
     let intermediates = PmapReservationIntermediates {
+        l2: None,
         l1: l1_node,
         l0: ensured_l0.node,
     };
@@ -410,6 +412,7 @@ pub(crate) fn reserve_mapping(
                     root,
                     virt,
                     PmapReservationIntermediates {
+                        l2: None,
                         l1: ensured_l1.node,
                         l0: None,
                     },
@@ -421,6 +424,7 @@ pub(crate) fn reserve_mapping(
                 phys,
                 kind,
                 PmapReservationIntermediates {
+                    l2: None,
                     l1: ensured_l1.node,
                     l0: None,
                 },
@@ -436,6 +440,7 @@ pub(crate) fn reserve_mapping(
                         root,
                         virt,
                         PmapReservationIntermediates {
+                            l2: None,
                             l1: l1_node,
                             l0: None,
                         },
@@ -444,6 +449,7 @@ pub(crate) fn reserve_mapping(
                 }
             };
             let intermediates = PmapReservationIntermediates {
+                l2: None,
                 l1: l1_node,
                 l0: ensured_l0.node,
             };

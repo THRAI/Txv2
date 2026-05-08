@@ -199,7 +199,7 @@ impl Rv64TrapFrame {
         self.sstatus & RV64_SSTATUS_SPIE != 0
     }
 
-    pub const fn view(&self) -> TrapFrameView<'_> {
+    pub const fn view(&self) -> TrapFrameView {
         TrapFrameView::new(
             VirtAddr(self.sepc),
             VirtAddr(self.x[X_SP]),
@@ -297,6 +297,7 @@ impl Rv64TrapFrame {
 }
 
 static RV64_TRAP_FRAME_MUT_VTABLE: TrapFrameMutVtable = TrapFrameMutVtable {
+    read_view: rv64_read_view,
     set_pc: rv64_set_pc,
     set_sp: rv64_set_sp,
     set_syscall_return: rv64_set_syscall_return,
@@ -310,6 +311,10 @@ static RV64_TRAP_FRAME_MUT_VTABLE: TrapFrameMutVtable = TrapFrameMutVtable {
 
 fn rv64_frame_ptr(raw: NonNull<()>) -> *mut Rv64TrapFrame {
     raw.cast::<Rv64TrapFrame>().as_ptr()
+}
+
+fn rv64_read_view(raw: NonNull<()>) -> TrapFrameView {
+    unsafe { (*rv64_frame_ptr(raw)).view() }
 }
 
 fn rv64_set_pc(raw: NonNull<()>, pc: VirtAddr) {

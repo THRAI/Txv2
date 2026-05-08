@@ -31,6 +31,7 @@ type UnmapMappingFn =
 #[derive(Clone, Copy)]
 struct VmPmapOps {
     destroy_root: fn(PmapRoot),
+    activate_root: fn(&PmapRoot) -> Result<(), PmapError>,
     reserve_mapping: ReserveMappingFn,
     commit_mapping: fn(&PmapRoot, PmapReservation, PmapPermissions),
     unmap_mapping: UnmapMappingFn,
@@ -41,6 +42,7 @@ impl VmPmapOps {
     fn for_platform<P: PmapIf>() -> Self {
         Self {
             destroy_root: P::destroy_pmap_root,
+            activate_root: P::activate_pmap,
             reserve_mapping: P::reserve_mapping,
             commit_mapping: P::commit_mapping,
             unmap_mapping: P::unmap_mapping,
@@ -168,6 +170,16 @@ impl VmPmap {
             rollbacks: state.rollbacks,
             shootdowns: state.shootdowns,
         }
+    }
+
+    /// Install this VM pmap root on the current CPU.
+    ///
+    /// ThreadRuntime should call this immediately before returning to a user
+    /// context owned by the surrounding AddressSpace. The HAL owns the actual
+    /// ASID/root CSR writes; this layer only supplies the root captured when the
+    /// AddressSpace was created for that platform.
+    pub fn activate(&self) -> Result<(), VmPmapError> {
+        (self.ops.activate_root)(self.root()).map_err(VmPmapError::Pmap)
     }
 
     pub fn publish_page(

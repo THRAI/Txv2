@@ -82,7 +82,7 @@ impl TrapFrameSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TrapFrameView<'a> {
+pub struct TrapFrameView {
     pub pc: VirtAddr,
     pub sp: VirtAddr,
     pub syscall_number: u64,
@@ -92,10 +92,9 @@ pub struct TrapFrameView<'a> {
     pub previous_mode: TrapPreviousMode,
     pub interrupts_enabled_before: bool,
     pub user_tls_register: u64,
-    _frame: PhantomData<&'a ()>,
 }
 
-impl<'a> TrapFrameView<'a> {
+impl TrapFrameView {
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         pc: VirtAddr,
@@ -118,7 +117,6 @@ impl<'a> TrapFrameView<'a> {
             previous_mode,
             interrupts_enabled_before,
             user_tls_register,
-            _frame: PhantomData,
         }
     }
 }
@@ -144,7 +142,7 @@ pub struct SignalHandlerRegs {
 
 #[derive(Debug)]
 pub struct TrapFrameMut<'a> {
-    view: TrapFrameView<'a>,
+    view: TrapFrameView,
     raw: NonNull<()>,
     vtable: &'static TrapFrameMutVtable,
     _frame: PhantomData<&'a mut ()>,
@@ -152,6 +150,7 @@ pub struct TrapFrameMut<'a> {
 
 #[derive(Debug)]
 pub struct TrapFrameMutVtable {
+    pub read_view: fn(NonNull<()>) -> TrapFrameView,
     pub set_pc: fn(NonNull<()>, VirtAddr),
     pub set_sp: fn(NonNull<()>, VirtAddr),
     pub set_syscall_return: fn(NonNull<()>, i64),
@@ -172,7 +171,7 @@ impl<'a> TrapFrameMut<'a> {
     /// `view`; the frame must remain uniquely borrowed for `'a`; and `vtable`
     /// must contain writeback functions for that exact raw frame layout.
     pub unsafe fn from_raw_parts(
-        view: TrapFrameView<'a>,
+        view: TrapFrameView,
         raw: NonNull<()>,
         vtable: &'static TrapFrameMutVtable,
     ) -> Self {
@@ -184,7 +183,7 @@ impl<'a> TrapFrameMut<'a> {
         }
     }
 
-    pub const fn view(&self) -> TrapFrameView<'_> {
+    pub const fn view(&self) -> TrapFrameView {
         self.view
     }
 
@@ -220,18 +219,7 @@ impl<'a> TrapFrameMut<'a> {
 
     pub fn restore_user_context(&mut self, context: &UserTrapContext) {
         (self.vtable.restore_user_context)(self.raw, context);
-        self.view.pc = VirtAddr(context.pc);
-        self.view.sp = VirtAddr(context.regs[2]);
-        self.view.syscall_number = context.regs[17] as u64;
-        self.view.syscall_args = [
-            context.regs[10] as u64,
-            context.regs[11] as u64,
-            context.regs[12] as u64,
-            context.regs[13] as u64,
-            context.regs[14] as u64,
-            context.regs[15] as u64,
-        ];
-        self.view.user_tls_register = context.regs[4] as u64;
+        self.view = (self.vtable.read_view)(self.raw);
     }
 
     pub fn set_signal_handler_regs(&mut self, regs: SignalHandlerRegs) {

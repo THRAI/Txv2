@@ -28,6 +28,7 @@ struct CountingPmap;
 struct CountingPmapCounters {
     creates: usize,
     destroys: usize,
+    activates: usize,
     reserves: usize,
     commits: usize,
     unmaps: usize,
@@ -106,6 +107,13 @@ impl PmapIf for CountingPmap {
         state
             .mappings
             .retain(|(mapped_root, _), _| *mapped_root != root_key);
+    }
+
+    fn activate_pmap(root: &PmapRoot) -> Result<(), PmapError> {
+        let mut state = COUNTING_PMAP_STATE.lock().expect("counting pmap lock");
+        state.counters.activates += 1;
+        state.counters.last_asid = Some(root.asid());
+        Ok(())
     }
 
     fn reserve_mapping(
@@ -1306,12 +1314,34 @@ fn address_space_cap_drop_tears_down_pmap_before_destroying_root() {
     wait_for_counting_pmap_counters(CountingPmapCounters {
         creates: 1,
         destroys: 1,
+        activates: 0,
         reserves: 1,
         commits: 1,
         unmaps: 1,
         shoots: 1,
         last_asid: Some(Asid(1)),
     });
+}
+
+#[test]
+fn address_space_activate_pmap_installs_owned_root() {
+    let _guard = COUNTING_PMAP_TEST_LOCK.lock().expect("counting test lock");
+    setup_host_substrate();
+    reset_counting_pmap();
+
+    let aspace =
+        AddressSpace::new_for_platform::<CountingPmap>().expect("counting pmap address space");
+    aspace.activate_pmap().expect("activate pmap");
+
+    assert_eq!(
+        counting_pmap_counters(),
+        CountingPmapCounters {
+            creates: 1,
+            activates: 1,
+            last_asid: Some(Asid(1)),
+            ..CountingPmapCounters::default()
+        }
+    );
 }
 
 #[test]

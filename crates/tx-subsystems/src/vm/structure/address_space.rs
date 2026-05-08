@@ -72,6 +72,14 @@ impl AddressSpace {
         &self.pmap
     }
 
+    /// Activate the platform pmap root owned by this address space.
+    ///
+    /// This is the VM-facing boundary used by the future ThreadRuntime
+    /// userspace-entry path before it calls the HAL's return-to-user primitive.
+    pub fn activate_pmap(&self) -> Result<(), VmPmapError> {
+        self.pmap.activate()
+    }
+
     pub const fn range_lock(&self) -> &RangeLock {
         &self.range_lock
     }

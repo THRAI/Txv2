@@ -113,17 +113,34 @@ pub(crate) fn target_triple(target: TxTarget) -> Result<String> {
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => Ok(RV64_TARGET.to_string()),
         TxTarget::La64Qemu => {
+            let installed = installed_targets().ok();
             let supported = supported_targets()?;
-            if supported.contains(LA64_TARGET_PREFERRED) {
-                Ok(LA64_TARGET_PREFERRED.to_string())
-            } else if supported.contains(LA64_TARGET_FALLBACK) {
-                Ok(LA64_TARGET_FALLBACK.to_string())
-            } else {
-                Err(format!(
-                    "compiler supports neither {LA64_TARGET_PREFERRED} nor {LA64_TARGET_FALLBACK}"
-                ))
-            }
+            select_la64_target(installed.as_ref(), &supported)
         }
+    }
+}
+
+fn select_la64_target(
+    installed: Option<&BTreeSet<String>>,
+    supported: &BTreeSet<String>,
+) -> Result<String> {
+    if let Some(installed) = installed {
+        if installed.contains(LA64_TARGET_PREFERRED) {
+            return Ok(LA64_TARGET_PREFERRED.to_string());
+        }
+        if installed.contains(LA64_TARGET_FALLBACK) {
+            return Ok(LA64_TARGET_FALLBACK.to_string());
+        }
+    }
+
+    if supported.contains(LA64_TARGET_PREFERRED) {
+        Ok(LA64_TARGET_PREFERRED.to_string())
+    } else if supported.contains(LA64_TARGET_FALLBACK) {
+        Ok(LA64_TARGET_FALLBACK.to_string())
+    } else {
+        Err(format!(
+            "compiler supports neither {LA64_TARGET_PREFERRED} nor {LA64_TARGET_FALLBACK}"
+        ))
     }
 }
 
@@ -179,5 +196,47 @@ pub(crate) fn require_target(
     } else {
         println!("missing: rustup target add {target}");
         missing.push(format!("rustup target add {target}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn la64_target_prefers_installed_fallback_over_uninstalled_softfloat() {
+        let installed = set(&[LA64_TARGET_FALLBACK]);
+        let supported = set(&[LA64_TARGET_PREFERRED, LA64_TARGET_FALLBACK]);
+
+        assert_eq!(
+            select_la64_target(Some(&installed), &supported).unwrap(),
+            LA64_TARGET_FALLBACK
+        );
+    }
+
+    #[test]
+    fn la64_target_uses_preferred_when_both_are_installed() {
+        let installed = set(&[LA64_TARGET_PREFERRED, LA64_TARGET_FALLBACK]);
+        let supported = set(&[LA64_TARGET_PREFERRED, LA64_TARGET_FALLBACK]);
+
+        assert_eq!(
+            select_la64_target(Some(&installed), &supported).unwrap(),
+            LA64_TARGET_PREFERRED
+        );
+    }
+
+    #[test]
+    fn la64_target_falls_back_to_supported_targets_when_nothing_installed() {
+        let installed = BTreeSet::new();
+        let supported = set(&[LA64_TARGET_PREFERRED, LA64_TARGET_FALLBACK]);
+
+        assert_eq!(
+            select_la64_target(Some(&installed), &supported).unwrap(),
+            LA64_TARGET_PREFERRED
+        );
     }
 }
