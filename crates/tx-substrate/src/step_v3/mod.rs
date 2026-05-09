@@ -240,6 +240,11 @@ impl ByteProgress {
     pub const fn bytes(self) -> usize {
         self.bytes
     }
+    /// Inherent shorthand for `<ByteProgress as StepProgress>::EMPTY`.
+    /// Avoids requiring `use StepProgress;` at byte-moving call sites
+    /// (e.g. `step_v3::StepOutcome::yield_on_carrier(ByteProgress::EMPTY,
+    /// carrier_id, interest_mask)`).
+    pub const EMPTY: Self = Self { bytes: 0 };
 }
 
 impl StepProgress for ByteProgress {

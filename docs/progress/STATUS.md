@@ -4,6 +4,63 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-6 of the v3 TDD migration landed (three
+  parallel cascade probes: W-mount, W-pipe, W-device — first
+  multi-subsystem fan-out under the additive sibling-fn pattern
+  from the wave-4 futex probe). Net additions:
+  (a) **W-pipe** migrated `step_pipe2_v3` (one-shot, NoProgress)
+  and `step_read_v3` (byte-moving, ByteProgress) in
+  `crates/tx-subsystems/src/pipe.rs`; v4 `step_pipe2`/`step_read`
+  and tx-shims callers untouched. Discovered: pipe's v4
+  step fns never emit `Advanced`/`AdvancedThenBlocked` — the
+  multi-step loop lives in `vfs::execution`, not the pipe
+  subsystem; pipe step fns are deliberately single-shot
+  `Done(n)` for both full and partial drains. v3 sibs preserve
+  this. `step_write` skipped (mechanically symmetric to
+  `step_read`, +EPIPE branch via the `From<Errno>` bridge);
+  trivial follow-up. 7 v3 tests; +7 workspace.
+  (b) **W-mount** found mount.rs has zero v4 production
+  `step_*` fns — only test-fixture `MockFs` impls of `FsOps`
+  /`FsPageBacking` traits. Worker added 3 v3 sibling free fns
+  inside `mod tests` (`mockfs_lookup_v3`, `mockfs_load_inode_meta_v3`,
+  `mockfs_fetch_page_v3`) demonstrating the v3 shape against
+  the FsOps trait surface; 4 v3 tests including one exercising
+  the `From<execution::Errno>` bridge. The mount cascade is
+  trait-method-shaped, not free-fn — wave-7+ migration here
+  requires a parallel `FsOpsV3` trait or per-impl shim, not
+  the additive sibling-fn pattern. +4 workspace.
+  (c) **W-device** Case B: device.rs is a trait-declaration
+  surface (`CharDeviceOps`, `BlockDeviceOps`,
+  `BlockDevice`) plus a thin LBA-bounds dispatcher (2 EINVAL
+  short-circuits). Zero `pub fn step_*` fns; nothing to
+  migrate additively. Real producers of the StepOutcomes
+  flowing through these traits live in `tx-kernel/src/init.rs`,
+  the tty/vfs/signal test impls, `tx-shims/.../tests.rs`, and
+  `tx-fs/src/devfs/tests.rs`; consumers in
+  `tty/execution/step_{write,read,poll_hardware}.rs` and
+  `vfs/walker.rs`. Recommended W-device-replacement targets:
+  `tty/execution/step_write.rs` (3 step_fns, 36 refs, 189
+  lines) or `page_backed/lifecycle.rs` (3 step_fns, 37 refs,
+  226 lines). No code changes from W-device.
+  Plus orchestrator added an inherent `ByteProgress::EMPTY`
+  const next to the trait const (W-pipe's ergonomic finding —
+  trait-impl access required `<ByteProgress as StepProgress>::EMPTY`
+  fully-qualified or a `use StepProgress;` that conflicted with
+  the v4 import style); pipe's `yield_on_carrier` site
+  simplified to use the inherent form. Final count: **1265
+  passed, 0 failed, 4 ignored across 60 binaries** (wave-5
+  baseline 1254 + 7 pipe + 4 mount; W-device 0). `cargo xtask
+  lint arch | docs | progress validate` all green. **Real
+  signals** for wave-7 planning: (1) Trait-method migration is
+  structurally different from free-fn migration; need an
+  approach for FsOps/FsPageBacking. (2) The "StepOutcome refs"
+  inventory metric over-counts trait-decl files; combine with
+  `pub fn step_*` count to filter wave targets. (3) `step_write`
+  follow-up in pipe.rs is trivial. **Next:** wave 7 — pick
+  W-tty-step-write or W-page-backed-lifecycle as the next
+  cascade probe; consider the trait-migration approach for
+  FsOps separately.
+
 - 2026-05-09 PR-1 wave-5 (pre-fan-out) of the v3 TDD migration
   landed (two parallel TDD workers extending v3 ergonomics
   ahead of the multi-subsystem cascade fan-out). W-errno-mirror
