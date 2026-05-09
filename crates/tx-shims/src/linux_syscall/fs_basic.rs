@@ -259,18 +259,22 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             return SyscallResult::Error(EISDIR_VALUE);
         }
         if meta.size != 0 {
-            let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
+            // Wave 9g: O_TRUNC migrated to v3 FsPageBackingV3.
+            use tx_substrate::step_v3::StepOutcome as V3Trunc;
+            let fs_page_backing_v3 = match fs_page_backing_v3_for_dentry(&dentry) {
                 Some(b) => b,
                 None => return SyscallResult::Error(ENOSYS_VALUE),
             };
             let fs_object_id = dentry.rnode().fs_object_id();
             let guard = tx_substrate::epoch::guard();
-            match fs_page_backing.truncate(fs_object_id, 0, &guard) {
-                StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
-                StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            match fs_page_backing_v3.truncate(fs_object_id, 0, &guard) {
+                V3Trunc::Done(()) => {}
+                V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => {
                     return SyscallResult::Error(EIO_VALUE);
                 }
-                StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                V3Trunc::Err(errno) => {
+                    return SyscallResult::Error(errno_to_i32(Errno::from(errno)));
+                }
             }
         }
     }
@@ -1011,7 +1015,12 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     // TODO(phase-readdir-mount): teach `materialise_child_rnode` to
     // forward the mount weak so descendants don't hit the fallback.
     // Until then, every test fixture uses the mount-root directory.
-    let fs_ops = match fs_ops_for_rnode(file.rnode()) {
+    //
+    // Wave 9g-c: getdents64 readdir migrated from v4 FsOps to v3
+    // FsOpsV3. Tmpfs/devfs delegate `FsOpsV3::readdir` back to their v4
+    // impl internally — semantics preserved, outcome shape becomes the
+    // v3 four-variant algebra (`Done` / `Continue` / `Yield` / `Err`).
+    let fs_ops_v3 = match fs_ops_v3_for_rnode(file.rnode()) {
         Some(o) => o,
         None => return SyscallResult::Error(ENOSYS_VALUE),
     };
@@ -1019,14 +1028,14 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let mut cursor = file.readdir_cursor();
     let mut written: usize = 0;
 
+    use tx_substrate::step_v3::StepOutcome as V3;
     loop {
         let outcome = {
             let guard = tx_substrate::epoch::guard();
-            fs_ops.readdir(dir_fs_object_id, cursor, &guard)
+            fs_ops_v3.readdir(dir_fs_object_id, cursor, &guard)
         };
         match outcome {
-            StepOutcome::Done(Some((entry, next_cursor)))
-            | StepOutcome::Advanced(Some((entry, next_cursor))) => {
+            V3::Done(Some((entry, next_cursor))) => {
                 let name_bytes = entry.name.as_bytes();
                 let raw_len = LINUX_DIRENT64_HEADER_BYTES + name_bytes.len() + 1;
                 let total_len = align_up_8(raw_len);
@@ -1085,13 +1094,13 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
                 cursor = next_cursor;
                 file.set_readdir_cursor(cursor);
             }
-            StepOutcome::Done(None) | StepOutcome::Advanced(None) => {
+            V3::Done(None) => {
                 // End of directory — durable cursor advance is
                 // unnecessary (the readdir backend's cursor is
                 // self-terminating).
                 break;
             }
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            V3::Continue { .. } | V3::Yield { .. } => {
                 // No in-tree backend produces these. Surface as
                 // `-EIO` defensively if the partial-progress shape
                 // ever fires.
@@ -1100,11 +1109,11 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
                 }
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => {
+            V3::Err(errno) => {
                 if written > 0 {
                     return SyscallResult::Return(written as i64);
                 }
-                return SyscallResult::Error(errno_to_i32(errno));
+                return SyscallResult::Error(errno_to_i32(Errno::from(errno)));
             }
         }
     }
@@ -1112,24 +1121,36 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     SyscallResult::Return(written as i64)
 }
 
-/// Resolve the `Arc<dyn FsOps>` in scope for a directory rnode.
-/// Mirrors `fs_ops_for_dentry`'s shape but operates on the rnode
-/// directly (the OpenFile carries `Cap<RNode>`, not `Cap<DEntry>`).
+/// Resolve the `Arc<dyn FsOpsV3>` in scope for a directory rnode.
+/// Mirrors `fs_ops_v3_for_dentry`'s shape (in `fs_path.rs`) but
+/// operates on the rnode directly — the OpenFile carries `Cap<RNode>`,
+/// not `Cap<DEntry>`.
 ///
 /// Returns `None` if the rnode does not carry a `containing_mount`
 /// weak (descendant rnodes minted by `materialise_child_rnode` don't
 /// — only mount-root rnodes do). The Slice 6 `getdents64` arm
-/// surfaces this as `-ENOSYS` defensively (no FsOps to dispatch
+/// surfaces this as `-ENOSYS` defensively (no `FsOpsV3` to dispatch
 /// through). In practice every tested directory is the mount root,
 /// matching tmpfs's day-1 surface.
 ///
 /// TODO(phase-readdir-mount): forward the mount weak to descendants
 /// during `materialise_child_rnode` so this fallback is unnecessary.
-pub(super) fn fs_ops_for_rnode(
+///
+/// Wave 9g-c grew this helper to migrate `getdents64` from the v4
+/// `FsOps::readdir` to the v3 `FsOpsV3::readdir` trait method. Tmpfs
+/// and devfs delegate `FsOpsV3::readdir` back to their v4 impl
+/// internally — semantics preserved, outcome shape becomes the v3
+/// four-variant algebra. The wave-9g-c migration retired the rnode
+/// helper's only v4 caller (`getdents64`) so the v4 sibling
+/// `fs_ops_for_rnode` was dropped here to keep the no-warnings gate.
+/// The dentry twin (`fs_ops_for_dentry` in `fs_path.rs`) is still
+/// load-bearing for `fs_mut.rs`'s mutator family and its v4 form will
+/// be retired alongside the trait deletion in wave 9h.
+pub(super) fn fs_ops_v3_for_rnode(
     rnode: &Cap<tx_subsystems::vfs::structure::RNode>,
-) -> Option<Arc<dyn tx_subsystems::vfs::FsOps>> {
+) -> Option<Arc<dyn tx_subsystems::vfs::FsOpsV3>> {
     let guard = tx_substrate::epoch::guard();
     let weak = rnode.containing_mount_weak()?;
     let payload = weak.upgrade(&guard)?;
-    Some(payload.fs_ops.clone())
+    Some(payload.fs_ops_v3.clone())
 }

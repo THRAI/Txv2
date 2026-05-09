@@ -447,17 +447,22 @@ impl<P: TxPlatform> CoreInit<P> {
             .clone()
             .expect("mount_devfs_at_dev: ROOT_MOUNT must be populated");
 
-        // mkdir("/dev") on the rootfs. The rootfs's fs_ops is the
-        // tmpfs instance whose `FsOps::mkdir` actually mutates the
-        // tmpfs directory map.
+        // mkdir("/dev") on the rootfs. The rootfs's fs_ops_v3 is the
+        // tmpfs instance whose `FsOpsV3::mkdir` actually mutates the
+        // tmpfs directory map (the v3 impl delegates back to v4).
+        // Wave 9g-d: migrated from v4 FsOps to v3 FsOpsV3 — outcome
+        // shape collapsed from 5 to 4 variants. Boot-time tmpfs
+        // mkdir is synchronous, so Continue/Yield are unreachable
+        // and panic if they fire.
         let guard = tx_substrate::epoch::guard();
         // Bootstrap path runs as root by construction.
         let cred = Credential::root();
+        use tx_substrate::step_v3::StepOutcome as V3;
         let (dev_object_id, dev_meta) = match root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
             .into_cap()
-            .fs_ops
+            .fs_ops_v3
             .mkdir(
                 tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
                 b"dev",
@@ -465,7 +470,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 &cred,
                 &guard,
             ) {
-            StepOutcome::Done(out) => out,
+            V3::Done(out) => out,
             other => panic!("mount_devfs_at_dev: tmpfs mkdir(/dev) failed: {other:?}"),
         };
         drop(guard);

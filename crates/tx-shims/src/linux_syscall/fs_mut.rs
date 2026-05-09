@@ -84,9 +84,10 @@ pub(crate) fn create_then_walk<P: PmapIf>(
         }
     };
 
-    // Resolve the FsOps in scope at `parent_dentry`. Mirrors the
-    // existing `fs_ops_for_dentry` shape used by the file-mode arms.
-    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
+    // Wave 9g-b: resolve the v3 FsOpsV3 in scope at `parent_dentry`.
+    // Mirrors the existing `fs_ops_v3_for_dentry` shape used by the
+    // file-mode arms.
+    let fs_ops_v3 = match fs_ops_v3_for_dentry(&parent_dentry) {
         Some(ops) => ops,
         None => return Err(EROFS_VALUE),
     };
@@ -98,14 +99,16 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     let parent_fs_object_id = parent_dentry.rnode().fs_object_id();
     let new_mode = mode & 0o7777;
     {
+        use tx_substrate::step_v3::StepOutcome as V3;
         let guard = tx_substrate::epoch::guard();
-        let outcome = fs_ops.create_inode(parent_fs_object_id, basename, new_mode, cred, &guard);
+        let outcome =
+            fs_ops_v3.create_inode(parent_fs_object_id, basename, new_mode, cred, &guard);
         match outcome {
-            StepOutcome::Done(_) | StepOutcome::Advanced(_) => {}
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            V3::Done(_) => {}
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return Err(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return Err(errno_to_i32(errno)),
+            V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
         }
     }
 
@@ -124,25 +127,20 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     }
 }
 
-/// Resolve the `Arc<dyn FsPageBacking>` in scope for a dentry by
-/// ascending its parent-hint chain to find an rnode that carries
-/// `with_containing_mount`. Mirrors `fs_ops_for_dentry`'s shape but
-/// reads the mount payload's `fs_page_backing` field instead of
-/// `fs_ops`. Used by `sys_openat`'s O_TRUNC arm to call
-/// `FsPageBacking::truncate(0)` on the resolved file.
-///
-/// Returns `None` for orphan dentries (no parent-hint chain reaches
-/// a rnode with a mount weak); the `O_TRUNC` arm surfaces that as
-/// `-ENOSYS` (no backing → no truncate).
-pub(super) fn fs_page_backing_for_dentry(
+/// v3 sibling of the (now-deleted) `fs_page_backing_for_dentry`. Wave 9g-b: mirrors
+/// the parent-hint ascent shape but reads `payload.fs_page_backing_v3`
+/// instead of `payload.fs_page_backing` so callers can dispatch
+/// against the v3 trait surface (`FsPageBackingV3`) and consume v3's
+/// four-variant outcome algebra.
+pub(super) fn fs_page_backing_v3_for_dentry(
     dentry: &Cap<DEntry>,
-) -> Option<Arc<dyn tx_subsystems::page_backed::FsPageBacking>> {
+) -> Option<Arc<dyn tx_subsystems::page_backed::FsPageBackingV3>> {
     let guard = tx_substrate::epoch::guard();
     let mut cursor: Cap<DEntry> = dentry.clone();
     loop {
         if let Some(weak) = cursor.rnode().containing_mount_weak() {
             if let Some(payload) = weak.upgrade(&guard) {
-                return Some(payload.fs_page_backing.clone());
+                return Some(payload.fs_page_backing_v3.clone());
             }
         }
         let next = cursor.parent_hint().and_then(|w| w.upgrade(&guard))?;
@@ -194,7 +192,9 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         }
     };
     let parent_id = parent_dentry.rnode().fs_object_id();
-    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
+    // Wave 9g-b: mkdir migrated from v4 FsOps to v3 FsOpsV3.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let fs_ops_v3 = match fs_ops_v3_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
@@ -204,14 +204,12 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     let effective_mode = mode & !umask & 0o7777;
     let outcome = {
         let guard = tx_substrate::epoch::guard();
-        fs_ops.mkdir(parent_id, basename, effective_mode, &cred, &guard)
+        fs_ops_v3.mkdir(parent_id, basename, effective_mode, &cred, &guard)
     };
     match outcome {
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-            SyscallResult::Error(EIO_VALUE)
-        }
-        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        V3::Done(_) => SyscallResult::Return(0),
+        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
     }
 }
 
@@ -263,7 +261,9 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let parent_id = parent_dentry.rnode().fs_object_id();
     let target_id = target_dentry.rnode().fs_object_id();
     let target_kind = target_dentry.rnode().meta().kind();
-    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
+    // Wave 9g-b: rmdir/unlink migrated from v4 FsOps to v3 FsOpsV3.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let fs_ops_v3 = match fs_ops_v3_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
@@ -277,17 +277,15 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let outcome = {
         let guard = tx_substrate::epoch::guard();
         if want_rmdir {
-            fs_ops.rmdir(parent_id, basename, target_id, &guard)
+            fs_ops_v3.rmdir(parent_id, basename, target_id, &guard)
         } else {
-            fs_ops.unlink(parent_id, basename, target_id, &guard)
+            fs_ops_v3.unlink(parent_id, basename, target_id, &guard)
         }
     };
     match outcome {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-            SyscallResult::Error(EIO_VALUE)
-        }
-        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        V3::Done(()) => SyscallResult::Return(0),
+        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
     }
 }
 
@@ -337,20 +335,20 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         }
     };
     let parent_id = parent_dentry.rnode().fs_object_id();
-    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
+    // Wave 9g-b: symlink migrated from v4 FsOps to v3 FsOpsV3.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let fs_ops_v3 = match fs_ops_v3_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
     let outcome = {
         let guard = tx_substrate::epoch::guard();
-        fs_ops.symlink(parent_id, basename, &target, &cred, &guard)
+        fs_ops_v3.symlink(parent_id, basename, &target, &cred, &guard)
     };
     match outcome {
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-            SyscallResult::Error(EIO_VALUE)
-        }
-        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        V3::Done(_) => SyscallResult::Return(0),
+        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
     }
 }
 
@@ -416,20 +414,20 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         }
     };
     let new_parent_id = new_parent_dentry.rnode().fs_object_id();
-    let fs_ops = match fs_ops_for_dentry(&new_parent_dentry) {
+    // Wave 9g-b: link migrated from v4 FsOps to v3 FsOpsV3.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let fs_ops_v3 = match fs_ops_v3_for_dentry(&new_parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
     let outcome = {
         let guard = tx_substrate::epoch::guard();
-        fs_ops.link(new_parent_id, new_basename, source_id, &guard)
+        fs_ops_v3.link(new_parent_id, new_basename, source_id, &guard)
     };
     match outcome {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-            SyscallResult::Error(EIO_VALUE)
-        }
-        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        V3::Done(()) => SyscallResult::Return(0),
+        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
     }
 }
 
@@ -568,31 +566,34 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         }
     };
     let parent_id = parent_dentry.rnode().fs_object_id();
-    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
+    // Wave 9g-b: lookup/load_inode_meta/read_link migrated from v4
+    // FsOps to v3 FsOpsV3.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let fs_ops_v3 = match fs_ops_v3_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(ENOSYS_VALUE),
     };
-    // Resolve the basename in the parent directly via `FsOps::lookup`
+    // Resolve the basename in the parent directly via `FsOpsV3::lookup`
     // — bypasses the walker's symlink-chase loop so the symlink's
     // own inode (not its target's) is what we read.
     let target_id = {
         let guard = tx_substrate::epoch::guard();
-        match fs_ops.lookup(parent_id, basename, &guard) {
-            StepOutcome::Done(id) | StepOutcome::Advanced(id) => id,
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+        match fs_ops_v3.lookup(parent_id, basename, &guard) {
+            V3::Done(id) => id,
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
         }
     };
     let target_meta = {
         let guard = tx_substrate::epoch::guard();
-        match fs_ops.load_inode_meta(target_id, &guard) {
-            StepOutcome::Done(m) | StepOutcome::Advanced(m) => m,
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+        match fs_ops_v3.load_inode_meta(target_id, &guard) {
+            V3::Done(m) => m,
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
         }
     };
     if target_meta.kind() != InodeKind::Symlink {
@@ -600,12 +601,12 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     }
     let link_bytes = {
         let guard = tx_substrate::epoch::guard();
-        match fs_ops.read_link(target_id, &guard) {
-            StepOutcome::Done(b) | StepOutcome::Advanced(b) => b,
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+        match fs_ops_v3.read_link(target_id, &guard) {
+            V3::Done(b) => b,
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
         }
     };
     let to_copy = core::cmp::min(link_bytes.len(), buf_len);
@@ -713,13 +714,15 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     }
     let old_parent_id = old_parent_dentry.rnode().fs_object_id();
     let new_parent_id = new_parent_dentry.rnode().fs_object_id();
-    let fs_ops = match fs_ops_for_dentry(&old_parent_dentry) {
+    // Wave 9g-b: rename migrated from v4 FsOps to v3 FsOpsV3.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let fs_ops_v3 = match fs_ops_v3_for_dentry(&old_parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
     let outcome = {
         let guard = tx_substrate::epoch::guard();
-        fs_ops.rename(
+        fs_ops_v3.rename(
             old_parent_id,
             old_basename,
             new_parent_id,
@@ -728,10 +731,8 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         )
     };
     match outcome {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-            SyscallResult::Error(EIO_VALUE)
-        }
-        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        V3::Done(()) => SyscallResult::Return(0),
+        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
     }
 }

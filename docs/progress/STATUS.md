@@ -4,6 +4,61 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9g fan-out landed (5 parallel workers
+  across disjoint files completing the trait-method caller
+  migration begun in 9g-a). After this wave essentially every
+  production v4 FsOps / FsPageBacking trait-method caller is
+  on v3.
+  (a) **W-9g-b** migrated `crates/tx-shims/src/linux_syscall/fs_mut.rs`
+  — 10 v4 trait-method calls (create_inode / mkdir / rmdir /
+  unlink / symlink / link / lookup / load_inode_meta / read_link
+  / rename) across mkdirat / unlinkat / symlinkat / linkat /
+  readlinkat / renameat2 syscall arms. Added
+  `fs_page_backing_v3_for_dentry` sibling helper.
+  (b) **W-9g-c** migrated `crates/tx-shims/src/linux_syscall/fs_basic.rs`
+  — `fs_ops.readdir` (getdents64) + the `fs_ops_for_rnode` helper
+  (renamed/migrated to `fs_ops_v3_for_rnode`).
+  (c) **W-9g-d** migrated `crates/tx-kernel/src/init/exec.rs`
+  bin/sh + init exec image build paths (mkdir / create_inode /
+  materialise_rnode / truncate / flush_page) and a
+  `mount_devfs_at_dev` mkdir call in `crates/tx-kernel/src/init.rs`.
+  Tmpfs's v3 `materialise_rnode` impl delegates to v4 internally
+  so semantics preserved.
+  (d) **W-9g-e** migrated `crates/tx-subsystems/src/initramfs/mod.rs`
+  populate helpers — 4 helper signatures (`walk_or_create_dirs`,
+  `mkdir_idempotent`, `unpack_regular`, `unpack_symlink`) now take
+  `&Arc<dyn FsOpsV3>` / `&Arc<dyn FsPageBackingV3>`; 8 internal
+  trait-method call sites migrated; field reads switched from
+  `payload.fs_ops` / `fs_page_backing` to v3 fields.
+  (e) **W-9g-f** migrated `crates/tx-subsystems/src/page_backed/lifecycle.rs`
+  — Approach A: v4 `step_truncate` / `step_fsync` fn bodies
+  rewrote to consume `fs_page_backing_v3.truncate` /
+  `flush_page` / `fsync` internally with a v3→v4 outcome
+  conversion at the boundary so v4-shaped callers stay
+  unchanged. Adjusted wave-9d test mock's v3 flush_page from
+  `V3::Err(EAGAIN)` to `yield_on_carrier(NoProgress, 13, 0x55)`
+  so the converter recovers the original WaitToken (load-bearing
+  test pin).
+  Plus orchestrator integration: wired `fs_page_backing_v3_for_dentry`
+  to fs_basic.rs O_TRUNC arm (W-9g-b created the helper but
+  fs_basic.rs's owner W-9g-c didn't use it — peer race), then
+  deleted both unused v4 helpers `fs_ops_for_dentry` and
+  `fs_page_backing_for_dentry`. Final count: **1328 passed, 0
+  failed, 11 ignored across 60 binaries** — unchanged baseline,
+  no warnings. All gates green. **Remaining v4 callers** (per
+  grep): only `init.rs:380, 382` (the `mount_output.fs_ops.clone()`
+  / `fs_page_backing.clone()` args still passed to
+  `MountPayload::new_cap`'s v4 slots — the slots themselves
+  will be removed in 9h) and `lifecycle.rs:343, 374` (the v3
+  `step_fsync_v3` body still calls v4 `fs_page_backing.flush_page`
+  / `fsync` from wave 7's original shape; needs migration before
+  v4 trait deletion). **Wave 9h** is now the structural
+  retirement: drop the v4 args from `MountPayload::new_cap` /
+  `MountPayload` struct / `MountOutput` struct; migrate
+  `step_fsync_v3` / `step_truncate_v3` bodies to v3 trait;
+  delete the 10×2 = 20 v4 impl blocks; delete the v4 `FsOps` /
+  `FsPageBacking` trait declarations.
+
 - 2026-05-09 PR-1 wave-9g-a of the v3 TDD migration landed —
   first direct-trait-method caller migration (the pattern that
   the aborted-9g brief should have specified). After the abort,
