@@ -4,40 +4,66 @@
 
 ## Current Shape
 
-- 2026-05-09 PR-1 wave-9h-a ATTEMPTED-AND-REVERTED. Tried to
-  migrate `step_fsync_v3` / `step_truncate_v3` bodies from v4
-  trait to v3 trait AND drop v4 fields from
-  `MountPayload`/`MountOutput` in one push. Reached 0 build
-  errors but 86 test failures (1328 → 1189), all in
-  `page_backed::core_tests` / `cross_variant_tests` /
-  `lifecycle::v3_tests` / `lifecycle_tests`. Root cause: every
-  test fixture (RecordingFs, BlockingFs, LifecycleFs, MockFs,
-  TestFs, ExecveTestFs, ExecTestFs) impls **both** v4 FsOps/
-  FsPageBacking and v3 FsOpsV3/FsPageBackingV3, but the v3
-  impls are stubs that don't preserve fixture-specific
-  bookkeeping (`flushes` counter, `block_flush_after` config
-  field, `WaitToken { 13, 0x55 }` marker). When migration
-  rerouted all readers from v4 to v3 trait, the v3 stubs lost
-  the test-fixture state. Reverting via stash drop; baseline
-  preserved at **1328 / 0 / 11 / 60**. **Lessons:** wave 9h
-  cannot land as one mechanical push. The right path is
-  per-fixture: for each of the 7+ test fixtures, rewrite its
-  v3 impls to delegate to v4 (call `<Self as FsOps>::method`,
-  translate v4 outcome → v3 outcome). Wave 9a's TestFs/Tmpfs
-  pattern + wave 9h-a's LifecycleFs lifecycle.rs (in v3_tests
-  submodule) demonstrate the delegation shape. Once every
-  fixture's v3 impl delegates to v4 (or is rewritten with
-  full fixture-state awareness), `MountPayload::fs_ops` /
-  `fs_page_backing` field reads can be safely retired. **Wave
-  9h plan revised:** 9h-a-actual = port each test fixture's v3
-  impls to delegate to v4 (one fixture per sub-wave); 9h-b =
-  drop MountPayload/MountOutput v4 fields once fixtures are
-  v4-stable; 9h-c = delete v4 trait + impl blocks; 9h-d =
-  rename FsOpsV3→FsOps. The original 9g-f Approach A choice
-  (v3 fns calling v4 trait, with conversion at boundary) is
-  ALSO compatible with this revised plan — leaving v3 fns as
-  v4-callers means MountPayload's v4 fields are needed
-  forever. Pick a direction in the next user check-in.
+- 2026-05-09 PR-1 RE-DIAGNOSIS after wave-9h-a abort. Empirical
+  re-verification of the tree (`28274a7`, baseline 1328/0/11
+  preserved single-threaded; the parallel-test "65 failures"
+  earlier are state-ordering flakes, not real failures) shows
+  my prior wave-9h-a postmortem was partially wrong. Corrected
+  picture:
+  - **Walker is fully migrated.** `step_walk_v3`/`step_open_v3`
+    use `payload.fs_ops_v3` end-to-end. All walker fixtures
+    (TestFs, Tmpfs) have **real** delegating v3 impls
+    (`<Self as FsOps>::method` with v4→v3 outcome translation),
+    not stubs. Walker-based tests genuinely exercise v3.
+  - **`step_truncate` (v4 fn) routes through v3 trait already**
+    (wave 9g-f Approach B-flavored: `mount.payload().fs_page_backing_v3.truncate`
+    with v3→v4 outcome conversion at the boundary). Tests pass
+    because BlockingFs/RecordingFs's v3 `truncate` impls
+    return `Done(())` matching their v4 truncates.
+  - **`step_fsync_v3` (v3 fn) STILL calls v4 trait** at
+    `lifecycle.rs:343,374` — this is the genuine inconsistency
+    wave 9h-a tried to fix. Flipping it to v3 trait would
+    require BlockingFs's v3 `fetch_page`/`flush_page` to
+    yield-on-carrier with `WaitToken{9,0x44}`, not return
+    `EAGAIN` as today.
+  - **Stub v3 fixtures aren't a 7-fixture problem.** Stubs in
+    LifecycleFs/MockFs/RecordingFs/BlockingFs work today
+    because production fns calling v3 trait happen to hit only
+    methods where the stub matches v4 behavior (e.g., truncate
+    is `Done(())` in both). True rewriting is needed only when
+    we route a production fn through a stub-method that
+    differs from v4 — currently just BlockingFs's
+    fetch_page/flush_page (yield vs EAGAIN) and RecordingFs's
+    fetches counter.
+  - **Real remaining v4 footprint** (rg verified, 4 production
+    files + 3 test files):
+    * Production: `tx-kernel/src/init.rs`, `tx-kernel/src/init/exec.rs`,
+      `tx-subsystems/src/initramfs/mod.rs` (all use `fs_ops`/
+      `fs_page_backing` field reads + method calls);
+      `tx-subsystems/src/page_backed/lifecycle.rs` (only
+      step_fsync_v3 still calls v4 internally).
+    * Tests: `tx-fs/src/initramfs_tests.rs`, `tx-fs/src/tmpfs/tests.rs`,
+      `tx-kernel/src/init/tests.rs` (each holds onto v4 trait
+      objects from MountPayload).
+  - **Decision point for the user.** Two coherent end-states:
+    * **Approach A as final:** Accept v4 trait declarations
+      and `MountPayload::fs_ops`/`fs_page_backing` fields as
+      permanent. v3 trait is the new outer API. Done — no more
+      waves. Cost: dual-trait bloat forever; bench/dispatch
+      cost is one extra Arc clone in MountPayload.
+    * **Full retirement:** Migrate the 4+3 remaining files
+      from v4 to v3, fix BlockingFs/RecordingFs v3 stubs to
+      match their v4 bookkeeping, flip step_fsync_v3 to v3
+      trait, then drop v4 fields/trait. Cost: ~4-6 sub-waves;
+      genuine architectural simplification at the end.
+    Recommend: **Approach A as final** unless the user
+    specifically values the dual-trait cleanup. Reason: the
+    cosmetic-vs-real test was the v3-walker migration (where
+    test count for v3-specific behaviors should have moved if
+    we'd added them; it didn't because the cutover was
+    semantically a translation, not a behavior change). Doing
+    more of the same buys nothing the user hasn't already paid
+    for.
 
 - 2026-05-09 PR-1 wave-9g fan-out landed (5 parallel workers
   across disjoint files completing the trait-method caller
