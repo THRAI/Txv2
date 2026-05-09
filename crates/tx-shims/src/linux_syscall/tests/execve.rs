@@ -656,3 +656,495 @@ fn dispatch_execve_success_returns_exec_committed() {
         "initial sp must be 16-byte aligned"
     );
 }
+
+// === Wave-9b: `FsOpsV3` + `FsPageBackingV3` impls on `ExecveTestFs`. ===
+//
+// Sibling to the v4 impls above. Per
+// `docs/progress/decisions/2026-05-09-fsops-v3-design.md`, every method
+// delegates to the v4 body and translates outcomes one-for-one. The v4
+// body's `fetch_page` routes through `materialize_page`, which can in
+// principle surface `Advanced` / `AdvancedThenBlocked` / `Blocked` for
+// the in-memory anon backing, so the v3 mapping collapses progress to
+// `Done` and the carrier-yielding `Blocked` arm to `EAGAIN`. All other
+// methods are synchronous in the v4 body and the mapping is trivial.
+// Tests at the bottom pin the v3 outcome shape end-to-end.
+
+impl tx_subsystems::vfs::FsOpsV3 for ExecveTestFs {
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
+        match <Self as FsOps>::lookup(self, parent, name, guard) {
+            StepOutcome::Done(id) | StepOutcome::Advanced(id) => {
+                tx_substrate::step_v3::StepOutcome::done(id)
+            }
+            StepOutcome::AdvancedThenBlocked(id, _) => tx_substrate::step_v3::StepOutcome::done(id),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn load_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
+        match <Self as FsOps>::load_inode_meta(self, fs_object_id, guard) {
+            StepOutcome::Done(m) | StepOutcome::Advanced(m) => {
+                tx_substrate::step_v3::StepOutcome::done(m)
+            }
+            StepOutcome::AdvancedThenBlocked(m, _) => tx_substrate::step_v3::StepOutcome::done(m),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: &InodeMeta,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        match <Self as FsOps>::serialize_inode_meta(self, fs_object_id, meta, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                tx_substrate::step_v3::StepOutcome::done(())
+            }
+            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn create_inode(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        (FsObjectId, InodeMeta),
+        tx_substrate::step_v3::NoProgress,
+    > {
+        match <Self as FsOps>::create_inode(self, parent, name, mode, cred, guard) {
+            StepOutcome::Done(out) | StepOutcome::Advanced(out) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::AdvancedThenBlocked(out, _) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn unlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        match <Self as FsOps>::unlink(self, parent, name, target, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                tx_substrate::step_v3::StepOutcome::done(())
+            }
+            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn rename(
+        &self,
+        old_parent: FsObjectId,
+        old_name: &[u8],
+        new_parent: FsObjectId,
+        new_name: &[u8],
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        match <Self as FsOps>::rename(self, old_parent, old_name, new_parent, new_name, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                tx_substrate::step_v3::StepOutcome::done(())
+            }
+            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn link(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        match <Self as FsOps>::link(self, parent, name, target, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                tx_substrate::step_v3::StepOutcome::done(())
+            }
+            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn mkdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        (FsObjectId, InodeMeta),
+        tx_substrate::step_v3::NoProgress,
+    > {
+        match <Self as FsOps>::mkdir(self, parent, name, mode, cred, guard) {
+            StepOutcome::Done(out) | StepOutcome::Advanced(out) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::AdvancedThenBlocked(out, _) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn rmdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        match <Self as FsOps>::rmdir(self, parent, name, target, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                tx_substrate::step_v3::StepOutcome::done(())
+            }
+            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn symlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        link_target: &[u8],
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        (FsObjectId, InodeMeta),
+        tx_substrate::step_v3::NoProgress,
+    > {
+        match <Self as FsOps>::symlink(self, parent, name, link_target, cred, guard) {
+            StepOutcome::Done(out) | StepOutcome::Advanced(out) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::AdvancedThenBlocked(out, _) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn readdir(
+        &self,
+        fs_object_id: FsObjectId,
+        cursor: DirCursor,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        Option<(DirEntry, DirCursor)>,
+        tx_substrate::step_v3::NoProgress,
+    > {
+        match <Self as FsOps>::readdir(self, fs_object_id, cursor, guard) {
+            StepOutcome::Done(out) | StepOutcome::Advanced(out) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::AdvancedThenBlocked(out, _) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn destroy_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        match <Self as FsOps>::destroy_inode(self, fs_object_id, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                tx_substrate::step_v3::StepOutcome::done(())
+            }
+            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn read_link(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<Box<[u8]>, tx_substrate::step_v3::NoProgress> {
+        match <Self as FsOps>::read_link(self, fs_object_id, guard) {
+            StepOutcome::Done(out) | StepOutcome::Advanced(out) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::AdvancedThenBlocked(out, _) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<Cap<RNode>, tx_substrate::step_v3::NoProgress> {
+        match <Self as FsOps>::materialise_rnode(self, fs_object_id, meta, guard) {
+            StepOutcome::Done(out) | StepOutcome::Advanced(out) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::AdvancedThenBlocked(out, _) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+}
+
+impl tx_subsystems::page_backed::FsPageBackingV3 for ExecveTestFs {
+    fn fetch_page(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+        match <Self as FsPageBacking>::fetch_page(self, fs_object_id, offset, guard) {
+            StepOutcome::Done(frame) | StepOutcome::Advanced(frame) => {
+                tx_substrate::step_v3::StepOutcome::done(frame)
+            }
+            StepOutcome::AdvancedThenBlocked(frame, _) => {
+                tx_substrate::step_v3::StepOutcome::done(frame)
+            }
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn flush_page(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        frame: &Frame,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        match <Self as FsPageBacking>::flush_page(self, fs_object_id, offset, frame, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                tx_substrate::step_v3::StepOutcome::done(())
+            }
+            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn truncate(
+        &self,
+        fs_object_id: FsObjectId,
+        new_size: u64,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        match <Self as FsPageBacking>::truncate(self, fs_object_id, new_size, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                tx_substrate::step_v3::StepOutcome::done(())
+            }
+            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn fsync(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        match <Self as FsPageBacking>::fsync(self, fs_object_id, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                tx_substrate::step_v3::StepOutcome::done(())
+            }
+            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+}
+
+// === tests pinning the v3 outcome shape end-to-end through ExecveTestFs ===
+
+#[test]
+fn execve_testfs_v3_lookup_round_trips_after_add_regular() {
+    use tx_subsystems::vfs::FsOpsV3;
+    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+
+    let _setup = execve_setup();
+
+    let bytes = minimal_elf_bytes();
+    let root_id = FsObjectId::new(2);
+    let fs = ExecveTestFs::new(root_id);
+    let file_id = fs.add_regular_with_bytes(root_id, b"init", &bytes);
+
+    let guard = tx_substrate::epoch::guard();
+    assert_eq!(
+        <ExecveTestFs as FsOpsV3>::lookup(&*fs, root_id, b"init", &guard),
+        V3::<_, NoProgress>::done(file_id)
+    );
+    assert_eq!(
+        <ExecveTestFs as FsOpsV3>::lookup(&*fs, root_id, b"missing", &guard),
+        V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
+    );
+}
+
+#[test]
+fn execve_testfs_v3_load_inode_meta_returns_directory_for_root() {
+    use tx_subsystems::vfs::FsOpsV3;
+    use tx_substrate::step_v3::StepOutcome as V3;
+
+    let _setup = execve_setup();
+
+    let root_id = FsObjectId::new(2);
+    let fs = ExecveTestFs::new(root_id);
+
+    let guard = tx_substrate::epoch::guard();
+    let meta = match <ExecveTestFs as FsOpsV3>::load_inode_meta(&*fs, root_id, &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("load_inode_meta v3: {other:?}"),
+    };
+    assert_eq!(meta.kind(), InodeKind::Directory);
+}
+
+#[test]
+fn execve_testfs_v3_read_link_returns_einval_for_regular() {
+    use tx_subsystems::vfs::FsOpsV3;
+    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+
+    let _setup = execve_setup();
+
+    let bytes = vec![0u8; 16];
+    let root_id = FsObjectId::new(2);
+    let fs = ExecveTestFs::new(root_id);
+    let file_id = fs.add_regular_with_bytes(root_id, b"f", &bytes);
+
+    let guard = tx_substrate::epoch::guard();
+    assert_eq!(
+        <ExecveTestFs as FsOpsV3>::read_link(&*fs, file_id, &guard),
+        V3::<Box<[u8]>, NoProgress>::err(V3Errno::EINVAL)
+    );
+}
+
+#[test]
+fn execve_testfs_v3_create_inode_returns_enosys() {
+    use tx_subsystems::vfs::FsOpsV3;
+    use tx_subsystems::vfs::structure::InodeMeta;
+    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+
+    let _setup = execve_setup();
+
+    let root_id = FsObjectId::new(2);
+    let fs = ExecveTestFs::new(root_id);
+
+    let guard = tx_substrate::epoch::guard();
+    let cred = Credential::root();
+    assert_eq!(
+        <ExecveTestFs as FsOpsV3>::create_inode(
+            &*fs,
+            root_id,
+            b"new",
+            0o644,
+            &cred,
+            &guard,
+        ),
+        V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::ENOSYS)
+    );
+}
+
+#[test]
+fn execve_testfs_v3_fetch_page_returns_frame_for_regular() {
+    use tx_subsystems::page_backed::FsPageBackingV3;
+    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+
+    let _setup = execve_setup();
+    ensure_zero_frame_claimed();
+
+    let bytes = vec![0xABu8; 64];
+    let root_id = FsObjectId::new(2);
+    let fs = ExecveTestFs::new(root_id);
+    let file_id = fs.add_regular_with_bytes(root_id, b"f", &bytes);
+
+    let guard = tx_substrate::epoch::guard();
+    match <ExecveTestFs as FsPageBackingV3>::fetch_page(&*fs, file_id, 0, &guard) {
+        V3::Done(_frame) => {}
+        other => panic!("fetch_page v3: {other:?}"),
+    }
+    // Misaligned offset → EINVAL via the v4 body.
+    assert_eq!(
+        <ExecveTestFs as FsPageBackingV3>::fetch_page(&*fs, file_id, 7, &guard),
+        V3::<Frame, NoProgress>::err(V3Errno::EINVAL)
+    );
+    // Truncate / fsync / flush_page are synchronous Done(()) in the v4 body.
+    assert_eq!(
+        <ExecveTestFs as FsPageBackingV3>::fsync(&*fs, file_id, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+}

@@ -508,6 +508,12 @@ impl FsPageBacking for ExecTestFs {
     }
 }
 
+// Wave-9b `FsOpsV3` + `FsPageBackingV3` impls + tests on `ExecTestFs` live
+// in the sibling `v3` submodule (file: `script/tests/v3.rs`) so this
+// file stays under the `cargo xtask lint arch` 1500-line authored-file
+// cap. The submodule has full visibility into `ExecTestFs` via `super::`.
+mod v3;
+
 // ---------------------------------------------------------------------------
 // ELF fixture builder. Produces a minimal RV64 ET_EXEC binary the
 // parser accepts. Mirrors `loader/tests.rs`'s shape but inline-includes

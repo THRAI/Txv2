@@ -302,6 +302,91 @@ fn devfs_lookup_unknown_returns_enoent() {
     );
 }
 
+// === Wave 9b: parallel v3 trait shape tests =============================
+//
+// Pin the `FsOpsV3` / `FsPageBackingV3` outcome shape on `Devfs` so a
+// regression in the v3 mapping surfaces locally rather than at the
+// walker call site once wave 9b's walker entry points land. Tests
+// exercise the most representative methods: `lookup` (positive +
+// negative), `load_inode_meta` (root directory), and `fetch_page`
+// (devfs's distinctive `ENOSYS` rejection — char-device I/O does not
+// flow through the page cache).
+
+#[test]
+fn devfs_v3_lookup_console_returns_done_with_object_id() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+
+    let _ops = install_capturing_console();
+
+    use tx_subsystems::vfs::FsOpsV3;
+    use tx_substrate::step_v3::StepOutcome as V3;
+
+    let devfs = Devfs::new();
+    let guard = tx_substrate::epoch::guard();
+
+    // Positive lookup: console alias is registered → `Done(id)` with a
+    // non-root id.
+    let id = match <Devfs as FsOpsV3>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"console", &guard) {
+        V3::Done(id) => id,
+        other => panic!("v3 lookup(console): {other:?}"),
+    };
+    assert_ne!(id, DEVFS_ROOT_OBJECT_ID);
+
+    // Negative lookup: missing alias → ENOENT through the v3 errno
+    // bridge.
+    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress};
+    assert_eq!(
+        <Devfs as FsOpsV3>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"nope-v3", &guard),
+        V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
+    );
+}
+
+#[test]
+fn devfs_v3_load_inode_meta_root_returns_directory_meta() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+
+    use tx_subsystems::vfs::{FsOpsV3, InodeKind};
+    use tx_substrate::step_v3::StepOutcome as V3;
+
+    let devfs = Devfs::new();
+    let guard = tx_substrate::epoch::guard();
+
+    let meta = match <Devfs as FsOpsV3>::load_inode_meta(&devfs, DEVFS_ROOT_OBJECT_ID, &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("v3 load_inode_meta(root): {other:?}"),
+    };
+    assert_eq!(meta.kind(), InodeKind::Directory);
+}
+
+#[test]
+fn devfs_v3_fetch_page_returns_enosys() {
+    // devfs is char-device-only — page-cache traffic does not flow
+    // through it. The v3 mapping must surface the v4 `ENOSYS` through
+    // the errno bridge unchanged. (Distinct from tmpfs, whose
+    // `fetch_page` returns `Done(Frame)` for regular files.)
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+
+    use tx_subsystems::page_backed::{Frame, FsPageBackingV3};
+    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+
+    let devfs = Devfs::new();
+    let guard = tx_substrate::epoch::guard();
+
+    assert_eq!(
+        <Devfs as FsPageBackingV3>::fetch_page(&devfs, DEVFS_ROOT_OBJECT_ID, 0, &guard),
+        V3::<Frame, NoProgress>::err(V3Errno::ENOSYS)
+    );
+}
+
 #[test]
 fn devfs_readdir_yields_registered_aliases_and_terminates() {
     let _serial = crate::test_support::FS_TEST_LOCK

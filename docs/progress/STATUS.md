@@ -4,6 +4,70 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9b of the v3 TDD migration landed — five
+  parallel workers fanned `FsOpsV3` + `FsPageBackingV3` impls
+  out to the remaining 5 backends. Trait-level migration is now
+  COMPLETE at the impl tier — all 8 FsOps impls have v3
+  siblings, all FsPageBacking impls have v3 siblings; walker
+  call-sites still consume v4 (wave 9c). Each worker did a
+  mechanical 1:1 port from the wave-9a Tmpfs/TestFs canonical
+  pattern: every v4 `Done(t)|Advanced(t)|AdvancedThenBlocked(t,_)`
+  body collapses to v3 `done(t)`, every `Blocked` to
+  `err(EAGAIN)`, every `Err(e)` through the `From<execution::Errno>`
+  bridge. Per-backend:
+  (a) **W-devfs** added `impl FsOpsV3 for Devfs` and
+  `impl FsPageBackingV3 for Devfs` in `crates/tx-fs/src/devfs.rs`
+  + factory methods (Devfs has no state, so factories use
+  `Arc::new(Self)` directly rather than `self: Arc<Self>`).
+  3 inline tests. devfs returns EROFS for mutators / ENOSYS
+  for page ops — all flow through the bridge unchanged.
+  (b) **W-ext4** added impls in
+  `crates/tx-ext4/src/{namespace.rs,pager.rs}` + a new
+  `tests_v3.rs` mod. 7 inline tests covering lookup,
+  load_inode_meta, mutation-ENOSYS, readdir, fetch_page,
+  truncate/fsync, factory arcs. **Despite the design doc
+  flagging ext4 as the most likely place to surface real
+  `Advanced(t)` returns, the current read-only ext4 v4 surface
+  has zero such sites** — every method body ends in
+  `Done(t)`/`Err(e)`. The defensive `Advanced(t) → done(t)`
+  translation will surface meaningfully only when a journaling
+  /async revision lands. Factory arcs are `#[cfg(test)]`-gated
+  for now since `Ext4FsInstance` is `pub(crate)` and there is
+  no production caller until wave 9c grows
+  `MountOutput::fs_*_v3` fields.
+  (c) **W-devpts** added impls in
+  `crates/tx-subsystems/src/tty/project.rs` + new
+  `tty/tests/project_v3.rs` mod. 6 inline tests. Devpts is a
+  PTY-side projection — page-backing methods all return
+  ENOSYS; trait defaults handle read_link / chmod / chown.
+  (d) **W-exectestfs** added impls in a new
+  `crates/tx-scripts/src/process/exec/script/tests/v3.rs`
+  sub-mod (mirroring the wave-9a TestFs sub-mod pattern). 5
+  inline tests. Test fixture; one extra method override
+  (`materialise_rnode`) over canonical TestFs.
+  (e) **W-execvetestfs** added impls in
+  `crates/tx-shims/src/linux_syscall/tests/execve.rs` (single
+  file already-test-shaped). 5 inline tests. ExecveTestFs's
+  `materialise_rnode` overrides v4 with real EISDIR/ENOENT/
+  ENOMEM mapping; ported to v3 verbatim.
+  Five-way concurrent edits across 5 separate crates landed
+  without merge conflicts. Final count: **1326 passed, 0
+  failed, 4 ignored across 60 binaries** under the canonical
+  `--test-threads=1` lane (wave-9a baseline 1300 + 3+7+6+5+5).
+  Two workers reported flakes under default-parallelism workspace
+  test (`page_backed::lifecycle_tests::fsopsv3_*` from
+  wave-9a) — these are pre-existing global-zone-state races
+  that pass under `--test-threads=1`; not regressions.
+  `cargo xtask lint arch | docs | progress validate` all green
+  on the canonical lane. **Wave 9c unblocked:** walker call
+  sites (`vfs::walker::step_walk`, `step_open`,
+  `vfs::execution::OpenFile::step_read`/`step_write`, etc.)
+  can now opt into the v3 trait surfaces. MountOutput grows
+  sibling `fs_ops_v3` / `fs_page_backing_v3` `Arc<dyn _>`
+  fields; backends wire them via the factory methods landed
+  in 9a/9b. After 9c the v3 path is genuinely exercised
+  end-to-end through one walker entry.
+
 - 2026-05-09 PR-1 wave-9a of the v3 TDD migration landed — single
   deep worker covering `FsPageBackingV3` design + first impls of
   both v3 traits on `Tmpfs` (smallest production fs) and
