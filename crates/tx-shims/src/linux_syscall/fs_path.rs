@@ -166,23 +166,7 @@ pub(super) fn fs_change_errno_magnitude(errno: Errno) -> i32 {
 /// Returns `None` for orphan dentries (no parent-hint chain reaches
 /// a rnode with a mount weak); the file-mode arms surface that as
 /// `-EROFS` defensively (no FS to act through).
-pub(super) fn fs_ops_for_dentry(
-    dentry: &Cap<DEntry>,
-) -> Option<Arc<dyn tx_subsystems::vfs::FsOps>> {
-    let guard = tx_substrate::epoch::guard();
-    let mut cursor: Cap<DEntry> = dentry.clone();
-    loop {
-        if let Some(weak) = cursor.rnode().containing_mount_weak() {
-            if let Some(payload) = weak.upgrade(&guard) {
-                return Some(payload.fs_ops.clone());
-            }
-        }
-        let next = cursor.parent_hint().and_then(|w| w.upgrade(&guard))?;
-        cursor = next;
-    }
-}
-
-/// v3 sibling of [`fs_ops_for_dentry`]. Wave 9g-a: the chmod/chown
+/// v3 sibling of the (now-deleted) `fs_ops_for_dentry`. Wave 9g-a: the chmod/chown
 /// arms switched to call the v3 trait surface
 /// (`FsOpsV3::step_chmod` / `step_chown`) which Tmpfs delegates back
 /// to its v4 impl internally — semantics preserved, outcome shape

@@ -50,22 +50,43 @@ pub fn step_truncate(pc: &PageContainer, new_size: u64, guard: &Guard<'_>) -> St
         return StepOutcome::Err(Errno::EINVAL);
     }
 
+    // Wave 9g-f: migrated to consume the v3 `FsPageBackingV3` trait.
+    // The v4 fn signature is preserved so the many existing callers
+    // (tx-shims syscalls, tx-fs/tmpfs, vm/execution, tests across the
+    // workspace) keep their v4 outcome shape until later waves migrate
+    // them. The 4-variant v3 algebra maps back to v4 as:
+    //
+    //   v3 Done(())                    -> v4 Done(())
+    //   v3 Continue { NoProgress }     -> v4 Advanced(())
+    //   v3 Yield { OnCarrier { c, i } }-> v4 Blocked(WaitToken::new(c.raw(), i.raw()))
+    //   v3 Yield { OnAgent { .. } }    -> v4 Err(EIO)  (no v4 representation)
+    //   v3 Err(v3errno)                -> v4 Err(Errno::from(v3errno))
+    use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
+
     let fs_advanced = match pc.kind() {
         PageContainerKind::File {
             mount,
             fs_object_id,
         } => match mount
             .payload()
-            .fs_page_backing
+            .fs_page_backing_v3
             .truncate(*fs_object_id, new_size, guard)
         {
-            StepOutcome::Done(()) => false,
-            StepOutcome::Advanced(()) => true,
-            StepOutcome::Blocked(token) => return StepOutcome::Blocked(token),
-            StepOutcome::AdvancedThenBlocked((), token) => {
-                return StepOutcome::AdvancedThenBlocked((), token);
+            V3::Done(()) => false,
+            V3::Continue { progress: _ } => true,
+            V3::Yield {
+                progress: _,
+                shape: YieldShape::OnCarrier { carrier, interests },
+            } => {
+                return StepOutcome::Blocked(crate::execution::WaitToken::new(
+                    carrier.raw(),
+                    interests.raw(),
+                ));
             }
-            StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+            V3::Yield { shape: YieldShape::OnAgent { .. }, .. } => {
+                return StepOutcome::Err(Errno::EIO);
+            }
+            V3::Err(errno) => return StepOutcome::Err(Errno::from(errno)),
         },
         PageContainerKind::Anon { .. } => false,
         PageContainerKind::Device { .. } => unreachable!(),
@@ -115,6 +136,12 @@ fn zero_partial_eof_tail(pc: &PageContainer, new_size: u64) {
 }
 
 pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<()> {
+    // Wave 9g-f: migrated to consume the v3 `FsPageBackingV3` trait.
+    // See `step_truncate` for the v3->v4 outcome conversion table; the
+    // v3 `Continue { NoProgress }` cases here map to the v4 "Advanced
+    // (loop iter counted as progress)" path by toggling `progressed`.
+    use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
+
     let PageContainerKind::File {
         mount,
         fs_object_id,
@@ -128,34 +155,54 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<()> {
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
             return StepOutcome::Err(Errno::EINVAL);
         };
-        match mount.payload().fs_page_backing.flush_page(
+        match mount.payload().fs_page_backing_v3.flush_page(
             *fs_object_id,
             offset,
             &Frame::new(ppn),
             guard,
         ) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+            V3::Done(()) | V3::Continue { progress: _ } => {
                 pc.clear_dirty_if_match(page, ppn);
                 progressed = true;
             }
-            StepOutcome::Blocked(token) => {
+            V3::Yield {
+                progress: _,
+                shape: YieldShape::OnCarrier { carrier, interests },
+            } => {
+                let token = crate::execution::WaitToken::new(carrier.raw(), interests.raw());
                 return if progressed {
                     StepOutcome::AdvancedThenBlocked((), token)
                 } else {
                     StepOutcome::Blocked(token)
                 };
             }
-            StepOutcome::AdvancedThenBlocked((), token) => {
-                pc.clear_dirty_if_match(page, ppn);
-                return StepOutcome::AdvancedThenBlocked((), token);
+            V3::Yield { shape: YieldShape::OnAgent { .. }, .. } => {
+                return StepOutcome::Err(Errno::EIO);
             }
-            StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+            V3::Err(errno) => return StepOutcome::Err(Errno::from(errno)),
         }
     }
 
-    match mount.payload().fs_page_backing.fsync(*fs_object_id, guard) {
-        StepOutcome::Blocked(token) if progressed => StepOutcome::AdvancedThenBlocked((), token),
-        other => other,
+    match mount.payload().fs_page_backing_v3.fsync(*fs_object_id, guard) {
+        // Even with prior page-loop progress, the v4 contract for "loop
+        // progress + fsync clean" is a single `Done(())`, not
+        // `Advanced` — match the original v4 body's `other => other`
+        // passthrough behavior.
+        V3::Done(()) => StepOutcome::Done(()),
+        V3::Continue { progress: _ } => StepOutcome::Advanced(()),
+        V3::Yield {
+            progress: _,
+            shape: YieldShape::OnCarrier { carrier, interests },
+        } => {
+            let token = crate::execution::WaitToken::new(carrier.raw(), interests.raw());
+            if progressed {
+                StepOutcome::AdvancedThenBlocked((), token)
+            } else {
+                StepOutcome::Blocked(token)
+            }
+        }
+        V3::Yield { shape: YieldShape::OnAgent { .. }, .. } => StepOutcome::Err(Errno::EIO),
+        V3::Err(errno) => StepOutcome::Err(Errno::from(errno)),
     }
 }
 

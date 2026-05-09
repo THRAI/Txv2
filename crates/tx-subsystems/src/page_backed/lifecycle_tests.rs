@@ -878,7 +878,13 @@ impl crate::page_backed::FsPageBackingV3 for LifecycleFs {
             .store(fs_object_id.as_u64(), Ordering::Release);
         self.last_offset.store(offset, Ordering::Release);
         if self.block_flush_after == Some(flush) {
-            V3Outcome::err(V3Errno::EAGAIN)
+            // Wave 9g-f: surface the wait carrier/interest pair so the
+            // v4 `step_fsync` body (which now consumes
+            // `FsPageBackingV3`) can map this back to v4 `Blocked` /
+            // `AdvancedThenBlocked` with the original `WaitToken`
+            // values the v4 fixture assertions check against. Replaces
+            // the wave-9d placeholder collapse to `Err(EAGAIN)`.
+            V3Outcome::yield_on_carrier(NoProgress, 13, 0x55)
         } else {
             V3Outcome::done(())
         }
