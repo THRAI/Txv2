@@ -4,6 +4,48 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9f of the v3 TDD migration landed — **v4
+  walker retired.** Single deep worker. Three deliverables:
+  (1) Migrated all 18 `step_walk` / `step_open` tests in
+  `crates/tx-subsystems/src/vfs/walker/tests.rs` to call the v3
+  siblings. The migration was fully mechanical: every
+  `Done|Advanced` collapsed to v3 `Done`, `Blocked|AdvancedThenBlocked`
+  arms were dead in production walker paths and dropped, errno
+  patterns swapped to `step_v3::Errno`. One non-mechanical
+  wrinkle: 5 tests using `assert_eq!(outcome, StepOutcome::Err(Errno::X))`
+  rewritten to a `match` because v3 `StepOutcome` doesn't impl
+  `PartialEq` for the full shape with `YieldShape`.
+  (2) **Deleted v4 walker fns** from `crates/tx-subsystems/src/vfs/walker.rs`:
+  `pub async fn step_walk`, `pub async fn step_open`,
+  `fn walk_inner`, `fn materialise_child_rnode`, `fn fs_ops_for`.
+  walker.rs shrank from 916 → 569 lines (-347). Module-level
+  rustdoc rewritten to point at v3 entry points only;
+  `vfs/mod.rs` `pub use` reduced to `step_open_v3 /
+  step_walk_v3 / SYMLOOP_MAX`.
+  (3) BONUS — worker discovered one additional v4 caller outside
+  the test suite that wave 9e missed:
+  `crates/tx-scripts/src/process/exec/script.rs::exec_script`
+  (the exec image walker call). Migrated to `step_open_v3` with
+  `Errno::from(v3_errno)` bridging back to the existing
+  `ExecError::from_walker_errno` mapping. tx-scripts' exec test
+  fixture also updated.
+  Worker tried un-`#[ignore]`'ing the 7 v3_walker.rs tests after
+  retirement; the cascade flake still positionally shifts (1
+  fail per pass; failing test is whichever sibling currently
+  holds the cascade-position). Restored ignores. **The cascade
+  flake is zone-level, not walker-level — wave-9f cannot move
+  it.** Final count: **1328 passed, 0 failed, 11 ignored across
+  60 binaries** — exactly matches wave-9e baseline. All gates
+  green. **Wave 9g unblocked:** retire v4 `FsOps` /
+  `FsPageBacking` traits. Concrete steps: walk
+  `MountPayload::new_cap` callers; the v4 `fs_ops` / `page_backing`
+  parameters can be dropped if no remaining production caller
+  reads them (the walker no longer does, post-9f). Then each
+  FS impl crate (tmpfs, devfs, tx-fs, tx-ext4) deletes its
+  `impl FsOps` / `impl FsPageBacking` blocks; the V3 impls are
+  renamed (drop the `_v3` / `V3` suffix); the trait files
+  themselves go last.
+
 - 2026-05-09 PR-1 wave-9e of the v3 TDD migration landed — last
   two non-test-suite v4 walker callers migrated. Two sites:
   (1) `crates/tx-fs/src/devfs.rs::open_console_for_init` — the

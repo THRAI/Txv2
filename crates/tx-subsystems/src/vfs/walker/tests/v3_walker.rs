@@ -251,7 +251,7 @@ fn step_walk_v3_chases_relative_symlink() {
 }
 
 #[test]
-#[ignore = "main-side zone-slot cascade flake (same root cause as v4 walker tests; passes in isolation)"]
+#[ignore = "main-side zone-slot cascade flake; passes in isolation"]
 fn step_open_v3_round_trips_to_directory() {
     use tx_substrate::step_v3::StepOutcome as V3;
 

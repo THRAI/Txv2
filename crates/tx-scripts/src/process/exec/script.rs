@@ -54,7 +54,7 @@ use tx_subsystems::process::{
 };
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vfs::structure::{Credential, InodeMeta, OpenFileFlags, RNodeBacking};
-use tx_subsystems::vfs::walker::step_open;
+use tx_subsystems::vfs::walker::step_open_v3;
 use tx_subsystems::vm::scripts::{
     self as vm_scripts, BssTail as VmBssTail, ImagePlan as VmImagePlan,
     LoadSegment as VmLoadSegment, SegmentFlags as VmSegmentFlags, USER_STACK_TOP_DEFAULT,
@@ -252,9 +252,10 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // canonical `take a fresh guard inside an await_*` shape per
     // `vm::execution::fault_script`.
     let openfile = {
+        use tx_substrate::step_v3::StepOutcome as V3;
         let guard = tx_substrate::epoch::guard();
         let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
-        let outcome = poll_walker_synchronously(step_open(
+        let outcome = poll_walker_synchronously(step_open_v3(
             rooted_at,
             path,
             OpenFileFlags {
@@ -269,11 +270,9 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
             &guard,
         ));
         let result = match outcome {
-            StepOutcome::Done(file) | StepOutcome::Advanced(file) => Ok(file),
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-                Err(ExecError::Busy)
-            }
-            StepOutcome::Err(err) => Err(ExecError::from_walker_errno(err)),
+            V3::Done(file) => Ok(file),
+            V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
+            V3::Err(err) => Err(ExecError::from_walker_errno(Errno::from(err))),
         };
         drop(guard);
         result?

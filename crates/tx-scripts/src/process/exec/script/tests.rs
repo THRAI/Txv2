@@ -922,10 +922,11 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
         // materialise_rnode and produce a PageBacked RNode. Use the
         // root walker cred so the test isn't gated on tmpfs's mode
         // bits — the slice's DAC test coverage lives elsewhere.
+        use tx_substrate::step_v3::StepOutcome as V3;
         let cred = Credential::root();
         let cwd = process.cwd().expect("cwd bound");
         let guard = tx_substrate::epoch::guard();
-        let outcome = block_on(tx_subsystems::vfs::walker::step_open(
+        let outcome = block_on(tx_subsystems::vfs::walker::step_open_v3(
             cwd,
             name,
             OpenFileFlags {
@@ -941,8 +942,8 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
         ));
         drop(guard);
         match outcome {
-            StepOutcome::Done(file) | StepOutcome::Advanced(file) => file,
-            other => panic!("step_open({name:?}) failed: {other:?}"),
+            V3::Done(file) => file,
+            other => panic!("step_open_v3({name:?}) failed: {other:?}"),
         }
     };
 
