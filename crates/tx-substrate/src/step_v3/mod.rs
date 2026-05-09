@@ -21,18 +21,78 @@
 //! - `txdoc:STEP-V2-STEP-OP-1` (StepOp trait shape)
 //! - `txdoc:STEP-V2-DRIVER-MODE-1` (DriveMode classify matrix)
 
-/// Minimal v3 errno surface. PR-0 pinned `EAGAIN` so `StepOutcome::Err`
-/// had at least one inhabitant; wave-4's first cascade probe (the futex
-/// step fns under `tx_subsystems::futex`) needs `EINVAL` to express
-/// uaddr-validation failures, so this catalog grows by one variant.
-/// Future cascade probes (mount, pipe, …) will expand this set as
-/// needed; later PRs still decide whether to relocate the existing
-/// `tx_subsystems::execution::Errno` upward or keep a substrate-side
-/// Errno separate.
+/// v3 errno surface. Mirrors `tx_subsystems::execution::Errno` byte-for-byte
+/// (variant names, ordering, doc comments). PR-0 originally pinned only
+/// `EAGAIN`; wave-4's first cascade probe (the futex step fns under
+/// `tx_subsystems::futex`) added `EINVAL` for uaddr/nargs validation;
+/// wave-5 grows the catalog to mirror the full v4 27-variant set in one
+/// step so wave-6 fan-out workers (mount, pipe, device, …) do not each
+/// add their own variants ad hoc.
+///
+/// Discipline: this enum stays in lock-step with v4. The
+/// `From<execution::Errno> for step_v3::Errno` impl in
+/// `tx_subsystems::execution` is an exhaustive no-wildcard match, so
+/// adding a new variant on the v4 side fails to compile until the same
+/// variant is added here. Removing a variant on either side is
+/// similarly load-bearing.
+///
+/// TBD per the original PR-0 stub note: whether v3's `Errno` ultimately
+/// replaces v4's `tx_subsystems::execution::Errno` (relocate upward) or
+/// whether both stay forever as a substrate/subsystem split. Wave-5
+/// leaves both in place and bridges them with a `From` impl.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Errno {
+    EACCES,
+    /// Resource temporarily unavailable. Surfaced by `O_NONBLOCK` I/O
+    /// paths (e.g. fd-ops Wave 3 `pipe::step_read` / `step_write` with
+    /// `nonblocking = true` and no progress yet).
     EAGAIN,
+    /// Bad file descriptor. Today only surfaced by fd-ops Wave 3
+    /// pipe dispatch when a wrong-side `step_read` / `step_write`
+    /// reaches the dispatcher despite the OpenFileFlags read/write
+    /// guard (defence in depth — the flag check at the top of
+    /// `OpenFile::step_read/step_write` returns `EINVAL` first for
+    /// the common case). Linux semantic: `read(2)` on a writer-end
+    /// fd is `-EBADF`, not `-EPIPE`.
+    EBADF,
+    EBUSY,
+    EDQUOT,
+    EEXIST,
+    EFAULT,
     EINVAL,
+    EIO,
+    EISDIR,
+    ELOOP,
+    ENAMETOOLONG,
+    ENODEV,
+    ENOEXEC,
+    ENOMEM,
+    ENOENT,
+    ENOSYS,
+    ENOTDIR,
+    ENOTEMPTY,
+    /// Inappropriate ioctl for device. Surfaced by Slice 5 of the
+    /// shell-prompt roadmap (`ioctl(2)` arm) when the target fd is not
+    /// a TTY (terminal-shape ioctl on a pipe / regular file / dir / etc.)
+    /// or the request code is not one of the eight TTY ioctls v1
+    /// implements. Linux value: 25.
+    ENOTTY,
+    EPERM,
+    /// Broken pipe: write to a pipe with all readers closed. The
+    /// caller is responsible for delivering SIGPIPE before returning
+    /// `-EPIPE` to userspace (fd-ops Wave 3, Q2 DECIDED 2026-05-07).
+    EPIPE,
+    /// Numerical result out of range. Surfaced by Slice 6's
+    /// `getcwd(2)` arm when the user buffer is smaller than the
+    /// rendered path (NUL terminator inclusive). Linux value: 34.
+    ERANGE,
+    EROFS,
+    /// Illegal seek. Surfaced by `lseek(2)` when called against a
+    /// non-seekable file (pipe / TTY / chardev / socket). fd-ops
+    /// Wave 4. Linux value: 29.
+    ESPIPE,
+    ESRCH,
+    ESTALE,
 }
 
 /// Opaque carrier handle. Replaces `tx_subsystems::execution::WaitToken`'s
@@ -83,6 +143,21 @@ pub enum YieldShape {
     },
 }
 
+impl YieldShape {
+    /// Shorthand for `OnCarrier { carrier: WakeCarrier::new(carrier_id),
+    /// interests: InterestConditions::new(interest_mask) }`. Wraps the
+    /// raw `u64` carrier id and `u64` interest mask the v4 `WaitToken`
+    /// exposes; zero-translation conversion. Wave-5 helper added so
+    /// fan-out-wave cascade-probe call sites don't have to hand-roll
+    /// the struct literal.
+    pub const fn on_carrier(carrier_id: u64, interest_mask: u64) -> Self {
+        Self::OnCarrier {
+            carrier: WakeCarrier::new(carrier_id),
+            interests: InterestConditions::new(interest_mask),
+        }
+    }
+}
+
 /// Four-variant step outcome. The v4 five-variant algebra is retired
 /// per STEP-1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,6 +166,45 @@ pub enum StepOutcome<T, P> {
     Yield { progress: P, shape: YieldShape },
     Done(T),
     Err(Errno),
+}
+
+impl<T, P: StepProgress> StepOutcome<T, P> {
+    /// `StepOutcome::done(t)` — terminal value. Wave-5 helper.
+    pub const fn done(value: T) -> Self {
+        Self::Done(value)
+    }
+
+    /// `StepOutcome::err(errno)` — terminal error. Wave-5 helper.
+    pub const fn err(errno: Errno) -> Self {
+        Self::Err(errno)
+    }
+
+    /// `StepOutcome::continue_with(progress)` — made progress, may
+    /// continue without waiting. Named `continue_with` (not `continue`)
+    /// because `continue` is a Rust keyword.
+    pub const fn continue_with(progress: P) -> Self {
+        Self::Continue { progress }
+    }
+
+    /// `StepOutcome::yield_on_carrier(progress, carrier_id, interest_mask)`
+    /// — shorthand for `Yield { progress, shape: YieldShape::on_carrier(...) }`.
+    /// Constructs a v3 `Yield` over an `OnCarrier` shape from the
+    /// underlying `u64` carrier id and `u64` interest mask, the same
+    /// pair v4 `WaitToken { carrier, interest }` exposes; zero-translation
+    /// conversion. No `yield_on_agent` shorthand this wave: the
+    /// `OnAgent` variant has five fields, so a single helper isn't
+    /// useful. Builders or shape-specific helpers can come later when
+    /// there's a real `OnAgent` client.
+    pub const fn yield_on_carrier(
+        progress: P,
+        carrier_id: u64,
+        interest_mask: u64,
+    ) -> Self {
+        Self::Yield {
+            progress,
+            shape: YieldShape::on_carrier(carrier_id, interest_mask),
+        }
+    }
 }
 
 /// Per STEP-3: `(Self, EMPTY, extend)` is monoid-shaped — associative,

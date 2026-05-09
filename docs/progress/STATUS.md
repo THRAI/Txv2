@@ -4,6 +4,42 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-5 (pre-fan-out) of the v3 TDD migration
+  landed (two parallel TDD workers extending v3 ergonomics
+  ahead of the multi-subsystem cascade fan-out). W-errno-mirror
+  expanded `tx_substrate::step_v3::Errno` from 2 variants
+  (`EAGAIN`, `EINVAL`) to mirror v4's full 27-variant set
+  byte-for-byte (`EACCES, EAGAIN, EBADF, EBUSY, EDQUOT, EEXIST,
+  EFAULT, EINVAL, EIO, EISDIR, ELOOP, ENAMETOOLONG, ENODEV,
+  ENOEXEC, ENOMEM, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, ENOTTY,
+  EPERM, EPIPE, ERANGE, EROFS, ESPIPE, ESRCH, ESTALE`) preserving
+  v4's substantive doc comments verbatim; added
+  `From<execution::Errno> for step_v3::Errno` in
+  `crates/tx-subsystems/src/execution.rs` with an exhaustive
+  no-wildcard match (so a future v4-only addition fails to
+  compile until v3 mirrors); updated the wave-4 errno smoke in
+  `tests/v3_algebra.rs` to `errno_mirrors_v4_catalog`
+  exhaustively covering all 27; added `from_v4_errno_round_trip`
+  table-test inline in `execution.rs`'s `mod tests` covering
+  every variant. W-step-outcome-helpers added ergonomic
+  constructor helpers on `step_v3::StepOutcome` (`done(t)`,
+  `err(errno)`, `continue_with(progress)`,
+  `yield_on_carrier(progress, carrier_id, interest_mask)`) and
+  on `YieldShape` (`on_carrier(carrier_id, interest_mask)`),
+  all `pub const fn`; pinned by 6 tests in new
+  `tests/v3_helpers.rs`. The helpers reduce the 6-line struct
+  literal at OnCarrier yield sites to a single call. Two
+  concurrent workers on the same `step_v3/mod.rs` succeeded via
+  unique-substring anchors on disjoint regions (Errno enum vs
+  StepOutcome/YieldShape impl blocks). Final count: **1254
+  passed, 0 failed, 4 ignored across 60 binaries** (wave-4
+  baseline 1247 + 6 helpers + 1 round-trip; v3_helpers is the
+  60th binary). `cargo xtask lint arch | docs | progress
+  validate` all green. **Wave 6 unblocked:** mount/pipe/device
+  cascade probes can now use the full Errno surface and the
+  yield-on-carrier helper without each worker expanding the v3
+  surface ad-hoc.
+
 - 2026-05-09 PR-1 wave-4 of the v3 TDD migration landed — first
   cascade probe, single careful worker on `crates/tx-subsystems/src/futex.rs`.
   Pure additive: new `step_futex_wait_v3` and `step_futex_wake_v3`

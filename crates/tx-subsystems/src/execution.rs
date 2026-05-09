@@ -61,6 +61,45 @@ pub enum Errno {
     ESTALE,
 }
 
+/// Bridge v4 errno into v3 errno. The v3 enum mirrors the v4 set
+/// byte-for-byte (see `tx_substrate::step_v3::Errno`), so this is a
+/// 1:1 same-name mapping. The match is exhaustive with no wildcard:
+/// adding a new v4 variant fails to compile here until v3 is also
+/// extended, which keeps the two catalogs in lock-step.
+impl From<Errno> for tx_substrate::step_v3::Errno {
+    fn from(value: Errno) -> Self {
+        match value {
+            Errno::EACCES => Self::EACCES,
+            Errno::EAGAIN => Self::EAGAIN,
+            Errno::EBADF => Self::EBADF,
+            Errno::EBUSY => Self::EBUSY,
+            Errno::EDQUOT => Self::EDQUOT,
+            Errno::EEXIST => Self::EEXIST,
+            Errno::EFAULT => Self::EFAULT,
+            Errno::EINVAL => Self::EINVAL,
+            Errno::EIO => Self::EIO,
+            Errno::EISDIR => Self::EISDIR,
+            Errno::ELOOP => Self::ELOOP,
+            Errno::ENAMETOOLONG => Self::ENAMETOOLONG,
+            Errno::ENODEV => Self::ENODEV,
+            Errno::ENOEXEC => Self::ENOEXEC,
+            Errno::ENOMEM => Self::ENOMEM,
+            Errno::ENOENT => Self::ENOENT,
+            Errno::ENOSYS => Self::ENOSYS,
+            Errno::ENOTDIR => Self::ENOTDIR,
+            Errno::ENOTEMPTY => Self::ENOTEMPTY,
+            Errno::ENOTTY => Self::ENOTTY,
+            Errno::EPERM => Self::EPERM,
+            Errno::EPIPE => Self::EPIPE,
+            Errno::ERANGE => Self::ERANGE,
+            Errno::EROFS => Self::EROFS,
+            Errno::ESPIPE => Self::ESPIPE,
+            Errno::ESRCH => Self::ESRCH,
+            Errno::ESTALE => Self::ESTALE,
+        }
+    }
+}
+
 pub type KernelResult<T> = Result<T, Errno>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,5 +155,49 @@ mod tests {
             StepOutcome::<()>::Blocked(token),
             StepOutcome::Blocked(token)
         );
+    }
+
+    #[test]
+    fn from_v4_errno_round_trip() {
+        // Wave-5: the `From<execution::Errno> for step_v3::Errno` impl
+        // must map each v4 variant to the same-named v3 variant. Closed
+        // catalog: the table below names each v4 variant explicitly so
+        // adding a new v4 variant later (without extending v3 + the
+        // From impl) fails to compile or this test fails immediately.
+        use tx_substrate::step_v3::Errno as V3;
+        let table: [(Errno, V3); 27] = [
+            (Errno::EACCES, V3::EACCES),
+            (Errno::EAGAIN, V3::EAGAIN),
+            (Errno::EBADF, V3::EBADF),
+            (Errno::EBUSY, V3::EBUSY),
+            (Errno::EDQUOT, V3::EDQUOT),
+            (Errno::EEXIST, V3::EEXIST),
+            (Errno::EFAULT, V3::EFAULT),
+            (Errno::EINVAL, V3::EINVAL),
+            (Errno::EIO, V3::EIO),
+            (Errno::EISDIR, V3::EISDIR),
+            (Errno::ELOOP, V3::ELOOP),
+            (Errno::ENAMETOOLONG, V3::ENAMETOOLONG),
+            (Errno::ENODEV, V3::ENODEV),
+            (Errno::ENOEXEC, V3::ENOEXEC),
+            (Errno::ENOMEM, V3::ENOMEM),
+            (Errno::ENOENT, V3::ENOENT),
+            (Errno::ENOSYS, V3::ENOSYS),
+            (Errno::ENOTDIR, V3::ENOTDIR),
+            (Errno::ENOTEMPTY, V3::ENOTEMPTY),
+            (Errno::ENOTTY, V3::ENOTTY),
+            (Errno::EPERM, V3::EPERM),
+            (Errno::EPIPE, V3::EPIPE),
+            (Errno::ERANGE, V3::ERANGE),
+            (Errno::EROFS, V3::EROFS),
+            (Errno::ESPIPE, V3::ESPIPE),
+            (Errno::ESRCH, V3::ESRCH),
+            (Errno::ESTALE, V3::ESTALE),
+        ];
+        assert_eq!(table.len(), 27);
+        for (v4, expected_v3) in table {
+            let mapped: V3 = v4.into();
+            assert_eq!(mapped, expected_v3, "v4 {:?} should map to v3 {:?}", v4, expected_v3);
+        }
     }
 }
