@@ -117,13 +117,9 @@ fn materialize_frame(page: &Page4K) -> StepOutcome<Frame> {
 
 /// v3 sibling factory for `MountOutput::fs_page_backing_v3` cutover.
 ///
-/// Mirrors `Tmpfs::fs_page_backing_v3_arc`. Gated behind `cfg(test)`
-/// for now because `Ext4FsInstance` is `pub(crate)` and the v3 wiring
-/// on `MountOutput` lands in wave 9c — the factory is exercised inline
-/// in `tests_v3.rs` to pin the cutover shape, and the non-test build
-/// does not yet have a caller. Wave 9c lifts the cfg gate as part of
-/// the `MountOutput::fs_page_backing_v3` field landing.
-#[cfg(test)]
+/// Mirrors `Tmpfs::fs_page_backing_v3_arc`. The cfg gate from wave 9b
+/// is lifted in wave 9c now that `MountOutput` carries the v3 field
+/// and `mount_ext4_read_only` populates it.
 impl<I> Ext4FsInstance<I>
 where
     I: BlockImage + Send + 'static,

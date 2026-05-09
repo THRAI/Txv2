@@ -324,7 +324,9 @@ pub struct MountInitContext {
 
 pub struct MountOutput {
     pub fs_ops: Arc<dyn FsOps>,
+    pub fs_ops_v3: Arc<dyn crate::vfs::FsOpsV3>,
     pub fs_page_backing: Arc<dyn FsPageBacking>,
+    pub fs_page_backing_v3: Arc<dyn crate::page_backed::FsPageBackingV3>,
     pub root_fs_object_id: FsObjectId,
     pub root_inode_meta: InodeMeta,
 }

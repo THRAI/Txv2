@@ -155,9 +155,18 @@ impl Tmpfs {
         let tmpfs: Arc<Self> = Arc::new(Self::new());
         let fs_ops: Arc<dyn FsOps> = tmpfs.clone();
         let fs_page_backing: Arc<dyn FsPageBacking> = tmpfs.clone();
+        // Wave 9c: populate the v3 sibling fields from the same
+        // `Arc<Tmpfs>` via the `fs_ops_v3_arc` / `fs_page_backing_v3_arc`
+        // factories landed in wave 9a. Both v3 fields are alongside the
+        // v4 fields; the new walker entry points (`step_walk_v3` /
+        // `step_open_v3`) consume `fs_ops_v3`.
+        let fs_ops_v3 = tmpfs.clone().fs_ops_v3_arc();
+        let fs_page_backing_v3 = tmpfs.clone().fs_page_backing_v3_arc();
         let output = MountOutput {
             fs_ops,
+            fs_ops_v3,
             fs_page_backing,
+            fs_page_backing_v3,
             root_fs_object_id: TMPFS_ROOT_OBJECT_ID,
             root_inode_meta: InodeMeta::new(InodeKind::Directory, TMPFS_ROOT_MODE),
         };
