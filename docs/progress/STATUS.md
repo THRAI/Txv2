@@ -4,6 +4,48 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-4 of the v3 TDD migration landed — first
+  cascade probe, single careful worker on `crates/tx-subsystems/src/futex.rs`.
+  Pure additive: new `step_futex_wait_v3` and `step_futex_wake_v3`
+  sibling fns alongside the existing v4 `step_futex_wait` /
+  `step_futex_wake`. v4 fns and tx-shims callers untouched
+  (`tx-shims/src/linux_syscall/vm.rs:526,563`). v3 sibs re-run
+  the same body emitting `tx_substrate::step_v3::StepOutcome<T,
+  NoProgress>` directly — fully-qualified to avoid a `use`
+  collision with the v4 `StepOutcome` already in scope. Single
+  variant addition to `step_v3::Errno` (`EINVAL`); v3_algebra
+  closed-catalog smoke updated to pin two-variant Errno. 5 new
+  v3-shape tests inline in futex.rs `mod tests`. **One real
+  signal:** the worker followed the brief verbatim, which had
+  pinned `wake(uaddr, 0)` → `EINVAL` — but v4 and Linux both
+  treat `n=0` as a no-op `Done(0)`. Brief was wrong; orchestrator
+  fixed the v3 fn body to drop the `n == 0` guard and renamed
+  the test to `step_futex_wake_v3_zero_n_is_a_no_op_done_zero`,
+  pinning v4-conformant semantics. Sibling fns are meant to
+  match v4 during the migration phase; tightening is a separate
+  v3 design decision. Final count: **1247 passed, 0 failed, 4
+  ignored across 59 binaries** (+6 vs wave-3: 5 futex v3 tests
+  + 1 errno catalog smoke). `cargo xtask lint arch | docs |
+  progress validate` all green. **Probe lessons** (recorded
+  here for the wave-5 fan-out brief): (1) v3/v4 coexistence in
+  one source file works cleanly when the v3 references are
+  fully-qualified `tx_substrate::step_v3::*` — no `use` of
+  the v3 types is needed and avoids name collision with the
+  v4 `StepOutcome` already in scope from `crate::execution`.
+  (2) `WakeCarrier::new(carrier_id)` and
+  `InterestConditions::new(mask)` are zero-translation wrappers
+  over the v4 `WaitToken { carrier, interest }` pair. (3) The
+  v3 `Errno` catalog is too thin for general migration — every
+  cascade probe will need to add variants. Wave-5 should land
+  the full `Errno` mirror (or a typed `From<v4::Errno>` bridge)
+  before fanning out to mount/pipe/etc. (4) No
+  constructor helpers exist (`StepOutcome::yield_on_carrier(id,
+  mask)`); call sites are 6-line struct literals. Worth landing
+  before the multi-file fan-out. **Next:** wave 5 — either a
+  short pre-fan-out wave (errno mirror + constructor helpers
+  + From-bridge), or fan out to mount/pipe/device with the
+  current minimal surface and accept the duplication.
+
 - 2026-05-09 PR-1 wave-3 of the v3 TDD migration landed (five
   parallel TDD workers, max-fan-out additive substrate
   completion, all five concurrent on different `pub use` anchor
