@@ -4,6 +4,103 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9h-γ/β/δ/ε LANDED. Per-fixture audit
+  showed earlier postmortem was wrong: v3 path was largely
+  exercised already; only step_fsync_v3 + materialize_file_page
+  + step_truncate_v3 still called v4 trait, plus a handful of
+  test-file callers and field-passthroughs. Sequenced sub-waves:
+
+  - **9h-γ** (commit 80d2a33): step_fsync_v3 routes through v3
+    `fs_page_backing_v3.flush_page`/`fsync`. Aligned mod-tests
+    LifecycleFs's v3 page-backing impl with v4 (counters,
+    yield_on_carrier(13, 0x55) on `block_flush_after`).
+  - **9h-β** (commit 694f503): materialize_file_page in
+    page_backed.rs routes through v3
+    `fs_page_backing_v3.fetch_page`. Aligned BlockingFs's v3
+    fetch_page with v4's `Blocked(WaitToken(9, 0x44))` via
+    yield_on_carrier(NoProgress, 9, 0x44).
+  - **9h-δ** (commit adce28d): tx-kernel/init/tests.rs's
+    register_setuid_fixture and tx-fs/initramfs_tests.rs's
+    helpers (lookup_in/lookup_in_root/fs_ops_of and the
+    load_inode_meta/read_link callers) migrated from v4 to
+    v3 outcome shape and v3 trait fields.
+  - **9h-ε** (commit fe543a6): v4 fields dropped from
+    `MountPayload` (+ `MountPayload::new`/`new_cap` signatures
+    9→7 args) and `MountOutput` (both definitions in mount.rs
+    and vfs/execution.rs). 20 `MountPayload::new_cap` callers
+    across the workspace updated to 7-arg form. step_fallocate
+    (v4 fn) and step_truncate_v3 (v3 fn) flipped from v4 to v3
+    page-backing trait. Tmpfs / Ext4 mount factories drop v4
+    field population from MountOutput.
+
+  Verification at each step: cargo test --workspace
+  --test-threads=1 → **1328 / 0 / 11** baseline preserved.
+  cargo xtask lint arch / progress validate ok.
+
+- 2026-05-09 PR-1 wave-9h-ζ ATTEMPTED-AND-REVERTED. Tried to
+  delete v4 trait declarations + 21 impl blocks + 4 v4 factory
+  methods. Pilot on TestFs with `impl FsOps for X` →
+  `impl X` (inherent same-name methods) + sed-replace of
+  `<Self as FsOps>::method` → `Self::method` worked in
+  isolation, but extending to Tmpfs/Devfs/Ext4/DevptsInstance
+  hit two compounding blockers:
+
+  1. **Inherent-vs-trait method ambiguity inside trait impls.**
+     Inside `impl FsPageBackingV3 for Devfs { fn fallocate(...)
+     -> V3Outcome<...> { Self::fallocate(self, ...) } }`, Rust
+     resolves `Self::fallocate` to the trait method being
+     defined (V3 outcome) — not the inherent method (V4
+     outcome). Inherent-method preference applies to
+     `self.method(args)` autoref form, NOT to the
+     `Self::method(self, args)` UFCS form when a trait method
+     of the same name is in active scope. The fallocate body's
+     v4-shape match arms therefore type-mismatch against the
+     v3 outcome the compiler resolves to.
+  2. **Test files call fixtures' methods directly with v4
+     outcome shape.** legacy_phase_a.rs (DevptsInstance) and
+     similar match `StepOutcome::Done/Advanced/etc` from
+     `devpts.lookup(...)` / `devpts.readdir(...)` directly —
+     17 such callers in tty tests alone. Without the v4 trait
+     these become private inherent methods and the test file
+     can't reach them, OR they shift to v3 trait dispatch and
+     the match arms (Advanced / Blocked / AdvancedThenBlocked)
+     no longer match v3's variants.
+
+  Reverted via git checkout. Tree stable at fe543a6 (wave 9h-ε).
+  Baseline 1328 / 0 / 11 preserved.
+
+- 2026-05-09 PR-1 wave-9h-ζ DEFERRED. Three viable paths to
+  finish v4 trait deletion if user wants to push further:
+
+  * **Rename inherent methods** (~60 method renames + ~60 v3
+    callsite updates + N test-file updates). Each delegating
+    fixture's v4 method gets a suffix (e.g. `_v4_inner_lookup`)
+    to avoid name collision with v3 trait. Most invasive but
+    keeps test v4 outcome assertions intact.
+  * **Inline v4 logic into v3 impl** (~1500 lines of body
+    duplication). Each delegating v3 method body gets the v4
+    impl logic pasted in, returning v3 outcome directly. Zero
+    inherent-method dependency. Heaviest but cleanest result.
+  * **Migrate tests to v3 outcome shape** (~17 tty-test calls
+    + N others). Tests use `<Fixture as FsOpsV3>::method`
+    explicitly with v3 match arms. Combined with the inherent-
+    method approach this might work — the trait stays the only
+    public surface; inherent forms only feed the v3 trait
+    delegates and never escape.
+
+  Recommend: **stop at 9h-ε.** The remaining v4 trait surface
+  is the legacy compatibility shim — production code reaches
+  it only through v3 trait delegates and a handful of v4 fns
+  (step_truncate / step_fsync / step_fallocate) that themselves
+  consume v3 trait. Deleting the trait declaration buys
+  clean-namespace value but no functional benefit; the user
+  can revisit if dual-trait dispatch becomes a perf concern or
+  if the test-file v4 outcome shape needs to evolve.
+
+  ----
+
+  Original re-diagnosis context preserved below.
+
 - 2026-05-09 PR-1 RE-DIAGNOSIS after wave-9h-a abort. Empirical
   re-verification of the tree (`28274a7`, baseline 1328/0/11
   preserved single-threaded; the parallel-test "65 failures"
