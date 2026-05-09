@@ -1,5 +1,5 @@
 use super::*;
-use crate::execution::{Errno, StepOutcome};
+use crate::execution::Errno;
 use crate::vfs::{FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking};
 use tx_substrate::step_v3::StepOutcome as V3Out;
 
@@ -62,7 +62,7 @@ fn pagebacked_step_read_uses_visible_size_not_capacity() {
     let of = open_file_for_pc(&pc);
     of.set_offset(crate::vm::USER_PAGE_SIZE as u64);
 
-    assert_eq!(step_read(&pc, &of, 16, &guard), StepOutcome::Done(0));
+    assert_eq!(step_read(&pc, &of, 16, &guard), V3Out::Done(0));
     assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64);
     assert_eq!(pc.resident_pages(), 0);
 }
@@ -82,7 +82,7 @@ fn pagebacked_step_write_extends_visible_size_within_capacity() {
     let of = open_file_for_pc(&pc);
     of.set_offset((crate::vm::USER_PAGE_SIZE + 9) as u64);
 
-    assert_eq!(step_write(&pc, &of, 7, &guard), StepOutcome::Done(7));
+    assert_eq!(step_write(&pc, &of, 7, &guard), V3Out::Done(7));
 
     assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE + 16) as u64);
     assert_eq!(pc.size_bytes(), (crate::vm::USER_PAGE_SIZE + 16) as u64);
@@ -106,7 +106,7 @@ fn pagebacked_step_write_rejects_growth_beyond_capacity_without_size_change() {
 
     assert_eq!(
         step_write(&pc, &of, 8, &guard),
-        StepOutcome::Err(Errno::EINVAL)
+        V3Out::Err(Errno::EINVAL.into())
     );
 
     assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64 - 4);
