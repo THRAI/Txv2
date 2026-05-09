@@ -1,8 +1,195 @@
 # txKernel Status
 
-**Updated:** 2026-05-08
+**Updated:** 2026-05-09
 
 ## Current Shape
+
+- 2026-05-09 PR-1 wave-3 of the v3 TDD migration landed (five
+  parallel TDD workers, max-fan-out additive substrate
+  completion, all five concurrent on different `pub use` anchor
+  lines in `step_v3/mod.rs`). New surfaces:
+  (a) `step_v3/subject_context.rs` adds the `SubjectContext`
+  struct + `SubjectAuthority` + placeholder `ProcessIdentity` /
+  `ThreadIdentity` / `Credential` / `RestrictionStackHandle`
+  newtypes per `docs/Txv3/01_CONCEPTS_v5.md` §2.1 and
+  `04_SYSCALL_SHAPE_v1.md`; `from_thread` and `borrowed`
+  constructors; SUBJ-1 (no global accessor) pinned by the
+  absence of a zero-arg getter; 4 tests.
+  (b) `step_v3/restriction_stack.rs` adds an append-only
+  `RestrictionStack` over a closed `RestrictionKind`
+  (`SeccompFilter`, `LandlockRule`, `LsmStack`); the type has
+  no `clear`/`pop`/`remove` API — append-only enforced
+  structurally; 6 tests including a structural-pin for SUBJ-3
+  authority replacement as the only "shrink" path.
+  (c) `step_v3/execution_scope.rs` adds the closed
+  `ExecutionScope { Thread, OnBehalfOf(OwnedProcessHandle) }`
+  catalog per `docs/Txv3/06_EXECUTION_SCOPE_v1.md` with
+  `is_thread`/`is_borrowed`/`borrowed_owner` const helpers; full
+  borrow primitive (`with_on_behalf_of`) deferred to PR-7; 6
+  tests.
+  (d) `step_v3/endpoint_kind.rs` adds the closed
+  `EndpointKind { Ufd, Fuse, FanotifyPerm, Ptrace, Synthetic }`
+  catalog per `docs/Txv3/05_DELEGATE_v1.md`; `is_real` and
+  `permits_fd_injection` predicates; **flagged for PR-4
+  reconciliation:** worker noted that doc 05 §3 also lists
+  `LsmMediated` as a fifth real kind not in this wave's spec
+  — PR-4 should add it; 4 tests.
+  (e) `step_v3/binding_obligations.rs` adds the closed
+  `BindingObligation { ResolutionOnly, Addressability,
+  Operational }` catalog per `docs/Txv3/01_CONCEPTS_v5.md` with
+  `at_least`/`rank`/`requires_operability` total-order helpers;
+  7 tests including reflexive/transitive/antisymmetric pins.
+  Final count: **1241 passed, 0 failed, 4 ignored across 59
+  binaries** — wave-3 baseline 1214 + 4+6+6+4+7. `cargo xtask
+  lint arch | docs | progress validate` all green. Five-way
+  concurrent edits to `step_v3/mod.rs` succeeded because each
+  worker anchored on a distinct unique `pub use` line; no
+  collisions, no manual integration. Total v3 surface so far:
+  `StepOutcome`, full `StepProgress` catalog (5 impls),
+  `YieldShape` (OnCarrier+OnAgent), `DriveMode::classify`,
+  `StepOp`, `ScriptCtx`, `WaitProtocol`/`WaitOutcome`, agent
+  placeholders, `SubjectContext`/`SubjectAuthority`,
+  `RestrictionStack`/`RestrictionKind`, `ExecutionScope`,
+  `EndpointKind`, `BindingObligation`. ~1100 LoC of
+  framework in `step_v3/`, zero consumer migration yet.
+  **Next:** likely wave 4 — start the actual cascade (plan
+  §9e wave 1, smallest crate W-mount-pipe-futex first), or one
+  more pre-cascade wave (e.g. add `LsmMediated` per the
+  endpoint-kind worker's flag, plus pull forward more of PR-7
+  borrow primitive).
+
+- 2026-05-09 PR-1 wave-2 of the v3 TDD migration landed (two
+  parallel TDD workers extending the closed-catalog surface).
+  W-on-agent-skeleton extended `YieldShape` with the `OnAgent`
+  variant against placeholder `DelegateEndpoint` /
+  `DelegateToken` / `DelegateRequest` / `Deadline` /
+  `CancelPolicy` types in `crates/tx-substrate/src/step_v3/agent.rs`
+  (full `Cap`-typed zone primitives still PR-4); extended
+  `DriveMode::classify` with the OnAgent rows including the
+  load-bearing `Selecting + OnAgent → UnsupportedShape`; pinned
+  by 9 tests in `tests/v3_yield_on_agent.rs`; updated existing
+  exhaustive-match tests in `tests/v3_algebra.rs` and
+  `tests/v3_step_op.rs` to handle the new variant without
+  changing test counts. W-wait-protocol added the
+  `WaitProtocol` (5 members) and `WaitOutcome` (4 members)
+  closed catalogs in `crates/tx-substrate/src/step_v3/wait_protocol.rs`
+  with `permits_signals`/`permits_kill`/`has_deadline`/`is_terminal`
+  helpers; pinned by 6 tests in `tests/v3_wait_protocol.rs`;
+  agent socket-dropped mid-flight after writing the test file
+  red, orchestrator finished the impl + mod.rs wiring (matching
+  the spec in the brief). Final count: **1214 passed, 0 failed,
+  4 ignored across 54 binaries** — wave-2 baseline 1199 + 9
+  on_agent + 6 wait_protocol. `cargo xtask lint arch | docs |
+  progress validate` all green. Substrate-side v3 surface is
+  now substantially complete: `StepOutcome` (4-variant), full
+  `StepProgress` catalog (NoProgress/ByteProgress/PageProgress/
+  EntryProgress/IoVecProgress), full `YieldShape` (OnCarrier +
+  OnAgent), full `DriveMode::classify` matrix, `StepOp` trait,
+  `ScriptCtx` placeholder, `WaitProtocol`/`WaitOutcome`. Net new
+  framework: ~700 LoC in `step_v3/`. **Next:** wave 3 — either
+  pull `SubjectContext` skeleton forward (plan PR-3) as another
+  additive step, or start the actual consumer-migration cascade
+  (plan §9e wave 1, beginning with W-mount-pipe-futex / smallest
+  crate ~30 sites).
+
+- 2026-05-09 PR-1 wave-1 of the v3 TDD migration landed (closed
+  `StepProgress` catalog completed, three TDD workers in
+  parallel). Refactor first: `crates/tx-substrate/src/step_v3.rs`
+  moved to `crates/tx-substrate/src/step_v3/mod.rs` so the impl
+  files for each progress shape sit in disjoint paths. Then
+  three parallel subagents (W-page-progress, W-entry-progress,
+  W-iovec-progress), each briefed on the live module + canonical
+  txdoc anchors (`STEP-V2-PROGRESS-TYPED-1`), each strict
+  red→green: (a) `step_v3/page_progress.rs` adds
+  `PageProgress { pages: u32 }` for fault/materialize/mlock
+  ops, monoid laws pinned by 6 tests in
+  `tests/v3_progress_page.rs`; (b) `step_v3/entry_progress.rs`
+  adds `EntryProgress { count, cursor }` plus a `DirCursor(u64)`
+  newtype placeholder for `getdents`/enumeration ops, with the
+  cross-step rule that `count` accumulates additively while
+  `cursor` advances to the rhs's high-water position only when
+  rhs has count>0 (right-identity preserved); 6 tests in
+  `tests/v3_progress_entry.rs`. (c) `step_v3/iovec_progress.rs`
+  adds `IoVecProgress { iovecs_complete, partial_bytes_in_current }`
+  for `readv`/`writev`/`preadv`/`pwritev`, with the rule that
+  the partial-bytes field accumulates within an iovec but
+  resets to the rhs value when the rhs advances iovec count
+  (composes correctly across kernel re-entries); 8 tests in
+  `tests/v3_progress_iovec.rs`. Final count: **1199 passed,
+  0 failed, 4 ignored across 52 binaries** — wave-1 baseline
+  1179 + 6 page + 6 entry + 8 iovec. All five `StepProgress`
+  impls per `docs/Txv3/03_STEP_MODEL_v2.md`
+  `txdoc:STEP-V2-PROGRESS-TYPED-1` now landed (NoProgress,
+  ByteProgress, PageProgress, EntryProgress, IoVecProgress).
+  `cargo xtask lint arch | docs | progress validate` all
+  green. **Next:** wave-2 of PR-1 — first real consumer
+  migration probe (smallest crate W-mount-pipe-futex, ~30
+  sites) or pre-migration extension (Wait protocol catalog,
+  `OnAgent` skeleton).
+
+- 2026-05-09 PR-0 of the v3 TDD migration landed (pre-flight,
+  red→green throughout). Five outputs: (1) baseline doc
+  `docs/progress/decisions/2026-05-09-v3-baseline.md` locking the
+  workspace at 1152 passed / 0 failed / 4 ignored across 47
+  binaries via `cargo test --workspace --lib --tests --
+  --test-threads=1`; (2) `crates/tx-substrate/src/step_v3.rs`
+  introducing the v3 step algebra shape — PR-0 lands the
+  `StepOutcome` four-variant (Done/Advanced/Yield/Err),
+  `YieldShape::OnCarrier`, the `StepProgress` trait with
+  `NoProgress` and `ByteProgress` impls, `DriveMode` +
+  `classify`, `AcceptOutcome`, `Translation`, and
+  `Errno::EAGAIN` — pinned by 15 algebra tests in
+  `crates/tx-substrate/tests/v3_algebra.rs` plus 5 StepOp tests
+  in `crates/tx-substrate/tests/v3_step_op.rs`; (3) A-3
+  anti-pattern lint in `xtask/src/lint.rs` (`lint_step_no_await`
+  helper, single-pass character walk that handles same-line
+  bodies, four pin tests covering reject-await-in-step,
+  reject-same-line, allow-await-in-async-helper,
+  allow-step-helper-fn); (4) txdoc-Txv3 harvest extension to
+  `lint_docs` in `xtask/src/lint.rs` (new
+  `extract_txv3_code_references` and `lint_txv3_code_references`
+  helpers; the `lint_docs` real-file pass now scans Rust source
+  under `crates/`, `boards/`, and `xtask/` for
+  `txdoc:TXV3-*` comment references and asserts each resolves to
+  a tag declared in `docs/Txv3/`; three pin tests cover known,
+  unknown, and design-doc-non-TXV3 paths). Final test count:
+  **1179 passed, 0 failed, 4 ignored across 49 binaries** —
+  baseline 1152 + 15 algebra + 5 StepOp + 4 A-3 + 3 docs_lint.
+  `cargo xtask progress validate` green. `cargo xtask lint
+  docs` against the real repo surfaced three real signals in
+  `crates/tx-substrate/src/step_v3.rs:18-20` referencing
+  `TXV3-STEP-MODEL-V2-STEP-1`, `TXV3-STEP-MODEL-V2-STEP-3`, and
+  `TXV3-STEP-MODEL-V2-YIELD-1`, none of which are declared in
+  `docs/Txv3/03_STEP_MODEL_v2.md` (which uses `STEP-V2-…`
+  prefixes); these are reported, not fixed, as the substrate
+  source is owned by a parallel agent for PR-0 integration. PR-0
+  summary in `docs/progress/decisions/2026-05-09-pr0-summary.md`.
+  **Next:** PR-1 step 1 — wire `StepOutcome` consumers off
+  `tx_subsystems::execution::StepOutcome` per the TDD migration
+  plan.
+
+- 2026-05-09 v3 TDD migration plan landed at
+  `docs/progress/plans/2026-05-09-v3-tdd-migration.md`. Plan
+  covers `docs/Txv3/` rollout into tx-* code: PR-0 pre-flight
+  (algebra pin tests via proptest, anti-pattern lints A-2/A-3/A-7
+  in xtask, txdoc-tag harvest, baseline lock); PR-1 `StepOutcome`
+  5→4 + `YieldShape::OnCarrier` (~354 prod sites + tests, fanned
+  out across 14 disjoint write-scope workers in two waves);
+  PR-2..N per-subsystem `StepOp`/`StepProgress` wrap; net-new
+  framework PRs (SubjectContext, OnAgent zones,
+  `Waiting::handle`, userfaultfd canary, `OnBehalfOf`, AIO
+  canary, restriction-stack stub) test-first. Verified: three
+  read-only locator/analyzer subagents (W-vfs, W-page-backed,
+  W-shims-fs) dry-ran the partition; no surprise write-scope
+  leaks; surfaced two real cross-worker dependencies
+  (W-fs↔W-page-backed type-boundary; W-vfs↔W-tty ioctl semantic
+  boundary) and one simplification (syscall-arm
+  `Done|Advanced→Done` rule predecidable). Wave plan revised to
+  reflect findings (§9e of the plan). No code changes yet.
+  **Next:** PR-0 — write `crates/tx-substrate/tests/v3_algebra.rs`,
+  proptest, lint extensions in `xtask/src/lint.rs`, baseline doc
+  in `docs/progress/decisions/2026-05-09-v3-baseline.md`. No
+  blockers.
 
 - 2026-05-08 jumbo-mod split on branch `feat/busybox-smoke` (PR
   #21). Mechanical refactor: every authored Rust file > 1500
