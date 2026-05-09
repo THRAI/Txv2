@@ -97,7 +97,23 @@ impl AddressSpace {
 
     /// Read a `T: Copy` value from user-space `src`. Wrapper over
     /// `copy_from_user`.
-    pub fn read_user<T: Copy>(&self, src: UserPtr<T>, guard: &Guard<'_>) -> StepOutcome<T> {
+    ///
+    /// Returns a step_v3 outcome with `NoProgress` (one-shot read; the
+    /// inner copy's byte-progress accumulator is summarised away here
+    /// because a partial-`T` read is not a meaningful intermediate
+    /// state for the caller). The inner v4 `copy_from_user` is bridged
+    /// per-variant: `Done`/`Advanced` → `Done(value)`,
+    /// `Blocked`/`AdvancedThenBlocked` → `Yield { OnCarrier }`,
+    /// `Err` → `Err(errno)` via the `execution::Errno → step_v3::Errno`
+    /// bridge in `crate::execution`.
+    pub fn read_user<T: Copy>(
+        &self,
+        src: UserPtr<T>,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<T, tx_substrate::step_v3::NoProgress> {
+        use tx_substrate::step_v3::{
+            InterestConditions, NoProgress, StepOutcome as V3, WakeCarrier, YieldShape,
+        };
         let mut value = core::mem::MaybeUninit::<T>::uninit();
         // SAFETY: value is a valid kernel-stack `MaybeUninit<T>`; we
         // expose its bytes to copy_from_user which fills exactly
@@ -113,11 +129,16 @@ impl AddressSpace {
             StepOutcome::Done(_) | StepOutcome::Advanced(_) => {
                 // SAFETY: copy_from_user wrote `size_of::<T>()` bytes
                 // before returning Done/Advanced.
-                StepOutcome::Done(unsafe { value.assume_init() })
+                V3::Done(unsafe { value.assume_init() })
             }
-            StepOutcome::Blocked(t) => StepOutcome::Blocked(t),
-            StepOutcome::AdvancedThenBlocked(_, t) => StepOutcome::Blocked(t),
-            StepOutcome::Err(e) => StepOutcome::Err(e),
+            StepOutcome::Blocked(t) | StepOutcome::AdvancedThenBlocked(_, t) => V3::Yield {
+                progress: NoProgress,
+                shape: YieldShape::OnCarrier {
+                    carrier: WakeCarrier::new(t.carrier()),
+                    interests: InterestConditions::new(t.interest()),
+                },
+            },
+            StepOutcome::Err(e) => V3::Err(e.into()),
         }
     }
 
@@ -253,9 +274,12 @@ impl AddressSpace {
         src: UserPtr<u8>,
         max_len: usize,
         guard: &Guard<'_>,
-    ) -> StepOutcome<Vec<u8>> {
+    ) -> tx_substrate::step_v3::StepOutcome<Vec<u8>, tx_substrate::step_v3::NoProgress> {
+        use tx_substrate::step_v3::{
+            InterestConditions, NoProgress, StepOutcome as V3, WakeCarrier, YieldShape,
+        };
         if src.addr() == 0 || max_len == 0 {
-            return StepOutcome::Done(Vec::new());
+            return V3::Done(Vec::new());
         }
         let mut out: Vec<u8> = Vec::with_capacity(core::cmp::min(max_len, 256));
         let mut consumed = 0usize;
@@ -267,8 +291,16 @@ impl AddressSpace {
             let frame_base =
                 match resolve_user_page_addr(self, page_addr, UserAccessKind::Read, guard) {
                     ResolveOutcome::Done(addr) => addr,
-                    ResolveOutcome::Err(e) => return StepOutcome::Err(e),
-                    ResolveOutcome::Blocked(t) => return StepOutcome::Blocked(t),
+                    ResolveOutcome::Err(e) => return V3::Err(e.into()),
+                    ResolveOutcome::Blocked(t) => {
+                        return V3::Yield {
+                            progress: NoProgress,
+                            shape: YieldShape::OnCarrier {
+                                carrier: WakeCarrier::new(t.carrier()),
+                                interests: InterestConditions::new(t.interest()),
+                            },
+                        };
+                    }
                 };
             // SAFETY: frame_base.add(within) is a valid kernel
             // direct-map pointer to the requested user byte; we read
@@ -282,13 +314,13 @@ impl AddressSpace {
             for i in 0..chunk {
                 let byte = unsafe { core::ptr::read(frame_base.add(within + i)) };
                 if byte == 0 {
-                    return StepOutcome::Done(out);
+                    return V3::Done(out);
                 }
                 out.push(byte);
             }
             consumed += chunk;
         }
-        StepOutcome::Err(Errno::ENAMETOOLONG)
+        V3::Err(Errno::ENAMETOOLONG.into())
     }
 }
 

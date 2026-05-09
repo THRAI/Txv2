@@ -11,6 +11,7 @@ use tx_hal::PmapIf;
 
 use crate::execution::WaitToken;
 use crate::execution::{Guard, StepOutcome};
+use tx_substrate::step_v3::{StepOutcome as V3StepOutcome, YieldShape};
 use crate::page_backed::{step_fsync, PageContainerKind};
 use crate::vm::checks::{
     require_disjoint_remap, require_fault_publication, require_fault_recipe, require_map_admission,
@@ -24,7 +25,7 @@ use crate::vm::{
 impl AddressSpace {
     pub fn resolve_fault(&self, fault: VmFault) -> Result<VmFaultOutcome, VmFaultError> {
         let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
-        let StepOutcome::Done(_guard) = self
+        let V3StepOutcome::Done(_guard) = self
             .range_lock
             .acquire_step(page_range, LockMode::Materializer)
         else {
@@ -39,7 +40,7 @@ impl AddressSpace {
         outcome: VmFaultOutcome,
         materialization: VmFaultMaterialization,
     ) -> Result<PmapPublishOutcome, VmFaultError> {
-        let StepOutcome::Done(_guard) = self
+        let V3StepOutcome::Done(_guard) = self
             .range_lock
             .acquire_step(outcome.page_range, LockMode::Materializer)
         else {
@@ -85,7 +86,7 @@ impl AddressSpace {
     /// retry is built in at the VM layer because the Process subsystem
     /// orchestrates fork above this function.
     pub fn fork_aspace<P: PmapIf>(parent: &AddressSpace) -> Result<AddressSpace, VmMapError> {
-        let StepOutcome::Done(_full_guard) = parent
+        let V3StepOutcome::Done(_full_guard) = parent
             .range_lock
             .acquire_step(UserRange::full_user_v1(), LockMode::ExclusiveWriter)
         else {
@@ -157,9 +158,12 @@ impl AddressSpace {
                     .range_lock
                     .acquire_step(page_range, LockMode::Materializer)
                 {
-                    StepOutcome::Done(guard) => guard,
-                    StepOutcome::Blocked(token) => {
-                        await_range_lock(token).await;
+                    V3StepOutcome::Done(guard) => guard,
+                    V3StepOutcome::Yield {
+                        shape: YieldShape::OnCarrier { carrier, interests },
+                        ..
+                    } => {
+                        await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
                         continue;
                     }
                     _ => unreachable_acquire_step(),
@@ -173,10 +177,13 @@ impl AddressSpace {
                 .range_lock
                 .acquire_step(outcome.page_range, LockMode::Materializer)
             {
-                StepOutcome::Done(guard) => guard,
-                StepOutcome::Blocked(token) => {
+                V3StepOutcome::Done(guard) => guard,
+                V3StepOutcome::Yield {
+                    shape: YieldShape::OnCarrier { carrier, interests },
+                    ..
+                } => {
                     drop(materialization);
-                    await_range_lock(token).await;
+                    await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
                     continue;
                 }
                 _ => unreachable_acquire_step(),
@@ -258,9 +265,12 @@ impl AddressSpace {
                 .range_lock
                 .acquire_step(range, LockMode::ExclusiveWriter)
             {
-                StepOutcome::Done(guard) => guard,
-                StepOutcome::Blocked(token) => {
-                    await_range_lock(token).await;
+                V3StepOutcome::Done(guard) => guard,
+                V3StepOutcome::Yield {
+                    shape: YieldShape::OnCarrier { carrier, interests },
+                    ..
+                } => {
+                    await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
                     continue;
                 }
                 _ => unreachable_acquire_step(),
@@ -285,9 +295,12 @@ impl AddressSpace {
                 .range_lock
                 .acquire_step(range, LockMode::ExclusiveWriter)
             {
-                StepOutcome::Done(guard) => guard,
-                StepOutcome::Blocked(token) => {
-                    await_range_lock(token).await;
+                V3StepOutcome::Done(guard) => guard,
+                V3StepOutcome::Yield {
+                    shape: YieldShape::OnCarrier { carrier, interests },
+                    ..
+                } => {
+                    await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
                     continue;
                 }
                 _ => unreachable_acquire_step(),
@@ -413,8 +426,13 @@ impl AddressSpace {
             .range_lock
             .acquire_step(entry.range, LockMode::ExclusiveWriter)
         {
-            StepOutcome::Done(guard) => guard,
-            StepOutcome::Blocked(token) => return MapReserveResult::Blocked(token),
+            V3StepOutcome::Done(guard) => guard,
+            V3StepOutcome::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => {
+                return MapReserveResult::Blocked(WaitToken::new(carrier.raw(), interests.raw()));
+            }
             _ => unreachable_acquire_step(),
         };
 
@@ -453,8 +471,8 @@ impl AddressSpace {
             .range_lock
             .acquire_step(range, LockMode::ExclusiveWriter)
         {
-            StepOutcome::Done(guard) => Ok(guard),
-            StepOutcome::Blocked(_) => Err(VmMapError::WouldBlock),
+            V3StepOutcome::Done(guard) => Ok(guard),
+            V3StepOutcome::Yield { .. } => Err(VmMapError::WouldBlock),
             _ => unreachable_acquire_step(),
         }
     }
@@ -620,14 +638,15 @@ async fn await_range_lock(token: WaitToken) {
     }
 }
 
-/// `RangeLock::acquire_step{,_pair}` only ever produce `StepOutcome::Done`
-/// or `StepOutcome::Blocked`. Other variants are unreachable by
-/// construction; this helper centralises the panic message so the asserts
-/// stay terse at the call sites.
+/// `RangeLock::acquire_step` only ever produces `V3StepOutcome::Done`
+/// or `V3StepOutcome::Yield { OnCarrier }`; `acquire_pair_step` only
+/// ever produces `StepOutcome::Done` or `StepOutcome::Blocked`. Other
+/// variants are unreachable by construction; this helper centralises
+/// the panic message so the asserts stay terse at the call sites.
 #[inline(always)]
 fn unreachable_acquire_step() -> ! {
     unreachable!(
         "RangeLock::acquire_step / acquire_pair_step never produce \
-         Advanced / AdvancedThenBlocked / Err"
+         Continue / Yield-OnAgent / Err / Advanced / AdvancedThenBlocked"
     );
 }

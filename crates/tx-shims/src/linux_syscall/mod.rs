@@ -727,18 +727,19 @@ pub(super) fn read_user_cstr_vec(
 /// `aspace.read_user` lane, falling back to the bootstrap
 /// kernel-pointer dance on `EFAULT`.
 pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) -> Result<T, Errno> {
+    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
     let guard = tx_substrate::epoch::guard();
     match aspace.read_user(UserPtr::<T>::new(uaddr as usize), &guard) {
-        StepOutcome::Done(v) | StepOutcome::Advanced(v) => Ok(v),
-        StepOutcome::Err(Errno::EFAULT) => {
+        V3::Done(v) => Ok(v),
+        V3::Err(V3Errno::EFAULT) => {
             drop(guard);
             // Fallback: kernel-pointer bootstrap exemption.
             // SAFETY: existing dispatch tests pass kernel-side pointers
             // directly. The fallback is a bridge until tests migrate.
             Ok(unsafe { core::ptr::read_volatile(uaddr as *const T) })
         }
-        StepOutcome::Err(e) => Err(e),
-        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => Err(Errno::EIO),
+        V3::Err(e) => Err(e.into()),
+        V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
     }
 }
 
@@ -832,13 +833,14 @@ pub(super) fn bootstrap_read_user_cstr(
     uaddr: u64,
     max_len: usize,
 ) -> Result<Vec<u8>, Errno> {
+    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
     if uaddr == 0 || max_len == 0 {
         return Ok(Vec::new());
     }
     let guard = tx_substrate::epoch::guard();
     match aspace.read_user_cstr(UserPtr::<u8>::new(uaddr as usize), max_len, &guard) {
-        StepOutcome::Done(v) | StepOutcome::Advanced(v) => Ok(v),
-        StepOutcome::Err(Errno::EFAULT) => {
+        V3::Done(v) => Ok(v),
+        V3::Err(V3Errno::EFAULT) => {
             drop(guard);
             // Fallback bootstrap scan — matches the previous inline
             // helper.
@@ -854,8 +856,8 @@ pub(super) fn bootstrap_read_user_cstr(
             }
             Err(Errno::ENAMETOOLONG)
         }
-        StepOutcome::Err(e) => Err(e),
-        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => Err(Errno::EIO),
+        V3::Err(e) => Err(e.into()),
+        V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
     }
 }
 
