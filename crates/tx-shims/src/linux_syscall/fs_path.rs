@@ -83,13 +83,22 @@ fn resolve_path_at<P: PmapIf>(
         None => return Err(EBADF_VALUE),
     };
     let guard = tx_substrate::epoch::guard();
-    let outcome = poll_walker_synchronously(step_walk(cwd, path, cred, &guard));
+    // Wave 9d (b): first tx-shims production caller migrated to the v3
+    // walker. Uses `step_walk_v3` (consuming `FsOpsV3` via the direct
+    // `MountPayload::fs_ops_v3` field grown in wave 9d (a)) and matches
+    // the four-variant v3 outcome. Errno routes back to v4 via the
+    // wave-9d-(b) reverse `From` bridge so the existing
+    // `errno_to_i32` table stays the single source of truth.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let outcome = poll_walker_synchronously(
+        tx_subsystems::vfs::step_walk_v3(cwd, path, cred, &guard),
+    );
     let dentry = match outcome {
-        StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+        V3::Done(d) => d,
+        V3::Continue { .. } | V3::Yield { .. } => {
             return Err(EIO_VALUE);
         }
-        StepOutcome::Err(errno) => return Err(errno_to_i32(errno)),
+        V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
     };
     drop(guard);
     Ok(dentry)
