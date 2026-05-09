@@ -73,6 +73,23 @@ fn step_outcome_continue_carries_progress() {
 }
 
 #[test]
+fn errno_includes_eagain_and_einval_after_wave_4_probe() {
+    // PR-0 pinned only `EAGAIN`; the wave-4 futex cascade probe added
+    // `EINVAL` for uaddr/nargs validation. Pin both members here so a
+    // future PR cannot silently drop a variant. Future cascade probes
+    // (mount, pipe, …) extend the catalog further.
+    let cases = [
+        tx_substrate::step_v3::Errno::EAGAIN,
+        tx_substrate::step_v3::Errno::EINVAL,
+    ];
+    for errno in cases {
+        match errno {
+            tx_substrate::step_v3::Errno::EAGAIN | tx_substrate::step_v3::Errno::EINVAL => {}
+        }
+    }
+}
+
+#[test]
 fn step_outcome_yield_carries_progress_and_shape() {
     let outcome: StepOutcome<(), ByteProgress> = StepOutcome::Yield {
         progress: ByteProgress::new(64),

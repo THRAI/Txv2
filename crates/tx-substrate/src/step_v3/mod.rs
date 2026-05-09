@@ -21,13 +21,18 @@
 //! - `txdoc:STEP-V2-STEP-OP-1` (StepOp trait shape)
 //! - `txdoc:STEP-V2-DRIVER-MODE-1` (DriveMode classify matrix)
 
-/// Minimal v3 errno surface. PR-0 only needs `EAGAIN` to pin
-/// `StepOutcome::Err`; later PRs decide whether to relocate the
-/// existing `tx_subsystems::execution::Errno` upward or to keep a
-/// substrate-side Errno separate.
+/// Minimal v3 errno surface. PR-0 pinned `EAGAIN` so `StepOutcome::Err`
+/// had at least one inhabitant; wave-4's first cascade probe (the futex
+/// step fns under `tx_subsystems::futex`) needs `EINVAL` to express
+/// uaddr-validation failures, so this catalog grows by one variant.
+/// Future cascade probes (mount, pipe, …) will expand this set as
+/// needed; later PRs still decide whether to relocate the existing
+/// `tx_subsystems::execution::Errno` upward or keep a substrate-side
+/// Errno separate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Errno {
     EAGAIN,
+    EINVAL,
 }
 
 /// Opaque carrier handle. Replaces `tx_subsystems::execution::WaitToken`'s
