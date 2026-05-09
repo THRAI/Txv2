@@ -20,7 +20,7 @@ mod tests;
 
 pub use crate::cred::CapabilitySet;
 pub use checks::{DirectoryAtPath, EntityAtPath, ParentAndName, ResolveCtx, RootCtx};
-pub use execution::{FsOps, MountOutput};
+pub use execution::{FsOps, FsOpsV3, MountOutput};
 pub use structure::{
     render_dentry_path, Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind,
     InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult,
