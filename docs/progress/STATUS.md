@@ -4,6 +4,44 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9d (b) of the v3 TDD migration landed —
+  **first tx-shims production caller migrated to the v3 walker.**
+  `crates/tx-shims/src/linux_syscall/fs_path.rs::resolve_path_at`
+  (the helper that file-mode arms chmod/chown use to resolve
+  dirfd+path to a `Cap<DEntry>`) now calls `step_walk_v3` instead
+  of `step_walk`, exercising the v3 trait surface
+  (`FsOpsV3` via `MountPayload::fs_ops_v3` direct-field access
+  from wave 9d (a)) and the four-variant v3 outcome. Two
+  supporting changes:
+  (1) Reverse errno bridge — added
+  `From<step_v3::Errno> for execution::Errno` in
+  `crates/tx-subsystems/src/execution.rs` (sibling of the
+  wave-5 forward bridge). Exhaustive no-wildcard match across
+  all 27 variants. Lets v3-using shim sites route v3 errnos
+  back through the existing `errno_to_i32` table without
+  reimplementing the variant→i32 mapping per call site.
+  (2) Match-arm collapse — `resolve_path_at`'s 5-variant
+  `Done | Advanced / AdvancedThenBlocked | Blocked / Err`
+  match collapsed to the 4-variant v3
+  `Done / Continue | Yield / Err` shape; defensive `Continue`/`Yield`
+  arms map to `EIO` (in-tree fs backends never yield from
+  these paths today, mirroring the v4 defensive shape).
+  This is the **first time the v3 path runs in a production
+  syscall arm**: chmod/chown calls now traverse
+  `resolve_path_at → step_walk_v3 → walk_inner_v3 → FsOpsV3
+  trait dispatch → Tmpfs/Devfs/Ext4 v3 impls`. The other two
+  walker call sites in fs_path.rs (line 438 and 573) and the
+  `step_open` callers in fs_basic.rs / fs_mut.rs continue to
+  consume v4; subsequent sub-waves migrate them. Final count:
+  **1328 passed, 0 failed, 11 ignored across 60 binaries**
+  (unchanged from wave 9d (a) baseline). All lints + progress
+  validate green. **Wave 9d (c)+ unblocked:** migrate the
+  remaining fs_path.rs walker call sites, then fs_basic.rs and
+  fs_mut.rs `step_open` callers. After all v4 walker callers
+  are gone, wave 9e retires `step_walk` / `step_open` /
+  `walk_inner` and the FsOps trait can begin its retirement
+  cascade.
+
 - 2026-05-09 PR-1 wave-9d (a) of the v3 TDD migration landed —
   retired the wave-9c `FS_OPS_V3_REGISTRY` global SpinMutex
   sidecar by growing `MountPayload` with direct

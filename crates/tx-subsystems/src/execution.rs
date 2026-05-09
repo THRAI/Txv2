@@ -100,6 +100,49 @@ impl From<Errno> for tx_substrate::step_v3::Errno {
     }
 }
 
+/// Reverse bridge — `step_v3::Errno → execution::Errno`. Wave 9d (b)
+/// added the inverse of the wave-5 `From<Errno> for step_v3::Errno`
+/// impl so tx-shims call sites that switch from `step_walk` to
+/// `step_walk_v3` can route the v3 outcome's errno back through the
+/// existing `errno_to_i32` translation table without each site
+/// reproducing the variant-by-variant mapping. Exhaustive no-wildcard
+/// match: a future `step_v3::Errno`-only addition fails to compile
+/// until the v4 mirror is grown.
+impl From<tx_substrate::step_v3::Errno> for Errno {
+    fn from(value: tx_substrate::step_v3::Errno) -> Self {
+        use tx_substrate::step_v3::Errno as V3;
+        match value {
+            V3::EACCES => Errno::EACCES,
+            V3::EAGAIN => Errno::EAGAIN,
+            V3::EBADF => Errno::EBADF,
+            V3::EBUSY => Errno::EBUSY,
+            V3::EDQUOT => Errno::EDQUOT,
+            V3::EEXIST => Errno::EEXIST,
+            V3::EFAULT => Errno::EFAULT,
+            V3::EINVAL => Errno::EINVAL,
+            V3::EIO => Errno::EIO,
+            V3::EISDIR => Errno::EISDIR,
+            V3::ELOOP => Errno::ELOOP,
+            V3::ENAMETOOLONG => Errno::ENAMETOOLONG,
+            V3::ENODEV => Errno::ENODEV,
+            V3::ENOEXEC => Errno::ENOEXEC,
+            V3::ENOMEM => Errno::ENOMEM,
+            V3::ENOENT => Errno::ENOENT,
+            V3::ENOSYS => Errno::ENOSYS,
+            V3::ENOTDIR => Errno::ENOTDIR,
+            V3::ENOTEMPTY => Errno::ENOTEMPTY,
+            V3::ENOTTY => Errno::ENOTTY,
+            V3::EPERM => Errno::EPERM,
+            V3::EPIPE => Errno::EPIPE,
+            V3::ERANGE => Errno::ERANGE,
+            V3::EROFS => Errno::EROFS,
+            V3::ESPIPE => Errno::ESPIPE,
+            V3::ESRCH => Errno::ESRCH,
+            V3::ESTALE => Errno::ESTALE,
+        }
+    }
+}
+
 pub type KernelResult<T> = Result<T, Errno>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
