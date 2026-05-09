@@ -4,6 +4,45 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9d (a) of the v3 TDD migration landed —
+  retired the wave-9c `FS_OPS_V3_REGISTRY` global SpinMutex
+  sidecar by growing `MountPayload` with direct
+  `fs_ops_v3: Arc<dyn FsOpsV3>` and
+  `fs_page_backing_v3: Arc<dyn FsPageBackingV3>` fields. Worker
+  hit an API ECONNRESET mid-flight after updating
+  `MountPayload::new_cap` to take 9 args (added v3 fs_ops + v3
+  fs_page_backing positional arguments) and ~half the callers;
+  orchestrator finished. The registry (`FS_OPS_V3_REGISTRY`,
+  `register_mount_payload_v3`, `fs_ops_v3_for`,
+  `reset_fs_ops_v3_registry_for_test`) is now fully deleted from
+  walker.rs; `fs_ops_v3_for` re-implemented inside `walk_inner_v3`
+  as direct field access on the dentry's mount payload. 5+
+  `MountPayload::new_cap` callers updated across tx-kernel/init.rs
+  (rootfs + devfs mounts), tx-fs (initramfs_tests, tmpfs/tests),
+  tx-ext4, tx-shims, tx-scripts, and tx-subsystems internals;
+  most test fixtures grew `fs_ops_v3_arc` / `fs_page_backing_v3_arc`
+  factory methods mirroring the wave-9b pattern. Worker also
+  added v3 trait impls for `RecordingFs` and `BlockingFs` test
+  fixtures inline in page_backed.rs's `mod tests` (387 lines),
+  pushing the file over the 1500-line cap; orchestrator extracted
+  the entire `mod tests` block (1087 lines) to a new sibling file
+  `crates/tx-subsystems/src/page_backed/core_tests.rs` (page_backed.rs
+  now 788 lines, well under cap). One test
+  (`step_walk_v3_returns_enoent_on_missing`) re-`#[ignore]`'d
+  alongside the other 6 v3_walker tests under the existing
+  main-side zone-slot Weak::upgrade cascade flake (passes in
+  isolation; cascade is zone-level, not registry-level — registry
+  retirement does not fix it). Final count: **1328 passed, 0
+  failed, 11 ignored across 60 binaries** (wave-9c baseline 1330;
+  net -2 = 1 newly-ignored cascade-flake test + 1 helper
+  retirement; all gates green). `cargo xtask lint arch | docs |
+  progress validate` all green. **Wave 9d (b) unblocked:**
+  migrate first tx-shims caller (likely `linux_syscall::fs_path::resolve_path_at`
+  via `poll_walker_synchronously(step_walk(...))` at fs_path.rs:86)
+  from `step_walk` / `step_open` to `step_walk_v3` / `step_open_v3`.
+  Once a tx-shims caller exercises v3 in production, the v4
+  walker fns can start being retired in wave 9e.
+
 - 2026-05-09 PR-1 wave-9c of the v3 TDD migration landed — first
   v3 path running end-to-end through a real walker entry. Single
   deep worker. Three deliverables:

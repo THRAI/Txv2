@@ -8,8 +8,8 @@ use tx_substrate::SpinMutex;
 
 use crate::device::BlockDevice;
 use crate::execution::KernelResult;
-use crate::page_backed::{FsPageBacking, PageContainer};
-use crate::vfs::{DEntry, FsObjectId, FsOps, InodeMeta, RNode};
+use crate::page_backed::{FsPageBacking, FsPageBackingV3, PageContainer};
+use crate::vfs::{DEntry, FsObjectId, FsOps, FsOpsV3, InodeMeta, RNode};
 use tx_substrate::zone::{
     self, Cap, Dead, Entity, PayloadBinding, PayloadCap, Zone, ZoneAllocated, ZoneError,
 };
@@ -92,7 +92,9 @@ pub enum SourceLabel {
 pub struct MountPayload {
     payload_pin_count: AtomicU32,
     pub fs_ops: Arc<dyn FsOps>,
+    pub fs_ops_v3: Arc<dyn FsOpsV3>,
     pub fs_page_backing: Arc<dyn FsPageBacking>,
+    pub fs_page_backing_v3: Arc<dyn FsPageBackingV3>,
     pub backing: Option<Arc<dyn BlockDevice>>,
     pub dev_id: DevId,
     pub options: MountOptions,
@@ -101,9 +103,12 @@ pub struct MountPayload {
 }
 
 impl MountPayload {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         fs_ops: Arc<dyn FsOps>,
+        fs_ops_v3: Arc<dyn FsOpsV3>,
         fs_page_backing: Arc<dyn FsPageBacking>,
+        fs_page_backing_v3: Arc<dyn FsPageBackingV3>,
         backing: Option<Arc<dyn BlockDevice>>,
         dev_id: DevId,
         options: MountOptions,
@@ -113,7 +118,9 @@ impl MountPayload {
         Self {
             payload_pin_count: AtomicU32::new(0),
             fs_ops,
+            fs_ops_v3,
             fs_page_backing,
+            fs_page_backing_v3,
             backing,
             dev_id,
             options,
@@ -122,9 +129,12 @@ impl MountPayload {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_cap(
         fs_ops: Arc<dyn FsOps>,
+        fs_ops_v3: Arc<dyn FsOpsV3>,
         fs_page_backing: Arc<dyn FsPageBacking>,
+        fs_page_backing_v3: Arc<dyn FsPageBackingV3>,
         backing: Option<Arc<dyn BlockDevice>>,
         dev_id: DevId,
         options: MountOptions,
@@ -136,7 +146,9 @@ impl MountPayload {
             reservation,
             Self::new(
                 fs_ops,
+                fs_ops_v3,
                 fs_page_backing,
+                fs_page_backing_v3,
                 backing,
                 dev_id,
                 options,
@@ -148,6 +160,20 @@ impl MountPayload {
 
     pub fn payload_pin_count(&self) -> u32 {
         self.payload_pin_count.load(Ordering::Acquire)
+    }
+
+    /// Accessor for the v3 fs_ops trait object. Mirrors the public
+    /// `fs_ops` field's read pattern; surfaced as a method so the
+    /// walker's `fs_ops_v3_for` can route through `payload.fs_ops_v3()`
+    /// the same way `payload.fs_ops` is read today.
+    pub fn fs_ops_v3(&self) -> &Arc<dyn FsOpsV3> {
+        &self.fs_ops_v3
+    }
+
+    /// Accessor for the v3 page-backing trait object. Mirrors
+    /// [`MountPayload::fs_ops_v3`].
+    pub fn fs_page_backing_v3(&self) -> &Arc<dyn FsPageBackingV3> {
+        &self.fs_page_backing_v3
     }
 }
 
@@ -646,6 +672,144 @@ mod tests {
         }
     }
 
+    // v3 trait impls so MockFs can satisfy the v3 fields on
+    // `MountPayload`. Bodies match the v4 impl one-for-one, with
+    // every v4 outcome replaced by `tx_substrate::step_v3::*`.
+    impl FsOpsV3 for MockFs {
+        fn lookup(
+            &self,
+            _parent: FsObjectId,
+            name: &[u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
+            if name == b"root" {
+                tx_substrate::step_v3::StepOutcome::done(FsObjectId::ROOT)
+            } else {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT)
+            }
+        }
+
+        fn load_inode_meta(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755))
+        }
+
+        fn serialize_inode_meta(
+            &self,
+            _fs_object_id: FsObjectId,
+            _meta: &InodeMeta,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::done(())
+        }
+
+        fn create_inode(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _mode: u16,
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<
+            (FsObjectId, InodeMeta),
+            tx_substrate::step_v3::NoProgress,
+        > {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        }
+
+        fn unlink(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        }
+
+        fn rename(
+            &self,
+            _old_parent: FsObjectId,
+            _old_name: &[u8],
+            _new_parent: FsObjectId,
+            _new_name: &[u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        }
+
+        fn link(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        }
+
+        fn mkdir(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _mode: u16,
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<
+            (FsObjectId, InodeMeta),
+            tx_substrate::step_v3::NoProgress,
+        > {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        }
+
+        fn rmdir(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        }
+
+        fn symlink(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _link_target: &[u8],
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<
+            (FsObjectId, InodeMeta),
+            tx_substrate::step_v3::NoProgress,
+        > {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        }
+
+        fn readdir(
+            &self,
+            _fs_object_id: FsObjectId,
+            _cursor: DirCursor,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<
+            Option<(DirEntry, DirCursor)>,
+            tx_substrate::step_v3::NoProgress,
+        > {
+            tx_substrate::step_v3::StepOutcome::done(None)
+        }
+
+        fn destroy_inode(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::done(())
+        }
+    }
+
     impl FsPageBacking for MockFs {
         fn fetch_page(
             &self,
@@ -680,6 +844,44 @@ mod tests {
         }
     }
 
+    impl FsPageBackingV3 for MockFs {
+        fn fetch_page(
+            &self,
+            _fs_object_id: FsObjectId,
+            _offset: u64,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+        }
+
+        fn flush_page(
+            &self,
+            _fs_object_id: FsObjectId,
+            _offset: u64,
+            _frame: &Frame,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        }
+
+        fn truncate(
+            &self,
+            _fs_object_id: FsObjectId,
+            _new_size: u64,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        }
+
+        fn fsync(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::done(())
+        }
+    }
+
     #[test]
     fn mount_payload_stores_backend_traits_and_pins_are_explicit() {
         tx_substrate::testing::init_host_for_test_once();
@@ -689,8 +891,10 @@ mod tests {
         crate::zones::register_all().expect("kernel zones");
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
-            fs.clone(),
-            fs,
+            fs.clone() as Arc<dyn FsOps>,
+            fs.clone() as Arc<dyn FsOpsV3>,
+            fs.clone() as Arc<dyn FsPageBacking>,
+            fs as Arc<dyn FsPageBackingV3>,
             None,
             DevId::new(1),
             MountOptions::default(),
@@ -717,8 +921,10 @@ mod tests {
         crate::zones::register_all().expect("kernel zones");
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
-            fs.clone(),
-            fs,
+            fs.clone() as Arc<dyn FsOps>,
+            fs.clone() as Arc<dyn FsOpsV3>,
+            fs.clone() as Arc<dyn FsPageBacking>,
+            fs as Arc<dyn FsPageBackingV3>,
             None,
             DevId::new(2),
             MountOptions::default(),
@@ -750,8 +956,10 @@ mod tests {
 
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
-            fs.clone(),
-            fs,
+            fs.clone() as Arc<dyn FsOps>,
+            fs.clone() as Arc<dyn FsOpsV3>,
+            fs.clone() as Arc<dyn FsPageBacking>,
+            fs as Arc<dyn FsPageBackingV3>,
             None,
             DevId::new(3),
             MountOptions::default(),

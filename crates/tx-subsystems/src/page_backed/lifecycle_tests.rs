@@ -249,6 +249,8 @@ impl FsOps for LifecycleFs {
 fn file_page_container(fs: Arc<LifecycleFs>, fs_object_id: FsObjectId) -> PageContainer {
     let mount = MountPayload::new_cap(
         fs.clone(),
+        fs.clone(),
+        fs.clone(),
         fs,
         None,
         DevId::new(8),
@@ -846,6 +848,87 @@ impl FsOpsV3 for LifecycleFs {
         _guard: &Guard<'_>,
     ) -> V3Outcome<(), NoProgress> {
         V3Outcome::done(())
+    }
+}
+
+// Wave 9d: `FsPageBackingV3` impl so `MountPayload` can hold a
+// `LifecycleFs` for the v3 page-backing slot. The impls mirror the
+// existing v4 bodies above; v4 `Blocked` becomes v3 `Err(EAGAIN)`.
+impl crate::page_backed::FsPageBackingV3 for LifecycleFs {
+    fn fetch_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<Frame, NoProgress> {
+        V3Outcome::done(Frame::new(
+            tx_substrate::page_allocator::zero_frame_ppn().expect("zero frame"),
+        ))
+    }
+
+    fn flush_page(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        _frame: &Frame,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
+        let flush = self.flushes.fetch_add(1, Ordering::AcqRel);
+        self.last_object
+            .store(fs_object_id.as_u64(), Ordering::Release);
+        self.last_offset.store(offset, Ordering::Release);
+        if self.block_flush_after == Some(flush) {
+            V3Outcome::err(V3Errno::EAGAIN)
+        } else {
+            V3Outcome::done(())
+        }
+    }
+
+    fn truncate(
+        &self,
+        fs_object_id: FsObjectId,
+        new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
+        self.truncates.fetch_add(1, Ordering::AcqRel);
+        self.last_object
+            .store(fs_object_id.as_u64(), Ordering::Release);
+        self.last_truncate_size.store(new_size, Ordering::Release);
+        match self.truncate_outcome.clone() {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => V3Outcome::done(()),
+            StepOutcome::AdvancedThenBlocked((), _) => V3Outcome::done(()),
+            StepOutcome::Blocked(_) => V3Outcome::err(V3Errno::EAGAIN),
+            StepOutcome::Err(e) => V3Outcome::err(e.into()),
+        }
+    }
+
+    fn fsync(
+        &self,
+        fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
+        self.fsyncs.fetch_add(1, Ordering::AcqRel);
+        self.last_object
+            .store(fs_object_id.as_u64(), Ordering::Release);
+        V3Outcome::done(())
+    }
+
+    fn fallocate(
+        &self,
+        fs_object_id: FsObjectId,
+        new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
+        self.fallocates.fetch_add(1, Ordering::AcqRel);
+        self.last_object
+            .store(fs_object_id.as_u64(), Ordering::Release);
+        self.last_fallocate_size.store(new_size, Ordering::Release);
+        match self.fallocate_outcome.clone() {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => V3Outcome::done(()),
+            StepOutcome::AdvancedThenBlocked((), _) => V3Outcome::done(()),
+            StepOutcome::Blocked(_) => V3Outcome::err(V3Errno::EAGAIN),
+            StepOutcome::Err(e) => V3Outcome::err(e.into()),
+        }
     }
 }
 

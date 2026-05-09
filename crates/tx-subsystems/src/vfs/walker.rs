@@ -500,78 +500,17 @@ fn materialise_child_rnode_v3<'g>(
 
 /// Resolve the `Arc<dyn FsOpsV3>` in scope for a given dentry by
 /// upgrading its RNode's containing-mount weak and reading the
-/// payload's v3 fs_ops slot.
+/// payload's v3 fs_ops slot directly. Mirrors [`fs_ops_for`] one-for-one
+/// against the v3 field.
 ///
-/// Today `MountPayload` only stores the v4 `fs_ops` field; the v3
-/// trait surface for a mount is resolved by walking the rootfs/mount
-/// configuration through `MountOutput::fs_ops_v3`, which a future
-/// mount-time wave threads into the payload. As a tide-over, we
-/// consult a thread-local `MountPayloadV3Map` registered from
-/// test fixtures (and, in production, populated by
-/// `MountOutput::fs_ops_v3` plumbing once it lands).
-///
-/// For wave 9c, the only production caller of `step_walk_v3` is the
-/// test surface; the registry below is populated in the v3 walker
-/// tests via [`register_mount_payload_v3`] (sibling-only API gated
-/// behind the same `#[cfg(test)]` as the test fixtures so the
-/// registry never grows in production builds).
+/// Wave 9d retired the sidecar registry that previously bridged the
+/// v3 walker to mount payloads — `MountPayload::fs_ops_v3` is now a
+/// regular field populated at mount-publication time, so the v3
+/// walker reads the same way the v4 walker reads `payload.fs_ops`.
 fn fs_ops_v3_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Arc<dyn FsOpsV3>> {
     let mount_payload_weak: Weak<MountPayload> = dentry.rnode().containing_mount_weak()?;
     let payload = mount_payload_weak.upgrade(guard)?;
-    fs_ops_v3_lookup(&payload)
-}
-
-// === MountPayload → FsOpsV3 sidecar registry ==========================
-//
-// `MountPayload` does not yet carry an `fs_ops_v3` slot — a sibling
-// wave grows the field on-payload. Until then, the v3 walker needs a
-// way to find the v3 trait object that corresponds to a given payload.
-// We store the mapping in a small `(payload_key, Arc<dyn FsOpsV3>)`
-// table that callers populate at the same time they install the
-// payload. The table is a `SpinMutex<Vec<...>>` matching the
-// existing mount-point registry's discipline; lookup is O(n) but n
-// is single-digit during the boot path.
-
-static FS_OPS_V3_REGISTRY: tx_substrate::SpinMutex<
-    Vec<(usize, Arc<dyn FsOpsV3>)>,
-> = tx_substrate::SpinMutex::new(Vec::new());
-
-/// Register an `Arc<dyn FsOpsV3>` for the given mount payload. Called
-/// by mount publication paths immediately after `MountPayload::new_cap`
-/// (and by the v3 walker tests). The mapping uses the payload Cap's
-/// pointer identity as the key.
-pub fn register_mount_payload_v3(payload: &Cap<MountPayload>, fs_ops_v3: Arc<dyn FsOpsV3>) {
-    let key = payload_key(payload);
-    let mut table = FS_OPS_V3_REGISTRY.lock();
-    if let Some(slot) = table.iter_mut().find(|(k, _)| *k == key) {
-        slot.1 = fs_ops_v3;
-    } else {
-        table.push((key, fs_ops_v3));
-    }
-}
-
-/// Drop every registered entry. Test-only, used by `reset_*` helpers
-/// to keep tests isolated.
-#[cfg(any(test, feature = "test-support"))]
-pub fn reset_fs_ops_v3_registry_for_test() {
-    FS_OPS_V3_REGISTRY.lock().clear();
-}
-
-fn fs_ops_v3_lookup(payload: &Cap<MountPayload>) -> Option<Arc<dyn FsOpsV3>> {
-    let key = payload_key(payload);
-    let table = FS_OPS_V3_REGISTRY.lock();
-    table
-        .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, ops)| ops.clone())
-}
-
-fn payload_key(payload: &Cap<MountPayload>) -> usize {
-    // Use the Cap's `key()` method (provided by the zone substrate)
-    // for stable identity hashing. The key encodes the zone slot
-    // pair `(zone_id, slot_id)`; cast its `raw()` u32 to `usize`
-    // for the registry table.
-    payload.key().raw() as usize
+    Some(payload.fs_ops_v3().clone())
 }
 
 // === DAC predicates ===================================================

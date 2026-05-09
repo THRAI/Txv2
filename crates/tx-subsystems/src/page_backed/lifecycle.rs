@@ -463,7 +463,7 @@ mod v3_tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tx_substrate::page_allocator;
     use tx_substrate::step_v3::{
-        Errno as V3Errno, InterestConditions, PageProgress, StepOutcome as V3Outcome,
+        Errno as V3Errno, InterestConditions, NoProgress, PageProgress, StepOutcome as V3Outcome,
         WakeCarrier, YieldShape,
     };
 
@@ -702,8 +702,174 @@ mod v3_tests {
         }
     }
 
+    // Wave 9d: v3 trait impls so the inner-mod LifecycleFs satisfies
+    // the v3 fields on `MountPayload`. Bodies mirror the v4 impls;
+    // anything that goes through `Blocked(_)` upgrades to
+    // `Err(EAGAIN)` (the v3 surface has no `NoProgress`-Blocked
+    // variant).
+    impl crate::vfs::FsOpsV3 for LifecycleFs {
+        fn lookup(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<FsObjectId, NoProgress> {
+            V3Outcome::err(V3Errno::ENOSYS)
+        }
+
+        fn load_inode_meta(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<InodeMeta, NoProgress> {
+            V3Outcome::done(InodeMeta::new(InodeKind::Regular, 0o100644))
+        }
+
+        fn serialize_inode_meta(
+            &self,
+            _fs_object_id: FsObjectId,
+            _meta: &InodeMeta,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(), NoProgress> {
+            V3Outcome::done(())
+        }
+
+        fn create_inode(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _mode: u16,
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(FsObjectId, InodeMeta), NoProgress> {
+            V3Outcome::err(V3Errno::EROFS)
+        }
+
+        fn unlink(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(), NoProgress> {
+            V3Outcome::err(V3Errno::EROFS)
+        }
+
+        fn rename(
+            &self,
+            _old_parent: FsObjectId,
+            _old_name: &[u8],
+            _new_parent: FsObjectId,
+            _new_name: &[u8],
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(), NoProgress> {
+            V3Outcome::err(V3Errno::EROFS)
+        }
+
+        fn link(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(), NoProgress> {
+            V3Outcome::err(V3Errno::EROFS)
+        }
+
+        fn mkdir(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _mode: u16,
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(FsObjectId, InodeMeta), NoProgress> {
+            V3Outcome::err(V3Errno::EROFS)
+        }
+
+        fn rmdir(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(), NoProgress> {
+            V3Outcome::err(V3Errno::EROFS)
+        }
+
+        fn symlink(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _link_target: &[u8],
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(FsObjectId, InodeMeta), NoProgress> {
+            V3Outcome::err(V3Errno::EROFS)
+        }
+
+        fn readdir(
+            &self,
+            _fs_object_id: FsObjectId,
+            _cursor: DirCursor,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<Option<(DirEntry, DirCursor)>, NoProgress> {
+            V3Outcome::done(None)
+        }
+
+        fn destroy_inode(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(), NoProgress> {
+            V3Outcome::done(())
+        }
+    }
+
+    impl crate::page_backed::FsPageBackingV3 for LifecycleFs {
+        fn fetch_page(
+            &self,
+            _fs_object_id: FsObjectId,
+            _offset: u64,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<Frame, NoProgress> {
+            V3Outcome::done(Frame::new(
+                page_allocator::zero_frame_ppn().expect("zero frame"),
+            ))
+        }
+
+        fn flush_page(
+            &self,
+            _fs_object_id: FsObjectId,
+            _offset: u64,
+            _frame: &Frame,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(), NoProgress> {
+            V3Outcome::done(())
+        }
+
+        fn truncate(
+            &self,
+            _fs_object_id: FsObjectId,
+            _new_size: u64,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(), NoProgress> {
+            V3Outcome::done(())
+        }
+
+        fn fsync(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> V3Outcome<(), NoProgress> {
+            V3Outcome::done(())
+        }
+    }
+
     fn file_page_container(fs: Arc<LifecycleFs>, fs_object_id: FsObjectId) -> PageContainer {
         let mount = MountPayload::new_cap(
+            fs.clone(),
+            fs.clone(),
             fs.clone(),
             fs,
             None,
