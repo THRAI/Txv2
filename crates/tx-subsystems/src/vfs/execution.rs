@@ -7,7 +7,7 @@
 
 use alloc::sync::Arc;
 
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
 use crate::page_backed::FsPageBacking;
 use crate::tty;
 
@@ -250,7 +250,24 @@ impl OpenFile {
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Reader,
-                } => crate::pipe::step_read(payload, out, guard, self.flags.nonblocking),
+                } => {
+                    // pipe::step_read returns step_v3 outcome; translate
+                    // back into the v4 outcome shape this fn surfaces.
+                    use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
+                    match crate::pipe::step_read(payload, out, guard, self.flags.nonblocking) {
+                        V3Out::Done(n) => StepOutcome::Done(n),
+                        V3Out::Continue { progress } => StepOutcome::Advanced(progress.bytes()),
+                        V3Out::Yield {
+                            progress: _,
+                            shape: YieldShape::OnCarrier { carrier, interests },
+                        } => StepOutcome::Blocked(WaitToken::new(carrier.raw(), interests.raw())),
+                        V3Out::Yield {
+                            shape: YieldShape::OnAgent { .. },
+                            ..
+                        } => StepOutcome::Err(Errno::EIO),
+                        V3Out::Err(v3errno) => StepOutcome::Err(v3errno.into()),
+                    }
+                }
                 // Wrong-side read against a writer-end RNode. The
                 // OpenFileFlags.read=false guard above handles the
                 // common case (writer-end OpenFiles never set read);
@@ -359,7 +376,24 @@ impl OpenFile {
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Writer,
-                } => crate::pipe::step_write(payload, bytes, guard, self.flags.nonblocking),
+                } => {
+                    // pipe::step_write returns step_v3 outcome; translate
+                    // back into the v4 outcome shape this fn surfaces.
+                    use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
+                    match crate::pipe::step_write(payload, bytes, guard, self.flags.nonblocking) {
+                        V3Out::Done(n) => StepOutcome::Done(n),
+                        V3Out::Continue { progress } => StepOutcome::Advanced(progress.bytes()),
+                        V3Out::Yield {
+                            progress: _,
+                            shape: YieldShape::OnCarrier { carrier, interests },
+                        } => StepOutcome::Blocked(WaitToken::new(carrier.raw(), interests.raw())),
+                        V3Out::Yield {
+                            shape: YieldShape::OnAgent { .. },
+                            ..
+                        } => StepOutcome::Err(Errno::EIO),
+                        V3Out::Err(v3errno) => StepOutcome::Err(v3errno.into()),
+                    }
+                }
                 // Wrong-side write against a reader-end RNode.
                 StructPayload::Pipe {
                     side: crate::pipe::PipeSide::Reader,
