@@ -233,22 +233,32 @@ pub fn step_fallocate(pc: &PageContainer, new_size: u64, guard: &Guard<'_>) -> S
         return StepOutcome::Done(());
     }
 
+    use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
     let fs_advanced = match pc.kind() {
         PageContainerKind::File {
             mount,
             fs_object_id,
         } => match mount
             .payload()
-            .fs_page_backing
+            .fs_page_backing_v3
             .fallocate(*fs_object_id, new_size, guard)
         {
-            StepOutcome::Done(()) => false,
-            StepOutcome::Advanced(()) => true,
-            StepOutcome::Blocked(token) => return StepOutcome::Blocked(token),
-            StepOutcome::AdvancedThenBlocked((), token) => {
-                return StepOutcome::AdvancedThenBlocked((), token);
+            V3::Done(()) => false,
+            V3::Continue { progress: _ } => true,
+            V3::Yield {
+                progress: _,
+                shape: YieldShape::OnCarrier { carrier, interests },
+            } => {
+                return StepOutcome::Blocked(crate::execution::WaitToken::new(
+                    carrier.raw(),
+                    interests.raw(),
+                ));
             }
-            StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+            V3::Yield {
+                shape: YieldShape::OnAgent { .. },
+                ..
+            } => return StepOutcome::Err(Errno::EIO),
+            V3::Err(v3_errno) => return StepOutcome::Err(Errno::from(v3_errno)),
         },
         PageContainerKind::Anon { .. } => false,
         PageContainerKind::Device { .. } => unreachable!(),
@@ -433,7 +443,7 @@ pub fn step_truncate_v3(
     new_size: u64,
     guard: &Guard<'_>,
 ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::PageProgress> {
-    use tx_substrate::step_v3::{PageProgress, StepOutcome as V3};
+    use tx_substrate::step_v3::{PageProgress, StepOutcome as V3, YieldShape};
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
         return V3::err(Errno::EINVAL.into());
@@ -452,26 +462,26 @@ pub fn step_truncate_v3(
             fs_object_id,
         } => match mount
             .payload()
-            .fs_page_backing
+            .fs_page_backing_v3
             .truncate(*fs_object_id, new_size, guard)
         {
-            StepOutcome::Done(()) => false,
-            StepOutcome::Advanced(()) => true,
-            StepOutcome::Blocked(token) => {
+            V3::Done(()) => false,
+            V3::Continue { progress: _ } => true,
+            V3::Yield {
+                progress: _,
+                shape: YieldShape::OnCarrier { carrier, interests },
+            } => {
                 return V3::yield_on_carrier(
                     PageProgress::EMPTY,
-                    token.carrier(),
-                    token.interest(),
+                    carrier.raw(),
+                    interests.raw(),
                 );
             }
-            StepOutcome::AdvancedThenBlocked((), token) => {
-                return V3::yield_on_carrier(
-                    PageProgress::EMPTY,
-                    token.carrier(),
-                    token.interest(),
-                );
-            }
-            StepOutcome::Err(errno) => return V3::err(errno.into()),
+            V3::Yield {
+                shape: YieldShape::OnAgent { .. },
+                ..
+            } => return V3::err(tx_substrate::step_v3::Errno::EIO),
+            V3::Err(v3_errno) => return V3::err(v3_errno),
         },
         PageContainerKind::Anon { .. } => false,
         PageContainerKind::Device { .. } => unreachable!(),
@@ -943,8 +953,6 @@ mod v3_tests {
 
     fn file_page_container(fs: Arc<LifecycleFs>, fs_object_id: FsObjectId) -> PageContainer {
         let mount = MountPayload::new_cap(
-            fs.clone(),
-            fs.clone(),
             fs.clone(),
             fs,
             None,

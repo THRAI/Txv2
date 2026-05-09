@@ -446,9 +446,7 @@ fn build_rootfs() -> Topology {
     let root_id = FsObjectId::new(2);
 
     let payload = MountPayload::new_cap(
-        rootfs.clone() as Arc<dyn FsOps>,
         rootfs.clone() as Arc<dyn crate::vfs::FsOpsV3>,
-        rootfs.clone() as Arc<dyn FsPageBacking>,
         rootfs.clone() as Arc<dyn crate::page_backed::FsPageBackingV3>,
         None,
         DevId::new(1),
@@ -521,9 +519,7 @@ fn mount_devfs_at_dev(topo: &Topology) -> (Cap<MountIdentity>, Cap<TtyIdentity>)
     devfs.add_dir(devfs_root_id, b"consoledir");
 
     let dev_payload = MountPayload::new_cap(
-        devfs.clone() as Arc<dyn FsOps>,
         devfs.clone() as Arc<dyn crate::vfs::FsOpsV3>,
-        devfs.clone() as Arc<dyn FsPageBacking>,
         devfs.clone() as Arc<dyn crate::page_backed::FsPageBackingV3>,
         None,
         DevId::new(2),

@@ -72,9 +72,7 @@ fn stat_setup() -> TestSetup {
 fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>, Cap<RNode>) {
     let tmpfs = Arc::new(Tmpfs::new());
     let payload = MountPayload::new_cap(
-        tmpfs.clone() as Arc<dyn FsOps>,
         tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOpsV3>,
-        tmpfs.clone() as Arc<dyn FsPageBacking>,
         tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBackingV3>,
         None,
         DevId::new(311),

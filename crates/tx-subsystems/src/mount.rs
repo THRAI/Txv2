@@ -8,8 +8,8 @@ use tx_substrate::SpinMutex;
 
 use crate::device::BlockDevice;
 use crate::execution::KernelResult;
-use crate::page_backed::{FsPageBacking, FsPageBackingV3, PageContainer};
-use crate::vfs::{DEntry, FsObjectId, FsOps, FsOpsV3, InodeMeta, RNode};
+use crate::page_backed::{FsPageBackingV3, PageContainer};
+use crate::vfs::{DEntry, FsObjectId, FsOpsV3, InodeMeta, RNode};
 use tx_substrate::zone::{
     self, Cap, Dead, Entity, PayloadBinding, PayloadCap, Zone, ZoneAllocated, ZoneError,
 };
@@ -91,9 +91,7 @@ pub enum SourceLabel {
 
 pub struct MountPayload {
     payload_pin_count: AtomicU32,
-    pub fs_ops: Arc<dyn FsOps>,
     pub fs_ops_v3: Arc<dyn FsOpsV3>,
-    pub fs_page_backing: Arc<dyn FsPageBacking>,
     pub fs_page_backing_v3: Arc<dyn FsPageBackingV3>,
     pub backing: Option<Arc<dyn BlockDevice>>,
     pub dev_id: DevId,
@@ -105,9 +103,7 @@ pub struct MountPayload {
 impl MountPayload {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        fs_ops: Arc<dyn FsOps>,
         fs_ops_v3: Arc<dyn FsOpsV3>,
-        fs_page_backing: Arc<dyn FsPageBacking>,
         fs_page_backing_v3: Arc<dyn FsPageBackingV3>,
         backing: Option<Arc<dyn BlockDevice>>,
         dev_id: DevId,
@@ -117,9 +113,7 @@ impl MountPayload {
     ) -> Self {
         Self {
             payload_pin_count: AtomicU32::new(0),
-            fs_ops,
             fs_ops_v3,
-            fs_page_backing,
             fs_page_backing_v3,
             backing,
             dev_id,
@@ -131,9 +125,7 @@ impl MountPayload {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_cap(
-        fs_ops: Arc<dyn FsOps>,
         fs_ops_v3: Arc<dyn FsOpsV3>,
-        fs_page_backing: Arc<dyn FsPageBacking>,
         fs_page_backing_v3: Arc<dyn FsPageBackingV3>,
         backing: Option<Arc<dyn BlockDevice>>,
         dev_id: DevId,
@@ -145,9 +137,7 @@ impl MountPayload {
         Ok(zone::sign_for(
             reservation,
             Self::new(
-                fs_ops,
                 fs_ops_v3,
-                fs_page_backing,
                 fs_page_backing_v3,
                 backing,
                 dev_id,
@@ -162,16 +152,10 @@ impl MountPayload {
         self.payload_pin_count.load(Ordering::Acquire)
     }
 
-    /// Accessor for the v3 fs_ops trait object. Mirrors the public
-    /// `fs_ops` field's read pattern; surfaced as a method so the
-    /// walker's `fs_ops_v3_for` can route through `payload.fs_ops_v3()`
-    /// the same way `payload.fs_ops` is read today.
     pub fn fs_ops_v3(&self) -> &Arc<dyn FsOpsV3> {
         &self.fs_ops_v3
     }
 
-    /// Accessor for the v3 page-backing trait object. Mirrors
-    /// [`MountPayload::fs_ops_v3`].
     pub fn fs_page_backing_v3(&self) -> &Arc<dyn FsPageBackingV3> {
         &self.fs_page_backing_v3
     }
@@ -349,9 +333,7 @@ pub struct MountInitContext {
 }
 
 pub struct MountOutput {
-    pub fs_ops: Arc<dyn FsOps>,
     pub fs_ops_v3: Arc<dyn crate::vfs::FsOpsV3>,
-    pub fs_page_backing: Arc<dyn FsPageBacking>,
     pub fs_page_backing_v3: Arc<dyn crate::page_backed::FsPageBackingV3>,
     pub root_fs_object_id: FsObjectId,
     pub root_inode_meta: InodeMeta,
@@ -548,8 +530,8 @@ fn cap_raw_addr<T>(cap: &Cap<T>) -> usize {
 mod tests {
     use super::*;
     use crate::execution::{Errno, Guard, StepOutcome};
-    use crate::page_backed::{Frame, PageContainerKind};
-    use crate::vfs::{Credential, DirCursor, DirEntry, InodeKind, RNodeBacking};
+    use crate::page_backed::{Frame, FsPageBacking, PageContainerKind};
+    use crate::vfs::{Credential, DirCursor, DirEntry, FsOps, InodeKind, RNodeBacking};
 
     struct MockFs;
 
@@ -891,9 +873,7 @@ mod tests {
         crate::zones::register_all().expect("kernel zones");
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
-            fs.clone() as Arc<dyn FsOps>,
             fs.clone() as Arc<dyn FsOpsV3>,
-            fs.clone() as Arc<dyn FsPageBacking>,
             fs as Arc<dyn FsPageBackingV3>,
             None,
             DevId::new(1),
@@ -921,9 +901,7 @@ mod tests {
         crate::zones::register_all().expect("kernel zones");
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
-            fs.clone() as Arc<dyn FsOps>,
             fs.clone() as Arc<dyn FsOpsV3>,
-            fs.clone() as Arc<dyn FsPageBacking>,
             fs as Arc<dyn FsPageBackingV3>,
             None,
             DevId::new(2),
@@ -956,9 +934,7 @@ mod tests {
 
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
-            fs.clone() as Arc<dyn FsOps>,
             fs.clone() as Arc<dyn FsOpsV3>,
-            fs.clone() as Arc<dyn FsPageBacking>,
             fs as Arc<dyn FsPageBackingV3>,
             None,
             DevId::new(3),
