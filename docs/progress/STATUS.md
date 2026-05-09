@@ -4,6 +4,41 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9h-a ATTEMPTED-AND-REVERTED. Tried to
+  migrate `step_fsync_v3` / `step_truncate_v3` bodies from v4
+  trait to v3 trait AND drop v4 fields from
+  `MountPayload`/`MountOutput` in one push. Reached 0 build
+  errors but 86 test failures (1328 → 1189), all in
+  `page_backed::core_tests` / `cross_variant_tests` /
+  `lifecycle::v3_tests` / `lifecycle_tests`. Root cause: every
+  test fixture (RecordingFs, BlockingFs, LifecycleFs, MockFs,
+  TestFs, ExecveTestFs, ExecTestFs) impls **both** v4 FsOps/
+  FsPageBacking and v3 FsOpsV3/FsPageBackingV3, but the v3
+  impls are stubs that don't preserve fixture-specific
+  bookkeeping (`flushes` counter, `block_flush_after` config
+  field, `WaitToken { 13, 0x55 }` marker). When migration
+  rerouted all readers from v4 to v3 trait, the v3 stubs lost
+  the test-fixture state. Reverting via stash drop; baseline
+  preserved at **1328 / 0 / 11 / 60**. **Lessons:** wave 9h
+  cannot land as one mechanical push. The right path is
+  per-fixture: for each of the 7+ test fixtures, rewrite its
+  v3 impls to delegate to v4 (call `<Self as FsOps>::method`,
+  translate v4 outcome → v3 outcome). Wave 9a's TestFs/Tmpfs
+  pattern + wave 9h-a's LifecycleFs lifecycle.rs (in v3_tests
+  submodule) demonstrate the delegation shape. Once every
+  fixture's v3 impl delegates to v4 (or is rewritten with
+  full fixture-state awareness), `MountPayload::fs_ops` /
+  `fs_page_backing` field reads can be safely retired. **Wave
+  9h plan revised:** 9h-a-actual = port each test fixture's v3
+  impls to delegate to v4 (one fixture per sub-wave); 9h-b =
+  drop MountPayload/MountOutput v4 fields once fixtures are
+  v4-stable; 9h-c = delete v4 trait + impl blocks; 9h-d =
+  rename FsOpsV3→FsOps. The original 9g-f Approach A choice
+  (v3 fns calling v4 trait, with conversion at boundary) is
+  ALSO compatible with this revised plan — leaving v3 fns as
+  v4-callers means MountPayload's v4 fields are needed
+  forever. Pick a direction in the next user check-in.
+
 - 2026-05-09 PR-1 wave-9g fan-out landed (5 parallel workers
   across disjoint files completing the trait-method caller
   migration begun in 9g-a). After this wave essentially every
