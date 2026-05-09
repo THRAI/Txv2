@@ -11,6 +11,7 @@ use tx_substrate::zone::{self, Cap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::{Errno, Guard, StepOutcome};
+use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
 use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
@@ -23,7 +24,7 @@ use crate::vfs::structure::{
 };
 use crate::vfs::FsOps;
 
-use super::{step_open, step_walk, SYMLOOP_MAX};
+use super::{step_open_v3, step_walk_v3, SYMLOOP_MAX};
 
 // === capturing char-device binding for the console TTY ================
 
@@ -601,7 +602,7 @@ fn step_walk_resolves_relative_path_within_rootfs() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(
+    let outcome = block_on(step_walk_v3(
         topo.root_dentry.clone(),
         b"foo/bar",
         &cred,
@@ -609,7 +610,7 @@ fn step_walk_resolves_relative_path_within_rootfs() {
     ));
     drop(guard);
     let dentry = match outcome {
-        StepOutcome::Done(d) => d,
+        V3::Done(d) => d,
         other => panic!("expected Done, got {other:?}"),
     };
     assert_eq!(dentry.name().as_bytes(), b"bar");
@@ -630,7 +631,7 @@ fn step_walk_resolves_absolute_path_from_root() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(
+    let outcome = block_on(step_walk_v3(
         topo.root_dentry.clone(),
         b"/foo/bar",
         &cred,
@@ -638,7 +639,7 @@ fn step_walk_resolves_absolute_path_from_root() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => assert_eq!(d.name().as_bytes(), b"bar"),
+        V3::Done(d) => assert_eq!(d.name().as_bytes(), b"bar"),
         other => panic!("expected Done, got {other:?}"),
     }
 }
@@ -654,9 +655,12 @@ fn step_walk_returns_enoent_on_missing() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/nope", &cred, &guard));
+    let outcome = block_on(step_walk_v3(topo.root_dentry.clone(), b"/nope", &cred, &guard));
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::ENOENT));
+    match outcome {
+        V3::Err(V3Errno::ENOENT) => {}
+        other => panic!("expected v3 Err(ENOENT), got {other:?}"),
+    }
 }
 
 #[test]
@@ -672,14 +676,17 @@ fn step_walk_returns_enotdir_on_trailing_slash_after_file() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(
+    let outcome = block_on(step_walk_v3(
         topo.root_dentry.clone(),
         b"/thing/",
         &cred,
         &guard,
     ));
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::ENOTDIR));
+    match outcome {
+        V3::Err(V3Errno::ENOTDIR) => {}
+        other => panic!("expected v3 Err(ENOTDIR), got {other:?}"),
+    }
 }
 
 #[test]
@@ -695,14 +702,17 @@ fn step_walk_returns_enotdir_when_traversing_through_file() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(
+    let outcome = block_on(step_walk_v3(
         topo.root_dentry.clone(),
         b"/thing/under",
         &cred,
         &guard,
     ));
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::ENOTDIR));
+    match outcome {
+        V3::Err(V3Errno::ENOTDIR) => {}
+        other => panic!("expected v3 Err(ENOTDIR), got {other:?}"),
+    }
 }
 
 #[test]
@@ -720,7 +730,7 @@ fn step_walk_chases_relative_symlink_to_target() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(
+    let outcome = block_on(step_walk_v3(
         topo.root_dentry.clone(),
         b"/alias",
         &cred,
@@ -728,7 +738,7 @@ fn step_walk_chases_relative_symlink_to_target() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => {
+        V3::Done(d) => {
             assert_eq!(d.rnode().fs_object_id(), target_id);
             assert_eq!(d.name().as_bytes(), b"realdir");
         }
@@ -752,10 +762,10 @@ fn step_walk_chases_absolute_symlink_from_root() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/jump", &cred, &guard));
+    let outcome = block_on(step_walk_v3(topo.root_dentry.clone(), b"/jump", &cred, &guard));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => {
+        V3::Done(d) => {
             assert_eq!(d.rnode().fs_object_id(), bar_id);
             assert_eq!(d.name().as_bytes(), b"bar");
         }
@@ -796,9 +806,12 @@ fn step_walk_returns_eloop_after_41_hops() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/s0", &cred, &guard));
+    let outcome = block_on(step_walk_v3(topo.root_dentry.clone(), b"/s0", &cred, &guard));
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::ELOOP));
+    match outcome {
+        V3::Err(V3Errno::ELOOP) => {}
+        other => panic!("expected v3 Err(ELOOP), got {other:?}"),
+    }
 }
 
 #[test]
@@ -836,7 +849,7 @@ fn step_walk_crosses_mount_point_at_dev() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(
+    let outcome = block_on(step_walk_v3(
         topo.root_dentry.clone(),
         b"/dev/consoledir",
         &cred,
@@ -844,7 +857,7 @@ fn step_walk_crosses_mount_point_at_dev() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => {
+        V3::Done(d) => {
             assert_eq!(d.name().as_bytes(), b"consoledir");
             // The terminal dentry's RNode lives on devfs, not
             // rootfs; its FsObjectId is in devfs's namespace
@@ -892,7 +905,7 @@ fn step_walk_owner_can_traverse_dir_with_owner_x_bit() {
 
     let cred = unprivileged_cred(1000, 0);
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(
+    let outcome = block_on(step_walk_v3(
         topo.root_dentry.clone(),
         b"/ownerdir/leaf",
         &cred,
@@ -900,7 +913,7 @@ fn step_walk_owner_can_traverse_dir_with_owner_x_bit() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
+        V3::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
         other => panic!("expected Done(leaf), got {other:?}"),
     }
 }
@@ -923,14 +936,17 @@ fn step_walk_other_cannot_traverse_dir_without_other_x_bit() {
 
     let cred = unprivileged_cred(9999, 9999);
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(
+    let outcome = block_on(step_walk_v3(
         topo.root_dentry.clone(),
         b"/ownerdir/leaf",
         &cred,
         &guard,
     ));
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::EACCES));
+    match outcome {
+        V3::Err(V3Errno::EACCES) => {}
+        other => panic!("expected v3 Err(EACCES), got {other:?}"),
+    }
 }
 
 #[test]
@@ -956,7 +972,7 @@ fn step_walk_dac_override_short_circuits_perm_check() {
         effective_caps: caps,
     };
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(
+    let outcome = block_on(step_walk_v3(
         topo.root_dentry.clone(),
         b"/locked/leaf",
         &cred,
@@ -964,7 +980,7 @@ fn step_walk_dac_override_short_circuits_perm_check() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
+        V3::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
         other => panic!("expected Done(leaf) under DAC_OVERRIDE, got {other:?}"),
     }
 }
@@ -987,7 +1003,7 @@ fn step_walk_group_match_uses_group_triplet() {
 
     let cred = unprivileged_cred(2000, 500);
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(
+    let outcome = block_on(step_walk_v3(
         topo.root_dentry.clone(),
         b"/groupdir/leaf",
         &cred,
@@ -995,7 +1011,7 @@ fn step_walk_group_match_uses_group_triplet() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
+        V3::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
         other => panic!("expected Done(leaf), got {other:?}"),
     }
 }
@@ -1020,7 +1036,7 @@ fn step_open_caller_with_read_bit_succeeds() {
 
     let cred = unprivileged_cred(1000, 0);
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_open(
+    let outcome = block_on(step_open_v3(
         topo.root_dentry.clone(),
         b"/readdir",
         OpenFileFlags {
@@ -1036,7 +1052,7 @@ fn step_open_caller_with_read_bit_succeeds() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(_) => {}
+        V3::Done(_) => {}
         other => panic!("expected Done, got {other:?}"),
     }
 }
@@ -1058,7 +1074,7 @@ fn step_open_no_read_bit_returns_eacces() {
 
     let cred = unprivileged_cred(1000, 0);
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_open(
+    let outcome = block_on(step_open_v3(
         topo.root_dentry.clone(),
         b"/locked",
         OpenFileFlags {
@@ -1073,7 +1089,10 @@ fn step_open_no_read_bit_returns_eacces() {
         &guard,
     ));
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::EACCES));
+    match outcome {
+        V3::Err(V3Errno::EACCES) => {}
+        other => panic!("expected v3 Err(EACCES), got {other:?}"),
+    }
 }
 
 #[test]
@@ -1093,7 +1112,7 @@ fn step_open_caller_with_write_bit_succeeds() {
 
     let cred = unprivileged_cred(1000, 0);
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_open(
+    let outcome = block_on(step_open_v3(
         topo.root_dentry.clone(),
         b"/rwdir",
         OpenFileFlags {
@@ -1109,7 +1128,7 @@ fn step_open_caller_with_write_bit_succeeds() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(_) => {}
+        V3::Done(_) => {}
         other => panic!("expected Done, got {other:?}"),
     }
 }
@@ -1137,7 +1156,7 @@ fn step_open_dac_override_short_circuits() {
         effective_caps: caps,
     };
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_open(
+    let outcome = block_on(step_open_v3(
         topo.root_dentry.clone(),
         b"/locked",
         OpenFileFlags {
@@ -1153,7 +1172,7 @@ fn step_open_dac_override_short_circuits() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(_) => {}
+        V3::Done(_) => {}
         other => panic!("expected Done under DAC_OVERRIDE, got {other:?}"),
     }
 }
@@ -1170,7 +1189,7 @@ fn step_open_round_trips_to_directory_dentry() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_open(
+    let outcome = block_on(step_open_v3(
         topo.root_dentry.clone(),
         b"/opendir",
         OpenFileFlags {
@@ -1186,7 +1205,7 @@ fn step_open_round_trips_to_directory_dentry() {
     ));
     drop(guard);
     let file = match outcome {
-        StepOutcome::Done(f) => f,
+        V3::Done(f) => f,
         other => panic!("expected Done(OpenFile), got {other:?}"),
     };
     let _ = file;

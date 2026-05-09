@@ -27,4 +27,4 @@ pub use structure::{
     RNode, RNodeBacking, StructPayload, Timespec, VfsName, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
     S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID, S_ISVTX, VFS_NAME_MAX,
 };
-pub use walker::{step_open, step_open_v3, step_walk, step_walk_v3, SYMLOOP_MAX};
+pub use walker::{step_open_v3, step_walk_v3, SYMLOOP_MAX};
