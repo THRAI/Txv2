@@ -325,7 +325,7 @@ pub fn step_fsync_v3(
     pc: &PageContainer,
     guard: &Guard<'_>,
 ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::PageProgress> {
-    use tx_substrate::step_v3::{PageProgress, StepOutcome as V3};
+    use tx_substrate::step_v3::{PageProgress, StepOutcome as V3, YieldShape};
 
     let PageContainerKind::File {
         mount,
@@ -340,43 +340,48 @@ pub fn step_fsync_v3(
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
             return V3::err(Errno::EINVAL.into());
         };
-        match mount.payload().fs_page_backing.flush_page(
+        match mount.payload().fs_page_backing_v3.flush_page(
             *fs_object_id,
             offset,
             &Frame::new(ppn),
             guard,
         ) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+            V3::Done(()) => {
                 pc.clear_dirty_if_match(page, ppn);
                 pages_so_far = pages_so_far.saturating_add(1);
             }
-            StepOutcome::Blocked(token) => {
+            V3::Continue { progress: _ } => {
                 let progress = if pages_so_far == 0 {
                     PageProgress::EMPTY
                 } else {
                     PageProgress::new(pages_so_far)
                 };
-                return V3::yield_on_carrier(progress, token.carrier(), token.interest());
+                return V3::continue_with(progress);
             }
-            StepOutcome::AdvancedThenBlocked((), token) => {
-                pc.clear_dirty_if_match(page, ppn);
-                pages_so_far = pages_so_far.saturating_add(1);
-                return V3::yield_on_carrier(
-                    PageProgress::new(pages_so_far),
-                    token.carrier(),
-                    token.interest(),
-                );
+            V3::Yield {
+                progress: _,
+                shape: YieldShape::OnCarrier { carrier, interests },
+            } => {
+                let progress = if pages_so_far == 0 {
+                    PageProgress::EMPTY
+                } else {
+                    PageProgress::new(pages_so_far)
+                };
+                return V3::yield_on_carrier(progress, carrier.raw(), interests.raw());
             }
-            StepOutcome::Err(errno) => return V3::err(errno.into()),
+            V3::Yield {
+                shape: YieldShape::OnAgent { .. },
+                ..
+            } => {
+                return V3::err(tx_substrate::step_v3::Errno::EIO);
+            }
+            V3::Err(v3_errno) => return V3::err(v3_errno),
         }
     }
 
-    match mount.payload().fs_page_backing.fsync(*fs_object_id, guard) {
-        StepOutcome::Done(()) => V3::done(()),
-        StepOutcome::Advanced(()) => {
-            // The fs is signalling "made progress, retry"; from the v3
-            // page-progress perspective the page-flush work is already
-            // accounted, so re-enter with the prior page count.
+    match mount.payload().fs_page_backing_v3.fsync(*fs_object_id, guard) {
+        V3::Done(()) => V3::done(()),
+        V3::Continue { progress: _ } => {
             let progress = if pages_so_far == 0 {
                 PageProgress::EMPTY
             } else {
@@ -384,27 +389,22 @@ pub fn step_fsync_v3(
             };
             V3::continue_with(progress)
         }
-        StepOutcome::Blocked(token) => {
+        V3::Yield {
+            progress: _,
+            shape: YieldShape::OnCarrier { carrier, interests },
+        } => {
             let progress = if pages_so_far == 0 {
                 PageProgress::EMPTY
             } else {
                 PageProgress::new(pages_so_far)
             };
-            V3::yield_on_carrier(progress, token.carrier(), token.interest())
+            V3::yield_on_carrier(progress, carrier.raw(), interests.raw())
         }
-        StepOutcome::AdvancedThenBlocked((), token) => {
-            // v4 `AdvancedThenBlocked((), token)` from `fsync` carries no
-            // page count — the unit of v4 progress here is "fs internal
-            // partial flush" not "another container page". We surface the
-            // page count we already accumulated.
-            let progress = if pages_so_far == 0 {
-                PageProgress::EMPTY
-            } else {
-                PageProgress::new(pages_so_far)
-            };
-            V3::yield_on_carrier(progress, token.carrier(), token.interest())
-        }
-        StepOutcome::Err(errno) => V3::err(errno.into()),
+        V3::Yield {
+            shape: YieldShape::OnAgent { .. },
+            ..
+        } => V3::err(tx_substrate::step_v3::Errno::EIO),
+        V3::Err(v3_errno) => V3::err(v3_errno),
     }
 }
 
@@ -887,28 +887,56 @@ mod v3_tests {
 
         fn flush_page(
             &self,
-            _fs_object_id: FsObjectId,
-            _offset: u64,
+            fs_object_id: FsObjectId,
+            offset: u64,
             _frame: &Frame,
             _guard: &Guard<'_>,
         ) -> V3Outcome<(), NoProgress> {
-            V3Outcome::done(())
+            let flush = self.flushes.fetch_add(1, Ordering::AcqRel);
+            self.last_object
+                .store(fs_object_id.as_u64(), Ordering::Release);
+            self.last_offset.store(offset, Ordering::Release);
+            if self.block_flush_after == Some(flush) {
+                V3Outcome::yield_on_carrier(NoProgress, 13, 0x55)
+            } else {
+                V3Outcome::done(())
+            }
         }
 
         fn truncate(
             &self,
-            _fs_object_id: FsObjectId,
-            _new_size: u64,
+            fs_object_id: FsObjectId,
+            new_size: u64,
             _guard: &Guard<'_>,
         ) -> V3Outcome<(), NoProgress> {
-            V3Outcome::done(())
+            self.last_object
+                .store(fs_object_id.as_u64(), Ordering::Release);
+            self.last_truncate_size.store(new_size, Ordering::Release);
+            match self.truncate_outcome.clone() {
+                V4Outcome::Done(()) => V3Outcome::done(()),
+                V4Outcome::Advanced(()) => V3Outcome::continue_with(NoProgress),
+                V4Outcome::AdvancedThenBlocked((), token) => V3Outcome::yield_on_carrier(
+                    NoProgress,
+                    token.carrier(),
+                    token.interest(),
+                ),
+                V4Outcome::Blocked(token) => V3Outcome::yield_on_carrier(
+                    NoProgress,
+                    token.carrier(),
+                    token.interest(),
+                ),
+                V4Outcome::Err(errno) => V3Outcome::err(errno.into()),
+            }
         }
 
         fn fsync(
             &self,
-            _fs_object_id: FsObjectId,
+            fs_object_id: FsObjectId,
             _guard: &Guard<'_>,
         ) -> V3Outcome<(), NoProgress> {
+            self.fsyncs.fetch_add(1, Ordering::AcqRel);
+            self.last_object
+                .store(fs_object_id.as_u64(), Ordering::Release);
             V3Outcome::done(())
         }
     }
