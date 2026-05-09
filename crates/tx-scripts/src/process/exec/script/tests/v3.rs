@@ -1,257 +1,32 @@
-use tx_ext4_format::pager::{BlockImage, DirEntryLite};
-use tx_substrate::epoch::Guard;
-use tx_subsystems::execution::{Errno, StepOutcome};
-use tx_subsystems::vfs::execution::FsOps;
+//! Wave-9b: `FsOpsV3` + `FsPageBackingV3` impls on `ExecTestFs`.
+//!
+//! Sibling to the v4 impls in the parent `tests` module. Per
+//! `docs/progress/decisions/2026-05-09-fsops-v3-design.md` and the
+//! wave-9a `TestFs` template (`tx-subsystems/src/vfs/walker/tests/v3.rs`),
+//! every method delegates to the v4 body and translates outcomes
+//! one-for-one. `ExecTestFs` is purely synchronous (no `Advanced` /
+//! `Blocked` variants in its v4 bodies, with the lone exception of
+//! `fetch_page`'s pass-through of `PageContainer::materialize_page`),
+//! so the v3 mapping is trivial.
+//!
+//! Lives in its own file so the parent `tests.rs` stays under the
+//! `cargo xtask lint arch` 1500-line authored-file cap (the v3 impl
+//! block alone is ~350 lines; with the v4 fixture it pushed `tests.rs`
+//! over the cap).
+
+use alloc::boxed::Box;
+
+use tx_substrate::zone::Cap;
+use tx_subsystems::execution::{Guard, StepOutcome};
+use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::vfs::structure::{
-    Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
+    Credential, DirCursor, DirEntry, FsObjectId, InodeMeta, RNode,
 };
+use tx_subsystems::vfs::FsOps;
 
-use crate::read_backend::{
-    cursor_from_index, cursor_index, fs_object_id as inode_fs_object_id, inode_no, map_inode_meta,
-    Ext4FsInstance, READDIR_WINDOW_ENTRIES,
-};
+use super::ExecTestFs;
 
-impl<I> FsOps for Ext4FsInstance<I>
-where
-    I: BlockImage + Send + 'static,
-{
-    fn lookup<'g>(
-        &self,
-        parent: FsObjectId,
-        name: &[u8],
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<FsObjectId> {
-        let parent = match inode_no(parent) {
-            Ok(parent) => parent,
-            Err(err) => return StepOutcome::Err(err),
-        };
-
-        match self.with_pager(|pager| pager.lookup(parent, name)) {
-            Ok(Some(inode)) => StepOutcome::Done(inode_fs_object_id(inode)),
-            Ok(None) => StepOutcome::Err(Errno::ENOENT),
-            Err(err) => StepOutcome::Err(err),
-        }
-    }
-
-    fn load_inode_meta<'g>(
-        &self,
-        fs_object_id: FsObjectId,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<InodeMeta> {
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
-            Err(err) => return StepOutcome::Err(err),
-        };
-
-        match self.with_pager(|pager| pager.inode_meta(inode)) {
-            Ok(meta) => StepOutcome::Done(map_inode_meta(meta)),
-            Err(err) => StepOutcome::Err(err),
-        }
-    }
-
-    fn serialize_inode_meta<'g>(
-        &self,
-        _fs_object_id: FsObjectId,
-        _meta: &InodeMeta,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn create_inode<'g>(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn unlink<'g>(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn rename<'g>(
-        &self,
-        _old_parent: FsObjectId,
-        _old_name: &[u8],
-        _new_parent: FsObjectId,
-        _new_name: &[u8],
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn link<'g>(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn mkdir<'g>(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn rmdir<'g>(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn symlink<'g>(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _link_target: &[u8],
-        _cred: &Credential,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn readdir<'g>(
-        &self,
-        fs_object_id: FsObjectId,
-        cursor: DirCursor,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
-            Err(err) => return StepOutcome::Err(err),
-        };
-        let index = match cursor_index(cursor) {
-            Ok(index) => index,
-            Err(err) => return StepOutcome::Err(err),
-        };
-        if index >= READDIR_WINDOW_ENTRIES {
-            return StepOutcome::Err(Errno::ENOSYS);
-        }
-
-        let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
-        let count = match self.with_pager(|pager| pager.read_dir_entries(inode, &mut entries)) {
-            Ok(count) => count,
-            Err(err) => return StepOutcome::Err(err),
-        };
-        if index >= count {
-            return StepOutcome::Done(None);
-        }
-
-        let entry = entries[index];
-        let name = match InlineName::new(entry.name()) {
-            Ok(name) => name,
-            Err(err) => return StepOutcome::Err(err),
-        };
-        StepOutcome::Done(Some((
-            DirEntry {
-                name,
-                fs_object_id: inode_fs_object_id(entry.inode),
-                kind: ext4_file_type_to_kind(entry.file_type),
-            },
-            cursor_from_index(index + 1),
-        )))
-    }
-
-    fn destroy_inode<'g>(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-}
-
-// ext4 dir-entry file_type codes (POSIX-shaped). Maps the on-disk byte
-// code into the canonical `InodeKind` enum surfaced by `tx-subsystems`.
-fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
-    match file_type {
-        2 => InodeKind::Directory,
-        3 => InodeKind::CharDevice,
-        4 => InodeKind::BlockDevice,
-        5 => InodeKind::Fifo,
-        6 => InodeKind::Socket,
-        7 => InodeKind::Symlink,
-        _ => InodeKind::Regular,
-    }
-}
-
-// === Wave 9b: parallel v3 trait impl =================================
-//
-// `impl FsOpsV3 for Ext4FsInstance<I>` mirrors the v4 body above
-// one-for-one. ext4 is the wave-9b backend most likely to surface
-// real `Advanced(t)` outcomes because the v4 surface dispatches to
-// on-disk block I/O via `with_pager(...).read_*` — but the current
-// read-only ext4 surface goes through `Ext4Pager::*` which returns
-// `Result<T, Ext4FormatError>`, **not** `StepOutcome`, so the v4
-// `FsOps` impls land on `StepOutcome::Done(t)` / `StepOutcome::Err(e)`
-// only. There are no `Advanced(t)` / `Blocked` / `AdvancedThenBlocked`
-// returns from the v4 bodies today; the v3 mapping has zero ambiguous
-// Continue-vs-Done call sites in this wave.
-//
-// Per the wave-9a design doc
-// (`docs/progress/decisions/2026-05-09-fsops-v3-design.md`) and the
-// trait-surface contract: where the v4 fn does (in a future async/
-// journal-aware revision) return `Advanced(t)`, the trait surface
-// translates `Advanced(t)` → `done(t)` (one-shot v3 contract); any
-// partial-progress accounting lives at the *caller* (wave 9c walker).
-// `Blocked` / `AdvancedThenBlocked` map defensively to `EAGAIN` since
-// the v3 trait returns `NoProgress` and the trait surface has no
-// carrier-progress yield shape that fits a one-shot identity-side
-// query.
-//
-// Fully-qualified `tx_substrate::step_v3::*` references at the impl
-// sites avoid clashing with `tx_subsystems::execution::StepOutcome`
-// already in scope, per the wave-4/6/7 trait-impl convention.
-
-use tx_subsystems::vfs::FsOpsV3;
-
-/// v3 sibling factory for `MountOutput::fs_ops_v3` cutover.
-///
-/// Wave 9c walker entry points will populate `MountPayload::fs_ops_v3`
-/// from this constructor; mirrors `Tmpfs::fs_ops_v3_arc`. Gated behind
-/// `cfg(test)` for now because `Ext4FsInstance` is `pub(crate)` and the
-/// v3 wiring on `MountOutput` lands in wave 9c — the factory is
-/// exercised inline in `tests_v3.rs` to pin the cutover shape, and the
-/// non-test build does not yet have a caller. Wave 9c lifts the cfg
-/// gate as part of the `MountOutput::fs_ops_v3` field landing.
-#[cfg(test)]
-impl<I> Ext4FsInstance<I>
-where
-    I: BlockImage + Send + 'static,
-{
-    pub(crate) fn fs_ops_v3_arc(
-        self: alloc::sync::Arc<Self>,
-    ) -> alloc::sync::Arc<dyn FsOpsV3> {
-        self
-    }
-}
-
-impl<I> FsOpsV3 for Ext4FsInstance<I>
-where
-    I: BlockImage + Send + 'static,
-{
+impl tx_subsystems::vfs::FsOpsV3 for ExecTestFs {
     fn lookup(
         &self,
         parent: FsObjectId,
@@ -276,12 +51,10 @@ where
         guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
         match <Self as FsOps>::load_inode_meta(self, fs_object_id, guard) {
-            StepOutcome::Done(meta) | StepOutcome::Advanced(meta) => {
-                tx_substrate::step_v3::StepOutcome::done(meta)
+            StepOutcome::Done(m) | StepOutcome::Advanced(m) => {
+                tx_substrate::step_v3::StepOutcome::done(m)
             }
-            StepOutcome::AdvancedThenBlocked(meta, _) => {
-                tx_substrate::step_v3::StepOutcome::done(meta)
-            }
+            StepOutcome::AdvancedThenBlocked(m, _) => tx_substrate::step_v3::StepOutcome::done(m),
             StepOutcome::Blocked(_) => {
                 tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
             }
@@ -499,7 +272,215 @@ where
         }
     }
 
-    // `read_link`, `materialise_rnode`, `step_chmod`, `step_chown` all
-    // inherit the trait-default `ENOSYS` mapping, matching the v4
-    // behaviour where ext4 does not override those methods either.
+    fn read_link(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<Box<[u8]>, tx_substrate::step_v3::NoProgress> {
+        match <Self as FsOps>::read_link(self, fs_object_id, guard) {
+            StepOutcome::Done(out) | StepOutcome::Advanced(out) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::AdvancedThenBlocked(out, _) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<Cap<RNode>, tx_substrate::step_v3::NoProgress> {
+        match <Self as FsOps>::materialise_rnode(self, fs_object_id, meta, guard) {
+            StepOutcome::Done(out) | StepOutcome::Advanced(out) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::AdvancedThenBlocked(out, _) => {
+                tx_substrate::step_v3::StepOutcome::done(out)
+            }
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+}
+
+impl tx_subsystems::page_backed::FsPageBackingV3 for ExecTestFs {
+    fn fetch_page(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+        match <Self as FsPageBacking>::fetch_page(self, fs_object_id, offset, guard) {
+            StepOutcome::Done(frame) | StepOutcome::Advanced(frame) => {
+                tx_substrate::step_v3::StepOutcome::done(frame)
+            }
+            StepOutcome::AdvancedThenBlocked(frame, _) => {
+                tx_substrate::step_v3::StepOutcome::done(frame)
+            }
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn flush_page(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        frame: &Frame,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        match <Self as FsPageBacking>::flush_page(self, fs_object_id, offset, frame, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                tx_substrate::step_v3::StepOutcome::done(())
+            }
+            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn truncate(
+        &self,
+        fs_object_id: FsObjectId,
+        new_size: u64,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        match <Self as FsPageBacking>::truncate(self, fs_object_id, new_size, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                tx_substrate::step_v3::StepOutcome::done(())
+            }
+            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+
+    fn fsync(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        match <Self as FsPageBacking>::fsync(self, fs_object_id, guard) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                tx_substrate::step_v3::StepOutcome::done(())
+            }
+            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
+            StepOutcome::Blocked(_) => {
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            }
+            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        }
+    }
+}
+
+// === tests pinning the v3 outcome shape end-to-end through ExecTestFs ===
+
+#[test]
+fn exec_testfs_v3_lookup_round_trips_after_add_regular() {
+    use tx_subsystems::vfs::FsOpsV3;
+    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+
+    let _setup = super::setup();
+    let (_root_dentry, fs) = super::build_fs_root();
+    let bytes = super::minimal_elf_bytes();
+    let file_id = fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &bytes);
+
+    let guard = tx_substrate::epoch::guard();
+    assert_eq!(
+        <ExecTestFs as FsOpsV3>::lookup(&*fs, FsObjectId::new(2), b"init", &guard),
+        V3::<_, NoProgress>::done(file_id)
+    );
+    assert_eq!(
+        <ExecTestFs as FsOpsV3>::lookup(&*fs, FsObjectId::new(2), b"missing", &guard),
+        V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
+    );
+}
+
+#[test]
+fn exec_testfs_v3_load_inode_meta_returns_regular() {
+    use tx_subsystems::vfs::structure::InodeKind;
+    use tx_subsystems::vfs::FsOpsV3;
+    use tx_substrate::step_v3::StepOutcome as V3;
+
+    let _setup = super::setup();
+    let (_root_dentry, fs) = super::build_fs_root();
+    let bytes = super::minimal_elf_bytes();
+    let file_id = fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &bytes);
+
+    let guard = tx_substrate::epoch::guard();
+    let meta = match <ExecTestFs as FsOpsV3>::load_inode_meta(&*fs, file_id, &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("load_inode_meta v3: {other:?}"),
+    };
+    assert_eq!(meta.kind(), InodeKind::Regular);
+}
+
+#[test]
+fn exec_testfs_v3_create_inode_returns_enosys() {
+    use tx_subsystems::vfs::FsOpsV3;
+    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+
+    let _setup = super::setup();
+    let (_root_dentry, fs) = super::build_fs_root();
+
+    let guard = tx_substrate::epoch::guard();
+    let cred = Credential::root();
+    assert_eq!(
+        <ExecTestFs as FsOpsV3>::create_inode(
+            &*fs,
+            FsObjectId::new(2),
+            b"new",
+            0o644,
+            &cred,
+            &guard
+        ),
+        V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::ENOSYS)
+    );
+}
+
+#[test]
+fn exec_testfs_v3_fetch_page_zero_offset_returns_frame() {
+    use tx_subsystems::page_backed::FsPageBackingV3;
+    use tx_substrate::step_v3::StepOutcome as V3;
+
+    let _setup = super::setup();
+    let (_root_dentry, fs) = super::build_fs_root();
+    let bytes = super::minimal_elf_bytes();
+    let file_id = fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &bytes);
+
+    let guard = tx_substrate::epoch::guard();
+    match <ExecTestFs as FsPageBackingV3>::fetch_page(&*fs, file_id, 0, &guard) {
+        V3::Done(_frame) => {}
+        other => panic!("fetch_page v3: {other:?}"),
+    }
+}
+
+#[test]
+fn exec_testfs_v3_fsync_returns_done() {
+    use tx_subsystems::page_backed::FsPageBackingV3;
+    use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
+
+    let _setup = super::setup();
+    let (_root_dentry, fs) = super::build_fs_root();
+
+    let guard = tx_substrate::epoch::guard();
+    assert_eq!(
+        <ExecTestFs as FsPageBackingV3>::fsync(&*fs, FsObjectId::new(2), &guard),
+        V3::<(), NoProgress>::done(())
+    );
 }
