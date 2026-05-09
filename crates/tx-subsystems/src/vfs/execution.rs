@@ -8,7 +8,7 @@
 use alloc::sync::Arc;
 
 use crate::execution::{Errno, Guard, StepOutcome};
-use crate::page_backed::{FsPageBacking, FsPageBackingV3};
+use crate::page_backed::FsPageBackingV3;
 use crate::tty;
 
 use super::structure::{
@@ -440,9 +440,7 @@ pub trait FsOpsV3: Send + Sync + 'static {
 /// factory methods on `Tmpfs`, `Devfs`, and `Ext4FsInstance` produce
 /// the v3-typed `Arc`s.
 pub struct MountOutput {
-    pub fs_ops: Arc<dyn FsOps>,
     pub fs_ops_v3: Arc<dyn FsOpsV3>,
-    pub fs_page_backing: Arc<dyn FsPageBacking>,
     pub fs_page_backing_v3: Arc<dyn FsPageBackingV3>,
     pub root_fs_object_id: FsObjectId,
     pub root_inode_meta: InodeMeta,

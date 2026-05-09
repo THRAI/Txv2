@@ -249,8 +249,6 @@ impl FsOps for LifecycleFs {
 fn file_page_container(fs: Arc<LifecycleFs>, fs_object_id: FsObjectId) -> PageContainer {
     let mount = MountPayload::new_cap(
         fs.clone(),
-        fs.clone(),
-        fs.clone(),
         fs,
         None,
         DevId::new(8),

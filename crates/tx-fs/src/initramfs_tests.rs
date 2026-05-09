@@ -33,9 +33,7 @@ fn init_substrate() {
 fn fresh_rootfs_mount() -> Cap<MountIdentity> {
     let (_tmpfs, mount_output) = Tmpfs::new_root();
     let payload = MountPayload::new_cap(
-        mount_output.fs_ops.clone(),
         mount_output.fs_ops_v3.clone(),
-        mount_output.fs_page_backing.clone(),
         mount_output.fs_page_backing_v3.clone(),
         None,
         tx_subsystems::mount::DevId::new(0xfeed),

@@ -714,17 +714,13 @@
     }
 
     fn file_page_container(
-        fs: Arc<dyn FsOps + Send + Sync>,
         fs_v3: Arc<dyn FsOpsV3>,
-        page_backing: Arc<dyn FsPageBacking + Send + Sync>,
         page_backing_v3: Arc<dyn FsPageBackingV3>,
         fs_object_id: FsObjectId,
         page_count: u64,
     ) -> PageContainer {
         let mount = MountPayload::new_cap(
-            fs,
             fs_v3,
-            page_backing,
             page_backing_v3,
             None,
             DevId::new(8),
@@ -895,8 +891,6 @@
         let pc = file_page_container(
             fs.clone(),
             fs.clone(),
-            fs.clone(),
-            fs.clone(),
             FsObjectId::new(55),
             4,
         );
@@ -932,8 +926,6 @@
         let guard = tx_substrate::epoch::guard();
         let fs = Arc::new(BlockingFs);
         let pc = file_page_container(
-            fs.clone(),
-            fs.clone(),
             fs.clone(),
             fs,
             FsObjectId::new(77),
@@ -1058,8 +1050,6 @@
         let guard = tx_substrate::epoch::guard();
         let fs = Arc::new(BlockingFs);
         let pc = file_page_container(
-            fs.clone(),
-            fs.clone(),
             fs.clone(),
             fs,
             FsObjectId::new(88),

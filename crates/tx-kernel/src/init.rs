@@ -377,9 +377,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // `MountId(2)` / `DevId(2)`. Existing trio boot-smoke
         // assertions on the literal ids stay valid.
         let payload = MountPayload::new_cap(
-            mount_output.fs_ops.clone(),
             mount_output.fs_ops_v3.clone(),
-            mount_output.fs_page_backing.clone(),
             mount_output.fs_page_backing_v3.clone(),
             None,
             mount::allocate_dev_id(),
@@ -489,15 +487,11 @@ impl<P: TxPlatform> CoreInit<P> {
         // rootfs root rnode above (the walker's `fs_ops_for` returns
         // `None` and falls through to `ENODEV` if the hint is
         // missing).
-        let devfs_fs_ops = tx_fs::devfs::Devfs::fs_ops_arc();
         let devfs_fs_ops_v3 = tx_fs::devfs::Devfs::fs_ops_v3_arc();
-        let devfs_fs_page_backing = tx_fs::devfs::Devfs::fs_page_backing_arc();
         let devfs_fs_page_backing_v3 = tx_fs::devfs::Devfs::fs_page_backing_v3_arc();
 
         let devfs_payload = MountPayload::new_cap(
-            devfs_fs_ops,
             devfs_fs_ops_v3,
-            devfs_fs_page_backing,
             devfs_fs_page_backing_v3,
             None,
             mount::allocate_dev_id(),

@@ -18,13 +18,13 @@ use crate::execution::Errno;
 use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
-use crate::page_backed::{FsPageBacking, FsPageBackingV3};
+use crate::page_backed::FsPageBackingV3;
 use crate::vfs::structure::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
     RNodeBacking, S_IFDIR,
 };
 use crate::vfs::walker::{step_open_v3, step_walk_v3};
-use crate::vfs::{FsOps, FsOpsV3};
+use crate::vfs::FsOpsV3;
 
 use super::{block_on, init_zones, TestFs};
 
@@ -43,9 +43,7 @@ fn build_rootfs_v3() -> V3Topology {
     // object now flows through `MountPayload`'s `fs_ops_v3` field
     // directly, the same way the v4 fs_ops field is populated.
     let payload = MountPayload::new_cap(
-        rootfs.clone() as Arc<dyn FsOps>,
         rootfs.clone() as Arc<dyn FsOpsV3>,
-        rootfs.clone() as Arc<dyn FsPageBacking>,
         rootfs.clone() as Arc<dyn FsPageBackingV3>,
         None,
         DevId::new(1),

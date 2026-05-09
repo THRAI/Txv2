@@ -890,9 +890,7 @@ fn step_walk_v3_against_tmpfs_resolves_real_path() {
     // Wave 9d retired the sidecar registry: the v3 fs_ops trait
     // object now flows through `MountPayload`'s `fs_ops_v3` field.
     let payload: Cap<MountPayload> = MountPayload::new_cap(
-        mount_output.fs_ops.clone(),
         mount_output.fs_ops_v3.clone(),
-        mount_output.fs_page_backing.clone(),
         mount_output.fs_page_backing_v3.clone(),
         None,
         DevId::new(1),
