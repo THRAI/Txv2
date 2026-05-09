@@ -73,18 +73,75 @@ fn step_outcome_continue_carries_progress() {
 }
 
 #[test]
-fn errno_includes_eagain_and_einval_after_wave_4_probe() {
-    // PR-0 pinned only `EAGAIN`; the wave-4 futex cascade probe added
-    // `EINVAL` for uaddr/nargs validation. Pin both members here so a
-    // future PR cannot silently drop a variant. Future cascade probes
-    // (mount, pipe, …) extend the catalog further.
+fn errno_mirrors_v4_catalog() {
+    // Wave-5 grows the v3 Errno catalog to mirror the v4 27-variant set
+    // byte-for-byte (see `tx_subsystems::execution::Errno`). PR-0
+    // originally pinned only `EAGAIN`; wave-4's futex cascade probe
+    // added `EINVAL`; wave-5 adds the rest in one step so wave-6
+    // fan-out workers (mount, pipe, device, …) do not each grow this
+    // catalog ad hoc. Closed-catalog discipline: an exhaustive match
+    // with no wildcard arm so adding a v4 variant later requires
+    // mirroring it here.
+    use tx_substrate::step_v3::Errno;
     let cases = [
-        tx_substrate::step_v3::Errno::EAGAIN,
-        tx_substrate::step_v3::Errno::EINVAL,
+        Errno::EACCES,
+        Errno::EAGAIN,
+        Errno::EBADF,
+        Errno::EBUSY,
+        Errno::EDQUOT,
+        Errno::EEXIST,
+        Errno::EFAULT,
+        Errno::EINVAL,
+        Errno::EIO,
+        Errno::EISDIR,
+        Errno::ELOOP,
+        Errno::ENAMETOOLONG,
+        Errno::ENODEV,
+        Errno::ENOEXEC,
+        Errno::ENOMEM,
+        Errno::ENOENT,
+        Errno::ENOSYS,
+        Errno::ENOTDIR,
+        Errno::ENOTEMPTY,
+        Errno::ENOTTY,
+        Errno::EPERM,
+        Errno::EPIPE,
+        Errno::ERANGE,
+        Errno::EROFS,
+        Errno::ESPIPE,
+        Errno::ESRCH,
+        Errno::ESTALE,
     ];
+    assert_eq!(cases.len(), 27);
     for errno in cases {
         match errno {
-            tx_substrate::step_v3::Errno::EAGAIN | tx_substrate::step_v3::Errno::EINVAL => {}
+            Errno::EACCES
+            | Errno::EAGAIN
+            | Errno::EBADF
+            | Errno::EBUSY
+            | Errno::EDQUOT
+            | Errno::EEXIST
+            | Errno::EFAULT
+            | Errno::EINVAL
+            | Errno::EIO
+            | Errno::EISDIR
+            | Errno::ELOOP
+            | Errno::ENAMETOOLONG
+            | Errno::ENODEV
+            | Errno::ENOEXEC
+            | Errno::ENOMEM
+            | Errno::ENOENT
+            | Errno::ENOSYS
+            | Errno::ENOTDIR
+            | Errno::ENOTEMPTY
+            | Errno::ENOTTY
+            | Errno::EPERM
+            | Errno::EPIPE
+            | Errno::ERANGE
+            | Errno::EROFS
+            | Errno::ESPIPE
+            | Errno::ESRCH
+            | Errno::ESTALE => {}
         }
     }
 }
