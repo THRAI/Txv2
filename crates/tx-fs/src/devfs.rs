@@ -445,7 +445,9 @@ pub fn open_console_for_init() -> Cap<OpenFile> {
             // Bootstrap path: init opens /dev/console as root.
             let cred = Credential::root();
             let guard = tx_substrate::epoch::guard();
-            let outcome = block_on(vfs::step_open(
+            // Wave 9e: bootstrap-path console open migrated to v3 walker.
+            use tx_substrate::step_v3::StepOutcome as V3;
+            let outcome = block_on(vfs::step_open_v3(
                 root,
                 b"/dev/console",
                 OpenFileFlags {
@@ -460,7 +462,7 @@ pub fn open_console_for_init() -> Cap<OpenFile> {
                 &guard,
             ));
             match outcome {
-                StepOutcome::Done(file) | StepOutcome::Advanced(file) => return file,
+                V3::Done(file) => return file,
                 _other => {
                     // Walker could not resolve the path under current
                     // bootstrap state — fall through to legacy
