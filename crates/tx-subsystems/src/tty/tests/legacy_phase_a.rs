@@ -516,12 +516,13 @@ fn step_write_to_pty_peer_ingests_peer_input() {
     );
     let mut out = [0u8; 8];
 
-    assert_eq!(step_write(&writer, b"hi", &guard), StepOutcome::Done(2));
+    use tx_substrate::step_v3::StepOutcome as V3Out;
+    assert_eq!(step_write(&writer, b"hi", &guard), V3Out::Done(2));
     assert!(matches!(
         step_read(&peer, &mut out, &guard),
         StepOutcome::Blocked(_)
     ));
-    assert_eq!(step_write(&writer, b"\n", &guard), StepOutcome::Done(1));
+    assert_eq!(step_write(&writer, b"\n", &guard), V3Out::Done(1));
     assert_eq!(step_read(&peer, &mut out, &guard), StepOutcome::Done(3));
     assert_eq!(&out[..3], b"hi\n");
 }
@@ -930,16 +931,17 @@ fn background_write_with_tostop_returns_eio() {
         StepOutcome::Done(Default::default())
     );
 
+    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
     let bg = IoctlCaller::new(1, 11).background();
     assert_eq!(
         step_write_for_caller(&tty, b"x", bg, &guard),
-        StepOutcome::Err(Errno::EIO)
+        V3Out::Err(V3Errno::EIO)
     );
 
     let ignored = IoctlCaller::new(1, 11).background().ignore_sigttou();
     assert_eq!(
         step_write_for_caller(&tty, b"x", ignored, &guard),
-        StepOutcome::Err(Errno::EIO)
+        V3Out::Err(V3Errno::EIO)
     );
 }
 
@@ -1089,9 +1091,10 @@ fn slave_close_does_not_hangup_master() {
     let _ = pty.slave.take_payload();
     assert!(!pty.slave.is_live(), "slave payload should be gone");
     assert!(pty.master.is_live(), "slave close must not hang up master");
+    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
     assert_eq!(
         step_write(&pty.master, b"x", &guard),
-        StepOutcome::Err(Errno::EIO)
+        V3Out::Err(V3Errno::EIO)
     );
 }
 
@@ -1114,7 +1117,10 @@ fn hangup_makes_followup_io_return_eio_and_second_hangup_is_eio() {
         step_read(&tty, &mut out, &guard),
         StepOutcome::Err(Errno::EIO)
     );
-    assert_eq!(step_write(&tty, b"x", &guard), StepOutcome::Err(Errno::EIO));
+    {
+        use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
+        assert_eq!(step_write(&tty, b"x", &guard), V3Out::Err(V3Errno::EIO));
+    }
     assert_eq!(step_hangup(&tty, &guard), StepOutcome::Err(Errno::EIO));
 }
 
