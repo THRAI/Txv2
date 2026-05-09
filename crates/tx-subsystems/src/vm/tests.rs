@@ -1282,7 +1282,7 @@ fn vm_aspace_copy_from_user_consistent_with_prior_copy_to_user_for_private_anon(
     let dst = tx_hal::UserPtr::<u8>::new(user_va);
     let payload: alloc::vec::Vec<u8> = (0u8..200).collect();
     match aspace.copy_to_user(dst, &payload, &guard) {
-        StepOutcome::Done(n) => assert_eq!(n, payload.len()),
+        tx_substrate::step_v3::StepOutcome::Done(n) => assert_eq!(n, payload.len()),
         other => panic!("copy_to_user expected Done, got {other:?}"),
     }
 
@@ -1297,7 +1297,7 @@ fn vm_aspace_copy_from_user_consistent_with_prior_copy_to_user_for_private_anon(
     let mut readback = alloc::vec![0u8; payload.len()];
     let src = tx_hal::UserPtr::<u8>::new(user_va);
     match aspace.copy_from_user(&mut readback, src, &guard) {
-        StepOutcome::Done(n) => assert_eq!(n, payload.len()),
+        tx_substrate::step_v3::StepOutcome::Done(n) => assert_eq!(n, payload.len()),
         other => panic!("copy_from_user expected Done, got {other:?}"),
     }
     assert_eq!(readback, payload, "readback must match prior write");
