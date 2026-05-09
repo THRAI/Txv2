@@ -4,6 +4,37 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9g-a of the v3 TDD migration landed —
+  first direct-trait-method caller migration (the pattern that
+  the aborted-9g brief should have specified). After the abort,
+  picked the smallest possible scope:
+  `crates/tx-shims/src/linux_syscall/fs_path.rs` chmod / chown
+  arms (2 trait-method calls). Same shape as wave 9d (b)'s
+  walker-caller migration but applied to direct trait methods
+  instead of `step_walk`:
+  - Added `fs_ops_v3_for_dentry(&Cap<DEntry>) -> Option<Arc<dyn
+    FsOpsV3>>` sibling to the existing `fs_ops_for_dentry`
+    (which returns the v4 `Arc<dyn FsOps>`). Same
+    parent-dentry-chain ascent looking for a `containing_mount_weak`
+    pin; reads `payload.fs_ops_v3` instead of `payload.fs_ops`.
+  - Migrated `sys_fchmodat::*::sys_fchmodat_impl` and
+    `sys_fchownat::*::sys_fchownat_impl` (the chmod and chown
+    syscall arms) from `fs_ops.step_chmod` / `fs_ops.step_chown`
+    (v4) to `fs_ops_v3.step_chmod` / `fs_ops_v3.step_chown`
+    (v3). Match arms collapsed from 5-variant to 4-variant; v3
+    errno bridges back via `Errno::from(v3_errno)` then through
+    the existing `fs_change_errno_magnitude` table.
+  Tmpfs's v3 `step_chmod` / `step_chown` impls delegate to v4
+  internally, so semantics are preserved end-to-end. **chmod
+  and chown syscalls now run through the v3 trait surface.**
+  Final count: **1328 passed, 0 failed, 11 ignored across 60
+  binaries** (unchanged baseline). All gates green. **Wave
+  9g-b unblocked:** migrate the next-smallest tx-shims caller
+  cluster — likely `fs_basic.rs::sys_getdents64` (1 call,
+  `fs_ops.readdir`) or the `fs_mut.rs` mutator family
+  (mknod/mkdir/rmdir/unlink/symlink/link — 6 calls, larger but
+  shape-uniform).
+
 - 2026-05-09 PR-1 wave-9g v3 TDD migration ABORTED — worker
   discovered the brief's premise was wrong. Brief assumed wave
   9d/9f had migrated all production code to v3. They migrated
