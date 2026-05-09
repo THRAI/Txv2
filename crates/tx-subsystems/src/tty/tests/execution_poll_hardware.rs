@@ -14,12 +14,20 @@ use super::support::{alloc_tty, init_zones, NOOP_BINDING, TTY_ZONE_TEST_LOCK};
 struct BlockingReadOps;
 
 impl CharDeviceOps for BlockingReadOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Blocked(crate::execution::WaitToken::new(0x55, 0x0f))
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> V3Out<usize, tx_substrate::step_v3::ByteProgress> {
+        V3Out::yield_on_carrier(tx_substrate::step_v3::ByteProgress::EMPTY, 0x55, 0x0f)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(bytes.len())
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> V3Out<usize, tx_substrate::step_v3::ByteProgress> {
+        V3Out::Done(bytes.len())
     }
 }
 

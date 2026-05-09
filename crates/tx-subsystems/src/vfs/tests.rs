@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use crate::execution::{Errno as V4Errno, Guard, StepOutcome as V4StepOutcome};
+use crate::execution::{Errno as V4Errno, Guard};
 use tx_substrate::step_v3::{Errno, StepOutcome};
 use crate::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
 use crate::process::execution::reset_init_process_for_test;
@@ -19,16 +19,24 @@ use tx_substrate::zone::{self, Cap, PayloadCap};
 struct EchoCharOps;
 
 impl CharDeviceOps for EchoCharOps {
-    fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> V4StepOutcome<usize> {
+    fn read(
+        &self,
+        out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
         if out.is_empty() {
-            return V4StepOutcome::Done(0);
+            return StepOutcome::Done(0);
         }
         out[0] = b'R';
-        V4StepOutcome::Done(1)
+        StepOutcome::Done(1)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> V4StepOutcome<usize> {
-        V4StepOutcome::Done(bytes.len())
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        StepOutcome::Done(bytes.len())
     }
 }
 

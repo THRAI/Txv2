@@ -122,25 +122,20 @@ fn step_range_with_user_buffer(
             PageBackedIoKind::Write => MaterializeAccess::Write,
         };
 
-        // `materialize_page` is still on v4 (`execution::StepOutcome<MaterializedPage>`);
-        // its many other callers rely on that shape. Translate per
-        // outcome variant to v3 here, mirroring the pattern in
-        // `page_backed::step_range`:
-        // - v4 `Done` / `Advanced` → run the user-side copy, then either
-        //   continue the loop (on success) or terminate.
-        // - v4 `AdvancedThenBlocked(_, token)` → after advancing, return
-        //   v3 `Yield { progress: ByteProgress::new(advanced), shape:
-        //   OnCarrier { carrier, interests } }`.
-        // - v4 `Blocked(token)` with `advanced == 0` → v3 `Yield {
-        //   progress: ByteProgress::EMPTY, ... }`. Otherwise return a
-        //   v3 `Yield` carrying the accumulated bytes (matches the v4
-        //   `AdvancedThenBlocked` semantic).
-        // - v4 `Err(errno)` with `advanced == 0` → v3 `Err(errno.into())`.
-        //   Otherwise return v3 `Done(advanced)` (partial-success;
-        //   matches existing v4 semantics where errors after progress
-        //   were swallowed into a successful partial step).
+        // `materialize_page` is now v3
+        // `StepOutcome<MaterializedPage, NoProgress>`. Map per variant:
+        // - `Done` / `Continue { .. }` → run the user-side copy, then
+        //   either continue the loop (on success) or terminate.
+        // - `Yield { OnCarrier .. }` with `advanced == 0` → v3 `Yield`
+        //   with `ByteProgress::EMPTY`. Otherwise propagate the yield
+        //   carrying the accumulated bytes.
+        // - `Yield { .. }` (OnAgent) → unsupported; surface `Err(EIO)`
+        //   if no progress yet, else partial `Done`.
+        // - `Err(errno)` with `advanced == 0` → v3 `Err(errno)`.
+        //   Otherwise return v3 `Done(advanced)` (partial-success).
+        use tx_substrate::step_v3::YieldShape;
         match pc.materialize_page(page_index, access, guard) {
-            StepOutcome::Done(materialized) | StepOutcome::Advanced(materialized) => {
+            tx_substrate::step_v3::StepOutcome::Done(materialized) => {
                 match copy_chunk_user(
                     materialized.ppn,
                     within_page,
@@ -163,34 +158,44 @@ fn step_range_with_user_buffer(
                     }
                 }
             }
-            StepOutcome::AdvancedThenBlocked(_, token) => {
-                advanced += chunk;
-                offset += chunk as u64;
+            tx_substrate::step_v3::StepOutcome::Continue { .. } => {
+                // NoProgress carrier: no materialized frame; treat as
+                // EAGAIN-like and surface partial progress (or EIO if
+                // none) — page allocation rarely emits this.
+                if advanced == 0 {
+                    return V3::err(tx_substrate::step_v3::Errno::EAGAIN);
+                }
                 of.set_offset(offset);
-                return V3::yield_on_carrier(
-                    ByteProgress::new(advanced),
-                    token.carrier(),
-                    token.interest(),
-                );
+                return V3::done(advanced);
             }
-            StepOutcome::Blocked(token) => {
+            tx_substrate::step_v3::StepOutcome::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => {
                 if advanced == 0 {
                     return V3::yield_on_carrier(
                         ByteProgress::EMPTY,
-                        token.carrier(),
-                        token.interest(),
+                        carrier.raw(),
+                        interests.raw(),
                     );
                 }
                 of.set_offset(offset);
                 return V3::yield_on_carrier(
                     ByteProgress::new(advanced),
-                    token.carrier(),
-                    token.interest(),
+                    carrier.raw(),
+                    interests.raw(),
                 );
             }
-            StepOutcome::Err(errno) => {
+            tx_substrate::step_v3::StepOutcome::Yield { .. } => {
                 if advanced == 0 {
-                    return V3::err(errno.into());
+                    return V3::err(tx_substrate::step_v3::Errno::EIO);
+                }
+                of.set_offset(offset);
+                return V3::done(advanced);
+            }
+            tx_substrate::step_v3::StepOutcome::Err(errno) => {
+                if advanced == 0 {
+                    return V3::err(errno);
                 }
                 of.set_offset(offset);
                 return V3::done(advanced);

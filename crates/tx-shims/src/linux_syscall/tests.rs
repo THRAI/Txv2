@@ -239,16 +239,24 @@ impl CapturingOps {
 }
 
 impl CharDeviceOps for CapturingOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(0)
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        tx_substrate::step_v3::StepOutcome::Done(0)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
         self.captured
             .lock()
             .expect("capture lock")
             .extend_from_slice(bytes);
-        StepOutcome::Done(bytes.len())
+        tx_substrate::step_v3::StepOutcome::Done(bytes.len())
     }
 }
 

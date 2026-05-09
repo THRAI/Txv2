@@ -72,45 +72,54 @@ pub fn step_copy_file_range(
             ),
         );
 
-        // `materialize_page` is still on v4; translate per outcome
-        // variant to v3 here, mirroring `page_backed::step_range`:
-        // - v4 `Done` / `Advanced` → continue the copy loop.
-        // - v4 `AdvancedThenBlocked(_, token)` → publish progress on
-        //   out_pc, return v3 `Yield { progress, OnCarrier }`.
-        // - v4 `Blocked(token)` with `advanced == 0` → v3 `Yield {
-        //   progress: ByteProgress::EMPTY, ... }`. Otherwise publish
-        //   progress and return v3 `Yield` with accumulated bytes.
-        // - v4 `Err(errno)` with `advanced == 0` → v3 `Err(errno.into())`.
-        //   Otherwise publish progress and return v3 `Done(advanced)`.
+        // `materialize_page` returns v3
+        // `StepOutcome<MaterializedPage, NoProgress>`. Map per variant:
+        // - `Done` → continue the copy loop with the materialized frame.
+        // - `Continue { .. }` (NoProgress) → no frame; partial-success
+        //   surface (`Done(advanced)` if any) or `EAGAIN`.
+        // - `Yield { OnCarrier .. }` → propagate carrying accumulated
+        //   byte progress (or `EMPTY` when `advanced == 0`).
+        // - `Yield { OnAgent .. }` → unsupported, surface `EIO`/partial.
+        // - `Err(errno)` → `Err(errno)` (no progress yet) or partial `Done`.
+        use tx_substrate::step_v3::YieldShape;
         let in_materialized = match in_pc.materialize_page(in_page, MaterializeAccess::Read, guard)
         {
-            StepOutcome::Done(m) | StepOutcome::Advanced(m) => m,
-            StepOutcome::Blocked(token) => {
+            tx_substrate::step_v3::StepOutcome::Done(m) => m,
+            tx_substrate::step_v3::StepOutcome::Continue { .. } => {
+                if advanced == 0 {
+                    return V3::err(tx_substrate::step_v3::Errno::EAGAIN);
+                }
+                publish_progress(out_pc, out_offset, advanced);
+                return V3::done(advanced);
+            }
+            tx_substrate::step_v3::StepOutcome::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => {
                 if advanced == 0 {
                     return V3::yield_on_carrier(
                         ByteProgress::EMPTY,
-                        token.carrier(),
-                        token.interest(),
+                        carrier.raw(),
+                        interests.raw(),
                     );
                 }
                 publish_progress(out_pc, out_offset, advanced);
                 return V3::yield_on_carrier(
                     ByteProgress::new(advanced),
-                    token.carrier(),
-                    token.interest(),
+                    carrier.raw(),
+                    interests.raw(),
                 );
             }
-            StepOutcome::AdvancedThenBlocked(_, token) => {
-                publish_progress(out_pc, out_offset, advanced);
-                return V3::yield_on_carrier(
-                    ByteProgress::new(advanced),
-                    token.carrier(),
-                    token.interest(),
-                );
-            }
-            StepOutcome::Err(errno) => {
+            tx_substrate::step_v3::StepOutcome::Yield { .. } => {
                 if advanced == 0 {
-                    return V3::err(errno.into());
+                    return V3::err(tx_substrate::step_v3::Errno::EIO);
+                }
+                publish_progress(out_pc, out_offset, advanced);
+                return V3::done(advanced);
+            }
+            tx_substrate::step_v3::StepOutcome::Err(errno) => {
+                if advanced == 0 {
+                    return V3::err(errno);
                 }
                 publish_progress(out_pc, out_offset, advanced);
                 return V3::done(advanced);
@@ -119,33 +128,42 @@ pub fn step_copy_file_range(
 
         let out_materialized =
             match out_pc.materialize_page(out_page, MaterializeAccess::Write, guard) {
-                StepOutcome::Done(m) | StepOutcome::Advanced(m) => m,
-                StepOutcome::Blocked(token) => {
+                tx_substrate::step_v3::StepOutcome::Done(m) => m,
+                tx_substrate::step_v3::StepOutcome::Continue { .. } => {
+                    if advanced == 0 {
+                        return V3::err(tx_substrate::step_v3::Errno::EAGAIN);
+                    }
+                    publish_progress(out_pc, out_offset, advanced);
+                    return V3::done(advanced);
+                }
+                tx_substrate::step_v3::StepOutcome::Yield {
+                    shape: YieldShape::OnCarrier { carrier, interests },
+                    ..
+                } => {
                     if advanced == 0 {
                         return V3::yield_on_carrier(
                             ByteProgress::EMPTY,
-                            token.carrier(),
-                            token.interest(),
+                            carrier.raw(),
+                            interests.raw(),
                         );
                     }
                     publish_progress(out_pc, out_offset, advanced);
                     return V3::yield_on_carrier(
                         ByteProgress::new(advanced),
-                        token.carrier(),
-                        token.interest(),
+                        carrier.raw(),
+                        interests.raw(),
                     );
                 }
-                StepOutcome::AdvancedThenBlocked(_, token) => {
-                    publish_progress(out_pc, out_offset, advanced);
-                    return V3::yield_on_carrier(
-                        ByteProgress::new(advanced),
-                        token.carrier(),
-                        token.interest(),
-                    );
-                }
-                StepOutcome::Err(errno) => {
+                tx_substrate::step_v3::StepOutcome::Yield { .. } => {
                     if advanced == 0 {
-                        return V3::err(errno.into());
+                        return V3::err(tx_substrate::step_v3::Errno::EIO);
+                    }
+                    publish_progress(out_pc, out_offset, advanced);
+                    return V3::done(advanced);
+                }
+                tx_substrate::step_v3::StepOutcome::Err(errno) => {
+                    if advanced == 0 {
+                        return V3::err(errno);
                     }
                     publish_progress(out_pc, out_offset, advanced);
                     return V3::done(advanced);

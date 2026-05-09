@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use tx_substrate::zone::Cap;
 
-use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
+use crate::execution::{Errno, Guard};
 use crate::tty::checks::{background_write_signal, require_fg_pgrp, require_live_tty};
 use crate::tty::execution::{step_ingest, TTY_WRITABLE};
 use crate::tty::ldisc::process_output;
@@ -49,10 +49,14 @@ pub fn step_write_for_process(
     step_write(tty, bytes, guard)
 }
 
-fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usize> {
+fn kick_transport(
+    tty: &Cap<TtyIdentity>,
+    guard: &Guard<'_>,
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3Out, YieldShape};
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3Out::Err(err.into()),
     };
 
     enum Kick {
@@ -76,50 +80,77 @@ fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usiz
     });
 
     if chunk.is_empty() {
-        return StepOutcome::Done(0);
+        return V3Out::Done(0);
     }
 
     match kick {
         Kick::Hardware => match &payload.transport {
             TtyTransport::Hardware { binding } => match binding.ops.write(&chunk, guard) {
-                StepOutcome::Done(written) | StepOutcome::Advanced(written) => {
+                V3Out::Done(written) => {
                     if written < chunk.len() {
                         restore_front(tty, &payload, &chunk[written..]);
                     }
-                    StepOutcome::Done(written.min(chunk.len()))
+                    V3Out::Done(written.min(chunk.len()))
                 }
-                StepOutcome::AdvancedThenBlocked(written, wait) => {
+                V3Out::Continue { progress } => {
+                    let written = progress.bytes();
                     if written < chunk.len() {
                         restore_front(tty, &payload, &chunk[written..]);
                     }
-                    StepOutcome::AdvancedThenBlocked(written.min(chunk.len()), wait)
+                    V3Out::Done(written.min(chunk.len()))
                 }
-                StepOutcome::Blocked(wait) => {
-                    restore_front(tty, &payload, &chunk);
-                    StepOutcome::Blocked(wait)
+                V3Out::Yield {
+                    progress,
+                    shape: YieldShape::OnCarrier { carrier, interests },
+                } => {
+                    let written = progress.bytes();
+                    if written < chunk.len() {
+                        restore_front(tty, &payload, &chunk[written..]);
+                    } else {
+                        // Defensive: if the driver claimed it advanced
+                        // more than we passed, restore nothing.
+                    }
+                    if written == 0 {
+                        // Pure block: restore the chunk so a later kick
+                        // can try again.
+                        restore_front(tty, &payload, &chunk);
+                        V3Out::yield_on_carrier(
+                            ByteProgress::EMPTY,
+                            carrier.raw(),
+                            interests.raw(),
+                        )
+                    } else {
+                        V3Out::yield_on_carrier(
+                            ByteProgress::new(written.min(chunk.len())),
+                            carrier.raw(),
+                            interests.raw(),
+                        )
+                    }
                 }
-                StepOutcome::Err(err) => {
+                V3Out::Yield { .. } => {
                     restore_front(tty, &payload, &chunk);
-                    StepOutcome::Err(err)
+                    V3Out::Err(tx_substrate::step_v3::Errno::EIO)
+                }
+                V3Out::Err(err) => {
+                    restore_front(tty, &payload, &chunk);
+                    V3Out::Err(err)
                 }
             },
-            TtyTransport::Pty { .. } => StepOutcome::Err(Errno::EIO),
+            TtyTransport::Pty { .. } => V3Out::Err(Errno::EIO.into()),
         },
-        Kick::Pty(peer) => {
-            use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
-            match step_ingest(&peer, &chunk, guard) {
-                V3Out::Done(_) | V3Out::Continue { .. } => StepOutcome::Done(chunk.len()),
-                V3Out::Err(e) => StepOutcome::Err(e.into()),
-                V3Out::Yield {
-                    shape: YieldShape::OnCarrier { carrier, interests },
-                    ..
-                } => StepOutcome::Blocked(crate::execution::WaitToken::new(
-                    carrier.raw(),
-                    interests.raw(),
-                )),
-                V3Out::Yield { .. } => StepOutcome::Err(Errno::EIO),
-            }
-        }
+        Kick::Pty(peer) => match step_ingest(&peer, &chunk, guard) {
+            V3Out::Done(_) | V3Out::Continue { .. } => V3Out::Done(chunk.len()),
+            V3Out::Err(e) => V3Out::Err(e),
+            V3Out::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => V3Out::yield_on_carrier(
+                ByteProgress::new(chunk.len()),
+                carrier.raw(),
+                interests.raw(),
+            ),
+            V3Out::Yield { .. } => V3Out::Err(tx_substrate::step_v3::Errno::EIO),
+        },
     }
 }
 
@@ -222,23 +253,19 @@ pub fn step_write(
         );
     }
 
+    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3Out, YieldShape};
     match kick_transport(tty, guard) {
-        StepOutcome::Err(err) => tx_substrate::step_v3::StepOutcome::err(err.into()),
-        StepOutcome::Blocked(wait) => tx_substrate::step_v3::StepOutcome::yield_on_carrier(
-            tx_substrate::step_v3::ByteProgress::new(consumed),
-            wait.carrier(),
-            wait.interest(),
+        V3Out::Err(err) => V3Out::err(err),
+        V3Out::Yield {
+            shape: YieldShape::OnCarrier { carrier, interests },
+            ..
+        } => V3Out::yield_on_carrier(
+            ByteProgress::new(consumed),
+            carrier.raw(),
+            interests.raw(),
         ),
-        StepOutcome::AdvancedThenBlocked(_, wait) => {
-            tx_substrate::step_v3::StepOutcome::yield_on_carrier(
-                tx_substrate::step_v3::ByteProgress::new(consumed),
-                wait.carrier(),
-                wait.interest(),
-            )
-        }
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => {
-            tx_substrate::step_v3::StepOutcome::done(consumed)
-        }
+        V3Out::Yield { .. } => V3Out::err(tx_substrate::step_v3::Errno::EIO),
+        V3Out::Done(_) | V3Out::Continue { .. } => V3Out::done(consumed),
     }
 }
 
@@ -296,12 +323,24 @@ mod tests {
     }
 
     impl CharDeviceOps for BlockingOps {
-        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-            StepOutcome::Done(0)
+        fn read(
+            &self,
+            _out: &mut [u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+            tx_substrate::step_v3::StepOutcome::Done(0)
         }
 
-        fn write(&self, _bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-            StepOutcome::Blocked(WaitToken::new(self.carrier, self.interest))
+        fn write(
+            &self,
+            _bytes: &[u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+            tx_substrate::step_v3::StepOutcome::yield_on_carrier(
+                tx_substrate::step_v3::ByteProgress::EMPTY,
+                self.carrier,
+                self.interest,
+            )
         }
     }
 
@@ -310,12 +349,20 @@ mod tests {
     struct CompletingOps;
 
     impl CharDeviceOps for CompletingOps {
-        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-            StepOutcome::Done(0)
+        fn read(
+            &self,
+            _out: &mut [u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+            tx_substrate::step_v3::StepOutcome::Done(0)
         }
 
-        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-            StepOutcome::Done(bytes.len())
+        fn write(
+            &self,
+            bytes: &[u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
         }
     }
 

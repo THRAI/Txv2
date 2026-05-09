@@ -7,10 +7,10 @@
 
 use alloc::sync::Arc;
 
-use crate::execution::{Guard, StepOutcome as V4Out};
+use crate::execution::Guard;
 use crate::page_backed::FsPageBacking;
 use crate::tty;
-use tx_substrate::step_v3::{ByteProgress, Errno, NoProgress, StepOutcome, YieldShape};
+use tx_substrate::step_v3::{ByteProgress, Errno, NoProgress, StepOutcome};
 
 use super::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileIoctl,
@@ -237,31 +237,6 @@ pub struct MountOutput {
 // char-device struct payloads already route through their owning
 // subsystems.
 
-/// Bridge a v4 `StepOutcome<usize>` (from a `CharDeviceOps` impl that
-/// stays on the v4 surface) into a v3 `StepOutcome<usize, ByteProgress>`.
-///
-/// `CharDeviceOps::read` / `write` keep their v4 signatures because the
-/// trait has many test-side impls; lifting them in this seam lets
-/// `OpenFile::step_read` / `step_write` surface a v3 outcome shape to
-/// callers without disturbing those impls.
-fn bridge_char_v4_to_v3(v4: V4Out<usize>) -> StepOutcome<usize, ByteProgress> {
-    match v4 {
-        V4Out::Done(n) => StepOutcome::Done(n),
-        V4Out::Advanced(n) => StepOutcome::Continue {
-            progress: ByteProgress::new(n),
-        },
-        V4Out::Blocked(token) => StepOutcome::Yield {
-            progress: ByteProgress::EMPTY,
-            shape: YieldShape::on_carrier(token.carrier(), token.interest()),
-        },
-        V4Out::AdvancedThenBlocked(n, token) => StepOutcome::Yield {
-            progress: ByteProgress::new(n),
-            shape: YieldShape::on_carrier(token.carrier(), token.interest()),
-        },
-        V4Out::Err(errno) => StepOutcome::Err(errno.into()),
-    }
-}
-
 impl OpenFile {
     /// Dispatch a read against this file's RNode backing.
     pub fn step_read(
@@ -276,9 +251,7 @@ impl OpenFile {
         match self.rnode.backing() {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => tty::execution::step_read(tty, out, guard),
-                StructPayload::CharDevice(binding) => {
-                    bridge_char_v4_to_v3(binding.ops.read(out, guard))
-                }
+                StructPayload::CharDevice(binding) => binding.ops.read(out, guard),
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Reader,
@@ -396,9 +369,7 @@ impl OpenFile {
         match self.rnode.backing() {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => tty::execution::step_write(tty, bytes, guard),
-                StructPayload::CharDevice(binding) => {
-                    bridge_char_v4_to_v3(binding.ops.write(bytes, guard))
-                }
+                StructPayload::CharDevice(binding) => binding.ops.write(bytes, guard),
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Writer,

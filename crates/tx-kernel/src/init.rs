@@ -91,18 +91,26 @@ impl<P: TxPlatform> ConsoleCharOps<P> {
 // compiler treats as thread-safe. The impl therefore only needs the
 // `TxPlatform + 'static` bounds the binding actually consumes.
 impl<P: TxPlatform> CharDeviceOps for ConsoleCharOps<P> {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(0)
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        tx_substrate::step_v3::StepOutcome::Done(0)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
         // The HAL exposes byte-oriented console writes; tx-kernel's
         // existing init code uses `console_write_str` which calls
         // `P::write_bytes` under the hood. We bypass the str
         // adapter so non-UTF-8 bytes (e.g., raw control sequences)
         // round-trip unchanged.
         <P as tx_hal::ConsoleIf>::write_bytes(bytes);
-        StepOutcome::Done(bytes.len())
+        tx_substrate::step_v3::StepOutcome::Done(bytes.len())
     }
 }
 

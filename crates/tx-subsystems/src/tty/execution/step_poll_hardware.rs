@@ -9,7 +9,7 @@ use alloc::vec;
 
 use tx_substrate::zone::Cap;
 
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::{Errno, Guard};
 use crate::tty::checks::require_live_tty;
 use crate::tty::execution::{step_ingest, IngestOutcome};
 use crate::tty::structure::{TtyIdentity, TtyTransport};
@@ -81,8 +81,20 @@ pub fn step_poll_hardware_input(
     };
 
     let mut bytes = vec![0u8; max_bytes];
+    // `binding.ops.read` is now a v3 `StepOutcome<usize, ByteProgress>`.
+    // Map directly:
+    // - `Done(n)` → ingest the bytes (or short-circuit at n=0).
+    // - `Continue { progress }` → bytes were consumed but the op asked
+    //   to continue without waiting; ingest those bytes (the caller's
+    //   next poll re-enters the step).
+    // - `Yield { progress, shape: OnCarrier }` with non-empty progress
+    //   → ingest the bytes and surface the inner outcome (matches the
+    //   pre-v3 `AdvancedThenBlocked` collapse). With empty progress the
+    //   yield-on-carrier propagates as-is.
+    // - `Yield { shape: OnAgent .. }` → unsupported; surface `Err(EIO)`.
+    // - `Err(errno)` → propagate.
     match binding.ops.read(&mut bytes, guard) {
-        StepOutcome::Done(read) | StepOutcome::Advanced(read) => {
+        V3::Done(read) => {
             let read = read.min(bytes.len());
             if read == 0 {
                 return V3::Done(HardwarePollOutcome::default());
@@ -90,22 +102,26 @@ pub fn step_poll_hardware_input(
             bytes.truncate(read);
             drive_ingest(&bytes, read, guard)
         }
-        StepOutcome::AdvancedThenBlocked(read, wait) => {
-            let read = read.min(bytes.len());
+        V3::Continue { progress } => {
+            let read = progress.bytes().min(bytes.len());
             if read == 0 {
-                return V3::yield_on_carrier(NoProgress, wait.carrier(), wait.interest());
+                return V3::Done(HardwarePollOutcome::default());
             }
             bytes.truncate(read);
-            // Partial-then-blocked: ingest the bytes; if ingest itself
-            // is Done, surface Done(outcome) (the v3 NoProgress catalog
-            // can't carry a partial-value-plus-wait shape — the wait
-            // is implicitly resolved by the caller's next poll). If
-            // ingest itself yields, that yield dominates.
             drive_ingest(&bytes, read, guard)
         }
-        StepOutcome::Blocked(wait) => {
-            V3::yield_on_carrier(NoProgress, wait.carrier(), wait.interest())
+        V3::Yield {
+            progress,
+            shape: YieldShape::OnCarrier { carrier, interests },
+        } => {
+            let read = progress.bytes().min(bytes.len());
+            if read == 0 {
+                return V3::yield_on_carrier(NoProgress, carrier.raw(), interests.raw());
+            }
+            bytes.truncate(read);
+            drive_ingest(&bytes, read, guard)
         }
-        StepOutcome::Err(err) => V3::Err(err.into()),
+        V3::Yield { .. } => V3::Err(Errno::EIO.into()),
+        V3::Err(err) => V3::Err(err),
     }
 }

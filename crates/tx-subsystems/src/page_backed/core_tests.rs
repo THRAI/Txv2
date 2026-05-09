@@ -5,7 +5,7 @@
 //! `MountPayload` carries `fs_ops` / `fs_page_backing` fields.
 
     use super::*;
-    use crate::execution::{Errno, StepOutcome, WaitToken};
+    use crate::execution::Errno;
     use crate::mount::{DevId, MountOptions, MountPayload, SourceLabel};
     use tx_substrate::step_v3::StepOutcome as V3Out;
     use crate::vfs::{
@@ -573,7 +573,7 @@
         );
 
         let page = match pc.materialize_page(PageIndex::new(1), MaterializeAccess::Write, &guard) {
-            StepOutcome::Done(page) => page,
+            V3Out::Done(page) => page,
             other => panic!("unexpected materialize outcome: {other:?}"),
         };
 
@@ -596,12 +596,12 @@
         );
 
         let first = match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Read, &guard) {
-            StepOutcome::Done(page) => page,
+            V3Out::Done(page) => page,
             other => panic!("unexpected materialize outcome: {other:?}"),
         };
         let second = match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Write, &guard)
         {
-            StepOutcome::Done(page) => page,
+            V3Out::Done(page) => page,
             other => panic!("unexpected rematerialize outcome: {other:?}"),
         };
 
@@ -632,16 +632,20 @@
             4,
         );
 
-        assert_eq!(
-            match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
-                StepOutcome::Blocked(token) => StepOutcome::<()>::Blocked(token),
-                StepOutcome::Done(_)
-                | StepOutcome::Advanced(_)
-                | StepOutcome::AdvancedThenBlocked(_, _)
-                | StepOutcome::Err(_) => panic!("expected blocked file fetch"),
-            },
-            StepOutcome::Blocked(WaitToken::new(9, 0x44))
-        );
+        match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
+            V3Out::Yield {
+                shape:
+                    tx_substrate::step_v3::YieldShape::OnCarrier {
+                        carrier,
+                        interests,
+                    },
+                ..
+            } => {
+                assert_eq!(carrier.raw(), 9);
+                assert_eq!(interests.raw(), 0x44);
+            }
+            other => panic!("expected blocked file fetch, got {other:?}"),
+        }
         assert_eq!(pc.resident_pages(), 0);
     }
 
@@ -659,7 +663,7 @@
         );
 
         let page = match pc.materialize_page(PageIndex::new(1), MaterializeAccess::Write, &guard) {
-            StepOutcome::Done(page) => page,
+            V3Out::Done(page) => page,
             other => panic!("unexpected materialize outcome: {other:?}"),
         };
 
@@ -667,16 +671,12 @@
         assert!(page.newly_installed);
         assert!(!page.dirty);
         assert_eq!(pc.lookup(PageIndex::new(1)), Some(Ppn(0xfeed_0001)));
-        assert_eq!(
-            match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Read, &guard) {
-                StepOutcome::Err(errno) => StepOutcome::<()>::Err(errno),
-                StepOutcome::Done(_)
-                | StepOutcome::Advanced(_)
-                | StepOutcome::AdvancedThenBlocked(_, _)
-                | StepOutcome::Blocked(_) => panic!("expected out-of-bounds error"),
-            },
-            StepOutcome::Err(Errno::EINVAL)
-        );
+        match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Read, &guard) {
+            V3Out::Err(errno) => {
+                assert_eq!(errno, tx_substrate::step_v3::Errno::EINVAL);
+            }
+            other => panic!("expected out-of-bounds error, got {other:?}"),
+        }
     }
 
     #[test]

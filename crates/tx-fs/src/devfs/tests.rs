@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use std::sync::Mutex;
 
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use tx_subsystems::execution::{Errno, Guard, StepOutcome};
+use tx_subsystems::execution::{Guard, StepOutcome};
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::vfs::{
     Credential, DirCursor, FsObjectId, FsOps, RNodeBacking, StructPayload,
@@ -57,16 +57,24 @@ impl CapturingOps {
 }
 
 impl CharDeviceOps for CapturingOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(0)
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<usize, tx_substrate::step_v3::ByteProgress> {
+        V3Outcome::Done(0)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<usize, tx_substrate::step_v3::ByteProgress> {
         self.captured
             .lock()
             .expect("capture lock")
             .extend_from_slice(bytes);
-        StepOutcome::Done(bytes.len())
+        V3Outcome::Done(bytes.len())
     }
 }
 
