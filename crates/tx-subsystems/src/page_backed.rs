@@ -574,17 +574,18 @@ pub fn step_read(
     of: &OpenFile,
     len: usize,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     if len == 0 {
-        return StepOutcome::Done(0);
+        return V3::done(0);
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     let start = of.offset();
     let valid_end = core::cmp::min(pc.size_bytes(), capacity);
     if start >= valid_end {
-        return StepOutcome::Done(0);
+        return V3::done(0);
     }
     let effective_len = core::cmp::min(len as u64, valid_end - start) as usize;
     step_range(pc, of, effective_len, PageBackedIoKind::Read, guard)
@@ -595,37 +596,33 @@ pub fn step_write(
     of: &OpenFile,
     len: usize,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     if len == 0 {
-        return StepOutcome::Done(0);
+        return V3::done(0);
     }
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     let Some(end) = of.offset().checked_add(len as u64) else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     if end > capacity {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     }
     let start = of.offset();
     let outcome = step_range(pc, of, len, PageBackedIoKind::Write, guard);
-    match &outcome {
-        StepOutcome::Done(advanced)
-        | StepOutcome::Advanced(advanced)
-        | StepOutcome::AdvancedThenBlocked(advanced, _)
-            if *advanced > 0 =>
-        {
-            pc.grow_size_to(start + *advanced as u64);
-        }
-        StepOutcome::Done(_)
-        | StepOutcome::Advanced(_)
-        | StepOutcome::AdvancedThenBlocked(_, _)
-        | StepOutcome::Blocked(_)
-        | StepOutcome::Err(_) => {}
+    let advanced_bytes = match &outcome {
+        V3::Done(n) => *n,
+        V3::Continue { progress } => progress.bytes(),
+        V3::Yield { progress, .. } => progress.bytes(),
+        V3::Err(_) => 0,
+    };
+    if advanced_bytes > 0 {
+        pc.grow_size_to(start + advanced_bytes as u64);
     }
     outcome
 }
@@ -636,7 +633,8 @@ fn step_range(
     len: usize,
     kind: PageBackedIoKind,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
     let mut advanced = 0usize;
     let mut offset = of.offset();
     while advanced < len {
@@ -648,6 +646,22 @@ fn step_range(
             PageBackedIoKind::Write => MaterializeAccess::Write,
         };
 
+        // `materialize_page` is still on v4 (`execution::StepOutcome<MaterializedPage>`);
+        // its many other callers rely on that shape. Translate per
+        // outcome variant to v3 here:
+        // - v4 `Done` / `Advanced` → continue the loop, advancing
+        //   `offset` and accumulating `advanced` bytes.
+        // - v4 `AdvancedThenBlocked(_, token)` → after advancing, return
+        //   v3 `Yield { progress: ByteProgress::new(advanced), shape:
+        //   OnCarrier { carrier, interests } }`.
+        // - v4 `Blocked(token)` with `advanced == 0` → v3 `Yield {
+        //   progress: ByteProgress::EMPTY, ... }`. Otherwise return a
+        //   v3 `Yield` carrying the accumulated bytes (matches the v4
+        //   `AdvancedThenBlocked` semantic).
+        // - v4 `Err(errno)` with `advanced == 0` → v3 `Err(errno.into())`.
+        //   Otherwise return v3 `Done(advanced)` (partial-success;
+        //   matches existing v4 semantics where errors after progress
+        //   were swallowed into a successful partial step).
         match pc.materialize_page(page_index, access, guard) {
             StepOutcome::Done(_) | StepOutcome::Advanced(_) => {
                 advanced += chunk;
@@ -657,27 +671,39 @@ fn step_range(
                 advanced += chunk;
                 offset += chunk as u64;
                 of.set_offset(offset);
-                return StepOutcome::AdvancedThenBlocked(advanced, token);
+                return V3::yield_on_carrier(
+                    ByteProgress::new(advanced),
+                    token.carrier(),
+                    token.interest(),
+                );
             }
             StepOutcome::Blocked(token) => {
                 if advanced == 0 {
-                    return StepOutcome::Blocked(token);
+                    return V3::yield_on_carrier(
+                        ByteProgress::EMPTY,
+                        token.carrier(),
+                        token.interest(),
+                    );
                 }
                 of.set_offset(offset);
-                return StepOutcome::AdvancedThenBlocked(advanced, token);
+                return V3::yield_on_carrier(
+                    ByteProgress::new(advanced),
+                    token.carrier(),
+                    token.interest(),
+                );
             }
             StepOutcome::Err(errno) => {
                 if advanced == 0 {
-                    return StepOutcome::Err(errno);
+                    return V3::err(errno.into());
                 }
                 of.set_offset(offset);
-                return StepOutcome::Done(advanced);
+                return V3::done(advanced);
             }
         }
     }
 
     of.set_offset(offset);
-    StepOutcome::Done(advanced)
+    V3::done(advanced)
 }
 
 fn allocate_cached_frame() -> Result<CachedFrame, PageCacheError> {

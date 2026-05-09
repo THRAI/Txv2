@@ -7,6 +7,7 @@
     use super::*;
     use crate::execution::{Errno, StepOutcome, WaitToken};
     use crate::mount::{DevId, MountOptions, MountPayload, SourceLabel};
+    use tx_substrate::step_v3::StepOutcome as V3Out;
     use crate::vfs::{
         Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
         OpenFileFlags, RNode, RNodeBacking,
@@ -692,7 +693,7 @@
         let of = open_file_for_pc(&pc);
         of.set_offset((crate::vm::USER_PAGE_SIZE - 8) as u64);
 
-        assert_eq!(step_read(&pc, &of, 32, &guard), StepOutcome::Done(32));
+        assert_eq!(step_read(&pc, &of, 32, &guard), V3Out::Done(32));
 
         assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE - 8 + 32) as u64);
         assert_eq!(pc.resident_pages(), 2);
@@ -714,7 +715,7 @@
         let of = open_file_for_pc(&pc);
         of.set_offset(crate::vm::USER_PAGE_SIZE as u64);
 
-        assert_eq!(step_read(&pc, &of, 16, &guard), StepOutcome::Done(0));
+        assert_eq!(step_read(&pc, &of, 16, &guard), V3Out::Done(0));
         assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64);
         assert_eq!(pc.resident_pages(), 0);
     }
@@ -734,7 +735,7 @@
 
         assert_eq!(
             step_write(&pc, &of, crate::vm::USER_PAGE_SIZE + 17, &guard),
-            StepOutcome::Done(crate::vm::USER_PAGE_SIZE + 17)
+            V3Out::Done(crate::vm::USER_PAGE_SIZE + 17)
         );
 
         assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE + 17) as u64);
@@ -763,7 +764,11 @@
 
         assert_eq!(
             step_read(&pc, &of, crate::vm::USER_PAGE_SIZE + 1, &guard),
-            StepOutcome::AdvancedThenBlocked(crate::vm::USER_PAGE_SIZE, WaitToken::new(9, 0x44))
+            V3Out::yield_on_carrier(
+                tx_substrate::step_v3::ByteProgress::new(crate::vm::USER_PAGE_SIZE),
+                9,
+                0x44,
+            )
         );
         assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64);
     }
@@ -784,7 +789,7 @@
 
         assert_eq!(
             step_write(&pc, &of, 8, &guard),
-            StepOutcome::Err(Errno::EINVAL)
+            V3Out::Err(Errno::EINVAL.into())
         );
         assert_eq!(of.offset(), 0);
         assert_eq!(pc.resident_pages(), 0);
