@@ -13,8 +13,8 @@ use crate::tty::execution;
 use crate::tty::structure::registry;
 use crate::tty::structure::TtyIdentity;
 use crate::vfs::{
-    Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
-    OpenFileFlags, RNode, RNodeBacking, StructPayload,
+    Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags,
+    RNode, RNodeBacking, StructPayload,
 };
 
 const DEVFS_TTY_OBJECT_BASE: u64 = 0x7474_7900;
@@ -23,167 +23,6 @@ pub const DEVPTS_PTMX_OBJECT_ID: FsObjectId = FsObjectId::new(0x7074_7301);
 const DEVPTS_SLAVE_OBJECT_BASE: u64 = 0x7074_7400;
 
 pub struct DevptsInstance;
-
-impl FsOps for DevptsInstance {
-    fn lookup(
-        &self,
-        parent: FsObjectId,
-        name: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<FsObjectId> {
-        if parent != DEVPTS_ROOT_OBJECT_ID {
-            return StepOutcome::Err(Errno::ENOENT);
-        }
-
-        if name == b"ptmx" {
-            return StepOutcome::Done(DEVPTS_PTMX_OBJECT_ID);
-        }
-
-        let Some(index) = parse_u32_decimal(name) else {
-            return StepOutcome::Err(Errno::ENOENT);
-        };
-        if registry::contains_pty_slave(index) {
-            return StepOutcome::Done(devpts_object_id_for_index(index));
-        }
-
-        StepOutcome::Err(Errno::ENOENT)
-    }
-
-    fn load_inode_meta(
-        &self,
-        fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<InodeMeta> {
-        if fs_object_id == DEVPTS_ROOT_OBJECT_ID {
-            return StepOutcome::Done(InodeMeta::new(InodeKind::Directory, 0o040755));
-        }
-        if fs_object_id == DEVPTS_PTMX_OBJECT_ID {
-            return StepOutcome::Done(InodeMeta::new(InodeKind::CharDevice, 0o020666));
-        }
-        if let Some(index) = pty_index_from_devpts_object_id(fs_object_id) {
-            if registry::contains_pty_slave(index) {
-                return StepOutcome::Done(InodeMeta::new(InodeKind::CharDevice, 0o020620));
-            }
-        }
-        StepOutcome::Err(Errno::ENOENT)
-    }
-
-    fn serialize_inode_meta(
-        &self,
-        _fs_object_id: FsObjectId,
-        _meta: &InodeMeta,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn create_inode(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn unlink(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn rename(
-        &self,
-        _old_parent: FsObjectId,
-        _old_name: &[u8],
-        _new_parent: FsObjectId,
-        _new_name: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn link(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn mkdir(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn rmdir(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn symlink(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _link_target: &[u8],
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn readdir(
-        &self,
-        fs_object_id: FsObjectId,
-        cursor: DirCursor,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
-        if fs_object_id != DEVPTS_ROOT_OBJECT_ID {
-            return StepOutcome::Err(Errno::ENOTDIR);
-        }
-
-        let entries = match devpts_dir_entries() {
-            Ok(entries) => entries,
-            Err(err) => return StepOutcome::Err(err),
-        };
-        let index = cursor.as_u64() as usize;
-        let Some(entry) = entries.get(index).copied() else {
-            return StepOutcome::Done(None);
-        };
-        StepOutcome::Done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
-    }
-
-    fn destroy_inode(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-        if fs_object_id == DEVPTS_ROOT_OBJECT_ID
-            || fs_object_id == DEVPTS_PTMX_OBJECT_ID
-            || pty_index_from_devpts_object_id(fs_object_id)
-                .is_some_and(registry::contains_pty_slave)
-        {
-            return StepOutcome::Done(());
-        }
-
-        StepOutcome::Err(Errno::ENOENT)
-    }
-}
 
 /// Resolve a devfs TTY entry such as `ttyS0` or `console`.
 pub fn devfs_tty_by_name(name: &[u8], _guard: &Guard<'_>) -> StepOutcome<Cap<TtyIdentity>> {
@@ -436,20 +275,20 @@ impl PtyIndexName {
     }
 }
 
-// === Wave 9b: parallel v3 trait impls ==================================
+// === v3 trait impls =====================================================
 //
 // `impl FsOpsV3 for DevptsInstance` and `impl FsPageBackingV3 for
-// DevptsInstance` mirror the v4 surface above. Devpts is a PTY-side
-// projection: every method is purely synchronous (no v4 `Advanced` /
-// `Blocked` returns), so the v3 mapping is mechanical. There is no v4
-// `FsPageBacking for DevptsInstance` impl — devpts has no page cache —
-// so the v3 page-backing impl returns `ENOSYS` for every method whose
-// v3 trait does not provide a default. Per the wave-8 design doc
-// (`docs/progress/decisions/2026-05-09-fsops-v3-design.md`).
+// DevptsInstance` carry the standalone devpts filesystem logic. Devpts
+// is a PTY-side projection: every method is purely synchronous (no
+// `Continue` / `Yield` returns), so each body is a direct
+// `StepOutcome::done(...)` / `StepOutcome::err(...)` ladder. There is
+// no page cache, so the page-backing impl returns `ENOSYS` for every
+// method whose v3 trait does not provide a default. Per the wave-8
+// design doc (`docs/progress/decisions/2026-05-09-fsops-v3-design.md`).
 //
 // Fully-qualified `tx_substrate::step_v3::*` references at the impl
-// sites avoid clashing with `crate::execution::StepOutcome` already in
-// scope, per the wave-4/6/7/9a trait-impl convention.
+// sites avoid clashing with `crate::execution::StepOutcome` still in
+// scope for other helpers, per the wave-4/6/7/9a trait-impl convention.
 
 use crate::page_backed::{Frame, FsPageBackingV3, PageContainer};
 use crate::vfs::FsOpsV3;
@@ -459,251 +298,192 @@ impl FsOpsV3 for DevptsInstance {
         &self,
         parent: FsObjectId,
         name: &[u8],
-        guard: &Guard<'_>,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
-        match <Self as FsOps>::lookup(self, parent, name, guard) {
-            StepOutcome::Done(id) | StepOutcome::Advanced(id) => {
-                tx_substrate::step_v3::StepOutcome::done(id)
-            }
-            StepOutcome::AdvancedThenBlocked(id, _) => tx_substrate::step_v3::StepOutcome::done(id),
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        if parent != DEVPTS_ROOT_OBJECT_ID {
+            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into());
         }
+
+        if name == b"ptmx" {
+            return tx_substrate::step_v3::StepOutcome::done(DEVPTS_PTMX_OBJECT_ID);
+        }
+
+        let Some(index) = parse_u32_decimal(name) else {
+            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into());
+        };
+        if registry::contains_pty_slave(index) {
+            return tx_substrate::step_v3::StepOutcome::done(devpts_object_id_for_index(index));
+        }
+
+        tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into())
     }
 
     fn load_inode_meta(
         &self,
         fs_object_id: FsObjectId,
-        guard: &Guard<'_>,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
-        match <Self as FsOps>::load_inode_meta(self, fs_object_id, guard) {
-            StepOutcome::Done(m) | StepOutcome::Advanced(m) => {
-                tx_substrate::step_v3::StepOutcome::done(m)
-            }
-            StepOutcome::AdvancedThenBlocked(m, _) => tx_substrate::step_v3::StepOutcome::done(m),
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        if fs_object_id == DEVPTS_ROOT_OBJECT_ID {
+            return tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(
+                InodeKind::Directory,
+                0o040755,
+            ));
         }
+        if fs_object_id == DEVPTS_PTMX_OBJECT_ID {
+            return tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(
+                InodeKind::CharDevice,
+                0o020666,
+            ));
+        }
+        if let Some(index) = pty_index_from_devpts_object_id(fs_object_id) {
+            if registry::contains_pty_slave(index) {
+                return tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(
+                    InodeKind::CharDevice,
+                    0o020620,
+                ));
+            }
+        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into())
     }
 
     fn serialize_inode_meta(
         &self,
-        fs_object_id: FsObjectId,
-        meta: &InodeMeta,
-        guard: &Guard<'_>,
+        _fs_object_id: FsObjectId,
+        _meta: &InodeMeta,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        match <Self as FsOps>::serialize_inode_meta(self, fs_object_id, meta, guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
-                tx_substrate::step_v3::StepOutcome::done(())
-            }
-            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
-        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
     }
 
     fn create_inode(
         &self,
-        parent: FsObjectId,
-        name: &[u8],
-        mode: u16,
-        cred: &Credential,
-        guard: &Guard<'_>,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<
         (FsObjectId, InodeMeta),
         tx_substrate::step_v3::NoProgress,
     > {
-        match <Self as FsOps>::create_inode(self, parent, name, mode, cred, guard) {
-            StepOutcome::Done(out) | StepOutcome::Advanced(out) => {
-                tx_substrate::step_v3::StepOutcome::done(out)
-            }
-            StepOutcome::AdvancedThenBlocked(out, _) => {
-                tx_substrate::step_v3::StepOutcome::done(out)
-            }
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
-        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
     }
 
     fn unlink(
         &self,
-        parent: FsObjectId,
-        name: &[u8],
-        target: FsObjectId,
-        guard: &Guard<'_>,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        match <Self as FsOps>::unlink(self, parent, name, target, guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
-                tx_substrate::step_v3::StepOutcome::done(())
-            }
-            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
-        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
     }
 
     fn rename(
         &self,
-        old_parent: FsObjectId,
-        old_name: &[u8],
-        new_parent: FsObjectId,
-        new_name: &[u8],
-        guard: &Guard<'_>,
+        _old_parent: FsObjectId,
+        _old_name: &[u8],
+        _new_parent: FsObjectId,
+        _new_name: &[u8],
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        match <Self as FsOps>::rename(self, old_parent, old_name, new_parent, new_name, guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
-                tx_substrate::step_v3::StepOutcome::done(())
-            }
-            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
-        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
     }
 
     fn link(
         &self,
-        parent: FsObjectId,
-        name: &[u8],
-        target: FsObjectId,
-        guard: &Guard<'_>,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        match <Self as FsOps>::link(self, parent, name, target, guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
-                tx_substrate::step_v3::StepOutcome::done(())
-            }
-            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
-        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
     }
 
     fn mkdir(
         &self,
-        parent: FsObjectId,
-        name: &[u8],
-        mode: u16,
-        cred: &Credential,
-        guard: &Guard<'_>,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<
         (FsObjectId, InodeMeta),
         tx_substrate::step_v3::NoProgress,
     > {
-        match <Self as FsOps>::mkdir(self, parent, name, mode, cred, guard) {
-            StepOutcome::Done(out) | StepOutcome::Advanced(out) => {
-                tx_substrate::step_v3::StepOutcome::done(out)
-            }
-            StepOutcome::AdvancedThenBlocked(out, _) => {
-                tx_substrate::step_v3::StepOutcome::done(out)
-            }
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
-        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
     }
 
     fn rmdir(
         &self,
-        parent: FsObjectId,
-        name: &[u8],
-        target: FsObjectId,
-        guard: &Guard<'_>,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        match <Self as FsOps>::rmdir(self, parent, name, target, guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
-                tx_substrate::step_v3::StepOutcome::done(())
-            }
-            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
-        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
     }
 
     fn symlink(
         &self,
-        parent: FsObjectId,
-        name: &[u8],
-        link_target: &[u8],
-        cred: &Credential,
-        guard: &Guard<'_>,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _link_target: &[u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<
         (FsObjectId, InodeMeta),
         tx_substrate::step_v3::NoProgress,
     > {
-        match <Self as FsOps>::symlink(self, parent, name, link_target, cred, guard) {
-            StepOutcome::Done(out) | StepOutcome::Advanced(out) => {
-                tx_substrate::step_v3::StepOutcome::done(out)
-            }
-            StepOutcome::AdvancedThenBlocked(out, _) => {
-                tx_substrate::step_v3::StepOutcome::done(out)
-            }
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
-        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
     }
 
     fn readdir(
         &self,
         fs_object_id: FsObjectId,
         cursor: DirCursor,
-        guard: &Guard<'_>,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<
         Option<(DirEntry, DirCursor)>,
         tx_substrate::step_v3::NoProgress,
     > {
-        match <Self as FsOps>::readdir(self, fs_object_id, cursor, guard) {
-            StepOutcome::Done(out) | StepOutcome::Advanced(out) => {
-                tx_substrate::step_v3::StepOutcome::done(out)
-            }
-            StepOutcome::AdvancedThenBlocked(out, _) => {
-                tx_substrate::step_v3::StepOutcome::done(out)
-            }
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        if fs_object_id != DEVPTS_ROOT_OBJECT_ID {
+            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOTDIR.into());
         }
+
+        let entries = match devpts_dir_entries() {
+            Ok(entries) => entries,
+            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+        };
+        let index = cursor.as_u64() as usize;
+        let Some(entry) = entries.get(index).copied() else {
+            return tx_substrate::step_v3::StepOutcome::done(None);
+        };
+        tx_substrate::step_v3::StepOutcome::done(Some((
+            entry,
+            DirCursor::from_u64(cursor.as_u64() + 1),
+        )))
     }
 
     fn destroy_inode(
         &self,
         fs_object_id: FsObjectId,
-        guard: &Guard<'_>,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        match <Self as FsOps>::destroy_inode(self, fs_object_id, guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
-                tx_substrate::step_v3::StepOutcome::done(())
-            }
-            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        if fs_object_id == DEVPTS_ROOT_OBJECT_ID
+            || fs_object_id == DEVPTS_PTMX_OBJECT_ID
+            || pty_index_from_devpts_object_id(fs_object_id)
+                .is_some_and(registry::contains_pty_slave)
+        {
+            return tx_substrate::step_v3::StepOutcome::done(());
         }
+
+        tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into())
     }
 
     // `read_link`, `materialise_rnode`, `step_chmod`, `step_chown`:
-    // devpts does not override these on v4 (defaults return `ENOSYS`).
-    // The matching v3 trait defaults also return `ENOSYS`, so leave
-    // them unimplemented here.
+    // devpts does not override these. The v3 trait defaults return
+    // `ENOSYS`, so leave them unimplemented here.
 }
 
 impl FsPageBackingV3 for DevptsInstance {

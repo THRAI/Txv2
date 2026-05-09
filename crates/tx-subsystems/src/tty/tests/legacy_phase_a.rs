@@ -24,7 +24,7 @@ use crate::tty::ldisc::{
 use crate::tty::structure::ring::TtyRing;
 use crate::tty::structure::termios::{Termios, ICANON, IXON, TOSTOP};
 use crate::tty::structure::{SessionPgrp, TtyIdentity, TtyKind, TtyPayload, Winsize};
-use crate::vfs::{Credential, DirCursor, FsOps, InodeKind};
+use crate::vfs::{Credential, DirCursor, FsOpsV3, InodeKind};
 
 struct NoopOps;
 
@@ -1252,61 +1252,66 @@ fn devpts_fs_lookup_meta_and_readdir_follow_registry() {
         other => panic!("second open_ptmx failed: {other:?}"),
     };
 
-    assert_eq!(
-        devpts.lookup(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, b"ptmx", &guard),
-        StepOutcome::Done(crate::tty::project::DEVPTS_PTMX_OBJECT_ID)
-    );
-    let slave0_rnode = match crate::tty::project::devpts_rnode_by_index(p0.index, &guard) {
-        StepOutcome::Done(rnode) => rnode,
-        other => panic!("devpts slave 0 rnode failed: {other:?}"),
-    };
-    let slave1_rnode = match crate::tty::project::devpts_rnode_by_index(p1.index, &guard) {
-        StepOutcome::Done(rnode) => rnode,
-        other => panic!("devpts slave 1 rnode failed: {other:?}"),
-    };
-    assert_eq!(
-        devpts.lookup(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, b"0", &guard),
-        StepOutcome::Done(slave0_rnode.fs_object_id())
-    );
-    assert_eq!(
-        devpts.lookup(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, b"1", &guard),
-        StepOutcome::Done(slave1_rnode.fs_object_id())
-    );
-    assert_eq!(
-        devpts.lookup(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, b"99", &guard),
-        StepOutcome::Err(Errno::ENOENT)
-    );
+    {
+        use tx_substrate::step_v3::{Errno, StepOutcome};
+        assert_eq!(
+            devpts.lookup(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, b"ptmx", &guard),
+            StepOutcome::Done(crate::tty::project::DEVPTS_PTMX_OBJECT_ID)
+        );
+        let slave0_rnode = match crate::tty::project::devpts_rnode_by_index(p0.index, &guard) {
+            super::super::super::execution::StepOutcome::Done(rnode) => rnode,
+            other => panic!("devpts slave 0 rnode failed: {other:?}"),
+        };
+        let slave1_rnode = match crate::tty::project::devpts_rnode_by_index(p1.index, &guard) {
+            super::super::super::execution::StepOutcome::Done(rnode) => rnode,
+            other => panic!("devpts slave 1 rnode failed: {other:?}"),
+        };
+        assert_eq!(
+            devpts.lookup(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, b"0", &guard),
+            StepOutcome::Done(slave0_rnode.fs_object_id())
+        );
+        assert_eq!(
+            devpts.lookup(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, b"1", &guard),
+            StepOutcome::Done(slave1_rnode.fs_object_id())
+        );
+        assert_eq!(
+            devpts.lookup(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, b"99", &guard),
+            StepOutcome::Err(Errno::ENOENT)
+        );
 
-    assert_eq!(
-        devpts.load_inode_meta(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, &guard),
-        StepOutcome::Done(crate::vfs::InodeMeta::new(InodeKind::Directory, 0o040755))
-    );
-    assert_eq!(
-        devpts.load_inode_meta(crate::tty::project::DEVPTS_PTMX_OBJECT_ID, &guard),
-        StepOutcome::Done(crate::vfs::InodeMeta::new(InodeKind::CharDevice, 0o020666))
-    );
+        assert_eq!(
+            devpts.load_inode_meta(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, &guard),
+            StepOutcome::Done(crate::vfs::InodeMeta::new(InodeKind::Directory, 0o040755))
+        );
+        assert_eq!(
+            devpts.load_inode_meta(crate::tty::project::DEVPTS_PTMX_OBJECT_ID, &guard),
+            StepOutcome::Done(crate::vfs::InodeMeta::new(InodeKind::CharDevice, 0o020666))
+        );
 
-    let mut names = Vec::new();
-    let mut cursor = DirCursor::START;
-    loop {
-        match devpts.readdir(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, cursor, &guard) {
-            StepOutcome::Done(Some((entry, next))) => {
-                names.push(entry.name.as_bytes().to_vec());
-                cursor = next;
+        let mut names = Vec::new();
+        let mut cursor = DirCursor::START;
+        loop {
+            match devpts.readdir(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, cursor, &guard) {
+                StepOutcome::Done(Some((entry, next))) => {
+                    names.push(entry.name.as_bytes().to_vec());
+                    cursor = next;
+                }
+                StepOutcome::Done(None) => break,
+                other => panic!("readdir failed: {other:?}"),
             }
-            StepOutcome::Done(None) => break,
-            other => panic!("readdir failed: {other:?}"),
         }
-    }
 
-    assert_eq!(names.len(), 3);
-    assert_eq!(names[0], b"ptmx".to_vec());
-    assert_eq!(names[1], b"0".to_vec());
-    assert_eq!(names[2], b"1".to_vec());
+        assert_eq!(names.len(), 3);
+        assert_eq!(names[0], b"ptmx".to_vec());
+        assert_eq!(names[1], b"0".to_vec());
+        assert_eq!(names[2], b"1".to_vec());
+    }
 }
 
 #[test]
 fn devpts_fs_is_read_only_and_root_only() {
+    use tx_substrate::step_v3::Errno as V3Errno;
+    use tx_substrate::step_v3::StepOutcome as V3Outcome;
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
     let guard = tx_substrate::epoch::guard();
@@ -1315,7 +1320,7 @@ fn devpts_fs_is_read_only_and_root_only() {
 
     assert_eq!(
         devpts.lookup(crate::vfs::FsObjectId::new(9), b"ptmx", &guard),
-        StepOutcome::Err(Errno::ENOENT)
+        V3Outcome::Err(V3Errno::ENOENT)
     );
     assert_eq!(
         devpts.readdir(
@@ -1323,7 +1328,7 @@ fn devpts_fs_is_read_only_and_root_only() {
             DirCursor::START,
             &guard
         ),
-        StepOutcome::Err(Errno::ENOTDIR)
+        V3Outcome::Err(V3Errno::ENOTDIR)
     );
     assert_eq!(
         devpts.serialize_inode_meta(
@@ -1331,7 +1336,7 @@ fn devpts_fs_is_read_only_and_root_only() {
             &crate::vfs::InodeMeta::new(InodeKind::Directory, 0o040755),
             &guard,
         ),
-        StepOutcome::Err(Errno::EROFS)
+        V3Outcome::Err(V3Errno::EROFS)
     );
     assert_eq!(
         devpts.create_inode(
@@ -1341,7 +1346,7 @@ fn devpts_fs_is_read_only_and_root_only() {
             &cred,
             &guard,
         ),
-        StepOutcome::Err(Errno::EROFS)
+        V3Outcome::Err(V3Errno::EROFS)
     );
     assert_eq!(
         devpts.unlink(
@@ -1350,7 +1355,7 @@ fn devpts_fs_is_read_only_and_root_only() {
             crate::vfs::FsObjectId::new(0),
             &guard,
         ),
-        StepOutcome::Err(Errno::EROFS)
+        V3Outcome::Err(V3Errno::EROFS)
     );
     assert_eq!(
         devpts.rename(
@@ -1360,7 +1365,7 @@ fn devpts_fs_is_read_only_and_root_only() {
             b"1",
             &guard,
         ),
-        StepOutcome::Err(Errno::EROFS)
+        V3Outcome::Err(V3Errno::EROFS)
     );
     assert_eq!(
         devpts.link(
@@ -1369,7 +1374,7 @@ fn devpts_fs_is_read_only_and_root_only() {
             crate::vfs::FsObjectId::new(0),
             &guard,
         ),
-        StepOutcome::Err(Errno::EROFS)
+        V3Outcome::Err(V3Errno::EROFS)
     );
     assert_eq!(
         devpts.mkdir(
@@ -1379,7 +1384,7 @@ fn devpts_fs_is_read_only_and_root_only() {
             &cred,
             &guard,
         ),
-        StepOutcome::Err(Errno::EROFS)
+        V3Outcome::Err(V3Errno::EROFS)
     );
     assert_eq!(
         devpts.rmdir(
@@ -1388,7 +1393,7 @@ fn devpts_fs_is_read_only_and_root_only() {
             crate::vfs::FsObjectId::new(0),
             &guard,
         ),
-        StepOutcome::Err(Errno::EROFS)
+        V3Outcome::Err(V3Errno::EROFS)
     );
     assert_eq!(
         devpts.symlink(
@@ -1398,6 +1403,6 @@ fn devpts_fs_is_read_only_and_root_only() {
             &cred,
             &guard,
         ),
-        StepOutcome::Err(Errno::EROFS)
+        V3Outcome::Err(V3Errno::EROFS)
     );
 }

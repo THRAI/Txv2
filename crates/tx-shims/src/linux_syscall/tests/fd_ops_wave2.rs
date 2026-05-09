@@ -1,6 +1,7 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
+use tx_substrate::step_v3::StepOutcome;
 use alloc::sync::Arc;
 use alloc::vec;
 
@@ -11,12 +12,12 @@ use tx_subsystems::cross_crate_test_support::clear_caps_for_test;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
-use tx_subsystems::page_backed::FsPageBacking;
+use tx_subsystems::page_backed::FsPageBackingV3;
 use tx_subsystems::process::step_chdir;
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
 };
-use tx_subsystems::vfs::FsOps;
+use tx_subsystems::vfs::FsOpsV3;
 
 use crate::linux_syscall::{
     AT_FDCWD, EXECVE_PATH_MAX, NR_CLOSE, NR_DUP, NR_DUP3, NR_OPENAT, O_CLOEXEC, O_CREAT, O_EXCL,
@@ -205,7 +206,7 @@ fn dispatch_openat_o_creat_creates_new_file() {
     let guard = tx_substrate::epoch::guard();
     let outcome = tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"new", &guard);
     assert!(
-        matches!(outcome, StepOutcome::Done(_) | StepOutcome::Advanced(_)),
+        matches!(outcome, StepOutcome::Done(_)),
         "tmpfs should now resolve /new: {outcome:?}"
     );
     drop(path);
@@ -269,7 +270,7 @@ fn dispatch_openat_o_trunc_truncates_existing() {
     // Pre-stuff the file's page-backing so its size is non-zero.
     // tmpfs's FsPageBacking::truncate doubles as a "set size" op.
     match tmpfs.truncate(file_id, 4096, &guard) {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+        StepOutcome::Done(()) => {}
         other => panic!("preload truncate: {other:?}"),
     }
     drop(guard);

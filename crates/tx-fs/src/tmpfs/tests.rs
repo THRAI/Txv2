@@ -2,16 +2,16 @@
 //!
 //! Mount-table wiring is exercised separately in `tx-kernel`'s init
 //! tests; these tests construct a `Tmpfs` instance directly and
-//! exercise the `FsOps` + `FsPageBacking` surface against it.
+//! exercise the `FsOpsV3` + `FsPageBackingV3` surface against it.
 
 use alloc::sync::Arc;
 
 use tx_subsystems::cred::{Capability, CapabilitySet};
-use tx_subsystems::execution::{Errno, StepOutcome};
-use tx_subsystems::page_backed::FsPageBacking;
+use tx_subsystems::page_backed::FsPageBackingV3;
 use tx_subsystems::vfs::{
-    Credential, DirCursor, FsObjectId, FsOps, InodeKind, RNodeBacking, S_IFMT, S_ISGID, S_ISUID,
+    Credential, DirCursor, FsObjectId, FsOpsV3, InodeKind, RNodeBacking, S_IFMT, S_ISGID, S_ISUID,
 };
+use tx_substrate::step_v3::{Errno, StepOutcome};
 
 use super::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 
@@ -181,14 +181,14 @@ fn tmpfs_fetch_page_materialises_anon_then_flush_noop() {
         };
 
     // First fetch materialises a fresh anon frame.
-    let frame_first = match FsPageBacking::fetch_page(&*tmpfs, file_id, 0, &guard) {
+    let frame_first = match <Tmpfs as FsPageBackingV3>::fetch_page(&*tmpfs, file_id, 0, &guard) {
         StepOutcome::Done(frame) => frame,
         other => panic!("fetch_page failed: {other:?}"),
     };
 
     // Second fetch returns the same PPN — anon container cached the
     // page on the first access.
-    let frame_second = match FsPageBacking::fetch_page(&*tmpfs, file_id, 0, &guard) {
+    let frame_second = match <Tmpfs as FsPageBackingV3>::fetch_page(&*tmpfs, file_id, 0, &guard) {
         StepOutcome::Done(frame) => frame,
         other => panic!("fetch_page (second) failed: {other:?}"),
     };
@@ -196,24 +196,24 @@ fn tmpfs_fetch_page_materialises_anon_then_flush_noop() {
 
     // flush_page is a no-op on tmpfs.
     assert_eq!(
-        FsPageBacking::flush_page(&*tmpfs, file_id, 0, &frame_first, &guard),
+        <Tmpfs as FsPageBackingV3>::flush_page(&*tmpfs, file_id, 0, &frame_first, &guard),
         StepOutcome::Done(())
     );
     // fsync is a no-op too.
     assert_eq!(
-        FsPageBacking::fsync(&*tmpfs, file_id, &guard),
+        <Tmpfs as FsPageBackingV3>::fsync(&*tmpfs, file_id, &guard),
         StepOutcome::Done(())
     );
 
     // Directories cannot be fetched as pages.
     assert_eq!(
-        FsPageBacking::fetch_page(&*tmpfs, TMPFS_ROOT_OBJECT_ID, 0, &guard),
+        <Tmpfs as FsPageBackingV3>::fetch_page(&*tmpfs, TMPFS_ROOT_OBJECT_ID, 0, &guard),
         StepOutcome::Err(Errno::EISDIR)
     );
 
     // Misaligned offsets reject.
     assert_eq!(
-        FsPageBacking::fetch_page(&*tmpfs, file_id, 17, &guard),
+        <Tmpfs as FsPageBackingV3>::fetch_page(&*tmpfs, file_id, 17, &guard),
         StepOutcome::Err(Errno::EINVAL)
     );
 }
@@ -238,7 +238,7 @@ fn tmpfs_truncate_zeroes_size_and_reflects_in_meta() {
     // Grow visible size to one full page via truncate.
     let page = tx_subsystems::vm::USER_PAGE_SIZE as u64;
     assert_eq!(
-        FsPageBacking::truncate(&*tmpfs, file_id, page, &guard),
+        <Tmpfs as FsPageBackingV3>::truncate(&*tmpfs, file_id, page, &guard),
         StepOutcome::Done(())
     );
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
@@ -249,7 +249,7 @@ fn tmpfs_truncate_zeroes_size_and_reflects_in_meta() {
 
     // Shrink back to 0 — visible size + payload size both reset.
     assert_eq!(
-        FsPageBacking::truncate(&*tmpfs, file_id, 0, &guard),
+        <Tmpfs as FsPageBackingV3>::truncate(&*tmpfs, file_id, 0, &guard),
         StepOutcome::Done(())
     );
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
@@ -260,13 +260,13 @@ fn tmpfs_truncate_zeroes_size_and_reflects_in_meta() {
 
     // Truncate of a directory rejects.
     assert_eq!(
-        FsPageBacking::truncate(&*tmpfs, TMPFS_ROOT_OBJECT_ID, 0, &guard),
+        <Tmpfs as FsPageBackingV3>::truncate(&*tmpfs, TMPFS_ROOT_OBJECT_ID, 0, &guard),
         StepOutcome::Err(Errno::EISDIR)
     );
 
     // Truncate of an absent inode rejects.
     assert_eq!(
-        FsPageBacking::truncate(&*tmpfs, FsObjectId::new(0xdead_beef), 0, &guard),
+        <Tmpfs as FsPageBackingV3>::truncate(&*tmpfs, FsObjectId::new(0xdead_beef), 0, &guard),
         StepOutcome::Err(Errno::ENOENT)
     );
 }
@@ -381,7 +381,7 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
     // discriminant; the `Cap<PageContainer>::key` (or any other
     // identity check) would suffice but the variant alone is the
     // contract Phase 7 needs.
-    let rnode = match FsOps::materialise_rnode(&*tmpfs, file_id, file_meta, &guard) {
+    let rnode = match <Tmpfs as FsOpsV3>::materialise_rnode(&*tmpfs, file_id, file_meta, &guard) {
         StepOutcome::Done(rnode) => rnode,
         other => panic!("materialise_rnode for regular file: {other:?}"),
     };
@@ -425,8 +425,8 @@ fn tmpfs_materialise_rnode_for_directory_returns_eisdir() {
         other => panic!("load_inode_meta(root): {other:?}"),
     };
     assert_eq!(
-        FsOps::materialise_rnode(&*tmpfs, TMPFS_ROOT_OBJECT_ID, meta, &guard),
-        StepOutcome::Err(tx_subsystems::execution::Errno::EISDIR)
+        <Tmpfs as FsOpsV3>::materialise_rnode(&*tmpfs, TMPFS_ROOT_OBJECT_ID, meta, &guard),
+        StepOutcome::Err(Errno::EISDIR)
     );
 }
 
@@ -452,8 +452,8 @@ fn tmpfs_materialise_rnode_for_symlink_returns_einval() {
     // mirroring the Linux `inode_operations.lookup` shape for non-
     // page-backed kinds tmpfs intentionally rejects here.
     assert_eq!(
-        FsOps::materialise_rnode(&*tmpfs, link_id, link_meta, &guard),
-        StepOutcome::Err(tx_subsystems::execution::Errno::EINVAL)
+        <Tmpfs as FsOpsV3>::materialise_rnode(&*tmpfs, link_id, link_meta, &guard),
+        StepOutcome::Err(Errno::EINVAL)
     );
 }
 
@@ -495,7 +495,7 @@ fn tmpfs_chmod_owner_succeeds() {
             other => panic!("create_inode: {other:?}"),
         };
     assert_eq!(
-        FsOps::step_chmod(&*tmpfs, file_id, 0o600, &owner, &guard),
+        <Tmpfs as FsOpsV3>::step_chmod(&*tmpfs, file_id, 0o600, &owner, &guard),
         StepOutcome::Done(())
     );
 
@@ -524,7 +524,7 @@ fn tmpfs_chmod_non_owner_returns_eperm() {
             other => panic!("create_inode: {other:?}"),
         };
     assert_eq!(
-        FsOps::step_chmod(&*tmpfs, file_id, 0o600, &stranger, &guard),
+        <Tmpfs as FsOpsV3>::step_chmod(&*tmpfs, file_id, 0o600, &stranger, &guard),
         StepOutcome::Err(Errno::EPERM)
     );
 }
@@ -549,7 +549,7 @@ fn tmpfs_chmod_with_fowner_cap_succeeds() {
             other => panic!("create_inode: {other:?}"),
         };
     assert_eq!(
-        FsOps::step_chmod(&*tmpfs, file_id, 0o755, &admin, &guard),
+        <Tmpfs as FsOpsV3>::step_chmod(&*tmpfs, file_id, 0o755, &admin, &guard),
         StepOutcome::Done(())
     );
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
@@ -577,7 +577,7 @@ fn tmpfs_chown_unprivileged_to_self_succeeds() {
 
     // Chown to current uid/gid (no-op-shaped success).
     assert_eq!(
-        FsOps::step_chown(&*tmpfs, file_id, Some(1000), Some(200), &owner, &guard),
+        <Tmpfs as FsOpsV3>::step_chown(&*tmpfs, file_id, Some(1000), Some(200), &owner, &guard),
         StepOutcome::Done(())
     );
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
@@ -607,12 +607,12 @@ fn tmpfs_chown_unprivileged_to_other_returns_eperm() {
     // Try to chown to a foreign uid; non-privileged callers can only
     // chown to their own uid.
     assert_eq!(
-        FsOps::step_chown(&*tmpfs, file_id, Some(2000), None, &owner, &guard),
+        <Tmpfs as FsOpsV3>::step_chown(&*tmpfs, file_id, Some(2000), None, &owner, &guard),
         StepOutcome::Err(Errno::EPERM)
     );
     // Same for gid.
     assert_eq!(
-        FsOps::step_chown(&*tmpfs, file_id, None, Some(999), &owner, &guard),
+        <Tmpfs as FsOpsV3>::step_chown(&*tmpfs, file_id, None, Some(999), &owner, &guard),
         StepOutcome::Err(Errno::EPERM)
     );
 }
@@ -649,7 +649,7 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
     // Non-privileged owner self-chown clears the setuid + setgid
     // bits. Use the owner cred (no CAP_FOWNER).
     assert_eq!(
-        FsOps::step_chown(&*tmpfs, file_id, Some(1000), Some(200), &owner, &guard),
+        <Tmpfs as FsOpsV3>::step_chown(&*tmpfs, file_id, Some(1000), Some(200), &owner, &guard),
         StepOutcome::Done(())
     );
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
@@ -662,11 +662,11 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
     // Privileged callers preserve the setuid bit on chown — set
     // it again, then chown via admin and verify it survives.
     assert_eq!(
-        FsOps::step_chmod(&*tmpfs, file_id, S_ISUID | 0o755, &admin, &guard),
+        <Tmpfs as FsOpsV3>::step_chmod(&*tmpfs, file_id, S_ISUID | 0o755, &admin, &guard),
         StepOutcome::Done(())
     );
     assert_eq!(
-        FsOps::step_chown(&*tmpfs, file_id, Some(1000), None, &admin, &guard),
+        <Tmpfs as FsOpsV3>::step_chown(&*tmpfs, file_id, Some(1000), None, &admin, &guard),
         StepOutcome::Done(())
     );
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
@@ -869,7 +869,6 @@ fn tmpfs_v3_truncate_then_load_meta_reflects_size() {
 
 #[test]
 fn step_walk_v3_against_tmpfs_resolves_real_path() {
-    use tx_subsystems::execution::StepOutcome as V4;
     use tx_subsystems::mount::{
         DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
     };
@@ -935,7 +934,7 @@ fn step_walk_v3_against_tmpfs_resolves_real_path() {
         &cred,
         &guard,
     ) {
-        V4::Done(out) => out,
+        V3::Done(out) => out,
         other => panic!("tmpfs mkdir failed: {other:?}"),
     };
 

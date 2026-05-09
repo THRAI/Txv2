@@ -14,7 +14,10 @@ use std::sync::Mutex;
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
-use tx_subsystems::vfs::{Credential, DirCursor, FsObjectId, FsOps, RNodeBacking, StructPayload};
+use tx_subsystems::vfs::{
+    Credential, DirCursor, FsObjectId, FsOpsV3, RNodeBacking, StructPayload,
+};
+use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Outcome};
 
 use super::{open_console_for_init, Devfs, DEVFS_ROOT_OBJECT_ID};
 
@@ -104,10 +107,11 @@ fn devfs_lookup_console_after_register_hardware_returns_tty_rnode() {
     let guard = tx_substrate::epoch::guard();
     let devfs = Devfs::new();
 
-    // FsOps::lookup over the devfs root yields a stable FsObjectId for
-    // the alias.
-    let obj_id = match devfs.lookup(DEVFS_ROOT_OBJECT_ID, b"console", &guard) {
-        StepOutcome::Done(id) => id,
+    // FsOpsV3::lookup over the devfs root yields a stable FsObjectId
+    // for the alias.
+    let obj_id = match <Devfs as FsOpsV3>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"console", &guard)
+    {
+        V3Outcome::Done(id) => id,
         other => panic!("devfs.lookup(console) failed: {other:?}"),
     };
 
@@ -209,26 +213,40 @@ fn devfs_create_returns_erofs() {
     // not affect the assertion; leaving as `Credential::default()`
     // documents that this test is not gated on DAC behaviour.
     let cred = Credential::default();
-    let outcome = devfs.create_inode(DEVFS_ROOT_OBJECT_ID, b"new-thing", 0o100644, &cred, &guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::EROFS));
+    let outcome = <Devfs as FsOpsV3>::create_inode(
+        &devfs,
+        DEVFS_ROOT_OBJECT_ID,
+        b"new-thing",
+        0o100644,
+        &cred,
+        &guard,
+    );
+    assert_eq!(outcome, V3Outcome::err(V3Errno::EROFS));
 
     // Other mutators report the same. Spot-check the most likely
     // accidental-success paths:
     assert_eq!(
-        devfs.mkdir(DEVFS_ROOT_OBJECT_ID, b"sub", 0o755, &cred, &guard),
-        StepOutcome::Err(Errno::EROFS)
+        <Devfs as FsOpsV3>::mkdir(&devfs, DEVFS_ROOT_OBJECT_ID, b"sub", 0o755, &cred, &guard),
+        V3Outcome::err(V3Errno::EROFS)
     );
     assert_eq!(
-        devfs.unlink(DEVFS_ROOT_OBJECT_ID, b"console", FsObjectId::new(0), &guard),
-        StepOutcome::Err(Errno::EROFS)
+        <Devfs as FsOpsV3>::unlink(
+            &devfs,
+            DEVFS_ROOT_OBJECT_ID,
+            b"console",
+            FsObjectId::new(0),
+            &guard
+        ),
+        V3Outcome::err(V3Errno::EROFS)
     );
     assert_eq!(
-        devfs.serialize_inode_meta(
+        <Devfs as FsOpsV3>::serialize_inode_meta(
+            &devfs,
             DEVFS_ROOT_OBJECT_ID,
             &tx_subsystems::vfs::InodeMeta::new(tx_subsystems::vfs::InodeKind::Directory, 0o755),
             &guard,
         ),
-        StepOutcome::Err(Errno::EROFS)
+        V3Outcome::err(V3Errno::EROFS)
     );
 }
 
@@ -247,8 +265,8 @@ fn devfs_chmod_returns_erofs() {
     // supported. The override returns EROFS regardless of
     // privilege.
     assert_eq!(
-        FsOps::step_chmod(&devfs, DEVFS_ROOT_OBJECT_ID, 0o700, &cred, &guard),
-        StepOutcome::Err(Errno::EROFS)
+        FsOpsV3::step_chmod(&devfs, DEVFS_ROOT_OBJECT_ID, 0o700, &cred, &guard),
+        V3Outcome::err(V3Errno::EROFS)
     );
 }
 
@@ -264,7 +282,7 @@ fn devfs_chown_returns_erofs() {
     let cred = Credential::root();
 
     assert_eq!(
-        FsOps::step_chown(
+        FsOpsV3::step_chown(
             &devfs,
             DEVFS_ROOT_OBJECT_ID,
             Some(1000),
@@ -272,7 +290,7 @@ fn devfs_chown_returns_erofs() {
             &cred,
             &guard,
         ),
-        StepOutcome::Err(Errno::EROFS)
+        V3Outcome::err(V3Errno::EROFS)
     );
 }
 
@@ -291,14 +309,14 @@ fn devfs_lookup_unknown_returns_enoent() {
     let devfs = Devfs::new();
 
     assert_eq!(
-        devfs.lookup(DEVFS_ROOT_OBJECT_ID, b"not-a-real-device", &guard),
-        StepOutcome::Err(Errno::ENOENT)
+        <Devfs as FsOpsV3>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"not-a-real-device", &guard),
+        V3Outcome::err(V3Errno::ENOENT)
     );
 
     // Non-root parent always misses too.
     assert_eq!(
-        devfs.lookup(FsObjectId::new(0xdead_beef), b"console", &guard),
-        StepOutcome::Err(Errno::ENOENT)
+        <Devfs as FsOpsV3>::lookup(&devfs, FsObjectId::new(0xdead_beef), b"console", &guard),
+        V3Outcome::err(V3Errno::ENOENT)
     );
 }
 
@@ -402,12 +420,12 @@ fn devfs_readdir_yields_registered_aliases_and_terminates() {
     let mut cursor = DirCursor::START;
     let mut names: Vec<Vec<u8>> = Vec::new();
     loop {
-        match devfs.readdir(DEVFS_ROOT_OBJECT_ID, cursor, &guard) {
-            StepOutcome::Done(Some((entry, next))) => {
+        match <Devfs as FsOpsV3>::readdir(&devfs, DEVFS_ROOT_OBJECT_ID, cursor, &guard) {
+            V3Outcome::Done(Some((entry, next))) => {
                 names.push(entry.name.as_bytes().to_vec());
                 cursor = next;
             }
-            StepOutcome::Done(None) => break,
+            V3Outcome::Done(None) => break,
             other => panic!("readdir failed: {other:?}"),
         }
     }
