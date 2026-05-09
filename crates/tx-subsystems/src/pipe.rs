@@ -540,6 +540,57 @@ pub fn step_read_v3(
     )
 }
 
+/// `write(pipe_fd, buf, len)` — v3 outcome shape.
+///
+/// Same body as [`step_write`], but returns a v3
+/// [`tx_substrate::step_v3::StepOutcome`] over `usize` (bytes written) and
+/// `ByteProgress`:
+///
+/// - empty `bytes` → `Done(0)` (terminal, with `ByteProgress`-shaped
+///   accumulator unused)
+/// - all readers closed → `Err(EPIPE)`. The syscall arm is responsible
+///   for delivering SIGPIPE before returning `-EPIPE` — the pipe module
+///   has no process Cap.
+/// - non-full ring → `Done(copied)` — pipe `step_write` is single-step
+///   per the wave-6 finding (multi-step loop lives in
+///   `vfs::execution`); a partial fill is reported as `Done(n)` rather
+///   than `Continue { progress: ByteProgress::new(n) }`.
+/// - full + nonblocking → `Err(EAGAIN)`
+/// - full + blocking → `Yield { progress: ByteProgress::EMPTY, shape:
+///   OnCarrier { writer_carrier, PIPE_WRITABLE } }`
+pub fn step_write_v3(
+    payload: &Cap<PipePayload>,
+    bytes: &[u8],
+    _guard: &Guard<'_>,
+    nonblocking: bool,
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    if bytes.is_empty() {
+        return tx_substrate::step_v3::StepOutcome::done(0);
+    }
+    if payload.reader_count.load(Ordering::Acquire) == 0 {
+        return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EPIPE);
+    }
+    let mut ring = payload.ring.lock();
+    if !ring.is_full() {
+        let copied = ring.fill_from_slice(bytes);
+        drop(ring);
+        // Wake any reader parked on bytes-available.
+        payload
+            .reader_wait_channel
+            .fire(Mask::from_bits(PIPE_READABLE));
+        return tx_substrate::step_v3::StepOutcome::done(copied);
+    }
+    drop(ring);
+    if nonblocking {
+        return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN);
+    }
+    tx_substrate::step_v3::StepOutcome::yield_on_carrier(
+        tx_substrate::step_v3::ByteProgress::EMPTY,
+        payload.writer_wait_carrier_id,
+        PIPE_WRITABLE,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,5 +1035,97 @@ mod tests {
         }
         drop(reader);
         drain_to_quiescence();
+    }
+
+    // === wave-7 v3 cascade probe (W-pipe-step-write) =====================
+    //
+    // Mirrors the `step_read_v3_*` tests above but for `step_write_v3`.
+    // The new variant pipe write encounters that read does not is the
+    // `EPIPE` branch when all readers are gone.
+
+    #[test]
+    fn step_write_v3_returns_done_for_partial_drain() {
+        let _setup = setup();
+        let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        let _ = writer; // hold writer alive so reader_count > 0 path is irrelevant
+        let guard = tx_substrate::epoch::guard();
+        let outcome = step_write_v3(&payload, b"hello", &guard, false);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Done(n) => {
+                assert_eq!(n, 5);
+            }
+            other => panic!("expected v3 Done(5), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_write_v3_returns_err_epipe_when_all_readers_gone() {
+        let _setup = setup();
+        let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        // Production-path simulate of last-reader-close.
+        drop(reader);
+        drain_to_quiescence();
+        assert_eq!(payload.reader_count_snapshot(), 0);
+        let guard = tx_substrate::epoch::guard();
+        let outcome = step_write_v3(&payload, b"x", &guard, false);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EPIPE) => {}
+            other => panic!("expected v3 Err(EPIPE), got {other:?}"),
+        }
+        drop(writer);
+        drain_to_quiescence();
+    }
+
+    #[test]
+    fn step_write_v3_yields_on_carrier_when_full_and_blocking() {
+        let _setup = setup();
+        let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        // Fill the ring exactly to PIPE_BUF via the v4 write path.
+        let big = alloc::vec![b'x'; PIPE_BUF];
+        let guard = tx_substrate::epoch::guard();
+        let filled = step_write(&payload, &big, &guard, false);
+        assert_eq!(filled, StepOutcome::Done(PIPE_BUF));
+        // Next write blocks → Yield::OnCarrier with empty progress.
+        let outcome = step_write_v3(&payload, b"y", &guard, false);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Yield {
+                progress,
+                shape:
+                    tx_substrate::step_v3::YieldShape::OnCarrier {
+                        carrier,
+                        interests,
+                    },
+            } => {
+                assert!(
+                    progress.is_empty(),
+                    "blocked-full write must carry empty ByteProgress",
+                );
+                assert_eq!(carrier.raw(), payload.writer_carrier_id());
+                assert_eq!(interests.raw(), PIPE_WRITABLE);
+            }
+            other => panic!("expected v3 Yield::OnCarrier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_write_v3_returns_eagain_when_full_and_nonblocking() {
+        let _setup = setup();
+        let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        let big = alloc::vec![b'x'; PIPE_BUF];
+        let guard = tx_substrate::epoch::guard();
+        let _ = step_write(&payload, &big, &guard, false);
+        let outcome = step_write_v3(&payload, b"y", &guard, true);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EAGAIN) => {}
+            other => panic!("expected v3 Err(EAGAIN), got {other:?}"),
+        }
     }
 }
