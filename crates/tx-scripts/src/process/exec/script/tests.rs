@@ -660,7 +660,9 @@ fn build_fs_root() -> (Cap<DEntry>, Arc<ExecTestFs>) {
 
     let payload = MountPayload::new_cap(
         fs.clone() as Arc<dyn FsOps>,
+        fs.clone() as Arc<dyn tx_subsystems::vfs::FsOpsV3>,
         fs.clone() as Arc<dyn FsPageBacking>,
+        fs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBackingV3>,
         None,
         DevId::new(99),
         MountOptions::default(),

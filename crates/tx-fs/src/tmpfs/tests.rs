@@ -876,7 +876,7 @@ fn step_walk_v3_against_tmpfs_resolves_real_path() {
     use tx_subsystems::vfs::structure::{
         DEntry, InlineName, InodeMeta, RNode, RNodeBacking, S_IFDIR,
     };
-    use tx_subsystems::vfs::walker::{register_mount_payload_v3, step_walk_v3};
+    use tx_subsystems::vfs::walker::step_walk_v3;
     use tx_substrate::step_v3::StepOutcome as V3;
     use tx_substrate::zone::{self, Cap};
 
@@ -887,9 +887,13 @@ fn step_walk_v3_against_tmpfs_resolves_real_path() {
 
     let (tmpfs, mount_output) = Tmpfs::new_root();
 
+    // Wave 9d retired the sidecar registry: the v3 fs_ops trait
+    // object now flows through `MountPayload`'s `fs_ops_v3` field.
     let payload: Cap<MountPayload> = MountPayload::new_cap(
         mount_output.fs_ops.clone(),
+        mount_output.fs_ops_v3.clone(),
         mount_output.fs_page_backing.clone(),
+        mount_output.fs_page_backing_v3.clone(),
         None,
         DevId::new(1),
         MountOptions::default(),
@@ -897,11 +901,6 @@ fn step_walk_v3_against_tmpfs_resolves_real_path() {
         SourceLabel::Static("rootfs-tmpfs-v3"),
     )
     .expect("payload reservation");
-
-    // Wire the v3 sidecar from `mount_output.fs_ops_v3` directly;
-    // this is the wave-9c cutover discipline. If the field were
-    // unpopulated, this line wouldn't compile.
-    register_mount_payload_v3(&payload, mount_output.fs_ops_v3.clone());
 
     let root_rnode: Cap<RNode> = {
         let raw = RNode::new(
