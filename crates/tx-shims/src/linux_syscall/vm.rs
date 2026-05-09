@@ -398,23 +398,37 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // Loop on the canonical wait-carrier discipline mirroring
     // `sys_write` — fresh epoch guard inside the call site, never
     // crossing an `.await`.
+    use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
     loop {
         let outcome = {
             let guard = tx_substrate::epoch::guard();
             ctx.aspace.msync(range, &guard)
         };
         match outcome {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+            V3::Done(()) | V3::Continue { .. } => {
                 return SyscallResult::Return(0);
             }
-            StepOutcome::AdvancedThenBlocked((), token) | StepOutcome::Blocked(token) => {
+            V3::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => {
+                let token = tx_subsystems::execution::WaitToken::new(
+                    carrier.raw(),
+                    interests.raw(),
+                );
                 if let Some(future) = wait_carrier::wait_on_token(token) {
                     let _ = future.await;
                 }
                 // Otherwise re-poll immediately.
             }
-            StepOutcome::Err(errno) => {
-                return SyscallResult::Error(errno_to_i32(errno));
+            V3::Yield {
+                shape: YieldShape::OnAgent { .. },
+                ..
+            } => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+            V3::Err(v3_errno) => {
+                return SyscallResult::Error(errno_to_i32(v3_errno.into()));
             }
         }
     }

@@ -28,8 +28,8 @@ use tx_substrate::SpinMutex;
 use tx_subsystems::cred::Capability;
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::page_backed::{
-    step_truncate, step_truncate_v3, AnonSwapPolicy, Frame, FsPageBacking, MaterializeAccess,
-    PageContainer, PageContainerKind, PageIndex,
+    step_truncate, AnonSwapPolicy, Frame, FsPageBacking, MaterializeAccess, PageContainer,
+    PageContainerKind, PageIndex,
 };
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, FsOps, InlineName, InodeKind, InodeMeta,
@@ -179,7 +179,7 @@ impl Default for Tmpfs {
 //   which can return any v4 outcome variant; we translate AdvancedThenBlocked
 //   to a v3 `done(frame)` (dropping the wait token, since the materialised
 //   PPN is observable now), and Blocked to `yield_on_carrier`.
-// * `FsPageBackingV3::truncate` uses `step_truncate_v3`, which in turn
+// * `FsPageBackingV3::truncate` uses `step_truncate`, which in turn
 //   calls `FsPageBackingV3::truncate` recursively for File-kind containers
 //   only. tmpfs containers are `PageContainerKind::Anon`, so no recursion;
 //   any `Yield` from the call is reflected as `EAGAIN` per
@@ -997,7 +997,7 @@ impl FsPageBackingV3 for Tmpfs {
         guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
         // Snapshot the container under the state lock, then call
-        // `step_truncate_v3` outside it: the page-backed lifecycle path
+        // `step_truncate` outside it: the page-backed lifecycle path
         // takes its own internal lock, and we must not stack lock
         // domains.
         let container = {
@@ -1022,11 +1022,11 @@ impl FsPageBackingV3 for Tmpfs {
             }
         };
 
-        // tmpfs containers are PageContainerKind::Anon, so step_truncate_v3
+        // tmpfs containers are PageContainerKind::Anon, so step_truncate
         // never recurses into FsPageBackingV3::truncate; only Done / Err are
         // observable in practice. Continue / Yield are handled defensively
         // for completeness.
-        match step_truncate_v3(&container, new_size, guard) {
+        match step_truncate(&container, new_size, guard) {
             tx_substrate::step_v3::StepOutcome::Done(()) => {}
             tx_substrate::step_v3::StepOutcome::Continue { progress: _ } => {}
             tx_substrate::step_v3::StepOutcome::Yield { .. } => {

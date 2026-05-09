@@ -38,77 +38,6 @@ impl PageContainer {
     }
 }
 
-pub fn step_truncate(pc: &PageContainer, new_size: u64, guard: &Guard<'_>) -> StepOutcome<()> {
-    if matches!(pc.kind(), PageContainerKind::Device { .. }) {
-        return StepOutcome::Err(Errno::EINVAL);
-    }
-
-    let Some(capacity) = pc.byte_capacity() else {
-        return StepOutcome::Err(Errno::EINVAL);
-    };
-    if new_size > capacity {
-        return StepOutcome::Err(Errno::EINVAL);
-    }
-
-    // Wave 9g-f: migrated to consume the v3 `FsPageBackingV3` trait.
-    // The v4 fn signature is preserved so the many existing callers
-    // (tx-shims syscalls, tx-fs/tmpfs, vm/execution, tests across the
-    // workspace) keep their v4 outcome shape until later waves migrate
-    // them. The 4-variant v3 algebra maps back to v4 as:
-    //
-    //   v3 Done(())                    -> v4 Done(())
-    //   v3 Continue { NoProgress }     -> v4 Advanced(())
-    //   v3 Yield { OnCarrier { c, i } }-> v4 Blocked(WaitToken::new(c.raw(), i.raw()))
-    //   v3 Yield { OnAgent { .. } }    -> v4 Err(EIO)  (no v4 representation)
-    //   v3 Err(v3errno)                -> v4 Err(Errno::from(v3errno))
-    use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
-
-    let fs_advanced = match pc.kind() {
-        PageContainerKind::File {
-            mount,
-            fs_object_id,
-        } => match mount
-            .payload()
-            .fs_page_backing_v3
-            .truncate(*fs_object_id, new_size, guard)
-        {
-            V3::Done(()) => false,
-            V3::Continue { progress: _ } => true,
-            V3::Yield {
-                progress: _,
-                shape: YieldShape::OnCarrier { carrier, interests },
-            } => {
-                return StepOutcome::Blocked(crate::execution::WaitToken::new(
-                    carrier.raw(),
-                    interests.raw(),
-                ));
-            }
-            V3::Yield { shape: YieldShape::OnAgent { .. }, .. } => {
-                return StepOutcome::Err(Errno::EIO);
-            }
-            V3::Err(errno) => return StepOutcome::Err(Errno::from(errno)),
-        },
-        PageContainerKind::Anon { .. } => false,
-        PageContainerKind::Device { .. } => unreachable!(),
-    };
-
-    let old_size = pc.size_bytes();
-    pc.set_size_bytes(new_size);
-
-    if new_size < old_size {
-        let Some(first_drop) = first_page_after_size(new_size) else {
-            return StepOutcome::Err(Errno::EINVAL);
-        };
-        pc.withdraw_cached_pages_from(first_drop);
-        zero_partial_eof_tail(pc, new_size);
-    }
-
-    if fs_advanced {
-        StepOutcome::Advanced(())
-    } else {
-        StepOutcome::Done(())
-    }
-}
 
 /// Zero the bytes in the cached page containing the new EOF, from the
 /// in-page byte offset of `new_size` up to the page end. After
@@ -135,143 +64,7 @@ fn zero_partial_eof_tail(pc: &PageContainer, new_size: u64) {
     }
 }
 
-pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<()> {
-    // Wave 9g-f: migrated to consume the v3 `FsPageBackingV3` trait.
-    // See `step_truncate` for the v3->v4 outcome conversion table; the
-    // v3 `Continue { NoProgress }` cases here map to the v4 "Advanced
-    // (loop iter counted as progress)" path by toggling `progressed`.
-    use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
-
-    let PageContainerKind::File {
-        mount,
-        fs_object_id,
-    } = pc.kind()
-    else {
-        return StepOutcome::Done(());
-    };
-
-    let mut progressed = false;
-    for (page, ppn) in pc.dirty_pages_snapshot() {
-        let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
-            return StepOutcome::Err(Errno::EINVAL);
-        };
-        match mount.payload().fs_page_backing_v3.flush_page(
-            *fs_object_id,
-            offset,
-            &Frame::new(ppn),
-            guard,
-        ) {
-            V3::Done(()) | V3::Continue { progress: _ } => {
-                pc.clear_dirty_if_match(page, ppn);
-                progressed = true;
-            }
-            V3::Yield {
-                progress: _,
-                shape: YieldShape::OnCarrier { carrier, interests },
-            } => {
-                let token = crate::execution::WaitToken::new(carrier.raw(), interests.raw());
-                return if progressed {
-                    StepOutcome::AdvancedThenBlocked((), token)
-                } else {
-                    StepOutcome::Blocked(token)
-                };
-            }
-            V3::Yield { shape: YieldShape::OnAgent { .. }, .. } => {
-                return StepOutcome::Err(Errno::EIO);
-            }
-            V3::Err(errno) => return StepOutcome::Err(Errno::from(errno)),
-        }
-    }
-
-    match mount.payload().fs_page_backing_v3.fsync(*fs_object_id, guard) {
-        // Even with prior page-loop progress, the v4 contract for "loop
-        // progress + fsync clean" is a single `Done(())`, not
-        // `Advanced` — match the original v4 body's `other => other`
-        // passthrough behavior.
-        V3::Done(()) => StepOutcome::Done(()),
-        V3::Continue { progress: _ } => StepOutcome::Advanced(()),
-        V3::Yield {
-            progress: _,
-            shape: YieldShape::OnCarrier { carrier, interests },
-        } => {
-            let token = crate::execution::WaitToken::new(carrier.raw(), interests.raw());
-            if progressed {
-                StepOutcome::AdvancedThenBlocked((), token)
-            } else {
-                StepOutcome::Blocked(token)
-            }
-        }
-        V3::Yield { shape: YieldShape::OnAgent { .. }, .. } => StepOutcome::Err(Errno::EIO),
-        V3::Err(errno) => StepOutcome::Err(Errno::from(errno)),
-    }
-}
-
-/// Reserve space up to `new_size` for future writes per PAGE_BACKED §5.5.
-///
-/// - Device backings reject with `EINVAL` (the device aperture is fixed).
-/// - `new_size` beyond the fixed `page_count` capacity rejects with
-///   `EINVAL`; the capacity bound is preserved.
-/// - `new_size <= pc.size_bytes()` is a `Done(())` no-op (fallocate cannot
-///   shrink; that is the truncate path).
-/// - File backings call `FsPageBacking::fallocate` first; on backing
-///   success, `pc.size_bytes` is published. Pages are not materialized.
-/// - Anon backings simply publish the new visible size; per spec this is
 ///   "mostly a hint".
-pub fn step_fallocate(pc: &PageContainer, new_size: u64, guard: &Guard<'_>) -> StepOutcome<()> {
-    if matches!(pc.kind(), PageContainerKind::Device { .. }) {
-        return StepOutcome::Err(Errno::EINVAL);
-    }
-
-    let Some(capacity) = pc.byte_capacity() else {
-        return StepOutcome::Err(Errno::EINVAL);
-    };
-    if new_size > capacity {
-        return StepOutcome::Err(Errno::EINVAL);
-    }
-
-    if new_size <= pc.size_bytes() {
-        return StepOutcome::Done(());
-    }
-
-    use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
-    let fs_advanced = match pc.kind() {
-        PageContainerKind::File {
-            mount,
-            fs_object_id,
-        } => match mount
-            .payload()
-            .fs_page_backing_v3
-            .fallocate(*fs_object_id, new_size, guard)
-        {
-            V3::Done(()) => false,
-            V3::Continue { progress: _ } => true,
-            V3::Yield {
-                progress: _,
-                shape: YieldShape::OnCarrier { carrier, interests },
-            } => {
-                return StepOutcome::Blocked(crate::execution::WaitToken::new(
-                    carrier.raw(),
-                    interests.raw(),
-                ));
-            }
-            V3::Yield {
-                shape: YieldShape::OnAgent { .. },
-                ..
-            } => return StepOutcome::Err(Errno::EIO),
-            V3::Err(v3_errno) => return StepOutcome::Err(Errno::from(v3_errno)),
-        },
-        PageContainerKind::Anon { .. } => false,
-        PageContainerKind::Device { .. } => unreachable!(),
-    };
-
-    pc.set_size_bytes(new_size);
-
-    if fs_advanced {
-        StepOutcome::Advanced(())
-    } else {
-        StepOutcome::Done(())
-    }
-}
 
 fn first_page_after_size(size: u64) -> Option<PageIndex> {
     let page_size = crate::vm::USER_PAGE_SIZE as u64;
@@ -282,56 +75,7 @@ fn first_page_after_size(size: u64) -> Option<PageIndex> {
         .map(|rounded| PageIndex::new(rounded / page_size))
 }
 
-// -- v3 cascade probe (wave 7) -----------------------------------------------
-//
-// Sibling `*_v3` fns matching the same logic as the v4 fns above but
-// emitting v3 step-algebra outcomes (`tx_substrate::step_v3::StepOutcome`)
-// over `PageProgress` (page-shaped unit of work per
-// `docs/Txv3/03_STEP_MODEL_v2.md` §STEP-V2-PROGRESS-TYPED-1).
-//
-// Existing callers stay on the v4 fns; later waves switch them over and
-// delete the v4 fns. We re-run the body inline rather than delegating, so
-// the v3 path is independently testable and there's no conversion-shim
-// layer.
-//
-// Per-call-site `Advanced(())` mapping decisions (the load-bearing TDD
-// signal for the wave-7 probe):
-//
-// * `step_fsync_v3`: each successful page flush is one unit of page work.
-//   We track `pages_so_far: u32` across the loop and surface it through
-//   `PageProgress::new(pages_so_far)` whenever the v4 path would have
-//   yielded `AdvancedThenBlocked((), token)`. The v4 final-fsync `Blocked`
-//   case (post-loop) similarly carries the page count of dirty pages
-//   already flushed. The v4 final-fsync `Done(())` / non-blocked passthrough
-//   maps to `done(())`.
-// * `step_truncate_v3`: the fs `Advanced(())` is fs-implementation-internal
-//   partial progress, NOT a page count — the v4 `T = ()` carries no page
-//   delta to plumb through. We map `Advanced(())` to
-//   `continue_with(PageProgress::EMPTY)` ("made progress, retry; no
-//   page-count to expose"), and `AdvancedThenBlocked((), token)` to
-//   `yield_on_carrier(PageProgress::EMPTY, c, i)` for the same reason.
-//   The simpler-path choice flagged in the wave-7 worker spec; an inherent
-//   `PageProgress::EMPTY` shadow (parallel to `ByteProgress::EMPTY`) would
-//   shave an import line at these call sites — see report.
-
-/// `step_fsync` — v3 outcome shape over `PageProgress`.
-///
-/// Same body and semantics as [`step_fsync`], translated to a v3
-/// [`tx_substrate::step_v3::StepOutcome`]:
-///
-/// - `Anon` / `Device` / no dirty pages → `Done(())`
-/// - blocking mid-loop with prior progress → `Yield { progress:
-///   PageProgress::new(pages_so_far), shape: OnCarrier { … } }`
-/// - blocking with no prior progress → `Yield { progress:
-///   PageProgress::EMPTY, shape: OnCarrier { … } }`
-/// - underlying flush/fsync errno → `Err(errno)`
-/// - all dirty pages flushed and final fsync clean → `Done(())`
-///
-/// Per-call-site `Advanced(())` decision: counted as one page of progress
-/// (we just cleared a dirty mark), accumulated into `pages_so_far` and
-/// surfaced through `PageProgress::new(pages_so_far)` when the next call
-/// blocks. See module-level comment.
-pub fn step_fsync_v3(
+pub fn step_fsync(
     pc: &PageContainer,
     guard: &Guard<'_>,
 ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::PageProgress> {
@@ -438,7 +182,7 @@ pub fn step_fsync_v3(
 /// in both yield/continue cases. If a later wave needs interim page-step
 /// accounting for truncate it must extend `FsPageBacking::truncate` to
 /// expose a `pages` count or have v3 callers track it externally.
-pub fn step_truncate_v3(
+pub fn step_truncate(
     pc: &PageContainer,
     new_size: u64,
     guard: &Guard<'_>,
@@ -497,6 +241,68 @@ pub fn step_truncate_v3(
         pc.withdraw_cached_pages_from(first_drop);
         zero_partial_eof_tail(pc, new_size);
     }
+
+    if fs_advanced {
+        V3::continue_with(PageProgress::EMPTY)
+    } else {
+        V3::done(())
+    }
+}
+
+pub fn step_fallocate(
+    pc: &PageContainer,
+    new_size: u64,
+    guard: &Guard<'_>,
+) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::PageProgress> {
+    use tx_substrate::step_v3::{PageProgress, StepOutcome as V3, YieldShape};
+
+    if matches!(pc.kind(), PageContainerKind::Device { .. }) {
+        return V3::err(Errno::EINVAL.into());
+    }
+
+    let Some(capacity) = pc.byte_capacity() else {
+        return V3::err(Errno::EINVAL.into());
+    };
+    if new_size > capacity {
+        return V3::err(Errno::EINVAL.into());
+    }
+
+    if new_size <= pc.size_bytes() {
+        return V3::done(());
+    }
+
+    let fs_advanced = match pc.kind() {
+        PageContainerKind::File {
+            mount,
+            fs_object_id,
+        } => match mount
+            .payload()
+            .fs_page_backing_v3
+            .fallocate(*fs_object_id, new_size, guard)
+        {
+            V3::Done(()) => false,
+            V3::Continue { progress: _ } => true,
+            V3::Yield {
+                progress: _,
+                shape: YieldShape::OnCarrier { carrier, interests },
+            } => {
+                return V3::yield_on_carrier(
+                    PageProgress::EMPTY,
+                    carrier.raw(),
+                    interests.raw(),
+                );
+            }
+            V3::Yield {
+                shape: YieldShape::OnAgent { .. },
+                ..
+            } => return V3::err(tx_substrate::step_v3::Errno::EIO),
+            V3::Err(v3_errno) => return V3::err(v3_errno),
+        },
+        PageContainerKind::Anon { .. } => false,
+        PageContainerKind::Device { .. } => unreachable!(),
+    };
+
+    pc.set_size_bytes(new_size);
 
     if fs_advanced {
         V3::continue_with(PageProgress::EMPTY)
@@ -976,7 +782,7 @@ mod v3_tests {
         allocate_cached_frame().expect("cached frame")
     }
 
-    // ------- step_fsync_v3 -------------------------------------------------
+    // ------- step_fsync -------------------------------------------------
 
     #[test]
     fn fsync_v3_anon_returns_done() {
@@ -989,7 +795,7 @@ mod v3_tests {
             },
             1,
         );
-        assert_eq!(step_fsync_v3(&pc, &guard), V3Outcome::done(()));
+        assert_eq!(step_fsync(&pc, &guard), V3Outcome::done(()));
     }
 
     #[test]
@@ -999,7 +805,7 @@ mod v3_tests {
         let guard = tx_substrate::epoch::guard();
         let fs = Arc::new(LifecycleFs::new());
         let pc = file_page_container(fs.clone(), FsObjectId::new(91));
-        assert_eq!(step_fsync_v3(&pc, &guard), V3Outcome::done(()));
+        assert_eq!(step_fsync(&pc, &guard), V3Outcome::done(()));
         assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
         assert_eq!(fs.flushes.load(Ordering::Acquire), 0);
     }
@@ -1022,7 +828,7 @@ mod v3_tests {
                 .mark_dirty(PageIndex::new(page))
                 .expect("mark dirty");
         }
-        assert_eq!(step_fsync_v3(&pc, &guard), V3Outcome::done(()));
+        assert_eq!(step_fsync(&pc, &guard), V3Outcome::done(()));
         assert_eq!(fs.flushes.load(Ordering::Acquire), 3);
         assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
     }
@@ -1046,7 +852,7 @@ mod v3_tests {
                 .expect("mark dirty");
         }
         assert_eq!(
-            step_fsync_v3(&pc, &guard),
+            step_fsync(&pc, &guard),
             V3Outcome::Yield {
                 progress: PageProgress::EMPTY,
                 shape: YieldShape::OnCarrier {
@@ -1078,7 +884,7 @@ mod v3_tests {
                 .expect("mark dirty");
         }
         assert_eq!(
-            step_fsync_v3(&pc, &guard),
+            step_fsync(&pc, &guard),
             V3Outcome::Yield {
                 progress: PageProgress::new(1),
                 shape: YieldShape::OnCarrier {
@@ -1093,7 +899,7 @@ mod v3_tests {
         assert_eq!(fs.fsyncs.load(Ordering::Acquire), 0);
     }
 
-    // ------- step_truncate_v3 ---------------------------------------------
+    // ------- step_truncate ---------------------------------------------
 
     #[test]
     fn truncate_v3_anon_shrink_done_and_withdraws_pages() {
@@ -1114,7 +920,7 @@ mod v3_tests {
                 .expect("seed page");
         }
         assert_eq!(
-            step_truncate_v3(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
+            step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
             V3Outcome::done(())
         );
         assert!(pc.lookup(PageIndex::new(0)).is_some());
@@ -1134,7 +940,7 @@ mod v3_tests {
             1,
         );
         assert_eq!(
-            step_truncate_v3(&device, 0, &guard),
+            step_truncate(&device, 0, &guard),
             V3Outcome::err(V3Errno::EINVAL)
         );
     }
@@ -1151,7 +957,7 @@ mod v3_tests {
             1,
         );
         assert_eq!(
-            step_truncate_v3(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
+            step_truncate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
             V3Outcome::err(V3Errno::EINVAL)
         );
     }
@@ -1165,7 +971,7 @@ mod v3_tests {
         let pc = file_page_container(fs.clone(), FsObjectId::new(95));
         let original_size = pc.size_bytes();
         assert_eq!(
-            step_truncate_v3(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
+            step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
             V3Outcome::err(V3Errno::EROFS)
         );
         assert_eq!(pc.size_bytes(), original_size);
@@ -1180,7 +986,7 @@ mod v3_tests {
         let pc = file_page_container(fs.clone(), FsObjectId::new(96));
         let original_size = pc.size_bytes();
         assert_eq!(
-            step_truncate_v3(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
+            step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
             V3Outcome::Yield {
                 progress: PageProgress::EMPTY,
                 shape: YieldShape::OnCarrier {
@@ -1204,7 +1010,7 @@ mod v3_tests {
         pc.set_size_bytes(2 * crate::vm::USER_PAGE_SIZE as u64);
         let new_size = crate::vm::USER_PAGE_SIZE as u64;
         assert_eq!(
-            step_truncate_v3(&pc, new_size, &guard),
+            step_truncate(&pc, new_size, &guard),
             V3Outcome::continue_with(PageProgress::EMPTY)
         );
         // Post-fs work *did* run, so size is published.

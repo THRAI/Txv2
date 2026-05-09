@@ -119,7 +119,7 @@ fn read_exact_at_short_read_returns_err() {
     // hits EOF before fill.
     assert_eq!(
         crate::page_backed::step_truncate(&pc, 120, &guard),
-        StepOutcome::Done(())
+        tx_substrate::step_v3::StepOutcome::Done(())
     );
     let payload: Vec<u8> = (0u8..120).collect();
     seed_anon_pc_with_bytes(&pc, &payload);

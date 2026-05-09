@@ -559,7 +559,12 @@ impl AddressSpace {
     /// PC. Anon, PrivateAnon, Device, and `None` backings are no-op. Returns
     /// the first non-`Done` outcome from any underlying fsync; `Done(())` if
     /// every visited PC flushed cleanly.
-    pub fn msync(&self, range: UserRange, guard: &Guard<'_>) -> StepOutcome<()> {
+    pub fn msync(
+        &self,
+        range: UserRange,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::PageProgress> {
+        use tx_substrate::step_v3::StepOutcome as V3;
         let entries = self.recipes.snapshot(guard);
         let mut visited: BTreeSet<u32> = BTreeSet::new();
         for entry in entries {
@@ -576,11 +581,11 @@ impl AddressSpace {
                 continue;
             }
             match step_fsync(pc, guard) {
-                StepOutcome::Done(()) => continue,
+                V3::Done(()) => continue,
                 other => return other,
             }
         }
-        StepOutcome::Done(())
+        V3::done(())
     }
 }
 
