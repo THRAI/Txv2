@@ -15,7 +15,7 @@
 //! `NoProgress`: the trait surface is "fetch one page" — the caller
 //! asked for one specific page; partial progress within a single page
 //! fetch is meaningless, and multi-page accumulation lives at the
-//! *call-site* loop (`step_fsync_v3`, `step_truncate_v3`) where
+//! *call-site* loop (`step_fsync`, `step_truncate`) where
 //! `PageProgress` is tallied against the dirty-page snapshot, not at
 //! the trait surface. Same reasoning for `flush_page`, `truncate`,
 //! `fsync`, `fallocate`. If a later backend surfaces real per-call

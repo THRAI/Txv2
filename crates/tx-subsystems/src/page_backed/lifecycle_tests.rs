@@ -5,6 +5,16 @@ use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, 
 use alloc::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+// `step_truncate`, `step_fsync`, `step_fallocate` are now v3-shaped
+// (return `tx_substrate::step_v3::StepOutcome<(), PageProgress>`),
+// so the assertions below use `V3Out::Done(())` against them. The
+// LifecycleFs v4 outcome wiring is unchanged — it stores v4 outcomes
+// for `FsPageBacking` and translates to v3 inside its
+// `FsPageBackingV3` impl below.
+use tx_substrate::step_v3::{
+    PageProgress as V3PageProgress, StepOutcome as V3Out, YieldShape as V3YieldShape,
+};
+
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
     crate::zones::register_all().expect("kernel zones");
@@ -294,7 +304,7 @@ fn pagebacked_step_truncate_withdraws_pages_at_or_beyond_new_size() {
 
     assert_eq!(
         step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64 + 1, &guard),
-        StepOutcome::Done(())
+        V3Out::Done(())
     );
 
     assert_eq!(pc.size_bytes(), crate::vm::USER_PAGE_SIZE as u64 + 1);
@@ -317,11 +327,11 @@ fn pagebacked_step_truncate_can_grow_visible_size_without_materializing_pages() 
         },
         4,
     );
-    assert_eq!(step_truncate(&pc, 8, &guard), StepOutcome::Done(()));
+    assert_eq!(step_truncate(&pc, 8, &guard), V3Out::Done(()));
 
     assert_eq!(
         step_truncate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64 + 11, &guard),
-        StepOutcome::Done(())
+        V3Out::Done(())
     );
 
     assert_eq!(pc.size_bytes(), 2 * crate::vm::USER_PAGE_SIZE as u64 + 11);
@@ -345,7 +355,7 @@ fn pagebacked_step_truncate_asks_file_backing_before_withdrawal() {
 
     assert_eq!(
         step_truncate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
-        StepOutcome::Done(())
+        V3Out::Done(())
     );
 
     assert_eq!(fs.truncates.load(Ordering::Acquire), 1);
@@ -375,7 +385,7 @@ fn pagebacked_step_truncate_leaves_state_unchanged_when_file_backing_fails() {
 
     assert_eq!(
         step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
-        StepOutcome::Err(Errno::EROFS)
+        V3Out::Err(Errno::EROFS.into())
     );
 
     assert_eq!(pc.size_bytes(), original_size);
@@ -406,11 +416,11 @@ fn pagebacked_step_truncate_rejects_device_and_capacity_growth() {
 
     assert_eq!(
         step_truncate(&device, 0, &guard),
-        StepOutcome::Err(Errno::EINVAL)
+        V3Out::Err(Errno::EINVAL.into())
     );
     assert_eq!(
         step_truncate(&anon, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
-        StepOutcome::Err(Errno::EINVAL)
+        V3Out::Err(Errno::EINVAL.into())
     );
 }
 
@@ -435,7 +445,7 @@ fn pagebacked_step_fsync_flushes_dirty_file_pages_in_order_and_cleans_marks() {
             .expect("mark dirty");
     }
 
-    assert_eq!(step_fsync(&pc, &guard), StepOutcome::Done(()));
+    assert_eq!(step_fsync(&pc, &guard), V3Out::Done(()));
 
     assert_eq!(fs.flushes.load(Ordering::Acquire), 2);
     assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
@@ -471,7 +481,10 @@ fn pagebacked_step_fsync_returns_advanced_then_blocked_after_flush_progress() {
 
     assert_eq!(
         step_fsync(&pc, &guard),
-        StepOutcome::AdvancedThenBlocked((), WaitToken::new(13, 0x55))
+        V3Out::Yield {
+            progress: V3PageProgress::new(1),
+            shape: V3YieldShape::on_carrier(13, 0x55),
+        }
     );
 
     assert!(!pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
@@ -500,8 +513,8 @@ fn pagebacked_step_fsync_is_noop_for_anon_and_device() {
         1,
     );
 
-    assert_eq!(step_fsync(&anon, &guard), StepOutcome::Done(()));
-    assert_eq!(step_fsync(&device, &guard), StepOutcome::Done(()));
+    assert_eq!(step_fsync(&anon, &guard), V3Out::Done(()));
+    assert_eq!(step_fsync(&device, &guard), V3Out::Done(()));
 }
 
 #[test]
@@ -532,7 +545,7 @@ fn pagebacked_step_truncate_zeros_partial_eof_tail_in_cached_page() {
     tx_substrate::page_allocator::testing::write_frame_bytes_for_test(ppn_page1, 0, &pattern);
 
     let new_size = crate::vm::USER_PAGE_SIZE as u64 + 4;
-    assert_eq!(step_truncate(&pc, new_size, &guard), StepOutcome::Done(()));
+    assert_eq!(step_truncate(&pc, new_size, &guard), V3Out::Done(()));
 
     let mut head = [0u8; 4];
     tx_substrate::page_allocator::testing::read_frame_bytes_for_test(ppn_page1, 0, &mut head);
@@ -572,7 +585,7 @@ fn pagebacked_step_truncate_does_not_touch_surviving_pages_at_page_aligned_shrin
 
     assert_eq!(
         step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
-        StepOutcome::Done(())
+        V3Out::Done(())
     );
 
     let mut readback = alloc::vec![0u8; crate::vm::USER_PAGE_SIZE];
@@ -593,12 +606,12 @@ fn pagebacked_step_fallocate_grows_anon_visible_size_without_materializing_pages
         },
         4,
     );
-    assert_eq!(step_truncate(&pc, 8, &guard), StepOutcome::Done(()));
+    assert_eq!(step_truncate(&pc, 8, &guard), V3Out::Done(()));
     assert_eq!(pc.size_bytes(), 8);
 
     assert_eq!(
         step_fallocate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64 + 17, &guard),
-        StepOutcome::Done(())
+        V3Out::Done(())
     );
 
     assert_eq!(pc.size_bytes(), 2 * crate::vm::USER_PAGE_SIZE as u64 + 17);
@@ -614,11 +627,11 @@ fn pagebacked_step_fallocate_calls_file_backing_before_publishing_size() {
     let guard = tx_substrate::epoch::guard();
     let fs = Arc::new(LifecycleFs::new());
     let pc = file_page_container(fs.clone(), FsObjectId::new(91));
-    assert_eq!(step_truncate(&pc, 16, &guard), StepOutcome::Done(()));
+    assert_eq!(step_truncate(&pc, 16, &guard), V3Out::Done(()));
     assert_eq!(fs.truncates.load(Ordering::Acquire), 1);
 
     let new_size = 3 * crate::vm::USER_PAGE_SIZE as u64;
-    assert_eq!(step_fallocate(&pc, new_size, &guard), StepOutcome::Done(()));
+    assert_eq!(step_fallocate(&pc, new_size, &guard), V3Out::Done(()));
 
     assert_eq!(fs.fallocates.load(Ordering::Acquire), 1);
     assert_eq!(fs.last_fallocate_size.load(Ordering::Acquire), new_size);
@@ -636,12 +649,12 @@ fn pagebacked_step_fallocate_leaves_state_unchanged_when_file_backing_fails() {
     let guard = tx_substrate::epoch::guard();
     let fs = Arc::new(LifecycleFs::failing_fallocate(Errno::EDQUOT));
     let pc = file_page_container(fs.clone(), FsObjectId::new(92));
-    assert_eq!(step_truncate(&pc, 16, &guard), StepOutcome::Done(()));
+    assert_eq!(step_truncate(&pc, 16, &guard), V3Out::Done(()));
     let baseline_size = pc.size_bytes();
 
     assert_eq!(
         step_fallocate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
-        StepOutcome::Err(Errno::EDQUOT)
+        V3Out::Err(Errno::EDQUOT.into())
     );
 
     assert_eq!(fs.fallocates.load(Ordering::Acquire), 1);
@@ -665,7 +678,7 @@ fn pagebacked_step_fallocate_rejects_device_and_capacity_growth() {
 
     assert_eq!(
         step_fallocate(&device, 16, &guard),
-        StepOutcome::Err(Errno::EINVAL)
+        V3Out::Err(Errno::EINVAL.into())
     );
 
     let anon = PageContainer::new(
@@ -677,7 +690,7 @@ fn pagebacked_step_fallocate_rejects_device_and_capacity_growth() {
     let beyond = 3 * crate::vm::USER_PAGE_SIZE as u64;
     assert_eq!(
         step_fallocate(&anon, beyond, &guard),
-        StepOutcome::Err(Errno::EINVAL)
+        V3Out::Err(Errno::EINVAL.into())
     );
     assert_eq!(anon.size_bytes(), 2 * crate::vm::USER_PAGE_SIZE as u64);
 }
@@ -693,17 +706,17 @@ fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
     let pc = file_page_container(fs.clone(), FsObjectId::new(93));
     assert_eq!(
         step_truncate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
-        StepOutcome::Done(())
+        V3Out::Done(())
     );
     let stable_size = pc.size_bytes();
 
     assert_eq!(
         step_fallocate(&pc, stable_size, &guard),
-        StepOutcome::Done(())
+        V3Out::Done(())
     );
     assert_eq!(
         step_fallocate(&pc, stable_size - 1, &guard),
-        StepOutcome::Done(())
+        V3Out::Done(())
     );
 
     assert_eq!(fs.fallocates.load(Ordering::Acquire), 0);
@@ -715,7 +728,7 @@ fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
 // Wave-8 design + prototype slice for the trait migration. Per
 // `docs/progress/decisions/2026-05-09-fsops-v3-design.md`, `LifecycleFs`
 // is the smallest test-only `FsOps` impl in the workspace — it lives
-// next to wave-7's `step_truncate_v3`/`step_fsync_v3` work, so the
+// next to wave-7's `step_truncate`/`step_fsync` work, so the
 // `FsOpsV3` impl gets validated against the same fixture that already
 // exercises the v3 sibling fns. Wave 9 fans out to the remaining
 // seven impls (`Tmpfs`, `Devfs`, `Ext4FsInstance`, `DevptsInstance`,

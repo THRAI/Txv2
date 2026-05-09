@@ -467,12 +467,11 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         let guard = tx_substrate::epoch::guard();
         tx_subsystems::page_backed::step_truncate(&pc, new_size, &guard)
     };
+    use tx_substrate::step_v3::StepOutcome as V3;
     match outcome {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-            SyscallResult::Error(EIO_VALUE)
-        }
-        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
+        V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+        V3::Err(v3_errno) => SyscallResult::Error(errno_to_i32(v3_errno.into())),
     }
 }
 
@@ -503,12 +502,11 @@ pub(super) fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         let guard = tx_substrate::epoch::guard();
         tx_subsystems::page_backed::step_truncate(&pc, new_size, &guard)
     };
+    use tx_substrate::step_v3::StepOutcome as V3;
     match outcome {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-            SyscallResult::Error(EIO_VALUE)
-        }
-        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
+        V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+        V3::Err(v3_errno) => SyscallResult::Error(errno_to_i32(v3_errno.into())),
     }
 }
 

@@ -2,6 +2,7 @@ use super::*;
 use crate::execution::{Errno, StepOutcome};
 use alloc::vec;
 use alloc::vec::Vec;
+use tx_substrate::step_v3::StepOutcome as V3Out;
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
@@ -75,7 +76,7 @@ fn pagebacked_step_copy_file_range_anon_to_anon_within_one_page_each() {
     let guard = tx_substrate::epoch::guard();
     let src = anon_pc(2);
     let dst = anon_pc(2);
-    assert_eq!(step_truncate(&dst, 0, &guard), StepOutcome::Done(()));
+    assert_eq!(step_truncate(&dst, 0, &guard), V3Out::Done(()));
 
     let payload: Vec<u8> = (0u8..200).collect();
     write_pattern(&src, 0, &payload, &guard);
@@ -118,7 +119,7 @@ fn pagebacked_step_copy_file_range_truncates_to_source_eof() {
 
     let payload: Vec<u8> = (0u8..40).collect();
     write_pattern(&src, 0, &payload, &guard);
-    assert_eq!(step_truncate(&src, 40, &guard), StepOutcome::Done(()));
+    assert_eq!(step_truncate(&src, 40, &guard), V3Out::Done(()));
 
     let outcome = step_copy_file_range(&src, 10, &dst, 0, 1024, &guard);
     assert_eq!(outcome, StepOutcome::Done(30));
@@ -135,7 +136,7 @@ fn pagebacked_step_copy_file_range_returns_done_zero_when_source_is_at_eof() {
     let src = anon_pc(1);
     let dst = anon_pc(1);
 
-    assert_eq!(step_truncate(&src, 32, &guard), StepOutcome::Done(()));
+    assert_eq!(step_truncate(&src, 32, &guard), V3Out::Done(()));
 
     let outcome = step_copy_file_range(&src, 32, &dst, 0, 100, &guard);
     assert_eq!(outcome, StepOutcome::Done(0));

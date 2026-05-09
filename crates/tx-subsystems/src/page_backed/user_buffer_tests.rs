@@ -1,5 +1,6 @@
 use super::*;
 use crate::execution::{Errno, StepOutcome};
+use tx_substrate::step_v3::StepOutcome as V3Out;
 use crate::vfs::{FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking};
 use crate::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
@@ -320,11 +321,11 @@ fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
     let shrink_size = USER_PAGE_SIZE as u64 + 4;
     assert_eq!(
         step_truncate(&pc, shrink_size, &guard),
-        StepOutcome::Done(())
+        V3Out::Done(())
     );
 
     let grow_size = USER_PAGE_SIZE as u64 + 32;
-    assert_eq!(step_truncate(&pc, grow_size, &guard), StepOutcome::Done(()));
+    assert_eq!(step_truncate(&pc, grow_size, &guard), V3Out::Done(()));
 
     let zeros = vec![0u8; pattern.len()];
     fixture.seed_user_bytes(&zeros);

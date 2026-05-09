@@ -345,7 +345,7 @@ fn vm_fault_pagebacked_rejects_access_past_pc_size_with_sigbus_shape() {
     let truncate_guard = tx_substrate::epoch::guard();
     assert_eq!(
         crate::page_backed::step_truncate(&pc_cap, USER_PAGE_SIZE as u64, &truncate_guard),
-        crate::execution::StepOutcome::Done(())
+        tx_substrate::step_v3::StepOutcome::Done(())
     );
     drop(truncate_guard);
 
@@ -388,7 +388,7 @@ fn vm_fault_pagebacked_rejects_write_past_pc_size_before_cow_replacement() {
     let truncate_guard = tx_substrate::epoch::guard();
     assert_eq!(
         crate::page_backed::step_truncate(&pc_cap, USER_PAGE_SIZE as u64, &truncate_guard),
-        crate::execution::StepOutcome::Done(())
+        tx_substrate::step_v3::StepOutcome::Done(())
     );
     drop(truncate_guard);
 
@@ -424,7 +424,7 @@ fn vm_fault_pagebacked_admits_first_byte_of_partially_filled_page() {
     let truncate_guard = tx_substrate::epoch::guard();
     assert_eq!(
         crate::page_backed::step_truncate(&pc_cap, USER_PAGE_SIZE as u64 + 1, &truncate_guard),
-        crate::execution::StepOutcome::Done(())
+        tx_substrate::step_v3::StepOutcome::Done(())
     );
     drop(truncate_guard);
 

@@ -91,7 +91,8 @@ impl ExecveTestFs {
         let size = bytes.len() as u64;
         let guard = tx_substrate::epoch::guard();
         match tx_subsystems::page_backed::step_truncate(&pc, size, &guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+            tx_substrate::step_v3::StepOutcome::Done(())
+            | tx_substrate::step_v3::StepOutcome::Continue { .. } => {}
             other => panic!("step_truncate(pc, {size}) failed: {other:?}"),
         }
         drop(guard);
