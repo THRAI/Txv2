@@ -2,7 +2,7 @@
 
 use tx_substrate::zone::{self, Cap, PayloadCap};
 
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::{Errno, Guard};
 use crate::tty::project;
 use crate::tty::structure::registry;
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
@@ -77,13 +77,13 @@ pub fn step_openpty(
     }
 
     let master_file = match project::open_file_for_tty(master.clone(), guard) {
-        StepOutcome::Done(file) => file,
-        StepOutcome::Err(err) => return V3::Err(err.into()),
+        V3::Done(file) => file,
+        V3::Err(err) => return V3::Err(err),
         _ => return V3::Err(Errno::EIO.into()),
     };
     let slave_file = match project::open_file_for_tty(slave.clone(), guard) {
-        StepOutcome::Done(file) => file,
-        StepOutcome::Err(err) => return V3::Err(err.into()),
+        V3::Done(file) => file,
+        V3::Err(err) => return V3::Err(err),
         _ => return V3::Err(Errno::EIO.into()),
     };
 

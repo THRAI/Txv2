@@ -96,7 +96,7 @@ fn install_capturing_console() -> &'static CapturingOps {
     };
     assert_eq!(
         register_console_alias("console", tty),
-        StepOutcome::Done(())
+        tx_substrate::step_v3::StepOutcome::Done(())
     );
     ops_static
 }

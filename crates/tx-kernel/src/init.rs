@@ -575,7 +575,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let tty =
             console_tty().expect("register_devfs_console_alias: console TTY must be registered");
         match register_console_alias("console", tty) {
-            StepOutcome::Done(()) => {}
+            tx_substrate::step_v3::StepOutcome::Done(()) => {}
             other => {
                 panic!("register_devfs_console_alias: register_console_alias failed: {other:?}")
             }
