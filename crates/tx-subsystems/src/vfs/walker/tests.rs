@@ -420,6 +420,12 @@ impl FsPageBacking for TestFs {
     }
 }
 
+// Wave-9a `FsOpsV3` + `FsPageBackingV3` impls + tests on `TestFs` live
+// in the sibling `v3` submodule (file: `walker/tests/v3.rs`) so this
+// file stays under the `cargo xtask lint arch` 1500-line authored-file
+// cap. The submodule has full visibility into `TestFs` via `super::`.
+mod v3;
+
 // === fixture: rootfs + (optional) devfs at /dev =======================
 
 struct Topology {
@@ -1177,3 +1183,4 @@ fn step_open_round_trips_to_directory_dentry() {
     };
     let _ = file;
 }
+

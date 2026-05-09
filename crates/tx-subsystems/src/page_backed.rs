@@ -22,11 +22,13 @@ use tx_substrate::{
 };
 
 mod cross_variant;
+mod fs_page_backing_v3;
 mod lifecycle;
 mod reflink;
 mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
+pub use fs_page_backing_v3::FsPageBackingV3;
 pub use lifecycle::{
     step_fallocate, step_fsync, step_fsync_v3, step_truncate, step_truncate_v3,
 };

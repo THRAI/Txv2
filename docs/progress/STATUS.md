@@ -4,6 +4,47 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9a of the v3 TDD migration landed — single
+  deep worker covering `FsPageBackingV3` design + first impls of
+  both v3 traits on `Tmpfs` (smallest production fs) and
+  `TestFs` (smallest non-trivial test fixture). Three deliverables:
+  (1) `FsPageBackingV3` trait now lives in
+  `crates/tx-subsystems/src/page_backed/fs_page_backing_v3.rs`
+  (extracted to its own file to keep page_backed.rs under the
+  1500-line cap, re-exported via
+  `crate::page_backed::FsPageBackingV3`). 5 methods (`fetch_page`,
+  `flush_page`, `truncate`, `fsync`, `fallocate`) + the
+  `supports_reflink` predicate; all StepOutcome methods use
+  `step_v3::StepOutcome<T, NoProgress>` per the design doc —
+  `fetch_page` got `NoProgress` because the trait surface is
+  "fetch one specific page" and multi-page accumulation is
+  caller-side (where wave-7's `step_fsync_v3` already tallies
+  `PageProgress`). (2) `impl FsOpsV3 for Tmpfs` and
+  `impl FsPageBackingV3 for Tmpfs` in `tmpfs.rs` — every Tmpfs
+  v4 body is purely synchronous so the v3 impl is a 1:1
+  translation; defensive `Advanced(t)` arms map to `done(t)` and
+  defensive `Blocked` arms map to `Errno::EAGAIN` (neither fires
+  in Tmpfs); plus factory methods `Tmpfs::fs_ops_v3_arc` and
+  `Tmpfs::fs_page_backing_v3_arc` for one-line wiring at
+  MountOutput cutover. (3) `impl FsOpsV3 for TestFs` and
+  `impl FsPageBackingV3 for TestFs` in a new submodule
+  `vfs/walker/tests/v3.rs`. 8 v3 tests pin the new shapes
+  end-to-end (4 Tmpfs + 4 TestFs). Final count: **1300 passed,
+  0 failed, 4 ignored across 60 binaries** (wave-8 baseline 1292
+  + 8). Worker reports the cross-trait coupling at MountOutput
+  is genuinely independent — the two v3 traits migrate
+  separately at the MountOutput level (wave 9b will grow the
+  sibling `fs_ops_v3`/`fs_page_backing_v3` fields on
+  MountPayload once impl coverage is 8/8). All lints + progress
+  validate green. **Wave 9b unblocked:** worker recommends full
+  parallel fan-out to the remaining 5 backends (Devfs,
+  Ext4FsInstance, DevptsInstance, ExecTestFs, ExecveTestFs) —
+  Tmpfs is the most semantically rich impl and went green
+  without surfacing any Continue-vs-Done decisions, so the
+  simpler backends should fan out cleanly. Each remaining
+  backend is ~30-50 line FsOpsV3 + ~15-line FsPageBackingV3 +
+  2-3 inline tests. Independent files, no merge conflicts.
+
 - 2026-05-09 PR-1 wave-8 of the v3 TDD migration landed — first
   trait-migration design probe. Wave 6's W-mount surfaced that
   the additive sibling-fn pattern doesn't apply to trait-shaped

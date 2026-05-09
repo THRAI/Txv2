@@ -679,3 +679,179 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
         "privileged chown should preserve S_ISUID"
     );
 }
+
+// === FsOpsV3 + FsPageBackingV3 — wave 9a parallel-trait impls ===========
+//
+// Wave-8 prototype landed `FsOpsV3` on the test-only `LifecycleFs` fixture
+// + the trait declaration in `crates/tx-subsystems/src/vfs/execution.rs`.
+// Wave 9a is the learning sub-wave per
+// `docs/progress/decisions/2026-05-09-fsops-v3-design.md`: the first
+// production impl (`Tmpfs`) plus the first non-trivial test fixture
+// (`TestFs` in `vfs/walker/tests.rs`) lift the v3 trait off ENOSYS-only
+// stubs and exercise the real semantics. Wave 9b fans out to the
+// remaining five impls (Devfs, Ext4FsInstance, DevptsInstance, ExecTestFs,
+// ExecveTestFs) once these are green.
+//
+// Tests below pin the v3 outcome shape end-to-end through both `FsOpsV3`
+// and `FsPageBackingV3` on `Tmpfs`. Each test is the red driver for
+// exactly one new method body.
+
+#[test]
+fn tmpfs_v3_lookup_round_trips_after_create() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    use tx_subsystems::vfs::FsOpsV3;
+    use tx_substrate::step_v3::{NoProgress, StepOutcome as V3, Errno as V3Errno};
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let cred = Credential::root();
+
+    // create_inode v3 — mirrors v4 create then expose v3 outcome.
+    let (file_id, file_meta) = match <Tmpfs as FsOpsV3>::create_inode(
+        &*tmpfs,
+        TMPFS_ROOT_OBJECT_ID,
+        b"hello-v3",
+        0o100644,
+        &cred,
+        &guard,
+    ) {
+        V3::Done((id, meta)) => (id, meta),
+        other => panic!("create_inode v3: {other:?}"),
+    };
+    assert_eq!(file_meta.kind(), InodeKind::Regular);
+
+    // lookup v3 round-trips the same id.
+    assert_eq!(
+        <Tmpfs as FsOpsV3>::lookup(&*tmpfs, TMPFS_ROOT_OBJECT_ID, b"hello-v3", &guard),
+        V3::<_, NoProgress>::done(file_id)
+    );
+
+    // missing-name → ENOENT round-trips through the v3 errno bridge.
+    assert_eq!(
+        <Tmpfs as FsOpsV3>::lookup(&*tmpfs, TMPFS_ROOT_OBJECT_ID, b"missing-v3", &guard),
+        V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
+    );
+}
+
+#[test]
+fn tmpfs_v3_mkdir_yields_directory_inode() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    use tx_subsystems::vfs::FsOpsV3;
+    use tx_substrate::step_v3::StepOutcome as V3;
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let cred = Credential::root();
+
+    let (dir_id, dir_meta) =
+        match <Tmpfs as FsOpsV3>::mkdir(&*tmpfs, TMPFS_ROOT_OBJECT_ID, b"v3dir", 0o755, &cred, &guard) {
+            V3::Done(out) => out,
+            other => panic!("mkdir v3: {other:?}"),
+        };
+    assert_eq!(dir_meta.kind(), InodeKind::Directory);
+
+    // load_inode_meta over v3 returns the same kind.
+    let loaded = match <Tmpfs as FsOpsV3>::load_inode_meta(&*tmpfs, dir_id, &guard) {
+        V3::Done(m) => m,
+        other => panic!("load_inode_meta v3: {other:?}"),
+    };
+    assert_eq!(loaded.kind(), InodeKind::Directory);
+}
+
+#[test]
+fn tmpfs_v3_fetch_page_done_for_anon_file() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    use tx_subsystems::page_backed::FsPageBackingV3;
+    use tx_subsystems::vfs::FsOpsV3;
+    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let cred = Credential::root();
+
+    let (file_id, _) = match <Tmpfs as FsOpsV3>::create_inode(
+        &*tmpfs,
+        TMPFS_ROOT_OBJECT_ID,
+        b"page-v3",
+        0o100644,
+        &cred,
+        &guard,
+    ) {
+        V3::Done(out) => out,
+        other => panic!("create_inode v3: {other:?}"),
+    };
+
+    let frame_first = match <Tmpfs as FsPageBackingV3>::fetch_page(&*tmpfs, file_id, 0, &guard) {
+        V3::Done(frame) => frame,
+        other => panic!("fetch_page v3: {other:?}"),
+    };
+    let frame_second = match <Tmpfs as FsPageBackingV3>::fetch_page(&*tmpfs, file_id, 0, &guard) {
+        V3::Done(frame) => frame,
+        other => panic!("fetch_page (second) v3: {other:?}"),
+    };
+    assert_eq!(frame_first.ppn(), frame_second.ppn());
+
+    // Misaligned offsets reject through the v3 errno bridge.
+    assert_eq!(
+        <Tmpfs as FsPageBackingV3>::fetch_page(&*tmpfs, file_id, 17, &guard),
+        V3::<tx_subsystems::page_backed::Frame, NoProgress>::err(V3Errno::EINVAL)
+    );
+}
+
+#[test]
+fn tmpfs_v3_truncate_then_load_meta_reflects_size() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    use tx_subsystems::page_backed::FsPageBackingV3;
+    use tx_subsystems::vfs::FsOpsV3;
+    use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = tx_substrate::epoch::guard();
+    let cred = Credential::root();
+
+    let (file_id, _) = match <Tmpfs as FsOpsV3>::create_inode(
+        &*tmpfs,
+        TMPFS_ROOT_OBJECT_ID,
+        b"trunc-v3",
+        0o100644,
+        &cred,
+        &guard,
+    ) {
+        V3::Done(out) => out,
+        other => panic!("create_inode v3: {other:?}"),
+    };
+
+    let page = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+    assert_eq!(
+        <Tmpfs as FsPageBackingV3>::truncate(&*tmpfs, file_id, page, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+
+    let meta = match <Tmpfs as FsOpsV3>::load_inode_meta(&*tmpfs, file_id, &guard) {
+        V3::Done(m) => m,
+        other => panic!("load_inode_meta v3: {other:?}"),
+    };
+    assert_eq!(meta.size, page);
+
+    // fsync is a no-op on tmpfs in v3 too.
+    assert_eq!(
+        <Tmpfs as FsPageBackingV3>::fsync(&*tmpfs, file_id, &guard),
+        V3::<(), NoProgress>::done(())
+    );
+}
