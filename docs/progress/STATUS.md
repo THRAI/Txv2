@@ -4,6 +4,35 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9e of the v3 TDD migration landed — last
+  two non-test-suite v4 walker callers migrated. Two sites:
+  (1) `crates/tx-fs/src/devfs.rs::open_console_for_init` — the
+  bootstrap `block_on(vfs::step_open(...))` for `/dev/console`
+  flipped to `step_open_v3` with the v3 4-variant match
+  collapsed to `V3::Done(file) → return file` and the legacy
+  fallthrough preserved. This was the last v3 production-side
+  caller of v4 walker; **all production code now exclusively
+  consumes the v3 walker.**
+  (2) `crates/tx-kernel/src/init/tests.rs:372` — the
+  `boot_smoke_walker_resolves_dev_console_after_mount_registration`
+  test flipped to `step_walk_v3`; the unused `StepOutcome` v4
+  import dropped. Confirms the boot-time devfs mount
+  registration is exercised through the v3 walker.
+  After 9e, the only remaining v4 walker callers are the 18 v4
+  tests in `crates/tx-subsystems/src/vfs/walker/tests.rs` (rich
+  test coverage that pre-dates the v3 walker by several waves)
+  and walker.rs's own internal `step_walk(...)` call inside the
+  v4 `step_open` body. Wave 9f migrates those v4 tests to v3,
+  then deletes v4 `step_walk` / `step_open` / `walk_inner`.
+  Final count: **1328 passed, 0 failed, 11 ignored across 60
+  binaries** (unchanged baseline — no new tests). All lints +
+  progress validate green. Net surface change this wave: zero
+  behavior, one production caller fewer on v4, one test
+  caller fewer on v4. **Wave 9f unblocked:** migrate the 18
+  v4 walker tests to v3 (mechanical), then retire v4
+  `step_walk` / `step_open` / `walk_inner` and the `FsOps` v4
+  trait can begin retirement.
+
 - 2026-05-09 PR-1 wave-9d (c) of the v3 TDD migration landed —
   **all remaining tx-shims production callers migrated to the v3
   walker.** Six `step_walk` call sites + one `step_open` call

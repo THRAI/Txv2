@@ -358,7 +358,6 @@ fn boot_smoke_mounts_root_and_dev_and_resolves_console() {
 /// RNode is a `StructBacked { Tty(...) }` for the boot console.
 #[test]
 fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
-    use tx_subsystems::execution::StepOutcome;
     use tx_subsystems::vfs::{walker, Credential, RNodeBacking, StructPayload};
 
     let _serial = setup();
@@ -369,13 +368,17 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
     let cwd = init.cwd().expect("init cwd must be bound");
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(walker::step_walk(cwd, b"/dev/console", &cred, &guard));
+    // Wave 9e: migrated to v3 walker.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let outcome = block_on(walker::step_walk_v3(cwd, b"/dev/console", &cred, &guard));
     drop(guard);
 
     let dentry = match outcome {
-        StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
+        V3::Done(d) => d,
         other => {
-            panic!("step_walk(/dev/console) must succeed after mount registration, got {other:?}",)
+            panic!(
+                "step_walk_v3(/dev/console) must succeed after mount registration, got {other:?}",
+            )
         }
     };
     assert_eq!(dentry.name().as_bytes(), b"console");
