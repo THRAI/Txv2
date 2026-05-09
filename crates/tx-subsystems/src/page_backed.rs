@@ -27,7 +27,9 @@ mod reflink;
 mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
-pub use lifecycle::{step_fallocate, step_fsync, step_truncate};
+pub use lifecycle::{
+    step_fallocate, step_fsync, step_fsync_v3, step_truncate, step_truncate_v3,
+};
 pub use reflink::{cow_replace_into_private, install_shared_page};
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{step_read_to_user, step_write_from_user};

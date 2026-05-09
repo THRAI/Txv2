@@ -28,7 +28,10 @@ pub use step_master_close::step_master_close_last;
 pub use step_openpty::{step_openpty, OpenPtyOutcome};
 pub use step_poll_hardware::{step_poll_hardware_input, HardwarePollOutcome};
 pub use step_read::{step_read, step_read_for_caller, step_read_for_process};
-pub use step_write::{step_write, step_write_for_caller, step_write_for_process};
+pub use step_write::{
+    step_write, step_write_for_caller, step_write_for_caller_v3, step_write_for_process,
+    step_write_v3,
+};
 
 /// Level bit for `TtyIdentity::input_readable`.
 pub const TTY_READABLE: u64 = 0x1;

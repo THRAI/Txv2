@@ -4,6 +4,61 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-7 of the v3 TDD migration landed (three
+  parallel cascade probes — first multi-fn fan-out exercising the
+  full v3 surface from waves 4-6). Net additions:
+  (a) **W-tty-step-write** migrated `step_write_v3` and
+  `step_write_for_caller_v3` in
+  `crates/tx-subsystems/src/tty/execution/step_write.rs` (skipped
+  `step_write_for_process` — its SIGTTOU side-effect path crosses
+  into `step_ioctl.rs` peer territory). Load-bearing TDD signal:
+  the probe is the canonical `AdvancedThenBlocked(consumed, wait)`
+  case where v3 carries real `ByteProgress::new(consumed)` through
+  the yield (pipe was deliberately single-shot). Test
+  `step_write_v3_partial_then_blocked_yields_on_carrier_with_byte_progress`
+  pinned this. Re-exported `step_write_v3` and `step_write_for_caller_v3`
+  from `tty/execution/mod.rs` to silence dead_code. 7 v3 tests.
+  (b) **W-page-backed-lifecycle** migrated `step_fsync_v3` and
+  `step_truncate_v3` in
+  `crates/tx-subsystems/src/page_backed/lifecycle.rs` (deferred
+  `step_fallocate` — same shape as `step_truncate`, ~10-line
+  follow-up). First cascade probe over `PageProgress`-typed step
+  fns. Per-call-site `Advanced(())` decisions documented inline:
+  `step_fsync_v3` threads a `pages_so_far: u32` counter through
+  the dirty-pages loop and yields with
+  `PageProgress::new(pages_so_far)`; `step_truncate_v3` yields
+  with `PageProgress::EMPTY` since the v4 fs `truncate` returns
+  `T = ()` and there's no per-step page-count to plumb.
+  Worker flagged ergonomic friction at 6 sites where
+  `<PageProgress as StepProgress>::EMPTY` was the only path to the
+  trait const without a `use StepProgress;` conflict — orchestrator
+  fixed by adding inherent `pub const PageProgress::EMPTY` (parallel
+  to wave-6's `ByteProgress::EMPTY`); all 6 sites simplified to
+  `PageProgress::EMPTY`; unused `StepProgress` test imports cleaned.
+  11 v3 tests. Re-exported `step_fsync_v3` / `step_truncate_v3`
+  from `page_backed.rs` to silence dead_code.
+  (c) **W-pipe-step-write** added `step_write_v3` in
+  `crates/tx-subsystems/src/pipe.rs` — the trivial wave-6
+  follow-up (mechanically symmetric to `step_read_v3`, +EPIPE
+  branch via `step_v3::Errno::EPIPE`). 4 v3 tests; clean port.
+  Final count: **1287 passed, 0 failed, 4 ignored across 60
+  binaries** (wave-6 baseline 1265 + 7 tty + 11 lifecycle + 4 pipe).
+  No warnings — all dead_code on v3 sibs silenced via re-exports.
+  `cargo xtask lint arch | docs | progress validate` all green.
+  **Real signals** for wave-8 planning: (1) `AdvancedThenBlocked`
+  → `yield_on_carrier(P::new(progress), c, i)` mapping is now
+  pattern-validated end-to-end; pipe-style single-shot vs
+  tty-style mid-step-yielding both work. (2) `T = ()` payloads
+  don't plumb interim progress under v3 today — the v4 fn shape
+  needs adapting (caller-tracked counter as in `step_fsync_v3`)
+  if interim per-step progress is needed. (3) Two parallel
+  workers in the same `mod.rs`-style file structure can land
+  cleanly via re-export edits. **Next:** wave 8 — either pull
+  `step_fallocate_v3` (trivial), step_write_for_process_v3 (SIGTTOU
+  branch), `step_read_v3` in tty (parallel to step_write_v3), or
+  shift to the FsOps trait-migration design problem (the only
+  path to real cross-trait cascade for mount/devfs/ext4).
+
 - 2026-05-09 PR-1 wave-6 of the v3 TDD migration landed (three
   parallel cascade probes: W-mount, W-pipe, W-device — first
   multi-subsystem fan-out under the additive sibling-fn pattern

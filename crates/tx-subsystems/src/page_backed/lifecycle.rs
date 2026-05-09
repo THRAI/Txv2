@@ -224,3 +224,741 @@ fn first_page_after_size(size: u64) -> Option<PageIndex> {
     size.checked_add(page_size - 1)
         .map(|rounded| PageIndex::new(rounded / page_size))
 }
+
+// -- v3 cascade probe (wave 7) -----------------------------------------------
+//
+// Sibling `*_v3` fns matching the same logic as the v4 fns above but
+// emitting v3 step-algebra outcomes (`tx_substrate::step_v3::StepOutcome`)
+// over `PageProgress` (page-shaped unit of work per
+// `docs/Txv3/03_STEP_MODEL_v2.md` §STEP-V2-PROGRESS-TYPED-1).
+//
+// Existing callers stay on the v4 fns; later waves switch them over and
+// delete the v4 fns. We re-run the body inline rather than delegating, so
+// the v3 path is independently testable and there's no conversion-shim
+// layer.
+//
+// Per-call-site `Advanced(())` mapping decisions (the load-bearing TDD
+// signal for the wave-7 probe):
+//
+// * `step_fsync_v3`: each successful page flush is one unit of page work.
+//   We track `pages_so_far: u32` across the loop and surface it through
+//   `PageProgress::new(pages_so_far)` whenever the v4 path would have
+//   yielded `AdvancedThenBlocked((), token)`. The v4 final-fsync `Blocked`
+//   case (post-loop) similarly carries the page count of dirty pages
+//   already flushed. The v4 final-fsync `Done(())` / non-blocked passthrough
+//   maps to `done(())`.
+// * `step_truncate_v3`: the fs `Advanced(())` is fs-implementation-internal
+//   partial progress, NOT a page count — the v4 `T = ()` carries no page
+//   delta to plumb through. We map `Advanced(())` to
+//   `continue_with(PageProgress::EMPTY)` ("made progress, retry; no
+//   page-count to expose"), and `AdvancedThenBlocked((), token)` to
+//   `yield_on_carrier(PageProgress::EMPTY, c, i)` for the same reason.
+//   The simpler-path choice flagged in the wave-7 worker spec; an inherent
+//   `PageProgress::EMPTY` shadow (parallel to `ByteProgress::EMPTY`) would
+//   shave an import line at these call sites — see report.
+
+/// `step_fsync` — v3 outcome shape over `PageProgress`.
+///
+/// Same body and semantics as [`step_fsync`], translated to a v3
+/// [`tx_substrate::step_v3::StepOutcome`]:
+///
+/// - `Anon` / `Device` / no dirty pages → `Done(())`
+/// - blocking mid-loop with prior progress → `Yield { progress:
+///   PageProgress::new(pages_so_far), shape: OnCarrier { … } }`
+/// - blocking with no prior progress → `Yield { progress:
+///   PageProgress::EMPTY, shape: OnCarrier { … } }`
+/// - underlying flush/fsync errno → `Err(errno)`
+/// - all dirty pages flushed and final fsync clean → `Done(())`
+///
+/// Per-call-site `Advanced(())` decision: counted as one page of progress
+/// (we just cleared a dirty mark), accumulated into `pages_so_far` and
+/// surfaced through `PageProgress::new(pages_so_far)` when the next call
+/// blocks. See module-level comment.
+pub fn step_fsync_v3(
+    pc: &PageContainer,
+    guard: &Guard<'_>,
+) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::PageProgress> {
+    use tx_substrate::step_v3::{PageProgress, StepOutcome as V3};
+
+    let PageContainerKind::File {
+        mount,
+        fs_object_id,
+    } = pc.kind()
+    else {
+        return V3::done(());
+    };
+
+    let mut pages_so_far: u32 = 0;
+    for (page, ppn) in pc.dirty_pages_snapshot() {
+        let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
+            return V3::err(Errno::EINVAL.into());
+        };
+        match mount.payload().fs_page_backing.flush_page(
+            *fs_object_id,
+            offset,
+            &Frame::new(ppn),
+            guard,
+        ) {
+            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                pc.clear_dirty_if_match(page, ppn);
+                pages_so_far = pages_so_far.saturating_add(1);
+            }
+            StepOutcome::Blocked(token) => {
+                let progress = if pages_so_far == 0 {
+                    PageProgress::EMPTY
+                } else {
+                    PageProgress::new(pages_so_far)
+                };
+                return V3::yield_on_carrier(progress, token.carrier(), token.interest());
+            }
+            StepOutcome::AdvancedThenBlocked((), token) => {
+                pc.clear_dirty_if_match(page, ppn);
+                pages_so_far = pages_so_far.saturating_add(1);
+                return V3::yield_on_carrier(
+                    PageProgress::new(pages_so_far),
+                    token.carrier(),
+                    token.interest(),
+                );
+            }
+            StepOutcome::Err(errno) => return V3::err(errno.into()),
+        }
+    }
+
+    match mount.payload().fs_page_backing.fsync(*fs_object_id, guard) {
+        StepOutcome::Done(()) => V3::done(()),
+        StepOutcome::Advanced(()) => {
+            // The fs is signalling "made progress, retry"; from the v3
+            // page-progress perspective the page-flush work is already
+            // accounted, so re-enter with the prior page count.
+            let progress = if pages_so_far == 0 {
+                PageProgress::EMPTY
+            } else {
+                PageProgress::new(pages_so_far)
+            };
+            V3::continue_with(progress)
+        }
+        StepOutcome::Blocked(token) => {
+            let progress = if pages_so_far == 0 {
+                PageProgress::EMPTY
+            } else {
+                PageProgress::new(pages_so_far)
+            };
+            V3::yield_on_carrier(progress, token.carrier(), token.interest())
+        }
+        StepOutcome::AdvancedThenBlocked((), token) => {
+            // v4 `AdvancedThenBlocked((), token)` from `fsync` carries no
+            // page count — the unit of v4 progress here is "fs internal
+            // partial flush" not "another container page". We surface the
+            // page count we already accumulated.
+            let progress = if pages_so_far == 0 {
+                PageProgress::EMPTY
+            } else {
+                PageProgress::new(pages_so_far)
+            };
+            V3::yield_on_carrier(progress, token.carrier(), token.interest())
+        }
+        StepOutcome::Err(errno) => V3::err(errno.into()),
+    }
+}
+
+/// `step_truncate` — v3 outcome shape over `PageProgress`.
+///
+/// Same body and semantics as [`step_truncate`], translated to a v3
+/// [`tx_substrate::step_v3::StepOutcome`]:
+///
+/// - `Device` / new_size > capacity → `Err(EINVAL)`
+/// - fs `Done(())` then post-fs work → `Done(())`
+/// - fs `Advanced(())` then post-fs work → `Continue { progress:
+///   PageProgress::EMPTY }` (rerun, no page count to expose — see note)
+/// - fs `Blocked(token)` → `Yield { progress: PageProgress::EMPTY, … }`
+/// - fs `AdvancedThenBlocked((), token)` → `Yield { progress:
+///   PageProgress::EMPTY, … }` (see note)
+/// - fs `Err(e)` → `Err(e)`
+///
+/// Per-call-site `Advanced(())` / `AdvancedThenBlocked` decision: the v4
+/// fs `truncate` returns `T = ()`, so there is no per-step page count to
+/// thread through. We pick the simpler probe path of `PageProgress::EMPTY`
+/// in both yield/continue cases. If a later wave needs interim page-step
+/// accounting for truncate it must extend `FsPageBacking::truncate` to
+/// expose a `pages` count or have v3 callers track it externally.
+pub fn step_truncate_v3(
+    pc: &PageContainer,
+    new_size: u64,
+    guard: &Guard<'_>,
+) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::PageProgress> {
+    use tx_substrate::step_v3::{PageProgress, StepOutcome as V3};
+
+    if matches!(pc.kind(), PageContainerKind::Device { .. }) {
+        return V3::err(Errno::EINVAL.into());
+    }
+
+    let Some(capacity) = pc.byte_capacity() else {
+        return V3::err(Errno::EINVAL.into());
+    };
+    if new_size > capacity {
+        return V3::err(Errno::EINVAL.into());
+    }
+
+    let fs_advanced = match pc.kind() {
+        PageContainerKind::File {
+            mount,
+            fs_object_id,
+        } => match mount
+            .payload()
+            .fs_page_backing
+            .truncate(*fs_object_id, new_size, guard)
+        {
+            StepOutcome::Done(()) => false,
+            StepOutcome::Advanced(()) => true,
+            StepOutcome::Blocked(token) => {
+                return V3::yield_on_carrier(
+                    PageProgress::EMPTY,
+                    token.carrier(),
+                    token.interest(),
+                );
+            }
+            StepOutcome::AdvancedThenBlocked((), token) => {
+                return V3::yield_on_carrier(
+                    PageProgress::EMPTY,
+                    token.carrier(),
+                    token.interest(),
+                );
+            }
+            StepOutcome::Err(errno) => return V3::err(errno.into()),
+        },
+        PageContainerKind::Anon { .. } => false,
+        PageContainerKind::Device { .. } => unreachable!(),
+    };
+
+    let old_size = pc.size_bytes();
+    pc.set_size_bytes(new_size);
+
+    if new_size < old_size {
+        let Some(first_drop) = first_page_after_size(new_size) else {
+            return V3::err(Errno::EINVAL.into());
+        };
+        pc.withdraw_cached_pages_from(first_drop);
+        zero_partial_eof_tail(pc, new_size);
+    }
+
+    if fs_advanced {
+        V3::continue_with(PageProgress::EMPTY)
+    } else {
+        V3::done(())
+    }
+}
+
+#[cfg(test)]
+mod v3_tests {
+    use super::*;
+    use crate::execution::{Errno as V4Errno, StepOutcome as V4Outcome, WaitToken};
+    use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
+    use crate::page_backed::{
+        AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind, PageIndex,
+        allocate_cached_frame,
+    };
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta};
+    use alloc::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use tx_substrate::page_allocator;
+    use tx_substrate::step_v3::{
+        Errno as V3Errno, InterestConditions, PageProgress, StepOutcome as V3Outcome,
+        WakeCarrier, YieldShape,
+    };
+
+    fn setup_host_substrate() {
+        tx_substrate::testing::init_host_for_test_once();
+        crate::zones::register_all().expect("kernel zones");
+        match tx_substrate::page_allocator::claim_zero_frame() {
+            Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+            Err(error) => panic!("claim zero frame for v3 lifecycle tests: {error:?}"),
+        }
+    }
+
+    struct LifecycleFs {
+        flushes: AtomicUsize,
+        fsyncs: AtomicUsize,
+        last_object: AtomicU64,
+        last_offset: AtomicU64,
+        last_truncate_size: AtomicU64,
+        block_flush_after: Option<usize>,
+        truncate_outcome: V4Outcome<()>,
+    }
+
+    impl LifecycleFs {
+        fn new() -> Self {
+            Self {
+                flushes: AtomicUsize::new(0),
+                fsyncs: AtomicUsize::new(0),
+                last_object: AtomicU64::new(0),
+                last_offset: AtomicU64::new(0),
+                last_truncate_size: AtomicU64::new(0),
+                block_flush_after: None,
+                truncate_outcome: V4Outcome::Done(()),
+            }
+        }
+
+        fn blocking_after(first_done_count: usize) -> Self {
+            Self {
+                block_flush_after: Some(first_done_count),
+                ..Self::new()
+            }
+        }
+
+        fn failing_truncate(errno: V4Errno) -> Self {
+            Self {
+                truncate_outcome: V4Outcome::Err(errno),
+                ..Self::new()
+            }
+        }
+
+        fn blocking_truncate(token: WaitToken) -> Self {
+            Self {
+                truncate_outcome: V4Outcome::Blocked(token),
+                ..Self::new()
+            }
+        }
+
+        fn advancing_truncate() -> Self {
+            Self {
+                truncate_outcome: V4Outcome::Advanced(()),
+                ..Self::new()
+            }
+        }
+    }
+
+    impl FsPageBacking for LifecycleFs {
+        fn fetch_page(
+            &self,
+            _fs_object_id: FsObjectId,
+            _offset: u64,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<Frame> {
+            V4Outcome::Done(Frame::new(
+                page_allocator::zero_frame_ppn().expect("zero frame"),
+            ))
+        }
+
+        fn flush_page(
+            &self,
+            fs_object_id: FsObjectId,
+            offset: u64,
+            _frame: &Frame,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<()> {
+            let flush = self.flushes.fetch_add(1, Ordering::AcqRel);
+            self.last_object
+                .store(fs_object_id.as_u64(), Ordering::Release);
+            self.last_offset.store(offset, Ordering::Release);
+            if self.block_flush_after == Some(flush) {
+                V4Outcome::Blocked(WaitToken::new(13, 0x55))
+            } else {
+                V4Outcome::Done(())
+            }
+        }
+
+        fn truncate(
+            &self,
+            fs_object_id: FsObjectId,
+            new_size: u64,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<()> {
+            self.last_object
+                .store(fs_object_id.as_u64(), Ordering::Release);
+            self.last_truncate_size.store(new_size, Ordering::Release);
+            self.truncate_outcome.clone()
+        }
+
+        fn fsync(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V4Outcome<()> {
+            self.fsyncs.fetch_add(1, Ordering::AcqRel);
+            self.last_object
+                .store(fs_object_id.as_u64(), Ordering::Release);
+            V4Outcome::Done(())
+        }
+
+        fn fallocate(
+            &self,
+            _fs_object_id: FsObjectId,
+            _new_size: u64,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<()> {
+            V4Outcome::Done(())
+        }
+    }
+
+    impl FsOps for LifecycleFs {
+        fn lookup(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<FsObjectId> {
+            V4Outcome::Err(V4Errno::ENOSYS)
+        }
+
+        fn load_inode_meta(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<InodeMeta> {
+            V4Outcome::Done(InodeMeta::new(InodeKind::Regular, 0o100644))
+        }
+
+        fn serialize_inode_meta(
+            &self,
+            _fs_object_id: FsObjectId,
+            _meta: &InodeMeta,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<()> {
+            V4Outcome::Done(())
+        }
+
+        fn create_inode(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _mode: u16,
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<(FsObjectId, InodeMeta)> {
+            V4Outcome::Err(V4Errno::EROFS)
+        }
+
+        fn unlink(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<()> {
+            V4Outcome::Err(V4Errno::EROFS)
+        }
+
+        fn rename(
+            &self,
+            _old_parent: FsObjectId,
+            _old_name: &[u8],
+            _new_parent: FsObjectId,
+            _new_name: &[u8],
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<()> {
+            V4Outcome::Err(V4Errno::EROFS)
+        }
+
+        fn link(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<()> {
+            V4Outcome::Err(V4Errno::EROFS)
+        }
+
+        fn mkdir(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _mode: u16,
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<(FsObjectId, InodeMeta)> {
+            V4Outcome::Err(V4Errno::EROFS)
+        }
+
+        fn rmdir(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<()> {
+            V4Outcome::Err(V4Errno::EROFS)
+        }
+
+        fn symlink(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _link_target: &[u8],
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<(FsObjectId, InodeMeta)> {
+            V4Outcome::Err(V4Errno::EROFS)
+        }
+
+        fn readdir(
+            &self,
+            _fs_object_id: FsObjectId,
+            _cursor: DirCursor,
+            _guard: &Guard<'_>,
+        ) -> V4Outcome<Option<(DirEntry, DirCursor)>> {
+            V4Outcome::Done(None)
+        }
+
+        fn destroy_inode(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V4Outcome<()> {
+            V4Outcome::Done(())
+        }
+    }
+
+    fn file_page_container(fs: Arc<LifecycleFs>, fs_object_id: FsObjectId) -> PageContainer {
+        let mount = MountPayload::new_cap(
+            fs.clone(),
+            fs,
+            None,
+            DevId::new(8),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("mock"),
+        )
+        .expect("mount payload");
+        PageContainer::new(
+            PageContainerKind::File {
+                mount: MountPayloadPin::acquire(&tx_substrate::zone::PayloadCap::from_cap(mount)),
+                fs_object_id,
+            },
+            4,
+        )
+    }
+
+    fn cached_frame_for_test() -> CachedFrame {
+        setup_host_substrate();
+        allocate_cached_frame().expect("cached frame")
+    }
+
+    // ------- step_fsync_v3 -------------------------------------------------
+
+    #[test]
+    fn fsync_v3_anon_returns_done() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        );
+        assert_eq!(step_fsync_v3(&pc, &guard), V3Outcome::done(()));
+    }
+
+    #[test]
+    fn fsync_v3_no_dirty_pages_done() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let fs = Arc::new(LifecycleFs::new());
+        let pc = file_page_container(fs.clone(), FsObjectId::new(91));
+        assert_eq!(step_fsync_v3(&pc, &guard), V3Outcome::done(()));
+        assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
+        assert_eq!(fs.flushes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn fsync_v3_flushes_clean_pages_done() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let fs = Arc::new(LifecycleFs::new());
+        let pc = file_page_container(fs.clone(), FsObjectId::new(92));
+        for page in [0u64, 1, 2] {
+            let mut state = pc.state.lock();
+            state
+                .pages
+                .install_if_absent(PageIndex::new(page), cached_frame_for_test())
+                .expect("seed page");
+            state
+                .pages
+                .mark_dirty(PageIndex::new(page))
+                .expect("mark dirty");
+        }
+        assert_eq!(step_fsync_v3(&pc, &guard), V3Outcome::done(()));
+        assert_eq!(fs.flushes.load(Ordering::Acquire), 3);
+        assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn fsync_v3_blocked_first_page_yields_with_empty_progress() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let fs = Arc::new(LifecycleFs::blocking_after(0));
+        let pc = file_page_container(fs.clone(), FsObjectId::new(93));
+        for page in [0u64, 1] {
+            let mut state = pc.state.lock();
+            state
+                .pages
+                .install_if_absent(PageIndex::new(page), cached_frame_for_test())
+                .expect("seed page");
+            state
+                .pages
+                .mark_dirty(PageIndex::new(page))
+                .expect("mark dirty");
+        }
+        assert_eq!(
+            step_fsync_v3(&pc, &guard),
+            V3Outcome::Yield {
+                progress: PageProgress::EMPTY,
+                shape: YieldShape::OnCarrier {
+                    carrier: WakeCarrier::new(13),
+                    interests: InterestConditions::new(0x55),
+                },
+            }
+        );
+        // No clear-dirty happened on the blocked page.
+        assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
+    }
+
+    #[test]
+    fn fsync_v3_blocked_after_progress_yields_with_pages_so_far() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let fs = Arc::new(LifecycleFs::blocking_after(1));
+        let pc = file_page_container(fs.clone(), FsObjectId::new(94));
+        for page in [0u64, 1] {
+            let mut state = pc.state.lock();
+            state
+                .pages
+                .install_if_absent(PageIndex::new(page), cached_frame_for_test())
+                .expect("seed page");
+            state
+                .pages
+                .mark_dirty(PageIndex::new(page))
+                .expect("mark dirty");
+        }
+        assert_eq!(
+            step_fsync_v3(&pc, &guard),
+            V3Outcome::Yield {
+                progress: PageProgress::new(1),
+                shape: YieldShape::OnCarrier {
+                    carrier: WakeCarrier::new(13),
+                    interests: InterestConditions::new(0x55),
+                },
+            }
+        );
+        // The first flush did clear-dirty; the second blocked one didn't.
+        assert!(!pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
+        assert!(pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
+        assert_eq!(fs.fsyncs.load(Ordering::Acquire), 0);
+    }
+
+    // ------- step_truncate_v3 ---------------------------------------------
+
+    #[test]
+    fn truncate_v3_anon_shrink_done_and_withdraws_pages() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            4,
+        );
+        for page in 0..4 {
+            pc.state
+                .lock()
+                .pages
+                .install_if_absent(PageIndex::new(page), cached_frame_for_test())
+                .expect("seed page");
+        }
+        assert_eq!(
+            step_truncate_v3(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
+            V3Outcome::done(())
+        );
+        assert!(pc.lookup(PageIndex::new(0)).is_some());
+        assert_eq!(pc.lookup(PageIndex::new(1)), None);
+    }
+
+    #[test]
+    fn truncate_v3_device_returns_einval() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let device = PageContainer::new(
+            PageContainerKind::Device {
+                base_ppn: Ppn(0xface_3000),
+                page_count: 1,
+            },
+            1,
+        );
+        assert_eq!(
+            step_truncate_v3(&device, 0, &guard),
+            V3Outcome::err(V3Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn truncate_v3_grow_past_capacity_returns_einval() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        );
+        assert_eq!(
+            step_truncate_v3(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
+            V3Outcome::err(V3Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn truncate_v3_fs_err_propagates_unchanged_state() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let fs = Arc::new(LifecycleFs::failing_truncate(V4Errno::EROFS));
+        let pc = file_page_container(fs.clone(), FsObjectId::new(95));
+        let original_size = pc.size_bytes();
+        assert_eq!(
+            step_truncate_v3(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
+            V3Outcome::err(V3Errno::EROFS)
+        );
+        assert_eq!(pc.size_bytes(), original_size);
+    }
+
+    #[test]
+    fn truncate_v3_fs_blocked_yields_empty_progress() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let fs = Arc::new(LifecycleFs::blocking_truncate(WaitToken::new(7, 0x11)));
+        let pc = file_page_container(fs.clone(), FsObjectId::new(96));
+        let original_size = pc.size_bytes();
+        assert_eq!(
+            step_truncate_v3(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
+            V3Outcome::Yield {
+                progress: PageProgress::EMPTY,
+                shape: YieldShape::OnCarrier {
+                    carrier: WakeCarrier::new(7),
+                    interests: InterestConditions::new(0x11),
+                },
+            }
+        );
+        // Size stays unpublished on a yield (post-fs work didn't run).
+        assert_eq!(pc.size_bytes(), original_size);
+    }
+
+    #[test]
+    fn truncate_v3_fs_advanced_returns_continue_with_empty_progress() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let fs = Arc::new(LifecycleFs::advancing_truncate());
+        let pc = file_page_container(fs.clone(), FsObjectId::new(97));
+        // Pick a shrink so the post-fs work runs (withdraw + zero-tail).
+        pc.set_size_bytes(2 * crate::vm::USER_PAGE_SIZE as u64);
+        let new_size = crate::vm::USER_PAGE_SIZE as u64;
+        assert_eq!(
+            step_truncate_v3(&pc, new_size, &guard),
+            V3Outcome::continue_with(PageProgress::EMPTY)
+        );
+        // Post-fs work *did* run, so size is published.
+        assert_eq!(pc.size_bytes(), new_size);
+    }
+}
