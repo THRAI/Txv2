@@ -855,3 +855,125 @@ fn tmpfs_v3_truncate_then_load_meta_reflects_size() {
         V3::<(), NoProgress>::done(())
     );
 }
+
+// === Wave 9c — v3 walker end-to-end against Tmpfs =====================
+//
+// This test pins that the production v3 cutover actually exercises
+// `FsOpsV3 for Tmpfs` end-to-end through the new `step_walk_v3`
+// entry point and through the v3 fields landing on `MountOutput`. If
+// the walker degenerates to v4, this test still passes because both
+// fields populate from the same `Arc<Tmpfs>`; the
+// `register_mount_payload_v3` step here uses
+// `mount_output.fs_ops_v3` (not `mount_output.fs_ops`) so the route
+// is hard-pinned to the v3 trait surface.
+
+#[test]
+fn step_walk_v3_against_tmpfs_resolves_real_path() {
+    use tx_subsystems::execution::StepOutcome as V4;
+    use tx_subsystems::mount::{
+        DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
+    };
+    use tx_subsystems::vfs::structure::{
+        DEntry, InlineName, InodeMeta, RNode, RNodeBacking, S_IFDIR,
+    };
+    use tx_subsystems::vfs::walker::{register_mount_payload_v3, step_walk_v3};
+    use tx_substrate::step_v3::StepOutcome as V3;
+    use tx_substrate::zone::{self, Cap};
+
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let (tmpfs, mount_output) = Tmpfs::new_root();
+
+    let payload: Cap<MountPayload> = MountPayload::new_cap(
+        mount_output.fs_ops.clone(),
+        mount_output.fs_page_backing.clone(),
+        None,
+        DevId::new(1),
+        MountOptions::default(),
+        "tmpfs",
+        SourceLabel::Static("rootfs-tmpfs-v3"),
+    )
+    .expect("payload reservation");
+
+    // Wire the v3 sidecar from `mount_output.fs_ops_v3` directly;
+    // this is the wave-9c cutover discipline. If the field were
+    // unpopulated, this line wouldn't compile.
+    register_mount_payload_v3(&payload, mount_output.fs_ops_v3.clone());
+
+    let root_rnode: Cap<RNode> = {
+        let raw = RNode::new(
+            mount_output.root_fs_object_id,
+            InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
+            RNodeBacking::Directory,
+        )
+        .with_containing_mount(&payload);
+        let res = zone::reserve_for::<RNode>().expect("rnode reservation");
+        zone::sign_for(res, raw)
+    };
+
+    let _mount = MountIdentity::new_cap(
+        MountId::new(1),
+        None,
+        root_rnode.clone(),
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("mount identity reservation");
+
+    let root_dentry: Cap<DEntry> =
+        DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+
+    // Use real Tmpfs mkdir to add an entry the walker has to find by
+    // resolving through `FsOpsV3 for Tmpfs`.
+    let cred = Credential::root();
+    let guard = tx_substrate::epoch::guard();
+    let _new_dir = match tmpfs.mkdir(
+        mount_output.root_fs_object_id,
+        b"dir",
+        0o755,
+        &cred,
+        &guard,
+    ) {
+        V4::Done(out) => out,
+        other => panic!("tmpfs mkdir failed: {other:?}"),
+    };
+
+    // Walker must use the wide block_on shape from the v3 walker
+    // tests; reuse a simple poll loop here.
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn raw_clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+    fn raw_wake(_: *const ()) {}
+    fn raw_wake_by_ref(_: *const ()) {}
+    fn raw_drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(raw_clone, raw_wake, raw_wake_by_ref, raw_drop);
+    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = Context::from_waker(&waker);
+
+    let outcome = {
+        let mut fut = step_walk_v3(root_dentry.clone(), b"/dir", &cred, &guard);
+        let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        loop {
+            match pinned.as_mut().poll(&mut cx) {
+                Poll::Ready(o) => break o,
+                Poll::Pending => continue,
+            }
+        }
+    };
+    drop(guard);
+    match outcome {
+        V3::Done(d) => {
+            assert_eq!(d.name().as_bytes(), b"dir");
+        }
+        other => panic!("expected v3 Done(dir) against tmpfs, got {other:?}"),
+    }
+}

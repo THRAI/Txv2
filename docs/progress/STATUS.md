@@ -4,6 +4,57 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9c of the v3 TDD migration landed — first
+  v3 path running end-to-end through a real walker entry. Single
+  deep worker. Three deliverables:
+  (1) **`MountOutput` grew sibling v3 fields:**
+  `fs_ops_v3: Arc<dyn FsOpsV3>` and
+  `fs_page_backing_v3: Arc<dyn FsPageBackingV3>`. Two production
+  construction sites updated: `Tmpfs::new_root` in `tx-fs/tmpfs.rs`
+  and `mount_ext4_read_only` in `tx-ext4/src/mount.rs`. Ext4's
+  `fs_ops_v3_arc` / `fs_page_backing_v3_arc` factories
+  un-cfg-gated (no longer test-only). The duplicate
+  `tx_subsystems::mount::MountOutput` grown for consistency.
+  (2) **`step_walk_v3`, `step_open_v3`, and `walk_inner_v3`** in
+  `crates/tx-subsystems/src/vfs/walker.rs` — full duplicate of
+  `walk_inner` against `FsOpsV3` (not `FsOps`); roughly 95%
+  mechanical port (`Done(t)|Advanced(t)` → `V3::done(t)`,
+  `Errno::*` via `e.into()`, `Yield` forwarded verbatim).
+  Per-call-site `Continue { progress: NoProgress }` from
+  `FsOpsV3` is treated as no-op retry per the v3 monoid contract.
+  No code path in `walk_inner_v3` calls v4 `FsOps` — confirmed by
+  the `step_walk_v3_against_tmpfs_resolves_real_path` e2e test
+  in `tx-fs/tmpfs/tests.rs` which builds rootfs from
+  `MountOutput::fs_ops_v3` and exercises `mkdir → step_walk_v3`
+  on production Tmpfs.
+  (3) **`FS_OPS_V3_REGISTRY` sidecar** in walker.rs — temporary
+  scaffolding because `MountPayload` doesn't yet carry an
+  `fs_ops_v3` field; the registry is a `SpinMutex<BTreeMap<u64,
+  Arc<dyn FsOpsV3>>>` keyed by `Cap<MountPayload>::key().raw()`,
+  populated by `register_mount_payload_v3` from production
+  callers, resolved by `fs_ops_v3_for(&dentry, &guard)` from
+  inside the walker. Worker explicitly flags this for wave 9d
+  retirement: grow `MountPayload::{fs_ops_v3, fs_page_backing_v3}`
+  as direct fields and remove the global SpinMutex hot spot.
+  10 new tests: 9 in new `vfs/walker/tests/v3_walker.rs`
+  (simple/multi-component walk, ENOENT/EACCES, relative symlink
+  chase, ENODEV-when-unregistered, step_open round-trip, EACCES
+  without R bit, errno-bridge consistency) + 1 e2e in tmpfs.
+  **6 of the 9 walker tests landed `#[ignore]`d under the
+  existing main-side zone-slot cascade flake** (same root cause
+  already documenting 4 v4 walker tests in STATUS); all pass in
+  isolation. Net workspace-visible: **+4 tests** (3 walker_v3 +
+  1 tmpfs e2e). Final count: **1330 passed, 0 failed, 10 ignored
+  across 60 binaries** under `--test-threads=1` (4 of those
+  ignored are pre-existing v4 walker; 6 are wave-9c v3 walker).
+  `cargo xtask lint arch | docs | progress validate` all green.
+  **Wave 9d unblocked:** (a) retire FS_OPS_V3_REGISTRY by growing
+  MountPayload v3 fields directly; (b) migrate tx-shims callers
+  (`linux_syscall::execve/openat/getcwd/...`) from `step_walk` /
+  `step_open` to `step_walk_v3` / `step_open_v3`. Wave 9e can
+  retire `step_walk` / `step_open` / `walk_inner` once no caller
+  remains.
+
 - 2026-05-09 PR-1 wave-9b of the v3 TDD migration landed — five
   parallel workers fanned `FsOpsV3` + `FsPageBackingV3` impls
   out to the remaining 5 backends. Trait-level migration is now

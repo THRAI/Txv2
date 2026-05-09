@@ -425,6 +425,10 @@ impl FsPageBacking for TestFs {
 // file stays under the `cargo xtask lint arch` 1500-line authored-file
 // cap. The submodule has full visibility into `TestFs` via `super::`.
 mod v3;
+// Wave-9c end-to-end tests for `step_walk_v3` / `step_open_v3` live
+// alongside the wave-9a trait-impl tests. Same parent-module access
+// pattern (`use super::{TestFs, init_zones, block_on};`).
+mod v3_walker;
 
 // === fixture: rootfs + (optional) devfs at /dev =======================
 

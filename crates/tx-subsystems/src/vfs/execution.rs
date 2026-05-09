@@ -8,7 +8,7 @@
 use alloc::sync::Arc;
 
 use crate::execution::{Errno, Guard, StepOutcome};
-use crate::page_backed::FsPageBacking;
+use crate::page_backed::{FsPageBacking, FsPageBackingV3};
 use crate::tty;
 
 use super::structure::{
@@ -431,9 +431,19 @@ pub trait FsOpsV3: Send + Sync + 'static {
 /// Filesystem driver output produced at mount time and consumed by Mount
 /// to build the mount payload. Per `TX_EXT4_PLAN_v1_2.md` §pub-types and
 /// `bringup_fs_specs_v_1` §root-output.
+///
+/// Wave 9c grew the `fs_ops_v3` / `fs_page_backing_v3` sibling fields
+/// alongside the v4 `fs_ops` / `fs_page_backing` so the new walker
+/// entry points (`step_walk_v3` / `step_open_v3`) can route through the
+/// v3 trait surface end-to-end. Backends populate both pairs from the
+/// same `Arc<Self>`; the existing `fs_ops_v3_arc` / `fs_page_backing_v3_arc`
+/// factory methods on `Tmpfs`, `Devfs`, and `Ext4FsInstance` produce
+/// the v3-typed `Arc`s.
 pub struct MountOutput {
     pub fs_ops: Arc<dyn FsOps>,
+    pub fs_ops_v3: Arc<dyn FsOpsV3>,
     pub fs_page_backing: Arc<dyn FsPageBacking>,
+    pub fs_page_backing_v3: Arc<dyn FsPageBackingV3>,
     pub root_fs_object_id: FsObjectId,
     pub root_inode_meta: InodeMeta,
 }
