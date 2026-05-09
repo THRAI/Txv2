@@ -529,134 +529,12 @@ fn cap_raw_addr<T>(cap: &Cap<T>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::{Errno, Guard, StepOutcome};
-    use crate::page_backed::{Frame, FsPageBacking, PageContainerKind};
-    use crate::vfs::{Credential, DirCursor, DirEntry, FsOps, InodeKind, RNodeBacking};
+    use crate::execution::{Errno, Guard};
+    use crate::page_backed::{Frame, PageContainerKind};
+    use crate::vfs::{Credential, DirCursor, DirEntry, InodeKind, RNodeBacking};
 
     struct MockFs;
 
-    impl FsOps for MockFs {
-        fn lookup(
-            &self,
-            _parent: FsObjectId,
-            name: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<FsObjectId> {
-            if name == b"root" {
-                StepOutcome::Done(FsObjectId::ROOT)
-            } else {
-                StepOutcome::Err(Errno::ENOENT)
-            }
-        }
-
-        fn load_inode_meta(
-            &self,
-            _fs_object_id: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<InodeMeta> {
-            StepOutcome::Done(InodeMeta::new(InodeKind::Directory, 0o040755))
-        }
-
-        fn serialize_inode_meta(
-            &self,
-            _fs_object_id: FsObjectId,
-            _meta: &InodeMeta,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Done(())
-        }
-
-        fn create_inode(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _mode: u16,
-            _cred: &Credential,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn unlink(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _target: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn rename(
-            &self,
-            _old_parent: FsObjectId,
-            _old_name: &[u8],
-            _new_parent: FsObjectId,
-            _new_name: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn link(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _target: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn mkdir(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _mode: u16,
-            _cred: &Credential,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn rmdir(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _target: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn symlink(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _link_target: &[u8],
-            _cred: &Credential,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn readdir(
-            &self,
-            _fs_object_id: FsObjectId,
-            _cursor: DirCursor,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
-            StepOutcome::Done(None)
-        }
-
-        fn destroy_inode(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-            StepOutcome::Done(())
-        }
-    }
-
-    // v3 trait impls so MockFs can satisfy the v3 fields on
-    // `MountPayload`. Bodies match the v4 impl one-for-one, with
-    // every v4 outcome replaced by `tx_substrate::step_v3::*`.
     impl FsOpsV3 for MockFs {
         fn lookup(
             &self,
@@ -789,40 +667,6 @@ mod tests {
             _guard: &Guard<'_>,
         ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
             tx_substrate::step_v3::StepOutcome::done(())
-        }
-    }
-
-    impl FsPageBacking for MockFs {
-        fn fetch_page(
-            &self,
-            _fs_object_id: FsObjectId,
-            _offset: u64,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<Frame> {
-            StepOutcome::Err(Errno::ENOSYS)
-        }
-
-        fn flush_page(
-            &self,
-            _fs_object_id: FsObjectId,
-            _offset: u64,
-            _frame: &Frame,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn truncate(
-            &self,
-            _fs_object_id: FsObjectId,
-            _new_size: u64,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-            StepOutcome::Done(())
         }
     }
 

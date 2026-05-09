@@ -251,47 +251,6 @@ enum PageBackedIoKind {
     Write,
 }
 
-pub trait FsPageBacking: Send + Sync + 'static {
-    fn fetch_page(
-        &self,
-        fs_object_id: FsObjectId,
-        offset: u64,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<Frame>;
-
-    fn flush_page(
-        &self,
-        fs_object_id: FsObjectId,
-        offset: u64,
-        frame: &Frame,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<()>;
-
-    fn truncate(
-        &self,
-        fs_object_id: FsObjectId,
-        new_size: u64,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<()>;
-
-    fn fsync(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<()>;
-
-    /// Reserve space for future writes up to `new_size`. The default
-    /// implementation is `Done(())`: most filesystems can treat fallocate as
-    /// a hint. Backends that pre-allocate on-disk blocks override this.
-    fn fallocate(
-        &self,
-        _fs_object_id: FsObjectId,
-        _new_size: u64,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Done(())
-    }
-
-    fn supports_reflink(&self, _other: &PageContainer) -> bool {
-        false
-    }
-}
 
 #[derive(Debug)]
 pub struct MaterializedPage {

@@ -28,11 +28,11 @@ use tx_substrate::SpinMutex;
 use tx_subsystems::cred::Capability;
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::page_backed::{
-    step_truncate, AnonSwapPolicy, Frame, FsPageBacking, MaterializeAccess, PageContainer,
+    step_truncate, AnonSwapPolicy, Frame, MaterializeAccess, PageContainer,
     PageContainerKind, PageIndex,
 };
 use tx_subsystems::vfs::{
-    Credential, DirCursor, DirEntry, FsObjectId, FsOps, InlineName, InodeKind, InodeMeta,
+    Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
     MountOutput, RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
     VFS_NAME_MAX,
 };

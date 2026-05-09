@@ -33,22 +33,18 @@ use tx_substrate::SpinMutex;
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
-use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
 use tx_subsystems::page_backed::{
-    AnonSwapPolicy, Frame, FsPageBacking, MaterializeAccess, PageContainer, PageContainerKind,
-    PageIndex,
+    AnonSwapPolicy, MaterializeAccess, PageContainer, PageContainerKind, PageIndex,
 };
 use tx_subsystems::process::{bootstrap_init_process, step_chdir, ChdirOutcome, ProcessIdentity};
 use tx_subsystems::signal::{SigDisposition, Signum};
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vfs::structure::{
-    Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
-    RNodeBacking, S_IFDIR, S_IFREG,
+    Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
 };
-use tx_subsystems::vfs::FsOps;
 use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE};
 use tx_subsystems::zones;
 
@@ -279,240 +275,11 @@ impl ExecTestFs {
     }
 }
 
-impl FsOps for ExecTestFs {
-    fn lookup(
-        &self,
-        parent: FsObjectId,
-        name: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<FsObjectId> {
-        let inner = self.inner.lock();
-        let Some(map) = inner.children.get(&parent) else {
-            return StepOutcome::Err(Errno::ENOTDIR);
-        };
-        match map.get(name) {
-            Some(id) => StepOutcome::Done(*id),
-            None => StepOutcome::Err(Errno::ENOENT),
-        }
-    }
-
-    fn load_inode_meta(
-        &self,
-        fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<InodeMeta> {
-        let inner = self.inner.lock();
-        let Some(inode) = inner.inodes.get(&fs_object_id) else {
-            return StepOutcome::Err(Errno::ENOENT);
-        };
-        let meta = match inode {
-            ExecTestInode::Directory => InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
-            ExecTestInode::Regular {
-                size,
-                mode_bits,
-                uid,
-                gid,
-                ..
-            } => {
-                let mut meta = InodeMeta::new(InodeKind::Regular, S_IFREG | *mode_bits);
-                meta.size = *size;
-                meta.uid = *uid;
-                meta.gid = *gid;
-                meta
-            }
-        };
-        StepOutcome::Done(meta)
-    }
-
-    fn serialize_inode_meta(
-        &self,
-        _fs_object_id: FsObjectId,
-        _meta: &InodeMeta,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Done(())
-    }
-
-    fn create_inode(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn unlink(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn rename(
-        &self,
-        _old_parent: FsObjectId,
-        _old_name: &[u8],
-        _new_parent: FsObjectId,
-        _new_name: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn link(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn mkdir(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn rmdir(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn symlink(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _link_target: &[u8],
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn readdir(
-        &self,
-        _fs_object_id: FsObjectId,
-        _cursor: DirCursor,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
-        StepOutcome::Done(None)
-    }
-
-    fn destroy_inode(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-        StepOutcome::Done(())
-    }
-
-    fn read_link(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<Box<[u8]>> {
-        StepOutcome::Err(Errno::EINVAL)
-    }
-
-    fn materialise_rnode(
-        &self,
-        fs_object_id: FsObjectId,
-        meta: InodeMeta,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<Cap<RNode>> {
-        let inner = self.inner.lock();
-        let Some(inode) = inner.inodes.get(&fs_object_id) else {
-            return StepOutcome::Err(Errno::ENOENT);
-        };
-        match inode {
-            ExecTestInode::Regular { container, .. } => {
-                match RNode::new_cap(
-                    fs_object_id,
-                    meta,
-                    RNodeBacking::PageBacked {
-                        pc: container.clone(),
-                    },
-                ) {
-                    Ok(rnode) => StepOutcome::Done(rnode),
-                    Err(_) => StepOutcome::Err(Errno::ENOMEM),
-                }
-            }
-            ExecTestInode::Directory => StepOutcome::Err(Errno::EISDIR),
-        }
-    }
-}
-
-impl FsPageBacking for ExecTestFs {
-    fn fetch_page(
-        &self,
-        fs_object_id: FsObjectId,
-        offset: u64,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<Frame> {
-        let inner = self.inner.lock();
-        let container = match inner.inodes.get(&fs_object_id) {
-            Some(ExecTestInode::Regular { container, .. }) => container.clone(),
-            Some(ExecTestInode::Directory) => return StepOutcome::Err(Errno::EISDIR),
-            None => return StepOutcome::Err(Errno::ENOENT),
-        };
-        drop(inner);
-
-        let page_size = USER_PAGE_SIZE as u64;
-        if !offset.is_multiple_of(page_size) {
-            return StepOutcome::Err(Errno::EINVAL);
-        }
-        let page_index = PageIndex::new(offset / page_size);
-        match container.materialize_page(page_index, MaterializeAccess::Read, guard) {
-            StepOutcome::Done(materialised) => StepOutcome::Done(Frame::new(materialised.ppn)),
-            StepOutcome::Advanced(materialised) => {
-                StepOutcome::Advanced(Frame::new(materialised.ppn))
-            }
-            StepOutcome::AdvancedThenBlocked(materialised, token) => {
-                StepOutcome::AdvancedThenBlocked(Frame::new(materialised.ppn), token)
-            }
-            StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
-            StepOutcome::Err(errno) => StepOutcome::Err(errno),
-        }
-    }
-
-    fn flush_page(
-        &self,
-        _fs_object_id: FsObjectId,
-        _offset: u64,
-        _frame: &Frame,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Done(())
-    }
-
-    fn truncate(
-        &self,
-        _fs_object_id: FsObjectId,
-        _new_size: u64,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Done(())
-    }
-
-    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-        StepOutcome::Done(())
-    }
-}
-
-// Wave-9b `FsOpsV3` + `FsPageBackingV3` impls + tests on `ExecTestFs` live
-// in the sibling `v3` submodule (file: `script/tests/v3.rs`) so this
-// file stays under the `cargo xtask lint arch` 1500-line authored-file
-// cap. The submodule has full visibility into `ExecTestFs` via `super::`.
+// `FsOpsV3` + `FsPageBackingV3` impls + tests on `ExecTestFs` live in
+// the sibling `v3` submodule (file: `script/tests/v3.rs`). The v3 traits
+// are the sole `FsOps`-shaped surface; v4 `FsOps` / `FsPageBacking` were
+// retired as part of the v3-only unification. The submodule has full
+// visibility into `ExecTestFs` via `super::`.
 mod v3;
 
 // ---------------------------------------------------------------------------
