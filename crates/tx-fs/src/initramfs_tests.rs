@@ -5,12 +5,12 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use tx_substrate::step_v3::{Errno, NoProgress, StepOutcome};
 use tx_substrate::zone::Cap;
-use tx_subsystems::execution::{Errno, StepOutcome};
 use tx_subsystems::initramfs::{unpack_into_root_mount, UnpackError};
 use tx_subsystems::mount::{MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel};
 use tx_subsystems::vfs::{
-    DEntry, FsObjectId, FsOps, InlineName, InodeKind, RNode, RNodeBacking, S_IFMT,
+    DEntry, FsObjectId, FsOpsV3, InlineName, InodeKind, RNode, RNodeBacking, S_IFMT,
 };
 
 use crate::tmpfs::Tmpfs;
@@ -119,35 +119,38 @@ fn hex8(value: u32) -> [u8; 8] {
 }
 
 /// Walk the mount's root, look up `name`, and return the resolved id.
-fn lookup_in_root(mount: &Cap<MountIdentity>, name: &[u8]) -> StepOutcome<FsObjectId> {
+fn lookup_in_root(
+    mount: &Cap<MountIdentity>,
+    name: &[u8],
+) -> StepOutcome<FsObjectId, NoProgress> {
     let payload = mount
         .payload_cap()
         .expect("mount payload alive in test")
         .into_cap();
     let root_id = mount.root().fs_object_id();
     let guard = tx_substrate::epoch::guard();
-    payload.fs_ops.lookup(root_id, name, &guard)
+    payload.fs_ops_v3.lookup(root_id, name, &guard)
 }
 
 fn lookup_in(
     mount: &Cap<MountIdentity>,
     parent: FsObjectId,
     name: &[u8],
-) -> StepOutcome<FsObjectId> {
+) -> StepOutcome<FsObjectId, NoProgress> {
     let payload = mount
         .payload_cap()
         .expect("mount payload alive in test")
         .into_cap();
     let guard = tx_substrate::epoch::guard();
-    payload.fs_ops.lookup(parent, name, &guard)
+    payload.fs_ops_v3.lookup(parent, name, &guard)
 }
 
-fn fs_ops_of(mount: &Cap<MountIdentity>) -> Arc<dyn FsOps> {
+fn fs_ops_of(mount: &Cap<MountIdentity>) -> Arc<dyn FsOpsV3> {
     mount
         .payload_cap()
         .expect("mount payload alive in test")
         .into_cap()
-        .fs_ops
+        .fs_ops_v3
         .clone()
 }
 

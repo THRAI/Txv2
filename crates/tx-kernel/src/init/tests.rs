@@ -1306,7 +1306,7 @@ fn boot_smoke_setuid_exec_seeds_post_setuid_euid_and_at_secure() {
 /// vs `/init`) and (b) the post-creation chown + chmod to install
 /// the setuid mode + non-root owner.
 fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
-    use tx_subsystems::execution::StepOutcome;
+    use tx_substrate::step_v3::StepOutcome;
     use tx_subsystems::vfs::{Credential, RNodeBacking, S_ISUID};
 
     let root_mount =
@@ -1315,13 +1315,13 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
         .payload_cap()
         .expect("rootfs payload alive in test")
         .into_cap()
-        .fs_ops
+        .fs_ops_v3
         .clone();
     let fs_page_backing = root_mount
         .payload_cap()
         .expect("rootfs payload alive in test")
         .into_cap()
-        .fs_page_backing
+        .fs_page_backing_v3
         .clone();
     let root_object_id = root_mount.root().fs_object_id();
 
@@ -1386,7 +1386,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     {
         let guard = tx_substrate::epoch::guard();
         match fs_page_backing.truncate(file_id, size, &guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+            StepOutcome::Done(()) => {}
             other => panic!("register_setuid_fixture: truncate({size}): {other:?}"),
         }
     }
@@ -1397,7 +1397,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     {
         let guard = tx_substrate::epoch::guard();
         match fs_ops.step_chown(file_id, Some(file_uid), Some(file_gid), &cred, &guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+            StepOutcome::Done(()) => {}
             other => {
                 panic!("register_setuid_fixture: step_chown({file_uid}, {file_gid}): {other:?}")
             }
@@ -1413,7 +1413,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     {
         let guard = tx_substrate::epoch::guard();
         match fs_ops.step_chmod(file_id, new_mode, &cred, &guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+            StepOutcome::Done(()) => {}
             other => panic!("register_setuid_fixture: step_chmod({new_mode:#o}): {other:?}"),
         }
     }
