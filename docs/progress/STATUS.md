@@ -4,6 +4,48 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9d (c) of the v3 TDD migration landed —
+  **all remaining tx-shims production callers migrated to the v3
+  walker.** Six `step_walk` call sites + one `step_open` call
+  site flipped from v4 to v3 across:
+  `crates/tx-shims/src/linux_syscall/fs_path.rs` (lines 447,
+  582 — beyond the wave 9d (b) `resolve_path_at` site),
+  `fs_mut.rs` (lines 73, 113 — mkdir/file-mutation parent
+  resolution + post-create re-walk),
+  `fs_basic.rs` (lines 226, 288, 930 — openat first-walk,
+  step_open materialisation, getcwd-related re-walk).
+  Each site applies the same wave 9d (b) pattern: 5-variant v4
+  match → 4-variant v3 match (`Done | Continue/Yield | Err`),
+  defensive `Continue/Yield` arms map to `EIO`, errno conversion
+  via the wave 9d (b) reverse `From<step_v3::Errno>` bridge.
+  The fs_basic.rs:226 `openat` first-walk site has the more
+  interesting shape: it pattern-matches on `V3::Err(V3Errno::ENOENT)`
+  to fall through to `create_then_walk` for `O_CREAT` paths,
+  preserving the v4 semantics through the v3 errno enum.
+  Module import in `linux_syscall/mod.rs:77` updated:
+  `use tx_subsystems::vfs::{step_open_v3, step_walk_v3, ...}`
+  (v4 names removed). **tx-shims linux_syscall is now 100% v3
+  walker.** All chmod, chown, mkdir, rmdir, unlinkat, renameat2,
+  symlinkat, linkat, openat, getcwd-family syscalls traverse
+  `syscall arm → fs_path/fs_mut/fs_basic helper → step_walk_v3
+  /step_open_v3 → walk_inner_v3 → MountPayload::fs_ops_v3 →
+  <Tmpfs/Devfs/Ext4 as FsOpsV3>::method`. Pre-existing tests
+  pass without modification — the v3 cascade preserves v4
+  semantics across every syscall arm. v4 `step_walk`/`step_open`
+  fns continue to exist (used by walker.rs's own v4 `step_open`
+  definition, tx-kernel/init/tests, and tx-subsystems walker
+  tests). Final count: **1328 passed, 0 failed, 11 ignored
+  across 60 binaries** (unchanged from wave 9d (b) baseline —
+  no new tests; the load-bearing pin is that existing tests
+  pass with v3-walker dispatch). All lints + progress validate
+  green. **Wave 9e unblocked:** retire v4 `step_walk`,
+  `step_open`, `walk_inner`, and the v4 trait-method calls
+  inside `walk_inner_v3` (it currently still exists as a
+  separate fn alongside walk_inner). Then begin retiring v4
+  `FsOps` and `FsPageBacking` traits, working from the impl
+  side (delete `impl FsOps for X` blocks) up to the trait
+  declaration.
+
 - 2026-05-09 PR-1 wave-9d (b) of the v3 TDD migration landed —
   **first tx-shims production caller migrated to the v3 walker.**
   `crates/tx-shims/src/linux_syscall/fs_path.rs::resolve_path_at`

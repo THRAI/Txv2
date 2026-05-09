@@ -444,14 +444,16 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let walker_cred = ctx.walker_cred();
     let dentry: Cap<DEntry> = {
         let guard = tx_substrate::epoch::guard();
-        let outcome = poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard));
+        // Wave 9d (c): migrated to v3 walker (step_walk_v3 + 4-variant outcome).
+        use tx_substrate::step_v3::StepOutcome as V3;
+        let outcome = poll_walker_synchronously(step_walk_v3(cwd, &path, &walker_cred, &guard));
         drop(guard);
         match outcome {
-            StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            V3::Done(d) => d,
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
         }
     };
 
@@ -579,11 +581,13 @@ pub(super) fn walk_from(
     cred: &Credential,
 ) -> Result<Cap<DEntry>, i32> {
     let guard = tx_substrate::epoch::guard();
-    let outcome = poll_walker_synchronously(step_walk(cwd, path, cred, &guard));
+    // Wave 9d (c): migrated to v3 walker.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let outcome = poll_walker_synchronously(step_walk_v3(cwd, path, cred, &guard));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) | StepOutcome::Advanced(d) => Ok(d),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => Err(EIO_VALUE),
-        StepOutcome::Err(errno) => Err(errno_to_i32(errno)),
+        V3::Done(d) => Ok(d),
+        V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
+        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
     }
 }
