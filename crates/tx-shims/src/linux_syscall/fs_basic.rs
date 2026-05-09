@@ -599,14 +599,27 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         _ => return SyscallResult::Error(errno_to_i32(Errno::ENOTTY)),
     };
 
+    // v3 step_ioctl_* return Done/Err only in practice; helper to
+    // collapse the four-variant catalog into a v4 Errno-or-value.
+    use tx_substrate::step_v3::StepOutcome as V3Out;
+    fn unwrap_v3<T>(
+        v: V3Out<T, tx_substrate::step_v3::NoProgress>,
+    ) -> Result<T, Errno> {
+        match v {
+            V3Out::Done(t) => Ok(t),
+            V3Out::Err(e) => Err(e.into()),
+            V3Out::Continue { .. } | V3Out::Yield { .. } => Err(Errno::EIO),
+        }
+    }
+
     match request {
         TCGETS => {
             let outcome = {
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tcgets(&tty, &guard)
             };
-            match outcome {
-                StepOutcome::Done(termios) | StepOutcome::Advanced(termios) => {
+            match unwrap_v3(outcome) {
+                Ok(termios) => {
                     if argp == 0 {
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
@@ -616,10 +629,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     }
                     SyscallResult::Return(0)
                 }
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TCSETS | TCSETSW | TCSETSF => {
@@ -639,12 +649,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tcsets(&tty, new_termios, &guard)
             };
-            match outcome {
-                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TIOCGPGRP => {
@@ -652,8 +659,8 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tiocgpgrp(&tty, &guard)
             };
-            match outcome {
-                StepOutcome::Done(pgid) | StepOutcome::Advanced(pgid) => {
+            match unwrap_v3(outcome) {
+                Ok(pgid) => {
                     if argp == 0 {
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
@@ -662,10 +669,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     }
                     SyscallResult::Return(0)
                 }
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TIOCSPGRP => {
@@ -681,12 +685,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tiocspgrp(&tty, caller, new_pgrp, &guard)
             };
-            match outcome {
-                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TIOCGWINSZ => {
@@ -694,8 +695,8 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tiocgwinsz(&tty, &guard)
             };
-            match outcome {
-                StepOutcome::Done(ws) | StepOutcome::Advanced(ws) => {
+            match unwrap_v3(outcome) {
+                Ok(ws) => {
                     if argp == 0 {
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
@@ -704,10 +705,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     }
                     SyscallResult::Return(0)
                 }
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TIOCSWINSZ => {
@@ -722,12 +720,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tiocswinsz(&tty, ws, &guard)
             };
-            match outcome {
-                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TIOCSCTTY => {
@@ -741,12 +736,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tiocsctty(&tty, caller, &guard)
             };
-            match outcome {
-                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TIOCNOTTY => {
@@ -755,12 +747,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tiocnotty(&tty, caller, &guard)
             };
-            match outcome {
-                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         // Unknown ioctl request → -ENOTTY (the POSIX `man ioctl_tty`

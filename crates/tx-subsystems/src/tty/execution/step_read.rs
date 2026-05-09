@@ -4,7 +4,7 @@ use core::sync::atomic::Ordering;
 
 use tx_substrate::zone::Cap;
 
-use crate::execution::{Guard, StepOutcome, WaitToken};
+use crate::execution::Guard;
 use crate::tty::checks::{
     background_read_signal, require_fg_pgrp, require_fg_pgrp_for, require_live_tty,
 };
@@ -14,25 +14,31 @@ use crate::tty::structure::TtyIdentity;
 
 /// Drain bytes from a live TTY input queue into `out`.
 ///
-/// Empty queue returns `Blocked(input_readable)`. A canonical VEOF on an empty
-/// line returns `Done(0)` once via `eof_pending`.
-pub fn step_read(tty: &Cap<TtyIdentity>, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize> {
+/// Empty queue returns a `Yield` on the TTY's wait carrier. A canonical
+/// VEOF on an empty line returns `Done(0)` once via `eof_pending`.
+pub fn step_read(
+    tty: &Cap<TtyIdentity>,
+    out: &mut [u8],
+    guard: &Guard<'_>,
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
+
     if out.is_empty() {
-        return StepOutcome::Done(0);
+        return V3::Done(0);
     }
 
     if let Err(err) = require_fg_pgrp(tty, guard) {
-        return StepOutcome::Err(err);
+        return V3::Err(err.into());
     }
 
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     if payload.eof_pending.swap(false, Ordering::AcqRel) {
         tty.input_readable.clear(TTY_READABLE);
-        return StepOutcome::Done(0);
+        return V3::Done(0);
     }
 
     let vmin_policy = payload.with_termios(|termios| {
@@ -71,15 +77,15 @@ pub fn step_read(tty: &Cap<TtyIdentity>, out: &mut [u8], guard: &Guard<'_>) -> S
     // bytes arrive. Threshold / VMIN logic comes from main's
     // 2026-05-06 tty work.
     if threshold_unmet {
-        StepOutcome::Blocked(WaitToken::new(tty.wait_carrier_id(), TTY_READABLE))
+        V3::yield_on_carrier(ByteProgress::EMPTY, tty.wait_carrier_id(), TTY_READABLE)
     } else if copied == 0 {
         if matches!(vmin_policy, Some(0)) {
-            StepOutcome::Done(0)
+            V3::Done(0)
         } else {
-            StepOutcome::Blocked(WaitToken::new(tty.wait_carrier_id(), TTY_READABLE))
+            V3::yield_on_carrier(ByteProgress::EMPTY, tty.wait_carrier_id(), TTY_READABLE)
         }
     } else {
-        StepOutcome::Done(copied)
+        V3::Done(copied)
     }
 }
 
@@ -88,14 +94,16 @@ pub fn step_read_for_caller(
     out: &mut [u8],
     caller: super::IoctlCaller,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
+
     if out.is_empty() {
-        return StepOutcome::Done(0);
+        return V3::Done(0);
     }
 
     if let Err(err) = require_fg_pgrp_for(tty, Some(caller)) {
         let _ = background_read_signal(tty, caller);
-        return StepOutcome::Err(err);
+        return V3::Err(err.into());
     }
 
     step_read(tty, out, guard)
@@ -106,14 +114,16 @@ pub fn step_read_for_process(
     out: &mut [u8],
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
+
     let caller_info = match super::IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     if out.is_empty() {
-        return StepOutcome::Done(0);
+        return V3::Done(0);
     }
 
     if let Err(err) = require_fg_pgrp_for(tty, Some(caller_info)) {
@@ -121,7 +131,7 @@ pub fn step_read_for_process(
         let _ = super::step_ioctl::deliver_signal_dispatch_for_process_with_guard(
             caller, dispatch, guard,
         );
-        return StepOutcome::Err(err);
+        return V3::Err(err.into());
     }
 
     step_read(tty, out, guard)

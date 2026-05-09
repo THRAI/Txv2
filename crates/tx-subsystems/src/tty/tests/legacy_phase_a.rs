@@ -8,7 +8,17 @@ use alloc::vec::Vec;
 use tx_substrate::zone::{self, Cap, PayloadCap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use crate::execution::{Errno, Guard, StepOutcome};
+// `StepOutcome` here resolves to the v3 outcome shape because most of
+// the assertions in this file go against tty step fns that return
+// `tx_substrate::step_v3::StepOutcome`. The few v4-shaped surfaces
+// (`CharDeviceOps` trait impls, `register_hardware`, `register_console_alias`,
+// `vfs::OpenFile::step_*`) refer to the v4 outcome type via the explicit
+// `crate::execution::StepOutcome` path or the `V4Out`/`V4Errno` aliases below.
+use crate::execution::Guard;
+use crate::execution::Errno as V4Errno;
+use crate::execution::StepOutcome as V4Out;
+use tx_substrate::step_v3::Errno;
+use tx_substrate::step_v3::StepOutcome;
 use crate::test_support::EPOCH_TEST_LOCK as TTY_ZONE_TEST_LOCK;
 use crate::tty::execution::{
     register_console_alias, register_hardware, step_hangup, step_ingest, step_ioctl_tcgets,
@@ -29,12 +39,12 @@ use crate::vfs::{Credential, DirCursor, FsOps, InodeKind};
 struct NoopOps;
 
 impl CharDeviceOps for NoopOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(0)
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> V4Out<usize> {
+        V4Out::Done(0)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(bytes.len())
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> V4Out<usize> {
+        V4Out::Done(bytes.len())
     }
 }
 
@@ -64,20 +74,20 @@ impl ScriptedReadOps {
 }
 
 impl CharDeviceOps for ScriptedReadOps {
-    fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+    fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> V4Out<usize> {
         let mut script = self.script.lock().expect("script lock");
         let copied = out.len().min(script.len());
         out[..copied].copy_from_slice(&script[..copied]);
         script.drain(..copied);
-        StepOutcome::Done(copied)
+        V4Out::Done(copied)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> V4Out<usize> {
         self.writes
             .lock()
             .expect("writes lock")
             .push(bytes.to_vec());
-        StepOutcome::Done(bytes.len())
+        V4Out::Done(bytes.len())
     }
 }
 
@@ -455,7 +465,7 @@ fn step_ingest_commits_cooked_line_and_step_read_drains_it() {
     );
     assert!(matches!(
         step_read(&tty, &mut out, &guard),
-        StepOutcome::Blocked(_)
+        StepOutcome::Yield { .. }
     ));
 
     let outcome = step_ingest(&tty, b"\n", &guard);
@@ -516,13 +526,12 @@ fn step_write_to_pty_peer_ingests_peer_input() {
     );
     let mut out = [0u8; 8];
 
-    use tx_substrate::step_v3::StepOutcome as V3Out;
-    assert_eq!(step_write(&writer, b"hi", &guard), V3Out::Done(2));
+    assert_eq!(step_write(&writer, b"hi", &guard), StepOutcome::Done(2));
     assert!(matches!(
         step_read(&peer, &mut out, &guard),
-        StepOutcome::Blocked(_)
+        StepOutcome::Yield { .. }
     ));
-    assert_eq!(step_write(&writer, b"\n", &guard), V3Out::Done(1));
+    assert_eq!(step_write(&writer, b"\n", &guard), StepOutcome::Done(1));
     assert_eq!(step_read(&peer, &mut out, &guard), StepOutcome::Done(3));
     assert_eq!(&out[..3], b"hi\n");
 }
@@ -534,27 +543,27 @@ fn project_devfs_materializes_hardware_tty_and_console_alias() {
     let guard = tx_substrate::epoch::guard();
 
     let tty = match register_hardware("ttyS0", 0, &NOOP_BINDING, &guard) {
-        StepOutcome::Done(tty) => tty,
+        V4Out::Done(tty) => tty,
         other => panic!("register_hardware failed: {other:?}"),
     };
     assert_eq!(
         register_console_alias("console", tty.clone()),
-        StepOutcome::Done(())
+        V4Out::Done(())
     );
 
     let by_name = match crate::tty::project::devfs_tty_by_name(b"ttyS0", &guard) {
-        StepOutcome::Done(tty) => tty,
+        V4Out::Done(tty) => tty,
         other => panic!("ttyS0 lookup failed: {other:?}"),
     };
     let console = match crate::tty::project::devfs_tty_by_name(b"console", &guard) {
-        StepOutcome::Done(tty) => tty,
+        V4Out::Done(tty) => tty,
         other => panic!("console lookup failed: {other:?}"),
     };
     assert_eq!(by_name, tty);
     assert_eq!(console, tty);
 
     let rnode = match crate::tty::project::devfs_rnode_by_name(b"console", &guard) {
-        StepOutcome::Done(rnode) => rnode,
+        V4Out::Done(rnode) => rnode,
         other => panic!("console rnode failed: {other:?}"),
     };
     assert!(matches!(
@@ -572,20 +581,20 @@ fn project_open_devfs_tty_by_name_shares_identity_between_console_and_ttys0() {
     let guard = tx_substrate::epoch::guard();
 
     let tty = match register_hardware("ttyS0", 0, &NOOP_BINDING, &guard) {
-        StepOutcome::Done(tty) => tty,
+        V4Out::Done(tty) => tty,
         other => panic!("register_hardware failed: {other:?}"),
     };
     assert_eq!(
         register_console_alias("console", tty.clone()),
-        StepOutcome::Done(())
+        V4Out::Done(())
     );
 
     let ttys0_file = match crate::tty::project::open_devfs_tty_by_name(b"ttyS0", &guard) {
-        StepOutcome::Done(file) => file,
+        V4Out::Done(file) => file,
         other => panic!("open ttyS0 failed: {other:?}"),
     };
     let console_file = match crate::tty::project::open_devfs_tty_by_name(b"console", &guard) {
-        StepOutcome::Done(file) => file,
+        V4Out::Done(file) => file,
         other => panic!("open console failed: {other:?}"),
     };
 
@@ -604,11 +613,11 @@ fn project_open_devfs_tty_by_name_shares_identity_between_console_and_ttys0() {
 
     assert_eq!(
         ttys0_file.step_write(b"ttyS0\n", &guard),
-        StepOutcome::Done(6)
+        V4Out::Done(6)
     );
     assert_eq!(
         console_file.step_write(b"console\n", &guard),
-        StepOutcome::Done(8)
+        V4Out::Done(8)
     );
 }
 
@@ -626,12 +635,12 @@ fn step_poll_hardware_input_ingests_uart_bytes_into_registered_console_tty() {
     }));
 
     let tty = match register_hardware("ttyS1", 1, binding, &guard) {
-        StepOutcome::Done(tty) => tty,
+        V4Out::Done(tty) => tty,
         other => panic!("register_hardware failed: {other:?}"),
     };
     assert_eq!(
         register_console_alias("console", tty.clone()),
-        StepOutcome::Done(())
+        V4Out::Done(())
     );
 
     let outcome = step_poll_hardware_input(&tty, 16, &guard);
@@ -651,13 +660,13 @@ fn step_poll_hardware_input_ingests_uart_bytes_into_registered_console_tty() {
     );
 
     let console_file = match crate::tty::project::open_devfs_tty_by_name(b"console", &guard) {
-        StepOutcome::Done(file) => file,
+        V4Out::Done(file) => file,
         other => panic!("open console failed: {other:?}"),
     };
     let mut out = [0u8; 16];
     assert_eq!(
         console_file.step_read(&mut out, &guard),
-        StepOutcome::Done(6)
+        V4Out::Done(6)
     );
     assert_eq!(&out[..6], b"hello\n");
 
@@ -998,7 +1007,7 @@ fn tcsets_flushes_pending_cooked_buffer_into_read_queue() {
     let mut out = [0u8; 16];
     assert!(matches!(
         step_read(&tty, &mut out, &guard),
-        StepOutcome::Blocked(_)
+        StepOutcome::Yield { .. }
     ));
 
     let mut raw_mode = match step_ioctl_tcgets(&tty, &guard) {
@@ -1056,7 +1065,7 @@ fn step_hangup_and_master_close_drop_payload_and_emit_signals() {
     assert_eq!(tty.session_pgrp(), None);
 
     let pty = match crate::tty::project::open_ptmx(&guard) {
-        StepOutcome::Done(pty) => pty,
+        V4Out::Done(pty) => pty,
         other => panic!("open_ptmx failed: {other:?}"),
     };
     pty.slave
@@ -1084,7 +1093,7 @@ fn slave_close_does_not_hangup_master() {
     let guard = tx_substrate::epoch::guard();
 
     let pty = match crate::tty::project::open_ptmx(&guard) {
-        StepOutcome::Done(pty) => pty,
+        V4Out::Done(pty) => pty,
         other => panic!("open_ptmx failed: {other:?}"),
     };
 
@@ -1153,7 +1162,7 @@ fn pty_registry_unregister_removes_entry_and_next_open_reuses_slot_space() {
     let guard = tx_substrate::epoch::guard();
 
     let first = match crate::tty::project::open_ptmx(&guard) {
-        StepOutcome::Done(pty) => pty,
+        V4Out::Done(pty) => pty,
         other => panic!("first open_ptmx failed: {other:?}"),
     };
     assert!(crate::tty::structure::registry::contains_pty_slave(
@@ -1166,11 +1175,11 @@ fn pty_registry_unregister_removes_entry_and_next_open_reuses_slot_space() {
     ));
     assert!(matches!(
         crate::tty::project::devpts_slave_by_index(first.index, &guard),
-        StepOutcome::Err(Errno::ENOENT)
+        V4Out::Err(V4Errno::ENOENT)
     ));
 
     let second = match crate::tty::project::open_ptmx(&guard) {
-        StepOutcome::Done(pty) => pty,
+        V4Out::Done(pty) => pty,
         other => panic!("second open_ptmx failed: {other:?}"),
     };
     assert!(
@@ -1186,15 +1195,15 @@ fn pty_index_allocation_is_monotonic_while_entries_remain_live() {
     let guard = tx_substrate::epoch::guard();
 
     let first = match crate::tty::project::open_ptmx(&guard) {
-        StepOutcome::Done(pty) => pty,
+        V4Out::Done(pty) => pty,
         other => panic!("first open_ptmx failed: {other:?}"),
     };
     let second = match crate::tty::project::open_ptmx(&guard) {
-        StepOutcome::Done(pty) => pty,
+        V4Out::Done(pty) => pty,
         other => panic!("second open_ptmx failed: {other:?}"),
     };
     let third = match crate::tty::project::open_ptmx(&guard) {
-        StepOutcome::Done(pty) => pty,
+        V4Out::Done(pty) => pty,
         other => panic!("third open_ptmx failed: {other:?}"),
     };
 
@@ -1210,17 +1219,17 @@ fn project_open_ptmx_registers_devpts_slave_and_files_are_usable() {
     let guard = tx_substrate::epoch::guard();
 
     let pty = match crate::tty::project::open_ptmx(&guard) {
-        StepOutcome::Done(pty) => pty,
+        V4Out::Done(pty) => pty,
         other => panic!("open_ptmx failed: {other:?}"),
     };
     let slave = match crate::tty::project::devpts_slave_by_index(pty.index, &guard) {
-        StepOutcome::Done(slave) => slave,
+        V4Out::Done(slave) => slave,
         other => panic!("devpts slave lookup failed: {other:?}"),
     };
     assert_eq!(slave, pty.slave);
 
     let slave_rnode = match crate::tty::project::devpts_rnode_by_index(pty.index, &guard) {
-        StepOutcome::Done(rnode) => rnode,
+        V4Out::Done(rnode) => rnode,
         other => panic!("devpts rnode failed: {other:?}"),
     };
     assert!(matches!(
@@ -1232,12 +1241,12 @@ fn project_open_ptmx_registers_devpts_slave_and_files_are_usable() {
 
     assert_eq!(
         pty.master_file.step_write(b"from master\n", &guard),
-        StepOutcome::Done(12)
+        V4Out::Done(12)
     );
     let mut out = [0u8; 16];
     assert_eq!(
         pty.slave_file.step_read(&mut out, &guard),
-        StepOutcome::Done(12)
+        V4Out::Done(12)
     );
     assert_eq!(&out[..12], b"from master\n");
 }
@@ -1250,26 +1259,28 @@ fn devpts_fs_lookup_meta_and_readdir_follow_registry() {
     let devpts = crate::tty::project::DevptsInstance;
 
     let p0 = match crate::tty::project::open_ptmx(&guard) {
-        StepOutcome::Done(pty) => pty,
+        V4Out::Done(pty) => pty,
         other => panic!("first open_ptmx failed: {other:?}"),
     };
     let p1 = match crate::tty::project::open_ptmx(&guard) {
-        StepOutcome::Done(pty) => pty,
+        V4Out::Done(pty) => pty,
         other => panic!("second open_ptmx failed: {other:?}"),
     };
 
     {
-        use tx_substrate::step_v3::{Errno, StepOutcome};
+        // Note: file-level `Errno`/`StepOutcome` already alias to v3 — no
+        // shadow needed here. The devpts `lookup` / `load_inode_meta` /
+        // `readdir` already return v3 outcomes.
         assert_eq!(
             devpts.lookup(crate::tty::project::DEVPTS_ROOT_OBJECT_ID, b"ptmx", &guard),
             StepOutcome::Done(crate::tty::project::DEVPTS_PTMX_OBJECT_ID)
         );
         let slave0_rnode = match crate::tty::project::devpts_rnode_by_index(p0.index, &guard) {
-            super::super::super::execution::StepOutcome::Done(rnode) => rnode,
+            V4Out::Done(rnode) => rnode,
             other => panic!("devpts slave 0 rnode failed: {other:?}"),
         };
         let slave1_rnode = match crate::tty::project::devpts_rnode_by_index(p1.index, &guard) {
-            super::super::super::execution::StepOutcome::Done(rnode) => rnode,
+            V4Out::Done(rnode) => rnode,
             other => panic!("devpts slave 1 rnode failed: {other:?}"),
         };
         assert_eq!(

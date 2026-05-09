@@ -105,12 +105,21 @@ fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usiz
             },
             TtyTransport::Pty { .. } => StepOutcome::Err(Errno::EIO),
         },
-        Kick::Pty(peer) => match step_ingest(&peer, &chunk, guard) {
-            StepOutcome::Done(_) | StepOutcome::Advanced(_) => StepOutcome::Done(chunk.len()),
-            StepOutcome::Err(err) => StepOutcome::Err(err),
-            StepOutcome::Blocked(wait) => StepOutcome::Blocked(wait),
-            StepOutcome::AdvancedThenBlocked(_, wait) => StepOutcome::Blocked(wait),
-        },
+        Kick::Pty(peer) => {
+            use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
+            match step_ingest(&peer, &chunk, guard) {
+                V3Out::Done(_) | V3Out::Continue { .. } => StepOutcome::Done(chunk.len()),
+                V3Out::Err(e) => StepOutcome::Err(e.into()),
+                V3Out::Yield {
+                    shape: YieldShape::OnCarrier { carrier, interests },
+                    ..
+                } => StepOutcome::Blocked(crate::execution::WaitToken::new(
+                    carrier.raw(),
+                    interests.raw(),
+                )),
+                V3Out::Yield { .. } => StepOutcome::Err(Errno::EIO),
+            }
+        }
     }
 }
 

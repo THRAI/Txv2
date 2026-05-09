@@ -163,15 +163,18 @@ fn open_file_dispatches_struct_payload_read_write() {
         tty_file.step_read(&mut out, &guard),
         StepOutcome::Blocked(_)
     ));
-    assert_eq!(
-        crate::tty::execution::step_ingest(&tty, b"ok\n", &guard),
-        StepOutcome::Done(crate::tty::execution::IngestOutcome {
-            consumed: 3,
-            readable_fired: true,
-            writable_fired: true,
-            ..Default::default()
-        })
-    );
+    {
+        use tx_substrate::step_v3::StepOutcome as V3Out;
+        assert_eq!(
+            crate::tty::execution::step_ingest(&tty, b"ok\n", &guard),
+            V3Out::Done(crate::tty::execution::IngestOutcome {
+                consumed: 3,
+                readable_fired: true,
+                writable_fired: true,
+                ..Default::default()
+            })
+        );
+    }
     assert_eq!(tty_file.step_read(&mut out, &guard), StepOutcome::Done(3));
     assert_eq!(&out[..3], b"ok\n");
     assert_eq!(tty_file.step_write(b"x", &guard), StepOutcome::Done(1));

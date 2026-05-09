@@ -18,7 +18,6 @@ use tx_hal::{
     ConsoleIf, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, IRQ_DISPATCH_TABLE_SIZE,
 };
 use tx_substrate::SpinMutex;
-use tx_subsystems::execution::StepOutcome;
 use tx_subsystems::tty::execution::step_ingest;
 
 /// The single global IRQ dispatch table tx-kernel publishes to the
@@ -137,8 +136,9 @@ pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
         return IrqHandled::NotMine;
     };
     let guard = tx_substrate::epoch::guard();
+    use tx_substrate::step_v3::StepOutcome as V3Out;
     match step_ingest(&tty, &buf[..n], &guard) {
-        StepOutcome::Done(outcome) => {
+        V3Out::Done(outcome) => {
             if outcome.consumed > 0 {
                 IrqHandled::Wake
             } else {

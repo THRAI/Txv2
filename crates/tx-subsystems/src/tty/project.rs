@@ -114,7 +114,12 @@ pub fn devfs_rnode_by_name(name: &[u8], guard: &Guard<'_>) -> StepOutcome<Cap<RN
 /// Open `/dev/ptmx`-shaped pty master. Full path-walk/fd-table layers can wrap
 /// this and install `master_file` into the caller's fd table.
 pub fn open_ptmx(guard: &Guard<'_>) -> StepOutcome<execution::OpenPtyOutcome> {
-    execution::step_openpty(guard)
+    use tx_substrate::step_v3::StepOutcome as V3;
+    match execution::step_openpty(guard) {
+        V3::Done(out) => StepOutcome::Done(out),
+        V3::Err(e) => StepOutcome::Err(e.into()),
+        V3::Continue { .. } | V3::Yield { .. } => StepOutcome::Err(Errno::EIO),
+    }
 }
 
 /// Open a devfs hardware/alias TTY entry such as `/dev/ttyS0` or `/dev/console`.

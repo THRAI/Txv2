@@ -8,7 +8,9 @@ use tx_substrate::testing::init_host_for_test_once;
 use tx_substrate::zone::{self, Cap, PayloadCap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use crate::execution::{Guard, StepOutcome};
+use crate::execution::Guard;
+use crate::execution::StepOutcome as V4Out;
+use tx_substrate::step_v3::StepOutcome;
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ExitStatus, Pgid};
 use crate::process::{
@@ -30,12 +32,12 @@ use crate::zones;
 struct NoopOps;
 
 impl CharDeviceOps for NoopOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(0)
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> V4Out<usize> {
+        V4Out::Done(0)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(bytes.len())
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> V4Out<usize> {
+        V4Out::Done(bytes.len())
     }
 }
 
@@ -335,7 +337,7 @@ fn step_read_for_process_posts_sigttin_to_background_caller_pgrp() {
     let mut out = [0u8; 1];
     assert_eq!(
         step_read_for_process(&tty, &mut out, &child, &guard),
-        StepOutcome::Err(crate::execution::Errno::EIO)
+        StepOutcome::Err(tx_substrate::step_v3::Errno::EIO)
     );
     assert!(leader_pending(&child, Signum::SIGTTIN));
 }
