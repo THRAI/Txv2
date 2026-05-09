@@ -709,3 +709,218 @@ fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
     assert_eq!(fs.fallocates.load(Ordering::Acquire), 0);
     assert_eq!(pc.size_bytes(), stable_size);
 }
+
+// === FsOpsV3 prototype impl + tests ====================================
+//
+// Wave-8 design + prototype slice for the trait migration. Per
+// `docs/progress/decisions/2026-05-09-fsops-v3-design.md`, `LifecycleFs`
+// is the smallest test-only `FsOps` impl in the workspace — it lives
+// next to wave-7's `step_truncate_v3`/`step_fsync_v3` work, so the
+// `FsOpsV3` impl gets validated against the same fixture that already
+// exercises the v3 sibling fns. Wave 9 fans out to the remaining
+// seven impls (`Tmpfs`, `Devfs`, `Ext4FsInstance`, `DevptsInstance`,
+// `TestFs`, `ExecTestFs`, `ExecveTestFs`).
+//
+// Every method picks `NoProgress` per the design doc's per-method
+// progress-type table: the trait surface is one-shot identity-side
+// queries / mutations, page accounting belongs to `FsPageBacking{,V3}`.
+
+use crate::vfs::FsOpsV3;
+use tx_substrate::step_v3::{
+    Errno as V3Errno, NoProgress, StepOutcome as V3Outcome,
+};
+
+impl FsOpsV3 for LifecycleFs {
+    fn lookup(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<FsObjectId, NoProgress> {
+        V3Outcome::err(V3Errno::ENOSYS)
+    }
+
+    fn load_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<InodeMeta, NoProgress> {
+        V3Outcome::done(InodeMeta::new(InodeKind::Regular, 0o100644))
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _meta: &InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
+        V3Outcome::done(())
+    }
+
+    fn create_inode(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(FsObjectId, InodeMeta), NoProgress> {
+        V3Outcome::err(V3Errno::EROFS)
+    }
+
+    fn unlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
+        V3Outcome::err(V3Errno::EROFS)
+    }
+
+    fn rename(
+        &self,
+        _old_parent: FsObjectId,
+        _old_name: &[u8],
+        _new_parent: FsObjectId,
+        _new_name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
+        V3Outcome::err(V3Errno::EROFS)
+    }
+
+    fn link(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
+        V3Outcome::err(V3Errno::EROFS)
+    }
+
+    fn mkdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(FsObjectId, InodeMeta), NoProgress> {
+        V3Outcome::err(V3Errno::EROFS)
+    }
+
+    fn rmdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
+        V3Outcome::err(V3Errno::EROFS)
+    }
+
+    fn symlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _link_target: &[u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(FsObjectId, InodeMeta), NoProgress> {
+        V3Outcome::err(V3Errno::EROFS)
+    }
+
+    fn readdir(
+        &self,
+        _fs_object_id: FsObjectId,
+        _cursor: DirCursor,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<Option<(DirEntry, DirCursor)>, NoProgress> {
+        V3Outcome::done(None)
+    }
+
+    fn destroy_inode(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
+        V3Outcome::done(())
+    }
+}
+
+// Tests pin the v3 outcome shape end-to-end through the `LifecycleFs`
+// impl. They are red until both the `FsOpsV3` trait declaration in
+// `crates/tx-subsystems/src/vfs/execution.rs` and the `impl FsOpsV3
+// for LifecycleFs` block above are present.
+
+#[test]
+fn fsopsv3_load_inode_meta_returns_done_with_default_meta() {
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let fs = LifecycleFs::new();
+    let outcome = <LifecycleFs as FsOpsV3>::load_inode_meta(&fs, FsObjectId::new(7), &guard);
+    let expected = InodeMeta::new(InodeKind::Regular, 0o100644);
+    assert_eq!(outcome, V3Outcome::done(expected));
+}
+
+#[test]
+fn fsopsv3_create_inode_returns_err_erofs_on_readonly_fixture() {
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let fs = LifecycleFs::new();
+    let outcome = <LifecycleFs as FsOpsV3>::create_inode(
+        &fs,
+        FsObjectId::new(1),
+        b"foo",
+        0o100644,
+        &Credential::root(),
+        &guard,
+    );
+    assert_eq!(
+        outcome,
+        V3Outcome::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EROFS)
+    );
+}
+
+#[test]
+fn fsopsv3_readdir_done_none_for_empty_directory() {
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let fs = LifecycleFs::new();
+    let outcome = <LifecycleFs as FsOpsV3>::readdir(
+        &fs,
+        FsObjectId::new(1),
+        DirCursor::START,
+        &guard,
+    );
+    assert_eq!(outcome, V3Outcome::done(None));
+}
+
+#[test]
+fn fsopsv3_lookup_returns_err_enosys() {
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let fs = LifecycleFs::new();
+    let outcome =
+        <LifecycleFs as FsOpsV3>::lookup(&fs, FsObjectId::new(1), b"missing", &guard);
+    assert_eq!(
+        outcome,
+        V3Outcome::<FsObjectId, NoProgress>::err(V3Errno::ENOSYS)
+    );
+}
+
+#[test]
+fn fsopsv3_default_read_link_returns_enosys() {
+    // Wave-8 design choice: defaults match `FsOps` exactly. `LifecycleFs`
+    // does not override `read_link`, so the default `ENOSYS` answer
+    // must round-trip through the v3 outcome shape.
+    setup_host_substrate();
+    let guard = tx_substrate::epoch::guard();
+    let fs = LifecycleFs::new();
+    let outcome = <LifecycleFs as FsOpsV3>::read_link(&fs, FsObjectId::new(1), &guard);
+    assert_eq!(
+        outcome,
+        V3Outcome::<alloc::boxed::Box<[u8]>, NoProgress>::err(V3Errno::ENOSYS)
+    );
+}

@@ -4,6 +4,46 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-8 of the v3 TDD migration landed — first
+  trait-migration design probe. Wave 6's W-mount surfaced that
+  the additive sibling-fn pattern doesn't apply to trait-shaped
+  step surfaces (`FsOps`, `FsPageBacking`); wave 8 lays the
+  parallel-trait approach. Single deep worker
+  W-fsops-v3-design produced: (1) the `FsOpsV3` parallel trait
+  appended after `FsOps` in
+  `crates/tx-subsystems/src/vfs/execution.rs` (13 methods, all
+  returning `step_v3::StepOutcome<T, NoProgress>` — every fs
+  op is a one-shot identity-side query/mutation, so `NoProgress`
+  is correct across the board; `readdir`'s cursor is a method
+  *input* not progress); same default-`ENOSYS` impls as v4 for
+  `read_link`/`materialise_rnode`/`step_chmod`/`step_chown`;
+  re-exported from `vfs/mod.rs`. (2) First impl: `impl FsOpsV3
+  for LifecycleFs` in `page_backed/lifecycle_tests.rs` —
+  test-only fixture, mechanical 1:1 mirror of the v4 impl with
+  bodies collapsing to `V3Outcome::done(...)` /
+  `V3Outcome::err(V3Errno::EROFS)` etc. Worker hit two minor
+  type gaps (vfs `DirCursor` is `[u8; 16]` not the v3 `u64`
+  newtype; `Credential::root()` not `ROOT`) and resolved them
+  via the existing `DirCursor::START` const and method form;
+  zero semantic gaps. (3) Design doc at
+  `docs/progress/decisions/2026-05-09-fsops-v3-design.md`
+  argues parallel trait over the three rejected alternatives
+  (default-method shim — Advanced ambiguity; wrapper free fns
+  — same; wholesale flip — single-PR blast). 5 v3 tests
+  pinning `load_inode_meta`/`create_inode`/`readdir`/`lookup`/
+  default-`read_link` end-to-end through `FsOpsV3`. Final
+  count: **1292 passed, 0 failed, 4 ignored across 60 binaries**
+  (wave-7 baseline 1287 + 5). All lints + progress validate
+  green. **Wave 9 plan from the worker:** two-step fan-out, not
+  full-parallel. 9a is a learning sub-wave (single worker on
+  Tmpfs + TestFs which exercise non-trivial materialise_rnode
+  paths) PLUS the sibling `FsPageBackingV3` design (trait
+  coupling at MountOutput requires shipping both v3 traits
+  together so each backend dual-routes in one PR). 9b fans out
+  in parallel to the remaining 5 impls (Devfs, Ext4FsInstance,
+  DevptsInstance, ExecTestFs, ExecveTestFs). 9c migrates walker
+  call sites once 8/8 impl coverage holds.
+
 - 2026-05-09 PR-1 wave-7 of the v3 TDD migration landed (three
   parallel cascade probes — first multi-fn fan-out exercising the
   full v3 surface from waves 4-6). Net additions:

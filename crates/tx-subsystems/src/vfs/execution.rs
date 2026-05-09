@@ -210,6 +210,224 @@ pub trait FsOps: Send + Sync + 'static {
     }
 }
 
+// === FsOpsV3 — parallel trait emitting v3 step outcomes ================
+//
+// Wave-8 design + prototype slice. Per
+// `docs/progress/decisions/2026-05-09-fsops-v3-design.md`, the trait-
+// migration cascade is shaped differently from the free-fn cascades
+// (waves 4/6/7) because trait surfaces — not call sites — choose how
+// to map v4's `Advanced(t)` onto v3's `Continue { progress }` /
+// `Yield { progress, … }` split. A default-method shim on `FsOps`
+// (default `lookup_v3` calling `lookup` and converting) cannot make
+// that decision — `Advanced(t)` is per-call-site ambiguous (Continue
+// vs Done), and the default body has no caller context. So we grow
+// `FsOpsV3` as a parallel trait. Each FS impl block grows a sibling
+// `impl FsOpsV3 for X` next to its existing `impl FsOps for X`. The
+// final wholesale cascade (replacing FsOps with FsOpsV3) lives in a
+// later wave once all eight impls + walker callers are dual-routed.
+//
+// Per-method progress-type choice: every method in `FsOpsV3` uses
+// `step_v3::NoProgress`. The trait surface is one-shot identity-side
+// queries / mutations (`lookup`, `mkdir`, `unlink`, …): the caller
+// asks one question per call, and the trait's contract has no
+// sub-operation accumulation (`readdir` returns one entry per call;
+// the caller composes by re-calling with the new cursor — the cursor
+// is a method input, not progress). Page-counting accumulators
+// (`PageProgress`) live on the page-backing trait surface
+// (`FsPageBackingV3`, wave 9 design), where ops like `flush_page`
+// genuinely move pages. Cross-trait coupling: `FsOps::materialise_rnode`
+// returns `Cap<RNode>` and the caller (`walker`) routes between
+// FsOps and FsPageBacking via a single `MountPayload`; designing
+// FsOpsV3 first leaves the FsPageBackingV3 shape consistent and
+// validates the approach with the smaller surface.
+//
+// Doc tag: `txdoc:STEP-V2-OUTCOME-ALGEBRA-1` (closed four-variant
+// outcome). The `FsOpsV3` declaration site is referenced by the
+// design doc at `docs/progress/decisions/2026-05-09-fsops-v3-design.md`.
+
+/// Parallel `FsOps` trait emitting v3 step outcomes.
+///
+/// Mirrors the 13-method shape of [`FsOps`] one-for-one, with every
+/// `StepOutcome<T>` replaced by
+/// `tx_substrate::step_v3::StepOutcome<T, NoProgress>`. Defaults match
+/// `FsOps` exactly so projection-only / device-only backends inherit
+/// `ENOSYS` without per-impl boilerplate.
+///
+/// Wave-8 introduces this trait and one prototype impl
+/// (`LifecycleFs`); wave 9 fans out to the remaining seven impls
+/// (`Tmpfs`, `Devfs`, `Ext4FsInstance`, `DevptsInstance`, `TestFs`,
+/// `ExecTestFs`, `ExecveTestFs`). The eventual final cascade
+/// replaces `FsOps` outright with `FsOpsV3`.
+pub trait FsOpsV3: Send + Sync + 'static {
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress>;
+
+    fn load_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress>;
+
+    fn serialize_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: &InodeMeta,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+
+    fn create_inode(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        (FsObjectId, InodeMeta),
+        tx_substrate::step_v3::NoProgress,
+    >;
+
+    fn unlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+
+    fn rename(
+        &self,
+        old_parent: FsObjectId,
+        old_name: &[u8],
+        new_parent: FsObjectId,
+        new_name: &[u8],
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+
+    fn link(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+
+    fn mkdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        (FsObjectId, InodeMeta),
+        tx_substrate::step_v3::NoProgress,
+    >;
+
+    fn rmdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+
+    fn symlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        link_target: &[u8],
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        (FsObjectId, InodeMeta),
+        tx_substrate::step_v3::NoProgress,
+    >;
+
+    /// Per-call one-entry readdir. Cursor is a method input, not
+    /// progress — the caller composes multi-entry enumerations by
+    /// re-calling with the returned cursor. The trait surface is
+    /// `NoProgress`; if a later wave grows a multi-entry-per-call
+    /// `readdir` it should live on a new method (e.g. `readdir_batch`)
+    /// carrying `EntryProgress`.
+    fn readdir(
+        &self,
+        fs_object_id: FsObjectId,
+        cursor: super::structure::DirCursor,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        Option<(DirEntry, super::structure::DirCursor)>,
+        tx_substrate::step_v3::NoProgress,
+    >;
+
+    fn destroy_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+
+    /// Read a symlink's target bytes. Default returns `ENOSYS` (parity
+    /// with [`FsOps::read_link`]).
+    fn read_link(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        alloc::boxed::Box<[u8]>,
+        tx_substrate::step_v3::NoProgress,
+    > {
+        let _ = (fs_object_id, guard);
+        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+    }
+
+    /// Backend hook for materialising an `RNode` for a non-directory,
+    /// non-symlink inode. Default returns `ENOSYS` (parity with
+    /// [`FsOps::materialise_rnode`]).
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        tx_substrate::zone::Cap<crate::vfs::structure::RNode>,
+        tx_substrate::step_v3::NoProgress,
+    > {
+        let _ = (fs_object_id, meta, guard);
+        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+    }
+
+    /// Update the inode's mode bits. Default returns `ENOSYS` (parity
+    /// with [`FsOps::step_chmod`]).
+    fn step_chmod(
+        &self,
+        fs_object_id: FsObjectId,
+        new_mode: u16,
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        let _ = (fs_object_id, new_mode, cred, guard);
+        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+    }
+
+    /// Update the inode's `(uid, gid)`. Default returns `ENOSYS`
+    /// (parity with [`FsOps::step_chown`]).
+    fn step_chown(
+        &self,
+        fs_object_id: FsObjectId,
+        new_uid: Option<u32>,
+        new_gid: Option<u32>,
+        cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        let _ = (fs_object_id, new_uid, new_gid, cred, guard);
+        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+    }
+}
+
 /// Filesystem driver output produced at mount time and consumed by Mount
 /// to build the mount payload. Per `TX_EXT4_PLAN_v1_2.md` §pub-types and
 /// `bringup_fs_specs_v_1` §root-output.
