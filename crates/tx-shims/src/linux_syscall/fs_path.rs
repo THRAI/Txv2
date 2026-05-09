@@ -182,6 +182,27 @@ pub(super) fn fs_ops_for_dentry(
     }
 }
 
+/// v3 sibling of [`fs_ops_for_dentry`]. Wave 9g-a: the chmod/chown
+/// arms switched to call the v3 trait surface
+/// (`FsOpsV3::step_chmod` / `step_chown`) which Tmpfs delegates back
+/// to its v4 impl internally — semantics preserved, outcome shape
+/// becomes the v3 four-variant algebra.
+pub(super) fn fs_ops_v3_for_dentry(
+    dentry: &Cap<DEntry>,
+) -> Option<Arc<dyn tx_subsystems::vfs::FsOpsV3>> {
+    let guard = tx_substrate::epoch::guard();
+    let mut cursor: Cap<DEntry> = dentry.clone();
+    loop {
+        if let Some(weak) = cursor.rnode().containing_mount_weak() {
+            if let Some(payload) = weak.upgrade(&guard) {
+                return Some(payload.fs_ops_v3.clone());
+            }
+        }
+        let next = cursor.parent_hint().and_then(|w| w.upgrade(&guard))?;
+        cursor = next;
+    }
+}
+
 /// `fchmodat(dirfd, path, mode, flags)`. Linux RV64 generic ABI.
 ///
 /// Wraps `FsOps::step_chmod` (Wave 3 Part 2). Permission failures
@@ -207,7 +228,9 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let fs_object_id = dentry.rnode().fs_object_id();
-    let fs_ops = match fs_ops_for_dentry(&dentry) {
+    // Wave 9g-a: chmod migrated from v4 FsOps to v3 FsOpsV3.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let fs_ops_v3 = match fs_ops_v3_for_dentry(&dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
@@ -215,12 +238,10 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     // callers can't change S_IFMT bits via chmod.
     let new_mode = (mode & 0o7777) as u16;
     let guard = tx_substrate::epoch::guard();
-    match fs_ops.step_chmod(fs_object_id, new_mode, &walker_cred, &guard) {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-            SyscallResult::Error(EIO_VALUE)
-        }
-        StepOutcome::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(errno)),
+    match fs_ops_v3.step_chmod(fs_object_id, new_mode, &walker_cred, &guard) {
+        V3::Done(()) => SyscallResult::Return(0),
+        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+        V3::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
     }
 }
 
@@ -250,19 +271,19 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let fs_object_id = dentry.rnode().fs_object_id();
-    let fs_ops = match fs_ops_for_dentry(&dentry) {
+    // Wave 9g-a: chown migrated from v4 FsOps to v3 FsOpsV3.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let fs_ops_v3 = match fs_ops_v3_for_dentry(&dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
     let uid_opt = decode_uid_arg(uid_arg).map(|u| u.raw());
     let gid_opt = decode_gid_arg(gid_arg).map(|g| g.raw());
     let guard = tx_substrate::epoch::guard();
-    match fs_ops.step_chown(fs_object_id, uid_opt, gid_opt, &walker_cred, &guard) {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-            SyscallResult::Error(EIO_VALUE)
-        }
-        StepOutcome::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(errno)),
+    match fs_ops_v3.step_chown(fs_object_id, uid_opt, gid_opt, &walker_cred, &guard) {
+        V3::Done(()) => SyscallResult::Return(0),
+        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+        V3::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
     }
 }
 
