@@ -40,8 +40,16 @@ impl PhysicalBlockNumber {
 }
 
 pub trait CharDeviceOps: Send + Sync + 'static {
-    fn read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize>;
-    fn write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize>;
+    fn read(
+        &self,
+        out: &mut [u8],
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>;
+    fn write(
+        &self,
+        bytes: &[u8],
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>;
 }
 
 #[derive(Clone, Copy)]

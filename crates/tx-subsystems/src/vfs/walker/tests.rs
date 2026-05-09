@@ -29,12 +29,20 @@ use super::{step_open, step_walk, SYMLOOP_MAX};
 struct CapturingOps;
 
 impl CharDeviceOps for CapturingOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(0)
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> V3<usize, tx_substrate::step_v3::ByteProgress> {
+        V3::Done(0)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(bytes.len())
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> V3<usize, tx_substrate::step_v3::ByteProgress> {
+        V3::Done(bytes.len())
     }
 }
 

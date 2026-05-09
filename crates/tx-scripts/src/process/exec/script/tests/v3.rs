@@ -11,7 +11,7 @@ use alloc::boxed::Box;
 
 use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3Outcome};
 use tx_substrate::zone::Cap;
-use tx_subsystems::execution::{Errno, Guard, StepOutcome};
+use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::page_backed::{Frame, MaterializeAccess, PageIndex};
 use tx_subsystems::vfs::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, RNode, RNodeBacking,
@@ -223,14 +223,10 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecTestFs {
         }
         let page_index = PageIndex::new(offset / page_size);
         match container.materialize_page(page_index, MaterializeAccess::Read, guard) {
-            StepOutcome::Done(materialised) | StepOutcome::Advanced(materialised) => {
-                V3Outcome::done(Frame::new(materialised.ppn))
-            }
-            StepOutcome::AdvancedThenBlocked(materialised, _) => {
-                V3Outcome::done(Frame::new(materialised.ppn))
-            }
-            StepOutcome::Blocked(_) => V3Outcome::err(V3Errno::EAGAIN),
-            StepOutcome::Err(errno) => V3Outcome::err(errno.into()),
+            V3Outcome::Done(materialised) => V3Outcome::done(Frame::new(materialised.ppn)),
+            V3Outcome::Continue { .. } => V3Outcome::err(V3Errno::EAGAIN),
+            V3Outcome::Yield { .. } => V3Outcome::err(V3Errno::EAGAIN),
+            V3Outcome::Err(errno) => V3Outcome::err(errno),
         }
     }
 

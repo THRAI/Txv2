@@ -9,7 +9,6 @@ use tx_substrate::zone::{self, Cap, PayloadCap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::Guard;
-use crate::execution::StepOutcome as V4Out;
 use tx_substrate::step_v3::StepOutcome;
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ExitStatus, Pgid};
@@ -32,12 +31,20 @@ use crate::zones;
 struct NoopOps;
 
 impl CharDeviceOps for NoopOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> V4Out<usize> {
-        V4Out::Done(0)
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        StepOutcome::Done(0)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> V4Out<usize> {
-        V4Out::Done(bytes.len())
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        StepOutcome::Done(bytes.len())
     }
 }
 

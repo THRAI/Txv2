@@ -1,5 +1,4 @@
 use super::*;
-use crate::execution::StepOutcome;
 use alloc::vec;
 use alloc::vec::Vec;
 use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
@@ -29,7 +28,7 @@ fn write_pattern(pc: &PageContainer, offset: u64, bytes: &[u8], guard: &Guard<'_
         let within = (cursor % crate::vm::USER_PAGE_SIZE as u64) as usize;
         let chunk = core::cmp::min(left.len(), crate::vm::USER_PAGE_SIZE - within);
         let materialized = match pc.materialize_page(page, MaterializeAccess::Write, guard) {
-            StepOutcome::Done(m) | StepOutcome::Advanced(m) => m,
+            V3Out::Done(m) => m,
             other => panic!("materialize_page during pattern write: {other:?}"),
         };
         tx_substrate::page_allocator::testing::write_frame_bytes_for_test(
@@ -52,7 +51,7 @@ fn read_pattern(pc: &PageContainer, offset: u64, len: usize, guard: &Guard<'_>) 
         let within = (cursor % crate::vm::USER_PAGE_SIZE as u64) as usize;
         let chunk = core::cmp::min(left.len(), crate::vm::USER_PAGE_SIZE - within);
         let materialized = match pc.materialize_page(page, MaterializeAccess::Read, guard) {
-            StepOutcome::Done(m) | StepOutcome::Advanced(m) => m,
+            V3Out::Done(m) => m,
             other => panic!("materialize_page during pattern read: {other:?}"),
         };
         tx_substrate::page_allocator::testing::read_frame_bytes_for_test(

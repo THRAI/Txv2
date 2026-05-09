@@ -65,11 +65,34 @@ pub fn read_exact_at(
         let within_page = (offset % crate::vm::USER_PAGE_SIZE as u64) as usize;
         let chunk = core::cmp::min(len - advanced, crate::vm::USER_PAGE_SIZE - within_page);
 
+        // `materialize_page` is on v3
+        // (`StepOutcome<MaterializedPage, NoProgress>`); translate per
+        // outcome variant onto the v4 return:
+        // - v3 `Done(m)` → use the materialized frame.
+        // - v3 `Continue { .. }` (NoProgress) → no frame; surface
+        //   `Err(EAGAIN)` as a conservative collapse — page allocation
+        //   rarely emits this for a one-shot loader read.
+        // - v3 `Yield { OnCarrier { c, i } }` → v4
+        //   `Blocked(WaitToken(c, i))` (`read_exact_at` does not split
+        //   progress; matches the prior semantics where any block was
+        //   surfaced bare).
+        // - v3 `Yield { OnAgent .. }` → `Err(EIO)`.
+        // - v3 `Err(e)` → `Err(e.into())`.
+        use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
         let materialized = match pc.materialize_page(page_index, MaterializeAccess::Read, guard) {
-            StepOutcome::Done(m) | StepOutcome::Advanced(m) => m,
-            StepOutcome::Blocked(token) => return StepOutcome::Blocked(token),
-            StepOutcome::AdvancedThenBlocked(_, token) => return StepOutcome::Blocked(token),
-            StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+            V3::Done(m) => m,
+            V3::Continue { .. } => return StepOutcome::Err(Errno::EAGAIN),
+            V3::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => {
+                return StepOutcome::Blocked(crate::execution::WaitToken::new(
+                    carrier.raw(),
+                    interests.raw(),
+                ))
+            }
+            V3::Yield { .. } => return StepOutcome::Err(Errno::EIO),
+            V3::Err(errno) => return StepOutcome::Err(errno.into()),
         };
 
         let frame_base = match page_allocator::frame_kernel_addr(materialized.ppn) {

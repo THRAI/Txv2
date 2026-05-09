@@ -647,20 +647,12 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecveTestFs {
             return tx_substrate::step_v3::StepOutcome::err(Errno::EINVAL.into());
         }
         let page_index = PageIndex::new(offset / page_size);
+        use tx_substrate::step_v3::StepOutcome as V3;
         match container.materialize_page(page_index, MaterializeAccess::Read, guard) {
-            StepOutcome::Done(materialised) => {
-                tx_substrate::step_v3::StepOutcome::done(Frame::new(materialised.ppn))
-            }
-            StepOutcome::Advanced(materialised) => {
-                tx_substrate::step_v3::StepOutcome::done(Frame::new(materialised.ppn))
-            }
-            StepOutcome::AdvancedThenBlocked(materialised, _token) => {
-                tx_substrate::step_v3::StepOutcome::done(Frame::new(materialised.ppn))
-            }
-            StepOutcome::Blocked(_token) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(errno) => tx_substrate::step_v3::StepOutcome::err(errno.into()),
+            V3::Done(materialised) => V3::done(Frame::new(materialised.ppn)),
+            V3::Continue { .. } => V3::err(tx_substrate::step_v3::Errno::EAGAIN),
+            V3::Yield { .. } => V3::err(tx_substrate::step_v3::Errno::EAGAIN),
+            V3::Err(errno) => V3::err(errno),
         }
     }
 

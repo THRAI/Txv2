@@ -1,5 +1,5 @@
 use super::*;
-use crate::execution::{Errno, StepOutcome, WaitToken};
+use crate::execution::{Errno, StepOutcome};
 use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
 use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};
 use alloc::sync::Arc;

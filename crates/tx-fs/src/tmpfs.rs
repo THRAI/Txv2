@@ -26,7 +26,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use tx_substrate::zone::Cap;
 use tx_substrate::SpinMutex;
 use tx_subsystems::cred::Capability;
-use tx_subsystems::execution::{Errno, Guard, StepOutcome};
+use tx_subsystems::execution::Guard;
 use tx_subsystems::page_backed::{
     step_truncate, AnonSwapPolicy, Frame, MaterializeAccess, PageContainer,
     PageContainerKind, PageIndex,
@@ -946,27 +946,29 @@ impl FsPageBacking for Tmpfs {
             );
         }
         let page_index = PageIndex::new(offset / page_size);
-        // `materialize_page` emits the PageContainer-internal outcome
-        // shape (not a trait surface). Map to step_v3: Done/Advanced ->
-        // done(frame), AdvancedThenBlocked -> done (the materialised
-        // PPN is observable now, drop the wait token), Blocked ->
-        // yield_on_carrier with NoProgress, Err -> err(...).
+        // `materialize_page` is now v3
+        // `StepOutcome<MaterializedPage, NoProgress>`. Map per variant:
+        // - `Done(m)` → `done(Frame::new(m.ppn))`.
+        // - `Continue { .. }` (NoProgress) → `err(EAGAIN)` —
+        //   conservative collapse; tmpfs page allocation rarely emits
+        //   this.
+        // - `Yield { OnCarrier { c, i } }` → `yield_on_carrier(NoProgress, c, i)`.
+        // - `Yield { OnAgent .. }` → `err(EIO)`.
+        // - `Err(e)` → `err(e)`.
+        use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
         match container.materialize_page(page_index, MaterializeAccess::Read, guard) {
-            StepOutcome::Done(materialized) => {
-                tx_substrate::step_v3::StepOutcome::done(Frame::new(materialized.ppn))
-            }
-            StepOutcome::Advanced(materialized) => {
-                tx_substrate::step_v3::StepOutcome::done(Frame::new(materialized.ppn))
-            }
-            StepOutcome::AdvancedThenBlocked(materialized, _token) => {
-                tx_substrate::step_v3::StepOutcome::done(Frame::new(materialized.ppn))
-            }
-            StepOutcome::Blocked(token) => tx_substrate::step_v3::StepOutcome::yield_on_carrier(
+            V3::Done(materialized) => V3::done(Frame::new(materialized.ppn)),
+            V3::Continue { .. } => V3::err(tx_substrate::step_v3::Errno::EAGAIN),
+            V3::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => V3::yield_on_carrier(
                 tx_substrate::step_v3::NoProgress,
-                token.carrier(),
-                token.interest(),
+                carrier.raw(),
+                interests.raw(),
             ),
-            StepOutcome::Err(errno) => tx_substrate::step_v3::StepOutcome::err(errno.into()),
+            V3::Yield { .. } => V3::err(tx_substrate::step_v3::Errno::EIO),
+            V3::Err(errno) => V3::err(errno),
         }
     }
 

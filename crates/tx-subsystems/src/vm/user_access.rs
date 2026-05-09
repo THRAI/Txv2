@@ -565,11 +565,27 @@ fn resolve_user_page(
                 return ResolvePageOutcome::Err(Errno::EFAULT);
             }
             let page_index = PageIndex::new(backing_offset / USER_PAGE_SIZE as u64);
+            // `materialize_page` is now v3
+            // (`StepOutcome<MaterializedPage, NoProgress>`); translate
+            // per outcome variant onto the v4 `ResolvePageOutcome`:
+            // - v3 `Done(m)` → `ResolvePageOutcome::Done(m)`.
+            // - v3 `Continue { .. }` (NoProgress) → `Err(EFAULT)` —
+            //   page allocation rarely emits this; treating it as a
+            //   fault keeps the user-access path conservative.
+            // - v3 `Yield { OnCarrier { c, i } }` →
+            //   `ResolvePageOutcome::Blocked(WaitToken(c, i))`.
+            // - v3 `Yield { OnAgent .. }` → `Err(EFAULT)`.
+            // - v3 `Err(_)` → `Err(EFAULT)`.
+            use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
             match pc.materialize_page(page_index, kind.materialize_access(), guard) {
-                StepOutcome::Done(m) | StepOutcome::Advanced(m) => ResolvePageOutcome::Done(m),
-                StepOutcome::Blocked(t) => ResolvePageOutcome::Blocked(t),
-                StepOutcome::AdvancedThenBlocked(m, _) => ResolvePageOutcome::Done(m),
-                StepOutcome::Err(_) => ResolvePageOutcome::Err(Errno::EFAULT),
+                V3::Done(m) => ResolvePageOutcome::Done(m),
+                V3::Continue { .. } => ResolvePageOutcome::Err(Errno::EFAULT),
+                V3::Yield {
+                    shape: YieldShape::OnCarrier { carrier, interests },
+                    ..
+                } => ResolvePageOutcome::Blocked(WaitToken::new(carrier.raw(), interests.raw())),
+                V3::Yield { .. } => ResolvePageOutcome::Err(Errno::EFAULT),
+                V3::Err(_) => ResolvePageOutcome::Err(Errno::EFAULT),
             }
         }
     }
