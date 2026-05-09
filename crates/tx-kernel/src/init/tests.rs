@@ -423,7 +423,7 @@ fn boot_smoke_init_fds_preopened_to_console() {
     let stdout = init.fd(1).expect("fd 1");
     let guard = tx_substrate::epoch::guard();
     match stdout.step_write(b"hi\n", &guard) {
-        tx_subsystems::execution::StepOutcome::Done(written) => {
+        tx_substrate::step_v3::StepOutcome::Done(written) => {
             assert_eq!(written, 3, "step_write reports the requested byte count");
         }
         other => panic!("fd 1 step_write failed: {other:?}"),
