@@ -673,7 +673,16 @@
             _offset: u64,
             _guard: &Guard<'_>,
         ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
+            // Wave 9h-β: align v3 with v4's `Blocked(WaitToken(9, 0x44))`
+            // so production fns routing through v3 (e.g. materialize_file_page)
+            // observe a yield, not EAGAIN. Without this, the v4→v3 swap of
+            // materialize_file_page would convert the test's Blocked
+            // expectation into Err(EAGAIN).
+            tx_substrate::step_v3::StepOutcome::yield_on_carrier(
+                tx_substrate::step_v3::NoProgress,
+                9,
+                0x44,
+            )
         }
 
         fn flush_page(
