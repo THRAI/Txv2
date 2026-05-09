@@ -52,7 +52,7 @@ use tx_subsystems::cred::{
     step_setgid, step_setregid, step_setresgid, step_setresuid, step_setreuid, step_setuid,
     Capability, Cred, CredChange, Gid, Uid,
 };
-use tx_subsystems::execution::{Errno, StepOutcome};
+use tx_subsystems::execution::Errno;
 use tx_subsystems::process::{
     process_by_pid, seed_child_leader_context, step_chdir, step_exit_group, step_fork, step_getcwd,
     step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome, ExitStatus, Pgid, Pid,
@@ -751,10 +751,11 @@ pub(super) fn bootstrap_write_user<T: Copy>(
     uaddr: u64,
     value: T,
 ) -> Result<(), Errno> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     let guard = tx_substrate::epoch::guard();
     match aspace.write_user(UserPtr::<T>::new(uaddr as usize), value, &guard) {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => Ok(()),
-        StepOutcome::Err(Errno::EFAULT) => {
+        V3::Done(()) | V3::Continue { .. } => Ok(()),
+        V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
             drop(guard);
             // SAFETY: see `bootstrap_read_user`.
             unsafe {
@@ -762,8 +763,8 @@ pub(super) fn bootstrap_write_user<T: Copy>(
             }
             Ok(())
         }
-        StepOutcome::Err(e) => Err(e),
-        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => Err(Errno::EIO),
+        V3::Err(e) => Err(Errno::from(e)),
+        V3::Yield { .. } => Err(Errno::EIO),
     }
 }
 
@@ -775,13 +776,14 @@ pub(super) fn bootstrap_copy_from_user(
     dst: &mut [u8],
     uaddr: u64,
 ) -> Result<(), Errno> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     if dst.is_empty() {
         return Ok(());
     }
     let guard = tx_substrate::epoch::guard();
     match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => Ok(()),
-        StepOutcome::Err(Errno::EFAULT) => {
+        V3::Done(_) | V3::Continue { .. } => Ok(()),
+        V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
             drop(guard);
             // SAFETY: see `bootstrap_read_user`.
             unsafe {
@@ -789,8 +791,8 @@ pub(super) fn bootstrap_copy_from_user(
             }
             Ok(())
         }
-        StepOutcome::Err(e) => Err(e),
-        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => Err(Errno::EIO),
+        V3::Err(e) => Err(Errno::from(e)),
+        V3::Yield { .. } => Err(Errno::EIO),
     }
 }
 
@@ -802,13 +804,14 @@ pub(super) fn bootstrap_copy_to_user(
     uaddr: u64,
     src: &[u8],
 ) -> Result<(), Errno> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     if src.is_empty() {
         return Ok(());
     }
     let guard = tx_substrate::epoch::guard();
     match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => Ok(()),
-        StepOutcome::Err(Errno::EFAULT) => {
+        V3::Done(_) | V3::Continue { .. } => Ok(()),
+        V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
             drop(guard);
             // SAFETY: see `bootstrap_read_user`.
             unsafe {
@@ -816,8 +819,8 @@ pub(super) fn bootstrap_copy_to_user(
             }
             Ok(())
         }
-        StepOutcome::Err(e) => Err(e),
-        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => Err(Errno::EIO),
+        V3::Err(e) => Err(Errno::from(e)),
+        V3::Yield { .. } => Err(Errno::EIO),
     }
 }
 
