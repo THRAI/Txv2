@@ -613,11 +613,11 @@ fn project_open_devfs_tty_by_name_shares_identity_between_console_and_ttys0() {
 
     assert_eq!(
         ttys0_file.step_write(b"ttyS0\n", &guard),
-        V4Out::Done(6)
+        StepOutcome::Done(6)
     );
     assert_eq!(
         console_file.step_write(b"console\n", &guard),
-        V4Out::Done(8)
+        StepOutcome::Done(8)
     );
 }
 
@@ -666,7 +666,7 @@ fn step_poll_hardware_input_ingests_uart_bytes_into_registered_console_tty() {
     let mut out = [0u8; 16];
     assert_eq!(
         console_file.step_read(&mut out, &guard),
-        V4Out::Done(6)
+        StepOutcome::Done(6)
     );
     assert_eq!(&out[..6], b"hello\n");
 
@@ -1241,12 +1241,12 @@ fn project_open_ptmx_registers_devpts_slave_and_files_are_usable() {
 
     assert_eq!(
         pty.master_file.step_write(b"from master\n", &guard),
-        V4Out::Done(12)
+        StepOutcome::Done(12)
     );
     let mut out = [0u8; 16];
     assert_eq!(
         pty.slave_file.step_read(&mut out, &guard),
-        V4Out::Done(12)
+        StepOutcome::Done(12)
     );
     assert_eq!(&out[..12], b"from master\n");
 }

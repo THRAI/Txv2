@@ -7,9 +7,10 @@
 
 use alloc::sync::Arc;
 
-use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
+use crate::execution::{Guard, StepOutcome as V4Out};
 use crate::page_backed::FsPageBacking;
 use crate::tty;
+use tx_substrate::step_v3::{ByteProgress, Errno, NoProgress, StepOutcome, YieldShape};
 
 use super::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileIoctl,
@@ -236,53 +237,52 @@ pub struct MountOutput {
 // char-device struct payloads already route through their owning
 // subsystems.
 
+/// Bridge a v4 `StepOutcome<usize>` (from a `CharDeviceOps` impl that
+/// stays on the v4 surface) into a v3 `StepOutcome<usize, ByteProgress>`.
+///
+/// `CharDeviceOps::read` / `write` keep their v4 signatures because the
+/// trait has many test-side impls; lifting them in this seam lets
+/// `OpenFile::step_read` / `step_write` surface a v3 outcome shape to
+/// callers without disturbing those impls.
+fn bridge_char_v4_to_v3(v4: V4Out<usize>) -> StepOutcome<usize, ByteProgress> {
+    match v4 {
+        V4Out::Done(n) => StepOutcome::Done(n),
+        V4Out::Advanced(n) => StepOutcome::Continue {
+            progress: ByteProgress::new(n),
+        },
+        V4Out::Blocked(token) => StepOutcome::Yield {
+            progress: ByteProgress::EMPTY,
+            shape: YieldShape::on_carrier(token.carrier(), token.interest()),
+        },
+        V4Out::AdvancedThenBlocked(n, token) => StepOutcome::Yield {
+            progress: ByteProgress::new(n),
+            shape: YieldShape::on_carrier(token.carrier(), token.interest()),
+        },
+        V4Out::Err(errno) => StepOutcome::Err(errno.into()),
+    }
+}
+
 impl OpenFile {
     /// Dispatch a read against this file's RNode backing.
-    pub fn step_read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize> {
+    pub fn step_read(
+        &self,
+        out: &mut [u8],
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, ByteProgress> {
         if !self.flags.read {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
         match self.rnode.backing() {
             RNodeBacking::StructBacked { payload } => match payload {
-                StructPayload::Tty(tty) => {
-                    use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
-                    match tty::execution::step_read(tty, out, guard) {
-                        V3Out::Done(n) => StepOutcome::Done(n),
-                        V3Out::Continue { progress } => StepOutcome::Advanced(progress.bytes()),
-                        V3Out::Yield {
-                            progress: _,
-                            shape: YieldShape::OnCarrier { carrier, interests },
-                        } => StepOutcome::Blocked(WaitToken::new(carrier.raw(), interests.raw())),
-                        V3Out::Yield {
-                            shape: YieldShape::OnAgent { .. },
-                            ..
-                        } => StepOutcome::Err(Errno::EIO),
-                        V3Out::Err(v3errno) => StepOutcome::Err(v3errno.into()),
-                    }
+                StructPayload::Tty(tty) => tty::execution::step_read(tty, out, guard),
+                StructPayload::CharDevice(binding) => {
+                    bridge_char_v4_to_v3(binding.ops.read(out, guard))
                 }
-                StructPayload::CharDevice(binding) => binding.ops.read(out, guard),
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Reader,
-                } => {
-                    // pipe::step_read returns step_v3 outcome; translate
-                    // back into the v4 outcome shape this fn surfaces.
-                    use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
-                    match crate::pipe::step_read(payload, out, guard, self.flags.nonblocking) {
-                        V3Out::Done(n) => StepOutcome::Done(n),
-                        V3Out::Continue { progress } => StepOutcome::Advanced(progress.bytes()),
-                        V3Out::Yield {
-                            progress: _,
-                            shape: YieldShape::OnCarrier { carrier, interests },
-                        } => StepOutcome::Blocked(WaitToken::new(carrier.raw(), interests.raw())),
-                        V3Out::Yield {
-                            shape: YieldShape::OnAgent { .. },
-                            ..
-                        } => StepOutcome::Err(Errno::EIO),
-                        V3Out::Err(v3errno) => StepOutcome::Err(v3errno.into()),
-                    }
-                }
+                } => crate::pipe::step_read(payload, out, guard, self.flags.nonblocking),
                 // Wrong-side read against a writer-end RNode. The
                 // OpenFileFlags.read=false guard above handles the
                 // common case (writer-end OpenFiles never set read);
@@ -322,7 +322,12 @@ impl OpenFile {
     /// `AdvancedThenBlocked` outcomes are reachable. The `Guard` is
     /// accepted for symmetry with the other `OpenFile::step_*`
     /// methods even though the body never crosses an EBR boundary.
-    pub fn step_lseek(&self, offset: i64, whence: u32, _guard: &Guard<'_>) -> StepOutcome<u64> {
+    pub fn step_lseek(
+        &self,
+        offset: i64,
+        whence: u32,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
         // Backing-driven dispatch: short-circuit non-seekable
         // backings before any arithmetic. Pipes / TTY / chardev are
         // ESPIPE regardless of whence (Linux's `lseek(2)` man page:
@@ -379,48 +384,25 @@ impl OpenFile {
     }
 
     /// Dispatch a write against this file's RNode backing.
-    pub fn step_write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize> {
+    pub fn step_write(
+        &self,
+        bytes: &[u8],
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, ByteProgress> {
         if !self.flags.write {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
         match self.rnode.backing() {
             RNodeBacking::StructBacked { payload } => match payload {
-                StructPayload::Tty(tty) => {
-                    use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
-                    match tty::execution::step_write(tty, bytes, guard) {
-                        V3Out::Done(n) => StepOutcome::Done(n),
-                        V3Out::Continue { progress } => StepOutcome::Advanced(progress.bytes()),
-                        V3Out::Yield {
-                            progress: _,
-                            shape: YieldShape::OnCarrier { carrier, interests },
-                        } => StepOutcome::Blocked(WaitToken::new(carrier.raw(), interests.raw())),
-                        V3Out::Yield { .. } => StepOutcome::Err(Errno::EIO),
-                        V3Out::Err(v3_errno) => StepOutcome::Err(v3_errno.into()),
-                    }
+                StructPayload::Tty(tty) => tty::execution::step_write(tty, bytes, guard),
+                StructPayload::CharDevice(binding) => {
+                    bridge_char_v4_to_v3(binding.ops.write(bytes, guard))
                 }
-                StructPayload::CharDevice(binding) => binding.ops.write(bytes, guard),
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Writer,
-                } => {
-                    // pipe::step_write returns step_v3 outcome; translate
-                    // back into the v4 outcome shape this fn surfaces.
-                    use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
-                    match crate::pipe::step_write(payload, bytes, guard, self.flags.nonblocking) {
-                        V3Out::Done(n) => StepOutcome::Done(n),
-                        V3Out::Continue { progress } => StepOutcome::Advanced(progress.bytes()),
-                        V3Out::Yield {
-                            progress: _,
-                            shape: YieldShape::OnCarrier { carrier, interests },
-                        } => StepOutcome::Blocked(WaitToken::new(carrier.raw(), interests.raw())),
-                        V3Out::Yield {
-                            shape: YieldShape::OnAgent { .. },
-                            ..
-                        } => StepOutcome::Err(Errno::EIO),
-                        V3Out::Err(v3errno) => StepOutcome::Err(v3errno.into()),
-                    }
-                }
+                } => crate::pipe::step_write(payload, bytes, guard, self.flags.nonblocking),
                 // Wrong-side write against a reader-end RNode.
                 StructPayload::Pipe {
                     side: crate::pipe::PipeSide::Reader,
@@ -445,7 +427,7 @@ impl OpenFile {
         caller: OpenFileIoctlCaller<'_>,
         request: OpenFileIoctl<'_>,
         guard: &Guard<'_>,
-    ) -> StepOutcome<OpenFileIoctlResult> {
+    ) -> StepOutcome<OpenFileIoctlResult, NoProgress> {
         match self.rnode.backing() {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => step_tty_ioctl(tty, caller, request, guard),
@@ -467,37 +449,37 @@ fn step_tty_ioctl(
     caller: OpenFileIoctlCaller<'_>,
     request: OpenFileIoctl<'_>,
     guard: &Guard<'_>,
-) -> StepOutcome<OpenFileIoctlResult> {
-    use tx_substrate::step_v3::StepOutcome as V3Out;
-
+) -> StepOutcome<OpenFileIoctlResult, NoProgress> {
     // v3 NoProgress outcomes are one-shot Done/Err (Yield/Continue
-    // unreachable for tty ioctl bodies today). Bridge each call to the
-    // v4 surface this fn presents.
-    fn bridge<T>(
-        v3: V3Out<T, tx_substrate::step_v3::NoProgress>,
+    // unreachable for tty ioctl bodies today). Wrap each call's `Done`
+    // into the typed `OpenFileIoctlResult` constructor.
+    fn wrap_result<T>(
+        v3: StepOutcome<T, NoProgress>,
         wrap: impl FnOnce(T) -> OpenFileIoctlResult,
-    ) -> StepOutcome<OpenFileIoctlResult> {
+    ) -> StepOutcome<OpenFileIoctlResult, NoProgress> {
         match v3 {
-            V3Out::Done(value) => StepOutcome::Done(wrap(value)),
-            V3Out::Err(e) => StepOutcome::Err(e.into()),
-            V3Out::Continue { .. } | V3Out::Yield { .. } => StepOutcome::Err(Errno::EIO),
+            StepOutcome::Done(value) => StepOutcome::Done(wrap(value)),
+            StepOutcome::Err(e) => StepOutcome::Err(e),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                StepOutcome::Err(Errno::EIO)
+            }
         }
     }
 
     match request {
-        OpenFileIoctl::Tcgets => bridge(
+        OpenFileIoctl::Tcgets => wrap_result(
             tty::execution::step_ioctl_tcgets(tty_id, guard),
             OpenFileIoctlResult::Termios,
         ),
-        OpenFileIoctl::Tcsets { termios } => bridge(
+        OpenFileIoctl::Tcsets { termios } => wrap_result(
             tty::execution::step_ioctl_tcsets(tty_id, termios, guard),
             OpenFileIoctlResult::SideEffect,
         ),
-        OpenFileIoctl::Tiocgpgrp => bridge(
+        OpenFileIoctl::Tiocgpgrp => wrap_result(
             tty::execution::step_ioctl_tiocgpgrp(tty_id, guard),
             OpenFileIoctlResult::Pgrp,
         ),
-        OpenFileIoctl::Tiocspgrp { new_pgrp } => bridge(
+        OpenFileIoctl::Tiocspgrp { new_pgrp } => wrap_result(
             tty::execution::step_ioctl_tiocspgrp_for_process(
                 tty_id,
                 caller.process(),
@@ -506,19 +488,19 @@ fn step_tty_ioctl(
             ),
             OpenFileIoctlResult::SideEffect,
         ),
-        OpenFileIoctl::Tiocgwinsz => bridge(
+        OpenFileIoctl::Tiocgwinsz => wrap_result(
             tty::execution::step_ioctl_tiocgwinsz(tty_id, guard),
             OpenFileIoctlResult::Winsize,
         ),
-        OpenFileIoctl::Tiocswinsz { winsize } => bridge(
+        OpenFileIoctl::Tiocswinsz { winsize } => wrap_result(
             tty::execution::step_ioctl_tiocswinsz(tty_id, winsize, guard),
             OpenFileIoctlResult::SideEffect,
         ),
-        OpenFileIoctl::Tiocsctty => bridge(
+        OpenFileIoctl::Tiocsctty => wrap_result(
             tty::execution::step_ioctl_tiocsctty_for_process(tty_id, caller.process(), guard),
             OpenFileIoctlResult::SideEffect,
         ),
-        OpenFileIoctl::Tiocnotty => bridge(
+        OpenFileIoctl::Tiocnotty => wrap_result(
             tty::execution::step_ioctl_tiocnotty_for_process(tty_id, caller.process(), guard),
             OpenFileIoctlResult::SideEffect,
         ),

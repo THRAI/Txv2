@@ -188,7 +188,7 @@ fn devfs_write_through_openfile_reaches_tty_step_write() {
     // path goes through TTY's ldisc rather than dropping straight onto
     // the binding.
     match console.step_write(b"hi\n", &guard) {
-        StepOutcome::Done(written) => assert_eq!(written, 3),
+        V3Outcome::Done(written) => assert_eq!(written, 3),
         other => panic!("step_write failed: {other:?}"),
     }
 

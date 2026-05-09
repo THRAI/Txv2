@@ -499,16 +499,18 @@ pub(super) fn sys_lseek<'a>(
         None => return SyscallResult::Error(EBADF_VALUE),
     };
     let guard = tx_substrate::epoch::guard();
+    use tx_substrate::step_v3::StepOutcome as V3Out;
     match file.step_lseek(offset, whence, &guard) {
-        StepOutcome::Done(new_offset) | StepOutcome::Advanced(new_offset) => {
-            SyscallResult::Return(new_offset as i64)
-        }
-        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+        V3Out::Done(new_offset) => SyscallResult::Return(new_offset as i64),
+        V3Out::Continue { .. } | V3Out::Yield { .. } => {
             // Unreachable in practice — see the comment on the
             // function header.
             SyscallResult::Error(errno_to_i32(Errno::EIO))
         }
-        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        V3Out::Err(v3errno) => {
+            let errno: Errno = v3errno.into();
+            SyscallResult::Error(errno_to_i32(errno))
+        }
     }
 }
 
