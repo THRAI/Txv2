@@ -188,42 +188,43 @@ fn restore_front(
     });
 }
 
-// === wave-7 v3 cascade probe (W-tty-step-write) =========================
+// === step_v3-shape sibling fns ==========================================
 //
-// Sibling `*_v3` fns matching the same logic as the v4 fns above but
-// emitting v3 step-algebra outcomes (`tx_substrate::step_v3::StepOutcome`).
-// Existing tx-shims callers stay on the v4 fns; future migration waves
-// switch them over and delete the v4 fns. We re-run the body inline here
-// rather than delegating, to keep the v3 path independently testable and
-// avoid a conversion-shim layer.
+// Sibling `*_v3` fns matching the same logic as the fns above but
+// emitting `tx_substrate::step_v3::StepOutcome`. Bodies are run inline
+// rather than delegating, to keep the step_v3 path independently
+// testable and avoid a conversion-shim layer.
 //
-// `step_write` IS the canonical AdvancedThenBlocked test of the v3 mapping.
-// Unlike pipe (single-shot) the tty write path genuinely emits all five v4
-// outcome variants. The v3 mapping per the wave-7 worker spec:
+// `step_write` is the canonical `AdvancedThenBlocked` test of the
+// step_v3 mapping. Unlike pipe (single-shot), the tty write path
+// genuinely emits all five `execution::StepOutcome` variants. The
+// step_v3 mapping:
 //
 // - empty bytes → `Done(0)` (pre-progress short-circuit)
 // - require_fg_pgrp / require_live_tty err → `Err(e.into())`
-// - process_output consumed nothing → `Yield { progress: ByteProgress::EMPTY,
-//   shape: OnCarrier { tty.raw(), TTY_WRITABLE } }` (no progress, no
-//   bytes-driven yield — the level wire is the carrier)
-// - kick_transport Err → `Err(e.into())` (consumed bytes are left in the
-//   output queue's restore-front state; v4 mirrors the same swallow.)
+// - process_output consumed nothing → `Yield { progress:
+//   ByteProgress::EMPTY, shape: OnCarrier { tty.raw(), TTY_WRITABLE } }`
+//   (no progress, no bytes-driven yield — the level wire is the
+//   carrier)
+// - kick_transport Err → `Err(e.into())` (consumed bytes are left in
+//   the output queue's restore-front state)
 // - kick_transport Blocked / AdvancedThenBlocked → `Yield {
-//   progress: ByteProgress::new(consumed), shape: OnCarrier { wait.carrier,
-//   wait.interest } }` — load-bearing: `Advanced(consumed)` from v4
-//   collapses into the byte-progress accumulator that travels through the
-//   yield, exactly the way STEP-1's monoid composition prescribes.
-// - kick_transport Done | Advanced → `Done(consumed)` (terminal; matches
-//   v4 line 48 — `Advanced(consumed)` here is a no-op because the call
-//   site already considers the bytes terminal).
+//   progress: ByteProgress::new(consumed), shape: OnCarrier {
+//   wait.carrier, wait.interest } }` — load-bearing: any
+//   `Advanced(consumed)` collapses into the byte-progress accumulator
+//   that travels through the yield, per STEP-1's monoid composition.
+// - kick_transport Done | Advanced → `Done(consumed)` (terminal; the
+//   call site considers the bytes terminal so `Advanced(consumed)` is
+//   a no-op).
 //
-// We deliberately fully-qualify v3 types as `tx_substrate::step_v3::*`
-// instead of adding a `use` so the v4 `StepOutcome` / `Errno` already in
-// scope from `crate::execution` keep working without rename gymnastics.
+// We deliberately fully-qualify step_v3 types as
+// `tx_substrate::step_v3::*` instead of adding a `use` so the
+// `StepOutcome` / `Errno` already in scope from `crate::execution`
+// keep working without rename gymnastics.
 
-/// `write(2)`-shaped TTY step — v3 outcome shape.
+/// `write(2)`-shaped TTY step — step_v3 outcome shape.
 ///
-/// Same body and semantics as [`step_write`], translated to a v3
+/// Same body and semantics as [`step_write`], translated to a
 /// [`tx_substrate::step_v3::StepOutcome`]:
 ///
 /// - empty bytes → `Done(0)`
@@ -291,12 +292,12 @@ pub fn step_write_v3(
     }
 }
 
-/// `step_write_for_caller`-shaped TTY step — v3 outcome shape.
+/// `step_write_for_caller`-shaped TTY step — step_v3 outcome shape.
 ///
 /// Mirrors [`step_write_for_caller`] (background TOSTOP gate then the
-/// shared `step_write` body), translated to v3
+/// shared `step_write` body), translated to
 /// [`tx_substrate::step_v3::StepOutcome`]. The TOSTOP background-write
-/// rejection becomes `Err(EIO.into())` exactly like v4.
+/// rejection becomes `Err(EIO.into())`.
 pub fn step_write_for_caller_v3(
     tty: &Cap<TtyIdentity>,
     bytes: &[u8],
@@ -335,10 +336,10 @@ mod tests {
     // -- ops fixtures --------------------------------------------------
 
     /// Always-blocking write ops. The hardware kick path turns this into
-    /// a `Blocked(wait)` from `kick_transport`, which the v4 fn maps to
-    /// `AdvancedThenBlocked(consumed, wait)`. The v3 fn must map it to
-    /// `Yield { progress: ByteProgress::new(consumed), shape: OnCarrier
-    /// { wait.carrier, wait.interest } }`.
+    /// a `Blocked(wait)` from `kick_transport`, which `step_write` maps
+    /// to `AdvancedThenBlocked(consumed, wait)`; `step_write_v3` maps
+    /// it to `Yield { progress: ByteProgress::new(consumed), shape:
+    /// OnCarrier { wait.carrier, wait.interest } }`.
     struct BlockingOps {
         carrier: u64,
         interest: u64,
@@ -471,12 +472,12 @@ mod tests {
     }
 
     /// **Load-bearing test.** When the hardware kick blocks after
-    /// `process_output` consumed bytes, v4 emits `AdvancedThenBlocked
-    /// (consumed, wait)`. The v3 mapping must surface this as
-    /// `Yield { progress: ByteProgress::new(consumed), shape: OnCarrier {
-    /// wait.carrier, wait.interest } }`. This is the first v3 Yield with
-    /// non-EMPTY ByteProgress in the migration; it pins the
-    /// `ByteProgress::new(consumed)` ergonomics inside `yield_on_carrier`.
+    /// `process_output` consumed bytes, `step_write` emits
+    /// `AdvancedThenBlocked(consumed, wait)`. `step_write_v3` must
+    /// surface this as `Yield { progress: ByteProgress::new(consumed),
+    /// shape: OnCarrier { wait.carrier, wait.interest } }`. This pins
+    /// the `ByteProgress::new(consumed)` ergonomics inside
+    /// `yield_on_carrier`.
     #[test]
     fn step_write_v3_partial_then_blocked_yields_on_carrier_with_byte_progress() {
         let _setup = setup();

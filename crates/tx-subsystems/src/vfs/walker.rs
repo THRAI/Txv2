@@ -27,11 +27,6 @@
 //! `load_inode_meta` / `read_link` against in-memory backends, so
 //! every `.await` is a no-op today.
 //!
-//! Wave 9f retired the v4 `step_walk` / `step_open` / `walk_inner`
-//! entry points; all callers now route through the v3 surface. The
-//! v4 `FsOps` trait is still observed at mount-payload construction
-//! time (wave 9g retires it).
-//!
 //! ## Mount-point crossing
 //!
 //! When a freshly-resolved DEntry carries a `mounted: Some(Weak<MountIdentity>)`
@@ -101,26 +96,22 @@ use crate::vfs::FsOps;
 /// substituted into the path) returns `Errno::ELOOP`.
 pub const SYMLOOP_MAX: u32 = 40;
 
-// === v3 walker entry points ==========================================
+// === Walker entry points =============================================
 //
-// Wave 9c introduced `step_walk` / `step_open` as v3-typed
-// siblings of the legacy v4 `step_walk` / `step_open`. Wave 9f retired
-// the v4 entry points: every production and test caller now routes
-// through the v3 surface, and `walk_inner` / `step_walk` / `step_open`
-// were deleted. The walker today routes exclusively through
-// `FsOps` and emits `tx_substrate::step_v3::StepOutcome`.
+// The walker routes through `FsOps` and emits
+// `tx_substrate::step_v3::StepOutcome`.
 //
 // Per-call-site `Continue` mapping: `FsOps::lookup` /
-// `FsOps::load_inode_meta` / `FsOps::read_link` / `FsOps::
-// materialise_rnode` are all one-shot identity-side queries with
-// `NoProgress`. The trait surface contract (per the wave-8 design doc
-// and the existing impls in `tmpfs.rs`, `devfs.rs`, `namespace.rs`,
-// `pager.rs`, `tty/project.rs`) returns only `Done`, `Continue {
-// progress: NoProgress }`, `Yield`, and `Err`. A `Continue` with
-// `NoProgress` is treated as a no-op retry — the walker loops once
-// more without advancing path state, which matches the v3 monoid
-// contract (NoProgress is the EMPTY identity). A `Yield` carries no
-// progress for these one-shot ops, so it's surfaced verbatim.
+// `FsOps::load_inode_meta` / `FsOps::read_link` /
+// `FsOps::materialise_rnode` are all one-shot identity-side queries
+// with `NoProgress`. The trait surface contract (per the existing
+// impls in `tmpfs.rs`, `devfs.rs`, `namespace.rs`, `pager.rs`,
+// `tty/project.rs`) returns only `Done`, `Continue { progress:
+// NoProgress }`, `Yield`, and `Err`. A `Continue` with `NoProgress`
+// is treated as a no-op retry — the walker loops once more without
+// advancing path state, which matches the monoid contract
+// (`NoProgress` is the EMPTY identity). A `Yield` carries no progress
+// for these one-shot ops, so it's surfaced verbatim.
 
 /// Resolve `path` against the namespace rooted at `rooted_at` and
 /// return the terminal `Cap<DEntry>`.
@@ -136,7 +127,7 @@ pub const SYMLOOP_MAX: u32 = 40;
 /// middle of a walk, or trailing `/` after a non-directory), `ELOOP`
 /// (symlink budget exceeded), `ENAMETOOLONG` (component too long),
 /// and propagated `FsOps` errors. Resolution goes through the
-/// `FsOps` trait surface and emits a v3 `StepOutcome<Cap<DEntry>,
+/// `FsOps` trait surface and emits `StepOutcome<Cap<DEntry>,
 /// NoProgress>`.
 pub async fn step_walk<'g>(
     rooted_at: Cap<DEntry>,
@@ -273,7 +264,7 @@ fn walk_inner_v3<'g>(
             return V3::err(tx_substrate::step_v3::Errno::ENOTDIR);
         }
 
-        // POSIX search permission. Same predicate as v4.
+        // POSIX search permission.
         let parent_meta = current.rnode().meta();
         if let Err(err) = check_descend_perm(&parent_meta, cred) {
             return V3::err(err.into());
@@ -298,7 +289,7 @@ fn walk_inner_v3<'g>(
             V3::Err(err) => return V3::err(err),
         };
 
-        // Mid-path non-directory check (same as v4).
+        // Mid-path non-directory check.
         if child_meta.kind() != InodeKind::Directory
             && child_meta.kind() != InodeKind::Symlink
             && (!remaining.is_empty() || must_be_directory)
@@ -325,7 +316,7 @@ fn walk_inner_v3<'g>(
             Err(_) => return V3::err(tx_substrate::step_v3::Errno::ENOMEM),
         };
 
-        // === Symlink chasing (same predicate as v4) ====================
+        // === Symlink chasing ============================================
         if let RNodeBacking::Symlink { target } = child_rnode_cap.backing() {
             hop_count += 1;
             if hop_count > SYMLOOP_MAX {
@@ -452,12 +443,9 @@ fn materialise_child_rnode_v3<'g>(
 }
 
 /// Resolve the `Arc<dyn FsOps>` in scope for a given dentry by
-/// upgrading its RNode's containing-mount weak and reading the
-/// payload's v3 fs_ops slot directly.
-///
-/// Wave 9d retired the sidecar registry that previously bridged the
-/// v3 walker to mount payloads — `MountPayload::fs_ops` is now a
-/// regular field populated at mount-publication time.
+/// upgrading its RNode's containing-mount weak and reading
+/// `MountPayload::fs_ops` directly. The field is populated at
+/// mount-publication time.
 fn fs_ops_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Arc<dyn FsOps>> {
     let mount_payload_weak: Weak<MountPayload> = dentry.rnode().containing_mount_weak()?;
     let payload = mount_payload_weak.upgrade(guard)?;

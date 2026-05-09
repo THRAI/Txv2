@@ -24,30 +24,23 @@ fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
     }
 }
 
-// === v3 trait impl (v3-only after v4 retirement) ====================
+// === FsOps impl =====================================================
 //
-// The v4 `FsOps` impl was deleted as part of unifying the kernel on
-// the v3 trait surface. The bodies below are the original v4 logic
-// inlined directly, with terminal outcomes mapped onto the v3
-// `StepOutcome` shape (`done(t)` / `err(e)`). The current read-only
-// ext4 surface routes through `Ext4Pager::*` which returns
-// `Result<T, Ext4FormatError>` (not `StepOutcome`), so every body
-// here lands on `done` or `err` only — there is no `Advanced` /
-// `Blocked` / `AdvancedThenBlocked` path through this read-only
-// backend today. Any future async/journal-aware revision should map
-// `Advanced(t)` → `done(t)` (one-shot v3 contract) and `Blocked` /
-// `AdvancedThenBlocked` defensively to `EAGAIN`.
+// The current read-only ext4 surface routes through `Ext4Pager::*`
+// which returns `Result<T, Ext4FormatError>` (not `StepOutcome`), so
+// every body here lands on `done` or `err` only — there is no
+// `Advanced` / `Blocked` / `AdvancedThenBlocked` path through this
+// read-only backend today.
 //
 // Fully-qualified `tx_substrate::step_v3::*` references at the impl
 // sites avoid clashing with `tx_subsystems::execution::Errno`
-// already in scope, per the wave-4/6/7 trait-impl convention.
+// already in scope.
 
 use tx_subsystems::vfs::FsOps;
 
-/// v3 sibling factory for `MountOutput::fs_ops` cutover.
+/// Factory for `MountOutput::fs_ops`.
 ///
-/// Wave 9c walker entry points populate `MountOutput::fs_ops`
-/// from this constructor; mirrors `Tmpfs::fs_ops_arc`.
+/// Mirrors `Tmpfs::fs_ops_arc`.
 impl<I> Ext4FsInstance<I>
 where
     I: BlockImage + Send + 'static,
@@ -245,6 +238,6 @@ where
     }
 
     // `read_link`, `materialise_rnode`, `step_chmod`, `step_chown` all
-    // inherit the trait-default `ENOSYS` mapping, matching the prior
-    // v4 behaviour where ext4 did not override those methods either.
+    // inherit the trait-default `ENOSYS` mapping; ext4 does not
+    // override those methods.
 }

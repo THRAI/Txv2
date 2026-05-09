@@ -320,15 +320,14 @@ fn devfs_lookup_unknown_returns_enoent() {
     );
 }
 
-// === Wave 9b: parallel v3 trait shape tests =============================
+// === FsOps / FsPageBacking trait shape tests =========================
 //
-// Pin the `FsOps` / `FsPageBacking` outcome shape on `Devfs` so a
-// regression in the v3 mapping surfaces locally rather than at the
-// walker call site once wave 9b's walker entry points land. Tests
-// exercise the most representative methods: `lookup` (positive +
-// negative), `load_inode_meta` (root directory), and `fetch_page`
-// (devfs's distinctive `ENOSYS` rejection — char-device I/O does not
-// flow through the page cache).
+// Pin the outcome shape on `Devfs` so a regression surfaces locally
+// rather than at the walker call site. Tests exercise the most
+// representative methods: `lookup` (positive + negative),
+// `load_inode_meta` (root directory), and `fetch_page` (devfs's
+// distinctive `ENOSYS` rejection — char-device I/O does not flow
+// through the page cache).
 
 #[test]
 fn devfs_v3_lookup_console_returns_done_with_object_id() {
@@ -385,9 +384,9 @@ fn devfs_v3_load_inode_meta_root_returns_directory_meta() {
 #[test]
 fn devfs_v3_fetch_page_returns_enosys() {
     // devfs is char-device-only — page-cache traffic does not flow
-    // through it. The v3 mapping must surface the v4 `ENOSYS` through
-    // the errno bridge unchanged. (Distinct from tmpfs, whose
-    // `fetch_page` returns `Done(Frame)` for regular files.)
+    // through it, so `fetch_page` surfaces `ENOSYS`. (Distinct from
+    // tmpfs, whose `fetch_page` returns `Done(Frame)` for regular
+    // files.)
     let _serial = crate::test_support::FS_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());

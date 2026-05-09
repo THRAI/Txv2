@@ -5,12 +5,11 @@ use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMe
 use alloc::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-// `step_truncate`, `step_fsync`, `step_fallocate` are now v3-shaped
-// (return `tx_substrate::step_v3::StepOutcome<(), PageProgress>`),
-// so the assertions below use `V3Out::Done(())` against them. The
-// LifecycleFs v4 outcome wiring is unchanged — it stores v4 outcomes
-// for `FsPageBacking` and translates to v3 inside its
-// `FsPageBacking` impl below.
+// `step_truncate`, `step_fsync`, `step_fallocate` return
+// `tx_substrate::step_v3::StepOutcome<(), PageProgress>`, so the
+// assertions below use `V3Out::Done(())` against them. LifecycleFs
+// stores its internal outcomes in the `execution::StepOutcome` shape
+// for `FsPageBacking` and translates inside its trait impl below.
 use tx_substrate::step_v3::{
     PageProgress as V3PageProgress, StepOutcome as V3Out, YieldShape as V3YieldShape,
 };
@@ -546,20 +545,15 @@ fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
     assert_eq!(pc.size_bytes(), stable_size);
 }
 
-// === FsOps prototype impl + tests ====================================
+// === FsOps impl + tests ==============================================
 //
-// Wave-8 design + prototype slice for the trait migration. Per
-// `docs/progress/decisions/2026-05-09-fsops-v3-design.md`, `LifecycleFs`
-// is the smallest test-only `FsOps` impl in the workspace — it lives
-// next to wave-7's `step_truncate`/`step_fsync` work, so the
-// `FsOps` impl gets validated against the same fixture that already
-// exercises the v3 sibling fns. Wave 9 fans out to the remaining
-// seven impls (`Tmpfs`, `Devfs`, `Ext4FsInstance`, `DevptsInstance`,
-// `TestFs`, `ExecTestFs`, `ExecveTestFs`).
+// `LifecycleFs` is a small test-only `FsOps` impl that lives next to
+// `step_truncate`/`step_fsync` so the trait surface is validated
+// against the same fixture exercising those step fns.
 //
-// Every method picks `NoProgress` per the design doc's per-method
-// progress-type table: the trait surface is one-shot identity-side
-// queries / mutations, page accounting belongs to `FsPageBacking{,V3}`.
+// Every method picks `NoProgress`: the trait surface is one-shot
+// identity-side queries / mutations; page accounting belongs to
+// `FsPageBacking`.
 
 use crate::vfs::FsOps;
 use tx_substrate::step_v3::{
@@ -685,9 +679,9 @@ impl FsOps for LifecycleFs {
     }
 }
 
-// Wave 9d: `FsPageBacking` impl so `MountPayload` can hold a
-// `LifecycleFs` for the v3 page-backing slot. The impls mirror the
-// existing v4 bodies above; v4 `Blocked` becomes v3 `Err(EAGAIN)`.
+// `FsPageBacking` impl so `MountPayload` can hold a `LifecycleFs`
+// for the page-backing slot. Anything that would be `Blocked` becomes
+// `Err(EAGAIN)`.
 impl crate::page_backed::FsPageBacking for LifecycleFs {
     fn fetch_page(
         &self,
@@ -712,12 +706,10 @@ impl crate::page_backed::FsPageBacking for LifecycleFs {
             .store(fs_object_id.as_u64(), Ordering::Release);
         self.last_offset.store(offset, Ordering::Release);
         if self.block_flush_after == Some(flush) {
-            // Wave 9g-f: surface the wait carrier/interest pair so the
-            // v4 `step_fsync` body (which now consumes
-            // `FsPageBacking`) can map this back to v4 `Blocked` /
-            // `AdvancedThenBlocked` with the original `WaitToken`
-            // values the v4 fixture assertions check against. Replaces
-            // the wave-9d placeholder collapse to `Err(EAGAIN)`.
+            // Surface the wait carrier/interest pair so `step_fsync`
+            // (which consumes `FsPageBacking`) can map this back to
+            // the appropriate yield shape with the carrier/interest
+            // values the fixture assertions check against.
             V3Outcome::yield_on_carrier(NoProgress, 13, 0x55)
         } else {
             V3Outcome::done(())

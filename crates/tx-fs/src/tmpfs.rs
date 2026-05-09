@@ -164,47 +164,40 @@ impl Default for Tmpfs {
     }
 }
 
-// === v3-only trait impls ===============================================
+// === FsOps + FsPageBacking impls =======================================
 //
-// `impl FsOps for Tmpfs` and `impl FsPageBacking for Tmpfs` carry the
-// full method bodies. The earlier dual-trait (v3+v4) shape, where v3
-// methods delegated to v4 method bodies via `<Self as FsOps>::method`, is
-// retired per the v3-only unification: each method here owns its
-// implementation and emits `tx_substrate::step_v3::StepOutcome` directly.
+// Each method owns its implementation and emits
+// `tx_substrate::step_v3::StepOutcome` directly.
 //
-// Tmpfs is one-shot through every method (no v4 `Advanced(t)` /
-// `Blocked` branches survive), with two real wait points:
+// Tmpfs is one-shot through every method, with two real wait points:
 //
-// * `FsPageBacking::fetch_page` calls `PageContainer::materialize_page`
-//   which can return any v4 outcome variant; we translate AdvancedThenBlocked
-//   to a v3 `done(frame)` (dropping the wait token, since the materialised
-//   PPN is observable now), and Blocked to `yield_on_carrier`.
+// * `FsPageBacking::fetch_page` calls `PageContainer::materialize_page`;
+//   we translate `AdvancedThenBlocked` to `done(frame)` (dropping the
+//   wait token, since the materialised PPN is observable now), and
+//   `Blocked` to `yield_on_carrier`.
 // * `FsPageBacking::truncate` uses `step_truncate`, which in turn
 //   calls `FsPageBacking::truncate` recursively for File-kind containers
-//   only. tmpfs containers are `PageContainerKind::Anon`, so no recursion;
-//   any `Yield` from the call is reflected as `EAGAIN` per
-//   `crates/tx-subsystems/src/page_backed/lifecycle.rs`'s wave-7 comment.
+//   only. tmpfs containers are `PageContainerKind::Anon`, so no
+//   recursion; any `Yield` from the call is reflected as `EAGAIN`.
 //
-// Per the wave-8 design doc
-// (`docs/progress/decisions/2026-05-09-fsops-v3-design.md`), v3 callers
-// (the walker entry points) consume these impls via
+// Callers (the walker entry points) consume these impls via
 // `Arc<dyn FsOps>` / `Arc<dyn FsPageBacking>`. `MountPayload` carries
-// the v3 trait objects directly.
+// the trait objects directly.
 //
 // Fully-qualified `tx_substrate::step_v3::*` references at the impl sites
 // avoid clashing with `tx_subsystems::execution::StepOutcome` already in
-// scope, per the wave-4/6/7 trait-impl convention.
+// scope.
 
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::FsOps;
 
 impl Tmpfs {
-    /// v3 trait-object factory for [`FsOps`].
+    /// Trait-object factory for [`FsOps`].
     pub fn fs_ops_arc(self: Arc<Self>) -> Arc<dyn FsOps> {
         self
     }
 
-    /// v3 trait-object factory for [`FsPageBacking`].
+    /// Trait-object factory for [`FsPageBacking`].
     pub fn fs_page_backing_arc(self: Arc<Self>) -> Arc<dyn FsPageBacking> {
         self
     }
@@ -953,11 +946,11 @@ impl FsPageBacking for Tmpfs {
             );
         }
         let page_index = PageIndex::new(offset / page_size);
-        // `materialize_page` still emits the v4 outcome shape (it is a
-        // PageContainer-internal entry point, not a trait surface). Map
-        // to v3: Done/Advanced -> done(frame), AdvancedThenBlocked -> done
-        // (the materialised PPN is observable now, drop the wait token),
-        // Blocked -> yield_on_carrier with NoProgress, Err -> err(...).
+        // `materialize_page` emits the PageContainer-internal outcome
+        // shape (not a trait surface). Map to step_v3: Done/Advanced ->
+        // done(frame), AdvancedThenBlocked -> done (the materialised
+        // PPN is observable now, drop the wait token), Blocked ->
+        // yield_on_carrier with NoProgress, Err -> err(...).
         match container.materialize_page(page_index, MaterializeAccess::Read, guard) {
             StepOutcome::Done(materialized) => {
                 tx_substrate::step_v3::StepOutcome::done(Frame::new(materialized.ppn))
@@ -1064,8 +1057,8 @@ impl FsPageBacking for Tmpfs {
     }
 
     // `fallocate` is intentionally not overridden: the trait's default
-    // returns `done(())`, which matches tmpfs's prior v4 behaviour
-    // (tmpfs treated fallocate as a hint with no on-disk reservation).
+    // returns `done(())` and tmpfs treats fallocate as a hint with no
+    // on-disk reservation.
 
     fn supports_reflink(&self, _other: &tx_subsystems::page_backed::PageContainer) -> bool {
         // tmpfs day-1 has no reflink seam.

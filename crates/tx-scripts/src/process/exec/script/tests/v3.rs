@@ -1,12 +1,8 @@
-//! Wave-9b: `FsOps` + `FsPageBacking` impls on `ExecTestFs`.
+//! `FsOps` + `FsPageBacking` impls on `ExecTestFs`.
 //!
-//! Per `docs/progress/decisions/2026-05-09-fsops-v3-design.md` and the
-//! wave-9a `TestFs` template (`tx-subsystems/src/vfs/walker/tests/v3.rs`),
-//! these are the sole `FsOps`-shaped impls on `ExecTestFs`; the v4
-//! `FsOps` / `FsPageBacking` traits have been retired. `ExecTestFs` is
-//! purely synchronous (no `Continue` / `Yield` variants in its bodies,
-//! with the lone exception of `fetch_page`'s pass-through of
-//! `PageContainer::materialize_page`).
+//! `ExecTestFs` is purely synchronous (no `Continue` / `Yield`
+//! variants in its bodies, with the lone exception of `fetch_page`'s
+//! pass-through of `PageContainer::materialize_page`).
 //!
 //! Lives in its own file so the parent `tests.rs` stays under the
 //! `cargo xtask lint arch` 1500-line authored-file cap.

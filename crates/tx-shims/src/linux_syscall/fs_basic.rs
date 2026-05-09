@@ -217,10 +217,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // `Guard` is `!Send + !Sync` so we cannot hold one across this
     // function's `.await`s — the `dispatch` future feeds
     // `Reactor::submit_task` which requires `Send`. Use the
-    // `poll_walker_synchronously` helper that the Wave 4 file-mode
-    // arms also use; every in-tree walker backend resolves
-    // immediately so the noop-waker poll always returns `Ready`.
-    // Wave 9d (c): migrated to v3 walker.
+    // `poll_walker_synchronously` helper that the file-mode arms also
+    // use; every in-tree walker backend resolves immediately so the
+    // noop-waker poll always returns `Ready`.
     use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
     let walk_first = {
         let guard = tx_substrate::epoch::guard();
@@ -259,7 +258,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             return SyscallResult::Error(EISDIR_VALUE);
         }
         if meta.size != 0 {
-            // Wave 9g: O_TRUNC migrated to v3 FsPageBacking.
             use tx_substrate::step_v3::StepOutcome as V3Trunc;
             let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
                 Some(b) => b,
@@ -291,7 +289,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // Same Send-future discipline as Step 1: poll_walker_synchronously.
     let openfile: Cap<OpenFile> = {
         let guard = tx_substrate::epoch::guard();
-        // Wave 9d (c): migrated to v3 walker.
         let outcome = poll_walker_synchronously(step_open(
             cwd,
             &path,
@@ -932,7 +929,6 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             Some(d) => d,
             None => return SyscallResult::Error(ENOENT_VALUE),
         };
-        // Wave 9d (c): migrated to v3 walker.
         use tx_substrate::step_v3::StepOutcome as V3;
         let outcome = {
             let guard = tx_substrate::epoch::guard();
@@ -1015,11 +1011,6 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     // TODO(phase-readdir-mount): teach `materialise_child_rnode` to
     // forward the mount weak so descendants don't hit the fallback.
     // Until then, every test fixture uses the mount-root directory.
-    //
-    // Wave 9g-c: getdents64 readdir migrated from v4 FsOps to v3
-    // FsOps. Tmpfs/devfs delegate `FsOps::readdir` back to their v4
-    // impl internally — semantics preserved, outcome shape becomes the
-    // v3 four-variant algebra (`Done` / `Continue` / `Yield` / `Err`).
     let fs_ops = match fs_ops_for_rnode(file.rnode()) {
         Some(o) => o,
         None => return SyscallResult::Error(ENOSYS_VALUE),
@@ -1135,17 +1126,6 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 ///
 /// TODO(phase-readdir-mount): forward the mount weak to descendants
 /// during `materialise_child_rnode` so this fallback is unnecessary.
-///
-/// Wave 9g-c grew this helper to migrate `getdents64` from the v4
-/// `FsOps::readdir` to the v3 `FsOps::readdir` trait method. Tmpfs
-/// and devfs delegate `FsOps::readdir` back to their v4 impl
-/// internally — semantics preserved, outcome shape becomes the v3
-/// four-variant algebra. The wave-9g-c migration retired the rnode
-/// helper's only v4 caller (`getdents64`) so the v4 sibling
-/// `fs_ops_for_rnode` was dropped here to keep the no-warnings gate.
-/// The dentry twin (`fs_ops_for_dentry` in `fs_path.rs`) is still
-/// load-bearing for `fs_mut.rs`'s mutator family and its v4 form will
-/// be retired alongside the trait deletion in wave 9h.
 pub(super) fn fs_ops_for_rnode(
     rnode: &Cap<tx_subsystems::vfs::structure::RNode>,
 ) -> Option<Arc<dyn tx_subsystems::vfs::FsOps>> {

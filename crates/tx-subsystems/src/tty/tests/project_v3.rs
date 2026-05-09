@@ -1,10 +1,7 @@
-//! Wave-9b: `FsOps` + `FsPageBacking` impls on `DevptsInstance`.
+//! `FsOps` + `FsPageBacking` impls on `DevptsInstance`.
 //!
-//! Sibling to `legacy_phase_a::devpts_fs_*` (which pins the v4 shape).
-//! Per `docs/progress/decisions/2026-05-09-fsops-v3-design.md`, every
-//! method delegates to the v4 body and translates outcomes one-for-one.
-//! Devpts is a PTY-side projection: no `Advanced` / `Blocked` returns
-//! reach the v4 bodies, so the v3 mapping is mechanical.
+//! Devpts is a PTY-side projection: no `Advanced` / `Blocked`
+//! outcomes are produced — every body lands on `Done` or `Err`.
 
 use alloc::format;
 

@@ -447,11 +447,8 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // mkdir("/dev") on the rootfs. The rootfs's fs_ops is the
         // tmpfs instance whose `FsOps::mkdir` actually mutates the
-        // tmpfs directory map (the v3 impl delegates back to v4).
-        // Wave 9g-d: migrated from v4 FsOps to v3 FsOps — outcome
-        // shape collapsed from 5 to 4 variants. Boot-time tmpfs
-        // mkdir is synchronous, so Continue/Yield are unreachable
-        // and panic if they fire.
+        // tmpfs directory map. Boot-time tmpfs mkdir is synchronous,
+        // so Continue/Yield are unreachable and panic if they fire.
         let guard = tx_substrate::epoch::guard();
         // Bootstrap path runs as root by construction.
         let cred = Credential::root();

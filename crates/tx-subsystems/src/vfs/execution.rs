@@ -19,21 +19,7 @@ use super::structure::{
 /// Filesystem backend trait. The boundary tx-ext4, tmpfs, devfs, etc.
 /// implement to provide namespace + page-backing operations.
 
-// === FsOps — parallel trait emitting v3 step outcomes ================
-//
-// Wave-8 design + prototype slice. Per
-// `docs/progress/decisions/2026-05-09-fsops-v3-design.md`, the trait-
-// migration cascade is shaped differently from the free-fn cascades
-// (waves 4/6/7) because trait surfaces — not call sites — choose how
-// to map v4's `Advanced(t)` onto v3's `Continue { progress }` /
-// `Yield { progress, … }` split. A default-method shim on `FsOps`
-// (default `lookup_v3` calling `lookup` and converting) cannot make
-// that decision — `Advanced(t)` is per-call-site ambiguous (Continue
-// vs Done), and the default body has no caller context. So we grow
-// `FsOps` as a parallel trait. Each FS impl block grows a sibling
-// `impl FsOps for X` next to its existing `impl FsOps for X`. The
-// final wholesale cascade (replacing FsOps with FsOps) lives in a
-// later wave once all eight impls + walker callers are dual-routed.
+// === FsOps — emits step_v3 outcomes ==================================
 //
 // Per-method progress-type choice: every method in `FsOps` uses
 // `step_v3::NoProgress`. The trait surface is one-shot identity-side
@@ -43,30 +29,20 @@ use super::structure::{
 // the caller composes by re-calling with the new cursor — the cursor
 // is a method input, not progress). Page-counting accumulators
 // (`PageProgress`) live on the page-backing trait surface
-// (`FsPageBacking`, wave 9 design), where ops like `flush_page`
-// genuinely move pages. Cross-trait coupling: `FsOps::materialise_rnode`
-// returns `Cap<RNode>` and the caller (`walker`) routes between
-// FsOps and FsPageBacking via a single `MountPayload`; designing
-// FsOps first leaves the FsPageBacking shape consistent and
-// validates the approach with the smaller surface.
+// (`FsPageBacking`), where ops like `flush_page` genuinely move pages.
+// Cross-trait coupling: `FsOps::materialise_rnode` returns
+// `Cap<RNode>` and the caller (`walker`) routes between `FsOps` and
+// `FsPageBacking` via a single `MountPayload`.
 //
 // Doc tag: `txdoc:STEP-V2-OUTCOME-ALGEBRA-1` (closed four-variant
-// outcome). The `FsOps` declaration site is referenced by the
-// design doc at `docs/progress/decisions/2026-05-09-fsops-v3-design.md`.
+// outcome).
 
-/// Parallel `FsOps` trait emitting v3 step outcomes.
+/// `FsOps` trait emitting `step_v3` outcomes.
 ///
-/// Mirrors the 13-method shape of [`FsOps`] one-for-one, with every
-/// `StepOutcome<T>` replaced by
-/// `tx_substrate::step_v3::StepOutcome<T, NoProgress>`. Defaults match
-/// `FsOps` exactly so projection-only / device-only backends inherit
-/// `ENOSYS` without per-impl boilerplate.
-///
-/// Wave-8 introduces this trait and one prototype impl
-/// (`LifecycleFs`); wave 9 fans out to the remaining seven impls
-/// (`Tmpfs`, `Devfs`, `Ext4FsInstance`, `DevptsInstance`, `TestFs`,
-/// `ExecTestFs`, `ExecveTestFs`). The eventual final cascade
-/// replaces `FsOps` outright with `FsOps`.
+/// 13 methods returning
+/// `tx_substrate::step_v3::StepOutcome<T, NoProgress>`. Defaults give
+/// projection-only / device-only backends `ENOSYS` without per-impl
+/// boilerplate.
 pub trait FsOps: Send + Sync + 'static {
     fn lookup(
         &self,
@@ -241,13 +217,11 @@ pub trait FsOps: Send + Sync + 'static {
 /// to build the mount payload. Per `TX_EXT4_PLAN_v1_2.md` §pub-types and
 /// `bringup_fs_specs_v_1` §root-output.
 ///
-/// Wave 9c grew the `fs_ops` / `fs_page_backing` sibling fields
-/// alongside the v4 `fs_ops` / `fs_page_backing` so the new walker
-/// entry points (`step_walk` / `step_open`) can route through the
-/// v3 trait surface end-to-end. Backends populate both pairs from the
-/// same `Arc<Self>`; the existing `fs_ops_arc` / `fs_page_backing_arc`
-/// factory methods on `Tmpfs`, `Devfs`, and `Ext4FsInstance` produce
-/// the v3-typed `Arc`s.
+/// Backends populate `fs_ops` / `fs_page_backing` via the
+/// `fs_ops_arc` / `fs_page_backing_arc` factory methods on `Tmpfs`,
+/// `Devfs`, and `Ext4FsInstance`; the walker entry points
+/// (`step_walk` / `step_open`) route through these trait objects
+/// end-to-end.
 pub struct MountOutput {
     pub fs_ops: Arc<dyn FsOps>,
     pub fs_page_backing: Arc<dyn FsPageBacking>,

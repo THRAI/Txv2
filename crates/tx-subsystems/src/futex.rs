@@ -173,22 +173,21 @@ pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u3
     StepOutcome::Done(n)
 }
 
-// -- v3 cascade probe (wave 4) -----------------------------------------------
+// -- step_v3-shape sibling fns ------------------------------------------------
 //
-// Sibling `*_v3` fns matching the same logic as the v4 fns above but
-// emitting v3 step-algebra outcomes (`tx_substrate::step_v3::StepOutcome`).
-// Existing tx-shims callers stay on the v4 fns; future migration waves
-// switch them over and delete the v4 fns. Per the wave-4 worker spec, we
-// re-run the body inline here rather than delegating, to keep the v3 path
-// independently testable and avoid a conversion-shim layer.
+// Sibling `*_v3` fns matching the same logic as the fns above but
+// emitting `tx_substrate::step_v3::StepOutcome`. Bodies are run inline
+// rather than delegating, to keep the step_v3 path independently
+// testable and avoid a conversion-shim layer.
 //
-// We deliberately fully-qualify the v3 types as `tx_substrate::step_v3::*`
-// instead of adding a `use` so the v4 `StepOutcome`/`Errno` already in
-// scope from `crate::execution` keep working without rename gymnastics.
+// We deliberately fully-qualify the step_v3 types as
+// `tx_substrate::step_v3::*` instead of adding a `use` so the
+// `StepOutcome`/`Errno` already in scope from `crate::execution` keep
+// working without rename gymnastics.
 
-/// `futex(uaddr, FUTEX_WAIT, val, timeout, ...)` — v3 outcome shape.
+/// `futex(uaddr, FUTEX_WAIT, val, timeout, ...)` — step_v3 outcome shape.
 ///
-/// Same body as [`step_futex_wait`], but returns a v3
+/// Same body as [`step_futex_wait`], but returns a
 /// [`tx_substrate::step_v3::StepOutcome`]:
 /// - bad uaddr → `Err(Errno::EINVAL)`
 /// - `*uaddr != val` → `Err(Errno::EAGAIN)`
@@ -205,7 +204,7 @@ pub fn step_futex_wait_v3(
         return tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EINVAL);
     }
     // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
-    // Mirrors the v4 fn's read; see its comment for the migration plan.
+    // Mirrors `step_futex_wait`'s read; see that fn for migration plan.
     let observed = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
     if observed != val {
         return tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EAGAIN);
@@ -227,15 +226,15 @@ pub fn step_futex_wait_v3(
     }
 }
 
-/// `futex(uaddr, FUTEX_WAKE, n, ...)` — v3 outcome shape.
+/// `futex(uaddr, FUTEX_WAKE, n, ...)` — step_v3 outcome shape.
 ///
-/// Same body and semantics as [`step_futex_wake`], translated to a v3
+/// Same body and semantics as [`step_futex_wake`], translated to a
 /// [`tx_substrate::step_v3::StepOutcome`]:
 /// - bad uaddr (zero or unaligned) → `Err(Errno::EINVAL)`
-/// - otherwise → `Done(n)` (best-effort: returned count is the requested
-///   `n`, not the actually-woken count; same caveat as the v4 fn).
-///   `n == 0` is permitted and returns `Done(0)` — Linux `FUTEX_WAKE`
-///   with `n=0` is a defined no-op.
+/// - otherwise → `Done(n)` (best-effort: returned count is the
+///   requested `n`, not the actually-woken count; same caveat as
+///   `step_futex_wake`). `n == 0` is permitted and returns `Done(0)` —
+///   Linux `FUTEX_WAKE` with `n=0` is a defined no-op.
 ///
 /// Wake never produces `Yield`/`Continue`.
 pub fn step_futex_wake_v3(
@@ -376,13 +375,12 @@ mod tests {
         );
     }
 
-    // -- v3 cascade probe (wave 4) ----------------------------------------
+    // -- step_v3 sibling-fn tests -----------------------------------------
     //
-    // The tests below exercise the v3-shape sibling fns
-    // `step_futex_wait_v3` / `step_futex_wake_v3`. The v4 fns above stay
-    // untouched — these tests pin the v3 outcome catalog without crossing
-    // the tx-shims cascade boundary. Future waves migrate the syscall arm
-    // to the v3 fns and delete the v4 fns.
+    // The tests below exercise the step_v3-shape sibling fns
+    // `step_futex_wait_v3` / `step_futex_wake_v3`. They pin the
+    // step_v3 outcome catalog without crossing the tx-shims dispatch
+    // boundary.
 
     #[test]
     fn step_futex_wait_v3_misaligned_uaddr_returns_einval() {
@@ -453,11 +451,9 @@ mod tests {
 
     #[test]
     fn step_futex_wake_v3_zero_n_is_a_no_op_done_zero() {
-        // Linux `FUTEX_WAKE` with `n=0` is a defined no-op; v4
-        // `step_futex_wake` falls through to `Done(0)`. The v3 sibling
-        // matches v4 semantics during the migration phase — any
-        // tightening (rejecting `n=0` as EINVAL) is a separate v3
-        // design decision the migration plan does not authorise.
+        // Linux `FUTEX_WAKE` with `n=0` is a defined no-op;
+        // `step_futex_wake` falls through to `Done(0)`. Tightening
+        // (rejecting `n=0` as EINVAL) is a separate design decision.
         let _setup = setup();
         let word: u32 = 0;
         let uaddr = &word as *const u32 as u64;

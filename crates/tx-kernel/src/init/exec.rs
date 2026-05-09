@@ -125,12 +125,8 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let cred = Credential::root();
 
-        // Wave 9g-d: bin/sh exec image build path migrated to v3
-        // (FsOps + FsPageBacking). Tmpfs's v3 impls delegate
-        // back to v4 internally — semantics preserved; outcome shape
-        // collapses from 5 to 4 variants. Boot-time tmpfs ops are
-        // synchronous, so Continue/Yield are unreachable and panic
-        // if they fire.
+        // Boot-time tmpfs ops are synchronous, so Continue/Yield are
+        // unreachable and panic if they fire.
         use tx_substrate::step_v3::StepOutcome as V3;
 
         // 1. Create or look up `/bin` directory. Use `mkdir`; on
@@ -248,12 +244,8 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let bytes = &init_fixture::INIT_FIXTURE_BYTES[..];
 
-        // Wave 9g-d: init exec image build path migrated to v3
-        // (FsOps + FsPageBacking). Tmpfs's v3 impls delegate back
-        // to v4 internally — semantics preserved; outcome shape
-        // collapses from 5 to 4 variants. Boot-time tmpfs ops are
-        // synchronous, so Continue/Yield are unreachable and panic
-        // if they fire.
+        // Boot-time tmpfs ops are synchronous, so Continue/Yield are
+        // unreachable and panic if they fire.
         use tx_substrate::step_v3::StepOutcome as V3;
 
         // Allocate the inode. Bootstrap process is root by construction.

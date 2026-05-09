@@ -416,12 +416,13 @@ impl PageContainer {
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
             return StepOutcome::Err(Errno::EINVAL);
         };
-        // Wave 9h-β: routes through v3 trait. The v3 outcome variants
-        // collapse onto v4 as: Done→Done, Continue→Advanced(install),
-        // Yield{OnCarrier{c,i}}→Blocked(WaitToken(c,i)), Yield{OnAgent}→
-        // Err(EIO), Err(v3errno)→Err(v4errno). v3 has no
-        // AdvancedThenBlocked-with-frame variant; the install side
-        // is therefore reached only via Done.
+        // Routes through `FsPageBacking::fetch_page`. The step_v3
+        // outcome variants collapse onto `execution::StepOutcome` as:
+        // Done→Done, Continue→handled below (no frame to install,
+        // surface EAGAIN), Yield{OnCarrier{c,i}}→Blocked(WaitToken(c,i)),
+        // Yield{OnAgent}→Err(EIO), Err→Err. There is no
+        // `AdvancedThenBlocked`-with-frame variant; the install side
+        // is reached only via Done.
         use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
         match mount
             .payload()
@@ -430,13 +431,10 @@ impl PageContainer {
         {
             V3::Done(frame) => self.install_fetched_file_page(page, access, frame, false),
             V3::Continue { progress: _ } => {
-                // v3 Continue with NoProgress means "fs is asking us to
-                // retry"; from v4's shape this is Advanced(()) with no
-                // frame to install. Surface as v4 Advanced(prior page),
-                // which our caller treats as "made progress, retry".
-                // No frame to install here — fall through with sentinel.
-                // Conservative choice: surface as Err(EAGAIN) so callers
-                // that expect a frame don't observe a stale value.
+                // `Continue` with `NoProgress` means "fs is asking us
+                // to retry"; there is no frame to install. Conservative
+                // choice: surface `Err(EAGAIN)` so callers that expect
+                // a frame don't observe a stale value.
                 StepOutcome::Err(Errno::EAGAIN)
             }
             V3::Yield {

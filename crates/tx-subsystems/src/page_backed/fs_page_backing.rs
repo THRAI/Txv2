@@ -1,48 +1,35 @@
-//! `FsPageBacking` — parallel trait emitting v3 step outcomes.
+//! `FsPageBacking` — page-backing trait emitting `step_v3` outcomes.
 //!
-//! Wave-9a sibling to [`crate::vfs::FsOps`] in
-//! `crates/tx-subsystems/src/vfs/execution.rs`. Per
-//! `docs/progress/decisions/2026-05-09-fsops-v3-design.md` (wave-8
-//! design doc), `FsPageBacking` ships its v3 mirror at the same time
-//! as the first production `FsOps` impl (`Tmpfs`) because
-//! `MountOutput` / `MountPayload` holds both trait objects
-//! (`Arc<dyn FsOps>`, `Arc<dyn FsPageBacking>`) and every backend
-//! constructs them together. Shipping both v3 traits in the same wave
-//! lets each backend dual-route in one step.
+//! Sibling to [`crate::vfs::FsOps`] in
+//! `crates/tx-subsystems/src/vfs/execution.rs`. `MountOutput` /
+//! `MountPayload` holds both trait objects (`Arc<dyn FsOps>`,
+//! `Arc<dyn FsPageBacking>`); every backend constructs them together.
 //!
 //! Per-method progress-type choice: every method picks `NoProgress`.
-//! The design doc's open question on `fetch_page` resolves to
-//! `NoProgress`: the trait surface is "fetch one page" — the caller
-//! asked for one specific page; partial progress within a single page
-//! fetch is meaningless, and multi-page accumulation lives at the
-//! *call-site* loop (`step_fsync`, `step_truncate`) where
-//! `PageProgress` is tallied against the dirty-page snapshot, not at
-//! the trait surface. Same reasoning for `flush_page`, `truncate`,
-//! `fsync`, `fallocate`. If a later backend surfaces real per-call
-//! partial progress (e.g. a `fetch_page` that streams sub-page chunks),
-//! it grows a new method rather than re-typing the trait surface.
+//! `fetch_page` resolves to `NoProgress` because the trait surface is
+//! "fetch one page" — the caller asked for one specific page; partial
+//! progress within a single page fetch is meaningless, and multi-page
+//! accumulation lives at the *call-site* loop (`step_fsync`,
+//! `step_truncate`) where `PageProgress` is tallied against the
+//! dirty-page snapshot, not at the trait surface. Same reasoning for
+//! `flush_page`, `truncate`, `fsync`, `fallocate`. If a later backend
+//! surfaces real per-call partial progress (e.g. a `fetch_page` that
+//! streams sub-page chunks), it grows a new method rather than
+//! re-typing the trait surface.
 //!
-//! `supports_reflink` mirrors the v4 trait shape (boolean predicate,
-//! not StepOutcome-returning) so backends keep impling the same
-//! signature on both during the migration.
+//! `supports_reflink` is a boolean predicate (not `StepOutcome`-
+//! returning).
 
 use crate::execution::Guard;
 use crate::vfs::FsObjectId;
 
 use super::{Frame, PageContainer};
 
-/// Parallel `FsPageBacking` trait emitting v3 step outcomes.
+/// `FsPageBacking` trait emitting `step_v3` outcomes.
 ///
-/// Mirrors the 5 stepping methods of [`super::FsPageBacking`] one-for-one
-/// with every `StepOutcome<T>` replaced by
-/// `tx_substrate::step_v3::StepOutcome<T, NoProgress>`. Defaults match
-/// `FsPageBacking` exactly: `fallocate` defaults to `Done(())`,
-/// `supports_reflink` defaults to `false`.
-///
-/// Wave-9a introduces this trait with first impls on `Tmpfs` and
-/// `TestFs`; wave 9b fans out to the remaining five backends
-/// (`Devfs`, `Ext4FsInstance`, `DevptsInstance`, `ExecTestFs`,
-/// `ExecveTestFs`).
+/// Each stepping method returns
+/// `tx_substrate::step_v3::StepOutcome<T, NoProgress>`. `fallocate`
+/// defaults to `Done(())` and `supports_reflink` defaults to `false`.
 pub trait FsPageBacking: Send + Sync + 'static {
     fn fetch_page(
         &self,
@@ -72,8 +59,7 @@ pub trait FsPageBacking: Send + Sync + 'static {
         guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
 
-    /// Default returns `Done(())` (parity with
-    /// [`super::FsPageBacking::fallocate`]).
+    /// Default returns `Done(())`.
     fn fallocate(
         &self,
         _fs_object_id: FsObjectId,
@@ -83,8 +69,7 @@ pub trait FsPageBacking: Send + Sync + 'static {
         tx_substrate::step_v3::StepOutcome::done(())
     }
 
-    /// Reflink predicate — same shape as the v4 trait. Default `false`,
-    /// mirroring [`super::FsPageBacking::supports_reflink`].
+    /// Reflink predicate. Default `false`.
     fn supports_reflink(&self, _other: &PageContainer) -> bool {
         false
     }

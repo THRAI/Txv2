@@ -824,39 +824,31 @@ mod tests {
         assert_eq!(payload.payload_pin_count(), 0);
     }
 
-    // -- v3 cascade probe (wave 6) ----------------------------------------
+    // -- step_v3 free-fn probes -------------------------------------------
     //
-    // Mount has no v4 production `step_*` fns to migrate (its only
-    // `StepOutcome`-shaped surface is the `MockFs` test fixture's
-    // `FsOps`/`FsPageBacking` trait impls, which can't grow `_v3`
-    // sibling methods without breaking the trait shape). Instead, this
-    // wave probes the v3 surface by adding standalone v3-shape sibling
-    // free fns that mirror the *same* logic as a few representative
-    // MockFs methods, exactly as the wave-4 futex probe mirrored the v4
-    // `step_futex_*` bodies. These free fns are pure additive scaffolding:
-    // the trait impls above stay untouched, and any future "real" mount
-    // step fns will land alongside them in the same shape.
+    // Mount has no production `step_*` fns; the only `StepOutcome`-shaped
+    // surface is the `MockFs` test fixture's `FsOps`/`FsPageBacking`
+    // trait impls. These standalone free fns mirror representative
+    // MockFs methods through the step_v3 outcome shape so the helper
+    // surface (`StepOutcome::done` / `err`) is exercised here. The
+    // trait impls above stay untouched.
     //
-    // Like the futex probe, we fully-qualify v3 types as
-    // `tx_substrate::step_v3::*` so the v4 `StepOutcome`/`Errno` already
-    // imported via `use crate::execution::{Errno, Guard, StepOutcome}`
-    // keep working without rename gymnastics.
+    // We fully-qualify step_v3 types as `tx_substrate::step_v3::*` so
+    // `StepOutcome`/`Errno` already imported via
+    // `use crate::execution::{Errno, Guard, StepOutcome}` keep working
+    // without rename gymnastics.
     //
     // Coverage:
-    // - `mockfs_lookup_v3` — `Done` (happy path) + `Err` (ENOENT). Uses
-    //   the wave-5 `StepOutcome::done` / `StepOutcome::err` helpers.
-    // - `mockfs_load_inode_meta_v3` — single `Done` outcome; smallest
-    //   possible probe of the helper surface against a non-trivial
-    //   payload (`InodeMeta`).
+    // - `mockfs_lookup_v3` — `Done` (happy path) + `Err` (ENOENT).
+    // - `mockfs_load_inode_meta_v3` — single `Done` outcome over a
+    //   non-trivial payload (`InodeMeta`).
     // - `mockfs_fetch_page_v3` — single `Err(ENOSYS)` outcome routed
     //   through the `From<execution::Errno> for step_v3::Errno` bridge
-    //   (`Errno::into()`); pins that conversion path against fan-out
-    //   regressions.
+    //   (`Errno::into()`); pins that conversion path.
 
-    /// v3-shape sibling of [`MockFs::lookup`]. Same body, v3 outcome
-    /// surface. Returns `Done(FsObjectId::ROOT)` for `b"root"`, else
-    /// `Err(ENOENT)`. Mount has no real `step_lookup` today; the trait
-    /// impl above is the only logic to mirror.
+    /// step_v3-shape sibling of [`MockFs::lookup`]. Returns
+    /// `Done(FsObjectId::ROOT)` for `b"root"`, else `Err(ENOENT)`. The
+    /// trait impl above is the only logic to mirror.
     fn mockfs_lookup_v3(
         _parent: FsObjectId,
         name: &[u8],
@@ -869,10 +861,10 @@ mod tests {
         }
     }
 
-    /// v3-shape sibling of [`MockFs::load_inode_meta`]. Always returns
-    /// `Done(InodeMeta::new(Directory, 0o040755))` (the same constant
-    /// the trait impl returns). Pins the `done()` helper against a
-    /// non-trivial payload type.
+    /// step_v3-shape sibling of [`MockFs::load_inode_meta`]. Always
+    /// returns `Done(InodeMeta::new(Directory, 0o040755))` (the same
+    /// constant the trait impl returns). Pins the `done()` helper
+    /// against a non-trivial payload type.
     fn mockfs_load_inode_meta_v3(
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
@@ -880,19 +872,19 @@ mod tests {
         tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755))
     }
 
-    /// v3-shape sibling of [`MockFs::fetch_page`]. Always returns
+    /// step_v3-shape sibling of [`MockFs::fetch_page`]. Always returns
     /// `Err(ENOSYS)`, routed through the `From<execution::Errno> for
-    /// step_v3::Errno` bridge so any drift in the v4↔v3 errno catalog
-    /// fails this test. Mirrors how a real mount-side step fn would
-    /// surface a v4 errno into a v3 outcome:
-    /// `let v3_err: step_v3::Errno = v4_err.into()`.
+    /// step_v3::Errno` bridge so any drift in the errno catalog fails
+    /// this test. Mirrors how a real mount-side step fn would surface
+    /// an `execution::Errno` into a step_v3 outcome:
+    /// `let errno: step_v3::Errno = exec_err.into()`.
     fn mockfs_fetch_page_v3(
         _fs_object_id: FsObjectId,
         _offset: u64,
         _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
-        let v4_err = Errno::ENOSYS;
-        let v3_err: tx_substrate::step_v3::Errno = v4_err.into();
+        let exec_err = Errno::ENOSYS;
+        let v3_err: tx_substrate::step_v3::Errno = exec_err.into();
         tx_substrate::step_v3::StepOutcome::err(v3_err)
     }
 

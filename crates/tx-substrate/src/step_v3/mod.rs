@@ -21,25 +21,15 @@
 //! - `txdoc:STEP-V2-STEP-OP-1` (StepOp trait shape)
 //! - `txdoc:STEP-V2-DRIVER-MODE-1` (DriveMode classify matrix)
 
-/// v3 errno surface. Mirrors `tx_subsystems::execution::Errno` byte-for-byte
-/// (variant names, ordering, doc comments). PR-0 originally pinned only
-/// `EAGAIN`; wave-4's first cascade probe (the futex step fns under
-/// `tx_subsystems::futex`) added `EINVAL` for uaddr/nargs validation;
-/// wave-5 grows the catalog to mirror the full v4 27-variant set in one
-/// step so wave-6 fan-out workers (mount, pipe, device, …) do not each
-/// add their own variants ad hoc.
+/// Errno surface. Mirrors `tx_subsystems::execution::Errno` byte-for-byte
+/// (variant names, ordering, doc comments).
 ///
-/// Discipline: this enum stays in lock-step with v4. The
+/// Discipline: this enum stays in lock-step with `execution::Errno`. The
 /// `From<execution::Errno> for step_v3::Errno` impl in
 /// `tx_subsystems::execution` is an exhaustive no-wildcard match, so
-/// adding a new variant on the v4 side fails to compile until the same
+/// adding a new variant on one side fails to compile until the same
 /// variant is added here. Removing a variant on either side is
 /// similarly load-bearing.
-///
-/// TBD per the original PR-0 stub note: whether v3's `Errno` ultimately
-/// replaces v4's `tx_subsystems::execution::Errno` (relocate upward) or
-/// whether both stay forever as a substrate/subsystem split. Wave-5
-/// leaves both in place and bridges them with a `From` impl.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Errno {
     EACCES,
@@ -146,10 +136,9 @@ pub enum YieldShape {
 impl YieldShape {
     /// Shorthand for `OnCarrier { carrier: WakeCarrier::new(carrier_id),
     /// interests: InterestConditions::new(interest_mask) }`. Wraps the
-    /// raw `u64` carrier id and `u64` interest mask the v4 `WaitToken`
-    /// exposes; zero-translation conversion. Wave-5 helper added so
-    /// fan-out-wave cascade-probe call sites don't have to hand-roll
-    /// the struct literal.
+    /// raw `u64` carrier id and `u64` interest mask; zero-translation
+    /// conversion so call sites don't have to hand-roll the struct
+    /// literal.
     pub const fn on_carrier(carrier_id: u64, interest_mask: u64) -> Self {
         Self::OnCarrier {
             carrier: WakeCarrier::new(carrier_id),
@@ -158,8 +147,7 @@ impl YieldShape {
     }
 }
 
-/// Four-variant step outcome. The v4 five-variant algebra is retired
-/// per STEP-1.
+/// Four-variant step outcome per STEP-1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StepOutcome<T, P> {
     Continue { progress: P },
@@ -188,10 +176,9 @@ impl<T, P: StepProgress> StepOutcome<T, P> {
 
     /// `StepOutcome::yield_on_carrier(progress, carrier_id, interest_mask)`
     /// — shorthand for `Yield { progress, shape: YieldShape::on_carrier(...) }`.
-    /// Constructs a v3 `Yield` over an `OnCarrier` shape from the
-    /// underlying `u64` carrier id and `u64` interest mask, the same
-    /// pair v4 `WaitToken { carrier, interest }` exposes; zero-translation
-    /// conversion. No `yield_on_agent` shorthand this wave: the
+    /// Constructs a `Yield` over an `OnCarrier` shape from the
+    /// underlying `u64` carrier id and `u64` interest mask;
+    /// zero-translation conversion. No `yield_on_agent` shorthand: the
     /// `OnAgent` variant has five fields, so a single helper isn't
     /// useful. Builders or shape-specific helpers can come later when
     /// there's a real `OnAgent` client.

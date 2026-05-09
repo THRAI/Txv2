@@ -1,14 +1,11 @@
-//! Wave 9c: end-to-end tests for `step_walk` / `step_open`.
+//! End-to-end tests for `step_walk` / `step_open`.
 //!
-//! Mirrors the v4 walker tests in `tests.rs` but exercises the v3
-//! entry points landed in wave 9c. Each test goes through `FsOps`
-//! dispatch end-to-end against the canonical production fs (Tmpfs) so
-//! the wave is a genuine cutover, not a parallel-trait test isolated
-//! from real filesystem code.
+//! Each test goes through `FsOps` dispatch end-to-end against the
+//! canonical production fs (Tmpfs).
 //!
 //! Lives in its own file so the parent `tests.rs` stays under the
 //! `cargo xtask lint arch` 1500-line authored-file cap, mirroring the
-//! `v3.rs` sibling that hosts the wave-9a `FsOps for TestFs` impl.
+//! `v3.rs` sibling that hosts the `FsOps for TestFs` impl.
 
 use alloc::sync::Arc;
 
@@ -28,7 +25,7 @@ use crate::vfs::FsOps;
 
 use super::{block_on, init_zones, TestFs};
 
-// === fixture: rootfs over TestFs, with the v3 sidecar registered ====
+// === fixture: rootfs over TestFs ===================================
 
 struct V3Topology {
     root_dentry: Cap<DEntry>,
@@ -39,9 +36,6 @@ fn build_rootfs_v3() -> V3Topology {
     let rootfs = TestFs::new(FsObjectId::new(2));
     let root_id = FsObjectId::new(2);
 
-    // Wave 9d retired the sidecar registry: the v3 fs_ops trait
-    // object now flows through `MountPayload`'s `fs_ops` field
-    // directly, the same way the v4 fs_ops field is populated.
     let payload = MountPayload::new_cap(
         rootfs.clone() as Arc<dyn FsOps>,
         rootfs.clone() as Arc<dyn FsPageBacking>,
@@ -85,7 +79,7 @@ fn build_rootfs_v3() -> V3Topology {
 // === tests pinning the v3 walker against TestFs =====================
 
 #[test]
-#[ignore = "main-side zone-slot cascade flake (Weak upgrade fails — same root cause as v4 walker tests)"]
+#[ignore = "main-side zone-slot cascade flake (Weak upgrade fails)"]
 fn step_walk_resolves_simple_name() {
     use tx_substrate::step_v3::StepOutcome as V3;
 
@@ -115,7 +109,7 @@ fn step_walk_resolves_simple_name() {
 }
 
 #[test]
-#[ignore = "main-side zone-slot cascade flake (Weak upgrade fails — same root cause as v4 walker tests)"]
+#[ignore = "main-side zone-slot cascade flake (Weak upgrade fails)"]
 fn step_walk_resolves_multi_component_path() {
     use tx_substrate::step_v3::StepOutcome as V3;
 
@@ -147,11 +141,10 @@ fn step_walk_resolves_multi_component_path() {
     }
 }
 
-// Cascade flake: fails under workspace serial-test order due to the existing
-// main-side zone-slot Weak::upgrade race (same root cause as the other 6
-// ignored v3_walker tests). Passes in isolation. Wave 9d retired the
-// FS_OPS_V3_REGISTRY but the cascade flake is at the zone level, not the
-// registry level, so the ignore stays.
+// Cascade flake: fails under workspace serial-test order due to the
+// existing main-side zone-slot `Weak::upgrade` race (same root cause
+// as the other 6 ignored v3_walker tests). Passes in isolation. The
+// flake is at the zone level, so the ignore stays.
 #[test]
 #[ignore = "main-side zone-slot cascade flake; passes in isolation"]
 fn step_walk_returns_enoent_on_missing() {
@@ -179,7 +172,7 @@ fn step_walk_returns_enoent_on_missing() {
 }
 
 #[test]
-#[ignore = "main-side zone-slot cascade flake (Weak upgrade fails — same root cause as v4 walker tests)"]
+#[ignore = "main-side zone-slot cascade flake (Weak upgrade fails)"]
 fn step_walk_eacces_when_descend_perm_denied() {
     use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
 
@@ -329,16 +322,13 @@ fn step_open_eacces_without_read_bit() {
     }
 }
 
-// Wave 9d retired the registry-based `step_walk_returns_enodev_when_v3_fs_ops_unregistered`
-// test: `MountPayload::fs_ops` is now a required field, so the
-// "unregistered v3 fs_ops" state can no longer be constructed.
-// The walker's ENODEV branch still fires when the rnode lacks a
-// `containing_mount` weak (mount tear-down mid-walk), which is
-// exercised by the v4 walker tests.
+// `MountPayload::fs_ops` is a required field, so an "unregistered
+// fs_ops" state cannot be constructed. The walker's ENODEV branch
+// still fires when the rnode lacks a `containing_mount` weak (mount
+// tear-down mid-walk).
 
-// Compile-time sanity: enforce the v4 Errno path is gone from the v3
-// walker's surface (there's no v3-side `Errno::ENODEV` directly on the
-// walker; the conversion goes through the From impl).
+// Compile-time sanity: the `From<execution::Errno> for step_v3::Errno`
+// bridge round-trips ENODEV identically.
 #[test]
 fn errno_v4_to_v3_is_consistent() {
     use tx_substrate::step_v3::Errno as V3Errno;
