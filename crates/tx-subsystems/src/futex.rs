@@ -39,7 +39,8 @@ use tx_reactor::wait::{Channel, Mask};
 use tx_substrate::zone::ZoneError;
 use tx_substrate::SpinMutex;
 
-use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
+use crate::execution::{Errno, Guard, WaitToken};
+use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome};
 use crate::wait_carrier;
 
 /// Number of futex hash buckets. Fixed; no dynamic allocation.
@@ -126,28 +127,6 @@ pub fn bucket_index(uaddr: u64) -> usize {
 ///
 /// `uaddr` must be non-zero and 4-byte aligned; otherwise returns
 /// [`StepOutcome::Err(Errno::EINVAL)`].
-pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<()> {
-    if uaddr == 0 || (uaddr & 0x3) != 0 {
-        return StepOutcome::Err(Errno::EINVAL);
-    }
-    // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
-    // Replace with `UserAccessIf::read_user::<u32>` once Slice 9
-    // lands. The same exemption powers `sys_pipe2`'s userspace
-    // writeback and the `getresuid`/`getresgid` arms.
-    let observed = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
-    if observed != val {
-        return StepOutcome::Err(Errno::EAGAIN);
-    }
-    let idx = bucket_index(uaddr);
-    let carrier_id = {
-        let guard = BUCKETS.lock();
-        let buckets = guard
-            .as_ref()
-            .expect("futex buckets uninitialised — register_zones not called");
-        buckets[idx].carrier_id
-    };
-    StepOutcome::Blocked(WaitToken::new(carrier_id, FUTEX_WAKE_MASK))
-}
 
 /// `futex(uaddr, FUTEX_WAKE, n, ...)`.
 ///
@@ -158,20 +137,6 @@ pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<
 ///
 /// `uaddr` must be non-zero and 4-byte aligned; otherwise returns
 /// [`StepOutcome::Err(Errno::EINVAL)`].
-pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u32> {
-    if uaddr == 0 || (uaddr & 0x3) != 0 {
-        return StepOutcome::Err(Errno::EINVAL);
-    }
-    let idx = bucket_index(uaddr);
-    {
-        let guard = BUCKETS.lock();
-        let buckets = guard
-            .as_ref()
-            .expect("futex buckets uninitialised — register_zones not called");
-        buckets[idx].channel.fire(Mask::from_bits(FUTEX_WAKE_MASK));
-    }
-    StepOutcome::Done(n)
-}
 
 // -- step_v3-shape sibling fns ------------------------------------------------
 //
@@ -195,7 +160,7 @@ pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u3
 ///
 /// Wait never produces `Done`: completion arrives via the carrier
 /// resolution step driven by the script driver after the yield resolves.
-pub fn step_futex_wait_v3(
+pub fn step_futex_wait(
     uaddr: u64,
     val: u32,
     _guard: &Guard<'_>,
@@ -237,7 +202,7 @@ pub fn step_futex_wait_v3(
 ///   Linux `FUTEX_WAKE` with `n=0` is a defined no-op.
 ///
 /// Wake never produces `Yield`/`Continue`.
-pub fn step_futex_wake_v3(
+pub fn step_futex_wake(
     uaddr: u64,
     n: u32,
     _guard: &Guard<'_>,
@@ -289,7 +254,7 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let outcome = step_futex_wake(0, 1, &guard);
         drop(guard);
-        assert_eq!(outcome, StepOutcome::Err(Errno::EINVAL));
+        assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
     }
 
     #[test]
@@ -299,7 +264,7 @@ mod tests {
         // 0x1 — non-zero, non-zero-mod-4.
         let outcome = step_futex_wake(0x1, 1, &guard);
         drop(guard);
-        assert_eq!(outcome, StepOutcome::Err(Errno::EINVAL));
+        assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
     }
 
     #[test]
@@ -312,7 +277,7 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let outcome = step_futex_wait(uaddr, 0, &guard);
         drop(guard);
-        assert_eq!(outcome, StepOutcome::Err(Errno::EAGAIN));
+        assert_eq!(outcome, StepOutcome::Err(V3Errno::EAGAIN));
     }
 
     #[test]
@@ -323,16 +288,19 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let outcome = step_futex_wait(uaddr, 0xdead_beef, &guard);
         drop(guard);
+        use tx_substrate::step_v3::YieldShape;
         match outcome {
-            StepOutcome::Blocked(token) => {
-                assert_eq!(token.interest(), FUTEX_WAKE_MASK);
-                // Carrier id must resolve back to a registered channel.
+            StepOutcome::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => {
+                assert_eq!(interests.raw(), FUTEX_WAKE_MASK);
                 assert!(
-                    wait_carrier::lookup_wait_channel(token.carrier()).is_some(),
+                    wait_carrier::lookup_wait_channel(carrier.raw()).is_some(),
                     "futex bucket carrier must be registered with wait_carrier",
                 );
             }
-            other => panic!("expected Blocked, got {other:?}"),
+            other => panic!("expected Yield, got {other:?}"),
         }
     }
 
@@ -342,7 +310,7 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let outcome = step_futex_wait(0, 0, &guard);
         drop(guard);
-        assert_eq!(outcome, StepOutcome::Err(Errno::EINVAL));
+        assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
     }
 
     #[test]
@@ -351,7 +319,7 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let outcome = step_futex_wait(0x2, 0, &guard);
         drop(guard);
-        assert_eq!(outcome, StepOutcome::Err(Errno::EINVAL));
+        assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
     }
 
     #[test]
@@ -378,16 +346,16 @@ mod tests {
     // -- step_v3 sibling-fn tests -----------------------------------------
     //
     // The tests below exercise the step_v3-shape sibling fns
-    // `step_futex_wait_v3` / `step_futex_wake_v3`. They pin the
+    // `step_futex_wait` / `step_futex_wake`. They pin the
     // step_v3 outcome catalog without crossing the tx-shims dispatch
     // boundary.
 
     #[test]
-    fn step_futex_wait_v3_misaligned_uaddr_returns_einval() {
+    fn step_futex_wait_misaligned_uaddr_returns_einval() {
         let _setup = setup();
         let guard = tx_substrate::epoch::guard();
         // 0x1 — non-zero, non-zero-mod-4 (misaligned for u32).
-        let outcome = step_futex_wait_v3(0x1, 0, &guard);
+        let outcome = step_futex_wait(0x1, 0, &guard);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EINVAL) => {}
@@ -401,14 +369,14 @@ mod tests {
     }
 
     #[test]
-    fn step_futex_wait_v3_value_mismatch_returns_eagain() {
+    fn step_futex_wait_value_mismatch_returns_eagain() {
         let _setup = setup();
         // Word holds 0xdead_beef; FUTEX_WAIT with val=0 must observe
         // the mismatch and short-circuit to EAGAIN.
         let word: u32 = 0xdead_beef;
         let uaddr = &word as *const u32 as u64;
         let guard = tx_substrate::epoch::guard();
-        let outcome = step_futex_wait_v3(uaddr, 0, &guard);
+        let outcome = step_futex_wait(uaddr, 0, &guard);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EAGAIN) => {}
@@ -422,12 +390,12 @@ mod tests {
     }
 
     #[test]
-    fn step_futex_wait_v3_value_match_yields_on_carrier() {
+    fn step_futex_wait_value_match_yields_on_carrier() {
         let _setup = setup();
         let word: u32 = 0xdead_beef;
         let uaddr = &word as *const u32 as u64;
         let guard = tx_substrate::epoch::guard();
-        let outcome = step_futex_wait_v3(uaddr, 0xdead_beef, &guard);
+        let outcome = step_futex_wait(uaddr, 0xdead_beef, &guard);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Yield {
@@ -450,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn step_futex_wake_v3_zero_n_is_a_no_op_done_zero() {
+    fn step_futex_wake_zero_n_is_a_no_op_done_zero() {
         // Linux `FUTEX_WAKE` with `n=0` is a defined no-op;
         // `step_futex_wake` falls through to `Done(0)`. Tightening
         // (rejecting `n=0` as EINVAL) is a separate design decision.
@@ -458,7 +426,7 @@ mod tests {
         let word: u32 = 0;
         let uaddr = &word as *const u32 as u64;
         let guard = tx_substrate::epoch::guard();
-        let outcome = step_futex_wake_v3(uaddr, 0, &guard);
+        let outcome = step_futex_wake(uaddr, 0, &guard);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Done(0) => {}
@@ -467,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn step_futex_wake_v3_unwaited_returns_done_zero() {
+    fn step_futex_wake_unwaited_returns_done_zero() {
         let _setup = setup();
         // Wake on an idle bucket with no waiters parked on it.
         //
@@ -481,7 +449,7 @@ mod tests {
         let word: u32 = 0;
         let uaddr = &word as *const u32 as u64;
         let guard = tx_substrate::epoch::guard();
-        let outcome = step_futex_wake_v3(uaddr, 1, &guard);
+        let outcome = step_futex_wake(uaddr, 1, &guard);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Done(woken) => {
@@ -504,11 +472,15 @@ mod tests {
         let word: u32 = 42;
         let uaddr = &word as *const u32 as u64;
         let guard = tx_substrate::epoch::guard();
-        // wait → Blocked(token); pull the carrier id.
+        use tx_substrate::step_v3::YieldShape;
+        // wait → Yield { OnCarrier { … } }; pull the carrier id.
         let wait_outcome = step_futex_wait(uaddr, 42, &guard);
         let waiter_carrier = match wait_outcome {
-            StepOutcome::Blocked(token) => token.carrier(),
-            other => panic!("expected Blocked, got {other:?}"),
+            StepOutcome::Yield {
+                shape: YieldShape::OnCarrier { carrier, .. },
+                ..
+            } => carrier.raw(),
+            other => panic!("expected Yield, got {other:?}"),
         };
         // wake on the same uaddr; record success.
         let wake_outcome = step_futex_wake(uaddr, 1, &guard);
