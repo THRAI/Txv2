@@ -1,4 +1,4 @@
-//! Wave-9b: `FsOpsV3` + `FsPageBackingV3` impls on `ExecTestFs`.
+//! Wave-9b: `FsOps` + `FsPageBacking` impls on `ExecTestFs`.
 //!
 //! Per `docs/progress/decisions/2026-05-09-fsops-v3-design.md` and the
 //! wave-9a `TestFs` template (`tx-subsystems/src/vfs/walker/tests/v3.rs`),
@@ -25,7 +25,7 @@ use tx_subsystems::vm::USER_PAGE_SIZE;
 
 use super::{ExecTestFs, ExecTestInode};
 
-impl tx_subsystems::vfs::FsOpsV3 for ExecTestFs {
+impl tx_subsystems::vfs::FsOps for ExecTestFs {
     fn lookup(
         &self,
         parent: FsObjectId,
@@ -206,7 +206,7 @@ impl tx_subsystems::vfs::FsOpsV3 for ExecTestFs {
     }
 }
 
-impl tx_subsystems::page_backed::FsPageBackingV3 for ExecTestFs {
+impl tx_subsystems::page_backed::FsPageBacking for ExecTestFs {
     fn fetch_page(
         &self,
         fs_object_id: FsObjectId,
@@ -270,7 +270,7 @@ impl tx_subsystems::page_backed::FsPageBackingV3 for ExecTestFs {
 
 #[test]
 fn exec_testfs_v3_lookup_round_trips_after_add_regular() {
-    use tx_subsystems::vfs::FsOpsV3;
+    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
     let _setup = super::setup();
@@ -280,11 +280,11 @@ fn exec_testfs_v3_lookup_round_trips_after_add_regular() {
 
     let guard = tx_substrate::epoch::guard();
     assert_eq!(
-        <ExecTestFs as FsOpsV3>::lookup(&*fs, FsObjectId::new(2), b"init", &guard),
+        <ExecTestFs as FsOps>::lookup(&*fs, FsObjectId::new(2), b"init", &guard),
         V3::<_, NoProgress>::done(file_id)
     );
     assert_eq!(
-        <ExecTestFs as FsOpsV3>::lookup(&*fs, FsObjectId::new(2), b"missing", &guard),
+        <ExecTestFs as FsOps>::lookup(&*fs, FsObjectId::new(2), b"missing", &guard),
         V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
     );
 }
@@ -292,7 +292,7 @@ fn exec_testfs_v3_lookup_round_trips_after_add_regular() {
 #[test]
 fn exec_testfs_v3_load_inode_meta_returns_regular() {
     use tx_subsystems::vfs::structure::InodeKind;
-    use tx_subsystems::vfs::FsOpsV3;
+    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::StepOutcome as V3;
 
     let _setup = super::setup();
@@ -301,7 +301,7 @@ fn exec_testfs_v3_load_inode_meta_returns_regular() {
     let file_id = fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &bytes);
 
     let guard = tx_substrate::epoch::guard();
-    let meta = match <ExecTestFs as FsOpsV3>::load_inode_meta(&*fs, file_id, &guard) {
+    let meta = match <ExecTestFs as FsOps>::load_inode_meta(&*fs, file_id, &guard) {
         V3::Done(meta) => meta,
         other => panic!("load_inode_meta v3: {other:?}"),
     };
@@ -310,7 +310,7 @@ fn exec_testfs_v3_load_inode_meta_returns_regular() {
 
 #[test]
 fn exec_testfs_v3_create_inode_returns_enosys() {
-    use tx_subsystems::vfs::FsOpsV3;
+    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
     let _setup = super::setup();
@@ -319,7 +319,7 @@ fn exec_testfs_v3_create_inode_returns_enosys() {
     let guard = tx_substrate::epoch::guard();
     let cred = Credential::root();
     assert_eq!(
-        <ExecTestFs as FsOpsV3>::create_inode(
+        <ExecTestFs as FsOps>::create_inode(
             &*fs,
             FsObjectId::new(2),
             b"new",
@@ -333,7 +333,7 @@ fn exec_testfs_v3_create_inode_returns_enosys() {
 
 #[test]
 fn exec_testfs_v3_fetch_page_zero_offset_returns_frame() {
-    use tx_subsystems::page_backed::FsPageBackingV3;
+    use tx_subsystems::page_backed::FsPageBacking;
     use tx_substrate::step_v3::StepOutcome as V3;
 
     let _setup = super::setup();
@@ -342,7 +342,7 @@ fn exec_testfs_v3_fetch_page_zero_offset_returns_frame() {
     let file_id = fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &bytes);
 
     let guard = tx_substrate::epoch::guard();
-    match <ExecTestFs as FsPageBackingV3>::fetch_page(&*fs, file_id, 0, &guard) {
+    match <ExecTestFs as FsPageBacking>::fetch_page(&*fs, file_id, 0, &guard) {
         V3::Done(_frame) => {}
         other => panic!("fetch_page v3: {other:?}"),
     }
@@ -350,7 +350,7 @@ fn exec_testfs_v3_fetch_page_zero_offset_returns_frame() {
 
 #[test]
 fn exec_testfs_v3_fsync_returns_done() {
-    use tx_subsystems::page_backed::FsPageBackingV3;
+    use tx_subsystems::page_backed::FsPageBacking;
     use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
 
     let _setup = super::setup();
@@ -358,7 +358,7 @@ fn exec_testfs_v3_fsync_returns_done() {
 
     let guard = tx_substrate::epoch::guard();
     assert_eq!(
-        <ExecTestFs as FsPageBackingV3>::fsync(&*fs, FsObjectId::new(2), &guard),
+        <ExecTestFs as FsPageBacking>::fsync(&*fs, FsObjectId::new(2), &guard),
         V3::<(), NoProgress>::done(())
     );
 }

@@ -10,13 +10,13 @@ use tx_subsystems::cred::CapabilitySet;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
-use tx_subsystems::page_backed::FsPageBackingV3;
+use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::step_chdir;
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
 };
-use tx_subsystems::vfs::FsOpsV3;
+use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
     AT_FDCWD, AT_REMOVEDIR, NR_FTRUNCATE, NR_LINKAT, NR_MKDIRAT, NR_READLINKAT, NR_RENAMEAT2,
@@ -49,8 +49,8 @@ fn fm_setup() -> TestSetup {
 fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     let tmpfs = Arc::new(Tmpfs::new());
     let payload = MountPayload::new_cap(
-        tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOpsV3>,
-        tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBackingV3>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
         None,
         DevId::new(411),
         MountOptions::default(),

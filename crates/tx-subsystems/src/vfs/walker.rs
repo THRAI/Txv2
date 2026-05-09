@@ -1,4 +1,4 @@
-//! VFS path walker (`step_walk_v3`) and open-by-path (`step_open_v3`).
+//! VFS path walker (`step_walk`) and open-by-path (`step_open`).
 //!
 //! The walker resolves a `&[u8]` path rooted at a `Cap<DEntry>` into a
 //! terminal `Cap<DEntry>`, honouring mount-point boundaries and
@@ -16,14 +16,14 @@
 //!
 //! ## Surface
 //!
-//! - [`step_walk_v3`] returns the terminal `Cap<DEntry>` for a path.
-//! - [`step_open_v3`] composes [`step_walk_v3`] with `OpenFile::new_cap`
+//! - [`step_walk`] returns the terminal `Cap<DEntry>` for a path.
+//! - [`step_open`] composes [`step_walk`] with `OpenFile::new_cap`
 //!   to produce a `Cap<OpenFile>` over the resolved RNode.
 //!
 //! Both are `async` so future cross-await disciplines (range-lock
-//! waits inside `FsOpsV3::lookup`, page-cache materialisation inside
+//! waits inside `FsOps::lookup`, page-cache materialisation inside
 //! `OpenFile::step_read` for regular files) compose cleanly. The
-//! day-1 implementations call only synchronous `FsOpsV3::lookup` /
+//! day-1 implementations call only synchronous `FsOps::lookup` /
 //! `load_inode_meta` / `read_link` against in-memory backends, so
 //! every `.await` is a no-op today.
 //!
@@ -38,7 +38,7 @@
 //! hint (set at mount-publication time per
 //! `txdoc:MOUNT-STEP-MOUNT-COMMIT-ORDERING-1`, see
 //! `crate::mount::MountIdentity`), the walker upgrades the weak,
-//! switches the active filesystem to the mount's `payload().fs_ops_v3`,
+//! switches the active filesystem to the mount's `payload().fs_ops`,
 //! and continues from a fresh DEntry over `mount.root()`. If the
 //! upgrade fails (mount torn down mid-walk), the walker reports
 //! `Errno::EIO` (`Errno::ENXIO` is not in the day-1 set; the
@@ -68,11 +68,11 @@
 //!   triplet receives `Errno::EACCES` (mapping to `WalkCause::
 //!   TraverseDenied` for spec-trace consumers); `CAP_DAC_OVERRIDE`
 //!   short-circuits.
-//! - At terminal-component open ([`step_open_v3`]), [`check_open_perm`]
+//! - At terminal-component open ([`step_open`]), [`check_open_perm`]
 //!   validates the requested `OpenFileFlags { read, write }` against
 //!   the inode's mode bits using the same triplet selection rule.
 //!   Execute permission for `exec_script` is enforced separately at
-//!   exec time (Wave 4); `step_open_v3` only enforces R/W.
+//!   exec time (Wave 4); `step_open` only enforces R/W.
 //!
 //! Both checks consult the **effective** uid/gid (the
 //! `Credential` projection of `Cred` already does this — see
@@ -94,7 +94,7 @@ use crate::vfs::structure::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile, OpenFileFlags,
     RNode, RNodeBacking,
 };
-use crate::vfs::FsOpsV3;
+use crate::vfs::FsOps;
 
 /// POSIX symlink-loop budget. Matches Linux's `MAXSYMLINKS = 40`.
 /// The 41st observed symlink (after 40 hops have already been
@@ -103,15 +103,15 @@ pub const SYMLOOP_MAX: u32 = 40;
 
 // === v3 walker entry points ==========================================
 //
-// Wave 9c introduced `step_walk_v3` / `step_open_v3` as v3-typed
+// Wave 9c introduced `step_walk` / `step_open` as v3-typed
 // siblings of the legacy v4 `step_walk` / `step_open`. Wave 9f retired
 // the v4 entry points: every production and test caller now routes
 // through the v3 surface, and `walk_inner` / `step_walk` / `step_open`
 // were deleted. The walker today routes exclusively through
-// `FsOpsV3` and emits `tx_substrate::step_v3::StepOutcome`.
+// `FsOps` and emits `tx_substrate::step_v3::StepOutcome`.
 //
-// Per-call-site `Continue` mapping: `FsOpsV3::lookup` /
-// `FsOpsV3::load_inode_meta` / `FsOpsV3::read_link` / `FsOpsV3::
+// Per-call-site `Continue` mapping: `FsOps::lookup` /
+// `FsOps::load_inode_meta` / `FsOps::read_link` / `FsOps::
 // materialise_rnode` are all one-shot identity-side queries with
 // `NoProgress`. The trait surface contract (per the wave-8 design doc
 // and the existing impls in `tmpfs.rs`, `devfs.rs`, `namespace.rs`,
@@ -135,10 +135,10 @@ pub const SYMLOOP_MAX: u32 = 40;
 /// `ENOENT` (missing component), `ENOTDIR` (non-directory in the
 /// middle of a walk, or trailing `/` after a non-directory), `ELOOP`
 /// (symlink budget exceeded), `ENAMETOOLONG` (component too long),
-/// and propagated `FsOpsV3` errors. Resolution goes through the
-/// `FsOpsV3` trait surface and emits a v3 `StepOutcome<Cap<DEntry>,
+/// and propagated `FsOps` errors. Resolution goes through the
+/// `FsOps` trait surface and emits a v3 `StepOutcome<Cap<DEntry>,
 /// NoProgress>`.
-pub async fn step_walk_v3<'g>(
+pub async fn step_walk<'g>(
     rooted_at: Cap<DEntry>,
     path: &[u8],
     cred: &Credential,
@@ -147,10 +147,10 @@ pub async fn step_walk_v3<'g>(
     walk_inner_v3(rooted_at, path, cred, guard)
 }
 
-/// Open a path by name. Composes [`step_walk_v3`] with
+/// Open a path by name. Composes [`step_walk`] with
 /// `OpenFile::new_cap` and the DAC R/W check, returning a
 /// `Cap<OpenFile>` over the resolved RNode.
-pub async fn step_open_v3<'g>(
+pub async fn step_open<'g>(
     rooted_at: Cap<DEntry>,
     path: &[u8],
     flags: OpenFileFlags,
@@ -164,7 +164,7 @@ pub async fn step_open_v3<'g>(
     // current surface only resolves existing entries.
     let _ = mode;
 
-    let dentry = match step_walk_v3(rooted_at, path, cred, guard).await {
+    let dentry = match step_walk(rooted_at, path, cred, guard).await {
         V3::Done(d) => d,
         V3::Continue { .. } => {
             // `walk_inner_v3` only returns `Done` / `Yield` / `Err` at
@@ -192,7 +192,7 @@ pub async fn step_open_v3<'g>(
     }
 }
 
-/// Synchronous core of [`step_walk_v3`].
+/// Synchronous core of [`step_walk`].
 ///
 /// The walker takes a single `&Guard<'_>` borrowed from the caller's
 /// frame; it is not held across an `.await` because the walker itself
@@ -200,10 +200,10 @@ pub async fn step_open_v3<'g>(
 /// waits, each backend call site will take a fresh per-call guard
 /// inside the `await_*` helper, matching `vm::execution::fault_script`.
 ///
-/// All FS calls go through the `FsOpsV3` trait surface
-/// (`Arc<dyn FsOpsV3>`); every `StepOutcome::*` / `Errno::*` is the v3
+/// All FS calls go through the `FsOps` trait surface
+/// (`Arc<dyn FsOps>`); every `StepOutcome::*` / `Errno::*` is the v3
 /// variant. Mount-crossing rebuilds the v3 fs_ops from the new
-/// mount-root dentry's containing-payload — see `fs_ops_v3_for`.
+/// mount-root dentry's containing-payload — see `fs_ops_for`.
 fn walk_inner_v3<'g>(
     rooted_at: Cap<DEntry>,
     path: &[u8],
@@ -222,7 +222,7 @@ fn walk_inner_v3<'g>(
 
     let must_be_directory = remaining.last().copied() == Some(b'/');
 
-    let mut current_fs_ops: Option<Arc<dyn FsOpsV3>> = fs_ops_v3_for(&current, guard);
+    let mut current_fs_ops: Option<Arc<dyn FsOps>> = fs_ops_for(&current, guard);
     let mut current_mount_payload: Option<Cap<MountPayload>> = mount_payload_for(&current, guard);
 
     let mut hop_count: u32 = 0;
@@ -260,7 +260,7 @@ fn walk_inner_v3<'g>(
                 if let Some(parent_cap) = parent_weak.upgrade(guard) {
                     if !is_same_dentry(&current, &mount_root) {
                         current = parent_cap;
-                        current_fs_ops = fs_ops_v3_for(&current, guard);
+                        current_fs_ops = fs_ops_for(&current, guard);
                         current_mount_payload = mount_payload_for(&current, guard);
                     }
                 }
@@ -334,7 +334,7 @@ fn walk_inner_v3<'g>(
             let target_bytes = target.clone();
             if target_bytes.first() == Some(&b'/') {
                 current = mount_root.clone();
-                current_fs_ops = fs_ops_v3_for(&current, guard);
+                current_fs_ops = fs_ops_for(&current, guard);
                 current_mount_payload = mount_payload_for(&current, guard);
                 let mut new_remaining =
                     Vec::with_capacity(target_bytes.len() + remaining.len() + 1);
@@ -372,7 +372,7 @@ fn walk_inner_v3<'g>(
         //
         // The two paths produce the same downstream state: a fresh
         // DEntry over the mount's root rnode, with `current_fs_ops`
-        // switched to the new mount's `payload.fs_ops_v3`.
+        // switched to the new mount's `payload.fs_ops`.
         let crossing_mount = child_dentry.mounted_hint().and_then(|w| w.upgrade(guard));
         let crossing_mount = match crossing_mount {
             Some(m) => Some(m),
@@ -385,9 +385,9 @@ fn walk_inner_v3<'g>(
                 Ok(d) => d,
                 Err(err) => return V3::err(err.into()),
             };
-            // `fs_ops_v3_for` reads `payload.fs_ops_v3()` directly via
+            // `fs_ops_for` reads `payload.fs_ops()` directly via
             // the new mount-root dentry's `containing_mount_weak`.
-            current_fs_ops = fs_ops_v3_for(&current, guard);
+            current_fs_ops = fs_ops_for(&current, guard);
             current_mount_payload = mount_payload_for(&current, guard);
             continue;
         }
@@ -398,16 +398,16 @@ fn walk_inner_v3<'g>(
 }
 
 /// Materialise an `RNode` for a freshly-resolved child inode using
-/// `FsOpsV3`.
+/// `FsOps`.
 ///
 /// - `Directory` → `RNodeBacking::Directory`.
-/// - `Symlink` → call `FsOpsV3::read_link` and wrap the bytes in
+/// - `Symlink` → call `FsOps::read_link` and wrap the bytes in
 ///   `RNodeBacking::Symlink { target }`.
 /// - Other kinds (Regular / CharDevice / BlockDevice / Fifo / Socket)
 ///   delegate to the FS's `materialise_rnode` hook; default impl
 ///   returns `ENOSYS` for backends that don't yet support the kind.
 fn materialise_child_rnode_v3<'g>(
-    fs_ops: &Arc<dyn FsOpsV3>,
+    fs_ops: &Arc<dyn FsOps>,
     child_fs_object_id: FsObjectId,
     meta: InodeMeta,
     guard: &Guard<'g>,
@@ -451,17 +451,17 @@ fn materialise_child_rnode_v3<'g>(
     }
 }
 
-/// Resolve the `Arc<dyn FsOpsV3>` in scope for a given dentry by
+/// Resolve the `Arc<dyn FsOps>` in scope for a given dentry by
 /// upgrading its RNode's containing-mount weak and reading the
 /// payload's v3 fs_ops slot directly.
 ///
 /// Wave 9d retired the sidecar registry that previously bridged the
-/// v3 walker to mount payloads — `MountPayload::fs_ops_v3` is now a
+/// v3 walker to mount payloads — `MountPayload::fs_ops` is now a
 /// regular field populated at mount-publication time.
-fn fs_ops_v3_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Arc<dyn FsOpsV3>> {
+fn fs_ops_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Arc<dyn FsOps>> {
     let mount_payload_weak: Weak<MountPayload> = dentry.rnode().containing_mount_weak()?;
     let payload = mount_payload_weak.upgrade(guard)?;
-    Some(payload.fs_ops_v3().clone())
+    Some(payload.fs_ops().clone())
 }
 
 // === DAC predicates ===================================================
@@ -507,7 +507,7 @@ fn check_descend_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), Errno> 
 ///
 /// Slice simplification: full DAC override (real Linux's
 /// `CAP_DAC_OVERRIDE` does not grant exec on regular files unless an
-/// X bit is set, but `step_open_v3` does not enforce exec — that
+/// X bit is set, but `step_open` does not enforce exec — that
 /// lives in `exec_script` in Wave 4). Per
 /// `txdoc:VFS-CHECKS-PERMISSIONS-1`.
 fn check_open_perm(meta: &InodeMeta, flags: OpenFileFlags, cred: &Credential) -> Result<(), Errno> {

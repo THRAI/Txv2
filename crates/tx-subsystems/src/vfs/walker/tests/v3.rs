@@ -1,4 +1,4 @@
-//! Wave 9a: `FsOpsV3` + `FsPageBackingV3` impls + tests on `TestFs`.
+//! Wave 9a: `FsOps` + `FsPageBacking` impls + tests on `TestFs`.
 //!
 //! Standalone v3 bodies for `TestFs` (the v4 trait is no longer
 //! implemented after the v3-only unification). `TestFs` is purely
@@ -18,7 +18,7 @@ use crate::vfs::structure::{
 
 use super::TestFs;
 
-impl crate::vfs::FsOpsV3 for TestFs {
+impl crate::vfs::FsOps for TestFs {
     fn lookup(
         &self,
         parent: FsObjectId,
@@ -189,7 +189,7 @@ impl crate::vfs::FsOpsV3 for TestFs {
     }
 }
 
-impl crate::page_backed::FsPageBackingV3 for TestFs {
+impl crate::page_backed::FsPageBacking for TestFs {
     fn fetch_page(
         &self,
         _fs_object_id: FsObjectId,
@@ -231,7 +231,7 @@ impl crate::page_backed::FsPageBackingV3 for TestFs {
 
 #[test]
 fn testfs_v3_lookup_round_trips_after_add_dir() {
-    use crate::vfs::FsOpsV3;
+    use crate::vfs::FsOps;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
@@ -244,18 +244,18 @@ fn testfs_v3_lookup_round_trips_after_add_dir() {
 
     let guard = tx_substrate::epoch::guard();
     assert_eq!(
-        <TestFs as FsOpsV3>::lookup(&*testfs, FsObjectId::new(2), b"foo", &guard),
+        <TestFs as FsOps>::lookup(&*testfs, FsObjectId::new(2), b"foo", &guard),
         V3::<_, NoProgress>::done(dir_id)
     );
     assert_eq!(
-        <TestFs as FsOpsV3>::lookup(&*testfs, FsObjectId::new(2), b"missing", &guard),
+        <TestFs as FsOps>::lookup(&*testfs, FsObjectId::new(2), b"missing", &guard),
         V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
     );
 }
 
 #[test]
 fn testfs_v3_read_link_returns_target_bytes() {
-    use crate::vfs::FsOpsV3;
+    use crate::vfs::FsOps;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
@@ -267,7 +267,7 @@ fn testfs_v3_read_link_returns_target_bytes() {
     let link_id = testfs.add_symlink(FsObjectId::new(2), b"l", b"target");
 
     let guard = tx_substrate::epoch::guard();
-    let outcome = <TestFs as FsOpsV3>::read_link(&*testfs, link_id, &guard);
+    let outcome = <TestFs as FsOps>::read_link(&*testfs, link_id, &guard);
     match outcome {
         V3::Done(bytes) => assert_eq!(&*bytes, b"target".as_slice()),
         other => panic!("read_link v3: {other:?}"),
@@ -275,14 +275,14 @@ fn testfs_v3_read_link_returns_target_bytes() {
 
     let dir_id = testfs.add_dir(FsObjectId::new(2), b"d");
     assert_eq!(
-        <TestFs as FsOpsV3>::read_link(&*testfs, dir_id, &guard),
+        <TestFs as FsOps>::read_link(&*testfs, dir_id, &guard),
         V3::<Box<[u8]>, NoProgress>::err(V3Errno::EINVAL)
     );
 }
 
 #[test]
 fn testfs_v3_load_inode_meta_returns_kind_and_mode() {
-    use crate::vfs::FsOpsV3;
+    use crate::vfs::FsOps;
     use tx_substrate::step_v3::StepOutcome as V3;
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
@@ -294,7 +294,7 @@ fn testfs_v3_load_inode_meta_returns_kind_and_mode() {
     let reg_id = testfs.add_regular(FsObjectId::new(2), b"file");
 
     let guard = tx_substrate::epoch::guard();
-    let meta = match <TestFs as FsOpsV3>::load_inode_meta(&*testfs, reg_id, &guard) {
+    let meta = match <TestFs as FsOps>::load_inode_meta(&*testfs, reg_id, &guard) {
         V3::Done(meta) => meta,
         other => panic!("load_inode_meta v3: {other:?}"),
     };
@@ -303,7 +303,7 @@ fn testfs_v3_load_inode_meta_returns_kind_and_mode() {
 
 #[test]
 fn testfs_v3_fetch_page_default_returns_enosys() {
-    use crate::page_backed::FsPageBackingV3;
+    use crate::page_backed::FsPageBacking;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
@@ -314,11 +314,11 @@ fn testfs_v3_fetch_page_default_returns_enosys() {
     let testfs = TestFs::new(FsObjectId::new(2));
     let guard = tx_substrate::epoch::guard();
     assert_eq!(
-        <TestFs as FsPageBackingV3>::fetch_page(&*testfs, FsObjectId::new(2), 0, &guard),
+        <TestFs as FsPageBacking>::fetch_page(&*testfs, FsObjectId::new(2), 0, &guard),
         V3::<Frame, NoProgress>::err(V3Errno::ENOSYS)
     );
     assert_eq!(
-        <TestFs as FsPageBackingV3>::fsync(&*testfs, FsObjectId::new(2), &guard),
+        <TestFs as FsPageBacking>::fsync(&*testfs, FsObjectId::new(2), &guard),
         V3::<(), NoProgress>::done(())
     );
 }

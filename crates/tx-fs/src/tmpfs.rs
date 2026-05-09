@@ -115,7 +115,7 @@ impl TmpfsState {
 ///
 /// Holds the inode table plus a monotonic id allocator. One instance
 /// per mount; the `ROOT_MOUNT` slot in `tx-kernel`'s init keeps a
-/// strong `Arc<dyn FsOpsV3>` and `Arc<dyn FsPageBackingV3>` against the
+/// strong `Arc<dyn FsOps>` and `Arc<dyn FsPageBacking>` against the
 /// same `Tmpfs` so both trait objects observe the same state.
 pub struct Tmpfs {
     state: SpinMutex<TmpfsState>,
@@ -141,11 +141,11 @@ impl Tmpfs {
     /// instance the mount payload exposes).
     pub fn new_root() -> (Arc<Self>, MountOutput) {
         let tmpfs: Arc<Self> = Arc::new(Self::new());
-        let fs_ops_v3 = tmpfs.clone().fs_ops_v3_arc();
-        let fs_page_backing_v3 = tmpfs.clone().fs_page_backing_v3_arc();
+        let fs_ops = tmpfs.clone().fs_ops_arc();
+        let fs_page_backing = tmpfs.clone().fs_page_backing_arc();
         let output = MountOutput {
-            fs_ops_v3,
-            fs_page_backing_v3,
+            fs_ops,
+            fs_page_backing,
             root_fs_object_id: TMPFS_ROOT_OBJECT_ID,
             root_inode_meta: InodeMeta::new(InodeKind::Directory, TMPFS_ROOT_MODE),
         };
@@ -166,7 +166,7 @@ impl Default for Tmpfs {
 
 // === v3-only trait impls ===============================================
 //
-// `impl FsOpsV3 for Tmpfs` and `impl FsPageBackingV3 for Tmpfs` carry the
+// `impl FsOps for Tmpfs` and `impl FsPageBacking for Tmpfs` carry the
 // full method bodies. The earlier dual-trait (v3+v4) shape, where v3
 // methods delegated to v4 method bodies via `<Self as FsOps>::method`, is
 // retired per the v3-only unification: each method here owns its
@@ -175,12 +175,12 @@ impl Default for Tmpfs {
 // Tmpfs is one-shot through every method (no v4 `Advanced(t)` /
 // `Blocked` branches survive), with two real wait points:
 //
-// * `FsPageBackingV3::fetch_page` calls `PageContainer::materialize_page`
+// * `FsPageBacking::fetch_page` calls `PageContainer::materialize_page`
 //   which can return any v4 outcome variant; we translate AdvancedThenBlocked
 //   to a v3 `done(frame)` (dropping the wait token, since the materialised
 //   PPN is observable now), and Blocked to `yield_on_carrier`.
-// * `FsPageBackingV3::truncate` uses `step_truncate`, which in turn
-//   calls `FsPageBackingV3::truncate` recursively for File-kind containers
+// * `FsPageBacking::truncate` uses `step_truncate`, which in turn
+//   calls `FsPageBacking::truncate` recursively for File-kind containers
 //   only. tmpfs containers are `PageContainerKind::Anon`, so no recursion;
 //   any `Yield` from the call is reflected as `EAGAIN` per
 //   `crates/tx-subsystems/src/page_backed/lifecycle.rs`'s wave-7 comment.
@@ -188,29 +188,29 @@ impl Default for Tmpfs {
 // Per the wave-8 design doc
 // (`docs/progress/decisions/2026-05-09-fsops-v3-design.md`), v3 callers
 // (the walker entry points) consume these impls via
-// `Arc<dyn FsOpsV3>` / `Arc<dyn FsPageBackingV3>`. `MountPayload` carries
+// `Arc<dyn FsOps>` / `Arc<dyn FsPageBacking>`. `MountPayload` carries
 // the v3 trait objects directly.
 //
 // Fully-qualified `tx_substrate::step_v3::*` references at the impl sites
 // avoid clashing with `tx_subsystems::execution::StepOutcome` already in
 // scope, per the wave-4/6/7 trait-impl convention.
 
-use tx_subsystems::page_backed::FsPageBackingV3;
-use tx_subsystems::vfs::FsOpsV3;
+use tx_subsystems::page_backed::FsPageBacking;
+use tx_subsystems::vfs::FsOps;
 
 impl Tmpfs {
-    /// v3 trait-object factory for [`FsOpsV3`].
-    pub fn fs_ops_v3_arc(self: Arc<Self>) -> Arc<dyn FsOpsV3> {
+    /// v3 trait-object factory for [`FsOps`].
+    pub fn fs_ops_arc(self: Arc<Self>) -> Arc<dyn FsOps> {
         self
     }
 
-    /// v3 trait-object factory for [`FsPageBackingV3`].
-    pub fn fs_page_backing_v3_arc(self: Arc<Self>) -> Arc<dyn FsPageBackingV3> {
+    /// v3 trait-object factory for [`FsPageBacking`].
+    pub fn fs_page_backing_arc(self: Arc<Self>) -> Arc<dyn FsPageBacking> {
         self
     }
 }
 
-impl FsOpsV3 for Tmpfs {
+impl FsOps for Tmpfs {
     fn lookup(
         &self,
         parent: FsObjectId,
@@ -918,7 +918,7 @@ impl FsOpsV3 for Tmpfs {
     }
 }
 
-impl FsPageBackingV3 for Tmpfs {
+impl FsPageBacking for Tmpfs {
     fn fetch_page(
         &self,
         fs_object_id: FsObjectId,
@@ -1023,7 +1023,7 @@ impl FsPageBackingV3 for Tmpfs {
         };
 
         // tmpfs containers are PageContainerKind::Anon, so step_truncate
-        // never recurses into FsPageBackingV3::truncate; only Done / Err are
+        // never recurses into FsPageBacking::truncate; only Done / Err are
         // observable in practice. Continue / Yield are handled defensively
         // for completeness.
         match step_truncate(&container, new_size, guard) {

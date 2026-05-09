@@ -1,14 +1,14 @@
-//! Wave 9c: end-to-end tests for `step_walk_v3` / `step_open_v3`.
+//! Wave 9c: end-to-end tests for `step_walk` / `step_open`.
 //!
 //! Mirrors the v4 walker tests in `tests.rs` but exercises the v3
-//! entry points landed in wave 9c. Each test goes through `FsOpsV3`
+//! entry points landed in wave 9c. Each test goes through `FsOps`
 //! dispatch end-to-end against the canonical production fs (Tmpfs) so
 //! the wave is a genuine cutover, not a parallel-trait test isolated
 //! from real filesystem code.
 //!
 //! Lives in its own file so the parent `tests.rs` stays under the
 //! `cargo xtask lint arch` 1500-line authored-file cap, mirroring the
-//! `v3.rs` sibling that hosts the wave-9a `FsOpsV3 for TestFs` impl.
+//! `v3.rs` sibling that hosts the wave-9a `FsOps for TestFs` impl.
 
 use alloc::sync::Arc;
 
@@ -18,13 +18,13 @@ use crate::execution::Errno;
 use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
-use crate::page_backed::FsPageBackingV3;
+use crate::page_backed::FsPageBacking;
 use crate::vfs::structure::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
     RNodeBacking, S_IFDIR,
 };
-use crate::vfs::walker::{step_open_v3, step_walk_v3};
-use crate::vfs::FsOpsV3;
+use crate::vfs::walker::{step_open, step_walk};
+use crate::vfs::FsOps;
 
 use super::{block_on, init_zones, TestFs};
 
@@ -40,11 +40,11 @@ fn build_rootfs_v3() -> V3Topology {
     let root_id = FsObjectId::new(2);
 
     // Wave 9d retired the sidecar registry: the v3 fs_ops trait
-    // object now flows through `MountPayload`'s `fs_ops_v3` field
+    // object now flows through `MountPayload`'s `fs_ops` field
     // directly, the same way the v4 fs_ops field is populated.
     let payload = MountPayload::new_cap(
-        rootfs.clone() as Arc<dyn FsOpsV3>,
-        rootfs.clone() as Arc<dyn FsPageBackingV3>,
+        rootfs.clone() as Arc<dyn FsOps>,
+        rootfs.clone() as Arc<dyn FsPageBacking>,
         None,
         DevId::new(1),
         MountOptions::default(),
@@ -86,7 +86,7 @@ fn build_rootfs_v3() -> V3Topology {
 
 #[test]
 #[ignore = "main-side zone-slot cascade flake (Weak upgrade fails — same root cause as v4 walker tests)"]
-fn step_walk_v3_resolves_simple_name() {
+fn step_walk_resolves_simple_name() {
     use tx_substrate::step_v3::StepOutcome as V3;
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
@@ -99,7 +99,7 @@ fn step_walk_v3_resolves_simple_name() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk_v3(
+    let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"foo",
         &cred,
@@ -116,7 +116,7 @@ fn step_walk_v3_resolves_simple_name() {
 
 #[test]
 #[ignore = "main-side zone-slot cascade flake (Weak upgrade fails — same root cause as v4 walker tests)"]
-fn step_walk_v3_resolves_multi_component_path() {
+fn step_walk_resolves_multi_component_path() {
     use tx_substrate::step_v3::StepOutcome as V3;
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
@@ -131,7 +131,7 @@ fn step_walk_v3_resolves_multi_component_path() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk_v3(
+    let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/foo/bar/baz",
         &cred,
@@ -154,7 +154,7 @@ fn step_walk_v3_resolves_multi_component_path() {
 // registry level, so the ignore stays.
 #[test]
 #[ignore = "main-side zone-slot cascade flake; passes in isolation"]
-fn step_walk_v3_returns_enoent_on_missing() {
+fn step_walk_returns_enoent_on_missing() {
     use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
@@ -165,7 +165,7 @@ fn step_walk_v3_returns_enoent_on_missing() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk_v3(
+    let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/nope",
         &cred,
@@ -180,7 +180,7 @@ fn step_walk_v3_returns_enoent_on_missing() {
 
 #[test]
 #[ignore = "main-side zone-slot cascade flake (Weak upgrade fails — same root cause as v4 walker tests)"]
-fn step_walk_v3_eacces_when_descend_perm_denied() {
+fn step_walk_eacces_when_descend_perm_denied() {
     use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
@@ -202,7 +202,7 @@ fn step_walk_v3_eacces_when_descend_perm_denied() {
         effective_caps: crate::cred::CapabilitySet::EMPTY,
     };
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk_v3(
+    let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/ownerdir/leaf",
         &cred,
@@ -217,7 +217,7 @@ fn step_walk_v3_eacces_when_descend_perm_denied() {
 
 #[test]
 #[ignore = "main-side zone-slot cascade flake (same root cause as v4 walker tests; passes in isolation)"]
-fn step_walk_v3_chases_relative_symlink() {
+fn step_walk_chases_relative_symlink() {
     use tx_substrate::step_v3::StepOutcome as V3;
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
@@ -232,7 +232,7 @@ fn step_walk_v3_chases_relative_symlink() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk_v3(
+    let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/alias",
         &cred,
@@ -250,7 +250,7 @@ fn step_walk_v3_chases_relative_symlink() {
 
 #[test]
 #[ignore = "main-side zone-slot cascade flake; passes in isolation"]
-fn step_open_v3_round_trips_to_directory() {
+fn step_open_round_trips_to_directory() {
     use tx_substrate::step_v3::StepOutcome as V3;
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
@@ -263,7 +263,7 @@ fn step_open_v3_round_trips_to_directory() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_open_v3(
+    let outcome = block_on(step_open(
         topo.root_dentry.clone(),
         b"/opendir",
         OpenFileFlags {
@@ -286,7 +286,7 @@ fn step_open_v3_round_trips_to_directory() {
 
 #[test]
 #[ignore = "main-side zone-slot cascade flake (same root cause as v4 walker EACCES tests; passes in isolation)"]
-fn step_open_v3_eacces_without_read_bit() {
+fn step_open_eacces_without_read_bit() {
     use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
@@ -308,7 +308,7 @@ fn step_open_v3_eacces_without_read_bit() {
         effective_caps: crate::cred::CapabilitySet::EMPTY,
     };
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_open_v3(
+    let outcome = block_on(step_open(
         topo.root_dentry.clone(),
         b"/locked",
         OpenFileFlags {
@@ -329,8 +329,8 @@ fn step_open_v3_eacces_without_read_bit() {
     }
 }
 
-// Wave 9d retired the registry-based `step_walk_v3_returns_enodev_when_v3_fs_ops_unregistered`
-// test: `MountPayload::fs_ops_v3` is now a required field, so the
+// Wave 9d retired the registry-based `step_walk_returns_enodev_when_v3_fs_ops_unregistered`
+// test: `MountPayload::fs_ops` is now a required field, so the
 // "unregistered v3 fs_ops" state can no longer be constructed.
 // The walker's ENODEV branch still fires when the rnode lacks a
 // `containing_mount` weak (mount tear-down mid-walk), which is

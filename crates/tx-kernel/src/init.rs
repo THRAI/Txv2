@@ -377,8 +377,8 @@ impl<P: TxPlatform> CoreInit<P> {
         // `MountId(2)` / `DevId(2)`. Existing trio boot-smoke
         // assertions on the literal ids stay valid.
         let payload = MountPayload::new_cap(
-            mount_output.fs_ops_v3.clone(),
-            mount_output.fs_page_backing_v3.clone(),
+            mount_output.fs_ops.clone(),
+            mount_output.fs_page_backing.clone(),
             None,
             mount::allocate_dev_id(),
             MountOptions::default(),
@@ -445,10 +445,10 @@ impl<P: TxPlatform> CoreInit<P> {
             .clone()
             .expect("mount_devfs_at_dev: ROOT_MOUNT must be populated");
 
-        // mkdir("/dev") on the rootfs. The rootfs's fs_ops_v3 is the
-        // tmpfs instance whose `FsOpsV3::mkdir` actually mutates the
+        // mkdir("/dev") on the rootfs. The rootfs's fs_ops is the
+        // tmpfs instance whose `FsOps::mkdir` actually mutates the
         // tmpfs directory map (the v3 impl delegates back to v4).
-        // Wave 9g-d: migrated from v4 FsOps to v3 FsOpsV3 — outcome
+        // Wave 9g-d: migrated from v4 FsOps to v3 FsOps — outcome
         // shape collapsed from 5 to 4 variants. Boot-time tmpfs
         // mkdir is synchronous, so Continue/Yield are unreachable
         // and panic if they fire.
@@ -460,7 +460,7 @@ impl<P: TxPlatform> CoreInit<P> {
             .payload_cap()
             .expect("rootfs payload alive during boot")
             .into_cap()
-            .fs_ops_v3
+            .fs_ops
             .mkdir(
                 tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
                 b"dev",
@@ -487,12 +487,12 @@ impl<P: TxPlatform> CoreInit<P> {
         // rootfs root rnode above (the walker's `fs_ops_for` returns
         // `None` and falls through to `ENODEV` if the hint is
         // missing).
-        let devfs_fs_ops_v3 = tx_fs::devfs::Devfs::fs_ops_v3_arc();
-        let devfs_fs_page_backing_v3 = tx_fs::devfs::Devfs::fs_page_backing_v3_arc();
+        let devfs_fs_ops = tx_fs::devfs::Devfs::fs_ops_arc();
+        let devfs_fs_page_backing = tx_fs::devfs::Devfs::fs_page_backing_arc();
 
         let devfs_payload = MountPayload::new_cap(
-            devfs_fs_ops_v3,
-            devfs_fs_page_backing_v3,
+            devfs_fs_ops,
+            devfs_fs_page_backing,
             None,
             mount::allocate_dev_id(),
             MountOptions::default(),

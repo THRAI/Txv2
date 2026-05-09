@@ -14,12 +14,12 @@ use tx_subsystems::cross_crate_test_support::{
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
-use tx_subsystems::page_backed::FsPageBackingV3;
+use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::process::step_chdir;
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
 };
-use tx_subsystems::vfs::FsOpsV3;
+use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
     AT_EACCESS, AT_FDCWD, EXECVE_PATH_MAX, F_OK, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHMODAT,
@@ -60,8 +60,8 @@ fn wave4_setup() -> TestSetup {
 fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     let tmpfs = Arc::new(Tmpfs::new());
     let payload = MountPayload::new_cap(
-        tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOpsV3>,
-        tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBackingV3>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
         None,
         DevId::new(101),
         MountOptions::default(),
@@ -99,8 +99,8 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
 /// `tx_fs::devfs::Devfs` (FsOps + FsPageBacking) at root.
 fn build_devfs_root() -> Cap<DEntry> {
     let payload = MountPayload::new_cap(
-        tx_fs::devfs::Devfs::fs_ops_v3_arc(),
-        tx_fs::devfs::Devfs::fs_page_backing_v3_arc(),
+        tx_fs::devfs::Devfs::fs_ops_arc(),
+        tx_fs::devfs::Devfs::fs_page_backing_arc(),
         None,
         DevId::new(102),
         MountOptions::default(),

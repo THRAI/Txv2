@@ -370,14 +370,14 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
     let guard = tx_substrate::epoch::guard();
     // Wave 9e: migrated to v3 walker.
     use tx_substrate::step_v3::StepOutcome as V3;
-    let outcome = block_on(walker::step_walk_v3(cwd, b"/dev/console", &cred, &guard));
+    let outcome = block_on(walker::step_walk(cwd, b"/dev/console", &cred, &guard));
     drop(guard);
 
     let dentry = match outcome {
         V3::Done(d) => d,
         other => {
             panic!(
-                "step_walk_v3(/dev/console) must succeed after mount registration, got {other:?}",
+                "step_walk(/dev/console) must succeed after mount registration, got {other:?}",
             )
         }
     };
@@ -1315,13 +1315,13 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
         .payload_cap()
         .expect("rootfs payload alive in test")
         .into_cap()
-        .fs_ops_v3
+        .fs_ops
         .clone();
     let fs_page_backing = root_mount
         .payload_cap()
         .expect("rootfs payload alive in test")
         .into_cap()
-        .fs_page_backing_v3
+        .fs_page_backing
         .clone();
     let root_object_id = root_mount.root().fs_object_id();
 

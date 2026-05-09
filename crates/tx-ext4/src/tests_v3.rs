@@ -1,4 +1,4 @@
-//! Wave-9b: `FsOpsV3` + `FsPageBackingV3` shape tests against
+//! Wave-9b: `FsOps` + `FsPageBacking` shape tests against
 //! `Ext4FsInstance`.
 //!
 //! Pins the v3 outcome shape end-to-end through both v3 traits on
@@ -22,9 +22,9 @@ use alloc::vec::Vec;
 
 use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
-use tx_subsystems::page_backed::FsPageBackingV3;
+use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::structure::{DirCursor, FsObjectId};
-use tx_subsystems::vfs::FsOpsV3;
+use tx_subsystems::vfs::FsOps;
 use tx_substrate::epoch;
 use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
@@ -219,13 +219,13 @@ fn ext4_v3_lookup_round_trips_through_v3_outcome() {
 
     // Existing name → Done(file_id).
     assert_eq!(
-        <Ext4FsInstance<MemImage> as FsOpsV3>::lookup(&*fs, FsObjectId::new(2), b"hello", &guard),
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, FsObjectId::new(2), b"hello", &guard),
         V3::<_, NoProgress>::done(FsObjectId::new(12))
     );
 
     // Missing name → Err(ENOENT) bridged through the v3 errno.
     assert_eq!(
-        <Ext4FsInstance<MemImage> as FsOpsV3>::lookup(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(
             &*fs,
             FsObjectId::new(2),
             b"missing",
@@ -244,7 +244,7 @@ fn ext4_v3_load_inode_meta_returns_done_for_real_inode() {
     let fs = open_fs();
     let guard = epoch::guard();
 
-    let meta = match <Ext4FsInstance<MemImage> as FsOpsV3>::load_inode_meta(
+    let meta = match <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(
         &*fs,
         FsObjectId::new(12),
         &guard,
@@ -273,7 +273,7 @@ fn ext4_v3_mutation_methods_surface_enosys_through_v3_errno() {
     let cred = tx_subsystems::vfs::Credential::root();
 
     assert_eq!(
-        <Ext4FsInstance<MemImage> as FsOpsV3>::create_inode(
+        <Ext4FsInstance<MemImage> as FsOps>::create_inode(
             &*fs,
             FsObjectId::new(2),
             b"new",
@@ -284,7 +284,7 @@ fn ext4_v3_mutation_methods_surface_enosys_through_v3_errno() {
         V3::<(FsObjectId, _), NoProgress>::err(V3Errno::ENOSYS)
     );
     assert_eq!(
-        <Ext4FsInstance<MemImage> as FsOpsV3>::mkdir(
+        <Ext4FsInstance<MemImage> as FsOps>::mkdir(
             &*fs,
             FsObjectId::new(2),
             b"newdir",
@@ -295,7 +295,7 @@ fn ext4_v3_mutation_methods_surface_enosys_through_v3_errno() {
         V3::<(FsObjectId, _), NoProgress>::err(V3Errno::ENOSYS)
     );
     assert_eq!(
-        <Ext4FsInstance<MemImage> as FsOpsV3>::destroy_inode(&*fs, FsObjectId::new(12), &guard),
+        <Ext4FsInstance<MemImage> as FsOps>::destroy_inode(&*fs, FsObjectId::new(12), &guard),
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
 }
@@ -311,7 +311,7 @@ fn ext4_v3_readdir_done_then_terminator() {
 
     // First entry: index 0 → Done(Some(...)).
     let cursor0 = DirCursor([0u8; 16]);
-    let (entry, next) = match <Ext4FsInstance<MemImage> as FsOpsV3>::readdir(
+    let (entry, next) = match <Ext4FsInstance<MemImage> as FsOps>::readdir(
         &*fs,
         FsObjectId::new(2),
         cursor0,
@@ -334,7 +334,7 @@ fn ext4_v3_fetch_page_returns_done_frame_for_aligned_offset() {
     let guard = epoch::guard();
 
     let frame =
-        match <Ext4FsInstance<MemImage> as FsPageBackingV3>::fetch_page(
+        match <Ext4FsInstance<MemImage> as FsPageBacking>::fetch_page(
             &*fs,
             FsObjectId::new(12),
             0,
@@ -349,7 +349,7 @@ fn ext4_v3_fetch_page_returns_done_frame_for_aligned_offset() {
 
     // Misaligned offset → EINVAL through the v3 errno bridge.
     assert_eq!(
-        <Ext4FsInstance<MemImage> as FsPageBackingV3>::fetch_page(
+        <Ext4FsInstance<MemImage> as FsPageBacking>::fetch_page(
             &*fs,
             FsObjectId::new(12),
             17,
@@ -370,7 +370,7 @@ fn ext4_v3_truncate_and_fsync_surface_enosys() {
     let guard = epoch::guard();
 
     assert_eq!(
-        <Ext4FsInstance<MemImage> as FsPageBackingV3>::truncate(
+        <Ext4FsInstance<MemImage> as FsPageBacking>::truncate(
             &*fs,
             FsObjectId::new(12),
             0,
@@ -379,7 +379,7 @@ fn ext4_v3_truncate_and_fsync_surface_enosys() {
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
     assert_eq!(
-        <Ext4FsInstance<MemImage> as FsPageBackingV3>::fsync(&*fs, FsObjectId::new(12), &guard),
+        <Ext4FsInstance<MemImage> as FsPageBacking>::fsync(&*fs, FsObjectId::new(12), &guard),
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
 }
@@ -388,14 +388,14 @@ fn ext4_v3_truncate_and_fsync_surface_enosys() {
 fn ext4_v3_factory_arcs_produce_dyn_v3_traits() {
     // Pin the wave-9c MountOutput cutover wiring shape: each factory
     // returns the canonical `Arc<dyn …V3>` that walker entry points
-    // will populate `MountPayload::fs_ops_v3` /
-    // `…::fs_page_backing_v3` from. Mirrors `Tmpfs::fs_ops_v3_arc`
-    // / `Tmpfs::fs_page_backing_v3_arc`.
+    // will populate `MountPayload::fs_ops` /
+    // `…::fs_page_backing` from. Mirrors `Tmpfs::fs_ops_arc`
+    // / `Tmpfs::fs_page_backing_arc`.
     let _serial = EXT4_V3_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
-    let _ops_v3: Arc<dyn FsOpsV3> = fs.clone().fs_ops_v3_arc();
-    let _pb_v3: Arc<dyn FsPageBackingV3> = fs.fs_page_backing_v3_arc();
+    let _ops_v3: Arc<dyn FsOps> = fs.clone().fs_ops_arc();
+    let _pb_v3: Arc<dyn FsPageBacking> = fs.fs_page_backing_arc();
 }

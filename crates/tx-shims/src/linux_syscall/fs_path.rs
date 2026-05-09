@@ -84,14 +84,14 @@ fn resolve_path_at<P: PmapIf>(
     };
     let guard = tx_substrate::epoch::guard();
     // Wave 9d (b): first tx-shims production caller migrated to the v3
-    // walker. Uses `step_walk_v3` (consuming `FsOpsV3` via the direct
-    // `MountPayload::fs_ops_v3` field grown in wave 9d (a)) and matches
+    // walker. Uses `step_walk` (consuming `FsOps` via the direct
+    // `MountPayload::fs_ops` field grown in wave 9d (a)) and matches
     // the four-variant v3 outcome. Errno routes back to v4 via the
     // wave-9d-(b) reverse `From` bridge so the existing
     // `errno_to_i32` table stays the single source of truth.
     use tx_substrate::step_v3::StepOutcome as V3;
     let outcome = poll_walker_synchronously(
-        tx_subsystems::vfs::step_walk_v3(cwd, path, cred, &guard),
+        tx_subsystems::vfs::step_walk(cwd, path, cred, &guard),
     );
     let dentry = match outcome {
         V3::Done(d) => d,
@@ -168,18 +168,18 @@ pub(super) fn fs_change_errno_magnitude(errno: Errno) -> i32 {
 /// `-EROFS` defensively (no FS to act through).
 /// v3 sibling of the (now-deleted) `fs_ops_for_dentry`. Wave 9g-a: the chmod/chown
 /// arms switched to call the v3 trait surface
-/// (`FsOpsV3::step_chmod` / `step_chown`) which Tmpfs delegates back
+/// (`FsOps::step_chmod` / `step_chown`) which Tmpfs delegates back
 /// to its v4 impl internally — semantics preserved, outcome shape
 /// becomes the v3 four-variant algebra.
-pub(super) fn fs_ops_v3_for_dentry(
+pub(super) fn fs_ops_for_dentry(
     dentry: &Cap<DEntry>,
-) -> Option<Arc<dyn tx_subsystems::vfs::FsOpsV3>> {
+) -> Option<Arc<dyn tx_subsystems::vfs::FsOps>> {
     let guard = tx_substrate::epoch::guard();
     let mut cursor: Cap<DEntry> = dentry.clone();
     loop {
         if let Some(weak) = cursor.rnode().containing_mount_weak() {
             if let Some(payload) = weak.upgrade(&guard) {
-                return Some(payload.fs_ops_v3.clone());
+                return Some(payload.fs_ops.clone());
             }
         }
         let next = cursor.parent_hint().and_then(|w| w.upgrade(&guard))?;
@@ -212,9 +212,9 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let fs_object_id = dentry.rnode().fs_object_id();
-    // Wave 9g-a: chmod migrated from v4 FsOps to v3 FsOpsV3.
+    // Wave 9g-a: chmod migrated from v4 FsOps to v3 FsOps.
     use tx_substrate::step_v3::StepOutcome as V3;
-    let fs_ops_v3 = match fs_ops_v3_for_dentry(&dentry) {
+    let fs_ops = match fs_ops_for_dentry(&dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
@@ -222,7 +222,7 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     // callers can't change S_IFMT bits via chmod.
     let new_mode = (mode & 0o7777) as u16;
     let guard = tx_substrate::epoch::guard();
-    match fs_ops_v3.step_chmod(fs_object_id, new_mode, &walker_cred, &guard) {
+    match fs_ops.step_chmod(fs_object_id, new_mode, &walker_cred, &guard) {
         V3::Done(()) => SyscallResult::Return(0),
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
         V3::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
@@ -255,16 +255,16 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let fs_object_id = dentry.rnode().fs_object_id();
-    // Wave 9g-a: chown migrated from v4 FsOps to v3 FsOpsV3.
+    // Wave 9g-a: chown migrated from v4 FsOps to v3 FsOps.
     use tx_substrate::step_v3::StepOutcome as V3;
-    let fs_ops_v3 = match fs_ops_v3_for_dentry(&dentry) {
+    let fs_ops = match fs_ops_for_dentry(&dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
     let uid_opt = decode_uid_arg(uid_arg).map(|u| u.raw());
     let gid_opt = decode_gid_arg(gid_arg).map(|g| g.raw());
     let guard = tx_substrate::epoch::guard();
-    match fs_ops_v3.step_chown(fs_object_id, uid_opt, gid_opt, &walker_cred, &guard) {
+    match fs_ops.step_chown(fs_object_id, uid_opt, gid_opt, &walker_cred, &guard) {
         V3::Done(()) => SyscallResult::Return(0),
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
         V3::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
@@ -449,9 +449,9 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let walker_cred = ctx.walker_cred();
     let dentry: Cap<DEntry> = {
         let guard = tx_substrate::epoch::guard();
-        // Wave 9d (c): migrated to v3 walker (step_walk_v3 + 4-variant outcome).
+        // Wave 9d (c): migrated to v3 walker (step_walk + 4-variant outcome).
         use tx_substrate::step_v3::StepOutcome as V3;
-        let outcome = poll_walker_synchronously(step_walk_v3(cwd, &path, &walker_cred, &guard));
+        let outcome = poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard));
         drop(guard);
         match outcome {
             V3::Done(d) => d,
@@ -588,7 +588,7 @@ pub(super) fn walk_from(
     let guard = tx_substrate::epoch::guard();
     // Wave 9d (c): migrated to v3 walker.
     use tx_substrate::step_v3::StepOutcome as V3;
-    let outcome = poll_walker_synchronously(step_walk_v3(cwd, path, cred, &guard));
+    let outcome = poll_walker_synchronously(step_walk(cwd, path, cred, &guard));
     drop(guard);
     match outcome {
         V3::Done(d) => Ok(d),

@@ -31,18 +31,18 @@
 //!   namespace's backend.
 //! - `txdoc:MOUNT-MOUNTPAYLOAD-1`
 //!   (`docs/design/05_filesystem/MOUNT_v1.md` §MountPayload) — devfs
-//!   has to satisfy the `Arc<dyn FsOpsV3>` + `Arc<dyn FsPageBackingV3>`
+//!   has to satisfy the `Arc<dyn FsOps>` + `Arc<dyn FsPageBacking>`
 //!   shape for Phase 3b's `MountIdentity::new_cap`.
 
 use alloc::sync::Arc;
 
 use tx_substrate::zone::Cap;
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
-use tx_subsystems::page_backed::{Frame, FsPageBackingV3};
+use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::process;
 use tx_subsystems::tty;
 use tx_subsystems::vfs::{
-    self, Credential, DirCursor, DirEntry, FsObjectId, FsOpsV3, InodeKind, InodeMeta, OpenFile,
+    self, Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
     OpenFileFlags, RNode, RNodeBacking, StructPayload, S_IFCHR, S_IFDIR,
 };
 
@@ -72,7 +72,7 @@ pub const DEVFS_ROOT_MODE: u16 = S_IFDIR | 0o755;
 /// Holds no state of its own — every observation resolves against the
 /// TTY registry through `tty::project`. A single instance is enough for
 /// the whole kernel, but the type stays unit-shaped so Phase 3b can
-/// build an `Arc<dyn FsOpsV3>` (and an `Arc<dyn FsPageBackingV3>`)
+/// build an `Arc<dyn FsOps>` (and an `Arc<dyn FsPageBacking>`)
 /// without needing a constructor.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Devfs;
@@ -84,12 +84,12 @@ impl Devfs {
 
     /// v3 factory matching the `MountOutput` shape Phase 3b will pass
     /// into `MountIdentity::new_cap`.
-    pub fn fs_ops_v3_arc() -> Arc<dyn FsOpsV3> {
+    pub fn fs_ops_arc() -> Arc<dyn FsOps> {
         Arc::new(Self)
     }
 
     /// v3 page-backing factory.
-    pub fn fs_page_backing_v3_arc() -> Arc<dyn FsPageBackingV3> {
+    pub fn fs_page_backing_arc() -> Arc<dyn FsPageBacking> {
         Arc::new(Self)
     }
 }
@@ -178,7 +178,7 @@ pub fn open_console_for_init() -> Cap<OpenFile> {
             let guard = tx_substrate::epoch::guard();
             // Wave 9e: bootstrap-path console open migrated to v3 walker.
             use tx_substrate::step_v3::StepOutcome as V3;
-            let outcome = block_on(vfs::step_open_v3(
+            let outcome = block_on(vfs::step_open(
                 root,
                 b"/dev/console",
                 OpenFileFlags {
@@ -277,7 +277,7 @@ fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
     panic!("open_console_for_init::block_on: future did not resolve in 1024 polls");
 }
 
-// === FsOpsV3 / FsPageBackingV3 impls ====================================
+// === FsOps / FsPageBacking impls ====================================
 //
 // Devfs is a read-only projection backend (every mutating op returns
 // `EROFS`, every page-cache op returns `ENOSYS`) — every method
@@ -286,13 +286,13 @@ fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
 // wave-8 design doc
 // (`docs/progress/decisions/2026-05-09-fsops-v3-design.md`), v3 callers
 // (the walker entry points) opt into these impls via
-// `Arc<dyn FsOpsV3>` / `Arc<dyn FsPageBackingV3>`.
+// `Arc<dyn FsOps>` / `Arc<dyn FsPageBacking>`.
 //
 // Fully-qualified `tx_substrate::step_v3::*` references at the impl
 // sites avoid clashing with `tx_subsystems::execution::StepOutcome`
 // already in scope, per the wave-4/6/7 trait-impl convention.
 
-impl FsOpsV3 for Devfs {
+impl FsOps for Devfs {
     fn lookup(
         &self,
         parent: FsObjectId,
@@ -548,7 +548,7 @@ impl FsOpsV3 for Devfs {
     }
 }
 
-impl FsPageBackingV3 for Devfs {
+impl FsPageBacking for Devfs {
     fn fetch_page(
         &self,
         _fs_object_id: FsObjectId,

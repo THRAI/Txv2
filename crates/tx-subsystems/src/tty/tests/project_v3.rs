@@ -1,4 +1,4 @@
-//! Wave-9b: `FsOpsV3` + `FsPageBackingV3` impls on `DevptsInstance`.
+//! Wave-9b: `FsOps` + `FsPageBacking` impls on `DevptsInstance`.
 //!
 //! Sibling to `legacy_phase_a::devpts_fs_*` (which pins the v4 shape).
 //! Per `docs/progress/decisions/2026-05-09-fsops-v3-design.md`, every
@@ -9,12 +9,12 @@
 use alloc::format;
 
 use crate::execution::StepOutcome;
-use crate::page_backed::{Frame, FsPageBackingV3};
+use crate::page_backed::{Frame, FsPageBacking};
 use crate::test_support::EPOCH_TEST_LOCK as TTY_ZONE_TEST_LOCK;
 use crate::tty::project::{
     open_ptmx, DevptsInstance, DEVPTS_PTMX_OBJECT_ID, DEVPTS_ROOT_OBJECT_ID,
 };
-use crate::vfs::{Credential, DirCursor, FsObjectId, FsOpsV3, InodeKind, InodeMeta};
+use crate::vfs::{Credential, DirCursor, FsObjectId, FsOps, InodeKind, InodeMeta};
 
 use tx_hal::Ppn;
 use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
@@ -30,7 +30,7 @@ fn init_zones() {
     crate::tty::structure::registry::reset_for_tests();
 }
 
-// === FsOpsV3 lookup / load_inode_meta / readdir ========================
+// === FsOps lookup / load_inode_meta / readdir ========================
 
 #[test]
 fn devpts_v3_lookup_round_trips_to_ptmx_and_allocated_slaves() {
@@ -47,13 +47,13 @@ fn devpts_v3_lookup_round_trips_to_ptmx_and_allocated_slaves() {
 
     // ptmx is the static entry.
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::lookup(&devpts, DEVPTS_ROOT_OBJECT_ID, b"ptmx", &guard),
+        <DevptsInstance as FsOps>::lookup(&devpts, DEVPTS_ROOT_OBJECT_ID, b"ptmx", &guard),
         V3::<_, NoProgress>::done(DEVPTS_PTMX_OBJECT_ID)
     );
 
     // The numeric slave entry resolves to a backend-shaped FsObjectId.
     let slave_name = format!("{}", pty.index);
-    let v3_slave = <DevptsInstance as FsOpsV3>::lookup(
+    let v3_slave = <DevptsInstance as FsOps>::lookup(
         &devpts,
         DEVPTS_ROOT_OBJECT_ID,
         slave_name.as_bytes(),
@@ -66,12 +66,12 @@ fn devpts_v3_lookup_round_trips_to_ptmx_and_allocated_slaves() {
 
     // Missing names → ENOENT, bridged through v3.
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::lookup(&devpts, DEVPTS_ROOT_OBJECT_ID, b"99", &guard),
+        <DevptsInstance as FsOps>::lookup(&devpts, DEVPTS_ROOT_OBJECT_ID, b"99", &guard),
         V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
     );
     // Wrong parent → ENOENT.
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::lookup(&devpts, FsObjectId::new(9), b"ptmx", &guard),
+        <DevptsInstance as FsOps>::lookup(&devpts, FsObjectId::new(9), b"ptmx", &guard),
         V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
     );
 }
@@ -84,16 +84,16 @@ fn devpts_v3_load_inode_meta_for_root_and_ptmx() {
     let devpts = DevptsInstance;
 
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::load_inode_meta(&devpts, DEVPTS_ROOT_OBJECT_ID, &guard),
+        <DevptsInstance as FsOps>::load_inode_meta(&devpts, DEVPTS_ROOT_OBJECT_ID, &guard),
         V3::<_, NoProgress>::done(InodeMeta::new(InodeKind::Directory, 0o040755))
     );
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::load_inode_meta(&devpts, DEVPTS_PTMX_OBJECT_ID, &guard),
+        <DevptsInstance as FsOps>::load_inode_meta(&devpts, DEVPTS_PTMX_OBJECT_ID, &guard),
         V3::<_, NoProgress>::done(InodeMeta::new(InodeKind::CharDevice, 0o020666))
     );
     // Unknown ids → ENOENT.
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::load_inode_meta(&devpts, FsObjectId::new(9), &guard),
+        <DevptsInstance as FsOps>::load_inode_meta(&devpts, FsObjectId::new(9), &guard),
         V3::<InodeMeta, NoProgress>::err(V3Errno::ENOENT)
     );
 }
@@ -105,7 +105,7 @@ fn devpts_v3_readdir_lists_ptmx_and_returns_none_at_end() {
     let guard = tx_substrate::epoch::guard();
     let devpts = DevptsInstance;
 
-    let first = <DevptsInstance as FsOpsV3>::readdir(
+    let first = <DevptsInstance as FsOps>::readdir(
         &devpts,
         DEVPTS_ROOT_OBJECT_ID,
         DirCursor::START,
@@ -119,7 +119,7 @@ fn devpts_v3_readdir_lists_ptmx_and_returns_none_at_end() {
 
     // readdir on a non-directory id returns ENOTDIR.
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::readdir(
+        <DevptsInstance as FsOps>::readdir(
             &devpts,
             DEVPTS_PTMX_OBJECT_ID,
             DirCursor::START,
@@ -136,7 +136,7 @@ fn devpts_v3_readdir_lists_ptmx_and_returns_none_at_end() {
         if steps > 1024 {
             panic!("readdir v3 did not terminate");
         }
-        match <DevptsInstance as FsOpsV3>::readdir(&devpts, DEVPTS_ROOT_OBJECT_ID, cursor, &guard) {
+        match <DevptsInstance as FsOps>::readdir(&devpts, DEVPTS_ROOT_OBJECT_ID, cursor, &guard) {
             V3::Done(Some((_, next))) => cursor = next,
             V3::Done(None) => break,
             other => panic!("readdir v3 walk: {other:?}"),
@@ -144,7 +144,7 @@ fn devpts_v3_readdir_lists_ptmx_and_returns_none_at_end() {
     }
 }
 
-// === FsOpsV3 mutations are read-only / EROFS ==========================
+// === FsOps mutations are read-only / EROFS ==========================
 
 #[test]
 fn devpts_v3_mutations_are_erofs() {
@@ -155,7 +155,7 @@ fn devpts_v3_mutations_are_erofs() {
     let cred = Credential::default();
 
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::serialize_inode_meta(
+        <DevptsInstance as FsOps>::serialize_inode_meta(
             &devpts,
             DEVPTS_ROOT_OBJECT_ID,
             &InodeMeta::new(InodeKind::Directory, 0o040755),
@@ -164,7 +164,7 @@ fn devpts_v3_mutations_are_erofs() {
         V3::<(), NoProgress>::err(V3Errno::EROFS)
     );
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::create_inode(
+        <DevptsInstance as FsOps>::create_inode(
             &devpts,
             DEVPTS_ROOT_OBJECT_ID,
             b"x",
@@ -175,7 +175,7 @@ fn devpts_v3_mutations_are_erofs() {
         V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EROFS)
     );
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::mkdir(
+        <DevptsInstance as FsOps>::mkdir(
             &devpts,
             DEVPTS_ROOT_OBJECT_ID,
             b"d",
@@ -186,7 +186,7 @@ fn devpts_v3_mutations_are_erofs() {
         V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EROFS)
     );
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::rmdir(
+        <DevptsInstance as FsOps>::rmdir(
             &devpts,
             DEVPTS_ROOT_OBJECT_ID,
             b"d",
@@ -196,7 +196,7 @@ fn devpts_v3_mutations_are_erofs() {
         V3::<(), NoProgress>::err(V3Errno::EROFS)
     );
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::unlink(
+        <DevptsInstance as FsOps>::unlink(
             &devpts,
             DEVPTS_ROOT_OBJECT_ID,
             b"0",
@@ -206,7 +206,7 @@ fn devpts_v3_mutations_are_erofs() {
         V3::<(), NoProgress>::err(V3Errno::EROFS)
     );
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::rename(
+        <DevptsInstance as FsOps>::rename(
             &devpts,
             DEVPTS_ROOT_OBJECT_ID,
             b"a",
@@ -217,7 +217,7 @@ fn devpts_v3_mutations_are_erofs() {
         V3::<(), NoProgress>::err(V3Errno::EROFS)
     );
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::link(
+        <DevptsInstance as FsOps>::link(
             &devpts,
             DEVPTS_ROOT_OBJECT_ID,
             b"x",
@@ -227,7 +227,7 @@ fn devpts_v3_mutations_are_erofs() {
         V3::<(), NoProgress>::err(V3Errno::EROFS)
     );
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::symlink(
+        <DevptsInstance as FsOps>::symlink(
             &devpts,
             DEVPTS_ROOT_OBJECT_ID,
             b"l",
@@ -248,21 +248,21 @@ fn devpts_v3_destroy_inode_done_for_known_objects() {
 
     // Root + ptmx are known and return Done(()).
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::destroy_inode(&devpts, DEVPTS_ROOT_OBJECT_ID, &guard),
+        <DevptsInstance as FsOps>::destroy_inode(&devpts, DEVPTS_ROOT_OBJECT_ID, &guard),
         V3::<(), NoProgress>::done(())
     );
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::destroy_inode(&devpts, DEVPTS_PTMX_OBJECT_ID, &guard),
+        <DevptsInstance as FsOps>::destroy_inode(&devpts, DEVPTS_PTMX_OBJECT_ID, &guard),
         V3::<(), NoProgress>::done(())
     );
     // Unknown id → ENOENT.
     assert_eq!(
-        <DevptsInstance as FsOpsV3>::destroy_inode(&devpts, FsObjectId::new(9), &guard),
+        <DevptsInstance as FsOps>::destroy_inode(&devpts, FsObjectId::new(9), &guard),
         V3::<(), NoProgress>::err(V3Errno::ENOENT)
     );
 }
 
-// === FsPageBackingV3 — devpts has no page cache =======================
+// === FsPageBacking — devpts has no page cache =======================
 
 #[test]
 fn devpts_v3_fs_page_backing_returns_enosys() {
@@ -272,12 +272,12 @@ fn devpts_v3_fs_page_backing_returns_enosys() {
     let devpts = DevptsInstance;
 
     assert_eq!(
-        <DevptsInstance as FsPageBackingV3>::fetch_page(&devpts, DEVPTS_PTMX_OBJECT_ID, 0, &guard,),
+        <DevptsInstance as FsPageBacking>::fetch_page(&devpts, DEVPTS_PTMX_OBJECT_ID, 0, &guard,),
         V3::<Frame, NoProgress>::err(V3Errno::ENOSYS)
     );
     let frame = Frame::new(Ppn(0));
     assert_eq!(
-        <DevptsInstance as FsPageBackingV3>::flush_page(
+        <DevptsInstance as FsPageBacking>::flush_page(
             &devpts,
             DEVPTS_PTMX_OBJECT_ID,
             0,
@@ -287,11 +287,11 @@ fn devpts_v3_fs_page_backing_returns_enosys() {
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
     assert_eq!(
-        <DevptsInstance as FsPageBackingV3>::truncate(&devpts, DEVPTS_PTMX_OBJECT_ID, 0, &guard,),
+        <DevptsInstance as FsPageBacking>::truncate(&devpts, DEVPTS_PTMX_OBJECT_ID, 0, &guard,),
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
     assert_eq!(
-        <DevptsInstance as FsPageBackingV3>::fsync(&devpts, DEVPTS_PTMX_OBJECT_ID, &guard),
+        <DevptsInstance as FsPageBacking>::fsync(&devpts, DEVPTS_PTMX_OBJECT_ID, &guard),
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
 }

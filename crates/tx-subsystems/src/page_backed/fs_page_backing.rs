@@ -1,10 +1,10 @@
-//! `FsPageBackingV3` — parallel trait emitting v3 step outcomes.
+//! `FsPageBacking` — parallel trait emitting v3 step outcomes.
 //!
-//! Wave-9a sibling to [`crate::vfs::FsOpsV3`] in
+//! Wave-9a sibling to [`crate::vfs::FsOps`] in
 //! `crates/tx-subsystems/src/vfs/execution.rs`. Per
 //! `docs/progress/decisions/2026-05-09-fsops-v3-design.md` (wave-8
 //! design doc), `FsPageBacking` ships its v3 mirror at the same time
-//! as the first production `FsOpsV3` impl (`Tmpfs`) because
+//! as the first production `FsOps` impl (`Tmpfs`) because
 //! `MountOutput` / `MountPayload` holds both trait objects
 //! (`Arc<dyn FsOps>`, `Arc<dyn FsPageBacking>`) and every backend
 //! constructs them together. Shipping both v3 traits in the same wave
@@ -43,7 +43,7 @@ use super::{Frame, PageContainer};
 /// `TestFs`; wave 9b fans out to the remaining five backends
 /// (`Devfs`, `Ext4FsInstance`, `DevptsInstance`, `ExecTestFs`,
 /// `ExecveTestFs`).
-pub trait FsPageBackingV3: Send + Sync + 'static {
+pub trait FsPageBacking: Send + Sync + 'static {
     fn fetch_page(
         &self,
         fs_object_id: FsObjectId,

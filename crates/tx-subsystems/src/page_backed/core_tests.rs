@@ -1,14 +1,14 @@
 //! Inline tests for the core page_backed module — extracted to a sibling
 //! file in wave 9d to keep page_backed.rs under the 1500-line authored-Rust
 //! cap. RecordingFs/BlockingFs fixtures live here, including their wave-9d
-//! v3 trait impls (FsOpsV3 + FsPageBackingV3) needed because MountPayload
-//! now carries fs_ops_v3 / fs_page_backing_v3 fields.
+//! v3 trait impls (FsOps + FsPageBacking) needed because MountPayload
+//! now carries fs_ops / fs_page_backing fields.
 
     use super::*;
     use crate::execution::{Errno, StepOutcome, WaitToken};
     use crate::mount::{DevId, MountOptions, MountPayload, SourceLabel};
     use crate::vfs::{
-        Credential, DirCursor, DirEntry, FsObjectId, FsOpsV3, InodeKind, InodeMeta, OpenFile,
+        Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
         OpenFileFlags, RNode, RNodeBacking,
     };
     use alloc::sync::Arc;
@@ -48,7 +48,7 @@
 
     // Wave 9d: v3 trait impls so `RecordingFs` satisfies the v3 fields
     // on `MountPayload`. Bodies mirror the v4 impls one-for-one.
-    impl crate::vfs::FsOpsV3 for RecordingFs {
+    impl crate::vfs::FsOps for RecordingFs {
         fn lookup(
             &self,
             _parent: FsObjectId,
@@ -179,7 +179,7 @@
         }
     }
 
-    impl FsPageBackingV3 for RecordingFs {
+    impl FsPageBacking for RecordingFs {
         fn fetch_page(
             &self,
             fs_object_id: FsObjectId,
@@ -235,7 +235,7 @@
     // result. The page-backed unit tests below all drive `BlockingFs`
     // through the v4 surface (`materialize_page` reads `fs_page_backing`,
     // not the v3 sibling), so this v3 body is dispatch-stub-only.
-    impl crate::vfs::FsOpsV3 for BlockingFs {
+    impl crate::vfs::FsOps for BlockingFs {
         fn lookup(
             &self,
             _parent: FsObjectId,
@@ -366,7 +366,7 @@
         }
     }
 
-    impl FsPageBackingV3 for BlockingFs {
+    impl FsPageBacking for BlockingFs {
         fn fetch_page(
             &self,
             _fs_object_id: FsObjectId,
@@ -414,8 +414,8 @@
     }
 
     fn file_page_container(
-        fs_v3: Arc<dyn FsOpsV3>,
-        page_backing_v3: Arc<dyn FsPageBackingV3>,
+        fs_v3: Arc<dyn FsOps>,
+        page_backing_v3: Arc<dyn FsPageBacking>,
         fs_object_id: FsObjectId,
         page_count: u64,
     ) -> PageContainer {
