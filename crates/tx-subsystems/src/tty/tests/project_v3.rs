@@ -5,7 +5,6 @@
 
 use alloc::format;
 
-use crate::execution::StepOutcome;
 use crate::page_backed::{Frame, FsPageBacking};
 use crate::test_support::EPOCH_TEST_LOCK as TTY_ZONE_TEST_LOCK;
 use crate::tty::project::{
@@ -38,7 +37,7 @@ fn devpts_v3_lookup_round_trips_to_ptmx_and_allocated_slaves() {
 
     // Allocate a single PTY so a numeric devpts entry exists.
     let pty = match open_ptmx(&guard) {
-        StepOutcome::Done(pty) => pty,
+        V3::Done(pty) => pty,
         other => panic!("open_ptmx failed: {other:?}"),
     };
 

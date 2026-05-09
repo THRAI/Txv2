@@ -325,7 +325,7 @@ fn install_console_tty() -> Cap<TtyIdentity> {
     };
     assert_eq!(
         register_console_alias("console", tty.clone()),
-        StepOutcome::Done(())
+        V3::Done(())
     );
     tty
 }

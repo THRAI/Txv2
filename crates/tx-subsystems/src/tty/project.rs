@@ -6,9 +6,10 @@
 
 use alloc::vec::Vec;
 
+use tx_substrate::step_v3::{NoProgress, StepOutcome as V3Out};
 use tx_substrate::zone::Cap;
 
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::{Errno, Guard};
 use crate::tty::execution;
 use crate::tty::structure::registry;
 use crate::tty::structure::TtyIdentity;
@@ -25,22 +26,25 @@ const DEVPTS_SLAVE_OBJECT_BASE: u64 = 0x7074_7400;
 pub struct DevptsInstance;
 
 /// Resolve a devfs TTY entry such as `ttyS0` or `console`.
-pub fn devfs_tty_by_name(name: &[u8], _guard: &Guard<'_>) -> StepOutcome<Cap<TtyIdentity>> {
+pub fn devfs_tty_by_name(
+    name: &[u8],
+    _guard: &Guard<'_>,
+) -> V3Out<Cap<TtyIdentity>, NoProgress> {
     if name == b"ptmx" {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3Out::err(Errno::EINVAL.into());
     }
 
     if let Some(index) = parse_tty_s_index(name) {
         if let Some(tty) = registry::hardware_tty(index) {
-            return StepOutcome::Done(tty);
+            return V3Out::done(tty);
         }
     }
 
     if let Some(alias) = registry::devfs_alias(name) {
-        return StepOutcome::Done(alias);
+        return V3Out::done(alias);
     }
 
-    StepOutcome::Err(Errno::ENOENT)
+    V3Out::err(Errno::ENOENT.into())
 }
 
 /// Snapshot of one devfs alias entry, surfaced to consumers that want to
@@ -101,11 +105,11 @@ pub fn resolve_devfs_alias(name: &[u8]) -> Option<Cap<TtyIdentity>> {
 }
 
 /// Materialize a devfs RNode for `ttyS<N>` or `console`.
-pub fn devfs_rnode_by_name(name: &[u8], guard: &Guard<'_>) -> StepOutcome<Cap<RNode>> {
+pub fn devfs_rnode_by_name(name: &[u8], guard: &Guard<'_>) -> V3Out<Cap<RNode>, NoProgress> {
     let tty = match devfs_tty_by_name(name, guard) {
-        StepOutcome::Done(tty) => tty,
-        StepOutcome::Err(err) => return StepOutcome::Err(err),
-        _ => return StepOutcome::Err(Errno::EIO),
+        V3Out::Done(tty) => tty,
+        V3Out::Err(err) => return V3Out::Err(err),
+        _ => return V3Out::err(Errno::EIO.into()),
     };
     let index = tty.index;
     rnode_for_tty(tty, FsObjectId::new(DEVFS_TTY_OBJECT_BASE + index as u64))
@@ -113,50 +117,51 @@ pub fn devfs_rnode_by_name(name: &[u8], guard: &Guard<'_>) -> StepOutcome<Cap<RN
 
 /// Open `/dev/ptmx`-shaped pty master. Full path-walk/fd-table layers can wrap
 /// this and install `master_file` into the caller's fd table.
-pub fn open_ptmx(guard: &Guard<'_>) -> StepOutcome<execution::OpenPtyOutcome> {
-    use tx_substrate::step_v3::StepOutcome as V3;
-    match execution::step_openpty(guard) {
-        V3::Done(out) => StepOutcome::Done(out),
-        V3::Err(e) => StepOutcome::Err(e.into()),
-        V3::Continue { .. } | V3::Yield { .. } => StepOutcome::Err(Errno::EIO),
-    }
+pub fn open_ptmx(guard: &Guard<'_>) -> V3Out<execution::OpenPtyOutcome, NoProgress> {
+    execution::step_openpty(guard)
 }
 
 /// Open a devfs hardware/alias TTY entry such as `/dev/ttyS0` or `/dev/console`.
-pub fn open_devfs_tty_by_name(name: &[u8], guard: &Guard<'_>) -> StepOutcome<Cap<OpenFile>> {
+pub fn open_devfs_tty_by_name(name: &[u8], guard: &Guard<'_>) -> V3Out<Cap<OpenFile>, NoProgress> {
     let tty = match devfs_tty_by_name(name, guard) {
-        StepOutcome::Done(tty) => tty,
-        StepOutcome::Err(err) => return StepOutcome::Err(err),
-        _ => return StepOutcome::Err(Errno::EIO),
+        V3Out::Done(tty) => tty,
+        V3Out::Err(err) => return V3Out::Err(err),
+        _ => return V3Out::err(Errno::EIO.into()),
     };
     open_file_for_tty(tty, guard)
 }
 
 /// Resolve a devpts numeric slave entry.
-pub fn devpts_slave_by_index(index: u32, _guard: &Guard<'_>) -> StepOutcome<Cap<TtyIdentity>> {
+pub fn devpts_slave_by_index(
+    index: u32,
+    _guard: &Guard<'_>,
+) -> V3Out<Cap<TtyIdentity>, NoProgress> {
     match registry::pty_slave(index) {
-        Some(slave) => StepOutcome::Done(slave),
-        None => StepOutcome::Err(Errno::ENOENT),
+        Some(slave) => V3Out::done(slave),
+        None => V3Out::err(Errno::ENOENT.into()),
     }
 }
 
 /// Materialize `/dev/pts/<N>` as `StructBacked::Tty(slave)`.
-pub fn devpts_rnode_by_index(index: u32, guard: &Guard<'_>) -> StepOutcome<Cap<RNode>> {
+pub fn devpts_rnode_by_index(index: u32, guard: &Guard<'_>) -> V3Out<Cap<RNode>, NoProgress> {
     let slave = match devpts_slave_by_index(index, guard) {
-        StepOutcome::Done(slave) => slave,
-        StepOutcome::Err(err) => return StepOutcome::Err(err),
-        _ => return StepOutcome::Err(Errno::EIO),
+        V3Out::Done(slave) => slave,
+        V3Out::Err(err) => return V3Out::Err(err),
+        _ => return V3Out::err(Errno::EIO.into()),
     };
     rnode_for_tty(slave, devpts_object_id_for_index(index))
 }
 
 /// Build an OpenFile over a fresh StructBacked TTY RNode.
-pub fn open_file_for_tty(tty: Cap<TtyIdentity>, _guard: &Guard<'_>) -> StepOutcome<Cap<OpenFile>> {
+pub fn open_file_for_tty(
+    tty: Cap<TtyIdentity>,
+    _guard: &Guard<'_>,
+) -> V3Out<Cap<OpenFile>, NoProgress> {
     let object_id = FsObjectId::new(DEVFS_TTY_OBJECT_BASE + tty.raw() as u64);
     let rnode = match rnode_for_tty(tty, object_id) {
-        StepOutcome::Done(rnode) => rnode,
-        StepOutcome::Err(err) => return StepOutcome::Err(err),
-        _ => return StepOutcome::Err(Errno::EIO),
+        V3Out::Done(rnode) => rnode,
+        V3Out::Err(err) => return V3Out::Err(err),
+        _ => return V3Out::err(Errno::EIO.into()),
     };
 
     match OpenFile::new_cap(
@@ -169,12 +174,12 @@ pub fn open_file_for_tty(tty: Cap<TtyIdentity>, _guard: &Guard<'_>) -> StepOutco
             nonblocking: false,
         },
     ) {
-        Ok(file) => StepOutcome::Done(file),
-        Err(_) => StepOutcome::Err(Errno::EIO),
+        Ok(file) => V3Out::done(file),
+        Err(_) => V3Out::err(Errno::EIO.into()),
     }
 }
 
-fn rnode_for_tty(tty: Cap<TtyIdentity>, object_id: FsObjectId) -> StepOutcome<Cap<RNode>> {
+fn rnode_for_tty(tty: Cap<TtyIdentity>, object_id: FsObjectId) -> V3Out<Cap<RNode>, NoProgress> {
     match RNode::new_cap(
         object_id,
         InodeMeta::new(InodeKind::CharDevice, 0o020600),
@@ -182,8 +187,8 @@ fn rnode_for_tty(tty: Cap<TtyIdentity>, object_id: FsObjectId) -> StepOutcome<Ca
             payload: StructPayload::Tty(tty),
         },
     ) {
-        Ok(rnode) => StepOutcome::Done(rnode),
-        Err(_) => StepOutcome::Err(Errno::EIO),
+        Ok(rnode) => V3Out::done(rnode),
+        Err(_) => V3Out::err(Errno::EIO.into()),
     }
 }
 

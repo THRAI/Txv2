@@ -44,9 +44,13 @@ pub fn register_hardware(
 }
 
 /// Register a devfs alias, such as `/dev/console`, for an existing TTY.
-pub fn register_console_alias(name: &str, tty: Cap<TtyIdentity>) -> StepOutcome<()> {
+pub fn register_console_alias(
+    name: &str,
+    tty: Cap<TtyIdentity>,
+) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3Out;
     if registry::register_devfs_alias(name, tty).is_err() {
-        return StepOutcome::Err(Errno::EIO);
+        return V3Out::err(Errno::EIO.into());
     }
-    StepOutcome::Done(())
+    V3Out::done(())
 }
