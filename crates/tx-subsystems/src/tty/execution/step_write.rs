@@ -12,86 +12,27 @@ use crate::tty::structure::{termios::TOSTOP, TtyIdentity, TtyTransport};
 
 /// Transform user bytes through N_TTY output processing, enqueue them, and
 /// kick the underlying transport.
-pub fn step_write(tty: &Cap<TtyIdentity>, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize> {
-    if bytes.is_empty() {
-        return StepOutcome::Done(0);
-    }
 
-    if let Err(err) = require_fg_pgrp(tty, guard) {
-        return StepOutcome::Err(err);
-    }
-
-    let payload = match require_live_tty(tty, guard) {
-        Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
-    };
-
-    let consumed = payload.with_termios(|termios| {
-        payload.with_output_queue(|output_queue| {
-            // SAFETY: Phase C serializes ldisc_state writes through TTY steps.
-            // `process_output` owns the output column counter for this write.
-            let state = unsafe { &mut *payload.ldisc_state.get() };
-            process_output(state, termios, output_queue, bytes)
-        })
-    });
-
-    if consumed == 0 {
-        return StepOutcome::Blocked(WaitToken::new(tty.raw() as u64, TTY_WRITABLE));
-    }
-
-    match kick_transport(tty, guard) {
-        StepOutcome::Err(err) => StepOutcome::Err(err),
-        StepOutcome::Blocked(wait) => StepOutcome::AdvancedThenBlocked(consumed, wait),
-        StepOutcome::AdvancedThenBlocked(_, wait) => {
-            StepOutcome::AdvancedThenBlocked(consumed, wait)
-        }
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => StepOutcome::Done(consumed),
-    }
-}
-
-pub fn step_write_for_caller(
-    tty: &Cap<TtyIdentity>,
-    bytes: &[u8],
-    caller: super::IoctlCaller,
-    guard: &Guard<'_>,
-) -> StepOutcome<usize> {
-    if bytes.is_empty() {
-        return StepOutcome::Done(0);
-    }
-
-    let payload = match require_live_tty(tty, guard) {
-        Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
-    };
-
-    let background = tty
-        .session_pgrp()
-        .is_some_and(|binding| !caller.in_foreground && caller.pgrp_id != binding.foreground_pgid);
-    if background && payload.with_termios(|termios| termios.c_lflag & TOSTOP != 0) {
-        return StepOutcome::Err(Errno::EIO);
-    }
-
-    step_write(tty, bytes, guard)
-}
 
 pub fn step_write_for_process(
     tty: &Cap<TtyIdentity>,
     bytes: &[u8],
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     let caller_info = match super::IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     if bytes.is_empty() {
-        return StepOutcome::Done(0);
+        return V3::Done(0);
     }
 
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     let background = tty.session_pgrp().is_some_and(|binding| {
@@ -102,7 +43,7 @@ pub fn step_write_for_process(
         let _ = super::step_ioctl::deliver_signal_dispatch_for_process_with_guard(
             caller, dispatch, guard,
         );
-        return StepOutcome::Err(Errno::EIO);
+        return V3::Err(tx_substrate::step_v3::Errno::EIO);
     }
 
     step_write(tty, bytes, guard)
@@ -237,7 +178,7 @@ fn restore_front(
 ///   `Yield { progress: ByteProgress::new(consumed), shape: OnCarrier {
 ///   wait.carrier, wait.interest } }`
 /// - transport kick completes (Done / Advanced) → `Done(consumed)`
-pub fn step_write_v3(
+pub fn step_write(
     tty: &Cap<TtyIdentity>,
     bytes: &[u8],
     guard: &Guard<'_>,
@@ -298,7 +239,7 @@ pub fn step_write_v3(
 /// shared `step_write` body), translated to
 /// [`tx_substrate::step_v3::StepOutcome`]. The TOSTOP background-write
 /// rejection becomes `Err(EIO.into())`.
-pub fn step_write_for_caller_v3(
+pub fn step_write_for_caller(
     tty: &Cap<TtyIdentity>,
     bytes: &[u8],
     caller: super::IoctlCaller,
@@ -320,7 +261,7 @@ pub fn step_write_for_caller_v3(
         return tx_substrate::step_v3::StepOutcome::err(Errno::EIO.into());
     }
 
-    step_write_v3(tty, bytes, guard)
+    step_write(tty, bytes, guard)
 }
 
 #[cfg(test)]
@@ -337,7 +278,7 @@ mod tests {
 
     /// Always-blocking write ops. The hardware kick path turns this into
     /// a `Blocked(wait)` from `kick_transport`, which `step_write` maps
-    /// to `AdvancedThenBlocked(consumed, wait)`; `step_write_v3` maps
+    /// to `AdvancedThenBlocked(consumed, wait)`; `step_write` maps
     /// it to `Yield { progress: ByteProgress::new(consumed), shape:
     /// OnCarrier { wait.carrier, wait.interest } }`.
     struct BlockingOps {
@@ -410,10 +351,10 @@ mod tests {
         identity
     }
 
-    // -- step_write_v3 tests ------------------------------------------
+    // -- step_write tests ------------------------------------------
 
     #[test]
-    fn step_write_v3_empty_bytes_returns_done_zero() {
+    fn step_write_empty_bytes_returns_done_zero() {
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -422,7 +363,7 @@ mod tests {
             TtyPayload::new_hardware(&COMPLETING_BINDING),
         );
         let guard = tx_substrate::epoch::guard();
-        let outcome = step_write_v3(&tty, b"", &guard);
+        let outcome = step_write(&tty, b"", &guard);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Done(0) => {}
@@ -431,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn step_write_v3_dead_tty_returns_err_eio() {
+    fn step_write_dead_tty_returns_err_eio() {
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -441,7 +382,7 @@ mod tests {
         );
         let _ = tty.take_payload();
         let guard = tx_substrate::epoch::guard();
-        let outcome = step_write_v3(&tty, b"x", &guard);
+        let outcome = step_write(&tty, b"x", &guard);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EIO) => {}
@@ -450,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn step_write_v3_completing_kick_returns_done_consumed() {
+    fn step_write_completing_kick_returns_done_consumed() {
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -461,7 +402,7 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         // 5 bytes; canonical termios -- process_output should pass them
         // through cleanly, then completing ops drains the queue.
-        let outcome = step_write_v3(&tty, b"hello", &guard);
+        let outcome = step_write(&tty, b"hello", &guard);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Done(n) => {
@@ -473,13 +414,13 @@ mod tests {
 
     /// **Load-bearing test.** When the hardware kick blocks after
     /// `process_output` consumed bytes, `step_write` emits
-    /// `AdvancedThenBlocked(consumed, wait)`. `step_write_v3` must
+    /// `AdvancedThenBlocked(consumed, wait)`. `step_write` must
     /// surface this as `Yield { progress: ByteProgress::new(consumed),
     /// shape: OnCarrier { wait.carrier, wait.interest } }`. This pins
     /// the `ByteProgress::new(consumed)` ergonomics inside
     /// `yield_on_carrier`.
     #[test]
-    fn step_write_v3_partial_then_blocked_yields_on_carrier_with_byte_progress() {
+    fn step_write_partial_then_blocked_yields_on_carrier_with_byte_progress() {
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -488,7 +429,7 @@ mod tests {
             TtyPayload::new_hardware(&BLOCKING_BINDING),
         );
         let guard = tx_substrate::epoch::guard();
-        let outcome = step_write_v3(&tty, b"hello", &guard);
+        let outcome = step_write(&tty, b"hello", &guard);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Yield {
@@ -523,10 +464,10 @@ mod tests {
         }
     }
 
-    // -- step_write_for_caller_v3 tests --------------------------------
+    // -- step_write_for_caller tests --------------------------------
 
     #[test]
-    fn step_write_for_caller_v3_empty_bytes_returns_done_zero() {
+    fn step_write_for_caller_empty_bytes_returns_done_zero() {
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -536,7 +477,7 @@ mod tests {
         );
         let guard = tx_substrate::epoch::guard();
         let caller = super::super::IoctlCaller::new(1, 1);
-        let outcome = step_write_for_caller_v3(&tty, b"", caller, &guard);
+        let outcome = step_write_for_caller(&tty, b"", caller, &guard);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Done(0) => {}
@@ -545,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn step_write_for_caller_v3_foreground_caller_completes_to_done() {
+    fn step_write_for_caller_foreground_caller_completes_to_done() {
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -555,9 +496,9 @@ mod tests {
         );
         let guard = tx_substrate::epoch::guard();
         // Default IoctlCaller has in_foreground=true, so TOSTOP gate is
-        // skipped and step_write_v3 runs to completion.
+        // skipped and step_write runs to completion.
         let caller = super::super::IoctlCaller::new(1, 1);
-        let outcome = step_write_for_caller_v3(&tty, b"hi", caller, &guard);
+        let outcome = step_write_for_caller(&tty, b"hi", caller, &guard);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Done(2) => {}
@@ -566,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn step_write_for_caller_v3_background_caller_with_tostop_returns_eio() {
+    fn step_write_for_caller_background_caller_with_tostop_returns_eio() {
         use crate::tty::structure::termios::TOSTOP as TOSTOP_FLAG;
         use crate::tty::structure::SessionPgrp;
 
@@ -589,7 +530,7 @@ mod tests {
         // Caller in pgrp 7 (≠ foreground 2) and not in_foreground.
         let mut caller = super::super::IoctlCaller::new(1, 7);
         caller.in_foreground = false;
-        let outcome = step_write_for_caller_v3(&tty, b"x", caller, &guard);
+        let outcome = step_write_for_caller(&tty, b"x", caller, &guard);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EIO) => {}

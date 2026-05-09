@@ -361,10 +361,13 @@ fn step_write_for_process_posts_sigttou_to_background_caller_pgrp() {
         other => panic!("tcsets failed: {other:?}"),
     }
 
-    assert_eq!(
-        step_write_for_process(&tty, b"x", &child, &guard),
-        StepOutcome::Err(crate::execution::Errno::EIO)
-    );
+    {
+        use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
+        assert_eq!(
+            step_write_for_process(&tty, b"x", &child, &guard),
+            V3Out::Err(V3Errno::EIO)
+        );
+    }
     assert!(leader_pending(&child, Signum::SIGTTOU));
 }
 

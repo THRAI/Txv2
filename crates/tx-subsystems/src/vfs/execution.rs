@@ -371,7 +371,19 @@ impl OpenFile {
 
         match self.rnode.backing() {
             RNodeBacking::StructBacked { payload } => match payload {
-                StructPayload::Tty(tty) => tty::execution::step_write(tty, bytes, guard),
+                StructPayload::Tty(tty) => {
+                    use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
+                    match tty::execution::step_write(tty, bytes, guard) {
+                        V3Out::Done(n) => StepOutcome::Done(n),
+                        V3Out::Continue { progress } => StepOutcome::Advanced(progress.bytes()),
+                        V3Out::Yield {
+                            progress: _,
+                            shape: YieldShape::OnCarrier { carrier, interests },
+                        } => StepOutcome::Blocked(WaitToken::new(carrier.raw(), interests.raw())),
+                        V3Out::Yield { .. } => StepOutcome::Err(Errno::EIO),
+                        V3Out::Err(v3_errno) => StepOutcome::Err(v3_errno.into()),
+                    }
+                }
                 StructPayload::CharDevice(binding) => binding.ops.write(bytes, guard),
                 StructPayload::Pipe {
                     payload,
