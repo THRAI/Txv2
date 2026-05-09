@@ -275,7 +275,7 @@ impl ExecTestFs {
     }
 }
 
-// `FsOpsV3` + `FsPageBackingV3` impls + tests on `ExecTestFs` live in
+// `FsOps` + `FsPageBacking` impls + tests on `ExecTestFs` live in
 // the sibling `v3` submodule (file: `script/tests/v3.rs`). The v3 traits
 // are the sole `FsOps`-shaped surface; v4 `FsOps` / `FsPageBacking` were
 // retired as part of the v3-only unification. The submodule has full
@@ -427,8 +427,8 @@ fn build_fs_root() -> (Cap<DEntry>, Arc<ExecTestFs>) {
     let fs = ExecTestFs::new(root_id);
 
     let payload = MountPayload::new_cap(
-        fs.clone() as Arc<dyn tx_subsystems::vfs::FsOpsV3>,
-        fs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBackingV3>,
+        fs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        fs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
         None,
         DevId::new(99),
         MountOptions::default(),
@@ -692,7 +692,7 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
         let cred = Credential::root();
         let cwd = process.cwd().expect("cwd bound");
         let guard = tx_substrate::epoch::guard();
-        let outcome = block_on(tx_subsystems::vfs::walker::step_open_v3(
+        let outcome = block_on(tx_subsystems::vfs::walker::step_open(
             cwd,
             name,
             OpenFileFlags {
@@ -709,7 +709,7 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
         drop(guard);
         match outcome {
             V3::Done(file) => file,
-            other => panic!("step_open_v3({name:?}) failed: {other:?}"),
+            other => panic!("step_open({name:?}) failed: {other:?}"),
         }
     };
 

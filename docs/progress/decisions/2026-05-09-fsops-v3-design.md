@@ -1,16 +1,16 @@
-# Decision: FsOps v3 trait migration via parallel `FsOpsV3`
+# Decision: FsOps v3 trait migration via parallel `FsOps`
 
 **Date:** 2026-05-09
 
 ## Decision
 
-- The `FsOps` filesystem-backend trait migrates to v3 step outcomes via a **parallel `FsOpsV3` trait** declared alongside the existing `FsOps` in `crates/tx-subsystems/src/vfs/execution.rs`. Each of the eight `impl FsOps for X` blocks across the workspace grows a sibling `impl FsOpsV3 for X` block; existing v4 callers stay on `FsOps` unchanged, and v3 callers opt into `FsOpsV3` per call site. A final wholesale cascade replaces `FsOps` with `FsOpsV3` once every impl + caller is dual-routed.
-- Wave 8 (this slice) declares the trait and lands one prototype impl (`LifecycleFs`) + five inline tests. Wave 9 fans out to the remaining seven impls. The same pattern applies to the sibling `FsPageBacking` trait, designed in this doc but **not** prototyped here — `FsPageBackingV3` lands first in wave 9 because it shares mount-payload coupling with `FsOpsV3` (the walker dual-routes through `MountPayload { fs_ops, fs_page_backing }`).
+- The `FsOps` filesystem-backend trait migrates to v3 step outcomes via a **parallel `FsOps` trait** declared alongside the existing `FsOps` in `crates/tx-subsystems/src/vfs/execution.rs`. Each of the eight `impl FsOps for X` blocks across the workspace grows a sibling `impl FsOps for X` block; existing v4 callers stay on `FsOps` unchanged, and v3 callers opt into `FsOps` per call site. A final wholesale cascade replaces `FsOps` with `FsOps` once every impl + caller is dual-routed.
+- Wave 8 (this slice) declares the trait and lands one prototype impl (`LifecycleFs`) + five inline tests. Wave 9 fans out to the remaining seven impls. The same pattern applies to the sibling `FsPageBacking` trait, designed in this doc but **not** prototyped here — `FsPageBacking` lands first in wave 9 because it shares mount-payload coupling with `FsOps` (the walker dual-routes through `MountPayload { fs_ops, fs_page_backing }`).
 
 ## Trait shape
 
 ```rust
-pub trait FsOpsV3: Send + Sync + 'static {
+pub trait FsOps: Send + Sync + 'static {
     fn lookup(&self, parent, name, guard)
         -> step_v3::StepOutcome<FsObjectId, NoProgress>;
     fn load_inode_meta(&self, fs_object_id, guard)
@@ -57,7 +57,7 @@ All 13 methods carry `NoProgress`. The Rust signature lives in `crates/tx-subsys
 | `materialise_rnode` | `NoProgress` | Returns one `Cap<RNode>`. |
 | `step_chmod`/`step_chown` | `NoProgress` | Per-inode metadata mutation. |
 
-`PageProgress` does **not** appear on `FsOpsV3`. The page-counting accumulators live one trait over, on `FsPageBacking{,V3}`, where ops like `flush_page` genuinely move pages and the caller (e.g. `step_fsync_v3`) tallies pages across a loop.
+`PageProgress` does **not** appear on `FsOps`. The page-counting accumulators live one trait over, on `FsPageBacking{,V3}`, where ops like `flush_page` genuinely move pages and the caller (e.g. `step_fsync_v3`) tallies pages across a loop.
 
 ## Context
 
@@ -69,15 +69,15 @@ All 13 methods carry `NoProgress`. The Rust signature lives in `crates/tx-subsys
 
 ## Consequences
 
-- **Wave 9 fan-out (seven impls):** `Tmpfs`, `Devfs`, `Ext4FsInstance`, `DevptsInstance`, `TestFs`, `LifecycleFs` (done in wave 8), `ExecTestFs`, `ExecveTestFs` each grow a sibling `impl FsOpsV3 for X` block next to their existing `impl FsOps for X`. Most are mechanical: the `LifecycleFs` prototype is a pure error-and-`Done(())` skeleton (no progress decisions to make), so wave 9's risk is concentrated in the impls that do real work — `Tmpfs` and `Ext4FsInstance`. Recommendation: do `Tmpfs` + one test fixture (`TestFs`) first as a learning sub-wave, then fan out the remaining five in parallel.
-- **`FsPageBackingV3` design (wave 9 first slice):** the sibling page-backing trait has 5 methods (`fetch_page`, `flush_page`, `truncate`, `fsync`, `fallocate`). Same `NoProgress` answer for all five — the trait surface is per-page or per-fs-internal-op, not aggregating. Page-count accounting stays at the caller (e.g. `step_fsync_v3` already tracks `pages_so_far`). `MountOutput` already holds `Arc<dyn FsPageBacking>` separately from `Arc<dyn FsOps>`, so the two traits migrate independently — no joint trait-object coupling.
-- **Walker dual-dispatch:** `walker.rs:247` types `current_fs_ops: Option<Arc<dyn FsOps>>` and routes lookups/materialisations through it. The cleanest path is **new walker entry points using `FsOpsV3`** rather than an adapter (`&dyn FsOps` → `&dyn FsOpsV3`). An adapter would re-introduce the per-call-site `Advanced` ambiguity at the adapter layer, which is exactly the problem `FsOpsV3` exists to dissolve. The walker grows `step_walk_v3` / `step_open_v3` siblings (free-fn cascade pattern from wave 4/6/7); when every impl dual-routes, walker callers swap, then `step_walk` deletes alongside `FsOps`.
-- **Final cascade still required:** the parallel-trait approach defers the wholesale rename, it doesn't eliminate it. Once every impl + every caller is on `FsOpsV3`, a final wave deletes `FsOps`, renames `FsOpsV3 → FsOps`, and the workspace is single-trait again. This wave is large but mechanical (no logic decisions left).
-- **Trait-object lifetime contracts unchanged:** both traits are `Send + Sync + 'static`. `Arc<dyn FsOps>` and `Arc<dyn FsOpsV3>` coexist without trouble in `MountPayload` — wave 9 grows a sibling `fs_ops_v3: Arc<dyn FsOpsV3>` on `MountPayload`, populated by the same backend whose `mount_root` constructor returns both.
+- **Wave 9 fan-out (seven impls):** `Tmpfs`, `Devfs`, `Ext4FsInstance`, `DevptsInstance`, `TestFs`, `LifecycleFs` (done in wave 8), `ExecTestFs`, `ExecveTestFs` each grow a sibling `impl FsOps for X` block next to their existing `impl FsOps for X`. Most are mechanical: the `LifecycleFs` prototype is a pure error-and-`Done(())` skeleton (no progress decisions to make), so wave 9's risk is concentrated in the impls that do real work — `Tmpfs` and `Ext4FsInstance`. Recommendation: do `Tmpfs` + one test fixture (`TestFs`) first as a learning sub-wave, then fan out the remaining five in parallel.
+- **`FsPageBacking` design (wave 9 first slice):** the sibling page-backing trait has 5 methods (`fetch_page`, `flush_page`, `truncate`, `fsync`, `fallocate`). Same `NoProgress` answer for all five — the trait surface is per-page or per-fs-internal-op, not aggregating. Page-count accounting stays at the caller (e.g. `step_fsync_v3` already tracks `pages_so_far`). `MountOutput` already holds `Arc<dyn FsPageBacking>` separately from `Arc<dyn FsOps>`, so the two traits migrate independently — no joint trait-object coupling.
+- **Walker dual-dispatch:** `walker.rs:247` types `current_fs_ops: Option<Arc<dyn FsOps>>` and routes lookups/materialisations through it. The cleanest path is **new walker entry points using `FsOps`** rather than an adapter (`&dyn FsOps` → `&dyn FsOps`). An adapter would re-introduce the per-call-site `Advanced` ambiguity at the adapter layer, which is exactly the problem `FsOps` exists to dissolve. The walker grows `step_walk` / `step_open` siblings (free-fn cascade pattern from wave 4/6/7); when every impl dual-routes, walker callers swap, then `step_walk` deletes alongside `FsOps`.
+- **Final cascade still required:** the parallel-trait approach defers the wholesale rename, it doesn't eliminate it. Once every impl + every caller is on `FsOps`, a final wave deletes `FsOps`, renames `FsOps → FsOps`, and the workspace is single-trait again. This wave is large but mechanical (no logic decisions left).
+- **Trait-object lifetime contracts unchanged:** both traits are `Send + Sync + 'static`. `Arc<dyn FsOps>` and `Arc<dyn FsOps>` coexist without trouble in `MountPayload` — wave 9 grows a sibling `fs_ops: Arc<dyn FsOps>` on `MountPayload`, populated by the same backend whose `mount_root` constructor returns both.
 
 ## Cross-trait coupling found
 
-- `MountOutput { fs_ops, fs_page_backing }` couples both traits at construction time. Each backend (`tmpfs::mount_root`, `ext4::mount_root`, …) builds both objects from the same internal state. Wave 9 needs to ship both `FsOpsV3` and `FsPageBackingV3` together so backends can dual-route in one PR rather than having to add `fs_ops_v3` first and `fs_page_backing_v3` second across all eight backends.
+- `MountOutput { fs_ops, fs_page_backing }` couples both traits at construction time. Each backend (`tmpfs::mount_root`, `ext4::mount_root`, …) builds both objects from the same internal state. Wave 9 needs to ship both `FsOps` and `FsPageBacking` together so backends can dual-route in one PR rather than having to add `fs_ops` first and `fs_page_backing` second across all eight backends.
 - `materialise_rnode` returns `Cap<RNode>` whose `RNodeBacking::PageBacked { pc }` variant references a `PageContainer` whose `mount` field already references the `MountPayload` (which holds the page-backing trait object). No type-level v3↔v4 leak — the cap is opaque at the trait boundary.
 - The walker calls `fs_ops.lookup(...)` and `mount_payload.fs_page_backing.fetch_page(...)` independently per step. No method on `FsOps` consumes a type produced by `FsPageBacking` or vice versa. The two trait migrations are **decoupled at the surface** even though both backends are built together.
 
@@ -90,9 +90,9 @@ All 13 methods carry `NoProgress`. The Rust signature lives in `crates/tx-subsys
 ## Open Questions
 
 - **`fetch_page` returns a `Frame` — is `PageProgress` the right v3 type, or `NoProgress`?** Current design picks `NoProgress` because the trait surface is "fetch one page" (the caller asked for one specific page; partial progress within a single page fetch is meaningless). But page-cache lifecycle ops drive a loop over pages from outside, so the per-call accumulator is genuinely empty. Confirmed `NoProgress` for wave 9 unless an impl surfaces a counter-example.
-- **Should `readdir_batch` (multi-entry per call) land at the same time as `FsOpsV3`?** Adding it later means a second trait migration; adding it now means designing a `EntryProgress`-carrying method without a caller. Defer to wave 9: ship the 13-method `FsOpsV3` mirror first, add `readdir_batch` only when there's a caller that benefits.
-- **Should the wholesale-cascade wave delete `FsOps` and rename `FsOpsV3 → FsOps`, or keep the `V3` suffix as the new spelling?** Code-style guess: drop the suffix. The `_v3` naming is a migration scaffold; once the migration completes the kernel is single-version again.
-- **Walker call-site `dyn FsOps` → `dyn FsOpsV3` cutover order:** does the walker grow `step_walk_v3` first (freezing `step_walk` against `FsOps`), or do the impls grow `FsOpsV3` first (so `step_walk_v3` has impls to test against)? Recommended order: impls first (wave 9a), walker entry points second (wave 9b). The wave-8 prototype validates the impl side; wave 9a is the impl fan-out; wave 9b adds `step_walk_v3` once impl coverage is 8/8.
+- **Should `readdir_batch` (multi-entry per call) land at the same time as `FsOps`?** Adding it later means a second trait migration; adding it now means designing a `EntryProgress`-carrying method without a caller. Defer to wave 9: ship the 13-method `FsOps` mirror first, add `readdir_batch` only when there's a caller that benefits.
+- **Should the wholesale-cascade wave delete `FsOps` and rename `FsOps → FsOps`, or keep the `V3` suffix as the new spelling?** Code-style guess: drop the suffix. The `_v3` naming is a migration scaffold; once the migration completes the kernel is single-version again.
+- **Walker call-site `dyn FsOps` → `dyn FsOps` cutover order:** does the walker grow `step_walk` first (freezing `step_walk` against `FsOps`), or do the impls grow `FsOps` first (so `step_walk` has impls to test against)? Recommended order: impls first (wave 9a), walker entry points second (wave 9b). The wave-8 prototype validates the impl side; wave 9a is the impl fan-out; wave 9b adds `step_walk` once impl coverage is 8/8.
 
 ## Verification
 

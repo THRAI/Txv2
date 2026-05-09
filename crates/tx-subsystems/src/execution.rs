@@ -103,7 +103,7 @@ impl From<Errno> for tx_substrate::step_v3::Errno {
 /// Reverse bridge — `step_v3::Errno → execution::Errno`. Wave 9d (b)
 /// added the inverse of the wave-5 `From<Errno> for step_v3::Errno`
 /// impl so tx-shims call sites that switch from `step_walk` to
-/// `step_walk_v3` can route the v3 outcome's errno back through the
+/// `step_walk` can route the v3 outcome's errno back through the
 /// existing `errno_to_i32` translation table without each site
 /// reproducing the variant-by-variant mapping. Exhaustive no-wildcard
 /// match: a future `step_v3::Errno`-only addition fails to compile

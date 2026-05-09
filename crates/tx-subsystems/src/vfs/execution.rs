@@ -8,7 +8,7 @@
 use alloc::sync::Arc;
 
 use crate::execution::{Errno, Guard, StepOutcome};
-use crate::page_backed::FsPageBackingV3;
+use crate::page_backed::FsPageBacking;
 use crate::tty;
 
 use super::structure::{
@@ -19,7 +19,7 @@ use super::structure::{
 /// Filesystem backend trait. The boundary tx-ext4, tmpfs, devfs, etc.
 /// implement to provide namespace + page-backing operations.
 
-// === FsOpsV3 — parallel trait emitting v3 step outcomes ================
+// === FsOps — parallel trait emitting v3 step outcomes ================
 //
 // Wave-8 design + prototype slice. Per
 // `docs/progress/decisions/2026-05-09-fsops-v3-design.md`, the trait-
@@ -30,12 +30,12 @@ use super::structure::{
 // (default `lookup_v3` calling `lookup` and converting) cannot make
 // that decision — `Advanced(t)` is per-call-site ambiguous (Continue
 // vs Done), and the default body has no caller context. So we grow
-// `FsOpsV3` as a parallel trait. Each FS impl block grows a sibling
-// `impl FsOpsV3 for X` next to its existing `impl FsOps for X`. The
-// final wholesale cascade (replacing FsOps with FsOpsV3) lives in a
+// `FsOps` as a parallel trait. Each FS impl block grows a sibling
+// `impl FsOps for X` next to its existing `impl FsOps for X`. The
+// final wholesale cascade (replacing FsOps with FsOps) lives in a
 // later wave once all eight impls + walker callers are dual-routed.
 //
-// Per-method progress-type choice: every method in `FsOpsV3` uses
+// Per-method progress-type choice: every method in `FsOps` uses
 // `step_v3::NoProgress`. The trait surface is one-shot identity-side
 // queries / mutations (`lookup`, `mkdir`, `unlink`, …): the caller
 // asks one question per call, and the trait's contract has no
@@ -43,15 +43,15 @@ use super::structure::{
 // the caller composes by re-calling with the new cursor — the cursor
 // is a method input, not progress). Page-counting accumulators
 // (`PageProgress`) live on the page-backing trait surface
-// (`FsPageBackingV3`, wave 9 design), where ops like `flush_page`
+// (`FsPageBacking`, wave 9 design), where ops like `flush_page`
 // genuinely move pages. Cross-trait coupling: `FsOps::materialise_rnode`
 // returns `Cap<RNode>` and the caller (`walker`) routes between
 // FsOps and FsPageBacking via a single `MountPayload`; designing
-// FsOpsV3 first leaves the FsPageBackingV3 shape consistent and
+// FsOps first leaves the FsPageBacking shape consistent and
 // validates the approach with the smaller surface.
 //
 // Doc tag: `txdoc:STEP-V2-OUTCOME-ALGEBRA-1` (closed four-variant
-// outcome). The `FsOpsV3` declaration site is referenced by the
+// outcome). The `FsOps` declaration site is referenced by the
 // design doc at `docs/progress/decisions/2026-05-09-fsops-v3-design.md`.
 
 /// Parallel `FsOps` trait emitting v3 step outcomes.
@@ -66,8 +66,8 @@ use super::structure::{
 /// (`LifecycleFs`); wave 9 fans out to the remaining seven impls
 /// (`Tmpfs`, `Devfs`, `Ext4FsInstance`, `DevptsInstance`, `TestFs`,
 /// `ExecTestFs`, `ExecveTestFs`). The eventual final cascade
-/// replaces `FsOps` outright with `FsOpsV3`.
-pub trait FsOpsV3: Send + Sync + 'static {
+/// replaces `FsOps` outright with `FsOps`.
+pub trait FsOps: Send + Sync + 'static {
     fn lookup(
         &self,
         parent: FsObjectId,
@@ -241,16 +241,16 @@ pub trait FsOpsV3: Send + Sync + 'static {
 /// to build the mount payload. Per `TX_EXT4_PLAN_v1_2.md` §pub-types and
 /// `bringup_fs_specs_v_1` §root-output.
 ///
-/// Wave 9c grew the `fs_ops_v3` / `fs_page_backing_v3` sibling fields
+/// Wave 9c grew the `fs_ops` / `fs_page_backing` sibling fields
 /// alongside the v4 `fs_ops` / `fs_page_backing` so the new walker
-/// entry points (`step_walk_v3` / `step_open_v3`) can route through the
+/// entry points (`step_walk` / `step_open`) can route through the
 /// v3 trait surface end-to-end. Backends populate both pairs from the
-/// same `Arc<Self>`; the existing `fs_ops_v3_arc` / `fs_page_backing_v3_arc`
+/// same `Arc<Self>`; the existing `fs_ops_arc` / `fs_page_backing_arc`
 /// factory methods on `Tmpfs`, `Devfs`, and `Ext4FsInstance` produce
 /// the v3-typed `Arc`s.
 pub struct MountOutput {
-    pub fs_ops_v3: Arc<dyn FsOpsV3>,
-    pub fs_page_backing_v3: Arc<dyn FsPageBackingV3>,
+    pub fs_ops: Arc<dyn FsOps>,
+    pub fs_page_backing: Arc<dyn FsPageBacking>,
     pub root_fs_object_id: FsObjectId,
     pub root_inode_meta: InodeMeta,
 }

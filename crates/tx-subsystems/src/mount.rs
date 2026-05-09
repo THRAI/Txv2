@@ -8,8 +8,8 @@ use tx_substrate::SpinMutex;
 
 use crate::device::BlockDevice;
 use crate::execution::KernelResult;
-use crate::page_backed::{FsPageBackingV3, PageContainer};
-use crate::vfs::{DEntry, FsObjectId, FsOpsV3, InodeMeta, RNode};
+use crate::page_backed::{FsPageBacking, PageContainer};
+use crate::vfs::{DEntry, FsObjectId, FsOps, InodeMeta, RNode};
 use tx_substrate::zone::{
     self, Cap, Dead, Entity, PayloadBinding, PayloadCap, Zone, ZoneAllocated, ZoneError,
 };
@@ -91,8 +91,8 @@ pub enum SourceLabel {
 
 pub struct MountPayload {
     payload_pin_count: AtomicU32,
-    pub fs_ops_v3: Arc<dyn FsOpsV3>,
-    pub fs_page_backing_v3: Arc<dyn FsPageBackingV3>,
+    pub fs_ops: Arc<dyn FsOps>,
+    pub fs_page_backing: Arc<dyn FsPageBacking>,
     pub backing: Option<Arc<dyn BlockDevice>>,
     pub dev_id: DevId,
     pub options: MountOptions,
@@ -103,8 +103,8 @@ pub struct MountPayload {
 impl MountPayload {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        fs_ops_v3: Arc<dyn FsOpsV3>,
-        fs_page_backing_v3: Arc<dyn FsPageBackingV3>,
+        fs_ops: Arc<dyn FsOps>,
+        fs_page_backing: Arc<dyn FsPageBacking>,
         backing: Option<Arc<dyn BlockDevice>>,
         dev_id: DevId,
         options: MountOptions,
@@ -113,8 +113,8 @@ impl MountPayload {
     ) -> Self {
         Self {
             payload_pin_count: AtomicU32::new(0),
-            fs_ops_v3,
-            fs_page_backing_v3,
+            fs_ops,
+            fs_page_backing,
             backing,
             dev_id,
             options,
@@ -125,8 +125,8 @@ impl MountPayload {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_cap(
-        fs_ops_v3: Arc<dyn FsOpsV3>,
-        fs_page_backing_v3: Arc<dyn FsPageBackingV3>,
+        fs_ops: Arc<dyn FsOps>,
+        fs_page_backing: Arc<dyn FsPageBacking>,
         backing: Option<Arc<dyn BlockDevice>>,
         dev_id: DevId,
         options: MountOptions,
@@ -137,8 +137,8 @@ impl MountPayload {
         Ok(zone::sign_for(
             reservation,
             Self::new(
-                fs_ops_v3,
-                fs_page_backing_v3,
+                fs_ops,
+                fs_page_backing,
                 backing,
                 dev_id,
                 options,
@@ -152,12 +152,12 @@ impl MountPayload {
         self.payload_pin_count.load(Ordering::Acquire)
     }
 
-    pub fn fs_ops_v3(&self) -> &Arc<dyn FsOpsV3> {
-        &self.fs_ops_v3
+    pub fn fs_ops(&self) -> &Arc<dyn FsOps> {
+        &self.fs_ops
     }
 
-    pub fn fs_page_backing_v3(&self) -> &Arc<dyn FsPageBackingV3> {
-        &self.fs_page_backing_v3
+    pub fn fs_page_backing(&self) -> &Arc<dyn FsPageBacking> {
+        &self.fs_page_backing
     }
 }
 
@@ -333,8 +333,8 @@ pub struct MountInitContext {
 }
 
 pub struct MountOutput {
-    pub fs_ops_v3: Arc<dyn crate::vfs::FsOpsV3>,
-    pub fs_page_backing_v3: Arc<dyn crate::page_backed::FsPageBackingV3>,
+    pub fs_ops: Arc<dyn crate::vfs::FsOps>,
+    pub fs_page_backing: Arc<dyn crate::page_backed::FsPageBacking>,
     pub root_fs_object_id: FsObjectId,
     pub root_inode_meta: InodeMeta,
 }
@@ -535,7 +535,7 @@ mod tests {
 
     struct MockFs;
 
-    impl FsOpsV3 for MockFs {
+    impl FsOps for MockFs {
         fn lookup(
             &self,
             _parent: FsObjectId,
@@ -670,7 +670,7 @@ mod tests {
         }
     }
 
-    impl FsPageBackingV3 for MockFs {
+    impl FsPageBacking for MockFs {
         fn fetch_page(
             &self,
             _fs_object_id: FsObjectId,
@@ -717,8 +717,8 @@ mod tests {
         crate::zones::register_all().expect("kernel zones");
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
-            fs.clone() as Arc<dyn FsOpsV3>,
-            fs as Arc<dyn FsPageBackingV3>,
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
             None,
             DevId::new(1),
             MountOptions::default(),
@@ -745,8 +745,8 @@ mod tests {
         crate::zones::register_all().expect("kernel zones");
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
-            fs.clone() as Arc<dyn FsOpsV3>,
-            fs as Arc<dyn FsPageBackingV3>,
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
             None,
             DevId::new(2),
             MountOptions::default(),
@@ -778,8 +778,8 @@ mod tests {
 
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
-            fs.clone() as Arc<dyn FsOpsV3>,
-            fs as Arc<dyn FsPageBackingV3>,
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
             None,
             DevId::new(3),
             MountOptions::default(),

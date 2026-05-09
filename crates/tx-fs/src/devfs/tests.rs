@@ -15,7 +15,7 @@ use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::vfs::{
-    Credential, DirCursor, FsObjectId, FsOpsV3, RNodeBacking, StructPayload,
+    Credential, DirCursor, FsObjectId, FsOps, RNodeBacking, StructPayload,
 };
 use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Outcome};
 
@@ -107,9 +107,9 @@ fn devfs_lookup_console_after_register_hardware_returns_tty_rnode() {
     let guard = tx_substrate::epoch::guard();
     let devfs = Devfs::new();
 
-    // FsOpsV3::lookup over the devfs root yields a stable FsObjectId
+    // FsOps::lookup over the devfs root yields a stable FsObjectId
     // for the alias.
-    let obj_id = match <Devfs as FsOpsV3>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"console", &guard)
+    let obj_id = match <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"console", &guard)
     {
         V3Outcome::Done(id) => id,
         other => panic!("devfs.lookup(console) failed: {other:?}"),
@@ -213,7 +213,7 @@ fn devfs_create_returns_erofs() {
     // not affect the assertion; leaving as `Credential::default()`
     // documents that this test is not gated on DAC behaviour.
     let cred = Credential::default();
-    let outcome = <Devfs as FsOpsV3>::create_inode(
+    let outcome = <Devfs as FsOps>::create_inode(
         &devfs,
         DEVFS_ROOT_OBJECT_ID,
         b"new-thing",
@@ -226,11 +226,11 @@ fn devfs_create_returns_erofs() {
     // Other mutators report the same. Spot-check the most likely
     // accidental-success paths:
     assert_eq!(
-        <Devfs as FsOpsV3>::mkdir(&devfs, DEVFS_ROOT_OBJECT_ID, b"sub", 0o755, &cred, &guard),
+        <Devfs as FsOps>::mkdir(&devfs, DEVFS_ROOT_OBJECT_ID, b"sub", 0o755, &cred, &guard),
         V3Outcome::err(V3Errno::EROFS)
     );
     assert_eq!(
-        <Devfs as FsOpsV3>::unlink(
+        <Devfs as FsOps>::unlink(
             &devfs,
             DEVFS_ROOT_OBJECT_ID,
             b"console",
@@ -240,7 +240,7 @@ fn devfs_create_returns_erofs() {
         V3Outcome::err(V3Errno::EROFS)
     );
     assert_eq!(
-        <Devfs as FsOpsV3>::serialize_inode_meta(
+        <Devfs as FsOps>::serialize_inode_meta(
             &devfs,
             DEVFS_ROOT_OBJECT_ID,
             &tx_subsystems::vfs::InodeMeta::new(tx_subsystems::vfs::InodeKind::Directory, 0o755),
@@ -265,7 +265,7 @@ fn devfs_chmod_returns_erofs() {
     // supported. The override returns EROFS regardless of
     // privilege.
     assert_eq!(
-        FsOpsV3::step_chmod(&devfs, DEVFS_ROOT_OBJECT_ID, 0o700, &cred, &guard),
+        FsOps::step_chmod(&devfs, DEVFS_ROOT_OBJECT_ID, 0o700, &cred, &guard),
         V3Outcome::err(V3Errno::EROFS)
     );
 }
@@ -282,7 +282,7 @@ fn devfs_chown_returns_erofs() {
     let cred = Credential::root();
 
     assert_eq!(
-        FsOpsV3::step_chown(
+        FsOps::step_chown(
             &devfs,
             DEVFS_ROOT_OBJECT_ID,
             Some(1000),
@@ -309,20 +309,20 @@ fn devfs_lookup_unknown_returns_enoent() {
     let devfs = Devfs::new();
 
     assert_eq!(
-        <Devfs as FsOpsV3>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"not-a-real-device", &guard),
+        <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"not-a-real-device", &guard),
         V3Outcome::err(V3Errno::ENOENT)
     );
 
     // Non-root parent always misses too.
     assert_eq!(
-        <Devfs as FsOpsV3>::lookup(&devfs, FsObjectId::new(0xdead_beef), b"console", &guard),
+        <Devfs as FsOps>::lookup(&devfs, FsObjectId::new(0xdead_beef), b"console", &guard),
         V3Outcome::err(V3Errno::ENOENT)
     );
 }
 
 // === Wave 9b: parallel v3 trait shape tests =============================
 //
-// Pin the `FsOpsV3` / `FsPageBackingV3` outcome shape on `Devfs` so a
+// Pin the `FsOps` / `FsPageBacking` outcome shape on `Devfs` so a
 // regression in the v3 mapping surfaces locally rather than at the
 // walker call site once wave 9b's walker entry points land. Tests
 // exercise the most representative methods: `lookup` (positive +
@@ -339,7 +339,7 @@ fn devfs_v3_lookup_console_returns_done_with_object_id() {
 
     let _ops = install_capturing_console();
 
-    use tx_subsystems::vfs::FsOpsV3;
+    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::StepOutcome as V3;
 
     let devfs = Devfs::new();
@@ -347,7 +347,7 @@ fn devfs_v3_lookup_console_returns_done_with_object_id() {
 
     // Positive lookup: console alias is registered → `Done(id)` with a
     // non-root id.
-    let id = match <Devfs as FsOpsV3>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"console", &guard) {
+    let id = match <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"console", &guard) {
         V3::Done(id) => id,
         other => panic!("v3 lookup(console): {other:?}"),
     };
@@ -357,7 +357,7 @@ fn devfs_v3_lookup_console_returns_done_with_object_id() {
     // bridge.
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress};
     assert_eq!(
-        <Devfs as FsOpsV3>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"nope-v3", &guard),
+        <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"nope-v3", &guard),
         V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
     );
 }
@@ -369,13 +369,13 @@ fn devfs_v3_load_inode_meta_root_returns_directory_meta() {
         .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
-    use tx_subsystems::vfs::{FsOpsV3, InodeKind};
+    use tx_subsystems::vfs::{FsOps, InodeKind};
     use tx_substrate::step_v3::StepOutcome as V3;
 
     let devfs = Devfs::new();
     let guard = tx_substrate::epoch::guard();
 
-    let meta = match <Devfs as FsOpsV3>::load_inode_meta(&devfs, DEVFS_ROOT_OBJECT_ID, &guard) {
+    let meta = match <Devfs as FsOps>::load_inode_meta(&devfs, DEVFS_ROOT_OBJECT_ID, &guard) {
         V3::Done(meta) => meta,
         other => panic!("v3 load_inode_meta(root): {other:?}"),
     };
@@ -393,14 +393,14 @@ fn devfs_v3_fetch_page_returns_enosys() {
         .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
-    use tx_subsystems::page_backed::{Frame, FsPageBackingV3};
+    use tx_subsystems::page_backed::{Frame, FsPageBacking};
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
     let devfs = Devfs::new();
     let guard = tx_substrate::epoch::guard();
 
     assert_eq!(
-        <Devfs as FsPageBackingV3>::fetch_page(&devfs, DEVFS_ROOT_OBJECT_ID, 0, &guard),
+        <Devfs as FsPageBacking>::fetch_page(&devfs, DEVFS_ROOT_OBJECT_ID, 0, &guard),
         V3::<Frame, NoProgress>::err(V3Errno::ENOSYS)
     );
 }
@@ -420,7 +420,7 @@ fn devfs_readdir_yields_registered_aliases_and_terminates() {
     let mut cursor = DirCursor::START;
     let mut names: Vec<Vec<u8>> = Vec::new();
     loop {
-        match <Devfs as FsOpsV3>::readdir(&devfs, DEVFS_ROOT_OBJECT_ID, cursor, &guard) {
+        match <Devfs as FsOps>::readdir(&devfs, DEVFS_ROOT_OBJECT_ID, cursor, &guard) {
             V3Outcome::Done(Some((entry, next))) => {
                 names.push(entry.name.as_bytes().to_vec());
                 cursor = next;

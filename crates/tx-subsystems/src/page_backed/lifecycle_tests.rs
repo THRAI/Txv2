@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 // so the assertions below use `V3Out::Done(())` against them. The
 // LifecycleFs v4 outcome wiring is unchanged — it stores v4 outcomes
 // for `FsPageBacking` and translates to v3 inside its
-// `FsPageBackingV3` impl below.
+// `FsPageBacking` impl below.
 use tx_substrate::step_v3::{
     PageProgress as V3PageProgress, StepOutcome as V3Out, YieldShape as V3YieldShape,
 };
@@ -546,13 +546,13 @@ fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
     assert_eq!(pc.size_bytes(), stable_size);
 }
 
-// === FsOpsV3 prototype impl + tests ====================================
+// === FsOps prototype impl + tests ====================================
 //
 // Wave-8 design + prototype slice for the trait migration. Per
 // `docs/progress/decisions/2026-05-09-fsops-v3-design.md`, `LifecycleFs`
 // is the smallest test-only `FsOps` impl in the workspace — it lives
 // next to wave-7's `step_truncate`/`step_fsync` work, so the
-// `FsOpsV3` impl gets validated against the same fixture that already
+// `FsOps` impl gets validated against the same fixture that already
 // exercises the v3 sibling fns. Wave 9 fans out to the remaining
 // seven impls (`Tmpfs`, `Devfs`, `Ext4FsInstance`, `DevptsInstance`,
 // `TestFs`, `ExecTestFs`, `ExecveTestFs`).
@@ -561,12 +561,12 @@ fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
 // progress-type table: the trait surface is one-shot identity-side
 // queries / mutations, page accounting belongs to `FsPageBacking{,V3}`.
 
-use crate::vfs::FsOpsV3;
+use crate::vfs::FsOps;
 use tx_substrate::step_v3::{
     Errno as V3Errno, NoProgress, StepOutcome as V3Outcome,
 };
 
-impl FsOpsV3 for LifecycleFs {
+impl FsOps for LifecycleFs {
     fn lookup(
         &self,
         _parent: FsObjectId,
@@ -685,10 +685,10 @@ impl FsOpsV3 for LifecycleFs {
     }
 }
 
-// Wave 9d: `FsPageBackingV3` impl so `MountPayload` can hold a
+// Wave 9d: `FsPageBacking` impl so `MountPayload` can hold a
 // `LifecycleFs` for the v3 page-backing slot. The impls mirror the
 // existing v4 bodies above; v4 `Blocked` becomes v3 `Err(EAGAIN)`.
-impl crate::page_backed::FsPageBackingV3 for LifecycleFs {
+impl crate::page_backed::FsPageBacking for LifecycleFs {
     fn fetch_page(
         &self,
         _fs_object_id: FsObjectId,
@@ -714,7 +714,7 @@ impl crate::page_backed::FsPageBackingV3 for LifecycleFs {
         if self.block_flush_after == Some(flush) {
             // Wave 9g-f: surface the wait carrier/interest pair so the
             // v4 `step_fsync` body (which now consumes
-            // `FsPageBackingV3`) can map this back to v4 `Blocked` /
+            // `FsPageBacking`) can map this back to v4 `Blocked` /
             // `AdvancedThenBlocked` with the original `WaitToken`
             // values the v4 fixture assertions check against. Replaces
             // the wave-9d placeholder collapse to `Err(EAGAIN)`.
@@ -773,8 +773,8 @@ impl crate::page_backed::FsPageBackingV3 for LifecycleFs {
 }
 
 // Tests pin the v3 outcome shape end-to-end through the `LifecycleFs`
-// impl. They are red until both the `FsOpsV3` trait declaration in
-// `crates/tx-subsystems/src/vfs/execution.rs` and the `impl FsOpsV3
+// impl. They are red until both the `FsOps` trait declaration in
+// `crates/tx-subsystems/src/vfs/execution.rs` and the `impl FsOps
 // for LifecycleFs` block above are present.
 
 #[test]
@@ -782,7 +782,7 @@ fn fsopsv3_load_inode_meta_returns_done_with_default_meta() {
     setup_host_substrate();
     let guard = tx_substrate::epoch::guard();
     let fs = LifecycleFs::new();
-    let outcome = <LifecycleFs as FsOpsV3>::load_inode_meta(&fs, FsObjectId::new(7), &guard);
+    let outcome = <LifecycleFs as FsOps>::load_inode_meta(&fs, FsObjectId::new(7), &guard);
     let expected = InodeMeta::new(InodeKind::Regular, 0o100644);
     assert_eq!(outcome, V3Outcome::done(expected));
 }
@@ -792,7 +792,7 @@ fn fsopsv3_create_inode_returns_err_erofs_on_readonly_fixture() {
     setup_host_substrate();
     let guard = tx_substrate::epoch::guard();
     let fs = LifecycleFs::new();
-    let outcome = <LifecycleFs as FsOpsV3>::create_inode(
+    let outcome = <LifecycleFs as FsOps>::create_inode(
         &fs,
         FsObjectId::new(1),
         b"foo",
@@ -811,7 +811,7 @@ fn fsopsv3_readdir_done_none_for_empty_directory() {
     setup_host_substrate();
     let guard = tx_substrate::epoch::guard();
     let fs = LifecycleFs::new();
-    let outcome = <LifecycleFs as FsOpsV3>::readdir(
+    let outcome = <LifecycleFs as FsOps>::readdir(
         &fs,
         FsObjectId::new(1),
         DirCursor::START,
@@ -826,7 +826,7 @@ fn fsopsv3_lookup_returns_err_enosys() {
     let guard = tx_substrate::epoch::guard();
     let fs = LifecycleFs::new();
     let outcome =
-        <LifecycleFs as FsOpsV3>::lookup(&fs, FsObjectId::new(1), b"missing", &guard);
+        <LifecycleFs as FsOps>::lookup(&fs, FsObjectId::new(1), b"missing", &guard);
     assert_eq!(
         outcome,
         V3Outcome::<FsObjectId, NoProgress>::err(V3Errno::ENOSYS)
@@ -841,7 +841,7 @@ fn fsopsv3_default_read_link_returns_enosys() {
     setup_host_substrate();
     let guard = tx_substrate::epoch::guard();
     let fs = LifecycleFs::new();
-    let outcome = <LifecycleFs as FsOpsV3>::read_link(&fs, FsObjectId::new(1), &guard);
+    let outcome = <LifecycleFs as FsOps>::read_link(&fs, FsObjectId::new(1), &guard);
     assert_eq!(
         outcome,
         V3Outcome::<alloc::boxed::Box<[u8]>, NoProgress>::err(V3Errno::ENOSYS)

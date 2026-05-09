@@ -24,7 +24,7 @@ use crate::tty::ldisc::{
 use crate::tty::structure::ring::TtyRing;
 use crate::tty::structure::termios::{Termios, ICANON, IXON, TOSTOP};
 use crate::tty::structure::{SessionPgrp, TtyIdentity, TtyKind, TtyPayload, Winsize};
-use crate::vfs::{Credential, DirCursor, FsOpsV3, InodeKind};
+use crate::vfs::{Credential, DirCursor, FsOps, InodeKind};
 
 struct NoopOps;
 

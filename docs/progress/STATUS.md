@@ -11,12 +11,12 @@
   test-file callers and field-passthroughs. Sequenced sub-waves:
 
   - **9h-γ** (commit 80d2a33): step_fsync_v3 routes through v3
-    `fs_page_backing_v3.flush_page`/`fsync`. Aligned mod-tests
+    `fs_page_backing.flush_page`/`fsync`. Aligned mod-tests
     LifecycleFs's v3 page-backing impl with v4 (counters,
     yield_on_carrier(13, 0x55) on `block_flush_after`).
   - **9h-β** (commit 694f503): materialize_file_page in
     page_backed.rs routes through v3
-    `fs_page_backing_v3.fetch_page`. Aligned BlockingFs's v3
+    `fs_page_backing.fetch_page`. Aligned BlockingFs's v3
     fetch_page with v4's `Blocked(WaitToken(9, 0x44))` via
     yield_on_carrier(NoProgress, 9, 0x44).
   - **9h-δ** (commit adce28d): tx-kernel/init/tests.rs's
@@ -46,7 +46,7 @@
   hit two compounding blockers:
 
   1. **Inherent-vs-trait method ambiguity inside trait impls.**
-     Inside `impl FsPageBackingV3 for Devfs { fn fallocate(...)
+     Inside `impl FsPageBacking for Devfs { fn fallocate(...)
      -> V3Outcome<...> { Self::fallocate(self, ...) } }`, Rust
      resolves `Self::fallocate` to the trait method being
      defined (V3 outcome) — not the inherent method (V4
@@ -82,7 +82,7 @@
     impl logic pasted in, returning v3 outcome directly. Zero
     inherent-method dependency. Heaviest but cleanest result.
   * **Migrate tests to v3 outcome shape** (~17 tty-test calls
-    + N others). Tests use `<Fixture as FsOpsV3>::method`
+    + N others). Tests use `<Fixture as FsOps>::method`
     explicitly with v3 match arms. Combined with the inherent-
     method approach this might work — the trait stays the only
     public surface; inherent forms only feed the v3 trait
@@ -107,13 +107,13 @@
   earlier are state-ordering flakes, not real failures) shows
   my prior wave-9h-a postmortem was partially wrong. Corrected
   picture:
-  - **Walker is fully migrated.** `step_walk_v3`/`step_open_v3`
-    use `payload.fs_ops_v3` end-to-end. All walker fixtures
+  - **Walker is fully migrated.** `step_walk`/`step_open`
+    use `payload.fs_ops` end-to-end. All walker fixtures
     (TestFs, Tmpfs) have **real** delegating v3 impls
     (`<Self as FsOps>::method` with v4→v3 outcome translation),
     not stubs. Walker-based tests genuinely exercise v3.
   - **`step_truncate` (v4 fn) routes through v3 trait already**
-    (wave 9g-f Approach B-flavored: `mount.payload().fs_page_backing_v3.truncate`
+    (wave 9g-f Approach B-flavored: `mount.payload().fs_page_backing.truncate`
     with v3→v4 outcome conversion at the boundary). Tests pass
     because BlockingFs/RecordingFs's v3 `truncate` impls
     return `Done(())` matching their v4 truncates.
@@ -172,10 +172,10 @@
   unlink / symlink / link / lookup / load_inode_meta / read_link
   / rename) across mkdirat / unlinkat / symlinkat / linkat /
   readlinkat / renameat2 syscall arms. Added
-  `fs_page_backing_v3_for_dentry` sibling helper.
+  `fs_page_backing_for_dentry` sibling helper.
   (b) **W-9g-c** migrated `crates/tx-shims/src/linux_syscall/fs_basic.rs`
   — `fs_ops.readdir` (getdents64) + the `fs_ops_for_rnode` helper
-  (renamed/migrated to `fs_ops_v3_for_rnode`).
+  (renamed/migrated to `fs_ops_for_rnode`).
   (c) **W-9g-d** migrated `crates/tx-kernel/src/init/exec.rs`
   bin/sh + init exec image build paths (mkdir / create_inode /
   materialise_rnode / truncate / flush_page) and a
@@ -185,19 +185,19 @@
   (d) **W-9g-e** migrated `crates/tx-subsystems/src/initramfs/mod.rs`
   populate helpers — 4 helper signatures (`walk_or_create_dirs`,
   `mkdir_idempotent`, `unpack_regular`, `unpack_symlink`) now take
-  `&Arc<dyn FsOpsV3>` / `&Arc<dyn FsPageBackingV3>`; 8 internal
+  `&Arc<dyn FsOps>` / `&Arc<dyn FsPageBacking>`; 8 internal
   trait-method call sites migrated; field reads switched from
   `payload.fs_ops` / `fs_page_backing` to v3 fields.
   (e) **W-9g-f** migrated `crates/tx-subsystems/src/page_backed/lifecycle.rs`
   — Approach A: v4 `step_truncate` / `step_fsync` fn bodies
-  rewrote to consume `fs_page_backing_v3.truncate` /
+  rewrote to consume `fs_page_backing.truncate` /
   `flush_page` / `fsync` internally with a v3→v4 outcome
   conversion at the boundary so v4-shaped callers stay
   unchanged. Adjusted wave-9d test mock's v3 flush_page from
   `V3::Err(EAGAIN)` to `yield_on_carrier(NoProgress, 13, 0x55)`
   so the converter recovers the original WaitToken (load-bearing
   test pin).
-  Plus orchestrator integration: wired `fs_page_backing_v3_for_dentry`
+  Plus orchestrator integration: wired `fs_page_backing_for_dentry`
   to fs_basic.rs O_TRUNC arm (W-9g-b created the helper but
   fs_basic.rs's owner W-9g-c didn't use it — peer race), then
   deleted both unused v4 helpers `fs_ops_for_dentry` and
@@ -225,15 +225,15 @@
   arms (2 trait-method calls). Same shape as wave 9d (b)'s
   walker-caller migration but applied to direct trait methods
   instead of `step_walk`:
-  - Added `fs_ops_v3_for_dentry(&Cap<DEntry>) -> Option<Arc<dyn
-    FsOpsV3>>` sibling to the existing `fs_ops_for_dentry`
+  - Added `fs_ops_for_dentry(&Cap<DEntry>) -> Option<Arc<dyn
+    FsOps>>` sibling to the existing `fs_ops_for_dentry`
     (which returns the v4 `Arc<dyn FsOps>`). Same
     parent-dentry-chain ascent looking for a `containing_mount_weak`
-    pin; reads `payload.fs_ops_v3` instead of `payload.fs_ops`.
+    pin; reads `payload.fs_ops` instead of `payload.fs_ops`.
   - Migrated `sys_fchmodat::*::sys_fchmodat_impl` and
     `sys_fchownat::*::sys_fchownat_impl` (the chmod and chown
     syscall arms) from `fs_ops.step_chmod` / `fs_ops.step_chown`
-    (v4) to `fs_ops_v3.step_chmod` / `fs_ops_v3.step_chown`
+    (v4) to `fs_ops.step_chmod` / `fs_ops.step_chown`
     (v3). Match arms collapsed from 5-variant to 4-variant; v3
     errno bridges back via `Errno::from(v3_errno)` then through
     the existing `fs_change_errno_magnitude` table.
@@ -293,7 +293,7 @@
   applied to direct trait methods rather than walker calls:
   rewrite each `fs_ops_for_dentry`/`fs_ops_for_rnode`/
   `fs_page_backing_for_dentry` helper to return v3 `Arc<dyn
-  FsOpsV3>` / `Arc<dyn FsPageBackingV3>`; collapse 5-variant
+  FsOps>` / `Arc<dyn FsPageBacking>`; collapse 5-variant
   match arms to 4-variant; bridge errnos via `Errno::from(v3)`.
   After all v4 trait-method callers are migrated, the actual
   trait retirement (now wave 9h) becomes the small mechanical
@@ -315,12 +315,12 @@
   `fn walk_inner`, `fn materialise_child_rnode`, `fn fs_ops_for`.
   walker.rs shrank from 916 → 569 lines (-347). Module-level
   rustdoc rewritten to point at v3 entry points only;
-  `vfs/mod.rs` `pub use` reduced to `step_open_v3 /
-  step_walk_v3 / SYMLOOP_MAX`.
+  `vfs/mod.rs` `pub use` reduced to `step_open /
+  step_walk / SYMLOOP_MAX`.
   (3) BONUS — worker discovered one additional v4 caller outside
   the test suite that wave 9e missed:
   `crates/tx-scripts/src/process/exec/script.rs::exec_script`
-  (the exec image walker call). Migrated to `step_open_v3` with
+  (the exec image walker call). Migrated to `step_open` with
   `Errno::from(v3_errno)` bridging back to the existing
   `ExecError::from_walker_errno` mapping. tx-scripts' exec test
   fixture also updated.
@@ -345,14 +345,14 @@
   two non-test-suite v4 walker callers migrated. Two sites:
   (1) `crates/tx-fs/src/devfs.rs::open_console_for_init` — the
   bootstrap `block_on(vfs::step_open(...))` for `/dev/console`
-  flipped to `step_open_v3` with the v3 4-variant match
+  flipped to `step_open` with the v3 4-variant match
   collapsed to `V3::Done(file) → return file` and the legacy
   fallthrough preserved. This was the last v3 production-side
   caller of v4 walker; **all production code now exclusively
   consumes the v3 walker.**
   (2) `crates/tx-kernel/src/init/tests.rs:372` — the
   `boot_smoke_walker_resolves_dev_console_after_mount_registration`
-  test flipped to `step_walk_v3`; the unused `StepOutcome` v4
+  test flipped to `step_walk`; the unused `StepOutcome` v4
   import dropped. Confirms the boot-time devfs mount
   registration is exercised through the v3 walker.
   After 9e, the only remaining v4 walker callers are the 18 v4
@@ -389,13 +389,13 @@
   to fall through to `create_then_walk` for `O_CREAT` paths,
   preserving the v4 semantics through the v3 errno enum.
   Module import in `linux_syscall/mod.rs:77` updated:
-  `use tx_subsystems::vfs::{step_open_v3, step_walk_v3, ...}`
+  `use tx_subsystems::vfs::{step_open, step_walk, ...}`
   (v4 names removed). **tx-shims linux_syscall is now 100% v3
   walker.** All chmod, chown, mkdir, rmdir, unlinkat, renameat2,
   symlinkat, linkat, openat, getcwd-family syscalls traverse
-  `syscall arm → fs_path/fs_mut/fs_basic helper → step_walk_v3
-  /step_open_v3 → walk_inner_v3 → MountPayload::fs_ops_v3 →
-  <Tmpfs/Devfs/Ext4 as FsOpsV3>::method`. Pre-existing tests
+  `syscall arm → fs_path/fs_mut/fs_basic helper → step_walk
+  /step_open → walk_inner_v3 → MountPayload::fs_ops →
+  <Tmpfs/Devfs/Ext4 as FsOps>::method`. Pre-existing tests
   pass without modification — the v3 cascade preserves v4
   semantics across every syscall arm. v4 `step_walk`/`step_open`
   fns continue to exist (used by walker.rs's own v4 `step_open`
@@ -416,9 +416,9 @@
   **first tx-shims production caller migrated to the v3 walker.**
   `crates/tx-shims/src/linux_syscall/fs_path.rs::resolve_path_at`
   (the helper that file-mode arms chmod/chown use to resolve
-  dirfd+path to a `Cap<DEntry>`) now calls `step_walk_v3` instead
+  dirfd+path to a `Cap<DEntry>`) now calls `step_walk` instead
   of `step_walk`, exercising the v3 trait surface
-  (`FsOpsV3` via `MountPayload::fs_ops_v3` direct-field access
+  (`FsOps` via `MountPayload::fs_ops` direct-field access
   from wave 9d (a)) and the four-variant v3 outcome. Two
   supporting changes:
   (1) Reverse errno bridge — added
@@ -436,7 +436,7 @@
   these paths today, mirroring the v4 defensive shape).
   This is the **first time the v3 path runs in a production
   syscall arm**: chmod/chown calls now traverse
-  `resolve_path_at → step_walk_v3 → walk_inner_v3 → FsOpsV3
+  `resolve_path_at → step_walk → walk_inner_v3 → FsOps
   trait dispatch → Tmpfs/Devfs/Ext4 v3 impls`. The other two
   walker call sites in fs_path.rs (line 438 and 573) and the
   `step_open` callers in fs_basic.rs / fs_mut.rs continue to
@@ -453,20 +453,20 @@
 - 2026-05-09 PR-1 wave-9d (a) of the v3 TDD migration landed —
   retired the wave-9c `FS_OPS_V3_REGISTRY` global SpinMutex
   sidecar by growing `MountPayload` with direct
-  `fs_ops_v3: Arc<dyn FsOpsV3>` and
-  `fs_page_backing_v3: Arc<dyn FsPageBackingV3>` fields. Worker
+  `fs_ops: Arc<dyn FsOps>` and
+  `fs_page_backing: Arc<dyn FsPageBacking>` fields. Worker
   hit an API ECONNRESET mid-flight after updating
   `MountPayload::new_cap` to take 9 args (added v3 fs_ops + v3
   fs_page_backing positional arguments) and ~half the callers;
   orchestrator finished. The registry (`FS_OPS_V3_REGISTRY`,
-  `register_mount_payload_v3`, `fs_ops_v3_for`,
-  `reset_fs_ops_v3_registry_for_test`) is now fully deleted from
-  walker.rs; `fs_ops_v3_for` re-implemented inside `walk_inner_v3`
+  `register_mount_payload_v3`, `fs_ops_for`,
+  `reset_fs_ops_registry_for_test`) is now fully deleted from
+  walker.rs; `fs_ops_for` re-implemented inside `walk_inner_v3`
   as direct field access on the dentry's mount payload. 5+
   `MountPayload::new_cap` callers updated across tx-kernel/init.rs
   (rootfs + devfs mounts), tx-fs (initramfs_tests, tmpfs/tests),
   tx-ext4, tx-shims, tx-scripts, and tx-subsystems internals;
-  most test fixtures grew `fs_ops_v3_arc` / `fs_page_backing_v3_arc`
+  most test fixtures grew `fs_ops_arc` / `fs_page_backing_arc`
   factory methods mirroring the wave-9b pattern. Worker also
   added v3 trait impls for `RecordingFs` and `BlockingFs` test
   fixtures inline in page_backed.rs's `mod tests` (387 lines),
@@ -474,7 +474,7 @@
   the entire `mod tests` block (1087 lines) to a new sibling file
   `crates/tx-subsystems/src/page_backed/core_tests.rs` (page_backed.rs
   now 788 lines, well under cap). One test
-  (`step_walk_v3_returns_enoent_on_missing`) re-`#[ignore]`'d
+  (`step_walk_returns_enoent_on_missing`) re-`#[ignore]`'d
   alongside the other 6 v3_walker tests under the existing
   main-side zone-slot Weak::upgrade cascade flake (passes in
   isolation; cascade is zone-level, not registry-level — registry
@@ -485,7 +485,7 @@
   progress validate` all green. **Wave 9d (b) unblocked:**
   migrate first tx-shims caller (likely `linux_syscall::fs_path::resolve_path_at`
   via `poll_walker_synchronously(step_walk(...))` at fs_path.rs:86)
-  from `step_walk` / `step_open` to `step_walk_v3` / `step_open_v3`.
+  from `step_walk` / `step_open` to `step_walk` / `step_open`.
   Once a tx-shims caller exercises v3 in production, the v4
   walker fns can start being retired in wave 9e.
 
@@ -493,33 +493,33 @@
   v3 path running end-to-end through a real walker entry. Single
   deep worker. Three deliverables:
   (1) **`MountOutput` grew sibling v3 fields:**
-  `fs_ops_v3: Arc<dyn FsOpsV3>` and
-  `fs_page_backing_v3: Arc<dyn FsPageBackingV3>`. Two production
+  `fs_ops: Arc<dyn FsOps>` and
+  `fs_page_backing: Arc<dyn FsPageBacking>`. Two production
   construction sites updated: `Tmpfs::new_root` in `tx-fs/tmpfs.rs`
   and `mount_ext4_read_only` in `tx-ext4/src/mount.rs`. Ext4's
-  `fs_ops_v3_arc` / `fs_page_backing_v3_arc` factories
+  `fs_ops_arc` / `fs_page_backing_arc` factories
   un-cfg-gated (no longer test-only). The duplicate
   `tx_subsystems::mount::MountOutput` grown for consistency.
-  (2) **`step_walk_v3`, `step_open_v3`, and `walk_inner_v3`** in
+  (2) **`step_walk`, `step_open`, and `walk_inner_v3`** in
   `crates/tx-subsystems/src/vfs/walker.rs` — full duplicate of
-  `walk_inner` against `FsOpsV3` (not `FsOps`); roughly 95%
+  `walk_inner` against `FsOps` (not `FsOps`); roughly 95%
   mechanical port (`Done(t)|Advanced(t)` → `V3::done(t)`,
   `Errno::*` via `e.into()`, `Yield` forwarded verbatim).
   Per-call-site `Continue { progress: NoProgress }` from
-  `FsOpsV3` is treated as no-op retry per the v3 monoid contract.
+  `FsOps` is treated as no-op retry per the v3 monoid contract.
   No code path in `walk_inner_v3` calls v4 `FsOps` — confirmed by
-  the `step_walk_v3_against_tmpfs_resolves_real_path` e2e test
+  the `step_walk_against_tmpfs_resolves_real_path` e2e test
   in `tx-fs/tmpfs/tests.rs` which builds rootfs from
-  `MountOutput::fs_ops_v3` and exercises `mkdir → step_walk_v3`
+  `MountOutput::fs_ops` and exercises `mkdir → step_walk`
   on production Tmpfs.
   (3) **`FS_OPS_V3_REGISTRY` sidecar** in walker.rs — temporary
   scaffolding because `MountPayload` doesn't yet carry an
-  `fs_ops_v3` field; the registry is a `SpinMutex<BTreeMap<u64,
-  Arc<dyn FsOpsV3>>>` keyed by `Cap<MountPayload>::key().raw()`,
+  `fs_ops` field; the registry is a `SpinMutex<BTreeMap<u64,
+  Arc<dyn FsOps>>>` keyed by `Cap<MountPayload>::key().raw()`,
   populated by `register_mount_payload_v3` from production
-  callers, resolved by `fs_ops_v3_for(&dentry, &guard)` from
+  callers, resolved by `fs_ops_for(&dentry, &guard)` from
   inside the walker. Worker explicitly flags this for wave 9d
-  retirement: grow `MountPayload::{fs_ops_v3, fs_page_backing_v3}`
+  retirement: grow `MountPayload::{fs_ops, fs_page_backing}`
   as direct fields and remove the global SpinMutex hot spot.
   10 new tests: 9 in new `vfs/walker/tests/v3_walker.rs`
   (simple/multi-component walk, ENOENT/EACCES, relative symlink
@@ -536,12 +536,12 @@
   **Wave 9d unblocked:** (a) retire FS_OPS_V3_REGISTRY by growing
   MountPayload v3 fields directly; (b) migrate tx-shims callers
   (`linux_syscall::execve/openat/getcwd/...`) from `step_walk` /
-  `step_open` to `step_walk_v3` / `step_open_v3`. Wave 9e can
+  `step_open` to `step_walk` / `step_open`. Wave 9e can
   retire `step_walk` / `step_open` / `walk_inner` once no caller
   remains.
 
 - 2026-05-09 PR-1 wave-9b of the v3 TDD migration landed — five
-  parallel workers fanned `FsOpsV3` + `FsPageBackingV3` impls
+  parallel workers fanned `FsOps` + `FsPageBacking` impls
   out to the remaining 5 backends. Trait-level migration is now
   COMPLETE at the impl tier — all 8 FsOps impls have v3
   siblings, all FsPageBacking impls have v3 siblings; walker
@@ -551,8 +551,8 @@
   body collapses to v3 `done(t)`, every `Blocked` to
   `err(EAGAIN)`, every `Err(e)` through the `From<execution::Errno>`
   bridge. Per-backend:
-  (a) **W-devfs** added `impl FsOpsV3 for Devfs` and
-  `impl FsPageBackingV3 for Devfs` in `crates/tx-fs/src/devfs.rs`
+  (a) **W-devfs** added `impl FsOps for Devfs` and
+  `impl FsPageBacking for Devfs` in `crates/tx-fs/src/devfs.rs`
   + factory methods (Devfs has no state, so factories use
   `Arc::new(Self)` directly rather than `self: Arc<Self>`).
   3 inline tests. devfs returns EROFS for mutators / ENOSYS
@@ -599,42 +599,42 @@
   sites (`vfs::walker::step_walk`, `step_open`,
   `vfs::execution::OpenFile::step_read`/`step_write`, etc.)
   can now opt into the v3 trait surfaces. MountOutput grows
-  sibling `fs_ops_v3` / `fs_page_backing_v3` `Arc<dyn _>`
+  sibling `fs_ops` / `fs_page_backing` `Arc<dyn _>`
   fields; backends wire them via the factory methods landed
   in 9a/9b. After 9c the v3 path is genuinely exercised
   end-to-end through one walker entry.
 
 - 2026-05-09 PR-1 wave-9a of the v3 TDD migration landed — single
-  deep worker covering `FsPageBackingV3` design + first impls of
+  deep worker covering `FsPageBacking` design + first impls of
   both v3 traits on `Tmpfs` (smallest production fs) and
   `TestFs` (smallest non-trivial test fixture). Three deliverables:
-  (1) `FsPageBackingV3` trait now lives in
-  `crates/tx-subsystems/src/page_backed/fs_page_backing_v3.rs`
+  (1) `FsPageBacking` trait now lives in
+  `crates/tx-subsystems/src/page_backed/fs_page_backing.rs`
   (extracted to its own file to keep page_backed.rs under the
   1500-line cap, re-exported via
-  `crate::page_backed::FsPageBackingV3`). 5 methods (`fetch_page`,
+  `crate::page_backed::FsPageBacking`). 5 methods (`fetch_page`,
   `flush_page`, `truncate`, `fsync`, `fallocate`) + the
   `supports_reflink` predicate; all StepOutcome methods use
   `step_v3::StepOutcome<T, NoProgress>` per the design doc —
   `fetch_page` got `NoProgress` because the trait surface is
   "fetch one specific page" and multi-page accumulation is
   caller-side (where wave-7's `step_fsync_v3` already tallies
-  `PageProgress`). (2) `impl FsOpsV3 for Tmpfs` and
-  `impl FsPageBackingV3 for Tmpfs` in `tmpfs.rs` — every Tmpfs
+  `PageProgress`). (2) `impl FsOps for Tmpfs` and
+  `impl FsPageBacking for Tmpfs` in `tmpfs.rs` — every Tmpfs
   v4 body is purely synchronous so the v3 impl is a 1:1
   translation; defensive `Advanced(t)` arms map to `done(t)` and
   defensive `Blocked` arms map to `Errno::EAGAIN` (neither fires
-  in Tmpfs); plus factory methods `Tmpfs::fs_ops_v3_arc` and
-  `Tmpfs::fs_page_backing_v3_arc` for one-line wiring at
-  MountOutput cutover. (3) `impl FsOpsV3 for TestFs` and
-  `impl FsPageBackingV3 for TestFs` in a new submodule
+  in Tmpfs); plus factory methods `Tmpfs::fs_ops_arc` and
+  `Tmpfs::fs_page_backing_arc` for one-line wiring at
+  MountOutput cutover. (3) `impl FsOps for TestFs` and
+  `impl FsPageBacking for TestFs` in a new submodule
   `vfs/walker/tests/v3.rs`. 8 v3 tests pin the new shapes
   end-to-end (4 Tmpfs + 4 TestFs). Final count: **1300 passed,
   0 failed, 4 ignored across 60 binaries** (wave-8 baseline 1292
   + 8). Worker reports the cross-trait coupling at MountOutput
   is genuinely independent — the two v3 traits migrate
   separately at the MountOutput level (wave 9b will grow the
-  sibling `fs_ops_v3`/`fs_page_backing_v3` fields on
+  sibling `fs_ops`/`fs_page_backing` fields on
   MountPayload once impl coverage is 8/8). All lints + progress
   validate green. **Wave 9b unblocked:** worker recommends full
   parallel fan-out to the remaining 5 backends (Devfs,
@@ -642,7 +642,7 @@
   Tmpfs is the most semantically rich impl and went green
   without surfacing any Continue-vs-Done decisions, so the
   simpler backends should fan out cleanly. Each remaining
-  backend is ~30-50 line FsOpsV3 + ~15-line FsPageBackingV3 +
+  backend is ~30-50 line FsOps + ~15-line FsPageBacking +
   2-3 inline tests. Independent files, no merge conflicts.
 
 - 2026-05-09 PR-1 wave-8 of the v3 TDD migration landed — first
@@ -650,7 +650,7 @@
   the additive sibling-fn pattern doesn't apply to trait-shaped
   step surfaces (`FsOps`, `FsPageBacking`); wave 8 lays the
   parallel-trait approach. Single deep worker
-  W-fsops-v3-design produced: (1) the `FsOpsV3` parallel trait
+  W-fsops-v3-design produced: (1) the `FsOps` parallel trait
   appended after `FsOps` in
   `crates/tx-subsystems/src/vfs/execution.rs` (13 methods, all
   returning `step_v3::StepOutcome<T, NoProgress>` — every fs
@@ -658,7 +658,7 @@
   is correct across the board; `readdir`'s cursor is a method
   *input* not progress); same default-`ENOSYS` impls as v4 for
   `read_link`/`materialise_rnode`/`step_chmod`/`step_chown`;
-  re-exported from `vfs/mod.rs`. (2) First impl: `impl FsOpsV3
+  re-exported from `vfs/mod.rs`. (2) First impl: `impl FsOps
   for LifecycleFs` in `page_backed/lifecycle_tests.rs` —
   test-only fixture, mechanical 1:1 mirror of the v4 impl with
   bodies collapsing to `V3Outcome::done(...)` /
@@ -672,13 +672,13 @@
   (default-method shim — Advanced ambiguity; wrapper free fns
   — same; wholesale flip — single-PR blast). 5 v3 tests
   pinning `load_inode_meta`/`create_inode`/`readdir`/`lookup`/
-  default-`read_link` end-to-end through `FsOpsV3`. Final
+  default-`read_link` end-to-end through `FsOps`. Final
   count: **1292 passed, 0 failed, 4 ignored across 60 binaries**
   (wave-7 baseline 1287 + 5). All lints + progress validate
   green. **Wave 9 plan from the worker:** two-step fan-out, not
   full-parallel. 9a is a learning sub-wave (single worker on
   Tmpfs + TestFs which exercise non-trivial materialise_rnode
-  paths) PLUS the sibling `FsPageBackingV3` design (trait
+  paths) PLUS the sibling `FsPageBacking` design (trait
   coupling at MountOutput requires shipping both v3 traits
   together so each backend dual-routes in one PR). 9b fans out
   in parallel to the remaining 5 impls (Devfs, Ext4FsInstance,
@@ -763,7 +763,7 @@
   the FsOps trait surface; 4 v3 tests including one exercising
   the `From<execution::Errno>` bridge. The mount cascade is
   trait-method-shaped, not free-fn — wave-7+ migration here
-  requires a parallel `FsOpsV3` trait or per-impl shim, not
+  requires a parallel `FsOps` trait or per-impl shim, not
   the additive sibling-fn pattern. +4 workspace.
   (c) **W-device** Case B: device.rs is a trait-declaration
   surface (`CharDeviceOps`, `BlockDeviceOps`,

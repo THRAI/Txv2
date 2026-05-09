@@ -29,9 +29,9 @@ use alloc::sync::Arc;
 
 use crate::execution::Errno;
 use crate::mount::MountIdentity;
-use crate::page_backed::{FsPageBackingV3, MaterializeAccess, PageIndex};
+use crate::page_backed::{FsPageBacking, MaterializeAccess, PageIndex};
 use crate::vfs::{
-    Credential, FsObjectId, FsOpsV3, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
+    Credential, FsObjectId, FsOps, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
 };
 use tx_substrate::step_v3::StepOutcome as V3;
 use tx_substrate::zone::Cap;
@@ -290,15 +290,15 @@ pub fn unpack_into_root_mount(
         })?
         .into_cap();
     // Wave 9g-e: initramfs unpacker migrated from v4 FsOps /
-    // FsPageBacking to the v3 trait surfaces (`FsOpsV3` /
-    // `FsPageBackingV3`). Both sibling fields are populated by every
+    // FsPageBacking to the v3 trait surfaces (`FsOps` /
+    // `FsPageBacking`). Both sibling fields are populated by every
     // backend at mount time (`MountPayload::new`), so reading the v3
     // trio is a direct field swap. v3 errnos route back through
     // `Errno::from(v3)` into the existing
     // `UnpackError::FsOp { errno: Errno, .. }` carrier so the public
     // error type does not change.
-    let fs_ops = payload.fs_ops_v3.clone();
-    let fs_page_backing = payload.fs_page_backing_v3.clone();
+    let fs_ops = payload.fs_ops.clone();
+    let fs_page_backing = payload.fs_page_backing.clone();
     let root_object_id = root_mount.root().fs_object_id();
 
     let mut stats = UnpackStats::default();
@@ -381,7 +381,7 @@ fn split_path(path: &[u8]) -> (&[u8], &[u8]) {
 }
 
 fn walk_or_create_dirs(
-    fs_ops: &Arc<dyn FsOpsV3>,
+    fs_ops: &Arc<dyn FsOps>,
     root_object_id: FsObjectId,
     path: &[u8],
     cred: &Credential,
@@ -419,7 +419,7 @@ fn walk_or_create_dirs(
 }
 
 fn mkdir_idempotent(
-    fs_ops: &Arc<dyn FsOpsV3>,
+    fs_ops: &Arc<dyn FsOps>,
     parent: FsObjectId,
     name: &[u8],
     mode_low: u16,
@@ -451,8 +451,8 @@ fn mkdir_idempotent(
 }
 
 fn unpack_regular(
-    fs_ops: &Arc<dyn FsOpsV3>,
-    fs_page_backing: &Arc<dyn FsPageBackingV3>,
+    fs_ops: &Arc<dyn FsOps>,
+    fs_page_backing: &Arc<dyn FsPageBacking>,
     parent_id: FsObjectId,
     name: &[u8],
     mode_low: u16,
@@ -558,7 +558,7 @@ fn unpack_regular(
 }
 
 fn unpack_symlink(
-    fs_ops: &Arc<dyn FsOpsV3>,
+    fs_ops: &Arc<dyn FsOps>,
     parent_id: FsObjectId,
     name: &[u8],
     target: &[u8],

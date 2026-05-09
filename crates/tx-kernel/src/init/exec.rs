@@ -113,20 +113,20 @@ impl<P: TxPlatform> CoreInit<P> {
             .payload_cap()
             .expect("rootfs payload alive during boot")
             .into_cap()
-            .fs_ops_v3
+            .fs_ops
             .clone();
         let fs_page_backing = root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
             .into_cap()
-            .fs_page_backing_v3
+            .fs_page_backing
             .clone();
         let root_object_id = root_mount.root().fs_object_id();
 
         let cred = Credential::root();
 
         // Wave 9g-d: bin/sh exec image build path migrated to v3
-        // (FsOpsV3 + FsPageBackingV3). Tmpfs's v3 impls delegate
+        // (FsOps + FsPageBacking). Tmpfs's v3 impls delegate
         // back to v4 internally — semantics preserved; outcome shape
         // collapses from 5 to 4 variants. Boot-time tmpfs ops are
         // synchronous, so Continue/Yield are unreachable and panic
@@ -202,7 +202,7 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
 
-        // 5. Set the visible size via FsPageBackingV3::truncate.
+        // 5. Set the visible size via FsPageBacking::truncate.
         let size = bytes.len() as u64;
         {
             let guard = tx_substrate::epoch::guard();
@@ -236,20 +236,20 @@ impl<P: TxPlatform> CoreInit<P> {
             .payload_cap()
             .expect("rootfs payload alive during boot")
             .into_cap()
-            .fs_ops_v3
+            .fs_ops
             .clone();
         let fs_page_backing = root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
             .into_cap()
-            .fs_page_backing_v3
+            .fs_page_backing
             .clone();
         let root_object_id = root_mount.root().fs_object_id();
 
         let bytes = &init_fixture::INIT_FIXTURE_BYTES[..];
 
         // Wave 9g-d: init exec image build path migrated to v3
-        // (FsOpsV3 + FsPageBackingV3). Tmpfs's v3 impls delegate back
+        // (FsOps + FsPageBacking). Tmpfs's v3 impls delegate back
         // to v4 internally — semantics preserved; outcome shape
         // collapses from 5 to 4 variants. Boot-time tmpfs ops are
         // synchronous, so Continue/Yield are unreachable and panic

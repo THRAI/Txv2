@@ -94,7 +94,7 @@ pub fn step_fsync(
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
             return V3::err(Errno::EINVAL.into());
         };
-        match mount.payload().fs_page_backing_v3.flush_page(
+        match mount.payload().fs_page_backing.flush_page(
             *fs_object_id,
             offset,
             &Frame::new(ppn),
@@ -133,7 +133,7 @@ pub fn step_fsync(
         }
     }
 
-    match mount.payload().fs_page_backing_v3.fsync(*fs_object_id, guard) {
+    match mount.payload().fs_page_backing.fsync(*fs_object_id, guard) {
         V3::Done(()) => V3::done(()),
         V3::Continue { progress: _ } => {
             let progress = if pages_so_far == 0 {
@@ -206,7 +206,7 @@ pub fn step_truncate(
             fs_object_id,
         } => match mount
             .payload()
-            .fs_page_backing_v3
+            .fs_page_backing
             .truncate(*fs_object_id, new_size, guard)
         {
             V3::Done(()) => false,
@@ -277,7 +277,7 @@ pub fn step_fallocate(
             fs_object_id,
         } => match mount
             .payload()
-            .fs_page_backing_v3
+            .fs_page_backing
             .fallocate(*fs_object_id, new_size, guard)
         {
             V3::Done(()) => false,
@@ -398,7 +398,7 @@ mod v3_tests {
     // anything that goes through `Blocked(_)` upgrades to
     // `Err(EAGAIN)` (the v3 surface has no `NoProgress`-Blocked
     // variant).
-    impl crate::vfs::FsOpsV3 for LifecycleFs {
+    impl crate::vfs::FsOps for LifecycleFs {
         fn lookup(
             &self,
             _parent: FsObjectId,
@@ -517,7 +517,7 @@ mod v3_tests {
         }
     }
 
-    impl crate::page_backed::FsPageBackingV3 for LifecycleFs {
+    impl crate::page_backed::FsPageBacking for LifecycleFs {
         fn fetch_page(
             &self,
             _fs_object_id: FsObjectId,

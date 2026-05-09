@@ -73,7 +73,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
         // Wave 9d (c): migrated to v3 walker.
         use tx_substrate::step_v3::StepOutcome as V3;
         let outcome =
-            poll_walker_synchronously(step_walk_v3(cwd.clone(), parent_path, cred, &guard));
+            poll_walker_synchronously(step_walk(cwd.clone(), parent_path, cred, &guard));
         drop(guard);
         match outcome {
             V3::Done(d) => d,
@@ -84,10 +84,10 @@ pub(crate) fn create_then_walk<P: PmapIf>(
         }
     };
 
-    // Wave 9g-b: resolve the v3 FsOpsV3 in scope at `parent_dentry`.
-    // Mirrors the existing `fs_ops_v3_for_dentry` shape used by the
+    // Wave 9g-b: resolve the v3 FsOps in scope at `parent_dentry`.
+    // Mirrors the existing `fs_ops_for_dentry` shape used by the
     // file-mode arms.
-    let fs_ops_v3 = match fs_ops_v3_for_dentry(&parent_dentry) {
+    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(ops) => ops,
         None => return Err(EROFS_VALUE),
     };
@@ -102,7 +102,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
         use tx_substrate::step_v3::StepOutcome as V3;
         let guard = tx_substrate::epoch::guard();
         let outcome =
-            fs_ops_v3.create_inode(parent_fs_object_id, basename, new_mode, cred, &guard);
+            fs_ops.create_inode(parent_fs_object_id, basename, new_mode, cred, &guard);
         match outcome {
             V3::Done(_) => {}
             V3::Continue { .. } | V3::Yield { .. } => {
@@ -118,7 +118,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     let guard = tx_substrate::epoch::guard();
     // Wave 9d (c): migrated to v3 walker.
     use tx_substrate::step_v3::StepOutcome as V3;
-    let outcome = poll_walker_synchronously(step_walk_v3(cwd.clone(), path, cred, &guard));
+    let outcome = poll_walker_synchronously(step_walk(cwd.clone(), path, cred, &guard));
     drop(guard);
     match outcome {
         V3::Done(d) => Ok(d),
@@ -128,19 +128,19 @@ pub(crate) fn create_then_walk<P: PmapIf>(
 }
 
 /// v3 sibling of the (now-deleted) `fs_page_backing_for_dentry`. Wave 9g-b: mirrors
-/// the parent-hint ascent shape but reads `payload.fs_page_backing_v3`
+/// the parent-hint ascent shape but reads `payload.fs_page_backing`
 /// instead of `payload.fs_page_backing` so callers can dispatch
-/// against the v3 trait surface (`FsPageBackingV3`) and consume v3's
+/// against the v3 trait surface (`FsPageBacking`) and consume v3's
 /// four-variant outcome algebra.
-pub(super) fn fs_page_backing_v3_for_dentry(
+pub(super) fn fs_page_backing_for_dentry(
     dentry: &Cap<DEntry>,
-) -> Option<Arc<dyn tx_subsystems::page_backed::FsPageBackingV3>> {
+) -> Option<Arc<dyn tx_subsystems::page_backed::FsPageBacking>> {
     let guard = tx_substrate::epoch::guard();
     let mut cursor: Cap<DEntry> = dentry.clone();
     loop {
         if let Some(weak) = cursor.rnode().containing_mount_weak() {
             if let Some(payload) = weak.upgrade(&guard) {
-                return Some(payload.fs_page_backing_v3.clone());
+                return Some(payload.fs_page_backing.clone());
             }
         }
         let next = cursor.parent_hint().and_then(|w| w.upgrade(&guard))?;
@@ -192,9 +192,9 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         }
     };
     let parent_id = parent_dentry.rnode().fs_object_id();
-    // Wave 9g-b: mkdir migrated from v4 FsOps to v3 FsOpsV3.
+    // Wave 9g-b: mkdir migrated from v4 FsOps to v3 FsOps.
     use tx_substrate::step_v3::StepOutcome as V3;
-    let fs_ops_v3 = match fs_ops_v3_for_dentry(&parent_dentry) {
+    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
@@ -204,7 +204,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     let effective_mode = mode & !umask & 0o7777;
     let outcome = {
         let guard = tx_substrate::epoch::guard();
-        fs_ops_v3.mkdir(parent_id, basename, effective_mode, &cred, &guard)
+        fs_ops.mkdir(parent_id, basename, effective_mode, &cred, &guard)
     };
     match outcome {
         V3::Done(_) => SyscallResult::Return(0),
@@ -261,9 +261,9 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let parent_id = parent_dentry.rnode().fs_object_id();
     let target_id = target_dentry.rnode().fs_object_id();
     let target_kind = target_dentry.rnode().meta().kind();
-    // Wave 9g-b: rmdir/unlink migrated from v4 FsOps to v3 FsOpsV3.
+    // Wave 9g-b: rmdir/unlink migrated from v4 FsOps to v3 FsOps.
     use tx_substrate::step_v3::StepOutcome as V3;
-    let fs_ops_v3 = match fs_ops_v3_for_dentry(&parent_dentry) {
+    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
@@ -277,9 +277,9 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let outcome = {
         let guard = tx_substrate::epoch::guard();
         if want_rmdir {
-            fs_ops_v3.rmdir(parent_id, basename, target_id, &guard)
+            fs_ops.rmdir(parent_id, basename, target_id, &guard)
         } else {
-            fs_ops_v3.unlink(parent_id, basename, target_id, &guard)
+            fs_ops.unlink(parent_id, basename, target_id, &guard)
         }
     };
     match outcome {
@@ -335,15 +335,15 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         }
     };
     let parent_id = parent_dentry.rnode().fs_object_id();
-    // Wave 9g-b: symlink migrated from v4 FsOps to v3 FsOpsV3.
+    // Wave 9g-b: symlink migrated from v4 FsOps to v3 FsOps.
     use tx_substrate::step_v3::StepOutcome as V3;
-    let fs_ops_v3 = match fs_ops_v3_for_dentry(&parent_dentry) {
+    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
     let outcome = {
         let guard = tx_substrate::epoch::guard();
-        fs_ops_v3.symlink(parent_id, basename, &target, &cred, &guard)
+        fs_ops.symlink(parent_id, basename, &target, &cred, &guard)
     };
     match outcome {
         V3::Done(_) => SyscallResult::Return(0),
@@ -414,15 +414,15 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         }
     };
     let new_parent_id = new_parent_dentry.rnode().fs_object_id();
-    // Wave 9g-b: link migrated from v4 FsOps to v3 FsOpsV3.
+    // Wave 9g-b: link migrated from v4 FsOps to v3 FsOps.
     use tx_substrate::step_v3::StepOutcome as V3;
-    let fs_ops_v3 = match fs_ops_v3_for_dentry(&new_parent_dentry) {
+    let fs_ops = match fs_ops_for_dentry(&new_parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
     let outcome = {
         let guard = tx_substrate::epoch::guard();
-        fs_ops_v3.link(new_parent_id, new_basename, source_id, &guard)
+        fs_ops.link(new_parent_id, new_basename, source_id, &guard)
     };
     match outcome {
         V3::Done(()) => SyscallResult::Return(0),
@@ -565,18 +565,18 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     };
     let parent_id = parent_dentry.rnode().fs_object_id();
     // Wave 9g-b: lookup/load_inode_meta/read_link migrated from v4
-    // FsOps to v3 FsOpsV3.
+    // FsOps to v3 FsOps.
     use tx_substrate::step_v3::StepOutcome as V3;
-    let fs_ops_v3 = match fs_ops_v3_for_dentry(&parent_dentry) {
+    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(ENOSYS_VALUE),
     };
-    // Resolve the basename in the parent directly via `FsOpsV3::lookup`
+    // Resolve the basename in the parent directly via `FsOps::lookup`
     // — bypasses the walker's symlink-chase loop so the symlink's
     // own inode (not its target's) is what we read.
     let target_id = {
         let guard = tx_substrate::epoch::guard();
-        match fs_ops_v3.lookup(parent_id, basename, &guard) {
+        match fs_ops.lookup(parent_id, basename, &guard) {
             V3::Done(id) => id,
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
@@ -586,7 +586,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     };
     let target_meta = {
         let guard = tx_substrate::epoch::guard();
-        match fs_ops_v3.load_inode_meta(target_id, &guard) {
+        match fs_ops.load_inode_meta(target_id, &guard) {
             V3::Done(m) => m,
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
@@ -599,7 +599,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     }
     let link_bytes = {
         let guard = tx_substrate::epoch::guard();
-        match fs_ops_v3.read_link(target_id, &guard) {
+        match fs_ops.read_link(target_id, &guard) {
             V3::Done(b) => b,
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
@@ -712,15 +712,15 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     }
     let old_parent_id = old_parent_dentry.rnode().fs_object_id();
     let new_parent_id = new_parent_dentry.rnode().fs_object_id();
-    // Wave 9g-b: rename migrated from v4 FsOps to v3 FsOpsV3.
+    // Wave 9g-b: rename migrated from v4 FsOps to v3 FsOps.
     use tx_substrate::step_v3::StepOutcome as V3;
-    let fs_ops_v3 = match fs_ops_v3_for_dentry(&old_parent_dentry) {
+    let fs_ops = match fs_ops_for_dentry(&old_parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
     let outcome = {
         let guard = tx_substrate::epoch::guard();
-        fs_ops_v3.rename(
+        fs_ops.rename(
             old_parent_id,
             old_basename,
             new_parent_id,

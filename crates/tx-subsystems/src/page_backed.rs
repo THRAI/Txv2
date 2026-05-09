@@ -22,13 +22,13 @@ use tx_substrate::{
 };
 
 mod cross_variant;
-mod fs_page_backing_v3;
+mod fs_page_backing;
 mod lifecycle;
 mod reflink;
 mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
-pub use fs_page_backing_v3::FsPageBackingV3;
+pub use fs_page_backing::FsPageBacking;
 pub use lifecycle::{step_fallocate, step_fsync, step_truncate};
 pub use reflink::{cow_replace_into_private, install_shared_page};
 pub use targeted_read::read_exact_at;
@@ -425,7 +425,7 @@ impl PageContainer {
         use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
         match mount
             .payload()
-            .fs_page_backing_v3
+            .fs_page_backing
             .fetch_page(fs_object_id, offset, guard)
         {
             V3::Done(frame) => self.install_fetched_file_page(page, access, frame, false),

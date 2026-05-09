@@ -228,8 +228,8 @@ fn build_fs_root() -> (Cap<DEntry>, Arc<ExecveTestFs>) {
     let fs = ExecveTestFs::new(root_id);
 
     let payload = MountPayload::new_cap(
-        fs.clone() as Arc<dyn tx_subsystems::vfs::FsOpsV3>,
-        fs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBackingV3>,
+        fs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        fs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
         None,
         DevId::new(99),
         MountOptions::default(),
@@ -434,12 +434,12 @@ fn dispatch_execve_success_returns_exec_committed() {
     );
 }
 
-// === `FsOpsV3` + `FsPageBackingV3` impls on `ExecveTestFs`. ===
+// === `FsOps` + `FsPageBacking` impls on `ExecveTestFs`. ===
 //
 // Inlined v3 bodies. The legacy v4 trait impls have been deleted as
 // part of unifying the codebase to v3-only.
 
-impl tx_subsystems::vfs::FsOpsV3 for ExecveTestFs {
+impl tx_subsystems::vfs::FsOps for ExecveTestFs {
     fn lookup(
         &self,
         parent: FsObjectId,
@@ -626,7 +626,7 @@ impl tx_subsystems::vfs::FsOpsV3 for ExecveTestFs {
     }
 }
 
-impl tx_subsystems::page_backed::FsPageBackingV3 for ExecveTestFs {
+impl tx_subsystems::page_backed::FsPageBacking for ExecveTestFs {
     fn fetch_page(
         &self,
         fs_object_id: FsObjectId,
@@ -699,7 +699,7 @@ impl tx_subsystems::page_backed::FsPageBackingV3 for ExecveTestFs {
 
 #[test]
 fn execve_testfs_v3_lookup_round_trips_after_add_regular() {
-    use tx_subsystems::vfs::FsOpsV3;
+    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
     let _setup = execve_setup();
@@ -711,18 +711,18 @@ fn execve_testfs_v3_lookup_round_trips_after_add_regular() {
 
     let guard = tx_substrate::epoch::guard();
     assert_eq!(
-        <ExecveTestFs as FsOpsV3>::lookup(&*fs, root_id, b"init", &guard),
+        <ExecveTestFs as FsOps>::lookup(&*fs, root_id, b"init", &guard),
         V3::<_, NoProgress>::done(file_id)
     );
     assert_eq!(
-        <ExecveTestFs as FsOpsV3>::lookup(&*fs, root_id, b"missing", &guard),
+        <ExecveTestFs as FsOps>::lookup(&*fs, root_id, b"missing", &guard),
         V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
     );
 }
 
 #[test]
 fn execve_testfs_v3_load_inode_meta_returns_directory_for_root() {
-    use tx_subsystems::vfs::FsOpsV3;
+    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::StepOutcome as V3;
 
     let _setup = execve_setup();
@@ -731,7 +731,7 @@ fn execve_testfs_v3_load_inode_meta_returns_directory_for_root() {
     let fs = ExecveTestFs::new(root_id);
 
     let guard = tx_substrate::epoch::guard();
-    let meta = match <ExecveTestFs as FsOpsV3>::load_inode_meta(&*fs, root_id, &guard) {
+    let meta = match <ExecveTestFs as FsOps>::load_inode_meta(&*fs, root_id, &guard) {
         V3::Done(meta) => meta,
         other => panic!("load_inode_meta v3: {other:?}"),
     };
@@ -740,7 +740,7 @@ fn execve_testfs_v3_load_inode_meta_returns_directory_for_root() {
 
 #[test]
 fn execve_testfs_v3_read_link_returns_einval_for_regular() {
-    use tx_subsystems::vfs::FsOpsV3;
+    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
     let _setup = execve_setup();
@@ -752,14 +752,14 @@ fn execve_testfs_v3_read_link_returns_einval_for_regular() {
 
     let guard = tx_substrate::epoch::guard();
     assert_eq!(
-        <ExecveTestFs as FsOpsV3>::read_link(&*fs, file_id, &guard),
+        <ExecveTestFs as FsOps>::read_link(&*fs, file_id, &guard),
         V3::<Box<[u8]>, NoProgress>::err(V3Errno::EINVAL)
     );
 }
 
 #[test]
 fn execve_testfs_v3_create_inode_returns_enosys() {
-    use tx_subsystems::vfs::FsOpsV3;
+    use tx_subsystems::vfs::FsOps;
     use tx_subsystems::vfs::structure::InodeMeta;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
@@ -771,7 +771,7 @@ fn execve_testfs_v3_create_inode_returns_enosys() {
     let guard = tx_substrate::epoch::guard();
     let cred = Credential::root();
     assert_eq!(
-        <ExecveTestFs as FsOpsV3>::create_inode(
+        <ExecveTestFs as FsOps>::create_inode(
             &*fs,
             root_id,
             b"new",
@@ -785,7 +785,7 @@ fn execve_testfs_v3_create_inode_returns_enosys() {
 
 #[test]
 fn execve_testfs_v3_fetch_page_returns_frame_for_regular() {
-    use tx_subsystems::page_backed::FsPageBackingV3;
+    use tx_subsystems::page_backed::FsPageBacking;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
     let _setup = execve_setup();
@@ -797,18 +797,18 @@ fn execve_testfs_v3_fetch_page_returns_frame_for_regular() {
     let file_id = fs.add_regular_with_bytes(root_id, b"f", &bytes);
 
     let guard = tx_substrate::epoch::guard();
-    match <ExecveTestFs as FsPageBackingV3>::fetch_page(&*fs, file_id, 0, &guard) {
+    match <ExecveTestFs as FsPageBacking>::fetch_page(&*fs, file_id, 0, &guard) {
         V3::Done(_frame) => {}
         other => panic!("fetch_page v3: {other:?}"),
     }
     // Misaligned offset → EINVAL via the v4 body.
     assert_eq!(
-        <ExecveTestFs as FsPageBackingV3>::fetch_page(&*fs, file_id, 7, &guard),
+        <ExecveTestFs as FsPageBacking>::fetch_page(&*fs, file_id, 7, &guard),
         V3::<Frame, NoProgress>::err(V3Errno::EINVAL)
     );
     // Truncate / fsync / flush_page are synchronous Done(()) in the v4 body.
     assert_eq!(
-        <ExecveTestFs as FsPageBackingV3>::fsync(&*fs, file_id, &guard),
+        <ExecveTestFs as FsPageBacking>::fsync(&*fs, file_id, &guard),
         V3::<(), NoProgress>::done(())
     );
 }

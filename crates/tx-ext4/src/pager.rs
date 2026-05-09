@@ -2,7 +2,7 @@ use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_substrate::epoch::Guard;
 use tx_substrate::page_allocator::{self, ZeroPolicy};
 use tx_subsystems::execution::Errno;
-use tx_subsystems::page_backed::{Frame, FsPageBackingV3};
+use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::vfs::structure::FsObjectId;
 
 use crate::read_backend::{inode_no, Ext4FsInstance};
@@ -58,21 +58,21 @@ fn materialize_frame(
 // `Advanced(t)` → `done(t)` (one-shot v3 contract) and `Blocked` /
 // `AdvancedThenBlocked` defensively to `EAGAIN`.
 
-/// v3 sibling factory for `MountOutput::fs_page_backing_v3` cutover.
+/// v3 sibling factory for `MountOutput::fs_page_backing` cutover.
 ///
-/// Mirrors `Tmpfs::fs_page_backing_v3_arc`.
+/// Mirrors `Tmpfs::fs_page_backing_arc`.
 impl<I> Ext4FsInstance<I>
 where
     I: BlockImage + Send + 'static,
 {
-    pub(crate) fn fs_page_backing_v3_arc(
+    pub(crate) fn fs_page_backing_arc(
         self: alloc::sync::Arc<Self>,
-    ) -> alloc::sync::Arc<dyn FsPageBackingV3> {
+    ) -> alloc::sync::Arc<dyn FsPageBacking> {
         self
     }
 }
 
-impl<I> FsPageBackingV3 for Ext4FsInstance<I>
+impl<I> FsPageBacking for Ext4FsInstance<I>
 where
     I: BlockImage + Send + 'static,
 {

@@ -54,7 +54,7 @@ use tx_subsystems::process::{
 };
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vfs::structure::{Credential, InodeMeta, OpenFileFlags, RNodeBacking};
-use tx_subsystems::vfs::walker::step_open_v3;
+use tx_subsystems::vfs::walker::step_open;
 use tx_subsystems::vm::scripts::{
     self as vm_scripts, BssTail as VmBssTail, ImagePlan as VmImagePlan,
     LoadSegment as VmLoadSegment, SegmentFlags as VmSegmentFlags, USER_STACK_TOP_DEFAULT,
@@ -255,7 +255,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         use tx_substrate::step_v3::StepOutcome as V3;
         let guard = tx_substrate::epoch::guard();
         let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
-        let outcome = poll_walker_synchronously(step_open_v3(
+        let outcome = poll_walker_synchronously(step_open(
             rooted_at,
             path,
             OpenFileFlags {

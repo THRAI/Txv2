@@ -10,7 +10,7 @@ use tx_substrate::zone::Cap;
 use tx_subsystems::initramfs::{unpack_into_root_mount, UnpackError};
 use tx_subsystems::mount::{MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel};
 use tx_subsystems::vfs::{
-    DEntry, FsObjectId, FsOpsV3, InlineName, InodeKind, RNode, RNodeBacking, S_IFMT,
+    DEntry, FsObjectId, FsOps, InlineName, InodeKind, RNode, RNodeBacking, S_IFMT,
 };
 
 use crate::tmpfs::Tmpfs;
@@ -33,8 +33,8 @@ fn init_substrate() {
 fn fresh_rootfs_mount() -> Cap<MountIdentity> {
     let (_tmpfs, mount_output) = Tmpfs::new_root();
     let payload = MountPayload::new_cap(
-        mount_output.fs_ops_v3.clone(),
-        mount_output.fs_page_backing_v3.clone(),
+        mount_output.fs_ops.clone(),
+        mount_output.fs_page_backing.clone(),
         None,
         tx_subsystems::mount::DevId::new(0xfeed),
         MountOptions::default(),
@@ -127,7 +127,7 @@ fn lookup_in_root(
         .into_cap();
     let root_id = mount.root().fs_object_id();
     let guard = tx_substrate::epoch::guard();
-    payload.fs_ops_v3.lookup(root_id, name, &guard)
+    payload.fs_ops.lookup(root_id, name, &guard)
 }
 
 fn lookup_in(
@@ -140,15 +140,15 @@ fn lookup_in(
         .expect("mount payload alive in test")
         .into_cap();
     let guard = tx_substrate::epoch::guard();
-    payload.fs_ops_v3.lookup(parent, name, &guard)
+    payload.fs_ops.lookup(parent, name, &guard)
 }
 
-fn fs_ops_of(mount: &Cap<MountIdentity>) -> Arc<dyn FsOpsV3> {
+fn fs_ops_of(mount: &Cap<MountIdentity>) -> Arc<dyn FsOps> {
     mount
         .payload_cap()
         .expect("mount payload alive in test")
         .into_cap()
-        .fs_ops_v3
+        .fs_ops
         .clone()
 }
 

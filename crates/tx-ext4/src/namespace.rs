@@ -42,24 +42,24 @@ fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
 // sites avoid clashing with `tx_subsystems::execution::Errno`
 // already in scope, per the wave-4/6/7 trait-impl convention.
 
-use tx_subsystems::vfs::FsOpsV3;
+use tx_subsystems::vfs::FsOps;
 
-/// v3 sibling factory for `MountOutput::fs_ops_v3` cutover.
+/// v3 sibling factory for `MountOutput::fs_ops` cutover.
 ///
-/// Wave 9c walker entry points populate `MountOutput::fs_ops_v3`
-/// from this constructor; mirrors `Tmpfs::fs_ops_v3_arc`.
+/// Wave 9c walker entry points populate `MountOutput::fs_ops`
+/// from this constructor; mirrors `Tmpfs::fs_ops_arc`.
 impl<I> Ext4FsInstance<I>
 where
     I: BlockImage + Send + 'static,
 {
-    pub(crate) fn fs_ops_v3_arc(
+    pub(crate) fn fs_ops_arc(
         self: alloc::sync::Arc<Self>,
-    ) -> alloc::sync::Arc<dyn FsOpsV3> {
+    ) -> alloc::sync::Arc<dyn FsOps> {
         self
     }
 }
 
-impl<I> FsOpsV3 for Ext4FsInstance<I>
+impl<I> FsOps for Ext4FsInstance<I>
 where
     I: BlockImage + Send + 'static,
 {

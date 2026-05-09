@@ -277,7 +277,7 @@ impl PtyIndexName {
 
 // === v3 trait impls =====================================================
 //
-// `impl FsOpsV3 for DevptsInstance` and `impl FsPageBackingV3 for
+// `impl FsOps for DevptsInstance` and `impl FsPageBacking for
 // DevptsInstance` carry the standalone devpts filesystem logic. Devpts
 // is a PTY-side projection: every method is purely synchronous (no
 // `Continue` / `Yield` returns), so each body is a direct
@@ -290,10 +290,10 @@ impl PtyIndexName {
 // sites avoid clashing with `crate::execution::StepOutcome` still in
 // scope for other helpers, per the wave-4/6/7/9a trait-impl convention.
 
-use crate::page_backed::{Frame, FsPageBackingV3, PageContainer};
-use crate::vfs::FsOpsV3;
+use crate::page_backed::{Frame, FsPageBacking, PageContainer};
+use crate::vfs::FsOps;
 
-impl FsOpsV3 for DevptsInstance {
+impl FsOps for DevptsInstance {
     fn lookup(
         &self,
         parent: FsObjectId,
@@ -486,7 +486,7 @@ impl FsOpsV3 for DevptsInstance {
     // `ENOSYS`, so leave them unimplemented here.
 }
 
-impl FsPageBackingV3 for DevptsInstance {
+impl FsPageBacking for DevptsInstance {
     // Devpts has no page cache. Every page-backing method returns
     // `ENOSYS`. The v3 trait defaults `fallocate` to `Done(())` and
     // `supports_reflink` to `false`; both match the desired behaviour
