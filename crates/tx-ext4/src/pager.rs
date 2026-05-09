@@ -1,64 +1,11 @@
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_substrate::epoch::Guard;
 use tx_substrate::page_allocator::{self, ZeroPolicy};
-use tx_subsystems::execution::{Errno, StepOutcome};
-use tx_subsystems::page_backed::{Frame, FsPageBacking, FsPageBackingV3, PageContainer};
+use tx_subsystems::execution::Errno;
+use tx_subsystems::page_backed::{Frame, FsPageBackingV3};
 use tx_subsystems::vfs::structure::FsObjectId;
 
 use crate::read_backend::{inode_no, Ext4FsInstance};
-
-impl<I> FsPageBacking for Ext4FsInstance<I>
-where
-    I: BlockImage + Send + 'static,
-{
-    fn fetch_page<'g>(
-        &self,
-        fs_object_id: FsObjectId,
-        offset: u64,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<Frame> {
-        if !offset.is_multiple_of(BLOCK_SIZE as u64) {
-            return StepOutcome::Err(Errno::EINVAL);
-        }
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
-            Err(err) => return StepOutcome::Err(err),
-        };
-        let file_page_index = offset / BLOCK_SIZE as u64;
-        let mut page: Page4K = [0; BLOCK_SIZE];
-
-        if let Err(err) =
-            self.with_pager(|pager| pager.read_page(inode, file_page_index, &mut page))
-        {
-            return StepOutcome::Err(err);
-        }
-
-        materialize_frame(&page)
-    }
-
-    fn flush_page<'g>(
-        &self,
-        _fs_object_id: FsObjectId,
-        _offset: u64,
-        _frame: &Frame,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn truncate<'g>(
-        &self,
-        _fs_object_id: FsObjectId,
-        _new_size: u64,
-        _guard: &'g Guard<'g>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn fsync<'g>(&self, _fs_object_id: FsObjectId, _guard: &'g Guard<'g>) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-}
 
 /// Allocate a frame from the page substrate, copy the disk-fetched page bytes
 /// into it, and return a permanent-pinned `Frame` referencing the resulting
@@ -71,10 +18,12 @@ where
 /// are written via the testing helper. Non-test contexts require a real
 /// kernel direct-map, which is HAL-side follow-up work — `Errno::ENOSYS`
 /// for now in production builds.
-fn materialize_frame(page: &Page4K) -> StepOutcome<Frame> {
+fn materialize_frame(
+    page: &Page4K,
+) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
     let owned = match page_allocator::reserve_frame(ZeroPolicy::Zeroed) {
         Ok(reservation) => reservation.commit(),
-        Err(_) => return StepOutcome::Err(Errno::EBUSY),
+        Err(_) => return tx_substrate::step_v3::StepOutcome::err(Errno::EBUSY.into()),
     };
     let ppn = owned.ppn();
 
@@ -93,33 +42,25 @@ fn materialize_frame(page: &Page4K) -> StepOutcome<Frame> {
     // Hand off ownership: the permanent-frame token never releases the
     // PPN to the allocator; the page-cache will add its own cache pin.
     let _permanent = owned.into_permanent_frame();
-    StepOutcome::Done(Frame::new(ppn))
+    tx_substrate::step_v3::StepOutcome::done(Frame::new(ppn))
 }
 
-// === Wave 9b: parallel v3 trait impl =================================
+// === v3 trait impl (v3-only after v4 retirement) ====================
 //
-// `impl FsPageBackingV3 for Ext4FsInstance<I>` mirrors the v4 body
-// above one-for-one. ext4 is the wave-9b backend most likely to surface
-// real `Advanced(t)` outcomes because `fetch_page` drives on-disk block
-// I/O — but the current read-only `Ext4Pager::read_page` returns
-// `Result<T, Ext4FormatError>` (not `StepOutcome`), so the v4
-// `fetch_page` body lands on `StepOutcome::Done(t)` /
-// `StepOutcome::Err(e)` only. There are no `Advanced(t)` / `Blocked` /
-// `AdvancedThenBlocked` returns from the v4 bodies today; the v3
-// mapping has zero ambiguous Continue-vs-Done call sites in this wave.
-//
-// Per the wave-9a design doc + trait-surface contract: where the v4
-// fn does (in a future async/journal-aware revision) return
-// `Advanced(t)`, the trait surface translates `Advanced(t)` → `done(t)`
-// (one-shot v3 contract); any partial-progress accounting lives at the
-// *caller* (wave 9c walker). `Blocked` / `AdvancedThenBlocked` map
-// defensively to `EAGAIN`.
+// The v4 `FsPageBacking` impl was deleted as part of unifying the
+// kernel on the v3 trait surface. The bodies below are the original
+// v4 logic inlined directly, with terminal outcomes mapped onto the
+// v3 `StepOutcome` shape. The current read-only `Ext4Pager::read_page`
+// returns `Result<T, Ext4FormatError>` (not `StepOutcome`), so every
+// body lands on `done` or `err` only — there is no `Advanced` /
+// `Blocked` / `AdvancedThenBlocked` path through this read-only
+// backend today. Any future async/journal-aware revision should map
+// `Advanced(t)` → `done(t)` (one-shot v3 contract) and `Blocked` /
+// `AdvancedThenBlocked` defensively to `EAGAIN`.
 
 /// v3 sibling factory for `MountOutput::fs_page_backing_v3` cutover.
 ///
-/// Mirrors `Tmpfs::fs_page_backing_v3_arc`. The cfg gate from wave 9b
-/// is lifted in wave 9c now that `MountOutput` carries the v3 field
-/// and `mount_ext4_read_only` populates it.
+/// Mirrors `Tmpfs::fs_page_backing_v3_arc`.
 impl<I> Ext4FsInstance<I>
 where
     I: BlockImage + Send + 'static,
@@ -139,95 +80,56 @@ where
         &self,
         fs_object_id: FsObjectId,
         offset: u64,
-        guard: &Guard<'_>,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
-        match <Self as FsPageBacking>::fetch_page(self, fs_object_id, offset, guard) {
-            StepOutcome::Done(frame) | StepOutcome::Advanced(frame) => {
-                tx_substrate::step_v3::StepOutcome::done(frame)
-            }
-            StepOutcome::AdvancedThenBlocked(frame, _) => {
-                tx_substrate::step_v3::StepOutcome::done(frame)
-            }
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
+        if !offset.is_multiple_of(BLOCK_SIZE as u64) {
+            return tx_substrate::step_v3::StepOutcome::err(Errno::EINVAL.into());
         }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+        };
+        let file_page_index = offset / BLOCK_SIZE as u64;
+        let mut page: Page4K = [0; BLOCK_SIZE];
+
+        if let Err(err) =
+            self.with_pager(|pager| pager.read_page(inode, file_page_index, &mut page))
+        {
+            return tx_substrate::step_v3::StepOutcome::err(err.into());
+        }
+
+        materialize_frame(&page)
     }
 
     fn flush_page(
         &self,
-        fs_object_id: FsObjectId,
-        offset: u64,
-        frame: &Frame,
-        guard: &Guard<'_>,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _frame: &Frame,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        match <Self as FsPageBacking>::flush_page(self, fs_object_id, offset, frame, guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
-                tx_substrate::step_v3::StepOutcome::done(())
-            }
-            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
-        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn truncate(
         &self,
-        fs_object_id: FsObjectId,
-        new_size: u64,
-        guard: &Guard<'_>,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        match <Self as FsPageBacking>::truncate(self, fs_object_id, new_size, guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
-                tx_substrate::step_v3::StepOutcome::done(())
-            }
-            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
-        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn fsync(
         &self,
-        fs_object_id: FsObjectId,
-        guard: &Guard<'_>,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        match <Self as FsPageBacking>::fsync(self, fs_object_id, guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
-                tx_substrate::step_v3::StepOutcome::done(())
-            }
-            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
-        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
     }
 
-    fn fallocate(
-        &self,
-        fs_object_id: FsObjectId,
-        new_size: u64,
-        guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        match <Self as FsPageBacking>::fallocate(self, fs_object_id, new_size, guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
-                tx_substrate::step_v3::StepOutcome::done(())
-            }
-            StepOutcome::AdvancedThenBlocked((), _) => tx_substrate::step_v3::StepOutcome::done(()),
-            StepOutcome::Blocked(_) => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN)
-            }
-            StepOutcome::Err(e) => tx_substrate::step_v3::StepOutcome::err(e.into()),
-        }
-    }
-
-    fn supports_reflink(&self, other: &PageContainer) -> bool {
-        <Self as FsPageBacking>::supports_reflink(self, other)
-    }
+    // `fallocate` and `supports_reflink` inherit the v3 trait defaults
+    // (`done(())` and `false` respectively), which match the prior v4
+    // delegation behaviour exactly — the original v3 impl forwarded to
+    // the v4 trait defaults of the same shapes.
 }

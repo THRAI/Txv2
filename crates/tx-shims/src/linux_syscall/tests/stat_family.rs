@@ -1,6 +1,7 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
+use tx_substrate::step_v3::StepOutcome;
 use alloc::sync::Arc;
 use alloc::vec;
 
@@ -10,14 +11,14 @@ use tx_subsystems::cred::CapabilitySet;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
-use tx_subsystems::page_backed::FsPageBacking;
+use tx_subsystems::page_backed::FsPageBackingV3;
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::step_chdir;
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking,
     S_IFDIR,
 };
-use tx_subsystems::vfs::{FsOps, OpenFile};
+use tx_subsystems::vfs::{FsOpsV3, OpenFile};
 
 use crate::linux_syscall::{
     AT_EMPTY_PATH, AT_FDCWD, NR_CHDIR, NR_FCHDIR, NR_FSTAT, NR_GETCWD, NR_GETDENTS64,
@@ -188,7 +189,7 @@ fn dispatch_fstat_on_pagebacked_fd_writes_stat_struct() {
     let (file_id, _meta) = {
         let guard = tx_substrate::epoch::guard();
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard) {
-            StepOutcome::Done(pair) | StepOutcome::Advanced(pair) => pair,
+            StepOutcome::Done(pair) => pair,
             other => panic!("create_inode: {other:?}"),
         }
     };
@@ -531,14 +532,14 @@ fn dispatch_getdents64_on_directory_fd_writes_entries() {
     let id_a = {
         let guard = tx_substrate::epoch::guard();
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"a", 0o100644, &owner_cred, &guard) {
-            StepOutcome::Done((id, _)) | StepOutcome::Advanced((id, _)) => id,
+            StepOutcome::Done((id, _)) => id,
             other => panic!("create_inode a: {other:?}"),
         }
     };
     let id_b = {
         let guard = tx_substrate::epoch::guard();
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"bb", 0o100644, &owner_cred, &guard) {
-            StepOutcome::Done((id, _)) | StepOutcome::Advanced((id, _)) => id,
+            StepOutcome::Done((id, _)) => id,
             other => panic!("create_inode bb: {other:?}"),
         }
     };

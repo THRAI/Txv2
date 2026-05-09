@@ -4,25 +4,23 @@
 //! (the kernel's `init.rs` does the same wiring at boot) so the walker
 //! can be exercised without the full reactor + bootstrap state.
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use tx_substrate::zone::{self, Cap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::{Guard, StepOutcome};
 use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
 use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
-use crate::page_backed::{Frame, FsPageBacking};
 use crate::tty::execution::{register_console_alias, register_hardware};
 use crate::tty::structure::TtyIdentity;
 use crate::vfs::structure::{
-    Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
-    OpenFileFlags, RNode, RNodeBacking, S_IFDIR,
+    Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
+    RNodeBacking, S_IFDIR,
 };
-use crate::vfs::FsOps;
+use crate::vfs::FsOpsV3;
 
 use super::{step_open_v3, step_walk_v3, SYMLOOP_MAX};
 
@@ -241,183 +239,6 @@ impl TestFs {
             *u = uid;
             *g = gid;
         }
-    }
-}
-
-impl FsOps for TestFs {
-    fn lookup(
-        &self,
-        parent: FsObjectId,
-        name: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<FsObjectId> {
-        let inner = self.inner.lock();
-        let Some(map) = inner.children.get(&parent) else {
-            return StepOutcome::Err(Errno::ENOTDIR);
-        };
-        match map.get(name) {
-            Some(id) => StepOutcome::Done(*id),
-            None => StepOutcome::Err(Errno::ENOENT),
-        }
-    }
-
-    fn load_inode_meta(
-        &self,
-        fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<InodeMeta> {
-        let inner = self.inner.lock();
-        let Some((kind, _, mode_low, uid, gid)) = inner.inodes.get(&fs_object_id) else {
-            return StepOutcome::Err(Errno::ENOENT);
-        };
-        // S_IFMT bits get OR-ed in by InodeMeta::new based on `kind`;
-        // the per-inode mode_low covers the rwx triplets + setuid/
-        // setgid bits the DAC slice tests exercise.
-        let mut meta = InodeMeta::new(*kind, *mode_low);
-        meta.uid = *uid;
-        meta.gid = *gid;
-        StepOutcome::Done(meta)
-    }
-
-    fn serialize_inode_meta(
-        &self,
-        _fs_object_id: FsObjectId,
-        _meta: &InodeMeta,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Done(())
-    }
-
-    fn create_inode(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn unlink(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn rename(
-        &self,
-        _old_parent: FsObjectId,
-        _old_name: &[u8],
-        _new_parent: FsObjectId,
-        _new_name: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn link(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn mkdir(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn rmdir(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn symlink(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _link_target: &[u8],
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn readdir(
-        &self,
-        _fs_object_id: FsObjectId,
-        _cursor: DirCursor,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
-        StepOutcome::Done(None)
-    }
-
-    fn destroy_inode(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-        StepOutcome::Done(())
-    }
-
-    fn read_link(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<Box<[u8]>> {
-        let inner = self.inner.lock();
-        match inner.inodes.get(&fs_object_id) {
-            Some((InodeKind::Symlink, Some(target), _, _, _)) => {
-                StepOutcome::Done(target.clone().into_boxed_slice())
-            }
-            Some(_) => StepOutcome::Err(Errno::EINVAL),
-            None => StepOutcome::Err(Errno::ENOENT),
-        }
-    }
-}
-
-impl FsPageBacking for TestFs {
-    fn fetch_page(
-        &self,
-        _fs_object_id: FsObjectId,
-        _offset: u64,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<Frame> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn flush_page(
-        &self,
-        _fs_object_id: FsObjectId,
-        _offset: u64,
-        _frame: &Frame,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn truncate(
-        &self,
-        _fs_object_id: FsObjectId,
-        _new_size: u64,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-        StepOutcome::Done(())
     }
 }
 
@@ -823,14 +644,15 @@ fn step_walk_crosses_mount_point_at_dev() {
     // Find the rootfs's MountPayload Cap and the FsObjectId of /dev
     // on rootfs. These form the (parent_payload, child_fs_object_id)
     // key the walker consults via mount::mount_for.
-    let root_dev_id =
-        match topo
-            .rootfs
-            .lookup(FsObjectId::new(2), b"dev", &tx_substrate::epoch::guard())
-        {
-            StepOutcome::Done(id) => id,
-            other => panic!("rootfs lookup(dev) failed: {other:?}"),
-        };
+    let root_dev_id = match <TestFs as FsOpsV3>::lookup(
+        &*topo.rootfs,
+        FsObjectId::new(2),
+        b"dev",
+        &tx_substrate::epoch::guard(),
+    ) {
+        V3::Done(id) => id,
+        other => panic!("rootfs lookup(dev) failed: {other:?}"),
+    };
     let rootfs_payload = topo
         .root_dentry
         .rnode()

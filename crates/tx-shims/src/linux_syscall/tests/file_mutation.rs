@@ -10,13 +10,13 @@ use tx_subsystems::cred::CapabilitySet;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
-use tx_subsystems::page_backed::FsPageBacking;
+use tx_subsystems::page_backed::FsPageBackingV3;
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::step_chdir;
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
 };
-use tx_subsystems::vfs::FsOps;
+use tx_subsystems::vfs::FsOpsV3;
 
 use crate::linux_syscall::{
     AT_FDCWD, AT_REMOVEDIR, NR_FTRUNCATE, NR_LINKAT, NR_MKDIRAT, NR_READLINKAT, NR_RENAMEAT2,
@@ -113,37 +113,41 @@ fn root_cred() -> Credential {
 }
 
 fn create_regular(tmpfs: &Arc<Tmpfs>, name: &[u8]) {
+    use tx_substrate::step_v3::StepOutcome;
     let cred = root_cred();
     let guard = tx_substrate::epoch::guard();
     match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, name, 0o100644, &cred, &guard) {
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => {}
+        StepOutcome::Done(_) => {}
         other => panic!("create_inode {:?}: {other:?}", name),
     }
 }
 
 fn make_dir(tmpfs: &Arc<Tmpfs>, name: &[u8]) {
+    use tx_substrate::step_v3::StepOutcome;
     let cred = root_cred();
     let guard = tx_substrate::epoch::guard();
     match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, name, 0o755, &cred, &guard) {
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => {}
+        StepOutcome::Done(_) => {}
         other => panic!("mkdir {:?}: {other:?}", name),
     }
 }
 
 fn make_symlink(tmpfs: &Arc<Tmpfs>, name: &[u8], target: &[u8]) {
+    use tx_substrate::step_v3::StepOutcome;
     let cred = root_cred();
     let guard = tx_substrate::epoch::guard();
     match tmpfs.symlink(TMPFS_ROOT_OBJECT_ID, name, target, &cred, &guard) {
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => {}
+        StepOutcome::Done(_) => {}
         other => panic!("symlink {:?}: {other:?}", name),
     }
 }
 
 fn lookup_exists(tmpfs: &Arc<Tmpfs>, name: &[u8]) -> bool {
+    use tx_substrate::step_v3::StepOutcome;
     let guard = tx_substrate::epoch::guard();
     matches!(
         tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, name, &guard),
-        StepOutcome::Done(_) | StepOutcome::Advanced(_)
+        StepOutcome::Done(_)
     )
 }
 

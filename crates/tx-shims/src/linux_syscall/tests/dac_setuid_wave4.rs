@@ -1,6 +1,7 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
+use tx_substrate::step_v3::StepOutcome;
 use alloc::sync::Arc;
 use alloc::vec;
 
@@ -13,12 +14,12 @@ use tx_subsystems::cross_crate_test_support::{
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
-use tx_subsystems::page_backed::FsPageBacking;
+use tx_subsystems::page_backed::FsPageBackingV3;
 use tx_subsystems::process::step_chdir;
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
 };
-use tx_subsystems::vfs::FsOps;
+use tx_subsystems::vfs::FsOpsV3;
 
 use crate::linux_syscall::{
     AT_EACCESS, AT_FDCWD, EXECVE_PATH_MAX, F_OK, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHMODAT,
