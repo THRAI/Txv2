@@ -74,14 +74,10 @@ fn step_outcome_continue_carries_progress() {
 
 #[test]
 fn errno_mirrors_v4_catalog() {
-    // Wave-5 grows the v3 Errno catalog to mirror the v4 27-variant set
-    // byte-for-byte (see `tx_subsystems::execution::Errno`). PR-0
-    // originally pinned only `EAGAIN`; wave-4's futex cascade probe
-    // added `EINVAL`; wave-5 adds the rest in one step so wave-6
-    // fan-out workers (mount, pipe, device, …) do not each grow this
-    // catalog ad hoc. Closed-catalog discipline: an exhaustive match
-    // with no wildcard arm so adding a v4 variant later requires
-    // mirroring it here.
+    // The `step_v3::Errno` catalog mirrors `tx_subsystems::execution
+    // ::Errno` byte-for-byte (27 variants). Closed-catalog discipline:
+    // an exhaustive match with no wildcard arm so adding a variant
+    // later requires mirroring it here.
     use tx_substrate::step_v3::Errno;
     let cases = [
         Errno::EACCES,

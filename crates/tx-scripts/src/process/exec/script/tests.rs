@@ -276,10 +276,8 @@ impl ExecTestFs {
 }
 
 // `FsOps` + `FsPageBacking` impls + tests on `ExecTestFs` live in
-// the sibling `v3` submodule (file: `script/tests/v3.rs`). The v3 traits
-// are the sole `FsOps`-shaped surface; v4 `FsOps` / `FsPageBacking` were
-// retired as part of the v3-only unification. The submodule has full
-// visibility into `ExecTestFs` via `super::`.
+// the sibling `v3` submodule (file: `script/tests/v3.rs`). The
+// submodule has full visibility into `ExecTestFs` via `super::`.
 mod v3;
 
 // ---------------------------------------------------------------------------

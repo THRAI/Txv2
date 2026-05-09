@@ -176,7 +176,6 @@ pub fn open_console_for_init() -> Cap<OpenFile> {
             // Bootstrap path: init opens /dev/console as root.
             let cred = Credential::root();
             let guard = tx_substrate::epoch::guard();
-            // Wave 9e: bootstrap-path console open migrated to v3 walker.
             use tx_substrate::step_v3::StepOutcome as V3;
             let outcome = block_on(vfs::step_open(
                 root,

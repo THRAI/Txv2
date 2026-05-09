@@ -1,7 +1,7 @@
 //! Closed catalog of binding obligations.
 //!
-//! Per `docs/Txv3/01_CONCEPTS_v5.md` §8 (Bindings and obligations,
-//! preserved from v4) and `docs/Txv3/02_INVARIANTS_v5.md` (the OBL-*
+//! Per `docs/Txv3/01_CONCEPTS_v5.md` §8 (Bindings and obligations)
+//! and `docs/Txv3/02_INVARIANTS_v5.md` (the OBL-*
 //! family). A *binding obligation* names the strength required of a
 //! signifier→identity binding at a given dereference site. The catalog
 //! is closed (ARCH-3-gated) and totally ordered:

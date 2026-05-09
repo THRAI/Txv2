@@ -289,14 +289,9 @@ pub fn unpack_into_root_mount(
             errno: Errno::EIO,
         })?
         .into_cap();
-    // Wave 9g-e: initramfs unpacker migrated from v4 FsOps /
-    // FsPageBacking to the v3 trait surfaces (`FsOps` /
-    // `FsPageBacking`). Both sibling fields are populated by every
-    // backend at mount time (`MountPayload::new`), so reading the v3
-    // trio is a direct field swap. v3 errnos route back through
-    // `Errno::from(v3)` into the existing
-    // `UnpackError::FsOp { errno: Errno, .. }` carrier so the public
-    // error type does not change.
+    // Errnos from the trait surfaces route through
+    // `Errno::from(step_v3::Errno)` into the existing
+    // `UnpackError::FsOp { errno: Errno, .. }` carrier.
     let fs_ops = payload.fs_ops.clone();
     let fs_page_backing = payload.fs_page_backing.clone();
     let root_object_id = root_mount.root().fs_object_id();

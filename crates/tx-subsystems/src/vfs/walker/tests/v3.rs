@@ -1,9 +1,8 @@
-//! Wave 9a: `FsOps` + `FsPageBacking` impls + tests on `TestFs`.
+//! `FsOps` + `FsPageBacking` impls + tests on `TestFs`.
 //!
-//! Standalone v3 bodies for `TestFs` (the v4 trait is no longer
-//! implemented after the v3-only unification). `TestFs` is purely
-//! synchronous: every method either succeeds with `Done` or returns an
-//! `Err`. Tests at the bottom pin the v3 outcome shape end-to-end.
+//! `TestFs` is purely synchronous: every method either succeeds with
+//! `Done` or returns an `Err`. Tests at the bottom pin the outcome
+//! shape end-to-end.
 //!
 //! Lives in its own file so the parent `tests.rs` stays under the
 //! `cargo xtask lint arch` 1500-line authored-file cap.

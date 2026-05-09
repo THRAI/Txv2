@@ -61,11 +61,12 @@ pub enum Errno {
     ESTALE,
 }
 
-/// Bridge v4 errno into v3 errno. The v3 enum mirrors the v4 set
-/// byte-for-byte (see `tx_substrate::step_v3::Errno`), so this is a
-/// 1:1 same-name mapping. The match is exhaustive with no wildcard:
-/// adding a new v4 variant fails to compile here until v3 is also
-/// extended, which keeps the two catalogs in lock-step.
+/// Bridge `execution::Errno` into `step_v3::Errno`. The two enums
+/// mirror each other byte-for-byte (see `tx_substrate::step_v3::Errno`),
+/// so this is a 1:1 same-name mapping. The match is exhaustive with no
+/// wildcard: adding a new variant on either side fails to compile here
+/// until the other is extended, which keeps the two catalogs in
+/// lock-step.
 impl From<Errno> for tx_substrate::step_v3::Errno {
     fn from(value: Errno) -> Self {
         match value {
@@ -100,14 +101,13 @@ impl From<Errno> for tx_substrate::step_v3::Errno {
     }
 }
 
-/// Reverse bridge — `step_v3::Errno → execution::Errno`. Wave 9d (b)
-/// added the inverse of the wave-5 `From<Errno> for step_v3::Errno`
-/// impl so tx-shims call sites that switch from `step_walk` to
-/// `step_walk` can route the v3 outcome's errno back through the
+/// Reverse bridge — `step_v3::Errno → execution::Errno`. Inverse of
+/// the `From<Errno> for step_v3::Errno` impl above so tx-shims call
+/// sites can route the step_v3 outcome's errno back through the
 /// existing `errno_to_i32` translation table without each site
 /// reproducing the variant-by-variant mapping. Exhaustive no-wildcard
 /// match: a future `step_v3::Errno`-only addition fails to compile
-/// until the v4 mirror is grown.
+/// until the `execution::Errno` mirror is grown.
 impl From<tx_substrate::step_v3::Errno> for Errno {
     fn from(value: tx_substrate::step_v3::Errno) -> Self {
         use tx_substrate::step_v3::Errno as V3;
@@ -202,11 +202,12 @@ mod tests {
 
     #[test]
     fn from_v4_errno_round_trip() {
-        // Wave-5: the `From<execution::Errno> for step_v3::Errno` impl
-        // must map each v4 variant to the same-named v3 variant. Closed
-        // catalog: the table below names each v4 variant explicitly so
-        // adding a new v4 variant later (without extending v3 + the
-        // From impl) fails to compile or this test fails immediately.
+        // The `From<execution::Errno> for step_v3::Errno` impl must
+        // map each variant to the same-named variant. Closed catalog:
+        // the table below names each `execution::Errno` variant
+        // explicitly so adding a new variant later (without extending
+        // `step_v3::Errno` + the From impl) fails to compile or this
+        // test fails immediately.
         use tx_substrate::step_v3::Errno as V3;
         let table: [(Errno, V3); 27] = [
             (Errno::EACCES, V3::EACCES),

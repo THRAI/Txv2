@@ -435,9 +435,6 @@ fn dispatch_execve_success_returns_exec_committed() {
 }
 
 // === `FsOps` + `FsPageBacking` impls on `ExecveTestFs`. ===
-//
-// Inlined v3 bodies. The legacy v4 trait impls have been deleted as
-// part of unifying the codebase to v3-only.
 
 impl tx_subsystems::vfs::FsOps for ExecveTestFs {
     fn lookup(
@@ -801,12 +798,12 @@ fn execve_testfs_v3_fetch_page_returns_frame_for_regular() {
         V3::Done(_frame) => {}
         other => panic!("fetch_page v3: {other:?}"),
     }
-    // Misaligned offset → EINVAL via the v4 body.
+    // Misaligned offset → EINVAL.
     assert_eq!(
         <ExecveTestFs as FsPageBacking>::fetch_page(&*fs, file_id, 7, &guard),
         V3::<Frame, NoProgress>::err(V3Errno::EINVAL)
     );
-    // Truncate / fsync / flush_page are synchronous Done(()) in the v4 body.
+    // Truncate / fsync / flush_page are synchronous Done(()).
     assert_eq!(
         <ExecveTestFs as FsPageBacking>::fsync(&*fs, file_id, &guard),
         V3::<(), NoProgress>::done(())

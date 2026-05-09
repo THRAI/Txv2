@@ -680,21 +680,10 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
     );
 }
 
-// === FsOps + FsPageBacking — wave 9a parallel-trait impls ===========
+// === FsOps + FsPageBacking tests ====================================
 //
-// Wave-8 prototype landed `FsOps` on the test-only `LifecycleFs` fixture
-// + the trait declaration in `crates/tx-subsystems/src/vfs/execution.rs`.
-// Wave 9a is the learning sub-wave per
-// `docs/progress/decisions/2026-05-09-fsops-v3-design.md`: the first
-// production impl (`Tmpfs`) plus the first non-trivial test fixture
-// (`TestFs` in `vfs/walker/tests.rs`) lift the v3 trait off ENOSYS-only
-// stubs and exercise the real semantics. Wave 9b fans out to the
-// remaining five impls (Devfs, Ext4FsInstance, DevptsInstance, ExecTestFs,
-// ExecveTestFs) once these are green.
-//
-// Tests below pin the v3 outcome shape end-to-end through both `FsOps`
-// and `FsPageBacking` on `Tmpfs`. Each test is the red driver for
-// exactly one new method body.
+// Tests below pin the outcome shape end-to-end through both `FsOps`
+// and `FsPageBacking` on `Tmpfs`.
 
 #[test]
 fn tmpfs_v3_lookup_round_trips_after_create() {
@@ -710,7 +699,7 @@ fn tmpfs_v3_lookup_round_trips_after_create() {
     let guard = tx_substrate::epoch::guard();
     let cred = Credential::root();
 
-    // create_inode v3 — mirrors v4 create then expose v3 outcome.
+    // create_inode.
     let (file_id, file_meta) = match <Tmpfs as FsOps>::create_inode(
         &*tmpfs,
         TMPFS_ROOT_OBJECT_ID,
@@ -856,16 +845,10 @@ fn tmpfs_v3_truncate_then_load_meta_reflects_size() {
     );
 }
 
-// === Wave 9c — v3 walker end-to-end against Tmpfs =====================
+// === Walker end-to-end against Tmpfs =================================
 //
-// This test pins that the production v3 cutover actually exercises
-// `FsOps for Tmpfs` end-to-end through the new `step_walk`
-// entry point and through the v3 fields landing on `MountOutput`. If
-// the walker degenerates to v4, this test still passes because both
-// fields populate from the same `Arc<Tmpfs>`; the
-// `register_mount_payload_v3` step here uses
-// `mount_output.fs_ops` (not `mount_output.fs_ops`) so the route
-// is hard-pinned to the v3 trait surface.
+// This test pins that `FsOps for Tmpfs` exercises end-to-end through
+// `step_walk` and through the fs_ops field on `MountOutput`.
 
 #[test]
 fn step_walk_against_tmpfs_resolves_real_path() {
@@ -886,8 +869,6 @@ fn step_walk_against_tmpfs_resolves_real_path() {
 
     let (tmpfs, mount_output) = Tmpfs::new_root();
 
-    // Wave 9d retired the sidecar registry: the v3 fs_ops trait
-    // object now flows through `MountPayload`'s `fs_ops` field.
     let payload: Cap<MountPayload> = MountPayload::new_cap(
         mount_output.fs_ops.clone(),
         mount_output.fs_page_backing.clone(),

@@ -451,22 +451,21 @@ pub fn step_pipe2(flags: PipeFlags) -> Result<(Cap<OpenFile>, Cap<OpenFile>), Er
     Ok((reader_open, writer_open))
 }
 
-// === wave-6 v3 cascade probe (W-pipe) ================================
+// === step_v3-shape sibling fns =======================================
 //
-// Sibling `*_v3` fns matching the same logic as the v4 fns above but
-// emitting v3 step-algebra outcomes (`tx_substrate::step_v3::StepOutcome`).
-// Existing tx-shims callers stay on the v4 fns; future migration waves
-// switch them over and delete the v4 fns. Per the wave-4 worker spec, we
-// re-run the body inline here rather than delegating, to keep the v3
-// path independently testable and avoid a conversion-shim layer.
+// Sibling `*_v3` fns matching the same logic as the fns above but
+// emitting `tx_substrate::step_v3::StepOutcome`. Bodies are run inline
+// rather than delegating, to keep the step_v3 path independently
+// testable and avoid a conversion-shim layer.
 //
-// We deliberately fully-qualify the v3 types as `tx_substrate::step_v3::*`
-// instead of adding a `use` so the v4 `StepOutcome`/`Errno` already in
-// scope from `crate::execution` keep working without rename gymnastics.
+// We deliberately fully-qualify the step_v3 types as
+// `tx_substrate::step_v3::*` instead of adding a `use` so the
+// `StepOutcome`/`Errno` already in scope from `crate::execution` keep
+// working without rename gymnastics.
 
-/// `pipe2(2)` — v3 outcome shape.
+/// `pipe2(2)` — step_v3 outcome shape.
 ///
-/// Same body and semantics as [`step_pipe2`], translated to a v3
+/// Same body and semantics as [`step_pipe2`], translated to a
 /// [`tx_substrate::step_v3::StepOutcome`]:
 /// - allocation/zone failure → `Err(Errno::ENOMEM)`
 /// - success → `Done((reader_cap, writer_cap))`
@@ -485,9 +484,9 @@ pub fn step_pipe2_v3(
     }
 }
 
-/// `read(pipe_fd, buf, len)` — v3 outcome shape.
+/// `read(pipe_fd, buf, len)` — step_v3 outcome shape.
 ///
-/// Same body as [`step_read`], but returns a v3
+/// Same body as [`step_read`], but returns a
 /// [`tx_substrate::step_v3::StepOutcome`] over `usize` (bytes read) and
 /// `ByteProgress`:
 ///
@@ -495,12 +494,11 @@ pub fn step_pipe2_v3(
 ///   accumulator unused)
 /// - non-empty ring → `Done(copied)` — pipe `step_read` is single-step:
 ///   it copies what fits in one shot and the caller does not re-enter
-///   expecting more, so a partial drain is reported as `Done(n)` rather
-///   than `Continue { progress: ByteProgress::new(n) }`. The byte-moving
-///   probe-target answer for this call site: **`Done(n)`**, because the
-///   v4 fn never emits `Advanced`/`AdvancedThenBlocked` here — it
-///   reports terminal byte counts to its single caller
-///   (`vfs::execution::step_read` under nonblocking semantics).
+///   expecting more, so a partial drain is reported as `Done(n)`
+///   rather than `Continue { progress: ByteProgress::new(n) }`.
+///   `Advanced`/`AdvancedThenBlocked` are not emitted here — the
+///   single caller (`vfs::execution::step_read` under nonblocking
+///   semantics) consumes terminal byte counts.
 /// - empty ring + writers closed → `Done(0)` (EOF)
 /// - empty ring + writers alive + nonblocking → `Err(EAGAIN)`
 /// - empty ring + writers alive + blocking → `Yield { progress:
@@ -894,13 +892,11 @@ mod tests {
         drain_to_quiescence();
     }
 
-    // === wave-6 v3 cascade probe (W-pipe) ================================
+    // === step_v3 sibling-fn tests ========================================
     //
-    // The tests below exercise the v3-shape sibling fns
-    // `step_pipe2_v3` / `step_read_v3`. The v4 fns above stay untouched —
-    // these tests pin the v3 outcome catalog without crossing the
-    // tx-shims cascade boundary. Future waves migrate the syscall
-    // arm over and delete the v4 fns.
+    // The tests below exercise the step_v3-shape sibling fns
+    // `step_pipe2_v3` / `step_read_v3`. They pin the step_v3 outcome
+    // catalog without crossing the tx-shims dispatch boundary.
 
     use tx_substrate::step_v3::StepProgress;
 
@@ -944,7 +940,7 @@ mod tests {
         let payload = payload_of(&reader);
         let _ = writer; // hold writer alive so step_read sees writer_count > 0
         let guard = tx_substrate::epoch::guard();
-        // Seed with bytes via the v4 write path — we only migrate read here.
+        // Seed with bytes via the (non-step_v3) write path.
         let _ = step_write(&payload, b"hello", &guard, false);
         let mut buf = [0u8; 8];
         let outcome = step_read_v3(&payload, &mut buf, &guard, false);
@@ -1085,7 +1081,7 @@ mod tests {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        // Fill the ring exactly to PIPE_BUF via the v4 write path.
+        // Fill the ring exactly to PIPE_BUF.
         let big = alloc::vec![b'x'; PIPE_BUF];
         let guard = tx_substrate::epoch::guard();
         let filled = step_write(&payload, &big, &guard, false);

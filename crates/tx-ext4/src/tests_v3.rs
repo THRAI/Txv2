@@ -261,9 +261,8 @@ fn ext4_v3_mutation_methods_surface_enosys_through_v3_errno() {
     // The read-only ext4 surface returns `Errno::ENOSYS` from every
     // mutating method (create_inode, mkdir, unlink, rmdir, rename,
     // link, symlink, destroy_inode, serialize_inode_meta). Pin that
-    // the v4 → v3 errno bridge surfaces `ENOSYS` cleanly through the
-    // v3 trait so wave-9c walker callers observe the same shape on
-    // both backends.
+    // `ENOSYS` surfaces cleanly through the trait so walker callers
+    // observe a consistent shape across backends.
     let _serial = EXT4_V3_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -361,7 +360,7 @@ fn ext4_v3_fetch_page_returns_done_frame_for_aligned_offset() {
 
 #[test]
 fn ext4_v3_truncate_and_fsync_surface_enosys() {
-    // Read-only ext4 surface today; v3 must mirror v4.
+    // Read-only ext4 surface today.
     let _serial = EXT4_V3_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());

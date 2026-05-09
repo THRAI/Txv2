@@ -45,20 +45,14 @@ fn materialize_frame(
     tx_substrate::step_v3::StepOutcome::done(Frame::new(ppn))
 }
 
-// === v3 trait impl (v3-only after v4 retirement) ====================
+// === FsPageBacking impl =============================================
 //
-// The v4 `FsPageBacking` impl was deleted as part of unifying the
-// kernel on the v3 trait surface. The bodies below are the original
-// v4 logic inlined directly, with terminal outcomes mapped onto the
-// v3 `StepOutcome` shape. The current read-only `Ext4Pager::read_page`
-// returns `Result<T, Ext4FormatError>` (not `StepOutcome`), so every
-// body lands on `done` or `err` only — there is no `Advanced` /
-// `Blocked` / `AdvancedThenBlocked` path through this read-only
-// backend today. Any future async/journal-aware revision should map
-// `Advanced(t)` → `done(t)` (one-shot v3 contract) and `Blocked` /
-// `AdvancedThenBlocked` defensively to `EAGAIN`.
+// The current read-only `Ext4Pager::read_page` returns
+// `Result<T, Ext4FormatError>` (not `StepOutcome`), so every body lands
+// on `done` or `err` only — there is no `Advanced` / `Blocked` /
+// `AdvancedThenBlocked` path through this read-only backend today.
 
-/// v3 sibling factory for `MountOutput::fs_page_backing` cutover.
+/// Factory for `MountOutput::fs_page_backing`.
 ///
 /// Mirrors `Tmpfs::fs_page_backing_arc`.
 impl<I> Ext4FsInstance<I>
@@ -128,8 +122,6 @@ where
         tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
     }
 
-    // `fallocate` and `supports_reflink` inherit the v3 trait defaults
-    // (`done(())` and `false` respectively), which match the prior v4
-    // delegation behaviour exactly — the original v3 impl forwarded to
-    // the v4 trait defaults of the same shapes.
+    // `fallocate` and `supports_reflink` inherit the trait defaults
+    // (`done(())` and `false` respectively).
 }

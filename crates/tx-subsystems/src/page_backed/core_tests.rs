@@ -1,8 +1,8 @@
-//! Inline tests for the core page_backed module — extracted to a sibling
-//! file in wave 9d to keep page_backed.rs under the 1500-line authored-Rust
-//! cap. RecordingFs/BlockingFs fixtures live here, including their wave-9d
-//! v3 trait impls (FsOps + FsPageBacking) needed because MountPayload
-//! now carries fs_ops / fs_page_backing fields.
+//! Inline tests for the core page_backed module — extracted to a
+//! sibling file to keep page_backed.rs under the 1500-line
+//! authored-Rust cap. RecordingFs/BlockingFs fixtures live here,
+//! including their `FsOps` + `FsPageBacking` impls needed because
+//! `MountPayload` carries `fs_ops` / `fs_page_backing` fields.
 
     use super::*;
     use crate::execution::{Errno, StepOutcome, WaitToken};
@@ -46,8 +46,8 @@
 
 
 
-    // Wave 9d: v3 trait impls so `RecordingFs` satisfies the v3 fields
-    // on `MountPayload`. Bodies mirror the v4 impls one-for-one.
+    // Trait impls so `RecordingFs` satisfies the `FsOps` /
+    // `FsPageBacking` fields on `MountPayload`.
     impl crate::vfs::FsOps for RecordingFs {
         fn lookup(
             &self,
@@ -227,14 +227,15 @@
 
 
 
-    // Wave 9d: v3 trait impls so `BlockingFs` satisfies the v3 fields
-    // on `MountPayload`. Mirror the v4 bodies, except `fetch_page` —
-    // v4 returns `Blocked(token)`, which has no v3 equivalent in
-    // `NoProgress` outcomes; the closest analog is `Err(EAGAIN)` so
-    // tests that exercise the v3 walker get a non-Done deterministic
-    // result. The page-backed unit tests below all drive `BlockingFs`
-    // through the v4 surface (`materialize_page` reads `fs_page_backing`,
-    // not the v3 sibling), so this v3 body is dispatch-stub-only.
+    // Trait impls so `BlockingFs` satisfies the `FsOps` /
+    // `FsPageBacking` fields on `MountPayload`. The interesting case
+    // is `fetch_page`: a `Blocked(token)` shape has no equivalent in
+    // `NoProgress` outcomes, so the closest analog `Err(EAGAIN)` is
+    // surfaced here — that gives walker-driven tests a non-Done
+    // deterministic result. The page-backed unit tests below all
+    // drive `BlockingFs` through `materialize_page` (which reads its
+    // own `fs_page_backing` route), so this trait body is
+    // dispatch-stub-only.
     impl crate::vfs::FsOps for BlockingFs {
         fn lookup(
             &self,
@@ -373,11 +374,9 @@
             _offset: u64,
             _guard: &Guard<'_>,
         ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
-            // Wave 9h-β: align v3 with v4's `Blocked(WaitToken(9, 0x44))`
-            // so production fns routing through v3 (e.g. materialize_file_page)
-            // observe a yield, not EAGAIN. Without this, the v4→v3 swap of
-            // materialize_file_page would convert the test's Blocked
-            // expectation into Err(EAGAIN).
+            // Yield on `WaitToken(9, 0x44)` so production fns routing
+            // through this trait (e.g. `materialize_file_page`)
+            // observe a yield rather than `Err(EAGAIN)`.
             tx_substrate::step_v3::StepOutcome::yield_on_carrier(
                 tx_substrate::step_v3::NoProgress,
                 9,

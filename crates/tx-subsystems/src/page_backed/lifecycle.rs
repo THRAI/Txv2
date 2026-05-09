@@ -176,12 +176,11 @@ pub fn step_fsync(
 ///   PageProgress::EMPTY, … }` (see note)
 /// - fs `Err(e)` → `Err(e)`
 ///
-/// Per-call-site `Advanced(())` / `AdvancedThenBlocked` decision: the v4
-/// fs `truncate` returns `T = ()`, so there is no per-step page count to
-/// thread through. We pick the simpler probe path of `PageProgress::EMPTY`
-/// in both yield/continue cases. If a later wave needs interim page-step
-/// accounting for truncate it must extend `FsPageBacking::truncate` to
-/// expose a `pages` count or have v3 callers track it externally.
+/// `FsPageBacking::truncate` returns `T = ()`, so there is no per-step
+/// page count to thread through; both yield/continue cases use
+/// `PageProgress::EMPTY`. If interim page-step accounting for truncate
+/// is ever needed, extend `FsPageBacking::truncate` to expose a
+/// `pages` count or track it externally at call sites.
 pub fn step_truncate(
     pc: &PageContainer,
     new_size: u64,
@@ -393,11 +392,10 @@ mod v3_tests {
 
 
 
-    // Wave 9d: v3 trait impls so the inner-mod LifecycleFs satisfies
-    // the v3 fields on `MountPayload`. Bodies mirror the v4 impls;
-    // anything that goes through `Blocked(_)` upgrades to
-    // `Err(EAGAIN)` (the v3 surface has no `NoProgress`-Blocked
-    // variant).
+    // Trait impls so the inner-mod LifecycleFs satisfies the
+    // `FsOps` / `FsPageBacking` fields on `MountPayload`. Anything
+    // that would go through `Blocked(_)` upgrades to `Err(EAGAIN)`
+    // (this surface has no `NoProgress`-Blocked variant).
     impl crate::vfs::FsOps for LifecycleFs {
         fn lookup(
             &self,
