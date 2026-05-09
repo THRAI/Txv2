@@ -4,6 +4,57 @@
 
 ## Current Shape
 
+- 2026-05-09 PR-1 wave-9g v3 TDD migration ABORTED — worker
+  discovered the brief's premise was wrong. Brief assumed wave
+  9d/9f had migrated all production code to v3. They migrated
+  the walker callers (`step_walk`, `step_open`) but NOT the
+  direct-trait-method callers that syscall arms invoke
+  POST-walk on resolved dentries. Substantial v4 production
+  callers remain across:
+  - **tx-shims/src/linux_syscall/fs_path.rs:218,260** — chmod /
+    chown call `fs_ops.step_chmod` / `step_chown` directly via
+    a v4 `fs_ops_for_dentry(...) -> Option<Arc<dyn FsOps>>`
+    helper (lines 169–183).
+  - **tx-shims/src/linux_syscall/fs_mut.rs** — 8 v4 trait calls
+    in mknod / mkdir / rmdir / unlink / symlink / link /
+    readlinkat / rename arms via `fs_ops.{create_inode, mkdir,
+    rmdir, unlink, symlink, link, lookup, load_inode_meta,
+    read_link, rename}`; also `fs_page_backing_for_dentry(...)
+    -> Option<Arc<dyn FsPageBacking>>` for fallocate paths.
+  - **tx-shims/src/linux_syscall/fs_basic.rs:1025,1128** —
+    getdents64 path via `fs_ops_for_rnode(...) ->
+    Option<Arc<dyn FsOps>>` and `fs_ops.readdir(...)`.
+  - **tx-kernel/src/init/exec.rs:113–280** — bin/sh and init
+    exec image build paths use `root_mount.fs_ops.create_inode
+    / mkdir / materialise_rnode / serialize_inode_meta` plus
+    `fs_page_backing.flush_page / truncate`.
+  - **tx-kernel/src/init.rs:380–382, 460** — rootfs / devfs
+    `MountOutput` consumed via `mount_output.fs_ops.clone()`
+    and `fs_page_backing.clone()`.
+  - **tx-subsystems/src/initramfs/mod.rs:289–557** — populate
+    helpers take `&Arc<dyn FsOps>` / `&Arc<dyn FsPageBacking>`
+    parameters and call into v4 trait methods.
+  - **tx-subsystems/src/page_backed/lifecycle.rs** — the v4
+    `step_fsync` / `step_truncate` fns (which wave 7 added v3
+    siblings for; v3 is `step_fsync_v3` / `step_truncate_v3`)
+    still call `mount.payload().fs_page_backing.{flush_page,
+    fsync, truncate}` internally — and they are still
+    invoked by upstream v4 callers we haven't enumerated.
+  Worker did NOT modify the tree — aborted with a clean
+  state and a recommendation. Test count and gates unchanged
+  from wave 9f. **Wave 9g revised plan:** insert a wave 9g
+  (subdivided into 9g-a/b/c/...) that migrates the v4
+  trait-method callers above to v3 BEFORE attempting to delete
+  the v4 traits. The pattern mirrors wave 9d (b)/(c) but
+  applied to direct trait methods rather than walker calls:
+  rewrite each `fs_ops_for_dentry`/`fs_ops_for_rnode`/
+  `fs_page_backing_for_dentry` helper to return v3 `Arc<dyn
+  FsOpsV3>` / `Arc<dyn FsPageBackingV3>`; collapse 5-variant
+  match arms to 4-variant; bridge errnos via `Errno::from(v3)`.
+  After all v4 trait-method callers are migrated, the actual
+  trait retirement (now wave 9h) becomes the small mechanical
+  cleanup originally described.
+
 - 2026-05-09 PR-1 wave-9f of the v3 TDD migration landed — **v4
   walker retired.** Single deep worker. Three deliverables:
   (1) Migrated all 18 `step_walk` / `step_open` tests in
