@@ -70,14 +70,17 @@ pub(crate) fn create_then_walk<P: PmapIf>(
         cwd.clone()
     } else {
         let guard = tx_substrate::epoch::guard();
-        let outcome = poll_walker_synchronously(step_walk(cwd.clone(), parent_path, cred, &guard));
+        // Wave 9d (c): migrated to v3 walker.
+        use tx_substrate::step_v3::StepOutcome as V3;
+        let outcome =
+            poll_walker_synchronously(step_walk_v3(cwd.clone(), parent_path, cred, &guard));
         drop(guard);
         match outcome {
-            StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            V3::Done(d) => d,
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return Err(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return Err(errno_to_i32(errno)),
+            V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
         }
     };
 
@@ -110,12 +113,14 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     // inode; the resulting dentry carries the proper parent-hint
     // chain back to the mount root.
     let guard = tx_substrate::epoch::guard();
-    let outcome = poll_walker_synchronously(step_walk(cwd.clone(), path, cred, &guard));
+    // Wave 9d (c): migrated to v3 walker.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let outcome = poll_walker_synchronously(step_walk_v3(cwd.clone(), path, cred, &guard));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) | StepOutcome::Advanced(d) => Ok(d),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => Err(EIO_VALUE),
-        StepOutcome::Err(errno) => Err(errno_to_i32(errno)),
+        V3::Done(d) => Ok(d),
+        V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
+        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
     }
 }
 

@@ -220,31 +220,33 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // `poll_walker_synchronously` helper that the Wave 4 file-mode
     // arms also use; every in-tree walker backend resolves
     // immediately so the noop-waker poll always returns `Ready`.
+    // Wave 9d (c): migrated to v3 walker.
+    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
     let walk_first = {
         let guard = tx_substrate::epoch::guard();
         let outcome =
-            poll_walker_synchronously(step_walk(cwd.clone(), &path, &walker_cred, &guard));
+            poll_walker_synchronously(step_walk_v3(cwd.clone(), &path, &walker_cred, &guard));
         drop(guard);
         outcome
     };
 
     let dentry: Cap<DEntry> = match walk_first {
-        StepOutcome::Done(d) | StepOutcome::Advanced(d) => {
+        V3::Done(d) => {
             if want_create && want_excl {
                 return SyscallResult::Error(EEXIST_VALUE);
             }
             d
         }
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+        V3::Continue { .. } | V3::Yield { .. } => {
             return SyscallResult::Error(EIO_VALUE);
         }
-        StepOutcome::Err(Errno::ENOENT) if want_create => {
+        V3::Err(V3Errno::ENOENT) if want_create => {
             match create_then_walk::<P>(&cwd, &path, mode as u16, &walker_cred) {
                 Ok(d) => d,
                 Err(e) => return SyscallResult::Error(e),
             }
         }
-        StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
     };
 
     // Step 2: O_TRUNC. Apply *before* materialising the OpenFile so
@@ -285,7 +287,8 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // Same Send-future discipline as Step 1: poll_walker_synchronously.
     let openfile: Cap<OpenFile> = {
         let guard = tx_substrate::epoch::guard();
-        let outcome = poll_walker_synchronously(step_open(
+        // Wave 9d (c): migrated to v3 walker.
+        let outcome = poll_walker_synchronously(step_open_v3(
             cwd,
             &path,
             open_flags,
@@ -295,11 +298,11 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         ));
         drop(guard);
         match outcome {
-            StepOutcome::Done(file) | StepOutcome::Advanced(file) => file,
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            V3::Done(file) => file,
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
         }
     };
 
@@ -925,16 +928,18 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             Some(d) => d,
             None => return SyscallResult::Error(ENOENT_VALUE),
         };
+        // Wave 9d (c): migrated to v3 walker.
+        use tx_substrate::step_v3::StepOutcome as V3;
         let outcome = {
             let guard = tx_substrate::epoch::guard();
-            poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard))
+            poll_walker_synchronously(step_walk_v3(cwd, &path, &walker_cred, &guard))
         };
         match outcome {
-            StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            V3::Done(d) => d,
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
         }
     };
 

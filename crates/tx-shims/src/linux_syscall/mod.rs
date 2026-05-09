@@ -74,7 +74,7 @@ use tx_subsystems::tty::structure::{Termios, Winsize};
 use tx_subsystems::vfs::structure::{
     Credential, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking, StructPayload,
 };
-use tx_subsystems::vfs::{step_open, step_walk, DEntry, OpenFile};
+use tx_subsystems::vfs::{step_open_v3, step_walk_v3, DEntry, OpenFile};
 use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
     VmEntryFlags, VmMapError, VmMapRequest, VmRemapRequest, USER_PAGE_SIZE,
