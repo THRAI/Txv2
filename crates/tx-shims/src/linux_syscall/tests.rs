@@ -471,10 +471,11 @@ fn dispatch_read_blocks_until_tty_input_then_returns_byte() {
     // registered wait-carrier channel, so the next poll should
     // observe the bytes and complete.
     {
+        use tx_substrate::step_v3::StepOutcome as V3Out;
         let guard = tx_substrate::epoch::guard();
         let outcome = tx_subsystems::tty::execution::step_ingest(&console_tty, b"X\n", &guard);
         assert!(
-            matches!(outcome, StepOutcome::Done(_)),
+            matches!(outcome, V3Out::Done(_)),
             "step_ingest should accept the bytes; got {outcome:?}"
         );
     }
