@@ -24,10 +24,50 @@ Optional host tools for filesystem and image work:
 - `zip`
 - `jq` for ad hoc JSON queries; progress validation is owned by `xtask`
 
-For BusyBox initramfs generation, set `TX_BUSYBOX` to a static BusyBox binary.
-If BusyBox is dynamically linked against musl, set `TX_MUSL_LIBC` to the musl
-`libc.so`; the builder includes it under `/lib/libc.so` and adds musl loader
-symlinks for RV64 and LA64.
+For BusyBox initramfs generation, either set `TX_BUSYBOX` to a static BusyBox
+binary or use the in-tree vendored BusyBox for the selected target. RV64 uses
+`tools/images/vendor/busybox-riscv64-musl`; LA64 uses
+`tools/images/vendor/busybox-loongarch64-musl`. Build the LA64 binary either
+with `docker compose run --rm busybox-la64` or, after installing a
+`loongarch64-linux-musl-` cross toolchain, with
+`tools/images/build-busybox-loongarch64.sh`. If BusyBox is dynamically linked
+against musl, set `TX_MUSL_LIBC` to the musl `libc.so`; the builder includes it
+under `/lib/libc.so` and adds musl loader symlinks for RV64 and LA64.
+
+## Docker workflow
+
+Txv2 ships a `docker-compose.yml` with:
+
+- `oscomp`: general build/test/qemu container (`cargo xtask ...`)
+- `busybox-la64`: dedicated LA64 BusyBox builder
+
+Common entry points (from workspace root):
+
+```sh
+make docker-build
+make docker-shell
+make docker-ci
+make docker-build-la64
+make docker-busybox-la64
+make docker-image-cpio-la64
+make docker-qemu-la64-busybox
+```
+
+OSComp flow in container:
+
+```sh
+make docker-oscomp-doctor
+make docker-oscomp-prepare
+make docker-oscomp-submit
+make docker-oscomp-run
+```
+
+If a previous root-run container left root-owned files in your workspace, run
+`busybox-la64` as your uid/gid:
+
+```sh
+TX_DOCKER_UID=$(id -u) TX_DOCKER_GID=$(id -g) docker compose run --rm busybox-la64
+```
 
 The OSComp autotest suite is a submodule at `external/oscomp-autotest`.
 HumanLayer's agent workflow reference is a sparse submodule at
@@ -58,15 +98,17 @@ cargo xtask build --target rv64-m1dock-mock
 cargo xtask build --target la64-qemu
 cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel
 cargo xtask qemu --target rv64-qemu --profile busybox --dry-run
+cargo xtask qemu --target la64-qemu --profile busybox --dry-run
 cargo xtask qemu --target rv64-m1dock-mock --profile smoke --dry-run
 ```
 
 Image and submit commands:
 
 ```sh
-cargo xtask image cpio --profile busybox
-cargo xtask image ext4 --profile busybox --size 64M
-cargo xtask image m1dock-sd --profile busybox --size 64M
+docker compose run --rm busybox-la64
+cargo xtask image cpio --profile busybox --target la64-qemu
+cargo xtask image ext4 --profile busybox --target la64-qemu --size 64M
+cargo xtask image m1dock-sd --profile busybox --target rv64-m1dock-mock --size 64M
 cargo xtask submit k210
 ```
 

@@ -6,6 +6,7 @@ extern crate std;
 
 mod zones;
 
+pub mod devices;
 pub mod init;
 pub mod irq;
 pub mod thread_future;

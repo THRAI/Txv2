@@ -1,5 +1,9 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 
+extern crate alloc;
+
+pub mod virtio;
+
 pub mod spi {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum SpiError {

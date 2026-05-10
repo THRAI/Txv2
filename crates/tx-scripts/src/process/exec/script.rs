@@ -620,6 +620,7 @@ fn make_initial_user_trap_context(pc: usize, sp: usize) -> UserTrapContext {
         regs,
         pc,
         status: 0,
+        fp: tx_hal::UserFpContext::empty(),
     }
 }
 

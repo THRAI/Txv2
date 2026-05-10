@@ -21,6 +21,7 @@ fn synthetic_parent_ctx() -> UserTrapContext {
         regs,
         pc: 0x4000_1000,
         status: 0xdeadc0de,
+        fp: tx_hal::UserFpContext::empty(),
     }
 }
 

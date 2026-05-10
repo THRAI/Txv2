@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+args=()
+while (($# > 0)); do
+  case "$1" in
+    -Wp,-MD,*)
+      depfile="${1#-Wp,-MD,}"
+      args+=("-MD" "-MF" "$depfile")
+      shift
+      ;;
+    -Wp,-MMD,*)
+      depfile="${1#-Wp,-MMD,}"
+      args+=("-MMD" "-MF" "$depfile")
+      shift
+      ;;
+    -finline-limit=*|-falign-jumps=*|-falign-labels=*|-static-libgcc|-Wl,--warn-common|-Wl,--verbose)
+      shift
+      ;;
+    -Wl,-Map,*)
+      shift
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+exec zig cc -target loongarch64-linux-musl "${args[@]}"

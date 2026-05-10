@@ -245,6 +245,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_reactor_submit_seam();
     crate::init::reset_boot_state_for_test();
     crate::irq::reset_dispatch_table_for_test();
+    tx_subsystems::device::reset_block_registry_for_test();
     CONSOLE_CAPTURED_LEN.store(0, Ordering::Release);
     CONSOLE_CAPTURED_BYTES
         .lock()
@@ -279,6 +280,7 @@ fn drive_boot_wiring() {
     // The dispatch table still gets published, exercising the
     // platform-publication path in the boot-wiring smoke.
     CoreInit::<TestPlatform>::install_irq_handlers();
+    CoreInit::<TestPlatform>::init_block_devices();
     CoreInit::<TestPlatform>::mount_rootfs_tmpfs();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
@@ -608,6 +610,7 @@ fn boot_smoke_production_userspace_loop_writes_console_then_exits() {
         regs: [0; 32],
         pc: 0,
         status: 0,
+        fp: tx_hal::UserFpContext::empty(),
     }));
 
     let waker = Waker::noop().clone();

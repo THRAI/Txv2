@@ -268,6 +268,7 @@ fn install_saved_context(
         regs: [0; 32],
         pc: 0xCAFE_F00D,
         status: 0,
+        fp: tx_hal::UserFpContext::empty(),
     };
     // Plant a recognisable value in a0 so we can prove pre-existing
     // contents are overwritten only when a syscall return is drained.

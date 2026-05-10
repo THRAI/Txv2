@@ -44,6 +44,9 @@ cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel
 cargo xtask qemu --target rv64-m1dock-mock --profile smoke --dry-run
 cargo xtask progress list all --json
 cargo xtask submit k210
+make docker-build
+make docker-shell
+make docker-busybox-la64
 ```
 
 Generated build outputs, image roots, and submit trees live under `target/`.

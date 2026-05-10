@@ -240,6 +240,7 @@ impl<P: TxPlatform> CoreInit<P> {
             // #4 in the pre-ELF plan).
             Self::register_console_hardware();
             Self::install_irq_handlers();
+            Self::init_block_devices();
             Self::mount_rootfs_tmpfs();
             Self::mount_devfs_at_dev();
             Self::register_devfs_console_alias();
@@ -351,6 +352,22 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":irq:install:ok\n");
+    }
+
+    /// Initialize tier-2 block devices before devfs observes the device
+    /// registry. LA64 QEMU currently wires a static VirtIO-PCI disk here; other
+    /// boards may legitimately publish no block devices.
+    pub(crate) fn init_block_devices() {
+        let devices = alloc::boxed::Box::leak(alloc::boxed::Box::new(
+            crate::devices::KernelBlockDevices::<P>::new(),
+        ));
+        match devices.init_and_register() {
+            StepOutcome::Done(()) => {}
+            other => panic!("init_block_devices: registration failed: {other:?}"),
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":devices:block:ok\n");
     }
 
     /// Mount tmpfs as the rootfs.

@@ -8,6 +8,25 @@ use crate::util::{collect_files, relative, shell_join};
 use crate::Result;
 
 const MAX_AUTHORED_RUST_FILE_LINES: usize = 1_500;
+const AUTHORED_HOST_PACKAGES: &[&str] = &[
+    "xtask",
+    "tx-hal",
+    "tx-kernel",
+    "tx-drivers",
+    "tx-substrate",
+    "tx-subsystems",
+    "tx-reactor",
+    "tx-ext4-format",
+    "tx-fs",
+    "tx-scripts",
+    "tx-shims",
+    "tx-policy",
+    "tx-services",
+    "tx-ext4",
+    "tx-hal-riscv64-qemu-virt",
+    "tx-hal-riscv64-m1dock-mock",
+    "tx-hal-loongarch64-qemu-virt",
+];
 
 pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
@@ -32,7 +51,7 @@ pub(crate) fn lint_arch(root: &Path) -> Result<()> {
         let relative = relative(root, &file);
         let normalized = relative.replace('\\', "/");
 
-        if normalized.starts_with("target/") || normalized.starts_with("external/") {
+        if is_lint_excluded_path(&normalized) {
             continue;
         }
         if let Some(finding) = lint_file_size(&normalized, &relative, &text) {
@@ -64,7 +83,7 @@ pub(crate) fn lint_docs(root: &Path) -> Result<()> {
 
     for file in files {
         let normalized = relative(root, &file).replace('\\', "/");
-        if normalized.contains("/archived/") || normalized.starts_with("external/") {
+        if normalized.contains("/archived/") || is_lint_excluded_path(&normalized) {
             continue;
         }
         let text = fs::read_to_string(&file).map_err(|err| format!("{}: {err}", file.display()))?;
@@ -214,6 +233,10 @@ fn count_stale_doc_mentions(text: &str) -> usize {
     .iter()
     .map(|term| text.matches(term).count())
     .sum()
+}
+
+fn is_lint_excluded_path(path: &str) -> bool {
+    path.starts_with("target/") || path.starts_with("external/") || path.starts_with("third_party/")
 }
 
 fn zone_policy_allowed(path: &str) -> bool {
@@ -394,18 +417,31 @@ fn unused_check_steps_for_targets<I>(
 where
     I: IntoIterator<Item = (TxTarget, Result<String>)>,
 {
-    let mut steps = vec![UnusedCheckStep {
-        name: "host workspace",
-        args: strings(["check", "--workspace"]),
-        skip_reason: None,
-    }];
+    let mut steps = AUTHORED_HOST_PACKAGES
+        .iter()
+        .map(|package| UnusedCheckStep {
+            name: package,
+            args: strings(["rustc", "-p", package, "--lib", "--", "-Dunused"]),
+            skip_reason: None,
+        })
+        .collect::<Vec<_>>();
 
     for (target, triple) in targets {
         let name = target.name();
         match triple {
             Ok(triple) if installed.contains(&triple) => steps.push(UnusedCheckStep {
                 name,
-                args: strings(["check", "-p", target.package(), "--target", &triple]),
+                args: strings([
+                    "rustc",
+                    "-p",
+                    target.package(),
+                    "--target",
+                    &triple,
+                    "--bin",
+                    target.package(),
+                    "--",
+                    "-Dunused",
+                ]),
                 skip_reason: None,
             }),
             Ok(triple) => steps.push(UnusedCheckStep {
@@ -429,27 +465,16 @@ fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
 }
 
 fn run_unused_check(root: &Path, args: &[String]) -> Result<()> {
-    let rustflags = unused_rustflags();
-    println!("$ RUSTFLAGS={} cargo {}", rustflags, shell_join(args));
+    println!("$ cargo {}", shell_join(args));
     let status = Command::new("cargo")
         .args(args)
         .current_dir(root)
-        .env("RUSTFLAGS", rustflags)
         .status()
         .map_err(|err| format!("failed to run cargo: {err}"))?;
     if status.success() {
         Ok(())
     } else {
         Err(format!("cargo exited with {status}"))
-    }
-}
-
-fn unused_rustflags() -> String {
-    let unused = "-Dunused";
-    match std::env::var("RUSTFLAGS") {
-        Ok(current) if current.split_whitespace().any(|flag| flag == unused) => current,
-        Ok(current) if !current.trim().is_empty() => format!("{current} {unused}"),
-        _ => unused.to_string(),
     }
 }
 
@@ -675,7 +700,7 @@ fn sym() -> usize {
     }
 
     #[test]
-    fn unused_lint_plan_checks_workspace_and_installed_targets() {
+    fn unused_lint_plan_checks_authored_packages_and_installed_targets() {
         let installed = std::collections::BTreeSet::from(["riscv64gc-unknown-none-elf".into()]);
         let steps = unused_check_steps_for_targets(
             &installed,
@@ -689,7 +714,8 @@ fn sym() -> usize {
         );
 
         assert!(steps.iter().any(|step| {
-            step.skip_reason.is_none() && step.args == vec!["check", "--workspace"]
+            step.skip_reason.is_none()
+                && step.args == vec!["rustc", "-p", "tx-kernel", "--lib", "--", "-Dunused"]
         }));
         assert!(steps.iter().any(|step| {
             step.skip_reason.is_none()

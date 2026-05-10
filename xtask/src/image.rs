@@ -4,7 +4,7 @@ use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 
-use crate::target::Profile;
+use crate::target::{Profile, TxTarget};
 use crate::util::{
     command_exists, option_value, optional_option_value, run_cmd_owned, run_shell, shell_escape,
 };
@@ -15,10 +15,15 @@ pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
         return Err("image command needs a kind: cpio, initramfs, or ext4".into());
     };
     let profile = Profile::parse(&option_value(&args[1..], "--profile")?)?;
+    let target = image_target(&args[1..])?;
     match (kind.as_str(), profile) {
-        ("cpio" | "initramfs", Profile::Busybox) => image_cpio_busybox(root),
-        ("ext4", Profile::Busybox) => image_ext4_busybox(root, &args[1..], "busybox-root.ext4"),
-        ("m1dock-sd", Profile::Busybox) => image_ext4_busybox(root, &args[1..], "m1dock-sd.img"),
+        ("cpio" | "initramfs", Profile::Busybox) => image_cpio_busybox(root, target),
+        ("ext4", Profile::Busybox) => {
+            image_ext4_busybox(root, &args[1..], target, "busybox-root.ext4")
+        }
+        ("m1dock-sd", Profile::Busybox) => {
+            image_ext4_busybox(root, &args[1..], target, "m1dock-sd.img")
+        }
         ("cpio" | "initramfs" | "ext4" | "m1dock-sd", Profile::Smoke) => {
             Err("image smoke profile is not defined; use --profile busybox".into())
         }
@@ -28,11 +33,18 @@ pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
     }
 }
 
-fn image_cpio_busybox(root: &Path) -> Result<()> {
+fn image_target(args: &[String]) -> Result<TxTarget> {
+    optional_option_value(args, "--target")
+        .map(|target| TxTarget::parse(&target))
+        .transpose()
+        .map(|target| target.unwrap_or(TxTarget::Rv64Qemu))
+}
+
+fn image_cpio_busybox(root: &Path, target: TxTarget) -> Result<()> {
     if !command_exists("cpio") {
         return Err("cpio is required to create the busybox initramfs".into());
     }
-    let layout = prepare_busybox_rootfs(root)?;
+    let layout = prepare_busybox_rootfs(root, target)?;
     let out = root
         .join("target")
         .join("images")
@@ -50,12 +62,17 @@ fn image_cpio_busybox(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn image_ext4_busybox(root: &Path, args: &[String], output_name: &str) -> Result<()> {
+fn image_ext4_busybox(
+    root: &Path,
+    args: &[String],
+    target: TxTarget,
+    output_name: &str,
+) -> Result<()> {
     if !command_exists("mkfs.ext4") {
         return Err("mkfs.ext4 is required to create the busybox ext4 image".into());
     }
     let size = optional_option_value(args, "--size").unwrap_or_else(|| "64M".to_string());
-    let layout = prepare_busybox_rootfs(root)?;
+    let layout = prepare_busybox_rootfs(root, target)?;
     let out = root.join("target").join("images").join(output_name);
     fs::create_dir_all(out.parent().expect("image path has parent"))
         .map_err(|err| err.to_string())?;
@@ -81,12 +98,26 @@ fn image_ext4_busybox(root: &Path, args: &[String], output_name: &str) -> Result
     Ok(())
 }
 
-/// Path of the in-tree vendored busybox binary used when `TX_BUSYBOX` is not
-/// set. Populated by `tools/images/fetch-busybox.sh`. Kept relative so the
-/// path printed in errors matches what's checked into the repo.
+/// RV64 in-tree vendored busybox used when `TX_BUSYBOX` is not set.
+///
+/// Populated by `tools/images/fetch-busybox.sh`. Kept relative so the path
+/// printed in errors matches what's checked into the repo.
 pub(crate) const VENDORED_BUSYBOX_RELPATH: &str = "tools/images/vendor/busybox-riscv64-musl";
 
-fn resolve_busybox(root: &Path) -> Result<PathBuf> {
+/// LA64 in-tree vendored busybox used when `TX_BUSYBOX` is not set.
+///
+/// Populated by `tools/images/build-busybox-loongarch64.sh`.
+pub(crate) const VENDORED_LA64_BUSYBOX_RELPATH: &str =
+    "tools/images/vendor/busybox-loongarch64-musl";
+
+pub(crate) fn vendored_busybox_relpath(target: TxTarget) -> &'static str {
+    match target {
+        TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => VENDORED_BUSYBOX_RELPATH,
+        TxTarget::La64Qemu => VENDORED_LA64_BUSYBOX_RELPATH,
+    }
+}
+
+fn resolve_busybox(root: &Path, target: TxTarget) -> Result<PathBuf> {
     if let Ok(value) = env::var("TX_BUSYBOX") {
         let busybox = PathBuf::from(value);
         if !busybox.is_file() {
@@ -97,19 +128,26 @@ fn resolve_busybox(root: &Path) -> Result<PathBuf> {
         }
         return Ok(busybox);
     }
-    let vendored = root.join(VENDORED_BUSYBOX_RELPATH);
+    let relpath = vendored_busybox_relpath(target);
+    let vendored = root.join(relpath);
     if vendored.is_file() {
         return Ok(vendored);
     }
+    let help = match target {
+        TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
+            "run `tools/images/fetch-busybox.sh` or set TX_BUSYBOX"
+        }
+        TxTarget::La64Qemu => "run `tools/images/build-busybox-loongarch64.sh` or set TX_BUSYBOX",
+    };
     Err(format!(
-        "TX_BUSYBOX is not set and vendored binary missing at {}; \
-         run `tools/images/fetch-busybox.sh` or set TX_BUSYBOX",
-        VENDORED_BUSYBOX_RELPATH
+        "TX_BUSYBOX is not set and vendored busybox for {} is missing at {}; {help}",
+        target.name(),
+        relpath
     ))
 }
 
-fn prepare_busybox_rootfs(root: &Path) -> Result<PathBuf> {
-    let busybox = resolve_busybox(root)?;
+fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
+    let busybox = resolve_busybox(root, target)?;
 
     let layout = root.join("target").join("rootfs").join("busybox-musl");
     if layout.exists() {
@@ -150,18 +188,17 @@ fn prepare_busybox_rootfs(root: &Path) -> Result<PathBuf> {
 
     #[cfg(unix)]
     {
-        for (name, target) in [
-            ("sh", "busybox"),
-            ("mount", "busybox"),
-            ("cat", "busybox"),
-            ("ls", "busybox"),
-            ("echo", "busybox"),
+        for name in [
+            "sh", "ls", "cat", "mkdir", "rm", "rmdir", "mv", "cp", "touch", "pwd", "echo", "ln",
+            "chmod", "chown", "uname", "ps", "kill", "grep", "find", "head", "tail", "wc", "sort",
+            "sed", "awk", "mount",
         ] {
             let path = layout.join("bin").join(name);
             if path.exists() {
                 fs::remove_file(&path).map_err(|err| err.to_string())?;
             }
-            unix_fs::symlink(target, path).map_err(|err| err.to_string())?;
+            fs::hard_link(layout.join("bin").join("busybox"), path)
+                .map_err(|err| err.to_string())?;
         }
 
         // Initramfs slice (2026-05-08): replace the shebang `/init`

@@ -22,6 +22,7 @@ fn seed_parent_trap_context(thread: &Cap<ThreadIdentity>) {
         regs,
         pc: 0x4000_2000,
         status: 0x123,
+        fp: tx_hal::UserFpContext::empty(),
     };
     thread
         .payload_cap()

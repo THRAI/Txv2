@@ -113,18 +113,14 @@ fn qemu_command(
         qemu_memory(target).to_string(),
         "-smp".to_string(),
         match target {
-            // Interactive runs default to single-hart so multi-hart
-            // serial interleaving doesn't garble shell output. The
-            // sentinel-watch test path keeps the original SMP=4 to
-            // exercise the AP boot path.
-            TxTarget::Rv64Qemu => {
-                if options.interactive {
-                    "1"
-                } else {
-                    "4"
-                }
+            TxTarget::Rv64Qemu => "4",
+            TxTarget::La64Qemu => {
+                // LA64's current boot path expects the QEMU virt SMP
+                // shape; Debian QEMU 8.2.2 can SIGSEGV with this kernel
+                // under `-smp 1`, including interactive runs.
+                "4"
             }
-            TxTarget::Rv64M1DockMock | TxTarget::La64Qemu => "1",
+            TxTarget::Rv64M1DockMock => "1",
         }
         .to_string(),
         "-display".to_string(),
@@ -184,10 +180,16 @@ fn qemu_command(
 
     if profile == Profile::Busybox && !options.no_block {
         args.push("-device".into());
-        if target == TxTarget::Rv64M1DockMock {
-            args.push("virtio-blk-device,drive=m1sd,bus=virtio-mmio-bus.0".into());
-        } else {
-            args.push("virtio-blk-device,drive=txblk0".into());
+        match target {
+            TxTarget::Rv64M1DockMock => {
+                args.push("virtio-blk-device,drive=m1sd,bus=virtio-mmio-bus.0".into());
+            }
+            TxTarget::La64Qemu => {
+                args.push("virtio-blk-pci,drive=txblk0".into());
+            }
+            TxTarget::Rv64Qemu => {
+                args.push("virtio-blk-device,drive=txblk0".into());
+            }
         }
         args.push("-drive".into());
         if target == TxTarget::Rv64M1DockMock {
@@ -603,8 +605,31 @@ mod tests {
         assert!(rendered.contains("-machine virt"));
         assert!(rendered.contains("-cpu la464"));
         assert!(rendered.contains("-m 1152M"));
-        assert!(rendered.contains("-smp 1"));
+        assert!(rendered.contains("-smp 4"));
         assert!(rendered.contains("-serial file:target/qemu-la64-qemu-smoke.serial.log"));
         assert!(rendered.contains("tx-kernel-loongarch64-qemu-virt"));
+    }
+
+    #[test]
+    fn la64_busybox_block_device_uses_pci_transport() {
+        let options = QemuOptions {
+            expect_sentinel: false,
+            timeout: Duration::from_secs(10),
+            no_block: false,
+            interactive: false,
+        };
+        let command = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::La64Qemu,
+            Profile::Busybox,
+            &options,
+        )
+        .unwrap();
+        let rendered = command.join(" ");
+
+        assert!(rendered.contains("-device virtio-blk-pci,drive=txblk0"));
+        assert!(!rendered.contains("virtio-blk-device,drive=txblk0"));
+        assert!(rendered
+            .contains("-drive file=target/images/busybox-root.ext4,format=raw,if=none,id=txblk0"));
     }
 }

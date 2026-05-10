@@ -1,12 +1,14 @@
 use super::la64_irq_trap::*;
 use super::la64_pmap::*;
 use super::platform_impls::{la64_copy_from_user_raw, la64_copy_to_user_raw};
+#[cfg(not(target_arch = "loongarch64"))]
+use super::platform_impls::{la64_host_uart_ier_for_test, la64_reset_host_uart_ier_for_test};
 use super::*;
 use core::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 use tx_hal::{
-    AllocError, AuxvIf, DmaAddr, DmaDirection, MemoryRegionKind, PmapError, PmapIf, PtNode,
-    PtNodeSourceKind,
+    AllocError, AuxvIf, DmaAddr, DmaDirection, FpSimdIf, MemoryRegionKind, PmapError, PmapIf,
+    PtNode, PtNodeSourceKind,
 };
 
 static TEST_PMAP_STATE_LOCK: Mutex<()> = Mutex::new(());
@@ -160,12 +162,49 @@ fn substrate_smoke_gate_is_enabled_and_uart_mmio_is_published() {
     );
     assert_eq!(<Platform as PlatformConfig>::PAGE_TABLE_LEVELS, 4);
     assert_eq!(<Platform as PlatformConfig>::ASID_BITS, 10);
-    assert_eq!(Platform::platform_info().mmio_regions.len(), 1);
+    assert_eq!(Platform::platform_info().mmio_regions.len(), 4);
     assert_eq!(Platform::platform_info().mmio_regions[0].name, "uart0");
     assert_eq!(
         Platform::platform_info().mmio_regions[0].virt.start,
         VirtAddr(la64_uncached_virt(QEMU_LA64_UART0_BASE))
     );
+}
+
+#[test]
+fn qemu_la64_pci_windows_are_published_for_virtio_pci_devices() {
+    let regions = Platform::platform_info().mmio_regions;
+    let pcie_ecam = regions
+        .iter()
+        .find(|region| region.name == "pcie-ecam")
+        .expect("pcie-ecam region");
+    let pcie_mmio32 = regions
+        .iter()
+        .find(|region| region.name == "pcie-mmio32")
+        .expect("pcie-mmio32 region");
+    let pch_msi = regions
+        .iter()
+        .find(|region| region.name == "pch-msi")
+        .expect("pch-msi region");
+
+    assert_eq!(pcie_ecam.phys.start, PhysAddr(QEMU_LA64_PCIE_ECAM_BASE));
+    assert_eq!(pcie_ecam.phys.size, QEMU_LA64_PCIE_ECAM_SIZE);
+    assert_eq!(
+        pcie_ecam.virt.start,
+        VirtAddr(la64_uncached_virt(QEMU_LA64_PCIE_ECAM_BASE))
+    );
+    assert!(pcie_ecam.flags.contains(MmioFlags::DEVICE_NGNRNE));
+    assert!(pcie_ecam.flags.contains(MmioFlags::READ));
+    assert!(pcie_ecam.flags.contains(MmioFlags::WRITE));
+
+    assert_eq!(pcie_mmio32.phys.start, PhysAddr(QEMU_LA64_PCIE_MMIO32_BASE));
+    assert_eq!(pcie_mmio32.phys.size, QEMU_LA64_PCIE_MMIO32_SIZE);
+    assert_eq!(
+        pcie_mmio32.virt.start,
+        VirtAddr(la64_uncached_virt(QEMU_LA64_PCIE_MMIO32_BASE))
+    );
+
+    assert_eq!(pch_msi.phys.start, PhysAddr(QEMU_LA64_PCH_MSI_BASE));
+    assert_eq!(pch_msi.phys.size, QEMU_LA64_PCH_MSI_SIZE);
 }
 
 #[test]
@@ -312,6 +351,7 @@ fn la64_restore_user_context_refreshes_cached_view_with_la64_abi() {
         regs: [0; 32],
         pc: 0x4000,
         status: 0,
+        fp: tx_hal::UserFpContext::empty(),
     };
     context.regs[LA64_R_SP] = 0x9000;
     context.regs[LA64_R_TLS] = 0x55aa;
@@ -336,6 +376,20 @@ fn la64_restore_user_context_refreshes_cached_view_with_la64_abi() {
     }
     assert_eq!(frame.prmd & LA64_PRMD_PPLV_MASK, LA64_PRMD_PPLV_USER);
     assert_ne!(frame.prmd & LA64_PRMD_PIE, 0);
+}
+
+#[test]
+fn la64_capture_user_context_host_path_reports_empty_fp_state() {
+    let frame = La64TrapFrame {
+        r: [0; 32],
+        estat: LA64_ECODE_SYS << LA64_ESTAT_ECODE_SHIFT,
+        era: 0x1000,
+        badv: 0,
+        crmd: 0,
+        prmd: LA64_PRMD_PPLV_USER | LA64_PRMD_PIE,
+    };
+    let captured = frame.capture_user_context();
+    assert_eq!(captured.fp, tx_hal::UserFpContext::empty());
 }
 
 #[test]
@@ -394,6 +448,24 @@ fn dispatch_syscall_advances_era_and_uses_la64_abi() {
 }
 
 #[test]
+fn dispatch_user_ipe_trap_enables_lazy_fp_and_retries() {
+    let mut frame = La64TrapFrame {
+        r: [0; 32],
+        estat: LA64_ECODE_IPE << LA64_ESTAT_ECODE_SHIFT,
+        era: 0x2000,
+        badv: 0,
+        crmd: 0,
+        prmd: LA64_PRMD_PPLV_USER | LA64_PRMD_PIE,
+    };
+
+    assert_eq!(
+        dispatch_trap_frame::<RecordingTrapSink>(&mut frame),
+        TrapAction::Resume
+    );
+    assert_eq!(frame.era, 0x2000);
+}
+
+#[test]
 fn la64_user_access_host_paths_report_faults_for_nonzero_copies() {
     let mut kernel = [0u8; 4];
     let user = [1u8; 4];
@@ -447,6 +519,7 @@ fn la64_signal_frame_layout_and_trampoline_are_stable() {
 
 #[test]
 fn la64_signal_frame_restore_uses_saved_user_context() {
+    la64_test_reset_restored_fp_context();
     let mut frame = La64TrapFrame {
         r: [0; 32],
         estat: LA64_ECODE_SYS << LA64_ESTAT_ECODE_SHIFT,
@@ -461,6 +534,14 @@ fn la64_signal_frame_restore_uses_saved_user_context() {
             regs: [0; 32],
             pc: 0x6000,
             status: 0,
+            fp: tx_hal::UserFpContext {
+                regs: [0xfeed_face_cafe_beef; 32],
+                fcsr: 0x1234,
+                fcc: 0x5a,
+                _reserved0: [0; 3],
+                flags: tx_hal::UserFpContext::FLAG_VALID | tx_hal::UserFpContext::FLAG_DIRTY,
+                _reserved1: 0,
+            },
         },
     };
     saved.user_context.regs[LA64_R_SP] = 0x7000;
@@ -474,6 +555,17 @@ fn la64_signal_frame_restore_uses_saved_user_context() {
     assert_eq!(frame.r[LA64_R_TLS], 0x88);
     assert_eq!(frame.r[LA64_R_A7], LA64_RT_SIGRETURN_SYSCALL as usize);
     assert_eq!(frame.prmd & LA64_PRMD_PPLV_MASK, LA64_PRMD_PPLV_USER);
+    assert_eq!(la64_test_restored_fp_context(), saved.user_context.fp);
+}
+
+#[test]
+fn la64_fpsimdif_initial_state_is_signal_frame_compatible() {
+    const {
+        assert!(<Platform as FpSimdIf>::SUPPORTED);
+    }
+    let state = <Platform as FpSimdIf>::init_state();
+    assert!(state.is_valid());
+    assert_eq!(state.flags & tx_hal::UserFpContext::FLAG_DIRTY, 0);
 }
 
 #[test]
@@ -484,7 +576,7 @@ fn la64_kernel_mmio_mapping_commits_through_pgdh_root() {
         Platform::install_pt_node_allocator(test_pmap_allocator),
         Ok(())
     );
-    let virt = VirtAddr(la64_uncached_virt(QEMU_LA64_UART0_PAGE_BASE + 0x1000));
+    let virt = VirtAddr(0xffff_8000_1fe0_1000);
     let phys = PhysAddr(QEMU_LA64_UART0_PAGE_BASE + 0x1000);
 
     let reservation = Platform::reserve_kernel_mapping(virt, phys, PmapReserveKind::Page4K)
@@ -493,7 +585,10 @@ fn la64_kernel_mmio_mapping_commits_through_pgdh_root() {
     assert!(reservation.intermediates().l2.is_some());
     assert!(reservation.intermediates().l1.is_some());
     assert!(reservation.intermediates().l0.is_some());
-    Platform::commit_kernel_mapping(reservation);
+    Platform::commit_kernel_mapping(
+        reservation,
+        PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+    );
 
     let pgdh = PhysAddr(LA64_KERNEL_PGDH_PHYS.load(Ordering::Acquire));
     let l0 = la64_l0_table_mut(pgdh, virt).expect("kernel L0");
@@ -514,6 +609,22 @@ fn la64_kernel_mmio_mapping_commits_through_pgdh_root() {
             VirtAddr(la64_uncached_virt(QEMU_LA64_UART0_PAGE_BASE)),
             PhysAddr(QEMU_LA64_UART0_PAGE_BASE),
             PmapReserveKind::Page4K,
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        Platform::reserve_kernel_mapping(
+            VirtAddr(la64_uncached_virt(QEMU_LA64_PCIE_ECAM_BASE)),
+            PhysAddr(QEMU_LA64_PCIE_ECAM_BASE),
+            PmapReserveKind::Superpage2M,
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        Platform::reserve_kernel_mapping(
+            VirtAddr(la64_uncached_virt(QEMU_LA64_PCIE_MMIO32_BASE)),
+            PhysAddr(QEMU_LA64_PCIE_MMIO32_BASE),
+            PmapReserveKind::Superpage2M,
         ),
         Ok(None)
     );
@@ -548,7 +659,7 @@ fn la64_kernel_superpage_mappings_prune_committed_intermediates() {
         Ok(())
     );
 
-    let virt_1g = VirtAddr(LA64_DMW_UNCACHED_BASE + 0x4000_0000);
+    let virt_1g = VirtAddr(0xffff_8000_4000_0000);
     let phys_1g = PhysAddr(0x4000_0000);
     let reservation_1g =
         Platform::reserve_kernel_mapping(virt_1g, phys_1g, PmapReserveKind::Superpage1G)
@@ -557,7 +668,10 @@ fn la64_kernel_superpage_mappings_prune_committed_intermediates() {
     assert!(reservation_1g.intermediates().l2.is_some());
     assert_eq!(reservation_1g.intermediates().l1, None);
     assert_eq!(reservation_1g.intermediates().l0, None);
-    Platform::commit_kernel_mapping(reservation_1g);
+    Platform::commit_kernel_mapping(
+        reservation_1g,
+        PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+    );
 
     let pgdh = PhysAddr(LA64_KERNEL_PGDH_PHYS.load(Ordering::Acquire));
     let leaf_1g =
@@ -595,7 +709,7 @@ fn la64_kernel_superpage_mappings_prune_committed_intermediates() {
         Ok(())
     );
 
-    let virt_2m = VirtAddr(LA64_DMW_UNCACHED_BASE + 0x200_0000);
+    let virt_2m = VirtAddr(0xffff_8000_0200_0000);
     let phys_2m = PhysAddr(0x200_0000);
     let reservation_2m =
         Platform::reserve_kernel_mapping(virt_2m, phys_2m, PmapReserveKind::Superpage2M)
@@ -604,7 +718,10 @@ fn la64_kernel_superpage_mappings_prune_committed_intermediates() {
     assert!(reservation_2m.intermediates().l2.is_some());
     assert!(reservation_2m.intermediates().l1.is_some());
     assert_eq!(reservation_2m.intermediates().l0, None);
-    Platform::commit_kernel_mapping(reservation_2m);
+    Platform::commit_kernel_mapping(
+        reservation_2m,
+        PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+    );
 
     let pgdh = PhysAddr(LA64_KERNEL_PGDH_PHYS.load(Ordering::Acquire));
     let leaf_2m =
@@ -636,7 +753,7 @@ fn la64_kernel_mapping_rollback_releases_uncommitted_tables() {
         Ok(())
     );
 
-    let virt = VirtAddr(LA64_DMW_UNCACHED_BASE + 0x6000_0000);
+    let virt = VirtAddr(0xffff_8000_6000_0000);
     let phys = PhysAddr(0x6000_0000);
     let reservation = Platform::reserve_kernel_mapping(virt, phys, PmapReserveKind::Page4K)
         .expect("reserve")
@@ -909,6 +1026,7 @@ fn cache_and_dma_paths_publish_qemu_coherent_defaults() {
 fn irq_dispatch_table_routes_handlers_and_masks_spurious() {
     TEST_IRQ_DISPATCHES.store(0, Ordering::Release);
     LA64_IRQ_DISPATCH_TABLE.store(0, Ordering::Release);
+    la64_reset_host_uart_ier_for_test();
     reset_la64_host_irq_controller_for_test();
     unsafe {
         core::ptr::write(
@@ -928,11 +1046,17 @@ fn irq_dispatch_table_routes_handlers_and_masks_spurious() {
         IrqHandled::Wake
     );
     assert_eq!(TEST_IRQ_DISPATCHES.load(Ordering::Acquire), 1);
+    assert_eq!(la64_host_uart_ier_for_test(), UART_IER_ERBFI);
     assert_eq!(<Platform as IrqIf>::dispatch_irq(67), IrqHandled::Done);
     <Platform as IrqIf>::complete(QEMU_LA64_UART0_IRQ);
     <Platform as IrqIf>::mask(QEMU_LA64_UART0_IRQ);
     <Platform as IrqIf>::unmask(QEMU_LA64_UART0_IRQ);
     <Platform as IrqIf>::set_priority(QEMU_LA64_UART0_IRQ, 1);
+}
+
+#[test]
+fn la64_platform_overrides_uart_irq_constant() {
+    assert_eq!(<Platform as IrqIf>::UART_IRQ, QEMU_LA64_UART0_IRQ);
 }
 
 #[test]

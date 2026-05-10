@@ -11,8 +11,12 @@ use alloc::vec::Vec;
 
 use std::sync::Mutex;
 
-use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
+use tx_subsystems::device::{
+    reset_block_registry_for_test, BlockDevice, BlockDeviceOps, BlockDeviceRegistration,
+    CharDeviceBinding, CharDeviceOps, DevT, PhysicalBlockNumber,
+};
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
+use tx_subsystems::page_backed::Frame;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::vfs::{Credential, DirCursor, FsObjectId, FsOps, RNodeBacking, StructPayload};
 
@@ -40,6 +44,50 @@ fn init_tty_zones() {
 struct CapturingOps {
     captured: Mutex<Vec<u8>>,
 }
+
+struct NoopBlockOps;
+
+impl BlockDeviceOps for NoopBlockOps {
+    fn read_blocks(
+        &self,
+        _block_id: PhysicalBlockNumber,
+        _target: &mut [Frame],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        StepOutcome::Done(())
+    }
+
+    fn write_blocks(
+        &self,
+        _block_id: PhysicalBlockNumber,
+        _source: &[Frame],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<()> {
+        StepOutcome::Done(())
+    }
+
+    fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<()> {
+        StepOutcome::Done(())
+    }
+}
+
+impl BlockDevice for NoopBlockOps {
+    fn total_blocks(&self) -> u64 {
+        1024
+    }
+
+    fn block_size(&self) -> u32 {
+        512
+    }
+}
+
+static NOOP_BLOCK_OPS: NoopBlockOps = NoopBlockOps;
+static VDA_REGISTRATION: BlockDeviceRegistration = BlockDeviceRegistration {
+    devt: DevT::new(254, 0),
+    name: "vda",
+    ops: &NOOP_BLOCK_OPS,
+};
+static BLOCK_REGISTRATIONS: &[&BlockDeviceRegistration] = &[&VDA_REGISTRATION];
 
 impl CapturingOps {
     fn new() -> Self {
@@ -333,5 +381,60 @@ fn devfs_readdir_yields_registered_aliases_and_terminates() {
     assert!(
         names.iter().any(|n| n == b"console"),
         "readdir should yield console; got {names:?}"
+    );
+}
+
+#[test]
+fn devfs_projects_registered_block_devices() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+    reset_block_registry_for_test();
+    let _ops = install_capturing_console();
+    assert_eq!(
+        tx_subsystems::device::register_block_devices(BLOCK_REGISTRATIONS),
+        StepOutcome::Done(())
+    );
+
+    let guard = tx_substrate::epoch::guard();
+    let devfs = Devfs::new();
+
+    let obj_id = match devfs.lookup(DEVFS_ROOT_OBJECT_ID, b"vda", &guard) {
+        StepOutcome::Done(id) => id,
+        other => panic!("devfs.lookup(vda) failed: {other:?}"),
+    };
+    let meta = match devfs.load_inode_meta(obj_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("devfs.load_inode_meta(vda) failed: {other:?}"),
+    };
+    assert_eq!(meta.kind(), tx_subsystems::vfs::InodeKind::BlockDevice);
+
+    let rnode = match devfs.materialise_rnode(obj_id, meta, &guard) {
+        StepOutcome::Done(rnode) => rnode,
+        other => panic!("devfs.materialise_rnode(vda) failed: {other:?}"),
+    };
+    match rnode.backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::BlockDevice(reg),
+        } => assert!(core::ptr::eq(*reg, &VDA_REGISTRATION)),
+        other => panic!("expected StructBacked::BlockDevice, got {other:?}"),
+    }
+
+    let mut cursor = DirCursor::START;
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    loop {
+        match devfs.readdir(DEVFS_ROOT_OBJECT_ID, cursor, &guard) {
+            StepOutcome::Done(Some((entry, next))) => {
+                names.push(entry.name.as_bytes().to_vec());
+                cursor = next;
+            }
+            StepOutcome::Done(None) => break,
+            other => panic!("readdir failed: {other:?}"),
+        }
+    }
+    assert!(
+        names.iter().any(|n| n == b"vda"),
+        "readdir should yield vda; got {names:?}"
     );
 }

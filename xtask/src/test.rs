@@ -5,9 +5,9 @@
 //!   - `smoke` (default): build the kernel for the given target and boot it
 //!     under qemu with `--expect-sentinel`. Mirrors `ci-slow`.
 //!   - `busybox-smoke`: same as `smoke` but additionally builds the busybox
-//!     cpio initramfs from the vendored riscv64 musl busybox and boots qemu
-//!     in the busybox profile. The kernel still emits the boot sentinel
-//!     before exec'ing /init, so we reuse the same sentinel contract.
+//!     cpio initramfs from the vendored musl busybox for the selected target
+//!     and boots qemu in the busybox profile. The kernel still emits the boot
+//!     sentinel before exec'ing /init, so we reuse the same sentinel contract.
 //!
 //! Both lanes accept `--target rv64-qemu` (default), `--timeout-ms N`, and
 //! `--dry-run`. `--dry-run` prints the qemu command line without running it.
@@ -70,13 +70,18 @@ fn smoke(root: &Path, target: TxTarget, rest: &[String], with_busybox: bool) -> 
     check_build::build_with_features(root, target.name(), features)?;
 
     let profile = if with_busybox {
-        println!("test: image cpio --profile busybox");
+        println!(
+            "test: image cpio --profile busybox --target {}",
+            target.name()
+        );
         image::image(
             root,
             vec![
                 "cpio".to_string(),
                 "--profile".to_string(),
                 "busybox".to_string(),
+                "--target".to_string(),
+                target.name().to_string(),
             ],
         )?;
         "busybox"

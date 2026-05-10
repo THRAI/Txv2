@@ -259,13 +259,14 @@ pub(crate) fn rollback_kernel_mapping(reservation: PmapReservation) {
     rollback_intermediates(reservation.virt(), reservation.intermediates());
 }
 
-pub(crate) fn commit_kernel_mapping(reservation: PmapReservation) {
+pub(crate) fn commit_kernel_mapping(reservation: PmapReservation, permissions: PmapPermissions) {
     assert_eq!(reservation.kind(), PmapReserveKind::Page4K);
     assert!(identity_low_mmio_mapping(
         reservation.virt(),
         reservation.phys()
     ));
-    let pte = leaf_pte(reservation.phys(), PTE_R | PTE_W | PTE_G | PTE_A | PTE_D);
+    validate_kernel_leaf_permissions(permissions).expect("valid kernel leaf permissions");
+    let pte = leaf_pte_with_permissions(reservation.phys(), permissions);
     let l0 = l0_table_for_virt(reservation.virt()).expect("reserved L0 table must exist");
     register_committed_intermediates(reservation.intermediates());
     l0.0[rv64_4k_leaf_index(reservation.virt().0)] = pte;

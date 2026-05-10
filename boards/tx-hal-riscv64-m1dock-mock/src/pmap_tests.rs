@@ -145,7 +145,10 @@ fn uart_neighbor_page_can_reserve_commit_and_become_precovered() {
     assert_eq!(reservation.phys(), phys);
     assert_eq!(reservation.kind(), PmapReserveKind::Page4K);
 
-    Platform::commit_kernel_mapping(reservation);
+    Platform::commit_kernel_mapping(
+        reservation,
+        PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+    );
     assert_eq!(
         Platform::reserve_kernel_mapping(virt, phys, PmapReserveKind::Page4K),
         Ok(None)
@@ -208,7 +211,10 @@ fn second_uart_window_allocates_l0_before_commit() {
     );
     assert_eq!(TEST_PT_ALLOCATIONS.load(Ordering::Acquire), 1);
 
-    Platform::commit_kernel_mapping(reservation);
+    Platform::commit_kernel_mapping(
+        reservation,
+        PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+    );
     assert_eq!(
         Platform::reserve_kernel_mapping(virt, phys, PmapReserveKind::Page4K),
         Ok(None)
@@ -235,7 +241,10 @@ fn unmap_prunes_committed_l0_and_releases_pt_node() {
     let reservation = Platform::reserve_kernel_mapping(virt, phys, PmapReserveKind::Page4K)
         .expect("reserve second UART window")
         .expect("second UART window should allocate L0");
-    Platform::commit_kernel_mapping(reservation);
+    Platform::commit_kernel_mapping(
+        reservation,
+        PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+    );
 
     let unmapped = Platform::unmap_kernel_mapping(virt, PmapReserveKind::Page4K)
         .expect("unmap second UART window")
@@ -272,7 +281,10 @@ fn protect_kernel_mapping_updates_leaf_and_reports_invalidation() {
     let reservation = Platform::reserve_kernel_mapping(virt, phys, PmapReserveKind::Page4K)
         .expect("reserve neighbor UART page")
         .expect("neighbor page should need a new leaf");
-    Platform::commit_kernel_mapping(reservation);
+    Platform::commit_kernel_mapping(
+        reservation,
+        PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+    );
 
     let invalidation =
         Platform::protect_kernel_mapping(virt, PmapReserveKind::Page4K, PmapPermissions::KERNEL_RO)

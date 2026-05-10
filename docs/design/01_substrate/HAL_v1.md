@@ -1732,8 +1732,9 @@ pub struct SignalFramePlacement {
 
 pub struct SavedSignalFrame {
     pub saved_mask: UserSignalMaskAbi,
-    // The platform-private saved register image is interpreted only by
-    // SignalFrameIf::restore_signal_frame.
+    pub user_context: UserTrapContext,
+    // `user_context.fp` carries the platform FPU/SIMD image when the
+    // platform implements FpSimdIf; platforms without FpSimdIf leave it empty.
 }
 ```
 
@@ -2435,7 +2436,7 @@ In v1 single-CPU builds:
 - `broadcast_ipi(mask, _)` asserts if `mask` has more than the current CPU bit set.
 - `park_this_cpu()` enters a low-power wait loop.
 
-This is enough to make the rest of the kernel work without conditional compilation around SMP-vs-uniprocessor. RV64 QEMU now exercises the SMP shape with `-smp 4`: DTB CPU discovery publishes `PlatformInfo.possible_cpu_count`, the platform starts APs through SBI HSM into a low trampoline, each AP installs early per-CPU state, initializes AP-local substrate epoch/zone state, installs the kernel trap vector, marks online, and enters a kernel-owned AP loop. That loop arms SSIP wakeup, waits with `wfi`, polls and acknowledges pending reschedule IPIs, and hands reschedule work back to reactor-owned runqueue draining. The pmap path can issue SBI RFENCE to those online APs, but final scheduler policy and kernel-managed IPI/ack shootdown remain deferred.
+This is enough to make the rest of the kernel work without conditional compilation around SMP-vs-uniprocessor. RV64 QEMU now exercises the SMP shape with `-smp 4`: DTB CPU discovery publishes `PlatformInfo.possible_cpu_count`, the platform starts APs through SBI HSM into a low trampoline, each AP installs early per-CPU state, initializes AP-local substrate epoch/zone state, installs the kernel trap vector, marks online, and enters a kernel-owned AP loop. That loop arms SSIP wakeup, waits with `wfi`, polls and acknowledges pending reschedule IPIs, and hands reschedule work back to reactor-owned runqueue draining. The pmap path can issue SBI RFENCE to those online APs, but final scheduler policy and kernel-managed IPI/ack shootdown remain deferred. LA64 QEMU virt now follows the same operational shape: firmware CPU topology is parsed from DTB, secondaries are started through IOCSR mailbox+IPI, APs mark online, and then park in the AP loop pending scheduler ownership.
 
 ---
 
@@ -2515,6 +2516,12 @@ This is acceptable for v1 boot/init scenarios (the init userspace, busybox witho
 <!-- txdoc:HAL-FPSIMDIF-OPTIONAL-WHERE-FPU-STATE-LIVES-1 -->
 
 When a platform does implement `FpSimdIf`, the FPU `State` is part of the per-thread context maintained by the scheduler/process subsystem. `TaskFrame` (the scheduler's per-thread struct) gets an `Option<<P as FpSimdIf>::State>` field. v1 keeps this `None`.
+
+For the signal ABI, the saved userspace trap image already includes a
+`UserFpContext` field. A platform with `FpSimdIf` must capture that field when
+building a signal frame and restore it during `sigreturn`; this keeps handler
+delivery from clobbering user floating-point state even before a fuller
+per-thread lazy-FPU ownership policy is introduced.
 
 ---
 

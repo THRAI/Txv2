@@ -11,7 +11,7 @@ use alloc::boxed::Box;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cred::{CapabilitySet, Cred};
-use crate::device::CharDeviceBinding;
+use crate::device::{BlockDeviceRegistration, CharDeviceBinding};
 use crate::execution::Errno;
 use crate::mount::{MountIdentity, MountPayload};
 use crate::page_backed::PageContainer;
@@ -443,6 +443,7 @@ pub enum RNodeBacking {
 pub enum StructPayload {
     Tty(Cap<TtyIdentity>),
     CharDevice(&'static CharDeviceBinding),
+    BlockDevice(&'static BlockDeviceRegistration),
     /// Anonymous pipe — `pipe2(2)`. `side` distinguishes the
     /// reader-end RNode from the writer-end RNode; both share a
     /// single `Cap<PipePayload>`. fd-ops Wave 3.

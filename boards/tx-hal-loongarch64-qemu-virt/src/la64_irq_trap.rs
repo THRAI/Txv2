@@ -1,7 +1,9 @@
 use super::la64_pmap::{
-    la64_cached_virt, la64_fixup_lookup, la64_kernel_addr_to_phys, la64_uncached_virt,
+    dmw_covers_phys_range, la64_cached_virt, la64_fixup_lookup, la64_kernel_addr_to_phys,
+    la64_uncached_virt,
 };
 use super::*;
+use crate::dtb::{parse_boot_info_from_fdt, DtbBootInfo};
 
 pub(crate) fn la64_extioi_claim() -> u32 {
     for word in 0..(LA64_EIOINTC_IRQS / u64::BITS) {
@@ -386,6 +388,27 @@ where
 {
     let class = classify_la64_trap(frame.estat);
     let from_user = frame.previous_mode() == TrapPreviousMode::User;
+    let ecode = (frame.estat >> LA64_ESTAT_ECODE_SHIFT) & LA64_ESTAT_ECODE_MASK;
+
+    // LA64 lazy-FPU first-use path: when user code traps with IPE
+    // (FPU disabled), materialise a clean per-thread FP context and
+    // retry the same instruction.
+    if from_user && ecode == LA64_ECODE_IPE {
+        let mut fp = UserFpContext::empty();
+        fp.flags = UserFpContext::FLAG_VALID;
+        la64_restore_fp_context(&fp);
+        return TrapAction::Resume;
+    }
+
+    if from_user && ecode == LA64_ECODE_ALE {
+        match super::la64_unaligned::emulate_user_unaligned(frame) {
+            super::la64_unaligned::UnalignedOutcome::Emulated => return TrapAction::Resume,
+            super::la64_unaligned::UnalignedOutcome::Unsupported => {}
+            super::la64_unaligned::UnalignedOutcome::Fault(fault) => {
+                return K::on_page_fault(frame.view_mut(), fault);
+            }
+        }
+    }
 
     match class {
         TrapClass::PageFault { write, instruction } => {
@@ -798,38 +821,67 @@ pub(crate) fn publish_static_boot_facts() {
         <Platform as PlatformConfig>::PAGE_SIZE,
     )
     .min(QEMU_LA64_RAM_END);
-    let usable_size = QEMU_LA64_RAM_END.saturating_sub(reserved_end);
+    let parsed_from_dtb = parse_firmware_boot_info(reserved_end);
+    let (memory_region_count, initrd, cmdline_len, timebase_frequency_hz, possible_cpu_count) =
+        parsed_from_dtb.unwrap_or_else(|| {
+            let usable_size = QEMU_LA64_RAM_END.saturating_sub(reserved_end);
+            unsafe {
+                let regions = core::ptr::addr_of_mut!(BOOT_MEMORY_REGIONS) as *mut MemoryRegion;
+                core::ptr::write(
+                    regions,
+                    MemoryRegion {
+                        base: PhysAddr(QEMU_LA64_RAM_BASE),
+                        size: reserved_end - QEMU_LA64_RAM_BASE,
+                        kind: MemoryRegionKind::Reserved,
+                    },
+                );
+                core::ptr::write(
+                    regions.add(1),
+                    MemoryRegion {
+                        base: PhysAddr(reserved_end),
+                        size: usable_size,
+                        kind: MemoryRegionKind::Usable,
+                    },
+                );
+            }
+
+            (
+                2usize,
+                None,
+                0usize,
+                la64_detect_timebase_frequency_hz(),
+                LA64_DEFAULT_POSSIBLE_CPUS,
+            )
+        });
+
+    LA64_TIMEBASE_HZ.store(timebase_frequency_hz, Ordering::Release);
+    LA64_POSSIBLE_CPU_COUNT.store(possible_cpu_count, Ordering::Release);
+
     let direct_map = VirtRange {
         start: VirtAddr(la64_cached_virt(QEMU_LA64_RAM_BASE)),
         size: QEMU_LA64_RAM_SIZE,
     };
+    let cmdline = if cmdline_len > 0 {
+        unsafe {
+            Some(core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+                core::ptr::addr_of!(BOOT_CMDLINE) as *const u8,
+                cmdline_len,
+            )))
+        }
+    } else {
+        None
+    };
 
     unsafe {
-        let regions = core::ptr::addr_of_mut!(BOOT_MEMORY_REGIONS) as *mut MemoryRegion;
-        core::ptr::write(
-            regions,
-            MemoryRegion {
-                base: PhysAddr(QEMU_LA64_RAM_BASE),
-                size: reserved_end - QEMU_LA64_RAM_BASE,
-                kind: MemoryRegionKind::Reserved,
-            },
-        );
-        core::ptr::write(
-            regions.add(1),
-            MemoryRegion {
-                base: PhysAddr(reserved_end),
-                size: usable_size,
-                kind: MemoryRegionKind::Usable,
-            },
-        );
+        let regions = core::ptr::addr_of!(BOOT_MEMORY_REGIONS) as *const MemoryRegion;
 
         core::ptr::write(
             core::ptr::addr_of_mut!(BOOT_INFO),
             BootInfo {
-                memory_regions: core::slice::from_raw_parts(regions, 2),
+                memory_regions: core::slice::from_raw_parts(regions, memory_region_count),
                 kernel_image,
-                initrd: None,
-                cmdline: None,
+                initrd,
+                cmdline,
             },
         );
 
@@ -855,7 +907,222 @@ pub(crate) fn publish_static_boot_facts() {
                 reserved_page_tables: &[],
             },
         );
+
+        (*core::ptr::addr_of_mut!(PLATFORM_INFO)).timebase_frequency_hz = timebase_frequency_hz;
+        (*core::ptr::addr_of_mut!(PLATFORM_INFO)).possible_cpu_count = possible_cpu_count;
     }
+
+    write_boot_facts_summary(
+        parsed_from_dtb.is_some(),
+        memory_region_count,
+        timebase_frequency_hz,
+        possible_cpu_count,
+        initrd,
+        cmdline,
+    );
+}
+
+fn parse_firmware_boot_info(
+    reserved_end: usize,
+) -> Option<(usize, Option<PhysRange>, usize, u64, usize)> {
+    let firmware_arg = LA64_BOOT_FIRMWARE_ARG.load(Ordering::Acquire);
+    if firmware_arg == 0 {
+        return None;
+    }
+
+    unsafe {
+        let mut dtb_memory_regions = [MemoryRegion {
+            base: PhysAddr(0),
+            size: 0,
+            kind: MemoryRegionKind::Reserved,
+        }; LA64_BOOT_MEMORY_REGION_CAPACITY];
+        let cmdline = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(BOOT_CMDLINE) as *mut u8,
+            LA64_BOOT_CMDLINE_CAPACITY,
+        );
+
+        if let Some(parsed) =
+            parse_dtb_boot_info_with_fallbacks(firmware_arg, &mut dtb_memory_regions, cmdline)
+        {
+            let memory_region_count = populate_boot_memory_regions_from_dtb(
+                &dtb_memory_regions,
+                parsed.memory_region_count,
+                reserved_end,
+            );
+            let cmdline_len = parsed.cmdline_len.min(cmdline.len());
+            let timebase_frequency_hz = parsed
+                .timebase_frequency_hz
+                .unwrap_or_else(la64_detect_timebase_frequency_hz);
+            let possible_cpu_count = parsed.possible_cpu_count.clamp(1, LA64_MAX_BOOT_CPUS);
+
+            return Some((
+                memory_region_count,
+                parsed.initrd,
+                cmdline_len,
+                timebase_frequency_hz,
+                possible_cpu_count,
+            ));
+        }
+    }
+
+    None
+}
+
+unsafe fn parse_dtb_boot_info_with_fallbacks(
+    firmware_arg: usize,
+    memory_regions: &mut [MemoryRegion],
+    cmdline: &mut [u8],
+) -> Option<DtbBootInfo> {
+    let parse = |addr: usize, memory: &mut [MemoryRegion], out: &mut [u8]| unsafe {
+        parse_boot_info_from_fdt(addr, memory, out)
+    };
+
+    if let Some(parsed) = parse(firmware_arg, memory_regions, cmdline) {
+        return Some(parsed);
+    }
+
+    let phys = la64_kernel_addr_to_phys(firmware_arg);
+    let cached_alias = la64_cached_virt(phys);
+    if cached_alias != firmware_arg {
+        if let Some(parsed) = parse(cached_alias, memory_regions, cmdline) {
+            return Some(parsed);
+        }
+    }
+
+    let uncached_alias = la64_uncached_virt(phys);
+    if uncached_alias != firmware_arg {
+        return parse(uncached_alias, memory_regions, cmdline);
+    }
+
+    None
+}
+
+unsafe fn populate_boot_memory_regions_from_dtb(
+    dtb_regions: &[MemoryRegion],
+    dtb_region_count: usize,
+    reserved_end: usize,
+) -> usize {
+    let out = core::ptr::addr_of_mut!(BOOT_MEMORY_REGIONS) as *mut MemoryRegion;
+    let mut out_count = 0usize;
+
+    core::ptr::write(
+        out.add(out_count),
+        MemoryRegion {
+            base: PhysAddr(QEMU_LA64_RAM_BASE),
+            size: reserved_end.saturating_sub(QEMU_LA64_RAM_BASE),
+            kind: MemoryRegionKind::Reserved,
+        },
+    );
+    out_count += 1;
+
+    for region in dtb_regions.iter().take(dtb_region_count) {
+        if out_count >= LA64_BOOT_MEMORY_REGION_CAPACITY {
+            break;
+        }
+
+        if region.kind != MemoryRegionKind::Usable || region.size == 0 {
+            continue;
+        }
+
+        let start = region.base.0;
+        let end = region
+            .base
+            .0
+            .saturating_add(region.size)
+            .min(QEMU_LA64_RAM_END);
+        if end <= start {
+            continue;
+        }
+
+        if end <= reserved_end {
+            continue;
+        }
+
+        let usable_start = start.max(reserved_end);
+        if usable_start >= end {
+            continue;
+        }
+
+        core::ptr::write(
+            out.add(out_count),
+            MemoryRegion {
+                base: PhysAddr(usable_start),
+                size: end - usable_start,
+                kind: MemoryRegionKind::Usable,
+            },
+        );
+        out_count += 1;
+    }
+
+    if out_count == 1
+        && out_count < LA64_BOOT_MEMORY_REGION_CAPACITY
+        && reserved_end < QEMU_LA64_RAM_END
+    {
+        core::ptr::write(
+            out.add(out_count),
+            MemoryRegion {
+                base: PhysAddr(reserved_end),
+                size: QEMU_LA64_RAM_END - reserved_end,
+                kind: MemoryRegionKind::Usable,
+            },
+        );
+        out_count += 1;
+    }
+
+    out_count
+}
+
+fn write_boot_facts_summary(
+    parsed_from_dtb: bool,
+    memory_region_count: usize,
+    timebase_frequency_hz: u64,
+    possible_cpu_count: usize,
+    initrd: Option<PhysRange>,
+    cmdline: Option<&str>,
+) {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        console_write_literal(b"txkernel:qemu-loongarch64-virt:bootinfo:");
+        if parsed_from_dtb {
+            console_write_literal(b"dtb");
+        } else {
+            console_write_literal(b"fallback");
+        }
+        console_write_literal(b":regions=");
+        console_write_decimal(memory_region_count);
+        console_write_literal(b":timebase-hz=");
+        console_write_decimal(timebase_frequency_hz as usize);
+        console_write_literal(b":cpus=");
+        console_write_decimal(possible_cpu_count);
+
+        if let Some(range) = initrd {
+            console_write_literal(b":initrd=0x");
+            console_write_hex(range.start.0);
+            console_write_literal(b"+0x");
+            console_write_hex(range.size);
+        } else {
+            console_write_literal(b":initrd=none");
+        }
+
+        if let Some(value) = cmdline {
+            console_write_literal(b":cmdline=\"");
+            Platform::write_bytes(value.as_bytes());
+            console_write_literal(b"\"");
+        } else {
+            console_write_literal(b":cmdline=none");
+        }
+        console_write_literal(b"\n");
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    let _ = (
+        parsed_from_dtb,
+        memory_region_count,
+        timebase_frequency_hz,
+        possible_cpu_count,
+        initrd,
+        cmdline,
+    );
 }
 
 pub(crate) fn linked_kernel_image() -> PhysRange {
@@ -907,7 +1174,5 @@ pub(crate) fn dmw_mmio_page_is_precovered(
     phys: PhysAddr,
     kind: PmapReserveKind,
 ) -> bool {
-    kind == PmapReserveKind::Page4K
-        && virt == VirtAddr(la64_uncached_virt(QEMU_LA64_UART0_PAGE_BASE))
-        && phys == PhysAddr(QEMU_LA64_UART0_PAGE_BASE)
+    virt == VirtAddr(la64_uncached_virt(phys.0)) && dmw_covers_phys_range(phys, kind.size())
 }

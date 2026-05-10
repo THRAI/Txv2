@@ -22,6 +22,35 @@ members = [
     "boards/tx-kernel-riscv64-m1dock-mock",
     "boards/tx-kernel-loongarch64-qemu-virt",
 ]
+exclude = [
+    "third_party/bitflags",
+    "third_party/embedded-io",
+    "third_party/enumn",
+    "third_party/proc-macro2",
+    "third_party/quote",
+    "third_party/safe-mmio",
+    "third_party/syn",
+    "third_party/thiserror",
+    "third_party/thiserror-impl",
+    "third_party/unicode-ident",
+    "third_party/virtio-drivers",
+    "third_party/zerocopy",
+    "third_party/zerocopy-derive",
+]
+
+[patch.crates-io]
+bitflags = { path = "third_party/bitflags" }
+embedded-io = { path = "third_party/embedded-io" }
+enumn = { path = "third_party/enumn" }
+safe-mmio = { path = "third_party/safe-mmio" }
+thiserror = { path = "third_party/thiserror" }
+thiserror-impl = { path = "third_party/thiserror-impl" }
+zerocopy = { path = "third_party/zerocopy" }
+zerocopy-derive = { path = "third_party/zerocopy-derive" }
+proc-macro2 = { path = "third_party/proc-macro2" }
+quote = { path = "third_party/quote" }
+syn = { path = "third_party/syn" }
+unicode-ident = { path = "third_party/unicode-ident" }
 
 [workspace.package]
 version = "0.1.0"

@@ -242,16 +242,22 @@ pub(super) fn rollback_kernel_mapping_from_bag<State>(
     sfence_vma_all();
 }
 
-pub(crate) fn commit_kernel_mapping(reservation: PmapReservation) {
-    commit_kernel_mapping_from_bag(BootStaticBag::<IdentityDropped>::global_ref(), reservation);
+pub(crate) fn commit_kernel_mapping(reservation: PmapReservation, permissions: PmapPermissions) {
+    commit_kernel_mapping_from_bag(
+        BootStaticBag::<IdentityDropped>::global_ref(),
+        reservation,
+        permissions,
+    );
 }
 
 pub(super) fn commit_kernel_mapping_from_bag<State>(
     bag: &BootStaticBag<State>,
     reservation: PmapReservation,
+    permissions: PmapPermissions,
 ) {
+    validate_rv64_leaf_permissions(permissions, false).expect("valid kernel leaf permissions");
     register_committed_intermediates(reservation.intermediates());
-    let pte = encode_kernel_mapping_leaf(reservation.phys());
+    let pte = encode_leaf_pte_with_permissions(reservation.phys(), permissions);
     match reservation.kind() {
         PmapReserveKind::Superpage1G => unsafe {
             bag.bootstrap_root_mut().0[rv64_1g_leaf_index(reservation.virt().0)] = pte;

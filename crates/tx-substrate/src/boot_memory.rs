@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use tx_hal::{
     BootInfo, BootstrapPmapInfo, MemoryRegionKind, MmioRegion, PhysAddr, PhysRange,
-    PmapReserveKind, Ppn, TxPlatform, VirtAddr, VirtRange,
+    PmapPermissions, PmapReserveKind, Ppn, TxPlatform, VirtAddr, VirtRange,
 };
 
 use crate::page_allocator::{
@@ -516,7 +516,10 @@ fn map_mmio_region<P: TxPlatform>(region: MmioRegion) -> Result<(), BootMemoryEr
         if let Some(reservation) = P::reserve_kernel_mapping(VirtAddr(virt), PhysAddr(phys), kind)
             .map_err(|_| BootMemoryError::PmapMappingFailed)?
         {
-            P::commit_kernel_mapping(reservation);
+            P::commit_kernel_mapping(
+                reservation,
+                PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+            );
         }
         phys = phys
             .checked_add(size)

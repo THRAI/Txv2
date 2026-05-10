@@ -420,6 +420,7 @@ impl Rv64TrapFrame {
             regs: self.x,
             pc: self.sepc,
             status: self.sstatus,
+            fp: tx_hal::UserFpContext::empty(),
         }
     }
 

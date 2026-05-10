@@ -13,3 +13,6 @@ doctest = false
 [dependencies]
 tx-subsystems = { path = "../tx-subsystems" }
 tx-substrate = { path = "../tx-substrate" }
+
+[dev-dependencies]
+tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }

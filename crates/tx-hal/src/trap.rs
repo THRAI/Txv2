@@ -128,10 +128,66 @@ impl TrapFrameView {
 /// the selected platform through `SignalFrameIf::restore_signal_frame`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserFpContext {
+    pub regs: [u64; 32],
+    pub fcsr: u32,
+    pub fcc: u8,
+    pub _reserved0: [u8; 3],
+    /// Bit 0: FP state valid. Bit 1: FP state dirty.
+    pub flags: u32,
+    pub _reserved1: u32,
+}
+
+impl UserFpContext {
+    pub const FLAG_VALID: u32 = 1 << 0;
+    pub const FLAG_DIRTY: u32 = 1 << 1;
+
+    pub const fn empty() -> Self {
+        Self {
+            regs: [0; 32],
+            fcsr: 0,
+            fcc: 0,
+            _reserved0: [0; 3],
+            flags: 0,
+            _reserved1: 0,
+        }
+    }
+
+    pub const fn is_valid(&self) -> bool {
+        self.flags & Self::FLAG_VALID != 0
+    }
+}
+
+impl Default for UserFpContext {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UserTrapContext {
     pub regs: [usize; 32],
     pub pc: usize,
     pub status: usize,
+    pub fp: UserFpContext,
+}
+
+impl UserTrapContext {
+    pub const fn empty() -> Self {
+        Self {
+            regs: [0; 32],
+            pc: 0,
+            status: 0,
+            fp: UserFpContext::empty(),
+        }
+    }
+}
+
+impl Default for UserTrapContext {
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

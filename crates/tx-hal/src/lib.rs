@@ -696,7 +696,7 @@ pub trait PmapIf {
 
     fn rollback_kernel_mapping(_reservation: PmapReservation) {}
 
-    fn commit_kernel_mapping(_reservation: PmapReservation) {}
+    fn commit_kernel_mapping(_reservation: PmapReservation, _permissions: PmapPermissions) {}
 
     fn unmap_kernel_mapping(
         _virt: VirtAddr,
@@ -797,7 +797,7 @@ pub mod trap;
 pub use trap::{
     FaultInfo, KernelTrapSink, SignalHandlerRegs, TrapAction, TrapClass, TrapFrameMut,
     TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, TrapSnapshot,
-    UserTrapContext,
+    UserFpContext, UserTrapContext,
 };
 
 // ---------------------------------------------------------------------------
@@ -826,6 +826,7 @@ unsafe impl Pod for i128 {}
 unsafe impl Pod for usize {}
 unsafe impl Pod for isize {}
 unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
+unsafe impl Pod for UserFpContext {}
 unsafe impl Pod for UserTrapContext {}
 
 // ---------------------------------------------------------------------------
@@ -974,6 +975,22 @@ pub trait SignalFrameIf: TrapIf {
     fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {
         tf.rewind_pc(4);
     }
+}
+
+pub trait FpSimdIf {
+    const SUPPORTED: bool;
+
+    type State: Default;
+
+    fn init_state() -> Self::State;
+
+    fn enable_for_current();
+
+    fn disable_for_current();
+
+    fn save(state: &mut Self::State);
+
+    fn restore(state: &Self::State);
 }
 /// Platform-supplied entropy. Used to seed the AT_RANDOM auxv
 /// region at exec time (`build_initial_user_stack` consumes

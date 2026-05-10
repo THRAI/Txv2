@@ -9,6 +9,12 @@ repository.workspace = true
 default = []
 std = []
 
+[dependencies]
+tx-hal = { path = "../tx-hal" }
+tx-substrate = { path = "../tx-substrate" }
+tx-subsystems = { path = "../tx-subsystems" }
+virtio-drivers = { path = "../../third_party/virtio-drivers", default-features = false }
+
 [lib]
 path = "src/lib.rs"
 doctest = false
