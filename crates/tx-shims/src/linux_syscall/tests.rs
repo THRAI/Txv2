@@ -29,7 +29,7 @@ use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use tx_subsystems::execution::{Guard, StepOutcome};
+use tx_subsystems::execution::Guard;
 use tx_subsystems::process::{bootstrap_init_process, ExitStatus, Pid, ProcessIdentity};
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
@@ -269,7 +269,7 @@ fn install_capturing_console() -> &'static CapturingOps {
     }));
     let guard = tx_substrate::epoch::guard();
     let tty = match register_hardware("shims-console-hw", 0, binding, &guard) {
-        StepOutcome::Done(tty) => tty,
+        tx_substrate::step_v3::StepOutcome::Done(tty) => tty,
         other => panic!("register_hardware failed: {other:?}"),
     };
     assert_eq!(

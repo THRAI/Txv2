@@ -313,7 +313,7 @@ pub fn step_fallocate(
 #[cfg(test)]
 mod v3_tests {
     use super::*;
-    use crate::execution::{Errno as V4Errno, StepOutcome as V4Outcome, WaitToken};
+    use crate::execution::{Errno as V4Errno, WaitToken};
     use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
     use crate::page_backed::{
         AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind, PageIndex,
@@ -345,11 +345,12 @@ mod v3_tests {
         last_offset: AtomicU64,
         last_truncate_size: AtomicU64,
         block_flush_after: Option<usize>,
-        truncate_outcome: V4Outcome<()>,
+        truncate_outcome: tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>,
     }
 
     impl LifecycleFs {
         fn new() -> Self {
+            use tx_substrate::step_v3::StepOutcome as V3;
             Self {
                 flushes: AtomicUsize::new(0),
                 fsyncs: AtomicUsize::new(0),
@@ -357,7 +358,7 @@ mod v3_tests {
                 last_offset: AtomicU64::new(0),
                 last_truncate_size: AtomicU64::new(0),
                 block_flush_after: None,
-                truncate_outcome: V4Outcome::Done(()),
+                truncate_outcome: V3::done(()),
             }
         }
 
@@ -369,22 +370,29 @@ mod v3_tests {
         }
 
         fn failing_truncate(errno: V4Errno) -> Self {
+            use tx_substrate::step_v3::StepOutcome as V3;
             Self {
-                truncate_outcome: V4Outcome::Err(errno),
+                truncate_outcome: V3::err(errno.into()),
                 ..Self::new()
             }
         }
 
         fn blocking_truncate(token: WaitToken) -> Self {
+            use tx_substrate::step_v3::StepOutcome as V3;
             Self {
-                truncate_outcome: V4Outcome::Blocked(token),
+                truncate_outcome: V3::yield_on_carrier(
+                    tx_substrate::step_v3::NoProgress,
+                    token.carrier(),
+                    token.interest(),
+                ),
                 ..Self::new()
             }
         }
 
         fn advancing_truncate() -> Self {
+            use tx_substrate::step_v3::StepOutcome as V3;
             Self {
-                truncate_outcome: V4Outcome::Advanced(()),
+                truncate_outcome: V3::continue_with(tx_substrate::step_v3::NoProgress),
                 ..Self::new()
             }
         }
@@ -554,21 +562,7 @@ mod v3_tests {
             self.last_object
                 .store(fs_object_id.as_u64(), Ordering::Release);
             self.last_truncate_size.store(new_size, Ordering::Release);
-            match self.truncate_outcome.clone() {
-                V4Outcome::Done(()) => V3Outcome::done(()),
-                V4Outcome::Advanced(()) => V3Outcome::continue_with(NoProgress),
-                V4Outcome::AdvancedThenBlocked((), token) => V3Outcome::yield_on_carrier(
-                    NoProgress,
-                    token.carrier(),
-                    token.interest(),
-                ),
-                V4Outcome::Blocked(token) => V3Outcome::yield_on_carrier(
-                    NoProgress,
-                    token.carrier(),
-                    token.interest(),
-                ),
-                V4Outcome::Err(errno) => V3Outcome::err(errno.into()),
-            }
+            self.truncate_outcome.clone()
         }
 
         fn fsync(

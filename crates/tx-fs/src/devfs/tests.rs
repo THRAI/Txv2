@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use std::sync::Mutex;
 
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use tx_subsystems::execution::{Guard, StepOutcome};
+use tx_subsystems::execution::Guard;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::vfs::{
     Credential, DirCursor, FsObjectId, FsOps, RNodeBacking, StructPayload,
@@ -91,7 +91,7 @@ fn install_capturing_console() -> &'static CapturingOps {
     }));
     let guard = tx_substrate::epoch::guard();
     let tty = match register_hardware("console-hw", 0, binding, &guard) {
-        StepOutcome::Done(tty) => tty,
+        V3Outcome::Done(tty) => tty,
         other => panic!("register_hardware failed: {other:?}"),
     };
     assert_eq!(

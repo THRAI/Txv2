@@ -7,7 +7,7 @@ use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
 use tx_substrate::zone::Cap;
 use tx_substrate::SpinMutex;
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use tx_subsystems::execution::{Guard, StepOutcome};
+use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::{
     self, MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
@@ -327,7 +327,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let guard = tx_substrate::epoch::guard();
         let tty = match register_hardware("console", 0, binding, &guard) {
-            StepOutcome::Done(tty) => tty,
+            tx_substrate::step_v3::StepOutcome::Done(tty) => tty,
             other => panic!("register_console_hardware: register_hardware failed: {other:?}"),
         };
         drop(guard);

@@ -15,7 +15,6 @@ use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 // `vfs::OpenFile::step_*`) refer to the v4 outcome type via the explicit
 // `crate::execution::StepOutcome` path or the `V4Out` alias below.
 use crate::execution::Guard;
-use crate::execution::StepOutcome as V4Out;
 use tx_substrate::step_v3::Errno;
 use tx_substrate::step_v3::StepOutcome;
 use crate::test_support::EPOCH_TEST_LOCK as TTY_ZONE_TEST_LOCK;
@@ -558,7 +557,7 @@ fn project_devfs_materializes_hardware_tty_and_console_alias() {
     let guard = tx_substrate::epoch::guard();
 
     let tty = match register_hardware("ttyS0", 0, &NOOP_BINDING, &guard) {
-        V4Out::Done(tty) => tty,
+        StepOutcome::Done(tty) => tty,
         other => panic!("register_hardware failed: {other:?}"),
     };
     assert_eq!(
@@ -596,7 +595,7 @@ fn project_open_devfs_tty_by_name_shares_identity_between_console_and_ttys0() {
     let guard = tx_substrate::epoch::guard();
 
     let tty = match register_hardware("ttyS0", 0, &NOOP_BINDING, &guard) {
-        V4Out::Done(tty) => tty,
+        StepOutcome::Done(tty) => tty,
         other => panic!("register_hardware failed: {other:?}"),
     };
     assert_eq!(
@@ -650,7 +649,7 @@ fn step_poll_hardware_input_ingests_uart_bytes_into_registered_console_tty() {
     }));
 
     let tty = match register_hardware("ttyS1", 1, binding, &guard) {
-        V4Out::Done(tty) => tty,
+        StepOutcome::Done(tty) => tty,
         other => panic!("register_hardware failed: {other:?}"),
     };
     assert_eq!(

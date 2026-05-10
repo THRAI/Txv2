@@ -1,11 +1,12 @@
 //! TTY execution hardware polling step tests.
 
 use alloc::boxed::Box;
+use tx_substrate::step_v3::StepOutcome;
 
 use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out, YieldShape};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use crate::execution::{Guard, StepOutcome};
+use crate::execution::Guard;
 use crate::tty::execution::{register_hardware, step_poll_hardware_input};
 use crate::tty::structure::{TtyKind, TtyPayload};
 
