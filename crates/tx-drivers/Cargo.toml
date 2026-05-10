@@ -13,7 +13,7 @@ std = []
 tx-hal = { path = "../tx-hal" }
 tx-substrate = { path = "../tx-substrate" }
 tx-subsystems = { path = "../tx-subsystems" }
-virtio-drivers = { path = "../../third_party/virtio-drivers", default-features = false }
+virtio-drivers = { version = "0.11.0", default-features = false }
 
 [lib]
 path = "src/lib.rs"
