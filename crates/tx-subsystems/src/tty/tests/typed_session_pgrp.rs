@@ -8,7 +8,7 @@ use tx_substrate::testing::init_host_for_test_once;
 use tx_substrate::zone::{self, Cap, PayloadCap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use crate::execution::{Guard, StepOutcome};
+use crate::execution::Guard;
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ExitStatus, Pgid};
 use crate::process::{
@@ -26,15 +26,24 @@ use crate::tty::structure::termios::TOSTOP;
 use crate::tty::structure::{SessionPgrp, TtyIdentity, TtyKind, TtyPayload};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
+use tx_substrate::step_v3::StepOutcome;
 
 struct NoopOps;
 
 impl CharDeviceOps for NoopOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
         StepOutcome::Done(0)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
         StepOutcome::Done(bytes.len())
     }
 }
@@ -335,7 +344,7 @@ fn step_read_for_process_posts_sigttin_to_background_caller_pgrp() {
     let mut out = [0u8; 1];
     assert_eq!(
         step_read_for_process(&tty, &mut out, &child, &guard),
-        StepOutcome::Err(crate::execution::Errno::EIO)
+        StepOutcome::Err(tx_substrate::step_v3::Errno::EIO)
     );
     assert!(leader_pending(&child, Signum::SIGTTIN));
 }
@@ -361,10 +370,13 @@ fn step_write_for_process_posts_sigttou_to_background_caller_pgrp() {
         other => panic!("tcsets failed: {other:?}"),
     }
 
-    assert_eq!(
-        step_write_for_process(&tty, b"x", &child, &guard),
-        StepOutcome::Err(crate::execution::Errno::EIO)
-    );
+    {
+        use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
+        assert_eq!(
+            step_write_for_process(&tty, b"x", &child, &guard),
+            V3Out::Err(V3Errno::EIO)
+        );
+    }
     assert!(leader_pending(&child, Signum::SIGTTOU));
 }
 

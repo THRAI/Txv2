@@ -4,24 +4,24 @@
 //! (the kernel's `init.rs` does the same wiring at boot) so the walker
 //! can be exercised without the full reactor + bootstrap state.
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
+use tx_substrate::step_v3::StepOutcome;
 
 use tx_substrate::zone::{self, Cap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::Guard;
 use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
-use crate::page_backed::{Frame, FsPageBacking};
 use crate::tty::execution::{register_console_alias, register_hardware};
 use crate::tty::structure::TtyIdentity;
 use crate::vfs::structure::{
-    Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
-    OpenFileFlags, RNode, RNodeBacking, S_IFDIR,
+    Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
+    RNodeBacking, S_IFDIR,
 };
 use crate::vfs::FsOps;
+use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
 
 use super::{step_open, step_walk, SYMLOOP_MAX};
 
@@ -30,12 +30,20 @@ use super::{step_open, step_walk, SYMLOOP_MAX};
 struct CapturingOps;
 
 impl CharDeviceOps for CapturingOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(0)
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> V3<usize, tx_substrate::step_v3::ByteProgress> {
+        V3::Done(0)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(bytes.len())
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> V3<usize, tx_substrate::step_v3::ByteProgress> {
+        V3::Done(bytes.len())
     }
 }
 
@@ -243,182 +251,15 @@ impl TestFs {
     }
 }
 
-impl FsOps for TestFs {
-    fn lookup(
-        &self,
-        parent: FsObjectId,
-        name: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<FsObjectId> {
-        let inner = self.inner.lock();
-        let Some(map) = inner.children.get(&parent) else {
-            return StepOutcome::Err(Errno::ENOTDIR);
-        };
-        match map.get(name) {
-            Some(id) => StepOutcome::Done(*id),
-            None => StepOutcome::Err(Errno::ENOENT),
-        }
-    }
-
-    fn load_inode_meta(
-        &self,
-        fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<InodeMeta> {
-        let inner = self.inner.lock();
-        let Some((kind, _, mode_low, uid, gid)) = inner.inodes.get(&fs_object_id) else {
-            return StepOutcome::Err(Errno::ENOENT);
-        };
-        // S_IFMT bits get OR-ed in by InodeMeta::new based on `kind`;
-        // the per-inode mode_low covers the rwx triplets + setuid/
-        // setgid bits the DAC slice tests exercise.
-        let mut meta = InodeMeta::new(*kind, *mode_low);
-        meta.uid = *uid;
-        meta.gid = *gid;
-        StepOutcome::Done(meta)
-    }
-
-    fn serialize_inode_meta(
-        &self,
-        _fs_object_id: FsObjectId,
-        _meta: &InodeMeta,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Done(())
-    }
-
-    fn create_inode(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn unlink(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn rename(
-        &self,
-        _old_parent: FsObjectId,
-        _old_name: &[u8],
-        _new_parent: FsObjectId,
-        _new_name: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn link(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn mkdir(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn rmdir(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn symlink(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _link_target: &[u8],
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn readdir(
-        &self,
-        _fs_object_id: FsObjectId,
-        _cursor: DirCursor,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
-        StepOutcome::Done(None)
-    }
-
-    fn destroy_inode(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-        StepOutcome::Done(())
-    }
-
-    fn read_link(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<Box<[u8]>> {
-        let inner = self.inner.lock();
-        match inner.inodes.get(&fs_object_id) {
-            Some((InodeKind::Symlink, Some(target), _, _, _)) => {
-                StepOutcome::Done(target.clone().into_boxed_slice())
-            }
-            Some(_) => StepOutcome::Err(Errno::EINVAL),
-            None => StepOutcome::Err(Errno::ENOENT),
-        }
-    }
-}
-
-impl FsPageBacking for TestFs {
-    fn fetch_page(
-        &self,
-        _fs_object_id: FsObjectId,
-        _offset: u64,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<Frame> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn flush_page(
-        &self,
-        _fs_object_id: FsObjectId,
-        _offset: u64,
-        _frame: &Frame,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn truncate(
-        &self,
-        _fs_object_id: FsObjectId,
-        _new_size: u64,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-        StepOutcome::Done(())
-    }
-}
+// Wave-9a `FsOps` + `FsPageBacking` impls + tests on `TestFs` live
+// in the sibling `v3` submodule (file: `walker/tests/v3.rs`) so this
+// file stays under the `cargo xtask lint arch` 1500-line authored-file
+// cap. The submodule has full visibility into `TestFs` via `super::`.
+mod v3;
+// Wave-9c end-to-end tests for `step_walk` / `step_open` live
+// alongside the wave-9a trait-impl tests. Same parent-module access
+// pattern (`use super::{TestFs, init_zones, block_on};`).
+mod v3_walker;
 
 // === fixture: rootfs + (optional) devfs at /dev =======================
 
@@ -435,8 +276,8 @@ fn build_rootfs() -> Topology {
     let root_id = FsObjectId::new(2);
 
     let payload = MountPayload::new_cap(
-        rootfs.clone() as Arc<dyn FsOps>,
-        rootfs.clone() as Arc<dyn FsPageBacking>,
+        rootfs.clone() as Arc<dyn crate::vfs::FsOps>,
+        rootfs.clone() as Arc<dyn crate::page_backed::FsPageBacking>,
         None,
         DevId::new(1),
         MountOptions::default(),
@@ -483,10 +324,7 @@ fn install_console_tty() -> Cap<TtyIdentity> {
         StepOutcome::Done(t) => t,
         other => panic!("register_hardware failed: {other:?}"),
     };
-    assert_eq!(
-        register_console_alias("console", tty.clone()),
-        StepOutcome::Done(())
-    );
+    assert_eq!(register_console_alias("console", tty.clone()), V3::Done(()));
     tty
 }
 
@@ -508,8 +346,8 @@ fn mount_devfs_at_dev(topo: &Topology) -> (Cap<MountIdentity>, Cap<TtyIdentity>)
     devfs.add_dir(devfs_root_id, b"consoledir");
 
     let dev_payload = MountPayload::new_cap(
-        devfs.clone() as Arc<dyn FsOps>,
-        devfs.clone() as Arc<dyn FsPageBacking>,
+        devfs.clone() as Arc<dyn crate::vfs::FsOps>,
+        devfs.clone() as Arc<dyn crate::page_backed::FsPageBacking>,
         None,
         DevId::new(2),
         MountOptions::default(),
@@ -595,7 +433,7 @@ fn step_walk_resolves_relative_path_within_rootfs() {
     ));
     drop(guard);
     let dentry = match outcome {
-        StepOutcome::Done(d) => d,
+        V3::Done(d) => d,
         other => panic!("expected Done, got {other:?}"),
     };
     assert_eq!(dentry.name().as_bytes(), b"bar");
@@ -624,7 +462,7 @@ fn step_walk_resolves_absolute_path_from_root() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => assert_eq!(d.name().as_bytes(), b"bar"),
+        V3::Done(d) => assert_eq!(d.name().as_bytes(), b"bar"),
         other => panic!("expected Done, got {other:?}"),
     }
 }
@@ -642,7 +480,10 @@ fn step_walk_returns_enoent_on_missing() {
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/nope", &cred, &guard));
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::ENOENT));
+    match outcome {
+        V3::Err(V3Errno::ENOENT) => {}
+        other => panic!("expected v3 Err(ENOENT), got {other:?}"),
+    }
 }
 
 #[test]
@@ -665,7 +506,10 @@ fn step_walk_returns_enotdir_on_trailing_slash_after_file() {
         &guard,
     ));
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::ENOTDIR));
+    match outcome {
+        V3::Err(V3Errno::ENOTDIR) => {}
+        other => panic!("expected v3 Err(ENOTDIR), got {other:?}"),
+    }
 }
 
 #[test]
@@ -688,7 +532,10 @@ fn step_walk_returns_enotdir_when_traversing_through_file() {
         &guard,
     ));
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::ENOTDIR));
+    match outcome {
+        V3::Err(V3Errno::ENOTDIR) => {}
+        other => panic!("expected v3 Err(ENOTDIR), got {other:?}"),
+    }
 }
 
 #[test]
@@ -714,7 +561,7 @@ fn step_walk_chases_relative_symlink_to_target() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => {
+        V3::Done(d) => {
             assert_eq!(d.rnode().fs_object_id(), target_id);
             assert_eq!(d.name().as_bytes(), b"realdir");
         }
@@ -741,7 +588,7 @@ fn step_walk_chases_absolute_symlink_from_root() {
     let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/jump", &cred, &guard));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => {
+        V3::Done(d) => {
             assert_eq!(d.rnode().fs_object_id(), bar_id);
             assert_eq!(d.name().as_bytes(), b"bar");
         }
@@ -784,7 +631,10 @@ fn step_walk_returns_eloop_after_41_hops() {
     let guard = tx_substrate::epoch::guard();
     let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/s0", &cred, &guard));
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::ELOOP));
+    match outcome {
+        V3::Err(V3Errno::ELOOP) => {}
+        other => panic!("expected v3 Err(ELOOP), got {other:?}"),
+    }
 }
 
 #[test]
@@ -800,14 +650,15 @@ fn step_walk_crosses_mount_point_at_dev() {
     // Find the rootfs's MountPayload Cap and the FsObjectId of /dev
     // on rootfs. These form the (parent_payload, child_fs_object_id)
     // key the walker consults via mount::mount_for.
-    let root_dev_id =
-        match topo
-            .rootfs
-            .lookup(FsObjectId::new(2), b"dev", &tx_substrate::epoch::guard())
-        {
-            StepOutcome::Done(id) => id,
-            other => panic!("rootfs lookup(dev) failed: {other:?}"),
-        };
+    let root_dev_id = match <TestFs as FsOps>::lookup(
+        &*topo.rootfs,
+        FsObjectId::new(2),
+        b"dev",
+        &tx_substrate::epoch::guard(),
+    ) {
+        V3::Done(id) => id,
+        other => panic!("rootfs lookup(dev) failed: {other:?}"),
+    };
     let rootfs_payload = topo
         .root_dentry
         .rnode()
@@ -830,7 +681,7 @@ fn step_walk_crosses_mount_point_at_dev() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => {
+        V3::Done(d) => {
             assert_eq!(d.name().as_bytes(), b"consoledir");
             // The terminal dentry's RNode lives on devfs, not
             // rootfs; its FsObjectId is in devfs's namespace
@@ -886,7 +737,7 @@ fn step_walk_owner_can_traverse_dir_with_owner_x_bit() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
+        V3::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
         other => panic!("expected Done(leaf), got {other:?}"),
     }
 }
@@ -916,7 +767,10 @@ fn step_walk_other_cannot_traverse_dir_without_other_x_bit() {
         &guard,
     ));
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::EACCES));
+    match outcome {
+        V3::Err(V3Errno::EACCES) => {}
+        other => panic!("expected v3 Err(EACCES), got {other:?}"),
+    }
 }
 
 #[test]
@@ -950,7 +804,7 @@ fn step_walk_dac_override_short_circuits_perm_check() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
+        V3::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
         other => panic!("expected Done(leaf) under DAC_OVERRIDE, got {other:?}"),
     }
 }
@@ -981,7 +835,7 @@ fn step_walk_group_match_uses_group_triplet() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
+        V3::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
         other => panic!("expected Done(leaf), got {other:?}"),
     }
 }
@@ -1022,7 +876,7 @@ fn step_open_caller_with_read_bit_succeeds() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(_) => {}
+        V3::Done(_) => {}
         other => panic!("expected Done, got {other:?}"),
     }
 }
@@ -1059,7 +913,10 @@ fn step_open_no_read_bit_returns_eacces() {
         &guard,
     ));
     drop(guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::EACCES));
+    match outcome {
+        V3::Err(V3Errno::EACCES) => {}
+        other => panic!("expected v3 Err(EACCES), got {other:?}"),
+    }
 }
 
 #[test]
@@ -1095,7 +952,7 @@ fn step_open_caller_with_write_bit_succeeds() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(_) => {}
+        V3::Done(_) => {}
         other => panic!("expected Done, got {other:?}"),
     }
 }
@@ -1139,7 +996,7 @@ fn step_open_dac_override_short_circuits() {
     ));
     drop(guard);
     match outcome {
-        StepOutcome::Done(_) => {}
+        V3::Done(_) => {}
         other => panic!("expected Done under DAC_OVERRIDE, got {other:?}"),
     }
 }
@@ -1172,7 +1029,7 @@ fn step_open_round_trips_to_directory_dentry() {
     ));
     drop(guard);
     let file = match outcome {
-        StepOutcome::Done(f) => f,
+        V3::Done(f) => f,
         other => panic!("expected Done(OpenFile), got {other:?}"),
     };
     let _ = file;

@@ -7,33 +7,60 @@
 
 use alloc::sync::Arc;
 
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::Guard;
 use crate::page_backed::FsPageBacking;
 use crate::tty;
+use tx_substrate::step_v3::{ByteProgress, Errno, NoProgress, StepOutcome};
 
 use super::structure::{
-    Credential, DirCursor, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileIoctl,
-    OpenFileIoctlCaller, OpenFileIoctlResult, RNodeBacking, StructPayload,
+    Credential, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileIoctl, OpenFileIoctlCaller,
+    OpenFileIoctlResult, RNodeBacking, StructPayload,
 };
 
-/// Filesystem backend trait. The boundary tx-ext4, tmpfs, devfs, etc.
-/// implement to provide namespace + page-backing operations.
+// === FsOps — emits step_v3 outcomes ==================================
+//
+// Per-method progress-type choice: every method in `FsOps` uses
+// `step_v3::NoProgress`. The trait surface is one-shot identity-side
+// queries / mutations (`lookup`, `mkdir`, `unlink`, …): the caller
+// asks one question per call, and the trait's contract has no
+// sub-operation accumulation (`readdir` returns one entry per call;
+// the caller composes by re-calling with the new cursor — the cursor
+// is a method input, not progress). Page-counting accumulators
+// (`PageProgress`) live on the page-backing trait surface
+// (`FsPageBacking`), where ops like `flush_page` genuinely move pages.
+// Cross-trait coupling: `FsOps::materialise_rnode` returns
+// `Cap<RNode>` and the caller (`walker`) routes between `FsOps` and
+// `FsPageBacking` via a single `MountPayload`.
+//
+// Doc tag: `txdoc:STEP-V2-OUTCOME-ALGEBRA-1` (closed four-variant
+// outcome).
+
+/// `FsOps` trait emitting `step_v3` outcomes.
+///
+/// 13 methods returning
+/// `tx_substrate::step_v3::StepOutcome<T, NoProgress>`. Defaults give
+/// projection-only / device-only backends `ENOSYS` without per-impl
+/// boilerplate.
 pub trait FsOps: Send + Sync + 'static {
-    fn lookup(&self, parent: FsObjectId, name: &[u8], guard: &Guard<'_>)
-        -> StepOutcome<FsObjectId>;
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress>;
 
     fn load_inode_meta(
         &self,
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
-    ) -> StepOutcome<InodeMeta>;
+    ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress>;
 
     fn serialize_inode_meta(
         &self,
         fs_object_id: FsObjectId,
         meta: &InodeMeta,
         guard: &Guard<'_>,
-    ) -> StepOutcome<()>;
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
 
     fn create_inode(
         &self,
@@ -42,7 +69,10 @@ pub trait FsOps: Send + Sync + 'static {
         mode: u16,
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)>;
+    ) -> tx_substrate::step_v3::StepOutcome<
+        (FsObjectId, InodeMeta),
+        tx_substrate::step_v3::NoProgress,
+    >;
 
     fn unlink(
         &self,
@@ -50,7 +80,7 @@ pub trait FsOps: Send + Sync + 'static {
         name: &[u8],
         target: FsObjectId,
         guard: &Guard<'_>,
-    ) -> StepOutcome<()>;
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
 
     fn rename(
         &self,
@@ -59,7 +89,7 @@ pub trait FsOps: Send + Sync + 'static {
         new_parent: FsObjectId,
         new_name: &[u8],
         guard: &Guard<'_>,
-    ) -> StepOutcome<()>;
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
 
     fn link(
         &self,
@@ -67,7 +97,7 @@ pub trait FsOps: Send + Sync + 'static {
         name: &[u8],
         target: FsObjectId,
         guard: &Guard<'_>,
-    ) -> StepOutcome<()>;
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
 
     fn mkdir(
         &self,
@@ -76,7 +106,10 @@ pub trait FsOps: Send + Sync + 'static {
         mode: u16,
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)>;
+    ) -> tx_substrate::step_v3::StepOutcome<
+        (FsObjectId, InodeMeta),
+        tx_substrate::step_v3::NoProgress,
+    >;
 
     fn rmdir(
         &self,
@@ -84,7 +117,7 @@ pub trait FsOps: Send + Sync + 'static {
         name: &[u8],
         target: FsObjectId,
         guard: &Guard<'_>,
-    ) -> StepOutcome<()>;
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
 
     fn symlink(
         &self,
@@ -93,110 +126,78 @@ pub trait FsOps: Send + Sync + 'static {
         link_target: &[u8],
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)>;
+    ) -> tx_substrate::step_v3::StepOutcome<
+        (FsObjectId, InodeMeta),
+        tx_substrate::step_v3::NoProgress,
+    >;
 
+    /// Per-call one-entry readdir. Cursor is a method input, not
+    /// progress — the caller composes multi-entry enumerations by
+    /// re-calling with the returned cursor. The trait surface is
+    /// `NoProgress`; if a later wave grows a multi-entry-per-call
+    /// `readdir` it should live on a new method (e.g. `readdir_batch`)
+    /// carrying `EntryProgress`.
     fn readdir(
         &self,
         fs_object_id: FsObjectId,
-        cursor: DirCursor,
+        cursor: super::structure::DirCursor,
         guard: &Guard<'_>,
-    ) -> StepOutcome<Option<(DirEntry, DirCursor)>>;
+    ) -> tx_substrate::step_v3::StepOutcome<
+        Option<(DirEntry, super::structure::DirCursor)>,
+        tx_substrate::step_v3::NoProgress,
+    >;
 
-    fn destroy_inode(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<()>;
+    fn destroy_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
 
-    /// Read a symlink's target bytes.
-    ///
-    /// The walker calls this when materialising an `RNode` for an
-    /// inode whose `load_inode_meta(...).kind() == InodeKind::Symlink`.
-    /// Returned bytes are substituted into the remaining path
-    /// component stream per `txdoc:VFS-CHECKS-RUN-WALKER-LOOP-1`.
-    ///
-    /// Default returns `Errno::ENOSYS` so backends that do not yet
-    /// support symlinks (devfs, devpts, projection-only filesystems)
-    /// inherit the right error without forcing a method-by-method
-    /// flood. tmpfs and ext4 override.
+    /// Read a symlink's target bytes. Default returns `ENOSYS` (parity
+    /// with [`FsOps::read_link`]).
     fn read_link(
         &self,
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
-    ) -> StepOutcome<alloc::boxed::Box<[u8]>> {
+    ) -> tx_substrate::step_v3::StepOutcome<
+        alloc::boxed::Box<[u8]>,
+        tx_substrate::step_v3::NoProgress,
+    > {
         let _ = (fs_object_id, guard);
-        StepOutcome::Err(Errno::ENOSYS)
+        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
     }
 
     /// Backend hook for materialising an `RNode` for a non-directory,
-    /// non-symlink inode.
-    ///
-    /// The walker handles `Directory` (always
-    /// `RNodeBacking::Directory`) and `Symlink` (via [`read_link`])
-    /// inline; everything else (regular files, char/block devices,
-    /// fifos, sockets) needs backend-specific materialisation
-    /// because the right backing depends on the filesystem:
-    ///
-    /// - tmpfs `Regular` → `RNodeBacking::PageBacked { pc }` over
-    ///   the inode's `Cap<PageContainer>`.
-    /// - devfs `CharDevice` → `RNodeBacking::StructBacked { Tty }`
-    ///   resolved through the TTY registry.
-    /// - ext4 `Regular` → `RNodeBacking::PageBacked { pc }` over a
-    ///   per-inode `Cap<PageContainer>` keyed by `(mount, fs_object_id)`.
-    ///
-    /// Default returns `Errno::ENOSYS` so backends that don't grow
-    /// the hook fall through cleanly.
-    ///
-    /// `meta` is the freshly-loaded inode meta. The walker passes
-    /// it so the backend can decide based on `meta.kind()`.
+    /// non-symlink inode. Default returns `ENOSYS` (parity with
+    /// [`FsOps::materialise_rnode`]).
     fn materialise_rnode(
         &self,
         fs_object_id: FsObjectId,
         meta: InodeMeta,
         guard: &Guard<'_>,
-    ) -> StepOutcome<tx_substrate::zone::Cap<crate::vfs::structure::RNode>> {
+    ) -> tx_substrate::step_v3::StepOutcome<
+        tx_substrate::zone::Cap<crate::vfs::structure::RNode>,
+        tx_substrate::step_v3::NoProgress,
+    > {
         let _ = (fs_object_id, meta, guard);
-        StepOutcome::Err(Errno::ENOSYS)
+        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
     }
 
-    /// Update the inode's mode bits. Backend enforces the POSIX
-    /// chmod-permission rule (caller must be the file owner OR carry
-    /// `CAP_FOWNER`); the walker has already validated the path.
-    /// `new_mode` carries the post-change mode bits *below* `S_IFMT`
-    /// (callers cannot mutate the file kind via chmod). The setuid /
-    /// setgid / sticky bits (`S_ISUID`, `S_ISGID`, `S_ISVTX`) are
-    /// part of `new_mode` and the backend preserves them per the
-    /// caller's request — Linux's silent-clear-`S_ISGID` semantic on
-    /// non-owner-group chmod is **out of scope** for this slice (see
-    /// the DAC + setuid plan §"chmod silent-clear"). Permission
-    /// failures return `Errno::EPERM`; not-found returns
-    /// `Errno::ENOENT`; read-only filesystems return `Errno::EROFS`.
-    ///
-    /// Default returns `Errno::ENOSYS` so backends that don't grow
-    /// the hook (e.g. projection-only backends) fall through cleanly.
-    /// Cites: `txdoc:VFS-CHECKS-PERMISSIONS-1`.
+    /// Update the inode's mode bits. Default returns `ENOSYS` (parity
+    /// with [`FsOps::step_chmod`]).
     fn step_chmod(
         &self,
         fs_object_id: FsObjectId,
         new_mode: u16,
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
         let _ = (fs_object_id, new_mode, cred, guard);
-        StepOutcome::Err(Errno::ENOSYS)
+        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
     }
 
-    /// Update the inode's `(uid, gid)`. `new_uid` / `new_gid` of
-    /// `None` mean "leave unchanged" (the syscall arm decodes
-    /// Linux's `(u32) -1` sentinel into `None`). Backend enforces
-    /// the POSIX chown rule: only `CAP_FOWNER` grants arbitrary
-    /// `(uid, gid)` changes; non-privileged callers may chown only
-    /// to their own `(uid, gid)`. The slice uses `CAP_FOWNER` rather
-    /// than `CAP_CHOWN` for symmetry with `step_chmod` and because
-    /// the trio's cap surface is intentionally lean. Linux's
-    /// silent-clear-`S_ISUID`/`S_ISGID` on chown by non-privileged
-    /// callers is honoured by the backend (matches LTP `chown03`).
-    /// Permission failures return `Errno::EPERM`; not-found returns
-    /// `Errno::ENOENT`; read-only filesystems return `Errno::EROFS`.
-    ///
-    /// Default returns `Errno::ENOSYS`.
-    /// Cites: `txdoc:VFS-CHECKS-PERMISSIONS-1`.
+    /// Update the inode's `(uid, gid)`. Default returns `ENOSYS`
+    /// (parity with [`FsOps::step_chown`]).
     fn step_chown(
         &self,
         fs_object_id: FsObjectId,
@@ -204,15 +205,21 @@ pub trait FsOps: Send + Sync + 'static {
         new_gid: Option<u32>,
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
         let _ = (fs_object_id, new_uid, new_gid, cred, guard);
-        StepOutcome::Err(Errno::ENOSYS)
+        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
     }
 }
 
 /// Filesystem driver output produced at mount time and consumed by Mount
 /// to build the mount payload. Per `TX_EXT4_PLAN_v1_2.md` §pub-types and
 /// `bringup_fs_specs_v_1` §root-output.
+///
+/// Backends populate `fs_ops` / `fs_page_backing` via the
+/// `fs_ops_arc` / `fs_page_backing_arc` factory methods on `Tmpfs`,
+/// `Devfs`, and `Ext4FsInstance`; the walker entry points
+/// (`step_walk` / `step_open`) route through these trait objects
+/// end-to-end.
 pub struct MountOutput {
     pub fs_ops: Arc<dyn FsOps>,
     pub fs_page_backing: Arc<dyn FsPageBacking>,
@@ -229,7 +236,7 @@ pub struct MountOutput {
 
 impl OpenFile {
     /// Dispatch a read against this file's RNode backing.
-    pub fn step_read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize> {
+    pub fn step_read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         if !self.flags.read {
             return StepOutcome::Err(Errno::EINVAL);
         }
@@ -282,7 +289,12 @@ impl OpenFile {
     /// `AdvancedThenBlocked` outcomes are reachable. The `Guard` is
     /// accepted for symmetry with the other `OpenFile::step_*`
     /// methods even though the body never crosses an EBR boundary.
-    pub fn step_lseek(&self, offset: i64, whence: u32, _guard: &Guard<'_>) -> StepOutcome<u64> {
+    pub fn step_lseek(
+        &self,
+        offset: i64,
+        whence: u32,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
         // Backing-driven dispatch: short-circuit non-seekable
         // backings before any arithmetic. Pipes / TTY / chardev are
         // ESPIPE regardless of whence (Linux's `lseek(2)` man page:
@@ -340,7 +352,7 @@ impl OpenFile {
     }
 
     /// Dispatch a write against this file's RNode backing.
-    pub fn step_write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize> {
+    pub fn step_write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         if !self.flags.write {
             return StepOutcome::Err(Errno::EINVAL);
         }
@@ -378,7 +390,7 @@ impl OpenFile {
         caller: OpenFileIoctlCaller<'_>,
         request: OpenFileIoctl<'_>,
         guard: &Guard<'_>,
-    ) -> StepOutcome<OpenFileIoctlResult> {
+    ) -> StepOutcome<OpenFileIoctlResult, NoProgress> {
         match self.rnode.backing() {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => step_tty_ioctl(tty, caller, request, guard),
@@ -401,135 +413,60 @@ fn step_tty_ioctl(
     caller: OpenFileIoctlCaller<'_>,
     request: OpenFileIoctl<'_>,
     guard: &Guard<'_>,
-) -> StepOutcome<OpenFileIoctlResult> {
-    match request {
-        OpenFileIoctl::Tcgets => match tty::execution::step_ioctl_tcgets(tty_id, guard) {
-            StepOutcome::Done(termios) => StepOutcome::Done(OpenFileIoctlResult::Termios(termios)),
-            StepOutcome::Advanced(termios) => {
-                StepOutcome::Advanced(OpenFileIoctlResult::Termios(termios))
-            }
-            StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
-            StepOutcome::AdvancedThenBlocked(termios, token) => {
-                StepOutcome::AdvancedThenBlocked(OpenFileIoctlResult::Termios(termios), token)
-            }
-            StepOutcome::Err(err) => StepOutcome::Err(err),
-        },
-        OpenFileIoctl::Tcsets { termios } => {
-            match tty::execution::step_ioctl_tcsets(tty_id, termios, guard) {
-                StepOutcome::Done(side_effect) => {
-                    StepOutcome::Done(OpenFileIoctlResult::SideEffect(side_effect))
-                }
-                StepOutcome::Advanced(side_effect) => {
-                    StepOutcome::Advanced(OpenFileIoctlResult::SideEffect(side_effect))
-                }
-                StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
-                StepOutcome::AdvancedThenBlocked(side_effect, token) => {
-                    StepOutcome::AdvancedThenBlocked(
-                        OpenFileIoctlResult::SideEffect(side_effect),
-                        token,
-                    )
-                }
-                StepOutcome::Err(err) => StepOutcome::Err(err),
+) -> StepOutcome<OpenFileIoctlResult, NoProgress> {
+    // v3 NoProgress outcomes are one-shot Done/Err (Yield/Continue
+    // unreachable for tty ioctl bodies today). Wrap each call's `Done`
+    // into the typed `OpenFileIoctlResult` constructor.
+    fn wrap_result<T>(
+        v3: StepOutcome<T, NoProgress>,
+        wrap: impl FnOnce(T) -> OpenFileIoctlResult,
+    ) -> StepOutcome<OpenFileIoctlResult, NoProgress> {
+        match v3 {
+            StepOutcome::Done(value) => StepOutcome::Done(wrap(value)),
+            StepOutcome::Err(e) => StepOutcome::Err(e),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                StepOutcome::Err(Errno::EIO)
             }
         }
-        OpenFileIoctl::Tiocgpgrp => match tty::execution::step_ioctl_tiocgpgrp(tty_id, guard) {
-            StepOutcome::Done(pgid) => StepOutcome::Done(OpenFileIoctlResult::Pgrp(pgid)),
-            StepOutcome::Advanced(pgid) => StepOutcome::Advanced(OpenFileIoctlResult::Pgrp(pgid)),
-            StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
-            StepOutcome::AdvancedThenBlocked(pgid, token) => {
-                StepOutcome::AdvancedThenBlocked(OpenFileIoctlResult::Pgrp(pgid), token)
-            }
-            StepOutcome::Err(err) => StepOutcome::Err(err),
-        },
-        OpenFileIoctl::Tiocspgrp { new_pgrp } => {
-            match tty::execution::step_ioctl_tiocspgrp_for_process(
+    }
+
+    match request {
+        OpenFileIoctl::Tcgets => wrap_result(
+            tty::execution::step_ioctl_tcgets(tty_id, guard),
+            OpenFileIoctlResult::Termios,
+        ),
+        OpenFileIoctl::Tcsets { termios } => wrap_result(
+            tty::execution::step_ioctl_tcsets(tty_id, termios, guard),
+            OpenFileIoctlResult::SideEffect,
+        ),
+        OpenFileIoctl::Tiocgpgrp => wrap_result(
+            tty::execution::step_ioctl_tiocgpgrp(tty_id, guard),
+            OpenFileIoctlResult::Pgrp,
+        ),
+        OpenFileIoctl::Tiocspgrp { new_pgrp } => wrap_result(
+            tty::execution::step_ioctl_tiocspgrp_for_process(
                 tty_id,
                 caller.process(),
                 new_pgrp,
                 guard,
-            ) {
-                StepOutcome::Done(side_effect) => {
-                    StepOutcome::Done(OpenFileIoctlResult::SideEffect(side_effect))
-                }
-                StepOutcome::Advanced(side_effect) => {
-                    StepOutcome::Advanced(OpenFileIoctlResult::SideEffect(side_effect))
-                }
-                StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
-                StepOutcome::AdvancedThenBlocked(side_effect, token) => {
-                    StepOutcome::AdvancedThenBlocked(
-                        OpenFileIoctlResult::SideEffect(side_effect),
-                        token,
-                    )
-                }
-                StepOutcome::Err(err) => StepOutcome::Err(err),
-            }
-        }
-        OpenFileIoctl::Tiocgwinsz => match tty::execution::step_ioctl_tiocgwinsz(tty_id, guard) {
-            StepOutcome::Done(winsize) => StepOutcome::Done(OpenFileIoctlResult::Winsize(winsize)),
-            StepOutcome::Advanced(winsize) => {
-                StepOutcome::Advanced(OpenFileIoctlResult::Winsize(winsize))
-            }
-            StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
-            StepOutcome::AdvancedThenBlocked(winsize, token) => {
-                StepOutcome::AdvancedThenBlocked(OpenFileIoctlResult::Winsize(winsize), token)
-            }
-            StepOutcome::Err(err) => StepOutcome::Err(err),
-        },
-        OpenFileIoctl::Tiocswinsz { winsize } => {
-            match tty::execution::step_ioctl_tiocswinsz(tty_id, winsize, guard) {
-                StepOutcome::Done(side_effect) => {
-                    StepOutcome::Done(OpenFileIoctlResult::SideEffect(side_effect))
-                }
-                StepOutcome::Advanced(side_effect) => {
-                    StepOutcome::Advanced(OpenFileIoctlResult::SideEffect(side_effect))
-                }
-                StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
-                StepOutcome::AdvancedThenBlocked(side_effect, token) => {
-                    StepOutcome::AdvancedThenBlocked(
-                        OpenFileIoctlResult::SideEffect(side_effect),
-                        token,
-                    )
-                }
-                StepOutcome::Err(err) => StepOutcome::Err(err),
-            }
-        }
-        OpenFileIoctl::Tiocsctty => {
-            match tty::execution::step_ioctl_tiocsctty_for_process(tty_id, caller.process(), guard)
-            {
-                StepOutcome::Done(side_effect) => {
-                    StepOutcome::Done(OpenFileIoctlResult::SideEffect(side_effect))
-                }
-                StepOutcome::Advanced(side_effect) => {
-                    StepOutcome::Advanced(OpenFileIoctlResult::SideEffect(side_effect))
-                }
-                StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
-                StepOutcome::AdvancedThenBlocked(side_effect, token) => {
-                    StepOutcome::AdvancedThenBlocked(
-                        OpenFileIoctlResult::SideEffect(side_effect),
-                        token,
-                    )
-                }
-                StepOutcome::Err(err) => StepOutcome::Err(err),
-            }
-        }
-        OpenFileIoctl::Tiocnotty => {
-            match tty::execution::step_ioctl_tiocnotty_for_process(tty_id, caller.process(), guard)
-            {
-                StepOutcome::Done(side_effect) => {
-                    StepOutcome::Done(OpenFileIoctlResult::SideEffect(side_effect))
-                }
-                StepOutcome::Advanced(side_effect) => {
-                    StepOutcome::Advanced(OpenFileIoctlResult::SideEffect(side_effect))
-                }
-                StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
-                StepOutcome::AdvancedThenBlocked(side_effect, token) => {
-                    StepOutcome::AdvancedThenBlocked(
-                        OpenFileIoctlResult::SideEffect(side_effect),
-                        token,
-                    )
-                }
-                StepOutcome::Err(err) => StepOutcome::Err(err),
-            }
-        }
+            ),
+            OpenFileIoctlResult::SideEffect,
+        ),
+        OpenFileIoctl::Tiocgwinsz => wrap_result(
+            tty::execution::step_ioctl_tiocgwinsz(tty_id, guard),
+            OpenFileIoctlResult::Winsize,
+        ),
+        OpenFileIoctl::Tiocswinsz { winsize } => wrap_result(
+            tty::execution::step_ioctl_tiocswinsz(tty_id, winsize, guard),
+            OpenFileIoctlResult::SideEffect,
+        ),
+        OpenFileIoctl::Tiocsctty => wrap_result(
+            tty::execution::step_ioctl_tiocsctty_for_process(tty_id, caller.process(), guard),
+            OpenFileIoctlResult::SideEffect,
+        ),
+        OpenFileIoctl::Tiocnotty => wrap_result(
+            tty::execution::step_ioctl_tiocnotty_for_process(tty_id, caller.process(), guard),
+            OpenFileIoctlResult::SideEffect,
+        ),
     }
 }

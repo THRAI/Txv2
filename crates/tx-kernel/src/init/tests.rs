@@ -360,7 +360,6 @@ fn boot_smoke_mounts_root_and_dev_and_resolves_console() {
 /// RNode is a `StructBacked { Tty(...) }` for the boot console.
 #[test]
 fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
-    use tx_subsystems::execution::StepOutcome;
     use tx_subsystems::vfs::{walker, Credential, RNodeBacking, StructPayload};
 
     let _serial = setup();
@@ -371,11 +370,12 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
     let cwd = init.cwd().expect("init cwd must be bound");
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
+    use tx_substrate::step_v3::StepOutcome as V3;
     let outcome = block_on(walker::step_walk(cwd, b"/dev/console", &cred, &guard));
     drop(guard);
 
     let dentry = match outcome {
-        StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
+        V3::Done(d) => d,
         other => {
             panic!("step_walk(/dev/console) must succeed after mount registration, got {other:?}",)
         }
@@ -423,7 +423,7 @@ fn boot_smoke_init_fds_preopened_to_console() {
     let stdout = init.fd(1).expect("fd 1");
     let guard = tx_substrate::epoch::guard();
     match stdout.step_write(b"hi\n", &guard) {
-        tx_subsystems::execution::StepOutcome::Done(written) => {
+        tx_substrate::step_v3::StepOutcome::Done(written) => {
             assert_eq!(written, 3, "step_write reports the requested byte count");
         }
         other => panic!("fd 1 step_write failed: {other:?}"),
@@ -1306,7 +1306,7 @@ fn boot_smoke_setuid_exec_seeds_post_setuid_euid_and_at_secure() {
 /// vs `/init`) and (b) the post-creation chown + chmod to install
 /// the setuid mode + non-root owner.
 fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
-    use tx_subsystems::execution::StepOutcome;
+    use tx_substrate::step_v3::StepOutcome;
     use tx_subsystems::vfs::{Credential, RNodeBacking, S_ISUID};
 
     let root_mount =
@@ -1386,7 +1386,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     {
         let guard = tx_substrate::epoch::guard();
         match fs_page_backing.truncate(file_id, size, &guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+            StepOutcome::Done(()) => {}
             other => panic!("register_setuid_fixture: truncate({size}): {other:?}"),
         }
     }
@@ -1397,7 +1397,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     {
         let guard = tx_substrate::epoch::guard();
         match fs_ops.step_chown(file_id, Some(file_uid), Some(file_gid), &cred, &guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+            StepOutcome::Done(()) => {}
             other => {
                 panic!("register_setuid_fixture: step_chown({file_uid}, {file_gid}): {other:?}")
             }
@@ -1413,7 +1413,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     {
         let guard = tx_substrate::epoch::guard();
         match fs_ops.step_chmod(file_id, new_mode, &cred, &guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+            StepOutcome::Done(()) => {}
             other => panic!("register_setuid_fixture: step_chmod({new_mode:#o}): {other:?}"),
         }
     }

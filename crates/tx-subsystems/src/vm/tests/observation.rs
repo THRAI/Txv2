@@ -220,7 +220,7 @@ fn vm_msync_is_done_for_anon_only_address_space() {
     let guard = tx_substrate::epoch::guard();
     assert_eq!(
         aspace.msync(range(0x14000, 2), &guard),
-        crate::execution::StepOutcome::Done(())
+        tx_substrate::step_v3::StepOutcome::Done(())
     );
 }
 
@@ -240,6 +240,6 @@ fn vm_msync_skips_anon_page_containers_and_returns_done() {
     let guard = tx_substrate::epoch::guard();
     assert_eq!(
         aspace.msync(range(0x16000, 2), &guard),
-        crate::execution::StepOutcome::Done(())
+        tx_substrate::step_v3::StepOutcome::Done(())
     );
 }

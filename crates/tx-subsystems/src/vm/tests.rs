@@ -1,5 +1,4 @@
 use super::*;
-use crate::execution::StepOutcome;
 use crate::page_backed::PageContainer;
 use crate::test_support::EPOCH_TEST_LOCK;
 use alloc::collections::BTreeMap;
@@ -1216,7 +1215,10 @@ fn vm_aspace_reserve_user_range_for_access_publishes_private_anon_pages() {
 
     let outcome =
         aspace.reserve_user_range_for_access(range(0x10000, 3), crate::vm::UserAccessKind::Write);
-    assert!(matches!(outcome, StepOutcome::Done(())));
+    assert!(matches!(
+        outcome,
+        tx_substrate::step_v3::StepOutcome::Done(())
+    ));
     for page in [UserPage(0x10), UserPage(0x11), UserPage(0x12)] {
         let snap = aspace
             .pmap()
@@ -1262,7 +1264,10 @@ fn vm_aspace_reserve_user_range_for_access_returns_efault_for_unmapped() {
 
     let outcome =
         aspace.reserve_user_range_for_access(range(0x30000, 1), crate::vm::UserAccessKind::Read);
-    assert_eq!(outcome, StepOutcome::Err(crate::execution::Errno::EFAULT));
+    assert_eq!(
+        outcome,
+        tx_substrate::step_v3::StepOutcome::err(crate::execution::Errno::EFAULT.into())
+    );
     assert_eq!(aspace.pmap().stats().mapped_pages, 0);
 }
 
@@ -1284,7 +1289,10 @@ fn vm_aspace_reserve_user_range_for_access_propagates_prot_mismatch_efault() {
 
     let outcome =
         aspace.reserve_user_range_for_access(range(0x40000, 1), crate::vm::UserAccessKind::Write);
-    assert_eq!(outcome, StepOutcome::Err(crate::execution::Errno::EFAULT));
+    assert_eq!(
+        outcome,
+        tx_substrate::step_v3::StepOutcome::err(crate::execution::Errno::EFAULT.into())
+    );
 }
 
 #[test]
@@ -1313,7 +1321,7 @@ fn vm_aspace_copy_from_user_consistent_with_prior_copy_to_user_for_private_anon(
     let dst = tx_hal::UserPtr::<u8>::new(user_va);
     let payload: alloc::vec::Vec<u8> = (0u8..200).collect();
     match aspace.copy_to_user(dst, &payload, &guard) {
-        StepOutcome::Done(n) => assert_eq!(n, payload.len()),
+        tx_substrate::step_v3::StepOutcome::Done(n) => assert_eq!(n, payload.len()),
         other => panic!("copy_to_user expected Done, got {other:?}"),
     }
 
@@ -1328,7 +1336,7 @@ fn vm_aspace_copy_from_user_consistent_with_prior_copy_to_user_for_private_anon(
     let mut readback = alloc::vec![0u8; payload.len()];
     let src = tx_hal::UserPtr::<u8>::new(user_va);
     match aspace.copy_from_user(&mut readback, src, &guard) {
-        StepOutcome::Done(n) => assert_eq!(n, payload.len()),
+        tx_substrate::step_v3::StepOutcome::Done(n) => assert_eq!(n, payload.len()),
         other => panic!("copy_from_user expected Done, got {other:?}"),
     }
     assert_eq!(readback, payload, "readback must match prior write");

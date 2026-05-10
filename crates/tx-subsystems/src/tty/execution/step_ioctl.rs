@@ -4,7 +4,7 @@ use core::sync::atomic::Ordering;
 
 use tx_substrate::zone::Cap;
 
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::{Errno, Guard};
 use crate::signal::{self, DispatchOutcome, SigDisposition, Signum};
 use crate::tty::checks::{require_live_tty, require_session_leader};
 use crate::tty::execution::{TTY_READABLE, TTY_WRITABLE};
@@ -295,17 +295,19 @@ pub fn step_ioctl_tiocsctty(
     tty: &Cap<TtyIdentity>,
     caller: IoctlCaller,
     guard: &Guard<'_>,
-) -> StepOutcome<IoctlSideEffect> {
+) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
+
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     if let Err(err) = require_session_leader(caller) {
-        return StepOutcome::Err(err);
+        return V3::Err(err.into());
     }
     if tty.session_pgrp().is_some() {
-        return StepOutcome::Err(Errno::EBUSY);
+        return V3::Err(Errno::EBUSY.into());
     }
 
     tty.bind_session_pgrp(SessionPgrp::from_raw_ids(
@@ -315,7 +317,7 @@ pub fn step_ioctl_tiocsctty(
     ));
     tty.session_ctl_port.fire(SessionCtlEvent::Bound as u64);
 
-    StepOutcome::Done(IoctlSideEffect {
+    V3::Done(IoctlSideEffect {
         session_ctl_fired: true,
         signal: None,
     })
@@ -327,22 +329,24 @@ pub fn step_ioctl_tiocsctty_for_process(
     tty: &Cap<TtyIdentity>,
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
-) -> StepOutcome<IoctlSideEffect> {
+) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
+
     let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     if let Err(err) = require_session_leader(caller_info) {
-        return StepOutcome::Err(err);
+        return V3::Err(err.into());
     }
     if tty.session_pgrp().is_some() {
-        return StepOutcome::Err(Errno::EBUSY);
+        return V3::Err(Errno::EBUSY.into());
     }
 
     let pgrp = caller.pgrp_cap();
@@ -351,7 +355,7 @@ pub fn step_ioctl_tiocsctty_for_process(
     *session.controlling_tty.lock() = Some(tty.downgrade());
     tty.session_ctl_port.fire(SessionCtlEvent::Bound as u64);
 
-    StepOutcome::Done(IoctlSideEffect {
+    V3::Done(IoctlSideEffect {
         session_ctl_fired: true,
         signal: None,
     })
@@ -361,22 +365,24 @@ pub fn step_ioctl_tiocnotty(
     tty: &Cap<TtyIdentity>,
     caller: IoctlCaller,
     guard: &Guard<'_>,
-) -> StepOutcome<IoctlSideEffect> {
+) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
+
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     let Some(binding) = tty.session_pgrp() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::Err(Errno::EINVAL.into());
     };
     if binding.session_id != caller.session_id {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::Err(Errno::EINVAL.into());
     }
 
     tty.clear_session_pgrp();
     tty.session_ctl_port.fire(SessionCtlEvent::Detached as u64);
-    StepOutcome::Done(IoctlSideEffect {
+    V3::Done(IoctlSideEffect {
         session_ctl_fired: true,
         signal: None,
     })
@@ -388,30 +394,32 @@ pub fn step_ioctl_tiocnotty_for_process(
     tty: &Cap<TtyIdentity>,
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
-) -> StepOutcome<IoctlSideEffect> {
+) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
+
     let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     let pgrp = caller.pgrp_cap();
     let session = pgrp.session_cap();
     let Some(binding) = tty.session_pgrp() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::Err(Errno::EINVAL.into());
     };
     if binding.session_id != caller_info.session_id {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::Err(Errno::EINVAL.into());
     }
 
     tty.clear_session_pgrp();
     *session.controlling_tty.lock() = None;
     tty.session_ctl_port.fire(SessionCtlEvent::Detached as u64);
-    StepOutcome::Done(IoctlSideEffect {
+    V3::Done(IoctlSideEffect {
         session_ctl_fired: true,
         signal: None,
     })
@@ -422,24 +430,26 @@ pub fn step_ioctl_tiocspgrp(
     caller: IoctlCaller,
     new_pgrp: u32,
     guard: &Guard<'_>,
-) -> StepOutcome<IoctlSideEffect> {
+) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
+
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     let Some(mut binding) = tty.session_pgrp() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::Err(Errno::EINVAL.into());
     };
     if binding.session_id != caller.session_id {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::Err(Errno::EINVAL.into());
     }
 
     binding.foreground_pgid = new_pgrp;
     tty.bind_session_pgrp(binding);
     tty.session_ctl_port
         .fire(SessionCtlEvent::ForegroundChanged as u64);
-    StepOutcome::Done(IoctlSideEffect {
+    V3::Done(IoctlSideEffect {
         session_ctl_fired: true,
         signal: None,
     })
@@ -452,56 +462,66 @@ pub fn step_ioctl_tiocspgrp_for_process(
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     new_pgrp: &Cap<crate::process::structure::ProcessGroup>,
     guard: &Guard<'_>,
-) -> StepOutcome<IoctlSideEffect> {
+) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
+
     let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     let caller_session = caller.pgrp_cap().session_cap();
     if new_pgrp.session_cap().key() != caller_session.key() {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::Err(Errno::EINVAL.into());
     }
 
     let Some(binding) = tty.session_pgrp() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::Err(Errno::EINVAL.into());
     };
     if binding.session_id != caller_info.session_id {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::Err(Errno::EINVAL.into());
     }
 
     tty.bind_session_pgrp_typed(&caller_session, new_pgrp);
     tty.session_ctl_port
         .fire(SessionCtlEvent::ForegroundChanged as u64);
-    StepOutcome::Done(IoctlSideEffect {
+    V3::Done(IoctlSideEffect {
         session_ctl_fired: true,
         signal: None,
     })
 }
 
-pub fn step_ioctl_tiocgpgrp(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<u32> {
+pub fn step_ioctl_tiocgpgrp(
+    tty: &Cap<TtyIdentity>,
+    guard: &Guard<'_>,
+) -> tx_substrate::step_v3::StepOutcome<u32, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     match tty.session_pgrp() {
-        Some(binding) => StepOutcome::Done(binding.foreground_pgid),
-        None => StepOutcome::Err(Errno::EINVAL),
+        Some(binding) => V3::Done(binding.foreground_pgid),
+        None => V3::Err(Errno::EINVAL.into()),
     }
 }
 
-pub fn step_ioctl_tiocgwinsz(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<Winsize> {
+pub fn step_ioctl_tiocgwinsz(
+    tty: &Cap<TtyIdentity>,
+    guard: &Guard<'_>,
+) -> tx_substrate::step_v3::StepOutcome<Winsize, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
-    StepOutcome::Done(Winsize::from_u64(
+    V3::Done(Winsize::from_u64(
         payload.window_size.load(Ordering::Acquire),
     ))
 }
@@ -510,10 +530,11 @@ pub fn step_ioctl_tiocswinsz(
     tty: &Cap<TtyIdentity>,
     winsize: Winsize,
     guard: &Guard<'_>,
-) -> StepOutcome<IoctlSideEffect> {
+) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     payload
@@ -521,7 +542,7 @@ pub fn step_ioctl_tiocswinsz(
         .store(winsize.to_u64(), Ordering::Release);
     tty.session_ctl_port
         .fire(SessionCtlEvent::WinsizeChanged as u64);
-    StepOutcome::Done(IoctlSideEffect {
+    V3::Done(IoctlSideEffect {
         session_ctl_fired: true,
         signal: tty.session_pgrp().map(|binding| SignalDispatch {
             target: SignalTarget::ForegroundProcessGroup {
@@ -533,22 +554,27 @@ pub fn step_ioctl_tiocswinsz(
     })
 }
 
-pub fn step_ioctl_tcgets(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<Termios> {
+pub fn step_ioctl_tcgets(
+    tty: &Cap<TtyIdentity>,
+    guard: &Guard<'_>,
+) -> tx_substrate::step_v3::StepOutcome<Termios, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
-    StepOutcome::Done(payload.with_termios(|termios| *termios))
+    V3::Done(payload.with_termios(|termios| *termios))
 }
 
 pub fn step_ioctl_tcsets(
     tty: &Cap<TtyIdentity>,
     new_termios: Termios,
     guard: &Guard<'_>,
-) -> StepOutcome<IoctlSideEffect> {
+) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     let old_termios = payload.publish_termios(new_termios);
@@ -563,7 +589,7 @@ pub fn step_ioctl_tcsets(
     if linearized.writable_fired {
         tty.output_writable.fire(TTY_WRITABLE);
     }
-    StepOutcome::Done(IoctlSideEffect::default())
+    V3::Done(IoctlSideEffect::default())
 }
 
 pub fn deferred_signal_for_tty(

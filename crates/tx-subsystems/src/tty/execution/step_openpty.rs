@@ -2,11 +2,13 @@
 
 use tx_substrate::zone::{self, Cap, PayloadCap};
 
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::{Errno, Guard};
 use crate::tty::project;
 use crate::tty::structure::registry;
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
 use crate::vfs::OpenFile;
+
+// Re-import v3 types via local alias for brevity in fn body.
 
 #[derive(Debug)]
 pub struct OpenPtyOutcome {
@@ -19,30 +21,34 @@ pub struct OpenPtyOutcome {
 
 /// Create master/slave TTY identities, install peer-linked payloads, publish
 /// the slave into the devpts registry, and return OpenFiles for both sides.
-pub fn step_openpty(guard: &Guard<'_>) -> StepOutcome<OpenPtyOutcome> {
+pub fn step_openpty(
+    guard: &Guard<'_>,
+) -> tx_substrate::step_v3::StepOutcome<OpenPtyOutcome, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
+
     let index = match registry::allocate_pty_index() {
         Ok(index) => index,
-        Err(_) => return StepOutcome::Err(Errno::EIO),
+        Err(_) => return V3::Err(Errno::EIO.into()),
     };
     if registry::contains_pty_slave(index) {
-        return StepOutcome::Err(Errno::EIO);
+        return V3::Err(Errno::EIO.into());
     }
 
     let master_id_res = match zone::reserve_for::<TtyIdentity>() {
         Ok(reservation) => reservation,
-        Err(_) => return StepOutcome::Err(Errno::EIO),
+        Err(_) => return V3::Err(Errno::EIO.into()),
     };
     let slave_id_res = match zone::reserve_for::<TtyIdentity>() {
         Ok(reservation) => reservation,
-        Err(_) => return StepOutcome::Err(Errno::EIO),
+        Err(_) => return V3::Err(Errno::EIO.into()),
     };
     let master_payload_res = match zone::reserve_for::<TtyPayload>() {
         Ok(reservation) => reservation,
-        Err(_) => return StepOutcome::Err(Errno::EIO),
+        Err(_) => return V3::Err(Errno::EIO.into()),
     };
     let slave_payload_res = match zone::reserve_for::<TtyPayload>() {
         Ok(reservation) => reservation,
-        Err(_) => return StepOutcome::Err(Errno::EIO),
+        Err(_) => return V3::Err(Errno::EIO.into()),
     };
 
     let master = zone::sign_for(
@@ -67,21 +73,21 @@ pub fn step_openpty(guard: &Guard<'_>) -> StepOutcome<OpenPtyOutcome> {
     slave.install_payload(slave_payload);
 
     if registry::register_pty_slave(index, slave.clone()).is_err() {
-        return StepOutcome::Err(Errno::EIO);
+        return V3::Err(Errno::EIO.into());
     }
 
     let master_file = match project::open_file_for_tty(master.clone(), guard) {
-        StepOutcome::Done(file) => file,
-        StepOutcome::Err(err) => return StepOutcome::Err(err),
-        _ => return StepOutcome::Err(Errno::EIO),
+        V3::Done(file) => file,
+        V3::Err(err) => return V3::Err(err),
+        _ => return V3::Err(Errno::EIO.into()),
     };
     let slave_file = match project::open_file_for_tty(slave.clone(), guard) {
-        StepOutcome::Done(file) => file,
-        StepOutcome::Err(err) => return StepOutcome::Err(err),
-        _ => return StepOutcome::Err(Errno::EIO),
+        V3::Done(file) => file,
+        V3::Err(err) => return V3::Err(err),
+        _ => return V3::Err(Errno::EIO.into()),
     };
 
-    StepOutcome::Done(OpenPtyOutcome {
+    V3::Done(OpenPtyOutcome {
         index,
         master,
         slave,

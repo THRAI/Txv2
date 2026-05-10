@@ -228,6 +228,8 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // `vm::execution::fault_script`. Each iteration takes a fresh
     // `tx_substrate::epoch::guard()` inside the step's call site so
     // the guard never crosses an `.await`.
+    use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
+    use tx_subsystems::execution::WaitToken;
     let mut total: usize = 0;
     let mut remaining = bytes.as_slice();
     loop {
@@ -236,7 +238,12 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             file.step_write(remaining, &guard)
         };
         match outcome {
-            StepOutcome::Done(written) | StepOutcome::Advanced(written) => {
+            V3Out::Done(written) => {
+                total += written;
+                return SyscallResult::Return(total as i64);
+            }
+            V3Out::Continue { progress } => {
+                let written = progress.bytes();
                 total += written;
                 let stop = written == 0 || written >= remaining.len();
                 if stop {
@@ -244,28 +251,45 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 }
                 remaining = &remaining[written..];
             }
-            StepOutcome::AdvancedThenBlocked(written, token) => {
-                total += written;
-                if written >= remaining.len() {
-                    return SyscallResult::Return(total as i64);
+            V3Out::Yield {
+                progress,
+                shape: YieldShape::OnCarrier { carrier, interests },
+            } => {
+                let written = progress.bytes();
+                if written > 0 {
+                    total += written;
+                    if written >= remaining.len() {
+                        return SyscallResult::Return(total as i64);
+                    }
+                    remaining = &remaining[written..];
+                    let token = WaitToken::new(carrier.raw(), interests.raw());
+                    if let Some(future) = wait_carrier::wait_on_token(token) {
+                        let _ = future.await;
+                    }
+                    // Otherwise the carrier has been retired or is a test
+                    // placeholder; fall through and retry immediately.
+                } else {
+                    // No progress made yet; await the carrier and retry.
+                    let token = WaitToken::new(carrier.raw(), interests.raw());
+                    if let Some(future) = wait_carrier::wait_on_token(token) {
+                        let _ = future.await;
+                    }
                 }
-                remaining = &remaining[written..];
-                if let Some(future) = wait_carrier::wait_on_token(token) {
-                    let _ = future.await;
-                }
-                // Otherwise the carrier has been retired or is a test
-                // placeholder; fall through and retry immediately.
             }
-            StepOutcome::Blocked(token) => {
-                // No progress made yet; await the carrier and retry.
-                if let Some(future) = wait_carrier::wait_on_token(token) {
-                    let _ = future.await;
-                }
-            }
-            StepOutcome::Err(errno) => {
+            V3Out::Yield {
+                shape: YieldShape::OnAgent { .. },
+                ..
+            } => {
                 if total > 0 {
                     return SyscallResult::Return(total as i64);
                 }
+                return SyscallResult::Error(errno_to_i32(Errno::EIO));
+            }
+            V3Out::Err(v3errno) => {
+                if total > 0 {
+                    return SyscallResult::Return(total as i64);
+                }
+                let errno: Errno = v3errno.into();
                 // fd-ops Wave 3 — Q2 DECIDED 2026-05-07. SIGPIPE is
                 // delivered to the calling process before returning
                 // `-EPIPE` to userspace. The pipe `step_write` cannot
@@ -325,6 +349,8 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     // dance the trio's earlier exemption used).
     let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
 
+    use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
+    use tx_subsystems::execution::WaitToken;
     let mut total: usize = 0;
     let mut cursor: usize = 0;
     loop {
@@ -333,7 +359,24 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             file.step_read(&mut staging[cursor..], &guard)
         };
         match outcome {
-            StepOutcome::Done(read) | StepOutcome::Advanced(read) => {
+            V3Out::Done(read) => {
+                if read > 0 {
+                    if let Err(errno) = bootstrap_copy_to_user(
+                        &ctx.aspace,
+                        buf_ptr as u64 + cursor as u64,
+                        &staging[cursor..cursor + read],
+                    ) {
+                        if total > 0 {
+                            return SyscallResult::Return(total as i64);
+                        }
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
+                total += read;
+                return SyscallResult::Return(total as i64);
+            }
+            V3Out::Continue { progress } => {
+                let read = progress.bytes();
                 if read > 0 {
                     if let Err(errno) = bootstrap_copy_to_user(
                         &ctx.aspace,
@@ -353,7 +396,11 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 }
                 cursor += read;
             }
-            StepOutcome::AdvancedThenBlocked(read, _token) => {
+            V3Out::Yield {
+                progress,
+                shape: YieldShape::OnCarrier { carrier, interests },
+            } => {
+                let read = progress.bytes();
                 if read > 0 {
                     if let Err(errno) = bootstrap_copy_to_user(
                         &ctx.aspace,
@@ -365,49 +412,51 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                         }
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
-                }
-                total += read;
-                if total > 0 {
+                    total += read;
                     // Partial-success policy: same as `write`. Return
                     // what we got rather than blocking; userspace
                     // re-issues the syscall to drain more.
                     return SyscallResult::Return(total as i64);
                 }
-                // total == 0 here is unreachable in practice (Advanced
-                // implies progress) but fall through defensively to
-                // the `Blocked` arm below.
-                return SyscallResult::Return(0);
-            }
-            StepOutcome::Blocked(token) => {
-                // Pre-ELF Phase 5 (item 9): no input buffered yet.
-                // Park on the registered TTY wait carrier (fired
-                // from `tty::execution::step_ingest` after UART RX
-                // bytes land via `irq::uart_rx_irq_handler`), then
-                // re-poll. Mirrors the canonical async wait
-                // discipline pattern from
+                // No progress yet — park on the carrier (Pre-ELF
+                // Phase 5 (item 9)). Park on the registered TTY wait
+                // carrier (fired from `tty::execution::step_ingest`
+                // after UART RX bytes land via
+                // `irq::uart_rx_irq_handler`), then re-poll. Mirrors
+                // the canonical async wait discipline pattern from
                 // `vm::execution::fault_script` /
                 // `RangeLock::WouldBlock`.
                 //
                 // `wait_on_token` returns `None` for test
                 // placeholder tokens (carrier id not registered);
-                // in that case fall through and re-poll
-                // immediately. Production carriers are always
-                // registered (see `TtyIdentity::new`). If a partial
-                // read already happened on a prior iteration
-                // (`total > 0`) we return what we have rather than
-                // block, matching `sys_write`'s partial-success
-                // policy.
+                // in that case fall through and re-poll immediately.
+                // Production carriers are always registered (see
+                // `TtyIdentity::new`). If a partial read already
+                // happened on a prior iteration (`total > 0`) we
+                // return what we have rather than block, matching
+                // `sys_write`'s partial-success policy.
                 if total > 0 {
                     return SyscallResult::Return(total as i64);
                 }
+                let token = WaitToken::new(carrier.raw(), interests.raw());
                 if let Some(future) = wait_carrier::wait_on_token(token) {
                     let _ = future.await;
                 }
             }
-            StepOutcome::Err(errno) => {
+            V3Out::Yield {
+                shape: YieldShape::OnAgent { .. },
+                ..
+            } => {
                 if total > 0 {
                     return SyscallResult::Return(total as i64);
                 }
+                return SyscallResult::Error(errno_to_i32(Errno::EIO));
+            }
+            V3Out::Err(v3errno) => {
+                if total > 0 {
+                    return SyscallResult::Return(total as i64);
+                }
+                let errno: Errno = v3errno.into();
                 return SyscallResult::Error(errno_to_i32(errno));
             }
         }

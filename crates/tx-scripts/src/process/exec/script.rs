@@ -46,7 +46,7 @@ use alloc::vec::Vec;
 use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
 use tx_substrate::zone::Cap;
 use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
-use tx_subsystems::execution::{Errno, StepOutcome};
+use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{read_exact_at, PageContainer};
 use tx_subsystems::process::{
     step_close_cloexec_fds, step_install_brk_for_exec, step_reset_signal_dispositions_for_exec,
@@ -252,6 +252,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // canonical `take a fresh guard inside an await_*` shape per
     // `vm::execution::fault_script`.
     let openfile = {
+        use tx_substrate::step_v3::StepOutcome as V3;
         let guard = tx_substrate::epoch::guard();
         let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
         let outcome = poll_walker_synchronously(step_open(
@@ -269,11 +270,9 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
             &guard,
         ));
         let result = match outcome {
-            StepOutcome::Done(file) | StepOutcome::Advanced(file) => Ok(file),
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-                Err(ExecError::Busy)
-            }
-            StepOutcome::Err(err) => Err(ExecError::from_walker_errno(err)),
+            V3::Done(file) => Ok(file),
+            V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
+            V3::Err(err) => Err(ExecError::from_walker_errno(Errno::from(err))),
         };
         drop(guard);
         result?
@@ -323,14 +322,13 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     }
     let mut header_bytes: Vec<u8> = alloc::vec![0u8; read_len];
     {
+        use tx_substrate::step_v3::StepOutcome as V3;
         let guard = tx_substrate::epoch::guard();
         let outcome = read_exact_at(&file_pc, 0, &mut header_bytes, &guard);
         let result = match outcome {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => Ok(()),
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-                Err(ExecError::Busy)
-            }
-            StepOutcome::Err(err) => Err(ExecError::from_read_errno(err)),
+            V3::Done(()) => Ok(()),
+            V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
+            V3::Err(err) => Err(ExecError::from_read_errno(err.into())),
         };
         drop(guard);
         result?;
@@ -444,21 +442,23 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
             .ok_or(ExecError::NotExecutable)?;
         let mut buf = alloc::vec![0u8; partial_in_page as usize];
         {
+            use tx_substrate::step_v3::StepOutcome as V3;
             let guard = tx_substrate::epoch::guard();
             match read_exact_at(&segment.backing, file_off, &mut buf, &guard) {
-                StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
-                StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-                    return Err(ExecError::Busy);
-                }
-                StepOutcome::Err(_) => return Err(ExecError::NotExecutable),
+                V3::Done(()) => {}
+                V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
+                V3::Err(_) => return Err(ExecError::NotExecutable),
             }
         }
         match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            tx_substrate::step_v3::StepOutcome::Done(()) => {}
+            tx_substrate::step_v3::StepOutcome::Continue { .. }
+            | tx_substrate::step_v3::StepOutcome::Yield { .. } => {
                 return Err(ExecError::Busy);
             }
-            StepOutcome::Err(err) => return Err(ExecError::from_populate_errno(err)),
+            tx_substrate::step_v3::StepOutcome::Err(err) => {
+                return Err(ExecError::from_populate_errno(err.into()));
+            }
         }
     }
 
@@ -524,11 +524,14 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     )
     .await
     {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+        tx_substrate::step_v3::StepOutcome::Done(()) => {}
+        tx_substrate::step_v3::StepOutcome::Continue { .. }
+        | tx_substrate::step_v3::StepOutcome::Yield { .. } => {
             return Err(ExecError::Busy);
         }
-        StepOutcome::Err(err) => return Err(ExecError::from_populate_errno(err)),
+        tx_substrate::step_v3::StepOutcome::Err(err) => {
+            return Err(ExecError::from_populate_errno(err.into()));
+        }
     }
 
     // ----- Phase 5 (cont) — collapse old-AS work -------------------

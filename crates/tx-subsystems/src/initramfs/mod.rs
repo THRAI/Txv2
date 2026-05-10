@@ -27,10 +27,11 @@
 
 use alloc::sync::Arc;
 
-use crate::execution::{Errno, StepOutcome};
+use crate::execution::Errno;
 use crate::mount::MountIdentity;
 use crate::page_backed::{FsPageBacking, MaterializeAccess, PageIndex};
 use crate::vfs::{Credential, FsObjectId, FsOps, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
+use tx_substrate::step_v3::StepOutcome as V3;
 use tx_substrate::zone::Cap;
 
 #[cfg(test)]
@@ -286,6 +287,9 @@ pub fn unpack_into_root_mount(
             errno: Errno::EIO,
         })?
         .into_cap();
+    // Errnos from the trait surfaces route through
+    // `Errno::from(step_v3::Errno)` into the existing
+    // `UnpackError::FsOp { errno: Errno, .. }` carrier.
     let fs_ops = payload.fs_ops.clone();
     let fs_page_backing = payload.fs_page_backing.clone();
     let root_object_id = root_mount.root().fs_object_id();
@@ -383,24 +387,23 @@ fn walk_or_create_dirs(
         // Try lookup first; mkdir if missing.
         let guard = tx_substrate::epoch::guard();
         match fs_ops.lookup(current, component, &guard) {
-            StepOutcome::Done(id) => {
+            V3::Done(id) => {
                 current = id;
             }
-            StepOutcome::Advanced(id) => {
-                current = id;
+            V3::Err(v3_errno) => {
+                let errno = Errno::from(v3_errno);
+                if errno == Errno::ENOENT {
+                    drop(guard);
+                    let id = mkdir_idempotent(fs_ops, current, component, 0o755, cred)?;
+                    current = id;
+                } else {
+                    return Err(UnpackError::FsOp {
+                        op: "lookup",
+                        errno,
+                    });
+                }
             }
-            StepOutcome::Err(Errno::ENOENT) => {
-                drop(guard);
-                let id = mkdir_idempotent(fs_ops, current, component, 0o755, cred)?;
-                current = id;
-            }
-            StepOutcome::Err(errno) => {
-                return Err(UnpackError::FsOp {
-                    op: "lookup",
-                    errno,
-                });
-            }
-            StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return Err(UnpackError::UnexpectedAdvance("lookup"));
             }
         }
@@ -417,25 +420,26 @@ fn mkdir_idempotent(
 ) -> Result<FsObjectId, UnpackError> {
     let guard = tx_substrate::epoch::guard();
     match fs_ops.mkdir(parent, name, mode_low, cred, &guard) {
-        StepOutcome::Done((id, _)) => Ok(id),
-        StepOutcome::Advanced((id, _)) => Ok(id),
-        StepOutcome::Err(Errno::EEXIST) => {
-            // Directory already exists — look it up and return the id.
-            match fs_ops.lookup(parent, name, &guard) {
-                StepOutcome::Done(id) | StepOutcome::Advanced(id) => Ok(id),
-                StepOutcome::Err(errno) => Err(UnpackError::FsOp {
-                    op: "mkdir-eexist-relookup",
-                    errno,
-                }),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    Err(UnpackError::UnexpectedAdvance("mkdir-eexist-relookup"))
+        V3::Done((id, _)) => Ok(id),
+        V3::Err(v3_errno) => {
+            let errno = Errno::from(v3_errno);
+            if errno == Errno::EEXIST {
+                // Directory already exists — look it up and return the id.
+                match fs_ops.lookup(parent, name, &guard) {
+                    V3::Done(id) => Ok(id),
+                    V3::Err(v3_errno) => Err(UnpackError::FsOp {
+                        op: "mkdir-eexist-relookup",
+                        errno: Errno::from(v3_errno),
+                    }),
+                    V3::Continue { .. } | V3::Yield { .. } => {
+                        Err(UnpackError::UnexpectedAdvance("mkdir-eexist-relookup"))
+                    }
                 }
+            } else {
+                Err(UnpackError::FsOp { op: "mkdir", errno })
             }
         }
-        StepOutcome::Err(errno) => Err(UnpackError::FsOp { op: "mkdir", errno }),
-        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-            Err(UnpackError::UnexpectedAdvance("mkdir"))
-        }
+        V3::Continue { .. } | V3::Yield { .. } => Err(UnpackError::UnexpectedAdvance("mkdir")),
     }
 }
 
@@ -453,19 +457,19 @@ fn unpack_regular(
     let (file_id, file_meta) = {
         let guard = tx_substrate::epoch::guard();
         match fs_ops.create_inode(parent_id, name, mode_low, cred, &guard) {
-            StepOutcome::Done(out) => out,
-            StepOutcome::Advanced(out) => out,
-            StepOutcome::Err(Errno::EEXIST) => {
-                // Pre-existing file under that name — leave it alone.
-                return Ok(());
-            }
-            StepOutcome::Err(errno) => {
+            V3::Done(out) => out,
+            V3::Err(v3_errno) => {
+                let errno = Errno::from(v3_errno);
+                if errno == Errno::EEXIST {
+                    // Pre-existing file under that name — leave it alone.
+                    return Ok(());
+                }
                 return Err(UnpackError::FsOp {
                     op: "create_inode",
                     errno,
                 });
             }
-            StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return Err(UnpackError::UnexpectedAdvance("create_inode"));
             }
         }
@@ -478,14 +482,14 @@ fn unpack_regular(
         let guard = tx_substrate::epoch::guard();
         let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
         let rnode = match outcome {
-            StepOutcome::Done(r) | StepOutcome::Advanced(r) => r,
-            StepOutcome::Err(errno) => {
+            V3::Done(r) => r,
+            V3::Err(v3_errno) => {
                 return Err(UnpackError::FsOp {
                     op: "materialise_rnode",
-                    errno,
+                    errno: Errno::from(v3_errno),
                 });
             }
-            StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return Err(UnpackError::UnexpectedAdvance("materialise_rnode"));
             }
         };
@@ -531,14 +535,14 @@ fn unpack_regular(
     {
         let guard = tx_substrate::epoch::guard();
         match fs_page_backing.truncate(file_id, size, &guard) {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
-            StepOutcome::Err(errno) => {
+            V3::Done(()) => {}
+            V3::Err(v3_errno) => {
                 return Err(UnpackError::FsOp {
                     op: "truncate",
-                    errno,
+                    errno: Errno::from(v3_errno),
                 });
             }
-            StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return Err(UnpackError::UnexpectedAdvance("truncate"));
             }
         }
@@ -555,14 +559,18 @@ fn unpack_symlink(
 ) -> Result<(), UnpackError> {
     let guard = tx_substrate::epoch::guard();
     match fs_ops.symlink(parent_id, name, target, cred, &guard) {
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => Ok(()),
-        StepOutcome::Err(Errno::EEXIST) => Ok(()),
-        StepOutcome::Err(errno) => Err(UnpackError::FsOp {
-            op: "symlink",
-            errno,
-        }),
-        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-            Err(UnpackError::UnexpectedAdvance("symlink"))
+        V3::Done(_) => Ok(()),
+        V3::Err(v3_errno) => {
+            let errno = Errno::from(v3_errno);
+            if errno == Errno::EEXIST {
+                Ok(())
+            } else {
+                Err(UnpackError::FsOp {
+                    op: "symlink",
+                    errno,
+                })
+            }
         }
+        V3::Continue { .. } | V3::Yield { .. } => Err(UnpackError::UnexpectedAdvance("symlink")),
     }
 }

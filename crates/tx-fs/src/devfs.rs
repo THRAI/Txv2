@@ -37,14 +37,13 @@
 use alloc::sync::Arc;
 
 use tx_substrate::zone::Cap;
-use tx_subsystems::device;
-use tx_subsystems::execution::{Errno, Guard, StepOutcome};
+use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::process;
 use tx_subsystems::tty;
 use tx_subsystems::vfs::{
     self, Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
-    OpenFileFlags, RNode, RNodeBacking, StructPayload, S_IFBLK, S_IFCHR, S_IFDIR,
+    OpenFileFlags, RNode, RNodeBacking, StructPayload, S_IFCHR, S_IFDIR,
 };
 
 /// Stable `FsObjectId` for the devfs root directory.
@@ -65,9 +64,6 @@ const DEVFS_ENTRY_OBJECT_BASE: u64 = 0x6465_7601;
 /// Phase 3a plan §"devfs FsOps surface": `S_IFCHR | 0o620`).
 pub const DEVFS_CHAR_MODE: u16 = S_IFCHR | 0o620;
 
-/// Mode for static block-device entries resolved by devfs.
-pub const DEVFS_BLOCK_MODE: u16 = S_IFBLK | 0o660;
-
 /// Mode for the devfs root directory (`S_IFDIR | 0o755`).
 pub const DEVFS_ROOT_MODE: u16 = S_IFDIR | 0o755;
 
@@ -76,8 +72,8 @@ pub const DEVFS_ROOT_MODE: u16 = S_IFDIR | 0o755;
 /// Holds no state of its own — every observation resolves against the
 /// TTY registry through `tty::project`. A single instance is enough for
 /// the whole kernel, but the type stays unit-shaped so Phase 3b can
-/// build an `Arc<dyn FsOps>` (and an `Arc<dyn FsPageBacking>`) without
-/// needing a constructor.
+/// build an `Arc<dyn FsOps>` (and an `Arc<dyn FsPageBacking>`)
+/// without needing a constructor.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Devfs;
 
@@ -86,332 +82,15 @@ impl Devfs {
         Self
     }
 
-    /// Convenience factory matching the `MountOutput` shape Phase 3b
-    /// will pass into `MountIdentity::new_cap`. Phase 3a does not
-    /// itself call this — it exists so the type fans out cleanly when
-    /// devfs is mounted later.
+    /// v3 factory matching the `MountOutput` shape Phase 3b will pass
+    /// into `MountIdentity::new_cap`.
     pub fn fs_ops_arc() -> Arc<dyn FsOps> {
         Arc::new(Self)
     }
 
+    /// v3 page-backing factory.
     pub fn fs_page_backing_arc() -> Arc<dyn FsPageBacking> {
         Arc::new(Self)
-    }
-}
-
-impl FsOps for Devfs {
-    fn lookup(
-        &self,
-        parent: FsObjectId,
-        name: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<FsObjectId> {
-        if parent != DEVFS_ROOT_OBJECT_ID {
-            return StepOutcome::Err(Errno::ENOENT);
-        }
-        if tty::project::resolve_devfs_alias(name).is_some() {
-            // Identify the entry by its position in the live alias
-            // snapshot. Stable for one snapshot, opaque to the caller —
-            // devfs makes no inode-persistence promise.
-            let entries = tty::project::devfs_alias_entries();
-            for (idx, entry) in entries.iter().enumerate() {
-                if entry.name == name {
-                    return StepOutcome::Done(FsObjectId::new(
-                        DEVFS_ENTRY_OBJECT_BASE + idx as u64,
-                    ));
-                }
-            }
-        }
-        if device::block_device_by_name(name).is_some() {
-            let block_base = tty::project::devfs_alias_entries().len();
-            let entries = device::block_device_snapshot();
-            for (idx, entry) in entries.iter().enumerate() {
-                if entry.name.as_bytes() == name {
-                    return StepOutcome::Done(FsObjectId::new(
-                        DEVFS_ENTRY_OBJECT_BASE + (block_base + idx) as u64,
-                    ));
-                }
-            }
-        }
-        StepOutcome::Err(Errno::ENOENT)
-    }
-
-    fn load_inode_meta(
-        &self,
-        fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<InodeMeta> {
-        if fs_object_id == DEVFS_ROOT_OBJECT_ID {
-            return StepOutcome::Done(InodeMeta::new(InodeKind::Directory, DEVFS_ROOT_MODE));
-        }
-        if entry_index_from_object_id(fs_object_id)
-            .and_then(|idx| tty::project::devfs_alias_entries().into_iter().nth(idx))
-            .is_some()
-        {
-            return StepOutcome::Done(InodeMeta::new(InodeKind::CharDevice, DEVFS_CHAR_MODE));
-        }
-        if block_index_from_object_id(fs_object_id)
-            .and_then(|idx| device::block_device_snapshot().into_iter().nth(idx))
-            .is_some()
-        {
-            return StepOutcome::Done(InodeMeta::new(InodeKind::BlockDevice, DEVFS_BLOCK_MODE));
-        }
-        StepOutcome::Err(Errno::ENOENT)
-    }
-
-    fn serialize_inode_meta(
-        &self,
-        _fs_object_id: FsObjectId,
-        _meta: &InodeMeta,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn create_inode(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn unlink(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn rename(
-        &self,
-        _old_parent: FsObjectId,
-        _old_name: &[u8],
-        _new_parent: FsObjectId,
-        _new_name: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn link(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn mkdir(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn rmdir(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn symlink(
-        &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _link_target: &[u8],
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn readdir(
-        &self,
-        fs_object_id: FsObjectId,
-        cursor: DirCursor,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
-        if fs_object_id != DEVFS_ROOT_OBJECT_ID {
-            return StepOutcome::Err(Errno::ENOTDIR);
-        }
-        let entries = tty::project::devfs_alias_entries();
-        let index = cursor.as_u64() as usize;
-        if let Some(entry) = entries.get(index) {
-            let dir_entry = match DirEntry::new(
-                FsObjectId::new(DEVFS_ENTRY_OBJECT_BASE + index as u64),
-                InodeKind::CharDevice,
-                &entry.name,
-            ) {
-                Ok(de) => de,
-                Err(err) => return StepOutcome::Err(err),
-            };
-            return StepOutcome::Done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
-        }
-
-        let block_index = index.saturating_sub(entries.len());
-        let block_entries = device::block_device_snapshot();
-        let Some(entry) = block_entries.get(block_index) else {
-            return StepOutcome::Done(None);
-        };
-        let dir_entry = match DirEntry::new(
-            FsObjectId::new(DEVFS_ENTRY_OBJECT_BASE + index as u64),
-            InodeKind::BlockDevice,
-            entry.name.as_bytes(),
-        ) {
-            Ok(de) => de,
-            Err(err) => return StepOutcome::Err(err),
-        };
-        StepOutcome::Done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))))
-    }
-
-    fn destroy_inode(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-        // Registry entries are owned by the TTY subsystem; devfs has no
-        // inode storage to release. Successful no-op so the VFS layer
-        // can drop its `RNode` without seeing a backend error.
-        StepOutcome::Done(())
-    }
-
-    /// Materialise an `RNode` for a character-device alias.
-    ///
-    /// Per `txdoc:TTY-RNODE-MATERIALIZATION-1`
-    /// (`docs/design/06_devices/TTY.md` §6.3): char-device entries on
-    /// devfs project the registered TTY as
-    /// `RNodeBacking::StructBacked { payload: StructPayload::Tty(...) }`,
-    /// which routes `OpenFile::step_read` / `step_write` through the
-    /// TTY subsystem. The walker invokes this hook after `lookup` /
-    /// `load_inode_meta` resolve a char-device inode; without it, the
-    /// walker falls through to the trait default (`ENOSYS`) and the
-    /// path resolution fails at the terminal component.
-    ///
-    /// Mirrors the standalone `resolve_console_rnode` helper above —
-    /// the latter is retained for the bootstrap-fallback path
-    /// (`open_console_for_init_legacy`); this hook is the production
-    /// walker site.
-    fn step_chmod(
-        &self,
-        _fs_object_id: FsObjectId,
-        _new_mode: u16,
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        // devfs is a read-only projection-shaped backend; mode-bit
-        // mutation is not supported.
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn step_chown(
-        &self,
-        _fs_object_id: FsObjectId,
-        _new_uid: Option<u32>,
-        _new_gid: Option<u32>,
-        _cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::EROFS)
-    }
-
-    fn materialise_rnode(
-        &self,
-        fs_object_id: FsObjectId,
-        meta: InodeMeta,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<Cap<RNode>> {
-        match meta.kind() {
-            InodeKind::CharDevice => {
-                let Some(idx) = entry_index_from_object_id(fs_object_id) else {
-                    return StepOutcome::Err(Errno::ENOENT);
-                };
-                let entries = tty::project::devfs_alias_entries();
-                let Some(entry) = entries.into_iter().nth(idx) else {
-                    return StepOutcome::Err(Errno::ENOENT);
-                };
-                let tty = entry.tty;
-                match RNode::new_cap(
-                    fs_object_id,
-                    meta,
-                    RNodeBacking::StructBacked {
-                        payload: StructPayload::Tty(tty),
-                    },
-                ) {
-                    Ok(rnode) => StepOutcome::Done(rnode),
-                    Err(_) => StepOutcome::Err(Errno::EIO),
-                }
-            }
-            InodeKind::BlockDevice => {
-                let Some(idx) = block_index_from_object_id(fs_object_id) else {
-                    return StepOutcome::Err(Errno::ENOENT);
-                };
-                let entries = device::block_device_snapshot();
-                let Some(entry) = entries.into_iter().nth(idx) else {
-                    return StepOutcome::Err(Errno::ENOENT);
-                };
-                match RNode::new_cap(
-                    fs_object_id,
-                    meta,
-                    RNodeBacking::StructBacked {
-                        payload: StructPayload::BlockDevice(entry),
-                    },
-                ) {
-                    Ok(rnode) => StepOutcome::Done(rnode),
-                    Err(_) => StepOutcome::Err(Errno::EIO),
-                }
-            }
-            _ => StepOutcome::Err(Errno::ENOSYS),
-        }
-    }
-}
-
-impl FsPageBacking for Devfs {
-    fn fetch_page(
-        &self,
-        _fs_object_id: FsObjectId,
-        _offset: u64,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<Frame> {
-        // Char-device I/O does not flow through the page cache; routing
-        // happens via `OpenFile::step_read` / `step_write` against the
-        // RNode's `StructBacked { Tty }` backing instead.
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn flush_page(
-        &self,
-        _fs_object_id: FsObjectId,
-        _offset: u64,
-        _frame: &Frame,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn truncate(
-        &self,
-        _fs_object_id: FsObjectId,
-        _new_size: u64,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
-    }
-
-    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-        StepOutcome::Err(Errno::ENOSYS)
     }
 }
 
@@ -421,11 +100,6 @@ fn entry_index_from_object_id(id: FsObjectId) -> Option<usize> {
         return None;
     }
     usize::try_from(raw - DEVFS_ENTRY_OBJECT_BASE).ok()
-}
-
-fn block_index_from_object_id(id: FsObjectId) -> Option<usize> {
-    let idx = entry_index_from_object_id(id)?;
-    idx.checked_sub(tty::project::devfs_alias_entries().len())
 }
 
 /// Materialise an `RNode` for the named devfs alias.
@@ -438,9 +112,12 @@ fn block_index_from_object_id(id: FsObjectId) -> Option<usize> {
 ///
 /// Returns `Errno::ENOENT` if the registry has no such alias,
 /// `Errno::EIO` if RNode allocation fails.
-pub fn resolve_console_rnode(name: &[u8]) -> StepOutcome<Cap<RNode>> {
+pub fn resolve_console_rnode(
+    name: &[u8],
+) -> tx_substrate::step_v3::StepOutcome<Cap<RNode>, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     let Some(tty) = tty::project::resolve_devfs_alias(name) else {
-        return StepOutcome::Err(Errno::ENOENT);
+        return V3::err(Errno::ENOENT.into());
     };
 
     let entries = tty::project::devfs_alias_entries();
@@ -457,8 +134,8 @@ pub fn resolve_console_rnode(name: &[u8]) -> StepOutcome<Cap<RNode>> {
             payload: StructPayload::Tty(tty),
         },
     ) {
-        Ok(rnode) => StepOutcome::Done(rnode),
-        Err(_) => StepOutcome::Err(Errno::EIO),
+        Ok(rnode) => V3::done(rnode),
+        Err(_) => V3::err(Errno::EIO.into()),
     }
 }
 
@@ -502,6 +179,7 @@ pub fn open_console_for_init() -> Cap<OpenFile> {
             // Bootstrap path: init opens /dev/console as root.
             let cred = Credential::root();
             let guard = tx_substrate::epoch::guard();
+            use tx_substrate::step_v3::StepOutcome as V3;
             let outcome = block_on(vfs::step_open(
                 root,
                 b"/dev/console",
@@ -517,7 +195,7 @@ pub fn open_console_for_init() -> Cap<OpenFile> {
                 &guard,
             ));
             match outcome {
-                StepOutcome::Done(file) | StepOutcome::Advanced(file) => return file,
+                V3::Done(file) => return file,
                 _other => {
                     // Walker could not resolve the path under current
                     // bootstrap state — fall through to legacy
@@ -599,6 +277,322 @@ fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
         }
     }
     panic!("open_console_for_init::block_on: future did not resolve in 1024 polls");
+}
+
+// === FsOps / FsPageBacking impls ====================================
+//
+// Devfs is a read-only projection backend (every mutating op returns
+// `EROFS`, every page-cache op returns `ENOSYS`) — every method
+// returns synchronously, so each body is a direct
+// `StepOutcome::done(...)` / `StepOutcome::err(...)` ladder. Per the
+// wave-8 design doc
+// (`docs/progress/decisions/2026-05-09-fsops-v3-design.md`), v3 callers
+// (the walker entry points) opt into these impls via
+// `Arc<dyn FsOps>` / `Arc<dyn FsPageBacking>`.
+//
+// Fully-qualified `tx_substrate::step_v3::*` references at the impl
+// sites avoid clashing with `tx_subsystems::execution::StepOutcome`
+// already in scope, per the wave-4/6/7 trait-impl convention.
+
+impl FsOps for Devfs {
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
+        if parent != DEVFS_ROOT_OBJECT_ID {
+            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into());
+        }
+        if tty::project::resolve_devfs_alias(name).is_some() {
+            // Identify the entry by its position in the live alias
+            // snapshot. Stable for one snapshot, opaque to the caller —
+            // devfs makes no inode-persistence promise.
+            let entries = tty::project::devfs_alias_entries();
+            for (idx, entry) in entries.iter().enumerate() {
+                if entry.name == name {
+                    return tx_substrate::step_v3::StepOutcome::done(FsObjectId::new(
+                        DEVFS_ENTRY_OBJECT_BASE + idx as u64,
+                    ));
+                }
+            }
+        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into())
+    }
+
+    fn load_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
+        if fs_object_id == DEVFS_ROOT_OBJECT_ID {
+            return tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(
+                InodeKind::Directory,
+                DEVFS_ROOT_MODE,
+            ));
+        }
+        if entry_index_from_object_id(fs_object_id)
+            .and_then(|idx| tty::project::devfs_alias_entries().into_iter().nth(idx))
+            .is_some()
+        {
+            return tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(
+                InodeKind::CharDevice,
+                DEVFS_CHAR_MODE,
+            ));
+        }
+        tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into())
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _meta: &InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
+    }
+
+    fn create_inode(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        (FsObjectId, InodeMeta),
+        tx_substrate::step_v3::NoProgress,
+    > {
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
+    }
+
+    fn unlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
+    }
+
+    fn rename(
+        &self,
+        _old_parent: FsObjectId,
+        _old_name: &[u8],
+        _new_parent: FsObjectId,
+        _new_name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
+    }
+
+    fn link(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
+    }
+
+    fn mkdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        (FsObjectId, InodeMeta),
+        tx_substrate::step_v3::NoProgress,
+    > {
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
+    }
+
+    fn rmdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
+    }
+
+    fn symlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _link_target: &[u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        (FsObjectId, InodeMeta),
+        tx_substrate::step_v3::NoProgress,
+    > {
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
+    }
+
+    fn readdir(
+        &self,
+        fs_object_id: FsObjectId,
+        cursor: DirCursor,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        Option<(DirEntry, DirCursor)>,
+        tx_substrate::step_v3::NoProgress,
+    > {
+        if fs_object_id != DEVFS_ROOT_OBJECT_ID {
+            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOTDIR.into());
+        }
+        let entries = tty::project::devfs_alias_entries();
+        let index = cursor.as_u64() as usize;
+        let Some(entry) = entries.get(index) else {
+            return tx_substrate::step_v3::StepOutcome::done(None);
+        };
+        let dir_entry = match DirEntry::new(
+            FsObjectId::new(DEVFS_ENTRY_OBJECT_BASE + index as u64),
+            InodeKind::CharDevice,
+            &entry.name,
+        ) {
+            Ok(de) => de,
+            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+        };
+        tx_substrate::step_v3::StepOutcome::done(Some((
+            dir_entry,
+            DirCursor::from_u64(cursor.as_u64() + 1),
+        )))
+    }
+
+    fn destroy_inode(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        // Registry entries are owned by the TTY subsystem; devfs has no
+        // inode storage to release. Successful no-op so the VFS layer
+        // can drop its `RNode` without seeing a backend error.
+        tx_substrate::step_v3::StepOutcome::done(())
+    }
+
+    /// Materialise an `RNode` for a character-device alias.
+    ///
+    /// Per `txdoc:TTY-RNODE-MATERIALIZATION-1`
+    /// (`docs/design/06_devices/TTY.md` §6.3): char-device entries on
+    /// devfs project the registered TTY as
+    /// `RNodeBacking::StructBacked { payload: StructPayload::Tty(...) }`,
+    /// which routes `OpenFile::step_read` / `step_write` through the
+    /// TTY subsystem. The walker invokes this hook after `lookup` /
+    /// `load_inode_meta` resolve a char-device inode; without it, the
+    /// walker falls through to the trait default (`ENOSYS`) and the
+    /// path resolution fails at the terminal component.
+    ///
+    /// Mirrors the standalone `resolve_console_rnode` helper above —
+    /// the latter is retained for the bootstrap-fallback path
+    /// (`open_console_for_init_legacy`); this hook is the production
+    /// walker site.
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<Cap<RNode>, tx_substrate::step_v3::NoProgress> {
+        if meta.kind() != InodeKind::CharDevice {
+            // devfs only publishes the root directory and
+            // char-device aliases. Directories are handled by the
+            // walker's inline `Directory` arm; anything else is a
+            // backend bug.
+            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into());
+        }
+        let Some(idx) = entry_index_from_object_id(fs_object_id) else {
+            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into());
+        };
+        let entries = tty::project::devfs_alias_entries();
+        let Some(entry) = entries.into_iter().nth(idx) else {
+            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into());
+        };
+        let tty = entry.tty;
+        match RNode::new_cap(
+            fs_object_id,
+            meta,
+            RNodeBacking::StructBacked {
+                payload: StructPayload::Tty(tty),
+            },
+        ) {
+            Ok(rnode) => tx_substrate::step_v3::StepOutcome::done(rnode),
+            Err(_) => tx_substrate::step_v3::StepOutcome::err(Errno::EIO.into()),
+        }
+    }
+
+    fn step_chmod(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        // devfs is a read-only projection-shaped backend; mode-bit
+        // mutation is not supported.
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
+    }
+
+    fn step_chown(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_uid: Option<u32>,
+        _new_gid: Option<u32>,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        tx_substrate::step_v3::StepOutcome::err(Errno::EROFS.into())
+    }
+}
+
+impl FsPageBacking for Devfs {
+    fn fetch_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+        // Char-device I/O does not flow through the page cache; routing
+        // happens via `OpenFile::step_read` / `step_write` against the
+        // RNode's `StructBacked { Tty }` backing instead.
+        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _frame: &Frame,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    }
+
+    fn fsync(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    }
+
+    // `fallocate` keeps the v3 trait default (`Done(())`) — devfs has
+    // no on-disk space to reserve, so a hint is a successful no-op.
+    // `supports_reflink` keeps the trait default (`false`).
 }
 
 #[cfg(test)]

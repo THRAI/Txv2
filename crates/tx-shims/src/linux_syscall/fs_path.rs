@@ -83,13 +83,18 @@ fn resolve_path_at<P: PmapIf>(
         None => return Err(EBADF_VALUE),
     };
     let guard = tx_substrate::epoch::guard();
-    let outcome = poll_walker_synchronously(step_walk(cwd, path, cred, &guard));
+    // Uses `step_walk` (consuming `FsOps` via the direct
+    // `MountPayload::fs_ops` field) and matches the four-variant
+    // outcome. Errno routes back through the reverse `From` bridge so
+    // the existing `errno_to_i32` table stays the single source of truth.
+    use tx_substrate::step_v3::StepOutcome as V3;
+    let outcome = poll_walker_synchronously(tx_subsystems::vfs::step_walk(cwd, path, cred, &guard));
     let dentry = match outcome {
-        StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+        V3::Done(d) => d,
+        V3::Continue { .. } | V3::Yield { .. } => {
             return Err(EIO_VALUE);
         }
-        StepOutcome::Err(errno) => return Err(errno_to_i32(errno)),
+        V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
     };
     drop(guard);
     Ok(dentry)
@@ -198,6 +203,7 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let fs_object_id = dentry.rnode().fs_object_id();
+    use tx_substrate::step_v3::StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
@@ -207,11 +213,9 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     let new_mode = (mode & 0o7777) as u16;
     let guard = tx_substrate::epoch::guard();
     match fs_ops.step_chmod(fs_object_id, new_mode, &walker_cred, &guard) {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-            SyscallResult::Error(EIO_VALUE)
-        }
-        StepOutcome::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(errno)),
+        V3::Done(()) => SyscallResult::Return(0),
+        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+        V3::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
     }
 }
 
@@ -241,6 +245,7 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let fs_object_id = dentry.rnode().fs_object_id();
+    use tx_substrate::step_v3::StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
@@ -249,11 +254,9 @@ pub(super) fn sys_fchownat<P: PmapIf>(
     let gid_opt = decode_gid_arg(gid_arg).map(|g| g.raw());
     let guard = tx_substrate::epoch::guard();
     match fs_ops.step_chown(fs_object_id, uid_opt, gid_opt, &walker_cred, &guard) {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => SyscallResult::Return(0),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
-            SyscallResult::Error(EIO_VALUE)
-        }
-        StepOutcome::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(errno)),
+        V3::Done(()) => SyscallResult::Return(0),
+        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+        V3::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
     }
 }
 
@@ -435,14 +438,15 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let walker_cred = ctx.walker_cred();
     let dentry: Cap<DEntry> = {
         let guard = tx_substrate::epoch::guard();
+        use tx_substrate::step_v3::StepOutcome as V3;
         let outcome = poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard));
         drop(guard);
         match outcome {
-            StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            V3::Done(d) => d,
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
         }
     };
 
@@ -570,11 +574,12 @@ pub(super) fn walk_from(
     cred: &Credential,
 ) -> Result<Cap<DEntry>, i32> {
     let guard = tx_substrate::epoch::guard();
+    use tx_substrate::step_v3::StepOutcome as V3;
     let outcome = poll_walker_synchronously(step_walk(cwd, path, cred, &guard));
     drop(guard);
     match outcome {
-        StepOutcome::Done(d) | StepOutcome::Advanced(d) => Ok(d),
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => Err(EIO_VALUE),
-        StepOutcome::Err(errno) => Err(errno_to_i32(errno)),
+        V3::Done(d) => Ok(d),
+        V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
+        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
     }
 }
