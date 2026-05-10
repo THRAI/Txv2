@@ -26,10 +26,7 @@ const DEVPTS_SLAVE_OBJECT_BASE: u64 = 0x7074_7400;
 pub struct DevptsInstance;
 
 /// Resolve a devfs TTY entry such as `ttyS0` or `console`.
-pub fn devfs_tty_by_name(
-    name: &[u8],
-    _guard: &Guard<'_>,
-) -> V3Out<Cap<TtyIdentity>, NoProgress> {
+pub fn devfs_tty_by_name(name: &[u8], _guard: &Guard<'_>) -> V3Out<Cap<TtyIdentity>, NoProgress> {
     if name == b"ptmx" {
         return V3Out::err(Errno::EINVAL.into());
     }

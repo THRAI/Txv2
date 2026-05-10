@@ -153,8 +153,8 @@ fn binding_obligation_helpers_are_const() {
     assert_eq!(RANK_RES, 0);
     assert_eq!(RANK_ADDR, 1);
     assert_eq!(RANK_OP, 2);
-    assert!(AT_LEAST_REFL);
-    assert!(AT_LEAST_DOWN);
-    assert!(REQ_OP_TRUE);
-    assert!(!REQ_OP_FALSE);
+    const { assert!(AT_LEAST_REFL) };
+    const { assert!(AT_LEAST_DOWN) };
+    const { assert!(REQ_OP_TRUE) };
+    const { assert!(!REQ_OP_FALSE) };
 }

@@ -1,5 +1,4 @@
 use super::*;
-use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
 use crate::vfs::{FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking};
 use crate::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
@@ -9,6 +8,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use tx_hal::UserPtr;
 use tx_substrate::page_allocator;
+use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
@@ -318,10 +318,7 @@ fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
     assert_eq!(outcome, V3Out::Done(pattern.len()));
 
     let shrink_size = USER_PAGE_SIZE as u64 + 4;
-    assert_eq!(
-        step_truncate(&pc, shrink_size, &guard),
-        V3Out::Done(())
-    );
+    assert_eq!(step_truncate(&pc, shrink_size, &guard), V3Out::Done(()));
 
     let grow_size = USER_PAGE_SIZE as u64 + 32;
     assert_eq!(step_truncate(&pc, grow_size, &guard), V3Out::Done(()));

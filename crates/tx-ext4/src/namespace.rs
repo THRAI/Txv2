@@ -45,9 +45,7 @@ impl<I> Ext4FsInstance<I>
 where
     I: BlockImage + Send + 'static,
 {
-    pub(crate) fn fs_ops_arc(
-        self: alloc::sync::Arc<Self>,
-    ) -> alloc::sync::Arc<dyn FsOps> {
+    pub(crate) fn fs_ops_arc(self: alloc::sync::Arc<Self>) -> alloc::sync::Arc<dyn FsOps> {
         self
     }
 }
@@ -68,9 +66,7 @@ where
         };
 
         match self.with_pager(|pager| pager.lookup(parent, name)) {
-            Ok(Some(inode)) => {
-                tx_substrate::step_v3::StepOutcome::done(inode_fs_object_id(inode))
-            }
+            Ok(Some(inode)) => tx_substrate::step_v3::StepOutcome::done(inode_fs_object_id(inode)),
             Ok(None) => tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into()),
             Err(err) => tx_substrate::step_v3::StepOutcome::err(err.into()),
         }

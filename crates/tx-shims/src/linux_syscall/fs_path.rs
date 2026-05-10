@@ -88,9 +88,7 @@ fn resolve_path_at<P: PmapIf>(
     // outcome. Errno routes back through the reverse `From` bridge so
     // the existing `errno_to_i32` table stays the single source of truth.
     use tx_substrate::step_v3::StepOutcome as V3;
-    let outcome = poll_walker_synchronously(
-        tx_subsystems::vfs::step_walk(cwd, path, cred, &guard),
-    );
+    let outcome = poll_walker_synchronously(tx_subsystems::vfs::step_walk(cwd, path, cred, &guard));
     let dentry = match outcome {
         V3::Done(d) => d,
         V3::Continue { .. } | V3::Yield { .. } => {

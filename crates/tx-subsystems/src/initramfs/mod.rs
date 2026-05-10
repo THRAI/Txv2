@@ -30,9 +30,7 @@ use alloc::sync::Arc;
 use crate::execution::Errno;
 use crate::mount::MountIdentity;
 use crate::page_backed::{FsPageBacking, MaterializeAccess, PageIndex};
-use crate::vfs::{
-    Credential, FsObjectId, FsOps, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
-};
+use crate::vfs::{Credential, FsObjectId, FsOps, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 use tx_substrate::step_v3::StepOutcome as V3;
 use tx_substrate::zone::Cap;
 

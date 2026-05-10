@@ -11,13 +11,11 @@ use alloc::vec::Vec;
 
 use std::sync::Mutex;
 
+use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Outcome};
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
-use tx_subsystems::vfs::{
-    Credential, DirCursor, FsObjectId, FsOps, RNodeBacking, StructPayload,
-};
-use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Outcome};
+use tx_subsystems::vfs::{Credential, DirCursor, FsObjectId, FsOps, RNodeBacking, StructPayload};
 
 use super::{open_console_for_init, Devfs, DEVFS_ROOT_OBJECT_ID};
 
@@ -117,8 +115,7 @@ fn devfs_lookup_console_after_register_hardware_returns_tty_rnode() {
 
     // FsOps::lookup over the devfs root yields a stable FsObjectId
     // for the alias.
-    let obj_id = match <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"console", &guard)
-    {
+    let obj_id = match <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"console", &guard) {
         V3Outcome::Done(id) => id,
         other => panic!("devfs.lookup(console) failed: {other:?}"),
     };
@@ -346,8 +343,8 @@ fn devfs_v3_lookup_console_returns_done_with_object_id() {
 
     let _ops = install_capturing_console();
 
-    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::StepOutcome as V3;
+    use tx_subsystems::vfs::FsOps;
 
     let devfs = Devfs::new();
     let guard = tx_substrate::epoch::guard();
@@ -376,8 +373,8 @@ fn devfs_v3_load_inode_meta_root_returns_directory_meta() {
         .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
-    use tx_subsystems::vfs::{FsOps, InodeKind};
     use tx_substrate::step_v3::StepOutcome as V3;
+    use tx_subsystems::vfs::{FsOps, InodeKind};
 
     let devfs = Devfs::new();
     let guard = tx_substrate::epoch::guard();
@@ -400,8 +397,8 @@ fn devfs_v3_fetch_page_returns_enosys() {
         .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
-    use tx_subsystems::page_backed::{Frame, FsPageBacking};
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use tx_subsystems::page_backed::{Frame, FsPageBacking};
 
     let devfs = Devfs::new();
     let guard = tx_substrate::epoch::guard();

@@ -6,12 +6,12 @@
 
 use alloc::sync::Arc;
 
+use tx_substrate::step_v3::{Errno, StepOutcome};
 use tx_subsystems::cred::{Capability, CapabilitySet};
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::{
     Credential, DirCursor, FsObjectId, FsOps, InodeKind, RNodeBacking, S_IFMT, S_ISGID, S_ISUID,
 };
-use tx_substrate::step_v3::{Errno, StepOutcome};
 
 use super::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 
@@ -692,8 +692,8 @@ fn tmpfs_v3_lookup_round_trips_after_create() {
         .unwrap_or_else(|p| p.into_inner());
     init_substrate();
 
+    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
     use tx_subsystems::vfs::FsOps;
-    use tx_substrate::step_v3::{NoProgress, StepOutcome as V3, Errno as V3Errno};
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
@@ -733,18 +733,24 @@ fn tmpfs_v3_mkdir_yields_directory_inode() {
         .unwrap_or_else(|p| p.into_inner());
     init_substrate();
 
-    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::StepOutcome as V3;
+    use tx_subsystems::vfs::FsOps;
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
     let cred = Credential::root();
 
-    let (dir_id, dir_meta) =
-        match <Tmpfs as FsOps>::mkdir(&*tmpfs, TMPFS_ROOT_OBJECT_ID, b"v3dir", 0o755, &cred, &guard) {
-            V3::Done(out) => out,
-            other => panic!("mkdir v3: {other:?}"),
-        };
+    let (dir_id, dir_meta) = match <Tmpfs as FsOps>::mkdir(
+        &*tmpfs,
+        TMPFS_ROOT_OBJECT_ID,
+        b"v3dir",
+        0o755,
+        &cred,
+        &guard,
+    ) {
+        V3::Done(out) => out,
+        other => panic!("mkdir v3: {other:?}"),
+    };
     assert_eq!(dir_meta.kind(), InodeKind::Directory);
 
     // load_inode_meta over v3 returns the same kind.
@@ -762,9 +768,9 @@ fn tmpfs_v3_fetch_page_done_for_anon_file() {
         .unwrap_or_else(|p| p.into_inner());
     init_substrate();
 
+    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
     use tx_subsystems::page_backed::FsPageBacking;
     use tx_subsystems::vfs::FsOps;
-    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
@@ -806,9 +812,9 @@ fn tmpfs_v3_truncate_then_load_meta_reflects_size() {
         .unwrap_or_else(|p| p.into_inner());
     init_substrate();
 
+    use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
     use tx_subsystems::page_backed::FsPageBacking;
     use tx_subsystems::vfs::FsOps;
-    use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
 
     let tmpfs = Arc::new(Tmpfs::new());
     let guard = tx_substrate::epoch::guard();
@@ -852,6 +858,8 @@ fn tmpfs_v3_truncate_then_load_meta_reflects_size() {
 
 #[test]
 fn step_walk_against_tmpfs_resolves_real_path() {
+    use tx_substrate::step_v3::StepOutcome as V3;
+    use tx_substrate::zone::{self, Cap};
     use tx_subsystems::mount::{
         DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
     };
@@ -859,8 +867,6 @@ fn step_walk_against_tmpfs_resolves_real_path() {
         DEntry, InlineName, InodeMeta, RNode, RNodeBacking, S_IFDIR,
     };
     use tx_subsystems::vfs::walker::step_walk;
-    use tx_substrate::step_v3::StepOutcome as V3;
-    use tx_substrate::zone::{self, Cap};
 
     let _serial = crate::test_support::FS_TEST_LOCK
         .lock()
@@ -908,13 +914,7 @@ fn step_walk_against_tmpfs_resolves_real_path() {
     // resolving through `FsOps for Tmpfs`.
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let _new_dir = match tmpfs.mkdir(
-        mount_output.root_fs_object_id,
-        b"dir",
-        0o755,
-        &cred,
-        &guard,
-    ) {
+    let _new_dir = match tmpfs.mkdir(mount_output.root_fs_object_id, b"dir", 0o755, &cred, &guard) {
         V3::Done(out) => out,
         other => panic!("tmpfs mkdir failed: {other:?}"),
     };

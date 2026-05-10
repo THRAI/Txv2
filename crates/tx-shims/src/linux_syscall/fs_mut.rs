@@ -71,8 +71,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     } else {
         let guard = tx_substrate::epoch::guard();
         use tx_substrate::step_v3::StepOutcome as V3;
-        let outcome =
-            poll_walker_synchronously(step_walk(cwd.clone(), parent_path, cred, &guard));
+        let outcome = poll_walker_synchronously(step_walk(cwd.clone(), parent_path, cred, &guard));
         drop(guard);
         match outcome {
             V3::Done(d) => d,
@@ -99,8 +98,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     {
         use tx_substrate::step_v3::StepOutcome as V3;
         let guard = tx_substrate::epoch::guard();
-        let outcome =
-            fs_ops.create_inode(parent_fs_object_id, basename, new_mode, cred, &guard);
+        let outcome = fs_ops.create_inode(parent_fs_object_id, basename, new_mode, cred, &guard);
         match outcome {
             V3::Done(_) => {}
             V3::Continue { .. } | V3::Yield { .. } => {

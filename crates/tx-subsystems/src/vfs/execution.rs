@@ -13,12 +13,9 @@ use crate::tty;
 use tx_substrate::step_v3::{ByteProgress, Errno, NoProgress, StepOutcome};
 
 use super::structure::{
-    Credential, DirCursor, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileIoctl,
-    OpenFileIoctlCaller, OpenFileIoctlResult, RNodeBacking, StructPayload,
+    Credential, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileIoctl, OpenFileIoctlCaller,
+    OpenFileIoctlResult, RNodeBacking, StructPayload,
 };
-
-/// Filesystem backend trait. The boundary tx-ext4, tmpfs, devfs, etc.
-/// implement to provide namespace + page-backing operations.
 
 // === FsOps — emits step_v3 outcomes ==================================
 //
@@ -239,11 +236,7 @@ pub struct MountOutput {
 
 impl OpenFile {
     /// Dispatch a read against this file's RNode backing.
-    pub fn step_read(
-        &self,
-        out: &mut [u8],
-        guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    pub fn step_read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         if !self.flags.read {
             return StepOutcome::Err(Errno::EINVAL);
         }
@@ -357,11 +350,7 @@ impl OpenFile {
     }
 
     /// Dispatch a write against this file's RNode backing.
-    pub fn step_write(
-        &self,
-        bytes: &[u8],
-        guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    pub fn step_write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         if !self.flags.write {
             return StepOutcome::Err(Errno::EINVAL);
         }

@@ -41,10 +41,7 @@ fn execution_scope_has_exactly_two_variants_via_exhaustive_match() {
 fn execution_scope_thread_is_not_borrowed() {
     let thread = ExecutionScope::Thread;
     assert!(thread.is_thread(), "Thread.is_thread() must be true");
-    assert!(
-        !thread.is_borrowed(),
-        "Thread.is_borrowed() must be false",
-    );
+    assert!(!thread.is_borrowed(), "Thread.is_borrowed() must be false",);
     assert_eq!(
         thread.borrowed_owner(),
         None,
@@ -110,7 +107,7 @@ const _BORROWED_OWNER: Option<OwnedProcessHandle> = _THREAD_SCOPE.borrowed_owner
 fn execution_scope_helpers_are_const() {
     // Reference the const-evaluated values so the compiler must keep
     // them. The actual pinning happens at compile time above.
-    assert!(_IS_THREAD);
-    assert!(!_IS_BORROWED);
+    const { assert!(_IS_THREAD) };
+    const { assert!(!_IS_BORROWED) };
     assert!(_BORROWED_OWNER.is_none());
 }

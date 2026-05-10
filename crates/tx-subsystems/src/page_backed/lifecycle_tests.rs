@@ -77,8 +77,6 @@ impl LifecycleFs {
     }
 }
 
-
-
 fn file_page_container(fs: Arc<LifecycleFs>, fs_object_id: FsObjectId) -> PageContainer {
     let mount = MountPayload::new_cap(
         fs.clone(),
@@ -533,10 +531,7 @@ fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
     );
     let stable_size = pc.size_bytes();
 
-    assert_eq!(
-        step_fallocate(&pc, stable_size, &guard),
-        V3Out::Done(())
-    );
+    assert_eq!(step_fallocate(&pc, stable_size, &guard), V3Out::Done(()));
     assert_eq!(
         step_fallocate(&pc, stable_size - 1, &guard),
         V3Out::Done(())
@@ -725,14 +720,10 @@ impl crate::page_backed::FsPageBacking for LifecycleFs {
         self.last_object
             .store(fs_object_id.as_u64(), Ordering::Release);
         self.last_truncate_size.store(new_size, Ordering::Release);
-        self.truncate_outcome.clone()
+        self.truncate_outcome
     }
 
-    fn fsync(
-        &self,
-        fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> V3Outcome<(), NoProgress> {
+    fn fsync(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Outcome<(), NoProgress> {
         self.fsyncs.fetch_add(1, Ordering::AcqRel);
         self.last_object
             .store(fs_object_id.as_u64(), Ordering::Release);
@@ -749,7 +740,7 @@ impl crate::page_backed::FsPageBacking for LifecycleFs {
         self.last_object
             .store(fs_object_id.as_u64(), Ordering::Release);
         self.last_fallocate_size.store(new_size, Ordering::Release);
-        self.fallocate_outcome.clone()
+        self.fallocate_outcome
     }
 }
 
@@ -792,12 +783,8 @@ fn fsopsv3_readdir_done_none_for_empty_directory() {
     setup_host_substrate();
     let guard = tx_substrate::epoch::guard();
     let fs = LifecycleFs::new();
-    let outcome = <LifecycleFs as FsOps>::readdir(
-        &fs,
-        FsObjectId::new(1),
-        DirCursor::START,
-        &guard,
-    );
+    let outcome =
+        <LifecycleFs as FsOps>::readdir(&fs, FsObjectId::new(1), DirCursor::START, &guard);
     assert_eq!(outcome, V3Outcome::done(None));
 }
 
@@ -806,8 +793,7 @@ fn fsopsv3_lookup_returns_err_enosys() {
     setup_host_substrate();
     let guard = tx_substrate::epoch::guard();
     let fs = LifecycleFs::new();
-    let outcome =
-        <LifecycleFs as FsOps>::lookup(&fs, FsObjectId::new(1), b"missing", &guard);
+    let outcome = <LifecycleFs as FsOps>::lookup(&fs, FsObjectId::new(1), b"missing", &guard);
     assert_eq!(
         outcome,
         V3Outcome::<FsObjectId, NoProgress>::err(V3Errno::ENOSYS)

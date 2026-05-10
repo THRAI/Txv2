@@ -412,10 +412,8 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 shape: YieldShape::OnCarrier { carrier, interests },
                 ..
             } => {
-                let token = tx_subsystems::execution::WaitToken::new(
-                    carrier.raw(),
-                    interests.raw(),
-                );
+                let token =
+                    tx_subsystems::execution::WaitToken::new(carrier.raw(), interests.raw());
                 if let Some(future) = wait_carrier::wait_on_token(token) {
                     let _ = future.await;
                 }

@@ -220,7 +220,11 @@ mod tests {
         assert_eq!(table.len(), 27);
         for (v4, expected_v3) in table {
             let mapped: V3 = v4.into();
-            assert_eq!(mapped, expected_v3, "v4 {:?} should map to v3 {:?}", v4, expected_v3);
+            assert_eq!(
+                mapped, expected_v3,
+                "v4 {:?} should map to v3 {:?}",
+                v4, expected_v3
+            );
         }
     }
 }

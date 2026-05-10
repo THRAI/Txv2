@@ -11,9 +11,7 @@ use alloc::boxed::Box;
 
 use crate::execution::Guard;
 use crate::page_backed::Frame;
-use crate::vfs::structure::{
-    Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta,
-};
+use crate::vfs::structure::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};
 
 use super::TestFs;
 
@@ -26,9 +24,7 @@ impl crate::vfs::FsOps for TestFs {
     ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
         let inner = self.inner.lock();
         let Some(map) = inner.children.get(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOTDIR,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
         };
         match map.get(name) {
             Some(id) => tx_substrate::step_v3::StepOutcome::done(*id),
@@ -43,9 +39,7 @@ impl crate::vfs::FsOps for TestFs {
     ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
         let inner = self.inner.lock();
         let Some((kind, _, mode_low, uid, gid)) = inner.inodes.get(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         // S_IFMT bits get OR-ed in by InodeMeta::new based on `kind`;
         // the per-inode mode_low covers the rwx triplets + setuid/
@@ -181,9 +175,7 @@ impl crate::vfs::FsOps for TestFs {
             Some(_) => {
                 tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EINVAL)
             }
-            None => {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT)
-            }
+            None => tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT),
         }
     }
 }

@@ -93,12 +93,7 @@ fn step_walk_resolves_simple_name() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(
-        topo.root_dentry.clone(),
-        b"foo",
-        &cred,
-        &guard,
-    ));
+    let outcome = block_on(step_walk(topo.root_dentry.clone(), b"foo", &cred, &guard));
     drop(guard);
     let dentry = match outcome {
         V3::Done(d) => d,
@@ -158,12 +153,7 @@ fn step_walk_returns_enoent_on_missing() {
 
     let cred = Credential::root();
     let guard = tx_substrate::epoch::guard();
-    let outcome = block_on(step_walk(
-        topo.root_dentry.clone(),
-        b"/nope",
-        &cred,
-        &guard,
-    ));
+    let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/nope", &cred, &guard));
     drop(guard);
     match outcome {
         V3::Err(V3Errno::ENOENT) => {}

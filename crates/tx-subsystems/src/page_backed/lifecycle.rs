@@ -38,7 +38,6 @@ impl PageContainer {
     }
 }
 
-
 /// Zero the bytes in the cached page containing the new EOF, from the
 /// in-page byte offset of `new_size` up to the page end. After
 /// truncate-shrink past a non-aligned size, the partial last page must not
@@ -63,8 +62,6 @@ fn zero_partial_eof_tail(pc: &PageContainer, new_size: u64) {
         core::ptr::write_bytes(frame_base.add(within_page), 0, tail_len);
     }
 }
-
-///   "mostly a hint".
 
 fn first_page_after_size(size: u64) -> Option<PageIndex> {
     let page_size = crate::vm::USER_PAGE_SIZE as u64;
@@ -214,11 +211,7 @@ pub fn step_truncate(
                 progress: _,
                 shape: YieldShape::OnCarrier { carrier, interests },
             } => {
-                return V3::yield_on_carrier(
-                    PageProgress::EMPTY,
-                    carrier.raw(),
-                    interests.raw(),
-                );
+                return V3::yield_on_carrier(PageProgress::EMPTY, carrier.raw(), interests.raw());
             }
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
@@ -285,11 +278,7 @@ pub fn step_fallocate(
                 progress: _,
                 shape: YieldShape::OnCarrier { carrier, interests },
             } => {
-                return V3::yield_on_carrier(
-                    PageProgress::EMPTY,
-                    carrier.raw(),
-                    interests.raw(),
-                );
+                return V3::yield_on_carrier(PageProgress::EMPTY, carrier.raw(), interests.raw());
             }
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
@@ -316,8 +305,8 @@ mod v3_tests {
     use crate::execution::{Errno as V4Errno, WaitToken};
     use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
     use crate::page_backed::{
-        AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind, PageIndex,
-        allocate_cached_frame,
+        allocate_cached_frame, AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind,
+        PageIndex,
     };
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};
@@ -397,8 +386,6 @@ mod v3_tests {
             }
         }
     }
-
-
 
     // Trait impls so the inner-mod LifecycleFs satisfies the
     // `FsOps` / `FsPageBacking` fields on `MountPayload`. Anything
@@ -562,14 +549,10 @@ mod v3_tests {
             self.last_object
                 .store(fs_object_id.as_u64(), Ordering::Release);
             self.last_truncate_size.store(new_size, Ordering::Release);
-            self.truncate_outcome.clone()
+            self.truncate_outcome
         }
 
-        fn fsync(
-            &self,
-            fs_object_id: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> V3Outcome<(), NoProgress> {
+        fn fsync(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Outcome<(), NoProgress> {
             self.fsyncs.fetch_add(1, Ordering::AcqRel);
             self.last_object
                 .store(fs_object_id.as_u64(), Ordering::Release);

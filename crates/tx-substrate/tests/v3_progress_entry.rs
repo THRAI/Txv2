@@ -29,12 +29,7 @@ fn entry_progress_empty_is_zero_count_and_is_empty() {
 fn entry_progress_left_identity_preserves_count_and_cursor() {
     // EMPTY.extend(x) yields x's count and x's cursor — identity from
     // the left advances the cursor forward to the rhs's value.
-    for &(c, p) in &[
-        (0u32, 0u64),
-        (1, 16),
-        (256, 4096),
-        (1_000_000, u64::MAX),
-    ] {
+    for &(c, p) in &[(0u32, 0u64), (1, 16), (256, 4096), (1_000_000, u64::MAX)] {
         let mut acc = EntryProgress::EMPTY;
         acc.extend(EntryProgress::new(c, DirCursor::new(p)));
         assert_eq!(acc.count(), c, "left identity count broke at ({c}, {p})");
@@ -50,12 +45,7 @@ fn entry_progress_left_identity_preserves_count_and_cursor() {
 fn entry_progress_right_identity_preserves_count_and_cursor() {
     // x.extend(EMPTY) does not rewind the cursor: EMPTY.count == 0
     // means rhs has no progress, so the lhs cursor wins.
-    for &(c, p) in &[
-        (0u32, 0u64),
-        (1, 16),
-        (256, 4096),
-        (1_000_000, u64::MAX),
-    ] {
+    for &(c, p) in &[(0u32, 0u64), (1, 16), (256, 4096), (1_000_000, u64::MAX)] {
         let mut acc = EntryProgress::new(c, DirCursor::new(p));
         acc.extend(EntryProgress::EMPTY);
         assert_eq!(acc.count(), c, "right identity count broke at ({c}, {p})");

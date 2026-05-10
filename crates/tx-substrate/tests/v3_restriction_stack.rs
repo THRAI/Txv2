@@ -143,5 +143,4 @@ fn restriction_stack_walk_does_not_consume() {
 fn restriction_stack_append_only_no_remove_method() {
     // Structural pin — see the doc comment on this test for the rule.
     // The body is intentionally trivial; the documentation IS the test.
-    assert!(true);
 }

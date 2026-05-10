@@ -28,13 +28,12 @@ use tx_substrate::SpinMutex;
 use tx_subsystems::cred::Capability;
 use tx_subsystems::execution::Guard;
 use tx_subsystems::page_backed::{
-    step_truncate, AnonSwapPolicy, Frame, MaterializeAccess, PageContainer,
-    PageContainerKind, PageIndex,
+    step_truncate, AnonSwapPolicy, Frame, MaterializeAccess, PageContainer, PageContainerKind,
+    PageIndex,
 };
 use tx_subsystems::vfs::{
-    Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
-    MountOutput, RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
-    VFS_NAME_MAX,
+    Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, MountOutput,
+    RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID, VFS_NAME_MAX,
 };
 
 /// Mode for the tmpfs root directory.
@@ -220,20 +219,14 @@ impl FsOps for Tmpfs {
         };
         let state = self.state.lock();
         let Some(parent_inode) = state.inodes.get(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOTDIR,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
         };
         match children.get(&inline) {
             Some(id) => tx_substrate::step_v3::StepOutcome::done(*id),
-            None => tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            ),
+            None => tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT),
         }
     }
 
@@ -251,9 +244,7 @@ impl FsOps for Tmpfs {
                 }
                 tx_substrate::step_v3::StepOutcome::done(meta)
             }
-            None => tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            ),
+            None => tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT),
         }
     }
 
@@ -265,9 +256,7 @@ impl FsOps for Tmpfs {
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
         let mut state = self.state.lock();
         let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         // Preserve the IFMT bits from the existing meta — the kind is
         // determined at create time and must not be mutated through
@@ -308,9 +297,7 @@ impl FsOps for Tmpfs {
         // `symlink`. Reject anything else with `EINVAL`.
         let kind_bits = mode & S_IFMT;
         if kind_bits != 0 && kind_bits != S_IFREG {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::EINVAL,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EINVAL);
         }
         let mode = (mode & !S_IFMT) | S_IFREG;
 
@@ -336,19 +323,13 @@ impl FsOps for Tmpfs {
 
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOTDIR,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
         };
         if children.contains_key(&inline) {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::EEXIST,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EEXIST);
         }
         children.insert(inline, new_id);
 
@@ -380,24 +361,16 @@ impl FsOps for Tmpfs {
         };
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOTDIR,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
         };
         let Some(found_id) = children.get(&inline).copied() else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         if found_id != target {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         }
         // Reject directory targets — those go through `rmdir`.
         if let Some(target_inode) = state.inodes.get(&found_id) {
@@ -430,9 +403,7 @@ impl FsOps for Tmpfs {
         // ships same-directory rename; cross-directory needs the
         // walker + dentry rebinding seam to land first.
         if old_parent != new_parent {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOSYS,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS);
         }
         let old_key = match InlineName::new(old_name) {
             Ok(n) => n,
@@ -448,19 +419,13 @@ impl FsOps for Tmpfs {
 
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&old_parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOTDIR,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
         };
         let Some(target_id) = children.remove(&old_key) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         // If a file exists at the destination, replace it (POSIX
         // rename semantics for same-type-collision; cross-type
@@ -515,19 +480,13 @@ impl FsOps for Tmpfs {
 
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOTDIR,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
         };
         if children.contains_key(&inline) {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::EEXIST,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EEXIST);
         }
         children.insert(inline, new_id);
 
@@ -559,14 +518,10 @@ impl FsOps for Tmpfs {
         };
         let mut state = self.state.lock();
         let Some(target_inode) = state.inodes.get(&target) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(target_children) = &target_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOTDIR,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
         };
         if !target_children.is_empty() {
             return tx_substrate::step_v3::StepOutcome::err(
@@ -575,24 +530,16 @@ impl FsOps for Tmpfs {
         }
 
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOTDIR,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
         };
         let Some(found_id) = children.get(&inline).copied() else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         if found_id != target {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         }
         children.remove(&inline);
         state.inodes.remove(&found_id);
@@ -631,19 +578,13 @@ impl FsOps for Tmpfs {
 
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOTDIR,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
         };
         if children.contains_key(&inline) {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::EEXIST,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EEXIST);
         }
         children.insert(inline, new_id);
 
@@ -671,14 +612,10 @@ impl FsOps for Tmpfs {
     > {
         let state = self.state.lock();
         let Some(parent_inode) = state.inodes.get(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOTDIR,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
         };
         let index = cursor.as_u64() as usize;
         let Some((name, child_id)) = children.iter().nth(index) else {
@@ -738,17 +675,13 @@ impl FsOps for Tmpfs {
     > {
         let state = self.state.lock();
         let Some(inode) = state.inodes.get(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         match &inode.payload {
             TmpfsPayload::Symlink(bytes) => {
                 tx_substrate::step_v3::StepOutcome::done(bytes.clone().into_boxed_slice())
             }
-            _ => tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::EINVAL,
-            ),
+            _ => tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EINVAL),
         }
     }
 
@@ -791,9 +724,7 @@ impl FsOps for Tmpfs {
     ) -> tx_substrate::step_v3::StepOutcome<Cap<RNode>, tx_substrate::step_v3::NoProgress> {
         let state = self.state.lock();
         let Some(inode) = state.inodes.get(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         let backing = match &inode.payload {
             TmpfsPayload::RegularFile { container, .. } => RNodeBacking::PageBacked {
@@ -818,9 +749,7 @@ impl FsOps for Tmpfs {
 
         match RNode::new_cap(fs_object_id, meta, backing) {
             Ok(rnode) => tx_substrate::step_v3::StepOutcome::done(rnode),
-            Err(_) => tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOMEM,
-            ),
+            Err(_) => tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOMEM),
         }
     }
 
@@ -837,15 +766,11 @@ impl FsOps for Tmpfs {
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
         let mut state = self.state.lock();
         let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         // Permission: owner or CAP_FOWNER.
         if !cred.effective_caps.contains(Capability::FOWNER) && cred.uid != inode.meta.uid {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::EPERM,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EPERM);
         }
         // Preserve the IFMT bits from the existing meta — kind is
         // immutable through chmod (matches `serialize_inode_meta`).
@@ -874,9 +799,7 @@ impl FsOps for Tmpfs {
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
         let mut state = self.state.lock();
         let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         let privileged = cred.effective_caps.contains(Capability::FOWNER);
         if !privileged {
@@ -920,9 +843,7 @@ impl FsPageBacking for Tmpfs {
     ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
         let state = self.state.lock();
         let Some(inode) = state.inodes.get(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOENT,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
         };
         let container = match &inode.payload {
             TmpfsPayload::RegularFile { container, .. } => container.clone(),
@@ -941,9 +862,7 @@ impl FsPageBacking for Tmpfs {
 
         let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
         if !offset.is_multiple_of(page_size) {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::EINVAL,
-            );
+            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EINVAL);
         }
         let page_index = PageIndex::new(offset / page_size);
         // `materialize_page` is now v3
