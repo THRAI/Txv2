@@ -1,6 +1,7 @@
 //! TTY execution ioctl step tests.
 
-use crate::execution::StepOutcome;
+use tx_substrate::step_v3::StepOutcome;
+
 use crate::tty::execution::{step_ioctl_tcgets, step_ioctl_tcsets, step_read, TTY_READABLE};
 use crate::tty::structure::termios::ICANON;
 use crate::tty::structure::{TtyKind, TtyPayload};

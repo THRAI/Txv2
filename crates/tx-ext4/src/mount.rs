@@ -15,9 +15,11 @@ where
         .with_pager(|pager| pager.inode_meta(tx_ext4_format::pager::InodeNo::new(EXT4_ROOT_INODE)))
         .map(map_inode_meta)?;
 
+    let fs_ops = backend.clone().fs_ops_arc();
+    let fs_page_backing = backend.fs_page_backing_arc();
     Ok(MountOutput {
-        fs_ops: backend.clone(),
-        fs_page_backing: backend,
+        fs_ops,
+        fs_page_backing,
         root_fs_object_id,
         root_inode_meta,
     })

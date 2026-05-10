@@ -49,8 +49,8 @@ fn fm_setup() -> TestSetup {
 fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     let tmpfs = Arc::new(Tmpfs::new());
     let payload = MountPayload::new_cap(
-        tmpfs.clone() as Arc<dyn FsOps>,
-        tmpfs.clone() as Arc<dyn FsPageBacking>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
         None,
         DevId::new(411),
         MountOptions::default(),
@@ -113,37 +113,41 @@ fn root_cred() -> Credential {
 }
 
 fn create_regular(tmpfs: &Arc<Tmpfs>, name: &[u8]) {
+    use tx_substrate::step_v3::StepOutcome;
     let cred = root_cred();
     let guard = tx_substrate::epoch::guard();
     match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, name, 0o100644, &cred, &guard) {
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => {}
+        StepOutcome::Done(_) => {}
         other => panic!("create_inode {:?}: {other:?}", name),
     }
 }
 
 fn make_dir(tmpfs: &Arc<Tmpfs>, name: &[u8]) {
+    use tx_substrate::step_v3::StepOutcome;
     let cred = root_cred();
     let guard = tx_substrate::epoch::guard();
     match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, name, 0o755, &cred, &guard) {
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => {}
+        StepOutcome::Done(_) => {}
         other => panic!("mkdir {:?}: {other:?}", name),
     }
 }
 
 fn make_symlink(tmpfs: &Arc<Tmpfs>, name: &[u8], target: &[u8]) {
+    use tx_substrate::step_v3::StepOutcome;
     let cred = root_cred();
     let guard = tx_substrate::epoch::guard();
     match tmpfs.symlink(TMPFS_ROOT_OBJECT_ID, name, target, &cred, &guard) {
-        StepOutcome::Done(_) | StepOutcome::Advanced(_) => {}
+        StepOutcome::Done(_) => {}
         other => panic!("symlink {:?}: {other:?}", name),
     }
 }
 
 fn lookup_exists(tmpfs: &Arc<Tmpfs>, name: &[u8]) -> bool {
+    use tx_substrate::step_v3::StepOutcome;
     let guard = tx_substrate::epoch::guard();
     matches!(
         tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, name, &guard),
-        StepOutcome::Done(_) | StepOutcome::Advanced(_)
+        StepOutcome::Done(_)
     )
 }
 

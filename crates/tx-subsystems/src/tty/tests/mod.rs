@@ -8,5 +8,6 @@ mod execution_ioctl;
 mod execution_poll_hardware;
 mod execution_read;
 mod legacy_phase_a;
+mod project_v3;
 mod support;
 mod typed_session_pgrp;

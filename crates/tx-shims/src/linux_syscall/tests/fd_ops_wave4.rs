@@ -44,8 +44,8 @@ fn pagebacked_open_file(page_count: u64, size_bytes: u64) -> Cap<OpenFile> {
     .expect("page container cap");
     let guard = tx_substrate::epoch::guard();
     match step_truncate(&pc, size_bytes, &guard) {
-        tx_subsystems::execution::StepOutcome::Done(())
-        | tx_subsystems::execution::StepOutcome::Advanced(()) => {}
+        tx_substrate::step_v3::StepOutcome::Done(())
+        | tx_substrate::step_v3::StepOutcome::Continue { .. } => {}
         other => panic!("step_truncate({size_bytes}): {other:?}"),
     }
     drop(guard);

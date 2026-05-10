@@ -320,18 +320,19 @@ impl TtyPayload {
 mod tests {
     use super::*;
     use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-    use crate::execution::{Guard, StepOutcome};
+    use crate::execution::Guard;
     use crate::tty::structure::termios::{ICANON, ISIG};
+    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
 
     struct NoopOps;
 
     impl CharDeviceOps for NoopOps {
-        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-            StepOutcome::Done(0)
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> V3<usize, ByteProgress> {
+            V3::Done(0)
         }
 
-        fn write(&self, _bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-            StepOutcome::Done(0)
+        fn write(&self, _bytes: &[u8], _guard: &Guard<'_>) -> V3<usize, ByteProgress> {
+            V3::Done(0)
         }
     }
 

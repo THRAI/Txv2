@@ -3,6 +3,7 @@
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
+use tx_substrate::step_v3::StepOutcome;
 
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_substrate::{page_allocator, zone};
@@ -59,8 +60,8 @@ fn wave4_setup() -> TestSetup {
 fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     let tmpfs = Arc::new(Tmpfs::new());
     let payload = MountPayload::new_cap(
-        tmpfs.clone() as Arc<dyn FsOps>,
-        tmpfs.clone() as Arc<dyn FsPageBacking>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
         None,
         DevId::new(101),
         MountOptions::default(),

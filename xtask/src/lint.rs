@@ -118,6 +118,39 @@ pub(crate) fn lint_docs(root: &Path) -> Result<()> {
         println!("docs lint: {stale_warnings} stale-vocabulary mention(s) found in active docs; treated as warnings because current docs discuss retired terms");
     }
 
+    // Harvest TXV3 tag references from Rust sources under crates/, boards/,
+    // xtask/ and verify each resolves to a tag declared in some Txv3 (or
+    // design) doc. Tags from docs/Txv3/ are already in `txdoc_tags` because
+    // the markdown pass above scans all non-archived `.md` files.
+    let known: BTreeSet<String> = txdoc_tags.keys().cloned().collect();
+    let rust_files = collect_files(root, &["rs"]).map_err(|err| err.to_string())?;
+    let mut rust_payload: Vec<(String, String)> = Vec::new();
+    for file in rust_files {
+        let normalized = relative(root, &file).replace('\\', "/");
+        if normalized.starts_with("target/") || normalized.starts_with("external/") {
+            continue;
+        }
+        if !(normalized.starts_with("crates/")
+            || normalized.starts_with("boards/")
+            || normalized.starts_with("xtask/"))
+        {
+            continue;
+        }
+        // The linter implementation itself necessarily contains test
+        // fixtures and self-describing prose that mention `txdoc:TXV3-*`
+        // tags; do not lint the linter against itself.
+        if normalized == "xtask/src/lint.rs" {
+            continue;
+        }
+        let text = fs::read_to_string(&file).map_err(|err| format!("{}: {err}", file.display()))?;
+        rust_payload.push((normalized, text));
+    }
+    let borrowed: Vec<(&str, &str)> = rust_payload
+        .iter()
+        .map(|(d, t)| (d.as_str(), t.as_str()))
+        .collect();
+    errors.extend(lint_txv3_code_references(&known, &borrowed));
+
     if errors.is_empty() {
         println!("docs lint: ok");
         Ok(())
@@ -371,6 +404,131 @@ fn lint_arch_text(path: &str, display: &str, text: &str) -> Vec<String> {
             findings.push(format!(
                 "{display}:{line_no}: TTY-CTL-1a violation — process-side structs must not declare a `foreground_pgrp` field (authoritative slot lives on TtyIdentity.session_pgrp; use Session::foreground_pgrp_cap() for the two-hop weak dereference)"
             ));
+        }
+    }
+    // A-3: `.await` inside a `fn step(` body. Per
+    // `docs/Txv3/03_STEP_MODEL_v2.md` §10 (STEP-2): step functions are
+    // synchronous bounded transactions; suspension is expressed via
+    // `Yield { shape, .. }`, not via `.await`. The driver composes.
+    findings.extend(lint_step_no_await(display, text));
+    findings
+}
+
+/// A-3 detector: walk the file, track brace depth, and emit a finding
+/// for any `.await` whose enclosing `{ ... }` block was opened by a
+/// `fn step(` signature.
+///
+/// Heuristics: line-level scan with comment stripping (`//` only —
+/// block comments not handled), exact substring match on `fn step(`
+/// (so `fn step_foo(` does not trigger). The signature, the `{`, and
+/// the `.await` may all be on the same line; the scan resolves all
+/// three in one character-by-character pass per line.
+/// Scan Rust source `text` for `txdoc:TXV3-*` references inside comments
+/// and return `(line_no, tag)` tuples. Only `//`-style line comments and
+/// inner `///` / `//!` doc comments are considered; bare `txdoc:` strings
+/// outside comments (e.g. inside string literals) are ignored. Wildcard
+/// patterns like `txdoc:TXV3-*` (used in prose to describe the family of
+/// tags) are skipped — only well-formed tags with at least one segment
+/// after `TXV3-` and not ending in `-` are returned.
+fn extract_txv3_code_references(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let Some(comment_start) = line.find("//") else {
+            continue;
+        };
+        let comment = &line[comment_start..];
+        let mut rest = comment;
+        while let Some(start) = rest.find("txdoc:TXV3-") {
+            let tag_start = start + "txdoc:".len();
+            let tail = &rest[tag_start..];
+            let end = tail
+                .find(|c: char| {
+                    !(c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, '-' | '_'))
+                })
+                .unwrap_or(tail.len());
+            let tag = &tail[..end];
+            // Require at least one segment after `TXV3-`. A bare `TXV3-`
+            // (trailing dash, e.g. from the wildcard `TXV3-*` used in
+            // prose) is not a real reference.
+            if !tag.is_empty() && !tag.ends_with('-') && tag.len() > "TXV3-".len() {
+                out.push((idx + 1, tag.to_string()));
+            }
+            rest = &tail[end..];
+        }
+    }
+    out
+}
+
+/// Given a set of declared txdoc tags (harvested from `docs/Txv3/`) and
+/// a list of `(display_path, source_text)` Rust files, return a finding
+/// for every `txdoc:TXV3-*` reference in code comments that does not
+/// resolve to a declared tag.
+fn lint_txv3_code_references(known_tags: &BTreeSet<String>, files: &[(&str, &str)]) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (display, text) in files {
+        for (line_no, tag) in extract_txv3_code_references(text) {
+            if !known_tags.contains(&tag) {
+                findings.push(format!(
+                    "{display}:{line_no}: code references unknown txdoc tag `{tag}` (no declaration found in docs/Txv3/)"
+                ));
+            }
+        }
+    }
+    findings
+}
+
+fn lint_step_no_await(display: &str, text: &str) -> Vec<String> {
+    const AWAIT_BYTES: &[u8] = b".await";
+    let mut findings = Vec::new();
+    let mut depth: i32 = 0;
+    let mut step_body_depth: Option<i32> = None;
+    let mut awaiting_open_brace = false;
+
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        let cleaned = match trimmed.find("//") {
+            Some(pos) => &trimmed[..pos],
+            None => trimmed,
+        };
+
+        if step_body_depth.is_none() && !awaiting_open_brace && cleaned.contains("fn step(") {
+            awaiting_open_brace = true;
+        }
+
+        let bytes = cleaned.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'{' {
+                depth += 1;
+                if awaiting_open_brace {
+                    awaiting_open_brace = false;
+                    step_body_depth = Some(depth);
+                }
+                i += 1;
+            } else if c == b'}' {
+                if let Some(body_depth) = step_body_depth {
+                    if depth == body_depth {
+                        step_body_depth = None;
+                    }
+                }
+                depth -= 1;
+                i += 1;
+            } else if step_body_depth.is_some()
+                && i + AWAIT_BYTES.len() <= bytes.len()
+                && &bytes[i..i + AWAIT_BYTES.len()] == AWAIT_BYTES
+            {
+                findings.push(format!(
+                    "{display}:{line_no}: A-3 violation — `.await` inside `step()` body (STEP-2); return `Yield {{ shape: ... }}` and let the driver compose"
+                ));
+                i += AWAIT_BYTES.len();
+            } else {
+                i += 1;
+            }
         }
     }
     findings
@@ -750,6 +908,83 @@ fn sym() -> usize {
     }
 
     #[test]
+    fn arch_lint_rejects_await_in_step_fn_body() {
+        let findings = lint_arch_text(
+            "crates/tx-subsystems/src/foo.rs",
+            "crates/tx-subsystems/src/foo.rs",
+            r#"
+impl StepOp for FooOp {
+    fn step(&mut self, ctx: &mut ScriptCtx) -> StepOutcome<(), NoProgress> {
+        let _ = something().await;
+        StepOutcome::Done(())
+    }
+}
+"#,
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("A-3") && finding.contains(".await")),
+            "expected A-3 finding for `.await` inside step body, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn arch_lint_rejects_await_in_same_line_step_fn_body() {
+        // `fn step(...) -> X { body }` on a single line still counts.
+        let findings = lint_arch_text(
+            "crates/tx-subsystems/src/foo.rs",
+            "crates/tx-subsystems/src/foo.rs",
+            "fn step(&mut self) -> StepOutcome<(), NoProgress> { let _ = future().await; StepOutcome::Done(()) }",
+        );
+        assert!(
+            findings.iter().any(|finding| finding.contains("A-3")),
+            "expected A-3 finding for single-line step body, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn arch_lint_allows_await_outside_step_fn() {
+        let findings = lint_arch_text(
+            "crates/tx-subsystems/src/foo.rs",
+            "crates/tx-subsystems/src/foo.rs",
+            r#"
+async fn helper() -> u32 {
+    other().await
+}
+
+fn step(&mut self, ctx: &mut ScriptCtx) -> StepOutcome<(), NoProgress> {
+    StepOutcome::Done(())
+}
+"#,
+        );
+        assert!(
+            !findings.iter().any(|finding| finding.contains("A-3")),
+            "did not expect A-3 finding for `.await` in async helper, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn arch_lint_allows_step_underscore_named_fn_with_await() {
+        // `fn step_helper` is not the trait method `fn step` — only the
+        // exact `step` name is the StepOp::step contract. This test
+        // pins the name match.
+        let findings = lint_arch_text(
+            "crates/tx-subsystems/src/foo.rs",
+            "crates/tx-subsystems/src/foo.rs",
+            r#"
+async fn step_helper() -> u32 {
+    other().await
+}
+"#,
+        );
+        assert!(
+            !findings.iter().any(|finding| finding.contains("A-3")),
+            "did not expect A-3 finding for fn step_helper, got {findings:?}"
+        );
+    }
+
+    #[test]
     fn rv64_qemu_trampoline_uses_only_low_load_symbols() {
         // The trampoline `core::arch::global_asm!(...)` block lives in its
         // own file since the 2026-05-08 jumbo-mod split (see
@@ -782,5 +1017,74 @@ fn sym() -> usize {
                 }
             }
         }
+    }
+
+    #[test]
+    fn docs_lint_accepts_code_reference_to_known_txv3_tag() {
+        // A Rust file that mentions `txdoc:TXV3-STEP-MODEL-V2` in a comment
+        // must not produce a finding when that tag is declared in some
+        // docs/Txv3/ markdown. The harvest is provided as input so the
+        // test is hermetic.
+        let mut known = BTreeSet::<String>::new();
+        known.insert("TXV3-STEP-MODEL-V2".to_string());
+
+        let findings = lint_txv3_code_references(
+            &known,
+            &[(
+                "crates/tx-substrate/src/step_v3.rs",
+                "// Implements the v3 step algebra. txdoc:TXV3-STEP-MODEL-V2\npub struct Foo;\n",
+            )],
+        );
+
+        assert!(
+            findings.is_empty(),
+            "expected no findings for known TXV3 tag, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn docs_lint_rejects_code_reference_to_unknown_txv3_tag() {
+        // A Rust file mentioning `txdoc:TXV3-DOES-NOT-EXIST` in a comment
+        // must produce a finding naming the missing tag, because no
+        // docs/Txv3/ markdown declares it.
+        let known = BTreeSet::<String>::new();
+
+        let findings = lint_txv3_code_references(
+            &known,
+            &[(
+                "crates/tx-substrate/src/step_v3.rs",
+                "// txdoc:TXV3-DOES-NOT-EXIST referenced but no doc declares it\npub struct Foo;\n",
+            )],
+        );
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("TXV3-DOES-NOT-EXIST") && f.contains("step_v3.rs")),
+            "expected finding mentioning missing tag and file, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn docs_lint_treats_code_reference_to_v4_design_tag_as_already_supported_or_explicit_pass() {
+        // Pin existing behavior: a Rust file mentioning a non-TXV3 tag
+        // (e.g. `txdoc:CONCEPT-V4-OBJECT-MODEL`) must not be flagged by
+        // the new TXV3 harvest. Only `txdoc:TXV3-*` references are scanned
+        // by the harvest under test; design-doc tags are out of scope here
+        // and the existing docs/design/ harvest handles them separately.
+        let known = BTreeSet::<String>::new();
+
+        let findings = lint_txv3_code_references(
+            &known,
+            &[(
+                "crates/tx-substrate/src/lib.rs",
+                "// txdoc:CONCEPT-V4-OBJECT-MODEL — see docs/design/...\npub struct Foo;\n",
+            )],
+        );
+
+        assert!(
+            findings.is_empty(),
+            "non-TXV3 references must not be flagged by the TXV3 harvest, got {findings:?}"
+        );
     }
 }

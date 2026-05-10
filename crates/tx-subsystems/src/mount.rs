@@ -101,6 +101,7 @@ pub struct MountPayload {
 }
 
 impl MountPayload {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         fs_ops: Arc<dyn FsOps>,
         fs_page_backing: Arc<dyn FsPageBacking>,
@@ -122,6 +123,7 @@ impl MountPayload {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_cap(
         fs_ops: Arc<dyn FsOps>,
         fs_page_backing: Arc<dyn FsPageBacking>,
@@ -148,6 +150,14 @@ impl MountPayload {
 
     pub fn payload_pin_count(&self) -> u32 {
         self.payload_pin_count.load(Ordering::Acquire)
+    }
+
+    pub fn fs_ops(&self) -> &Arc<dyn FsOps> {
+        &self.fs_ops
+    }
+
+    pub fn fs_page_backing(&self) -> &Arc<dyn FsPageBacking> {
+        &self.fs_page_backing
     }
 }
 
@@ -323,8 +333,8 @@ pub struct MountInitContext {
 }
 
 pub struct MountOutput {
-    pub fs_ops: Arc<dyn FsOps>,
-    pub fs_page_backing: Arc<dyn FsPageBacking>,
+    pub fs_ops: Arc<dyn crate::vfs::FsOps>,
+    pub fs_page_backing: Arc<dyn crate::page_backed::FsPageBacking>,
     pub root_fs_object_id: FsObjectId,
     pub root_inode_meta: InodeMeta,
 }
@@ -519,7 +529,7 @@ fn cap_raw_addr<T>(cap: &Cap<T>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::{Errno, Guard, StepOutcome};
+    use crate::execution::{Errno, Guard};
     use crate::page_backed::{Frame, PageContainerKind};
     use crate::vfs::{Credential, DirCursor, DirEntry, InodeKind, RNodeBacking};
 
@@ -531,11 +541,12 @@ mod tests {
             _parent: FsObjectId,
             name: &[u8],
             _guard: &Guard<'_>,
-        ) -> StepOutcome<FsObjectId> {
+        ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress>
+        {
             if name == b"root" {
-                StepOutcome::Done(FsObjectId::ROOT)
+                tx_substrate::step_v3::StepOutcome::done(FsObjectId::ROOT)
             } else {
-                StepOutcome::Err(Errno::ENOENT)
+                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT)
             }
         }
 
@@ -543,8 +554,9 @@ mod tests {
             &self,
             _fs_object_id: FsObjectId,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<InodeMeta> {
-            StepOutcome::Done(InodeMeta::new(InodeKind::Directory, 0o040755))
+        ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress>
+        {
+            tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755))
         }
 
         fn serialize_inode_meta(
@@ -552,8 +564,8 @@ mod tests {
             _fs_object_id: FsObjectId,
             _meta: &InodeMeta,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Done(())
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::done(())
         }
 
         fn create_inode(
@@ -563,8 +575,11 @@ mod tests {
             _mode: u16,
             _cred: &Credential,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-            StepOutcome::Err(Errno::EROFS)
+        ) -> tx_substrate::step_v3::StepOutcome<
+            (FsObjectId, InodeMeta),
+            tx_substrate::step_v3::NoProgress,
+        > {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
         }
 
         fn unlink(
@@ -573,8 +588,8 @@ mod tests {
             _name: &[u8],
             _target: FsObjectId,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
         }
 
         fn rename(
@@ -584,8 +599,8 @@ mod tests {
             _new_parent: FsObjectId,
             _new_name: &[u8],
             _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
         }
 
         fn link(
@@ -594,8 +609,8 @@ mod tests {
             _name: &[u8],
             _target: FsObjectId,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
         }
 
         fn mkdir(
@@ -605,8 +620,11 @@ mod tests {
             _mode: u16,
             _cred: &Credential,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-            StepOutcome::Err(Errno::EROFS)
+        ) -> tx_substrate::step_v3::StepOutcome<
+            (FsObjectId, InodeMeta),
+            tx_substrate::step_v3::NoProgress,
+        > {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
         }
 
         fn rmdir(
@@ -615,8 +633,8 @@ mod tests {
             _name: &[u8],
             _target: FsObjectId,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
         }
 
         fn symlink(
@@ -626,8 +644,11 @@ mod tests {
             _link_target: &[u8],
             _cred: &Credential,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-            StepOutcome::Err(Errno::EROFS)
+        ) -> tx_substrate::step_v3::StepOutcome<
+            (FsObjectId, InodeMeta),
+            tx_substrate::step_v3::NoProgress,
+        > {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
         }
 
         fn readdir(
@@ -635,12 +656,19 @@ mod tests {
             _fs_object_id: FsObjectId,
             _cursor: DirCursor,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
-            StepOutcome::Done(None)
+        ) -> tx_substrate::step_v3::StepOutcome<
+            Option<(DirEntry, DirCursor)>,
+            tx_substrate::step_v3::NoProgress,
+        > {
+            tx_substrate::step_v3::StepOutcome::done(None)
         }
 
-        fn destroy_inode(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-            StepOutcome::Done(())
+        fn destroy_inode(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::done(())
         }
     }
 
@@ -650,8 +678,8 @@ mod tests {
             _fs_object_id: FsObjectId,
             _offset: u64,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<Frame> {
-            StepOutcome::Err(Errno::ENOSYS)
+        ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
         }
 
         fn flush_page(
@@ -660,8 +688,8 @@ mod tests {
             _offset: u64,
             _frame: &Frame,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
         }
 
         fn truncate(
@@ -669,12 +697,16 @@ mod tests {
             _fs_object_id: FsObjectId,
             _new_size: u64,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
         }
 
-        fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-            StepOutcome::Done(())
+        fn fsync(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+            tx_substrate::step_v3::StepOutcome::done(())
         }
     }
 
@@ -687,8 +719,8 @@ mod tests {
         crate::zones::register_all().expect("kernel zones");
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
-            fs.clone(),
-            fs,
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
             None,
             DevId::new(1),
             MountOptions::default(),
@@ -715,8 +747,8 @@ mod tests {
         crate::zones::register_all().expect("kernel zones");
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
-            fs.clone(),
-            fs,
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
             None,
             DevId::new(2),
             MountOptions::default(),
@@ -748,8 +780,8 @@ mod tests {
 
         let fs = Arc::new(MockFs);
         let payload = MountPayload::new_cap(
-            fs.clone(),
-            fs,
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
             None,
             DevId::new(3),
             MountOptions::default(),
@@ -792,5 +824,144 @@ mod tests {
         }
 
         assert_eq!(payload.payload_pin_count(), 0);
+    }
+
+    // -- step_v3 free-fn probes -------------------------------------------
+    //
+    // Mount has no production `step_*` fns; the only `StepOutcome`-shaped
+    // surface is the `MockFs` test fixture's `FsOps`/`FsPageBacking`
+    // trait impls. These standalone free fns mirror representative
+    // MockFs methods through the step_v3 outcome shape so the helper
+    // surface (`StepOutcome::done` / `err`) is exercised here. The
+    // trait impls above stay untouched.
+    //
+    // We fully-qualify step_v3 types as `tx_substrate::step_v3::*` so
+    // `StepOutcome`/`Errno` already imported via
+    // `use crate::execution::{Errno, Guard, StepOutcome}` keep working
+    // without rename gymnastics.
+    //
+    // Coverage:
+    // - `mockfs_lookup_v3` — `Done` (happy path) + `Err` (ENOENT).
+    // - `mockfs_load_inode_meta_v3` — single `Done` outcome over a
+    //   non-trivial payload (`InodeMeta`).
+    // - `mockfs_fetch_page_v3` — single `Err(ENOSYS)` outcome routed
+    //   through the `From<execution::Errno> for step_v3::Errno` bridge
+    //   (`Errno::into()`); pins that conversion path.
+
+    /// step_v3-shape sibling of [`MockFs::lookup`]. Returns
+    /// `Done(FsObjectId::ROOT)` for `b"root"`, else `Err(ENOENT)`. The
+    /// trait impl above is the only logic to mirror.
+    fn mockfs_lookup_v3(
+        _parent: FsObjectId,
+        name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
+        if name == b"root" {
+            tx_substrate::step_v3::StepOutcome::done(FsObjectId::ROOT)
+        } else {
+            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT)
+        }
+    }
+
+    /// step_v3-shape sibling of [`MockFs::load_inode_meta`]. Always
+    /// returns `Done(InodeMeta::new(Directory, 0o040755))` (the same
+    /// constant the trait impl returns). Pins the `done()` helper
+    /// against a non-trivial payload type.
+    fn mockfs_load_inode_meta_v3(
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
+        tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755))
+    }
+
+    /// step_v3-shape sibling of [`MockFs::fetch_page`]. Always returns
+    /// `Err(ENOSYS)`, routed through the `From<execution::Errno> for
+    /// step_v3::Errno` bridge so any drift in the errno catalog fails
+    /// this test. Mirrors how a real mount-side step fn would surface
+    /// an `execution::Errno` into a step_v3 outcome:
+    /// `let errno: step_v3::Errno = exec_err.into()`.
+    fn mockfs_fetch_page_v3(
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+        let exec_err = Errno::ENOSYS;
+        let v3_err: tx_substrate::step_v3::Errno = exec_err.into();
+        tx_substrate::step_v3::StepOutcome::err(v3_err)
+    }
+
+    #[test]
+    fn mockfs_lookup_v3_known_name_returns_done_root() {
+        tx_substrate::testing::init_host_for_test_once();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let guard = tx_substrate::epoch::guard();
+        let outcome = mockfs_lookup_v3(FsObjectId::ROOT, b"root", &guard);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Done(id) => {
+                assert_eq!(id, FsObjectId::ROOT);
+            }
+            other => panic!("expected v3 Done(ROOT), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mockfs_lookup_v3_unknown_name_returns_err_enoent() {
+        tx_substrate::testing::init_host_for_test_once();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let guard = tx_substrate::epoch::guard();
+        let outcome = mockfs_lookup_v3(FsObjectId::ROOT, b"nope", &guard);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::ENOENT) => {}
+            tx_substrate::step_v3::StepOutcome::Continue { .. }
+            | tx_substrate::step_v3::StepOutcome::Yield { .. }
+            | tx_substrate::step_v3::StepOutcome::Done(_)
+            | tx_substrate::step_v3::StepOutcome::Err(_) => {
+                panic!("expected v3 Err(ENOENT), got {outcome:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mockfs_load_inode_meta_v3_returns_done_directory_meta() {
+        tx_substrate::testing::init_host_for_test_once();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let guard = tx_substrate::epoch::guard();
+        let outcome = mockfs_load_inode_meta_v3(FsObjectId::ROOT, &guard);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Done(meta) => {
+                assert_eq!(meta.kind(), InodeKind::Directory);
+                assert_eq!(meta.mode, 0o040755);
+            }
+            other => panic!("expected v3 Done(InodeMeta), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mockfs_fetch_page_v3_returns_err_enosys_via_v4_into_v3_bridge() {
+        tx_substrate::testing::init_host_for_test_once();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let guard = tx_substrate::epoch::guard();
+        let outcome = mockfs_fetch_page_v3(FsObjectId::ROOT, 0, &guard);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::ENOSYS) => {}
+            tx_substrate::step_v3::StepOutcome::Continue { .. }
+            | tx_substrate::step_v3::StepOutcome::Yield { .. }
+            | tx_substrate::step_v3::StepOutcome::Done(_)
+            | tx_substrate::step_v3::StepOutcome::Err(_) => {
+                panic!("expected v3 Err(ENOSYS), got {outcome:?}");
+            }
+        }
     }
 }
