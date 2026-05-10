@@ -37,7 +37,7 @@
 use alloc::sync::Arc;
 
 use tx_substrate::zone::Cap;
-use tx_subsystems::execution::{Errno, Guard, StepOutcome};
+use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::process;
 use tx_subsystems::tty;
@@ -112,9 +112,12 @@ fn entry_index_from_object_id(id: FsObjectId) -> Option<usize> {
 ///
 /// Returns `Errno::ENOENT` if the registry has no such alias,
 /// `Errno::EIO` if RNode allocation fails.
-pub fn resolve_console_rnode(name: &[u8]) -> StepOutcome<Cap<RNode>> {
+pub fn resolve_console_rnode(
+    name: &[u8],
+) -> tx_substrate::step_v3::StepOutcome<Cap<RNode>, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     let Some(tty) = tty::project::resolve_devfs_alias(name) else {
-        return StepOutcome::Err(Errno::ENOENT);
+        return V3::err(Errno::ENOENT.into());
     };
 
     let entries = tty::project::devfs_alias_entries();
@@ -131,8 +134,8 @@ pub fn resolve_console_rnode(name: &[u8]) -> StepOutcome<Cap<RNode>> {
             payload: StructPayload::Tty(tty),
         },
     ) {
-        Ok(rnode) => StepOutcome::Done(rnode),
-        Err(_) => StepOutcome::Err(Errno::EIO),
+        Ok(rnode) => V3::done(rnode),
+        Err(_) => V3::err(Errno::EIO.into()),
     }
 }
 

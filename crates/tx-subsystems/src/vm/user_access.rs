@@ -39,7 +39,7 @@ use alloc::vec::Vec;
 use tx_hal::UserPtr;
 use tx_substrate::page_allocator;
 
-use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
+use crate::execution::{Errno, Guard, WaitToken};
 use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
 
 use super::structure::{
@@ -203,7 +203,8 @@ impl AddressSpace {
         &self,
         range: UserRange,
         kind: UserAccessKind,
-    ) -> StepOutcome<()> {
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        use tx_substrate::step_v3::StepOutcome as V3;
         for page in range.iter_pages() {
             // Skip pages already published with sufficient protection.
             // We only avoid re-materialisation when the cached entry
@@ -216,22 +217,22 @@ impl AddressSpace {
                 // The caller's intent (Read/Write) cannot be satisfied
                 // by the cached frame; surface as EFAULT (matches the
                 // recipe-permission fast path in `resolve_user_page_addr`).
-                return StepOutcome::Err(Errno::EFAULT);
+                return V3::err(Errno::EFAULT.into());
             }
             // Build a synthetic fault, observe the recipe, materialise,
             // and publish synchronously.
             let page_addr = match page.checked_start_addr() {
                 Ok(a) => a,
-                Err(_) => return StepOutcome::Err(Errno::EFAULT),
+                Err(_) => return V3::err(Errno::EFAULT.into()),
             };
             let fault = VmFault::new(page_addr, kind.required_prot());
             let outcome: VmFaultOutcome = match self.resolve_fault(fault) {
                 Ok(o) => o,
-                Err(_) => return StepOutcome::Err(Errno::EFAULT),
+                Err(_) => return V3::err(Errno::EFAULT.into()),
             };
             let materialization = match outcome.materialize_pagebacked() {
                 Ok(m) => m,
-                Err(_) => return StepOutcome::Err(Errno::EFAULT),
+                Err(_) => return V3::err(Errno::EFAULT.into()),
             };
             // Publish the materialisation. `replace_existing` honours
             // the materialisation's own intent (private CoW path sets
@@ -248,10 +249,10 @@ impl AddressSpace {
                 )
                 .is_err()
             {
-                return StepOutcome::Err(Errno::EFAULT);
+                return V3::err(Errno::EFAULT.into());
             }
         }
-        StepOutcome::Done(())
+        V3::done(())
     }
 
     /// Read a NUL-terminated byte string starting at `src`, capped at

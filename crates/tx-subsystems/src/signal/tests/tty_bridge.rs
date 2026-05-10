@@ -3,7 +3,7 @@
 use super::*;
 use crate::cred::Uid;
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::{Errno, Guard};
 use crate::process::{bootstrap_init_process, step_fork, ProcessIdentity};
 use crate::signal::{deliver_tty_dispatch, signum_for_job_control, DispatchOutcome};
 use crate::tty::execution::{JobControlSignal, SignalDispatch, SignalTarget};
