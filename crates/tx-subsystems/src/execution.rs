@@ -165,25 +165,6 @@ impl WaitToken {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StepOutcome<T> {
-    Done(T),
-    Advanced(T),
-    Blocked(WaitToken),
-    AdvancedThenBlocked(T, WaitToken),
-    Err(Errno),
-}
-
-impl<T> StepOutcome<T> {
-    pub const fn done(value: T) -> Self {
-        Self::Done(value)
-    }
-
-    pub const fn err(errno: Errno) -> Self {
-        Self::Err(errno)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,10 +175,8 @@ mod tests {
 
         assert_eq!(token.carrier(), 4);
         assert_eq!(token.interest(), 0b101);
-        assert_eq!(
-            StepOutcome::<()>::Blocked(token),
-            StepOutcome::Blocked(token)
-        );
+        let same = WaitToken::new(4, 0b101);
+        assert_eq!(token, same);
     }
 
     #[test]

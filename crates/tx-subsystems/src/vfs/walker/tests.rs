@@ -5,11 +5,12 @@
 //! can be exercised without the full reactor + bootstrap state.
 
 use alloc::sync::Arc;
+use tx_substrate::step_v3::StepOutcome;
 
 use tx_substrate::zone::{self, Cap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use crate::execution::{Guard, StepOutcome};
+use crate::execution::Guard;
 use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
 use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
