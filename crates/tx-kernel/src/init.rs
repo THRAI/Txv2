@@ -4,6 +4,7 @@ use core::{
 };
 
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
+use tx_substrate::step_v3::StepOutcome;
 use tx_substrate::zone::Cap;
 use tx_substrate::SpinMutex;
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
