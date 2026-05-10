@@ -131,6 +131,10 @@ pub fn reset_boot_state_for_test() {
     *MUSL_MOUNT.lock() = None;
     *CONSOLE_TTY.lock() = None;
     *ROOT_DENTRY.lock() = None;
+    AP_REACTOR_TASK_DONE_CPUS.store(0, Ordering::Release);
+    BSP_REACTOR_TIMER_DONE_CPUS.store(0, Ordering::Release);
+    BOOT_REACTOR.reset_for_test();
+    net::reset_boot_net_runtime_for_test();
 }
 
 /// Static `CharDeviceOps` impl that forwards `write` to
@@ -189,6 +193,7 @@ pub struct CoreInit<P: TxPlatform> {
 
 mod exec;
 mod helpers;
+mod net;
 mod reactor_submit;
 
 impl<P: TxPlatform> CoreInit<P> {
@@ -296,6 +301,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::populate_rootfs_tmp_dirs();
             Self::init_csprng();
             Self::bind_init_cwd_and_root();
+            Self::submit_net_runtime_tasks();
 
             // Deferred H4 spine slots:
             // - post-substrate init hooks
@@ -1348,6 +1354,16 @@ impl<P: TxPlatform> CoreInit<P> {
 
     fn init_boot_reactor() {
         let _ = BOOT_REACTOR.init();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn init_boot_reactor_for_test() {
+        Self::init_boot_reactor();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn step_boot_reactor_once_for_test() -> Option<tx_reactor::hart_loop::HartLoopStep> {
+        Self::step_boot_reactor_once(<P as tx_hal::SmpIf>::current_cpu_id())
     }
 
     fn boot_secondary_cpus() {

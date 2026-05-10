@@ -1,5 +1,6 @@
 //! Bounded key/value index with linear reservations.
 
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ops::Deref;
@@ -178,6 +179,26 @@ impl<K: Eq, V, const N: usize> Index<K, V, N> {
         }
 
         Err(IndexError::Missing)
+    }
+}
+
+impl<K, V, const N: usize> Index<K, V, N> {
+    /// Snapshot committed values observed under an epoch guard.
+    pub fn snapshot_values(&self, _guard: &Guard<'_>) -> Vec<V>
+    where
+        V: Clone,
+    {
+        let _lock = self.lock.lock();
+        let mut values = Vec::new();
+
+        for entry in &self.entries {
+            let state = unsafe { *entry.state.get() };
+            if state == COMMITTED {
+                values.push(unsafe { (*entry.value.get()).assume_init_ref().clone() });
+            }
+        }
+
+        values
     }
 }
 

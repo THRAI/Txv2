@@ -4,8 +4,8 @@ use super::*;
 
 use crate::linux_syscall::{
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL, NR_FCNTL, NR_GETRANDOM, NR_KILL, NR_PRLIMIT64,
-    NR_RT_SIGRETURN, NR_SETHOSTNAME, NR_TGKILL, NR_TKILL, NR_UNAME, O_RDWR, RLIMIT_AS,
-    RLIMIT_NOFILE, RLIM_INFINITY,
+    NR_RT_SIGRETURN, NR_SETHOSTNAME, NR_TGKILL, NR_TKILL, NR_UNAME, O_NONBLOCK, O_RDWR,
+    RLIMIT_AS, RLIMIT_NOFILE, RLIM_INFINITY,
 };
 
 const E_BADF: i32 = 9;
@@ -114,12 +114,29 @@ fn dispatch_fcntl_f_getfl_returns_open_flag_bits() {
     assert_eq!(r, SyscallResult::Return(O_RDWR as i64));
 }
 
-// Removed: `dispatch_fcntl_f_setfl_returns_neg_enosys`.
-// `F_SETFL` is now wired (the OpenFile-flags interior-mutability hook
-// landed in a later slice); the `-ENOSYS` expectation is stale. The
-// success path is exercised by `dispatch_fcntl_f_setfl_*` tests
-// elsewhere in this file when present, and at the
-// `OpenFile::set_runtime_nonblocking` unit-test level.
+/// `fcntl(fd, F_SETFL, O_NONBLOCK)` updates the shared OpenFile status
+/// bits that `F_GETFL` reports.
+#[test]
+fn dispatch_fcntl_f_setfl_updates_nonblocking_status_bit() {
+    let _setup = setup();
+    let _ops = install_capturing_console();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_FCNTL, [3, F_SETFL as u64, O_NONBLOCK as u64, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return(0));
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_FCNTL, [3, F_GETFL as u64, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Return((O_RDWR | O_NONBLOCK) as i64));
+}
 
 // -----------------------------------------------------------------
 // getpgrp.

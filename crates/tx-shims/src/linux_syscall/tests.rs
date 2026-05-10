@@ -1486,3 +1486,16 @@ mod mq_dispatch;
 // Kernel-to-user layout marker registry used by the musl ABI detector.
 // ===========================================================================
 mod kernel_user_layouts;
+
+// =====================================================================
+// Network N39 — socket fdtable/syscall bridge.
+//
+// Coverage:
+// - `socket(2)` installs a struct-backed socket `OpenFile`.
+// - `bind(2)` / `listen(2)` update the socket state and
+//   `getsockname(2)` reports the bound endpoint.
+// - `setsockopt(2)` / `getsockopt(2)` round-trip day-1 socket options.
+// - `close(2)` tears down the socket binding when the final fd closes.
+// =====================================================================
+
+mod socket_fdtable;

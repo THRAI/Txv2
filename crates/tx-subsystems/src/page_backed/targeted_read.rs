@@ -45,20 +45,20 @@ pub fn read_exact_at(
 
     let len = out.len();
     let Some(end) = off.checked_add(len as u64) else {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     };
 
     // Short-read contract: EOF before fill is `ENOEXEC`. Mirrors the
     // loader's targeted-read errno mapping in
     // `txdoc:EXEC-8-9-ERRNO-MAPPING`.
     if end > pc.size_bytes() {
-        return V3::err(Errno::ENOEXEC.into());
+        return V3::err(Errno::ENOEXEC);
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     };
     if end > capacity {
-        return V3::err(Errno::EINVAL.into());
+        return V3::err(Errno::EINVAL);
     }
 
     let mut advanced = 0usize;
@@ -81,7 +81,7 @@ pub fn read_exact_at(
         // - v3 `Err(e)` → `Err(e)`.
         let materialized = match pc.materialize_page(page_index, MaterializeAccess::Read, guard) {
             V3::Done(m) => m,
-            V3::Continue { .. } => return V3::err(Errno::EAGAIN.into()),
+            V3::Continue { .. } => return V3::err(Errno::EAGAIN),
             V3::Yield {
                 shape:
                     YieldShape::OnWaitSource {
@@ -96,13 +96,13 @@ pub fn read_exact_at(
                     interests.raw(),
                 );
             }
-            V3::Yield { .. } => return V3::err(Errno::EIO.into()),
+            V3::Yield { .. } => return V3::err(Errno::EIO),
             V3::Err(errno) => return V3::err(errno),
         };
 
         let frame_base = match page_allocator::frame_kernel_addr(materialized.ppn) {
             Ok(ptr) => ptr,
-            Err(_) => return V3::err(Errno::EIO.into()),
+            Err(_) => return V3::err(Errno::EIO),
         };
         // SAFETY: `frame_base` is the kernel direct-map view of an
         // installed page; we hold the materialisation pin via

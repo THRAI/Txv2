@@ -104,10 +104,7 @@ fn pagebacked_step_write_rejects_growth_beyond_capacity_without_size_change() {
     let of = open_file_for_pc(&pc);
     of.set_offset(crate::vm::USER_PAGE_SIZE as u64 - 4);
 
-    assert_eq!(
-        step_write(&pc, &of, 8, &guard),
-        V3Out::Err(Errno::EINVAL.into())
-    );
+    assert_eq!(step_write(&pc, &of, 8, &guard), V3Out::Err(Errno::EINVAL));
 
     assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64 - 4);
     assert_eq!(pc.size_bytes(), 8);

@@ -247,8 +247,8 @@ pub enum UnpackError {
     /// FsOps step returned an `Errno`. Carries the failed operation
     /// label (for diagnostics) and the errno.
     FsOp { op: &'static str, errno: Errno },
-    /// Got an `Advanced(_)` result from a step body that the unpacker
-    /// can't service synchronously. Should not occur against a
+    /// Got a progress-only `Continue` result from a step body that the
+    /// unpacker can't service synchronously. Should not occur against a
     /// freshly-mounted tmpfs.
     UnexpectedAdvance(&'static str),
 }
@@ -287,7 +287,8 @@ pub fn unpack_into_root_mount(
         })?
         .into_cap();
     // Errnos from the trait surfaces route through
-    // `Errno::from(step_v3::Errno)` into the existing
+    // `step_v3::Errno` is the execution errno surface in v3, so the
+    // unpacker can propagate it into the existing
     // `UnpackError::FsOp { errno: Errno, .. }` carrier.
     let fs_ops = payload.fs_ops.clone();
     let fs_page_backing = payload.fs_page_backing.clone();
@@ -391,7 +392,7 @@ fn walk_or_create_dirs(
                 current = id;
             }
             V3::Err(v3_errno) => {
-                let errno = Errno::from(v3_errno);
+                let errno = v3_errno;
                 if errno == Errno::ENOENT {
                     drop(guard);
                     let id = mkdir_idempotent(fs_ops, current, component, 0o755, cred)?;
@@ -422,14 +423,14 @@ fn mkdir_idempotent(
     match fs_ops.mkdir(parent, name, mode_low, cred, &guard) {
         V3::Done((id, _)) => Ok(id),
         V3::Err(v3_errno) => {
-            let errno = Errno::from(v3_errno);
+            let errno = v3_errno;
             if errno == Errno::EEXIST {
                 // Directory already exists — look it up and return the id.
                 match fs_ops.lookup(parent, name, &guard) {
                     V3::Done(id) => Ok(id),
                     V3::Err(v3_errno) => Err(UnpackError::FsOp {
                         op: "mkdir-eexist-relookup",
-                        errno: Errno::from(v3_errno),
+                        errno: v3_errno,
                     }),
                     V3::Continue { .. } | V3::Yield { .. } => {
                         Err(UnpackError::UnexpectedAdvance("mkdir-eexist-relookup"))
@@ -461,7 +462,7 @@ fn unpack_regular(
         match fs_ops.create_inode(parent_id, name, mode_low, cred, &guard) {
             V3::Done(out) => out,
             V3::Err(v3_errno) => {
-                let errno = Errno::from(v3_errno);
+                let errno = v3_errno;
                 if errno == Errno::EEXIST {
                     // Pre-existing file under that name — leave it alone.
                     return Ok(());
@@ -488,7 +489,7 @@ fn unpack_regular(
             V3::Err(v3_errno) => {
                 return Err(UnpackError::FsOp {
                     op: "materialise_rnode",
-                    errno: Errno::from(v3_errno),
+                    errno: v3_errno,
                 });
             }
             V3::Continue { .. } | V3::Yield { .. } => {
@@ -541,7 +542,7 @@ fn unpack_regular(
             V3::Err(v3_errno) => {
                 return Err(UnpackError::FsOp {
                     op: "truncate",
-                    errno: Errno::from(v3_errno),
+                    errno: v3_errno,
                 });
             }
             V3::Continue { .. } | V3::Yield { .. } => {
@@ -563,7 +564,7 @@ fn unpack_symlink(
     match fs_ops.symlink(parent_id, name, target, cred, &guard) {
         V3::Done(_) => Ok(()),
         V3::Err(v3_errno) => {
-            let errno = Errno::from(v3_errno);
+            let errno = v3_errno;
             if errno == Errno::EEXIST {
                 Ok(())
             } else {

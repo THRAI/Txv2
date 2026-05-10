@@ -324,6 +324,10 @@ impl SharedReactor {
         true
     }
 
+    pub fn reset_for_test(&self) {
+        *self.reactor.lock() = None;
+    }
+
     pub fn is_initialized(&self) -> bool {
         self.reactor.lock().is_some()
     }
