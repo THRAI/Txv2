@@ -36,6 +36,9 @@ use crate::zone::Cap;
 pub enum Errno {
     E2BIG,
     EACCES,
+    /// Operation already in progress. Used by nonblocking socket
+    /// connect when the socket is already in Connecting state.
+    EALREADY,
     /// Resource temporarily unavailable. Surfaced by `O_NONBLOCK` I/O
     /// paths (e.g. fd-ops Wave 3 `pipe::step_read` / `step_write` with
     /// `nonblocking = true` and no progress yet).
@@ -48,7 +51,12 @@ pub enum Errno {
     /// the common case). Linux semantic: `read(2)` on a writer-end
     /// fd is `-EBADF`, not `-EPIPE`.
     EBADF,
+    EADDRINUSE,
+    EADDRNOTAVAIL,
+    EAFNOSUPPORT,
     EBUSY,
+    ECONNREFUSED,
+    EDESTADDRREQ,
     EDQUOT,
     EEXIST,
     EFBIG,
@@ -58,7 +66,11 @@ pub enum Errno {
     /// Interrupted system call (e.g. by signal delivery during a
     /// blocked wait — D9-A EINTR path).
     EINTR,
+    /// Operation now in progress. Used by nonblocking socket connect
+    /// after the connect step has advanced but cannot complete yet.
+    EINPROGRESS,
     EIO,
+    EISCONN,
     EISDIR,
     ELOOP,
     EMLINK,
@@ -68,6 +80,9 @@ pub enum Errno {
     ENOMEM,
     ENOENT,
     ENOSYS,
+    /// Protocol option is not available at the requested socket level.
+    ENOPROTOOPT,
+    ENOTCONN,
     ENOTDIR,
     ENOTEMPTY,
     /// Inappropriate ioctl for device. Surfaced by Slice 5 of the
@@ -85,12 +100,18 @@ pub enum Errno {
     /// `getcwd(2)` arm when the user buffer is smaller than the
     /// rendered path (NUL terminator inclusive). Linux value: 34.
     ERANGE,
+    EOPNOTSUPP,
     EROFS,
+    /// Socket operation on a non-socket fd.
+    ENOTSOCK,
+    /// Protocol is not supported by the requested socket family/type.
+    EPROTONOSUPPORT,
     /// Illegal seek. Surfaced by `lseek(2)` when called against a
     /// non-seekable file (pipe / TTY / chardev / socket). fd-ops
     /// Wave 4. Linux value: 29.
     ESPIPE,
     ESRCH,
+    ESOCKTNOSUPPORT,
     ESTALE,
     /// Wait deadline expired. Linux value: 110.
     ETIMEDOUT,
@@ -106,16 +127,25 @@ impl Errno {
         match self {
             Errno::E2BIG => 7,
             Errno::EACCES => 13,
+            Errno::EALREADY => 114,
             Errno::EAGAIN => 11,
             Errno::EBADF => 9,
+            Errno::EADDRINUSE => 98,
+            Errno::EADDRNOTAVAIL => 99,
+            Errno::EAFNOSUPPORT => 97,
             Errno::EBUSY => 16,
+            Errno::ECONNREFUSED => 111,
+            Errno::EDESTADDRREQ => 89,
             Errno::EDQUOT => 122,
             Errno::EEXIST => 17,
             Errno::EFAULT => 14,
             Errno::EFBIG => 27,
             Errno::EIDRM => 43,
             Errno::EINVAL => 22,
+            Errno::EINTR => 4,
+            Errno::EINPROGRESS => 115,
             Errno::EIO => 5,
+            Errno::EISCONN => 106,
             Errno::EISDIR => 21,
             Errno::ELOOP => 40,
             Errno::EMLINK => 31,
@@ -125,15 +155,21 @@ impl Errno {
             Errno::ENOMEM => 12,
             Errno::ENOENT => 2,
             Errno::ENOSYS => 38,
+            Errno::ENOPROTOOPT => 92,
+            Errno::ENOTCONN => 107,
             Errno::ENOTDIR => 20,
             Errno::ENOTEMPTY => 39,
             Errno::ENOTTY => 25,
             Errno::EPERM => 1,
             Errno::EPIPE => 32,
             Errno::ERANGE => 34,
+            Errno::EOPNOTSUPP => 95,
             Errno::EROFS => 30,
+            Errno::ENOTSOCK => 88,
+            Errno::EPROTONOSUPPORT => 93,
             Errno::ESPIPE => 29,
             Errno::ESRCH => 3,
+            Errno::ESOCKTNOSUPPORT => 94,
             Errno::ESTALE => 116,
             Errno::ETIMEDOUT => 110,
             Errno::EINTR => 4,

@@ -28,20 +28,20 @@ pub fn step_master_close_last(
     // observe — require live TTY payload
     let payload = match require_live_tty(master, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     // upgrade — N/A (caller holds Cap<TtyIdentity>)
     let peer = match &payload.transport {
         TtyTransport::Pty { peer } => peer.clone(),
-        TtyTransport::Hardware { .. } => return V3::Err(Errno::EINVAL.into()),
+        TtyTransport::Hardware { .. } => return V3::Err(Errno::EINVAL),
     };
 
     // reserve — N/A (no allocation needed for teardown)
     let hangup = match step_hangup(&peer, guard) {
         V3::Done(outcome) => outcome,
         V3::Err(e) => return V3::Err(e),
-        V3::Continue { .. } | V3::Yield { .. } => return V3::Err(Errno::EIO.into()),
+        V3::Continue { .. } | V3::Yield { .. } => return V3::Err(Errno::EIO),
     };
 
     // commit — clear master's payload to signal hangup

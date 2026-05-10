@@ -301,6 +301,47 @@ pub const O_DIRECT: u32 = 0o40000;
 /// Returns the resulting absolute offset on success, or `-errno`.
 pub const NR_LSEEK: u64 = 62;
 
+// ---------------------------------------------------------------------
+// Network socket syscalls. Linux generic ABI numbers
+// (`include/uapi/asm-generic/unistd.h`).
+// ---------------------------------------------------------------------
+
+pub const NR_SOCKET: u64 = 198;
+pub const NR_SOCKETPAIR: u64 = 199;
+pub const NR_BIND: u64 = 200;
+pub const NR_LISTEN: u64 = 201;
+pub const NR_ACCEPT: u64 = 202;
+pub const NR_CONNECT: u64 = 203;
+pub const NR_GETSOCKNAME: u64 = 204;
+pub const NR_GETPEERNAME: u64 = 205;
+pub const NR_SENDTO: u64 = 206;
+pub const NR_RECVFROM: u64 = 207;
+pub const NR_SETSOCKOPT: u64 = 208;
+pub const NR_GETSOCKOPT: u64 = 209;
+pub const NR_SHUTDOWN: u64 = 210;
+pub const NR_SENDMSG: u64 = 211;
+pub const NR_RECVMSG: u64 = 212;
+pub const NR_ACCEPT4: u64 = 242;
+
+pub const AF_INET: u16 = 2;
+pub const SOL_SOCKET: i32 = 1;
+pub const IPPROTO_IP: i32 = 0;
+pub const IPPROTO_ICMP: i32 = 1;
+pub const IPPROTO_TCP: i32 = 6;
+pub const IPPROTO_UDP: i32 = 17;
+pub const SO_REUSEADDR: i32 = 2;
+pub const SO_TYPE: i32 = 3;
+pub const SO_ERROR: i32 = 4;
+pub const SO_KEEPALIVE: i32 = 9;
+pub const SO_BROADCAST: i32 = 6;
+pub const SO_LINGER: i32 = 13;
+pub const SO_REUSEPORT: i32 = 15;
+pub const SO_SNDBUF: i32 = 7;
+pub const SO_RCVBUF: i32 = 8;
+pub const SO_RCVTIMEO: i32 = 20;
+pub const SO_SNDTIMEO: i32 = 21;
+pub const TCP_NODELAY: i32 = 1;
+
 /// `lseek` whence: set the offset to the absolute value `offset`.
 /// Linux uapi `<unistd.h>` `SEEK_SET`.
 pub const SEEK_SET: u32 = 0;

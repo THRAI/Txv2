@@ -34,27 +34,27 @@ pub fn step_openpty(guard: &Guard<'_>) -> StepOutcome<OpenPtyOutcome, NoProgress
 
     let index = match registry::allocate_pty_index() {
         Ok(index) => index,
-        Err(_) => return V3::Err(Errno::EIO.into()),
+        Err(_) => return V3::Err(Errno::EIO),
     };
     if registry::contains_pty_slave(index) {
-        return V3::Err(Errno::EIO.into());
+        return V3::Err(Errno::EIO);
     }
 
     let master_id_res = match step_engine::reserve_for::<TtyIdentity>() {
         Ok(reservation) => reservation,
-        Err(_) => return V3::Err(Errno::EIO.into()),
+        Err(_) => return V3::Err(Errno::EIO),
     };
     let slave_id_res = match step_engine::reserve_for::<TtyIdentity>() {
         Ok(reservation) => reservation,
-        Err(_) => return V3::Err(Errno::EIO.into()),
+        Err(_) => return V3::Err(Errno::EIO),
     };
     let master_payload_res = match step_engine::reserve_for::<TtyPayload>() {
         Ok(reservation) => reservation,
-        Err(_) => return V3::Err(Errno::EIO.into()),
+        Err(_) => return V3::Err(Errno::EIO),
     };
     let slave_payload_res = match step_engine::reserve_for::<TtyPayload>() {
         Ok(reservation) => reservation,
-        Err(_) => return V3::Err(Errno::EIO.into()),
+        Err(_) => return V3::Err(Errno::EIO),
     };
 
     let master = step_engine::sign_for(
@@ -79,18 +79,18 @@ pub fn step_openpty(guard: &Guard<'_>) -> StepOutcome<OpenPtyOutcome, NoProgress
     slave.install_payload(slave_payload);
 
     if registry::register_pty_slave(index, slave.clone()).is_err() {
-        return V3::Err(Errno::EIO.into());
+        return V3::Err(Errno::EIO);
     }
 
     let master_file = match project::open_file_for_tty(master.clone(), guard) {
         V3::Done(file) => file,
         V3::Err(err) => return V3::Err(err),
-        _ => return V3::Err(Errno::EIO.into()),
+        _ => return V3::Err(Errno::EIO),
     };
     let slave_file = match project::open_file_for_tty(slave.clone(), guard) {
         V3::Done(file) => file,
         V3::Err(err) => return V3::Err(err),
-        _ => return V3::Err(Errno::EIO.into()),
+        _ => return V3::Err(Errno::EIO),
     };
 
     V3::Done(OpenPtyOutcome {

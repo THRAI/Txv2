@@ -304,14 +304,14 @@ pub fn step_ioctl_tiocsctty(
 
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     if let Err(err) = require_session_leader(caller) {
-        return V3::Err(err.into());
+        return V3::Err(err);
     }
     if tty.session_pgrp().is_some() {
-        return V3::Err(Errno::EBUSY.into());
+        return V3::Err(Errno::EBUSY);
     }
 
     tty.bind_session_pgrp(SessionPgrp::from_raw_ids(
@@ -343,19 +343,19 @@ pub fn step_ioctl_tiocsctty_for_process(
 
     let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     if let Err(err) = require_session_leader(caller_info) {
-        return V3::Err(err.into());
+        return V3::Err(err);
     }
     if tty.session_pgrp().is_some() {
-        return V3::Err(Errno::EBUSY.into());
+        return V3::Err(Errno::EBUSY);
     }
 
     let pgrp = caller.pgrp_cap();
@@ -384,14 +384,14 @@ pub fn step_ioctl_tiocnotty(
 
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     let Some(binding) = tty.session_pgrp() else {
-        return V3::Err(Errno::EINVAL.into());
+        return V3::Err(Errno::EINVAL);
     };
     if binding.session_id != caller.session_id {
-        return V3::Err(Errno::EINVAL.into());
+        return V3::Err(Errno::EINVAL);
     }
 
     tty.clear_session_pgrp();
@@ -418,21 +418,21 @@ pub fn step_ioctl_tiocnotty_for_process(
 
     let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     let pgrp = caller.pgrp_cap();
     let session = pgrp.session_cap();
     let Some(binding) = tty.session_pgrp() else {
-        return V3::Err(Errno::EINVAL.into());
+        return V3::Err(Errno::EINVAL);
     };
     if binding.session_id != caller_info.session_id {
-        return V3::Err(Errno::EINVAL.into());
+        return V3::Err(Errno::EINVAL);
     }
 
     tty.clear_session_pgrp();
@@ -459,14 +459,14 @@ pub fn step_ioctl_tiocspgrp(
 
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     let Some(mut binding) = tty.session_pgrp() else {
-        return V3::Err(Errno::EINVAL.into());
+        return V3::Err(Errno::EINVAL);
     };
     if binding.session_id != caller.session_id {
-        return V3::Err(Errno::EINVAL.into());
+        return V3::Err(Errno::EINVAL);
     }
 
     binding.foreground_pgid = new_pgrp;
@@ -496,24 +496,24 @@ pub fn step_ioctl_tiocspgrp_for_process(
 
     let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     let caller_session = caller.pgrp_cap().session_cap();
     if new_pgrp.session_cap().key() != caller_session.key() {
-        return V3::Err(Errno::EINVAL.into());
+        return V3::Err(Errno::EINVAL);
     }
 
     let Some(binding) = tty.session_pgrp() else {
-        return V3::Err(Errno::EINVAL.into());
+        return V3::Err(Errno::EINVAL);
     };
     if binding.session_id != caller_info.session_id {
-        return V3::Err(Errno::EINVAL.into());
+        return V3::Err(Errno::EINVAL);
     }
 
     tty.bind_session_pgrp_typed(&caller_session, new_pgrp);
@@ -537,12 +537,12 @@ pub fn step_ioctl_tiocgpgrp(
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     match tty.session_pgrp() {
         Some(binding) => V3::Done(binding.foreground_pgid),
-        None => V3::Err(Errno::EINVAL.into()),
+        None => V3::Err(Errno::EINVAL),
     }
 }
 
@@ -558,7 +558,7 @@ pub fn step_ioctl_tiocgwinsz(
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
     V3::Done(Winsize::from_u64(
         payload.window_size.load(Ordering::Acquire),
@@ -578,7 +578,7 @@ pub fn step_ioctl_tiocswinsz(
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     payload
@@ -610,7 +610,7 @@ pub fn step_ioctl_tcgets(
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
     V3::Done(payload.with_termios(|termios| *termios))
 }
@@ -628,7 +628,7 @@ pub fn step_ioctl_tcsets(
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err.into()),
+        Err(err) => return V3::Err(err),
     };
 
     let old_termios = payload.publish_termios(new_termios);

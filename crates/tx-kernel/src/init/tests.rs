@@ -14,7 +14,7 @@
 //! mount slots populate, tmpfs's `/dev` mkdir succeeds, devfs's
 //! console alias resolves, and init's cwd + fds 0/1/2 are bound.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use std::sync::Mutex;
 
@@ -119,6 +119,7 @@ static LAST_USERSPACE_CTX: Mutex<Option<tx_hal::UserTrapContext>> = Mutex::new(N
 /// test. Reset only by the next `setup()` — persists across the
 /// per-iteration `run_thread` invocations that the smoke chains.
 static USERSPACE_A0_LOG: Mutex<std::vec::Vec<usize>> = Mutex::new(std::vec::Vec::new());
+static TEST_NOW_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Test hook: when non-zero, the simulator marks the active userspace-run
 /// request as timer-preempted before returning from `enter_userspace_*`.
@@ -182,7 +183,7 @@ impl tx_hal::IrqIf for TestPlatform {}
 
 impl tx_hal::TimeIf for TestPlatform {
     fn read_ns() -> u64 {
-        0
+        TEST_NOW_NS.load(Ordering::Acquire)
     }
     fn set_deadline_ns(_deadline: u64) {}
     fn cancel_deadline() {}
@@ -282,7 +283,12 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
         .clear();
     USERSPACE_PREEMPT_ON_ENTER.store(0, Ordering::Release);
+    TEST_NOW_NS.store(0, Ordering::Release);
     guard
+}
+
+fn set_test_time_ns(now_ns: u64) {
+    TEST_NOW_NS.store(now_ns, Ordering::Release);
 }
 
 fn bootstrap_init() {
@@ -312,6 +318,10 @@ fn drive_boot_wiring() {
     CoreInit::<TestPlatform>::mount_bdevfs_at_dev_block();
     CoreInit::<TestPlatform>::bind_init_cwd_and_root();
 }
+
+mod net_delegate_deadline;
+mod net_delegate_device;
+mod userspace_net_smoke;
 
 // --- tests --------------------------------------------------------
 
