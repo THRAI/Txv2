@@ -46,7 +46,7 @@ use alloc::vec::Vec;
 use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
 use tx_substrate::zone::Cap;
 use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
-use tx_subsystems::execution::{Errno, StepOutcome};
+use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{read_exact_at, PageContainer};
 use tx_subsystems::process::{
     step_close_cloexec_fds, step_install_brk_for_exec, step_reset_signal_dispositions_for_exec,

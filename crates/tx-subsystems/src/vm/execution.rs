@@ -9,8 +9,8 @@ use alloc::vec::Vec;
 
 use tx_hal::PmapIf;
 
+use crate::execution::Guard;
 use crate::execution::WaitToken;
-use crate::execution::{Guard, StepOutcome};
 use tx_substrate::step_v3::{StepOutcome as V3StepOutcome, YieldShape};
 use crate::page_backed::{step_fsync, PageContainerKind};
 use crate::vm::checks::{

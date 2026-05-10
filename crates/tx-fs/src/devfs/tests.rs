@@ -126,7 +126,7 @@ fn devfs_lookup_console_after_register_hardware_returns_tty_rnode() {
     // Materialise an RNode through the project layer (this is the same
     // shape the future VFS walker will produce on `step_open`).
     let rnode = match super::resolve_console_rnode(b"console") {
-        StepOutcome::Done(rnode) => rnode,
+        V3Outcome::Done(rnode) => rnode,
         other => panic!("resolve_console_rnode(console) failed: {other:?}"),
     };
 

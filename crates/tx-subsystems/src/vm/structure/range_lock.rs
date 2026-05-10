@@ -15,7 +15,7 @@ use tx_substrate::step_v3::{
 };
 use tx_substrate::SpinMutex;
 
-use crate::execution::{StepOutcome, WaitToken};
+use crate::execution::WaitToken;
 use crate::wait_carrier;
 
 use super::UserRange;

@@ -1,5 +1,4 @@
 use super::*;
-use crate::execution::StepOutcome;
 use crate::page_backed::PageContainer;
 use crate::test_support::EPOCH_TEST_LOCK;
 use alloc::collections::BTreeMap;
@@ -1185,7 +1184,10 @@ fn vm_aspace_reserve_user_range_for_access_publishes_private_anon_pages() {
 
     let outcome =
         aspace.reserve_user_range_for_access(range(0x10000, 3), crate::vm::UserAccessKind::Write);
-    assert!(matches!(outcome, StepOutcome::Done(())));
+    assert!(matches!(
+        outcome,
+        tx_substrate::step_v3::StepOutcome::Done(())
+    ));
     for page in [UserPage(0x10), UserPage(0x11), UserPage(0x12)] {
         let snap = aspace
             .pmap()
@@ -1231,7 +1233,10 @@ fn vm_aspace_reserve_user_range_for_access_returns_efault_for_unmapped() {
 
     let outcome =
         aspace.reserve_user_range_for_access(range(0x30000, 1), crate::vm::UserAccessKind::Read);
-    assert_eq!(outcome, StepOutcome::Err(crate::execution::Errno::EFAULT));
+    assert_eq!(
+        outcome,
+        tx_substrate::step_v3::StepOutcome::err(crate::execution::Errno::EFAULT.into())
+    );
     assert_eq!(aspace.pmap().stats().mapped_pages, 0);
 }
 
@@ -1253,7 +1258,10 @@ fn vm_aspace_reserve_user_range_for_access_propagates_prot_mismatch_efault() {
 
     let outcome =
         aspace.reserve_user_range_for_access(range(0x40000, 1), crate::vm::UserAccessKind::Write);
-    assert_eq!(outcome, StepOutcome::Err(crate::execution::Errno::EFAULT));
+    assert_eq!(
+        outcome,
+        tx_substrate::step_v3::StepOutcome::err(crate::execution::Errno::EFAULT.into())
+    );
 }
 
 #[test]
