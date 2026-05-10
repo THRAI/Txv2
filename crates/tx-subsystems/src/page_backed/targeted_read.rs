@@ -25,8 +25,9 @@ use super::*;
 /// - `Err(Errno::EINVAL)` on offset overflow.
 /// - `Err(Errno::EIO)` if the substrate's direct-map hook is not
 ///   installed for a materialised PPN.
-/// - `Blocked` / `AdvancedThenBlocked` propagate from
-///   `materialize_page` (e.g. an `FsPageBacking::fetch_page` block).
+/// - `Yield { OnCarrier { .. } }` propagates from `materialize_page`
+///   (e.g. an `FsPageBacking::fetch_page` block) carrying the bytes
+///   read so far as `ByteProgress`.
 ///
 /// Cites: `txdoc:PAGE-BACKED-3-PAGECONTAINER`, cross-doc edit B1 in
 /// `txdoc:EXEC-WHAT-THIS-DOCUMENT-PINS`.
@@ -35,27 +36,28 @@ pub fn read_exact_at(
     off: u64,
     out: &mut [u8],
     guard: &Guard<'_>,
-) -> StepOutcome<()> {
+) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3, YieldShape};
     if out.is_empty() {
-        return StepOutcome::Done(());
+        return V3::done(());
     }
 
     let len = out.len();
     let Some(end) = off.checked_add(len as u64) else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
 
     // Short-read contract: EOF before fill is `ENOEXEC`. Mirrors the
     // loader's targeted-read errno mapping in
     // `txdoc:EXEC-8-9-ERRNO-MAPPING`.
     if end > pc.size_bytes() {
-        return StepOutcome::Err(Errno::ENOEXEC);
+        return V3::err(Errno::ENOEXEC.into());
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     if end > capacity {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     }
 
     let mut advanced = 0usize;
@@ -67,37 +69,35 @@ pub fn read_exact_at(
 
         // `materialize_page` is on v3
         // (`StepOutcome<MaterializedPage, NoProgress>`); translate per
-        // outcome variant onto the v4 return:
+        // outcome variant onto the v3 byte-progress return:
         // - v3 `Done(m)` → use the materialized frame.
         // - v3 `Continue { .. }` (NoProgress) → no frame; surface
         //   `Err(EAGAIN)` as a conservative collapse — page allocation
         //   rarely emits this for a one-shot loader read.
-        // - v3 `Yield { OnCarrier { c, i } }` → v4
-        //   `Blocked(WaitToken(c, i))` (`read_exact_at` does not split
-        //   progress; matches the prior semantics where any block was
-        //   surfaced bare).
+        // - v3 `Yield { OnCarrier { c, i } }` → propagate as v3
+        //   `Yield` carrying accumulated `ByteProgress`.
         // - v3 `Yield { OnAgent .. }` → `Err(EIO)`.
-        // - v3 `Err(e)` → `Err(e.into())`.
-        use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
+        // - v3 `Err(e)` → `Err(e)`.
         let materialized = match pc.materialize_page(page_index, MaterializeAccess::Read, guard) {
             V3::Done(m) => m,
-            V3::Continue { .. } => return StepOutcome::Err(Errno::EAGAIN),
+            V3::Continue { .. } => return V3::err(Errno::EAGAIN.into()),
             V3::Yield {
                 shape: YieldShape::OnCarrier { carrier, interests },
                 ..
             } => {
-                return StepOutcome::Blocked(crate::execution::WaitToken::new(
+                return V3::yield_on_carrier(
+                    ByteProgress::new(advanced),
                     carrier.raw(),
                     interests.raw(),
-                ))
+                );
             }
-            V3::Yield { .. } => return StepOutcome::Err(Errno::EIO),
-            V3::Err(errno) => return StepOutcome::Err(errno.into()),
+            V3::Yield { .. } => return V3::err(Errno::EIO.into()),
+            V3::Err(errno) => return V3::err(errno),
         };
 
         let frame_base = match page_allocator::frame_kernel_addr(materialized.ppn) {
             Ok(ptr) => ptr,
-            Err(_) => return StepOutcome::Err(Errno::EIO),
+            Err(_) => return V3::err(Errno::EIO.into()),
         };
         // SAFETY: `frame_base` is the kernel direct-map view of an
         // installed page; we hold the materialisation pin via
@@ -117,5 +117,5 @@ pub fn read_exact_at(
         offset += chunk as u64;
     }
 
-    StepOutcome::Done(())
+    V3::done(())
 }

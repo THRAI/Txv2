@@ -32,7 +32,7 @@ use tx_hal::PmapIf;
 use tx_substrate::page_allocator;
 use tx_substrate::zone::Cap;
 
-use crate::execution::{Errno, StepOutcome};
+use crate::execution::Errno;
 use crate::page_backed::PageContainer;
 use crate::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
@@ -297,14 +297,15 @@ pub async fn populate_detached_user_range(
     aspace: &Cap<AddressSpace>,
     vaddr: u64,
     bytes: &[u8],
-) -> StepOutcome<()> {
+) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     if bytes.is_empty() {
-        return StepOutcome::Done(());
+        return V3::done(());
     }
 
     // Bounds check.
     let Some(end) = (vaddr as usize).checked_add(bytes.len()) else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     let _ = end;
 
@@ -322,10 +323,10 @@ pub async fn populate_detached_user_range(
         // consumers that need a guard-scoped lookup later.
         let entry = match aspace.lookup(addr) {
             Some(entry) => entry,
-            None => return StepOutcome::Err(Errno::EFAULT),
+            None => return V3::err(Errno::EFAULT.into()),
         };
         if !entry.prot.write {
-            return StepOutcome::Err(Errno::EINVAL);
+            return V3::err(Errno::EINVAL.into());
         }
 
         // Materialise the page through the canonical fault-resolution
@@ -340,19 +341,19 @@ pub async fn populate_detached_user_range(
         // finds the mapping ready.
         let outcome = match aspace.resolve_fault(VmFault::new(addr, crate::vm::AccessMode::Write)) {
             Ok(outcome) => outcome,
-            Err(VmFaultError::WouldBlock) => return StepOutcome::Err(Errno::EBUSY),
-            Err(VmFaultError::ProtectionViolation) => return StepOutcome::Err(Errno::EINVAL),
-            Err(VmFaultError::NoRecipe) => return StepOutcome::Err(Errno::EFAULT),
-            Err(_) => return StepOutcome::Err(Errno::EIO),
+            Err(VmFaultError::WouldBlock) => return V3::err(Errno::EBUSY.into()),
+            Err(VmFaultError::ProtectionViolation) => return V3::err(Errno::EINVAL.into()),
+            Err(VmFaultError::NoRecipe) => return V3::err(Errno::EFAULT.into()),
+            Err(_) => return V3::err(Errno::EIO.into()),
         };
         let materialized = match outcome.materialize_pagebacked() {
             Ok(m) => m,
-            Err(_) => return StepOutcome::Err(Errno::ENOMEM),
+            Err(_) => return V3::err(Errno::ENOMEM.into()),
         };
 
         let frame_base = match page_allocator::frame_kernel_addr(materialized.page.ppn) {
             Ok(ptr) => ptr,
-            Err(_) => return StepOutcome::Err(Errno::EIO),
+            Err(_) => return V3::err(Errno::EIO.into()),
         };
         // SAFETY: `frame_base` is the kernel direct-map view of a
         // freshly materialised anonymous page; we hold the pin via
@@ -375,14 +376,14 @@ pub async fn populate_detached_user_range(
             // concurrent thread reservation contender); a `Pmap` /
             // `StaleRecipe` error here is a programmer error worth
             // surfacing.
-            return StepOutcome::Err(map_publish_error(error));
+            return V3::err(map_publish_error(error).into());
         }
 
         written += chunk;
         cursor += chunk;
     }
 
-    StepOutcome::Done(())
+    V3::done(())
 }
 
 /// Register a single LOAD segment as recipes on the aspace.
@@ -537,6 +538,7 @@ mod tests {
     use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
+    use tx_substrate::step_v3::StepOutcome as V3StepOutcome;
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -702,7 +704,7 @@ mod tests {
         let dst = USER_STACK_TOP_DEFAULT - 4096;
 
         let outcome = run_async(populate_detached_user_range(&aspace, dst, &payload));
-        assert_eq!(outcome, StepOutcome::Done(()));
+        assert_eq!(outcome, V3StepOutcome::Done(()));
 
         // Verify the page now resolves through pmap (publication
         // succeeded) — the pmap snapshot reports the mapping for the
@@ -726,7 +728,7 @@ mod tests {
         // range near `USER_STACK_TOP_DEFAULT` is registered).
         let bytes = [0x55u8; 16];
         let outcome = run_async(populate_detached_user_range(&aspace, 0x100, &bytes));
-        assert_eq!(outcome, StepOutcome::Err(Errno::EFAULT));
+        assert_eq!(outcome, V3StepOutcome::Err(Errno::EFAULT.into()));
     }
 
     #[test]
@@ -745,7 +747,7 @@ mod tests {
             .collect();
         let dst = USER_STACK_TOP_DEFAULT - (USER_STACK_INITIAL_RESERVATION);
         let outcome = run_async(populate_detached_user_range(&aspace, dst, &payload));
-        assert_eq!(outcome, StepOutcome::Done(()));
+        assert_eq!(outcome, V3StepOutcome::Done(()));
 
         // Pmap-look-up the first populated page and verify the bytes
         // through the kernel direct map.

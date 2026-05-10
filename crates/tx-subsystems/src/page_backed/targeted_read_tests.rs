@@ -1,10 +1,11 @@
 //! Tests for `page_backed::read_exact_at` (cross-doc edit B1).
 
 use super::*;
-use crate::execution::{Errno, StepOutcome};
+use crate::execution::Errno;
 use alloc::vec;
 use alloc::vec::Vec;
 use tx_substrate::page_allocator;
+use tx_substrate::step_v3::StepOutcome as V3StepOutcome;
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
@@ -70,7 +71,7 @@ fn read_exact_at_within_single_page_returns_bytes() {
     let mut out = vec![0u8; 64];
     let outcome = read_exact_at(&pc, 16, &mut out, &guard);
 
-    assert_eq!(outcome, StepOutcome::Done(()));
+    assert_eq!(outcome, V3StepOutcome::Done(()));
     assert_eq!(out.as_slice(), &payload[16..16 + 64]);
 }
 
@@ -96,7 +97,7 @@ fn read_exact_at_across_page_boundary_returns_full_buffer() {
     let mut out = vec![0u8; 5000];
     let outcome = read_exact_at(&pc, 1024, &mut out, &guard);
 
-    assert_eq!(outcome, StepOutcome::Done(()));
+    assert_eq!(outcome, V3StepOutcome::Done(()));
     assert_eq!(out.as_slice(), &payload[1024..1024 + 5000]);
 }
 
@@ -131,7 +132,7 @@ fn read_exact_at_short_read_returns_err() {
     let mut out = vec![0u8; 64];
     let outcome = read_exact_at(&pc, 100, &mut out, &guard);
 
-    assert_eq!(outcome, StepOutcome::Err(Errno::ENOEXEC));
+    assert_eq!(outcome, V3StepOutcome::Err(Errno::ENOEXEC.into()));
 }
 
 #[test]
@@ -151,6 +152,6 @@ fn read_exact_at_zero_length_is_done_noop() {
     let mut out: [u8; 0] = [];
     assert_eq!(
         read_exact_at(&pc, 0, &mut out, &guard),
-        StepOutcome::Done(())
+        V3StepOutcome::Done(())
     );
 }
