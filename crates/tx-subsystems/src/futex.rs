@@ -39,8 +39,7 @@ use tx_reactor::wait::{Channel, Mask};
 use tx_substrate::zone::ZoneError;
 use tx_substrate::SpinMutex;
 
-use crate::execution::{Errno, Guard, WaitToken};
-use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome};
+use crate::execution::Guard;
 use crate::wait_carrier;
 
 /// Number of futex hash buckets. Fixed; no dynamic allocation.
@@ -111,49 +110,12 @@ pub fn bucket_index(uaddr: u64) -> usize {
 
 /// `futex(uaddr, FUTEX_WAIT, val, timeout, ...)`.
 ///
-/// Synchronously samples the user word at `uaddr` and:
-/// - If `*uaddr != val`, returns [`StepOutcome::Err(Errno::EAGAIN)`]
-///   immediately (the futex's "fast path" guard — userspace already
-///   observed the wakeup and the kernel must not park).
-/// - Otherwise, returns [`StepOutcome::Blocked`] with a
-///   [`WaitToken`] over the bucket's wait channel.
+/// Samples `*uaddr`; if it equals `val`, yields on the bucket's wait
+/// channel (`OnCarrier`); otherwise returns `Err(EAGAIN)`.
+/// `uaddr` must be non-zero and 4-byte aligned; otherwise `Err(EINVAL)`.
+/// `timeout` is ignored in v1.
 ///
-/// `timeout` is ignored in v1 (Slice 4 carryover). The caller (the
-/// `sys_futex` arm in tx-shims) is responsible for the
-/// `wait_on_token(token).await` loop and the post-wake re-check
-/// (re-call `step_futex_wait`; if it now returns `EAGAIN` the wake
-/// was meaningful and the syscall returns 0; otherwise the same
-/// `Blocked` outcome re-parks).
-///
-/// `uaddr` must be non-zero and 4-byte aligned; otherwise returns
-/// [`StepOutcome::Err(Errno::EINVAL)`].
-
-/// `futex(uaddr, FUTEX_WAKE, n, ...)`.
-///
-/// Fires the bucket's channel, which wakes every waiter currently
-/// subscribed. Returns `n` directly — Linux's "wake at most n" is
-/// best-effort and over-waking is permissible (spurious wakees
-/// re-park on their next iteration).
-///
-/// `uaddr` must be non-zero and 4-byte aligned; otherwise returns
-/// [`StepOutcome::Err(Errno::EINVAL)`].
-
-// -- step_v3-shape sibling fns ------------------------------------------------
-//
-// Sibling `*_v3` fns matching the same logic as the fns above but
-// emitting `tx_substrate::step_v3::StepOutcome`. Bodies are run inline
-// rather than delegating, to keep the step_v3 path independently
-// testable and avoid a conversion-shim layer.
-//
-// We deliberately fully-qualify the step_v3 types as
-// `tx_substrate::step_v3::*` instead of adding a `use` so the
-// `StepOutcome`/`Errno` already in scope from `crate::execution` keep
-// working without rename gymnastics.
-
-/// `futex(uaddr, FUTEX_WAIT, val, timeout, ...)` — step_v3 outcome shape.
-///
-/// Same body as [`step_futex_wait`], but returns a
-/// [`tx_substrate::step_v3::StepOutcome`]:
+/// Returns a [`tx_substrate::step_v3::StepOutcome`]:
 /// - bad uaddr → `Err(Errno::EINVAL)`
 /// - `*uaddr != val` → `Err(Errno::EAGAIN)`
 /// - `*uaddr == val` → `Yield { progress: NoProgress, shape: OnCarrier { … } }`
@@ -191,10 +153,9 @@ pub fn step_futex_wait(
     }
 }
 
-/// `futex(uaddr, FUTEX_WAKE, n, ...)` — step_v3 outcome shape.
+/// `futex(uaddr, FUTEX_WAKE, n, ...)`.
 ///
-/// Same body and semantics as [`step_futex_wake`], translated to a
-/// [`tx_substrate::step_v3::StepOutcome`]:
+/// Returns a [`tx_substrate::step_v3::StepOutcome`]:
 /// - bad uaddr (zero or unaligned) → `Err(Errno::EINVAL)`
 /// - otherwise → `Done(n)` (best-effort: returned count is the
 ///   requested `n`, not the actually-woken count; same caveat as
@@ -224,7 +185,7 @@ pub fn step_futex_wake(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tx_substrate::step_v3::StepProgress;
+    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome, StepProgress};
     use tx_substrate::testing::init_host_for_test_once;
 
     use crate::test_support::EPOCH_TEST_LOCK;

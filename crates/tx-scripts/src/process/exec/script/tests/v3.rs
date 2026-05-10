@@ -249,11 +249,7 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecTestFs {
         V3Outcome::done(())
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> V3Outcome<(), NoProgress> {
+    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Outcome<(), NoProgress> {
         V3Outcome::done(())
     }
 }
@@ -262,8 +258,8 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecTestFs {
 
 #[test]
 fn exec_testfs_v3_lookup_round_trips_after_add_regular() {
-    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use tx_subsystems::vfs::FsOps;
 
     let _setup = super::setup();
     let (_root_dentry, fs) = super::build_fs_root();
@@ -283,9 +279,9 @@ fn exec_testfs_v3_lookup_round_trips_after_add_regular() {
 
 #[test]
 fn exec_testfs_v3_load_inode_meta_returns_regular() {
+    use tx_substrate::step_v3::StepOutcome as V3;
     use tx_subsystems::vfs::structure::InodeKind;
     use tx_subsystems::vfs::FsOps;
-    use tx_substrate::step_v3::StepOutcome as V3;
 
     let _setup = super::setup();
     let (_root_dentry, fs) = super::build_fs_root();
@@ -302,8 +298,8 @@ fn exec_testfs_v3_load_inode_meta_returns_regular() {
 
 #[test]
 fn exec_testfs_v3_create_inode_returns_enosys() {
-    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use tx_subsystems::vfs::FsOps;
 
     let _setup = super::setup();
     let (_root_dentry, fs) = super::build_fs_root();
@@ -311,22 +307,15 @@ fn exec_testfs_v3_create_inode_returns_enosys() {
     let guard = tx_substrate::epoch::guard();
     let cred = Credential::root();
     assert_eq!(
-        <ExecTestFs as FsOps>::create_inode(
-            &*fs,
-            FsObjectId::new(2),
-            b"new",
-            0o644,
-            &cred,
-            &guard
-        ),
+        <ExecTestFs as FsOps>::create_inode(&*fs, FsObjectId::new(2), b"new", 0o644, &cred, &guard),
         V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::ENOSYS)
     );
 }
 
 #[test]
 fn exec_testfs_v3_fetch_page_zero_offset_returns_frame() {
-    use tx_subsystems::page_backed::FsPageBacking;
     use tx_substrate::step_v3::StepOutcome as V3;
+    use tx_subsystems::page_backed::FsPageBacking;
 
     let _setup = super::setup();
     let (_root_dentry, fs) = super::build_fs_root();
@@ -342,8 +331,8 @@ fn exec_testfs_v3_fetch_page_zero_offset_returns_frame() {
 
 #[test]
 fn exec_testfs_v3_fsync_returns_done() {
-    use tx_subsystems::page_backed::FsPageBacking;
     use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
+    use tx_subsystems::page_backed::FsPageBacking;
 
     let _setup = super::setup();
     let (_root_dentry, fs) = super::build_fs_root();

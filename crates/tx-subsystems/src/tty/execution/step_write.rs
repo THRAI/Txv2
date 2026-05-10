@@ -12,8 +12,6 @@ use crate::tty::structure::{termios::TOSTOP, TtyIdentity, TtyTransport};
 
 /// Transform user bytes through N_TTY output processing, enqueue them, and
 /// kick the underlying transport.
-
-
 pub fn step_write_for_process(
     tty: &Cap<TtyIdentity>,
     bytes: &[u8],
@@ -114,11 +112,7 @@ fn kick_transport(
                         // Pure block: restore the chunk so a later kick
                         // can try again.
                         restore_front(tty, &payload, &chunk);
-                        V3Out::yield_on_carrier(
-                            ByteProgress::EMPTY,
-                            carrier.raw(),
-                            interests.raw(),
-                        )
+                        V3Out::yield_on_carrier(ByteProgress::EMPTY, carrier.raw(), interests.raw())
                     } else {
                         V3Out::yield_on_carrier(
                             ByteProgress::new(written.min(chunk.len())),
@@ -259,11 +253,7 @@ pub fn step_write(
         V3Out::Yield {
             shape: YieldShape::OnCarrier { carrier, interests },
             ..
-        } => V3Out::yield_on_carrier(
-            ByteProgress::new(consumed),
-            carrier.raw(),
-            interests.raw(),
-        ),
+        } => V3Out::yield_on_carrier(ByteProgress::new(consumed), carrier.raw(), interests.raw()),
         V3Out::Yield { .. } => V3Out::err(tx_substrate::step_v3::Errno::EIO),
         V3Out::Done(_) | V3Out::Continue { .. } => V3Out::done(consumed),
     }
@@ -327,7 +317,8 @@ mod tests {
             &self,
             _out: &mut [u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        {
             tx_substrate::step_v3::StepOutcome::Done(0)
         }
 
@@ -335,7 +326,8 @@ mod tests {
             &self,
             _bytes: &[u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        {
             tx_substrate::step_v3::StepOutcome::yield_on_carrier(
                 tx_substrate::step_v3::ByteProgress::EMPTY,
                 self.carrier,
@@ -353,7 +345,8 @@ mod tests {
             &self,
             _out: &mut [u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        {
             tx_substrate::step_v3::StepOutcome::Done(0)
         }
 
@@ -361,7 +354,8 @@ mod tests {
             &self,
             bytes: &[u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        {
             tx_substrate::step_v3::StepOutcome::Done(bytes.len())
         }
     }
@@ -398,9 +392,8 @@ mod tests {
         payload: TtyPayload,
     ) -> Cap<TtyIdentity> {
         let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res =
-            zone_mod::reserve_for::<crate::tty::structure::TtyPayload>()
-                .expect("tty payload reservation");
+        let payload_res = zone_mod::reserve_for::<crate::tty::structure::TtyPayload>()
+            .expect("tty payload reservation");
         let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(payload_res, payload));
         let identity = zone_mod::sign_for(id_res, TtyIdentity::new(kind, index, name));
         identity.install_payload(payload_cap);
@@ -490,11 +483,7 @@ mod tests {
         match outcome {
             tx_substrate::step_v3::StepOutcome::Yield {
                 progress,
-                shape:
-                    tx_substrate::step_v3::YieldShape::OnCarrier {
-                        carrier,
-                        interests,
-                    },
+                shape: tx_substrate::step_v3::YieldShape::OnCarrier { carrier, interests },
             } => {
                 assert!(
                     !progress.is_empty(),

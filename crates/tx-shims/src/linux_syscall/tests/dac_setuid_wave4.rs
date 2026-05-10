@@ -1,9 +1,9 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use tx_substrate::step_v3::StepOutcome;
 use alloc::sync::Arc;
 use alloc::vec;
+use tx_substrate::step_v3::StepOutcome;
 
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_substrate::{page_allocator, zone};

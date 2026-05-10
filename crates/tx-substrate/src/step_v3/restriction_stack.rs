@@ -59,9 +59,7 @@ pub struct RestrictionStack {
 impl RestrictionStack {
     /// Construct an empty restriction stack.
     pub const fn new() -> Self {
-        Self {
-            kinds: Vec::new(),
-        }
+        Self { kinds: Vec::new() }
     }
 
     /// Append a restriction. The only mutation operation. There is

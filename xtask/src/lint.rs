@@ -440,10 +440,7 @@ fn extract_txv3_code_references(text: &str) -> Vec<(usize, String)> {
 /// a list of `(display_path, source_text)` Rust files, return a finding
 /// for every `txdoc:TXV3-*` reference in code comments that does not
 /// resolve to a declared tag.
-fn lint_txv3_code_references(
-    known_tags: &BTreeSet<String>,
-    files: &[(&str, &str)],
-) -> Vec<String> {
+fn lint_txv3_code_references(known_tags: &BTreeSet<String>, files: &[(&str, &str)]) -> Vec<String> {
     let mut findings = Vec::new();
     for (display, text) in files {
         for (line_no, tag) in extract_txv3_code_references(text) {

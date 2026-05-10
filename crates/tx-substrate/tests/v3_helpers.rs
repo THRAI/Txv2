@@ -29,8 +29,7 @@ fn step_outcome_err_helper_constructs_err_variant() {
 
 #[test]
 fn step_outcome_continue_with_helper_constructs_continue_variant() {
-    let outcome: StepOutcome<(), ByteProgress> =
-        StepOutcome::continue_with(ByteProgress::new(64));
+    let outcome: StepOutcome<(), ByteProgress> = StepOutcome::continue_with(ByteProgress::new(64));
     match outcome {
         StepOutcome::Continue { progress } => {
             assert_eq!(progress.bytes(), 64);
@@ -41,8 +40,7 @@ fn step_outcome_continue_with_helper_constructs_continue_variant() {
 
 #[test]
 fn step_outcome_yield_on_carrier_helper_constructs_yield_oncarrier() {
-    let outcome: StepOutcome<(), NoProgress> =
-        StepOutcome::yield_on_carrier(NoProgress, 7, 0b101);
+    let outcome: StepOutcome<(), NoProgress> = StepOutcome::yield_on_carrier(NoProgress, 7, 0b101);
     match outcome {
         StepOutcome::Yield { progress, shape } => {
             assert!(progress.is_empty());
@@ -77,8 +75,7 @@ fn step_outcome_helpers_are_const() {
     const _DONE: StepOutcome<u32, NoProgress> = StepOutcome::done(1);
     const _ERR: StepOutcome<(), NoProgress> = StepOutcome::err(Errno::EAGAIN);
     const _CONTINUE: StepOutcome<(), NoProgress> = StepOutcome::continue_with(NoProgress);
-    const _YIELD: StepOutcome<(), NoProgress> =
-        StepOutcome::yield_on_carrier(NoProgress, 0, 0);
+    const _YIELD: StepOutcome<(), NoProgress> = StepOutcome::yield_on_carrier(NoProgress, 0, 0);
     const _SHAPE: YieldShape = YieldShape::on_carrier(0, 0);
 
     // Reference the constants so they're not dead-code-eliminated to

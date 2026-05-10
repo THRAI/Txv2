@@ -117,10 +117,7 @@ fn hex8(value: u32) -> [u8; 8] {
 }
 
 /// Walk the mount's root, look up `name`, and return the resolved id.
-fn lookup_in_root(
-    mount: &Cap<MountIdentity>,
-    name: &[u8],
-) -> StepOutcome<FsObjectId, NoProgress> {
+fn lookup_in_root(mount: &Cap<MountIdentity>, name: &[u8]) -> StepOutcome<FsObjectId, NoProgress> {
     let payload = mount
         .payload_cap()
         .expect("mount payload alive in test")

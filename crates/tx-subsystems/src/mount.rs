@@ -541,7 +541,8 @@ mod tests {
             _parent: FsObjectId,
             name: &[u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
+        ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress>
+        {
             if name == b"root" {
                 tx_substrate::step_v3::StepOutcome::done(FsObjectId::ROOT)
             } else {
@@ -553,7 +554,8 @@ mod tests {
             &self,
             _fs_object_id: FsObjectId,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
+        ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress>
+        {
             tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755))
         }
 

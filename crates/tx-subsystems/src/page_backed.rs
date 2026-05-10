@@ -251,7 +251,6 @@ enum PageBackedIoKind {
     Write,
 }
 
-
 #[derive(Debug)]
 pub struct MaterializedPage {
     pub ppn: Ppn,
@@ -377,7 +376,8 @@ impl PageContainer {
         page: PageIndex,
         access: MaterializeAccess,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress> {
+    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress>
+    {
         use tx_substrate::step_v3::StepOutcome as V3;
         if let Err(error) = self.check_bounds(page) {
             return V3::Err(page_cache_error_to_errno(error).into());
@@ -406,7 +406,8 @@ impl PageContainer {
         mount: &MountPayloadPin,
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress> {
+    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress>
+    {
         use tx_substrate::step_v3::{NoProgress, StepOutcome as V3, YieldShape};
         if let Some(materialized) = self.materialize_cached_page(page, access) {
             return match materialized {
@@ -453,7 +454,8 @@ impl PageContainer {
         access: MaterializeAccess,
         frame: Frame,
         newly_installed: bool,
-    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress> {
+    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress>
+    {
         use tx_substrate::step_v3::StepOutcome as V3;
         let frame = match cached_frame_from_frame(frame) {
             Ok(frame) => frame,
@@ -484,7 +486,8 @@ impl PageContainer {
         page: PageIndex,
         base_ppn: Ppn,
         page_count: u64,
-    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress> {
+    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress>
+    {
         use tx_substrate::step_v3::StepOutcome as V3;
         if page.as_u64() >= page_count {
             return V3::Err(tx_substrate::step_v3::Errno::EINVAL);
@@ -762,10 +765,8 @@ const fn page_cache_error_to_errno(error: PageCacheError) -> Errno {
     }
 }
 
-
 #[cfg(test)]
 mod core_tests;
-
 
 #[cfg(test)]
 mod cross_variant_tests;

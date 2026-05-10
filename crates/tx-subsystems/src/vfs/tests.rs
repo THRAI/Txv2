@@ -3,7 +3,6 @@
 use super::*;
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::{Errno as V4Errno, Guard};
-use tx_substrate::step_v3::{Errno, StepOutcome};
 use crate::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, Pgid};
@@ -14,6 +13,7 @@ use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::{Termios, TtyIdentity, TtyKind, TtyPayload, Winsize};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
+use tx_substrate::step_v3::{Errno, StepOutcome};
 use tx_substrate::zone::{self, Cap, PayloadCap};
 
 struct EchoCharOps;

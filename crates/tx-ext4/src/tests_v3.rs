@@ -22,11 +22,11 @@ use alloc::vec::Vec;
 
 use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
+use tx_substrate::epoch;
+use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::structure::{DirCursor, FsObjectId};
 use tx_subsystems::vfs::FsOps;
-use tx_substrate::epoch;
-use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
 
 use crate::read_backend::Ext4FsInstance;
 
@@ -210,9 +210,7 @@ fn open_fs() -> Arc<Ext4FsInstance<MemImage>> {
 
 #[test]
 fn ext4_v3_lookup_round_trips_through_v3_outcome() {
-    let _serial = EXT4_V3_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
@@ -225,21 +223,14 @@ fn ext4_v3_lookup_round_trips_through_v3_outcome() {
 
     // Missing name → Err(ENOENT) bridged through the v3 errno.
     assert_eq!(
-        <Ext4FsInstance<MemImage> as FsOps>::lookup(
-            &*fs,
-            FsObjectId::new(2),
-            b"missing",
-            &guard
-        ),
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, FsObjectId::new(2), b"missing", &guard),
         V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
     );
 }
 
 #[test]
 fn ext4_v3_load_inode_meta_returns_done_for_real_inode() {
-    let _serial = EXT4_V3_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
@@ -263,9 +254,7 @@ fn ext4_v3_mutation_methods_surface_enosys_through_v3_errno() {
     // link, symlink, destroy_inode, serialize_inode_meta). Pin that
     // `ENOSYS` surfaces cleanly through the trait so walker callers
     // observe a consistent shape across backends.
-    let _serial = EXT4_V3_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
@@ -301,9 +290,7 @@ fn ext4_v3_mutation_methods_surface_enosys_through_v3_errno() {
 
 #[test]
 fn ext4_v3_readdir_done_then_terminator() {
-    let _serial = EXT4_V3_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
@@ -325,23 +312,20 @@ fn ext4_v3_readdir_done_then_terminator() {
 
 #[test]
 fn ext4_v3_fetch_page_returns_done_frame_for_aligned_offset() {
-    let _serial = EXT4_V3_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
 
-    let frame =
-        match <Ext4FsInstance<MemImage> as FsPageBacking>::fetch_page(
-            &*fs,
-            FsObjectId::new(12),
-            0,
-            &guard,
-        ) {
-            V3::Done(f) => f,
-            other => panic!("fetch_page v3: {other:?}"),
-        };
+    let frame = match <Ext4FsInstance<MemImage> as FsPageBacking>::fetch_page(
+        &*fs,
+        FsObjectId::new(12),
+        0,
+        &guard,
+    ) {
+        V3::Done(f) => f,
+        other => panic!("fetch_page v3: {other:?}"),
+    };
     // ppn is host-allocated; just confirm we got a real frame back
     // (no Blocked/Advanced surfaced through the v3 surface).
     let _ = frame.ppn();
@@ -361,20 +345,13 @@ fn ext4_v3_fetch_page_returns_done_frame_for_aligned_offset() {
 #[test]
 fn ext4_v3_truncate_and_fsync_surface_enosys() {
     // Read-only ext4 surface today.
-    let _serial = EXT4_V3_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
 
     assert_eq!(
-        <Ext4FsInstance<MemImage> as FsPageBacking>::truncate(
-            &*fs,
-            FsObjectId::new(12),
-            0,
-            &guard,
-        ),
+        <Ext4FsInstance<MemImage> as FsPageBacking>::truncate(&*fs, FsObjectId::new(12), 0, &guard,),
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
     assert_eq!(
@@ -390,9 +367,7 @@ fn ext4_v3_factory_arcs_produce_dyn_v3_traits() {
     // will populate `MountPayload::fs_ops` /
     // `…::fs_page_backing` from. Mirrors `Tmpfs::fs_ops_arc`
     // / `Tmpfs::fs_page_backing_arc`.
-    let _serial = EXT4_V3_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
     let _ops_v3: Arc<dyn FsOps> = fs.clone().fs_ops_arc();

@@ -9,7 +9,6 @@ use tx_substrate::zone::{self, Cap, PayloadCap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::Guard;
-use tx_substrate::step_v3::StepOutcome;
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ExitStatus, Pgid};
 use crate::process::{
@@ -27,6 +26,7 @@ use crate::tty::structure::termios::TOSTOP;
 use crate::tty::structure::{SessionPgrp, TtyIdentity, TtyKind, TtyPayload};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
+use tx_substrate::step_v3::StepOutcome;
 
 struct NoopOps;
 

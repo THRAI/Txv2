@@ -11,7 +11,6 @@ use tx_hal::PmapIf;
 
 use crate::execution::Guard;
 use crate::execution::WaitToken;
-use tx_substrate::step_v3::{StepOutcome as V3StepOutcome, YieldShape};
 use crate::page_backed::{step_fsync, PageContainerKind};
 use crate::vm::checks::{
     require_disjoint_remap, require_fault_publication, require_fault_recipe, require_map_admission,
@@ -21,6 +20,7 @@ use crate::vm::{
     VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization, VmFaultOutcome, VmMapCommit,
     VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest,
 };
+use tx_substrate::step_v3::{StepOutcome as V3StepOutcome, YieldShape};
 
 impl AddressSpace {
     pub fn resolve_fault(&self, fault: VmFault) -> Result<VmFaultOutcome, VmFaultError> {

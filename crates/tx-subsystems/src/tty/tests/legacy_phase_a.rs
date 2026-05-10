@@ -15,8 +15,6 @@ use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 // `vfs::OpenFile::step_*`) refer to the v4 outcome type via the explicit
 // `crate::execution::StepOutcome` path or the `V4Out` alias below.
 use crate::execution::Guard;
-use tx_substrate::step_v3::Errno;
-use tx_substrate::step_v3::StepOutcome;
 use crate::test_support::EPOCH_TEST_LOCK as TTY_ZONE_TEST_LOCK;
 use crate::tty::execution::{
     register_console_alias, register_hardware, step_hangup, step_ingest, step_ioctl_tcgets,
@@ -33,6 +31,8 @@ use crate::tty::structure::ring::TtyRing;
 use crate::tty::structure::termios::{Termios, ICANON, IXON, TOSTOP};
 use crate::tty::structure::{SessionPgrp, TtyIdentity, TtyKind, TtyPayload, Winsize};
 use crate::vfs::{Credential, DirCursor, FsOps, InodeKind};
+use tx_substrate::step_v3::Errno;
+use tx_substrate::step_v3::StepOutcome;
 
 struct NoopOps;
 

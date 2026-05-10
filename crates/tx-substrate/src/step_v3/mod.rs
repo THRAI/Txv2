@@ -182,11 +182,7 @@ impl<T, P: StepProgress> StepOutcome<T, P> {
     /// `OnAgent` variant has five fields, so a single helper isn't
     /// useful. Builders or shape-specific helpers can come later when
     /// there's a real `OnAgent` client.
-    pub const fn yield_on_carrier(
-        progress: P,
-        carrier_id: u64,
-        interest_mask: u64,
-    ) -> Self {
+    pub const fn yield_on_carrier(progress: P, carrier_id: u64, interest_mask: u64) -> Self {
         Self::Yield {
             progress,
             shape: YieldShape::on_carrier(carrier_id, interest_mask),
@@ -253,14 +249,14 @@ pub mod iovec_progress;
 pub mod page_progress;
 pub use entry_progress::{DirCursor, EntryProgress};
 pub mod subject_context;
+pub use iovec_progress::IoVecProgress;
 pub use subject_context::{
     Credential, ProcessIdentity, RestrictionStackHandle, SubjectAuthority, SubjectContext,
     ThreadIdentity,
 };
-pub use iovec_progress::IoVecProgress;
 pub mod restriction_stack;
-pub use restriction_stack::{RestrictionKind, RestrictionStack};
 pub use page_progress::PageProgress;
+pub use restriction_stack::{RestrictionKind, RestrictionStack};
 pub mod execution_scope;
 pub use execution_scope::{ExecutionScope, OwnedProcessHandle};
 pub mod agent;

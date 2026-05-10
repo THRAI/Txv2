@@ -11,7 +11,6 @@ use tx_substrate::zone::{self, Cap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::Guard;
-use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
 use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
@@ -22,6 +21,7 @@ use crate::vfs::structure::{
     RNodeBacking, S_IFDIR,
 };
 use crate::vfs::FsOps;
+use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
 
 use super::{step_open, step_walk, SYMLOOP_MAX};
 
@@ -324,10 +324,7 @@ fn install_console_tty() -> Cap<TtyIdentity> {
         StepOutcome::Done(t) => t,
         other => panic!("register_hardware failed: {other:?}"),
     };
-    assert_eq!(
-        register_console_alias("console", tty.clone()),
-        V3::Done(())
-    );
+    assert_eq!(register_console_alias("console", tty.clone()), V3::Done(()));
     tty
 }
 
@@ -1037,4 +1034,3 @@ fn step_open_round_trips_to_directory_dentry() {
     };
     let _ = file;
 }
-

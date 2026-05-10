@@ -604,9 +604,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     // v3 step_ioctl_* return Done/Err only in practice; helper to
     // collapse the four-variant catalog into a v4 Errno-or-value.
     use tx_substrate::step_v3::StepOutcome as V3Out;
-    fn unwrap_v3<T>(
-        v: V3Out<T, tx_substrate::step_v3::NoProgress>,
-    ) -> Result<T, Errno> {
+    fn unwrap_v3<T>(v: V3Out<T, tx_substrate::step_v3::NoProgress>) -> Result<T, Errno> {
         match v {
             V3Out::Done(t) => Ok(t),
             V3Out::Err(e) => Err(e.into()),

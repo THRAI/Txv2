@@ -688,8 +688,8 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecveTestFs {
 
 #[test]
 fn execve_testfs_v3_lookup_round_trips_after_add_regular() {
-    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use tx_subsystems::vfs::FsOps;
 
     let _setup = execve_setup();
 
@@ -711,8 +711,8 @@ fn execve_testfs_v3_lookup_round_trips_after_add_regular() {
 
 #[test]
 fn execve_testfs_v3_load_inode_meta_returns_directory_for_root() {
-    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::StepOutcome as V3;
+    use tx_subsystems::vfs::FsOps;
 
     let _setup = execve_setup();
 
@@ -729,8 +729,8 @@ fn execve_testfs_v3_load_inode_meta_returns_directory_for_root() {
 
 #[test]
 fn execve_testfs_v3_read_link_returns_einval_for_regular() {
-    use tx_subsystems::vfs::FsOps;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use tx_subsystems::vfs::FsOps;
 
     let _setup = execve_setup();
 
@@ -748,9 +748,9 @@ fn execve_testfs_v3_read_link_returns_einval_for_regular() {
 
 #[test]
 fn execve_testfs_v3_create_inode_returns_enosys() {
-    use tx_subsystems::vfs::FsOps;
-    use tx_subsystems::vfs::structure::InodeMeta;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use tx_subsystems::vfs::structure::InodeMeta;
+    use tx_subsystems::vfs::FsOps;
 
     let _setup = execve_setup();
 
@@ -760,22 +760,15 @@ fn execve_testfs_v3_create_inode_returns_enosys() {
     let guard = tx_substrate::epoch::guard();
     let cred = Credential::root();
     assert_eq!(
-        <ExecveTestFs as FsOps>::create_inode(
-            &*fs,
-            root_id,
-            b"new",
-            0o644,
-            &cred,
-            &guard,
-        ),
+        <ExecveTestFs as FsOps>::create_inode(&*fs, root_id, b"new", 0o644, &cred, &guard,),
         V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::ENOSYS)
     );
 }
 
 #[test]
 fn execve_testfs_v3_fetch_page_returns_frame_for_regular() {
-    use tx_subsystems::page_backed::FsPageBacking;
     use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use tx_subsystems::page_backed::FsPageBacking;
 
     let _setup = execve_setup();
     ensure_zero_frame_claimed();

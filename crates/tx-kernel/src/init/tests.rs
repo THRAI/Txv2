@@ -375,9 +375,7 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
     let dentry = match outcome {
         V3::Done(d) => d,
         other => {
-            panic!(
-                "step_walk(/dev/console) must succeed after mount registration, got {other:?}",
-            )
+            panic!("step_walk(/dev/console) must succeed after mount registration, got {other:?}",)
         }
     };
     assert_eq!(dentry.name().as_bytes(), b"console");

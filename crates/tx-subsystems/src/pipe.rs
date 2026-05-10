@@ -276,26 +276,6 @@ impl Drop for PipePayload {
     }
 }
 
-/// Drain bytes from `payload`'s ring into `out`.
-///
-/// - Non-empty ring: copy what fits, fire the writer-side carrier
-///   (space freed), return `Done(copied)`.
-/// - Empty + writers closed: return `Done(0)` (EOF).
-/// - Empty + writers alive + nonblocking: return `Err(EAGAIN)`.
-/// - Empty + writers alive + blocking: return `Blocked(token)` over
-///   the reader-side carrier.
-
-/// Push bytes from `bytes` into `payload`'s ring.
-///
-/// - All readers closed: return `Err(EPIPE)`. The syscall arm is
-///   responsible for delivering SIGPIPE before returning `-EPIPE` —
-///   the pipe module has no process Cap.
-/// - Non-full ring: copy what fits, fire the reader-side carrier
-///   (data ready), return `Done(copied)`.
-/// - Full + nonblocking: return `Err(EAGAIN)`.
-/// - Full + blocking: return `Blocked(token)` over the writer-side
-///   carrier.
-
 // === step_pipe2 =======================================================
 
 /// Synthetic `FsObjectId` namespace for anonymous pipes. Linux's
@@ -388,48 +368,15 @@ pub fn step_pipe2(flags: PipeFlags) -> Result<(Cap<OpenFile>, Cap<OpenFile>), Er
     Ok((reader_open, writer_open))
 }
 
-// === step_v3-shape sibling fns =======================================
-//
-// Sibling `*_v3` fns matching the same logic as the fns above but
-// emitting `tx_substrate::step_v3::StepOutcome`. Bodies are run inline
-// rather than delegating, to keep the step_v3 path independently
-// testable and avoid a conversion-shim layer.
-//
-// We deliberately fully-qualify the step_v3 types as
-// `tx_substrate::step_v3::*` instead of adding a `use` so the
-// `StepOutcome`/`Errno` already in scope from `crate::execution` keep
-// working without rename gymnastics.
+// === step_read / step_write ==============================================
 
-/// `pipe2(2)` — step_v3 outcome shape.
+/// `read(pipe_fd, buf, len)`.
 ///
-/// Same body and semantics as [`step_pipe2`], translated to a
-/// [`tx_substrate::step_v3::StepOutcome`]:
-/// - allocation/zone failure → `Err(Errno::ENOMEM)`
-/// - success → `Done((reader_cap, writer_cap))`
-///
-/// `pipe2` is one-shot — there is no partial-progress shape on the
-/// success path — so the progress accumulator is `NoProgress`.
-
-/// `read(pipe_fd, buf, len)` — step_v3 outcome shape.
-///
-/// Same body as [`step_read`], but returns a
-/// [`tx_substrate::step_v3::StepOutcome`] over `usize` (bytes read) and
-/// `ByteProgress`:
-///
-/// - empty `out` → `Done(0)` (terminal, with `ByteProgress`-shaped
-///   accumulator unused)
-/// - non-empty ring → `Done(copied)` — pipe `step_read` is single-step:
-///   it copies what fits in one shot and the caller does not re-enter
-///   expecting more, so a partial drain is reported as `Done(n)`
-///   rather than `Continue { progress: ByteProgress::new(n) }`.
-///   `Advanced`/`AdvancedThenBlocked` are not emitted here — the
-///   single caller (`vfs::execution::step_read` under nonblocking
-///   semantics) consumes terminal byte counts.
+/// - empty `out` → `Done(0)`
+/// - non-empty ring → `Done(copied)` (single-step: copies what fits)
 /// - empty ring + writers closed → `Done(0)` (EOF)
 /// - empty ring + writers alive + nonblocking → `Err(EAGAIN)`
-/// - empty ring + writers alive + blocking → `Yield { progress:
-///   ByteProgress::EMPTY, shape: OnCarrier { reader_carrier,
-///   PIPE_READABLE } }`
+/// - empty ring + writers alive + blocking → `Yield` on reader carrier
 pub fn step_read(
     payload: &Cap<PipePayload>,
     out: &mut [u8],
@@ -464,24 +411,14 @@ pub fn step_read(
     )
 }
 
-/// `write(pipe_fd, buf, len)` — v3 outcome shape.
+/// `write(pipe_fd, buf, len)`.
 ///
-/// Same body as [`step_write`], but returns a v3
-/// [`tx_substrate::step_v3::StepOutcome`] over `usize` (bytes written) and
-/// `ByteProgress`:
-///
-/// - empty `bytes` → `Done(0)` (terminal, with `ByteProgress`-shaped
-///   accumulator unused)
-/// - all readers closed → `Err(EPIPE)`. The syscall arm is responsible
-///   for delivering SIGPIPE before returning `-EPIPE` — the pipe module
-///   has no process Cap.
-/// - non-full ring → `Done(copied)` — pipe `step_write` is single-step
-///   per the wave-6 finding (multi-step loop lives in
-///   `vfs::execution`); a partial fill is reported as `Done(n)` rather
-///   than `Continue { progress: ByteProgress::new(n) }`.
+/// - empty `bytes` → `Done(0)`
+/// - all readers closed → `Err(EPIPE)` (SIGPIPE delivery is the caller's
+///   responsibility — the pipe module has no process Cap)
+/// - non-full ring → `Done(copied)` (single-step per wave-6 finding)
 /// - full + nonblocking → `Err(EAGAIN)`
-/// - full + blocking → `Yield { progress: ByteProgress::EMPTY, shape:
-///   OnCarrier { writer_carrier, PIPE_WRITABLE } }`
+/// - full + blocking → `Yield` on writer carrier
 pub fn step_write(
     payload: &Cap<PipePayload>,
     bytes: &[u8],
@@ -929,11 +866,7 @@ mod tests {
         match outcome {
             tx_substrate::step_v3::StepOutcome::Yield {
                 progress,
-                shape:
-                    tx_substrate::step_v3::YieldShape::OnCarrier {
-                        carrier,
-                        interests,
-                    },
+                shape: tx_substrate::step_v3::YieldShape::OnCarrier { carrier, interests },
             } => {
                 assert!(
                     progress.is_empty(),
@@ -1025,11 +958,7 @@ mod tests {
         match outcome {
             tx_substrate::step_v3::StepOutcome::Yield {
                 progress,
-                shape:
-                    tx_substrate::step_v3::YieldShape::OnCarrier {
-                        carrier,
-                        interests,
-                    },
+                shape: tx_substrate::step_v3::YieldShape::OnCarrier { carrier, interests },
             } => {
                 assert!(
                     progress.is_empty(),
