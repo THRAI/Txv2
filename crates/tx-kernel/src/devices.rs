@@ -2,10 +2,8 @@ use alloc::boxed::Box;
 use core::marker::PhantomData;
 
 use tx_hal::{Arch, TxPlatform};
-use tx_subsystems::{
-    device::{register_block_devices, BlockDeviceRegistration, DevT},
-    execution::StepOutcome,
-};
+use tx_substrate::step_v3::{NoProgress, StepOutcome};
+use tx_subsystems::device::{register_block_devices, BlockDeviceRegistration, DevT};
 
 pub struct KernelBlockDevices<P: TxPlatform> {
     _platform: PhantomData<fn() -> P>,
@@ -18,14 +16,14 @@ impl<P: TxPlatform> KernelBlockDevices<P> {
         }
     }
 
-    pub fn init_and_register(&'static self) -> StepOutcome<()> {
+    pub fn init_and_register(&'static self) -> StepOutcome<(), NoProgress> {
         match P::ARCH {
             Arch::LoongArch64 => self.init_la64_qemu_virt(),
             _ => StepOutcome::Done(()),
         }
     }
 
-    fn init_la64_qemu_virt(&'static self) -> StepOutcome<()> {
+    fn init_la64_qemu_virt(&'static self) -> StepOutcome<(), NoProgress> {
         let block = Box::leak(Box::new(tx_drivers::virtio::VirtioPciBlock::<P>::new(
             "pcie-ecam",
             "pcie-mmio32",

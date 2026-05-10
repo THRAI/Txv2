@@ -1,8 +1,9 @@
 use super::*;
-use crate::execution::{Errno, StepOutcome};
+use crate::execution::Errno;
 use alloc::vec;
 use alloc::vec::Vec;
 use tx_hal::UserPtr;
+use tx_substrate::step_v3::StepOutcome;
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
@@ -64,7 +65,7 @@ fn vm_copy_from_user_rejects_unmapped_pointer_before_kernel_copy() {
 
     let copied = aspace.copy_from_user(&mut observed, UserPtr::new(0x8000), &guard);
 
-    assert_eq!(copied, StepOutcome::Err(Errno::EFAULT));
+    assert_eq!(copied, StepOutcome::Err(Errno::EFAULT.into()));
     assert_eq!(observed, [0xAA; 8]);
 }
 
@@ -80,5 +81,5 @@ fn vm_copy_to_user_rejects_read_only_recipe() {
 
     let copied = aspace.copy_to_user(UserPtr::new(user_addr), &payload, &guard);
 
-    assert_eq!(copied, StepOutcome::Err(Errno::EFAULT));
+    assert_eq!(copied, StepOutcome::Err(Errno::EFAULT.into()));
 }

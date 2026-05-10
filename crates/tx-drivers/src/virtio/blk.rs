@@ -2,10 +2,11 @@ use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tx_hal::TxPlatform;
+use tx_substrate::step_v3::{NoProgress, StepOutcome};
 use tx_substrate::{page_allocator, SpinMutex};
 use tx_subsystems::{
     device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber},
-    execution::{Errno, Guard, StepOutcome},
+    execution::{Errno, Guard},
     page_backed::Frame,
 };
 use virtio_drivers::{device::blk::VirtIOBlk, transport::pci::PciTransport};
@@ -68,14 +69,14 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
         block_id: PhysicalBlockNumber,
         target: &mut [Frame],
         _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
+    ) -> StepOutcome<(), NoProgress> {
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
-            return StepOutcome::Err(Errno::ENODEV);
+            return StepOutcome::Err(Errno::ENODEV.into());
         };
         let sectors_per_page = sectors_per_page(self.block_size());
         if sectors_per_page == 0 {
-            return StepOutcome::Err(Errno::EINVAL);
+            return StepOutcome::Err(Errno::EINVAL.into());
         }
 
         for (idx, frame) in target.iter_mut().enumerate() {
@@ -83,13 +84,13 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
                 .as_u64()
                 .checked_add(idx as u64 * sectors_per_page as u64)
             else {
-                return StepOutcome::Err(Errno::EINVAL);
+                return StepOutcome::Err(Errno::EINVAL.into());
             };
             let Some(buf) = frame_slice_mut(*frame) else {
-                return StepOutcome::Err(Errno::EIO);
+                return StepOutcome::Err(Errno::EIO.into());
             };
             if blk.read_blocks(lba as usize, buf).is_err() {
-                return StepOutcome::Err(Errno::EIO);
+                return StepOutcome::Err(Errno::EIO.into());
             }
         }
         StepOutcome::Done(())
@@ -100,14 +101,14 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
         block_id: PhysicalBlockNumber,
         source: &[Frame],
         _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
+    ) -> StepOutcome<(), NoProgress> {
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
-            return StepOutcome::Err(Errno::ENODEV);
+            return StepOutcome::Err(Errno::ENODEV.into());
         };
         let sectors_per_page = sectors_per_page(self.block_size());
         if sectors_per_page == 0 {
-            return StepOutcome::Err(Errno::EINVAL);
+            return StepOutcome::Err(Errno::EINVAL.into());
         }
 
         for (idx, frame) in source.iter().enumerate() {
@@ -115,25 +116,25 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
                 .as_u64()
                 .checked_add(idx as u64 * sectors_per_page as u64)
             else {
-                return StepOutcome::Err(Errno::EINVAL);
+                return StepOutcome::Err(Errno::EINVAL.into());
             };
             let Some(buf) = frame_slice(*frame) else {
-                return StepOutcome::Err(Errno::EIO);
+                return StepOutcome::Err(Errno::EIO.into());
             };
             if blk.write_blocks(lba as usize, buf).is_err() {
-                return StepOutcome::Err(Errno::EIO);
+                return StepOutcome::Err(Errno::EIO.into());
             }
         }
         StepOutcome::Done(())
     }
 
-    fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<()> {
+    fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
-            return StepOutcome::Err(Errno::ENODEV);
+            return StepOutcome::Err(Errno::ENODEV.into());
         };
         if blk.flush().is_err() {
-            return StepOutcome::Err(Errno::EIO);
+            return StepOutcome::Err(Errno::EIO.into());
         }
         StepOutcome::Done(())
     }

@@ -3,6 +3,8 @@
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use tx_substrate::step_v3::StepOutcome;
+
 use crate::execution::{Errno, Guard};
 use crate::page_backed::Frame;
 
@@ -214,12 +216,12 @@ static mut BLOCK_REGISTRY: [Option<&'static BlockDeviceRegistration>; MAX_STATIC
 
 pub fn register_block_devices(
     regs: &'static [&'static BlockDeviceRegistration],
-) -> StepOutcome<()> {
+) -> StepOutcome<(), tx_substrate::step_v3::NoProgress> {
     if BLOCK_REGISTRY_INITIALIZED.swap(true, Ordering::AcqRel) {
-        return StepOutcome::Err(Errno::EEXIST);
+        return StepOutcome::Err(Errno::EEXIST.into());
     }
     if regs.len() > MAX_STATIC_BLOCK_DEVICES {
-        return StepOutcome::Err(Errno::ENOMEM);
+        return StepOutcome::Err(Errno::ENOMEM.into());
     }
 
     for (idx, reg) in regs.iter().copied().enumerate() {
@@ -228,7 +230,7 @@ pub fn register_block_devices(
             .copied()
             .any(|seen| seen.devt == reg.devt || seen.name == reg.name)
         {
-            return StepOutcome::Err(Errno::EEXIST);
+            return StepOutcome::Err(Errno::EEXIST.into());
         }
         unsafe {
             BLOCK_REGISTRY[idx] = Some(reg);
@@ -367,7 +369,7 @@ mod tests {
         assert!(core::ptr::eq(snapshot[0], &BLOCK_REG));
         assert_eq!(
             register_block_devices(REGS),
-            StepOutcome::Err(Errno::EEXIST)
+            StepOutcome::Err(Errno::EEXIST.into())
         );
     }
 
@@ -383,7 +385,7 @@ mod tests {
 
         assert_eq!(
             register_block_devices(REGS),
-            StepOutcome::Err(Errno::EEXIST)
+            StepOutcome::Err(Errno::EEXIST.into())
         );
         assert!(block_device_snapshot().is_empty());
     }
