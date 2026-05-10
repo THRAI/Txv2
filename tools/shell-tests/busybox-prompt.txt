@@ -2,7 +2,7 @@
 #
 # Run with:
 #   cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf
-#   cargo xtask image cpio --profile busybox
+#   cargo xtask image cpio --profile busybox --target rv64-qemu
 #   cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-prompt.txt
 #
 # The deliberate `sleep` directives are heisenbug-catches: we don't

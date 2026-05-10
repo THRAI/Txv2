@@ -69,9 +69,9 @@ fn print_usage() {
            cargo xtask fault-decode --target rv64-qemu [--elf PATH] [--serial PATH [--all] | --scause HEX --sepc HEX --stval HEX | --addr HEX]\n\
            cargo xtask trap-trace --serial PATH [--syscalls | --raw]\n\
            cargo xtask shell-test --target rv64-qemu --script PATH\n\
-           cargo xtask image cpio --profile busybox\n\
-           cargo xtask image ext4 --profile busybox [--size 64M]\n\
-           cargo xtask image m1dock-sd --profile busybox [--size 64M]\n\
+           cargo xtask image cpio --profile busybox [--target rv64-qemu|la64-qemu]\n\
+           cargo xtask image ext4 --profile busybox [--target rv64-qemu|la64-qemu] [--size 64M]\n\
+           cargo xtask image m1dock-sd --profile busybox [--target rv64-m1dock-mock] [--size 64M]\n\
            cargo xtask oscomp doctor|prepare|submit|run|qemu\n\
            cargo xtask submit k210 [--out target/submit/k210]\n\
            cargo xtask progress validate\n\

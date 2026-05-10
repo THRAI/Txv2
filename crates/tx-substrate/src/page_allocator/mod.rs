@@ -310,6 +310,19 @@ pub fn acquire_cache_pin(
     Ok(CachePin::new(allocator, ppn))
 }
 
+/// Acquire DMA/long-term-pin role evidence for an already-live frame.
+///
+/// Device drivers use this when a frame is handed to hardware and must not be
+/// reclaimed until the DMA mapping is torn down. The returned token owns the
+/// `pin_count` contribution and releases it on drop.
+pub fn acquire_dma_pin(
+    ppn: Ppn,
+) -> Result<DmaPin<'static, BitmapPageAllocator<'static>>, AllocError> {
+    let allocator = installed_bitmap_allocator()?;
+    allocator.acquire_dma_pin(ppn)?;
+    Ok(DmaPin::new(allocator, ppn))
+}
+
 /// Copy the full contents of one frame to another through the installed direct-map hook.
 pub fn copy_frame_contents(source: Ppn, dest: Ppn) -> Result<(), AllocError> {
     let copier = FRAME_COPIER.load(Ordering::Acquire);

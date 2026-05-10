@@ -37,6 +37,7 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
             "cargo",
             &[
                 "clippy",
+                "--no-deps",
                 "--workspace",
                 "--all-targets",
                 "--exclude",
@@ -146,8 +147,9 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn ci_slow(root: &Path) -> Result<()> {
-    let busybox_present = root.join(crate::image::VENDORED_BUSYBOX_RELPATH).exists()
-        || std::env::var_os("TX_BUSYBOX").is_some();
+    let rv64_busybox = crate::image::vendored_busybox_relpath(TxTarget::Rv64Qemu);
+    let busybox_present =
+        root.join(rv64_busybox).exists() || std::env::var_os("TX_BUSYBOX").is_some();
 
     let mut results = vec![
         ci_run(
@@ -189,7 +191,7 @@ pub(crate) fn ci_slow(root: &Path) -> Result<()> {
             command: "cargo xtask test busybox-smoke --target rv64-qemu".to_string(),
             outcome: CiOutcome::Skipped(format!(
                 "vendored busybox missing at {}; run tools/images/fetch-busybox.sh",
-                crate::image::VENDORED_BUSYBOX_RELPATH
+                rv64_busybox
             )),
         });
     }

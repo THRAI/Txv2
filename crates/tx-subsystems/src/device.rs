@@ -1,9 +1,12 @@
 //! Device and block-handle shells shared by devfs, bdev-fs, and backends.
 
 use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::page_backed::Frame;
+
+const MAX_STATIC_BLOCK_DEVICES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DevT(u64);
@@ -190,6 +193,76 @@ impl fmt::Debug for BlockDeviceHandle {
     }
 }
 
+static BLOCK_REGISTRY_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static BLOCK_REGISTRY_LEN: AtomicUsize = AtomicUsize::new(0);
+static mut BLOCK_REGISTRY: [Option<&'static BlockDeviceRegistration>; MAX_STATIC_BLOCK_DEVICES] =
+    [None; MAX_STATIC_BLOCK_DEVICES];
+
+pub fn register_block_devices(
+    regs: &'static [&'static BlockDeviceRegistration],
+) -> StepOutcome<()> {
+    if BLOCK_REGISTRY_INITIALIZED.swap(true, Ordering::AcqRel) {
+        return StepOutcome::Err(Errno::EEXIST);
+    }
+    if regs.len() > MAX_STATIC_BLOCK_DEVICES {
+        return StepOutcome::Err(Errno::ENOMEM);
+    }
+
+    for (idx, reg) in regs.iter().copied().enumerate() {
+        if regs[..idx]
+            .iter()
+            .copied()
+            .any(|seen| seen.devt == reg.devt || seen.name == reg.name)
+        {
+            return StepOutcome::Err(Errno::EEXIST);
+        }
+        unsafe {
+            BLOCK_REGISTRY[idx] = Some(reg);
+        }
+    }
+    BLOCK_REGISTRY_LEN.store(regs.len(), Ordering::Release);
+    StepOutcome::Done(())
+}
+
+pub fn block_device_by_name(name: &[u8]) -> Option<&'static BlockDeviceRegistration> {
+    block_device_snapshot()
+        .into_iter()
+        .find(|reg| reg.name.as_bytes() == name)
+}
+
+pub fn block_device_by_devt(devt: DevT) -> Option<&'static BlockDeviceRegistration> {
+    block_device_snapshot()
+        .into_iter()
+        .find(|reg| reg.devt == devt)
+}
+
+pub fn block_device_snapshot() -> alloc::vec::Vec<&'static BlockDeviceRegistration> {
+    let len = BLOCK_REGISTRY_LEN.load(Ordering::Acquire);
+    let mut out = alloc::vec::Vec::with_capacity(len);
+    let mut idx = 0;
+    while idx < len {
+        let entry = unsafe { BLOCK_REGISTRY[idx] };
+        if let Some(reg) = entry {
+            out.push(reg);
+        }
+        idx += 1;
+    }
+    out
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_block_registry_for_test() {
+    let mut idx = 0;
+    while idx < MAX_STATIC_BLOCK_DEVICES {
+        unsafe {
+            BLOCK_REGISTRY[idx] = None;
+        }
+        idx += 1;
+    }
+    BLOCK_REGISTRY_LEN.store(0, Ordering::Release);
+    BLOCK_REGISTRY_INITIALIZED.store(false, Ordering::Release);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +331,45 @@ mod tests {
             handle.read_blocks(4, &mut frames, &guard),
             StepOutcome::Err(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn static_block_registry_indexes_by_name_and_devt_once() {
+        reset_block_registry_for_test();
+        static REGS: &[&BlockDeviceRegistration] = &[&BLOCK_REG];
+
+        assert_eq!(register_block_devices(REGS), StepOutcome::Done(()));
+        assert!(core::ptr::eq(
+            block_device_by_name(b"vda1").expect("vda1"),
+            &BLOCK_REG
+        ));
+        assert!(core::ptr::eq(
+            block_device_by_devt(DevT::new(8, 1)).expect("devt"),
+            &BLOCK_REG
+        ));
+        let snapshot = block_device_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert!(core::ptr::eq(snapshot[0], &BLOCK_REG));
+        assert_eq!(
+            register_block_devices(REGS),
+            StepOutcome::Err(Errno::EEXIST)
+        );
+    }
+
+    #[test]
+    fn static_block_registry_rejects_duplicate_names_or_devts() {
+        reset_block_registry_for_test();
+        static DUP_NAME: BlockDeviceRegistration = BlockDeviceRegistration {
+            devt: DevT::new(8, 2),
+            name: "vda1",
+            ops: &BLOCK_OPS,
+        };
+        static REGS: &[&BlockDeviceRegistration] = &[&BLOCK_REG, &DUP_NAME];
+
+        assert_eq!(
+            register_block_devices(REGS),
+            StepOutcome::Err(Errno::EEXIST)
+        );
+        assert!(block_device_snapshot().is_empty());
     }
 }

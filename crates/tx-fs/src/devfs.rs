@@ -37,13 +37,14 @@
 use alloc::sync::Arc;
 
 use tx_substrate::zone::Cap;
+use tx_subsystems::device;
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::process;
 use tx_subsystems::tty;
 use tx_subsystems::vfs::{
     self, Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
-    OpenFileFlags, RNode, RNodeBacking, StructPayload, S_IFCHR, S_IFDIR,
+    OpenFileFlags, RNode, RNodeBacking, StructPayload, S_IFBLK, S_IFCHR, S_IFDIR,
 };
 
 /// Stable `FsObjectId` for the devfs root directory.
@@ -63,6 +64,9 @@ const DEVFS_ENTRY_OBJECT_BASE: u64 = 0x6465_7601;
 /// Mode for any character-device alias resolved by devfs (per the
 /// Phase 3a plan §"devfs FsOps surface": `S_IFCHR | 0o620`).
 pub const DEVFS_CHAR_MODE: u16 = S_IFCHR | 0o620;
+
+/// Mode for static block-device entries resolved by devfs.
+pub const DEVFS_BLOCK_MODE: u16 = S_IFBLK | 0o660;
 
 /// Mode for the devfs root directory (`S_IFDIR | 0o755`).
 pub const DEVFS_ROOT_MODE: u16 = S_IFDIR | 0o755;
@@ -118,6 +122,17 @@ impl FsOps for Devfs {
                 }
             }
         }
+        if device::block_device_by_name(name).is_some() {
+            let block_base = tty::project::devfs_alias_entries().len();
+            let entries = device::block_device_snapshot();
+            for (idx, entry) in entries.iter().enumerate() {
+                if entry.name.as_bytes() == name {
+                    return StepOutcome::Done(FsObjectId::new(
+                        DEVFS_ENTRY_OBJECT_BASE + (block_base + idx) as u64,
+                    ));
+                }
+            }
+        }
         StepOutcome::Err(Errno::ENOENT)
     }
 
@@ -134,6 +149,12 @@ impl FsOps for Devfs {
             .is_some()
         {
             return StepOutcome::Done(InodeMeta::new(InodeKind::CharDevice, DEVFS_CHAR_MODE));
+        }
+        if block_index_from_object_id(fs_object_id)
+            .and_then(|idx| device::block_device_snapshot().into_iter().nth(idx))
+            .is_some()
+        {
+            return StepOutcome::Done(InodeMeta::new(InodeKind::BlockDevice, DEVFS_BLOCK_MODE));
         }
         StepOutcome::Err(Errno::ENOENT)
     }
@@ -232,13 +253,27 @@ impl FsOps for Devfs {
         }
         let entries = tty::project::devfs_alias_entries();
         let index = cursor.as_u64() as usize;
-        let Some(entry) = entries.get(index) else {
+        if let Some(entry) = entries.get(index) {
+            let dir_entry = match DirEntry::new(
+                FsObjectId::new(DEVFS_ENTRY_OBJECT_BASE + index as u64),
+                InodeKind::CharDevice,
+                &entry.name,
+            ) {
+                Ok(de) => de,
+                Err(err) => return StepOutcome::Err(err),
+            };
+            return StepOutcome::Done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
+        }
+
+        let block_index = index.saturating_sub(entries.len());
+        let block_entries = device::block_device_snapshot();
+        let Some(entry) = block_entries.get(block_index) else {
             return StepOutcome::Done(None);
         };
         let dir_entry = match DirEntry::new(
             FsObjectId::new(DEVFS_ENTRY_OBJECT_BASE + index as u64),
-            InodeKind::CharDevice,
-            &entry.name,
+            InodeKind::BlockDevice,
+            entry.name.as_bytes(),
         ) {
             Ok(de) => de,
             Err(err) => return StepOutcome::Err(err),
@@ -298,30 +333,47 @@ impl FsOps for Devfs {
         meta: InodeMeta,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>> {
-        if meta.kind() != InodeKind::CharDevice {
-            // devfs only publishes the root directory and
-            // char-device aliases. Directories are handled by the
-            // walker's inline `Directory` arm; anything else is a
-            // backend bug.
-            return StepOutcome::Err(Errno::ENOSYS);
-        }
-        let Some(idx) = entry_index_from_object_id(fs_object_id) else {
-            return StepOutcome::Err(Errno::ENOENT);
-        };
-        let entries = tty::project::devfs_alias_entries();
-        let Some(entry) = entries.into_iter().nth(idx) else {
-            return StepOutcome::Err(Errno::ENOENT);
-        };
-        let tty = entry.tty;
-        match RNode::new_cap(
-            fs_object_id,
-            meta,
-            RNodeBacking::StructBacked {
-                payload: StructPayload::Tty(tty),
-            },
-        ) {
-            Ok(rnode) => StepOutcome::Done(rnode),
-            Err(_) => StepOutcome::Err(Errno::EIO),
+        match meta.kind() {
+            InodeKind::CharDevice => {
+                let Some(idx) = entry_index_from_object_id(fs_object_id) else {
+                    return StepOutcome::Err(Errno::ENOENT);
+                };
+                let entries = tty::project::devfs_alias_entries();
+                let Some(entry) = entries.into_iter().nth(idx) else {
+                    return StepOutcome::Err(Errno::ENOENT);
+                };
+                let tty = entry.tty;
+                match RNode::new_cap(
+                    fs_object_id,
+                    meta,
+                    RNodeBacking::StructBacked {
+                        payload: StructPayload::Tty(tty),
+                    },
+                ) {
+                    Ok(rnode) => StepOutcome::Done(rnode),
+                    Err(_) => StepOutcome::Err(Errno::EIO),
+                }
+            }
+            InodeKind::BlockDevice => {
+                let Some(idx) = block_index_from_object_id(fs_object_id) else {
+                    return StepOutcome::Err(Errno::ENOENT);
+                };
+                let entries = device::block_device_snapshot();
+                let Some(entry) = entries.into_iter().nth(idx) else {
+                    return StepOutcome::Err(Errno::ENOENT);
+                };
+                match RNode::new_cap(
+                    fs_object_id,
+                    meta,
+                    RNodeBacking::StructBacked {
+                        payload: StructPayload::BlockDevice(entry),
+                    },
+                ) {
+                    Ok(rnode) => StepOutcome::Done(rnode),
+                    Err(_) => StepOutcome::Err(Errno::EIO),
+                }
+            }
+            _ => StepOutcome::Err(Errno::ENOSYS),
         }
     }
 }
@@ -369,6 +421,11 @@ fn entry_index_from_object_id(id: FsObjectId) -> Option<usize> {
         return None;
     }
     usize::try_from(raw - DEVFS_ENTRY_OBJECT_BASE).ok()
+}
+
+fn block_index_from_object_id(id: FsObjectId) -> Option<usize> {
+    let idx = entry_index_from_object_id(id)?;
+    idx.checked_sub(tty::project::devfs_alias_entries().len())
 }
 
 /// Materialise an `RNode` for the named devfs alias.

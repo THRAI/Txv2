@@ -65,15 +65,21 @@ verify_or_pin() {
     fi
     log "sha256 ok ($got)"
   else
-    printf '%s  %s\n' "$got" "$(basename "$TARGET")" > "$SHA_FILE"
+    if ! printf '%s  %s\n' "$got" "$(basename "$TARGET")" > "$SHA_FILE"; then
+      log "failed to write sha256 pin $SHA_FILE"
+      return 1
+    fi
     log "wrote new pin $SHA_FILE ($got)"
   fi
 }
 
 write_source() {
   local url="$1"
-  printf 'busybox riscv64 musl\nversion: %s\nfetched-from: %s\nfetched-at: %s\n' \
-    "$BUSYBOX_VERSION" "$url" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SOURCE_FILE"
+  if ! printf 'busybox riscv64 musl\nversion: %s\nfetched-from: %s\nfetched-at: %s\n' \
+    "$BUSYBOX_VERSION" "$url" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SOURCE_FILE"; then
+    log "failed to write source metadata $SOURCE_FILE"
+    return 1
+  fi
 }
 
 is_riscv64_static_elf() {
@@ -96,10 +102,14 @@ try_simple_download() {
   tmp="$(mktemp)"
   if curl --fail --silent --show-error --location --output "$tmp" "$url"; then
     if is_riscv64_static_elf "$tmp"; then
-      install -m 0755 "$tmp" "$TARGET"
+      if ! install -m 0755 "$tmp" "$TARGET"; then
+        log "failed to install $TARGET"
+        rm -f "$tmp"
+        return 1
+      fi
       rm -f "$tmp"
       verify_or_pin "$TARGET" || return 1
-      write_source "$url"
+      write_source "$url" || return 1
       log "wrote $TARGET ($(wc -c < "$TARGET") bytes)"
       return 0
     fi
@@ -144,9 +154,12 @@ try_alpine_apk() {
   if ! is_riscv64_static_elf "$workdir/bin/busybox.static"; then
     return 1
   fi
-  install -m 0755 "$workdir/bin/busybox.static" "$TARGET"
+  if ! install -m 0755 "$workdir/bin/busybox.static" "$TARGET"; then
+    log "failed to install $TARGET"
+    return 1
+  fi
   verify_or_pin "$TARGET" || return 1
-  write_source "$apk_url"
+  write_source "$apk_url" || return 1
   log "wrote $TARGET ($(wc -c < "$TARGET") bytes)"
   return 0
 }

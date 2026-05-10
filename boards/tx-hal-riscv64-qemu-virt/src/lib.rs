@@ -350,8 +350,8 @@ impl PmapIf for Platform {
         pmap::rollback_kernel_mapping(reservation);
     }
 
-    fn commit_kernel_mapping(reservation: PmapReservation) {
-        pmap::commit_kernel_mapping(reservation);
+    fn commit_kernel_mapping(reservation: PmapReservation, permissions: PmapPermissions) {
+        pmap::commit_kernel_mapping(reservation, permissions);
     }
 
     fn unmap_kernel_mapping(

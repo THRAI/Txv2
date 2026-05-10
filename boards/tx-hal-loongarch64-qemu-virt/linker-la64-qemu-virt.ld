@@ -40,7 +40,7 @@ SECTIONS
 
     .bss.stack (NOLOAD) : ALIGN(4K) {
         __tx_boot_stack_bottom = .;
-        . += 64K;
+        . += 256K;
         . = ALIGN(16);
         __tx_boot_stack_top = .;
     }

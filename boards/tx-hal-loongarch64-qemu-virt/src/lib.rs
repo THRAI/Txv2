@@ -6,14 +6,15 @@ extern crate std;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaIf,
-    EntropyIf, FaultInfo, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf, KernelTrapSink,
-    MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, PercpuIf, PhysAddr, PhysRange,
-    PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation,
+    EntropyIf, FaultInfo, FpSimdIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf,
+    KernelTrapSink, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, PercpuIf, PhysAddr,
+    PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation,
     PmapPermissions, PmapReservation, PmapReservationIntermediates, PmapReserveKind, PmapRoot,
     PmapUnmapResult, Pod, PowerIf, PtNode, PtNodeAllocator, SavedSignalFrame, SecondaryEntry,
     SignalFrameIf, SignalFramePlacement, SignalFrameWrite, SignalHandlerRegs, SmpIf, TimeIf,
     TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView,
-    TrapIf, TrapPreviousMode, UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr, VirtRange,
+    TrapIf, TrapPreviousMode, UserFpContext, UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr,
+    VirtRange,
 };
 
 use la64_irq_trap::{classify_la64_trap, ensure_static_boot_facts};
@@ -40,11 +41,20 @@ core::arch::global_asm!(
     .equ TX_LA64_CSR_DMW1, 0x181
     .equ TX_LA64_CSR_DMW2, 0x182
     .equ TX_LA64_CSR_DMW3, 0x183
+    .equ TX_LA64_IOCSR_IPI_EN, 0x1004
     .globl _start
 _start:
-    move    $s0, $a0
+    // LA64 firmware handoff is platform-owned and not stable across
+    // loaders; use CPUID CSR for hart identity.
+    csrrd   $s0, 0x20
     move    $s1, $a1
+    bnez    $s0, .Ltx_la64_secondary_wait
     la.local $sp, __tx_boot_stack_top
+    li.d    $t2, 4
+    bgeu    $s0, $t2, .Ltx_la64_bsp_stack_ready
+    slli.d  $t1, $s0, 16
+    sub.d   $sp, $sp, $t1
+.Ltx_la64_bsp_stack_ready:
 
     la.local $t0, _bss_start
     la.local $t1, _bss_end
@@ -55,6 +65,10 @@ _start:
     b       1b
 
 2:
+    li.w    $t4, -1
+    li.d    $t5, TX_LA64_IOCSR_IPI_EN
+    iocsrwr.w $t4, $t5
+
     li.d    $t0, TX_LA64_DMW_CACHED
     csrwr   $t0, TX_LA64_CSR_DMW0
     li.d    $t0, TX_LA64_DMW_UNCACHED
@@ -72,6 +86,43 @@ _start:
 3:
     idle    0
     b       3b
+
+    // AP early park loop: configured by BSP via IOCSR mailbox + IPI.
+    .equ TX_LA64_IOCSR_MBUF4, 0x1020
+    .equ TX_LA64_IOCSR_MBUF5, 0x1028
+    .equ TX_LA64_IOCSR_MBUF6, 0x1030
+.Ltx_la64_secondary_wait:
+    // Configure DMW like BSP so AP can execute kernel virtual addresses.
+    li.d    $t0, TX_LA64_DMW_CACHED
+    csrwr   $t0, TX_LA64_CSR_DMW0
+    li.d    $t0, TX_LA64_DMW_UNCACHED
+    csrwr   $t0, TX_LA64_CSR_DMW1
+    move    $t0, $zero
+    csrwr   $t0, TX_LA64_CSR_DMW2
+    csrwr   $t0, TX_LA64_CSR_DMW3
+    li.w    $t4, -1
+    li.d    $t5, TX_LA64_IOCSR_IPI_EN
+    iocsrwr.w $t4, $t5
+
+.Ltx_la64_secondary_park:
+    li.d    $t2, TX_LA64_IOCSR_MBUF4
+    li.d    $t3, TX_LA64_IOCSR_MBUF5
+    li.d    $t4, TX_LA64_IOCSR_MBUF6
+    iocsrrd.d $t0, $t2
+    beqz    $t0, .Ltx_la64_secondary_idle
+    iocsrrd.d $t1, $t3
+    iocsrrd.d $a0, $t4
+    iocsrwr.d $zero, $t2
+    iocsrwr.d $zero, $t3
+    iocsrwr.d $zero, $t4
+    move    $sp, $t1
+    jirl    $zero, $t0, 0
+.Ltx_la64_secondary_idle:
+    // Keep polling the mailbox even if IPI delivery is masked/late.
+    // This avoids AP bring-up stalling in `idle 0` before CRMD/ECFG
+    // are fully configured for interrupt wakeups.
+    nop
+    b       .Ltx_la64_secondary_park
 
     .section .text.trap, "ax"
     .align 12
@@ -118,6 +169,10 @@ _start:
     .equ TX_LA64_CSR_ESTAT_TRAP, 0x05
     .equ TX_LA64_CSR_ERA_TRAP, 0x06
     .equ TX_LA64_CSR_BADV_TRAP, 0x07
+    .equ TX_LA64_CSR_PGD_TRAP, 0x1b
+    .equ TX_LA64_CSR_TLBRSAVE_TRAP, 0x8b
+    .equ TX_LA64_CSR_TLBRELO0_TRAP, 0x8c
+    .equ TX_LA64_CSR_TLBRELO1_TRAP, 0x8d
 
     .globl tx_la64_qemu_exception_vector
     .type tx_la64_qemu_exception_vector, @function
@@ -213,7 +268,41 @@ tx_la64_qemu_exception_vector:
     .globl tx_la64_qemu_tlb_refill_vector
     .type tx_la64_qemu_tlb_refill_vector, @function
 tx_la64_qemu_tlb_refill_vector:
-    b       tx_la64_qemu_exception_vector
+    // Fast TLB refill path: walk page-table directories directly
+    // and fill TLB without constructing a full trap frame.
+    csrwr   $r12, TX_LA64_CSR_TLBRSAVE_TRAP
+    csrrd   $r12, TX_LA64_CSR_PGD_TRAP
+
+    // 4-level walk (Dir3 -> Dir2 -> Dir1 -> PTE pair).
+    lddir   $r12, $r12, 3
+    beqz    $r12, 1f
+    srli.d  $r12, $r12, 12
+    slli.d  $r12, $r12, 12
+
+    lddir   $r12, $r12, 2
+    beqz    $r12, 1f
+    srli.d  $r12, $r12, 12
+    slli.d  $r12, $r12, 12
+
+    lddir   $r12, $r12, 1
+    beqz    $r12, 1f
+    srli.d  $r12, $r12, 12
+    slli.d  $r12, $r12, 12
+
+    ldpte   $r12, 0
+    ldpte   $r12, 1
+    tlbfill
+    csrrd   $r12, TX_LA64_CSR_TLBRSAVE_TRAP
+    ertn
+
+1:
+    // Missing page-table path: install invalid refill entry so the
+    // next access is promoted to the normal page-fault path.
+    csrwr   $zero, TX_LA64_CSR_TLBRELO0_TRAP
+    csrwr   $zero, TX_LA64_CSR_TLBRELO1_TRAP
+    tlbfill
+    csrrd   $r12, TX_LA64_CSR_TLBRSAVE_TRAP
+    ertn
     .size tx_la64_qemu_tlb_refill_vector, . - tx_la64_qemu_tlb_refill_vector
 
     .globl tx_la64_qemu_return_to_userspace
@@ -257,6 +346,160 @@ tx_la64_qemu_return_to_userspace:
     ld.d    $r31, $r31, TX_LA64_TF_R31
     ertn
     .size tx_la64_qemu_return_to_userspace, . - tx_la64_qemu_return_to_userspace
+
+    .equ TX_LA64_CSR_EUEN, 0x02
+
+    .globl tx_la64_qemu_fp_save_context
+    .type tx_la64_qemu_fp_save_context, @function
+tx_la64_qemu_fp_save_context:
+    csrrd   $t0, TX_LA64_CSR_EUEN
+    andi    $t0, $t0, 1
+    beqz    $t0, .Ltx_la64_fp_save_none
+
+    fst.d   $f0,  $a0,   0
+    fst.d   $f1,  $a0,   8
+    fst.d   $f2,  $a0,  16
+    fst.d   $f3,  $a0,  24
+    fst.d   $f4,  $a0,  32
+    fst.d   $f5,  $a0,  40
+    fst.d   $f6,  $a0,  48
+    fst.d   $f7,  $a0,  56
+    fst.d   $f8,  $a0,  64
+    fst.d   $f9,  $a0,  72
+    fst.d   $f10, $a0,  80
+    fst.d   $f11, $a0,  88
+    fst.d   $f12, $a0,  96
+    fst.d   $f13, $a0, 104
+    fst.d   $f14, $a0, 112
+    fst.d   $f15, $a0, 120
+    fst.d   $f16, $a0, 128
+    fst.d   $f17, $a0, 136
+    fst.d   $f18, $a0, 144
+    fst.d   $f19, $a0, 152
+    fst.d   $f20, $a0, 160
+    fst.d   $f21, $a0, 168
+    fst.d   $f22, $a0, 176
+    fst.d   $f23, $a0, 184
+    fst.d   $f24, $a0, 192
+    fst.d   $f25, $a0, 200
+    fst.d   $f26, $a0, 208
+    fst.d   $f27, $a0, 216
+    fst.d   $f28, $a0, 224
+    fst.d   $f29, $a0, 232
+    fst.d   $f30, $a0, 240
+    fst.d   $f31, $a0, 248
+
+    movfcsr2gr $t1, $fcsr0
+    st.w    $t1, $a0, 256
+
+    move    $t0, $zero
+    movcf2gr $t1, $fcc7
+    or      $t0, $t0, $t1
+    slli.w  $t0, $t0, 1
+    movcf2gr $t1, $fcc6
+    or      $t0, $t0, $t1
+    slli.w  $t0, $t0, 1
+    movcf2gr $t1, $fcc5
+    or      $t0, $t0, $t1
+    slli.w  $t0, $t0, 1
+    movcf2gr $t1, $fcc4
+    or      $t0, $t0, $t1
+    slli.w  $t0, $t0, 1
+    movcf2gr $t1, $fcc3
+    or      $t0, $t0, $t1
+    slli.w  $t0, $t0, 1
+    movcf2gr $t1, $fcc2
+    or      $t0, $t0, $t1
+    slli.w  $t0, $t0, 1
+    movcf2gr $t1, $fcc1
+    or      $t0, $t0, $t1
+    slli.w  $t0, $t0, 1
+    movcf2gr $t1, $fcc0
+    or      $t0, $t0, $t1
+    st.b    $t0, $a0, 260
+
+    li.w    $t0, 3
+    st.w    $t0, $a0, 264
+    li.w    $a0, 1
+    jr      $ra
+
+.Ltx_la64_fp_save_none:
+    st.w    $zero, $a0, 264
+    move    $a0, $zero
+    jr      $ra
+    .size tx_la64_qemu_fp_save_context, . - tx_la64_qemu_fp_save_context
+
+    .globl tx_la64_qemu_fp_restore_context
+    .type tx_la64_qemu_fp_restore_context, @function
+tx_la64_qemu_fp_restore_context:
+    ld.w    $t0, $a0, 264
+    andi    $t1, $t0, 1
+    beqz    $t1, .Ltx_la64_fp_restore_disable
+
+    csrrd   $t2, TX_LA64_CSR_EUEN
+    ori     $t2, $t2, 1
+    csrwr   $t2, TX_LA64_CSR_EUEN
+
+    fld.d   $f0,  $a0,   0
+    fld.d   $f1,  $a0,   8
+    fld.d   $f2,  $a0,  16
+    fld.d   $f3,  $a0,  24
+    fld.d   $f4,  $a0,  32
+    fld.d   $f5,  $a0,  40
+    fld.d   $f6,  $a0,  48
+    fld.d   $f7,  $a0,  56
+    fld.d   $f8,  $a0,  64
+    fld.d   $f9,  $a0,  72
+    fld.d   $f10, $a0,  80
+    fld.d   $f11, $a0,  88
+    fld.d   $f12, $a0,  96
+    fld.d   $f13, $a0, 104
+    fld.d   $f14, $a0, 112
+    fld.d   $f15, $a0, 120
+    fld.d   $f16, $a0, 128
+    fld.d   $f17, $a0, 136
+    fld.d   $f18, $a0, 144
+    fld.d   $f19, $a0, 152
+    fld.d   $f20, $a0, 160
+    fld.d   $f21, $a0, 168
+    fld.d   $f22, $a0, 176
+    fld.d   $f23, $a0, 184
+    fld.d   $f24, $a0, 192
+    fld.d   $f25, $a0, 200
+    fld.d   $f26, $a0, 208
+    fld.d   $f27, $a0, 216
+    fld.d   $f28, $a0, 224
+    fld.d   $f29, $a0, 232
+    fld.d   $f30, $a0, 240
+    fld.d   $f31, $a0, 248
+
+    ld.w    $t1, $a0, 256
+    movgr2fcsr $fcsr0, $t1
+
+    ld.b    $t1, $a0, 260
+    movgr2cf $fcc0, $t1
+    srli.w  $t1, $t1, 1
+    movgr2cf $fcc1, $t1
+    srli.w  $t1, $t1, 1
+    movgr2cf $fcc2, $t1
+    srli.w  $t1, $t1, 1
+    movgr2cf $fcc3, $t1
+    srli.w  $t1, $t1, 1
+    movgr2cf $fcc4, $t1
+    srli.w  $t1, $t1, 1
+    movgr2cf $fcc5, $t1
+    srli.w  $t1, $t1, 1
+    movgr2cf $fcc6, $t1
+    srli.w  $t1, $t1, 1
+    movgr2cf $fcc7, $t1
+    jr      $ra
+
+.Ltx_la64_fp_restore_disable:
+    csrrd   $t2, TX_LA64_CSR_EUEN
+    andi    $t2, $t2, 0xffe
+    csrwr   $t2, TX_LA64_CSR_EUEN
+    jr      $ra
+    .size tx_la64_qemu_fp_restore_context, . - tx_la64_qemu_fp_restore_context
 "#
 );
 
@@ -358,15 +601,33 @@ const QEMU_LA64_RAM_END: usize = QEMU_LA64_RAM_BASE + QEMU_LA64_RAM_SIZE;
 const QEMU_LA64_KERNEL_LOAD_BASE: usize = 0x0020_0000;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const QEMU_LA64_PCH_PIC_BASE: usize = 0x1000_0000;
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+const QEMU_LA64_ACPI_BASE: usize = 0x100d_0000;
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+const QEMU_LA64_PM1_CNT: usize = QEMU_LA64_ACPI_BASE + 0x14;
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+const QEMU_LA64_PM1_CNT_S5: u16 = (7 << 10) | (1 << 13);
 const QEMU_LA64_GSI_BASE: u32 = 64;
 const QEMU_LA64_PCH_PIC_IRQS: u32 = 64;
 #[cfg_attr(not(test), allow(dead_code))]
 const QEMU_LA64_UART0_IRQ: u32 = 66;
-const LA64_MAX_BOOT_CPUS: usize = 1;
+const QEMU_LA64_PCIE_ECAM_BASE: usize = 0x2000_0000;
+const QEMU_LA64_PCIE_ECAM_SIZE: usize = 0x0800_0000;
+const QEMU_LA64_PCIE_MMIO32_BASE: usize = 0x4000_0000;
+const QEMU_LA64_PCIE_MMIO32_SIZE: usize = 0x4000_0000;
+const QEMU_LA64_PCH_MSI_BASE: usize = 0x2ff0_0000;
+const QEMU_LA64_PCH_MSI_SIZE: usize = 0x8;
+const LA64_MAX_BOOT_CPUS: usize = 4;
+#[cfg(target_arch = "loongarch64")]
+const LA64_DEFAULT_POSSIBLE_CPUS: usize = LA64_MAX_BOOT_CPUS;
+#[cfg(not(target_arch = "loongarch64"))]
+const LA64_DEFAULT_POSSIBLE_CPUS: usize = 1;
 const LA64_DMW_CACHED_BASE: usize = 0x9000_0000_0000_0000;
 const LA64_DMW_UNCACHED_BASE: usize = 0x8000_0000_0000_0000;
 const LA64_PHYS_ADDR_MASK: usize = (1usize << 48) - 1;
 const LA64_CSR_CRMD: usize = 0x00;
+#[cfg(target_arch = "loongarch64")]
+const LA64_CSR_EUEN: usize = 0x02;
 const LA64_CSR_ECFG: usize = 0x04;
 const LA64_CSR_EENTRY: usize = 0x0c;
 const LA64_CSR_ASID: usize = 0x18;
@@ -383,6 +644,8 @@ const LA64_CSR_TICLR: usize = 0x44;
 const LA64_CRMD_IE: usize = 1 << 2;
 const LA64_CRMD_DA: usize = 1 << 3;
 const LA64_CRMD_PG: usize = 1 << 4;
+#[cfg(target_arch = "loongarch64")]
+const LA64_EUEN_FPE: usize = 1 << 0;
 const LA64_ASID_MASK: usize = 0x3ff;
 const LA64_TCFG_ENABLE: usize = 1 << 0;
 const LA64_TCFG_TICK_MASK: usize = !0x3;
@@ -458,8 +721,10 @@ const fn la64_addi_d(rd: u32, rj: u32, imm12: u32) -> u32 {
 }
 
 static BOOT_FACTS_STATE: AtomicU8 = AtomicU8::new(0);
+static LA64_BOOT_FIRMWARE_ARG: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED_PT_NODE_ALLOCATOR: AtomicUsize = AtomicUsize::new(0);
 static LA64_TIMEBASE_HZ: AtomicU64 = AtomicU64::new(0);
+static LA64_POSSIBLE_CPU_COUNT: AtomicUsize = AtomicUsize::new(LA64_DEFAULT_POSSIBLE_CPUS);
 static LA64_ONLINE_CPUS: AtomicU64 = AtomicU64::new(1);
 static LA64_IPI_ACKED_CPUS: AtomicU64 = AtomicU64::new(0);
 static LA64_IRQ_CONTEXT_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -615,6 +880,7 @@ impl La64TrapFrame {
             regs: self.r,
             pc: self.era,
             status: self.prmd,
+            fp: la64_capture_fp_context(),
         }
     }
 
@@ -623,6 +889,7 @@ impl La64TrapFrame {
         self.r[0] = 0;
         self.era = context.pc;
         self.prmd = context.status;
+        la64_restore_fp_context(&context.fp);
         self.prepare_user_return();
     }
 
@@ -700,7 +967,103 @@ fn la64_rewind_pc(raw: NonNull<()>, bytes: usize) {
     unsafe { (*la64_frame_ptr(raw)).rewind_pc(bytes) };
 }
 
-static mut BOOT_MEMORY_REGIONS: [MemoryRegion; 2] = [
+#[cfg(target_arch = "loongarch64")]
+unsafe extern "C" {
+    fn tx_la64_qemu_fp_save_context(ctx: *mut UserFpContext) -> usize;
+    fn tx_la64_qemu_fp_restore_context(ctx: *const UserFpContext);
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn la64_capture_fp_context() -> UserFpContext {
+    let mut fp = <Platform as FpSimdIf>::init_state();
+    <Platform as FpSimdIf>::save(&mut fp);
+    fp
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_capture_fp_context() -> UserFpContext {
+    let mut fp = <Platform as FpSimdIf>::init_state();
+    <Platform as FpSimdIf>::save(&mut fp);
+    fp
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn la64_restore_fp_context(fp: &UserFpContext) {
+    <Platform as FpSimdIf>::restore(fp);
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_restore_fp_context(fp: &UserFpContext) {
+    <Platform as FpSimdIf>::restore(fp);
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn la64_set_fpu_enabled(enabled: bool) {
+    let mut euen = la64_irq_trap::read_la64_csr(LA64_CSR_EUEN);
+    if enabled {
+        euen |= LA64_EUEN_FPE;
+    } else {
+        euen &= !LA64_EUEN_FPE;
+    }
+    la64_irq_trap::write_la64_csr(LA64_CSR_EUEN, euen);
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_set_fpu_enabled(_enabled: bool) {}
+
+#[cfg(target_arch = "loongarch64")]
+fn la64_save_fp_context(state: &mut UserFpContext) {
+    let saved = unsafe { tx_la64_qemu_fp_save_context(core::ptr::addr_of_mut!(*state)) };
+    if saved == 0 {
+        *state = UserFpContext::empty();
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_save_fp_context(state: &mut UserFpContext) {
+    *state = UserFpContext::empty();
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn la64_restore_fp_context_raw(state: &UserFpContext) {
+    unsafe { tx_la64_qemu_fp_restore_context(core::ptr::addr_of!(*state)) };
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn la64_restore_fp_context_raw(state: &UserFpContext) {
+    #[cfg(test)]
+    {
+        *TEST_RESTORED_FP_CONTEXT
+            .lock()
+            .expect("LA64 restored FP test mutex poisoned") = *state;
+    }
+
+    #[cfg(not(test))]
+    {
+        let _ = state;
+    }
+}
+
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+static TEST_RESTORED_FP_CONTEXT: std::sync::Mutex<UserFpContext> =
+    std::sync::Mutex::new(UserFpContext::empty());
+
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+fn la64_test_reset_restored_fp_context() {
+    *TEST_RESTORED_FP_CONTEXT
+        .lock()
+        .expect("LA64 restored FP test mutex poisoned") = UserFpContext::empty();
+}
+
+#[cfg(all(test, not(target_arch = "loongarch64")))]
+fn la64_test_restored_fp_context() -> UserFpContext {
+    *TEST_RESTORED_FP_CONTEXT
+        .lock()
+        .expect("LA64 restored FP test mutex poisoned")
+}
+
+const LA64_BOOT_MEMORY_REGION_CAPACITY: usize = 8;
+static mut BOOT_MEMORY_REGIONS: [MemoryRegion; LA64_BOOT_MEMORY_REGION_CAPACITY] = [
     MemoryRegion {
         base: PhysAddr(0),
         size: 0,
@@ -711,9 +1074,41 @@ static mut BOOT_MEMORY_REGIONS: [MemoryRegion; 2] = [
         size: 0,
         kind: MemoryRegionKind::Usable,
     },
+    MemoryRegion {
+        base: PhysAddr(0),
+        size: 0,
+        kind: MemoryRegionKind::Reserved,
+    },
+    MemoryRegion {
+        base: PhysAddr(0),
+        size: 0,
+        kind: MemoryRegionKind::Reserved,
+    },
+    MemoryRegion {
+        base: PhysAddr(0),
+        size: 0,
+        kind: MemoryRegionKind::Reserved,
+    },
+    MemoryRegion {
+        base: PhysAddr(0),
+        size: 0,
+        kind: MemoryRegionKind::Reserved,
+    },
+    MemoryRegion {
+        base: PhysAddr(0),
+        size: 0,
+        kind: MemoryRegionKind::Reserved,
+    },
+    MemoryRegion {
+        base: PhysAddr(0),
+        size: 0,
+        kind: MemoryRegionKind::Reserved,
+    },
 ];
 
 static mut BOOT_INFO: BootInfo = BootInfo::empty();
+const LA64_BOOT_CMDLINE_CAPACITY: usize = 256;
+static mut BOOT_CMDLINE: [u8; LA64_BOOT_CMDLINE_CAPACITY] = [0; LA64_BOOT_CMDLINE_CAPACITY];
 
 static mut BOOTSTRAP_PMAP_INFO: BootstrapPmapInfo = BootstrapPmapInfo {
     root: PhysAddr(0),
@@ -730,10 +1125,15 @@ static mut BOOTSTRAP_PMAP_INFO: BootstrapPmapInfo = BootstrapPmapInfo {
 // UART at 0x1fe0_01e0; Linux examples use earlycon=uart,mmio,0x1fe001e0.
 const QEMU_LA64_UART0_BASE: usize = 0x1fe0_01e0;
 const QEMU_LA64_UART0_SIZE: usize = 0x100;
+#[cfg_attr(not(test), allow(dead_code))]
 const QEMU_LA64_UART0_PAGE_BASE: usize = 0x1fe0_0000;
 #[cfg(target_arch = "loongarch64")]
 const UART_RBR: usize = 0x00;
 const UART_THR: usize = 0x00;
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+const UART_IER: usize = 0x01;
+#[cfg_attr(not(any(target_arch = "loongarch64", test)), allow(dead_code))]
+const UART_IER_ERBFI: u8 = 1 << 0;
 const UART_LSR: usize = 0x05;
 #[cfg(target_arch = "loongarch64")]
 const UART_LSR_DR: u8 = 1 << 0;
@@ -743,27 +1143,71 @@ const UART_LSR_THRE: u8 = 1 << 5;
 // convention. Phase-3 substrate MMIO mapping treats this exact page as already
 // covered; all non-identity requests remain unsupported until LA64 owns real
 // DMW/page-table mutation.
-static MMIO_REGIONS: &[MmioRegion] = &[MmioRegion {
-    name: "uart0",
-    phys: PhysRange {
-        start: PhysAddr(QEMU_LA64_UART0_BASE),
-        size: QEMU_LA64_UART0_SIZE,
+static MMIO_REGIONS: &[MmioRegion] = &[
+    MmioRegion {
+        name: "uart0",
+        phys: PhysRange {
+            start: PhysAddr(QEMU_LA64_UART0_BASE),
+            size: QEMU_LA64_UART0_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(la64_uncached_virt(QEMU_LA64_UART0_BASE)),
+            size: QEMU_LA64_UART0_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
     },
-    virt: VirtRange {
-        start: VirtAddr(la64_uncached_virt(QEMU_LA64_UART0_BASE)),
-        size: QEMU_LA64_UART0_SIZE,
+    MmioRegion {
+        name: "pcie-ecam",
+        phys: PhysRange {
+            start: PhysAddr(QEMU_LA64_PCIE_ECAM_BASE),
+            size: QEMU_LA64_PCIE_ECAM_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(la64_uncached_virt(QEMU_LA64_PCIE_ECAM_BASE)),
+            size: QEMU_LA64_PCIE_ECAM_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
     },
-    flags: MmioFlags::DEVICE_NGNRNE
-        .union(MmioFlags::READ)
-        .union(MmioFlags::WRITE),
-}];
+    MmioRegion {
+        name: "pcie-mmio32",
+        phys: PhysRange {
+            start: PhysAddr(QEMU_LA64_PCIE_MMIO32_BASE),
+            size: QEMU_LA64_PCIE_MMIO32_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(la64_uncached_virt(QEMU_LA64_PCIE_MMIO32_BASE)),
+            size: QEMU_LA64_PCIE_MMIO32_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
+    },
+    MmioRegion {
+        name: "pch-msi",
+        phys: PhysRange {
+            start: PhysAddr(QEMU_LA64_PCH_MSI_BASE),
+            size: QEMU_LA64_PCH_MSI_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(la64_uncached_virt(QEMU_LA64_PCH_MSI_BASE)),
+            size: QEMU_LA64_PCH_MSI_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
+    },
+];
 
-static PLATFORM_INFO: PlatformInfo = PlatformInfo {
+static mut PLATFORM_INFO: PlatformInfo = PlatformInfo {
     board: Platform::BOARD,
     spi_sd: None,
     mmio_regions: MMIO_REGIONS,
     timebase_frequency_hz: 0,
-    possible_cpu_count: 1,
+    possible_cpu_count: LA64_DEFAULT_POSSIBLE_CPUS,
 };
 
 #[repr(C, align(16))]
@@ -777,6 +1221,7 @@ struct La64SignalFrame {
     flags: u64,
     siginfo: tx_hal::UserSigInfoAbi,
     saved_mask: UserSignalMaskAbi,
+    // Includes full GPR + PC + status and UserFpContext payload.
     user_context: UserTrapContext,
     trampoline: [u32; 2],
 }
@@ -839,6 +1284,7 @@ impl BootPlatformIf for Platform {
     const BOOT_PROTOCOL: BootProtocol = BootProtocol::LoongArchFirmware;
 
     fn boot_handoff(cpu_id: usize, firmware_arg: usize) -> BootHandoff {
+        LA64_BOOT_FIRMWARE_ARG.store(firmware_arg, Ordering::Release);
         ensure_static_boot_facts();
 
         BootHandoff {
@@ -864,7 +1310,9 @@ impl BootInfoIf for Platform {
 
 impl PlatformInfoIf for Platform {
     fn platform_info() -> &'static PlatformInfo {
-        &PLATFORM_INFO
+        ensure_static_boot_facts();
+
+        unsafe { &*core::ptr::addr_of!(PLATFORM_INFO) }
     }
 }
 
@@ -893,8 +1341,10 @@ impl ConsoleIf for Platform {
     }
 }
 
+mod dtb;
 mod la64_irq_trap;
 mod la64_pmap;
+mod la64_unaligned;
 mod platform_impls;
 
 #[cfg(test)]

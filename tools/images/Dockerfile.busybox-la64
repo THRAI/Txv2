@@ -1,0 +1,31 @@
+FROM ubuntu:24.04
+
+ARG ZIG_VERSION=0.14.1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        file \
+        make \
+        tar \
+        xz-utils \
+        bzip2 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | \
+    tar -xJ -C /opt && \
+    ln -s "/opt/zig-x86_64-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
+
+COPY tools/images/loongarch64-linux-musl-gcc.zig-wrapper /usr/local/bin/loongarch64-linux-musl-gcc
+
+RUN printf '#!/bin/sh\nexec zig ar "$@"\n' \
+        > /usr/local/bin/loongarch64-linux-musl-ar && \
+    chmod +x /usr/local/bin/loongarch64-linux-musl-gcc \
+             /usr/local/bin/loongarch64-linux-musl-ar
+
+ENV CROSS_COMPILE=loongarch64-linux-musl- \
+    ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache/global \
+    ZIG_LOCAL_CACHE_DIR=/tmp/zig-cache/local
+
+WORKDIR /workspace

@@ -201,14 +201,14 @@ pub(crate) fn rollback_la64_kernel_mapping(reservation: PmapReservation) {
     la64_invtlb_global(reservation.virt());
 }
 
-pub(crate) fn commit_la64_kernel_mapping(reservation: PmapReservation) {
+pub(crate) fn commit_la64_kernel_mapping(
+    reservation: PmapReservation,
+    permissions: PmapPermissions,
+) {
     let root = PhysAddr(LA64_KERNEL_PGDH_PHYS.load(Ordering::Acquire));
     assert_ne!(root.0, 0, "LA64 kernel PGDH root must exist");
     register_la64_committed_intermediates(reservation.intermediates());
-    let leaf = encode_la64_leaf_pte(
-        reservation.phys(),
-        default_la64_kernel_mapping_permissions(reservation.phys()),
-    );
+    let leaf = encode_la64_leaf_pte(reservation.phys(), permissions);
     write_la64_leaf(root, reservation.virt(), reservation.kind(), leaf)
         .expect("reserved LA64 kernel leaf slot");
     la64_invtlb_global(reservation.virt());
@@ -244,15 +244,6 @@ pub(crate) fn protect_la64_kernel_mapping(
         return Ok(None);
     }
     protect_la64_mapping_in_root(PhysAddr(root), virt, kind, permissions)
-}
-
-pub(crate) fn default_la64_kernel_mapping_permissions(phys: PhysAddr) -> PmapPermissions {
-    let permissions = PmapPermissions::KERNEL_RW;
-    if phys.0 >= QEMU_LA64_RAM_END {
-        permissions.union(PmapPermissions::DEVICE)
-    } else {
-        permissions
-    }
 }
 
 pub(crate) struct La64EnsuredTable {

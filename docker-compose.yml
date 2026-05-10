@@ -1,0 +1,29 @@
+services:
+  # Main development / CI / qemu container.
+  # Rust toolchain is mounted from host cache to keep image lean.
+  oscomp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/workspace
+      - ${HOME}/.cargo:/root/.cargo
+      - ${HOME}/.rustup:/root/.rustup
+    working_dir: /workspace
+    environment:
+      RUSTUP_HOME: /root/.rustup
+      CARGO_HOME: /root/.cargo
+      RUSTUP_TOOLCHAIN: nightly
+
+  # Dedicated LA64 busybox builder.
+  busybox-la64:
+    build:
+      context: .
+      dockerfile: tools/images/Dockerfile.busybox-la64
+    # Override when needed:
+    #   TX_DOCKER_UID=$(id -u) TX_DOCKER_GID=$(id -g) docker compose run --rm busybox-la64
+    user: "${TX_DOCKER_UID:-1000}:${TX_DOCKER_GID:-1000}"
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    command: tools/images/build-busybox-loongarch64.sh

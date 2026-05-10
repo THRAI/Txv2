@@ -238,6 +238,7 @@ impl OpenFile {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => tty::execution::step_read(tty, out, guard),
                 StructPayload::CharDevice(binding) => binding.ops.read(out, guard),
+                StructPayload::BlockDevice(_) => StepOutcome::Err(Errno::ENOSYS),
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Reader,
@@ -292,6 +293,7 @@ impl OpenFile {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(_)
                 | StructPayload::CharDevice(_)
+                | StructPayload::BlockDevice(_)
                 | StructPayload::Pipe { .. } => return StepOutcome::Err(Errno::ESPIPE),
             },
             RNodeBacking::Directory => return StepOutcome::Err(Errno::EISDIR),
@@ -347,6 +349,7 @@ impl OpenFile {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => tty::execution::step_write(tty, bytes, guard),
                 StructPayload::CharDevice(binding) => binding.ops.write(bytes, guard),
+                StructPayload::BlockDevice(_) => StepOutcome::Err(Errno::ENOSYS),
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Writer,
@@ -380,6 +383,7 @@ impl OpenFile {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => step_tty_ioctl(tty, caller, request, guard),
                 StructPayload::CharDevice(_) => StepOutcome::Err(Errno::ENOSYS),
+                StructPayload::BlockDevice(_) => StepOutcome::Err(Errno::ENOSYS),
                 // Pipe was added on main; ioctl on a pipe returns
                 // ENOTTY (matches Linux behaviour).
                 StructPayload::Pipe { .. } => StepOutcome::Err(Errno::ENOTTY),

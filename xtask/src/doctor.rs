@@ -74,14 +74,26 @@ pub(crate) fn doctor(root: &Path) -> Result<()> {
             println!("warn: TX_BUSYBOX points at missing file: {path}");
         }
     } else {
-        let vendored = root.join(crate::image::VENDORED_BUSYBOX_RELPATH);
-        if vendored.exists() {
-            println!("ok: vendored busybox at {}", vendored.display());
-        } else {
-            println!(
-                "warn: TX_BUSYBOX not set and {} missing; run `tools/images/fetch-busybox.sh`",
-                crate::image::VENDORED_BUSYBOX_RELPATH
-            );
+        for target in [TxTarget::Rv64Qemu, TxTarget::La64Qemu] {
+            let relpath = crate::image::vendored_busybox_relpath(target);
+            let vendored = root.join(relpath);
+            if vendored.exists() {
+                println!(
+                    "ok: vendored {} busybox at {}",
+                    target.name(),
+                    vendored.display()
+                );
+            } else {
+                let help = match target {
+                    TxTarget::Rv64Qemu => "tools/images/fetch-busybox.sh",
+                    TxTarget::La64Qemu => "tools/images/build-busybox-loongarch64.sh",
+                    TxTarget::Rv64M1DockMock => unreachable!("not checked here"),
+                };
+                println!(
+                    "warn: TX_BUSYBOX not set and {} missing; run `{}`",
+                    relpath, help
+                );
+            }
         }
     }
     if let Ok(path) = env::var("TX_MUSL_LIBC") {

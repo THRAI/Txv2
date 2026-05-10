@@ -485,7 +485,11 @@ fn mmio_mapping_commits_2m_leaf_through_l1_table() {
     assert_eq!(reservation.phys(), phys);
     assert_eq!(reservation.kind(), PmapReserveKind::Superpage2M);
 
-    commit_kernel_mapping_from_bag(&bag, reservation);
+    commit_kernel_mapping_from_bag(
+        &bag,
+        reservation,
+        PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+    );
 
     let l1 = l1_table_for_test(&bag, virt).expect("l1 table");
     assert_eq!(
@@ -509,7 +513,11 @@ fn mmio_mapping_commits_4k_leaf_through_l0_table() {
 
     assert_eq!(reservation.kind(), PmapReserveKind::Page4K);
 
-    commit_kernel_mapping_from_bag(&bag, reservation);
+    commit_kernel_mapping_from_bag(
+        &bag,
+        reservation,
+        PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+    );
 
     let l0 = l0_table_for_test(&bag, virt).expect("l0 table");
     assert_eq!(
@@ -615,7 +623,11 @@ fn unmap_kernel_mapping_clears_leaf_and_reports_invalidation() {
         reserve_kernel_mapping_from_bag(&bag, virt, phys, PmapReserveKind::Superpage2M)
             .expect("reserve mmio 2M")
             .expect("2M leaf should be empty");
-    commit_kernel_mapping_from_bag(&bag, reservation);
+    commit_kernel_mapping_from_bag(
+        &bag,
+        reservation,
+        PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+    );
 
     let result = unmap_kernel_mapping_from_bag(&bag, virt, PmapReserveKind::Superpage2M)
         .expect("unmap mmio 2M")
@@ -646,7 +658,11 @@ fn protect_kernel_mapping_updates_leaf_in_place_and_reports_invalidation() {
         reserve_kernel_mapping_from_bag(&bag, virt, phys, PmapReserveKind::Superpage2M)
             .expect("reserve mmio 2M")
             .expect("2M leaf should be empty");
-    commit_kernel_mapping_from_bag(&bag, reservation);
+    commit_kernel_mapping_from_bag(
+        &bag,
+        reservation,
+        PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+    );
 
     let invalidation = protect_kernel_mapping_from_bag(
         &bag,
@@ -716,7 +732,11 @@ fn committed_4k_unmap_releases_empty_intermediate_tables() {
     let reservation = reserve_kernel_mapping_from_bag(&bag, virt, phys, PmapReserveKind::Page4K)
         .expect("reserve 4K mapping")
         .expect("4K leaf should be empty");
-    commit_kernel_mapping_from_bag(&bag, reservation);
+    commit_kernel_mapping_from_bag(
+        &bag,
+        reservation,
+        PmapPermissions::KERNEL_RW.union(PmapPermissions::DEVICE),
+    );
 
     assert!(l1_table_for_test(&bag, virt).is_some());
     assert!(l0_table_for_test(&bag, virt).is_some());
