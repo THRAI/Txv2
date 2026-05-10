@@ -175,10 +175,19 @@ impl RangeLock {
         &self,
         a: (UserRange, LockMode),
         b: (UserRange, LockMode),
-    ) -> StepOutcome<RangeGuardPair<'_>> {
+    ) -> V3StepOutcome<RangeGuardPair<'_>, NoProgress> {
         match self.acquire_pair_step_rich(a, b) {
-            AcquirePairResult::Acquired(pair) => StepOutcome::Done(pair),
-            AcquirePairResult::WouldBlock(blocked) => StepOutcome::Blocked(blocked.wait_token()),
+            AcquirePairResult::Acquired(pair) => V3StepOutcome::Done(pair),
+            AcquirePairResult::WouldBlock(blocked) => {
+                let token = blocked.wait_token();
+                V3StepOutcome::Yield {
+                    progress: NoProgress,
+                    shape: YieldShape::OnCarrier {
+                        carrier: WakeCarrier::new(token.carrier()),
+                        interests: InterestConditions::new(token.interest()),
+                    },
+                }
+            }
         }
     }
 

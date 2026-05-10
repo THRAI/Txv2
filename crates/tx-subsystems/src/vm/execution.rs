@@ -326,8 +326,12 @@ impl AddressSpace {
                 (request.old_range, LockMode::ExclusiveWriter),
                 (request.new_range, LockMode::ExclusiveWriter),
             ) {
-                StepOutcome::Done(pair) => pair,
-                StepOutcome::Blocked(token) => {
+                V3StepOutcome::Done(pair) => pair,
+                V3StepOutcome::Yield {
+                    shape: YieldShape::OnCarrier { carrier, interests },
+                    ..
+                } => {
+                    let token = WaitToken::new(carrier.raw(), interests.raw());
                     await_range_lock(token).await;
                     continue;
                 }
@@ -404,8 +408,8 @@ impl AddressSpace {
             (request.old_range, LockMode::ExclusiveWriter),
             (request.new_range, LockMode::ExclusiveWriter),
         ) {
-            StepOutcome::Done(pair) => pair,
-            StepOutcome::Blocked(_) => return Err(VmMapError::WouldBlock),
+            V3StepOutcome::Done(pair) => pair,
+            V3StepOutcome::Yield { .. } => return Err(VmMapError::WouldBlock),
             _ => unreachable_acquire_step(),
         };
         let commit = self
