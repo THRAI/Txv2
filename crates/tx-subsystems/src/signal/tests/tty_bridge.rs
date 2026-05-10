@@ -3,7 +3,7 @@
 use super::*;
 use crate::cred::Uid;
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::{Errno, Guard};
 use crate::process::{bootstrap_init_process, step_fork, ProcessIdentity};
 use crate::signal::{deliver_tty_dispatch, signum_for_job_control, DispatchOutcome};
 use crate::tty::execution::{JobControlSignal, SignalDispatch, SignalTarget};
@@ -13,11 +13,19 @@ use tx_substrate::zone::{self, PayloadCap};
 
 struct NoopOps;
 impl CharDeviceOps for NoopOps {
-    fn read(&self, _out: &mut [u8], _g: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(0)
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _g: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        tx_substrate::step_v3::StepOutcome::Done(0)
     }
-    fn write(&self, b: &[u8], _g: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(b.len())
+    fn write(
+        &self,
+        b: &[u8],
+        _g: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        tx_substrate::step_v3::StepOutcome::Done(b.len())
     }
 }
 static NOOP_OPS: NoopOps = NoopOps;

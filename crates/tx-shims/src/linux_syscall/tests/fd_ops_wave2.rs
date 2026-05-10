@@ -3,6 +3,7 @@
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
+use tx_substrate::step_v3::StepOutcome;
 
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_substrate::{page_allocator, zone};
@@ -50,8 +51,8 @@ fn fd_ops_setup() -> TestSetup {
 fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     let tmpfs = Arc::new(Tmpfs::new());
     let payload = MountPayload::new_cap(
-        tmpfs.clone() as Arc<dyn FsOps>,
-        tmpfs.clone() as Arc<dyn FsPageBacking>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
         None,
         DevId::new(201),
         MountOptions::default(),
@@ -205,7 +206,7 @@ fn dispatch_openat_o_creat_creates_new_file() {
     let guard = tx_substrate::epoch::guard();
     let outcome = tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"new", &guard);
     assert!(
-        matches!(outcome, StepOutcome::Done(_) | StepOutcome::Advanced(_)),
+        matches!(outcome, StepOutcome::Done(_)),
         "tmpfs should now resolve /new: {outcome:?}"
     );
     drop(path);
@@ -269,7 +270,7 @@ fn dispatch_openat_o_trunc_truncates_existing() {
     // Pre-stuff the file's page-backing so its size is non-zero.
     // tmpfs's FsPageBacking::truncate doubles as a "set size" op.
     match tmpfs.truncate(file_id, 4096, &guard) {
-        StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+        StepOutcome::Done(()) => {}
         other => panic!("preload truncate: {other:?}"),
     }
     drop(guard);

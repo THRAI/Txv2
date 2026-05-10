@@ -105,7 +105,6 @@ impl<P: TxPlatform> CoreInit<P> {
     /// Creates the parent `/bin` directory if absent.
     #[cfg(busybox_baked)]
     pub(crate) fn register_busybox_into_tmpfs() {
-        use tx_subsystems::execution::StepOutcome;
         use tx_subsystems::vfs::{Credential, RNodeBacking};
 
         let root_mount =
@@ -126,13 +125,17 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let cred = Credential::root();
 
+        // Boot-time tmpfs ops are synchronous, so Continue/Yield are
+        // unreachable and panic if they fire.
+        use tx_substrate::step_v3::StepOutcome as V3;
+
         // 1. Create or look up `/bin` directory. Use `mkdir`; on
         //    EEXIST treat the existing dir as the parent.
         let bin_object_id = {
             let guard = tx_substrate::epoch::guard();
             let outcome = fs_ops.mkdir(root_object_id, b"bin", 0o040755, &cred, &guard);
             match outcome {
-                StepOutcome::Done((id, _)) | StepOutcome::Advanced((id, _)) => id,
+                V3::Done((id, _)) => id,
                 // EEXIST is unlikely from a clean tmpfs root, but
                 // tolerate it: walk to find the existing dir.
                 _ => {
@@ -149,7 +152,7 @@ impl<P: TxPlatform> CoreInit<P> {
             let guard = tx_substrate::epoch::guard();
             let outcome = fs_ops.create_inode(bin_object_id, b"sh", 0o100755, &cred, &guard);
             match outcome {
-                StepOutcome::Done(out) => out,
+                V3::Done(out) => out,
                 other => panic!("register_busybox_into_tmpfs: create_inode(/bin/sh): {other:?}"),
             }
         };
@@ -160,7 +163,7 @@ impl<P: TxPlatform> CoreInit<P> {
             let guard = tx_substrate::epoch::guard();
             let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
             let rnode = match outcome {
-                StepOutcome::Done(rnode) => rnode,
+                V3::Done(rnode) => rnode,
                 other => panic!("register_busybox_into_tmpfs: materialise_rnode: {other:?}"),
             };
             match rnode.backing() {
@@ -200,7 +203,7 @@ impl<P: TxPlatform> CoreInit<P> {
         {
             let guard = tx_substrate::epoch::guard();
             match fs_page_backing.truncate(file_id, size, &guard) {
-                StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+                V3::Done(()) => {}
                 other => panic!("register_busybox_into_tmpfs: truncate({size}): {other:?}"),
             }
         }
@@ -221,7 +224,6 @@ impl<P: TxPlatform> CoreInit<P> {
     /// the page contents, and `FsPageBacking::truncate` to set the
     /// visible size.
     pub(crate) fn register_init_fixture_into_tmpfs() {
-        use tx_subsystems::execution::StepOutcome;
         use tx_subsystems::vfs::{Credential, RNodeBacking};
 
         let root_mount =
@@ -242,13 +244,17 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let bytes = &init_fixture::INIT_FIXTURE_BYTES[..];
 
+        // Boot-time tmpfs ops are synchronous, so Continue/Yield are
+        // unreachable and panic if they fire.
+        use tx_substrate::step_v3::StepOutcome as V3;
+
         // Allocate the inode. Bootstrap process is root by construction.
         let cred = Credential::root();
         let (file_id, file_meta) = {
             let guard = tx_substrate::epoch::guard();
             let outcome = fs_ops.create_inode(root_object_id, b"init", 0o100755, &cred, &guard);
             match outcome {
-                StepOutcome::Done(out) => out,
+                V3::Done(out) => out,
                 other => panic!("register_init_fixture_into_tmpfs: create_inode(/init): {other:?}"),
             }
         };
@@ -260,7 +266,7 @@ impl<P: TxPlatform> CoreInit<P> {
             let guard = tx_substrate::epoch::guard();
             let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
             let rnode = match outcome {
-                StepOutcome::Done(rnode) => rnode,
+                V3::Done(rnode) => rnode,
                 other => panic!("register_init_fixture_into_tmpfs: materialise_rnode: {other:?}"),
             };
             match rnode.backing() {
@@ -304,7 +310,7 @@ impl<P: TxPlatform> CoreInit<P> {
         {
             let guard = tx_substrate::epoch::guard();
             match fs_page_backing.truncate(file_id, size, &guard) {
-                StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
+                V3::Done(()) => {}
                 other => panic!("register_init_fixture_into_tmpfs: truncate({size}): {other:?}"),
             }
         }

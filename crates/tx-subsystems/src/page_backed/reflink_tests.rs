@@ -36,9 +36,7 @@ fn pagebacked_install_shared_page_attaches_existing_frame_to_new_pc() {
 
     let materialized =
         match source.materialize_page(PageIndex::new(0), MaterializeAccess::Write, &guard) {
-            crate::execution::StepOutcome::Done(m) | crate::execution::StepOutcome::Advanced(m) => {
-                m
-            }
+            tx_substrate::step_v3::StepOutcome::Done(m) => m,
             other => panic!("source materialize: {other:?}"),
         };
     let source_ppn = materialized.ppn;
@@ -69,18 +67,14 @@ fn pagebacked_install_shared_page_rejects_already_present_entry() {
 
     let source_materialized =
         match source.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
-            crate::execution::StepOutcome::Done(m) | crate::execution::StepOutcome::Advanced(m) => {
-                m
-            }
+            tx_substrate::step_v3::StepOutcome::Done(m) => m,
             other => panic!("source materialize: {other:?}"),
         };
     let source_ppn = source_materialized.ppn;
     drop(source_materialized);
     let dest_materialized =
         match dest.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
-            crate::execution::StepOutcome::Done(m) | crate::execution::StepOutcome::Advanced(m) => {
-                m
-            }
+            tx_substrate::step_v3::StepOutcome::Done(m) => m,
             other => panic!("dest materialize: {other:?}"),
         };
     drop(dest_materialized);
@@ -120,9 +114,7 @@ fn pagebacked_cow_replace_into_private_swaps_to_fresh_frame_with_matching_bytes(
 
     let source_materialized =
         match source.materialize_page(PageIndex::new(0), MaterializeAccess::Write, &guard) {
-            crate::execution::StepOutcome::Done(m) | crate::execution::StepOutcome::Advanced(m) => {
-                m
-            }
+            tx_substrate::step_v3::StepOutcome::Done(m) => m,
             other => panic!("source materialize: {other:?}"),
         };
     let source_ppn = source_materialized.ppn;

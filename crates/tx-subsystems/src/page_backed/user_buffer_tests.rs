@@ -1,5 +1,4 @@
 use super::*;
-use crate::execution::{Errno, StepOutcome};
 use crate::vfs::{FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking};
 use crate::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
@@ -9,6 +8,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use tx_hal::UserPtr;
 use tx_substrate::page_allocator;
+use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
@@ -180,7 +180,7 @@ fn pagebacked_round_trip_through_user_buffer_preserves_bytes_in_one_page() {
         payload.len(),
         &guard,
     );
-    assert_eq!(outcome, StepOutcome::Done(payload.len()));
+    assert_eq!(outcome, V3Out::Done(payload.len()));
     assert_eq!(writer.offset(), payload.len() as u64);
 
     // Clear the user buffer to prove the read genuinely re-fills it.
@@ -195,7 +195,7 @@ fn pagebacked_round_trip_through_user_buffer_preserves_bytes_in_one_page() {
         payload.len(),
         &guard,
     );
-    assert_eq!(outcome, StepOutcome::Done(payload.len()));
+    assert_eq!(outcome, V3Out::Done(payload.len()));
     assert_eq!(reader.offset(), payload.len() as u64);
     assert_eq!(fixture.read_user_bytes(payload.len()), payload);
 }
@@ -228,7 +228,7 @@ fn pagebacked_round_trip_through_user_buffer_crosses_page_boundary() {
         payload.len(),
         &guard,
     );
-    assert_eq!(outcome, StepOutcome::Done(payload.len()));
+    assert_eq!(outcome, V3Out::Done(payload.len()));
     assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
     assert!(pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
 
@@ -243,7 +243,7 @@ fn pagebacked_round_trip_through_user_buffer_crosses_page_boundary() {
         payload.len(),
         &guard,
     );
-    assert_eq!(outcome, StepOutcome::Done(payload.len()));
+    assert_eq!(outcome, V3Out::Done(payload.len()));
     assert_eq!(fixture.read_user_bytes(payload.len()), payload);
 }
 
@@ -275,7 +275,7 @@ fn pagebacked_step_read_to_user_efault_propagates_when_user_va_unmapped() {
             payload.len(),
             &guard,
         ),
-        StepOutcome::Done(payload.len())
+        V3Out::Done(payload.len())
     );
 
     // Use a fresh aspace with NO recipe and a dangling user VA.
@@ -283,7 +283,7 @@ fn pagebacked_step_read_to_user_efault_propagates_when_user_va_unmapped() {
 
     let reader = open_file_for_pc(&pc);
     let outcome = step_read_to_user(&pc, &reader, &empty_aspace, dangling, 16, &guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::EFAULT));
+    assert_eq!(outcome, V3Out::Err(V3Errno::EFAULT));
     assert_eq!(reader.offset(), 0);
 }
 
@@ -315,16 +315,13 @@ fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
         pattern.len(),
         &guard,
     );
-    assert_eq!(outcome, StepOutcome::Done(pattern.len()));
+    assert_eq!(outcome, V3Out::Done(pattern.len()));
 
     let shrink_size = USER_PAGE_SIZE as u64 + 4;
-    assert_eq!(
-        step_truncate(&pc, shrink_size, &guard),
-        StepOutcome::Done(())
-    );
+    assert_eq!(step_truncate(&pc, shrink_size, &guard), V3Out::Done(()));
 
     let grow_size = USER_PAGE_SIZE as u64 + 32;
-    assert_eq!(step_truncate(&pc, grow_size, &guard), StepOutcome::Done(()));
+    assert_eq!(step_truncate(&pc, grow_size, &guard), V3Out::Done(()));
 
     let zeros = vec![0u8; pattern.len()];
     fixture.seed_user_bytes(&zeros);
@@ -338,7 +335,7 @@ fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
         32,
         &guard,
     );
-    assert_eq!(outcome, StepOutcome::Done(32));
+    assert_eq!(outcome, V3Out::Done(32));
     let received = fixture.read_user_bytes(32);
     assert_eq!(&received[..4], &pattern[USER_PAGE_SIZE..USER_PAGE_SIZE + 4]);
     assert!(
@@ -366,7 +363,7 @@ fn pagebacked_step_write_from_user_propagates_efault_without_advance() {
     let dangling = UserPtr::<u8>::new(0x60_0000);
     let writer = open_file_for_pc(&pc);
     let outcome = step_write_from_user(&pc, &writer, &empty_aspace, dangling, 8, &guard);
-    assert_eq!(outcome, StepOutcome::Err(Errno::EFAULT));
+    assert_eq!(outcome, V3Out::Err(V3Errno::EFAULT));
     assert_eq!(writer.offset(), 0);
     assert_eq!(pc.size_bytes(), pc.page_count() * USER_PAGE_SIZE as u64);
 }

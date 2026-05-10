@@ -217,9 +217,10 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // `Guard` is `!Send + !Sync` so we cannot hold one across this
     // function's `.await`s — the `dispatch` future feeds
     // `Reactor::submit_task` which requires `Send`. Use the
-    // `poll_walker_synchronously` helper that the Wave 4 file-mode
-    // arms also use; every in-tree walker backend resolves
-    // immediately so the noop-waker poll always returns `Ready`.
+    // `poll_walker_synchronously` helper that the file-mode arms also
+    // use; every in-tree walker backend resolves immediately so the
+    // noop-waker poll always returns `Ready`.
+    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
     let walk_first = {
         let guard = tx_substrate::epoch::guard();
         let outcome =
@@ -229,22 +230,22 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     };
 
     let dentry: Cap<DEntry> = match walk_first {
-        StepOutcome::Done(d) | StepOutcome::Advanced(d) => {
+        V3::Done(d) => {
             if want_create && want_excl {
                 return SyscallResult::Error(EEXIST_VALUE);
             }
             d
         }
-        StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+        V3::Continue { .. } | V3::Yield { .. } => {
             return SyscallResult::Error(EIO_VALUE);
         }
-        StepOutcome::Err(Errno::ENOENT) if want_create => {
+        V3::Err(V3Errno::ENOENT) if want_create => {
             match create_then_walk::<P>(&cwd, &path, mode as u16, &walker_cred) {
                 Ok(d) => d,
                 Err(e) => return SyscallResult::Error(e),
             }
         }
-        StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
     };
 
     // Step 2: O_TRUNC. Apply *before* materialising the OpenFile so
@@ -257,6 +258,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             return SyscallResult::Error(EISDIR_VALUE);
         }
         if meta.size != 0 {
+            use tx_substrate::step_v3::StepOutcome as V3Trunc;
             let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
                 Some(b) => b,
                 None => return SyscallResult::Error(ENOSYS_VALUE),
@@ -264,11 +266,13 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             let fs_object_id = dentry.rnode().fs_object_id();
             let guard = tx_substrate::epoch::guard();
             match fs_page_backing.truncate(fs_object_id, 0, &guard) {
-                StepOutcome::Done(()) | StepOutcome::Advanced(()) => {}
-                StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+                V3Trunc::Done(()) => {}
+                V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => {
                     return SyscallResult::Error(EIO_VALUE);
                 }
-                StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                V3Trunc::Err(errno) => {
+                    return SyscallResult::Error(errno_to_i32(Errno::from(errno)));
+                }
             }
         }
     }
@@ -295,11 +299,11 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         ));
         drop(guard);
         match outcome {
-            StepOutcome::Done(file) | StepOutcome::Advanced(file) => file,
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            V3::Done(file) => file,
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
         }
     };
 
@@ -495,16 +499,18 @@ pub(super) fn sys_lseek<'a>(
         None => return SyscallResult::Error(EBADF_VALUE),
     };
     let guard = tx_substrate::epoch::guard();
+    use tx_substrate::step_v3::StepOutcome as V3Out;
     match file.step_lseek(offset, whence, &guard) {
-        StepOutcome::Done(new_offset) | StepOutcome::Advanced(new_offset) => {
-            SyscallResult::Return(new_offset as i64)
-        }
-        StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
+        V3Out::Done(new_offset) => SyscallResult::Return(new_offset as i64),
+        V3Out::Continue { .. } | V3Out::Yield { .. } => {
             // Unreachable in practice — see the comment on the
             // function header.
             SyscallResult::Error(errno_to_i32(Errno::EIO))
         }
-        StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        V3Out::Err(v3errno) => {
+            let errno: Errno = v3errno.into();
+            SyscallResult::Error(errno_to_i32(errno))
+        }
     }
 }
 
@@ -595,14 +601,25 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         _ => return SyscallResult::Error(errno_to_i32(Errno::ENOTTY)),
     };
 
+    // v3 step_ioctl_* return Done/Err only in practice; helper to
+    // collapse the four-variant catalog into a v4 Errno-or-value.
+    use tx_substrate::step_v3::StepOutcome as V3Out;
+    fn unwrap_v3<T>(v: V3Out<T, tx_substrate::step_v3::NoProgress>) -> Result<T, Errno> {
+        match v {
+            V3Out::Done(t) => Ok(t),
+            V3Out::Err(e) => Err(e.into()),
+            V3Out::Continue { .. } | V3Out::Yield { .. } => Err(Errno::EIO),
+        }
+    }
+
     match request {
         TCGETS => {
             let outcome = {
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tcgets(&tty, &guard)
             };
-            match outcome {
-                StepOutcome::Done(termios) | StepOutcome::Advanced(termios) => {
+            match unwrap_v3(outcome) {
+                Ok(termios) => {
                     if argp == 0 {
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
@@ -612,10 +629,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     }
                     SyscallResult::Return(0)
                 }
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TCSETS | TCSETSW | TCSETSF => {
@@ -635,12 +649,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tcsets(&tty, new_termios, &guard)
             };
-            match outcome {
-                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TIOCGPGRP => {
@@ -648,8 +659,8 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tiocgpgrp(&tty, &guard)
             };
-            match outcome {
-                StepOutcome::Done(pgid) | StepOutcome::Advanced(pgid) => {
+            match unwrap_v3(outcome) {
+                Ok(pgid) => {
                     if argp == 0 {
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
@@ -658,10 +669,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     }
                     SyscallResult::Return(0)
                 }
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TIOCSPGRP => {
@@ -677,12 +685,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tiocspgrp(&tty, caller, new_pgrp, &guard)
             };
-            match outcome {
-                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TIOCGWINSZ => {
@@ -690,8 +695,8 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tiocgwinsz(&tty, &guard)
             };
-            match outcome {
-                StepOutcome::Done(ws) | StepOutcome::Advanced(ws) => {
+            match unwrap_v3(outcome) {
+                Ok(ws) => {
                     if argp == 0 {
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
@@ -700,10 +705,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     }
                     SyscallResult::Return(0)
                 }
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TIOCSWINSZ => {
@@ -718,12 +720,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tiocswinsz(&tty, ws, &guard)
             };
-            match outcome {
-                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TIOCSCTTY => {
@@ -737,12 +736,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tiocsctty(&tty, caller, &guard)
             };
-            match outcome {
-                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TIOCNOTTY => {
@@ -751,12 +747,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tiocnotty(&tty, caller, &guard)
             };
-            match outcome {
-                StepOutcome::Done(_) | StepOutcome::Advanced(_) => SyscallResult::Return(0),
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    SyscallResult::Error(errno_to_i32(Errno::EIO))
-                }
+            match unwrap_v3(outcome) {
+                Ok(_) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         // Unknown ioctl request → -ENOTTY (the POSIX `man ioctl_tty`
@@ -925,16 +918,17 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             Some(d) => d,
             None => return SyscallResult::Error(ENOENT_VALUE),
         };
+        use tx_substrate::step_v3::StepOutcome as V3;
         let outcome = {
             let guard = tx_substrate::epoch::guard();
             poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard))
         };
         match outcome {
-            StepOutcome::Done(d) | StepOutcome::Advanced(d) => d,
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            V3::Done(d) => d,
+            V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
         }
     };
 
@@ -1014,14 +1008,14 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let mut cursor = file.readdir_cursor();
     let mut written: usize = 0;
 
+    use tx_substrate::step_v3::StepOutcome as V3;
     loop {
         let outcome = {
             let guard = tx_substrate::epoch::guard();
             fs_ops.readdir(dir_fs_object_id, cursor, &guard)
         };
         match outcome {
-            StepOutcome::Done(Some((entry, next_cursor)))
-            | StepOutcome::Advanced(Some((entry, next_cursor))) => {
+            V3::Done(Some((entry, next_cursor))) => {
                 let name_bytes = entry.name.as_bytes();
                 let raw_len = LINUX_DIRENT64_HEADER_BYTES + name_bytes.len() + 1;
                 let total_len = align_up_8(raw_len);
@@ -1080,13 +1074,13 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
                 cursor = next_cursor;
                 file.set_readdir_cursor(cursor);
             }
-            StepOutcome::Done(None) | StepOutcome::Advanced(None) => {
+            V3::Done(None) => {
                 // End of directory — durable cursor advance is
                 // unnecessary (the readdir backend's cursor is
                 // self-terminating).
                 break;
             }
-            StepOutcome::AdvancedThenBlocked(_, _) | StepOutcome::Blocked(_) => {
+            V3::Continue { .. } | V3::Yield { .. } => {
                 // No in-tree backend produces these. Surface as
                 // `-EIO` defensively if the partial-progress shape
                 // ever fires.
@@ -1095,11 +1089,11 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
                 }
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => {
+            V3::Err(errno) => {
                 if written > 0 {
                     return SyscallResult::Return(written as i64);
                 }
-                return SyscallResult::Error(errno_to_i32(errno));
+                return SyscallResult::Error(errno_to_i32(Errno::from(errno)));
             }
         }
     }
@@ -1108,13 +1102,14 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 }
 
 /// Resolve the `Arc<dyn FsOps>` in scope for a directory rnode.
-/// Mirrors `fs_ops_for_dentry`'s shape but operates on the rnode
-/// directly (the OpenFile carries `Cap<RNode>`, not `Cap<DEntry>`).
+/// Mirrors `fs_ops_for_dentry`'s shape (in `fs_path.rs`) but
+/// operates on the rnode directly — the OpenFile carries `Cap<RNode>`,
+/// not `Cap<DEntry>`.
 ///
 /// Returns `None` if the rnode does not carry a `containing_mount`
 /// weak (descendant rnodes minted by `materialise_child_rnode` don't
 /// — only mount-root rnodes do). The Slice 6 `getdents64` arm
-/// surfaces this as `-ENOSYS` defensively (no FsOps to dispatch
+/// surfaces this as `-ENOSYS` defensively (no `FsOps` to dispatch
 /// through). In practice every tested directory is the mount root,
 /// matching tmpfs's day-1 surface.
 ///

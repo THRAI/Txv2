@@ -10,9 +10,12 @@
 //! `WouldBlock` outcome into an awaitable wait via `WouldBlock::wait_token`.
 
 use tx_reactor::wait::{Channel, Mask};
+use tx_substrate::step_v3::{
+    InterestConditions, NoProgress, StepOutcome as V3StepOutcome, WakeCarrier, YieldShape,
+};
 use tx_substrate::SpinMutex;
 
-use crate::execution::{StepOutcome, WaitToken};
+use crate::execution::WaitToken;
 use crate::wait_carrier;
 
 use super::UserRange;
@@ -134,17 +137,36 @@ impl RangeLock {
         self.wait_carrier_id
     }
 
-    /// Canonical step-shaped acquire per VM_v1_2 §3.1. Done = the
-    /// reservation is held; Blocked = the caller should await
-    /// `WaitToken` and retry. The internal `PendingWriter` slot used
-    /// for writer-preference is not exposed here; production scripts
-    /// (which drop the rich `WouldBlock` carrier immediately on
-    /// blocking anyway) compose against this surface. Tests that probe
-    /// the rich pending-writer machinery use `acquire_step_rich`.
-    pub fn acquire_step(&self, range: UserRange, mode: LockMode) -> StepOutcome<RangeGuard<'_>> {
+    /// Canonical step-shaped acquire per VM_v1_2 §3.1. `Done` = the
+    /// reservation is held; `Yield { OnCarrier }` = the caller should
+    /// await the carrier+interest pair and retry. The internal
+    /// `PendingWriter` slot used for writer-preference is not exposed
+    /// here; production scripts (which drop the rich `WouldBlock`
+    /// carrier immediately on blocking anyway) compose against this
+    /// surface. Tests that probe the rich pending-writer machinery use
+    /// `acquire_step_rich`.
+    ///
+    /// Returns a step_v3 outcome with `NoProgress` (one-shot acquire,
+    /// no byte/page accumulator). Only `Done` and `Yield { OnCarrier }`
+    /// are produced; `Continue` / `Yield { OnAgent }` / `Err` cannot
+    /// occur by construction.
+    pub fn acquire_step(
+        &self,
+        range: UserRange,
+        mode: LockMode,
+    ) -> V3StepOutcome<RangeGuard<'_>, NoProgress> {
         match self.acquire_step_rich(range, mode) {
-            AcquireResult::Acquired(guard) => StepOutcome::Done(guard),
-            AcquireResult::WouldBlock(blocked) => StepOutcome::Blocked(blocked.wait_token()),
+            AcquireResult::Acquired(guard) => V3StepOutcome::Done(guard),
+            AcquireResult::WouldBlock(blocked) => {
+                let token = blocked.wait_token();
+                V3StepOutcome::Yield {
+                    progress: NoProgress,
+                    shape: YieldShape::OnCarrier {
+                        carrier: WakeCarrier::new(token.carrier()),
+                        interests: InterestConditions::new(token.interest()),
+                    },
+                }
+            }
         }
     }
 
@@ -153,10 +175,19 @@ impl RangeLock {
         &self,
         a: (UserRange, LockMode),
         b: (UserRange, LockMode),
-    ) -> StepOutcome<RangeGuardPair<'_>> {
+    ) -> V3StepOutcome<RangeGuardPair<'_>, NoProgress> {
         match self.acquire_pair_step_rich(a, b) {
-            AcquirePairResult::Acquired(pair) => StepOutcome::Done(pair),
-            AcquirePairResult::WouldBlock(blocked) => StepOutcome::Blocked(blocked.wait_token()),
+            AcquirePairResult::Acquired(pair) => V3StepOutcome::Done(pair),
+            AcquirePairResult::WouldBlock(blocked) => {
+                let token = blocked.wait_token();
+                V3StepOutcome::Yield {
+                    progress: NoProgress,
+                    shape: YieldShape::OnCarrier {
+                        carrier: WakeCarrier::new(token.carrier()),
+                        interests: InterestConditions::new(token.interest()),
+                    },
+                }
+            }
         }
     }
 

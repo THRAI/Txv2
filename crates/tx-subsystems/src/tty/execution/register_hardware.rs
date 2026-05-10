@@ -3,7 +3,7 @@
 use tx_substrate::zone::{self, Cap, PayloadCap};
 
 use crate::device::CharDeviceBinding;
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::{Errno, Guard};
 use crate::tty::structure::registry;
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
 
@@ -14,14 +14,15 @@ pub fn register_hardware(
     index: u32,
     binding: &'static CharDeviceBinding,
     _guard: &Guard<'_>,
-) -> StepOutcome<Cap<TtyIdentity>> {
+) -> tx_substrate::step_v3::StepOutcome<Cap<TtyIdentity>, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3Out;
     let id_res = match zone::reserve_for::<TtyIdentity>() {
         Ok(reservation) => reservation,
-        Err(_) => return StepOutcome::Err(Errno::EIO),
+        Err(_) => return V3Out::err(Errno::EIO.into()),
     };
     let payload_res = match zone::reserve_for::<TtyPayload>() {
         Ok(reservation) => reservation,
-        Err(_) => return StepOutcome::Err(Errno::EIO),
+        Err(_) => return V3Out::err(Errno::EIO.into()),
     };
 
     let tty = zone::sign_for(
@@ -37,16 +38,20 @@ pub fn register_hardware(
     if registry::register_hardware_tty(index, tty.clone()).is_err()
         || registry::register_devfs_alias(name, tty.clone()).is_err()
     {
-        return StepOutcome::Err(Errno::EIO);
+        return V3Out::err(Errno::EIO.into());
     }
 
-    StepOutcome::Done(tty)
+    V3Out::done(tty)
 }
 
 /// Register a devfs alias, such as `/dev/console`, for an existing TTY.
-pub fn register_console_alias(name: &str, tty: Cap<TtyIdentity>) -> StepOutcome<()> {
+pub fn register_console_alias(
+    name: &str,
+    tty: Cap<TtyIdentity>,
+) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3Out;
     if registry::register_devfs_alias(name, tty).is_err() {
-        return StepOutcome::Err(Errno::EIO);
+        return V3Out::err(Errno::EIO.into());
     }
-    StepOutcome::Done(())
+    V3Out::done(())
 }

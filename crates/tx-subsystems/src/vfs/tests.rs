@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::{Errno as V4Errno, Guard};
 use crate::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, Pgid};
@@ -13,12 +13,17 @@ use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::{Termios, TtyIdentity, TtyKind, TtyPayload, Winsize};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
+use tx_substrate::step_v3::{Errno, StepOutcome};
 use tx_substrate::zone::{self, Cap, PayloadCap};
 
 struct EchoCharOps;
 
 impl CharDeviceOps for EchoCharOps {
-    fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+    fn read(
+        &self,
+        out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
         if out.is_empty() {
             return StepOutcome::Done(0);
         }
@@ -26,7 +31,11 @@ impl CharDeviceOps for EchoCharOps {
         StepOutcome::Done(1)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
         StepOutcome::Done(bytes.len())
     }
 }
@@ -74,11 +83,11 @@ fn alloc_tty(kind: TtyKind, index: u32, name: &str, payload: TtyPayload) -> Cap<
 #[test]
 fn inline_name_rejects_empty_slash_and_oversized_names() {
     assert_eq!(InlineName::new(b"etc").unwrap().as_bytes(), b"etc");
-    assert_eq!(InlineName::new(b""), Err(Errno::ENAMETOOLONG));
-    assert_eq!(InlineName::new(b"a/b"), Err(Errno::ENAMETOOLONG));
+    assert_eq!(InlineName::new(b""), Err(V4Errno::ENAMETOOLONG));
+    assert_eq!(InlineName::new(b"a/b"), Err(V4Errno::ENAMETOOLONG));
     assert_eq!(
         InlineName::new(&[b'x'; VFS_NAME_MAX + 1]),
-        Err(Errno::ENAMETOOLONG)
+        Err(V4Errno::ENAMETOOLONG)
     );
 }
 
@@ -161,17 +170,19 @@ fn open_file_dispatches_struct_payload_read_write() {
 
     assert!(matches!(
         tty_file.step_read(&mut out, &guard),
-        StepOutcome::Blocked(_)
+        StepOutcome::Yield { .. }
     ));
-    assert_eq!(
-        crate::tty::execution::step_ingest(&tty, b"ok\n", &guard),
-        StepOutcome::Done(crate::tty::execution::IngestOutcome {
-            consumed: 3,
-            readable_fired: true,
-            writable_fired: true,
-            ..Default::default()
-        })
-    );
+    {
+        assert_eq!(
+            crate::tty::execution::step_ingest(&tty, b"ok\n", &guard),
+            StepOutcome::Done(crate::tty::execution::IngestOutcome {
+                consumed: 3,
+                readable_fired: true,
+                writable_fired: true,
+                ..Default::default()
+            })
+        );
+    }
     assert_eq!(tty_file.step_read(&mut out, &guard), StepOutcome::Done(3));
     assert_eq!(&out[..3], b"ok\n");
     assert_eq!(tty_file.step_write(b"x", &guard), StepOutcome::Done(1));
