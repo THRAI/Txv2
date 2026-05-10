@@ -1,9 +1,12 @@
 //! TTY execution hardware polling step tests.
 
 use alloc::boxed::Box;
+use tx_substrate::step_v3::StepOutcome;
+
+use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out, YieldShape};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::Guard;
 use crate::tty::execution::{register_hardware, step_poll_hardware_input};
 use crate::tty::structure::{TtyKind, TtyPayload};
 
@@ -12,12 +15,20 @@ use super::support::{alloc_tty, init_zones, NOOP_BINDING, TTY_ZONE_TEST_LOCK};
 struct BlockingReadOps;
 
 impl CharDeviceOps for BlockingReadOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Blocked(crate::execution::WaitToken::new(0x55, 0x0f))
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> V3Out<usize, tx_substrate::step_v3::ByteProgress> {
+        V3Out::yield_on_carrier(tx_substrate::step_v3::ByteProgress::EMPTY, 0x55, 0x0f)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(bytes.len())
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> V3Out<usize, tx_substrate::step_v3::ByteProgress> {
+        V3Out::Done(bytes.len())
     }
 }
 
@@ -44,7 +55,7 @@ fn step_poll_hardware_input_rejects_pty_transport() {
 
     assert_eq!(
         step_poll_hardware_input(&master, 16, &guard),
-        StepOutcome::Err(Errno::EINVAL)
+        V3Out::Err(V3Errno::EINVAL)
     );
 }
 
@@ -64,8 +75,14 @@ fn step_poll_hardware_input_propagates_blocked_driver_read() {
         other => panic!("register_hardware failed: {other:?}"),
     };
 
-    assert_eq!(
-        step_poll_hardware_input(&tty, 16, &guard),
-        StepOutcome::Blocked(crate::execution::WaitToken::new(0x55, 0x0f))
-    );
+    match step_poll_hardware_input(&tty, 16, &guard) {
+        V3Out::Yield {
+            shape: YieldShape::OnCarrier { carrier, interests },
+            ..
+        } => {
+            assert_eq!(carrier.raw(), 0x55);
+            assert_eq!(interests.raw(), 0x0f);
+        }
+        other => panic!("expected v3 Yield::OnCarrier, got {other:?}"),
+    }
 }

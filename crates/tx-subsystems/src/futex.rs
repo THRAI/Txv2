@@ -39,7 +39,7 @@ use tx_reactor::wait::{Channel, Mask};
 use tx_substrate::zone::ZoneError;
 use tx_substrate::SpinMutex;
 
-use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
+use crate::execution::Guard;
 use crate::wait_carrier;
 
 /// Number of futex hash buckets. Fixed; no dynamic allocation.
@@ -110,33 +110,31 @@ pub fn bucket_index(uaddr: u64) -> usize {
 
 /// `futex(uaddr, FUTEX_WAIT, val, timeout, ...)`.
 ///
-/// Synchronously samples the user word at `uaddr` and:
-/// - If `*uaddr != val`, returns [`StepOutcome::Err(Errno::EAGAIN)`]
-///   immediately (the futex's "fast path" guard — userspace already
-///   observed the wakeup and the kernel must not park).
-/// - Otherwise, returns [`StepOutcome::Blocked`] with a
-///   [`WaitToken`] over the bucket's wait channel.
+/// Samples `*uaddr`; if it equals `val`, yields on the bucket's wait
+/// channel (`OnCarrier`); otherwise returns `Err(EAGAIN)`.
+/// `uaddr` must be non-zero and 4-byte aligned; otherwise `Err(EINVAL)`.
+/// `timeout` is ignored in v1.
 ///
-/// `timeout` is ignored in v1 (Slice 4 carryover). The caller (the
-/// `sys_futex` arm in tx-shims) is responsible for the
-/// `wait_on_token(token).await` loop and the post-wake re-check
-/// (re-call `step_futex_wait`; if it now returns `EAGAIN` the wake
-/// was meaningful and the syscall returns 0; otherwise the same
-/// `Blocked` outcome re-parks).
+/// Returns a [`tx_substrate::step_v3::StepOutcome`]:
+/// - bad uaddr → `Err(Errno::EINVAL)`
+/// - `*uaddr != val` → `Err(Errno::EAGAIN)`
+/// - `*uaddr == val` → `Yield { progress: NoProgress, shape: OnCarrier { … } }`
 ///
-/// `uaddr` must be non-zero and 4-byte aligned; otherwise returns
-/// [`StepOutcome::Err(Errno::EINVAL)`].
-pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<()> {
+/// Wait never produces `Done`: completion arrives via the carrier
+/// resolution step driven by the script driver after the yield resolves.
+pub fn step_futex_wait(
+    uaddr: u64,
+    val: u32,
+    _guard: &Guard<'_>,
+) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
     if uaddr == 0 || (uaddr & 0x3) != 0 {
-        return StepOutcome::Err(Errno::EINVAL);
+        return tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EINVAL);
     }
     // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
-    // Replace with `UserAccessIf::read_user::<u32>` once Slice 9
-    // lands. The same exemption powers `sys_pipe2`'s userspace
-    // writeback and the `getresuid`/`getresgid` arms.
+    // Mirrors `step_futex_wait`'s read; see that fn for migration plan.
     let observed = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
     if observed != val {
-        return StepOutcome::Err(Errno::EAGAIN);
+        return tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EAGAIN);
     }
     let idx = bucket_index(uaddr);
     let carrier_id = {
@@ -146,21 +144,32 @@ pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<
             .expect("futex buckets uninitialised — register_zones not called");
         buckets[idx].carrier_id
     };
-    StepOutcome::Blocked(WaitToken::new(carrier_id, FUTEX_WAKE_MASK))
+    tx_substrate::step_v3::StepOutcome::Yield {
+        progress: tx_substrate::step_v3::NoProgress,
+        shape: tx_substrate::step_v3::YieldShape::OnCarrier {
+            carrier: tx_substrate::step_v3::WakeCarrier::new(carrier_id),
+            interests: tx_substrate::step_v3::InterestConditions::new(FUTEX_WAKE_MASK),
+        },
+    }
 }
 
 /// `futex(uaddr, FUTEX_WAKE, n, ...)`.
 ///
-/// Fires the bucket's channel, which wakes every waiter currently
-/// subscribed. Returns `n` directly — Linux's "wake at most n" is
-/// best-effort and over-waking is permissible (spurious wakees
-/// re-park on their next iteration).
+/// Returns a [`tx_substrate::step_v3::StepOutcome`]:
+/// - bad uaddr (zero or unaligned) → `Err(Errno::EINVAL)`
+/// - otherwise → `Done(n)` (best-effort: returned count is the
+///   requested `n`, not the actually-woken count; same caveat as
+///   `step_futex_wake`). `n == 0` is permitted and returns `Done(0)` —
+///   Linux `FUTEX_WAKE` with `n=0` is a defined no-op.
 ///
-/// `uaddr` must be non-zero and 4-byte aligned; otherwise returns
-/// [`StepOutcome::Err(Errno::EINVAL)`].
-pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u32> {
+/// Wake never produces `Yield`/`Continue`.
+pub fn step_futex_wake(
+    uaddr: u64,
+    n: u32,
+    _guard: &Guard<'_>,
+) -> tx_substrate::step_v3::StepOutcome<u32, tx_substrate::step_v3::NoProgress> {
     if uaddr == 0 || (uaddr & 0x3) != 0 {
-        return StepOutcome::Err(Errno::EINVAL);
+        return tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EINVAL);
     }
     let idx = bucket_index(uaddr);
     {
@@ -170,12 +179,13 @@ pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u3
             .expect("futex buckets uninitialised — register_zones not called");
         buckets[idx].channel.fire(Mask::from_bits(FUTEX_WAKE_MASK));
     }
-    StepOutcome::Done(n)
+    tx_substrate::step_v3::StepOutcome::Done(n)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome, StepProgress};
     use tx_substrate::testing::init_host_for_test_once;
 
     use crate::test_support::EPOCH_TEST_LOCK;
@@ -205,7 +215,7 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let outcome = step_futex_wake(0, 1, &guard);
         drop(guard);
-        assert_eq!(outcome, StepOutcome::Err(Errno::EINVAL));
+        assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
     }
 
     #[test]
@@ -215,7 +225,7 @@ mod tests {
         // 0x1 — non-zero, non-zero-mod-4.
         let outcome = step_futex_wake(0x1, 1, &guard);
         drop(guard);
-        assert_eq!(outcome, StepOutcome::Err(Errno::EINVAL));
+        assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
     }
 
     #[test]
@@ -228,7 +238,7 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let outcome = step_futex_wait(uaddr, 0, &guard);
         drop(guard);
-        assert_eq!(outcome, StepOutcome::Err(Errno::EAGAIN));
+        assert_eq!(outcome, StepOutcome::Err(V3Errno::EAGAIN));
     }
 
     #[test]
@@ -239,16 +249,19 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let outcome = step_futex_wait(uaddr, 0xdead_beef, &guard);
         drop(guard);
+        use tx_substrate::step_v3::YieldShape;
         match outcome {
-            StepOutcome::Blocked(token) => {
-                assert_eq!(token.interest(), FUTEX_WAKE_MASK);
-                // Carrier id must resolve back to a registered channel.
+            StepOutcome::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => {
+                assert_eq!(interests.raw(), FUTEX_WAKE_MASK);
                 assert!(
-                    wait_carrier::lookup_wait_channel(token.carrier()).is_some(),
+                    wait_carrier::lookup_wait_channel(carrier.raw()).is_some(),
                     "futex bucket carrier must be registered with wait_carrier",
                 );
             }
-            other => panic!("expected Blocked, got {other:?}"),
+            other => panic!("expected Yield, got {other:?}"),
         }
     }
 
@@ -258,7 +271,7 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let outcome = step_futex_wait(0, 0, &guard);
         drop(guard);
-        assert_eq!(outcome, StepOutcome::Err(Errno::EINVAL));
+        assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
     }
 
     #[test]
@@ -267,7 +280,7 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let outcome = step_futex_wait(0x2, 0, &guard);
         drop(guard);
-        assert_eq!(outcome, StepOutcome::Err(Errno::EINVAL));
+        assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
     }
 
     #[test]
@@ -291,6 +304,122 @@ mod tests {
         );
     }
 
+    // -- step_v3 sibling-fn tests -----------------------------------------
+    //
+    // The tests below exercise the step_v3-shape sibling fns
+    // `step_futex_wait` / `step_futex_wake`. They pin the
+    // step_v3 outcome catalog without crossing the tx-shims dispatch
+    // boundary.
+
+    #[test]
+    fn step_futex_wait_misaligned_uaddr_returns_einval() {
+        let _setup = setup();
+        let guard = tx_substrate::epoch::guard();
+        // 0x1 — non-zero, non-zero-mod-4 (misaligned for u32).
+        let outcome = step_futex_wait(0x1, 0, &guard);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EINVAL) => {}
+            tx_substrate::step_v3::StepOutcome::Continue { .. }
+            | tx_substrate::step_v3::StepOutcome::Yield { .. }
+            | tx_substrate::step_v3::StepOutcome::Done(())
+            | tx_substrate::step_v3::StepOutcome::Err(_) => {
+                panic!("expected v3 Err(EINVAL), got {outcome:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn step_futex_wait_value_mismatch_returns_eagain() {
+        let _setup = setup();
+        // Word holds 0xdead_beef; FUTEX_WAIT with val=0 must observe
+        // the mismatch and short-circuit to EAGAIN.
+        let word: u32 = 0xdead_beef;
+        let uaddr = &word as *const u32 as u64;
+        let guard = tx_substrate::epoch::guard();
+        let outcome = step_futex_wait(uaddr, 0, &guard);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EAGAIN) => {}
+            tx_substrate::step_v3::StepOutcome::Continue { .. }
+            | tx_substrate::step_v3::StepOutcome::Yield { .. }
+            | tx_substrate::step_v3::StepOutcome::Done(())
+            | tx_substrate::step_v3::StepOutcome::Err(_) => {
+                panic!("expected v3 Err(EAGAIN), got {outcome:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn step_futex_wait_value_match_yields_on_carrier() {
+        let _setup = setup();
+        let word: u32 = 0xdead_beef;
+        let uaddr = &word as *const u32 as u64;
+        let guard = tx_substrate::epoch::guard();
+        let outcome = step_futex_wait(uaddr, 0xdead_beef, &guard);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Yield {
+                progress,
+                shape:
+                    tx_substrate::step_v3::YieldShape::OnCarrier {
+                        carrier: _,
+                        interests,
+                    },
+            } => {
+                assert!(progress.is_empty(), "wait yield must carry empty progress");
+                assert_eq!(
+                    interests.raw(),
+                    FUTEX_WAKE_MASK,
+                    "interest mask must match the futex wake bit",
+                );
+            }
+            other => panic!("expected v3 Yield::OnCarrier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_futex_wake_zero_n_is_a_no_op_done_zero() {
+        // Linux `FUTEX_WAKE` with `n=0` is a defined no-op;
+        // `step_futex_wake` falls through to `Done(0)`. Tightening
+        // (rejecting `n=0` as EINVAL) is a separate design decision.
+        let _setup = setup();
+        let word: u32 = 0;
+        let uaddr = &word as *const u32 as u64;
+        let guard = tx_substrate::epoch::guard();
+        let outcome = step_futex_wake(uaddr, 0, &guard);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Done(0) => {}
+            other => panic!("expected v3 Done(0) for n=0 no-op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_futex_wake_unwaited_returns_done_zero() {
+        let _setup = setup();
+        // Wake on an idle bucket with no waiters parked on it.
+        //
+        // v1's `step_futex_wake` is best-effort: returns the requested
+        // `n` regardless of how many waiters were actually woken. The
+        // probe-target semantics ("Done(0)" — number actually woken)
+        // require per-bucket waiter counts, which v1 doesn't track.
+        // We pin v1 behaviour here (Done(n) of requested n); future
+        // tightening per the wake-N comment in the module preamble
+        // flips this to Done(0).
+        let word: u32 = 0;
+        let uaddr = &word as *const u32 as u64;
+        let guard = tx_substrate::epoch::guard();
+        let outcome = step_futex_wake(uaddr, 1, &guard);
+        drop(guard);
+        match outcome {
+            tx_substrate::step_v3::StepOutcome::Done(woken) => {
+                assert_eq!(woken, 1, "v1 wake returns requested n (best-effort)");
+            }
+            other => panic!("expected v3 Done(_), got {other:?}"),
+        }
+    }
+
     #[test]
     fn futex_step_wake_fires_channel_observed_by_waiter() {
         // Cross-iteration check: register a wait, fire wake on the
@@ -304,11 +433,15 @@ mod tests {
         let word: u32 = 42;
         let uaddr = &word as *const u32 as u64;
         let guard = tx_substrate::epoch::guard();
-        // wait → Blocked(token); pull the carrier id.
+        use tx_substrate::step_v3::YieldShape;
+        // wait → Yield { OnCarrier { … } }; pull the carrier id.
         let wait_outcome = step_futex_wait(uaddr, 42, &guard);
         let waiter_carrier = match wait_outcome {
-            StepOutcome::Blocked(token) => token.carrier(),
-            other => panic!("expected Blocked, got {other:?}"),
+            StepOutcome::Yield {
+                shape: YieldShape::OnCarrier { carrier, .. },
+                ..
+            } => carrier.raw(),
+            other => panic!("expected Yield, got {other:?}"),
         };
         // wake on the same uaddr; record success.
         let wake_outcome = step_futex_wake(uaddr, 1, &guard);

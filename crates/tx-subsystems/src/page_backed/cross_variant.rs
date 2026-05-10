@@ -27,31 +27,32 @@ pub fn step_copy_file_range(
     out_offset: u64,
     len: usize,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
     if len == 0 {
-        return StepOutcome::Done(0);
+        return V3::done(0);
     }
     if matches!(out_pc.kind(), PageContainerKind::Device { .. }) {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     }
 
     let Some(in_capacity) = in_pc.byte_capacity() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     let Some(out_capacity) = out_pc.byte_capacity() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
 
     let Some(out_end) = out_offset.checked_add(len as u64) else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     if out_end > out_capacity {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     }
 
     let in_valid_end = core::cmp::min(in_pc.size_bytes(), in_capacity);
     if in_offset >= in_valid_end {
-        return StepOutcome::Done(0);
+        return V3::done(0);
     }
     let effective_len = core::cmp::min(len as u64, in_valid_end - in_offset) as usize;
 
@@ -71,45 +72,101 @@ pub fn step_copy_file_range(
             ),
         );
 
+        // `materialize_page` returns v3
+        // `StepOutcome<MaterializedPage, NoProgress>`. Map per variant:
+        // - `Done` → continue the copy loop with the materialized frame.
+        // - `Continue { .. }` (NoProgress) → no frame; partial-success
+        //   surface (`Done(advanced)` if any) or `EAGAIN`.
+        // - `Yield { OnCarrier .. }` → propagate carrying accumulated
+        //   byte progress (or `EMPTY` when `advanced == 0`).
+        // - `Yield { OnAgent .. }` → unsupported, surface `EIO`/partial.
+        // - `Err(errno)` → `Err(errno)` (no progress yet) or partial `Done`.
+        use tx_substrate::step_v3::YieldShape;
         let in_materialized = match in_pc.materialize_page(in_page, MaterializeAccess::Read, guard)
         {
-            StepOutcome::Done(m) | StepOutcome::Advanced(m) => m,
-            StepOutcome::Blocked(token) => {
+            tx_substrate::step_v3::StepOutcome::Done(m) => m,
+            tx_substrate::step_v3::StepOutcome::Continue { .. } => {
                 if advanced == 0 {
-                    return StepOutcome::Blocked(token);
-                }
-                return advanced_with_partial(out_pc, out_offset, advanced, token);
-            }
-            StepOutcome::AdvancedThenBlocked(_, token) => {
-                return advanced_with_partial(out_pc, out_offset, advanced, token);
-            }
-            StepOutcome::Err(errno) => {
-                if advanced == 0 {
-                    return StepOutcome::Err(errno);
+                    return V3::err(tx_substrate::step_v3::Errno::EAGAIN);
                 }
                 publish_progress(out_pc, out_offset, advanced);
-                return StepOutcome::Done(advanced);
+                return V3::done(advanced);
+            }
+            tx_substrate::step_v3::StepOutcome::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => {
+                if advanced == 0 {
+                    return V3::yield_on_carrier(
+                        ByteProgress::EMPTY,
+                        carrier.raw(),
+                        interests.raw(),
+                    );
+                }
+                publish_progress(out_pc, out_offset, advanced);
+                return V3::yield_on_carrier(
+                    ByteProgress::new(advanced),
+                    carrier.raw(),
+                    interests.raw(),
+                );
+            }
+            tx_substrate::step_v3::StepOutcome::Yield { .. } => {
+                if advanced == 0 {
+                    return V3::err(tx_substrate::step_v3::Errno::EIO);
+                }
+                publish_progress(out_pc, out_offset, advanced);
+                return V3::done(advanced);
+            }
+            tx_substrate::step_v3::StepOutcome::Err(errno) => {
+                if advanced == 0 {
+                    return V3::err(errno);
+                }
+                publish_progress(out_pc, out_offset, advanced);
+                return V3::done(advanced);
             }
         };
 
         let out_materialized =
             match out_pc.materialize_page(out_page, MaterializeAccess::Write, guard) {
-                StepOutcome::Done(m) | StepOutcome::Advanced(m) => m,
-                StepOutcome::Blocked(token) => {
+                tx_substrate::step_v3::StepOutcome::Done(m) => m,
+                tx_substrate::step_v3::StepOutcome::Continue { .. } => {
                     if advanced == 0 {
-                        return StepOutcome::Blocked(token);
-                    }
-                    return advanced_with_partial(out_pc, out_offset, advanced, token);
-                }
-                StepOutcome::AdvancedThenBlocked(_, token) => {
-                    return advanced_with_partial(out_pc, out_offset, advanced, token);
-                }
-                StepOutcome::Err(errno) => {
-                    if advanced == 0 {
-                        return StepOutcome::Err(errno);
+                        return V3::err(tx_substrate::step_v3::Errno::EAGAIN);
                     }
                     publish_progress(out_pc, out_offset, advanced);
-                    return StepOutcome::Done(advanced);
+                    return V3::done(advanced);
+                }
+                tx_substrate::step_v3::StepOutcome::Yield {
+                    shape: YieldShape::OnCarrier { carrier, interests },
+                    ..
+                } => {
+                    if advanced == 0 {
+                        return V3::yield_on_carrier(
+                            ByteProgress::EMPTY,
+                            carrier.raw(),
+                            interests.raw(),
+                        );
+                    }
+                    publish_progress(out_pc, out_offset, advanced);
+                    return V3::yield_on_carrier(
+                        ByteProgress::new(advanced),
+                        carrier.raw(),
+                        interests.raw(),
+                    );
+                }
+                tx_substrate::step_v3::StepOutcome::Yield { .. } => {
+                    if advanced == 0 {
+                        return V3::err(tx_substrate::step_v3::Errno::EIO);
+                    }
+                    publish_progress(out_pc, out_offset, advanced);
+                    return V3::done(advanced);
+                }
+                tx_substrate::step_v3::StepOutcome::Err(errno) => {
+                    if advanced == 0 {
+                        return V3::err(errno);
+                    }
+                    publish_progress(out_pc, out_offset, advanced);
+                    return V3::done(advanced);
                 }
             };
 
@@ -117,20 +174,20 @@ pub fn step_copy_file_range(
             Ok(ptr) => ptr,
             Err(_) => {
                 if advanced == 0 {
-                    return StepOutcome::Err(Errno::EIO);
+                    return V3::err(Errno::EIO.into());
                 }
                 publish_progress(out_pc, out_offset, advanced);
-                return StepOutcome::Done(advanced);
+                return V3::done(advanced);
             }
         };
         let out_base = match page_allocator::frame_kernel_addr(out_materialized.ppn) {
             Ok(ptr) => ptr,
             Err(_) => {
                 if advanced == 0 {
-                    return StepOutcome::Err(Errno::EIO);
+                    return V3::err(Errno::EIO.into());
                 }
                 publish_progress(out_pc, out_offset, advanced);
-                return StepOutcome::Done(advanced);
+                return V3::done(advanced);
             }
         };
         unsafe {
@@ -143,7 +200,7 @@ pub fn step_copy_file_range(
     }
 
     publish_progress(out_pc, out_offset, advanced);
-    StepOutcome::Done(advanced)
+    V3::done(advanced)
 }
 
 fn publish_progress(out_pc: &PageContainer, out_offset: u64, advanced: usize) {
@@ -151,14 +208,4 @@ fn publish_progress(out_pc: &PageContainer, out_offset: u64, advanced: usize) {
         return;
     }
     out_pc.grow_size_to(out_offset + advanced as u64);
-}
-
-fn advanced_with_partial(
-    out_pc: &PageContainer,
-    out_offset: u64,
-    advanced: usize,
-    token: crate::execution::WaitToken,
-) -> StepOutcome<usize> {
-    publish_progress(out_pc, out_offset, advanced);
-    StepOutcome::AdvancedThenBlocked(advanced, token)
 }

@@ -29,7 +29,7 @@ use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use tx_subsystems::execution::{Guard, StepOutcome};
+use tx_subsystems::execution::Guard;
 use tx_subsystems::process::{bootstrap_init_process, ExitStatus, Pid, ProcessIdentity};
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
@@ -239,16 +239,24 @@ impl CapturingOps {
 }
 
 impl CharDeviceOps for CapturingOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(0)
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        tx_substrate::step_v3::StepOutcome::Done(0)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
         self.captured
             .lock()
             .expect("capture lock")
             .extend_from_slice(bytes);
-        StepOutcome::Done(bytes.len())
+        tx_substrate::step_v3::StepOutcome::Done(bytes.len())
     }
 }
 
@@ -261,12 +269,12 @@ fn install_capturing_console() -> &'static CapturingOps {
     }));
     let guard = tx_substrate::epoch::guard();
     let tty = match register_hardware("shims-console-hw", 0, binding, &guard) {
-        StepOutcome::Done(tty) => tty,
+        tx_substrate::step_v3::StepOutcome::Done(tty) => tty,
         other => panic!("register_hardware failed: {other:?}"),
     };
     assert_eq!(
         register_console_alias("console", tty),
-        StepOutcome::Done(())
+        tx_substrate::step_v3::StepOutcome::Done(())
     );
     ops_static
 }
@@ -471,10 +479,11 @@ fn dispatch_read_blocks_until_tty_input_then_returns_byte() {
     // registered wait-carrier channel, so the next poll should
     // observe the bytes and complete.
     {
+        use tx_substrate::step_v3::StepOutcome as V3Out;
         let guard = tx_substrate::epoch::guard();
         let outcome = tx_subsystems::tty::execution::step_ingest(&console_tty, b"X\n", &guard);
         assert!(
-            matches!(outcome, StepOutcome::Done(_)),
+            matches!(outcome, V3Out::Done(_)),
             "step_ingest should accept the bytes; got {outcome:?}"
         );
     }

@@ -5,7 +5,7 @@ use core::sync::atomic::Ordering;
 use tx_reactor::wait::Mask;
 use tx_substrate::zone::Cap;
 
-use crate::execution::{Guard, StepOutcome};
+use crate::execution::Guard;
 use crate::tty::checks::require_live_tty;
 use crate::tty::execution::{
     deferred_signal_for_tty, SignalDispatch, TTY_DEFERRED_SIGNAL, TTY_READABLE, TTY_WRITABLE,
@@ -37,10 +37,11 @@ pub fn step_ingest(
     tty: &Cap<TtyIdentity>,
     bytes: &[u8],
     guard: &Guard<'_>,
-) -> StepOutcome<IngestOutcome> {
+) -> tx_substrate::step_v3::StepOutcome<IngestOutcome, tx_substrate::step_v3::NoProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return StepOutcome::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     let mut outcome = IngestOutcome::default();
@@ -115,5 +116,5 @@ pub fn step_ingest(
         });
     });
 
-    StepOutcome::Done(outcome)
+    V3::Done(outcome)
 }

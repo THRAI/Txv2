@@ -9,7 +9,7 @@
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::execution::{Errno, Guard, StepOutcome};
+use crate::execution::{Errno, Guard};
 use crate::mount::MountPayloadPin;
 use crate::sync::SpinMutex;
 use crate::vfs::{FsObjectId, OpenFile};
@@ -22,11 +22,13 @@ use tx_substrate::{
 };
 
 mod cross_variant;
+mod fs_page_backing;
 mod lifecycle;
 mod reflink;
 mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
+pub use fs_page_backing::FsPageBacking;
 pub use lifecycle::{step_fallocate, step_fsync, step_truncate};
 pub use reflink::{cow_replace_into_private, install_shared_page};
 pub use targeted_read::read_exact_at;
@@ -249,48 +251,6 @@ enum PageBackedIoKind {
     Write,
 }
 
-pub trait FsPageBacking: Send + Sync + 'static {
-    fn fetch_page(
-        &self,
-        fs_object_id: FsObjectId,
-        offset: u64,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<Frame>;
-
-    fn flush_page(
-        &self,
-        fs_object_id: FsObjectId,
-        offset: u64,
-        frame: &Frame,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<()>;
-
-    fn truncate(
-        &self,
-        fs_object_id: FsObjectId,
-        new_size: u64,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<()>;
-
-    fn fsync(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<()>;
-
-    /// Reserve space for future writes up to `new_size`. The default
-    /// implementation is `Done(())`: most filesystems can treat fallocate as
-    /// a hint. Backends that pre-allocate on-disk blocks override this.
-    fn fallocate(
-        &self,
-        _fs_object_id: FsObjectId,
-        _new_size: u64,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
-        StepOutcome::Done(())
-    }
-
-    fn supports_reflink(&self, _other: &PageContainer) -> bool {
-        false
-    }
-}
-
 #[derive(Debug)]
 pub struct MaterializedPage {
     pub ppn: Ppn,
@@ -416,15 +376,17 @@ impl PageContainer {
         page: PageIndex,
         access: MaterializeAccess,
         guard: &Guard<'_>,
-    ) -> StepOutcome<MaterializedPage> {
+    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress>
+    {
+        use tx_substrate::step_v3::StepOutcome as V3;
         if let Err(error) = self.check_bounds(page) {
-            return StepOutcome::Err(page_cache_error_to_errno(error));
+            return V3::Err(page_cache_error_to_errno(error).into());
         }
 
         match &self.kind {
             PageContainerKind::Anon { .. } => match self.materialize_anon(page, access) {
-                Ok(page) => StepOutcome::Done(page),
-                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
+                Ok(page) => V3::Done(page),
+                Err(error) => V3::Err(page_cache_error_to_errno(error).into()),
             },
             PageContainerKind::File {
                 mount,
@@ -444,37 +406,45 @@ impl PageContainer {
         mount: &MountPayloadPin,
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
-    ) -> StepOutcome<MaterializedPage> {
+    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress>
+    {
+        use tx_substrate::step_v3::{NoProgress, StepOutcome as V3, YieldShape};
         if let Some(materialized) = self.materialize_cached_page(page, access) {
             return match materialized {
-                Ok(page) => StepOutcome::Done(page),
-                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
+                Ok(page) => V3::Done(page),
+                Err(error) => V3::Err(page_cache_error_to_errno(error).into()),
             };
         }
 
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
-            return StepOutcome::Err(Errno::EINVAL);
+            return V3::Err(tx_substrate::step_v3::Errno::EINVAL);
         };
+        // Routes through `FsPageBacking::fetch_page`. v3 outcome:
+        // Done→install + Done; Continue→ no frame, surface EAGAIN as
+        // a conservative choice; Yield{OnCarrier{c,i}}→pass through
+        // with `NoProgress`; Yield{OnAgent}→Err(EIO); Err→Err.
         match mount
             .payload()
             .fs_page_backing
             .fetch_page(fs_object_id, offset, guard)
         {
-            StepOutcome::Done(frame) => self.install_fetched_file_page(page, access, frame, false),
-            StepOutcome::Advanced(frame) => {
-                match self.install_fetched_file_page(page, access, frame, false) {
-                    StepOutcome::Done(page) => StepOutcome::Advanced(page),
-                    other => other,
-                }
+            V3::Done(frame) => self.install_fetched_file_page(page, access, frame, false),
+            V3::Continue { progress: _ } => {
+                // `Continue` with `NoProgress` means "fs is asking us
+                // to retry"; there is no frame to install. Conservative
+                // choice: surface `Err(EAGAIN)` so callers that expect
+                // a frame don't observe a stale value.
+                V3::Err(tx_substrate::step_v3::Errno::EAGAIN)
             }
-            StepOutcome::Blocked(token) => StepOutcome::Blocked(token),
-            StepOutcome::AdvancedThenBlocked(frame, token) => {
-                match self.install_fetched_file_page(page, access, frame, false) {
-                    StepOutcome::Done(page) => StepOutcome::AdvancedThenBlocked(page, token),
-                    other => other,
-                }
-            }
-            StepOutcome::Err(errno) => StepOutcome::Err(errno),
+            V3::Yield {
+                progress: _,
+                shape: YieldShape::OnCarrier { carrier, interests },
+            } => V3::yield_on_carrier(NoProgress, carrier.raw(), interests.raw()),
+            V3::Yield {
+                shape: YieldShape::OnAgent { .. },
+                ..
+            } => V3::Err(tx_substrate::step_v3::Errno::EIO),
+            V3::Err(v3_errno) => V3::Err(v3_errno),
         }
     }
 
@@ -484,10 +454,12 @@ impl PageContainer {
         access: MaterializeAccess,
         frame: Frame,
         newly_installed: bool,
-    ) -> StepOutcome<MaterializedPage> {
+    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress>
+    {
+        use tx_substrate::step_v3::StepOutcome as V3;
         let frame = match cached_frame_from_frame(frame) {
             Ok(frame) => frame,
-            Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error)),
+            Err(error) => return V3::Err(page_cache_error_to_errno(error).into()),
         };
         let mut state = self.state.lock();
         let installed = match state.pages.lookup(page) {
@@ -495,17 +467,17 @@ impl PageContainer {
             None => match state.pages.install_if_absent(page, frame) {
                 Ok(()) => true,
                 Err(PageCacheError::AlreadyPresent { .. }) => false,
-                Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error)),
+                Err(error) => return V3::Err(page_cache_error_to_errno(error).into()),
             },
         };
         if access == MaterializeAccess::Write {
             if let Err(error) = state.pages.mark_dirty(page) {
-                return StepOutcome::Err(page_cache_error_to_errno(error));
+                return V3::Err(page_cache_error_to_errno(error).into());
             }
         }
         match materialized_from_state(&state, page, newly_installed || installed) {
-            Ok(page) => StepOutcome::Done(page),
-            Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
+            Ok(page) => V3::Done(page),
+            Err(error) => V3::Err(page_cache_error_to_errno(error).into()),
         }
     }
 
@@ -514,15 +486,17 @@ impl PageContainer {
         page: PageIndex,
         base_ppn: Ppn,
         page_count: u64,
-    ) -> StepOutcome<MaterializedPage> {
+    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress>
+    {
+        use tx_substrate::step_v3::StepOutcome as V3;
         if page.as_u64() >= page_count {
-            return StepOutcome::Err(Errno::EINVAL);
+            return V3::Err(tx_substrate::step_v3::Errno::EINVAL);
         }
         let Ok(delta) = usize::try_from(page.as_u64()) else {
-            return StepOutcome::Err(Errno::EINVAL);
+            return V3::Err(tx_substrate::step_v3::Errno::EINVAL);
         };
         let Some(ppn) = base_ppn.0.checked_add(delta).map(Ppn) else {
-            return StepOutcome::Err(Errno::EINVAL);
+            return V3::Err(tx_substrate::step_v3::Errno::EINVAL);
         };
 
         let mut state = self.state.lock();
@@ -536,13 +510,13 @@ impl PageContainer {
                 match state.pages.install_if_absent(page, frame) {
                     Ok(()) => true,
                     Err(PageCacheError::AlreadyPresent { .. }) => false,
-                    Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error)),
+                    Err(error) => return V3::Err(page_cache_error_to_errno(error).into()),
                 }
             }
         };
         match materialized_from_state(&state, page, newly_installed) {
-            Ok(page) => StepOutcome::Done(page),
-            Err(error) => StepOutcome::Err(page_cache_error_to_errno(error)),
+            Ok(page) => V3::Done(page),
+            Err(error) => V3::Err(page_cache_error_to_errno(error).into()),
         }
     }
 
@@ -600,17 +574,18 @@ pub fn step_read(
     of: &OpenFile,
     len: usize,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     if len == 0 {
-        return StepOutcome::Done(0);
+        return V3::done(0);
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     let start = of.offset();
     let valid_end = core::cmp::min(pc.size_bytes(), capacity);
     if start >= valid_end {
-        return StepOutcome::Done(0);
+        return V3::done(0);
     }
     let effective_len = core::cmp::min(len as u64, valid_end - start) as usize;
     step_range(pc, of, effective_len, PageBackedIoKind::Read, guard)
@@ -621,37 +596,33 @@ pub fn step_write(
     of: &OpenFile,
     len: usize,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     if len == 0 {
-        return StepOutcome::Done(0);
+        return V3::done(0);
     }
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     let Some(end) = of.offset().checked_add(len as u64) else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     if end > capacity {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     }
     let start = of.offset();
     let outcome = step_range(pc, of, len, PageBackedIoKind::Write, guard);
-    match &outcome {
-        StepOutcome::Done(advanced)
-        | StepOutcome::Advanced(advanced)
-        | StepOutcome::AdvancedThenBlocked(advanced, _)
-            if *advanced > 0 =>
-        {
-            pc.grow_size_to(start + *advanced as u64);
-        }
-        StepOutcome::Done(_)
-        | StepOutcome::Advanced(_)
-        | StepOutcome::AdvancedThenBlocked(_, _)
-        | StepOutcome::Blocked(_)
-        | StepOutcome::Err(_) => {}
+    let advanced_bytes = match &outcome {
+        V3::Done(n) => *n,
+        V3::Continue { progress } => progress.bytes(),
+        V3::Yield { progress, .. } => progress.bytes(),
+        V3::Err(_) => 0,
+    };
+    if advanced_bytes > 0 {
+        pc.grow_size_to(start + advanced_bytes as u64);
     }
     outcome
 }
@@ -662,7 +633,8 @@ fn step_range(
     len: usize,
     kind: PageBackedIoKind,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
     let mut advanced = 0usize;
     let mut offset = of.offset();
     while advanced < len {
@@ -674,36 +646,64 @@ fn step_range(
             PageBackedIoKind::Write => MaterializeAccess::Write,
         };
 
+        // `materialize_page` returns v3
+        // `StepOutcome<MaterializedPage, NoProgress>`. Map per variant:
+        // - `Done` → continue the loop, advancing `offset` and
+        //   accumulating `advanced` bytes.
+        // - `Continue { .. }` (NoProgress carrier) — page-level retry
+        //   without a frame. Treat as a no-op and continue, advancing
+        //   the chunk; one-shot page allocation rarely emits this.
+        // - `Yield { .. }` with `advanced == 0` → propagate yield with
+        //   `ByteProgress::EMPTY`. Otherwise propagate yield with
+        //   accumulated bytes (`ByteProgress::new(advanced)`).
+        // - `Err(errno)` with `advanced == 0` → v3 `Err(errno)`.
+        //   Otherwise return v3 `Done(advanced)` (partial-success;
+        //   matches the prior semantics where errors after progress
+        //   were swallowed into a successful partial step).
+        use tx_substrate::step_v3::YieldShape;
         match pc.materialize_page(page_index, access, guard) {
-            StepOutcome::Done(_) | StepOutcome::Advanced(_) => {
+            tx_substrate::step_v3::StepOutcome::Done(_)
+            | tx_substrate::step_v3::StepOutcome::Continue { .. } => {
                 advanced += chunk;
                 offset += chunk as u64;
             }
-            StepOutcome::AdvancedThenBlocked(_, token) => {
-                advanced += chunk;
-                offset += chunk as u64;
-                of.set_offset(offset);
-                return StepOutcome::AdvancedThenBlocked(advanced, token);
-            }
-            StepOutcome::Blocked(token) => {
+            tx_substrate::step_v3::StepOutcome::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => {
                 if advanced == 0 {
-                    return StepOutcome::Blocked(token);
+                    return V3::yield_on_carrier(
+                        ByteProgress::EMPTY,
+                        carrier.raw(),
+                        interests.raw(),
+                    );
                 }
                 of.set_offset(offset);
-                return StepOutcome::AdvancedThenBlocked(advanced, token);
+                return V3::yield_on_carrier(
+                    ByteProgress::new(advanced),
+                    carrier.raw(),
+                    interests.raw(),
+                );
             }
-            StepOutcome::Err(errno) => {
+            tx_substrate::step_v3::StepOutcome::Yield { .. } => {
                 if advanced == 0 {
-                    return StepOutcome::Err(errno);
+                    return V3::err(tx_substrate::step_v3::Errno::EIO);
                 }
                 of.set_offset(offset);
-                return StepOutcome::Done(advanced);
+                return V3::done(advanced);
+            }
+            tx_substrate::step_v3::StepOutcome::Err(errno) => {
+                if advanced == 0 {
+                    return V3::err(errno);
+                }
+                of.set_offset(offset);
+                return V3::done(advanced);
             }
         }
     }
 
     of.set_offset(offset);
-    StepOutcome::Done(advanced)
+    V3::done(advanced)
 }
 
 fn allocate_cached_frame() -> Result<CachedFrame, PageCacheError> {
@@ -766,716 +766,7 @@ const fn page_cache_error_to_errno(error: PageCacheError) -> Errno {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::execution::{Errno, StepOutcome, WaitToken};
-    use crate::mount::{DevId, MountOptions, MountPayload, SourceLabel};
-    use crate::vfs::{
-        Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
-        OpenFileFlags, RNode, RNodeBacking,
-    };
-    use alloc::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-
-    fn setup_host_substrate() {
-        tx_substrate::testing::init_host_for_test_once();
-        crate::zones::register_all().expect("kernel zones");
-        match tx_substrate::page_allocator::claim_zero_frame() {
-            Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
-            Err(error) => panic!("claim zero frame for PageBacked tests: {error:?}"),
-        }
-    }
-
-    fn cached_frame_for_test() -> CachedFrame {
-        setup_host_substrate();
-        allocate_cached_frame().expect("cached frame")
-    }
-
-    struct RecordingFs {
-        fetches: AtomicUsize,
-        last_object: AtomicU64,
-        last_offset: AtomicU64,
-    }
-
-    impl RecordingFs {
-        fn new() -> Self {
-            Self {
-                fetches: AtomicUsize::new(0),
-                last_object: AtomicU64::new(0),
-                last_offset: AtomicU64::new(0),
-            }
-        }
-    }
-
-    impl FsOps for RecordingFs {
-        fn lookup(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<FsObjectId> {
-            StepOutcome::Err(Errno::ENOSYS)
-        }
-
-        fn load_inode_meta(
-            &self,
-            _fs_object_id: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<InodeMeta> {
-            StepOutcome::Done(InodeMeta::new(InodeKind::Regular, 0o100644))
-        }
-
-        fn serialize_inode_meta(
-            &self,
-            _fs_object_id: FsObjectId,
-            _meta: &InodeMeta,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Done(())
-        }
-
-        fn create_inode(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _mode: u16,
-            _cred: &Credential,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn unlink(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _target: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn rename(
-            &self,
-            _old_parent: FsObjectId,
-            _old_name: &[u8],
-            _new_parent: FsObjectId,
-            _new_name: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn link(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _target: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn mkdir(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _mode: u16,
-            _cred: &Credential,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn rmdir(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _target: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn symlink(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _link_target: &[u8],
-            _cred: &Credential,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn readdir(
-            &self,
-            _fs_object_id: FsObjectId,
-            _cursor: DirCursor,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
-            StepOutcome::Done(None)
-        }
-
-        fn destroy_inode(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-            StepOutcome::Done(())
-        }
-    }
-
-    impl FsPageBacking for RecordingFs {
-        fn fetch_page(
-            &self,
-            fs_object_id: FsObjectId,
-            offset: u64,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<Frame> {
-            self.fetches.fetch_add(1, Ordering::AcqRel);
-            self.last_object
-                .store(fs_object_id.as_u64(), Ordering::Release);
-            self.last_offset.store(offset, Ordering::Release);
-            StepOutcome::Done(Frame::new(
-                page_allocator::zero_frame_ppn().expect("zero frame"),
-            ))
-        }
-
-        fn flush_page(
-            &self,
-            _fs_object_id: FsObjectId,
-            _offset: u64,
-            _frame: &Frame,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Done(())
-        }
-
-        fn truncate(
-            &self,
-            _fs_object_id: FsObjectId,
-            _new_size: u64,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Done(())
-        }
-
-        fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-            StepOutcome::Done(())
-        }
-    }
-
-    struct BlockingFs;
-
-    impl FsPageBacking for BlockingFs {
-        fn fetch_page(
-            &self,
-            _fs_object_id: FsObjectId,
-            _offset: u64,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<Frame> {
-            StepOutcome::Blocked(WaitToken::new(9, 0x44))
-        }
-
-        fn flush_page(
-            &self,
-            _fs_object_id: FsObjectId,
-            _offset: u64,
-            _frame: &Frame,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Done(())
-        }
-
-        fn truncate(
-            &self,
-            _fs_object_id: FsObjectId,
-            _new_size: u64,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Done(())
-        }
-
-        fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-            StepOutcome::Done(())
-        }
-    }
-
-    impl FsOps for BlockingFs {
-        fn lookup(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<FsObjectId> {
-            StepOutcome::Err(Errno::ENOSYS)
-        }
-
-        fn load_inode_meta(
-            &self,
-            _fs_object_id: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<InodeMeta> {
-            StepOutcome::Err(Errno::ENOSYS)
-        }
-
-        fn serialize_inode_meta(
-            &self,
-            _fs_object_id: FsObjectId,
-            _meta: &InodeMeta,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Done(())
-        }
-
-        fn create_inode(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _mode: u16,
-            _cred: &Credential,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn unlink(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _target: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn rename(
-            &self,
-            _old_parent: FsObjectId,
-            _old_name: &[u8],
-            _new_parent: FsObjectId,
-            _new_name: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn link(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _target: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn mkdir(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _mode: u16,
-            _cred: &Credential,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn rmdir(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _target: FsObjectId,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<()> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn symlink(
-            &self,
-            _parent: FsObjectId,
-            _name: &[u8],
-            _link_target: &[u8],
-            _cred: &Credential,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<(FsObjectId, InodeMeta)> {
-            StepOutcome::Err(Errno::EROFS)
-        }
-
-        fn readdir(
-            &self,
-            _fs_object_id: FsObjectId,
-            _cursor: DirCursor,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<Option<(DirEntry, DirCursor)>> {
-            StepOutcome::Done(None)
-        }
-
-        fn destroy_inode(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<()> {
-            StepOutcome::Done(())
-        }
-    }
-
-    fn file_page_container(
-        fs: Arc<dyn FsOps + Send + Sync>,
-        page_backing: Arc<dyn FsPageBacking + Send + Sync>,
-        fs_object_id: FsObjectId,
-        page_count: u64,
-    ) -> PageContainer {
-        let mount = MountPayload::new_cap(
-            fs,
-            page_backing,
-            None,
-            DevId::new(8),
-            MountOptions::default(),
-            "mockfs",
-            SourceLabel::Static("mock"),
-        )
-        .expect("mount payload");
-        PageContainer::new(
-            PageContainerKind::File {
-                mount: MountPayloadPin::acquire(&tx_substrate::zone::PayloadCap::from_cap(mount)),
-                fs_object_id,
-            },
-            page_count,
-        )
-    }
-
-    fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
-        let pc = PageContainer::new_cap(pc.kind().clone(), pc.page_count())
-            .expect("page container cap for open file");
-        let rnode = RNode::new_cap(
-            FsObjectId::new(700),
-            InodeMeta::new(InodeKind::Regular, 0o100644),
-            RNodeBacking::PageBacked { pc },
-        )
-        .expect("rnode cap");
-        OpenFile::new(
-            rnode,
-            OpenFileFlags {
-                read: true,
-                write: true,
-                append: false,
-                cloexec: false,
-                nonblocking: false,
-            },
-        )
-    }
-
-    #[test]
-    fn page_cache_index_install_if_absent_linearizes_sparse_offsets() {
-        let mut index = PageCacheIndex::new();
-        let page = PageIndex::new(7);
-        let first = cached_frame_for_test();
-        let first_ppn = first.ppn;
-        let second = cached_frame_for_test();
-
-        assert_eq!(index.lookup(page), None);
-        assert_eq!(index.install_if_absent(page, first), Ok(()));
-        assert_eq!(
-            index.install_if_absent(page, second),
-            Err(PageCacheError::AlreadyPresent { current: first_ppn })
-        );
-        assert_eq!(index.lookup(page), Some(first_ppn));
-        assert_eq!(index.len(), 1);
-    }
-
-    #[test]
-    fn page_cache_index_install_if_match_replaces_or_withdraws_exact_frame() {
-        let mut index = PageCacheIndex::new();
-        let page = PageIndex::new(3);
-        let first = cached_frame_for_test();
-        let first_ppn = first.ppn;
-        let wrong = cached_frame_for_test().ppn;
-        let replacement = cached_frame_for_test();
-
-        index
-            .install_if_absent(page, first)
-            .expect("initial insert");
-        assert_eq!(
-            index.install_if_match(page, wrong, Some(replacement)),
-            Err(PageCacheError::MismatchedFrame { current: first_ppn })
-        );
-        let replacement = cached_frame_for_test();
-        let replacement_ppn = replacement.ppn;
-        assert_eq!(
-            index.install_if_match(page, first_ppn, Some(replacement)),
-            Ok(Some(first_ppn))
-        );
-        assert_eq!(index.lookup(page), Some(replacement_ppn));
-        assert_eq!(
-            index.install_if_match(page, replacement_ppn, None),
-            Ok(Some(replacement_ppn))
-        );
-        assert_eq!(index.lookup(page), None);
-    }
-
-    #[test]
-    fn anon_page_container_materializes_once_and_tracks_dirty_writes() {
-        setup_host_substrate();
-        let pc = PageContainer::new(
-            PageContainerKind::Anon {
-                swap_policy: AnonSwapPolicy::Reclaimable,
-            },
-            4,
-        );
-        let page = PageIndex::new(2);
-
-        let first = pc
-            .materialize_anon(page, MaterializeAccess::Read)
-            .expect("read materializes anon page");
-        let second = pc
-            .materialize_anon(page, MaterializeAccess::Write)
-            .expect("write reuses anon page");
-
-        assert!(first.newly_installed);
-        assert!(!first.dirty);
-        assert_eq!(second.ppn, first.ppn);
-        assert!(!second.newly_installed);
-        assert!(second.dirty);
-        assert_eq!(pc.lookup(page), Some(first.ppn));
-        assert_eq!(pc.resident_pages(), 1);
-    }
-
-    #[test]
-    fn page_container_cap_materializes_anon_pages() {
-        setup_host_substrate();
-        let pc = PageContainer::new_cap(
-            PageContainerKind::Anon {
-                swap_policy: AnonSwapPolicy::Reclaimable,
-            },
-            4,
-        )
-        .expect("page container cap");
-        assert_eq!(pc.page_count(), 4);
-
-        let first = pc
-            .materialize_anon(PageIndex::new(1), MaterializeAccess::Read)
-            .expect("cap-backed materialization");
-        let second = pc
-            .materialize_anon(PageIndex::new(1), MaterializeAccess::Write)
-            .expect("cap-backed rematerialization");
-
-        assert_eq!(first.ppn, second.ppn);
-        assert!(first.newly_installed);
-        assert!(!second.newly_installed);
-        assert!(second.dirty);
-        assert_eq!(pc.resident_pages(), 1);
-    }
-
-    #[test]
-    fn page_container_materialize_page_dispatches_anon() {
-        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
-        setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
-        let pc = PageContainer::new(
-            PageContainerKind::Anon {
-                swap_policy: AnonSwapPolicy::Reclaimable,
-            },
-            4,
-        );
-
-        let page = match pc.materialize_page(PageIndex::new(1), MaterializeAccess::Write, &guard) {
-            StepOutcome::Done(page) => page,
-            other => panic!("unexpected materialize outcome: {other:?}"),
-        };
-
-        assert!(page.newly_installed);
-        assert!(page.dirty);
-        assert_eq!(pc.lookup(PageIndex::new(1)), Some(page.ppn));
-    }
-
-    #[test]
-    fn page_container_materialize_page_dispatches_file_fetch_once() {
-        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
-        setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
-        let fs = Arc::new(RecordingFs::new());
-        let pc = file_page_container(fs.clone(), fs.clone(), FsObjectId::new(55), 4);
-
-        let first = match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Read, &guard) {
-            StepOutcome::Done(page) => page,
-            other => panic!("unexpected materialize outcome: {other:?}"),
-        };
-        let second = match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Write, &guard)
-        {
-            StepOutcome::Done(page) => page,
-            other => panic!("unexpected rematerialize outcome: {other:?}"),
-        };
-
-        assert!(first.newly_installed);
-        assert!(!first.dirty);
-        assert_eq!(second.ppn, first.ppn);
-        assert!(!second.newly_installed);
-        assert!(second.dirty);
-        assert_eq!(fs.fetches.load(Ordering::Acquire), 1);
-        assert_eq!(fs.last_object.load(Ordering::Acquire), 55);
-        assert_eq!(
-            fs.last_offset.load(Ordering::Acquire),
-            2 * crate::vm::USER_PAGE_SIZE as u64
-        );
-        assert_eq!(pc.resident_pages(), 1);
-    }
-
-    #[test]
-    fn page_container_materialize_page_propagates_file_block() {
-        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
-        setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
-        let fs = Arc::new(BlockingFs);
-        let pc = file_page_container(fs.clone(), fs, FsObjectId::new(77), 4);
-
-        assert_eq!(
-            match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
-                StepOutcome::Blocked(token) => StepOutcome::<()>::Blocked(token),
-                StepOutcome::Done(_)
-                | StepOutcome::Advanced(_)
-                | StepOutcome::AdvancedThenBlocked(_, _)
-                | StepOutcome::Err(_) => panic!("expected blocked file fetch"),
-            },
-            StepOutcome::Blocked(WaitToken::new(9, 0x44))
-        );
-        assert_eq!(pc.resident_pages(), 0);
-    }
-
-    #[test]
-    fn page_container_materialize_page_wraps_device_ppns() {
-        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
-        setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
-        let pc = PageContainer::new(
-            PageContainerKind::Device {
-                base_ppn: Ppn(0xfeed_0000),
-                page_count: 2,
-            },
-            2,
-        );
-
-        let page = match pc.materialize_page(PageIndex::new(1), MaterializeAccess::Write, &guard) {
-            StepOutcome::Done(page) => page,
-            other => panic!("unexpected materialize outcome: {other:?}"),
-        };
-
-        assert_eq!(page.ppn, Ppn(0xfeed_0001));
-        assert!(page.newly_installed);
-        assert!(!page.dirty);
-        assert_eq!(pc.lookup(PageIndex::new(1)), Some(Ppn(0xfeed_0001)));
-        assert_eq!(
-            match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Read, &guard) {
-                StepOutcome::Err(errno) => StepOutcome::<()>::Err(errno),
-                StepOutcome::Done(_)
-                | StepOutcome::Advanced(_)
-                | StepOutcome::AdvancedThenBlocked(_, _)
-                | StepOutcome::Blocked(_) => panic!("expected out-of-bounds error"),
-            },
-            StepOutcome::Err(Errno::EINVAL)
-        );
-    }
-
-    #[test]
-    fn pagebacked_step_read_materializes_pages_and_advances_offset() {
-        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
-        setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
-        let pc = PageContainer::new(
-            PageContainerKind::Anon {
-                swap_policy: AnonSwapPolicy::Reclaimable,
-            },
-            3,
-        );
-        let of = open_file_for_pc(&pc);
-        of.set_offset((crate::vm::USER_PAGE_SIZE - 8) as u64);
-
-        assert_eq!(step_read(&pc, &of, 32, &guard), StepOutcome::Done(32));
-
-        assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE - 8 + 32) as u64);
-        assert_eq!(pc.resident_pages(), 2);
-        assert!(!pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
-        assert!(!pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
-    }
-
-    #[test]
-    fn pagebacked_step_read_eof_does_not_materialize() {
-        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
-        setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
-        let pc = PageContainer::new(
-            PageContainerKind::Anon {
-                swap_policy: AnonSwapPolicy::Reclaimable,
-            },
-            1,
-        );
-        let of = open_file_for_pc(&pc);
-        of.set_offset(crate::vm::USER_PAGE_SIZE as u64);
-
-        assert_eq!(step_read(&pc, &of, 16, &guard), StepOutcome::Done(0));
-        assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64);
-        assert_eq!(pc.resident_pages(), 0);
-    }
-
-    #[test]
-    fn pagebacked_step_write_marks_dirty_and_advances_offset() {
-        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
-        setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
-        let pc = PageContainer::new(
-            PageContainerKind::Anon {
-                swap_policy: AnonSwapPolicy::Reclaimable,
-            },
-            2,
-        );
-        let of = open_file_for_pc(&pc);
-
-        assert_eq!(
-            step_write(&pc, &of, crate::vm::USER_PAGE_SIZE + 17, &guard),
-            StepOutcome::Done(crate::vm::USER_PAGE_SIZE + 17)
-        );
-
-        assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE + 17) as u64);
-        assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
-        assert!(pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
-    }
-
-    #[test]
-    fn pagebacked_step_read_returns_advanced_then_blocked_after_progress() {
-        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
-        setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
-        let fs = Arc::new(BlockingFs);
-        let pc = file_page_container(fs.clone(), fs, FsObjectId::new(88), 2);
-        let of = open_file_for_pc(&pc);
-        pc.state
-            .lock()
-            .pages
-            .install_if_absent(PageIndex::new(0), cached_frame_for_test())
-            .expect("seed cached page");
-
-        assert_eq!(
-            step_read(&pc, &of, crate::vm::USER_PAGE_SIZE + 1, &guard),
-            StepOutcome::AdvancedThenBlocked(crate::vm::USER_PAGE_SIZE, WaitToken::new(9, 0x44))
-        );
-        assert_eq!(of.offset(), crate::vm::USER_PAGE_SIZE as u64);
-    }
-
-    #[test]
-    fn pagebacked_step_write_rejects_device_backing() {
-        let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
-        setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
-        let pc = PageContainer::new(
-            PageContainerKind::Device {
-                base_ppn: Ppn(0xface_0000),
-                page_count: 1,
-            },
-            1,
-        );
-        let of = open_file_for_pc(&pc);
-
-        assert_eq!(
-            step_write(&pc, &of, 8, &guard),
-            StepOutcome::Err(Errno::EINVAL)
-        );
-        assert_eq!(of.offset(), 0);
-        assert_eq!(pc.resident_pages(), 0);
-    }
-}
+mod core_tests;
 
 #[cfg(test)]
 mod cross_variant_tests;

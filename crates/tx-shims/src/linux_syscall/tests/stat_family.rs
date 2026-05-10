@@ -3,6 +3,7 @@
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
+use tx_substrate::step_v3::StepOutcome;
 
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_substrate::{page_allocator, zone};
@@ -72,8 +73,8 @@ fn stat_setup() -> TestSetup {
 fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>, Cap<RNode>) {
     let tmpfs = Arc::new(Tmpfs::new());
     let payload = MountPayload::new_cap(
-        tmpfs.clone() as Arc<dyn FsOps>,
-        tmpfs.clone() as Arc<dyn FsPageBacking>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+        tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
         None,
         DevId::new(311),
         MountOptions::default(),
@@ -188,7 +189,7 @@ fn dispatch_fstat_on_pagebacked_fd_writes_stat_struct() {
     let (file_id, _meta) = {
         let guard = tx_substrate::epoch::guard();
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard) {
-            StepOutcome::Done(pair) | StepOutcome::Advanced(pair) => pair,
+            StepOutcome::Done(pair) => pair,
             other => panic!("create_inode: {other:?}"),
         }
     };
@@ -531,14 +532,14 @@ fn dispatch_getdents64_on_directory_fd_writes_entries() {
     let id_a = {
         let guard = tx_substrate::epoch::guard();
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"a", 0o100644, &owner_cred, &guard) {
-            StepOutcome::Done((id, _)) | StepOutcome::Advanced((id, _)) => id,
+            StepOutcome::Done((id, _)) => id,
             other => panic!("create_inode a: {other:?}"),
         }
     };
     let id_b = {
         let guard = tx_substrate::epoch::guard();
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"bb", 0o100644, &owner_cred, &guard) {
-            StepOutcome::Done((id, _)) | StepOutcome::Advanced((id, _)) => id,
+            StepOutcome::Done((id, _)) => id,
             other => panic!("create_inode bb: {other:?}"),
         }
     };

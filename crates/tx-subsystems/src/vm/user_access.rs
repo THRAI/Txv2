@@ -39,7 +39,7 @@ use alloc::vec::Vec;
 use tx_hal::UserPtr;
 use tx_substrate::page_allocator;
 
-use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
+use crate::execution::{Errno, Guard, WaitToken};
 use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
 
 use super::structure::{
@@ -80,7 +80,7 @@ impl AddressSpace {
         dst: &mut [u8],
         src: UserPtr<u8>,
         guard: &Guard<'_>,
-    ) -> StepOutcome<usize> {
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
         copy_in(self, dst, src, guard)
     }
 
@@ -91,13 +91,26 @@ impl AddressSpace {
         dst: UserPtr<u8>,
         src: &[u8],
         guard: &Guard<'_>,
-    ) -> StepOutcome<usize> {
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
         copy_out(self, dst, src, guard)
     }
 
     /// Read a `T: Copy` value from user-space `src`. Wrapper over
     /// `copy_from_user`.
-    pub fn read_user<T: Copy>(&self, src: UserPtr<T>, guard: &Guard<'_>) -> StepOutcome<T> {
+    ///
+    /// Returns a step_v3 outcome with `NoProgress` (one-shot read; the
+    /// inner copy's byte-progress accumulator is summarised away here
+    /// because a partial-`T` read is not a meaningful intermediate
+    /// state for the caller). The inner v3 `copy_from_user` is bridged
+    /// per-variant: `Done`/`Continue` → `Done(value)`,
+    /// `Yield { shape, .. }` → `Yield { progress: NoProgress, shape }`,
+    /// `Err` → `Err(errno)` (errno already in `step_v3::Errno`).
+    pub fn read_user<T: Copy>(
+        &self,
+        src: UserPtr<T>,
+        guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<T, tx_substrate::step_v3::NoProgress> {
+        use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
         let mut value = core::mem::MaybeUninit::<T>::uninit();
         // SAFETY: value is a valid kernel-stack `MaybeUninit<T>`; we
         // expose its bytes to copy_from_user which fills exactly
@@ -110,14 +123,16 @@ impl AddressSpace {
         };
         let src_bytes = UserPtr::<u8>::new(src.addr());
         match self.copy_from_user(dst_bytes, src_bytes, guard) {
-            StepOutcome::Done(_) | StepOutcome::Advanced(_) => {
+            V3::Done(_) | V3::Continue { .. } => {
                 // SAFETY: copy_from_user wrote `size_of::<T>()` bytes
-                // before returning Done/Advanced.
-                StepOutcome::Done(unsafe { value.assume_init() })
+                // before returning Done.
+                V3::Done(unsafe { value.assume_init() })
             }
-            StepOutcome::Blocked(t) => StepOutcome::Blocked(t),
-            StepOutcome::AdvancedThenBlocked(_, t) => StepOutcome::Blocked(t),
-            StepOutcome::Err(e) => StepOutcome::Err(e),
+            V3::Yield { shape, .. } => V3::Yield {
+                progress: NoProgress,
+                shape,
+            },
+            V3::Err(e) => V3::Err(e),
         }
     }
 
@@ -128,7 +143,8 @@ impl AddressSpace {
         dst: UserPtr<T>,
         value: T,
         guard: &Guard<'_>,
-    ) -> StepOutcome<()> {
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
         // SAFETY: addr_of! yields a valid kernel pointer to `value`
         // for the lifetime of this call; the cast to *const u8 reads
         // exactly `size_of::<T>()` bytes from a Copy value.
@@ -140,11 +156,12 @@ impl AddressSpace {
         };
         let dst_bytes = UserPtr::<u8>::new(dst.addr());
         match self.copy_to_user(dst_bytes, src_bytes, guard) {
-            StepOutcome::Done(_) | StepOutcome::Advanced(_) => StepOutcome::Done(()),
-            StepOutcome::Blocked(t) | StepOutcome::AdvancedThenBlocked(_, t) => {
-                StepOutcome::Blocked(t)
-            }
-            StepOutcome::Err(e) => StepOutcome::Err(e),
+            V3::Done(_) | V3::Continue { .. } => V3::Done(()),
+            V3::Yield { shape, .. } => V3::Yield {
+                progress: NoProgress,
+                shape,
+            },
+            V3::Err(e) => V3::Err(e),
         }
     }
 
@@ -186,7 +203,8 @@ impl AddressSpace {
         &self,
         range: UserRange,
         kind: UserAccessKind,
-    ) -> StepOutcome<()> {
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        use tx_substrate::step_v3::StepOutcome as V3;
         for page in range.iter_pages() {
             // Skip pages already published with sufficient protection.
             // We only avoid re-materialisation when the cached entry
@@ -199,22 +217,22 @@ impl AddressSpace {
                 // The caller's intent (Read/Write) cannot be satisfied
                 // by the cached frame; surface as EFAULT (matches the
                 // recipe-permission fast path in `resolve_user_page_addr`).
-                return StepOutcome::Err(Errno::EFAULT);
+                return V3::err(Errno::EFAULT.into());
             }
             // Build a synthetic fault, observe the recipe, materialise,
             // and publish synchronously.
             let page_addr = match page.checked_start_addr() {
                 Ok(a) => a,
-                Err(_) => return StepOutcome::Err(Errno::EFAULT),
+                Err(_) => return V3::err(Errno::EFAULT.into()),
             };
             let fault = VmFault::new(page_addr, kind.required_prot());
             let outcome: VmFaultOutcome = match self.resolve_fault(fault) {
                 Ok(o) => o,
-                Err(_) => return StepOutcome::Err(Errno::EFAULT),
+                Err(_) => return V3::err(Errno::EFAULT.into()),
             };
             let materialization = match outcome.materialize_pagebacked() {
                 Ok(m) => m,
-                Err(_) => return StepOutcome::Err(Errno::EFAULT),
+                Err(_) => return V3::err(Errno::EFAULT.into()),
             };
             // Publish the materialisation. `replace_existing` honours
             // the materialisation's own intent (private CoW path sets
@@ -231,10 +249,10 @@ impl AddressSpace {
                 )
                 .is_err()
             {
-                return StepOutcome::Err(Errno::EFAULT);
+                return V3::err(Errno::EFAULT.into());
             }
         }
-        StepOutcome::Done(())
+        V3::done(())
     }
 
     /// Read a NUL-terminated byte string starting at `src`, capped at
@@ -253,9 +271,12 @@ impl AddressSpace {
         src: UserPtr<u8>,
         max_len: usize,
         guard: &Guard<'_>,
-    ) -> StepOutcome<Vec<u8>> {
+    ) -> tx_substrate::step_v3::StepOutcome<Vec<u8>, tx_substrate::step_v3::NoProgress> {
+        use tx_substrate::step_v3::{
+            InterestConditions, NoProgress, StepOutcome as V3, WakeCarrier, YieldShape,
+        };
         if src.addr() == 0 || max_len == 0 {
-            return StepOutcome::Done(Vec::new());
+            return V3::Done(Vec::new());
         }
         let mut out: Vec<u8> = Vec::with_capacity(core::cmp::min(max_len, 256));
         let mut consumed = 0usize;
@@ -267,8 +288,16 @@ impl AddressSpace {
             let frame_base =
                 match resolve_user_page_addr(self, page_addr, UserAccessKind::Read, guard) {
                     ResolveOutcome::Done(addr) => addr,
-                    ResolveOutcome::Err(e) => return StepOutcome::Err(e),
-                    ResolveOutcome::Blocked(t) => return StepOutcome::Blocked(t),
+                    ResolveOutcome::Err(e) => return V3::Err(e.into()),
+                    ResolveOutcome::Blocked(t) => {
+                        return V3::Yield {
+                            progress: NoProgress,
+                            shape: YieldShape::OnCarrier {
+                                carrier: WakeCarrier::new(t.carrier()),
+                                interests: InterestConditions::new(t.interest()),
+                            },
+                        };
+                    }
                 };
             // SAFETY: frame_base.add(within) is a valid kernel
             // direct-map pointer to the requested user byte; we read
@@ -282,13 +311,13 @@ impl AddressSpace {
             for i in 0..chunk {
                 let byte = unsafe { core::ptr::read(frame_base.add(within + i)) };
                 if byte == 0 {
-                    return StepOutcome::Done(out);
+                    return V3::Done(out);
                 }
                 out.push(byte);
             }
             consumed += chunk;
         }
-        StepOutcome::Err(Errno::ENAMETOOLONG)
+        V3::Err(Errno::ENAMETOOLONG.into())
     }
 }
 
@@ -297,12 +326,15 @@ fn copy_in(
     dst: &mut [u8],
     src: UserPtr<u8>,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::{
+        ByteProgress, InterestConditions, StepOutcome as V3, WakeCarrier, YieldShape,
+    };
     if dst.is_empty() {
-        return StepOutcome::Done(0);
+        return V3::Done(0);
     }
     if src.addr() == 0 {
-        return StepOutcome::Err(Errno::EFAULT);
+        return V3::Err(Errno::EFAULT.into());
     }
     let mut copied = 0usize;
     let total = dst.len();
@@ -332,19 +364,22 @@ fn copy_in(
             }
             ResolveOutcome::Err(e) => {
                 if copied > 0 {
-                    return StepOutcome::Done(copied);
+                    return V3::Done(copied);
                 }
-                return StepOutcome::Err(e);
+                return V3::Err(e.into());
             }
             ResolveOutcome::Blocked(t) => {
-                if copied > 0 {
-                    return StepOutcome::AdvancedThenBlocked(copied, t);
-                }
-                return StepOutcome::Blocked(t);
+                return V3::Yield {
+                    progress: ByteProgress::new(copied),
+                    shape: YieldShape::OnCarrier {
+                        carrier: WakeCarrier::new(t.carrier()),
+                        interests: InterestConditions::new(t.interest()),
+                    },
+                };
             }
         }
     }
-    StepOutcome::Done(copied)
+    V3::Done(copied)
 }
 
 fn copy_out(
@@ -352,12 +387,15 @@ fn copy_out(
     dst: UserPtr<u8>,
     src: &[u8],
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::{
+        ByteProgress, InterestConditions, StepOutcome as V3, WakeCarrier, YieldShape,
+    };
     if src.is_empty() {
-        return StepOutcome::Done(0);
+        return V3::Done(0);
     }
     if dst.addr() == 0 {
-        return StepOutcome::Err(Errno::EFAULT);
+        return V3::Err(Errno::EFAULT.into());
     }
     let mut copied = 0usize;
     let total = src.len();
@@ -383,19 +421,22 @@ fn copy_out(
             }
             ResolveOutcome::Err(e) => {
                 if copied > 0 {
-                    return StepOutcome::Done(copied);
+                    return V3::Done(copied);
                 }
-                return StepOutcome::Err(e);
+                return V3::Err(e.into());
             }
             ResolveOutcome::Blocked(t) => {
-                if copied > 0 {
-                    return StepOutcome::AdvancedThenBlocked(copied, t);
-                }
-                return StepOutcome::Blocked(t);
+                return V3::Yield {
+                    progress: ByteProgress::new(copied),
+                    shape: YieldShape::OnCarrier {
+                        carrier: WakeCarrier::new(t.carrier()),
+                        interests: InterestConditions::new(t.interest()),
+                    },
+                };
             }
         }
     }
-    StepOutcome::Done(copied)
+    V3::Done(copied)
 }
 
 /// Outcome of resolving one user page to its kernel direct-map
@@ -565,11 +606,27 @@ fn resolve_user_page(
                 return ResolvePageOutcome::Err(Errno::EFAULT);
             }
             let page_index = PageIndex::new(backing_offset / USER_PAGE_SIZE as u64);
+            // `materialize_page` is now v3
+            // (`StepOutcome<MaterializedPage, NoProgress>`); translate
+            // per outcome variant onto the v4 `ResolvePageOutcome`:
+            // - v3 `Done(m)` → `ResolvePageOutcome::Done(m)`.
+            // - v3 `Continue { .. }` (NoProgress) → `Err(EFAULT)` —
+            //   page allocation rarely emits this; treating it as a
+            //   fault keeps the user-access path conservative.
+            // - v3 `Yield { OnCarrier { c, i } }` →
+            //   `ResolvePageOutcome::Blocked(WaitToken(c, i))`.
+            // - v3 `Yield { OnAgent .. }` → `Err(EFAULT)`.
+            // - v3 `Err(_)` → `Err(EFAULT)`.
+            use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
             match pc.materialize_page(page_index, kind.materialize_access(), guard) {
-                StepOutcome::Done(m) | StepOutcome::Advanced(m) => ResolvePageOutcome::Done(m),
-                StepOutcome::Blocked(t) => ResolvePageOutcome::Blocked(t),
-                StepOutcome::AdvancedThenBlocked(m, _) => ResolvePageOutcome::Done(m),
-                StepOutcome::Err(_) => ResolvePageOutcome::Err(Errno::EFAULT),
+                V3::Done(m) => ResolvePageOutcome::Done(m),
+                V3::Continue { .. } => ResolvePageOutcome::Err(Errno::EFAULT),
+                V3::Yield {
+                    shape: YieldShape::OnCarrier { carrier, interests },
+                    ..
+                } => ResolvePageOutcome::Blocked(WaitToken::new(carrier.raw(), interests.raw())),
+                V3::Yield { .. } => ResolvePageOutcome::Err(Errno::EFAULT),
+                V3::Err(_) => ResolvePageOutcome::Err(Errno::EFAULT),
             }
         }
     }

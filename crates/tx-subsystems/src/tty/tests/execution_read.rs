@@ -1,6 +1,7 @@
 //! TTY execution read step tests.
 
-use crate::execution::StepOutcome;
+use tx_substrate::step_v3::StepOutcome;
+
 use crate::tty::execution::{step_ingest, step_ioctl_tcgets, step_ioctl_tcsets, step_read};
 use crate::tty::structure::termios::ICANON;
 use crate::tty::structure::{TtyKind, TtyPayload};
@@ -43,7 +44,7 @@ fn noncanonical_vmin_blocks_until_threshold_is_met() {
     );
     assert!(matches!(
         step_read(&tty, &mut out, &guard),
-        StepOutcome::Blocked(_)
+        StepOutcome::Yield { .. }
     ));
 
     assert_eq!(

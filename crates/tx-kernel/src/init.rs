@@ -7,7 +7,7 @@ use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
 use tx_substrate::zone::Cap;
 use tx_substrate::SpinMutex;
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use tx_subsystems::execution::{Guard, StepOutcome};
+use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::{
     self, MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
@@ -91,18 +91,26 @@ impl<P: TxPlatform> ConsoleCharOps<P> {
 // compiler treats as thread-safe. The impl therefore only needs the
 // `TxPlatform + 'static` bounds the binding actually consumes.
 impl<P: TxPlatform> CharDeviceOps for ConsoleCharOps<P> {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
-        StepOutcome::Done(0)
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        tx_substrate::step_v3::StepOutcome::Done(0)
     }
 
-    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize> {
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
         // The HAL exposes byte-oriented console writes; tx-kernel's
         // existing init code uses `console_write_str` which calls
         // `P::write_bytes` under the hood. We bypass the str
         // adapter so non-UTF-8 bytes (e.g., raw control sequences)
         // round-trip unchanged.
         <P as tx_hal::ConsoleIf>::write_bytes(bytes);
-        StepOutcome::Done(bytes.len())
+        tx_substrate::step_v3::StepOutcome::Done(bytes.len())
     }
 }
 
@@ -319,7 +327,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let guard = tx_substrate::epoch::guard();
         let tty = match register_hardware("console", 0, binding, &guard) {
-            StepOutcome::Done(tty) => tty,
+            tx_substrate::step_v3::StepOutcome::Done(tty) => tty,
             other => panic!("register_console_hardware: register_hardware failed: {other:?}"),
         };
         drop(guard);
@@ -447,10 +455,12 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // mkdir("/dev") on the rootfs. The rootfs's fs_ops is the
         // tmpfs instance whose `FsOps::mkdir` actually mutates the
-        // tmpfs directory map.
+        // tmpfs directory map. Boot-time tmpfs mkdir is synchronous,
+        // so Continue/Yield are unreachable and panic if they fire.
         let guard = tx_substrate::epoch::guard();
         // Bootstrap path runs as root by construction.
         let cred = Credential::root();
+        use tx_substrate::step_v3::StepOutcome as V3;
         let (dev_object_id, dev_meta) = match root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
@@ -463,7 +473,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 &cred,
                 &guard,
             ) {
-            StepOutcome::Done(out) => out,
+            V3::Done(out) => out,
             other => panic!("mount_devfs_at_dev: tmpfs mkdir(/dev) failed: {other:?}"),
         };
         drop(guard);
@@ -565,7 +575,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let tty =
             console_tty().expect("register_devfs_console_alias: console TTY must be registered");
         match register_console_alias("console", tty) {
-            StepOutcome::Done(()) => {}
+            tx_substrate::step_v3::StepOutcome::Done(()) => {}
             other => {
                 panic!("register_devfs_console_alias: register_console_alias failed: {other:?}")
             }

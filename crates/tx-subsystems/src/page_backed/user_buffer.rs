@@ -16,17 +16,18 @@ pub fn step_read_to_user(
     dst: UserPtr<u8>,
     len: usize,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     if len == 0 {
-        return StepOutcome::Done(0);
+        return V3::done(0);
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     let start = of.offset();
     let valid_end = core::cmp::min(pc.size_bytes(), capacity);
     if start >= valid_end {
-        return StepOutcome::Done(0);
+        return V3::done(0);
     }
     let effective_len = core::cmp::min(len as u64, valid_end - start) as usize;
     step_range_with_user_buffer(
@@ -54,38 +55,34 @@ pub fn step_write_from_user(
     src: UserPtr<u8>,
     len: usize,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::StepOutcome as V3;
     if len == 0 {
-        return StepOutcome::Done(0);
+        return V3::done(0);
     }
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     let Some(end) = of.offset().checked_add(len as u64) else {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     if end > capacity {
-        return StepOutcome::Err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     }
     let start = of.offset();
     let outcome =
         step_range_with_user_buffer(pc, of, aspace, len, UserBuffer::Write { src }, guard);
-    match &outcome {
-        StepOutcome::Done(advanced)
-        | StepOutcome::Advanced(advanced)
-        | StepOutcome::AdvancedThenBlocked(advanced, _)
-            if *advanced > 0 =>
-        {
-            pc.grow_size_to(start + *advanced as u64);
-        }
-        StepOutcome::Done(_)
-        | StepOutcome::Advanced(_)
-        | StepOutcome::AdvancedThenBlocked(_, _)
-        | StepOutcome::Blocked(_)
-        | StepOutcome::Err(_) => {}
+    let advanced_bytes = match &outcome {
+        V3::Done(n) => *n,
+        V3::Continue { progress } => progress.bytes(),
+        V3::Yield { progress, .. } => progress.bytes(),
+        V3::Err(_) => 0,
+    };
+    if advanced_bytes > 0 {
+        pc.grow_size_to(start + advanced_bytes as u64);
     }
     outcome
 }
@@ -112,7 +109,8 @@ fn step_range_with_user_buffer(
     len: usize,
     buffer: UserBuffer,
     guard: &Guard<'_>,
-) -> StepOutcome<usize> {
+) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
     let mut advanced = 0usize;
     let mut offset = of.offset();
     while advanced < len {
@@ -124,8 +122,20 @@ fn step_range_with_user_buffer(
             PageBackedIoKind::Write => MaterializeAccess::Write,
         };
 
+        // `materialize_page` is now v3
+        // `StepOutcome<MaterializedPage, NoProgress>`. Map per variant:
+        // - `Done` / `Continue { .. }` → run the user-side copy, then
+        //   either continue the loop (on success) or terminate.
+        // - `Yield { OnCarrier .. }` with `advanced == 0` → v3 `Yield`
+        //   with `ByteProgress::EMPTY`. Otherwise propagate the yield
+        //   carrying the accumulated bytes.
+        // - `Yield { .. }` (OnAgent) → unsupported; surface `Err(EIO)`
+        //   if no progress yet, else partial `Done`.
+        // - `Err(errno)` with `advanced == 0` → v3 `Err(errno)`.
+        //   Otherwise return v3 `Done(advanced)` (partial-success).
+        use tx_substrate::step_v3::YieldShape;
         match pc.materialize_page(page_index, access, guard) {
-            StepOutcome::Done(materialized) | StepOutcome::Advanced(materialized) => {
+            tx_substrate::step_v3::StepOutcome::Done(materialized) => {
                 match copy_chunk_user(
                     materialized.ppn,
                     within_page,
@@ -141,36 +151,60 @@ fn step_range_with_user_buffer(
                     }
                     Err(errno) => {
                         if advanced == 0 {
-                            return StepOutcome::Err(errno);
+                            return V3::err(errno.into());
                         }
                         of.set_offset(offset);
-                        return StepOutcome::Done(advanced);
+                        return V3::done(advanced);
                     }
                 }
             }
-            StepOutcome::AdvancedThenBlocked(_, token) => {
-                of.set_offset(offset);
-                return StepOutcome::AdvancedThenBlocked(advanced, token);
-            }
-            StepOutcome::Blocked(token) => {
+            tx_substrate::step_v3::StepOutcome::Continue { .. } => {
+                // NoProgress carrier: no materialized frame; treat as
+                // EAGAIN-like and surface partial progress (or EIO if
+                // none) — page allocation rarely emits this.
                 if advanced == 0 {
-                    return StepOutcome::Blocked(token);
+                    return V3::err(tx_substrate::step_v3::Errno::EAGAIN);
                 }
                 of.set_offset(offset);
-                return StepOutcome::AdvancedThenBlocked(advanced, token);
+                return V3::done(advanced);
             }
-            StepOutcome::Err(errno) => {
+            tx_substrate::step_v3::StepOutcome::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => {
                 if advanced == 0 {
-                    return StepOutcome::Err(errno);
+                    return V3::yield_on_carrier(
+                        ByteProgress::EMPTY,
+                        carrier.raw(),
+                        interests.raw(),
+                    );
                 }
                 of.set_offset(offset);
-                return StepOutcome::Done(advanced);
+                return V3::yield_on_carrier(
+                    ByteProgress::new(advanced),
+                    carrier.raw(),
+                    interests.raw(),
+                );
+            }
+            tx_substrate::step_v3::StepOutcome::Yield { .. } => {
+                if advanced == 0 {
+                    return V3::err(tx_substrate::step_v3::Errno::EIO);
+                }
+                of.set_offset(offset);
+                return V3::done(advanced);
+            }
+            tx_substrate::step_v3::StepOutcome::Err(errno) => {
+                if advanced == 0 {
+                    return V3::err(errno);
+                }
+                of.set_offset(offset);
+                return V3::done(advanced);
             }
         }
     }
 
     of.set_offset(offset);
-    StepOutcome::Done(advanced)
+    V3::done(advanced)
 }
 
 fn copy_chunk_user(
@@ -197,18 +231,18 @@ fn copy_chunk_user(
             // copy_to_user input.
             let kernel_slice = unsafe { core::slice::from_raw_parts(kernel_byte, chunk) };
             let user_dst = UserPtr::<u8>::new(dst.addr() + already_advanced);
+            use tx_substrate::step_v3::StepOutcome as V3;
             match aspace.copy_to_user(user_dst, kernel_slice, guard) {
-                StepOutcome::Done(n) | StepOutcome::Advanced(n) if n == chunk => Ok(()),
-                StepOutcome::Done(_) | StepOutcome::Advanced(_) => Err(Errno::EFAULT),
-                StepOutcome::Err(e) => Err(e),
+                V3::Done(n) if n == chunk => Ok(()),
+                V3::Continue { progress, .. } if progress.bytes() == chunk => Ok(()),
+                V3::Done(_) | V3::Continue { .. } => Err(Errno::EFAULT),
+                V3::Err(e) => Err(Errno::from(e)),
                 // For per-chunk copies we treat any block as EFAULT
                 // here — the outer step machinery already handles
                 // PC-side blocks; user-side blocks would only happen
                 // if a user-page backing itself blocks (not common
                 // for the fast paths PC ↔ user-buf serves today).
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    Err(Errno::EFAULT)
-                }
+                V3::Yield { .. } => Err(Errno::EFAULT),
             }
         }
         UserBuffer::Write { src } => {
@@ -219,13 +253,13 @@ fn copy_chunk_user(
             // side mutable slice for the copy_from_user output.
             let kernel_slice = unsafe { core::slice::from_raw_parts_mut(kernel_byte, chunk) };
             let user_src = UserPtr::<u8>::new(src.addr() + already_advanced);
+            use tx_substrate::step_v3::StepOutcome as V3;
             match aspace.copy_from_user(kernel_slice, user_src, guard) {
-                StepOutcome::Done(n) | StepOutcome::Advanced(n) if n == chunk => Ok(()),
-                StepOutcome::Done(_) | StepOutcome::Advanced(_) => Err(Errno::EFAULT),
-                StepOutcome::Err(e) => Err(e),
-                StepOutcome::Blocked(_) | StepOutcome::AdvancedThenBlocked(_, _) => {
-                    Err(Errno::EFAULT)
-                }
+                V3::Done(n) if n == chunk => Ok(()),
+                V3::Continue { progress, .. } if progress.bytes() == chunk => Ok(()),
+                V3::Done(_) | V3::Continue { .. } => Err(Errno::EFAULT),
+                V3::Err(e) => Err(Errno::from(e)),
+                V3::Yield { .. } => Err(Errno::EFAULT),
             }
         }
     }

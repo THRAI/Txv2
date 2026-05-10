@@ -398,23 +398,35 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // Loop on the canonical wait-carrier discipline mirroring
     // `sys_write` — fresh epoch guard inside the call site, never
     // crossing an `.await`.
+    use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
     loop {
         let outcome = {
             let guard = tx_substrate::epoch::guard();
             ctx.aspace.msync(range, &guard)
         };
         match outcome {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+            V3::Done(()) | V3::Continue { .. } => {
                 return SyscallResult::Return(0);
             }
-            StepOutcome::AdvancedThenBlocked((), token) | StepOutcome::Blocked(token) => {
+            V3::Yield {
+                shape: YieldShape::OnCarrier { carrier, interests },
+                ..
+            } => {
+                let token =
+                    tx_subsystems::execution::WaitToken::new(carrier.raw(), interests.raw());
                 if let Some(future) = wait_carrier::wait_on_token(token) {
                     let _ = future.await;
                 }
                 // Otherwise re-poll immediately.
             }
-            StepOutcome::Err(errno) => {
-                return SyscallResult::Error(errno_to_i32(errno));
+            V3::Yield {
+                shape: YieldShape::OnAgent { .. },
+                ..
+            } => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+            V3::Err(v3_errno) => {
+                return SyscallResult::Error(errno_to_i32(v3_errno.into()));
             }
         }
     }
@@ -525,33 +537,43 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sysc
                     let guard = tx_substrate::epoch::guard();
                     tx_subsystems::futex::step_futex_wait(uaddr, val, &guard)
                 };
+                use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
                 match outcome {
-                    StepOutcome::Done(()) | StepOutcome::Advanced(()) => {
+                    V3::Done(()) => {
                         return SyscallResult::Return(0);
                     }
-                    StepOutcome::AdvancedThenBlocked((), token) | StepOutcome::Blocked(token) => {
+                    V3::Continue { .. } => {
+                        // No-progress retry hint: re-poll immediately.
+                        continue;
+                    }
+                    V3::Yield {
+                        shape: YieldShape::OnCarrier { carrier, interests },
+                        ..
+                    } => {
                         parked = true;
+                        let token = tx_subsystems::execution::WaitToken::new(
+                            carrier.raw(),
+                            interests.raw(),
+                        );
                         if let Some(future) = wait_carrier::wait_on_token(token) {
                             let _ = future.await;
                         }
-                        // Otherwise re-poll immediately (no
-                        // registered carrier — should not happen
-                        // for production-built tokens).
                         continue;
                     }
-                    StepOutcome::Err(Errno::EAGAIN) => {
-                        return if parked {
-                            // Post-wake re-check showed the word
-                            // changed; the wake was meaningful.
-                            SyscallResult::Return(0)
-                        } else {
-                            // First-call mismatch — return -EAGAIN
-                            // to userspace per Linux.
-                            SyscallResult::Error(errno_to_i32(Errno::EAGAIN))
-                        };
+                    V3::Yield { .. } => {
+                        return SyscallResult::Error(EIO_VALUE);
                     }
-                    StepOutcome::Err(errno) => {
-                        return SyscallResult::Error(errno_to_i32(errno));
+                    V3::Err(v3_errno) => {
+                        let errno: Errno = v3_errno.into();
+                        return if errno == Errno::EAGAIN {
+                            if parked {
+                                SyscallResult::Return(0)
+                            } else {
+                                SyscallResult::Error(errno_to_i32(Errno::EAGAIN))
+                            }
+                        } else {
+                            SyscallResult::Error(errno_to_i32(errno))
+                        };
                     }
                 }
             }
@@ -562,18 +584,18 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sysc
                 let guard = tx_substrate::epoch::guard();
                 tx_subsystems::futex::step_futex_wake(uaddr, n, &guard)
             };
+            use tx_substrate::step_v3::StepOutcome as V3;
             match outcome {
-                StepOutcome::Done(woken) | StepOutcome::Advanced(woken) => {
-                    SyscallResult::Return(woken as i64)
-                }
-                StepOutcome::AdvancedThenBlocked(woken, _) => SyscallResult::Return(woken as i64),
-                StepOutcome::Blocked(_) => {
+                V3::Done(woken) => SyscallResult::Return(woken as i64),
+                V3::Continue { .. } | V3::Yield { .. } => {
                     // FUTEX_WAKE is not a blocking op. The step
-                    // never returns `Blocked` in practice; map to
-                    // `EIO` defensively rather than panic.
+                    // never yields in practice; map to EIO.
                     SyscallResult::Error(EIO_VALUE)
                 }
-                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                V3::Err(v3_errno) => {
+                    let errno: Errno = v3_errno.into();
+                    SyscallResult::Error(errno_to_i32(errno))
+                }
             }
         }
         // FUTEX_REQUEUE / CMP_REQUEUE / WAKE_OP / LOCK_PI /
