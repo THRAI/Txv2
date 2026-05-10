@@ -1,9 +1,10 @@
 use super::*;
-use crate::execution::{Errno, StepOutcome};
+use crate::execution::Errno;
 use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
 use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};
 use alloc::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use tx_substrate::step_v3::{NoProgress, StepOutcome as V3Outcome};
 
 // `step_truncate`, `step_fsync`, `step_fallocate` return
 // `tx_substrate::step_v3::StepOutcome<(), PageProgress>`, so the
@@ -33,8 +34,8 @@ struct LifecycleFs {
     last_truncate_size: AtomicU64,
     last_fallocate_size: AtomicU64,
     block_flush_after: Option<usize>,
-    truncate_outcome: StepOutcome<()>,
-    fallocate_outcome: StepOutcome<()>,
+    truncate_outcome: V3Outcome<(), NoProgress>,
+    fallocate_outcome: V3Outcome<(), NoProgress>,
 }
 
 impl LifecycleFs {
@@ -49,14 +50,14 @@ impl LifecycleFs {
             last_truncate_size: AtomicU64::new(0),
             last_fallocate_size: AtomicU64::new(0),
             block_flush_after: None,
-            truncate_outcome: StepOutcome::Done(()),
-            fallocate_outcome: StepOutcome::Done(()),
+            truncate_outcome: V3Outcome::done(()),
+            fallocate_outcome: V3Outcome::done(()),
         }
     }
 
     fn failing_fallocate(errno: Errno) -> Self {
         Self {
-            fallocate_outcome: StepOutcome::Err(errno),
+            fallocate_outcome: V3Outcome::err(errno.into()),
             ..Self::new()
         }
     }
@@ -70,7 +71,7 @@ impl LifecycleFs {
 
     fn failing_truncate(errno: Errno) -> Self {
         Self {
-            truncate_outcome: StepOutcome::Err(errno),
+            truncate_outcome: V3Outcome::err(errno.into()),
             ..Self::new()
         }
     }
@@ -556,9 +557,7 @@ fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
 // `FsPageBacking`.
 
 use crate::vfs::FsOps;
-use tx_substrate::step_v3::{
-    Errno as V3Errno, NoProgress, StepOutcome as V3Outcome,
-};
+use tx_substrate::step_v3::Errno as V3Errno;
 
 impl FsOps for LifecycleFs {
     fn lookup(
@@ -726,12 +725,7 @@ impl crate::page_backed::FsPageBacking for LifecycleFs {
         self.last_object
             .store(fs_object_id.as_u64(), Ordering::Release);
         self.last_truncate_size.store(new_size, Ordering::Release);
-        match self.truncate_outcome.clone() {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => V3Outcome::done(()),
-            StepOutcome::AdvancedThenBlocked((), _) => V3Outcome::done(()),
-            StepOutcome::Blocked(_) => V3Outcome::err(V3Errno::EAGAIN),
-            StepOutcome::Err(e) => V3Outcome::err(e.into()),
-        }
+        self.truncate_outcome.clone()
     }
 
     fn fsync(
@@ -755,12 +749,7 @@ impl crate::page_backed::FsPageBacking for LifecycleFs {
         self.last_object
             .store(fs_object_id.as_u64(), Ordering::Release);
         self.last_fallocate_size.store(new_size, Ordering::Release);
-        match self.fallocate_outcome.clone() {
-            StepOutcome::Done(()) | StepOutcome::Advanced(()) => V3Outcome::done(()),
-            StepOutcome::AdvancedThenBlocked((), _) => V3Outcome::done(()),
-            StepOutcome::Blocked(_) => V3Outcome::err(V3Errno::EAGAIN),
-            StepOutcome::Err(e) => V3Outcome::err(e.into()),
-        }
+        self.fallocate_outcome.clone()
     }
 }
 
