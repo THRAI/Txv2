@@ -111,17 +111,23 @@ pub fn step_fsync(
             }
             V3::Yield {
                 progress: _,
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape: YieldShape::OnWaitSource { source: carrier, interests },
             } => {
                 let progress = if pages_so_far == 0 {
                     PageProgress::EMPTY
                 } else {
                     PageProgress::new(pages_so_far)
                 };
-                return V3::yield_on_carrier(progress, carrier.raw(), interests.raw());
+                return V3::yield_on_wait_source(progress, carrier.raw(), interests.raw());
             }
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
+                ..
+            } => {
+                return V3::err(tx_substrate::step_v3::Errno::EIO);
+            }
+            V3::Yield {
+                shape: YieldShape::OnTimer { .. },
                 ..
             } => {
                 return V3::err(tx_substrate::step_v3::Errno::EIO);
@@ -142,17 +148,21 @@ pub fn step_fsync(
         }
         V3::Yield {
             progress: _,
-            shape: YieldShape::OnCarrier { carrier, interests },
+            shape: YieldShape::OnWaitSource { source: carrier, interests },
         } => {
             let progress = if pages_so_far == 0 {
                 PageProgress::EMPTY
             } else {
                 PageProgress::new(pages_so_far)
             };
-            V3::yield_on_carrier(progress, carrier.raw(), interests.raw())
+            V3::yield_on_wait_source(progress, carrier.raw(), interests.raw())
         }
         V3::Yield {
             shape: YieldShape::OnAgent { .. },
+            ..
+        } => V3::err(tx_substrate::step_v3::Errno::EIO),
+        V3::Yield {
+            shape: YieldShape::OnTimer { .. },
             ..
         } => V3::err(tx_substrate::step_v3::Errno::EIO),
         V3::Err(v3_errno) => V3::err(v3_errno),
@@ -209,12 +219,16 @@ pub fn step_truncate(
             V3::Continue { progress: _ } => true,
             V3::Yield {
                 progress: _,
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape: YieldShape::OnWaitSource { source: carrier, interests },
             } => {
-                return V3::yield_on_carrier(PageProgress::EMPTY, carrier.raw(), interests.raw());
+                return V3::yield_on_wait_source(PageProgress::EMPTY, carrier.raw(), interests.raw());
             }
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
+                ..
+            } => return V3::err(tx_substrate::step_v3::Errno::EIO),
+            V3::Yield {
+                shape: YieldShape::OnTimer { .. },
                 ..
             } => return V3::err(tx_substrate::step_v3::Errno::EIO),
             V3::Err(v3_errno) => return V3::err(v3_errno),
@@ -276,12 +290,16 @@ pub fn step_fallocate(
             V3::Continue { progress: _ } => true,
             V3::Yield {
                 progress: _,
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape: YieldShape::OnWaitSource { source: carrier, interests },
             } => {
-                return V3::yield_on_carrier(PageProgress::EMPTY, carrier.raw(), interests.raw());
+                return V3::yield_on_wait_source(PageProgress::EMPTY, carrier.raw(), interests.raw());
             }
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
+                ..
+            } => return V3::err(tx_substrate::step_v3::Errno::EIO),
+            V3::Yield {
+                shape: YieldShape::OnTimer { .. },
                 ..
             } => return V3::err(tx_substrate::step_v3::Errno::EIO),
             V3::Err(v3_errno) => return V3::err(v3_errno),
@@ -296,6 +314,75 @@ pub fn step_fallocate(
         V3::continue_with(PageProgress::EMPTY)
     } else {
         V3::done(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StepOp wraps (PR-2 pilot)
+// ---------------------------------------------------------------------------
+//
+// Additive `impl StepOp` adapters per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1.
+// Each wrap stores its inputs by reference under a single lifetime `'a` and
+// delegates from `step()` to the corresponding free fn above — semantics are
+// unchanged. The free fns remain the source of truth; callers can migrate to
+// the `*Op` types incrementally.
+
+/// `StepOp` wrap of [`step_fsync`].
+pub struct FsyncOp<'a> {
+    pub pc: &'a PageContainer,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for FsyncOp<'a>
+{
+    type Output = ();
+    type Progress = tx_substrate::step_v3::PageProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_fsync(self.pc, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_truncate`].
+pub struct TruncateOp<'a> {
+    pub pc: &'a PageContainer,
+    pub new_size: u64,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for TruncateOp<'a>
+{
+    type Output = ();
+    type Progress = tx_substrate::step_v3::PageProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_truncate(self.pc, self.new_size, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_fallocate`].
+pub struct FallocateOp<'a> {
+    pub pc: &'a PageContainer,
+    pub new_size: u64,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for FallocateOp<'a>
+{
+    type Output = ();
+    type Progress = tx_substrate::step_v3::PageProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_fallocate(self.pc, self.new_size, self.guard)
     }
 }
 
@@ -314,8 +401,8 @@ mod v3_tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tx_substrate::page_allocator;
     use tx_substrate::step_v3::{
-        Errno as V3Errno, InterestConditions, NoProgress, PageProgress, StepOutcome as V3Outcome,
-        WakeCarrier, YieldShape,
+        Errno as V3Errno, InterestMask, NoProgress, PageProgress, StepOutcome as V3Outcome,
+        WaitSourceId, YieldShape,
     };
 
     fn setup_host_substrate() {
@@ -369,9 +456,9 @@ mod v3_tests {
         fn blocking_truncate(token: WaitToken) -> Self {
             use tx_substrate::step_v3::StepOutcome as V3;
             Self {
-                truncate_outcome: V3::yield_on_carrier(
+                truncate_outcome: V3::yield_on_wait_source(
                     tx_substrate::step_v3::NoProgress,
-                    token.carrier(),
+                    token.source_id(),
                     token.interest(),
                 ),
                 ..Self::new()
@@ -534,7 +621,7 @@ mod v3_tests {
                 .store(fs_object_id.as_u64(), Ordering::Release);
             self.last_offset.store(offset, Ordering::Release);
             if self.block_flush_after == Some(flush) {
-                V3Outcome::yield_on_carrier(NoProgress, 13, 0x55)
+                V3Outcome::yield_on_wait_source(NoProgress, 13, 0x55)
             } else {
                 V3Outcome::done(())
             }
@@ -658,9 +745,9 @@ mod v3_tests {
             step_fsync(&pc, &guard),
             V3Outcome::Yield {
                 progress: PageProgress::EMPTY,
-                shape: YieldShape::OnCarrier {
-                    carrier: WakeCarrier::new(13),
-                    interests: InterestConditions::new(0x55),
+                shape: YieldShape::OnWaitSource {
+                    source: WaitSourceId::new(13),
+                    interests: InterestMask::new(0x55),
                 },
             }
         );
@@ -690,9 +777,9 @@ mod v3_tests {
             step_fsync(&pc, &guard),
             V3Outcome::Yield {
                 progress: PageProgress::new(1),
-                shape: YieldShape::OnCarrier {
-                    carrier: WakeCarrier::new(13),
-                    interests: InterestConditions::new(0x55),
+                shape: YieldShape::OnWaitSource {
+                    source: WaitSourceId::new(13),
+                    interests: InterestMask::new(0x55),
                 },
             }
         );
@@ -792,9 +879,9 @@ mod v3_tests {
             step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
             V3Outcome::Yield {
                 progress: PageProgress::EMPTY,
-                shape: YieldShape::OnCarrier {
-                    carrier: WakeCarrier::new(7),
-                    interests: InterestConditions::new(0x11),
+                shape: YieldShape::OnWaitSource {
+                    source: WaitSourceId::new(7),
+                    interests: InterestMask::new(0x11),
                 },
             }
         );
@@ -818,5 +905,82 @@ mod v3_tests {
         );
         // Post-fs work *did* run, so size is published.
         assert_eq!(pc.size_bytes(), new_size);
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    //! PR-2 pilot smoke tests for the `StepOp` wraps.
+    //!
+    //! Each test builds the `*Op` adapter, drives it through a single
+    //! `.step(&mut ctx)` call, and pins the outcome variant. Compile-checks
+    //! `impl StepOp` correctness; the heavy-lifting semantics tests live in
+    //! the free-fn suite in `v3_tests` above.
+    use super::*;
+    use crate::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3Outcome};
+
+    fn setup() {
+        tx_substrate::testing::init_host_for_test_once();
+        crate::zones::register_all().expect("kernel zones");
+        match tx_substrate::page_allocator::claim_zero_frame() {
+            Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+            Err(error) => panic!("claim zero frame for step_op_wraps tests: {error:?}"),
+        }
+    }
+
+    fn anon_pc(pages: u64) -> PageContainer {
+        PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            pages,
+        )
+    }
+
+    #[test]
+    fn fsync_op_anon_returns_done() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
+        setup();
+        let guard = tx_substrate::epoch::guard();
+        let pc = anon_pc(1);
+        let mut op = FsyncOp { pc: &pc, guard: &guard };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
+    }
+
+    #[test]
+    fn truncate_op_anon_shrink_returns_done() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
+        setup();
+        let guard = tx_substrate::epoch::guard();
+        let pc = anon_pc(4);
+        let new_size = crate::vm::USER_PAGE_SIZE as u64;
+        let mut op = TruncateOp {
+            pc: &pc,
+            new_size,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
+    }
+
+    #[test]
+    fn fallocate_op_anon_grow_returns_done() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
+        setup();
+        let guard = tx_substrate::epoch::guard();
+        let pc = anon_pc(4);
+        // pc.size_bytes() starts at 0 for a fresh Anon container, so growing
+        // to one page exercises the fs_advanced = false → Done(()) arm.
+        let new_size = crate::vm::USER_PAGE_SIZE as u64;
+        let mut op = FallocateOp {
+            pc: &pc,
+            new_size,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
     }
 }
