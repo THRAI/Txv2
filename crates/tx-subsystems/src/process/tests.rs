@@ -1360,7 +1360,7 @@ fn step_install_brk_for_exec_resets_both_brk_base_and_current() {
 //   - `seed_child_leader_context` (Part 1A): the syscall driver
 //     helper that stamps `regs[10] = 0` (RV64 a0) and `pc + 4`
 //     onto the child leader thread's saved trap context.
-//   - `ProcessPayload.exit_port` (Part 1B): the per-process wait
+//   - `ProcessPayload.exit_source` (Part 1B): the per-process wait
 //     channel that fires on child zombification, so a parent
 //     parked on `sys_wait4` wakes when any child exits.
 //   - POSIX `wait_status_word` migration (Open Q #3 DECIDED):
@@ -1369,6 +1369,6 @@ fn step_install_brk_for_exec_resets_both_brk_base_and_current() {
 
 mod seed_child_leader_context;
 
-mod exit_port;
+mod exit_source;
 
 mod posix_wait_status_word;

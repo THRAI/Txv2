@@ -26,10 +26,13 @@
 //! ```
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use tx_reactor::wait::{Channel, Mask};
+use tx_substrate::step_v3::{InterestMask, WaitSourceId};
+use tx_substrate::wake::WaitSource;
 use tx_substrate::zone::{Cap, Dead, Entity, PayloadCap, Weak, Zone, ZoneAllocated};
 use tx_substrate::SpinMutex;
 
@@ -43,13 +46,13 @@ use crate::vm::AddressSpace;
 use tx_substrate::AtomicSlot;
 
 /// Bit-mask for the "child has zombified" event on the per-process
-/// `exit_port`. Future events (stop, continue) get their own bits
+/// `exit_source`. Future events (stop, continue) get their own bits
 /// alongside their wakers; the slice carves out only this single bit.
 ///
 /// Cites: `txdoc:PROCESS-WAIT-FAMILY-1`
 /// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4); plan
 /// `docs/progress/plans/2026-05-06-fork-clone-wait4.md` Open Q #1.
-pub const EXIT_PORT_CHILD_ZOMBIFIED: u64 = 0x1;
+pub const EXIT_SOURCE_CHILD_ZOMBIFIED: u64 = 0x1;
 
 /// Per-process exit disposition, populated by `step_exit_group` /
 /// `step_exit_group_with_signal` / the last-thread cascade. Spec
@@ -166,6 +169,32 @@ pub struct ProcessIdentity {
     pub(crate) payload: SpinMutex<Option<PayloadCap<ProcessPayload>>>,
 }
 
+/// `ProcessIdentity` is the production [`tx_substrate::step_v3::SubjectIdentity`]
+/// per [D1](../../../../docs/progress/decisions/2026-05-11-d1-scriptctx-trait-bound-identity.md).
+///
+/// The trait declares what `step_v3` algebra needs to know about a
+/// subject (its credential view, restriction-stack view, optional
+/// thread-identity view, and exit-source id). Concrete types stay
+/// here in the subsystem layer.
+///
+/// `Restrictions` currently uses the `step_v3::RestrictionStackHandle`
+/// placeholder because the real append-only stack lives in
+/// `tx-policy`, which is still skeleton. PR-K wires the real type
+/// alongside the seccomp/landlock landing. The trait's
+/// `Restrictions` associated type will swap to the real type then;
+/// callers using `<I as SubjectIdentity>::Restrictions` will not
+/// need to change.
+impl tx_substrate::step_v3::SubjectIdentity for ProcessIdentity {
+    type Credential = crate::cred::Cred;
+    type Restrictions = tx_substrate::step_v3::RestrictionStackHandle;
+    type ThreadIdentity = crate::thread_runtime::ThreadIdentity;
+
+    fn exit_source(&self) -> Option<tx_substrate::step_v3::WaitSourceId> {
+        self.exit_source_id()
+            .map(tx_substrate::step_v3::WaitSourceId::new)
+    }
+}
+
 impl ProcessIdentity {
     /// Snapshot the current process-group `Cap`. The returned `Cap` is a
     /// strong reference; it remains valid until dropped even if the
@@ -258,6 +287,18 @@ impl ProcessIdentity {
     /// one lock acquisition.
     pub fn cred(&self) -> Option<Cred> {
         self.payload.lock().as_ref().map(|p| p.cred())
+    }
+
+    /// Snapshot the current `Cap<Cred>` for this process, if alive.
+    /// Returns `None` for zombies (payload dropped — cred unobservable).
+    ///
+    /// PR-9 phase 5 (D5 Path A): companion to [`Self::cred`]. Returns
+    /// the cap, not the value, so callers building a
+    /// `SubjectAuthority` can pass it directly without re-signing.
+    /// Used by `tx_shims::linux_syscall::SyscallCtx::cred_cap()` and
+    /// the v3 subject-population helpers.
+    pub fn cred_cap(&self) -> Option<Cap<Cred>> {
+        self.payload.lock().as_ref().map(|p| p.cred_cap())
     }
 
     /// Replace this process's address space with `new` and return the
@@ -526,19 +567,19 @@ impl ProcessIdentity {
         result
     }
 
-    /// Carrier id under which this process's `exit_port` channel is
-    /// registered with the global wait-carrier resolver. Returns
+    /// Carrier id under which this process's `exit_source` channel is
+    /// registered with the global wait-source resolver. Returns
     /// `None` for zombies (no payload — the channel is unreachable
     /// once the payload has been dropped).
     ///
     /// Wave 2's `sys_wait4` blocking arm pairs this with
-    /// [`EXIT_PORT_CHILD_ZOMBIFIED`] to build the `WaitToken` it
-    /// awaits via [`crate::wait_carrier::wait_on_token`].
-    pub fn exit_port_carrier_id(&self) -> Option<u64> {
+    /// [`EXIT_SOURCE_CHILD_ZOMBIFIED`] to build the `WaitToken` it
+    /// awaits via [`crate::wait_source::wait_on_token`].
+    pub fn exit_source_id(&self) -> Option<u64> {
         self.payload
             .lock()
             .as_ref()
-            .map(|p| p.exit_port_carrier_id())
+            .map(|p| p.exit_source_id())
     }
 
     /// Build the `WaitToken` an awaiter parks on while waiting for any
@@ -546,28 +587,61 @@ impl ProcessIdentity {
     /// (no payload).
     ///
     /// The returned token's interest mask is
-    /// [`EXIT_PORT_CHILD_ZOMBIFIED`] — Wave 1 carves out only the
+    /// [`EXIT_SOURCE_CHILD_ZOMBIFIED`] — Wave 1 carves out only the
     /// child-zombified bit; future stop/cont events get separate bits
     /// alongside their own wakers.
-    pub fn exit_port_wait_token(&self) -> Option<WaitToken> {
-        self.exit_port_carrier_id()
-            .map(|id| WaitToken::new(id, EXIT_PORT_CHILD_ZOMBIFIED))
+    pub fn exit_source_wait_token(&self) -> Option<WaitToken> {
+        self.exit_source_id()
+            .map(|id| WaitToken::new(id, EXIT_SOURCE_CHILD_ZOMBIFIED))
     }
 
-    /// Fire the `exit_port` channel with `mask`, returning the number
+    /// Fire the `exit_source` channel with `mask`, returning the number
     /// of awaiters released by [`Channel::fire`]. No-op (returns `0`)
     /// for zombies.
     ///
-    /// The fire site is
-    /// [`crate::process::execution::post_sigchld_to_parent`]: every
-    /// time SIGCHLD posts, the parent's `exit_port` fires the
-    /// `EXIT_PORT_CHILD_ZOMBIFIED` bit.
-    pub fn fire_exit_port(&self, mask: Mask) -> usize {
+    /// PR-3D-3 (D2/D4 coexistence): also fires the parallel
+    /// [`Self::exit_wait_source`] (the new `Arc<WaitSource>` mailbox
+    /// path) with the same mask reinterpreted as
+    /// [`InterestMask`]. Both fires happen under the same
+    /// payload-lock observation, so the zombie/live edge is
+    /// idempotent on both paths — once the payload drops, neither
+    /// fires (returns 0 / posts 0 events). Double-call on a
+    /// still-live payload re-fires both: that's a property of
+    /// `Channel::fire` (subsequent callers see the latch) and of
+    /// `WaitSource::notify` (re-posts to any subscribers still
+    /// registered). Production callers only invoke this once per
+    /// transition (`post_sigchld_to_parent` runs once per zombify),
+    /// so re-fire is not a concern in practice.
+    pub fn fire_exit_source(&self, mask: Mask) -> usize {
         self.payload
             .lock()
             .as_ref()
-            .map(|p| p.exit_port().fire(mask))
+            .map(|p| {
+                let released = p.exit_source().fire(mask);
+                // PR-3D-3 new path: post `MailboxEvent::SourceFired`
+                // to any v3 caller that registered a `TaskMailbox`
+                // against this process's exit_wait_source. Same
+                // mask bits — the legacy Channel and the new
+                // WaitSource share the bit-namespace
+                // (`EXIT_SOURCE_CHILD_ZOMBIFIED` and future stop/cont
+                // bits land in both).
+                p.exit_wait_source()
+                    .notify(InterestMask::new(mask.bits()));
+                released
+            })
             .unwrap_or(0)
+    }
+
+    /// PR-3D-3: per-process `WaitSource` for the new mailbox-based
+    /// wake path. Returns `None` for zombies (no payload — the
+    /// source is unreachable once the payload has been dropped).
+    /// `WaitSource::id()` matches the `u64` returned by
+    /// [`Self::exit_source_id`].
+    pub fn exit_wait_source(&self) -> Option<Arc<WaitSource>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.exit_wait_source().clone())
     }
 
     /// Build the process-exported value type that `cred::require_signal_send`
@@ -657,9 +731,27 @@ pub struct ProcessPayload {
     /// whose mask permits the signal will sweep it on its next
     /// delivery point.
     pub(crate) group_pending: PendingSignalQueue,
-    /// Per-process credential snapshot. Mutated via `cred::step_setuid`
-    /// / `cred::step_setgid`; readers clone via `cred()` accessor.
-    pub(crate) cred: SpinMutex<Cred>,
+    /// Per-process credential **cap slot**. Mutated via
+    /// `cred::step_setuid` / `cred::step_setgid` / ...; readers clone
+    /// the cap via [`Self::cred_cap`] or snapshot the value via
+    /// [`Self::cred`].
+    ///
+    /// PR-9 phase 5 (D5 Path A, 2026-05-11) — was `SpinMutex<Cred>`.
+    /// `Cred` is now `ZoneAllocated`; each cred-mutator
+    /// (`step_setuid`, ...) reads the current cap, derives a new
+    /// `Cred` value, signs a fresh `Cap<Cred>`, and publishes via
+    /// `AtomicSlot::swap`. The previous cap drops at the end of the
+    /// mutator and the slab entry is EBR-retired once concurrent
+    /// readers' guards complete. Atomicity becomes a single slot
+    /// store (release/acquire); torn reads of partial cred state are
+    /// structurally impossible.
+    ///
+    /// Initial state is always populated by `sign_process_payload`
+    /// (`bootstrap_init_process` and `step_fork` both seed a fresh
+    /// `Cap<Cred>`); the slot is never empty for a live payload.
+    /// Field shape mirrors the existing
+    /// `aspace: AtomicSlot<Cap<AddressSpace>>` precedent above.
+    pub(crate) cred: AtomicSlot<Cap<Cred>>,
     /// Current working directory as a `DEntry` `Cap`.
     ///
     /// Spec note: `PROCESS_v1` §3 declares this as `Cap<RNode>` on a
@@ -750,17 +842,17 @@ pub struct ProcessPayload {
     /// `SpinMutex<u16>` would be heavier than necessary for a 16-bit
     /// scalar with swap semantics.
     pub(crate) umask: AtomicU16,
-    /// Reactor wait carrier that fires when **any** child of this
+    /// Reactor wait source that fires when **any** child of this
     /// process zombifies (per `txdoc:PROCESS-WAIT-FAMILY-1`'s
     /// `children_state_channel` notion). Created at payload-sign time
-    /// and registered with [`crate::wait_carrier::register_wait_channel`]
+    /// and registered with [`crate::wait_source::register_wait_channel`]
     /// so async script wrappers can `wait_on_token` against the
     /// returned id without holding a `Cap<ProcessIdentity>`.
     ///
     /// Pattern mirrors `TtyIdentity.wait_channel` /
-    /// `wait_carrier_id` (see
+    /// `wait_source_id` (see
     /// `crates/tx-subsystems/src/tty/structure/identity.rs`'s
-    /// `TtyIdentity::new`) — the only other in-tree wait carrier
+    /// `TtyIdentity::new`) — the only other in-tree wait source
     /// today.
     ///
     /// Fire site: [`crate::process::execution::post_sigchld_to_parent`]
@@ -769,19 +861,32 @@ pub struct ProcessPayload {
     /// fire; the matching `sys_wait4` blocking-wait await arrives in
     /// Wave 2.
     ///
-    /// Bit allocation: see [`EXIT_PORT_CHILD_ZOMBIFIED`].
-    pub(crate) exit_port: Channel,
-    /// Carrier id under which `exit_port` is registered with the
-    /// global [`crate::wait_carrier`] resolver. Embedded in the
+    /// Bit allocation: see [`EXIT_SOURCE_CHILD_ZOMBIFIED`].
+    pub(crate) exit_source: Channel,
+    /// Carrier id under which `exit_source` is registered with the
+    /// global [`crate::wait_source`] resolver. Embedded in the
     /// `WaitToken` returned by
-    /// [`ProcessIdentity::exit_port_wait_token`] so the syscall arm
+    /// [`ProcessIdentity::exit_source_wait_token`] so the syscall arm
     /// can park on the carrier without reaching the channel directly.
     ///
     /// Carrier-lifetime cleanup (release on payload drop) is tracked
     /// as Cross-cutting Risk #1 in the slice plan and not addressed
     /// in Wave 1; see plan §"Cross-cutting risks #1" for the
     /// follow-up.
-    pub(crate) exit_port_carrier_id: u64,
+    pub(crate) exit_source_id: u64,
+    /// PR-3D-3 (D2/D4 coexistence). Per-process `WaitSource` minted at
+    /// `sign_process_payload` time alongside the legacy
+    /// `exit_source` Channel. Shares the same `WaitSourceId` (raw
+    /// `u64` matches `exit_source_id`) so a v3 caller's
+    /// `YieldShape::OnWaitSource { source: WaitSourceId(exit_source_id),
+    /// .. }` round-trips cleanly to this source. Fired in parallel
+    /// with the legacy Channel by `post_sigchld_to_parent` (the sole
+    /// fire site). `notify` is idempotent in the "no subscribers,
+    /// already-zombie process" sense — once the payload drops the
+    /// `Arc<WaitSource>` is unreachable through this slot and any
+    /// last fire was already issued under the live-payload guard
+    /// inside `fire_exit_source`.
+    pub(crate) exit_wait_source: Arc<WaitSource>,
 }
 
 impl ProcessPayload {
@@ -807,11 +912,50 @@ impl ProcessPayload {
         &self.group_pending
     }
 
-    /// Snapshot the current credential. Returns a `Copy` so callers
-    /// don't have to retain the lock; permissioned mutators
-    /// (`cred::step_setuid` etc.) take the lock internally.
+    /// Snapshot the current credential value. Returns a `Copy` so
+    /// callers don't have to retain the cap; permissioned mutators
+    /// (`cred::step_setuid` etc.) reserve+sign a fresh cap internally.
+    ///
+    /// PR-9 phase 5: under the new `AtomicSlot<Cap<Cred>>` shape,
+    /// this loads the current cap, derefs through it to read the
+    /// `Cred` value, and drops the cap clone on return — so the
+    /// returned `Cred` is independent of the slot and safe to hold
+    /// across `.await`. Equivalent semantics to the previous
+    /// `SpinMutex<Cred>` snapshot.
     pub fn cred(&self) -> Cred {
-        *self.cred.lock()
+        *self.cred_cap()
+    }
+
+    /// Snapshot the current `Cap<Cred>` out of the
+    /// `AtomicSlot<Cap<Cred>>` slot. Panics if the slot is empty —
+    /// by construction the initial state is always populated
+    /// (`sign_process_payload`), and the only mutators are the
+    /// cred-service `step_*` family which atomic-swap to a fresh
+    /// `Cap` and never leave the slot empty.
+    ///
+    /// PR-9 phase 5: this is the cap-shaped accessor consumed by
+    /// `SyscallCtx`-side `SubjectAuthority` construction. Mirrors
+    /// `aspace_cap()` (already present for the `AddressSpace` slot
+    /// per `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`).
+    pub fn cred_cap(&self) -> Cap<Cred> {
+        self.cred
+            .load()
+            .expect("ProcessPayload.cred slot is always populated")
+    }
+
+    /// Atomically install `new` as the current cred-cap and return
+    /// the previously installed cap. Used by the 7 cred-mutator
+    /// `step_*` functions and their test-only siblings.
+    ///
+    /// Per D5 Path A, the previous cap is returned (not dropped here)
+    /// so the caller controls drop timing — drop typically happens
+    /// at the end of the mutator's stack frame, releasing the
+    /// retain-count on the prior slab entry; EBR reclaims when
+    /// concurrent readers' guards exit.
+    pub(crate) fn replace_cred(&self, new: Cap<Cred>) -> Cap<Cred> {
+        self.cred
+            .swap(Some(new))
+            .expect("ProcessPayload.cred slot is always populated")
     }
 
     /// Snapshot the current working-directory `Cap<DEntry>` if one
@@ -955,24 +1099,39 @@ impl ProcessPayload {
         self.umask.swap(new & 0o777, Ordering::AcqRel)
     }
 
-    /// Borrow the per-process `exit_port` wait channel.
+    /// Borrow the per-process `exit_source` wait channel.
     ///
     /// Fired by [`crate::process::execution::post_sigchld_to_parent`]
     /// after the SIGCHLD producer post when a child zombifies. The
     /// matching syscall-side awaiter (Wave 2's `sys_wait4` blocking
     /// arm) parks on
-    /// [`ProcessIdentity::exit_port_wait_token`] via
-    /// [`crate::wait_carrier::wait_on_token`] rather than borrowing
+    /// [`ProcessIdentity::exit_source_wait_token`] via
+    /// [`crate::wait_source::wait_on_token`] rather than borrowing
     /// the channel directly.
-    pub fn exit_port(&self) -> &Channel {
-        &self.exit_port
+    pub fn exit_source(&self) -> &Channel {
+        &self.exit_source
     }
 
-    /// Carrier id under which [`Self::exit_port`] is registered with
-    /// the global wait-carrier resolver. Embedded in the
+    /// Carrier id under which [`Self::exit_source`] is registered with
+    /// the global wait-source resolver. Embedded in the
     /// `WaitToken` callers use to park.
-    pub fn exit_port_carrier_id(&self) -> u64 {
-        self.exit_port_carrier_id
+    pub fn exit_source_id(&self) -> u64 {
+        self.exit_source_id
+    }
+
+    /// PR-3D-3: per-process `WaitSource` for the new mailbox-based
+    /// wake path. Returned as `&Arc<WaitSource>` so callers can clone
+    /// the strong reference, register a `TaskMailbox` via
+    /// `WaitSource::prepare(..).install_if(..)`, and hold the source
+    /// alive across the wait window independent of payload lifetime.
+    ///
+    /// `WaitSource::id()` matches [`Self::exit_source_id`]: a v3
+    /// caller's `YieldShape::OnWaitSource { source: WaitSourceId(id),
+    /// .. }` where `id == exit_source_id()` resolves to this same
+    /// source without going through the legacy `wait_source`
+    /// resolver.
+    pub fn exit_wait_source(&self) -> &Arc<WaitSource> {
+        &self.exit_wait_source
     }
 }
 
@@ -1120,4 +1279,28 @@ pub fn allocate_pid() -> Pid {
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reset_pid_counter_for_test() {
     NEXT_PID.store(2, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod subject_identity_tests {
+    use super::ProcessIdentity;
+    use tx_substrate::step_v3::SubjectIdentity;
+
+    /// Compile-only smoke: associated types must resolve so generic
+    /// bodies `fn step<I: SubjectIdentity>(...)` can name them.
+    #[test]
+    fn process_identity_implements_subject_identity_with_expected_associated_types() {
+        fn assert_credential<I: SubjectIdentity<Credential = crate::cred::Cred>>() {}
+        fn assert_restrictions<
+            I: SubjectIdentity<Restrictions = tx_substrate::step_v3::RestrictionStackHandle>,
+        >() {
+        }
+        fn assert_thread<
+            I: SubjectIdentity<ThreadIdentity = crate::thread_runtime::ThreadIdentity>,
+        >() {
+        }
+        assert_credential::<ProcessIdentity>();
+        assert_restrictions::<ProcessIdentity>();
+        assert_thread::<ProcessIdentity>();
+    }
 }

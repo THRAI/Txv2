@@ -482,11 +482,11 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
 ///
 /// Day-1 scope: severs children's parent slots (§8.1 stub), writes
 /// the process-visible exit status, drops the `ProcessPayload`. The
-/// remaining §7.3.3 phase-5 cascade (SIGCHLD to parent, `exit_port`
+/// remaining §7.3.3 phase-5 cascade (SIGCHLD to parent, `exit_source`
 /// wake, full reparenting-into-init, orphan-pgrp SIGHUP,
 /// session-leader controlling-tty hangup per §8.3) lands incrementally:
 /// SIGCHLD post is wired via `post_sigchld_to_parent`, and the Wave 1
-/// fork/clone/wait4 slice (2026-05-06) added the `exit_port` fire
+/// fork/clone/wait4 slice (2026-05-06) added the `exit_source` fire
 /// alongside the SIGCHLD post for parent-side wake.
 pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     session_leader_hangup_cascade(process);
@@ -600,8 +600,8 @@ fn session_leader_hangup_cascade(process: &Cap<ProcessIdentity>) {
 /// parent's leader-thread `thread_pending` until reaped or masked).
 ///
 /// Wave 1 of the fork/clone/wait4 slice (2026-05-06): also fires the
-/// parent's per-process `exit_port` wait channel
-/// (`EXIT_PORT_CHILD_ZOMBIFIED` bit) so a parent parked on
+/// parent's per-process `exit_source` wait channel
+/// (`EXIT_SOURCE_CHILD_ZOMBIFIED` bit) so a parent parked on
 /// `sys_wait4` (Wave 2) wakes when any child zombifies. Per
 /// `txdoc:PROCESS-WAIT-FAMILY-1` and the spec's
 /// "Block until a child's state changes" arm.
@@ -609,8 +609,8 @@ fn session_leader_hangup_cascade(process: &Cap<ProcessIdentity>) {
 /// No-op for processes with no parent: bootstrap init (never had one)
 /// and orphans whose parent has already exited and severed them.
 /// Also no-op if the parent is itself a zombie — `step_kill_process`
-/// returns `NoLiveThread` and `fire_exit_port` returns `0` (no
-/// payload to fire through). The `exit_port` fire is harmless when
+/// returns `NoLiveThread` and `fire_exit_source` returns `0` (no
+/// payload to fire through). The `exit_source` fire is harmless when
 /// no awaiter is parked (Channel::fire returns 0).
 ///
 /// `siginfo` is not yet wired (no `SigInfo` type in day-1 signal
@@ -620,10 +620,10 @@ fn session_leader_hangup_cascade(process: &Cap<ProcessIdentity>) {
 fn post_sigchld_to_parent(process: &Cap<ProcessIdentity>) {
     if let Some(parent) = process.parent_cap() {
         let _ = crate::signal::step_kill_process(&parent, crate::signal::Signum::SIGCHLD);
-        // Fire the parent's exit_port. A zombie parent has no payload
-        // and `fire_exit_port` returns 0 — no panic, no double-fire.
-        let _ = parent.fire_exit_port(tx_reactor::wait::Mask::from_bits(
-            crate::process::structure::EXIT_PORT_CHILD_ZOMBIFIED,
+        // Fire the parent's exit_source. A zombie parent has no payload
+        // and `fire_exit_source` returns 0 — no panic, no double-fire.
+        let _ = parent.fire_exit_source(tx_reactor::wait::Mask::from_bits(
+            crate::process::structure::EXIT_SOURCE_CHILD_ZOMBIFIED,
         ));
     }
 }
@@ -961,18 +961,38 @@ fn sign_process_payload(
     let aspace_slot: AtomicSlot<Cap<AddressSpace>> = AtomicSlot::empty();
     aspace_slot.store(Some(aspace));
 
-    // Allocate a fresh `exit_port` Channel per `ProcessPayload` and
-    // register it with the global wait-carrier resolver so async
+    // PR-9 phase 5 (D5 Path A): mint a fresh `Cap<Cred>` for this
+    // process's cred slot. `bootstrap_init_process` passes `Cred::root()`;
+    // `step_fork` passes a value-copy of the parent's current `Cred`
+    // (the cred snapshot is read via `payload.cred()` at fork entry —
+    // which itself dereferences the parent's `Cap<Cred>` — so the
+    // child receives a fresh cap pointing at an independent slab
+    // entry, not a clone of the parent's cap key). Per D5 constraint
+    // #3: don't share the cap; that would couple parent and child
+    // cred lifetimes incorrectly.
+    let cred_cap = crate::cred::sign_cred(cred)?;
+    let cred_slot: AtomicSlot<Cap<crate::cred::Cred>> = AtomicSlot::empty();
+    cred_slot.store(Some(cred_cap));
+
+    // Allocate a fresh `exit_source` Channel per `ProcessPayload` and
+    // register it with the global wait-source resolver so async
     // awaiters can `wait_on_token` against the returned id without
     // holding a `Cap<ProcessIdentity>`. Pattern mirrors
-    // `TtyIdentity::new` — the only other in-tree wait carrier today
+    // `TtyIdentity::new` — the only other in-tree wait source today
     // (`crates/tx-subsystems/src/tty/structure/identity.rs`).
     //
     // Carrier-lifetime cleanup (release on payload drop) is tracked
     // as Cross-cutting Risk #1 in the slice plan and is deferred
     // beyond Wave 1.
-    let exit_port = Channel::new();
-    let exit_port_carrier_id = crate::wait_carrier::register_wait_channel(exit_port.clone());
+    let exit_source = Channel::new();
+    let exit_source_id = crate::wait_source::register_wait_channel(exit_source.clone());
+    // PR-3D-3 (D2/D4 coexistence). Per-process `WaitSource` shares the
+    // same `u64` namespace as the legacy `exit_source` channel so a
+    // `WaitSourceId` stamped into `YieldShape::OnWaitSource` lands at
+    // both ends (legacy resolver + new `Arc<WaitSource>` slot).
+    let exit_wait_source = alloc::sync::Arc::new(tx_substrate::wake::WaitSource::new(
+        tx_substrate::step_v3::WaitSourceId::new(exit_source_id),
+    ));
 
     let res = zone::reserve_for::<ProcessPayload>()?;
     let cap = zone::sign_for(
@@ -982,7 +1002,7 @@ fn sign_process_payload(
             threads: SpinMutex::new(threads),
             sig_actions: SigActionTable::new(),
             group_pending: PendingSignalQueue::new(),
-            cred: SpinMutex::new(cred),
+            cred: cred_slot,
             cwd: SpinMutex::new(cwd),
             fds: SpinMutex::new(fds),
             fd_cloexec: SpinMutex::new(fd_cloexec),
@@ -996,8 +1016,9 @@ fn sign_process_payload(
             // per-process, copied across fork). `step_exec` preserves
             // the umask (umask survives `exec` per POSIX).
             umask: core::sync::atomic::AtomicU16::new(umask & 0o777),
-            exit_port,
-            exit_port_carrier_id,
+            exit_source,
+            exit_source_id,
+            exit_wait_source,
         },
     );
     Ok(tx_substrate::zone::PayloadCap::from_cap(cap))
@@ -1025,6 +1046,28 @@ fn sign_thread(
     Ok(cap)
 }
 
+/// Test-only: attach a fresh sibling thread to `target`'s thread
+/// list. Used by D9-B's eligibility-scan pins and the D9-C
+/// interrupt-wake test to construct multi-thread processes without
+/// going through the (not-yet-shipped) `clone(CLONE_THREAD)` path.
+///
+/// Returns the new thread's `Cap<ThreadIdentity>`. The thread's
+/// `signal_mask` starts empty; tests block signals via
+/// `step_sigprocmask` after spawning.
+///
+/// Hidden behind `cfg(any(test, feature = "test-support"))` so it
+/// never reaches release builds.
+#[cfg(any(test, feature = "test-support"))]
+pub fn spawn_sibling_thread_for_test(
+    target: &Cap<ProcessIdentity>,
+) -> Result<Cap<ThreadIdentity>, ZoneError> {
+    let sibling = sign_thread(target.downgrade())?;
+    if let Some(payload) = target.payload.lock().as_ref() {
+        payload.threads.lock().push(sibling.clone());
+    }
+    Ok(sibling)
+}
+
 fn drop_member(pgrp: &Cap<ProcessGroup>, target: &Cap<ProcessIdentity>) {
     let target_key = target.key();
     pgrp.members.lock().retain(|weak| {
@@ -1048,5 +1091,446 @@ impl<T: 'static> WeakObserveExt<T> for tx_substrate::zone::Weak<T> {
     {
         let guard = tx_substrate::epoch::guard();
         self.observe(&guard).map(f)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR-2 StepOp wraps
+// ---------------------------------------------------------------------------
+//
+// Additive `impl StepOp` adapters per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1.
+// Each wrap stores its inputs (Cap by value — Cap is Clone+Send+Sync;
+// scalars/Copy by value; `&T` under a single lifetime `'a`) and delegates
+// `step()` to the corresponding free fn above. Synchronous free fns whose
+// return type is not already a `StepOutcome` are lifted via
+// `StepOutcome::Done(...)` (or `StepOutcome::Err(_)` when the free fn
+// returns a `Result<_, E>` that maps onto `StepOutcome::Err`).
+//
+// The free fns remain the source of truth; callers can migrate to the
+// `*Op` types incrementally.
+
+/// `StepOp` wrap of [`step_fork`]. The pmap generic `P: PmapIf` is
+/// carried as a `PhantomData` so the wrap type fixes the platform at
+/// construction time without runtime cost.
+///
+/// `Output = Result<Cap<ProcessIdentity>, ForkError>` — the rich error
+/// type is preserved inside `StepOutcome::Done` so callers can match on
+/// `Vm` / `Zone` variants without an Errno crush.
+pub struct ForkOp<'a, P: PmapIf> {
+    pub parent: &'a Cap<ProcessIdentity>,
+    pub _pmap: core::marker::PhantomData<P>,
+}
+
+impl<'a, P: PmapIf, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for ForkOp<'a, P>
+{
+    type Output = Result<Cap<ProcessIdentity>, ForkError>;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_fork::<P>(self.parent))
+    }
+}
+
+/// `StepOp` wrap of [`step_exit_group`].
+pub struct ExitGroupOp<'a> {
+    pub process: &'a Cap<ProcessIdentity>,
+    pub status: ExitStatus,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for ExitGroupOp<'a>
+{
+    type Output = ();
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_exit_group(self.process, self.status);
+        tx_substrate::step_v3::StepOutcome::Done(())
+    }
+}
+
+/// `StepOp` wrap of [`step_exit_group_with_signal`].
+pub struct ExitGroupWithSignalOp<'a> {
+    pub process: &'a Cap<ProcessIdentity>,
+    pub sig: crate::signal::Signum,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for ExitGroupWithSignalOp<'a>
+{
+    type Output = ();
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_exit_group_with_signal(self.process, self.sig);
+        tx_substrate::step_v3::StepOutcome::Done(())
+    }
+}
+
+/// `StepOp` wrap of [`step_waitpid_nohang`]. Returns the result type
+/// `Result<(Pid, ExitStatus), WaitError>` via `StepOutcome::Done` so
+/// callers can inspect both the success tuple and WNOHANG-empty signal.
+pub struct WaitpidNohangOp<'a> {
+    pub parent: &'a Cap<ProcessIdentity>,
+    pub target: WaitTarget,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for WaitpidNohangOp<'a>
+{
+    type Output = Result<(Pid, ExitStatus), WaitError>;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_waitpid_nohang(self.parent, self.target))
+    }
+}
+
+/// `StepOp` wrap of [`step_chdir`].
+pub struct ChdirOp<'a> {
+    pub target: &'a Cap<ProcessIdentity>,
+    pub new_cwd: Cap<crate::vfs::DEntry>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for ChdirOp<'a>
+{
+    type Output = ChdirOutcome;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_chdir(self.target, self.new_cwd.clone()))
+    }
+}
+
+/// `StepOp` wrap of [`step_getcwd`].
+pub struct GetcwdOp<'a> {
+    pub target: &'a Cap<ProcessIdentity>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for GetcwdOp<'a>
+{
+    type Output = Option<alloc::vec::Vec<u8>>;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_getcwd(self.target))
+    }
+}
+
+/// `StepOp` wrap of [`step_setpgid`].
+pub struct SetpgidOp<'a> {
+    pub target: &'a Cap<ProcessIdentity>,
+    pub new_pgid: Pgid,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for SetpgidOp<'a>
+{
+    type Output = Result<(), SetpgidError>;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_setpgid(self.target, self.new_pgid))
+    }
+}
+
+/// `StepOp` wrap of [`step_setsid`].
+pub struct SetsidOp<'a> {
+    pub target: &'a Cap<ProcessIdentity>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for SetsidOp<'a>
+{
+    type Output = Result<Sid, SetsidError>;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_setsid(self.target))
+    }
+}
+
+/// `StepOp` wrap of [`step_close_cloexec_fds`].
+pub struct CloseCloexecFdsOp<'a> {
+    pub process: &'a Cap<ProcessIdentity>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for CloseCloexecFdsOp<'a>
+{
+    type Output = ();
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_close_cloexec_fds(self.process);
+        tx_substrate::step_v3::StepOutcome::Done(())
+    }
+}
+
+/// `StepOp` wrap of [`step_reset_signal_dispositions_for_exec`].
+pub struct ResetSignalDispositionsForExecOp<'a> {
+    pub process: &'a Cap<ProcessIdentity>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for ResetSignalDispositionsForExecOp<'a>
+{
+    type Output = ();
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_reset_signal_dispositions_for_exec(self.process);
+        tx_substrate::step_v3::StepOutcome::Done(())
+    }
+}
+
+/// `StepOp` wrap of [`step_install_brk_for_exec`].
+pub struct InstallBrkForExecOp<'a> {
+    pub process: &'a Cap<ProcessIdentity>,
+    pub new_brk_base: u64,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for InstallBrkForExecOp<'a>
+{
+    type Output = ();
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_install_brk_for_exec(self.process, self.new_brk_base);
+        tx_substrate::step_v3::StepOutcome::Done(())
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    //! PR-2 StepOp wrap tests (process::execution scope).
+    //!
+    //! Each test exercises one `*Op` wrap end-to-end: build the op with
+    //! a fixture, drive `.step(&mut ScriptCtx)`, assert the outcome
+    //! variant shape. Coverage of the underlying step-fn semantics
+    //! lives in `process::tests`; the value here is the compile-check
+    //! plus a smoke that the wrap delegates with the expected arg
+    //! plumbing.
+    use super::*;
+    use crate::process::structure::reset_pid_counter_for_test;
+    use crate::signal::Signum;
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::thread_runtime::structure::reset_tid_counter_for_test;
+    use crate::vm::{AddressSpace, TestPmap};
+    use crate::zones;
+    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome};
+    use tx_substrate::testing::init_host_for_test_once;
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        init_host_for_test_once();
+        let _ = zones::register_all();
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        reset_pid_counter_for_test();
+        reset_tid_counter_for_test();
+        reset_init_process_for_test();
+        guard
+    }
+
+    fn fresh_aspace() -> Cap<AddressSpace> {
+        AddressSpace::new_cap_for_platform::<TestPmap>().expect("fresh aspace")
+    }
+
+    fn bootstrap() -> Cap<ProcessIdentity> {
+        bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
+    }
+
+    #[test]
+    fn fork_op_delegates_to_step_fork() {
+        let _g = setup();
+        let parent = bootstrap();
+        let mut op = ForkOp::<TestPmap> {
+            parent: &parent,
+            _pmap: core::marker::PhantomData,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(result) => {
+                let child = result.expect("step_fork should succeed");
+                assert_ne!(child.pid, parent.pid);
+            }
+            _ => panic!("expected Done(_), got non-Done outcome"),
+        }
+    }
+
+    #[test]
+    fn exit_group_op_delegates_to_step_exit_group() {
+        let _g = setup();
+        let parent = bootstrap();
+        let child = step_fork::<TestPmap>(&parent).expect("fork");
+        let mut op = ExitGroupOp {
+            process: &child,
+            status: ExitStatus::Exited(0),
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        assert_eq!(outcome, StepOutcome::Done(()));
+        assert!(child.is_zombie());
+        assert_eq!(child.exit_status(), Some(ExitStatus::Exited(0)));
+    }
+
+    #[test]
+    fn exit_group_with_signal_op_delegates_to_step_exit_group_with_signal() {
+        let _g = setup();
+        let parent = bootstrap();
+        let child = step_fork::<TestPmap>(&parent).expect("fork");
+        let mut op = ExitGroupWithSignalOp {
+            process: &child,
+            sig: Signum::SIGKILL,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        assert_eq!(outcome, StepOutcome::Done(()));
+        assert!(child.is_zombie());
+        assert_eq!(
+            child.exit_status(),
+            Some(ExitStatus::Signaled(Signum::SIGKILL))
+        );
+    }
+
+    #[test]
+    fn waitpid_nohang_op_no_children_returns_echild() {
+        let _g = setup();
+        let parent = bootstrap();
+        let mut op = WaitpidNohangOp {
+            parent: &parent,
+            target: WaitTarget::Any,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(Err(WaitError::NoChildren)) => {}
+            other => panic!("expected Done(Err(NoChildren)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn getcwd_op_returns_none_for_init_without_cwd() {
+        let _g = setup();
+        let parent = bootstrap();
+        let mut op = GetcwdOp { target: &parent };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        // init bootstrap leaves cwd unset, so step_getcwd returns None.
+        assert_eq!(outcome, StepOutcome::Done(None));
+    }
+
+    #[test]
+    fn setpgid_op_unimplemented_for_non_self_pgid() {
+        let _g = setup();
+        let parent = bootstrap();
+        // Day-1 only supports new_pgid == target.pid; anything else
+        // returns SetpgidError::Unimplemented. Use a value that is
+        // not the target's pid to exercise that arm deterministically.
+        let bogus = Pgid(parent.pid.0 + 999);
+        let mut op = SetpgidOp {
+            target: &parent,
+            new_pgid: bogus,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(Err(SetpgidError::Unimplemented)) => {}
+            other => panic!("expected Done(Err(Unimplemented)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setsid_op_delegates_to_step_setsid() {
+        let _g = setup();
+        let parent = bootstrap();
+        let child = step_fork::<TestPmap>(&parent).expect("fork");
+        let mut op = SetsidOp { target: &child };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(Ok(sid)) => {
+                assert_eq!(sid.0, child.pid.0);
+            }
+            other => panic!("expected Done(Ok(sid)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_cloexec_fds_op_is_noop_with_empty_set() {
+        let _g = setup();
+        let parent = bootstrap();
+        let mut op = CloseCloexecFdsOp { process: &parent };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        assert_eq!(outcome, StepOutcome::Done(()));
+        // Bootstrap leaves the CLOEXEC set empty; post-call it stays empty.
+        assert!(parent.fd_cloexec_snapshot().is_empty());
+    }
+
+    #[test]
+    fn reset_signal_dispositions_for_exec_op_runs_on_live_process() {
+        let _g = setup();
+        let parent = bootstrap();
+        let mut op = ResetSignalDispositionsForExecOp { process: &parent };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        assert_eq!(outcome, StepOutcome::Done(()));
+    }
+
+    #[test]
+    fn install_brk_for_exec_op_seeds_brk_base_and_current() {
+        let _g = setup();
+        let parent = bootstrap();
+        let new_base: u64 = 0x4000_0000;
+        let mut op = InstallBrkForExecOp {
+            process: &parent,
+            new_brk_base: new_base,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        assert_eq!(outcome, StepOutcome::Done(()));
+        let payload_guard = parent.payload.lock();
+        let payload = payload_guard.as_ref().expect("init payload live");
+        assert_eq!(
+            payload
+                .brk_base
+                .load(core::sync::atomic::Ordering::Acquire),
+            new_base
+        );
+        assert_eq!(
+            payload
+                .current_brk
+                .load(core::sync::atomic::Ordering::Acquire),
+            new_base
+        );
     }
 }
