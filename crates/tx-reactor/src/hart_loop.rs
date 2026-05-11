@@ -2,6 +2,21 @@
 //!
 //! This module is the dispatch seam for stepping a hart's reactor work without
 //! owning HAL WFI, interrupt acknowledgement, or userspace trap return.
+//!
+//! ## PR-7B integration point: DelegateTimeout fires
+//!
+//! `tx-substrate`'s `DelegateRegistry` and the `TimerWheel` now live
+//! in the same crate (per D6 the wheel moved down to
+//! `tx_substrate::wake::timer`; the reactor re-exports it through
+//! [`crate::timer::TimerWheel`] for back-compat). The reactor-side
+//! glue that routes a fired `DelegateTimeout` timer to
+//! `registry.mark_timed_out(...)` lives on the wheel itself, in
+//! [`crate::timer::TimerWheel::fire_due_delegate_timeouts`]. The
+//! hart-loop tick handler is the natural caller — drive it after
+//! [`HartLoopRuntime::advance_hart_loop_time`] returns. PR-8B (the
+//! wheel-mechanics PR) folds this into the wheel's primary fire path;
+//! until then the call is explicit so tests and any future caller
+//! can exercise the routing without rearchitecting the loop.
 
 use crate::{
     dispatch::{RescheduleSignal, WakeDispatchReport},
@@ -222,5 +237,197 @@ impl HartLoopRuntime for Reactor {
 
     fn hart_loop_next_deadline_ns(&self) -> Option<u64> {
         self.next_deadline_ns()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StepOp wraps (PR-2 cleanup)
+// ---------------------------------------------------------------------------
+//
+// Reactor-internal step fns. There is no epoch `Guard` argument here —
+// these step the hart loop entirely inside the reactor and do not cross
+// into substrate-protected payload storage. The `&mut` arguments are
+// stored by mutable reference; `StepOp::step` is a single call.
+
+/// `StepOp` wrap of [`step_hart_loop`].
+pub struct HartLoopOp<'a, R, C, S>
+where
+    R: HartLoopRuntime,
+    C: HartLoopClock,
+    S: RescheduleSignal,
+{
+    pub runtime: &'a mut R,
+    pub hart: HartId,
+    pub clock: &'a mut C,
+    pub signal: &'a mut S,
+}
+
+impl<'a, R, C, S, I> tx_substrate::step_v3::StepOp<I> for HartLoopOp<'a, R, C, S>
+where
+    R: HartLoopRuntime,
+    C: HartLoopClock,
+    S: RescheduleSignal,
+    I: tx_substrate::step_v3::SubjectIdentity,
+{
+    type Output = HartLoopStep;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_hart_loop(
+            self.runtime,
+            self.hart,
+            self.clock,
+            self.signal,
+        ))
+    }
+}
+
+/// `StepOp` wrap of [`step_hart_loop_at`].
+pub struct HartLoopAtOp<'a, R, S>
+where
+    R: HartLoopRuntime,
+    S: RescheduleSignal,
+{
+    pub runtime: &'a mut R,
+    pub hart: HartId,
+    pub now_ns: u64,
+    pub signal: &'a mut S,
+}
+
+impl<'a, R, S, I> tx_substrate::step_v3::StepOp<I> for HartLoopAtOp<'a, R, S>
+where
+    R: HartLoopRuntime,
+    S: RescheduleSignal,
+    I: tx_substrate::step_v3::SubjectIdentity,
+{
+    type Output = HartLoopStep;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_hart_loop_at(
+            self.runtime,
+            self.hart,
+            self.now_ns,
+            self.signal,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    //! PR-2 cleanup `StepOp` wrap smoke tests for `hart_loop`.
+    //!
+    //! Each test builds the `*Op` adapter, drives it with `.step(&mut ctx)`,
+    //! and pins the `StepOutcome::Done(HartLoopStep)` shape. Semantics
+    //! coverage lives in the integration tests under
+    //! `tests/hart_loop.rs`.
+    use super::*;
+    use crate::dispatch::NoopRescheduleSignal;
+    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+
+    #[derive(Debug)]
+    struct FakeHartRuntime {
+        timer_wakes: usize,
+        wake_dispatch: WakeDispatchReport,
+        markers: PreemptMarkers,
+        stats: RunStats,
+        next_deadline_ns: Option<u64>,
+        advanced_to: Option<u64>,
+    }
+
+    impl Default for FakeHartRuntime {
+        fn default() -> Self {
+            Self {
+                timer_wakes: 0,
+                wake_dispatch: WakeDispatchReport::empty(),
+                markers: PreemptMarkers::empty(),
+                stats: RunStats::empty(),
+                next_deadline_ns: None,
+                advanced_to: None,
+            }
+        }
+    }
+
+    impl HartLoopRuntime for FakeHartRuntime {
+        fn advance_hart_loop_time(&mut self, now_ns: u64) -> usize {
+            self.advanced_to = Some(now_ns);
+            self.timer_wakes
+        }
+
+        fn drain_hart_loop_wakes<S>(
+            &mut self,
+            _current_hart: HartId,
+            _signal: &mut S,
+        ) -> WakeDispatchReport
+        where
+            S: RescheduleSignal,
+        {
+            self.wake_dispatch
+        }
+
+        fn consume_hart_loop_markers(&mut self, _hart: HartId) -> PreemptMarkers {
+            self.markers
+        }
+
+        fn run_hart_loop_ready<S>(&mut self, _hart: HartId, _signal: &mut S) -> RunStats
+        where
+            S: RescheduleSignal,
+        {
+            self.stats
+        }
+
+        fn hart_loop_next_deadline_ns(&self) -> Option<u64> {
+            self.next_deadline_ns
+        }
+    }
+
+    #[test]
+    fn hart_loop_at_op_delegates_to_step_hart_loop_at() {
+        let mut runtime = FakeHartRuntime::default();
+        let mut signal = NoopRescheduleSignal::new();
+        let mut op = HartLoopAtOp {
+            runtime: &mut runtime,
+            hart: HartId(0),
+            now_ns: 100,
+            signal: &mut signal,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            V3::Done(step) => {
+                assert_eq!(step.hart, HartId(0));
+                assert_eq!(step.now_ns, 100);
+                assert!(step.should_idle());
+            }
+            other => panic!("expected Done(_), got {other:?}"),
+        }
+        assert_eq!(runtime.advanced_to, Some(100));
+    }
+
+    #[test]
+    fn hart_loop_op_delegates_to_step_hart_loop_via_clock() {
+        let mut runtime = FakeHartRuntime::default();
+        let mut signal = NoopRescheduleSignal::new();
+        let mut clock = || 400u64;
+        let mut op = HartLoopOp {
+            runtime: &mut runtime,
+            hart: HartId(1),
+            clock: &mut clock,
+            signal: &mut signal,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            V3::Done(step) => {
+                assert_eq!(step.now_ns, 400);
+                assert_eq!(step.hart, HartId(1));
+            }
+            other => panic!("expected Done(_), got {other:?}"),
+        }
+        assert_eq!(runtime.advanced_to, Some(400));
     }
 }

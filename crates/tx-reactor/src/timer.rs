@@ -1,4 +1,18 @@
 //! Host-drivable timer queue used by reactor wait timeouts.
+//!
+//! The PR-8 public timer surface (`TimerWheel`, `TimerGuard`,
+//! `TimerToken`, `TimerGuardRole`) moved down to
+//! [`tx_substrate::wake::timer`] per
+//! [`docs/progress/decisions/2026-05-11-d6-timerwheel-layering.md`].
+//! The re-export at the bottom of this module preserves the
+//! existing `tx_reactor::timer::*` and `crate::timer::*` paths
+//! (including the `pub use` in `crate::lib.rs`).
+//!
+//! What remains here is the **internal `TimerQueue`** that drives
+//! the reactor's built-in `WaitProtocol::*Timeout` paths. It owns
+//! the actual `Waker`s, is advanced by the host clock callback,
+//! and is unrelated to the public wheel — the two were always
+//! decoupled (D6 §2.2). PR-7+ may eventually consolidate them.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{
@@ -9,6 +23,15 @@ use core::{
 
 use crate::spin_lock::SpinLock;
 use crate::wait::WaitOutcome;
+
+// Re-export the relocated public surface so `tx_reactor::timer::*`
+// and `crate::timer::*` paths continue to resolve.
+pub use tx_substrate::wake::timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
+
+// =========================================================================
+// Internal: TimerQueue (unchanged; backs existing reactor
+// `WaitProtocol::*Timeout` paths and `tests/timer_idle.rs`).
+// =========================================================================
 
 #[derive(Clone)]
 pub(crate) struct TimerQueue {
@@ -22,18 +45,22 @@ struct TimerQueueState {
 }
 
 struct TimerWaiter {
-    token: TimerToken,
+    token: InternalTimerToken,
     deadline_ns: u64,
     waker: Waker,
 }
 
+/// Internal queue-local token kept private to the `TimerQueue` impl
+/// below. The public [`TimerToken`] (re-exported above from
+/// `tx_substrate::wake::timer`) is a separate type so we don't
+/// confuse the two roles (queue waiter id vs. wheel registration id).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TimerToken(usize);
+struct InternalTimerToken(usize);
 
 pub(crate) struct DeadlineFuture {
     timers: TimerQueue,
     deadline_ns: u64,
-    token: Option<TimerToken>,
+    token: Option<InternalTimerToken>,
 }
 
 impl TimerQueue {
@@ -87,7 +114,7 @@ impl TimerQueue {
         }
     }
 
-    fn unregister(&self, token: TimerToken) {
+    fn unregister(&self, token: InternalTimerToken) {
         let mut state = self.state.lock();
         if let Some(index) = state.timers.iter().position(|waiter| waiter.token == token) {
             state.timers.swap_remove(index);
@@ -120,7 +147,7 @@ impl Future for DeadlineFuture {
                 }
             }
             None => {
-                let token = TimerToken(state.next_timer);
+                let token = InternalTimerToken(state.next_timer);
                 state.next_timer = state.next_timer.wrapping_add(1);
                 state.timers.push(TimerWaiter {
                     token,
