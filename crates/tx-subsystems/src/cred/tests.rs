@@ -46,8 +46,13 @@ fn cred_of(proc_cap: &Cap<ProcessIdentity>) -> Cred {
 }
 
 fn set_cred(proc_cap: &Cap<ProcessIdentity>, cred: Cred) {
+    // PR-9 phase 5 (D5 Path A): `cred` now lives in
+    // `AtomicSlot<Cap<Cred>>`; tests mint a fresh `Cap<Cred>` and
+    // atomic-swap into the slot. The previous cap drops here.
     let payload_guard = proc_cap.payload.lock();
-    *payload_guard.as_ref().expect("alive").cred.lock() = cred;
+    let payload = payload_guard.as_ref().expect("alive");
+    let new_cap = crate::cred::sign_cred(cred).expect("zone slab has capacity in tests");
+    let _old = payload.replace_cred(new_cap);
 }
 
 #[test]
