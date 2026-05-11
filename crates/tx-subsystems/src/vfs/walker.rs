@@ -129,6 +129,19 @@ pub const SYMLOOP_MAX: u32 = 40;
 /// and propagated `FsOps` errors. Resolution goes through the
 /// `FsOps` trait surface and emits `StepOutcome<Cap<DEntry>,
 /// NoProgress>`.
+///
+/// **WALKER-CARVEOUT-1** (per
+/// [`docs/progress/decisions/2026-05-11-d3-walker-async-carveout.md`](../../../../../../docs/progress/decisions/2026-05-11-d3-walker-async-carveout.md)):
+/// `step_walk` and [`step_open`] are **script-level async resolvers**,
+/// not `StepOp` implementations. PR-2 explicitly skipped wrapping them.
+/// They must still obey the same external yield safety rules:
+/// - no `epoch::Guard` across `.await`
+/// - no witness across `.await`
+/// - no reservation guard across `.await`
+/// - resume revalidates path state
+///
+/// A future dedicated VFS PR may introduce a `PathResolveOp` state
+/// machine; that work is out of scope for v3 foundation.
 pub async fn step_walk<'g>(
     rooted_at: Cap<DEntry>,
     path: &[u8],

@@ -8,9 +8,17 @@
 //! pure observation helpers belong here.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use tx_reactor::wait::Channel;
+use tx_substrate::step_v3::WaitSourceId;
+use tx_substrate::wake::WaitSource;
+
+use crate::aio::AioContext;
+use crate::io_uring::IoUring;
 use crate::cred::{CapabilitySet, Cred};
+use crate::signalfd::SignalFd;
 use crate::device::{BlockDeviceRegistration, CharDeviceBinding};
 use crate::execution::Errno;
 use crate::mount::{MountIdentity, MountPayload};
@@ -19,9 +27,28 @@ use crate::process::{ProcessGroup, ProcessIdentity};
 use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::TtyIdentity;
 use crate::tty::structure::{Termios, Winsize};
+use crate::userfaultfd::UserfaultFd;
+use crate::wait_source;
 use tx_substrate::zone::{self, Cap, Weak, Zone, ZoneAllocated, ZoneError};
 
 pub const VFS_NAME_MAX: usize = 255;
+
+/// Per-RNode wait-source interest mask: bytes are available to read.
+///
+/// PR-3D-5: VFS lands the per-inode read/write wait-source primitive
+/// in the same shape pipe/tty/exit_source use: one `Arc<WaitSource>`
+/// per direction per inode, sharing the legacy `wait_source` registry
+/// `u64` namespace with a paired reactor `Channel`. The bit lives on
+/// VFS rather than on a backing because the wake-publication shape is
+/// VFS-uniform (every inode has read/write semantics with the same
+/// blocking-IO contract); per-backing helpers (`pipe`, `tty`, future
+/// `socket`) layer their own bit allocations on top of this shape if
+/// they need them.
+pub const VFS_READABLE: u64 = 0x1;
+
+/// Per-RNode wait-source interest mask: space is available to write.
+/// See [`VFS_READABLE`] for the namespace + lifecycle convention.
+pub const VFS_WRITABLE: u64 = 0x2;
 
 // === zone statics =====================================================
 
@@ -455,21 +482,76 @@ pub enum StructPayload {
 
 // === live-node entities ===============================================
 
-#[derive(Debug)]
 pub struct RNode {
     fs_object_id: FsObjectId,
     meta: InodeMeta,
     backing: RNodeBacking,
     containing_mount: Option<Weak<MountPayload>>,
+    /// Legacy reactor wait channel paired with [`Self::read_wait_source`].
+    /// Fires on every per-inode "newly readable" transition. PR-3D-5
+    /// (D2/D4 coexistence): callers landing v3 blocking-IO step bodies
+    /// against a regular-file / future-socket RNode park on the matching
+    /// `WaitToken` via [`crate::wait_source::wait_on_token`] resolved
+    /// through [`Self::read_wait_source_id`]; the parallel
+    /// `WaitSource` path is fired on the same transition so v3 callers
+    /// holding a `TaskMailbox` see the same wake.
+    ///
+    /// Today no in-tree fire site exists for non-pipe/non-tty backings
+    /// (pipe + tty manage their own wait channels on the backing
+    /// payload); this slot is the durable wake-publication endpoint for
+    /// future page-backed-blocking, socket, and `inotify` wires per
+    /// the per-inode unbounded-count flag W-M raised. The Drop impl
+    /// releases the registry slot when the inode retires (EBR), so the
+    /// large-N inode-create-destroy stress path does not leak registry
+    /// rows.
+    read_wait_channel: Channel,
+    /// Legacy registry carrier id for [`Self::read_wait_channel`].
+    /// Shares the `u64` namespace with [`Self::read_wait_source`]'s
+    /// `WaitSourceId` so a v3 caller's `YieldShape::OnWaitSource
+    /// { source: WaitSourceId(id), .. }` resolves to this same slot.
+    read_wait_source_id: u64,
+    /// PR-3D-5 (D2/D4 coexistence). Per-inode `WaitSource` for the new
+    /// mailbox-based wake path, fired in parallel with
+    /// [`Self::read_wait_channel`] on every "newly readable" transition.
+    /// Shape mirrors `Cap<RNode>`'s EBR semantics — the source is held
+    /// by `Arc<WaitSource>` on the RNode, so subscribers cloning the
+    /// strong ref retain it across the wait window independent of inode
+    /// retirement; once the inode drops, the registry slot is released
+    /// (see `Drop for RNode`) and no further notifies arrive.
+    read_wait_source: Arc<WaitSource>,
+    /// Companion to [`Self::read_wait_channel`] for the writable
+    /// direction. Fires on every "newly writable" transition (space
+    /// available in a future socket / page-backed-blocking ring,
+    /// reader-closed-EPIPE on a future socket reset path, etc.).
+    write_wait_channel: Channel,
+    /// Companion to [`Self::read_wait_source_id`] for the writable
+    /// direction.
+    write_wait_source_id: u64,
+    /// Companion to [`Self::read_wait_source`] for the writable
+    /// direction.
+    write_wait_source: Arc<WaitSource>,
 }
 
 impl RNode {
     pub fn new(fs_object_id: FsObjectId, meta: InodeMeta, backing: RNodeBacking) -> Self {
+        let read_wait_channel = Channel::new();
+        let read_wait_source_id = wait_source::register_wait_channel(read_wait_channel.clone());
+        let read_wait_source = Arc::new(WaitSource::new(WaitSourceId::new(read_wait_source_id)));
+        let write_wait_channel = Channel::new();
+        let write_wait_source_id = wait_source::register_wait_channel(write_wait_channel.clone());
+        let write_wait_source =
+            Arc::new(WaitSource::new(WaitSourceId::new(write_wait_source_id)));
         Self {
             fs_object_id,
             meta,
             backing,
             containing_mount: None,
+            read_wait_channel,
+            read_wait_source_id,
+            read_wait_source,
+            write_wait_channel,
+            write_wait_source_id,
+            write_wait_source,
         }
     }
 
@@ -513,6 +595,121 @@ impl RNode {
     /// hint at mount-publication time).
     pub fn containing_mount_weak(&self) -> Option<Weak<MountPayload>> {
         self.containing_mount
+    }
+
+    /// Legacy reactor `Channel` paired with [`Self::read_wait_source`].
+    /// Production callers fire this and the new `WaitSource` in tandem
+    /// from the per-inode "newly readable" transition site (see module
+    /// docs); v3 callers awaiting via
+    /// [`crate::wait_source::wait_on_token`] resolve the carrier id from
+    /// [`Self::read_wait_source_id`].
+    pub fn read_wait_channel(&self) -> &Channel {
+        &self.read_wait_channel
+    }
+
+    /// Legacy registry carrier id for [`Self::read_wait_channel`].
+    /// Shares the same `u64` with [`Self::read_wait_source`]'s
+    /// `WaitSourceId` so a v3 caller's `YieldShape::OnWaitSource
+    /// { source: WaitSourceId(id), .. }` resolves to this same slot.
+    pub fn read_wait_source_id(&self) -> u64 {
+        self.read_wait_source_id
+    }
+
+    /// PR-3D-5: per-inode `WaitSource` for the new mailbox-based wake
+    /// path. Returned as `&Arc<WaitSource>` so callers can clone the
+    /// strong ref and hold the source alive across the wait window via
+    /// `WaitSource::prepare(..).install_if(..)` independent of the
+    /// inode's EBR retirement. `WaitSource::id()` matches
+    /// [`Self::read_wait_source_id`].
+    pub fn read_wait_source(&self) -> &Arc<WaitSource> {
+        &self.read_wait_source
+    }
+
+    /// Companion to [`Self::read_wait_channel`] for the writable
+    /// direction.
+    pub fn write_wait_channel(&self) -> &Channel {
+        &self.write_wait_channel
+    }
+
+    /// Companion to [`Self::read_wait_source_id`] for the writable
+    /// direction.
+    pub fn write_wait_source_id(&self) -> u64 {
+        self.write_wait_source_id
+    }
+
+    /// Companion to [`Self::read_wait_source`] for the writable
+    /// direction.
+    pub fn write_wait_source(&self) -> &Arc<WaitSource> {
+        &self.write_wait_source
+    }
+
+    /// Fire the per-inode read wake path on both the legacy `Channel`
+    /// and the new `WaitSource` (PR-3D-5 D2/D4 coexistence). Pass the
+    /// interest bits the transition signals — today that is
+    /// [`VFS_READABLE`] for the single-bit "bytes available" semantic;
+    /// future per-backing wires (e.g. socket urgent-data, future
+    /// `inotify`) may carry additional bits on the same source.
+    ///
+    /// Returns the number of legacy `Channel` awaiters released by
+    /// [`Channel::fire`]. The `WaitSource::notify` count is intentionally
+    /// not surfaced — production callers don't branch on it, and the
+    /// dual-fire happens unconditionally under the same call (so
+    /// either both paths fire or neither does, matching the
+    /// exit_source / tty templates).
+    pub fn fire_read_wait(&self, mask: u64) -> usize {
+        let released = self
+            .read_wait_channel
+            .fire(tx_reactor::wait::Mask::from_bits(mask));
+        self.read_wait_source
+            .notify(tx_substrate::step_v3::InterestMask::new(mask));
+        released
+    }
+
+    /// Companion to [`Self::fire_read_wait`] for the writable direction.
+    pub fn fire_write_wait(&self, mask: u64) -> usize {
+        let released = self
+            .write_wait_channel
+            .fire(tx_reactor::wait::Mask::from_bits(mask));
+        self.write_wait_source
+            .notify(tx_substrate::step_v3::InterestMask::new(mask));
+        released
+    }
+}
+
+/// PR-3D-5: release the per-inode wait-source registry slots when the
+/// inode retires. EBR semantics on `Cap<RNode>` defer the drop until
+/// concurrent readers' guards complete, so the registry release
+/// happens after every observer has unparked. Symmetric with
+/// `Drop for PipePayload` and `Drop for TtyIdentity` (the latter
+/// releases via the identity-side carrier on payload teardown — for
+/// RNode the carrier lives on the identity itself, so `Drop for
+/// RNode` is the natural site). Without this drop, the
+/// large-N inode-create-destroy stress path would leak two registry
+/// rows per inode.
+impl Drop for RNode {
+    fn drop(&mut self) {
+        wait_source::release_wait_channel(self.read_wait_source_id);
+        wait_source::release_wait_channel(self.write_wait_source_id);
+    }
+}
+
+// PR-3D-5: `Channel` and `WaitSource` are not `Debug`, so the previous
+// `#[derive(Debug)]` on `RNode` cannot survive after the wait-source
+// fields land. The manual impl below preserves the previously-derived
+// shape (one entry per kept field) and elides the wake-publication
+// internals (which would be noisy and carry no value for debug
+// output — observers care about the inode identity / metadata, not
+// the registered subscriber list).
+impl core::fmt::Debug for RNode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RNode")
+            .field("fs_object_id", &self.fs_object_id)
+            .field("meta", &self.meta)
+            .field("backing", &self.backing)
+            .field("containing_mount", &self.containing_mount)
+            .field("read_wait_source_id", &self.read_wait_source_id)
+            .field("write_wait_source_id", &self.write_wait_source_id)
+            .finish()
     }
 }
 
@@ -627,6 +824,79 @@ pub fn render_dentry_path(dentry: &Cap<DEntry>) -> Option<alloc::vec::Vec<u8>> {
     Some(out)
 }
 
+/// Tag for the non-VFS `OpenFile` shapes. PR-10 phase 0 (D7 §3.7)
+/// introduces the first non-RNode variant — `Ufd` — so a
+/// `userfaultfd(2)` fd can live in the same `BTreeMap<u32, Cap<OpenFile>>`
+/// fd table as every other open file. Phase 0 keeps the existing
+/// RNode-backed shape as the default; later passes (e.g. pipe
+/// migration, `memfd_create`) may move pipes / anon fds into their
+/// own variants too.
+///
+/// Construction APIs:
+/// - `OpenFile::new(rnode, flags)` / `OpenFile::new_cap` — VFS-backed,
+///   always builds `OpenFileBacking::Rnode { rnode }`. Every existing
+///   call site keeps working unchanged.
+/// - `OpenFile::new_userfaultfd(ufd, flags)` /
+///   `OpenFile::new_userfaultfd_cap` — userfaultfd-backed.
+///
+/// The legacy `pub fn rnode(&self) -> &Cap<RNode>` accessor still
+/// resolves the inner cap for the `Rnode` shape and **panics** for
+/// `Ufd`. Callers that may handle either kind discriminate via
+/// [`OpenFile::backing`] / [`OpenFile::ufd`] first.
+#[derive(Debug)]
+pub enum OpenFileBacking {
+    /// VFS-rooted open file. Every existing in-tree path uses this
+    /// variant: regular files, directories, TTYs, char/block devices,
+    /// pipes, symlinks (the symlink target is just bytes on the
+    /// RNode).
+    Rnode { rnode: Cap<RNode> },
+    /// `userfaultfd(2)` open file (PR-10 phase 0). The cap is the
+    /// substrate-side endpoint identity later phases use to install
+    /// page-fault delegation requests; see
+    /// `docs/progress/decisions/2026-05-11-d7-pr-10-userfaultfd-plan.md`.
+    /// Drop semantics: when the last `Cap<OpenFile>` for a ufd is
+    /// released and EBR retires this slot, the inner `Cap<UserfaultFd>`
+    /// drops too and (in later phases) `Drop for UserfaultFd` will
+    /// drive `DelegateRegistry::mark_endpoint_died`.
+    Ufd { ufd: Cap<UserfaultFd> },
+    /// `io_setup(2)` open file (PR-11 phase 1). The cap is the
+    /// substrate-side `AioContext` identity later phases use to route
+    /// iocb submissions and completion events; see
+    /// `docs/progress/decisions/2026-05-11-d8-pr-11-aio-plan.md` §4.1
+    /// for the fd-shape decision (we normalize `aio_context_t` to a
+    /// real fd, diverging from Linux's pointer-shaped opaque value).
+    /// Drop semantics: when the last `Cap<OpenFile>` for an AIO
+    /// context is released and EBR retires this slot, the inner
+    /// `Cap<AioContext>` drops too — in later phases the
+    /// `Drop for AioContext` impl will fire the worker's
+    /// `exit_source` so the `with_on_behalf_of` borrow body observes
+    /// `Killed` and the worker task aborts.
+    AioContext { ctx: Cap<AioContext> },
+    /// `signalfd(2)` open file (D9-D). The cap is the substrate-side
+    /// per-fd signal subscription identity; signal posts to the owning
+    /// process route through the per-process subscription registry in
+    /// [`crate::signalfd`] and fan out to every matching cap *after*
+    /// the existing thread-eligibility post.
+    /// Drop semantics: when the last `Cap<OpenFile>` for a signalfd is
+    /// released and EBR retires this slot, the inner `Cap<SignalFd>`
+    /// drops too — `Drop for SignalFd` removes the subscription entry
+    /// from the per-process registry so future
+    /// `step_kill_process` calls no longer route to it.
+    SignalFd { sfd: Cap<SignalFd> },
+    /// `io_uring_setup(2)` open file (future PR-12 phase 0 — second
+    /// `OnBehalfOf<P>` canary). The cap is the substrate-side
+    /// `IoUring` identity later phases use to route SQE submissions
+    /// and completion events; see
+    /// `docs/Txv3/06_EXECUTION_SCOPE_v1.md` §8.1 (SQPOLL design).
+    /// Drop semantics: when the last `Cap<OpenFile>` for a uring fd
+    /// is released and EBR retires this slot, the inner
+    /// `Cap<IoUring>` drops too — `Drop for IoUring` trips the SQPOLL
+    /// kthread's `worker_abort` signal so the `with_on_behalf_of`
+    /// borrow body observes the cooperative-cancel reason and the
+    /// kthread aborts.
+    IoUring { ring: Cap<IoUring> },
+}
+
 /// Per-fd file-position carrier.
 ///
 /// fd-ops Wave 4 made `offset` interior-mutable (`AtomicU64`) so
@@ -635,9 +905,17 @@ pub fn render_dentry_path(dentry: &Cap<DEntry>) -> Option<alloc::vec::Vec<u8>> {
 /// matches Linux's "shared file description across `dup`/`fork` →
 /// shared offset" semantic without bolting an extra lock onto every
 /// fd-table read.
+///
+/// **PR-10 phase 0:** the backing field replaces the historical
+/// `rnode: Cap<RNode>` direct field, gated through the
+/// [`OpenFileBacking`] enum. The VFS-shaped accessor
+/// [`Self::rnode`] still returns `&Cap<RNode>` for backwards
+/// compatibility with existing call sites; it panics if the file
+/// happens to be a `userfaultfd(2)` (a state no VFS-aware caller can
+/// reach today).
 #[derive(Debug)]
 pub struct OpenFile {
-    pub(crate) rnode: Cap<RNode>,
+    pub(crate) backing: OpenFileBacking,
     offset: AtomicU64,
     /// Per-fd readdir cursor. Slice 6 of the shell-prompt roadmap
     /// added this so `getdents64(2)` can resume across calls without
@@ -657,7 +935,7 @@ pub struct OpenFile {
 impl OpenFile {
     pub fn new(rnode: Cap<RNode>, flags: OpenFileFlags) -> Self {
         Self {
-            rnode,
+            backing: OpenFileBacking::Rnode { rnode },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             flags,
@@ -669,8 +947,212 @@ impl OpenFile {
         Ok(zone::sign_for(reservation, Self::new(rnode, flags)))
     }
 
+    /// Construct a userfaultfd-backed `OpenFile` (PR-10 phase 0). The
+    /// resulting value carries `OpenFileBacking::Ufd { ufd }` and no
+    /// `Cap<RNode>` — userfaultfd is a non-VFS fd kind (see D7 §3.7).
+    /// Existing VFS-only paths (`step_read` / `step_write` /
+    /// `step_lseek` / etc.) must not be called against this shape;
+    /// callers branch via [`Self::backing`] / [`Self::ufd`].
+    pub fn new_userfaultfd(ufd: Cap<UserfaultFd>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::Ufd { ufd },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            flags,
+        }
+    }
+
+    /// Zone-sign a fresh userfaultfd-backed `OpenFile`. The
+    /// counterpart to [`Self::new_cap`] for the ufd shape (PR-10
+    /// phase 0).
+    pub fn new_userfaultfd_cap(
+        ufd: Cap<UserfaultFd>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        let reservation = zone::reserve_for::<Self>()?;
+        Ok(zone::sign_for(reservation, Self::new_userfaultfd(ufd, flags)))
+    }
+
+    /// Construct an AIO-context-backed `OpenFile` (PR-11 phase 1). The
+    /// resulting value carries `OpenFileBacking::AioContext { ctx }`
+    /// and no `Cap<RNode>` — AIO contexts are a non-VFS fd kind
+    /// (joining ufd in the OpenFileBacking enum, see D8 §4.1).
+    /// Existing VFS-only paths (`step_read` / `step_write` /
+    /// `step_lseek` / etc.) must not be called against this shape;
+    /// callers branch via [`Self::backing`] / [`Self::aio_context`].
+    pub fn new_aio_context(ctx: Cap<AioContext>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::AioContext { ctx },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            flags,
+        }
+    }
+
+    /// Zone-sign a fresh AIO-context-backed `OpenFile`. The
+    /// counterpart to [`Self::new_cap`] for the AIO shape (PR-11
+    /// phase 1).
+    pub fn new_aio_context_cap(
+        ctx: Cap<AioContext>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        let reservation = zone::reserve_for::<Self>()?;
+        Ok(zone::sign_for(
+            reservation,
+            Self::new_aio_context(ctx, flags),
+        ))
+    }
+
+    /// Construct a signalfd-backed `OpenFile` (D9-D). The resulting
+    /// value carries `OpenFileBacking::SignalFd { sfd }` and no
+    /// `Cap<RNode>` — signalfds are a non-VFS fd kind (joining ufd
+    /// and AIO in the OpenFileBacking enum, see D9 §6).
+    pub fn new_signalfd(sfd: Cap<SignalFd>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::SignalFd { sfd },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            flags,
+        }
+    }
+
+    /// Zone-sign a fresh signalfd-backed `OpenFile` (D9-D).
+    pub fn new_signalfd_cap(
+        sfd: Cap<SignalFd>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        let reservation = zone::reserve_for::<Self>()?;
+        Ok(zone::sign_for(reservation, Self::new_signalfd(sfd, flags)))
+    }
+
+    /// Construct an io_uring-backed `OpenFile` (future PR-12 phase 0 —
+    /// second `OnBehalfOf<P>` canary). The resulting value carries
+    /// `OpenFileBacking::IoUring { ring }` and no `Cap<RNode>` —
+    /// io_uring rings are a non-VFS fd kind (joining ufd, AIO, and
+    /// signalfd in the OpenFileBacking enum). Callers branch via
+    /// [`Self::backing`] / [`Self::io_uring`].
+    pub fn new_io_uring(ring: Cap<IoUring>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::IoUring { ring },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            flags,
+        }
+    }
+
+    /// Zone-sign a fresh io_uring-backed `OpenFile`.
+    pub fn new_io_uring_cap(
+        ring: Cap<IoUring>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        let reservation = zone::reserve_for::<Self>()?;
+        Ok(zone::sign_for(reservation, Self::new_io_uring(ring, flags)))
+    }
+
+    /// Snapshot the backing shape. Callers that may handle either an
+    /// RNode-backed or a ufd-backed OpenFile discriminate via this
+    /// accessor; the legacy [`Self::rnode`] accessor stays valid for
+    /// the dominant VFS path.
+    pub fn backing(&self) -> &OpenFileBacking {
+        &self.backing
+    }
+
+    /// VFS-shaped accessor — returns the inner `Cap<RNode>` for an
+    /// `OpenFileBacking::Rnode` shape.
+    ///
+    /// # Panics
+    ///
+    /// Panics for `OpenFileBacking::Ufd`. Userfaultfd fds are
+    /// non-VFS; callers reachable from a VFS path cannot encounter
+    /// this state today (no in-tree code installs a ufd on an
+    /// otherwise-VFS dispatch path). New code that may handle either
+    /// shape should branch on [`Self::backing`] first.
     pub fn rnode(&self) -> &Cap<RNode> {
-        &self.rnode
+        match &self.backing {
+            OpenFileBacking::Rnode { rnode } => rnode,
+            OpenFileBacking::Ufd { .. } => panic!(
+                "OpenFile::rnode() called on a userfaultfd-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::ufd() first",
+            ),
+            OpenFileBacking::AioContext { .. } => panic!(
+                "OpenFile::rnode() called on an AIO-context-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::aio_context() first",
+            ),
+            OpenFileBacking::SignalFd { .. } => panic!(
+                "OpenFile::rnode() called on a signalfd-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::signalfd() first",
+            ),
+            OpenFileBacking::IoUring { .. } => panic!(
+                "OpenFile::rnode() called on an io_uring-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::io_uring() first",
+            ),
+        }
+    }
+
+    /// `Some(&Cap<UserfaultFd>)` iff this `OpenFile` is the
+    /// userfaultfd-backed shape (PR-10 phase 0). Returns `None` for
+    /// every VFS-backed `OpenFile`. The future `sys_close` /
+    /// `ioctl(UFFDIO_*)` paths branch on this — phase 0 only
+    /// exposes it for the fd-table scaffold tests to verify the
+    /// install/retrieve round-trip preserves the inner cap identity.
+    pub fn ufd(&self) -> Option<&Cap<UserfaultFd>> {
+        match &self.backing {
+            OpenFileBacking::Ufd { ufd } => Some(ufd),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::IoUring { .. } => None,
+        }
+    }
+
+    /// `Some(&Cap<AioContext>)` iff this `OpenFile` is the
+    /// AIO-context-backed shape (PR-11 phase 1). Returns `None` for
+    /// every non-AIO `OpenFile`. The future `sys_io_submit` /
+    /// `sys_io_getevents` / `sys_io_destroy` paths branch on this —
+    /// phase 1 only exposes it for the fd-table scaffold tests to
+    /// verify the install/retrieve round-trip preserves the inner cap
+    /// identity.
+    pub fn aio_context(&self) -> Option<&Cap<AioContext>> {
+        match &self.backing {
+            OpenFileBacking::AioContext { ctx } => Some(ctx),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::IoUring { .. } => None,
+        }
+    }
+
+    /// `Some(&Cap<SignalFd>)` iff this `OpenFile` is the signalfd-backed
+    /// shape (D9-D). Returns `None` for every non-signalfd `OpenFile`.
+    /// The `sys_read(2)` arm branches on this to dispatch into
+    /// `signalfd::signalfd_read`; future paths
+    /// (`sys_signalfd4(fd, ...)` mask-update) consult this accessor as
+    /// well.
+    pub fn signalfd(&self) -> Option<&Cap<SignalFd>> {
+        match &self.backing {
+            OpenFileBacking::SignalFd { sfd } => Some(sfd),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::IoUring { .. } => None,
+        }
+    }
+
+    /// `Some(&Cap<IoUring>)` iff this `OpenFile` is the io_uring-backed
+    /// shape (future PR-12 phase 0 — second `OnBehalfOf<P>` canary).
+    /// Returns `None` for every non-uring `OpenFile`. The future
+    /// `sys_io_uring_enter` / `sys_io_uring_destroy` paths branch on
+    /// this — scaffold phase only exposes it for the fd-table tests to
+    /// verify the install/retrieve round-trip preserves the inner cap
+    /// identity.
+    pub fn io_uring(&self) -> Option<&Cap<IoUring>> {
+        match &self.backing {
+            OpenFileBacking::IoUring { ring } => Some(ring),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. } => None,
+        }
     }
 
     /// Load the current per-fd offset.
@@ -754,13 +1236,20 @@ impl OpenFile {
 /// `decr_*` helpers.
 impl Drop for OpenFile {
     fn drop(&mut self) {
-        if let RNodeBacking::StructBacked {
-            payload: StructPayload::Pipe { payload, side },
-        } = self.rnode.backing()
-        {
-            match side {
-                crate::pipe::PipeSide::Reader => payload.decr_reader(),
-                crate::pipe::PipeSide::Writer => payload.decr_writer(),
+        // PR-10 phase 0: only the RNode-backed shape carries the
+        // pipe lifecycle hook. Userfaultfd-backed OpenFiles have no
+        // per-side ref count to decrement — their inner
+        // `Cap<UserfaultFd>` drops via the normal `OpenFileBacking::Ufd`
+        // field drop and EBR reclamation of the ufd zone slot follows.
+        if let OpenFileBacking::Rnode { rnode } = &self.backing {
+            if let RNodeBacking::StructBacked {
+                payload: StructPayload::Pipe { payload, side },
+            } = rnode.backing()
+            {
+                match side {
+                    crate::pipe::PipeSide::Reader => payload.decr_reader(),
+                    crate::pipe::PipeSide::Writer => payload.decr_writer(),
+                }
             }
         }
     }
