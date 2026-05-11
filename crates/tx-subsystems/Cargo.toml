@@ -25,3 +25,9 @@ tx-substrate = { path = "../tx-substrate" }
 
 [dev-dependencies]
 tx-ext4-format = { path = "../tx-ext4-format" }
+# Self-dep with `test-support` enabled so integration tests in
+# `tests/` can reach the `_for_test` helpers gated behind
+# `feature = "test-support"` (D9-B's eligibility-scan pins and
+# D9-C's interrupt-wake pin both need multi-thread setup via
+# `process::execution::spawn_sibling_thread_for_test`).
+tx-subsystems = { path = ".", features = ["test-support"] }

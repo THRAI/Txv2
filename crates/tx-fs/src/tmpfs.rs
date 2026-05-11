@@ -173,7 +173,7 @@ impl Default for Tmpfs {
 // * `FsPageBacking::fetch_page` calls `PageContainer::materialize_page`;
 //   we translate `AdvancedThenBlocked` to `done(frame)` (dropping the
 //   wait token, since the materialised PPN is observable now), and
-//   `Blocked` to `yield_on_carrier`.
+//   `Blocked` to `yield_on_wait_source`.
 // * `FsPageBacking::truncate` uses `step_truncate`, which in turn
 //   calls `FsPageBacking::truncate` recursively for File-kind containers
 //   only. tmpfs containers are `PageContainerKind::Anon`, so no
@@ -871,7 +871,7 @@ impl FsPageBacking for Tmpfs {
         // - `Continue { .. }` (NoProgress) → `err(EAGAIN)` —
         //   conservative collapse; tmpfs page allocation rarely emits
         //   this.
-        // - `Yield { OnCarrier { c, i } }` → `yield_on_carrier(NoProgress, c, i)`.
+        // - `Yield { OnWaitSource { c, i } }` → `yield_on_wait_source(NoProgress, c, i)`.
         // - `Yield { OnAgent .. }` → `err(EIO)`.
         // - `Err(e)` → `err(e)`.
         use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
@@ -879,13 +879,17 @@ impl FsPageBacking for Tmpfs {
             V3::Done(materialized) => V3::done(Frame::new(materialized.ppn)),
             V3::Continue { .. } => V3::err(tx_substrate::step_v3::Errno::EAGAIN),
             V3::Yield {
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape: YieldShape::OnWaitSource { source: carrier, interests },
                 ..
-            } => V3::yield_on_carrier(
+            } => V3::yield_on_wait_source(
                 tx_substrate::step_v3::NoProgress,
                 carrier.raw(),
                 interests.raw(),
             ),
+            V3::Yield {
+                shape: YieldShape::OnTimer { .. },
+                ..
+            } => unreachable!("tmpfs page-backing does not produce OnTimer yields"),
             V3::Yield { .. } => V3::err(tx_substrate::step_v3::Errno::EIO),
             V3::Err(errno) => V3::err(errno),
         }

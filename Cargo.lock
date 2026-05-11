@@ -506,6 +506,7 @@ dependencies = [
  "tx-hal",
  "tx-reactor",
  "tx-substrate",
+ "tx-subsystems",
 ]
 
 [[package]]
