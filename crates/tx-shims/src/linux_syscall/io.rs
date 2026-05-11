@@ -141,7 +141,7 @@ pub(super) async fn sys_readv<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// - Interactive `sh` calls `ppoll([{fd=0, events=POLLIN}], 1,
 ///   NULL, NULL)` and then `read(0, ...)`. Our stub says
 ///   "ready"; busybox calls `read`; our `sys_read` blocks on the
-///   TTY wait carrier until UART RX delivers bytes. End-to-end
+///   TTY wait source until UART RX delivers bytes. End-to-end
 ///   semantics match Linux.
 ///
 /// - For polls with `nfds > 1`, every fd appears ready; busybox
@@ -228,14 +228,32 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // `vm::execution::fault_script`. Each iteration takes a fresh
     // `tx_substrate::epoch::guard()` inside the step's call site so
     // the guard never crosses an `.await`.
-    use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
+    //
+    // PR-9 phase 3b: drive `OpenFile::step_write` via the
+    // `OpenFileWriteOp` StepOp wrap, threading a `&mut KernelScriptCtx`.
+    //
+    // PR-9 phase 5 (D5 Path A): populate `SubjectContext` from
+    // `SyscallCtx`. The subject identifies the calling process+thread
+    // and carries the `Cap<Cred>` snapshot loaded at syscall entry —
+    // SUBJ-1 hygiene per `docs/Txv3/04_SYSCALL_SHAPE_v1.md` §2.
+    // Restrictions cap is a fresh placeholder
+    // (`tx_subsystems::cred::placeholder_restrictions_cap`) until PR-K
+    // lands the real append-only stack (D5 §7).
+    use tx_substrate::step_v3::{StepOp, StepOutcome as V3Out, YieldShape};
     use tx_subsystems::execution::WaitToken;
+    use tx_subsystems::vfs::execution::OpenFileWriteOp;
+    let mut script_ctx = build_subject_script_ctx(ctx);
     let mut total: usize = 0;
     let mut remaining = bytes.as_slice();
     loop {
         let outcome = {
             let guard = tx_substrate::epoch::guard();
-            file.step_write(remaining, &guard)
+            let mut op = OpenFileWriteOp {
+                file: &file,
+                bytes: remaining,
+                guard: &guard,
+            };
+            op.step(&mut script_ctx)
         };
         match outcome {
             V3Out::Done(written) => {
@@ -253,7 +271,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             }
             V3Out::Yield {
                 progress,
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape: YieldShape::OnWaitSource { source: carrier, interests },
             } => {
                 let written = progress.bytes();
                 if written > 0 {
@@ -263,7 +281,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     }
                     remaining = &remaining[written..];
                     let token = WaitToken::new(carrier.raw(), interests.raw());
-                    if let Some(future) = wait_carrier::wait_on_token(token) {
+                    if let Some(future) = wait_source::wait_on_token(token) {
                         let _ = future.await;
                     }
                     // Otherwise the carrier has been retired or is a test
@@ -271,13 +289,22 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 } else {
                     // No progress made yet; await the carrier and retry.
                     let token = WaitToken::new(carrier.raw(), interests.raw());
-                    if let Some(future) = wait_carrier::wait_on_token(token) {
+                    if let Some(future) = wait_source::wait_on_token(token) {
                         let _ = future.await;
                     }
                 }
             }
             V3Out::Yield {
                 shape: YieldShape::OnAgent { .. },
+                ..
+            } => {
+                if total > 0 {
+                    return SyscallResult::Return(total as i64);
+                }
+                return SyscallResult::Error(errno_to_i32(Errno::EIO));
+            }
+            V3Out::Yield {
+                shape: YieldShape::OnTimer { .. },
                 ..
             } => {
                 if total > 0 {
@@ -316,7 +343,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// **Blocking semantic.** Pre-ELF Phase 5 (item 9) wires the UART RX
 /// path so a blocked `read(0, ...)` actually parks until bytes arrive:
 /// `tty::execution::step_read` returns `Blocked(token)` on an empty
-/// input queue, the dispatcher awaits `wait_carrier::wait_on_token`,
+/// input queue, the dispatcher awaits `wait_source::wait_on_token`,
 /// and `tx_kernel::irq::uart_rx_irq_handler` drives
 /// `tty::execution::step_ingest` from the IRQ side, which fires the
 /// TTY's wait `Channel`. On any partial progress (`total > 0`)
@@ -343,20 +370,54 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         return SyscallResult::Return(0);
     }
 
+    // PR-10 phase 5: userfaultfd fds carry their own `read(2)` arm
+    // (drain a fault message off the pending queue, serialize 32-byte
+    // `struct uffd_msg`). The VFS-shaped `OpenFile::step_read` returns
+    // EINVAL for ufd backings, so dispatch here before the generic
+    // path.
+    if file.ufd().is_some() {
+        return super::userfaultfd::step_ufd_read(&file, args[1], len, ctx).await;
+    }
+    // D9-D: signalfd fds carry their own `read(2)` arm (drain one
+    // 128-byte `struct signalfd_siginfo` off the per-fd pending
+    // queue). The VFS-shaped `OpenFile::rnode()` panics for the
+    // signalfd backing, so this dispatch must run *before* any
+    // generic VFS path.
+    if file.signalfd().is_some() {
+        return super::signalfd::step_signalfd_read(&file, args[1], len, ctx).await;
+    }
+
     // Read into a kernel-side staging buffer, then copy out through
     // the canonical user-VA lane (`bootstrap_copy_to_user` bridges
     // via `aspace.copy_to_user`, falling back to the kernel-pointer
     // dance the trio's earlier exemption used).
     let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
 
-    use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
+    // PR-9 phase 3b: drive `OpenFile::step_read` via the
+    // `OpenFileReadOp` StepOp wrap, threading a `&mut KernelScriptCtx`.
+    //
+    // PR-9 phase 5 (D5 Path A): populate `SubjectContext` from
+    // `SyscallCtx`. The subject identifies the calling process+thread
+    // and carries the `Cap<Cred>` snapshot loaded at syscall entry —
+    // SUBJ-1 hygiene per `docs/Txv3/04_SYSCALL_SHAPE_v1.md` §2.
+    // Restrictions cap is a fresh placeholder
+    // (`tx_subsystems::cred::placeholder_restrictions_cap`) until PR-K
+    // lands the real append-only stack (D5 §7).
+    use tx_substrate::step_v3::{StepOp, StepOutcome as V3Out, YieldShape};
     use tx_subsystems::execution::WaitToken;
+    use tx_subsystems::vfs::execution::OpenFileReadOp;
+    let mut script_ctx = build_subject_script_ctx(ctx);
     let mut total: usize = 0;
     let mut cursor: usize = 0;
     loop {
         let outcome = {
             let guard = tx_substrate::epoch::guard();
-            file.step_read(&mut staging[cursor..], &guard)
+            let mut op = OpenFileReadOp {
+                file: &file,
+                out: &mut staging[cursor..],
+                guard: &guard,
+            };
+            op.step(&mut script_ctx)
         };
         match outcome {
             V3Out::Done(read) => {
@@ -398,7 +459,7 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             }
             V3Out::Yield {
                 progress,
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape: YieldShape::OnWaitSource { source: carrier, interests },
             } => {
                 let read = progress.bytes();
                 if read > 0 {
@@ -439,12 +500,21 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                     return SyscallResult::Return(total as i64);
                 }
                 let token = WaitToken::new(carrier.raw(), interests.raw());
-                if let Some(future) = wait_carrier::wait_on_token(token) {
+                if let Some(future) = wait_source::wait_on_token(token) {
                     let _ = future.await;
                 }
             }
             V3Out::Yield {
                 shape: YieldShape::OnAgent { .. },
+                ..
+            } => {
+                if total > 0 {
+                    return SyscallResult::Return(total as i64);
+                }
+                return SyscallResult::Error(errno_to_i32(Errno::EIO));
+            }
+            V3Out::Yield {
+                shape: YieldShape::OnTimer { .. },
                 ..
             } => {
                 if total > 0 {

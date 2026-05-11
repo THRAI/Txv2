@@ -54,7 +54,7 @@ use tx_subsystems::cred::{
 };
 use tx_subsystems::execution::Errno;
 use tx_subsystems::process::{
-    process_by_pid, seed_child_leader_context, step_chdir, step_exit_group, step_fork, step_getcwd,
+    process_by_pid, seed_child_leader_context, step_chdir, step_exit_group, step_getcwd,
     step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome, ExitStatus, Pgid, Pid,
     ProcessIdentity, SetpgidError, SetsidError, WaitError, WaitTarget,
 };
@@ -79,7 +79,7 @@ use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
     VmEntryFlags, VmMapError, VmMapRequest, VmRemapRequest, USER_PAGE_SIZE,
 };
-use tx_subsystems::wait_carrier;
+use tx_subsystems::wait_source;
 
 pub mod numbers;
 
@@ -103,6 +103,14 @@ mod proc;
 use proc::*;
 mod misc;
 use misc::*;
+mod userfaultfd;
+use userfaultfd::*;
+pub mod aio;
+use aio::*;
+pub mod io_uring;
+use io_uring::*;
+mod signalfd;
+use signalfd::*;
 
 #[cfg(test)]
 mod tests;
@@ -123,13 +131,16 @@ pub use numbers::{
     NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHDIR, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL,
     NR_FSTAT, NR_FTRUNCATE, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID,
     NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID, NR_GETRESUID,
-    NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_KILL, NR_LINKAT, NR_LSEEK, NR_MADVISE,
+    NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP,
+    NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL, NR_LINKAT, NR_LSEEK, NR_MADVISE,
     NR_MKDIRAT, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
     NR_OPENAT, NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RENAMEAT2,
     NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGRETURN, NR_SETGID, NR_SETPGID, NR_SETREGID,
     NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
-    NR_SET_TID_ADDRESS, NR_SYMLINKAT, NR_TGKILL, NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_UMASK,
-    NR_UNAME, NR_UNLINKAT, NR_UTIMENSAT, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND,
+    NR_SET_TID_ADDRESS, NR_SIGNALFD, NR_SIGNALFD4, NR_SYMLINKAT, NR_TGKILL, NR_TIMES, NR_TKILL,
+    NR_TRUNCATE, NR_UMASK,
+    NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE,
+    O_APPEND,
     O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
     PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ, PROT_WRITE, RENAME_EXCHANGE,
     RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA,
@@ -231,10 +242,10 @@ pub(super) const EACCES_VALUE: i32 = 13;
 /// Wave 3 slice's projection-only contract).
 pub(super) const EROFS_VALUE: i32 = 30;
 /// Linux generic ABI errno value for "I/O error" (`EIO`). Used as the
-/// fall-through magnitude for `StepOutcome::Blocked` /
-/// `AdvancedThenBlocked` shapes the file-mode arms cannot produce
-/// today (chmod/chown/access never block in tmpfs/devfs); matches
-/// `errno_to_i32`'s `Errno::EIO` row.
+/// fall-through magnitude for `StepOutcome::Yield { shape:
+/// YieldShape::OnWaitSource { .. } }` shapes the file-mode arms
+/// cannot produce today (chmod/chown/access never block in
+/// tmpfs/devfs); matches `errno_to_i32`'s `Errno::EIO` row.
 pub(super) const EIO_VALUE: i32 = 5;
 /// Required sigsetsize per Linux RV64 generic ABI: 8 bytes (a single
 /// `u64` bitset matching `tx_subsystems::signal::SignalMask`'s
@@ -312,11 +323,14 @@ impl<'a> SyscallCtx<'a> {
     /// Snapshot the current process's full credential.
     ///
     /// Returns a fresh [`Cred`] value (`Copy`); the payload's
-    /// `SpinMutex<Cred>` is acquired once and released before return,
-    /// so the snapshot is independent of the lock and safe to hold
-    /// across `.await` points. Holding a reference into the lock
-    /// would be unsound — `step_setuid` / `step_setresuid` etc. can
-    /// mutate the cred while a syscall arm is `.await`-ing.
+    /// `AtomicSlot<Cap<Cred>>` is loaded once (PR-9 phase 5 / D5 Path
+    /// A — was `SpinMutex<Cred>`), the resulting cap is derefed to
+    /// `&Cred`, and the value is copied out; the cap clone drops
+    /// before return, so the snapshot is independent of the slot and
+    /// safe to hold across `.await` points. Holding a reference
+    /// through the cap would still be sound (the cap retain-count
+    /// keeps the slab entry live), but callers that need the
+    /// long-lived cap shape should use [`Self::cred_cap`] instead.
     ///
     /// Falls back to [`Cred::root`] for zombies (impossible in
     /// practice from inside a live syscall arm — the caller is by
@@ -344,6 +358,59 @@ impl<'a> SyscallCtx<'a> {
     pub fn walker_cred(&self) -> Credential {
         Credential::from(&self.cred())
     }
+
+    /// Snapshot the current process's `Cap<Cred>`. Returns a cloned
+    /// strong cap; the slab entry stays live until the cap drops.
+    ///
+    /// PR-9 phase 5 (D5 Path A): the cred-mutators
+    /// (`step_setuid` / `step_setgid` / ...) replace the slot's
+    /// inhabitant per call; this accessor reads whichever cap is
+    /// current. Concurrent mutators between this read and the
+    /// `SubjectContext` construction yield a cap pointing at the
+    /// pre-mutation cred — the syscall arm sees a coherent snapshot
+    /// for the duration of its script frame.
+    ///
+    /// Defensive fallback: zombies have no payload, so no cred-cap.
+    /// In that case we mint a fresh `Cap<Cred>` from `Cred::root()`.
+    /// Reaching this fallback inside a live syscall is impossible by
+    /// construction (the calling process is by definition alive).
+    pub fn cred_cap(&self) -> Cap<Cred> {
+        self.process.cred_cap().unwrap_or_else(|| {
+            tx_subsystems::cred::sign_cred(Cred::root())
+                .expect("zone slab has capacity for defensive root cred")
+        })
+    }
+}
+
+/// PR-9 phase 5 (D5 Path A) — build a `KernelScriptCtx` whose subject
+/// is populated from `SyscallCtx`. The four wired arms (sys_read,
+/// sys_write, sys_pipe2, sys_clone) call this at script entry so the
+/// step body receives `ctx.subject()` rather than `None`.
+///
+/// Restrictions cap is a fresh placeholder per call until PR-K lands
+/// the real append-only stack (D5 §7). Each call mints one
+/// `Cap<RestrictionStackHandle>` from the substrate placeholder zone;
+/// the cap drops at script-frame exit (EBR retires the slab).
+///
+/// **Failure mode**: zone-slab exhaustion mints a defensive
+/// placeholder cap from `Cred::root()` and panics on
+/// restrictions-cap failure (the placeholder zone is sized for one
+/// cap per concurrent syscall — exhaustion is a kernel-wide pressure
+/// event PR-K will revisit). Production callers should not hit this
+/// path; for now the conservative-panic matches today's
+/// `expect("zone slab has capacity")` discipline elsewhere in this
+/// module.
+pub fn build_subject_script_ctx(ctx: &SyscallCtx<'_>) -> crate::KernelScriptCtx {
+    let cred_cap = ctx.cred_cap();
+    let restrictions_cap = tx_subsystems::cred::placeholder_restrictions_cap()
+        .expect("placeholder restrictions zone has capacity per syscall entry");
+    let authority = crate::KernelSubjectAuthority::new(cred_cap, restrictions_cap);
+    let subject = crate::KernelSubjectContext::from_thread(
+        ctx.process.clone(),
+        ctx.thread.clone(),
+        authority,
+    );
+    crate::KernelScriptCtx::new().with_subject(subject)
 }
 
 /// Outcome of a syscall dispatch.
@@ -382,9 +449,9 @@ pub enum SyscallResult {
 ///
 /// This is the single entry point that maps a `SyscallRequest` to a
 /// concrete `step_*` call. The function is `async` because some arms
-/// (notably `NR_WRITE`) loop on `StepOutcome::Blocked` and `.await`
-/// the wait-carrier release per
-/// `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`. The four currently
+/// (notably `NR_WRITE`) loop on `StepOutcome::Yield { shape:
+/// YieldShape::OnWaitSource { .. } }` and `.await` the wait-source
+/// release per `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`. The four currently
 /// implemented arms return synchronously today; the `async` shape
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
@@ -583,6 +650,75 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_READLINKAT => sys_readlinkat(req.args, ctx).await,
         nr if nr == NR_UTIMENSAT => sys_utimensat(req.args, ctx),
         nr if nr == NR_RENAMEAT2 => sys_renameat2(req.args, ctx).await,
+        // PR-10 phase 2 — `userfaultfd(2)` scaffold. Mints a fresh
+        // `Cap<UserfaultFd>` (W-Q phase 0 zone), wraps in an
+        // `OpenFile` with `OpenFileBacking::Ufd`, installs in the fd
+        // table, returns the fd. The companion `UFFDIO_API` ioctl
+        // handshake is dispatched from `sys_ioctl` when the resolved
+        // fd carries an `OpenFileBacking::Ufd` (see
+        // `super::userfaultfd::step_uffdio_api`). Later phases
+        // (P-10.3 / .4 / .5) land `UFFDIO_REGISTER` / fault
+        // interception / reply ioctls.
+        nr if nr == NR_USERFAULTFD => sys_userfaultfd(req.args[0] as u32, ctx),
+        // PR-11 phase 1 — `io_setup(2)` scaffold. Mints a fresh
+        // `Cap<AioContext>` (W-Z phase 1 zone), wraps in an
+        // `OpenFile` with `OpenFileBacking::AioContext`, installs in
+        // the fd table, returns the fd. Diverges from Linux which
+        // writes a pointer-shape into the `aio_context_t *`
+        // out-parameter; per D8 §4.1 we return a real fd and
+        // userspace bridges. Phases 2–4 land `io_submit` (worker +
+        // `with_on_behalf_of` borrow), `io_getevents`, and
+        // `io_destroy`.
+        nr if nr == NR_IO_SETUP => sys_io_setup(req.args[0] as u32, req.args[1], ctx),
+        // PR-11 phase 2 — `io_submit(2)` dispatch. Resolves the AIO
+        // fd, copies each iocb in, validates + pushes onto the
+        // context's submit queue, and returns the count admitted.
+        // The per-context worker future is the one
+        // `sys_io_setup` spawned + stashed for phase 2's deferred-
+        // pump model.
+        nr if nr == NR_IO_SUBMIT => sys_io_submit(req.args, ctx),
+        // PR-11 phase 4 — `io_getevents(2)` dispatch. Drains up to
+        // `nr` completions from the AIO context's completion queue;
+        // blocks on the `events_available` carrier until `min_nr` is
+        // satisfied when `timeout == NULL`. Serialises each drained
+        // event into a 32-byte `struct io_event` and writes through
+        // P's address space.
+        nr if nr == NR_IO_GETEVENTS => sys_io_getevents(req.args, ctx).await,
+        // PR-11 phase 5 — `io_destroy(2)` dispatch. Trips the
+        // worker's abort signal (cooperative cancel), drops the
+        // worker future, removes the fd-table entry. Mirrors
+        // `sys_close(2)` on the AIO fd plus the worker teardown.
+        nr if nr == NR_IO_DESTROY => sys_io_destroy(req.args[0] as u32, ctx),
+        // Future PR-12 phase 0 — `io_uring_setup(2)` scaffold (second
+        // `OnBehalfOf<P>` canary). Mints a fresh `Cap<IoUring>`
+        // (W-LL phase 0 zone), wraps in an `OpenFile` with
+        // `OpenFileBacking::IoUring`, spawns the SQPOLL kthread via
+        // `with_on_behalf_of`, installs the fd, returns the fd.
+        // Diverges from Linux which writes ring offsets into
+        // `*params`; per the scaffold scope the in-kernel `VecDeque`
+        // ring doesn't yet need user-mmaps. Phase 1 will land the
+        // user-mmapped ring + real SQE dispatch.
+        nr if nr == NR_IO_URING_SETUP => {
+            sys_io_uring_setup(req.args[0] as u32, req.args[1], ctx)
+        }
+        // Future PR-12 phase 1 — `io_uring_enter(2)` dispatch. SQPOLL
+        // by definition does not need this for SQE submission (the
+        // kthread polls); deferred to the future PR that handles
+        // non-SQPOLL setups + the user-mmapped ring path.
+        nr if nr == NR_IO_URING_ENTER => SyscallResult::Error(ENOSYS_VALUE),
+        // D9-D — `signalfd4(fd, &mask, sizemask, flags)` dispatch.
+        // `fd == -1` mints a fresh signalfd cap and installs it at
+        // the lowest free fd; `fd >= 0` updates the mask on an
+        // existing signalfd. Returns the fd. The companion
+        // signalfd-shaped read(2) arm lives in sys_read after the
+        // ufd discriminator.
+        nr if nr == NR_SIGNALFD4 => sys_signalfd4(
+            req.args[0] as i32,
+            req.args[1],
+            req.args[2],
+            req.args[3] as u32,
+            ctx,
+        ),
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -1008,10 +1144,10 @@ pub(super) const ERANGE_VALUE: i32 = 34;
 //
 // `nanosleep` / `clock_nanosleep` ship the zero-duration / past-
 // deadline short-circuit only. Real-duration sleeps need a per-task
-// timer-fire wait carrier (i.e. a Channel attached to the reactor's
+// timer-fire wait source (i.e. a Channel attached to the reactor's
 // TimerQueue, fired when `step_hart_loop_at`'s `advance_time_to` walks
 // past the parked deadline). That wiring requires either exposing
-// `Reactor::channel()` through `wait_carrier` (a tx-kernel ↔
+// `Reactor::channel()` through `wait_source` (a tx-kernel ↔
 // tx-subsystems plumbing change, since the BSP reactor lives in
 // tx-kernel) or adding a global timer queue to tx-subsystems and
 // driving it from the BSP loop. Both are out of scope for Slice 4 —
