@@ -19,5 +19,5 @@ pub use execution::{
 };
 pub use structure::{
     allocate_pid, ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,
-    Sid, EXIT_PORT_CHILD_ZOMBIFIED,
+    Sid, EXIT_SOURCE_CHILD_ZOMBIFIED,
 };
