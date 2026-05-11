@@ -26,6 +26,7 @@ pub mod slab;
 pub mod slot;
 pub mod step_v3;
 pub mod sync;
+pub mod wake;
 pub mod zone;
 
 pub use slot::AtomicSlot;
