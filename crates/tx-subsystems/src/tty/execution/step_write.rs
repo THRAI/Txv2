@@ -99,7 +99,7 @@ fn kick_transport(
                 }
                 V3Out::Yield {
                     progress,
-                    shape: YieldShape::OnCarrier { carrier, interests },
+                    shape: YieldShape::OnWaitSource { source: carrier, interests },
                 } => {
                     let written = progress.bytes();
                     if written < chunk.len() {
@@ -112,9 +112,9 @@ fn kick_transport(
                         // Pure block: restore the chunk so a later kick
                         // can try again.
                         restore_front(tty, &payload, &chunk);
-                        V3Out::yield_on_carrier(ByteProgress::EMPTY, carrier.raw(), interests.raw())
+                        V3Out::yield_on_wait_source(ByteProgress::EMPTY, carrier.raw(), interests.raw())
                     } else {
-                        V3Out::yield_on_carrier(
+                        V3Out::yield_on_wait_source(
                             ByteProgress::new(written.min(chunk.len())),
                             carrier.raw(),
                             interests.raw(),
@@ -136,9 +136,9 @@ fn kick_transport(
             V3Out::Done(_) | V3Out::Continue { .. } => V3Out::Done(chunk.len()),
             V3Out::Err(e) => V3Out::Err(e),
             V3Out::Yield {
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape: YieldShape::OnWaitSource { source: carrier, interests },
                 ..
-            } => V3Out::yield_on_carrier(
+            } => V3Out::yield_on_wait_source(
                 ByteProgress::new(chunk.len()),
                 carrier.raw(),
                 interests.raw(),
@@ -178,13 +178,13 @@ fn restore_front(
 // - empty bytes → `Done(0)` (pre-progress short-circuit)
 // - require_fg_pgrp / require_live_tty err → `Err(e.into())`
 // - process_output consumed nothing → `Yield { progress:
-//   ByteProgress::EMPTY, shape: OnCarrier { tty.raw(), TTY_WRITABLE } }`
+//   ByteProgress::EMPTY, shape: OnWaitSource { tty.raw(), TTY_WRITABLE } }`
 //   (no progress, no bytes-driven yield — the level wire is the
 //   carrier)
 // - kick_transport Err → `Err(e.into())` (consumed bytes are left in
 //   the output queue's restore-front state)
 // - kick_transport Blocked / AdvancedThenBlocked → `Yield {
-//   progress: ByteProgress::new(consumed), shape: OnCarrier {
+//   progress: ByteProgress::new(consumed), shape: OnWaitSource {
 //   wait.carrier, wait.interest } }` — load-bearing: any
 //   `Advanced(consumed)` collapses into the byte-progress accumulator
 //   that travels through the yield, per STEP-1's monoid composition.
@@ -205,11 +205,11 @@ fn restore_front(
 /// - empty bytes → `Done(0)`
 /// - foreground/liveness check fails → `Err(e.into())`
 /// - line discipline produced no output (queue full upstream) →
-///   `Yield { progress: ByteProgress::EMPTY, shape: OnCarrier { tty.raw(),
+///   `Yield { progress: ByteProgress::EMPTY, shape: OnWaitSource { tty.raw(),
 ///   TTY_WRITABLE } }`
 /// - transport kick fails → `Err(e.into())`
 /// - transport kick blocks (or advances-then-blocks) →
-///   `Yield { progress: ByteProgress::new(consumed), shape: OnCarrier {
+///   `Yield { progress: ByteProgress::new(consumed), shape: OnWaitSource {
 ///   wait.carrier, wait.interest } }`
 /// - transport kick completes (Done / Advanced) → `Done(consumed)`
 pub fn step_write(
@@ -240,7 +240,7 @@ pub fn step_write(
     });
 
     if consumed == 0 {
-        return tx_substrate::step_v3::StepOutcome::yield_on_carrier(
+        return tx_substrate::step_v3::StepOutcome::yield_on_wait_source(
             tx_substrate::step_v3::ByteProgress::EMPTY,
             tty.raw() as u64,
             TTY_WRITABLE,
@@ -251,9 +251,9 @@ pub fn step_write(
     match kick_transport(tty, guard) {
         V3Out::Err(err) => V3Out::err(err),
         V3Out::Yield {
-            shape: YieldShape::OnCarrier { carrier, interests },
+            shape: YieldShape::OnWaitSource { source: carrier, interests },
             ..
-        } => V3Out::yield_on_carrier(ByteProgress::new(consumed), carrier.raw(), interests.raw()),
+        } => V3Out::yield_on_wait_source(ByteProgress::new(consumed), carrier.raw(), interests.raw()),
         V3Out::Yield { .. } => V3Out::err(tx_substrate::step_v3::Errno::EIO),
         V3Out::Done(_) | V3Out::Continue { .. } => V3Out::done(consumed),
     }
@@ -290,6 +290,78 @@ pub fn step_write_for_caller(
     step_write(tty, bytes, guard)
 }
 
+// ---------------------------------------------------------------------------
+// StepOp wraps (PR-2 wave 2)
+// ---------------------------------------------------------------------------
+//
+// Additive `impl StepOp` adapters per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1.
+// Each wrap stores its inputs under a single lifetime `'a` and delegates
+// from `step()` to the corresponding free fn above — semantics are
+// unchanged. The free fns remain the source of truth; callers can migrate
+// to the `*Op` types incrementally.
+
+/// `StepOp` wrap of [`step_write`].
+pub struct WriteOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub bytes: &'a [u8],
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for WriteOp<'a>
+{
+    type Output = usize;
+    type Progress = tx_substrate::step_v3::ByteProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_write(self.tty, self.bytes, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_write_for_caller`].
+pub struct WriteForCallerOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub bytes: &'a [u8],
+    pub caller: super::IoctlCaller,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for WriteForCallerOp<'a>
+{
+    type Output = usize;
+    type Progress = tx_substrate::step_v3::ByteProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_write_for_caller(self.tty, self.bytes, self.caller, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_write_for_process`].
+pub struct WriteForProcessOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub bytes: &'a [u8],
+    pub caller: &'a Cap<crate::process::structure::ProcessIdentity>,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for WriteForProcessOp<'a>
+{
+    type Output = usize;
+    type Progress = tx_substrate::step_v3::ByteProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_write_for_process(self.tty, self.bytes, self.caller, self.guard)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,7 +378,7 @@ mod tests {
     /// a `Blocked(wait)` from `kick_transport`, which `step_write` maps
     /// to `AdvancedThenBlocked(consumed, wait)`; `step_write` maps
     /// it to `Yield { progress: ByteProgress::new(consumed), shape:
-    /// OnCarrier { wait.carrier, wait.interest } }`.
+    /// OnWaitSource { wait.carrier, wait.interest } }`.
     struct BlockingOps {
         carrier: u64,
         interest: u64,
@@ -328,7 +400,7 @@ mod tests {
             _guard: &Guard<'_>,
         ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::yield_on_carrier(
+            tx_substrate::step_v3::StepOutcome::yield_on_wait_source(
                 tx_substrate::step_v3::ByteProgress::EMPTY,
                 self.carrier,
                 self.interest,
@@ -465,11 +537,11 @@ mod tests {
     /// `process_output` consumed bytes, `step_write` emits
     /// `AdvancedThenBlocked(consumed, wait)`. `step_write` must
     /// surface this as `Yield { progress: ByteProgress::new(consumed),
-    /// shape: OnCarrier { wait.carrier, wait.interest } }`. This pins
+    /// shape: OnWaitSource { wait.carrier, wait.interest } }`. This pins
     /// the `ByteProgress::new(consumed)` ergonomics inside
-    /// `yield_on_carrier`.
+    /// `yield_on_wait_source`.
     #[test]
-    fn step_write_partial_then_blocked_yields_on_carrier_with_byte_progress() {
+    fn step_write_partial_then_blocked_yields_on_wait_source_with_byte_progress() {
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -483,7 +555,7 @@ mod tests {
         match outcome {
             tx_substrate::step_v3::StepOutcome::Yield {
                 progress,
-                shape: tx_substrate::step_v3::YieldShape::OnCarrier { carrier, interests },
+                shape: tx_substrate::step_v3::YieldShape::OnWaitSource { source: carrier, interests },
             } => {
                 assert!(
                     !progress.is_empty(),
@@ -505,7 +577,7 @@ mod tests {
                     "yield interest mask must match the blocking ops' interest",
                 );
             }
-            other => panic!("expected v3 Yield::OnCarrier with byte progress, got {other:?}"),
+            other => panic!("expected v3 Yield::OnWaitSource with byte progress, got {other:?}"),
         }
     }
 
@@ -580,6 +652,122 @@ mod tests {
         match outcome {
             tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EIO) => {}
             other => panic!("expected v3 Err(EIO) for TOSTOP background write, got {other:?}"),
+        }
+    }
+
+    // -- PR-2 wave 2: StepOp wrap tests -----------------------------------
+    //
+    // Minimal `op.step(&mut ctx)` smoke tests pinning that each wrap
+    // delegates to the matching free fn. Compile-check is the primary
+    // value.
+    mod step_op_wraps {
+        use super::super::{WriteForCallerOp, WriteOp};
+        use super::{alloc_tty_with, setup, COMPLETING_BINDING};
+        use crate::tty::structure::{TtyKind, TtyPayload};
+        use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+
+        #[test]
+        fn write_op_empty_bytes_returns_done_zero() {
+            let _setup = setup();
+            let tty = alloc_tty_with(
+                TtyKind::SerialHardware,
+                100,
+                "ttyV3-op-empty",
+                TtyPayload::new_hardware(&COMPLETING_BINDING),
+            );
+            let guard = tx_substrate::epoch::guard();
+            let mut op = WriteOp {
+                tty: &tty,
+                bytes: b"",
+                guard: &guard,
+            };
+            let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            let outcome = op.step(&mut ctx);
+            drop(guard);
+            match outcome {
+                V3::Done(0) => {}
+                other => panic!("expected Done(0), got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn write_op_delegates_to_step_write() {
+            let _setup = setup();
+            let tty = alloc_tty_with(
+                TtyKind::SerialHardware,
+                101,
+                "ttyV3-op-done",
+                TtyPayload::new_hardware(&COMPLETING_BINDING),
+            );
+            let guard = tx_substrate::epoch::guard();
+            let mut op = WriteOp {
+                tty: &tty,
+                bytes: b"hello",
+                guard: &guard,
+            };
+            let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            let outcome = op.step(&mut ctx);
+            drop(guard);
+            match outcome {
+                V3::Done(5) => {}
+                other => panic!("expected Done(5), got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn write_for_caller_op_empty_bytes_returns_done_zero() {
+            let _setup = setup();
+            let tty = alloc_tty_with(
+                TtyKind::SerialHardware,
+                102,
+                "ttyV3-op-caller-empty",
+                TtyPayload::new_hardware(&COMPLETING_BINDING),
+            );
+            let guard = tx_substrate::epoch::guard();
+            let caller = super::super::super::IoctlCaller::new(1, 1);
+            let mut op = WriteForCallerOp {
+                tty: &tty,
+                bytes: b"",
+                caller,
+                guard: &guard,
+            };
+            let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            let outcome = op.step(&mut ctx);
+            drop(guard);
+            match outcome {
+                V3::Done(0) => {}
+                other => panic!("expected Done(0), got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn write_for_caller_op_matches_free_fn() {
+            let _setup = setup();
+            let tty = alloc_tty_with(
+                TtyKind::SerialHardware,
+                103,
+                "ttyV3-op-caller-match",
+                TtyPayload::new_hardware(&COMPLETING_BINDING),
+            );
+            let guard = tx_substrate::epoch::guard();
+            let caller = super::super::super::IoctlCaller::new(1, 1);
+            let mut op = WriteForCallerOp {
+                tty: &tty,
+                bytes: b"hi",
+                caller,
+                guard: &guard,
+            };
+            let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            let wrap_outcome = op.step(&mut ctx);
+            // Free fn parallel call observed independently; cannot run on
+            // same tty without re-fixturing, so the wrap outcome is
+            // checked against an expected Done(2) (CompletingOps reports
+            // the queued bytes).
+            drop(guard);
+            match wrap_outcome {
+                V3::Done(2) => {}
+                other => panic!("expected Done(2), got {other:?}"),
+            }
         }
     }
 }

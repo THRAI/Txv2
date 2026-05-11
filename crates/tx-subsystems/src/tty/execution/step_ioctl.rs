@@ -604,3 +604,407 @@ pub fn deferred_signal_for_tty(
         signal: signal.into(),
     })
 }
+
+// ---------------------------------------------------------------------------
+// StepOp wraps (PR-2 wave 3)
+// ---------------------------------------------------------------------------
+//
+// Additive `impl StepOp` adapters per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1.
+// Each wrap stores its inputs under a single lifetime `'a` and delegates
+// from `step()` to the corresponding free fn above — semantics are
+// unchanged.
+
+/// `StepOp` wrap of [`step_ioctl_tiocsctty`].
+pub struct IoctlTiocscttyOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub caller: IoctlCaller,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for IoctlTiocscttyOp<'a>
+{
+    type Output = IoctlSideEffect;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_ioctl_tiocsctty(self.tty, self.caller, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_ioctl_tiocsctty_for_process`].
+pub struct IoctlTiocscttyForProcessOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub caller: &'a Cap<crate::process::structure::ProcessIdentity>,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for IoctlTiocscttyForProcessOp<'a>
+{
+    type Output = IoctlSideEffect;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_ioctl_tiocsctty_for_process(self.tty, self.caller, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_ioctl_tiocnotty`].
+pub struct IoctlTiocnottyOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub caller: IoctlCaller,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for IoctlTiocnottyOp<'a>
+{
+    type Output = IoctlSideEffect;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_ioctl_tiocnotty(self.tty, self.caller, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_ioctl_tiocnotty_for_process`].
+pub struct IoctlTiocnottyForProcessOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub caller: &'a Cap<crate::process::structure::ProcessIdentity>,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for IoctlTiocnottyForProcessOp<'a>
+{
+    type Output = IoctlSideEffect;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_ioctl_tiocnotty_for_process(self.tty, self.caller, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_ioctl_tiocspgrp`].
+pub struct IoctlTiocspgrpOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub caller: IoctlCaller,
+    pub new_pgrp: u32,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for IoctlTiocspgrpOp<'a>
+{
+    type Output = IoctlSideEffect;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_ioctl_tiocspgrp(self.tty, self.caller, self.new_pgrp, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_ioctl_tiocspgrp_for_process`].
+pub struct IoctlTiocspgrpForProcessOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub caller: &'a Cap<crate::process::structure::ProcessIdentity>,
+    pub new_pgrp: &'a Cap<crate::process::structure::ProcessGroup>,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for IoctlTiocspgrpForProcessOp<'a>
+{
+    type Output = IoctlSideEffect;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_ioctl_tiocspgrp_for_process(self.tty, self.caller, self.new_pgrp, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_ioctl_tiocgpgrp`].
+pub struct IoctlTiocgpgrpOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for IoctlTiocgpgrpOp<'a>
+{
+    type Output = u32;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_ioctl_tiocgpgrp(self.tty, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_ioctl_tiocgwinsz`].
+pub struct IoctlTiocgwinszOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for IoctlTiocgwinszOp<'a>
+{
+    type Output = Winsize;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_ioctl_tiocgwinsz(self.tty, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_ioctl_tiocswinsz`].
+pub struct IoctlTiocswinszOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub winsize: Winsize,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for IoctlTiocswinszOp<'a>
+{
+    type Output = IoctlSideEffect;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_ioctl_tiocswinsz(self.tty, self.winsize, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_ioctl_tcgets`].
+pub struct IoctlTcgetsOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for IoctlTcgetsOp<'a>
+{
+    type Output = Termios;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_ioctl_tcgets(self.tty, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_ioctl_tcsets`].
+pub struct IoctlTcsetsOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub new_termios: Termios,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for IoctlTcsetsOp<'a>
+{
+    type Output = IoctlSideEffect;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_ioctl_tcsets(self.tty, self.new_termios, self.guard)
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    use super::*;
+    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+    use tx_substrate::zone::{self as zone_mod, PayloadCap};
+
+    use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::tty::structure::{TtyKind, TtyPayload};
+
+    struct NoopOps;
+
+    impl CharDeviceOps for NoopOps {
+        fn read(
+            &self,
+            _out: &mut [u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        {
+            tx_substrate::step_v3::StepOutcome::Done(0)
+        }
+
+        fn write(
+            &self,
+            bytes: &[u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        {
+            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+        }
+    }
+
+    static NOOP_OPS: NoopOps = NoopOps;
+    static NOOP_BINDING: CharDeviceBinding = CharDeviceBinding {
+        devt: DevT::new(4, 210),
+        name: "tty-ioctl-op-test",
+        ops: &NOOP_OPS,
+    };
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        tx_substrate::testing::init_host_for_test_once();
+        let _ = crate::zones::register_all();
+        crate::tty::structure::registry::reset_for_tests();
+        guard
+    }
+
+    fn alloc_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
+        let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res =
+            zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(
+            payload_res,
+            TtyPayload::new_hardware(&NOOP_BINDING),
+        ));
+        let identity = zone_mod::sign_for(
+            id_res,
+            TtyIdentity::new(TtyKind::SerialHardware, index, name),
+        );
+        identity.install_payload(payload_cap);
+        identity
+    }
+
+    #[test]
+    fn tcgets_op_returns_done_on_live_tty() {
+        let _setup = setup();
+        let tty = alloc_tty(300, "ttyV3-tcgets-op");
+        let guard = tx_substrate::epoch::guard();
+        let mut op = IoctlTcgetsOp {
+            tty: &tty,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Done(_) => {}
+            other => panic!("expected Done(termios), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tcgets_op_dead_tty_returns_eio() {
+        let _setup = setup();
+        let tty = alloc_tty(301, "ttyV3-tcgets-dead");
+        let _ = tty.take_payload();
+        let guard = tx_substrate::epoch::guard();
+        let mut op = IoctlTcgetsOp {
+            tty: &tty,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Err(tx_substrate::step_v3::Errno::EIO) => {}
+            other => panic!("expected Err(EIO), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tiocgpgrp_op_unbound_returns_einval() {
+        let _setup = setup();
+        let tty = alloc_tty(302, "ttyV3-tiocgpgrp-unbound");
+        let guard = tx_substrate::epoch::guard();
+        let mut op = IoctlTiocgpgrpOp {
+            tty: &tty,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Err(tx_substrate::step_v3::Errno::EINVAL) => {}
+            other => panic!("expected Err(EINVAL), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tiocgwinsz_op_returns_done() {
+        let _setup = setup();
+        let tty = alloc_tty(303, "ttyV3-tiocgwinsz-op");
+        let guard = tx_substrate::epoch::guard();
+        let mut op = IoctlTiocgwinszOp {
+            tty: &tty,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Done(_) => {}
+            other => panic!("expected Done(winsize), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tiocswinsz_op_returns_done_and_fires_session_ctl() {
+        let _setup = setup();
+        let tty = alloc_tty(304, "ttyV3-tiocswinsz-op");
+        let guard = tx_substrate::epoch::guard();
+        let mut op = IoctlTiocswinszOp {
+            tty: &tty,
+            winsize: Winsize::default(),
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Done(side) => assert!(side.session_ctl_fired),
+            other => panic!("expected Done(side_effect), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tiocnotty_op_unbound_returns_einval() {
+        let _setup = setup();
+        let tty = alloc_tty(305, "ttyV3-tiocnotty-op");
+        let caller = IoctlCaller::new(1, 1).as_session_leader();
+        let guard = tx_substrate::epoch::guard();
+        let mut op = IoctlTiocnottyOp {
+            tty: &tty,
+            caller,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Err(tx_substrate::step_v3::Errno::EINVAL) => {}
+            other => panic!("expected Err(EINVAL), got {other:?}"),
+        }
+    }
+}
