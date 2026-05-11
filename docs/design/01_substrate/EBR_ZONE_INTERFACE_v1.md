@@ -19,7 +19,7 @@ Companion documents:
   hierarchy, obligations, semantic vs physical reclamation.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md)
   — substrate layout and zone reservation/signing surface.
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) — guard-scoped
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — guard-scoped
   witness and upgrade discipline.
 
 ---

@@ -12,9 +12,9 @@
 
 **Companion documents.**
 
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — reference hierarchy and authoritative bindings. The tier-2 static-table decision is consistent with §3: `'static` references sit outside the reference hierarchy because there is no slot to pin.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — reference hierarchy and authoritative bindings. The tier-2 static-table decision is consistent with §3: `'static` references sit outside the reference hierarchy because there is no slot to pin.
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) §3 (entities), §8.1.1 (bifurcation). Tier-2 bindings are *not entities*; tier 3's `DynamicCharDevice` (deferred) would be.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — BIF-*, PRED-*, SIG-*. This document introduces no new invariants; it uses existing ones and explicitly notes where the entity-centric rules do not apply.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — BIF-*, PRED-*, SIG-*. This document introduces no new invariants; it uses existing ones and explicitly notes where the entity-centric rules do not apply.
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) §2 — `RNodeBacking`; §11.1 retires `i_fops` / `i_ops`. This document specifies what replaces them for devices, including a **revision to `StructPayload::CharDevice`** (§5.2) to hold `&'static CharDeviceBinding` rather than `Cap<CharDeviceBinding>`.
 - [`SIGNAL_ATTACHMENTS_v1.md`](../04_process-signals/SIGNAL_ATTACHMENTS_v1.md) §3.9 — **closes the Device/Driver placeholder rows** with tier-2-specific attachments (§10).
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — the four-module layout. The device subsystem follows it in a reduced form; see §8.
@@ -815,9 +815,9 @@ later dynamic device/VFS integration, not the static registration rows above.
 
 <!-- txdoc:DEVICE-REFERENCES-1 -->
 
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) §2.5, §3.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) §2.5, §3.
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) §3, §8.1.1.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — BIF-*, PRED-*, SIG-*.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — BIF-*, PRED-*, SIG-*.
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) §2, §11.
 - [`PAGE_SUBSTRATE_v1.md`](../01_substrate/PAGE_SUBSTRATE_v1.md) — frame allocator, FrameMeta, slab.
 - [`SIGNAL_ATTACHMENTS_v1.md`](../04_process-signals/SIGNAL_ATTACHMENTS_v1.md) §3.9 (closed by §10 above).

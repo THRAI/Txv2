@@ -11,9 +11,9 @@
 **Companion documents.**
 
 - [`FRAMEWORK_HARVEST_v1.md`](FRAMEWORK_HARVEST_v1.md) — staging notes that motivated this map.
-- [`CONCEPTS_v4.md`](CONCEPTS_v4.md) — unified concepts document.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — unified concepts document.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](SUBSYSTEM_ANATOMY_v2_1.md) — current full-subsystem shape; to be generalized by `SUBSYSTEM_ANATOMY_v3.md`.
-- [`INVARIANTS_v4.md`](INVARIANTS_v4.md) — canonical invariant set and linter labels.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — canonical invariant set and linter labels.
 
 ---
 
@@ -221,7 +221,7 @@ Rules:
 - Wake delivery never grants truth; scripts re-enter steps/checks.
 - AST is a reactor carve-out consumed by thread runtime and signal delivery.
 
-Relevant specs: [`REACTOR_v0.md`](../02_execution/REACTOR_v0.md), [`THREAD_RUNTIME_v1.md`](../02_execution/THREAD_RUNTIME_v1.md), [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md).
+Relevant specs: [`REACTOR_v0.md`](../02_execution/REACTOR_v0.md), [`THREAD_RUNTIME_v1.md`](../02_execution/THREAD_RUNTIME_v1.md), [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md).
 
 ---
 
@@ -425,7 +425,7 @@ Examples:
 - recursive umount composition;
 - fork/clone composition when it spans process, VM, fd, and signal action state.
 
-Relevant specs: [`EXEC_v1.md`](../02_execution/EXEC_v1.md), [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md), [`SUBSYSTEM_ANATOMY_v2_1.md`](SUBSYSTEM_ANATOMY_v2_1.md).
+Relevant specs: [`EXEC_v1.md`](../02_execution/EXEC_v1.md), [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md), [`SUBSYSTEM_ANATOMY_v2_1.md`](SUBSYSTEM_ANATOMY_v2_1.md).
 
 ---
 

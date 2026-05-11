@@ -14,8 +14,8 @@ depends on the ones above it.
 
 The architectural vocabulary every other doc references. Read these first.
 
-- [`CONCEPTS_v4.md`](00_meta-framework/CONCEPTS_v4.md) — draft unified concepts rewrite: placement homes, step/script/reactor async model, middleware/protocol combinators, completion, publication rule.
-- [`INVARIANTS_v4.md`](00_meta-framework/INVARIANTS_v4.md) — canonical grep-friendly invariant set: BIF/PRED/WIT/OBL/SIG/STEP/ASYNC/SCRIPT/COMP/ARCH plus linter notes.
+- [`01_CONCEPTS_v5.md`](../Txv3/01_CONCEPTS_v5.md) — draft unified concepts rewrite: placement homes, step/script/reactor async model, middleware/protocol combinators, completion, publication rule.
+- [`02_INVARIANTS_v5.md`](../Txv3/02_INVARIANTS_v5.md) — canonical grep-friendly invariant set: BIF/PRED/WIT/OBL/SIG/STEP/ASYNC/SCRIPT/COMP/ARCH plus linter notes.
 - [`object_model_v2.md`](00_meta-framework/object_model_v2.md) — identity / capability / payload entity decomposition.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — four-module subsystem layout, five-stage step discipline, import rules.
 - [`MODULE_MAP_v1.md`](00_meta-framework/MODULE_MAP_v1.md) — draft placement taxonomy for foundation, substrate, reactor, policy, subsystems, services, filesystem instances, scripts, shims, projections, and static registries.
@@ -27,7 +27,7 @@ The architectural vocabulary every other doc references. Read these first.
 Noncanonical source-trace notes:
 
 - [`FRAMEWORK_HARVEST_v1.md`](00_meta-framework/FRAMEWORK_HARVEST_v1.md) — staging harvest that led to the current meta-framework cleanup; not an implementation contract.
-- [`INVARIANT_LEDGER_v1.md`](00_meta-framework/INVARIANT_LEDGER_v1.md) — source ledger preserved for traceability; `INVARIANTS_v4.md` is canonical.
+- [`INVARIANT_LEDGER_v1.md`](00_meta-framework/INVARIANT_LEDGER_v1.md) — source ledger preserved for traceability; `02_INVARIANTS_v5.md` is canonical.
 
 Archived historical meta-framework sources:
 
@@ -56,7 +56,7 @@ Primitives that sit below every subsystem.
 
 How work runs: the step primitive and the runtime that drives it.
 
-- [`STEP_MODEL_v1.md`](02_execution/STEP_MODEL_v1.md) — the synchronous, bounded step; outcome algebra; five-stage in-step discipline.
+- [`03_STEP_MODEL_v2.md`](../Txv3/03_STEP_MODEL_v2.md) — the synchronous, bounded step; outcome algebra; five-stage in-step discipline.
 - [`THREAD_RUNTIME_v1.md`](02_execution/THREAD_RUNTIME_v1.md) — running-thread states, reactor interaction, signal-delivery boundary.
 - [`REACTOR_v0.md`](02_execution/REACTOR_v0.md) — reactor boundary contract.
 - [`SCHEDULER_v0.md`](02_execution/SCHEDULER_v0.md) — scheduler policy and interface contract.
@@ -105,8 +105,8 @@ How work runs: the step primitive and the runtime that drives it.
 
 **For a new contributor.** 00 active docs → 01 HAL → 01 PAGE_SUBSTRATE → 01 BUS → 02 STEP_MODEL → 02 THREAD_RUNTIME → pick a subsystem (03–06).
 
-**For VM work.** 00 CONCEPTS_v4, INVARIANTS_v4, object_model_v2, SUBSYSTEM_ANATOMY_v2_1 → 01 PAGE_SUBSTRATE → 03 PAGE_BACKED → 03 VM.
+**For VM work.** 00 01_CONCEPTS_v5, 02_INVARIANTS_v5, object_model_v2, SUBSYSTEM_ANATOMY_v2_1 → 01 PAGE_SUBSTRATE → 03 PAGE_BACKED → 03 VM.
 
 **For filesystem / driver work.** 00 (all) → 01 HAL → 01 BUS → 03 PAGE_BACKED → 05 MOUNT → 05 VFS_CHECKS → 05 BDEV_FS → 05 bringup_fs_specs → 05 TX_EXT4_PLAN; for char devices add 06 DEVICE → 06 TTY.
 
-**For process / signal work.** 00 (all) → 02 STEP_MODEL → 02 THREAD_RUNTIME → 02 cred_service / rlimit_service → 04 PROCESS → 04 SIGNAL → 04 SIGNAL_ATTACHMENTS → 02 EXEC.
+**For process / signal work.** 00 (all) → 02 03_STEP_MODEL_v2 → 02 THREAD_RUNTIME → 02 cred_service / rlimit_service → 04 PROCESS → 04 SIGNAL → 04 SIGNAL_ATTACHMENTS → 02 EXEC.

@@ -2,7 +2,17 @@
 
 <!-- txdoc:00-META-FRAMEWORK-CONCEPTS-V4 -->
 
-**Status.** Draft v4 for meta-framework unification.
+> **⚠ SUPERSEDED by [`Txv3/01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md).**
+> Per `docs/Txv3/INDEX.md` §3, v4 is the prior conceptual spine.
+> v5 adds the five primitive cells (SubjectContext, Signifier
+> Resolution, StepOp/StepOutcome, YieldShape, Publication), the
+> upper/lower script split, the ExecutionScope vs YieldShape
+> cleavage, and the closed-catalog list. Read v5 for the current
+> canonical vocabulary. This file is retained for historical
+> reference and section anchors that other v4 subsystem docs still
+> cite; new prose should use v5.
+
+**Status.** Draft v4 for meta-framework unification — **superseded**.
 
 **Supersedes.** `CONCEPTS_v3.md` after review. v4 preserves the three basis claims and publication rule from v3, replaces the stale four-role framing with the placement taxonomy from `MODULE_MAP_v1`, promotes the async step/script/reactor story, makes middleware/protocol-combinator vocabulary explicit, and adds the canonical-topology/view-layer split needed for namespaces and projections.
 

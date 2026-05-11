@@ -2,7 +2,16 @@
 
 <!-- txdoc:00-META-FRAMEWORK-INVARIANTS-V4 -->
 
-**Status.** Draft canonical invariant set for meta-framework unification.
+> **⚠ SUPERSEDED by [`Txv3/02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md).**
+> Per `docs/Txv3/INDEX.md` §3, v4 is the prior invariant catalog.
+> v5 adds the SUBJ-*, YIELD-*, DELEGATE-*, SCOPE-* families and
+> updates STEP-* over the four-variant outcome. v4 families that
+> v5 carries forward unchanged remain authoritative through their
+> v5 restatement. This file is retained for historical reference
+> and section anchors that other v4 subsystem docs still cite;
+> new prose should use v5.
+
+**Status.** Draft canonical invariant set for meta-framework unification — **superseded**.
 
 **Supersedes.** `INVARIANTS_v3_3.md` after review. v4 promotes the grep-friendly ledger into the canonical invariant set, replaces the stale four-runtime-role framing with architectural homes from `MODULE_MAP_v1`, adds async/reactor and completion invariants, and folds newer service/filesystem/mount/exec/vm/process/device rules into one reviewable surface.
 

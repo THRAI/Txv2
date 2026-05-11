@@ -16,8 +16,8 @@
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) — authoritative for references, bindings, projections.
 - [`LIVENESS_v2.1.md`](../00_meta-framework/archived/LIVENESS_v2.1.md) — projection/require/witness framework.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — four-module layout, five-phase step discipline, substrate.
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) — execution primitive; the step function body within which vfs/checks witnesses are consumed.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — PRED-*, WIT-*, STEP-* rules for resolution purity and witness scope.
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — execution primitive; the step function body within which vfs/checks witnesses are consumed.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — PRED-*, WIT-*, STEP-* rules for resolution purity and witness scope.
 
 This document does not re-derive those frameworks. It specifies the VFS-specific instance.
 
@@ -759,7 +759,7 @@ Tests follow each step per SUBSYSTEM_ANATOMY §10.
 <!-- txdoc:VFS-CHECKS-REFERENCES-1 -->
 
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md)
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md)
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md)
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md)
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md)
 - [`LIVENESS_v2.1.md`](../00_meta-framework/archived/LIVENESS_v2.1.md)
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md)

@@ -22,8 +22,8 @@ Companion documents:
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) — `Binding<T>` vocabulary and binding-obligation model.
 - [`EBR_ZONE_INTERFACE_v1.md`](EBR_ZONE_INTERFACE_v1.md) — current reference/evidence interface.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) §3 (five-phase discipline), §4 (substrate primitive families).
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — authoritative bindings and derived materializations.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — ARCH-5 (publication rule).
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — authoritative bindings and derived materializations.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — ARCH-5 (publication rule).
 - [`PROCESS_v1.md`](../04_process-signals/PROCESS_v1.md) — primary consumer; §8 cross-cutting patterns.
 
 ### What this document pins

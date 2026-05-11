@@ -10,8 +10,8 @@
 
 **Companion documents.**
 
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — middleware as protocol combinator; specialized protocol objects.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — `ARCH-*`, `SIG-*`, `SCRIPT-*`, `EXC-*`, and `COMP-*`.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — middleware as protocol combinator; specialized protocol objects.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — `ARCH-*`, `SIG-*`, `SCRIPT-*`, `EXC-*`, and `COMP-*`.
 - [`REACTOR_v0.md`](REACTOR_v0.md) — wait/wake boundary and classified wait outcomes.
 - [`BUS_v1.md`](../01_substrate/BUS_v1.md) — wake carriers, subscription, and "wake is not truth."
 - [`PROCESS_v1.md`](../04_process-signals/PROCESS_v1.md) — group-exit collapse currently uses a hand-written countdown completion.

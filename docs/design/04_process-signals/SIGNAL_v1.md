@@ -17,10 +17,10 @@ Companion documents:
 - [`PROCESS_v1.md`](./PROCESS_v1.md) — process model, Frame layout, GroupExit coordination, SIGCHLD wiring.
 - [`SCHEDULER_v0.md`](../02_execution/SCHEDULER_v0.md) — scheduler policy (for SIGSTOP/SIGCONT interaction).
 - [`BUS_v1.md`](../01_substrate/BUS_v1.md) — RawPort, RawQueue, Subscription primitives.
-- [`SIGNAL_ATTACHMENTS_v1.md`](./SIGNAL_ATTACHMENTS_v1.md) — publication catalog; `signal_port`, `exit_port`, `signalfd_readable`, etc.
+- [`SIGNAL_ATTACHMENTS_v1.md`](./SIGNAL_ATTACHMENTS_v1.md) — publication catalog; `signal_port`, `exit_source`, `signalfd_readable`, etc.
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) and [`EBR_ZONE_INTERFACE_v1.md`](../01_substrate/EBR_ZONE_INTERFACE_v1.md) — `Binding<T>`, `Weak<T>`, and retention evidence vocabulary.
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — planes, scripts, publication, and factoring vocabulary.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — SIG-*, STEP-*, SCRIPT-* rules this spec respects.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — planes, scripts, publication, and factoring vocabulary.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — SIG-*, STEP-*, SCRIPT-* rules this spec respects.
 
 ### What this document pins
 
@@ -29,7 +29,7 @@ Companion documents:
 - The Gewalt/event factoring as architectural commitment, not rhetorical framing.
 - `sig_actions` as a routing table; sigaction as a routing-configuration syscall.
 - `PendingSignalQueue` structure for catchable signals (standard bitset + RT FIFO).
-- The delivery-selection algorithm run at wait-adapt and at AST.
+- The delivery-selection algorithm run at yield-adapt and at AST.
 - `deliver_posix_signal` as the central producer entry point.
 - `deliver_synchronous_fault` as the trap-context entry point for hardware faults.
 - The trap-return signal contract consumed through `KernelTrapSink<P>` and HAL `SignalFrameIf`.
@@ -397,7 +397,7 @@ async fn script_sigprocmask(how: SigHow, set: Option<&SignalMask>, oldset: Optio
 }
 ```
 
-`refresh_signal_summary` recomputes the `has_deliverable` bit on `signal_summary` by examining `thread_pending` and `group_pending` minus `signal_mask`. If any catchable signal is pending and unmasked, set the bit. This drives wait-adapt's interrupt detection (see §13).
+`refresh_signal_summary` recomputes the `has_deliverable` bit on `signal_summary` by examining `thread_pending` and `group_pending` minus `signal_mask`. If any catchable signal is pending and unmasked, set the bit. This drives yield-adapt's interrupt detection (see §13).
 
 #### 7.2 pthread_sigmask
 
@@ -780,7 +780,7 @@ fn mark_deliverable(thread: &Cap<ThreadIdentity>, sig: Signum) {
         payload.signal_summary.store(summary);
 
         // Wake the thread's task if parked on an Interruptible wait.
-        // The wake is via the task's waker; wait-adapt will re-observe
+        // The wake is via the task's waker; yield-adapt will re-observe
         // and return Interrupted if summary.has_deliverable() is set.
         reactor::wake_task(thread.task_id);
     }
@@ -797,7 +797,7 @@ Per REACTOR_v0, `wake_task` is a hint; the thread re-observes on next poll. If t
 
 Run at two sites:
 
-- **Site A (wait-adapt)**: when a wait-adapt wake fires, wait-adapt checks if the wake was signal-caused. If so, returns `WaitOutcome::Interrupted` to the calling script.
+- **Site A (yield-adapt)**: when a yield-adapt wake fires, yield-adapt checks if the wake was signal-caused. If so, returns `WaitOutcome::Interrupted` to the calling script.
 - **Site B (AST)**: at every kernel→user transition, HAL invokes `ast_check`; signal subsystem runs the selection and either approves userspace-return or installs a handler frame.
 
 Both sites use the same selection:
@@ -1244,7 +1244,7 @@ POSIX: when a slow (blocking, interruptible) syscall is interrupted by a signal 
 
 Implementation:
 
-- A blocking syscall parks on `reactor::wait(channel, mask, WaitProtocol::Interruptible)`. On signal post that interrupts, wait-adapt returns `WaitOutcome::Interrupted`.
+- A blocking syscall parks on `reactor::wait(channel, mask, WaitProtocol::Interruptible)`. On signal post that interrupts, yield-adapt returns `WaitOutcome::Interrupted`.
 - The script receives `Interrupted` and returns `ERESTARTSYS` (internal errno; not POSIX-visible as such).
 - thread_future's state-machine unwind observes ERESTARTSYS as it propagates up through the dispatch_trap future.
 - At the trap-return path, before HAL does sret, the trap-return code checks: if the syscall returned ERESTARTSYS and a signal is being delivered with SA_RESTART: rewind the trap PC to the syscall instruction, then deliver the signal. Handler runs; when handler returns via sigreturn, pre-signal PC is the syscall entry, so the syscall re-executes.
@@ -1893,9 +1893,12 @@ impl RNodeOps for SignalFd {
         }
 
         // Block on readable wire.
-        StepOutcome::Blocked {
-            channel: payload.readable.channel(),
-            mask: SignalFdReadiness::HAS_SIGNAL,
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource {
+                source: payload.readable.channel(),
+                interests: SignalFdReadiness::HAS_SIGNAL,
+            },
+            progress: Progress::ZERO,
         }
     }
 
@@ -1952,7 +1955,7 @@ pub struct PidFd {
 
 pub struct PidFdPayload {
     pub target: Weak<ProcessIdentity>,
-    pub exit_subscription: Subscription,   // on target.exit_port
+    pub exit_subscription: Subscription,   // on target.exit_source
     pub readable: RawQueue<PidFdReadiness>,
 }
 ```
@@ -2009,7 +2012,7 @@ This section enumerates every substrate primitive the signal spec uses and where
 | `RawPort<T>` | ProcessIdentity.signal_port (fired here); target.signal_port subscription | BUS_v1 §1 |
 | `RawQueue<M>` | SignalFd.readable, PidFd.readable; `signalfd_readable` wire | BUS_v1 §1 |
 | `Subscription` | SignalFd.subscription, PidFd.exit_subscription | BUS_v1 §4 |
-| `Subscribable` trait | Implemented by ProcessIdentity for signal_port and exit_port | BUS_v1 §4 |
+| `Subscribable` trait | Implemented by ProcessIdentity for signal_port and exit_source | BUS_v1 §4 |
 
 ### 42. Primitives from REACTOR_v0
 
@@ -2030,11 +2033,11 @@ This section enumerates every substrate primitive the signal spec uses and where
 | Attachment | Used for | Cataloged in |
 |---|---|---|
 | `ProcessIdentity.signal_port` | Fires on every signal produced | SIGNAL_ATTACHMENTS_v1 §3.3 |
-| `ProcessIdentity.exit_port` | Subscribed by pidfd | SIGNAL_ATTACHMENTS_v1 §3.3 |
+| `ProcessIdentity.exit_source` | Subscribed by pidfd | SIGNAL_ATTACHMENTS_v1 §3.3 |
 | `SignalFd.signalfd_readable` | Fires on mask-matching pending | SIGNAL_ATTACHMENTS_v1 §3.4 |
 | `PidFd.pidfd_readable` | Fires on target exit | SIGNAL_ATTACHMENTS_v1 §3.4 |
 | `Socket.urgent_port` | SIGURG generation path | SIGNAL_ATTACHMENTS_v1 §3.6 |
-| `ThreadIdentity.thread_exit_port` | pthread_join; clear_child_tid | SIGNAL_ATTACHMENTS_v1 §3.3 |
+| `ThreadIdentity.thread_exit_source` | pthread_join; clear_child_tid | SIGNAL_ATTACHMENTS_v1 §3.3 |
 
 ### 44. Primitives from PROCESS_v1 / THREAD_RUNTIME_v1 / SCHEDULER_v0
 
@@ -2152,4 +2155,4 @@ Explicitly confirmed as outside the Phase 1 signal spec's substrate usage:
 
 <!-- txdoc:SIGNAL-SHORT-VERSION-1 -->
 
-> The signal spec is the POSIX compatibility shim over txKernel's factored Gewalt/event native architecture. Gewalt (SIGKILL, SIGSTOP, synchronous faults with SIG_DFL) invokes control primitives in PROCESS_v1 / THREAD_RUNTIME_v1 / SCHEDULER_v0 directly, bypassing routing. Events (SIGCHLD, SIGALRM, SIGPIPE, etc.) fire native bus wires (`signal_port`, `exit_port`, `signalfd_readable`) per SIGNAL_ATTACHMENTS_v1, which native consumers (signalfd, pidfd, timerfd) subscribe to. The shim consults `sig_actions` as a routing table: handler-installed signals route to per-process pending queues (standard bitset + RT FIFO); SIG_IGN drops; SIG_DFL applies POSIX default action. Delivery happens at two sites: wait-adapt interruption (returns Interrupted to script, translated to ERESTARTSYS or EINTR) and AST at kernel→user transitions (`KernelTrapSink<P>` reaches signal code, and `SignalFrameIf` installs signal frames). Multistage handler flow stacks frames naturally; sigreturn restores. SA_RESTART rewinds the trap PC when a handler with SA_RESTART runs. Synchronous faults take a distinct `deliver_synchronous_fault` entry with mask-bypass and force-Term for uncaught. Substrate: no new primitives; all state uses existing atomic / BUS_v1 / EBR_ZONE_INTERFACE_v1 / REACTOR_v0 / SIGNAL_ATTACHMENTS_v1 / PROCESS_v1 mechanisms. signalfd and pidfd are thin VFS RNodes with BUS_v1 subscriptions on target publications; no private siginfo rings.
+> The signal spec is the POSIX compatibility shim over txKernel's factored Gewalt/event native architecture. Gewalt (SIGKILL, SIGSTOP, synchronous faults with SIG_DFL) invokes control primitives in PROCESS_v1 / THREAD_RUNTIME_v1 / SCHEDULER_v0 directly, bypassing routing. Events (SIGCHLD, SIGALRM, SIGPIPE, etc.) fire native bus wires (`signal_port`, `exit_source`, `signalfd_readable`) per SIGNAL_ATTACHMENTS_v1, which native consumers (signalfd, pidfd, timerfd) subscribe to. The shim consults `sig_actions` as a routing table: handler-installed signals route to per-process pending queues (standard bitset + RT FIFO); SIG_IGN drops; SIG_DFL applies POSIX default action. Delivery happens at two sites: yield-adapt interruption (returns Interrupted to script, translated to ERESTARTSYS or EINTR) and AST at kernel→user transitions (`KernelTrapSink<P>` reaches signal code, and `SignalFrameIf` installs signal frames). Multistage handler flow stacks frames naturally; sigreturn restores. SA_RESTART rewinds the trap PC when a handler with SA_RESTART runs. Synchronous faults take a distinct `deliver_synchronous_fault` entry with mask-bypass and force-Term for uncaught. Substrate: no new primitives; all state uses existing atomic / BUS_v1 / EBR_ZONE_INTERFACE_v1 / REACTOR_v0 / SIGNAL_ATTACHMENTS_v1 / PROCESS_v1 mechanisms. signalfd and pidfd are thin VFS RNodes with BUS_v1 subscriptions on target publications; no private siginfo rings.

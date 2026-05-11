@@ -46,8 +46,8 @@ This document does *not* cover:
 
 - [`PAGE_SUBSTRATE_v1.md`](../01_substrate/PAGE_SUBSTRATE_v1.md) — frame allocator, FrameMeta, pmap substrate this doc consumes.
 - [`object_model.md`](../00_meta-framework/object_model_v2.md) §3.3 — compound payload predicates (Frame.payload_live = map_count > 0 ∨ cache_ref > 0 ∨ pin_count > 0).
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) — step outcome algebra, five-phase discipline.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — STEP-4, OBL-*, BIF-*.
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — step outcome algebra, five-phase discipline.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-4, OBL-*, BIF-*.
 - [`MODULE_MAP_v1.md`](../00_meta-framework/MODULE_MAP_v1.md) §5.1 (vm subsystem), §7 (FS instances).
 
 ### Zone-derived type policy
@@ -1071,8 +1071,8 @@ The model unifies file-like things at the substrate level without forcing pipes,
 
 - [`PAGE_SUBSTRATE_v1.md`](../01_substrate/PAGE_SUBSTRATE_v1.md) — frame allocator, FrameMeta, pmap, slab.
 - [`object_model.md`](../00_meta-framework/object_model_v2.md) §3.3 (compound payloads), §5 (reference hierarchy), §6 (reclamation), §7 (operational contributions).
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) — step outcome algebra, multi-step operations, wait primitives.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — STEP-4, OBL-*, BIF-*.
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — step outcome algebra, multi-step operations, wait primitives.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-4, OBL-*, BIF-*.
 - [`MODULE_MAP_v1.md`](../00_meta-framework/MODULE_MAP_v1.md) §5.1 (vm subsystem), §6.1 (vfs subsystem), §7 (FS instances), §8 (scripts).
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — four-module layout; PageContainer and RNodeBacking structural content lives in vm and vfs subsystems' structure/ modules.
 - Linux kernel source for reference: `include/linux/fs.h` (file_operations, inode_operations, address_space_operations — the things this spec replaces).
