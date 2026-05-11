@@ -602,7 +602,9 @@ async fn open(ctx: &ThreadContext, path: &CStr, flags: OpenFlags, mode: u16) {
         // Credential-derived ownership inputs when constructing the new inode.
         match vfs::execution::step_open(path_w, auth_w, cred, flags, mode) {
             StepOutcome::Done(fd) => return Ok(fd),
-            StepOutcome::Blocked(c, m) => wait_on(c, m).await?,
+            StepOutcome::Yield { shape: YieldShape::OnWaitSource { source, interests }, .. } => {
+                wait_on(source, interests).await?
+            }
             StepOutcome::Err(e) => return Err(e),
             _ => unreachable!(),
         }

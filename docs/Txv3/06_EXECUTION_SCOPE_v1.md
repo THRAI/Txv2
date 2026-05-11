@@ -158,6 +158,8 @@ When the io_uring instance is closed (or the owner exits), the scope drops; fixe
 
 POSIX AIO (io_setup / io_submit / io_getevents) workers are kernel tasks that execute submitted I/O on behalf of the user task. Each AIO context has an associated `Cap<ProcessIdentity>`; the worker enters `OnBehalfOf` scope for the lifetime of one execution batch (or, for long-lived workers, for the lifetime of the AIO context).
 
+**Landed in PR-11** as the `OnBehalfOf<P>` canary. Implementation: `crates/tx-subsystems/src/aio.rs` (the `AioContext` zone, the per-context worker future entered through `with_on_behalf_of` at `io_setup` time, the iocb submission queue + completion queue, and the `IocbDispatcher` callback that resolves `aio_fildes` against P's fd table under the borrow); `crates/tx-shims/src/linux_syscall/aio.rs` (the four syscall arms — `sys_io_setup`, `sys_io_submit`, `sys_io_getevents`, `sys_io_destroy`); `crates/tx-shims/tests/v3_aio_e2e.rs` (the end-to-end canary pinning the submit → dispatch → completion → getevents → destroy loop). The planning + readiness audit is recorded in `docs/progress/decisions/2026-05-11-d8-pr-11-aio-plan.md`.
+
 ### 8.3 FUSE helper
 
 <!-- txdoc:SCOPE-V1-FUSE-HELPER-1 -->
@@ -226,8 +228,8 @@ Per-use-case work (uring registration, AIO context, FUSE helper) is additional a
 
 Recommended landing order:
 
-1. Framework: `with_on_behalf_of`, `SubjectContext::borrowed`, exit-port routing. ~500 LoC.
-2. First use case: AIO worker (smallest surface; one borrow per AIO context). Validates the framework against a real use.
+1. Framework: `with_on_behalf_of`, `SubjectContext::borrowed`, exit-port routing. ~500 LoC. **Landed in PR-11 phases 0–1** (W-W + W-Z); see `crates/tx-substrate/src/step_v3/borrow.rs` for `with_on_behalf_of`, `crates/tx-substrate/src/step_v3/subject_context.rs` for the `SubjectContext::borrowed` constructor, and `OnBehalfOfAbort` for the abandonment routing.
+2. First use case: AIO worker (smallest surface; one borrow per AIO context). Validates the framework against a real use. **Landed in PR-11 phases 2–6** (W-Z `AioContext` zone, W-CC worker spawn, W-FF real dispatch + completion queue + `io_getevents` + `io_destroy`, W-JJ end-to-end canary). See `crates/tx-subsystems/src/aio.rs` for the subsystem, `crates/tx-shims/src/linux_syscall/aio.rs` for the syscall arms, and `crates/tx-shims/tests/v3_aio_e2e.rs` for the e2e canary. The full PR-11 plan + readiness audit is recorded in `docs/progress/decisions/2026-05-11-d8-pr-11-aio-plan.md`.
 3. io_uring SQPOLL with the registered-buffer authority story.
 4. cgroup-v2 writeback under per-cgroup identity (after the cgroup-identity catalog member lands).
 

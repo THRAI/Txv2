@@ -10,11 +10,11 @@
 
 **Companion documents.**
 
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — SIG-* rules this catalog realizes; BIF-5 single-carrier rule enforced here.
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — publication plane and bus layering.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — SIG-* rules this catalog realizes; BIF-5 single-carrier rule enforced here.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — publication plane and bus layering.
 - [`LIVENESS_v2.1.md`](../00_meta-framework/archived/LIVENESS_v2.1.md) — archived projection-catalog source material.
 - [`BUS_v1.md`](../01_substrate/BUS_v1.md) — bus primitive APIs and declaration machinery.
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) §3.4 — publish phase of the in-step commit discipline.
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) §3.4 — publish phase of the in-step commit discipline.
 
 ---
 
@@ -101,13 +101,13 @@ OpenFile itself publishes little; most observable state lives on its RNode. The 
 
 | Entity | Carrier | Wire | Transition | Polarity | Fired from | Subscribers | Projection link |
 |---|---|---|---|---|---|---|---|
-| ProcessIdentity | RawPort | `exit_port` | Payload transitioned to None (exit) | `fire(Exited{status})` | `process::step_exit_commit` | waitpid (parent), pidfd subscribers, ptrace tracer | ProcessPayload.payload → false |
+| ProcessIdentity | RawPort | `exit_source` | Payload transitioned to None (exit) | `fire(Exited{status})` | `process::step_exit_commit` | waitpid (parent), pidfd subscribers, ptrace tracer | ProcessPayload.payload → false |
 | ProcessIdentity | RawPort | `signal_port` | Signal delivered (generated for this process) | `fire(SignalGenerated{sig})` | `process::step_signal_deliver` | signalfd subscribers, ptrace tracer | — (not a projection change) |
 | ProcessIdentity | RawPort | `ptrace_port` | Ptrace stop point reached | `fire(Stop{reason})` | dispatch/intercept/ptrace via `process::step_intercept_commit` | attached tracer | — |
 | ProcessIdentity | RawTrace | `sched_trace` | Scheduling events, context switches | `emit({from, to, reason})` | scheduler (in reactor), via process wire | ftrace, perf | — |
-| ThreadIdentity | RawPort | `thread_exit_port` | ThreadPayload transitioned to None | `fire(ThreadExited)` | `thread::step_thread_exit_commit` | pthread_join, clear_child_tid futex wake | ThreadPayload.payload → false |
+| ThreadIdentity | RawPort | `thread_exit_source` | ThreadPayload transitioned to None | `fire(ThreadExited)` | `thread::step_thread_exit_commit` | pthread_join, clear_child_tid futex wake | ThreadPayload.payload → false |
 
-Notes on BIF-5 compliance: every row names a single entity (ProcessIdentity or ProcessPayload or ThreadIdentity). No wire spans both Identity and Payload. The `exit_port` fires when Payload transitions to None; the wire lives on Identity (because ProcessPayload has been reclaimed by the time subscribers observe the event — only Identity survives the zombie window). Placing the wire on Identity is the BIF-5-compliant choice.
+Notes on BIF-5 compliance: every row names a single entity (ProcessIdentity or ProcessPayload or ThreadIdentity). No wire spans both Identity and Payload. The `exit_source` fires when Payload transitions to None; the wire lives on Identity (because ProcessPayload has been reclaimed by the time subscribers observe the event — only Identity survives the zombie window). Placing the wire on Identity is the BIF-5-compliant choice.
 
 ### 3.4 Process — signalfd, pidfd
 
@@ -118,7 +118,7 @@ Notes on BIF-5 compliance: every row names a single entity (ProcessIdentity or P
 | SignalFd | RawQueue | `signalfd_readable` | New signal matching mask enqueued | `set(HasSignal)` | `process::step_signal_enqueue` (when signal routes to a signalfd) | poll/select, epoll | — |
 | PidFd | RawQueue | `pidfd_readable` | Target process exited (pidfd becomes readable with exit info) | `set(HasExit)` | `process::step_exit_commit` | poll/select, epoll | ProcessPayload.payload → false |
 
-PidFd's `HasExit` and ProcessIdentity's `exit_port` fire on the same underlying transition (process exit) but target different subscriber shapes: pidfd for poll-based readers holding an fd, exit_port for waitpid-style direct observers. Both fire from the same step-commit; the step publishes to both wires as separate `fire` calls.
+PidFd's `HasExit` and ProcessIdentity's `exit_source` fire on the same underlying transition (process exit) but target different subscriber shapes: pidfd for poll-based readers holding an fd, exit_source for waitpid-style direct observers. Both fire from the same step-commit; the step publishes to both wires as separate `fire` calls.
 
 ### 3.5 Pipe
 
@@ -126,12 +126,12 @@ PidFd's `HasExit` and ProcessIdentity's `exit_port` fire on the same underlying 
 
 | Entity | Carrier | Wire | Transition | Polarity | Fired from | Subscribers | Projection link |
 |---|---|---|---|---|---|---|---|
-| Pipe (read end) | RawQueue | `read_wq` | Bytes written to ring | `set(HasData)` | `pipe::step_write_commit` | blocking reader, poll/select, epoll | Pipe.readable projection |
-| Pipe (read end) | RawQueue | `read_wq` | All writers closed | `set(Broken)` | `pipe::step_close` (last write-side close) | blocking reader, poll/select, epoll | Pipe.writers_exist → false |
-| Pipe (write end) | RawQueue | `write_wq` | Bytes drained from ring | `set(Space)` | `pipe::step_read_commit` | blocking writer, poll/select, epoll | Pipe.writable projection |
-| Pipe (write end) | RawQueue | `write_wq` | All readers closed | `set(Broken)` | `pipe::step_close` (last read-side close) | blocking writer, poll/select, epoll | Pipe.readers_exist → false |
+| Pipe (read end) | RawQueue | `read_source` | Bytes written to ring | `set(HasData)` | `pipe::step_write_commit` | blocking reader, poll/select, epoll | Pipe.readable projection |
+| Pipe (read end) | RawQueue | `read_source` | All writers closed | `set(Broken)` | `pipe::step_close` (last write-side close) | blocking reader, poll/select, epoll | Pipe.writers_exist → false |
+| Pipe (write end) | RawQueue | `write_source` | Bytes drained from ring | `set(Space)` | `pipe::step_read_commit` | blocking writer, poll/select, epoll | Pipe.writable projection |
+| Pipe (write end) | RawQueue | `write_source` | All readers closed | `set(Broken)` | `pipe::step_close` (last read-side close) | blocking writer, poll/select, epoll | Pipe.readers_exist → false |
 
-Note: a pipe is two capability ends (read end, write end), each with its own RawQueue. Writing to the pipe fires on the read end's `read_wq` (readers care); draining fires on the write end's `write_wq` (writers care). This is cross-capability firing within one subsystem — legal per SIG-6 because both capabilities are in the pipe subsystem's commit path. BIF-5 is satisfied: each wire attaches to exactly one capability.
+Note: a pipe is two capability ends (read end, write end), each with its own RawQueue. Writing to the pipe fires on the read end's `read_source` (readers care); draining fires on the write end's `write_source` (writers care). This is cross-capability firing within one subsystem — legal per SIG-6 because both capabilities are in the pipe subsystem's commit path. BIF-5 is satisfied: each wire attaches to exactly one capability.
 
 ### 3.6 Socket
 
@@ -311,7 +311,7 @@ The catalog is the source of record for versioning decisions. Rows marked with `
 
 <!-- txdoc:SIGNAL-ATTACHMENTS-OPEN-QUESTIONS-1 -->
 
-**8.1. Cross-subsystem attachment ownership.** When a fire on one subsystem's wire is triggered by a commit in another subsystem's step (e.g., pipe's write_commit fires on the pipe's read_wq, which the reader's driver observes), the catalog row lives in the pipe subsystem's section. For less symmetric cases (e.g., a VFS operation firing fsnotify on a directory that the inotify subsystem subscribes to across module boundaries), the placement is less clear. Current convention: the row is cataloged in the subsystem owning the entity the wire attaches to.
+**8.1. Cross-subsystem attachment ownership.** When a fire on one subsystem's wire is triggered by a commit in another subsystem's step (e.g., pipe's write_commit fires on the pipe's read_source, which the reader's driver observes), the catalog row lives in the pipe subsystem's section. For less symmetric cases (e.g., a VFS operation firing fsnotify on a directory that the inotify subsystem subscribes to across module boundaries), the placement is less clear. Current convention: the row is cataloged in the subsystem owning the entity the wire attaches to.
 
 **8.2. Aggregate tracepoints.** Tracepoint entries are currently aggregated as a single catalog row ("any entity, tracepoint, per-op"). A more granular catalog would record each tracepoint declaration separately. Whether the granularity is worth the catalog size is deferred.
 
@@ -325,8 +325,8 @@ The catalog is the source of record for versioning decisions. Rows marked with `
 
 <!-- txdoc:SIGNAL-ATTACHMENTS-REFERENCES-1 -->
 
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) §6 (SIG-*), §2 (BIF-5), §7 (STEP-9 composite).
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — publication plane and bus static/temporal layering.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) §6 (SIG-*), §2 (BIF-5), §7 (STEP-9 composite).
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — publication plane and bus static/temporal layering.
 - [`LIVENESS_v2.1.md`](../00_meta-framework/archived/LIVENESS_v2.1.md) — archived projection-catalog source material.
 - [`BUS_v1.md`](../01_substrate/BUS_v1.md) §1 (primitives), §3 (declarations), §5 (firing).
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) §3.4 (publish phase), §3.5 (return), §5.x and §6.x (per-subsystem step examples with fire calls).
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) §3.4 (publish phase), §3.5 (return), §5.x and §6.x (per-subsystem step examples with fire calls).

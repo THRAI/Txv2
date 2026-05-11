@@ -177,7 +177,7 @@ After day 10: subsystem-by-subsystem `StepOp` wrap PRs (PR-4 series) run in para
 | **PR-8** | Protocol-deadline + TimerGuard (H/full): `TimerWheel` public surface, `TimerGuard` with `PrimarySleep`/`DeadlineAbort`/`DelegateTimeout` roles | 1 | timer.rs + scripts/drive.rs |
 | **PR-9** | SubjectContext threading (I): canonical syscalls (sys_open, sys_read, sys_write, sys_fork, sys_execve, sys_close, sys_pipe) threading `&SubjectContext` | 2 | shims/ + scripts/ |
 | **PR-10** | First agent kind: userfaultfd | 5–10 | new ufd subsystem |
-| **PR-11** | First OnBehalfOf user: AIO worker (lands J framework + AIO subsystem together) | 5 | tx-scripts + new aio subsystem |
+| **PR-11** | First OnBehalfOf user: AIO worker (lands J framework + AIO subsystem together) — **LANDED** (`docs/progress/decisions/2026-05-11-d8-pr-11-aio-plan.md`; `crates/tx-subsystems/src/aio.rs`; `crates/tx-shims/src/linux_syscall/aio.rs`; `crates/tx-shims/tests/v3_aio_e2e.rs`) | 5 | tx-scripts + new aio subsystem |
 
 Total foundation (PR-1 through PR-3): **~10 working days, ~140 files touched, ~600 mechanical edits**.
 Total full v3 vocabulary retired (PR-1 through PR-8): **~22 working days, ~250 files touched**.

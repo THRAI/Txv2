@@ -13,16 +13,16 @@ Exec has no entities of its own. It owns no `structure/`, no `checks/`, no `exec
 
 Companion documents:
 
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — basis claims, scripts, waits, publication, and carve-outs.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — basis claims, scripts, waits, publication, and carve-outs.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) §3.6 (compositional scripts), §3.7 (point of no return), §9 (cross-subsystem scripts).
-- [`STEP_MODEL_v1.md`](STEP_MODEL_v1.md) — five-phase discipline; each step inside exec follows it.
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — five-phase discipline; each step inside exec follows it.
 - [`VM_v1_2.md`](../03_memory-vm/VM_v1_2.md) §5.7 — detached-build-then-swap address-space construction consumed here.
 - [`PROCESS_v1.md`](../04_process-signals/PROCESS_v1.md) §5 (group-exit coordination), §7.2 (the `script_execve` skeleton this document elaborates), and §3 (`Frame` shared slots).
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) — `step_read` and the `read_exact_at` helper.
 - [`VFS_CHECKS_V2.1.md`](../05_filesystem/VFS_CHECKS_V2.1.md) — path resolution; mount-witness production.
 - [`SIGNAL_v1.md`](../04_process-signals/SIGNAL_v1.md) — disposition reset semantics consumed by phase 7.
 - [`SIGNAL_ATTACHMENTS_v1.md`](../04_process-signals/SIGNAL_ATTACHMENTS_v1.md) — the `process_execd` tracepoint declared by this document.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — `STEP-*`, `SCRIPT-*`, `EXEC-*`, and publication rules.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — `STEP-*`, `SCRIPT-*`, `EXEC-*`, and publication rules.
 
 ### What this document pins
 <!-- txdoc:EXEC-WHAT-THIS-DOCUMENT-PINS -->
@@ -100,7 +100,7 @@ Exec is unique among POSIX operations: it preserves the calling process's identi
 
 This straddles every architectural axis the kernel cares about:
 
-- **Resolution** ([CONCEPTS §2.1](../00_meta-framework/CONCEPTS_v4.md)). Exec resolves a path to an executable RNode, and resolves cred against the binary's permissions and mount policy.
+- **Resolution** ([CONCEPTS §2.1](../../Txv3/01_CONCEPTS_v5.md)). Exec resolves a path to an executable RNode, and resolves cred against the binary's permissions and mount policy.
 - **Lifecycle.** The AddressSpace is destroyed and a new one is constructed. The fd-table is partially evicted. sig_actions is reset. Other threads in the group are killed.
 - **Publication.** The `process_execd` tracepoint fires; ptrace observes; closing FD_CLOEXEC fds publishes fsnotify events to outside watchers.
 
@@ -1598,7 +1598,7 @@ The trace is **not authoritative**. Per SIG-1 and SIG-2, signals are not truth a
 ### 18.4 PTRACE_EVENT_EXEC (deferred)
 <!-- txdoc:EXEC-18-4-PTRACE-EVENT-EXEC-DEFERRED -->
 
-When ptrace lands, exec will additionally raise `PTRACE_EVENT_EXEC` here as an intercept (per [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md)'s script/intercept vocabulary). The intercept may park the thread until the tracer continues. Unlike the tracepoint, the ptrace event is consumed by exactly one tracer and is part of the operation's control flow.
+When ptrace lands, exec will additionally raise `PTRACE_EVENT_EXEC` here as an intercept (per [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md)'s script/intercept vocabulary). The intercept may park the thread until the tracer continues. Unlike the tracepoint, the ptrace event is consumed by exactly one tracer and is part of the operation's control flow.
 
 The ptrace intercept fires *after* the tracepoint, ensuring tracepoint subscribers see the event before the thread potentially blocks for tracer interaction.
 
@@ -1803,10 +1803,10 @@ About 1500 lines of spec covering ~80 lines of script. The high spec-to-code rat
 ## 22. References
 <!-- txdoc:EXEC-22-REFERENCES -->
 
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — basis claims, script/wait vocabulary, publication, and carve-outs.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — `STEP-*`, `SCRIPT-*`, `EXEC-*`, and publication rules.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — basis claims, script/wait vocabulary, publication, and carve-outs.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — `STEP-*`, `SCRIPT-*`, `EXEC-*`, and publication rules.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) §3.6 (compositional scripts), §3.7 (point of no return), §9 (cross-subsystem scripts).
-- [`STEP_MODEL_v1.md`](./STEP_MODEL_v1.md) — five-phase discipline.
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — five-phase discipline.
 - [`PROCESS_v1.md`](../04_process-signals/PROCESS_v1.md) §5 (group exit), §7.2 (script_execve skeleton), §11.2 (deferrals), §3 (Frame shared slots).
 - [`VM_v1_2.md`](../03_memory-vm/VM_v1_2.md) §5.7 (detached exec address-space construction).
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) — PageContainer, materialize_page, `read_exact_at`.

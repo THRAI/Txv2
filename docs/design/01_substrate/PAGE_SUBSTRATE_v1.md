@@ -27,7 +27,7 @@
 - [`HAL_v1.md`](HAL_v1.md) — axHal-style static platform selection, boot sequence, pmap primitives (`PmapReservation`, kernel mapping reserve/commit/rollback, unmap invalidations, future `PmapCommitBatch`), `PT_NODE_POOL`, trap infrastructure. This document's preconditions are HAL's deliverables.
 - [`../00_meta-framework/MODULE_MAP_v1.md`](../00_meta-framework/MODULE_MAP_v1.md) §3 — foundation/HAL layout and boundary rules.
 - [`../00_meta-framework/object_model_v2.md`](../00_meta-framework/object_model_v2.md) §3, §7 — Frame as compound-payload entity; MapPin / CachePin / DmaToken as typed evidence.
-- [`../00_meta-framework/INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — STEP, MAP, and HAL/substrate boundary discipline.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP, MAP, and HAL/substrate boundary discipline.
 - [`../03_memory-vm/PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) — consumes frame and page-cache substrate primitives.
 
 ### Zone-derived type policy
@@ -1031,5 +1031,5 @@ Everything on top of this — `PageContainer`, `RNodeBacking`, user AddressSpace
 - [`HAL_v1.md`](HAL_v1.md) — boot sequence, trap, pmap primitives, TLB shootdown.
 - [`MODULE_MAP_v1.md`](../00_meta-framework/MODULE_MAP_v1.md) — foundation/HAL layout.
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) §3.3 (compound payload predicates), §5 (reference hierarchy), §6 (reclamation), §7.5 (operational contributions).
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — STEP-4, OBL-*, ARCH-*.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-4, OBL-*, ARCH-*.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) §4 (substrate primitives: zone, index, credit, mutation; this document adds the frame allocator as a sibling).

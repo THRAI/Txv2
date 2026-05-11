@@ -47,12 +47,12 @@ Does *not* cover:
 
 **Companion documents.**
 
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) §1 (third basis claim), §8 (authoritative bindings and derived materializations; justification invariant; publication rule; conditional-commit primitive family).
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — ARCH-5 (justification; publication rule), STEP-4, PRED-7, SIG-*.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) §1 (third basis claim), §8 (authoritative bindings and derived materializations; justification invariant; publication rule; conditional-commit primitive family).
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — ARCH-5 (justification; publication rule), STEP-4, PRED-7, SIG-*.
 - [`PAGE_SUBSTRATE_v1.md`](../01_substrate/PAGE_SUBSTRATE_v1.md) — frame allocator, FrameMeta, pmap substrate, slab.
 - [`PAGE_BACKED_v1.md`](PAGE_BACKED_v1.md) — PageContainer, RNodeBacking, materialize_page.
 - [`object_model.md`](../00_meta-framework/object_model_v2.md) §3.3 — Frame compound payload, MapPin.
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) — step outcome algebra, retry-on-wake discipline.
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — step outcome algebra, retry-on-wake discipline.
 - HAL design document — `PmapReservation`, `PmapCommitBatch`, `ShootdownBatch` primitives.
 
 ### Zone-derived type policy
@@ -244,7 +244,7 @@ writer-preference clients:
   `munmap_script`, `mprotect_script`, `mremap_script`,
   `fault_script`, `brk_script`). It produces `Done(guard)` on
   immediate acquisition and `Blocked(WaitToken)` on contention; async
-  callers feed the token to `wait_carrier::wait_on_token` and retry.
+  callers feed the token to `wait_source::wait_on_token` and retry.
 - `acquire_step_rich(range, mode) -> AcquireResult<'_>` is the
   underlying rich variant whose `WouldBlock` carrier holds an internal
   `PendingWriter` slot. The slot pushes back on subsequent
@@ -1141,11 +1141,11 @@ Approximately 1200 lines of spec. The architecture is substantially cleaner than
 ## References
 <!-- txdoc:VM-REFERENCES -->
 
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) §1 (third basis claim: publication principle), §8 (authoritative bindings, derived materializations, justification invariant, publication rule, conditional-commit primitive family).
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — ARCH-5 (justification; publication rule), STEP-4 (five-phase discipline), PRED-7 (anti-TOCTOU), SIG-* (publication discipline).
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) §1 (third basis claim: publication principle), §8 (authoritative bindings, derived materializations, justification invariant, publication rule, conditional-commit primitive family).
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — ARCH-5 (justification; publication rule), STEP-4 (five-phase discipline), PRED-7 (anti-TOCTOU), SIG-* (publication discipline).
 - [`PAGE_SUBSTRATE_v1.md`](../01_substrate/PAGE_SUBSTRATE_v1.md) — frame allocator, FrameMeta, pmap substrate, slab.
 - [`PAGE_BACKED_v1.md`](PAGE_BACKED_v1.md) — PageContainer, RNodeBacking, materialize_page, reflink.
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) — step outcome algebra, retry-on-wake.
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — step outcome algebra, retry-on-wake.
 - [`object_model.md`](../00_meta-framework/object_model_v2.md) §3.3, §5, §6, §7 — compound payload, reference hierarchy, reclamation.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) §4 — substrate primitives (zone, index, credit, mutation); §4.5 is the realization catalog for ARCH-5's publication rule.
 - HAL design document — `PmapReservation`, `PmapCommitBatch`, `ShootdownBatch`.

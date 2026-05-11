@@ -13,12 +13,12 @@
 - [`DEVICE.md`](./DEVICE.md) — tier-2 `CharDeviceBinding` consumed by hardware-backed TTYs via `TtyTransport::Hardware`.
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) §3, §8.1.1 — Identity/Payload factoring convention. TTY is factored per this convention.
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) §2 — `StructBacked::Tty(Cap<TtyIdentity>)`; §2.3 lifecycle notes. This document **revises** PAGE_BACKED's note that the payload is `TtyData`: TTY now factors per `object_model_v2 §8.1.1`, with `Tty(Cap<TtyIdentity>)` as the identity handle.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — BIF-*, PRED-*, OBL-*, SIG-*. TTY's entity split is a BIF application; session/pgrp bindings use OBL addressability; `hangup_port` is a SIG-4 / SIG-11 attachment.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — BIF-*, PRED-*, OBL-*, SIG-*. TTY's entity split is a BIF application; session/pgrp bindings use OBL addressability; `hangup_port` is a SIG-4 / SIG-11 attachment.
 - [`LIVENESS_v2.1.md`](../00_meta-framework/archived/LIVENESS_v2.1.md) — archived partial-order source material.
 - [`SIGNAL_ATTACHMENTS_v1.md`](../04_process-signals/SIGNAL_ATTACHMENTS_v1.md) — this document contributes catalog entries for TTY wires (`hangup_port`, `input_readable`, `output_writable`, `session_ctl_port`); see §8.
 - [`BUS_v1.md`](../01_substrate/BUS_v1.md) — RawQueue / RawPort used.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — standard four-module layout (§9).
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — step/script model.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — step/script model.
 
 ### Zone-derived type policy
 
@@ -285,7 +285,7 @@ TtyIdentity.addressability ⟂ TtyPayload.payload
 
 <!-- txdoc:TTY-INTRA-TTYPAYLOAD-CONCURRENCY-DISCIPLINE-1 -->
 
-Every shared field on `TtyIdentity` and `TtyPayload` carries an explicit concurrency contract chosen to match its access pattern. This section names the contracts and their justifications. The underlying framework rules come from [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) and [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) publication and binding rules.
+Every shared field on `TtyIdentity` and `TtyPayload` carries an explicit concurrency contract chosen to match its access pattern. This section names the contracts and their justifications. The underlying framework rules come from [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) and [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) publication and binding rules.
 
 **Two disciplines coexist in TTY.** (a) The standard IPC-producer-serialization pattern for `input_queue` / `output_queue` — identical in shape to what pipe, socket send/recv buffers, and POSIX message queues use for concurrent `read()` / `write()` on the same fd. Not a TTY invention; TTY inherits it. (b) A transformation-layer single-writer pattern for `ldisc_state`, specific to subsystems with a kernel-internal transformation step between producer and consumer queues. TTY is the first subsystem with this shape; whether the pattern recurs elsewhere will decide whether it becomes a shared primitive.
 
@@ -886,7 +886,7 @@ frame/devpts/
 - [`DEVICE.md`](./DEVICE.md) §5.2 — CharDeviceBinding consumed via `TtyTransport::Hardware`.
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) §8.1.1.
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) §2.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — BIF-*, SIG-*.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — BIF-*, SIG-*.
 - [`LIVENESS_v2.1.md`](../00_meta-framework/archived/LIVENESS_v2.1.md) §3.
 - [`SIGNAL_ATTACHMENTS_v1.md`](../04_process-signals/SIGNAL_ATTACHMENTS_v1.md) §3.
 - [`BUS_v1.md`](../01_substrate/BUS_v1.md).

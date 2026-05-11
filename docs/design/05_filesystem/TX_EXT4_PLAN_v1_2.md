@@ -17,8 +17,8 @@
 - [`VFS_CHECKS_V2.1.md`](VFS_CHECKS_V2.1.md) and [`MOUNT_v1.md`](MOUNT_v1.md) — VFS ownership boundary, `FsOps` and `FsPageBacking` consumer side.
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) — `FsPageBacking` trait, `PageContainer` model.
 - [`VM_v1_2.md`](../03_memory-vm/VM_v1_2.md) — fault handler and `FsPageBacking::fetch_page` integration.
-- [`CONCEPTS_v4.md §3.5`](../00_meta-framework/CONCEPTS_v4.md) — factoring/topology axes used throughout this plan.
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) — `StepOutcome` contract; all async methods return step outcomes.
+- [`01_CONCEPTS_v5.md §3.5`](../../Txv3/01_CONCEPTS_v5.md) — factoring/topology axes used throughout this plan.
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — `StepOutcome` contract; all async methods return step outcomes.
 
 ### Zone-derived type policy
 
@@ -74,7 +74,7 @@ resolved through VFS/PageBacked.
 
 - **No runtime dependence on rsext4.** rsext4 is a reference and the on-disk format is ported from it; the runtime library is ours.
 - **No rsext4-style multi-level cache.** `PageContainer` is the cache.
-- **No synchronous blocking.** Every I/O call yields a `StepOutcome::Blocked` and resumes when the block device completes. The block device trait is async.
+- **No synchronous blocking.** Every I/O call yields a `StepOutcome::Yield { shape: YieldShape::OnWaitSource { .. } }` and resumes when the block device completes. The block device trait is async.
 - **No `&mut self` threading.** Concurrent operations on the same `Ext4FsInstance` must be admissible. State mutation goes through PC-level publication discipline (ARCH-5) and substrate primitives.
 - **No `Cap<RNode>` held inside tx-ext4.** All operations key on `fs_object_id`.
 - **tx-ext4 is stateless per persistent object.** All per-inode state lives in one of two places: (a) POSIX-abstract decoded metadata (`InodeMeta`) on VFS's RNode, serialized to/from on-disk records by tx-ext4; (b) ext4-specific fields (extent tree root, htree info, flags beyond POSIX) addressed as *bytes* in the inode-table PC, re-parsed on each use. **tx-ext4 does not maintain a per-inode decoded cache of ext4-specific fields.** The only persistent state tx-ext4 holds is mount-level: block device handle, superblock mirror, journal state, metadata PC handles. This is stronger than "no Cap<RNode>" — it closes off a second decoded-cache coherence domain. If profiling later shows per-inode re-parse is a measurable cost, a bounded decoded-extent-root cache keyed by `(fs_object_id, modification_counter)` may be added as a phase-5 optimization; the invalidation key ensures coherence across rematerialization.
@@ -578,7 +578,7 @@ tx-ext4 implements two traits (`FsPageBacking`, `FsOps`), consumes one trait (`B
 <!-- txdoc:TX-EXT4-PLAN-INTEGRATION-GOALS-1 -->
 
 1. **VFS walker consumes tx-ext4.** The walker's `NeedIO` resume path correctly delegates to `FsOps::lookup` and `FsOps::load_inode_meta` via the MountPayload coherence-index find-or-create protocol.
-2. **Page fault handler consumes tx-ext4.** User-space page faults on file-backed mappings drive through `FsPageBacking::fetch_page` with correct `StepOutcome::Blocked` yield behavior.
+2. **Page fault handler consumes tx-ext4.** User-space page faults on file-backed mappings drive through `FsPageBacking::fetch_page` with correct `StepOutcome::Yield { shape: YieldShape::OnWaitSource { .. } }` yield behavior.
 3. **No tx-ext4 reference to `Cap<RNode>`.** Verified by `grep` — the tx-ext4 crate does not import `RNode` or hold it in any type.
 4. **No rsext4 code in runtime build.** Verified by `cargo tree` — rsext4 is not a compile-time or runtime dependency.
 

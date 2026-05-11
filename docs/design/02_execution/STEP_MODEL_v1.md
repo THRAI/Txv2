@@ -2,7 +2,20 @@
 
 <!-- txdoc:02-EXECUTION-STEP-MODEL-V1 -->
 
-**Status.** v1 (2026-04-19).
+> **⚠ SUPERSEDED by [`Txv3/03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md).**
+> Per `docs/Txv3/INDEX.md` §3, v1 is the prior step model.
+> v2 narrows `StepOutcome` to four variants (Continue, Yield,
+> Done, Err), factors against a closed `YieldShape` catalog
+> (`OnWaitSource`, `OnAgent`, `OnTimer`), introduces the typed
+> `StepOp` trait and the `StepProgress` monoid, and adds the
+> `DriverMode::classify` matrix. v1 vocabulary (`Wait-adapt`,
+> `Blocked(WaitToken)`, `AdvancedThenBlocked`) is replaced by
+> the v2 forms (`Yield-adapt`, `Yield { shape: OnWaitSource }`,
+> `Yield { progress, shape }` with non-empty progress). This file
+> is retained for historical reference and section anchors that
+> v4 subsystem docs still cite; new prose should use v2.
+
+**Status.** v1 (2026-04-19) — **superseded**.
 
 **Purpose.** Specify the step primitive: the synchronous, bounded unit of execution that replaces the prepare/commit split as txKernel's operation-building primitive. Define the step outcome algebra, the five-stage in-step discipline, witness scope in practice, and how steps compose with drivers and the wait primitive to form operations.
 

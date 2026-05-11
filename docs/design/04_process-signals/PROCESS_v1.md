@@ -23,8 +23,8 @@ Companion documents:
 - [`REACTOR_v0.md`](../02_execution/REACTOR_v0.md) — reactor contract.
 - [`SCHEDULER_v0.md`](../02_execution/SCHEDULER_v0.md) — scheduler policy (for nice/setpriority/setscheduler deferrals).
 - [`NAMESPACE_VIEW_v1.md`](../00_meta-framework/NAMESPACE_VIEW_v1.md) — nsproxy, pid-name resolution, namespace-view commits, and projected RNodes.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — ARCH-5 (publication rule), BIF-* (bifurcation), STEP-* (step discipline), SCRIPT-* (script rules).
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — authoritative bindings, derived materializations, and publication rule.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — ARCH-5 (publication rule), BIF-* (bifurcation), STEP-* (step discipline), SCRIPT-* (script rules).
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — authoritative bindings, derived materializations, and publication rule.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) §3 (five-phase discipline), §4 (substrate primitive families).
 - [`cred_service_v_1_draft (2).md`](<../02_execution/cred_service_v_1_draft (2).md>) and [`rlimit_service_v_1_draft (1).md`](<../02_execution/rlimit_service_v_1_draft (1).md>) — process policy services.
 
@@ -141,7 +141,7 @@ Execution, scheduling, signal delivery, synchronous-fault attribution, stop/cont
 - **Fault attribution.** Only a thread faults. SIGSEGV's target is the specific faulting thread, not "the process."
 - **Stop/continue compliance.** "The process is stopped" means every thread has transitioned to `Stopped`. Process-stopped is emergent from all-threads-stopped; no separate process-level stop flag exists.
 - **Termination compliance.** "The process exits" means every thread has run `step_thread_exit` and the last triggered `step_process_exit`. `exit_status` is populated by the last thread.
-- **Wait observability.** `thread_exit_port` fires per thread (pthread_join, clear_child_tid); `exit_port` fires when the last-thread-exit triggers process exit (waitpid, pidfd). Both wires fire because threads fire them.
+- **Wait observability.** `thread_exit_source` fires per thread (pthread_join, clear_child_tid); `exit_source` fires when the last-thread-exit triggers process exit (waitpid, pidfd). Both wires fire because threads fire them.
 
 **What the process provides to threads:**
 
@@ -279,8 +279,8 @@ flat shape, in this order:
 - ELF loader Wave 1 (commit `c67c970`): flipped `aspace` to
   `AtomicSlot<Cap<AddressSpace>>` so exec Phase 6's atomic store
   could swap the address space without a sibling-thread quiesce.
-- fork/clone/wait4 Wave 1 (commit `e697631`): added `exit_port:
-  Channel` and `exit_port_carrier_id: u64` so `sys_wait4` could
+- fork/clone/wait4 Wave 1 (commit `e697631`): added `exit_source:
+  Channel` and `exit_source_id: u64` so `sys_wait4` could
   park on the carrier without holding the parent's `Cap`.
 - DAC + setuid Wave 2 (commit `fcd9639`): added `cred:
   SpinMutex<Cred>` (a per-process credential snapshot) and the
@@ -335,10 +335,10 @@ pub struct ProcessPayload {
     /// Heap region anchors. (Trio Phase 2b.)
     pub(crate) brk_base: AtomicU64,
     pub(crate) current_brk: AtomicU64,
-    /// Reactor wait carrier for child-zombify events.
+    /// Reactor wait source for child-zombify events.
     /// (Fork/clone/wait4 Wave 1.)
-    pub(crate) exit_port: Channel,
-    pub(crate) exit_port_carrier_id: u64,
+    pub(crate) exit_source: Channel,
+    pub(crate) exit_source_id: u64,
     /// Identity back-pointer.
     pub(crate) identity: tx_substrate::zone::Weak<ProcessIdentity>,
 }
@@ -1017,7 +1017,7 @@ fn step_process_exit(proc: Cap<ProcessIdentity>, status: ExitStatus) -> StepOutc
     //                 si_status: exit_status, .. })
     //     (per SIGNAL_v1 §17.2; subject to parent's SIGCHLD disposition and
     //      SA_NOCLDSTOP / SA_NOCLDWAIT flags)
-    //   - fire exit_port: SignalGenerated{Exited(status)} per SIGNAL_ATTACHMENTS_v1 §3.3
+    //   - fire exit_source: SignalGenerated{Exited(status)} per SIGNAL_ATTACHMENTS_v1 §3.3
     //     (for waitpid direct observers, pidfd subscribers, ptrace tracer)
     //   - fire wait-queue wake: parent's waitpid waiters
     //   - tracepoint: trace_process_exited(pid, status)
