@@ -74,10 +74,20 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 // fn) — no `*Op` wrap exists for the exec orchestration today.
 // When `exec_script` gains a StepOp wrap (or is decomposed into a
 // pipeline of wraps), thread `&mut KernelScriptCtx` here.
-pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf>(
+pub static SYS_EXECVE_INVOCATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_CLONE_INVOCATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_WAIT4_INVOCATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_EXECVE_LAST_ERRNO: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(0);
+
+pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
+    SYS_EXECVE_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let path_uaddr = args[0];
     let argv_uaddr = args[1];
     let envp_uaddr = args[2];
@@ -202,14 +212,25 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
 /// v1's single-thread-per-process model). The function is non-`async`
 /// to keep the seam minimal.
-pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub static SYS_CLONE_LAST_FLAGS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static SYS_CLONE_LAST_REJECT_FLAGS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn sys_clone<'a, P: PmapIf + tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    SYS_CLONE_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let flags = args[0];
     let stack = args[1];
+    SYS_CLONE_LAST_FLAGS.store(flags, core::sync::atomic::Ordering::Relaxed);
 
     // Validation: bare-SIGCHLD only. Reject any other flag combo
     // (CLONE_VM, CLONE_VFORK, pthread_create OR-set, zero, etc.) and
     // any non-zero stack.
     if flags != SIGCHLD {
+        SYS_CLONE_LAST_REJECT_FLAGS.store(flags, core::sync::atomic::Ordering::Relaxed);
         return SyscallResult::Error(EINVAL_VALUE);
     }
     if stack != 0 {
@@ -251,8 +272,6 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         match op.step(&mut script_ctx) {
             V3Fork::Done(r) => r,
             V3Fork::Err(_) | V3Fork::Continue { .. } | V3Fork::Yield { .. } => {
-                // `ForkOp` always returns `Done(Result<...>)`; the
-                // other variants are unreachable by construction.
                 return SyscallResult::Error(EAGAIN_VALUE);
             }
         }
@@ -353,6 +372,7 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 /// Cites: `txdoc:PROCESS-WAIT-FAMILY-1`
 /// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4).
 pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SYS_WAIT4_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let pid = args[0] as i64 as i32;
     let wstatus_uaddr = args[1];
     let options = args[2] as i32;

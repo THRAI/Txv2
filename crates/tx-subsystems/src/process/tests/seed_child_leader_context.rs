@@ -54,7 +54,7 @@ fn seed_child_leader_context_zeroes_a0() {
 }
 
 #[test]
-fn seed_child_leader_context_skips_ecall() {
+fn seed_child_leader_context_inherits_pc() {
     let _g = setup();
     let parent = bootstrap();
     let child = step_fork::<TestPmap>(&parent).expect("fork");
@@ -69,9 +69,11 @@ fn seed_child_leader_context_skips_ecall() {
         .saved_user_context()
         .expect("seed installs Some");
     assert_eq!(
-        saved.pc,
-        parent_ctx.pc + 4,
-        "RV64 ecall is 4 bytes; child resumes after the trapping ecall, not at it",
+        saved.pc, parent_ctx.pc,
+        "the trap shell (`tx-kernel::trap_handoff::hand_off_syscall`) \
+         already advances PC past the trapping ecall before storing \
+         `saved_user_context`; the child therefore inherits the same \
+         post-ecall PC as the parent and must NOT double-advance.",
     );
 }
 

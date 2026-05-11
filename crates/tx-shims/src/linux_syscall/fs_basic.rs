@@ -613,10 +613,53 @@ pub(super) fn make_ioctl_caller(ctx: &SyscallCtx<'_>) -> IoctlCaller {
 /// arm itself is non-async; `Blocked` / `AdvancedThenBlocked` outcomes
 /// are unreachable in practice and surface as `-EIO` for symmetry with
 /// the other fd arms.
+/// DIAGNOSTIC (temp, 2026-05-12): counts of ioctl requests and the
+/// last seen request word. Useful for tracing the post-prompt EOF
+/// gap, where the TTY's termios is somehow ICANON-cleared before
+/// busybox's first read.
+pub static SYS_IOCTL_INVOCATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_IOCTL_LAST_REQUEST: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static SYS_IOCTL_TCSETS_CALLS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_IOCTL_TCGETS_CALLS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+/// On the first TCGETS, record the lflag the kernel handed back —
+/// this reveals what state the TTY was in *before* busybox touched it.
+pub static FIRST_TCGETS_LFLAG: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+pub static FIRST_TCGETS_VMIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+/// On every TCSETS, record the lflag/vmin/vtime busybox installed.
+/// We watch the latest one because the call right before the read is
+/// the one that puts the TTY into the VMIN=0 polling shape.
+pub static LAST_TCSETS_LFLAG: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+pub static LAST_TCSETS_VMIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+pub static LAST_TCSETS_VTIME: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+pub static FIRST_TCSETS_LFLAG: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+pub static FIRST_TCSETS_VMIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+
 pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let request = args[1] as u32;
     let argp = args[2];
+    SYS_IOCTL_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    SYS_IOCTL_LAST_REQUEST.store(request, core::sync::atomic::Ordering::Relaxed);
+    match request {
+        TCSETS | TCSETSW | TCSETSF => {
+            SYS_IOCTL_TCSETS_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        TCGETS => {
+            SYS_IOCTL_TCGETS_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {}
+    }
 
     if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
@@ -681,6 +724,16 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match unwrap_v3(outcome) {
                 Ok(termios) => {
+                    if SYS_IOCTL_TCGETS_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1 {
+                        FIRST_TCGETS_LFLAG.store(
+                            termios.c_lflag as u32,
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                        FIRST_TCGETS_VMIN.store(
+                            termios.c_cc[tx_subsystems::tty::structure::termios::VMIN] as u32,
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                     if argp == 0 {
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
@@ -706,6 +759,28 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 Ok(v) => v,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
+            LAST_TCSETS_LFLAG.store(
+                new_termios.c_lflag as u32,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            LAST_TCSETS_VMIN.store(
+                new_termios.c_cc[tx_subsystems::tty::structure::termios::VMIN] as u32,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            LAST_TCSETS_VTIME.store(
+                new_termios.c_cc[tx_subsystems::tty::structure::termios::VTIME] as u32,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            if SYS_IOCTL_TCSETS_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1 {
+                FIRST_TCSETS_LFLAG.store(
+                    new_termios.c_lflag as u32,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                FIRST_TCSETS_VMIN.store(
+                    new_termios.c_cc[tx_subsystems::tty::structure::termios::VMIN] as u32,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
             let outcome = {
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tcsets(&tty, new_termios, &guard)

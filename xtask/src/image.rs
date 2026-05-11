@@ -188,6 +188,21 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
 
     #[cfg(unix)]
     {
+        // BusyBox applet wiring: symlink each applet name to the
+        // single `busybox` binary. Previously this used `hard_link`,
+        // which created 28 directory entries all pointing at the same
+        // inode — and `find … | cpio -o -H newc` honours the newc
+        // hardlink convention by emitting file data on the LAST
+        // hardlink only, leaving the others as 0-byte stubs. The
+        // kernel's initramfs unpacker does not resolve newc
+        // hardlinks (each entry is a fresh inode), so 27 of 28
+        // applets — including `/bin/sh` and `/bin/busybox` itself —
+        // landed empty, and exec rejected them with `not-executable`.
+        // Symlinks sidestep the issue: `cpio` emits each entry as a
+        // first-class symlink, the unpacker calls
+        // `FsOps::symlink(...)`, and walker chases through to the
+        // single 1.4 MiB regular file. Matches BusyBox's standard
+        // install layout, where applets are also symlinks.
         for name in [
             "sh", "ls", "cat", "mkdir", "rm", "rmdir", "mv", "cp", "touch", "pwd", "echo", "ln",
             "chmod", "chown", "uname", "ps", "kill", "grep", "find", "head", "tail", "wc", "sort",
@@ -197,8 +212,9 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
             if path.exists() {
                 fs::remove_file(&path).map_err(|err| err.to_string())?;
             }
-            fs::hard_link(layout.join("bin").join("busybox"), path)
-                .map_err(|err| err.to_string())?;
+            // Relative target so the symlink resolves to the sibling
+            // `busybox` regardless of where the rootfs is mounted.
+            unix_fs::symlink("busybox", path).map_err(|err| err.to_string())?;
         }
 
         // Initramfs slice (2026-05-08): replace the shebang `/init`

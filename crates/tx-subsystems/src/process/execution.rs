@@ -432,8 +432,20 @@ pub fn seed_child_leader_context(
     let mut child_ctx = *parent_user_ctx;
     // (2) RV64 a0 = 0: child's clone-syscall return value.
     child_ctx.regs[10] = 0;
-    // (3) Skip past ecall: child resumes after, not retries.
-    child_ctx.pc = parent_user_ctx.pc.wrapping_add(4);
+    // (3) PC already points past `ecall`: the trap shell
+    // (`tx-kernel::trap_handoff::hand_off_syscall`) added the 4-byte
+    // RV64 `ecall` insn width to `pc` at trap-capture time before
+    // storing into `saved_user_context`. Adding another 4 here would
+    // skip an extra instruction in the child (off-by-one), which
+    // shows up as a crash on the first userspace instruction the
+    // child should not be executing.
+    //
+    // The init fixture works around this by luck: the instruction
+    // skipped is the `bnez a0, parent_path` branch that for `a0=0`
+    // falls through anyway, so the extra +4 lands at the start of
+    // the child path. Real musl-built binaries (busybox sh forking
+    // for an applet) place a `mv` or load between the ecall and the
+    // branch, and the +4 turns into a wild PC.
 
     // (4) Store on the leader thread's payload. payload_cap == None
     // here means a freshly forked thread already lost its payload,

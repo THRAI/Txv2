@@ -155,9 +155,48 @@ pub(super) async fn sys_readv<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// follow-up). For non-blocking polls (timeout = 0) this would
 /// busy-loop in userspace; address it if/when a real workload hits
 /// it.
+pub static SYS_PPOLL_INVOCATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_PPOLL_LAST_NFDS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_PPOLL_LAST_TIMEOUT_PTR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// `ppoll(fds, nfds, timeout_ptr, sigmask_ptr)`.
+///
+/// Minimal implementation that supports the busybox interactive-shell
+/// pattern (single fd, POLLIN, blocking wait). For each pollfd we
+/// peek at the fd's TTY backing readability; if no fd is currently
+/// ready and the timeout is non-zero, we park on the first TTY fd's
+/// wait source and re-poll on wake. Returns the number of fds with
+/// non-zero `revents`.
+///
+/// Behaviour gaps (called out so a future caller doesn't trip on
+/// them):
+/// - Only POLLIN is honoured; POLLOUT / POLLERR / etc. are reported
+///   verbatim from `events` if any fd is found to be ready, otherwise
+///   suppressed. POLLOUT-only polls on TTY backings still return
+///   "ready" eagerly to match the legacy stub semantics.
+/// - Multi-fd waits park on the FIRST TTY POLLIN fd only. If a
+///   different fd becomes readable while we're parked on the first,
+///   we wake on the next ingest event regardless (the wait_source
+///   carrier fires from any TTY ingest path); the re-check loop then
+///   notices the other fd. Cross-fd starvation is theoretically
+///   possible but not observed in practice for the busybox flows.
+/// - The `timeout_ptr` is read but a non-NULL timeout uses the
+///   timeout-elapsed branch only as an upper bound; the actual
+///   timer hookup ships with the OnTimer wave (deferred).
+/// - The signal mask is ignored.
 pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    use tx_subsystems::execution::WaitToken;
+    use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
+
+    SYS_PPOLL_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let fds_ptr = args[0];
     let nfds = args[1];
+    let timeout_ptr = args[2];
+    SYS_PPOLL_LAST_NFDS.store(nfds as usize, core::sync::atomic::Ordering::Relaxed);
+    SYS_PPOLL_LAST_TIMEOUT_PTR.store(timeout_ptr, core::sync::atomic::Ordering::Relaxed);
 
     if nfds > 1024 {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -166,26 +205,105 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return SyscallResult::Return(0);
     }
 
+    // Pollfd layout: { i32 fd; i16 events; i16 revents } — 8 bytes
+    // packed on Linux RV64 generic ABI.
     const POLLFD_BYTES: u64 = 8;
-    let mut ready: i64 = 0;
-    for i in 0..nfds {
-        let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
-        let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
-            return SyscallResult::Error(errno_to_i32(errno));
+    const POLLIN: i16 = 0x0001;
+
+    // Snapshot the timeout treatment: NULL → infinite wait, else
+    // treat any non-NULL pointer as "wait but bounded" — the timer
+    // wire isn't actually consulted today (see header comment), so
+    // for non-NULL we still wait on the carrier (the re-poll loop
+    // returns whatever's ready on wake) and trust the caller to
+    // retry. Empty timespec ({0,0}) would be the "poll-without-wait"
+    // shape, but distinguishing it from "wait forever" requires
+    // reading two u64s; the busybox flow uses NULL = forever, so we
+    // only implement that branch precisely.
+    let wait_allowed = true;
+    let _ = timeout_ptr; // see header note
+
+    // First pass: read each pollfd, check readability against the
+    // backing, write back `revents`, and remember the first TTY fd
+    // that requested POLLIN but isn't currently readable. That fd's
+    // wait source is what we park on if nothing is ready.
+    let mut park_on_carrier: Option<u64> = None;
+    let ready = loop {
+        let mut ready: i64 = 0;
+        for i in 0..nfds {
+            let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
+            let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
+            if let Err(errno) =
+                bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr)
+            {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            let fd = i32::from_le_bytes(ent_bytes[0..4].try_into().unwrap());
+            let events = i16::from_le_bytes(ent_bytes[4..6].try_into().unwrap());
+            let mut revents: i16 = 0;
+            if fd >= 0 {
+                if let Some(file) = resolve_fd(&ctx.process, fd as u32) {
+                    if events & POLLIN != 0 {
+                        // TTY backing: peek the readable level.
+                        if let RNodeBacking::StructBacked {
+                            payload: StructPayload::Tty(tty),
+                        } = file.rnode().backing()
+                        {
+                            use tx_subsystems::tty::execution::TTY_READABLE;
+                            if tty.input_readable.peek() & TTY_READABLE != 0 {
+                                revents |= POLLIN;
+                            } else if park_on_carrier.is_none() {
+                                park_on_carrier =
+                                    Some(tty.wait_source_id());
+                            }
+                        } else {
+                            // Non-TTY backings: punt to the legacy
+                            // "always ready" shape so files / pipes
+                            // / chardevs don't regress to a hang.
+                            revents |= POLLIN;
+                        }
+                    }
+                    // POLLOUT-only polls: legacy semantics — TTYs
+                    // and most other fds are always writable in v1.
+                    let pollout: i16 = 0x0004;
+                    if events & pollout != 0 {
+                        revents |= pollout;
+                    }
+                } else {
+                    let pollnval: i16 = 0x0020;
+                    revents = pollnval;
+                }
+            }
+            if revents != 0 {
+                ready += 1;
+            }
+            ent_bytes[6..8].copy_from_slice(&revents.to_le_bytes());
+            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, ent_ptr, &ent_bytes) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
         }
-        let fd = i32::from_le_bytes(ent_bytes[0..4].try_into().unwrap());
-        let events = i16::from_le_bytes(ent_bytes[4..6].try_into().unwrap());
-        // revents = events for fd >= 0; revents = 0 for fd < 0.
-        let revents: i16 = if fd >= 0 { events } else { 0 };
-        if fd >= 0 {
-            ready += 1;
+
+        if ready > 0 {
+            break ready;
         }
-        ent_bytes[6..8].copy_from_slice(&revents.to_le_bytes());
-        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, ent_ptr, &ent_bytes) {
-            return SyscallResult::Error(errno_to_i32(errno));
+        if !wait_allowed {
+            break 0;
         }
-    }
+        let Some(carrier_id) = park_on_carrier.take() else {
+            // No carrier to park on (all fds non-TTY, none ready) —
+            // give up rather than spin.
+            break 0;
+        };
+        use tx_subsystems::tty::execution::TTY_READABLE;
+        let token = WaitToken::new(carrier_id, TTY_READABLE);
+        if let Some(future) = wait_source::wait_on_token(token) {
+            let _ = future.await;
+        } else {
+            // Carrier not registered — fall through and return what
+            // we have rather than spinning forever.
+            break 0;
+        }
+    };
+
     SyscallResult::Return(ready)
 }
 
@@ -349,7 +467,28 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// TTY's wait `Channel`. On any partial progress (`total > 0`)
 /// the dispatcher returns what it has rather than block again,
 /// matching `sys_write`'s partial-success policy.
+/// DIAGNOSTIC (temp, 2026-05-12): one atomic per sys_read outcome
+/// shape. Read by `tx-kernel::init::exec::run_userspace_reactor_loop`'s
+/// exit sentinel so the boot log can show whether sys_read ever ran,
+/// what it returned, and whether the wait-source carrier was
+/// registered. Helps isolate the post-prompt EOF gap.
+pub static SYS_READ_INVOCATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_READ_DONE_ZERO: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_READ_DONE_NONZERO: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_READ_YIELDS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_READ_WAIT_NONE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_READ_ERR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_READ_LAST_ERRNO: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(0);
+
 pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SYS_READ_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let fd = args[0] as i32;
     let buf_ptr = args[1] as usize;
     let len = args[2] as usize;
@@ -422,6 +561,7 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         match outcome {
             V3Out::Done(read) => {
                 if read > 0 {
+                    SYS_READ_DONE_NONZERO.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     if let Err(errno) = bootstrap_copy_to_user(
                         &ctx.aspace,
                         buf_ptr as u64 + cursor as u64,
@@ -432,6 +572,8 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                         }
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
+                } else {
+                    SYS_READ_DONE_ZERO.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 total += read;
                 return SyscallResult::Return(total as i64);
@@ -499,9 +641,12 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 if total > 0 {
                     return SyscallResult::Return(total as i64);
                 }
+                SYS_READ_YIELDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 let token = WaitToken::new(carrier.raw(), interests.raw());
                 if let Some(future) = wait_source::wait_on_token(token) {
                     let _ = future.await;
+                } else {
+                    SYS_READ_WAIT_NONE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
             V3Out::Yield {
@@ -523,11 +668,14 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 return SyscallResult::Error(errno_to_i32(Errno::EIO));
             }
             V3Out::Err(v3errno) => {
+                SYS_READ_ERR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 if total > 0 {
                     return SyscallResult::Return(total as i64);
                 }
                 let errno: Errno = v3errno.into();
-                return SyscallResult::Error(errno_to_i32(errno));
+                let errno_i32 = errno_to_i32(errno);
+                SYS_READ_LAST_ERRNO.store(errno_i32, core::sync::atomic::Ordering::Relaxed);
+                return SyscallResult::Error(errno_i32);
             }
         }
     }
