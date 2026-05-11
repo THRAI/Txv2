@@ -167,8 +167,10 @@ fn deliver_tty_dispatch_skips_members_when_source_lacks_permission() {
     // parent is permitted to itself (uid match) but denied to
     // child (1000 vs 0).
     {
+        // PR-9 phase 5 (D5 Path A): `cred` lives in `AtomicSlot<Cap<Cred>>`.
         let p = parent.payload.lock();
-        *p.as_ref().unwrap().cred.lock() = crate::cred::Cred {
+        let payload = p.as_ref().unwrap();
+        let new = crate::cred::Cred {
             uid: Uid(1000),
             euid: Uid(1000),
             suid: Uid(1000),
@@ -178,6 +180,9 @@ fn deliver_tty_dispatch_skips_members_when_source_lacks_permission() {
             effective_caps: crate::cred::CapabilitySet::EMPTY,
             permitted_caps: crate::cred::CapabilitySet::EMPTY,
         };
+        let new_cap =
+            crate::cred::sign_cred(new).expect("zone slab has capacity in tests");
+        let _old = payload.replace_cred(new_cap);
     }
 
     let pgrp = parent.pgrp_cap();
