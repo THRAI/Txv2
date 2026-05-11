@@ -5,18 +5,18 @@
 //! persistent/concurrent interval index for a later substrate fit.
 //!
 //! Each `RangeLock` owns a `tx_reactor::wait::Channel` registered with
-//! `wait_carrier`. On every release the channel fires the
+//! `wait_source`. On every release the channel fires the
 //! `RANGE_LOCK_RELEASE_MASK` bit so async script wrappers can convert a
 //! `WouldBlock` outcome into an awaitable wait via `WouldBlock::wait_token`.
 
 use tx_reactor::wait::{Channel, Mask};
 use tx_substrate::step_v3::{
-    InterestConditions, NoProgress, StepOutcome as V3StepOutcome, WakeCarrier, YieldShape,
+    InterestMask, NoProgress, StepOutcome as V3StepOutcome, WaitSourceId, YieldShape,
 };
 use tx_substrate::SpinMutex;
 
 use crate::execution::WaitToken;
-use crate::wait_carrier;
+use crate::wait_source;
 
 use super::UserRange;
 
@@ -54,12 +54,12 @@ impl<'a> WouldBlock<'a> {
         self.pending_writer.is_some()
     }
 
-    /// `WaitToken` whose carrier resolves to the underlying `RangeLock`'s
+    /// `WaitToken` whose source resolves to the underlying `RangeLock`'s
     /// release channel. Async wrappers feed this into
-    /// `wait_carrier::wait_on_token` to await the next release before
+    /// `wait_source::wait_on_token` to await the next release before
     /// retrying their try-acquire.
     pub fn wait_token(&self) -> WaitToken {
-        WaitToken::new(self.lock.wait_carrier_id, RANGE_LOCK_RELEASE_MASK)
+        WaitToken::new(self.lock.wait_source_id, RANGE_LOCK_RELEASE_MASK)
     }
 }
 
@@ -116,29 +116,29 @@ impl Drop for PendingWriter<'_> {
 pub struct RangeLock {
     state: SpinMutex<RangeLockState>,
     wait_channel: Channel,
-    wait_carrier_id: u64,
+    wait_source_id: u64,
 }
 
 impl RangeLock {
     pub fn new() -> Self {
         let wait_channel = Channel::new();
-        let wait_carrier_id = wait_carrier::register_wait_channel(wait_channel.clone());
+        let wait_source_id = wait_source::register_wait_channel(wait_channel.clone());
         Self {
             state: SpinMutex::new(RangeLockState::new()),
             wait_channel,
-            wait_carrier_id,
+            wait_source_id,
         }
     }
 
     /// Carrier id under which this `RangeLock`'s release channel is
-    /// registered with the global wait-carrier resolver. Exposed for async
+    /// registered with the global wait-source resolver. Exposed for async
     /// wrappers that hand-build their own `WaitToken` values.
-    pub fn wait_carrier_id(&self) -> u64 {
-        self.wait_carrier_id
+    pub fn wait_source_id(&self) -> u64 {
+        self.wait_source_id
     }
 
     /// Canonical step-shaped acquire per VM_v1_2 §3.1. `Done` = the
-    /// reservation is held; `Yield { OnCarrier }` = the caller should
+    /// reservation is held; `Yield { OnWaitSource }` = the caller should
     /// await the carrier+interest pair and retry. The internal
     /// `PendingWriter` slot used for writer-preference is not exposed
     /// here; production scripts (which drop the rich `WouldBlock`
@@ -147,7 +147,7 @@ impl RangeLock {
     /// `acquire_step_rich`.
     ///
     /// Returns a step_v3 outcome with `NoProgress` (one-shot acquire,
-    /// no byte/page accumulator). Only `Done` and `Yield { OnCarrier }`
+    /// no byte/page accumulator). Only `Done` and `Yield { OnWaitSource }`
     /// are produced; `Continue` / `Yield { OnAgent }` / `Err` cannot
     /// occur by construction.
     pub fn acquire_step(
@@ -161,9 +161,9 @@ impl RangeLock {
                 let token = blocked.wait_token();
                 V3StepOutcome::Yield {
                     progress: NoProgress,
-                    shape: YieldShape::OnCarrier {
-                        carrier: WakeCarrier::new(token.carrier()),
-                        interests: InterestConditions::new(token.interest()),
+                    shape: YieldShape::OnWaitSource {
+                        source: WaitSourceId::new(token.source_id()),
+                        interests: InterestMask::new(token.interest()),
                     },
                 }
             }
@@ -182,9 +182,9 @@ impl RangeLock {
                 let token = blocked.wait_token();
                 V3StepOutcome::Yield {
                     progress: NoProgress,
-                    shape: YieldShape::OnCarrier {
-                        carrier: WakeCarrier::new(token.carrier()),
-                        interests: InterestConditions::new(token.interest()),
+                    shape: YieldShape::OnWaitSource {
+                        source: WaitSourceId::new(token.source_id()),
+                        interests: InterestMask::new(token.interest()),
                     },
                 }
             }
@@ -302,7 +302,7 @@ impl Default for RangeLock {
 
 impl Drop for RangeLock {
     fn drop(&mut self) {
-        wait_carrier::release_wait_channel(self.wait_carrier_id);
+        wait_source::release_wait_channel(self.wait_source_id);
     }
 }
 

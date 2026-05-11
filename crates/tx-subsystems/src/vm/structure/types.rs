@@ -276,22 +276,70 @@ impl VmBacking {
     }
 }
 
+/// Per-VMA userfaultfd registration tag (PR-10 phase 3).
+///
+/// When `UFFDIO_REGISTER` succeeds against a VMA the shim records the
+/// owning ufd's id and the mode bits on this tag. The phase 3 contract
+/// is **read-only by the VM fault path** — the existence of this field
+/// on a `VmEntry` does not yet alter `fault_script` behaviour
+/// (that lands in phase 4). Phase 3 ships only the tag so a phase-4
+/// branch can be added with no further structural changes.
+///
+/// Spec:
+/// - `docs/progress/decisions/2026-05-11-d7-pr-10-userfaultfd-plan.md`
+///   §3.6 (fault-path interception sketch), §6 row P-10.3.
+/// - `docs/Txv3/05_DELEGATE_v1.md` §8.1.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UfdRegistration {
+    /// The owning ufd's stable id (also the `endpoint_marker` later
+    /// phases pass to `DelegateRegistry::install_request`). Matches
+    /// `UserfaultFd::ufd_id()` of the cap installed in the fd table.
+    pub ufd_id: u64,
+    /// Mode bits from `struct uffdio_register { mode }`. Phase 3 only
+    /// accepts `UFFDIO_REGISTER_MODE_MISSING` (the most common Linux
+    /// mode); WP / MINOR are reserved for follow-up phases.
+    pub mode: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmEntry {
     pub range: UserRange,
     pub prot: Prot,
     pub flags: VmEntryFlags,
     pub backing: VmBacking,
+    /// Optional userfaultfd registration tag (PR-10 phase 3).
+    ///
+    /// `None` for every VMA built before phase 3 wiring or by callers
+    /// that have not driven `UFFDIO_REGISTER`. Phase 3 sets this to
+    /// `Some` when the shim's `step_uffdio_register` arm covers the
+    /// VMA's range; phase 4's fault-path branch will read this tag
+    /// before invoking `materialize_pagebacked` and substitute the
+    /// `OnAgent` yield when present.
+    pub ufd_registration: Option<UfdRegistration>,
 }
 
 impl VmEntry {
+    /// Construct a VmEntry without a userfaultfd registration tag (the
+    /// common case). Mirrors the pre-phase-3 signature so every
+    /// existing call site stays source-compatible — the additive
+    /// `ufd_registration` field defaults to `None`.
     pub fn new(range: UserRange, prot: Prot, flags: VmEntryFlags, backing: VmBacking) -> Self {
         Self {
             range,
             prot,
             flags,
             backing,
+            ufd_registration: None,
         }
+    }
+
+    /// Builder helper: return a clone of `self` with `ufd_registration`
+    /// replaced by `tag`. Used by `step_uffdio_register` to tag each
+    /// VMA in the registered range without bypassing the EBR-published
+    /// recipe-tree contract.
+    pub fn with_ufd_registration(mut self, tag: Option<UfdRegistration>) -> Self {
+        self.ufd_registration = tag;
+        self
     }
 
     pub fn split_for_unmap(&self, hole: UserRange) -> Result<VmEntryRewrite, VmEntryError> {
@@ -354,6 +402,13 @@ impl VmEntry {
             prot,
             flags: self.flags,
             backing: self.backing.at_range_offset(delta)?,
+            // Userfaultfd tag is per-VMA and inherited verbatim across
+            // split-for-unmap / split-for-protect rewrites. Phase 3
+            // does not yet split the registered range on partial
+            // overlap — the shim rejects partial overlaps with
+            // `-EINVAL` so every sub-entry built here carries the
+            // same tag.
+            ufd_registration: self.ufd_registration,
         })
     }
 }
@@ -597,6 +652,56 @@ impl VmFaultOutcome {
         })
     }
 
+    /// PR-10 phase 6 — materialize a fresh private-anon page suitable
+    /// for `UFFDIO_COPY` byte-move.
+    ///
+    /// `UFFDIO_COPY` semantics (per `man userfaultfd(2)`): the agent
+    /// supplies a kernel-side `src` buffer whose bytes the kernel
+    /// memcpy's into a freshly-installed private page covering
+    /// `[dst_uaddr, dst_uaddr+len)`. Unlike a plain read fault, the
+    /// destination must be a private (writable) page even on a read
+    /// fault — the agent's bytes need to land somewhere we can write,
+    /// and Linux's userfaultfd installs the page with full `entry.prot`
+    /// regardless of the faulting access mode.
+    ///
+    /// This entrypoint always allocates a fresh private page (via
+    /// [`allocate_private_materialized_page`]) and returns the
+    /// materialization with `publish_prot = entry.prot` and
+    /// `replace_existing = true` so the caller's
+    /// `publish_page_with_replacement` swaps in the agent-filled page
+    /// even if a zero-frame happened to be installed by a concurrent
+    /// read-fault path.
+    ///
+    /// The byte-copy itself happens at the caller site
+    /// (`fault_script_with_ufd_dispatch`) after this returns and before
+    /// `publish_page_with_replacement` — see that function for the
+    /// `copy_nonoverlapping` step.
+    ///
+    /// Restricted to `VmBacking::PrivateAnon`. Page-backed and
+    /// Shared/None backings return `BackingMismatch` — phase 6 wires
+    /// PrivateAnon only; other backings are a follow-up.
+    pub fn materialize_pagebacked_for_ufd_copy(
+        &self,
+    ) -> Result<VmFaultMaterialization, VmFaultError> {
+        if !matches!(self.entry.backing, VmBacking::PrivateAnon) {
+            return Err(VmFaultError::BackingMismatch);
+        }
+        let page_index = self.private_anon_page_index()?;
+        // Use `UninitFullOverwrite` because the agent's memcpy will
+        // overwrite every byte of the page anyway — zeroing first
+        // would be wasted work. The `dirty=true` flag matches the
+        // post-COPY state of the page (the agent has written to it).
+        let page = allocate_private_materialized_page_unzeroed(true)?;
+        Ok(VmFaultMaterialization {
+            backing: VmFaultMaterializationBacking::PrivateAnon,
+            page_index,
+            page,
+            publish_prot: self.entry.prot,
+            replace_existing: true,
+            pmap_materialization_deferred: self.pmap_materialization_deferred,
+        })
+    }
+
     pub(in crate::vm) fn backing_page_index(&self) -> Result<PageIndex, VmFaultError> {
         let VmBacking::Page { offset, .. } = &self.entry.backing else {
             return Err(VmFaultError::BackingMismatch);
@@ -682,6 +787,28 @@ fn materialize_zero_frame() -> Result<MaterializedPage, VmFaultError> {
 
 fn allocate_private_materialized_page(dirty: bool) -> Result<MaterializedPage, VmFaultError> {
     let frame = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
+        .map_err(page_alloc_error)?
+        .commit();
+    let ppn = frame.ppn();
+    let map_pin = frame.try_map_pin().map_err(page_alloc_error)?;
+    drop(frame);
+    Ok(MaterializedPage {
+        ppn,
+        map_pin: MaterializedPagePin::Allocated(map_pin),
+        newly_installed: true,
+        dirty,
+    })
+}
+
+/// PR-10 phase 6 — reserve a private materialized page without
+/// zeroing it. The caller (the `UFFDIO_COPY` byte-move path in
+/// `fault_script_with_ufd_dispatch`) overwrites every byte of the
+/// page with the agent's `src` buffer immediately after this
+/// returns, so the zero step is unnecessary.
+fn allocate_private_materialized_page_unzeroed(
+    dirty: bool,
+) -> Result<MaterializedPage, VmFaultError> {
+    let frame = page_allocator::reserve_frame(ZeroPolicy::UninitFullOverwrite)
         .map_err(page_alloc_error)?
         .commit();
     let ppn = frame.ppn();
