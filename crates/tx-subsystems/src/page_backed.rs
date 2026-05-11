@@ -32,7 +32,10 @@ pub use fs_page_backing::FsPageBacking;
 pub use lifecycle::{step_fallocate, step_fsync, step_truncate};
 pub use reflink::{cow_replace_into_private, install_shared_page};
 pub use targeted_read::read_exact_at;
-pub use user_buffer::{step_read_to_user, step_write_from_user};
+pub use user_buffer::{
+    step_read_to_kernel, step_read_to_user, step_write_from_kernel, step_write_from_user,
+    ReadToUserOp, WriteFromUserOp,
+};
 
 #[cfg(test)]
 use crate::test_support::EPOCH_TEST_LOCK;
@@ -421,7 +424,7 @@ impl PageContainer {
         };
         // Routes through `FsPageBacking::fetch_page`. v3 outcome:
         // Done→install + Done; Continue→ no frame, surface EAGAIN as
-        // a conservative choice; Yield{OnCarrier{c,i}}→pass through
+        // a conservative choice; Yield{OnWaitSource{c,i}}→pass through
         // with `NoProgress`; Yield{OnAgent}→Err(EIO); Err→Err.
         match mount
             .payload()
@@ -438,10 +441,14 @@ impl PageContainer {
             }
             V3::Yield {
                 progress: _,
-                shape: YieldShape::OnCarrier { carrier, interests },
-            } => V3::yield_on_carrier(NoProgress, carrier.raw(), interests.raw()),
+                shape: YieldShape::OnWaitSource { source: carrier, interests },
+            } => V3::yield_on_wait_source(NoProgress, carrier.raw(), interests.raw()),
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
+                ..
+            } => V3::Err(tx_substrate::step_v3::Errno::EIO),
+            V3::Yield {
+                shape: YieldShape::OnTimer { .. },
                 ..
             } => V3::Err(tx_substrate::step_v3::Errno::EIO),
             V3::Err(v3_errno) => V3::Err(v3_errno),
@@ -650,7 +657,7 @@ fn step_range(
         // `StepOutcome<MaterializedPage, NoProgress>`. Map per variant:
         // - `Done` → continue the loop, advancing `offset` and
         //   accumulating `advanced` bytes.
-        // - `Continue { .. }` (NoProgress carrier) — page-level retry
+        // - `Continue { .. }` (NoProgress wait source) — page-level retry
         //   without a frame. Treat as a no-op and continue, advancing
         //   the chunk; one-shot page allocation rarely emits this.
         // - `Yield { .. }` with `advanced == 0` → propagate yield with
@@ -668,18 +675,18 @@ fn step_range(
                 offset += chunk as u64;
             }
             tx_substrate::step_v3::StepOutcome::Yield {
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape: YieldShape::OnWaitSource { source: carrier, interests },
                 ..
             } => {
                 if advanced == 0 {
-                    return V3::yield_on_carrier(
+                    return V3::yield_on_wait_source(
                         ByteProgress::EMPTY,
                         carrier.raw(),
                         interests.raw(),
                     );
                 }
                 of.set_offset(offset);
-                return V3::yield_on_carrier(
+                return V3::yield_on_wait_source(
                     ByteProgress::new(advanced),
                     carrier.raw(),
                     interests.raw(),
@@ -704,6 +711,58 @@ fn step_range(
 
     of.set_offset(offset);
     V3::done(advanced)
+}
+
+// ---------------------------------------------------------------------------
+// StepOp wraps (PR-2 wave 3)
+// ---------------------------------------------------------------------------
+//
+// Additive `impl StepOp` adapters per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1.
+// Each wrap stores its inputs by reference under a single lifetime `'a` and
+// delegates from `step()` to the corresponding free fn above — semantics are
+// unchanged. The free fns remain the source of truth; callers can migrate to
+// the `*Op` types incrementally.
+
+/// `StepOp` wrap of [`step_read`].
+pub struct ReadOp<'a> {
+    pub pc: &'a PageContainer,
+    pub of: &'a OpenFile,
+    pub len: usize,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for ReadOp<'a>
+{
+    type Output = usize;
+    type Progress = tx_substrate::step_v3::ByteProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_read(self.pc, self.of, self.len, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`step_write`].
+pub struct WriteOp<'a> {
+    pub pc: &'a PageContainer,
+    pub of: &'a OpenFile,
+    pub len: usize,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for WriteOp<'a>
+{
+    type Output = usize;
+    type Progress = tx_substrate::step_v3::ByteProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_write(self.pc, self.of, self.len, self.guard)
+    }
 }
 
 fn allocate_cached_frame() -> Result<CachedFrame, PageCacheError> {
