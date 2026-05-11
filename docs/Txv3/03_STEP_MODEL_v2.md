@@ -93,16 +93,19 @@ The driver accumulates progress across `Continue` and `Yield` returns via `exten
 
 ```rust
 enum YieldShape {
-    OnCarrier {
-        carrier: WakeCarrier,
-        interests: InterestConditions,
+    OnWaitSource {
+        source: WaitSourceId,
+        interests: InterestMask,
+        registration: PreparedWaitRegistration,
     },
     OnAgent {
         endpoint: Cap<DelegateEndpoint>,
         request: DelegateRequest,
         token: Cap<DelegateToken>,
+        cancel: AgentCancelPolicy,
+    },
+    OnTimer {
         deadline: Deadline,
-        cancel: CancelPolicy,
     },
     // deferred catalog members:
     // OnEdge { subscription: Cap<EdgeSubscription>, interests: EdgeInterests },
@@ -114,12 +117,15 @@ Each member's substrate cost, resume protocol, and abandonment semantics are sta
 
 | Member | Substrate cost | Resume protocol | Abandonment |
 |---|---|---|---|
-| `OnCarrier` | zero (existing `RawQueue`/`RawPort`) | wait_event(carrier, condition, protocol) | wait outcome `Killed`/`Interrupted`/`TimedOut` |
-| `OnAgent` | `DelegateToken` zone, endpoint zone, per-endpoint request bus carrier, RLIMIT_DELEGATE | await reply on token; verify token live; re-require | token → `SENTINEL_DEAD` on cancel/timeout/agent-death |
+| `OnWaitSource` | object-owned `WaitSource` (existing `RawQueue`/`RawPort` underneath) | wake hint posts to mailbox; driver re-runs `step()` under fresh guard | source unregister on `ActiveWait` drop |
+| `OnAgent` | `DelegateToken` zone, endpoint zone, per-endpoint request `WaitSource`, `RLIMIT_DELEGATE` | await reply on token; verify token live; re-require | token state CAS → `Canceled`/`AgentDied`/`TimedOut` |
+| `OnTimer` | `TimerWheel` slot, `TimerToken` zone | await `TimerFired` mailbox hint; resume with `TimerExpired(id)` | timer cancel on `ActiveWait` drop |
 | `OnEdge` (deferred) | per-subscription edge-state slot, overflow mark | await edge fire; consume from subscription | subscription drop |
 | `OnHandoff` (deferred) | `Owned<T>` ref strength, priority-donation lattice, owner-CAS primitive | await ownership transfer; resume holds `Owned<T>` | `EOWNERDEAD` |
 
 Catalog extension is governed by ARCH-3.
+
+**Deadlines are not yield-shape fields.** `OnAgent` does not carry `deadline`. Timeouts are protocol attachments via `WaitProtocol.deadline` and are realized as a driver-installed `TimerGuard` regardless of primary shape — the same mechanism handles `OnWaitSource + timeout` (poll/select), `OnAgent + timeout` (FUSE/ufd), and `OnTimer` (nanosleep). `OnTimer` is the *primary* timer wait; composing it with `WaitProtocol.deadline` is invalid.
 
 ## 3. The StepOp trait
 
@@ -129,13 +135,41 @@ Catalog extension is governed by ARCH-3.
 trait StepOp {
     type Output;
     type Progress: StepProgress;
-    fn step(&mut self, ctx: &mut ScriptCtx) -> StepOutcome<Self::Output, Self::Progress>;
+
+    fn step(&mut self, ctx: &mut ScriptCtx)
+        -> StepOutcome<Self::Output, Self::Progress>;
+
+    /// Called between wait_active returning and the next step() invocation.
+    ///
+    /// For OnWaitSource yields the resume is `Retry` and the default impl
+    /// is a no-op.  For OnAgent the resume carries `WithReply(DelegateReply)`
+    /// and the StepOp must override to stash the reply in `&mut self` so the
+    /// next `step()` can consume it under a fresh guard.
+    fn apply_resume(&mut self, resume: ResumeOutcome) -> Result<(), Errno> {
+        match resume {
+            ResumeOutcome::Retry => Ok(()),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+}
+
+pub enum ResumeOutcome {
+    /// Rerun step. Used by OnWaitSource.
+    Retry,
+    /// Delegate reply available. Used by OnAgent.
+    WithReply(DelegateReply),
+    /// Primary timer wait expired. Used by OnTimer.
+    TimerExpired(TimerId),
+    /// Wait aborted (signal, scope teardown, etc.).
+    Aborted(AbortReason),
 }
 ```
 
 A typed `StepOp` impl is the unit of subsystem work. The associated types make progress and output type-safe per-operation: `vfs::ReadOp` is `StepOp<Output = (), Progress = ByteProgress>` (the Output is `()` because the byte count flows through Progress and the script's `Done` synthesis pulls it out); `pipe::OpenOp` is `StepOp<Output = Fd, Progress = NoProgress>`.
 
-Each step impl owns its private resume state in `&mut self`. The driver constructs the op, calls `step` repeatedly until `Done` / `Err`, and accumulates progress externally.
+Each step impl owns its private resume state in `&mut self`. The driver constructs the op, calls `step` repeatedly until `Done` / `Err`, accumulates progress externally, and on each `Yield` calls `apply_resume(...)` between the wait completing and the next `step()`.
+
+The default `apply_resume` accepts only `Retry` and rejects other variants with `EINVAL`. This is deliberate: any StepOp that yields `OnAgent` (and therefore can receive `WithReply`) must explicitly opt in to handling reply payloads. Silent acceptance of unhandled resumes is a bug class the framework forecloses.
 
 ## 4. The five-stage in-step discipline (preserved from v1)
 
@@ -226,25 +260,31 @@ impl DriveMode {
         match (self, shape) {
             (Nonblocking, _) if progress_empty => Translate(Translation::EAGAIN),
             (Nonblocking, _) => Translate(Translation::PartialReturn),
-            (Waiting, OnCarrier { .. }) => Resolve,
-            (Waiting, OnAgent   { .. }) => Resolve,
-            (Selecting, OnCarrier { .. }) => Resolve,  // register-only, never wait
-            (Selecting, OnAgent { .. }) => Translate(Translation::UnsupportedShape),
+            (Waiting, OnWaitSource { .. }) => Resolve,
+            (Waiting, OnAgent      { .. }) => Resolve,
+            (Waiting, OnTimer      { .. }) => Resolve,
+            (Selecting, OnWaitSource { .. }) => Resolve,  // register-only, never wait
+            (Selecting, OnAgent      { .. }) => Translate(Translation::UnsupportedShape),
+            (Selecting, OnTimer      { .. }) => Translate(Translation::UnsupportedShape),
             // future variants: same pattern
         }
     }
 }
 ```
 
-`Selecting` does not invoke `await`; it registers on the carrier and returns the readiness mask, leaving step invocation to the caller's epoll loop.
+`UnsupportedShape` translates to `EOPNOTSUPP` at the driver loop boundary (POSIX convention for "operation not supported on this object/mode"). Modes that prefer a different errno for a specific shape should classify as `Translate(custom_errno)` rather than `UnsupportedShape`.
 
-When `OnAgent` is added to a mode's accept set, the mode's `handle` implementation must define how it awaits the token reply, what protocol family applies (Killable, KillableTimeout, etc.), and how abandonment is reported. See `05_DELEGATE_v1`.
+`Selecting` does not invoke `await`; it registers on the wait source and returns the readiness mask, leaving step invocation to the caller's epoll loop.
 
-### 5.2 Selecting mode and OnAgent
+When `OnAgent` is in a mode's accept set, the mode's `handle` implementation must define how it awaits the token reply, what protocol family applies (Killable, KillableTimeout, etc.), and how abandonment is reported. See `05_DELEGATE_v1`.
+
+### 5.2 Selecting mode and OnAgent / OnTimer
 
 <!-- txdoc:STEP-V2-SELECTING-AGENT-1 -->
 
-`Selecting` does not currently accept `OnAgent` because epoll-shape registration on a delegated yield has no well-defined semantic: the step has not yet run, so no token has been issued. Future use cases (e.g., epolling a ufd endpoint to know when faults are pending) operate on the *agent's read-side fd*, not on the script's yield. They are a separate selecting target.
+`Selecting` does not accept `OnAgent` because epoll-shape registration on a delegated yield has no well-defined semantic: the step has not yet run, so no token has been issued. Future use cases (e.g., epolling a ufd endpoint to know when faults are pending) operate on the *agent's read-side fd*, not on the script's yield. They are a separate selecting target.
+
+`Selecting` does not accept `OnTimer` either; primary timer waits are not select-shaped.
 
 ## 6. One-step operations (preserved from v1)
 
@@ -283,7 +323,7 @@ impl StepOp for OpenOp {
 }
 ```
 
-Yields possible only in upper-half resolution (dcache miss → `OnCarrier`; seccomp-trap → `OnAgent`). The lower-half `OpenOp` shown here is one-step.
+Yields possible only in upper-half resolution (dcache miss → `OnWaitSource`; seccomp-trap → `OnAgent`). The lower-half `OpenOp` shown here is one-step.
 
 ### 6.2 Example: fork (preserved from v1, four-variant rephrasing)
 
@@ -323,9 +363,10 @@ impl StepOp for PipeReadOp {
             } else {
                 Yield {
                     progress: ByteProgress::EMPTY,
-                    shape: YieldShape::OnCarrier {
-                        carrier: pipe.read_wq,
+                    shape: YieldShape::OnWaitSource {
+                        source: pipe.read_source.id(),
                         interests: ReadInterests::HasData | ReadInterests::Broken,
+                        registration: prepared_registration_pipe_read(&pipe),
                     },
                 }
             };
@@ -335,7 +376,7 @@ impl StepOp for PipeReadOp {
         let n = avail.min(self.buf.remaining());
         pipe.ring.pop_into(&mut self.buf.slice_mut(n));
         pipe.ring.advance_read(n);
-        pipe.write_wq.fire(WriteReadiness::Space);
+        pipe.write_source.notify(WriteReadiness::Space);
 
         if self.buf.remaining() == 0 {
             return Done(());
@@ -343,9 +384,10 @@ impl StepOp for PipeReadOp {
         if pipe.ring.available_read() == 0 && !writers_closed {
             return Yield {
                 progress: ByteProgress(n),
-                shape: YieldShape::OnCarrier {
-                    carrier: pipe.read_wq,
+                shape: YieldShape::OnWaitSource {
+                    source: pipe.read_source.id(),
                     interests: ReadInterests::HasData | ReadInterests::Broken,
+                    registration: prepared_registration_pipe_read(&pipe),
                 },
             };
         }
@@ -354,7 +396,7 @@ impl StepOp for PipeReadOp {
 }
 ```
 
-`Continue { progress: ByteProgress(n) }` covers v1's `Advanced(n)`; `Yield { progress: ByteProgress::EMPTY, shape: OnCarrier{..} }` covers v1's `Blocked(..)`; `Yield { progress: ByteProgress(n), shape: OnCarrier{..} }` covers v1's `AdvancedThenBlocked(n, ..)`.
+`Continue { progress: ByteProgress(n) }` covers v1's `Advanced(n)`; `Yield { progress: ByteProgress::EMPTY, shape: OnWaitSource{..} }` covers v1's `Blocked(..)`; `Yield { progress: ByteProgress(n), shape: OnWaitSource{..} }` covers v1's `AdvancedThenBlocked(n, ..)`.
 
 ### 7.2 Example: FUSE read (delegated)
 
@@ -378,15 +420,16 @@ impl StepOp for FuseReadOp {
                 endpoint: self.fuse_endpoint.clone(),
                 request: DelegateRequest::Fuse(req),
                 token: Cap::from_slot(token),
-                deadline: Deadline::from(ctx.fuse_timeout),
-                cancel: CancelPolicy::BestEffort,
+                cancel: AgentCancelPolicy::BestEffort,
             },
         }
+        // Caller drives with WaitProtocol { deadline: Some(ctx.fuse_timeout), .. }
+        // — the deadline is a protocol attachment, not part of the yield shape.
     }
 }
 ```
 
-The two yield shapes (carrier and agent) are uniform from the script's perspective; the driver mode's `handle` does the right thing for each.
+The three yield shapes (`OnWaitSource`, `OnAgent`, `OnTimer`) are uniform from the script's perspective; the driver mode's `handle` does the right thing for each, and `WaitProtocol.deadline` attaches a uniform timeout regardless of shape.
 
 ## 8. Subsystem module layout for steps (preserved from v1)
 
@@ -414,7 +457,7 @@ Witness rules (WIT-3 / WIT-4) are strict and v5 adds WIT-5 / WIT-6 for the yield
 - Witnesses must not be stored in `&mut self`-fields of the `StepOp`, returned in `StepOutcome`, passed to other threads, or held across `.await` points.
 - Reservation guards are subject to the same yield-boundary prohibition (YIELD-8): commit or roll back before yielding.
 - Cross-step continuation carries `Cap<T>` / `OperationalEvidence` only.
-- Cross-yield continuation (across `OnCarrier`, `OnAgent`, etc.) carries `'static` retention only — no witness, no reservation guard, no `IdentRef`.
+- Cross-yield continuation (across `OnWaitSource`, `OnAgent`, `OnTimer`, etc.) carries `'static` retention only — no witness, no reservation guard, no `IdentRef`.
 
 Resume after yield re-acquires guard and re-runs `require_*` (anti-TOCTOU re-check, PRED-7 + WIT-5).
 

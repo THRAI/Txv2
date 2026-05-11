@@ -83,7 +83,11 @@ YIELD-7. **A YieldShape resolution does not change SubjectContext (see SUBJ-5).*
 
 YIELD-8. **A reservation must be either consumed by commit before yield, or explicitly rolled back before yield.** Reservations may not cross yield boundaries; "carry reservation across yield, commit on resume" is forbidden.
 
-YIELD-9. **Driver modes declare which YieldShape variants they accept.** A script that returns a yield shape its driver mode does not accept is a `DriveMode::handle` translation: `Nonblocking` returns `EAGAIN` (no progress) or partial-Ok (progress > EMPTY); modes-without-handler for the shape return `EOPNOTSUPP`.
+YIELD-9. **Driver modes declare which YieldShape variants they accept.** A script that returns a yield shape its driver mode does not accept is a `DriveMode::handle` translation: `Nonblocking` returns `EAGAIN` (no progress) or partial-Ok (progress > EMPTY); modes-without-handler for the shape return `EOPNOTSUPP` (POSIX convention for "operation not supported on this object/mode").
+
+YIELD-10. **`PreparedWaitRegistration` is permitted as `OnWaitSource` payload only if its `PreparedPredicate` satisfies WAIT-2.** That is: the still-blocked predicate must be non-blocking, non-allocating, atomic-load-only, must not acquire locks, must not access user memory, and must not call subsystem callbacks. This forecloses `PreparedPredicate` from becoming a hidden semantic-callback channel through the yield path.
+
+YIELD-11. **Deadlines are `WaitProtocol` attachments, not `YieldShape` fields.** `OnAgent` carries no `deadline` field; timeouts are realized by a driver-installed `TimerGuard` regardless of primary shape. Composing `OnTimer` with `WaitProtocol.deadline` is invalid (the primary timer is itself the deadline).
 
 ---
 
@@ -95,13 +99,13 @@ DELEGATE-1. **A delegate endpoint reverses the normal authority direction; the a
 
 DELEGATE-2. **Endpoints are typed.** A `Cap<DelegateEndpoint<K>>` constrains the legal `DelegateRequest` and `DelegateReply` shapes via the type parameter `K` (e.g., `Ufd`, `Fuse`, `Ptrace`, `FanotifyPerm`). No covert channel between endpoint kinds.
 
-DELEGATE-3. **A delegation token is a Cap on a slot in the `DelegateToken` zone.** Token liveness is the sole linearization point of the delegation. Abandonment by signal/cancel/timeout/agent-death produces `SENTINEL_DEAD`; agent reply against a dead token is dropped without observable effect.
+DELEGATE-3. **A delegation token has both a slot lifecycle and a logical state machine.** The slot lifecycle (substrate): `Cap<DelegateToken>` retain count; `SENTINEL_DEAD` on final drop; EBR reclamation of bytes. The logical lifecycle (runtime): `DelegateState` transitions `Pending → ReplyInstalling → Replied` (or `Pending → Canceled / AgentDied / TimedOut`). The two are independent: the token may reach `Replied` while the slot is still pinned by other holders; the slot reaches `SENTINEL_DEAD` only when no `Cap` retains it. **A reply against any non-`Pending` state is rejected as late and has no observable effect on the script** — regardless of slot lifecycle.
 
 DELEGATE-4. **`DelegateReply::fd_injections` is capability transfer.** Each injection is checked at the receiving step's resume-side `require_*` for (a) endpoint-kind authority to inject, (b) cred check against the receiving SubjectContext, (c) `RLIMIT_NOFILE` reservation in the script's resume reserve-phase. Injection failure → `Agent::Refused` or a fresh errno class.
 
 DELEGATE-5. **Per-endpoint in-flight-token cap is an rlimit dimension.** A new `RLIMIT_DELEGATE` (or borrowed `RLIMIT_NOFILE` charge) bounds outstanding delegations per script-side process. Reservation in the step's reserve-phase, sign at publish, drop at resume / timeout / cancel.
 
-DELEGATE-6. **`CancelPolicy` is a closed catalog: `BestEffort | Synchronous | Detached`.** BestEffort notifies the endpoint and gives up after a grace; Synchronous blocks the cancellation script on agent ack; Detached is fire-and-forget for idempotent agent ops.
+DELEGATE-6. **Cancellation has two orthogonal closed catalogs.** `AgentCancelPolicy` (`BestEffort | Synchronous | Detached`) controls the agent-side protocol when the kernel cancels a delegated request and is carried in `YieldShape::OnAgent::cancel`. `TokenDropPolicy` (`CancelOnDrop | Abandon`, reserved `KeepAlive`) controls what `ActiveWait` drop does to the token and is held internally by `AgentTokenGuard`. The two compose: `CancelOnDrop + Synchronous` means "on drop, cancel and wait for agent ack." `TokenDropPolicy::from_agent_cancel` derives the drop policy from the agent-cancel policy at `prepare_active_wait` time.
 
 DELEGATE-7. **Nested delegation has a maximum depth.** Each delegation increments the script's resume-state nesting counter; exhaustion fails with `EDELEGLOOP`. The bound is a build-time constant chosen with adversarial-agent assumptions.
 
@@ -117,7 +121,7 @@ DELEGATE-9. **`DelegateReply::continuation` is typed.** Closed sum: `Final | Par
 
 SCOPE-1. **ExecutionScope is a script-context modifier, not a YieldShape.** A scope is extent-shaped; a yield is point-shaped. The two compose orthogonally.
 
-SCOPE-2. **`OnBehalfOf<P>` borrows `Cap<ProcessIdentity>`.** The borrow holds the identity Cap for the scope's lifetime. The scope additionally subscribes to the borrowed process's `exit_port` carrier.
+SCOPE-2. **`OnBehalfOf<P>` borrows `Cap<ProcessIdentity>`.** The borrow holds the identity Cap for the scope's lifetime. The scope additionally subscribes to the borrowed process's `exit_source` (a `WaitSource`).
 
 SCOPE-3. **Scope abandonment is delivered through the existing Killable wait protocol.** When the borrowed process exits (or its borrow scope is otherwise revoked), the script's drive loop observes a Killed outcome at its next yield and aborts with `EOWNERDEAD`.
 

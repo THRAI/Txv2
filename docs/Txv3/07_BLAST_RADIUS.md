@@ -1,263 +1,257 @@
-# Migration: Blast Radius and Landing Order — v2 (post-merge)
+# Migration: Blast Radius and Landing Order — v3 (full-retire plan)
 
-<!-- txdoc:TXV3-BLAST-RADIUS-V2 -->
+<!-- txdoc:TXV3-BLAST-RADIUS-V3 -->
 
-**Status.** v2 (Txv3 refresh, 2026-05; supersedes v1 with post-merge numbers).
-**Purpose.** Quantify the cost of landing the v3 architectural changes against the merged tree. Recommend a landing order updated for the absence of worktree-rebase coordination.
+**Status.** v3 (Txv3 refresh, 2026-05; supersedes v2 with measured-not-estimated numbers and a full-retire landing plan).
+**Purpose.** Quantify the actual cost of landing the v3 architectural changes against the merged tree and recommend a landing order that retires the v4 vocabulary completely — no compat shim, no parallel-shape transition.
 **Audience.** Implementation lead; reviewers of the migration ADR.
-**Method.** Survey of merged mainline as of 2026-05 (the funny-hugle / objective-davinci / distracted-lichterman worktrees have landed). Grep-based call-site counts; per-change blast estimate.
-**Diff vs v1.** v1 modeled the world before the layered-subsystems merge; v2 reflects the merged tree. The refactor surface is now entirely on mainline; the previously-skeleton crates are populated; tests are part of the surface.
+**Method.** Four parallel agent surveys against merged mainline as of 2026-05. Grep-based call-site counts with context classification, not estimates.
+**Diff vs v2.** v2's numbers underestimated the surface by ~40% (the post-merge code grew further into `step_v3/`). v3 corrects to measured totals, adds the `exit_port` rename axis that v2 omitted, recognises the half-built `step_v3/` scaffold as a real timeline-shortener, and abandons the compat-layer fallback in favour of a focused atomic refactor.
 
 ---
 
-## 1. Code volume baseline (post-merge)
+## 1. Code volume baseline
 
-<!-- txdoc:BLAST-V2-BASELINE-1 -->
+<!-- txdoc:BLAST-V3-BASELINE-1 -->
 
 ```
 mainline (excluding target/, ext4 backend, HAL boards):
-  tx-subsystems        33,979 lines  104 files   ← was 9 lines (skeleton)
-  tx-shims             15,266 lines   29 files   ← was 4 lines (skeleton)
-  tx-substrate         13,061 lines   51 files   ← was 12,217
-  boards/tx-hal-rv64    8,546 lines   18 files   ← was 6,265 (HAL grew)
-  tx-reactor            8,427 lines   31 files   ← unchanged
-  tx-kernel             6,570 lines   16 files   ← was 8,792 (some moved into subsystems)
-  tx-scripts            3,786 lines    8 files   ← was 8 lines (skeleton)
-  tx-fs                 2,794 lines    6 files   ← was 8 lines (skeleton)
-  tx-ext4-format        2,706 lines    5 files   ← unchanged
-  boards/tx-hal-m1dock  2,252 lines    3 files   ← unchanged
-  tx-hal                1,894 lines    4 files   ← was 1,387
-  boards/tx-hal-la64    1,352 lines    1 files   ← was 534
-  tx-ext4               1,318 lines    7 files   ← was 849
-  tx-drivers              196 lines    1 files   ← unchanged
-  tx-policy                 9 lines    1 files   ← still skeleton
-  tx-services               7 lines    1 files   ← still skeleton
+  tx-subsystems        33,979 lines  104 files
+  tx-shims             15,266 lines   29 files
+  tx-substrate         13,061 lines   51 files     (incl. step_v3/ scaffold)
+  boards/tx-hal-rv64    8,546 lines   18 files
+  tx-reactor            8,427 lines   31 files
+  tx-kernel             6,570 lines   16 files
+  tx-scripts            3,786 lines    8 files
+  tx-fs                 2,794 lines    6 files
+  tx-ext4-format        2,706 lines    5 files
+  boards/tx-hal-m1dock  2,252 lines    3 files
+  tx-hal                1,894 lines    4 files
+  boards/tx-hal-la64    1,352 lines    1 files
+  tx-ext4               1,318 lines    7 files
+  tx-drivers              196 lines    1 files
+  tx-policy                 9 lines    1 files     (skeleton)
+  tx-services               7 lines    1 files     (skeleton)
 ```
 
-Total kernel-material LoC: ~88,000 (was ~30,000 pre-merge). The migration target tripled. The `tx-policy` and `tx-services` skeletons remain — `SubjectAuthority` / `RestrictionStack` will land in those.
+Total kernel-material LoC: ~88,000. `tx-policy` and `tx-services` still skeleton; `SubjectAuthority` / restriction stack lands there. Everything else has real code.
 
-## 2. Surface counts (post-merge)
+---
 
-<!-- txdoc:BLAST-V2-SURFACE-1 -->
+## 2. The scaffold: `step_v3/` is partly built already
 
-### 2.1 StepOutcome surface — fully concentrated on mainline
+<!-- txdoc:BLAST-V3-SCAFFOLD-1 -->
 
-| Variant | Sites |
-|---|---|
-| `StepOutcome::Advanced` | 142 |
-| `StepOutcome::Blocked` | 152 |
-| `StepOutcome::AdvancedThenBlocked` | 129 |
-| `StepOutcome::Done` | 649 |
-| `StepOutcome::Err` | 609 |
-| **Total construction-or-pattern sites** | **~1,512** |
-| **Sites needing mechanical refactor (Advanced/Blocked/AdvancedThenBlocked)** | **354** |
-| `match` arms over `StepOutcome` | 1,506 |
-| Files containing `StepOutcome` | 75 |
+The single largest correction vs v2: **`tx-substrate/src/step_v3/` already exists and is in active use.** This is the migration's load-bearing fact.
 
-Refactor sites split production vs test:
-
-| | Files | Refactor sites |
+| Type | Status | Site count |
 |---|---|---|
-| Production | 44 | 323 |
-| Test | 31 | 31 |
-| **Total** | **75** | **354** |
+| `WaitProtocol` | defined; in use | 33 hits / 13 files |
+| `StepOp` trait | defined; in use | 102 hits / 13 files |
+| `SubjectContext` | defined `step_v3/subject_context.rs` | 28+ hits |
+| `EndpointKind` | defined `step_v3/endpoint_kind.rs:22` | ~30 hits |
+| `DelegateToken` | defined `step_v3/agent.rs:58` | 8 hits / 4 files |
+| `DelegateEndpoint` | defined `step_v3/agent.rs:44` | 8 hits / 4 files |
+| `DelegateRequest` | defined `step_v3/agent.rs:71` | 8 hits / 4 files |
+| `CancelPolicy` (Agent-side) | defined `step_v3/agent.rs:20` | 9 hits / 3 files |
+| `TimerToken` | defined `tx-reactor/src/timer.rs:31`, private | 5 hits |
 
-Distribution by crate (refactor sites only):
+The v3 work *populates* these scaffolds with the missing state machine, mailbox plumbing, AgentTokenGuard, and the renamed YieldShape — it does not start from green field.
 
-| Crate | Refactor sites |
-|---|---|
-| `tx-subsystems` | 215 |
-| `tx-shims` | 105 |
-| `tx-scripts` | 17 |
-| `tx-fs` | 10 |
-| `tx-kernel` | 7 |
-| **Total** | **354** |
-
-`tx-subsystems` carries 60% of the refactor cost; the top three files (`page_backed.rs` 150 occurrences, `tmpfs.rs` 116, `vfs/execution.rs` 107) account for ~25% of total `StepOutcome` surface.
-
-### 2.2 Step-function surface — for `StepOp` trait wrapping
+What's net new (zero hits anywhere):
 
 ```
-135 step_* function signatures across 32 files
+DelegateReply, DelegateState, AgentTokenGuard, AgentCancelPolicy,
+TokenDropPolicy, EndpointScope, TimerWheel, TimerGuard, TaskMailbox,
+WakeHint, WaitGeneration, WaitSource, WaitSourceId, WaitRegistrationGuard,
+PreparedWaitRegistration, ActiveWait, ActiveYieldShape, YieldRegistration,
+ResumeOutcome, Interruptibility, CancelReason, AbortReason, apply_resume,
+ScriptCtx, SubjectAuthority
 ```
 
-Adding the `StepOp` trait wraps each as `impl StepOp for FooOp { ... }`, with the function body relocated. Modal cost per step-fn: low, but cumulative for 135 functions.
+Existing wait/wake plumbing to retire: **43 `Waker` sites across 9 files**, concentrated in `tx-substrate/src/bus/`. `wait_queue`, `wake_up*`, `Notify*` are *not* in use — clean replacement field.
 
-### 2.3 Other primitive surfaces
+---
 
-| Name | Files | Hits | State |
+## 3. Measured surface
+
+<!-- txdoc:BLAST-V3-SURFACE-1 -->
+
+### 3.1 Vocabulary rename axis
+
+| Name (→ rename) | Hits | Files | Heaviest |
 |---|---|---|---|
-| `Cap<` | 89 | 600 | wired throughout |
-| `PayloadCap` | 26 | 91 | wired |
-| `Weak<` | 10 | 52 | light |
-| `OperationalEvidence` | 5 | 17 | light |
-| `IdentRef<` | 4 | 13 | light (most witnesses are implicit) |
-| `require_*` | 21 | 113 | wired |
-| `Reservation` | 4 | 16 | light |
-| `Witness` | 0 | 0 | not a named type |
-| `ScriptCtx` / `ThreadContext` / `SubjectContext` | 0 | 0 | **net new** |
-| `WakeCarrier` / `InterestConditions` | 0 | 0 | **net new** (current code uses subsystem-specific types) |
-| `drive_blocking` / `_nonblocking` / `_selecting` | 0 | 0 | **net new** |
-| `zone::sign` / `index::commit` | 0 | 0 | **net new vocabulary** (substrate primitives exist under different names) |
+| `OnCarrier` → `OnWaitSource` | **118** | **28** | `tty/execution/step_write.rs` 11, `vm/execution.rs` 11, `step_v3/mod.rs` 7 |
+| `WakeCarrier` → `WaitSource` + `WaitSourceId` | **39** | **12** | `step_v3/mod.rs` 7, `vm/user_access.rs` 6 |
+| `InterestConditions` → `InterestMask` | **38** | **12** | identical to `WakeCarrier` distribution |
+| `read_wq` / `write_wq` → `read_source` / `write_source` | **24** | **5** | mostly docs; one site in `tests/bus.rs` |
+| `exit_port` → `exit_source` | **164** | **24** | `process/structure.rs` 21, `process/tests/exit_port.rs` 19, plus docs |
+| `carrier` identifier (case-by-case) | 71 | 11 | needs per-site judgment |
+| **Subtotal: mechanical** | **~383** | | |
+| **Subtotal: judgment** | **71** | | |
 
-**Cap discipline is real and pervasive.** Identity/payload split is wired (`PayloadCap` in 26 files). The witness/IdentRef discipline is *light* (only 4 files name `IdentRef<`), suggesting most observation evidence is implicit in `require_*` returns rather than typed witnesses. The driver-mode catalog and the wake-carrier/interest types are still doc-vocabulary, not code vocabulary.
+### 3.2 StepOutcome refactor axis
 
-## 3. Per-change blast radius (post-merge)
+| | Measured |
+|---|---|
+| `step_*` free function signatures (StepOp wrap candidates) | **178** across **26** source files |
+| `StepOutcome::Advanced/Blocked/AdvancedThenBlocked` construction sites | 423 |
+| `StepOutcome::Done(...)` sites (unchanged, but reviewed) | 283 |
+| `StepOutcome::Err(...)` sites (unchanged, but reviewed) | 215 |
+| `Yield { shape }` match sites | 22 |
+| Driver-loop match composition files | 4 |
+| Test files touching `StepOutcome` | 16 |
+| Heaviest test files | `tty/tests/legacy_phase_a.rs` 91 refs; `tmpfs/tests.rs` 66 refs |
 
-<!-- txdoc:BLAST-V2-PER-CHANGE-1 -->
+### 3.3 CancelPolicy axis
+
+**9 sites, 3 files, 100% Agent-side**. All in `tx-substrate`:
+
+```
+crates/tx-substrate/src/step_v3/agent.rs:8,20         (doc + enum def)
+crates/tx-substrate/src/step_v3/mod.rs:132,263        (field + re-export)
+crates/tx-substrate/tests/v3_yield_on_agent.rs:×5    (constructors + tests)
+```
+
+The rename is `CancelPolicy` → `AgentCancelPolicy`. `TokenDropPolicy` is net-new (lands with `AgentTokenGuard`). **No compat shim needed** because (a) zero `TokenDropPolicy` sites exist to need bridging, and (b) the existing 9 sites all want `Agent-` variant naming anyway.
+
+### 3.4 Progress-type distribution
+
+| Type | Use sites across 178 step_* fns |
+|---|---|
+| `NoProgress` | 453 (one-shots: open, mkdir, fork, dup, close, …) |
+| `ByteProgress` | 139 (read/write/splice/sendfile/pipe/tty I/O) |
+| `PageProgress` | 65 (page_backed lifecycle / vm fault) |
+| `IoVecProgress` | 34 (scatter-gather) |
+| `EntryProgress` | 27 (getdents / vfs walker) |
+
+---
+
+## 4. Per-change blast radius (measured)
+
+<!-- txdoc:BLAST-V3-PER-CHANGE-1 -->
 
 | # | Change | Code surface | Doc surface | New code | Risk |
 |---|---|---|---|---|---|
-| **A** | `StepOutcome` 5→4 + `YieldShape::OnCarrier` | **354 mechanical refactor sites across 75 files** (323 production + 31 test); ~1,150 unchanged Done/Err sites | `STEP_MODEL_v1` superseded by `03_STEP_MODEL_v2`; tag updates in ~33 v4 docs | ~50 LoC for new types | **Medium** — exhaustive match catches misses at compile time, but test-suite has to be re-greened across 31 test files. |
-| **B** | `StepOp` trait + `StepProgress` associated type | **135 step-fn signatures across 32 files wrap into impls** | one new section in `03_STEP_MODEL_v2` | ~150 LoC trait + 5–10 progress types | **Medium** — one wrap per function; per-step body lift. |
-| **C** | `YieldShape::OnAgent` (Delegate) | 0 — net new | new `05_DELEGATE_v1` (in this folder); INVARIANTS-V5 YIELD-* + DELEGATE-* | ~500 LoC token zone (`tx-substrate`), ~500 LoC endpoint (`tx-subsystems`), ~200 LoC bus wiring (`tx-reactor`), ~300 LoC drive logic (`tx-scripts`). **~1,500 LoC framework.** | **Medium** — new substrate primitive |
-| **D** | `SubjectContext` + upper/lower split | 0 — net new in code (zero hits today) | new `04_SYSCALL_SHAPE_v1`; CONCEPTS-V5 §SUBJ; INVARIANTS-V5 SUBJ-* | ~200 LoC types; ~300 LoC threading through canonical syscalls (sys_open / sys_read / sys_write / sys_fork / sys_execve) | **Low** — additive; lands in tx-policy skeleton + new `tx-shims/src/subject.rs`. |
-| **E** | `OnBehalfOf<P>` execution scope | 0 — net new | new `06_EXECUTION_SCOPE_v1`; INVARIANTS-V5 SCOPE-* | ~500 LoC framework (`tx-scripts`) | **Medium** — defers cleanly until first user (AIO or SQPOLL). |
-| **F** | `SubjectAuthority.restrictions` cell | 0 — `tx-policy` is still skeleton | new RESTRICTION_v1 (deferred); cred_service v2 doc | ~150 LoC framework cell in `tx-policy`; per-restriction-kind cost is large (seccomp BPF VM ~3-6k LoC) | **Low for cell, high per implementation.** |
+| **A** | Vocabulary rename (`OnCarrier`/`WakeCarrier`/`InterestConditions`/`exit_port`/wq-fields) | **383 mechanical + 71 judgment = 454 sites across ~50 files** | Concept-doc rename PR (separate; already drafted in Txv3/) | type aliases initially zero; identifier rename only | **Low** — entirely mechanical; sed-with-review; no semantic change |
+| **B** | `StepOutcome` 5→4 + `YieldShape::OnWaitSource`/`OnAgent`/`OnTimer` | **423 construction sites + 22 Yield matches + driver loops in 4 files** | `STEP_MODEL_v1` superseded | ~50 LoC new variants | **Medium** — exhaustive match catches misses; test re-green real |
+| **C** | `StepOp` trait wrap | **178 free step_* fns → 178 `impl StepOp for FooOp` shells across 26 files** | scaffold already exists in `step_v3/` | ~500 LoC mechanical wrap + 5 progress types ~200 LoC | **Medium** — per-subsystem parallelizable; trait already defined |
+| **D** | `apply_resume` + `ResumeOutcome` | OnAgent-yielding steps need override (~5–8 files) | trait change in `03_STEP_MODEL_v2` | ~100 LoC trait method + default | **Low** — additive; default impl handles the common case |
+| **E** | `CancelPolicy` → `AgentCancelPolicy` + new `TokenDropPolicy` | **9 mechanical + N net-new** | `02_INVARIANTS_v5`, `05_DELEGATE_v1` already updated | ~30 LoC enum + derive | **Low** — trivially small |
+| **F** | Wake-substrate (`TaskMailbox`/`WakeHint`/`WaitGeneration`/`WaitSource`) | replaces **43 `Waker` sites across 9 files in `tx-substrate/src/bus/`** | runtime spec already specifies | ~1,500 LoC framework (token zone, endpoint zone, mailbox, source index) | **Medium-High** — new substrate primitive; the most architecturally consequential PR |
+| **G** | `OnAgent` delegate runtime (token state machine, install_request, EndpointScope) | populate existing `step_v3/agent.rs` scaffold | runtime spec specifies | ~500 LoC adding DelegateState, install_request, AgentTokenGuard, mark_* methods | **Medium** — builds on §2's scaffold |
+| **H** | `OnTimer` + protocol-deadline TimerGuard | uses `TimerToken` (already exists, private) | `03_STEP_MODEL_v2` + `06_EXECUTION_SCOPE_v1` updated | ~300 LoC TimerWheel public surface + TimerGuard | **Low** — small additive |
+| **I** | `SubjectContext` + upper/lower split | scaffold exists (`step_v3/subject_context.rs`); needs threading | `04_SYSCALL_SHAPE_v1` specifies | ~300 LoC threading through ~10 canonical syscalls | **Low** — additive |
+| **J** | `OnBehalfOf<P>` execution scope | net new | `06_EXECUTION_SCOPE_v1` specifies | ~500 LoC framework | **Medium** — defers cleanly until first user (AIO/SQPOLL) |
+| **K** | `SubjectAuthority.restrictions` cell | lands in `tx-policy` skeleton | deferred to later RESTRICTION doc | ~150 LoC framework cell | **Low** — additive |
 
-### 3.1 What changed vs v1
+Total framework LoC for A through I: **~3,500 LoC of net-new code + ~600 sites of rename + 423 sites of variant refactor + 178 step-fn wraps**. J and K defer until their first users materialize.
 
-| Aspect | v1 (pre-merge) | v2 (post-merge) |
-|---|---|---|
-| Refactor location | mostly worktrees; 8 files in mainline | all on mainline; 75 files |
-| Refactor sites | 280 (mainline) + 423 (funny-hugle worktree) = staggered | 354 (single tree) |
-| Worktree rebase | 3 branches × ~1.5 days | **gone** |
-| Test-suite refactor | small (mainline tests) | **31 test files**, 31 refactor sites |
-| Concurrency cost | sequential: foundation → worktree rebase × 3 | sequential within mainline |
-| Net new code estimate | ~2.7k LoC for steps 1–3 | ~2.7k LoC unchanged |
-| Step-fn wrap surface | ~75 estimated | **135 measured** |
+---
 
-The total mechanical work shrunk slightly (354 vs 280 + 423) because the worktrees overlapped each other's refactor sites; merge consolidated. Coordination cost vanished. Test surface entered the picture as a real cost.
+## 5. Full-retire landing plan
 
-## 4. Implications for landing strategy
+<!-- txdoc:BLAST-V3-LANDING-1 -->
 
-<!-- txdoc:BLAST-V2-STRATEGY-1 -->
+**No compat layer. No parallel-shape transition. Each PR retires the v4 vocabulary it touches.** The compat-layer fallback from v2 is dropped because (a) the rename is mechanical and the per-PR review surface is bounded; (b) `step_v3/` already provides the scaffold to migrate into; (c) carrying two shapes simultaneously bloats the cognitive surface for reviewers and ships kernel-week-of-debt.
 
-**The foundation PR is now bigger but more contained.** Pre-merge, the foundation could land on a near-empty `tx-subsystems` and worktrees rebased afterward. Post-merge, the foundation refactor touches 75 files and 354 sites in one tree at one time.
+The plan is **eleven sequential PRs**, two parallelizable PR series, and a freeze window for the foundation.
 
-**Two viable paths:**
+### 5.1 Freeze window
 
-### Path A — Atomic foundation PR
+Days 1–10 (two weeks): foundation PRs (1, 2, 3) land sequentially on mainline. **Hold non-foundation subsystem PRs for the freeze duration.** Communicate the freeze in the implementation ADR.
 
-One large PR: `StepOutcome` 4-variant + `YieldShape::OnCarrier` + `StepOp`/`StepProgress` traits, with all 354 sites rewritten and all 31 test files re-greened. Compile-driven; the rust compiler enumerates every miss.
+After day 10: subsystem-by-subsystem `StepOp` wrap PRs (PR-4 series) run in parallel; other feature work resumes.
 
-**Cost:** ~5–8 days of focused work; long PR review window.
-**Risk:** large diff, high merge-conflict surface for any concurrent work.
-**Mitigation:** lock concurrent subsystem work for the duration; communicate the freeze.
+### 5.2 PR sequence
 
-### Path B — Compat-layer transitional shape
+| PR | Lands | Days | Touches |
+|---|---|---|---|
+| **PR-1** | Vocabulary rename (A): `OnCarrier` → `OnWaitSource`, `WakeCarrier` → `WaitSource`/`WaitSourceId`, `InterestConditions` → `InterestMask`, `read_wq`/`write_wq` → `read_source`/`write_source`, `exit_port` → `exit_source`, audit of `carrier` identifier sites. **No type aliases; no shim.** Direct rename. | 2 | ~50 files |
+| **PR-2** | StepOutcome 5→4 + YieldShape catalog (B) + OnTimer admission (H/partial): `StepOutcome::{Continue, Yield, Done, Err}`; `YieldShape::{OnWaitSource, OnAgent, OnTimer}`; rewrite 423 construction sites; re-green 16 test files including `legacy_phase_a.rs` (91 refs) and `tmpfs/tests.rs` (66 refs). | 4 | ~75 files |
+| **PR-3** | Wake substrate (F): introduce `TaskMailbox`, `WakeHint`, `WaitGeneration`, `WaitSource`, `PreparedWaitRegistration`, `WaitRegistrationGuard`. **Retire the 43 `Waker` sites in `tx-substrate/src/bus/`.** New zone for tokens; new endpoint zone. | 4 | ~15 files (bus + new zones) |
+| **PR-4 series** | StepOp wrap (C): one PR per subsystem (8 subsystems × ~22 fns each). Parallelizable across reviewers after the foundation freeze. | 3 (total) | 26 files split across 8 PRs |
+| **PR-5** | apply_resume + ResumeOutcome (D): trait method, default impl, OnAgent-yielding step overrides (~5-8 files) | 1 | ~8 files |
+| **PR-6** | CancelPolicy rename + TokenDropPolicy introduction (E): rename 9 sites; add new enum + derivation helper | 0.5 | 3 files |
+| **PR-7** | OnAgent delegate runtime (G): `DelegateState` state machine, `install_request`, `AgentTokenGuard`, `mark_agent_died`/`mark_timed_out`, `EndpointScope`-driven abandonment | 3 | populate `step_v3/agent.rs` + new files |
+| **PR-8** | Protocol-deadline + TimerGuard (H/full): `TimerWheel` public surface, `TimerGuard` with `PrimarySleep`/`DeadlineAbort`/`DelegateTimeout` roles | 1 | timer.rs + scripts/drive.rs |
+| **PR-9** | SubjectContext threading (I): canonical syscalls (sys_open, sys_read, sys_write, sys_fork, sys_execve, sys_close, sys_pipe) threading `&SubjectContext` | 2 | shims/ + scripts/ |
+| **PR-10** | First agent kind: userfaultfd | 5–10 | new ufd subsystem |
+| **PR-11** | First OnBehalfOf user: AIO worker (lands J framework + AIO subsystem together) | 5 | tx-scripts + new aio subsystem |
 
-Land the new four-variant `StepOutcome` and `YieldShape` alongside the old five-variant via a *compatibility shim*:
+Total foundation (PR-1 through PR-3): **~10 working days, ~140 files touched, ~600 mechanical edits**.
+Total full v3 vocabulary retired (PR-1 through PR-8): **~22 working days, ~250 files touched**.
 
-```rust
-// transitional helpers in tx-substrate (or a new tx-step crate):
-impl<T> StepOutcome<T, ByteProgress> {
-    pub fn advanced(n: usize) -> Self {
-        Continue { progress: ByteProgress(n) }
-    }
-    pub fn blocked(c: WakeCarrier, m: InterestConditions) -> Self {
-        Yield { progress: ByteProgress::EMPTY,
-                shape: YieldShape::OnCarrier { carrier: c, interests: m } }
-    }
-    pub fn advanced_then_blocked(n: usize, c: WakeCarrier, m: InterestConditions) -> Self {
-        Yield { progress: ByteProgress(n),
-                shape: YieldShape::OnCarrier { carrier: c, interests: m } }
-    }
-}
-```
+K (`SubjectAuthority.restrictions`) defers until seccomp/landlock work begins.
 
-Old call sites continue to compile via `StepOutcome::advanced(n)` etc. Subsystems migrate to the explicit forms incrementally; a deprecation lint deletes the shim once all sites are converted.
+### 5.3 Heaviest individual files
 
-**Cost:** ~1–2 days for the shim; ~3 days × 4 subsystem-week increments to migrate `tx-subsystems`, `tx-shims`, `tx-fs`, `tx-scripts` separately; cleanup once. Spread over weeks rather than concentrated in a window.
-**Risk:** dual shape exists for the migration period; reviewers must remember which is canonical.
-**Recommendation:** **Path A is cleaner. Path B is the fallback if calendar pressure forbids a focused refactor week.**
+These need explicit owner-attention during their PR:
 
-### Path A's actual sequence
+| File | Sites | PR | Notes |
+|---|---|---|---|
+| `tx-subsystems/src/tty/tests/legacy_phase_a.rs` | 91 StepOutcome refs | PR-2 | Largest test re-green |
+| `tx-subsystems/src/process/structure.rs` | 21 exit_port + carrier | PR-1 | Single file dominates process rename |
+| `tx-fs/src/tmpfs/tests.rs` | 66 StepOutcome refs | PR-2 | Second-largest test re-green |
+| `tx-substrate/src/step_v3/mod.rs` | 7+7+7 of three renamed types | PR-1 | Scaffold's central re-export module |
+| `tx-subsystems/src/tty/execution/step_write.rs` | 11 OnCarrier + step_* signatures | PR-1, PR-4 | Hot in both axes |
+| `tx-subsystems/src/vm/execution.rs` | 11 OnCarrier + step_* signatures | PR-1, PR-4 | Hot in both axes |
+| `tx-substrate/src/bus/` (9 files, 43 Waker sites) | Waker → Mailbox | PR-3 | Concentrated retire surface |
 
-1. **Day 1.** Land the new `StepOutcome` enum + `YieldShape` enum + `StepProgress` trait (no `StepOp` yet). All 354 sites updated; 31 test files re-greened. Single PR to mainline. ~4–5 days of work, including review.
-2. **Day 2.** Land `StepOp` trait wrap. Each step-fn becomes `impl StepOp for FooOp`. ~135 wraps across 32 files. ~3 days of work; can be split into per-subsystem PRs (one for `vfs`, one for `tty`, one for `page_backed`, etc.) since the underlying outcome shape is already migrated.
-3. **Day 3.** Land `SubjectContext` + canonical syscall examples in `tx-shims` and `tx-policy`. ~500 LoC; mostly net-new. ~2 days of work.
+---
 
-After step 3, the foundation is in place. Subsequent work (Delegate, OnBehalfOf, restrictions) is feature-gated — each lands when its first user is ready.
+## 6. Risk register
 
-## 5. Recommended landing order (post-merge)
-
-<!-- txdoc:BLAST-V2-LANDING-1 -->
-
-1. **PR-1: Foundation algebra refactor.** `StepOutcome` 4-variant, `YieldShape::OnCarrier`, `StepProgress` trait + 5 progress impls. All 354 sites rewritten; tests re-greened. (~5 days, single PR or coordinated PR series.)
-2. **PR-2 through PR-N: `StepOp` per-subsystem wrap.** One PR per `tx-subsystems` module (vfs, page_backed, tty, vm, signal, mount, …) wrapping its step-fns. Atomic per subsystem, parallelizable across reviewers. (~3 days total work.)
-3. **PR: SubjectContext skeleton.** Lands in `tx-policy` (currently skeleton) and new `tx-shims/src/subject.rs`. Canonical syscall examples in `tx-shims`. (~2 days.)
-4. **PR: OnAgent token zone + endpoint zone (no agent kind yet).** Compile-only changes in `tx-substrate` and `tx-subsystems`. (~3 days.)
-5. **PR: Driver-mode `Waiting::handle` for OnAgent.** Tested with synthetic kind. (~2 days.)
-6. **PR: First agent kind — userfaultfd.** ~1,500 LoC including ufd subsystem. (~1–2 weeks.)
-7. **PR: OnBehalfOf framework.** ~500 LoC. (~3 days.)
-8. **PR: First OnBehalfOf user — AIO worker.** ~1,000 LoC AIO + integration. (~1 week.)
-9. **PR: SubjectAuthority.restrictions cell stub.** ~150 LoC; opens the door for seccomp/landlock work as separate large efforts.
-10. **Subsequent: FUSE delegation, fanotify-perm, ptrace, io_uring SQPOLL, seccomp BPF.** Each as its own large effort against a stable framework.
-
-Total framework foundation (PRs 1–3 + 4–5 + 7 + 9): **~6 PRs over ~3 weeks of focused work**, plus ~2 weeks of follow-up for the first canary use case (PR-6 ufd).
-
-## 6. Risk register (updated)
-
-<!-- txdoc:BLAST-V2-RISKS-1 -->
+<!-- txdoc:BLAST-V3-RISKS-1 -->
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| PR-1 conflicts with concurrent subsystem work | High | Medium | Lock concurrent edits in `tx-subsystems` / `tx-shims` / `tx-fs` / `tx-scripts` / `tx-kernel` for the foundation week. |
-| Test-suite breakage during refactor | High | Low | Compile-driven; each test file's update is mechanical. Allocate explicit re-greening time. |
-| `StepProgress` monomorphization bloat | Low | Low | Per-step impl only; bounded instance count. |
-| `StepOp` wrap regresses inlining / hot paths | Low | Low | `#[inline]` annotations on small step impls; benchmark `page_backed.rs` and `tmpfs.rs` (heaviest) before/after. |
-| `StepOp` per-subsystem PRs conflict with each other | Low | Low | One subsystem per PR; merge in dependency order. |
-| OnAgent token zone contention | Low | Medium | Per-endpoint sharded zone if measurements show contention. |
-| Authority drift in OnBehalfOf borrows | Medium | Medium | v1 holds snapshot; document the limit; revisit if real use case. |
-| Seccomp BPF VM is large | High | Low (for framework) | Land restriction-stack stub first; defer real BPF. |
+| Foundation freeze runs over 10 days | Medium | Medium | Strict PR-1/2/3 review SLA; second reviewer pre-assigned per PR |
+| PR-2 test re-green takes >2 days for legacy_phase_a.rs | Medium | Low | Pre-write the test mechanical-rewrite script before merging PR-2's source changes |
+| `carrier` identifier (71 sites) judgment calls miss a domain "carrier" | Low | Low | PR-1 ships with explicit list of each rename decision in the commit message; reviewers veto-able |
+| PR-3 (`TaskMailbox` substrate) regresses bus performance | Low | High | Benchmark `tx-substrate/src/bus/` before/after; performance gate in CI |
+| `StepOp` wrap regresses inlining hot paths | Low | Low | `#[inline]` on small impls; benchmark `page_backed.rs` and `tmpfs.rs` |
+| Per-subsystem PR-4 series conflicts | Low | Low | Merge in dependency order (substrate first, then upper subsystems) |
+| `OnAgent` deadline race in PR-7 | Low | Medium | DTOK-3 invariant + dedicated reply-vs-timeout test before merge |
+| `EndpointScope` abandonment routing edge cases | Medium | Medium | Land with explicit test exercising tracee-process exit during ptrace stop |
+| `step_v3/` scaffold has divergent intent from spec | Medium | High | **Before PR-1**, walk through `step_v3/agent.rs` line-by-line vs spec; if divergence is real, reconcile in a pre-PR-1 ADR |
+| Reviewer fatigue across long PR series | Medium | Low | Acknowledge: ~22 working days is real; rotate primary reviewer per PR family |
 
-## 7. What's already in mainline that helps
+The **highest-impact item** is the `step_v3/` scaffold reconciliation. If the scaffold already encodes design decisions that conflict with the v3 spec — particularly around `WaitProtocol`, `EndpointKind`, or `DelegateRequest` shape — those conflicts must be surfaced before PR-1, not discovered during it.
 
-<!-- txdoc:BLAST-V2-LANDED-1 -->
+---
 
-The merge has wired up the real surface that the v3 framework attaches to:
+## 7. Success criteria
 
-- **600 `Cap<T>` sites across 89 files.** The retention discipline is real.
-- **91 `PayloadCap` sites across 26 files.** The identity/payload split is implemented.
-- **113 `require_*` sites across 21 files.** The predicate-and-witness discipline (modulo the witness type itself being implicit) is enforced.
-- **Substrate primitives:** EBR, zone, slab, page allocator. ~13k LoC; functioning.
-- **Reactor:** wait, scheduler, polling. ~8.4k LoC; functioning.
-- **Subsystem code:** 33,979 LoC of actual subsystem implementations to migrate against.
-
-The v3 refactor is *finishing* a partly-built kernel, not starting from scratch.
-
-## 8. What's still skeleton
-
-<!-- txdoc:BLAST-V2-SKELETON-1 -->
-
-| Crate | Lines | Skeleton because… |
-|---|---|---|
-| `tx-policy` | 9 | Awaits `SubjectAuthority` / `RestrictionStack` / scheduler-policy types. |
-| `tx-services` | 7 | Awaits cred-service / rlimit-service / random / time / trace implementations. |
-
-Both are intentionally empty until v3 lands the types they host. PR-3 (SubjectContext) populates `tx-policy`. Service-layer work is later.
-
-## 9. Compared to v1's plan
-
-<!-- txdoc:BLAST-V2-V1-DIFF-1 -->
-
-The v1 landing order was: foundation → worktree rebase × 3 → SubjectContext → OnAgent. The worktree rebase took 3–6 days of coordination cost.
-
-The v2 landing order has no rebase step. The mainline refactor week (~5 days for PR-1, ~3 days for PR-2 series) replaces it directly. Total foundation cost is similar; *coordination* cost dropped substantially. The remaining schedule (PR-4 onward for OnAgent and beyond) is unchanged from v1.
-
-The single biggest shift is **the loss of staging area.** v1 had skeleton crates as a buffer for SubjectContext-shaped additions. v2 still has `tx-policy` and `tx-services` as buffers, but the StepOutcome refactor itself touches 75 files across the active subsystem code with no isolation. Path A's atomic-PR approach is the cleanest response; Path B's compat-layer is the calendar-pressure fallback.
-
-## 10. Success criteria (unchanged)
-
-<!-- txdoc:BLAST-V2-SUCCESS-1 -->
+<!-- txdoc:BLAST-V3-SUCCESS-1 -->
 
 The migration is "done" when:
 
-- All three v3 foundation primitives (`StepOutcome` four-variant, `StepOp`/`StepProgress`, `SubjectContext`) are in mainline.
-- All ~135 step-fn sites have been wrapped into `StepOp` impls.
-- All ~354 refactor sites compile and tests pass.
-- `OnAgent` is callable and userfaultfd works end-to-end.
-- `OnBehalfOf` is callable and AIO works end-to-end.
-- v3 docs in `Txv3/` are referenced by the v4 docs they supersede.
-- A migration ADR in `docs/progress/decisions/` records the landing.
+- v4 vocabulary is **fully retired** from mainline: no `OnCarrier`, `WakeCarrier`, `InterestConditions`, `exit_port`, `read_wq`/`write_wq` identifiers remain in code (excluding archived docs).
+- `StepOutcome` is four-variant; all 423 construction sites use the new shape.
+- All 178 `step_*` functions are wrapped as `impl StepOp`.
+- `tx-substrate/src/bus/` no longer uses bare `Waker`; `TaskMailbox` is the wake-routing primitive.
+- `step_v3/` scaffold is populated: `DelegateState`, `install_request`, `AgentTokenGuard`, `mark_*` methods all exist and pass the runtime-spec tests.
+- userfaultfd works end-to-end (PR-10 success).
+- AIO worker works end-to-end (PR-11 success).
+- v3 docs in `Txv3/` are referenced by the v4 docs they supersede; v4 docs carry `[deprecated by v5]` notes where applicable.
+- A migration ADR records the landing in `docs/progress/decisions/`.
+
+The success bar is **vocabulary retirement plus two canary use cases**. Subsystems that don't yet exist (FUSE, fanotify-perm, ptrace, full seccomp) ship on their own schedule against the stable v3 framework.
+
+---
+
+## 8. What this plan does *not* do
+
+<!-- txdoc:BLAST-V3-NEGATIVE-1 -->
+
+To avoid scope creep:
+
+- **No compat layer.** Type aliases / constructor shims are explicitly rejected. The transition is direct.
+- **No parallel-shape period.** v4 and v5 vocabulary do not coexist in mainline after PR-1.
+- **No per-subsystem opt-in.** The vocabulary rename and `StepOutcome` refactor are tree-wide in their respective PRs.
+- **No deferred test re-green.** Tests update in the same PR as their source.
+- **No `OnEdge` / `OnHandoff` in this landing.** Deferred to a later phase when their first users (EPOLLET, PI futex) materialize.
+- **No restriction-kind implementations.** The `SubjectAuthority.restrictions` cell is reserved for the seccomp/landlock work, which is its own multi-week effort.
+
+These exclusions exist to keep the landing window bounded and the per-PR review surface tractable.
