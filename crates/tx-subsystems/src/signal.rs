@@ -30,11 +30,12 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use tx_substrate::wake::SignalRouting;
 use tx_substrate::zone::{Cap, OperationalCapExt};
 
 use crate::execution::Errno;
 use crate::process::structure::{ProcessGroup, ProcessIdentity};
-use crate::thread_runtime::execution::post_signal;
+use crate::thread_runtime::execution::{post_signal, post_signal_mailbox};
 use tx_substrate::SpinMutex;
 
 /// POSIX signal number, 1..=64.
@@ -540,25 +541,95 @@ pub enum KillOutcome {
 /// - **Gewalt** signums (SIGKILL, SIGSTOP, SIGCONT) bypass the
 ///   pending queue entirely and route through [`route_gewalt`],
 ///   which updates each thread's `signal_summary` in place.
-/// - **Event** signums (catchable) route to the first live thread's
-///   `thread_pending` via [`post_signal`].
+/// - **Event** signums (catchable) route to a single eligible live
+///   thread's `thread_pending` via [`post_signal`].
 ///
-/// Zombies are skipped.
+/// **D9-B eligibility scan.** Per POSIX, a process-directed signal
+/// must be delivered to a thread whose mask permits the signum if
+/// one exists. The scan runs under `payload.threads.lock()` so that
+/// concurrent `kill(pid, sig)` calls serialise on the thread-list
+/// lock; only one CAS into a thread's `thread_pending` succeeds in
+/// *first* setting the bit (POSIX coalescence for standard signals).
+///
+/// Two-pass selection:
+/// 1. **Eligible.** Prefer the first non-zombie thread that does
+///    *not* have `sig` blocked in its sigmask.
+/// 2. **Fallback.** If every non-zombie thread has `sig` blocked
+///    (POSIX permits the signal to remain pending until the chosen
+///    thread unblocks it), pick the first non-zombie thread anyway.
+///    The bit is set in its `thread_pending`; `signal_summary.
+///    deliverable_signal` stays `false` because `post_signal`'s mask
+///    check filters the summary update.
+///
+/// The mailbox post happens via `post_signal` *after* the
+/// thread-list lock is dropped — `post_signal` does not reacquire
+/// `payload.threads.lock()`, so this order avoids any
+/// post-while-holding-list-lock hazard. Zombies are skipped.
 pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
     if is_gewalt(sig) {
-        return route_gewalt(target, sig);
+        let outcome = route_gewalt(target, sig);
+        // D9-D: route_gewalt does not currently fan out to signalfd
+        // subscriptions — SIGKILL/SIGSTOP/SIGCONT bypass pending
+        // queues per SIGNAL_v1 §2 Consequence 2, and the canonical
+        // signalfd Linux behaviour for SIGSTOP/SIGCONT is to deliver
+        // them as well (handler-bypassing, but signalfd-visible).
+        // We follow that here: notify any per-process subscription
+        // whose mask covers the signum *after* the gewalt routing
+        // completes its per-thread fan-out. SIGKILL routes to the
+        // process-exit path which already zombifies every thread; the
+        // signalfd post happens before zombify reaches the registry
+        // unregister site (Drop for SignalFd runs only when the cap
+        // drops, not at thread zombify).
+        if outcome == KillOutcome::Delivered {
+            crate::signalfd::notify_process_signal(target.key().raw(), sig);
+        }
+        return outcome;
     }
 
     let Ok(payload) = target.upgrade_operational() else {
         return KillOutcome::NoLiveThread;
     };
-    let threads = payload.threads.lock();
-    let Some(leader) = threads.iter().find(|t| !t.is_zombie()).cloned() else {
+
+    let chosen = {
+        let threads = payload.threads.lock();
+
+        // Pass 1: first non-zombie thread with `sig` NOT blocked.
+        // The sigmask read goes through the payload's `signal_mask`
+        // atomic via `signal_mask()`, matching `post_signal` /
+        // `step_sigprocmask`'s discipline.
+        let mut eligible: Option<Cap<crate::thread_runtime::ThreadIdentity>> = None;
+        let mut fallback: Option<Cap<crate::thread_runtime::ThreadIdentity>> = None;
+        for thread in threads.iter() {
+            let Some(thread_payload) = thread.payload_cap() else {
+                // Zombie: skip.
+                continue;
+            };
+            if fallback.is_none() {
+                fallback = Some(thread.clone());
+            }
+            if !thread_payload.signal_mask().is_blocked(sig) {
+                eligible = Some(thread.clone());
+                break;
+            }
+        }
+        eligible.or(fallback)
+        // `threads` lock drops at end of scope before `post_signal`.
+    };
+
+    let Some(chosen) = chosen else {
         return KillOutcome::NoLiveThread;
     };
-    drop(threads);
 
-    post_signal(&leader, sig);
+    post_signal(&chosen, sig);
+
+    // D9-D: fan out to every per-process signalfd subscription whose
+    // mask covers `sig`. Runs *after* the thread-eligibility post —
+    // the wake paths are additive (per D9 §6 / W-II prompt
+    // constraint 1). The thread post still updates the truth-bearing
+    // `InterruptSummary` and the bound mailbox; the signalfd post
+    // routes signal-as-event to any agent draining via `read(2)`.
+    crate::signalfd::notify_process_signal(target.key().raw(), sig);
+
     KillOutcome::Delivered
 }
 
@@ -618,6 +689,14 @@ pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
             18 => s.stop_requested = false,
             _ => unreachable!("SIGKILL handled above; is_gewalt guarantees the rest"),
         });
+        // D9-A: post the wake-hint to each thread's mailbox after
+        // the summary mutation so a parked future re-polls and
+        // observes the new `stop_requested` bit. The routing tag is
+        // `ProcessDirected` — SIGSTOP/SIGCONT are process-wide
+        // control ops; per D9 §5 these "control ops, not
+        // readiness transitions" still warrant a wake-hint because
+        // the parked future has to notice the summary change.
+        post_signal_mailbox(&thread_payload, sig, SignalRouting::ProcessDirected);
         touched = true;
     }
 
@@ -905,6 +984,177 @@ pub fn deliver_tty_dispatch_with_guard(
     let signum = signum_for_job_control(dispatch.signal);
     let count = script_kill_pgrp_with_guard(source, &pgrp_cap, signum, guard)?;
     Ok(DispatchOutcome::Delivered { count })
+}
+
+// -- PR-2 StepOp wraps -------------------------------------------------
+//
+// Per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1, PR-2 wraps each free
+// `step_*` fn in an `impl StepOp for FooOp` shell. The signal-shim
+// mutators here take `&Cap<_>` references; the wraps store the cap by
+// value (`Cap` is `Clone`) per the PR-2 convention demonstrated by
+// `cred::SetuidOp`. None of these fns take an epoch `Guard`, so the
+// wraps need no lifetime parameter. Each `step()` body delegates to
+// the free fn unchanged and lifts the return into `StepOutcome::Done`.
+
+/// `StepOp` wrap for [`step_kill_process`]. PR-2 wave 2.
+pub struct KillProcessOp {
+    pub target: Cap<ProcessIdentity>,
+    pub sig: Signum,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for KillProcessOp
+{
+    type Output = KillOutcome;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_kill_process(&self.target, self.sig))
+    }
+}
+
+/// `StepOp` wrap for [`step_kill_pgrp`]. PR-2 wave 2.
+pub struct KillPgrpOp {
+    pub pgrp: Cap<ProcessGroup>,
+    pub sig: Signum,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for KillPgrpOp
+{
+    type Output = usize;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_kill_pgrp(&self.pgrp, self.sig))
+    }
+}
+
+/// `StepOp` wrap for [`step_sigaction`]. PR-2 wave 2.
+pub struct SigactionOp {
+    pub process: Cap<ProcessIdentity>,
+    pub sig: Signum,
+    pub disposition: SigDisposition,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for SigactionOp
+{
+    type Output = SigDispositionChange;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_sigaction(
+            &self.process,
+            self.sig,
+            self.disposition,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    //! PR-2 wave-2 `StepOp` wrap tests for the signal shim. Each test
+    //! exercises one wrap against a `bootstrap_init_process`-minted
+    //! cap, confirming the wrap delegates to the free fn and lifts
+    //! the result into `StepOutcome::Done`. Permission-rule and
+    //! routing semantics are covered by the existing free-fn tests
+    //! in `signal::tests`.
+    use super::*;
+    use crate::process::bootstrap_init_process;
+    use crate::process::structure::reset_pid_counter_for_test;
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::thread_runtime::structure::reset_tid_counter_for_test;
+    use crate::vm::{AddressSpace, TestPmap};
+    use crate::zones;
+    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome};
+    use tx_substrate::testing::init_host_for_test_once;
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        init_host_for_test_once();
+        let _ = zones::register_all();
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        reset_pid_counter_for_test();
+        reset_tid_counter_for_test();
+        crate::process::execution::reset_init_process_for_test();
+        guard
+    }
+
+    fn fresh_aspace() -> Cap<crate::vm::AddressSpace> {
+        AddressSpace::new_cap_for_platform::<TestPmap>().expect("fresh aspace")
+    }
+
+    #[test]
+    fn kill_process_op_delegates_to_step_kill_process() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let mut op = KillProcessOp {
+            target: proc_cap.clone(),
+            sig: Signum::SIGTERM,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        assert_eq!(outcome, StepOutcome::Done(KillOutcome::Delivered));
+    }
+
+    #[test]
+    fn kill_pgrp_op_delegates_to_step_kill_pgrp() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let pgrp = proc_cap.pgrp_cap();
+        let mut op = KillPgrpOp {
+            pgrp,
+            sig: Signum::SIGINT,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        // bootstrap_init_process gives a single-member pgrp.
+        assert_eq!(outcome, StepOutcome::Done(1usize));
+    }
+
+    #[test]
+    fn sigaction_op_delegates_to_step_sigaction() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let mut op = SigactionOp {
+            process: proc_cap.clone(),
+            sig: Signum::SIGTERM,
+            disposition: SigDisposition::Ignore,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(SigDispositionChange::Replaced {
+                prev: SigDisposition::Default,
+            }) => {}
+            other => panic!("expected Done(Replaced{{Default}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sigaction_op_uncatchable_signum_returns_uncatchable() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let mut op = SigactionOp {
+            process: proc_cap.clone(),
+            sig: Signum::SIGKILL,
+            disposition: SigDisposition::Ignore,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        assert_eq!(
+            outcome,
+            StepOutcome::Done(SigDispositionChange::Uncatchable(SigDisposition::Default))
+        );
+    }
 }
 
 #[cfg(test)]
