@@ -15,8 +15,8 @@
 //! - txdoc:STEP-V2-DRIVER-MODE-1 (DriveMode classify matrix)
 
 use tx_substrate::step_v3::{
-    AcceptOutcome, ByteProgress, DriveMode, InterestConditions, NoProgress, StepOutcome,
-    StepProgress, Translation, WakeCarrier, YieldShape,
+    AcceptOutcome, ByteProgress, DriveMode, InterestMask, NoProgress, StepOutcome,
+    StepProgress, Translation, WaitSourceId, YieldShape,
 };
 
 // -- StepOutcome closed catalog -----------------------------------------------
@@ -32,9 +32,9 @@ fn step_outcome_has_exactly_four_variants_via_exhaustive_match() {
         },
         StepOutcome::Yield {
             progress: NoProgress,
-            shape: YieldShape::OnCarrier {
-                carrier: WakeCarrier::new(7),
-                interests: InterestConditions::new(0b101),
+            shape: YieldShape::OnWaitSource {
+                source: WaitSourceId::new(7),
+                interests: InterestMask::new(0b101),
             },
         },
         StepOutcome::Done(42),
@@ -47,11 +47,12 @@ fn step_outcome_has_exactly_four_variants_via_exhaustive_match() {
             StepOutcome::Yield { progress, shape } => {
                 assert!(progress.is_empty());
                 match shape {
-                    YieldShape::OnCarrier { carrier, interests } => {
-                        assert_eq!(carrier.raw(), 7);
+                    YieldShape::OnWaitSource { source, interests } => {
+                        assert_eq!(source.raw(), 7);
                         assert_eq!(interests.raw(), 0b101);
                     }
                     YieldShape::OnAgent { .. } => {}
+                    YieldShape::OnTimer { .. } => {}
                 }
             }
             StepOutcome::Done(v) => assert_eq!(v, 42),
@@ -146,19 +147,20 @@ fn errno_mirrors_v4_catalog() {
 fn step_outcome_yield_carries_progress_and_shape() {
     let outcome: StepOutcome<(), ByteProgress> = StepOutcome::Yield {
         progress: ByteProgress::new(64),
-        shape: YieldShape::OnCarrier {
-            carrier: WakeCarrier::new(3),
-            interests: InterestConditions::new(0b1),
+        shape: YieldShape::OnWaitSource {
+            source: WaitSourceId::new(3),
+            interests: InterestMask::new(0b1),
         },
     };
     if let StepOutcome::Yield { progress, shape } = outcome {
         assert_eq!(progress.bytes(), 64);
         match shape {
-            YieldShape::OnCarrier { carrier, interests } => {
-                assert_eq!(carrier.raw(), 3);
+            YieldShape::OnWaitSource { source, interests } => {
+                assert_eq!(source.raw(), 3);
                 assert_eq!(interests.raw(), 0b1);
             }
-            YieldShape::OnAgent { .. } => panic!("expected OnCarrier, got OnAgent"),
+            YieldShape::OnAgent { .. } => panic!("expected OnWaitSource, got OnAgent"),
+            YieldShape::OnTimer { .. } => panic!("expected OnWaitSource, got OnTimer"),
         }
     } else {
         panic!("expected Yield");
@@ -168,19 +170,20 @@ fn step_outcome_yield_carries_progress_and_shape() {
 // -- YieldShape closed catalog ------------------------------------------------
 
 #[test]
-fn yield_shape_has_oncarrier_variant_with_carrier_and_interests() {
+fn yield_shape_has_onwaitsource_variant_with_source_and_interests() {
     // OnAgent is reserved for PR-4 under ARCH-3. PR-0 only pins
-    // OnCarrier; adding OnAgent is itself a closed-catalog extension.
-    let shape = YieldShape::OnCarrier {
-        carrier: WakeCarrier::new(11),
-        interests: InterestConditions::new(0b1100),
+    // OnWaitSource; adding OnAgent is itself a closed-catalog extension.
+    let shape = YieldShape::OnWaitSource {
+        source: WaitSourceId::new(11),
+        interests: InterestMask::new(0b1100),
     };
     match shape {
-        YieldShape::OnCarrier { carrier, interests } => {
-            assert_eq!(carrier.raw(), 11);
+        YieldShape::OnWaitSource { source, interests } => {
+            assert_eq!(source.raw(), 11);
             assert_eq!(interests.raw(), 0b1100);
         }
-        YieldShape::OnAgent { .. } => panic!("expected OnCarrier, got OnAgent"),
+        YieldShape::OnAgent { .. } => panic!("expected OnWaitSource, got OnAgent"),
+        YieldShape::OnTimer { .. } => panic!("expected OnWaitSource, got OnTimer"),
     }
 }
 
@@ -267,25 +270,25 @@ fn byte_progress_extend_accumulates() {
 
 // -- DriveMode classify matrix ------------------------------------------------
 //
-// Per docs/Txv3/03_STEP_MODEL_v2.md §5.1. PR-0 covers OnCarrier only;
+// Per docs/Txv3/03_STEP_MODEL_v2.md §5.1. PR-0 covers OnWaitSource only;
 // the OnAgent rows are added in PR-4.
 
-fn carrier_shape() -> YieldShape {
-    YieldShape::OnCarrier {
-        carrier: WakeCarrier::new(0),
-        interests: InterestConditions::new(0),
+fn wait_source_shape() -> YieldShape {
+    YieldShape::OnWaitSource {
+        source: WaitSourceId::new(0),
+        interests: InterestMask::new(0),
     }
 }
 
 #[test]
-fn classify_nonblocking_oncarrier_empty_progress_translates_to_eagain() {
-    let outcome = DriveMode::Nonblocking.classify(&carrier_shape(), true);
+fn classify_nonblocking_onwaitsource_empty_progress_translates_to_eagain() {
+    let outcome = DriveMode::Nonblocking.classify(&wait_source_shape(), true);
     assert_eq!(outcome, AcceptOutcome::Translate(Translation::Eagain));
 }
 
 #[test]
-fn classify_nonblocking_oncarrier_with_progress_translates_to_partial_return() {
-    let outcome = DriveMode::Nonblocking.classify(&carrier_shape(), false);
+fn classify_nonblocking_onwaitsource_with_progress_translates_to_partial_return() {
+    let outcome = DriveMode::Nonblocking.classify(&wait_source_shape(), false);
     assert_eq!(
         outcome,
         AcceptOutcome::Translate(Translation::PartialReturn)
@@ -293,15 +296,15 @@ fn classify_nonblocking_oncarrier_with_progress_translates_to_partial_return() {
 }
 
 #[test]
-fn classify_waiting_oncarrier_resolves() {
-    let outcome = DriveMode::Waiting.classify(&carrier_shape(), true);
+fn classify_waiting_onwaitsource_resolves() {
+    let outcome = DriveMode::Waiting.classify(&wait_source_shape(), true);
     assert_eq!(outcome, AcceptOutcome::Resolve);
-    let outcome = DriveMode::Waiting.classify(&carrier_shape(), false);
+    let outcome = DriveMode::Waiting.classify(&wait_source_shape(), false);
     assert_eq!(outcome, AcceptOutcome::Resolve);
 }
 
 #[test]
-fn classify_selecting_oncarrier_resolves() {
-    let outcome = DriveMode::Selecting.classify(&carrier_shape(), true);
+fn classify_selecting_onwaitsource_resolves() {
+    let outcome = DriveMode::Selecting.classify(&wait_source_shape(), true);
     assert_eq!(outcome, AcceptOutcome::Resolve);
 }

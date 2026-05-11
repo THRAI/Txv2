@@ -1,19 +1,44 @@
 //! v3 execution-scope catalog pin tests.
 //!
-//! These tests pin the closed-catalog shape for `ExecutionScope` and the
-//! placeholder `OwnedProcessHandle`. Wave 3 lands the enum + helpers only;
-//! the actual borrow primitive (`with_on_behalf_of` async fn), abandonment
-//! routing, and resource-scoping machinery are deferred to PR-7 of the v3
-//! TDD migration plan. Wave 3 just makes the closed catalog representable
-//! so subsequent migration PRs cannot silently widen it or shift helper
-//! semantics.
+//! Pins the closed-catalog shape for `ExecutionScope`. PR-11 phase 0
+//! reshaped the `OnBehalfOf` variant to carry a real `Cap<I>` (generic
+//! over `I: SubjectIdentity`); the unit-typed `OwnedProcessHandle`
+//! placeholder is retired. Catalog extension is gated on ARCH-3
+//! review.
 //!
 //! txdoc cross-refs:
-//! - txdoc:TXV3-STEP-MODEL-V2 (step model algebra; ExecutionScope is the
-//!   identity-context modifier orthogonal to YieldShape)
+//! - txdoc:TXV3-STEP-MODEL-V2 (step model algebra; ExecutionScope is
+//!   the identity-context modifier orthogonal to YieldShape)
 //! - txdoc:TXV3-EXECUTION-SCOPE-V1 (full ExecutionScope spec)
+//! - txdoc:SCOPE-V1-CATALOG-1 (closed catalog)
 
-use tx_substrate::step_v3::{ExecutionScope, OwnedProcessHandle};
+use tx_substrate::epoch;
+use tx_substrate::step_v3::{ExecutionScope, ProcessIdentity};
+use tx_substrate::zone::{self, register_zone_for, reserve_for, sign_for, Cap};
+
+static ZONE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn reset_zone_and_epoch() -> std::sync::MutexGuard<'static, ()> {
+    let guard = ZONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tx_substrate::testing::init_host_for_test_once();
+    unsafe {
+        epoch::testing::reset_for_test();
+        zone::testing::reset_for_test();
+    }
+    epoch::testing::init_for_test();
+    zone::testing::init_for_test(
+        4096,
+        tx_substrate::page_allocator::testing::direct_map_base_for_test(),
+    )
+    .expect("test zone runtime init");
+    register_zone_for::<ProcessIdentity>().expect("register placeholder process zone");
+    guard
+}
+
+fn mint_process_cap() -> Cap<ProcessIdentity> {
+    let reservation = reserve_for::<ProcessIdentity>().expect("reserve process placeholder");
+    sign_for(reservation, ProcessIdentity::placeholder())
+}
 
 // -- ExecutionScope closed catalog -------------------------------------------
 
@@ -22,9 +47,11 @@ fn execution_scope_has_exactly_two_variants_via_exhaustive_match() {
     // Build every variant, then exhaustively destructure them. The
     // absence of a wildcard arm is the test: if a third variant appears
     // later without an ARCH-3 review, this stops compiling.
+    let _g = reset_zone_and_epoch();
+    let cap = mint_process_cap();
     let cases: [ExecutionScope; 2] = [
         ExecutionScope::Thread,
-        ExecutionScope::OnBehalfOf(OwnedProcessHandle::placeholder()),
+        ExecutionScope::OnBehalfOf(cap.clone()),
     ];
 
     for scope in cases {
@@ -39,20 +66,20 @@ fn execution_scope_has_exactly_two_variants_via_exhaustive_match() {
 
 #[test]
 fn execution_scope_thread_is_not_borrowed() {
-    let thread = ExecutionScope::Thread;
+    let thread: ExecutionScope = ExecutionScope::Thread;
     assert!(thread.is_thread(), "Thread.is_thread() must be true");
     assert!(!thread.is_borrowed(), "Thread.is_borrowed() must be false",);
-    assert_eq!(
-        thread.borrowed_owner(),
-        None,
+    assert!(
+        thread.borrowed_owner().is_none(),
         "Thread.borrowed_owner() must be None",
     );
 }
 
 #[test]
 fn execution_scope_on_behalf_of_is_not_thread() {
-    let handle = OwnedProcessHandle::placeholder();
-    let borrowed = ExecutionScope::OnBehalfOf(handle);
+    let _g = reset_zone_and_epoch();
+    let cap = mint_process_cap();
+    let borrowed = ExecutionScope::OnBehalfOf(cap.clone());
     assert!(
         !borrowed.is_thread(),
         "OnBehalfOf.is_thread() must be false",
@@ -63,51 +90,20 @@ fn execution_scope_on_behalf_of_is_not_thread() {
     );
     assert_eq!(
         borrowed.borrowed_owner(),
-        Some(handle),
-        "OnBehalfOf.borrowed_owner() must return the handle",
+        Some(&cap),
+        "OnBehalfOf.borrowed_owner() must return the principal cap",
     );
 }
 
 #[test]
-fn execution_scope_borrowed_owner_round_trips_handle() {
-    // Pin: the handle returned by borrowed_owner is the exact one passed
-    // to OnBehalfOf. (Eq round-trip; once the placeholder is replaced by
-    // a real Cap<ProcessIdentity> in PR-7, this should pin the same
-    // identity equality.)
-    let handle = OwnedProcessHandle::placeholder();
-    let scope = ExecutionScope::OnBehalfOf(handle);
+fn execution_scope_borrowed_owner_round_trips_cap() {
+    // Pin: the cap returned by borrowed_owner is the exact one passed
+    // to OnBehalfOf. Cap equality is raw-key equality, which means a
+    // clone compares equal to the original (clone bumps EBR retain
+    // but doesn't change the slot key).
+    let _g = reset_zone_and_epoch();
+    let cap = mint_process_cap();
+    let scope = ExecutionScope::OnBehalfOf(cap.clone());
     let recovered = scope.borrowed_owner().expect("OnBehalfOf carries owner");
-    assert_eq!(recovered, handle, "borrowed_owner must round-trip handle");
-}
-
-// -- OwnedProcessHandle placeholder ------------------------------------------
-
-#[test]
-fn owned_process_handle_placeholder_is_constructible() {
-    // The placeholder constructor must be reachable from outside the
-    // crate, and two calls must compare equal (it is the unique
-    // placeholder value until PR-7 swaps in Cap<ProcessIdentity>).
-    let a = OwnedProcessHandle::placeholder();
-    let b = OwnedProcessHandle::placeholder();
-    assert_eq!(a, b, "placeholder() must be the unique placeholder value");
-}
-
-// -- const-fn shape pin ------------------------------------------------------
-
-// txdoc:SCOPE-1
-// Compile-only: invoke is_thread / is_borrowed / borrowed_owner in a
-// const context to pin their `const fn` shape. If a future change drops
-// `const`, this stops compiling.
-const _THREAD_SCOPE: ExecutionScope = ExecutionScope::Thread;
-const _IS_THREAD: bool = _THREAD_SCOPE.is_thread();
-const _IS_BORROWED: bool = _THREAD_SCOPE.is_borrowed();
-const _BORROWED_OWNER: Option<OwnedProcessHandle> = _THREAD_SCOPE.borrowed_owner();
-
-#[test]
-fn execution_scope_helpers_are_const() {
-    // Reference the const-evaluated values so the compiler must keep
-    // them. The actual pinning happens at compile time above.
-    const { assert!(_IS_THREAD) };
-    const { assert!(!_IS_BORROWED) };
-    assert!(_BORROWED_OWNER.is_none());
+    assert_eq!(recovered, &cap, "borrowed_owner must round-trip cap");
 }

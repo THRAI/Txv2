@@ -30,10 +30,9 @@
 //!   `step_setregid` helpers covering the full Linux privilege rule.
 
 use core::marker::PhantomData;
-use core::sync::atomic::Ordering;
 
 use tx_substrate::epoch::Guard;
-use tx_substrate::zone::Cap;
+use tx_substrate::zone::{self, Cap, Zone, ZoneAllocated, ZoneError};
 
 use crate::execution::Errno;
 use crate::process::structure::{ProcessIdentity, TargetProcCred};
@@ -137,8 +136,19 @@ impl CapabilitySet {
 ///
 /// Mutations go through [`step_setuid`] / [`step_setgid`] which enforce
 /// POSIX privilege rules. Reads are atomic-snapshot: the field on
-/// `ProcessPayload` is a `SpinMutex<Cred>` and `Cred` is `Copy`, so
-/// readers clone a complete view under one lock acquisition.
+/// `ProcessPayload` is an `AtomicSlot<Cap<Cred>>` (PR-9 phase 5 / D5
+/// Path A — was `SpinMutex<Cred>`). Readers load the cap, `Deref` to
+/// `&Cred`, and the snapshot is independent of the slot once cloned
+/// (`Cred: Copy`).
+///
+/// Implements [`tx_substrate::step_v3::CredentialView`] per
+/// [D1](../../../../docs/progress/decisions/2026-05-11-d1-scriptctx-trait-bound-identity.md):
+/// `step_v3` declares the trait shape; the concrete `Cred` lives
+/// here in the subsystem layer. The trait body is intentionally
+/// empty — step-level authority helpers consume the rich Cred
+/// surface (uid/gid/effective caps) via inherent methods and the
+/// `From<&Cred> for step_v3::Credential` bridge, not via the
+/// abstract view.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Cred {
     pub uid: Uid,
@@ -154,6 +164,76 @@ pub struct Cred {
     pub sgid: Gid,
     pub effective_caps: CapabilitySet,
     pub permitted_caps: CapabilitySet,
+}
+
+impl tx_substrate::step_v3::CredentialView for Cred {}
+
+// PR-9 phase 5 — D5 Path A. `Cred` is zone-allocated so that
+// `ProcessPayload.cred` can hold `AtomicSlot<Cap<Cred>>` and mutators
+// publish a fresh cap atomically per cred-mutation syscall. The COW
+// model (one cap per setuid/setgid/...) replaces the old
+// `SpinMutex<Cred>` lock-and-mutate-in-place pattern.
+//
+// Registration lives in `crate::zones::cred::register_zones()`. The
+// zone is registered alongside the other subsystem zones; tests pick
+// it up via `zones::register_all()`.
+//
+// `Cred` is a small POD struct (`Copy`) — moving it into a zone slot
+// is a value-copy with no interior `Drop` to worry about. Senders/
+// receivers cross threads via `Cap<Cred>` clones (atomic retain-count
+// bumps on the cap key), not by value, so no `Send`/`Sync` markers
+// are needed beyond what `Cred` already gets (its fields are all
+// `Copy`).
+static CRED_ZONE: Zone<Cred> = Zone::const_new();
+
+unsafe impl ZoneAllocated for Cred {
+    fn zone() -> &'static Zone<Self> {
+        &CRED_ZONE
+    }
+}
+
+/// Reserve a slot in the `Cred` zone and sign `cred` into it,
+/// producing a fresh `Cap<Cred>`. Used by:
+///
+/// - `sign_process_payload` (process construction in
+///   `bootstrap_init_process` and `step_fork`).
+/// - The 7 cred-mutator wraps (`step_setuid`, ...) — each mutation
+///   reserves a fresh cap, the slot's `AtomicSlot::swap` publishes
+///   it, and the previous cap drops at the end of the call (EBR-
+///   deferred reclamation).
+/// - The 3 test helpers (`*_for_test`).
+///
+/// Returns `ZoneError` only on slab exhaustion; tests reset the slab
+/// at `setup()`.
+pub fn sign_cred(cred: Cred) -> Result<Cap<Cred>, ZoneError> {
+    let reservation = zone::reserve_for::<Cred>()?;
+    Ok(zone::sign_for(reservation, cred))
+}
+
+/// PR-9 phase 5 — D5 §7. Mint a placeholder
+/// `Cap<RestrictionStackHandle>` for `SubjectAuthority::new` calls in
+/// the syscall arms.
+///
+/// The real append-only restriction stack lands in PR-K alongside the
+/// seccomp / landlock surfaces; until then `SubjectAuthority` just
+/// needs *some* cap to satisfy the type signature. The
+/// `RestrictionStackHandle` placeholder is a unit-typed
+/// `ZoneAllocated` struct in `tx_substrate::step_v3`, so each call
+/// reserves a fresh slot in the placeholder zone and signs the
+/// unit-typed value into it. The resulting cap is short-lived (the
+/// syscall arm drops it at script-frame exit; EBR retires the slab).
+///
+/// Cost is one zone reservation per syscall entry — acceptable for
+/// the placeholder; PR-K replaces with the proper slot-style append-
+/// only stack.
+pub fn placeholder_restrictions_cap()
+    -> Result<Cap<tx_substrate::step_v3::RestrictionStackHandle>, ZoneError>
+{
+    let reservation = zone::reserve_for::<tx_substrate::step_v3::RestrictionStackHandle>()?;
+    Ok(zone::sign_for(
+        reservation,
+        tx_substrate::step_v3::RestrictionStackHandle::placeholder(),
+    ))
 }
 
 impl Cred {
@@ -203,8 +283,12 @@ pub fn step_setuid(target: &Cap<ProcessIdentity>, new_uid: Uid) -> CredChange {
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;
     };
-    let mut cred_guard = payload.cred.lock();
-    let prev = *cred_guard;
+    // PR-9 phase 5 (D5 Path A): load the current cred cap, derive the
+    // new value, sign a fresh cap, and publish via `AtomicSlot::swap`.
+    // The previous cap drops at the end of this function and the slab
+    // entry is EBR-retired once outstanding readers' guards complete.
+    let prev_cap = payload.cred_cap();
+    let prev = *prev_cap;
     let mut new = prev;
 
     if prev.is_privileged_for(Capability::SETUID) {
@@ -219,12 +303,20 @@ pub fn step_setuid(target: &Cap<ProcessIdentity>, new_uid: Uid) -> CredChange {
         return CredChange::PermissionDenied;
     }
 
-    *cred_guard = new;
-    drop(cred_guard);
+    let new_cap = match sign_cred(new) {
+        Ok(cap) => cap,
+        // Slab exhaustion. Today's slab is sized to "one per live
+        // process + a few transient caps in flight" — exhaustion here
+        // is a kernel-wide pressure event, not a per-process bug.
+        // Surface as PermissionDenied (the only error variant a
+        // setuid-family rule produces); a future ENOMEM-bearing
+        // CredChange variant lands when slabs become user-visible.
+        Err(_) => return CredChange::PermissionDenied,
+    };
+    let _old_cap = payload.replace_cred(new_cap);
     drop(payload_guard);
-
-    // Force-publish so concurrent readers see the new cred immediately.
-    core::sync::atomic::fence(Ordering::SeqCst);
+    // `_old_cap` drops here, releasing its retain-count on the prior
+    // slab entry; EBR reclaims when concurrent readers' guards exit.
 
     CredChange::Replaced { prev, new }
 }
@@ -238,8 +330,8 @@ pub fn step_setgid(target: &Cap<ProcessIdentity>, new_gid: Gid) -> CredChange {
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;
     };
-    let mut cred_guard = payload.cred.lock();
-    let prev = *cred_guard;
+    let prev_cap = payload.cred_cap();
+    let prev = *prev_cap;
     let mut new = prev;
 
     if prev.is_privileged_for(Capability::SETGID) {
@@ -252,11 +344,12 @@ pub fn step_setgid(target: &Cap<ProcessIdentity>, new_gid: Gid) -> CredChange {
         return CredChange::PermissionDenied;
     }
 
-    *cred_guard = new;
-    drop(cred_guard);
+    let new_cap = match sign_cred(new) {
+        Ok(cap) => cap,
+        Err(_) => return CredChange::PermissionDenied,
+    };
+    let _old_cap = payload.replace_cred(new_cap);
     drop(payload_guard);
-
-    core::sync::atomic::fence(Ordering::SeqCst);
 
     CredChange::Replaced { prev, new }
 }
@@ -278,8 +371,8 @@ pub fn step_setresuid(
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;
     };
-    let mut cred_guard = payload.cred.lock();
-    let prev = *cred_guard;
+    let prev_cap = payload.cred_cap();
+    let prev = *prev_cap;
 
     if !prev.is_privileged_for(Capability::SETUID) {
         let allowed = |candidate: Uid| -> bool {
@@ -313,10 +406,12 @@ pub fn step_setresuid(
         new.suid = s;
     }
 
-    *cred_guard = new;
-    drop(cred_guard);
+    let new_cap = match sign_cred(new) {
+        Ok(cap) => cap,
+        Err(_) => return CredChange::PermissionDenied,
+    };
+    let _old_cap = payload.replace_cred(new_cap);
     drop(payload_guard);
-    core::sync::atomic::fence(Ordering::SeqCst);
 
     CredChange::Replaced { prev, new }
 }
@@ -333,8 +428,8 @@ pub fn step_setresgid(
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;
     };
-    let mut cred_guard = payload.cred.lock();
-    let prev = *cred_guard;
+    let prev_cap = payload.cred_cap();
+    let prev = *prev_cap;
 
     if !prev.is_privileged_for(Capability::SETGID) {
         let allowed = |candidate: Gid| -> bool {
@@ -368,10 +463,12 @@ pub fn step_setresgid(
         new.sgid = s;
     }
 
-    *cred_guard = new;
-    drop(cred_guard);
+    let new_cap = match sign_cred(new) {
+        Ok(cap) => cap,
+        Err(_) => return CredChange::PermissionDenied,
+    };
+    let _old_cap = payload.replace_cred(new_cap);
     drop(payload_guard);
-    core::sync::atomic::fence(Ordering::SeqCst);
 
     CredChange::Replaced { prev, new }
 }
@@ -393,8 +490,8 @@ pub fn step_setreuid(
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;
     };
-    let mut cred_guard = payload.cred.lock();
-    let prev = *cred_guard;
+    let prev_cap = payload.cred_cap();
+    let prev = *prev_cap;
 
     if !prev.is_privileged_for(Capability::SETUID) {
         let allowed = |candidate: Uid| -> bool {
@@ -426,10 +523,12 @@ pub fn step_setreuid(
         new.suid = new.euid;
     }
 
-    *cred_guard = new;
-    drop(cred_guard);
+    let new_cap = match sign_cred(new) {
+        Ok(cap) => cap,
+        Err(_) => return CredChange::PermissionDenied,
+    };
+    let _old_cap = payload.replace_cred(new_cap);
     drop(payload_guard);
-    core::sync::atomic::fence(Ordering::SeqCst);
 
     CredChange::Replaced { prev, new }
 }
@@ -445,8 +544,8 @@ pub fn step_setregid(
     let Some(payload) = payload_guard.as_ref() else {
         return CredChange::Zombie;
     };
-    let mut cred_guard = payload.cred.lock();
-    let prev = *cred_guard;
+    let prev_cap = payload.cred_cap();
+    let prev = *prev_cap;
 
     if !prev.is_privileged_for(Capability::SETGID) {
         let allowed = |candidate: Gid| -> bool {
@@ -476,10 +575,12 @@ pub fn step_setregid(
         new.sgid = new.egid;
     }
 
-    *cred_guard = new;
-    drop(cred_guard);
+    let new_cap = match sign_cred(new) {
+        Ok(cap) => cap,
+        Err(_) => return CredChange::PermissionDenied,
+    };
+    let _old_cap = payload.replace_cred(new_cap);
     drop(payload_guard);
-    core::sync::atomic::fence(Ordering::SeqCst);
 
     CredChange::Replaced { prev, new }
 }
@@ -556,8 +657,8 @@ pub fn step_apply_suid_for_exec(
 ) -> Option<ExecCredOutcome> {
     let payload_guard = target.payload.lock();
     let payload = payload_guard.as_ref()?;
-    let mut cred_guard = payload.cred.lock();
-    let prev = *cred_guard;
+    let prev_cap = payload.cred_cap();
+    let prev = *prev_cap;
     let mut new = prev;
 
     let setuid = (file_mode & S_ISUID) != 0;
@@ -580,10 +681,16 @@ pub fn step_apply_suid_for_exec(
 
     let at_secure = (setuid && new.euid != prev.euid) || (setgid && new.egid != prev.egid);
 
-    *cred_guard = new;
-    drop(cred_guard);
+    // PR-9 phase 5 (D5 Path A): sign the new Cred into a fresh
+    // `Cap<Cred>` and publish via slot swap. `step_apply_suid_for_exec`
+    // is infallible at runtime under normal conditions; slab
+    // exhaustion at this site is a kernel-wide pressure event the
+    // caller must surface — return `None` (the zombie variant of the
+    // outcome shape) defensively so the caller's existing
+    // `expect("alive")` chain remains structurally tight.
+    let new_cap = sign_cred(new).ok()?;
+    let _old_cap = payload.replace_cred(new_cap);
     drop(payload_guard);
-    core::sync::atomic::fence(Ordering::SeqCst);
 
     Some(ExecCredOutcome {
         at_secure,
@@ -675,9 +782,12 @@ pub(crate) fn clear_caps_for_test(target: &Cap<ProcessIdentity>) {
     let Some(payload) = payload_guard.as_ref() else {
         return;
     };
-    let mut cred_guard = payload.cred.lock();
-    cred_guard.effective_caps = CapabilitySet::EMPTY;
-    cred_guard.permitted_caps = CapabilitySet::EMPTY;
+    let prev_cap = payload.cred_cap();
+    let mut new = *prev_cap;
+    new.effective_caps = CapabilitySet::EMPTY;
+    new.permitted_caps = CapabilitySet::EMPTY;
+    let new_cap = sign_cred(new).expect("zone slab has capacity in tests");
+    let _old_cap = payload.replace_cred(new_cap);
 }
 
 /// Test-only: install the given `caps` as both `effective_caps` and
@@ -696,9 +806,12 @@ pub(crate) fn install_caps_for_test(target: &Cap<ProcessIdentity>, caps: Capabil
     let Some(payload) = payload_guard.as_ref() else {
         return;
     };
-    let mut cred_guard = payload.cred.lock();
-    cred_guard.effective_caps = caps;
-    cred_guard.permitted_caps = caps;
+    let prev_cap = payload.cred_cap();
+    let mut new = *prev_cap;
+    new.effective_caps = caps;
+    new.permitted_caps = caps;
+    let new_cap = sign_cred(new).expect("zone slab has capacity in tests");
+    let _old_cap = payload.replace_cred(new_cap);
 }
 
 /// Test-only: overwrite the (uid, gid, euid, egid, suid, sgid)
@@ -725,13 +838,388 @@ pub(crate) fn set_cred_ids_for_test(
     let Some(payload) = payload_guard.as_ref() else {
         return;
     };
-    let mut cred_guard = payload.cred.lock();
-    cred_guard.uid = Uid(uid);
-    cred_guard.euid = Uid(euid);
-    cred_guard.suid = Uid(suid);
-    cred_guard.gid = Gid(gid);
-    cred_guard.egid = Gid(egid);
-    cred_guard.sgid = Gid(sgid);
+    let prev_cap = payload.cred_cap();
+    let mut new = *prev_cap;
+    new.uid = Uid(uid);
+    new.euid = Uid(euid);
+    new.suid = Uid(suid);
+    new.gid = Gid(gid);
+    new.egid = Gid(egid);
+    new.sgid = Gid(sgid);
+    let new_cap = sign_cred(new).expect("zone slab has capacity in tests");
+    let _old_cap = payload.replace_cred(new_cap);
+}
+
+// -- PR-2 StepOp wraps -------------------------------------------------
+//
+// Per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1, PR-2 wraps each free
+// `step_*` fn in an `impl StepOp for FooOp` shell. The cred mutators
+// take no `Guard` argument (they swap the per-payload
+// `AtomicSlot<Cap<Cred>>` internally — PR-9 phase 5 / D5 Path A,
+// previously a `SpinMutex<Cred>`), so the wraps need no lifetime
+// parameter — `Cap` is `Clone` and stored by value. The `step()`
+// body delegates to the free fn unchanged and lifts the `CredChange`
+// return into `StepOutcome::Done`.
+//
+// PR-2 pilot wraps (`SetuidOp`, `SetgidOp`, `SetreuidOp`) validated the
+// pattern across the simplest scalar-arg shape and an `Option<_>`-pair
+// shape. PR-2 cleanup extends coverage to the remaining cred mutators:
+// `SetresuidOp`, `SetresgidOp`, `SetregidOp`, and `ApplySuidForExecOp`.
+// `step_apply_suid_for_exec` returns `Option<ExecCredOutcome>` (no
+// `Result`, no `StepOutcome`); the `Option` is lifted unchanged into
+// `StepOutcome::Done(_)`.
+
+/// StepOp wrap for [`step_setuid`]. PR-2 pilot.
+pub struct SetuidOp {
+    pub target: Cap<ProcessIdentity>,
+    pub new_uid: Uid,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for SetuidOp
+{
+    type Output = CredChange;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_setuid(&self.target, self.new_uid))
+    }
+}
+
+/// StepOp wrap for [`step_setgid`]. PR-2 pilot.
+pub struct SetgidOp {
+    pub target: Cap<ProcessIdentity>,
+    pub new_gid: Gid,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for SetgidOp
+{
+    type Output = CredChange;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_setgid(&self.target, self.new_gid))
+    }
+}
+
+/// StepOp wrap for [`step_setreuid`]. PR-2 pilot. Demonstrates the
+/// `Option<_>`-pair arg shape; the wrap stores each option by value
+/// (`Uid: Copy`).
+pub struct SetreuidOp {
+    pub target: Cap<ProcessIdentity>,
+    pub ruid: Option<Uid>,
+    pub euid: Option<Uid>,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for SetreuidOp
+{
+    type Output = CredChange;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_setreuid(
+            &self.target,
+            self.ruid,
+            self.euid,
+        ))
+    }
+}
+
+/// StepOp wrap for [`step_setresuid`].
+pub struct SetresuidOp {
+    pub target: Cap<ProcessIdentity>,
+    pub ruid: Option<Uid>,
+    pub euid: Option<Uid>,
+    pub suid: Option<Uid>,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for SetresuidOp
+{
+    type Output = CredChange;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_setresuid(
+            &self.target,
+            self.ruid,
+            self.euid,
+            self.suid,
+        ))
+    }
+}
+
+/// StepOp wrap for [`step_setresgid`].
+pub struct SetresgidOp {
+    pub target: Cap<ProcessIdentity>,
+    pub rgid: Option<Gid>,
+    pub egid: Option<Gid>,
+    pub sgid: Option<Gid>,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for SetresgidOp
+{
+    type Output = CredChange;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_setresgid(
+            &self.target,
+            self.rgid,
+            self.egid,
+            self.sgid,
+        ))
+    }
+}
+
+/// StepOp wrap for [`step_setregid`].
+pub struct SetregidOp {
+    pub target: Cap<ProcessIdentity>,
+    pub rgid: Option<Gid>,
+    pub egid: Option<Gid>,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for SetregidOp
+{
+    type Output = CredChange;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_setregid(
+            &self.target,
+            self.rgid,
+            self.egid,
+        ))
+    }
+}
+
+/// StepOp wrap for [`step_apply_suid_for_exec`]. The free fn returns
+/// `Option<ExecCredOutcome>` (no `Result`, no `StepOutcome`), so the
+/// `Option` is lifted unchanged into `StepOutcome::Done(_)`.
+pub struct ApplySuidForExecOp {
+    pub target: Cap<ProcessIdentity>,
+    pub file_uid: Uid,
+    pub file_gid: Gid,
+    pub file_mode: u16,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity>
+    tx_substrate::step_v3::StepOp<I> for ApplySuidForExecOp
+{
+    type Output = Option<ExecCredOutcome>;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_apply_suid_for_exec(
+            &self.target,
+            self.file_uid,
+            self.file_gid,
+            self.file_mode,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    //! PR-2 StepOp wrap pilot tests. Each test exercises one wrap
+    //! against a `bootstrap_init_process`-minted cap (root cred by
+    //! default), confirming the wrap delegates to the free fn and
+    //! that the result lifts into `StepOutcome::Done`. Coverage of
+    //! the privilege/permission rules themselves lives in the
+    //! existing `cred::tests` module against the free fns.
+    use super::*;
+    use crate::process::bootstrap_init_process;
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::vm::{AddressSpace, TestPmap};
+    use crate::zones;
+    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome};
+    use tx_substrate::testing::init_host_for_test_once;
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        init_host_for_test_once();
+        let _ = zones::register_all();
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        crate::process::structure::reset_pid_counter_for_test();
+        crate::thread_runtime::structure::reset_tid_counter_for_test();
+        crate::process::execution::reset_init_process_for_test();
+        guard
+    }
+
+    fn fresh_aspace() -> Cap<crate::vm::AddressSpace> {
+        AddressSpace::new_cap_for_platform::<TestPmap>().expect("fresh aspace")
+    }
+
+    #[test]
+    fn setuid_op_delegates_to_step_setuid() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let mut op = SetuidOp {
+            target: proc_cap.clone(),
+            new_uid: Uid(1000),
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(CredChange::Replaced { new, .. }) => {
+                assert_eq!(new.uid, Uid(1000));
+                assert_eq!(new.euid, Uid(1000));
+                assert_eq!(new.suid, Uid(1000));
+            }
+            other => panic!("expected Done(Replaced), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setgid_op_delegates_to_step_setgid() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let mut op = SetgidOp {
+            target: proc_cap.clone(),
+            new_gid: Gid(2000),
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(CredChange::Replaced { new, .. }) => {
+                assert_eq!(new.gid, Gid(2000));
+                assert_eq!(new.egid, Gid(2000));
+                assert_eq!(new.sgid, Gid(2000));
+            }
+            other => panic!("expected Done(Replaced), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setreuid_op_delegates_to_step_setreuid() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let mut op = SetreuidOp {
+            target: proc_cap.clone(),
+            ruid: Some(Uid(1000)),
+            euid: Some(Uid(1001)),
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(CredChange::Replaced { new, .. }) => {
+                assert_eq!(new.uid, Uid(1000));
+                assert_eq!(new.euid, Uid(1001));
+                // Privileged caller: per step_setreuid's Linux quirk
+                // (ruid was set), suid is bumped to post-call euid.
+                assert_eq!(new.suid, Uid(1001));
+            }
+            other => panic!("expected Done(Replaced), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setresuid_op_delegates_to_step_setresuid() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let mut op = SetresuidOp {
+            target: proc_cap.clone(),
+            ruid: Some(Uid(1000)),
+            euid: Some(Uid(1001)),
+            suid: Some(Uid(1002)),
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(CredChange::Replaced { new, .. }) => {
+                assert_eq!(new.uid, Uid(1000));
+                assert_eq!(new.euid, Uid(1001));
+                assert_eq!(new.suid, Uid(1002));
+            }
+            other => panic!("expected Done(Replaced), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setresgid_op_delegates_to_step_setresgid() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let mut op = SetresgidOp {
+            target: proc_cap.clone(),
+            rgid: Some(Gid(2000)),
+            egid: Some(Gid(2001)),
+            sgid: Some(Gid(2002)),
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(CredChange::Replaced { new, .. }) => {
+                assert_eq!(new.gid, Gid(2000));
+                assert_eq!(new.egid, Gid(2001));
+                assert_eq!(new.sgid, Gid(2002));
+            }
+            other => panic!("expected Done(Replaced), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setregid_op_delegates_to_step_setregid() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let mut op = SetregidOp {
+            target: proc_cap.clone(),
+            rgid: Some(Gid(2000)),
+            egid: Some(Gid(2001)),
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(CredChange::Replaced { new, .. }) => {
+                assert_eq!(new.gid, Gid(2000));
+                assert_eq!(new.egid, Gid(2001));
+                // Privileged caller: per step_setregid's Linux quirk
+                // (rgid was set), sgid is bumped to post-call egid.
+                assert_eq!(new.sgid, Gid(2001));
+            }
+            other => panic!("expected Done(Replaced), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_suid_for_exec_op_lifts_option_into_done() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        // file_mode without S_ISUID/S_ISGID: at_secure must be false,
+        // and the wrap must lift the `Some(_)` into `StepOutcome::Done`.
+        let mut op = ApplySuidForExecOp {
+            target: proc_cap.clone(),
+            file_uid: Uid(1000),
+            file_gid: Gid(2000),
+            file_mode: 0o755,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(Some(o)) => {
+                assert!(!o.at_secure);
+            }
+            other => panic!("expected Done(Some(_)), got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
