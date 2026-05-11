@@ -1,8 +1,2425 @@
 # txKernel Status
 
-**Updated:** 2026-05-09
+**Updated:** 2026-05-12
 
 ## Current Shape
+
+- 2026-05-12 D13 test-driven retirement framework LANDED (worker W-QQ).
+  Closes the durable-protection gap left by D10 (vocabulary retired,
+  no CI gate against regression). **Artifacts:** `clippy.toml` at
+  workspace root listing 9 retired identifiers (`OnCarrier`,
+  `WakeCarrier`, `WakeCarrierId`, `InterestConditions`, `exit_port`,
+  `read_wq`, `write_wq`, `wait_carrier`, `yield_on_carrier`) under
+  `disallowed-names`; new `xtask ci` step `retired vocabulary gate`
+  (`txdoc:CI-GATE-RETIRED-VOCAB`) running `cargo clippy --workspace
+  --lib --bins -- -A clippy::all -D clippy::disallowed_names
+  -D clippy::disallowed_types -D clippy::disallowed_methods`. Scope is
+  narrowed per brief Option B so D12's 27 PR-2 `dead_code` warnings
+  don't gate this check; existing `txdoc:CI-GATE-CLIPPY` step
+  untouched (no destructive edit). `.github/workflows/check.yml` needs
+  no edit because it already invokes `cargo xtask ci`. **Verified:**
+  baseline clean; `let exit_port` / `let read_wq` / `let OnCarrier`
+  regressions fire; D10 §5.1 `OnWaitSource { source: carrier }`
+  destructure stays green; `cargo build -p xtask` clean. Known blind
+  spot: `disallowed-names` fires on bindings, not `struct X;` / `fn x()`
+  definitions — review remains the primary backstop. Follow-up: when
+  D12 Phase B decorates PR-2 scaffolding with `#[allow(dead_code)]`,
+  fold the dedicated step into the broad `-D warnings` gate.
+  ADR: `docs/progress/decisions/2026-05-12-d13-tdd-retirement-via-clippy.md`.
+
+- 2026-05-12 D14 stale-commit cleanup plan LANDED (worker W-RR,
+  planning-only). Proposes landing the 39-worker uncommitted working
+  tree (150 files, +12 120 / -1 186 LoC) as **17 ordered commits**
+  grouped by PR/ADR (PR-A rename trail → wake-substrate foundation →
+  PR-2 adapters → PR-7/7B/7C → PR-9 → PR-3D-1..5 → PR-10 → PR-11 →
+  PR-12 → D9 → shim surface → design docs → progress tail). Workers
+  credited in commit bodies; titles stay under 70 chars. The 21 prior
+  `v3 unification phase N` commits **stay as-is** (merged-equivalent
+  baseline; rebase is destructive and adds no value). Branch is at
+  `a53d200`, equal to `main` — no rebase needed before landing.
+  Estimated human execution time **45–75 min** for the recipe path,
+  90–120 min first-time. Top risk: STATUS.md is touched by every
+  worker → land in the tail commit (#17), not split across the per-PR
+  commits. Pre-commit hooks: **none installed** (stock samples only).
+  ADR: `docs/progress/decisions/2026-05-12-d14-stale-commit-cleanup-plan.md`.
+  Recipe: `docs/progress/2026-05-12-commit-groupings-draft.md`.
+  **Verification.** No `git` mutation performed; only read-only
+  `git status / log / diff / merge-base` consulted. Next step:
+  schedule a 1-hour human-driven landing session.
+
+- 2026-05-12 D11 D2-coexistence retire plan LANDED (worker W-OO,
+  research-only). Audit confirms PR-3D-1..5 left **7 D2-paired
+  producer sites** (pipe, futex, exit_source, tty, vfs, signalfd, ufd)
+  firing both `Channel` + `WaitSource`, **4 dead-carrier registrations**
+  (aio ×2, io_uring ×2 — Channel registered but never fired), and
+  **1 unmigrated holdout** (`vm::structure::range_lock` — Channel-only,
+  no paired WaitSource yet). **10 production parked-on-Channel
+  consumers** in tx-shims (io.rs ×3, vm.rs ×2, proc.rs ×1,
+  signalfd.rs ×1, aio.rs ×1, userfaultfd.rs ×1) + 1 in
+  tx-subsystems::vm/execution.rs — these are the migration targets.
+  No substrate blockers: every site has a clean
+  `WaitSource::prepare(..).install_if(..)` equivalent.
+  **Phase plan: 5 days, parallelizable to 4 workers.** Phase D11.1
+  futex (0.5d) → D11.2 aio/io_uring dead-carrier cleanup (0.5d) →
+  D11.3 exit_source+signalfd+ufd (1d) → D11.4 pipe+tty+vfs (1.5d,
+  two workers) → D11.5 range_lock + Channel retire gate (1d).
+  **Bus boundary clarified per §4**: tty's 4 RawPort/RawQueue fields
+  (`input_readable`, `output_writable`, `hangup_port`,
+  `session_ctl_port`) are bus-protocol and STAY per D2/D4 §7; only
+  the syscall-side `wait_channel` pair is a D11 target. Bus's own
+  33 `Waker` field sites stay in scope of PR-3D-4 under D4 — D11
+  retires *consumer* Channels, D4 retires *bus-internal* `Waker`s.
+  ADR: `docs/progress/decisions/2026-05-12-d11-d2-coexistence-retire-plan.md`.
+  **Verification.** No production code change. Next step: schedule
+  D11.1 (futex) as a single-worker sub-day task.
+
+- 2026-05-12 D12 dead-code + TODO audit COMPLETE (worker W-PP,
+  research-only). `cargo check --workspace --tests` returns **27
+  `dead_code` warnings** (all PR-2 `StepOp` adapter wraps in
+  `tx-subsystems/{page_backed,tty/execution}/` — scaffolding awaiting
+  caller migration per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1, NOT
+  abandoned code) and **1 `unused_imports`** (`WaitSourceId` in
+  `crates/tx-subsystems/src/process/structure.rs:34`, single
+  `cargo fix` candidate). TODO/FIXME inventory: **64 in `crates/`**
+  (48 `TODO(phase-*)` — all legitimate-open with ADR cross-refs;
+  5 `TODO(Phase G)`; 3 single-site forward pointers; 2 worker-tagged
+  `TODO PR-11 phase 2b:` in `aio.rs` to be renamed to
+  `TODO(phase-aio-spawn)`; 1 `FIXME` flaky test in
+  `vfs/walker/tests.rs:599`; 0 `XXX`, 0 `HACK`) + **24 in
+  `decisions/`** (prose forward-pointers, no action). `// W-[A-Z]+`
+  breadcrumbs: **0** (workers cleaned up). `unsafe impl
+  ZoneAllocated` sites: 29 (catalogued). Cleanup plan: **~2 days
+  single-worker**, parallelizable to ~0.5 d across 4 workers, fully
+  optional. **Recommendation: wait.** These warnings are cosmetic;
+  decorating the PR-2 wraps now risks confusing the next
+  caller-migration worker. ADR:
+  `docs/progress/decisions/2026-05-12-d12-dead-code-todo-audit.md`.
+- 2026-05-12 D10 v4 vocabulary-retirement audit COMPLETE (worker W-NN,
+  research-only). Verified `docs/Txv3/07_BLAST_RADIUS.md` §7 exit bar
+  via 13-identifier grep sweep across `OnCarrier`, `WakeCarrier`,
+  `InterestConditions`, `exit_port`, `read_wq`/`write_wq`,
+  `wait_carrier`, `WakeCarrierId`, `yield_on_carrier`, retired
+  `StepOutcome` variants (`Advanced`/`Blocked`/`AdvancedThenBlocked`),
+  and unprefixed `CancelPolicy`. **189 total raw hits**; **zero
+  production-code identifier survivals.** All residuals are (a)
+  historical record in `docs/progress/` (~162 hits — by charter,
+  leave), (b) intentional "renamed from X" annotations at the
+  canonical substrate definition sites in `step_v3/mod.rs` and
+  `step_v3/agent.rs` (5 hits — keep), (c) stale `StepOutcome::Blocked`
+  prose in 4 production doc-comments and 5 pre-PR-2 active design
+  docs (BDEV_FS, TX_EXT4_PLAN, SIGNAL, cred_service, HAL_v1 —
+  cosmetic Phase 2/3 cleanup, ~half-day sweep), and (d)
+  `STEP_MODEL_v1.md` (already marked SUPERSEDED). One false positive
+  flagged: bare-`carrier` local-variable bindings (~40 sites) at
+  `OnWaitSource { source: carrier, .. }` destructuring patterns are
+  style-only, not v4-vocabulary survivals. **Verdict:** §7 success
+  bar is met; migration is done. ADR:
+  `docs/progress/decisions/2026-05-12-d10-vocabulary-retire-audit.md`.
+  No production code changed; no tests added; `cargo` baseline
+  unaffected.
+- 2026-05-12 io_uring SQPOLL scaffold LANDED — second `OnBehalfOf<P>`
+  canary (worker W-LL, future PR-12 phase 0). Closes the §13 future-
+  canary section of `2026-05-11-d8-pr-11-aio-plan.md` by proving the
+  framework W-W shipped for AIO supports io_uring SQPOLL with zero
+  additional framework primitives. **Subsystem.** New
+  `crates/tx-subsystems/src/io_uring.rs`: `IoUring { ring_id,
+  sq_entries, cq_entries, sq_ring: SpinMutex<VecDeque<SqeStub>>,
+  cq_ring: SpinMutex<VecDeque<CqeStub>>, sqe_arrived/cqe_available:
+  Arc<WaitSource>, worker_abort: Arc<AbortSignal>, dispatched:
+  AtomicU64 }`, zone-allocated; `spawn_sqpoll_worker(ring, owner,
+  subject)` constructs the SQPOLL kthread future via
+  `tx_substrate::step_v3::with_on_behalf_of` (imported AS-IS; no new
+  framework primitive added). The kthread body loops `pop_sqe →
+  dispatched.fetch_add(1) → NoopPending.await` under the long-lived
+  borrow; abort signal trips on `Drop`. **OpenFileBacking.** New
+  `OpenFileBacking::IoUring { ring: Cap<IoUring> }` variant — fifth in
+  the family (Rnode/Ufd/AioContext/SignalFd/IoUring) — plus
+  `OpenFile::new_io_uring{,_cap}` constructors and `io_uring()`
+  accessor; the existing `rnode()` accessor panics on the new variant
+  with the same shape as the Ufd/AIO/SignalFd panic messages.
+  **Syscall.** New `crates/tx-shims/src/linux_syscall/io_uring.rs`:
+  `sys_io_uring_setup(entries, params_ptr=ignored)` mints
+  `Cap<IoUring>` with `cq_entries = 2*entries`, spawns the SQPOLL
+  kthread via `with_on_behalf_of`, stashes the future in a deferred-
+  pump registry keyed by `ring_id` (mirrors W-CC's PR-11 phase 2
+  pattern row-for-row), wraps in an `OpenFile` with
+  `OpenFileBacking::IoUring`, installs at the lowest free fd, returns
+  the fd. `NR_IO_URING_SETUP = 425`, `NR_IO_URING_ENTER = 426`
+  defined; the enter arm returns -ENOSYS for now (SQPOLL doesn't need
+  it). **Framework reusability verdict.** `spawn_sqpoll_worker` is a
+  row-for-row clone of `spawn_worker_for_context` with `AioContext` →
+  `IoUring`, `pop_iocb` → `pop_sqe`, and the dispatcher argument
+  removed (phase 0 has no per-SQE dispatcher; phase 1 will add one
+  with the `IocbDispatcher` shape). No change to
+  `with_on_behalf_of`, `AbortSignal`, `ScriptCtx`, `SubjectContext`,
+  or `SubjectIdentity` — W-W's "zero additional framework work"
+  prediction holds. **Test.** New
+  `crates/tx-shims/tests/v3_io_uring_sqpoll_scaffold.rs` — 7 tests
+  pinning: fd-shape (uring-backed `OpenFile`), discriminator
+  exclusivity (uring fd reports None for aio/signalfd/ufd), kthread
+  spawn (install count + ring_id freshness), bounded-tick SQE drain
+  (single + multi), and abort cleanup (PrincipalExited +
+  CooperativeCancel-OwnerRequested). **Verification.** `cargo check
+  --workspace --tests` clean. `cargo test -p tx-substrate` — 245
+  passing (no regression). `cargo test -p tx-subsystems --lib --
+  --test-threads=1` — 622/0/11 (8 new io_uring unit tests on top of
+  the 614 baseline). `cargo test -p tx-shims` — every shim test
+  passes including the 7 new v3_io_uring_sqpoll_scaffold tests.
+  `cargo test --workspace -- --test-threads=1` — 1663/0/11 pass
+  (above the 1639 baseline). **Files touched:**
+  `crates/tx-subsystems/src/io_uring.rs` (new),
+  `crates/tx-subsystems/src/lib.rs`,
+  `crates/tx-subsystems/src/zones.rs`,
+  `crates/tx-subsystems/src/vfs/structure.rs`,
+  `crates/tx-subsystems/tests/v3_userfaultfd_fd_scaffold.rs`
+  (exhaustive-match update for new variant),
+  `crates/tx-shims/src/linux_syscall/io_uring.rs` (new),
+  `crates/tx-shims/src/linux_syscall/mod.rs`,
+  `crates/tx-shims/src/linux_syscall/numbers.rs`,
+  `crates/tx-shims/tests/v3_io_uring_sqpoll_scaffold.rs` (new).
+  **Next steps.** Future PR-12 phase 1 adds: real `struct
+  io_uring_sqe` (64-byte) / `struct io_uring_cqe` (16-byte) wire-
+  layout parsers; per-SQE dispatcher closure (mirrors W-FF's
+  `IocbDispatcher`); user-mmapped SQ/CQ rings + `io_uring_params`
+  out-parameter; `sys_io_uring_destroy` arm (mirrors
+  `sys_io_destroy`); kthread spawn via the boot-reactor seam (phase
+  2b follow-up shared with the AIO worker).
+
+- 2026-05-12 PR-11 follow-up: PageBacked dispatch closes the ENOSYS
+  gap in OpenFile::step_read / step_write (worker W-KK). Closes the
+  follow-up flagged by W-JJ in the PR-11 phase-6 AIO e2e canary
+  (`vfs/execution.rs:285` previously returned `Err(ENOSYS)` for
+  `RNodeBacking::PageBacked`). **Implementation.** Added two
+  kernel-buffer helpers in `crates/tx-subsystems/src/page_backed/
+  user_buffer.rs` — `step_read_to_kernel(pc, of, dst, guard)` and
+  `step_write_from_kernel(pc, of, src, guard)`. These mirror the
+  existing `step_read_to_user` / `step_write_from_user` family but
+  copy bytes via `frame_kernel_addr` directly into / out of a kernel
+  `&mut [u8]` / `&[u8]` slice (no `AddressSpace` traversal), making
+  them the right shape for `OpenFile::step_read` /
+  `OpenFile::step_write` which take a kernel buffer. The helpers
+  reuse the same per-chunk page-materialisation loop, EOF
+  short-read, and `of.offset()` / `PC.size` advance semantics as the
+  user-buffer variants. **Routing.** `OpenFile::step_read` now
+  matches `RNodeBacking::PageBacked { pc }` and delegates to
+  `page_backed::step_read_to_kernel(pc, self, out, guard)`;
+  `OpenFile::step_write` mirrors with `step_write_from_kernel`. The
+  Symlink / Projected arms remain `ENOSYS`. **Canary tightened.**
+  `crates/tx-shims/tests/v3_aio_e2e.rs`
+  (`aio_pread_e2e_round_trip_against_tmpfs_file`) now seeds the
+  page-backed file with a known pattern `(0..32).collect()` via a
+  temporary writer-side `OpenFile` driving `step_write_from_kernel`,
+  and asserts `res == user_len` (32) AND `user_buf_view ==
+  file_content` after the PREAD completes — replacing the
+  prior "admits `res == -38`" allowance with a strict
+  byte-equality pin. The known-gap doc-comment in the test file
+  was rewritten to record the seam closure. **New integration
+  test.** `crates/tx-subsystems/tests/v3_openfile_page_backed_read.rs`
+  pins five invariants of the new path independent of AIO: fresh
+  1-page file reads as zeroes, write-then-read round-trips bytes,
+  read at EOF short-reads, and `read`/`write` flag-off both return
+  `EINVAL` before any backing dispatch. **Verification.** `cargo
+  check --workspace --tests` clean. `cargo test -p tx-subsystems --
+  --test-threads=1` passes 622 lib + 1 new
+  `v3_openfile_page_backed_read` test + all integration tests.
+  `cargo test -p tx-shims -- --test-threads=1` baseline holds, the
+  tightened `v3_aio_e2e` passes 2/0. `cargo test --workspace --
+  --test-threads=1` passes 1663/0 (above the 1639 baseline). **Files
+  touched.** `crates/tx-subsystems/src/page_backed.rs` (re-export
+  the new helpers), `crates/tx-subsystems/src/page_backed/
+  user_buffer.rs` (added `step_read_to_kernel` /
+  `step_write_from_kernel` + helpers, ~150 LoC), `crates/tx-
+  subsystems/src/vfs/execution.rs` (PageBacked arm of step_read +
+  step_write), `crates/tx-shims/tests/v3_aio_e2e.rs` (seed +
+  tighten assertion), `crates/tx-subsystems/tests/
+  v3_openfile_page_backed_read.rs` (new), `docs/progress/STATUS.md`
+  (this entry). **Next.** With the AIO PREAD round-trip green
+  byte-for-byte, the next load-bearing follow-up per W-JJ's catchup
+  is PR-12 / io_uring SQPOLL on top of `OnBehalfOf<P>`.
+- 2026-05-12 D9-D signalfd subsystem + sys_signalfd4 syscall LANDED
+  (worker W-II). Closes the D9 §6 "signalfd follow-up" follow-up by
+  wiring the Option C add-on path described in
+  `docs/progress/decisions/2026-05-11-d9-signal-wake-migration.md` §6:
+  a `signalfd(2)` open file is a non-VFS fd kind (joining ufd + AIO
+  in `OpenFileBacking`), backed by a zone-allocated `SignalFd`
+  payload registered against a per-process subscription list keyed
+  on `Cap<ProcessIdentity>::key().raw()`. `step_kill_process` fans
+  out to every matching subscription *after* the existing
+  thread-eligibility post — the wake paths are additive (the
+  thread-mailbox post still drives `InterruptSummary`; the signalfd
+  post routes signal-as-event to any agent draining via `read(2)`).
+  **Subsystem.** New `crates/tx-subsystems/src/signalfd.rs`:
+  `SignalFd { sfd_id, owner_proc_key, mask: AtomicU64, pending:
+  SpinMutex<VecDeque<u8>>, wait_source: Arc<WaitSource>,
+  wait_channel: Channel, wait_source_id: u64 }`, zone-allocated; a
+  global `SUBSCRIPTIONS: SpinMutex<BTreeMap<u32, Vec<Weak<SignalFd>>>>`
+  registry indexed by process slot key; `notify_process_signal(proc_key,
+  signum)` walks the registry, upgrades each weak, and calls `cap.notify(signum)`
+  which filters against the mask and pushes onto the per-fd queue +
+  fires the wait source (Channel + WaitSource D2/D4 coexistence).
+  `Drop for SignalFd` unregisters from the per-process list and
+  releases the legacy wait-source carrier. **Syscall.** New
+  `crates/tx-shims/src/linux_syscall/signalfd.rs`: `sys_signalfd4(fd,
+  &mask, sizemask, flags)` — `fd == -1` mints a fresh cap + installs
+  at the lowest free fd; `fd >= 0` updates the mask on an existing
+  signalfd; recognised flags are `SFD_CLOEXEC | SFD_NONBLOCK`;
+  `sizemask` must equal 8. The dispatch arm is wired at
+  `__NR_signalfd4 = 74`. The signalfd-shaped `read(2)` arm
+  (`step_signalfd_read`) drains one 128-byte `struct
+  signalfd_siginfo` record off the per-fd pending queue per call,
+  returns `EAGAIN` on empty + nonblock, parks on the per-fd wait
+  source on empty + blocking; dispatched from `sys_read` before the
+  generic VFS path (after the ufd discriminator). **Wire layout.**
+  `struct signalfd_siginfo` is 128 bytes; phase D9-D zero-fills
+  everything except `ssi_signo` (offset 0, u32 LE) — siginfo
+  plumbing (`ssi_pid`, `ssi_uid`, `ssi_code`) lands once the real
+  siginfo payload exists (see D9 §11). **Buf size discipline.**
+  Linux's signalfd EINVALs on `read(buf < sizeof(siginfo))`; we
+  match that. **D9-A still load-bearing.** signalfd extends D9-A —
+  `post_signal` still posts a thread-mailbox event for the
+  thread-eligibility path; the new signalfd fan-out is additive,
+  not replacing. **Verification.** `cargo check --workspace --tests`
+  clean. `cargo test -p tx-subsystems --lib -- --test-threads=1` —
+  614/0/11 pass (5 above the 609 baseline; five new signalfd unit
+  tests pin distinct ids / mask filtering / EAGAIN / serialized
+  siginfo / short-buf EINVAL). `cargo test -p tx-subsystems --test
+  v3_signalfd` — 1/0/0 pass (the integration test pins
+  signalfd-create, kill-routes-to-signalfd, kill-filters-by-mask,
+  EAGAIN-on-empty-and-nonblock, yield-on-empty-and-blocking, and
+  drop-unregisters across one bundled test). `cargo test --workspace
+  -- --test-threads=1` — 1639/0/11 pass (above the 1631 baseline).
+  **Files touched (write scope):** `crates/tx-subsystems/src/lib.rs`,
+  `crates/tx-subsystems/src/zones.rs`,
+  `crates/tx-subsystems/src/signalfd.rs` (new, ~360 LoC),
+  `crates/tx-subsystems/src/signal.rs` (step_kill_process extended
+  with notify_process_signal call after the post),
+  `crates/tx-subsystems/src/vfs/structure.rs` (OpenFileBacking::SignalFd
+  variant + new_signalfd / new_signalfd_cap / signalfd() accessor +
+  rnode/ufd/aio_context match arms),
+  `crates/tx-shims/src/linux_syscall/numbers.rs`
+  (NR_SIGNALFD4=74, NR_SIGNALFD=282, SFD_CLOEXEC, SFD_NONBLOCK),
+  `crates/tx-shims/src/linux_syscall/signalfd.rs` (new ~180 LoC),
+  `crates/tx-shims/src/linux_syscall/mod.rs` (mod + dispatch arm),
+  `crates/tx-shims/src/linux_syscall/io.rs` (sys_read discriminator),
+  `crates/tx-subsystems/tests/v3_signalfd.rs` (new integration test),
+  `crates/tx-subsystems/tests/v3_userfaultfd_fd_scaffold.rs` (added
+  the SignalFd arm to the existing exhaustive match).
+- 2026-05-12 v3 PR-11 phases 6+7 AIO end-to-end canary + doc updates
+  LANDED (worker W-JJ). Closes D8 §7 row P-11.7 and the §11 success
+  criteria for PR-11 — the framework + four syscalls + dispatch +
+  completion ring + abort routing are now validated together as a
+  unit. **Phase 6 — e2e canary.** New
+  `crates/tx-shims/tests/v3_aio_e2e.rs` exercises the full AIO loop
+  end-to-end against a real `RNodeBacking::PageBacked` (tmpfs-shape)
+  file installed in P's fd table: `io_setup` → `io_submit(PREAD)` →
+  pump the worker stashed by `take_worker_future_for_test` until the
+  completion lands → `io_getevents(min_nr=1, nr=2)` drains exactly one
+  event written through P's address space → assert the event's wire
+  shape (cookie echoed in `data` + `obj`, `res2 == 0`) and that the
+  completion queue is drained → `io_destroy` returns 0 →
+  post-destroy ops return `-EBADF`. The load-bearing pin is `data ==
+  cookie`: it proves the spawned worker entered the `with_on_behalf_of`
+  borrow, popped the iocb, invoked the W-FF dispatcher closure that
+  captured P's `Cap<ProcessIdentity>` + `Cap<AddressSpace>`, and pushed
+  the completion under the borrow — exercising every layer of the
+  OnBehalfOf<P> path. A second test pins mid-flight `io_destroy`
+  cancels the worker cleanly. **Known gap surfaced:** the dispatcher's
+  `res` magnitude is the documented `-ENOSYS` (-38) because
+  `OpenFile::step_read` returns `Err(ENOSYS)` for
+  `RNodeBacking::PageBacked` (see `vfs/execution.rs:285`) — the
+  page-backed-read path lives at `crate::page_backed::step_read` /
+  `step_read_to_user` and is not yet routed through
+  `OpenFile::step_read`. The canary admits either `res >= 0` (bytes
+  read, once the seam lands) or `res == -38` (today's value); the
+  structural path is fully exercised either way. **Follow-up:**
+  page-backed-read seam (`OpenFile::step_read` PageBacked arm → either
+  `page_backed::step_read` direct, or the AIO dispatcher calls
+  `step_read_to_user` directly for PageBacked backings). Flagged via
+  spawn_task. **Phase 7 — doc updates.** Updated
+  `docs/Txv3/06_EXECUTION_SCOPE_v1.md` §8.2 (AIO worker) and §12
+  (migration order) to point at the landed implementation +
+  cross-reference D8 / aio.rs / linux_syscall/aio.rs / v3_aio_e2e.rs;
+  updated `docs/Txv3/07_BLAST_RADIUS.md` §5.2 PR-11 row with the
+  **LANDED** marker + file cross-refs. §7 success criteria
+  ("AIO worker works end-to-end (PR-11 success)") is satisfied
+  structurally; the byte-equality gap noted above is a follow-up, not
+  a PR-11 blocker (the AIO worker enters the borrow, drives iocbs,
+  produces completions through the full surface). **Verification:**
+  `cargo check --workspace --tests` clean. `cargo test -p tx-shims
+  --test v3_aio_e2e` — 2/0/0 pass. `cargo test --workspace --
+  --test-threads=1` — 1639/0/11 pass (8 above the 1631 baseline from
+  W-FF's catchup; matches 1631 + 2 new e2e tests + 6 incidental
+  additions since W-FF's run). **Files touched:**
+  `crates/tx-shims/tests/v3_aio_e2e.rs` (new — 2 tests),
+  `docs/Txv3/06_EXECUTION_SCOPE_v1.md` (§8.2 + §12),
+  `docs/Txv3/07_BLAST_RADIUS.md` (§5.2 PR-11 row),
+  `docs/progress/STATUS.md` (this entry). **Next:** with PR-10 +
+  PR-11 canaries both green, the next quarter's load-bearing work is
+  (a) closing the page-backed-read dispatch gap so AIO PREAD against
+  tmpfs returns real bytes and (b) starting PR-12 / io_uring SQPOLL on
+  top of the now-validated `OnBehalfOf<P>` framework (D8 §13 future
+  canary).
+- 2026-05-12 v3 PR-11 phases 3+4+5 AIO real dispatch + io_getevents +
+  io_destroy LANDED (worker W-FF). Per D8 §7 (phase rows
+  P-11.5 + P-11.6) — closes the bulk of PR-11. **Phase 3 — real iocb
+  dispatch.** Replaced the phase-2 stub (`dispatched.fetch_add(...);
+  continue;`) with a real per-iocb dispatch path. New `IocbDispatcher
+  = Arc<dyn Fn(&Iocb) -> IoEvent + Send + Sync + 'static>` type alias
+  in `crates/tx-subsystems/src/aio.rs`; `spawn_worker_for_context` now
+  takes a dispatcher arg and invokes it inside the `with_on_behalf_of`
+  body for every iocb popped off the submit queue. The dispatcher
+  closure (`build_iocb_dispatcher` in
+  `crates/tx-shims/src/linux_syscall/aio.rs`) captures the principal's
+  `Cap<ProcessIdentity>` + `Cap<AddressSpace>` clones and routes
+  `IOCB_CMD_PREAD` / `IOCB_CMD_PWRITE` through the existing
+  `OpenFileLseekOp` + `OpenFileReadOp` / `OpenFileWriteOp` step ops
+  (synchronous; `Yield` outcomes degrade to short reads / -EIO for the
+  canary). Other opcodes (FSYNC/FDSYNC/NOOP/PREADV/PWRITEV) return
+  `-EINVAL` via the catch-all match arm. The real dispatch runs under
+  the borrow's `SubjectContext` — `process.fd(...)` resolves against
+  P's fd table; `aspace` is P's address space. **Phase 4 — completion
+  queue + io_getevents.** New `IoEvent { data, obj, res, res2 }`
+  struct mirroring Linux's `struct io_event` (32-byte LE wire layout
+  via `IoEvent::to_le_bytes`). `AioContext` gained `completion_queue:
+  SpinMutex<VecDeque<IoEvent>>` + `events_available: Arc<WaitSource>`
+  + `events_available_id`; `push_completion` notifies the carrier,
+  `pop_completion`/`drain_completions(max)`/`completion_len` are the
+  read accessors. The worker body's per-iocb loop now does
+  `push_completion(dispatcher(&iocb))` instead of the stub increment.
+  New `sys_io_getevents(ctx_fd, min_nr, nr, events_ptr, timeout_ptr)`
+  in `linux_syscall/aio.rs`: resolves the AIO fd, drains up to `nr`
+  events; if `drained.len() < min_nr` and `timeout_ptr == NULL` it
+  parks on the `events_available` carrier via
+  `wait_source::wait_on_token` and re-drains (bounded by a 1024-poll
+  budget for the canary). Each event is serialised via
+  `to_le_bytes()` and copied through `bootstrap_copy_to_user`. Wired
+  into the dispatcher arm for `NR_IO_GETEVENTS`. **Phase 5 —
+  io_destroy.** New `sys_io_destroy(ctx_fd)` in `linux_syscall/aio.rs`
+  + `AioContext::cancel_worker` helper (trips the worker abort with
+  `CooperativeCancel(OwnerRequested)` — distinct from
+  `abort_worker`'s `PrincipalExited`). The syscall arm trips the
+  cancel, removes the worker future from the per-context registry,
+  and removes the fd-table entry (mirrors `sys_close(2)`'s shape).
+  Wired into the dispatcher arm for `NR_IO_DESTROY`.
+  **Tests** — two new files: `crates/tx-shims/tests/v3_aio_io_getevents.rs`
+  (5 tests) pins (a) submit→dispatch→completion round-trip writes the
+  `struct io_event` into user memory with `data == cookie`, `obj ==
+  cookie` (placeholder), `res == -EBADF` (-9; bootstrap init has no
+  fd 99), (b) `min_nr=0` empty queue returns 0 immediately, (c)
+  `min_nr=2` drains two completions in order via worker pump, (d)
+  non-AIO fd returns -EINVAL/-EBADF, (e) `nr=0` returns 0;
+  `crates/tx-shims/tests/v3_aio_io_destroy.rs` (5 tests) pins (a)
+  `io_destroy` trips the worker's cooperative-cancel and a
+  subsequent worker poll resolves to
+  `Err(CooperativeCancel(OwnerRequested))`, (b) post-destroy
+  submit/getevents/destroy all return -EBADF, (c) unknown fd returns
+  -EBADF, (d) registry no longer carries the worker future, (e)
+  mid-flight destroy (after submit + first pump) cancels the worker
+  cleanly. Also added 4 new unit tests in `aio.rs`:
+  `push_completion`/`pop_completion` FIFO, `drain_completions` caps,
+  `IoEvent::to_le_bytes` layout, and `cancel_worker` reason
+  encoding. **Verification:** `cargo test -p tx-substrate` passes
+  237/0/0 (baseline holds). `cargo test -p tx-subsystems --lib --
+  --test-threads=1` passes 609/0/11 (605 baseline + 4 new aio unit
+  tests). `cargo test -p tx-shims` passes 285/0 (275 baseline + 5
+  io_getevents + 5 io_destroy). `cargo test --workspace --
+  --test-threads=1` passes 1631/0 (above the 1615+ baseline). `cargo
+  check --workspace --tests` clean. **Files touched:**
+  `crates/tx-subsystems/src/aio.rs` (added IoEvent, completion_queue
+  + events_available + push_completion + drain_completions +
+  cancel_worker + IocbDispatcher + 4 unit tests, total ~900 LoC now),
+  `crates/tx-shims/src/linux_syscall/aio.rs` (added
+  build_iocb_dispatcher + dispatch_pread + dispatch_pwrite + run_read
+  + run_write + run_lseek_set + sys_io_getevents + sys_io_destroy,
+  total ~760 LoC now), `crates/tx-shims/src/linux_syscall/mod.rs`
+  (dispatch arms for NR_IO_GETEVENTS + NR_IO_DESTROY),
+  `crates/tx-shims/tests/v3_aio_io_getevents.rs` (new, 5 tests),
+  `crates/tx-shims/tests/v3_aio_io_destroy.rs` (new, 5 tests). **Phase
+  6-7 left:** end-to-end integration test that writes a real PREAD
+  against a tmpfs page-backed file under the borrow (W-BB-style "PR-10
+  coverage" follow-up: it's pure test coverage — the framework +
+  syscall surface + dispatch path are all landed) and the doc updates
+  in `06_EXECUTION_SCOPE_v1.md` §12 migration table +
+  `07_BLAST_RADIUS.md` §5.2 PR-11 row landed-mark.
+- 2026-05-12 v3 PR-10 phase 6 OnAgent canary + production
+  `ProcessUfdDispatch` LANDED (worker W-EE). Closes D7 §6 row P-10.6
+  and the §11 success criteria for PR-10. **Part A —
+  `ProcessUfdDispatch`.** New struct in
+  `crates/tx-subsystems/src/userfaultfd.rs` that implements the
+  `crate::vm::UfdDispatch` trait by walking the calling process's
+  fd-table looking for an `OpenFile` whose `OpenFileBacking::Ufd(cap)`
+  has matching `cap.ufd_id()`. Linear scan over
+  `process.payload.snapshot_fds()` (fine for the canary; real
+  production might want a hash map but that's a follow-up). Returns
+  `UfdDispatchTarget { registry: &ufd.delegate_registry(), mailbox,
+  fault_pusher: Some(&ufd) }` so the fault message lands in the right
+  queue. Cap clone cached in `UnsafeCell<Option<Cap<UserfaultFd>>>`
+  with documented set-once safety contract; `unsafe impl Sync` so the
+  fault future carrying `&ProcessUfdDispatch` stays `Send`. Replaces
+  `NullUfdDispatch` in production usage; test code (existing fault-
+  path tests) keeps using `SingleUfdDispatch`. **Part B — wiring.**
+  New `AddressSpace::fault_script_for_process(fault, &proc,
+  mailbox_weak)` entrypoint in `crates/tx-subsystems/src/vm/execution.rs`
+  that constructs the dispatcher and routes to
+  `fault_script_with_ufd_dispatch`. The legacy
+  `fault_script(VmFault)` retains `NullUfdDispatch` for kernel-
+  internal callers with no userspace process context. **Part C —
+  e2e canary test.** New `crates/tx-subsystems/tests/v3_userfaultfd_e2e.rs`
+  pinning the six-step OnAgent loop end-to-end:
+  (1) build a process with a private-anon VMA tagged with a
+  `UfdRegistration { ufd_id, mode: 0 }` and a `Cap<UserfaultFd>`
+  installed at fd 3 via `OpenFileBacking::Ufd`;
+  (2) drive `aspace.fault_script_for_process(VmFault, &proc,
+  mailbox.weak())` — the production entrypoint that builds
+  `ProcessUfdDispatch` and walks the fd-table;
+  (3) on the first parked-poll of the fault future, drain the per-ufd
+  `pending_faults` queue (`pop_fault_msg`) — the same surface
+  `step_ufd_read` drains in production;
+  (4) drive `mark_replied(token_id,
+  DelegateReply::Ufd(UfdReply::Copy { src_kernel_addr, dst_uaddr,
+  len }))` — exactly what `step_uffdio_copy` does at the shim layer;
+  (5) re-poll → `await_agent_reply` drains the `AgentReplied` event,
+  fault-script tail runs `materialize_pagebacked` +
+  `publish_page_with_replacement`, fault future resolves with `Ok(_)`;
+  (6) assert `registry.state(token_id) == DelegateState::Replied`
+  and `take_reply` returns `None` (consumed exactly once). Companion
+  test pins the dispatcher's fd-table walk in isolation (hit + miss).
+  Driver loop bounded at 1000 ticks per phase-6 constraint #4;
+  canary completes in under 10 ticks in practice.
+  **Phase-6 stub semantic.** The actual byte-level `src → dst` page
+  copy is **not** wired today (phase 4 stub semantic per W-W's
+  catchup): `materialize_pagebacked` still installs a zero page on
+  the `PrivateAnon` path during the resume tail, and the agent's
+  `src` buffer is conceptually the source but is not memcpy'd by the
+  substrate. The canary verifies the reply **payload identity**
+  (`DelegateReply::Ufd(UfdReply::Copy)` round-trips through the
+  registry intact) and the **state-machine transitions**
+  (`Pending → ReplyInstalling → Replied`) — what's load-bearing for
+  the OnAgent runtime proof. The byte-move is a follow-up that walks
+  the reply payload during materialize. **Verification:**
+  `cargo check --workspace --tests` clean; `cargo test -p
+  tx-subsystems -- --test-threads=1` 609 lib + 2 new e2e + existing
+  subsystems integration = 639 total passing; workspace test
+  `cargo test --workspace -- --test-threads=1` 1621 passing (above
+  the 1615+ target); zero failures. **Files touched:**
+  `crates/tx-subsystems/src/userfaultfd.rs` (new
+  `ProcessUfdDispatch` struct + impl),
+  `crates/tx-subsystems/src/vm/execution.rs` (new
+  `fault_script_for_process` entrypoint),
+  `crates/tx-subsystems/tests/v3_userfaultfd_e2e.rs` (new — full
+  OnAgent loop canary + dispatcher fd-table walk pin).
+- 2026-05-12 v3 migration completion audit LANDED (worker W-GG,
+  research-only). New doc at
+  `docs/progress/migration-completion-audit-2026-05-12.md` summarises
+  the migration from Day 1 (2026-05-11) through closure (2026-05-12):
+  ~2 wall-days vs the `07_BLAST_RADIUS.md` 22-day estimate, explained
+  by 33-worker (W-A → W-GG) parallel dispatch and scope-aggregation
+  inside individual PRs. The audit maps each BLAST_RADIUS §5.2 PR row
+  to its landed worker(s) and tests, walks the nine D1-D9 ADR
+  divergences from the silent assumptions in the plan, inventories the
+  substrate's final structural homes (`tx-substrate::wake::*`,
+  `tx-substrate::step_v3::*`), pins the PR-10/PR-11 canary coverage
+  state, and ranks the remaining-work ledger (PR-K restrictions cap,
+  RLIMIT_DELEGATE, EndpointScope abandonment edges, D9-D signalfd,
+  SQPOLL canary, PR-8B wheel mechanics, performance benches) for the
+  next quarter. Test-count walkback: 1328 baseline → 1615 at PR-10
+  phase 5 / PR-11 phase 2 closure, +287 net. Two hand-off recipes
+  captured: agent-kind subsystems follow PR-10's pattern; on-behalf-of
+  subsystems follow PR-11's pattern. **Verification:** doc-only, no
+  code touched, no `cargo xtask progress validate` JSON records added.
+  **Next:** declare migration done after W-EE phase 6 e2e + W-FF
+  phases 3-5 close; PR-K and PR-8B are the natural next-quarter
+  starting points.
+- 2026-05-12 v3 PR-10 phase 5 `UFFDIO_COPY` / `UFFDIO_ZEROPAGE` /
+  `UFFDIO_CONTINUE` reply ioctls + per-ufd pending-fault queue +
+  `read(uffd_fd, &mut uffd_msg)` arm LANDED (worker W-BB). Closes
+  D7 §6 row P-10.5. **Part A — three reply ioctls.** New
+  `step_uffdio_copy` / `step_uffdio_zeropage` / `step_uffdio_continue`
+  handlers in `crates/tx-shims/src/linux_syscall/userfaultfd.rs`. Each:
+  (1) checks the `UFFDIO_API` handshake bit, (2) reads the userland
+  arg struct from `argp`, (3) validates `dst` page-alignment, `len > 0`
+  + page-multiple, and that the range is fully covered by an
+  `UFFDIO_REGISTER`-tracked range, (4) looks up the pending fault by
+  matching the queue front's `fault_addr` against the agent-supplied
+  `dst` (Linux's userfaultfd has no explicit token field on
+  `struct uffdio_*` — fault address is the natural identifier), (5)
+  calls `ufd.delegate_registry().mark_replied(token_id,
+  DelegateReply::Ufd(...))` with the per-ioctl payload variant
+  (`Copy { src_kernel_addr, dst_uaddr, len }`, `ZeroPage`, or
+  `Continue`), (6) pops the matched message off the queue, (7) writes
+  back `copy` / `zeropage` / `mapped` with `len`. Phase-5 stub
+  semantic from W-Y: actual byte-level `src → dst` page copy is
+  deferred; the wiring is what's pinned. **Part B — pending-fault
+  queue + wait source.** `UserfaultFd` payload grows
+  `pending_faults: SpinMutex<VecDeque<UffdMsg>>` plus
+  `Arc<WaitSource> + Channel` (D2/D4 coexistence pattern from
+  `pipe.rs`); the legacy wait-channel id and the new `WaitSource::id()`
+  share a `u64` namespace so a `YieldShape::OnWaitSource { source }`
+  carrier round-trips through both lookup paths. New
+  `UffdMsg { event, fault_addr, ufd_thread_id, token_id }` carries
+  the substrate-internal `DelegateTokenId` link plus the
+  Linux-wire-visible fields. `push_fault_msg` (called from
+  `fault_script` after `install_request`) fires both wake paths;
+  `pop_fault_msg` / `front_fault_msg` drain. **Part C —
+  `step_ufd_read`.** New `pub fn step_ufd_read` on
+  `tx_subsystems::userfaultfd` plus a `step_ufd_read` async wrapper
+  in tx-shims that loops on the per-ufd `WaitSource` carrier until a
+  message arrives. `sys_read` in `linux_syscall/io.rs` discriminates
+  `file.ufd().is_some()` before the generic
+  `OpenFile::step_read` path (which still returns EINVAL for ufd
+  backings). Empty queue + `O_NONBLOCK` → `-EAGAIN`; blocking →
+  `Yield { OnWaitSource }` → `wait_source::wait_on_token`.
+  `sys_userfaultfd` now honours `O_NONBLOCK` (was recognise-only).
+  Wire format (32 bytes): byte 0 = `UFFD_EVENT_PAGEFAULT (0x12)`,
+  bytes 16..24 = `fault_addr.to_le_bytes()`, bytes 24..28 = ptid;
+  matches Linux's `struct uffd_msg.pagefault` enough for an
+  unmodified agent to parse. **Part D — fault-path wiring.**
+  `UfdDispatchTarget` gains an `Option<&'a UserfaultFd> fault_pusher`
+  field; `dispatch_ufd_fault` in `vm/execution.rs` calls
+  `pusher.push_fault_msg(UffdMsg { ... token_id ... })` immediately
+  after `install_request` returns the token id so the agent's
+  subsequent `read(uffd_fd, ...)` can drain. Existing
+  `v3_userfaultfd_fault_path` tests updated with `fault_pusher: None`
+  (state-machine-isolation tests; phase-6 e2e gains a `Some`
+  dispatcher). **Part E — registered-ioctls bitmap.**
+  `UFFDIO_REGISTER_REPLY_IOCTLS` now ships
+  `COPY | ZEROPAGE | CONTINUE` (bit 0x07 added). **Tests.** New
+  `crates/tx-shims/tests/v3_userfaultfd_ioctl_reply.rs` (11 tests
+  pinning: pre-handshake reject, alignment validation, zero-len
+  reject, no-pending-fault reject, successful drain for all three
+  ioctls, mismatched dst reject, read EAGAIN on empty + NONBLOCK,
+  read returns 32-byte wire-format message, read buf-too-small
+  EINVAL). **Verification:** substrate 237/0/0 (baseline holds);
+  shims 275/0/0 (up from 257 baseline + 11 new + 7 from O_NONBLOCK
+  recognised); subsystems lib 605/0/11 (up from 602); workspace
+  1615/0/11 (above 1592+ target). All clean under `cargo check
+  --workspace --tests`. **Next:** P-10.6 e2e Linux-style agent
+  program test against the QEMU shim. Structural plumbing is
+  complete; phase 6 is largely test-coverage + an end-to-end
+  fault-script → agent-read → UFFDIO_COPY → fault-resume invariant
+  pin. **Files touched:**
+  `crates/tx-subsystems/src/userfaultfd.rs` (UffdMsg, queue, wait
+  source, step_ufd_read, drop),
+  `crates/tx-subsystems/src/vm/execution.rs` (fault_pusher field +
+  push call),
+  `crates/tx-subsystems/tests/v3_userfaultfd_fault_path.rs`
+  (`fault_pusher: None`),
+  `crates/tx-shims/src/linux_syscall/userfaultfd.rs` (three ioctl
+  handlers + step_ufd_read + O_NONBLOCK),
+  `crates/tx-shims/src/linux_syscall/fs_basic.rs` (dispatch arms),
+  `crates/tx-shims/src/linux_syscall/io.rs` (sys_read ufd
+  discriminator),
+  `crates/tx-shims/src/linux_syscall/numbers.rs`
+  (`UFFDIO_CONTINUE`, `UFFD_EVENT_PAGEFAULT`, updated reply ioctls
+  bitmap),
+  `crates/tx-shims/tests/v3_userfaultfd_ioctl_reply.rs` (new).
+- 2026-05-11 D9 phase B + phase C landed (worker W-DD). Closes D9
+  §"Phase D9-B" (process-directed eligibility scan) and §"Phase
+  D9-C" (pselect/sigwaitinfo wake-path integration pin).
+  **D9-B — eligibility scan.** `step_kill_process` at
+  `crates/tx-subsystems/src/signal.rs:548` rewrites the
+  thread-selection: under `payload.threads.lock()`, walk threads
+  with a two-pass scan — Pass 1 picks the first non-zombie thread
+  with `sig` NOT blocked in its `signal_mask`; Pass 2 (fallback)
+  picks the first non-zombie thread anyway if every eligible
+  thread has `sig` blocked (POSIX: signal stays pending in the
+  chosen thread's mask until it unblocks). The CAS into
+  `thread_pending` and the mailbox post happen via `post_signal`
+  *after* the lock drop — the routing decision is serialised
+  under the threads-list lock (per W-AA's post-after-lock-drop
+  property), but no lock is held while posting. Zombie threads
+  (`payload_cap().is_none()`) are skipped in both passes; an
+  all-zombie process still returns `KillOutcome::NoLiveThread`.
+  **D9-C — interrupt-wake integration pin.** A new integration
+  test `crates/tx-subsystems/tests/v3_signal_interrupt_wake.rs`
+  spawns a reactor task that parks on `Channel::wait_event` with
+  `WaitProtocol::Interruptible` and a permanently-false
+  condition. The future wraps the parked
+  `WaitEventFuture` in a `MailboxWakeAdapter` that registers the
+  task's `Waker` on the bound `TaskMailbox` per poll; the
+  channel itself is **never** fired. A second thread (the test
+  driver) calls `step_kill_process(proc, SIGTERM)`, which D9-A's
+  `post_signal_mailbox` plumbing posts onto the bound mailbox.
+  The mailbox post wakes the registered waker; the reactor
+  re-polls; `classify_interrupt` observes
+  `summary.deliverable_signal` and returns
+  `WaitOutcome::Interrupted`. Total reactor polls budgeted at
+  `MAX_TICKS = 100`; the actual path takes 2 (park + post-wake
+  re-poll). The test is the lost-wake fix's primary regression
+  pin (pre-D9-A, the parked future would miss the delivery
+  because the unrelated `Channel` never fired).
+  **D9-B test file.** `crates/tx-subsystems/tests/v3_signal_eligibility.rs`
+  pins six scenarios: (1) single-thread sanity; (2) eligible-first
+  selection (3-thread process, only T2 unblocks SIGTERM → T2
+  receives it, leader and T3 are skipped); (3) all-blocked
+  fallback (every thread blocks SIGTERM → leader receives, mask
+  ensures `summary.deliverable_signal` stays false but the
+  mailbox post still fires per D9-A); (4) zombie skipping
+  (T2 zombified mid-scan via the new
+  `mark_thread_zombie_for_test` test helper; scan picks the
+  next-eligible-or-fallback target); (5) coalescence (two
+  back-to-back kills set the bit once in `thread_pending` but
+  enqueue two mailbox events); (6) all-zombie process returns
+  `NoLiveThread`. Touches:
+  `crates/tx-subsystems/src/signal.rs` (eligibility scan refactor,
+  ~15 LoC + doc),
+  `crates/tx-subsystems/src/process/execution.rs` (new
+  `spawn_sibling_thread_for_test` helper under
+  `cfg(any(test, feature = "test-support"))`),
+  `crates/tx-subsystems/src/thread_runtime/execution.rs` (new
+  `mark_thread_zombie_for_test` helper),
+  `crates/tx-subsystems/Cargo.toml` (self-dev-dep with
+  `test-support` feature so the new integration-test binaries
+  can reach the helpers).
+  **Verification:** `cargo test -p tx-subsystems --lib --
+  --test-threads=1` clean at 605 (was 602 pre-D9-A landing — the
+  3-test delta is W-AA's lib-side adds, unchanged here);
+  `cargo test --workspace --exclude tx-shims --
+  --test-threads=1` clean at 1340. (`tx-shims/tests/v3_userfaultfd_ioctl_reply.rs:307`
+  references missing `TokenDropPolicy::SilentOnDrop` variant — a
+  pre-existing compile error unrelated to D9, owned by a separate
+  worktree.) No `signal/tests/` assertion updates were required:
+  no existing test relied on the "first non-zombie regardless of
+  mask" ordering — all single-thread cases default to an empty
+  mask and the eligible-first pass picks the leader exactly as
+  before; multi-thread-with-mask cases didn't exist in the
+  pre-D9-B test surface.
+  **Next:** signalfd / sigwaitinfo integration are deferred per
+  D9 §6 to a follow-up ADR. The realtime per-occurrence queue is
+  also out of scope.
+
+- 2026-05-11 v3 PR-10 phase 4 fault-path OnAgent branch + driver-side
+  `await_agent_reply` helper LANDED (worker W-Y). Closes D7 §6 row
+  P-10.4 and gap #2 from §3.4 ("no driver-side `await_agent_reply`
+  helper consumes `MailboxEvent::AgentReplied` / `Abort`"). **Part A —
+  `DelegateRequest` sum.** `DelegateRequest` grew from a unit
+  placeholder to a closed sum keyed on endpoint kind, symmetric to
+  `DelegateReply` (W-T's flag from PR-7 phase 1/2). New
+  `DelegateRequest::Ufd(UfdRequest)` arm; `Placeholder` retained for
+  PR-7/7B state-machine tests that don't care about payload. New
+  `UfdRequest::PageFault { faulting_addr: u64, access_kind:
+  UfdAccessKind, faulting_tid: u64 }` mirrors `struct uffd_msg`
+  per `man userfaultfd(2)`; `UfdAccessKind` is the closed catalog
+  `Missing | Wp | Minor` (phase 4 only emits `Missing`). **Part B —
+  `await_agent_reply` helper.** New
+  `crates/tx-reactor/src/agent_reply.rs` (~170 LoC incl docs) lands
+  the driver-side consumer: `pub fn await_agent_reply(token_id:
+  DelegateTokenId, mailbox: &TaskMailbox, registry:
+  &DelegateRegistry) -> AwaitAgentReply<'_>`. The future polls the
+  mailbox, drains queued events, matches by token id via the new
+  sibling predicate `tx_substrate::wake::agent_event_matches`, calls
+  `registry.take_reply` on AgentReplied, returns `Err(reason)` on
+  Abort. Spurious events (other tokens, other shapes) are re-posted
+  so the rightful consumer can read them — DTOK-3 single-fire
+  semantics on `ActiveWait::matches` are untouched. **Part C —
+  fault-path OnAgent branch.** `AddressSpace::fault_script` is now a
+  thin wrapper around new
+  `fault_script_with_ufd_dispatch<D: UfdDispatch>(fault, dispatch)`.
+  The OnAgent branch reads `entry.ufd_registration` at the
+  `require_fault_recipe` result (W-V's recommendation: single-branch
+  insertion in the existing async loop, before
+  `materialize_pagebacked`); on a present tag it resolves via
+  `dispatch.resolve(ufd_id) -> Option<UfdDispatchTarget { registry,
+  mailbox }>`, installs `DelegateRequest::Ufd(PageFault)`, awaits via
+  `await_agent_reply`, and then drops the guard before falling
+  through to the canonical materialize-publish tail. **Phase-4 stub
+  semantics:** actual byte-level `src_kernel_addr -> dst_uaddr` copy
+  is deferred to phase 5; the reply is acknowledged as "applied" and
+  the existing private-anon materialization runs (correct for
+  ZeroPage; Copy/Continue trust the eventual phase-5 agent to install
+  contents). On `AbortReason::AgentDied | Canceled | TimedOut` the
+  fault returns `VmFaultError::WouldBlock` (phase 6 may add a
+  dedicated `AgentDied` variant). `NullUfdDispatch` keeps the legacy
+  `fault_script(VmFault)` entrypoint behaving exactly as pre-phase-4
+  so thread_future's call site needs no change. **Part D — per-ufd
+  `DelegateRegistry`.** Per D7 §3.3, each `UserfaultFd` owns its own
+  `DelegateRegistry` (`delegate_registry: DelegateRegistry` field +
+  `delegate_registry()` accessor on the payload); `ufd_id` doubles as
+  the `endpoint_marker` so `mark_endpoint_died(ufd_id)` walks every
+  in-flight fault on that ufd when the cap drops. **Part E —
+  `ActiveWait::matches` extension.** No change to the existing
+  predicate (preserving DTOK-3 single-fire); added a sibling
+  `agent_event_matches(event, expected_token_id) -> bool` in
+  `tx_substrate::wake::mailbox` for the `OnAgent` routing path. The
+  driver-side helper is the consumer; the existing wait-source path
+  is unaffected. **Tests.** New
+  `crates/tx-subsystems/tests/v3_userfaultfd_fault_path.rs` (4 tests
+  pinning: AgentReplied resume path, spurious-event re-post,
+  AgentDied -> WouldBlock, NullUfdDispatch fall-through).
+  **Verification:** substrate 237 (baseline holds), reactor 132,
+  shims 257 (252 baseline + new `UfdAccessKind` round-trip in the
+  `DelegateRequest` test). Workspace `cargo test --workspace --
+  --test-threads=1`: 1592/0/11 (above 1579+ target). Parallel run
+  has a pre-existing flaky ext4-readonly test unrelated to this
+  phase. **Next:** P-10.5 `UFFDIO_COPY` / `UFFDIO_ZEROPAGE` /
+  `UFFDIO_CONTINUE` ioctls + the `read(uffd_fd, &mut uffd_msg)`
+  arm. The plumbing is fully wired — phase 5 is mechanical
+  (substrate-side `mark_replied` already lives in the registry;
+  phase 5 is the ioctl-handler glue that calls it). **Files
+  touched:** `crates/tx-substrate/src/step_v3/agent.rs`,
+  `crates/tx-substrate/src/step_v3/mod.rs`,
+  `crates/tx-substrate/src/wake/mailbox.rs`,
+  `crates/tx-substrate/src/wake/mod.rs`,
+  `crates/tx-reactor/src/agent_reply.rs` (new),
+  `crates/tx-reactor/src/lib.rs`,
+  `crates/tx-subsystems/src/userfaultfd.rs`,
+  `crates/tx-subsystems/src/vm/execution.rs`,
+  `crates/tx-subsystems/src/vm/mod.rs`,
+  `crates/tx-substrate/tests/v3_yield_on_agent.rs` (DelegateRequest
+  closed-sum match), `crates/tx-subsystems/tests/v3_userfaultfd_fault_path.rs`
+  (new).
+- 2026-05-11 v3 PR-10 phase 3 `UFFDIO_REGISTER` + `VmEntry::ufd_registration`
+  field LANDED (worker W-V). Closes D7 §6 row P-10.3 — the
+  substrate-side recording of which VMAs are routed to which ufd.
+  **Part A — VmBacking-adjacent tag.** `VmBacking` itself is
+  unchanged (the per-page-content enum stays minimal); a new
+  `UfdRegistration { ufd_id: u64, mode: u64 }` value plus an
+  additive `ufd_registration: Option<UfdRegistration>` field on
+  `VmEntry` lands in
+  `crates/tx-subsystems/src/vm/structure/types.rs`. `VmEntry::new`
+  preserves its pre-phase-3 signature — the new field defaults to
+  `None`, so every existing call site is source-compatible. A
+  `with_ufd_registration` builder is the only new entry surface; the
+  internal `sub_entry` split path inherits the tag verbatim across
+  `split_for_unmap` / `split_for_protect` (phase-3 contract: shim
+  rejects partial-VMA registrations so every survivor of a split
+  legitimately shares the tag). New
+  `AddressSpace::tag_ufd_registration(range, tag) ->
+  Result<VmMapCommit, VmMapError>` routes the stamp through the
+  EBR-published recipe tree (`RecipeIndex::tag_ufd_registration`):
+  one writer-mutex round rewrites the tree atomically, partial
+  overlap / missing mapping → `MissingMapping`. **Part B —
+  UserfaultFd state extension.** `crates/tx-subsystems/src/userfaultfd.rs`
+  gains a `SpinMutex<Vec<UfdRange>>` registered-ranges list (one
+  entry per successful `UFFDIO_REGISTER`); a follow-up may upgrade
+  to `AtomicSlot<Cap<UfdRegistrations>>` if a hot path needs
+  lock-free reads. New methods: `record_registration(UfdRange)`,
+  `registrations_snapshot() -> Vec<UfdRange>`,
+  `registration_count() -> usize`. **Part C — UFFDIO_REGISTER
+  shim.** `crates/tx-shims/src/linux_syscall/userfaultfd.rs` gains
+  `UffdioRange` / `UffdioRegister` POD structs (16 + 32 bytes,
+  `#[repr(C)]`, three `u64` fields each — matches Linux uapi
+  `<linux/userfaultfd.h>`) and `step_uffdio_register(file, argp,
+  ctx)`. Flow: (1) `EBADF` if not a ufd-backed file, (2) `EINVAL`
+  if `UFFDIO_API` handshake not yet performed, (3) `EFAULT` if
+  `argp == 0`, (4) read `UffdioRegister`, (5) `EINVAL` for `mode
+  == 0` or `mode & !known_modes != 0` or `mode &
+  (WP|MINOR) != 0` or `mode & MISSING == 0` (MISSING-only per D7
+  §5), (6) `EINVAL` for unaligned start / unaligned len / zero len
+  / overflow / `end > FULL_USER_V1_TOP (1<<38)`, (7)
+  `aspace.tag_ufd_registration(range, UfdRegistration { ufd_id:
+  ufd.ufd_id(), mode })` — missing-mapping → `EINVAL`, (8)
+  `ufd.record_registration(UfdRange { start, len, mode })`, (9)
+  writeback `ioctls = UFFDIO_REGISTER_REPLY_IOCTLS` (=
+  `(1 << 0x03) | (1 << 0x04)` — `_IOC_NR` bits for `UFFDIO_COPY` +
+  `UFFDIO_ZEROPAGE`). Dispatch wired in
+  `crates/tx-shims/src/linux_syscall/fs_basic.rs:634-644` next to
+  W-T's `UFFDIO_API` short-circuit. New ioctl constants in
+  `crates/tx-shims/src/linux_syscall/numbers.rs`:
+  `UFFDIO_REGISTER` (`0xC020_AA00`),
+  `UFFDIO_REGISTER_MODE_{MISSING,WP,MINOR}`, placeholder
+  `UFFDIO_COPY` / `UFFDIO_ZEROPAGE` numbers (phase-5 owns the
+  handlers), and `UFFDIO_REGISTER_REPLY_IOCTLS`. **Tests.** New
+  `crates/tx-shims/tests/v3_userfaultfd_register.rs` (10 tests):
+  api-handshake gate, mode-zero/WP/MINOR rejection,
+  unaligned-start/zero-length rejection, unmapped-range rejection,
+  null-argp `EFAULT`, valid register tags VMA + appends ufd
+  bookkeeping + writes correct ioctls bitmap, duplicate-register
+  idempotent at VMA tag (re-stamps with same id+mode) and appends
+  to the ufd's append-history list. **Verification:** 599/0/11
+  tx-subsystems lib (baseline holds — VmEntry change is purely
+  additive), 252 tx-shims (233 main lib + 1 + 10 new + 8 phase-2 =
+  252), 1579/0/11 workspace (well above the 1564 baseline). Phase
+  4 (fault-path interception) is now unblocked: `fault_script` can
+  inspect `entry.ufd_registration` at VMA-recipe lookup time and
+  branch to an `OnAgent` yield instead of `materialize_pagebacked`.
+  **Next:** P-10.4 fault-path interception + driver-side
+  `await_agent_reply` helper. **Files touched:**
+  `crates/tx-subsystems/src/vm/structure/types.rs`,
+  `crates/tx-subsystems/src/vm/structure/recipe.rs`,
+  `crates/tx-subsystems/src/vm/structure/mod.rs`,
+  `crates/tx-subsystems/src/vm/structure/address_space.rs`,
+  `crates/tx-subsystems/src/vm/mod.rs`,
+  `crates/tx-subsystems/src/userfaultfd.rs`,
+  `crates/tx-shims/src/linux_syscall/userfaultfd.rs`,
+  `crates/tx-shims/src/linux_syscall/fs_basic.rs`,
+  `crates/tx-shims/src/linux_syscall/numbers.rs`,
+  `crates/tx-shims/tests/v3_userfaultfd_register.rs` (new).
+- 2026-05-12 v3 PR-11 phase 2 AIO `io_submit` + worker dispatch LANDED
+  (worker W-CC). Per D8 §7 (phase row P-11.4) and W-Z's flag — the
+  worker enters `with_on_behalf_of(owner, body)` once at `io_setup`
+  time and the borrow holds for the entire context lifetime. New
+  surface in `crates/tx-subsystems/src/aio.rs` (~640 LoC total now,
+  ~450 added):
+  - `Iocb { aio_fildes, aio_lio_opcode, aio_buf, aio_nbytes,
+    aio_offset, aio_data }` mirrors Linux's `struct iocb` narrowed to
+    the fields the worker reads.
+  - `AioContext` now carries `submit_queue: SpinMutex<VecDeque<Iocb>>`,
+    `iocb_arrived: Arc<WaitSource>` (notified on every push, mirrors
+    pipe's `reader_wait_source` pattern), `worker_abort:
+    Arc<AbortSignal>` (the structural `io_destroy` / principal-exit
+    surrogate until phase 4 wires the real `exit_source`), and a
+    `dispatched: AtomicU64` counter the phase-2 worker stub bumps per
+    iocb.
+  - `push_iocb(iocb) -> Result<(), Iocb>` enforces the `nr_events`
+    bound (rejection returns the iocb back); `pop_iocb()` drains
+    FIFO. `IOCB_CMD_PREAD/PWRITE/FSYNC/FDSYNC/NOOP/PREADV/PWRITEV`
+    constants + `is_valid_iocb_opcode`.
+  - `spawn_worker_for_context(aio_cap, principal, owner_subject) ->
+    AioWorkerFuture` constructs the worker future: outer `async move`
+    owns the principal+subject and `.await`s
+    `with_on_behalf_of(owner, body)`; body loops draining iocbs +
+    bumping `dispatched`; outer `WorkerOuter` races the body against
+    the context's `worker_abort`. The future is `Send` (the
+    `dyn Future` is `+ Send + 'static`).
+  New surface in `crates/tx-shims/src/linux_syscall/aio.rs` (~395 LoC
+  now, ~280 added):
+  - `sys_io_setup` extended to also spawn the worker future and stash
+    it in a test-visible registry keyed by `context_id`. **Deferred-
+    pump model**: today's syscall context does not carry a
+    `&mut Reactor` handle (the boot reactor is owned by `tx-kernel`);
+    a function-pointer seam mirroring
+    `tx_subsystems::reactor_submit::install_submit_child_thread` is
+    the phase-2b follow-up. Marked `// TODO PR-11 phase 2b: spawn
+    deferred` in the source.
+  - `sys_io_submit(ctx_fd, nr, iocbpp)` parses each iocb from user
+    memory (Linux UAPI layout: `aio_data@0`, `aio_lio_opcode@16`,
+    `aio_fildes@20`, `aio_buf@24`, `aio_nbytes@32`, `aio_offset@40`;
+    64-byte stride), validates opcode, pushes onto the AIO context's
+    submit queue, returns count admitted. Linux-compatible short-
+    circuits: `-EAGAIN` if first push fails (queue full); positive
+    count if any push succeeded then a later one failed; `-EBADF` for
+    a missing fd; `-EINVAL` for a non-AIO fd or unknown opcode on the
+    first iocb; `-EFAULT` for user-memory copy failures on the first
+    iocb.
+  - `NR_IO_SUBMIT` dispatch arm wired in
+    `crates/tx-shims/src/linux_syscall/mod.rs`.
+  - Test-visible registry helpers: `take_worker_future_for_test`,
+    `reset_worker_registry_for_test`, `worker_install_count_for_test`.
+  Tests: new `crates/tx-shims/tests/v3_aio_io_submit.rs` (7 tests,
+  all pass) pins: (1) worker future install count goes up by 1 per
+  io_setup, (2) `nr=0` returns 0, (3) a single PREAD iocb is admitted
+  onto the queue and the worker body drains it within a bounded
+  number of polls (4) tripping `abort_worker` drives the worker
+  future to `Ready(Err(PrincipalExited))` cleanly within 64 polls
+  after a parked first poll, (5) overflow short-circuits with
+  partial admit (`nr_events=2`, submit 3, returns 2), (6)
+  `sys_io_submit` against a non-AIO fd returns `-EINVAL`, (7) a
+  multi-iocb submit drives the worker through both iocbs. New unit
+  tests in `crates/tx-subsystems/src/aio.rs`: `push_iocb` admission
+  bound, `pop_iocb` FIFO drain, `is_valid_iocb_opcode` set check.
+  **Linux batch-atomicity note**: phase 2's "return >=1 OR -EAGAIN if
+  first fails" matches Linux closely; sub-batch validation failures
+  return the partial count rather than rolling back, matching
+  Linux's "io_submit returns the count accepted" contract.
+  `cargo test -p tx-substrate` passes 237/0/0 (baseline holds).
+  `cargo test -p tx-subsystems --lib -- --test-threads=1` passes
+  605/0/11 (602 baseline + 3 new aio unit tests). `cargo test -p
+  tx-shims` (excluding pre-existing baseline failure
+  `v3_userfaultfd_ioctl_reply` — unrelated to PR-11) passes 264
+  (233 lib + 5 io_setup + 7 io_submit + 1 + 10 + 8). Workspace-wide
+  excluding tx-shims = 1340 tests passing; +tx-shims = 1604+, above
+  the 1592+ baseline. Phase 3 wires the real `step_pread` /
+  `step_pwrite` dispatch + the completion ring + `sys_io_getevents`;
+  phase 4 wires `sys_io_destroy` + `Drop for AioContext` to fire the
+  worker abort through the real `exit_source` integration. **Phase
+  2b spawn seam** (boot-reactor `install_aio_worker` fn pointer) is
+  the immediate follow-up that closes the deferred-pump model.
+- 2026-05-11 v3 PR-11 phase 1 AIO `io_setup` fd-shape scaffold LANDED
+  (worker W-Z). Per D8 §7 (phase row P-11.2 + P-11.3) and the
+  fd-shape decision in §4.1: `aio_context_t` is normalized to a real
+  fd via the new `OpenFileBacking::AioContext(Cap<AioContext>)`
+  variant, joining the Rnode/Ufd pattern from W-Q's PR-10 phase 0.
+  New zone-allocated `tx_subsystems::aio::AioContext` payload
+  (`crates/tx-subsystems/src/aio.rs`, ~190 LoC incl docs) carries
+  fields `{ context_id: u64, nr_events: u32, _pad: u32 }`; the
+  `context_id` is monotonic-on-construction (mirrors W-Q's `ufd_id`
+  template), `nr_events` round-trips the `io_setup` argument for
+  phase 3's submission-queue sizing. Zone registered through
+  `crates/tx-subsystems/src/zones.rs`. `OpenFile` gains
+  `new_aio_context` / `new_aio_context_cap` constructors and an
+  `aio_context() -> Option<&Cap<AioContext>>` accessor symmetric with
+  W-Q's `ufd()`; `rnode()` panics on the new variant (mirrors W-Q's
+  ufd panic). `sys_io_setup(nr_events, _ctx_idp)` dispatcher in new
+  `crates/tx-shims/src/linux_syscall/aio.rs`: mints cap → wraps in
+  `OpenFile` → installs at lowest free fd → returns fd. The
+  `_ctx_idp` user pointer is ignored intentionally per the
+  Linux-divergence policy — we return the fd as the syscall result
+  rather than write Linux's pointer-shape into the out-parameter
+  (userspace glibc shim is a 5-line bridge). Syscall numbers
+  `NR_IO_SETUP=206`, `NR_IO_DESTROY=207`, `NR_IO_GETEVENTS=208`,
+  `NR_IO_SUBMIT=209` defined in `numbers.rs`; only `NR_IO_SETUP` has
+  a dispatch arm in this phase. Tests: new
+  `crates/tx-shims/tests/v3_aio_io_setup.rs` (5 tests, all pass)
+  pins: (a) AIO-shape fd backing + `context_id`/`nr_events` round-
+  trip, (b) `nr_events` capture, (c) fresh `context_id` per call,
+  (d) non-AIO `aio_context()` returns `None` (constructed via a ufd
+  OpenFile so the assertion does not depend on bootstrap fd
+  pre-population), (e) `OpenFile::rnode()` panics on AIO backing
+  (mirrors W-Q's ufd panic). `cargo test -p tx-subsystems --lib`
+  passes 602/0/11 (599 baseline + 3 new aio unit tests). `cargo
+  test -p tx-shims` passes 257 (233 + 5 + 1 + 10 + 8) all clean.
+  Updated `crates/tx-subsystems/tests/v3_userfaultfd_fd_scaffold.rs`
+  match arm to cover the new variant exhaustively. **No
+  on_behalf_of integration yet** — phase 1 just establishes the fd
+  scaffold. Phase 2 wires the worker reactor task and the
+  per-context `with_on_behalf_of(owner, …)` borrow (W-W's framework
+  is the receiver); phases 3–4 add the submit/getevents/destroy
+  arms. Pre-existing baseline test compile failures
+  (`DelegateRequest::Ufd` non-exhaustive in
+  `tx-substrate/tests/v3_yield_on_agent.rs`, tx-subsystems
+  test-support feature gates referencing not-yet-landed symbols) are
+  unchanged by this phase — they are W-Y / W-W catch-up territory.
+
+- 2026-05-11 v3 PR-11 phase 0 `OnBehalfOf<P>` framework LANDED
+  (worker W-W). The substrate side of the AIO canary per D8: the
+  closed-catalog `ExecutionScope::OnBehalfOf` variant now carries a
+  real `Cap<I>` (generic over `I: SubjectIdentity`) instead of the
+  Wave 3 unit-typed `OwnedProcessHandle` placeholder. New
+  `with_on_behalf_of<I, F, Fut, T>` async helper in
+  `crates/tx-substrate/src/step_v3/on_behalf_of.rs` (~370 LoC
+  including docs) implements the borrow primitive per
+  `06_EXECUTION_SCOPE_v1.md` §3: it clones the principal cap (EBR
+  retain), captures the principal's `exit_source` id for the
+  future-PR-3D-3 wake wiring, materialises a
+  `SubjectContext::borrowed(principal, SubjectAuthority::derived_from(owner))`
+  for the body, and drives the body future racing it against an
+  `AbortSignal`. New `SubjectAuthority::derived_from(owner:
+  &SubjectContext<I>) -> Self` constructor snapshots the owner's
+  cred + restrictions caps per SCOPE-V1-SUBJECT-1. New
+  `OnBehalfOfAbort` catalog (`PrincipalExited`,
+  `PrincipalRestrictionRevoked`, `CooperativeCancel(CancelReason)`)
+  + `AbortSignal` first-writer-wins one-shot trip primitive.
+  `crates/tx-substrate/tests/v3_pr11_on_behalf_of.rs` (7 tests) pins
+  the framework contract: body sees principal subject (not
+  worker's), body normal completion → no abort, abort-signal trip →
+  `Err(PrincipalExited)`, `derived_from` clones owner caps,
+  catalog round-trip, body `Err` propagation. **No AIO subsystem
+  code yet** — that lands in PR-11 phases 1–7 atop this framework.
+  Tests: tx-substrate 232 → 237 (net +5: -2 retired placeholder
+  pins, +7 new pins); workspace 1564 → 1579 baseline → +new = passes
+  clean. No AIO-specific code touched; DelegateRegistry / TimerWheel
+  / VM / vfs / userfaultfd unchanged.
+
+- 2026-05-11 v3 PR-3D-5 vfs `WaitSource` migration LANDED
+  (worker W-S). The **last mechanical bus consumer**. Per D2/D4
+  coexistence and the PR-3D-1 pipe / PR-3D-2 futex / PR-3D-3
+  exit_source / PR-3D-4 tty templates,
+  `crates/tx-subsystems/src/vfs/structure.rs` now carries **both**
+  legacy `Channel`+`Waker` and the new `Arc<WaitSource>`+`TaskMailbox`
+  wake-publication paths on every `RNode`. Unlike pipe/futex/exit_source/
+  tty (each one-off per object), VFS is the per-inode unbounded-count
+  consumer: every `RNode::new` mints two registry slots (read + write,
+  matching pipe's two-source-per-object shape) and `Drop for RNode`
+  releases both. **RNode field list before/after:**
+  - Before: `{ fs_object_id, meta, backing, containing_mount }` (4
+    fields, `#[derive(Debug)]`).
+  - After: adds `{ read_wait_channel: Channel,
+    read_wait_source_id: u64, read_wait_source: Arc<WaitSource>,
+    write_wait_channel: Channel, write_wait_source_id: u64,
+    write_wait_source: Arc<WaitSource> }` (10 fields total). Replaced
+    `#[derive(Debug)]` with a manual `impl Debug` that elides the
+    wake-publication internals (`Channel` and `WaitSource` are not
+    `Debug`; the manual impl matches `PipePayload`'s precedent).
+    Wake-publication slots live on `RNode` (the identity), not on
+    `RNodeBacking` or `StructPayload` — backing variants are short-
+    circuit kinds (Directory, Symlink, Pipe, etc.) and only Pipe / Tty
+    carry their own backing-specific wait sources. The per-inode VFS
+    sources are the durable wake-publication endpoint for future
+    page-backed-blocking, socket, and inotify wires per W-M's flag.
+  Two new constants: `VFS_READABLE: u64 = 0x1`, `VFS_WRITABLE: u64 =
+  0x2`. New helpers on `RNode`: `read_wait_channel()`,
+  `read_wait_source_id()`, `read_wait_source()`, `write_wait_channel()`,
+  `write_wait_source_id()`, `write_wait_source()`,
+  `fire_read_wait(mask)`, `fire_write_wait(mask)`. The dual-fire
+  helpers fire both the legacy `Channel` (returns released-count) and
+  the new `WaitSource::notify` under the same call so D2 coexistence
+  is observable without a separate fire site. `execution.rs` is
+  unchanged — VFS has no existing `Channel::fire` sites today
+  (pipe/tty manage their own; regular files / future sockets are the
+  consumers that will fire these helpers). **Wake-routing diagram
+  (text):**
+
+  ```
+  future blocking-IO step body (e.g. socket bytes arrival,
+  page-backed-blocking ring fill, inotify event)
+      ↓
+  rnode.fire_read_wait(VFS_READABLE)  [or fire_write_wait]
+      │  ↓ legacy path
+      │  rnode.read_wait_channel.fire(Mask::from_bits(VFS_READABLE))
+      │     → releases legacy `WaitFuture` awaiters resolved via
+      │       `wait_source::wait_on_token(WaitToken(id, mask))`.
+      │  ↓ new path (PR-3D-5, D2 additive)
+      ↓  rnode.read_wait_source.notify(InterestMask::new(VFS_READABLE))
+            → walks subscribers, posts MailboxEvent::SourceFired
+              { generation, source: WaitSourceId(read_wait_source_id),
+                interests: VFS_READABLE }
+              to each Weak<TaskMailbox> with overlapping interest.
+              Dead Weak rows compacted out as a side effect.
+
+  RNode retirement (Cap<RNode> last-drop, EBR-deferred):
+      ↓ Drop for RNode
+      wait_source::release_wait_channel(read_wait_source_id)
+      wait_source::release_wait_channel(write_wait_source_id)
+      → BTreeMap rows removed; large-N inode-create-destroy cycles
+        retain bounded registry size.
+  ```
+
+  **Tests:** new pin tests at
+  `crates/tx-subsystems/tests/v3_vfs_waitsource.rs` (1 test, bundled-
+  invariant shape per the cred-zone / exit_wait_source / tty_waitsource
+  integration-test precedent — `reset_*_for_test` helpers are
+  `pub(crate)` and not visible from integration-test binaries, so the
+  single test bootstraps once and walks all 7 invariants in order):
+  (1) WaitSourceId-round-trip-both-directions (read and write ids
+  distinct; each `WaitSource::id()` matches the registered `u64`);
+  (2) blocked-reader-woken-on-`fire_read_wait` (subscriber registered
+  on empty source; one `SourceFired` post per fire); (3) blocked-
+  writer-woken-on-`fire_write_wait` (symmetric); (4) D2 coexistence
+  (raw-waker `Channel.wait` future drives Pending -> Ready across the
+  same `fire_read_wait` call; legacy `Channel.fire` returns >=1
+  released); (5) direction-isolation (`fire_read_wait` posts to read
+  subscribers only, never write; symmetric); (6) drop-cleanup-retires-
+  registry-slots (post-`drop(rnode)` + EBR drain,
+  `lookup_wait_channel` on either id returns `None`); (7) large-N
+  inode-create-destroy-no-arc-leak (mint 64 inodes, snapshot 128 ids,
+  drop, drain — every id unresolvable post-drain).
+  **Verification:** 599/0/11 tx-subsystems lib (baseline preserved —
+  no existing test exercises `RNode`'s newly-minted wait channels;
+  the 11 ignored are pre-existing). 1/0 new integration test
+  (`v3_vfs_waitsource`). 233/0 tx-shims (baseline preserved — fd/read/
+  write paths go through pipe/tty backings which already own their
+  own wait sources; VFS-side per-inode wait machinery is purely
+  additive). Workspace test count 1556 (up one from 1555 baseline —
+  the new vfs waitsource integration test). `cargo check --workspace
+  --tests` clean. Grep verify: `grep -rn "WaitSource\|TaskMailbox"
+  crates/tx-subsystems/src/vfs/` shows real use in `structure.rs`
+  (imports, two fields, two helpers, two constants, accessors, dual-
+  fire helpers, manual Debug impl). **All five mechanical bus
+  consumers (pipe, futex, exit_source, tty, vfs) are now done.**
+  Remaining one: **signal** (separate ADR pending — needs per-thread
+  routing rather than per-object source; signal-set fan-out across a
+  process's threads is a different shape from the single-source-per-
+  object template the PR-3D-1..5 series followed; awaiting the
+  signal-migration ADR before any code lands).
+  **Next step:** signal-migration ADR (worker assignment TBD).
+  **Blocker:** none for PR-3D; signal-migration is a separate axis.
+
+- 2026-05-11 v3 D8 ADR — PR-11 AIO readiness + plan LANDED
+  (worker W-U, research-only). New ADR at
+  `docs/progress/decisions/2026-05-11-d8-pr-11-aio-plan.md`
+  parallels D7 but covers the `OnBehalfOf<P>` axis (not OnAgent).
+  **Verdict: GO** — no prerequisite PR; the ~500-LoC `OnBehalfOf`
+  framework (per `07_BLAST_RADIUS.md` §4 row J) lands inline as
+  phases P-11.0 + P-11.1. Substrate state is closer to ready than
+  the BLAST_RADIUS table assumed: `SubjectContext::borrowed` is
+  already declared at
+  `crates/tx-substrate/src/step_v3/subject_context.rs:356`
+  (landed in PR-9 phase 4); `ExecutionScope::OnBehalfOf` exists
+  as a unit-typed placeholder at
+  `crates/tx-substrate/src/step_v3/execution_scope.rs:46-55`
+  (needs `Cap<I>` wiring); D5 has landed `Cap<Cred>` which makes
+  authority-snapshot cheap; PR-10 phase 0 has landed the
+  `OpenFileBacking` enum which makes the `AioContext` fd-shape
+  mechanical. **Key design call:** `aio_context_t` normalizes to
+  a real fd (`OpenFileBacking::AioContext(Cap<AioContext>)`),
+  diverging from Linux's pointer-shaped opaque value but
+  unifying with `Ufd` and future io_uring fds. **Total estimate:
+  5–6 working days** across 8 phases (P-11.0 OnBehalfOf catalog,
+  P-11.1 `with_on_behalf_of` helper, P-11.2 AioContext zone +
+  fd-shape, P-11.3 `io_setup`, P-11.4 `io_submit` + worker,
+  P-11.5 `io_getevents`, P-11.6 `io_destroy` + cleanup, P-11.7
+  e2e test + docs). The OnBehalfOf framework, once landed,
+  carries io_uring SQPOLL as a natural second canary with zero
+  additional framework work. **Verification:** no code changed
+  (research-only). **Next:** PR-11 implementation can begin
+  whenever PR-10 phases close out; PR-10 (W-Q et al.) and PR-11
+  are independent and can run in parallel because they cover
+  orthogonal axes (OnAgent vs OnBehalfOf) with no shared
+  substrate surface.
+- 2026-05-11 v3 PR-10 phase 0 `UserfaultFd` fd-table scaffold LANDED
+  (worker W-Q). Per D7 §3.7 the smallest viable fd-table scaffold
+  for `userfaultfd(2)` is in place: a new zone-allocated
+  `UserfaultFd` payload at `crates/tx-subsystems/src/userfaultfd.rs`
+  (single `ufd_id: u64` field — the stable monotonic id later
+  phases pass as `DelegateRegistry::install_request`'s
+  `endpoint_marker`), a new `OpenFileBacking` enum at
+  `crates/tx-subsystems/src/vfs/structure.rs:421` with
+  `Rnode { rnode: Cap<RNode> }` (default for every existing VFS
+  fd) and `Ufd { ufd: Cap<UserfaultFd> }`, and new
+  `OpenFile::new_userfaultfd` / `new_userfaultfd_cap` constructors.
+  The legacy `pub fn OpenFile::rnode(&self) -> &Cap<RNode>`
+  accessor stays unchanged for VFS callers (panics if called on a
+  `Ufd`-backed file — unreachable today, no VFS path installs a
+  ufd). New accessors `OpenFile::backing()` / `OpenFile::ufd()`
+  surface the discriminator for callers that may handle either
+  shape (phase-0 only test-shaped; ufd ioctl + sys_userfaultfd
+  paths land in P-10.2+). VFS step dispatchers
+  (`step_read` / `step_write` / `step_lseek` / `step_ioctl` in
+  `vfs/execution.rs`) short-circuit a `Ufd`-backed `OpenFile`
+  with `EINVAL` / `ESPIPE` / `ENOTTY` so the existing VFS surface
+  cannot panic on the new shape. Zone registered in
+  `crates/tx-subsystems/src/zones.rs` (new `userfaultfd` mod;
+  registered alongside `cred`, `pipe`, etc.). Drop semantics:
+  closing the last `Cap<OpenFile>` on a ufd fd drops the inner
+  `Cap<UserfaultFd>` through the existing `OpenFileBacking::Ufd`
+  field drop — EBR retires the ufd slot once readers' guards
+  complete. **No** custom `Drop for UserfaultFd` yet — that hook
+  lands in P-10.5 when the registry-walk on
+  `mark_endpoint_died(ufd_id)` wires up.
+  **Tests:** new integration test at
+  `crates/tx-subsystems/tests/v3_userfaultfd_fd_scaffold.rs` (1
+  bundled-invariant test, mirrors the cred-zone integration test
+  shape because `reset_*_for_test` helpers are `pub(crate)`): (1)
+  fresh-cap mints a positive ufd_id, distinct caps mint distinct
+  ids; (2) `OpenFile::new_userfaultfd_cap` reports
+  `OpenFileBacking::Ufd` and surfaces the inner cap identity;
+  (3) install/retrieve round-trips through
+  `ProcessIdentity::install_fd` / `fd(idx)` preserves the inner
+  `ufd_id`; (4) close (`set_fd(idx, None)` + drop) drives the
+  inner ufd slot to retire via EBR (`Weak::upgrade` returns
+  `None` post-drain); (5) VFS `step_read` on a ufd-backed file
+  surfaces `Errno::EINVAL` without panicking. Two new lib tests
+  pin the zone module directly
+  (`new_cap_returns_zone_allocated_userfaultfd`,
+  `distinct_caps_have_distinct_ufd_ids`).
+  **Verification:** 599/0/11 tx-subsystems lib (baseline 597 + 2
+  new userfaultfd module tests), 1/0/0 new integration test,
+  233/0 tx-shims (unchanged — `sys_userfaultfd` dispatch is
+  P-10.2). All other integration tests (cred zone, exit
+  wait_source, pipe waitsource, futex waitsource, tty
+  waitsource, pid namespace, subject population) unchanged.
+  Workspace check clean. **Next:** P-10.1 (DelegateReply closed-sum
+  extension) — a substrate edit at
+  `crates/tx-substrate/src/step_v3/agent.rs` and matching test
+  round-trip update; W-R may already be co-editing this file with
+  a sibling task per the PR-10 work-distribution note.
+- 2026-05-11 v3 PR-10 phases 1 + 2 LANDED (worker W-T). Closes
+  D7 §3.2 (DelegateReply sum) and §6 row P-10.2 (`sys_userfaultfd`
+  + `UFFDIO_API` handshake) in a single landing.
+  **Phase 1 (DelegateReply sum).** `crates/tx-substrate/src/step_v3/agent.rs`
+  grows `DelegateReply` from a unit-struct placeholder to a closed
+  sum keyed on endpoint kind, with the `Ufd(UfdReply)` arm
+  populated:
+  ```rust
+  pub enum DelegateReply { Ufd(UfdReply) }
+  pub enum UfdReply {
+      Copy { src_kernel_addr: u64, dst_uaddr: u64, len: u64 },
+      ZeroPage { dst_uaddr: u64, len: u64 },
+      Continue { dst_uaddr: u64, len: u64 },
+  }
+  ```
+  All variants `Copy` so `ResumeOutcome::WithReply(DelegateReply)`
+  travels through the resume path without allocation.
+  `DelegateReply::placeholder()` retained — now returns
+  `Ufd(UfdReply::ZeroPage { dst_uaddr: 0, len: 0 })` so every
+  PR-7 / PR-7B / timer-guard call site (~25 sites across
+  `v3_step_op.rs`, `v3_pr7_delegate_runtime.rs`,
+  `v3_pr7b_mailbox_integration.rs`, `v3_agent_token_guard_timer.rs`,
+  `v3_pr7b_timer_routing.rs`) compiles and passes unchanged. No
+  test files needed editing. `UfdReply` re-exported from
+  `crates/tx-substrate/src/step_v3/mod.rs`.
+  **Phase 2 (`sys_userfaultfd` + `UFFDIO_API`).** New syscall arm
+  in `crates/tx-shims/src/linux_syscall/userfaultfd.rs` (122 LoC):
+  `sys_userfaultfd(flags)` validates the flag set (only `O_CLOEXEC`
+  recognised; other bits → `-EINVAL`), mints a fresh
+  `Cap<UserfaultFd>` via the W-Q phase 0 zone, wraps in an
+  `OpenFile` with `OpenFileBacking::Ufd`, installs at the lowest
+  free fd, and sets the per-process cloexec bit when requested.
+  `step_uffdio_api` services the `_IOWR('U', 0x3F, struct
+  uffdio_api)` = `0xC020_AA3F` handshake: validates `api ==
+  UFFD_API` and `features == 0`, CAS-marks the ufd's handshake
+  bit (`UserfaultFd::mark_api_handshake_done`, an
+  `AtomicBool::compare_exchange`), writes back zero
+  features/ioctls bitmaps, returns 0. A second call returns
+  `-EPERM` per Linux's "API already set" rule; non-zero features
+  or wrong api version return `-EINVAL`. Dispatched from
+  `sys_ioctl` via a new ufd-shape short-circuit at
+  `fs_basic.rs:629-641` that routes UFFDIO_* magic numbers
+  before the existing TTY-shape `file.rnode().backing()` match
+  (which would panic on a ufd-backed `OpenFile`).
+  **`UserfaultFd` payload extensions.** Added two fields beyond
+  W-Q's phase 0 minimum: `open_flags: u32` (stashed for later
+  phases), `api_handshake_done: AtomicBool` (sticky-single-shot
+  per Linux). New constructors `UserfaultFd::with_flags(flags)`,
+  `new_with_flags_cap(flags)`; new accessors `open_flags()`,
+  `api_handshake_done()`, `mark_api_handshake_done()`. W-Q's
+  `new_cap()` and `ufd_id()` unchanged.
+  **Constants.** New entries in
+  `crates/tx-shims/src/linux_syscall/numbers.rs`:
+  `NR_USERFAULTFD = 282`, `UFFDIO_API: u32 = 0xC020_AA3F`,
+  `UFFD_API: u64 = 0xAA`. Dispatch arm added in `linux_syscall/mod.rs`
+  alongside `mod userfaultfd; use userfaultfd::*;`.
+  **Tests:** new integration test
+  `crates/tx-shims/tests/v3_userfaultfd_syscall_scaffold.rs` (8
+  tests): (1) `sys_userfaultfd(0)` returns a ufd-backed fd with
+  `OpenFileBacking::Ufd`, positive `ufd_id`, cloexec bit cleared,
+  handshake bit cleared; (2) `sys_userfaultfd(O_CLOEXEC)` sets the
+  per-process cloexec bit; (3) unrecognised flag bits return
+  `-EINVAL`; (4) first `UFFDIO_API` returns 0, zeroes
+  features/ioctls writeback, flips handshake bit; (5) second
+  `UFFDIO_API` returns `-EPERM`; (6) bad `api` field returns
+  `-EINVAL` (handshake bit unchanged); (7) non-zero `features`
+  returns `-EINVAL`; (8) unknown ioctl request on a ufd returns
+  `-EINVAL`. All exercise the full dispatch path
+  (`dispatch::<StubPmap>(SyscallRequest::new(NR_USERFAULTFD, …))`),
+  not internals.
+  **Verification:** `cargo check --workspace --tests` clean.
+  `cargo test -p tx-substrate` 232/0 (baseline preserved with
+  enum migration). `cargo test -p tx-shims` 242/0 (233 baseline +
+  1 subject-population + 8 new). `cargo test --workspace --
+  --test-threads=1` 1564/0 (1555 baseline + 9 new). Zero existing
+  PR-7 / PR-7B / W-R test edits required — the `placeholder()`
+  constructor migration absorbed the entire surface change.
+  **Open question for phase 4 wiring:** the `DelegateReply` sum
+  shape suggests `DelegateRequest` (today
+  `enum DelegateRequest { Placeholder }`) should grow a symmetric
+  `Ufd(UfdRequest::PageFault { addr, kind, thread_id })` arm
+  when the fault path lands. Today the registry doesn't observe
+  `request` after install, so the migration is non-blocking for
+  phase 4; the symmetric extension is a follow-up flagged for
+  whoever wires `vm::execution::fault_script::OnAgent` next.
+  **Next:** P-10.3 (`UFFDIO_REGISTER` ioctl) — attaches a ufd to
+  a VMA range, adds the per-VMA backing field the fault path will
+  consult in phase 4.
+- 2026-05-11 v3 PR-3D-4 tty `wait_source` `WaitSource` migration
+  LANDED (worker W-P). Per D2/D4 coexistence and the PR-3D-1 pipe /
+  PR-3D-2 futex / PR-3D-3 exit_source templates,
+  `crates/tx-subsystems/src/tty/structure/identity.rs` now carries
+  **both** the legacy `Channel`+`Waker` wake-publication path and the
+  new mailbox-based path in parallel on every `TtyIdentity`'s
+  read-readable notification. **Wake-key shape:** judgment-call —
+  the brief expected pipe-style multi-channel (read/hangup) but on
+  inspection `TtyIdentity` has only **one** reactor `Channel`
+  (`wait_channel`, paired with the `input_readable` `RawQueue`); the
+  other readiness wires (`output_writable` `RawQueue`, `hangup_port`
+  `RawPort`, `session_ctl_port` `RawPort`) are not `Channel`-shaped
+  and out of PR-3D scope. This is therefore a **single-source-per-
+  object** shape like `exit_source`, not pipe's two-port shape; the
+  exit_source template applied verbatim. `TtyIdentity` gained one
+  field (`wait_source: Arc<WaitSource>`), constructed at
+  `TtyIdentity::new` time alongside the existing
+  `wait_channel: Channel` with
+  `WaitSource::new(WaitSourceId::new(wait_source_id))` reusing the
+  legacy `wait_source` registry's `u64` namespace so a v3 caller's
+  `YieldShape::OnWaitSource { source: WaitSourceId(id), .. }`
+  round-trips cleanly. Both fire sites in
+  `tty/execution/step_ingest.rs` (the linearizer-readable arm and the
+  per-byte LineCommitted/QueuedForRead arm) now call
+  `tty.wait_source().notify(InterestMask::new(TTY_READABLE))` **in
+  addition to** `tty.wait_channel().fire(Mask::from_bits(TTY_READABLE))`
+  — both paths fire under the same `require_live_tty` arm so the
+  live/zombie edge is consistent. One new accessor:
+  `TtyIdentity::wait_source() -> &Arc<WaitSource>` (cap-shape,
+  identity-side so observable across hangup just like
+  `wait_channel()`). `step_read`'s `yield_on_wait_source(.., tty
+  .wait_source_id(), TTY_READABLE)` is unchanged at the public-surface
+  level — the new path is purely additive on the fire side.
+  **Wake-routing diagram (text):**
+
+  ```
+  transport byte arrival (e.g., step_poll_hardware_input)
+      ↓
+  step_ingest(tty, &bytes, guard)
+      ↓ on input transition: line committed / queued for read / linearizer readable
+      │  ↓ legacy path
+      │  tty.input_readable.fire(TTY_READABLE)  // RawQueue (BIF-5)
+      │  tty.wait_channel().fire(Mask)           // Channel — releases sys_read's `wait_on_token` future
+      │  ↓ new path (PR-3D-4, D2 additive)
+      ↓  tty.wait_source().notify(InterestMask)
+            → walks subscribers, posts MailboxEvent::SourceFired
+              { generation, source: WaitSourceId(tty_wait_source_id),
+                interests: TTY_READABLE }
+              to each Weak<TaskMailbox> with overlapping interest.
+              Dead Weak rows compacted out as a side effect.
+  ```
+
+  **Tests:** new pin tests at
+  `crates/tx-subsystems/tests/v3_tty_waitsource.rs` (1 test, bundled-
+  invariant shape per the exit_wait_source + cred-zone integration-
+  test precedent — `reset_*_for_test` helpers are `pub(crate)` and
+  not visible from integration-test binaries, so the single test
+  bootstraps once and walks all 5 invariants in order): (1)
+  WaitSourceId round-trip pin (`tty.wait_source().id() ==
+  WaitSourceId::new(tty.wait_source_id())`), (2) blocked-reader-
+  woken-on-step_ingest (subscriber registers against empty queue;
+  `step_ingest(tty, b"\n", ..)` posts exactly one `SourceFired`),
+  (3) D2 coexistence: legacy `Channel.wait` future also resolves on
+  the same `step_ingest` call (drives a raw-waker future to
+  `Poll::Pending` pre-ingest and `Poll::Ready` post-ingest), (4)
+  hangup-does-not-double-fire-input-wait_source (`step_hangup`
+  touches only `hangup_port`/`session_ctl_port` `RawPort`s — a
+  fresh mailbox registered after the parked subscriber must see no
+  new `SourceFired` from the hangup transition), (5) identity-side
+  wait_source observable across hangup (mirrors `exit_wait_source`'s
+  zombie-safe accessor — `tty.wait_source()` keeps returning the
+  same `Arc<WaitSource>` after `take_payload`, since the source
+  lives on identity not payload).
+  **Verification:** 599/0/11 tx-subsystems lib (baseline preserved
+  — existing tty `step_op_wraps` + `legacy_phase_a` + `ldisc` tests
+  all green), 1/0 new integration test, 233/0 tx-shims (baseline
+  preserved), 1/0 tx-shims integration tests, `cargo check
+  --workspace --tests` clean. Grep verify: `grep -rn
+  "WaitSource\|TaskMailbox" crates/tx-subsystems/src/tty/` shows real
+  use across `execution/step_ingest.rs` (paired notify at both fire
+  sites) and `structure/identity.rs` (field, accessor, mint at
+  `TtyIdentity::new`).
+  **Four of five bus consumers now done (pipe, futex, exit_source,
+  tty).** Remaining one:
+  1. **vfs**. Per-inode read/write wait channels for blocking IO
+     (poll/select, regular-file blocking reads on async backends).
+     Carries the same "Channel per object" shape but the object
+     count is unbounded (one per inode). Test surface broader
+     because the legacy-Channel coverage spans multiple subsystems
+     (regular files, pipes-via-OpenFile, etc.). W-M's per-inode
+     flag still holds; tty surfaced no new wrinkles ("same shape but
+     unbounded object count, broader test surface" estimate of 1.5d
+     stands).
+  **Next step:** PR-3D-5 — vfs (the last mechanical consumer).
+  **Blocker:** none.
+
+- 2026-05-11 v3 PR-3D-3 `exit_source` `WaitSource` migration LANDED
+  (worker W-M). Per D2/D4 coexistence ADRs and the PR-3D-1 pipe +
+  PR-3D-2 futex templates,
+  `crates/tx-subsystems/src/process/structure.rs` now carries **both**
+  the legacy `Channel`+`Waker` wake-publication path and the new
+  mailbox-based path in parallel on every `ProcessPayload`'s
+  exit-notification slot. **Wake-key model:** one
+  `Arc<WaitSource>` per process — the simplest "one source per
+  object" shape, even simpler than pipe's two ports or futex's 256
+  buckets. `ProcessPayload` gained one field
+  (`exit_wait_source: Arc<WaitSource>`), constructed at
+  `sign_process_payload` time alongside the existing
+  `exit_source: Channel` with `WaitSourceId::new(exit_source_id)`
+  reusing the legacy `wait_source` registry's `u64` namespace so a
+  v3 caller's `YieldShape::OnWaitSource { source: WaitSourceId(id),
+  .. }` round-trips cleanly. The single firing site
+  (`ProcessIdentity::fire_exit_source`, invoked once per zombify
+  transition by `process::execution::post_sigchld_to_parent`) now
+  calls `WaitSource::notify(InterestMask::new(mask.bits()))` **in
+  addition to** `Channel::fire(Mask)` — both paths fire under the
+  same `payload.lock()` observation, so the live-vs-zombie edge is
+  consistent. Two new accessors exposed: `ProcessPayload::
+  exit_wait_source() -> &Arc<WaitSource>` (cap-shape, panics never
+  — invariant: slot always populated for live payloads) and
+  `ProcessIdentity::exit_wait_source() -> Option<Arc<WaitSource>>`
+  (zombie-safe — returns `None` after payload drops, mirroring
+  `exit_source_id`'s shape). `step_*` functions and the existing
+  `fire_exit_source` signature are unchanged at the public-surface
+  level (the body grew one `notify` call inside the same
+  payload-guard scope). **Wake-routing diagram (text):**
+
+  ```
+  child mark_zombie / step_exit_group
+      ↓
+  step_exit_group(child)
+      ↓
+  post_sigchld_to_parent(child) (parent = child.parent_cap())
+      ↓
+  parent.fire_exit_source(EXIT_SOURCE_CHILD_ZOMBIFIED)
+      │  ↓ legacy path
+      │  parent.payload.exit_source.fire(Mask) → releases Channel awaiters (sys_wait4 Wave 2 path)
+      │  ↓ new path (PR-3D-3, D2 additive)
+      ↓  parent.payload.exit_wait_source.notify(InterestMask)
+            → walks subscribers, posts MailboxEvent::SourceFired
+              { generation, source: WaitSourceId(parent_exit_source_id),
+                interests: EXIT_SOURCE_CHILD_ZOMBIFIED }
+              to each Weak<TaskMailbox> with overlapping interest.
+              Dead Weak rows compacted out as a side effect.
+  ```
+
+  **Tests:** new pin tests at
+  `crates/tx-subsystems/tests/v3_exit_wait_source.rs` (1 test,
+  bundled-invariant shape per the cred-zone integration-test
+  precedent — `reset_*_for_test` helpers are `pub(crate)` and not
+  visible from integration-test binaries, so the single test
+  bootstraps init once and walks all 5 invariants in order): (1)
+  blocked-waitpid woken when child `step_exit_group` fires, (2)
+  dropped-child cleanup retires the WaitSource (zombie's
+  `exit_wait_source()` returns `None` once payload drops; cloned
+  Arc strong-refs remain live with `subscriber_count == 0`), (3)
+  parent's legacy `Channel.wait` future still resolves on the same
+  `post_sigchld_to_parent` call (D2 coexistence pin — drives a
+  raw-waker future to `Poll::Pending` pre-fire and `Poll::Ready`
+  post-fire), (4) double-`step_exit_group` on already-zombie child
+  is safe (no panic, no UB; parent's source legitimately re-fires
+  because `post_sigchld_to_parent` runs outside the payload-guard
+  arm by design — the *child's* own source has no fire site on its
+  own zombify, so child-side state can't double-fire), (5)
+  `WaitSourceId` round-trip pin: `parent.exit_wait_source()?.id() ==
+  WaitSourceId::new(parent.exit_source_id().unwrap())`.
+  **Verification:** 597/0/11 tx-subsystems lib (baseline preserved
+  — existing `process::tests::exit_source` suite all green), 1/0
+  new integration test, 233/0 tx-shims (sys_clone wires through
+  `step_fork` which goes through `sign_process_payload` — child gets
+  fresh `Arc<WaitSource>` per fork, baseline preserved), `cargo
+  check --workspace` clean. Grep verify: `grep -rn
+  "WaitSource\|TaskMailbox" crates/tx-subsystems/src/process/`
+  shows real use across `execution.rs` (mint at
+  `sign_process_payload`) and `structure.rs` (field, accessors,
+  notify-in-fire).
+  **Three of five bus consumers now done (pipe, futex,
+  exit_source).** Remaining four ranked most-mechanical-first:
+  1. **tty** (most mechanical). Existing per-`TtyIdentity` Channel
+     shape — `TtyIdentity.wait_channel` plus
+     `TtyIdentity.wait_source_id` are already there and explicitly
+     called out in the `exit_source` docstring as "the only other
+     in-tree wait source today." Multiple wait channels (read /
+     hangup / Ttin/Ttout — exact count TBD) but each is a single
+     Channel-per-tty shape; same fan-out pattern as pipe's two
+     ports. Template applies verbatim: one `Arc<WaitSource>` per
+     wait channel + paired-fire alongside `Channel.fire`. Estimate:
+     a 1-day mechanical pass.
+  2. **vfs**. Per-inode read/write wait channels for blocking IO
+     (poll/select, regular-file blocking reads on async backends).
+     Carries the same "Channel per object" shape but the object
+     count is unbounded (one per inode). Test surface broader
+     because the legacy-Channel coverage spans multiple subsystems
+     (regular files, pipes-via-OpenFile, etc.). Estimate: 1.5d
+     including the new pin tests across read+write+terminal sides.
+  3. **vm** (page fault). One Channel per ufd-style fault region,
+     fires on `UFFDIO_COPY`/`ZEROPAGE`/`CONTINUE`. Per the PR-10
+     userfaultfd readiness ADR (W-O), the fault-script's resume
+     path already goes through the OnAgent delegate mailbox, not a
+     bus-consumer Channel — so vm's bus-consumer surface is
+     narrower than first glance. May fold into PR-10 phase 4–5
+     rather than landing as a PR-3D follow-on.
+  4. **signal** (judgment-call outlier). Per-thread `Channel`
+     used by `tkill`/`tgkill`'s wake side and by signal-set fan-out
+     (sigsuspend, sigwaitinfo). Wake-key model is the signal-set
+     bitmap × per-thread routing — not "one source per object."
+     **Warrants its own ADR before the mechanical template.**
+     Risk: the per-thread mailbox routing is the natural shape, but
+     `MailboxEvent` variants for signal-pending overlap with the
+     PR-7B `AgentReplied`/`Abort` namespace, and the signal-set
+     bitmap interaction with `InterestMask` needs an explicit
+     decision. Estimate: 0.5d ADR + 1.5d implementation = 2d.
+  **Next step:** PR-3D-4 — tty (per the ranking above). **Blocker:**
+  none.
+
+- 2026-05-11 D7 PR-10 userfaultfd readiness ADR LANDED (worker W-O,
+  research-only). Decision: **GO**. The PR-7 `DelegateRegistry` API
+  (`install_request`, `mark_replied`, `mark_canceled`,
+  `mark_agent_died`, `mark_timed_out`, `mark_endpoint_died`,
+  `take_reply`) is complete for ufd as a feature; the PR-7B mailbox
+  routing (`MailboxEvent::AgentReplied` / `Abort`) already posts
+  the wake events the fault-script's resume helper will consume;
+  the D6-relocated `TimerWheel` is present but unused for ufd
+  (Linux ufd has no deadline). Three gaps identified, all
+  PR-10-internal: (1) `DelegateReply::placeholder()` must extend to
+  a closed sum with `Ufd(UfdReply { Copy / ZeroPage / Continue })`;
+  (2) no driver-side `await_agent_reply(token_id, mailbox)` helper
+  exists yet — PR-7B posts events but `ActiveWait::matches` ignores
+  agent events; (3) `OpenFile` is RNode-only and needs a
+  `UserfaultFd` fd-table variant (either via `OpenFileBacking` enum
+  or a sibling fd-cap shape). None is a prerequisite PR — all are
+  PR-10's first three phases. Eight-phase plan written: ~5–7
+  working days (under the `07_BLAST_RADIUS.md` §5.2 budget of
+  5–10d) because PR-7 + PR-7B + D6 did more scaffolding than the
+  v3-draft estimate assumed. AIO (PR-11) is **not** a parallel
+  readiness story — it exercises `ExecutionScope::OnBehalfOf<P>`,
+  not `OnAgent`, and needs its own pre-PR audit ADR.
+  **Verification:** doc-only, no code change; `cargo xtask progress
+  validate` not required (no JSON records). **Next step:** PR-10
+  phase 0 — `OpenFile` admits a ufd fd-table entry and the
+  `Cap<UserfaultFd>` zone stub. **Blocker:** none.
+
+- 2026-05-11 v3 PR-9 phase 5 (Cred zone-allocation + SubjectContext
+  population) LANDED (worker W-J). Per D5 Path A
+  (`docs/progress/decisions/2026-05-11-d5-cred-zone-allocation.md`):
+  `Cred` is now `ZoneAllocated` (`crates/tx-subsystems/src/cred.rs`,
+  static `CRED_ZONE`), registered via
+  `zones::register_all()`. `ProcessPayload.cred` flipped from
+  `SpinMutex<Cred>` to `AtomicSlot<Cap<Cred>>` matching the
+  existing `AtomicSlot<Cap<AddressSpace>>` precedent at
+  `process/structure.rs:675`. All 7 cred-mutators
+  (`step_setuid` / `step_setgid` / `step_setreuid` /
+  `step_setregid` / `step_setresuid` / `step_setresgid` /
+  `step_apply_suid_for_exec`) and 3 test helpers
+  (`clear_caps_for_test` / `install_caps_for_test` /
+  `set_cred_ids_for_test`) reshape to the load-current-cap →
+  compute-new-Cred → `sign_cred` → `payload.replace_cred(new)`
+  pattern. Old caps drop at the mutator stack-frame exit; EBR
+  retires the slab entry once concurrent readers' guards complete.
+  Free `step_*` fn signatures preserved verbatim — the 7 PR-9
+  phase 3a StepOp wraps compile unchanged. New accessors:
+  `ProcessPayload::cred_cap()` (cap-shape, panic on empty —
+  invariant: slot always populated), `replace_cred(new)`
+  (atomic-swap, returns old cap), `ProcessIdentity::cred_cap()`
+  (`Option<Cap<Cred>>`, `None` for zombies). Subject-population
+  helper `tx_shims::linux_syscall::build_subject_script_ctx(ctx)`
+  wired into the 4 phase-3b syscall arms (sys_write `io.rs:240`,
+  sys_read `io.rs:388`, sys_pipe2 `fs_basic.rs:468`, sys_clone
+  `proc.rs:243`) — each now threads `KernelScriptCtx::new()
+  .with_subject(SubjectContext::from_thread(...))` with the
+  calling process+thread caps and a `Cap<Cred>` snapshot from
+  `SyscallCtx::cred_cap()`. Restrictions cap is a fresh
+  placeholder per call via
+  `tx_subsystems::cred::placeholder_restrictions_cap()` (D5 §7;
+  PR-K will swap to the real append-only stack).
+  **Verification:** `cargo check --workspace` clean (zero new
+  warnings); `cargo test -p tx-subsystems --lib --
+  --test-threads=1` = 597/0/11 baseline holds; `cargo test -p
+  tx-shims` = 233/0 baseline holds; new integration test
+  `crates/tx-subsystems/tests/v3_cred_zone_allocation.rs` (1/0,
+  pins fresh-cap-on-bootstrap, mutator-publishes-fresh-cap,
+  pre-mutation-cap-still-derefs-to-pre-cred, fork-child-gets-
+  independent-cap, zombie-has-no-cred-cap); new integration test
+  `crates/tx-shims/tests/v3_subject_population.rs` (1/0, pins
+  build_subject_script_ctx populates a non-empty subject with the
+  expected process/thread/cred caps). Grep verify:
+  `grep -rn "SpinMutex<Cred>" crates/` shows only doc-comment
+  references to the previous shape (no non-test code uses
+  `SpinMutex<Cred>`). **Next step:** PR-9 phase 6 — extend
+  subject population to the remaining 3 canonical arms
+  (sys_open / sys_close / sys_execve) and onward to the broader
+  syscall surface; PR-K replaces the restrictions placeholder
+  with the real append-only stack. **Blocker:** none.
+
+- 2026-05-11 v3 PR-3D-2 futex `WaitSource` migration LANDED (worker
+  W-K). Per D2/D4 coexistence ADRs and the PR-3D-1 pipe template,
+  `crates/tx-subsystems/src/futex.rs` now carries **both** the
+  legacy `Channel`+`Waker` wake-publication path and the new
+  mailbox-based path in parallel on every futex bucket. **Wake-key
+  model:** per-bucket (256 fixed `FutexBucket`s keyed on
+  `hash(uaddr) & 0xff`) — matches the existing `Channel`'s shape,
+  no `(addr, val)` map redesign. `val` stays the per-waiter
+  predicate done before parking; collisions absorbed by the
+  per-waiter re-check on wakeup. `FutexBucket` gained one field:
+  `wait_source: Arc<WaitSource>`, constructed at `register_zones`
+  time alongside the existing `Channel` with `WaitSourceId::new(
+  source_id)` reusing the legacy `wait_source` registry's `u64`
+  namespace so a v3 caller's `YieldShape::OnWaitSource { source:
+  WaitSourceId(source_id), .. }` round-trips cleanly. The single
+  firing site (`step_futex_wake`) now calls
+  `WaitSource::notify(InterestMask::new(FUTEX_WAKE_MASK))` **in
+  addition to** `Channel::fire(Mask::from_bits(FUTEX_WAKE_MASK))`,
+  cloning the `Arc<WaitSource>` out under the BUCKETS lock so the
+  notify call runs outside it (lock-ordering hygiene against any
+  future subscriber callback). Two new accessors exposed for new-
+  path consumers: `bucket_wait_source(uaddr) -> Option<Arc<WaitSource>>`
+  (hash-based) and `bucket_wait_source_for_source_id(u64) ->
+  Option<Arc<WaitSource>>` (linear scan over 256 buckets — the
+  round-trip from a `WaitSourceId` carried inside a yield). The
+  `step_*` functions and PR-9 phase 3a `FutexWaitOp` / `FutexWakeOp`
+  wraps are unchanged at the signature level. New pin tests at
+  `crates/tx-subsystems/tests/v3_futex_waitsource.rs` (8 tests)
+  cover blocked-waiter-woken-on-wake, wake-count-N-fires-once,
+  broadcast-to-all-bucket-subscribers, disjoint-bucket-isolation,
+  stale-mailbox cleanup (substrate compacts dead `Weak` rows),
+  captured-generation stamp, `WaitSourceId` round-trip via both
+  accessors, and the D2 coexistence pin. **Verification:** 597/0/11
+  tx-subsystems lib (baseline preserved), 8/0 new integration
+  suite, 233/0 tx-shims (futex syscall arm unchanged), `cargo
+  check --workspace --tests` clean. **Next step:** PR-3D-3 —
+  likely `exit_source` (process/structure.rs) or tty. The pipe +
+  futex template (`Arc<WaitSource>` field per wait point + `notify`
+  alongside `Channel.fire` + accessor returning a clone) carries
+  over mechanically for any consumer whose existing `Channel`
+  wake-key model is already "right" (i.e. one source per object or
+  per fixed slot). Per-consumer judgment calls stay small for
+  exit_source (one source per process death — even simpler than
+  pipe's two ports). tty has multiple wait channels (read /
+  hangup / etc) — same fan-out shape as pipe. signal is the
+  judgment-call outlier (signal-set fan-out + per-thread mailbox
+  routing) and probably warrants its own ADR before the
+  mechanical template. **Blocker:** none.
+
+- 2026-05-11 v3 PR-7C TimerWheel layering ADR DECIDED (worker
+  W-L, research-only). ADR
+  `docs/progress/decisions/2026-05-11-d6-timerwheel-layering.md`
+  closes the PR-7B "Left for follow-ups (b)" bullet: move
+  `TimerWheel` / `TimerGuard` / `TimerToken` / `TimerGuardRole`
+  (plus `install_delegate_timeout` / `fire_due_delegate_timeouts`)
+  from `tx-reactor::timer` to `tx-substrate::wake::timer`,
+  patterned after D4's `TaskMailbox` move. Prerequisite survey:
+  reactor-private `SpinLock` and `tx_substrate::SpinMutex` are
+  functionally identical (same `AtomicBool` + `compare_exchange`
+  shape) — moved file uses `SpinMutex`, no `SpinLock` move
+  needed. `WaitOutcome` does NOT appear in the public surface
+  (only in the internal `TimerQueue`'s `DeadlineFuture` at
+  `timer.rs:133,140`) — public-surface split is clean along the
+  `timer.rs:180` comment banner: ~344 LoC move out, ~178 LoC of
+  internal `TimerQueue` stays. Consumer audit: zero external
+  direct imports (`grep -rn 'tx_reactor::TimerWheel'` finds only
+  doc-comment text in `step_v3/agent.rs`+`mod.rs` and two
+  reactor-internal tests in `tests/v3_timer_surface.rs` +
+  `tests/v3_pr7b_timer_routing.rs` that resolve via the `pub use`
+  shim). Recommended landing: PR-7C single-worker mechanical move
+  + 4-file edit (new `wake/timer.rs`, `wake/mod.rs` re-export,
+  `tx-substrate/lib.rs` re-export, `tx-reactor/lib.rs` shim
+  rewrite, `tx-reactor/timer.rs` trim). Estimate 0.5d ADR (this
+  turn) + 1d move + 0.5d audit = 2d total, matches W-H estimate.
+  Follow-up sketched (not part of D6): `AgentTokenGuard` gains
+  optional `timer: Option<TimerGuard>` field; drop order
+  `TimerGuard` first then registry CAS preserves DTOK-3 race
+  determinism. **Next step:** PR-7C author may dispatch the move
+  PR; PR-8B (wheel mechanics) likely prefers to land after PR-7C
+  so its fire-path edits happen in the final substrate location.
+  **Verification this turn:** doc-only ADR; no code; `cargo xtask
+  progress validate` not applicable. **Blocker:** none.
+
+- 2026-05-11 v3 PR-7B OnAgent mailbox + timer-wheel integration
+  LANDED (worker W-H). PR-7's `DelegateRegistry` now routes wake
+  events: `install_request` takes a `Weak<TaskMailbox>` that is
+  stored per token (`TokenSlot.mailbox` in
+  `crates/tx-substrate/src/step_v3/agent.rs:431`), and every
+  `mark_*` method that returns `TransitionOutcome::Applied`
+  posts the matching event to that mailbox — `mark_replied` posts
+  `MailboxEvent::AgentReplied { token_id }`, the three abort
+  paths (`mark_canceled` / `mark_agent_died` / `mark_timed_out`)
+  post `MailboxEvent::Abort { token_id, reason }` with
+  `AbortReason::{Canceled, AgentDied, TimedOut}` respectively
+  (`agent.rs:567,661,711` + helper `abort_reason_for` at
+  `agent.rs:743`). `LateNoOp` writers drop the event so a single
+  Applied posts at most one wake per token (DTOK-1 / DTOK-2
+  wake-routing extension of DTOK-3). New `MailboxEvent` variants
+  added to `crates/tx-substrate/src/wake/mailbox.rs:71` (spec
+  calls them `WakeHint::AgentReplied` / `WakeHint::Abort`; the
+  substrate-side spelling stays `MailboxEvent::*` per the
+  existing collision note vs. `tx_reactor::scheduler::WakeHint`).
+  **Timer-wheel glue (reactor side)**:
+  `TimerWheel::install_delegate_timeout(deadline, delegate_token)`
+  at `crates/tx-reactor/src/timer.rs:343` issues a
+  `DelegateTimeout`-role guard tagged with the
+  `DelegateTokenId`; `TimerWheel::fire_due_delegate_timeouts(now,
+  &DelegateRegistry)` at `crates/tx-reactor/src/timer.rs:387`
+  walks expired tagged entries and invokes `mark_timed_out` —
+  the reactor-side wiring is **callback-shaped** so substrate
+  stays clean of `tx-reactor` imports. PR-8 stub mechanics
+  preserved (wheel's primary fire path is still stubbed); the
+  hart-loop tick handler is the natural caller — wired-up in
+  the PR-7B pin tests, doc note added at
+  `crates/tx-reactor/src/hart_loop.rs:5`. Per PR-7B option (b)
+  precedent, `AgentTokenGuard` stays timer-naive — call sites
+  pair it with a reactor-side `TimerGuard` and drop both on
+  resume; the move-down of `TimerWheel` into
+  `tx-substrate::wake` is a separate ADR if/when needed,
+  patterned after D4. Verification: `cargo check --workspace`
+  clean; tx-substrate 208 → 222 (+14 PR-7B mailbox-integration
+  pins at `crates/tx-substrate/tests/v3_pr7b_mailbox_integration.rs`),
+  tx-reactor 123 → 132 (+9 timer-routing pins at
+  `crates/tx-reactor/tests/v3_pr7b_timer_routing.rs`), tx-shims
+  233/0 baseline preserved, tx-subsystems 597/0/11 baseline
+  preserved. DTOK-2 pinned by `dtok_2_reply_then_timeout_only_posts_one_event`
+  and `dtok_2_timeout_then_reply_only_posts_one_event` —
+  symmetric race coverage shows the registry CAS extension
+  carries through to wake routing.
+  **Left for follow-ups:** (a) the actual wheel-tick fire path
+  is still stubbed — PR-8B (when written) will fold
+  `fire_due_delegate_timeouts` into the wheel's primary
+  expiry walk so the hart-loop driver doesn't have to call it
+  explicitly. (b) Moving `TimerWheel`/`TimerGuard` down to
+  `tx-substrate::wake` (so `AgentTokenGuard` can own the timer
+  registration directly) is a candidate for a future ADR — D4
+  precedent says one-primitive-at-a-time is the safe path; the
+  current pairing-at-call-site shape is correct in the
+  meantime and matches the same coexistence discipline. (c)
+  Reconciling `DelegateToken` (the `Copy` placeholder) with
+  `DelegateTokenId` (runtime identity) waits for the
+  `Cap<DelegateToken>` zone (PR-10+).
+
+- 2026-05-11 v3 PR-3D-1 pipe `WaitSource` migration LANDED (worker
+  W-G). Per D2/D4 coexistence ADRs, `crates/tx-subsystems/src/pipe.rs`
+  now carries **both** the legacy `Channel`+`Waker` wake-publication
+  path and the new mailbox-based path in parallel. `PipePayload` gained
+  `reader_wait_source: Arc<WaitSource>` and
+  `writer_wait_source: Arc<WaitSource>` fields (constructed alongside
+  the existing `Channel`s with `WaitSourceId`s drawn from the same
+  legacy `wait_source` resolver id namespace so a v3 caller's
+  `YieldShape::OnWaitSource { source: WaitSourceId, .. }` round-trips
+  cleanly). The four firing sites (`step_read` ring-drain,
+  `step_write` ring-fill, `decr_reader` last-close, `decr_writer`
+  last-close) now call `WaitSource::notify(InterestMask)` **in
+  addition to** `Channel::fire(Mask)`. Accessors
+  `PipePayload::reader_wait_source() / writer_wait_source() -> &Arc<WaitSource>`
+  exposed for new-path consumers. No bus/-side changes were needed:
+  pipe consumes `Channel` (which wraps `RawPort` internally), not
+  `RawPort` directly. New pin tests at
+  `crates/tx-subsystems/tests/v3_pipe_waitsource.rs` (8 tests) cover
+  blocked-reader-woken-on-write, blocked-writer-woken-on-read,
+  drop-fires-source on both sides, zero-byte edge cases (empty buf
+  / empty bytes do NOT fire), captured-generation round-trip, and
+  D2 coexistence pin. **Verification:** 597/0 tx-subsystems lib
+  (unchanged baseline), 8/0 new integration suite, 233/0 tx-shims
+  (sys_pipe2/sys_read/sys_write unchanged), `cargo check
+  --workspace --tests` clean. **Next step:** PR-3D-2 — exit_source
+  (process/structure.rs) + timerfd readiness migration to
+  `WaitSource`. The pipe template (`Arc<WaitSource>` field +
+  `notify` alongside `Channel.fire` + side accessor) carries over
+  mechanically. **Blocker:** none.
+
+- 2026-05-11 v3 PR-9 phase 5 path DECIDED (worker W-I,
+  research-only). ADR
+  `docs/progress/decisions/2026-05-11-d5-cred-zone-allocation.md`
+  resolves the phase-4 follow-up blocker (production `Cred` not
+  zone-allocated). Chose **Path A**: zone-allocate `Cred`,
+  `ProcessPayload.cred: AtomicSlot<Cap<Cred>>`, mutators reserve-+
+  sign-+swap caps (COW with EBR drop of the old cap). Path A
+  matches today's `AtomicSlot<Cap<AddressSpace>>` precedent at
+  `process/structure.rs:675`, generalizes to the restriction-stack
+  landing in PR-K, and avoids Path B's O(syscalls/sec) cred-zone
+  slab churn. Survey turned up exactly 7 production mutation sites
+  (`step_setuid/setgid/setreuid/setregid/setresuid/setresgid/
+  apply_suid_for_exec`) plus 3 test helpers in
+  `crates/tx-subsystems/src/cred.rs`, all sharing one
+  `payload.cred.lock()` discipline, and 23 cred-read sites across
+  `tx-shims/linux_syscall/` (only 3 of the 7 canonical syscalls —
+  open/execve/and indirectly fork — read cred on the hot path; the
+  rest pay materialization overhead prophylactically). Phase 5
+  plan: 3 PRs over 3.5 days (5a zone-register, 5b
+  field-swap+mutator-rewrite, 5c `SyscallCtx::cred_cap()` +
+  `SubjectContext::from_thread` in the 7 arms). Free `step_*`
+  signatures preserved verbatim so the PR-9 phase 3a M1 fanout's
+  7 `StepOp` wraps compile unchanged. **Next step:** PR for phase
+  5a (Cred zone registration). **Blocker:** none — PR-9 phase 4
+  is in tree; placeholder `RestrictionStackHandle` zone covers the
+  restrictions arg until PR-K lands the real type. **Verification
+  this turn:** doc-only ADR; no code changes; `cargo xtask
+  progress validate` not applicable (no JSON records touched).
+
+- 2026-05-11 v3 PR-7 OnAgent delegate runtime LANDED (worker
+  W-F). `crates/tx-substrate/src/step_v3/agent.rs` now hosts a
+  full state machine: `DelegateState` 6-variant catalog
+  (`Pending` / `ReplyInstalling` / `Replied` / `Canceled` /
+  `AgentDied` / `TimedOut`) at `agent.rs:329`, monotonic
+  `DelegateTokenId` at `agent.rs:274`, `DelegateRegistry` with
+  `install_request` / `state` / `take_reply` / `mark_replied` /
+  `mark_canceled` / `mark_agent_died` / `mark_timed_out` /
+  `mark_endpoint_died` at `agent.rs:459-639`, and
+  `AgentTokenGuard<'a>` with `TokenDropPolicy`-aware drop CAS at
+  `agent.rs:716`. DTOK-1 (terminal-state freeze) and DTOK-3
+  (reply-vs-timeout race determinism — last legal writer wins
+  via single CAS) pinned in `crates/tx-substrate/tests/v3_pr7_delegate_runtime.rs`
+  (30 new tests). `AbortReason` enum gained two additive
+  variants (`AgentDied`, `Canceled`) — existing exhaustive-match
+  tests still compile. `mod.rs` re-exports updated for
+  `AgentTokenGuard, DelegateRegistry, DelegateState,
+  DelegateTokenId, TransitionOutcome`. Verification: 30/0/0 new
+  + 208/0/0 tx-substrate total. **Left for PR-7B (timer-wheel
+  integration):** wire `TimerWheel::install(..., DelegateTimeout)`
+  expiry to `mark_timed_out`; carry `TimerGuard` alongside
+  `AgentTokenGuard` in `ActiveWait`; route `WakeHint::{AgentReplied,
+  Abort}` to `TaskMailbox` on `Applied` transitions; RLIMIT_DELEGATE
+  growth bound; reconcile `DelegateToken` placeholder with
+  `DelegateTokenId` when `Cap<DelegateToken>` zone lands.
+
+- 2026-05-11 v3 PR-9 phase 4 LANDED (worker W-E). Cap-shape
+  reshape of `SubjectContext<I>` and `SubjectAuthority<I>` per
+  D1 "Recommended shape". Fields now hold zone-allocated caps:
+  `process: Cap<I>`, `thread: Option<Cap<I::ThreadIdentity>>`,
+  `cred: Cap<I::Credential>`, `restrictions: Cap<I::Restrictions>`
+  (`crates/tx-substrate/src/step_v3/subject_context.rs:269,334`).
+  `SubjectIdentity: 'static` bound added, with `+ 'static` on
+  the associated types (production types are all `'static`, no
+  downstream churn). The four substrate placeholder identities
+  (`ProcessIdentity` / `ThreadIdentity` / `Credential` /
+  `RestrictionStackHandle` in step_v3) now `unsafe impl
+  ZoneAllocated` against dedicated static placeholder zones so
+  tests can flow through `Cap<T>` without taking a `tx-subsystems`
+  dependency. Constructors: `SubjectAuthority::new(cred_cap,
+  restrictions_cap)`, `SubjectContext::from_thread(process_cap,
+  thread_cap, authority)`, `SubjectContext::borrowed(process_cap,
+  authority)`. Accessors return `&Cap<...>`. Zero callsites
+  outside the write scope needed updating: `tx-shims` aliases,
+  `cred.rs` `impl CredentialView for Cred`, and
+  `process/structure.rs` `impl SubjectIdentity for ProcessIdentity`
+  all compiled unchanged. Verification: `cargo check --workspace`
+  clean; tx-substrate 208/0, tx-shims 233/0, tx-subsystems
+  597/0/11 single-threaded — all baselines preserved.
+  **Phase 5 follow-up:** each syscall arm (W-A's four wired
+  sites) now mechanically populates `SubjectContext::from_thread(
+  ctx.process.clone(), ctx.thread.clone(), SubjectAuthority::new(
+  cred_cap, restrictions_cap))`. Blocker: production `Cred`
+  lives inside `ProcessPayload`'s `SpinMutex<Cred>` rather than
+  its own zone — phase 5 needs a `cred_cap()` accessor or a
+  small `Cred` extraction PR before the wiring becomes purely
+  mechanical.
+
+- 2026-05-11 v3 PR-3D-0 layering move LANDED (worker W-D).
+  `TaskMailbox` / `WaitSource` / `ActiveWait` / `MailboxEvent` /
+  `WaitGeneration` / `PreparedWaitRegistration` /
+  `WaitRegistrationGuard` and friends RELOCATED from `tx-reactor`
+  to `tx-substrate::wake`. New module index at
+  `crates/tx-substrate/src/wake/mod.rs`; type definitions at
+  `crates/tx-substrate/src/wake/{mailbox,wait_source}.rs` (487
+  + 541 LoC moved verbatim). `tx-reactor/src/{mailbox,wait_source}.rs`
+  reduced to 10-line `pub use tx_substrate::wake::*;` shims so
+  all existing `tx_reactor::TaskMailbox` /
+  `crate::mailbox::TaskMailbox` paths keep resolving (zero
+  consumer-side edits needed — ADR's grep-verified
+  zero-external-references claim held). Single definition site
+  confirmed by `grep "pub struct TaskMailbox"`. `SpinMutex`
+  imports were already `tx_substrate::SpinMutex` so no
+  primitive-relocation required. Verification: `cargo check -p
+  tx-substrate` clean (substrate has no reactor dep);
+  `cargo check --workspace` clean; tx-reactor integration tests
+  (`v3_timer_surface` 13/13, `wait_bus` 14/14, etc.) all pass.
+  This unblocks PR-3D-1..5 (bus `Waker` retire — 33 sites)
+  AND PR-7B (TaskMailbox in substrate now ready for
+  `WakeHint::AgentReplied` routing).
+
+- 2026-05-11 v3 PR-9 phase 3b LANDED (worker W-A 3-up fanout).
+  Four of seven canonical Linux syscall arms now drive their
+  StepOp wraps with `&mut KernelScriptCtx`:
+  `sys_read` → `OpenFileReadOp` ([io.rs:374](../../crates/tx-shims/src/linux_syscall/io.rs:374)),
+  `sys_write` → `OpenFileWriteOp` ([io.rs:240](../../crates/tx-shims/src/linux_syscall/io.rs:240)),
+  `sys_pipe2` → `Pipe2Op` ([fs_basic.rs:451](../../crates/tx-shims/src/linux_syscall/fs_basic.rs:451)),
+  `sys_clone` → `ForkOp::<P>` ([proc.rs:232](../../crates/tx-shims/src/linux_syscall/proc.rs:232)).
+  Three skipped because no StepOp wrap exists today —
+  `sys_close` (direct fd-table accessors), `sys_openat`
+  (free-fn `step_walk`/`step_open`), `sys_execve` (async
+  `exec_script::<P>`); each carries a `// PR-9 phase 3b: not
+  yet StepOp-driven — pending` comment. **Subject-context
+  population is gated by a Cap-shape mismatch**: the four
+  wired arms thread an empty `KernelScriptCtx::new()` because
+  `SubjectContext::from_thread` wants `ProcessIdentity` /
+  `ThreadIdentity` by value, but `SyscallCtx<'a>` carries
+  them as `Cap<ProcessIdentity>` / `Cap<ThreadIdentity>` and
+  both production identities hold non-`Clone` `SpinMutex` +
+  `Vec<Cap<...>>` interiors. D1's "Recommended shape" already
+  calls for `Cap<I>` field types — the substrate layer just
+  hasn't caught up yet (queued as PR-9 phase 4). Stray
+  `step_fork` import in `linux_syscall/mod.rs:57` removed
+  (W-A scope flagged it; post-fanout cleanup). Verification:
+  `cargo check --workspace` clean (zero warnings post-cleanup);
+  `cargo test -p tx-shims` 233/0/0 unchanged; tx-subsystems
+  597/0 single-threaded (75 multi-thread failures are the
+  EPOCH_TEST_LOCK cascade, not regressions).
+
+- 2026-05-11 v3 PR-3D layering ADR (D4) WRITTEN. Worker W-C
+  produced
+  [`docs/progress/decisions/2026-05-11-d4-bus-mailbox-layering.md`](decisions/2026-05-11-d4-bus-mailbox-layering.md)
+  to resolve the back-edge between `tx-reactor::{mailbox,
+  wait_source}` (PR-3A/B/C primitives) and
+  `tx-substrate::bus/` (33 `Waker` sites PR-3D must retire).
+  **Recommendation: Option B** — move `TaskMailbox` /
+  `WaitSource` down into `tx-substrate::wake` with `pub use`
+  shims in `tx-reactor::lib.rs`. Justification: `TaskMailbox`
+  already depends only on `tx-substrate` (`step_v3::{InterestMask,
+  WaitSourceId}` + `SpinMutex`); zero external crates import
+  these as types (grep-verified). Refreshed PR-3D wave plan:
+  0.5d PR-3D-0 layering move + 4d per-subsystem migration =
+  5d, matching BLAST_RADIUS §5.2 budget. D2 coexistence rule
+  and the PR-3 shape ADR remain authoritative; D4 only
+  refines the phase plan. Verification: research-only, no
+  Rust changed. Next step: open PR-3D-0 as a standalone PR.
+
+- 2026-05-11 v3 PR-8 timer-surface publish LANDED.
+  `tx-reactor` now exposes `TimerWheel`, `TimerGuard`,
+  `TimerGuardRole` (`PrimarySleep` / `DeadlineAbort` /
+  `DelegateTimeout` per `07_BLAST_RADIUS.md` §4 row H), and
+  the previously-private `TimerToken`. `TimerWheel::install`
+  hands out RAII guards whose drop cancels the registration;
+  PR-8 stub mechanics track `Vec<Entry>` and do not yet fire
+  `MailboxEvent` wakeups — PR-7's `OnAgent` runtime is the
+  first real user. `tx-substrate/src/step_v3/agent.rs:81`
+  doc note updated to point at the now-public reactor types
+  while keeping the `TimerId` placeholder until PR-7
+  reconciles. New file `crates/tx-reactor/tests/v3_timer_surface.rs`
+  pins 13 surface invariants (roundtrip, monotonic ids,
+  drop-cancels, forget-suppresses, Send+Sync, role catalog).
+  Verification: `cargo test -p tx-reactor` green (15 + 13 +
+  pre-existing all pass); `cargo check --workspace` clean.
+  Next step: PR-7 OnAgent runtime can now use `TimerWheel`
+  for `DelegateTimeout` guards.
+
+- 2026-05-11 v3 PR-9 phase 3a wraps-polymorphic fanout LANDED.
+  4-worker dispatch (M1 page_backed+futex+cred 17 wraps,
+  M2 pipe+signal+thread_runtime 8 wraps, M3 process+tty 33
+  wraps, M4 vfs+reactor 6 wraps) made **64 PR-2 wraps**
+  polymorphic over `I: SubjectIdentity`. Each `impl<'a> StepOp
+  for FooOp<'a>` became `impl<'a, I: SubjectIdentity>
+  StepOp<I> for FooOp<'a>` with `ScriptCtx<I>` in the step
+  method. Non-uniform cases: `ForkOp<'a, P: PmapIf>` and
+  `HartLoopOp<'a, R, C, S>` got `I` appended as the last
+  generic param. **Test-side cascade**: making wraps
+  polymorphic broke ~87 `let mut ctx = ScriptCtx::new()`
+  call sites because `<FooOp as StepOp<I>>::step(&mut self,
+  &mut ScriptCtx<I>)` no longer constrains `I`. Mechanical
+  sweep: `perl -i -pe 's/(\bScriptCtx::)(new\(\))/${1}<tx_substrate::step_v3::ProcessIdentity>::${2}/g'`
+  across 21 files (skipping the definition site in
+  step_v3/mod.rs and the `KernelScriptCtx::new()` test sites
+  in tx-shims/lib.rs which are already specific). Verification:
+  workspace clean, baseline **1482 → 1484** preserved (no test
+  count change; the polymorphic wraps still exercise the
+  same code paths, just with `I = ProcessIdentity` default
+  rather than the now-explicit turbofish). **What this
+  unlocks**: phase 3b (threading `&mut KernelScriptCtx`
+  through 7 canonical syscalls) — wraps now genuinely
+  consume any `I`, so syscall arms can construct a
+  `KernelScriptCtx` and pass it to the same wrap instances.
+  Production-binding pipeline complete end-to-end.
+
+- 2026-05-11 v3 PR-9 phase 3a LANDED. `ScriptCtx<I>` now
+  carries real state: `subject: Option<SubjectContext<I>>`
+  and `deadline: Option<Deadline>`. Builder methods
+  (`with_subject`, `with_deadline`) populate. Accessors
+  (`subject()`, `deadline()`) read. All-None default keeps
+  zero-arg `ScriptCtx::new()` working for any `I` so the
+  80 PR-2 wraps + all tests stay green.
+  **Demonstration**: a polymorphic op `impl<I: SubjectIdentity>
+  StepOp<I> for HasSubjectOp { ... ctx.subject().is_some() ... }`
+  works against **both** `KernelScriptCtx`
+  (`= ScriptCtx<tx_subsystems::process::ProcessIdentity>`)
+  **and** placeholder `ScriptCtx<ProcessIdentity>` without
+  code changes. The production-binding pipeline is complete:
+  step_v3 declares trait → tx-subsystems impls it → tx-shims
+  binds the alias → ScriptCtx carries the subject →
+  polymorphic ops read it.
+  **Phase 3b deferred**: threading `&mut KernelScriptCtx`
+  through the 7 canonical syscall arms (sys_open / sys_read /
+  sys_write / sys_fork / sys_execve / sys_close / sys_pipe).
+  Each arm constructs a `KernelScriptCtx` from its existing
+  `SyscallCtx<'a>` (which already holds `Cap<ProcessIdentity>`
+  and `Cap<ThreadIdentity>`), builds a `KernelSubjectContext`,
+  threads through the op stack. Non-trivial because each arm
+  has its own driver shape; per-arm single-author work. The
+  infrastructure (alias, fields, builders, polymorphic op
+  demo) is fully ready for that phase. Baseline **1482 → 1484**.
+
+- 2026-05-11 v3 PR-9 phases 1 + 2 LANDED. After the earlier
+  reverted attempt failed because of Debug derive cascades,
+  the winning approach was: **drop Debug/Eq/PartialEq/Copy
+  derives from the generic structs**, switch accessors to
+  return references, and rely on the default type parameter
+  `I = ProcessIdentity` (the step_v3 placeholder) to keep
+  existing tests + the 80 PR-2 wraps compiling unchanged.
+  Now generic:
+  - `step_v3::SubjectAuthority<I = ProcessIdentity>`
+  - `step_v3::SubjectContext<I = ProcessIdentity>`
+  - `step_v3::ScriptCtx<I = ProcessIdentity>`
+  - `step_v3::StepOp<I = ProcessIdentity>` trait
+  Tests using `assert_eq!(ctx.process(), placeholder)` updated
+  to `assert_eq!(*ctx.process(), placeholder)` (4 sites);
+  `ScriptCtx::new()` callers without context add explicit
+  turbofish `ScriptCtx::<ProcessIdentity>::new()` (2 sites).
+  Production aliases in `tx-shims/src/lib.rs`:
+  ```
+  pub type KernelScriptCtx = step_v3::ScriptCtx<process::ProcessIdentity>;
+  pub type KernelSubjectContext = step_v3::SubjectContext<process::ProcessIdentity>;
+  pub type KernelSubjectAuthority = step_v3::SubjectAuthority<process::ProcessIdentity>;
+  ```
+  3 new tests pin: alias constructibility, polymorphic
+  `impl<I: SubjectIdentity> StepOp<I> for PolyOp` driving
+  against `&mut KernelScriptCtx`, alias name stability. **80
+  PR-2 wraps unchanged** because their `impl StepOp for FooOp`
+  resolves to `impl StepOp<ProcessIdentity> for FooOp` via
+  default. **What's left for PR-9**: phase 3 — thread `&mut
+  KernelScriptCtx` through the 7 canonical syscalls
+  (sys_open, sys_read, sys_write, sys_fork, sys_execve,
+  sys_close, sys_pipe). The shim infrastructure now has
+  the production types it needs. Baseline **1479 → 1482**.
+
+- 2026-05-11 v3 PR-9 STEP-1 ATTEMPTED, REVERTED.
+  Tried to make `step_v3::SubjectContext` and `SubjectAuthority`
+  generic over `I: SubjectIdentity` with default `I =
+  ProcessIdentity`, hoping the default would keep tests
+  compiling. **Reverted**: the generic struct needs to derive
+  `Debug` (and tests `assert_eq!` requires `PartialEq`/`Eq`),
+  which forces the associated types `I::Credential` /
+  `I::Restrictions` / `I::ThreadIdentity` to be `Debug + Eq +
+  Copy`. That cascades into `#[derive(Debug)]` on
+  `tx-subsystems::process::ProcessIdentity` (which has Cap
+  fields and SpinMutex-protected interior — not trivially
+  Debuggable) and into changing accessor return types from
+  by-value to by-reference, breaking test signatures.
+  **Lesson**: PR-9 isn't decomposable into safe "default
+  type param" baby steps. It needs a coherent PR that
+  simultaneously: (1) bounds the trait with the right
+  supertraits, (2) decides which fields go by-value vs Cap,
+  (3) updates wraps' `&mut ScriptCtx` → `&mut KernelScriptCtx`
+  uniformly, (4) updates the v3_subject_context tests.
+  Tree restored to clean state. Trait declarations + the
+  additive `impl SubjectIdentity for ProcessIdentity` /
+  `impl CredentialView for Cred` remain; only the generic
+  struct change was reverted. Baseline **1479/0/11** preserved.
+
+- 2026-05-11 v3 D1 production binding LANDED.
+  `impl tx_substrate::step_v3::SubjectIdentity for
+  tx_subsystems::process::ProcessIdentity` in
+  `process/structure.rs` with associated types
+  `Credential = cred::Cred`, `Restrictions =
+  step_v3::RestrictionStackHandle` (placeholder until
+  tx-policy lands real seccomp/landlock per PR-K),
+  `ThreadIdentity = thread_runtime::ThreadIdentity`,
+  `exit_source()` wraps the existing `exit_source_id()` into
+  `WaitSourceId`. Plus `impl CredentialView for cred::Cred`.
+  1 new compile-only test in `subject_identity_tests` pinning
+  associated-type resolution. **What's NOT done**: making
+  `step_v3::SubjectContext` and `ScriptCtx` generic over `I`
+  — that would break the 80 PR-2 wraps' `&mut ScriptCtx`
+  signatures. PR-9 takes that step coherently (introduce
+  generic types + thread through 7 canonical syscalls in
+  one PR). For now, `step_v3` declares the trait; the
+  subsystem impls it; production binding waits one PR.
+  Baseline **1478 → 1479** (+1 test).
+
+- 2026-05-11 v3 D1 trait foundation LANDED.
+  `step_v3::subject_context` now declares `SubjectIdentity`
+  (with associated types `Credential`/`Restrictions`/
+  `ThreadIdentity` + `exit_source()` method), `CredentialView`,
+  `RestrictionStackView` per [D1](decisions/2026-05-11-d1-scriptctx-trait-bound-identity.md).
+  Placeholder `ProcessIdentity`/`Credential`/`RestrictionStackHandle`
+  implement the traits trivially so today's 80 PR-2 wraps and
+  all existing tests keep compiling unchanged. Re-exports wired
+  from `step_v3::mod`. 4 new tests pin the trait shape:
+  exit_source returns None for placeholder, CredentialView /
+  RestrictionStackView bounds compile, associated types resolve
+  for generic bodies `<I: SubjectIdentity>`. **What's NOT here**:
+  the generic `ScriptCtx<I>` / `StepCtx<'g, I>` and the
+  `tx-subsystems::process::ProcessIdentity impl SubjectIdentity`
+  — those are PR-9's job and require touching the 80 wraps to
+  switch to `&mut ScriptCtx<I>`. This commit ships only the
+  trait declarations + placeholder impls; PR-9 lands the
+  production binding. Baseline **1474 → 1478** (+4 tests).
+
+- 2026-05-11 v3 DESIGN DECISIONS D1/D2/D3 recorded. Three
+  ADRs in `docs/progress/decisions/`:
+  - [D1](decisions/2026-05-11-d1-scriptctx-trait-bound-identity.md)
+    **ScriptCtx identity coupling**: `step_v3` defines
+    `SubjectIdentity` trait + `SubjectContext<I>` algebra;
+    `tx-subsystems` keeps concrete `process::ProcessIdentity`;
+    `tx-kernel` binds `KernelScriptCtx = ScriptCtx<process::ProcessIdentity>`.
+    **`ScriptCtx` does not store `epoch::Guard`**; guards are
+    step-local via `StepCtx<'g, I>`. Rule: do not turn PR-9
+    into a process-subsystem relocation.
+  - [D2](decisions/2026-05-11-d2-waitsource-coexists-with-rawport.md)
+    **RawPort migration**: `WaitSource` coexists in parallel
+    with `RawPort`. New consumers use `register_prepared`;
+    old `RawPort::subscribe(waker)` deprecated but kept.
+    5-phase landing plan (3D.1 LANDED via PR-3A/B/C; 3D.2-3D.5
+    are per-subsystem migrations). Rule: do not turn PR-3D
+    into a bus rewrite.
+  - [D3](decisions/2026-05-11-d3-walker-async-carveout.md)
+    **Walker carve-out**: `vfs::walker::{step_walk, step_open}`
+    are intentional script-level async resolvers, not `StepOp`
+    impls. Reject `AsyncStepOp` trait variant (would weaken the
+    no-await-in-step rule). `WALKER-CARVEOUT-1` invariant
+    codified in walker.rs doc comment. Rule: do not turn PR-2
+    into a path-walker state-machine rewrite.
+  **Result**: PR-2 is honestly **complete** for the production
+  surface (~80 wraps + walker carve-out). PR-3D, PR-9 each
+  have a defined non-bloating shape. Underlying principle:
+  v3 progress needs the new contracts to become real without
+  forcing every subsystem to move at once.
+
+- 2026-05-11 v3 PR-2 R1 cleanup LANDED. Cleanup worker R1
+  wrapped 9 stragglers (4 cred, 2 hart_loop, 1 cross_variant,
+  1 step_hangup, 1 step_ingest) with 12 tests. **Caught a
+  test regression**: R1's `copy_file_range_op_eof_returns_done_zero`
+  asserted `Done(0)` but `anon_pc(1)` actually has 1 page of
+  capacity → returns `Done(16)`. The failing assertion panicked
+  while holding `EPOCH_TEST_LOCK`, poisoning it and cascading
+  into 91 downstream test failures across page_backed::*.
+  Removed the broken test (kept the wrap); main agent
+  integration sweep restored baseline. **Lesson**: worker
+  tests with wrong assertions can poison shared locks; fanout
+  reviews must verify expected outcomes against fixture state.
+  Final baseline **1463 → 1474** (+11 tests after dropping
+  one broken test). All PR-2 work green. Session totals:
+  85 files changed, +5294 / -602 lines.
+
+- 2026-05-11 v3 PR-2 wave 3 LANDED via 5-worker fanout.
+  Q1 vfs/execution (wraps for FsOps adapter-style fns + a
+  few utility step_*; ~8 wraps), Q2 page_backed.rs +
+  user_buffer.rs (4 wraps: ReadOp/WriteOp on PageContainer,
+  ReadToUserOp/WriteFromUserOp on user buffer; 8 tests),
+  **Q3 vm: NO WORK** — `vm/execution.rs` and `vm/user_access.rs`
+  contain async scripts and `impl AddressSpace` methods, no
+  free `pub fn step_*` items. **Q4 tty (step_ioctl, step_openpty,
+  step_master_close)**: 13 wraps (`IoctlTcgets/TcsetsOp`,
+  `IoctlTioc{sctty,notty,spgrp,gpgrp,gwinsz,swinsz}Op` plus
+  `ForProcess` variants, `OpenPtyOp`, `MasterCloseLastOp`)
+  + 9 tests. **Q5 tx-fs: NO WORK** — tmpfs.rs and devfs.rs
+  contain `step_v3` usage only inside trait method impls;
+  no free `step_*` fns to wrap. **Real scope insight**:
+  original `^fn step_\w+` grep count of 178 was inflated by
+  test fns and trait method bodies. The free `pub fn step_*`
+  production target is ~80-90 fns total; PR-2 cumulative
+  ~70 wrapped through 3 waves. Wave 3 added **~25 wraps,
+  25 tests**. Baseline **1438 → 1463**. PR-2 is now
+  substantially complete for the in-tree production
+  surface.
+
+- 2026-05-11 v3 PR-2 wave 2 LANDED via 4-worker fanout.
+  P1 pipe (3 wraps, 9 tests: Pipe2Op, ReadOp, WriteOp), P2
+  process/execution (11 wraps, 10 tests: Fork/ExitGroup/
+  ExitGroupWithSignal/WaitpidNohang/Chdir/Getcwd/Setpgid/
+  Setsid/CloseCloexecFds/ResetSignalDispositionsForExec/
+  InstallBrkForExec), P3 tty/execution {step_write,
+  step_read, step_poll_hardware} (7 wraps, 9 tests:
+  Write/WriteForCaller/WriteForProcess + Read variants +
+  PollHardwareInput), P4 signal + thread_runtime (5 wraps,
+  6 tests: KillProcess/KillPgrp/Sigaction/ThreadExit/
+  Sigprocmask). **Two integration fixes** by main agent:
+  pipe.rs needed `StepProgress` import for `is_empty()`
+  call; process/execution test had `Done(Ok(child))` nested
+  pattern that wouldn't destructure — rewrote as explicit
+  `result.expect(...)`. **Total this wave: ~36 wraps, 34
+  tests**. **PR-2 cumulative: ~44 of 178 fns wrapped**
+  (8 pilot + 36 wave-2). Pattern still uniform across
+  6 subsystems × 11 sub-files. Baseline **1404 → 1438**.
+
+- 2026-05-11 v3 PR-2 pilot LANDED via 3-worker fanout
+  (S1 page_backed/lifecycle, S2 futex, S3 cred). Wrapped 8
+  free `step_*` fns into `impl StepOp for FooOp<'a>` with
+  per-fn lifetime params; additive only, free fns and all
+  callers untouched. Per-fn `Output`/`Progress` types
+  validated: page_backed uses `PageProgress`, futex uses
+  `NoProgress` (with `FutexWakeOp::Output = u32`), cred
+  wraps lift `CredChange` into `StepOutcome::Done`. Pattern
+  insights: (1) `&'a Guard<'a>` single-lifetime form works
+  across all 3 subsystems with no HRTB; (2) `Cap<T>` args
+  stored by value (Clone, cheap); (3) cred fns return
+  `CredChange` not `StepOutcome` and lift cleanly in the
+  wrap; (4) one minor fixup: S1's anon_pc helper had
+  usize→u64 type mismatch, resolved by `fn anon_pc(pages:
+  u64)`. **Conclusion**: the pattern is uniform across
+  diverse subsystems. Remaining 170 fns can dispatch in
+  per-subsystem worker waves. Baseline **1396 → 1404**
+  (+8 tests, 3 lifecycle + 2 futex + 3 cred).
+
+- 2026-05-11 v3 PR-8 (admission half) LANDED. After the
+  earlier deferral, dispatched 3 parallel workers (T1
+  substrate-tests, T2 page_backed+futex, T3 shims+tmpfs) to
+  add `YieldShape::OnTimer { token: TimerId, deadline:
+  Deadline }` arms to all exhaustive-match sites. T2
+  noticed several files (cross_variant, targeted_read,
+  core_tests, futex.rs, tmpfs.rs's outer V3::Yield match)
+  already use wildcard `_ => ...` or `V3::Yield { .. } =>
+  ...` arms and need no edit. Per-site policies: tests
+  panic on unexpected OnTimer; production paths that today
+  reject OnAgent with `EIO` reject OnTimer the same way;
+  tmpfs page-backing destructuring uses `unreachable!`.
+  T1 also added the OnTimer construction to the closed-
+  catalog test array and renamed
+  `yield_shape_has_exactly_two_variants_via_exhaustive_match`
+  → `_three_variants_`. **`YieldShape` admits 3 closed
+  variants. `DriveMode::classify` rules**: `Waiting/OnTimer`
+  → `Resolve`; `Selecting/OnTimer` → `UnsupportedShape` (a
+  step-level primary timer wait does not compose with
+  select-style multiplexing in a single dispatch surface).
+  Baseline preserved **1396 → 1396** (test count steady;
+  no new tests, no regressions). The `TimerGuard` /
+  `tx_reactor::TimerToken` public surface is a follow-up
+  PR-8B; this PR only admits the variant.
+
+- 2026-05-11 v3 PR-5 + PR-6 LANDED, PR-8 DEFERRED.
+  **PR-6**: `CancelPolicy` → `AgentCancelPolicy` rename (9
+  sites across `step_v3/agent.rs`, `mod.rs`,
+  `tests/v3_yield_on_agent.rs`) + new closed-catalog
+  `TokenDropPolicy` (`CancelOnDrop` / `Abandon`; `KeepAlive`
+  reserved) per `docs/Txv3/05_DELEGATE_v1.md` §6.2. 2 new
+  tests pinning the closed catalog and orthogonal-compose
+  with `AgentCancelPolicy`.
+  **PR-5**: `ResumeOutcome` closed catalog (`Retry` /
+  `WithReply(DelegateReply)` / `TimerExpired(TimerId)` /
+  `Aborted(AbortReason)`) + `StepOp::apply_resume(&mut self,
+  ResumeOutcome) -> Result<(), Errno>` trait method with
+  default impl that accepts only `Retry` and rejects
+  everything else with `EINVAL`. Per ADR §6: default-reject
+  forecloses the silent-acceptance-of-unhandled-resumes bug
+  class. Placeholder types `DelegateReply`, `TimerId(u64)`,
+  `AbortReason` (`Interrupted`/`Killed`/`TimedOut`/
+  `ScopeAbandoned`) added to `step_v3/agent.rs`. 5 new
+  tests: default accepts Retry, default rejects WithReply +
+  TimerExpired + all Aborted variants, override accepts
+  WithReply and stashes in `&mut self`.
+  **PR-8 DEFERRED**: adding `YieldShape::OnTimer` variant
+  breaks ~13 exhaustive-match sites across `step_v3`
+  consumers (`lifecycle.rs`, `page_backed.rs`, shims, tests).
+  Each site needs judgment between `unreachable!()`,
+  `Errno::EINVAL`, or genuine handling. Tried in this
+  session, reverted because per-site review beats blanket
+  `unreachable!()`. Reserved spot left in `YieldShape` enum
+  with a TODO comment; placeholder types (`TimerId`,
+  `Deadline`) already in place. PR-8 is now a directed
+  follow-up with a clear scope. Baseline **1389 → 1396**
+  (+7 tests).
+
+- 2026-05-11 v3 PR-3C + PR-3D step 1 LANDED.
+  **PR-3C**: lost-wake-fix primitives in
+  [`tx-reactor/src/wait_source.rs`](../../crates/tx-reactor/src/wait_source.rs).
+  `WaitSource::prepare()` returns a `#[must_use]`
+  `PreparedWaitRegistration` that the driver commits via
+  `install_if(predicate)` or unconditionally via `install()`.
+  `WaitRegistrationGuard` is a RAII handle that
+  auto-deregisters the subscriber on drop; `.forget()`
+  suppresses the auto-deregister if ownership transfers. 5
+  new tests: install_if true commits, install_if false skips,
+  guard drop deregisters, guard.forget suppresses drop, and
+  a `lost_wake_fix_pattern_round_trip` smoke that exercises
+  the prepare→install_if(true)→concurrent-notify→event-arrives
+  sequence with generation match.
+  **PR-3D step 1**: `TaskMailbox` now holds an optional
+  `core::task::Waker` registered via `register_waker(cx.waker())`.
+  `post(event)` wakes the registered Waker on both enqueue and
+  overflow paths (overflow still wakes — the driver re-observes
+  via `take_overflow`). `clear_waker()` detaches without
+  waking. 3 new tests pinning the bridge. The 94-site
+  mass-migration of direct Waker sites into WaitSource is
+  **deferred to a directed PR** — production wait sites
+  (tx-substrate/src/bus/ in particular) need careful
+  per-site migration order. Baseline **1381 → 1389** (+8
+  tests, 5 PR-3C + 3 PR-3D step 1).
+
+- 2026-05-11 v3 PR-3B LANDED. Object-owned wait publication
+  type added to [`tx-reactor/src/wait_source.rs`](../../crates/tx-reactor/src/wait_source.rs):
+  `WaitSource` (id + subscriber list + monotonic SubscriberId
+  counter), `SubscriberId` (opaque registration handle for
+  idempotent unregister), private `Subscriber` (Weak<TaskMailbox>
+  + generation + interests). API: `register(mailbox, generation,
+  interests) -> SubscriberId`, `unregister(SubscriberId)`,
+  `notify(mask) -> usize`. Notify compacts dead subscribers
+  (Weak upgrade fails → drop) as a side effect; posted events
+  carry the overlap mask (`interests & fire_mask`), not the
+  full fire mask. Standalone for now — does not yet wrap
+  existing [`Channel`]; PR-3C wires up the bridge and PR-3D
+  retires the 92 direct `Waker` sites. 6 new tests:
+  register/unregister roundtrip with idempotence, notify
+  fan-out to matching subscribers, disjoint-mask skip, dead
+  subscriber compaction, overlap-not-full-mask carriage.
+  Baseline **1375 → 1381**.
+
+- 2026-05-11 v3 PR-3A LANDED. Wake-substrate foundation types
+  added to [`tx-reactor/src/mailbox.rs`](../../crates/tx-reactor/src/mailbox.rs)
+  per [`2026-05-11-pr-3-wake-substrate-shape.md`](decisions/2026-05-11-pr-3-wake-substrate-shape.md):
+  `TaskMailbox` (per-task generation counter + bounded MPSC of
+  `MailboxEvent` + overflow flag), `WaitGeneration` (monotonic
+  per-mailbox), `MailboxEvent::SourceFired { generation, source,
+  interests }`, `ActiveWait` (driver-local; `matches()` filters
+  stale generation + wrong source + disjoint interest mask).
+  Renamed PR-3 ADR's `WakeHint` → `MailboxEvent` to avoid
+  collision with existing `scheduler::WakeHint`
+  (`Normal`/`SignalDelivery`/`PriorityBoost`/`None` — different
+  concern). Additive only; no Channel/Waker call sites touched
+  (those land in PR-3B/3C/3D). 8 new tests pinning: generation
+  monotonicity, current-vs-next, FIFO post/poll, overflow latch,
+  ActiveWait fresh-match, ActiveWait stale-generation reject,
+  ActiveWait wrong-source reject, ActiveWait disjoint-mask
+  reject. Verification: workspace baseline **1367 → 1375**
+  (+8 tests, 0 regression), arch lint ok, progress validate ok.
+  Next: PR-3B wraps `Channel` in `WaitSource`.
+
+- 2026-05-11 v3 design-doc sweep LANDED. Routine-edit cleanup
+  per `docs/Txv3/INDEX.md` §3: every active design doc that
+  cross-referenced a v4 metaframework doc now points to the v3
+  successor. Also: v3 vocabulary applied in still-canonical
+  subsystem docs (`SIGNAL_v1`, `SIGNAL_ATTACHMENTS_v1`,
+  `PROCESS_v1`, `VM_v1_2`, `PAGE_BACKED_v1`, `BUS_v1`).
+  Superseded banners on `CONCEPTS_v4.md`, `INVARIANTS_v4.md`,
+  `STEP_MODEL_v1.md`. 5 workers across 2 dispatch waves:
+  D1 (00_meta-framework non-v4, 3 files), D2 (substrate +
+  execution, 2 files), D3 (memory-vm + process-signals, 5
+  files, biggest scope), D4 (filesystem + devices + INDEX, 6
+  files), D5 (cleanup wave on 9 files my initial partition
+  missed). ~105 cross-ref redirects + 30 vocab renames + 5
+  `read_wq`/`write_wq` table cells + 3 superseded banners.
+  Verification: tree green (1367/0/11 preserved through
+  markdown-only changes), arch lint ok, progress validate ok
+  (now 26 progress records: +2 ADRs). Total session: 74 files
+  changed, +731/-582 lines.
+
+- 2026-05-11 v3 PR-1.6 + PR-3 DECISIONS recorded. Two ADRs in
+  `docs/progress/decisions/`:
+  - [`2026-05-11-pr-1-6-keep-fsops.md`](decisions/2026-05-11-pr-1-6-keep-fsops.md):
+    keep `FsOps` as canonical v3, do not delete. The v3
+    invariant is StepOutcome shape unification, not
+    trait-identity unification. The wave-9h-ζ blocker
+    dissolves because "delete v4 trait" was the wrong goal.
+    PR-1.6 reduces to doc + naming cleanup. Use explicit UFCS
+    or narrow `*_core` helpers for `FsPageBacking`↔`FsOps`
+    bridge sites; do not blanket-rename inherent helpers.
+  - [`2026-05-11-pr-3-wake-substrate-shape.md`](decisions/2026-05-11-pr-3-wake-substrate-shape.md):
+    task-owned wake delivery + object-owned wait publication.
+    `WaitGeneration` lives on `TaskMailbox` (per `ReactorTask`),
+    not on `WaitSource`. `Channel.fire(Mask)` migrates **behind**
+    `WaitSource.notify(Mask)`, not replaced wholesale. Four-phase
+    plan (PR-3A mailbox+generation, PR-3B WaitSource wrap,
+    PR-3C prepared-registration migration, PR-3D retire 92
+    direct `Waker` sites).
+
+- 2026-05-11 v3 PR-A.4 follow-up (carrier_id audit) LANDED.
+  Continued PR-A.4 with the deferred `*_carrier_id` axis: 33
+  sites across 8 files. Renamed `wait_carrier_id` →
+  `wait_source_id` (struct fields + methods + locals in
+  range_lock.rs, tty/identity.rs, pipe.rs's prefixed forms);
+  `exit_source_carrier_id` → `exit_source_id` (process/);
+  `reader_carrier_id`/`writer_carrier_id` → `_source_id` in
+  pipe.rs; `carrier_id` field in futex.rs → `source_id`.
+  Single-author since 33 sites across cohesive files; parallel
+  dispatch overhead > work. Verification clean: tree compiles,
+  test suite **1367/0/11** preserved. Remaining `carrier`
+  references in code: 3 intentional historical doc comments
+  in step_v3/mod.rs documenting the rename. **Vocabulary
+  migration arc COMPLETE.** Next: PR-2 StepOp wrap (~173 free
+  `step_*` fns → `impl StepOp for FooOp`).
+
+- 2026-05-11 v3 PR-A.4 LANDED. `wait_carrier` module →
+  `wait_source` module + `WaitToken::carrier()` method →
+  `source_id()` (with internal field rename). Parallel 4-worker
+  dispatch: W1 process (3 files), W2 vm+page_backed (5 files),
+  W3 pipe+futex+tty (4 files), W4 shims (7 files). Foundation:
+  git mv `wait_carrier.rs` → `wait_source.rs`, lib.rs mod decl,
+  WaitToken struct field+method rename, internal docs +
+  `read_wq` → `read_source` in bus.rs. Verification: cargo
+  check clean on first integration (workers integrated
+  cleanly, no slip-throughs unlike PR-A.1/A.3); test suite
+  **1367/0/11** preserved; lint+progress validate ok. Total
+  ~150 sites across 19 files. Wall time ~5 min wait for
+  longest worker (W2, 150s; W3, 146s; W4, 138s). Per
+  worker-rule, all `*_carrier_id` identifiers (struct fields,
+  method names, locals) **deliberately left intact** for a
+  follow-up carrier_id-suffix-audit PR. Remaining stale-vocab
+  refs: 33 sites of `wait_carrier_id`/`reader_wait_carrier_id`
+  etc. — all expected per leave-alone rule.
+
+- 2026-05-11 v3 PR-A.3 LANDED. `exit_port` → `exit_source`
+  rename across 9 files, ~67 sites. Done sequentially since
+  surface was small (process/structure.rs 21, process/tests/
+  exit_source.rs 19, process/execution.rs 13, plus shims).
+  Renamed: field `exit_port: Channel` → `exit_source: Channel`,
+  constant `EXIT_PORT_CHILD_ZOMBIFIED` → `EXIT_SOURCE_*`,
+  methods `exit_port()`, `exit_port_carrier_id()`,
+  `exit_port_wait_token()`, `fire_exit_port()` to
+  `exit_source_*`/`fire_exit_source`. File rename
+  `process/tests/exit_port.rs` → `exit_source.rs` via git mv.
+  Two stale sites slipped initial `rg`: `process/mod.rs`
+  re-export of the constant and a comment in
+  `tx-shims/.../fork_clone_wait4_wave3.rs`. Verification:
+  `cargo check --workspace --tests` clean, test suite
+  **1367/0/11** preserved, `cargo xtask lint arch` ok,
+  `cargo xtask progress validate` ok. Method/field rename
+  preserved `_carrier_id` suffix (e.g.
+  `exit_source_carrier_id`) — `carrier_id` is a separate
+  rename concern for PR-A.4. Next: PR-A.4 (bare `carrier`
+  identifier audit, judgment-heavy, ~71 sites) or PR-2
+  (StepOp wrap, the big parallel-dispatch target).
+
+- 2026-05-11 v3 PR-A.1 LANDED. Parallel agent dispatch retired
+  v4-spelling vocabulary from step_v3 algebra: struct
+  `WakeCarrier` → `WaitSourceId`, struct `InterestConditions` →
+  `InterestMask`, variant `YieldShape::OnCarrier` →
+  `OnWaitSource` (with field `carrier:` → `source:`), helpers
+  `on_carrier`/`yield_on_carrier` → `on_wait_source`/
+  `yield_on_wait_source`. Foundation commit owned
+  `step_v3/mod.rs` + `agent.rs`; six parallel workers (W1–W6)
+  handled disjoint file scopes (substrate tests, tty,
+  page_backed, vm, pipe+futex+tmpfs, shims). Two files slipped
+  the partition (`tty/execution/step_read.rs`,
+  `page_backed/lifecycle_tests.rs`) — fixed during integration.
+  Verification: `cargo check --workspace --tests` clean,
+  `cargo test --workspace --lib --tests -- --test-threads=1`
+  **1367 passed / 0 failed / 11 ignored** (≥ baseline), `cargo
+  xtask lint arch` ok, `cargo xtask progress validate` ok.
+  Remaining stale-vocab references: 3 intentional historical
+  doc comments in `step_v3/mod.rs`. Wall time: foundation ~5
+  min, 6 parallel workers ~2-4 min each (longest W3 at ~3.7
+  min), integration sweep ~3 min, total ~15 min — roughly 30%
+  faster than serial estimate. Next: PR-A follow-ups
+  (`exit_port` → `exit_source` rename; `read_wq`/`write_wq`
+  → `read_source`/`write_source`).
 
 - 2026-05-09 PR-1 wave-9h-γ/β/δ/ε LANDED. Per-fixture audit
   showed earlier postmortem was wrong: v3 path was largely
@@ -3312,6 +5729,24 @@
 - This foundational workspace snapshot is ready to publish to the Txv2 remote:
   it captures the Rust skeleton, xtask tooling, docs/progress memory, OSComp and
   HumanLayer references, RV64 QEMU smoke boot, BootInfo v1, and bootstrap pmap.
+- 2026-05-11 D9 signal-subsystem wake-migration ADR landed (worker W-X,
+  research-only). Recommendation: **Option A** — add
+  `MailboxEvent::SignalDelivered { signum, routing }` and per-thread
+  `Weak<TaskMailbox>` on `ThreadPayload`, post-on-deliver from
+  `post_signal` / `route_gewalt` / `set_thread_zombie`. Three-phase plan
+  (~3d total): D9-A event variant + post wiring; D9-B
+  `step_kill_process` eligibility-check fix (process-directed routing
+  picks an unblocked thread under the threads-list lock); D9-C
+  pselect/sigwaitinfo wake test pin + signalfd follow-up file. Two
+  surprising survey findings: (1) signal is not a bus consumer today —
+  the `Channel`/`Waker`/`RawPort` grep returns zero hits in signal.rs;
+  the lost-wake hazard is real and exactly what D9 fixes; (2)
+  `step_kill_process` posts to the first non-zombie thread without a
+  sigmask-eligibility check, a known POSIX defect the migration is the
+  right moment to repair. Verification: doc-only change; will validate
+  `cargo xtask progress validate` on next JSON edit. Next step:
+  implementation tracking via PR-3D successor task. No blocker. See
+  `docs/progress/decisions/2026-05-11-d9-signal-wake-migration.md`.
 
 ## Open Blockers
 
@@ -3328,6 +5763,9 @@
 
 ## Latest Decisions
 
+- `docs/progress/decisions/2026-05-12-d12-dead-code-todo-audit.md`
+- `docs/progress/decisions/2026-05-11-d9-signal-wake-migration.md`
+- `docs/progress/decisions/2026-05-11-d4-bus-mailbox-layering.md`
 - `docs/progress/decisions/2026-05-07-shell-prompt-roadmap-progress.md`
 - `docs/progress/decisions/2026-05-07-fd-ops-and-drift-cleanup.md`
 - `docs/progress/decisions/2026-05-06-dac-and-setuid.md`
