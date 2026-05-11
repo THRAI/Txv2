@@ -367,3 +367,156 @@ fn pagebacked_step_write_from_user_propagates_efault_without_advance() {
     assert_eq!(writer.offset(), 0);
     assert_eq!(pc.size_bytes(), pc.page_count() * USER_PAGE_SIZE as u64);
 }
+
+#[cfg(test)]
+mod step_op_wraps {
+    //! PR-2 wave-3 smoke tests for `ReadToUserOp`/`WriteFromUserOp`
+    //! `StepOp` wraps.
+    //!
+    //! Each test builds the `*Op` adapter, drives it through a single
+    //! `.step(&mut ctx)` call, and pins the outcome variant against the
+    //! same expectation as the free-fn suite above. Compile-checks
+    //! `impl StepOp` correctness; the heavy-lifting semantics tests
+    //! live in the free-fn suite.
+    use super::*;
+    use crate::page_backed::{ReadToUserOp, WriteFromUserOp};
+    use tx_substrate::step_v3::{ScriptCtx, StepOp};
+
+    #[test]
+    fn write_from_user_op_round_trip_one_page() {
+        let _lock = EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed user-buffer step_op_wraps lock");
+        setup_host_substrate();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            2,
+        );
+        let fixture = UserBufferFixture::new(0x70_0000, 1);
+        let guard = tx_substrate::epoch::guard();
+
+        let payload: Vec<u8> = (0u8..200).collect();
+        fixture.seed_user_bytes(&payload);
+        let writer = open_file_for_pc(&pc);
+        let mut op = WriteFromUserOp {
+            pc: &pc,
+            of: &writer,
+            aspace: &fixture.aspace,
+            src: fixture.user_ptr(),
+            len: payload.len(),
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        assert_eq!(op.step(&mut ctx), V3Out::Done(payload.len()));
+        assert_eq!(writer.offset(), payload.len() as u64);
+        assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
+    }
+
+    #[test]
+    fn read_to_user_op_after_seed_returns_done_with_bytes() {
+        let _lock = EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed user-buffer step_op_wraps lock");
+        setup_host_substrate();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            2,
+        );
+        let fixture = UserBufferFixture::new(0x80_0000, 1);
+        let guard = tx_substrate::epoch::guard();
+
+        let payload: Vec<u8> = (0u8..96).collect();
+        fixture.seed_user_bytes(&payload);
+        // First write the bytes into pc via free fn so size grows.
+        let writer = open_file_for_pc(&pc);
+        assert_eq!(
+            step_write_from_user(
+                &pc,
+                &writer,
+                &fixture.aspace,
+                fixture.user_ptr(),
+                payload.len(),
+                &guard,
+            ),
+            V3Out::Done(payload.len())
+        );
+
+        // Clear the user buffer and read back through the wrap.
+        let zeros = vec![0u8; payload.len()];
+        fixture.seed_user_bytes(&zeros);
+        let reader = open_file_for_pc(&pc);
+        let mut op = ReadToUserOp {
+            pc: &pc,
+            of: &reader,
+            aspace: &fixture.aspace,
+            dst: fixture.user_ptr(),
+            len: payload.len(),
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        assert_eq!(op.step(&mut ctx), V3Out::Done(payload.len()));
+        assert_eq!(reader.offset(), payload.len() as u64);
+        assert_eq!(fixture.read_user_bytes(payload.len()), payload);
+    }
+
+    #[test]
+    fn read_to_user_op_zero_len_returns_done_zero() {
+        let _lock = EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed user-buffer step_op_wraps lock");
+        setup_host_substrate();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        );
+        let fixture = UserBufferFixture::new(0x90_0000, 1);
+        let guard = tx_substrate::epoch::guard();
+        let reader = open_file_for_pc(&pc);
+        let mut op = ReadToUserOp {
+            pc: &pc,
+            of: &reader,
+            aspace: &fixture.aspace,
+            dst: fixture.user_ptr(),
+            len: 0,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        assert_eq!(op.step(&mut ctx), V3Out::Done(0));
+        assert_eq!(reader.offset(), 0);
+    }
+
+    #[test]
+    fn write_from_user_op_efault_propagates_without_advance() {
+        let _lock = EPOCH_TEST_LOCK
+            .lock()
+            .expect("page-backed user-buffer step_op_wraps lock");
+        setup_host_substrate();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        );
+        let empty_aspace = AddressSpace::new();
+        let guard = tx_substrate::epoch::guard();
+        let dangling = UserPtr::<u8>::new(0xA0_0000);
+        let writer = open_file_for_pc(&pc);
+        let mut op = WriteFromUserOp {
+            pc: &pc,
+            of: &writer,
+            aspace: &empty_aspace,
+            src: dangling,
+            len: 8,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        assert_eq!(op.step(&mut ctx), V3Out::Err(V3Errno::EFAULT));
+        assert_eq!(writer.offset(), 0);
+    }
+}
