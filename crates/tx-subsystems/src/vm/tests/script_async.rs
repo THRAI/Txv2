@@ -39,7 +39,7 @@ fn range_lock_would_block_wait_token_carrier_matches_lock() {
     };
 
     let token = blocked.wait_token();
-    assert_eq!(token.carrier(), aspace.range_lock().wait_carrier_id());
+    assert_eq!(token.source_id(), aspace.range_lock().wait_source_id());
     assert_eq!(token.interest(), RANGE_LOCK_RELEASE_MASK);
 }
 
@@ -585,7 +585,7 @@ fn range_lock_release_fires_registered_channel_for_external_subscribers() {
     };
 
     let channel: Channel =
-        crate::wait_carrier::lookup_wait_channel(aspace.range_lock().wait_carrier_id())
+        crate::wait_source::lookup_wait_channel(aspace.range_lock().wait_source_id())
             .expect("RangeLock channel registered");
     let mut wait_future =
         Box::pin(channel.wait(tx_reactor::wait::Mask::from_bits(RANGE_LOCK_RELEASE_MASK)));

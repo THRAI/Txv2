@@ -369,7 +369,7 @@ pub(super) fn sys_madvise<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
 ///
 /// The lone async VM arm: `AddressSpace::msync` calls into
 /// `step_fsync` per File-backed page container, which can return
-/// `Blocked` against the page-cache wait carrier. The arm awaits the
+/// `Blocked` against the page-cache wait source. The arm awaits the
 /// carrier and re-polls until `step_fsync` reaches `Done`.
 ///
 /// `flags` (`MS_ASYNC` / `MS_SYNC` / `MS_INVALIDATE`) is recognised
@@ -409,18 +409,24 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 return SyscallResult::Return(0);
             }
             V3::Yield {
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape: YieldShape::OnWaitSource { source: carrier, interests },
                 ..
             } => {
                 let token =
                     tx_subsystems::execution::WaitToken::new(carrier.raw(), interests.raw());
-                if let Some(future) = wait_carrier::wait_on_token(token) {
+                if let Some(future) = wait_source::wait_on_token(token) {
                     let _ = future.await;
                 }
                 // Otherwise re-poll immediately.
             }
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
+                ..
+            } => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+            V3::Yield {
+                shape: YieldShape::OnTimer { .. },
                 ..
             } => {
                 return SyscallResult::Error(EIO_VALUE);
@@ -547,7 +553,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sysc
                         continue;
                     }
                     V3::Yield {
-                        shape: YieldShape::OnCarrier { carrier, interests },
+                        shape: YieldShape::OnWaitSource { source: carrier, interests },
                         ..
                     } => {
                         parked = true;
@@ -555,7 +561,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sysc
                             carrier.raw(),
                             interests.raw(),
                         );
-                        if let Some(future) = wait_carrier::wait_on_token(token) {
+                        if let Some(future) = wait_source::wait_on_token(token) {
                             let _ = future.await;
                         }
                         continue;

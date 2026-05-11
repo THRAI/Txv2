@@ -187,7 +187,7 @@ impl AddressSpace {
     ///   subsystems (`VmFault` / pmap surface them as opaque internal
     ///   shapes; the user-VA contract collapses every one to EFAULT).
     /// - `Blocked(token)` if a page-cache fetch needs to await; the
-    ///   caller awaits the carrier and retries.
+    ///   caller awaits the wait source and retries.
     ///
     /// Per VM_v1_2 §"No rmap": private anon frames are tracked only
     /// via published PTEs, so the pmap is the canonical authoritative
@@ -273,7 +273,7 @@ impl AddressSpace {
         guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<Vec<u8>, tx_substrate::step_v3::NoProgress> {
         use tx_substrate::step_v3::{
-            InterestConditions, NoProgress, StepOutcome as V3, WakeCarrier, YieldShape,
+            InterestMask, NoProgress, StepOutcome as V3, WaitSourceId, YieldShape,
         };
         if src.addr() == 0 || max_len == 0 {
             return V3::Done(Vec::new());
@@ -292,9 +292,9 @@ impl AddressSpace {
                     ResolveOutcome::Blocked(t) => {
                         return V3::Yield {
                             progress: NoProgress,
-                            shape: YieldShape::OnCarrier {
-                                carrier: WakeCarrier::new(t.carrier()),
-                                interests: InterestConditions::new(t.interest()),
+                            shape: YieldShape::OnWaitSource {
+                                source: WaitSourceId::new(t.source_id()),
+                                interests: InterestMask::new(t.interest()),
                             },
                         };
                     }
@@ -328,7 +328,7 @@ fn copy_in(
     guard: &Guard<'_>,
 ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
     use tx_substrate::step_v3::{
-        ByteProgress, InterestConditions, StepOutcome as V3, WakeCarrier, YieldShape,
+        ByteProgress, InterestMask, StepOutcome as V3, WaitSourceId, YieldShape,
     };
     if dst.is_empty() {
         return V3::Done(0);
@@ -371,9 +371,9 @@ fn copy_in(
             ResolveOutcome::Blocked(t) => {
                 return V3::Yield {
                     progress: ByteProgress::new(copied),
-                    shape: YieldShape::OnCarrier {
-                        carrier: WakeCarrier::new(t.carrier()),
-                        interests: InterestConditions::new(t.interest()),
+                    shape: YieldShape::OnWaitSource {
+                        source: WaitSourceId::new(t.source_id()),
+                        interests: InterestMask::new(t.interest()),
                     },
                 };
             }
@@ -389,7 +389,7 @@ fn copy_out(
     guard: &Guard<'_>,
 ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
     use tx_substrate::step_v3::{
-        ByteProgress, InterestConditions, StepOutcome as V3, WakeCarrier, YieldShape,
+        ByteProgress, InterestMask, StepOutcome as V3, WaitSourceId, YieldShape,
     };
     if src.is_empty() {
         return V3::Done(0);
@@ -428,9 +428,9 @@ fn copy_out(
             ResolveOutcome::Blocked(t) => {
                 return V3::Yield {
                     progress: ByteProgress::new(copied),
-                    shape: YieldShape::OnCarrier {
-                        carrier: WakeCarrier::new(t.carrier()),
-                        interests: InterestConditions::new(t.interest()),
+                    shape: YieldShape::OnWaitSource {
+                        source: WaitSourceId::new(t.source_id()),
+                        interests: InterestMask::new(t.interest()),
                     },
                 };
             }
@@ -613,7 +613,7 @@ fn resolve_user_page(
             // - v3 `Continue { .. }` (NoProgress) → `Err(EFAULT)` —
             //   page allocation rarely emits this; treating it as a
             //   fault keeps the user-access path conservative.
-            // - v3 `Yield { OnCarrier { c, i } }` →
+            // - v3 `Yield { OnWaitSource { c, i } }` →
             //   `ResolvePageOutcome::Blocked(WaitToken(c, i))`.
             // - v3 `Yield { OnAgent .. }` → `Err(EFAULT)`.
             // - v3 `Err(_)` → `Err(EFAULT)`.
@@ -622,7 +622,7 @@ fn resolve_user_page(
                 V3::Done(m) => ResolvePageOutcome::Done(m),
                 V3::Continue { .. } => ResolvePageOutcome::Err(Errno::EFAULT),
                 V3::Yield {
-                    shape: YieldShape::OnCarrier { carrier, interests },
+                    shape: YieldShape::OnWaitSource { source: carrier, interests },
                     ..
                 } => ResolvePageOutcome::Blocked(WaitToken::new(carrier.raw(), interests.raw())),
                 V3::Yield { .. } => ResolvePageOutcome::Err(Errno::EFAULT),

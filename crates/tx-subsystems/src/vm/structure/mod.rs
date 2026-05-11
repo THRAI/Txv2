@@ -16,11 +16,11 @@ pub use range_lock::{
     RangeLock, WouldBlock, RANGE_LOCK_RELEASE_MASK,
 };
 pub use types::{
-    AccessMode, AddressSpaceStats, MapPlacement, Prot, UserPage, UserPageIter, UserRange,
-    UserRangeError, UserVirtAddr, VmBacking, VmEntry, VmEntryError, VmEntryFlags, VmEntryRewrite,
-    VmFault, VmFaultError, VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultOutcome,
-    VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome,
-    VmRemapRequest, USER_PAGE_SIZE,
+    AccessMode, AddressSpaceStats, MapPlacement, Prot, UfdRegistration, UserPage, UserPageIter,
+    UserRange, UserRangeError, UserVirtAddr, VmBacking, VmEntry, VmEntryError, VmEntryFlags,
+    VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization, VmFaultMaterializationBacking,
+    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget,
+    VmRemapOutcome, VmRemapRequest, USER_PAGE_SIZE,
 };
 
 pub(in crate::vm) use recipe::{AddressSpaceStatsCell, RecipeIndex};

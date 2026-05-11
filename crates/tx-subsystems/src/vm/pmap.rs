@@ -452,7 +452,7 @@ fn permissions_for_prot(prot: Prot) -> PmapPermissions {
 }
 
 #[cfg(test)]
-pub(crate) struct TestPmap;
+pub struct TestPmap;
 
 #[cfg(test)]
 struct TestPmapState {
