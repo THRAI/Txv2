@@ -53,10 +53,10 @@ where
 Inside the closure, `body` receives a `SubjectContext` constructed via `SubjectContext::borrowed(owner, ...)`. The borrow scope:
 
 1. Holds `Cap<ProcessIdentity>` for the duration of the body's future, keeping identity addressable.
-2. Subscribes to the borrowed process's `exit_port` carrier as an abandonment source.
+2. Subscribes to the borrowed process's `exit_source` (a `WaitSource`) as an abandonment source.
 3. On scope exit (body completes or aborts), drops the cap, unsubscribes, releases any scope-held resources.
 
-The body is an `async` closure: it can `.await` arbitrary subscripts, including `drive(...)` calls, including subscripts that yield `OnAgent` or `OnCarrier`. Yields inside the scope do not exit the scope; the borrow holds.
+The body is an `async` closure: it can `.await` arbitrary subscripts, including `drive(...)` calls, including subscripts that yield `OnAgent`, `OnWaitSource`, or `OnTimer`. Yields inside the scope do not exit the scope; the borrow holds.
 
 ## 4. SubjectContext under borrow
 
@@ -84,11 +84,11 @@ SCOPE-3: scope abandonment is delivered through the existing Killable wait proto
 
 When the borrowed process exits while a scope is active:
 
-1. The `exit_port` subscription fires.
+1. The `exit_source` subscription fires.
 2. The script's drive loop, on its next yield resolution, observes a `Killed` outcome.
 3. The script terminates with `Err(EOWNERDEAD)`.
 4. All in-flight `OnAgent` tokens on the script reach `SENTINEL_DEAD` via their endpoints' standard cleanup.
-5. The scope's drop releases the `Cap<ProcessIdentity>` and unsubscribes the exit_port watcher.
+5. The scope's drop releases the `Cap<ProcessIdentity>` and unsubscribes the `exit_source` watcher.
 
 This means io_uring SQPOLL script abandonment, AIO worker abandonment, and FUSE helper abandonment all use the *same protocol* native syscall scripts use for SIGKILL. No new mechanism. `Killable` wait protocol is sufficient.
 
@@ -102,7 +102,7 @@ This is an invariant about *what* a scope's body may carry across the scope's ex
 
 - Fixed-buffer pins (e.g., io_uring `IORING_REGISTER_BUFFERS`) are typed as `OperationalEvidence` *bound to the scope's `Cap<ProcessIdentity>`*. Their drop is part of the scope's drop.
 - In-flight delegation tokens issued inside the scope are bound to the scope's lifetime; on scope exit they reach `SENTINEL_DEAD`.
-- Subscribed bus carriers are unsubscribed on scope exit.
+- Subscribed wait sources are unsubscribed on scope exit.
 
 The corollary is that *long-lived* resources (e.g., io_uring's permanently-registered fixed buffers spanning many submitted ops) require a *long-lived* scope. SQPOLL kthread runs *one* OnBehalfOf scope for the entire lifetime of the io_uring instance, and individual SQE-handling sub-scripts run inside it. Each sub-script is its own short-lived script; the scope is the kthread's outer frame.
 

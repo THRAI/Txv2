@@ -49,9 +49,9 @@ If a feature requires the kernel to act *on behalf of* a process (io_uring SQPOL
 ```rust
 struct DelegateEndpoint<K: EndpointKind> {
     scope: EndpointScope,
-    request_carrier: RawPort<DelegateRequestEnvelope<K>>,
-    reply_slot: ReplySlot<K>,
-    in_flight: TokenLedger,    // bounded by RLIMIT_DELEGATE
+    request_queue: MpscQueue<Cap<DelegateToken>>,    // tokens, not envelopes
+    request_source: WaitSource,                       // agents wait on this
+    in_flight: TokenLedger,                           // bounded by RLIMIT_DELEGATE
     // ...
 }
 
@@ -70,9 +70,11 @@ enum EndpointKind {
 }
 ```
 
-An endpoint is a Cap-owned object exposed to userspace through a fd. Standard fd semantics drive cleanup: when the fd is closed (or its owning process exits), the `Cap<DelegateEndpoint>` reaches `SENTINEL_DEAD` and all outstanding tokens collectively fail with `Agent::Died` at their next resume (DELEGATE-3).
+An endpoint is a Cap-owned object exposed to userspace through a fd. Standard fd semantics drive cleanup: when the fd is closed (or its owning process exits), the `Cap<DelegateEndpoint>` reaches `SENTINEL_DEAD` and all outstanding tokens are transitioned to `AgentDied` (via `mark_agent_died`) so that their bound script waiters wake with `Aborted(AgentDied)` (DELEGATE-3, DTOK-2).
 
 The endpoint's type parameter `K` constrains the legal `DelegateRequest` and `DelegateReply` shapes. A `Cap<DelegateEndpoint<Ufd>>` cannot receive `Fuse` requests; the type system rejects the mismatch. This kills covert channels between endpoint kinds (DELEGATE-2).
+
+The endpoint's request queue holds **`Cap<DelegateToken>`**, not request envelopes. The request payload lives on the token (see §4). Agents waiting for new requests subscribe to `request_source` (a `WaitSource`); each `enqueue_request` call ends with `request_source.notify(HasRequest)`.
 
 ### 3.1 EndpointScope
 
@@ -80,7 +82,7 @@ The endpoint's type parameter `K` constrains the legal `DelegateRequest` and `De
 
 `Thread`-scoped endpoints attach to a particular thread; `Process`-scoped attach to a process. Most cases are `Process` (FUSE, userfaultfd, fanotify). Ptrace requires `Thread` scope because tracer/tracee relationships are per-thread.
 
-The endpoint's scope determines whose `exit_port` is subscribed for abandonment. A `Process`-scoped endpoint dies when its owning process exits; a `Thread`-scoped endpoint dies when its owning thread exits.
+The endpoint's scope determines whose `exit_source` is subscribed for abandonment. A `Process`-scoped endpoint dies when its owning process exits; a `Thread`-scoped endpoint dies when its owning thread exits. On endpoint death, the runtime walks `in_flight` and calls `mark_agent_died` on each token.
 
 ## 4. Token
 
@@ -88,34 +90,50 @@ The endpoint's scope determines whose `exit_port` is subscribed for abandonment.
 
 ```rust
 struct DelegateToken {
-    request_id: NonZeroU64,
-    state: TokenState,
+    id: DelegateTokenId,
+    state: AtomicDelegateState,
+    request: OnceCell<DelegateRequest>,    // installed by install_request before enqueue
+    reply: OnceCell<DelegateReply>,        // populated only in ReplyInstalling phase
+    waiter: AtomicOption<Weak<TaskMailbox>>,
+    generation: AtomicU64,
 }
 
-enum TokenState {
+enum DelegateState {
     Pending,
-    Replied(ReplyEnvelope),
-    Abandoned(AbandonReason),
-}
-
-enum AbandonReason {
-    TimedOut,
-    Cancelled,
+    ReplyInstalling,
+    Replied,
+    Canceled,
     AgentDied,
-    AgentRefused,
-    LoopDetected,
+    TimedOut,
 }
 ```
 
-A `Cap<DelegateToken>` is the script's resume credential. Token liveness is the *sole linearization point* of the delegation:
+A `Cap<DelegateToken>` is the script's resume credential. Token state — *not* slot lifecycle — is the linearization point of the delegation:
 
-- Reply against a live token → script resumes with reply data.
-- Reply against a `SENTINEL_DEAD` token → reply dropped.
-- Token reaches `SENTINEL_DEAD` while the agent is still computing → reply dropped on arrival; agent has no observable effect on the script.
+- The state machine has CAS-only transitions: `Pending → ReplyInstalling → Replied`, or `Pending → Canceled / AgentDied / TimedOut`. The first transition wins; later attempts return `LateReply` and are dropped.
+- `ReplyInstalling` is the single-writer phase that owns the `reply` slot; only after the reply is fully installed does the state transition to `Replied`.
+- A reply against any non-`Pending` state is rejected as late and has no observable effect on the script.
+
+Slot lifecycle (substrate) and logical lifecycle (state machine) are independent (DELEGATE-3): the token may reach `Replied` while the slot is still pinned by other holders; the slot reaches `SENTINEL_DEAD` only when no `Cap` retains it.
 
 The token zone is its own zone (`DelegateToken`), with bounded slot count per endpoint. Reservation in the script's reserve-phase, sign at publish (the `Yield` outcome's reserve→commit→publish sequence), drop at resume / timeout / cancel / agent death.
 
 DELEGATE-5: per-endpoint in-flight tokens are bounded by `RLIMIT_DELEGATE` (or by borrowed `RLIMIT_NOFILE` charge), preventing a misbehaving script-side process from saturating the token zone.
+
+### 4.1 Request placement
+
+The request envelope lives **on the token**, not in the endpoint queue. The script-side flow is:
+
+```
+1. step constructs YieldShape::OnAgent { endpoint, request, token, cancel }
+2. prepare_active_wait calls token.install_request(request)
+3. prepare_active_wait calls endpoint.enqueue_request(token.clone())
+4. agent dequeues token from endpoint, reads token.request()
+5. agent computes, calls token.reply(reply)
+6. token state CASes Pending → ReplyInstalling → Replied
+```
+
+The endpoint queue is therefore `MpscQueue<Cap<DelegateToken>>`, not `MpscQueue<DelegateRequest>`. Concept-layer `YieldShape::OnAgent` carries `request` for clarity; runtime `prepare_active_wait` moves it onto the token before enqueue.
 
 ## 5. Request and reply
 
@@ -185,23 +203,44 @@ DELEGATE-9 makes continuation a closed sum:
 
 <!-- txdoc:DELEGATE-V1-CANCELLATION-1 -->
 
-DELEGATE-6: closed `CancelPolicy`:
+Cancellation has two orthogonal axes. The two are independent because they live at different layers:
+
+### 6.1 `AgentCancelPolicy` — what the kernel tells the agent
+
+DELEGATE-6: closed `AgentCancelPolicy`:
 
 ```rust
-enum CancelPolicy {
+enum AgentCancelPolicy {
     BestEffort,       // notify endpoint, give up after a grace
     Synchronous,      // block on agent ack of cancellation
     Detached,         // fire-and-forget, only for idempotent agent ops
 }
 ```
 
-When a script is cancelled (signal interrupt, parent abandonment, OnBehalfOf scope teardown), each in-flight `OnAgent` token's cancel-policy determines the cleanup:
+Carried in `YieldShape::OnAgent::cancel`. Determines the agent-side protocol when the kernel cancels a delegated request:
 
-- `BestEffort`: post a `CANCEL` notification on the endpoint's request carrier; transition the token to `Cancelled` after grace; the agent's eventual reply is dropped.
-- `Synchronous`: post `CANCEL` and wait on a per-token cancellation-ack carrier; the script's cancellation path itself yields until the agent acknowledges.
+- `BestEffort`: post a `CANCEL` notification on the endpoint's request carrier; transition the token to `Canceled` after grace; the agent's eventual reply is dropped.
+- `Synchronous`: post `CANCEL` and wait on a per-token cancellation-ack carrier; the script's cancellation path itself yields until the agent acknowledges. The token state still CASes `Pending → Canceled` immediately; the kernel just additionally waits for the agent's ack before releasing scope-owned resources. No new token state is needed.
 - `Detached`: drop the token immediately; agent's reply is dropped on arrival. Only safe when the agent's pending work has no observable side effects on the kernel beyond the (now-dropped) reply.
 
 The default for most yield sites is `BestEffort`. `Synchronous` is needed when the agent holds resources whose release is required for forward progress (e.g., a file lock the agent acquired pending its reply).
+
+### 6.2 `TokenDropPolicy` — what `ActiveWait` drop does
+
+```rust
+enum TokenDropPolicy {
+    CancelOnDrop,     // drop ⇒ token.cancel(Abandoned); waiter unbound
+    Abandon,          // drop ⇒ unbind waiter only; agent reply lands on dead waiter
+    // reserved (not in R2):
+    // KeepAlive,     // drop ⇒ unbind only; preserve token for another consumer
+}
+```
+
+Held internally by `AgentTokenGuard` (the `YieldRegistration` for `OnAgent`). Consumed only at `ActiveWait` drop time; the runtime never reads it during normal resume.
+
+`CancelOnDrop + Synchronous` is meaningful: on drop, cancel the agent's request *and* wait for ack. The two policies compose orthogonally — `AgentCancelPolicy` decides the protocol the agent sees; `TokenDropPolicy` decides whether `ActiveWait` drop initiates that protocol.
+
+`KeepAlive` is reserved but not implemented; landing it requires a concrete consumer (a token's reply being passed to a different script frame).
 
 ## 7. Resume protocol
 
@@ -209,14 +248,15 @@ The default for most yield sites is `BestEffort`. `Synchronous` is needed when t
 
 When the agent writes a reply, the kernel:
 
-1. Verifies the token is `Pending` (Cap upgrade against `SENTINEL_DEAD`). Dead → drop reply.
-2. Validates the reply envelope's structural shape against the token's endpoint kind. Mismatch → `Agent::Refused`.
-3. Acquires a fresh epoch guard.
-4. Re-runs `require_*` on the script's relevant entities (WIT-5, anti-pattern A-15). The wake/reply itself is not truth; the next step under fresh guard establishes truth.
-5. Resumes the script's `StepOp::step` with the reply envelope available in the `&mut self` resume state.
-6. The script either continues (Continue, Yield, Done) or terminates the operation per its semantics.
+1. CAS the token state `Pending → ReplyInstalling`. Failure → reply rejected as `LateReply`; the previous transition (Canceled/AgentDied/TimedOut) wins.
+2. Validate the reply envelope's structural shape against the token's endpoint kind. Mismatch → state CAS rolls forward to a terminal kind (e.g., `AgentDied`); reply rejected.
+3. Install reply payload in the `OnceCell<DelegateReply>` slot. The `ReplyInstalling` state is the single-writer phase that owns the slot.
+4. Store state `Replied`; post `WakeHint::AgentReplied` to the bound waiter.
+5. Driver wakes, validates generation, classifies the token state (`Replied` → `Ready(WithReply(reply))`), takes the reply.
+6. Driver acquires fresh epoch guard, calls `op.apply_resume(WithReply(reply))` to stash the reply in the StepOp's `&mut self`, then re-invokes `step()`.
+7. The next `step()` runs `require_*` from scratch under fresh guard (WIT-5, anti-pattern A-15). The wake/reply itself is not truth; the predicate re-evaluation establishes truth.
 
-Abandonment (`AgentTimedOut`, `AgentDied`, `AgentRefused`, `Cancelled`) flows through the same path: the script resumes seeing the abandonment reason in its resume state and chooses how to terminate (typically `Err(EOWNERDEAD)` for died, `Err(EINTR)` or partial-Ok for cancelled, `Err(EAGAIN)` or feature-specific for timed out).
+Abandonment (`Canceled`, `AgentDied`, `TimedOut`) flows through the same path: each transitions the token state via CAS, the bound waiter receives `WakeHint::Abort{reason}`, and the driver returns the corresponding errno (`EINTR` for Canceled, `EOWNERDEAD` for AgentDied, `ETIMEDOUT` for TimedOut). The reply-vs-abandonment race is resolved by the token state machine, not by mailbox order: whichever transition CAS wins first determines the outcome.
 
 ## 8. Worked uses
 
@@ -238,13 +278,13 @@ Yield {
             kind: fault_kind,
         }),
         token: token_cap,
-        deadline: Deadline::from(ctx.ufd_timeout),
-        cancel: CancelPolicy::BestEffort,
+        cancel: AgentCancelPolicy::BestEffort,
     },
 }
+// Caller drives with WaitProtocol { deadline: Some(ctx.ufd_timeout), .. }
 ```
 
-The agent process holds the ufd-fd, reads requests, replies with `UFFDIO_COPY { src, dst }`, `UFFDIO_CONTINUE { ... }`, or `UFFDIO_ZEROPAGE`. The reply's `result` carries the page contents (or copy-source). Resume revalidates the recipe BTree under fresh guard and materializes the PTE; if munmap raced, resume sees the recipe gone and returns `Err(EFAULT)`.
+The agent process holds the ufd-fd, reads requests, replies with `UFFDIO_COPY { src, dst }`, `UFFDIO_CONTINUE { ... }`, or `UFFDIO_ZEROPAGE`. The reply's `result` carries the page contents (or copy-source). Resume revalidates the recipe BTree under fresh guard and materializes the PTE; if munmap raced, resume sees the recipe gone and returns `Err(EFAULT)`. The deadline is enforced by a driver-installed `TimerGuard` with `TimerRole::DelegateTimeout { token }`; on timer expiry it CASes the token state `Pending → TimedOut`, racing the agent's reply CAS by token state.
 
 ### 8.2 FUSE
 
@@ -252,7 +292,7 @@ The agent process holds the ufd-fd, reads requests, replies with `UFFDIO_COPY { 
 
 A FUSE mount creates RNodes whose backing is `FuseDelegate` with `endpoint` = the mounting daemon's `Cap<DelegateEndpoint<Fuse>>`. Every VFS step on those RNodes (READ, WRITE, READDIR, GETATTR, OPEN, ...) yields `OnAgent` with the relevant `FuseRequest`. Replies carry inode metadata, page content, attributes; `fd_injections` allow the daemon to hand back open backing fds for OPEN replies.
 
-The deadline is configurable per-mount; default is "long" because FUSE filesystems are not adversarial-by-assumption (compared to userfaultfd, which often is).
+The deadline is per-mount, attached via `WaitProtocol.deadline` at the driver call site; default is "long" because FUSE filesystems are not adversarial-by-assumption (compared to userfaultfd, which often is).
 
 ### 8.3 fanotify FAN_OPEN_PERM
 
@@ -269,10 +309,10 @@ Yield {
             path: path_buf, flags, mode,
         }),
         token: token_cap,
-        deadline: Deadline::from(watch.deadline),
-        cancel: CancelPolicy::BestEffort,
+        cancel: AgentCancelPolicy::BestEffort,
     },
 }
+// Caller drives with WaitProtocol { deadline: Some(watch.deadline), .. }
 ```
 
 The daemon replies with `Allow` or `Deny`; resume continues path resolution or returns `Err(EACCES)`.
@@ -292,10 +332,11 @@ Yield {
             regs, syscall_num, args,
         }),
         token: token_cap,
-        deadline: Deadline::Never,    // ptrace stops are unbounded by Linux convention
-        cancel: CancelPolicy::Synchronous,
+        cancel: AgentCancelPolicy::Synchronous,
     },
 }
+// Caller drives with WaitProtocol { deadline: None, .. } — ptrace stops are
+// unbounded by Linux convention; signal-driven abort is the only escape.
 ```
 
 The tracer reads the request, optionally mutates registers, and replies with `Continue`, `RouteSyscall(new_num, new_args)`, `InjectSignal(sig)`, or `Detach`. The tracee's resume applies the reply *under the tracee's SubjectContext* — the reply's content (register values, etc.) is reply data, not authority transfer (DELEGATE-1, SUBJ-5).
