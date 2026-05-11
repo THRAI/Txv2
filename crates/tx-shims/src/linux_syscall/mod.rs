@@ -44,7 +44,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use tx_hal::{EntropyIf, PmapIf, TimeIf, UserPtr};
+use tx_hal::{ConsoleIf, EntropyIf, PmapIf, TimeIf, UserPtr};
 use tx_reactor::userspace::SyscallRequest;
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_substrate::zone::Cap;
@@ -91,15 +91,15 @@ mod signal;
 use signal::*;
 mod vm;
 use vm::*;
-mod io;
+pub mod io;
 use io::*;
-mod fs_basic;
+pub mod fs_basic;
 use fs_basic::*;
 mod fs_path;
 use fs_path::*;
 mod fs_mut;
 use fs_mut::*;
-mod proc;
+pub mod proc;
 use proc::*;
 mod misc;
 use misc::*;
@@ -456,7 +456,7 @@ pub enum SyscallResult {
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
+pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + ConsoleIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
