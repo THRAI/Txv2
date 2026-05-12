@@ -4,7 +4,6 @@ use core::{
 };
 
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
-use tx_substrate::SpinMutex;
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::{
@@ -13,7 +12,7 @@ use tx_subsystems::mount::{
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::tty::structure::TtyIdentity;
 use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNodeBacking};
-use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, init, init_on_ap, ByteProgress, Cap, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity};
 use crate::adapter::boot_runtime;
 
 // Boot-smoke busy-wait budget for AP reactor task completion. 100k was
@@ -210,7 +209,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
     fn init_substrate_if_ready(handoff: BootHandoff) {
         if P::SUBSTRATE_BOOT_READY {
-            tx_substrate::init::<P>();
+            init::<P>();
             crate::zones::register_all().expect("tx_kernel zone registration failed");
             Self::init_later(handoff);
             Self::install_kernel_trap_vector();
@@ -843,7 +842,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let cpu_id = CpuId(cpu_id);
         P::install_early_percpu(cpu_id);
         P::init_early_secondary(cpu_id);
-        tx_substrate::init_on_ap(cpu_id).expect("tx_kernel AP substrate initialization failed");
+        init_on_ap(cpu_id).expect("tx_kernel AP substrate initialization failed");
         P::init_later_secondary(cpu_id);
         P::install_kernel_trap_vector();
         P::mark_cpu_online(cpu_id);
@@ -1034,8 +1033,8 @@ impl<P: TxPlatform> CoreInit<P> {
     /// silent no-op rather than panicking because the syscall arm
     /// has its own error reporting path.
     fn submit_child_thread_into_boot_reactor(
-        _child_process: tx_substrate::zone::Cap<tx_subsystems::process::ProcessIdentity>,
-        child_thread: tx_substrate::zone::Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
+        _child_process: Cap<tx_subsystems::process::ProcessIdentity>,
+        child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
     ) {
         // The reactor's `BOOT_REACTOR.with(...)` lock is held by
         // `step_boot_reactor_once` *while* polling tasks. The
@@ -1053,7 +1052,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// caller. Drained by `drain_pending_child_submits` between
     /// reactor steps.
     fn queue_pending_child_submit(
-        child_thread: tx_substrate::zone::Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
+        child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
     ) {
         PENDING_CHILD_SUBMITS.lock().push(child_thread);
     }
@@ -1086,9 +1085,9 @@ impl<P: TxPlatform> CoreInit<P> {
 /// `submit_child_thread_into_boot_reactor` (running inside the
 /// reactor-poll inner lock) and drained from the BSP loop between
 /// reactor steps.
-static PENDING_CHILD_SUBMITS: tx_substrate::SpinMutex<
-    alloc::vec::Vec<tx_substrate::zone::Cap<tx_subsystems::thread_runtime::ThreadIdentity>>,
-> = tx_substrate::SpinMutex::new(alloc::vec::Vec::new());
+static PENDING_CHILD_SUBMITS: SpinMutex<
+    alloc::vec::Vec<Cap<tx_subsystems::thread_runtime::ThreadIdentity>>,
+> = SpinMutex::new(alloc::vec::Vec::new());
 
 /// Synchronously poll a future to completion using a noop waker.
 ///

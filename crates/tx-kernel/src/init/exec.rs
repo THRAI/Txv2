@@ -16,7 +16,7 @@
 // CoreInit<P>` block in this file augments the one in `init.rs`.
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, page_allocator, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
@@ -188,7 +188,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     tx_subsystems::page_backed::MaterializeAccess::Write,
                 )
                 .expect("register_busybox_into_tmpfs: materialize_anon");
-            let frame_base = tx_substrate::page_allocator::frame_kernel_addr(materialised.ppn)
+            let frame_base = page_allocator::frame_kernel_addr(materialised.ppn)
                 .expect("register_busybox_into_tmpfs: direct-map view");
             // SAFETY: `materialised.map_pin` keeps the page resident
             // for this scope; destination region covers exactly
@@ -291,7 +291,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     tx_subsystems::page_backed::MaterializeAccess::Write,
                 )
                 .expect("register_init_fixture_into_tmpfs: materialize_anon");
-            let frame_base = tx_substrate::page_allocator::frame_kernel_addr(materialised.ppn)
+            let frame_base = page_allocator::frame_kernel_addr(materialised.ppn)
                 .expect("register_init_fixture_into_tmpfs: direct-map view");
             // SAFETY: `materialised.map_pin` keeps the page resident
             // for the duration of this scope; the destination region

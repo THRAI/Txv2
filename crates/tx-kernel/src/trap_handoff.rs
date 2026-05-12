@@ -45,9 +45,8 @@ use boot_runtime::userspace::{
 /// trio plan's "Phase 1 surface" reference for everyone above the
 /// reactor.
 pub use boot_runtime::userspace::SyscallRequest;
-use tx_substrate::zone::PayloadCap;
 use tx_subsystems::thread_runtime::{current_thread_payload, ThreadPayload};
-use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, PayloadCap, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 use crate::adapter::boot_runtime;
 
 /// Re-export of the reactor's [`PageFaultAccess`] for the trap-shell
