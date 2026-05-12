@@ -22,6 +22,8 @@ pub static FAULT_SIGSEGV_ACCESS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 pub static FAULT_SIGSEGV_HITS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+pub static FAULT_SIGSEGV_PID: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 use tx_hal::{BootHandoff, TxPlatform};
 
