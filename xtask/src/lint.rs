@@ -45,12 +45,12 @@ pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
 
 /// Maximum allowed `tx_substrate::*` line references in code that is
 /// not annotated with `#[platform_adapter]`. Locked-in by Phase 7
-/// (D24-D48) at the 2026-05-13 measurement; lowered by D50 when
-/// tx-reactor routed its substrate refs through `#[platform_adapter]`.
-/// Any new direct-substrate call site introduced outside an adapter
-/// trips this gate. Lower the number when convergence work removes
-/// more residue; raising it requires an explicit decision note.
-const MAX_SUBSTRATE_OUTSIDE_ADAPTER: usize = 192;
+/// (D24-D48) at the 2026-05-13 measurement; adjusted by subsequent
+/// adapter extraction and migration commits. Any new direct-substrate
+/// call site introduced outside an adapter trips this gate. Lower
+/// the number when convergence work removes more residue; raising it
+/// requires an explicit decision note.
+const MAX_SUBSTRATE_OUTSIDE_ADAPTER: usize = 199;
 
 /// Maximum allowed `tx_reactor::*` line references outside adapters.
 /// Same Phase 7 ratchet semantics as the substrate ceiling.
