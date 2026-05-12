@@ -4,6 +4,23 @@
 
 ## Current Shape
 
+- 2026-05-13 D41-D45 Phase 7 cross-crate wave LANDED. Five commits
+  completing the substrate adapter migration across all remaining crates:
+  D41 tx-ext4 (f079e21), D42 tx-kernel (876f9b5), D43 tx-scripts (0f5d79c),
+  D44 tx-fs (38a4607), D45 tx-shims (f0bfe61). Each crate now routes all
+  tx_substrate::/tx_reactor:: refs through per-crate adapter modules. Key
+  patterns: PlaceholderProcessSubject alias for ProcessIdentity collision
+  avoidance; guard as ebr_guard in test files with let-binding shadowing
+  (dac_setuid_wave4.rs, fd_ops_wave2.rs); two-domain adapters (step_engine
+  + boot_runtime/reactor_entry) in tx-kernel and tx-shims. Allowed residue
+  preserved: tx_substrate::testing::init_host_for_test_once (test harness
+  chain), tx_substrate::epoch::drain_with_budget. **Boundary report:**
+  substrate outside-adapter 575→304 lines / 96 files (−271), inside
+  100→150 (+50); reactor outside 22→19 (−3), inside 18→18; adapters 43
+  declared (unchanged). **Verified:** tx-ext4 7/7, tx-kernel 43/43,
+  tx-scripts 47/47, tx-fs 39/39, tx-shims 233/233 all pass
+  single-threaded. ADR: 2026-05-13-d41-d45-phase7-cross-crate-adapter.md
+
 - 2026-05-13 D34-D40 Phase 7 continued: thread_runtime, signalfd, aio,
   userfaultfd, io_uring, reactor_submit, execution, device, wait_source,
   zones, lib, initramfs LANDED. 7 commits (D34-D40 + fixup). Each file
