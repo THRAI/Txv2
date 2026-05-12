@@ -17,6 +17,7 @@ mod submit;
 mod target;
 mod test;
 mod trap_trace;
+mod unit;
 mod util;
 
 pub fn run() -> Result<()> {
@@ -47,6 +48,7 @@ pub fn run() -> Result<()> {
         "submit" => submit::submit(&root, args.collect()),
         "progress" => progress::progress(&root, args.collect()),
         "lint" => lint::lint(&root, args.collect()),
+        "unit" => unit::unit(&root),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -79,7 +81,8 @@ fn print_usage() {
            cargo xtask progress new plan|handoff|worktree --id ID --title TITLE [...]\n\
            cargo xtask progress claim plan|worktree --id ID --owner NAME --scope PATH [--scope PATH]\n\
            cargo xtask progress close plan|handoff|worktree --id ID --status STATUS\n\
-           cargo xtask lint arch|docs|unused\n"
+           cargo xtask lint arch|docs|unused\n\
+           cargo xtask unit\n"
     );
 }
 

@@ -147,7 +147,7 @@ fn qemu_command(
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
             args.push("-bios".into());
-            args.push("default".into());
+            args.push(opensbi_bios(root));
         }
         TxTarget::La64Qemu => {}
     }
@@ -302,6 +302,15 @@ fn run_with_sentinel(
         }
 
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn opensbi_bios(root: &Path) -> String {
+    let silent = root.join("external/opensbi-silent/fw_dynamic.bin");
+    if silent.exists() {
+        silent.display().to_string()
+    } else {
+        "default".to_string()
     }
 }
 
