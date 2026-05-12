@@ -19,11 +19,11 @@ use tx_hal::{
     PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PtNode,
 };
-use tx_reactor::userspace::{
+use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult, NR_EXIT_GROUP, NR_WRITE};
+use crate::adapter::step_engine::PayloadCap;
+use crate::adapter::boot_runtime::userspace::{
     PageFaultAccess, PageFaultInfo, SyscallRequest, UserAddr, UserspaceTrapInfo,
 };
-use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult, NR_EXIT_GROUP, NR_WRITE};
-use tx_substrate::zone::PayloadCap;
 use tx_subsystems::process::ExitStatus;
 use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::{
@@ -432,8 +432,9 @@ fn pf_access_translates_to_vm_access_mode() {
 /// `materialize_pagebacked` (private-anon read fault) can publish
 /// the global zero PPN. Idempotent across tests.
 fn ensure_zero_frame_claimed() {
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    use crate::adapter::step_engine::page_allocator;
+    match page_allocator::claim_zero_frame() {
+        Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for thread-future tests: {error:?}"),
     }
 }

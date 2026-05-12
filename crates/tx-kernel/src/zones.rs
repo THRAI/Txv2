@@ -1,7 +1,7 @@
 use tx_hal::TxPlatform;
-use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, ZoneError};
 
-pub(crate) fn register_all() -> Result<(), tx_substrate::zone::ZoneError> {
+pub(crate) fn register_all() -> Result<(), ZoneError> {
     tx_subsystems::zones::register_all()
 }
 

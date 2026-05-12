@@ -84,7 +84,6 @@ use boot_runtime::userspace::{
     PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserspaceEntryDecision,
     UserspaceTrapInfo,
 };
-use tx_substrate::zone::PayloadCap;
 use tx_subsystems::process::execution::step_exit_group_with_signal;
 use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload;
@@ -92,7 +91,7 @@ use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, set_current_thread_payload, ThreadIdentity, ThreadPayload,
 };
 use tx_subsystems::vm::{AccessMode, UserVirtAddr, VmFault};
-use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, PayloadCap, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 use crate::adapter::boot_runtime;
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
@@ -192,7 +191,7 @@ impl<P: TxPlatform, F: Future> Future for PerHartSlotted<P, F> {
 /// `txdoc:THREAD-4-2-OWNERSHIP`; epoch-managed `Cap` is safe across
 /// yields. No `IdentRef<'g, _>` ever crosses an await.
 pub async fn run_thread<P: TxPlatform>(
-    thread: tx_substrate::zone::Cap<ThreadIdentity>,
+    thread: Cap<ThreadIdentity>,
     payload: PayloadCap<ThreadPayload>,
 ) {
     loop {

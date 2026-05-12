@@ -29,9 +29,9 @@ pub mod step_engine {
         ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     };
     pub use tx_substrate::zone::{
-        reserve_for, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
+        reserve_for, sign_for, Cap, PayloadCap, Zone, ZoneAllocated, ZoneError,
     };
-    pub use tx_substrate::SpinMutex;
+    pub use tx_substrate::{init, init_on_ap, page_allocator, SpinMutex};
 
     pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
         let reservation = zone::reserve_for::<T>()?;
