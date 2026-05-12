@@ -134,7 +134,7 @@ impl MountPayload {
         fstype: &'static str,
         source_label: SourceLabel,
     ) -> Result<Cap<Self>, ZoneError> {
-        runtime::sign_zone_for(Self::new(
+        runtime::sign(Self::new(
             fs_ops,
             fs_page_backing,
             backing,
@@ -248,7 +248,7 @@ impl MountIdentity {
         flags: MountFlags,
     ) -> Result<Cap<Self>, ZoneError> {
         let payload = PayloadBinding::installed(PayloadCap::from_cap(payload));
-        runtime::sign_zone_for(Self::new(id, mountpoint, root, parent, payload, flags))
+        runtime::sign(Self::new(id, mountpoint, root, parent, payload, flags))
     }
 
     pub const fn id(&self) -> MountId {
@@ -301,7 +301,7 @@ impl MountNamespace {
     }
 
     pub fn new_cap(root: Cap<MountIdentity>) -> Result<Cap<Self>, ZoneError> {
-        runtime::sign_zone_for(Self::new(root))
+        runtime::sign(Self::new(root))
     }
 
     pub fn root(&self) -> &Cap<MountIdentity> {

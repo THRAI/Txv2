@@ -1,7 +1,7 @@
 use tx_substrate::epoch;
 use tx_substrate::zone::{
     self, registered_zone_count, CoLocatedEntity, OperationalCapExt, OperationalRefExt, Zone,
-    ZoneAllocated, ZoneError, ZoneId, ZoneMaintenanceBudget,
+    ZoneAllocated, ZoneError, ZoneId, ZoneMaintenanceBudget, Cap,
 };
 
 static ZONE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -195,4 +195,49 @@ fn colocated_entity_operational_upgrade_matches_identity_cap() {
     assert_eq!(op_from_ref.id, 7);
     assert_eq!(op_from_cap.key(), cap.key());
     assert_eq!(op_from_ref.key(), cap.key());
+}
+
+// === zone::sign tests ===================================================
+
+#[test]
+fn sign_round_trips_a_value() {
+    let _guard = reset_zone_and_epoch();
+    zone::register_zone_for::<Object>().expect("object zone registration");
+
+    let cap: Cap<Object> = zone::sign(Object { id: 42 }).expect("sign succeeds");
+    let epoch_guard = epoch::guard();
+    let view = cap
+        .upgrade_operational()
+        .expect("cap is live after sign");
+    assert_eq!(view.id, 42);
+    drop(epoch_guard);
+}
+
+#[test]
+fn sign_propagates_not_registered_error() {
+    // reserve_for fails with NotRegistered when the zone is not registered.
+    // zone::sign wraps reserve_for, so the same error propagates.
+    let _guard = reset_zone_and_epoch();
+    // Deliberately skip zone::register_zone_for::<Object>() so the zone is unregistered.
+    let err = zone::sign(Object { id: 1 }).expect_err("sign must fail on unregistered zone");
+    assert_eq!(err, ZoneError::NotRegistered);
+}
+
+#[test]
+fn sign_result_matches_reserve_then_sign_for() {
+    // Both paths should produce live, operationally-accessible caps with
+    // the same value; sign is the canonical one-step form.
+    let _guard = reset_zone_and_epoch();
+    zone::register_zone_for::<Object>().expect("object zone registration");
+
+    let one_step: Cap<Object> = zone::sign(Object { id: 10 }).expect("one-step sign");
+    let reservation = zone::reserve_for::<Object>().expect("reserve");
+    let two_step: Cap<Object> = zone::sign_for(reservation, Object { id: 20 });
+
+    let epoch_guard = epoch::guard();
+    let v1 = one_step.upgrade_operational().expect("one_step live");
+    let v2 = two_step.upgrade_operational().expect("two_step live");
+    assert_eq!(v1.id, 10);
+    assert_eq!(v2.id, 20);
+    drop(epoch_guard);
 }

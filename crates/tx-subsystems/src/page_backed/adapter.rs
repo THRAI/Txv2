@@ -17,8 +17,6 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine outcome types, zone role types, page-allocator primitives (BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy), EBR guard, and SpinMutex used by the page_backed subsystem's per-variant fetch/write step ops"
 )]
 pub mod step_engine {
-    use tx_substrate::zone;
-
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::page_allocator::{
         self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,
@@ -29,12 +27,7 @@ pub mod step_engine {
         SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        reserve_for, sign_for, Cap, PayloadCap, Zone, ZoneAllocated, ZoneError,
+        reserve_for, sign, sign_for, Cap, PayloadCap, Zone, ZoneAllocated, ZoneError,
     };
     pub use tx_substrate::SpinMutex;
-
-    pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
-        let reservation = zone::reserve_for::<T>()?;
-        Ok(zone::sign_for(reservation, value))
-    }
 }

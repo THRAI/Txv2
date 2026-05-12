@@ -4,6 +4,22 @@
 
 ## Current Shape
 
+- 2026-05-13 substrate: `zone::sign<T>(value) -> Result<Cap<T>, ZoneError>` LANDED
+  (refactor #6/7, branch cc/crazy-ardinghelli-91c48e). Added `zone::sign` to
+  `crates/tx-substrate/src/zone/mod.rs` as the one-step reserve+publish convenience.
+  Removed the 2-arg `reservation::sign` re-export from `zone::mod` (no external
+  consumers; external API is `sign_for`). Added `sign` to `tx_substrate::verbs`
+  and pinned in `verbs_surface.rs`. Collapsed 20 identical `sign_zone_for` wrappers
+  across adapters: pipe, process, vfs, mount (domain=runtime), signal, page_backed,
+  signalfd, io_uring, userfaultfd, cred, aio, thread_runtime, tmpfs, devfs, shims,
+  kernel, ext4, scripts, tty, vm — all replaced with `pub use tx_substrate::zone::sign`.
+  All call sites updated from `sign_zone_for(x)` to `sign(x)`. No bespoke wrappers
+  kept (all were identical 2-line patterns). 3 new zone tests added to zone.rs
+  (sign_round_trips_a_value, sign_propagates_not_registered_error,
+  sign_result_matches_reserve_then_sign_for), all passing. Build clean. Boundary
+  lint 0/0. 1698/1711 tests pass; 13 pre-existing page_backed/vm failures unchanged.
+  Net LoC delta: negative (collapsed ~80 wrapper lines). Next: #7/7.
+
 - 2026-05-13 substrate+reactor: canonical wake/wait verbs promoted out of per-subsystem adapters LANDED
   (refactor #5/7, branch cc/crazy-ardinghelli-91c48e). Added `tx_substrate::wake::new_source(id)
   -> Arc<WaitSource>` and `tx_substrate::wake::notify(source, mask_bits)` free functions; added

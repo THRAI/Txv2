@@ -375,7 +375,7 @@ pub fn step_pipe2(flags: PipeFlags) -> Result<(Cap<OpenFile>, Cap<OpenFile>), Er
     // 1. Mint the shared payload + cap.
     let payload_value = PipePayload::new().map_err(|_| Errno::ENOMEM)?;
     let payload_cap: Cap<PipePayload> =
-        step_engine::sign_zone_for(payload_value).map_err(|_| Errno::ENOMEM)?;
+        step_engine::sign(payload_value).map_err(|_| Errno::ENOMEM)?;
 
     // 2. Build per-side RNodes. Each carries
     //    `StructPayload::Pipe { payload, side }` so dispatch in

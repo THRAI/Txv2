@@ -29,8 +29,6 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine (StepOp/StepOutcome/NoProgress/ScriptCtx/SubjectIdentity), D9-A signal-wake mailbox (MailboxEvent/SignalRouting/TaskMailbox), zone role types (Cap/PayloadCap/Weak/Dead/Entity/OperationalCapExt/Zone/ZoneAllocated), EBR guard, and SpinMutex used by thread_runtime structure, execution, and tests"
 )]
 pub mod step_engine {
-    use tx_substrate::zone;
-
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
@@ -38,14 +36,10 @@ pub mod step_engine {
     };
     pub use tx_substrate::wake::{MailboxEvent, SignalRouting, TaskMailbox};
     pub use tx_substrate::zone::{
-        Cap, Dead, Entity, OperationalCapExt, PayloadCap, Weak, Zone, ZoneAllocated,
+        sign, Cap, Dead, Entity, OperationalCapExt, PayloadCap, Weak, Zone, ZoneAllocated,
+        ZoneError,
     };
     pub use tx_substrate::SpinMutex;
-
-    pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, tx_substrate::zone::ZoneError> {
-        let reservation = zone::reserve_for::<T>()?;
-        Ok(zone::sign_for(reservation, value))
-    }
 }
 
 #[platform_adapter(

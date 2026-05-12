@@ -324,7 +324,7 @@ fn walk_inner_v3<'g>(
         };
         let mut child_dentry_raw = DEntry::new(child_inline, child_rnode_cap.clone());
         child_dentry_raw.set_parent_hint(&current);
-        let child_dentry = match step_engine::sign_zone_for(child_dentry_raw) {
+        let child_dentry = match step_engine::sign(child_dentry_raw) {
             Ok(cap) => cap,
             Err(_) => return V3::err(step_engine::Errno::ENOMEM),
         };
@@ -532,7 +532,7 @@ fn check_open_perm(meta: &InodeMeta, flags: OpenFileFlags, cred: &Credential) ->
 /// root for an absolute symlink target.
 fn dentry_for_mount_root(mount: &Cap<MountIdentity>) -> Result<Cap<DEntry>, Errno> {
     let raw = DEntry::new(InlineName::ROOT, mount.root().clone());
-    step_engine::sign_zone_for(raw).map_err(|_| Errno::ENOMEM)
+    step_engine::sign(raw).map_err(|_| Errno::ENOMEM)
 }
 
 /// Walk `from`'s parent-hint chain to find the namespace's root

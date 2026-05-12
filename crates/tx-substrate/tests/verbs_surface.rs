@@ -20,6 +20,7 @@ use tx_substrate::verbs::{
     YieldShape,
     // Zone allocation
     reserve_for,
+    sign,
     sign_for,
     Cap,
     Dead,
