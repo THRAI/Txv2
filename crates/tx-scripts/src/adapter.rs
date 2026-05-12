@@ -16,7 +16,10 @@ pub mod step_engine {
 
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::{
-        ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+        AcceptOutcome, AgentCancelPolicy, ByteProgress, Deadline, DelegateEndpoint,
+        DelegateRequest, DelegateToken, DriveMode, Errno, InterestMask, NoProgress, ProcessIdentity,
+        ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity, Translation, WaitSourceId,
+        YieldShape,
     };
     pub use tx_substrate::zone::{
         reserve_for, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
