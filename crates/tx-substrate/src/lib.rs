@@ -26,6 +26,7 @@ pub mod slab;
 pub mod slot;
 pub mod step;
 pub mod sync;
+pub mod verbs;
 pub mod wake;
 pub mod zone;
 
