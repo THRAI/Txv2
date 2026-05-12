@@ -46,11 +46,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use tx_reactor::wait::{Channel, Mask};
-use tx_substrate::step_v3::{InterestMask, WaitSourceId};
-use tx_substrate::wake::WaitSource;
-use tx_substrate::zone::{self, Cap, ZoneAllocated, ZoneError};
-use tx_substrate::SpinMutex;
+pub mod adapter;
+
+use adapter::step_engine::{
+    self, ByteProgress, Cap, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome,
+    SubjectIdentity, Zone, ZoneAllocated, ZoneError,
+};
+use adapter::wait_routing::{self, Channel, WaitSource};
 
 use crate::execution::{Errno, Guard};
 use crate::vfs::structure::{
@@ -202,16 +204,16 @@ impl RingBuffer {
 
 // === zone wiring ======================================================
 
-static PIPE_PAYLOAD_ZONE: zone::Zone<PipePayload> = zone::Zone::const_new();
+static PIPE_PAYLOAD_ZONE: Zone<PipePayload> = Zone::const_new();
 
 unsafe impl ZoneAllocated for PipePayload {
-    fn zone() -> &'static zone::Zone<Self> {
+    fn zone() -> &'static Zone<Self> {
         &PIPE_PAYLOAD_ZONE
     }
 }
 
 pub(crate) fn register_zones() -> Result<(), ZoneError> {
-    zone::register_zone_for::<PipePayload>()?;
+    step_engine::register_zone_for::<PipePayload>()?;
     Ok(())
 }
 
@@ -234,10 +236,8 @@ impl PipePayload {
         // the legacy registry's id namespace so a v3 caller using the
         // `WaitSourceId` stamped into `YieldShape::OnWaitSource` lands
         // on the right side here.
-        let reader_wait_source =
-            Arc::new(WaitSource::new(WaitSourceId::new(reader_wait_source_id)));
-        let writer_wait_source =
-            Arc::new(WaitSource::new(WaitSourceId::new(writer_wait_source_id)));
+        let reader_wait_source = wait_routing::new_wait_source(reader_wait_source_id);
+        let writer_wait_source = wait_routing::new_wait_source(writer_wait_source_id);
 
         Ok(Self {
             ring: SpinMutex::new(RingBuffer::new()),
@@ -302,14 +302,12 @@ impl PipePayload {
         let prev = self.reader_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             // Legacy path (D2 coexistence): wake any `Waker`-based waiter.
-            self.writer_wait_channel
-                .fire(Mask::from_bits(PIPE_WRITABLE));
+            wait_routing::fire_legacy_channel(&self.writer_wait_channel, PIPE_WRITABLE);
             // PR-3D-1 new path: post `MailboxEvent::SourceFired` to
             // any v3 caller that registered against the writer
             // source. Blocked writers will re-observe and surface
             // EPIPE on the next step (reader_count == 0).
-            self.writer_wait_source
-                .notify(InterestMask::new(PIPE_WRITABLE));
+            wait_routing::notify_v3_source(&self.writer_wait_source, PIPE_WRITABLE);
         }
     }
 
@@ -321,12 +319,10 @@ impl PipePayload {
         let prev = self.writer_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             // Legacy path (D2 coexistence).
-            self.reader_wait_channel
-                .fire(Mask::from_bits(PIPE_READABLE));
+            wait_routing::fire_legacy_channel(&self.reader_wait_channel, PIPE_READABLE);
             // PR-3D-1 new path. Blocked readers will re-observe and
             // surface EOF (Done(0)) on the next step.
-            self.reader_wait_source
-                .notify(InterestMask::new(PIPE_READABLE));
+            wait_routing::notify_v3_source(&self.reader_wait_source, PIPE_READABLE);
         }
     }
 
@@ -378,8 +374,8 @@ fn allocate_pipe_fs_object_id() -> FsObjectId {
 pub fn step_pipe2(flags: PipeFlags) -> Result<(Cap<OpenFile>, Cap<OpenFile>), Errno> {
     // 1. Mint the shared payload + cap.
     let payload_value = PipePayload::new().map_err(|_| Errno::ENOMEM)?;
-    let payload_reservation = zone::reserve_for::<PipePayload>().map_err(|_| Errno::ENOMEM)?;
-    let payload_cap: Cap<PipePayload> = zone::sign_for(payload_reservation, payload_value);
+    let payload_cap: Cap<PipePayload> =
+        step_engine::sign_zone_for(payload_value).map_err(|_| Errno::ENOMEM)?;
 
     // 2. Build per-side RNodes. Each carries
     //    `StructPayload::Pipe { payload, side }` so dispatch in
@@ -456,9 +452,9 @@ pub fn step_read(
     out: &mut [u8],
     _guard: &Guard<'_>,
     nonblocking: bool,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+) -> StepOutcome<usize, ByteProgress> {
     if out.is_empty() {
-        return tx_substrate::step_v3::StepOutcome::done(0);
+        return step_engine::done_bytes(0);
     }
     let mut ring = payload.ring.lock();
     if !ring.is_empty() {
@@ -467,27 +463,19 @@ pub fn step_read(
         // Wake any writer parked on space-available — both paths
         // (D2 coexistence): legacy `Channel` waker AND the new
         // `WaitSource` mailbox path.
-        payload
-            .writer_wait_channel
-            .fire(Mask::from_bits(PIPE_WRITABLE));
-        payload
-            .writer_wait_source
-            .notify(InterestMask::new(PIPE_WRITABLE));
-        return tx_substrate::step_v3::StepOutcome::done(copied);
+        wait_routing::fire_legacy_channel(&payload.writer_wait_channel, PIPE_WRITABLE);
+        wait_routing::notify_v3_source(&payload.writer_wait_source, PIPE_WRITABLE);
+        return step_engine::done_bytes(copied);
     }
     drop(ring);
     // Empty ring. EOF if all writers gone, otherwise block / EAGAIN.
     if payload.writer_count.load(Ordering::Acquire) == 0 {
-        return tx_substrate::step_v3::StepOutcome::done(0);
+        return step_engine::done_bytes(0);
     }
     if nonblocking {
-        return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN);
+        return step_engine::eagain();
     }
-    tx_substrate::step_v3::StepOutcome::yield_on_wait_source(
-        tx_substrate::step_v3::ByteProgress::EMPTY,
-        payload.reader_wait_source_id,
-        PIPE_READABLE,
-    )
+    step_engine::yield_until_readable(payload.reader_wait_source_id, PIPE_READABLE)
 }
 
 /// `write(pipe_fd, buf, len)`.
@@ -503,12 +491,12 @@ pub fn step_write(
     bytes: &[u8],
     _guard: &Guard<'_>,
     nonblocking: bool,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+) -> StepOutcome<usize, ByteProgress> {
     if bytes.is_empty() {
-        return tx_substrate::step_v3::StepOutcome::done(0);
+        return step_engine::done_bytes(0);
     }
     if payload.reader_count.load(Ordering::Acquire) == 0 {
-        return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EPIPE);
+        return step_engine::epipe();
     }
     let mut ring = payload.ring.lock();
     if !ring.is_full() {
@@ -516,23 +504,15 @@ pub fn step_write(
         drop(ring);
         // Wake any reader parked on bytes-available — both paths
         // (D2 coexistence).
-        payload
-            .reader_wait_channel
-            .fire(Mask::from_bits(PIPE_READABLE));
-        payload
-            .reader_wait_source
-            .notify(InterestMask::new(PIPE_READABLE));
-        return tx_substrate::step_v3::StepOutcome::done(copied);
+        wait_routing::fire_legacy_channel(&payload.reader_wait_channel, PIPE_READABLE);
+        wait_routing::notify_v3_source(&payload.reader_wait_source, PIPE_READABLE);
+        return step_engine::done_bytes(copied);
     }
     drop(ring);
     if nonblocking {
-        return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN);
+        return step_engine::eagain();
     }
-    tx_substrate::step_v3::StepOutcome::yield_on_wait_source(
-        tx_substrate::step_v3::ByteProgress::EMPTY,
-        payload.writer_wait_source_id,
-        PIPE_WRITABLE,
-    )
+    step_engine::yield_until_writable(payload.writer_wait_source_id, PIPE_WRITABLE)
 }
 
 // ---------------------------------------------------------------------------
@@ -554,16 +534,16 @@ pub struct Pipe2Op {
     pub flags: PipeFlags,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for Pipe2Op {
+impl<I: SubjectIdentity> StepOp<I> for Pipe2Op {
     type Output = (Cap<OpenFile>, Cap<OpenFile>);
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         match step_pipe2(self.flags) {
-            Ok(pair) => tx_substrate::step_v3::StepOutcome::Done(pair),
-            Err(e) => tx_substrate::step_v3::StepOutcome::Err(e.into()),
+            Ok(pair) => StepOutcome::Done(pair),
+            Err(e) => StepOutcome::Err(e.into()),
         }
     }
 }
@@ -576,15 +556,13 @@ pub struct ReadOp<'a> {
     pub nonblocking: bool,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
-    for ReadOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
-    type Progress = tx_substrate::step_v3::ByteProgress;
+    type Progress = ByteProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_read(self.payload, self.out, self.guard, self.nonblocking)
     }
 }
@@ -597,15 +575,13 @@ pub struct WriteOp<'a> {
     pub nonblocking: bool,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
-    for WriteOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Output = usize;
-    type Progress = tx_substrate::step_v3::ByteProgress;
+    type Progress = ByteProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_write(self.payload, self.bytes, self.guard, self.nonblocking)
     }
 }
