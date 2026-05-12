@@ -16,7 +16,7 @@
 //! PR-7B's timer-tick → substrate-state-machine glue
 //! ([`TimerWheel::install_delegate_timeout`] /
 //! [`TimerWheel::fire_due_delegate_timeouts`]) lives here too: both
-//! the wheel and [`crate::step_v3::DelegateRegistry`] are substrate
+//! the wheel and [`crate::step::DelegateRegistry`] are substrate
 //! types, so the routing call is a same-crate edge.
 
 use alloc::{sync::Arc, vec::Vec};
@@ -41,14 +41,14 @@ pub struct TimerToken(u64);
 impl TimerToken {
     /// Construct a `TimerToken` from a raw `u64`. Provided so tests
     /// and PR-7's eventual reconciliation with
-    /// [`crate::step_v3::TimerId`] can round-trip the id
+    /// [`crate::step::TimerId`] can round-trip the id
     /// without going through [`TimerWheel::install`].
     pub const fn new(raw: u64) -> Self {
         Self(raw)
     }
 
     /// The underlying raw id. Useful for log/trace lines and for
-    /// bridging to `crate::step_v3::TimerId` until PR-7
+    /// bridging to `crate::step::TimerId` until PR-7
     /// collapses the two.
     pub const fn raw(self) -> u64 {
         self.0
