@@ -200,6 +200,12 @@ pub(crate) fn ci_slow(root: &Path) -> Result<()> {
                 "--profile",
                 "smoke",
                 "--expect-sentinel",
+                // GitHub Actions runs qemu-system-riscv64 under software
+                // emulation (no KVM); the 10s dev default isn't enough
+                // headroom for SMP=4 boot through reactor + process +
+                // tty + mount + init. 30s is empirically comfortable.
+                "--timeout-ms",
+                "30000",
             ],
             "txdoc:CI-GATE-QEMU-SMOKE",
         ),
