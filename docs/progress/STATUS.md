@@ -4,6 +4,27 @@
 
 ## Current Shape
 
+- 2026-05-13 D47-D48 Phase 7 integration test migration LANDED.
+  tx-subsystems integration tests (14 files, commit 82b8ef0) and tx-shims
+  integration tests (10 files + adapter.rs, commit 4b6bbf4) migrated to
+  consume crate-public adapter modules instead of direct tx_substrate::/
+  tx_reactor:: refs. Key adapter changes: made pub(crate) mod adapter →
+  pub mod adapter in aio/signalfd/userfaultfd/io_uring (4 inline adapters);
+  lib.rs root adapter made pub; added DelegateState/TransitionOutcome/
+  DelegateTokenId to vm adapter; added MailboxEvent/TaskMailbox/
+  WaitGeneration/WaitRegistrationGuard to pipe/futex/tty/vfs/process
+  wait_routing adapters; added reactor interrupt types to signal adapter
+  new wait_routing domain; added CancelReason/DelegateState/DelegateRequest/
+  etc to tx-shims step_engine adapter; added SyscallRequest to tx-shims
+  reactor_entry. **Boundary report (final):** substrate outside adapters
+  301→208 lines / 94 files (−93 lines); reactor outside adapters 19→4 lines
+  / 4 files (−15 lines). All 4 remaining reactor lines and residue substrate
+  refs are allowed (epoch::drain_with_budget, testing::init_host_for_test_once,
+  doc comments). tx-reactor integration tests deferred — no adapter module
+  exists in that crate (wait_bus.rs macros, timer tests). **Verified:**
+  cargo build --tests -p tx-subsystems and -p tx-shims both clean; boundary-
+  report numbers confirmed post-commit. Phase 7 D17-D48 complete.
+
 - 2026-05-13 D41-D45 Phase 7 cross-crate wave LANDED. Five commits
   completing the substrate adapter migration across all remaining crates:
   D41 tx-ext4 (f079e21), D42 tx-kernel (876f9b5), D43 tx-scripts (0f5d79c),
