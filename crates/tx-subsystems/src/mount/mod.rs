@@ -523,6 +523,7 @@ mod tests {
     use super::*;
     use crate::execution::{Errno, Guard};
     use crate::page_backed::{Frame, PageContainerKind};
+    use crate::vfs::adapter::step_engine::{Errno as V3Errno, NoProgress, StepOutcome};
     use crate::vfs::{Credential, DirCursor, DirEntry, InodeKind, RNodeBacking};
 
     struct MockFs;
@@ -533,12 +534,12 @@ mod tests {
             _parent: FsObjectId,
             name: &[u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress>
+        ) -> StepOutcome<FsObjectId, NoProgress>
         {
             if name == b"root" {
-                tx_substrate::step_v3::StepOutcome::done(FsObjectId::ROOT)
+                StepOutcome::done(FsObjectId::ROOT)
             } else {
-                tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT)
+                StepOutcome::err(V3Errno::ENOENT)
             }
         }
 
@@ -546,9 +547,9 @@ mod tests {
             &self,
             _fs_object_id: FsObjectId,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress>
+        ) -> StepOutcome<InodeMeta, NoProgress>
         {
-            tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755))
+            StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755))
         }
 
         fn serialize_inode_meta(
@@ -556,8 +557,8 @@ mod tests {
             _fs_object_id: FsObjectId,
             _meta: &InodeMeta,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::done(())
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
         }
 
         fn create_inode(
@@ -567,11 +568,11 @@ mod tests {
             _mode: u16,
             _cred: &Credential,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<
+        ) -> StepOutcome<
             (FsObjectId, InodeMeta),
-            tx_substrate::step_v3::NoProgress,
+            NoProgress,
         > {
-            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+            StepOutcome::err(V3Errno::EROFS)
         }
 
         fn unlink(
@@ -580,8 +581,8 @@ mod tests {
             _name: &[u8],
             _target: FsObjectId,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(V3Errno::EROFS)
         }
 
         fn rename(
@@ -591,8 +592,8 @@ mod tests {
             _new_parent: FsObjectId,
             _new_name: &[u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(V3Errno::EROFS)
         }
 
         fn link(
@@ -601,8 +602,8 @@ mod tests {
             _name: &[u8],
             _target: FsObjectId,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(V3Errno::EROFS)
         }
 
         fn mkdir(
@@ -612,11 +613,11 @@ mod tests {
             _mode: u16,
             _cred: &Credential,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<
+        ) -> StepOutcome<
             (FsObjectId, InodeMeta),
-            tx_substrate::step_v3::NoProgress,
+            NoProgress,
         > {
-            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+            StepOutcome::err(V3Errno::EROFS)
         }
 
         fn rmdir(
@@ -625,8 +626,8 @@ mod tests {
             _name: &[u8],
             _target: FsObjectId,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(V3Errno::EROFS)
         }
 
         fn symlink(
@@ -636,11 +637,11 @@ mod tests {
             _link_target: &[u8],
             _cred: &Credential,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<
+        ) -> StepOutcome<
             (FsObjectId, InodeMeta),
-            tx_substrate::step_v3::NoProgress,
+            NoProgress,
         > {
-            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+            StepOutcome::err(V3Errno::EROFS)
         }
 
         fn readdir(
@@ -648,19 +649,19 @@ mod tests {
             _fs_object_id: FsObjectId,
             _cursor: DirCursor,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<
+        ) -> StepOutcome<
             Option<(DirEntry, DirCursor)>,
-            tx_substrate::step_v3::NoProgress,
+            NoProgress,
         > {
-            tx_substrate::step_v3::StepOutcome::done(None)
+            StepOutcome::done(None)
         }
 
         fn destroy_inode(
             &self,
             _fs_object_id: FsObjectId,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::done(())
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
         }
     }
 
@@ -670,8 +671,8 @@ mod tests {
             _fs_object_id: FsObjectId,
             _offset: u64,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+        ) -> StepOutcome<Frame, NoProgress> {
+            StepOutcome::err(V3Errno::ENOSYS)
         }
 
         fn flush_page(
@@ -680,8 +681,8 @@ mod tests {
             _offset: u64,
             _frame: &Frame,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(V3Errno::EROFS)
         }
 
         fn truncate(
@@ -689,16 +690,16 @@ mod tests {
             _fs_object_id: FsObjectId,
             _new_size: u64,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(V3Errno::EROFS)
         }
 
         fn fsync(
             &self,
             _fs_object_id: FsObjectId,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::done(())
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
         }
     }
 
@@ -827,10 +828,10 @@ mod tests {
     // surface (`StepOutcome::done` / `err`) is exercised here. The
     // trait impls above stay untouched.
     //
-    // We fully-qualify step_v3 types as `tx_substrate::step_v3::*` so
-    // `StepOutcome`/`Errno` already imported via
-    // `use crate::execution::{Errno, Guard, StepOutcome}` keep working
-    // without rename gymnastics.
+    // We import step_v3 types via `crate::vfs::adapter::step_engine`
+    // under aliases (`V3Errno`, `NoProgress`, `StepOutcome`) so the
+    // surface keeps working alongside `crate::execution::{Errno,
+    // Guard, StepOutcome}` which is also in scope.
     //
     // Coverage:
     // - `mockfs_lookup_v3` — `Done` (happy path) + `Err` (ENOENT).
@@ -847,11 +848,11 @@ mod tests {
         _parent: FsObjectId,
         name: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<FsObjectId, NoProgress> {
         if name == b"root" {
-            tx_substrate::step_v3::StepOutcome::done(FsObjectId::ROOT)
+            StepOutcome::done(FsObjectId::ROOT)
         } else {
-            tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT)
+            StepOutcome::err(V3Errno::ENOENT)
         }
     }
 
@@ -862,8 +863,8 @@ mod tests {
     fn mockfs_load_inode_meta_v3(
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755))
+    ) -> StepOutcome<InodeMeta, NoProgress> {
+        StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755))
     }
 
     /// step_v3-shape sibling of [`MockFs::fetch_page`]. Always returns
@@ -876,10 +877,10 @@ mod tests {
         _fs_object_id: FsObjectId,
         _offset: u64,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<Frame, NoProgress> {
         let exec_err = Errno::ENOSYS;
-        let v3_err: tx_substrate::step_v3::Errno = exec_err.into();
-        tx_substrate::step_v3::StepOutcome::err(v3_err)
+        let v3_err: V3Errno = exec_err.into();
+        StepOutcome::err(v3_err)
     }
 
     #[test]
@@ -888,11 +889,11 @@ mod tests {
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
-        let guard = tx_substrate::epoch::guard();
+        let guard = crate::vfs::adapter::step_engine::guard();
         let outcome = mockfs_lookup_v3(FsObjectId::ROOT, b"root", &guard);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Done(id) => {
+            StepOutcome::Done(id) => {
                 assert_eq!(id, FsObjectId::ROOT);
             }
             other => panic!("expected v3 Done(ROOT), got {other:?}"),
@@ -905,15 +906,15 @@ mod tests {
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
-        let guard = tx_substrate::epoch::guard();
+        let guard = crate::vfs::adapter::step_engine::guard();
         let outcome = mockfs_lookup_v3(FsObjectId::ROOT, b"nope", &guard);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::ENOENT) => {}
-            tx_substrate::step_v3::StepOutcome::Continue { .. }
-            | tx_substrate::step_v3::StepOutcome::Yield { .. }
-            | tx_substrate::step_v3::StepOutcome::Done(_)
-            | tx_substrate::step_v3::StepOutcome::Err(_) => {
+            StepOutcome::Err(V3Errno::ENOENT) => {}
+            StepOutcome::Continue { .. }
+            | StepOutcome::Yield { .. }
+            | StepOutcome::Done(_)
+            | StepOutcome::Err(_) => {
                 panic!("expected v3 Err(ENOENT), got {outcome:?}");
             }
         }
@@ -925,11 +926,11 @@ mod tests {
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
-        let guard = tx_substrate::epoch::guard();
+        let guard = crate::vfs::adapter::step_engine::guard();
         let outcome = mockfs_load_inode_meta_v3(FsObjectId::ROOT, &guard);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Done(meta) => {
+            StepOutcome::Done(meta) => {
                 assert_eq!(meta.kind(), InodeKind::Directory);
                 assert_eq!(meta.mode, 0o040755);
             }
@@ -943,15 +944,15 @@ mod tests {
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
-        let guard = tx_substrate::epoch::guard();
+        let guard = crate::vfs::adapter::step_engine::guard();
         let outcome = mockfs_fetch_page_v3(FsObjectId::ROOT, 0, &guard);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::ENOSYS) => {}
-            tx_substrate::step_v3::StepOutcome::Continue { .. }
-            | tx_substrate::step_v3::StepOutcome::Yield { .. }
-            | tx_substrate::step_v3::StepOutcome::Done(_)
-            | tx_substrate::step_v3::StepOutcome::Err(_) => {
+            StepOutcome::Err(V3Errno::ENOSYS) => {}
+            StepOutcome::Continue { .. }
+            | StepOutcome::Yield { .. }
+            | StepOutcome::Done(_)
+            | StepOutcome::Err(_) => {
                 panic!("expected v3 Err(ENOSYS), got {outcome:?}");
             }
         }
