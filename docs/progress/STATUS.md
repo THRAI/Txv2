@@ -1,8 +1,21 @@
 # txKernel Status
 
-**Updated:** 2026-05-12
+**Updated:** 2026-05-13
 
 ## Current Shape
+
+- 2026-05-13 D31+D32 Phase 7 (page_backed, vm) adapter migration
+  LANDED. Two commits: D31 for page_backed, D32 for vm. Both subsystems
+  now route all tx_substrate::*/tx_reactor::* through their per-subsystem
+  adapter re-exports. vm/adapter.rs additions: PageProgress,
+  PlaceholderProcessSubject, await_agent_reply. **Boundary report:**
+  substrate outside-adapter 756 lines/130 files, inside 99 lines/16
+  files; reactor outside 32 lines/27 files, inside 11 lines/8 files;
+  adapters declared 30. **Verified:** cargo build -p tx-subsystems clean
+  (4 pre-existing warnings); vm tests 97/97 pass; page_backed tests
+  81/81 pass single-threaded (concurrent failures are pre-existing epoch
+  nesting races). Next: progress catch-up and boundary-report delta
+  relative to D23 baseline.
 
 - 2026-05-12 D23 Phase 6 (tx-shims, tx-kernel, tx-ext4, tx-scripts)
   adapter migration LANDED. Cross-layer consumer crates. tx-kernel
