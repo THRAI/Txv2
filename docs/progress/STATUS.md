@@ -4,6 +4,20 @@
 
 ## Current Shape
 
+- 2026-05-13 substrate+reactor: canonical wake/wait verbs promoted out of per-subsystem adapters LANDED
+  (refactor #5/7, branch cc/crazy-ardinghelli-91c48e). Added `tx_substrate::wake::new_source(id)
+  -> Arc<WaitSource>` and `tx_substrate::wake::notify(source, mask_bits)` free functions; added
+  `tx_reactor::wait::fire_legacy(channel, mask_bits) -> usize` free function. Collapsed the
+  3-function `new_wait_source`/`fire_legacy_channel`/`notify_v3_source` bodies in 5 adapter
+  modules (pipe, futex, process, vfs, tty) to one-line delegations. Adapters cannot vanish
+  entirely because they still re-export types (Channel, Mask, WaitSource, etc.) used by subsystem
+  callers. Adapters without the 3 verbs (io_uring, aio, userfaultfd, signalfd, vm) unchanged.
+  4 new integration tests in `crates/tx-substrate/tests/wake_verbs.rs`. Workspace build clean.
+  1147/1152 tests pass; 5 pre-existing `page_backed` zone-registration failures unchanged.
+  Boundary lint 0/0. Platform adapters declared: 48 (unchanged — the 3 verbs were within
+  existing adapter modules, not new `#[platform_adapter]` blocks). Future observation hooks
+  attach in 3 canonical places instead of 15. Next: #6/7.
+
 - 2026-05-13 substrate: `tx_substrate::verbs` curated re-export module LANDED
   (refactor #4/7, branch cc/crazy-ardinghelli-91c48e, commit 933a02f). Added
   `crates/tx-substrate/src/verbs.rs` collecting 35 cross-cutting types and

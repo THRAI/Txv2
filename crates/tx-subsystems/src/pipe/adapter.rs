@@ -105,7 +105,6 @@ pub mod step_engine {
 )]
 pub mod wait_routing {
     use alloc::sync::Arc;
-    use tx_substrate::step::{InterestMask, WaitSourceId};
 
     pub use tx_reactor::wait::{Channel, Mask};
     pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};
@@ -115,19 +114,25 @@ pub mod wait_routing {
     /// `crate::wait_source::register_wait_channel` so the legacy
     /// (`Channel`) and v3 (`WaitSource`) paths share an id namespace
     /// (PR-3D-1 / D2 coexistence).
+    ///
+    /// Delegates to `tx_substrate::wake::new_source`.
     pub fn new_wait_source(side_id: u64) -> Arc<WaitSource> {
-        Arc::new(WaitSource::new(WaitSourceId::new(side_id)))
+        tx_substrate::wake::new_source(side_id)
     }
 
     /// Fire the legacy `Channel` for one side of a pipe — the D2
     /// coexistence path that the resolver still uses today.
+    ///
+    /// Delegates to `tx_reactor::wait::fire_legacy`.
     pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {
-        channel.fire(Mask::from_bits(mask_bits))
+        tx_reactor::wait::fire_legacy(channel, mask_bits)
     }
 
     /// Notify the v3 `WaitSource` for one side of a pipe — the
     /// mailbox path that the new caller stack uses.
+    ///
+    /// Delegates to `tx_substrate::wake::notify`.
     pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
-        source.notify(InterestMask::new(mask_bits));
+        tx_substrate::wake::notify(source, mask_bits)
     }
 }

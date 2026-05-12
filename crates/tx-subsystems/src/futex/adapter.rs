@@ -58,7 +58,6 @@ pub mod step_engine {
 )]
 pub mod wait_routing {
     use alloc::sync::Arc;
-    use tx_substrate::step::{InterestMask, WaitSourceId};
 
     pub use tx_reactor::wait::{Channel, Mask};
     pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};
@@ -67,19 +66,25 @@ pub mod wait_routing {
     /// bucket's `source_id` so the legacy `Channel` resolver and the
     /// v3 mailbox path share the id namespace (PR-3D-2 / D2
     /// coexistence).
+    ///
+    /// Delegates to `tx_substrate::wake::new_source`.
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
-        Arc::new(WaitSource::new(WaitSourceId::new(source_id)))
+        tx_substrate::wake::new_source(source_id)
     }
 
     /// Fire the legacy `Channel` for one futex bucket — D2
     /// coexistence wake path.
+    ///
+    /// Delegates to `tx_reactor::wait::fire_legacy`.
     pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) {
-        channel.fire(Mask::from_bits(mask_bits));
+        tx_reactor::wait::fire_legacy(channel, mask_bits);
     }
 
     /// Notify the v3 `WaitSource` for one futex bucket — D2
     /// coexistence wake path (mailbox).
+    ///
+    /// Delegates to `tx_substrate::wake::notify`.
     pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
-        source.notify(InterestMask::new(mask_bits));
+        tx_substrate::wake::notify(source, mask_bits)
     }
 }

@@ -243,6 +243,16 @@ impl Channel {
     }
 }
 
+/// Fire a legacy wait `Channel` with a raw mask value, returning the
+/// number of waiters woken.
+///
+/// Replaces the per-subsystem adapter pattern
+/// `channel.fire(Mask::from_bits(mask_bits))`.
+/// Future observation hooks (tracing, metrics) attach here in one place.
+pub fn fire_legacy(channel: &Channel, mask_bits: u64) -> usize {
+    channel.fire(Mask::from_bits(mask_bits))
+}
+
 impl<E> DeclaredChannel<E>
 where
     E: WireEventSet + Send + Sync + 'static,
