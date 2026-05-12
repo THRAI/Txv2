@@ -99,7 +99,11 @@ fn kick_transport(
                 }
                 V3Out::Yield {
                     progress,
-                    shape: YieldShape::OnWaitSource { source: carrier, interests },
+                    shape:
+                        YieldShape::OnWaitSource {
+                            source: carrier,
+                            interests,
+                        },
                 } => {
                     let written = progress.bytes();
                     if written < chunk.len() {
@@ -112,7 +116,11 @@ fn kick_transport(
                         // Pure block: restore the chunk so a later kick
                         // can try again.
                         restore_front(tty, &payload, &chunk);
-                        V3Out::yield_on_wait_source(ByteProgress::EMPTY, carrier.raw(), interests.raw())
+                        V3Out::yield_on_wait_source(
+                            ByteProgress::EMPTY,
+                            carrier.raw(),
+                            interests.raw(),
+                        )
                     } else {
                         V3Out::yield_on_wait_source(
                             ByteProgress::new(written.min(chunk.len())),
@@ -136,7 +144,11 @@ fn kick_transport(
             V3Out::Done(_) | V3Out::Continue { .. } => V3Out::Done(chunk.len()),
             V3Out::Err(e) => V3Out::Err(e),
             V3Out::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => V3Out::yield_on_wait_source(
                 ByteProgress::new(chunk.len()),
@@ -251,9 +263,15 @@ pub fn step_write(
     match kick_transport(tty, guard) {
         V3Out::Err(err) => V3Out::err(err),
         V3Out::Yield {
-            shape: YieldShape::OnWaitSource { source: carrier, interests },
+            shape:
+                YieldShape::OnWaitSource {
+                    source: carrier,
+                    interests,
+                },
             ..
-        } => V3Out::yield_on_wait_source(ByteProgress::new(consumed), carrier.raw(), interests.raw()),
+        } => {
+            V3Out::yield_on_wait_source(ByteProgress::new(consumed), carrier.raw(), interests.raw())
+        }
         V3Out::Yield { .. } => V3Out::err(tx_substrate::step_v3::Errno::EIO),
         V3Out::Done(_) | V3Out::Continue { .. } => V3Out::done(consumed),
     }
@@ -301,14 +319,15 @@ pub fn step_write_for_caller(
 // to the `*Op` types incrementally.
 
 /// `StepOp` wrap of [`step_write`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct WriteOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub bytes: &'a [u8],
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for WriteOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for WriteOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;
@@ -321,6 +340,7 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_write_for_caller`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct WriteForCallerOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub bytes: &'a [u8],
@@ -328,8 +348,8 @@ pub struct WriteForCallerOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for WriteForCallerOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for WriteForCallerOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;
@@ -342,6 +362,7 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_write_for_process`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct WriteForProcessOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub bytes: &'a [u8],
@@ -349,8 +370,8 @@ pub struct WriteForProcessOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for WriteForProcessOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for WriteForProcessOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;
@@ -555,7 +576,11 @@ mod tests {
         match outcome {
             tx_substrate::step_v3::StepOutcome::Yield {
                 progress,
-                shape: tx_substrate::step_v3::YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    tx_substrate::step_v3::YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
                 assert!(
                     !progress.is_empty(),

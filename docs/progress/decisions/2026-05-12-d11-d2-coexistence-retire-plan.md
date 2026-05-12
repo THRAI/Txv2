@@ -5,7 +5,7 @@
 **Worker:** W-OO (audit pass)
 **Companion:** [D2](2026-05-11-d2-waitsource-coexists-with-rawport.md),
 [D4](2026-05-11-d4-bus-mailbox-layering.md),
-[D9 family](2026-05-11-d9-signal-mailbox-routing.md) (signal/signalfd mailbox routing — adjacent, not a Channel retire target),
+[D9 family](2026-05-11-d9-signal-wake-migration.md) (signal/signalfd mailbox routing — adjacent, not a Channel retire target),
 PR-3D-1..5 worker reports.
 **Supersedes:** nothing. Refines D2's §"PR-3D landing sequence" §PR-3D.5
 (the bullet that said "Remove or demote `RawPort.subscribe(waker)`") into

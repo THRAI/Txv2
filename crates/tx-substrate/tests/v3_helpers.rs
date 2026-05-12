@@ -40,7 +40,8 @@ fn step_outcome_continue_with_helper_constructs_continue_variant() {
 
 #[test]
 fn step_outcome_yield_on_wait_source_helper_constructs_yield_onwaitsource() {
-    let outcome: StepOutcome<(), NoProgress> = StepOutcome::yield_on_wait_source(NoProgress, 7, 0b101);
+    let outcome: StepOutcome<(), NoProgress> =
+        StepOutcome::yield_on_wait_source(NoProgress, 7, 0b101);
     match outcome {
         StepOutcome::Yield { progress, shape } => {
             assert!(progress.is_empty());

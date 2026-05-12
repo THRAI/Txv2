@@ -44,13 +44,13 @@ use tx_substrate::step_v3::{InterestMask, StepOutcome, WaitSourceId};
 use tx_substrate::testing::init_host_for_test_once;
 use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 
+use tx_substrate::zone::Cap;
 use tx_subsystems::pipe::{
     step_pipe2, step_read, step_write, PipeFlags, PipePayload, PIPE_BUF, PIPE_READABLE,
     PIPE_WRITABLE,
 };
 use tx_subsystems::vfs::structure::{OpenFile, RNodeBacking, StructPayload};
 use tx_subsystems::zones;
-use tx_substrate::zone::Cap;
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -278,8 +278,7 @@ fn step_write_empty_bytes_does_not_fire_reader_wait_source() {
     let payload = payload_of(&reader);
     let mailbox = Arc::new(TaskMailbox::new());
 
-    let (_guard_reg, _gen) =
-        register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
+    let (_guard_reg, _gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
 
     let guard = epoch::guard();
     let outcome = step_write(&payload, &[], &guard, false);
@@ -313,8 +312,7 @@ fn step_read_empty_buf_does_not_fire_writer_wait_source() {
     // none, so this is a no-op; kept for clarity.)
     let _ = mailbox.poll();
 
-    let (_guard_reg, _gen) =
-        register(payload.writer_wait_source(), &mailbox, PIPE_WRITABLE);
+    let (_guard_reg, _gen) = register(payload.writer_wait_source(), &mailbox, PIPE_WRITABLE);
 
     let mut empty: [u8; 0] = [];
     let guard = epoch::guard();
@@ -348,8 +346,7 @@ fn waitsource_notify_stamps_caller_generation_on_event() {
     // > 1 — pins the "captured at registration time" semantic.
     let _burned = mailbox.next_generation();
 
-    let (_guard_reg, gen) =
-        register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
+    let (_guard_reg, gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
     assert!(
         gen.raw() >= 2,
         "captured generation should be monotonic past 1, got {}",
@@ -383,8 +380,7 @@ fn write_fires_both_legacy_channel_and_new_wait_source() {
     let mailbox = Arc::new(TaskMailbox::new());
 
     // The new path receiver.
-    let (_guard_reg, gen) =
-        register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
+    let (_guard_reg, gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
 
     // We don't directly observe the legacy `Channel.fire(...)` here —
     // the legacy path is tested in `src/pipe.rs::tests` — but we

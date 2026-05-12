@@ -100,9 +100,7 @@ mod kernel_script_ctx_tests {
     /// changes.
     #[test]
     fn polymorphic_op_reads_subject_from_script_ctx() {
-        use tx_substrate::step_v3::{
-            NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
-        };
+        use tx_substrate::step_v3::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
         // Op semantics: returns Done(true) if a subject is populated,
         // Done(false) otherwise. Real production ops would read
@@ -111,10 +109,7 @@ mod kernel_script_ctx_tests {
         impl<I: SubjectIdentity> StepOp<I> for HasSubjectOp {
             type Output = bool;
             type Progress = NoProgress;
-            fn step(
-                &mut self,
-                ctx: &mut ScriptCtx<I>,
-            ) -> StepOutcome<bool, NoProgress> {
+            fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<bool, NoProgress> {
                 StepOutcome::Done(ctx.subject().is_some())
             }
         }

@@ -77,7 +77,11 @@ fn step_poll_hardware_input_propagates_blocked_driver_read() {
 
     match step_poll_hardware_input(&tty, 16, &guard) {
         V3Out::Yield {
-            shape: YieldShape::OnWaitSource { source: carrier, interests },
+            shape:
+                YieldShape::OnWaitSource {
+                    source: carrier,
+                    interests,
+                },
             ..
         } => {
             assert_eq!(carrier.raw(), 0x55);

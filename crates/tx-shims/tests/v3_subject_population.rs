@@ -51,9 +51,8 @@ struct StubPmapState {
     next_root: usize,
 }
 
-static STUB_PMAP_STATE: LazyLock<Mutex<StubPmapState>> = LazyLock::new(|| {
-    Mutex::new(StubPmapState { next_root: 1 })
-});
+static STUB_PMAP_STATE: LazyLock<Mutex<StubPmapState>> =
+    LazyLock::new(|| Mutex::new(StubPmapState { next_root: 1 }));
 
 impl PmapIf for StubPmap {
     fn create_pmap_root() -> Result<PmapRoot, PmapError> {
@@ -149,7 +148,10 @@ fn build_subject_script_ctx_populates_a_non_empty_subject() {
     // by slot key, so cloning the same cap yields the same key.
     assert_eq!(subject.process().key(), proc_cap.key());
     assert_eq!(
-        subject.thread().expect("from_thread sets thread slot").key(),
+        subject
+            .thread()
+            .expect("from_thread sets thread slot")
+            .key(),
         thread_cap.key(),
     );
 

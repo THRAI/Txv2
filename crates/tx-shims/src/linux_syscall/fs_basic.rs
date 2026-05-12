@@ -682,9 +682,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             super::numbers::UFFDIO_REGISTER => {
                 super::userfaultfd::step_uffdio_register(&file, argp, ctx)
             }
-            super::numbers::UFFDIO_COPY => {
-                super::userfaultfd::step_uffdio_copy(&file, argp, ctx)
-            }
+            super::numbers::UFFDIO_COPY => super::userfaultfd::step_uffdio_copy(&file, argp, ctx),
             super::numbers::UFFDIO_ZEROPAGE => {
                 super::userfaultfd::step_uffdio_zeropage(&file, argp, ctx)
             }
@@ -725,10 +723,8 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             match unwrap_v3(outcome) {
                 Ok(termios) => {
                     if SYS_IOCTL_TCGETS_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1 {
-                        FIRST_TCGETS_LFLAG.store(
-                            termios.c_lflag as u32,
-                            core::sync::atomic::Ordering::Relaxed,
-                        );
+                        FIRST_TCGETS_LFLAG
+                            .store(termios.c_lflag, core::sync::atomic::Ordering::Relaxed);
                         FIRST_TCGETS_VMIN.store(
                             termios.c_cc[tx_subsystems::tty::structure::termios::VMIN] as u32,
                             core::sync::atomic::Ordering::Relaxed,
@@ -759,10 +755,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 Ok(v) => v,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
-            LAST_TCSETS_LFLAG.store(
-                new_termios.c_lflag as u32,
-                core::sync::atomic::Ordering::Relaxed,
-            );
+            LAST_TCSETS_LFLAG.store(new_termios.c_lflag, core::sync::atomic::Ordering::Relaxed);
             LAST_TCSETS_VMIN.store(
                 new_termios.c_cc[tx_subsystems::tty::structure::termios::VMIN] as u32,
                 core::sync::atomic::Ordering::Relaxed,
@@ -772,10 +765,8 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 core::sync::atomic::Ordering::Relaxed,
             );
             if SYS_IOCTL_TCSETS_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1 {
-                FIRST_TCSETS_LFLAG.store(
-                    new_termios.c_lflag as u32,
-                    core::sync::atomic::Ordering::Relaxed,
-                );
+                FIRST_TCSETS_LFLAG
+                    .store(new_termios.c_lflag, core::sync::atomic::Ordering::Relaxed);
                 FIRST_TCSETS_VMIN.store(
                     new_termios.c_cc[tx_subsystems::tty::structure::termios::VMIN] as u32,
                     core::sync::atomic::Ordering::Relaxed,

@@ -146,8 +146,7 @@ fn signal_eligibility_pins() {
     let _ = epoch::drain_with_budget(usize::MAX);
     let _ = epoch::drain_with_budget(usize::MAX);
 
-    let proc_cap: Cap<ProcessIdentity> =
-        bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+    let proc_cap: Cap<ProcessIdentity> = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
     let leader = proc_cap.nth_thread(0).expect("leader");
 
     // ---- (4) Single-thread sanity ----
@@ -161,7 +160,11 @@ fn signal_eligibility_pins() {
         KillOutcome::Delivered
     );
     assert!(
-        leader.payload_cap().unwrap().pending().is_pending(Signum::SIGTERM),
+        leader
+            .payload_cap()
+            .unwrap()
+            .pending()
+            .is_pending(Signum::SIGTERM),
         "single-thread case: SIGTERM lands on leader"
     );
     assert_eq!(
@@ -172,7 +175,11 @@ fn signal_eligibility_pins() {
 
     // Clear the leader's pending bit so it doesn't leak into the
     // next phase.
-    leader.payload_cap().unwrap().pending().clear(Signum::SIGTERM);
+    leader
+        .payload_cap()
+        .unwrap()
+        .pending()
+        .clear(Signum::SIGTERM);
 
     // Now add two sibling threads: T2, T3. Bind a mailbox to each.
     let t2 = spawn_sibling_thread_for_test(&proc_cap).expect("t2");
@@ -202,7 +209,10 @@ fn signal_eligibility_pins() {
         "leader blocks SIGTERM and must be skipped"
     );
     assert!(
-        t2.payload_cap().unwrap().pending().is_pending(Signum::SIGTERM),
+        t2.payload_cap()
+            .unwrap()
+            .pending()
+            .is_pending(Signum::SIGTERM),
         "T2 (unblocked) receives SIGTERM"
     );
     assert_eq!(
@@ -240,7 +250,11 @@ fn signal_eligibility_pins() {
         KillOutcome::Delivered
     );
     assert!(
-        leader.payload_cap().unwrap().pending().is_pending(Signum::SIGTERM),
+        leader
+            .payload_cap()
+            .unwrap()
+            .pending()
+            .is_pending(Signum::SIGTERM),
         "fallback: leader (first non-zombie) receives SIGTERM despite blocking"
     );
     assert!(
@@ -275,7 +289,11 @@ fn signal_eligibility_pins() {
     step_sigprocmask(&t2, SigmaskHow::SetMask, SignalMask::EMPTY);
     // Clear the leader bit from the prior fallback so we can
     // distinguish.
-    leader.payload_cap().unwrap().pending().clear(Signum::SIGTERM);
+    leader
+        .payload_cap()
+        .unwrap()
+        .pending()
+        .clear(Signum::SIGTERM);
     // Drain any residual mailbox events accumulated.
     while leader_mb.poll().is_some() {}
     while t2_mb.poll().is_some() {}
@@ -290,7 +308,10 @@ fn signal_eligibility_pins() {
         KillOutcome::Delivered
     );
     assert!(
-        t2.payload_cap().unwrap().pending().is_pending(Signum::SIGTERM),
+        t2.payload_cap()
+            .unwrap()
+            .pending()
+            .is_pending(Signum::SIGTERM),
         "T2 still has the bit (idempotent)"
     );
     assert_eq!(
@@ -319,13 +340,21 @@ fn signal_eligibility_pins() {
     // T3 still blocks SIGTERM. The scan order is [leader, T2, T3];
     // T2 is a zombie (skipped), leader is now unblocked, so the
     // post must land on leader.
-    leader.payload_cap().unwrap().pending().clear(Signum::SIGTERM);
+    leader
+        .payload_cap()
+        .unwrap()
+        .pending()
+        .clear(Signum::SIGTERM);
     assert_eq!(
         step_kill_process(&proc_cap, Signum::SIGTERM),
         KillOutcome::Delivered
     );
     assert!(
-        leader.payload_cap().unwrap().pending().is_pending(Signum::SIGTERM),
+        leader
+            .payload_cap()
+            .unwrap()
+            .pending()
+            .is_pending(Signum::SIGTERM),
         "leader is the eligible non-zombie target"
     );
     assert_eq!(

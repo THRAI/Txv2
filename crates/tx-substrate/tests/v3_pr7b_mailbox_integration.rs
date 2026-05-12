@@ -31,8 +31,7 @@ use std::sync::Arc;
 
 use tx_substrate::step_v3::{
     AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply, DelegateRequest,
-    DelegateState, DelegateTokenId, InterestMask, TokenDropPolicy, TransitionOutcome,
-    WaitSourceId,
+    DelegateState, DelegateTokenId, InterestMask, TokenDropPolicy, TransitionOutcome, WaitSourceId,
 };
 use tx_substrate::wake::{ActiveWait, MailboxEvent, TaskMailbox, WaitGeneration};
 
@@ -161,7 +160,10 @@ fn late_no_op_does_not_post_a_second_event() {
     );
     let id = guard.id();
     // First writer wins, posts an event.
-    assert_eq!(registry.mark_replied(id, DelegateReply::placeholder()), TransitionOutcome::Applied);
+    assert_eq!(
+        registry.mark_replied(id, DelegateReply::placeholder()),
+        TransitionOutcome::Applied
+    );
     assert_eq!(mailbox.len(), 1);
 
     // Late timeout fire: state machine returns LateNoOp(Replied);

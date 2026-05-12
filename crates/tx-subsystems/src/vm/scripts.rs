@@ -543,6 +543,7 @@ mod tests {
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         tx_substrate::testing::init_host_for_test_once();
+        crate::zones::register_all().expect("kernel zones");
         match tx_substrate::page_allocator::claim_zero_frame() {
             Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
             Err(error) => panic!("claim zero frame for vm::scripts tests: {error:?}"),

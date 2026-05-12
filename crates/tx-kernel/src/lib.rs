@@ -13,18 +13,6 @@ pub mod thread_future;
 pub mod trap;
 pub mod trap_handoff;
 
-/// DIAGNOSTIC (temp, 2026-05-12): captures the most-recent SIGSEGV
-/// triggered by a page-fault under `thread_future`. Useful for
-/// post-mortem in shell-test runs.
-pub static FAULT_SIGSEGV_ADDR: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static FAULT_SIGSEGV_ACCESS: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-pub static FAULT_SIGSEGV_HITS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static FAULT_SIGSEGV_PID: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
 use tx_hal::{BootHandoff, TxPlatform};
 
 #[cfg(all(not(target_os = "none"), not(test)))]

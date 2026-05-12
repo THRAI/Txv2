@@ -153,8 +153,7 @@ fn read_one_signo(sfd: &SignalFd) -> u32 {
 fn signalfd_d9d_pins_create_route_and_drain() {
     let _g = setup();
 
-    let proc_cap: Cap<ProcessIdentity> =
-        bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+    let proc_cap: Cap<ProcessIdentity> = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
     let proc_key = proc_cap.key().raw();
 
     // SIGUSR1 = 10 on Linux generic; SIGUSR2 = 12.

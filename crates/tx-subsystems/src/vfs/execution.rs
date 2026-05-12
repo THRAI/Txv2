@@ -549,8 +549,8 @@ pub struct OpenFileReadOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for OpenFileReadOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for OpenFileReadOp<'a>
 {
     type Output = usize;
     type Progress = ByteProgress;
@@ -571,8 +571,8 @@ pub struct OpenFileLseekOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for OpenFileLseekOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for OpenFileLseekOp<'a>
 {
     type Output = u64;
     type Progress = NoProgress;
@@ -591,8 +591,8 @@ pub struct OpenFileWriteOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for OpenFileWriteOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for OpenFileWriteOp<'a>
 {
     type Output = usize;
     type Progress = ByteProgress;
@@ -613,8 +613,8 @@ pub struct OpenFileIoctlOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for OpenFileIoctlOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for OpenFileIoctlOp<'a>
 {
     type Output = OpenFileIoctlResult;
     type Progress = NoProgress;
@@ -715,8 +715,10 @@ mod step_op_wraps {
             payload_res,
             TtyPayload::new_hardware(&ECHO_BINDING),
         ));
-        let identity =
-            zone_mod::sign_for(id_res, TtyIdentity::new(TtyKind::SerialHardware, index, name));
+        let identity = zone_mod::sign_for(
+            id_res,
+            TtyIdentity::new(TtyKind::SerialHardware, index, name),
+        );
         identity.install_payload(payload);
         identity
     }
@@ -886,8 +888,7 @@ mod step_op_wraps {
         crate::process::structure::reset_pid_counter_for_test();
         crate::thread_runtime::structure::reset_tid_counter_for_test();
         let proc_cap = crate::process::bootstrap_init_process(
-            crate::vm::AddressSpace::new_cap_for_platform::<crate::vm::TestPmap>()
-                .expect("aspace"),
+            crate::vm::AddressSpace::new_cap_for_platform::<crate::vm::TestPmap>().expect("aspace"),
         )
         .expect("init");
         let caller = OpenFileIoctlCaller::from_process(&proc_cap);
@@ -913,8 +914,7 @@ mod step_op_wraps {
         crate::process::structure::reset_pid_counter_for_test();
         crate::thread_runtime::structure::reset_tid_counter_for_test();
         let proc_cap = crate::process::bootstrap_init_process(
-            crate::vm::AddressSpace::new_cap_for_platform::<crate::vm::TestPmap>()
-                .expect("aspace"),
+            crate::vm::AddressSpace::new_cap_for_platform::<crate::vm::TestPmap>().expect("aspace"),
         )
         .expect("init");
         let caller = OpenFileIoctlCaller::from_process(&proc_cap);

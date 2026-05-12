@@ -226,9 +226,8 @@ pub fn sign_cred(cred: Cred) -> Result<Cap<Cred>, ZoneError> {
 /// Cost is one zone reservation per syscall entry — acceptable for
 /// the placeholder; PR-K replaces with the proper slot-style append-
 /// only stack.
-pub fn placeholder_restrictions_cap()
-    -> Result<Cap<tx_substrate::step_v3::RestrictionStackHandle>, ZoneError>
-{
+pub fn placeholder_restrictions_cap(
+) -> Result<Cap<tx_substrate::step_v3::RestrictionStackHandle>, ZoneError> {
     let reservation = zone::reserve_for::<tx_substrate::step_v3::RestrictionStackHandle>()?;
     Ok(zone::sign_for(
         reservation,
@@ -875,9 +874,7 @@ pub struct SetuidOp {
     pub new_uid: Uid,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for SetuidOp
-{
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SetuidOp {
     type Output = CredChange;
     type Progress = tx_substrate::step_v3::NoProgress;
     fn step(
@@ -894,9 +891,7 @@ pub struct SetgidOp {
     pub new_gid: Gid,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for SetgidOp
-{
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SetgidOp {
     type Output = CredChange;
     type Progress = tx_substrate::step_v3::NoProgress;
     fn step(
@@ -916,20 +911,14 @@ pub struct SetreuidOp {
     pub euid: Option<Uid>,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for SetreuidOp
-{
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SetreuidOp {
     type Output = CredChange;
     type Progress = tx_substrate::step_v3::NoProgress;
     fn step(
         &mut self,
         _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
     ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_setreuid(
-            &self.target,
-            self.ruid,
-            self.euid,
-        ))
+        tx_substrate::step_v3::StepOutcome::Done(step_setreuid(&self.target, self.ruid, self.euid))
     }
 }
 
@@ -941,9 +930,7 @@ pub struct SetresuidOp {
     pub suid: Option<Uid>,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for SetresuidOp
-{
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SetresuidOp {
     type Output = CredChange;
     type Progress = tx_substrate::step_v3::NoProgress;
     fn step(
@@ -967,9 +954,7 @@ pub struct SetresgidOp {
     pub sgid: Option<Gid>,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for SetresgidOp
-{
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SetresgidOp {
     type Output = CredChange;
     type Progress = tx_substrate::step_v3::NoProgress;
     fn step(
@@ -992,20 +977,14 @@ pub struct SetregidOp {
     pub egid: Option<Gid>,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for SetregidOp
-{
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SetregidOp {
     type Output = CredChange;
     type Progress = tx_substrate::step_v3::NoProgress;
     fn step(
         &mut self,
         _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
     ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_setregid(
-            &self.target,
-            self.rgid,
-            self.egid,
-        ))
+        tx_substrate::step_v3::StepOutcome::Done(step_setregid(&self.target, self.rgid, self.egid))
     }
 }
 
@@ -1019,8 +998,8 @@ pub struct ApplySuidForExecOp {
     pub file_mode: u16,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ApplySuidForExecOp
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ApplySuidForExecOp
 {
     type Output = Option<ExecCredOutcome>;
     type Progress = tx_substrate::step_v3::NoProgress;

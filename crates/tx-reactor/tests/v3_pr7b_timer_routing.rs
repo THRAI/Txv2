@@ -131,14 +131,15 @@ fn fire_due_ignores_non_delegate_timeout_roles() {
     let wheel = TimerWheel::new();
     let registry = DelegateRegistry::new();
     // Install other roles; fire_due_delegate_timeouts must skip them.
-    let _g_primary =
-        wheel.install(Deadline::from_raw(10), TimerGuardRole::PrimarySleep);
-    let _g_abort =
-        wheel.install(Deadline::from_raw(10), TimerGuardRole::DeadlineAbort);
+    let _g_primary = wheel.install(Deadline::from_raw(10), TimerGuardRole::PrimarySleep);
+    let _g_abort = wheel.install(Deadline::from_raw(10), TimerGuardRole::DeadlineAbort);
     assert_eq!(wheel.armed_count(), 2);
 
     let fired = wheel.fire_due_delegate_timeouts(Deadline::from_raw(1_000_000), &registry);
-    assert_eq!(fired, 0, "non-DelegateTimeout entries are not fired by this path");
+    assert_eq!(
+        fired, 0,
+        "non-DelegateTimeout entries are not fired by this path"
+    );
     assert_eq!(wheel.armed_count(), 2);
 }
 

@@ -148,12 +148,13 @@ impl PtsName {
 // ---------------------------------------------------------------------------
 
 /// `StepOp` wrap of [`step_openpty`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct OpenPtyOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for OpenPtyOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for OpenPtyOp<'a>
 {
     type Output = OpenPtyOutcome;
     type Progress = tx_substrate::step_v3::NoProgress;

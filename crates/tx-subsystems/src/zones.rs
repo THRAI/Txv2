@@ -200,9 +200,11 @@ mod thread {
 
 mod vm {
     use super::*;
+    use crate::vm::PrivatePageSet;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
         zone::register_zone_for::<AddressSpace>()?;
+        zone::register_zone_for::<PrivatePageSet>()?;
         Ok(())
     }
 }

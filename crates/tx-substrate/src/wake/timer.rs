@@ -245,11 +245,7 @@ impl TimerWheel {
     ///
     /// Returns the number of entries that were retired (regardless
     /// of `TransitionOutcome`).
-    pub fn fire_due_delegate_timeouts(
-        &self,
-        now: Deadline,
-        registry: &DelegateRegistry,
-    ) -> usize {
+    pub fn fire_due_delegate_timeouts(&self, now: Deadline, registry: &DelegateRegistry) -> usize {
         let due: Vec<(TimerToken, DelegateTokenId)> = {
             let state = self.state.lock();
             state

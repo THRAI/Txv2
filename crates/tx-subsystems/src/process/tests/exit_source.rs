@@ -107,7 +107,9 @@ fn zombie_process_exit_source_id_is_none() {
     assert!(init.exit_source_wait_token().is_none());
     // fire_exit_source on a zombie is a no-op (returns 0).
     assert_eq!(
-        init.fire_exit_source(tx_reactor::wait::Mask::from_bits(EXIT_SOURCE_CHILD_ZOMBIFIED)),
+        init.fire_exit_source(tx_reactor::wait::Mask::from_bits(
+            EXIT_SOURCE_CHILD_ZOMBIFIED
+        )),
         0,
     );
 }

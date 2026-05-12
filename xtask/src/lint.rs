@@ -296,11 +296,24 @@ fn rv64_qemu_boot_static_path(path: &str) -> bool {
 }
 
 fn unused_allowance(line: &str) -> bool {
-    (line.contains("#[allow(") || line.contains("#![allow("))
-        && (line.contains("dead_code")
-            || line.contains("unused")
-            || line.contains("unused_imports")
-            || line.contains("unused_variables"))
+    if !(line.contains("#[allow(") || line.contains("#![allow(")) {
+        return false;
+    }
+    if !(line.contains("dead_code")
+        || line.contains("unused")
+        || line.contains("unused_imports")
+        || line.contains("unused_variables"))
+    {
+        return false;
+    }
+    // Documented exemption: PR-2 step-op scaffold adapters land before their
+    // dispatcher consumers in D12 Phase B. Allowing the dead-code annotation
+    // alongside a grep-stable marker keeps the broader policy (no silent
+    // dead-code allowances) intact.
+    if line.contains("txdoc:pr2-step-op-scaffold") {
+        return false;
+    }
+    true
 }
 
 fn lint_arch_text(path: &str, display: &str, text: &str) -> Vec<String> {
@@ -651,6 +664,28 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.contains("must not cfg on target_arch")));
+    }
+
+    #[test]
+    fn arch_lint_rejects_undocumented_dead_code_allowance() {
+        let findings = lint_arch_text(
+            "crates/tx-subsystems/src/foo.rs",
+            "crates/tx-subsystems/src/foo.rs",
+            "#[allow(dead_code)]\nstruct Stale;",
+        );
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("dead-code allowances hide stale")));
+    }
+
+    #[test]
+    fn arch_lint_allows_documented_pr2_step_op_scaffold() {
+        let findings = lint_arch_text(
+            "crates/tx-subsystems/src/tty/execution/step_hangup.rs",
+            "crates/tx-subsystems/src/tty/execution/step_hangup.rs",
+            "#[allow(dead_code)] // txdoc:pr2-step-op-scaffold\nstruct HangupOp;",
+        );
+        assert!(findings.is_empty());
     }
 
     #[test]

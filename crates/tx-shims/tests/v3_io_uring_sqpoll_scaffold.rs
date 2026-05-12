@@ -60,9 +60,7 @@ use tx_substrate::zone::Cap;
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
-use tx_subsystems::io_uring::{
-    reset_ring_id_counter_for_test, SqeStub, SqpollWorkerFuture,
-};
+use tx_subsystems::io_uring::{reset_ring_id_counter_for_test, SqeStub, SqpollWorkerFuture};
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vfs::structure::OpenFileBacking;
@@ -237,7 +235,11 @@ fn sys_io_uring_setup_returns_an_io_uring_backed_fd() {
         "ring_id must be positive, got {}",
         ring.ring_id()
     );
-    assert_eq!(ring.sq_entries(), 4, "sq_entries round-trips the syscall arg");
+    assert_eq!(
+        ring.sq_entries(),
+        4,
+        "sq_entries round-trips the syscall arg"
+    );
     assert_eq!(
         ring.cq_entries(),
         8,
@@ -303,7 +305,7 @@ fn io_uring_setup_spawns_one_sqpoll_worker_per_ring() {
         .io_uring()
         .expect("io_uring accessor")
         .ring_id();
-    let _ = take_io_uring_worker_for_test(ring_a).expect("worker future stashed");
+    _ = take_io_uring_worker_for_test(ring_a).expect("worker future stashed");
 
     // A second setup installs a second worker keyed by a fresh
     // ring_id.
@@ -319,7 +321,7 @@ fn io_uring_setup_spawns_one_sqpoll_worker_per_ring() {
         .expect("io_uring accessor")
         .ring_id();
     assert_ne!(ring_a, ring_b, "each setup mints a fresh ring_id");
-    let _ = take_io_uring_worker_for_test(ring_b).expect("worker future for fd_b stashed");
+    _ = take_io_uring_worker_for_test(ring_b).expect("worker future for fd_b stashed");
 }
 
 /// Pin invariant 3 — an SQE pushed via the scaffold test helper is
@@ -378,11 +380,13 @@ fn sqpoll_kthread_drains_multiple_sqes_in_sequence() {
         .io_uring()
         .expect("io_uring accessor")
         .clone();
-    let worker = take_io_uring_worker_for_test(ring.ring_id())
-        .expect("SQPOLL kthread future stashed");
+    let worker =
+        take_io_uring_worker_for_test(ring.ring_id()).expect("SQPOLL kthread future stashed");
 
-    ring.push_sqe_for_test(SqeStub::new(0, 0x1111)).expect("sqe a");
-    ring.push_sqe_for_test(SqeStub::new(0, 0x2222)).expect("sqe b");
+    ring.push_sqe_for_test(SqeStub::new(0, 0x1111))
+        .expect("sqe a");
+    ring.push_sqe_for_test(SqeStub::new(0, 0x2222))
+        .expect("sqe b");
     pump_worker_until(worker, |_| ring.dispatched() >= 2, 64);
     assert_eq!(ring.dispatched(), 2);
     assert_eq!(ring.sq_len(), 0);
@@ -409,8 +413,8 @@ fn sqpoll_kthread_terminates_cleanly_when_abort_trips() {
         .io_uring()
         .expect("io_uring accessor")
         .clone();
-    let mut worker = take_io_uring_worker_for_test(ring.ring_id())
-        .expect("SQPOLL kthread future stashed");
+    let mut worker =
+        take_io_uring_worker_for_test(ring.ring_id()).expect("SQPOLL kthread future stashed");
 
     // Pump once — the kthread enters the borrow and parks on the
     // empty SQ ring (Pending).
@@ -463,8 +467,8 @@ fn sqpoll_kthread_cancel_worker_trips_cooperative_cancel() {
         .io_uring()
         .expect("io_uring accessor")
         .clone();
-    let mut worker = take_io_uring_worker_for_test(ring.ring_id())
-        .expect("SQPOLL kthread future stashed");
+    let mut worker =
+        take_io_uring_worker_for_test(ring.ring_id()).expect("SQPOLL kthread future stashed");
 
     let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);

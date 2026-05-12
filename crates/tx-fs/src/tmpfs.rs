@@ -879,7 +879,11 @@ impl FsPageBacking for Tmpfs {
             V3::Done(materialized) => V3::done(Frame::new(materialized.ppn)),
             V3::Continue { .. } => V3::err(tx_substrate::step_v3::Errno::EAGAIN),
             V3::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => V3::yield_on_wait_source(
                 tx_substrate::step_v3::NoProgress,

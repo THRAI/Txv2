@@ -76,8 +76,7 @@ fn reset_zone_and_epoch() -> std::sync::MutexGuard<'static, ()> {
     register_zone_for::<ProcessIdentity>().expect("register placeholder process zone");
     register_zone_for::<ThreadIdentity>().expect("register placeholder thread zone");
     register_zone_for::<Credential>().expect("register placeholder cred zone");
-    register_zone_for::<RestrictionStackHandle>()
-        .expect("register placeholder restrictions zone");
+    register_zone_for::<RestrictionStackHandle>().expect("register placeholder restrictions zone");
     guard
 }
 
@@ -263,8 +262,7 @@ fn principal_exit_aborts_body_with_principal_exited() {
     // simulate."
 
     extern crate alloc;
-    let body_signal: alloc::sync::Arc<AbortSignal> =
-        alloc::sync::Arc::new(AbortSignal::new());
+    let body_signal: alloc::sync::Arc<AbortSignal> = alloc::sync::Arc::new(AbortSignal::new());
     let body_signal_for_body = body_signal.clone();
 
     /// Body future that yields Pending until its captured abort
@@ -358,12 +356,7 @@ fn subject_authority_derived_from_clones_owner_caps() {
     let cred = mint_cred_cap();
     let restrictions = mint_restrictions_cap();
 
-    let owner = build_owner_subject(
-        process,
-        thread,
-        cred.clone(),
-        restrictions.clone(),
-    );
+    let owner = build_owner_subject(process, thread, cred.clone(), restrictions.clone());
 
     // PR-11 phase 0: SubjectAuthority::derived_from(&owner) clones
     // the owner's cred/restrictions caps; the snapshot is stable

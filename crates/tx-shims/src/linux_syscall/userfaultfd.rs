@@ -39,9 +39,7 @@ use tx_subsystems::execution::Errno;
 use tx_subsystems::userfaultfd::{UfdRange, UserfaultFd};
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
-use tx_subsystems::vm::{
-    UfdRegistration, UserRange, UserVirtAddr, VmMapError, USER_PAGE_SIZE,
-};
+use tx_subsystems::vm::{UfdRegistration, UserRange, UserVirtAddr, VmMapError, USER_PAGE_SIZE};
 
 use super::numbers::{
     O_CLOEXEC, O_NONBLOCK, UFFDIO_REGISTER_MODE_MINOR, UFFDIO_REGISTER_MODE_MISSING,
@@ -192,11 +190,7 @@ pub(super) fn sys_userfaultfd<'a>(flags: u32, ctx: &SyscallCtx<'a>) -> SyscallRe
 ///    yet — `UFFDIO_REGISTER` lands in P-10.3, `UFFDIO_COPY` in
 ///    P-10.5; the agent uses this round to learn what's available).
 /// 5. Return `0`.
-pub(super) fn step_uffdio_api(
-    file: &OpenFile,
-    argp: u64,
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+pub(super) fn step_uffdio_api(file: &OpenFile, argp: u64, ctx: &SyscallCtx<'_>) -> SyscallResult {
     // Resolve the ufd payload — `step_uffdio_api` is only reached
     // after `sys_ioctl` has verified the fd is a ufd shape, so this
     // is total in practice. Defensive `EBADF` for the unreachable
@@ -309,11 +303,10 @@ pub(super) fn step_uffdio_register(
         return SyscallResult::Error(errno_to_i32(Errno::EFAULT));
     }
 
-    let mut reg: UffdioRegister =
-        match bootstrap_read_user::<UffdioRegister>(&ctx.aspace, argp) {
-            Ok(s) => s,
-            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-        };
+    let mut reg: UffdioRegister = match bootstrap_read_user::<UffdioRegister>(&ctx.aspace, argp) {
+        Ok(s) => s,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
 
     // Validate mode bits. Phase 3 accepts MISSING only; any unknown
     // bits or the WP/MINOR bits return EINVAL.
@@ -513,7 +506,7 @@ fn validate_and_match_pending(
         return Err(EINVAL_VALUE);
     }
     let page = USER_PAGE_SIZE as u64;
-    if dst % page != 0 || len % page != 0 {
+    if !dst.is_multiple_of(page) || !len.is_multiple_of(page) {
         return Err(EINVAL_VALUE);
     }
     let end = match dst.checked_add(len) {
@@ -573,11 +566,7 @@ fn map_transition(outcome: TransitionOutcome) -> Result<(), i32> {
 /// 5. Pop the matched pending message off the queue.
 /// 6. Write back `copy = len` (whole-range success — phase 5 reply
 ///    payloads do not support partial copy).
-pub(super) fn step_uffdio_copy(
-    file: &OpenFile,
-    argp: u64,
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+pub(super) fn step_uffdio_copy(file: &OpenFile, argp: u64, ctx: &SyscallCtx<'_>) -> SyscallResult {
     let ufd_cap = match file.ufd() {
         Some(cap) => cap,
         None => return SyscallResult::Error(EBADF_VALUE),
@@ -590,7 +579,7 @@ pub(super) fn step_uffdio_copy(
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
 
-    let token_id = match validate_and_match_pending(&ufd_cap, req.dst, req.len) {
+    let token_id = match validate_and_match_pending(ufd_cap, req.dst, req.len) {
         Ok(id) => id,
         Err(code) => return SyscallResult::Error(code),
     };
@@ -631,17 +620,15 @@ pub(super) fn step_uffdio_zeropage(
     if argp == 0 {
         return SyscallResult::Error(errno_to_i32(Errno::EFAULT));
     }
-    let mut req: UffdioZeropage =
-        match bootstrap_read_user::<UffdioZeropage>(&ctx.aspace, argp) {
-            Ok(s) => s,
-            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-        };
+    let mut req: UffdioZeropage = match bootstrap_read_user::<UffdioZeropage>(&ctx.aspace, argp) {
+        Ok(s) => s,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
 
-    let token_id =
-        match validate_and_match_pending(&ufd_cap, req.range.start, req.range.len) {
-            Ok(id) => id,
-            Err(code) => return SyscallResult::Error(code),
-        };
+    let token_id = match validate_and_match_pending(ufd_cap, req.range.start, req.range.len) {
+        Ok(id) => id,
+        Err(code) => return SyscallResult::Error(code),
+    };
 
     let reply = DelegateReply::Ufd(UfdReply::ZeroPage {
         dst_uaddr: req.range.start,
@@ -673,17 +660,15 @@ pub(super) fn step_uffdio_continue(
     if argp == 0 {
         return SyscallResult::Error(errno_to_i32(Errno::EFAULT));
     }
-    let mut req: UffdioContinue =
-        match bootstrap_read_user::<UffdioContinue>(&ctx.aspace, argp) {
-            Ok(s) => s,
-            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-        };
+    let mut req: UffdioContinue = match bootstrap_read_user::<UffdioContinue>(&ctx.aspace, argp) {
+        Ok(s) => s,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
 
-    let token_id =
-        match validate_and_match_pending(&ufd_cap, req.range.start, req.range.len) {
-            Ok(id) => id,
-            Err(code) => return SyscallResult::Error(code),
-        };
+    let token_id = match validate_and_match_pending(ufd_cap, req.range.start, req.range.len) {
+        Ok(id) => id,
+        Err(code) => return SyscallResult::Error(code),
+    };
 
     let reply = DelegateReply::Ufd(UfdReply::Continue {
         dst_uaddr: req.range.start,
@@ -739,7 +724,7 @@ pub(super) async fn step_ufd_read(
         let outcome = {
             let mut staging = [0u8; 32];
             let result = tx_subsystems::userfaultfd::step_ufd_read(
-                &ufd_cap,
+                ufd_cap,
                 &mut staging[..wire_size],
                 nonblocking,
             );
@@ -766,7 +751,11 @@ pub(super) async fn step_ufd_read(
                 return SyscallResult::Error(errno_to_i32(errno));
             }
             V3Out::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => {
                 let token = WaitToken::new(carrier.raw(), interests.raw());

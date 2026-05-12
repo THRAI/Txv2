@@ -93,7 +93,11 @@ pub fn step_copy_file_range(
                 return V3::done(advanced);
             }
             tx_substrate::step_v3::StepOutcome::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => {
                 if advanced == 0 {
@@ -137,7 +141,11 @@ pub fn step_copy_file_range(
                     return V3::done(advanced);
                 }
                 tx_substrate::step_v3::StepOutcome::Yield {
-                    shape: YieldShape::OnWaitSource { source: carrier, interests },
+                    shape:
+                        YieldShape::OnWaitSource {
+                            source: carrier,
+                            interests,
+                        },
                     ..
                 } => {
                     if advanced == 0 {
@@ -215,6 +223,7 @@ fn publish_progress(out_pc: &PageContainer, out_offset: u64, advanced: usize) {
 // ---------------------------------------------------------------------------
 
 /// `StepOp` wrap of [`step_copy_file_range`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct CopyFileRangeOp<'a> {
     pub in_pc: &'a PageContainer,
     pub in_offset: u64,
@@ -224,8 +233,8 @@ pub struct CopyFileRangeOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for CopyFileRangeOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for CopyFileRangeOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;

@@ -4,6 +4,62 @@
 
 ## Current Shape
 
+- 2026-05-12 D12 Phase B (PR-2 scaffolding dead-code allowance)
+  LANDED. Closes the D13 follow-up: the 26 PR-2 `StepOp` adapter
+  wraps in `tx-subsystems/{page_backed,tty/execution}/` now carry
+  `#[allow(dead_code)] // txdoc:pr2-step-op-scaffold` and arch-lint
+  recognises that documented exemption (general dead-code allowances
+  still rejected, per D10 policy). Collateral cleanup along the
+  stricter clippy bar: `pipe.rs` redundant `drop(op)` removals,
+  `script.rs` `map_err` → `inspect_err`, AIO test helpers gain
+  `#[allow(clippy::vec_box)]` (stable per-element heap pointers are
+  load-bearing — Vec growth must not invalidate the user-pointer
+  array the syscall reads), `let _ = take_*_future(..)` → bare
+  `_ = take_*_future(..)` (avoids `let_underscore_future`),
+  `userfaultfd.rs` `%` → `is_multiple_of`, multiple `&cap` →
+  `cap` (needless-borrow), trivial `as u64`/`as u32` self-cast
+  removals, doc-comment list-bullet escapes in `v3_aio_*` tests.
+  **Verified:** `cargo xtask ci` 12/12 pass (was 10/12). Tests:
+  full host suite still 1182 passing / 11 ignored single-threaded.
+  ADR: none new — extends `2026-05-12-d13-tdd-retirement-via-clippy.md`.
+
+- 2026-05-12 D15 VM-private CoW (mapping-identity-keyed) LANDED.
+  Replaces the pre-D15 fork CoW path that lost parent stack bytes on
+  child first read at PC=0. Final architecture: per-`VmEntry`
+  `Option<Cap<PrivatePageSet>>` keyed by `VmPageOff` (mapping-relative
+  offset, not absolute `UserPage`), with `PrivateFrameState::Exclusive
+  | SharedCow` for true lazy share-RO fork. **Artifacts:**
+  `crates/tx-subsystems/src/vm/structure/private.rs` (new) —
+  `PrivatePageSet` with `install_if_absent` / `replace_if_match` /
+  `fork_share` / `split` / `drain_range` CAS surface;
+  `VmEntry.private` field with hand-rolled `PartialEq` that skips
+  the `private` Cap so post-split sub-entries compare by semantic
+  identity; `reserve_map` auto-attaches a fresh `Cap<PrivatePageSet>`
+  for any private mapping so all mmap paths get one without
+  duplicating logic; `fork_aspace` rewritten as lazy `fork_share()` +
+  parent PTE teardown; `VmFaultOutcome::materialize_pagebacked`
+  rewritten to consult `vme.private` on hit (RO PTE for read; RW PTE
+  for Exclusive write; alloc+copy+`replace_if_match` for SharedCow
+  write) and fall through to backing-frame install on miss; mremap
+  preserves the moving VmEntry's `Cap<PrivatePageSet>`. Phase B
+  retired the SIGSEGV/clone diagnostic counters that proved the
+  pre-D15 PC=0 fault. **Verified:** `cargo xtask shell-test --target
+  rv64-qemu --script tools/shell-tests/busybox-prompt.txt` now
+  reaches `ls /` (prints full directory listing) and `echo pipe-ok |
+  cat` (prints `pipe-ok`); remaining pipe-then-`true && echo done`
+  timeout is a separate wait4/pipe issue out of D15 scope. New
+  `fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow`
+  test exercises the full Exclusive→SharedCow→CoW cycle. Full
+  workspace test suite passes single-threaded (1182 passing, 11
+  ignored; parallel-test flakiness is a pre-existing infra issue
+  with epoch guards, not introduced by D15). **Next step:** debug
+  the pipe/wait4 path so the shell-test completes through `true &&
+  echo done`. **Blocker:** none for D15; pipe completion is a
+  separate task. ADR:
+  `docs/progress/decisions/2026-05-12-pc-cow-implementation-plan.md`
+  (revision 2 — final architecture, supersedes the earlier
+  `AddressSpace.private_pages` rev-1 hotfix).
+
 - 2026-05-12 D13 test-driven retirement framework LANDED (worker W-QQ).
   Closes the durable-protection gap left by D10 (vocabulary retired,
   no CI gate against regression). **Artifacts:** `clippy.toml` at
@@ -22,9 +78,12 @@
   regressions fire; D10 §5.1 `OnWaitSource { source: carrier }`
   destructure stays green; `cargo build -p xtask` clean. Known blind
   spot: `disallowed-names` fires on bindings, not `struct X;` / `fn x()`
-  definitions — review remains the primary backstop. Follow-up: when
-  D12 Phase B decorates PR-2 scaffolding with `#[allow(dead_code)]`,
-  fold the dedicated step into the broad `-D warnings` gate.
+  definitions — review remains the primary backstop. Follow-up
+  **discharged 2026-05-12** by D12 Phase B (below): PR-2 scaffolding
+  now carries `#[allow(dead_code)] // txdoc:pr2-step-op-scaffold`
+  and arch-lint exempts that documented form, so the broad clippy
+  step covers the unused-lint surface; the dedicated retired-vocab
+  gate stays as a focused name-regression backstop.
   ADR: `docs/progress/decisions/2026-05-12-d13-tdd-retirement-via-clippy.md`.
 
 - 2026-05-12 D14 stale-commit cleanup plan LANDED (worker W-RR,
@@ -1862,10 +1921,10 @@
 - 2026-05-11 v3 PR-9 phase 3b LANDED (worker W-A 3-up fanout).
   Four of seven canonical Linux syscall arms now drive their
   StepOp wraps with `&mut KernelScriptCtx`:
-  `sys_read` → `OpenFileReadOp` ([io.rs:374](../../crates/tx-shims/src/linux_syscall/io.rs:374)),
-  `sys_write` → `OpenFileWriteOp` ([io.rs:240](../../crates/tx-shims/src/linux_syscall/io.rs:240)),
-  `sys_pipe2` → `Pipe2Op` ([fs_basic.rs:451](../../crates/tx-shims/src/linux_syscall/fs_basic.rs:451)),
-  `sys_clone` → `ForkOp::<P>` ([proc.rs:232](../../crates/tx-shims/src/linux_syscall/proc.rs:232)).
+  `sys_read` → `OpenFileReadOp` ([io.rs:374](../../crates/tx-shims/src/linux_syscall/io.rs)),
+  `sys_write` → `OpenFileWriteOp` ([io.rs:240](../../crates/tx-shims/src/linux_syscall/io.rs)),
+  `sys_pipe2` → `Pipe2Op` ([fs_basic.rs:451](../../crates/tx-shims/src/linux_syscall/fs_basic.rs)),
+  `sys_clone` → `ForkOp::<P>` ([proc.rs:232](../../crates/tx-shims/src/linux_syscall/proc.rs)).
   Three skipped because no StepOp wrap exists today —
   `sys_close` (direct fd-table accessors), `sys_openat`
   (free-fn `step_walk`/`step_open`), `sys_execve` (async

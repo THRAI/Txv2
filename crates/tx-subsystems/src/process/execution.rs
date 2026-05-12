@@ -838,78 +838,11 @@ pub fn step_setsid(target: &Cap<ProcessIdentity>) -> Result<Sid, SetsidError> {
 // nothing to await. The script's phase 7 is therefore a sequential
 // block of synchronous calls.
 
-/// Close every fd whose CLOEXEC bit is set on `process`, then clear
-/// the close-on-exec set.
-///
-/// Per `txdoc:EXEC-12-2-RESET-FDS-WITH-CLOEXEC` and the Wave 2 plan's
-/// Part 1 P1 sub-item. Walks the per-process CLOEXEC `BTreeSet<u32>`
-/// snapshot; for each marked fd, drops the fd via the existing
-/// `set_fd(i, None)` accessor — the resulting `Cap<OpenFile>` `Drop`
-/// runs the close per `txdoc:VFS-CHECKS-WALKER-MODES-1`. Any
-/// `OpenFile::Drop` side-effects (eventual file-flush etc.) are NOT
-/// awaited here: the EBR machinery handles deferred drop, and exec's
-/// post-PoNR commit cannot await.
-///
-/// Infallible — by EXEC-PONR. No-op for zombies (no payload to sweep).
-/// fd-ops Wave 1 (2026-05-07): the CLOEXEC set's fd-31 ceiling has been
-/// removed alongside the fd table's 8-slot ceiling; any `u32` fd may
-/// be marked.
-pub fn step_close_cloexec_fds(process: &Cap<ProcessIdentity>) {
-    let cloexec = process.fd_cloexec_snapshot();
-    if cloexec.is_empty() {
-        return;
-    }
-    for fd in cloexec {
-        // Drop via the existing accessor; the previous `Cap` (if any)
-        // is returned for EBR-deferred drop. We discard it here — the
-        // slot is now empty, the fd is closed.
-        let _ = process.set_fd(fd, None);
-    }
-    // Clear the set wholesale: every previously-marked fd is now
-    // closed; future fcntl(F_SETFD) calls start from a clean state.
-    process.clear_fd_cloexec();
-}
-
-/// Reset every user-installed signal disposition on `process` to
-/// `SigDisposition::Default`, preserving `Default` and `Ignore` slots.
-///
-/// Thin Phase-5 wrapper around
-/// [`crate::signal::SigActionTable::step_reset_for_exec`] (Wave 2 P2)
-/// that lets the exec script (`tx-scripts::process::exec`) reach the
-/// per-process action table without touching the `pub(crate)` payload
-/// field on [`ProcessIdentity`]. Per
-/// `txdoc:EXEC-12-3-RESET-SIGNAL-DISPOSITIONS` and `SIGNAL_v1` §15.2:
-/// exec resets handlers but does NOT clear pending signals or
-/// SIG_IGN dispositions.
-///
-/// Infallible — by EXEC-PONR. No-op for zombies (no payload).
-pub fn step_reset_signal_dispositions_for_exec(process: &Cap<ProcessIdentity>) {
-    if let Some(payload) = process.payload.lock().as_ref() {
-        payload.sig_actions().step_reset_for_exec();
-    }
-}
-
-/// Install `new_brk_base` as both the brk base and the current brk
-/// for `process`. Per `txdoc:EXEC-12-4-INSTALL-BRK` and the Wave 2
-/// plan's Part 1 P3 sub-item.
-///
-/// The exec script (Part 5) computes `new_brk_base` from the image
-/// plan: typically the highest LOAD segment's `vaddr + memsz`,
-/// page-rounded up. Storing the same value into both fields seeds the
-/// process at "no heap allocated yet" — `brk(2)` with a request above
-/// `current_brk` then grows the heap on demand.
-///
-/// Infallible — by EXEC-PONR. No-op for zombies (no payload to seed).
-pub fn step_install_brk_for_exec(process: &Cap<ProcessIdentity>, new_brk_base: u64) {
-    if let Some(payload) = process.payload.lock().as_ref() {
-        payload
-            .brk_base
-            .store(new_brk_base, core::sync::atomic::Ordering::Release);
-        payload
-            .current_brk
-            .store(new_brk_base, core::sync::atomic::Ordering::Release);
-    }
-}
+// `step_close_cloexec_fds`, `step_reset_signal_dispositions_for_exec`,
+// and `step_install_brk_for_exec` moved to `process/exec_prep.rs` to
+// keep this file under the 1500-line authored-source cap. They are
+// re-exported from `process::mod` at the same path so callers don't
+// change.
 
 // --- internal sign-and-publish helpers ---
 
@@ -1133,8 +1066,8 @@ pub struct ForkOp<'a, P: PmapIf> {
     pub _pmap: core::marker::PhantomData<P>,
 }
 
-impl<'a, P: PmapIf, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ForkOp<'a, P>
+impl<'a, P: PmapIf, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ForkOp<'a, P>
 {
     type Output = Result<Cap<ProcessIdentity>, ForkError>;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -1152,8 +1085,8 @@ pub struct ExitGroupOp<'a> {
     pub status: ExitStatus,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ExitGroupOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ExitGroupOp<'a>
 {
     type Output = ();
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -1172,8 +1105,8 @@ pub struct ExitGroupWithSignalOp<'a> {
     pub sig: crate::signal::Signum,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ExitGroupWithSignalOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ExitGroupWithSignalOp<'a>
 {
     type Output = ();
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -1194,8 +1127,8 @@ pub struct WaitpidNohangOp<'a> {
     pub target: WaitTarget,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for WaitpidNohangOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for WaitpidNohangOp<'a>
 {
     type Output = Result<(Pid, ExitStatus), WaitError>;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -1213,8 +1146,8 @@ pub struct ChdirOp<'a> {
     pub new_cwd: Cap<crate::vfs::DEntry>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ChdirOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ChdirOp<'a>
 {
     type Output = ChdirOutcome;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -1231,8 +1164,8 @@ pub struct GetcwdOp<'a> {
     pub target: &'a Cap<ProcessIdentity>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for GetcwdOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for GetcwdOp<'a>
 {
     type Output = Option<alloc::vec::Vec<u8>>;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -1250,8 +1183,8 @@ pub struct SetpgidOp<'a> {
     pub new_pgid: Pgid,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for SetpgidOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for SetpgidOp<'a>
 {
     type Output = Result<(), SetpgidError>;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -1268,8 +1201,8 @@ pub struct SetsidOp<'a> {
     pub target: &'a Cap<ProcessIdentity>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for SetsidOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for SetsidOp<'a>
 {
     type Output = Result<Sid, SetsidError>;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -1286,8 +1219,8 @@ pub struct CloseCloexecFdsOp<'a> {
     pub process: &'a Cap<ProcessIdentity>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for CloseCloexecFdsOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for CloseCloexecFdsOp<'a>
 {
     type Output = ();
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -1295,7 +1228,7 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
         &mut self,
         _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
     ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        step_close_cloexec_fds(self.process);
+        super::exec_prep::step_close_cloexec_fds(self.process);
         tx_substrate::step_v3::StepOutcome::Done(())
     }
 }
@@ -1305,8 +1238,8 @@ pub struct ResetSignalDispositionsForExecOp<'a> {
     pub process: &'a Cap<ProcessIdentity>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ResetSignalDispositionsForExecOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ResetSignalDispositionsForExecOp<'a>
 {
     type Output = ();
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -1314,7 +1247,7 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
         &mut self,
         _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
     ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        step_reset_signal_dispositions_for_exec(self.process);
+        super::exec_prep::step_reset_signal_dispositions_for_exec(self.process);
         tx_substrate::step_v3::StepOutcome::Done(())
     }
 }
@@ -1325,8 +1258,8 @@ pub struct InstallBrkForExecOp<'a> {
     pub new_brk_base: u64,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for InstallBrkForExecOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for InstallBrkForExecOp<'a>
 {
     type Output = ();
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -1334,7 +1267,7 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
         &mut self,
         _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
     ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        step_install_brk_for_exec(self.process, self.new_brk_base);
+        super::exec_prep::step_install_brk_for_exec(self.process, self.new_brk_base);
         tx_substrate::step_v3::StepOutcome::Done(())
     }
 }
@@ -1533,9 +1466,7 @@ mod step_op_wraps {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().expect("init payload live");
         assert_eq!(
-            payload
-                .brk_base
-                .load(core::sync::atomic::Ordering::Acquire),
+            payload.brk_base.load(core::sync::atomic::Ordering::Acquire),
             new_base
         );
         assert_eq!(

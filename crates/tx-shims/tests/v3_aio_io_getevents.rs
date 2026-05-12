@@ -46,9 +46,7 @@ use tx_hal::{
 };
 use tx_reactor::userspace::SyscallRequest;
 use tx_substrate::zone::Cap;
-use tx_subsystems::aio::{
-    reset_context_id_counter_for_test, AioWorkerFuture, IOCB_CMD_PREAD,
-};
+use tx_subsystems::aio::{reset_context_id_counter_for_test, AioWorkerFuture, IOCB_CMD_PREAD};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
@@ -57,9 +55,7 @@ use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE};
 use tx_subsystems::zones;
 
-use tx_shims::linux_syscall::aio::{
-    reset_worker_registry_for_test, take_worker_future_for_test,
-};
+use tx_shims::linux_syscall::aio::{reset_worker_registry_for_test, take_worker_future_for_test};
 use tx_shims::linux_syscall::numbers::{NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT};
 use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult};
 
@@ -191,11 +187,10 @@ fn encode_iocb(
     buf
 }
 
+#[allow(clippy::vec_box)] // stable per-element heap addresses; Vec growth must not invalidate
 fn stage_iocb_array(iocbs: &[[u8; 64]]) -> (u64, alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>>) {
-    let mut heap_iocbs: alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>> = iocbs
-        .iter()
-        .map(|b| alloc::boxed::Box::new(*b))
-        .collect();
+    let mut heap_iocbs: alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>> =
+        iocbs.iter().map(|b| alloc::boxed::Box::new(*b)).collect();
     let mut pointers: alloc::vec::Vec<u64> = heap_iocbs
         .iter_mut()
         .map(|b| b.as_mut_ptr() as u64)
@@ -225,7 +220,6 @@ where
     for _ in 0..budget {
         let _ = pinned.as_mut().poll(&mut cx);
         if done(&pinned) {
-            drop(pinned);
             return worker;
         }
     }
@@ -245,10 +239,7 @@ fn submit_dispatch_completion_round_trip() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -260,8 +251,7 @@ fn submit_dispatch_completion_round_trip() {
         .expect("aio_context accessor")
         .clone();
 
-    let worker = take_worker_future_for_test(aio.context_id())
-        .expect("worker stashed by io_setup");
+    let worker = take_worker_future_for_test(aio.context_id()).expect("worker stashed by io_setup");
 
     // Submit one PREAD iocb. aio_fildes=99 → dispatcher will get
     // None from ctx.process.fd(99) → returns -EBADF (-9).
@@ -274,7 +264,7 @@ fn submit_dispatch_completion_round_trip() {
     assert_eq!(r, SyscallResult::Return(1));
 
     // Pump worker until one completion lands.
-    let _ = pump_worker_until(worker, |_| aio.completion_len() >= 1, 128);
+    _ = pump_worker_until(worker, |_| aio.completion_len() >= 1, 128);
     assert_eq!(aio.completion_len(), 1);
 
     // Drain via sys_io_getevents.
@@ -288,9 +278,7 @@ fn submit_dispatch_completion_round_trip() {
     assert_eq!(r, SyscallResult::Return(1));
 
     // Verify the event was serialised into user memory at events_ptr.
-    let event_bytes = unsafe {
-        core::slice::from_raw_parts(events_ptr as *const u8, 32)
-    };
+    let event_bytes = unsafe { core::slice::from_raw_parts(events_ptr as *const u8, 32) };
     let data = u64::from_le_bytes(event_bytes[0..8].try_into().unwrap());
     let obj = u64::from_le_bytes(event_bytes[8..16].try_into().unwrap());
     let res = i64::from_le_bytes(event_bytes[16..24].try_into().unwrap());
@@ -311,10 +299,7 @@ fn io_getevents_with_min_nr_zero_and_empty_queue_returns_zero() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -338,10 +323,7 @@ fn io_getevents_min_nr_two_drains_two_completions() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -352,8 +334,7 @@ fn io_getevents_min_nr_two_drains_two_completions() {
         .aio_context()
         .expect("aio_context accessor")
         .clone();
-    let worker = take_worker_future_for_test(aio.context_id())
-        .expect("worker stashed");
+    let worker = take_worker_future_for_test(aio.context_id()).expect("worker stashed");
 
     // Submit two iocbs (both surface -EBADF since fd 99 absent).
     let a = encode_iocb(0xAAAA, IOCB_CMD_PREAD, 99, 0, 16, 0);
@@ -366,7 +347,7 @@ fn io_getevents_min_nr_two_drains_two_completions() {
     assert_eq!(r, SyscallResult::Return(2));
 
     // Pump until both completions land.
-    let _ = pump_worker_until(worker, |_| aio.completion_len() >= 2, 128);
+    _ = pump_worker_until(worker, |_| aio.completion_len() >= 2, 128);
     assert_eq!(aio.completion_len(), 2);
 
     // Drain via sys_io_getevents with min_nr = 2.
@@ -379,9 +360,7 @@ fn io_getevents_min_nr_two_drains_two_completions() {
 
     // Both events should land at offsets 0 and 32.
     let first = unsafe { core::slice::from_raw_parts(events_ptr as *const u8, 32) };
-    let second = unsafe {
-        core::slice::from_raw_parts((events_ptr + 32) as *const u8, 32)
-    };
+    let second = unsafe { core::slice::from_raw_parts((events_ptr + 32) as *const u8, 32) };
     let data0 = u64::from_le_bytes(first[0..8].try_into().unwrap());
     let data1 = u64::from_le_bytes(second[0..8].try_into().unwrap());
     assert_eq!(data0, 0xAAAA);
@@ -420,10 +399,7 @@ fn io_getevents_with_nr_zero_returns_zero() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };

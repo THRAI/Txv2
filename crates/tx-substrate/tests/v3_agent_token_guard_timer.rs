@@ -39,7 +39,7 @@ use tx_substrate::step_v3::{
     AbortReason, AgentCancelPolicy, Deadline, DelegateRegistry, DelegateReply, DelegateRequest,
     DelegateState, TokenDropPolicy, TransitionOutcome,
 };
-use tx_substrate::wake::timer::{TimerWheel, TimerGuardRole};
+use tx_substrate::wake::timer::{TimerGuardRole, TimerWheel};
 use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 
 // ---------------------------------------------------------------------------

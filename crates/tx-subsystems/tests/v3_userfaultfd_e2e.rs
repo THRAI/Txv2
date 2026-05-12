@@ -65,9 +65,7 @@ use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
-use tx_subsystems::userfaultfd::{
-    reset_ufd_id_counter_for_test, ProcessUfdDispatch, UserfaultFd,
-};
+use tx_subsystems::userfaultfd::{reset_ufd_id_counter_for_test, ProcessUfdDispatch, UserfaultFd};
 use tx_subsystems::vfs::{OpenFile, OpenFileFlags};
 use tx_subsystems::vm::{
     AccessMode, AddressSpace, MapPlacement, Prot, UfdRegistration, UserRange, UserVirtAddr,
@@ -201,19 +199,20 @@ const MAX_DRIVER_TICKS: usize = 1000;
 /// the faulting thread will be parked against.
 fn setup_proc_with_registered_ufd(
     vma_base: u64,
-) -> (Cap<ProcessIdentity>, u32, Cap<UserfaultFd>, Arc<TaskMailbox>) {
+) -> (
+    Cap<ProcessIdentity>,
+    u32,
+    Cap<UserfaultFd>,
+    Arc<TaskMailbox>,
+) {
     // Build the process.
-    let aspace_cap =
-        AddressSpace::new_cap_for_platform::<StubPmap>().expect("aspace cap");
+    let aspace_cap = AddressSpace::new_cap_for_platform::<StubPmap>().expect("aspace cap");
     let proc_cap = bootstrap_init_process(aspace_cap).expect("bootstrap init");
     let aspace = proc_cap.aspace_cap().expect("aspace");
 
     // Map a single private-anon page at vma_base.
-    let range = UserRange::new_aligned(
-        UserVirtAddr::new(vma_base as usize),
-        USER_PAGE_SIZE,
-    )
-    .expect("aligned");
+    let range = UserRange::new_aligned(UserVirtAddr::new(vma_base as usize), USER_PAGE_SIZE)
+        .expect("aligned");
     let request = VmMapRequest::fixed(
         range,
         MapPlacement::RequireFree,
@@ -226,20 +225,13 @@ fn setup_proc_with_registered_ufd(
     // Build the ufd cap and install it as fd 3.
     let ufd_cap = UserfaultFd::new_cap().expect("ufd cap");
     let ufd_id = ufd_cap.ufd_id();
-    let open_file =
-        OpenFile::new_userfaultfd_cap(ufd_cap.clone(), OpenFileFlags::default())
-            .expect("ufd OpenFile");
+    let open_file = OpenFile::new_userfaultfd_cap(ufd_cap.clone(), OpenFileFlags::default())
+        .expect("ufd OpenFile");
     let _prev = proc_cap.set_fd(3, Some(open_file));
 
     // Tag the VMA with the ufd registration.
     aspace
-        .tag_ufd_registration(
-            range,
-            UfdRegistration {
-                ufd_id,
-                mode: 0,
-            },
-        )
+        .tag_ufd_registration(range, UfdRegistration { ufd_id, mode: 0 })
         .expect("tag ufd registration");
 
     // Faulting thread's mailbox.
@@ -403,8 +395,7 @@ fn pr_10_phase_6_oneagent_canary_full_loop() {
     }
 
     // ----- Step 5 + 6: resume + verify --------------------------------
-    let result =
-        fault_result.expect("fault future must resolve within MAX_DRIVER_TICKS");
+    let result = fault_result.expect("fault future must resolve within MAX_DRIVER_TICKS");
     assert!(
         result.is_ok(),
         "fault_script_for_process must succeed end-to-end, got {result:?}",
@@ -492,7 +483,10 @@ fn process_ufd_dispatch_resolves_via_process_fd_table() {
 
     // Hit: the ufd is installed at fd 3 with matching ufd_id.
     let target = dispatch.resolve(ufd_cap.ufd_id());
-    assert!(target.is_some(), "dispatcher resolves a live ufd via fd table");
+    assert!(
+        target.is_some(),
+        "dispatcher resolves a live ufd via fd table"
+    );
 
     // Miss: a bogus ufd_id falls through to None.
     let dispatch2 = ProcessUfdDispatch::new(&proc_cap, Arc::downgrade(&mailbox));

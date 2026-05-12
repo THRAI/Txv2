@@ -50,13 +50,13 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use tx_substrate::SpinMutex;
 use tx_subsystems::io_uring::{spawn_sqpoll_worker, IoUring, SqpollWorkerFuture};
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
-use tx_substrate::SpinMutex;
 
-use super::{SyscallCtx, SyscallResult};
 use super::ENOMEM_VALUE;
+use super::{SyscallCtx, SyscallResult};
 
 /// Build the owner's `SubjectContext` from the syscall ctx. Mirrors
 /// the helper used by `linux_syscall::aio::sys_io_setup` — see that
@@ -66,11 +66,7 @@ fn build_owner_subject(ctx: &SyscallCtx<'_>) -> crate::KernelSubjectContext {
     let restrictions_cap = tx_subsystems::cred::placeholder_restrictions_cap()
         .expect("placeholder restrictions zone has capacity per syscall entry");
     let authority = crate::KernelSubjectAuthority::new(cred_cap, restrictions_cap);
-    crate::KernelSubjectContext::from_thread(
-        ctx.process.clone(),
-        ctx.thread.clone(),
-        authority,
-    )
+    crate::KernelSubjectContext::from_thread(ctx.process.clone(), ctx.thread.clone(), authority)
 }
 
 /// `io_uring_setup(entries, params)` syscall arm — second
@@ -118,11 +114,7 @@ pub(super) fn sys_io_uring_setup(
     // function-pointer seam (a future PR-12 phase 2b follow-up).
     let ring_id = ring_cap.ring_id();
     let owner_subject = build_owner_subject(ctx);
-    let worker = spawn_sqpoll_worker(
-        ring_cap.clone(),
-        ctx.process.clone(),
-        owner_subject,
-    );
+    let worker = spawn_sqpoll_worker(ring_cap.clone(), ctx.process.clone(), owner_subject);
     install_io_uring_worker_for_test(ring_id, worker);
 
     // 5. Wrap in an `OpenFile`. Phase 0 leaves every `OpenFileFlags`

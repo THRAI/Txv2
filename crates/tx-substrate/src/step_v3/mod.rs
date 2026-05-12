@@ -145,10 +145,7 @@ pub enum YieldShape {
     /// corresponding to this `token` is held by a
     /// [`crate::wake::timer::TimerGuard`] (future PR-8 follow-up)
     /// that the driver retires on resume.
-    OnTimer {
-        token: TimerId,
-        deadline: Deadline,
-    },
+    OnTimer { token: TimerId, deadline: Deadline },
 }
 
 impl YieldShape {

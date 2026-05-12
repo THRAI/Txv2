@@ -7,6 +7,7 @@ use tx_substrate::step_v3::StepOutcome;
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
+    crate::zones::register_all().expect("kernel zones");
     match tx_substrate::page_allocator::claim_zero_frame() {
         Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for VM user-access tests: {error:?}"),

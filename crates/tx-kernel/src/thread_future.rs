@@ -396,17 +396,6 @@ pub async fn run_thread<P: TxPlatform>(
                         // `pending_syscall_return` write).
                     }
                     Err(_e) => {
-                        use core::sync::atomic::Ordering;
-                        crate::FAULT_SIGSEGV_ADDR.store(
-                            info.addr.raw() as usize, Ordering::Relaxed,
-                        );
-                        crate::FAULT_SIGSEGV_ACCESS.store(
-                            info.access as u32, Ordering::Relaxed,
-                        );
-                        crate::FAULT_SIGSEGV_HITS
-                            .fetch_add(1, Ordering::Relaxed);
-                        crate::FAULT_SIGSEGV_PID
-                            .store(process.pid.0 as usize, Ordering::Relaxed);
                         step_exit_group_with_signal(&process, Signum::SIGSEGV);
                         return;
                     }

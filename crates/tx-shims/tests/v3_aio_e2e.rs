@@ -74,9 +74,7 @@ use tx_reactor::userspace::SyscallRequest;
 use tx_substrate::page_allocator;
 use tx_substrate::step_v3::{CancelReason, OnBehalfOfAbort};
 use tx_substrate::zone::{self, Cap};
-use tx_subsystems::aio::{
-    reset_context_id_counter_for_test, AioWorkerFuture, IOCB_CMD_PREAD,
-};
+use tx_subsystems::aio::{reset_context_id_counter_for_test, AioWorkerFuture, IOCB_CMD_PREAD};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
@@ -92,12 +90,8 @@ use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE};
 use tx_subsystems::zones;
 
-use tx_shims::linux_syscall::aio::{
-    reset_worker_registry_for_test, take_worker_future_for_test,
-};
-use tx_shims::linux_syscall::numbers::{
-    NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT,
-};
+use tx_shims::linux_syscall::aio::{reset_worker_registry_for_test, take_worker_future_for_test};
+use tx_shims::linux_syscall::numbers::{NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT};
 use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult};
 
 // -------- Stub PMAP (mirrors v3_aio_io_getevents.rs / v3_aio_io_destroy.rs) --
@@ -329,13 +323,10 @@ fn encode_iocb(
     buf
 }
 
-fn stage_iocb_array(
-    iocbs: &[[u8; 64]],
-) -> (u64, alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>>) {
-    let mut heap_iocbs: alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>> = iocbs
-        .iter()
-        .map(|b| alloc::boxed::Box::new(*b))
-        .collect();
+#[allow(clippy::vec_box)] // stable per-element heap addresses; Vec growth must not invalidate
+fn stage_iocb_array(iocbs: &[[u8; 64]]) -> (u64, alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>>) {
+    let mut heap_iocbs: alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>> =
+        iocbs.iter().map(|b| alloc::boxed::Box::new(*b)).collect();
     let mut pointers: alloc::vec::Vec<u64> = heap_iocbs
         .iter_mut()
         .map(|b| b.as_mut_ptr() as u64)
@@ -365,11 +356,7 @@ fn stage_user_buffer(len: usize) -> (u64, &'static mut [u8]) {
     (uaddr, leak)
 }
 
-fn pump_worker_until<F>(
-    mut worker: AioWorkerFuture,
-    mut done: F,
-    budget: u32,
-) -> AioWorkerFuture
+fn pump_worker_until<F>(mut worker: AioWorkerFuture, mut done: F, budget: u32) -> AioWorkerFuture
 where
     F: FnMut(&AioWorkerFuture) -> bool,
 {
@@ -379,7 +366,6 @@ where
     for _ in 0..budget {
         let _ = pinned.as_mut().poll(&mut cx);
         if done(&pinned) {
-            drop(pinned);
             return worker;
         }
     }
@@ -391,11 +377,11 @@ where
 /// The big six-step canary: setup tmpfs file; AIO setup; submit
 /// PREAD; pump worker; getevents; verify byte-equality; destroy.
 ///
-/// If this passes, PR-11's structural framework (W-W with_on_behalf_of
-/// + W-Z AioContext + W-CC worker spawn + W-FF real dispatch +
-/// io_getevents + io_destroy) is validated end-to-end as a unit,
-/// including the PageBacked-read seam (W-KK 2026-05-12) that copies
-/// real bytes from a tmpfs file into P's address space.
+/// If this passes, PR-11's structural framework (W-W with_on_behalf_of,
+/// W-Z AioContext, W-CC worker spawn, W-FF real dispatch, io_getevents,
+/// and io_destroy) is validated end-to-end as a unit, including the
+/// PageBacked-read seam (W-KK 2026-05-12) that copies real bytes from
+/// a tmpfs file into P's address space.
 #[test]
 fn aio_pread_e2e_round_trip_against_tmpfs_file() {
     let _g = setup();
@@ -423,10 +409,7 @@ fn aio_pread_e2e_round_trip_against_tmpfs_file() {
     proc_cap.set_fd(file_fd, Some(file));
 
     // 2. io_setup → AIO context fd.
-    let aio_fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let aio_fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("io_setup expected Return, got {other:?}"),
     };
@@ -439,8 +422,7 @@ fn aio_pread_e2e_round_trip_against_tmpfs_file() {
         .expect("aio_context accessor")
         .clone();
 
-    let worker = take_worker_future_for_test(aio.context_id())
-        .expect("worker stashed by io_setup");
+    let worker = take_worker_future_for_test(aio.context_id()).expect("worker stashed by io_setup");
 
     // 3. Build and submit the PREAD iocb. The user buffer is a leaked
     //    heap allocation; its raw pointer doubles as the user-VA the
@@ -463,7 +445,11 @@ fn aio_pread_e2e_round_trip_against_tmpfs_file() {
         &ctx,
         SyscallRequest::new(NR_IO_SUBMIT, [aio_fd as u64, 1, iocbpp, 0, 0, 0]),
     );
-    assert_eq!(submit_r, SyscallResult::Return(1), "io_submit admits one iocb");
+    assert_eq!(
+        submit_r,
+        SyscallResult::Return(1),
+        "io_submit admits one iocb"
+    );
 
     // 4. Pump the worker until one completion lands. Budget capped at
     //    1000 per the W-JJ task spec — the real path completes in well
@@ -478,10 +464,7 @@ fn aio_pread_e2e_round_trip_against_tmpfs_file() {
     // does not matter functionally.
     let get_r = dispatch_call(
         &ctx,
-        SyscallRequest::new(
-            NR_IO_GETEVENTS,
-            [aio_fd as u64, 1, 2, events_ptr, 1, 0],
-        ),
+        SyscallRequest::new(NR_IO_GETEVENTS, [aio_fd as u64, 1, 2, events_ptr, 1, 0]),
     );
     assert_eq!(
         get_r,
@@ -502,8 +485,7 @@ fn aio_pread_e2e_round_trip_against_tmpfs_file() {
     //        byte count from the seeded file content (W-KK closed the
     //        PageBacked seam 2026-05-12).
     //    (d) `res2 == 0` for non-vectored PREAD.
-    let event_bytes =
-        unsafe { core::slice::from_raw_parts(events_ptr as *const u8, 32) };
+    let event_bytes = unsafe { core::slice::from_raw_parts(events_ptr as *const u8, 32) };
     let data = u64::from_le_bytes(event_bytes[0..8].try_into().unwrap());
     let obj = u64::from_le_bytes(event_bytes[8..16].try_into().unwrap());
     let res = i64::from_le_bytes(event_bytes[16..24].try_into().unwrap());
@@ -527,7 +509,11 @@ fn aio_pread_e2e_round_trip_against_tmpfs_file() {
     );
 
     // 7. The completion queue has been drained.
-    assert_eq!(aio.completion_len(), 0, "completion queue drained by getevents");
+    assert_eq!(
+        aio.completion_len(),
+        0,
+        "completion queue drained by getevents"
+    );
 
     // 8. io_destroy → cleanup; subsequent ops return -EBADF.
     let destroy_r = dispatch_call(
@@ -567,10 +553,7 @@ fn aio_e2e_mid_flight_destroy_cancels_worker() {
     let file_fd: u32 = 7;
     proc_cap.set_fd(file_fd, Some(file));
 
-    let aio_fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let aio_fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("io_setup: {other:?}"),
     };
@@ -581,18 +564,10 @@ fn aio_e2e_mid_flight_destroy_cancels_worker() {
         .aio_context()
         .expect("aio_context")
         .clone();
-    let mut worker = take_worker_future_for_test(aio.context_id())
-        .expect("worker stashed");
+    let mut worker = take_worker_future_for_test(aio.context_id()).expect("worker stashed");
 
     let (user_buf_addr, _user_buf_view) = stage_user_buffer(32);
-    let iocb = encode_iocb(
-        0xBEEF,
-        IOCB_CMD_PREAD,
-        file_fd,
-        user_buf_addr,
-        32,
-        0,
-    );
+    let iocb = encode_iocb(0xBEEF, IOCB_CMD_PREAD, file_fd, user_buf_addr, 32, 0);
     let (iocbpp, _ka) = stage_iocb_array(&[iocb]);
     let r = dispatch_call(
         &ctx,

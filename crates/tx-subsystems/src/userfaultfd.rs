@@ -477,11 +477,7 @@ pub fn step_ufd_read(
     // Park on the per-ufd wait source. The caller (sys_read in the
     // shim) drives `wait_source::wait_on_token` against the carrier
     // id; `push_fault_msg` fires the channel on the next install.
-    StepOutcome::yield_on_wait_source(
-        ByteProgress::EMPTY,
-        ufd.wait_source_id(),
-        UFD_READABLE,
-    )
+    StepOutcome::yield_on_wait_source(ByteProgress::EMPTY, ufd.wait_source_id(), UFD_READABLE)
 }
 
 /// Wire-format size of a serialized `struct uffd_msg` record per
@@ -682,7 +678,7 @@ impl<'a> crate::vm::UfdDispatch for ProcessUfdDispatch<'a> {
         // `await_agent_reply` await (the dispatcher is `&D` in
         // `dispatch_ufd_fault`'s signature, so the borrow survives
         // the await).
-        let ufd_ref: &UserfaultFd = &**cap_ref;
+        let ufd_ref: &UserfaultFd = cap_ref;
         Some(crate::vm::UfdDispatchTarget {
             registry: ufd_ref.delegate_registry(),
             mailbox: self.mailbox.clone(),

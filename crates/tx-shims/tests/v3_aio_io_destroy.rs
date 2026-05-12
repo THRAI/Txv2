@@ -48,12 +48,8 @@ use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vm::{AddressSpace, USER_PAGE_SIZE};
 use tx_subsystems::zones;
 
-use tx_shims::linux_syscall::aio::{
-    reset_worker_registry_for_test, take_worker_future_for_test,
-};
-use tx_shims::linux_syscall::numbers::{
-    NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT,
-};
+use tx_shims::linux_syscall::aio::{reset_worker_registry_for_test, take_worker_future_for_test};
+use tx_shims::linux_syscall::numbers::{NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT};
 use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult};
 
 // -------- Stub PMAP ------------------------------------------------
@@ -184,11 +180,10 @@ fn encode_iocb(
     buf
 }
 
+#[allow(clippy::vec_box)] // stable per-element heap addresses; Vec growth must not invalidate
 fn stage_iocb_array(iocbs: &[[u8; 64]]) -> (u64, alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>>) {
-    let mut heap_iocbs: alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>> = iocbs
-        .iter()
-        .map(|b| alloc::boxed::Box::new(*b))
-        .collect();
+    let mut heap_iocbs: alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>> =
+        iocbs.iter().map(|b| alloc::boxed::Box::new(*b)).collect();
     let mut pointers: alloc::vec::Vec<u64> = heap_iocbs
         .iter_mut()
         .map(|b| b.as_mut_ptr() as u64)
@@ -210,10 +205,7 @@ fn io_destroy_trips_worker_cooperative_cancel() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -224,8 +216,8 @@ fn io_destroy_trips_worker_cooperative_cancel() {
         .aio_context()
         .expect("aio_context accessor")
         .clone();
-    let mut worker = take_worker_future_for_test(aio.context_id())
-        .expect("worker stashed by io_setup");
+    let mut worker =
+        take_worker_future_for_test(aio.context_id()).expect("worker stashed by io_setup");
 
     // Pump once so the worker enters the borrow body and parks.
     let waker = Waker::noop().clone();
@@ -267,10 +259,7 @@ fn post_destroy_fd_ops_return_ebadf() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -330,10 +319,7 @@ fn io_destroy_drops_worker_from_registry() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -368,10 +354,7 @@ fn io_destroy_mid_flight_cancels_worker_cleanly() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -382,8 +365,7 @@ fn io_destroy_mid_flight_cancels_worker_cleanly() {
         .aio_context()
         .expect("aio_context")
         .clone();
-    let mut worker = take_worker_future_for_test(aio.context_id())
-        .expect("worker stashed");
+    let mut worker = take_worker_future_for_test(aio.context_id()).expect("worker stashed");
 
     // Submit an iocb. The dispatcher will run when we pump, but
     // we destroy first.

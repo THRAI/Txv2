@@ -153,7 +153,10 @@ pub struct WaitToken {
 
 impl WaitToken {
     pub const fn new(source_id: u64, interest: u64) -> Self {
-        Self { source_id, interest }
+        Self {
+            source_id,
+            interest,
+        }
     }
 
     pub const fn source_id(self) -> u64 {
