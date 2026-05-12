@@ -12,8 +12,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, Cap, CachePin,
-    DeviceFrame, MapPin, Zone, ZoneAllocated, ZoneError, ZeroPolicy,
+    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, Cap,
+    CachePin, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+    YieldShape, Zone, ZoneAllocated, ZoneError, ZeroPolicy,
 };
 
 use crate::execution::{Errno, Guard};
@@ -379,17 +380,16 @@ impl PageContainer {
         page: PageIndex,
         access: MaterializeAccess,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress>
+    ) -> StepOutcome<MaterializedPage, NoProgress>
     {
-        use tx_substrate::step_v3::StepOutcome as V3;
         if let Err(error) = self.check_bounds(page) {
-            return V3::Err(page_cache_error_to_errno(error).into());
+            return StepOutcome::Err(page_cache_error_to_errno(error).into());
         }
 
         match &self.kind {
             PageContainerKind::Anon { .. } => match self.materialize_anon(page, access) {
-                Ok(page) => V3::Done(page),
-                Err(error) => V3::Err(page_cache_error_to_errno(error).into()),
+                Ok(page) => StepOutcome::Done(page),
+                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
             },
             PageContainerKind::File {
                 mount,
@@ -409,18 +409,18 @@ impl PageContainer {
         mount: &MountPayloadPin,
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress>
+    ) -> StepOutcome<MaterializedPage, NoProgress>
     {
-        use tx_substrate::step_v3::{NoProgress, StepOutcome as V3, YieldShape};
+        use adapter::step_engine::Errno as V3Errno;
         if let Some(materialized) = self.materialize_cached_page(page, access) {
             return match materialized {
-                Ok(page) => V3::Done(page),
-                Err(error) => V3::Err(page_cache_error_to_errno(error).into()),
+                Ok(page) => StepOutcome::Done(page),
+                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
             };
         }
 
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
-            return V3::Err(tx_substrate::step_v3::Errno::EINVAL);
+            return StepOutcome::Err(V3Errno::EINVAL);
         };
         // Routes through `FsPageBacking::fetch_page`. v3 outcome:
         // Done→install + Done; Continue→ no frame, surface EAGAIN as
@@ -431,31 +431,31 @@ impl PageContainer {
             .fs_page_backing
             .fetch_page(fs_object_id, offset, guard)
         {
-            V3::Done(frame) => self.install_fetched_file_page(page, access, frame, false),
-            V3::Continue { progress: _ } => {
+            StepOutcome::Done(frame) => self.install_fetched_file_page(page, access, frame, false),
+            StepOutcome::Continue { progress: _ } => {
                 // `Continue` with `NoProgress` means "fs is asking us
                 // to retry"; there is no frame to install. Conservative
                 // choice: surface `Err(EAGAIN)` so callers that expect
                 // a frame don't observe a stale value.
-                V3::Err(tx_substrate::step_v3::Errno::EAGAIN)
+                StepOutcome::Err(V3Errno::EAGAIN)
             }
-            V3::Yield {
+            StepOutcome::Yield {
                 progress: _,
                 shape:
                     YieldShape::OnWaitSource {
                         source: carrier,
                         interests,
                     },
-            } => V3::yield_on_wait_source(NoProgress, carrier.raw(), interests.raw()),
-            V3::Yield {
+            } => StepOutcome::yield_on_wait_source(NoProgress, carrier.raw(), interests.raw()),
+            StepOutcome::Yield {
                 shape: YieldShape::OnAgent { .. },
                 ..
-            } => V3::Err(tx_substrate::step_v3::Errno::EIO),
-            V3::Yield {
+            } => StepOutcome::Err(V3Errno::EIO),
+            StepOutcome::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
-            } => V3::Err(tx_substrate::step_v3::Errno::EIO),
-            V3::Err(v3_errno) => V3::Err(v3_errno),
+            } => StepOutcome::Err(V3Errno::EIO),
+            StepOutcome::Err(v3_errno) => StepOutcome::Err(v3_errno),
         }
     }
 
@@ -465,12 +465,11 @@ impl PageContainer {
         access: MaterializeAccess,
         frame: Frame,
         newly_installed: bool,
-    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress>
+    ) -> StepOutcome<MaterializedPage, NoProgress>
     {
-        use tx_substrate::step_v3::StepOutcome as V3;
         let frame = match cached_frame_from_frame(frame) {
             Ok(frame) => frame,
-            Err(error) => return V3::Err(page_cache_error_to_errno(error).into()),
+            Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
         };
         let mut state = self.state.lock();
         let installed = match state.pages.lookup(page) {
@@ -478,17 +477,17 @@ impl PageContainer {
             None => match state.pages.install_if_absent(page, frame) {
                 Ok(()) => true,
                 Err(PageCacheError::AlreadyPresent { .. }) => false,
-                Err(error) => return V3::Err(page_cache_error_to_errno(error).into()),
+                Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
             },
         };
         if access == MaterializeAccess::Write {
             if let Err(error) = state.pages.mark_dirty(page) {
-                return V3::Err(page_cache_error_to_errno(error).into());
+                return StepOutcome::Err(page_cache_error_to_errno(error).into());
             }
         }
         match materialized_from_state(&state, page, newly_installed || installed) {
-            Ok(page) => V3::Done(page),
-            Err(error) => V3::Err(page_cache_error_to_errno(error).into()),
+            Ok(page) => StepOutcome::Done(page),
+            Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
         }
     }
 
@@ -497,17 +496,17 @@ impl PageContainer {
         page: PageIndex,
         base_ppn: Ppn,
         page_count: u64,
-    ) -> tx_substrate::step_v3::StepOutcome<MaterializedPage, tx_substrate::step_v3::NoProgress>
+    ) -> StepOutcome<MaterializedPage, NoProgress>
     {
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use adapter::step_engine::Errno as V3Errno;
         if page.as_u64() >= page_count {
-            return V3::Err(tx_substrate::step_v3::Errno::EINVAL);
+            return StepOutcome::Err(V3Errno::EINVAL);
         }
         let Ok(delta) = usize::try_from(page.as_u64()) else {
-            return V3::Err(tx_substrate::step_v3::Errno::EINVAL);
+            return StepOutcome::Err(V3Errno::EINVAL);
         };
         let Some(ppn) = base_ppn.0.checked_add(delta).map(Ppn) else {
-            return V3::Err(tx_substrate::step_v3::Errno::EINVAL);
+            return StepOutcome::Err(V3Errno::EINVAL);
         };
 
         let mut state = self.state.lock();
@@ -521,13 +520,13 @@ impl PageContainer {
                 match state.pages.install_if_absent(page, frame) {
                     Ok(()) => true,
                     Err(PageCacheError::AlreadyPresent { .. }) => false,
-                    Err(error) => return V3::Err(page_cache_error_to_errno(error).into()),
+                    Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
                 }
             }
         };
         match materialized_from_state(&state, page, newly_installed) {
-            Ok(page) => V3::Done(page),
-            Err(error) => V3::Err(page_cache_error_to_errno(error).into()),
+            Ok(page) => StepOutcome::Done(page),
+            Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
         }
     }
 
@@ -585,18 +584,17 @@ pub fn step_read(
     of: &OpenFile,
     len: usize,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<usize, ByteProgress> {
     if len == 0 {
-        return V3::done(0);
+        return StepOutcome::done(0);
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return V3::err(Errno::EINVAL.into());
+        return StepOutcome::err(Errno::EINVAL.into());
     };
     let start = of.offset();
     let valid_end = core::cmp::min(pc.size_bytes(), capacity);
     if start >= valid_end {
-        return V3::done(0);
+        return StepOutcome::done(0);
     }
     let effective_len = core::cmp::min(len as u64, valid_end - start) as usize;
     step_range(pc, of, effective_len, PageBackedIoKind::Read, guard)
@@ -607,30 +605,29 @@ pub fn step_write(
     of: &OpenFile,
     len: usize,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<usize, ByteProgress> {
     if len == 0 {
-        return V3::done(0);
+        return StepOutcome::done(0);
     }
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
-        return V3::err(Errno::EINVAL.into());
+        return StepOutcome::err(Errno::EINVAL.into());
     }
     let Some(capacity) = pc.byte_capacity() else {
-        return V3::err(Errno::EINVAL.into());
+        return StepOutcome::err(Errno::EINVAL.into());
     };
     let Some(end) = of.offset().checked_add(len as u64) else {
-        return V3::err(Errno::EINVAL.into());
+        return StepOutcome::err(Errno::EINVAL.into());
     };
     if end > capacity {
-        return V3::err(Errno::EINVAL.into());
+        return StepOutcome::err(Errno::EINVAL.into());
     }
     let start = of.offset();
     let outcome = step_range(pc, of, len, PageBackedIoKind::Write, guard);
     let advanced_bytes = match &outcome {
-        V3::Done(n) => *n,
-        V3::Continue { progress } => progress.bytes(),
-        V3::Yield { progress, .. } => progress.bytes(),
-        V3::Err(_) => 0,
+        StepOutcome::Done(n) => *n,
+        StepOutcome::Continue { progress } => progress.bytes(),
+        StepOutcome::Yield { progress, .. } => progress.bytes(),
+        StepOutcome::Err(_) => 0,
     };
     if advanced_bytes > 0 {
         pc.grow_size_to(start + advanced_bytes as u64);
@@ -644,8 +641,7 @@ fn step_range(
     len: usize,
     kind: PageBackedIoKind,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
+) -> StepOutcome<usize, ByteProgress> {
     let mut advanced = 0usize;
     let mut offset = of.offset();
     while advanced < len {
@@ -671,14 +667,14 @@ fn step_range(
         //   Otherwise return v3 `Done(advanced)` (partial-success;
         //   matches the prior semantics where errors after progress
         //   were swallowed into a successful partial step).
-        use tx_substrate::step_v3::YieldShape;
+        use adapter::step_engine::Errno as V3Errno;
         match pc.materialize_page(page_index, access, guard) {
-            tx_substrate::step_v3::StepOutcome::Done(_)
-            | tx_substrate::step_v3::StepOutcome::Continue { .. } => {
+            StepOutcome::Done(_)
+            | StepOutcome::Continue { .. } => {
                 advanced += chunk;
                 offset += chunk as u64;
             }
-            tx_substrate::step_v3::StepOutcome::Yield {
+            StepOutcome::Yield {
                 shape:
                     YieldShape::OnWaitSource {
                         source: carrier,
@@ -687,38 +683,38 @@ fn step_range(
                 ..
             } => {
                 if advanced == 0 {
-                    return V3::yield_on_wait_source(
+                    return StepOutcome::yield_on_wait_source(
                         ByteProgress::EMPTY,
                         carrier.raw(),
                         interests.raw(),
                     );
                 }
                 of.set_offset(offset);
-                return V3::yield_on_wait_source(
+                return StepOutcome::yield_on_wait_source(
                     ByteProgress::new(advanced),
                     carrier.raw(),
                     interests.raw(),
                 );
             }
-            tx_substrate::step_v3::StepOutcome::Yield { .. } => {
+            StepOutcome::Yield { .. } => {
                 if advanced == 0 {
-                    return V3::err(tx_substrate::step_v3::Errno::EIO);
+                    return StepOutcome::err(V3Errno::EIO);
                 }
                 of.set_offset(offset);
-                return V3::done(advanced);
+                return StepOutcome::done(advanced);
             }
-            tx_substrate::step_v3::StepOutcome::Err(errno) => {
+            StepOutcome::Err(errno) => {
                 if advanced == 0 {
-                    return V3::err(errno);
+                    return StepOutcome::err(errno);
                 }
                 of.set_offset(offset);
-                return V3::done(advanced);
+                return StepOutcome::done(advanced);
             }
         }
     }
 
     of.set_offset(offset);
-    V3::done(advanced)
+    StepOutcome::done(advanced)
 }
 
 // ---------------------------------------------------------------------------
@@ -739,15 +735,15 @@ pub struct ReadOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for ReadOp<'a>
 {
     type Output = usize;
-    type Progress = tx_substrate::step_v3::ByteProgress;
+    type Progress = ByteProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_read(self.pc, self.of, self.len, self.guard)
     }
 }
@@ -760,15 +756,15 @@ pub struct WriteOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for WriteOp<'a>
 {
     type Output = usize;
-    type Progress = tx_substrate::step_v3::ByteProgress;
+    type Progress = ByteProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_write(self.pc, self.of, self.len, self.guard)
     }
 }

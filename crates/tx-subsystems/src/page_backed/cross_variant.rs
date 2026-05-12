@@ -29,7 +29,7 @@ pub fn step_copy_file_range(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
+    use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3};
     if len == 0 {
         return V3::done(0);
     }
@@ -259,7 +259,7 @@ mod step_op_wraps {
     use super::*;
     use crate::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
     use crate::test_support::EPOCH_TEST_LOCK;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+    use step_engine::{PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome as V3};
 
     fn setup_host_substrate() {
         tx_substrate::testing::init_host_for_test_once();
@@ -295,7 +295,7 @@ mod step_op_wraps {
             len: 0,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3::done(0));
     }
 
