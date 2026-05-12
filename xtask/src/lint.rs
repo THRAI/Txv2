@@ -50,7 +50,7 @@ pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
 /// call site introduced outside an adapter trips this gate. Lower
 /// the number when convergence work removes more residue; raising it
 /// requires an explicit decision note.
-const MAX_SUBSTRATE_OUTSIDE_ADAPTER: usize = 199;
+const MAX_SUBSTRATE_OUTSIDE_ADAPTER: usize = 23;
 
 /// Maximum allowed `tx_reactor::*` line references outside adapters.
 /// Same Phase 7 ratchet semantics as the substrate ceiling.
