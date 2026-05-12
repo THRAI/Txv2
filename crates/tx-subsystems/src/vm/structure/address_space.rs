@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use tx_hal::PmapIf;
 use tx_substrate::epoch;
-use tx_substrate::zone::{self, Cap, Zone, ZoneAllocated};
+use tx_substrate::zone::{Cap, Zone, ZoneAllocated};
 
 #[cfg(test)]
 use crate::vm::pmap::TestPmap;
@@ -14,6 +14,7 @@ use super::{
     AddressSpaceStats, AddressSpaceStatsCell, RangeLock, RecipeIndex, UfdRegistration, UserRange,
     UserVirtAddr, VmEntry, VmMapCommit, VmMapError,
 };
+use crate::vm::adapter::step_engine::{self as step_engine};
 
 static ADDRESS_SPACE_ZONE: Zone<AddressSpace> = Zone::const_new();
 
@@ -54,8 +55,8 @@ impl AddressSpace {
     }
 
     pub fn new_cap_for_platform<P: PmapIf>() -> Result<Cap<AddressSpace>, VmPmapError> {
-        let reservation = zone::reserve_for::<AddressSpace>()?;
-        Ok(zone::sign_for(reservation, Self::new_for_platform::<P>()?))
+        let reservation = step_engine::reserve_for::<AddressSpace>()?;
+        Ok(step_engine::sign_for(reservation, Self::new_for_platform::<P>()?))
     }
 
     #[cfg(test)]

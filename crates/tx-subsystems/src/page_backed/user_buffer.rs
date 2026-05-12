@@ -1,5 +1,6 @@
 use super::*;
 use crate::vm::AddressSpace;
+use crate::page_backed::adapter::step_engine::{self as step_engine, ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 /// Read up to `len` bytes from `pc` at `of.offset()` into the user buffer at
 /// `dst`, returning the number of bytes actually copied.
@@ -16,8 +17,8 @@ pub fn step_read_to_user(
     dst: UserPtr<u8>,
     len: usize,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<usize, ByteProgress> {
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     if len == 0 {
         return V3::done(0);
     }
@@ -55,8 +56,8 @@ pub fn step_write_from_user(
     src: UserPtr<u8>,
     len: usize,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<usize, ByteProgress> {
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     if len == 0 {
         return V3::done(0);
     }
@@ -109,7 +110,7 @@ fn step_range_with_user_buffer(
     len: usize,
     buffer: UserBuffer,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+) -> StepOutcome<usize, ByteProgress> {
     use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
     let mut advanced = 0usize;
     let mut offset = of.offset();
@@ -133,9 +134,9 @@ fn step_range_with_user_buffer(
         //   if no progress yet, else partial `Done`.
         // - `Err(errno)` with `advanced == 0` → v3 `Err(errno)`.
         //   Otherwise return v3 `Done(advanced)` (partial-success).
-        use tx_substrate::step_v3::YieldShape;
+use crate::page_backed::adapter::step_engine::YieldShape;
         match pc.materialize_page(page_index, access, guard) {
-            tx_substrate::step_v3::StepOutcome::Done(materialized) => {
+            StepOutcome::Done(materialized) => {
                 match copy_chunk_user(
                     materialized.ppn,
                     within_page,
@@ -158,17 +159,17 @@ fn step_range_with_user_buffer(
                     }
                 }
             }
-            tx_substrate::step_v3::StepOutcome::Continue { .. } => {
+            StepOutcome::Continue { .. } => {
                 // NoProgress wait source: no materialized frame; treat as
                 // EAGAIN-like and surface partial progress (or EIO if
                 // none) — page allocation rarely emits this.
                 if advanced == 0 {
-                    return V3::err(tx_substrate::step_v3::Errno::EAGAIN);
+                    return V3::err(step_engine::Errno::EAGAIN);
                 }
                 of.set_offset(offset);
                 return V3::done(advanced);
             }
-            tx_substrate::step_v3::StepOutcome::Yield {
+            StepOutcome::Yield {
                 shape:
                     YieldShape::OnWaitSource {
                         source: carrier,
@@ -190,14 +191,14 @@ fn step_range_with_user_buffer(
                     interests.raw(),
                 );
             }
-            tx_substrate::step_v3::StepOutcome::Yield { .. } => {
+            StepOutcome::Yield { .. } => {
                 if advanced == 0 {
-                    return V3::err(tx_substrate::step_v3::Errno::EIO);
+                    return V3::err(step_engine::Errno::EIO);
                 }
                 of.set_offset(offset);
                 return V3::done(advanced);
             }
-            tx_substrate::step_v3::StepOutcome::Err(errno) => {
+            StepOutcome::Err(errno) => {
                 if advanced == 0 {
                     return V3::err(errno);
                 }
@@ -235,7 +236,7 @@ fn copy_chunk_user(
             // copy_to_user input.
             let kernel_slice = unsafe { core::slice::from_raw_parts(kernel_byte, chunk) };
             let user_dst = UserPtr::<u8>::new(dst.addr() + already_advanced);
-            use tx_substrate::step_v3::StepOutcome as V3;
+            use crate::page_backed::adapter::step_engine::StepOutcome as V3;
             match aspace.copy_to_user(user_dst, kernel_slice, guard) {
                 V3::Done(n) if n == chunk => Ok(()),
                 V3::Continue { progress, .. } if progress.bytes() == chunk => Ok(()),
@@ -257,7 +258,7 @@ fn copy_chunk_user(
             // side mutable slice for the copy_from_user output.
             let kernel_slice = unsafe { core::slice::from_raw_parts_mut(kernel_byte, chunk) };
             let user_src = UserPtr::<u8>::new(src.addr() + already_advanced);
-            use tx_substrate::step_v3::StepOutcome as V3;
+            use crate::page_backed::adapter::step_engine::StepOutcome as V3;
             match aspace.copy_from_user(kernel_slice, user_src, guard) {
                 V3::Done(n) if n == chunk => Ok(()),
                 V3::Continue { progress, .. } if progress.bytes() == chunk => Ok(()),
@@ -299,8 +300,8 @@ pub fn step_read_to_kernel(
     of: &OpenFile,
     dst: &mut [u8],
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<usize, ByteProgress> {
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     let len = dst.len();
     if len == 0 {
         return V3::done(0);
@@ -328,8 +329,8 @@ pub fn step_write_from_kernel(
     of: &OpenFile,
     src: &[u8],
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<usize, ByteProgress> {
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     let len = src.len();
     if len == 0 {
         return V3::done(0);
@@ -380,7 +381,7 @@ fn step_range_with_kernel_buffer(
     len: usize,
     mut buffer: KernelBuffer<'_>,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+) -> StepOutcome<usize, ByteProgress> {
     use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3, YieldShape};
     let mut advanced = 0usize;
     let mut offset = of.offset();
@@ -412,7 +413,7 @@ fn step_range_with_kernel_buffer(
             }
             V3::Continue { .. } => {
                 if advanced == 0 {
-                    return V3::err(tx_substrate::step_v3::Errno::EAGAIN);
+                    return V3::err(step_engine::Errno::EAGAIN);
                 }
                 of.set_offset(offset);
                 return V3::done(advanced);
@@ -441,7 +442,7 @@ fn step_range_with_kernel_buffer(
             }
             V3::Yield { .. } => {
                 if advanced == 0 {
-                    return V3::err(tx_substrate::step_v3::Errno::EIO);
+                    return V3::err(step_engine::Errno::EIO);
                 }
                 of.set_offset(offset);
                 return V3::done(advanced);
@@ -528,15 +529,15 @@ pub struct ReadToUserOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for ReadToUserOp<'a>
 {
     type Output = usize;
-    type Progress = tx_substrate::step_v3::ByteProgress;
+    type Progress = ByteProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_read_to_user(
             self.pc,
             self.of,
@@ -558,15 +559,15 @@ pub struct WriteFromUserOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for WriteFromUserOp<'a>
 {
     type Output = usize;
-    type Progress = tx_substrate::step_v3::ByteProgress;
+    type Progress = ByteProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_write_from_user(
             self.pc,
             self.of,

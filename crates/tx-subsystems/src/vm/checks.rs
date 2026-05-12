@@ -9,6 +9,7 @@ use crate::vm::{
     AccessMode, AddressSpace, MapPlacement, UserRange, VmEntry, VmFault, VmFaultError,
     VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultOutcome, VmMapError,
 };
+use crate::vm::adapter::step_engine::{self as step_engine};
 
 pub fn require_fault_recipe(
     aspace: &AddressSpace,
@@ -62,7 +63,7 @@ pub fn require_map_admission(
     entry: &VmEntry,
     placement: MapPlacement,
 ) -> Result<(), VmMapError> {
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     aspace.recipes.validate_map(entry, placement, &guard)
 }
 

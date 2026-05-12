@@ -1,11 +1,15 @@
 //! TTY hangup execution steps.
 
-use crate::tty::adapter::step_engine::{self as step_engine, Cap};
+use crate::tty::adapter::step_engine::Cap;
 
 use super::step_ioctl::{JobControlSignal, SessionCtlEvent, SignalDispatch, SignalTarget};
 use crate::execution::{Errno, Guard};
 use crate::tty::structure::TtyIdentity;
-use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
+use crate::tty::adapter::step_engine::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+#[cfg(test)]
+use crate::tty::adapter::step_engine::ByteProgress;
+#[cfg(test)]
+use crate::tty::adapter::step_engine::{self as step_engine};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HangupOutcome {

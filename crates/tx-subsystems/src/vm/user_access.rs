@@ -37,7 +37,7 @@
 
 use alloc::vec::Vec;
 use tx_hal::UserPtr;
-use tx_substrate::page_allocator;
+use step_engine::page_allocator;
 
 use crate::execution::{Errno, Guard, WaitToken};
 use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
@@ -46,6 +46,7 @@ use super::structure::{
     AccessMode, AddressSpace, UserRange, UserVirtAddr, VmBacking, VmEntry, VmFault, VmFaultOutcome,
     USER_PAGE_SIZE,
 };
+use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, NoProgress, StepOutcome};
 
 /// Whether a user-access primitive is reading from or writing to
 /// user-space memory. Determines both the protection check and the
@@ -80,7 +81,7 @@ impl AddressSpace {
         dst: &mut [u8],
         src: UserPtr<u8>,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> StepOutcome<usize, ByteProgress> {
         copy_in(self, dst, src, guard)
     }
 
@@ -91,7 +92,7 @@ impl AddressSpace {
         dst: UserPtr<u8>,
         src: &[u8],
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> StepOutcome<usize, ByteProgress> {
         copy_out(self, dst, src, guard)
     }
 
@@ -109,7 +110,7 @@ impl AddressSpace {
         &self,
         src: UserPtr<T>,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<T, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<T, NoProgress> {
         use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
         let mut value = core::mem::MaybeUninit::<T>::uninit();
         // SAFETY: value is a valid kernel-stack `MaybeUninit<T>`; we
@@ -143,7 +144,7 @@ impl AddressSpace {
         dst: UserPtr<T>,
         value: T,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
         // SAFETY: addr_of! yields a valid kernel pointer to `value`
         // for the lifetime of this call; the cast to *const u8 reads
@@ -203,8 +204,8 @@ impl AddressSpace {
         &self,
         range: UserRange,
         kind: UserAccessKind,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        use tx_substrate::step_v3::StepOutcome as V3;
+    ) -> StepOutcome<(), NoProgress> {
+        use crate::page_backed::adapter::step_engine::StepOutcome as V3;
         for page in range.iter_pages() {
             // Skip pages already published with sufficient protection.
             // We only avoid re-materialisation when the cached entry
@@ -271,7 +272,7 @@ impl AddressSpace {
         src: UserPtr<u8>,
         max_len: usize,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<Vec<u8>, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<Vec<u8>, NoProgress> {
         use tx_substrate::step_v3::{
             InterestMask, NoProgress, StepOutcome as V3, WaitSourceId, YieldShape,
         };
@@ -326,7 +327,7 @@ fn copy_in(
     dst: &mut [u8],
     src: UserPtr<u8>,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+) -> StepOutcome<usize, ByteProgress> {
     use tx_substrate::step_v3::{
         ByteProgress, InterestMask, StepOutcome as V3, WaitSourceId, YieldShape,
     };
@@ -387,7 +388,7 @@ fn copy_out(
     dst: UserPtr<u8>,
     src: &[u8],
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+) -> StepOutcome<usize, ByteProgress> {
     use tx_substrate::step_v3::{
         ByteProgress, InterestMask, StepOutcome as V3, WaitSourceId, YieldShape,
     };

@@ -1,5 +1,6 @@
 use super::*;
 use alloc::vec::Vec;
+use crate::page_backed::adapter::step_engine::{self as step_engine, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 impl PageCacheIndex {
     fn withdraw_from(&mut self, first: PageIndex) {
@@ -75,7 +76,7 @@ fn first_page_after_size(size: u64) -> Option<PageIndex> {
 pub fn step_fsync(
     pc: &PageContainer,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::PageProgress> {
+) -> StepOutcome<(), tx_substrate::step_v3::PageProgress> {
     use tx_substrate::step_v3::{PageProgress, StepOutcome as V3, YieldShape};
 
     let PageContainerKind::File {
@@ -128,13 +129,13 @@ pub fn step_fsync(
                 shape: YieldShape::OnAgent { .. },
                 ..
             } => {
-                return V3::err(tx_substrate::step_v3::Errno::EIO);
+                return V3::err(step_engine::Errno::EIO);
             }
             V3::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
             } => {
-                return V3::err(tx_substrate::step_v3::Errno::EIO);
+                return V3::err(step_engine::Errno::EIO);
             }
             V3::Err(v3_errno) => return V3::err(v3_errno),
         }
@@ -168,11 +169,11 @@ pub fn step_fsync(
         V3::Yield {
             shape: YieldShape::OnAgent { .. },
             ..
-        } => V3::err(tx_substrate::step_v3::Errno::EIO),
+        } => V3::err(step_engine::Errno::EIO),
         V3::Yield {
             shape: YieldShape::OnTimer { .. },
             ..
-        } => V3::err(tx_substrate::step_v3::Errno::EIO),
+        } => V3::err(step_engine::Errno::EIO),
         V3::Err(v3_errno) => V3::err(v3_errno),
     }
 }
@@ -180,7 +181,7 @@ pub fn step_fsync(
 /// `step_truncate` — v3 outcome shape over `PageProgress`.
 ///
 /// Same body and semantics as [`step_truncate`], translated to a v3
-/// [`tx_substrate::step_v3::StepOutcome`]:
+/// [`StepOutcome`]:
 ///
 /// - `Device` / new_size > capacity → `Err(EINVAL)`
 /// - fs `Done(())` then post-fs work → `Done(())`
@@ -200,7 +201,7 @@ pub fn step_truncate(
     pc: &PageContainer,
     new_size: u64,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::PageProgress> {
+) -> StepOutcome<(), tx_substrate::step_v3::PageProgress> {
     use tx_substrate::step_v3::{PageProgress, StepOutcome as V3, YieldShape};
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
@@ -242,11 +243,11 @@ pub fn step_truncate(
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
                 ..
-            } => return V3::err(tx_substrate::step_v3::Errno::EIO),
+            } => return V3::err(step_engine::Errno::EIO),
             V3::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
-            } => return V3::err(tx_substrate::step_v3::Errno::EIO),
+            } => return V3::err(step_engine::Errno::EIO),
             V3::Err(v3_errno) => return V3::err(v3_errno),
         },
         PageContainerKind::Anon { .. } => false,
@@ -275,7 +276,7 @@ pub fn step_fallocate(
     pc: &PageContainer,
     new_size: u64,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::PageProgress> {
+) -> StepOutcome<(), tx_substrate::step_v3::PageProgress> {
     use tx_substrate::step_v3::{PageProgress, StepOutcome as V3, YieldShape};
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
@@ -321,11 +322,11 @@ pub fn step_fallocate(
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
                 ..
-            } => return V3::err(tx_substrate::step_v3::Errno::EIO),
+            } => return V3::err(step_engine::Errno::EIO),
             V3::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
-            } => return V3::err(tx_substrate::step_v3::Errno::EIO),
+            } => return V3::err(step_engine::Errno::EIO),
             V3::Err(v3_errno) => return V3::err(v3_errno),
         },
         PageContainerKind::Anon { .. } => false,
@@ -358,15 +359,15 @@ pub struct FsyncOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for FsyncOp<'a>
 {
     type Output = ();
     type Progress = tx_substrate::step_v3::PageProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_fsync(self.pc, self.guard)
     }
 }
@@ -379,15 +380,15 @@ pub struct TruncateOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for TruncateOp<'a>
 {
     type Output = ();
     type Progress = tx_substrate::step_v3::PageProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_truncate(self.pc, self.new_size, self.guard)
     }
 }
@@ -400,15 +401,15 @@ pub struct FallocateOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for FallocateOp<'a>
 {
     type Output = ();
     type Progress = tx_substrate::step_v3::PageProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_fallocate(self.pc, self.new_size, self.guard)
     }
 }
@@ -426,7 +427,7 @@ mod v3_tests {
     use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};
     use alloc::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use tx_substrate::page_allocator;
+    use step_engine::page_allocator;
     use tx_substrate::step_v3::{
         Errno as V3Errno, InterestMask, NoProgress, PageProgress, StepOutcome as V3Outcome,
         WaitSourceId, YieldShape,
@@ -435,8 +436,8 @@ mod v3_tests {
     fn setup_host_substrate() {
         tx_substrate::testing::init_host_for_test_once();
         crate::zones::register_all().expect("kernel zones");
-        match tx_substrate::page_allocator::claim_zero_frame() {
-            Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+        match step_engine::page_allocator::claim_zero_frame() {
+            Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
             Err(error) => panic!("claim zero frame for v3 lifecycle tests: {error:?}"),
         }
     }
@@ -448,12 +449,12 @@ mod v3_tests {
         last_offset: AtomicU64,
         last_truncate_size: AtomicU64,
         block_flush_after: Option<usize>,
-        truncate_outcome: tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>,
+        truncate_outcome: StepOutcome<(), NoProgress>,
     }
 
     impl LifecycleFs {
         fn new() -> Self {
-            use tx_substrate::step_v3::StepOutcome as V3;
+            use crate::page_backed::adapter::step_engine::StepOutcome as V3;
             Self {
                 flushes: AtomicUsize::new(0),
                 fsyncs: AtomicUsize::new(0),
@@ -473,7 +474,7 @@ mod v3_tests {
         }
 
         fn failing_truncate(errno: V4Errno) -> Self {
-            use tx_substrate::step_v3::StepOutcome as V3;
+            use crate::page_backed::adapter::step_engine::StepOutcome as V3;
             Self {
                 truncate_outcome: V3::err(errno.into()),
                 ..Self::new()
@@ -481,10 +482,10 @@ mod v3_tests {
         }
 
         fn blocking_truncate(token: WaitToken) -> Self {
-            use tx_substrate::step_v3::StepOutcome as V3;
+            use crate::page_backed::adapter::step_engine::StepOutcome as V3;
             Self {
                 truncate_outcome: V3::yield_on_wait_source(
-                    tx_substrate::step_v3::NoProgress,
+                    NoProgress,
                     token.source_id(),
                     token.interest(),
                 ),
@@ -493,9 +494,9 @@ mod v3_tests {
         }
 
         fn advancing_truncate() -> Self {
-            use tx_substrate::step_v3::StepOutcome as V3;
+            use crate::page_backed::adapter::step_engine::StepOutcome as V3;
             Self {
-                truncate_outcome: V3::continue_with(tx_substrate::step_v3::NoProgress),
+                truncate_outcome: V3::continue_with(NoProgress),
                 ..Self::new()
             }
         }
@@ -705,7 +706,7 @@ mod v3_tests {
     fn fsync_v3_anon_returns_done() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -719,7 +720,7 @@ mod v3_tests {
     fn fsync_v3_no_dirty_pages_done() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let fs = Arc::new(LifecycleFs::new());
         let pc = file_page_container(fs.clone(), FsObjectId::new(91));
         assert_eq!(step_fsync(&pc, &guard), V3Outcome::done(()));
@@ -731,7 +732,7 @@ mod v3_tests {
     fn fsync_v3_flushes_clean_pages_done() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let fs = Arc::new(LifecycleFs::new());
         let pc = file_page_container(fs.clone(), FsObjectId::new(92));
         for page in [0u64, 1, 2] {
@@ -754,7 +755,7 @@ mod v3_tests {
     fn fsync_v3_blocked_first_page_yields_with_empty_progress() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let fs = Arc::new(LifecycleFs::blocking_after(0));
         let pc = file_page_container(fs.clone(), FsObjectId::new(93));
         for page in [0u64, 1] {
@@ -786,7 +787,7 @@ mod v3_tests {
     fn fsync_v3_blocked_after_progress_yields_with_pages_so_far() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let fs = Arc::new(LifecycleFs::blocking_after(1));
         let pc = file_page_container(fs.clone(), FsObjectId::new(94));
         for page in [0u64, 1] {
@@ -822,7 +823,7 @@ mod v3_tests {
     fn truncate_v3_anon_shrink_done_and_withdraws_pages() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -848,7 +849,7 @@ mod v3_tests {
     fn truncate_v3_device_returns_einval() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let device = PageContainer::new(
             PageContainerKind::Device {
                 base_ppn: Ppn(0xface_3000),
@@ -866,7 +867,7 @@ mod v3_tests {
     fn truncate_v3_grow_past_capacity_returns_einval() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -883,7 +884,7 @@ mod v3_tests {
     fn truncate_v3_fs_err_propagates_unchanged_state() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let fs = Arc::new(LifecycleFs::failing_truncate(V4Errno::EROFS));
         let pc = file_page_container(fs.clone(), FsObjectId::new(95));
         let original_size = pc.size_bytes();
@@ -898,7 +899,7 @@ mod v3_tests {
     fn truncate_v3_fs_blocked_yields_empty_progress() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let fs = Arc::new(LifecycleFs::blocking_truncate(WaitToken::new(7, 0x11)));
         let pc = file_page_container(fs.clone(), FsObjectId::new(96));
         let original_size = pc.size_bytes();
@@ -920,7 +921,7 @@ mod v3_tests {
     fn truncate_v3_fs_advanced_returns_continue_with_empty_progress() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("v3 lifecycle test lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let fs = Arc::new(LifecycleFs::advancing_truncate());
         let pc = file_page_container(fs.clone(), FsObjectId::new(97));
         // Pick a shrink so the post-fs work runs (withdraw + zero-tail).
@@ -951,8 +952,8 @@ mod step_op_wraps {
     fn setup() {
         tx_substrate::testing::init_host_for_test_once();
         crate::zones::register_all().expect("kernel zones");
-        match tx_substrate::page_allocator::claim_zero_frame() {
-            Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+        match step_engine::page_allocator::claim_zero_frame() {
+            Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
             Err(error) => panic!("claim zero frame for step_op_wraps tests: {error:?}"),
         }
     }
@@ -970,7 +971,7 @@ mod step_op_wraps {
     fn fsync_op_anon_returns_done() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let pc = anon_pc(1);
         let mut op = FsyncOp {
             pc: &pc,
@@ -984,7 +985,7 @@ mod step_op_wraps {
     fn truncate_op_anon_shrink_returns_done() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let pc = anon_pc(4);
         let new_size = crate::vm::USER_PAGE_SIZE as u64;
         let mut op = TruncateOp {
@@ -1000,7 +1001,7 @@ mod step_op_wraps {
     fn fallocate_op_anon_grow_returns_done() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let pc = anon_pc(4);
         // pc.size_bytes() starts at 0 for a fresh Anon container, so growing
         // to one page exercises the fs_advanced = false → Done(()) arm.

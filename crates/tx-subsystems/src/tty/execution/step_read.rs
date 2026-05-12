@@ -35,7 +35,7 @@ pub static STEP_READ_LAST_VMIN: core::sync::atomic::AtomicU32 =
 pub static STEP_READ_LAST_VTIME: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0xdead_beef);
 
-use crate::tty::adapter::step_engine::{self as step_engine, Cap};
+use crate::tty::adapter::step_engine::Cap;
 
 use crate::execution::Guard;
 use crate::tty::checks::{
@@ -44,7 +44,9 @@ use crate::tty::checks::{
 use crate::tty::execution::TTY_READABLE;
 use crate::tty::structure::termios::{ICANON, VMIN, VTIME};
 use crate::tty::structure::TtyIdentity;
-use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
+use crate::tty::adapter::step_engine::{ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+#[cfg(test)]
+use crate::tty::adapter::step_engine::{self as step_engine};
 
 /// Drain bytes from a live TTY input queue into `out`.
 ///

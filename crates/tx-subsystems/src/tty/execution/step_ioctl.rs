@@ -10,7 +10,9 @@ use crate::tty::checks::{require_live_tty, require_session_leader};
 use crate::tty::execution::{TTY_READABLE, TTY_WRITABLE};
 use crate::tty::ldisc::SignalKind;
 use crate::tty::structure::{SessionPgrp, Termios, TtyIdentity, Winsize};
-use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
+use crate::tty::adapter::step_engine::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+#[cfg(test)]
+use crate::tty::adapter::step_engine::ByteProgress;
 
 #[derive(Clone, Copy, Debug)]
 pub struct IoctlCaller {

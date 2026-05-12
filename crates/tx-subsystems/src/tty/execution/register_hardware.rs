@@ -6,7 +6,7 @@ use crate::device::CharDeviceBinding;
 use crate::execution::{Errno, Guard};
 use crate::tty::structure::registry;
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
-use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
+use crate::tty::adapter::step_engine::{NoProgress, StepOutcome};
 
 /// Create a hardware-backed TTY identity/payload and publish it to the tty
 /// registry. devfs aliases can then materialize RNodes pointing at it.

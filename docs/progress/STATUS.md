@@ -4,6 +4,17 @@
 
 ## Current Shape
 
+- 2026-05-12 D21 Phase 4 (page_backed, vm) adapter migration
+  LANDED. Memory subsystems migrated. VM adapter is the richest yet —
+  re-exports the full userfaultfd-delegate surface
+  (DelegateRegistry/Request/Reply, UfdRequest/Reply, AbortReason,
+  AgentCancelPolicy, TokenDropPolicy, YieldShape), TaskMailbox,
+  shootdown primitives, page_allocator. **Boundary report:**
+  substrate outside-adapter 1955 → 1815 (cumulative −732), inside
+  48 → 62; reactor outside 62 → 61, inside 7 → 8; adapters 18 → 22.
+  **Verified:** full tx-subsystems lib suite still 623 passing;
+  lint arch ok. ADR: `2026-05-12-d21-phase4-memory-adapter.md`.
+
 - 2026-05-12 D20 Phase 3 (tty family) adapter migration LANDED.
   14 production files across tty/execution/{register_hardware,step_*},
   tty/structure/, tty/checks/, tty/project.rs. Two adapter domains

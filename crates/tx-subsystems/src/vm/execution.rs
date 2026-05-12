@@ -26,7 +26,8 @@ use tx_substrate::step_v3::{
     AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply, DelegateRequest,
     StepOutcome as V3StepOutcome, TokenDropPolicy, UfdAccessKind, UfdReply, UfdRequest, YieldShape,
 };
-use tx_substrate::wake::TaskMailbox;
+use crate::vm::adapter::step_engine::TaskMailbox;
+use crate::vm::adapter::step_engine::{self as step_engine, StepOp, StepOutcome, SubjectIdentity};
 
 impl AddressSpace {
     pub fn resolve_fault(&self, fault: VmFault) -> Result<VmFaultOutcome, VmFaultError> {
@@ -125,7 +126,7 @@ impl AddressSpace {
             }
         }
 
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         child.stats.store(child.recipes.stats(&guard));
         Ok(child)
     }
@@ -426,7 +427,7 @@ impl AddressSpace {
             };
             let commit = self.recipes.unmap(range)?;
             self.pmap.teardown_range(range)?;
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             self.stats.store(self.recipes.stats(&guard));
             return Ok(commit);
         }
@@ -460,7 +461,7 @@ impl AddressSpace {
             };
             let commit = self.recipes.protect(range, prot)?;
             self.pmap.teardown_range(range)?;
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             self.stats.store(self.recipes.stats(&guard));
             return Ok(commit);
         }
@@ -498,7 +499,7 @@ impl AddressSpace {
                 .recipes
                 .remap_disjoint(request.old_range, request.new_range)?;
             self.pmap.teardown_range(request.old_range)?;
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             self.stats.store(self.recipes.stats(&guard));
             return Ok(VmRemapOutcome {
                 old_range: request.old_range,
@@ -573,7 +574,7 @@ impl AddressSpace {
             .recipes
             .remap_disjoint(request.old_range, request.new_range)?;
         self.pmap.teardown_range(request.old_range)?;
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         self.stats.store(self.recipes.stats(&guard));
         Ok(VmRemapOutcome {
             old_range: request.old_range,
@@ -634,7 +635,7 @@ impl AddressSpace {
         let _guard = self.acquire_writer(range)?;
         let commit = self.recipes.unmap(range)?;
         self.pmap.teardown_range(range)?;
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         self.stats.store(self.recipes.stats(&guard));
         Ok(commit)
     }
@@ -643,7 +644,7 @@ impl AddressSpace {
         let _guard = self.acquire_writer(range)?;
         let commit = self.recipes.protect(range, prot)?;
         self.pmap.teardown_range(range)?;
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         self.stats.store(self.recipes.stats(&guard));
         Ok(commit)
     }
@@ -669,7 +670,7 @@ impl AddressSpace {
         if placement == MapPlacement::FixedReplace {
             self.pmap.teardown_range(range)?;
         }
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         self.stats.store(self.recipes.stats(&guard));
         Ok(commit)
     }
@@ -743,7 +744,7 @@ impl AddressSpace {
             MadviseAdvice::DontNeed | MadviseAdvice::Free => {
                 let _guard = self.acquire_writer(range)?;
                 self.pmap.teardown_range(range)?;
-                let guard = tx_substrate::epoch::guard();
+                let guard = step_engine::guard();
                 self.stats.store(self.recipes.stats(&guard));
                 Ok(())
             }
@@ -763,8 +764,8 @@ impl AddressSpace {
         &self,
         range: UserRange,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::PageProgress> {
-        use tx_substrate::step_v3::StepOutcome as V3;
+    ) -> StepOutcome<(), tx_substrate::step_v3::PageProgress> {
+        use crate::page_backed::adapter::step_engine::StepOutcome as V3;
         let entries = self.recipes.snapshot(guard);
         let mut visited: BTreeSet<u32> = BTreeSet::new();
         for entry in entries {
@@ -1033,7 +1034,7 @@ fn materialize_ufd_copy(
     // bare-metal this is the linear-map VA of the freshly-allocated
     // frame; in tests the page_allocator's test backend installs a
     // direct-map hook that returns a usable `*mut u8`.
-    let dst_kernel_ptr = tx_substrate::page_allocator::frame_kernel_addr(materialization.page.ppn)
+    let dst_kernel_ptr = step_engine::page_allocator::frame_kernel_addr(materialization.page.ppn)
         .map_err(|alloc_err| {
             VmFaultError::PageCache(crate::page_backed::PageCacheError::Alloc(alloc_err))
         })?;

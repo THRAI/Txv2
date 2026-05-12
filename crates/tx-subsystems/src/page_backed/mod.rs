@@ -9,17 +9,18 @@
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+pub mod adapter;
+
+use adapter::step_engine::{
+    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, Cap, CachePin,
+    DeviceFrame, MapPin, Zone, ZoneAllocated, ZoneError, ZeroPolicy,
+};
+
 use crate::execution::{Errno, Guard};
 use crate::mount::MountPayloadPin;
 use crate::sync::SpinMutex;
 use crate::vfs::{FsObjectId, OpenFile};
 use tx_hal::{Ppn, UserPtr};
-use tx_substrate::{
-    page_allocator::{
-        self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,
-    },
-    zone::{self, Cap, Zone, ZoneAllocated, ZoneError},
-};
 
 mod cross_variant;
 mod fs_page_backing;
@@ -308,8 +309,7 @@ impl PageContainer {
         kind: PageContainerKind,
         page_count: u64,
     ) -> Result<Cap<PageContainer>, ZoneError> {
-        let reservation = zone::reserve_for::<PageContainer>()?;
-        Ok(zone::sign_for(reservation, Self::new(kind, page_count)))
+        step_engine::sign_zone_for(Self::new(kind, page_count))
     }
 
     pub const fn kind(&self) -> &PageContainerKind {

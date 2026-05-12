@@ -15,6 +15,7 @@
 //! returns `Errno::ENOEXEC` per the loader's short-read contract.
 
 use super::*;
+use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome};
 
 /// Read exactly `out.len()` bytes from `pc` starting at byte offset
 /// `off` into the kernel-side buffer `out`. Returns `Done(())` on
@@ -36,7 +37,7 @@ pub fn read_exact_at(
     off: u64,
     out: &mut [u8],
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::ByteProgress> {
+) -> StepOutcome<(), ByteProgress> {
     use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3, YieldShape};
     if out.is_empty() {
         return V3::done(());
