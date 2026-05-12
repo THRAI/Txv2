@@ -24,7 +24,7 @@ use crate::{
     wait,
     waker::task_waker,
 };
-use tx_substrate::bus::{
+use crate::adapter::bus_wire::{
     DeclaredPort, DeclaredQueue, WireDeclaration, WireDeclarationError, WireEventSet,
 };
 

@@ -262,20 +262,20 @@ where
     pub signal: &'a mut S,
 }
 
-impl<'a, R, C, S, I> tx_substrate::step_v3::StepOp<I> for HartLoopOp<'a, R, C, S>
+impl<'a, R, C, S, I> crate::adapter::step_engine::StepOp<I> for HartLoopOp<'a, R, C, S>
 where
     R: HartLoopRuntime,
     C: HartLoopClock,
     S: RescheduleSignal,
-    I: tx_substrate::step_v3::SubjectIdentity,
+    I: crate::adapter::step_engine::SubjectIdentity,
 {
     type Output = HartLoopStep;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = crate::adapter::step_engine::NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_hart_loop(
+        _ctx: &mut crate::adapter::step_engine::ScriptCtx<I>,
+    ) -> crate::adapter::step_engine::StepOutcome<Self::Output, Self::Progress> {
+        crate::adapter::step_engine::StepOutcome::Done(step_hart_loop(
             self.runtime,
             self.hart,
             self.clock,
@@ -296,19 +296,19 @@ where
     pub signal: &'a mut S,
 }
 
-impl<'a, R, S, I> tx_substrate::step_v3::StepOp<I> for HartLoopAtOp<'a, R, S>
+impl<'a, R, S, I> crate::adapter::step_engine::StepOp<I> for HartLoopAtOp<'a, R, S>
 where
     R: HartLoopRuntime,
     S: RescheduleSignal,
-    I: tx_substrate::step_v3::SubjectIdentity,
+    I: crate::adapter::step_engine::SubjectIdentity,
 {
     type Output = HartLoopStep;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = crate::adapter::step_engine::NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_hart_loop_at(
+        _ctx: &mut crate::adapter::step_engine::ScriptCtx<I>,
+    ) -> crate::adapter::step_engine::StepOutcome<Self::Output, Self::Progress> {
+        crate::adapter::step_engine::StepOutcome::Done(step_hart_loop_at(
             self.runtime,
             self.hart,
             self.now_ns,
@@ -327,7 +327,7 @@ mod step_op_wraps {
     //! `tests/hart_loop.rs`.
     use super::*;
     use crate::dispatch::NoopRescheduleSignal;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+    use crate::adapter::step_engine::{ScriptCtx, StepOp, StepOutcome as V3, PlaceholderProcessSubject};
 
     #[derive(Debug)]
     struct FakeHartRuntime {
@@ -395,7 +395,7 @@ mod step_op_wraps {
             now_ns: 100,
             signal: &mut signal,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             V3::Done(step) => {
@@ -419,7 +419,7 @@ mod step_op_wraps {
             clock: &mut clock,
             signal: &mut signal,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             V3::Done(step) => {

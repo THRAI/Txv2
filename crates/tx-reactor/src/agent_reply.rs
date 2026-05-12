@@ -47,8 +47,8 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use tx_substrate::step_v3::{AbortReason, DelegateRegistry, DelegateReply, DelegateTokenId};
-use tx_substrate::wake::{agent_event_matches, MailboxEvent, TaskMailbox};
+use crate::adapter::step_engine::{AbortReason, DelegateRegistry, DelegateReply, DelegateTokenId};
+use crate::adapter::bus_wire::{agent_event_matches, MailboxEvent, TaskMailbox};
 
 /// Outcome of [`await_agent_reply`]. Mirrors the `Replied` /
 /// non-`Replied` terminal split in the registry state machine: on

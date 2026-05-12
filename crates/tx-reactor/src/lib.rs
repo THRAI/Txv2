@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+pub mod adapter;
 pub mod agent_reply;
 pub mod ast;
 pub mod completion;

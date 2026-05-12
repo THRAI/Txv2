@@ -4,6 +4,17 @@
 
 ## Current Shape
 
+- 2026-05-13 D50 tx-reactor adapter LANDED. Created `crates/tx-reactor/src/adapter.rs`
+  with two `#[platform_adapter]` domains: `step_engine` (step_v3 types used by
+  hart_loop StepOp impls and agent_reply future) and `bus_wire` (bus + wake
+  primitives used by the back-compat shims and wait/runtime). Migrated 7 files:
+  hart_loop.rs, agent_reply.rs, mailbox.rs, wait_source.rs, timer.rs, wait.rs,
+  runtime.rs. Lowered `MAX_SUBSTRATE_OUTSIDE_ADAPTER` from 208 → 192.
+  **Boundary report (before→after):** substrate outside adapters 208→192 lines
+  (−16); inside adapters 153→155; adapters declared 45→47. **Verified:** cargo
+  build -p tx-reactor clean; 2/2 unit tests pass; cargo xtask lint boundary ok
+  at ceiling 192. ADR: 2026-05-13-d50-tx-reactor-adapter.md.
+
 - 2026-05-13 D47-D48 Phase 7 integration test migration LANDED.
   tx-subsystems integration tests (14 files, commit 82b8ef0) and tx-shims
   integration tests (10 files + adapter.rs, commit 4b6bbf4) migrated to
