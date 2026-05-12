@@ -24,7 +24,7 @@ use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentit
 use crate::vfs::{DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
-use crate::process::adapter::step_engine::{guard as ebr_guard, sign_zone_for, Cap};
+use crate::process::adapter::step_engine::{guard as ebr_guard, sign, Cap};
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -500,7 +500,7 @@ fn fresh_dentry_under(parent: &Cap<DEntry>, name: &[u8], fs_id: u64) -> Cap<DEnt
     let inline = InlineName::new(name).expect("name");
     let mut raw = DEntry::new(inline, fresh_rnode(fs_id));
     raw.set_parent_hint(parent);
-    sign_zone_for::<DEntry>(raw).expect("dentry slot")
+    sign::<DEntry>(raw).expect("dentry slot")
 }
 
 #[test]

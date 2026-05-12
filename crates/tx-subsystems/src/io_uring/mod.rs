@@ -82,7 +82,7 @@ use core::task::{Context, Poll};
 pub mod adapter;
 
 use adapter::step_engine::{
-    sign_zone_for, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask,
+    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask,
     OnBehalfOfAbort, ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource,
     WaitSourceId, Zone, ZoneAllocated, ZoneError,
 };
@@ -291,7 +291,7 @@ impl IoUring {
     /// Zone-sign a fresh io_uring with the given ring depths. Companion
     /// to [`Self::with_entries`] for the `sys_io_uring_setup(2)` arm.
     pub fn new_with_entries_cap(sq_entries: u32, cq_entries: u32) -> Result<Cap<Self>, ZoneError> {
-        sign_zone_for(Self::with_entries(sq_entries, cq_entries))
+        sign(Self::with_entries(sq_entries, cq_entries))
     }
 
     /// Snapshot the stable per-ring id. Used as the worker-registry

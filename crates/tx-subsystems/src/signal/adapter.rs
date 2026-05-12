@@ -24,8 +24,6 @@ use tx_platform_adapter::platform_adapter;
     reason = "wrap substrate step engine (StepOp), EBR guard/guard(), and signal-routing primitives (SignalRouting, OperationalCapExt, SpinMutex) used by the signal mutators"
 )]
 pub mod step_engine {
-    use tx_substrate::zone;
-
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
@@ -33,14 +31,9 @@ pub mod step_engine {
     };
     pub use tx_substrate::wake::{MailboxEvent, SignalRouting, TaskMailbox};
     pub use tx_substrate::zone::{
-        reserve_for, sign_for, Cap, OperationalCapExt, PayloadCap, ZoneAllocated, ZoneError,
+        reserve_for, sign, sign_for, Cap, OperationalCapExt, PayloadCap, ZoneAllocated, ZoneError,
     };
     pub use tx_substrate::SpinMutex;
-
-    pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
-        let reservation = zone::reserve_for::<T>()?;
-        Ok(zone::sign_for(reservation, value))
-    }
 }
 
 #[platform_adapter(

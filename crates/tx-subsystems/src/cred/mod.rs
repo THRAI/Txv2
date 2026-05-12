@@ -210,7 +210,7 @@ unsafe impl ZoneAllocated for Cred {
 /// Returns `ZoneError` only on slab exhaustion; tests reset the slab
 /// at `setup()`.
 pub fn sign_cred(cred: Cred) -> Result<Cap<Cred>, ZoneError> {
-    step_engine::sign_zone_for(cred)
+    step_engine::sign(cred)
 }
 
 /// PR-9 phase 5 — D5 §7. Mint a placeholder
@@ -230,7 +230,7 @@ pub fn sign_cred(cred: Cred) -> Result<Cap<Cred>, ZoneError> {
 /// the placeholder; PR-K replaces with the proper slot-style append-
 /// only stack.
 pub fn placeholder_restrictions_cap() -> Result<Cap<RestrictionStackHandle>, ZoneError> {
-    step_engine::sign_zone_for(RestrictionStackHandle::placeholder())
+    step_engine::sign(RestrictionStackHandle::placeholder())
 }
 
 impl Cred {

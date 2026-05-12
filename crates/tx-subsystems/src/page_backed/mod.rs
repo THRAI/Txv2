@@ -310,7 +310,7 @@ impl PageContainer {
         kind: PageContainerKind,
         page_count: u64,
     ) -> Result<Cap<PageContainer>, ZoneError> {
-        step_engine::sign_zone_for(Self::new(kind, page_count))
+        step_engine::sign(Self::new(kind, page_count))
     }
 
     pub const fn kind(&self) -> &PageContainerKind {

@@ -100,7 +100,7 @@ use core::task::{Context, Poll};
 pub mod adapter;
 
 use adapter::step_engine::{
-    sign_zone_for, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask,
+    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask,
     OnBehalfOfAbort, ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource,
     WaitSourceId, Zone, ZoneAllocated, ZoneError,
 };
@@ -414,7 +414,7 @@ impl AioContext {
     /// Companion to [`Self::with_nr_events`] for the
     /// `sys_io_setup(2)` arm.
     pub fn new_with_nr_events_cap(nr_events: u32) -> Result<Cap<Self>, ZoneError> {
-        sign_zone_for(Self::with_nr_events(nr_events))
+        sign(Self::with_nr_events(nr_events))
     }
 
     /// Snapshot the stable per-context id. Used as the iocb-routing

@@ -20,20 +20,8 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose the substrate zone role types (Cap, PayloadCap, Entity, ...) and SpinMutex primitive that mount uses for its identity/payload/namespace zones and global mount table"
 )]
 pub mod runtime {
-    use tx_substrate::zone;
-
     pub use tx_substrate::zone::{
-        Cap, Dead, Entity, PayloadBinding, PayloadCap, Zone, ZoneAllocated, ZoneError,
+        sign, Cap, Dead, Entity, PayloadBinding, PayloadCap, Zone, ZoneAllocated, ZoneError,
     };
     pub use tx_substrate::SpinMutex;
-
-    /// Reserve + sign in one step: mint a `Cap<T>` from `T`'s zone.
-    /// Mirrors the pipe adapter's `sign_zone_for` verb — bundles the
-    /// substrate two-step alloc into a single mount-side helper so
-    /// the production call sites read as "mint a mount cap" rather
-    /// than "reserve then sign in substrate vocabulary".
-    pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
-        let reservation = zone::reserve_for::<T>()?;
-        Ok(zone::sign_for(reservation, value))
-    }
 }

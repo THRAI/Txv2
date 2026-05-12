@@ -10,7 +10,7 @@
 //!   Entity, Dead, ZoneAllocated, ZoneError, Zone), EBR Guard +
 //!   guard(), bus primitives (RawPort, RawQueue) used by
 //!   TtyIdentity's mailbox path, AtomicSlot + SpinMutex, plus the
-//!   `sign_zone_for` verb.
+//!   `sign` (re-exported from `zone::sign`).
 //!
 //! * `wait_routing` — stacked substrate + reactor. Same shape as
 //!   pipe / process / vfs (TtyIdentity exposes wait sources for
@@ -25,8 +25,6 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine (StepOp/StepOutcome and ten step_* file types), zone role types, EBR guard, and bus primitives (RawPort/RawQueue) used by TtyIdentity / TtyPayload across the tty subsystem"
 )]
 pub mod step_engine {
-    use tx_substrate::zone;
-
     pub use tx_substrate::bus::{RawPort, RawQueue};
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
@@ -35,15 +33,10 @@ pub mod step_engine {
         SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        register_zone_for, reserve_for, sign_for, Cap, Dead, Entity, OperationalCapExt, PayloadCap,
-        Weak, Zone, ZoneAllocated, ZoneError,
+        register_zone_for, reserve_for, sign, sign_for, Cap, Dead, Entity, OperationalCapExt,
+        PayloadCap, Weak, Zone, ZoneAllocated, ZoneError,
     };
     pub use tx_substrate::{AtomicSlot, SpinMutex};
-
-    pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
-        let reservation = zone::reserve_for::<T>()?;
-        Ok(zone::sign_for(reservation, value))
-    }
 }
 
 #[platform_adapter(

@@ -24,10 +24,11 @@ pub use crate::step::{
 };
 
 // ── Zone allocation ────────────────────────────────────────────────────────
-// Role-typed allocation primitives: reserve+sign is the canonical two-step
-// for minting a Cap<T>; the trait and error complete the zone surface.
+// Role-typed allocation primitives: `sign` is the one-step convenience that
+// collapses `reserve_for + sign_for`; the two-step pair is still available
+// when resources must be reserved before value construction.
 pub use crate::zone::{
-    reserve_for, sign_for, Cap, Dead, Entity, OperationalCapExt, PayloadCap, Weak, Zone,
+    reserve_for, sign, sign_for, Cap, Dead, Entity, OperationalCapExt, PayloadCap, Weak, Zone,
     ZoneAllocated, ZoneError,
 };
 

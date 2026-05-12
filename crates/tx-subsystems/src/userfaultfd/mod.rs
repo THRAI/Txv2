@@ -41,7 +41,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    sign_zone_for, ByteProgress, Cap, DelegateRegistry, DelegateTokenId, InterestMask, SpinMutex,
+    sign, ByteProgress, Cap, DelegateRegistry, DelegateTokenId, InterestMask, SpinMutex,
     StepOutcome, TaskMailbox, V3Errno, WaitSource, WaitSourceId, Zone, ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::{Channel, Mask};
@@ -280,7 +280,7 @@ impl UserfaultFd {
     /// (PR-10 phase 2). Companion to [`Self::with_flags`] for the
     /// `sys_userfaultfd(2)` arm.
     pub fn new_with_flags_cap(open_flags: u32) -> Result<Cap<Self>, ZoneError> {
-        sign_zone_for(Self::with_flags(open_flags))
+        sign(Self::with_flags(open_flags))
     }
 
     /// Snapshot the stable per-ufd id. Phase 0 callers use this only

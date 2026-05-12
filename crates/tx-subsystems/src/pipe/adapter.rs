@@ -10,7 +10,7 @@
 //! * **`step_engine`** — wraps `tx_substrate::step` step outcomes,
 //!   `tx_substrate::zone` allocation, and `tx_substrate::SpinMutex` as
 //!   named pipe-side verbs (`done_bytes`, `eagain`, `epipe`,
-//!   `yield_until_readable`, `yield_until_writable`, `sign_zone_for`).
+//!   `yield_until_readable`, `yield_until_writable`, `sign`).
 //!
 //! * **`wait_routing`** — wraps `tx_substrate::wake::WaitSource` (v3
 //!   path) and `tx_reactor::wait::{Channel, Mask}` (D2 legacy
@@ -29,14 +29,12 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose pipe step outcomes (done/eagain/epipe/yield) as named verbs; bundle zone allocation into pipe-domain helpers"
 )]
 pub mod step_engine {
-    use tx_substrate::zone;
-
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::{
         ByteProgress, Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp,
         StepOutcome, StepProgress, SubjectIdentity, WaitSourceId, YieldShape,
     };
-    pub use tx_substrate::zone::{Cap, Zone, ZoneAllocated, ZoneError};
+    pub use tx_substrate::zone::{sign, Cap, Zone, ZoneAllocated, ZoneError};
     pub use tx_substrate::SpinMutex;
 
     pub type ByteOutcome = StepOutcome<usize, ByteProgress>;
@@ -73,21 +71,13 @@ pub mod step_engine {
         StepOutcome::yield_on_wait_source(ByteProgress::EMPTY, writer_wait_source_id, mask)
     }
 
-    /// Reserve + sign in one step: mint a `Cap<T>` from `T`'s zone.
-    /// Fails iff the zone is exhausted; `step_pipe2` maps that to
-    /// `Errno::ENOMEM`.
-    pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
-        let reservation = zone::reserve_for::<T>()?;
-        Ok(zone::sign_for(reservation, value))
-    }
-
     /// Bootstrap-side zone registration. Called once during workspace
     /// init via `pipe::register_zones`. The underlying substrate verb
     /// returns a `ZoneInfo` descriptor the caller has never needed;
     /// the pipe-domain wrapper drops it to keep the bootstrap surface
     /// simple.
     pub fn register_zone_for<T: ZoneAllocated>() -> Result<(), ZoneError> {
-        zone::register_zone_for::<T>()?;
+        tx_substrate::zone::register_zone_for::<T>()?;
         Ok(())
     }
 }

@@ -6,7 +6,7 @@
 //! reactor surface in production. Re-exports the step_v3 outcome
 //! types, zone role types, epoch Guard, and SpinMutex used by the
 //! `FsOps` impl, plus pass-through `reserve_for` / `sign_for` and
-//! `sign_zone_for`.
+//! `sign`.
 //!
 //! Crosses crate boundaries: `tx-fs` (this crate) depends on
 //! `tx-platform-adapter` so the attribute resolves.
@@ -20,20 +20,13 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine outcome types, zone role types, EBR guard, and SpinMutex used by tmpfs FsOps implementation (the largest single-file substrate consumer in the workspace)"
 )]
 pub mod step_engine {
-    use tx_substrate::zone;
-
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::{
         ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
         YieldShape,
     };
     pub use tx_substrate::zone::{
-        reserve_for, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
+        reserve_for, sign, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
     };
     pub use tx_substrate::{page_allocator, SpinMutex};
-
-    pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
-        let reservation = zone::reserve_for::<T>()?;
-        Ok(zone::sign_for(reservation, value))
-    }
 }

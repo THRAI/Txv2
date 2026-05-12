@@ -336,7 +336,7 @@ pub fn step_fork<P: PmapIf>(
 
     // Fork the address space, then publish into the AddressSpace zone.
     let child_aspace = AddressSpace::fork_aspace::<P>(&parent_aspace)?;
-    let child_aspace_cap = step_engine::sign_zone_for(child_aspace)?;
+    let child_aspace_cap = step_engine::sign(child_aspace)?;
 
     // Identity first (payload=None) so the leader thread can hold a
     // Weak<ProcessIdentity> back-reference.
@@ -850,7 +850,7 @@ pub fn step_setsid(target: &Cap<ProcessIdentity>) -> Result<Sid, SetsidError> {
 // --- internal sign-and-publish helpers ---
 
 fn sign_session(sid: Sid) -> Result<Cap<Session>, ZoneError> {
-    step_engine::sign_zone_for(Session {
+    step_engine::sign(Session {
         sid,
         controlling_tty: SpinMutex::new(None),
         members: SpinMutex::new(Vec::new()),
@@ -858,7 +858,7 @@ fn sign_session(sid: Sid) -> Result<Cap<Session>, ZoneError> {
 }
 
 fn sign_process_group(pgid: Pgid, session: Cap<Session>) -> Result<Cap<ProcessGroup>, ZoneError> {
-    step_engine::sign_zone_for(ProcessGroup {
+    step_engine::sign(ProcessGroup {
         pgid,
         session,
         members: SpinMutex::new(Vec::new()),
@@ -870,7 +870,7 @@ fn sign_process_identity(
     parent: Option<Weak<ProcessIdentity>>,
     pgrp: Cap<ProcessGroup>,
 ) -> Result<Cap<ProcessIdentity>, ZoneError> {
-    step_engine::sign_zone_for(ProcessIdentity {
+    step_engine::sign(ProcessIdentity {
         pid,
         parent: SpinMutex::new(parent),
         children: SpinMutex::new(Vec::new()),
@@ -928,7 +928,7 @@ fn sign_process_payload(
     // both ends (legacy resolver + new `Arc<WaitSource>` slot).
     let exit_wait_source = wait_routing::new_wait_source(exit_source_id);
 
-    let cap = step_engine::sign_zone_for(ProcessPayload {
+    let cap = step_engine::sign(ProcessPayload {
             aspace: aspace_slot,
             threads: SpinMutex::new(threads),
             sig_actions: SigActionTable::new(),
@@ -956,9 +956,9 @@ fn sign_process_payload(
 
 fn sign_thread(owner_proc: Weak<ProcessIdentity>) -> Result<Cap<ThreadIdentity>, ZoneError> {
     let tid = allocate_tid();
-    let payload_cap = step_engine::sign_zone_for(ThreadPayload::fresh())?;
+    let payload_cap = step_engine::sign(ThreadPayload::fresh())?;
     let payload = PayloadCap::from_cap(payload_cap);
-    step_engine::sign_zone_for(ThreadIdentity {
+    step_engine::sign(ThreadIdentity {
         tid,
         owner_proc,
         exit_status: SpinMutex::new(None),

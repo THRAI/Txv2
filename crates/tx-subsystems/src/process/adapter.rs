@@ -12,7 +12,7 @@
 //!   ProcessGroup / Session, EBR `Guard` / `guard()`, the
 //!   `RestrictionStackHandle` (`SubjectAuthority` plumbing), the
 //!   `AtomicSlot` primitive (used for slot-style payload binding),
-//!   and `SpinMutex`. Provides `sign_zone_for`.
+//!   and `SpinMutex`. Re-exports `zone::sign`.
 //!
 //! * `wait_routing` — stacked substrate + reactor. The exit-source
 //!   path: each process exposes a `WaitSource` (substrate) that
@@ -30,8 +30,6 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine (StepOp/StepOutcome, RestrictionStackHandle, SubjectIdentity), EBR guard, zone role types (Cap/PayloadCap/Weak/IdentRef/Entity), and lock primitives (SpinMutex/AtomicSlot) used by process identity, payload, group, session, and the seven fork/exit/wait/chdir/getcwd/setpgid/setsid step ops"
 )]
 pub mod step_engine {
-    use tx_substrate::zone;
-
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
@@ -39,16 +37,10 @@ pub mod step_engine {
         SubjectIdentity, WaitSourceId,
     };
     pub use tx_substrate::zone::{
-        Cap, Dead, Entity, IdentRef, OperationalCapExt, PayloadCap, Weak, Zone, ZoneAllocated,
-        ZoneError,
+        sign, Cap, Dead, Entity, IdentRef, OperationalCapExt, PayloadCap, Weak, Zone,
+        ZoneAllocated, ZoneError,
     };
     pub use tx_substrate::{AtomicSlot, SpinMutex};
-
-    /// Reserve + sign in one step: mint a `Cap<T>` from `T`'s zone.
-    pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
-        let reservation = zone::reserve_for::<T>()?;
-        Ok(zone::sign_for(reservation, value))
-    }
 }
 
 #[platform_adapter(

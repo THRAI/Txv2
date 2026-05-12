@@ -557,7 +557,7 @@ impl RNode {
         meta: InodeMeta,
         backing: RNodeBacking,
     ) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign_zone_for(Self::new(fs_object_id, meta, backing))
+        step_engine::sign(Self::new(fs_object_id, meta, backing))
     }
 
     pub const fn fs_object_id(&self) -> FsObjectId {
@@ -719,7 +719,7 @@ impl DEntry {
     }
 
     pub fn new_cap(name: InlineName, rnode: Cap<RNode>) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign_zone_for(Self::new(name, rnode))
+        step_engine::sign(Self::new(name, rnode))
     }
 
     pub const fn name(&self) -> InlineName {
@@ -929,7 +929,7 @@ impl OpenFile {
     }
 
     pub fn new_cap(rnode: Cap<RNode>, flags: OpenFileFlags) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign_zone_for(Self::new(rnode, flags))
+        step_engine::sign(Self::new(rnode, flags))
     }
 
     /// Construct a userfaultfd-backed `OpenFile` (PR-10 phase 0). The
@@ -954,7 +954,7 @@ impl OpenFile {
         ufd: Cap<UserfaultFd>,
         flags: OpenFileFlags,
     ) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign_zone_for(Self::new_userfaultfd(ufd, flags))
+        step_engine::sign(Self::new_userfaultfd(ufd, flags))
     }
 
     /// Construct an AIO-context-backed `OpenFile` (PR-11 phase 1). The
@@ -980,7 +980,7 @@ impl OpenFile {
         ctx: Cap<AioContext>,
         flags: OpenFileFlags,
     ) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign_zone_for(Self::new_aio_context(ctx, flags))
+        step_engine::sign(Self::new_aio_context(ctx, flags))
     }
 
     /// Construct a signalfd-backed `OpenFile` (D9-D). The resulting
@@ -1001,7 +1001,7 @@ impl OpenFile {
         sfd: Cap<SignalFd>,
         flags: OpenFileFlags,
     ) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign_zone_for(Self::new_signalfd(sfd, flags))
+        step_engine::sign(Self::new_signalfd(sfd, flags))
     }
 
     /// Construct an io_uring-backed `OpenFile` (future PR-12 phase 0 —
@@ -1024,7 +1024,7 @@ impl OpenFile {
         ring: Cap<IoUring>,
         flags: OpenFileFlags,
     ) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign_zone_for(Self::new_io_uring(ring, flags))
+        step_engine::sign(Self::new_io_uring(ring, flags))
     }
 
     /// Snapshot the backing shape. Callers that may handle either an

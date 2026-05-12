@@ -15,13 +15,8 @@ pub mod step_engine {
         Errno as V3Errno, InterestMask, StepOutcome, TransitionOutcome, UfdReply, WaitSourceId,
     };
     pub use tx_substrate::wake::{TaskMailbox, WaitSource};
-    pub use tx_substrate::zone::{Cap, Zone, ZoneAllocated, ZoneError};
+    pub use tx_substrate::zone::{sign, Cap, Zone, ZoneAllocated, ZoneError};
     pub use tx_substrate::SpinMutex;
-
-    pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
-        let reservation = zone::reserve_for::<T>()?;
-        Ok(zone::sign_for(reservation, value))
-    }
 
     pub fn register_zone_for<T: ZoneAllocated>() -> Result<(), ZoneError> {
         zone::register_zone_for::<T>().map(|_| ())

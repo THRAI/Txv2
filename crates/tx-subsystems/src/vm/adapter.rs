@@ -13,7 +13,7 @@
 //! Two domains:
 //!
 //! * `step_engine` — substrate. Everything in the above paragraph
-//!   except the reactor `Channel`/`Mask`. Plus `sign_zone_for` and
+//!   except the reactor `Channel`/`Mask`. Re-exports `zone::sign` plus
 //!   pass-through `reserve_for` / `sign_for`.
 //!
 //! * `wait_routing` — stacked substrate + reactor. `RangeLock`
@@ -29,8 +29,6 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine (including delegate-registry plumbing for userfaultfd: DelegateRequest/Reply, UfdRequest/Reply, AbortReason, AgentCancelPolicy, TokenDropPolicy, YieldShape), zone role types, EBR guard, page-allocator primitives, shootdown surface (AddressSpaceShootdownBatch, ShootdownError), TaskMailbox, and SpinMutex used by vm fault resolver, address-space ops, range-lock wait sources, and the recipe/private mapping structures"
 )]
 pub mod step_engine {
-    use tx_substrate::zone;
-
     pub use tx_substrate::epoch::{self as epoch_mod, guard, Guard};
     pub use tx_substrate::page_allocator::{
         self, BitmapPageAllocator, CachePin, ZeroPolicy,
@@ -45,14 +43,9 @@ pub mod step_engine {
     };
     pub use tx_substrate::wake::{MailboxEvent, TaskMailbox};
     pub use tx_substrate::zone::{
-        reserve_for, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
+        reserve_for, sign, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
     };
     pub use tx_substrate::SpinMutex;
-
-    pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
-        let reservation = zone::reserve_for::<T>()?;
-        Ok(zone::sign_for(reservation, value))
-    }
 }
 
 #[platform_adapter(
