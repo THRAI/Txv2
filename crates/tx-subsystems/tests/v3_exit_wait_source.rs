@@ -58,8 +58,6 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_substrate::epoch;
-use tx_substrate::testing::init_host_for_test_once;
 use tx_subsystems::process::adapter::step_engine::{Cap, InterestMask, WaitSourceId};
 use tx_subsystems::process::adapter::wait_routing::{
     MailboxEvent, Mask, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
@@ -185,10 +183,9 @@ fn assert_source_fired_for(
 /// shape).
 #[test]
 fn exit_wait_source_invariants_round_trip() {
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 
     let parent: Cap<ProcessIdentity> = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
 
@@ -348,6 +345,5 @@ fn exit_wait_source_invariants_round_trip() {
 
     // Drop the strong child-source ref so EBR can retire.
     drop(child_source_strong);
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 }

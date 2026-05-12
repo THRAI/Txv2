@@ -63,7 +63,6 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use tx_substrate::epoch;
-use tx_substrate::testing::init_host_for_test_once;
 use tx_subsystems::tty::adapter::step_engine::{
     self as zone_mod, ByteProgress, Cap, InterestMask, PayloadCap, StepOutcome, WaitSourceId,
 };
@@ -108,22 +107,10 @@ static NOOP_BINDING: CharDeviceBinding = CharDeviceBinding {
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
     guard
-}
-
-fn drain_to_quiescence() {
-    let mut quiet = 0u32;
-    while quiet < 2 {
-        let stats = epoch::drain_with_budget(usize::MAX);
-        if stats.reclaimed == 0 {
-            quiet += 1;
-        } else {
-            quiet = 0;
-        }
-    }
 }
 
 fn alloc_hardware_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
@@ -305,5 +292,5 @@ fn tty_wait_source_invariants_round_trip() {
 
     // Drop strong refs so EBR can retire.
     drop(tty);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 }

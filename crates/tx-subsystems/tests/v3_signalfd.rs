@@ -44,8 +44,6 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_substrate::epoch;
-use tx_substrate::testing::init_host_for_test_once;
 use tx_subsystems::signalfd::adapter::step_engine::{Cap, StepOutcome, V3Errno, YieldShape};
 
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
@@ -115,22 +113,10 @@ impl PmapIf for StubPmap {
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
     guard
-}
-
-fn drain_to_quiescence() {
-    let mut quiet = 0u32;
-    while quiet < 2 {
-        let stats = epoch::drain_with_budget(usize::MAX);
-        if stats.reclaimed == 0 {
-            quiet += 1;
-        } else {
-            quiet = 0;
-        }
-    }
 }
 
 fn fresh_aspace() -> Cap<AddressSpace> {
@@ -249,7 +235,7 @@ fn signalfd_d9d_pins_create_route_and_drain() {
     );
 
     drop(sfd_a);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 
     let delivered_after = notify_process_signal(proc_key, sigusr1);
     assert_eq!(
@@ -264,5 +250,5 @@ fn signalfd_d9d_pins_create_route_and_drain() {
     let _ = sfd_b.pop_pending();
     drop(sfd_b);
 
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 }

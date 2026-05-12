@@ -39,7 +39,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use tx_substrate::epoch;
-use tx_substrate::testing::init_host_for_test_once;
 use tx_subsystems::page_backed::adapter::step_engine::{self as zone, Errno as V3Errno, StepOutcome as V3Out, page_allocator};
 
 use tx_subsystems::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
@@ -50,13 +49,13 @@ use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::zones;
 
 fn setup_substrate() {
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
     match page_allocator::claim_zero_frame() {
         Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame: {error:?}"),
     }
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 }
 
 fn make_page_backed_open_file(
@@ -191,5 +190,5 @@ fn openfile_step_read_page_backed_round_trips() {
     }
 
     // Final housekeeping.
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 }

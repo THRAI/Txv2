@@ -50,8 +50,6 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_substrate::epoch;
-use tx_substrate::testing::init_host_for_test_once;
 use tx_subsystems::signal::adapter::step_engine::{Cap, MailboxEvent, SignalRouting, TaskMailbox};
 
 use tx_subsystems::process::bootstrap_init_process;
@@ -161,10 +159,9 @@ fn assert_signal_delivered(
 
 #[test]
 fn signal_mailbox_phase_a_plumbing() {
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 
     let proc_cap: Cap<ProcessIdentity> = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
     let leader = proc_cap.nth_thread(0).expect("leader thread");
@@ -295,6 +292,5 @@ fn signal_mailbox_phase_a_plumbing() {
     assert!(weak_clone.upgrade().is_none());
 
     // EBR drain to let zone caps recycle.
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 }
