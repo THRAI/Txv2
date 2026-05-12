@@ -18,7 +18,7 @@ use alloc::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 fn setup_host_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     crate::zones::register_all().expect("kernel zones");
     match step_engine::page_allocator::claim_zero_frame() {
         Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}

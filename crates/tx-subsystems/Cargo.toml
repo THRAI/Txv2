@@ -23,6 +23,7 @@ tx-hal = { path = "../tx-hal" }
 tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-reactor = { path = "../tx-reactor" }
 tx-substrate = { path = "../tx-substrate" }
+tx-test-support = { path = "../tx-test-support" }
 
 [dev-dependencies]
 tx-ext4-format = { path = "../tx-ext4-format" }

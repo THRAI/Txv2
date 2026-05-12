@@ -6,7 +6,7 @@ use tx_hal::UserPtr;
 use crate::vm::adapter::step_engine::StepOutcome;
 
 fn setup_host_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     crate::zones::register_all().expect("kernel zones");
     match crate::vm::adapter::step_engine::page_allocator::claim_zero_frame() {
         Ok(_) | Err(crate::vm::adapter::step_engine::page_allocator::AllocError::AlreadyInstalled) => {}

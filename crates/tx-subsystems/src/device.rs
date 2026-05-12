@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn block_device_handle_translates_partition_relative_lbas() {
         use crate::adapter::step_engine::{guard, StepOutcome as V3};
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");

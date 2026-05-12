@@ -23,7 +23,7 @@ use crate::tty::adapter::step_engine::{
 /// shared `support::init_zones` helper only registers the tty zones,
 /// so calling it here would fail later allocations with `EIO`.
 fn init_zones() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     crate::zones::register_all().expect("kernel zones");
     crate::tty::structure::registry::reset_for_tests();
 }

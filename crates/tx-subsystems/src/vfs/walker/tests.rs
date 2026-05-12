@@ -55,7 +55,7 @@ static CAPTURING_BINDING: CharDeviceBinding = CharDeviceBinding {
 };
 
 fn init_zones() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     crate::zones::register_all().expect("register all subsystem zones");
 }
 

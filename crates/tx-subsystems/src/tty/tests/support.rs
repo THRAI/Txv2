@@ -30,7 +30,7 @@ pub(super) static NOOP_BINDING: CharDeviceBinding = CharDeviceBinding {
 };
 
 pub(super) fn init_zones() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     crate::tty::structure::registry::register_zones().expect("tty zones");
     crate::tty::structure::registry::reset_for_tests();
 }

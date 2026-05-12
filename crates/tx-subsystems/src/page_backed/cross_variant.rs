@@ -262,7 +262,7 @@ mod step_op_wraps {
     use step_engine::{PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome as V3};
 
     fn setup_host_substrate() {
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         match step_engine::page_allocator::claim_zero_frame() {
             Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
             Err(error) => panic!("claim zero frame for cross-variant op tests: {error:?}"),

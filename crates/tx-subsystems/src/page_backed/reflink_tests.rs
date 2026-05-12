@@ -2,7 +2,7 @@ use super::*;
 use crate::page_backed::adapter::step_engine::{self as step_engine, StepOutcome as V3Out};
 
 fn setup_host_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     match step_engine::page_allocator::claim_zero_frame() {
         Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for reflink tests: {error:?}"),
