@@ -81,7 +81,7 @@ fn print_usage() {
            cargo xtask progress new plan|handoff|worktree --id ID --title TITLE [...]\n\
            cargo xtask progress claim plan|worktree --id ID --owner NAME --scope PATH [--scope PATH]\n\
            cargo xtask progress close plan|handoff|worktree --id ID --status STATUS\n\
-           cargo xtask lint arch|docs|unused\n   \
+           cargo xtask lint arch|docs|unused|boundary\n   \
            cargo xtask boundary-report [--top N] [--json]\n"
     );
 }
