@@ -361,7 +361,7 @@ pub fn notify_process_signal(proc_key: u32, signum: Signum) -> usize {
     if snapshot.is_empty() {
         return 0;
     }
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let mut delivered = 0usize;
     for weak in &snapshot {
         let Some(cap) = weak.upgrade(&guard) else {
