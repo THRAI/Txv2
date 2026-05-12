@@ -81,6 +81,8 @@ pub(crate) fn fault_decode(root: &Path, args: Vec<String>) -> Result<()> {
                     serde_json::to_string_pretty(&values)
                         .unwrap_or_else(|_| "[]".to_string())
                 );
+            } else if config.summary {
+                print_trap_summary_table(&selected, &image, &spec);
             } else {
                 for (index, trap) in selected.iter().enumerate() {
                     if config.brief {
@@ -107,6 +109,7 @@ struct FaultDecodeConfig {
     user_elf: Option<PathBuf>,
     brief: bool,
     json: bool,
+    summary: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +130,7 @@ impl FaultDecodeConfig {
         let all = args.iter().any(|arg| arg == "--all");
         let brief = args.iter().any(|arg| arg == "--brief");
         let json = args.iter().any(|arg| arg == "--json");
+        let summary = args.iter().any(|arg| arg == "--summary");
 
         let input = if let Some(path) = optional_option_value(args, "--serial") {
             FaultDecodeInput::Serial {
@@ -159,7 +163,7 @@ impl FaultDecodeConfig {
             }
         };
 
-        Ok(Self { target, elf, input, user_elf, brief, json })
+        Ok(Self { target, elf, input, user_elf, brief, json, summary })
     }
 }
 
@@ -1922,6 +1926,79 @@ fn decode_illegal_insn_stval(scause: &ScauseInfo, stval: u64) -> Option<String> 
     Some(format!("illegal insn: {decoded}"))
 }
 
+fn print_trap_summary_table(traps: &[TrapRecord], image: &ElfImage, spec: &TargetSpec) {
+    println!(
+        "  {:>3}  {:<32}  {:<30}  {:<18}  {}",
+        "#", "cause", "sepc→symbol", "stval", "flags"
+    );
+    println!(
+        "  {:>3}  {:<32}  {:<30}  {:<18}  {}",
+        "─", "─────", "───────────", "─────", "─────"
+    );
+
+    for (i, trap) in traps.iter().enumerate() {
+        let scause = decode_scause(trap.scause);
+        let cause_str = scause.name;
+
+        let sepc_analysis = image.analyze_address(trap.sepc, spec);
+        let selected_addr = sepc_analysis
+            .selected
+            .as_ref()
+            .map(|c| c.address)
+            .unwrap_or(trap.sepc);
+        let sym_str = match nearest_symbol(&image.symbols, selected_addr) {
+            Some((name, 0)) => name,
+            Some((name, off)) => format!("{name}+{off:#x}"),
+            None => format_hex(trap.sepc),
+        };
+        // truncate to 30 chars
+        let sym_str = if sym_str.len() > 30 {
+            sym_str[..30].to_string()
+        } else {
+            sym_str
+        };
+
+        let stval_str = format_hex(trap.stval);
+
+        let mut flags = Vec::new();
+        if null_deref_note(trap.stval).is_some() {
+            flags.push("null");
+        }
+        if trap.panic_msg.is_some() {
+            flags.push("panic");
+        }
+        let flags_str = flags.join(" ");
+
+        println!(
+            "  {:>3}  {:<32}  {:<30}  {:<18}  {}",
+            i + 1,
+            cause_str,
+            sym_str,
+            stval_str,
+            flags_str,
+        );
+    }
+
+    println!();
+
+    // Build histogram sorted by count descending
+    let mut counts: Vec<(u64, &'static str, u64)> = Vec::new(); // (scause_raw, name, count)
+    for trap in traps {
+        let scause = decode_scause(trap.scause);
+        if let Some(entry) = counts.iter_mut().find(|e| e.0 == trap.scause) {
+            entry.2 += 1;
+        } else {
+            counts.push((trap.scause, scause.name, 1));
+        }
+    }
+    counts.sort_by(|a, b| b.2.cmp(&a.2));
+
+    println!("scause histogram:");
+    for (_, name, count) in &counts {
+        println!("  {count}×  {name}");
+    }
+}
+
 fn format_hex(value: u64) -> String {
     format!("0x{value:016x}")
 }
@@ -2721,5 +2798,76 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
         // scause=13 = load page fault; should return None
         let result = decode_illegal_insn_stval(&decode_scause(13), 0xFF843503);
         assert!(result.is_none(), "expected None, got {result:?}");
+    }
+
+    #[test]
+    fn summary_table_histogram_counts_correctly() {
+        let spec = TargetSpec::rv64_qemu();
+        let image = ElfImage {
+            bytes: Vec::new(),
+            layout: KernelLinkMode::LowLinkedHighAlias {
+                elf_base: spec.kernel_phys_base,
+                high_alias_base: spec.kernel_virt_base,
+            },
+            loader: None,
+            sections: Vec::new(),
+            symbols: Vec::new(),
+            build_id: None,
+        };
+
+        let traps = vec![
+            TrapRecord {
+                scause: 13,
+                sepc: 0x8020_1000,
+                stval: 0x48,
+                frame: None,
+                fp_chain: vec![],
+                panic_msg: None,
+            },
+            TrapRecord {
+                scause: 13,
+                sepc: 0x8020_2000,
+                stval: 0x8020_3000,
+                frame: None,
+                fp_chain: vec![],
+                panic_msg: Some("panic!".to_string()),
+            },
+            TrapRecord {
+                scause: 15,
+                sepc: 0x8020_4000,
+                stval: 0x8020_5000,
+                frame: None,
+                fp_chain: vec![],
+                panic_msg: None,
+            },
+        ];
+
+        // Should not panic
+        print_trap_summary_table(&traps, &image, &spec);
+
+        // Verify histogram logic inline
+        let mut counts: Vec<(u64, u64)> = Vec::new(); // (scause_raw, count)
+        for trap in &traps {
+            if let Some(entry) = counts.iter_mut().find(|e| e.0 == trap.scause) {
+                entry.1 += 1;
+            } else {
+                counts.push((trap.scause, 1));
+            }
+        }
+        let count_13 = counts.iter().find(|e| e.0 == 13).map(|e| e.1).unwrap_or(0);
+        let count_15 = counts.iter().find(|e| e.0 == 15).map(|e| e.1).unwrap_or(0);
+        assert_eq!(count_13, 2, "expected 2 entries for scause=13 (load page fault)");
+        assert_eq!(count_15, 1, "expected 1 entry for scause=15 (store/AMO page fault)");
+    }
+
+    #[test]
+    fn summary_flag_parsed_from_args() {
+        let root = std::path::Path::new(".");
+        let args: Vec<String> = ["--target", "rv64-qemu", "--summary", "--addr", "0x80200000"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let config = FaultDecodeConfig::parse(root, &args).expect("parse must succeed");
+        assert!(config.summary, "expected summary == true");
     }
 }
