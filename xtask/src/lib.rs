@@ -70,7 +70,7 @@ fn print_usage() {
            cargo xtask check\n\
            cargo xtask build --target rv64-qemu|rv64-m1dock-mock|la64-qemu|all\n\
            cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox [--dry-run] [--expect-sentinel] [--timeout-ms N] [--no-block] [--interactive]\n\
-           cargo xtask test [smoke|busybox-smoke] [--target rv64-qemu] [--timeout-ms N] [--dry-run] [--trap-trace]\n\
+           cargo xtask test [smoke|busybox-boot] [--target rv64-qemu] [--timeout-ms N] [--dry-run] [--trap-trace]\n\
            cargo xtask fault-decode --target rv64-qemu [--elf PATH] [--serial PATH [--all] | --scause HEX --sepc HEX --stval HEX | --addr HEX]\n\
            cargo xtask trap-trace --serial PATH [--syscalls | --raw]\n\
            cargo xtask shell-test --target rv64-qemu --script PATH\n\
