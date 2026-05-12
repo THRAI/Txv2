@@ -3,7 +3,7 @@
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use tx_substrate::step_v3::StepOutcome;
+use crate::adapter::step_engine::{ByteProgress, NoProgress, StepOutcome, V3Errno};
 
 use crate::execution::{Errno, Guard};
 use crate::page_backed::Frame;
@@ -49,12 +49,12 @@ pub trait CharDeviceOps: Send + Sync + 'static {
         &self,
         out: &mut [u8],
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>;
+    ) -> StepOutcome<usize, ByteProgress>;
     fn write(
         &self,
         bytes: &[u8],
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>;
+    ) -> StepOutcome<usize, ByteProgress>;
 }
 
 #[derive(Clone, Copy)]
@@ -79,19 +79,19 @@ pub trait BlockDeviceOps: Send + Sync + 'static {
         block_id: PhysicalBlockNumber,
         target: &mut [Frame],
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<(), NoProgress>;
 
     fn write_blocks(
         &self,
         block_id: PhysicalBlockNumber,
         source: &[Frame],
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<(), NoProgress>;
 
     fn barrier(
         &self,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<(), NoProgress>;
 }
 
 pub trait BlockDevice: BlockDeviceOps {
@@ -162,9 +162,9 @@ impl BlockDeviceHandle {
         lba_offset: u64,
         target: &mut [Frame],
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         let Some(block_id) = self.block_id_for(lba_offset, target.len() as u64) else {
-            return tx_substrate::step_v3::StepOutcome::err(Errno::EINVAL.into());
+            return StepOutcome::err(Errno::EINVAL.into());
         };
         self.reg.ops.read_blocks(block_id, target, guard)
     }
@@ -174,9 +174,9 @@ impl BlockDeviceHandle {
         lba_offset: u64,
         source: &[Frame],
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         let Some(block_id) = self.block_id_for(lba_offset, source.len() as u64) else {
-            return tx_substrate::step_v3::StepOutcome::err(Errno::EINVAL.into());
+            return StepOutcome::err(Errno::EINVAL.into());
         };
         self.reg.ops.write_blocks(block_id, source, guard)
     }
@@ -184,7 +184,7 @@ impl BlockDeviceHandle {
     pub fn barrier(
         self,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         self.reg.ops.barrier(guard)
     }
 
@@ -216,7 +216,7 @@ static mut BLOCK_REGISTRY: [Option<&'static BlockDeviceRegistration>; MAX_STATIC
 
 pub fn register_block_devices(
     regs: &'static [&'static BlockDeviceRegistration],
-) -> StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+) -> StepOutcome<(), NoProgress> {
     if BLOCK_REGISTRY_INITIALIZED.swap(true, Ordering::AcqRel) {
         return StepOutcome::Err(Errno::EEXIST.into());
     }
@@ -292,9 +292,9 @@ mod tests {
             block_id: PhysicalBlockNumber,
             target: &mut [Frame],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        ) -> StepOutcome<(), NoProgress> {
             target[0] = Frame::new(Ppn(block_id.as_u64() as usize));
-            tx_substrate::step_v3::StepOutcome::done(())
+            StepOutcome::done(())
         }
 
         fn write_blocks(
@@ -302,15 +302,15 @@ mod tests {
             _block_id: PhysicalBlockNumber,
             _source: &[Frame],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::done(())
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
         }
 
         fn barrier(
             &self,
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-            tx_substrate::step_v3::StepOutcome::done(())
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
         }
     }
 
@@ -333,12 +333,12 @@ mod tests {
 
     #[test]
     fn block_device_handle_translates_partition_relative_lbas() {
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use crate::adapter::step_engine::{guard, StepOutcome as V3};
         tx_substrate::testing::init_host_for_test_once();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 4);
         let mut frames = [Frame::new(Ppn(0))];
 

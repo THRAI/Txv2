@@ -4,7 +4,7 @@
 //! This module gives VFS, Mount, PageBacked, and filesystem backends one public
 //! spelling to compile against until those carriers are connected.
 
-pub use tx_substrate::epoch::Guard;
+pub use crate::adapter::step_engine::Guard;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Errno {
@@ -67,7 +67,7 @@ pub enum Errno {
 /// wildcard: adding a new variant on either side fails to compile here
 /// until the other is extended, which keeps the two catalogs in
 /// lock-step.
-impl From<Errno> for tx_substrate::step_v3::Errno {
+impl From<Errno> for crate::adapter::step_engine::V3Errno {
     fn from(value: Errno) -> Self {
         match value {
             Errno::EACCES => Self::EACCES,
@@ -108,9 +108,9 @@ impl From<Errno> for tx_substrate::step_v3::Errno {
 /// reproducing the variant-by-variant mapping. Exhaustive no-wildcard
 /// match: a future `step_v3::Errno`-only addition fails to compile
 /// until the `execution::Errno` mirror is grown.
-impl From<tx_substrate::step_v3::Errno> for Errno {
-    fn from(value: tx_substrate::step_v3::Errno) -> Self {
-        use tx_substrate::step_v3::Errno as V3;
+impl From<crate::adapter::step_engine::V3Errno> for Errno {
+    fn from(value: crate::adapter::step_engine::V3Errno) -> Self {
+        use crate::adapter::step_engine::V3Errno as V3;
         match value {
             V3::EACCES => Errno::EACCES,
             V3::EAGAIN => Errno::EAGAIN,
@@ -190,7 +190,7 @@ mod tests {
         // explicitly so adding a new variant later (without extending
         // `step_v3::Errno` + the From impl) fails to compile or this
         // test fails immediately.
-        use tx_substrate::step_v3::Errno as V3;
+        use crate::adapter::step_engine::V3Errno as V3;
         let table: [(Errno, V3); 27] = [
             (Errno::EACCES, V3::EACCES),
             (Errno::EAGAIN, V3::EAGAIN),
