@@ -4,6 +4,29 @@
 
 ## Current Shape
 
+- 2026-05-12 D17 Pipe pilot adapter LANDED. First subsystem migrated
+  to `#[platform_adapter]` boundary modules. Restructured
+  `crates/tx-subsystems/src/pipe.rs` → `pipe/{mod.rs, adapter.rs}`;
+  `adapter.rs` declares two adapter modules: `step_engine`
+  (substrate, wraps `step_v3` outcome builders + `zone` allocation
+  as pipe-side verbs `done_bytes` / `eagain` / `epipe` /
+  `yield_until_readable` / `yield_until_writable` / `sign_zone_for`)
+  and `wait_routing` (stacked substrate + reactor attribute, wraps
+  `WaitSource` v3 path and `Channel`/`Mask` legacy D2 path as
+  `new_wait_source` / `fire_legacy_channel` / `notify_v3_source`).
+  Macro extended to namespace the injected manifest const by
+  platform (`__PLATFORM_ADAPTER_SUBSTRATE`,
+  `__PLATFORM_ADAPTER_REACTOR`) so multi-platform adapters can stack
+  the attribute on one module. **Boundary report movement:** substrate
+  outside-adapter 2547 → 2515 (−32 production lines), inside 0 → 10;
+  reactor outside 72 → 71 (−1), inside 0 → 3; adapters declared 0 →
+  3. Remaining 53 substrate refs in `pipe/mod.rs` are exclusively
+  the `#[cfg(test)]` block (phase 7 work). **Verified:** all 34 pipe
+  lib tests + 8 v3_pipe_waitsource integration tests pass; full
+  tx-subsystems lib suite 623 passing single-threaded; `cargo xtask
+  lint arch` ok; `cargo xtask boundary-report --json` shows the
+  expected adapter manifest. Macro tests now 11 unit + 4 expansion.
+
 - 2026-05-12 D16 Platform-adapter boundary tooling LANDED. Adds
   `cargo xtask boundary-report` (xtask/src/boundary_report.rs) which
   scans `crates/**/*.rs` and produces the Architecture Boundary
