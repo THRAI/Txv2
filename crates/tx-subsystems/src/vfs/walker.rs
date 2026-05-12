@@ -311,7 +311,7 @@ fn walk_inner_v3<'g>(
         }
 
         let child_rnode_cap =
-            match materialise_child_rnode_v3(&fs_ops, child_fs_object_id, child_meta, guard) {
+            match materialise_child_rnode_v3(&fs_ops, child_fs_object_id, child_meta, current_mount_payload.as_ref(), guard) {
                 V3::Done(rnode) => rnode,
                 V3::Continue { .. } => continue,
                 V3::Yield { progress, shape } => return V3::Yield { progress, shape },
@@ -414,13 +414,19 @@ fn materialise_child_rnode_v3<'g>(
     fs_ops: &Arc<dyn FsOps>,
     child_fs_object_id: FsObjectId,
     meta: InodeMeta,
+    mount_payload: Option<&Cap<MountPayload>>,
     guard: &Guard<'g>,
 ) -> tx_substrate::step_v3::StepOutcome<Cap<RNode>, tx_substrate::step_v3::NoProgress> {
     use tx_substrate::step_v3::StepOutcome as V3;
 
     match meta.kind() {
         InodeKind::Directory => {
-            match RNode::new_cap(child_fs_object_id, meta, RNodeBacking::Directory) {
+            let result = if let Some(mp) = mount_payload {
+                RNode::new_cap_in_mount(child_fs_object_id, meta, RNodeBacking::Directory, mp)
+            } else {
+                RNode::new_cap(child_fs_object_id, meta, RNodeBacking::Directory)
+            };
+            match result {
                 Ok(rnode) => V3::done(rnode),
                 Err(_) => V3::err(tx_substrate::step_v3::Errno::ENOMEM),
             }

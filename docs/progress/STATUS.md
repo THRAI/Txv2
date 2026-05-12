@@ -78,6 +78,33 @@
   the kernel boots cleanly through `:boot:ok` and exits
   `userspace:exited:0` under the contest QEMU flags.
 
+- 2026-05-13 getdents64 sub-directory fix LANDED. `ls /bin` and
+  `ls /tmp` now enumerate entries correctly on QEMU.
+
+  **Bug:** `sys_getdents64` calls `fs_ops_for_rnode(rnode)` which
+  reads `rnode.containing_mount_weak()`. Only the mount-root rnode
+  had `containing_mount` set (via `with_containing_mount` at
+  mount-publication time); every descendant directory rnode minted
+  by `materialise_child_rnode_v3` was created without it, so
+  `fs_ops_for_rnode` returned `None` and the syscall fell back to
+  `-ENOSYS`. **Fix:** added `RNode::new_cap_in_mount` constructor
+  (`vfs/structure.rs`) and threaded `mount_payload: Option<&Cap<MountPayload>>`
+  through `materialise_child_rnode_v3` (`vfs/walker.rs`); all
+  directory rnodes materialised during path walks now carry the
+  containing-mount weak.
+
+  **Verified:** `cargo test --workspace --lib --tests` 0 failures;
+  `cargo xtask shell-test --target rv64-qemu --script
+  tools/shell-tests/busybox-extended.txt --keep-going` 8/8 groups
+  pass, including `vfs-readdir` (`ls /bin` now asserts `busybox`
+  visible) and `file-mutation` (`ls /tmp` asserts `dir1` visible).
+  Note: `tr` and `sleep` remain absent from the minimal initramfs
+  (27 symlinks baked in — neither applet is included); those are
+  initramfs content gaps, not kernel bugs.
+
+  **Next step:** extend initramfs or add `tr`/`sleep` applets if
+  needed for deeper pipe/timer test coverage.
+
 - 2026-05-13 D15 pipe-EOF + WFI-drain-interlock LANDED. Two-bug
   fix; `tools/shell-tests/busybox-prompt.txt` 28/28 on QEMU.
 
