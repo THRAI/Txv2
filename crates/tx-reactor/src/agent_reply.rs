@@ -33,12 +33,12 @@
 //!
 //! ## Why a separate helper
 //!
-//! The existing `ActiveWait::matches` (per
-//! `tx_substrate::wake::mailbox`) is wait-source-shaped — it filters
+//! The existing `ActiveWait::matches` (per substrate's
+//! `wake::mailbox`) is wait-source-shaped — it filters
 //! `SourceFired` events keyed by `(generation, source, interests)`.
 //! Agent events name a `DelegateTokenId`, not a `WaitSourceId`, so
 //! they need a sibling predicate
-//! ([`tx_substrate::wake::agent_event_matches`]) and a sibling
+//! (substrate's `wake::agent_event_matches`) and a sibling
 //! consumer (this helper). No substrate redesign required (D7 §3.4
 //! "runtime code, not new substrate surface").
 

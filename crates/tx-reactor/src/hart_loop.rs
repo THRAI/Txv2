@@ -6,8 +6,8 @@
 //! ## PR-7B integration point: DelegateTimeout fires
 //!
 //! `tx-substrate`'s `DelegateRegistry` and the `TimerWheel` now live
-//! in the same crate (per D6 the wheel moved down to
-//! `tx_substrate::wake::timer`; the reactor re-exports it through
+//! in the same crate (per D6 the wheel moved down to substrate's
+//! `wake::timer`; the reactor re-exports it through
 //! [`crate::timer::TimerWheel`] for back-compat). The reactor-side
 //! glue that routes a fired `DelegateTimeout` timer to
 //! `registry.mark_timed_out(...)` lives on the wheel itself, in

@@ -9,8 +9,9 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     use tx_substrate::zone;
 
+    pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step_v3::{
-        ByteProgress, DelegateRegistry, DelegateReply, DelegateState, DelegateTokenId,
+        ByteProgress, DelegateRegistry, DelegateReply, DelegateState, DelegateTokenId, Errno,
         Errno as V3Errno, InterestMask, StepOutcome, TransitionOutcome, UfdReply, WaitSourceId,
     };
     pub use tx_substrate::wake::{TaskMailbox, WaitSource};
