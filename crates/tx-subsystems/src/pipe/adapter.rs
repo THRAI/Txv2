@@ -31,8 +31,10 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     use tx_substrate::zone;
 
+    pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step_v3::{
-        ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+        ByteProgress, Errno, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
+        StepProgress, SubjectIdentity, YieldShape,
     };
     pub use tx_substrate::zone::{Cap, Zone, ZoneAllocated, ZoneError};
     pub use tx_substrate::SpinMutex;

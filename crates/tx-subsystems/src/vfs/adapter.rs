@@ -28,9 +28,10 @@ pub mod step_engine {
 
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step_v3::{
-        ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+        ByteProgress, Errno, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
+        StepProgress, SubjectIdentity,
     };
-    pub use tx_substrate::zone::{Cap, Weak, Zone, ZoneAllocated, ZoneError};
+    pub use tx_substrate::zone::{Cap, PayloadCap, Weak, Zone, ZoneAllocated, ZoneError};
 
     /// Reserve + sign in one step: mint a `Cap<T>` from `T`'s zone.
     pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
