@@ -6,8 +6,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use tx_hal::{PmapIf, UserTrapContext};
-use tx_substrate::zone::{self, Cap, OperationalCapExt, ZoneError};
-use tx_substrate::SpinMutex;
+
+use crate::process::adapter::step_engine::{
+    self, Cap, IdentRef, NoProgress, OperationalCapExt, PayloadCap, ScriptCtx, SpinMutex, StepOp,
+    StepOutcome, SubjectIdentity, Weak, ZoneError,
+};
+use crate::process::adapter::wait_routing::{self, Mask};
 
 use crate::cred::Cred;
 use crate::process::structure::{
@@ -332,8 +336,7 @@ pub fn step_fork<P: PmapIf>(
 
     // Fork the address space, then publish into the AddressSpace zone.
     let child_aspace = AddressSpace::fork_aspace::<P>(&parent_aspace)?;
-    let aspace_res = zone::reserve_for::<AddressSpace>()?;
-    let child_aspace_cap = zone::sign_for(aspace_res, child_aspace);
+    let child_aspace_cap = step_engine::sign_zone_for(child_aspace)?;
 
     // Identity first (payload=None) so the leader thread can hold a
     // Weak<ProcessIdentity> back-reference.
@@ -634,7 +637,7 @@ fn post_sigchld_to_parent(process: &Cap<ProcessIdentity>) {
         let _ = crate::signal::step_kill_process(&parent, crate::signal::Signum::SIGCHLD);
         // Fire the parent's exit_source. A zombie parent has no payload
         // and `fire_exit_source` returns 0 — no panic, no double-fire.
-        let _ = parent.fire_exit_source(tx_reactor::wait::Mask::from_bits(
+        let _ = parent.fire_exit_source(Mask::from_bits(
             crate::process::structure::EXIT_SOURCE_CHILD_ZOMBIFIED,
         ));
     }
@@ -847,46 +850,34 @@ pub fn step_setsid(target: &Cap<ProcessIdentity>) -> Result<Sid, SetsidError> {
 // --- internal sign-and-publish helpers ---
 
 fn sign_session(sid: Sid) -> Result<Cap<Session>, ZoneError> {
-    let res = zone::reserve_for::<Session>()?;
-    Ok(zone::sign_for(
-        res,
-        Session {
-            sid,
-            controlling_tty: SpinMutex::new(None),
-            members: SpinMutex::new(Vec::new()),
-        },
-    ))
+    step_engine::sign_zone_for(Session {
+        sid,
+        controlling_tty: SpinMutex::new(None),
+        members: SpinMutex::new(Vec::new()),
+    })
 }
 
 fn sign_process_group(pgid: Pgid, session: Cap<Session>) -> Result<Cap<ProcessGroup>, ZoneError> {
-    let res = zone::reserve_for::<ProcessGroup>()?;
-    Ok(zone::sign_for(
-        res,
-        ProcessGroup {
-            pgid,
-            session,
-            members: SpinMutex::new(Vec::new()),
-        },
-    ))
+    step_engine::sign_zone_for(ProcessGroup {
+        pgid,
+        session,
+        members: SpinMutex::new(Vec::new()),
+    })
 }
 
 fn sign_process_identity(
     pid: Pid,
-    parent: Option<tx_substrate::zone::Weak<ProcessIdentity>>,
+    parent: Option<Weak<ProcessIdentity>>,
     pgrp: Cap<ProcessGroup>,
 ) -> Result<Cap<ProcessIdentity>, ZoneError> {
-    let res = zone::reserve_for::<ProcessIdentity>()?;
-    Ok(zone::sign_for(
-        res,
-        ProcessIdentity {
-            pid,
-            parent: SpinMutex::new(parent),
-            children: SpinMutex::new(Vec::new()),
-            pgrp: SpinMutex::new(pgrp),
-            exit_status: SpinMutex::new(None),
-            payload: SpinMutex::new(None),
-        },
-    ))
+    step_engine::sign_zone_for(ProcessIdentity {
+        pid,
+        parent: SpinMutex::new(parent),
+        children: SpinMutex::new(Vec::new()),
+        pgrp: SpinMutex::new(pgrp),
+        exit_status: SpinMutex::new(None),
+        payload: SpinMutex::new(None),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -900,9 +891,9 @@ fn sign_process_payload(
     brk_base: u64,
     current_brk: u64,
     umask: u16,
-) -> Result<tx_substrate::zone::PayloadCap<ProcessPayload>, ZoneError> {
-    use tx_reactor::wait::Channel;
-    use tx_substrate::AtomicSlot;
+) -> Result<PayloadCap<ProcessPayload>, ZoneError> {
+    use crate::process::adapter::step_engine::AtomicSlot;
+    use crate::process::adapter::wait_routing::Channel;
     let aspace_slot: AtomicSlot<Cap<AddressSpace>> = AtomicSlot::empty();
     aspace_slot.store(Some(aspace));
 
@@ -935,14 +926,9 @@ fn sign_process_payload(
     // same `u64` namespace as the legacy `exit_source` channel so a
     // `WaitSourceId` stamped into `YieldShape::OnWaitSource` lands at
     // both ends (legacy resolver + new `Arc<WaitSource>` slot).
-    let exit_wait_source = alloc::sync::Arc::new(tx_substrate::wake::WaitSource::new(
-        tx_substrate::step_v3::WaitSourceId::new(exit_source_id),
-    ));
+    let exit_wait_source = wait_routing::new_wait_source(exit_source_id);
 
-    let res = zone::reserve_for::<ProcessPayload>()?;
-    let cap = zone::sign_for(
-        res,
-        ProcessPayload {
+    let cap = step_engine::sign_zone_for(ProcessPayload {
             aspace: aspace_slot,
             threads: SpinMutex::new(threads),
             sig_actions: SigActionTable::new(),
@@ -964,31 +950,20 @@ fn sign_process_payload(
             exit_source,
             exit_source_id,
             exit_wait_source,
-        },
-    );
-    Ok(tx_substrate::zone::PayloadCap::from_cap(cap))
+        })?;
+    Ok(PayloadCap::from_cap(cap))
 }
 
-fn sign_thread(
-    owner_proc: tx_substrate::zone::Weak<ProcessIdentity>,
-) -> Result<Cap<ThreadIdentity>, ZoneError> {
+fn sign_thread(owner_proc: Weak<ProcessIdentity>) -> Result<Cap<ThreadIdentity>, ZoneError> {
     let tid = allocate_tid();
-
-    let payload_res = zone::reserve_for::<ThreadPayload>()?;
-    let payload_cap = zone::sign_for(payload_res, ThreadPayload::fresh());
-    let payload = tx_substrate::zone::PayloadCap::from_cap(payload_cap);
-
-    let identity_res = zone::reserve_for::<ThreadIdentity>()?;
-    let cap = zone::sign_for(
-        identity_res,
-        ThreadIdentity {
-            tid,
-            owner_proc,
-            exit_status: SpinMutex::new(None),
-            payload: SpinMutex::new(Some(payload)),
-        },
-    );
-    Ok(cap)
+    let payload_cap = step_engine::sign_zone_for(ThreadPayload::fresh())?;
+    let payload = PayloadCap::from_cap(payload_cap);
+    step_engine::sign_zone_for(ThreadIdentity {
+        tid,
+        owner_proc,
+        exit_status: SpinMutex::new(None),
+        payload: SpinMutex::new(Some(payload)),
+    })
 }
 
 /// Test-only: attach a fresh sibling thread to `target`'s thread
@@ -1026,15 +1001,15 @@ fn drop_member(pgrp: &Cap<ProcessGroup>, target: &Cap<ProcessIdentity>) {
 trait WeakObserveExt<T: 'static> {
     fn observe_with_guard<F, R>(&self, f: F) -> Option<R>
     where
-        F: FnOnce(tx_substrate::zone::IdentRef<'_, T>) -> R;
+        F: FnOnce(IdentRef<'_, T>) -> R;
 }
 
-impl<T: 'static> WeakObserveExt<T> for tx_substrate::zone::Weak<T> {
+impl<T: 'static> WeakObserveExt<T> for Weak<T> {
     fn observe_with_guard<F, R>(&self, f: F) -> Option<R>
     where
-        F: FnOnce(tx_substrate::zone::IdentRef<'_, T>) -> R,
+        F: FnOnce(IdentRef<'_, T>) -> R,
     {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         self.observe(&guard).map(f)
     }
 }
@@ -1066,16 +1041,16 @@ pub struct ForkOp<'a, P: PmapIf> {
     pub _pmap: core::marker::PhantomData<P>,
 }
 
-impl<'a, P: PmapIf, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, P: PmapIf, I: SubjectIdentity> StepOp<I>
     for ForkOp<'a, P>
 {
     type Output = Result<Cap<ProcessIdentity>, ForkError>;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_fork::<P>(self.parent))
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_fork::<P>(self.parent))
     }
 }
 
@@ -1085,17 +1060,17 @@ pub struct ExitGroupOp<'a> {
     pub status: ExitStatus,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for ExitGroupOp<'a>
 {
     type Output = ();
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_exit_group(self.process, self.status);
-        tx_substrate::step_v3::StepOutcome::Done(())
+        StepOutcome::Done(())
     }
 }
 
@@ -1105,17 +1080,17 @@ pub struct ExitGroupWithSignalOp<'a> {
     pub sig: crate::signal::Signum,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for ExitGroupWithSignalOp<'a>
 {
     type Output = ();
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_exit_group_with_signal(self.process, self.sig);
-        tx_substrate::step_v3::StepOutcome::Done(())
+        StepOutcome::Done(())
     }
 }
 
@@ -1127,16 +1102,16 @@ pub struct WaitpidNohangOp<'a> {
     pub target: WaitTarget,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for WaitpidNohangOp<'a>
 {
     type Output = Result<(Pid, ExitStatus), WaitError>;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_waitpid_nohang(self.parent, self.target))
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_waitpid_nohang(self.parent, self.target))
     }
 }
 
@@ -1146,16 +1121,16 @@ pub struct ChdirOp<'a> {
     pub new_cwd: Cap<crate::vfs::DEntry>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for ChdirOp<'a>
 {
     type Output = ChdirOutcome;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_chdir(self.target, self.new_cwd.clone()))
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_chdir(self.target, self.new_cwd.clone()))
     }
 }
 
@@ -1164,16 +1139,16 @@ pub struct GetcwdOp<'a> {
     pub target: &'a Cap<ProcessIdentity>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for GetcwdOp<'a>
 {
     type Output = Option<alloc::vec::Vec<u8>>;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_getcwd(self.target))
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_getcwd(self.target))
     }
 }
 
@@ -1183,16 +1158,16 @@ pub struct SetpgidOp<'a> {
     pub new_pgid: Pgid,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for SetpgidOp<'a>
 {
     type Output = Result<(), SetpgidError>;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_setpgid(self.target, self.new_pgid))
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_setpgid(self.target, self.new_pgid))
     }
 }
 
@@ -1201,16 +1176,16 @@ pub struct SetsidOp<'a> {
     pub target: &'a Cap<ProcessIdentity>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for SetsidOp<'a>
 {
     type Output = Result<Sid, SetsidError>;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_setsid(self.target))
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_setsid(self.target))
     }
 }
 
@@ -1219,17 +1194,17 @@ pub struct CloseCloexecFdsOp<'a> {
     pub process: &'a Cap<ProcessIdentity>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for CloseCloexecFdsOp<'a>
 {
     type Output = ();
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         super::exec_prep::step_close_cloexec_fds(self.process);
-        tx_substrate::step_v3::StepOutcome::Done(())
+        StepOutcome::Done(())
     }
 }
 
@@ -1238,17 +1213,17 @@ pub struct ResetSignalDispositionsForExecOp<'a> {
     pub process: &'a Cap<ProcessIdentity>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for ResetSignalDispositionsForExecOp<'a>
 {
     type Output = ();
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         super::exec_prep::step_reset_signal_dispositions_for_exec(self.process);
-        tx_substrate::step_v3::StepOutcome::Done(())
+        StepOutcome::Done(())
     }
 }
 
@@ -1258,17 +1233,17 @@ pub struct InstallBrkForExecOp<'a> {
     pub new_brk_base: u64,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for InstallBrkForExecOp<'a>
 {
     type Output = ();
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         super::exec_prep::step_install_brk_for_exec(self.process, self.new_brk_base);
-        tx_substrate::step_v3::StepOutcome::Done(())
+        StepOutcome::Done(())
     }
 }
 

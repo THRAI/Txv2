@@ -5,7 +5,7 @@
 //! into execution-side step bodies; they prove that observed state was
 //! re-predicated under an epoch guard. No mutation lives here.
 
-use tx_substrate::zone::Cap;
+use crate::vfs::adapter::step_engine::Cap;
 
 use crate::mount::MountNamespace;
 

@@ -80,7 +80,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use tx_substrate::zone::{Cap, Weak};
+use crate::vfs::adapter::step_engine::{self, Cap, NoProgress, StepOutcome, Weak};
 
 use crate::cred::Capability;
 use crate::execution::{Errno, Guard};
@@ -99,7 +99,7 @@ pub const SYMLOOP_MAX: u32 = 40;
 // === Walker entry points =============================================
 //
 // The walker routes through `FsOps` and emits
-// `tx_substrate::step_v3::StepOutcome`.
+// `StepOutcome`.
 //
 // Per-call-site `Continue` mapping: `FsOps::lookup` /
 // `FsOps::load_inode_meta` / `FsOps::read_link` /
@@ -147,7 +147,7 @@ pub async fn step_walk<'g>(
     path: &[u8],
     cred: &Credential,
     guard: &Guard<'g>,
-) -> tx_substrate::step_v3::StepOutcome<Cap<DEntry>, tx_substrate::step_v3::NoProgress> {
+) -> StepOutcome<Cap<DEntry>, NoProgress> {
     walk_inner_v3(rooted_at, path, cred, guard)
 }
 
@@ -161,8 +161,8 @@ pub async fn step_open<'g>(
     mode: u16,
     cred: &Credential,
     guard: &Guard<'g>,
-) -> tx_substrate::step_v3::StepOutcome<Cap<OpenFile>, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<Cap<OpenFile>, NoProgress> {
+    use StepOutcome as V3;
 
     // `mode` is reserved for future create-on-open semantics; the
     // current surface only resolves existing entries.
@@ -176,7 +176,7 @@ pub async fn step_open<'g>(
             // inner loop. Defence in depth: an unexpected `Continue`
             // at this layer means the walker yielded with no progress
             // and fell through; surface as `EAGAIN`.
-            return V3::err(tx_substrate::step_v3::Errno::EAGAIN);
+            return V3::err(step_engine::Errno::EAGAIN);
         }
         V3::Yield { progress, shape } => return V3::Yield { progress, shape },
         V3::Err(err) => return V3::err(err),
@@ -192,7 +192,7 @@ pub async fn step_open<'g>(
     let rnode = dentry.rnode().clone();
     match OpenFile::new_cap(rnode, flags) {
         Ok(open) => V3::done(open),
-        Err(_) => V3::err(tx_substrate::step_v3::Errno::EIO),
+        Err(_) => V3::err(step_engine::Errno::EIO),
     }
 }
 
@@ -213,8 +213,8 @@ fn walk_inner_v3<'g>(
     path: &[u8],
     cred: &Credential,
     guard: &Guard<'g>,
-) -> tx_substrate::step_v3::StepOutcome<Cap<DEntry>, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<Cap<DEntry>, NoProgress> {
+    use StepOutcome as V3;
 
     let mount_root = mount_root_dentry(&rooted_at, guard);
 
@@ -240,7 +240,7 @@ fn walk_inner_v3<'g>(
         if remaining.is_empty() {
             // End of input: enforce the trailing-`/` directory rule.
             if must_be_directory && current.rnode().meta().kind() != InodeKind::Directory {
-                return V3::err(tx_substrate::step_v3::Errno::ENOTDIR);
+                return V3::err(step_engine::Errno::ENOTDIR);
             }
             return V3::done(current);
         }
@@ -274,7 +274,7 @@ fn walk_inner_v3<'g>(
 
         // Interior components require the current to be a directory.
         if current.rnode().meta().kind() != InodeKind::Directory {
-            return V3::err(tx_substrate::step_v3::Errno::ENOTDIR);
+            return V3::err(step_engine::Errno::ENOTDIR);
         }
 
         // POSIX search permission.
@@ -286,7 +286,7 @@ fn walk_inner_v3<'g>(
         let parent_fs_object_id = current.rnode().fs_object_id();
         let fs_ops = match &current_fs_ops {
             Some(ops) => ops.clone(),
-            None => return V3::err(tx_substrate::step_v3::Errno::ENODEV),
+            None => return V3::err(step_engine::Errno::ENODEV),
         };
         let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
             V3::Done(id) => id,
@@ -307,7 +307,7 @@ fn walk_inner_v3<'g>(
             && child_meta.kind() != InodeKind::Symlink
             && (!remaining.is_empty() || must_be_directory)
         {
-            return V3::err(tx_substrate::step_v3::Errno::ENOTDIR);
+            return V3::err(step_engine::Errno::ENOTDIR);
         }
 
         let child_rnode_cap =
@@ -324,16 +324,16 @@ fn walk_inner_v3<'g>(
         };
         let mut child_dentry_raw = DEntry::new(child_inline, child_rnode_cap.clone());
         child_dentry_raw.set_parent_hint(&current);
-        let child_dentry = match tx_substrate::zone::reserve_for::<DEntry>() {
-            Ok(res) => tx_substrate::zone::sign_for(res, child_dentry_raw),
-            Err(_) => return V3::err(tx_substrate::step_v3::Errno::ENOMEM),
+        let child_dentry = match step_engine::sign_zone_for(child_dentry_raw) {
+            Ok(cap) => cap,
+            Err(_) => return V3::err(step_engine::Errno::ENOMEM),
         };
 
         // === Symlink chasing ============================================
         if let RNodeBacking::Symlink { target } = child_rnode_cap.backing() {
             hop_count += 1;
             if hop_count > SYMLOOP_MAX {
-                return V3::err(tx_substrate::step_v3::Errno::ELOOP);
+                return V3::err(step_engine::Errno::ELOOP);
             }
             let target_bytes = target.clone();
             if target_bytes.first() == Some(&b'/') {
@@ -415,14 +415,14 @@ fn materialise_child_rnode_v3<'g>(
     child_fs_object_id: FsObjectId,
     meta: InodeMeta,
     guard: &Guard<'g>,
-) -> tx_substrate::step_v3::StepOutcome<Cap<RNode>, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<Cap<RNode>, NoProgress> {
+    use StepOutcome as V3;
 
     match meta.kind() {
         InodeKind::Directory => {
             match RNode::new_cap(child_fs_object_id, meta, RNodeBacking::Directory) {
                 Ok(rnode) => V3::done(rnode),
-                Err(_) => V3::err(tx_substrate::step_v3::Errno::ENOMEM),
+                Err(_) => V3::err(step_engine::Errno::ENOMEM),
             }
         }
         InodeKind::Symlink => {
@@ -433,7 +433,7 @@ fn materialise_child_rnode_v3<'g>(
                     // for read_link (NoProgress identity). Defensively
                     // surface as ENOSYS — the caller will see the
                     // symlink is unresolvable.
-                    return V3::err(tx_substrate::step_v3::Errno::ENOSYS);
+                    return V3::err(step_engine::Errno::ENOSYS);
                 }
                 V3::Yield { progress, shape } => return V3::Yield { progress, shape },
                 V3::Err(err) => return V3::err(err),
@@ -446,7 +446,7 @@ fn materialise_child_rnode_v3<'g>(
                 },
             ) {
                 Ok(rnode) => V3::done(rnode),
-                Err(_) => V3::err(tx_substrate::step_v3::Errno::ENOMEM),
+                Err(_) => V3::err(step_engine::Errno::ENOMEM),
             }
         }
         // Regular / CharDevice / BlockDevice / Fifo / Socket — delegate
@@ -532,8 +532,7 @@ fn check_open_perm(meta: &InodeMeta, flags: OpenFileFlags, cred: &Credential) ->
 /// root for an absolute symlink target.
 fn dentry_for_mount_root(mount: &Cap<MountIdentity>) -> Result<Cap<DEntry>, Errno> {
     let raw = DEntry::new(InlineName::ROOT, mount.root().clone());
-    let res = tx_substrate::zone::reserve_for::<DEntry>().map_err(|_| Errno::ENOMEM)?;
-    Ok(tx_substrate::zone::sign_for(res, raw))
+    step_engine::sign_zone_for(raw).map_err(|_| Errno::ENOMEM)
 }
 
 /// Walk `from`'s parent-hint chain to find the namespace's root
