@@ -1,8 +1,73 @@
 # txKernel Status
 
-**Updated:** 2026-05-12
+**Updated:** 2026-05-13
 
 ## Current Shape
+
+- 2026-05-13 `xtask fault-decode` fourth pass (stack dump + panic path) COMPLETE.
+  Kernel side: `boards/tx-hal-riscv64-qemu-virt/src/trap.rs` gained
+  `emit_panic_location(fp, ra)` (emits `scause=3 sepc=<ra> stval=0` in the
+  exact format fault-decode already parses, then walks the fp chain) and
+  `console_write_stack_dump(sp, 32)` (emits a `stack dump: sp=0x...` header
+  + 4-word-per-row indented lines). `lib.rs` re-exports `emit_panic_location`.
+  The `panic_handler` in `tx-kernel-riscv64-qemu-virt` now captures `ra`/`s0`
+  via inline asm and calls `emit_panic_location`, making panics show the same
+  scause/sepc/stval/fp-chain story as hardware traps.
+  Tool side (`xtask/src/fault_decode.rs`): `TrapRecord` gains
+  `stack_dump: Vec<(u64,u64)>` (address+value pairs); `parse_traps` is
+  refactored so the fp-chain lookup runs unconditionally after any trapframe
+  (or after the raw trap line for the panic path — previously fp chain was
+  only found inside a `trapframe:` block); `parse_stack_dump_block` parses
+  the `stack dump: sp=0x...` header and indented data rows;
+  `scan_stack_code_pointers` checks each word against the ELF text ranges
+  via `address_candidates`; `print_trap_block` shows a
+  "stack code pointers (heuristic):" section after the call stack; JSON
+  output gains `stack_code_pointers`. **Verified:** `cargo test -p xtask`
+  — 91 tests pass (up from 87: 4 new: `parses_fp_chain_without_trapframe`,
+  `parses_stack_dump_block`, `parses_stack_dump_after_fp_chain`,
+  `scan_stack_code_pointers_finds_code_words`); `cargo -q xtask unit` — all
+  330 host tests pass. **Next step:** smoke-test with a live QEMU run to
+  verify panic output is actually parsed end-to-end.
+
+- 2026-05-13 `xtask fault-decode` third diagnostic pass COMPLETE.
+  Added expanded RV64C compressed instruction decoder, illegal-instruction
+  stval decode, `--summary` table + scause histogram, and `--color` /
+  `--no-color` ANSI terminal output to `xtask/src/fault_decode.rs`.
+  Specifics: `decode_rv64_insn` now covers all three RV64C quadrants
+  (C.ADDI4SPN, C.LW/LD/SW/SD, C.NOP/ADDI/ADDIW/LI/LUI/ADDI16SP, full
+  arith group, C.J/BEQZ/BNEZ, C.SLLI, C.LWSP/LDSP/SWSP/SDSP,
+  C.JR/MV/EBREAK/JALR/ADD); `decode_illegal_insn_stval` decodes the
+  instruction encoding held in `stval` when `scause=2` (illegal
+  instruction); `--summary` with `--serial [--all]` prints an aligned
+  cause/sepc/stval/flags table followed by a count-descending scause
+  histogram; `--color` / `--no-color` enables ANSI escape coloring of
+  fault cause (red+bold), register names (green), hex values (cyan), with
+  auto-detect via `stdout().is_terminal()`. **Verified:** `cargo -q xtask
+  unit` — all host tests pass; `cargo test -p xtask` — 87 tests pass (up
+  from 78: 5 from RV64C+illegal-insn, 2 from --summary, 2 from --color).
+  No warnings. **Next step:** stack-region code-pointer scan from SP, or
+  DWARF CFI unwinding (requires runtime memory → not feasible without a
+  coredump; stack scan is the realistic alternative).
+
+- 2026-05-13 `xtask fault-decode` second diagnostic pass COMPLETE.
+  Added `--brief`, `--json`, `--user-elf`, ELF build-id, and DWARF
+  type-name features to `xtask/src/fault_decode.rs`. Specifics:
+  `--brief` prints one line per trap (`scause-name  stval-class  @
+  symbol  from X-mode`); `--json` emits structured JSON (single trap
+  or array for `--serial --all`); `--user-elf PATH` loads a user-space
+  ELF for register annotations and address-block user-symbol lookup;
+  ELF build-id (`.note.gnu.build-id`) extracted and displayed in
+  header unless `--json`; DWARF `DW_AT_type` resolution shows type
+  prefix before each formal parameter in call-stack output. All
+  existing feature flags (`--serial`, `--addr`, `--scause/sepc/stval`,
+  `--all`) compose cleanly with the new flags. **Verified:** `cargo -q
+  xtask unit` — 330 host tests pass; `cargo test -p xtask` — 78 tests
+  pass (up from 74; 4 new tests: `extract_build_id_returns_none_on_empty_and_invalid`,
+  `formal_param_type_name_defaults_none`,
+  `brief_format_includes_scause_and_null_deref_stval`,
+  `json_output_is_valid_json`). No warnings. **Next step:** optional
+  remaining features: stack-region code-pointer scan, DWARF CFI
+  unwinding for deeper backtraces.
 
 - 2026-05-12 D12 Phase B (PR-2 scaffolding dead-code allowance)
   LANDED. Closes the D13 follow-up: the 26 PR-2 `StepOp` adapter
@@ -5492,6 +5557,16 @@
   auto-annotation later if desired; no blocker. Post-merge high-VMA smoke
   coverage also fixed high-kernel alias classification and added regression
   coverage so those addresses are not reported as direct-map addresses.
+- `fault-decode` diagnostic improvements (2026-05-13): complete scause/stval/
+  sstatus field decoding, per-register symbol annotation in the trapframe dump,
+  DWARF named-parameter extraction (DW_TAG_formal_parameter + location exprs),
+  unified call-stack output (sepc frame + ra/fp-chain frames in one block),
+  and frame-pointer chain walk. The kernel's `tx_rv64_qemu_trap_panic` now
+  emits a `fp chain:` block (64-frame cap, strict-increasing-fp guard);
+  `fault-decode --serial` parses these entries and expands the call stack
+  beyond frame #1 without requiring stack memory access.
+  Verification: `cargo test -p xtask` (68 tests, including
+  `parses_fp_chain_after_trapframe`).
 - HumanLayer `.claude` workflow references are available as a sparse submodule
   at `external/humanlayer-reference`.
 - `cargo xtask ci` provides concise CI reporting with `txdoc:` references into
