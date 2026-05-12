@@ -21,9 +21,10 @@ pub mod step_engine {
 
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step_v3::{
-        ByteProgress, DelegateReply, DelegateTokenId, Errno, NoProgress, ScriptCtx, StepOp,
-        StepOutcome, SubjectAuthority, SubjectContext, SubjectIdentity, TransitionOutcome,
-        UfdReply, YieldShape,
+        AgentCancelPolicy, ByteProgress, CancelReason, DelegateReply, DelegateRequest,
+        DelegateState, DelegateTokenId, Errno, InterestMask, NoProgress, OnBehalfOfAbort, ScriptCtx,
+        StepOp, StepOutcome, SubjectAuthority, SubjectContext, SubjectIdentity, TokenDropPolicy,
+        TransitionOutcome, UfdAccessKind, UfdReply, UfdRequest, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::step_v3::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::zone::{
@@ -44,4 +45,5 @@ pub mod step_engine {
 )]
 pub mod reactor_entry {
     pub use tx_reactor::userspace;
+    pub use tx_reactor::userspace::SyscallRequest;
 }

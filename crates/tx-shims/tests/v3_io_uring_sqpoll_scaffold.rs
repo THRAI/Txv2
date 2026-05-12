@@ -54,9 +54,8 @@ use tx_hal::{
     Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
 };
-use tx_reactor::userspace::SyscallRequest;
-use tx_substrate::step_v3::OnBehalfOfAbort;
-use tx_substrate::zone::Cap;
+use tx_shims::adapter::reactor_entry::SyscallRequest;
+use tx_shims::adapter::step_engine::{Cap, CancelReason, OnBehalfOfAbort};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
@@ -483,7 +482,7 @@ fn sqpoll_kthread_cancel_worker_trips_cooperative_cancel() {
                 matches!(
                     out,
                     Err(OnBehalfOfAbort::CooperativeCancel(
-                        tx_substrate::step_v3::CancelReason::OwnerRequested
+                        CancelReason::OwnerRequested
                     ))
                 ),
                 "cancel_worker trips CooperativeCancel(OwnerRequested), got {out:?}"

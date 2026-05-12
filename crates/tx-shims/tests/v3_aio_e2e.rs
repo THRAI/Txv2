@@ -70,10 +70,8 @@ use tx_hal::{
     Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
 };
-use tx_reactor::userspace::SyscallRequest;
-use tx_substrate::page_allocator;
-use tx_substrate::step_v3::{CancelReason, OnBehalfOfAbort};
-use tx_substrate::zone::{self, Cap};
+use tx_shims::adapter::reactor_entry::SyscallRequest;
+use tx_shims::adapter::step_engine::{self as zone, page_allocator, CancelReason, Cap, OnBehalfOfAbort};
 use tx_subsystems::aio::{reset_context_id_counter_for_test, AioWorkerFuture, IOCB_CMD_PREAD};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
@@ -290,9 +288,9 @@ fn seed_file_content(file: &Cap<OpenFile>, content: &[u8]) {
         },
     )
     .expect("writer open file cap");
-    let guard = tx_substrate::epoch::guard();
+    let guard = zone::guard();
     match step_write_from_kernel(&pc, &writer, content, &guard) {
-        tx_substrate::step_v3::StepOutcome::Done(n) => assert_eq!(
+        zone::StepOutcome::Done(n) => assert_eq!(
             n,
             content.len(),
             "seed: step_write_from_kernel wrote {n}/{} bytes",
