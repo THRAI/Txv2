@@ -7,6 +7,7 @@ mod check_build;
 mod ci;
 mod doctor;
 mod fault_decode;
+mod full_build;
 mod image;
 mod lint;
 mod oscomp;
@@ -30,6 +31,7 @@ pub fn run() -> Result<()> {
     let root = workspace_root();
     match cmd.as_str() {
         "doctor" => doctor::doctor(&root),
+        "full-build" => full_build::full_build(&root, args.collect()),
         "ci" => ci::ci(&root),
         "ci-slow" => ci::ci_slow(&root),
         "check" => check_build::check(&root),
@@ -62,6 +64,7 @@ fn print_usage() {
         "txKernel xtask\n\n\
          Commands:\n\
            cargo xtask doctor\n\
+           cargo xtask full-build [--target rv64-qemu|la64-qemu|rv64-m1dock-mock|all] [--skip-doctor] [--no-image]\n\
            cargo xtask ci\n\
            cargo xtask ci-slow\n\
            cargo xtask check\n\

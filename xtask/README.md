@@ -8,6 +8,7 @@ it, but orchestration should live here.
 - `main.rs` is only the binary entrypoint.
 - `lib.rs` owns command dispatch and usage text.
 - `doctor.rs` checks local toolchain, target, QEMU, image, and submodule setup.
+- `full_build.rs` owns `full-build`: doctor → kernel build → image build in one step.
 - `check_build.rs` owns `check` and `build`.
 - `ci.rs` owns CI reporting and design-doc `txdoc:` references.
 - `lint.rs` owns architecture and Markdown documentation lints.
