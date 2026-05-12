@@ -10,11 +10,11 @@ use alloc::sync::Weak as ArcWeak;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use tx_hal::UserTrapContext;
-use tx_reactor::userspace::{UserspaceRunRequest, UserspaceRunSlot};
-use tx_reactor::TaskKey;
-use tx_substrate::wake::TaskMailbox;
-use tx_substrate::zone::{Dead, Entity, PayloadCap, Weak, Zone, ZoneAllocated};
-use tx_substrate::SpinMutex;
+
+use crate::thread_runtime::adapter::reactor_entry::{UserspaceRunRequest, UserspaceRunSlot, TaskKey};
+use crate::thread_runtime::adapter::step_engine::{
+    Dead, Entity, PayloadCap, SpinMutex, TaskMailbox, Weak, Zone, ZoneAllocated,
+};
 
 use crate::process::ProcessIdentity;
 use crate::signal::{InterruptSummary, PendingSignalQueue, SignalMask};
@@ -56,8 +56,8 @@ impl ThreadIdentity {
 
     /// Snapshot the owning process via `Weak::upgrade` under a fresh
     /// guard. Returns `None` if the process identity has been dropped.
-    pub fn upgrade_owner_proc(&self) -> Option<tx_substrate::zone::Cap<ProcessIdentity>> {
-        let guard = tx_substrate::epoch::guard();
+    pub fn upgrade_owner_proc(&self) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ProcessIdentity>> {
+        let guard = crate::thread_runtime::adapter::step_engine::guard();
         self.owner_proc.upgrade(&guard)
     }
 
@@ -95,7 +95,7 @@ impl Entity for ThreadIdentity {
     type OperationalEvidence = PayloadCap<ThreadPayload>;
 
     fn upgrade_operational(
-        identity: &tx_substrate::zone::Cap<Self>,
+        identity: &crate::thread_runtime::adapter::step_engine::Cap<Self>,
     ) -> Result<Self::OperationalEvidence, Dead> {
         identity.payload.lock().as_ref().cloned().ok_or(Dead)
     }
