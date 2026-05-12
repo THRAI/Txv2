@@ -97,13 +97,52 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
-use tx_substrate::step_v3::{
-    with_on_behalf_of, AbortSignal, InterestMask, OnBehalfOfAbort, ScriptCtx, SubjectContext,
-    SubjectIdentity, WaitSourceId,
+mod adapter {
+    use tx_platform_adapter::platform_adapter;
+
+    #[platform_adapter(
+        platform = "substrate",
+        domain = "step_engine",
+        apis = ["step_v3", "zone", "wake"],
+        reason = "expose substrate step engine on-behalf-of framework (with_on_behalf_of, AbortSignal, OnBehalfOfAbort, SubjectIdentity, SubjectContext, ScriptCtx, CancelReason, InterestMask, WaitSourceId), WaitSource, zone allocation, and SpinMutex for AIO context and worker future"
+    )]
+    pub mod step_engine {
+        use tx_substrate::zone;
+
+        pub use tx_substrate::step_v3::{
+            with_on_behalf_of, AbortSignal, CancelReason, InterestMask, OnBehalfOfAbort, ScriptCtx,
+            SubjectContext, SubjectIdentity, WaitSourceId,
+        };
+        pub use tx_substrate::wake::WaitSource;
+        pub use tx_substrate::zone::{Cap, Zone, ZoneAllocated, ZoneError};
+        pub use tx_substrate::SpinMutex;
+
+        pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
+            let reservation = zone::reserve_for::<T>()?;
+            Ok(zone::sign_for(reservation, value))
+        }
+
+        pub fn register_zone_for<T: ZoneAllocated>() -> Result<(), ZoneError> {
+            zone::register_zone_for::<T>().map(|_| ())
+        }
+    }
+
+    #[platform_adapter(
+        platform = "reactor",
+        domain = "wait_routing",
+        reason = "wrap reactor Channel/Mask as AIO iocb-arrived and events-available legacy wake channels"
+    )]
+    pub mod wait_routing {
+        pub use tx_reactor::wait::Channel;
+    }
+}
+
+use adapter::step_engine::{
+    sign_zone_for, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask,
+    OnBehalfOfAbort, ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource,
+    WaitSourceId, Zone, ZoneAllocated, ZoneError,
 };
-use tx_substrate::wake::WaitSource;
-use tx_substrate::zone::{self, Cap, Zone, ZoneAllocated, ZoneError};
-use tx_substrate::SpinMutex;
+use adapter::wait_routing::Channel;
 
 use crate::wait_source;
 
@@ -378,10 +417,10 @@ impl AioContext {
     /// `nr_events` capacity. Mirrors `UserfaultFd::with_flags` from
     /// W-Q's phase 0 template.
     pub fn with_nr_events(nr_events: u32) -> Self {
-        let iocb_arrived_channel = tx_reactor::wait::Channel::new();
+        let iocb_arrived_channel = Channel::new();
         let iocb_arrived_id = wait_source::register_wait_channel(iocb_arrived_channel);
         let iocb_arrived = Arc::new(WaitSource::new(WaitSourceId::new(iocb_arrived_id)));
-        let events_available_channel = tx_reactor::wait::Channel::new();
+        let events_available_channel = Channel::new();
         let events_available_id = wait_source::register_wait_channel(events_available_channel);
         let events_available = Arc::new(WaitSource::new(WaitSourceId::new(events_available_id)));
         Self {
@@ -413,8 +452,7 @@ impl AioContext {
     /// Companion to [`Self::with_nr_events`] for the
     /// `sys_io_setup(2)` arm.
     pub fn new_with_nr_events_cap(nr_events: u32) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(reservation, Self::with_nr_events(nr_events)))
+        sign_zone_for(Self::with_nr_events(nr_events))
     }
 
     /// Snapshot the stable per-context id. Used as the iocb-routing
@@ -515,7 +553,7 @@ impl AioContext {
     /// teardown.
     pub fn cancel_worker(&self) {
         self.worker_abort.trip(OnBehalfOfAbort::CooperativeCancel(
-            tx_substrate::step_v3::CancelReason::OwnerRequested,
+            CancelReason::OwnerRequested,
         ));
     }
 
@@ -593,7 +631,7 @@ impl Drop for AioContext {
         // Phase 5 wires `sys_io_destroy(2)` and the principal-exit
         // path through the same signal.
         self.worker_abort.trip(OnBehalfOfAbort::CooperativeCancel(
-            tx_substrate::step_v3::CancelReason::OwnerRequested,
+            CancelReason::OwnerRequested,
         ));
         wait_source::release_wait_channel(self.iocb_arrived_id);
         wait_source::release_wait_channel(self.events_available_id);
@@ -611,7 +649,7 @@ unsafe impl ZoneAllocated for AioContext {
 }
 
 pub(crate) fn register_zones() -> Result<(), ZoneError> {
-    zone::register_zone_for::<AioContext>()?;
+    adapter::step_engine::register_zone_for::<AioContext>()?;
     Ok(())
 }
 
@@ -988,7 +1026,7 @@ mod tests {
             matches!(
                 reason,
                 OnBehalfOfAbort::CooperativeCancel(
-                    tx_substrate::step_v3::CancelReason::OwnerRequested
+                    CancelReason::OwnerRequested
                 )
             ),
             "cancel_worker trips OwnerRequested, got {reason:?}"
