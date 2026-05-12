@@ -40,11 +40,11 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use tx_substrate::epoch;
-use tx_substrate::step_v3::{InterestMask, StepOutcome, WaitSourceId};
 use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::wake::{MailboxEvent, TaskMailbox};
-
-use tx_substrate::zone::Cap;
+use tx_subsystems::pipe::adapter::step_engine::{Cap, InterestMask, StepOutcome, WaitSourceId};
+use tx_subsystems::pipe::adapter::wait_routing::{
+    MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+};
 use tx_subsystems::pipe::{
     step_pipe2, step_read, step_write, PipeFlags, PipePayload, PIPE_BUF, PIPE_READABLE,
     PIPE_WRITABLE,
@@ -90,12 +90,12 @@ fn payload_of(openfile: &Cap<OpenFile>) -> Cap<PipePayload> {
 /// can either hold it across the wait or drop it explicitly to
 /// model an unwound wait window.
 fn register<'a>(
-    source: &'a Arc<tx_substrate::wake::WaitSource>,
+    source: &'a Arc<WaitSource>,
     mailbox: &Arc<TaskMailbox>,
     interests: u64,
 ) -> (
-    tx_substrate::wake::WaitRegistrationGuard<'a>,
-    tx_substrate::wake::WaitGeneration,
+    WaitRegistrationGuard<'a>,
+    WaitGeneration,
 ) {
     let gen = mailbox.next_generation();
     let prep = source.prepare(Arc::downgrade(mailbox), gen, InterestMask::new(interests));
@@ -113,7 +113,7 @@ fn register<'a>(
 fn assert_source_fired(
     mailbox: &TaskMailbox,
     source: WaitSourceId,
-    generation: tx_substrate::wake::WaitGeneration,
+    generation: WaitGeneration,
     expected_overlap: u64,
 ) {
     let evt = mailbox

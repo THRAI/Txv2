@@ -33,8 +33,8 @@ pub mod step_engine {
 
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step_v3::{
-        ByteProgress, Errno, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
-        StepProgress, SubjectIdentity, YieldShape,
+        ByteProgress, Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp,
+        StepOutcome, StepProgress, SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{Cap, Zone, ZoneAllocated, ZoneError};
     pub use tx_substrate::SpinMutex;
@@ -108,7 +108,7 @@ pub mod wait_routing {
     use tx_substrate::step_v3::{InterestMask, WaitSourceId};
 
     pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::WaitSource;
+    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};
 
     /// Build a `WaitSource` for one side of a pipe, keyed by the
     /// wait-source id minted from

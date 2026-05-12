@@ -57,9 +57,11 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use tx_substrate::epoch;
-use tx_substrate::step_v3::{InterestMask, StepOutcome, WaitSourceId, YieldShape};
 use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::wake::{MailboxEvent, TaskMailbox};
+use tx_subsystems::futex::adapter::step_engine::{InterestMask, StepOutcome, WaitSourceId, YieldShape};
+use tx_subsystems::futex::adapter::wait_routing::{
+    MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+};
 
 use tx_subsystems::futex::{
     bucket_index, bucket_wait_source, bucket_wait_source_for_source_id, step_futex_wait,
@@ -81,12 +83,12 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
 /// the mailbox's freshly-claimed generation. Returns the registration
 /// guard (auto-deregisters on drop) and the captured generation.
 fn register<'a>(
-    source: &'a Arc<tx_substrate::wake::WaitSource>,
+    source: &'a Arc<WaitSource>,
     mailbox: &Arc<TaskMailbox>,
     interests: u64,
 ) -> (
-    tx_substrate::wake::WaitRegistrationGuard<'a>,
-    tx_substrate::wake::WaitGeneration,
+    WaitRegistrationGuard<'a>,
+    WaitGeneration,
 ) {
     let gen = mailbox.next_generation();
     let prep = source.prepare(Arc::downgrade(mailbox), gen, InterestMask::new(interests));
@@ -104,7 +106,7 @@ fn register<'a>(
 fn assert_source_fired(
     mailbox: &TaskMailbox,
     source: WaitSourceId,
-    generation: tx_substrate::wake::WaitGeneration,
+    generation: WaitGeneration,
     expected_overlap: u64,
 ) {
     let evt = mailbox

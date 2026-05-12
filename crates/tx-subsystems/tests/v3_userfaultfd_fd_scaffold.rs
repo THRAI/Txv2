@@ -38,7 +38,7 @@ use tx_hal::{
 };
 use tx_substrate::epoch;
 use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::zone::Cap;
+use tx_subsystems::userfaultfd::adapter::step_engine::Cap;
 
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
 use tx_subsystems::userfaultfd::UserfaultFd;

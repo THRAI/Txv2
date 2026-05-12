@@ -38,7 +38,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-mod adapter {
+pub mod adapter {
     use tx_platform_adapter::platform_adapter;
 
     #[platform_adapter(
@@ -51,8 +51,8 @@ mod adapter {
         use tx_substrate::zone;
 
         pub use tx_substrate::step_v3::{
-            ByteProgress, DelegateRegistry, DelegateTokenId, Errno as V3Errno, InterestMask,
-            StepOutcome, WaitSourceId,
+            ByteProgress, DelegateRegistry, DelegateReply, DelegateState, DelegateTokenId,
+            Errno as V3Errno, InterestMask, StepOutcome, TransitionOutcome, UfdReply, WaitSourceId,
         };
         pub use tx_substrate::wake::{TaskMailbox, WaitSource};
         pub use tx_substrate::zone::{Cap, Zone, ZoneAllocated, ZoneError};

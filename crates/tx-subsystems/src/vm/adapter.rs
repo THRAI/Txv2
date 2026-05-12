@@ -38,12 +38,12 @@ pub mod step_engine {
     pub use tx_substrate::shootdown::{AddressSpaceShootdownBatch, ShootdownError};
     pub use tx_substrate::step_v3::{
         AbortReason, AgentCancelPolicy, ByteProgress, DelegateRegistry, DelegateReply,
-        DelegateRequest, Errno, InterestMask, NoProgress, PageProgress,
-        ProcessIdentity as PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
-        SubjectIdentity, TokenDropPolicy, UfdAccessKind, UfdReply, UfdRequest, WaitSourceId,
-        YieldShape,
+        DelegateRequest, DelegateState, DelegateTokenId, Errno, InterestMask, NoProgress,
+        PageProgress, ProcessIdentity as PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
+        SubjectIdentity, TokenDropPolicy, TransitionOutcome, UfdAccessKind, UfdReply, UfdRequest,
+        WaitSourceId, YieldShape,
     };
-    pub use tx_substrate::wake::TaskMailbox;
+    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox};
     pub use tx_substrate::zone::{
         reserve_for, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
     };

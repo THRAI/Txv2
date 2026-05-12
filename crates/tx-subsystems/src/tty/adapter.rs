@@ -62,7 +62,7 @@ pub mod wait_routing {
     use tx_substrate::step_v3::{InterestMask, WaitSourceId};
 
     pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::WaitSource;
+    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};
 
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
         Arc::new(WaitSource::new(WaitSourceId::new(source_id)))

@@ -61,7 +61,7 @@ pub mod wait_routing {
     use tx_substrate::step_v3::{InterestMask, WaitSourceId};
 
     pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::WaitSource;
+    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};
 
     /// Mint a `WaitSource` for one futex bucket, keyed by the
     /// bucket's `source_id` so the legacy `Channel` resolver and the

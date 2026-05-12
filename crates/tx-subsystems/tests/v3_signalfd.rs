@@ -45,9 +45,8 @@ use tx_hal::{
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
 use tx_substrate::epoch;
-use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome, YieldShape};
 use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::zone::Cap;
+use tx_subsystems::signalfd::adapter::step_engine::{Cap, StepOutcome, V3Errno, YieldShape};
 
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
 use tx_subsystems::signal::{step_kill_process, KillOutcome, Signum};

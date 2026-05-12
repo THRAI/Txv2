@@ -28,8 +28,8 @@ pub mod step_engine {
 
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step_v3::{
-        ByteProgress, Errno, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
-        StepProgress, SubjectIdentity,
+        ByteProgress, Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp,
+        StepOutcome, StepProgress, SubjectIdentity, WaitSourceId,
     };
     pub use tx_substrate::zone::{
         reserve_for, sign_for, Cap, PayloadCap, Weak, Zone, ZoneAllocated, ZoneError,
@@ -59,7 +59,7 @@ pub mod wait_routing {
     use tx_substrate::step_v3::{InterestMask, WaitSourceId};
 
     pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::WaitSource;
+    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};
 
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
         Arc::new(WaitSource::new(WaitSourceId::new(source_id)))
