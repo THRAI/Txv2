@@ -23,6 +23,13 @@
 //!
 //! ```text
 //! # comment
+//! group NAME               ; start a named group. Directives until
+//!                          ; the next `group` (or EOF) belong to it.
+//!                          ; Directives before the FIRST `group`
+//!                          ; form an implicit `setup` block that
+//!                          ; always runs, regardless of `--group`.
+//!                          ; NAME is the rest of the line (trimmed);
+//!                          ; wrap in `"..."` if it contains spaces.
 //! wait SUBSTR within MS    ; block until SUBSTR appears in output;
 //!                          ; fail if not seen within MS milliseconds.
 //! sleep MS                 ; unconditional delay (heisenbug-catch).
@@ -36,6 +43,15 @@
 //!
 //! Substring matching is plain literal — no regex. For multi-line
 //! patterns use a substring of one line.
+//!
+//! ## Group selection
+//!
+//! Without `--group`, every group in the script runs in source
+//! order. Pass `--group A` (or `--group A,B`) to run only those
+//! groups; the setup block always runs first. `--list-groups`
+//! parses the script and prints group names without spawning QEMU.
+//! `--keep-going` runs every selected group even if an earlier one
+//! fails, and reports a per-group summary at the end.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -58,20 +74,72 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         .ok_or_else(|| "missing required --script PATH".to_string())?;
     let script_path = resolve_path(root, PathBuf::from(script_path));
 
+    let group_filter: Option<Vec<String>> = optional_option_value(&args, "--group").map(|s| {
+        s.split(',')
+            .map(|part| part.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    });
+    let list_groups = args.iter().any(|a| a == "--list-groups");
+    let keep_going = args.iter().any(|a| a == "--keep-going");
+
     let script_text = fs::read_to_string(&script_path)
         .map_err(|err| format!("failed to read {}: {err}", script_path.display()))?;
-    let directives = parse_script(&script_text)?;
+    let script = parse_script(&script_text)?;
 
-    if directives.is_empty() {
+    if script.setup.is_empty() && script.groups.is_empty() {
         return Err("script is empty (no directives)".into());
     }
+
+    if list_groups {
+        if script.groups.is_empty() {
+            println!("shell-test: (no groups in script — setup-only)");
+        } else {
+            println!("shell-test: groups in {}:", script_path.display());
+            for g in &script.groups {
+                println!("  - {} ({} directives)", g.name, g.directives.len());
+            }
+        }
+        return Ok(());
+    }
+
+    // Validate that every name passed to --group exists in the script.
+    if let Some(filter) = &group_filter {
+        let known: Vec<&str> = script.groups.iter().map(|g| g.name.as_str()).collect();
+        for name in filter {
+            if !known.iter().any(|k| *k == name.as_str()) {
+                return Err(format!(
+                    "--group {name:?} not present in script (have: {})",
+                    if known.is_empty() {
+                        "no groups defined".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ));
+            }
+        }
+    }
+
+    let groups_to_run: Vec<&NamedGroup> = match &group_filter {
+        Some(filter) => script
+            .groups
+            .iter()
+            .filter(|g| filter.iter().any(|n| n == &g.name))
+            .collect(),
+        None => script.groups.iter().collect(),
+    };
 
     println!(
         "shell-test: target={} script={}",
         target.name(),
         script_path.display()
     );
-    println!("shell-test: {} directives", directives.len());
+    let setup_count = script.setup.len();
+    println!(
+        "shell-test: setup={setup_count} directives, groups={}/{} selected",
+        groups_to_run.len(),
+        script.groups.len()
+    );
 
     let qemu_cmd = build_qemu_command(root, target)?;
     println!("shell-test: spawning {}", qemu_cmd.join(" "));
@@ -92,8 +160,41 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     spawn_reader(&mut child, "stdout", Arc::clone(&buffer));
     spawn_reader(&mut child, "stderr", Arc::clone(&buffer));
 
-    let mut script_anchor = 0usize;
-    let result = run_script(&mut child, &buffer, &directives, &mut script_anchor);
+    let mut anchor = 0usize;
+    let mut group_results: Vec<(String, std::result::Result<(), String>)> = Vec::new();
+    let mut quit_seen = false;
+
+    let outer = (|| -> Result<()> {
+        // Setup always runs. A failure here is fatal regardless of
+        // --keep-going (subsequent groups have no usable session).
+        if let Some(err) = run_block(&mut child, &buffer, "setup", &script.setup, &mut anchor)? {
+            return Err(format!("setup: {err}"));
+        }
+        if directives_quit(&script.setup) {
+            quit_seen = true;
+            return Ok(());
+        }
+        for group in &groups_to_run {
+            if quit_seen {
+                break;
+            }
+            let outcome =
+                run_block(&mut child, &buffer, &group.name, &group.directives, &mut anchor)?;
+            match outcome {
+                None => group_results.push((group.name.clone(), Ok(()))),
+                Some(err) => {
+                    group_results.push((group.name.clone(), Err(err.clone())));
+                    if !keep_going {
+                        return Err(format!("group {:?}: {}", group.name, err));
+                    }
+                }
+            }
+            if directives_quit(&group.directives) {
+                quit_seen = true;
+            }
+        }
+        Ok(())
+    })();
 
     // Best-effort cleanup. If the script ran `quit`, the child is
     // already gone or being reaped. Otherwise kill the child so
@@ -101,31 +202,78 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let _ = child.kill();
     let _ = child.wait();
 
-    if let Err(err) = result {
+    let captured_bytes = buffer.lock().unwrap().len();
+    let dump_captured = || {
         println!();
-        println!(
-            "--- captured output ({} bytes) ---",
-            buffer.lock().unwrap().len()
-        );
+        println!("--- captured output ({captured_bytes} bytes) ---");
         println!("{}", buffer.lock().unwrap());
-        return Err(err);
-    }
+    };
 
-    println!("shell-test: ok");
-    Ok(())
+    match outer {
+        Ok(()) => {
+            let failed: Vec<&(String, std::result::Result<(), String>)> =
+                group_results.iter().filter(|(_, r)| r.is_err()).collect();
+            if !group_results.is_empty() {
+                let passed = group_results.len() - failed.len();
+                println!(
+                    "shell-test: groups: {} passed, {} failed",
+                    passed,
+                    failed.len()
+                );
+                for (name, result) in &group_results {
+                    match result {
+                        Ok(()) => println!("  ok    {name}"),
+                        Err(err) => println!("  FAIL  {name}: {err}"),
+                    }
+                }
+            }
+            if failed.is_empty() {
+                println!("shell-test: ok");
+                Ok(())
+            } else {
+                dump_captured();
+                Err(format!("{} group(s) failed", failed.len()))
+            }
+        }
+        Err(err) => {
+            dump_captured();
+            Err(err)
+        }
+    }
 }
 
-fn run_script(
+fn directives_quit(d: &[Directive]) -> bool {
+    matches!(d.last(), Some(Directive::Quit))
+}
+
+/// Run one block (the setup block or one named group). Returns
+/// `Ok(None)` if every directive succeeded, `Ok(Some(err))` for a
+/// directive-level failure (caller decides whether to keep going),
+/// and `Err(_)` for harness-level failures (broken stdin pipe, etc.)
+/// that prevent the session from continuing at all.
+fn run_block(
     child: &mut Child,
     buffer: &Arc<Mutex<String>>,
+    block_label: &str,
     directives: &[Directive],
     script_anchor: &mut usize,
-) -> Result<()> {
+) -> Result<Option<String>> {
+    if directives.is_empty() {
+        return Ok(None);
+    }
+    println!("[{block_label}]");
     for (idx, directive) in directives.iter().enumerate() {
-        println!("[{idx}] {}", directive.summary());
+        println!("  [{idx}] {}", directive.summary());
         match directive {
+            Directive::Group(_) => {
+                // Group markers are consumed by `parse_script` and never
+                // appear inside a block.
+                unreachable!("Directive::Group should not survive parse_script");
+            }
             Directive::Wait { needle, timeout } => {
-                wait_for(buffer, 0, needle, *timeout)?;
+                if let Err(err) = wait_for(buffer, 0, needle, *timeout) {
+                    return Ok(Some(err));
+                }
             }
             Directive::Sleep(ms) => {
                 thread::sleep(Duration::from_millis(*ms));
@@ -147,7 +295,9 @@ fn run_script(
                     .map_err(|err| format!("flush qemu stdin: {err}"))?;
             }
             Directive::Expect { needle, timeout } => {
-                wait_for(buffer, *script_anchor, needle, *timeout)?;
+                if let Err(err) = wait_for(buffer, *script_anchor, needle, *timeout) {
+                    return Ok(Some(err));
+                }
             }
             Directive::Quit => {
                 // Drop the kernel pipe and kill QEMU. We don't wait
@@ -163,11 +313,11 @@ fn run_script(
                 }
                 let _ = child.kill();
                 let _ = child.wait();
-                return Ok(());
+                return Ok(None);
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn wait_for(
@@ -234,6 +384,7 @@ fn spawn_reader(child: &mut Child, kind: &'static str, buffer: Arc<Mutex<String>
 
 #[derive(Debug)]
 enum Directive {
+    Group(String),
     Wait { needle: String, timeout: Duration },
     Sleep(u64),
     Send(String),
@@ -244,6 +395,7 @@ enum Directive {
 impl Directive {
     fn summary(&self) -> String {
         match self {
+            Self::Group(name) => format!("group {name:?}"),
             Self::Wait { needle, timeout } => {
                 format!("wait {:?} within {} ms", needle, timeout.as_millis())
             }
@@ -257,8 +409,25 @@ impl Directive {
     }
 }
 
-fn parse_script(text: &str) -> Result<Vec<Directive>> {
-    let mut out = Vec::new();
+#[derive(Debug)]
+struct NamedGroup {
+    name: String,
+    directives: Vec<Directive>,
+}
+
+#[derive(Debug, Default)]
+struct Script {
+    /// Directives that appear before the first `group` line. Always
+    /// executed, regardless of `--group` filtering.
+    setup: Vec<Directive>,
+    groups: Vec<NamedGroup>,
+}
+
+fn parse_script(text: &str) -> Result<Script> {
+    let mut script = Script::default();
+    let mut current: Option<NamedGroup> = None;
+    let mut seen_names: Vec<String> = Vec::new();
+
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -266,14 +435,45 @@ fn parse_script(text: &str) -> Result<Vec<Directive>> {
         }
         let parsed =
             parse_line(line).map_err(|err| format!("script line {}: {err}", lineno + 1))?;
-        out.push(parsed);
+        match parsed {
+            Directive::Group(name) => {
+                if name.is_empty() {
+                    return Err(format!("script line {}: empty group name", lineno + 1));
+                }
+                if seen_names.iter().any(|n| n == &name) {
+                    return Err(format!(
+                        "script line {}: duplicate group name {name:?}",
+                        lineno + 1
+                    ));
+                }
+                seen_names.push(name.clone());
+                if let Some(prev) = current.take() {
+                    script.groups.push(prev);
+                }
+                current = Some(NamedGroup {
+                    name,
+                    directives: Vec::new(),
+                });
+            }
+            other => match current.as_mut() {
+                Some(group) => group.directives.push(other),
+                None => script.setup.push(other),
+            },
+        }
     }
-    Ok(out)
+    if let Some(last) = current.take() {
+        script.groups.push(last);
+    }
+    Ok(script)
 }
 
 fn parse_line(line: &str) -> std::result::Result<Directive, String> {
     if line == "quit" {
         return Ok(Directive::Quit);
+    }
+    if let Some(rest) = line.strip_prefix("group ") {
+        let name = parse_group_name(rest)?;
+        return Ok(Directive::Group(name));
     }
     if let Some(rest) = line.strip_prefix("sleep ") {
         let ms: u64 = rest
@@ -295,6 +495,19 @@ fn parse_line(line: &str) -> std::result::Result<Directive, String> {
         return Ok(Directive::Expect { needle, timeout });
     }
     Err(format!("unknown directive '{line}'"))
+}
+
+/// Parse the value half of a `group ...` directive. Accept either a
+/// quoted string (`group "file ops"`) for names that need spaces or
+/// special characters, or a bare identifier-like name (everything
+/// after `group ` trimmed) for the common case.
+fn parse_group_name(rest: &str) -> std::result::Result<String, String> {
+    let rest = rest.trim();
+    if rest.starts_with('"') {
+        parse_quoted(rest)
+    } else {
+        Ok(rest.to_string())
+    }
 }
 
 fn parse_pattern_with_timeout(rest: &str) -> std::result::Result<(String, Duration), String> {
