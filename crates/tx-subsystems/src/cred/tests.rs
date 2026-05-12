@@ -17,8 +17,8 @@ use crate::vfs::structure::{S_ISGID, S_ISUID};
 use crate::vfs::Credential;
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
+use crate::cred::adapter::step_engine::Cap;
 use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::zone::Cap;
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

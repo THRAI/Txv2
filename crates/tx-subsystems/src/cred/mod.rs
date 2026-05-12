@@ -145,7 +145,7 @@ impl CapabilitySet {
 /// `&Cred`, and the snapshot is independent of the slot once cloned
 /// (`Cred: Copy`).
 ///
-/// Implements [`tx_substrate::step_v3::CredentialView`] per
+/// Implements [`adapter::step_engine::CredentialView`] per
 /// [D1](../../../../docs/progress/decisions/2026-05-11-d1-scriptctx-trait-bound-identity.md):
 /// `step_v3` declares the trait shape; the concrete `Cred` lives
 /// here in the subsystem layer. The trait body is intentionally
@@ -221,7 +221,7 @@ pub fn sign_cred(cred: Cred) -> Result<Cap<Cred>, ZoneError> {
 /// seccomp / landlock surfaces; until then `SubjectAuthority` just
 /// needs *some* cap to satisfy the type signature. The
 /// `RestrictionStackHandle` placeholder is a unit-typed
-/// `ZoneAllocated` struct in `tx_substrate::step_v3`, so each call
+/// `ZoneAllocated` struct in `adapter::step_engine`, so each call
 /// reserves a fresh slot in the placeholder zone and signs the
 /// unit-typed value into it. The resulting cap is short-lived (the
 /// syscall arm drops it at script-frame exit; EBR retires the slab).
@@ -1027,7 +1027,9 @@ mod step_op_wraps {
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vm::{AddressSpace, TestPmap};
     use crate::zones;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome};
+    use crate::cred::adapter::step_engine::{
+        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
+    };
     use tx_substrate::testing::init_host_for_test_once;
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
@@ -1054,7 +1056,7 @@ mod step_op_wraps {
             target: proc_cap.clone(),
             new_uid: Uid(1000),
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(CredChange::Replaced { new, .. }) => {
@@ -1074,7 +1076,7 @@ mod step_op_wraps {
             target: proc_cap.clone(),
             new_gid: Gid(2000),
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(CredChange::Replaced { new, .. }) => {
@@ -1095,7 +1097,7 @@ mod step_op_wraps {
             ruid: Some(Uid(1000)),
             euid: Some(Uid(1001)),
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(CredChange::Replaced { new, .. }) => {
@@ -1119,7 +1121,7 @@ mod step_op_wraps {
             euid: Some(Uid(1001)),
             suid: Some(Uid(1002)),
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(CredChange::Replaced { new, .. }) => {
@@ -1141,7 +1143,7 @@ mod step_op_wraps {
             egid: Some(Gid(2001)),
             sgid: Some(Gid(2002)),
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(CredChange::Replaced { new, .. }) => {
@@ -1162,7 +1164,7 @@ mod step_op_wraps {
             rgid: Some(Gid(2000)),
             egid: Some(Gid(2001)),
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(CredChange::Replaced { new, .. }) => {
@@ -1188,7 +1190,7 @@ mod step_op_wraps {
             file_gid: Gid(2000),
             file_mode: 0o755,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(Some(o)) => {

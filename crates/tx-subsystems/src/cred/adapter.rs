@@ -21,6 +21,7 @@ pub mod step_engine {
     use tx_substrate::zone;
 
     pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::step_v3::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step_v3::{
         CredentialView, NoProgress, RestrictionStackHandle, ScriptCtx, StepOp, StepOutcome,
         SubjectIdentity,
