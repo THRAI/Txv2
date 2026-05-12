@@ -64,13 +64,51 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_reactor::wait::{Channel, Mask};
-use tx_substrate::step_v3::{
-    ByteProgress, Errno as V3Errno, InterestMask, StepOutcome, WaitSourceId,
+mod adapter {
+    use tx_platform_adapter::platform_adapter;
+
+    #[platform_adapter(
+        platform = "substrate",
+        domain = "step_engine",
+        apis = ["step_v3", "zone", "epoch", "wake"],
+        reason = "expose substrate step engine outcome/error types, zone allocation, EBR guard, and WaitSource for signalfd pending-queue and read step"
+    )]
+    pub mod step_engine {
+        use tx_substrate::zone;
+
+        pub use tx_substrate::epoch::guard;
+        pub use tx_substrate::step_v3::{
+            ByteProgress, Errno as V3Errno, InterestMask, StepOutcome, WaitSourceId,
+        };
+        pub use tx_substrate::wake::WaitSource;
+        pub use tx_substrate::zone::{Cap, Weak, Zone, ZoneAllocated, ZoneError};
+        pub use tx_substrate::SpinMutex;
+
+        pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
+            let reservation = zone::reserve_for::<T>()?;
+            Ok(zone::sign_for(reservation, value))
+        }
+
+        pub fn register_zone_for<T: ZoneAllocated>() -> Result<(), ZoneError> {
+            zone::register_zone_for::<T>().map(|_| ())
+        }
+    }
+
+    #[platform_adapter(
+        platform = "reactor",
+        domain = "wait_routing",
+        reason = "wrap reactor Channel/Mask as signalfd legacy wake verbs (D2/D4 coexistence)"
+    )]
+    pub mod wait_routing {
+        pub use tx_reactor::wait::{Channel, Mask};
+    }
+}
+
+use adapter::step_engine::{
+    guard, sign_zone_for, ByteProgress, Cap, InterestMask, SpinMutex, StepOutcome, V3Errno,
+    WaitSource, WaitSourceId, Weak, Zone, ZoneAllocated, ZoneError,
 };
-use tx_substrate::wake::WaitSource;
-use tx_substrate::zone::{self, Cap, Weak, Zone, ZoneAllocated, ZoneError};
-use tx_substrate::SpinMutex;
+use adapter::wait_routing::{Channel, Mask};
 
 use crate::process::structure::ProcessIdentity;
 use crate::signal::Signum;
@@ -187,9 +225,8 @@ impl SignalFd {
         owner_proc: &Cap<ProcessIdentity>,
         mask: u64,
     ) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
         let payload = Self::new(owner_proc.key().raw(), mask);
-        let cap = zone::sign_for(reservation, payload);
+        let cap = sign_zone_for(payload)?;
         register_subscription(owner_proc.key().raw(), cap.downgrade());
         Ok(cap)
     }
@@ -293,7 +330,7 @@ fn unregister_subscription(proc_key: u32, sfd_id: u64) {
         // Retain entries that either fail to upgrade (already gone) or
         // upgrade to a different `sfd_id`. The matching entry drops out
         // of the list.
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         list.retain(|w| match w.upgrade(&guard) {
             Some(cap) => cap.sfd_id() != sfd_id,
             None => false,
@@ -412,7 +449,7 @@ unsafe impl ZoneAllocated for SignalFd {
 }
 
 pub(crate) fn register_zones() -> Result<(), ZoneError> {
-    zone::register_zone_for::<SignalFd>()?;
+    adapter::step_engine::register_zone_for::<SignalFd>()?;
     Ok(())
 }
 
@@ -445,12 +482,10 @@ mod tests {
         // Use a faked owner_proc_key = 0; for the no-process raw path
         // we sign directly via the zone (skipping the registry).
         let a = {
-            let res = zone::reserve_for::<SignalFd>().expect("reserve a");
-            zone::sign_for(res, SignalFd::new(0, 0))
+            sign_zone_for(SignalFd::new(0, 0)).expect("reserve a")
         };
         let b = {
-            let res = zone::reserve_for::<SignalFd>().expect("reserve b");
-            zone::sign_for(res, SignalFd::new(0, 0))
+            sign_zone_for(SignalFd::new(0, 0)).expect("reserve b")
         };
         assert_ne!(
             a.sfd_id(),
@@ -467,8 +502,7 @@ mod tests {
         let sigusr2 = Signum::new(12).expect("SIGUSR2");
 
         let cap = {
-            let res = zone::reserve_for::<SignalFd>().expect("reserve");
-            zone::sign_for(res, SignalFd::new(0, sigusr1.bit()))
+            sign_zone_for(SignalFd::new(0, sigusr1.bit())).expect("reserve")
         };
 
         // SIGUSR2 is not in the mask — drop on the floor.
@@ -489,8 +523,7 @@ mod tests {
     fn signalfd_read_returns_eagain_when_empty_and_nonblocking() {
         let _g = setup();
         let cap = {
-            let res = zone::reserve_for::<SignalFd>().expect("reserve");
-            zone::sign_for(res, SignalFd::new(0, !0u64))
+            sign_zone_for(SignalFd::new(0, !0u64)).expect("reserve")
         };
         let mut buf = [0u8; SIGNALFD_SIGINFO_SIZE];
         let outcome = signalfd_read(&cap, &mut buf, /* nonblocking = */ true);
@@ -505,8 +538,7 @@ mod tests {
         let _g = setup();
         let sigusr1 = Signum::new(10).expect("SIGUSR1");
         let cap = {
-            let res = zone::reserve_for::<SignalFd>().expect("reserve");
-            zone::sign_for(res, SignalFd::new(0, sigusr1.bit()))
+            sign_zone_for(SignalFd::new(0, sigusr1.bit())).expect("reserve")
         };
         assert!(cap.notify(sigusr1));
         let mut buf = [0xFFu8; SIGNALFD_SIGINFO_SIZE];
@@ -526,8 +558,7 @@ mod tests {
     fn signalfd_read_short_buf_returns_einval() {
         let _g = setup();
         let cap = {
-            let res = zone::reserve_for::<SignalFd>().expect("reserve");
-            zone::sign_for(res, SignalFd::new(0, !0u64))
+            sign_zone_for(SignalFd::new(0, !0u64)).expect("reserve")
         };
         let mut short_buf = [0u8; SIGNALFD_SIGINFO_SIZE - 1];
         let outcome = signalfd_read(&cap, &mut short_buf, false);
