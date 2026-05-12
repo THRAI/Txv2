@@ -29,13 +29,14 @@ pub mod step_engine {
 
     pub use tx_substrate::bus::{RawPort, RawQueue};
     pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::step_v3::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step_v3::{
-        ByteProgress, Errno, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome,
-        SubjectIdentity, WaitSourceId,
+        ByteProgress, Errno, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, StepProgress,
+        SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        reserve_for, sign_for, Cap, Dead, Entity, OperationalCapExt, PayloadCap, Weak, Zone,
-        ZoneAllocated, ZoneError,
+        register_zone_for, reserve_for, sign_for, Cap, Dead, Entity, OperationalCapExt, PayloadCap,
+        Weak, Zone, ZoneAllocated, ZoneError,
     };
     pub use tx_substrate::{AtomicSlot, SpinMutex};
 

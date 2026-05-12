@@ -52,7 +52,7 @@ fn kick_transport(
     tty: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3Out, YieldShape};
+    use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3Out, YieldShape};
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
         Err(err) => return V3Out::Err(err.into()),
@@ -163,7 +163,7 @@ fn kick_transport(
 
 fn restore_front(
     tty: &Cap<TtyIdentity>,
-    payload: &tx_substrate::zone::PayloadCap<crate::tty::structure::TtyPayload>,
+    payload: &crate::tty::adapter::step_engine::PayloadCap<crate::tty::structure::TtyPayload>,
     bytes: &[u8],
 ) {
     payload.with_output_queue(|output_queue| {
@@ -206,9 +206,9 @@ fn restore_front(
 //   a no-op).
 //
 // We deliberately fully-qualify step_v3 types as
-// `tx_substrate::step_v3::*` instead of adding a `use` so the
-// `StepOutcome` / `Errno` already in scope from `crate::execution`
-// keep working without rename gymnastics.
+// `step_engine::*` instead of adding a `use` so the `StepOutcome` /
+// `Errno` already in scope from `crate::execution` keep working
+// without rename gymnastics.
 
 /// `write(2)`-shaped TTY step — step_v3 outcome shape.
 ///
@@ -260,7 +260,7 @@ pub fn step_write(
         );
     }
 
-    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3Out, YieldShape};
+    use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3Out, YieldShape};
     match kick_transport(tty, guard) {
         V3Out::Err(err) => V3Out::err(err),
         V3Out::Yield {
@@ -387,8 +387,7 @@ impl<'a, I: SubjectIdentity> StepOp<I>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tx_substrate::step_v3::StepProgress;
-    use tx_substrate::zone::{self as zone_mod, PayloadCap};
+    use crate::tty::adapter::step_engine::{reserve_for, sign_for, PayloadCap, StepProgress};
 
     use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
     use crate::test_support::EPOCH_TEST_LOCK;
@@ -485,11 +484,11 @@ mod tests {
         name: &str,
         payload: TtyPayload,
     ) -> Cap<TtyIdentity> {
-        let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res = zone_mod::reserve_for::<crate::tty::structure::TtyPayload>()
+        let id_res = reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = reserve_for::<crate::tty::structure::TtyPayload>()
             .expect("tty payload reservation");
-        let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(payload_res, payload));
-        let identity = zone_mod::sign_for(id_res, TtyIdentity::new(kind, index, name));
+        let payload_cap = PayloadCap::from_cap(sign_for(payload_res, payload));
+        let identity = sign_for(id_res, TtyIdentity::new(kind, index, name));
         identity.install_payload(payload_cap);
         identity
     }
@@ -578,7 +577,7 @@ mod tests {
             StepOutcome::Yield {
                 progress,
                 shape:
-                    tx_substrate::step_v3::YieldShape::OnWaitSource {
+                    crate::tty::adapter::step_engine::YieldShape::OnWaitSource {
                         source: carrier,
                         interests,
                     },
@@ -690,7 +689,9 @@ mod tests {
         use super::super::{step_engine, WriteForCallerOp, WriteOp};
         use super::{alloc_tty_with, setup, COMPLETING_BINDING};
         use crate::tty::structure::{TtyKind, TtyPayload};
-        use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+        use crate::tty::adapter::step_engine::{
+            PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome as V3,
+        };
 
         #[test]
         fn write_op_empty_bytes_returns_done_zero() {
@@ -707,7 +708,7 @@ mod tests {
                 bytes: b"",
                 guard: &guard,
             };
-            let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let outcome = op.step(&mut ctx);
             drop(guard);
             match outcome {
@@ -731,7 +732,7 @@ mod tests {
                 bytes: b"hello",
                 guard: &guard,
             };
-            let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let outcome = op.step(&mut ctx);
             drop(guard);
             match outcome {
@@ -757,7 +758,7 @@ mod tests {
                 caller,
                 guard: &guard,
             };
-            let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let outcome = op.step(&mut ctx);
             drop(guard);
             match outcome {
@@ -783,7 +784,7 @@ mod tests {
                 caller,
                 guard: &guard,
             };
-            let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let wrap_outcome = op.step(&mut ctx);
             // Free fn parallel call observed independently; cannot run on
             // same tty without re-fixturing, so the wrap outcome is

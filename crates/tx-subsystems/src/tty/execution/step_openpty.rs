@@ -170,7 +170,9 @@ impl<'a, I: SubjectIdentity> StepOp<I>
 #[cfg(test)]
 mod step_op_wraps {
     use super::*;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+    use crate::tty::adapter::step_engine::{
+        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome as V3,
+    };
 
     use crate::test_support::EPOCH_TEST_LOCK;
 
@@ -187,7 +189,7 @@ mod step_op_wraps {
         let _setup = setup();
         let guard = step_engine::guard();
         let mut op = OpenPtyOp { guard: &guard };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {

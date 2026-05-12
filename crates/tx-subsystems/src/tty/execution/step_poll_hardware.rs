@@ -40,7 +40,7 @@ pub fn step_poll_hardware_input(
     max_bytes: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<HardwarePollOutcome, NoProgress> {
-    use tx_substrate::step_v3::{NoProgress, StepOutcome as V3, YieldShape};
+    use crate::tty::adapter::step_engine::{NoProgress, StepOutcome as V3, YieldShape};
 
     if max_bytes == 0 {
         return V3::Done(HardwarePollOutcome::default());
@@ -171,8 +171,10 @@ impl<'a, I: SubjectIdentity> StepOp<I>
 #[cfg(test)]
 mod step_op_wraps {
     use super::*;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
-    use tx_substrate::zone::{self as zone_mod, PayloadCap};
+    use crate::tty::adapter::step_engine::{
+        reserve_for, sign_for, PayloadCap, PlaceholderProcessSubject, ScriptCtx, StepOp,
+        StepOutcome as V3,
+    };
 
     use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
     use crate::test_support::EPOCH_TEST_LOCK;
@@ -216,13 +218,13 @@ mod step_op_wraps {
     }
 
     fn alloc_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
-        let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
-        let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(
+        let id_res = reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_cap = PayloadCap::from_cap(sign_for(
             payload_res,
             TtyPayload::new_hardware(&NOOP_BINDING),
         ));
-        let identity = zone_mod::sign_for(
+        let identity = sign_for(
             id_res,
             TtyIdentity::new(TtyKind::SerialHardware, index, name),
         );
@@ -240,7 +242,7 @@ mod step_op_wraps {
             max_bytes: 0,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
@@ -262,7 +264,7 @@ mod step_op_wraps {
             max_bytes: 8,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {

@@ -293,9 +293,9 @@ impl PtyIndexName {
 // method whose v3 trait does not provide a default. Per the wave-8
 // design doc (`docs/progress/decisions/2026-05-09-fsops-v3-design.md`).
 //
-// Fully-qualified `tx_substrate::step_v3::*` references at the impl
-// sites avoid clashing with `crate::execution::StepOutcome` still in
-// scope for other helpers, per the wave-4/6/7/9a trait-impl convention.
+// Fully-qualified `step_engine::*` references at the impl sites avoid
+// clashing with `crate::execution::StepOutcome` still in scope for
+// other helpers, per the wave-4/6/7/9a trait-impl convention.
 
 use crate::page_backed::{Frame, FsPageBacking, PageContainer};
 use crate::vfs::FsOps;

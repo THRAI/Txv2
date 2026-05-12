@@ -2,7 +2,11 @@
 
 use core::sync::atomic::Ordering;
 
-use crate::tty::adapter::step_engine::{self as step_engine, Cap};
+use crate::tty::adapter::step_engine::{
+    self as step_engine, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Weak,
+};
+#[cfg(test)]
+use crate::tty::adapter::step_engine::ByteProgress;
 
 use crate::execution::{Errno, Guard};
 use crate::signal::{self, DispatchOutcome, SigDisposition, Signum};
@@ -10,9 +14,6 @@ use crate::tty::checks::{require_live_tty, require_session_leader};
 use crate::tty::execution::{TTY_READABLE, TTY_WRITABLE};
 use crate::tty::ldisc::SignalKind;
 use crate::tty::structure::{SessionPgrp, Termios, TtyIdentity, Winsize};
-use crate::tty::adapter::step_engine::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
-#[cfg(test)]
-use crate::tty::adapter::step_engine::ByteProgress;
 
 #[derive(Clone, Copy, Debug)]
 pub struct IoctlCaller {
@@ -21,7 +22,7 @@ pub struct IoctlCaller {
     /// Typed `Weak<ProcessGroup>` for the caller's pgrp. `None` for
     /// legacy raw-id callers; populated by [`Self::with_pgrp_weak`]
     /// once the syscall driver carries a real `Cap<ProcessIdentity>`.
-    pub pgrp: Option<tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>>,
+    pub pgrp: Option<Weak<crate::process::structure::ProcessGroup>>,
     pub is_session_leader: bool,
     pub has_controlling_tty: bool,
     pub in_foreground: bool,
@@ -116,7 +117,7 @@ impl IoctlCaller {
     /// resolving from the raw `pgrp_id` later.
     pub fn with_pgrp_weak(
         mut self,
-        pgrp: tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>,
+        pgrp: Weak<crate::process::structure::ProcessGroup>,
     ) -> Self {
         self.pgrp = Some(pgrp);
         self
@@ -181,17 +182,17 @@ pub enum SignalTarget {
     /// TTY's bound foreground pgrp (TIOCSCTTY-installed, ioctl-emitted).
     ForegroundProcessGroup {
         pgid: u32,
-        pgrp: Option<tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>>,
+        pgrp: Option<Weak<crate::process::structure::ProcessGroup>>,
     },
     /// Session leader's pgrp (used by hangup → SIGHUP fanout).
     SessionLeaderProcessGroup {
         pgid: u32,
-        pgrp: Option<tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>>,
+        pgrp: Option<Weak<crate::process::structure::ProcessGroup>>,
     },
     /// Caller's own pgrp (used by background-IO SIGTTIN/SIGTTOU).
     CallerProcessGroup {
         pgid: u32,
-        pgrp: Option<tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>>,
+        pgrp: Option<Weak<crate::process::structure::ProcessGroup>>,
     },
 }
 
@@ -233,7 +234,7 @@ impl SignalTarget {
     /// `signal::deliver_tty_dispatch` for upgrade-and-route).
     pub fn pgrp_weak(
         &self,
-    ) -> Option<&tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>> {
+    ) -> Option<&Weak<crate::process::structure::ProcessGroup>> {
         match self {
             SignalTarget::ForegroundProcessGroup { pgrp, .. }
             | SignalTarget::SessionLeaderProcessGroup { pgrp, .. }
@@ -850,8 +851,10 @@ impl<'a, I: SubjectIdentity> StepOp<I>
 #[cfg(test)]
 mod step_op_wraps {
     use super::*;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
-    use tx_substrate::zone::{self as zone_mod, PayloadCap};
+    use crate::tty::adapter::step_engine::{
+        reserve_for, sign_for, PayloadCap, PlaceholderProcessSubject, ScriptCtx, StepOp,
+        StepOutcome as V3,
+    };
 
     use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
     use crate::test_support::EPOCH_TEST_LOCK;
@@ -895,13 +898,13 @@ mod step_op_wraps {
     }
 
     fn alloc_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
-        let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
-        let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(
+        let id_res = reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_cap = PayloadCap::from_cap(sign_for(
             payload_res,
             TtyPayload::new_hardware(&NOOP_BINDING),
         ));
-        let identity = zone_mod::sign_for(
+        let identity = sign_for(
             id_res,
             TtyIdentity::new(TtyKind::SerialHardware, index, name),
         );
@@ -918,7 +921,7 @@ mod step_op_wraps {
             tty: &tty,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
@@ -937,7 +940,7 @@ mod step_op_wraps {
             tty: &tty,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
@@ -955,7 +958,7 @@ mod step_op_wraps {
             tty: &tty,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
@@ -973,7 +976,7 @@ mod step_op_wraps {
             tty: &tty,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
@@ -992,7 +995,7 @@ mod step_op_wraps {
             winsize: Winsize::default(),
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
@@ -1012,7 +1015,7 @@ mod step_op_wraps {
             caller,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
