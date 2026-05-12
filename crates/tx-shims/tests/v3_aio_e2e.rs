@@ -158,7 +158,7 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
     // The tmpfs (page-backed) file writes need the zero-frame page
     // installed; idempotent on re-entry.
@@ -166,8 +166,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
         Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for aio e2e: {error:?}"),
     }
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
     reset_pid_counter();
     reset_tid_counter();
     reset_init_process();
