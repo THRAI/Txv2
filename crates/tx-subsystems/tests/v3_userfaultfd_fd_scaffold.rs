@@ -36,8 +36,7 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_substrate::epoch;
-use tx_subsystems::userfaultfd::adapter::step_engine::Cap;
+use tx_subsystems::userfaultfd::adapter::step_engine::{guard as ebr_guard, Cap, Errno, StepOutcome};
 
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
 use tx_subsystems::userfaultfd::UserfaultFd;
@@ -210,7 +209,7 @@ fn userfaultfd_phase0_fd_scaffold_invariants_round_trip() {
     drop(closed);
     tx_test_support::drain_to_quiescence();
 
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     assert!(
         inner_weak.upgrade(&guard).is_none(),
         "ufd zone slot must be reclaimed after the last OpenFile drops",
@@ -227,11 +226,11 @@ fn userfaultfd_phase0_fd_scaffold_invariants_round_trip() {
     let file_c =
         OpenFile::new_userfaultfd_cap(ufd_c, ufd_open_file_flags()).expect("openfile cap c");
     let mut buf = [0u8; 8];
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let outcome = file_c.step_read(&mut buf, &guard);
     drop(guard);
     match outcome {
-        tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EINVAL) => {}
+        StepOutcome::Err(Errno::EINVAL) => {}
         other => panic!("expected v3 Err(EINVAL), got {other:?}"),
     }
     drop(file_c);

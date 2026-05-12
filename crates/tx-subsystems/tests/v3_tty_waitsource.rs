@@ -62,9 +62,9 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
-use tx_substrate::epoch;
 use tx_subsystems::tty::adapter::step_engine::{
-    self as zone_mod, ByteProgress, Cap, InterestMask, PayloadCap, StepOutcome, WaitSourceId,
+    self as zone_mod, guard as ebr_guard, ByteProgress, Cap, InterestMask, PayloadCap, StepOutcome,
+    WaitSourceId,
 };
 use tx_subsystems::tty::adapter::wait_routing::{
     MailboxEvent, Mask, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
@@ -223,7 +223,7 @@ fn tty_wait_source_invariants_round_trip() {
     // Single byte-ingest transition. `\n` commits a cooked line under
     // default_cooked() termios, which fires `input_readable` and
     // both the legacy `wait_channel` and the new `wait_source`.
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let outcome = step_ingest(&tty, b"\n", &guard);
     drop(guard);
     use tx_subsystems::tty::adapter::step_engine::StepOutcome as V3;
@@ -261,7 +261,7 @@ fn tty_wait_source_invariants_round_trip() {
     let (_reg_guard_hangup, _gen_hangup) = register(&tty_source, &mailbox_hangup, TTY_READABLE);
     assert!(mailbox_hangup.is_empty());
 
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let hangup = step_hangup(&tty, &guard);
     drop(guard);
     match hangup {
