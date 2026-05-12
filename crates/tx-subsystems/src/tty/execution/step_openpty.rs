@@ -178,7 +178,7 @@ mod step_op_wraps {
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _ = crate::zones::register_all();
         crate::tty::structure::registry::reset_for_tests();
         guard

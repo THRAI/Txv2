@@ -592,39 +592,16 @@ mod tests {
     use super::adapter::step_engine::{
         guard, Errno as V3Errno, StepOutcome as V3Out, YieldShape,
     };
-    use tx_substrate::testing::init_host_for_test_once;
-
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vfs::structure::{RNodeBacking, StructPayload};
     use crate::zones;
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        init_host_for_test_once();
+        tx_test_support::init_host();
         let _ = zones::register_all();
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
         guard
-    }
-
-    /// Loop `drain_with_budget(usize::MAX)` until two consecutive
-    /// drains reclaim zero nodes. Each individual drain advances the
-    /// global epoch at most once and only reclaims nodes whose
-    /// retirement epoch is at least 2 behind the current epoch, so a
-    /// single call is insufficient to flush a freshly-dropped
-    /// `Cap<OpenFile>` chain (the OpenFile drop queues its inner
-    /// `Cap<RNode>` / `Cap<PipePayload>` retirements, which need
-    /// further advances). This helper hides that bookkeeping behind
-    /// a single call so the lifecycle assertions read cleanly.
-    fn drain_to_quiescence() {
-        let mut quiet = 0u32;
-        while quiet < 2 {
-            let stats = tx_substrate::epoch::drain_with_budget(usize::MAX);
-            if stats.reclaimed == 0 {
-                quiet += 1;
-            } else {
-                quiet = 0;
-            }
-        }
     }
 
     /// Pull the shared `Cap<PipePayload>` back out of an OpenFile so
@@ -702,7 +679,7 @@ mod tests {
         // `decr_writer` exactly once. `drain_with_budget` forces the
         // reclamation callback to run synchronously inside the test.
         drop(writer);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
         assert_eq!(payload.writer_count_snapshot(), 0);
         let mut buf = [0u8; 4];
         let guard = guard();
@@ -779,7 +756,7 @@ mod tests {
         // reader's `Cap<OpenFile>`. `Drop for OpenFile` fires from
         // EBR reclamation and calls `decr_reader` exactly once.
         drop(reader);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
         assert_eq!(payload.reader_count_snapshot(), 0);
         let guard = guard();
         let outcome = step_write(&payload, b"x", &guard, false);
@@ -788,7 +765,7 @@ mod tests {
         // Hold writer to PIPE_BUF lifetime so its drop happens after
         // the assertion (and naturally drives writer_count to 0 too).
         drop(writer);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
     }
 
     #[test]
@@ -848,7 +825,7 @@ mod tests {
         let payload = payload_of(&reader);
         assert_eq!(payload.writer_count_snapshot(), 1);
         drop(writer);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
         assert_eq!(payload.writer_count_snapshot(), 0);
         // Reader still alive; reader_count untouched.
         assert_eq!(payload.reader_count_snapshot(), 1);
@@ -861,11 +838,11 @@ mod tests {
         let payload = payload_of(&reader);
         assert_eq!(payload.reader_count_snapshot(), 1);
         drop(reader);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
         assert_eq!(payload.reader_count_snapshot(), 0);
         assert_eq!(payload.writer_count_snapshot(), 1);
         drop(writer);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
     }
 
     #[test]
@@ -875,7 +852,7 @@ mod tests {
         let payload = payload_of(&reader);
         // Close the reader side via the production path.
         drop(reader);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
         // A subsequent writer-side step must surface EPIPE; the
         // syscall arm in tx-shims pairs this with SIGPIPE delivery
         // before returning -EPIPE to userspace.
@@ -884,7 +861,7 @@ mod tests {
         drop(guard);
         assert_eq!(outcome, V3Out::Err(V3Errno::EPIPE));
         drop(writer);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
     }
 
     #[test]
@@ -894,7 +871,7 @@ mod tests {
         let payload = payload_of(&reader);
         // Close the writer side via the production path.
         drop(writer);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
         // Reader on empty + writers closed must observe EOF (Done(0))
         // rather than parking forever.
         let mut buf = [0u8; 8];
@@ -903,7 +880,7 @@ mod tests {
         drop(guard);
         assert_eq!(outcome, V3Out::Done(0));
         drop(reader);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
     }
 
     // === step_v3 sibling-fn tests ========================================
@@ -1034,7 +1011,7 @@ mod tests {
         let payload = payload_of(&reader);
         // Close the writer side via the production path.
         drop(writer);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
         let mut buf = [0u8; 4];
         let guard = guard();
         let outcome = step_read(&payload, &mut buf, &guard, false);
@@ -1044,7 +1021,7 @@ mod tests {
             other => panic!("expected v3 Done(0) for EOF, got {other:?}"),
         }
         drop(reader);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
     }
 
     // === wave-7 v3 cascade probe (W-pipe-step-write) =====================
@@ -1077,7 +1054,7 @@ mod tests {
         let payload = payload_of(&reader);
         // Production-path simulate of last-reader-close.
         drop(reader);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
         assert_eq!(payload.reader_count_snapshot(), 0);
         let guard = guard();
         let outcome = step_write(&payload, b"x", &guard, false);
@@ -1087,7 +1064,7 @@ mod tests {
             other => panic!("expected v3 Err(EPIPE), got {other:?}"),
         }
         drop(writer);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
     }
 
     #[test]
@@ -1153,40 +1130,18 @@ mod step_op_wraps {
         guard, ByteProgress, Errno as V3Errno, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
         StepProgress, YieldShape,
     };
-    use tx_substrate::testing::init_host_for_test_once;
-
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vfs::structure::{RNodeBacking, StructPayload};
     use crate::zones;
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        init_host_for_test_once();
+        tx_test_support::init_host();
         let _ = zones::register_all();
         // Quiesce any deferred drops from prior tests so reader/writer
         // counts read cleanly here.
-        let mut quiet = 0u32;
-        while quiet < 2 {
-            let stats = tx_substrate::epoch::drain_with_budget(usize::MAX);
-            if stats.reclaimed == 0 {
-                quiet += 1;
-            } else {
-                quiet = 0;
-            }
-        }
+        tx_test_support::drain_to_quiescence();
         guard
-    }
-
-    fn drain_to_quiescence() {
-        let mut quiet = 0u32;
-        while quiet < 2 {
-            let stats = tx_substrate::epoch::drain_with_budget(usize::MAX);
-            if stats.reclaimed == 0 {
-                quiet += 1;
-            } else {
-                quiet = 0;
-            }
-        }
     }
 
     fn payload_of(openfile: &Cap<OpenFile>) -> Cap<PipePayload> {
@@ -1388,7 +1343,7 @@ mod step_op_wraps {
         let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         drop(reader);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
         assert_eq!(payload.reader_count_snapshot(), 0);
         let guard = guard();
         let bytes: &[u8] = b"x";
@@ -1405,6 +1360,6 @@ mod step_op_wraps {
             other => panic!("expected Err(EPIPE), got {other:?}"),
         }
         drop(writer);
-        drain_to_quiescence();
+        tx_test_support::drain_to_quiescence();
     }
 }

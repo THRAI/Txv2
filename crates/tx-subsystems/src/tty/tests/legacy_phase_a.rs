@@ -147,7 +147,7 @@ fn drain(ring: &mut Ring) -> Vec<u8> {
 }
 
 fn init_zones() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     crate::zones::register_all().expect("kernel zones");
     crate::tty::structure::registry::reset_for_tests();
 }

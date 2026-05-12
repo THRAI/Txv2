@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn mount_payload_stores_backend_traits_and_pins_are_explicit() {
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
@@ -733,7 +733,7 @@ mod tests {
 
     #[test]
     fn file_page_container_kind_carries_mount_payload_and_object_id() {
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn mount_identity_payload_binding_upgrades_and_operational_pin_counts_separately() {
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
@@ -885,7 +885,7 @@ mod tests {
 
     #[test]
     fn mockfs_lookup_v3_known_name_returns_done_root() {
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
@@ -902,7 +902,7 @@ mod tests {
 
     #[test]
     fn mockfs_lookup_v3_unknown_name_returns_err_enoent() {
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn mockfs_load_inode_meta_v3_returns_done_directory_meta() {
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
@@ -940,7 +940,7 @@ mod tests {
 
     #[test]
     fn mockfs_fetch_page_v3_returns_err_enosys_via_v4_into_v3_bridge() {
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");

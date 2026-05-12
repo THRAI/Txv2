@@ -76,7 +76,7 @@ fn counting_pmap_counters() -> CountingPmapCounters {
 
 fn wait_for_counting_pmap_counters(expected: CountingPmapCounters) {
     for _ in 0..1024 {
-        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        let _ = tx_test_support::drain_once_unbounded();
         if counting_pmap_counters() == expected {
             return;
         }
@@ -178,14 +178,13 @@ fn setup_host_substrate() {
             *slot = Some(EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
         }
     });
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     crate::zones::register_all().expect("kernel zones");
     match crate::vm::adapter::step_engine::page_allocator::claim_zero_frame() {
         Ok(_) | Err(crate::vm::adapter::step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for VM tests: {error:?}"),
     }
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 }
 
 fn page_backing(offset: u64) -> VmBacking {

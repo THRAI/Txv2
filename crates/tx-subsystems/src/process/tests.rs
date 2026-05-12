@@ -25,14 +25,12 @@ use crate::vfs::{DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RN
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
 use crate::process::adapter::step_engine::{guard as ebr_guard, sign_zone_for, Cap};
-use tx_substrate::testing::init_host_for_test_once;
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
     reset_pid_counter_for_test();
     reset_tid_counter_for_test();
     reset_init_process_for_test();
@@ -242,8 +240,7 @@ fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
     step_exit_group(&child, ExitStatus::Exited(0));
     drop(child);
     let _ = step_waitpid_nohang(&parent, WaitTarget::Pid(child_pid)).expect("reap");
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 
     let guard = ebr_guard();
     let live_after: usize = pgrp
@@ -920,8 +917,7 @@ fn dropping_test_child_cap_leaves_parent_children_list_intact() {
 
     // Drop one external Cap. Parent's children list retains both.
     drop(c1);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 
     assert_eq!(
         parent.child_count(),

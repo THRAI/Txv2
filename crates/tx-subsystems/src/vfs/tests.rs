@@ -49,17 +49,16 @@ static ECHO_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
 };
 
 fn init_tty_zones() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
     crate::tty::structure::registry::reset_for_tests();
 }
 
 fn setup_process_world() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
     crate::tty::structure::registry::reset_for_tests();
     reset_pid_counter_for_test();
     reset_tid_counter_for_test();
