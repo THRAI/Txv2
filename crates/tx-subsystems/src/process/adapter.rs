@@ -26,15 +26,15 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "epoch"],
+    apis = ["step", "zone", "epoch"],
     reason = "expose substrate step engine (StepOp/StepOutcome, RestrictionStackHandle, SubjectIdentity), EBR guard, zone role types (Cap/PayloadCap/Weak/IdentRef/Entity), and lock primitives (SpinMutex/AtomicSlot) used by process identity, payload, group, session, and the seven fork/exit/wait/chdir/getcwd/setpgid/setsid step ops"
 )]
 pub mod step_engine {
     use tx_substrate::zone;
 
     pub use tx_substrate::epoch::{guard, Guard};
-    pub use tx_substrate::step_v3::ProcessIdentity as PlaceholderProcessSubject;
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
+    pub use tx_substrate::step::{
         InterestMask, NoProgress, RestrictionStackHandle, ScriptCtx, StepOp, StepOutcome,
         SubjectIdentity, WaitSourceId,
     };
@@ -54,7 +54,7 @@ pub mod step_engine {
 #[platform_adapter(
     platform = "substrate",
     domain = "wait_routing",
-    apis = ["wake", "step_v3"],
+    apis = ["wake", "step"],
     reason = "wrap process exit-source WaitSource registration and v3 mailbox notify"
 )]
 #[platform_adapter(
@@ -64,7 +64,7 @@ pub mod step_engine {
 )]
 pub mod wait_routing {
     use alloc::sync::Arc;
-    use tx_substrate::step_v3::{InterestMask, WaitSourceId};
+    use tx_substrate::step::{InterestMask, WaitSourceId};
 
     pub use tx_reactor::wait::{Channel, Mask};
     pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};

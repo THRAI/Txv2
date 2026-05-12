@@ -11,7 +11,7 @@
 //! - txdoc:TXV3-STEP-MODEL-V2 (consumed by cap-side dereference sites)
 //! - txdoc:CONCEPTS-V5-BINDINGS-1 (canonical bindings/obligations section)
 
-use tx_substrate::step_v3::BindingObligation;
+use tx_substrate::step::BindingObligation;
 
 // -- BindingObligation closed catalog ----------------------------------------
 

@@ -1120,7 +1120,7 @@ async fn step_helper() -> u32 {
         let findings = lint_txv3_code_references(
             &known,
             &[(
-                "crates/tx-substrate/src/step_v3.rs",
+                "crates/tx-substrate/src/step.rs",
                 "// Implements the v3 step algebra. txdoc:TXV3-STEP-MODEL-V2\npub struct Foo;\n",
             )],
         );
@@ -1141,7 +1141,7 @@ async fn step_helper() -> u32 {
         let findings = lint_txv3_code_references(
             &known,
             &[(
-                "crates/tx-substrate/src/step_v3.rs",
+                "crates/tx-substrate/src/step.rs",
                 "// txdoc:TXV3-DOES-NOT-EXIST referenced but no doc declares it\npub struct Foo;\n",
             )],
         );
@@ -1149,7 +1149,7 @@ async fn step_helper() -> u32 {
         assert!(
             findings
                 .iter()
-                .any(|f| f.contains("TXV3-DOES-NOT-EXIST") && f.contains("step_v3.rs")),
+                .any(|f| f.contains("TXV3-DOES-NOT-EXIST") && f.contains("step.rs")),
             "expected finding mentioning missing tag and file, got {findings:?}"
         );
     }

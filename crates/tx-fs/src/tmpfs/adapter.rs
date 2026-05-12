@@ -16,14 +16,14 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "epoch"],
+    apis = ["step", "zone", "epoch"],
     reason = "expose substrate step engine outcome types, zone role types, EBR guard, and SpinMutex used by tmpfs FsOps implementation (the largest single-file substrate consumer in the workspace)"
 )]
 pub mod step_engine {
     use tx_substrate::zone;
 
     pub use tx_substrate::epoch::{guard, Guard};
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::{
         ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
         YieldShape,
     };

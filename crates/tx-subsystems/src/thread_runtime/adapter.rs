@@ -25,15 +25,15 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "epoch", "wake"],
+    apis = ["step", "zone", "epoch", "wake"],
     reason = "expose substrate step engine (StepOp/StepOutcome/NoProgress/ScriptCtx/SubjectIdentity), D9-A signal-wake mailbox (MailboxEvent/SignalRouting/TaskMailbox), zone role types (Cap/PayloadCap/Weak/Dead/Entity/OperationalCapExt/Zone/ZoneAllocated), EBR guard, and SpinMutex used by thread_runtime structure, execution, and tests"
 )]
 pub mod step_engine {
     use tx_substrate::zone;
 
     pub use tx_substrate::epoch::{guard, Guard};
-    pub use tx_substrate::step_v3::ProcessIdentity as PlaceholderProcessSubject;
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
+    pub use tx_substrate::step::{
         NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     };
     pub use tx_substrate::wake::{MailboxEvent, SignalRouting, TaskMailbox};

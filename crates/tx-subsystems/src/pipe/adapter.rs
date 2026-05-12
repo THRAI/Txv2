@@ -7,7 +7,7 @@
 //!
 //! Two domains:
 //!
-//! * **`step_engine`** — wraps `tx_substrate::step_v3` step outcomes,
+//! * **`step_engine`** — wraps `tx_substrate::step` step outcomes,
 //!   `tx_substrate::zone` allocation, and `tx_substrate::SpinMutex` as
 //!   named pipe-side verbs (`done_bytes`, `eagain`, `epipe`,
 //!   `yield_until_readable`, `yield_until_writable`, `sign_zone_for`).
@@ -25,14 +25,14 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone"],
+    apis = ["step", "zone"],
     reason = "expose pipe step outcomes (done/eagain/epipe/yield) as named verbs; bundle zone allocation into pipe-domain helpers"
 )]
 pub mod step_engine {
     use tx_substrate::zone;
 
     pub use tx_substrate::epoch::{guard, Guard};
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::{
         ByteProgress, Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp,
         StepOutcome, StepProgress, SubjectIdentity, WaitSourceId, YieldShape,
     };
@@ -95,7 +95,7 @@ pub mod step_engine {
 #[platform_adapter(
     platform = "substrate",
     domain = "wait_routing",
-    apis = ["wake", "step_v3"],
+    apis = ["wake", "step"],
     reason = "wrap WaitSource registration and v3 mailbox notify in pipe-side reader/writer wakeup verbs"
 )]
 #[platform_adapter(
@@ -105,7 +105,7 @@ pub mod step_engine {
 )]
 pub mod wait_routing {
     use alloc::sync::Arc;
-    use tx_substrate::step_v3::{InterestMask, WaitSourceId};
+    use tx_substrate::step::{InterestMask, WaitSourceId};
 
     pub use tx_reactor::wait::{Channel, Mask};
     pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};

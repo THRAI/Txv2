@@ -21,7 +21,7 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "epoch", "bus"],
+    apis = ["step", "zone", "epoch", "bus"],
     reason = "expose substrate step engine (StepOp/StepOutcome and ten step_* file types), zone role types, EBR guard, and bus primitives (RawPort/RawQueue) used by TtyIdentity / TtyPayload across the tty subsystem"
 )]
 pub mod step_engine {
@@ -29,8 +29,8 @@ pub mod step_engine {
 
     pub use tx_substrate::bus::{RawPort, RawQueue};
     pub use tx_substrate::epoch::{guard, Guard};
-    pub use tx_substrate::step_v3::ProcessIdentity as PlaceholderProcessSubject;
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
+    pub use tx_substrate::step::{
         ByteProgress, Errno, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, StepProgress,
         SubjectIdentity, WaitSourceId, YieldShape,
     };
@@ -59,7 +59,7 @@ pub mod step_engine {
 )]
 pub mod wait_routing {
     use alloc::sync::Arc;
-    use tx_substrate::step_v3::{InterestMask, WaitSourceId};
+    use tx_substrate::step::{InterestMask, WaitSourceId};
 
     pub use tx_reactor::wait::{Channel, Mask};
     pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};

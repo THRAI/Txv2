@@ -13,20 +13,20 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "epoch"],
+    apis = ["step", "zone", "epoch"],
     reason = "expose substrate step engine outcome types, zone role types, EBR guard, and SpinMutex used by tx-shims syscall dispatch arms"
 )]
 pub mod step_engine {
     use tx_substrate::zone;
 
     pub use tx_substrate::epoch::{guard, Guard};
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::{
         AgentCancelPolicy, ByteProgress, CancelReason, DelegateReply, DelegateRequest,
         DelegateState, DelegateTokenId, Errno, InterestMask, NoProgress, OnBehalfOfAbort, ScriptCtx,
         StepOp, StepOutcome, SubjectAuthority, SubjectContext, SubjectIdentity, TokenDropPolicy,
         TransitionOutcome, UfdAccessKind, UfdReply, UfdRequest, WaitSourceId, YieldShape,
     };
-    pub use tx_substrate::step_v3::ProcessIdentity as PlaceholderProcessSubject;
+    pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::zone::{
         reserve_for, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
     };

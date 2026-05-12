@@ -9,7 +9,7 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "epoch", "page_allocator"],
+    apis = ["step", "zone", "epoch", "page_allocator"],
     reason = "expose substrate step engine outcome types, zone role types, EBR guard, and page-allocator primitives used by tx-ext4 FsOps implementation"
 )]
 pub mod step_engine {
@@ -17,7 +17,7 @@ pub mod step_engine {
 
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::page_allocator;
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::{
         ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     };
     pub use tx_substrate::zone::{

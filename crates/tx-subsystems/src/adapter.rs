@@ -17,13 +17,13 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "epoch", "page_allocator"],
+    apis = ["step", "zone", "epoch", "page_allocator"],
     reason = "expose substrate step engine outcome/error/progress types, zone Cap, EBR Guard/guard, and page_allocator frame_kernel_addr used by crate-root shared infrastructure files (execution.rs, device.rs, initramfs/mod.rs, zones.rs)"
 )]
 pub mod step_engine {
     pub use tx_substrate::epoch::{self as epoch, guard, EpochSummary, Guard};
     pub use tx_substrate::page_allocator;
-    pub use tx_substrate::step_v3::{ByteProgress, Errno as V3Errno, NoProgress, RestrictionStackHandle, StepOutcome};
+    pub use tx_substrate::step::{ByteProgress, Errno as V3Errno, NoProgress, RestrictionStackHandle, StepOutcome};
     pub use tx_substrate::zone::{self as zone, Cap, Zone, ZoneAllocated, ZoneError, ZoneInfo};
     pub use tx_substrate::SpinMutex;
 }

@@ -16,17 +16,17 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3"],
+    apis = ["step"],
     reason = "expose substrate step_v3 trait/type surface (StepOp, StepOutcome, NoProgress, ScriptCtx, SubjectIdentity, ProcessIdentity, AbortReason, DelegateRegistry, DelegateReply, DelegateTokenId) used by hart_loop StepOp impls and agent_reply future"
 )]
 pub mod step_engine {
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::{
         AbortReason, AgentCancelPolicy, Deadline, DelegateRegistry, DelegateReply, DelegateRequest,
         DelegateState, DelegateTokenId, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
         TokenDropPolicy, TransitionOutcome,
     };
     // ProcessIdentity is used as a placeholder subject in tests.
-    pub use tx_substrate::step_v3::ProcessIdentity as PlaceholderProcessSubject;
+    pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
 }
 
 #[platform_adapter(

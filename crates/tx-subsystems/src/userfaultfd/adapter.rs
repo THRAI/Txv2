@@ -3,14 +3,14 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "wake"],
+    apis = ["step", "zone", "wake"],
     reason = "expose substrate step engine outcome/error types, delegate registry, WaitSource, TaskMailbox, zone allocation, and SpinMutex for userfaultfd pending-fault queue and step_ufd_read"
 )]
 pub mod step_engine {
     use tx_substrate::zone;
 
     pub use tx_substrate::epoch::{guard, Guard};
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::{
         ByteProgress, DelegateRegistry, DelegateReply, DelegateState, DelegateTokenId, Errno,
         Errno as V3Errno, InterestMask, StepOutcome, TransitionOutcome, UfdReply, WaitSourceId,
     };

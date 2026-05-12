@@ -13,7 +13,7 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "epoch", "page_allocator"],
+    apis = ["step", "zone", "epoch", "page_allocator"],
     reason = "expose substrate step engine outcome types, zone role types, page-allocator primitives (BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy), EBR guard, and SpinMutex used by the page_backed subsystem's per-variant fetch/write step ops"
 )]
 pub mod step_engine {
@@ -23,7 +23,7 @@ pub mod step_engine {
     pub use tx_substrate::page_allocator::{
         self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,
     };
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::{
         ByteProgress, Errno, InterestMask, NoProgress, PageProgress,
         ProcessIdentity as PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
         SubjectIdentity, WaitSourceId, YieldShape,

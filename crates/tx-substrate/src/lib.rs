@@ -24,7 +24,7 @@ pub mod pmap {
 pub mod page_allocator;
 pub mod slab;
 pub mod slot;
-pub mod step_v3;
+pub mod step;
 pub mod sync;
 pub mod wake;
 pub mod zone;
