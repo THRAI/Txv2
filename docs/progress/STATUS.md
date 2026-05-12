@@ -4,6 +4,18 @@
 
 ## Current Shape
 
+- 2026-05-13 D56–D61 tx-test-support adapter LANDED. Created
+  `crates/tx-test-support` with a `#[platform_adapter]` `step_engine` module
+  exposing `init_host()`, `drain_to_quiescence()`, and `drain_once_unbounded()`.
+  Migrated ~87 test files across tx-subsystems (lib+integration) and tx-shims
+  (lib+integration) away from direct `tx_substrate::testing::init_host_for_test_once`
+  and double `tx_substrate::epoch::drain_with_budget` calls. Lowered ratchet
+  ceiling 199→23. **Boundary report (post-D61):** substrate outside adapters
+  23 lines (ceiling 23 ok); reactor outside adapters 0 lines (ceiling 4 ok).
+  All test suites verified green. Residual 23 lines are in `crates/tx-reactor/`
+  and require a separate EBR adapter pass. ADR:
+  2026-05-13-d56-d61-tx-test-support-adapter.md.
+
 - 2026-05-13 D51-D55 inline adapter relocation LANDED. Five inline
   `mod adapter { ... }` blocks extracted from flat .rs files into sibling
   adapter.rs files: aio (d049833), signalfd (9d74aba), userfaultfd (3a9f821),
