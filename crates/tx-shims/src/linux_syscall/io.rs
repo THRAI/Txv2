@@ -355,7 +355,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // Restrictions cap is a fresh placeholder
     // (`tx_subsystems::cred::placeholder_restrictions_cap`) until PR-K
     // lands the real append-only stack (D5 §7).
-    use tx_substrate::step_v3::{StepOp, StepOutcome as V3Out, YieldShape};
+    use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
     use tx_subsystems::execution::WaitToken;
     use tx_subsystems::vfs::execution::OpenFileWriteOp;
     let mut script_ctx = build_subject_script_ctx(ctx);
@@ -543,7 +543,7 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     // Restrictions cap is a fresh placeholder
     // (`tx_subsystems::cred::placeholder_restrictions_cap`) until PR-K
     // lands the real append-only stack (D5 §7).
-    use tx_substrate::step_v3::{StepOp, StepOutcome as V3Out, YieldShape};
+    use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
     use tx_subsystems::execution::WaitToken;
     use tx_subsystems::vfs::execution::OpenFileReadOp;
     let mut script_ctx = build_subject_script_ctx(ctx);

@@ -260,7 +260,7 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     // syscall entry. `step_fork` reads the parent cred internally
     // (via `payload.cred()`) to seed the child — the subject's role
     // here is SUBJ-1 hygiene, not driving the fork-time cred copy.
-    use tx_substrate::step_v3::{StepOp, StepOutcome as V3Fork};
+    use step_engine::{StepOp, StepOutcome as V3Fork};
     let mut script_ctx = build_subject_script_ctx(ctx);
     let fork_result = {
         let mut op = tx_subsystems::process::execution::ForkOp::<P> {

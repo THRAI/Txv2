@@ -21,12 +21,15 @@ pub mod step_engine {
 
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step_v3::{
-        ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+        ByteProgress, DelegateReply, DelegateTokenId, Errno, NoProgress, ScriptCtx, StepOp,
+        StepOutcome, SubjectAuthority, SubjectContext, SubjectIdentity, TransitionOutcome,
+        UfdReply, YieldShape,
     };
+    pub use tx_substrate::step_v3::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::zone::{
         reserve_for, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
     };
-    pub use tx_substrate::SpinMutex;
+    pub use tx_substrate::{page_allocator, SpinMutex};
 
     pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
         let reservation = zone::reserve_for::<T>()?;

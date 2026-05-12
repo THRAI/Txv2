@@ -70,7 +70,6 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_substrate::SpinMutex;
 use tx_subsystems::aio::{
     is_valid_iocb_opcode, spawn_worker_for_context, AioContext, AioWorkerFuture, IoEvent, Iocb,
     IocbDispatcher, EVENTS_AVAILABLE_MASK, IOCB_CMD_PREAD, IOCB_CMD_PWRITE, IO_EVENT_BYTES,
@@ -85,7 +84,7 @@ use tx_subsystems::wait_source;
 
 use super::{bootstrap_copy_from_user, bootstrap_copy_to_user, SyscallCtx, SyscallResult};
 use super::{EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
-use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity};
 use crate::adapter::step_engine::StepOutcome as V3Out;
 
 // === Linux negative-errno values used by the dispatcher =============

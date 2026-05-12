@@ -860,7 +860,7 @@ pub(super) fn read_user_cstr_vec(
 /// `aspace.read_user` lane, falling back to the bootstrap
 /// kernel-pointer dance on `EFAULT`.
 pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) -> Result<T, Errno> {
-    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, StepOutcome as V3};
     let guard = step_engine::guard();
     match aspace.read_user(UserPtr::<T>::new(uaddr as usize), &guard) {
         V3::Done(v) => Ok(v),
@@ -969,7 +969,7 @@ pub(super) fn bootstrap_read_user_cstr(
     uaddr: u64,
     max_len: usize,
 ) -> Result<Vec<u8>, Errno> {
-    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, StepOutcome as V3};
     if uaddr == 0 || max_len == 0 {
         return Ok(Vec::new());
     }
