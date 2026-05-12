@@ -43,11 +43,18 @@ Start with:
 - To build everything needed before a QEMU run (environment check, kernel ELF,
   and initramfs/disk image), run `cargo xtask full-build [--target TARGET]
   [--skip-doctor] [--no-image]`. This is the prepare step before
-  `cargo xtask qemu`; `cargo xtask test [busybox-]smoke` chains all three.
+  `cargo xtask qemu`; `cargo xtask test [busybox-boot|smoke]` chains all three.
 - For RV64 QEMU trap or fault logs, prefer `cargo xtask fault-decode
   --target rv64-qemu` before hand-decoding `scause`/`sepc`/`stval`. The tool
   handles low-linked and high-VMA ELF layouts, direct-map classification,
-  demangling, and conservative data code-pointer candidate tracing.
+  demangling, conservative data code-pointer candidate tracing, full RV64C
+  compressed instruction decode, stack dump with heuristic code-pointer
+  scanning, and kernel panics (the panic handler emits a synthetic
+  `scause=3 sepc=<ra> stval=0` line so panics parse identically to hardware
+  traps). Key flags: `--serial <log>` (parse a full QEMU log, `--all` for
+  every trap); `--brief` (one line per trap); `--json` (structured output);
+  `--summary` (aligned table + histogram); `--color`/`--no-color`; `--user-elf`
+  (annotate user-space addresses).
 - Before declaring any task complete, do a progress catch-up in
   `docs/progress/`: update `STATUS.md` and, when useful, close or update the
   relevant JSON plan/worktree/handoff or add a dated decision/research note.
