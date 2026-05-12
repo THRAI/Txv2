@@ -420,6 +420,13 @@ impl OpenFile {
             // helper handles capacity checks, page materialisation,
             // `of.offset()` advance, and `PC.size` growth.
             RNodeBacking::PageBacked { pc } => {
+                // O_APPEND: seek to current EOF before each write. POSIX
+                // requires this seek-and-write to be atomic; our model
+                // approximates it by snapping the offset just before the
+                // write helper consumes it.
+                if self.flags.append {
+                    self.set_offset(pc.size_bytes());
+                }
                 crate::page_backed::step_write_from_kernel(pc, self, bytes, guard)
             }
             RNodeBacking::Symlink { .. } | RNodeBacking::Projected => {

@@ -35,6 +35,17 @@ static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 /// `tx_subsystems::process::execution::INIT_PROCESS`.
 static ROOT_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 
+/// Pin slot for the rootfs's root `DEntry` identity. Populated by
+/// `bind_init_cwd_and_root` with a clone of the same `Cap<DEntry>`
+/// it hands to `step_chdir(init, …)`. Each `DEntry` produced by the
+/// walker stores a `Weak<DEntry>` to its parent (`parent_hint`);
+/// `getcwd` and `step_walk`'s ascent-to-mount-root rely on those
+/// weaks upgrading. Without this pin, a `cd` away from `/` would
+/// drop the only strong `Cap` to the root identity (init's cwd),
+/// EBR-retire it, and break every `parent_hint` chain that
+/// terminates at `/`.
+static ROOT_DENTRY: SpinMutex<Option<Cap<DEntry>>> = SpinMutex::new(None);
+
 /// Global devfs-mount slot. Populated by `mount_devfs_at_dev`.
 /// Retained alongside `ROOT_MOUNT` so the mount table remains live
 /// after `init_substrate_if_ready` returns.
@@ -71,6 +82,7 @@ pub fn reset_boot_state_for_test() {
     *ROOT_MOUNT.lock() = None;
     *DEV_MOUNT.lock() = None;
     *CONSOLE_TTY.lock() = None;
+    *ROOT_DENTRY.lock() = None;
 }
 
 /// Static `CharDeviceOps` impl that forwards `write` to
@@ -639,6 +651,14 @@ impl<P: TxPlatform> CoreInit<P> {
         let root_rnode = root_mount.root().clone();
         let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode)
             .expect("bind_init_cwd_and_root: cwd dentry reservation");
+        // Pin the root dentry identity for the kernel lifetime. The
+        // walker writes `parent_hint = Weak<DEntry>` to whatever root
+        // dentry the syscall driver hands it; without a long-lived
+        // strong Cap to that specific identity, a `cd` away from `/`
+        // drops the only strong ref (init.cwd) and EBR retires the
+        // identity, breaking every subsequent `getcwd` (and every
+        // walk whose target's parent_hint chain terminates at `/`).
+        *ROOT_DENTRY.lock() = Some(root_dentry.clone());
         let _outcome = tx_subsystems::process::execution::step_chdir(&init, root_dentry);
 
         // Preopen fds 0/1/2. Each call materialises a fresh
