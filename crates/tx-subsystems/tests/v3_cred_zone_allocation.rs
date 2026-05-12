@@ -43,7 +43,7 @@ use tx_hal::{
 };
 use tx_substrate::epoch;
 use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::zone::Cap;
+use tx_subsystems::cred::adapter::step_engine::Cap;
 
 use tx_subsystems::cred::{step_setuid, CredChange, Uid};
 use tx_subsystems::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};

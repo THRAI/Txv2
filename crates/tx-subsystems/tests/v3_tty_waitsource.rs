@@ -63,10 +63,13 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use tx_substrate::epoch;
-use tx_substrate::step_v3::{InterestMask, WaitSourceId};
 use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::wake::{MailboxEvent, TaskMailbox};
-use tx_substrate::zone::{self as zone_mod, Cap, PayloadCap};
+use tx_subsystems::tty::adapter::step_engine::{
+    self as zone_mod, ByteProgress, Cap, InterestMask, PayloadCap, StepOutcome, WaitSourceId,
+};
+use tx_subsystems::tty::adapter::wait_routing::{
+    MailboxEvent, Mask, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+};
 
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
@@ -83,16 +86,16 @@ impl CharDeviceOps for NoopOps {
         &self,
         _out: &mut [u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-        tx_substrate::step_v3::StepOutcome::Done(0)
+    ) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::Done(0)
     }
 
     fn write(
         &self,
         bytes: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-        tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+    ) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::Done(bytes.len())
     }
 }
 
@@ -139,12 +142,12 @@ fn alloc_hardware_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
 }
 
 fn register<'a>(
-    source: &'a Arc<tx_substrate::wake::WaitSource>,
+    source: &'a Arc<WaitSource>,
     mailbox: &Arc<TaskMailbox>,
     interests: u64,
 ) -> (
-    tx_substrate::wake::WaitRegistrationGuard<'a>,
-    tx_substrate::wake::WaitGeneration,
+    WaitRegistrationGuard<'a>,
+    WaitGeneration,
 ) {
     let gen = mailbox.next_generation();
     let prep = source.prepare(Arc::downgrade(mailbox), gen, InterestMask::new(interests));
@@ -155,7 +158,7 @@ fn register<'a>(
 fn assert_source_fired_for(
     mailbox: &TaskMailbox,
     source: WaitSourceId,
-    generation: tx_substrate::wake::WaitGeneration,
+    generation: WaitGeneration,
     expected_overlap: u64,
 ) {
     let evt = mailbox
@@ -193,7 +196,7 @@ fn tty_wait_source_invariants_round_trip() {
 
     // ---- (1) WaitSourceId round-trip pin --------------------------
     let tty_source_id = tty.wait_source_id();
-    let tty_source: Arc<tx_substrate::wake::WaitSource> = tty.wait_source().clone();
+    let tty_source: Arc<WaitSource> = tty.wait_source().clone();
     assert_eq!(
         tty_source.id(),
         WaitSourceId::new(tty_source_id),
@@ -223,7 +226,7 @@ fn tty_wait_source_invariants_round_trip() {
 
     let legacy_channel = tx_subsystems::wait_source::lookup_wait_channel(tty_source_id)
         .expect("legacy resolver still has the carrier");
-    let mut legacy_wait = legacy_channel.wait(tx_reactor::wait::Mask::from_bits(TTY_READABLE));
+    let mut legacy_wait = legacy_channel.wait(Mask::from_bits(TTY_READABLE));
     let pre_legacy = Pin::new(&mut legacy_wait).poll(&mut cx);
     assert!(
         matches!(pre_legacy, Poll::Pending),
@@ -236,7 +239,7 @@ fn tty_wait_source_invariants_round_trip() {
     let guard = epoch::guard();
     let outcome = step_ingest(&tty, b"\n", &guard);
     drop(guard);
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use tx_subsystems::tty::adapter::step_engine::StepOutcome as V3;
     match outcome {
         V3::Done(o) => assert!(o.readable_fired, "expected readable_fired"),
         other => panic!("expected Done(_) with readable_fired, got {other:?}"),

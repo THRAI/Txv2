@@ -1,4 +1,4 @@
-//! Substrate adapter for signal.
+//! Substrate / reactor adapter for signal.
 //!
 //! Signal touches substrate via three surfaces:
 //!
@@ -9,10 +9,11 @@
 //!   `SpinMutex` — the signal-routing primitives (per-process
 //!   pending masks, etc.).
 //!
-//! Single adapter domain `step_engine` collects all of these — signal
-//! has no reactor surface and the substrate primitives are tightly
-//! coupled (every kill mutator reads under an EBR guard, looks up the
-//! target's signal-routing slot, and updates state through Cap APIs).
+//! Two adapter domains:
+//! * `step_engine` — substrate: step_v3, epoch, wake, zone.
+//! * `wait_routing` — reactor: interrupt and wait primitives used by
+//!   the D9-C interrupt-wake integration test (Channel, WaitOutcome,
+//!   WaitProtocol, InterruptSource, InterruptSummary, Reactor).
 
 use tx_platform_adapter::platform_adapter;
 
@@ -30,7 +31,7 @@ pub mod step_engine {
     pub use tx_substrate::step_v3::{
         ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     };
-    pub use tx_substrate::wake::SignalRouting;
+    pub use tx_substrate::wake::{MailboxEvent, SignalRouting, TaskMailbox};
     pub use tx_substrate::zone::{
         reserve_for, sign_for, Cap, OperationalCapExt, PayloadCap, ZoneAllocated, ZoneError,
     };
@@ -40,4 +41,15 @@ pub mod step_engine {
         let reservation = zone::reserve_for::<T>()?;
         Ok(zone::sign_for(reservation, value))
     }
+}
+
+#[platform_adapter(
+    platform = "reactor",
+    domain = "wait_routing",
+    reason = "wrap reactor interrupt and wait primitives (InterruptSource, InterruptSummary, Channel, Mask, WaitOutcome, WaitProtocol, Reactor) used by the D9-C interrupt-wake integration test"
+)]
+pub mod wait_routing {
+    pub use tx_reactor::interrupt::{InterruptSource, InterruptSummary};
+    pub use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
+    pub use tx_reactor::Reactor;
 }

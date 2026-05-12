@@ -78,7 +78,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
-mod adapter {
+pub mod adapter {
     use tx_platform_adapter::platform_adapter;
 
     #[platform_adapter(

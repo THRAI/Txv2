@@ -4,7 +4,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-pub(crate) mod adapter;
+pub mod adapter;
 pub mod aio;
 pub mod cred;
 pub mod device;

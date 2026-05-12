@@ -58,13 +58,13 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_reactor::interrupt::{InterruptSource, InterruptSummary as ReactorSummary};
-use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
-use tx_reactor::Reactor;
 use tx_substrate::epoch;
 use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::wake::TaskMailbox;
-use tx_substrate::zone::{Cap, PayloadCap};
+use tx_subsystems::signal::adapter::step_engine::{Cap, PayloadCap, TaskMailbox};
+use tx_subsystems::signal::adapter::wait_routing::{
+    Channel, InterruptSource, InterruptSummary as ReactorSummary, Mask, Reactor, WaitOutcome,
+    WaitProtocol,
+};
 
 use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::process::structure::ProcessIdentity;

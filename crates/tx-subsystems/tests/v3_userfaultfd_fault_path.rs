@@ -49,9 +49,10 @@ use tx_hal::{
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
 use tx_substrate::epoch;
-use tx_substrate::step_v3::{DelegateReply, DelegateState, TransitionOutcome, UfdReply};
 use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::wake::TaskMailbox;
+use tx_subsystems::vm::adapter::step_engine::{
+    DelegateReply, DelegateState, TaskMailbox, TransitionOutcome, UfdReply,
+};
 
 use tx_subsystems::userfaultfd::UserfaultFd;
 use tx_subsystems::vm::{
@@ -119,8 +120,8 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     // The materialize_pagebacked path needs a zero frame for the
     // private-anon read fallback; mirror the vm-tests setup so the
     // tail of fault_script can complete.
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    match tx_subsystems::vm::adapter::step_engine::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(tx_subsystems::vm::adapter::step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame: {error:?}"),
     }
     drain_to_quiescence();
@@ -264,7 +265,7 @@ fn fault_script_yields_on_agent_and_resumes_on_mark_replied() {
     // Walk the slot to recover the token id. The registry has no
     // public "iter" today; we know id starts at 1 per
     // DelegateRegistry::new docs.
-    use tx_substrate::step_v3::DelegateTokenId;
+    use tx_subsystems::vm::adapter::step_engine::DelegateTokenId;
     let token_id = DelegateTokenId::new(1);
     assert_eq!(
         registry.state(token_id),
@@ -306,8 +307,8 @@ fn fault_script_yields_on_agent_and_resumes_on_mark_replied() {
 
 #[test]
 fn await_agent_reply_repost_spurious_events_for_other_tokens() {
-    use tx_substrate::step_v3::DelegateTokenId;
-    use tx_substrate::wake::MailboxEvent;
+    use tx_subsystems::vm::adapter::step_engine::DelegateTokenId;
+    use tx_subsystems::vm::adapter::step_engine::MailboxEvent;
 
     let _g = setup();
     let ufd_cap = UserfaultFd::new_cap().expect("ufd cap");
@@ -357,7 +358,7 @@ fn await_agent_reply_repost_spurious_events_for_other_tokens() {
 
 #[test]
 fn fault_script_resolves_to_would_block_on_agent_died() {
-    use tx_substrate::step_v3::DelegateTokenId;
+    use tx_subsystems::vm::adapter::step_engine::DelegateTokenId;
 
     let _g = setup();
     let ufd_cap = UserfaultFd::new_cap().expect("ufd cap");

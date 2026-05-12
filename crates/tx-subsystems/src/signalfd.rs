@@ -64,7 +64,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-mod adapter {
+pub mod adapter {
     use tx_platform_adapter::platform_adapter;
 
     #[platform_adapter(
@@ -78,7 +78,7 @@ mod adapter {
 
         pub use tx_substrate::epoch::guard;
         pub use tx_substrate::step_v3::{
-            ByteProgress, Errno as V3Errno, InterestMask, StepOutcome, WaitSourceId,
+            ByteProgress, Errno as V3Errno, InterestMask, StepOutcome, WaitSourceId, YieldShape,
         };
         pub use tx_substrate::wake::WaitSource;
         pub use tx_substrate::zone::{Cap, Weak, Zone, ZoneAllocated, ZoneError};
