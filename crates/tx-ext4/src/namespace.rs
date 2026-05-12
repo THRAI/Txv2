@@ -37,7 +37,7 @@ fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
 // already in scope.
 
 use tx_subsystems::vfs::FsOps;
-use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, NoProgress, StepOutcome};
 
 /// Factory for `MountOutput::fs_ops`.
 ///

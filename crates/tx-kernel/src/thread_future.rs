@@ -91,7 +91,7 @@ use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, set_current_thread_payload, ThreadIdentity, ThreadPayload,
 };
 use tx_subsystems::vm::{AccessMode, UserVirtAddr, VmFault};
-use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, PayloadCap, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{Cap, PayloadCap};
 use crate::adapter::boot_runtime;
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's

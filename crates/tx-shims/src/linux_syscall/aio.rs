@@ -84,7 +84,7 @@ use tx_subsystems::wait_source;
 
 use super::{bootstrap_copy_from_user, bootstrap_copy_to_user, SyscallCtx, SyscallResult};
 use super::{EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
-use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, Cap, SpinMutex, StepOp, SubjectIdentity};
 use crate::adapter::step_engine::StepOutcome as V3Out;
 
 // === Linux negative-errno values used by the dispatcher =============

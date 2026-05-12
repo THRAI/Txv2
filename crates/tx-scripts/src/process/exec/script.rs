@@ -64,7 +64,7 @@ use super::loader::{
     SegmentFlags as ParsedSegmentFlags, ELF64_PHENT,
 };
 use super::stack::{build_initial_user_stack, AuxvFacts};
-use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 
 /// User page size — RV64 today; mirrors `vm::USER_PAGE_SIZE` so the
 /// brk-base round-up doesn't require pulling in another import.
