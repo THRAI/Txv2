@@ -589,7 +589,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out, YieldShape};
+    use super::adapter::step_engine::{
+        guard, Errno as V3Errno, StepOutcome as V3Out, YieldShape,
+    };
     use tx_substrate::testing::init_host_for_test_once;
 
     use crate::test_support::EPOCH_TEST_LOCK;
@@ -670,7 +672,7 @@ mod tests {
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let mut buf = [0u8; 4];
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_read(&payload, &mut buf, &guard, false);
         drop(guard);
         match outcome {
@@ -703,7 +705,7 @@ mod tests {
         drain_to_quiescence();
         assert_eq!(payload.writer_count_snapshot(), 0);
         let mut buf = [0u8; 4];
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_read(&payload, &mut buf, &guard, false);
         drop(guard);
         assert_eq!(outcome, V3Out::Done(0));
@@ -716,7 +718,7 @@ mod tests {
         let payload = payload_of(&reader);
         // payload pulled via reader; same identity as writer's payload.
         let _ = writer;
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let write_outcome = step_write(&payload, b"hello", &guard, false);
         assert_eq!(write_outcome, V3Out::Done(5));
         let mut buf = [0u8; 8];
@@ -733,7 +735,7 @@ mod tests {
         let payload = payload_of(&reader);
         // Fill the ring exactly to PIPE_BUF.
         let big = alloc::vec![b'x'; PIPE_BUF];
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let filled = step_write(&payload, &big, &guard, false);
         assert_eq!(filled, V3Out::Done(PIPE_BUF));
         // Next write blocks.
@@ -761,7 +763,7 @@ mod tests {
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let big = alloc::vec![b'x'; PIPE_BUF];
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let _ = step_write(&payload, &big, &guard, false);
         let outcome = step_write(&payload, b"y", &guard, true);
         drop(guard);
@@ -779,7 +781,7 @@ mod tests {
         drop(reader);
         drain_to_quiescence();
         assert_eq!(payload.reader_count_snapshot(), 0);
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_write(&payload, b"x", &guard, false);
         drop(guard);
         assert_eq!(outcome, V3Out::Err(V3Errno::EPIPE));
@@ -823,7 +825,7 @@ mod tests {
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let mut buf = [0u8; 4];
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_read(&payload, &mut buf, &guard, true);
         drop(guard);
         assert_eq!(outcome, V3Out::Err(V3Errno::EAGAIN));
@@ -877,7 +879,7 @@ mod tests {
         // A subsequent writer-side step must surface EPIPE; the
         // syscall arm in tx-shims pairs this with SIGPIPE delivery
         // before returning -EPIPE to userspace.
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_write(&payload, b"x", &guard, false);
         drop(guard);
         assert_eq!(outcome, V3Out::Err(V3Errno::EPIPE));
@@ -896,7 +898,7 @@ mod tests {
         // Reader on empty + writers closed must observe EOF (Done(0))
         // rather than parking forever.
         let mut buf = [0u8; 8];
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_read(&payload, &mut buf, &guard, false);
         drop(guard);
         assert_eq!(outcome, V3Out::Done(0));
@@ -910,7 +912,7 @@ mod tests {
     // `step_pipe2` / `step_read`. They pin the step_v3 outcome
     // catalog without crossing the tx-shims dispatch boundary.
 
-    use tx_substrate::step_v3::StepProgress;
+    use super::adapter::step_engine::StepProgress;
 
     #[test]
     fn step_pipe2_returns_done_with_reader_writer_pair() {
@@ -951,14 +953,14 @@ mod tests {
         let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let _ = writer; // hold writer alive so step_read sees writer_count > 0
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         // Seed with bytes via the (non-step_v3) write path.
         let _ = step_write(&payload, b"hello", &guard, false);
         let mut buf = [0u8; 8];
         let outcome = step_read(&payload, &mut buf, &guard, false);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Done(n) => {
+            StepOutcome::Done(n) => {
                 assert_eq!(n, 5);
                 assert_eq!(&buf[..5], b"hello");
             }
@@ -971,12 +973,12 @@ mod tests {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let mut empty: [u8; 0] = [];
         let outcome = step_read(&payload, &mut empty, &guard, false);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Done(0) => {}
+            StepOutcome::Done(0) => {}
             other => panic!("expected v3 Done(0) for empty buf, got {other:?}"),
         }
     }
@@ -987,11 +989,11 @@ mod tests {
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let mut buf = [0u8; 4];
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_read(&payload, &mut buf, &guard, true);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EAGAIN) => {}
+            StepOutcome::Err(V3Errno::EAGAIN) => {}
             other => panic!("expected v3 Err(EAGAIN), got {other:?}"),
         }
     }
@@ -1002,14 +1004,14 @@ mod tests {
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let mut buf = [0u8; 4];
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_read(&payload, &mut buf, &guard, false);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Yield {
+            StepOutcome::Yield {
                 progress,
                 shape:
-                    tx_substrate::step_v3::YieldShape::OnWaitSource {
+                    YieldShape::OnWaitSource {
                         source: carrier,
                         interests,
                     },
@@ -1034,11 +1036,11 @@ mod tests {
         drop(writer);
         drain_to_quiescence();
         let mut buf = [0u8; 4];
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_read(&payload, &mut buf, &guard, false);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Done(0) => {}
+            StepOutcome::Done(0) => {}
             other => panic!("expected v3 Done(0) for EOF, got {other:?}"),
         }
         drop(reader);
@@ -1057,11 +1059,11 @@ mod tests {
         let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let _ = writer; // hold writer alive so reader_count > 0 path is irrelevant
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_write(&payload, b"hello", &guard, false);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Done(n) => {
+            StepOutcome::Done(n) => {
                 assert_eq!(n, 5);
             }
             other => panic!("expected v3 Done(5), got {other:?}"),
@@ -1077,11 +1079,11 @@ mod tests {
         drop(reader);
         drain_to_quiescence();
         assert_eq!(payload.reader_count_snapshot(), 0);
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_write(&payload, b"x", &guard, false);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EPIPE) => {}
+            StepOutcome::Err(V3Errno::EPIPE) => {}
             other => panic!("expected v3 Err(EPIPE), got {other:?}"),
         }
         drop(writer);
@@ -1095,17 +1097,17 @@ mod tests {
         let payload = payload_of(&reader);
         // Fill the ring exactly to PIPE_BUF.
         let big = alloc::vec![b'x'; PIPE_BUF];
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let filled = step_write(&payload, &big, &guard, false);
         assert_eq!(filled, V3Out::Done(PIPE_BUF));
         // Next write blocks → Yield::OnWaitSource with empty progress.
         let outcome = step_write(&payload, b"y", &guard, false);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Yield {
+            StepOutcome::Yield {
                 progress,
                 shape:
-                    tx_substrate::step_v3::YieldShape::OnWaitSource {
+                    YieldShape::OnWaitSource {
                         source: carrier,
                         interests,
                     },
@@ -1127,12 +1129,12 @@ mod tests {
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let big = alloc::vec![b'x'; PIPE_BUF];
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let _ = step_write(&payload, &big, &guard, false);
         let outcome = step_write(&payload, b"y", &guard, true);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EAGAIN) => {}
+            StepOutcome::Err(V3Errno::EAGAIN) => {}
             other => panic!("expected v3 Err(EAGAIN), got {other:?}"),
         }
     }
@@ -1147,8 +1149,9 @@ mod step_op_wraps {
     //! the source of truth for the semantic surface; these tests pin
     //! the wrap layer.
     use super::*;
-    use tx_substrate::step_v3::{
-        ByteProgress, Errno as V3Errno, ScriptCtx, StepOp, StepOutcome, StepProgress, YieldShape,
+    use super::adapter::step_engine::{
+        guard, ByteProgress, Errno as V3Errno, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
+        StepProgress, YieldShape,
     };
     use tx_substrate::testing::init_host_for_test_once;
 
@@ -1201,7 +1204,7 @@ mod step_op_wraps {
         let mut op = Pipe2Op {
             flags: PipeFlags::default(),
         };
-        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         match outcome {
             StepOutcome::Done((reader, writer)) => {
                 assert!(reader.flags().read);
@@ -1222,7 +1225,7 @@ mod step_op_wraps {
                 nonblocking: true,
             },
         };
-        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         match outcome {
             StepOutcome::Done((reader, writer)) => {
                 assert!(reader.flags().cloexec);
@@ -1239,7 +1242,7 @@ mod step_op_wraps {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let mut empty: [u8; 0] = [];
         let mut op = ReadOp {
             payload: &payload,
@@ -1247,7 +1250,7 @@ mod step_op_wraps {
             guard: &guard,
             nonblocking: false,
         };
-        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         drop(guard);
         match outcome {
             StepOutcome::Done(0) => {}
@@ -1260,7 +1263,7 @@ mod step_op_wraps {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let mut buf = [0u8; 4];
         let mut op = ReadOp {
             payload: &payload,
@@ -1268,7 +1271,7 @@ mod step_op_wraps {
             guard: &guard,
             nonblocking: true,
         };
-        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EAGAIN) => {}
@@ -1282,7 +1285,7 @@ mod step_op_wraps {
         let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let _ = writer; // hold writer alive so step_read sees writer_count > 0
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         // Seed via the free fn.
         let _ = step_write(&payload, b"hello", &guard, false);
         let mut buf = [0u8; 8];
@@ -1292,7 +1295,7 @@ mod step_op_wraps {
             guard: &guard,
             nonblocking: false,
         };
-        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         drop(guard);
         match outcome {
             StepOutcome::Done(n) => {
@@ -1308,7 +1311,7 @@ mod step_op_wraps {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let mut buf = [0u8; 4];
         let mut op = ReadOp {
             payload: &payload,
@@ -1316,7 +1319,7 @@ mod step_op_wraps {
             guard: &guard,
             nonblocking: false,
         };
-        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         drop(guard);
         match outcome {
             StepOutcome::Yield {
@@ -1340,7 +1343,7 @@ mod step_op_wraps {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let bytes: &[u8] = &[];
         let mut op = WriteOp {
             payload: &payload,
@@ -1348,7 +1351,7 @@ mod step_op_wraps {
             guard: &guard,
             nonblocking: false,
         };
-        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         drop(guard);
         match outcome {
             StepOutcome::Done(0) => {}
@@ -1363,7 +1366,7 @@ mod step_op_wraps {
         let payload = payload_of(&reader);
         let _ = writer; // hold writer alive
         let _ = reader; // hold reader alive
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let bytes: &[u8] = b"hello";
         let mut op = WriteOp {
             payload: &payload,
@@ -1371,7 +1374,7 @@ mod step_op_wraps {
             guard: &guard,
             nonblocking: false,
         };
-        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         drop(guard);
         match outcome {
             StepOutcome::Done(n) => assert_eq!(n, 5),
@@ -1387,7 +1390,7 @@ mod step_op_wraps {
         drop(reader);
         drain_to_quiescence();
         assert_eq!(payload.reader_count_snapshot(), 0);
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let bytes: &[u8] = b"x";
         let mut op = WriteOp {
             payload: &payload,
@@ -1395,7 +1398,7 @@ mod step_op_wraps {
             guard: &guard,
             nonblocking: false,
         };
-        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EPIPE) => {}
