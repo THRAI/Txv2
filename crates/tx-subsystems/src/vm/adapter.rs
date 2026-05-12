@@ -38,7 +38,8 @@ pub mod step_engine {
     pub use tx_substrate::shootdown::{AddressSpaceShootdownBatch, ShootdownError};
     pub use tx_substrate::step_v3::{
         AbortReason, AgentCancelPolicy, ByteProgress, DelegateRegistry, DelegateReply,
-        DelegateRequest, Errno, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome,
+        DelegateRequest, Errno, InterestMask, NoProgress, PageProgress,
+        ProcessIdentity as PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
         SubjectIdentity, TokenDropPolicy, UfdAccessKind, UfdReply, UfdRequest, WaitSourceId,
         YieldShape,
     };
@@ -66,5 +67,6 @@ pub mod step_engine {
     reason = "wrap reactor Channel/Mask as vm range-lock legacy wakeup verbs"
 )]
 pub mod wait_routing {
+    pub use tx_reactor::await_agent_reply;
     pub use tx_reactor::wait::{Channel, Mask};
 }

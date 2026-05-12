@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use core::future::Future;
 use core::ptr::null;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use tx_reactor::wait::Channel;
+use crate::vm::adapter::wait_routing::Channel;
 
 const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |_| RawWaker::new(null(), &NOOP_WAKER_VTABLE),
@@ -599,11 +599,11 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
     // vme.private as Exclusive, and copy the pattern bytes.
     let pattern = [0xABu8; 16];
     let user_addr = 0x40080usize;
-    let guard = tx_substrate::epoch::guard();
+    let guard = crate::vm::adapter::step_engine::guard();
     let copied = parent.copy_to_user(tx_hal::UserPtr::new(user_addr), &pattern, &guard);
     assert_eq!(
         copied,
-        tx_substrate::step_v3::StepOutcome::Done(pattern.len()),
+        crate::vm::adapter::step_engine::StepOutcome::Done(pattern.len()),
         "parent write should publish a private page"
     );
 
@@ -612,7 +612,7 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
     let copied = parent.copy_from_user(&mut parent_read, tx_hal::UserPtr::new(user_addr), &guard);
     assert_eq!(
         copied,
-        tx_substrate::step_v3::StepOutcome::Done(pattern.len()),
+        crate::vm::adapter::step_engine::StepOutcome::Done(pattern.len()),
         "parent should read back its own write"
     );
     assert_eq!(parent_read, pattern, "parent must see its own pattern");
@@ -635,7 +635,7 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
     // Parent re-reads after fork: read fault should consult vme.private
     // (SharedCow hit) and install RO PTE pointing at the shared frame.
     // Result: parent must still see its own pattern.
-    let guard = tx_substrate::epoch::guard();
+    let guard = crate::vm::adapter::step_engine::guard();
     let mut parent_post_fork = [0u8; 16];
     let copied = parent.copy_from_user(
         &mut parent_post_fork,
@@ -644,7 +644,7 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
     );
     assert_eq!(
         copied,
-        tx_substrate::step_v3::StepOutcome::Done(pattern.len()),
+        crate::vm::adapter::step_engine::StepOutcome::Done(pattern.len()),
         "parent post-fork read must succeed"
     );
     assert_eq!(
@@ -660,7 +660,7 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
     let copied = child.copy_from_user(&mut child_read, tx_hal::UserPtr::new(user_addr), &guard);
     assert_eq!(
         copied,
-        tx_substrate::step_v3::StepOutcome::Done(pattern.len()),
+        crate::vm::adapter::step_engine::StepOutcome::Done(pattern.len()),
         "child post-fork read must succeed"
     );
     assert_eq!(
@@ -675,7 +675,7 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
     let copied = parent.copy_to_user(tx_hal::UserPtr::new(user_addr), &pattern2, &guard);
     assert_eq!(
         copied,
-        tx_substrate::step_v3::StepOutcome::Done(pattern2.len()),
+        crate::vm::adapter::step_engine::StepOutcome::Done(pattern2.len()),
         "parent post-fork write must succeed (SharedCow → Exclusive)"
     );
 
@@ -688,7 +688,7 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
     );
     assert_eq!(
         copied,
-        tx_substrate::step_v3::StepOutcome::Done(pattern2.len()),
+        crate::vm::adapter::step_engine::StepOutcome::Done(pattern2.len()),
         "parent post-write read must succeed"
     );
     assert_eq!(
@@ -707,7 +707,7 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
     );
     assert_eq!(
         copied,
-        tx_substrate::step_v3::StepOutcome::Done(pattern.len()),
+        crate::vm::adapter::step_engine::StepOutcome::Done(pattern.len()),
         "child read after parent CoW must succeed"
     );
     assert_eq!(
@@ -732,7 +732,7 @@ fn range_lock_release_fires_registered_channel_for_external_subscribers() {
         crate::wait_source::lookup_wait_channel(aspace.range_lock().wait_source_id())
             .expect("RangeLock channel registered");
     let mut wait_future =
-        Box::pin(channel.wait(tx_reactor::wait::Mask::from_bits(RANGE_LOCK_RELEASE_MASK)));
+        Box::pin(channel.wait(crate::vm::adapter::wait_routing::Mask::from_bits(RANGE_LOCK_RELEASE_MASK)));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 

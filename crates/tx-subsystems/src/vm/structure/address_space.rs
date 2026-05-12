@@ -2,8 +2,7 @@
 
 use alloc::vec::Vec;
 use tx_hal::PmapIf;
-use tx_substrate::epoch;
-use tx_substrate::zone::{Cap, Zone, ZoneAllocated};
+use crate::vm::adapter::step_engine::{epoch_mod as epoch, Cap, Zone, ZoneAllocated};
 
 #[cfg(test)]
 use crate::vm::pmap::TestPmap;

@@ -5,7 +5,7 @@ use crate::page_backed::{
     PageIndex,
 };
 use step_engine::page_allocator::{self, ZeroPolicy};
-use tx_substrate::zone::Cap;
+use crate::vm::adapter::step_engine::Cap;
 
 use super::private::{
     PrivateFrame, PrivateFrameIdentity, PrivateFrameSnapshot, PrivateFrameState, PrivatePageError,

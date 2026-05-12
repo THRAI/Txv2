@@ -22,12 +22,11 @@ use crate::vm::{
     VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization, VmFaultOutcome, VmMapCommit,
     VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest,
 };
-use tx_substrate::step_v3::{
-    AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply, DelegateRequest,
-    StepOutcome as V3StepOutcome, TokenDropPolicy, UfdAccessKind, UfdReply, UfdRequest, YieldShape,
+use crate::vm::adapter::step_engine::{
+    self as step_engine, AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply,
+    DelegateRequest, StepOutcome, StepOutcome as V3StepOutcome, TaskMailbox, TokenDropPolicy,
+    UfdAccessKind, UfdReply, UfdRequest, YieldShape,
 };
-use crate::vm::adapter::step_engine::TaskMailbox;
-use crate::vm::adapter::step_engine::{self as step_engine, StepOp, StepOutcome, SubjectIdentity};
 
 impl AddressSpace {
     pub fn resolve_fault(&self, fault: VmFault) -> Result<VmFaultOutcome, VmFaultError> {
@@ -209,7 +208,7 @@ impl AddressSpace {
     pub async fn fault_script_for_process(
         &self,
         fault: VmFault,
-        process: &tx_substrate::zone::Cap<crate::process::ProcessIdentity>,
+        process: &step_engine::Cap<crate::process::ProcessIdentity>,
         mailbox: Weak<TaskMailbox>,
     ) -> Result<PmapPublishOutcome, VmFaultError> {
         let dispatch = crate::userfaultfd::ProcessUfdDispatch::new(process, mailbox);
@@ -764,7 +763,7 @@ impl AddressSpace {
         &self,
         range: UserRange,
         guard: &Guard<'_>,
-    ) -> StepOutcome<(), tx_substrate::step_v3::PageProgress> {
+    ) -> StepOutcome<(), step_engine::PageProgress> {
         use crate::page_backed::adapter::step_engine::StepOutcome as V3;
         let entries = self.recipes.snapshot(guard);
         let mut visited: BTreeSet<u32> = BTreeSet::new();
@@ -969,7 +968,7 @@ async fn dispatch_ufd_fault<D: UfdDispatch>(
     // The agent-side mark_replied happens via UFFDIO_COPY / ZEROPAGE
     // (phase 5). For phase 4 the test drives mark_replied directly
     // to exercise the plumbing.
-    let outcome = tx_reactor::await_agent_reply(token_id, &mailbox_arc, target.registry).await;
+    let outcome = crate::vm::adapter::wait_routing::await_agent_reply(token_id, &mailbox_arc, target.registry).await;
     // Drop the guard *after* the await — if the agent replied
     // successfully the CancelOnDrop transition is a no-op
     // (LateNoOp(Replied)); if the await aborted (AgentDied / Canceled

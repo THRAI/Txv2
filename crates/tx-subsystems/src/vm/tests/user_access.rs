@@ -3,13 +3,13 @@ use crate::execution::Errno;
 use alloc::vec;
 use alloc::vec::Vec;
 use tx_hal::UserPtr;
-use tx_substrate::step_v3::StepOutcome;
+use crate::vm::adapter::step_engine::StepOutcome;
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
     crate::zones::register_all().expect("kernel zones");
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    match crate::vm::adapter::step_engine::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(crate::vm::adapter::step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for VM user-access tests: {error:?}"),
     }
 }
@@ -41,7 +41,7 @@ fn vm_copy_to_user_then_copy_from_user_walks_recipes_and_pmap() {
         .map(|i| (i & 0xff) as u8)
         .collect();
     map_private(&aspace, user_addr, payload.len(), Prot::READ_WRITE);
-    let guard = tx_substrate::epoch::guard();
+    let guard = crate::vm::adapter::step_engine::guard();
 
     let copied = aspace.copy_to_user(UserPtr::new(user_addr), &payload, &guard);
     assert_eq!(copied, StepOutcome::Done(payload.len()));
@@ -62,7 +62,7 @@ fn vm_copy_from_user_rejects_unmapped_pointer_before_kernel_copy() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let mut observed = [0xAAu8; 8];
-    let guard = tx_substrate::epoch::guard();
+    let guard = crate::vm::adapter::step_engine::guard();
 
     let copied = aspace.copy_from_user(&mut observed, UserPtr::new(0x8000), &guard);
 
@@ -78,7 +78,7 @@ fn vm_copy_to_user_rejects_read_only_recipe() {
     let user_addr = 0x10_000;
     map_private(&aspace, user_addr, 16, Prot::READ);
     let payload = [0x5Au8; 16];
-    let guard = tx_substrate::epoch::guard();
+    let guard = crate::vm::adapter::step_engine::guard();
 
     let copied = aspace.copy_to_user(UserPtr::new(user_addr), &payload, &guard);
 

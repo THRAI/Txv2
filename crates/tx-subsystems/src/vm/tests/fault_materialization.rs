@@ -88,7 +88,7 @@ fn vm_fault_materializes_pagebacked_anon_page_from_recipe_offset() {
 #[test]
 fn vm_fault_private_anon_read_uses_zero_frame_read_only() {
     setup_host_substrate();
-    let zero_ppn = tx_substrate::page_allocator::zero_frame_ppn().expect("zero frame");
+    let zero_ppn = crate::vm::adapter::step_engine::page_allocator::zero_frame_ppn().expect("zero frame");
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x5000, 1),
@@ -128,7 +128,7 @@ fn vm_fault_private_anon_read_uses_zero_frame_read_only() {
 #[test]
 fn vm_fault_private_anon_write_uses_fresh_private_frame() {
     setup_host_substrate();
-    let zero_ppn = tx_substrate::page_allocator::zero_frame_ppn().expect("zero frame");
+    let zero_ppn = crate::vm::adapter::step_engine::page_allocator::zero_frame_ppn().expect("zero frame");
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
         range(0x6000, 1),
@@ -274,7 +274,7 @@ fn vm_fault_map_private_write_copies_source_page_contents() {
         .expect("read materializes shared page");
     let shared_ppn = read_materialized.page.ppn;
     let source_pattern = [0x41, 0x42, 0x43, 0x44, 0xd0, 0xd1, 0xd2, 0xd3];
-    tx_substrate::page_allocator::testing::write_frame_bytes_for_test(
+    crate::vm::adapter::step_engine::page_allocator::testing::write_frame_bytes_for_test(
         shared_ppn,
         128,
         &source_pattern,
@@ -291,14 +291,14 @@ fn vm_fault_map_private_write_copies_source_page_contents() {
         .expect("write CoW materializes private page");
     let private_ppn = write_materialized.page.ppn;
     let mut copied = [0u8; 8];
-    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(private_ppn, 128, &mut copied);
+    crate::vm::adapter::step_engine::page_allocator::testing::read_frame_bytes_for_test(private_ppn, 128, &mut copied);
 
     assert_ne!(private_ppn, shared_ppn);
     assert_eq!(copied, source_pattern);
 
-    tx_substrate::page_allocator::testing::write_frame_bytes_for_test(private_ppn, 128, &[0x55; 8]);
+    crate::vm::adapter::step_engine::page_allocator::testing::write_frame_bytes_for_test(private_ppn, 128, &[0x55; 8]);
     let mut source_after_private_write = [0u8; 8];
-    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(
+    crate::vm::adapter::step_engine::page_allocator::testing::read_frame_bytes_for_test(
         shared_ppn,
         128,
         &mut source_after_private_write,
@@ -342,10 +342,10 @@ fn vm_fault_pagebacked_rejects_access_past_pc_size_with_sigbus_shape() {
         _ => unreachable!("page_backing returns VmBacking::Page"),
     };
 
-    let truncate_guard = tx_substrate::epoch::guard();
+    let truncate_guard = crate::vm::adapter::step_engine::guard();
     assert_eq!(
         crate::page_backed::step_truncate(&pc_cap, USER_PAGE_SIZE as u64, &truncate_guard),
-        tx_substrate::step_v3::StepOutcome::Done(())
+        crate::vm::adapter::step_engine::StepOutcome::Done(())
     );
     drop(truncate_guard);
 
@@ -385,10 +385,10 @@ fn vm_fault_pagebacked_rejects_write_past_pc_size_before_cow_replacement() {
         _ => unreachable!("page_backing returns VmBacking::Page"),
     };
 
-    let truncate_guard = tx_substrate::epoch::guard();
+    let truncate_guard = crate::vm::adapter::step_engine::guard();
     assert_eq!(
         crate::page_backed::step_truncate(&pc_cap, USER_PAGE_SIZE as u64, &truncate_guard),
-        tx_substrate::step_v3::StepOutcome::Done(())
+        crate::vm::adapter::step_engine::StepOutcome::Done(())
     );
     drop(truncate_guard);
 
@@ -421,10 +421,10 @@ fn vm_fault_pagebacked_admits_first_byte_of_partially_filled_page() {
         _ => unreachable!("page_backing returns VmBacking::Page"),
     };
 
-    let truncate_guard = tx_substrate::epoch::guard();
+    let truncate_guard = crate::vm::adapter::step_engine::guard();
     assert_eq!(
         crate::page_backed::step_truncate(&pc_cap, USER_PAGE_SIZE as u64 + 1, &truncate_guard),
-        tx_substrate::step_v3::StepOutcome::Done(())
+        crate::vm::adapter::step_engine::StepOutcome::Done(())
     );
     drop(truncate_guard);
 
