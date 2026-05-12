@@ -1,6 +1,8 @@
 use std::fs;
+use std::io::IsTerminal;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use addr2line::Loader;
 use gimli::RunTimeEndian;
@@ -9,6 +11,20 @@ use object::{Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind};
 use crate::target::TxTarget;
 use crate::util::{optional_option_value, resolve_path};
 use crate::Result;
+
+static COLOR_ENABLED: AtomicBool = AtomicBool::new(false);
+
+const ANSI_RESET:  &str = "\x1b[0m";
+const ANSI_BOLD:   &str = "\x1b[1m";
+const ANSI_RED:    &str = "\x1b[31m";
+#[allow(dead_code)]
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_CYAN:   &str = "\x1b[36m";
+const ANSI_GREEN:  &str = "\x1b[32m";
+
+fn color_enabled() -> bool { COLOR_ENABLED.load(Ordering::Relaxed) }
+fn col(code: &'static str) -> &'static str { if color_enabled() { code } else { "" } }
+fn col_reset() -> &'static str { if color_enabled() { ANSI_RESET } else { "" } }
 
 const RV64_KERNEL_WINDOW_SIZE: u64 = 512 * 1024 * 1024;
 const RV64_USER_TOP: u64 = 0x0000_0040_0000_0000;
@@ -21,6 +37,7 @@ const RV64_REG_NAMES: [&str; 32] = [
 
 pub(crate) fn fault_decode(root: &Path, args: Vec<String>) -> Result<()> {
     let config = FaultDecodeConfig::parse(root, &args)?;
+    COLOR_ENABLED.store(config.color, Ordering::Relaxed);
     let spec = TargetSpec::for_target(config.target, root)?;
     let elf_path = config.elf.unwrap_or_else(|| spec.elf_path.clone());
     let image = ElfImage::load(&elf_path, &spec)?;
@@ -29,7 +46,7 @@ pub(crate) fn fault_decode(root: &Path, args: Vec<String>) -> Result<()> {
         .and_then(|path| ElfImage::load_user(path).ok());
 
     if !config.json {
-        println!("txKernel fault-decode: {}", spec.name);
+        println!("{}txKernel fault-decode:{} {}", col(ANSI_BOLD), col_reset(), spec.name);
         println!("ELF: {}", elf_path.display());
         if let Some(id) = &image.build_id {
             println!("build-id: {id}");
@@ -110,6 +127,7 @@ struct FaultDecodeConfig {
     brief: bool,
     json: bool,
     summary: bool,
+    color: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +149,15 @@ impl FaultDecodeConfig {
         let brief = args.iter().any(|arg| arg == "--brief");
         let json = args.iter().any(|arg| arg == "--json");
         let summary = args.iter().any(|arg| arg == "--summary");
+        let color_flag = args.iter().any(|a| a == "--color");
+        let no_color_flag = args.iter().any(|a| a == "--no-color");
+        let color = if no_color_flag {
+            false
+        } else if color_flag {
+            true
+        } else {
+            std::io::stdout().is_terminal()
+        };
 
         let input = if let Some(path) = optional_option_value(args, "--serial") {
             FaultDecodeInput::Serial {
@@ -150,6 +177,7 @@ impl FaultDecodeConfig {
                     stval: parse_u64_value(&stval)?,
                     frame: None,
                     fp_chain: vec![],
+                    stack_dump: vec![],
                     panic_msg: None,
                 }),
                 (None, None, None) => {
@@ -163,7 +191,7 @@ impl FaultDecodeConfig {
             }
         };
 
-        Ok(Self { target, elf, input, user_elf, brief, json, summary })
+        Ok(Self { target, elf, input, user_elf, brief, json, summary, color })
     }
 }
 
@@ -177,6 +205,8 @@ struct TrapRecord {
     /// innermost-first order. fp[0].saved_ra == the return address of the
     /// faulting function; fp[1].saved_ra == its caller's, etc.
     fp_chain: Vec<(u64, u64)>,
+    /// Stack memory words: (address, value) pairs, innermost-first.
+    stack_dump: Vec<(u64, u64)>,
     /// Panic message from the serial log seen within 30 lines before this trap.
     panic_msg: Option<String>,
 }
@@ -966,19 +996,31 @@ fn parse_traps(serial: &str) -> Vec<TrapRecord> {
             let (frame, consumed) = parse_trapframe_block(&lines[next + 1..]);
             trap.frame = frame;
             index = next + 1 + consumed;
-
-            // Look for an optional fp chain: block immediately after the trapframe.
-            let mut fp_next = index;
-            while fp_next < lines.len() && lines[fp_next].trim().is_empty() {
-                fp_next += 1;
-            }
-            if fp_next < lines.len() && lines[fp_next].trim() == "fp chain:" {
-                let (chain, fp_consumed) = parse_fp_chain_block(&lines[fp_next + 1..]);
-                trap.fp_chain = chain;
-                index = fp_next + 1 + fp_consumed;
-            }
         } else {
             index += 1;
+        }
+
+        // Look for optional fp chain: after trapframe (hardware trap) or directly
+        // after the trap summary line (panic path, which has no trapframe block).
+        let mut fp_next = index;
+        while fp_next < lines.len() && lines[fp_next].trim().is_empty() {
+            fp_next += 1;
+        }
+        if fp_next < lines.len() && lines[fp_next].trim() == "fp chain:" {
+            let (chain, fp_consumed) = parse_fp_chain_block(&lines[fp_next + 1..]);
+            trap.fp_chain = chain;
+            index = fp_next + 1 + fp_consumed;
+        }
+
+        // Look for optional stack dump: block after fp chain (or trapframe).
+        let mut sd_next = index;
+        while sd_next < lines.len() && lines[sd_next].trim().is_empty() {
+            sd_next += 1;
+        }
+        if sd_next < lines.len() && lines[sd_next].trim().starts_with("stack dump:") {
+            let (dump, sd_consumed) = parse_stack_dump_block(&lines[sd_next..]);
+            trap.stack_dump = dump;
+            index = sd_next + sd_consumed;
         }
 
         traps.push(trap);
@@ -994,6 +1036,7 @@ fn parse_trap_summary(line: &str) -> Option<TrapRecord> {
         stval: parse_value_after_key(line, "stval")?,
         frame: None,
         fp_chain: vec![],
+        stack_dump: vec![],
         panic_msg: None,
     })
 }
@@ -1061,6 +1104,65 @@ fn parse_fp_chain_block(lines: &[&str]) -> (Vec<(u64, u64)>, usize) {
         }
     }
     (chain, consumed)
+}
+
+fn parse_stack_dump_block(lines: &[&str]) -> (Vec<(u64, u64)>, usize) {
+    let mut dump = Vec::new();
+    let Some(first) = lines.first() else {
+        return (dump, 0);
+    };
+    if !first.trim().starts_with("stack dump:") {
+        return (dump, 0);
+    }
+    let mut consumed = 1;
+    for line in &lines[1..] {
+        if line.trim().is_empty() || !(line.starts_with(' ') || line.starts_with('\t')) {
+            break;
+        }
+        consumed += 1;
+        // "  0x<ADDR>: 0x<W0> 0x<W1> 0x<W2> 0x<W3>"
+        let trimmed = line.trim();
+        let Some((addr_part, rest)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let Ok(base_addr) = parse_u64_value(addr_part.trim()) else {
+            continue;
+        };
+        for (word_idx, word_str) in rest.split_whitespace().enumerate() {
+            let Ok(word) = parse_u64_value(word_str) else {
+                continue;
+            };
+            dump.push((base_addr.wrapping_add(word_idx as u64 * 8), word));
+        }
+    }
+    (dump, consumed)
+}
+
+fn scan_stack_code_pointers(
+    dump: &[(u64, u64)],
+    image: &ElfImage,
+    spec: &TargetSpec,
+) -> Vec<(u64, u64, String)> {
+    let text_ranges = image.text_ranges();
+    if text_ranges.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &(stack_addr, word) in dump {
+        if word == 0 {
+            continue;
+        }
+        let candidates = address_candidates(word, image.layout, spec);
+        if !candidates.iter().any(|c| text_ranges.iter().any(|r| r.contains(&c.address))) {
+            continue;
+        }
+        let resolved = image.select_candidate(&candidates).map(|c| c.address).unwrap_or(word);
+        let sym = nearest_symbol(&image.symbols, resolved)
+            .map(|(name, off)| if off == 0 { name } else { format!("{name}+{off:#x}") })
+            .unwrap_or_else(|| format_hex(resolved));
+        out.push((stack_addr, word, sym));
+    }
+    out
 }
 
 fn parse_value_after_key(line: &str, key: &str) -> Option<u64> {
@@ -1388,7 +1490,7 @@ fn print_trap_block(index: usize, trap: &TrapRecord, image: &ElfImage, user_imag
 
     println!("trap #{index}");
     println!();
-    println!("fault: {}  ({}{})", scause.name, format_hex(scause.raw), mode_suffix);
+    println!("fault: {}{}{}{}  ({}{})", col(ANSI_RED), col(ANSI_BOLD), scause.name, col_reset(), format_hex(scause.raw), mode_suffix);
     println!();
 
     println!("call stack:");
@@ -1422,6 +1524,17 @@ fn print_trap_block(index: usize, trap: &TrapRecord, image: &ElfImage, user_imag
         println!("  (no trap frame — ra unavailable)");
     }
     println!();
+
+    if !trap.stack_dump.is_empty() {
+        let code_ptrs = scan_stack_code_pointers(&trap.stack_dump, image, spec);
+        if !code_ptrs.is_empty() {
+            println!("stack code pointers (heuristic):");
+            for (stack_addr, word, sym) in &code_ptrs {
+                println!("  {}  →  {sym}  [sp+{:#x}]", format_hex(*word), stack_addr.wrapping_sub(trap.stack_dump[0].0));
+            }
+            println!();
+        }
+    }
 
     if let Some(frame) = &trap.frame {
         print_trapframe_dump(frame, image, user_image, spec);
@@ -1592,20 +1705,20 @@ fn print_trapframe_dump(frame: &TrapFrameDump, image: &ElfImage, user_image: Opt
             note
         };
         println!(
-            "  x{index:02} ({:>4}): {}{}",
-            RV64_REG_NAMES[index],
-            format_hex(*value),
+            "  x{index:02} ({}{:>4}{}): {}{}{}{}",
+            col(ANSI_GREEN), RV64_REG_NAMES[index], col_reset(),
+            col(ANSI_CYAN), format_hex(*value), col_reset(),
             note
         );
     }
     let scause = decode_scause(frame.scause);
-    println!("  scause:  {}  ({})", format_hex(scause.raw), scause.name);
-    println!("  sepc:    {}", format_hex(frame.sepc));
-    println!("  stval:   {}", format_hex(frame.stval));
+    println!("  scause:  {}{}{}  ({})", col(ANSI_CYAN), format_hex(scause.raw), col_reset(), scause.name);
+    println!("  sepc:    {}{}{}", col(ANSI_CYAN), format_hex(frame.sepc), col_reset());
+    println!("  stval:   {}{}{}", col(ANSI_CYAN), format_hex(frame.stval), col_reset());
     let ss = decode_sstatus(frame.sstatus);
     println!(
-        "  sstatus: {}  spp={} spie={} sie={} fs={} sum={} mxr={}",
-        format_hex(ss.raw),
+        "  sstatus: {}{}{}  spp={} spie={} sie={} fs={} sum={} mxr={}",
+        col(ANSI_CYAN), format_hex(ss.raw), col_reset(),
         ss.spp_label(),
         ss.spie as u8,
         ss.sie as u8,
@@ -2098,6 +2211,21 @@ fn build_json_trap(
         .map(|f| Value::String(decode_sstatus(f.sstatus).spp_label().to_string()))
         .unwrap_or(Value::Null);
 
+    let stack_code_ptrs: Vec<Value> = if !trap.stack_dump.is_empty() {
+        scan_stack_code_pointers(&trap.stack_dump, image, spec)
+            .into_iter()
+            .map(|(addr, word, sym)| {
+                json!({
+                    "sp_addr": format_hex(addr),
+                    "value": format_hex(word),
+                    "symbol": sym,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     json!({
         "trap": index,
         "scause": {
@@ -2116,6 +2244,7 @@ fn build_json_trap(
         "from_mode": from_mode,
         "call_stack": frames,
         "trapframe": trapframe_json,
+        "stack_code_pointers": stack_code_ptrs,
     })
 }
 
@@ -2170,6 +2299,7 @@ txkernel:qemu-riscv64-virt:trap scause=0xf sepc=0x80219096 stval=0x0
                     stval: 0xffff_ffc0_8000_0000,
                     frame: None,
                     fp_chain: vec![],
+                    stack_dump: vec![],
                     panic_msg: None,
                 },
                 TrapRecord {
@@ -2178,6 +2308,7 @@ txkernel:qemu-riscv64-virt:trap scause=0xf sepc=0x80219096 stval=0x0
                     stval: 0,
                     frame: None,
                     fp_chain: vec![],
+                    stack_dump: vec![],
                     panic_msg: None,
                 },
             ]
@@ -2746,6 +2877,7 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
             stval: 0x0,
             frame: None,
             fp_chain: vec![],
+            stack_dump: vec![],
             panic_msg: None,
         };
         let val = build_json_trap(1, &trap, &image, &spec);
@@ -2822,6 +2954,7 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
                 stval: 0x48,
                 frame: None,
                 fp_chain: vec![],
+                stack_dump: vec![],
                 panic_msg: None,
             },
             TrapRecord {
@@ -2830,6 +2963,7 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
                 stval: 0x8020_3000,
                 frame: None,
                 fp_chain: vec![],
+                stack_dump: vec![],
                 panic_msg: Some("panic!".to_string()),
             },
             TrapRecord {
@@ -2838,6 +2972,7 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
                 stval: 0x8020_5000,
                 frame: None,
                 fp_chain: vec![],
+                stack_dump: vec![],
                 panic_msg: None,
             },
         ];
@@ -2869,5 +3004,116 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
             .collect();
         let config = FaultDecodeConfig::parse(root, &args).expect("parse must succeed");
         assert!(config.summary, "expected summary == true");
+    }
+
+    #[test]
+    fn parses_fp_chain_without_trapframe() {
+        // Panic path: scause/sepc/stval line followed directly by fp chain: (no trapframe block).
+        let serial = concat!(
+            "txkernel:panic: index out of bounds\n",
+            "scause=0x0000000000000003 sepc=0xffffffff80209000 stval=0x0000000000000000\n",
+            "fp chain:\n",
+            "  fp=0xffffffff80218f80 ra=0xffffffff80209000\n",
+            "  fp=0xffffffff80218fa0 ra=0xffffffff80205500\n",
+        );
+        let traps = parse_traps(serial);
+        assert_eq!(traps.len(), 1);
+        let trap = &traps[0];
+        assert_eq!(trap.scause, 3);
+        assert_eq!(trap.sepc, 0xffffffff80209000);
+        assert!(trap.frame.is_none());
+        assert_eq!(
+            trap.fp_chain,
+            vec![
+                (0xffffffff80218f80, 0xffffffff80209000),
+                (0xffffffff80218fa0, 0xffffffff80205500),
+            ]
+        );
+        assert!(trap.panic_msg.is_none()); // panic line doesn't match standard panic patterns
+    }
+
+    #[test]
+    fn parses_stack_dump_block() {
+        let lines = [
+            "stack dump: sp=0xffffffff80218f70",
+            "  0xffffffff80218f70: 0xffffffff80219000 0x0000000000000001 0xffffffff80218fa0 0x0000000000000002",
+            "  0xffffffff80218f90: 0x0000000000000003 0x0000000000000000 0x0000000000000000 0x0000000000000000",
+            "not-indented",
+        ];
+        let line_refs: Vec<&str> = lines.iter().copied().collect();
+        let (dump, consumed) = parse_stack_dump_block(&line_refs);
+        assert_eq!(consumed, 3); // header + 2 data lines
+        assert_eq!(dump.len(), 8);
+        assert_eq!(dump[0], (0xffffffff80218f70, 0xffffffff80219000));
+        assert_eq!(dump[1], (0xffffffff80218f78, 0x0000000000000001));
+        assert_eq!(dump[4], (0xffffffff80218f90, 0x0000000000000003));
+    }
+
+    #[test]
+    fn parses_stack_dump_after_fp_chain() {
+        let serial = concat!(
+            "scause=0x0000000000000003 sepc=0xffffffff80209000 stval=0x0000000000000000\n",
+            "fp chain:\n",
+            "  fp=0xffffffff80218f80 ra=0xffffffff80209000\n",
+            "stack dump: sp=0xffffffff80218f70\n",
+            "  0xffffffff80218f70: 0xffffffff80219000 0x0000000000000001 0x0000000000000000 0x0000000000000000\n",
+        );
+        let traps = parse_traps(serial);
+        assert_eq!(traps.len(), 1);
+        let trap = &traps[0];
+        assert_eq!(trap.fp_chain.len(), 1);
+        assert_eq!(trap.stack_dump.len(), 4);
+        assert_eq!(trap.stack_dump[0], (0xffffffff80218f70, 0xffffffff80219000));
+    }
+
+    #[test]
+    fn scan_stack_code_pointers_finds_code_words() {
+        let spec = TargetSpec::rv64_qemu();
+        let image = ElfImage {
+            bytes: Vec::new(),
+            layout: KernelLinkMode::LowLinkedHighAlias {
+                elf_base: spec.kernel_phys_base,
+                high_alias_base: spec.kernel_virt_base,
+            },
+            loader: None,
+            sections: vec![SectionInfo {
+                name: ".text".into(),
+                address: 0x8020_0000,
+                size: 0x0010_0000,
+                kind: SectionKind::Text,
+                data: None,
+            }],
+            symbols: vec![SymbolInfo {
+                name: "some_fn".into(),
+                address: 0x8020_1000,
+                size: 0x80,
+            }],
+            build_id: None,
+        };
+
+        // A stack word that is a code pointer (in text range) and one that is data.
+        let dump = vec![
+            (0xffffffff80218f70u64, 0x8020_1040u64), // code pointer
+            (0xffffffff80218f78u64, 0x0000_0000_0000_0042u64), // data, not code
+        ];
+        let ptrs = scan_stack_code_pointers(&dump, &image, &spec);
+        assert_eq!(ptrs.len(), 1);
+        assert_eq!(ptrs[0].0, 0xffffffff80218f70);
+        assert!(ptrs[0].2.contains("some_fn"), "got '{}'", ptrs[0].2);
+    }
+
+    #[test]
+    fn color_codes_absent_when_disabled() {
+        COLOR_ENABLED.store(false, Ordering::Relaxed);
+        assert_eq!(col(ANSI_RED), "");
+        assert_eq!(col_reset(), "");
+    }
+
+    #[test]
+    fn color_codes_present_when_enabled() {
+        COLOR_ENABLED.store(true, Ordering::Relaxed);
+        assert_eq!(col(ANSI_RED), "\x1b[31m");
+        assert_eq!(col_reset(), "\x1b[0m");
+        COLOR_ENABLED.store(false, Ordering::Relaxed);
     }
 }
