@@ -8,7 +8,7 @@
 //! with roles; [`TimerGuard`] is the RAII handle that cancels the
 //! registration on drop.
 //!
-//! The reactor's internal [`tx_reactor::timer::TimerQueue`] — which
+//! The reactor's internal `timer::TimerQueue` — which
 //! holds the actual `Waker`s and drives `WaitProtocol::*Timeout`
 //! paths — continues to live in `tx-reactor` and is unrelated to
 //! this surface.
