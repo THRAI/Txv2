@@ -10,6 +10,7 @@
 //! All public types are re-exported here so external imports keep using
 //! `crate::vfs::FooBar` paths.
 
+pub mod adapter;
 pub mod checks;
 pub mod execution;
 pub mod structure;

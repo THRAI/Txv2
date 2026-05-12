@@ -4,6 +4,18 @@
 
 ## Current Shape
 
+- 2026-05-12 D19 Phase 2 adapter migration LANDED. Two multi-file
+  core subsystems migrated to `#[platform_adapter]`: `process/`
+  and `vfs/`. Both use one `adapter.rs` consumed by multiple
+  sibling files. Same two-domain shape (`step_engine` + stacked
+  `wait_routing`). **Boundary report:** substrate outside-adapter
+  2420 → 2257 (cumulative −290), inside 27 → 40; reactor outside
+  70 → 64 (cumulative −8), inside 4 → 6; adapters declared 9 → 15.
+  7:1 bundling ratio. **Verified:** process + vfs lib tests pass;
+  full tx-subsystems lib suite still 623 passing single-threaded;
+  `cargo xtask lint arch` ok. ADR:
+  `2026-05-12-d19-phase2-adapter-migration.md`.
+
 - 2026-05-12 D18 Phase 1 adapter migration LANDED. Four single-file
   subsystems migrated to `#[platform_adapter]` boundary modules:
   `mount` (one `runtime` domain — zone role types + SpinMutex +
