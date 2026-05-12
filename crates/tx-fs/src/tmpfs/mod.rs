@@ -23,8 +23,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_substrate::zone::Cap;
-use tx_substrate::SpinMutex;
+pub mod adapter;
+
+use adapter::step_engine::{
+    self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome,
+};
+
 use tx_subsystems::cred::Capability;
 use tx_subsystems::execution::Guard;
 use tx_subsystems::page_backed::{
@@ -166,7 +170,7 @@ impl Default for Tmpfs {
 // === FsOps + FsPageBacking impls =======================================
 //
 // Each method owns its implementation and emits
-// `tx_substrate::step_v3::StepOutcome` directly.
+// `StepOutcome` directly.
 //
 // Tmpfs is one-shot through every method, with two real wait points:
 //
@@ -208,25 +212,25 @@ impl FsOps for Tmpfs {
         parent: FsObjectId,
         name: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<FsObjectId, NoProgress> {
         // `InlineName::new` is the canonical name-validity check
         // (rejects empty, oversized, or `/` -bearing names). The
         // inline name is also the directory BTreeMap key now that
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let state = self.state.lock();
         let Some(parent_inode) = state.inodes.get(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
         match children.get(&inline) {
-            Some(id) => tx_substrate::step_v3::StepOutcome::done(*id),
-            None => tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT),
+            Some(id) => StepOutcome::done(*id),
+            None => StepOutcome::err(step_engine::Errno::ENOENT),
         }
     }
 
@@ -234,7 +238,7 @@ impl FsOps for Tmpfs {
         &self,
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<InodeMeta, NoProgress> {
         let state = self.state.lock();
         match state.inodes.get(&fs_object_id) {
             Some(inode) => {
@@ -242,9 +246,9 @@ impl FsOps for Tmpfs {
                 if let TmpfsPayload::RegularFile { size, .. } = &inode.payload {
                     meta.size = *size;
                 }
-                tx_substrate::step_v3::StepOutcome::done(meta)
+                StepOutcome::done(meta)
             }
-            None => tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT),
+            None => StepOutcome::err(step_engine::Errno::ENOENT),
         }
     }
 
@@ -253,10 +257,10 @@ impl FsOps for Tmpfs {
         fs_object_id: FsObjectId,
         meta: &InodeMeta,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         let mut state = self.state.lock();
         let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         // Preserve the IFMT bits from the existing meta — the kind is
         // determined at create time and must not be mutated through
@@ -270,7 +274,7 @@ impl FsOps for Tmpfs {
             ..*meta
         };
         inode.meta = new_meta;
-        tx_substrate::step_v3::StepOutcome::done(())
+        StepOutcome::done(())
     }
 
     fn create_inode(
@@ -280,9 +284,9 @@ impl FsOps for Tmpfs {
         mode: u16,
         cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
+    ) -> StepOutcome<
         (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
+        NoProgress,
     > {
         // `InlineName::new` is the canonical name-validity check
         // (rejects empty, oversized, or `/` -bearing names). The
@@ -290,14 +294,14 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         // Day-1 tmpfs only handles regular files via `create_inode`.
         // Directories arrive through `mkdir`, symlinks through
         // `symlink`. Reject anything else with `EINVAL`.
         let kind_bits = mode & S_IFMT;
         if kind_bits != 0 && kind_bits != S_IFREG {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EINVAL);
+            return StepOutcome::err(step_engine::Errno::EINVAL);
         }
         let mode = (mode & !S_IFMT) | S_IFREG;
 
@@ -309,8 +313,8 @@ impl FsOps for Tmpfs {
         ) {
             Ok(cap) => cap,
             Err(_) => {
-                return tx_substrate::step_v3::StepOutcome::err(
-                    tx_substrate::step_v3::Errno::ENOMEM,
+                return StepOutcome::err(
+                    step_engine::Errno::ENOMEM,
                 );
             }
         };
@@ -323,13 +327,13 @@ impl FsOps for Tmpfs {
 
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
         if children.contains_key(&inline) {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EEXIST);
+            return StepOutcome::err(step_engine::Errno::EEXIST);
         }
         children.insert(inline, new_id);
 
@@ -341,7 +345,7 @@ impl FsOps for Tmpfs {
             },
         );
 
-        tx_substrate::step_v3::StepOutcome::done((new_id, meta))
+        StepOutcome::done((new_id, meta))
     }
 
     fn unlink(
@@ -350,33 +354,33 @@ impl FsOps for Tmpfs {
         name: &[u8],
         target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         // `InlineName::new` is the canonical name-validity check
         // (rejects empty, oversized, or `/` -bearing names). The
         // inline name is also the directory BTreeMap key now that
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
         let Some(found_id) = children.get(&inline).copied() else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         if found_id != target {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         }
         // Reject directory targets — those go through `rmdir`.
         if let Some(target_inode) = state.inodes.get(&found_id) {
             if matches!(target_inode.payload, TmpfsPayload::Directory(_)) {
-                return tx_substrate::step_v3::StepOutcome::err(
-                    tx_substrate::step_v3::Errno::EISDIR,
+                return StepOutcome::err(
+                    step_engine::Errno::EISDIR,
                 );
             }
         }
@@ -388,7 +392,7 @@ impl FsOps for Tmpfs {
             children.remove(&inline);
         }
         state.inodes.remove(&found_id);
-        tx_substrate::step_v3::StepOutcome::done(())
+        StepOutcome::done(())
     }
 
     fn rename(
@@ -398,34 +402,34 @@ impl FsOps for Tmpfs {
         new_parent: FsObjectId,
         new_name: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         // TODO(phase-vfs-rename-xdir): cross-directory rename. Day-1
         // ships same-directory rename; cross-directory needs the
         // walker + dentry rebinding seam to land first.
         if old_parent != new_parent {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS);
+            return StepOutcome::err(step_engine::Errno::ENOSYS);
         }
         let old_key = match InlineName::new(old_name) {
             Ok(n) => n,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let new_key = match InlineName::new(new_name) {
             Ok(n) => n,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         if old_key == new_key {
-            return tx_substrate::step_v3::StepOutcome::done(());
+            return StepOutcome::done(());
         }
 
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&old_parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
         let Some(target_id) = children.remove(&old_key) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         // If a file exists at the destination, replace it (POSIX
         // rename semantics for same-type-collision; cross-type
@@ -434,7 +438,7 @@ impl FsOps for Tmpfs {
         if let Some(displaced_id) = displaced {
             state.inodes.remove(&displaced_id);
         }
-        tx_substrate::step_v3::StepOutcome::done(())
+        StepOutcome::done(())
     }
 
     fn link(
@@ -443,14 +447,14 @@ impl FsOps for Tmpfs {
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         // Hard links are out of scope for Phase 3b; tmpfs day-1 maps
         // each child name to a single owning inode and refcounts via
         // the parent's BTreeMap. Adding `link` requires a full nlink
         // counter pass on `unlink`/`rmdir`/`destroy_inode`.
         // TODO(phase-vfs-tmpfs-link): implement when nlink semantics
         // land in the broader VFS layer.
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+        StepOutcome::err(step_engine::Errno::ENOSYS)
     }
 
     fn mkdir(
@@ -460,9 +464,9 @@ impl FsOps for Tmpfs {
         mode: u16,
         cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
+    ) -> StepOutcome<
         (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
+        NoProgress,
     > {
         // `InlineName::new` is the canonical name-validity check
         // (rejects empty, oversized, or `/` -bearing names). The
@@ -470,7 +474,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let mode = (mode & !S_IFMT) | S_IFDIR;
         let new_id = self.alloc_object_id();
@@ -480,13 +484,13 @@ impl FsOps for Tmpfs {
 
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
         if children.contains_key(&inline) {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EEXIST);
+            return StepOutcome::err(step_engine::Errno::EEXIST);
         }
         children.insert(inline, new_id);
 
@@ -498,7 +502,7 @@ impl FsOps for Tmpfs {
             },
         );
 
-        tx_substrate::step_v3::StepOutcome::done((new_id, meta))
+        StepOutcome::done((new_id, meta))
     }
 
     fn rmdir(
@@ -507,43 +511,43 @@ impl FsOps for Tmpfs {
         name: &[u8],
         target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         // `InlineName::new` is the canonical name-validity check
         // (rejects empty, oversized, or `/` -bearing names). The
         // inline name is also the directory BTreeMap key now that
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let mut state = self.state.lock();
         let Some(target_inode) = state.inodes.get(&target) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(target_children) = &target_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
         if !target_children.is_empty() {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENOTEMPTY,
+            return StepOutcome::err(
+                step_engine::Errno::ENOTEMPTY,
             );
         }
 
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
         let Some(found_id) = children.get(&inline).copied() else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         if found_id != target {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         }
         children.remove(&inline);
         state.inodes.remove(&found_id);
-        tx_substrate::step_v3::StepOutcome::done(())
+        StepOutcome::done(())
     }
 
     fn symlink(
@@ -553,13 +557,13 @@ impl FsOps for Tmpfs {
         link_target: &[u8],
         cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
+    ) -> StepOutcome<
         (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
+        NoProgress,
     > {
         if link_target.is_empty() || link_target.len() > TMPFS_SYMLINK_MAX {
-            return tx_substrate::step_v3::StepOutcome::err(
-                tx_substrate::step_v3::Errno::ENAMETOOLONG,
+            return StepOutcome::err(
+                step_engine::Errno::ENAMETOOLONG,
             );
         }
         // `InlineName::new` is the canonical name-validity check
@@ -568,7 +572,7 @@ impl FsOps for Tmpfs {
         // `InlineName: Ord` is upstream.
         let inline = match InlineName::new(name) {
             Ok(n) => n,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let new_id = self.alloc_object_id();
         let mut meta = InodeMeta::new(InodeKind::Symlink, S_IFLNK | 0o777);
@@ -578,13 +582,13 @@ impl FsOps for Tmpfs {
 
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
         if children.contains_key(&inline) {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EEXIST);
+            return StepOutcome::err(step_engine::Errno::EEXIST);
         }
         children.insert(inline, new_id);
 
@@ -598,7 +602,7 @@ impl FsOps for Tmpfs {
             },
         );
 
-        tx_substrate::step_v3::StepOutcome::done((new_id, meta))
+        StepOutcome::done((new_id, meta))
     }
 
     fn readdir(
@@ -606,20 +610,20 @@ impl FsOps for Tmpfs {
         fs_object_id: FsObjectId,
         cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
+    ) -> StepOutcome<
         Option<(DirEntry, DirCursor)>,
-        tx_substrate::step_v3::NoProgress,
+        NoProgress,
     > {
         let state = self.state.lock();
         let Some(parent_inode) = state.inodes.get(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &parent_inode.payload else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOTDIR);
+            return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
         let index = cursor.as_u64() as usize;
         let Some((name, child_id)) = children.iter().nth(index) else {
-            return tx_substrate::step_v3::StepOutcome::done(None);
+            return StepOutcome::done(None);
         };
         // Resolve child kind for the DirEntry by peeking the child
         // inode's meta. Falls back to Regular if the child is missing
@@ -631,9 +635,9 @@ impl FsOps for Tmpfs {
             .unwrap_or(InodeKind::Regular);
         let entry = match DirEntry::new(*child_id, kind, name.as_bytes()) {
             Ok(e) => e,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
-        tx_substrate::step_v3::StepOutcome::done(Some((
+        StepOutcome::done(Some((
             entry,
             DirCursor::from_u64(cursor.as_u64() + 1),
         )))
@@ -643,7 +647,7 @@ impl FsOps for Tmpfs {
         &self,
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         // The plan calls for `destroy_inode` to drop the inode entry;
         // the regular-file `Cap<PageContainer>` falls when the
         // owning `TmpfsInode` is dropped, releasing all anon pages
@@ -655,7 +659,7 @@ impl FsOps for Tmpfs {
         // observing an error.
         let mut state = self.state.lock();
         state.inodes.remove(&fs_object_id);
-        tx_substrate::step_v3::StepOutcome::done(())
+        StepOutcome::done(())
     }
 
     /// Read the inline symlink target bytes for a tmpfs symlink inode.
@@ -669,19 +673,19 @@ impl FsOps for Tmpfs {
         &self,
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
+    ) -> StepOutcome<
         alloc::boxed::Box<[u8]>,
-        tx_substrate::step_v3::NoProgress,
+        NoProgress,
     > {
         let state = self.state.lock();
         let Some(inode) = state.inodes.get(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         match &inode.payload {
             TmpfsPayload::Symlink(bytes) => {
-                tx_substrate::step_v3::StepOutcome::done(bytes.clone().into_boxed_slice())
+                StepOutcome::done(bytes.clone().into_boxed_slice())
             }
-            _ => tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EINVAL),
+            _ => StepOutcome::err(step_engine::Errno::EINVAL),
         }
     }
 
@@ -721,10 +725,10 @@ impl FsOps for Tmpfs {
         fs_object_id: FsObjectId,
         meta: InodeMeta,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<Cap<RNode>, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<Cap<RNode>, NoProgress> {
         let state = self.state.lock();
         let Some(inode) = state.inodes.get(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let backing = match &inode.payload {
             TmpfsPayload::RegularFile { container, .. } => RNodeBacking::PageBacked {
@@ -735,21 +739,21 @@ impl FsOps for Tmpfs {
             // POSIX-shaped errno rather than panicking so a backend
             // misroute surfaces as a recoverable error.
             TmpfsPayload::Directory(_) => {
-                return tx_substrate::step_v3::StepOutcome::err(
-                    tx_substrate::step_v3::Errno::EISDIR,
+                return StepOutcome::err(
+                    step_engine::Errno::EISDIR,
                 );
             }
             TmpfsPayload::Symlink(_) => {
-                return tx_substrate::step_v3::StepOutcome::err(
-                    tx_substrate::step_v3::Errno::EINVAL,
+                return StepOutcome::err(
+                    step_engine::Errno::EINVAL,
                 );
             }
         };
         drop(state);
 
         match RNode::new_cap(fs_object_id, meta, backing) {
-            Ok(rnode) => tx_substrate::step_v3::StepOutcome::done(rnode),
-            Err(_) => tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOMEM),
+            Ok(rnode) => StepOutcome::done(rnode),
+            Err(_) => StepOutcome::err(step_engine::Errno::ENOMEM),
         }
     }
 
@@ -763,14 +767,14 @@ impl FsOps for Tmpfs {
         new_mode: u16,
         cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         let mut state = self.state.lock();
         let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         // Permission: owner or CAP_FOWNER.
         if !cred.effective_caps.contains(Capability::FOWNER) && cred.uid != inode.meta.uid {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EPERM);
+            return StepOutcome::err(step_engine::Errno::EPERM);
         }
         // Preserve the IFMT bits from the existing meta — kind is
         // immutable through chmod (matches `serialize_inode_meta`).
@@ -779,7 +783,7 @@ impl FsOps for Tmpfs {
         let masked = new_mode & 0o7777;
         let kind_bits = inode.meta.mode & S_IFMT;
         inode.meta.mode = kind_bits | masked;
-        tx_substrate::step_v3::StepOutcome::done(())
+        StepOutcome::done(())
     }
 
     /// Update the inode's `(uid, gid)`. `None` for either field
@@ -796,24 +800,24 @@ impl FsOps for Tmpfs {
         new_gid: Option<u32>,
         cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         let mut state = self.state.lock();
         let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let privileged = cred.effective_caps.contains(Capability::FOWNER);
         if !privileged {
             if let Some(u) = new_uid {
                 if u != cred.uid {
-                    return tx_substrate::step_v3::StepOutcome::err(
-                        tx_substrate::step_v3::Errno::EPERM,
+                    return StepOutcome::err(
+                        step_engine::Errno::EPERM,
                     );
                 }
             }
             if let Some(g) = new_gid {
                 if g != cred.gid {
-                    return tx_substrate::step_v3::StepOutcome::err(
-                        tx_substrate::step_v3::Errno::EPERM,
+                    return StepOutcome::err(
+                        step_engine::Errno::EPERM,
                     );
                 }
             }
@@ -830,7 +834,7 @@ impl FsOps for Tmpfs {
         if !privileged {
             inode.meta.mode &= !(S_ISUID | S_ISGID);
         }
-        tx_substrate::step_v3::StepOutcome::done(())
+        StepOutcome::done(())
     }
 }
 
@@ -840,21 +844,21 @@ impl FsPageBacking for Tmpfs {
         fs_object_id: FsObjectId,
         offset: u64,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<Frame, NoProgress> {
         let state = self.state.lock();
         let Some(inode) = state.inodes.get(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOENT);
+            return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let container = match &inode.payload {
             TmpfsPayload::RegularFile { container, .. } => container.clone(),
             TmpfsPayload::Directory(_) => {
-                return tx_substrate::step_v3::StepOutcome::err(
-                    tx_substrate::step_v3::Errno::EISDIR,
+                return StepOutcome::err(
+                    step_engine::Errno::EISDIR,
                 );
             }
             TmpfsPayload::Symlink(_) => {
-                return tx_substrate::step_v3::StepOutcome::err(
-                    tx_substrate::step_v3::Errno::EINVAL,
+                return StepOutcome::err(
+                    step_engine::Errno::EINVAL,
                 );
             }
         };
@@ -862,7 +866,7 @@ impl FsPageBacking for Tmpfs {
 
         let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
         if !offset.is_multiple_of(page_size) {
-            return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EINVAL);
+            return StepOutcome::err(step_engine::Errno::EINVAL);
         }
         let page_index = PageIndex::new(offset / page_size);
         // `materialize_page` is now v3
@@ -877,7 +881,7 @@ impl FsPageBacking for Tmpfs {
         use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
         match container.materialize_page(page_index, MaterializeAccess::Read, guard) {
             V3::Done(materialized) => V3::done(Frame::new(materialized.ppn)),
-            V3::Continue { .. } => V3::err(tx_substrate::step_v3::Errno::EAGAIN),
+            V3::Continue { .. } => V3::err(step_engine::Errno::EAGAIN),
             V3::Yield {
                 shape:
                     YieldShape::OnWaitSource {
@@ -886,7 +890,7 @@ impl FsPageBacking for Tmpfs {
                     },
                 ..
             } => V3::yield_on_wait_source(
-                tx_substrate::step_v3::NoProgress,
+                NoProgress,
                 carrier.raw(),
                 interests.raw(),
             ),
@@ -894,7 +898,7 @@ impl FsPageBacking for Tmpfs {
                 shape: YieldShape::OnTimer { .. },
                 ..
             } => unreachable!("tmpfs page-backing does not produce OnTimer yields"),
-            V3::Yield { .. } => V3::err(tx_substrate::step_v3::Errno::EIO),
+            V3::Yield { .. } => V3::err(step_engine::Errno::EIO),
             V3::Err(errno) => V3::err(errno),
         }
     }
@@ -905,11 +909,11 @@ impl FsPageBacking for Tmpfs {
         _offset: u64,
         _frame: &Frame,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         // tmpfs is in-memory: there is no underlying durable store to
         // sync. Returning `done(())` short-circuits `step_fsync`'s
         // dirty-page walk to a no-op, per the plan §"FsPageBacking".
-        tx_substrate::step_v3::StepOutcome::done(())
+        StepOutcome::done(())
     }
 
     fn truncate(
@@ -917,7 +921,7 @@ impl FsPageBacking for Tmpfs {
         fs_object_id: FsObjectId,
         new_size: u64,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         // Snapshot the container under the state lock, then call
         // `step_truncate` outside it: the page-backed lifecycle path
         // takes its own internal lock, and we must not stack lock
@@ -925,20 +929,20 @@ impl FsPageBacking for Tmpfs {
         let container = {
             let state = self.state.lock();
             let Some(inode) = state.inodes.get(&fs_object_id) else {
-                return tx_substrate::step_v3::StepOutcome::err(
-                    tx_substrate::step_v3::Errno::ENOENT,
+                return StepOutcome::err(
+                    step_engine::Errno::ENOENT,
                 );
             };
             match &inode.payload {
                 TmpfsPayload::RegularFile { container, .. } => container.clone(),
                 TmpfsPayload::Directory(_) => {
-                    return tx_substrate::step_v3::StepOutcome::err(
-                        tx_substrate::step_v3::Errno::EISDIR,
+                    return StepOutcome::err(
+                        step_engine::Errno::EISDIR,
                     );
                 }
                 TmpfsPayload::Symlink(_) => {
-                    return tx_substrate::step_v3::StepOutcome::err(
-                        tx_substrate::step_v3::Errno::EINVAL,
+                    return StepOutcome::err(
+                        step_engine::Errno::EINVAL,
                     );
                 }
             }
@@ -949,15 +953,15 @@ impl FsPageBacking for Tmpfs {
         // observable in practice. Continue / Yield are handled defensively
         // for completeness.
         match step_truncate(&container, new_size, guard) {
-            tx_substrate::step_v3::StepOutcome::Done(()) => {}
-            tx_substrate::step_v3::StepOutcome::Continue { progress: _ } => {}
-            tx_substrate::step_v3::StepOutcome::Yield { .. } => {
-                return tx_substrate::step_v3::StepOutcome::err(
-                    tx_substrate::step_v3::Errno::EAGAIN,
+            StepOutcome::Done(()) => {}
+            StepOutcome::Continue { progress: _ } => {}
+            StepOutcome::Yield { .. } => {
+                return StepOutcome::err(
+                    step_engine::Errno::EAGAIN,
                 );
             }
-            tx_substrate::step_v3::StepOutcome::Err(e) => {
-                return tx_substrate::step_v3::StepOutcome::err(e);
+            StepOutcome::Err(e) => {
+                return StepOutcome::err(e);
             }
         }
 
@@ -973,16 +977,16 @@ impl FsPageBacking for Tmpfs {
             }
             inode.meta.size = new_size;
         }
-        tx_substrate::step_v3::StepOutcome::done(())
+        StepOutcome::done(())
     }
 
     fn fsync(
         &self,
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         // In-memory; durability is trivially satisfied.
-        tx_substrate::step_v3::StepOutcome::done(())
+        StepOutcome::done(())
     }
 
     // `fallocate` is intentionally not overridden: the trait's default
