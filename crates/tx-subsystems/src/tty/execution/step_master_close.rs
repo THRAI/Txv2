@@ -1,21 +1,22 @@
 //! Master-close hangup path for ptys.
 
-use tx_substrate::zone::Cap;
+use crate::tty::adapter::step_engine::{self as step_engine, Cap};
 
 use super::step_hangup::{step_hangup, HangupOutcome};
 use super::step_ioctl::IoctlSideEffect;
 use crate::execution::{Errno, Guard};
 use crate::tty::checks::require_live_tty;
 use crate::tty::structure::{TtyIdentity, TtyTransport};
+use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
 
 pub fn step_master_close_last(
     master: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<
+) -> StepOutcome<
     (HangupOutcome, IoctlSideEffect),
-    tx_substrate::step_v3::NoProgress,
+    NoProgress,
 > {
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let payload = match require_live_tty(master, guard) {
         Ok(payload) => payload,
@@ -48,15 +49,15 @@ pub struct MasterCloseLastOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for MasterCloseLastOp<'a>
 {
     type Output = (HangupOutcome, IoctlSideEffect);
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_master_close_last(self.master, self.guard)
     }
 }
@@ -78,18 +79,18 @@ mod step_op_wraps {
             &self,
             _out: &mut [u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(0)
+            StepOutcome::Done(0)
         }
 
         fn write(
             &self,
             bytes: &[u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+            StepOutcome::Done(bytes.len())
         }
     }
 
@@ -129,7 +130,7 @@ mod step_op_wraps {
         // A hardware (non-pty) TTY is rejected with EINVAL since its
         // transport isn't `Pty { .. }`.
         let tty = alloc_hardware_tty(400, "ttyV3-master-close-hw");
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = MasterCloseLastOp {
             master: &tty,
             guard: &guard,
@@ -138,7 +139,7 @@ mod step_op_wraps {
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
-            V3::Err(tx_substrate::step_v3::Errno::EINVAL) => {}
+            V3::Err(step_engine::Errno::EINVAL) => {}
             other => panic!("expected Err(EINVAL), got {other:?}"),
         }
     }
@@ -148,7 +149,7 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_hardware_tty(401, "ttyV3-master-close-dead");
         let _ = tty.take_payload();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = MasterCloseLastOp {
             master: &tty,
             guard: &guard,
@@ -157,7 +158,7 @@ mod step_op_wraps {
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
-            V3::Err(tx_substrate::step_v3::Errno::EIO) => {}
+            V3::Err(step_engine::Errno::EIO) => {}
             other => panic!("expected Err(EIO), got {other:?}"),
         }
     }

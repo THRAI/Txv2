@@ -2,7 +2,7 @@
 
 use core::sync::atomic::Ordering;
 
-use tx_substrate::zone::Cap;
+use crate::tty::adapter::step_engine::{self as step_engine, Cap};
 
 use crate::execution::{Errno, Guard};
 use crate::signal::{self, DispatchOutcome, SigDisposition, Signum};
@@ -10,6 +10,7 @@ use crate::tty::checks::{require_live_tty, require_session_leader};
 use crate::tty::execution::{TTY_READABLE, TTY_WRITABLE};
 use crate::tty::ldisc::SignalKind;
 use crate::tty::structure::{SessionPgrp, Termios, TtyIdentity, Winsize};
+use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
 
 #[derive(Clone, Copy, Debug)]
 pub struct IoctlCaller {
@@ -69,13 +70,13 @@ impl IoctlCaller {
     pub fn from_process(
         process: &Cap<crate::process::structure::ProcessIdentity>,
     ) -> Result<Self, Errno> {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         Self::from_process_with_guard(process, &guard)
     }
 
     pub(crate) fn from_process_with_guard(
         process: &Cap<crate::process::structure::ProcessIdentity>,
-        guard: &tx_substrate::epoch::Guard<'_>,
+        guard: &step_engine::Guard<'_>,
     ) -> Result<Self, Errno> {
         let payload_guard = process.payload.lock();
         let payload = payload_guard.as_ref().ok_or(Errno::ESRCH)?;
@@ -269,7 +270,7 @@ pub fn deliver_signal_dispatch_for_process(
     source: &Cap<crate::process::structure::ProcessIdentity>,
     dispatch: Option<SignalDispatch>,
 ) -> Result<Option<DispatchOutcome>, Errno> {
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     match dispatch {
         Some(dispatch) => {
             signal::deliver_tty_dispatch_with_guard(source, dispatch, &guard).map(Some)
@@ -281,7 +282,7 @@ pub fn deliver_signal_dispatch_for_process(
 pub(crate) fn deliver_signal_dispatch_for_process_with_guard(
     source: &Cap<crate::process::structure::ProcessIdentity>,
     dispatch: Option<SignalDispatch>,
-    guard: &tx_substrate::epoch::Guard<'_>,
+    guard: &step_engine::Guard<'_>,
 ) -> Result<Option<DispatchOutcome>, Errno> {
     match dispatch {
         Some(dispatch) => {
@@ -295,8 +296,8 @@ pub fn step_ioctl_tiocsctty(
     tty: &Cap<TtyIdentity>,
     caller: IoctlCaller,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
@@ -329,8 +330,8 @@ pub fn step_ioctl_tiocsctty_for_process(
     tty: &Cap<TtyIdentity>,
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
@@ -365,8 +366,8 @@ pub fn step_ioctl_tiocnotty(
     tty: &Cap<TtyIdentity>,
     caller: IoctlCaller,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
@@ -394,8 +395,8 @@ pub fn step_ioctl_tiocnotty_for_process(
     tty: &Cap<TtyIdentity>,
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
@@ -430,8 +431,8 @@ pub fn step_ioctl_tiocspgrp(
     caller: IoctlCaller,
     new_pgrp: u32,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
@@ -462,8 +463,8 @@ pub fn step_ioctl_tiocspgrp_for_process(
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     new_pgrp: &Cap<crate::process::structure::ProcessGroup>,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
@@ -499,8 +500,8 @@ pub fn step_ioctl_tiocspgrp_for_process(
 pub fn step_ioctl_tiocgpgrp(
     tty: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<u32, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<u32, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
         Err(err) => return V3::Err(err.into()),
@@ -515,8 +516,8 @@ pub fn step_ioctl_tiocgpgrp(
 pub fn step_ioctl_tiocgwinsz(
     tty: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<Winsize, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<Winsize, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
         Err(err) => return V3::Err(err.into()),
@@ -530,8 +531,8 @@ pub fn step_ioctl_tiocswinsz(
     tty: &Cap<TtyIdentity>,
     winsize: Winsize,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
         Err(err) => return V3::Err(err.into()),
@@ -557,8 +558,8 @@ pub fn step_ioctl_tiocswinsz(
 pub fn step_ioctl_tcgets(
     tty: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<Termios, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<Termios, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
         Err(err) => return V3::Err(err.into()),
@@ -570,8 +571,8 @@ pub fn step_ioctl_tcsets(
     tty: &Cap<TtyIdentity>,
     new_termios: Termios,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<IoctlSideEffect, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
         Err(err) => return V3::Err(err.into()),
@@ -622,15 +623,15 @@ pub struct IoctlTiocscttyOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IoctlTiocscttyOp<'a>
 {
     type Output = IoctlSideEffect;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocsctty(self.tty, self.caller, self.guard)
     }
 }
@@ -643,15 +644,15 @@ pub struct IoctlTiocscttyForProcessOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IoctlTiocscttyForProcessOp<'a>
 {
     type Output = IoctlSideEffect;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocsctty_for_process(self.tty, self.caller, self.guard)
     }
 }
@@ -664,15 +665,15 @@ pub struct IoctlTiocnottyOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IoctlTiocnottyOp<'a>
 {
     type Output = IoctlSideEffect;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocnotty(self.tty, self.caller, self.guard)
     }
 }
@@ -685,15 +686,15 @@ pub struct IoctlTiocnottyForProcessOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IoctlTiocnottyForProcessOp<'a>
 {
     type Output = IoctlSideEffect;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocnotty_for_process(self.tty, self.caller, self.guard)
     }
 }
@@ -707,15 +708,15 @@ pub struct IoctlTiocspgrpOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IoctlTiocspgrpOp<'a>
 {
     type Output = IoctlSideEffect;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocspgrp(self.tty, self.caller, self.new_pgrp, self.guard)
     }
 }
@@ -729,15 +730,15 @@ pub struct IoctlTiocspgrpForProcessOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IoctlTiocspgrpForProcessOp<'a>
 {
     type Output = IoctlSideEffect;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocspgrp_for_process(self.tty, self.caller, self.new_pgrp, self.guard)
     }
 }
@@ -749,15 +750,15 @@ pub struct IoctlTiocgpgrpOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IoctlTiocgpgrpOp<'a>
 {
     type Output = u32;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocgpgrp(self.tty, self.guard)
     }
 }
@@ -769,15 +770,15 @@ pub struct IoctlTiocgwinszOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IoctlTiocgwinszOp<'a>
 {
     type Output = Winsize;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocgwinsz(self.tty, self.guard)
     }
 }
@@ -790,15 +791,15 @@ pub struct IoctlTiocswinszOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IoctlTiocswinszOp<'a>
 {
     type Output = IoctlSideEffect;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocswinsz(self.tty, self.winsize, self.guard)
     }
 }
@@ -810,15 +811,15 @@ pub struct IoctlTcgetsOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IoctlTcgetsOp<'a>
 {
     type Output = Termios;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tcgets(self.tty, self.guard)
     }
 }
@@ -831,15 +832,15 @@ pub struct IoctlTcsetsOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IoctlTcsetsOp<'a>
 {
     type Output = IoctlSideEffect;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tcsets(self.tty, self.new_termios, self.guard)
     }
 }
@@ -861,18 +862,18 @@ mod step_op_wraps {
             &self,
             _out: &mut [u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(0)
+            StepOutcome::Done(0)
         }
 
         fn write(
             &self,
             bytes: &[u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+            StepOutcome::Done(bytes.len())
         }
     }
 
@@ -910,7 +911,7 @@ mod step_op_wraps {
     fn tcgets_op_returns_done_on_live_tty() {
         let _setup = setup();
         let tty = alloc_tty(300, "ttyV3-tcgets-op");
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = IoctlTcgetsOp {
             tty: &tty,
             guard: &guard,
@@ -929,7 +930,7 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_tty(301, "ttyV3-tcgets-dead");
         let _ = tty.take_payload();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = IoctlTcgetsOp {
             tty: &tty,
             guard: &guard,
@@ -938,7 +939,7 @@ mod step_op_wraps {
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
-            V3::Err(tx_substrate::step_v3::Errno::EIO) => {}
+            V3::Err(step_engine::Errno::EIO) => {}
             other => panic!("expected Err(EIO), got {other:?}"),
         }
     }
@@ -947,7 +948,7 @@ mod step_op_wraps {
     fn tiocgpgrp_op_unbound_returns_einval() {
         let _setup = setup();
         let tty = alloc_tty(302, "ttyV3-tiocgpgrp-unbound");
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = IoctlTiocgpgrpOp {
             tty: &tty,
             guard: &guard,
@@ -956,7 +957,7 @@ mod step_op_wraps {
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
-            V3::Err(tx_substrate::step_v3::Errno::EINVAL) => {}
+            V3::Err(step_engine::Errno::EINVAL) => {}
             other => panic!("expected Err(EINVAL), got {other:?}"),
         }
     }
@@ -965,7 +966,7 @@ mod step_op_wraps {
     fn tiocgwinsz_op_returns_done() {
         let _setup = setup();
         let tty = alloc_tty(303, "ttyV3-tiocgwinsz-op");
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = IoctlTiocgwinszOp {
             tty: &tty,
             guard: &guard,
@@ -983,7 +984,7 @@ mod step_op_wraps {
     fn tiocswinsz_op_returns_done_and_fires_session_ctl() {
         let _setup = setup();
         let tty = alloc_tty(304, "ttyV3-tiocswinsz-op");
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = IoctlTiocswinszOp {
             tty: &tty,
             winsize: Winsize::default(),
@@ -1003,7 +1004,7 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_tty(305, "ttyV3-tiocnotty-op");
         let caller = IoctlCaller::new(1, 1).as_session_leader();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = IoctlTiocnottyOp {
             tty: &tty,
             caller,
@@ -1013,7 +1014,7 @@ mod step_op_wraps {
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
-            V3::Err(tx_substrate::step_v3::Errno::EINVAL) => {}
+            V3::Err(step_engine::Errno::EINVAL) => {}
             other => panic!("expected Err(EINVAL), got {other:?}"),
         }
     }

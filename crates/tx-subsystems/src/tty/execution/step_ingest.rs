@@ -2,9 +2,8 @@
 
 use core::sync::atomic::Ordering;
 
-use tx_reactor::wait::Mask;
-use tx_substrate::step_v3::InterestMask;
-use tx_substrate::zone::Cap;
+use crate::tty::adapter::wait_routing::Mask;
+use crate::tty::adapter::step_engine::{self as step_engine, Cap};
 
 use crate::execution::Guard;
 use crate::tty::checks::require_live_tty;
@@ -13,6 +12,7 @@ use crate::tty::execution::{
 };
 use crate::tty::ldisc::{process_input_byte, FlowCtl, LdiscInputEffect, SignalKind};
 use crate::tty::structure::TtyIdentity;
+use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
 
 /// Deferred signal observed while ingesting bytes.
 ///
@@ -38,8 +38,8 @@ pub fn step_ingest(
     tty: &Cap<TtyIdentity>,
     bytes: &[u8],
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<IngestOutcome, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<IngestOutcome, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
         Err(err) => return V3::Err(err.into()),
@@ -143,15 +143,15 @@ pub struct IngestOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IngestOp<'a>
 {
     type Output = IngestOutcome;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ingest(self.tty, self.bytes, self.guard)
     }
 }
@@ -173,18 +173,18 @@ mod step_op_wraps {
             &self,
             _out: &mut [u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(0)
+            StepOutcome::Done(0)
         }
 
         fn write(
             &self,
             bytes: &[u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+            StepOutcome::Done(bytes.len())
         }
     }
 
@@ -222,7 +222,7 @@ mod step_op_wraps {
     fn ingest_op_consumes_bytes() {
         let _setup = setup();
         let tty = alloc_hardware_tty(600, "ttyV3-ingest-op-live");
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let bytes: &[u8] = b"hi";
         let mut op = IngestOp {
             tty: &tty,
@@ -243,7 +243,7 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_hardware_tty(601, "ttyV3-ingest-op-dead");
         let _ = tty.take_payload();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = IngestOp {
             tty: &tty,
             bytes: b"x",

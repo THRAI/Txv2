@@ -16,16 +16,16 @@
 
 use alloc::sync::Arc;
 
-use tx_reactor::wait::Channel;
-use tx_substrate::bus::{RawPort, RawQueue};
-use tx_substrate::step_v3::WaitSourceId;
-use tx_substrate::wake::WaitSource;
-use tx_substrate::zone::{Dead, Entity, PayloadCap};
-use tx_substrate::{AtomicSlot, SpinMutex};
+use crate::tty::adapter::wait_routing::Channel;
+use crate::tty::adapter::step_engine::{RawPort, RawQueue};
+use crate::tty::adapter::wait_routing::WaitSource;
+use crate::tty::adapter::step_engine::{Dead, Entity, PayloadCap};
+use crate::tty::adapter::step_engine::{AtomicSlot, SpinMutex};
 
 use crate::wait_source;
 
 use super::payload::TtyPayload;
+use crate::tty::adapter::step_engine::{self as step_engine, ByteProgress, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, WaitSourceId};
 
 // ---------------------------------------------------------------------------
 // Staging: FixedName<N>
@@ -146,7 +146,7 @@ impl SessionPgrp {
         &self,
     ) -> Option<tx_substrate::zone::Cap<crate::process::structure::Session>> {
         let weak = self.session.as_ref()?;
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         weak.upgrade(&guard)
     }
 
@@ -157,7 +157,7 @@ impl SessionPgrp {
         &self,
     ) -> Option<tx_substrate::zone::Cap<crate::process::structure::ProcessGroup>> {
         let weak = self.foreground_pgrp.as_ref()?;
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         weak.upgrade(&guard)
     }
 }
@@ -419,14 +419,14 @@ mod tests {
     fn tty_operational_upgrade_returns_live_payload_and_fails_after_hangup() {
         let _g = setup();
 
-        let id_res = zone::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res = zone::reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let id_res = step_engine::reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = step_engine::reserve_for::<TtyPayload>().expect("tty payload reservation");
 
-        let tty = zone::sign_for(
+        let tty = step_engine::sign_for(
             id_res,
             TtyIdentity::new(TtyKind::SerialHardware, 9, "ttyS-operational"),
         );
-        let payload = PayloadCap::from_cap(zone::sign_for(
+        let payload = PayloadCap::from_cap(step_engine::sign_for(
             payload_res,
             TtyPayload::new_hardware(&NOOP_BINDING),
         ));

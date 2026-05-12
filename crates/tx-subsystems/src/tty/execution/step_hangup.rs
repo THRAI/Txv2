@@ -1,10 +1,11 @@
 //! TTY hangup execution steps.
 
-use tx_substrate::zone::Cap;
+use crate::tty::adapter::step_engine::{self as step_engine, Cap};
 
 use super::step_ioctl::{JobControlSignal, SessionCtlEvent, SignalDispatch, SignalTarget};
 use crate::execution::{Errno, Guard};
 use crate::tty::structure::TtyIdentity;
+use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HangupOutcome {
@@ -18,8 +19,8 @@ pub struct HangupOutcome {
 pub fn step_hangup(
     tty: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<HangupOutcome, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<HangupOutcome, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let binding = tty.session_pgrp();
     let session_leader_pgrp = binding
@@ -74,15 +75,15 @@ pub struct HangupOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for HangupOp<'a>
 {
     type Output = HangupOutcome;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_hangup(self.tty, self.guard)
     }
 }
@@ -104,18 +105,18 @@ mod step_op_wraps {
             &self,
             _out: &mut [u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(0)
+            StepOutcome::Done(0)
         }
 
         fn write(
             &self,
             bytes: &[u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+            StepOutcome::Done(bytes.len())
         }
     }
 
@@ -153,7 +154,7 @@ mod step_op_wraps {
     fn hangup_op_on_live_tty_returns_done() {
         let _setup = setup();
         let tty = alloc_hardware_tty(500, "ttyV3-hangup-op-live");
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = HangupOp {
             tty: &tty,
             guard: &guard,
@@ -176,7 +177,7 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_hardware_tty(501, "ttyV3-hangup-op-dead");
         let _ = tty.take_payload();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = HangupOp {
             tty: &tty,
             guard: &guard,
@@ -185,7 +186,7 @@ mod step_op_wraps {
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
-            V3::Err(tx_substrate::step_v3::Errno::EIO) => {}
+            V3::Err(step_engine::Errno::EIO) => {}
             other => panic!("expected Err(EIO), got {other:?}"),
         }
     }
