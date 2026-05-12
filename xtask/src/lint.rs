@@ -50,7 +50,7 @@ pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
 /// call site introduced outside an adapter trips this gate. Lower
 /// the number when convergence work removes more residue; raising it
 /// requires an explicit decision note.
-const MAX_SUBSTRATE_OUTSIDE_ADAPTER: usize = 6;
+const MAX_SUBSTRATE_OUTSIDE_ADAPTER: usize = 0;
 
 /// Maximum allowed `tx_reactor::*` line references outside adapters.
 /// Phase 7 ratchet, driven to 0 by D62/D63 (tx-reactor doc-comment

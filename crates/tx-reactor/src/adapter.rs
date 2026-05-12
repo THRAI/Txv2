@@ -21,8 +21,9 @@ use tx_platform_adapter::platform_adapter;
 )]
 pub mod step_engine {
     pub use tx_substrate::step_v3::{
-        AbortReason, DelegateRegistry, DelegateReply, DelegateTokenId, NoProgress, ScriptCtx,
-        StepOp, StepOutcome, SubjectIdentity,
+        AbortReason, AgentCancelPolicy, Deadline, DelegateRegistry, DelegateReply, DelegateRequest,
+        DelegateState, DelegateTokenId, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+        TokenDropPolicy, TransitionOutcome,
     };
     // ProcessIdentity is used as a placeholder subject in tests.
     pub use tx_substrate::step_v3::ProcessIdentity as PlaceholderProcessSubject;
@@ -37,11 +38,18 @@ pub mod step_engine {
 pub mod bus_wire {
     pub use tx_substrate::bus::{
         DeclaredPort, DeclaredPortSubscription, DeclaredQueue, DeclaredQueueSubscription,
-        DeclaredWireError, RawPort, RawPortSubscription, WireDeclaration, WireDeclarationError,
-        WireEventSet,
+        DeclaredWireError, RawPort, RawPortSubscription, RawQueue, WireDeclaration,
+        WireDeclarationError, WireEventSet,
     };
-    pub use tx_substrate::wake::{agent_event_matches, MailboxEvent, TaskMailbox};
     pub use tx_substrate::wake::mailbox;
-    pub use tx_substrate::wake::wait_source;
     pub use tx_substrate::wake::timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
+    pub use tx_substrate::wake::wait_source;
+    pub use tx_substrate::wake::{agent_event_matches, MailboxEvent, TaskMailbox};
+
+    // Re-export the bus DSL macros so test code can declare lifecycle
+    // and readiness wire-protocols via `bus_wire::bus_lifecycle! { ... }`
+    // instead of reaching past the adapter to `tx_substrate::bus::*`.
+    // `pub use` of `#[macro_export]` macros lifts them into the adapter
+    // module path while preserving the original definitions.
+    pub use tx_substrate::{bus_lifecycle, bus_readiness};
 }
