@@ -22,8 +22,7 @@ use alloc::vec::Vec;
 
 use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
-use tx_substrate::epoch;
-use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+use crate::adapter::step_engine::{self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOutcome as V3};
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::structure::{DirCursor, FsObjectId};
 use tx_subsystems::vfs::FsOps;
@@ -89,8 +88,8 @@ impl BlockImage for MemImage {
 fn init_substrate() {
     tx_substrate::testing::init_host_for_test_once();
     tx_subsystems::zones::register_all().expect("tx-subsystems zones");
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    match page_allocator::claim_zero_frame() {
+        Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for tx-ext4 v3 tests: {error:?}"),
     }
 }
