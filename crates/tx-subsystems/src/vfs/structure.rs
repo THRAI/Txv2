@@ -566,6 +566,25 @@ impl RNode {
         ))
     }
 
+    /// Like `new_cap` but stamps `containing_mount` immediately so
+    /// `containing_mount_weak()` is non-None on the returned cap.
+    /// Used by `materialise_child_rnode_v3` to forward the current
+    /// mount context to descendant directory rnodes, enabling
+    /// `fs_ops_for_rnode` (and therefore `getdents64`) to work on
+    /// any sub-directory, not just the mount root.
+    pub fn new_cap_in_mount(
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        backing: RNodeBacking,
+        mount: &Cap<MountPayload>,
+    ) -> Result<Cap<Self>, ZoneError> {
+        let reservation = zone::reserve_for::<Self>()?;
+        Ok(zone::sign_for(
+            reservation,
+            Self::new(fs_object_id, meta, backing).with_containing_mount(mount),
+        ))
+    }
+
     pub const fn fs_object_id(&self) -> FsObjectId {
         self.fs_object_id
     }
