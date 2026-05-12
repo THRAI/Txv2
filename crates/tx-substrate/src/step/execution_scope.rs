@@ -16,7 +16,7 @@
 //! `docs/Txv3/02_INVARIANTS_v5.md` (SCOPE-1).
 //!
 //! The async `with_on_behalf_of` borrow primitive (PR-11 phase 0)
-//! lives in [`crate::step_v3::on_behalf_of`]; it constructs a
+//! lives in [`crate::step::on_behalf_of`]; it constructs a
 //! `SubjectContext::borrowed` for the body, subscribes the principal's
 //! `exit_source` for abandonment routing, and drops the borrow at
 //! end-of-scope. See `06_EXECUTION_SCOPE_v1.md` §3 for the spec.
