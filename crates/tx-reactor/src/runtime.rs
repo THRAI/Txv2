@@ -1018,6 +1018,22 @@ impl HartRuntimeView<'_> {
             signal,
         ))
     }
+
+    pub fn step_hart_loop_at<S>(
+        &self,
+        hart: crate::HartId,
+        now_ns: u64,
+        signal: &mut S,
+    ) -> Option<crate::hart_loop::HartLoopStep>
+    where
+        S: crate::dispatch::RescheduleSignal,
+    {
+        let mut reactor = self.reactor.lock();
+        let reactor = reactor.as_mut()?;
+        Some(crate::hart_loop::step_hart_loop_at(
+            reactor, hart, now_ns, signal,
+        ))
+    }
 }
 
 impl Reactor {
