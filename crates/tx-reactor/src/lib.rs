@@ -14,25 +14,32 @@
 
 extern crate alloc;
 
+pub mod agent_reply;
 pub mod ast;
 pub mod completion;
 pub mod dispatch;
 pub mod hart_loop;
 pub mod interrupt;
+pub mod mailbox;
 pub mod preempt;
 mod runtime;
 pub mod scheduler;
 pub(crate) mod spin_lock;
 pub mod sync_coord;
 pub mod task;
-pub(crate) mod timer;
+pub mod timer;
 pub mod userspace;
 pub mod wait;
+pub mod wait_source;
 pub(crate) mod waker;
 mod yield_now;
 
+pub use agent_reply::{await_agent_reply, AgentReplyOutcome, AwaitAgentReply};
 pub use dispatch::{
     DispatchState, NoopRescheduleSignal, RescheduleSignal, WakeDispatchAction, WakeDispatchReport,
+};
+pub use mailbox::{
+    ActiveWait, MailboxEvent, SignalRouting, TaskMailbox, WaitGeneration, MAILBOX_QUEUE_BOUND,
 };
 pub use runtime::{Reactor, RunIdleReport, RunStats, SharedReactor};
 pub use scheduler::{
@@ -40,4 +47,6 @@ pub use scheduler::{
     SliceConfig, StopReason, TaskHandle, WakeHint,
 };
 pub use task::{TaskDrainRecord, TaskId, TaskKey, TaskLifecycleError, TaskStatus};
+pub use timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
+pub use wait_source::{PreparedWaitRegistration, SubscriberId, WaitRegistrationGuard, WaitSource};
 pub use yield_now::{yield_now, YieldNow};

@@ -15,7 +15,7 @@
 - [`PAGE_SUBSTRATE_v1.md`](PAGE_SUBSTRATE_v1.md) — substrate is HAL's primary consumer; §2's deliverables list is now realized here as platform obligations.
 - [`DEVICE.md`](../06_devices/DEVICE.md) — tier-1 devices (PLIC, CLINT/timer, early UART) live in HAL; tier-2 device construction sits above HAL.
 - [`00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — HAL is *not* a subsystem; it predates the four-module discipline and has its own organization.
-- [`00_meta-framework/INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — MAP and HAL/foundation invariants; TLB shootdown ordering is realized by `PmapIf::shootdown` plus the substrate-side post-shootdown accounting.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — MAP and HAL/foundation invariants; TLB shootdown ordering is realized by `PmapIf::shootdown` plus the substrate-side post-shootdown accounting.
 
 **Interface status.** This document is the axHal-style replacement for the older OSTD-style HAL management notes. "axHal-style" means: one statically selected platform family, compile/link-time platform choice, no runtime HAL manager, no boxed dynamic HAL trait object, no HAL-owned semantic objects, and no subsystem callbacks into HAL initialization order. txKernel still gives the surface typed names (`TxPlatform`, `PmapIf`, `TrapIf`, etc.) because upper documents need proof objects and trap-frame views, but those traits describe a static platform module family rather than a managed HAL service.
 
@@ -1665,8 +1665,9 @@ No subsystem code references `sepc`, `sstatus`, `sscratch`, `era`, `prmd`, `badv
 > - There is no fixup table, no SUM / SMAP dance in subsystem-side
 >   user access, and no asm. Every materialisation either yields a
 >   frame, returns `Errno::EFAULT`, or returns
->   `StepOutcome::Blocked(WaitToken)`; the syscall caller surfaces all
->   three without relying on kernel-mode fault recovery.
+>   `StepOutcome::Yield { shape: YieldShape::OnWaitSource { .. } }`
+>   (carrying a `WaitToken`); the syscall caller surfaces all three
+>   without relying on kernel-mode fault recovery.
 >
 > The implementation lives at
 > `crates/tx-subsystems/src/vm/user_access.rs` as inherent methods on
@@ -2681,7 +2682,7 @@ What this document does *not* specify:
 
 - [`PAGE_SUBSTRATE_v1.md`](PAGE_SUBSTRATE_v1.md) — primary HAL consumer; §2 deliverables list is now realized as platform obligations here.
 - [`DEVICE.md`](../06_devices/DEVICE.md) — tier-1 devices live in HAL; §7 phase table is the H4 expansion.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — HAL/foundation dependency direction and TLB shootdown ordering; `PmapIf::shootdown` realizes the HAL side, while the wait-for-acks and post-shootdown frame accounting live in the substrate-side aggregator.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — HAL/foundation dependency direction and TLB shootdown ordering; `PmapIf::shootdown` realizes the HAL side, while the wait-for-acks and post-shootdown frame accounting live in the substrate-side aggregator.
 - [`00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — HAL is *not* a subsystem; it predates the four-module discipline.
 
 ### External (architectural inspiration only)

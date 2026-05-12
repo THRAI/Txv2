@@ -10,9 +10,9 @@
 
 **Companion documents.**
 
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — SIG-* rules this document implements; BIF-5 (single-carrier attachment) and SCRIPT-* isolation relate.
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — bus static/temporal layering at the vocabulary level.
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) — the publish phase of the in-step commit discipline invokes bus primitives.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — SIG-* rules this document implements; BIF-5 (single-carrier attachment) and SCRIPT-* isolation relate.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — bus static/temporal layering at the vocabulary level.
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — the publish phase of the in-step commit discipline invokes bus primitives.
 - [`SIGNAL_ATTACHMENTS_v1.md`](../04_process-signals/SIGNAL_ATTACHMENTS_v1.md) — per-subsystem publication catalog.
 
 ### Zone-derived type policy
@@ -172,8 +172,8 @@ The declaration types enable compile-time safety for signal firing. Firing a mas
 
 ```
 // at publish phase in step_write_commit:
-pipe.read_wq.fire(ReadinessMask::<PipeReadEnd>::has_data());  // OK
-pipe.read_wq.fire(ReadinessMask::<PipeReadEnd>::writable());  // compile error
+pipe.read_source.fire(ReadinessMask::<PipeReadEnd>::has_data());  // OK
+pipe.read_source.fire(ReadinessMask::<PipeReadEnd>::writable());  // compile error
 //                                             ^^^^^^^^
 //                      error: not a variant of PipeReadEnd's readiness
 ```
@@ -398,7 +398,7 @@ Per SIG-6, signal firing is not a substrate responsibility. The substrate primit
 ```rust
 // inside a step's publish phase (illustrative):
 substrate::index::commit(container, key, evidence);    // the write
-pipe.read_wq.fire(ReadinessMask::has_data());          // the publish
+pipe.read_source.fire(ReadinessMask::has_data());          // the publish
 ```
 
 A lint flags bus-primitive calls outside step commit code (SIG-6): checks/, structure/, projection/ may not call fire. Only execution code inside step functions' publish phase may.
@@ -627,7 +627,7 @@ Attempts to add any of these to the bus would violate either its minimality (goa
 ## 11. Interaction with carve-outs
 <!-- txdoc:BUS-INTERACTION-WITH-CARVE-OUTS-1 -->
 
-Per EXC-1, EXC-2, EXC-3 in `INVARIANTS_v4.md`, three mechanisms are normatively excluded from bus publication:
+Per EXC-1, EXC-2, EXC-3 in `02_INVARIANTS_v5.md`, three mechanisms are normatively excluded from bus publication:
 
 **EXC-1 (fault injection).** Thread-local. The signal subsystem's two-site model handles fault signals via the AST mechanism at trap-return path. The bus sees none of this.
 
@@ -666,9 +666,9 @@ For readers familiar with earlier iterations:
 ## References
 <!-- txdoc:BUS-REFERENCES-1 -->
 
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) §6 (SIG-*), §10 (EXC-*), §2 (BIF-5).
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — bus static/temporal layering and wait primitive integration.
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) §3.4 (publish phase), §3.5 (return).
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) §6 (SIG-*), §10 (EXC-*), §2 (BIF-5).
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — bus static/temporal layering and wait primitive integration.
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) §3.4 (publish phase), §3.5 (return).
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) §7 (import rules: bus/ restrictions).
 - [`SIGNAL_ATTACHMENTS_v1.md`](../04_process-signals/SIGNAL_ATTACHMENTS_v1.md) — per-subsystem catalog of wire usage.
 - [`REACTOR_v0.md`](../02_execution/REACTOR_v0.md) — reactor-provided waker infrastructure.

@@ -14,9 +14,9 @@
 
 **Companion documents**:
 - [`object_model_v2.md`](object_model_v2.md) — current implementation object model (entities, projections, bindings, obligations, retention).
-- [`INVARIANTS_v4.md`](INVARIANTS_v4.md) — STEP-4 codifies the five-phase discipline stated here as invariants; SCRIPT-* covers the script-boundary rules §7.5 enforces.
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) §3 — the same discipline as seen from the execution-primitive view.
-- [`CONCEPTS_v4.md`](CONCEPTS_v4.md) — sub-phase vocabulary, architectural homes, and middleware/protocol-combinator vocabulary.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-4 codifies the five-phase discipline stated here as invariants; SCRIPT-* covers the script-boundary rules §7.5 enforces.
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) §3 — the same discipline as seen from the execution-primitive view.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — sub-phase vocabulary, architectural homes, and middleware/protocol-combinator vocabulary.
 - [`MODULE_MAP_v1.md`](MODULE_MAP_v1.md) — where subsystems, services, scripts, and FS instances live in the codebase.
 - [`LIVENESS_v2.1.md`](archived/LIVENESS_v2.1.md) — archived projection-catalog source material.
 
@@ -814,7 +814,7 @@ Rust module visibility (pub / pub(crate) / private) handles most cases. AST-base
 - Witness types stored in struct fields, static bindings, `Vec`/`HashMap`, or returned/held across `.await` boundaries.
 - `mem::forget` or `ManuallyDrop::new` on reservation types outside `substrate/`.
 - Raw predicate reimplementation: any external code reading subsystem-internal flags (`dentry.removed`, `process.state`, `mount.detached`) outside the canonical predicate function.
-- Scripts importing any subsystem's `structure/` directly (must route through `checks/` and `execution/` only; enforces SCRIPT-2 / SCRIPT-6 from `INVARIANTS_v4.md`).
+- Scripts importing any subsystem's `structure/` directly (must route through `checks/` and `execution/` only; enforces SCRIPT-2 / SCRIPT-6 from `02_INVARIANTS_v5.md`).
 
 These run as pre-commit hooks or CI gates.
 
@@ -935,7 +935,7 @@ Checklist:
 
 1. **Identify entity types.** What entities does this subsystem own? Per `object_model_v2.md` §3, determine each entity's payload organization (co-located / indirected / compound-predicate).
 2. **Draft structure/.** Indexes and flags. pub(crate) fields.
-3. **Enumerate projections.** Use `INVARIANTS_v4.md` PRED-* for rules; archived `LIVENESS_v2.1.md` remains source material for the old catalog format.
+3. **Enumerate projections.** Use `02_INVARIANTS_v5.md` PRED-* for rules; archived `LIVENESS_v2.1.md` remains source material for the old catalog format.
 4. **Write checks/predicates.rs.** One predicate per projection.
 5. **Write checks/witness.rs.** Witness types, lifetime-parameterized, !Send + !Sync, private constructors, contain the IdentRefs that the step's upgrade sub-phase will consume.
 6. **Write checks/require.rs.** One require per operation entry point.
@@ -973,7 +973,7 @@ Checklist:
 <!-- txdoc:SUBSYSTEM-ANATOMY-REFERENCES-1 -->
 
 - [`object_model_v2.md`](object_model_v2.md) — semantic object model: entities, projections, bindings, obligations, retention, concurrency contract
-- [`INVARIANTS_v4.md`](INVARIANTS_v4.md) — STEP-4 codifies the five-phase discipline stated here as invariants
-- [`STEP_MODEL_v1.md`](../02_execution/STEP_MODEL_v1.md) §3 — the same discipline as seen from the execution-primitive view
-- [`CONCEPTS_v4.md`](CONCEPTS_v4.md) — sub-phase vocabulary
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-4 codifies the five-phase discipline stated here as invariants
+- [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) §3 — the same discipline as seen from the execution-primitive view
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — sub-phase vocabulary
 - [`LIVENESS_v2.1.md`](archived/LIVENESS_v2.1.md) — archived source material for projection catalog migration

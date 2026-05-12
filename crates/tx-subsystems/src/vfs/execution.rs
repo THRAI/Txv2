@@ -13,8 +13,8 @@ use crate::tty;
 use tx_substrate::step_v3::{ByteProgress, Errno, NoProgress, StepOutcome};
 
 use super::structure::{
-    Credential, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileIoctl, OpenFileIoctlCaller,
-    OpenFileIoctlResult, RNodeBacking, StructPayload,
+    Credential, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileBacking, OpenFileIoctl,
+    OpenFileIoctlCaller, OpenFileIoctlResult, RNodeBacking, StructPayload,
 };
 
 // === FsOps — emits step_v3 outcomes ==================================
@@ -35,12 +35,26 @@ use super::structure::{
 // Doc tag: `txdoc:STEP-V2-OUTCOME-ALGEBRA-1` (closed four-variant
 // outcome).
 
-/// `FsOps` trait emitting `step_v3` outcomes.
+/// `FsOps` — canonical v3 filesystem operation vtable.
 ///
 /// 13 methods returning
 /// `tx_substrate::step_v3::StepOutcome<T, NoProgress>`. Defaults give
 /// projection-only / device-only backends `ENOSYS` without per-impl
 /// boilerplate.
+///
+/// `FsOps` is **not** the "v4 trait." It is the live VFS operation
+/// boundary dispatched as `Arc<dyn FsOps>` from the shim layer
+/// (`fs_basic.rs`, `fs_mut.rs`, `fs_path.rs`). Once its methods return
+/// `step_v3::StepOutcome`, it is a v3 trait in substance — the name
+/// is older than the v3 vocabulary, that is all. See
+/// `docs/progress/decisions/2026-05-11-pr-1-6-keep-fsops.md` for the
+/// rationale (v3 requires StepOutcome shape unification, not
+/// trait-identity unification; deleting `FsOps` would force a
+/// filesystem-dispatch redesign out of scope for v3).
+///
+/// Companion trait: [`crate::page_backed::FsPageBacking`] is the
+/// page-cache / pager-facing backing surface. Page-cache-backed
+/// filesystems implement both; the traits do not subsume each other.
 pub trait FsOps: Send + Sync + 'static {
     fn lookup(
         &self,
@@ -241,7 +255,15 @@ impl OpenFile {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
-        match self.rnode.backing() {
+        // PR-10 phase 0: userfaultfd fds have no VFS-shaped read path.
+        // The agent-side read syscall lands in P-10.5 with its own
+        // dispatch (it dequeues a fault message, not bytes from a
+        // file). Surface EINVAL until then.
+        if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
+            return StepOutcome::Err(Errno::EINVAL);
+        }
+
+        match self.rnode().backing() {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => tty::execution::step_read(tty, out, guard),
                 StructPayload::CharDevice(binding) => binding.ops.read(out, guard),
@@ -260,9 +282,17 @@ impl OpenFile {
                 } => StepOutcome::Err(Errno::EBADF),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
-            RNodeBacking::PageBacked { .. }
-            | RNodeBacking::Symlink { .. }
-            | RNodeBacking::Projected => StepOutcome::Err(Errno::ENOSYS),
+            // PR-11 follow-up (W-KK, closing the ENOSYS gap W-JJ flagged
+            // in the PR-11 phase-6 AIO canary): route PageBacked reads
+            // through the kernel-buffer page-backed read path. PC-side
+            // page materialisation handles EOF / blocking / errors;
+            // `of.offset()` is advanced inside the helper.
+            RNodeBacking::PageBacked { pc } => {
+                crate::page_backed::step_read_to_kernel(pc, self, out, guard)
+            }
+            RNodeBacking::Symlink { .. } | RNodeBacking::Projected => {
+                StepOutcome::Err(Errno::ENOSYS)
+            }
         }
     }
 
@@ -295,13 +325,18 @@ impl OpenFile {
         whence: u32,
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
+        // PR-10 phase 0: userfaultfd fds have no offset semantic.
+        // Linux returns ESPIPE on `lseek(uffd_fd, ...)`; match that.
+        if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
+            return StepOutcome::Err(Errno::ESPIPE);
+        }
         // Backing-driven dispatch: short-circuit non-seekable
         // backings before any arithmetic. Pipes / TTY / chardev are
         // ESPIPE regardless of whence (Linux's `lseek(2)` man page:
         // "lseek() may, but need not, return -1 with errno set to
         // ESPIPE when offset is 0; portable code must treat any
         // result other than the requested offset as an error").
-        match self.rnode.backing() {
+        match self.rnode().backing() {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(_)
                 | StructPayload::CharDevice(_)
@@ -326,7 +361,7 @@ impl OpenFile {
             },
             // SEEK_END
             2 => {
-                let size = match self.rnode.backing() {
+                let size = match self.rnode().backing() {
                     RNodeBacking::PageBacked { pc } => pc.size_bytes() as i64,
                     // The outer match above already short-circuited
                     // every non-PageBacked backing; this arm is
@@ -357,7 +392,14 @@ impl OpenFile {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
-        match self.rnode.backing() {
+        // PR-10 phase 0: userfaultfd fds have no VFS-shaped write path.
+        // The agent-side `UFFDIO_*` ioctls (phase P-10.5) deliver the
+        // reply path, not write(2). Surface EINVAL until then.
+        if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
+            return StepOutcome::Err(Errno::EINVAL);
+        }
+
+        match self.rnode().backing() {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => tty::execution::step_write(tty, bytes, guard),
                 StructPayload::CharDevice(binding) => binding.ops.write(bytes, guard),
@@ -373,9 +415,16 @@ impl OpenFile {
                 } => StepOutcome::Err(Errno::EBADF),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
-            RNodeBacking::PageBacked { .. }
-            | RNodeBacking::Symlink { .. }
-            | RNodeBacking::Projected => StepOutcome::Err(Errno::ENOSYS),
+            // Symmetric to the PageBacked step_read arm above — route
+            // through the kernel-buffer page-backed write path. The
+            // helper handles capacity checks, page materialisation,
+            // `of.offset()` advance, and `PC.size` growth.
+            RNodeBacking::PageBacked { pc } => {
+                crate::page_backed::step_write_from_kernel(pc, self, bytes, guard)
+            }
+            RNodeBacking::Symlink { .. } | RNodeBacking::Projected => {
+                StepOutcome::Err(Errno::ENOSYS)
+            }
         }
     }
 
@@ -391,7 +440,14 @@ impl OpenFile {
         request: OpenFileIoctl<'_>,
         guard: &Guard<'_>,
     ) -> StepOutcome<OpenFileIoctlResult, NoProgress> {
-        match self.rnode.backing() {
+        // PR-10 phase 0: the VFS ioctl surface (`OpenFileIoctl`) is
+        // TTY-shaped; userfaultfd ioctls have their own request
+        // catalog landing in P-10.2+. Return ENOTTY for ufd fds via
+        // this dispatcher.
+        if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
+            return StepOutcome::Err(Errno::ENOTTY);
+        }
+        match self.rnode().backing() {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => step_tty_ioctl(tty, caller, request, guard),
                 StructPayload::CharDevice(_) => StepOutcome::Err(Errno::ENOSYS),
@@ -468,5 +524,410 @@ fn step_tty_ioctl(
             tty::execution::step_ioctl_tiocnotty_for_process(tty_id, caller.process(), guard),
             OpenFileIoctlResult::SideEffect,
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StepOp wraps (PR-2 wave 3)
+// ---------------------------------------------------------------------------
+//
+// Additive `impl StepOp` adapters per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1.
+//
+// Unlike most PR-2 wraps in sibling subsystems (which target free `step_*`
+// fns), the VFS execution surface exposes its four `step_*` operations as
+// inherent methods on `OpenFile` (`step_read`, `step_lseek`, `step_write`,
+// `step_ioctl`). The wraps therefore hold a `&'a Cap<OpenFile>` and delegate
+// from `step()` through `Cap::deref()` to the method body — semantics are
+// unchanged. The `Cap<OpenFile>` is borrowed (not cloned) so the `Op` shape
+// matches the other wave-3 byte-IO wraps (`pipe::ReadOp`, `tty::execution::
+// step_read::ReadOp`).
+
+/// `StepOp` wrap of [`OpenFile::step_read`].
+pub struct OpenFileReadOp<'a> {
+    pub file: &'a tx_substrate::zone::Cap<super::structure::OpenFile>,
+    pub out: &'a mut [u8],
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for OpenFileReadOp<'a>
+{
+    type Output = usize;
+    type Progress = ByteProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        self.file.step_read(self.out, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`OpenFile::step_lseek`]. `offset` / `whence` are
+/// scalar; stored by value.
+pub struct OpenFileLseekOp<'a> {
+    pub file: &'a tx_substrate::zone::Cap<super::structure::OpenFile>,
+    pub offset: i64,
+    pub whence: u32,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for OpenFileLseekOp<'a>
+{
+    type Output = u64;
+    type Progress = NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        self.file.step_lseek(self.offset, self.whence, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`OpenFile::step_write`].
+pub struct OpenFileWriteOp<'a> {
+    pub file: &'a tx_substrate::zone::Cap<super::structure::OpenFile>,
+    pub bytes: &'a [u8],
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for OpenFileWriteOp<'a>
+{
+    type Output = usize;
+    type Progress = ByteProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        self.file.step_write(self.bytes, self.guard)
+    }
+}
+
+/// `StepOp` wrap of [`OpenFile::step_ioctl`]. The caller / request enums
+/// borrow `'a`, so the wrap inherits the same lifetime.
+pub struct OpenFileIoctlOp<'a> {
+    pub file: &'a tx_substrate::zone::Cap<super::structure::OpenFile>,
+    pub caller: OpenFileIoctlCaller<'a>,
+    pub request: OpenFileIoctl<'a>,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for OpenFileIoctlOp<'a>
+{
+    type Output = OpenFileIoctlResult;
+    type Progress = NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        self.file.step_ioctl(self.caller, self.request, self.guard)
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    //! PR-2 wave-3 StepOp wrap tests. Each test constructs a minimal
+    //! `OpenFile` (TTY-, char-device-, or directory-backed) and confirms
+    //! the wrap delegates to the corresponding `OpenFile::step_*` method.
+    //! Coverage of the dispatch table itself lives in
+    //! `crate::vfs::tests`.
+    use super::*;
+    use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
+    use crate::vfs::structure::{
+        FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl,
+        OpenFileIoctlCaller, OpenFileIoctlResult, RNode, RNodeBacking, StructPayload,
+    };
+    use crate::zones;
+    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+    use tx_substrate::zone::{self as zone_mod, Cap, PayloadCap};
+
+    struct EchoOps;
+
+    impl CharDeviceOps for EchoOps {
+        fn read(
+            &self,
+            out: &mut [u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, ByteProgress> {
+            if out.is_empty() {
+                return V3::Done(0);
+            }
+            out[0] = b'E';
+            V3::Done(1)
+        }
+
+        fn write(
+            &self,
+            bytes: &[u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, ByteProgress> {
+            V3::Done(bytes.len())
+        }
+    }
+
+    static ECHO_OPS: EchoOps = EchoOps;
+    static ECHO_BINDING: CharDeviceBinding = CharDeviceBinding {
+        devt: DevT::new(241, 0),
+        name: "echo-wraptest",
+        ops: &ECHO_OPS,
+    };
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        tx_substrate::testing::init_host_for_test_once();
+        let _ = zones::register_all();
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        crate::tty::structure::registry::reset_for_tests();
+        guard
+    }
+
+    fn make_char_open_file(read: bool, write: bool) -> Cap<OpenFile> {
+        let rnode = RNode::new_cap(
+            FsObjectId::new(1001),
+            InodeMeta::new(InodeKind::CharDevice, 0o020600),
+            RNodeBacking::StructBacked {
+                payload: StructPayload::CharDevice(&ECHO_BINDING),
+            },
+        )
+        .expect("char rnode");
+        OpenFile::new_cap(
+            rnode,
+            OpenFileFlags {
+                read,
+                write,
+                append: false,
+                cloexec: false,
+                nonblocking: false,
+            },
+        )
+        .expect("open file")
+    }
+
+    fn make_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
+        let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload = PayloadCap::from_cap(zone_mod::sign_for(
+            payload_res,
+            TtyPayload::new_hardware(&ECHO_BINDING),
+        ));
+        let identity = zone_mod::sign_for(
+            id_res,
+            TtyIdentity::new(TtyKind::SerialHardware, index, name),
+        );
+        identity.install_payload(payload);
+        identity
+    }
+
+    fn make_tty_open_file(read: bool, write: bool, index: u32, name: &str) -> Cap<OpenFile> {
+        let tty = make_tty(index, name);
+        let rnode = RNode::new_cap(
+            FsObjectId::new(2000 + u64::from(index)),
+            InodeMeta::new(InodeKind::CharDevice, 0o020600),
+            RNodeBacking::StructBacked {
+                payload: StructPayload::Tty(tty),
+            },
+        )
+        .expect("tty rnode");
+        OpenFile::new_cap(
+            rnode,
+            OpenFileFlags {
+                read,
+                write,
+                append: false,
+                cloexec: false,
+                nonblocking: false,
+            },
+        )
+        .expect("open file")
+    }
+
+    fn make_dir_open_file(read: bool) -> Cap<OpenFile> {
+        let rnode = RNode::new_cap(
+            FsObjectId::new(3000),
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+        )
+        .expect("dir rnode");
+        OpenFile::new_cap(
+            rnode,
+            OpenFileFlags {
+                read,
+                write: false,
+                append: false,
+                cloexec: false,
+                nonblocking: false,
+            },
+        )
+        .expect("open file")
+    }
+
+    #[test]
+    fn read_op_delegates_to_step_read() {
+        let _g = setup();
+        let guard = tx_substrate::epoch::guard();
+        let file = make_char_open_file(true, false);
+        let mut buf = [0u8; 4];
+        let mut op = OpenFileReadOp {
+            file: &file,
+            out: &mut buf,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        match op.step(&mut ctx) {
+            V3::Done(n) => {
+                assert_eq!(n, 1);
+                assert_eq!(buf[0], b'E');
+            }
+            other => panic!("expected Done(1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_op_propagates_einval_when_not_readable() {
+        let _g = setup();
+        let guard = tx_substrate::epoch::guard();
+        let file = make_char_open_file(false, true);
+        let mut buf = [0u8; 4];
+        let mut op = OpenFileReadOp {
+            file: &file,
+            out: &mut buf,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        match op.step(&mut ctx) {
+            V3::Err(e) => assert_eq!(e, Errno::EINVAL),
+            other => panic!("expected Err(EINVAL), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_op_delegates_to_step_write() {
+        let _g = setup();
+        let guard = tx_substrate::epoch::guard();
+        let file = make_char_open_file(false, true);
+        let mut op = OpenFileWriteOp {
+            file: &file,
+            bytes: b"hello",
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        match op.step(&mut ctx) {
+            V3::Done(n) => assert_eq!(n, 5),
+            other => panic!("expected Done(5), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_op_propagates_einval_when_not_writable() {
+        let _g = setup();
+        let guard = tx_substrate::epoch::guard();
+        let file = make_char_open_file(true, false);
+        let mut op = OpenFileWriteOp {
+            file: &file,
+            bytes: b"hi",
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        match op.step(&mut ctx) {
+            V3::Err(e) => assert_eq!(e, Errno::EINVAL),
+            other => panic!("expected Err(EINVAL), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lseek_op_on_non_seekable_returns_espipe() {
+        let _g = setup();
+        let guard = tx_substrate::epoch::guard();
+        let file = make_char_open_file(true, false);
+        let mut op = OpenFileLseekOp {
+            file: &file,
+            offset: 0,
+            whence: 0,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        match op.step(&mut ctx) {
+            V3::Err(e) => assert_eq!(e, Errno::ESPIPE),
+            other => panic!("expected Err(ESPIPE), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lseek_op_on_directory_returns_eisdir() {
+        let _g = setup();
+        let guard = tx_substrate::epoch::guard();
+        let file = make_dir_open_file(true);
+        let mut op = OpenFileLseekOp {
+            file: &file,
+            offset: 0,
+            whence: 0,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        match op.step(&mut ctx) {
+            V3::Err(e) => assert_eq!(e, Errno::EISDIR),
+            other => panic!("expected Err(EISDIR), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ioctl_op_on_chardev_returns_enosys() {
+        let _g = setup();
+        let guard = tx_substrate::epoch::guard();
+        let file = make_char_open_file(true, true);
+        // Construct an OpenFileIoctlCaller that does not require a real
+        // process — `step_ioctl` short-circuits on chardev backings
+        // before it consults the caller, so we can use a default-shaped
+        // caller built from a freshly bootstrapped init process.
+        crate::process::execution::reset_init_process_for_test();
+        crate::process::structure::reset_pid_counter_for_test();
+        crate::thread_runtime::structure::reset_tid_counter_for_test();
+        let proc_cap = crate::process::bootstrap_init_process(
+            crate::vm::AddressSpace::new_cap_for_platform::<crate::vm::TestPmap>().expect("aspace"),
+        )
+        .expect("init");
+        let caller = OpenFileIoctlCaller::from_process(&proc_cap);
+        let mut op = OpenFileIoctlOp {
+            file: &file,
+            caller,
+            request: OpenFileIoctl::Tcgets,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        match op.step(&mut ctx) {
+            V3::Err(e) => assert_eq!(e, Errno::ENOSYS),
+            other => panic!("expected Err(ENOSYS), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ioctl_op_on_tty_returns_termios() {
+        let _g = setup();
+        let guard = tx_substrate::epoch::guard();
+        let file = make_tty_open_file(true, true, 7, "ttyS7-wraptest");
+        crate::process::execution::reset_init_process_for_test();
+        crate::process::structure::reset_pid_counter_for_test();
+        crate::thread_runtime::structure::reset_tid_counter_for_test();
+        let proc_cap = crate::process::bootstrap_init_process(
+            crate::vm::AddressSpace::new_cap_for_platform::<crate::vm::TestPmap>().expect("aspace"),
+        )
+        .expect("init");
+        let caller = OpenFileIoctlCaller::from_process(&proc_cap);
+        let mut op = OpenFileIoctlOp {
+            file: &file,
+            caller,
+            request: OpenFileIoctl::Tcgets,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        match op.step(&mut ctx) {
+            V3::Done(OpenFileIoctlResult::Termios(_)) => {}
+            other => panic!("expected Done(Termios), got {other:?}"),
+        }
     }
 }

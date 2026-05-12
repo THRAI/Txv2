@@ -202,7 +202,7 @@ fn dispatch_wait4_specific_pid_skips_other_zombies() {
 /// driver future that polls `sys_wait4(-1, NULL, 0, NULL)`. First
 /// poll → Pending (no zombie). Manually call `step_exit_group` on
 /// the child (which routes through `post_sigchld_to_parent` and
-/// fires the parent's `exit_port` channel). Subsequent polls →
+/// fires the parent's `exit_source` channel). Subsequent polls →
 /// Ready with the child's pid.
 #[test]
 fn dispatch_wait4_blocking_resolves_when_child_zombifies() {
@@ -230,8 +230,8 @@ fn dispatch_wait4_blocking_resolves_when_child_zombifies() {
     let fut = dispatch::<ShimsTestPmap>(req, &ctx);
     let mut pinned = Box::pin(fut);
 
-    // First poll: no zombie ready, parks on exit_port via
-    // wait_carrier::wait_on_token.
+    // First poll: no zombie ready, parks on exit_source via
+    // wait_source::wait_on_token.
     let first = pinned.as_mut().poll(&mut cx);
     assert!(
         matches!(first, Poll::Pending),
@@ -239,8 +239,8 @@ fn dispatch_wait4_blocking_resolves_when_child_zombifies() {
     );
 
     // Now zombify the child. step_exit_group →
-    // post_sigchld_to_parent → parent.fire_exit_port(...) — fires
-    // the EXIT_PORT_CHILD_ZOMBIFIED bit on the parent's channel,
+    // post_sigchld_to_parent → parent.fire_exit_source(...) — fires
+    // the EXIT_SOURCE_CHILD_ZOMBIFIED bit on the parent's channel,
     // which wakes the WaitFuture.
     step_exit_group(&child, ExitStatus::Exited(0));
     assert!(child.is_zombie());

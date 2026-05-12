@@ -52,6 +52,35 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
             ],
             "txdoc:CI-GATE-CLIPPY",
         ),
+        // Retired-vocabulary regression gate. Enforces clippy.toml's
+        // `disallowed-names` (et al.) without inheriting the broad
+        // `-D warnings` of the step above so that unrelated cosmetic
+        // lints (e.g. PR-2 dead_code scaffolding, byte-grouping style)
+        // do not gate this check. See:
+        //   docs/progress/decisions/2026-05-12-d13-tdd-retirement-via-clippy.md
+        //   docs/progress/decisions/2026-05-12-d10-vocabulary-retire-audit.md
+        ci_run(
+            root,
+            "retired vocabulary gate",
+            "cargo",
+            &[
+                "clippy",
+                "--no-deps",
+                "--workspace",
+                "--lib",
+                "--bins",
+                "--",
+                "-A",
+                "clippy::all",
+                "-D",
+                "clippy::disallowed_names",
+                "-D",
+                "clippy::disallowed_types",
+                "-D",
+                "clippy::disallowed_methods",
+            ],
+            "txdoc:CI-GATE-RETIRED-VOCAB",
+        ),
         ci_run(
             root,
             "host workspace check",
@@ -171,6 +200,12 @@ pub(crate) fn ci_slow(root: &Path) -> Result<()> {
                 "--profile",
                 "smoke",
                 "--expect-sentinel",
+                // GitHub Actions runs qemu-system-riscv64 under software
+                // emulation (no KVM); the 10s dev default isn't enough
+                // headroom for SMP=4 boot through reactor + process +
+                // tty + mount + init. 30s is empirically comfortable.
+                "--timeout-ms",
+                "30000",
             ],
             "txdoc:CI-GATE-QEMU-SMOKE",
         ),

@@ -25,7 +25,7 @@ use super::*;
 /// - `Err(Errno::EINVAL)` on offset overflow.
 /// - `Err(Errno::EIO)` if the substrate's direct-map hook is not
 ///   installed for a materialised PPN.
-/// - `Yield { OnCarrier { .. } }` propagates from `materialize_page`
+/// - `Yield { OnWaitSource { .. } }` propagates from `materialize_page`
 ///   (e.g. an `FsPageBacking::fetch_page` block) carrying the bytes
 ///   read so far as `ByteProgress`.
 ///
@@ -74,7 +74,7 @@ pub fn read_exact_at(
         // - v3 `Continue { .. }` (NoProgress) → no frame; surface
         //   `Err(EAGAIN)` as a conservative collapse — page allocation
         //   rarely emits this for a one-shot loader read.
-        // - v3 `Yield { OnCarrier { c, i } }` → propagate as v3
+        // - v3 `Yield { OnWaitSource { c, i } }` → propagate as v3
         //   `Yield` carrying accumulated `ByteProgress`.
         // - v3 `Yield { OnAgent .. }` → `Err(EIO)`.
         // - v3 `Err(e)` → `Err(e)`.
@@ -82,10 +82,14 @@ pub fn read_exact_at(
             V3::Done(m) => m,
             V3::Continue { .. } => return V3::err(Errno::EAGAIN.into()),
             V3::Yield {
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => {
-                return V3::yield_on_carrier(
+                return V3::yield_on_wait_source(
                     ByteProgress::new(advanced),
                     carrier.raw(),
                     interests.raw(),

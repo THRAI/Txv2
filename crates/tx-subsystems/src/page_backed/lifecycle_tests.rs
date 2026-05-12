@@ -304,7 +304,7 @@ fn pagebacked_step_fsync_returns_advanced_then_blocked_after_flush_progress() {
         step_fsync(&pc, &guard),
         V3Out::Yield {
             progress: V3PageProgress::new(1),
-            shape: V3YieldShape::on_carrier(13, 0x55),
+            shape: V3YieldShape::on_wait_source(13, 0x55),
         }
     );
 
@@ -704,7 +704,7 @@ impl crate::page_backed::FsPageBacking for LifecycleFs {
             // (which consumes `FsPageBacking`) can map this back to
             // the appropriate yield shape with the carrier/interest
             // values the fixture assertions check against.
-            V3Outcome::yield_on_carrier(NoProgress, 13, 0x55)
+            V3Outcome::yield_on_wait_source(NoProgress, 13, 0x55)
         } else {
             V3Outcome::done(())
         }

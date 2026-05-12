@@ -212,7 +212,7 @@ impl StepOp for vfs::ReadOp {
         match self.of.rnode().backing_kind() {
             BackingKind::PageCache => self.step_page_cache(ctx),
             BackingKind::Fuse => self.step_fuse(ctx),       // Yields OnAgent
-            BackingKind::Pipe => self.step_pipe(ctx),       // Yields OnCarrier
+            BackingKind::Pipe => self.step_pipe(ctx),       // Yields OnWaitSource
             BackingKind::Tty  => self.step_tty(ctx),
             // ...
         }
@@ -236,7 +236,7 @@ A lower-half `StepOp` does not encode whose authority it runs under. It receives
 
 ### 4.3 Both halves yield identically
 
-A dcache miss in upper-half `vfs::PathResolveOp` returns `Yield { shape: OnCarrier { carrier: dcache.fill_wq, ... } }`. A FUSE read in lower-half `vfs::ReadOp` returns `Yield { shape: OnAgent { endpoint: ..., request: ..., ... } }`. The driver mode handles both. There is no special "upper-half-only" or "lower-half-only" yield shape.
+A dcache miss in upper-half `vfs::PathResolveOp` returns `Yield { shape: OnWaitSource { source: dcache.fill_source.id(), ... } }`. A FUSE read in lower-half `vfs::ReadOp` returns `Yield { shape: OnAgent { endpoint: ..., request: ..., ... } }`. The driver mode handles both. There is no special "upper-half-only" or "lower-half-only" yield shape.
 
 ### 4.4 The upper-half terminates the lower-half input
 

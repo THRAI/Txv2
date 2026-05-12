@@ -13,7 +13,7 @@ Companion documents:
 
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) §3 (five-phase discipline), §4.1 (zone reservation pattern).
 - [`PROCESS_v1.md`](../04_process-signals/PROCESS_v1.md) §9 and [`NAMESPACE_VIEW_v1.md`](../00_meta-framework/NAMESPACE_VIEW_v1.md) (PidNamespace allocation through `AllocIndex`).
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — reservation, step, and publication invariants consumed by this primitive.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — reservation, step, and publication invariants consumed by this primitive.
 
 ### What this document pins
 <!-- txdoc:BITMAP-RESERVATION-STATUS-WHAT-THIS-DOCUMENT-PINS-1 -->

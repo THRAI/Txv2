@@ -341,7 +341,13 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Bootstrap exec runs as init (root) by construction.
         let cred = Credential::root();
-        let envp: &[&[u8]] = &[];
+        // busybox sh needs at least PATH to find applet binaries
+        // (`ls`, `cat`, etc.) — without it, command lookup short-
+        // circuits to "not found" before the kernel's fork/exec path
+        // ever runs, and the prompt never returns from the failing
+        // command. `/bin` is where our cpio rootfs places every
+        // applet symlink.
+        let envp: &[&[u8]] = &[b"PATH=/bin"];
 
         // Cmdline-driven init path (initramfs slice):
         //   `init=/some/path` -> exec that path with argv=[basename]
@@ -376,6 +382,24 @@ impl<P: TxPlatform> CoreInit<P> {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":bootstrap-exec:fallback:");
                 tx_hal::console_write_str::<P>(exec_error_tag(e));
+                // DIAGNOSTIC (temp, 2026-05-12): when the tag is
+                // `not-executable` the kernel's exec_script records a
+                // finer-grained site label in
+                // `tx_scripts::process::exec::LAST_NOTEXEC_SITE`. Emit
+                // that on the same line so the busybox loader gap can
+                // be triaged from the boot log alone.
+                if matches!(e, tx_scripts::process::exec::ExecError::NotExecutable) {
+                    tx_hal::console_write_str::<P>(":site=");
+                    tx_hal::console_write_str::<P>(
+                        tx_scripts::process::exec::script::last_notexec_site_label(),
+                    );
+                    tx_hal::console_write_str::<P>(":file_size=");
+                    Self::write_decimal_unsigned(
+                        tx_scripts::process::exec::script::LAST_EXEC_FILE_SIZE
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                            as usize,
+                    );
+                }
                 tx_hal::console_write_str::<P>("\n");
             }
             Err(e) => {
@@ -516,10 +540,65 @@ impl<P: TxPlatform> CoreInit<P> {
                 break;
             }
 
+            // Drain any pending child-thread submits posted from
+            // sys_clone *before* polling the reactor again. This is
+            // the per-loop visibility seam — submits enqueued during
+            // the previous poll iteration become visible to the
+            // reactor here, outside the inner lock that sys_clone
+            // ran under.
+            Self::drain_pending_child_submits();
+
             let step = match Self::step_boot_reactor_once(current_cpu) {
                 Some(step) => step,
                 None => break,
             };
+
+            // DIAGNOSTIC: dump counters every Nth loop iteration so we
+            // see flow even when busybox spins on a userspace-side
+            // loop or fast-yielding syscall chain.
+            {
+                use core::sync::atomic::{AtomicUsize, Ordering};
+                static ITER_SINCE_DUMP: AtomicUsize = AtomicUsize::new(0);
+                const DUMP_ITER_PERIOD: usize = 500;
+                if ITER_SINCE_DUMP.fetch_add(1, Ordering::Relaxed) + 1 >= DUMP_ITER_PERIOD {
+                    ITER_SINCE_DUMP.store(0, Ordering::Relaxed);
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":iter_tick:read=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS.load(Ordering::Relaxed),
+                    );
+                    tx_hal::console_write_str::<P>(":ppoll=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS.load(Ordering::Relaxed),
+                    );
+                    tx_hal::console_write_str::<P>(":clone=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::proc::SYS_CLONE_INVOCATIONS
+                            .load(Ordering::Relaxed),
+                    );
+                    tx_hal::console_write_str::<P>(":execve=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::proc::SYS_EXECVE_INVOCATIONS
+                            .load(Ordering::Relaxed),
+                    );
+                    tx_hal::console_write_str::<P>(":wait4=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::proc::SYS_WAIT4_INVOCATIONS
+                            .load(Ordering::Relaxed),
+                    );
+                    tx_hal::console_write_str::<P>(":clone_flags=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::proc::SYS_CLONE_LAST_FLAGS.load(Ordering::Relaxed)
+                            as usize,
+                    );
+                    tx_hal::console_write_str::<P>(":clone_reject=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::proc::SYS_CLONE_LAST_REJECT_FLAGS
+                            .load(Ordering::Relaxed) as usize,
+                    );
+                    tx_hal::console_write_str::<P>("\n");
+                }
+            }
 
             if step.should_idle() && !init.is_zombie() {
                 P::wait_for_interrupt_once();
@@ -538,6 +617,47 @@ impl<P: TxPlatform> CoreInit<P> {
                 // becomes redundant, but it's harmless when
                 // there are no buffered bytes).
                 Self::drain_sbi_console_into_tty();
+                // DIAGNOSTIC (temp, 2026-05-12): periodically dump
+                // the syscall counters so we can see what shape
+                // userspace is in even when no userspace exit
+                // sentinel fires (busybox hanging on an unimplemented
+                // syscall, for example).
+                use core::sync::atomic::{AtomicUsize, Ordering};
+                static IDLE_WAKES_SINCE_DUMP: AtomicUsize = AtomicUsize::new(0);
+                const DUMP_PERIOD: usize = 50;
+                if IDLE_WAKES_SINCE_DUMP.fetch_add(1, Ordering::Relaxed) + 1 >= DUMP_PERIOD {
+                    IDLE_WAKES_SINCE_DUMP.store(0, Ordering::Relaxed);
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":syscall_tick:read=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS.load(Ordering::Relaxed),
+                    );
+                    tx_hal::console_write_str::<P>(":ppoll=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS.load(Ordering::Relaxed),
+                    );
+                    tx_hal::console_write_str::<P>(":ioctl=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::fs_basic::SYS_IOCTL_INVOCATIONS
+                            .load(Ordering::Relaxed),
+                    );
+                    tx_hal::console_write_str::<P>(":clone=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::proc::SYS_CLONE_INVOCATIONS
+                            .load(Ordering::Relaxed),
+                    );
+                    tx_hal::console_write_str::<P>(":execve=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::proc::SYS_EXECVE_INVOCATIONS
+                            .load(Ordering::Relaxed),
+                    );
+                    tx_hal::console_write_str::<P>(":wait4=");
+                    Self::write_decimal_unsigned(
+                        tx_shims::linux_syscall::proc::SYS_WAIT4_INVOCATIONS
+                            .load(Ordering::Relaxed),
+                    );
+                    tx_hal::console_write_str::<P>("\n");
+                }
             }
         }
 
@@ -549,6 +669,163 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:exited:");
         Self::write_signed_decimal(status_word);
+        tx_hal::console_write_str::<P>("\n");
+
+        // DIAGNOSTIC (temp, 2026-05-12): dump sys_read counters so we
+        // can see what shape the post-prompt EOF takes.
+        use core::sync::atomic::Ordering;
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":sys_read:invocations=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":done_zero=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::io::SYS_READ_DONE_ZERO.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":done_nonzero=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::io::SYS_READ_DONE_NONZERO.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":yields=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::io::SYS_READ_YIELDS.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":wait_none=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::io::SYS_READ_WAIT_NONE.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":err=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::io::SYS_READ_ERR.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":last_errno=");
+        Self::write_signed_decimal(
+            tx_shims::linux_syscall::io::SYS_READ_LAST_ERRNO.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>("\n");
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":step_read:eof_pending=");
+        Self::write_decimal_unsigned(
+            tx_subsystems::tty::execution::STEP_READ_EOF_PENDING.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":vmin_none=");
+        Self::write_decimal_unsigned(
+            tx_subsystems::tty::execution::STEP_READ_VMIN_NONE.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":vmin_zero=");
+        Self::write_decimal_unsigned(
+            tx_subsystems::tty::execution::STEP_READ_VMIN_ZERO_EMPTY.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":vmin_nonzero=");
+        Self::write_decimal_unsigned(
+            tx_subsystems::tty::execution::STEP_READ_VMIN_NONZERO.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":threshold_unmet=");
+        Self::write_decimal_unsigned(
+            tx_subsystems::tty::execution::STEP_READ_THRESHOLD_UNMET.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":drained=");
+        Self::write_decimal_unsigned(
+            tx_subsystems::tty::execution::STEP_READ_DRAINED.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":yield_noncanon_empty=");
+        Self::write_decimal_unsigned(
+            tx_subsystems::tty::execution::STEP_READ_YIELD_NONCANON_EMPTY.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":fgpgrp_err=");
+        Self::write_decimal_unsigned(
+            tx_subsystems::tty::execution::STEP_READ_FGPGRP_ERR.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":lflag=");
+        Self::write_decimal_unsigned(
+            tx_subsystems::tty::execution::STEP_READ_LAST_LFLAG.load(Ordering::Relaxed) as usize,
+        );
+        tx_hal::console_write_str::<P>(":vmin=");
+        Self::write_decimal_unsigned(
+            tx_subsystems::tty::execution::STEP_READ_LAST_VMIN.load(Ordering::Relaxed) as usize,
+        );
+        tx_hal::console_write_str::<P>(":vtime=");
+        Self::write_decimal_unsigned(
+            tx_subsystems::tty::execution::STEP_READ_LAST_VTIME.load(Ordering::Relaxed) as usize,
+        );
+        tx_hal::console_write_str::<P>("\n");
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":sys_ioctl:invocations=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_INVOCATIONS.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":last_request=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_LAST_REQUEST.load(Ordering::Relaxed)
+                as usize,
+        );
+        tx_hal::console_write_str::<P>(":tcsets_calls=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_TCSETS_CALLS.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":tcgets_calls=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_TCGETS_CALLS.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":first_tcgets_lflag=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::fs_basic::FIRST_TCGETS_LFLAG.load(Ordering::Relaxed) as usize,
+        );
+        tx_hal::console_write_str::<P>(":first_tcgets_vmin=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::fs_basic::FIRST_TCGETS_VMIN.load(Ordering::Relaxed) as usize,
+        );
+        tx_hal::console_write_str::<P>(":last_tcsets_lflag=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::fs_basic::LAST_TCSETS_LFLAG.load(Ordering::Relaxed) as usize,
+        );
+        tx_hal::console_write_str::<P>(":last_tcsets_vmin=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::fs_basic::LAST_TCSETS_VMIN.load(Ordering::Relaxed) as usize,
+        );
+        tx_hal::console_write_str::<P>(":last_tcsets_vtime=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::fs_basic::LAST_TCSETS_VTIME.load(Ordering::Relaxed) as usize,
+        );
+        tx_hal::console_write_str::<P>(":first_tcsets_lflag=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::fs_basic::FIRST_TCSETS_LFLAG.load(Ordering::Relaxed) as usize,
+        );
+        tx_hal::console_write_str::<P>(":first_tcsets_vmin=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::fs_basic::FIRST_TCSETS_VMIN.load(Ordering::Relaxed) as usize,
+        );
+        tx_hal::console_write_str::<P>(":ppoll_invocations=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":ppoll_last_nfds=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::io::SYS_PPOLL_LAST_NFDS.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":ppoll_last_timeout_ptr=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::io::SYS_PPOLL_LAST_TIMEOUT_PTR.load(Ordering::Relaxed)
+                as usize,
+        );
+        tx_hal::console_write_str::<P>("\n");
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":sys_proc:execve=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::proc::SYS_EXECVE_INVOCATIONS.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":clone=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::proc::SYS_CLONE_INVOCATIONS.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":wait4=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::proc::SYS_WAIT4_INVOCATIONS.load(Ordering::Relaxed),
+        );
         tx_hal::console_write_str::<P>("\n");
     }
 

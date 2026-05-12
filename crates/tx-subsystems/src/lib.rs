@@ -4,23 +4,27 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod aio;
 pub mod cred;
 pub mod device;
 pub mod execution;
 pub mod futex;
 pub mod initramfs;
+pub mod io_uring;
 pub mod mount;
 pub mod page_backed;
 pub mod pipe;
 pub mod process;
 pub mod reactor_submit;
 pub mod signal;
+pub mod signalfd;
 mod sync;
 pub mod thread_runtime;
 pub mod tty;
+pub mod userfaultfd;
 pub mod vfs;
 pub mod vm;
-pub mod wait_carrier;
+pub mod wait_source;
 pub mod zones;
 
 #[cfg(test)]

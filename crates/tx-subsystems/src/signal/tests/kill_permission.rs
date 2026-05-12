@@ -8,8 +8,11 @@ use crate::signal::{script_kill_pgrp, script_kill_probe, script_kill_process, Ki
 use tx_substrate::zone::Cap;
 
 fn set_cred(proc_cap: &Cap<ProcessIdentity>, cred: Cred) {
+    // PR-9 phase 5 (D5 Path A): `cred` lives in `AtomicSlot<Cap<Cred>>`.
     let payload_guard = proc_cap.payload.lock();
-    *payload_guard.as_ref().expect("alive").cred.lock() = cred;
+    let payload = payload_guard.as_ref().expect("alive");
+    let new_cap = crate::cred::sign_cred(cred).expect("zone slab has capacity in tests");
+    let _old = payload.replace_cred(new_cap);
 }
 
 fn limited_cred(uid: u32) -> Cred {

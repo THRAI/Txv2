@@ -11,8 +11,8 @@ use tx_substrate::SpinMutex;
 use crate::execution::Guard;
 
 use super::{
-    AddressSpaceStats, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry,
-    VmEntryError, VmEntryFlags, VmMapCommit, VmMapError, USER_PAGE_SIZE,
+    AddressSpaceStats, MapPlacement, Prot, UfdRegistration, UserRange, UserVirtAddr, VmBacking,
+    VmEntry, VmEntryError, VmEntryFlags, VmMapCommit, VmMapError, USER_PAGE_SIZE,
 };
 
 type RecipeTree = BTreeMap<UserVirtAddr, VmEntry>;
@@ -208,6 +208,34 @@ impl RecipeIndex {
         self.publish(rewritten);
         Ok(VmMapCommit { changed_pages })
     }
+
+    /// PR-10 phase 3: stamp `tag` on every VMA whose range is fully
+    /// contained in `range`. The range must be fully covered by VMAs
+    /// (every byte mapped) and each covering VMA must be fully contained
+    /// in `range` — partial overlap returns
+    /// [`VmMapError::MissingMapping`] so the ufd shim can map that to
+    /// the Linux `-EINVAL` it returns for unaligned registrations.
+    ///
+    /// On success returns a [`VmMapCommit`] whose `changed_pages` is
+    /// the page count of every VMA tagged. The recipe tree is
+    /// published atomically under the writer mutation lock; readers
+    /// observe either the pre-tag or post-tag state, never a torn
+    /// view.
+    ///
+    /// Phase 3 contract: this is the **only** structural change the
+    /// shim drives; the fault path (`fault_script`) does not yet read
+    /// the tag — that branch lands in phase 4.
+    pub(in crate::vm) fn tag_ufd_registration(
+        &self,
+        range: UserRange,
+        tag: UfdRegistration,
+    ) -> Result<VmMapCommit, VmMapError> {
+        let _writer = self.mutation.lock();
+        let current = unsafe { self.under_writer_lock() };
+        let (rewritten, changed_pages) = rewrite_tag_ufd_registration(current, range, tag)?;
+        self.publish(rewritten);
+        Ok(VmMapCommit { changed_pages })
+    }
 }
 
 unsafe fn reclaim_recipe_tree(ptr: *mut u8) {
@@ -395,12 +423,15 @@ fn rewrite_remap_disjoint(
         );
         let target_range = UserRange::new_aligned(target_start, overlap.len())
             .map_err(|_| VmMapError::InvalidRange)?;
-        moved.push(VmEntry::new(
-            target_range,
-            moving.prot,
-            moving.flags,
-            moving.backing,
-        ));
+        // Preserve the moving VmEntry's private CoW set (mapping
+        // identity follows the VmEntry across mremap-move per the
+        // plan). `moving.private` is the Cap for the sub-range
+        // produced by `split_for_protect`; it already covers exactly
+        // the pages being relocated.
+        moved.push(
+            VmEntry::new(target_range, moving.prot, moving.flags, moving.backing)
+                .with_private(moving.private),
+        );
     }
 
     for entry in moved {
@@ -408,6 +439,41 @@ fn rewrite_remap_disjoint(
     }
 
     Ok((rewritten, old_range.page_count() + new_range.page_count()))
+}
+
+fn rewrite_tag_ufd_registration(
+    entries: &RecipeTree,
+    range: UserRange,
+    tag: UfdRegistration,
+) -> Result<(RecipeTree, usize), VmMapError> {
+    // Phase 3 only handles whole-VMA registrations: every byte of
+    // `range` must be mapped, and no VMA in `range` may straddle the
+    // boundary (start before / end after the requested range). The
+    // partial-overlap case maps to the Linux `-EINVAL` the shim
+    // returns when `UFFDIO_REGISTER` is given an unaligned range.
+    if !range_is_fully_mapped(entries, range) {
+        return Err(VmMapError::MissingMapping);
+    }
+
+    let mut rewritten = RecipeTree::new();
+    let mut tagged_pages = 0;
+    for existing in entries.values().cloned() {
+        if existing.range.overlaps(range) {
+            if !range.contains_range(existing.range) {
+                // Partial-VMA registration is out of scope for phase
+                // 3. The shim is expected to pre-align the registered
+                // range to VMA boundaries; we surface the misuse here
+                // rather than silently re-tagging part of a VMA.
+                return Err(VmMapError::MissingMapping);
+            }
+            tagged_pages += existing.range.page_count();
+            push_entry(&mut rewritten, existing.with_ufd_registration(Some(tag)));
+        } else {
+            push_entry(&mut rewritten, existing);
+        }
+    }
+
+    Ok((rewritten, tagged_pages))
 }
 
 fn range_is_fully_mapped(entries: &RecipeTree, range: UserRange) -> bool {
@@ -507,5 +573,6 @@ pub(in crate::vm) fn vm_entry_error(error: VmEntryError) -> VmMapError {
     match error {
         VmEntryError::BackingOffsetOverflow => VmMapError::BackingOffsetOverflow,
         VmEntryError::Range(_) | VmEntryError::RangeNotContained => VmMapError::AlreadyMapped,
+        VmEntryError::Private(err) => VmMapError::Private(err),
     }
 }

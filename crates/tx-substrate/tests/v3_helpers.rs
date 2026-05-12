@@ -39,17 +39,18 @@ fn step_outcome_continue_with_helper_constructs_continue_variant() {
 }
 
 #[test]
-fn step_outcome_yield_on_carrier_helper_constructs_yield_oncarrier() {
-    let outcome: StepOutcome<(), NoProgress> = StepOutcome::yield_on_carrier(NoProgress, 7, 0b101);
+fn step_outcome_yield_on_wait_source_helper_constructs_yield_onwaitsource() {
+    let outcome: StepOutcome<(), NoProgress> =
+        StepOutcome::yield_on_wait_source(NoProgress, 7, 0b101);
     match outcome {
         StepOutcome::Yield { progress, shape } => {
             assert!(progress.is_empty());
             match shape {
-                YieldShape::OnCarrier { carrier, interests } => {
-                    assert_eq!(carrier.raw(), 7);
+                YieldShape::OnWaitSource { source, interests } => {
+                    assert_eq!(source.raw(), 7);
                     assert_eq!(interests.raw(), 0b101);
                 }
-                _ => panic!("expected OnCarrier shape"),
+                _ => panic!("expected OnWaitSource shape"),
             }
         }
         _ => panic!("expected Yield"),
@@ -57,14 +58,14 @@ fn step_outcome_yield_on_carrier_helper_constructs_yield_oncarrier() {
 }
 
 #[test]
-fn yield_shape_on_carrier_helper_zero_translates_carrier_and_interests() {
-    let shape = YieldShape::on_carrier(11, 0b1100);
+fn yield_shape_on_wait_source_helper_zero_translates_source_and_interests() {
+    let shape = YieldShape::on_wait_source(11, 0b1100);
     match shape {
-        YieldShape::OnCarrier { carrier, interests } => {
-            assert_eq!(carrier.raw(), 11);
+        YieldShape::OnWaitSource { source, interests } => {
+            assert_eq!(source.raw(), 11);
             assert_eq!(interests.raw(), 0b1100);
         }
-        _ => panic!("expected OnCarrier"),
+        _ => panic!("expected OnWaitSource"),
     }
 }
 
@@ -75,8 +76,8 @@ fn step_outcome_helpers_are_const() {
     const _DONE: StepOutcome<u32, NoProgress> = StepOutcome::done(1);
     const _ERR: StepOutcome<(), NoProgress> = StepOutcome::err(Errno::EAGAIN);
     const _CONTINUE: StepOutcome<(), NoProgress> = StepOutcome::continue_with(NoProgress);
-    const _YIELD: StepOutcome<(), NoProgress> = StepOutcome::yield_on_carrier(NoProgress, 0, 0);
-    const _SHAPE: YieldShape = YieldShape::on_carrier(0, 0);
+    const _YIELD: StepOutcome<(), NoProgress> = StepOutcome::yield_on_wait_source(NoProgress, 0, 0);
+    const _SHAPE: YieldShape = YieldShape::on_wait_source(0, 0);
 
     // Reference the constants so they're not dead-code-eliminated to
     // sidestep a const-eval bug.
@@ -84,5 +85,5 @@ fn step_outcome_helpers_are_const() {
     assert_eq!(_ERR, StepOutcome::Err(Errno::EAGAIN));
     assert!(matches!(_CONTINUE, StepOutcome::Continue { .. }));
     assert!(matches!(_YIELD, StepOutcome::Yield { .. }));
-    assert!(matches!(_SHAPE, YieldShape::OnCarrier { .. }));
+    assert!(matches!(_SHAPE, YieldShape::OnWaitSource { .. }));
 }

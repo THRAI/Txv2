@@ -62,3 +62,131 @@ pub fn step_hangup(
         }),
     })
 }
+
+// ---------------------------------------------------------------------------
+// StepOp wraps (PR-2 cleanup)
+// ---------------------------------------------------------------------------
+
+/// `StepOp` wrap of [`step_hangup`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
+pub struct HangupOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for HangupOp<'a>
+{
+    type Output = HangupOutcome;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_hangup(self.tty, self.guard)
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    use super::*;
+    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+    use tx_substrate::zone::{self as zone_mod, PayloadCap};
+
+    use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::tty::structure::{TtyKind, TtyPayload};
+
+    struct NoopOps;
+
+    impl CharDeviceOps for NoopOps {
+        fn read(
+            &self,
+            _out: &mut [u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        {
+            tx_substrate::step_v3::StepOutcome::Done(0)
+        }
+
+        fn write(
+            &self,
+            bytes: &[u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        {
+            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+        }
+    }
+
+    static NOOP_OPS: NoopOps = NoopOps;
+    static NOOP_BINDING: CharDeviceBinding = CharDeviceBinding {
+        devt: DevT::new(4, 230),
+        name: "tty-hangup-op-test",
+        ops: &NOOP_OPS,
+    };
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        tx_substrate::testing::init_host_for_test_once();
+        let _ = crate::zones::register_all();
+        crate::tty::structure::registry::reset_for_tests();
+        guard
+    }
+
+    fn alloc_hardware_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
+        let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(
+            payload_res,
+            TtyPayload::new_hardware(&NOOP_BINDING),
+        ));
+        let identity = zone_mod::sign_for(
+            id_res,
+            TtyIdentity::new(TtyKind::SerialHardware, index, name),
+        );
+        identity.install_payload(payload_cap);
+        identity
+    }
+
+    #[test]
+    fn hangup_op_on_live_tty_returns_done() {
+        let _setup = setup();
+        let tty = alloc_hardware_tty(500, "ttyV3-hangup-op-live");
+        let guard = tx_substrate::epoch::guard();
+        let mut op = HangupOp {
+            tty: &tty,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Done(o) => {
+                assert!(o.had_payload);
+                assert!(o.hangup_fired);
+                assert!(o.session_ctl_fired);
+            }
+            other => panic!("expected Done(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hangup_op_on_dead_tty_returns_eio() {
+        let _setup = setup();
+        let tty = alloc_hardware_tty(501, "ttyV3-hangup-op-dead");
+        let _ = tty.take_payload();
+        let guard = tx_substrate::epoch::guard();
+        let mut op = HangupOp {
+            tty: &tty,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Err(tx_substrate::step_v3::Errno::EIO) => {}
+            other => panic!("expected Err(EIO), got {other:?}"),
+        }
+    }
+}

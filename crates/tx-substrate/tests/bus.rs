@@ -285,14 +285,14 @@ fn declared_static_queue_and_port_validate_events_over_static_storage() {
 
 #[test]
 fn declared_queue_exposes_metadata_and_rejects_undeclared_bits() {
-    let declaration = WireDeclaration::<Readiness>::queue("pipe.read_wq");
+    let declaration = WireDeclaration::<Readiness>::queue("pipe.read_source");
     let queue = DeclaredQueue::new(declaration).expect("valid queue declaration");
     let wakes = Arc::new(AtomicUsize::new(0));
     let mut subscription = queue
         .try_subscribe(Readiness::HAS_DATA, counting_waker(Arc::clone(&wakes)))
         .expect("declared interest");
 
-    assert_eq!(queue.declaration().name(), "pipe.read_wq");
+    assert_eq!(queue.declaration().name(), "pipe.read_source");
     assert_eq!(queue.declaration().kind(), WireKind::Queue);
     assert_eq!(queue.declaration().declared_bits(), Readiness::BOTH.0);
     assert_eq!(
@@ -323,7 +323,7 @@ fn declared_queue_exposes_metadata_and_rejects_undeclared_bits() {
 
 #[test]
 fn declared_port_wraps_edge_delivery_and_terminal_state() {
-    let port = DeclaredPort::new(WireDeclaration::<Lifecycle>::port("process.exit_port"))
+    let port = DeclaredPort::new(WireDeclaration::<Lifecycle>::port("process.exit_source"))
         .expect("valid port declaration");
     let wakes = Arc::new(AtomicUsize::new(0));
     let late_wakes = Arc::new(AtomicUsize::new(0));
@@ -456,7 +456,7 @@ fn declared_wires_reject_empty_declarations() {
 #[test]
 fn declared_queue_retire_records_epoch_terminal_handshake() {
     let _epoch = reset_epoch();
-    let queue = DeclaredQueue::new(WireDeclaration::<Readiness>::queue("pipe.read_wq"))
+    let queue = DeclaredQueue::new(WireDeclaration::<Readiness>::queue("pipe.read_source"))
         .expect("valid queue declaration");
     let wakes = Arc::new(AtomicUsize::new(0));
     let mut subscription = queue.subscribe(Readiness::HAS_DATA, counting_waker(Arc::clone(&wakes)));

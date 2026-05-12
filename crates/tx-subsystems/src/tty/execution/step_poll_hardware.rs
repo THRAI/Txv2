@@ -70,8 +70,12 @@ pub fn step_poll_hardware_input(
             }),
             V3::Yield {
                 progress: _,
-                shape: YieldShape::OnCarrier { carrier, interests },
-            } => V3::yield_on_carrier(NoProgress, carrier.raw(), interests.raw()),
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
+            } => V3::yield_on_wait_source(NoProgress, carrier.raw(), interests.raw()),
             V3::Yield { shape, .. } => V3::Yield {
                 progress: NoProgress,
                 shape,
@@ -87,10 +91,10 @@ pub fn step_poll_hardware_input(
     // - `Continue { progress }` → bytes were consumed but the op asked
     //   to continue without waiting; ingest those bytes (the caller's
     //   next poll re-enters the step).
-    // - `Yield { progress, shape: OnCarrier }` with non-empty progress
+    // - `Yield { progress, shape: OnWaitSource }` with non-empty progress
     //   → ingest the bytes and surface the inner outcome (matches the
     //   pre-v3 `AdvancedThenBlocked` collapse). With empty progress the
-    //   yield-on-carrier propagates as-is.
+    //   yield-on-wait-source propagates as-is.
     // - `Yield { shape: OnAgent .. }` → unsupported; surface `Err(EIO)`.
     // - `Err(errno)` → propagate.
     match binding.ops.read(&mut bytes, guard) {
@@ -112,16 +116,153 @@ pub fn step_poll_hardware_input(
         }
         V3::Yield {
             progress,
-            shape: YieldShape::OnCarrier { carrier, interests },
+            shape:
+                YieldShape::OnWaitSource {
+                    source: carrier,
+                    interests,
+                },
         } => {
             let read = progress.bytes().min(bytes.len());
             if read == 0 {
-                return V3::yield_on_carrier(NoProgress, carrier.raw(), interests.raw());
+                return V3::yield_on_wait_source(NoProgress, carrier.raw(), interests.raw());
             }
             bytes.truncate(read);
             drive_ingest(&bytes, read, guard)
         }
         V3::Yield { .. } => V3::Err(Errno::EIO.into()),
         V3::Err(err) => V3::Err(err),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StepOp wraps (PR-2 wave 2)
+// ---------------------------------------------------------------------------
+//
+// Additive `impl StepOp` adapter per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1.
+// `max_bytes` is `Copy` scalar; the guard is held by reference under the
+// wrap lifetime.
+
+/// `StepOp` wrap of [`step_poll_hardware_input`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
+pub struct PollHardwareInputOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub max_bytes: usize,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for PollHardwareInputOp<'a>
+{
+    type Output = HardwarePollOutcome;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_poll_hardware_input(self.tty, self.max_bytes, self.guard)
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    use super::*;
+    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+    use tx_substrate::zone::{self as zone_mod, PayloadCap};
+
+    use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::tty::structure::{TtyKind, TtyPayload};
+
+    struct NoopOps;
+
+    impl CharDeviceOps for NoopOps {
+        fn read(
+            &self,
+            _out: &mut [u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        {
+            tx_substrate::step_v3::StepOutcome::Done(0)
+        }
+
+        fn write(
+            &self,
+            bytes: &[u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        {
+            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+        }
+    }
+
+    static NOOP_OPS: NoopOps = NoopOps;
+    static NOOP_BINDING: CharDeviceBinding = CharDeviceBinding {
+        devt: DevT::new(4, 209),
+        name: "tty-poll-op-test",
+        ops: &NOOP_OPS,
+    };
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        tx_substrate::testing::init_host_for_test_once();
+        let _ = crate::zones::register_all();
+        crate::tty::structure::registry::reset_for_tests();
+        guard
+    }
+
+    fn alloc_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
+        let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(
+            payload_res,
+            TtyPayload::new_hardware(&NOOP_BINDING),
+        ));
+        let identity = zone_mod::sign_for(
+            id_res,
+            TtyIdentity::new(TtyKind::SerialHardware, index, name),
+        );
+        identity.install_payload(payload_cap);
+        identity
+    }
+
+    #[test]
+    fn poll_hardware_input_op_zero_max_bytes_returns_done_default() {
+        let _setup = setup();
+        let tty = alloc_tty(300, "ttyV3-poll-op-zero");
+        let guard = tx_substrate::epoch::guard();
+        let mut op = PollHardwareInputOp {
+            tty: &tty,
+            max_bytes: 0,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Done(out) => {
+                assert_eq!(out.bytes_read, 0);
+            }
+            other => panic!("expected Done(default), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_hardware_input_op_dead_tty_returns_err() {
+        let _setup = setup();
+        let tty = alloc_tty(301, "ttyV3-poll-op-dead");
+        let _ = tty.take_payload();
+        let guard = tx_substrate::epoch::guard();
+        let mut op = PollHardwareInputOp {
+            tty: &tty,
+            max_bytes: 8,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Err(_) => {}
+            other => panic!("expected Err, got {other:?}"),
+        }
     }
 }

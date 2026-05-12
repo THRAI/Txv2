@@ -53,10 +53,10 @@ where
 Inside the closure, `body` receives a `SubjectContext` constructed via `SubjectContext::borrowed(owner, ...)`. The borrow scope:
 
 1. Holds `Cap<ProcessIdentity>` for the duration of the body's future, keeping identity addressable.
-2. Subscribes to the borrowed process's `exit_port` carrier as an abandonment source.
+2. Subscribes to the borrowed process's `exit_source` (a `WaitSource`) as an abandonment source.
 3. On scope exit (body completes or aborts), drops the cap, unsubscribes, releases any scope-held resources.
 
-The body is an `async` closure: it can `.await` arbitrary subscripts, including `drive(...)` calls, including subscripts that yield `OnAgent` or `OnCarrier`. Yields inside the scope do not exit the scope; the borrow holds.
+The body is an `async` closure: it can `.await` arbitrary subscripts, including `drive(...)` calls, including subscripts that yield `OnAgent`, `OnWaitSource`, or `OnTimer`. Yields inside the scope do not exit the scope; the borrow holds.
 
 ## 4. SubjectContext under borrow
 
@@ -84,11 +84,11 @@ SCOPE-3: scope abandonment is delivered through the existing Killable wait proto
 
 When the borrowed process exits while a scope is active:
 
-1. The `exit_port` subscription fires.
+1. The `exit_source` subscription fires.
 2. The script's drive loop, on its next yield resolution, observes a `Killed` outcome.
 3. The script terminates with `Err(EOWNERDEAD)`.
 4. All in-flight `OnAgent` tokens on the script reach `SENTINEL_DEAD` via their endpoints' standard cleanup.
-5. The scope's drop releases the `Cap<ProcessIdentity>` and unsubscribes the exit_port watcher.
+5. The scope's drop releases the `Cap<ProcessIdentity>` and unsubscribes the `exit_source` watcher.
 
 This means io_uring SQPOLL script abandonment, AIO worker abandonment, and FUSE helper abandonment all use the *same protocol* native syscall scripts use for SIGKILL. No new mechanism. `Killable` wait protocol is sufficient.
 
@@ -102,7 +102,7 @@ This is an invariant about *what* a scope's body may carry across the scope's ex
 
 - Fixed-buffer pins (e.g., io_uring `IORING_REGISTER_BUFFERS`) are typed as `OperationalEvidence` *bound to the scope's `Cap<ProcessIdentity>`*. Their drop is part of the scope's drop.
 - In-flight delegation tokens issued inside the scope are bound to the scope's lifetime; on scope exit they reach `SENTINEL_DEAD`.
-- Subscribed bus carriers are unsubscribed on scope exit.
+- Subscribed wait sources are unsubscribed on scope exit.
 
 The corollary is that *long-lived* resources (e.g., io_uring's permanently-registered fixed buffers spanning many submitted ops) require a *long-lived* scope. SQPOLL kthread runs *one* OnBehalfOf scope for the entire lifetime of the io_uring instance, and individual SQE-handling sub-scripts run inside it. Each sub-script is its own short-lived script; the scope is the kthread's outer frame.
 
@@ -157,6 +157,8 @@ When the io_uring instance is closed (or the owner exits), the scope drops; fixe
 <!-- txdoc:SCOPE-V1-AIO-1 -->
 
 POSIX AIO (io_setup / io_submit / io_getevents) workers are kernel tasks that execute submitted I/O on behalf of the user task. Each AIO context has an associated `Cap<ProcessIdentity>`; the worker enters `OnBehalfOf` scope for the lifetime of one execution batch (or, for long-lived workers, for the lifetime of the AIO context).
+
+**Landed in PR-11** as the `OnBehalfOf<P>` canary. Implementation: `crates/tx-subsystems/src/aio.rs` (the `AioContext` zone, the per-context worker future entered through `with_on_behalf_of` at `io_setup` time, the iocb submission queue + completion queue, and the `IocbDispatcher` callback that resolves `aio_fildes` against P's fd table under the borrow); `crates/tx-shims/src/linux_syscall/aio.rs` (the four syscall arms — `sys_io_setup`, `sys_io_submit`, `sys_io_getevents`, `sys_io_destroy`); `crates/tx-shims/tests/v3_aio_e2e.rs` (the end-to-end canary pinning the submit → dispatch → completion → getevents → destroy loop). The planning + readiness audit is recorded in `docs/progress/decisions/2026-05-11-d8-pr-11-aio-plan.md`.
 
 ### 8.3 FUSE helper
 
@@ -226,8 +228,8 @@ Per-use-case work (uring registration, AIO context, FUSE helper) is additional a
 
 Recommended landing order:
 
-1. Framework: `with_on_behalf_of`, `SubjectContext::borrowed`, exit-port routing. ~500 LoC.
-2. First use case: AIO worker (smallest surface; one borrow per AIO context). Validates the framework against a real use.
+1. Framework: `with_on_behalf_of`, `SubjectContext::borrowed`, exit-port routing. ~500 LoC. **Landed in PR-11 phases 0–1** (W-W + W-Z); see `crates/tx-substrate/src/step_v3/borrow.rs` for `with_on_behalf_of`, `crates/tx-substrate/src/step_v3/subject_context.rs` for the `SubjectContext::borrowed` constructor, and `OnBehalfOfAbort` for the abandonment routing.
+2. First use case: AIO worker (smallest surface; one borrow per AIO context). Validates the framework against a real use. **Landed in PR-11 phases 2–6** (W-Z `AioContext` zone, W-CC worker spawn, W-FF real dispatch + completion queue + `io_getevents` + `io_destroy`, W-JJ end-to-end canary). See `crates/tx-subsystems/src/aio.rs` for the subsystem, `crates/tx-shims/src/linux_syscall/aio.rs` for the syscall arms, and `crates/tx-shims/tests/v3_aio_e2e.rs` for the e2e canary. The full PR-11 plan + readiness audit is recorded in `docs/progress/decisions/2026-05-11-d8-pr-11-aio-plan.md`.
 3. io_uring SQPOLL with the registered-buffer authority story.
 4. cgroup-v2 writeback under per-cgroup identity (after the cgroup-identity catalog member lands).
 

@@ -34,6 +34,12 @@ pub fn register_all() -> Result<(), ZoneError> {
     tty::register_zones()?;
     pipe::register_zones()?;
     futex::register_zones()?;
+    cred::register_zones()?;
+    userfaultfd::register_zones()?;
+    aio::register_zones()?;
+    io_uring::register_zones()?;
+    signalfd::register_zones()?;
+    subject_placeholders::register_zones()?;
     Ok(())
 }
 
@@ -194,9 +200,11 @@ mod thread {
 
 mod vm {
     use super::*;
+    use crate::vm::PrivatePageSet;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
         zone::register_zone_for::<AddressSpace>()?;
+        zone::register_zone_for::<PrivatePageSet>()?;
         Ok(())
     }
 }
@@ -253,5 +261,63 @@ mod futex {
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
         crate::futex::register_zones()
+    }
+}
+
+mod cred {
+    use super::*;
+    use crate::cred::Cred;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        zone::register_zone_for::<Cred>()?;
+        Ok(())
+    }
+}
+
+mod userfaultfd {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::userfaultfd::register_zones()
+    }
+}
+
+mod aio {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::aio::register_zones()
+    }
+}
+
+mod io_uring {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::io_uring::register_zones()
+    }
+}
+
+mod signalfd {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::signalfd::register_zones()
+    }
+}
+
+/// Register the `step_v3` placeholder zones used by PR-9 phase 5 to
+/// satisfy `SubjectAuthority`'s `Cap<RestrictionStackHandle>` slot.
+///
+/// `RestrictionStackHandle` is a substrate-side placeholder
+/// (per D5 §7); the real append-only stack lands in PR-K. Until then,
+/// shim arms mint a fresh placeholder cap per syscall entry through
+/// [`crate::cred::placeholder_restrictions_cap`].
+mod subject_placeholders {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        zone::register_zone_for::<tx_substrate::step_v3::RestrictionStackHandle>()?;
+        Ok(())
     }
 }

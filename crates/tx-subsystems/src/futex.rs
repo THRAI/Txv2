@@ -5,7 +5,7 @@
 //!
 //! **Bucket model.** A fixed array of 256 `FutexBucket`s indexed by
 //! `hash(uaddr) & 0xff`. Each bucket holds a [`Channel`] registered
-//! with the global [`crate::wait_carrier`]. `FUTEX_WAIT` parks on the
+//! with the global [`crate::wait_source`]. `FUTEX_WAIT` parks on the
 //! bucket's channel (after verifying `*uaddr == val`); `FUTEX_WAKE`
 //! fires the bucket's channel, waking all waiters in that bucket.
 //! Collisions are absorbed by the per-waiter re-check on wakeup —
@@ -19,7 +19,7 @@
 //!
 //! **Timeout deferred to Slice 4.** v1 ignores the `timeout`
 //! argument; `FUTEX_WAIT` parks indefinitely until `FUTEX_WAKE`
-//! fires. Slice 4's `nanosleep` lands the timer-wait-carrier
+//! fires. Slice 4's `nanosleep` lands the timer-wait-source
 //! infrastructure futex needs for proper timeout support.
 //!
 //! **PRIVATE / CLOCK_REALTIME flags.** Recognised but ignored at
@@ -32,15 +32,39 @@
 //! shared with the existing `getresuid` / `pipe2` arms.
 //! `TODO(phase-userva)` — replace with `UserAccessIf::read_user::<u32>`
 //! once Slice 9 lands.
+//!
+//! **PR-3D-2 coexistence** (D2/D4 ADRs). Each bucket now carries
+//! **two** parallel wake-publication points, mirroring the pipe
+//! template from PR-3D-1:
+//!
+//! 1. The legacy `Channel` (`channel`) — backed by `RawPort`+`Waker`.
+//!    Consumed by the existing `wait_source` resolver and any caller
+//!    that `lookup_wait_channel`s the bucket's `source_id` and awaits
+//!    via `WaitFuture`. **Stays in place** until PR-3D-5 retires the
+//!    legacy resolver path.
+//! 2. The new `Arc<WaitSource>` (`wait_source`) — backed by
+//!    `TaskMailbox`. Consumed by v3 callers that own a `TaskMailbox`
+//!    and register via `WaitSource::prepare(...).install_if(...)`.
+//!    Tested in `crates/tx-subsystems/tests/v3_futex_waitsource.rs`.
+//!
+//! Both paths fire on every `step_futex_wake`. The `WaitSourceId`
+//! stamped into `step_futex_wait`'s `YieldShape::OnWaitSource` is the
+//! same `u64` the legacy `wait_source` resolver returned, so the two
+//! paths share an id namespace and a v3 caller's
+//! `WaitSourceId.raw()` round-trips cleanly to the right bucket's
+//! `WaitSource`.
 
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use tx_reactor::wait::{Channel, Mask};
+use tx_substrate::step_v3::{InterestMask, WaitSourceId};
+use tx_substrate::wake::WaitSource;
 use tx_substrate::zone::ZoneError;
 use tx_substrate::SpinMutex;
 
 use crate::execution::Guard;
-use crate::wait_carrier;
+use crate::wait_source;
 
 /// Number of futex hash buckets. Fixed; no dynamic allocation.
 /// Collisions are absorbed by the per-waiter re-check on wakeup.
@@ -52,10 +76,22 @@ pub const FUTEX_BUCKET_COUNT: usize = 256;
 pub const FUTEX_WAKE_MASK: u64 = 0x1;
 
 /// Per-bucket state. Holds the wait channel + the carrier id
-/// registered with [`crate::wait_carrier`].
+/// registered with [`crate::wait_source`].
+///
+/// **PR-3D-2 (D2/D4 coexistence)** adds an `Arc<WaitSource>` next to
+/// the legacy `Channel`. Both fire on `step_futex_wake`; v3 callers
+/// register a `TaskMailbox` against `wait_source` via
+/// `WaitSource::prepare(..).install_if(..)` while legacy callers stay
+/// on the `Channel`+`wait_source` resolver path. `wait_source.id()`
+/// matches `source_id` (same `u64` in both worlds) so the round-trip
+/// from `YieldShape::OnWaitSource { source: WaitSourceId(source_id), .. }`
+/// lands on the right bucket.
 struct FutexBucket {
     channel: Channel,
-    carrier_id: u64,
+    source_id: u64,
+    /// PR-3D-2 new path. Fired alongside `channel` on every
+    /// `step_futex_wake` call routed to this bucket.
+    wait_source: Arc<WaitSource>,
 }
 
 /// Static table of 256 buckets. Initialised lazily under a single
@@ -63,7 +99,7 @@ struct FutexBucket {
 /// [`register_zones`]. Subsequent calls (from re-running
 /// [`crate::zones::register_all`] in tests) are no-ops — the
 /// buckets are kept across re-init because their carrier ids are
-/// already published to [`crate::wait_carrier`] and tearing them
+/// already published to [`crate::wait_source`] and tearing them
 /// down would invalidate any token references held by in-flight
 /// futures.
 static BUCKETS: SpinMutex<Option<[FutexBucket; FUTEX_BUCKET_COUNT]>> = SpinMutex::new(None);
@@ -87,10 +123,16 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
     }
     let buckets: [FutexBucket; FUTEX_BUCKET_COUNT] = core::array::from_fn(|_| {
         let channel = Channel::new();
-        let carrier_id = wait_carrier::register_wait_channel(channel.clone());
+        let source_id = wait_source::register_wait_channel(channel.clone());
+        // PR-3D-2 (D2/D4 coexistence). Per-bucket `WaitSource` shares
+        // the legacy registry's id namespace so a v3 caller using the
+        // `WaitSourceId` stamped into `YieldShape::OnWaitSource` lands
+        // on the right bucket here.
+        let wait_source = Arc::new(WaitSource::new(WaitSourceId::new(source_id)));
         FutexBucket {
             channel,
-            carrier_id,
+            source_id,
+            wait_source,
         }
     });
     *guard = Some(buckets);
@@ -111,14 +153,14 @@ pub fn bucket_index(uaddr: u64) -> usize {
 /// `futex(uaddr, FUTEX_WAIT, val, timeout, ...)`.
 ///
 /// Samples `*uaddr`; if it equals `val`, yields on the bucket's wait
-/// channel (`OnCarrier`); otherwise returns `Err(EAGAIN)`.
+/// channel (`OnWaitSource`); otherwise returns `Err(EAGAIN)`.
 /// `uaddr` must be non-zero and 4-byte aligned; otherwise `Err(EINVAL)`.
 /// `timeout` is ignored in v1.
 ///
 /// Returns a [`tx_substrate::step_v3::StepOutcome`]:
 /// - bad uaddr → `Err(Errno::EINVAL)`
 /// - `*uaddr != val` → `Err(Errno::EAGAIN)`
-/// - `*uaddr == val` → `Yield { progress: NoProgress, shape: OnCarrier { … } }`
+/// - `*uaddr == val` → `Yield { progress: NoProgress, shape: OnWaitSource { … } }`
 ///
 /// Wait never produces `Done`: completion arrives via the carrier
 /// resolution step driven by the script driver after the yield resolves.
@@ -137,18 +179,18 @@ pub fn step_futex_wait(
         return tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EAGAIN);
     }
     let idx = bucket_index(uaddr);
-    let carrier_id = {
+    let source_id = {
         let guard = BUCKETS.lock();
         let buckets = guard
             .as_ref()
             .expect("futex buckets uninitialised — register_zones not called");
-        buckets[idx].carrier_id
+        buckets[idx].source_id
     };
     tx_substrate::step_v3::StepOutcome::Yield {
         progress: tx_substrate::step_v3::NoProgress,
-        shape: tx_substrate::step_v3::YieldShape::OnCarrier {
-            carrier: tx_substrate::step_v3::WakeCarrier::new(carrier_id),
-            interests: tx_substrate::step_v3::InterestConditions::new(FUTEX_WAKE_MASK),
+        shape: tx_substrate::step_v3::YieldShape::OnWaitSource {
+            source: tx_substrate::step_v3::WaitSourceId::new(source_id),
+            interests: tx_substrate::step_v3::InterestMask::new(FUTEX_WAKE_MASK),
         },
     }
 }
@@ -172,14 +214,116 @@ pub fn step_futex_wake(
         return tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EINVAL);
     }
     let idx = bucket_index(uaddr);
-    {
+    // Clone the `Arc<WaitSource>` out under the bucket lock so the
+    // `WaitSource::notify` call below (which itself takes the
+    // source's subscriber-list lock) runs **outside** the BUCKETS
+    // lock — keeps the lock-ordering simple if a future subscriber
+    // callback ever needs to call back into futex.
+    let wait_source = {
         let guard = BUCKETS.lock();
         let buckets = guard
             .as_ref()
             .expect("futex buckets uninitialised — register_zones not called");
+        // Legacy path (D2 coexistence): wake any `Waker`-based waiter.
         buckets[idx].channel.fire(Mask::from_bits(FUTEX_WAKE_MASK));
-    }
+        buckets[idx].wait_source.clone()
+    };
+    // PR-3D-2 new path: post `MailboxEvent::SourceFired` to any v3
+    // caller that registered a `TaskMailbox` against this bucket's
+    // source. Per-waiter re-check on wakeup re-reads `*uaddr` and
+    // either returns success or re-parks.
+    wait_source.notify(InterestMask::new(FUTEX_WAKE_MASK));
     tx_substrate::step_v3::StepOutcome::Done(n)
+}
+
+/// PR-3D-2: look up the `Arc<WaitSource>` for the bucket that
+/// `uaddr` hashes to. Returned as a clone so callers (tests, future
+/// v3 syscall arms) can hold the source across a wait window
+/// independent of the bucket-table lock. `None` only if the bucket
+/// table has not been initialised yet (i.e. `register_zones` has not
+/// been called) — production callers will always have it
+/// initialised.
+///
+/// `WaitSource::id()` matches the bucket's `source_id` (the same
+/// `u64` published into the legacy `wait_source` resolver at
+/// `register_zones` time), so the round-trip from
+/// `step_futex_wait`'s `YieldShape::OnWaitSource { source, .. }`
+/// resolves to the same bucket via
+/// [`bucket_wait_source_for_source_id`] without going through the
+/// `(uaddr -> bucket_index)` hash.
+pub fn bucket_wait_source(uaddr: u64) -> Option<Arc<WaitSource>> {
+    let idx = bucket_index(uaddr);
+    let guard = BUCKETS.lock();
+    let buckets = guard.as_ref()?;
+    Some(buckets[idx].wait_source.clone())
+}
+
+/// PR-3D-2: look up the bucket's `Arc<WaitSource>` by the
+/// `source_id` published into the legacy `wait_source` resolver
+/// (i.e. the `u64` carried inside a `WaitSourceId`). Linear scan over
+/// the 256 buckets; the alternative is a parallel BTreeMap, but at
+/// 256 entries the scan is well under a microsecond and avoids
+/// duplicating the bucket-id namespace.
+///
+/// Returns `None` if `source_id` does not match any current bucket
+/// (or buckets are uninitialised).
+pub fn bucket_wait_source_for_source_id(source_id: u64) -> Option<Arc<WaitSource>> {
+    let guard = BUCKETS.lock();
+    let buckets = guard.as_ref()?;
+    buckets
+        .iter()
+        .find(|b| b.source_id == source_id)
+        .map(|b| b.wait_source.clone())
+}
+
+// -- PR-2 StepOp wraps -------------------------------------------------
+//
+// Per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1, PR-2 wraps each free
+// `step_*` fn in an `impl StepOp for FooOp` shell. The wrap stores
+// args by value (`Copy` scalars) and the guard by reference so the
+// wrap's lifetime captures the guard's. The `step()` body delegates
+// to the free fn unchanged; the free fn ignores the guard but the
+// field is held to pin the lifetime.
+
+/// StepOp wrap for [`step_futex_wait`]. PR-2 pilot.
+pub struct FutexWaitOp<'a> {
+    pub uaddr: u64,
+    pub val: u32,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for FutexWaitOp<'a>
+{
+    type Output = ();
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_futex_wait(self.uaddr, self.val, self.guard)
+    }
+}
+
+/// StepOp wrap for [`step_futex_wake`]. PR-2 pilot. Note `Output = u32`,
+/// not `()` — wake returns the requested wake count.
+pub struct FutexWakeOp<'a> {
+    pub uaddr: u64,
+    pub n: u32,
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for FutexWakeOp<'a>
+{
+    type Output = u32;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_futex_wake(self.uaddr, self.n, self.guard)
+    }
 }
 
 #[cfg(test)]
@@ -242,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn futex_step_wait_observes_match_returns_blocked_with_carrier_id() {
+    fn futex_step_wait_observes_match_returns_blocked_with_source_id() {
         let _setup = setup();
         let word: u32 = 0xdead_beef;
         let uaddr = &word as *const u32 as u64;
@@ -252,13 +396,17 @@ mod tests {
         use tx_substrate::step_v3::YieldShape;
         match outcome {
             StepOutcome::Yield {
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => {
                 assert_eq!(interests.raw(), FUTEX_WAKE_MASK);
                 assert!(
-                    wait_carrier::lookup_wait_channel(carrier.raw()).is_some(),
-                    "futex bucket carrier must be registered with wait_carrier",
+                    wait_source::lookup_wait_channel(carrier.raw()).is_some(),
+                    "futex bucket carrier must be registered with wait_source",
                 );
             }
             other => panic!("expected Yield, got {other:?}"),
@@ -351,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn step_futex_wait_value_match_yields_on_carrier() {
+    fn step_futex_wait_value_match_yields_on_wait_source() {
         let _setup = setup();
         let word: u32 = 0xdead_beef;
         let uaddr = &word as *const u32 as u64;
@@ -362,8 +510,8 @@ mod tests {
             tx_substrate::step_v3::StepOutcome::Yield {
                 progress,
                 shape:
-                    tx_substrate::step_v3::YieldShape::OnCarrier {
-                        carrier: _,
+                    tx_substrate::step_v3::YieldShape::OnWaitSource {
+                        source: _,
                         interests,
                     },
             } => {
@@ -374,7 +522,7 @@ mod tests {
                     "interest mask must match the futex wake bit",
                 );
             }
-            other => panic!("expected v3 Yield::OnCarrier, got {other:?}"),
+            other => panic!("expected v3 Yield::OnWaitSource, got {other:?}"),
         }
     }
 
@@ -424,7 +572,7 @@ mod tests {
     fn futex_step_wake_fires_channel_observed_by_waiter() {
         // Cross-iteration check: register a wait, fire wake on the
         // same uaddr, observe the channel state through
-        // wait_carrier::lookup. We don't actually drive a future to
+        // wait_source::lookup. We don't actually drive a future to
         // completion (that requires async coordination — Slice 11's
         // QEMU shell smoke covers it). Instead we confirm the
         // bucket's carrier id matches across calls — the same
@@ -434,11 +582,14 @@ mod tests {
         let uaddr = &word as *const u32 as u64;
         let guard = tx_substrate::epoch::guard();
         use tx_substrate::step_v3::YieldShape;
-        // wait → Yield { OnCarrier { … } }; pull the carrier id.
+        // wait → Yield { OnWaitSource { … } }; pull the carrier id.
         let wait_outcome = step_futex_wait(uaddr, 42, &guard);
         let waiter_carrier = match wait_outcome {
             StepOutcome::Yield {
-                shape: YieldShape::OnCarrier { carrier, .. },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier, ..
+                    },
                 ..
             } => carrier.raw(),
             other => panic!("expected Yield, got {other:?}"),
@@ -451,8 +602,67 @@ mod tests {
         // The channel underlying that carrier id is the one fire()
         // was just called on.
         assert!(
-            wait_carrier::lookup_wait_channel(waiter_carrier).is_some(),
+            wait_source::lookup_wait_channel(waiter_carrier).is_some(),
             "fired channel still resolvable",
         );
+    }
+
+    // -- PR-2 StepOp wrap tests -------------------------------------------
+    //
+    // Minimal construction + one `.step()` call per wrap. Pins that the
+    // wrap delegates to the free fn unchanged. The compile-check is the
+    // primary value — these assert the variant matches what the free
+    // fn would have returned.
+    mod step_op_wraps {
+        use super::super::{step_futex_wake, FutexWaitOp, FutexWakeOp, FUTEX_WAKE_MASK};
+        use super::setup;
+        use tx_substrate::step_v3::{
+            Errno as V3Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, YieldShape,
+        };
+
+        #[test]
+        fn futex_wait_op_step_delegates_to_free_fn() {
+            let _setup = setup();
+            // Word holds 0xdead_beef; matching val parks → Yield::OnWaitSource.
+            let word: u32 = 0xdead_beef;
+            let uaddr = &word as *const u32 as u64;
+            let guard = tx_substrate::epoch::guard();
+            let mut op = FutexWaitOp {
+                uaddr,
+                val: 0xdead_beef,
+                guard: &guard,
+            };
+            let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            let outcome = op.step(&mut ctx);
+            match outcome {
+                StepOutcome::Yield {
+                    progress: NoProgress,
+                    shape: YieldShape::OnWaitSource { interests, .. },
+                } => {
+                    assert_eq!(interests.raw(), FUTEX_WAKE_MASK);
+                }
+                other => panic!("expected Yield::OnWaitSource, got {other:?}"),
+            }
+            drop(guard);
+        }
+
+        #[test]
+        fn futex_wake_op_step_delegates_to_free_fn() {
+            let _setup = setup();
+            // Zero uaddr → EINVAL. Output type is u32, not ().
+            let guard = tx_substrate::epoch::guard();
+            let mut op = FutexWakeOp {
+                uaddr: 0,
+                n: 1,
+                guard: &guard,
+            };
+            let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            let outcome: StepOutcome<u32, NoProgress> = op.step(&mut ctx);
+            assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
+            // Sanity: parallel free-fn call matches.
+            let free = step_futex_wake(0, 1, &guard);
+            drop(guard);
+            assert_eq!(outcome, free);
+        }
     }
 }

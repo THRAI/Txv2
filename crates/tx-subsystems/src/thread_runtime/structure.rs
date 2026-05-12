@@ -6,11 +6,13 @@
 //! pending queue. The realtime per-occurrence queue and `signal_summary`
 //! fast-check atomic land alongside the delivery pass.
 
+use alloc::sync::Weak as ArcWeak;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use tx_hal::UserTrapContext;
 use tx_reactor::userspace::{UserspaceRunRequest, UserspaceRunSlot};
 use tx_reactor::TaskKey;
+use tx_substrate::wake::TaskMailbox;
 use tx_substrate::zone::{Dead, Entity, PayloadCap, Weak, Zone, ZoneAllocated};
 use tx_substrate::SpinMutex;
 
@@ -148,6 +150,32 @@ pub struct ThreadPayload {
     /// discipline pinned in the Trio plan's "Cross-cutting risks #1"
     /// (Plan B, deferred writeback).
     pub(crate) pending_syscall_return: SpinMutex<Option<Result<i64, i32>>>,
+    /// Wake mailbox bound to the reactor task that drives this
+    /// thread's future, used by D9-A's signal-wake plumbing.
+    ///
+    /// **D9-A (lost-wake fix for signals).** `post_signal`,
+    /// `route_gewalt`, and `set_thread_zombie` post a
+    /// [`MailboxEvent::SignalDelivered`] event to this mailbox after
+    /// updating the per-thread `signal_summary`. The mailbox post
+    /// wakes the registered `core::task::Waker`, forcing the parked
+    /// future to re-poll and observe the new summary bit; the event
+    /// itself is **not** matched by `ActiveWait::matches`
+    /// (`MailboxEvent::SignalDelivered` is a wake-hint, the truth
+    /// lives in `InterruptSummary`).
+    ///
+    /// **Lifecycle.** Stored as `Weak<TaskMailbox>` so the mailbox
+    /// is task-owned, not thread-owned — the mailbox lives with the
+    /// reactor task driving the thread future. Bound by the
+    /// reactor's thread-task wiring once that exists; until then
+    /// the slot stays `None` and the signal-side hooks treat an
+    /// unbound mailbox as no-op (best-effort post). See D9 §8 Phase
+    /// D9-A: "no-op when the mailbox is unbound (the invariant
+    /// during early bring-up)."
+    ///
+    /// Holds `alloc::sync::Weak` because PR-3A's `TaskMailbox` is
+    /// `Arc`-managed at the substrate layer; the eventual zone
+    /// migration (PR-3D+) flips this to `zone::Weak<TaskMailbox>`.
+    pub(crate) mailbox: SpinMutex<Option<ArcWeak<TaskMailbox>>>,
 }
 
 impl ThreadPayload {
@@ -163,7 +191,30 @@ impl ThreadPayload {
             active_request: SpinMutex::new(None),
             saved_user_context: SpinMutex::new(None),
             pending_syscall_return: SpinMutex::new(None),
+            mailbox: SpinMutex::new(None),
         }
+    }
+
+    /// Bind a `TaskMailbox` to this thread payload so the D9-A
+    /// signal-wake plumbing has a wake destination.
+    ///
+    /// Stored as a `Weak` handle: the mailbox is task-owned (lives
+    /// with the reactor task driving the thread future), and the
+    /// payload only needs the wake-hint route. A subsequent
+    /// `bind_mailbox` replaces the previously bound handle (the
+    /// reactor task wrapper is the unique caller and binds once
+    /// per task).
+    pub fn bind_mailbox(&self, mailbox: ArcWeak<TaskMailbox>) {
+        *self.mailbox.lock() = Some(mailbox);
+    }
+
+    /// Snapshot the bound mailbox handle (if any). Returns `None`
+    /// when the slot is unset, which is the invariant during early
+    /// bring-up (D9 Phase D9-A note: the mailbox post is best-
+    /// effort while existing thread-creation paths haven't been
+    /// extended to call `bind_mailbox`).
+    pub fn mailbox_handle(&self) -> Option<ArcWeak<TaskMailbox>> {
+        self.mailbox.lock().clone()
     }
 
     /// Snapshot the reactor task handle, if one has been bound. Always

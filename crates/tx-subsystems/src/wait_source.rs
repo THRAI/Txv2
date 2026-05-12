@@ -45,10 +45,10 @@ pub fn lookup_wait_channel(id: u64) -> Option<Channel> {
 }
 
 /// Convert `token` into a `WaitFuture` over the registered channel. Returns
-/// `None` if `token.carrier()` is not a currently-registered id (typical
+/// `None` if `token.source_id()` is not a currently-registered id (typical
 /// for test placeholder tokens constructed via raw `WaitToken::new`).
 pub fn wait_on_token(token: WaitToken) -> Option<WaitFuture> {
-    let channel = lookup_wait_channel(token.carrier())?;
+    let channel = lookup_wait_channel(token.source_id())?;
     Some(channel.wait(Mask::from_bits(token.interest())))
 }
 
@@ -57,7 +57,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wait_carrier_register_returns_nonzero_distinct_ids() {
+    fn wait_source_register_returns_nonzero_distinct_ids() {
         let a = register_wait_channel(Channel::new());
         let b = register_wait_channel(Channel::new());
         assert!(a != 0);
@@ -68,7 +68,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_carrier_lookup_returns_some_for_registered_id_and_none_after_release() {
+    fn wait_source_lookup_returns_some_for_registered_id_and_none_after_release() {
         let id = register_wait_channel(Channel::new());
         assert!(lookup_wait_channel(id).is_some());
         release_wait_channel(id);
@@ -76,7 +76,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_carrier_lookup_returns_none_for_unregistered_id() {
+    fn wait_source_lookup_returns_none_for_unregistered_id() {
         assert!(lookup_wait_channel(0xdead_beef_dead_beef).is_none());
     }
 

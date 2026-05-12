@@ -4,6 +4,7 @@
 use core::sync::atomic::Ordering;
 
 use tx_hal::UserTrapContext;
+use tx_substrate::wake::{MailboxEvent, SignalRouting};
 use tx_substrate::zone::{Cap, OperationalCapExt, PayloadCap};
 
 use crate::signal::{SignalMask, Signum};
@@ -11,14 +12,68 @@ use crate::thread_runtime::structure::{
     drain_pending_syscall_return, ThreadIdentity, ThreadPayload,
 };
 
+/// Best-effort `MailboxEvent::SignalDelivered` post to a thread
+/// payload's bound mailbox per D9-A.
+///
+/// Silently no-ops when no mailbox is bound (early bring-up) or
+/// when the `Weak::upgrade` fails because the reactor task has
+/// already dropped its `TaskMailbox`. Idempotent — duplicate posts
+/// queue up but the future's poll consults `InterruptSummary`,
+/// which is the truth-bearing path.
+pub(crate) fn post_signal_mailbox(payload: &ThreadPayload, signum: Signum, routing: SignalRouting) {
+    let Some(weak) = payload.mailbox_handle() else {
+        return;
+    };
+    let Some(mailbox) = weak.upgrade() else {
+        return;
+    };
+    let _ = mailbox.post(MailboxEvent::SignalDelivered {
+        signum: signum.raw() as u32,
+        routing,
+    });
+}
+
 /// Mark a thread zombie: set its exit status, drop its payload. Does
 /// not touch the parent process's thread list — callers that need
 /// parent-side bookkeeping (e.g. `step_thread_exit`) do that
 /// themselves; callers that already hold the parent payload (e.g.
 /// `process::step_exit_group`) skip it.
+///
+/// **D9-A.** Before dropping the payload, post a `SignalDelivered`
+/// wake-hint with signum `SIGKILL` and routing `ProcessDirected` to
+/// the bound mailbox so a parked future re-polls and observes
+/// `summary.termination` / the payload-dropped state instead of
+/// sitting idle until some unrelated channel fires. Silently no-op
+/// when no mailbox is bound (D9-A's early-bring-up invariant). The
+/// summary side of "termination" itself is *not* mutated here —
+/// `step_exit_group_with_signal` is the canonical site for the
+/// termination bit; D9-A only adds the wake-hint side.
 pub(crate) fn set_thread_zombie(thread: &Cap<ThreadIdentity>, status: i32) {
+    // Post the wake-hint *before* dropping the payload so the
+    // `mailbox` slot is still readable. If the payload is already
+    // gone (idempotent double-zombify), `payload.lock()` returns
+    // `None` and we skip the post — the future has already had its
+    // last chance to observe state.
+    if let Some(payload) = thread.payload.lock().as_ref() {
+        post_signal_mailbox(payload, Signum::SIGKILL, SignalRouting::ProcessDirected);
+    }
     *thread.exit_status.lock() = Some(status);
     *thread.payload.lock() = None;
+}
+
+/// Test-only: mark a thread as a zombie **without** removing it
+/// from its parent's thread list. The D9-B eligibility-scan pin
+/// (`crates/tx-subsystems/tests/v3_signal_eligibility.rs`) uses this
+/// to construct a process whose `payload.threads` includes a
+/// zombie entry the scan must skip; the shipping
+/// [`step_thread_exit`] removes the zombie from the list entirely
+/// (so the scan can't see it).
+///
+/// Hidden behind `cfg(any(test, feature = "test-support"))` so it
+/// never reaches release builds.
+#[cfg(any(test, feature = "test-support"))]
+pub fn mark_thread_zombie_for_test(thread: &Cap<ThreadIdentity>, status: i32) {
+    set_thread_zombie(thread, status);
 }
 
 /// Single-thread exit. Marks the thread zombie, removes it from the
@@ -138,6 +193,16 @@ pub fn post_signal(thread: &Cap<ThreadIdentity>, sig: Signum) {
     if !mask.is_blocked(sig) {
         payload.update_summary(|s| s.deliverable_signal = true);
     }
+
+    // D9-A: post the wake-hint to the thread's mailbox *after* the
+    // summary update so a parked future, on re-poll, observes the
+    // same summary bit the post advertises. Routing is
+    // `ProcessDirected` — `post_signal` is the back-end for
+    // `step_kill_process` / `step_kill_pgrp` (process-directed
+    // delivery). A future tgkill-shaped entry point that targets a
+    // specific thread will route through a sibling helper that
+    // passes `ThreadDirected { tid: thread.tid.0 as u64 }` instead.
+    post_signal_mailbox(&payload, sig, SignalRouting::ProcessDirected);
 }
 
 // ---------------------------------------------------------------------------
@@ -194,4 +259,146 @@ pub fn prepare_userspace_entry_payload(payload: &PayloadCap<ThreadPayload>) -> U
     payload.set_active_userspace_request(None);
 
     ctx
+}
+
+// -- PR-2 StepOp wraps -------------------------------------------------
+//
+// Per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1, PR-2 wraps each free
+// `step_*` fn in an `impl StepOp for FooOp` shell. These thread-runtime
+// mutators don't take an epoch `Guard`, so no lifetime parameter is
+// needed. `step_thread_exit` consumes its `Cap` by value (the wrap
+// follows suit and clones internally so `step()`'s `&mut self` can
+// re-run if needed); `step_sigprocmask` borrows `&Cap` (the wrap
+// stores `Cap` by value per the cred-pilot convention).
+
+/// `StepOp` wrap for [`step_thread_exit`]. PR-2 wave 2.
+///
+/// `step_thread_exit` returns `()`; the wrap lifts that into
+/// `StepOutcome::Done(())`. The `Cap` is stored by value (`Cap` is
+/// `Clone`) and the wrap clones into the free fn so the `step` method
+/// remains `&mut self`-shaped.
+pub struct ThreadExitOp {
+    pub thread: Cap<ThreadIdentity>,
+    pub status: i32,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for ThreadExitOp {
+    type Output = ();
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_thread_exit(self.thread.clone(), self.status);
+        tx_substrate::step_v3::StepOutcome::Done(())
+    }
+}
+
+/// `StepOp` wrap for [`step_sigprocmask`]. PR-2 wave 2.
+pub struct SigprocmaskOp {
+    pub thread: Cap<ThreadIdentity>,
+    pub how: SigmaskHow,
+    pub next: SignalMask,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SigprocmaskOp {
+    type Output = SigprocmaskChange;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        tx_substrate::step_v3::StepOutcome::Done(step_sigprocmask(
+            &self.thread,
+            self.how,
+            self.next,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    //! PR-2 wave-2 `StepOp` wrap tests for the thread-runtime
+    //! mutators. Each test exercises one wrap against a
+    //! `bootstrap_init_process`-minted cap, confirming the wrap
+    //! delegates to the free fn and lifts the result into
+    //! `StepOutcome::Done`. The free-fn semantics themselves are
+    //! covered by the existing `thread_runtime::tests` and
+    //! `signal::tests` modules.
+    use super::*;
+    use crate::process::bootstrap_init_process;
+    use crate::process::structure::reset_pid_counter_for_test;
+    use crate::signal::Signum;
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::thread_runtime::structure::reset_tid_counter_for_test;
+    use crate::vm::{AddressSpace, TestPmap};
+    use crate::zones;
+    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome};
+    use tx_substrate::testing::init_host_for_test_once;
+    use tx_substrate::zone::Cap;
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        init_host_for_test_once();
+        let _ = zones::register_all();
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        reset_pid_counter_for_test();
+        reset_tid_counter_for_test();
+        crate::process::execution::reset_init_process_for_test();
+        guard
+    }
+
+    fn fresh_aspace() -> Cap<AddressSpace> {
+        AddressSpace::new_cap_for_platform::<TestPmap>().expect("fresh aspace")
+    }
+
+    fn first_thread(
+        proc_cap: &Cap<crate::process::structure::ProcessIdentity>,
+    ) -> Cap<ThreadIdentity> {
+        let payload_guard = proc_cap.payload.lock();
+        let payload = payload_guard.as_ref().expect("alive");
+        let threads = payload.threads.lock();
+        threads[0].clone()
+    }
+
+    #[test]
+    fn thread_exit_op_delegates_to_step_thread_exit() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let leader = first_thread(&proc_cap);
+        assert!(!leader.is_zombie());
+        let mut op = ThreadExitOp {
+            thread: leader.clone(),
+            status: 7,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        assert_eq!(outcome, StepOutcome::Done(()));
+        assert!(leader.is_zombie());
+        assert_eq!(leader.exit_status(), Some(7));
+    }
+
+    #[test]
+    fn sigprocmask_op_delegates_to_step_sigprocmask() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let leader = first_thread(&proc_cap);
+        let mut next = SignalMask::EMPTY;
+        next.block(Signum::SIGTERM);
+        let mut op = SigprocmaskOp {
+            thread: leader.clone(),
+            how: SigmaskHow::SetMask,
+            next,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        match outcome {
+            StepOutcome::Done(SigprocmaskChange::Replaced { prev, new }) => {
+                assert_eq!(prev, SignalMask::EMPTY);
+                assert!(new.is_blocked(Signum::SIGTERM));
+            }
+            other => panic!("expected Done(Replaced), got {other:?}"),
+        }
+    }
 }
