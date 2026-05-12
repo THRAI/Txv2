@@ -19,7 +19,7 @@ type RecipeTree = BTreeMap<UserVirtAddr, VmEntry>;
 /// Authoritative recipe range index.
 ///
 /// The published tree is owned by an `AtomicPtr<RecipeTree>` and reachable via
-/// EBR (`tx_substrate::epoch`): readers under a `Guard<'_>` perform a single
+/// EBR (`adapter::step_engine::epoch_mod`): readers under a `Guard<'_>` perform a single
 /// `Acquire` load and observe the immutable tree without holding a lock. A
 /// separate writer `mutation` mutex serializes mutators so they can build a
 /// replacement tree, atomically swap it in, and retire the old one through

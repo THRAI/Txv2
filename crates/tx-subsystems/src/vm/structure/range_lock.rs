@@ -4,7 +4,7 @@
 //! declared overlap semantics and writer preference while leaving the final
 //! persistent/concurrent interval index for a later substrate fit.
 //!
-//! Each `RangeLock` owns a `tx_reactor::wait::Channel` registered with
+//! Each `RangeLock` owns a `wait_routing::Channel` registered with
 //! `wait_source`. On every release the channel fires the
 //! `RANGE_LOCK_RELEASE_MASK` bit so async script wrappers can convert a
 //! `WouldBlock` outcome into an awaitable wait via `WouldBlock::wait_token`.

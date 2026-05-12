@@ -29,7 +29,7 @@ unsafe impl ZoneAllocated for AddressSpace {
 // AddressSpace as a whole is still safe to share across CPUs under
 // the kernel's epoch + pmap discipline: external access goes through
 // the zone slot via `Cap<AddressSpace>` and is guarded by
-// `tx_substrate::epoch::guard`. The Send/Sync impls here lift the
+// `adapter::step_engine::guard`. The Send/Sync impls here lift the
 // stricter token-level !Send into a kernel-level shared-by-discipline
 // shape so `Cap<AddressSpace>` can flow through `ProcessPayload`,
 // which is itself shared by `Cap<ProcessIdentity>` references.

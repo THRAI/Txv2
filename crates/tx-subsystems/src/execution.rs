@@ -62,7 +62,7 @@ pub enum Errno {
 }
 
 /// Bridge `execution::Errno` into `step_v3::Errno`. The two enums
-/// mirror each other byte-for-byte (see `tx_substrate::step_v3::Errno`),
+/// mirror each other byte-for-byte (see `adapter::step_engine::V3Errno`),
 /// so this is a 1:1 same-name mapping. The match is exhaustive with no
 /// wildcard: adding a new variant on either side fails to compile here
 /// until the other is extended, which keeps the two catalogs in
