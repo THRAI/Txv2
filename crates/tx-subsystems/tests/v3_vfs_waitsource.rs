@@ -69,8 +69,6 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
-use tx_substrate::epoch;
-use tx_substrate::testing::init_host_for_test_once;
 use tx_subsystems::vfs::adapter::step_engine::{Cap, InterestMask, WaitSourceId};
 use tx_subsystems::vfs::adapter::wait_routing::{
     MailboxEvent, Mask, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
@@ -86,22 +84,10 @@ static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
     guard
-}
-
-fn drain_to_quiescence() {
-    let mut quiet = 0u32;
-    while quiet < 2 {
-        let stats = epoch::drain_with_budget(usize::MAX);
-        if stats.reclaimed == 0 {
-            quiet += 1;
-        } else {
-            quiet = 0;
-        }
-    }
 }
 
 fn make_rnode(id: u64) -> Cap<RNode> {
@@ -307,7 +293,7 @@ fn vfs_wait_source_invariants_round_trip() {
     drop(_reader_guard);
     drop(_writer_guard);
     drop(rnode);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 
     assert!(
         legacy_wait_source::lookup_wait_channel(read_id).is_none(),
@@ -358,7 +344,7 @@ fn vfs_wait_source_invariants_round_trip() {
         // Drop all caps.
         drop(caps);
     }
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 
     // Post-drop: every minted id is unresolvable. This is the no-leak
     // proof — without `Drop for RNode` releasing the slots, the legacy

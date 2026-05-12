@@ -57,7 +57,6 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use tx_substrate::epoch;
-use tx_substrate::testing::init_host_for_test_once;
 use tx_subsystems::futex::adapter::step_engine::{InterestMask, StepOutcome, WaitSourceId, YieldShape};
 use tx_subsystems::futex::adapter::wait_routing::{
     MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
@@ -74,7 +73,7 @@ static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
     guard
 }

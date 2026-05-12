@@ -40,7 +40,6 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use tx_substrate::epoch;
-use tx_substrate::testing::init_host_for_test_once;
 use tx_subsystems::pipe::adapter::step_engine::{Cap, InterestMask, StepOutcome, WaitSourceId};
 use tx_subsystems::pipe::adapter::wait_routing::{
     MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
@@ -56,22 +55,10 @@ static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
     guard
-}
-
-fn drain_to_quiescence() {
-    let mut quiet = 0u32;
-    while quiet < 2 {
-        let stats = epoch::drain_with_budget(usize::MAX);
-        if stats.reclaimed == 0 {
-            quiet += 1;
-        } else {
-            quiet = 0;
-        }
-    }
 }
 
 fn payload_of(openfile: &Cap<OpenFile>) -> Cap<PipePayload> {
@@ -166,7 +153,7 @@ fn blocked_reader_on_empty_ring_is_woken_when_writer_pushes_bytes() {
 
     // Hold writer alive past the assertion.
     drop(writer);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 }
 
 // === Invariant 2: blocked-writer-woken-on-read =========================
@@ -221,7 +208,7 @@ fn dropping_last_reader_cap_fires_writer_wait_source() {
 
     // Production-path last-reader-close.
     drop(reader);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 
     // Sanity: the reader-source vs writer-source id namespaces are
     // distinct (each side registers a separate id with the legacy
@@ -240,7 +227,7 @@ fn dropping_last_reader_cap_fires_writer_wait_source() {
     );
 
     drop(writer);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 }
 
 // === Invariant 4: terminal-fires-on-last-writer-close ==================
@@ -256,7 +243,7 @@ fn dropping_last_writer_cap_fires_reader_wait_source() {
     let (_guard_reg, gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
 
     drop(writer);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 
     assert_source_fired(
         &mailbox,
@@ -266,7 +253,7 @@ fn dropping_last_writer_cap_fires_reader_wait_source() {
     );
 
     drop(reader);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 }
 
 // === Invariant 5: zero-byte-edge-cases =================================
@@ -292,7 +279,7 @@ fn step_write_empty_bytes_does_not_fire_reader_wait_source() {
 
     drop(reader);
     drop(writer);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 }
 
 #[test]
@@ -327,7 +314,7 @@ fn step_read_empty_buf_does_not_fire_writer_wait_source() {
 
     drop(reader);
     drop(writer);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 }
 
 // === Invariant 6: generation-stamped (the round-trip) ==================
@@ -367,7 +354,7 @@ fn waitsource_notify_stamps_caller_generation_on_event() {
 
     drop(reader);
     drop(writer);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 }
 
 // === Coexistence pin (D2): both paths fire on the same transition =====
@@ -407,5 +394,5 @@ fn write_fires_both_legacy_channel_and_new_wait_source() {
 
     drop(reader);
     drop(writer);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 }

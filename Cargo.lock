@@ -374,6 +374,7 @@ dependencies = [
  "tx-platform-adapter",
  "tx-substrate",
  "tx-subsystems",
+ "tx-test-support",
 ]
 
 [[package]]
@@ -387,6 +388,7 @@ dependencies = [
  "tx-platform-adapter",
  "tx-substrate",
  "tx-subsystems",
+ "tx-test-support",
 ]
 
 [[package]]
@@ -429,6 +431,7 @@ dependencies = [
  "tx-shims",
  "tx-substrate",
  "tx-subsystems",
+ "tx-test-support",
 ]
 
 [[package]]
@@ -488,6 +491,7 @@ dependencies = [
  "tx-platform-adapter",
  "tx-substrate",
  "tx-subsystems",
+ "tx-test-support",
 ]
 
 [[package]]
@@ -505,6 +509,7 @@ dependencies = [
  "tx-scripts",
  "tx-substrate",
  "tx-subsystems",
+ "tx-test-support",
 ]
 
 [[package]]
@@ -524,6 +529,15 @@ dependencies = [
  "tx-reactor",
  "tx-substrate",
  "tx-subsystems",
+ "tx-test-support",
+]
+
+[[package]]
+name = "tx-test-support"
+version = "0.1.0"
+dependencies = [
+ "tx-platform-adapter",
+ "tx-substrate",
 ]
 
 [[package]]
