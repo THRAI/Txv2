@@ -1,6 +1,8 @@
 use super::*;
 use alloc::vec::Vec;
-use crate::page_backed::adapter::step_engine::{self as step_engine, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::page_backed::adapter::step_engine::{
+    self as step_engine, PageProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 
 impl PageCacheIndex {
     fn withdraw_from(&mut self, first: PageIndex) {
@@ -76,8 +78,8 @@ fn first_page_after_size(size: u64) -> Option<PageIndex> {
 pub fn step_fsync(
     pc: &PageContainer,
     guard: &Guard<'_>,
-) -> StepOutcome<(), tx_substrate::step_v3::PageProgress> {
-    use tx_substrate::step_v3::{PageProgress, StepOutcome as V3, YieldShape};
+) -> StepOutcome<(), PageProgress> {
+    use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
 
     let PageContainerKind::File {
         mount,
@@ -201,8 +203,8 @@ pub fn step_truncate(
     pc: &PageContainer,
     new_size: u64,
     guard: &Guard<'_>,
-) -> StepOutcome<(), tx_substrate::step_v3::PageProgress> {
-    use tx_substrate::step_v3::{PageProgress, StepOutcome as V3, YieldShape};
+) -> StepOutcome<(), PageProgress> {
+    use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
         return V3::err(Errno::EINVAL.into());
@@ -276,8 +278,8 @@ pub fn step_fallocate(
     pc: &PageContainer,
     new_size: u64,
     guard: &Guard<'_>,
-) -> StepOutcome<(), tx_substrate::step_v3::PageProgress> {
-    use tx_substrate::step_v3::{PageProgress, StepOutcome as V3, YieldShape};
+) -> StepOutcome<(), PageProgress> {
+    use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
         return V3::err(Errno::EINVAL.into());
@@ -363,7 +365,7 @@ impl<'a, I: SubjectIdentity> StepOp<I>
     for FsyncOp<'a>
 {
     type Output = ();
-    type Progress = tx_substrate::step_v3::PageProgress;
+    type Progress = PageProgress;
     fn step(
         &mut self,
         _ctx: &mut ScriptCtx<I>,
@@ -384,7 +386,7 @@ impl<'a, I: SubjectIdentity> StepOp<I>
     for TruncateOp<'a>
 {
     type Output = ();
-    type Progress = tx_substrate::step_v3::PageProgress;
+    type Progress = PageProgress;
     fn step(
         &mut self,
         _ctx: &mut ScriptCtx<I>,
@@ -405,7 +407,7 @@ impl<'a, I: SubjectIdentity> StepOp<I>
     for FallocateOp<'a>
 {
     type Output = ();
-    type Progress = tx_substrate::step_v3::PageProgress;
+    type Progress = PageProgress;
     fn step(
         &mut self,
         _ctx: &mut ScriptCtx<I>,
@@ -428,10 +430,10 @@ mod v3_tests {
     use alloc::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use step_engine::page_allocator;
-    use tx_substrate::step_v3::{
-        Errno as V3Errno, InterestMask, NoProgress, PageProgress, StepOutcome as V3Outcome,
-        WaitSourceId, YieldShape,
+    use step_engine::{
+        Errno as V3Errno, NoProgress, PageProgress, StepOutcome as V3Outcome, YieldShape,
     };
+    use step_engine::{InterestMask, WaitSourceId};
 
     fn setup_host_substrate() {
         tx_substrate::testing::init_host_for_test_once();
@@ -688,7 +690,7 @@ mod v3_tests {
         .expect("mount payload");
         PageContainer::new(
             PageContainerKind::File {
-                mount: MountPayloadPin::acquire(&tx_substrate::zone::PayloadCap::from_cap(mount)),
+                mount: MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(mount)),
                 fs_object_id,
             },
             4,
@@ -947,7 +949,7 @@ mod step_op_wraps {
     use super::*;
     use crate::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
     use crate::test_support::EPOCH_TEST_LOCK;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3Outcome};
+    use step_engine::{PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome as V3Outcome};
 
     fn setup() {
         tx_substrate::testing::init_host_for_test_once();
@@ -977,7 +979,7 @@ mod step_op_wraps {
             pc: &pc,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
     }
 
@@ -993,7 +995,7 @@ mod step_op_wraps {
             new_size,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
     }
 
@@ -1011,7 +1013,7 @@ mod step_op_wraps {
             new_size,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
     }
 }

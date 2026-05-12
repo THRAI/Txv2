@@ -24,10 +24,12 @@ pub mod step_engine {
         self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,
     };
     pub use tx_substrate::step_v3::{
-        ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, YieldShape,
+        ByteProgress, Errno, InterestMask, NoProgress, PageProgress,
+        ProcessIdentity as PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
+        SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        reserve_for, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
+        reserve_for, sign_for, Cap, PayloadCap, Zone, ZoneAllocated, ZoneError,
     };
     pub use tx_substrate::SpinMutex;
 

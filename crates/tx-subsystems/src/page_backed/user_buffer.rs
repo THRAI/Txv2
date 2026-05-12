@@ -111,7 +111,7 @@ fn step_range_with_user_buffer(
     buffer: UserBuffer,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
+    use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3};
     let mut advanced = 0usize;
     let mut offset = of.offset();
     while advanced < len {
@@ -382,7 +382,7 @@ fn step_range_with_kernel_buffer(
     mut buffer: KernelBuffer<'_>,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3, YieldShape};
+    use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3, YieldShape};
     let mut advanced = 0usize;
     let mut offset = of.offset();
     while advanced < len {

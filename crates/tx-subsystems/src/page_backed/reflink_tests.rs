@@ -1,9 +1,10 @@
 use super::*;
+use crate::page_backed::adapter::step_engine::{self as step_engine, StepOutcome as V3Out};
 
 fn setup_host_substrate() {
     tx_substrate::testing::init_host_for_test_once();
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    match step_engine::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for reflink tests: {error:?}"),
     }
 }
@@ -19,7 +20,7 @@ fn anon_pc(page_count: u64) -> PageContainer {
 
 fn read_frame_bytes(ppn: Ppn, len: usize) -> alloc::vec::Vec<u8> {
     let mut out = alloc::vec![0u8; len];
-    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(ppn, 0, &mut out);
+    step_engine::page_allocator::testing::read_frame_bytes_for_test(ppn, 0, &mut out);
     out
 }
 
@@ -29,21 +30,21 @@ fn pagebacked_install_shared_page_attaches_existing_frame_to_new_pc() {
         .lock()
         .expect("page-backed reflink test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
 
     let source = anon_pc(1);
     let dest = anon_pc(1);
 
     let materialized =
         match source.materialize_page(PageIndex::new(0), MaterializeAccess::Write, &guard) {
-            tx_substrate::step_v3::StepOutcome::Done(m) => m,
+            V3Out::Done(m) => m,
             other => panic!("source materialize: {other:?}"),
         };
     let source_ppn = materialized.ppn;
     drop(materialized);
 
     let pattern = alloc::vec![0xa7u8; crate::vm::USER_PAGE_SIZE];
-    tx_substrate::page_allocator::testing::write_frame_bytes_for_test(source_ppn, 0, &pattern);
+    step_engine::page_allocator::testing::write_frame_bytes_for_test(source_ppn, 0, &pattern);
 
     install_shared_page(&dest, PageIndex::new(0), source_ppn).expect("share page");
 
@@ -60,21 +61,21 @@ fn pagebacked_install_shared_page_rejects_already_present_entry() {
         .lock()
         .expect("page-backed reflink test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
 
     let source = anon_pc(1);
     let dest = anon_pc(1);
 
     let source_materialized =
         match source.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
-            tx_substrate::step_v3::StepOutcome::Done(m) => m,
+            V3Out::Done(m) => m,
             other => panic!("source materialize: {other:?}"),
         };
     let source_ppn = source_materialized.ppn;
     drop(source_materialized);
     let dest_materialized =
         match dest.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
-            tx_substrate::step_v3::StepOutcome::Done(m) => m,
+            V3Out::Done(m) => m,
             other => panic!("dest materialize: {other:?}"),
         };
     drop(dest_materialized);
@@ -107,14 +108,14 @@ fn pagebacked_cow_replace_into_private_swaps_to_fresh_frame_with_matching_bytes(
         .lock()
         .expect("page-backed reflink test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
 
     let source = anon_pc(1);
     let dest = anon_pc(1);
 
     let source_materialized =
         match source.materialize_page(PageIndex::new(0), MaterializeAccess::Write, &guard) {
-            tx_substrate::step_v3::StepOutcome::Done(m) => m,
+            V3Out::Done(m) => m,
             other => panic!("source materialize: {other:?}"),
         };
     let source_ppn = source_materialized.ppn;
@@ -123,7 +124,7 @@ fn pagebacked_cow_replace_into_private_swaps_to_fresh_frame_with_matching_bytes(
     let pattern: alloc::vec::Vec<u8> = (0..crate::vm::USER_PAGE_SIZE)
         .map(|i| (i & 0xff) as u8)
         .collect();
-    tx_substrate::page_allocator::testing::write_frame_bytes_for_test(source_ppn, 0, &pattern);
+    step_engine::page_allocator::testing::write_frame_bytes_for_test(source_ppn, 0, &pattern);
 
     install_shared_page(&dest, PageIndex::new(0), source_ppn).expect("share page");
     assert_eq!(dest.lookup(PageIndex::new(0)), Some(source_ppn));
