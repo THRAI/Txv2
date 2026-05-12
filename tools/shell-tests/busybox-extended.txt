@@ -88,11 +88,11 @@ send "ls /\n"
 expect "/ # " within 8000
 sleep 200
 
-# ls /bin — initramfs symlinks should be visible. KNOWN COVERAGE
-# GAP: directory enumeration of initramfs-unpacked entries.
-# `/bin/busybox` is reachable by direct path (wc -c /bin/busybox =
-# 1021784) but `ls /bin` reports an empty directory.
+# ls /bin — fixed by forwarding containing_mount to child dir rnodes
+# in materialise_child_rnode_v3 (walker.rs). Previously getdents64
+# returned -ENOSYS for every non-root directory.
 send "ls /bin | head -3\n"
+expect "busybox" within 8000
 expect "/ # " within 8000
 sleep 200
 
@@ -148,8 +148,9 @@ expect "MK-OK" within 5000
 expect "/ # " within 5000
 sleep 200
 
-# ls the new dir's parent (should now contain test1 + dir1)
+# ls the new dir's parent — getdents64 now works for sub-directories
 send "ls /tmp\n"
+expect "dir1" within 5000
 expect "/ # " within 5000
 sleep 200
 
@@ -172,9 +173,9 @@ expect "3" within 5000
 expect "/ # " within 5000
 sleep 200
 
-# Three-stage pipe — `tr` is currently missing because /bin/tr
-# symlink isn't enumerable; this directive is here to document the
-# gap and will turn green once the readdir/symlink path lands.
+# Three-stage pipe — `tr` is absent from the minimal initramfs
+# (only 27 symlinks baked in; see target/images/busybox-initramfs.cpio).
+# Assertion-free: documents the gap without blocking green.
 send "echo hello-world | tr - _ | wc -c\n"
 expect "/ # " within 5000
 sleep 200
@@ -187,6 +188,7 @@ send "uname\n"
 expect "/ # " within 5000
 sleep 200
 
+# `sleep` is absent from the minimal initramfs — same gap as `tr`.
 send "sleep 0 && echo SLEEP-OK\n"
 expect "/ # " within 5000
 sleep 200
