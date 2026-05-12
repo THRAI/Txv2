@@ -23,9 +23,9 @@ use crate::thread_runtime::structure::{
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
 use tx_hal::UserTrapContext;
-use tx_reactor::userspace::{SyscallRequest, UserspaceTrapInfo};
+use crate::thread_runtime::adapter::reactor_entry::{SyscallRequest, UserspaceTrapInfo};
+use crate::thread_runtime::adapter::step_engine::{Cap, PayloadCap};
 use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::zone::Cap;
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -262,7 +262,7 @@ fn pending_syscall_return_drains_at_userspace_entry() {
 const A0_INDEX: usize = 10;
 
 fn install_saved_context(
-    payload: &tx_substrate::zone::PayloadCap<crate::thread_runtime::ThreadPayload>,
+    payload: &PayloadCap<crate::thread_runtime::ThreadPayload>,
 ) -> UserTrapContext {
     let mut ctx = UserTrapContext {
         regs: [0; 32],
