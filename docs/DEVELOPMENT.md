@@ -203,7 +203,7 @@ cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf \
 or via the test lane's flag:
 
 ```sh
-cargo xtask test busybox-smoke --target rv64-qemu --trap-trace
+cargo xtask test busybox-boot --target rv64-qemu --trap-trace
 ```
 
 Wire format (canonical, see
