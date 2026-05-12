@@ -214,16 +214,16 @@ pub(crate) fn ci_slow(root: &Path) -> Result<()> {
     if busybox_present {
         results.push(ci_run(
             root,
-            "rv64 qemu busybox smoke sentinel",
+            "rv64 qemu busybox boot sentinel",
             "cargo",
-            &["xtask", "test", "busybox-smoke", "--target", "rv64-qemu"],
-            "txdoc:CI-GATE-QEMU-BUSYBOX-SMOKE",
+            &["xtask", "test", "busybox-boot", "--target", "rv64-qemu"],
+            "txdoc:CI-GATE-QEMU-BUSYBOX-BOOT",
         ));
     } else {
         results.push(CiStepResult {
-            name: "rv64 qemu busybox smoke sentinel",
-            reference: "txdoc:CI-GATE-QEMU-BUSYBOX-SMOKE",
-            command: "cargo xtask test busybox-smoke --target rv64-qemu".to_string(),
+            name: "rv64 qemu busybox boot sentinel",
+            reference: "txdoc:CI-GATE-QEMU-BUSYBOX-BOOT",
+            command: "cargo xtask test busybox-boot --target rv64-qemu".to_string(),
             outcome: CiOutcome::Skipped(format!(
                 "vendored busybox missing at {}; run tools/images/fetch-busybox.sh",
                 rv64_busybox
