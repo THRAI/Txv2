@@ -8,7 +8,7 @@
 //! HAL `PmapIf` root evidence through `pmap.rs`.
 
 pub mod checks;
-mod execution;
+pub mod execution;
 mod pmap;
 pub mod project;
 pub mod scripts;
@@ -21,7 +21,10 @@ pub(crate) use pmap::TestPmap;
 #[cfg(test)]
 mod tests;
 
-pub use execution::{MadviseAdvice, MapReservation, MapReserveResult};
+pub use execution::{
+    MadviseAdvice, MapReservation, MapReserveResult, NullUfdDispatch, UfdDispatch,
+    UfdDispatchTarget,
+};
 pub use pmap::{PmapMappingSnapshot, PmapPublishOutcome, PmapStats, VmPmapError};
 pub use scripts::{
     build_aspace_from_image, populate_detached_user_range, BssTail, ImagePlan, LoadSegment,
@@ -29,11 +32,12 @@ pub use scripts::{
 };
 pub use structure::{
     AccessMode, AcquirePairResult, AcquireResult, AddressSpace, AddressSpaceStats, LockMode,
-    MapPlacement, PendingWriter, Prot, RangeGuard, RangeGuardPair, RangeLock, UserPage,
-    UserPageIter, UserRange, UserRangeError, UserVirtAddr, VmBacking, VmEntry, VmEntryError,
-    VmEntryFlags, VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization,
-    VmFaultMaterializationBacking, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
-    VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest, WouldBlock, RANGE_LOCK_RELEASE_MASK,
-    USER_PAGE_SIZE,
+    MapPlacement, PendingWriter, PrivateFrame, PrivateFrameIdentity, PrivateFrameSnapshot,
+    PrivateFrameState, PrivatePageError, PrivatePageSet, Prot, RangeGuard, RangeGuardPair,
+    RangeLock, UfdRegistration, UserPage, UserPageIter, UserRange, UserRangeError, UserVirtAddr,
+    VmBacking, VmEntry, VmEntryError, VmEntryFlags, VmEntryRewrite, VmFault, VmFaultError,
+    VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultOutcome, VmMapCommit, VmMapError,
+    VmMapOutcome, VmMapRequest, VmMapTarget, VmPageOff, VmRemapOutcome, VmRemapRequest, WouldBlock,
+    RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
 };
 pub use user_access::UserAccessKind;

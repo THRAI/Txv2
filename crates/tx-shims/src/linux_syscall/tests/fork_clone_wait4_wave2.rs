@@ -179,9 +179,10 @@ fn dispatch_clone_seeds_child_a0_to_zero_and_pc_after_ecall() {
         "RV64 a0 (regs[10]) must be 0 in the child — Linux fork-clone ABI"
     );
     assert_eq!(
-        saved.pc,
-        parent_ctx.pc + 4,
-        "child's pc must skip past the trapping ecall (4 bytes on RV64)"
+        saved.pc, parent_ctx.pc,
+        "child inherits parent's saved-context PC verbatim; the +4 ecall-skip \
+         is applied by the trap shell at user-mode entry, not at clone time \
+         (see seed_child_leader_context comment)"
     );
     // Other GPRs preserved.
     for i in 0..32 {

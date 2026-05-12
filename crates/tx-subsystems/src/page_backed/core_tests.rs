@@ -374,7 +374,7 @@ impl FsPageBacking for BlockingFs {
         // Yield on `WaitToken(9, 0x44)` so production fns routing
         // through this trait (e.g. `materialize_file_page`)
         // observe a yield rather than `Err(EAGAIN)`.
-        tx_substrate::step_v3::StepOutcome::yield_on_carrier(
+        tx_substrate::step_v3::StepOutcome::yield_on_wait_source(
             tx_substrate::step_v3::NoProgress,
             9,
             0x44,
@@ -619,7 +619,11 @@ fn page_container_materialize_page_propagates_file_block() {
 
     match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
         V3Out::Yield {
-            shape: tx_substrate::step_v3::YieldShape::OnCarrier { carrier, interests },
+            shape:
+                tx_substrate::step_v3::YieldShape::OnWaitSource {
+                    source: carrier,
+                    interests,
+                },
             ..
         } => {
             assert_eq!(carrier.raw(), 9);
@@ -740,7 +744,7 @@ fn pagebacked_step_read_returns_advanced_then_blocked_after_progress() {
 
     assert_eq!(
         step_read(&pc, &of, crate::vm::USER_PAGE_SIZE + 1, &guard),
-        V3Out::yield_on_carrier(
+        V3Out::yield_on_wait_source(
             tx_substrate::step_v3::ByteProgress::new(crate::vm::USER_PAGE_SIZE),
             9,
             0x44,
@@ -769,4 +773,117 @@ fn pagebacked_step_write_rejects_device_backing() {
     );
     assert_eq!(of.offset(), 0);
     assert_eq!(pc.resident_pages(), 0);
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    //! PR-2 wave-3 smoke tests for `ReadOp`/`WriteOp` `StepOp` wraps.
+    //!
+    //! Each test builds the `*Op` adapter, drives it through a single
+    //! `.step(&mut ctx)` call, and pins the outcome variant against the
+    //! same expectation as the free-fn suite above. Compile-checks
+    //! `impl StepOp` correctness; the heavy-lifting semantics tests
+    //! live in the free-fn suite.
+    use super::*;
+    use crate::page_backed::{ReadOp, WriteOp};
+    use tx_substrate::step_v3::{ScriptCtx, StepOp};
+
+    #[test]
+    fn read_op_advances_offset_through_step() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            3,
+        );
+        let of = open_file_for_pc(&pc);
+        of.set_offset((crate::vm::USER_PAGE_SIZE - 8) as u64);
+        let mut op = ReadOp {
+            pc: &pc,
+            of: &of,
+            len: 32,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        assert_eq!(op.step(&mut ctx), V3Out::Done(32));
+        assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE - 8 + 32) as u64);
+    }
+
+    #[test]
+    fn read_op_eof_returns_done_zero() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        );
+        let of = open_file_for_pc(&pc);
+        of.set_offset(crate::vm::USER_PAGE_SIZE as u64);
+        let mut op = ReadOp {
+            pc: &pc,
+            of: &of,
+            len: 16,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        assert_eq!(op.step(&mut ctx), V3Out::Done(0));
+        assert_eq!(pc.resident_pages(), 0);
+    }
+
+    #[test]
+    fn write_op_marks_dirty_and_advances_offset() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            2,
+        );
+        let of = open_file_for_pc(&pc);
+        let len = crate::vm::USER_PAGE_SIZE + 17;
+        let mut op = WriteOp {
+            pc: &pc,
+            of: &of,
+            len,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        assert_eq!(op.step(&mut ctx), V3Out::Done(len));
+        assert_eq!(of.offset(), len as u64);
+        assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
+        assert!(pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
+    }
+
+    #[test]
+    fn write_op_rejects_device_backing() {
+        let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
+        setup_host_substrate();
+        let guard = tx_substrate::epoch::guard();
+        let pc = PageContainer::new(
+            PageContainerKind::Device {
+                base_ppn: Ppn(0xface_0000),
+                page_count: 1,
+            },
+            1,
+        );
+        let of = open_file_for_pc(&pc);
+        let mut op = WriteOp {
+            pc: &pc,
+            of: &of,
+            len: 8,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        assert_eq!(op.step(&mut ctx), V3Out::Err(Errno::EINVAL.into()));
+        assert_eq!(of.offset(), 0);
+        assert_eq!(pc.resident_pages(), 0);
+    }
 }

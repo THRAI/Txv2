@@ -312,7 +312,7 @@ pub const NR_SET_ROBUST_LIST: u64 = 99;
 
 // ---------------------------------------------------------------------
 // Wave 3 of the fork/clone/wait4 slice — Part 3 (NR_WAIT4 syscall arm
-// with blocking-wait via the per-process `exit_port` carrier wired in
+// with blocking-wait via the per-process `exit_source` carrier wired in
 // Wave 1). NR_WAITID is intentionally absent — deferred per the slice
 // plan's Open Q #2 (DECIDED 2026-05-06: NR_WAITID deferred).
 // ---------------------------------------------------------------------
@@ -322,9 +322,9 @@ pub const NR_SET_ROBUST_LIST: u64 = 99;
 ///
 /// Wave 3 of the fork/clone/wait4 slice ships the blocking variant —
 /// when no zombie matches and `WNOHANG` is unset, the arm parks on the
-/// caller's per-process `exit_port` carrier (registered at payload
+/// caller's per-process `exit_source` carrier (registered at payload
 /// sign time per Wave 1) via
-/// [`tx_subsystems::wait_carrier::wait_on_token`], waking when any
+/// [`tx_subsystems::wait_source::wait_on_token`], waking when any
 /// child of this process zombifies. See
 /// `txdoc:PROCESS-WAIT-FAMILY-1`.
 pub const NR_WAIT4: u64 = 260;
@@ -626,7 +626,7 @@ pub const MADV_FREE: u64 = 8;
 // op selectors return `-ENOSYS`. The `FUTEX_PRIVATE_FLAG` and
 // `FUTEX_CLOCK_REALTIME` flag bits are recognised but ignored
 // (per-process isolation is implicit from the per-aspace user word;
-// timeout support is deferred to Slice 4 with the timer-wait carrier).
+// timeout support is deferred to Slice 4 with the timer-wait source).
 // See `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 3.
 // ---------------------------------------------------------------------
 
@@ -691,7 +691,7 @@ pub const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 /// already past (`tv_sec == 0 && tv_nsec == 0`, or the deadline has
 /// already elapsed by the time we sample `read_ns()`), the arm returns
 /// `0` immediately. Real-duration nanosleep needs a per-task timer-fire
-/// wait carrier (so the parked task wakes on the next BSP reactor tick
+/// wait source (so the parked task wakes on the next BSP reactor tick
 /// after `read_ns() >= deadline`); that wiring is deferred — Slice 4's
 /// timer-channel infrastructure lands in a follow-up slice. Real
 /// non-zero durations currently return `-ENOSYS`. busybox sh barely
@@ -1164,3 +1164,250 @@ pub const UTIME_NOW: i64 = (1 << 30) - 1;
 /// `UTIME_OMIT = (1 << 30) - 2` — `utimensat(2)` "leave unchanged"
 /// sentinel.
 pub const UTIME_OMIT: i64 = (1 << 30) - 2;
+
+// ---------------------------------------------------------------------
+// PR-10 phase 2 — `userfaultfd(2)` + `UFFDIO_API` ioctl handshake.
+//
+// `__NR_userfaultfd = 282` per Linux RV64 generic ABI
+// (`include/uapi/asm-generic/unistd.h`); x86_64 also uses 282 (in
+// arch-specific `unistd_64.h`). The bare-`flags` syscall mints a fresh
+// userfaultfd object and returns the fd. Phase 2 only validates flags
+// and installs the ufd in the fd table; later phases (P-10.3 / P-10.4
+// / P-10.5) wire `UFFDIO_REGISTER` / fault interception / reply
+// ioctls.
+//
+// `UFFDIO_API` is the api-handshake ioctl on a fresh ufd:
+//
+//   struct uffdio_api { __u64 api; __u64 features; __u64 ioctls; }
+//
+// The ioctl number is `_IOWR(0xAA, 0x3F, struct uffdio_api)` =
+// `0xC020_AA3F`. We pin the magic value here for grep-stability —
+// later phases gain `_IOWR` / `_IOR` helpers if other UFFDIO_* numbers
+// are wanted.
+//
+// Spec:
+// - `docs/progress/decisions/2026-05-11-d7-pr-10-userfaultfd-plan.md`
+//   (§6 phase plan)
+// - `docs/Txv3/05_DELEGATE_v1.md` §8.1 (userfaultfd worked example)
+// - `man 2 userfaultfd`, `man 2 ioctl_userfaultfd`
+// ---------------------------------------------------------------------
+
+/// `userfaultfd(flags)`. Linux RV64 generic ABI
+/// `__NR_userfaultfd = 282`. Mints a fresh ufd object, wraps it in an
+/// `OpenFile` with `OpenFileBacking::Ufd`, installs at the lowest free
+/// fd, and returns the fd. Recognised `flags`: `O_CLOEXEC`. Other bits
+/// return `-EINVAL`.
+pub const NR_USERFAULTFD: u64 = 282;
+
+/// `UFFDIO_API` ioctl request number on Linux generic uapi:
+/// `_IOWR('U', 0x3F, struct uffdio_api)` (`'U'` = `0xAA`, size = 24).
+/// The handshake validates the api version + features fields and
+/// writes back the supported `ioctls` bitmap. PR-10 phase 2 ships a
+/// no-op handshake: it accepts `api == UFFD_API`, requires `features
+/// == 0`, writes `0` for the supported-features mask, sets the
+/// handshake bit on the ufd, and returns `0`. Later phases populate
+/// the real supported-features mask.
+///
+/// Typed as `u32` to compare directly against `sys_ioctl`'s
+/// `args[1] as u32` request word. All `UFFDIO_*` numbers fit in 32
+/// bits per the `_IOWR(0xAA, _, _)` encoding.
+pub const UFFDIO_API: u32 = 0xC020_AA3F;
+
+/// `UFFD_API` magic value the agent passes in the
+/// `struct uffdio_api { api: ... }` field. Linux's userfaultfd ships
+/// `0xAA` as the only currently-supported API revision; rejecting any
+/// other value matches Linux's "api mismatch → -EINVAL" behaviour.
+pub const UFFD_API: u64 = 0xAA;
+
+// === PR-10 phase 3 — UFFDIO_REGISTER ioctl ============================
+
+/// `UFFDIO_REGISTER` ioctl request number on Linux generic uapi:
+/// `_IOWR('U', 0x00, struct uffdio_register)`. The struct is 32 bytes
+/// (16-byte `range`, an 8-byte `mode`, and an 8-byte writeback
+/// `ioctls`). PR-10 phase 3 ships a MISSING-only handler — the
+/// agent registers a VMA range against the ufd and the kernel
+/// returns the bitmap of reply ioctls supported on that range
+/// (`UFFDIO_COPY | UFFDIO_ZEROPAGE` for the canary).
+///
+/// Typed `u32` to match `sys_ioctl`'s `args[1] as u32` shape;
+/// all `UFFDIO_*` numbers fit in 32 bits per `_IOWR(0xAA, _, _)`.
+pub const UFFDIO_REGISTER: u32 = 0xC020_AA00;
+
+/// `UFFDIO_REGISTER_MODE_MISSING` — the most common Linux mode,
+/// "deliver page faults on missing-pages to the ufd's handler."
+/// PR-10 phase 3 accepts this mode only.
+pub const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
+
+/// `UFFDIO_REGISTER_MODE_WP` — write-protect mode. Phase 3 rejects
+/// this with `-EINVAL`; reserved for a follow-up phase.
+pub const UFFDIO_REGISTER_MODE_WP: u64 = 1 << 1;
+
+/// `UFFDIO_REGISTER_MODE_MINOR` — minor-fault mode (Linux 5.13+).
+/// Phase 3 rejects this with `-EINVAL`; reserved for a follow-up
+/// phase.
+pub const UFFDIO_REGISTER_MODE_MINOR: u64 = 1 << 2;
+
+/// `UFFDIO_COPY` — page-copy reply ioctl (PR-10 phase 5).
+///
+/// `_IOWR('U', 0x03, struct uffdio_copy)` — the struct is 40 bytes
+/// (`__u64 dst, src, len, mode, copy`), so the size field is
+/// `0x028` (40 in hex). Phase 5 (this) wires the handler in
+/// `userfaultfd::step_uffdio_copy`.
+pub const UFFDIO_COPY: u32 = 0xC028_AA03;
+
+/// `UFFDIO_ZEROPAGE` — zero-page reply ioctl (PR-10 phase 5).
+///
+/// `_IOWR('U', 0x04, struct uffdio_zeropage)` — the struct is 32 bytes
+/// (`struct uffdio_range range; __u64 mode; __u64 zeropage`), so the
+/// size field is `0x020`. Phase 5 wires `step_uffdio_zeropage`.
+pub const UFFDIO_ZEROPAGE: u32 = 0xC020_AA04;
+
+/// `UFFDIO_CONTINUE` — page-cache continue reply ioctl (PR-10 phase 5).
+///
+/// `_IOWR('U', 0x07, struct uffdio_continue)` — the struct is 32 bytes
+/// (`struct uffdio_range range; __u64 mode; __u64 mapped`). Used by
+/// ufd-shm to install existing page-cache contents without supplying
+/// a fresh source buffer.
+pub const UFFDIO_CONTINUE: u32 = 0xC020_AA07;
+
+/// `UFFD_EVENT_PAGEFAULT` — `struct uffd_msg { event }` discriminator
+/// returned by `read(uffd_fd, &mut uffd_msg)` for a page-fault
+/// message. Linux userfaultfd uapi (`<linux/userfaultfd.h>`):
+/// `#define UFFD_EVENT_PAGEFAULT  0x12`. PR-10 phase 5 only emits
+/// this event variant; future ufd events (`FORK`, `REMAP`, `REMOVE`,
+/// `UNMAP`) gain their own constants when wired.
+pub const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
+
+/// Bitmap returned in `struct uffdio_register { ioctls }` on a
+/// successful registration: the reply ioctls the agent may now use
+/// against the registered range. Per Linux's userfaultfd uapi,
+/// each bit is `_IOC_NR(UFFDIO_*)` — bit 0x03 for `UFFDIO_COPY`,
+/// bit 0x04 for `UFFDIO_ZEROPAGE`, and bit 0x07 for
+/// `UFFDIO_CONTINUE`. Phase 5 grows the bitmap to include
+/// `UFFDIO_CONTINUE` now that the handler is wired.
+pub const UFFDIO_REGISTER_REPLY_IOCTLS: u64 = (1u64 << 0x03) | (1u64 << 0x04) | (1u64 << 0x07);
+
+// =====================================================================
+// PR-11 phase 1 — AIO syscall numbers
+//
+// Spec:
+// - `docs/Txv3/06_EXECUTION_SCOPE_v1.md` (`OnBehalfOf<P>` execution scope)
+// - `docs/progress/decisions/2026-05-11-d8-pr-11-aio-plan.md` §4.1 / §7
+// - `man 2 io_setup`, `man 2 io_destroy`, `man 2 io_submit`,
+//   `man 2 io_getevents`
+//
+// **Linux divergence (per D8 §4.1):** our `sys_io_setup` returns a real
+// `fd` (via `OpenFileBacking::AioContext`) rather than Linux's opaque
+// pointer-shaped `aio_context_t`. The user-visible numeric value of
+// the syscall return is therefore a fd, not a ring-buffer address.
+// Userspace glibc shims bridge the fd back into the legacy
+// `aio_context_t *` out-parameter shape with a 5-line conversion.
+//
+// **Linux numbering reference (x86_64):** `io_setup = 206`,
+// `io_destroy = 207`, `io_getevents = 208`, `io_submit = 209`. These
+// numbers are stable across Linux's generic uapi for RV64 as well.
+// Phase 1 wires only `NR_IO_SETUP`; the other three are defined here
+// for forward-reference (phases 2–4 will populate the dispatch arms).
+// =====================================================================
+
+/// `io_setup(nr_events, ctx_idp)`. Linux RV64 generic ABI
+/// `__NR_io_setup = 206`. Mints a fresh [`AioContext`] cap (W-Z PR-11
+/// phase 1 zone), wraps it in an `OpenFile` with
+/// `OpenFileBacking::AioContext`, installs at the lowest free fd, and
+/// returns the fd (diverging from Linux which writes a pointer-shape
+/// into `*ctx_idp`; see module-doc note above).
+///
+/// [`AioContext`]: tx_subsystems::aio::AioContext
+pub const NR_IO_SETUP: u64 = 206;
+
+/// `io_destroy(ctx)`. Linux RV64 generic ABI `__NR_io_destroy = 207`.
+/// Phase 1 defines the constant for forward-reference; the dispatch
+/// arm lands in phase 4 (close + worker abandonment via the borrow's
+/// `exit_source`).
+pub const NR_IO_DESTROY: u64 = 207;
+
+/// `io_getevents(ctx, min, max, events, timeout)`. Linux RV64 generic
+/// ABI `__NR_io_getevents = 208`. Phase 1 defines the constant for
+/// forward-reference; the dispatch arm lands in phase 3.
+pub const NR_IO_GETEVENTS: u64 = 208;
+
+/// `io_submit(ctx, nr, iocbpp)`. Linux RV64 generic ABI
+/// `__NR_io_submit = 209`. Phase 1 defines the constant for
+/// forward-reference; the dispatch arm lands in phase 2 (alongside
+/// the worker task spawn + `with_on_behalf_of` integration).
+pub const NR_IO_SUBMIT: u64 = 209;
+
+// =====================================================================
+// Future PR-12 phase 0 — io_uring SQPOLL syscall numbers (second
+// `OnBehalfOf<P>` canary)
+//
+// Spec:
+// - `docs/Txv3/06_EXECUTION_SCOPE_v1.md` §8.1 (SQPOLL design)
+// - `docs/progress/decisions/2026-05-11-d8-pr-11-aio-plan.md` §13
+//   (future canary discussion)
+// - `man 2 io_uring_setup`, `man 2 io_uring_enter`
+//
+// **Linux numbering (generic uapi / x86_64 share the value for these
+// post-RV64 syscalls):** `io_uring_setup = 425`, `io_uring_enter = 426`,
+// `io_uring_register = 427`. Phase 0 wires only `NR_IO_URING_SETUP`;
+// `NR_IO_URING_ENTER` is defined for forward reference (SQPOLL by
+// definition does not need it for SQE submission — the kthread polls —
+// but a future phase wires it for the non-SQPOLL setup path).
+// =====================================================================
+
+/// `io_uring_setup(entries, params)`. Linux generic uapi
+/// `__NR_io_uring_setup = 425`. Mints a fresh
+/// [`tx_subsystems::io_uring::IoUring`] cap (W-LL phase 0 zone), wraps
+/// it in an `OpenFile` with `OpenFileBacking::IoUring`, spawns the
+/// SQPOLL kthread via `with_on_behalf_of`, installs at the lowest
+/// free fd, and returns the fd. Phase 0 ignores `*params` per the
+/// scaffold scope.
+pub const NR_IO_URING_SETUP: u64 = 425;
+
+/// `io_uring_enter(fd, to_submit, min_complete, flags, sig, sigsz)`.
+/// Linux generic uapi `__NR_io_uring_enter = 426`. Phase 0 defines the
+/// constant for forward reference; SQPOLL setups do not need this
+/// syscall for SQE submission (the kthread polls), so the dispatch
+/// arm is deferred to a future phase that handles the non-SQPOLL
+/// setup path.
+pub const NR_IO_URING_ENTER: u64 = 426;
+
+// =====================================================================
+// D9-D — signalfd syscall numbers
+//
+// Spec:
+// - `docs/progress/decisions/2026-05-11-d9-signal-wake-migration.md`
+//   §6 (signalfd as Option C follow-up)
+// - `man 2 signalfd`, `man 2 signalfd4`
+//
+// Linux RV64 generic ABI: `signalfd = 282`-historical (x86_64 282 was
+// signalfd-1; signalfd4 = 289). The generic uapi number for
+// `signalfd4(2)` (the only signalfd Linux retains in modern kernels)
+// is 74. We expose both constants for clarity, but the dispatch arm
+// only wires `NR_SIGNALFD4`; the older `signalfd(2)` API is omitted
+// per "modern Linux only signalfd4 is in use" reality (the older
+// variant lacked the flags argument; modern glibc only emits
+// signalfd4).
+// =====================================================================
+
+/// `signalfd4(fd, &mask, sizemask, flags)`. Linux RV64 generic ABI
+/// `__NR_signalfd4 = 74`. Mints a fresh signalfd cap (D9-D zone) if
+/// `fd == -1`, or updates an existing signalfd's mask if `fd` names
+/// one. Returns the fd. Recognised `flags`: `SFD_CLOEXEC`,
+/// `SFD_NONBLOCK`; other bits return `-EINVAL`.
+pub const NR_SIGNALFD4: u64 = 74;
+
+/// Historical `signalfd(fd, &mask, sizemask)` (no `flags`). x86_64
+/// number is 282; on the RV64 generic uapi the older signalfd is
+/// not exposed (modern glibc dispatches through signalfd4 only).
+/// We define the x86_64 number here for cross-reference but do not
+/// wire it.
+pub const NR_SIGNALFD: u64 = 282;
+
+/// `SFD_CLOEXEC` — set close-on-exec on the resulting fd. Same bit
+/// value as `O_CLOEXEC` per Linux's signalfd4 flag convention.
+pub const SFD_CLOEXEC: u32 = O_CLOEXEC;
+
+/// `SFD_NONBLOCK` — set non-blocking mode on the resulting fd. Same
+/// bit value as `O_NONBLOCK` per Linux's signalfd4 flag convention.
+pub const SFD_NONBLOCK: u32 = O_NONBLOCK;

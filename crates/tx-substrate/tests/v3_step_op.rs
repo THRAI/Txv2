@@ -13,8 +13,8 @@
 //! - STEP-3 (StepProgress monoid bound on the associated type)
 
 use tx_substrate::step_v3::{
-    ByteProgress, InterestConditions, NoProgress, ScriptCtx, StepOp, StepOutcome, StepProgress,
-    WakeCarrier, YieldShape,
+    AbortReason, ByteProgress, DelegateReply, Errno, InterestMask, NoProgress, ResumeOutcome,
+    ScriptCtx, StepOp, StepOutcome, StepProgress, TimerId, WaitSourceId, YieldShape,
 };
 
 // -- 1. Done variant w/ NoProgress -------------------------------------------
@@ -33,7 +33,7 @@ fn step_op_trait_has_associated_output_and_progress_types() {
     }
 
     let mut op = OneShotOp;
-    let mut ctx = ScriptCtx::new();
+    let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
     let out = op.step(&mut ctx);
     assert_eq!(out, StepOutcome::Done(7u32));
 }
@@ -51,27 +51,28 @@ fn step_op_can_yield_with_progress_and_shape() {
         fn step(&mut self, _ctx: &mut ScriptCtx) -> StepOutcome<Self::Output, Self::Progress> {
             StepOutcome::Yield {
                 progress: ByteProgress::new(64),
-                shape: YieldShape::OnCarrier {
-                    carrier: WakeCarrier::new(1),
-                    interests: InterestConditions::new(0b1),
+                shape: YieldShape::OnWaitSource {
+                    source: WaitSourceId::new(1),
+                    interests: InterestMask::new(0b1),
                 },
             }
         }
     }
 
     let mut op = YieldingOp;
-    let mut ctx = ScriptCtx::new();
+    let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
     let out = op.step(&mut ctx);
 
     match out {
         StepOutcome::Yield { progress, shape } => {
             assert_eq!(progress, ByteProgress::new(64));
             match shape {
-                YieldShape::OnCarrier { carrier, interests } => {
-                    assert_eq!(carrier, WakeCarrier::new(1));
-                    assert_eq!(interests, InterestConditions::new(0b1));
+                YieldShape::OnWaitSource { source, interests } => {
+                    assert_eq!(source, WaitSourceId::new(1));
+                    assert_eq!(interests, InterestMask::new(0b1));
                 }
-                YieldShape::OnAgent { .. } => panic!("expected OnCarrier, got OnAgent"),
+                YieldShape::OnAgent { .. } => panic!("expected OnWaitSource, got OnAgent"),
+                YieldShape::OnTimer { .. } => panic!("expected OnWaitSource, got OnTimer"),
             }
         }
         other => panic!("expected Yield, got {:?}", other),
@@ -96,7 +97,7 @@ fn step_op_can_continue() {
     }
 
     let mut op = ContinuingOp;
-    let mut ctx = ScriptCtx::new();
+    let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
     let out = op.step(&mut ctx);
 
     match out {
@@ -133,5 +134,90 @@ fn step_op_progress_associated_type_must_implement_step_progress() {
 
 #[test]
 fn script_ctx_is_constructible() {
-    let _ = ScriptCtx::new();
+    // Default type param `I = ProcessIdentity` doesn't auto-resolve
+    // when there's no contextual constraint; name it explicitly.
+    let _ = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+}
+
+// -- 6. apply_resume default accepts Retry, rejects everything else -----------
+
+struct DefaultResumeOp;
+
+impl StepOp for DefaultResumeOp {
+    type Output = ();
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(())
+    }
+}
+
+#[test]
+fn apply_resume_default_accepts_retry() {
+    let mut op = DefaultResumeOp;
+    assert_eq!(op.apply_resume(ResumeOutcome::Retry), Ok(()));
+}
+
+#[test]
+fn apply_resume_default_rejects_with_reply() {
+    let mut op = DefaultResumeOp;
+    let r = op.apply_resume(ResumeOutcome::WithReply(DelegateReply::placeholder()));
+    assert_eq!(r, Err(Errno::EINVAL));
+}
+
+#[test]
+fn apply_resume_default_rejects_timer_expired() {
+    let mut op = DefaultResumeOp;
+    let r = op.apply_resume(ResumeOutcome::TimerExpired(TimerId::new(99)));
+    assert_eq!(r, Err(Errno::EINVAL));
+}
+
+#[test]
+fn apply_resume_default_rejects_aborted_variants() {
+    let mut op = DefaultResumeOp;
+    for reason in [
+        AbortReason::Interrupted,
+        AbortReason::Killed,
+        AbortReason::TimedOut,
+        AbortReason::ScopeAbandoned,
+    ] {
+        assert_eq!(
+            op.apply_resume(ResumeOutcome::Aborted(reason)),
+            Err(Errno::EINVAL),
+            "default impl rejects Aborted({:?})",
+            reason
+        );
+    }
+}
+
+// -- 7. Override accepts WithReply --------------------------------------------
+
+#[test]
+fn apply_resume_override_can_accept_with_reply_and_stash_in_self() {
+    struct DelegateOp {
+        last_reply: Option<DelegateReply>,
+    }
+
+    impl StepOp for DelegateOp {
+        type Output = ();
+        type Progress = NoProgress;
+        fn step(&mut self, _ctx: &mut ScriptCtx) -> StepOutcome<Self::Output, Self::Progress> {
+            StepOutcome::Done(())
+        }
+        fn apply_resume(&mut self, resume: ResumeOutcome) -> Result<(), Errno> {
+            match resume {
+                ResumeOutcome::WithReply(r) => {
+                    self.last_reply = Some(r);
+                    Ok(())
+                }
+                ResumeOutcome::Retry => Ok(()),
+                _ => Err(Errno::EINVAL),
+            }
+        }
+    }
+
+    let mut op = DelegateOp { last_reply: None };
+    assert!(op.last_reply.is_none());
+    op.apply_resume(ResumeOutcome::WithReply(DelegateReply::placeholder()))
+        .expect("override accepts WithReply");
+    assert!(op.last_reply.is_some());
 }

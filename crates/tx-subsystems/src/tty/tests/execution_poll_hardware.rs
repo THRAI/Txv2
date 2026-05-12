@@ -20,7 +20,7 @@ impl CharDeviceOps for BlockingReadOps {
         _out: &mut [u8],
         _guard: &Guard<'_>,
     ) -> V3Out<usize, tx_substrate::step_v3::ByteProgress> {
-        V3Out::yield_on_carrier(tx_substrate::step_v3::ByteProgress::EMPTY, 0x55, 0x0f)
+        V3Out::yield_on_wait_source(tx_substrate::step_v3::ByteProgress::EMPTY, 0x55, 0x0f)
     }
 
     fn write(
@@ -77,12 +77,16 @@ fn step_poll_hardware_input_propagates_blocked_driver_read() {
 
     match step_poll_hardware_input(&tty, 16, &guard) {
         V3Out::Yield {
-            shape: YieldShape::OnCarrier { carrier, interests },
+            shape:
+                YieldShape::OnWaitSource {
+                    source: carrier,
+                    interests,
+                },
             ..
         } => {
             assert_eq!(carrier.raw(), 0x55);
             assert_eq!(interests.raw(), 0x0f);
         }
-        other => panic!("expected v3 Yield::OnCarrier, got {other:?}"),
+        other => panic!("expected v3 Yield::OnWaitSource, got {other:?}"),
     }
 }

@@ -15,7 +15,7 @@
 //!   has no `Cap<ProcessIdentity>` and so cannot fan out the signal.
 //!
 //! The payload allocates *two* `Channel`s registered with the global
-//! `wait_carrier` resolver: one fired when bytes become available
+//! `wait_source` resolver: one fired when bytes become available
 //! (wakes blocked readers) and one fired when space becomes available
 //! (wakes blocked writers). This mirrors the TTY identity's
 //! single-channel pattern in `tty::structure::TtyIdentity`, generalised
@@ -42,10 +42,13 @@
 //! last-writer-close transition fires the reader-side wait channel
 //! for EOF.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use tx_reactor::wait::{Channel, Mask};
+use tx_substrate::step_v3::{InterestMask, WaitSourceId};
+use tx_substrate::wake::WaitSource;
 use tx_substrate::zone::{self, Cap, ZoneAllocated, ZoneError};
 use tx_substrate::SpinMutex;
 
@@ -54,7 +57,7 @@ use crate::vfs::structure::{
     FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking, StructPayload,
     S_IFIFO,
 };
-use crate::wait_carrier;
+use crate::wait_source;
 
 /// Linux's `PIPE_BUF` per `man 7 pipe`. Atomic-write boundary; we
 /// reuse the same value as the ring capacity for simplicity (Linux
@@ -87,16 +90,49 @@ pub struct PipeFlags {
 }
 
 /// Anonymous-pipe payload. Carries the byte ring, per-side reference
-/// counts, and the two wait carriers. Single zone slot per pipe; the
-/// reader and writer ends share one `Cap<PipePayload>`.
+/// counts, and the two wait sources.
+///
+/// **PR-3D-1 coexistence** (D2/D4 ADRs). Each side carries **two**
+/// parallel wake-publication points:
+///
+/// 1. The legacy `Channel` (`reader_wait_channel` /
+///    `writer_wait_channel`) — backed by `RawPort`+`Waker`. Consumed
+///    by the existing `wait_source` resolver and any caller that
+///    `lookup_wait_channel`s the source id and awaits via
+///    `WaitFuture`. **Stays in place** until PR-3D-4 retires the
+///    legacy resolver path.
+/// 2. The new `Arc<WaitSource>` (`reader_wait_source` /
+///    `writer_wait_source`) — backed by `TaskMailbox`. Consumed by
+///    v3 callers that own a `TaskMailbox` and register via
+///    `WaitSource::prepare(...).install_if(...)`. Tested in
+///    `crates/tx-subsystems/tests/v3_pipe_waitsource.rs`.
+///
+/// Both paths fire on every state transition (`step_read`,
+/// `step_write`, `decr_reader`, `decr_writer`). The `WaitSourceId`
+/// stamped into `step_read` / `step_write`'s `YieldShape::OnWaitSource`
+/// is the same `u64` the legacy `wait_source` resolver returned, so
+/// the two paths share an id namespace and a v3 caller's
+/// `WaitSourceId.raw()` round-trips cleanly to the right side's
+/// `WaitSource`.
+///
+/// Single zone slot per pipe; the reader and writer ends share one
+/// `Cap<PipePayload>`.
 pub struct PipePayload {
     ring: SpinMutex<RingBuffer>,
     reader_count: AtomicU32,
     writer_count: AtomicU32,
     reader_wait_channel: Channel,
-    reader_wait_carrier_id: u64,
+    reader_wait_source_id: u64,
     writer_wait_channel: Channel,
-    writer_wait_carrier_id: u64,
+    writer_wait_source_id: u64,
+    /// PR-3D-1 new path. Fired alongside `reader_wait_channel` on
+    /// every transition that makes the reader side wake-relevant
+    /// (bytes-available, writer-closed-EOF).
+    reader_wait_source: Arc<WaitSource>,
+    /// PR-3D-1 new path. Fired alongside `writer_wait_channel` on
+    /// every transition that makes the writer side wake-relevant
+    /// (space-available, reader-closed-EPIPE).
+    writer_wait_source: Arc<WaitSource>,
 }
 
 impl core::fmt::Debug for PipePayload {
@@ -104,8 +140,8 @@ impl core::fmt::Debug for PipePayload {
         f.debug_struct("PipePayload")
             .field("reader_count", &self.reader_count.load(Ordering::Acquire))
             .field("writer_count", &self.writer_count.load(Ordering::Acquire))
-            .field("reader_wait_carrier_id", &self.reader_wait_carrier_id)
-            .field("writer_wait_carrier_id", &self.writer_wait_carrier_id)
+            .field("reader_wait_source_id", &self.reader_wait_source_id)
+            .field("writer_wait_source_id", &self.writer_wait_source_id)
             .finish()
     }
 }
@@ -184,25 +220,35 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
 impl PipePayload {
     /// Construct a fresh payload with one reader-end and one
     /// writer-end already accounted for — `step_pipe2` mints exactly
-    /// one fd of each side. Fails iff the wait-carrier registry is
+    /// one fd of each side. Fails iff the wait-source registry is
     /// out of memory (currently impossible on the in-tree
     /// `BTreeMap`-backed registry, but the Result surface keeps the
     /// signature aligned with future bounded carrier slabs).
     pub fn new() -> Result<Self, ZoneError> {
         let reader_wait_channel = Channel::new();
-        let reader_wait_carrier_id =
-            wait_carrier::register_wait_channel(reader_wait_channel.clone());
+        let reader_wait_source_id = wait_source::register_wait_channel(reader_wait_channel.clone());
         let writer_wait_channel = Channel::new();
-        let writer_wait_carrier_id =
-            wait_carrier::register_wait_channel(writer_wait_channel.clone());
+        let writer_wait_source_id = wait_source::register_wait_channel(writer_wait_channel.clone());
+
+        // PR-3D-1 (D2/D4 coexistence). Per-side `WaitSource`s share
+        // the legacy registry's id namespace so a v3 caller using the
+        // `WaitSourceId` stamped into `YieldShape::OnWaitSource` lands
+        // on the right side here.
+        let reader_wait_source =
+            Arc::new(WaitSource::new(WaitSourceId::new(reader_wait_source_id)));
+        let writer_wait_source =
+            Arc::new(WaitSource::new(WaitSourceId::new(writer_wait_source_id)));
+
         Ok(Self {
             ring: SpinMutex::new(RingBuffer::new()),
             reader_count: AtomicU32::new(1),
             writer_count: AtomicU32::new(1),
             reader_wait_channel,
-            reader_wait_carrier_id,
+            reader_wait_source_id,
             writer_wait_channel,
-            writer_wait_carrier_id,
+            writer_wait_source_id,
+            reader_wait_source,
+            writer_wait_source,
         })
     }
 
@@ -210,8 +256,8 @@ impl PipePayload {
     /// embeds this in any `Blocked(WaitToken)` it returns; the
     /// channel fires when bytes land in the ring (on
     /// `step_write`-side push).
-    pub fn reader_carrier_id(&self) -> u64 {
-        self.reader_wait_carrier_id
+    pub fn reader_source_id(&self) -> u64 {
+        self.reader_wait_source_id
     }
 
     /// Carrier id paired with the writer-side `Channel`. `step_write`
@@ -219,8 +265,24 @@ impl PipePayload {
     /// channel fires when space frees up in the ring (on
     /// `step_read`-side drain) and on last-reader-close to surface
     /// SIGPIPE/EPIPE to blocked writers.
-    pub fn writer_carrier_id(&self) -> u64 {
-        self.writer_wait_carrier_id
+    pub fn writer_source_id(&self) -> u64 {
+        self.writer_wait_source_id
+    }
+
+    /// PR-3D-1: reader-side `WaitSource` for the new mailbox-based
+    /// wake path. Returned as `&Arc<WaitSource>` so callers can clone
+    /// and hold the source across the wait window — pipe's
+    /// `Drop` releases its own clone independently of any consumer's.
+    ///
+    /// `WaitSource::id()` matches [`Self::reader_source_id`].
+    pub fn reader_wait_source(&self) -> &Arc<WaitSource> {
+        &self.reader_wait_source
+    }
+
+    /// PR-3D-1: writer-side `WaitSource`. See [`Self::reader_wait_source`].
+    /// `WaitSource::id()` matches [`Self::writer_source_id`].
+    pub fn writer_wait_source(&self) -> &Arc<WaitSource> {
+        &self.writer_wait_source
     }
 
     /// Reader-end ref drop. Called from `Drop for OpenFile` when the
@@ -239,8 +301,15 @@ impl PipePayload {
     pub(crate) fn decr_reader(&self) {
         let prev = self.reader_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
+            // Legacy path (D2 coexistence): wake any `Waker`-based waiter.
             self.writer_wait_channel
                 .fire(Mask::from_bits(PIPE_WRITABLE));
+            // PR-3D-1 new path: post `MailboxEvent::SourceFired` to
+            // any v3 caller that registered against the writer
+            // source. Blocked writers will re-observe and surface
+            // EPIPE on the next step (reader_count == 0).
+            self.writer_wait_source
+                .notify(InterestMask::new(PIPE_WRITABLE));
         }
     }
 
@@ -251,8 +320,13 @@ impl PipePayload {
     pub(crate) fn decr_writer(&self) {
         let prev = self.writer_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
+            // Legacy path (D2 coexistence).
             self.reader_wait_channel
                 .fire(Mask::from_bits(PIPE_READABLE));
+            // PR-3D-1 new path. Blocked readers will re-observe and
+            // surface EOF (Done(0)) on the next step.
+            self.reader_wait_source
+                .notify(InterestMask::new(PIPE_READABLE));
         }
     }
 
@@ -271,8 +345,8 @@ impl PipePayload {
 
 impl Drop for PipePayload {
     fn drop(&mut self) {
-        wait_carrier::release_wait_channel(self.reader_wait_carrier_id);
-        wait_carrier::release_wait_channel(self.writer_wait_carrier_id);
+        wait_source::release_wait_channel(self.reader_wait_source_id);
+        wait_source::release_wait_channel(self.writer_wait_source_id);
     }
 }
 
@@ -390,10 +464,15 @@ pub fn step_read(
     if !ring.is_empty() {
         let copied = ring.drain_to_slice(out);
         drop(ring);
-        // Wake any writer parked on space-available.
+        // Wake any writer parked on space-available — both paths
+        // (D2 coexistence): legacy `Channel` waker AND the new
+        // `WaitSource` mailbox path.
         payload
             .writer_wait_channel
             .fire(Mask::from_bits(PIPE_WRITABLE));
+        payload
+            .writer_wait_source
+            .notify(InterestMask::new(PIPE_WRITABLE));
         return tx_substrate::step_v3::StepOutcome::done(copied);
     }
     drop(ring);
@@ -404,9 +483,9 @@ pub fn step_read(
     if nonblocking {
         return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN);
     }
-    tx_substrate::step_v3::StepOutcome::yield_on_carrier(
+    tx_substrate::step_v3::StepOutcome::yield_on_wait_source(
         tx_substrate::step_v3::ByteProgress::EMPTY,
-        payload.reader_wait_carrier_id,
+        payload.reader_wait_source_id,
         PIPE_READABLE,
     )
 }
@@ -435,21 +514,100 @@ pub fn step_write(
     if !ring.is_full() {
         let copied = ring.fill_from_slice(bytes);
         drop(ring);
-        // Wake any reader parked on bytes-available.
+        // Wake any reader parked on bytes-available — both paths
+        // (D2 coexistence).
         payload
             .reader_wait_channel
             .fire(Mask::from_bits(PIPE_READABLE));
+        payload
+            .reader_wait_source
+            .notify(InterestMask::new(PIPE_READABLE));
         return tx_substrate::step_v3::StepOutcome::done(copied);
     }
     drop(ring);
     if nonblocking {
         return tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EAGAIN);
     }
-    tx_substrate::step_v3::StepOutcome::yield_on_carrier(
+    tx_substrate::step_v3::StepOutcome::yield_on_wait_source(
         tx_substrate::step_v3::ByteProgress::EMPTY,
-        payload.writer_wait_carrier_id,
+        payload.writer_wait_source_id,
         PIPE_WRITABLE,
     )
+}
+
+// ---------------------------------------------------------------------------
+// StepOp wraps (PR-2 wave 2)
+// ---------------------------------------------------------------------------
+//
+// Additive `impl StepOp` adapters per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1.
+// Each wrap stores its inputs (Cap by value, slice + guard by reference under
+// a single lifetime `'a`) and delegates from `step()` to the corresponding
+// free fn above. The free fns remain the source of truth; callers can migrate
+// to the `*Op` types incrementally.
+//
+// `step_pipe2` returns `Result<_, Errno>` rather than `StepOutcome`, so its
+// wrap lifts the result via `StepOutcome::Done` / `StepOutcome::Err`, mirroring
+// the cred mutators.
+
+/// `StepOp` wrap of [`step_pipe2`]. No guard arg, so no lifetime needed.
+pub struct Pipe2Op {
+    pub flags: PipeFlags,
+}
+
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for Pipe2Op {
+    type Output = (Cap<OpenFile>, Cap<OpenFile>);
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        match step_pipe2(self.flags) {
+            Ok(pair) => tx_substrate::step_v3::StepOutcome::Done(pair),
+            Err(e) => tx_substrate::step_v3::StepOutcome::Err(e.into()),
+        }
+    }
+}
+
+/// `StepOp` wrap of [`step_read`].
+pub struct ReadOp<'a> {
+    pub payload: &'a Cap<PipePayload>,
+    pub out: &'a mut [u8],
+    pub guard: &'a Guard<'a>,
+    pub nonblocking: bool,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ReadOp<'a>
+{
+    type Output = usize;
+    type Progress = tx_substrate::step_v3::ByteProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_read(self.payload, self.out, self.guard, self.nonblocking)
+    }
+}
+
+/// `StepOp` wrap of [`step_write`].
+pub struct WriteOp<'a> {
+    pub payload: &'a Cap<PipePayload>,
+    pub bytes: &'a [u8],
+    pub guard: &'a Guard<'a>,
+    pub nonblocking: bool,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for WriteOp<'a>
+{
+    type Output = usize;
+    type Progress = tx_substrate::step_v3::ByteProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_write(self.payload, self.bytes, self.guard, self.nonblocking)
+    }
 }
 
 #[cfg(test)]
@@ -526,8 +684,8 @@ mod tests {
         let payload_b = payload_of(&writer);
         assert_eq!(payload_a.reader_count_snapshot(), 1);
         assert_eq!(payload_a.writer_count_snapshot(), 1);
-        assert_eq!(payload_a.reader_carrier_id(), payload_b.reader_carrier_id());
-        assert_eq!(payload_a.writer_carrier_id(), payload_b.writer_carrier_id());
+        assert_eq!(payload_a.reader_source_id(), payload_b.reader_source_id());
+        assert_eq!(payload_a.writer_source_id(), payload_b.writer_source_id());
     }
 
     #[test]
@@ -542,12 +700,16 @@ mod tests {
         match outcome {
             V3Out::Yield {
                 progress: _,
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
-                assert_eq!(carrier.raw(), payload.reader_carrier_id());
+                assert_eq!(carrier.raw(), payload.reader_source_id());
                 assert_eq!(interests.raw(), PIPE_READABLE);
             }
-            other => panic!("expected Yield::OnCarrier, got {other:?}"),
+            other => panic!("expected Yield::OnWaitSource, got {other:?}"),
         }
     }
 
@@ -604,12 +766,16 @@ mod tests {
         match outcome {
             V3Out::Yield {
                 progress: _,
-                shape: YieldShape::OnCarrier { carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
-                assert_eq!(carrier.raw(), payload.writer_carrier_id());
+                assert_eq!(carrier.raw(), payload.writer_source_id());
                 assert_eq!(interests.raw(), PIPE_WRITABLE);
             }
-            other => panic!("expected Yield::OnCarrier, got {other:?}"),
+            other => panic!("expected Yield::OnWaitSource, got {other:?}"),
         }
     }
 
@@ -855,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn step_read_empty_ring_blocking_yields_on_carrier_with_empty_progress() {
+    fn step_read_empty_ring_blocking_yields_on_wait_source_with_empty_progress() {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
@@ -866,16 +1032,20 @@ mod tests {
         match outcome {
             tx_substrate::step_v3::StepOutcome::Yield {
                 progress,
-                shape: tx_substrate::step_v3::YieldShape::OnCarrier { carrier, interests },
+                shape:
+                    tx_substrate::step_v3::YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
                 assert!(
                     progress.is_empty(),
                     "blocked-empty read must carry empty ByteProgress",
                 );
-                assert_eq!(carrier.raw(), payload.reader_carrier_id());
+                assert_eq!(carrier.raw(), payload.reader_source_id());
                 assert_eq!(interests.raw(), PIPE_READABLE);
             }
-            other => panic!("expected v3 Yield::OnCarrier, got {other:?}"),
+            other => panic!("expected v3 Yield::OnWaitSource, got {other:?}"),
         }
     }
 
@@ -943,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn step_write_yields_on_carrier_when_full_and_blocking() {
+    fn step_write_yields_on_wait_source_when_full_and_blocking() {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
@@ -952,22 +1122,26 @@ mod tests {
         let guard = tx_substrate::epoch::guard();
         let filled = step_write(&payload, &big, &guard, false);
         assert_eq!(filled, V3Out::Done(PIPE_BUF));
-        // Next write blocks → Yield::OnCarrier with empty progress.
+        // Next write blocks → Yield::OnWaitSource with empty progress.
         let outcome = step_write(&payload, b"y", &guard, false);
         drop(guard);
         match outcome {
             tx_substrate::step_v3::StepOutcome::Yield {
                 progress,
-                shape: tx_substrate::step_v3::YieldShape::OnCarrier { carrier, interests },
+                shape:
+                    tx_substrate::step_v3::YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
                 assert!(
                     progress.is_empty(),
                     "blocked-full write must carry empty ByteProgress",
                 );
-                assert_eq!(carrier.raw(), payload.writer_carrier_id());
+                assert_eq!(carrier.raw(), payload.writer_source_id());
                 assert_eq!(interests.raw(), PIPE_WRITABLE);
             }
-            other => panic!("expected v3 Yield::OnCarrier, got {other:?}"),
+            other => panic!("expected v3 Yield::OnWaitSource, got {other:?}"),
         }
     }
 
@@ -985,5 +1159,273 @@ mod tests {
             tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EAGAIN) => {}
             other => panic!("expected v3 Err(EAGAIN), got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    //! PR-2 wave 2 StepOp wrap tests. Each test exercises one wrap
+    //! against fixtures already used by the file's existing tests,
+    //! confirming the wrap delegates to the corresponding free fn and
+    //! the outcome shape is preserved. The free-fn tests above remain
+    //! the source of truth for the semantic surface; these tests pin
+    //! the wrap layer.
+    use super::*;
+    use tx_substrate::step_v3::{
+        ByteProgress, Errno as V3Errno, ScriptCtx, StepOp, StepOutcome, StepProgress, YieldShape,
+    };
+    use tx_substrate::testing::init_host_for_test_once;
+
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::vfs::structure::{RNodeBacking, StructPayload};
+    use crate::zones;
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        init_host_for_test_once();
+        let _ = zones::register_all();
+        // Quiesce any deferred drops from prior tests so reader/writer
+        // counts read cleanly here.
+        let mut quiet = 0u32;
+        while quiet < 2 {
+            let stats = tx_substrate::epoch::drain_with_budget(usize::MAX);
+            if stats.reclaimed == 0 {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+        }
+        guard
+    }
+
+    fn drain_to_quiescence() {
+        let mut quiet = 0u32;
+        while quiet < 2 {
+            let stats = tx_substrate::epoch::drain_with_budget(usize::MAX);
+            if stats.reclaimed == 0 {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+        }
+    }
+
+    fn payload_of(openfile: &Cap<OpenFile>) -> Cap<PipePayload> {
+        match openfile.rnode().backing() {
+            RNodeBacking::StructBacked {
+                payload: StructPayload::Pipe { payload, .. },
+            } => payload.clone(),
+            other => panic!("expected StructPayload::Pipe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipe2_op_default_flags_returns_done_with_reader_writer_pair() {
+        let _setup = setup();
+        let mut op = Pipe2Op {
+            flags: PipeFlags::default(),
+        };
+        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        match outcome {
+            StepOutcome::Done((reader, writer)) => {
+                assert!(reader.flags().read);
+                assert!(writer.flags().write);
+                assert!(!reader.flags().cloexec);
+                assert!(!writer.flags().nonblocking);
+            }
+            other => panic!("expected Done((reader, writer)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipe2_op_honors_cloexec_and_nonblocking_flags() {
+        let _setup = setup();
+        let mut op = Pipe2Op {
+            flags: PipeFlags {
+                cloexec: true,
+                nonblocking: true,
+            },
+        };
+        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        match outcome {
+            StepOutcome::Done((reader, writer)) => {
+                assert!(reader.flags().cloexec);
+                assert!(reader.flags().nonblocking);
+                assert!(writer.flags().cloexec);
+                assert!(writer.flags().nonblocking);
+            }
+            other => panic!("expected Done((reader, writer)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_op_empty_buf_returns_done_zero() {
+        let _setup = setup();
+        let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        let guard = tx_substrate::epoch::guard();
+        let mut empty: [u8; 0] = [];
+        let mut op = ReadOp {
+            payload: &payload,
+            out: &mut empty,
+            guard: &guard,
+            nonblocking: false,
+        };
+        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        drop(guard);
+        match outcome {
+            StepOutcome::Done(0) => {}
+            other => panic!("expected Done(0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_op_empty_ring_nonblocking_returns_eagain() {
+        let _setup = setup();
+        let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        let guard = tx_substrate::epoch::guard();
+        let mut buf = [0u8; 4];
+        let mut op = ReadOp {
+            payload: &payload,
+            out: &mut buf,
+            guard: &guard,
+            nonblocking: true,
+        };
+        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        drop(guard);
+        match outcome {
+            StepOutcome::Err(V3Errno::EAGAIN) => {}
+            other => panic!("expected Err(EAGAIN), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_op_drains_ring_returns_done_byte_count() {
+        let _setup = setup();
+        let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        let _ = writer; // hold writer alive so step_read sees writer_count > 0
+        let guard = tx_substrate::epoch::guard();
+        // Seed via the free fn.
+        let _ = step_write(&payload, b"hello", &guard, false);
+        let mut buf = [0u8; 8];
+        let mut op = ReadOp {
+            payload: &payload,
+            out: &mut buf,
+            guard: &guard,
+            nonblocking: false,
+        };
+        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        drop(guard);
+        match outcome {
+            StepOutcome::Done(n) => {
+                assert_eq!(n, 5);
+                assert_eq!(&buf[..5], b"hello");
+            }
+            other => panic!("expected Done(5), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_op_empty_ring_blocking_yields_on_wait_source() {
+        let _setup = setup();
+        let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        let guard = tx_substrate::epoch::guard();
+        let mut buf = [0u8; 4];
+        let mut op = ReadOp {
+            payload: &payload,
+            out: &mut buf,
+            guard: &guard,
+            nonblocking: false,
+        };
+        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        drop(guard);
+        match outcome {
+            StepOutcome::Yield {
+                progress,
+                shape: YieldShape::OnWaitSource { source, interests },
+            } => {
+                assert!(
+                    progress.is_empty(),
+                    "blocked-empty read must carry empty ByteProgress"
+                );
+                assert_eq!(source.raw(), payload.reader_source_id());
+                assert_eq!(interests.raw(), PIPE_READABLE);
+                let _ = ByteProgress::EMPTY; // exercise the type
+            }
+            other => panic!("expected Yield::OnWaitSource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_op_empty_bytes_returns_done_zero() {
+        let _setup = setup();
+        let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        let guard = tx_substrate::epoch::guard();
+        let bytes: &[u8] = &[];
+        let mut op = WriteOp {
+            payload: &payload,
+            bytes,
+            guard: &guard,
+            nonblocking: false,
+        };
+        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        drop(guard);
+        match outcome {
+            StepOutcome::Done(0) => {}
+            other => panic!("expected Done(0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_op_partial_drain_returns_done_byte_count() {
+        let _setup = setup();
+        let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        let _ = writer; // hold writer alive
+        let _ = reader; // hold reader alive
+        let guard = tx_substrate::epoch::guard();
+        let bytes: &[u8] = b"hello";
+        let mut op = WriteOp {
+            payload: &payload,
+            bytes,
+            guard: &guard,
+            nonblocking: false,
+        };
+        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        drop(guard);
+        match outcome {
+            StepOutcome::Done(n) => assert_eq!(n, 5),
+            other => panic!("expected Done(5), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_op_no_readers_returns_epipe() {
+        let _setup = setup();
+        let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
+        let payload = payload_of(&reader);
+        drop(reader);
+        drain_to_quiescence();
+        assert_eq!(payload.reader_count_snapshot(), 0);
+        let guard = tx_substrate::epoch::guard();
+        let bytes: &[u8] = b"x";
+        let mut op = WriteOp {
+            payload: &payload,
+            bytes,
+            guard: &guard,
+            nonblocking: false,
+        };
+        let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
+        drop(guard);
+        match outcome {
+            StepOutcome::Err(V3Errno::EPIPE) => {}
+            other => panic!("expected Err(EPIPE), got {other:?}"),
+        }
+        drop(writer);
+        drain_to_quiescence();
     }
 }

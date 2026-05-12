@@ -144,6 +144,13 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 /// per the DAC + setuid plan Open Q #6 — the `O_TRUNC` request is
 /// honoured iff the open mode itself was permitted (which already
 /// went through `check_open_perm` inside `step_open`).
+//
+// PR-9 phase 3b: not yet StepOp-driven — pending. `sys_openat`
+// orchestrates resolution via the free fns `step_walk` and
+// `step_open` (no `*Op` wrap exists for either today); creation
+// goes through `FsOps::create_inode`, also free-fn. When walker /
+// open / create gain StepOp wraps, thread `&mut KernelScriptCtx`
+// here and replace the synchronous-poll dance with the wrap form.
 pub(super) async fn sys_openat<'a, P: PmapIf>(
     dirfd: i32,
     path_uaddr: u64,
@@ -328,6 +335,12 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
 /// same fd number reports a clean state if it gets reused.
 ///
 /// Returns `0` on success, `-EBADF` if the fd was already closed.
+//
+// PR-9 phase 3b: not yet StepOp-driven — pending. `sys_close` does
+// not invoke any `*Op::step(ctx)` call site; it operates directly on
+// the process fd-table via `Cap<ProcessIdentity>` accessors
+// (`fd`, `set_fd`, `set_fd_cloexec`). When fd-table mutation gains a
+// StepOp wrap, thread `&mut KernelScriptCtx` here.
 pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     if ctx.process.fd(fd).is_none() {
         return SyscallResult::Error(EBADF_VALUE);
@@ -443,9 +456,31 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
         cloexec: flags & O_CLOEXEC != 0,
         nonblocking: flags & O_NONBLOCK != 0,
     };
-    let (reader_cap, writer_cap) = match tx_subsystems::pipe::step_pipe2(pipe_flags) {
-        Ok(pair) => pair,
-        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    // PR-9 phase 3b: drive `step_pipe2` via the `Pipe2Op` StepOp
+    // wrap, threading a `&mut KernelScriptCtx`.
+    //
+    // PR-9 phase 5 (D5 Path A): populate `SubjectContext` from
+    // `SyscallCtx`. SUBJ-1 hygiene — even arms whose step body does
+    // not (yet) read authority receive the same context shape so
+    // future authority-bearing arms compose. Restrictions cap is a
+    // fresh placeholder until PR-K (D5 §7).
+    use tx_substrate::step_v3::{StepOp, StepOutcome as V3Pipe};
+    use tx_subsystems::pipe::Pipe2Op;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let (reader_cap, writer_cap) = {
+        let mut op = Pipe2Op { flags: pipe_flags };
+        match op.step(&mut script_ctx) {
+            V3Pipe::Done(pair) => pair,
+            V3Pipe::Err(v3errno) => {
+                let errno: Errno = v3errno.into();
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            V3Pipe::Continue { .. } | V3Pipe::Yield { .. } => {
+                // `step_pipe2` is allocation-only; Continue/Yield
+                // are unreachable. Surface as -EIO defensively.
+                return SyscallResult::Error(EIO_VALUE);
+            }
+        }
     };
 
     // Install at the lowest two unused fds. `allocate_fd()` returns
@@ -578,10 +613,53 @@ pub(super) fn make_ioctl_caller(ctx: &SyscallCtx<'_>) -> IoctlCaller {
 /// arm itself is non-async; `Blocked` / `AdvancedThenBlocked` outcomes
 /// are unreachable in practice and surface as `-EIO` for symmetry with
 /// the other fd arms.
+/// DIAGNOSTIC (temp, 2026-05-12): counts of ioctl requests and the
+/// last seen request word. Useful for tracing the post-prompt EOF
+/// gap, where the TTY's termios is somehow ICANON-cleared before
+/// busybox's first read.
+pub static SYS_IOCTL_INVOCATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_IOCTL_LAST_REQUEST: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static SYS_IOCTL_TCSETS_CALLS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_IOCTL_TCGETS_CALLS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+/// On the first TCGETS, record the lflag the kernel handed back —
+/// this reveals what state the TTY was in *before* busybox touched it.
+pub static FIRST_TCGETS_LFLAG: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+pub static FIRST_TCGETS_VMIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+/// On every TCSETS, record the lflag/vmin/vtime busybox installed.
+/// We watch the latest one because the call right before the read is
+/// the one that puts the TTY into the VMIN=0 polling shape.
+pub static LAST_TCSETS_LFLAG: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+pub static LAST_TCSETS_VMIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+pub static LAST_TCSETS_VTIME: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+pub static FIRST_TCSETS_LFLAG: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+pub static FIRST_TCSETS_VMIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xdead_beef);
+
 pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let request = args[1] as u32;
     let argp = args[2];
+    SYS_IOCTL_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    SYS_IOCTL_LAST_REQUEST.store(request, core::sync::atomic::Ordering::Relaxed);
+    match request {
+        TCSETS | TCSETSW | TCSETSF => {
+            SYS_IOCTL_TCSETS_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        TCGETS => {
+            SYS_IOCTL_TCGETS_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {}
+    }
 
     if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
@@ -590,6 +668,30 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
+
+    // PR-10 phase 2: route userfaultfd-shape ioctls before the
+    // VFS/TTY discriminator. The `OpenFile::rnode()` accessor panics
+    // for `OpenFileBacking::Ufd`, so any ufd-shape ioctl must be
+    // handled (or short-circuited with `-ENOTTY`/`-EINVAL`) before
+    // we reach the TTY-shaped match below.
+    if file.ufd().is_some() {
+        // All `UFFDIO_*` numbers fit in u32 per the
+        // `_IOWR(0xAA, _, _)` encoding; dispatch on the request word.
+        return match request {
+            super::numbers::UFFDIO_API => super::userfaultfd::step_uffdio_api(&file, argp, ctx),
+            super::numbers::UFFDIO_REGISTER => {
+                super::userfaultfd::step_uffdio_register(&file, argp, ctx)
+            }
+            super::numbers::UFFDIO_COPY => super::userfaultfd::step_uffdio_copy(&file, argp, ctx),
+            super::numbers::UFFDIO_ZEROPAGE => {
+                super::userfaultfd::step_uffdio_zeropage(&file, argp, ctx)
+            }
+            super::numbers::UFFDIO_CONTINUE => {
+                super::userfaultfd::step_uffdio_continue(&file, argp, ctx)
+            }
+            _ => SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
+        };
+    }
 
     // Resolve to a TTY. Non-TTY fds → -ENOTTY for terminal-shape ioctls
     // (Linux semantic — even pipes / regular files return ENOTTY for
@@ -620,6 +722,14 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match unwrap_v3(outcome) {
                 Ok(termios) => {
+                    if SYS_IOCTL_TCGETS_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1 {
+                        FIRST_TCGETS_LFLAG
+                            .store(termios.c_lflag, core::sync::atomic::Ordering::Relaxed);
+                        FIRST_TCGETS_VMIN.store(
+                            termios.c_cc[tx_subsystems::tty::structure::termios::VMIN] as u32,
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                     if argp == 0 {
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
@@ -645,6 +755,23 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 Ok(v) => v,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
+            LAST_TCSETS_LFLAG.store(new_termios.c_lflag, core::sync::atomic::Ordering::Relaxed);
+            LAST_TCSETS_VMIN.store(
+                new_termios.c_cc[tx_subsystems::tty::structure::termios::VMIN] as u32,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            LAST_TCSETS_VTIME.store(
+                new_termios.c_cc[tx_subsystems::tty::structure::termios::VTIME] as u32,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            if SYS_IOCTL_TCSETS_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1 {
+                FIRST_TCSETS_LFLAG
+                    .store(new_termios.c_lflag, core::sync::atomic::Ordering::Relaxed);
+                FIRST_TCSETS_VMIN.store(
+                    new_termios.c_cc[tx_subsystems::tty::structure::termios::VMIN] as u32,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
             let outcome = {
                 let guard = tx_substrate::epoch::guard();
                 step_ioctl_tcsets(&tty, new_termios, &guard)
@@ -955,7 +1082,7 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 ///
 /// Synchronous: every in-tree FS backend (`tmpfs`, `devfs`) resolves
 /// readdir without `.await`. A future async-aware backend would
-/// require shifting to the `wait_carrier::wait_on_token` pattern; the
+/// require shifting to the `wait_source::wait_on_token` pattern; the
 /// arm panics defensively on `Blocked` / `AdvancedThenBlocked` per the
 /// `Guard` send-future discipline (`txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
 pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {

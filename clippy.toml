@@ -1,0 +1,50 @@
+# clippy.toml — retired-vocabulary regression gate
+#
+# This file enumerates v4-era identifiers that the v3 migration retired.
+# CI runs `cargo clippy ... -D clippy::disallowed_names -D clippy::disallowed_types`
+# to fail the build if any of these names reappear at a definition site.
+#
+# Audit anchor: docs/progress/decisions/2026-05-12-d10-vocabulary-retire-audit.md
+# Design ADR  : docs/progress/decisions/2026-05-12-d13-tdd-retirement-via-clippy.md
+#
+# Limitations (documented in the D13 ADR):
+#   * `disallowed-names` fires at definition / binding sites of an identifier,
+#     not at every textual occurrence. A bare `use foo::OnCarrier;` of a
+#     hypothetical external `OnCarrier` may slip through; the migration
+#     audit + code review is the backstop.
+#   * Doc-comments (`///`, `//!`) are NOT scanned. Per D10 the surviving
+#     doc-comments are intentional "renamed from X" traceability anchors at
+#     the canonical substrate definition sites — keep them.
+#   * The bare local-variable name `carrier` (40 sites at
+#     `OnWaitSource { source: carrier, .. }` destructuring patterns) is a
+#     style choice, NOT a v4-vocabulary survival (D10 §5.1). It is
+#     deliberately NOT listed below.
+#   * Variants of removed enums (`StepOutcome::{Advanced,Blocked,
+#     AdvancedThenBlocked}`) have no separable identifier — they were
+#     deleted with the enum's PR-2 redesign and cannot be re-introduced
+#     without re-introducing the parent type. Structural deletion is the
+#     test; no entry needed here.
+
+disallowed-names = [
+    # PR-A.1..A.4 — direct §7 BLAST_RADIUS exit-bar names
+    "OnCarrier",
+    "WakeCarrier",
+    "WakeCarrierId",
+    "InterestConditions",
+    "exit_port",
+    "read_wq",
+    "write_wq",
+    "wait_carrier",
+    "yield_on_carrier",
+]
+
+# disallowed-types intentionally empty: every retired type's *name* is
+# already covered by disallowed-names above, and any path-only ban would
+# only fire on use-sites that import a still-existing external type with
+# the same path — there are none today. Left as a hook for future PRs.
+disallowed-types = []
+
+# disallowed-methods intentionally empty for the same structural reason
+# documented in D13 §3: the retired StepOutcome variants live (or rather,
+# don't) on a redesigned enum; their paths simply do not exist.
+disallowed-methods = []

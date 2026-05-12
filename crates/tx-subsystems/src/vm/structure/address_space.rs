@@ -11,8 +11,8 @@ use crate::vm::pmap::VmPmap;
 use crate::vm::VmPmapError;
 
 use super::{
-    AddressSpaceStats, AddressSpaceStatsCell, RangeLock, RecipeIndex, UserRange, UserVirtAddr,
-    VmEntry,
+    AddressSpaceStats, AddressSpaceStatsCell, RangeLock, RecipeIndex, UfdRegistration, UserRange,
+    UserVirtAddr, VmEntry, VmMapCommit, VmMapError,
 };
 
 static ADDRESS_SPACE_ZONE: Zone<AddressSpace> = Zone::const_new();
@@ -106,6 +106,31 @@ impl AddressSpace {
     pub fn recipes_snapshot(&self) -> Vec<VmEntry> {
         let guard = epoch::guard();
         self.recipes.snapshot(&guard)
+    }
+
+    /// Stamp a [`UfdRegistration`] tag on every VMA whose range is
+    /// fully contained in `range` (PR-10 phase 3).
+    ///
+    /// The Linux `UFFDIO_REGISTER` semantic this method backs:
+    /// - `range` must be page-aligned and non-empty (the caller — the
+    ///   shim's `step_uffdio_register` — pre-validates this against
+    ///   the user-VA-range invariant).
+    /// - Every byte of `range` must be mapped. Holes fail with
+    ///   `Err(VmMapError::MissingMapping)` which the shim maps to
+    ///   `-EINVAL`.
+    /// - Every overlapping VMA must be fully contained in `range`.
+    ///   Phase 3 does **not** split VMAs to register a sub-range; the
+    ///   shim is expected to register whole VMAs only.
+    ///
+    /// On success returns a [`VmMapCommit`] whose `changed_pages` is
+    /// the page count tagged. The recipe tree's atomic publish ensures
+    /// readers observe either the pre-tag or post-tag state.
+    pub fn tag_ufd_registration(
+        &self,
+        range: UserRange,
+        tag: UfdRegistration,
+    ) -> Result<VmMapCommit, VmMapError> {
+        self.recipes.tag_ufd_registration(range, tag)
     }
 
     /// Drop every materialized PTE in the AddressSpace by tearing down each

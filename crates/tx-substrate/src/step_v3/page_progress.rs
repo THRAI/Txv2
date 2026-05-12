@@ -25,8 +25,8 @@ impl PageProgress {
     }
     /// Inherent shorthand for `<PageProgress as StepProgress>::EMPTY`.
     /// Avoids requiring `use StepProgress;` at page-moving call sites
-    /// (e.g. `step_v3::StepOutcome::yield_on_carrier(PageProgress::EMPTY,
-    /// carrier_id, interest_mask)`). Parallel to `ByteProgress::EMPTY`.
+    /// (e.g. `step_v3::StepOutcome::yield_on_wait_source(PageProgress::EMPTY,
+    /// source_id, interest_mask)`). Parallel to `ByteProgress::EMPTY`.
     pub const EMPTY: Self = Self { pages: 0 };
 }
 

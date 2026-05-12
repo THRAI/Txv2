@@ -728,7 +728,7 @@ LINT: syscall implementations must separate `resolve_number`, `operate_on_identi
 
 <!-- txdoc:OBJECT-PATTERN-FIXES-PATCH-ORDER-1 -->
 
-1. Add `PID-*` invariants to [`INVARIANTS_v4.md`](INVARIANTS_v4.md).
+1. Add `PID-*` invariants to [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md).
 2. Patch [`PROCESS_v1.md`](../04_process-signals/PROCESS_v1.md) §2 and §9 to use Option C or explicitly choose Option A.
 3. Patch [`TTY.md`](../06_devices/TTY.md) §2.2 and §4 to bind to `Session` / `ProcessGroup`, with slave-owned pty control.
 4. Patch [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) §2 and §3.2 for stale backing variants.

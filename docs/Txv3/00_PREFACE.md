@@ -99,7 +99,7 @@ As of v3:
 | Binding obligations | ResolutionOnly, Addressability, Operational |
 | Step-phase classes | Observe, Intercept, Gate, Yield-adapt (was Wait-adapt), Drive |
 | StepOutcome variants | Continue, Yield, Done, Err |
-| YieldShape members | OnCarrier, OnAgent (deferred: OnEdge, OnHandoff) |
+| YieldShape members | OnWaitSource, OnAgent, OnTimer (deferred: OnEdge, OnHandoff) |
 | ExecutionScope kinds | Thread (default), OnBehalfOf (deferred: future scopes) |
 | Wait protocols | Uninterruptible, Interruptible, Killable, InterruptibleTimeout, KillableTimeout |
 | Wait outcomes | Ready, Interrupted, Killed, TimedOut |

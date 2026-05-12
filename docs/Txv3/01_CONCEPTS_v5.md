@@ -100,10 +100,20 @@ Progress is operation-specific and typed by `StepProgress` (see `03_STEP_MODEL_v
 
 ```rust
 enum YieldShape {                          // closed catalog
-    OnCarrier { carrier: WakeCarrier, interests: InterestConditions },
-    OnAgent   { endpoint: Cap<DelegateEndpoint>, request: DelegateRequest,
-                token: Cap<DelegateToken>, deadline: Deadline,
-                cancel: CancelPolicy },
+    OnWaitSource {
+        source: WaitSourceId,
+        interests: InterestMask,
+        registration: PreparedWaitRegistration,
+    },
+    OnAgent {
+        endpoint: Cap<DelegateEndpoint>,
+        request: DelegateRequest,
+        token: Cap<DelegateToken>,
+        cancel: AgentCancelPolicy,
+    },
+    OnTimer {
+        deadline: Deadline,
+    },
     // deferred catalog members:
     // OnEdge   { subscription: Cap<EdgeSubscription>, interests: EdgeInterests },
     // OnHandoff { owned: Cap<OwnedSlot<T>>, priority: PriorityHint },
@@ -113,6 +123,8 @@ enum YieldShape {                          // closed catalog
 A YieldShape is the closed enumeration of things a script may pause-and-resume on. Each member states its substrate cost, its resume protocol, and its abandonment semantics.
 
 A YieldShape is *not* an ExecutionScope. ExecutionScope is extent-shaped (the script runs within a borrowed identity); YieldShape is point-shaped (the script halts at a point and is resumed when a condition resolves). The two compose orthogonally.
+
+**Deadlines are not yield-shape fields.** Timeouts are protocol attachments via `WaitProtocol.deadline` and are realized as a driver-installed `TimerGuard` regardless of primary shape. The same mechanism handles `OnWaitSource + timeout` (poll/select), `OnAgent + timeout` (FUSE/ufd), and standalone `OnTimer`. Composing `OnTimer` with `WaitProtocol.deadline` is invalid (the primary timer is itself the deadline).
 
 ### 2.5 Publication / Projection — *what becomes visible*
 
@@ -241,7 +253,7 @@ A script's `SubjectContext` is established at entry and remains constant for the
 
 <!-- txdoc:CONCEPTS-V5-YIELD-ADAPT-1 -->
 
-The script-phase catalog stays at five members. v5 generalizes the wait-adapt member to **yield-adapt** to reflect that it consumes any closed `YieldShape`, not only `OnCarrier`. The five remain disjoint:
+The script-phase catalog stays at five members. v5 generalizes the wait-adapt member to **yield-adapt** to reflect that it consumes any closed `YieldShape`, not only `OnWaitSource`. The five remain disjoint:
 
 | Class | Role |
 |---|---|
@@ -267,7 +279,7 @@ The two compose orthogonally: a script running inside `OnBehalfOf<P>` may emit a
 
 | | Shape | Examples |
 |---|---|---|
-| **YieldShape** (point) | OnCarrier, OnAgent, *OnEdge, OnHandoff* | wait on pipe readiness; delegate to FUSE daemon; *epoll-ET subscription; PI-futex handoff* |
+| **YieldShape** (point) | OnWaitSource, OnAgent, OnTimer, *OnEdge, OnHandoff* | wait on pipe readiness; delegate to FUSE daemon; nanosleep; *epoll-ET subscription; PI-futex handoff* |
 | **ExecutionScope** (extent) | Thread (default), OnBehalfOf | native syscall under thread identity; SQPOLL kthread under user identity |
 
 See `06_EXECUTION_SCOPE_v1` for OnBehalfOf details.
@@ -282,7 +294,7 @@ The bus is the publication mechanism for transition hints. The primitive set is 
 
 <!-- txdoc:CONCEPTS-V5-COMPLETION-1 -->
 
-v5 preserves v4 §13. Completion is specialized wait middleware, not bus, not truth. It composes through the new `Yield` outcome with `OnCarrier` (the completion's private channel).
+v5 preserves v4 §13. Completion is specialized wait middleware, not bus, not truth. It composes through the new `Yield` outcome with `OnWaitSource` (the completion's private `WaitSource`).
 
 The `EXC-3` exclusion (completion may not select a particular waiter / donate priority / transfer ownership) becomes structurally clearer in v5: those are the contract of `OnHandoff` (deferred), which is a different YieldShape.
 
@@ -319,7 +331,7 @@ The full closed-catalog list is in `00_PREFACE.md §6`. Catalogs require archite
 v5 changes vs v4:
 
 - **StepOutcome variants** reduced from 5 to 4 (`Continue` / `Yield` / `Done` / `Err`).
-- **YieldShape** added as a new closed catalog (`OnCarrier`, `OnAgent` initially).
+- **YieldShape** added as a new closed catalog (`OnWaitSource`, `OnAgent`, `OnTimer` initially; `OnEdge` and `OnHandoff` deferred).
 - **ExecutionScope kinds** added as a new closed catalog (`Thread`, `OnBehalfOf` initially).
 - **Driver modes** become a closed catalog explicitly (`Nonblocking`, `Waiting`, `Selecting`).
 - **Restriction kinds** reserved as a future closed catalog (will populate when seccomp/landlock land).

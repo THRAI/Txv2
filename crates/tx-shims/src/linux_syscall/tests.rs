@@ -427,7 +427,7 @@ fn dispatch_unknown_nr_returns_neg_enosys() {
 
 /// `read(0, buf, len)` against a console with no buffered input
 /// blocks until `tty::execution::step_ingest` queues a byte and fires
-/// the registered `wait_carrier` channel, then returns the byte.
+/// the registered `wait_source` channel, then returns the byte.
 ///
 /// Pre-ELF Phase 5 (item 9): the dispatcher used to short-circuit
 /// `Blocked` to `Done(0)` per the trio's non-blocking slice. With the
@@ -909,7 +909,7 @@ mod fork_clone_wait4_wave2;
 
 // ===========================================================================
 // Wave 3 of the fork/clone/wait4 slice — Part 3 (NR_WAIT4 syscall arm
-// with blocking-wait via the per-process `exit_port` carrier).
+// with blocking-wait via the per-process `exit_source` carrier).
 // ===========================================================================
 
 mod fork_clone_wait4_wave3;

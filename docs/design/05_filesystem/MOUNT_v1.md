@@ -31,9 +31,9 @@ Companion documents:
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) — Identity/Payload
   split (§8.1.1 applies directly), Cap/PayloadCap/Weak,
   SENTINEL_DEAD.
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — authoritative bindings
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — authoritative bindings
   vs derived materializations and publication rule.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — ARCH-5 (publication
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — ARCH-5 (publication
   rule), BIF-* (bifurcation), STEP-* (step discipline), SIG-*
   (publication).
 - [`LIVENESS_v2.1.md`](../00_meta-framework/archived/LIVENESS_v2.1.md) — archived catalog rows for
@@ -3035,9 +3035,9 @@ through.
 
 - `../00_meta-framework/object_model_v2.md` — Identity/Payload split (§8.1.1),
   reference hierarchy, reclamation.
-- `../00_meta-framework/CONCEPTS_v4.md` — authoritative bindings vs derived
+- `../../Txv3/01_CONCEPTS_v5.md` — authoritative bindings vs derived
   materializations and publication rule.
-- `../00_meta-framework/INVARIANTS_v4.md` — ARCH-5 (publication rule), BIF-* (BIF-1
+- `../../Txv3/02_INVARIANTS_v5.md` — ARCH-5 (publication rule), BIF-* (BIF-1
   declaration of split, BIF-3 obligation matching, BIF-5
   single-carrier signal attachment), STEP-4 (five-phase
   discipline), SIG-* (publication rules).

@@ -142,3 +142,56 @@ impl PtsName {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// StepOp wraps (PR-2 wave 3)
+// ---------------------------------------------------------------------------
+
+/// `StepOp` wrap of [`step_openpty`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
+pub struct OpenPtyOp<'a> {
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for OpenPtyOp<'a>
+{
+    type Output = OpenPtyOutcome;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_openpty(self.guard)
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    use super::*;
+    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+
+    use crate::test_support::EPOCH_TEST_LOCK;
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        tx_substrate::testing::init_host_for_test_once();
+        let _ = crate::zones::register_all();
+        crate::tty::structure::registry::reset_for_tests();
+        guard
+    }
+
+    #[test]
+    fn openpty_op_returns_done_with_pair() {
+        let _setup = setup();
+        let guard = tx_substrate::epoch::guard();
+        let mut op = OpenPtyOp { guard: &guard };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Done(_) => {}
+            other => panic!("expected Done(OpenPtyOutcome), got {other:?}"),
+        }
+    }
+}

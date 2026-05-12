@@ -8,11 +8,11 @@
 **Version.** v2
 
 **Supersedes.** The core claims from archived `LIVENESS_v2.1.md` and `ADR-resolution-half_v2.md` for projections, binding obligations, reachability, and reclamation. Subsystem-anatomy details derive from this document and live in their own specs.
-**Companions.** [`CONCEPTS_v4.md`](CONCEPTS_v4.md), [`INVARIANTS_v4.md`](INVARIANTS_v4.md), [`SUBSYSTEM_ANATOMY_v2_1.md`](SUBSYSTEM_ANATOMY_v2_1.md), and [`EBR_ZONE_INTERFACE_v1.md`](../01_substrate/EBR_ZONE_INTERFACE_v1.md).
+**Companions.** [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md), [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md), [`SUBSYSTEM_ANATOMY_v2_1.md`](SUBSYSTEM_ANATOMY_v2_1.md), and [`EBR_ZONE_INTERFACE_v1.md`](../01_substrate/EBR_ZONE_INTERFACE_v1.md).
 
 This document is the consolidated statement of the kernel's object model: how entities exist, how they are named, how they persist, and how they are reclaimed. It commits to **policy-based zones as the universal upper-subsystem lifetime substrate**, with **EBR-based traversal composed with refcounted pinning** as the ordinary realization. It develops the two halves — **lifecycle** (object / liveness / commit) and **resolution** (binding / obligation / reachability) — as one integrated framework.
 
-**Relationship to invariants.** This document's §7 (bindings, obligations) and §8.1.1 (bifurcation) ground `INVARIANTS_v4.md`'s OBL and BIF rules. §6 (reclamation) grounds the anti-TOCTOU and `ZONE-*`/`EBR-*` rules. The reference hierarchy in §4 grounds the five-phase step discipline (`STEP-4`): observation under guard uses `IdentRef`, upgrade transitions to `Cap` or `OperationalEvidence`, and commit points publish reserved evidence through the substrate transitions this document specifies.
+**Relationship to invariants.** This document's §7 (bindings, obligations) and §8.1.1 (bifurcation) ground `02_INVARIANTS_v5.md`'s OBL and BIF rules. §6 (reclamation) grounds the anti-TOCTOU and `ZONE-*`/`EBR-*` rules. The reference hierarchy in §4 grounds the five-phase step discipline (`STEP-4`): observation under guard uses `IdentRef`, upgrade transitions to `Cap` or `OperationalEvidence`, and commit points publish reserved evidence through the substrate transitions this document specifies.
 
 Subsystem-specific application (VFS, process, VM, net, etc.) derives from the rules stated here. Specific projection catalogs, binding taxonomies, and substrate module layouts are separate documents.
 
@@ -22,7 +22,7 @@ Subsystem-specific application (VFS, process, VM, net, etc.) derives from the ru
 
 <!-- txdoc:OBJECT-MODEL-THREE-CLAIM-BASIS-1 -->
 
-`CONCEPTS_v4.md` states three architectural basis claims:
+`01_CONCEPTS_v5.md` states three architectural basis claims:
 
 - *A kernel maintains `(signifier, consistency, binding)` triples.*
 - *Every entity decomposes into `(identity, capability, payload)` layers.*
@@ -359,7 +359,7 @@ Predicates on namespace projections are binding-chain reachability queries, comp
 
 <!-- txdoc:OBJECT-MODEL-BINDINGS-COMMIT-1 -->
 
-The step model's five-phase commit discipline (`STEP-4` in `INVARIANTS_v4.md`) integrates with bindings as follows:
+The step model's five-phase commit discipline (`STEP-4` in `02_INVARIANTS_v5.md`) integrates with bindings as follows:
 
 - **Observe** (phase 1) produces `IdentRef`-carrying witnesses by traversal under the epoch guard.
 - **Upgrade** (phase 2) promotes `IdentRef` to `Cap` or operational evidence as the obligation requires. Upgrades are fallible CASes against `SENTINEL_DEAD`; failure returns `Err` with no reservations yet held.
@@ -484,9 +484,9 @@ Binding designers:
 
 <!-- txdoc:OBJECT-MODEL-DOCUMENT-RELATIONSHIP-1 -->
 
-- `CONCEPTS_v4.md` owns the vocabulary and the three basis claims.
-- `INVARIANTS_v4.md` owns enforceable labels: `BIF-*`, `PRED-*`, `WIT-*`, `OBL-*`, `STEP-*`, `ZONE-*`, and `EBR-*`.
-- `STEP_MODEL_v1.md` owns the five-phase step discipline (observe -> upgrade -> reserve -> commit -> publish); this document integrates that discipline with bindings in §7.6.
+- `01_CONCEPTS_v5.md` owns the vocabulary and the three basis claims.
+- `02_INVARIANTS_v5.md` owns enforceable labels: `BIF-*`, `PRED-*`, `WIT-*`, `OBL-*`, `STEP-*`, `ZONE-*`, and `EBR-*`.
+- `03_STEP_MODEL_v2.md` owns the five-phase step discipline (observe -> upgrade -> reserve -> commit -> publish); this document integrates that discipline with bindings in §7.6.
 - `EBR_ZONE_INTERFACE_v1.md` owns the implementation-facing interface spelling: `Guard`, `Weak<T>`, `IdentRef<'g, T>`, `Cap<T>`, `PayloadCap<T>`, `ZoneReservation<T>`, `zone::reserve`, and `zone::sign`.
 - Archived `LIVENESS_v2.1.md` and `ADR-resolution-half_v2.md` remain rationale/source material only.
 
@@ -494,7 +494,7 @@ Binding designers:
 
 <!-- txdoc:OBJECT-MODEL-OPEN-QUESTIONS-1 -->
 
-- Exact guard-registration implementation (per-CPU tables, drain budgets, debug nesting checks) belongs to EBR/Zone implementation, with architecture-facing rules already pinned by `EBR_ZONE_INTERFACE_v1.md` and `INVARIANTS_v4.md`.
+- Exact guard-registration implementation (per-CPU tables, drain budgets, debug nesting checks) belongs to EBR/Zone implementation, with architecture-facing rules already pinned by `EBR_ZONE_INTERFACE_v1.md` and `02_INVARIANTS_v5.md`.
 - COW payload slots such as fd tables, signal-action tables, fs-context, and VM roots should be modeled as identity-retaining payload evidence or explicit service-owned shared payloads. Do not resurrect the retired draft's `Shared<T>` as an untyped escape hatch.
 - Weak back-references for future rmap (Frame → VmEntries) are a natural extension; not required before Phase 2.
 - Name-cache eviction and staleness discipline for resolution-only bindings is implementation choice; framework accommodates both lazy and eager strategies.

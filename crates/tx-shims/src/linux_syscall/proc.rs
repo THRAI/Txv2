@@ -68,10 +68,26 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// through `read_user_cstr` / `read_user_cstr_vec`, which bridge via
 /// the canonical `aspace.read_user` / `aspace.read_user_cstr` lane
 /// (with a kernel-pointer fallback for test scaffolding).
+//
+// PR-9 phase 3b: not yet StepOp-driven — pending. `sys_execve`
+// invokes `exec_script::<P>(...).await` (multi-phase async free
+// fn) — no `*Op` wrap exists for the exec orchestration today.
+// When `exec_script` gains a StepOp wrap (or is decomposed into a
+// pipeline of wraps), thread `&mut KernelScriptCtx` here.
+pub static SYS_EXECVE_INVOCATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_CLONE_INVOCATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_WAIT4_INVOCATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_EXECVE_LAST_ERRNO: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(0);
+
 pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
+    SYS_EXECVE_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let path_uaddr = args[0];
     let argv_uaddr = args[1];
     let envp_uaddr = args[2];
@@ -151,7 +167,7 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 // stubs).
 //
 // NR_WAIT4 is intentionally absent — it lives in Wave 3 with the
-// blocking-wait scaffolding (`exit_port` `WaitToken` await loop). See
+// blocking-wait scaffolding (`exit_source` `WaitToken` await loop). See
 // `docs/progress/plans/2026-05-06-fork-clone-wait4.md`.
 // =====================================================================
 
@@ -196,14 +212,22 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
 /// v1's single-thread-per-process model). The function is non-`async`
 /// to keep the seam minimal.
+pub static SYS_CLONE_LAST_FLAGS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static SYS_CLONE_LAST_REJECT_FLAGS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SYS_CLONE_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let flags = args[0];
     let stack = args[1];
+    SYS_CLONE_LAST_FLAGS.store(flags, core::sync::atomic::Ordering::Relaxed);
 
     // Validation: bare-SIGCHLD only. Reject any other flag combo
     // (CLONE_VM, CLONE_VFORK, pthread_create OR-set, zero, etc.) and
     // any non-zero stack.
     if flags != SIGCHLD {
+        SYS_CLONE_LAST_REJECT_FLAGS.store(flags, core::sync::atomic::Ordering::Relaxed);
         return SyscallResult::Error(EINVAL_VALUE);
     }
     if stack != 0 {
@@ -223,9 +247,35 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         .saved_user_context()
         .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
 
+    // PR-9 phase 3b: drive `step_fork::<P>` via the `ForkOp::<P>`
+    // StepOp wrap, threading a `&mut KernelScriptCtx`. The wrap lifts
+    // the `Result<Cap<...>, ForkError>` into `StepOutcome::Done(inner_result)`
+    // per its `Output` shape, so the existing match-on-`ForkError`
+    // arm is preserved post-unwrap.
+    //
+    // PR-9 phase 5 (D5 Path A): populate `SubjectContext` from
+    // `SyscallCtx`. The subject identifies the calling (parent)
+    // process+thread and carries the `Cap<Cred>` snapshot loaded at
+    // syscall entry. `step_fork` reads the parent cred internally
+    // (via `payload.cred()`) to seed the child — the subject's role
+    // here is SUBJ-1 hygiene, not driving the fork-time cred copy.
+    use tx_substrate::step_v3::{StepOp, StepOutcome as V3Fork};
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let fork_result = {
+        let mut op = tx_subsystems::process::execution::ForkOp::<P> {
+            parent: &ctx.process,
+            _pmap: core::marker::PhantomData,
+        };
+        match op.step(&mut script_ctx) {
+            V3Fork::Done(r) => r,
+            V3Fork::Err(_) | V3Fork::Continue { .. } | V3Fork::Yield { .. } => {
+                return SyscallResult::Error(EAGAIN_VALUE);
+            }
+        }
+    };
     // step_fork: mint a child ProcessIdentity + leader ThreadIdentity
     // + payload + parent.children/pgrp wiring.
-    let child = match step_fork::<P>(&ctx.process) {
+    let child = match fork_result {
         Ok(c) => c,
         Err(tx_subsystems::process::ForkError::ParentZombie) => {
             // Impossible by construction — the calling process is the
@@ -267,7 +317,7 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 
 /// `wait4(pid, status, options, rusage)` — Wave 3 of the fork/clone/wait4
 /// slice. The blocking variant: when no zombie matches and `WNOHANG`
-/// is unset, the arm parks on the caller's per-process `exit_port`
+/// is unset, the arm parks on the caller's per-process `exit_source`
 /// carrier (registered at payload sign time per Wave 1) until any
 /// child of this process zombifies, then re-polls.
 ///
@@ -310,7 +360,7 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 /// each iteration calls the synchronous `step_waitpid_nohang` walker
 /// (no guard parameter — it takes its own snapshot internally). On
 /// `Err(WaitError::NoneReady)` without `WNOHANG`, build a `WaitToken`
-/// from `ctx.process.exit_port_wait_token()` and `wait_carrier::wait_on_token`
+/// from `ctx.process.exit_source_wait_token()` and `wait_source::wait_on_token`
 /// it. Post-wake, loop and re-poll: a third party may have reaped the
 /// same zombie (e.g. another wait4 caller in the same process; or the
 /// shared `INIT_PROCESS` reaper if init wakes first), so the second
@@ -319,6 +369,7 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 /// Cites: `txdoc:PROCESS-WAIT-FAMILY-1`
 /// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4).
 pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SYS_WAIT4_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let pid = args[0] as i64 as i32;
     let wstatus_uaddr = args[1];
     let options = args[2] as i32;
@@ -369,15 +420,15 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 if wnohang {
                     return SyscallResult::Return(0);
                 }
-                // Build the WaitToken from the parent's exit_port
+                // Build the WaitToken from the parent's exit_source
                 // carrier id (registered at payload-sign time, Wave 1).
                 // `None` means the calling process is itself a zombie
                 // — race against our own exit; surface as -ECHILD per
                 // POSIX (no children to wait for from a dead process).
-                let Some(token) = ctx.process.exit_port_wait_token() else {
+                let Some(token) = ctx.process.exit_source_wait_token() else {
                     return SyscallResult::Error(ECHILD_VALUE);
                 };
-                if let Some(future) = wait_carrier::wait_on_token(token) {
+                if let Some(future) = wait_source::wait_on_token(token) {
                     let _ = future.await;
                 }
                 // Either `wait_on_token` returned None (test placeholder

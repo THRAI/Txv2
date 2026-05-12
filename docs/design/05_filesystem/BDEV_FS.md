@@ -14,8 +14,8 @@
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) §2 (`RNodeBacking`), §3 (`PageContainer`), §4 (PC lifecycle), §5 (`FsPageBacking` trait). bdev-fs is a vanilla consumer of this trait.
 - [`TX_EXT4_PLAN.md`](TX_EXT4_PLAN_v1_2.md) §3.2 (`BlockDevice` trait). bdev-fs's `FsPageBacking` impl is what sits between tx-ext4 (or any block-device-consuming filesystem) and the driver's `BlockDeviceOps`.
 - [`object_model.md`](../00_meta-framework/object_model_v2.md) §3 (entities), §8.1.1 (bifurcation). bdev-fs's MountPayload follows the standard Mount Identity/Payload split; no new entity classes are introduced.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — ARCH-5 (publication rule), PRED-7 (race degradation). Partition-table mutation is rejected until phase 5 of tx-ext4; v1 partitions are compile-time or mount-time only.
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) §8 (authoritative bindings and derived materializations). bdev-fs's `devt → Cap<PageContainer>` coherence index is an authoritative binding in the same sense as a persistent filesystem's `fs_object_id → RNode` index.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — ARCH-5 (publication rule), PRED-7 (race degradation). Partition-table mutation is rejected until phase 5 of tx-ext4; v1 partitions are compile-time or mount-time only.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) §8 (authoritative bindings and derived materializations). bdev-fs's `devt → Cap<PageContainer>` coherence index is an authoritative binding in the same sense as a persistent filesystem's `fs_object_id → RNode` index.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — four-module layout (§6).
 - [`VFS_CHECKS_V2.1.md`](VFS_CHECKS_V2.1.md) — `MountPayload` structure, `FsOps` consumer side.
 
@@ -232,17 +232,19 @@ impl FsPageBacking for BdevFsMountPayload {
         match (reg.ops.step_read_blocks)(reg, page_lba, blocks_per_page as u32,
                                          core::slice::from_mut(&mut frame.as_mut())) {
             StepOutcome::Done(()) => Done(frame),
-            StepOutcome::Blocked(ch, mask) => {
+            StepOutcome::Yield { shape: YieldShape::OnWaitSource { source, interests }, .. } => {
                 // Driver yielded; reactor will resume us on the
                 // registration's io_complete_wire.
                 // On resume, step is re-entered; we re-validate the PC
                 // coherence state per ARCH-5 and continue.
                 frame::free(frame);
-                Blocked(ch, mask)
+                StepOutcome::Yield {
+                    shape: YieldShape::OnWaitSource { source, interests },
+                    progress: Progress::ZERO,
+                }
             }
-            StepOutcome::AdvancedThenBlocked(_, ch, mask) => Blocked(ch, mask),
+            StepOutcome::Continue { progress } => unreachable!("block read returns Done or Yield"),
             StepOutcome::Err(e) => { frame::free(frame); Err(e) }
-            StepOutcome::Advanced(_) => unreachable!("block read is terminal"),
         }
     }
 
@@ -609,7 +611,7 @@ frame/bdev_fs/
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) §2, §3, §4, §5.
 - [`TX_EXT4_PLAN.md`](TX_EXT4_PLAN_v1_2.md) §3.2, §3.4, §1.1.
 - [`object_model.md`](../00_meta-framework/object_model_v2.md) §3, §8.1.1.
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) §8, §15.7.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — ARCH-5, PRED-7.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) §8, §15.7.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — ARCH-5, PRED-7.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md).
 - [`VFS_CHECKS_V2.1.md`](VFS_CHECKS_V2.1.md) — MountPayload and FsOps consumer side.

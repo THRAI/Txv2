@@ -16,7 +16,14 @@ use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::tty::structure::TtyIdentity;
 use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNodeBacking};
 
-const AP_REACTOR_WAIT_SPINS: usize = 100_000;
+// Boot-smoke busy-wait budget for AP reactor task completion. 100k was
+// fine on bare metal and Apple-silicon TCG, but GitHub Actions runs
+// qemu-system-riscv64 under stock-ubuntu software emulation where AP
+// HARTs make scheduling progress so slowly that the AP couldn't drain
+// its queue inside the prior budget; the smoke would panic at
+// `reactor AP loop work completion`. 10M iterations is still
+// sub-second on real hardware but gives the emulator enough headroom.
+const AP_REACTOR_WAIT_SPINS: usize = 10_000_000;
 
 static BOOT_REACTOR: tx_reactor::SharedReactor = tx_reactor::SharedReactor::empty();
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
@@ -1030,22 +1037,58 @@ impl<P: TxPlatform> CoreInit<P> {
         _child_process: tx_substrate::zone::Cap<tx_subsystems::process::ProcessIdentity>,
         child_thread: tx_substrate::zone::Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
     ) {
-        let Some(payload) = child_thread.payload_cap() else {
-            // Kernel-invariant violation: a freshly-cloned child
-            // thread should always be live-with-payload. Wave 2's
-            // sys_clone has its own error reporting path; we don't
-            // panic here so the caller sees the error surface.
-            return;
-        };
-        let task_payload = payload.clone();
-        let _ = BOOT_REACTOR.with(|reactor| {
-            reactor.submit_task(crate::thread_future::PerHartSlotted::<P, _>::new(
-                task_payload.clone(),
-                crate::thread_future::run_thread::<P>(child_thread, task_payload),
-            ));
-        });
+        // The reactor's `BOOT_REACTOR.with(...)` lock is held by
+        // `step_boot_reactor_once` *while* polling tasks. The
+        // currently-polled task is sys_clone — calling
+        // `BOOT_REACTOR.with(reactor.submit_task(...))` from here
+        // would deadlock that same spin lock. Defer the submit to a
+        // separate pending-queue that the BSP reactor loop drains
+        // between iterations (outside the inner lock).
+        Self::queue_pending_child_submit(child_thread);
+    }
+
+    /// Push a freshly-cloned child thread onto the deferred-submit
+    /// queue. Called from sys_clone via the reactor-submission seam
+    /// when the boot-reactor spin lock is already held by the
+    /// caller. Drained by `drain_pending_child_submits` between
+    /// reactor steps.
+    fn queue_pending_child_submit(
+        child_thread: tx_substrate::zone::Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
+    ) {
+        PENDING_CHILD_SUBMITS.lock().push(child_thread);
+    }
+
+    /// Drain the deferred-submit queue, building the task future for
+    /// each pending child and submitting it through `BOOT_REACTOR`.
+    /// Safe to call from the BSP loop because no syscall task is
+    /// being polled at this point (the inner spin lock is free).
+    fn drain_pending_child_submits() {
+        loop {
+            let next = PENDING_CHILD_SUBMITS.lock().pop();
+            let Some(child_thread) = next else {
+                break;
+            };
+            let Some(payload) = child_thread.payload_cap() else {
+                continue;
+            };
+            let task_payload = payload.clone();
+            let _ = BOOT_REACTOR.with(|reactor| {
+                reactor.submit_task(crate::thread_future::PerHartSlotted::<P, _>::new(
+                    task_payload.clone(),
+                    crate::thread_future::run_thread::<P>(child_thread, task_payload),
+                ));
+            });
+        }
     }
 }
+
+/// Deferred-submit queue for `sys_clone` children. Pushed from
+/// `submit_child_thread_into_boot_reactor` (running inside the
+/// reactor-poll inner lock) and drained from the BSP loop between
+/// reactor steps.
+static PENDING_CHILD_SUBMITS: tx_substrate::SpinMutex<
+    alloc::vec::Vec<tx_substrate::zone::Cap<tx_subsystems::thread_runtime::ThreadIdentity>>,
+> = tx_substrate::SpinMutex::new(alloc::vec::Vec::new());
 
 /// Synchronously poll a future to completion using a noop waker.
 ///

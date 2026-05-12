@@ -39,7 +39,7 @@ fn range_lock_would_block_wait_token_carrier_matches_lock() {
     };
 
     let token = blocked.wait_token();
-    assert_eq!(token.carrier(), aspace.range_lock().wait_carrier_id());
+    assert_eq!(token.source_id(), aspace.range_lock().wait_source_id());
     assert_eq!(token.interest(), RANGE_LOCK_RELEASE_MASK);
 }
 
@@ -572,6 +572,150 @@ fn exec_aspace_tears_down_all_resident_ptes() {
         .is_none());
 }
 
+/// Hot-path verification for the D15 / PC CoW plan: parent writes a
+/// pattern into a private anon page, forks, both sides observe the
+/// pattern, and a parent write does not affect the child.
+#[test]
+fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
+    setup_host_substrate();
+
+    let parent = AddressSpace::new();
+    let stack_range = range(0x40000, 1);
+
+    map_reserved(parent.reserve_map(
+        VmEntry::new(
+            stack_range,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("private anon map");
+
+    // Parent writes a distinctive pattern into the page. The write
+    // fault path must allocate a private frame, install it into
+    // vme.private as Exclusive, and copy the pattern bytes.
+    let pattern = [0xABu8; 16];
+    let user_addr = 0x40080usize;
+    let guard = tx_substrate::epoch::guard();
+    let copied = parent.copy_to_user(tx_hal::UserPtr::new(user_addr), &pattern, &guard);
+    assert_eq!(
+        copied,
+        tx_substrate::step_v3::StepOutcome::Done(pattern.len()),
+        "parent write should publish a private page"
+    );
+
+    // Verify parent reads back the pattern (round-trip).
+    let mut parent_read = [0u8; 16];
+    let copied = parent.copy_from_user(&mut parent_read, tx_hal::UserPtr::new(user_addr), &guard);
+    assert_eq!(
+        copied,
+        tx_substrate::step_v3::StepOutcome::Done(pattern.len()),
+        "parent should read back its own write"
+    );
+    assert_eq!(parent_read, pattern, "parent must see its own pattern");
+    drop(guard);
+
+    // Fork: parent's vme.private should fork_share into child as
+    // SharedCow. Parent's PTE in the private range is torn down.
+    let child =
+        crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
+
+    // Sanity: parent's PTE for the private page is gone (lazy refault).
+    assert!(
+        parent
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x40000).containing_page())
+            .is_none(),
+        "fork must demote parent PTE for private mapping"
+    );
+
+    // Parent re-reads after fork: read fault should consult vme.private
+    // (SharedCow hit) and install RO PTE pointing at the shared frame.
+    // Result: parent must still see its own pattern.
+    let guard = tx_substrate::epoch::guard();
+    let mut parent_post_fork = [0u8; 16];
+    let copied = parent.copy_from_user(
+        &mut parent_post_fork,
+        tx_hal::UserPtr::new(user_addr),
+        &guard,
+    );
+    assert_eq!(
+        copied,
+        tx_substrate::step_v3::StepOutcome::Done(pattern.len()),
+        "parent post-fork read must succeed"
+    );
+    assert_eq!(
+        parent_post_fork, pattern,
+        "parent post-fork read must observe pre-fork bytes (SharedCow refault)"
+    );
+
+    // Child reads at the same VA: child's vme.private got the SharedCow
+    // entry via fork_share, so the read fault should HIT and install
+    // RO PTE pointing at the same shared frame. Result: child must see
+    // parent's pre-fork pattern.
+    let mut child_read = [0u8; 16];
+    let copied = child.copy_from_user(&mut child_read, tx_hal::UserPtr::new(user_addr), &guard);
+    assert_eq!(
+        copied,
+        tx_substrate::step_v3::StepOutcome::Done(pattern.len()),
+        "child post-fork read must succeed"
+    );
+    assert_eq!(
+        child_read, pattern,
+        "child must observe parent's pre-fork bytes via SharedCow"
+    );
+
+    // Parent writes a new pattern. SharedCow CoW: parent should
+    // allocate a fresh frame, copy the shared content, replace_if_match
+    // its private entry to Exclusive, install RW PTE on the new frame.
+    let pattern2 = [0xCDu8; 16];
+    let copied = parent.copy_to_user(tx_hal::UserPtr::new(user_addr), &pattern2, &guard);
+    assert_eq!(
+        copied,
+        tx_substrate::step_v3::StepOutcome::Done(pattern2.len()),
+        "parent post-fork write must succeed (SharedCow → Exclusive)"
+    );
+
+    // Parent now reads back the new pattern.
+    let mut parent_after_write = [0u8; 16];
+    let copied = parent.copy_from_user(
+        &mut parent_after_write,
+        tx_hal::UserPtr::new(user_addr),
+        &guard,
+    );
+    assert_eq!(
+        copied,
+        tx_substrate::step_v3::StepOutcome::Done(pattern2.len()),
+        "parent post-write read must succeed"
+    );
+    assert_eq!(
+        parent_after_write, pattern2,
+        "parent must see its new pattern after CoW"
+    );
+
+    // Child still observes the OLD shared pattern (its SharedCow entry
+    // points at the original frame, parent's CoW only allocated a new
+    // frame for parent).
+    let mut child_after_parent_write = [0u8; 16];
+    let copied = child.copy_from_user(
+        &mut child_after_parent_write,
+        tx_hal::UserPtr::new(user_addr),
+        &guard,
+    );
+    assert_eq!(
+        copied,
+        tx_substrate::step_v3::StepOutcome::Done(pattern.len()),
+        "child read after parent CoW must succeed"
+    );
+    assert_eq!(
+        child_after_parent_write, pattern,
+        "child must still see pre-fork bytes after parent CoW (no cross-process leak)"
+    );
+}
+
 #[test]
 fn range_lock_release_fires_registered_channel_for_external_subscribers() {
     let aspace = AddressSpace::new();
@@ -585,7 +729,7 @@ fn range_lock_release_fires_registered_channel_for_external_subscribers() {
     };
 
     let channel: Channel =
-        crate::wait_carrier::lookup_wait_channel(aspace.range_lock().wait_carrier_id())
+        crate::wait_source::lookup_wait_channel(aspace.range_lock().wait_source_id())
             .expect("RangeLock channel registered");
     let mut wait_future =
         Box::pin(channel.wait(tx_reactor::wait::Mask::from_bits(RANGE_LOCK_RELEASE_MASK)));

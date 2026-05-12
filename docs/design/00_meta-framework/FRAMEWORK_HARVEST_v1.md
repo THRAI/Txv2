@@ -2,7 +2,7 @@
 
 <!-- txdoc:00-META-FRAMEWORK-FRAMEWORK-HARVEST-V1 -->
 
-**Status.** Noncanonical staging note. Superseded for implementation by `CONCEPTS_v4.md`, `INVARIANTS_v4.md`, `MODULE_MAP_v1.md`, `object_model_v2.md`, and `SUBSYSTEM_ANATOMY_v2_1.md`.
+**Status.** Noncanonical staging note. Superseded for implementation by `01_CONCEPTS_v5.md`, `02_INVARIANTS_v5.md`, `MODULE_MAP_v1.md`, `object_model_v2.md`, and `SUBSYSTEM_ANATOMY_v2_1.md`.
 
 **Purpose.** Preserve the harvest trail: stable ideas, promoted subsystem decisions, stale vocabulary, and integration points that shaped the current meta-framework cleanup. This is not a canonical architecture document and should not be used as an implementation contract.
 
@@ -17,9 +17,9 @@
 The rewrite should produce a small canonical meta-framework set:
 
 - `MODULE_MAP_v1.md` — placement taxonomy: foundation, substrate, reactor, scheduler policy, semantic subsystems, service subsystems, filesystem instances, scripts, shims, static registries, projections.
-- `CONCEPTS_v4.md` — master vocabulary: three basis claims, planes, roles, reference hierarchy, steps, wait/drive, publication rule, carve-outs.
+- `01_CONCEPTS_v5.md` — master vocabulary: three basis claims, planes, roles, reference hierarchy, steps, wait/drive, publication rule, carve-outs.
 - `OBJECT_MODEL_v3.md` — entities, identity/payload factoring, references, bindings, obligations, retention, reclamation.
-- `INVARIANTS_v4.md` — enforceable rules only; stable identifiers for review/lints/tests.
+- `02_INVARIANTS_v5.md` — enforceable rules only; stable identifiers for review/lints/tests.
 - `SUBSYSTEM_ANATOMY_v3.md` — shapes for full subsystems, service subsystems, filesystem instances, scripts, shims, static registries, and HAL-facing leaves.
 - `PROJECTION_CATALOG_v1.md` — successor to `LIVENESS`: projection rows, partial orders, signal-catalog cross-links, checklist.
 - `FRAMEWORK_CHANGELOG.md` — old-to-new map: what superseded `ADR-resolution-half_v2`, `LIVENESS_v2.1`, old filename references, and retired terms.
@@ -424,9 +424,9 @@ Exit criterion: no major taxonomy dispute remains.
 Write skeletons in this order:
 
 1. `MODULE_MAP_v1.md`
-2. `CONCEPTS_v4.md`
+2. `01_CONCEPTS_v5.md`
 3. `OBJECT_MODEL_v3.md`
-4. `INVARIANTS_v4.md`
+4. `02_INVARIANTS_v5.md`
 5. `SUBSYSTEM_ANATOMY_v3.md`
 6. `PROJECTION_CATALOG_v1.md`
 

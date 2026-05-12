@@ -85,12 +85,13 @@ pub enum Errno {
     ESTALE,
 }
 
-/// Opaque carrier handle. Replaces `tx_subsystems::execution::WaitToken`'s
-/// carrier slot; the underlying integer is the bus-primitive carrier id.
+/// Opaque wait-source handle. Replaces `tx_subsystems::execution::WaitToken`'s
+/// carrier slot; the underlying integer is the bus-primitive source id.
+/// Renamed from `WakeCarrier` per docs/Txv3/07_BLAST_RADIUS.md §3.1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WakeCarrier(u64);
+pub struct WaitSourceId(u64);
 
-impl WakeCarrier {
+impl WaitSourceId {
     pub const fn new(raw: u64) -> Self {
         Self(raw)
     }
@@ -99,12 +100,13 @@ impl WakeCarrier {
     }
 }
 
-/// Bitmask of interest conditions on a carrier. Replaces
-/// `tx_subsystems::execution::WaitToken`'s interest slot.
+/// Bitmask of interest conditions on a wait source. Replaces
+/// `tx_subsystems::execution::WaitToken`'s interest slot. Renamed from
+/// `InterestConditions` per docs/Txv3/07_BLAST_RADIUS.md §3.1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InterestConditions(u64);
+pub struct InterestMask(u64);
 
-impl InterestConditions {
+impl InterestMask {
     pub const fn new(raw: u64) -> Self {
         Self(raw)
     }
@@ -115,34 +117,47 @@ impl InterestConditions {
 
 /// Closed catalog of yield shapes. Extension is ARCH-3.
 ///
-/// PR-0 pinned `OnCarrier`; this PR adds `OnAgent` against placeholder
-/// delegate types (see `agent.rs`). PR-4 of the v3 TDD migration plan
-/// replaces those placeholders with real cap-typed zone primitives.
+/// PR-0 pinned `OnWaitSource` (formerly `OnCarrier`); the OnAgent variant
+/// lands against placeholder delegate types (see `agent.rs`). PR-4 of the
+/// v3 TDD migration plan replaces those placeholders with real cap-typed
+/// zone primitives.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum YieldShape {
-    OnCarrier {
-        carrier: WakeCarrier,
-        interests: InterestConditions,
+    OnWaitSource {
+        source: WaitSourceId,
+        interests: InterestMask,
     },
     OnAgent {
         endpoint: DelegateEndpoint,
         request: DelegateRequest,
         token: DelegateToken,
         deadline: Deadline,
-        cancel: CancelPolicy,
+        cancel: AgentCancelPolicy,
     },
+    /// Primary timer wait: a deadline fires and the driver resumes
+    /// the op via [`ResumeOutcome::TimerExpired`]. Distinct from a
+    /// secondary `Deadline` carried by `OnAgent` (which times out
+    /// the agent's reply); `OnTimer` is the timer itself being the
+    /// wait subject.
+    ///
+    /// Per `docs/Txv3/03_STEP_MODEL_v2.md` and PR-8 of the v3
+    /// migration. The [`crate::wake::timer::TimerToken`]
+    /// corresponding to this `token` is held by a
+    /// [`crate::wake::timer::TimerGuard`] (future PR-8 follow-up)
+    /// that the driver retires on resume.
+    OnTimer { token: TimerId, deadline: Deadline },
 }
 
 impl YieldShape {
-    /// Shorthand for `OnCarrier { carrier: WakeCarrier::new(carrier_id),
-    /// interests: InterestConditions::new(interest_mask) }`. Wraps the
-    /// raw `u64` carrier id and `u64` interest mask; zero-translation
+    /// Shorthand for `OnWaitSource { source: WaitSourceId::new(source_id),
+    /// interests: InterestMask::new(interest_mask) }`. Wraps the
+    /// raw `u64` source id and `u64` interest mask; zero-translation
     /// conversion so call sites don't have to hand-roll the struct
     /// literal.
-    pub const fn on_carrier(carrier_id: u64, interest_mask: u64) -> Self {
-        Self::OnCarrier {
-            carrier: WakeCarrier::new(carrier_id),
-            interests: InterestConditions::new(interest_mask),
+    pub const fn on_wait_source(source_id: u64, interest_mask: u64) -> Self {
+        Self::OnWaitSource {
+            source: WaitSourceId::new(source_id),
+            interests: InterestMask::new(interest_mask),
         }
     }
 }
@@ -174,18 +189,18 @@ impl<T, P: StepProgress> StepOutcome<T, P> {
         Self::Continue { progress }
     }
 
-    /// `StepOutcome::yield_on_carrier(progress, carrier_id, interest_mask)`
-    /// — shorthand for `Yield { progress, shape: YieldShape::on_carrier(...) }`.
-    /// Constructs a `Yield` over an `OnCarrier` shape from the
-    /// underlying `u64` carrier id and `u64` interest mask;
+    /// `StepOutcome::yield_on_wait_source(progress, source_id, interest_mask)`
+    /// — shorthand for `Yield { progress, shape: YieldShape::on_wait_source(...) }`.
+    /// Constructs a `Yield` over an `OnWaitSource` shape from the
+    /// underlying `u64` source id and `u64` interest mask;
     /// zero-translation conversion. No `yield_on_agent` shorthand: the
     /// `OnAgent` variant has five fields, so a single helper isn't
     /// useful. Builders or shape-specific helpers can come later when
     /// there's a real `OnAgent` client.
-    pub const fn yield_on_carrier(progress: P, carrier_id: u64, interest_mask: u64) -> Self {
+    pub const fn yield_on_wait_source(progress: P, source_id: u64, interest_mask: u64) -> Self {
         Self::Yield {
             progress,
-            shape: YieldShape::on_carrier(carrier_id, interest_mask),
+            shape: YieldShape::on_wait_source(source_id, interest_mask),
         }
     }
 }
@@ -225,8 +240,8 @@ impl ByteProgress {
     }
     /// Inherent shorthand for `<ByteProgress as StepProgress>::EMPTY`.
     /// Avoids requiring `use StepProgress;` at byte-moving call sites
-    /// (e.g. `step_v3::StepOutcome::yield_on_carrier(ByteProgress::EMPTY,
-    /// carrier_id, interest_mask)`).
+    /// (e.g. `step_v3::StepOutcome::yield_on_wait_source(ByteProgress::EMPTY,
+    /// source_id, interest_mask)`).
     pub const EMPTY: Self = Self { bytes: 0 };
 }
 
@@ -251,16 +266,24 @@ pub use entry_progress::{DirCursor, EntryProgress};
 pub mod subject_context;
 pub use iovec_progress::IoVecProgress;
 pub use subject_context::{
-    Credential, ProcessIdentity, RestrictionStackHandle, SubjectAuthority, SubjectContext,
-    ThreadIdentity,
+    Credential, CredentialView, ProcessIdentity, RestrictionStackHandle, RestrictionStackView,
+    SubjectAuthority, SubjectContext, SubjectIdentity, ThreadIdentity,
 };
 pub mod restriction_stack;
 pub use page_progress::PageProgress;
 pub use restriction_stack::{RestrictionKind, RestrictionStack};
 pub mod execution_scope;
-pub use execution_scope::{ExecutionScope, OwnedProcessHandle};
+pub use execution_scope::ExecutionScope;
+pub mod on_behalf_of;
+pub use on_behalf_of::{
+    with_on_behalf_of, AbortSignal, CancelReason, OnBehalfOfAbort, OnBehalfOfBorrow,
+};
 pub mod agent;
-pub use agent::{CancelPolicy, Deadline, DelegateEndpoint, DelegateRequest, DelegateToken};
+pub use agent::{
+    AbortReason, AgentCancelPolicy, AgentTokenGuard, Deadline, DelegateEndpoint, DelegateRegistry,
+    DelegateReply, DelegateRequest, DelegateState, DelegateToken, DelegateTokenId, TimerId,
+    TokenDropPolicy, TransitionOutcome, UfdAccessKind, UfdReply, UfdRequest,
+};
 pub mod endpoint_kind;
 pub use endpoint_kind::EndpointKind;
 pub mod wait_protocol;
@@ -306,10 +329,18 @@ impl DriveMode {
                 AcceptOutcome::Translate(Translation::Eagain)
             }
             (DriveMode::Nonblocking, _) => AcceptOutcome::Translate(Translation::PartialReturn),
-            (DriveMode::Waiting, YieldShape::OnCarrier { .. }) => AcceptOutcome::Resolve,
+            (DriveMode::Waiting, YieldShape::OnWaitSource { .. }) => AcceptOutcome::Resolve,
             (DriveMode::Waiting, YieldShape::OnAgent { .. }) => AcceptOutcome::Resolve,
-            (DriveMode::Selecting, YieldShape::OnCarrier { .. }) => AcceptOutcome::Resolve,
+            (DriveMode::Waiting, YieldShape::OnTimer { .. }) => AcceptOutcome::Resolve,
+            (DriveMode::Selecting, YieldShape::OnWaitSource { .. }) => AcceptOutcome::Resolve,
             (DriveMode::Selecting, YieldShape::OnAgent { .. }) => {
+                AcceptOutcome::Translate(Translation::UnsupportedShape)
+            }
+            // `OnTimer` under `Selecting` is rejected: select(2) expresses
+            // its own timeout via the `timeout` argument; a step-level
+            // primary timer wait does not compose with select-style
+            // multiplexing in a single dispatch surface.
+            (DriveMode::Selecting, YieldShape::OnTimer { .. }) => {
                 AcceptOutcome::Translate(Translation::UnsupportedShape)
             }
         }
@@ -318,29 +349,89 @@ impl DriveMode {
 
 /// Per-script execution context handed to each `StepOp::step` call.
 ///
-/// PR-0 placeholder: intentionally empty. Later PRs of the v3 TDD
-/// migration thread the SubjectContext, guard, deadline, and
-/// per-script scratch state through this struct. The `_private` field
-/// keeps the struct nominally non-empty so external crates cannot
-/// construct it without `ScriptCtx::new()`, which keeps the door open
-/// for future fields without a breaking change.
-#[derive(Debug)]
-pub struct ScriptCtx {
-    _private: (),
+/// Script-scoped state bag threaded through every `StepOp::step`
+/// invocation.
+///
+/// Generic over `I: SubjectIdentity` per
+/// [D1](../../../../docs/progress/decisions/2026-05-11-d1-scriptctx-trait-bound-identity.md).
+/// Default `I = ProcessIdentity` (placeholder) keeps existing PR-2
+/// wraps compiling unchanged. Production uses
+/// `KernelScriptCtx = ScriptCtx<tx_subsystems::process::ProcessIdentity>`.
+///
+/// Fields are `Option<T>` so `ScriptCtx::new()` is zero-arg for any
+/// `I`. Production callers populate via builder methods (`with_subject`,
+/// `with_deadline`). PR-2 wraps that don't read these fields work
+/// unchanged whether they're populated or not.
+///
+/// **The `epoch::Guard` is NOT a field here** — guards are step-local
+/// (acquired inside `StepOp::step` body, never carried across
+/// `.await`/yield). See D1 §"guard is step-local, not ScriptCtx-held".
+///
+/// PR-9 phase 3 populates `subject` / `deadline` from the syscall
+/// trampoline; subsequent waves populate `mailbox` and `trace`.
+pub struct ScriptCtx<I: SubjectIdentity = ProcessIdentity> {
+    subject: Option<SubjectContext<I>>,
+    deadline: Option<Deadline>,
 }
 
-impl ScriptCtx {
-    /// Construct an empty `ScriptCtx`. PR-0 placeholder; later PRs add
-    /// real construction parameters (subject, guard, deadline, …).
+impl<I: SubjectIdentity> ScriptCtx<I> {
+    /// Construct an empty `ScriptCtx<I>`. All fields default to `None`;
+    /// production callers populate via the builder methods.
     pub const fn new() -> Self {
-        Self { _private: () }
+        Self {
+            subject: None,
+            deadline: None,
+        }
+    }
+
+    /// Populate the subject context (PR-9 phase 3).
+    pub fn with_subject(mut self, subject: SubjectContext<I>) -> Self {
+        self.subject = Some(subject);
+        self
+    }
+
+    /// Populate the script-level deadline (PR-8B / later).
+    pub fn with_deadline(mut self, deadline: Deadline) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// Subject context if populated; `None` for placeholder/test
+    /// contexts.
+    pub fn subject(&self) -> Option<&SubjectContext<I>> {
+        self.subject.as_ref()
+    }
+
+    /// Script-level deadline if populated.
+    pub fn deadline(&self) -> Option<Deadline> {
+        self.deadline
     }
 }
 
-impl Default for ScriptCtx {
+impl<I: SubjectIdentity> Default for ScriptCtx<I> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Closed catalog of resume outcomes (per `docs/Txv3/03_STEP_MODEL_v2.md`).
+///
+/// The driver consumes a `StepOutcome::Yield`, waits on the named
+/// `YieldShape`, and produces a `ResumeOutcome` it hands back to the
+/// op via [`StepOp::apply_resume`]. The op stashes any payload in
+/// `&mut self` and the driver then re-invokes [`StepOp::step`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResumeOutcome {
+    /// Rerun step. Used by `OnWaitSource` — the source fired with a
+    /// matching interest; the step re-checks its semantic predicate.
+    Retry,
+    /// Delegate reply available. Used by `OnAgent` — the agent has
+    /// written a reply payload that the op should consume.
+    WithReply(DelegateReply),
+    /// Primary timer wait expired. Used by `OnTimer`.
+    TimerExpired(TimerId),
+    /// Wait aborted (signal, scope teardown, kill, timeout, …).
+    Aborted(AbortReason),
 }
 
 /// Step-able operation.
@@ -348,9 +439,19 @@ impl Default for ScriptCtx {
 /// Per `docs/Txv3/03_STEP_MODEL_v2.md` §2.1: every script driver pulls
 /// on a `StepOp`, receiving a four-variant `StepOutcome` parameterized
 /// by the op's `Output` and a monoid-shaped `Progress` accumulator.
-/// PR-0 only requires the trait shape to compile; later PRs land the
-/// resolver, the `OnAgent` yield variant, and concrete op impls.
-pub trait StepOp {
+///
+/// Generic over `I: SubjectIdentity` per
+/// [D1](../../../../docs/progress/decisions/2026-05-11-d1-scriptctx-trait-bound-identity.md).
+/// Default `I = ProcessIdentity` (the step_v3 placeholder) keeps the
+/// 80 PR-2 wraps compiling unchanged — their `impl StepOp for FooOp`
+/// resolves to `impl StepOp<ProcessIdentity> for FooOp` via default.
+///
+/// Production wraps that need to consume a real
+/// `ScriptCtx<tx_subsystems::process::ProcessIdentity>` impl
+/// `StepOp<tx_subsystems::process::ProcessIdentity>` explicitly. Wraps
+/// that don't access identity-specific fields can be polymorphic
+/// (`impl<I: SubjectIdentity> StepOp<I> for FooOp`).
+pub trait StepOp<I: SubjectIdentity = ProcessIdentity> {
     /// Final value produced when the op completes (via
     /// `StepOutcome::Done`).
     type Output;
@@ -361,5 +462,29 @@ pub trait StepOp {
 
     /// Drive the op one step. Returns one of the four `StepOutcome`
     /// variants per STEP-1.
-    fn step(&mut self, ctx: &mut ScriptCtx) -> StepOutcome<Self::Output, Self::Progress>;
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress>;
+
+    /// Apply a resume payload between two `step()` invocations.
+    ///
+    /// Called by the driver after a wait (named in the previous
+    /// `step()`'s `Yield`) completes. The op should stash any
+    /// payload in `&mut self`; the driver then re-invokes `step()`.
+    ///
+    /// The default impl accepts only [`ResumeOutcome::Retry`] and
+    /// rejects other variants with [`Errno::EINVAL`]. **This is
+    /// deliberate**: any StepOp that yields `OnAgent` (and therefore
+    /// can receive `WithReply`) **must** explicitly opt in to
+    /// handling reply payloads by overriding this method. Silent
+    /// acceptance of unhandled resumes is a bug class the framework
+    /// forecloses. Same for `OnTimer` ⇒ `TimerExpired`.
+    ///
+    /// `Aborted(_)` is also rejected by the default impl — abort
+    /// handling is op-specific (cleanup of partial state, etc.) and
+    /// must be opted into.
+    fn apply_resume(&mut self, resume: ResumeOutcome) -> Result<(), Errno> {
+        match resume {
+            ResumeOutcome::Retry => Ok(()),
+            _ => Err(Errno::EINVAL),
+        }
+    }
 }

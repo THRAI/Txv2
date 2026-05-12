@@ -3,6 +3,7 @@
 use core::sync::atomic::Ordering;
 
 use tx_reactor::wait::Mask;
+use tx_substrate::step_v3::InterestMask;
 use tx_substrate::zone::Cap;
 
 use crate::execution::Guard;
@@ -56,6 +57,13 @@ pub fn step_ingest(
         // Channel is registered at TTY construction; see
         // `TtyIdentity::new`.
         tty.wait_channel().fire(Mask::from_bits(TTY_READABLE));
+        // PR-3D-4 (D2 coexistence): fire the new `WaitSource`
+        // alongside the legacy `Channel`. Same `WaitSourceId`
+        // namespace, same `TTY_READABLE` interest bit. Subscribers
+        // installed via `WaitSource::prepare(..).install_if(..)`
+        // receive a `MailboxEvent::SourceFired` posted under the same
+        // payload-observation arm as the Channel fire above.
+        tty.wait_source().notify(InterestMask::new(TTY_READABLE));
         outcome.readable_fired = true;
     }
     if linearized.writable_fired {
@@ -94,6 +102,10 @@ pub fn step_ingest(
                             // fire above. The wait-carrier `Channel`
                             // wakes `sys_read`'s blocking-read loop.
                             tty.wait_channel().fire(Mask::from_bits(TTY_READABLE));
+                            // PR-3D-4 (D2 coexistence): paired notify
+                            // on the new `WaitSource`. See the
+                            // companion site above for the rationale.
+                            tty.wait_source().notify(InterestMask::new(TTY_READABLE));
                             outcome.readable_fired = true;
                         }
                         LdiscInputEffect::SignalFgPgrp(signal) => {
@@ -117,4 +129,132 @@ pub fn step_ingest(
     });
 
     V3::Done(outcome)
+}
+
+// ---------------------------------------------------------------------------
+// StepOp wraps (PR-2 cleanup)
+// ---------------------------------------------------------------------------
+
+/// `StepOp` wrap of [`step_ingest`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
+pub struct IngestOp<'a> {
+    pub tty: &'a Cap<TtyIdentity>,
+    pub bytes: &'a [u8],
+    pub guard: &'a Guard<'a>,
+}
+
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for IngestOp<'a>
+{
+    type Output = IngestOutcome;
+    type Progress = tx_substrate::step_v3::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
+    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        step_ingest(self.tty, self.bytes, self.guard)
+    }
+}
+
+#[cfg(test)]
+mod step_op_wraps {
+    use super::*;
+    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+    use tx_substrate::zone::{self as zone_mod, PayloadCap};
+
+    use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
+    use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::tty::structure::{TtyKind, TtyPayload};
+
+    struct NoopOps;
+
+    impl CharDeviceOps for NoopOps {
+        fn read(
+            &self,
+            _out: &mut [u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        {
+            tx_substrate::step_v3::StepOutcome::Done(0)
+        }
+
+        fn write(
+            &self,
+            bytes: &[u8],
+            _guard: &Guard<'_>,
+        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        {
+            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+        }
+    }
+
+    static NOOP_OPS: NoopOps = NoopOps;
+    static NOOP_BINDING: CharDeviceBinding = CharDeviceBinding {
+        devt: DevT::new(4, 240),
+        name: "tty-ingest-op-test",
+        ops: &NOOP_OPS,
+    };
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        tx_substrate::testing::init_host_for_test_once();
+        let _ = crate::zones::register_all();
+        crate::tty::structure::registry::reset_for_tests();
+        guard
+    }
+
+    fn alloc_hardware_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
+        let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(
+            payload_res,
+            TtyPayload::new_hardware(&NOOP_BINDING),
+        ));
+        let identity = zone_mod::sign_for(
+            id_res,
+            TtyIdentity::new(TtyKind::SerialHardware, index, name),
+        );
+        identity.install_payload(payload_cap);
+        identity
+    }
+
+    #[test]
+    fn ingest_op_consumes_bytes() {
+        let _setup = setup();
+        let tty = alloc_hardware_tty(600, "ttyV3-ingest-op-live");
+        let guard = tx_substrate::epoch::guard();
+        let bytes: &[u8] = b"hi";
+        let mut op = IngestOp {
+            tty: &tty,
+            bytes,
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Done(o) => assert_eq!(o.consumed, bytes.len()),
+            other => panic!("expected Done(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ingest_op_on_dead_tty_errors() {
+        let _setup = setup();
+        let tty = alloc_hardware_tty(601, "ttyV3-ingest-op-dead");
+        let _ = tty.take_payload();
+        let guard = tx_substrate::epoch::guard();
+        let mut op = IngestOp {
+            tty: &tty,
+            bytes: b"x",
+            guard: &guard,
+        };
+        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let outcome = op.step(&mut ctx);
+        drop(guard);
+        match outcome {
+            V3::Err(_) => {}
+            other => panic!("expected Err(_), got {other:?}"),
+        }
+    }
 }

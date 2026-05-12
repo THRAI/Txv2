@@ -21,8 +21,8 @@ Companion documents:
 - [`REACTOR_v0.md`](REACTOR_v0.md) — reactor contract; preemption mechanism.
 - [`THREAD_RUNTIME_v1.md`](THREAD_RUNTIME_v1.md) — thread_future and its composition with scripts.
 - [`PROCESS_v1.md`](../04_process-signals/PROCESS_v1.md) — process model; nice/setpriority are deferred to this scheduler spec.
-- [`CONCEPTS_v4.md`](../00_meta-framework/CONCEPTS_v4.md) — architectural homes and reactor/scheduler split.
-- [`INVARIANTS_v4.md`](../00_meta-framework/INVARIANTS_v4.md) — STEP-2 bounds; SCRIPT-* rules.
+- [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — architectural homes and reactor/scheduler split.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-2 bounds; SCRIPT-* rules.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) §6 — layering; policy consults data, doesn't own entities.
 
 ### What this document pins
