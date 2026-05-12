@@ -4,15 +4,16 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use tx_substrate::SpinMutex;
+pub mod adapter;
+
+use adapter::runtime::{
+    self, Cap, Dead, Entity, PayloadBinding, PayloadCap, SpinMutex, Zone, ZoneAllocated, ZoneError,
+};
 
 use crate::device::BlockDevice;
 use crate::execution::KernelResult;
 use crate::page_backed::{FsPageBacking, PageContainer};
 use crate::vfs::{DEntry, FsObjectId, FsOps, InodeMeta, RNode};
-use tx_substrate::zone::{
-    self, Cap, Dead, Entity, PayloadBinding, PayloadCap, Zone, ZoneAllocated, ZoneError,
-};
 
 static MOUNT_IDENTITY_ZONE: Zone<MountIdentity> = Zone::const_new();
 static MOUNT_PAYLOAD_ZONE: Zone<MountPayload> = Zone::const_new();
@@ -133,18 +134,14 @@ impl MountPayload {
         fstype: &'static str,
         source_label: SourceLabel,
     ) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(
-            reservation,
-            Self::new(
-                fs_ops,
-                fs_page_backing,
-                backing,
-                dev_id,
-                options,
-                fstype,
-                source_label,
-            ),
+        runtime::sign_zone_for(Self::new(
+            fs_ops,
+            fs_page_backing,
+            backing,
+            dev_id,
+            options,
+            fstype,
+            source_label,
         ))
     }
 
@@ -250,12 +247,8 @@ impl MountIdentity {
         payload: Cap<MountPayload>,
         flags: MountFlags,
     ) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
         let payload = PayloadBinding::installed(PayloadCap::from_cap(payload));
-        Ok(zone::sign_for(
-            reservation,
-            Self::new(id, mountpoint, root, parent, payload, flags),
-        ))
+        runtime::sign_zone_for(Self::new(id, mountpoint, root, parent, payload, flags))
     }
 
     pub const fn id(&self) -> MountId {
@@ -291,7 +284,7 @@ impl Entity for MountIdentity {
     type OperationalEvidence = MountPayloadPin;
 
     fn upgrade_operational(
-        identity: &tx_substrate::zone::Cap<Self>,
+        identity: &Cap<Self>,
     ) -> Result<Self::OperationalEvidence, Dead> {
         Ok(MountPayloadPin::acquire(&identity.payload_cap()?))
     }
@@ -308,8 +301,7 @@ impl MountNamespace {
     }
 
     pub fn new_cap(root: Cap<MountIdentity>) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(reservation, Self::new(root)))
+        runtime::sign_zone_for(Self::new(root))
     }
 
     pub fn root(&self) -> &Cap<MountIdentity> {

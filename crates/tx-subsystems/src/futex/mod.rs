@@ -57,11 +57,12 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use tx_reactor::wait::{Channel, Mask};
-use tx_substrate::step_v3::{InterestMask, WaitSourceId};
-use tx_substrate::wake::WaitSource;
-use tx_substrate::zone::ZoneError;
-use tx_substrate::SpinMutex;
+pub mod adapter;
+
+use adapter::step_engine::{
+    self, Errno, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, ZoneError,
+};
+use adapter::wait_routing::{self, Channel, WaitSource};
 
 use crate::execution::Guard;
 use crate::wait_source;
@@ -128,7 +129,7 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
         // the legacy registry's id namespace so a v3 caller using the
         // `WaitSourceId` stamped into `YieldShape::OnWaitSource` lands
         // on the right bucket here.
-        let wait_source = Arc::new(WaitSource::new(WaitSourceId::new(source_id)));
+        let wait_source = wait_routing::new_wait_source(source_id);
         FutexBucket {
             channel,
             source_id,
@@ -168,15 +169,15 @@ pub fn step_futex_wait(
     uaddr: u64,
     val: u32,
     _guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+) -> StepOutcome<(), NoProgress> {
     if uaddr == 0 || (uaddr & 0x3) != 0 {
-        return tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EINVAL);
+        return StepOutcome::Err(Errno::EINVAL);
     }
     // SAFETY: bootstrap kernel-buffer exemption — TODO(phase-userva).
     // Mirrors `step_futex_wait`'s read; see that fn for migration plan.
     let observed = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
     if observed != val {
-        return tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EAGAIN);
+        return StepOutcome::Err(Errno::EAGAIN);
     }
     let idx = bucket_index(uaddr);
     let source_id = {
@@ -186,13 +187,7 @@ pub fn step_futex_wait(
             .expect("futex buckets uninitialised — register_zones not called");
         buckets[idx].source_id
     };
-    tx_substrate::step_v3::StepOutcome::Yield {
-        progress: tx_substrate::step_v3::NoProgress,
-        shape: tx_substrate::step_v3::YieldShape::OnWaitSource {
-            source: tx_substrate::step_v3::WaitSourceId::new(source_id),
-            interests: tx_substrate::step_v3::InterestMask::new(FUTEX_WAKE_MASK),
-        },
-    }
+    step_engine::yield_until_wake(source_id, FUTEX_WAKE_MASK)
 }
 
 /// `futex(uaddr, FUTEX_WAKE, n, ...)`.
@@ -209,9 +204,9 @@ pub fn step_futex_wake(
     uaddr: u64,
     n: u32,
     _guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<u32, tx_substrate::step_v3::NoProgress> {
+) -> StepOutcome<u32, NoProgress> {
     if uaddr == 0 || (uaddr & 0x3) != 0 {
-        return tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EINVAL);
+        return StepOutcome::Err(Errno::EINVAL);
     }
     let idx = bucket_index(uaddr);
     // Clone the `Arc<WaitSource>` out under the bucket lock so the
@@ -225,15 +220,15 @@ pub fn step_futex_wake(
             .as_ref()
             .expect("futex buckets uninitialised — register_zones not called");
         // Legacy path (D2 coexistence): wake any `Waker`-based waiter.
-        buckets[idx].channel.fire(Mask::from_bits(FUTEX_WAKE_MASK));
+        wait_routing::fire_legacy_channel(&buckets[idx].channel, FUTEX_WAKE_MASK);
         buckets[idx].wait_source.clone()
     };
     // PR-3D-2 new path: post `MailboxEvent::SourceFired` to any v3
     // caller that registered a `TaskMailbox` against this bucket's
     // source. Per-waiter re-check on wakeup re-reads `*uaddr` and
     // either returns success or re-parks.
-    wait_source.notify(InterestMask::new(FUTEX_WAKE_MASK));
-    tx_substrate::step_v3::StepOutcome::Done(n)
+    wait_routing::notify_v3_source(&wait_source, FUTEX_WAKE_MASK);
+    StepOutcome::Done(n)
 }
 
 /// PR-3D-2: look up the `Arc<WaitSource>` for the bucket that
@@ -292,15 +287,13 @@ pub struct FutexWaitOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
-    for FutexWaitOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for FutexWaitOp<'a> {
     type Output = ();
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_futex_wait(self.uaddr, self.val, self.guard)
     }
 }
@@ -313,15 +306,13 @@ pub struct FutexWakeOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
-    for FutexWakeOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for FutexWakeOp<'a> {
     type Output = u32;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_futex_wake(self.uaddr, self.n, self.guard)
     }
 }

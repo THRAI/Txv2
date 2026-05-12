@@ -30,13 +30,16 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_substrate::wake::SignalRouting;
-use tx_substrate::zone::{Cap, OperationalCapExt};
+pub mod adapter;
+
+use adapter::step_engine::{
+    self, Cap, Guard, NoProgress, OperationalCapExt, ScriptCtx, SignalRouting, SpinMutex, StepOp,
+    StepOutcome, SubjectIdentity,
+};
 
 use crate::execution::Errno;
 use crate::process::structure::{ProcessGroup, ProcessIdentity};
 use crate::thread_runtime::execution::{post_signal, post_signal_mailbox};
-use tx_substrate::SpinMutex;
 
 /// POSIX signal number, 1..=64.
 ///
@@ -367,7 +370,7 @@ pub fn select_next_signal(
     drop(payload_guard);
 
     // Group-directed pending next.
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let proc = thread.owner_proc.upgrade(&guard)?;
     drop(guard);
 
@@ -451,7 +454,7 @@ pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutc
         return AstOutcome::InitiateTermination;
     }
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let Some(proc) = thread.owner_proc.upgrade(&guard) else {
         return AstOutcome::Continue;
     };
@@ -517,7 +520,7 @@ pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutc
 pub fn ast_dispatch(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutcome {
     let outcome = ast_check(thread);
     if let AstOutcome::DefaultTerminate { sig } = outcome {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         if let Some(proc) = thread.owner_proc.upgrade(&guard) {
             drop(guard);
             crate::process::execution::step_exit_group_with_signal(&proc, sig);
@@ -717,7 +720,7 @@ pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
 ///
 /// Returns the count of processes that received the post.
 pub fn step_kill_pgrp(pgrp: &Cap<ProcessGroup>, sig: Signum) -> usize {
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let mut delivered = 0usize;
     let catchable = !is_gewalt(sig);
     for weak in pgrp.members.lock().iter() {
@@ -802,7 +805,7 @@ pub fn script_kill_process(
     target: &Cap<ProcessIdentity>,
     sig: Signum,
 ) -> Result<KillScriptOutcome, Errno> {
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
 
     let source_cred = source
         .upgrade_operational()
@@ -828,7 +831,7 @@ pub fn script_kill_probe(
     source: &Cap<ProcessIdentity>,
     target: &Cap<ProcessIdentity>,
 ) -> Result<KillScriptOutcome, Errno> {
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
 
     let source_cred = source
         .upgrade_operational()
@@ -867,7 +870,7 @@ pub fn script_kill_pgrp(
     pgrp: &Cap<ProcessGroup>,
     sig: Signum,
 ) -> Result<u32, Errno> {
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     script_kill_pgrp_with_guard(source, pgrp, sig, &guard)
 }
 
@@ -875,7 +878,7 @@ pub(crate) fn script_kill_pgrp_with_guard(
     source: &Cap<ProcessIdentity>,
     pgrp: &Cap<ProcessGroup>,
     sig: Signum,
-    guard: &tx_substrate::epoch::Guard<'_>,
+    guard: &Guard<'_>,
 ) -> Result<u32, Errno> {
     let source_cred = source
         .upgrade_operational()
@@ -964,14 +967,14 @@ pub fn deliver_tty_dispatch(
     source: &Cap<ProcessIdentity>,
     dispatch: crate::tty::execution::SignalDispatch,
 ) -> Result<DispatchOutcome, Errno> {
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     deliver_tty_dispatch_with_guard(source, dispatch, &guard)
 }
 
 pub fn deliver_tty_dispatch_with_guard(
     source: &Cap<ProcessIdentity>,
     dispatch: crate::tty::execution::SignalDispatch,
-    guard: &tx_substrate::epoch::Guard<'_>,
+    guard: &Guard<'_>,
 ) -> Result<DispatchOutcome, Errno> {
     let Some(weak) = dispatch.target.pgrp_weak() else {
         return Ok(DispatchOutcome::NoTypedPgrp);
@@ -1002,14 +1005,14 @@ pub struct KillProcessOp {
     pub sig: Signum,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for KillProcessOp {
+impl<I: SubjectIdentity> StepOp<I> for KillProcessOp {
     type Output = KillOutcome;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_kill_process(&self.target, self.sig))
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_kill_process(&self.target, self.sig))
     }
 }
 
@@ -1019,14 +1022,14 @@ pub struct KillPgrpOp {
     pub sig: Signum,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for KillPgrpOp {
+impl<I: SubjectIdentity> StepOp<I> for KillPgrpOp {
     type Output = usize;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_kill_pgrp(&self.pgrp, self.sig))
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_kill_pgrp(&self.pgrp, self.sig))
     }
 }
 
@@ -1037,14 +1040,14 @@ pub struct SigactionOp {
     pub disposition: SigDisposition,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SigactionOp {
+impl<I: SubjectIdentity> StepOp<I> for SigactionOp {
     type Output = SigDispositionChange;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_sigaction(
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_sigaction(
             &self.process,
             self.sig,
             self.disposition,
