@@ -455,6 +455,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tx-platform-adapter"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "tx-policy"
 version = "0.1.0"
 

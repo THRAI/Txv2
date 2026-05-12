@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, String>;
 
+mod boundary_report;
 mod check_build;
 mod ci;
 mod doctor;
@@ -47,6 +48,7 @@ pub fn run() -> Result<()> {
         "submit" => submit::submit(&root, args.collect()),
         "progress" => progress::progress(&root, args.collect()),
         "lint" => lint::lint(&root, args.collect()),
+        "boundary-report" => boundary_report::boundary_report(&root, args.collect()),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -79,7 +81,8 @@ fn print_usage() {
            cargo xtask progress new plan|handoff|worktree --id ID --title TITLE [...]\n\
            cargo xtask progress claim plan|worktree --id ID --owner NAME --scope PATH [--scope PATH]\n\
            cargo xtask progress close plan|handoff|worktree --id ID --status STATUS\n\
-           cargo xtask lint arch|docs|unused\n"
+           cargo xtask lint arch|docs|unused\n   \
+           cargo xtask boundary-report [--top N] [--json]\n"
     );
 }
 

@@ -4,6 +4,26 @@
 
 ## Current Shape
 
+- 2026-05-12 D16 Platform-adapter boundary tooling LANDED. Adds
+  `cargo xtask boundary-report` (xtask/src/boundary_report.rs) which
+  scans `crates/**/*.rs` and produces the Architecture Boundary
+  Report — raw substrate/reactor calls outside vs. inside adapter
+  modules, per sub-API fan-in, top per-file offenders. Adds the
+  `tx-platform-adapter` proc-macro crate exporting
+  `#[platform_adapter(platform = ..., domain = ..., reason = ..., apis = ...)]`
+  which validates args (snake_case domain, ≥12-char reason, known
+  platforms) and injects a `pub const __PLATFORM_ADAPTER` manifest
+  into each annotated inline module. Baseline counts (no adapters
+  yet): substrate 2547 lines / 164 files outside, reactor 72 / 41;
+  `step_v3` alone is 1948 (76%). **Verified:** `cargo test -p
+  tx-platform-adapter` 11 unit + 3 expansion pass; `cargo test -p
+  xtask --lib boundary_report::` 8 pass; `cargo xtask lint arch` ok;
+  host workspace builds clean. ADR:
+  `2026-05-12-d16-platform-adapter-boundary-tooling.md`. **Next:**
+  begin per-subsystem `step_adapter` migration (vfs, tty,
+  process, page_backed, pipe, mount, futex, signal, cred, tmpfs,
+  devfs) so the outside-adapter number burns down.
+
 - 2026-05-12 D12 Phase B (PR-2 scaffolding dead-code allowance)
   LANDED. Closes the D13 follow-up: the 26 PR-2 `StepOp` adapter
   wraps in `tx-subsystems/{page_backed,tty/execution}/` now carry
