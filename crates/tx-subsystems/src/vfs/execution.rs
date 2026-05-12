@@ -644,8 +644,10 @@ mod step_op_wraps {
         OpenFileIoctlCaller, OpenFileIoctlResult, RNode, RNodeBacking, StructPayload,
     };
     use crate::zones;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
-    use tx_substrate::zone::{self as zone_mod, Cap, PayloadCap};
+    use crate::vfs::adapter::step_engine::{
+        guard, reserve_for, sign_for, Cap, PayloadCap, ProcessIdentity, ScriptCtx, StepOp,
+        StepOutcome as V3,
+    };
 
     struct EchoOps;
 
@@ -711,13 +713,13 @@ mod step_op_wraps {
     }
 
     fn make_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
-        let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
-        let payload = PayloadCap::from_cap(zone_mod::sign_for(
+        let id_res = reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload = PayloadCap::from_cap(sign_for(
             payload_res,
             TtyPayload::new_hardware(&ECHO_BINDING),
         ));
-        let identity = zone_mod::sign_for(
+        let identity = sign_for(
             id_res,
             TtyIdentity::new(TtyKind::SerialHardware, index, name),
         );
@@ -771,7 +773,7 @@ mod step_op_wraps {
     #[test]
     fn read_op_delegates_to_step_read() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_char_open_file(true, false);
         let mut buf = [0u8; 4];
         let mut op = OpenFileReadOp {
@@ -779,7 +781,7 @@ mod step_op_wraps {
             out: &mut buf,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Done(n) => {
                 assert_eq!(n, 1);
@@ -792,7 +794,7 @@ mod step_op_wraps {
     #[test]
     fn read_op_propagates_einval_when_not_readable() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_char_open_file(false, true);
         let mut buf = [0u8; 4];
         let mut op = OpenFileReadOp {
@@ -800,7 +802,7 @@ mod step_op_wraps {
             out: &mut buf,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Err(e) => assert_eq!(e, Errno::EINVAL),
             other => panic!("expected Err(EINVAL), got {other:?}"),
@@ -810,14 +812,14 @@ mod step_op_wraps {
     #[test]
     fn write_op_delegates_to_step_write() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_char_open_file(false, true);
         let mut op = OpenFileWriteOp {
             file: &file,
             bytes: b"hello",
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Done(n) => assert_eq!(n, 5),
             other => panic!("expected Done(5), got {other:?}"),
@@ -827,14 +829,14 @@ mod step_op_wraps {
     #[test]
     fn write_op_propagates_einval_when_not_writable() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_char_open_file(true, false);
         let mut op = OpenFileWriteOp {
             file: &file,
             bytes: b"hi",
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Err(e) => assert_eq!(e, Errno::EINVAL),
             other => panic!("expected Err(EINVAL), got {other:?}"),
@@ -844,7 +846,7 @@ mod step_op_wraps {
     #[test]
     fn lseek_op_on_non_seekable_returns_espipe() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_char_open_file(true, false);
         let mut op = OpenFileLseekOp {
             file: &file,
@@ -852,7 +854,7 @@ mod step_op_wraps {
             whence: 0,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Err(e) => assert_eq!(e, Errno::ESPIPE),
             other => panic!("expected Err(ESPIPE), got {other:?}"),
@@ -862,7 +864,7 @@ mod step_op_wraps {
     #[test]
     fn lseek_op_on_directory_returns_eisdir() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_dir_open_file(true);
         let mut op = OpenFileLseekOp {
             file: &file,
@@ -870,7 +872,7 @@ mod step_op_wraps {
             whence: 0,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Err(e) => assert_eq!(e, Errno::EISDIR),
             other => panic!("expected Err(EISDIR), got {other:?}"),
@@ -880,7 +882,7 @@ mod step_op_wraps {
     #[test]
     fn ioctl_op_on_chardev_returns_enosys() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_char_open_file(true, true);
         // Construct an OpenFileIoctlCaller that does not require a real
         // process — `step_ioctl` short-circuits on chardev backings
@@ -900,7 +902,7 @@ mod step_op_wraps {
             request: OpenFileIoctl::Tcgets,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Err(e) => assert_eq!(e, Errno::ENOSYS),
             other => panic!("expected Err(ENOSYS), got {other:?}"),
@@ -910,7 +912,7 @@ mod step_op_wraps {
     #[test]
     fn ioctl_op_on_tty_returns_termios() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_tty_open_file(true, true, 7, "ttyS7-wraptest");
         crate::process::execution::reset_init_process_for_test();
         crate::process::structure::reset_pid_counter_for_test();
@@ -926,7 +928,7 @@ mod step_op_wraps {
             request: OpenFileIoctl::Tcgets,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Done(OpenFileIoctlResult::Termios(_)) => {}
             other => panic!("expected Done(Termios), got {other:?}"),
