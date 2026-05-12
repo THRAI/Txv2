@@ -553,6 +553,26 @@ impl<P: TxPlatform> CoreInit<P> {
                 None => break,
             };
 
+            // EBR drain. Caps retired during the task polls above
+            // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd
+            // table teardown, `Cap<ProcessPayload>` from
+            // `step_exit_group`) sit in the per-CPU retired list until
+            // an epoch advance lets them be reclaimed. Without this
+            // call, the retired list only auto-drains at
+            // `RETIRE_THRESHOLD = 64` items — too high for short
+            // pipelines, so `Drop for OpenFile`'s
+            // `decr_reader`/`decr_writer` (which signal pipe EOF/EPIPE
+            // by notifying the peer wait-source) never fires and
+            // blocked readers/writers hang.
+            //
+            // A bounded budget per iteration keeps per-iteration
+            // latency predictable. Two-level deferral chains
+            // (ProcessPayload → fd table → OpenFile) need ~4 drain
+            // rounds to fully propagate; iteration cadence (driven by
+            // task polls + 5 ms timer ticks) finishes that in well
+            // under a millisecond.
+            let drain_stats = tx_substrate::epoch::drain_with_budget(64);
+
             // DIAGNOSTIC: dump counters every Nth loop iteration so we
             // see flow even when busybox spins on a userspace-side
             // loop or fast-yielding syscall chain.
@@ -600,7 +620,13 @@ impl<P: TxPlatform> CoreInit<P> {
                 }
             }
 
-            if step.should_idle() && !init.is_zombie() {
+            // Don't enter WFI if EBR reclaimed anything (reclaim callbacks
+            // may have called wake_by_ref() on parked tasks, which is
+            // invisible to step.should_idle() computed before the drain) or
+            // if there are items still pending reclamation (need more epoch
+            // advances before they can be reclaimed).
+            let ebr_active = drain_stats.reclaimed > 0 || drain_stats.remaining > 0;
+            if step.should_idle() && !ebr_active && !init.is_zombie() {
                 P::wait_for_interrupt_once();
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);

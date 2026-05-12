@@ -1,8 +1,45 @@
 # txKernel Status
 
-**Updated:** 2026-05-12
+**Updated:** 2026-05-13
 
 ## Current Shape
+
+- 2026-05-13 D15 pipe-EOF + WFI-drain-interlock LANDED. Two-bug
+  fix; `tools/shell-tests/busybox-prompt.txt` 28/28 on QEMU.
+
+  **Bug 1 (EBR drain missing):** `Drop for OpenFile`'s pipe
+  lifecycle hooks (`decr_reader` / `decr_writer`) only fire after
+  EBR reclaims the zone slot — requiring the global epoch to
+  advance ≥ 2 past retirement. The boot reactor never called
+  `epoch::drain_with_budget`; the auto-drain at
+  `RETIRE_THRESHOLD = 64` is never tripped by a short pipeline.
+  Result: `writer_count` stays at 1 after `echo` exits, the pipe's
+  `reader_wait_source.notify` for EOF never fires, `cat` blocks
+  forever in `step_read`, and the shell's `wait4(-1)` blocks behind
+  it. **Fix:** one bounded drain
+  (`tx_substrate::epoch::drain_with_budget(64)`) per iteration of
+  `run_userspace_reactor_loop` after `step_boot_reactor_once`
+  returns (`crates/tx-kernel/src/init/exec.rs`).
+
+  **Bug 2 (WFI swallows EBR wakes):** Even with the drain in place,
+  EBR reclaim callbacks call `wake_by_ref()` on parked tasks (cat
+  woken at `writer_count→0`), but `step.should_idle()` was computed
+  *before* the drain. The reactor then entered WFI immediately,
+  stranding the wake permanently since no timer was armed. **Fix:**
+  gate WFI on `!(drain_stats.reclaimed > 0 || drain_stats.remaining
+  > 0)` — skip WFI whenever the drain reclaimed anything or has
+  pending items; the next `step_boot_reactor_once` call picks up
+  woken tasks via `drain_wakes_for_hart`.
+
+  **Verified:** `cargo build -p tx-kernel-riscv64-qemu-virt
+  --target riscv64gc-unknown-none-elf` clean; `cargo test
+  --workspace --lib --tests -- --test-threads=1` 0 failures;
+  `cargo xtask shell-test --target rv64-qemu --script
+  tools/shell-tests/busybox-prompt.txt` 28/28 directives pass
+  (boot → bare-LF → true → echo hello-v3 → pwd → ls / →
+  echo pipe-ok | cat → true && echo done → quit).
+  **Next step:** none for this bug cluster. Shell prompt milestone
+  complete.
 
 - 2026-05-12 D12 Phase B (PR-2 scaffolding dead-code allowance)
   LANDED. Closes the D13 follow-up: the 26 PR-2 `StepOp` adapter
