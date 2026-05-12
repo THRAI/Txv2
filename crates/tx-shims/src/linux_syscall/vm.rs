@@ -399,7 +399,7 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // Loop on the canonical wait-carrier discipline mirroring
     // `sys_write` — fresh epoch guard inside the call site, never
     // crossing an `.await`.
-    use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
+    use step_engine::{StepOutcome as V3, YieldShape};
     loop {
         let outcome = {
             let guard = step_engine::guard();
@@ -549,7 +549,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sysc
                     let guard = step_engine::guard();
                     tx_subsystems::futex::step_futex_wait(uaddr, val, &guard)
                 };
-                use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
+                use step_engine::{StepOutcome as V3, YieldShape};
                 match outcome {
                     V3::Done(()) => {
                         return SyscallResult::Return(0);

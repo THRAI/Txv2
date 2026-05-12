@@ -228,7 +228,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // `poll_walker_synchronously` helper that the file-mode arms also
     // use; every in-tree walker backend resolves immediately so the
     // noop-waker poll always returns `Ready`.
-    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, StepOutcome as V3};
     let walk_first = {
         let guard = step_engine::guard();
         let outcome =
@@ -465,7 +465,7 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     // not (yet) read authority receive the same context shape so
     // future authority-bearing arms compose. Restrictions cap is a
     // fresh placeholder until PR-K (D5 §7).
-    use tx_substrate::step_v3::{StepOp, StepOutcome as V3Pipe};
+    use step_engine::{StepOp, StepOutcome as V3Pipe};
     use tx_subsystems::pipe::Pipe2Op;
     let mut script_ctx = build_subject_script_ctx(ctx);
     let (reader_cap, writer_cap) = {

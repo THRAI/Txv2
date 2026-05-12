@@ -159,7 +159,7 @@ pub(super) async fn step_signalfd_read(
             let result = signalfd_read(sfd_cap, &mut staging, nonblocking);
             (result, staging)
         };
-        use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
+        use step_engine::{StepOutcome as V3Out, YieldShape};
         match outcome.0 {
             V3Out::Done(read) => {
                 if read == 0 {
