@@ -38,14 +38,51 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use tx_reactor::wait::{Channel, Mask};
-use tx_substrate::step_v3::{
-    ByteProgress, DelegateRegistry, DelegateTokenId, Errno as V3Errno, InterestMask, StepOutcome,
-    WaitSourceId,
+mod adapter {
+    use tx_platform_adapter::platform_adapter;
+
+    #[platform_adapter(
+        platform = "substrate",
+        domain = "step_engine",
+        apis = ["step_v3", "zone", "wake"],
+        reason = "expose substrate step engine outcome/error types, delegate registry, WaitSource, TaskMailbox, zone allocation, and SpinMutex for userfaultfd pending-fault queue and step_ufd_read"
+    )]
+    pub mod step_engine {
+        use tx_substrate::zone;
+
+        pub use tx_substrate::step_v3::{
+            ByteProgress, DelegateRegistry, DelegateTokenId, Errno as V3Errno, InterestMask,
+            StepOutcome, WaitSourceId,
+        };
+        pub use tx_substrate::wake::{TaskMailbox, WaitSource};
+        pub use tx_substrate::zone::{Cap, Zone, ZoneAllocated, ZoneError};
+        pub use tx_substrate::SpinMutex;
+
+        pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
+            let reservation = zone::reserve_for::<T>()?;
+            Ok(zone::sign_for(reservation, value))
+        }
+
+        pub fn register_zone_for<T: ZoneAllocated>() -> Result<(), ZoneError> {
+            zone::register_zone_for::<T>().map(|_| ())
+        }
+    }
+
+    #[platform_adapter(
+        platform = "reactor",
+        domain = "wait_routing",
+        reason = "wrap reactor Channel/Mask as userfaultfd legacy read-readiness wake channel"
+    )]
+    pub mod wait_routing {
+        pub use tx_reactor::wait::{Channel, Mask};
+    }
+}
+
+use adapter::step_engine::{
+    sign_zone_for, ByteProgress, Cap, DelegateRegistry, DelegateTokenId, InterestMask, SpinMutex,
+    StepOutcome, TaskMailbox, V3Errno, WaitSource, WaitSourceId, Zone, ZoneAllocated, ZoneError,
 };
-use tx_substrate::wake::WaitSource;
-use tx_substrate::zone::{self, Cap, Zone, ZoneAllocated, ZoneError};
-use tx_substrate::SpinMutex;
+use adapter::wait_routing::{Channel, Mask};
 
 use crate::wait_source;
 
@@ -281,8 +318,7 @@ impl UserfaultFd {
     /// (PR-10 phase 2). Companion to [`Self::with_flags`] for the
     /// `sys_userfaultfd(2)` arm.
     pub fn new_with_flags_cap(open_flags: u32) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(reservation, Self::with_flags(open_flags)))
+        sign_zone_for(Self::with_flags(open_flags))
     }
 
     /// Snapshot the stable per-ufd id. Phase 0 callers use this only
@@ -572,7 +608,7 @@ pub struct ProcessUfdDispatch<'a> {
     /// Faulting thread's mailbox (held `Weak` so the script frame's
     /// teardown does not pin a dead mailbox alive — see PR-7B
     /// invariant on `mark_replied`'s `Weak::upgrade` semantics).
-    mailbox: alloc::sync::Weak<tx_substrate::wake::TaskMailbox>,
+    mailbox: alloc::sync::Weak<TaskMailbox>,
     /// Cached cap clone produced by `resolve`. The cap is held inside
     /// the dispatcher across the `await_agent_reply` window so the
     /// returned `UfdDispatchTarget`'s `&UserfaultFd` borrow remains
@@ -612,7 +648,7 @@ impl<'a> ProcessUfdDispatch<'a> {
     /// or equivalent).
     pub fn new(
         process: &'a Cap<crate::process::ProcessIdentity>,
-        mailbox: alloc::sync::Weak<tx_substrate::wake::TaskMailbox>,
+        mailbox: alloc::sync::Weak<TaskMailbox>,
     ) -> Self {
         Self {
             process,
@@ -698,7 +734,7 @@ unsafe impl ZoneAllocated for UserfaultFd {
 }
 
 pub(crate) fn register_zones() -> Result<(), ZoneError> {
-    zone::register_zone_for::<UserfaultFd>()?;
+    adapter::step_engine::register_zone_for::<UserfaultFd>()?;
     Ok(())
 }
 
