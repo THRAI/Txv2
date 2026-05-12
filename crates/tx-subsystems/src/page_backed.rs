@@ -441,7 +441,11 @@ impl PageContainer {
             }
             V3::Yield {
                 progress: _,
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => V3::yield_on_wait_source(NoProgress, carrier.raw(), interests.raw()),
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
@@ -675,7 +679,11 @@ fn step_range(
                 offset += chunk as u64;
             }
             tx_substrate::step_v3::StepOutcome::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => {
                 if advanced == 0 {
@@ -731,8 +739,8 @@ pub struct ReadOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ReadOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ReadOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;
@@ -752,8 +760,8 @@ pub struct WriteOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for WriteOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for WriteOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;

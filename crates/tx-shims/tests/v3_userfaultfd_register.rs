@@ -199,10 +199,7 @@ fn dispatch_userfaultfd(ctx: &SyscallCtx<'_>, flags: u32) -> SyscallResult {
 }
 
 fn dispatch_uffdio_api(ctx: &SyscallCtx<'_>, ufd_fd: u32, argp: u64) -> SyscallResult {
-    let req = SyscallRequest::new(
-        NR_IOCTL,
-        [ufd_fd as u64, UFFDIO_API as u64, argp, 0, 0, 0],
-    );
+    let req = SyscallRequest::new(NR_IOCTL, [ufd_fd as u64, UFFDIO_API as u64, argp, 0, 0, 0]);
     block_on(dispatch::<StubPmap>(req, ctx))
 }
 
@@ -496,7 +493,10 @@ fn uffdio_register_valid_range_tags_vma_and_writes_ioctls() {
     assert_eq!(reg.mode, UFFDIO_REGISTER_MODE_MISSING);
 
     // VMA tagged with ufd id + MISSING mode.
-    let entry_after = ctx.aspace.lookup(vma_range.start()).expect("vma still present");
+    let entry_after = ctx
+        .aspace
+        .lookup(vma_range.start())
+        .expect("vma still present");
     let tag = entry_after
         .ufd_registration
         .expect("vma must carry ufd_registration after register");

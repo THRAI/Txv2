@@ -1285,8 +1285,7 @@ pub const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 /// bit 0x04 for `UFFDIO_ZEROPAGE`, and bit 0x07 for
 /// `UFFDIO_CONTINUE`. Phase 5 grows the bitmap to include
 /// `UFFDIO_CONTINUE` now that the handler is wired.
-pub const UFFDIO_REGISTER_REPLY_IOCTLS: u64 =
-    (1u64 << 0x03) | (1u64 << 0x04) | (1u64 << 0x07);
+pub const UFFDIO_REGISTER_REPLY_IOCTLS: u64 = (1u64 << 0x03) | (1u64 << 0x04) | (1u64 << 0x07);
 
 // =====================================================================
 // PR-11 phase 1 — AIO syscall numbers

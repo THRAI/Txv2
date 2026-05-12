@@ -178,10 +178,7 @@ pub enum MailboxEvent {
     /// - `thread_runtime::execution::set_thread_zombie`
     ///   (terminal-state notification so a parked future observes
     ///   `summary.termination` and resolves to `Killed`/`Interrupted`).
-    SignalDelivered {
-        signum: u32,
-        routing: SignalRouting,
-    },
+    SignalDelivered { signum: u32, routing: SignalRouting },
 }
 
 /// Bounded MPSC queue capacity for a single mailbox.
@@ -518,20 +515,17 @@ mod tests {
         use core::task::{RawWaker, RawWakerVTable};
 
         unsafe fn clone(p: *const ()) -> RawWaker {
-            let arc =
-                unsafe { Arc::from_raw(p as *const core::sync::atomic::AtomicBool) };
+            let arc = unsafe { Arc::from_raw(p as *const core::sync::atomic::AtomicBool) };
             let cloned = Arc::clone(&arc);
             let _ = Arc::into_raw(arc);
             RawWaker::new(Arc::into_raw(cloned) as *const (), &VTABLE)
         }
         unsafe fn wake(p: *const ()) {
-            let arc =
-                unsafe { Arc::from_raw(p as *const core::sync::atomic::AtomicBool) };
+            let arc = unsafe { Arc::from_raw(p as *const core::sync::atomic::AtomicBool) };
             arc.store(true, Ordering::Release);
         }
         unsafe fn wake_by_ref(p: *const ()) {
-            let arc =
-                unsafe { Arc::from_raw(p as *const core::sync::atomic::AtomicBool) };
+            let arc = unsafe { Arc::from_raw(p as *const core::sync::atomic::AtomicBool) };
             arc.store(true, Ordering::Release);
             let _ = Arc::into_raw(arc);
         }

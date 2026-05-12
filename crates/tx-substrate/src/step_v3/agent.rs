@@ -900,9 +900,7 @@ const fn abort_reason_for(state: DelegateState) -> Option<AbortReason> {
         DelegateState::Canceled => Some(AbortReason::Canceled),
         DelegateState::AgentDied => Some(AbortReason::AgentDied),
         DelegateState::TimedOut => Some(AbortReason::TimedOut),
-        DelegateState::Replied
-        | DelegateState::Pending
-        | DelegateState::ReplyInstalling => None,
+        DelegateState::Replied | DelegateState::Pending | DelegateState::ReplyInstalling => None,
     }
 }
 

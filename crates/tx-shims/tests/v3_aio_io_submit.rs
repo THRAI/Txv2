@@ -51,9 +51,7 @@ use tx_hal::{
 use tx_reactor::userspace::SyscallRequest;
 use tx_substrate::step_v3::OnBehalfOfAbort;
 use tx_substrate::zone::Cap;
-use tx_subsystems::aio::{
-    reset_context_id_counter_for_test, AioWorkerFuture, IOCB_CMD_PREAD,
-};
+use tx_subsystems::aio::{reset_context_id_counter_for_test, AioWorkerFuture, IOCB_CMD_PREAD};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
@@ -215,13 +213,12 @@ fn encode_iocb(
 /// `bootstrap_copy_from_user`). So we can stash bytes anywhere
 /// addressable in the test process's memory and pass kernel pointers
 /// as the "user VA" — the fallback path picks them up.
+#[allow(clippy::vec_box)] // stable per-element heap addresses; Vec growth must not invalidate
 fn stage_iocb_array(iocbs: &[[u8; 64]]) -> (u64, alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>>) {
     // Heap-allocate every iocb so the pointers are stable across the
     // syscall arm's read window.
-    let mut heap_iocbs: alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>> = iocbs
-        .iter()
-        .map(|b| alloc::boxed::Box::new(*b))
-        .collect();
+    let mut heap_iocbs: alloc::vec::Vec<alloc::boxed::Box<[u8; 64]>> =
+        iocbs.iter().map(|b| alloc::boxed::Box::new(*b)).collect();
     // The iocbpp array stores u64 pointer values.
     let mut pointers: alloc::vec::Vec<u64> = heap_iocbs
         .iter_mut()
@@ -250,10 +247,7 @@ fn io_setup_spawns_one_worker_per_context() {
     let ctx = make_ctx(proc_cap.clone(), thread);
 
     assert_eq!(worker_install_count_for_test(), 0);
-    let fd_a = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [8, 0, 0, 0, 0, 0]),
-    ) {
+    let fd_a = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [8, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -265,13 +259,10 @@ fn io_setup_spawns_one_worker_per_context() {
         .aio_context()
         .expect("aio_context accessor")
         .context_id();
-    let _ = take_worker_future_for_test(aio_a).expect("worker future stashed");
+    _ = take_worker_future_for_test(aio_a).expect("worker future stashed");
 
     // Second setup → second install.
-    let fd_b = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [8, 0, 0, 0, 0, 0]),
-    ) {
+    let fd_b = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [8, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -283,7 +274,7 @@ fn io_setup_spawns_one_worker_per_context() {
         .expect("aio_context accessor")
         .context_id();
     assert_ne!(aio_a, aio_b);
-    let _ = take_worker_future_for_test(aio_b).expect("worker future for fd_b stashed");
+    _ = take_worker_future_for_test(aio_b).expect("worker future for fd_b stashed");
 }
 
 /// `sys_io_submit` with `nr = 0` returns 0 without touching the queue.
@@ -294,10 +285,7 @@ fn io_submit_with_zero_nr_returns_zero() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -327,10 +315,7 @@ fn io_submit_admits_one_iocb_onto_the_queue() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -348,8 +333,8 @@ fn io_submit_admits_one_iocb_onto_the_queue() {
         .aio_context()
         .expect("aio_context accessor")
         .clone();
-    let worker = take_worker_future_for_test(aio.context_id())
-        .expect("worker future stashed by io_setup");
+    let worker =
+        take_worker_future_for_test(aio.context_id()).expect("worker future stashed by io_setup");
 
     let r = dispatch_call(
         &ctx,
@@ -379,10 +364,7 @@ fn worker_terminates_cleanly_when_abort_signal_trips() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -393,8 +375,8 @@ fn worker_terminates_cleanly_when_abort_signal_trips() {
         .aio_context()
         .expect("aio_context accessor")
         .clone();
-    let mut worker = take_worker_future_for_test(aio.context_id())
-        .expect("worker future stashed by io_setup");
+    let mut worker =
+        take_worker_future_for_test(aio.context_id()).expect("worker future stashed by io_setup");
 
     // Pump once — the worker enters the borrow and parks on the
     // empty queue (Pending).
@@ -431,10 +413,7 @@ fn io_submit_overflow_short_circuits_with_partial_admit() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [2, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [2, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -481,7 +460,9 @@ fn io_submit_against_non_aio_fd_returns_einval() {
     // either -EBADF (fd missing) or -EINVAL (fd present but
     // non-AIO).
     match r {
-        SyscallResult::Error(e) => assert!(e == 9 || e == 22, "expected -EBADF or -EINVAL, got {e}"),
+        SyscallResult::Error(e) => {
+            assert!(e == 9 || e == 22, "expected -EBADF or -EINVAL, got {e}")
+        }
         other => panic!("expected Error, got {other:?}"),
     }
 }
@@ -499,10 +480,7 @@ fn io_submit_iocb_arrived_notify_drives_worker_drain() {
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
-    let fd = match dispatch_call(
-        &ctx,
-        SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0]),
-    ) {
+    let fd = match dispatch_call(&ctx, SyscallRequest::new(NR_IO_SETUP, [4, 0, 0, 0, 0, 0])) {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
@@ -513,8 +491,7 @@ fn io_submit_iocb_arrived_notify_drives_worker_drain() {
         .aio_context()
         .expect("aio_context accessor")
         .clone();
-    let worker = take_worker_future_for_test(aio.context_id())
-        .expect("worker future stashed");
+    let worker = take_worker_future_for_test(aio.context_id()).expect("worker future stashed");
 
     // Submit two iocbs.
     let iocb_a = encode_iocb(0x1111, IOCB_CMD_PREAD, 0, 0, 0, 0);

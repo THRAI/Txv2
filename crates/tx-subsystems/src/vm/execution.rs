@@ -16,6 +16,7 @@ use crate::page_backed::{step_fsync, PageContainerKind};
 use crate::vm::checks::{
     require_disjoint_remap, require_fault_publication, require_fault_recipe, require_map_admission,
 };
+use crate::vm::structure::{PrivatePageError, PrivatePageSet};
 use crate::vm::{
     AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard, UserRange,
     VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization, VmFaultOutcome, VmMapCommit,
@@ -104,7 +105,21 @@ impl AddressSpace {
         for entry in parent_recipes {
             let private = !entry.flags.shared;
             let range = entry.range;
-            child.recipes.commit_map(entry, MapPlacement::RequireFree)?;
+            // Final-form lazy share-RO CoW (see plan).
+            let child_entry = if private {
+                match &entry.private {
+                    Some(parent_set) => {
+                        let child_set = parent_set.fork_share().map_err(VmMapError::Private)?;
+                        entry.clone().with_private(Some(child_set))
+                    }
+                    None => entry.clone(),
+                }
+            } else {
+                entry.clone()
+            };
+            child
+                .recipes
+                .commit_map(child_entry, MapPlacement::RequireFree)?;
             if private {
                 let _ = parent.pmap.teardown_range(range);
             }
@@ -166,7 +181,8 @@ impl AddressSpace {
         // This entrypoint preserves the pre-PR-10 fault-only behaviour
         // for callers that never need OnAgent (e.g. kernel-internal
         // fault scripts that have no userspace process context).
-        self.fault_script_with_ufd_dispatch(fault, NullUfdDispatch).await
+        self.fault_script_with_ufd_dispatch(fault, NullUfdDispatch)
+            .await
     }
 
     /// PR-10 phase 6 — production fault-script entrypoint.
@@ -240,7 +256,11 @@ impl AddressSpace {
                 {
                     V3StepOutcome::Done(guard) => guard,
                     V3StepOutcome::Yield {
-                        shape: YieldShape::OnWaitSource { source: carrier, interests },
+                        shape:
+                            YieldShape::OnWaitSource {
+                                source: carrier,
+                                interests,
+                            },
                         ..
                     } => {
                         await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
@@ -300,7 +320,11 @@ impl AddressSpace {
             {
                 V3StepOutcome::Done(guard) => guard,
                 V3StepOutcome::Yield {
-                    shape: YieldShape::OnWaitSource { source: carrier, interests },
+                    shape:
+                        YieldShape::OnWaitSource {
+                            source: carrier,
+                            interests,
+                        },
                     ..
                 } => {
                     drop(materialization);
@@ -388,7 +412,11 @@ impl AddressSpace {
             {
                 V3StepOutcome::Done(guard) => guard,
                 V3StepOutcome::Yield {
-                    shape: YieldShape::OnWaitSource { source: carrier, interests },
+                    shape:
+                        YieldShape::OnWaitSource {
+                            source: carrier,
+                            interests,
+                        },
                     ..
                 } => {
                     await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
@@ -418,7 +446,11 @@ impl AddressSpace {
             {
                 V3StepOutcome::Done(guard) => guard,
                 V3StepOutcome::Yield {
-                    shape: YieldShape::OnWaitSource { source: carrier, interests },
+                    shape:
+                        YieldShape::OnWaitSource {
+                            source: carrier,
+                            interests,
+                        },
                     ..
                 } => {
                     await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
@@ -449,7 +481,11 @@ impl AddressSpace {
             ) {
                 V3StepOutcome::Done(pair) => pair,
                 V3StepOutcome::Yield {
-                    shape: YieldShape::OnWaitSource { source: carrier, interests },
+                    shape:
+                        YieldShape::OnWaitSource {
+                            source: carrier,
+                            interests,
+                        },
                     ..
                 } => {
                     let token = WaitToken::new(carrier.raw(), interests.raw());
@@ -553,7 +589,11 @@ impl AddressSpace {
         {
             V3StepOutcome::Done(guard) => guard,
             V3StepOutcome::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => {
                 return MapReserveResult::Blocked(WaitToken::new(carrier.raw(), interests.raw()));
@@ -564,6 +604,23 @@ impl AddressSpace {
         if let Err(error) = require_map_admission(self, &entry, placement) {
             return MapReserveResult::Err(error);
         }
+
+        // Auto-attach a fresh `PrivatePageSet` to private mappings that
+        // didn't already provide one (the call paths that don't go
+        // through `build_mmap_entry`, e.g. `register_recipe` in
+        // `vm::scripts`). Without this, private write faults would
+        // allocate pages straight into the pmap but skip the per-VmEntry
+        // CoW store — fork would then have nothing to share.
+        let entry = if !entry.flags.shared && entry.private.is_none() {
+            match PrivatePageSet::new_cap() {
+                Ok(set) => entry.with_private(Some(set)),
+                Err(e) => {
+                    return MapReserveResult::Err(VmMapError::Private(PrivatePageError::Zone(e)))
+                }
+            }
+        } else {
+            entry
+        };
 
         MapReserveResult::Reserved(MapReservation {
             aspace: self,
@@ -976,11 +1033,10 @@ fn materialize_ufd_copy(
     // bare-metal this is the linear-map VA of the freshly-allocated
     // frame; in tests the page_allocator's test backend installs a
     // direct-map hook that returns a usable `*mut u8`.
-    let dst_kernel_ptr =
-        tx_substrate::page_allocator::frame_kernel_addr(materialization.page.ppn)
-            .map_err(|alloc_err| {
-                VmFaultError::PageCache(crate::page_backed::PageCacheError::Alloc(alloc_err))
-            })?;
+    let dst_kernel_ptr = tx_substrate::page_allocator::frame_kernel_addr(materialization.page.ppn)
+        .map_err(|alloc_err| {
+            VmFaultError::PageCache(crate::page_backed::PageCacheError::Alloc(alloc_err))
+        })?;
     // Copy `len` bytes from the agent's `src` buffer into the
     // freshly-allocated frame. `len` is page-multiple and bounded to
     // a single page (the fault-script materializes one user page at
@@ -1001,12 +1057,7 @@ fn materialize_ufd_copy(
     //   kernel-bookkept storage, dst is a fresh frame just minted by
     //   `reserve_frame`.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            src_kernel_addr as *const u8,
-            dst_kernel_ptr,
-            copy_len,
-        );
+        core::ptr::copy_nonoverlapping(src_kernel_addr as *const u8, dst_kernel_ptr, copy_len);
     }
     Ok(materialization)
 }
-

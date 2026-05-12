@@ -21,9 +21,7 @@
 //!    non-blocking.
 
 use tx_subsystems::execution::Errno;
-use tx_subsystems::signalfd::{
-    signalfd_create, signalfd_read, SignalFd, SIGNALFD_SIGINFO_SIZE,
-};
+use tx_subsystems::signalfd::{signalfd_create, signalfd_read, SignalFd, SIGNALFD_SIGINFO_SIZE};
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::wait_source;
@@ -157,7 +155,7 @@ pub(super) async fn step_signalfd_read(
     loop {
         let outcome = {
             let mut staging = [0u8; SIGNALFD_SIGINFO_SIZE];
-            let result = signalfd_read(&sfd_cap, &mut staging, nonblocking);
+            let result = signalfd_read(sfd_cap, &mut staging, nonblocking);
             (result, staging)
         };
         use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
@@ -181,7 +179,11 @@ pub(super) async fn step_signalfd_read(
                 return SyscallResult::Error(errno_to_i32(errno));
             }
             V3Out::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => {
                 let token = WaitToken::new(carrier.raw(), interests.raw());

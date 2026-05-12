@@ -20,11 +20,7 @@ use crate::thread_runtime::structure::{
 /// already dropped its `TaskMailbox`. Idempotent — duplicate posts
 /// queue up but the future's poll consults `InterruptSummary`,
 /// which is the truth-bearing path.
-pub(crate) fn post_signal_mailbox(
-    payload: &ThreadPayload,
-    signum: Signum,
-    routing: SignalRouting,
-) {
+pub(crate) fn post_signal_mailbox(payload: &ThreadPayload, signum: Signum, routing: SignalRouting) {
     let Some(weak) = payload.mailbox_handle() else {
         return;
     };
@@ -286,9 +282,7 @@ pub struct ThreadExitOp {
     pub status: i32,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ThreadExitOp
-{
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for ThreadExitOp {
     type Output = ();
     type Progress = tx_substrate::step_v3::NoProgress;
     fn step(
@@ -307,9 +301,7 @@ pub struct SigprocmaskOp {
     pub next: SignalMask,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for SigprocmaskOp
-{
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SigprocmaskOp {
     type Output = SigprocmaskChange;
     type Progress = tx_substrate::step_v3::NoProgress;
     fn step(
@@ -317,7 +309,9 @@ impl<I: tx_substrate::step_v3::SubjectIdentity>
         _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
     ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
         tx_substrate::step_v3::StepOutcome::Done(step_sigprocmask(
-            &self.thread, self.how, self.next,
+            &self.thread,
+            self.how,
+            self.next,
         ))
     }
 }
@@ -359,7 +353,9 @@ mod step_op_wraps {
         AddressSpace::new_cap_for_platform::<TestPmap>().expect("fresh aspace")
     }
 
-    fn first_thread(proc_cap: &Cap<crate::process::structure::ProcessIdentity>) -> Cap<ThreadIdentity> {
+    fn first_thread(
+        proc_cap: &Cap<crate::process::structure::ProcessIdentity>,
+    ) -> Cap<ThreadIdentity> {
         let payload_guard = proc_cap.payload.lock();
         let payload = payload_guard.as_ref().expect("alive");
         let threads = payload.threads.lock();

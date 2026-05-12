@@ -31,7 +31,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use tx_reactor::wait::{Channel, Mask};
-use tx_substrate::step_v3::{InterestMask, WaitSourceId};
+use tx_substrate::step_v3::InterestMask;
 use tx_substrate::wake::WaitSource;
 use tx_substrate::zone::{Cap, Dead, Entity, PayloadCap, Weak, Zone, ZoneAllocated};
 use tx_substrate::SpinMutex;
@@ -576,10 +576,7 @@ impl ProcessIdentity {
     /// [`EXIT_SOURCE_CHILD_ZOMBIFIED`] to build the `WaitToken` it
     /// awaits via [`crate::wait_source::wait_on_token`].
     pub fn exit_source_id(&self) -> Option<u64> {
-        self.payload
-            .lock()
-            .as_ref()
-            .map(|p| p.exit_source_id())
+        self.payload.lock().as_ref().map(|p| p.exit_source_id())
     }
 
     /// Build the `WaitToken` an awaiter parks on while waiting for any
@@ -625,8 +622,7 @@ impl ProcessIdentity {
                 // WaitSource share the bit-namespace
                 // (`EXIT_SOURCE_CHILD_ZOMBIFIED` and future stop/cont
                 // bits land in both).
-                p.exit_wait_source()
-                    .notify(InterestMask::new(mask.bits()));
+                p.exit_wait_source().notify(InterestMask::new(mask.bits()));
                 released
             })
             .unwrap_or(0)

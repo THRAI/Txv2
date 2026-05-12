@@ -156,12 +156,7 @@ fn endpoint_death_walks_all_in_flight_tokens_for_that_endpoint() {
     let transitioned = registry.mark_endpoint_died(endpoint_marker);
     assert_eq!(transitioned, 4, "every in-flight token must transition");
 
-    for (guard, mb) in [
-        (&g1, &mb_1),
-        (&g2, &mb_2),
-        (&g3, &mb_3),
-        (&g4, &mb_4),
-    ] {
+    for (guard, mb) in [(&g1, &mb_1), (&g2, &mb_2), (&g3, &mb_3), (&g4, &mb_4)] {
         assert_eq!(
             registry.state(guard.id()),
             Some(DelegateState::AgentDied),
@@ -294,7 +289,7 @@ fn endpoint_death_wins_then_late_mark_replied_is_late_no_op() {
 #[test]
 fn endpoint_death_after_some_tokens_already_terminal_skips_them() {
     let registry = DelegateRegistry::new();
-    let endpoint_marker = 0xC0FF_EE_u64;
+    let endpoint_marker = 0x00C0_FFEE_u64;
 
     // Three tokens on the same endpoint.
     let mb_replied = Arc::new(TaskMailbox::new());
@@ -350,7 +345,10 @@ fn endpoint_death_after_some_tokens_already_terminal_skips_them() {
 
     // States: Replied / Canceled stand; live one moved to AgentDied.
     assert_eq!(registry.state(g_replied.id()), Some(DelegateState::Replied));
-    assert_eq!(registry.state(g_canceled.id()), Some(DelegateState::Canceled));
+    assert_eq!(
+        registry.state(g_canceled.id()),
+        Some(DelegateState::Canceled)
+    );
     assert_eq!(registry.state(g_live.id()), Some(DelegateState::AgentDied));
 
     // Mailbox accounting: no second event posted to the already-terminal
@@ -415,7 +413,10 @@ fn late_mark_replied_for_dead_endpoint_is_late_no_op_and_no_state_change() {
     // It MUST return LateNoOp(AgentDied) and MUST NOT change the
     // observable state of the registry or the mailbox.
     let outcome = registry.mark_replied(id, DelegateReply::placeholder());
-    assert_eq!(outcome, TransitionOutcome::LateNoOp(DelegateState::AgentDied));
+    assert_eq!(
+        outcome,
+        TransitionOutcome::LateNoOp(DelegateState::AgentDied)
+    );
 
     // State unchanged.
     assert_eq!(registry.state(id), snapshot_state);
@@ -594,7 +595,10 @@ fn endpoint_death_is_scoped_to_matching_endpoint_marker_only() {
         "sibling-b's token must remain Pending",
     );
     assert!(mb_sib_a.is_empty(), "no spurious wake to sibling-a");
-    assert!(mb_sib_a2.is_empty(), "no spurious wake to sibling-a (second)");
+    assert!(
+        mb_sib_a2.is_empty(),
+        "no spurious wake to sibling-a (second)"
+    );
     assert!(mb_sib_b.is_empty(), "no spurious wake to sibling-b");
 
     // And the surviving endpoints can still complete normally.

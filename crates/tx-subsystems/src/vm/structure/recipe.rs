@@ -423,12 +423,15 @@ fn rewrite_remap_disjoint(
         );
         let target_range = UserRange::new_aligned(target_start, overlap.len())
             .map_err(|_| VmMapError::InvalidRange)?;
-        moved.push(VmEntry::new(
-            target_range,
-            moving.prot,
-            moving.flags,
-            moving.backing,
-        ));
+        // Preserve the moving VmEntry's private CoW set (mapping
+        // identity follows the VmEntry across mremap-move per the
+        // plan). `moving.private` is the Cap for the sub-range
+        // produced by `split_for_protect`; it already covers exactly
+        // the pages being relocated.
+        moved.push(
+            VmEntry::new(target_range, moving.prot, moving.flags, moving.backing)
+                .with_private(moving.private),
+        );
     }
 
     for entry in moved {
@@ -570,5 +573,6 @@ pub(in crate::vm) fn vm_entry_error(error: VmEntryError) -> VmMapError {
     match error {
         VmEntryError::BackingOffsetOverflow => VmMapError::BackingOffsetOverflow,
         VmEntryError::Range(_) | VmEntryError::RangeNotContained => VmMapError::AlreadyMapped,
+        VmEntryError::Private(err) => VmMapError::Private(err),
     }
 }

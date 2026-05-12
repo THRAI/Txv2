@@ -247,7 +247,8 @@ impl SignalFd {
         // Fire both wake paths (D2/D4 coexistence, mirroring pipe.rs /
         // userfaultfd.rs):
         self.wait_channel.fire(Mask::from_bits(SIGNALFD_READABLE));
-        self.wait_source.notify(InterestMask::new(SIGNALFD_READABLE));
+        self.wait_source
+            .notify(InterestMask::new(SIGNALFD_READABLE));
         true
     }
 
@@ -380,11 +381,7 @@ pub fn signalfd_read(
     if nonblocking {
         return StepOutcome::err(V3Errno::EAGAIN);
     }
-    StepOutcome::yield_on_wait_source(
-        ByteProgress::EMPTY,
-        sfd.wait_source_id(),
-        SIGNALFD_READABLE,
-    )
+    StepOutcome::yield_on_wait_source(ByteProgress::EMPTY, sfd.wait_source_id(), SIGNALFD_READABLE)
 }
 
 /// Serialize a single `Signum` into a 128-byte

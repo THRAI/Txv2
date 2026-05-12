@@ -81,7 +81,7 @@ pub fn step_read(
     }
 
     let vmin_policy = payload.with_termios(|termios| {
-        STEP_READ_LAST_LFLAG.store(termios.c_lflag as u32, Ordering::Relaxed);
+        STEP_READ_LAST_LFLAG.store(termios.c_lflag, Ordering::Relaxed);
         STEP_READ_LAST_VMIN.store(termios.c_cc[VMIN] as u32, Ordering::Relaxed);
         STEP_READ_LAST_VTIME.store(termios.c_cc[VTIME] as u32, Ordering::Relaxed);
         if termios.c_lflag & ICANON != 0 || termios.c_cc[VTIME] != 0 {
@@ -118,7 +118,7 @@ pub fn step_read(
     });
     if threshold_unmet {
         STEP_READ_THRESHOLD_UNMET.fetch_add(1, Ordering::Relaxed);
-    } else if copied == 0 && matches!(vmin_policy, None) {
+    } else if copied == 0 && vmin_policy.is_none() {
         STEP_READ_YIELD_NONCANON_EMPTY.fetch_add(1, Ordering::Relaxed);
     } else if copied > 0 {
         STEP_READ_DRAINED.fetch_add(1, Ordering::Relaxed);
@@ -202,14 +202,15 @@ pub fn step_read_for_process(
 // unchanged. The output buffer is held by `&'a mut [u8]`.
 
 /// `StepOp` wrap of [`step_read`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct ReadOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub out: &'a mut [u8],
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ReadOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ReadOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;
@@ -222,6 +223,7 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_read_for_caller`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct ReadForCallerOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub out: &'a mut [u8],
@@ -229,8 +231,8 @@ pub struct ReadForCallerOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ReadForCallerOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ReadForCallerOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;
@@ -243,6 +245,7 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_read_for_process`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct ReadForProcessOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub out: &'a mut [u8],
@@ -250,8 +253,8 @@ pub struct ReadForProcessOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ReadForProcessOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ReadForProcessOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;
@@ -312,8 +315,7 @@ mod step_op_wraps {
 
     fn alloc_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
         let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res =
-            zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
         let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(
             payload_res,
             TtyPayload::new_hardware(&NOOP_BINDING),

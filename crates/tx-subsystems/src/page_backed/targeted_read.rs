@@ -82,7 +82,11 @@ pub fn read_exact_at(
             V3::Done(m) => m,
             V3::Continue { .. } => return V3::err(Errno::EAGAIN.into()),
             V3::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => {
                 return V3::yield_on_wait_source(

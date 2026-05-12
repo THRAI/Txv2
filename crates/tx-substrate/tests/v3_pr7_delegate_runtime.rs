@@ -272,7 +272,10 @@ fn timed_out_blocks_subsequent_reply_as_late() {
 
     assert_eq!(registry.mark_timed_out(id), TransitionOutcome::Applied);
     let outcome = registry.mark_replied(id, DelegateReply::placeholder());
-    assert_eq!(outcome, TransitionOutcome::LateNoOp(DelegateState::TimedOut));
+    assert_eq!(
+        outcome,
+        TransitionOutcome::LateNoOp(DelegateState::TimedOut)
+    );
     // No reply slot installed.
     assert_eq!(registry.take_reply(id), None);
     let _ = guard.forget();

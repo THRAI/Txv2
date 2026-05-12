@@ -53,9 +53,8 @@ use tx_subsystems::vm::{
 use tx_subsystems::zones;
 
 use tx_shims::linux_syscall::numbers::{
-    NR_IOCTL, NR_READ, NR_USERFAULTFD, UFFDIO_API, UFFDIO_CONTINUE, UFFDIO_COPY,
-    UFFDIO_REGISTER, UFFDIO_REGISTER_MODE_MISSING, UFFDIO_ZEROPAGE, UFFD_API,
-    UFFD_EVENT_PAGEFAULT,
+    NR_IOCTL, NR_READ, NR_USERFAULTFD, UFFDIO_API, UFFDIO_CONTINUE, UFFDIO_COPY, UFFDIO_REGISTER,
+    UFFDIO_REGISTER_MODE_MISSING, UFFDIO_ZEROPAGE, UFFD_API, UFFD_EVENT_PAGEFAULT,
 };
 use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult};
 
@@ -222,16 +221,8 @@ fn dispatch_userfaultfd(ctx: &SyscallCtx<'_>, flags: u32) -> SyscallResult {
     block_on(dispatch::<StubPmap>(req, ctx))
 }
 
-fn dispatch_ioctl(
-    ctx: &SyscallCtx<'_>,
-    fd: u32,
-    request: u32,
-    argp: u64,
-) -> SyscallResult {
-    let req = SyscallRequest::new(
-        NR_IOCTL,
-        [fd as u64, request as u64, argp, 0, 0, 0],
-    );
+fn dispatch_ioctl(ctx: &SyscallCtx<'_>, fd: u32, request: u32, argp: u64) -> SyscallResult {
+    let req = SyscallRequest::new(NR_IOCTL, [fd as u64, request as u64, argp, 0, 0, 0]);
     block_on(dispatch::<StubPmap>(req, ctx))
 }
 
@@ -254,11 +245,13 @@ fn open_ufd_register_one_page(ctx: &SyscallCtx<'_>, base: usize) -> u32 {
         ioctls: 0,
     };
     let argp = (&mut api as *mut UffdioApi) as u64;
-    assert_eq!(dispatch_ioctl(ctx, fd, UFFDIO_API, argp), SyscallResult::Return(0));
+    assert_eq!(
+        dispatch_ioctl(ctx, fd, UFFDIO_API, argp),
+        SyscallResult::Return(0)
+    );
 
     // Install a private-anon VMA.
-    let range =
-        UserRange::new_aligned(UserVirtAddr(base), USER_PAGE_SIZE).expect("aligned range");
+    let range = UserRange::new_aligned(UserVirtAddr(base), USER_PAGE_SIZE).expect("aligned range");
     let req = VmMapRequest::fixed(
         range,
         MapPlacement::FixedReplace,
@@ -270,12 +263,18 @@ fn open_ufd_register_one_page(ctx: &SyscallCtx<'_>, base: usize) -> u32 {
 
     // Register.
     let mut reg = UffdioRegister {
-        range: UffdioRange { start: base as u64, len: USER_PAGE_SIZE as u64 },
+        range: UffdioRange {
+            start: base as u64,
+            len: USER_PAGE_SIZE as u64,
+        },
         mode: UFFDIO_REGISTER_MODE_MISSING,
         ioctls: 0,
     };
     let reg_argp = (&mut reg as *mut UffdioRegister) as u64;
-    assert_eq!(dispatch_ioctl(ctx, fd, UFFDIO_REGISTER, reg_argp), SyscallResult::Return(0));
+    assert_eq!(
+        dispatch_ioctl(ctx, fd, UFFDIO_REGISTER, reg_argp),
+        SyscallResult::Return(0)
+    );
     fd
 }
 
@@ -283,11 +282,7 @@ fn open_ufd_register_one_page(ctx: &SyscallCtx<'_>, base: usize) -> u32 {
 /// matching pending request in its DelegateRegistry. Mirrors the
 /// runtime path the phase-4 fault_script takes, without requiring a
 /// fault interceptor here.
-fn push_fault(
-    ctx: &SyscallCtx<'_>,
-    fd: u32,
-    fault_addr: u64,
-) {
+fn push_fault(ctx: &SyscallCtx<'_>, fd: u32, fault_addr: u64) {
     use tx_substrate::step_v3::{
         AgentCancelPolicy, DelegateRequest, TokenDropPolicy, UfdAccessKind, UfdRequest,
     };
@@ -341,7 +336,10 @@ fn uffdio_copy_without_handshake_returns_einval() {
         copy: 0,
     };
     let argp = (&mut req as *mut UffdioCopy) as u64;
-    assert_eq!(dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp), SyscallResult::Error(22));
+    assert_eq!(
+        dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp),
+        SyscallResult::Error(22)
+    );
 }
 
 /// `UFFDIO_COPY` with unaligned `dst` returns `-EINVAL`.
@@ -362,7 +360,10 @@ fn uffdio_copy_unaligned_dst_returns_einval() {
         copy: 0,
     };
     let argp = (&mut req as *mut UffdioCopy) as u64;
-    assert_eq!(dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp), SyscallResult::Error(22));
+    assert_eq!(
+        dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp),
+        SyscallResult::Error(22)
+    );
 }
 
 /// `UFFDIO_COPY` with `len = 0` returns `-EINVAL`.
@@ -383,7 +384,10 @@ fn uffdio_copy_zero_len_returns_einval() {
         copy: 0,
     };
     let argp = (&mut req as *mut UffdioCopy) as u64;
-    assert_eq!(dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp), SyscallResult::Error(22));
+    assert_eq!(
+        dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp),
+        SyscallResult::Error(22)
+    );
 }
 
 /// `UFFDIO_COPY` when no fault is pending returns `-EINVAL`.
@@ -403,7 +407,10 @@ fn uffdio_copy_no_pending_fault_returns_einval() {
         copy: 0,
     };
     let argp = (&mut req as *mut UffdioCopy) as u64;
-    assert_eq!(dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp), SyscallResult::Error(22));
+    assert_eq!(
+        dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp),
+        SyscallResult::Error(22)
+    );
 }
 
 /// `UFFDIO_COPY` with a matching pending fault drives `mark_replied`,
@@ -431,7 +438,10 @@ fn uffdio_copy_with_pending_fault_succeeds_and_drains_queue() {
         copy: 0,
     };
     let argp = (&mut req as *mut UffdioCopy) as u64;
-    assert_eq!(dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp), SyscallResult::Return(0));
+    assert_eq!(
+        dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp),
+        SyscallResult::Return(0)
+    );
 
     // Post-state: queue drained, writeback set.
     assert_eq!(ufd.pending_fault_count(), 0);
@@ -451,12 +461,18 @@ fn uffdio_zeropage_with_pending_fault_succeeds_and_drains_queue() {
     push_fault(&ctx, fd, base as u64);
 
     let mut req = UffdioZeropage {
-        range: UffdioRange { start: base as u64, len: USER_PAGE_SIZE as u64 },
+        range: UffdioRange {
+            start: base as u64,
+            len: USER_PAGE_SIZE as u64,
+        },
         mode: 0,
         zeropage: 0,
     };
     let argp = (&mut req as *mut UffdioZeropage) as u64;
-    assert_eq!(dispatch_ioctl(&ctx, fd, UFFDIO_ZEROPAGE, argp), SyscallResult::Return(0));
+    assert_eq!(
+        dispatch_ioctl(&ctx, fd, UFFDIO_ZEROPAGE, argp),
+        SyscallResult::Return(0)
+    );
 
     let open = ctx.process.fd(fd).expect("fd installed");
     let ufd = open.ufd().expect("ufd backing");
@@ -477,12 +493,18 @@ fn uffdio_continue_with_pending_fault_succeeds_and_drains_queue() {
     push_fault(&ctx, fd, base as u64);
 
     let mut req = UffdioContinue {
-        range: UffdioRange { start: base as u64, len: USER_PAGE_SIZE as u64 },
+        range: UffdioRange {
+            start: base as u64,
+            len: USER_PAGE_SIZE as u64,
+        },
         mode: 0,
         mapped: 0,
     };
     let argp = (&mut req as *mut UffdioContinue) as u64;
-    assert_eq!(dispatch_ioctl(&ctx, fd, UFFDIO_CONTINUE, argp), SyscallResult::Return(0));
+    assert_eq!(
+        dispatch_ioctl(&ctx, fd, UFFDIO_CONTINUE, argp),
+        SyscallResult::Return(0)
+    );
 
     let open = ctx.process.fd(fd).expect("fd installed");
     let ufd = open.ufd().expect("ufd backing");
@@ -511,7 +533,10 @@ fn uffdio_copy_mismatched_dst_returns_einval() {
         copy: 0,
     };
     let argp = (&mut req as *mut UffdioCopy) as u64;
-    assert_eq!(dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp), SyscallResult::Error(22));
+    assert_eq!(
+        dispatch_ioctl(&ctx, fd, UFFDIO_COPY, argp),
+        SyscallResult::Error(22)
+    );
 
     // Queue remained intact — the front message stayed.
     let open = ctx.process.fd(fd).expect("fd installed");

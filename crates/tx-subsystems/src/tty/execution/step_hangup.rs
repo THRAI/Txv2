@@ -68,13 +68,14 @@ pub fn step_hangup(
 // ---------------------------------------------------------------------------
 
 /// `StepOp` wrap of [`step_hangup`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct HangupOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for HangupOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for HangupOp<'a>
 {
     type Output = HangupOutcome;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -135,8 +136,7 @@ mod step_op_wraps {
 
     fn alloc_hardware_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
         let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res =
-            zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
         let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(
             payload_res,
             TtyPayload::new_hardware(&NOOP_BINDING),

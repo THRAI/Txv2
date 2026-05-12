@@ -16,14 +16,14 @@ use tx_substrate::step_v3::WaitSourceId;
 use tx_substrate::wake::WaitSource;
 
 use crate::aio::AioContext;
-use crate::io_uring::IoUring;
 use crate::cred::{CapabilitySet, Cred};
-use crate::signalfd::SignalFd;
 use crate::device::{BlockDeviceRegistration, CharDeviceBinding};
 use crate::execution::Errno;
+use crate::io_uring::IoUring;
 use crate::mount::{MountIdentity, MountPayload};
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
+use crate::signalfd::SignalFd;
 use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::TtyIdentity;
 use crate::tty::structure::{Termios, Winsize};
@@ -539,8 +539,7 @@ impl RNode {
         let read_wait_source = Arc::new(WaitSource::new(WaitSourceId::new(read_wait_source_id)));
         let write_wait_channel = Channel::new();
         let write_wait_source_id = wait_source::register_wait_channel(write_wait_channel.clone());
-        let write_wait_source =
-            Arc::new(WaitSource::new(WaitSourceId::new(write_wait_source_id)));
+        let write_wait_source = Arc::new(WaitSource::new(WaitSourceId::new(write_wait_source_id)));
         Self {
             fs_object_id,
             meta,
@@ -970,7 +969,10 @@ impl OpenFile {
         flags: OpenFileFlags,
     ) -> Result<Cap<Self>, ZoneError> {
         let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(reservation, Self::new_userfaultfd(ufd, flags)))
+        Ok(zone::sign_for(
+            reservation,
+            Self::new_userfaultfd(ufd, flags),
+        ))
     }
 
     /// Construct an AIO-context-backed `OpenFile` (PR-11 phase 1). The

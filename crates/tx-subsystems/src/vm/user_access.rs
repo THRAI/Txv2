@@ -622,7 +622,11 @@ fn resolve_user_page(
                 V3::Done(m) => ResolvePageOutcome::Done(m),
                 V3::Continue { .. } => ResolvePageOutcome::Err(Errno::EFAULT),
                 V3::Yield {
-                    shape: YieldShape::OnWaitSource { source: carrier, interests },
+                    shape:
+                        YieldShape::OnWaitSource {
+                            source: carrier,
+                            interests,
+                        },
                     ..
                 } => ResolvePageOutcome::Blocked(WaitToken::new(carrier.raw(), interests.raw())),
                 V3::Yield { .. } => ResolvePageOutcome::Err(Errno::EFAULT),

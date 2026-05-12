@@ -169,10 +169,7 @@ fn dispatch_userfaultfd(ctx: &SyscallCtx<'_>, flags: u32) -> SyscallResult {
 }
 
 fn dispatch_uffdio_api(ctx: &SyscallCtx<'_>, ufd_fd: u32, argp: u64) -> SyscallResult {
-    let req = SyscallRequest::new(
-        NR_IOCTL,
-        [ufd_fd as u64, UFFDIO_API as u64, argp, 0, 0, 0],
-    );
+    let req = SyscallRequest::new(NR_IOCTL, [ufd_fd as u64, UFFDIO_API as u64, argp, 0, 0, 0]);
     block_on(dispatch::<StubPmap>(req, ctx))
 }
 
@@ -201,7 +198,11 @@ fn sys_userfaultfd_returns_a_userfaultfd_backed_fd() {
     );
     let ufd = open_file.ufd().expect("ufd accessor");
     // ufd_id is monotonic from 1.
-    assert!(ufd.ufd_id() >= 1, "ufd_id must be positive, got {}", ufd.ufd_id());
+    assert!(
+        ufd.ufd_id() >= 1,
+        "ufd_id must be positive, got {}",
+        ufd.ufd_id()
+    );
     // Open-time flags are stashed (zero here).
     assert_eq!(ufd.open_flags(), 0);
     // Handshake bit starts cleared.
@@ -223,7 +224,10 @@ fn sys_userfaultfd_cloexec_sets_per_process_bit() {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
-    assert!(proc_cap.fd_cloexec(fd), "O_CLOEXEC must set the per-process cloexec bit");
+    assert!(
+        proc_cap.fd_cloexec(fd),
+        "O_CLOEXEC must set the per-process cloexec bit"
+    );
 }
 
 /// `sys_userfaultfd(bogus_bits)` rejects with `-EINVAL` (22).
@@ -261,7 +265,11 @@ fn uffdio_api_first_call_succeeds_and_marks_handshake_done() {
     };
     let argp = (&mut api as *mut UffdioApi) as u64;
     let result = dispatch_uffdio_api(&ctx, fd, argp);
-    assert_eq!(result, SyscallResult::Return(0), "UFFDIO_API returns 0 on success");
+    assert_eq!(
+        result,
+        SyscallResult::Return(0),
+        "UFFDIO_API returns 0 on success"
+    );
 
     // Writeback: features and ioctls cleared.
     assert_eq!(api.api, UFFD_API);
@@ -271,7 +279,10 @@ fn uffdio_api_first_call_succeeds_and_marks_handshake_done() {
     // Handshake bit flipped on the substrate side.
     let open_file = proc_cap.fd(fd).expect("fd still installed");
     let ufd = open_file.ufd().expect("ufd accessor");
-    assert!(ufd.api_handshake_done(), "UFFDIO_API must set the handshake bit");
+    assert!(
+        ufd.api_handshake_done(),
+        "UFFDIO_API must set the handshake bit"
+    );
 }
 
 /// A second `UFFDIO_API` against the same ufd returns `-EPERM` (1)
@@ -294,11 +305,18 @@ fn uffdio_api_second_call_returns_eperm() {
         ioctls: 0,
     };
     let argp = (&mut api as *mut UffdioApi) as u64;
-    assert_eq!(dispatch_uffdio_api(&ctx, fd, argp), SyscallResult::Return(0));
+    assert_eq!(
+        dispatch_uffdio_api(&ctx, fd, argp),
+        SyscallResult::Return(0)
+    );
 
     // Second call: already handshaken → EPERM (1).
     let result2 = dispatch_uffdio_api(&ctx, fd, argp);
-    assert_eq!(result2, SyscallResult::Error(1), "second UFFDIO_API → EPERM");
+    assert_eq!(
+        result2,
+        SyscallResult::Error(1),
+        "second UFFDIO_API → EPERM"
+    );
 }
 
 /// `UFFDIO_API` with the wrong api version returns `-EINVAL`.

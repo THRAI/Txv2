@@ -70,10 +70,12 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use tx_substrate::step_v3::{StepOp, StepOutcome as V3Out};
+use tx_substrate::zone::Cap;
+use tx_substrate::SpinMutex;
 use tx_subsystems::aio::{
-    is_valid_iocb_opcode, spawn_worker_for_context, AioContext, AioWorkerFuture, Iocb,
-    IocbDispatcher, IoEvent, EVENTS_AVAILABLE_MASK, IO_EVENT_BYTES, IOCB_CMD_PREAD,
-    IOCB_CMD_PWRITE,
+    is_valid_iocb_opcode, spawn_worker_for_context, AioContext, AioWorkerFuture, IoEvent, Iocb,
+    IocbDispatcher, EVENTS_AVAILABLE_MASK, IOCB_CMD_PREAD, IOCB_CMD_PWRITE, IO_EVENT_BYTES,
 };
 use tx_subsystems::execution::WaitToken;
 use tx_subsystems::process::ProcessIdentity;
@@ -82,9 +84,6 @@ use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::wait_source;
-use tx_substrate::step_v3::{StepOp, StepOutcome as V3Out};
-use tx_substrate::zone::Cap;
-use tx_substrate::SpinMutex;
 
 use super::{bootstrap_copy_from_user, bootstrap_copy_to_user, SyscallCtx, SyscallResult};
 use super::{EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
@@ -119,9 +118,7 @@ fn build_iocb_dispatcher(
     process: Cap<ProcessIdentity>,
     aspace: Cap<AddressSpace>,
 ) -> IocbDispatcher {
-    Arc::new(move |iocb: &Iocb| -> IoEvent {
-        dispatch_one_iocb(&process, &aspace, iocb)
-    })
+    Arc::new(move |iocb: &Iocb| -> IoEvent { dispatch_one_iocb(&process, &aspace, iocb) })
 }
 
 /// Per-iocb dispatch body. Called synchronously by the worker for each
@@ -173,11 +170,8 @@ fn dispatch_pread(
     match read_result {
         Ok(bytes) => {
             if bytes > 0 {
-                if let Err(errno) = bootstrap_copy_to_user(
-                    aspace,
-                    iocb.aio_buf,
-                    &staging[..bytes],
-                ) {
+                if let Err(errno) = bootstrap_copy_to_user(aspace, iocb.aio_buf, &staging[..bytes])
+                {
                     let _ = errno;
                     return IoEvent::new(cookie, cookie, NEG_EFAULT, 0);
                 }
@@ -340,11 +334,7 @@ fn build_owner_subject(ctx: &SyscallCtx<'_>) -> crate::KernelSubjectContext {
     let restrictions_cap = tx_subsystems::cred::placeholder_restrictions_cap()
         .expect("placeholder restrictions zone has capacity per syscall entry");
     let authority = crate::KernelSubjectAuthority::new(cred_cap, restrictions_cap);
-    crate::KernelSubjectContext::from_thread(
-        ctx.process.clone(),
-        ctx.thread.clone(),
-        authority,
-    )
+    crate::KernelSubjectContext::from_thread(ctx.process.clone(), ctx.thread.clone(), authority)
 }
 
 /// `io_setup(nr_events, ctx_idp)` syscall arm.
@@ -591,12 +581,7 @@ fn read_u16(bytes: &[u8], off: usize) -> u16 {
 }
 
 fn read_u32(bytes: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[off],
-        bytes[off + 1],
-        bytes[off + 2],
-        bytes[off + 3],
-    ])
+    u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
 }
 
 fn read_u64(bytes: &[u8], off: usize) -> u64 {
@@ -638,13 +623,10 @@ fn read_u64(bytes: &[u8], off: usize) -> u64 {
 /// `OnTimer` yield is phase 6 territory. Tests use `timeout = NULL`
 /// for blocking and `timeout = 1` (any non-zero pointer) for the
 /// non-blocking variant.
-pub(super) async fn sys_io_getevents<'a>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+pub(super) async fn sys_io_getevents<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let ctx_fd = args[0] as u32;
-    let min_nr = args[1] as u64;
-    let nr = args[2] as u64;
+    let min_nr = args[1];
+    let nr = args[2];
     let events_ptr = args[3];
     let timeout_ptr = args[4];
 
@@ -685,10 +667,7 @@ pub(super) async fn sys_io_getevents<'a>(
             break;
         }
         // Park on the events_available carrier and re-drain.
-        let token = WaitToken::new(
-            aio_cap.events_available_id(),
-            EVENTS_AVAILABLE_MASK,
-        );
+        let token = WaitToken::new(aio_cap.events_available_id(), EVENTS_AVAILABLE_MASK);
         if let Some(future) = wait_source::wait_on_token(token) {
             let _ = future.await;
         }

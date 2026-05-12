@@ -22,7 +22,6 @@ pub mod hart_loop;
 pub mod interrupt;
 pub mod mailbox;
 pub mod preempt;
-pub mod wait_source;
 mod runtime;
 pub mod scheduler;
 pub(crate) mod spin_lock;
@@ -31,6 +30,7 @@ pub mod task;
 pub mod timer;
 pub mod userspace;
 pub mod wait;
+pub mod wait_source;
 pub(crate) mod waker;
 mod yield_now;
 
@@ -41,9 +41,6 @@ pub use dispatch::{
 pub use mailbox::{
     ActiveWait, MailboxEvent, SignalRouting, TaskMailbox, WaitGeneration, MAILBOX_QUEUE_BOUND,
 };
-pub use wait_source::{
-    PreparedWaitRegistration, SubscriberId, WaitRegistrationGuard, WaitSource,
-};
 pub use runtime::{Reactor, RunIdleReport, RunStats, SharedReactor};
 pub use scheduler::{
     HartId, InitialSchedMeta, Phase1Scheduler, RunnablePlacement, SchedClass, SchedulerPolicy,
@@ -51,4 +48,5 @@ pub use scheduler::{
 };
 pub use task::{TaskDrainRecord, TaskId, TaskKey, TaskLifecycleError, TaskStatus};
 pub use timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
+pub use wait_source::{PreparedWaitRegistration, SubscriberId, WaitRegistrationGuard, WaitSource};
 pub use yield_now::{yield_now, YieldNow};

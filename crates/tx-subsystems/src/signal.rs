@@ -1002,9 +1002,7 @@ pub struct KillProcessOp {
     pub sig: Signum,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for KillProcessOp
-{
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for KillProcessOp {
     type Output = KillOutcome;
     type Progress = tx_substrate::step_v3::NoProgress;
     fn step(
@@ -1021,9 +1019,7 @@ pub struct KillPgrpOp {
     pub sig: Signum,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for KillPgrpOp
-{
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for KillPgrpOp {
     type Output = usize;
     type Progress = tx_substrate::step_v3::NoProgress;
     fn step(
@@ -1041,9 +1037,7 @@ pub struct SigactionOp {
     pub disposition: SigDisposition,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for SigactionOp
-{
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SigactionOp {
     type Output = SigDispositionChange;
     type Progress = tx_substrate::step_v3::NoProgress;
     fn step(

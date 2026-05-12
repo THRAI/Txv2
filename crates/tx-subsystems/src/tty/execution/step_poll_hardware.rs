@@ -70,7 +70,11 @@ pub fn step_poll_hardware_input(
             }),
             V3::Yield {
                 progress: _,
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => V3::yield_on_wait_source(NoProgress, carrier.raw(), interests.raw()),
             V3::Yield { shape, .. } => V3::Yield {
                 progress: NoProgress,
@@ -112,7 +116,11 @@ pub fn step_poll_hardware_input(
         }
         V3::Yield {
             progress,
-            shape: YieldShape::OnWaitSource { source: carrier, interests },
+            shape:
+                YieldShape::OnWaitSource {
+                    source: carrier,
+                    interests,
+                },
         } => {
             let read = progress.bytes().min(bytes.len());
             if read == 0 {
@@ -135,14 +143,15 @@ pub fn step_poll_hardware_input(
 // wrap lifetime.
 
 /// `StepOp` wrap of [`step_poll_hardware_input`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct PollHardwareInputOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub max_bytes: usize,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for PollHardwareInputOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for PollHardwareInputOp<'a>
 {
     type Output = HardwarePollOutcome;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -203,8 +212,7 @@ mod step_op_wraps {
 
     fn alloc_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
         let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res =
-            zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
         let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(
             payload_res,
             TtyPayload::new_hardware(&NOOP_BINDING),

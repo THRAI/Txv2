@@ -182,8 +182,7 @@ fn pselect_style_wait_resolves_interrupted_via_signal_mailbox() {
     let _ = epoch::drain_with_budget(usize::MAX);
     let _ = epoch::drain_with_budget(usize::MAX);
 
-    let proc_cap: Cap<ProcessIdentity> =
-        bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+    let proc_cap: Cap<ProcessIdentity> = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
     let leader = proc_cap.nth_thread(0).expect("leader");
     let leader_payload = leader.payload_cap().expect("live leader");
 

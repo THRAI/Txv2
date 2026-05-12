@@ -167,8 +167,7 @@ fn signal_mailbox_phase_a_plumbing() {
     let _ = epoch::drain_with_budget(usize::MAX);
     let _ = epoch::drain_with_budget(usize::MAX);
 
-    let proc_cap: Cap<ProcessIdentity> =
-        bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+    let proc_cap: Cap<ProcessIdentity> = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
     let leader = proc_cap.nth_thread(0).expect("leader thread");
     assert!(!leader.is_zombie());
 
@@ -212,10 +211,7 @@ fn signal_mailbox_phase_a_plumbing() {
         step_kill_process(&proc_cap, Signum::SIGSTOP),
         KillOutcome::Delivered,
     );
-    let summary_after_stop = leader
-        .payload_cap()
-        .expect("alive")
-        .interrupt_summary();
+    let summary_after_stop = leader.payload_cap().expect("alive").interrupt_summary();
     assert!(
         summary_after_stop.stop_requested,
         "route_gewalt sets stop_requested on each live thread (D2 coexistence)"
@@ -234,10 +230,7 @@ fn signal_mailbox_phase_a_plumbing() {
         step_kill_process(&proc_cap, Signum::SIGCONT),
         KillOutcome::Delivered,
     );
-    let summary_after_cont = leader
-        .payload_cap()
-        .expect("alive")
-        .interrupt_summary();
+    let summary_after_cont = leader.payload_cap().expect("alive").interrupt_summary();
     assert!(
         !summary_after_cont.stop_requested,
         "SIGCONT clears stop_requested",
@@ -255,10 +248,7 @@ fn signal_mailbox_phase_a_plumbing() {
     // updates; no panic / UB.
     drop(leader_mailbox);
     post_signal(&leader, Signum::SIGINT);
-    let summary_after_dangling = leader
-        .payload_cap()
-        .expect("alive")
-        .interrupt_summary();
+    let summary_after_dangling = leader.payload_cap().expect("alive").interrupt_summary();
     assert!(
         summary_after_dangling.deliverable_signal,
         "summary still updates when the bound mailbox's strong refs are gone",
@@ -279,10 +269,7 @@ fn signal_mailbox_phase_a_plumbing() {
     // separately from the mailbox's queue.
     let weak_clone: ArcWeak<TaskMailbox> = Arc::downgrade(&terminal_mailbox);
 
-    tx_subsystems::process::execution::step_exit_group_with_signal(
-        &proc_cap,
-        Signum::SIGKILL,
-    );
+    tx_subsystems::process::execution::step_exit_group_with_signal(&proc_cap, Signum::SIGKILL);
 
     // Per D9-A: set_thread_zombie posts SIGKILL/ProcessDirected
     // before dropping the payload.

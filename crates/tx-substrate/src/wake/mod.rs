@@ -31,6 +31,4 @@ pub use mailbox::{
     MAILBOX_QUEUE_BOUND,
 };
 pub use timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
-pub use wait_source::{
-    PreparedWaitRegistration, SubscriberId, WaitRegistrationGuard, WaitSource,
-};
+pub use wait_source::{PreparedWaitRegistration, SubscriberId, WaitRegistrationGuard, WaitSource};

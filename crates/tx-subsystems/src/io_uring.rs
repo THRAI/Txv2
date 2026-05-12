@@ -288,10 +288,7 @@ impl IoUring {
 
     /// Zone-sign a fresh io_uring with the given ring depths. Companion
     /// to [`Self::with_entries`] for the `sys_io_uring_setup(2)` arm.
-    pub fn new_with_entries_cap(
-        sq_entries: u32,
-        cq_entries: u32,
-    ) -> Result<Cap<Self>, ZoneError> {
+    pub fn new_with_entries_cap(sq_entries: u32, cq_entries: u32) -> Result<Cap<Self>, ZoneError> {
         let reservation = zone::reserve_for::<Self>()?;
         Ok(zone::sign_for(
             reservation,
@@ -429,10 +426,9 @@ impl Drop for IoUring {
         // Trip the worker's abort signal so any still-live SQPOLL
         // kthread future observes the abort on its next poll and
         // terminates. Mirrors `AioContext::Drop`.
-        self.worker_abort
-            .trip(OnBehalfOfAbort::CooperativeCancel(
-                tx_substrate::step_v3::CancelReason::OwnerRequested,
-            ));
+        self.worker_abort.trip(OnBehalfOfAbort::CooperativeCancel(
+            tx_substrate::step_v3::CancelReason::OwnerRequested,
+        ));
         wait_source::release_wait_channel(self.sqe_arrived_id);
         wait_source::release_wait_channel(self.cqe_available_id);
     }
@@ -503,9 +499,7 @@ where
                 // mirroring the AIO `IocbDispatcher` shape.
                 loop {
                     if let Some(_sqe) = ring_inner.pop_sqe() {
-                        ring_inner
-                            .dispatched
-                            .fetch_add(1, Ordering::AcqRel);
+                        ring_inner.dispatched.fetch_add(1, Ordering::AcqRel);
                         continue;
                     }
                     // SQ ring drained — yield so the outer racer
@@ -546,11 +540,7 @@ pub struct SqpollWorkerFuture {
 
 enum SqpollWorkerState {
     Running(
-        Pin<
-            alloc::boxed::Box<
-                dyn Future<Output = Result<(), OnBehalfOfAbort>> + Send + 'static,
-            >,
-        >,
+        Pin<alloc::boxed::Box<dyn Future<Output = Result<(), OnBehalfOfAbort>> + Send + 'static>>,
     ),
     Finished(Result<(), OnBehalfOfAbort>),
 }
@@ -597,9 +587,8 @@ impl Future for SqpollWorkerFuture {
 /// `worker_abort` — so the future `io_uring_destroy` arm can terminate
 /// the kthread without principal exit. We trip from the outer layer.
 struct WorkerOuter {
-    helper: Pin<alloc::boxed::Box<
-        dyn Future<Output = Result<(), OnBehalfOfAbort>> + Send + 'static,
-    >>,
+    helper:
+        Pin<alloc::boxed::Box<dyn Future<Output = Result<(), OnBehalfOfAbort>> + Send + 'static>>,
     worker_abort: Arc<AbortSignal>,
 }
 
@@ -697,8 +686,10 @@ mod tests {
         let ring = IoUring::new_with_entries_cap(2, 4).expect("ring cap");
         let make = |ud: u64| SqeStub::new(0, ud);
         assert_eq!(ring.sq_len(), 0);
-        ring.push_sqe_for_test(make(1)).expect("first push admitted");
-        ring.push_sqe_for_test(make(2)).expect("second push admitted");
+        ring.push_sqe_for_test(make(1))
+            .expect("first push admitted");
+        ring.push_sqe_for_test(make(2))
+            .expect("second push admitted");
         let rejected = ring
             .push_sqe_for_test(make(3))
             .expect_err("third push beyond capacity must reject");
@@ -710,8 +701,10 @@ mod tests {
     fn pop_sqe_drains_fifo() {
         let _g = setup();
         let ring = IoUring::new_with_entries_cap(4, 8).expect("ring cap");
-        ring.push_sqe_for_test(SqeStub::new(0, 10)).expect("push 10");
-        ring.push_sqe_for_test(SqeStub::new(0, 20)).expect("push 20");
+        ring.push_sqe_for_test(SqeStub::new(0, 10))
+            .expect("push 10");
+        ring.push_sqe_for_test(SqeStub::new(0, 20))
+            .expect("push 20");
         let first = ring.pop_sqe().expect("first pop");
         let second = ring.pop_sqe().expect("second pop");
         assert_eq!(first.user_data, 10);

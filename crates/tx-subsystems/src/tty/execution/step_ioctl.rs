@@ -615,14 +615,15 @@ pub fn deferred_signal_for_tty(
 // unchanged.
 
 /// `StepOp` wrap of [`step_ioctl_tiocsctty`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct IoctlTiocscttyOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub caller: IoctlCaller,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for IoctlTiocscttyOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for IoctlTiocscttyOp<'a>
 {
     type Output = IoctlSideEffect;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -635,14 +636,15 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_ioctl_tiocsctty_for_process`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct IoctlTiocscttyForProcessOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub caller: &'a Cap<crate::process::structure::ProcessIdentity>,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for IoctlTiocscttyForProcessOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for IoctlTiocscttyForProcessOp<'a>
 {
     type Output = IoctlSideEffect;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -655,14 +657,15 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_ioctl_tiocnotty`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct IoctlTiocnottyOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub caller: IoctlCaller,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for IoctlTiocnottyOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for IoctlTiocnottyOp<'a>
 {
     type Output = IoctlSideEffect;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -675,14 +678,15 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_ioctl_tiocnotty_for_process`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct IoctlTiocnottyForProcessOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub caller: &'a Cap<crate::process::structure::ProcessIdentity>,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for IoctlTiocnottyForProcessOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for IoctlTiocnottyForProcessOp<'a>
 {
     type Output = IoctlSideEffect;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -695,6 +699,7 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_ioctl_tiocspgrp`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct IoctlTiocspgrpOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub caller: IoctlCaller,
@@ -702,8 +707,8 @@ pub struct IoctlTiocspgrpOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for IoctlTiocspgrpOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for IoctlTiocspgrpOp<'a>
 {
     type Output = IoctlSideEffect;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -716,6 +721,7 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_ioctl_tiocspgrp_for_process`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct IoctlTiocspgrpForProcessOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub caller: &'a Cap<crate::process::structure::ProcessIdentity>,
@@ -723,8 +729,8 @@ pub struct IoctlTiocspgrpForProcessOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for IoctlTiocspgrpForProcessOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for IoctlTiocspgrpForProcessOp<'a>
 {
     type Output = IoctlSideEffect;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -737,13 +743,14 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_ioctl_tiocgpgrp`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct IoctlTiocgpgrpOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for IoctlTiocgpgrpOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for IoctlTiocgpgrpOp<'a>
 {
     type Output = u32;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -756,13 +763,14 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_ioctl_tiocgwinsz`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct IoctlTiocgwinszOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for IoctlTiocgwinszOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for IoctlTiocgwinszOp<'a>
 {
     type Output = Winsize;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -775,14 +783,15 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_ioctl_tiocswinsz`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct IoctlTiocswinszOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub winsize: Winsize,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for IoctlTiocswinszOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for IoctlTiocswinszOp<'a>
 {
     type Output = IoctlSideEffect;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -795,13 +804,14 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_ioctl_tcgets`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct IoctlTcgetsOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for IoctlTcgetsOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for IoctlTcgetsOp<'a>
 {
     type Output = Termios;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -814,14 +824,15 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_ioctl_tcsets`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct IoctlTcsetsOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub new_termios: Termios,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for IoctlTcsetsOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for IoctlTcsetsOp<'a>
 {
     type Output = IoctlSideEffect;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -882,8 +893,7 @@ mod step_op_wraps {
 
     fn alloc_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
         let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res =
-            zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
         let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(
             payload_res,
             TtyPayload::new_hardware(&NOOP_BINDING),

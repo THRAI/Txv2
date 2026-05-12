@@ -21,7 +21,7 @@
 //!
 //! Phases 2–4 (D8 plan) add `io_submit` + worker + `with_on_behalf_of`
 //! integration, `io_getevents` + completion routing, and `io_destroy`
-//! + cleanup. This file's tests only exercise the open + fd-install
+//! with cleanup. This file's tests only exercise the open + fd-install
 //! primitives.
 
 extern crate alloc;
@@ -191,11 +191,7 @@ fn sys_io_setup_returns_an_aio_context_backed_fd() {
         "context_id must be positive, got {}",
         aio.context_id()
     );
-    assert_eq!(
-        aio.nr_events(),
-        0,
-        "nr_events round-trips the syscall arg"
-    );
+    assert_eq!(aio.nr_events(), 0, "nr_events round-trips the syscall arg");
 }
 
 /// `sys_io_setup(nr_events=128, _)` stashes the capacity on the
@@ -235,7 +231,10 @@ fn sys_io_setup_mints_fresh_context_ids() {
         SyscallResult::Return(n) => n as u32,
         other => panic!("expected Return, got {other:?}"),
     };
-    assert_ne!(fd_a, fd_b, "each io_setup call installs at the next free fd");
+    assert_ne!(
+        fd_a, fd_b,
+        "each io_setup call installs at the next free fd"
+    );
 
     let aio_a = proc_cap
         .fd(fd_a)

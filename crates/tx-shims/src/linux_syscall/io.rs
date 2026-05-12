@@ -232,9 +232,7 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         for i in 0..nfds {
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
             let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
-            if let Err(errno) =
-                bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr)
-            {
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
             let fd = i32::from_le_bytes(ent_bytes[0..4].try_into().unwrap());
@@ -252,8 +250,7 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                             if tty.input_readable.peek() & TTY_READABLE != 0 {
                                 revents |= POLLIN;
                             } else if park_on_carrier.is_none() {
-                                park_on_carrier =
-                                    Some(tty.wait_source_id());
+                                park_on_carrier = Some(tty.wait_source_id());
                             }
                         } else {
                             // Non-TTY backings: punt to the legacy
@@ -389,7 +386,11 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             }
             V3Out::Yield {
                 progress,
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
                 let written = progress.bytes();
                 if written > 0 {
@@ -482,8 +483,7 @@ pub static SYS_READ_YIELDS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 pub static SYS_READ_WAIT_NONE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
-pub static SYS_READ_ERR: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+pub static SYS_READ_ERR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 pub static SYS_READ_LAST_ERRNO: core::sync::atomic::AtomicI32 =
     core::sync::atomic::AtomicI32::new(0);
 
@@ -601,7 +601,11 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             }
             V3Out::Yield {
                 progress,
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
                 let read = progress.bytes();
                 if read > 0 {

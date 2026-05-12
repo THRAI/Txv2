@@ -49,9 +49,7 @@ use tx_hal::{
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
 use tx_substrate::epoch;
-use tx_substrate::step_v3::{
-    DelegateReply, DelegateState, TransitionOutcome, UfdReply,
-};
+use tx_substrate::step_v3::{DelegateReply, DelegateState, TransitionOutcome, UfdReply};
 use tx_substrate::testing::init_host_for_test_once;
 use tx_substrate::wake::TaskMailbox;
 
@@ -203,17 +201,10 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Option<F::Output> {
 
 // -------- Helper: build an aspace with one ufd-tagged private-anon VMA --
 
-fn fresh_aspace_with_ufd_tagged_vma(
-    ufd: &UserfaultFd,
-    range_start: u64,
-) -> Arc<AddressSpace> {
-    let aspace =
-        AddressSpace::new_for_platform::<StubPmap>().expect("fresh aspace");
-    let range = UserRange::new_aligned(
-        UserVirtAddr::new(range_start as usize),
-        USER_PAGE_SIZE,
-    )
-    .expect("aligned range");
+fn fresh_aspace_with_ufd_tagged_vma(ufd: &UserfaultFd, range_start: u64) -> Arc<AddressSpace> {
+    let aspace = AddressSpace::new_for_platform::<StubPmap>().expect("fresh aspace");
+    let range = UserRange::new_aligned(UserVirtAddr::new(range_start as usize), USER_PAGE_SIZE)
+        .expect("aligned range");
     let request = VmMapRequest::fixed(
         range,
         MapPlacement::RequireFree,
@@ -221,9 +212,7 @@ fn fresh_aspace_with_ufd_tagged_vma(
         VmEntryFlags::PRIVATE,
         VmBacking::PrivateAnon,
     );
-    aspace
-        .try_mmap(request)
-        .expect("mmap private anon page");
+    aspace.try_mmap(request).expect("mmap private anon page");
     aspace
         .tag_ufd_registration(
             range,
@@ -252,7 +241,10 @@ fn fault_script_yields_on_agent_and_resumes_on_mark_replied() {
         ufd: &ufd_cap,
         mailbox: Arc::downgrade(&mailbox),
     };
-    let fault = VmFault::new(UserVirtAddr::new(0x4000_0000), tx_subsystems::vm::AccessMode::Read);
+    let fault = VmFault::new(
+        UserVirtAddr::new(0x4000_0000),
+        tx_subsystems::vm::AccessMode::Read,
+    );
 
     let aspace_ref = aspace.clone();
     let future = aspace_ref.fault_script_with_ufd_dispatch(fault, dispatcher);
@@ -295,9 +287,12 @@ fn fault_script_yields_on_agent_and_resumes_on_mark_replied() {
 
     // Poll the future again: drains the mailbox, takes the reply,
     // runs the materialize-and-publish tail.
-    let result = poll_once(fut.as_mut())
-        .expect("future must resolve once the agent reply is drained");
-    assert!(result.is_ok(), "fault must succeed end-to-end, got {result:?}");
+    let result =
+        poll_once(fut.as_mut()).expect("future must resolve once the agent reply is drained");
+    assert!(
+        result.is_ok(),
+        "fault must succeed end-to-end, got {result:?}"
+    );
     // The take_reply CAS should have drained the reply slot.
     assert!(
         registry.take_reply(token_id).is_none(),
@@ -323,7 +318,10 @@ fn await_agent_reply_repost_spurious_events_for_other_tokens() {
         ufd: &ufd_cap,
         mailbox: Arc::downgrade(&mailbox),
     };
-    let fault = VmFault::new(UserVirtAddr::new(0x5000_0000), tx_subsystems::vm::AccessMode::Read);
+    let fault = VmFault::new(
+        UserVirtAddr::new(0x5000_0000),
+        tx_subsystems::vm::AccessMode::Read,
+    );
 
     let aspace_ref = aspace.clone();
     let future = aspace_ref.fault_script_with_ufd_dispatch(fault, dispatcher);
@@ -335,7 +333,9 @@ fn await_agent_reply_repost_spurious_events_for_other_tokens() {
 
     // Inject a spurious AgentReplied for a different (unminted) token.
     let other_token = DelegateTokenId::new(999);
-    let _ = mailbox.post(MailboxEvent::AgentReplied { token_id: other_token });
+    let _ = mailbox.post(MailboxEvent::AgentReplied {
+        token_id: other_token,
+    });
     assert_eq!(mailbox.len(), 1);
 
     // Polling should drain and re-post the spurious event (not match
@@ -369,7 +369,10 @@ fn fault_script_resolves_to_would_block_on_agent_died() {
         ufd: &ufd_cap,
         mailbox: Arc::downgrade(&mailbox),
     };
-    let fault = VmFault::new(UserVirtAddr::new(0x6000_0000), tx_subsystems::vm::AccessMode::Read);
+    let fault = VmFault::new(
+        UserVirtAddr::new(0x6000_0000),
+        tx_subsystems::vm::AccessMode::Read,
+    );
 
     let aspace_ref = aspace.clone();
     let future = aspace_ref.fault_script_with_ufd_dispatch(fault, dispatcher);
@@ -392,8 +395,7 @@ fn fault_script_resolves_to_would_block_on_agent_died() {
     assert_eq!(mailbox.len(), 1);
     // Polling resolves the future with WouldBlock (phase 4 mapping
     // for AgentDied / Canceled / TimedOut).
-    let result =
-        poll_once(fut.as_mut()).expect("Abort must resolve the future");
+    let result = poll_once(fut.as_mut()).expect("Abort must resolve the future");
     assert!(
         matches!(result, Err(VmFaultError::WouldBlock)),
         "AgentDied must surface as WouldBlock in phase 4, got {result:?}",
@@ -409,7 +411,10 @@ fn null_ufd_dispatch_falls_through_to_normal_materialize() {
     let _g = setup();
     let ufd_cap = UserfaultFd::new_cap().expect("ufd cap");
     let aspace = fresh_aspace_with_ufd_tagged_vma(&ufd_cap, 0x7000_0000);
-    let fault = VmFault::new(UserVirtAddr::new(0x7000_0000), tx_subsystems::vm::AccessMode::Read);
+    let fault = VmFault::new(
+        UserVirtAddr::new(0x7000_0000),
+        tx_subsystems::vm::AccessMode::Read,
+    );
 
     // Even though the VMA is tagged, NullUfdDispatch::resolve returns
     // None, so fault_script_with_ufd_dispatch must fall through to
@@ -417,7 +422,6 @@ fn null_ufd_dispatch_falls_through_to_normal_materialize() {
     let aspace_ref = aspace.clone();
     let future = aspace_ref.fault_script_with_ufd_dispatch(fault, NullUfdDispatch);
     let mut fut = Box::pin(future);
-    let result = poll_once(fut.as_mut())
-        .expect("null-dispatch must run to completion in one poll");
+    let result = poll_once(fut.as_mut()).expect("null-dispatch must run to completion in one poll");
     assert!(result.is_ok(), "null-dispatch fall-through must succeed");
 }

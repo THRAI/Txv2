@@ -292,8 +292,8 @@ pub struct FutexWaitOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for FutexWaitOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for FutexWaitOp<'a>
 {
     type Output = ();
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -313,8 +313,8 @@ pub struct FutexWakeOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for FutexWakeOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for FutexWakeOp<'a>
 {
     type Output = u32;
     type Progress = tx_substrate::step_v3::NoProgress;
@@ -396,7 +396,11 @@ mod tests {
         use tx_substrate::step_v3::YieldShape;
         match outcome {
             StepOutcome::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => {
                 assert_eq!(interests.raw(), FUTEX_WAKE_MASK);
@@ -582,7 +586,10 @@ mod tests {
         let wait_outcome = step_futex_wait(uaddr, 42, &guard);
         let waiter_carrier = match wait_outcome {
             StepOutcome::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, .. },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier, ..
+                    },
                 ..
             } => carrier.raw(),
             other => panic!("expected Yield, got {other:?}"),

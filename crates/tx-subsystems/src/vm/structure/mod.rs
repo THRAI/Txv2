@@ -6,11 +6,16 @@
 //! execution. Mutation entrypoints live in `execution.rs`.
 
 mod address_space;
+mod private;
 mod range_lock;
 mod recipe;
 mod types;
 
 pub use address_space::AddressSpace;
+pub use private::{
+    PrivateFrame, PrivateFrameIdentity, PrivateFrameSnapshot, PrivateFrameState, PrivatePageError,
+    PrivatePageSet, VmPageOff,
+};
 pub use range_lock::{
     AcquirePairResult, AcquireResult, LockMode, PendingWriter, RangeGuard, RangeGuardPair,
     RangeLock, WouldBlock, RANGE_LOCK_RELEASE_MASK,

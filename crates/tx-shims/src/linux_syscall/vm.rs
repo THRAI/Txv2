@@ -409,7 +409,11 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 return SyscallResult::Return(0);
             }
             V3::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => {
                 let token =
@@ -485,6 +489,7 @@ pub(super) fn vmmap_error_to_i32(error: VmMapError) -> i32 {
         VmMapError::WouldBlock => EAGAIN_VALUE,
         VmMapError::BackingOffsetOverflow => EINVAL_VALUE,
         VmMapError::Pmap(_) => errno_to_i32(Errno::EIO),
+        VmMapError::Private(_) => errno_to_i32(Errno::ENOMEM),
     }
 }
 
@@ -553,7 +558,11 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sysc
                         continue;
                     }
                     V3::Yield {
-                        shape: YieldShape::OnWaitSource { source: carrier, interests },
+                        shape:
+                            YieldShape::OnWaitSource {
+                                source: carrier,
+                                interests,
+                            },
                         ..
                     } => {
                         parked = true;

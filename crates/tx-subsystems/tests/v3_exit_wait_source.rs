@@ -34,7 +34,7 @@
 //!    no spurious posts after payload drop.
 //! 3. **D2-coexistence: legacy_channel_still_fires**. The parent's
 //!    legacy `Channel`-side awaiter (`fire_exit_source` return value
-//!    > 0 when an awaiter was parked) keeps firing alongside the new
+//!    \> 0 when an awaiter was parked) keeps firing alongside the new
 //!    path. Pinned indirectly via re-using the source: the new
 //!    `MailboxEvent::SourceFired` post must coexist with — not
 //!    replace — the legacy channel-fire.
@@ -208,10 +208,7 @@ fn exit_wait_source_invariants_round_trip() {
     // ---- (1) blocked-waitpid-woken-on-child-mark_zombie ------------
     let mailbox = Arc::new(TaskMailbox::new());
     let (_reg_guard, gen) = register(&parent_source, &mailbox, EXIT_SOURCE_CHILD_ZOMBIFIED);
-    assert!(
-        mailbox.is_empty(),
-        "no events before any child zombifies"
-    );
+    assert!(mailbox.is_empty(), "no events before any child zombifies");
 
     let child = step_fork::<StubPmap>(&parent).expect("fork");
 
@@ -243,8 +240,7 @@ fn exit_wait_source_invariants_round_trip() {
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn no_op(_: *const ()) {}
     fn waker_clone(_: *const ()) -> RawWaker {
-        const VTABLE: RawWakerVTable =
-            RawWakerVTable::new(waker_clone, no_op, no_op, no_op);
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTABLE)
     }
     const VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, no_op, no_op, no_op);
@@ -253,11 +249,11 @@ fn exit_wait_source_invariants_round_trip() {
     let waker = unsafe { Waker::from_raw(raw) };
     let mut cx = Context::from_waker(&waker);
 
-    let legacy_channel =
-        tx_subsystems::wait_source::lookup_wait_channel(parent_source_id)
-            .expect("legacy resolver still has the carrier");
-    let mut legacy_wait =
-        legacy_channel.wait(tx_reactor::wait::Mask::from_bits(EXIT_SOURCE_CHILD_ZOMBIFIED));
+    let legacy_channel = tx_subsystems::wait_source::lookup_wait_channel(parent_source_id)
+        .expect("legacy resolver still has the carrier");
+    let mut legacy_wait = legacy_channel.wait(tx_reactor::wait::Mask::from_bits(
+        EXIT_SOURCE_CHILD_ZOMBIFIED,
+    ));
     let pre_legacy = Pin::new(&mut legacy_wait).poll(&mut cx);
     assert!(
         matches!(pre_legacy, Poll::Pending),
@@ -313,8 +309,7 @@ fn exit_wait_source_invariants_round_trip() {
     // path, since the second call short-circuits before
     // `post_sigchld_to_parent`.
     let mailbox2 = Arc::new(TaskMailbox::new());
-    let (_reg_guard2, gen2) =
-        register(&parent_source, &mailbox2, EXIT_SOURCE_CHILD_ZOMBIFIED);
+    let (_reg_guard2, gen2) = register(&parent_source, &mailbox2, EXIT_SOURCE_CHILD_ZOMBIFIED);
     assert!(mailbox2.is_empty());
 
     // Second zombify call on the same child — payload is already

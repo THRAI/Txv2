@@ -619,7 +619,11 @@ fn page_container_materialize_page_propagates_file_block() {
 
     match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
         V3Out::Yield {
-            shape: tx_substrate::step_v3::YieldShape::OnWaitSource { source: carrier, interests },
+            shape:
+                tx_substrate::step_v3::YieldShape::OnWaitSource {
+                    source: carrier,
+                    interests,
+                },
             ..
         } => {
             assert_eq!(carrier.raw(), 9);

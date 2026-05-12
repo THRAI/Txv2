@@ -58,8 +58,7 @@ fn reset_zone_and_epoch() -> std::sync::MutexGuard<'static, ()> {
     register_zone_for::<ProcessIdentity>().expect("register placeholder process zone");
     register_zone_for::<ThreadIdentity>().expect("register placeholder thread zone");
     register_zone_for::<Credential>().expect("register placeholder cred zone");
-    register_zone_for::<RestrictionStackHandle>()
-        .expect("register placeholder restrictions zone");
+    register_zone_for::<RestrictionStackHandle>().expect("register placeholder restrictions zone");
     guard
 }
 
@@ -136,10 +135,8 @@ fn subject_authority_carries_cred_and_restrictions() {
     // `I = ProcessIdentity` still works at constructor sites with a
     // contextual type, but the turbofish keeps this test independent
     // of inference).
-    let authority = SubjectAuthority::<ProcessIdentity>::new(
-        cred_cap.clone(),
-        restrictions_cap.clone(),
-    );
+    let authority =
+        SubjectAuthority::<ProcessIdentity>::new(cred_cap.clone(), restrictions_cap.clone());
     assert_eq!(authority.cred(), &cred_cap);
     assert_eq!(authority.restrictions(), &restrictions_cap);
 }

@@ -226,11 +226,9 @@ impl PipePayload {
     /// signature aligned with future bounded carrier slabs).
     pub fn new() -> Result<Self, ZoneError> {
         let reader_wait_channel = Channel::new();
-        let reader_wait_source_id =
-            wait_source::register_wait_channel(reader_wait_channel.clone());
+        let reader_wait_source_id = wait_source::register_wait_channel(reader_wait_channel.clone());
         let writer_wait_channel = Channel::new();
-        let writer_wait_source_id =
-            wait_source::register_wait_channel(writer_wait_channel.clone());
+        let writer_wait_source_id = wait_source::register_wait_channel(writer_wait_channel.clone());
 
         // PR-3D-1 (D2/D4 coexistence). Per-side `WaitSource`s share
         // the legacy registry's id namespace so a v3 caller using the
@@ -556,9 +554,7 @@ pub struct Pipe2Op {
     pub flags: PipeFlags,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for Pipe2Op
-{
+impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for Pipe2Op {
     type Output = (Cap<OpenFile>, Cap<OpenFile>);
     type Progress = tx_substrate::step_v3::NoProgress;
     fn step(
@@ -580,8 +576,8 @@ pub struct ReadOp<'a> {
     pub nonblocking: bool,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ReadOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ReadOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;
@@ -601,8 +597,8 @@ pub struct WriteOp<'a> {
     pub nonblocking: bool,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for WriteOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for WriteOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;
@@ -704,7 +700,11 @@ mod tests {
         match outcome {
             V3Out::Yield {
                 progress: _,
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
                 assert_eq!(carrier.raw(), payload.reader_source_id());
                 assert_eq!(interests.raw(), PIPE_READABLE);
@@ -766,7 +766,11 @@ mod tests {
         match outcome {
             V3Out::Yield {
                 progress: _,
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
                 assert_eq!(carrier.raw(), payload.writer_source_id());
                 assert_eq!(interests.raw(), PIPE_WRITABLE);
@@ -1028,7 +1032,11 @@ mod tests {
         match outcome {
             tx_substrate::step_v3::StepOutcome::Yield {
                 progress,
-                shape: tx_substrate::step_v3::YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    tx_substrate::step_v3::YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
                 assert!(
                     progress.is_empty(),
@@ -1120,7 +1128,11 @@ mod tests {
         match outcome {
             tx_substrate::step_v3::StepOutcome::Yield {
                 progress,
-                shape: tx_substrate::step_v3::YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    tx_substrate::step_v3::YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
                 assert!(
                     progress.is_empty(),
@@ -1210,7 +1222,9 @@ mod step_op_wraps {
     #[test]
     fn pipe2_op_default_flags_returns_done_with_reader_writer_pair() {
         let _setup = setup();
-        let mut op = Pipe2Op { flags: PipeFlags::default() };
+        let mut op = Pipe2Op {
+            flags: PipeFlags::default(),
+        };
         let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
         match outcome {
             StepOutcome::Done((reader, writer)) => {
@@ -1227,7 +1241,10 @@ mod step_op_wraps {
     fn pipe2_op_honors_cloexec_and_nonblocking_flags() {
         let _setup = setup();
         let mut op = Pipe2Op {
-            flags: PipeFlags { cloexec: true, nonblocking: true },
+            flags: PipeFlags {
+                cloexec: true,
+                nonblocking: true,
+            },
         };
         let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
         match outcome {
@@ -1255,7 +1272,6 @@ mod step_op_wraps {
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
-        drop(op);
         drop(guard);
         match outcome {
             StepOutcome::Done(0) => {}
@@ -1277,7 +1293,6 @@ mod step_op_wraps {
             nonblocking: true,
         };
         let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
-        drop(op);
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EAGAIN) => {}
@@ -1302,7 +1317,6 @@ mod step_op_wraps {
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
-        drop(op);
         drop(guard);
         match outcome {
             StepOutcome::Done(n) => {
@@ -1327,14 +1341,16 @@ mod step_op_wraps {
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
-        drop(op);
         drop(guard);
         match outcome {
             StepOutcome::Yield {
                 progress,
                 shape: YieldShape::OnWaitSource { source, interests },
             } => {
-                assert!(progress.is_empty(), "blocked-empty read must carry empty ByteProgress");
+                assert!(
+                    progress.is_empty(),
+                    "blocked-empty read must carry empty ByteProgress"
+                );
                 assert_eq!(source.raw(), payload.reader_source_id());
                 assert_eq!(interests.raw(), PIPE_READABLE);
                 let _ = ByteProgress::EMPTY; // exercise the type
@@ -1357,7 +1373,6 @@ mod step_op_wraps {
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
-        drop(op);
         drop(guard);
         match outcome {
             StepOutcome::Done(0) => {}
@@ -1381,7 +1396,6 @@ mod step_op_wraps {
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
-        drop(op);
         drop(guard);
         match outcome {
             StepOutcome::Done(n) => assert_eq!(n, 5),
@@ -1406,7 +1420,6 @@ mod step_op_wraps {
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new());
-        drop(op);
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EPIPE) => {}

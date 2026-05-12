@@ -93,8 +93,9 @@ pub static LAST_NOTEXEC_SITE: core::sync::atomic::AtomicUsize =
 pub static LAST_EXEC_FILE_SIZE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-#[allow(dead_code)]
-const NOTEXEC_SITE_NONE: usize = 0;
+// NOTEXEC_SITE_NONE = 0 is the implicit initial value of
+// `LAST_NOTEXEC_SITE` (resolves to "none" via the `_` arm in
+// `last_notexec_site_label`); no named constant needed.
 const NOTEXEC_SITE_RNODE_NOT_PAGEBACKED: usize = 1;
 const NOTEXEC_SITE_READ_TOO_SMALL: usize = 2;
 const NOTEXEC_SITE_READ_ENOEXEC: usize = 3;
@@ -381,8 +382,10 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
             V3::Done(()) => Ok(()),
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
             V3::Err(err) => {
-                LAST_NOTEXEC_SITE
-                    .store(NOTEXEC_SITE_READ_ENOEXEC, core::sync::atomic::Ordering::Relaxed);
+                LAST_NOTEXEC_SITE.store(
+                    NOTEXEC_SITE_READ_ENOEXEC,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
                 Err(ExecError::from_read_errno(err.into()))
             }
         };
@@ -398,7 +401,10 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // congruence / overlap / W^X). All failures collapse to
     // `ExecError::NotExecutable` at the syscall boundary.
     let parsed: ExecImagePlan = parse_image_plan(&header_bytes).map_err(|err| {
-        LAST_NOTEXEC_SITE.store(NOTEXEC_SITE_PARSE_ERROR, core::sync::atomic::Ordering::Relaxed);
+        LAST_NOTEXEC_SITE.store(
+            NOTEXEC_SITE_PARSE_ERROR,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         ExecError::from_parse_error(err)
     })?;
 
@@ -407,10 +413,11 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // `setup_arg_pages` does the same — heap starts where the image
     // ends so static binaries can grow up. Computed here so Phase 7
     // is a pure infallible store.
-    let new_brk_base = compute_brk_base(&parsed.load_segments).map_err(|err| {
-        LAST_NOTEXEC_SITE
-            .store(NOTEXEC_SITE_COMPUTE_BRK_BASE, core::sync::atomic::Ordering::Relaxed);
-        err
+    let new_brk_base = compute_brk_base(&parsed.load_segments).inspect_err(|_err| {
+        LAST_NOTEXEC_SITE.store(
+            NOTEXEC_SITE_COMPUTE_BRK_BASE,
+            core::sync::atomic::Ordering::Relaxed,
+        );
     })?;
 
     // ===== Phase 3.5 — apply S_ISUID / S_ISGID =======================
@@ -452,16 +459,15 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // its own per-call guards internally. Per
     // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE` callers must NOT
     // hold a guard at the call site.
-    let new_aspace =
-        vm_scripts::build_aspace_from_image::<P>(&image_plan).map_err(|err| {
-            if matches!(err, vm_scripts::ScriptError::InvalidImage) {
-                LAST_NOTEXEC_SITE.store(
-                    NOTEXEC_SITE_BUILD_ASPACE_INVALID,
-                    core::sync::atomic::Ordering::Relaxed,
-                );
-            }
-            ExecError::from_build_aspace_error(err)
-        })?;
+    let new_aspace = vm_scripts::build_aspace_from_image::<P>(&image_plan).map_err(|err| {
+        if matches!(err, vm_scripts::ScriptError::InvalidImage) {
+            LAST_NOTEXEC_SITE.store(
+                NOTEXEC_SITE_BUILD_ASPACE_INVALID,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        ExecError::from_build_aspace_error(err)
+    })?;
 
     // ===== Phase 5a — eagerly populate partial-last-page bytes ========
     //
@@ -493,9 +499,10 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         if segment.memsz <= segment.filesz {
             continue;
         }
-        let file_end = segment.vaddr.checked_add(segment.filesz).ok_or_else(|| {
-            record_notexec_site(NOTEXEC_SITE_PHASE5A_FILE_END_OVERFLOW)
-        })?;
+        let file_end = segment
+            .vaddr
+            .checked_add(segment.filesz)
+            .ok_or_else(|| record_notexec_site(NOTEXEC_SITE_PHASE5A_FILE_END_OVERFLOW))?;
         let partial_in_page = file_end & (page_size - 1);
         if partial_in_page == 0 {
             continue;

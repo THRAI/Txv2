@@ -47,9 +47,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use tx_substrate::step_v3::{
-    AbortReason, DelegateRegistry, DelegateReply, DelegateTokenId,
-};
+use tx_substrate::step_v3::{AbortReason, DelegateRegistry, DelegateReply, DelegateTokenId};
 use tx_substrate::wake::{agent_event_matches, MailboxEvent, TaskMailbox};
 
 /// Outcome of [`await_agent_reply`]. Mirrors the `Replied` /

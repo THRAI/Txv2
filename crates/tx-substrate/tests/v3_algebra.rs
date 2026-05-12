@@ -15,8 +15,8 @@
 //! - txdoc:STEP-V2-DRIVER-MODE-1 (DriveMode classify matrix)
 
 use tx_substrate::step_v3::{
-    AcceptOutcome, ByteProgress, DriveMode, InterestMask, NoProgress, StepOutcome,
-    StepProgress, Translation, WaitSourceId, YieldShape,
+    AcceptOutcome, ByteProgress, DriveMode, InterestMask, NoProgress, StepOutcome, StepProgress,
+    Translation, WaitSourceId, YieldShape,
 };
 
 // -- StepOutcome closed catalog -----------------------------------------------

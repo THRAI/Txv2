@@ -203,10 +203,7 @@ fn tty_wait_source_invariants_round_trip() {
     // ---- (2) blocked-reader-woken-on-step_ingest ------------------
     let mailbox = Arc::new(TaskMailbox::new());
     let (_reg_guard, gen) = register(&tty_source, &mailbox, TTY_READABLE);
-    assert!(
-        mailbox.is_empty(),
-        "no events before any byte ingest"
-    );
+    assert!(mailbox.is_empty(), "no events before any byte ingest");
 
     // ---- (3) D2-coexistence: drive a legacy `Channel.wait` future
     // through Pending -> Ready across the same step_ingest call.
@@ -271,8 +268,7 @@ fn tty_wait_source_invariants_round_trip() {
     // mailbox registered after hangup must see no `SourceFired` from
     // the hangup transition itself.
     let mailbox_hangup = Arc::new(TaskMailbox::new());
-    let (_reg_guard_hangup, _gen_hangup) =
-        register(&tty_source, &mailbox_hangup, TTY_READABLE);
+    let (_reg_guard_hangup, _gen_hangup) = register(&tty_source, &mailbox_hangup, TTY_READABLE);
     assert!(mailbox_hangup.is_empty());
 
     let guard = epoch::guard();

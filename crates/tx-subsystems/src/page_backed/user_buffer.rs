@@ -169,7 +169,11 @@ fn step_range_with_user_buffer(
                 return V3::done(advanced);
             }
             tx_substrate::step_v3::StepOutcome::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => {
                 if advanced == 0 {
@@ -343,8 +347,7 @@ pub fn step_write_from_kernel(
         return V3::err(Errno::EINVAL.into());
     }
     let start = of.offset();
-    let outcome =
-        step_range_with_kernel_buffer(pc, of, len, KernelBuffer::Write { src }, guard);
+    let outcome = step_range_with_kernel_buffer(pc, of, len, KernelBuffer::Write { src }, guard);
     let advanced_bytes = match &outcome {
         V3::Done(n) => *n,
         V3::Continue { progress } => progress.bytes(),
@@ -392,13 +395,8 @@ fn step_range_with_kernel_buffer(
 
         match pc.materialize_page(page_index, access, guard) {
             V3::Done(materialized) => {
-                match copy_chunk_kernel(
-                    materialized.ppn,
-                    within_page,
-                    chunk,
-                    &mut buffer,
-                    advanced,
-                ) {
+                match copy_chunk_kernel(materialized.ppn, within_page, chunk, &mut buffer, advanced)
+                {
                     Ok(()) => {
                         advanced += chunk;
                         offset += chunk as u64;
@@ -420,7 +418,11 @@ fn step_range_with_kernel_buffer(
                 return V3::done(advanced);
             }
             V3::Yield {
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
                 ..
             } => {
                 if advanced == 0 {
@@ -526,8 +528,8 @@ pub struct ReadToUserOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for ReadToUserOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for ReadToUserOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;
@@ -535,7 +537,14 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
         &mut self,
         _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
     ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        step_read_to_user(self.pc, self.of, self.aspace, self.dst, self.len, self.guard)
+        step_read_to_user(
+            self.pc,
+            self.of,
+            self.aspace,
+            self.dst,
+            self.len,
+            self.guard,
+        )
     }
 }
 
@@ -549,8 +558,8 @@ pub struct WriteFromUserOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for WriteFromUserOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for WriteFromUserOp<'a>
 {
     type Output = usize;
     type Progress = tx_substrate::step_v3::ByteProgress;

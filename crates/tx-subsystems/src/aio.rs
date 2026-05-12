@@ -90,8 +90,8 @@
 //! `VecDeque` and the `Arc<WaitSource>` clean up through normal
 //! `Drop`.
 
-use alloc::sync::Arc;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -380,13 +380,10 @@ impl AioContext {
     pub fn with_nr_events(nr_events: u32) -> Self {
         let iocb_arrived_channel = tx_reactor::wait::Channel::new();
         let iocb_arrived_id = wait_source::register_wait_channel(iocb_arrived_channel);
-        let iocb_arrived =
-            Arc::new(WaitSource::new(WaitSourceId::new(iocb_arrived_id)));
+        let iocb_arrived = Arc::new(WaitSource::new(WaitSourceId::new(iocb_arrived_id)));
         let events_available_channel = tx_reactor::wait::Channel::new();
-        let events_available_id =
-            wait_source::register_wait_channel(events_available_channel);
-        let events_available =
-            Arc::new(WaitSource::new(WaitSourceId::new(events_available_id)));
+        let events_available_id = wait_source::register_wait_channel(events_available_channel);
+        let events_available = Arc::new(WaitSource::new(WaitSourceId::new(events_available_id)));
         Self {
             context_id: allocate_context_id(),
             nr_events,
@@ -595,10 +592,9 @@ impl Drop for AioContext {
         // future observes the abort on its next poll and terminates.
         // Phase 5 wires `sys_io_destroy(2)` and the principal-exit
         // path through the same signal.
-        self.worker_abort
-            .trip(OnBehalfOfAbort::CooperativeCancel(
-                tx_substrate::step_v3::CancelReason::OwnerRequested,
-            ));
+        self.worker_abort.trip(OnBehalfOfAbort::CooperativeCancel(
+            tx_substrate::step_v3::CancelReason::OwnerRequested,
+        ));
         wait_source::release_wait_channel(self.iocb_arrived_id);
         wait_source::release_wait_channel(self.events_available_id);
     }
@@ -636,8 +632,7 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
 ///
 /// `Send + Sync + 'static` so the future containing the callback is
 /// itself `Send + 'static` (matching `AioWorkerFuture`'s bound).
-pub type IocbDispatcher =
-    Arc<dyn Fn(&Iocb) -> IoEvent + Send + Sync + 'static>;
+pub type IocbDispatcher = Arc<dyn Fn(&Iocb) -> IoEvent + Send + Sync + 'static>;
 
 /// Default dispatcher: every iocb completes with `-EINVAL` (i.e. the
 /// kernel rejects the op). Used by the framework / unit tests that
@@ -706,9 +701,7 @@ where
                     if let Some(iocb) = aio_cap_inner.pop_iocb() {
                         let event = dispatcher_inner(&iocb);
                         aio_cap_inner.push_completion(event);
-                        aio_cap_inner
-                            .dispatched
-                            .fetch_add(1, Ordering::AcqRel);
+                        aio_cap_inner.dispatched.fetch_add(1, Ordering::AcqRel);
                         continue;
                     }
                     // Queue drained — yield so the outer racer
@@ -755,11 +748,7 @@ pub struct AioWorkerFuture {
 
 enum AioWorkerState {
     Running(
-        Pin<
-            alloc::boxed::Box<
-                dyn Future<Output = Result<(), OnBehalfOfAbort>> + Send + 'static,
-            >,
-        >,
+        Pin<alloc::boxed::Box<dyn Future<Output = Result<(), OnBehalfOfAbort>> + Send + 'static>>,
     ),
     Finished(Result<(), OnBehalfOfAbort>),
 }
@@ -808,9 +797,8 @@ impl Future for AioWorkerFuture {
 /// layer; the body sees Pending on each parked iteration so this
 /// outer racer is given a chance to fire.
 struct WorkerOuter {
-    helper: Pin<alloc::boxed::Box<
-        dyn Future<Output = Result<(), OnBehalfOfAbort>> + Send + 'static,
-    >>,
+    helper:
+        Pin<alloc::boxed::Box<dyn Future<Output = Result<(), OnBehalfOfAbort>> + Send + 'static>>,
     worker_abort: Arc<AbortSignal>,
 }
 

@@ -173,10 +173,8 @@ fn vfs_wait_source_invariants_round_trip() {
         read_id, write_id,
         "read and write directions must mint distinct registry slots",
     );
-    let read_source: Arc<tx_substrate::wake::WaitSource> =
-        rnode.read_wait_source().clone();
-    let write_source: Arc<tx_substrate::wake::WaitSource> =
-        rnode.write_wait_source().clone();
+    let read_source: Arc<tx_substrate::wake::WaitSource> = rnode.read_wait_source().clone();
+    let write_source: Arc<tx_substrate::wake::WaitSource> = rnode.write_wait_source().clone();
     assert_eq!(
         read_source.id(),
         WaitSourceId::new(read_id),
@@ -190,8 +188,7 @@ fn vfs_wait_source_invariants_round_trip() {
 
     // ---- (2) blocked-reader-woken-on-fire_read_wait ---------------
     let reader_mb = Arc::new(TaskMailbox::new());
-    let (_reader_guard, reader_gen) =
-        register(&read_source, &reader_mb, VFS_READABLE);
+    let (_reader_guard, reader_gen) = register(&read_source, &reader_mb, VFS_READABLE);
     assert!(reader_mb.is_empty(), "no events before any fire");
 
     // ---- (4) D2-coexistence: drive a legacy `Channel.wait` future
@@ -251,8 +248,7 @@ fn vfs_wait_source_invariants_round_trip() {
 
     // ---- (3) blocked-writer-woken-on-fire_write_wait --------------
     let writer_mb = Arc::new(TaskMailbox::new());
-    let (_writer_guard, writer_gen) =
-        register(&write_source, &writer_mb, VFS_WRITABLE);
+    let (_writer_guard, writer_gen) = register(&write_source, &writer_mb, VFS_WRITABLE);
     assert!(writer_mb.is_empty(), "no events before fire_write_wait");
 
     let _ = rnode.fire_write_wait(VFS_WRITABLE);

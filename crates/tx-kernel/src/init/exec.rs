@@ -388,10 +388,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 // `tx_scripts::process::exec::LAST_NOTEXEC_SITE`. Emit
                 // that on the same line so the busybox loader gap can
                 // be triaged from the boot log alone.
-                if matches!(
-                    e,
-                    tx_scripts::process::exec::ExecError::NotExecutable
-                ) {
+                if matches!(e, tx_scripts::process::exec::ExecError::NotExecutable) {
                     tx_hal::console_write_str::<P>(":site=");
                     tx_hal::console_write_str::<P>(
                         tx_scripts::process::exec::script::last_notexec_site_label(),
@@ -568,13 +565,11 @@ impl<P: TxPlatform> CoreInit<P> {
                     Self::write_board_sentinel_prefix();
                     tx_hal::console_write_str::<P>(":iter_tick:read=");
                     Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS
-                            .load(Ordering::Relaxed),
+                        tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS.load(Ordering::Relaxed),
                     );
                     tx_hal::console_write_str::<P>(":ppoll=");
                     Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS
-                            .load(Ordering::Relaxed),
+                        tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS.load(Ordering::Relaxed),
                     );
                     tx_hal::console_write_str::<P>(":clone=");
                     Self::write_decimal_unsigned(
@@ -593,8 +588,8 @@ impl<P: TxPlatform> CoreInit<P> {
                     );
                     tx_hal::console_write_str::<P>(":clone_flags=");
                     Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_CLONE_LAST_FLAGS
-                            .load(Ordering::Relaxed) as usize,
+                        tx_shims::linux_syscall::proc::SYS_CLONE_LAST_FLAGS.load(Ordering::Relaxed)
+                            as usize,
                     );
                     tx_hal::console_write_str::<P>(":clone_reject=");
                     Self::write_decimal_unsigned(
@@ -635,13 +630,11 @@ impl<P: TxPlatform> CoreInit<P> {
                     Self::write_board_sentinel_prefix();
                     tx_hal::console_write_str::<P>(":syscall_tick:read=");
                     Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS
-                            .load(Ordering::Relaxed),
+                        tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS.load(Ordering::Relaxed),
                     );
                     tx_hal::console_write_str::<P>(":ppoll=");
                     Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS
-                            .load(Ordering::Relaxed),
+                        tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS.load(Ordering::Relaxed),
                     );
                     tx_hal::console_write_str::<P>(":ioctl=");
                     Self::write_decimal_unsigned(
@@ -766,7 +759,8 @@ impl<P: TxPlatform> CoreInit<P> {
         );
         tx_hal::console_write_str::<P>(":last_request=");
         Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_LAST_REQUEST.load(Ordering::Relaxed) as usize,
+            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_LAST_REQUEST.load(Ordering::Relaxed)
+                as usize,
         );
         tx_hal::console_write_str::<P>(":tcsets_calls=");
         Self::write_decimal_unsigned(
@@ -814,7 +808,8 @@ impl<P: TxPlatform> CoreInit<P> {
         );
         tx_hal::console_write_str::<P>(":ppoll_last_timeout_ptr=");
         Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_PPOLL_LAST_TIMEOUT_PTR.load(Ordering::Relaxed) as usize,
+            tx_shims::linux_syscall::io::SYS_PPOLL_LAST_TIMEOUT_PTR.load(Ordering::Relaxed)
+                as usize,
         );
         tx_hal::console_write_str::<P>("\n");
 
@@ -830,25 +825,6 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":wait4=");
         Self::write_decimal_unsigned(
             tx_shims::linux_syscall::proc::SYS_WAIT4_INVOCATIONS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>("\n");
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":fault_sigsegv:hits=");
-        Self::write_decimal_unsigned(crate::FAULT_SIGSEGV_HITS.load(Ordering::Relaxed));
-        tx_hal::console_write_str::<P>(":last_addr=");
-        Self::write_decimal_unsigned(crate::FAULT_SIGSEGV_ADDR.load(Ordering::Relaxed));
-        tx_hal::console_write_str::<P>(":last_access=");
-        Self::write_decimal_unsigned(crate::FAULT_SIGSEGV_ACCESS.load(Ordering::Relaxed) as usize);
-        tx_hal::console_write_str::<P>(":last_pid=");
-        Self::write_decimal_unsigned(crate::FAULT_SIGSEGV_PID.load(Ordering::Relaxed));
-        tx_hal::console_write_str::<P>(":clone_pc_entry=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::proc::SYS_CLONE_PARENT_PC_ENTRY.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":clone_pc_exit=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::proc::SYS_CLONE_PARENT_PC_EXIT.load(Ordering::Relaxed),
         );
         tx_hal::console_write_str::<P>("\n");
     }

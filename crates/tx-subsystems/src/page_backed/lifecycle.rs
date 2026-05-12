@@ -111,7 +111,11 @@ pub fn step_fsync(
             }
             V3::Yield {
                 progress: _,
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
                 let progress = if pages_so_far == 0 {
                     PageProgress::EMPTY
@@ -148,7 +152,11 @@ pub fn step_fsync(
         }
         V3::Yield {
             progress: _,
-            shape: YieldShape::OnWaitSource { source: carrier, interests },
+            shape:
+                YieldShape::OnWaitSource {
+                    source: carrier,
+                    interests,
+                },
         } => {
             let progress = if pages_so_far == 0 {
                 PageProgress::EMPTY
@@ -219,9 +227,17 @@ pub fn step_truncate(
             V3::Continue { progress: _ } => true,
             V3::Yield {
                 progress: _,
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
-                return V3::yield_on_wait_source(PageProgress::EMPTY, carrier.raw(), interests.raw());
+                return V3::yield_on_wait_source(
+                    PageProgress::EMPTY,
+                    carrier.raw(),
+                    interests.raw(),
+                );
             }
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
@@ -290,9 +306,17 @@ pub fn step_fallocate(
             V3::Continue { progress: _ } => true,
             V3::Yield {
                 progress: _,
-                shape: YieldShape::OnWaitSource { source: carrier, interests },
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
             } => {
-                return V3::yield_on_wait_source(PageProgress::EMPTY, carrier.raw(), interests.raw());
+                return V3::yield_on_wait_source(
+                    PageProgress::EMPTY,
+                    carrier.raw(),
+                    interests.raw(),
+                );
             }
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
@@ -328,13 +352,14 @@ pub fn step_fallocate(
 // the `*Op` types incrementally.
 
 /// `StepOp` wrap of [`step_fsync`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct FsyncOp<'a> {
     pub pc: &'a PageContainer,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for FsyncOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for FsyncOp<'a>
 {
     type Output = ();
     type Progress = tx_substrate::step_v3::PageProgress;
@@ -347,14 +372,15 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_truncate`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct TruncateOp<'a> {
     pub pc: &'a PageContainer,
     pub new_size: u64,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for TruncateOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for TruncateOp<'a>
 {
     type Output = ();
     type Progress = tx_substrate::step_v3::PageProgress;
@@ -367,14 +393,15 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
 }
 
 /// `StepOp` wrap of [`step_fallocate`].
+#[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct FallocateOp<'a> {
     pub pc: &'a PageContainer,
     pub new_size: u64,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity>
-    tx_substrate::step_v3::StepOp<I> for FallocateOp<'a>
+impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+    for FallocateOp<'a>
 {
     type Output = ();
     type Progress = tx_substrate::step_v3::PageProgress;
@@ -945,7 +972,10 @@ mod step_op_wraps {
         setup();
         let guard = tx_substrate::epoch::guard();
         let pc = anon_pc(1);
-        let mut op = FsyncOp { pc: &pc, guard: &guard };
+        let mut op = FsyncOp {
+            pc: &pc,
+            guard: &guard,
+        };
         let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
         assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
     }

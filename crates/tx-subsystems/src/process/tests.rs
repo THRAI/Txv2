@@ -1279,7 +1279,7 @@ fn step_fork_clones_fd_cloexec_bits() {
 
 #[test]
 fn step_close_cloexec_fds_closes_marked_fds_clears_others() {
-    use crate::process::execution::step_close_cloexec_fds;
+    use crate::process::exec_prep::step_close_cloexec_fds;
     let _g = setup();
     let proc_cap = bootstrap();
 
@@ -1303,7 +1303,7 @@ fn step_close_cloexec_fds_closes_marked_fds_clears_others() {
 
 #[test]
 fn step_close_cloexec_fds_clears_bitmap_after() {
-    use crate::process::execution::step_close_cloexec_fds;
+    use crate::process::exec_prep::step_close_cloexec_fds;
     let _g = setup();
     let proc_cap = bootstrap();
 
@@ -1327,7 +1327,8 @@ fn step_close_cloexec_fds_clears_bitmap_after() {
 
 #[test]
 fn step_install_brk_for_exec_resets_both_brk_base_and_current() {
-    use crate::process::execution::{step_install_brk_for_exec, BOOTSTRAP_BRK_BASE};
+    use crate::process::exec_prep::step_install_brk_for_exec;
+    use crate::process::execution::BOOTSTRAP_BRK_BASE;
     let _g = setup();
     let proc_cap = bootstrap();
 
