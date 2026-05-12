@@ -40,6 +40,10 @@ Start with:
 - For fast local feedback (build + host unit tests), run `cargo -q xtask unit`.
   One line per step on pass; failures show only the failing test name, panic
   message, and failure list — no passing lines or cargo build headers.
+- To build everything needed before a QEMU run (environment check, kernel ELF,
+  and initramfs/disk image), run `cargo xtask full-build [--target TARGET]
+  [--skip-doctor] [--no-image]`. This is the prepare step before
+  `cargo xtask qemu`; `cargo xtask test [busybox-]smoke` chains all three.
 - For RV64 QEMU trap or fault logs, prefer `cargo xtask fault-decode
   --target rv64-qemu` before hand-decoding `scause`/`sepc`/`stval`. The tool
   handles low-linked and high-VMA ELF layouts, direct-map classification,
