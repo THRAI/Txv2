@@ -198,7 +198,7 @@ impl tx_hal::PmapIf for IrqTestPlatform {
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = IRQ_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = tx_subsystems::zones::register_all();
     tx_subsystems::cross_crate_test_support::reset_init_process();
     tx_subsystems::cross_crate_test_support::reset_pid_counter();

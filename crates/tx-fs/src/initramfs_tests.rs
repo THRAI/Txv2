@@ -17,7 +17,7 @@ use crate::tmpfs::Tmpfs;
 const NEWC_HEADER_LEN: usize = 110;
 
 fn init_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     tx_subsystems::zones::register_all().expect("tx-subsystems zones");
     match page_allocator::claim_zero_frame() {
         Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}

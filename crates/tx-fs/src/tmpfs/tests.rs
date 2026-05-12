@@ -16,7 +16,7 @@ use tx_subsystems::vfs::{
 use super::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 
 fn init_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     // tmpfs's `PageContainer::new_cap` requires the
     // `PAGE_CONTAINER_ZONE` to be registered. `register_all` is
     // idempotent (`register_static_zone` is a no-op for zones it
