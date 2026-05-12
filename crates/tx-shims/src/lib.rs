@@ -6,6 +6,8 @@
 // brings the crate into the namespace they share.
 #[cfg_attr(not(test), allow(unused_extern_crates))]
 extern crate alloc;
+pub mod adapter;
+use crate::adapter::step_engine::ScriptCtx;
 #[cfg(test)]
 extern crate std;
 
@@ -29,7 +31,7 @@ pub mod posix_signal {}
 /// the 7 canonical syscalls (sys_open, sys_read, sys_write, sys_fork,
 /// sys_execve, sys_close, sys_pipe).
 pub type KernelScriptCtx =
-    tx_substrate::step_v3::ScriptCtx<tx_subsystems::process::ProcessIdentity>;
+    ScriptCtx<tx_subsystems::process::ProcessIdentity>;
 
 /// Production `SubjectContext` alias parallel to [`KernelScriptCtx`].
 pub type KernelSubjectContext =
@@ -122,7 +124,7 @@ mod kernel_script_ctx_tests {
         // Same op against placeholder ScriptCtx<ProcessIdentity> →
         // Done(false). Confirms the op is polymorphic across I.
         let mut placeholder_ctx =
-            tx_substrate::step_v3::ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
         assert_eq!(op.step(&mut placeholder_ctx), StepOutcome::Done(false));
     }
 }

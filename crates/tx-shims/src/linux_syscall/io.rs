@@ -4,6 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 /// `write(fd, buf, count)`.
 ///
@@ -341,7 +342,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 
     // Loop on the canonical async wait discipline pattern from
     // `vm::execution::fault_script`. Each iteration takes a fresh
-    // `tx_substrate::epoch::guard()` inside the step's call site so
+    // `step_engine::guard()` inside the step's call site so
     // the guard never crosses an `.await`.
     //
     // PR-9 phase 3b: drive `OpenFile::step_write` via the
@@ -362,7 +363,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let mut remaining = bytes.as_slice();
     loop {
         let outcome = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let mut op = OpenFileWriteOp {
                 file: &file,
                 bytes: remaining,
@@ -550,7 +551,7 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     let mut cursor: usize = 0;
     loop {
         let outcome = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let mut op = OpenFileReadOp {
                 file: &file,
                 out: &mut staging[cursor..],

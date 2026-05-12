@@ -4,6 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 /// `fcntl(fd, cmd, arg)` per the Wave 2 ELF-loader plan §"Part 2 —
 /// Per-fd CLOEXEC bitmap + fcntl(F_SETFD) + O_CLOEXEC" plus Slice 7 of
@@ -229,7 +230,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // noop-waker poll always returns `Ready`.
     use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
     let walk_first = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let outcome =
             poll_walker_synchronously(step_walk(cwd.clone(), &path, &walker_cred, &guard));
         drop(guard);
@@ -265,13 +266,13 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             return SyscallResult::Error(EISDIR_VALUE);
         }
         if meta.size != 0 {
-            use tx_substrate::step_v3::StepOutcome as V3Trunc;
+            use StepOutcome as V3Trunc;
             let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
                 Some(b) => b,
                 None => return SyscallResult::Error(ENOSYS_VALUE),
             };
             let fs_object_id = dentry.rnode().fs_object_id();
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             match fs_page_backing.truncate(fs_object_id, 0, &guard) {
                 V3Trunc::Done(()) => {}
                 V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => {
@@ -295,7 +296,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     //
     // Same Send-future discipline as Step 1: poll_walker_synchronously.
     let openfile: Cap<OpenFile> = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let outcome = poll_walker_synchronously(step_open(
             cwd,
             &path,
@@ -533,8 +534,8 @@ pub(super) fn sys_lseek<'a>(
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let guard = tx_substrate::epoch::guard();
-    use tx_substrate::step_v3::StepOutcome as V3Out;
+    let guard = step_engine::guard();
+    use StepOutcome as V3Out;
     match file.step_lseek(offset, whence, &guard) {
         V3Out::Done(new_offset) => SyscallResult::Return(new_offset as i64),
         V3Out::Continue { .. } | V3Out::Yield { .. } => {
@@ -705,8 +706,8 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 
     // v3 step_ioctl_* return Done/Err only in practice; helper to
     // collapse the four-variant catalog into a v4 Errno-or-value.
-    use tx_substrate::step_v3::StepOutcome as V3Out;
-    fn unwrap_v3<T>(v: V3Out<T, tx_substrate::step_v3::NoProgress>) -> Result<T, Errno> {
+    use StepOutcome as V3Out;
+    fn unwrap_v3<T>(v: V3Out<T, NoProgress>) -> Result<T, Errno> {
         match v {
             V3Out::Done(t) => Ok(t),
             V3Out::Err(e) => Err(e.into()),
@@ -717,7 +718,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     match request {
         TCGETS => {
             let outcome = {
-                let guard = tx_substrate::epoch::guard();
+                let guard = step_engine::guard();
                 step_ioctl_tcgets(&tty, &guard)
             };
             match unwrap_v3(outcome) {
@@ -773,7 +774,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 );
             }
             let outcome = {
-                let guard = tx_substrate::epoch::guard();
+                let guard = step_engine::guard();
                 step_ioctl_tcsets(&tty, new_termios, &guard)
             };
             match unwrap_v3(outcome) {
@@ -783,7 +784,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         }
         TIOCGPGRP => {
             let outcome = {
-                let guard = tx_substrate::epoch::guard();
+                let guard = step_engine::guard();
                 step_ioctl_tiocgpgrp(&tty, &guard)
             };
             match unwrap_v3(outcome) {
@@ -809,7 +810,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             let caller = make_ioctl_caller(ctx);
             let outcome = {
-                let guard = tx_substrate::epoch::guard();
+                let guard = step_engine::guard();
                 step_ioctl_tiocspgrp(&tty, caller, new_pgrp, &guard)
             };
             match unwrap_v3(outcome) {
@@ -819,7 +820,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         }
         TIOCGWINSZ => {
             let outcome = {
-                let guard = tx_substrate::epoch::guard();
+                let guard = step_engine::guard();
                 step_ioctl_tiocgwinsz(&tty, &guard)
             };
             match unwrap_v3(outcome) {
@@ -844,7 +845,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
             let outcome = {
-                let guard = tx_substrate::epoch::guard();
+                let guard = step_engine::guard();
                 step_ioctl_tiocswinsz(&tty, ws, &guard)
             };
             match unwrap_v3(outcome) {
@@ -860,7 +861,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             // -EBUSY regardless of the force flag.
             let caller = make_ioctl_caller(ctx);
             let outcome = {
-                let guard = tx_substrate::epoch::guard();
+                let guard = step_engine::guard();
                 step_ioctl_tiocsctty(&tty, caller, &guard)
             };
             match unwrap_v3(outcome) {
@@ -871,7 +872,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         TIOCNOTTY => {
             let caller = make_ioctl_caller(ctx);
             let outcome = {
-                let guard = tx_substrate::epoch::guard();
+                let guard = step_engine::guard();
                 step_ioctl_tiocnotty(&tty, caller, &guard)
             };
             match unwrap_v3(outcome) {
@@ -1045,9 +1046,9 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             Some(d) => d,
             None => return SyscallResult::Error(ENOENT_VALUE),
         };
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use StepOutcome as V3;
         let outcome = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard))
         };
         match outcome {
@@ -1135,10 +1136,10 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let mut cursor = file.readdir_cursor();
     let mut written: usize = 0;
 
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use StepOutcome as V3;
     loop {
         let outcome = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             fs_ops.readdir(dir_fs_object_id, cursor, &guard)
         };
         match outcome {
@@ -1245,7 +1246,7 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 pub(super) fn fs_ops_for_rnode(
     rnode: &Cap<tx_subsystems::vfs::structure::RNode>,
 ) -> Option<Arc<dyn tx_subsystems::vfs::FsOps>> {
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let weak = rnode.containing_mount_weak()?;
     let payload = weak.upgrade(&guard)?;
     Some(payload.fs_ops.clone())

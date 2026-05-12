@@ -4,8 +4,6 @@ use core::{
 };
 
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
-use tx_substrate::step_v3::StepOutcome;
-use tx_substrate::zone::Cap;
 use tx_substrate::SpinMutex;
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
@@ -15,6 +13,8 @@ use tx_subsystems::mount::{
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::tty::structure::TtyIdentity;
 use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNodeBacking};
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::boot_runtime;
 
 // Boot-smoke busy-wait budget for AP reactor task completion. 100k was
 // fine on bare metal and Apple-silicon TCG, but GitHub Actions runs
@@ -25,7 +25,7 @@ use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNode
 // sub-second on real hardware but gives the emulator enough headroom.
 const AP_REACTOR_WAIT_SPINS: usize = 10_000_000;
 
-static BOOT_REACTOR: tx_reactor::SharedReactor = tx_reactor::SharedReactor::empty();
+static BOOT_REACTOR: boot_runtime::SharedReactor = boot_runtime::SharedReactor::empty();
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 
@@ -103,22 +103,22 @@ impl<P: TxPlatform> CharDeviceOps for ConsoleCharOps<P> {
         &self,
         _out: &mut [u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-        tx_substrate::step_v3::StepOutcome::Done(0)
+    ) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::Done(0)
     }
 
     fn write(
         &self,
         bytes: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> StepOutcome<usize, ByteProgress> {
         // The HAL exposes byte-oriented console writes; tx-kernel's
         // existing init code uses `console_write_str` which calls
         // `P::write_bytes` under the hood. We bypass the str
         // adapter so non-UTF-8 bytes (e.g., raw control sequences)
         // round-trip unchanged.
         <P as tx_hal::ConsoleIf>::write_bytes(bytes);
-        tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+        StepOutcome::Done(bytes.len())
     }
 }
 
@@ -134,8 +134,8 @@ impl<P: TxPlatform> SmpRescheduleSignal<P> {
     }
 }
 
-impl<P: TxPlatform> tx_reactor::RescheduleSignal for SmpRescheduleSignal<P> {
-    fn send_reschedule_ipi(&mut self, target_hart: tx_reactor::HartId) {
+impl<P: TxPlatform> boot_runtime::RescheduleSignal for SmpRescheduleSignal<P> {
+    fn send_reschedule_ipi(&mut self, target_hart: boot_runtime::HartId) {
         <P as tx_hal::SmpIf>::send_ipi(CpuId(target_hart.0), IpiKind::Reschedule);
     }
 }
@@ -334,9 +334,9 @@ impl<P: TxPlatform> CoreInit<P> {
             ops: ops_static,
         }));
 
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let tty = match register_hardware("console", 0, binding, &guard) {
-            tx_substrate::step_v3::StepOutcome::Done(tty) => tty,
+            StepOutcome::Done(tty) => tty,
             other => panic!("register_console_hardware: register_hardware failed: {other:?}"),
         };
         drop(guard);
@@ -437,9 +437,9 @@ impl<P: TxPlatform> CoreInit<P> {
                 RNodeBacking::Directory,
             )
             .with_containing_mount(&payload);
-            let res = tx_substrate::zone::reserve_for::<RNode>()
+            let res = step_engine::reserve_for::<RNode>()
                 .expect("mount_rootfs_tmpfs: root rnode reservation");
-            tx_substrate::zone::sign_for(res, raw)
+            step_engine::sign_for(res, raw)
         };
         let _root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone())
             .expect("mount_rootfs_tmpfs: root dentry reservation");
@@ -482,10 +482,10 @@ impl<P: TxPlatform> CoreInit<P> {
         // tmpfs instance whose `FsOps::mkdir` actually mutates the
         // tmpfs directory map. Boot-time tmpfs mkdir is synchronous,
         // so Continue/Yield are unreachable and panic if they fire.
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         // Bootstrap path runs as root by construction.
         let cred = Credential::root();
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use StepOutcome as V3;
         let (dev_object_id, dev_meta) = match root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
@@ -541,9 +541,9 @@ impl<P: TxPlatform> CoreInit<P> {
                 RNodeBacking::Directory,
             )
             .with_containing_mount(&devfs_payload);
-            let res = tx_substrate::zone::reserve_for::<RNode>()
+            let res = step_engine::reserve_for::<RNode>()
                 .expect("mount_devfs_at_dev: devfs root rnode reservation");
-            tx_substrate::zone::sign_for(res, raw)
+            step_engine::sign_for(res, raw)
         };
 
         // Snapshot the rootfs's payload before consuming `root_mount`
@@ -600,7 +600,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let tty =
             console_tty().expect("register_devfs_console_alias: console TTY must be registered");
         match register_console_alias("console", tty) {
-            tx_substrate::step_v3::StepOutcome::Done(()) => {}
+            StepOutcome::Done(()) => {}
             other => {
                 panic!("register_devfs_console_alias: register_console_alias failed: {other:?}")
             }
@@ -766,9 +766,9 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         };
 
-        let target_hart = tx_reactor::HartId(target_cpu.0);
-        let current_hart = tx_reactor::HartId(<P as tx_hal::SmpIf>::current_cpu_id().0);
-        let mask = tx_reactor::wait::Mask::from_bits(0x1);
+        let target_hart = boot_runtime::HartId(target_cpu.0);
+        let current_hart = boot_runtime::HartId(<P as tx_hal::SmpIf>::current_cpu_id().0);
+        let mask = boot_runtime::wait::Mask::from_bits(0x1);
         let targets = CpuMask::single(target_cpu);
         Self::clear_ap_reactor_task_done(targets);
 
@@ -783,7 +783,7 @@ impl<P: TxPlatform> CoreInit<P> {
                             Self::mark_ap_reactor_task_done(target_cpu);
                         }
                     },
-                    tx_reactor::InitialSchedMeta::kernel()
+                    boot_runtime::InitialSchedMeta::kernel()
                         .with_affinity(CpuMask::single(target_cpu).bits()),
                 );
                 channel
@@ -870,23 +870,23 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::step_boot_reactor_once(cpu_id).is_some_and(|step| !step.should_idle())
     }
 
-    fn step_boot_reactor_once(cpu_id: CpuId) -> Option<tx_reactor::hart_loop::HartLoopStep> {
-        let hart = tx_reactor::HartId(cpu_id.0);
+    fn step_boot_reactor_once(cpu_id: CpuId) -> Option<boot_runtime::hart_loop::HartLoopStep> {
+        let hart = boot_runtime::HartId(cpu_id.0);
         let now_ns = P::read_ns();
         let mut signal = SmpRescheduleSignal::<P>::new();
         let step = BOOT_REACTOR.with(|reactor| {
-            tx_reactor::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal)
+            boot_runtime::hart_loop::step_hart_loop_at(reactor, hart, now_ns, &mut signal)
         })?;
         Self::program_hart_loop_deadline(step.deadline_action);
         Some(step)
     }
 
-    fn program_hart_loop_deadline(action: tx_reactor::hart_loop::HartLoopDeadlineAction) {
+    fn program_hart_loop_deadline(action: boot_runtime::hart_loop::HartLoopDeadlineAction) {
         match action {
-            tx_reactor::hart_loop::HartLoopDeadlineAction::Arm { deadline_ns } => {
+            boot_runtime::hart_loop::HartLoopDeadlineAction::Arm { deadline_ns } => {
                 P::set_deadline_ns(deadline_ns)
             }
-            tx_reactor::hart_loop::HartLoopDeadlineAction::Cancel => P::cancel_deadline(),
+            boot_runtime::hart_loop::HartLoopDeadlineAction::Cancel => P::cancel_deadline(),
         }
     }
 
@@ -934,7 +934,7 @@ impl<P: TxPlatform> CoreInit<P> {
                         Self::write_board_sentinel_prefix();
                         tx_hal::console_write_str::<P>(":reactor:task:ok\n");
                     },
-                    tx_reactor::InitialSchedMeta::kernel()
+                    boot_runtime::InitialSchedMeta::kernel()
                         .with_affinity(CpuMask::single(current_cpu).bits()),
                 );
             })
@@ -967,20 +967,20 @@ impl<P: TxPlatform> CoreInit<P> {
         BOOT_REACTOR
             .with(|reactor| {
                 let channel = reactor.channel();
-                let mask = tx_reactor::wait::Mask::from_bits(0x1);
+                let mask = boot_runtime::wait::Mask::from_bits(0x1);
                 reactor.submit_task_with_meta(
                     async move {
                         let outcome = channel
                             .wait_event(
                                 mask,
-                                tx_reactor::wait::WaitProtocol::InterruptibleTimeout(deadline_ns),
+                                boot_runtime::wait::WaitProtocol::InterruptibleTimeout(deadline_ns),
                                 || false,
                             )
                             .await;
-                        assert_eq!(outcome, tx_reactor::wait::WaitOutcome::TimedOut);
+                        assert_eq!(outcome, boot_runtime::wait::WaitOutcome::TimedOut);
                         BSP_REACTOR_TIMER_DONE_CPUS.fetch_or(cpu_bit, Ordering::Release);
                     },
-                    tx_reactor::InitialSchedMeta::kernel()
+                    boot_runtime::InitialSchedMeta::kernel()
                         .with_affinity(CpuMask::single(current_cpu).bits()),
                 );
             })

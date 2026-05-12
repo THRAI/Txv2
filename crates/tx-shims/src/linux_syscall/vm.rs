@@ -4,6 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 /// `brk(requested)` per `txdoc:VM-5-8-BRK`.
 ///
@@ -401,7 +402,7 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
     loop {
         let outcome = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             ctx.aspace.msync(range, &guard)
         };
         match outcome {
@@ -545,7 +546,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sysc
             let mut parked = false;
             loop {
                 let outcome = {
-                    let guard = tx_substrate::epoch::guard();
+                    let guard = step_engine::guard();
                     tx_subsystems::futex::step_futex_wait(uaddr, val, &guard)
                 };
                 use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
@@ -596,10 +597,10 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sysc
         FUTEX_WAKE => {
             let n = val;
             let outcome = {
-                let guard = tx_substrate::epoch::guard();
+                let guard = step_engine::guard();
                 tx_subsystems::futex::step_futex_wake(uaddr, n, &guard)
             };
-            use tx_substrate::step_v3::StepOutcome as V3;
+            use StepOutcome as V3;
             match outcome {
                 V3::Done(woken) => SyscallResult::Return(woken as i64),
                 V3::Continue { .. } | V3::Yield { .. } => {

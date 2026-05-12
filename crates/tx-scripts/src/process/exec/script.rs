@@ -44,7 +44,6 @@
 use alloc::vec::Vec;
 
 use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
-use tx_substrate::zone::Cap;
 use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{read_exact_at, PageContainer};
@@ -65,6 +64,7 @@ use super::loader::{
     SegmentFlags as ParsedSegmentFlags, ELF64_PHENT,
 };
 use super::stack::{build_initial_user_stack, AuxvFacts};
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 /// User page size — RV64 today; mirrors `vm::USER_PAGE_SIZE` so the
 /// brk-base round-up doesn't require pulling in another import.
@@ -304,8 +304,8 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // canonical `take a fresh guard inside an await_*` shape per
     // `vm::execution::fault_script`.
     let openfile = {
-        use tx_substrate::step_v3::StepOutcome as V3;
-        let guard = tx_substrate::epoch::guard();
+        use StepOutcome as V3;
+        let guard = step_engine::guard();
         let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
         let outcome = poll_walker_synchronously(step_open(
             rooted_at,
@@ -375,8 +375,8 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     }
     let mut header_bytes: Vec<u8> = alloc::vec![0u8; read_len];
     {
-        use tx_substrate::step_v3::StepOutcome as V3;
-        let guard = tx_substrate::epoch::guard();
+        use StepOutcome as V3;
+        let guard = step_engine::guard();
         let outcome = read_exact_at(&file_pc, 0, &mut header_bytes, &guard);
         let result = match outcome {
             V3::Done(()) => Ok(()),
@@ -518,8 +518,8 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
             .ok_or_else(|| record_notexec_site(NOTEXEC_SITE_PHASE5A_FILE_OFF_OVERFLOW))?;
         let mut buf = alloc::vec![0u8; partial_in_page as usize];
         {
-            use tx_substrate::step_v3::StepOutcome as V3;
-            let guard = tx_substrate::epoch::guard();
+            use StepOutcome as V3;
+            let guard = step_engine::guard();
             match read_exact_at(&segment.backing, file_off, &mut buf, &guard) {
                 V3::Done(()) => {}
                 V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
@@ -527,12 +527,12 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
             }
         }
         match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
-            tx_substrate::step_v3::StepOutcome::Done(()) => {}
-            tx_substrate::step_v3::StepOutcome::Continue { .. }
-            | tx_substrate::step_v3::StepOutcome::Yield { .. } => {
+            StepOutcome::Done(()) => {}
+            StepOutcome::Continue { .. }
+            | StepOutcome::Yield { .. } => {
                 return Err(ExecError::Busy);
             }
-            tx_substrate::step_v3::StepOutcome::Err(err) => {
+            StepOutcome::Err(err) => {
                 return Err(ExecError::from_populate_errno(err.into()));
             }
         }
@@ -600,12 +600,12 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     )
     .await
     {
-        tx_substrate::step_v3::StepOutcome::Done(()) => {}
-        tx_substrate::step_v3::StepOutcome::Continue { .. }
-        | tx_substrate::step_v3::StepOutcome::Yield { .. } => {
+        StepOutcome::Done(()) => {}
+        StepOutcome::Continue { .. }
+        | StepOutcome::Yield { .. } => {
             return Err(ExecError::Busy);
         }
-        tx_substrate::step_v3::StepOutcome::Err(err) => {
+        StepOutcome::Err(err) => {
             return Err(ExecError::from_populate_errno(err.into()));
         }
     }

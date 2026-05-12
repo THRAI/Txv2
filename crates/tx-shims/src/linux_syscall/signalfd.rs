@@ -31,6 +31,7 @@ use super::{
     bootstrap_read_user, errno_to_i32, SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE,
     EINVAL_VALUE, ENOMEM_VALUE,
 };
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 /// Linux's `sigset_t` is 8 bytes on RV64 / x86_64 (a single `u64`).
 /// The signalfd4 syscall takes `sizemask = sizeof(sigset_t) = 8` and
