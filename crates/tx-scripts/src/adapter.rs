@@ -21,6 +21,7 @@ pub mod step_engine {
     pub use tx_substrate::zone::{
         reserve_for, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
     };
+    pub use tx_substrate::{page_allocator, SpinMutex};
 
     pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
         let reservation = zone::reserve_for::<T>()?;
