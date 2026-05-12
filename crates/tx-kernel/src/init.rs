@@ -16,7 +16,14 @@ use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::tty::structure::TtyIdentity;
 use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNodeBacking};
 
-const AP_REACTOR_WAIT_SPINS: usize = 100_000;
+// Boot-smoke busy-wait budget for AP reactor task completion. 100k was
+// fine on bare metal and Apple-silicon TCG, but GitHub Actions runs
+// qemu-system-riscv64 under stock-ubuntu software emulation where AP
+// HARTs make scheduling progress so slowly that the AP couldn't drain
+// its queue inside the prior budget; the smoke would panic at
+// `reactor AP loop work completion`. 10M iterations is still
+// sub-second on real hardware but gives the emulator enough headroom.
+const AP_REACTOR_WAIT_SPINS: usize = 10_000_000;
 
 static BOOT_REACTOR: tx_reactor::SharedReactor = tx_reactor::SharedReactor::empty();
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
