@@ -4,6 +4,22 @@
 
 ## Current Shape
 
+- 2026-05-13 D34-D40 Phase 7 continued: thread_runtime, signalfd, aio,
+  userfaultfd, io_uring, reactor_submit, execution, device, wait_source,
+  zones, lib, initramfs LANDED. 7 commits (D34-D40 + fixup). Each file
+  routes all raw tx_substrate::/tx_reactor:: refs through per-file inline
+  adapters or the new crate-root adapter.rs. New adapters: thread_runtime/
+  adapter.rs (step_engine + reactor_entry), inline adapters in signalfd/
+  aio/userfaultfd/io_uring/reactor_submit, crate-root adapter.rs (step_engine
+  + wait_routing). **Boundary report:** substrate outside-adapter 683→575
+  lines (−108), inside 100→148 (+48); reactor outside 32→22 (−10), inside
+  11→18 (+7); adapters declared 30→43. Allowed residue (testing::
+  init_host_for_test_once, epoch::drain_with_budget) preserved. **Verified:**
+  cargo build -p tx-subsystems clean; all migrated subsystem tests green
+  (13 thread_runtime, 5 signalfd, 10 aio, 2 userfaultfd, 8 io_uring,
+  3 reactor_submit, device/execution/wait_source pass). Pre-existing
+  parallel test isolation failures unrelated to migration.
+
 - 2026-05-13 D31+D32 Phase 7 (page_backed, vm) adapter migration
   LANDED. Two commits: D31 for page_backed, D32 for vm. Both subsystems
   now route all tx_substrate::*/tx_reactor::* through their per-subsystem
@@ -14,8 +30,8 @@
   adapters declared 30. **Verified:** cargo build -p tx-subsystems clean
   (4 pre-existing warnings); vm tests 97/97 pass; page_backed tests
   81/81 pass single-threaded (concurrent failures are pre-existing epoch
-  nesting races). Next: progress catch-up and boundary-report delta
-  relative to D23 baseline.
+  nesting races). Next: D34+ migration of thread_runtime and standalone
+  files.
 
 - 2026-05-12 D23 Phase 6 (tx-shims, tx-kernel, tx-ext4, tx-scripts)
   adapter migration LANDED. Cross-layer consumer crates. tx-kernel
