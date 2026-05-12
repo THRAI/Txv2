@@ -78,13 +78,52 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
-use tx_substrate::step_v3::{
-    with_on_behalf_of, AbortSignal, InterestMask, OnBehalfOfAbort, ScriptCtx, SubjectContext,
-    SubjectIdentity, WaitSourceId,
+mod adapter {
+    use tx_platform_adapter::platform_adapter;
+
+    #[platform_adapter(
+        platform = "substrate",
+        domain = "step_engine",
+        apis = ["step_v3", "zone", "wake"],
+        reason = "expose substrate on-behalf-of framework (with_on_behalf_of, AbortSignal, OnBehalfOfAbort, SubjectIdentity/Context, ScriptCtx, CancelReason, InterestMask, WaitSourceId), WaitSource, zone allocation, and SpinMutex for io_uring SQPOLL worker scaffold"
+    )]
+    pub mod step_engine {
+        use tx_substrate::zone;
+
+        pub use tx_substrate::step_v3::{
+            with_on_behalf_of, AbortSignal, CancelReason, InterestMask, OnBehalfOfAbort, ScriptCtx,
+            SubjectContext, SubjectIdentity, WaitSourceId,
+        };
+        pub use tx_substrate::wake::WaitSource;
+        pub use tx_substrate::zone::{Cap, Zone, ZoneAllocated, ZoneError};
+        pub use tx_substrate::SpinMutex;
+
+        pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
+            let reservation = zone::reserve_for::<T>()?;
+            Ok(zone::sign_for(reservation, value))
+        }
+
+        pub fn register_zone_for<T: ZoneAllocated>() -> Result<(), ZoneError> {
+            zone::register_zone_for::<T>().map(|_| ())
+        }
+    }
+
+    #[platform_adapter(
+        platform = "reactor",
+        domain = "wait_routing",
+        reason = "wrap reactor Channel as io_uring SQE-arrived and CQE-available legacy wake channel"
+    )]
+    pub mod wait_routing {
+        pub use tx_reactor::wait::Channel;
+    }
+}
+
+use adapter::step_engine::{
+    sign_zone_for, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask,
+    OnBehalfOfAbort, ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource,
+    WaitSourceId, Zone, ZoneAllocated, ZoneError,
 };
-use tx_substrate::wake::WaitSource;
-use tx_substrate::zone::{self, Cap, Zone, ZoneAllocated, ZoneError};
-use tx_substrate::SpinMutex;
+use adapter::wait_routing::Channel;
 
 use crate::wait_source;
 
@@ -257,10 +296,10 @@ impl IoUring {
     /// Construct a fresh io_uring payload with the given SQ / CQ ring
     /// depths. Mirrors `AioContext::with_nr_events`.
     pub fn with_entries(sq_entries: u32, cq_entries: u32) -> Self {
-        let sqe_arrived_channel = tx_reactor::wait::Channel::new();
+        let sqe_arrived_channel = Channel::new();
         let sqe_arrived_id = wait_source::register_wait_channel(sqe_arrived_channel);
         let sqe_arrived = Arc::new(WaitSource::new(WaitSourceId::new(sqe_arrived_id)));
-        let cqe_available_channel = tx_reactor::wait::Channel::new();
+        let cqe_available_channel = Channel::new();
         let cqe_available_id = wait_source::register_wait_channel(cqe_available_channel);
         let cqe_available = Arc::new(WaitSource::new(WaitSourceId::new(cqe_available_id)));
         Self {
@@ -289,11 +328,7 @@ impl IoUring {
     /// Zone-sign a fresh io_uring with the given ring depths. Companion
     /// to [`Self::with_entries`] for the `sys_io_uring_setup(2)` arm.
     pub fn new_with_entries_cap(sq_entries: u32, cq_entries: u32) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(
-            reservation,
-            Self::with_entries(sq_entries, cq_entries),
-        ))
+        sign_zone_for(Self::with_entries(sq_entries, cq_entries))
     }
 
     /// Snapshot the stable per-ring id. Used as the worker-registry
@@ -410,7 +445,7 @@ impl IoUring {
     /// `AioContext::cancel_worker`.
     pub fn cancel_worker(&self) {
         self.worker_abort.trip(OnBehalfOfAbort::CooperativeCancel(
-            tx_substrate::step_v3::CancelReason::OwnerRequested,
+            CancelReason::OwnerRequested,
         ));
     }
 }
@@ -427,7 +462,7 @@ impl Drop for IoUring {
         // kthread future observes the abort on its next poll and
         // terminates. Mirrors `AioContext::Drop`.
         self.worker_abort.trip(OnBehalfOfAbort::CooperativeCancel(
-            tx_substrate::step_v3::CancelReason::OwnerRequested,
+            CancelReason::OwnerRequested,
         ));
         wait_source::release_wait_channel(self.sqe_arrived_id);
         wait_source::release_wait_channel(self.cqe_available_id);
@@ -445,7 +480,7 @@ unsafe impl ZoneAllocated for IoUring {
 }
 
 pub(crate) fn register_zones() -> Result<(), ZoneError> {
-    zone::register_zone_for::<IoUring>()?;
+    adapter::step_engine::register_zone_for::<IoUring>()?;
     Ok(())
 }
 
@@ -736,7 +771,7 @@ mod tests {
             matches!(
                 reason,
                 OnBehalfOfAbort::CooperativeCancel(
-                    tx_substrate::step_v3::CancelReason::OwnerRequested
+                    CancelReason::OwnerRequested
                 )
             ),
             "cancel_worker trips OwnerRequested, got {reason:?}"
