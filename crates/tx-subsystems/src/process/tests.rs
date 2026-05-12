@@ -24,8 +24,8 @@ use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentit
 use crate::vfs::{DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
+use crate::process::adapter::step_engine::{guard as ebr_guard, sign_zone_for, Cap};
 use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::zone::Cap;
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -219,7 +219,7 @@ fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
     // The pgrp has two members: parent and child.
     assert_eq!(pgrp.member_slot_count(), 2);
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let live: usize = pgrp
         .members
         .lock()
@@ -245,7 +245,7 @@ fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
     let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let live_after: usize = pgrp
         .members
         .lock()
@@ -503,8 +503,7 @@ fn fresh_dentry_under(parent: &Cap<DEntry>, name: &[u8], fs_id: u64) -> Cap<DEnt
     let inline = InlineName::new(name).expect("name");
     let mut raw = DEntry::new(inline, fresh_rnode(fs_id));
     raw.set_parent_hint(parent);
-    let res = tx_substrate::zone::reserve_for::<DEntry>().expect("dentry slot");
-    tx_substrate::zone::sign_for(res, raw)
+    sign_zone_for::<DEntry>(raw).expect("dentry slot")
 }
 
 #[test]

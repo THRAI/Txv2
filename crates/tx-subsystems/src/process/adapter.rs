@@ -33,9 +33,10 @@ pub mod step_engine {
     use tx_substrate::zone;
 
     pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::step_v3::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step_v3::{
-        NoProgress, ProcessIdentity, RestrictionStackHandle, ScriptCtx, StepOp, StepOutcome,
-        SubjectIdentity, WaitSourceId,
+        NoProgress, RestrictionStackHandle, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+        WaitSourceId,
     };
     pub use tx_substrate::zone::{
         Cap, Dead, Entity, IdentRef, OperationalCapExt, PayloadCap, Weak, Zone, ZoneAllocated,

@@ -167,7 +167,7 @@ pub struct ProcessIdentity {
     pub(crate) payload: SpinMutex<Option<PayloadCap<ProcessPayload>>>,
 }
 
-/// `ProcessIdentity` is the production [`tx_substrate::step_v3::SubjectIdentity`]
+/// `ProcessIdentity` is the production [`SubjectIdentity`]
 /// per [D1](../../../../docs/progress/decisions/2026-05-11-d1-scriptctx-trait-bound-identity.md).
 ///
 /// The trait declares what `step_v3` algebra needs to know about a
@@ -1277,7 +1277,7 @@ pub(crate) fn reset_pid_counter_for_test() {
 #[cfg(test)]
 mod subject_identity_tests {
     use super::ProcessIdentity;
-    use tx_substrate::step_v3::SubjectIdentity;
+    use crate::process::adapter::step_engine::{RestrictionStackHandle, SubjectIdentity};
 
     /// Compile-only smoke: associated types must resolve so generic
     /// bodies `fn step<I: SubjectIdentity>(...)` can name them.
@@ -1285,7 +1285,7 @@ mod subject_identity_tests {
     fn process_identity_implements_subject_identity_with_expected_associated_types() {
         fn assert_credential<I: SubjectIdentity<Credential = crate::cred::Cred>>() {}
         fn assert_restrictions<
-            I: SubjectIdentity<Restrictions = tx_substrate::step_v3::RestrictionStackHandle>,
+            I: SubjectIdentity<Restrictions = RestrictionStackHandle>,
         >() {
         }
         fn assert_thread<
