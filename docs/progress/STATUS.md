@@ -4,6 +4,30 @@
 
 ## Current Shape
 
+- 2026-05-12 Pipe EOF + TIOCSCTTY fixes LANDED. Two root causes
+  for the post-`echo pipe-ok | cat` hang / TTY inaccessibility:
+  (1) **EBR idle-drain missing** — `OpenFile::drop()` (→ `decr_writer()`
+  → pipe EOF signal) fires only when EBR reclaims the slot via
+  `drain_with_budget`; the reactor never called it unless the retired
+  queue hit RETIRE_THRESHOLD=64, which a simple pipeline never does.
+  Fix: added `tx_substrate::epoch::drain_with_budget(usize::MAX)` in
+  the idle path of `crates/tx-kernel/src/init/exec.rs` immediately
+  after `drain_sbi_console_into_tty()`, so EOF propagates within a
+  few timer ticks (~20 ms) after the last writer closes.
+  (2) **TIOCSCTTY legacy path** — `sys_ioctl` TIOCSCTTY arm was calling
+  `step_ioctl_tiocsctty` (legacy) which binds `session_pgrp` on the
+  TTY but leaves `session.controlling_tty` unset, making
+  `has_controlling_tty()` always false and breaking subsequent
+  TIOCGPGRP calls. Fix: changed TIOCSCTTY arm in
+  `crates/tx-shims/src/linux_syscall/fs_basic.rs` to call
+  `step_ioctl_tiocsctty_for_process(&tty, &ctx.process, &guard)`.
+  **Verified:** `cargo build -p tx-kernel-riscv64-qemu-virt` clean.
+  **Next step:** run `cargo xtask shell-test --target rv64-qemu
+  --script tools/shell-tests/busybox-prompt.txt` to verify the
+  shell-test now completes through `true && echo done`; add
+  `/dev/tty` devfs entry and cross-process setpgid if job-control
+  paths still fail. **Blocker:** none.
+
 - 2026-05-12 D12 Phase B (PR-2 scaffolding dead-code allowance)
   LANDED. Closes the D13 follow-up: the 26 PR-2 `StepOp` adapter
   wraps in `tx-subsystems/{page_backed,tty/execution}/` now carry

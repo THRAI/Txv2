@@ -601,6 +601,22 @@ impl<P: TxPlatform> CoreInit<P> {
             }
 
             if step.should_idle() && !init.is_zombie() {
+                // When the reactor has no pending deadline, the platform
+                // timer was cancelled by `program_hart_loop_deadline`.
+                // Re-arm it here so WFI wakes periodically — the drain
+                // calls below need to fire on every tick. This must only
+                // happen in the userspace reactor loop (not in boot smoke
+                // tests) because the timer interrupt fires
+                // `try_bounded_maintenance_tick`, which acquires zone
+                // locks that boot-time code may already hold.
+                if matches!(
+                    step.deadline_action,
+                    tx_reactor::hart_loop::HartLoopDeadlineAction::Cancel
+                ) {
+                    P::set_deadline_ns(
+                        P::read_ns().saturating_add(crate::init::IDLE_TIMER_PERIOD_NS),
+                    );
+                }
                 P::wait_for_interrupt_once();
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
@@ -617,6 +633,15 @@ impl<P: TxPlatform> CoreInit<P> {
                 // becomes redundant, but it's harmless when
                 // there are no buffered bytes).
                 Self::drain_sbi_console_into_tty();
+                // Flush deferred EBR drops so pipe write-end close
+                // propagates to blocked readers. OpenFile::drop() (which
+                // calls decr_writer → EOF signal) fires only when EBR
+                // reclaims the slot; without an explicit drain here the
+                // reactor never calls drain_with_budget unless the retired
+                // queue hits RETIRE_THRESHOLD=64, which a simple pipeline
+                // never reaches. This ensures EOF propagates within a
+                // few timer ticks (~20 ms) after the last writer closes.
+                let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
                 // DIAGNOSTIC (temp, 2026-05-12): periodically dump
                 // the syscall counters so we can see what shape
                 // userspace is in even when no userspace exit
