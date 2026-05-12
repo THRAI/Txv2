@@ -8,7 +8,7 @@ use core::{
 
 use crate::interrupt::{InterruptSource, NoInterrupts};
 use crate::timer::{DeadlineFuture, TimerQueue};
-use tx_substrate::bus::{
+use crate::adapter::bus_wire::{
     DeclaredPort, DeclaredPortSubscription, DeclaredQueue, DeclaredQueueSubscription,
     DeclaredWireError, RawPort, RawPortSubscription, WireDeclaration, WireDeclarationError,
     WireEventSet,

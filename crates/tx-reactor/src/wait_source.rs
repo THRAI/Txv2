@@ -7,4 +7,4 @@
 //! resolve. New code should import directly from
 //! `tx_substrate::wake::wait_source`.
 
-pub use tx_substrate::wake::wait_source::*;
+pub use crate::adapter::bus_wire::wait_source::*;

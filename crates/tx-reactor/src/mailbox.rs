@@ -7,4 +7,4 @@
 //! resolve. New code should import directly from
 //! `tx_substrate::wake::mailbox`.
 
-pub use tx_substrate::wake::mailbox::*;
+pub use crate::adapter::bus_wire::mailbox::*;

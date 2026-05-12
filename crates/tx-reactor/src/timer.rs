@@ -26,7 +26,7 @@ use crate::wait::WaitOutcome;
 
 // Re-export the relocated public surface so `tx_reactor::timer::*`
 // and `crate::timer::*` paths continue to resolve.
-pub use tx_substrate::wake::timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
+pub use crate::adapter::bus_wire::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
 
 // =========================================================================
 // Internal: TimerQueue (unchanged; backs existing reactor
