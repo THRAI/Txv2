@@ -19,6 +19,7 @@ use tx_hal::{
 };
 use tx_substrate::SpinMutex;
 use tx_subsystems::tty::execution::step_ingest;
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 /// The single global IRQ dispatch table tx-kernel publishes to the
 /// platform. The platform crate stores a raw `&'static
@@ -135,8 +136,8 @@ pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
     let Some(tty) = crate::init::console_tty() else {
         return IrqHandled::NotMine;
     };
-    let guard = tx_substrate::epoch::guard();
-    use tx_substrate::step_v3::StepOutcome as V3Out;
+    let guard = step_engine::guard();
+    use StepOutcome as V3Out;
     match step_ingest(&tty, &buf[..n], &guard) {
         V3Out::Done(outcome) => {
             if outcome.consumed > 0 {

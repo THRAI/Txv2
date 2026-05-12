@@ -1,11 +1,12 @@
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
-use tx_substrate::epoch::Guard;
+use step_engine::Guard;
 use tx_substrate::page_allocator::{self, ZeroPolicy};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::vfs::structure::FsObjectId;
 
 use crate::read_backend::{inode_no, Ext4FsInstance};
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 /// Allocate a frame from the page substrate, copy the disk-fetched page bytes
 /// into it, and return a permanent-pinned `Frame` referencing the resulting
@@ -20,10 +21,10 @@ use crate::read_backend::{inode_no, Ext4FsInstance};
 /// for now in production builds.
 fn materialize_frame(
     page: &Page4K,
-) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+) -> StepOutcome<Frame, NoProgress> {
     let owned = match page_allocator::reserve_frame(ZeroPolicy::Zeroed) {
         Ok(reservation) => reservation.commit(),
-        Err(_) => return tx_substrate::step_v3::StepOutcome::err(Errno::EBUSY.into()),
+        Err(_) => return StepOutcome::err(Errno::EBUSY.into()),
     };
     let ppn = owned.ppn();
 
@@ -42,7 +43,7 @@ fn materialize_frame(
     // Hand off ownership: the permanent-frame token never releases the
     // PPN to the allocator; the page-cache will add its own cache pin.
     let _permanent = owned.into_permanent_frame();
-    tx_substrate::step_v3::StepOutcome::done(Frame::new(ppn))
+    StepOutcome::done(Frame::new(ppn))
 }
 
 // === FsPageBacking impl =============================================
@@ -75,13 +76,13 @@ where
         fs_object_id: FsObjectId,
         offset: u64,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<Frame, NoProgress> {
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
-            return tx_substrate::step_v3::StepOutcome::err(Errno::EINVAL.into());
+            return StepOutcome::err(Errno::EINVAL.into());
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let file_page_index = offset / BLOCK_SIZE as u64;
         let mut page: Page4K = [0; BLOCK_SIZE];
@@ -89,7 +90,7 @@ where
         if let Err(err) =
             self.with_pager(|pager| pager.read_page(inode, file_page_index, &mut page))
         {
-            return tx_substrate::step_v3::StepOutcome::err(err.into());
+            return StepOutcome::err(err.into());
         }
 
         materialize_frame(&page)
@@ -101,8 +102,8 @@ where
         _offset: u64,
         _frame: &Frame,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn truncate(
@@ -110,16 +111,16 @@ where
         _fs_object_id: FsObjectId,
         _new_size: u64,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn fsync(
         &self,
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     // `fallocate` and `supports_reflink` inherit the trait defaults

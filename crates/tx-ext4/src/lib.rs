@@ -1,6 +1,7 @@
 //! tx-ext4 adapters.
 
 extern crate alloc;
+pub mod adapter;
 
 pub mod host_async;
 pub mod mount;

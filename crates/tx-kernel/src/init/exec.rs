@@ -16,6 +16,7 @@
 // CoreInit<P>` block in this file augments the one in `init.rs`.
 
 use super::*;
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
@@ -127,12 +128,12 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Boot-time tmpfs ops are synchronous, so Continue/Yield are
         // unreachable and panic if they fire.
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use StepOutcome as V3;
 
         // 1. Create or look up `/bin` directory. Use `mkdir`; on
         //    EEXIST treat the existing dir as the parent.
         let bin_object_id = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.mkdir(root_object_id, b"bin", 0o040755, &cred, &guard);
             match outcome {
                 V3::Done((id, _)) => id,
@@ -149,7 +150,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // 2. Allocate the `/bin/sh` inode.
         let bytes = busybox_fixture::BUSYBOX_BYTES;
         let (file_id, file_meta) = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.create_inode(bin_object_id, b"sh", 0o100755, &cred, &guard);
             match outcome {
                 V3::Done(out) => out,
@@ -160,7 +161,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // 3. Materialise the inode's RNode and grab its
         //    `Cap<PageContainer>`.
         let pc = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
             let rnode = match outcome {
                 V3::Done(rnode) => rnode,
@@ -201,7 +202,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // 5. Set the visible size via FsPageBacking::truncate.
         let size = bytes.len() as u64;
         {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             match fs_page_backing.truncate(file_id, size, &guard) {
                 V3::Done(()) => {}
                 other => panic!("register_busybox_into_tmpfs: truncate({size}): {other:?}"),
@@ -246,12 +247,12 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Boot-time tmpfs ops are synchronous, so Continue/Yield are
         // unreachable and panic if they fire.
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use StepOutcome as V3;
 
         // Allocate the inode. Bootstrap process is root by construction.
         let cred = Credential::root();
         let (file_id, file_meta) = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.create_inode(root_object_id, b"init", 0o100755, &cred, &guard);
             match outcome {
                 V3::Done(out) => out,
@@ -263,7 +264,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // `Cap<PageContainer>`. Tmpfs's Phase-7 override returns
         // `RNodeBacking::PageBacked { pc }` for regular files.
         let pc = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
             let rnode = match outcome {
                 V3::Done(rnode) => rnode,
@@ -308,7 +309,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // reports the right `meta.size`).
         let size = bytes.len() as u64;
         {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             match fs_page_backing.truncate(file_id, size, &guard) {
                 V3::Done(()) => {}
                 other => panic!("register_init_fixture_into_tmpfs: truncate({size}): {other:?}"),
@@ -487,7 +488,7 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         }
         let Some(tty) = console_tty() else { return };
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
     }
 

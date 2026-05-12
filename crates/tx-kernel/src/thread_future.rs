@@ -79,8 +79,8 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use tx_hal::{PercpuIf, PmapIf, TrapIf, TxPlatform};
-use tx_reactor::ast::AstBatch;
-use tx_reactor::userspace::{
+use boot_runtime::ast::AstBatch;
+use boot_runtime::userspace::{
     PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserspaceEntryDecision,
     UserspaceTrapInfo,
 };
@@ -92,6 +92,8 @@ use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, set_current_thread_payload, ThreadIdentity, ThreadPayload,
 };
 use tx_subsystems::vm::{AccessMode, UserVirtAddr, VmFault};
+use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::boot_runtime;
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
 /// `AccessMode`, which is what `VmFault` consumes. The two enums do

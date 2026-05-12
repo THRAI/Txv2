@@ -370,6 +370,7 @@ version = "0.1.0"
 dependencies = [
  "tokio",
  "tx-ext4-format",
+ "tx-platform-adapter",
  "tx-substrate",
  "tx-subsystems",
 ]
@@ -421,6 +422,7 @@ dependencies = [
  "tx-drivers",
  "tx-fs",
  "tx-hal",
+ "tx-platform-adapter",
  "tx-reactor",
  "tx-scripts",
  "tx-shims",
@@ -481,6 +483,7 @@ version = "0.1.0"
 dependencies = [
  "goblin",
  "tx-hal",
+ "tx-platform-adapter",
  "tx-substrate",
  "tx-subsystems",
 ]
@@ -495,6 +498,7 @@ version = "0.1.0"
 dependencies = [
  "tx-fs",
  "tx-hal",
+ "tx-platform-adapter",
  "tx-reactor",
  "tx-scripts",
  "tx-substrate",

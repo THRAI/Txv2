@@ -4,6 +4,20 @@
 
 ## Current Shape
 
+- 2026-05-12 D23 Phase 6 (tx-shims, tx-kernel, tx-ext4, tx-scripts)
+  adapter migration LANDED. Cross-layer consumer crates. tx-kernel
+  introduces a new `boot_runtime` adapter domain wrapping reactor's
+  BSP/AP startup primitives (HartId, hart_loop, userspace, wait,
+  SharedReactor, InitialSchedMeta, RescheduleSignal, ast). **First
+  phase where reactor outside-adapter ratchet moves appreciably.**
+  **Boundary report:** substrate outside-adapter 1623 → 1446
+  (cumulative −1101, 43%), inside 72 → 92; reactor outside 61 → 37
+  (cumulative −35, 49%), inside 8 → 10; adapters declared 24 → 30
+  across 6 crates. **Verified:** tx-shims 233, tx-kernel 43,
+  tx-ext4 7, tx-scripts 47, tx-subsystems 623, tx-fs 39 all pass;
+  lint arch ok; lint docs ok. ADR:
+  `2026-05-12-d23-phase6-cross-layer-adapter.md`.
+
 - 2026-05-12 D22 Phase 5 (tx-fs: tmpfs, devfs) adapter migration
   LANDED. First cross-crate migration. Each subsystem owns its own
   adapter.rs in tx-fs/src/<name>/. **Boundary report:** substrate
