@@ -21,7 +21,7 @@ fn step_accept_blocks_when_queue_empty() {
 
     let wait = expect_carrier_yield(step_accept(&listener, &guard));
 
-    assert_eq!(wait.carrier(), listener.wait_carriers.accept);
+    assert_eq!(wait.source_id(), listener.wait_carriers.accept);
     assert_eq!(
         wait.interest(),
         AcceptWireSet::HAS_PENDING.bits() | AcceptWireSet::BROKEN.bits()

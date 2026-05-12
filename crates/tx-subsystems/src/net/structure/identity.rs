@@ -2,7 +2,7 @@ use tx_substrate::bus::RawPort;
 use tx_substrate::zone::PayloadCap;
 
 use crate::sync::SpinMutex;
-use crate::wait_carrier;
+use crate::wait_source;
 
 use super::payload::{SocketOperationalEvidence, SocketPayload};
 use super::readiness::{new_urgent_port, SocketReadiness};
@@ -70,18 +70,18 @@ impl SocketIdentity {
 impl SocketWaitCarriers {
     fn register(readiness: &SocketReadiness, urgent_port: &RawPort) -> Self {
         Self {
-            recv: wait_carrier::register_wait_queue(readiness.recv_wq.clone()),
-            send: wait_carrier::register_wait_queue(readiness.send_wq.clone()),
-            accept: wait_carrier::register_wait_queue(readiness.accept_wq.clone()),
-            urgent: wait_carrier::register_wait_port(urgent_port.clone()),
+            recv: wait_source::register_wait_queue(readiness.recv_wq.clone()),
+            send: wait_source::register_wait_queue(readiness.send_wq.clone()),
+            accept: wait_source::register_wait_queue(readiness.accept_wq.clone()),
+            urgent: wait_source::register_wait_port(urgent_port.clone()),
         }
     }
 
     fn release(&self) {
-        wait_carrier::release_wait_carrier(self.recv);
-        wait_carrier::release_wait_carrier(self.send);
-        wait_carrier::release_wait_carrier(self.accept);
-        wait_carrier::release_wait_carrier(self.urgent);
+        wait_source::release_wait_source(self.recv);
+        wait_source::release_wait_source(self.send);
+        wait_source::release_wait_source(self.accept);
+        wait_source::release_wait_source(self.urgent);
     }
 }
 

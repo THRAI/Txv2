@@ -88,6 +88,7 @@ fn boot_smoke_userspace_tcp_loopback_uses_reactor_owned_delegate() {
         regs: [0; 32],
         pc: 0,
         status: 0,
+        fp: tx_hal::UserFpContext::empty(),
     }));
 
     let waker = Waker::noop().clone();

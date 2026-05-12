@@ -1426,7 +1426,7 @@ fn tcp_loopback_handshake_requires_bound_client_for_now() {
     assert!(matches!(
         step_connect(&client, inet(40_164), &guard),
         StepOutcome::Yield {
-            shape: YieldShape::OnCarrier { .. },
+            shape: YieldShape::OnWaitSource { .. },
             ..
         }
     ));
@@ -1483,7 +1483,7 @@ fn prepare_loopback_connect_with_client_send_buf(
     assert!(matches!(
         step_connect(&client, inet(server_port), &guard),
         StepOutcome::Yield {
-            shape: YieldShape::OnCarrier { .. },
+            shape: YieldShape::OnWaitSource { .. },
             ..
         }
     ));

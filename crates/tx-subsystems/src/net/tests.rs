@@ -125,10 +125,10 @@ fn endpoint(port: u16) -> IpEndpoint {
 fn expect_carrier_yield<T, P>(outcome: StepOutcome<T, P>) -> WaitToken {
     match outcome {
         StepOutcome::Yield {
-            shape: YieldShape::OnCarrier { carrier, interests },
+            shape: YieldShape::OnWaitSource { source, interests },
             ..
-        } => WaitToken::new(carrier.raw(), interests.raw()),
-        _ => panic!("expected OnCarrier yield"),
+        } => WaitToken::new(source.raw(), interests.raw()),
+        _ => panic!("expected OnWaitSource yield"),
     }
 }
 
@@ -521,25 +521,25 @@ fn socket_wait_carriers_register_rawqueue_and_rawport() {
     )
     .expect("socket");
 
-    assert!(crate::wait_carrier::lookup_wait_queue(identity.wait_carriers.recv).is_some());
-    assert!(crate::wait_carrier::lookup_wait_queue(identity.wait_carriers.send).is_some());
-    assert!(crate::wait_carrier::lookup_wait_queue(identity.wait_carriers.accept).is_some());
-    assert!(crate::wait_carrier::lookup_wait_port(identity.wait_carriers.urgent).is_some());
+    assert!(crate::wait_source::lookup_wait_queue(identity.wait_carriers.recv).is_some());
+    assert!(crate::wait_source::lookup_wait_queue(identity.wait_carriers.send).is_some());
+    assert!(crate::wait_source::lookup_wait_queue(identity.wait_carriers.accept).is_some());
+    assert!(crate::wait_source::lookup_wait_port(identity.wait_carriers.urgent).is_some());
 
     assert_eq!(
-        socket_recv_wait_token(&identity).carrier(),
+        socket_recv_wait_token(&identity).source_id(),
         identity.wait_carriers.recv
     );
     assert_eq!(
-        socket_send_wait_token(&identity).carrier(),
+        socket_send_wait_token(&identity).source_id(),
         identity.wait_carriers.send
     );
     assert_eq!(
-        socket_accept_wait_token(&identity).carrier(),
+        socket_accept_wait_token(&identity).source_id(),
         identity.wait_carriers.accept
     );
     assert_eq!(
-        socket_urgent_wait_token(&identity).carrier(),
+        socket_urgent_wait_token(&identity).source_id(),
         identity.wait_carriers.urgent
     );
 }
@@ -550,10 +550,10 @@ fn net_delegate_queue_registers_rawqueue_and_wakes_on_poll() {
         crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK;
     crate::net::delegate::net_delegate_clear(bits);
     let token = crate::net::delegate::net_delegate_wait_token();
-    assert!(crate::wait_carrier::lookup_wait_queue(token.carrier()).is_some());
+    assert!(crate::wait_source::lookup_wait_queue(token.source_id()).is_some());
     assert_eq!(token.interest(), bits.bits());
 
-    let mut future = crate::wait_carrier::wait_on_token(token).expect("delegate wait future");
+    let mut future = crate::wait_source::wait_on_token(token).expect("delegate wait future");
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -914,9 +914,9 @@ fn execution_connect_blocks_tcp_and_completes_udp() {
     let remote = inet(40_014);
 
     let wait = expect_carrier_yield(step_connect(&tcp, remote, &guard));
-    assert_ne!(wait.carrier(), tcp.raw() as u64);
-    assert_eq!(wait.carrier(), tcp.wait_carriers.send);
-    assert!(crate::wait_carrier::wait_on_token(wait).is_some());
+    assert_ne!(wait.source_id(), tcp.raw() as u64);
+    assert_eq!(wait.source_id(), tcp.wait_carriers.send);
+    assert!(crate::wait_source::wait_on_token(wait).is_some());
     assert!(wait.interest() & SendWireSet::SPACE.bits() != 0);
     assert!(wait.interest() & SendWireSet::BROKEN.bits() != 0);
     assert_eq!(
@@ -1006,7 +1006,7 @@ fn shutdown_fires_same_rawqueue_used_by_wait_token() {
     )
     .expect("tcp socket");
     let token = socket_send_wait_token(&tcp);
-    let mut future = crate::wait_carrier::wait_on_token(token).expect("send wq registered");
+    let mut future = crate::wait_source::wait_on_token(token).expect("send wq registered");
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -1181,7 +1181,7 @@ fn tcp_packet_event_sets_connection_readiness_and_urgent_port() {
         .insert_tcp_connection(key, tcp.clone())
         .expect("connection insert");
     let mut urgent_future =
-        crate::wait_carrier::wait_on_token(socket_urgent_wait_token(&tcp)).expect("urgent future");
+        crate::wait_source::wait_on_token(socket_urgent_wait_token(&tcp)).expect("urgent future");
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     assert!(matches!(
@@ -1322,7 +1322,7 @@ fn step_recv_blocks_when_no_data() {
 
     let wait = expect_carrier_yield(step_recv(&udp, 32, SendRecvFlags::empty(), &guard));
 
-    assert_eq!(wait.carrier(), udp.wait_carriers.recv);
+    assert_eq!(wait.source_id(), udp.wait_carriers.recv);
     assert_eq!(
         wait.interest(),
         RecvWireSet::HAS_DATA.bits() | RecvWireSet::BROKEN.bits()
@@ -1402,7 +1402,7 @@ fn step_send_blocks_when_no_space() {
 
     let wait = expect_carrier_yield(step_send(&udp, 32, SendRecvFlags::empty(), &guard));
 
-    assert_eq!(wait.carrier(), udp.wait_carriers.send);
+    assert_eq!(wait.source_id(), udp.wait_carriers.send);
     assert_eq!(
         wait.interest(),
         SendWireSet::SPACE.bits() | SendWireSet::BROKEN.bits()
@@ -1493,7 +1493,7 @@ fn step_accept_blocks_when_queue_empty() {
 
     let wait = expect_carrier_yield(step_accept(&listener, &guard));
 
-    assert_eq!(wait.carrier(), listener.wait_carriers.accept);
+    assert_eq!(wait.source_id(), listener.wait_carriers.accept);
     assert_eq!(
         wait.interest(),
         AcceptWireSet::HAS_PENDING.bits() | AcceptWireSet::BROKEN.bits()

@@ -79,7 +79,7 @@ fn virtio_net_device_tx_queue_accepts_frame_until_capacity() {
     assert!(matches!(
         device.transmit(&[4, 5, 6], &guard),
         StepOutcome::Yield {
-            shape: YieldShape::OnCarrier { .. },
+            shape: YieldShape::OnWaitSource { .. },
             ..
         }
     ));
@@ -109,7 +109,7 @@ fn virtio_tx_completion_releases_capacity_for_retry() {
     assert!(matches!(
         device.transmit(&[4, 5, 6], &guard),
         StepOutcome::Yield {
-            shape: YieldShape::OnCarrier { .. },
+            shape: YieldShape::OnWaitSource { .. },
             ..
         }
     ));
@@ -232,7 +232,7 @@ fn virtio_irq_tx_complete_releases_capacity_and_fires_delegate_poll() {
     assert!(matches!(
         device.transmit(&[5, 6, 7, 8], &guard),
         StepOutcome::Yield {
-            shape: YieldShape::OnCarrier { .. },
+            shape: YieldShape::OnWaitSource { .. },
             ..
         }
     ));
