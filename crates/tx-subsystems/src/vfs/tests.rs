@@ -13,8 +13,9 @@ use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::{Termios, TtyIdentity, TtyKind, TtyPayload, Winsize};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
-use tx_substrate::step_v3::{Errno, StepOutcome};
-use tx_substrate::zone::{self, Cap, PayloadCap};
+use crate::vfs::adapter::step_engine::{
+    guard, reserve_for, sign_for, ByteProgress, Cap, Errno, PayloadCap, StepOutcome,
+};
 
 struct EchoCharOps;
 
@@ -23,7 +24,7 @@ impl CharDeviceOps for EchoCharOps {
         &self,
         out: &mut [u8],
         _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> StepOutcome<usize, ByteProgress> {
         if out.is_empty() {
             return StepOutcome::Done(0);
         }
@@ -35,7 +36,7 @@ impl CharDeviceOps for EchoCharOps {
         &self,
         bytes: &[u8],
         _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(bytes.len())
     }
 }
@@ -72,10 +73,10 @@ fn fresh_init() -> Cap<ProcessIdentity> {
 }
 
 fn alloc_tty(kind: TtyKind, index: u32, name: &str, payload: TtyPayload) -> Cap<TtyIdentity> {
-    let id_res = zone::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-    let payload_res = zone::reserve_for::<TtyPayload>().expect("tty payload reservation");
-    let payload = PayloadCap::from_cap(zone::sign_for(payload_res, payload));
-    let identity = zone::sign_for(id_res, TtyIdentity::new(kind, index, name));
+    let id_res = reserve_for::<TtyIdentity>().expect("tty identity reservation");
+    let payload_res = reserve_for::<TtyPayload>().expect("tty payload reservation");
+    let payload = PayloadCap::from_cap(sign_for(payload_res, payload));
+    let identity = sign_for(id_res, TtyIdentity::new(kind, index, name));
     identity.install_payload(payload);
     identity
 }
@@ -141,7 +142,7 @@ fn rnode_backing_carries_tty_identity_payload() {
 fn open_file_dispatches_struct_payload_read_write() {
     let _g = setup_process_world();
     init_tty_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::SerialHardware,
         1,
@@ -268,7 +269,7 @@ fn open_file_step_ioctl_dispatches_basic_tty_requests() {
     let caller = OpenFileIoctlCaller::from_process(&init);
 
     assert_eq!(
-        tty_file.step_ioctl(caller, OpenFileIoctl::Tcgets, &tx_substrate::epoch::guard()),
+        tty_file.step_ioctl(caller, OpenFileIoctl::Tcgets, &guard()),
         StepOutcome::Done(OpenFileIoctlResult::Termios(Termios::default_cooked()))
     );
 
@@ -277,12 +278,12 @@ fn open_file_step_ioctl_dispatches_basic_tty_requests() {
         tty_file.step_ioctl(
             caller,
             OpenFileIoctl::Tcsets { termios: raw },
-            &tx_substrate::epoch::guard()
+            &guard()
         ),
         StepOutcome::Done(OpenFileIoctlResult::SideEffect(Default::default()))
     );
     assert_eq!(
-        tty_file.step_ioctl(caller, OpenFileIoctl::Tcgets, &tx_substrate::epoch::guard()),
+        tty_file.step_ioctl(caller, OpenFileIoctl::Tcgets, &guard()),
         StepOutcome::Done(OpenFileIoctlResult::Termios(raw))
     );
 
@@ -291,7 +292,7 @@ fn open_file_step_ioctl_dispatches_basic_tty_requests() {
         tty_file.step_ioctl(
             caller,
             OpenFileIoctl::Tiocswinsz { winsize },
-            &tx_substrate::epoch::guard()
+            &guard()
         ),
         StepOutcome::Done(OpenFileIoctlResult::SideEffect(IoctlSideEffect {
             session_ctl_fired: true,
@@ -302,7 +303,7 @@ fn open_file_step_ioctl_dispatches_basic_tty_requests() {
         tty_file.step_ioctl(
             caller,
             OpenFileIoctl::Tiocgwinsz,
-            &tx_substrate::epoch::guard()
+            &guard()
         ),
         StepOutcome::Done(OpenFileIoctlResult::Winsize(winsize))
     );
@@ -343,7 +344,7 @@ fn open_file_step_ioctl_dispatches_process_aware_tty_session_ops() {
         tty_file.step_ioctl(
             init_caller,
             OpenFileIoctl::Tiocsctty,
-            &tx_substrate::epoch::guard()
+            &guard()
         ),
         StepOutcome::Done(OpenFileIoctlResult::SideEffect(IoctlSideEffect {
             session_ctl_fired: true,
@@ -354,7 +355,7 @@ fn open_file_step_ioctl_dispatches_process_aware_tty_session_ops() {
         tty_file.step_ioctl(
             init_caller,
             OpenFileIoctl::Tiocgpgrp,
-            &tx_substrate::epoch::guard()
+            &guard()
         ),
         StepOutcome::Done(OpenFileIoctlResult::Pgrp(init.pgrp_cap().pgid.0))
     );
@@ -368,7 +369,7 @@ fn open_file_step_ioctl_dispatches_process_aware_tty_session_ops() {
             OpenFileIoctl::Tiocspgrp {
                 new_pgrp: &peer_pgrp
             },
-            &tx_substrate::epoch::guard()
+            &guard()
         ),
         StepOutcome::Done(OpenFileIoctlResult::SideEffect(IoctlSideEffect {
             session_ctl_fired: true,
@@ -379,7 +380,7 @@ fn open_file_step_ioctl_dispatches_process_aware_tty_session_ops() {
         tty_file.step_ioctl(
             init_caller,
             OpenFileIoctl::Tiocgpgrp,
-            &tx_substrate::epoch::guard()
+            &guard()
         ),
         StepOutcome::Done(OpenFileIoctlResult::Pgrp(peer_pgrp.pgid.0))
     );
@@ -388,7 +389,7 @@ fn open_file_step_ioctl_dispatches_process_aware_tty_session_ops() {
         tty_file.step_ioctl(
             init_caller,
             OpenFileIoctl::Tiocnotty,
-            &tx_substrate::epoch::guard()
+            &guard()
         ),
         StepOutcome::Done(OpenFileIoctlResult::SideEffect(IoctlSideEffect {
             session_ctl_fired: true,
@@ -423,7 +424,7 @@ fn open_file_step_ioctl_rejects_non_tty_backings() {
         },
     );
     assert_eq!(
-        char_file.step_ioctl(caller, OpenFileIoctl::Tcgets, &tx_substrate::epoch::guard()),
+        char_file.step_ioctl(caller, OpenFileIoctl::Tcgets, &guard()),
         StepOutcome::Err(Errno::ENOSYS)
     );
 
@@ -444,7 +445,7 @@ fn open_file_step_ioctl_rejects_non_tty_backings() {
         },
     );
     assert_eq!(
-        dir_file.step_ioctl(caller, OpenFileIoctl::Tcgets, &tx_substrate::epoch::guard()),
+        dir_file.step_ioctl(caller, OpenFileIoctl::Tcgets, &guard()),
         StepOutcome::Err(Errno::EISDIR)
     );
 }

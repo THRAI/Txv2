@@ -31,7 +31,10 @@ pub mod step_engine {
         ByteProgress, Errno, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
         StepProgress, SubjectIdentity,
     };
-    pub use tx_substrate::zone::{Cap, PayloadCap, Weak, Zone, ZoneAllocated, ZoneError};
+    pub use tx_substrate::zone::{
+        reserve_for, sign_for, Cap, PayloadCap, Weak, Zone, ZoneAllocated, ZoneError,
+    };
+    pub use tx_substrate::SpinMutex;
 
     /// Reserve + sign in one step: mint a `Cap<T>` from `T`'s zone.
     pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
