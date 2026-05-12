@@ -64,8 +64,9 @@
 //! # Framework reusability claim
 //!
 //! This module imports `with_on_behalf_of` / `AbortSignal` /
-//! `ScriptCtx` / `SubjectContext` / `SubjectIdentity` **as-is** from
-//! `tx_substrate::step_v3`. No new framework primitive is introduced.
+//! `ScriptCtx` / `SubjectContext` / `SubjectIdentity` **as-is** via
+//! `adapter::step_engine` (which re-exports them from substrate). No
+//! new framework primitive is introduced.
 //! The IoUring is just another principal-P invocation of the same
 //! borrow-scope shape W-W shipped for AIO. See the report section at
 //! the bottom of `crates/tx-shims/tests/v3_io_uring_sqpoll_scaffold.rs`
