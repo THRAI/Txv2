@@ -4,6 +4,31 @@
 
 ## Current Shape
 
+- 2026-05-12 D18 Phase 1 adapter migration LANDED. Four single-file
+  subsystems migrated to `#[platform_adapter]` boundary modules:
+  `mount` (one `runtime` domain — zone role types + SpinMutex +
+  sign_zone_for), `futex` (two domains: `step_engine` with new
+  `yield_until_wake` verb wrapping the explicit
+  `Yield { progress: NoProgress, shape: OnWaitSource { … } }`
+  constructor, plus stacked `wait_routing` mirroring pipe's shape),
+  `cred` (one `step_engine` domain covering 7 StepOp impls +
+  CredentialView + RestrictionStackHandle), `signal` (one
+  `step_engine` domain covering 3 StepOp impls + 8 production
+  `epoch::guard()` call sites + `SignalRouting` + `OperationalCapExt`).
+  Each is `src/<name>.rs` → `<name>/{mod.rs, adapter.rs}`.
+  **Boundary report:** substrate outside-adapter 2547 → 2420
+  (cumulative −127), inside 0 → 27; reactor outside 72 → 70
+  (cumulative −2), inside 0 → 4; adapters declared 0 → 9. The 5:1
+  outside-removed vs inside-added ratio is the bundling payoff
+  (`reserve_for + sign_for` → one `sign_zone_for`; 4-line
+  `Yield { ... OnWaitSource { ... } }` → one `yield_until_wake`).
+  **Verified:** pipe + mount + futex + cred + signal lib tests
+  34 + 7 + 16 + 36 + 65 = 158 / 158 pass; full tx-subsystems lib
+  suite still 623 passing single-threaded; `cargo xtask lint arch`
+  ok. ADR: `2026-05-12-d18-phase1-adapter-migration.md`. **Next:**
+  phase 2 of the refactor plan — `vfs/` and `process/` multi-file
+  subsystems (~600 substrate lines combined).
+
 - 2026-05-12 D17 Pipe pilot adapter LANDED. First subsystem migrated
   to `#[platform_adapter]` boundary modules. Restructured
   `crates/tx-subsystems/src/pipe.rs` → `pipe/{mod.rs, adapter.rs}`;

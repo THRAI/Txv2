@@ -31,8 +31,12 @@
 
 use core::marker::PhantomData;
 
-use tx_substrate::epoch::Guard;
-use tx_substrate::zone::{self, Cap, Zone, ZoneAllocated, ZoneError};
+pub mod adapter;
+
+use adapter::step_engine::{
+    self, Cap, CredentialView, Guard, NoProgress, RestrictionStackHandle, ScriptCtx, StepOp,
+    StepOutcome, SubjectIdentity, Zone, ZoneAllocated, ZoneError,
+};
 
 use crate::execution::Errno;
 use crate::process::structure::{ProcessIdentity, TargetProcCred};
@@ -166,7 +170,7 @@ pub struct Cred {
     pub permitted_caps: CapabilitySet,
 }
 
-impl tx_substrate::step_v3::CredentialView for Cred {}
+impl CredentialView for Cred {}
 
 // PR-9 phase 5 — D5 Path A. `Cred` is zone-allocated so that
 // `ProcessPayload.cred` can hold `AtomicSlot<Cap<Cred>>` and mutators
@@ -206,8 +210,7 @@ unsafe impl ZoneAllocated for Cred {
 /// Returns `ZoneError` only on slab exhaustion; tests reset the slab
 /// at `setup()`.
 pub fn sign_cred(cred: Cred) -> Result<Cap<Cred>, ZoneError> {
-    let reservation = zone::reserve_for::<Cred>()?;
-    Ok(zone::sign_for(reservation, cred))
+    step_engine::sign_zone_for(cred)
 }
 
 /// PR-9 phase 5 — D5 §7. Mint a placeholder
@@ -226,13 +229,8 @@ pub fn sign_cred(cred: Cred) -> Result<Cap<Cred>, ZoneError> {
 /// Cost is one zone reservation per syscall entry — acceptable for
 /// the placeholder; PR-K replaces with the proper slot-style append-
 /// only stack.
-pub fn placeholder_restrictions_cap(
-) -> Result<Cap<tx_substrate::step_v3::RestrictionStackHandle>, ZoneError> {
-    let reservation = zone::reserve_for::<tx_substrate::step_v3::RestrictionStackHandle>()?;
-    Ok(zone::sign_for(
-        reservation,
-        tx_substrate::step_v3::RestrictionStackHandle::placeholder(),
-    ))
+pub fn placeholder_restrictions_cap() -> Result<Cap<RestrictionStackHandle>, ZoneError> {
+    step_engine::sign_zone_for(RestrictionStackHandle::placeholder())
 }
 
 impl Cred {
@@ -874,14 +872,14 @@ pub struct SetuidOp {
     pub new_uid: Uid,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SetuidOp {
+impl<I: SubjectIdentity> StepOp<I> for SetuidOp {
     type Output = CredChange;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_setuid(&self.target, self.new_uid))
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_setuid(&self.target, self.new_uid))
     }
 }
 
@@ -891,14 +889,14 @@ pub struct SetgidOp {
     pub new_gid: Gid,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SetgidOp {
+impl<I: SubjectIdentity> StepOp<I> for SetgidOp {
     type Output = CredChange;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_setgid(&self.target, self.new_gid))
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_setgid(&self.target, self.new_gid))
     }
 }
 
@@ -911,14 +909,14 @@ pub struct SetreuidOp {
     pub euid: Option<Uid>,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SetreuidOp {
+impl<I: SubjectIdentity> StepOp<I> for SetreuidOp {
     type Output = CredChange;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_setreuid(&self.target, self.ruid, self.euid))
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_setreuid(&self.target, self.ruid, self.euid))
     }
 }
 
@@ -930,14 +928,14 @@ pub struct SetresuidOp {
     pub suid: Option<Uid>,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SetresuidOp {
+impl<I: SubjectIdentity> StepOp<I> for SetresuidOp {
     type Output = CredChange;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_setresuid(
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_setresuid(
             &self.target,
             self.ruid,
             self.euid,
@@ -954,14 +952,14 @@ pub struct SetresgidOp {
     pub sgid: Option<Gid>,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SetresgidOp {
+impl<I: SubjectIdentity> StepOp<I> for SetresgidOp {
     type Output = CredChange;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_setresgid(
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_setresgid(
             &self.target,
             self.rgid,
             self.egid,
@@ -977,14 +975,14 @@ pub struct SetregidOp {
     pub egid: Option<Gid>,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SetregidOp {
+impl<I: SubjectIdentity> StepOp<I> for SetregidOp {
     type Output = CredChange;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_setregid(&self.target, self.rgid, self.egid))
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_setregid(&self.target, self.rgid, self.egid))
     }
 }
 
@@ -998,16 +996,16 @@ pub struct ApplySuidForExecOp {
     pub file_mode: u16,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<I: SubjectIdentity> StepOp<I>
     for ApplySuidForExecOp
 {
     type Output = Option<ExecCredOutcome>;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_apply_suid_for_exec(
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_apply_suid_for_exec(
             &self.target,
             self.file_uid,
             self.file_gid,
