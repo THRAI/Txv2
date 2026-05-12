@@ -16,7 +16,7 @@ use page_allocator::ZeroPolicy;
 /// the PPN alive across that window.
 ///
 /// In host-test contexts the test direct-map (set up by
-/// `tx_substrate::testing::init_host_for_test_once`) backs the PPN; bytes
+/// `tx_test_support::init_host`) backs the PPN; bytes
 /// are written via the testing helper. Non-test contexts require a real
 /// kernel direct-map, which is HAL-side follow-up work — `Errno::ENOSYS`
 /// for now in production builds.

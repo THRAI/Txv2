@@ -187,7 +187,7 @@ impl Default for Tmpfs {
 // `Arc<dyn FsOps>` / `Arc<dyn FsPageBacking>`. `MountPayload` carries
 // the trait objects directly.
 //
-// Fully-qualified `tx_substrate::step_v3::*` references at the impl sites
+// Fully-qualified `adapter::step_engine::*` references at the impl sites
 // avoid clashing with `tx_subsystems::execution::StepOutcome` already in
 // scope.
 

@@ -32,7 +32,7 @@ fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
 // `Advanced` / `Blocked` / `AdvancedThenBlocked` path through this
 // read-only backend today.
 //
-// Fully-qualified `tx_substrate::step_v3::*` references at the impl
+// Fully-qualified `adapter::step_engine::*` references at the impl
 // sites avoid clashing with `tx_subsystems::execution::Errno`
 // already in scope.
 

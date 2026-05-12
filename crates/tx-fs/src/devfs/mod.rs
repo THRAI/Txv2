@@ -294,7 +294,7 @@ fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
 // (the walker entry points) opt into these impls via
 // `Arc<dyn FsOps>` / `Arc<dyn FsPageBacking>`.
 //
-// Fully-qualified `tx_substrate::step_v3::*` references at the impl
+// Fully-qualified `adapter::step_engine::*` references at the impl
 // sites avoid clashing with `tx_subsystems::execution::StepOutcome`
 // already in scope, per the wave-4/6/7 trait-impl convention.
 
