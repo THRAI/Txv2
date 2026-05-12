@@ -30,7 +30,7 @@ fn init_tty_zones() {
     // `register_hardware` / `register_console_alias` overwriting
     // same-name entries (the alias table is a fixed-slot in-place
     // upsert per `crates/tx-subsystems/src/tty/structure/registry.rs`).
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     tx_subsystems::zones::register_all().expect("tx-subsystems zones");
 }
 

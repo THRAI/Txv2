@@ -24,6 +24,7 @@ tx-scripts = { path = "../tx-scripts" }
 # runtime dependency.
 tx-shims = { path = "../tx-shims" }
 tx-substrate = { path = "../tx-substrate" }
+tx-test-support = { path = "../tx-test-support" }
 tx-subsystems = { path = "../tx-subsystems" }
 
 [dev-dependencies]

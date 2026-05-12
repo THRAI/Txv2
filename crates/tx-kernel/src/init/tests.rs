@@ -232,7 +232,7 @@ impl tx_hal::PmapIf for TestPlatform {
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = INIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = tx_subsystems::zones::register_all();
     // Reset every global slot the boot wiring touches. The
     // `cross_crate_test_support::reset_*` helpers are gated on the
