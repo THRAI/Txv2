@@ -4,6 +4,21 @@
 
 ## Current Shape
 
+- 2026-05-13 substrate: `tx_substrate::verbs` curated re-export module LANDED
+  (refactor #4/7, branch cc/crazy-ardinghelli-91c48e, commit 933a02f). Added
+  `crates/tx-substrate/src/verbs.rs` collecting 35 cross-cutting types and
+  functions that adapters reach for, organized in 6 categories: step execution
+  (StepOp, StepOutcome, NoProgress, ByteProgress, ScriptCtx, SubjectIdentity,
+  Errno, InterestMask, WaitSourceId, YieldShape, Deadline, StepProgress),
+  zone allocation (Cap, ZoneAllocated, ZoneError, Zone, reserve_for, sign_for,
+  PayloadCap, Weak, Entity, Dead, OperationalCapExt), EBR (guard, Guard,
+  drain_with_budget), wake/mailbox (MailboxEvent, TaskMailbox, WaitSource,
+  WaitRegistrationGuard, WaitGeneration, SignalRouting), bus wire (RawPort,
+  RawQueue), sync (SpinMutex, AtomicSlot). Surface pin test at
+  `crates/tx-substrate/tests/verbs_surface.rs` (2 tests: verbs_surface_compiles,
+  verbs_send_sync). Purely additive — no callers migrated. Boundary lint 0/0.
+  Next step: #5/7 of the refactor series.
+
 - 2026-05-13 scripts: `drive<O: StepOp>` central driver LANDED (refactor #3/7,
   branch cc/crazy-ardinghelli-91c48e). Added `crates/tx-scripts/src/drive.rs`
   implementing the spec's algorithm from `docs/Txv3/03_STEP_MODEL_v2.md` §5.
