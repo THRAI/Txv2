@@ -4,6 +4,17 @@
 
 ## Current Shape
 
+- 2026-05-13 hal: HartLocal<T> per-hart slot primitive LANDED (refactor #2/7,
+  branch cc/crazy-ardinghelli-91c48e). Added `crates/tx-hal/src/hart_local.rs`
+  with `HartLocal<T>` backed by `[Slot<T>; MAX_HARTS]` (MAX_HARTS=64, matching
+  CpuMask's u64 bit-width). Uses `UnsafeCell<MaybeUninit<T>>` + `AtomicBool`
+  (Release/Acquire) — no external deps, no_std compatible. Public surface:
+  `HartLocal::new()` (const), `init(CpuId, T)`, `get::<P: PercpuIf>() -> Option<&T>`.
+  Re-exported from tx-hal lib root as `HartLocal` and `MAX_HARTS`. 8 integration
+  tests in `crates/tx-hal/tests/hart_local.rs`, all passing. Boundary lint 0/0.
+  No callers yet — purely additive. Grounded in: `PercpuIf` trait, `CpuId`,
+  `CpuMask`. Next step: #3 drive() PR which will use HartLocal for per-hart state.
+
 - 2026-05-13 D56–D61 tx-test-support adapter LANDED. Created
   `crates/tx-test-support` with a `#[platform_adapter]` `step_engine` module
   exposing `init_host()`, `drain_to_quiescence()`, and `drain_once_unbounded()`.
