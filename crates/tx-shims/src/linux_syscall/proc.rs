@@ -82,6 +82,12 @@ pub static SYS_WAIT4_INVOCATIONS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 pub static SYS_EXECVE_LAST_ERRNO: core::sync::atomic::AtomicI32 =
     core::sync::atomic::AtomicI32::new(0);
+/// Parent's saved_user_context.pc snapshotted at sys_clone entry.
+pub static SYS_CLONE_PARENT_PC_ENTRY: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+/// Parent's saved_user_context.pc re-read at sys_clone exit.
+pub static SYS_CLONE_PARENT_PC_EXIT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
@@ -249,6 +255,10 @@ pub(super) fn sys_clone<'a, P: PmapIf + tx_hal::ConsoleIf>(
         .expect(":clone:no-payload: kernel-invariant violation, calling thread had no payload")
         .saved_user_context()
         .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
+    SYS_CLONE_PARENT_PC_ENTRY.store(
+        parent_user_ctx.pc as usize,
+        core::sync::atomic::Ordering::Relaxed,
+    );
 
     // PR-9 phase 3b: drive `step_fork::<P>` via the `ForkOp::<P>`
     // StepOp wrap, threading a `&mut KernelScriptCtx`. The wrap lifts
@@ -311,6 +321,16 @@ pub(super) fn sys_clone<'a, P: PmapIf + tx_hal::ConsoleIf>(
     // `:clone:no-reactor-seam` if the boot path didn't install the
     // seam — that's a boot-time invariant violation.
     reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
+
+    // DIAGNOSTIC: re-read parent's saved_user_context.pc at exit to
+    // confirm fork didn't clobber it.
+    let parent_pc_at_exit = ctx
+        .thread
+        .payload_cap()
+        .and_then(|p| p.saved_user_context())
+        .map(|c| c.pc as usize)
+        .unwrap_or(0);
+    SYS_CLONE_PARENT_PC_EXIT.store(parent_pc_at_exit, core::sync::atomic::Ordering::Relaxed);
 
     // Parent observes the child's pid. The trap shell drains
     // `pending_syscall_return` into the parent's fresh trap frame's

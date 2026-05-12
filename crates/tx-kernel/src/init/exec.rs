@@ -840,6 +840,16 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_decimal_unsigned(crate::FAULT_SIGSEGV_ADDR.load(Ordering::Relaxed));
         tx_hal::console_write_str::<P>(":last_access=");
         Self::write_decimal_unsigned(crate::FAULT_SIGSEGV_ACCESS.load(Ordering::Relaxed) as usize);
+        tx_hal::console_write_str::<P>(":last_pid=");
+        Self::write_decimal_unsigned(crate::FAULT_SIGSEGV_PID.load(Ordering::Relaxed));
+        tx_hal::console_write_str::<P>(":clone_pc_entry=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::proc::SYS_CLONE_PARENT_PC_ENTRY.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":clone_pc_exit=");
+        Self::write_decimal_unsigned(
+            tx_shims::linux_syscall::proc::SYS_CLONE_PARENT_PC_EXIT.load(Ordering::Relaxed),
+        );
         tx_hal::console_write_str::<P>("\n");
     }
 
