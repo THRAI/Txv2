@@ -6,6 +6,7 @@ members = [
     "crates/tx-kernel",
     "crates/tx-platform-adapter",
     "crates/tx-substrate",
+    "crates/tx-test-support",
     "crates/tx-reactor",
     "crates/tx-policy",
     "crates/tx-drivers",
