@@ -24,6 +24,16 @@ use crate::adapter::boot_runtime;
 // sub-second on real hardware but gives the emulator enough headroom.
 const AP_REACTOR_WAIT_SPINS: usize = 10_000_000;
 
+/// Minimum platform-timer period used in the userspace reactor loop when
+/// the reactor has no pending deadline. Without this, WFI never wakes
+/// when all tasks block on WaitSources rather than timer-backed futures,
+/// starving the EBR idle drain and SBI console poll.
+///
+/// Used in `exec.rs` where it is safe to arm the timer (userspace reactor
+/// loop), NOT in `step_boot_reactor_once` which is also called from boot
+/// smoke tests that may run during critical sections.
+pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
+
 static BOOT_REACTOR: boot_runtime::SharedReactor = boot_runtime::SharedReactor::empty();
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);

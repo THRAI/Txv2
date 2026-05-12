@@ -24,7 +24,7 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     use tx_substrate::zone;
 
-    pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::epoch::{drain_with_budget, guard, Guard};
     pub use tx_substrate::step_v3::{
         ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     };

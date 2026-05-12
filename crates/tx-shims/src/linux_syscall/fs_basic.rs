@@ -856,13 +856,15 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         TIOCSCTTY => {
             // The `argp` for TIOCSCTTY is a "force" bit (0 or 1) on
             // Linux, used to steal the TTY from another session when
-            // the caller is root. v1 ignores it — the underlying
-            // `step_ioctl_tiocsctty` rejects already-bound TTYs with
-            // -EBUSY regardless of the force flag.
-            let caller = make_ioctl_caller(ctx);
+            // the caller is root. v1 ignores it — the underlying step
+            // rejects already-bound TTYs with -EBUSY regardless.
+            // Use the process-aware variant so session.controlling_tty
+            // is updated; the legacy step_ioctl_tiocsctty only binds
+            // the session_pgrp field and leaves has_controlling_tty()
+            // false, which breaks subsequent TIOCGPGRP calls.
             let outcome = {
                 let guard = step_engine::guard();
-                step_ioctl_tiocsctty(&tty, caller, &guard)
+                step_ioctl_tiocsctty_for_process(&tty, &ctx.process, &guard)
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),

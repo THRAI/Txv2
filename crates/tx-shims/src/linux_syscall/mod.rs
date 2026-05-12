@@ -67,8 +67,8 @@ use tx_subsystems::thread_runtime::execution::{step_sigprocmask, SigmaskHow, Sig
 use tx_subsystems::thread_runtime::{step_thread_exit, ThreadIdentity};
 use tx_subsystems::tty::execution::{
     step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
-    step_ioctl_tiocnotty, step_ioctl_tiocsctty, step_ioctl_tiocspgrp, step_ioctl_tiocswinsz,
-    IoctlCaller,
+    step_ioctl_tiocnotty, step_ioctl_tiocsctty_for_process, step_ioctl_tiocspgrp,
+    step_ioctl_tiocswinsz, IoctlCaller,
 };
 use tx_subsystems::tty::structure::{Termios, Winsize};
 use tx_subsystems::vfs::structure::{
