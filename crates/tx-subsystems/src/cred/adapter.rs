@@ -14,15 +14,15 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "epoch"],
+    apis = ["step", "zone", "epoch"],
     reason = "expose substrate step engine (StepOp/StepOutcome, CredentialView, RestrictionStackHandle), EBR guard, and zone allocation as cred-side primitives"
 )]
 pub mod step_engine {
     use tx_substrate::zone;
 
     pub use tx_substrate::epoch::{guard, Guard};
-    pub use tx_substrate::step_v3::ProcessIdentity as PlaceholderProcessSubject;
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
+    pub use tx_substrate::step::{
         CredentialView, NoProgress, RestrictionStackHandle, ScriptCtx, StepOp, StepOutcome,
         SubjectIdentity,
     };

@@ -36,7 +36,7 @@ use core::task::Waker;
 
 use alloc::collections::VecDeque;
 
-use crate::step_v3::{AbortReason, DelegateTokenId, InterestMask, WaitSourceId};
+use crate::step::{AbortReason, DelegateTokenId, InterestMask, WaitSourceId};
 use crate::SpinMutex;
 
 /// Generation counter for a [`TaskMailbox`]'s currently-active wait.

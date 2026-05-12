@@ -25,7 +25,7 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "epoch", "page_allocator", "shootdown", "wake"],
+    apis = ["step", "zone", "epoch", "page_allocator", "shootdown", "wake"],
     reason = "expose substrate step engine (including delegate-registry plumbing for userfaultfd: DelegateRequest/Reply, UfdRequest/Reply, AbortReason, AgentCancelPolicy, TokenDropPolicy, YieldShape), zone role types, EBR guard, page-allocator primitives, shootdown surface (AddressSpaceShootdownBatch, ShootdownError), TaskMailbox, and SpinMutex used by vm fault resolver, address-space ops, range-lock wait sources, and the recipe/private mapping structures"
 )]
 pub mod step_engine {
@@ -36,7 +36,7 @@ pub mod step_engine {
         self, BitmapPageAllocator, CachePin, ZeroPolicy,
     };
     pub use tx_substrate::shootdown::{AddressSpaceShootdownBatch, ShootdownError};
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::{
         AbortReason, AgentCancelPolicy, ByteProgress, DelegateRegistry, DelegateReply,
         DelegateRequest, DelegateState, DelegateTokenId, Errno, InterestMask, NoProgress,
         PageProgress, ProcessIdentity as PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
@@ -58,7 +58,7 @@ pub mod step_engine {
 #[platform_adapter(
     platform = "substrate",
     domain = "wait_routing",
-    apis = ["step_v3"],
+    apis = ["step"],
     reason = "wrap WaitSourceId minting for vm range-lock wait sources (range_lock.rs)"
 )]
 #[platform_adapter(

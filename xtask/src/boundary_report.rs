@@ -151,7 +151,7 @@ fn accumulate(p: &Platform, rel: &str, scan: &FileScan, stats: &mut PlatformStat
 struct FileScan {
     /// `tx_substrate` / `tx_reactor` -> number of lines that mention it.
     line_counts: BTreeMap<String, usize>,
-    /// fully-prefixed sub-API segment (e.g. `tx_substrate::step_v3`) ->
+    /// fully-prefixed sub-API segment (e.g. `tx_substrate::step`) ->
     /// total line-level occurrences across the file.
     sub_api_counts: BTreeMap<String, usize>,
     adapters: Vec<AdapterDecl>,
@@ -351,12 +351,12 @@ mod tests {
     fn scan_counts_substrate_lines_and_sub_apis() {
         let scan = scan_file(
             "crates/tx-subsystems/src/vfs/execution.rs",
-            "use tx_substrate::step_v3::StepOutcome;\n\
+            "use tx_substrate::step::StepOutcome;\n\
              use tx_substrate::epoch::guard;\n\
-             fn f() { tx_substrate::step_v3::run(); }\n",
+             fn f() { tx_substrate::step::run(); }\n",
         );
         assert_eq!(scan.line_counts["tx_substrate"], 3);
-        assert_eq!(scan.sub_api_counts["tx_substrate::step_v3"], 2);
+        assert_eq!(scan.sub_api_counts["tx_substrate::step"], 2);
         assert_eq!(scan.sub_api_counts["tx_substrate::epoch"], 1);
     }
 
@@ -429,7 +429,7 @@ mod tests {
     fn non_adapter_file_lines_count_as_outside() {
         let scan = scan_file(
             "crates/tx-subsystems/src/vfs/execution.rs",
-            "use tx_substrate::step_v3::StepOutcome;\n",
+            "use tx_substrate::step::StepOutcome;\n",
         );
         let mut stats = PlatformStats::default();
         accumulate(
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(stats.raw_lines_outside_adapter, 1);
         assert_eq!(stats.files_outside_adapter, 1);
         assert_eq!(stats.raw_lines_inside_adapter, 0);
-        assert_eq!(stats.sub_api_lines["step_v3"], 1);
+        assert_eq!(stats.sub_api_lines["step"], 1);
     }
 
     #[test]

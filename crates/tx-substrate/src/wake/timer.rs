@@ -21,7 +21,7 @@
 
 use alloc::{sync::Arc, vec::Vec};
 
-use crate::step_v3::{Deadline, DelegateRegistry, DelegateTokenId};
+use crate::step::{Deadline, DelegateRegistry, DelegateTokenId};
 use crate::sync::SpinMutex;
 
 /// Opaque identifier for a timer registered on a [`TimerWheel`].

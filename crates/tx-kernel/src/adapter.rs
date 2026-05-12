@@ -18,14 +18,14 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "epoch"],
+    apis = ["step", "zone", "epoch"],
     reason = "expose substrate step engine outcome types, zone role types, EBR guard, and SpinMutex used by tx-kernel init and bootstrap wiring"
 )]
 pub mod step_engine {
     use tx_substrate::zone;
 
     pub use tx_substrate::epoch::{drain_with_budget, guard, Guard};
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::{
         ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     };
     pub use tx_substrate::zone::{

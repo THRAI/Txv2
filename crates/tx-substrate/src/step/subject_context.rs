@@ -26,7 +26,7 @@
 //! - `txdoc:TXV3-STEP-MODEL-V2`
 //! - `txdoc:TXV3-CONCEPTS-V5`
 
-use crate::step_v3::WaitSourceId;
+use crate::step::WaitSourceId;
 use crate::zone::{Cap, Zone, ZoneAllocated};
 
 // ---------------------------------------------------------------------------

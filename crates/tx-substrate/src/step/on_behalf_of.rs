@@ -64,8 +64,8 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 
-use crate::step_v3::subject_context::{SubjectAuthority, SubjectContext, SubjectIdentity};
-use crate::step_v3::{ScriptCtx, WaitSourceId};
+use crate::step::subject_context::{SubjectAuthority, SubjectContext, SubjectIdentity};
+use crate::step::{ScriptCtx, WaitSourceId};
 use crate::zone::Cap;
 
 /// Closed catalog of reasons a `with_on_behalf_of` borrow may abort

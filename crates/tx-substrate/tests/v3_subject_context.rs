@@ -34,7 +34,7 @@
 //! - `txdoc:TXV3-CONCEPTS-V5`
 
 use tx_substrate::epoch;
-use tx_substrate::step_v3::{
+use tx_substrate::step::{
     Credential, ProcessIdentity, RestrictionStackHandle, SubjectAuthority, SubjectContext,
     ThreadIdentity,
 };

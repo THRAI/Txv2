@@ -27,7 +27,7 @@
 //! - `txdoc:TXV3-EXECUTION-SCOPE-V1` (full ExecutionScope spec)
 //! - `txdoc:SCOPE-V1-CATALOG-1` (closed catalog)
 
-use crate::step_v3::subject_context::{ProcessIdentity, SubjectIdentity};
+use crate::step::subject_context::{ProcessIdentity, SubjectIdentity};
 use crate::zone::Cap;
 
 /// Closed catalog of execution scopes. Per

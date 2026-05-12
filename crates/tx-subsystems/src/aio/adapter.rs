@@ -3,13 +3,13 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "wake"],
+    apis = ["step", "zone", "wake"],
     reason = "expose substrate step engine on-behalf-of framework (with_on_behalf_of, AbortSignal, OnBehalfOfAbort, SubjectIdentity, SubjectContext, ScriptCtx, CancelReason, InterestMask, WaitSourceId), WaitSource, zone allocation, and SpinMutex for AIO context and worker future"
 )]
 pub mod step_engine {
     use tx_substrate::zone;
 
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::{
         with_on_behalf_of, AbortSignal, CancelReason, InterestMask, OnBehalfOfAbort, ScriptCtx,
         SubjectContext, SubjectIdentity, WaitSourceId,
     };

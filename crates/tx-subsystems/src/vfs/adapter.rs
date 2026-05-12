@@ -20,14 +20,14 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone", "epoch"],
+    apis = ["step", "zone", "epoch"],
     reason = "expose substrate step engine outcome types (StepOutcome, ByteProgress, NoProgress, Errno), zone role types (Cap, Weak, Zone, ZoneAllocated), and EBR guard used by vfs trait surface and walker step ops"
 )]
 pub mod step_engine {
     use tx_substrate::zone;
 
     pub use tx_substrate::epoch::{guard, Guard};
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::{
         ByteProgress, Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp,
         StepOutcome, StepProgress, SubjectIdentity, WaitSourceId,
     };
@@ -46,7 +46,7 @@ pub mod step_engine {
 #[platform_adapter(
     platform = "substrate",
     domain = "wait_routing",
-    apis = ["wake", "step_v3"],
+    apis = ["wake", "step"],
     reason = "wrap WaitSource registration and v3 mailbox notify for vfs RNode open-file wakeup paths"
 )]
 #[platform_adapter(
@@ -56,7 +56,7 @@ pub mod step_engine {
 )]
 pub mod wait_routing {
     use alloc::sync::Arc;
-    use tx_substrate::step_v3::{InterestMask, WaitSourceId};
+    use tx_substrate::step::{InterestMask, WaitSourceId};
 
     pub use tx_reactor::wait::{Channel, Mask};
     pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};

@@ -18,12 +18,12 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step_v3", "zone"],
+    apis = ["step", "zone"],
     reason = "wrap futex step outcomes (einval, eagain, yield-until-wake, done(n)) as named verbs over the substrate step engine"
 )]
 pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
-    pub use tx_substrate::step_v3::{
+    pub use tx_substrate::step::{
         Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
         StepProgress, SubjectIdentity, WaitSourceId, YieldShape,
     };
@@ -48,7 +48,7 @@ pub mod step_engine {
 #[platform_adapter(
     platform = "substrate",
     domain = "wait_routing",
-    apis = ["wake", "step_v3"],
+    apis = ["wake", "step"],
     reason = "wrap WaitSource registration and v3 mailbox notify in futex-side bucket wakeup verbs (D2 coexistence path)"
 )]
 #[platform_adapter(
@@ -58,7 +58,7 @@ pub mod step_engine {
 )]
 pub mod wait_routing {
     use alloc::sync::Arc;
-    use tx_substrate::step_v3::{InterestMask, WaitSourceId};
+    use tx_substrate::step::{InterestMask, WaitSourceId};
 
     pub use tx_reactor::wait::{Channel, Mask};
     pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};
