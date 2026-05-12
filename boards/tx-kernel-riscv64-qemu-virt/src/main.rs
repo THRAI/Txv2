@@ -31,6 +31,15 @@ pub extern "C" fn tx_kernel_riscv64_qemu_trap_dispatch(
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
+fn panic(info: &PanicInfo<'_>) -> ! {
+    use core::fmt::Write;
+    struct ConsoleWriter;
+    impl Write for ConsoleWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            tx_hal::console_write_str::<ActivePlatform>(s);
+            Ok(())
+        }
+    }
+    let _ = writeln!(ConsoleWriter, "\ntxkernel:panic: {info}");
     tx_kernel::panic_shutdown::<ActivePlatform>()
 }
