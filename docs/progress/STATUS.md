@@ -4,6 +4,15 @@
 
 ## Current Shape
 
+- 2026-05-12 D22 Phase 5 (tx-fs: tmpfs, devfs) adapter migration
+  LANDED. First cross-crate migration. Each subsystem owns its own
+  adapter.rs in tx-fs/src/<name>/. **Boundary report:** substrate
+  outside-adapter 1815 → 1623 (cumulative −924, 36%), inside 62 →
+  72; reactor unchanged; adapters declared 22 → 24.
+  **Verified:** tx-fs lib tests 39/39 pass; tx-subsystems suite
+  still 623 passing; lint arch ok; lint docs ok. ADR:
+  `2026-05-12-d22-phase5-fs-adapter.md`.
+
 - 2026-05-12 D21 Phase 4 (page_backed, vm) adapter migration
   LANDED. Memory subsystems migrated. VM adapter is the richest yet —
   re-exports the full userfaultfd-delegate surface
