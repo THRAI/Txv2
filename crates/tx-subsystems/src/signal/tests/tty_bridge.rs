@@ -9,7 +9,9 @@ use crate::signal::{deliver_tty_dispatch, signum_for_job_control, DispatchOutcom
 use crate::tty::execution::{JobControlSignal, SignalDispatch, SignalTarget};
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
 use crate::vm::{AddressSpace, TestPmap};
-use tx_substrate::zone::{self, PayloadCap};
+use crate::signal::adapter::step_engine::{
+    reserve_for, sign_for, ByteProgress, PayloadCap, StepOutcome,
+};
 
 struct NoopOps;
 impl CharDeviceOps for NoopOps {
@@ -17,15 +19,15 @@ impl CharDeviceOps for NoopOps {
         &self,
         _out: &mut [u8],
         _g: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-        tx_substrate::step_v3::StepOutcome::Done(0)
+    ) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::Done(0)
     }
     fn write(
         &self,
         b: &[u8],
         _g: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-        tx_substrate::step_v3::StepOutcome::Done(b.len())
+    ) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::Done(b.len())
     }
 }
 static NOOP_OPS: NoopOps = NoopOps;
@@ -54,11 +56,11 @@ fn fresh_init() -> Cap<ProcessIdentity> {
 
 fn fresh_tty(name: &str) -> Cap<TtyIdentity> {
     let id = TtyIdentity::new(TtyKind::SerialHardware, 0, name);
-    let res = zone::reserve_for::<TtyIdentity>().expect("identity");
-    let cap = zone::sign_for(res, id);
+    let res = reserve_for::<TtyIdentity>().expect("identity");
+    let cap = sign_for(res, id);
     let payload = TtyPayload::new_hardware(&NOOP_BINDING);
-    let pres = zone::reserve_for::<TtyPayload>().expect("payload");
-    let pcap = zone::sign_for(pres, payload);
+    let pres = reserve_for::<TtyPayload>().expect("payload");
+    let pcap = sign_for(pres, payload);
     cap.install_payload(PayloadCap::from_cap(pcap));
     cap
 }

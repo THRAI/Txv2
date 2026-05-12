@@ -16,8 +16,8 @@ use crate::thread_runtime::execution::{step_sigprocmask, SigmaskHow, Sigprocmask
 use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentity};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
+use crate::signal::adapter::step_engine::Cap;
 use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::zone::Cap;
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

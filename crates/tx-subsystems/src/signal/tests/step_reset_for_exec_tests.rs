@@ -4,7 +4,7 @@ use super::*;
 use crate::process::{bootstrap_init_process, ProcessIdentity};
 use crate::signal::{step_sigaction, SigDisposition};
 use crate::vm::{AddressSpace, TestPmap};
-use tx_substrate::zone::Cap;
+use crate::signal::adapter::step_engine::Cap;
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let g = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
