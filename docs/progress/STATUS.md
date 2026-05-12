@@ -4,6 +4,21 @@
 
 ## Current Shape
 
+- 2026-05-13 D51-D55 inline adapter relocation LANDED. Five inline
+  `mod adapter { ... }` blocks extracted from flat .rs files into sibling
+  adapter.rs files: aio (d049833), signalfd (9d74aba), userfaultfd (3a9f821),
+  io_uring (8b99513), reactor_submit (21480d1). Each .rs converted to
+  <name>/mod.rs + <name>/adapter.rs. Effect: boundary scanner now sees
+  adapter.rs as inside-adapter and mod.rs as outside with test-bootstrap
+  residue only. Test-bootstrap residue (init_host_for_test_once,
+  drain_with_budget) that was previously hidden inside the file now appears
+  in outside count. Net: +7 newly-visible residue lines relative to D50's
+  192 measurement; concurrent fixup D50 commit updated ceiling 192→199.
+  **Boundary report (post-D51-D55):** substrate outside 199 lines (ceiling
+  199 ok); reactor outside 4 lines (ceiling 4 ok). All 5 subsystem test
+  suites pass (10 aio, 5 signalfd, 2 userfaultfd, 8 io_uring, 3
+  reactor_submit). ADR: 2026-05-13-d51-d55-inline-adapter-relocation.md.
+
 - 2026-05-13 D50 tx-reactor adapter LANDED. Created `crates/tx-reactor/src/adapter.rs`
   with two `#[platform_adapter]` domains: `step_engine` (step_v3 types used by
   hart_loop StepOp impls and agent_reply future) and `bus_wire` (bus + wake
