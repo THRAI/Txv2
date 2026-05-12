@@ -4,6 +4,22 @@
 
 ## Current Shape
 
+- 2026-05-13 xtask: `verb_ratio` column added to `boundary-report` LANDED
+  (refactor #7/7, branch cc/crazy-ardinghelli-91c48e). Added `AdapterVerbStats`
+  struct with `pub_fn_count`, `total_pub_item_count`, `ratio()` to
+  `xtask/src/boundary_report.rs`. Text-scan-based metric (consistent with
+  existing no-syn approach): counts `pub fn` items (numerator + denominator),
+  individual names in `pub use {…}` groups (denominator), globs and other `pub`
+  items as 1 each (denominator). Stats computed once per adapter file and shared
+  across all `#[platform_adapter]` blocks in the same file. Report adds a
+  per-file verb-ratio table sorted ascending (alias-only adapters first). 4 new
+  unit tests. Build clean; `cargo test -p xtask` 72/72 pass; `lint boundary` 0/0.
+  Reporting only — not wired into the lint ratchet. 5 lowest-ratio adapters
+  (all 0.00): tx-drivers, tx-ext4, tx-fs/devfs, tx-fs/tmpfs, tx-kernel,
+  tx-reactor, tx-scripts, tx-shims, tx-subsystems (adapter.rs, cred, mount,
+  page_backed, reactor_submit, signal, thread_runtime, vm) — all almost entirely
+  `pub use` re-exports. Next: no further refactors planned in this series.
+
 - 2026-05-13 substrate: `zone::sign<T>(value) -> Result<Cap<T>, ZoneError>` LANDED
   (refactor #6/7, branch cc/crazy-ardinghelli-91c48e). Added `zone::sign` to
   `crates/tx-substrate/src/zone/mod.rs` as the one-step reserve+publish convenience.

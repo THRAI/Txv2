@@ -19,6 +19,228 @@ use std::path::Path;
 use crate::util::{collect_files, relative};
 use crate::Result;
 
+/// Verb-ratio metric for a single platform adapter file.
+///
+/// Scores how much "real" wrapping the adapter does versus mere
+/// type/name re-exporting:
+///
+/// * `pub_fn_count` — every `pub fn` item in the file (permissive:
+///   includes trivial one-line delegating wrappers).
+/// * `total_pub_item_count` — `pub fn` count plus the number of
+///   individually-exported names from `pub use` items (each name in a
+///   brace-group counts separately) plus one for every other `pub`
+///   keyword item (`pub const`, `pub static`, `pub type`, `pub struct`,
+///   `pub enum`, `pub trait`, `pub use foo::*`).
+///
+/// A ratio close to 0 means the adapter is almost entirely type
+/// aliasing; close to 1 means it is doing real wrapping work.
+///
+/// **Reporting only** — not part of the lint ratchet.
+#[derive(Debug, Clone, Copy)]
+pub struct AdapterVerbStats {
+    pub pub_fn_count: usize,
+    pub total_pub_item_count: usize,
+}
+
+impl AdapterVerbStats {
+    pub fn ratio(&self) -> f64 {
+        if self.total_pub_item_count == 0 {
+            0.0
+        } else {
+            self.pub_fn_count as f64 / self.total_pub_item_count as f64
+        }
+    }
+}
+
+/// Compute verb stats for the text of a single adapter file.
+///
+/// Scans the raw source text without parsing; sufficient for the
+/// heuristic metric.
+fn adapter_verb_stats(text: &str) -> AdapterVerbStats {
+    let mut pub_fn_count: usize = 0;
+    let mut total_pub_item_count: usize = 0;
+
+    // We need multi-line context for `pub use foo::{...}` groups, so
+    // build a collapsed view: join logical continuation lines (lines
+    // ending with `{` that don't close before a `;`).
+    //
+    // Strategy: iterate lines, tracking whether we are inside a
+    // brace-group started by `pub use`.
+    let mut in_pub_use_group = false;
+    let mut brace_depth: usize = 0;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        // Skip comments and attributes.
+        if trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if in_pub_use_group {
+            // Count names and track brace depth.
+            for ch in trimmed.chars() {
+                match ch {
+                    '{' => brace_depth += 1,
+                    '}' => {
+                        if brace_depth > 0 {
+                            brace_depth -= 1;
+                        }
+                        if brace_depth == 0 {
+                            in_pub_use_group = false;
+                        }
+                    }
+                    ',' => {
+                        // Each comma separates identifiers at any nesting
+                        // level inside the group. Count it as one more item
+                        // (the item before the comma; the last item is
+                        // counted by seeing `}` at depth 1).
+                        total_pub_item_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            // The closing `}` at depth 0 ends a name — already handled
+            // by incrementing before each `,`, plus one for the last item
+            // after the last `,` (or the only item). We add 1 here when
+            // we just closed the group.
+            if !in_pub_use_group {
+                // Closing brace counted as one final item.
+                total_pub_item_count += 1;
+            }
+            continue;
+        }
+
+        // Detect `pub fn`.
+        if is_pub_fn(trimmed) {
+            pub_fn_count += 1;
+            total_pub_item_count += 1;
+            continue;
+        }
+
+        // Detect `pub use`.
+        if let Some(after_use) = pub_use_tail(trimmed) {
+            // Check whether it uses a brace group.
+            if let Some(brace_pos) = after_use.find('{') {
+                // Enter group-counting mode.
+                in_pub_use_group = true;
+                brace_depth = 1;
+                // Count items in the already-seen part of the brace group
+                // on this same line.
+                let inside = &after_use[brace_pos + 1..];
+                for ch in inside.chars() {
+                    match ch {
+                        '{' => brace_depth += 1,
+                        '}' => {
+                            if brace_depth > 0 {
+                                brace_depth -= 1;
+                            }
+                            if brace_depth == 0 {
+                                in_pub_use_group = false;
+                            }
+                        }
+                        ',' => {
+                            total_pub_item_count += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                if !in_pub_use_group {
+                    // Group closed on the same line — count final item.
+                    total_pub_item_count += 1;
+                }
+            } else if after_use.contains('*') {
+                // `pub use foo::*` — glob, count as 1.
+                total_pub_item_count += 1;
+            } else {
+                // Single-name `pub use foo::Bar;` — count as 1.
+                total_pub_item_count += 1;
+            }
+            continue;
+        }
+
+        // Detect other `pub` items: const, static, type, struct, enum,
+        // trait, macro, extern.
+        if is_other_pub_item(trimmed) {
+            total_pub_item_count += 1;
+        }
+    }
+
+    AdapterVerbStats {
+        pub_fn_count,
+        total_pub_item_count,
+    }
+}
+
+/// True when the (trimmed) line introduces a `pub fn` item.
+fn is_pub_fn(trimmed: &str) -> bool {
+    // Accept `pub fn`, `pub async fn`, `pub const fn`, `pub unsafe fn`,
+    // `pub(crate) fn`, etc.
+    if let Some(rest) = trimmed.strip_prefix("pub") {
+        // Skip visibility qualifiers like `(crate)`, `(super)`, etc.
+        let rest = rest.trim_start();
+        let rest = if rest.starts_with('(') {
+            rest.find(')').map(|i| &rest[i + 1..]).unwrap_or(rest)
+        } else {
+            rest
+        };
+        let rest = rest.trim_start();
+        // Skip optional qualifiers: async, unsafe, const, extern.
+        for prefix in &["async ", "unsafe ", "const ", "extern "] {
+            if rest.starts_with(prefix) {
+                let inner = rest[prefix.len()..].trim_start();
+                if inner.starts_with("fn ") || inner.starts_with("fn(") {
+                    return true;
+                }
+            }
+        }
+        return rest.starts_with("fn ") || rest.starts_with("fn(");
+    }
+    false
+}
+
+/// If the trimmed line is a `pub use ...` statement, return the slice
+/// after `pub use ` (or `pub(…) use `). Returns `None` otherwise.
+fn pub_use_tail(trimmed: &str) -> Option<&str> {
+    let rest = trimmed.strip_prefix("pub")?;
+    let rest = rest.trim_start();
+    let rest = if rest.starts_with('(') {
+        &rest[rest.find(')')? + 1..]
+    } else {
+        rest
+    };
+    let rest = rest.trim_start();
+    rest.strip_prefix("use ")
+        .or_else(|| rest.strip_prefix("use\t"))
+}
+
+/// True when the (trimmed) line is a non-`fn`, non-`use` `pub` item.
+fn is_other_pub_item(trimmed: &str) -> bool {
+    let rest = match trimmed.strip_prefix("pub") {
+        Some(r) => r,
+        None => return false,
+    };
+    let rest = rest.trim_start();
+    let rest = if rest.starts_with('(') {
+        match rest.find(')') {
+            Some(i) => &rest[i + 1..],
+            None => rest,
+        }
+    } else {
+        rest
+    };
+    let rest = rest.trim_start();
+    for kw in &[
+        "const ", "static ", "type ", "struct ", "enum ", "trait ",
+        "macro ", "macro_rules", "extern ",
+    ] {
+        if rest.starts_with(kw) {
+            return true;
+        }
+    }
+    false
+}
+
 struct Platform {
     name: &'static str,
     home_crate: &'static str,
@@ -54,6 +276,7 @@ struct AdapterDecl {
     platform: String,
     domain: String,
     reason: String,
+    verb_stats: AdapterVerbStats,
 }
 
 pub(crate) fn boundary_report(root: &Path, args: Vec<String>) -> Result<()> {
@@ -189,6 +412,10 @@ fn scan_file(rel: &str, text: &str) -> FileScan {
 }
 
 fn extract_adapters(rel: &str, text: &str) -> Vec<AdapterDecl> {
+    // Compute verb stats once for the whole file (shared across all adapter
+    // declarations in the same file — multiple `#[platform_adapter]` blocks
+    // in one file are measured together as a single unit).
+    let verb_stats = adapter_verb_stats(text);
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(pos) = rest.find("#[platform_adapter(") {
@@ -202,6 +429,7 @@ fn extract_adapters(rel: &str, text: &str) -> Vec<AdapterDecl> {
             platform: extract_kv(body, "platform"),
             domain: extract_kv(body, "domain"),
             reason: extract_kv(body, "reason"),
+            verb_stats,
         });
         rest = &after[end + 2..];
     }
@@ -283,6 +511,8 @@ fn emit_human(
             }
         }
     }
+    println!();
+    print_verb_ratio_table(adapters);
 }
 
 fn print_sub_api(label: &str, m: &BTreeMap<String, usize>) {
@@ -311,6 +541,49 @@ fn print_top_files(label: &str, m: &BTreeMap<String, usize>, n: usize) {
     }
 }
 
+/// Print a per-adapter verb-ratio table sorted ascending (lowest ratio
+/// first — these are the candidates for consolidation or deletion).
+///
+/// Deduplicates by file so multi-domain adapters that share a file
+/// appear only once.
+fn print_verb_ratio_table(adapters: &[AdapterDecl]) {
+    println!("adapter verb-ratio (pub_fn / total_pub_items) — low ratio = alias-only:");
+    if adapters.is_empty() {
+        println!("  (none)");
+        return;
+    }
+
+    // Deduplicate: one row per unique file.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut rows: Vec<(&str, AdapterVerbStats)> = Vec::new();
+    for a in adapters {
+        if seen.insert(a.file.as_str()) {
+            rows.push((a.file.as_str(), a.verb_stats));
+        }
+    }
+    // Sort ascending by ratio (alias-only adapters first).
+    rows.sort_by(|a, b| {
+        a.1.ratio()
+            .partial_cmp(&b.1.ratio())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(b.0))
+    });
+
+    println!(
+        "  {:<6}  {:<10}  {}",
+        "ratio", "fns/total", "file"
+    );
+    for (file, stats) in &rows {
+        println!(
+            "  {:<6.2}  {:>2}/{:<7}  {}",
+            stats.ratio(),
+            stats.pub_fn_count,
+            stats.total_pub_item_count,
+            file,
+        );
+    }
+}
+
 fn emit_json(
     s: &PlatformStats,
     r: &PlatformStats,
@@ -326,6 +599,11 @@ fn emit_json(
                 "platform": a.platform,
                 "domain": a.domain,
                 "reason": a.reason,
+                "verb_stats": {
+                    "pub_fn_count": a.verb_stats.pub_fn_count,
+                    "total_pub_item_count": a.verb_stats.total_pub_item_count,
+                    "ratio": a.verb_stats.ratio(),
+                },
             }))
             .collect::<Vec<_>>(),
     });
@@ -481,5 +759,68 @@ mod tests {
         );
         assert_eq!(stats.raw_lines_outside_adapter, 1);
         assert_eq!(stats.raw_lines_inside_adapter, 0);
+    }
+
+    #[test]
+    fn adapter_verb_stats_counts_fns_and_use_items() {
+        // Synthetic adapter body: two pub fns, one multi-name pub use
+        // (counts as 3 exports), one glob (counts as 1), one type alias
+        // (counts as 1).
+        let text = "\
+#[platform_adapter(platform = \"substrate\", domain = \"step_engine\", reason = \"r\")]\n\
+pub mod step_engine {\n\
+    pub use tx_substrate::step::{Errno, NoProgress, StepOutcome};\n\
+    pub use tx_substrate::zone::*;\n\
+    pub type ErrCode = u32;\n\
+    pub fn wrap_run() { tx_substrate::step::run(); }\n\
+    pub fn wrap_lookup() -> u64 { tx_substrate::index::lookup() }\n\
+}\n";
+        let stats = adapter_verb_stats(text);
+        // fns: wrap_run, wrap_lookup => 2
+        assert_eq!(stats.pub_fn_count, 2, "pub_fn_count");
+        // use group {Errno, NoProgress, StepOutcome} => 3 (2 commas + closing)
+        // use glob * => 1
+        // type ErrCode => 1
+        // two fns => 2
+        // total = 3 + 1 + 1 + 2 = 7
+        assert_eq!(stats.total_pub_item_count, 7, "total_pub_item_count");
+        let ratio = stats.ratio();
+        assert!((ratio - 2.0 / 7.0).abs() < 1e-9, "ratio {ratio}");
+    }
+
+    #[test]
+    fn adapter_verb_stats_all_fns_gives_ratio_one() {
+        let text = "\
+pub mod m {\n\
+    pub fn a() {}\n\
+    pub fn b() {}\n\
+    pub fn c() {}\n\
+}\n";
+        let stats = adapter_verb_stats(text);
+        assert_eq!(stats.pub_fn_count, 3);
+        assert_eq!(stats.total_pub_item_count, 3);
+        assert!((stats.ratio() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn adapter_verb_stats_all_reexports_gives_ratio_zero() {
+        let text = "\
+pub mod m {\n\
+    pub use foo::A;\n\
+    pub use foo::B;\n\
+    pub use foo::C;\n\
+}\n";
+        let stats = adapter_verb_stats(text);
+        assert_eq!(stats.pub_fn_count, 0);
+        assert_eq!(stats.total_pub_item_count, 3);
+        assert!((stats.ratio() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn adapter_verb_stats_empty_gives_zero_ratio() {
+        let stats = adapter_verb_stats("");
+        assert_eq!(stats.pub_fn_count, 0);
+        assert_eq!(stats.total_pub_item_count, 0);
+        assert!((stats.ratio() - 0.0).abs() < 1e-9);
     }
 }
