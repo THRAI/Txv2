@@ -41,7 +41,7 @@ pub const BOOTSTRAP_BRK_BASE: u64 = 0x6000_0000;
 ///
 /// The `SpinMutex<Option<Cap>>` shape matches every other day-1 slot
 /// in the process subsystem; migration to a future
-/// `tx_substrate::AtomicSlot<T>` is a subsystem-internal change.
+/// `adapter::step_engine::AtomicSlot<T>` is a subsystem-internal change.
 static INIT_PROCESS: SpinMutex<Option<Cap<ProcessIdentity>>> = SpinMutex::new(None);
 
 /// Snapshot the global init handle. Returns `None` before
@@ -1264,7 +1264,9 @@ mod step_op_wraps {
     use crate::thread_runtime::structure::reset_tid_counter_for_test;
     use crate::vm::{AddressSpace, TestPmap};
     use crate::zones;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome};
+    use crate::process::adapter::step_engine::{
+        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
+    };
     use tx_substrate::testing::init_host_for_test_once;
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
@@ -1295,7 +1297,7 @@ mod step_op_wraps {
             parent: &parent,
             _pmap: core::marker::PhantomData,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(result) => {
@@ -1315,7 +1317,7 @@ mod step_op_wraps {
             process: &child,
             status: ExitStatus::Exited(0),
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         assert_eq!(outcome, StepOutcome::Done(()));
         assert!(child.is_zombie());
@@ -1331,7 +1333,7 @@ mod step_op_wraps {
             process: &child,
             sig: Signum::SIGKILL,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         assert_eq!(outcome, StepOutcome::Done(()));
         assert!(child.is_zombie());
@@ -1349,7 +1351,7 @@ mod step_op_wraps {
             parent: &parent,
             target: WaitTarget::Any,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(Err(WaitError::NoChildren)) => {}
@@ -1362,7 +1364,7 @@ mod step_op_wraps {
         let _g = setup();
         let parent = bootstrap();
         let mut op = GetcwdOp { target: &parent };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         // init bootstrap leaves cwd unset, so step_getcwd returns None.
         assert_eq!(outcome, StepOutcome::Done(None));
@@ -1380,7 +1382,7 @@ mod step_op_wraps {
             target: &parent,
             new_pgid: bogus,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(Err(SetpgidError::Unimplemented)) => {}
@@ -1394,7 +1396,7 @@ mod step_op_wraps {
         let parent = bootstrap();
         let child = step_fork::<TestPmap>(&parent).expect("fork");
         let mut op = SetsidOp { target: &child };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(Ok(sid)) => {
@@ -1409,7 +1411,7 @@ mod step_op_wraps {
         let _g = setup();
         let parent = bootstrap();
         let mut op = CloseCloexecFdsOp { process: &parent };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         assert_eq!(outcome, StepOutcome::Done(()));
         // Bootstrap leaves the CLOEXEC set empty; post-call it stays empty.
@@ -1421,7 +1423,7 @@ mod step_op_wraps {
         let _g = setup();
         let parent = bootstrap();
         let mut op = ResetSignalDispositionsForExecOp { process: &parent };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         assert_eq!(outcome, StepOutcome::Done(()));
     }
@@ -1435,7 +1437,7 @@ mod step_op_wraps {
             process: &parent,
             new_brk_base: new_base,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         assert_eq!(outcome, StepOutcome::Done(()));
         let payload_guard = parent.payload.lock();
