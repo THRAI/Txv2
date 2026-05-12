@@ -1,11 +1,11 @@
 //! Shared TTY test fixtures.
 
-use tx_substrate::zone::{self, Cap, PayloadCap};
-
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::Guard;
+use crate::tty::adapter::step_engine::{
+    reserve_for, sign_for, ByteProgress, Cap, PayloadCap, StepOutcome as V3,
+};
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
-use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
 
 pub(super) use crate::test_support::EPOCH_TEST_LOCK as TTY_ZONE_TEST_LOCK;
 
@@ -41,10 +41,10 @@ pub(super) fn alloc_tty(
     name: &str,
     payload: TtyPayload,
 ) -> Cap<TtyIdentity> {
-    let id_res = zone::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-    let payload_res = zone::reserve_for::<TtyPayload>().expect("tty payload reservation");
-    let payload = PayloadCap::from_cap(zone::sign_for(payload_res, payload));
-    let identity = zone::sign_for(id_res, TtyIdentity::new(kind, index, name));
+    let id_res = reserve_for::<TtyIdentity>().expect("tty identity reservation");
+    let payload_res = reserve_for::<TtyPayload>().expect("tty payload reservation");
+    let payload = PayloadCap::from_cap(sign_for(payload_res, payload));
+    let identity = sign_for(id_res, TtyIdentity::new(kind, index, name));
     identity.install_payload(payload);
     identity
 }

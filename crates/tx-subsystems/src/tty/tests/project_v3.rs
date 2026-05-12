@@ -13,7 +13,9 @@ use crate::tty::project::{
 use crate::vfs::{Credential, DirCursor, FsObjectId, FsOps, InodeKind, InodeMeta};
 
 use tx_hal::Ppn;
-use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+use crate::tty::adapter::step_engine::{
+    guard, Errno as V3Errno, NoProgress, StepOutcome as V3,
+};
 
 /// Register every kernel zone (matching `legacy_phase_a::init_zones`)
 /// because `open_ptmx` allocates PTY identity / payload / open-file
@@ -32,7 +34,7 @@ fn init_zones() {
 fn devpts_v3_lookup_round_trips_to_ptmx_and_allocated_slaves() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devpts = DevptsInstance;
 
     // Allocate a single PTY so a numeric devpts entry exists.
@@ -76,7 +78,7 @@ fn devpts_v3_lookup_round_trips_to_ptmx_and_allocated_slaves() {
 fn devpts_v3_load_inode_meta_for_root_and_ptmx() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devpts = DevptsInstance;
 
     assert_eq!(
@@ -98,7 +100,7 @@ fn devpts_v3_load_inode_meta_for_root_and_ptmx() {
 fn devpts_v3_readdir_lists_ptmx_and_returns_none_at_end() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devpts = DevptsInstance;
 
     let first = <DevptsInstance as FsOps>::readdir(
@@ -146,7 +148,7 @@ fn devpts_v3_readdir_lists_ptmx_and_returns_none_at_end() {
 fn devpts_v3_mutations_are_erofs() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devpts = DevptsInstance;
     let cred = Credential::default();
 
@@ -239,7 +241,7 @@ fn devpts_v3_mutations_are_erofs() {
 fn devpts_v3_destroy_inode_done_for_known_objects() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devpts = DevptsInstance;
 
     // Root + ptmx are known and return Done(()).
@@ -264,7 +266,7 @@ fn devpts_v3_destroy_inode_done_for_known_objects() {
 fn devpts_v3_fs_page_backing_returns_enosys() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devpts = DevptsInstance;
 
     assert_eq!(
