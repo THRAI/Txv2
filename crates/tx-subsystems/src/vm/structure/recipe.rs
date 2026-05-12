@@ -5,8 +5,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use tx_substrate::epoch;
-use tx_substrate::SpinMutex;
+use crate::vm::adapter::step_engine::{epoch_mod as epoch, SpinMutex};
 
 use crate::execution::Guard;
 

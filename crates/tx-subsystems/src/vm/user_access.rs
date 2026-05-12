@@ -111,7 +111,7 @@ impl AddressSpace {
         src: UserPtr<T>,
         guard: &Guard<'_>,
     ) -> StepOutcome<T, NoProgress> {
-        use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
+        use step_engine::{NoProgress, StepOutcome as V3};
         let mut value = core::mem::MaybeUninit::<T>::uninit();
         // SAFETY: value is a valid kernel-stack `MaybeUninit<T>`; we
         // expose its bytes to copy_from_user which fills exactly
@@ -145,7 +145,7 @@ impl AddressSpace {
         value: T,
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
+        use step_engine::{NoProgress, StepOutcome as V3};
         // SAFETY: addr_of! yields a valid kernel pointer to `value`
         // for the lifetime of this call; the cast to *const u8 reads
         // exactly `size_of::<T>()` bytes from a Copy value.
@@ -273,9 +273,7 @@ impl AddressSpace {
         max_len: usize,
         guard: &Guard<'_>,
     ) -> StepOutcome<Vec<u8>, NoProgress> {
-        use tx_substrate::step_v3::{
-            InterestMask, NoProgress, StepOutcome as V3, WaitSourceId, YieldShape,
-        };
+        use step_engine::{InterestMask, NoProgress, StepOutcome as V3, WaitSourceId, YieldShape};
         if src.addr() == 0 || max_len == 0 {
             return V3::Done(Vec::new());
         }
@@ -328,9 +326,7 @@ fn copy_in(
     src: UserPtr<u8>,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-    use tx_substrate::step_v3::{
-        ByteProgress, InterestMask, StepOutcome as V3, WaitSourceId, YieldShape,
-    };
+    use step_engine::{ByteProgress, InterestMask, StepOutcome as V3, WaitSourceId, YieldShape};
     if dst.is_empty() {
         return V3::Done(0);
     }
@@ -389,9 +385,7 @@ fn copy_out(
     src: &[u8],
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-    use tx_substrate::step_v3::{
-        ByteProgress, InterestMask, StepOutcome as V3, WaitSourceId, YieldShape,
-    };
+    use step_engine::{ByteProgress, InterestMask, StepOutcome as V3, WaitSourceId, YieldShape};
     if src.is_empty() {
         return V3::Done(0);
     }
@@ -618,7 +612,7 @@ fn resolve_user_page(
             //   `ResolvePageOutcome::Blocked(WaitToken(c, i))`.
             // - v3 `Yield { OnAgent .. }` → `Err(EFAULT)`.
             // - v3 `Err(_)` → `Err(EFAULT)`.
-            use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
+            use step_engine::{StepOutcome as V3, YieldShape};
             match pc.materialize_page(page_index, kind.materialize_access(), guard) {
                 V3::Done(m) => ResolvePageOutcome::Done(m),
                 V3::Continue { .. } => ResolvePageOutcome::Err(Errno::EFAULT),

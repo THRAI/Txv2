@@ -30,7 +30,7 @@ use alloc::vec::Vec;
 
 use tx_hal::PmapIf;
 use step_engine::page_allocator;
-use tx_substrate::zone::Cap;
+use step_engine::Cap;
 
 use crate::execution::Errno;
 use crate::page_backed::PageContainer;

@@ -26,8 +26,7 @@
 use alloc::collections::BTreeMap;
 use tx_hal::Ppn;
 use step_engine::page_allocator::{self, BitmapPageAllocator, CachePin};
-use tx_substrate::zone::{Cap, Zone, ZoneAllocated, ZoneError};
-use tx_substrate::SpinMutex;
+use crate::vm::adapter::step_engine::{Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
 use crate::vm::adapter::step_engine::{self as step_engine};
 
 /// Page offset within a `VmEntry`'s range. `VmPageOff(0)` is the first
