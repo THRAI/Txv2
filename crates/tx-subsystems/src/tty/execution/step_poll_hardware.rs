@@ -7,13 +7,17 @@
 
 use alloc::vec;
 
-use crate::tty::adapter::step_engine::{self as step_engine, Cap};
+use crate::tty::adapter::step_engine::Cap;
 
 use crate::execution::{Errno, Guard};
 use crate::tty::checks::require_live_tty;
 use crate::tty::execution::{step_ingest, IngestOutcome};
 use crate::tty::structure::{TtyIdentity, TtyTransport};
-use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
+use crate::tty::adapter::step_engine::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+#[cfg(test)]
+use crate::tty::adapter::step_engine::ByteProgress;
+#[cfg(test)]
+use crate::tty::adapter::step_engine::{self as step_engine};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HardwarePollOutcome {

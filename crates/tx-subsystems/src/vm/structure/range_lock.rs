@@ -9,11 +9,11 @@
 //! `RANGE_LOCK_RELEASE_MASK` bit so async script wrappers can convert a
 //! `WouldBlock` outcome into an awaitable wait via `WouldBlock::wait_token`.
 
-use tx_reactor::wait::{Channel, Mask};
-use tx_substrate::step_v3::{
-    InterestMask, NoProgress, StepOutcome as V3StepOutcome, WaitSourceId, YieldShape,
+use crate::vm::adapter::step_engine::{
+    InterestMask, NoProgress, SpinMutex, StepOp, StepOutcome as V3StepOutcome, SubjectIdentity, WaitSourceId,
+    YieldShape,
 };
-use tx_substrate::SpinMutex;
+use crate::vm::adapter::wait_routing::{Channel, Mask};
 
 use crate::execution::WaitToken;
 use crate::wait_source;

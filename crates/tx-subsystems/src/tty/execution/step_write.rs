@@ -9,7 +9,7 @@ use crate::tty::checks::{background_write_signal, require_fg_pgrp, require_live_
 use crate::tty::execution::{step_ingest, TTY_WRITABLE};
 use crate::tty::ldisc::process_output;
 use crate::tty::structure::{termios::TOSTOP, TtyIdentity, TtyTransport};
-use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
+use crate::tty::adapter::step_engine::{ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 /// Transform user bytes through N_TTY output processing, enqueue them, and
 /// kick the underlying transport.

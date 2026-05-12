@@ -1,0 +1,38 @@
+//! Substrate adapter for page_backed.
+//!
+//! Page_backed has no reactor surface in production (the two
+//! tx_reactor refs in the directory are inside test files). Single
+//! domain `step_engine` covers everything: step_v3 types used by the
+//! per-variant fetch / write step ops, zone role types for the
+//! `PageContainer` zone, the `page_allocator` surface (allocator,
+//! cache pins, device frames, map pins, zero policy), EBR Guard +
+//! guard, and SpinMutex.
+
+use tx_platform_adapter::platform_adapter;
+
+#[platform_adapter(
+    platform = "substrate",
+    domain = "step_engine",
+    apis = ["step_v3", "zone", "epoch", "page_allocator"],
+    reason = "expose substrate step engine outcome types, zone role types, page-allocator primitives (BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy), EBR guard, and SpinMutex used by the page_backed subsystem's per-variant fetch/write step ops"
+)]
+pub mod step_engine {
+    use tx_substrate::zone;
+
+    pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::page_allocator::{
+        self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,
+    };
+    pub use tx_substrate::step_v3::{
+        ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, YieldShape,
+    };
+    pub use tx_substrate::zone::{
+        reserve_for, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
+    };
+    pub use tx_substrate::SpinMutex;
+
+    pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
+        let reservation = zone::reserve_for::<T>()?;
+        Ok(zone::sign_for(reservation, value))
+    }
+}

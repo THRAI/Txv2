@@ -25,7 +25,7 @@ use crate::tty::adapter::step_engine::{AtomicSlot, SpinMutex};
 use crate::wait_source;
 
 use super::payload::TtyPayload;
-use crate::tty::adapter::step_engine::{self as step_engine, ByteProgress, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, WaitSourceId};
+use crate::tty::adapter::step_engine::{self as step_engine, StepOp, SubjectIdentity, WaitSourceId};
 
 // ---------------------------------------------------------------------------
 // Staging: FixedName<N>

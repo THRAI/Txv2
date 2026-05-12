@@ -1,13 +1,17 @@
 //! Master-close hangup path for ptys.
 
-use crate::tty::adapter::step_engine::{self as step_engine, Cap};
+use crate::tty::adapter::step_engine::Cap;
 
 use super::step_hangup::{step_hangup, HangupOutcome};
 use super::step_ioctl::IoctlSideEffect;
 use crate::execution::{Errno, Guard};
 use crate::tty::checks::require_live_tty;
 use crate::tty::structure::{TtyIdentity, TtyTransport};
-use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
+use crate::tty::adapter::step_engine::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+#[cfg(test)]
+use crate::tty::adapter::step_engine::ByteProgress;
+#[cfg(test)]
+use crate::tty::adapter::step_engine::{self as step_engine};
 
 pub fn step_master_close_last(
     master: &Cap<TtyIdentity>,

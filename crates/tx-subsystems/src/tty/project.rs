@@ -299,7 +299,7 @@ impl PtyIndexName {
 
 use crate::page_backed::{Frame, FsPageBacking, PageContainer};
 use crate::vfs::FsOps;
-use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
+use crate::tty::adapter::step_engine::{NoProgress, StepOutcome};
 
 impl FsOps for DevptsInstance {
     fn lookup(
