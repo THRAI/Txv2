@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use std::sync::Mutex;
 
-use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Outcome};
+use super::adapter::step_engine::{self as step_engine, guard, ByteProgress, Errno as V3Errno, StepOutcome as V3Outcome};
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
@@ -59,7 +59,7 @@ impl CharDeviceOps for CapturingOps {
         &self,
         _out: &mut [u8],
         _guard: &Guard<'_>,
-    ) -> V3Outcome<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> V3Outcome<usize, ByteProgress> {
         V3Outcome::Done(0)
     }
 
@@ -67,7 +67,7 @@ impl CharDeviceOps for CapturingOps {
         &self,
         bytes: &[u8],
         _guard: &Guard<'_>,
-    ) -> V3Outcome<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> V3Outcome<usize, ByteProgress> {
         self.captured
             .lock()
             .expect("capture lock")
@@ -87,14 +87,14 @@ fn install_capturing_console() -> &'static CapturingOps {
         name: "console-test",
         ops: ops_static,
     }));
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = match register_hardware("console-hw", 0, binding, &guard) {
         V3Outcome::Done(tty) => tty,
         other => panic!("register_hardware failed: {other:?}"),
     };
     assert_eq!(
         register_console_alias("console", tty),
-        tx_substrate::step_v3::StepOutcome::Done(())
+        step_engine::StepOutcome::Done(())
     );
     ops_static
 }
@@ -110,7 +110,7 @@ fn devfs_lookup_console_after_register_hardware_returns_tty_rnode() {
 
     let _ops = install_capturing_console();
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devfs = Devfs::new();
 
     // FsOps::lookup over the devfs root yields a stable FsObjectId
@@ -182,7 +182,7 @@ fn devfs_write_through_openfile_reaches_tty_step_write() {
 
     let ops = install_capturing_console();
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let console = open_console_for_init();
 
     // step_write goes: OpenFile::step_write -> RNodeBacking::StructBacked
@@ -211,7 +211,7 @@ fn devfs_create_returns_erofs() {
         .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devfs = Devfs::new();
 
     // Devfs always returns EROFS for mutators, so cred privilege does
@@ -262,7 +262,7 @@ fn devfs_chmod_returns_erofs() {
         .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devfs = Devfs::new();
     let cred = Credential::root();
 
@@ -282,7 +282,7 @@ fn devfs_chown_returns_erofs() {
         .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devfs = Devfs::new();
     let cred = Credential::root();
 
@@ -310,7 +310,7 @@ fn devfs_lookup_unknown_returns_enoent() {
     // `not-a-real-device` still misses.
     let _ops = install_capturing_console();
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devfs = Devfs::new();
 
     assert_eq!(
@@ -343,11 +343,11 @@ fn devfs_v3_lookup_console_returns_done_with_object_id() {
 
     let _ops = install_capturing_console();
 
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use step_engine::StepOutcome as V3;
     use tx_subsystems::vfs::FsOps;
 
     let devfs = Devfs::new();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     // Positive lookup: console alias is registered → `Done(id)` with a
     // non-root id.
@@ -359,7 +359,7 @@ fn devfs_v3_lookup_console_returns_done_with_object_id() {
 
     // Negative lookup: missing alias → ENOENT through the v3 errno
     // bridge.
-    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress};
+    use step_engine::{Errno as V3Errno, NoProgress};
     assert_eq!(
         <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"nope-v3", &guard),
         V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT)
@@ -373,11 +373,11 @@ fn devfs_v3_load_inode_meta_root_returns_directory_meta() {
         .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use step_engine::StepOutcome as V3;
     use tx_subsystems::vfs::{FsOps, InodeKind};
 
     let devfs = Devfs::new();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     let meta = match <Devfs as FsOps>::load_inode_meta(&devfs, DEVFS_ROOT_OBJECT_ID, &guard) {
         V3::Done(meta) => meta,
@@ -397,11 +397,11 @@ fn devfs_v3_fetch_page_returns_enosys() {
         .unwrap_or_else(|p| p.into_inner());
     init_tty_zones();
 
-    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, NoProgress, StepOutcome as V3};
     use tx_subsystems::page_backed::{Frame, FsPageBacking};
 
     let devfs = Devfs::new();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     assert_eq!(
         <Devfs as FsPageBacking>::fetch_page(&devfs, DEVFS_ROOT_OBJECT_ID, 0, &guard),
@@ -418,7 +418,7 @@ fn devfs_readdir_yields_registered_aliases_and_terminates() {
 
     let _ops = install_capturing_console();
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devfs = Devfs::new();
 
     let mut cursor = DirCursor::START;

@@ -878,7 +878,7 @@ impl FsPageBacking for Tmpfs {
         // - `Yield { OnWaitSource { c, i } }` → `yield_on_wait_source(NoProgress, c, i)`.
         // - `Yield { OnAgent .. }` → `err(EIO)`.
         // - `Err(e)` → `err(e)`.
-        use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
+        use adapter::step_engine::{StepOutcome as V3, YieldShape};
         match container.materialize_page(page_index, MaterializeAccess::Read, guard) {
             V3::Done(materialized) => V3::done(Frame::new(materialized.ppn)),
             V3::Continue { .. } => V3::err(step_engine::Errno::EAGAIN),
