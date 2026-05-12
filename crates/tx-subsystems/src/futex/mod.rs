@@ -158,7 +158,7 @@ pub fn bucket_index(uaddr: u64) -> usize {
 /// `uaddr` must be non-zero and 4-byte aligned; otherwise `Err(EINVAL)`.
 /// `timeout` is ignored in v1.
 ///
-/// Returns a [`tx_substrate::step_v3::StepOutcome`]:
+/// Returns a [`StepOutcome`]:
 /// - bad uaddr → `Err(Errno::EINVAL)`
 /// - `*uaddr != val` → `Err(Errno::EAGAIN)`
 /// - `*uaddr == val` → `Yield { progress: NoProgress, shape: OnWaitSource { … } }`
@@ -192,7 +192,7 @@ pub fn step_futex_wait(
 
 /// `futex(uaddr, FUTEX_WAKE, n, ...)`.
 ///
-/// Returns a [`tx_substrate::step_v3::StepOutcome`]:
+/// Returns a [`StepOutcome`]:
 /// - bad uaddr (zero or unaligned) → `Err(Errno::EINVAL)`
 /// - otherwise → `Done(n)` (best-effort: returned count is the
 ///   requested `n`, not the actually-woken count; same caveat as
@@ -320,7 +320,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FutexWakeOp<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome, StepProgress};
+    use super::adapter::step_engine::{
+        guard, Errno as V3Errno, StepOutcome, StepProgress, YieldShape,
+    };
     use tx_substrate::testing::init_host_for_test_once;
 
     use crate::test_support::EPOCH_TEST_LOCK;
@@ -338,7 +340,7 @@ mod tests {
         let _setup = setup();
         let word: u32 = 0;
         let uaddr = &word as *const u32 as u64;
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_futex_wake(uaddr, 7, &guard);
         drop(guard);
         assert_eq!(outcome, StepOutcome::Done(7));
@@ -347,7 +349,7 @@ mod tests {
     #[test]
     fn futex_step_wake_zero_uaddr_returns_einval() {
         let _setup = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_futex_wake(0, 1, &guard);
         drop(guard);
         assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
@@ -356,7 +358,7 @@ mod tests {
     #[test]
     fn futex_step_wake_unaligned_uaddr_returns_einval() {
         let _setup = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         // 0x1 — non-zero, non-zero-mod-4.
         let outcome = step_futex_wake(0x1, 1, &guard);
         drop(guard);
@@ -370,7 +372,7 @@ mod tests {
         // observe the mismatch and short-circuit to EAGAIN.
         let word: u32 = 0xdead_beef;
         let uaddr = &word as *const u32 as u64;
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_futex_wait(uaddr, 0, &guard);
         drop(guard);
         assert_eq!(outcome, StepOutcome::Err(V3Errno::EAGAIN));
@@ -381,10 +383,9 @@ mod tests {
         let _setup = setup();
         let word: u32 = 0xdead_beef;
         let uaddr = &word as *const u32 as u64;
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_futex_wait(uaddr, 0xdead_beef, &guard);
         drop(guard);
-        use tx_substrate::step_v3::YieldShape;
         match outcome {
             StepOutcome::Yield {
                 shape:
@@ -407,7 +408,7 @@ mod tests {
     #[test]
     fn futex_step_wait_zero_uaddr_returns_einval() {
         let _setup = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_futex_wait(0, 0, &guard);
         drop(guard);
         assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
@@ -416,7 +417,7 @@ mod tests {
     #[test]
     fn futex_step_wait_unaligned_uaddr_returns_einval() {
         let _setup = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_futex_wait(0x2, 0, &guard);
         drop(guard);
         assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
@@ -453,16 +454,16 @@ mod tests {
     #[test]
     fn step_futex_wait_misaligned_uaddr_returns_einval() {
         let _setup = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         // 0x1 — non-zero, non-zero-mod-4 (misaligned for u32).
         let outcome = step_futex_wait(0x1, 0, &guard);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EINVAL) => {}
-            tx_substrate::step_v3::StepOutcome::Continue { .. }
-            | tx_substrate::step_v3::StepOutcome::Yield { .. }
-            | tx_substrate::step_v3::StepOutcome::Done(())
-            | tx_substrate::step_v3::StepOutcome::Err(_) => {
+            StepOutcome::Err(V3Errno::EINVAL) => {}
+            StepOutcome::Continue { .. }
+            | StepOutcome::Yield { .. }
+            | StepOutcome::Done(())
+            | StepOutcome::Err(_) => {
                 panic!("expected v3 Err(EINVAL), got {outcome:?}");
             }
         }
@@ -475,15 +476,15 @@ mod tests {
         // the mismatch and short-circuit to EAGAIN.
         let word: u32 = 0xdead_beef;
         let uaddr = &word as *const u32 as u64;
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_futex_wait(uaddr, 0, &guard);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EAGAIN) => {}
-            tx_substrate::step_v3::StepOutcome::Continue { .. }
-            | tx_substrate::step_v3::StepOutcome::Yield { .. }
-            | tx_substrate::step_v3::StepOutcome::Done(())
-            | tx_substrate::step_v3::StepOutcome::Err(_) => {
+            StepOutcome::Err(V3Errno::EAGAIN) => {}
+            StepOutcome::Continue { .. }
+            | StepOutcome::Yield { .. }
+            | StepOutcome::Done(())
+            | StepOutcome::Err(_) => {
                 panic!("expected v3 Err(EAGAIN), got {outcome:?}");
             }
         }
@@ -494,14 +495,14 @@ mod tests {
         let _setup = setup();
         let word: u32 = 0xdead_beef;
         let uaddr = &word as *const u32 as u64;
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_futex_wait(uaddr, 0xdead_beef, &guard);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Yield {
+            StepOutcome::Yield {
                 progress,
                 shape:
-                    tx_substrate::step_v3::YieldShape::OnWaitSource {
+                    YieldShape::OnWaitSource {
                         source: _,
                         interests,
                     },
@@ -525,11 +526,11 @@ mod tests {
         let _setup = setup();
         let word: u32 = 0;
         let uaddr = &word as *const u32 as u64;
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_futex_wake(uaddr, 0, &guard);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Done(0) => {}
+            StepOutcome::Done(0) => {}
             other => panic!("expected v3 Done(0) for n=0 no-op, got {other:?}"),
         }
     }
@@ -548,11 +549,11 @@ mod tests {
         // flips this to Done(0).
         let word: u32 = 0;
         let uaddr = &word as *const u32 as u64;
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = step_futex_wake(uaddr, 1, &guard);
         drop(guard);
         match outcome {
-            tx_substrate::step_v3::StepOutcome::Done(woken) => {
+            StepOutcome::Done(woken) => {
                 assert_eq!(woken, 1, "v1 wake returns requested n (best-effort)");
             }
             other => panic!("expected v3 Done(_), got {other:?}"),
@@ -571,8 +572,7 @@ mod tests {
         let _setup = setup();
         let word: u32 = 42;
         let uaddr = &word as *const u32 as u64;
-        let guard = tx_substrate::epoch::guard();
-        use tx_substrate::step_v3::YieldShape;
+        let guard = guard();
         // wait → Yield { OnWaitSource { … } }; pull the carrier id.
         let wait_outcome = step_futex_wait(uaddr, 42, &guard);
         let waiter_carrier = match wait_outcome {
@@ -607,8 +607,9 @@ mod tests {
     mod step_op_wraps {
         use super::super::{step_futex_wake, FutexWaitOp, FutexWakeOp, FUTEX_WAKE_MASK};
         use super::setup;
-        use tx_substrate::step_v3::{
-            Errno as V3Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, YieldShape,
+        use super::super::adapter::step_engine::{
+            guard, Errno as V3Errno, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
+            YieldShape,
         };
 
         #[test]
@@ -617,13 +618,13 @@ mod tests {
             // Word holds 0xdead_beef; matching val parks → Yield::OnWaitSource.
             let word: u32 = 0xdead_beef;
             let uaddr = &word as *const u32 as u64;
-            let guard = tx_substrate::epoch::guard();
+            let guard = guard();
             let mut op = FutexWaitOp {
                 uaddr,
                 val: 0xdead_beef,
                 guard: &guard,
             };
-            let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            let mut ctx = ScriptCtx::<ProcessIdentity>::new();
             let outcome = op.step(&mut ctx);
             match outcome {
                 StepOutcome::Yield {
@@ -641,13 +642,13 @@ mod tests {
         fn futex_wake_op_step_delegates_to_free_fn() {
             let _setup = setup();
             // Zero uaddr → EINVAL. Output type is u32, not ().
-            let guard = tx_substrate::epoch::guard();
+            let guard = guard();
             let mut op = FutexWakeOp {
                 uaddr: 0,
                 n: 1,
                 guard: &guard,
             };
-            let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            let mut ctx = ScriptCtx::<ProcessIdentity>::new();
             let outcome: StepOutcome<u32, NoProgress> = op.step(&mut ctx);
             assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
             // Sanity: parallel free-fn call matches.
