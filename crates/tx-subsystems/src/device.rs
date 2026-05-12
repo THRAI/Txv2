@@ -3,7 +3,7 @@
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::adapter::step_engine::{ByteProgress, NoProgress, StepOutcome, V3Errno};
+use crate::adapter::step_engine::{ByteProgress, NoProgress, StepOutcome};
 
 use crate::execution::{Errno, Guard};
 use crate::page_backed::Frame;

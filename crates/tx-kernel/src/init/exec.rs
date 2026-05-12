@@ -16,7 +16,7 @@
 // CoreInit<P>` block in this file augments the one in `init.rs`.
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, page_allocator, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and

@@ -5,7 +5,7 @@ use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::vfs::structure::FsObjectId;
 
 use crate::read_backend::{inode_no, Ext4FsInstance};
-use crate::adapter::step_engine::{self as step_engine, page_allocator, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, page_allocator, NoProgress, StepOutcome};
 
 use page_allocator::ZeroPolicy;
 

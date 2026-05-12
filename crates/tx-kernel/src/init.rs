@@ -12,7 +12,7 @@ use tx_subsystems::mount::{
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::tty::structure::TtyIdentity;
 use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNodeBacking};
-use crate::adapter::step_engine::{self as step_engine, init, init_on_ap, ByteProgress, Cap, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, init, init_on_ap, ByteProgress, Cap, SpinMutex, StepOutcome};
 use crate::adapter::boot_runtime;
 
 // Boot-smoke busy-wait budget for AP reactor task completion. 100k was
