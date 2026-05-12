@@ -1070,7 +1070,9 @@ mod step_op_wraps {
     use crate::thread_runtime::structure::reset_tid_counter_for_test;
     use crate::vm::{AddressSpace, TestPmap};
     use crate::zones;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome};
+    use crate::signal::adapter::step_engine::{
+        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
+    };
     use tx_substrate::testing::init_host_for_test_once;
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
@@ -1097,7 +1099,7 @@ mod step_op_wraps {
             target: proc_cap.clone(),
             sig: Signum::SIGTERM,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         assert_eq!(outcome, StepOutcome::Done(KillOutcome::Delivered));
     }
@@ -1111,7 +1113,7 @@ mod step_op_wraps {
             pgrp,
             sig: Signum::SIGINT,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         // bootstrap_init_process gives a single-member pgrp.
         assert_eq!(outcome, StepOutcome::Done(1usize));
@@ -1126,7 +1128,7 @@ mod step_op_wraps {
             sig: Signum::SIGTERM,
             disposition: SigDisposition::Ignore,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(SigDispositionChange::Replaced {
@@ -1145,7 +1147,7 @@ mod step_op_wraps {
             sig: Signum::SIGKILL,
             disposition: SigDisposition::Ignore,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         assert_eq!(
             outcome,

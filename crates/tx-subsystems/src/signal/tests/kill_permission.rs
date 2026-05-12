@@ -5,7 +5,7 @@ use crate::cred::{signal_permitted, Capability, CapabilitySet, Cred, Gid, Uid};
 use crate::execution::Errno;
 use crate::process::structure::{ProcessIdentity, TargetProcCred};
 use crate::signal::{script_kill_pgrp, script_kill_probe, script_kill_process, KillScriptOutcome};
-use tx_substrate::zone::Cap;
+use crate::signal::adapter::step_engine::Cap;
 
 fn set_cred(proc_cap: &Cap<ProcessIdentity>, cred: Cred) {
     // PR-9 phase 5 (D5 Path A): `cred` lives in `AtomicSlot<Cap<Cred>>`.
