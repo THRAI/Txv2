@@ -1,12 +1,13 @@
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use step_engine::Guard;
-use tx_substrate::page_allocator::{self, ZeroPolicy};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::vfs::structure::FsObjectId;
 
 use crate::read_backend::{inode_no, Ext4FsInstance};
-use crate::adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, page_allocator, ByteProgress, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+
+use page_allocator::ZeroPolicy;
 
 /// Allocate a frame from the page substrate, copy the disk-fetched page bytes
 /// into it, and return a permanent-pinned `Frame` referencing the resulting
