@@ -22,9 +22,10 @@ use tx_platform_adapter::platform_adapter;
     reason = "wrap futex step outcomes (einval, eagain, yield-until-wake, done(n)) as named verbs over the substrate step engine"
 )]
 pub mod step_engine {
+    pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step_v3::{
-        Errno, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
-        WaitSourceId, YieldShape,
+        Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
+        StepProgress, SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::ZoneError;
     pub use tx_substrate::SpinMutex;
