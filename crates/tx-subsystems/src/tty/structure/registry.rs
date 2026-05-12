@@ -5,8 +5,9 @@
 //! can succeed.
 
 use crate::tty::structure::identity::FixedName;
-use tx_substrate::zone::{register_zone_for, Cap, Zone, ZoneAllocated, ZoneError};
-use tx_substrate::SpinMutex;
+use tx_substrate::zone::register_zone_for;
+use crate::tty::adapter::step_engine::{Cap, Zone, ZoneAllocated, ZoneError};
+use crate::tty::adapter::step_engine::SpinMutex;
 
 use super::identity::TtyIdentity;
 use super::payload::TtyPayload;

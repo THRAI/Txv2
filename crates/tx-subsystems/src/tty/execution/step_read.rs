@@ -35,7 +35,7 @@ pub static STEP_READ_LAST_VMIN: core::sync::atomic::AtomicU32 =
 pub static STEP_READ_LAST_VTIME: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0xdead_beef);
 
-use tx_substrate::zone::Cap;
+use crate::tty::adapter::step_engine::{self as step_engine, Cap};
 
 use crate::execution::Guard;
 use crate::tty::checks::{
@@ -44,6 +44,7 @@ use crate::tty::checks::{
 use crate::tty::execution::TTY_READABLE;
 use crate::tty::structure::termios::{ICANON, VMIN, VTIME};
 use crate::tty::structure::TtyIdentity;
+use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
 
 /// Drain bytes from a live TTY input queue into `out`.
 ///
@@ -53,7 +54,7 @@ pub fn step_read(
     tty: &Cap<TtyIdentity>,
     out: &mut [u8],
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+) -> StepOutcome<usize, ByteProgress> {
     use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
 
     if out.is_empty() {
@@ -149,8 +150,8 @@ pub fn step_read_for_caller(
     out: &mut [u8],
     caller: super::IoctlCaller,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<usize, ByteProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     if out.is_empty() {
         return V3::Done(0);
@@ -169,8 +170,8 @@ pub fn step_read_for_process(
     out: &mut [u8],
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<usize, ByteProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let caller_info = match super::IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
@@ -209,15 +210,15 @@ pub struct ReadOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for ReadOp<'a>
 {
     type Output = usize;
-    type Progress = tx_substrate::step_v3::ByteProgress;
+    type Progress = ByteProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_read(self.tty, self.out, self.guard)
     }
 }
@@ -231,15 +232,15 @@ pub struct ReadForCallerOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for ReadForCallerOp<'a>
 {
     type Output = usize;
-    type Progress = tx_substrate::step_v3::ByteProgress;
+    type Progress = ByteProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_read_for_caller(self.tty, self.out, self.caller, self.guard)
     }
 }
@@ -253,15 +254,15 @@ pub struct ReadForProcessOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for ReadForProcessOp<'a>
 {
     type Output = usize;
-    type Progress = tx_substrate::step_v3::ByteProgress;
+    type Progress = ByteProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_read_for_process(self.tty, self.out, self.caller, self.guard)
     }
 }
@@ -283,18 +284,18 @@ mod step_op_wraps {
             &self,
             _out: &mut [u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(0)
+            StepOutcome::Done(0)
         }
 
         fn write(
             &self,
             bytes: &[u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+            StepOutcome::Done(bytes.len())
         }
     }
 
@@ -332,7 +333,7 @@ mod step_op_wraps {
     fn read_op_empty_out_returns_done_zero() {
         let _setup = setup();
         let tty = alloc_tty(200, "ttyV3-read-op-empty");
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut buf: [u8; 0] = [];
         let mut op = ReadOp {
             tty: &tty,
@@ -352,7 +353,7 @@ mod step_op_wraps {
     fn read_for_caller_op_empty_out_returns_done_zero() {
         let _setup = setup();
         let tty = alloc_tty(201, "ttyV3-read-caller-op-empty");
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut buf: [u8; 0] = [];
         let caller = super::super::IoctlCaller::new(1, 1);
         let mut op = ReadForCallerOp {
@@ -375,7 +376,7 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_tty(202, "ttyV3-read-op-dead");
         let _ = tty.take_payload();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut buf = [0u8; 4];
         let mut op = ReadOp {
             tty: &tty,
@@ -386,7 +387,7 @@ mod step_op_wraps {
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
-            V3::Err(tx_substrate::step_v3::Errno::EIO) => {}
+            V3::Err(step_engine::Errno::EIO) => {}
             other => panic!("expected Err(EIO), got {other:?}"),
         }
     }

@@ -1,0 +1,77 @@
+//! Substrate / reactor adapter for tty.
+//!
+//! Tty is the largest single-subsystem phase. ~14 production files
+//! across `tty/structure/`, `tty/execution/{register_hardware,
+//! step_*}.rs`, `tty/checks/`, and `tty/project.rs` share this one
+//! adapter. Two domains:
+//!
+//! * `step_engine` — substrate. Bundles step-v3 types used by the
+//!   ten tty `step_*` files, zone role types (Cap, Weak, PayloadCap,
+//!   Entity, Dead, ZoneAllocated, ZoneError, Zone), EBR Guard +
+//!   guard(), bus primitives (RawPort, RawQueue) used by
+//!   TtyIdentity's mailbox path, AtomicSlot + SpinMutex, plus the
+//!   `sign_zone_for` verb.
+//!
+//! * `wait_routing` — stacked substrate + reactor. Same shape as
+//!   pipe / process / vfs (TtyIdentity exposes wait sources for
+//!   readers / writers, plus step_ingest uses reactor::wait::Mask).
+
+use tx_platform_adapter::platform_adapter;
+
+#[platform_adapter(
+    platform = "substrate",
+    domain = "step_engine",
+    apis = ["step_v3", "zone", "epoch", "bus"],
+    reason = "expose substrate step engine (StepOp/StepOutcome and ten step_* file types), zone role types, EBR guard, and bus primitives (RawPort/RawQueue) used by TtyIdentity / TtyPayload across the tty subsystem"
+)]
+pub mod step_engine {
+    use tx_substrate::zone;
+
+    pub use tx_substrate::bus::{RawPort, RawQueue};
+    pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::step_v3::{
+        ByteProgress, Errno, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome,
+        SubjectIdentity, WaitSourceId,
+    };
+    pub use tx_substrate::zone::{
+        reserve_for, sign_for, Cap, Dead, Entity, OperationalCapExt, PayloadCap, Weak, Zone,
+        ZoneAllocated, ZoneError,
+    };
+    pub use tx_substrate::{AtomicSlot, SpinMutex};
+
+    pub fn sign_zone_for<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
+        let reservation = zone::reserve_for::<T>()?;
+        Ok(zone::sign_for(reservation, value))
+    }
+}
+
+#[platform_adapter(
+    platform = "substrate",
+    domain = "wait_routing",
+    apis = ["wake"],
+    reason = "wrap WaitSource registration for tty reader/writer wakeup paths"
+)]
+#[platform_adapter(
+    platform = "reactor",
+    domain = "wait_routing",
+    reason = "wrap reactor Channel/Mask as tty legacy wakeup primitives (D2 coexistence)"
+)]
+pub mod wait_routing {
+    use alloc::sync::Arc;
+    use tx_substrate::step_v3::{InterestMask, WaitSourceId};
+
+    pub use tx_reactor::wait::{Channel, Mask};
+    pub use tx_substrate::wake::WaitSource;
+
+    pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
+        Arc::new(WaitSource::new(WaitSourceId::new(source_id)))
+    }
+
+    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {
+        channel.fire(Mask::from_bits(mask_bits))
+    }
+
+    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
+        source.notify(InterestMask::new(mask_bits));
+    }
+}

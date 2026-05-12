@@ -1,6 +1,6 @@
 //! Live-payload check for TTY operations.
 
-use tx_substrate::zone::{OperationalCapExt, PayloadCap};
+use crate::tty::adapter::step_engine::{OperationalCapExt, PayloadCap};
 
 use crate::execution::{Errno, Guard};
 use crate::tty::structure::{TtyIdentity, TtyPayload};

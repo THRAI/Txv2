@@ -4,6 +4,18 @@
 
 ## Current Shape
 
+- 2026-05-12 D20 Phase 3 (tty family) adapter migration LANDED.
+  14 production files across tty/execution/{register_hardware,step_*},
+  tty/structure/, tty/checks/, tty/project.rs. Two adapter domains
+  (step_engine, wait_routing). **Boundary report:** substrate
+  outside-adapter 2257 → 1955 (cumulative −592, 23%), inside 40 →
+  48; reactor outside 64 → 62 (cumulative −10), inside 6 → 7;
+  adapters 15 → 18. 38:1 outside-removed:inside-added ratio (TTY
+  surface is overwhelmingly types — pure re-export substitution).
+  **Verified:** full tx-subsystems lib suite still 623 passing
+  single-threaded; lint arch ok. ADR:
+  `2026-05-12-d20-phase3-tty-adapter.md`.
+
 - 2026-05-12 D19 Phase 2 adapter migration LANDED. Two multi-file
   core subsystems migrated to `#[platform_adapter]`: `process/`
   and `vfs/`. Both use one `adapter.rs` consumed by multiple

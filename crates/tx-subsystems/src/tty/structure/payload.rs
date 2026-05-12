@@ -14,8 +14,8 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU64;
 
-use tx_substrate::zone::Cap;
-use tx_substrate::SpinMutex;
+use crate::tty::adapter::step_engine::{self as step_engine, Cap};
+use crate::tty::adapter::step_engine::SpinMutex;
 
 use crate::device::CharDeviceBinding;
 use crate::tty::ldisc::on_termios_changed;
@@ -24,7 +24,8 @@ use crate::tty::structure::ring::TtyRing;
 use crate::tty::structure::termios::Termios;
 
 use super::identity::TtyIdentity;
-use tx_substrate::AtomicSlot;
+use crate::tty::adapter::step_engine::AtomicSlot;
+use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
 
 // ---------------------------------------------------------------------------
 // Ring capacities

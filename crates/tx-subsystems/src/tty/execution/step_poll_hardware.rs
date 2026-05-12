@@ -7,12 +7,13 @@
 
 use alloc::vec;
 
-use tx_substrate::zone::Cap;
+use crate::tty::adapter::step_engine::{self as step_engine, Cap};
 
 use crate::execution::{Errno, Guard};
 use crate::tty::checks::require_live_tty;
 use crate::tty::execution::{step_ingest, IngestOutcome};
 use crate::tty::structure::{TtyIdentity, TtyTransport};
+use crate::tty::adapter::step_engine::{ByteProgress, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask, WaitSourceId};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HardwarePollOutcome {
@@ -34,7 +35,7 @@ pub fn step_poll_hardware_input(
     tty: &Cap<TtyIdentity>,
     max_bytes: usize,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<HardwarePollOutcome, tx_substrate::step_v3::NoProgress> {
+) -> StepOutcome<HardwarePollOutcome, NoProgress> {
     use tx_substrate::step_v3::{NoProgress, StepOutcome as V3, YieldShape};
 
     if max_bytes == 0 {
@@ -55,9 +56,9 @@ pub fn step_poll_hardware_input(
     let drive_ingest = |bytes: &[u8],
                         read: usize,
                         guard: &Guard<'_>|
-     -> tx_substrate::step_v3::StepOutcome<
+     -> StepOutcome<
         HardwarePollOutcome,
-        tx_substrate::step_v3::NoProgress,
+        NoProgress,
     > {
         match step_ingest(tty, bytes, guard) {
             V3::Done(ingest) => V3::Done(HardwarePollOutcome {
@@ -150,15 +151,15 @@ pub struct PollHardwareInputOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for PollHardwareInputOp<'a>
 {
     type Output = HardwarePollOutcome;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_poll_hardware_input(self.tty, self.max_bytes, self.guard)
     }
 }
@@ -180,18 +181,18 @@ mod step_op_wraps {
             &self,
             _out: &mut [u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(0)
+            StepOutcome::Done(0)
         }
 
         fn write(
             &self,
             bytes: &[u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+            StepOutcome::Done(bytes.len())
         }
     }
 
@@ -229,7 +230,7 @@ mod step_op_wraps {
     fn poll_hardware_input_op_zero_max_bytes_returns_done_default() {
         let _setup = setup();
         let tty = alloc_tty(300, "ttyV3-poll-op-zero");
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = PollHardwareInputOp {
             tty: &tty,
             max_bytes: 0,
@@ -251,7 +252,7 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_tty(301, "ttyV3-poll-op-dead");
         let _ = tty.take_payload();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = PollHardwareInputOp {
             tty: &tty,
             max_bytes: 8,
