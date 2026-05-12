@@ -20,7 +20,7 @@
 //!   [`docs/progress/decisions/2026-05-11-d6-timerwheel-layering.md`].
 //!
 //! `tx-reactor` re-exports these at its crate root for back-compat;
-//! existing `tx_reactor::TaskMailbox` paths continue to resolve.
+//! existing reactor `TaskMailbox` paths continue to resolve.
 
 pub mod mailbox;
 pub mod timer;
