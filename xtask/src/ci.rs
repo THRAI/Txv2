@@ -134,6 +134,13 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
         ),
         ci_run(
             root,
+            "architecture boundary ratchet",
+            "cargo",
+            &["xtask", "lint", "boundary"],
+            "txdoc:CI-GATE-BOUNDARY-RATCHET",
+        ),
+        ci_run(
+            root,
             "progress json",
             "cargo",
             &["xtask", "progress", "validate"],

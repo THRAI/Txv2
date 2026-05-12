@@ -30,16 +30,68 @@ const AUTHORED_HOST_PACKAGES: &[&str] = &[
 
 pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
-        return Err("lint command needs `arch`, `docs`, or `unused`".into());
+        return Err("lint command needs `arch`, `docs`, `unused`, or `boundary`".into());
     };
     match kind.as_str() {
         "arch" => lint_arch(root),
         "docs" => lint_docs(root),
         "unused" => lint_unused(root),
+        "boundary" => lint_boundary(root),
         other => Err(format!(
-            "unknown lint kind '{other}', expected arch, docs, or unused"
+            "unknown lint kind '{other}', expected arch, docs, unused, or boundary"
         )),
     }
+}
+
+/// Maximum allowed `tx_substrate::*` line references in code that is
+/// not annotated with `#[platform_adapter]`. Locked-in by Phase 7
+/// (D24-D48) at the 2026-05-13 measurement; any new direct-substrate
+/// call site introduced outside an adapter trips this gate. Lower the
+/// number when convergence work removes more residue; raising it
+/// requires an explicit decision note.
+const MAX_SUBSTRATE_OUTSIDE_ADAPTER: usize = 208;
+
+/// Maximum allowed `tx_reactor::*` line references outside adapters.
+/// Same Phase 7 ratchet semantics as the substrate ceiling.
+const MAX_REACTOR_OUTSIDE_ADAPTER: usize = 4;
+
+fn lint_boundary(root: &Path) -> Result<()> {
+    let (substrate, reactor) = crate::boundary_report::outside_adapter_totals(root)?;
+
+    let substrate_over = substrate > MAX_SUBSTRATE_OUTSIDE_ADAPTER;
+    let reactor_over = reactor > MAX_REACTOR_OUTSIDE_ADAPTER;
+
+    println!("Architecture Boundary Ratchet");
+    println!("=============================");
+    println!(
+        "substrate outside adapters: {substrate:>4} lines  (ceiling {ceiling})  {status}",
+        ceiling = MAX_SUBSTRATE_OUTSIDE_ADAPTER,
+        status = if substrate_over { "OVER" } else { "ok" }
+    );
+    println!(
+        "reactor   outside adapters: {reactor:>4} lines  (ceiling {ceiling})  {status}",
+        ceiling = MAX_REACTOR_OUTSIDE_ADAPTER,
+        status = if reactor_over { "OVER" } else { "ok" }
+    );
+
+    if substrate_over || reactor_over {
+        let mut detail = Vec::new();
+        if substrate_over {
+            detail.push(format!(
+                "substrate: {substrate} > {MAX_SUBSTRATE_OUTSIDE_ADAPTER}"
+            ));
+        }
+        if reactor_over {
+            detail.push(format!(
+                "reactor: {reactor} > {MAX_REACTOR_OUTSIDE_ADAPTER}"
+            ));
+        }
+        return Err(format!(
+            "boundary ratchet regression — {}. Run `cargo xtask boundary-report` to see the new outside-adapter call sites, then either route them through an existing `#[platform_adapter]` module or add a new one. Do not raise the ceiling constants without a decision note.",
+            detail.join("; "),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn lint_arch(root: &Path) -> Result<()> {

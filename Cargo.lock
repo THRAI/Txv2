@@ -359,6 +359,7 @@ name = "tx-drivers"
 version = "0.1.0"
 dependencies = [
  "tx-hal",
+ "tx-platform-adapter",
  "tx-substrate",
  "tx-subsystems",
  "virtio-drivers",

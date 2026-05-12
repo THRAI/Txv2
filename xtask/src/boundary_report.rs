@@ -65,6 +65,29 @@ pub(crate) fn boundary_report(root: &Path, args: Vec<String>) -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
 
+    let (stats_substrate, stats_reactor, adapters) = scan_workspace(root)?;
+
+    if json {
+        emit_json(&stats_substrate, &stats_reactor, &adapters);
+    } else {
+        emit_human(&stats_substrate, &stats_reactor, &adapters, top_n);
+    }
+    Ok(())
+}
+
+/// Outside-adapter line counts for the boundary ratchet.
+///
+/// Returns `(substrate_lines, reactor_lines)`. The ratchet in
+/// `lint::lint_boundary` compares these against constant ceilings so a
+/// regression turns into a CI failure.
+pub(crate) fn outside_adapter_totals(root: &Path) -> Result<(usize, usize)> {
+    let (s, r, _) = scan_workspace(root)?;
+    Ok((s.raw_lines_outside_adapter, r.raw_lines_outside_adapter))
+}
+
+fn scan_workspace(
+    root: &Path,
+) -> Result<(PlatformStats, PlatformStats, Vec<AdapterDecl>)> {
     let files = collect_files(root, &["rs"]).map_err(|err| err.to_string())?;
     let mut stats_substrate = PlatformStats::default();
     let mut stats_reactor = PlatformStats::default();
@@ -89,13 +112,7 @@ pub(crate) fn boundary_report(root: &Path, args: Vec<String>) -> Result<()> {
         accumulate(&PLATFORMS[0], &rel, &scan, &mut stats_substrate);
         accumulate(&PLATFORMS[1], &rel, &scan, &mut stats_reactor);
     }
-
-    if json {
-        emit_json(&stats_substrate, &stats_reactor, &adapters);
-    } else {
-        emit_human(&stats_substrate, &stats_reactor, &adapters, top_n);
-    }
-    Ok(())
+    Ok((stats_substrate, stats_reactor, adapters))
 }
 
 fn is_meta_crate(rel: &str) -> bool {
