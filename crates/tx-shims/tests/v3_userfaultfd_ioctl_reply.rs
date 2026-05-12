@@ -38,8 +38,8 @@ use tx_hal::{
     Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
 };
-use tx_reactor::userspace::SyscallRequest;
-use tx_substrate::zone::Cap;
+use tx_shims::adapter::reactor_entry::SyscallRequest;
+use tx_shims::adapter::step_engine::Cap;
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
@@ -283,7 +283,7 @@ fn open_ufd_register_one_page(ctx: &SyscallCtx<'_>, base: usize) -> u32 {
 /// runtime path the phase-4 fault_script takes, without requiring a
 /// fault interceptor here.
 fn push_fault(ctx: &SyscallCtx<'_>, fd: u32, fault_addr: u64) {
-    use tx_substrate::step_v3::{
+    use tx_shims::adapter::step_engine::{
         AgentCancelPolicy, DelegateRequest, TokenDropPolicy, UfdAccessKind, UfdRequest,
     };
     let open = ctx.process.fd(fd).expect("fd installed");
