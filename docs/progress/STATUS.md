@@ -4,6 +4,23 @@
 
 ## Current Shape
 
+- 2026-05-13 scripts: `drive<O: StepOp>` central driver LANDED (refactor #3/7,
+  branch cc/crazy-ardinghelli-91c48e). Added `crates/tx-scripts/src/drive.rs`
+  implementing the spec's algorithm from `docs/Txv3/03_STEP_MODEL_v2.md` §5.
+  Signature: `async fn drive<S: StepOp<I>, I: SubjectIdentity>(op, ctx, mode) ->
+  Result<S::Output, Errno>`. Handles four StepOutcome variants + DriveMode classify
+  matrix (Translate(Eagain)→EAGAIN, Translate(PartialReturn)→EAGAIN stub,
+  Translate(UnsupportedShape)→ENOSYS, Resolve→EAGAIN stub pending reactor wiring).
+  Exported via `pub mod drive; pub use drive::drive;` in lib.rs. Adapter extended
+  with 10 new pub-uses (AcceptOutcome, AgentCancelPolicy, Deadline, DelegateEndpoint,
+  DelegateRequest, DelegateToken, DriveMode, InterestMask, ProcessIdentity, Translation,
+  WaitSourceId, YieldShape, StepProgress). 8 integration tests in
+  `crates/tx-scripts/tests/drive.rs`, all passing. Boundary lint 0/0. No callers
+  migrated, no observation hooks. Next step: observation hooks PR (#4/7) which
+  hooks one place in drive() instead of every shim.
+  Spec: `docs/Txv3/03_STEP_MODEL_v2.md` §5 (NOTE: the task said §8.6 but the spec
+  file has no §8.6; the drive algorithm is in §5 of STEP_MODEL_v2.md).
+
 - 2026-05-13 hal: HartLocal<T> per-hart slot primitive LANDED (refactor #2/7,
   branch cc/crazy-ardinghelli-91c48e). Added `crates/tx-hal/src/hart_local.rs`
   with `HartLocal<T>` backed by `[Slot<T>; MAX_HARTS]` (MAX_HARTS=64, matching
