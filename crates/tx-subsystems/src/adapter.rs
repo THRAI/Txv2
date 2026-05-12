@@ -41,5 +41,5 @@ pub mod step_engine {
     reason = "wrap reactor Channel/Mask/WaitFuture used by wait_source.rs registry"
 )]
 pub mod wait_routing {
-    pub use tx_reactor::wait::{Channel, Mask, WaitFuture};
+    pub use tx_reactor::wait::{Channel, Mask, WaitFuture, WaitOutcome};
 }

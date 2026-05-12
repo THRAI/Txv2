@@ -158,7 +158,7 @@ fn prepare_loopback_connecting(
     assert!(matches!(
         step_connect(&client, inet(server_port), &guard),
         StepOutcome::Yield {
-            shape: YieldShape::OnCarrier { .. },
+            shape: YieldShape::OnWaitSource { .. },
             ..
         }
     ));

@@ -2,7 +2,7 @@ use tx_substrate::bus::{RawQueue, StaticRawQueue};
 
 use crate::execution::WaitToken;
 use crate::sync::SpinMutex;
-use crate::wait_carrier;
+use crate::wait_source;
 
 tx_substrate::bus::bus_readiness! {
     pub struct DelegateWireSet {
@@ -24,7 +24,7 @@ pub fn net_delegate_carrier_id() -> u64 {
         return id;
     }
 
-    let registered = wait_carrier::register_wait_queue(net_delegate_queue());
+    let registered = wait_source::register_wait_queue(net_delegate_queue());
     *id = Some(registered);
     registered
 }

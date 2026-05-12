@@ -30,7 +30,7 @@ fn socket_table_snapshot_tcp_bound_reports_bound_connecting_client() {
     assert!(matches!(
         step_connect(&client, inet(40_188), &guard),
         StepOutcome::Yield {
-            shape: YieldShape::OnCarrier { .. },
+            shape: YieldShape::OnWaitSource { .. },
             ..
         }
     ));

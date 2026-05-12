@@ -15,6 +15,7 @@ use tx_subsystems::net::{
     SockAddrIn, SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol,
     TcpState, UdpInner,
 };
+use tx_subsystems::wait_source;
 
 const SOCKADDR_IN_BYTES: u32 = 16;
 const ACCEPT4_KNOWN_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
@@ -1179,13 +1180,13 @@ fn step_unit_result(outcome: StepOutcome<(), NoProgress>) -> SyscallResult {
     }
 }
 
-fn wait_on_yield_shape(shape: YieldShape) -> Option<wait_carrier::RegisteredWaitFuture> {
+fn wait_on_yield_shape(shape: YieldShape) -> Option<wait_source::RegisteredWaitFuture> {
     match shape {
-        YieldShape::OnCarrier { carrier, interests } => {
-            let token = tx_subsystems::execution::WaitToken::new(carrier.raw(), interests.raw());
-            wait_carrier::wait_on_token(token)
+        YieldShape::OnWaitSource { source, interests } => {
+            let token = tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
+            wait_source::wait_on_token(token)
         }
-        YieldShape::OnAgent { .. } => None,
+        YieldShape::OnAgent { .. } | YieldShape::OnTimer { .. } => None,
     }
 }
 

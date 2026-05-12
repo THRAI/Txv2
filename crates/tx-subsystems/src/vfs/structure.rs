@@ -26,6 +26,7 @@ use crate::execution::Errno;
 use crate::io_uring::IoUring;
 use crate::ipc::posix_mq::structure::PosixMqInstance;
 use crate::mount::{MountIdentity, MountPayload};
+use crate::net::SocketIdentity;
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
 use crate::signalfd::SignalFd;
@@ -520,6 +521,10 @@ pub enum StructPayload {
     Pipe {
         payload: Cap<crate::pipe::PipePayload>,
         side: crate::pipe::PipeSide,
+    },
+    /// Socket-backed open file used by the network syscall facade.
+    Socket {
+        identity: Cap<SocketIdentity>,
     },
 }
 

@@ -688,6 +688,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
 /// `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     let closing_file = ctx.process.fd(fd);
+    if let Some(file) = closing_file.as_deref() {
+        maybe_close_socket_file(file);
+    }
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = CloseOp {
         process: ctx.process.clone(),

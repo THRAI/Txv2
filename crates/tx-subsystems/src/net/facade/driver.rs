@@ -45,12 +45,12 @@ pub async fn drive_socket_connect_waiting(
     }
 }
 
-fn wait_on_yield_shape(shape: YieldShape) -> Option<crate::wait_carrier::RegisteredWaitFuture> {
+fn wait_on_yield_shape(shape: YieldShape) -> Option<crate::wait_source::RegisteredWaitFuture> {
     match shape {
-        YieldShape::OnCarrier { carrier, interests } => {
-            let token = crate::execution::WaitToken::new(carrier.raw(), interests.raw());
-            crate::wait_carrier::wait_on_token(token)
+        YieldShape::OnWaitSource { source, interests } => {
+            let token = crate::execution::WaitToken::new(source.raw(), interests.raw());
+            crate::wait_source::wait_on_token(token)
         }
-        YieldShape::OnAgent { .. } => None,
+        YieldShape::OnAgent { .. } | YieldShape::OnTimer { .. } => None,
     }
 }

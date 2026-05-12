@@ -82,14 +82,14 @@ pub const SOMAXCONN_STAGING: usize = 128;
 pub type ByteStepOutcome<T> = V3StepOutcome<T, ByteProgress>;
 
 pub(crate) fn yield_on_token<T>(token: WaitToken) -> crate::execution::StepOutcome<T> {
-    V3StepOutcome::yield_on_carrier(NoProgress, token.carrier(), token.interest())
+    V3StepOutcome::yield_on_wait_source(NoProgress, token.source_id(), token.interest())
 }
 
 pub(crate) fn yield_bytes_on_token<T>(
     progress: ByteProgress,
     token: WaitToken,
 ) -> ByteStepOutcome<T> {
-    V3StepOutcome::yield_on_carrier(progress, token.carrier(), token.interest())
+    V3StepOutcome::yield_on_wait_source(progress, token.source_id(), token.interest())
 }
 
 pub fn socket_recv_wait_token(socket: &SocketIdentity) -> WaitToken {

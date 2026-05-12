@@ -85,7 +85,7 @@ impl NetDeviceOps for MockNetDevice {
 
     fn transmit(&self, frame: &[u8], _guard: &Guard<'_>) -> crate::execution::StepOutcome<()> {
         if !self.tx_ready.load(Ordering::Acquire) {
-            return StepOutcome::yield_on_carrier(NoProgress, 0, 0);
+            return StepOutcome::yield_on_wait_source(NoProgress, 0, 0);
         }
         if self.fail_tx.load(Ordering::Acquire) {
             return StepOutcome::Err(Errno::EIO);
