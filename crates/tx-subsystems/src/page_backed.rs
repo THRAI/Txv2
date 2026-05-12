@@ -560,7 +560,7 @@ impl PageContainer {
             .checked_mul(crate::vm::USER_PAGE_SIZE as u64)
     }
 
-    fn set_size_bytes(&self, size: u64) {
+    pub fn set_size_bytes(&self, size: u64) {
         self.size_bytes.store(size, Ordering::Release);
     }
 
