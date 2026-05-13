@@ -7,8 +7,9 @@ use alloc::sync::Arc;
 use tx_ext4_format::pager::{BlockImage, Ext4Pager, InodeMetaLite, InodeNo};
 use tx_ext4_format::Ext4FormatError;
 use tx_substrate::SpinMutex;
+use tx_substrate::zone::{Cap, PayloadCap};
 use tx_subsystems::execution::Errno;
-use tx_subsystems::mount::MountPayloadPin;
+use tx_subsystems::mount::{MountPayload, MountPayloadPin};
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
@@ -30,6 +31,15 @@ impl<I: BlockImage> Ext4FsInstance<I> {
 
     pub(crate) fn register_mount_pin(&self, pin: MountPayloadPin) {
         *self.mount_pin.lock() = Some(pin);
+    }
+
+    pub(crate) fn bind_mount_payload(&self, payload: &Cap<MountPayload>) {
+        let payload = PayloadCap::from_cap(payload.clone());
+        *self.mount_pin.lock() = Some(MountPayloadPin::acquire(&payload));
+    }
+
+    pub(crate) fn mount_payload_pin(&self) -> Option<MountPayloadPin> {
+        self.mount_pin.lock().clone()
     }
 
     pub(crate) fn with_pager<T>(
