@@ -19,7 +19,7 @@ impl<P: TxPlatform> KernelBlockDevices<P> {
     pub fn init_and_register(&'static self) -> StepOutcome<(), NoProgress> {
         match P::ARCH {
             Arch::LoongArch64 => self.init_la64_qemu_virt(),
-            _ => StepOutcome::Done(()),
+            Arch::Riscv64 => StepOutcome::Done(()),
         }
     }
 
@@ -28,7 +28,12 @@ impl<P: TxPlatform> KernelBlockDevices<P> {
             "pcie-ecam",
             "pcie-mmio32",
         )));
-        if block.init().is_err() {
+        if let Err(error) = block.init() {
+            tx_hal::console_write_str::<P>("txkernel:");
+            tx_hal::console_write_str::<P>(P::BOARD);
+            tx_hal::console_write_str::<P>(":devices:block:virtio-pci:skip:");
+            tx_hal::console_write_str::<P>(error.as_str());
+            tx_hal::console_write_str::<P>("\n");
             return StepOutcome::Done(());
         }
 

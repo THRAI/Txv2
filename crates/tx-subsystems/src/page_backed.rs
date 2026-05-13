@@ -142,6 +142,7 @@ pub enum PageCacheError {
     MismatchedFrame { current: Ppn },
     OutOfBounds,
     UnsupportedKind,
+    Backend(Errno),
     Alloc(AllocError),
 }
 
@@ -312,6 +313,28 @@ impl PageContainer {
         Ok(zone::sign_for(reservation, Self::new(kind, page_count)))
     }
 
+    pub fn new_file_cap(
+        mount: MountPayloadPin,
+        fs_object_id: FsObjectId,
+        size_bytes: u64,
+    ) -> Result<Cap<PageContainer>, ZoneError> {
+        let page_size = crate::vm::USER_PAGE_SIZE as u64;
+        let page_count = if size_bytes == 0 {
+            0
+        } else {
+            1 + (size_bytes - 1) / page_size
+        };
+        let container = Self::new_cap(
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            },
+            page_count,
+        )?;
+        container.set_size_bytes(size_bytes);
+        Ok(container)
+    }
+
     pub const fn kind(&self) -> &PageContainerKind {
         &self.kind
     }
@@ -399,6 +422,25 @@ impl PageContainer {
                 base_ppn,
                 page_count,
             } => self.materialize_device_page(page, *base_ppn, *page_count),
+        }
+    }
+
+    pub fn materialize_page_now(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+        guard: &Guard<'_>,
+    ) -> Result<MaterializedPage, PageCacheError> {
+        use tx_substrate::step_v3::{StepOutcome as V3, YieldShape};
+        match self.materialize_page(page, access, guard) {
+            V3::Done(page) => Ok(page),
+            V3::Err(errno) => Err(PageCacheError::Backend(errno.into())),
+            V3::Continue { .. } => Err(PageCacheError::Backend(Errno::EAGAIN)),
+            V3::Yield {
+                shape: YieldShape::OnWaitSource { .. },
+                ..
+            } => Err(PageCacheError::Backend(Errno::EAGAIN)),
+            V3::Yield { .. } => Err(PageCacheError::Backend(Errno::EIO)),
         }
     }
 
@@ -828,6 +870,7 @@ const fn page_cache_error_to_errno(error: PageCacheError) -> Errno {
         | PageCacheError::MissingPage
         | PageCacheError::MismatchedFrame { .. } => Errno::ESTALE,
         PageCacheError::OutOfBounds | PageCacheError::UnsupportedKind => Errno::EINVAL,
+        PageCacheError::Backend(errno) => errno,
         PageCacheError::Alloc(_) => Errno::ENOMEM,
     }
 }

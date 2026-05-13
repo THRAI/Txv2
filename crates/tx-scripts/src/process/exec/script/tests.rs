@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use tx_hal::{
-    Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
+    Arch, Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
 use tx_substrate::page_allocator;
@@ -548,6 +548,12 @@ fn exec_script_loads_minimal_elf_seeds_saved_user_context() {
     // Other GPRs (besides x2) are zero per System V `_start` contract.
     assert_eq!(ctx.regs[0], 0);
     assert_eq!(ctx.regs[1], 0);
+}
+
+#[test]
+fn initial_user_context_uses_arch_specific_stack_register() {
+    assert_eq!(super::initial_user_sp_reg_for_arch(Arch::Riscv64), 2);
+    assert_eq!(super::initial_user_sp_reg_for_arch(Arch::LoongArch64), 3);
 }
 
 #[test]

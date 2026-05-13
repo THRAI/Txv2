@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::image::{busybox_initramfs_name, busybox_root_ext4_name};
 use crate::target::{Profile, TxTarget};
 use crate::util::{option_value, optional_option_value, shell_join, tail_lines};
 use crate::Result;
@@ -160,7 +161,7 @@ fn qemu_command(
         let initramfs = root
             .join("target")
             .join("images")
-            .join("busybox-initramfs.cpio");
+            .join(busybox_initramfs_name(target));
         args.push("-initrd".into());
         args.push(initramfs.display().to_string());
         args.push("-append".into());
@@ -185,7 +186,7 @@ fn qemu_command(
                 args.push("virtio-blk-device,drive=m1sd,bus=virtio-mmio-bus.0".into());
             }
             TxTarget::La64Qemu => {
-                args.push("virtio-blk-pci,drive=txblk0".into());
+                args.push("virtio-blk-pci-non-transitional,drive=txblk0,rombar=0".into());
             }
             TxTarget::Rv64Qemu => {
                 args.push("virtio-blk-device,drive=txblk0".into());
@@ -194,8 +195,16 @@ fn qemu_command(
         args.push("-drive".into());
         if target == TxTarget::Rv64M1DockMock {
             args.push("file=target/images/m1dock-sd.img,format=raw,if=none,id=m1sd".into());
+        } else if target == TxTarget::La64Qemu {
+            args.push(format!(
+                "driver=raw,file.driver=file,file.filename=target/images/{},file.locking=off,if=none,id=txblk0,read-only=on",
+                busybox_root_ext4_name(target)
+            ));
         } else {
-            args.push("file=target/images/busybox-root.ext4,format=raw,if=none,id=txblk0".into());
+            args.push(format!(
+                "file=target/images/{},format=raw,if=none,id=txblk0",
+                busybox_root_ext4_name(target)
+            ));
         }
     }
     args.push("-d".into());
@@ -627,9 +636,10 @@ mod tests {
         .unwrap();
         let rendered = command.join(" ");
 
-        assert!(rendered.contains("-device virtio-blk-pci,drive=txblk0"));
+        assert!(rendered.contains("-device virtio-blk-pci-non-transitional,drive=txblk0,rombar=0"));
         assert!(!rendered.contains("virtio-blk-device,drive=txblk0"));
-        assert!(rendered
-            .contains("-drive file=target/images/busybox-root.ext4,format=raw,if=none,id=txblk0"));
+        assert!(rendered.contains(
+            "-drive driver=raw,file.driver=file,file.filename=target/images/busybox-root-la64-qemu.ext4,file.locking=off,if=none,id=txblk0,read-only=on"
+        ));
     }
 }

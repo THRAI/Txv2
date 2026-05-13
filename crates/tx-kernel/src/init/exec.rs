@@ -255,6 +255,15 @@ impl<P: TxPlatform> CoreInit<P> {
             let outcome = fs_ops.create_inode(root_object_id, b"init", 0o100755, &cred, &guard);
             match outcome {
                 V3::Done(out) => out,
+                V3::Err(tx_substrate::step_v3::Errno::EROFS)
+                | V3::Err(tx_substrate::step_v3::Errno::ENOSYS)
+                | V3::Err(tx_substrate::step_v3::Errno::EEXIST) => {
+                    // Rootfs is read-only (e.g. ext4 mounted from vda).
+                    // The fixture is not needed; the real binary lives on disk.
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":init:fixture:skip:ro\n");
+                    return;
+                }
                 other => panic!("register_init_fixture_into_tmpfs: create_inode(/init): {other:?}"),
             }
         };
@@ -354,6 +363,10 @@ impl<P: TxPlatform> CoreInit<P> {
         //   `tx.profile=busybox` (no init=) -> /bin/sh argv=[sh]
         //   default -> bake-in /init fixture, argv=[init]
         let (init_path, argv0) = parse_init_from_cmdline::<P>();
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":bootstrap-exec:path:");
+        tx_hal::console_write_bytes::<P>(init_path);
+        tx_hal::console_write_str::<P>("\n");
 
         // `exec_script` opens its own fresh epoch guards inside V1
         // (`build_aspace_from_image`) and V2
@@ -367,7 +380,20 @@ impl<P: TxPlatform> CoreInit<P> {
         match outcome {
             Ok(()) => {
                 Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
+                tx_hal::console_write_str::<P>(":bootstrap-exec:ok:entry=0x");
+                Self::write_hex_usize(
+                    tx_scripts::process::exec::script::LAST_EXEC_ENTRY
+                        .load(core::sync::atomic::Ordering::Relaxed) as usize,
+                );
+                if let Some(payload) = thread.payload_cap() {
+                    if let Some(ctx) = payload.saved_user_context() {
+                        tx_hal::console_write_str::<P>(":saved-pc=0x");
+                        Self::write_hex_usize(ctx.pc);
+                        tx_hal::console_write_str::<P>(":saved-sp=0x");
+                        Self::write_hex_usize(ctx.regs[3]);
+                    }
+                }
+                tx_hal::console_write_str::<P>("\n");
                 return;
             }
             Err(ref e) if init_path != b"/init" => {
@@ -409,6 +435,12 @@ impl<P: TxPlatform> CoreInit<P> {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":bootstrap-exec:fail:");
                 tx_hal::console_write_str::<P>(exec_error_tag(&e));
+                if matches!(e, tx_scripts::process::exec::ExecError::NotExecutable) {
+                    tx_hal::console_write_str::<P>(":site=");
+                    tx_hal::console_write_str::<P>(
+                        tx_scripts::process::exec::script::last_notexec_site_label(),
+                    );
+                }
                 tx_hal::console_write_str::<P>("\n");
                 panic!("bootstrap exec for /init failed: {e:?}");
             }
@@ -480,15 +512,28 @@ impl<P: TxPlatform> CoreInit<P> {
     ///
     /// Cheap when no bytes are pending (`read_bytes` returns 0,
     /// the rest is skipped).
-    pub(super) fn drain_sbi_console_into_tty() {
+    pub(crate) fn drain_pending_uart_rx_into_tty() -> usize {
+        let mut buf = [0u8; 64];
+        let n = crate::irq::drain_pending_uart_rx_into(&mut buf);
+        if n == 0 {
+            return 0;
+        }
+        let Some(tty) = console_tty() else { return 0 };
+        let guard = tx_substrate::epoch::guard();
+        let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
+        n
+    }
+
+    pub(crate) fn drain_sbi_console_into_tty() -> usize {
         let mut buf = [0u8; 64];
         let n = <P as tx_hal::ConsoleIf>::read_bytes(&mut buf);
         if n == 0 {
-            return;
+            return 0;
         }
-        let Some(tty) = console_tty() else { return };
+        let Some(tty) = console_tty() else { return 0 };
         let guard = tx_substrate::epoch::guard();
         let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
+        n
     }
 
     pub(super) fn run_userspace_reactor_loop() {
@@ -513,20 +558,27 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         };
 
-        let task_payload = payload.clone();
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let wrapper_payload = payload.clone();
+        let future_payload = payload.clone();
         let submit_thread = thread.clone();
         let submitted = BOOT_REACTOR.with(|reactor| {
-            reactor.submit_task(crate::thread_future::PerHartSlotted::<P, _>::new(
-                task_payload.clone(),
-                crate::thread_future::run_thread::<P>(submit_thread, task_payload),
-            ));
+            reactor.submit_task_with_meta(
+                crate::thread_future::PerHartSlotted::<P, _>::new(
+                    wrapper_payload,
+                    crate::thread_future::run_thread::<P>(submit_thread, future_payload),
+                ),
+                tx_reactor::InitialSchedMeta::kernel()
+                    .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
+            );
         });
         if submitted.is_none() {
             // Boot reactor not initialised; nothing to drive.
             return;
         }
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":userspace:submitted\n");
 
-        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
         P::enable_timer_wakeups();
 
         // Drive the BSP reactor loop until init zombifies. Each
@@ -538,6 +590,15 @@ impl<P: TxPlatform> CoreInit<P> {
         loop {
             if init.is_zombie() {
                 break;
+            }
+
+            // UART IRQ handlers cannot touch TTY state directly
+            // because epoch guards are forbidden in IRQ context.
+            // They queue bytes in an IRQ-safe buffer and request a
+            // reactor wake; consume that buffer here in normal
+            // context before deciding whether there is runnable work.
+            if Self::drain_pending_uart_rx_into_tty() != 0 {
+                continue;
             }
 
             // Drain any pending child-thread submits posted from
@@ -553,54 +614,18 @@ impl<P: TxPlatform> CoreInit<P> {
                 None => break,
             };
 
-            // DIAGNOSTIC: dump counters every Nth loop iteration so we
-            // see flow even when busybox spins on a userspace-side
-            // loop or fast-yielding syscall chain.
-            {
-                use core::sync::atomic::{AtomicUsize, Ordering};
-                static ITER_SINCE_DUMP: AtomicUsize = AtomicUsize::new(0);
-                const DUMP_ITER_PERIOD: usize = 500;
-                if ITER_SINCE_DUMP.fetch_add(1, Ordering::Relaxed) + 1 >= DUMP_ITER_PERIOD {
-                    ITER_SINCE_DUMP.store(0, Ordering::Relaxed);
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":iter_tick:read=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS.load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":ppoll=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS.load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":clone=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_CLONE_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":execve=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_EXECVE_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":wait4=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_WAIT4_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":clone_flags=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_CLONE_LAST_FLAGS.load(Ordering::Relaxed)
-                            as usize,
-                    );
-                    tx_hal::console_write_str::<P>(":clone_reject=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_CLONE_LAST_REJECT_FLAGS
-                            .load(Ordering::Relaxed) as usize,
-                    );
-                    tx_hal::console_write_str::<P>("\n");
-                }
-            }
-
             if step.should_idle() && !init.is_zombie() {
+                if Self::drain_sbi_console_into_tty() != 0 {
+                    continue;
+                }
+                const CONSOLE_POLL_NS: u64 = 5_000_000;
+                let poll_deadline = P::read_ns().saturating_add(CONSOLE_POLL_NS);
+                if step
+                    .next_deadline_ns
+                    .is_none_or(|deadline| deadline > poll_deadline)
+                {
+                    P::set_deadline_ns(poll_deadline);
+                }
                 P::wait_for_interrupt_once();
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
@@ -617,47 +642,6 @@ impl<P: TxPlatform> CoreInit<P> {
                 // becomes redundant, but it's harmless when
                 // there are no buffered bytes).
                 Self::drain_sbi_console_into_tty();
-                // DIAGNOSTIC (temp, 2026-05-12): periodically dump
-                // the syscall counters so we can see what shape
-                // userspace is in even when no userspace exit
-                // sentinel fires (busybox hanging on an unimplemented
-                // syscall, for example).
-                use core::sync::atomic::{AtomicUsize, Ordering};
-                static IDLE_WAKES_SINCE_DUMP: AtomicUsize = AtomicUsize::new(0);
-                const DUMP_PERIOD: usize = 50;
-                if IDLE_WAKES_SINCE_DUMP.fetch_add(1, Ordering::Relaxed) + 1 >= DUMP_PERIOD {
-                    IDLE_WAKES_SINCE_DUMP.store(0, Ordering::Relaxed);
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":syscall_tick:read=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS.load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":ppoll=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS.load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":ioctl=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::fs_basic::SYS_IOCTL_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":clone=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_CLONE_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":execve=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_EXECVE_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":wait4=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_WAIT4_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>("\n");
-                }
             }
         }
 
@@ -669,163 +653,6 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:exited:");
         Self::write_signed_decimal(status_word);
-        tx_hal::console_write_str::<P>("\n");
-
-        // DIAGNOSTIC (temp, 2026-05-12): dump sys_read counters so we
-        // can see what shape the post-prompt EOF takes.
-        use core::sync::atomic::Ordering;
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":sys_read:invocations=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":done_zero=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_READ_DONE_ZERO.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":done_nonzero=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_READ_DONE_NONZERO.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":yields=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_READ_YIELDS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":wait_none=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_READ_WAIT_NONE.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":err=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_READ_ERR.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":last_errno=");
-        Self::write_signed_decimal(
-            tx_shims::linux_syscall::io::SYS_READ_LAST_ERRNO.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>("\n");
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":step_read:eof_pending=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_EOF_PENDING.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":vmin_none=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_VMIN_NONE.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":vmin_zero=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_VMIN_ZERO_EMPTY.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":vmin_nonzero=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_VMIN_NONZERO.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":threshold_unmet=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_THRESHOLD_UNMET.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":drained=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_DRAINED.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":yield_noncanon_empty=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_YIELD_NONCANON_EMPTY.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":fgpgrp_err=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_FGPGRP_ERR.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":lflag=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_LAST_LFLAG.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":vmin=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_LAST_VMIN.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":vtime=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_LAST_VTIME.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>("\n");
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":sys_ioctl:invocations=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_INVOCATIONS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":last_request=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_LAST_REQUEST.load(Ordering::Relaxed)
-                as usize,
-        );
-        tx_hal::console_write_str::<P>(":tcsets_calls=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_TCSETS_CALLS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":tcgets_calls=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_TCGETS_CALLS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":first_tcgets_lflag=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::FIRST_TCGETS_LFLAG.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":first_tcgets_vmin=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::FIRST_TCGETS_VMIN.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":last_tcsets_lflag=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::LAST_TCSETS_LFLAG.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":last_tcsets_vmin=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::LAST_TCSETS_VMIN.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":last_tcsets_vtime=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::LAST_TCSETS_VTIME.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":first_tcsets_lflag=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::FIRST_TCSETS_LFLAG.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":first_tcsets_vmin=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::FIRST_TCSETS_VMIN.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":ppoll_invocations=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":ppoll_last_nfds=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_PPOLL_LAST_NFDS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":ppoll_last_timeout_ptr=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_PPOLL_LAST_TIMEOUT_PTR.load(Ordering::Relaxed)
-                as usize,
-        );
-        tx_hal::console_write_str::<P>("\n");
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":sys_proc:execve=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::proc::SYS_EXECVE_INVOCATIONS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":clone=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::proc::SYS_CLONE_INVOCATIONS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":wait4=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::proc::SYS_WAIT4_INVOCATIONS.load(Ordering::Relaxed),
-        );
         tx_hal::console_write_str::<P>("\n");
     }
 
@@ -857,6 +684,22 @@ impl<P: TxPlatform> CoreInit<P> {
         }
         let s = core::str::from_utf8(&buf[idx..])
             .expect("write_signed_decimal: ASCII digits are always UTF-8");
+        tx_hal::console_write_str::<P>(s);
+    }
+
+    pub(super) fn write_hex_usize(value: usize) {
+        let mut buf = [0u8; core::mem::size_of::<usize>() * 2];
+        let mut n = value;
+        for idx in (0..buf.len()).rev() {
+            let digit = (n & 0xf) as u8;
+            buf[idx] = if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + (digit - 10)
+            };
+            n >>= 4;
+        }
+        let s = core::str::from_utf8(&buf).expect("hex digits are always UTF-8");
         tx_hal::console_write_str::<P>(s);
     }
 

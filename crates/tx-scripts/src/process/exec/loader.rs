@@ -27,9 +27,21 @@ use alloc::vec::Vec;
 
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::header::header64;
+#[allow(unused_imports)]
+use goblin::elf::header::EM_RISCV;
 use goblin::elf::header::{
-    Header, EI_CLASS, EI_DATA, EI_VERSION, ELFCLASS64, ELFDATA2LSB, EM_RISCV, ET_EXEC, EV_CURRENT,
+    Header, EI_CLASS, EI_DATA, EI_VERSION, ELFCLASS64, ELFDATA2LSB, ET_EXEC, EV_CURRENT,
 };
+
+/// LoongArch64 machine type (goblin 0.10.x does not export this constant).
+#[allow(dead_code)]
+const EM_LOONGARCH: u16 = 0x102;
+
+/// Expected `e_machine` for this kernel build.
+#[cfg(target_arch = "loongarch64")]
+const EXPECTED_E_MACHINE: u16 = EM_LOONGARCH;
+#[cfg(not(target_arch = "loongarch64"))]
+const EXPECTED_E_MACHINE: u16 = EM_RISCV;
 use goblin::elf::program_header::{
     ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_PHDR,
 };
@@ -168,7 +180,7 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
     {
         return Err(ParseError::Magic);
     }
-    if header.e_machine != EM_RISCV {
+    if header.e_machine != EXPECTED_E_MACHINE {
         return Err(ParseError::Arch);
     }
     if header.e_type != ET_EXEC {
@@ -380,12 +392,11 @@ fn compute_bss_extension(load_segments: &[LoadSegment]) -> Result<Option<BssTail
                 .checked_add(seg.filesz)
                 .ok_or(ParseError::LoadSegment)?;
             let tail_size = seg.memsz - seg.filesz;
-            if found.is_some() {
-                // TODO(multi-bss): handle multiple BSS-extending
-                // LOADs. The slice's design only needs one (the
-                // last writable LOAD for static binaries).
-                return Err(ParseError::LoadSegment);
-            }
+            // Multiple BSS-extending LOADs are legal (e.g. LA64
+            // busybox has two: .relro_padding and .data/.bss).
+            // `vm/scripts.rs` ignores `bss_extension` for actual
+            // mapping (handled per-segment by `register_load_segment`);
+            // keep the last one for auxv / debug consumers.
             found = Some(BssTail {
                 vaddr: tail_vaddr,
                 size: tail_size,

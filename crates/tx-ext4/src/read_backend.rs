@@ -1,12 +1,17 @@
 use core::cell::UnsafeCell;
 use core::convert::TryFrom;
-use core::ops::{Deref, DerefMut};
+use core::marker::{Send, Sync};
+use core::ops::{Deref, DerefMut, Drop, FnOnce};
+use core::result::Result;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 use tx_ext4_format::pager::{BlockImage, Ext4Pager, InodeMetaLite, InodeNo};
 use tx_ext4_format::Ext4FormatError;
+use tx_substrate::zone::{Cap, PayloadCap};
+use tx_substrate::SpinMutex;
 use tx_subsystems::execution::Errno;
+use tx_subsystems::mount::{MountPayload, MountPayloadPin};
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
@@ -15,12 +20,14 @@ pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
 
 pub(crate) struct Ext4FsInstance<I> {
     pager: Ext4PagerCell<I>,
+    mount_payload: SpinMutex<Option<MountPayloadPin>>,
 }
 
 impl<I: BlockImage> Ext4FsInstance<I> {
     pub(crate) fn open(image: I) -> Result<Arc<Self>, Errno> {
         Ok(Arc::new(Self {
             pager: Ext4PagerCell::new(Ext4Pager::open(image).map_err(map_format_error)?),
+            mount_payload: SpinMutex::new(None),
         }))
     }
 
@@ -30,6 +37,15 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     ) -> Result<T, Errno> {
         let mut pager = self.pager.lock();
         f(&mut pager).map_err(map_format_error)
+    }
+
+    pub(crate) fn bind_mount_payload(&self, payload: &Cap<MountPayload>) {
+        let payload = PayloadCap::from_cap(payload.clone());
+        *self.mount_payload.lock() = Some(MountPayloadPin::acquire(&payload));
+    }
+
+    pub(crate) fn mount_payload_pin(&self) -> Option<MountPayloadPin> {
+        self.mount_payload.lock().clone()
     }
 }
 

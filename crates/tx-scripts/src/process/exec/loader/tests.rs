@@ -487,9 +487,11 @@ fn parse_image_plan_rejects_filesz_gt_memsz() {
 }
 
 #[test]
-fn parse_image_plan_rejects_multi_bss() {
-    // Two writable LOADs each with `memsz > filesz` → unsupported
-    // for the slice (TODO: handle multi-BSS later).
+fn parse_image_plan_accepts_multi_bss_and_records_last_tail() {
+    // Two writable LOADs each with `memsz > filesz` is legal ELF:
+    // LA64 busybox uses this shape for .relro padding plus .data/.bss.
+    // The VM mapping path handles BSS per LOAD segment; the summary
+    // bss_extension keeps the last tail for auxv/debug consumers.
     let mut cfg = FixtureCfg::minimal();
     // Make the existing LOAD writable with a BSS tail.
     cfg.phdrs[0] = PhdrSpec::load(
@@ -507,8 +509,11 @@ fn parse_image_plan_rejects_multi_bss() {
         PF_R_BIT | PF_W_BIT,
     ));
     let bytes = cfg.build();
-    assert_eq!(
-        parse_image_plan(&bytes).unwrap_err(),
-        ParseError::LoadSegment
-    );
+    let plan = parse_image_plan(&bytes).expect("multi-BSS LOADs should parse");
+    assert_eq!(plan.load_segments.len(), 2);
+    let bss = plan
+        .bss_extension
+        .expect("last BSS-extending LOAD should be recorded");
+    assert_eq!(bss.vaddr, 0x20000 + 0x100);
+    assert_eq!(bss.size, 0x800 - 0x100);
 }

@@ -383,12 +383,13 @@ pub fn step_fork<P: PmapIf>(
 ///
 /// Linux fork/clone ABI: the child returns from the clone syscall
 /// with the parent's GPRs *except* `a0 = 0`, and resumes at the
-/// instruction *after* the trapping `ecall`. RV64-specific:
+/// instruction *after* the trapping syscall instruction:
 ///
-/// - `a0` lives in `regs[10]` (RV64 ABI),
-/// - `ecall` is exactly 4 bytes (RV32I/RV64I base ISA — there is no
-///   `c.ecall` compressed form), so the child's resume address is
-///   `parent_user_ctx.pc + 4`.
+/// - `a0` lives in an architecture-specific GPR slot (`regs[10]` on
+///   RV64, `regs[4]` on LoongArch64).
+/// - the syscall instruction is exactly 4 bytes on the supported
+///   ports, and `hand_off_syscall` has already advanced the saved pc
+///   by that width before this helper runs.
 ///
 /// The parent thread is intentionally **not** modified here: the
 /// syscall arm encodes the child's pid into the parent's
@@ -399,7 +400,7 @@ pub fn step_fork<P: PmapIf>(
 /// Behaviour:
 ///
 /// 1. Clone `parent_user_ctx` into a fresh `UserTrapContext`.
-/// 2. Overwrite `regs[10] = 0` (RV64 a0).
+/// 2. Overwrite the child-return register (`a0`) with 0.
 /// 3. Overwrite `pc = parent_user_ctx.pc + 4` (skip past `ecall`).
 /// 4. `store_saved_user_context(Some(child_ctx))` on the child
 ///    thread's payload.
@@ -412,7 +413,7 @@ pub fn step_fork<P: PmapIf>(
 /// `:bootstrap-exec:fail`).
 ///
 /// Sibling helper, not a method on [`ProcessIdentity`]: keeps the
-/// RV64-ABI knowledge (the `+ 4` skip and the `regs[10]` index)
+/// ABI knowledge (the syscall skip and the `a0` register index)
 /// local to a single grep target so a future ARM64 / x86_64 port
 /// has one place to extract per-arch constants.
 ///
@@ -424,14 +425,19 @@ pub fn step_fork<P: PmapIf>(
 ///   (`docs/design/02_execution/THREAD_RUNTIME_v1.md`) — the
 ///   child's `saved_user_context` lives on the child's leader
 ///   thread payload.
+#[cfg(target_arch = "loongarch64")]
+const CLONE_CHILD_RETURN_REG_INDEX: usize = 4;
+#[cfg(not(target_arch = "loongarch64"))]
+const CLONE_CHILD_RETURN_REG_INDEX: usize = 10;
+
 pub fn seed_child_leader_context(
     child_thread: &Cap<ThreadIdentity>,
     parent_user_ctx: &UserTrapContext,
 ) {
     // (1) Clone the parent context.
     let mut child_ctx = *parent_user_ctx;
-    // (2) RV64 a0 = 0: child's clone-syscall return value.
-    child_ctx.regs[10] = 0;
+    // (2) a0 = 0: child's clone-syscall return value.
+    child_ctx.regs[CLONE_CHILD_RETURN_REG_INDEX] = 0;
     // (3) PC already points past `ecall`: the trap shell
     // (`tx-kernel::trap_handoff::hand_off_syscall`) added the 4-byte
     // RV64 `ecall` insn width to `pc` at trap-capture time before

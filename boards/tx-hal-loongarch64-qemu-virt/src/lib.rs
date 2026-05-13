@@ -37,6 +37,8 @@ core::arch::global_asm!(
     .section .text.boot, "ax"
     .equ TX_LA64_DMW_CACHED,   0x9000000000000011
     .equ TX_LA64_DMW_UNCACHED, 0x8000000000000001
+    .equ TX_LA64_DMW_CACHED_BASE, 0x9000000000000000
+    .equ TX_LA64_PHYS_ADDR_MASK, 0x0000ffffffffffff
     .equ TX_LA64_CSR_DMW0, 0x180
     .equ TX_LA64_CSR_DMW1, 0x181
     .equ TX_LA64_CSR_DMW2, 0x182
@@ -78,9 +80,17 @@ _start:
     csrwr   $t0, TX_LA64_CSR_DMW3
     invtlb  0x0, $zero, $zero
 
+    li.d    $t2, TX_LA64_PHYS_ADDR_MASK
+    and     $sp, $sp, $t2
+    li.d    $t2, TX_LA64_DMW_CACHED_BASE
+    or      $sp, $sp, $t2
     move    $a0, $s0
     move    $a1, $s1
     la.local $t0, rust_entry
+    li.d    $t2, TX_LA64_PHYS_ADDR_MASK
+    and     $t0, $t0, $t2
+    li.d    $t2, TX_LA64_DMW_CACHED_BASE
+    or      $t0, $t0, $t2
     jirl    $zero, $t0, 0
 
 3:
@@ -115,7 +125,12 @@ _start:
     iocsrwr.d $zero, $t2
     iocsrwr.d $zero, $t3
     iocsrwr.d $zero, $t4
-    move    $sp, $t1
+    li.d    $t2, TX_LA64_PHYS_ADDR_MASK
+    and     $sp, $t1, $t2
+    and     $t0, $t0, $t2
+    li.d    $t2, TX_LA64_DMW_CACHED_BASE
+    or      $sp, $sp, $t2
+    or      $t0, $t0, $t2
     jirl    $zero, $t0, 0
 .Ltx_la64_secondary_idle:
     // Keep polling the mailbox even if IPI delivery is masked/late.
@@ -169,20 +184,50 @@ _start:
     .equ TX_LA64_CSR_ESTAT_TRAP, 0x05
     .equ TX_LA64_CSR_ERA_TRAP, 0x06
     .equ TX_LA64_CSR_BADV_TRAP, 0x07
+    .equ TX_LA64_CSR_KSAVE0_TRAP, 0x30
+    .equ TX_LA64_CSR_KSAVE1_TRAP, 0x31
+    .equ TX_LA64_CSR_KSAVE2_TRAP, 0x32
     .equ TX_LA64_CSR_PGD_TRAP, 0x1b
+    .equ TX_LA64_CSR_TLBRERA_TRAP, 0x8a
     .equ TX_LA64_CSR_TLBRSAVE_TRAP, 0x8b
     .equ TX_LA64_CSR_TLBRELO0_TRAP, 0x8c
     .equ TX_LA64_CSR_TLBRELO1_TRAP, 0x8d
+    .equ TX_LA64_RCTX_SP, 0
+    .equ TX_LA64_RCTX_RA, 8
+    .equ TX_LA64_RCTX_R21, 16
+    .equ TX_LA64_RCTX_TP, 24
+    .equ TX_LA64_RCTX_R22, 32
+    .equ TX_LA64_PRMD_PPLV_USER, 3
+
+    .section .text.trap, "ax"
 
     .globl tx_la64_qemu_exception_vector
     .type tx_la64_qemu_exception_vector, @function
 tx_la64_qemu_exception_vector:
+    csrrd   $r12, TX_LA64_CSR_PRMD_TRAP
+    andi    $r12, $r12, TX_LA64_PRMD_PPLV_USER
+    li.w    $r13, TX_LA64_PRMD_PPLV_USER
+    bne     $r12, $r13, .Ltx_la64_kernel_trap_stack_ready
+
+    // User trap: switch onto the per-hart trap stack. KSAVE0 is primed
+    // with trap_stack_top before entering user mode and on every clean
+    // user-trap exit. After csrwr: sp = trap_stack_top, KSAVE0 = user sp.
+    csrwr   $sp, TX_LA64_CSR_KSAVE0_TRAP
+.Ltx_la64_kernel_trap_stack_ready:
     addi.d  $sp, $sp, -TX_LA64_TF_SIZE
     st.d    $r12, $sp, TX_LA64_TF_R12
     st.d    $zero, $sp, TX_LA64_TF_R0
     st.d    $r1, $sp, TX_LA64_TF_R1
     st.d    $r2, $sp, TX_LA64_TF_R2
+    csrrd   $r12, TX_LA64_CSR_PRMD_TRAP
+    andi    $r12, $r12, TX_LA64_PRMD_PPLV_USER
+    li.w    $r13, TX_LA64_PRMD_PPLV_USER
+    bne     $r12, $r13, .Ltx_la64_save_kernel_sp
+    csrrd   $r12, TX_LA64_CSR_KSAVE0_TRAP
+    b       .Ltx_la64_save_sp_done
+.Ltx_la64_save_kernel_sp:
     addi.d  $r12, $sp, TX_LA64_TF_SIZE
+.Ltx_la64_save_sp_done:
     st.d    $r12, $sp, TX_LA64_TF_R3
     st.d    $r4, $sp, TX_LA64_TF_R4
     st.d    $r5, $sp, TX_LA64_TF_R5
@@ -222,45 +267,65 @@ tx_la64_qemu_exception_vector:
     csrrd   $r12, TX_LA64_CSR_PRMD_TRAP
     st.d    $r12, $sp, TX_LA64_TF_PRMD
 
+    // User traps arrive with user GPRs, including r21 and the user thread
+    // pointer in r2. Recover the kernel TLS registers before entering Rust;
+    // the user values remain saved in the trap frame and are restored below.
+    ld.d    $r12, $sp, TX_LA64_TF_PRMD
+    andi    $r12, $r12, TX_LA64_PRMD_PPLV_USER
+    li.w    $r13, TX_LA64_PRMD_PPLV_USER
+    bne     $r12, $r13, .Ltx_la64_kernel_tls_ready
+    csrrd   $r21, TX_LA64_CSR_KSAVE1_TRAP
+    csrrd   $r2, TX_LA64_CSR_KSAVE2_TRAP
+.Ltx_la64_kernel_tls_ready:
+
     move    $a0, $sp
     bl      tx_la64_qemu_kernel_trap_entry
 
-    ld.d    $r12, $sp, TX_LA64_TF_ERA
+    move    $r31, $sp
+    ld.d    $r12, $r31, TX_LA64_TF_ERA
     csrwr   $r12, TX_LA64_CSR_ERA_TRAP
-    ld.d    $r12, $sp, TX_LA64_TF_PRMD
+    ld.d    $r12, $r31, TX_LA64_TF_PRMD
     csrwr   $r12, TX_LA64_CSR_PRMD_TRAP
 
-    ld.d    $r1, $sp, TX_LA64_TF_R1
-    ld.d    $r2, $sp, TX_LA64_TF_R2
-    ld.d    $r4, $sp, TX_LA64_TF_R4
-    ld.d    $r5, $sp, TX_LA64_TF_R5
-    ld.d    $r6, $sp, TX_LA64_TF_R6
-    ld.d    $r7, $sp, TX_LA64_TF_R7
-    ld.d    $r8, $sp, TX_LA64_TF_R8
-    ld.d    $r9, $sp, TX_LA64_TF_R9
-    ld.d    $r10, $sp, TX_LA64_TF_R10
-    ld.d    $r11, $sp, TX_LA64_TF_R11
-    ld.d    $r12, $sp, TX_LA64_TF_R12
-    ld.d    $r13, $sp, TX_LA64_TF_R13
-    ld.d    $r14, $sp, TX_LA64_TF_R14
-    ld.d    $r15, $sp, TX_LA64_TF_R15
-    ld.d    $r16, $sp, TX_LA64_TF_R16
-    ld.d    $r17, $sp, TX_LA64_TF_R17
-    ld.d    $r18, $sp, TX_LA64_TF_R18
-    ld.d    $r19, $sp, TX_LA64_TF_R19
-    ld.d    $r20, $sp, TX_LA64_TF_R20
-    ld.d    $r21, $sp, TX_LA64_TF_R21
-    ld.d    $r22, $sp, TX_LA64_TF_R22
-    ld.d    $r23, $sp, TX_LA64_TF_R23
-    ld.d    $r24, $sp, TX_LA64_TF_R24
-    ld.d    $r25, $sp, TX_LA64_TF_R25
-    ld.d    $r26, $sp, TX_LA64_TF_R26
-    ld.d    $r27, $sp, TX_LA64_TF_R27
-    ld.d    $r28, $sp, TX_LA64_TF_R28
-    ld.d    $r29, $sp, TX_LA64_TF_R29
-    ld.d    $r30, $sp, TX_LA64_TF_R30
-    ld.d    $r31, $sp, TX_LA64_TF_R31
-    ld.d    $sp, $sp, TX_LA64_TF_R3
+    ld.d    $r12, $r31, TX_LA64_TF_PRMD
+    andi    $r12, $r12, TX_LA64_PRMD_PPLV_USER
+    li.w    $r13, TX_LA64_PRMD_PPLV_USER
+    bne     $r12, $r13, .Ltx_la64_restore_gprs
+    addi.d  $r13, $r31, TX_LA64_TF_SIZE
+    csrwr   $r13, TX_LA64_CSR_KSAVE0_TRAP
+.Ltx_la64_restore_gprs:
+    ld.d    $r1, $r31, TX_LA64_TF_R1
+    ld.d    $r2, $r31, TX_LA64_TF_R2
+    ld.d    $r4, $r31, TX_LA64_TF_R4
+    ld.d    $r5, $r31, TX_LA64_TF_R5
+    ld.d    $r6, $r31, TX_LA64_TF_R6
+    ld.d    $r7, $r31, TX_LA64_TF_R7
+    ld.d    $r8, $r31, TX_LA64_TF_R8
+    ld.d    $r9, $r31, TX_LA64_TF_R9
+    ld.d    $r10, $r31, TX_LA64_TF_R10
+    ld.d    $r11, $r31, TX_LA64_TF_R11
+    ld.d    $r12, $r31, TX_LA64_TF_R12
+    ld.d    $r13, $r31, TX_LA64_TF_R13
+    ld.d    $r14, $r31, TX_LA64_TF_R14
+    ld.d    $r15, $r31, TX_LA64_TF_R15
+    ld.d    $r16, $r31, TX_LA64_TF_R16
+    ld.d    $r17, $r31, TX_LA64_TF_R17
+    ld.d    $r18, $r31, TX_LA64_TF_R18
+    ld.d    $r19, $r31, TX_LA64_TF_R19
+    ld.d    $r20, $r31, TX_LA64_TF_R20
+    ld.d    $r21, $r31, TX_LA64_TF_R21
+    ld.d    $r22, $r31, TX_LA64_TF_R22
+    ld.d    $r23, $r31, TX_LA64_TF_R23
+    ld.d    $r24, $r31, TX_LA64_TF_R24
+    ld.d    $r25, $r31, TX_LA64_TF_R25
+    ld.d    $r26, $r31, TX_LA64_TF_R26
+    ld.d    $r27, $r31, TX_LA64_TF_R27
+    ld.d    $r28, $r31, TX_LA64_TF_R28
+    ld.d    $r29, $r31, TX_LA64_TF_R29
+    ld.d    $r30, $r31, TX_LA64_TF_R30
+    ld.d    $sp, $r31, TX_LA64_TF_R3
+    ld.d    $r31, $r31, TX_LA64_TF_R31
+.Ltx_la64_trap_ertn:
     ertn
     .size tx_la64_qemu_exception_vector, . - tx_la64_qemu_exception_vector
 
@@ -313,6 +378,7 @@ tx_la64_qemu_return_to_userspace:
     csrwr   $r12, TX_LA64_CSR_ERA_TRAP
     ld.d    $r12, $r31, TX_LA64_TF_PRMD
     csrwr   $r12, TX_LA64_CSR_PRMD_TRAP
+    csrwr   $zero, TX_LA64_CSR_TLBRERA_TRAP
     ld.d    $r1, $r31, TX_LA64_TF_R1
     ld.d    $r2, $r31, TX_LA64_TF_R2
     ld.d    $r4, $r31, TX_LA64_TF_R4
@@ -346,6 +412,104 @@ tx_la64_qemu_return_to_userspace:
     ld.d    $r31, $r31, TX_LA64_TF_R31
     ertn
     .size tx_la64_qemu_return_to_userspace, . - tx_la64_qemu_return_to_userspace
+
+    .globl tx_la64_qemu_activate_enter_userspace
+    .type tx_la64_qemu_activate_enter_userspace, @function
+tx_la64_qemu_activate_enter_userspace:
+    // a0 = *mut KernelResumeCtx
+    // a1 = *const La64TrapFrame
+    // a2 = trap_stack_top
+    // a3 = asid
+    // a4 = pgdl
+    // a5 = pgdh
+    // All Rust stack-dependent work must be complete before this
+    // function. After CRMD.PG is written, do not return to Rust.
+    st.d    $sp, $a0, TX_LA64_RCTX_SP
+    st.d    $r1, $a0, TX_LA64_RCTX_RA
+    st.d    $r21, $a0, TX_LA64_RCTX_R21
+    st.d    $r2, $a0, TX_LA64_RCTX_TP
+    st.d    $r22, $a0, (TX_LA64_RCTX_R22 + 0)
+    st.d    $r23, $a0, (TX_LA64_RCTX_R22 + 8)
+    st.d    $r24, $a0, (TX_LA64_RCTX_R22 + 16)
+    st.d    $r25, $a0, (TX_LA64_RCTX_R22 + 24)
+    st.d    $r26, $a0, (TX_LA64_RCTX_R22 + 32)
+    st.d    $r27, $a0, (TX_LA64_RCTX_R22 + 40)
+    st.d    $r28, $a0, (TX_LA64_RCTX_R22 + 48)
+    st.d    $r29, $a0, (TX_LA64_RCTX_R22 + 56)
+    st.d    $r30, $a0, (TX_LA64_RCTX_R22 + 64)
+    st.d    $r31, $a0, (TX_LA64_RCTX_R22 + 72)
+
+    csrwr   $a2, TX_LA64_CSR_KSAVE0_TRAP
+    csrwr   $r21, TX_LA64_CSR_KSAVE1_TRAP
+    csrwr   $r2, TX_LA64_CSR_KSAVE2_TRAP
+
+    move    $r31, $a1
+    ld.d    $r12, $r31, TX_LA64_TF_ERA
+    csrwr   $r12, TX_LA64_CSR_ERA_TRAP
+    ld.d    $r12, $r31, TX_LA64_TF_PRMD
+    csrwr   $r12, TX_LA64_CSR_PRMD_TRAP
+    csrwr   $zero, TX_LA64_CSR_TLBRERA_TRAP
+
+    csrwr   $a3, 0x18
+    csrwr   $a4, 0x19
+    csrwr   $a5, 0x1a
+    li.d    $r12, 0x00000000000000b0
+    csrwr   $r12, 0x00
+    invtlb  0x0, $zero, $zero
+
+    ld.d    $r1, $r31, TX_LA64_TF_R1
+    ld.d    $r2, $r31, TX_LA64_TF_R2
+    ld.d    $r4, $r31, TX_LA64_TF_R4
+    ld.d    $r5, $r31, TX_LA64_TF_R5
+    ld.d    $r6, $r31, TX_LA64_TF_R6
+    ld.d    $r7, $r31, TX_LA64_TF_R7
+    ld.d    $r8, $r31, TX_LA64_TF_R8
+    ld.d    $r9, $r31, TX_LA64_TF_R9
+    ld.d    $r10, $r31, TX_LA64_TF_R10
+    ld.d    $r11, $r31, TX_LA64_TF_R11
+    ld.d    $r12, $r31, TX_LA64_TF_R12
+    ld.d    $r13, $r31, TX_LA64_TF_R13
+    ld.d    $r14, $r31, TX_LA64_TF_R14
+    ld.d    $r15, $r31, TX_LA64_TF_R15
+    ld.d    $r16, $r31, TX_LA64_TF_R16
+    ld.d    $r17, $r31, TX_LA64_TF_R17
+    ld.d    $r18, $r31, TX_LA64_TF_R18
+    ld.d    $r19, $r31, TX_LA64_TF_R19
+    ld.d    $r20, $r31, TX_LA64_TF_R20
+    ld.d    $r21, $r31, TX_LA64_TF_R21
+    ld.d    $r22, $r31, TX_LA64_TF_R22
+    ld.d    $r23, $r31, TX_LA64_TF_R23
+    ld.d    $r24, $r31, TX_LA64_TF_R24
+    ld.d    $r25, $r31, TX_LA64_TF_R25
+    ld.d    $r26, $r31, TX_LA64_TF_R26
+    ld.d    $r27, $r31, TX_LA64_TF_R27
+    ld.d    $r28, $r31, TX_LA64_TF_R28
+    ld.d    $r29, $r31, TX_LA64_TF_R29
+    ld.d    $r30, $r31, TX_LA64_TF_R30
+    ld.d    $sp, $r31, TX_LA64_TF_R3
+    ld.d    $r31, $r31, TX_LA64_TF_R31
+    ertn
+    .size tx_la64_qemu_activate_enter_userspace, . - tx_la64_qemu_activate_enter_userspace
+
+    .globl tx_la64_resume_kernel_after_reschedule
+    .type tx_la64_resume_kernel_after_reschedule, @function
+tx_la64_resume_kernel_after_reschedule:
+    ld.d    $sp,  $a0, TX_LA64_RCTX_SP
+    ld.d    $r1,  $a0, TX_LA64_RCTX_RA
+    ld.d    $r21, $a0, TX_LA64_RCTX_R21
+    ld.d    $r2,  $a0, TX_LA64_RCTX_TP
+    ld.d    $r22, $a0, (TX_LA64_RCTX_R22 + 0)
+    ld.d    $r23, $a0, (TX_LA64_RCTX_R22 + 8)
+    ld.d    $r24, $a0, (TX_LA64_RCTX_R22 + 16)
+    ld.d    $r25, $a0, (TX_LA64_RCTX_R22 + 24)
+    ld.d    $r26, $a0, (TX_LA64_RCTX_R22 + 32)
+    ld.d    $r27, $a0, (TX_LA64_RCTX_R22 + 40)
+    ld.d    $r28, $a0, (TX_LA64_RCTX_R22 + 48)
+    ld.d    $r29, $a0, (TX_LA64_RCTX_R22 + 56)
+    ld.d    $r30, $a0, (TX_LA64_RCTX_R22 + 64)
+    ld.d    $r31, $a0, (TX_LA64_RCTX_R22 + 72)
+    ret
+    .size tx_la64_resume_kernel_after_reschedule, . - tx_la64_resume_kernel_after_reschedule
 
     .equ TX_LA64_CSR_EUEN, 0x02
 
@@ -630,6 +794,8 @@ const LA64_CSR_CRMD: usize = 0x00;
 const LA64_CSR_EUEN: usize = 0x02;
 const LA64_CSR_ECFG: usize = 0x04;
 const LA64_CSR_EENTRY: usize = 0x0c;
+#[cfg(target_arch = "loongarch64")]
+const LA64_CSR_KSAVE0: usize = 0x30;
 const LA64_CSR_ASID: usize = 0x18;
 const LA64_CSR_PGDL: usize = 0x19;
 const LA64_CSR_PGDH: usize = 0x1a;
@@ -644,6 +810,11 @@ const LA64_CSR_TICLR: usize = 0x44;
 const LA64_CRMD_IE: usize = 1 << 2;
 const LA64_CRMD_DA: usize = 1 << 3;
 const LA64_CRMD_PG: usize = 1 << 4;
+const LA64_CRMD_PLV_MASK: usize = 0x3;
+const LA64_CRMD_DATF_MASK: usize = 0b11 << 5;
+const LA64_CRMD_DATM_MASK: usize = 0b11 << 7;
+const LA64_CRMD_DATF_CC: usize = 0b01 << 5;
+const LA64_CRMD_DATM_CC: usize = 0b01 << 7;
 #[cfg(target_arch = "loongarch64")]
 const LA64_EUEN_FPE: usize = 1 << 0;
 const LA64_ASID_MASK: usize = 0x3ff;
@@ -674,6 +845,7 @@ const LA64_ECODE_SYS: usize = 11;
 const LA64_ECODE_BRK: usize = 12;
 const LA64_ECODE_INE: usize = 13;
 const LA64_ECODE_IPE: usize = 14;
+const LA64_ECODE_FPD: usize = 15;
 const LA64_USER_TOP: usize = 0x0000_4000_0000_0000;
 const LA64_PTE_PFN_MASK: u64 = ((1u64 << 48) - 1) & !((1u64 << 12) - 1);
 const LA64_PTE_V: u64 = 1 << 0;
@@ -746,6 +918,110 @@ static LA64_HOST_EIOINTC_COREISR0: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(target_arch = "loongarch64"))]
 static LA64_HOST_PCH_PIC_MASK: AtomicU64 = AtomicU64::new(u64::MAX);
 
+#[repr(C, align(8))]
+pub struct KernelResumeCtx {
+    pub sp: usize,
+    pub ra: usize,
+    pub r21: usize,
+    pub tp: usize,
+    pub r22: [usize; 10],
+}
+
+const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 14 * 8);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, sp) == 0);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, ra) == 8);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, r21) == 16);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, tp) == 24);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, r22) == 32);
+
+#[repr(transparent)]
+pub struct PerHartCell<T>(UnsafeCell<T>);
+
+unsafe impl<T> Sync for PerHartCell<T> {}
+
+impl<T> PerHartCell<T> {
+    pub const fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    pub fn as_ptr(&self) -> *mut T {
+        self.0.get()
+    }
+}
+
+static LA64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; LA64_MAX_BOOT_CPUS] = [
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        r21: 0,
+        tp: 0,
+        r22: [0; 10],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        r21: 0,
+        tp: 0,
+        r22: [0; 10],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        r21: 0,
+        tp: 0,
+        r22: [0; 10],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        r21: 0,
+        tp: 0,
+        r22: [0; 10],
+    }),
+];
+
+const LA64_TRAP_STACK_SIZE: usize = 16 * 1024;
+
+#[repr(C, align(16))]
+pub struct La64TrapStack(pub [u8; LA64_TRAP_STACK_SIZE]);
+
+static LA64_TRAP_STACKS: [PerHartCell<La64TrapStack>; LA64_MAX_BOOT_CPUS] = [
+    PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
+    PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
+    PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
+    PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
+];
+
+pub(crate) fn la64_trap_stack_top_for_cpu(cpu: CpuId) -> usize {
+    let stack = LA64_TRAP_STACKS[cpu.0].as_ptr();
+    stack as usize + LA64_TRAP_STACK_SIZE
+}
+
+pub(crate) fn la64_kernel_resume_ctx_ptr_for_cpu(cpu: CpuId) -> *mut KernelResumeCtx {
+    LA64_KERNEL_RESUME_CTX[cpu.0].as_ptr()
+}
+
+pub(crate) fn current_la64_kernel_resume_ctx_ptr() -> *mut KernelResumeCtx {
+    let cpu = la64_pmap::la64_current_cpu_id();
+    la64_kernel_resume_ctx_ptr_for_cpu(cpu)
+}
+
+static LA64_ENTRY_TRAP_FRAMES: [PerHartCell<La64TrapFrame>; LA64_MAX_BOOT_CPUS] = [
+    PerHartCell::new(La64TrapFrame::empty()),
+    PerHartCell::new(La64TrapFrame::empty()),
+    PerHartCell::new(La64TrapFrame::empty()),
+    PerHartCell::new(La64TrapFrame::empty()),
+];
+
+pub(crate) fn current_la64_entry_trap_frame_ptr() -> *mut La64TrapFrame {
+    let cpu = la64_pmap::la64_current_cpu_id();
+    la64_entry_trap_frame_ptr_for_cpu(cpu)
+}
+
+pub(crate) fn la64_entry_trap_frame_ptr_for_cpu(cpu: CpuId) -> *mut La64TrapFrame {
+    LA64_ENTRY_TRAP_FRAMES[cpu.0].as_ptr()
+}
+
 struct La64CommittedPtNodeRegistry(UnsafeCell<[Option<PtNode>; 256]>);
 
 unsafe impl Sync for La64CommittedPtNodeRegistry {}
@@ -770,6 +1046,17 @@ pub struct La64TrapFrame {
 }
 
 impl La64TrapFrame {
+    pub const fn empty() -> Self {
+        Self {
+            r: [0; 32],
+            estat: 0,
+            era: 0,
+            badv: 0,
+            crmd: 0,
+            prmd: 0,
+        }
+    }
+
     pub const fn snapshot(&self) -> TrapFrameSnapshot {
         // `TrapFrameSnapshot` still carries RV64-flavoured field names. For
         // LA64, `scause/sepc/stval` transport `ESTAT/ERA/BADV` respectively.
@@ -1272,7 +1559,7 @@ impl PlatformConfig for Platform {
     const DIRECT_MAP_SIZE: usize = QEMU_LA64_RAM_SIZE;
     const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(la64_cached_virt(QEMU_LA64_KERNEL_LOAD_BASE));
     const USER_TOP: VirtAddr = VirtAddr(LA64_USER_TOP);
-    const KERNEL_STACK_SIZE: usize = 64 * 1024;
+    const KERNEL_STACK_SIZE: usize = 128 * 1024;
     const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE;
     const PAGE_TABLE_LEVELS: u8 = 4;
     const ASID_BITS: u8 = 10;

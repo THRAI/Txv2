@@ -6,8 +6,8 @@ use crate::{current_kernel_resume_ctx_ptr, trap_stack_top_for_cpu, KernelResumeC
 #[cfg(target_arch = "riscv64")]
 use tx_hal::SmpIf;
 use tx_hal::{
-    FaultInfo, KernelTrapSink, SignalHandlerRegs, TrapAction, TrapClass, TrapFrameMut,
-    TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode,
+    FaultInfo, KernelTrapSink, PmapIf, PmapRoot, SignalHandlerRegs, TrapAction, TrapClass,
+    TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode,
     UserTrapContext, VirtAddr,
 };
 
@@ -117,6 +117,14 @@ tx_rv64_qemu_minimal_trap_vector:
     sd t0, TX_RV64_TF_STVAL(sp)
     csrr t0, sstatus
     sd t0, TX_RV64_TF_SSTATUS(sp)
+
+    # From-user traps arrive with tp restored from the user frame.
+    # Recover the kernel TLS pointer from the trap-stack top before
+    # entering Rust; all per-CPU state (current_cpu_id, irq depth,
+    # active userspace payload) depends on tp being the kernel value.
+    addi a0, sp, TX_RV64_TF_SIZE
+    call tx_rv64_kernel_tls_from_trap_stack_top
+    mv tp, a0
 
     mv a0, sp
     call tx_rv64_qemu_kernel_trap_entry
@@ -544,7 +552,7 @@ impl TrapIf for Platform {
     /// the per-CPU trap-stack top, and `sret`s into user mode.
     /// Returns when the trap shell chooses `TrapAction::Reschedule`
     /// and longjmps back via [`tx_rv64_resume_kernel_after_reschedule`].
-    fn enter_userspace_with_context(ctx: UserTrapContext) {
+    fn enter_userspace_with_context(ctx: &UserTrapContext, root: &PmapRoot) {
         crate::debug_trace::record_entry(&ctx);
 
         let mut frame = Rv64TrapFrame {
@@ -558,6 +566,7 @@ impl TrapIf for Platform {
         // `restore_user_context` already calls `prepare_user_return`,
         // which clears SPP and sets SPIE so `sret` lands in user mode
         // with interrupts enabled.
+        <Platform as PmapIf>::activate_user_pmap(root);
 
         #[cfg(target_arch = "riscv64")]
         unsafe {
