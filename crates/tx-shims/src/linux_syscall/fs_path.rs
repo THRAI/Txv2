@@ -174,8 +174,7 @@ pub(super) fn fs_ops_for_dentry(
                 return Some(payload.fs_ops.clone());
             }
         }
-        let next = cursor.parent_hint().and_then(|w| w.upgrade(&guard))?;
-        cursor = next;
+        cursor = cursor.parent_hint()?;
     }
 }
 

@@ -247,7 +247,7 @@ impl SignalFd {
         // userfaultfd.rs):
         self.wait_channel.fire(Mask::from_bits(SIGNALFD_READABLE));
         self.wait_source
-            .notify(InterestMask::new(SIGNALFD_READABLE));
+            .notify_emit(InterestMask::new(SIGNALFD_READABLE));
         true
     }
 

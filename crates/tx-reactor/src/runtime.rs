@@ -18,7 +18,7 @@ use crate::{
     },
     spin_lock::SpinLock,
     task::{TaskDrainRecord, TaskId, TaskKey, TaskLifecycleError, TaskStatus, TaskTable},
-    timer::TimerQueue,
+    timer::{DeadlineFuture, TimerQueue},
     userspace::{
         UserspaceEntryCheckpoint, UserspaceEntryDecision, UserspaceEntryOutcome,
         UserspaceEntryTaskError, UserspaceRunError, UserspaceRunRequest, UserspaceRunSlot,
@@ -201,6 +201,17 @@ impl Reactor {
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
         self.timers.next_deadline_ns()
+    }
+
+    /// Create a future that resolves once the reactor's clock advances past `deadline_ns`.
+    pub fn sleep_until(&self, deadline_ns: u64) -> DeadlineFuture {
+        self.timers.wait_until(deadline_ns)
+    }
+
+    /// Clone the reactor's timer queue so callers can schedule deadline
+    /// futures without holding the reactor lock.
+    pub fn timer_queue(&self) -> TimerQueue {
+        self.timers.clone()
     }
 
     /// Drive expired timers from a monotonic clock, run ready work, then

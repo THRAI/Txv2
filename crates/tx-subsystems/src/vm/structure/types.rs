@@ -5,7 +5,6 @@ use crate::page_backed::{
     PageIndex,
 };
 use crate::vm::adapter::step_engine::Cap;
-use step_engine::guard;
 use step_engine::page_allocator::{self, ZeroPolicy};
 
 use super::private::{
@@ -687,9 +686,8 @@ impl VmFaultOutcome {
             AccessMode::Write => MaterializeAccess::Write,
             _ => MaterializeAccess::Read,
         };
-        let guard = guard();
         let page = pc
-            .materialize_page_now(page_index, access, &guard)
+            .materialize_page_for_fault(page_index, access)
             .map_err(VmFaultError::PageCache)?;
         Ok(VmFaultMaterialization {
             backing: VmFaultMaterializationBacking::PageBacked,
@@ -843,8 +841,7 @@ impl VmFaultOutcome {
                 if access_byte >= pc.size_bytes() {
                     return Err(VmFaultError::PageBeyondSize);
                 }
-                let guard = guard();
-                pc.materialize_page_now(page_index, MaterializeAccess::Read, &guard)
+                pc.materialize_page_for_fault(page_index, MaterializeAccess::Read)
                     .map_err(VmFaultError::PageCache)?
             }
             (VmBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
@@ -879,9 +876,8 @@ impl VmFaultOutcome {
                 if access_byte >= pc.size_bytes() {
                     return Err(VmFaultError::PageBeyondSize);
                 }
-                let guard = guard();
                 let source = pc
-                    .materialize_page_now(page_index, MaterializeAccess::Read, &guard)
+                    .materialize_page_for_fault(page_index, MaterializeAccess::Read)
                     .map_err(VmFaultError::PageCache)?;
                 let new = allocate_private_materialized_page_from_source(source.ppn, true)?;
                 drop(source);

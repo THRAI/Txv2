@@ -34,7 +34,7 @@ use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaAddr,
     DmaDirection, DmaIf, EntropyIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf,
-    MemoryRegion, MemoryRegionKind, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
+    MemoryRegion, MemoryRegionKind, ObserverIf, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
     PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry,
     SmpIf, TimeIf, VirtAddr,
@@ -758,6 +758,8 @@ impl EntropyIf for Platform {
         }
     }
 }
+
+impl ObserverIf for Platform {}
 
 #[cfg(target_arch = "riscv64")]
 fn read_rdtime_ticks() -> u64 {

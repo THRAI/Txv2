@@ -81,6 +81,11 @@ The default CI gate is `cargo xtask ci`. It reports these checks individually:
 
 - `cargo xtask progress validate`
 
+<!-- txdoc:CI-GATE-OBSERVE-SMOKE -->
+
+- `cargo xtask observe demo --output /tmp/txkernel-ci-observe-demo.txtrace`
+- `cargo xtask observe validate --file /tmp/txkernel-ci-observe-demo.txtrace`
+
 <!-- txdoc:CI-GATE-RV64 -->
 
 - `cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`

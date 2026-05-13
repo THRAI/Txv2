@@ -2,7 +2,9 @@
 
 pub mod blk;
 pub mod dma;
+pub mod mmio;
 pub mod pci;
 
 pub use blk::VirtioPciBlock;
 pub use dma::TxVirtioHal;
+pub use mmio::VirtioMmioBlock;

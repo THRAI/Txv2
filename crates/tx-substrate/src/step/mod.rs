@@ -98,6 +98,9 @@ impl WaitSourceId {
     pub const fn raw(self) -> u64 {
         self.0
     }
+    /// Sentinel zero value — used by `YieldResolved::PLACEHOLDER` and
+    /// by non-`OnWaitSource` yield shapes that carry no source id.
+    pub const ZERO: Self = Self(0);
 }
 
 /// Bitmask of interest conditions on a wait source. Replaces
@@ -291,6 +294,114 @@ pub use wait_protocol::{WaitOutcome, WaitProtocol};
 pub mod binding_obligations;
 pub use binding_obligations::BindingObligation;
 
+// ── YieldOutcome / YieldResolved — OBS-3b wake-context return types ──────────
+//
+// These types extend the `yield_resolve` closure signature from
+// `Option<Errno>` to `YieldOutcome`, enabling the `drive` convergence
+// point to emit L3 YieldBegin + Resume records with full metadata.
+//
+// See `docs/progress/decisions/2026-05-13-d17-obs3b-resume-emission.md` §5.
+
+use crate::wake::mailbox::WaitGeneration;
+
+/// Discriminant encoding why a yield resolved.
+///
+/// Wire encoding (same values as `PayloadResume::resume_kind`):
+/// 0=Retry, 1=WithReply, 2=TimerExpired, 3=Aborted.
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ResumeKind {
+    /// Source fired; retry the step. Used by `OnWaitSource`.
+    Retry = 0,
+    /// Agent replied with payload. Used by `OnAgent`.
+    WithReply = 1,
+    /// Primary timer arm fired. Used by `OnTimer`.
+    TimerExpired = 2,
+    /// Wait aborted (signal, cancellation, kill, …).
+    Aborted = 3,
+}
+
+/// Discriminant encoding why an `Aborted` wake occurred.
+///
+/// Wire encoding (same values as `PayloadResume::abort_reason`):
+/// 0=None, 1=Signal, 2=Cancelled, 3=Killed.
+/// This enum is separate from [`AbortReason`] (which is the delegate-side
+/// runtime catalog) — it collapses all abort varieties into a compact wire
+/// discriminant suitable for `PayloadResume`.
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum WireAbortReason {
+    /// Not aborted (valid only when `resume_kind != Aborted`).
+    None = 0,
+    /// Wait interrupted by a signal (EINTR path).
+    Signal = 1,
+    /// Wait cancelled (delegate token drop, scope teardown).
+    Cancelled = 2,
+    /// Wait killed (SIGKILL, irrecoverable).
+    Killed = 3,
+}
+
+/// Wake-context metadata returned by a `yield_resolve` closure.
+///
+/// Carries the generation, source, and classification fields that
+/// the L3 Resume convergence point in `drive` needs to emit a
+/// `PayloadResume` record. Fields match the `PayloadResume` wire layout
+/// (see `08_OBSERVATION_SERIALIZATION_v0.md §8.4`).
+///
+/// **Production call sites** populate all fields from the active wait
+/// state captured in the closure (`ActiveWait::generation`, `source`).
+/// **Stub / test / kernel-actor call sites** use `PLACEHOLDER` to
+/// avoid scope-bloating boilerplate — the daemon emits a degenerate
+/// record but will not fail.
+#[derive(Copy, Clone, Debug)]
+pub struct YieldResolved {
+    /// Generation of the wait that fired (from `ActiveWait::generation`).
+    pub wait_generation: WaitGeneration,
+    /// Source that delivered the wake; `WaitSourceId::ZERO` for non-`OnWaitSource` shapes.
+    pub source_id: WaitSourceId,
+    /// Why the wait ended.
+    pub resume_kind: ResumeKind,
+    /// Abort discriminant; valid iff `resume_kind == ResumeKind::Aborted`.
+    pub abort_reason: WireAbortReason,
+}
+
+impl YieldResolved {
+    /// Placeholder for closures that do not have wake-context
+    /// (test stubs, kernel actors that never actually park, etc.).
+    ///
+    /// The daemon emits a degenerate flow record but will not panic.
+    /// Every production path where a task genuinely parks and wakes
+    /// should populate the real values.
+    ///
+    /// Call sites using this should be annotated with:
+    /// `// TODO(α-followup): real metadata once <X> is in scope`
+    pub const PLACEHOLDER: Self = Self {
+        wait_generation: WaitGeneration::ZERO,
+        source_id: WaitSourceId::ZERO,
+        resume_kind: ResumeKind::Retry,
+        abort_reason: WireAbortReason::None,
+    };
+}
+
+/// Return type of a `yield_resolve` closure.
+///
+/// Replaces the previous `Option<Errno>` return:
+/// - `None` (resolved, continue loop) → `Resolved(YieldResolved { .. })`
+/// - `Some(errno)` (abort) → `Aborted { resolved: YieldResolved { .. }, errno }`
+///
+/// The `resolved` field in the `Aborted` arm carries whatever
+/// wake-context the closure observed at the time of the abort; the
+/// L3 Resume emit in `drive` uses it before breaking out.
+pub enum YieldOutcome {
+    /// Wait resolved; continue the step loop.
+    Resolved(YieldResolved),
+    /// Wait aborted; break the step loop with `errno`.
+    Aborted {
+        resolved: YieldResolved,
+        errno: Errno,
+    },
+}
+
 /// Closed catalog of driver dispatch modes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DriveMode {
@@ -405,6 +516,24 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
     /// Script-level deadline if populated.
     pub fn deadline(&self) -> Option<Deadline> {
         self.deadline
+    }
+
+    /// Low 32 bits of the subject's task trace identity.
+    ///
+    /// Delegates to `SubjectIdentity::task_id_low` on the subject's
+    /// process identity if a `SubjectContext` is populated; returns
+    /// `0` for empty (`None`) contexts (test / kernel-internal actors
+    /// with no subject wired in).
+    ///
+    /// Used by `drive` to populate `PayloadDriveBegin::task_id_low`
+    /// (OBS-4 / γ-fix) so the daemon's `compute_flow_id` hashes the
+    /// right identity.
+    #[inline]
+    pub fn task_id_low(&self) -> u32 {
+        self.subject
+            .as_ref()
+            .map(|s| s.process().task_id_low())
+            .unwrap_or(0)
     }
 }
 

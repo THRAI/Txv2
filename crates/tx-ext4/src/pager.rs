@@ -1,9 +1,10 @@
+use step_engine::Guard;
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::vfs::structure::FsObjectId;
 
-use crate::adapter::step_engine::{page_allocator, Guard, NoProgress, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, page_allocator, NoProgress, StepOutcome};
 use crate::read_backend::{inode_no, Ext4FsInstance};
 
 use page_allocator::ZeroPolicy;
@@ -26,12 +27,23 @@ fn materialize_frame(page: &Page4K) -> StepOutcome<Frame, NoProgress> {
     };
     let ppn = owned.ppn();
 
-    let frame_base = match page_allocator::frame_kernel_addr(ppn) {
-        Ok(ptr) => ptr,
-        Err(_) => return StepOutcome::err(Errno::EIO.into()),
-    };
-    unsafe {
-        core::ptr::copy_nonoverlapping(page.as_ptr(), frame_base, BLOCK_SIZE);
+    #[cfg(test)]
+    {
+        page_allocator::testing::write_frame_bytes_for_test(ppn, 0, page);
+    }
+    #[cfg(not(test))]
+    {
+        let dst = match page_allocator::frame_kernel_addr(ppn) {
+            Ok(ptr) => ptr,
+            Err(_) => return StepOutcome::err(Errno::EIO.into()),
+        };
+        // SAFETY: `dst` is the kernel direct-map VA of a freshly
+        // allocated frame we own through `owned`. `page` is a
+        // `&[u8; BLOCK_SIZE]`.  Both regions are disjoint and valid
+        // for BLOCK_SIZE bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(page.as_ptr(), dst, BLOCK_SIZE);
+        }
     }
 
     // Hand off ownership: the permanent-frame token never releases the

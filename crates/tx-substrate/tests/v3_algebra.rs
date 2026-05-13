@@ -75,7 +75,7 @@ fn step_outcome_continue_carries_progress() {
 
 #[test]
 fn errno_mirrors_v4_catalog() {
-    // The `step_v3::Errno` catalog mirrors `tx_subsystems::execution
+    // The `step::Errno` catalog mirrors `tx_subsystems::execution
     // ::Errno` byte-for-byte (27 variants). Closed-catalog discipline:
     // an exhaustive match with no wildcard arm so adding a variant
     // later requires mirroring it here.

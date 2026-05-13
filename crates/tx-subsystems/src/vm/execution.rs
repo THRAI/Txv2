@@ -24,9 +24,15 @@ use crate::vm::checks::{
 use crate::vm::structure::{PrivatePageError, PrivatePageSet};
 use crate::vm::{
     AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard, UserRange,
-    VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization, VmFaultOutcome, VmMapCommit,
-    VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest,
+    UserVirtAddr, VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization,
+    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget,
+    VmRemapOutcome, VmRemapRequest,
 };
+
+fn page_align_up(addr: usize) -> usize {
+    const PAGE_SIZE: usize = 4096;
+    (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
 
 impl AddressSpace {
     pub fn resolve_fault(&self, fault: VmFault) -> Result<VmFaultOutcome, VmFaultError> {
@@ -538,22 +544,34 @@ impl AddressSpace {
             return Ok(current_brk);
         }
         if requested_brk.0 > current_brk.0 {
-            let len = requested_brk.0 - current_brk.0;
-            let range =
-                UserRange::new_aligned(current_brk, len).map_err(|_| VmMapError::InvalidRange)?;
-            let request = VmMapRequest::fixed(
-                range,
-                MapPlacement::RequireFree,
-                Prot::READ_WRITE,
-                crate::vm::VmEntryFlags::PRIVATE,
-                VmBacking::PrivateAnon,
-            );
-            self.mmap_script(request).await?;
+            let old_committed = page_align_up(current_brk.0);
+            let new_committed = page_align_up(requested_brk.0);
+            if new_committed > old_committed {
+                let range = UserRange::new_aligned(
+                    UserVirtAddr(old_committed),
+                    new_committed - old_committed,
+                )
+                .map_err(|_| VmMapError::InvalidRange)?;
+                let request = VmMapRequest::fixed(
+                    range,
+                    MapPlacement::RequireFree,
+                    Prot::READ_WRITE,
+                    crate::vm::VmEntryFlags::PRIVATE,
+                    VmBacking::PrivateAnon,
+                );
+                self.mmap_script(request).await?;
+            }
         } else {
-            let len = current_brk.0 - requested_brk.0;
-            let range =
-                UserRange::new_aligned(requested_brk, len).map_err(|_| VmMapError::InvalidRange)?;
-            self.munmap_script(range).await?;
+            let old_committed = page_align_up(current_brk.0);
+            let new_committed = page_align_up(requested_brk.0);
+            if new_committed < old_committed {
+                let range = UserRange::new_aligned(
+                    UserVirtAddr(new_committed),
+                    old_committed - new_committed,
+                )
+                .map_err(|_| VmMapError::InvalidRange)?;
+                self.munmap_script(range).await?;
+            }
         }
         Ok(requested_brk)
     }
