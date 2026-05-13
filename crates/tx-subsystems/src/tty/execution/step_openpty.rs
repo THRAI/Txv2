@@ -1,12 +1,13 @@
 //! Minimal pty pair creation.
 
-use tx_substrate::zone::{self, Cap, PayloadCap};
+use crate::tty::adapter::step_engine::{self as step_engine, Cap, PayloadCap};
 
 use crate::execution::{Errno, Guard};
 use crate::tty::project;
 use crate::tty::structure::registry;
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
 use crate::vfs::OpenFile;
+use crate::tty::adapter::step_engine::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 // Re-import v3 types via local alias for brevity in fn body.
 
@@ -23,8 +24,8 @@ pub struct OpenPtyOutcome {
 /// the slave into the devpts registry, and return OpenFiles for both sides.
 pub fn step_openpty(
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<OpenPtyOutcome, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<OpenPtyOutcome, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let index = match registry::allocate_pty_index() {
         Ok(index) => index,
@@ -34,38 +35,38 @@ pub fn step_openpty(
         return V3::Err(Errno::EIO.into());
     }
 
-    let master_id_res = match zone::reserve_for::<TtyIdentity>() {
+    let master_id_res = match step_engine::reserve_for::<TtyIdentity>() {
         Ok(reservation) => reservation,
         Err(_) => return V3::Err(Errno::EIO.into()),
     };
-    let slave_id_res = match zone::reserve_for::<TtyIdentity>() {
+    let slave_id_res = match step_engine::reserve_for::<TtyIdentity>() {
         Ok(reservation) => reservation,
         Err(_) => return V3::Err(Errno::EIO.into()),
     };
-    let master_payload_res = match zone::reserve_for::<TtyPayload>() {
+    let master_payload_res = match step_engine::reserve_for::<TtyPayload>() {
         Ok(reservation) => reservation,
         Err(_) => return V3::Err(Errno::EIO.into()),
     };
-    let slave_payload_res = match zone::reserve_for::<TtyPayload>() {
+    let slave_payload_res = match step_engine::reserve_for::<TtyPayload>() {
         Ok(reservation) => reservation,
         Err(_) => return V3::Err(Errno::EIO.into()),
     };
 
-    let master = zone::sign_for(
+    let master = step_engine::sign_for(
         master_id_res,
         TtyIdentity::new(TtyKind::PtyMaster, index, "ptmx"),
     );
     let slave_name = PtsName::new(index);
-    let slave = zone::sign_for(
+    let slave = step_engine::sign_for(
         slave_id_res,
         TtyIdentity::new(TtyKind::PtySlave, index, slave_name.as_str()),
     );
 
-    let master_payload = PayloadCap::from_cap(zone::sign_for(
+    let master_payload = PayloadCap::from_cap(step_engine::sign_for(
         master_payload_res,
         TtyPayload::new_pty_master(slave.clone()),
     ));
-    let slave_payload = PayloadCap::from_cap(zone::sign_for(
+    let slave_payload = PayloadCap::from_cap(step_engine::sign_for(
         slave_payload_res,
         TtyPayload::new_pty(master.clone()),
     ));
@@ -153,15 +154,15 @@ pub struct OpenPtyOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for OpenPtyOp<'a>
 {
     type Output = OpenPtyOutcome;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_openpty(self.guard)
     }
 }
@@ -169,13 +170,15 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepO
 #[cfg(test)]
 mod step_op_wraps {
     use super::*;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+    use crate::tty::adapter::step_engine::{
+        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome as V3,
+    };
 
     use crate::test_support::EPOCH_TEST_LOCK;
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _ = crate::zones::register_all();
         crate::tty::structure::registry::reset_for_tests();
         guard
@@ -184,9 +187,9 @@ mod step_op_wraps {
     #[test]
     fn openpty_op_returns_done_with_pair() {
         let _setup = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = OpenPtyOp { guard: &guard };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {

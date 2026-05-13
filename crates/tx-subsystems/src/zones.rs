@@ -1,8 +1,5 @@
 use tx_hal::{console_write_str, TxPlatform};
-use tx_substrate::{
-    epoch,
-    zone::{self, Zone, ZoneAllocated, ZoneError},
-};
+use crate::adapter::step_engine::{epoch, zone, Zone, ZoneAllocated, ZoneError};
 
 use crate::{
     mount::{MountIdentity, MountNamespace, MountPayload},
@@ -72,9 +69,9 @@ pub fn run_smoke<P: TxPlatform>() -> Result<(), ZoneError> {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KernelZoneSummary {
-    pub epoch: tx_substrate::epoch::EpochSummary,
+    pub epoch: crate::adapter::step_engine::EpochSummary,
     pub zone_count: usize,
-    pub zones: [Option<tx_substrate::zone::ZoneInfo>; 32],
+    pub zones: [Option<crate::adapter::step_engine::ZoneInfo>; 32],
 }
 
 pub(crate) fn summary() -> KernelZoneSummary {
@@ -317,7 +314,7 @@ mod subject_placeholders {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        zone::register_zone_for::<tx_substrate::step_v3::RestrictionStackHandle>()?;
+        zone::register_zone_for::<crate::adapter::step_engine::RestrictionStackHandle>().map(|_| ())?;
         Ok(())
     }
 }

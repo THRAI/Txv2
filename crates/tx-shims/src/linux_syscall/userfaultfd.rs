@@ -34,7 +34,6 @@
 //!   [`UserfaultFd::mark_api_handshake_done`] returning `false`).
 //! - **VM fault path is untouched** (phase 4 territory).
 
-use tx_substrate::step_v3::{DelegateReply, TransitionOutcome, UfdReply};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::userfaultfd::{UfdRange, UserfaultFd};
 use tx_subsystems::vfs::structure::OpenFileFlags;
@@ -45,6 +44,7 @@ use super::numbers::{
     O_CLOEXEC, O_NONBLOCK, UFFDIO_REGISTER_MODE_MINOR, UFFDIO_REGISTER_MODE_MISSING,
     UFFDIO_REGISTER_MODE_WP, UFFDIO_REGISTER_REPLY_IOCTLS, UFFD_API,
 };
+use crate::adapter::step_engine::{self as step_engine, DelegateReply, TransitionOutcome, UfdReply};
 use super::{
     bootstrap_read_user, bootstrap_write_user, errno_to_i32, SyscallCtx, SyscallResult,
     EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
@@ -498,7 +498,7 @@ fn validate_and_match_pending(
     ufd: &UserfaultFd,
     dst: u64,
     len: u64,
-) -> Result<tx_substrate::step_v3::DelegateTokenId, i32> {
+) -> Result<step_engine::DelegateTokenId, i32> {
     if !ufd.api_handshake_done() {
         return Err(EINVAL_VALUE);
     }
@@ -730,7 +730,7 @@ pub(super) async fn step_ufd_read(
             );
             (result, staging)
         };
-        use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
+        use step_engine::{StepOutcome as V3Out, YieldShape};
         match outcome.0 {
             V3Out::Done(read) => {
                 if read == 0 {

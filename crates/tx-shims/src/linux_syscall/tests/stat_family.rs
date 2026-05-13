@@ -3,10 +3,8 @@
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
-use tx_substrate::step_v3::StepOutcome;
-
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
-use tx_substrate::{page_allocator, zone};
+use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, StepOutcome};
 use tx_subsystems::cred::CapabilitySet;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
@@ -90,8 +88,8 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>, Cap<RNode>) {
             RNodeBacking::Directory,
         )
         .with_containing_mount(&payload);
-        let res = zone::reserve_for::<RNode>().expect("rnode reservation");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
     };
 
     let _mount = MountIdentity::new_cap(
@@ -187,7 +185,7 @@ fn dispatch_fstat_on_pagebacked_fd_writes_stat_struct() {
         effective_caps: CapabilitySet::FULL,
     };
     let (file_id, _meta) = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard) {
             StepOutcome::Done(pair) => pair,
             other => panic!("create_inode: {other:?}"),
@@ -303,7 +301,7 @@ fn dispatch_newfstatat_with_valid_path_returns_zero() {
         effective_caps: CapabilitySet::FULL,
     };
     {
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100640, &owner_cred, &guard);
     }
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
@@ -433,7 +431,7 @@ fn dispatch_chdir_to_regular_file_returns_neg_enotdir() {
         effective_caps: CapabilitySet::FULL,
     };
     {
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     }
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
@@ -530,14 +528,14 @@ fn dispatch_getdents64_on_directory_fd_writes_entries() {
         effective_caps: CapabilitySet::FULL,
     };
     let id_a = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"a", 0o100644, &owner_cred, &guard) {
             StepOutcome::Done((id, _)) => id,
             other => panic!("create_inode a: {other:?}"),
         }
     };
     let id_b = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"bb", 0o100644, &owner_cred, &guard) {
             StepOutcome::Done((id, _)) => id,
             other => panic!("create_inode bb: {other:?}"),

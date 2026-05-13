@@ -32,8 +32,8 @@
 use tx_hal::{
     ConsoleIf, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, IRQ_DISPATCH_TABLE_SIZE,
 };
-use tx_substrate::SpinMutex;
 use tx_subsystems::tty::execution::step_ingest;
+use crate::adapter::step_engine::{self as step_engine, SpinMutex, StepOutcome};
 
 /// The single global IRQ dispatch table tx-kernel publishes to the
 /// platform. The platform crate stores a raw `&'static
@@ -226,8 +226,8 @@ pub(crate) fn drain_uart_rx_pending() -> usize {
     let Some(tty) = crate::init::console_tty() else {
         return 0;
     };
-    let guard = tx_substrate::epoch::guard();
-    use tx_substrate::step_v3::StepOutcome as V3Out;
+    let guard = step_engine::guard();
+    use StepOutcome as V3Out;
     match step_ingest(&tty, &bytes[..n], &guard) {
         V3Out::Done(_) => n,
         _ => 0,

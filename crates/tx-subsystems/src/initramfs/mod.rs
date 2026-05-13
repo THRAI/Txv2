@@ -31,8 +31,7 @@ use crate::execution::Errno;
 use crate::mount::MountIdentity;
 use crate::page_backed::{FsPageBacking, MaterializeAccess, PageIndex};
 use crate::vfs::{Credential, FsObjectId, FsOps, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
-use tx_substrate::step_v3::StepOutcome as V3;
-use tx_substrate::zone::Cap;
+use crate::adapter::step_engine::{guard as ebr_guard, page_allocator, Cap, StepOutcome as V3};
 
 #[cfg(test)]
 mod tests;
@@ -385,7 +384,7 @@ fn walk_or_create_dirs(
             continue;
         }
         // Try lookup first; mkdir if missing.
-        let guard = tx_substrate::epoch::guard();
+        let guard = ebr_guard();
         match fs_ops.lookup(current, component, &guard) {
             V3::Done(id) => {
                 current = id;
@@ -418,7 +417,7 @@ fn mkdir_idempotent(
     mode_low: u16,
     cred: &Credential,
 ) -> Result<FsObjectId, UnpackError> {
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     match fs_ops.mkdir(parent, name, mode_low, cred, &guard) {
         V3::Done((id, _)) => Ok(id),
         V3::Err(v3_errno) => {
@@ -455,7 +454,7 @@ fn unpack_regular(
     // Allocate the inode. mode_low carries the rwx bits; we do not
     // re-OR S_IFREG since `Tmpfs::create_inode` does that internally.
     let (file_id, file_meta) = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = ebr_guard();
         match fs_ops.create_inode(parent_id, name, mode_low, cred, &guard) {
             V3::Done(out) => out,
             V3::Err(v3_errno) => {
@@ -479,7 +478,7 @@ fn unpack_regular(
     // `Cap<PageContainer>` so we can populate pages via the same
     // direct-map path `register_init_fixture_into_tmpfs` uses.
     let pc = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = ebr_guard();
         let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
         let rnode = match outcome {
             V3::Done(r) => r,
@@ -516,7 +515,7 @@ fn unpack_regular(
                 op: "materialize_anon",
                 errno: Errno::ENOMEM,
             })?;
-        let frame_base = tx_substrate::page_allocator::frame_kernel_addr(materialised.ppn)
+        let frame_base = page_allocator::frame_kernel_addr(materialised.ppn)
             .map_err(|_| UnpackError::FsOp {
                 op: "frame_kernel_addr",
                 errno: Errno::EFAULT,
@@ -533,7 +532,7 @@ fn unpack_regular(
     // Set the visible byte size.
     let size = data.len() as u64;
     {
-        let guard = tx_substrate::epoch::guard();
+        let guard = ebr_guard();
         match fs_page_backing.truncate(file_id, size, &guard) {
             V3::Done(()) => {}
             V3::Err(v3_errno) => {
@@ -557,7 +556,7 @@ fn unpack_symlink(
     target: &[u8],
     cred: &Credential,
 ) -> Result<(), UnpackError> {
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     match fs_ops.symlink(parent_id, name, target, cred, &guard) {
         V3::Done(_) => Ok(()),
         V3::Err(v3_errno) => {

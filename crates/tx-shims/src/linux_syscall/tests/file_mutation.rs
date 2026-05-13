@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
-use tx_substrate::{page_allocator, zone};
+use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, reserve_for, sign_for, StepOutcome};
 use tx_subsystems::cred::CapabilitySet;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
@@ -66,8 +66,8 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
             RNodeBacking::Directory,
         )
         .with_containing_mount(&payload);
-        let res = zone::reserve_for::<RNode>().expect("rnode reservation");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
     };
 
     let _mount = MountIdentity::new_cap(
@@ -113,9 +113,9 @@ fn root_cred() -> Credential {
 }
 
 fn create_regular(tmpfs: &Arc<Tmpfs>, name: &[u8]) {
-    use tx_substrate::step_v3::StepOutcome;
+    use step_engine::StepOutcome;
     let cred = root_cred();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, name, 0o100644, &cred, &guard) {
         StepOutcome::Done(_) => {}
         other => panic!("create_inode {:?}: {other:?}", name),
@@ -123,9 +123,9 @@ fn create_regular(tmpfs: &Arc<Tmpfs>, name: &[u8]) {
 }
 
 fn make_dir(tmpfs: &Arc<Tmpfs>, name: &[u8]) {
-    use tx_substrate::step_v3::StepOutcome;
+    use step_engine::StepOutcome;
     let cred = root_cred();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, name, 0o755, &cred, &guard) {
         StepOutcome::Done(_) => {}
         other => panic!("mkdir {:?}: {other:?}", name),
@@ -133,9 +133,9 @@ fn make_dir(tmpfs: &Arc<Tmpfs>, name: &[u8]) {
 }
 
 fn make_symlink(tmpfs: &Arc<Tmpfs>, name: &[u8], target: &[u8]) {
-    use tx_substrate::step_v3::StepOutcome;
+    use step_engine::StepOutcome;
     let cred = root_cred();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     match tmpfs.symlink(TMPFS_ROOT_OBJECT_ID, name, target, &cred, &guard) {
         StepOutcome::Done(_) => {}
         other => panic!("symlink {:?}: {other:?}", name),
@@ -143,8 +143,8 @@ fn make_symlink(tmpfs: &Arc<Tmpfs>, name: &[u8], target: &[u8]) {
 }
 
 fn lookup_exists(tmpfs: &Arc<Tmpfs>, name: &[u8]) -> bool {
-    use tx_substrate::step_v3::StepOutcome;
-    let guard = tx_substrate::epoch::guard();
+    use step_engine::StepOutcome;
+    let guard = guard();
     matches!(
         tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, name, &guard),
         StepOutcome::Done(_)

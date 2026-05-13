@@ -36,9 +36,7 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_substrate::epoch;
-use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::zone::Cap;
+use tx_subsystems::userfaultfd::adapter::step_engine::{guard as ebr_guard, Cap, Errno, StepOutcome};
 
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
 use tx_subsystems::userfaultfd::UserfaultFd;
@@ -108,22 +106,10 @@ impl PmapIf for StubPmap {
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
     guard
-}
-
-fn drain_to_quiescence() {
-    let mut quiet = 0u32;
-    while quiet < 2 {
-        let stats = epoch::drain_with_budget(usize::MAX);
-        if stats.reclaimed == 0 {
-            quiet += 1;
-        } else {
-            quiet = 0;
-        }
-    }
 }
 
 fn fresh_aspace() -> Cap<AddressSpace> {
@@ -221,9 +207,9 @@ fn userfaultfd_phase0_fd_scaffold_invariants_round_trip() {
         .expect("occupant was present");
     assert_eq!(closed.ufd().expect("ufd").ufd_id(), id_a);
     drop(closed);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     assert!(
         inner_weak.upgrade(&guard).is_none(),
         "ufd zone slot must be reclaimed after the last OpenFile drops",
@@ -240,13 +226,13 @@ fn userfaultfd_phase0_fd_scaffold_invariants_round_trip() {
     let file_c =
         OpenFile::new_userfaultfd_cap(ufd_c, ufd_open_file_flags()).expect("openfile cap c");
     let mut buf = [0u8; 8];
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let outcome = file_c.step_read(&mut buf, &guard);
     drop(guard);
     match outcome {
-        tx_substrate::step_v3::StepOutcome::Err(tx_substrate::step_v3::Errno::EINVAL) => {}
+        StepOutcome::Err(Errno::EINVAL) => {}
         other => panic!("expected v3 Err(EINVAL), got {other:?}"),
     }
     drop(file_c);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 }

@@ -6,14 +6,15 @@ use crate::vm::{
 };
 use alloc::vec;
 use alloc::vec::Vec;
+use crate::page_backed::adapter::step_engine::{
+    self as step_engine, Errno as V3Errno, StepOutcome as V3Out,
+};
 use tx_hal::UserPtr;
-use tx_substrate::page_allocator;
-use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
 
 fn setup_host_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    tx_test_support::init_host();
+    match step_engine::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for PageBacked user-buffer tests: {error:?}"),
     }
 }
@@ -167,7 +168,7 @@ fn pagebacked_round_trip_through_user_buffer_preserves_bytes_in_one_page() {
         2,
     );
     let fixture = UserBufferFixture::new(0x10_0000, 1);
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
 
     let payload: Vec<u8> = (0u8..200).collect();
     fixture.seed_user_bytes(&payload);
@@ -213,7 +214,7 @@ fn pagebacked_round_trip_through_user_buffer_crosses_page_boundary() {
         2,
     );
     let fixture = UserBufferFixture::new(0x20_0000, 2);
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
 
     let payload: Vec<u8> = (0..(USER_PAGE_SIZE + 23))
         .map(|i| (i & 0xff) as u8)
@@ -263,7 +264,7 @@ fn pagebacked_step_read_to_user_efault_propagates_when_user_va_unmapped() {
     let payload: Vec<u8> = (0u8..32).collect();
     let writer_fixture = UserBufferFixture::new(0x30_0000, 1);
     let empty_aspace = AddressSpace::new();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     writer_fixture.seed_user_bytes(&payload);
     let writer = open_file_for_pc(&pc);
     assert_eq!(
@@ -300,7 +301,7 @@ fn pagebacked_truncate_shrink_then_grow_reads_zeros_for_post_eof_region() {
         2,
     );
     let fixture = UserBufferFixture::new(0x50_0000, 2);
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
 
     let pattern: Vec<u8> = (0..(USER_PAGE_SIZE + 32))
         .map(|i| ((i & 0xff) | 0x20) as u8)
@@ -359,7 +360,7 @@ fn pagebacked_step_write_from_user_propagates_efault_without_advance() {
     );
     // No recipe in this aspace → user VA dereference yields EFAULT.
     let empty_aspace = AddressSpace::new();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let dangling = UserPtr::<u8>::new(0x60_0000);
     let writer = open_file_for_pc(&pc);
     let outcome = step_write_from_user(&pc, &writer, &empty_aspace, dangling, 8, &guard);
@@ -380,7 +381,7 @@ mod step_op_wraps {
     //! live in the free-fn suite.
     use super::*;
     use crate::page_backed::{ReadToUserOp, WriteFromUserOp};
-    use tx_substrate::step_v3::{ScriptCtx, StepOp};
+    use step_engine::{PlaceholderProcessSubject, ScriptCtx, StepOp};
 
     #[test]
     fn write_from_user_op_round_trip_one_page() {
@@ -395,7 +396,7 @@ mod step_op_wraps {
             2,
         );
         let fixture = UserBufferFixture::new(0x70_0000, 1);
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
 
         let payload: Vec<u8> = (0u8..200).collect();
         fixture.seed_user_bytes(&payload);
@@ -408,7 +409,7 @@ mod step_op_wraps {
             len: payload.len(),
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(payload.len()));
         assert_eq!(writer.offset(), payload.len() as u64);
         assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
@@ -427,7 +428,7 @@ mod step_op_wraps {
             2,
         );
         let fixture = UserBufferFixture::new(0x80_0000, 1);
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
 
         let payload: Vec<u8> = (0u8..96).collect();
         fixture.seed_user_bytes(&payload);
@@ -457,7 +458,7 @@ mod step_op_wraps {
             len: payload.len(),
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(payload.len()));
         assert_eq!(reader.offset(), payload.len() as u64);
         assert_eq!(fixture.read_user_bytes(payload.len()), payload);
@@ -476,7 +477,7 @@ mod step_op_wraps {
             1,
         );
         let fixture = UserBufferFixture::new(0x90_0000, 1);
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let reader = open_file_for_pc(&pc);
         let mut op = ReadToUserOp {
             pc: &pc,
@@ -486,7 +487,7 @@ mod step_op_wraps {
             len: 0,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(0));
         assert_eq!(reader.offset(), 0);
     }
@@ -504,7 +505,7 @@ mod step_op_wraps {
             1,
         );
         let empty_aspace = AddressSpace::new();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let dangling = UserPtr::<u8>::new(0xA0_0000);
         let writer = open_file_for_pc(&pc);
         let mut op = WriteFromUserOp {
@@ -515,7 +516,7 @@ mod step_op_wraps {
             len: 8,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Err(V3Errno::EFAULT));
         assert_eq!(writer.offset(), 0);
     }

@@ -4,8 +4,10 @@
 use core::sync::atomic::Ordering;
 
 use tx_hal::UserTrapContext;
-use tx_substrate::wake::{MailboxEvent, SignalRouting};
-use tx_substrate::zone::{Cap, OperationalCapExt, PayloadCap};
+
+use crate::thread_runtime::adapter::step_engine::{
+    Cap, MailboxEvent, OperationalCapExt, PayloadCap, SignalRouting,
+};
 
 use crate::signal::{SignalMask, Signum};
 use crate::thread_runtime::structure::{
@@ -82,7 +84,7 @@ pub fn mark_thread_zombie_for_test(thread: &Cap<ThreadIdentity>, status: i32) {
 pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     set_thread_zombie(&thread, status);
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = crate::thread_runtime::adapter::step_engine::guard();
     let Some(parent) = thread.owner_proc.upgrade(&guard) else {
         return;
     };
@@ -282,15 +284,15 @@ pub struct ThreadExitOp {
     pub status: i32,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for ThreadExitOp {
+impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity> crate::thread_runtime::adapter::step_engine::StepOp<I> for ThreadExitOp {
     type Output = ();
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = crate::thread_runtime::adapter::step_engine::NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut crate::thread_runtime::adapter::step_engine::ScriptCtx<I>,
+    ) -> crate::thread_runtime::adapter::step_engine::StepOutcome<Self::Output, Self::Progress> {
         step_thread_exit(self.thread.clone(), self.status);
-        tx_substrate::step_v3::StepOutcome::Done(())
+        crate::thread_runtime::adapter::step_engine::StepOutcome::Done(())
     }
 }
 
@@ -301,14 +303,14 @@ pub struct SigprocmaskOp {
     pub next: SignalMask,
 }
 
-impl<I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I> for SigprocmaskOp {
+impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity> crate::thread_runtime::adapter::step_engine::StepOp<I> for SigprocmaskOp {
     type Output = SigprocmaskChange;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = crate::thread_runtime::adapter::step_engine::NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_sigprocmask(
+        _ctx: &mut crate::thread_runtime::adapter::step_engine::ScriptCtx<I>,
+    ) -> crate::thread_runtime::adapter::step_engine::StepOutcome<Self::Output, Self::Progress> {
+        crate::thread_runtime::adapter::step_engine::StepOutcome::Done(step_sigprocmask(
             &self.thread,
             self.how,
             self.next,
@@ -333,16 +335,13 @@ mod step_op_wraps {
     use crate::thread_runtime::structure::reset_tid_counter_for_test;
     use crate::vm::{AddressSpace, TestPmap};
     use crate::zones;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome};
-    use tx_substrate::testing::init_host_for_test_once;
-    use tx_substrate::zone::Cap;
+    use crate::thread_runtime::adapter::step_engine::{Cap, ScriptCtx, StepOp, StepOutcome};
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        init_host_for_test_once();
+        tx_test_support::init_host();
         let _ = zones::register_all();
-        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        tx_test_support::drain_to_quiescence();
         reset_pid_counter_for_test();
         reset_tid_counter_for_test();
         crate::process::execution::reset_init_process_for_test();
@@ -372,7 +371,7 @@ mod step_op_wraps {
             thread: leader.clone(),
             status: 7,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<crate::thread_runtime::adapter::step_engine::PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         assert_eq!(outcome, StepOutcome::Done(()));
         assert!(leader.is_zombie());
@@ -391,7 +390,7 @@ mod step_op_wraps {
             how: SigmaskHow::SetMask,
             next,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<crate::thread_runtime::adapter::step_engine::PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(SigprocmaskChange::Replaced { prev, new }) => {

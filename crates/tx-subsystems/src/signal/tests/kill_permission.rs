@@ -5,7 +5,7 @@ use crate::cred::{signal_permitted, Capability, CapabilitySet, Cred, Gid, Uid};
 use crate::execution::Errno;
 use crate::process::structure::{ProcessIdentity, TargetProcCred};
 use crate::signal::{script_kill_pgrp, script_kill_probe, script_kill_process, KillScriptOutcome};
-use tx_substrate::zone::Cap;
+use crate::signal::adapter::step_engine::Cap;
 
 fn set_cred(proc_cap: &Cap<ProcessIdentity>, cred: Cred) {
     // PR-9 phase 5 (D5 Path A): `cred` lives in `AtomicSlot<Cap<Cred>>`.
@@ -114,10 +114,9 @@ fn sigcont_different_session_still_requires_cred_match() {
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
     reset_pid_counter_for_test();
     reset_tid_counter_for_test();
     reset_init_process_for_test();

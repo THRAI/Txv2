@@ -38,10 +38,9 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use tx_substrate::epoch;
-use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
-use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::zone;
+use tx_subsystems::page_backed::adapter::step_engine::{
+    self as zone, guard as ebr_guard, page_allocator, Errno as V3Errno, StepOutcome as V3Out,
+};
 
 use tx_subsystems::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
 use tx_subsystems::vfs::structure::{
@@ -51,20 +50,20 @@ use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::zones;
 
 fn setup_substrate() {
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    match page_allocator::claim_zero_frame() {
+        Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame: {error:?}"),
     }
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 }
 
 fn make_page_backed_open_file(
     page_count: u64,
     read: bool,
     write: bool,
-) -> tx_substrate::zone::Cap<OpenFile> {
+) -> zone::Cap<OpenFile> {
     let pc = PageContainer::new_cap(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -105,7 +104,7 @@ fn openfile_step_read_page_backed_round_trips() {
     {
         let file = make_page_backed_open_file(/* page_count */ 1, true, true);
         let mut buf = vec![0xAA_u8; 32];
-        let guard = epoch::guard();
+        let guard = ebr_guard();
         match file.step_read(&mut buf, &guard) {
             V3Out::Done(n) => {
                 assert_eq!(n, 32, "fresh 1-page file: step_read returns 32 bytes");
@@ -124,7 +123,7 @@ fn openfile_step_read_page_backed_round_trips() {
     {
         let file = make_page_backed_open_file(1, true, true);
         let pattern: Vec<u8> = (0u8..64).collect();
-        let guard = epoch::guard();
+        let guard = ebr_guard();
         match file.step_write(&pattern, &guard) {
             V3Out::Done(n) => assert_eq!(n, 64, "step_write returns 64 bytes"),
             other => panic!("step_write: unexpected {other:?}"),
@@ -147,7 +146,7 @@ fn openfile_step_read_page_backed_round_trips() {
         // Seek past the visible size — read returns Done(0).
         file.set_offset(8192); // > page_count * USER_PAGE_SIZE = 4096
         let mut buf = vec![0xCC_u8; 16];
-        let guard = epoch::guard();
+        let guard = ebr_guard();
         match file.step_read(&mut buf, &guard) {
             V3Out::Done(n) => assert_eq!(n, 0, "read past EOF returns 0"),
             other => panic!("read past EOF: unexpected {other:?}"),
@@ -173,7 +172,7 @@ fn openfile_step_read_page_backed_round_trips() {
     {
         let file = make_page_backed_open_file(1, /* read */ false, /* write */ true);
         let mut buf = vec![0u8; 16];
-        let guard = epoch::guard();
+        let guard = ebr_guard();
         match file.step_read(&mut buf, &guard) {
             V3Out::Err(V3Errno::EINVAL) => {}
             other => panic!("read with read=false: expected Err(EINVAL), got {other:?}"),
@@ -184,7 +183,7 @@ fn openfile_step_read_page_backed_round_trips() {
     {
         let file = make_page_backed_open_file(1, /* read */ true, /* write */ false);
         let buf = [0u8; 16];
-        let guard = epoch::guard();
+        let guard = ebr_guard();
         match file.step_write(&buf, &guard) {
             V3Out::Err(V3Errno::EINVAL) => {}
             other => panic!("write with write=false: expected Err(EINVAL), got {other:?}"),
@@ -192,5 +191,5 @@ fn openfile_step_read_page_backed_round_trips() {
     }
 
     // Final housekeeping.
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 }

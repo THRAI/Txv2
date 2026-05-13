@@ -6,6 +6,8 @@
 // brings the crate into the namespace they share.
 #[cfg_attr(not(test), allow(unused_extern_crates))]
 extern crate alloc;
+pub mod adapter;
+use crate::adapter::step_engine::ScriptCtx;
 #[cfg(test)]
 extern crate std;
 
@@ -29,20 +31,20 @@ pub mod posix_signal {}
 /// the 7 canonical syscalls (sys_open, sys_read, sys_write, sys_fork,
 /// sys_execve, sys_close, sys_pipe).
 pub type KernelScriptCtx =
-    tx_substrate::step_v3::ScriptCtx<tx_subsystems::process::ProcessIdentity>;
+    ScriptCtx<tx_subsystems::process::ProcessIdentity>;
 
 /// Production `SubjectContext` alias parallel to [`KernelScriptCtx`].
 pub type KernelSubjectContext =
-    tx_substrate::step_v3::SubjectContext<tx_subsystems::process::ProcessIdentity>;
+    crate::adapter::step_engine::SubjectContext<tx_subsystems::process::ProcessIdentity>;
 
 /// Production `SubjectAuthority` alias parallel to [`KernelScriptCtx`].
 pub type KernelSubjectAuthority =
-    tx_substrate::step_v3::SubjectAuthority<tx_subsystems::process::ProcessIdentity>;
+    crate::adapter::step_engine::SubjectAuthority<tx_subsystems::process::ProcessIdentity>;
 
 #[cfg(test)]
 mod kernel_script_ctx_tests {
     use super::{KernelScriptCtx, KernelSubjectAuthority, KernelSubjectContext};
-    use tx_substrate::step_v3::{StepOp, StepOutcome};
+    use crate::adapter::step_engine::{StepOp, StepOutcome};
 
     /// Compile-only smoke: production aliases resolve and `KernelScriptCtx`
     /// is constructible.
@@ -55,7 +57,7 @@ mod kernel_script_ctx_tests {
     /// for FooOp` can be driven against `&mut KernelScriptCtx`.
     #[test]
     fn polymorphic_step_op_works_with_kernel_script_ctx() {
-        use tx_substrate::step_v3::{NoProgress, ScriptCtx, SubjectIdentity};
+        use crate::adapter::step_engine::{NoProgress, ScriptCtx, SubjectIdentity};
 
         struct PolyOp;
         impl<I: SubjectIdentity> StepOp<I> for PolyOp {
@@ -100,7 +102,7 @@ mod kernel_script_ctx_tests {
     /// changes.
     #[test]
     fn polymorphic_op_reads_subject_from_script_ctx() {
-        use tx_substrate::step_v3::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+        use crate::adapter::step_engine::{NoProgress, PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
         // Op semantics: returns Done(true) if a subject is populated,
         // Done(false) otherwise. Real production ops would read
@@ -122,7 +124,7 @@ mod kernel_script_ctx_tests {
         // Same op against placeholder ScriptCtx<ProcessIdentity> →
         // Done(false). Confirms the op is polymorphic across I.
         let mut placeholder_ctx =
-            tx_substrate::step_v3::ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+            ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut placeholder_ctx), StepOutcome::Done(false));
     }
 }

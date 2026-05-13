@@ -1,11 +1,12 @@
 //! Hardware TTY registration helpers.
 
-use tx_substrate::zone::{self, Cap, PayloadCap};
+use crate::tty::adapter::step_engine::{self as step_engine, Cap, PayloadCap};
 
 use crate::device::CharDeviceBinding;
 use crate::execution::{Errno, Guard};
 use crate::tty::structure::registry;
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
+use crate::tty::adapter::step_engine::{NoProgress, StepOutcome};
 
 /// Create a hardware-backed TTY identity/payload and publish it to the tty
 /// registry. devfs aliases can then materialize RNodes pointing at it.
@@ -14,22 +15,22 @@ pub fn register_hardware(
     index: u32,
     binding: &'static CharDeviceBinding,
     _guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<Cap<TtyIdentity>, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3Out;
-    let id_res = match zone::reserve_for::<TtyIdentity>() {
+) -> StepOutcome<Cap<TtyIdentity>, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3Out;
+    let id_res = match step_engine::reserve_for::<TtyIdentity>() {
         Ok(reservation) => reservation,
         Err(_) => return V3Out::err(Errno::EIO.into()),
     };
-    let payload_res = match zone::reserve_for::<TtyPayload>() {
+    let payload_res = match step_engine::reserve_for::<TtyPayload>() {
         Ok(reservation) => reservation,
         Err(_) => return V3Out::err(Errno::EIO.into()),
     };
 
-    let tty = zone::sign_for(
+    let tty = step_engine::sign_for(
         id_res,
         TtyIdentity::new(TtyKind::SerialHardware, index, name),
     );
-    let payload = PayloadCap::from_cap(zone::sign_for(
+    let payload = PayloadCap::from_cap(step_engine::sign_for(
         payload_res,
         TtyPayload::new_hardware(binding),
     ));
@@ -48,8 +49,8 @@ pub fn register_hardware(
 pub fn register_console_alias(
     name: &str,
     tty: Cap<TtyIdentity>,
-) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3Out;
+) -> StepOutcome<(), NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3Out;
     if registry::register_devfs_alias(name, tty).is_err() {
         return V3Out::err(Errno::EIO.into());
     }

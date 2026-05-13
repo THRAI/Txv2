@@ -15,7 +15,7 @@
 //! - txdoc:TXV3-STEP-MODEL-V2 (entire algebra)
 //! - txdoc:STEP-V2-PROGRESS-TYPED-1 (StepProgress is a monoid; scatter/gather variant)
 
-use tx_substrate::step_v3::{IoVecProgress, StepProgress};
+use tx_substrate::step::{IoVecProgress, StepProgress};
 
 // -- Empty + constructors -----------------------------------------------------
 
@@ -181,6 +181,6 @@ fn iovec_progress_extend_associative_across_iovec_advance() {
 
 #[test]
 fn iovec_progress_satisfies_step_progress_bound() {
-    fn _bound<P: tx_substrate::step_v3::StepProgress>() {}
+    fn _bound<P: tx_substrate::step::StepProgress>() {}
     _bound::<IoVecProgress>();
 }

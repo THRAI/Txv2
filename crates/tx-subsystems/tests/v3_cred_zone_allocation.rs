@@ -41,9 +41,7 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_substrate::epoch;
-use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::zone::Cap;
+use tx_subsystems::cred::adapter::step_engine::Cap;
 
 use tx_subsystems::cred::{step_setuid, CredChange, Uid};
 use tx_subsystems::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
@@ -117,10 +115,9 @@ fn fresh_aspace() -> Cap<AddressSpace> {
 /// every cred-cap invariant from there.
 #[test]
 fn cred_zone_allocation_invariants_round_trip() {
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 
     let init = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
 
@@ -180,6 +177,5 @@ fn cred_zone_allocation_invariants_round_trip() {
     drop(pre_cap);
     drop(post_cap);
     drop(child_cap);
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 }

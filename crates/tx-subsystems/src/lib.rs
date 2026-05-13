@@ -4,6 +4,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod adapter;
 pub mod aio;
 pub mod cred;
 pub mod device;
@@ -108,7 +109,7 @@ pub mod cross_crate_test_support {
     /// This helper closes that gap for unit tests; production callers
     /// drop capabilities through file-cap / `prctl` slices that the
     /// DAC + setuid slice does not ship.
-    pub fn clear_caps_for_test(process: &tx_substrate::zone::Cap<crate::process::ProcessIdentity>) {
+    pub fn clear_caps_for_test(process: &crate::adapter::step_engine::Cap<crate::process::ProcessIdentity>) {
         crate::cred::clear_caps_for_test(process);
     }
 
@@ -121,7 +122,7 @@ pub mod cross_crate_test_support {
     /// to assemble. Used by tx-shims' DAC + setuid Wave 4 tests for
     /// the `CAP_DAC_OVERRIDE`-only access checks.
     pub fn install_caps_for_test(
-        process: &tx_substrate::zone::Cap<crate::process::ProcessIdentity>,
+        process: &crate::adapter::step_engine::Cap<crate::process::ProcessIdentity>,
         caps: crate::cred::CapabilitySet,
     ) {
         crate::cred::install_caps_for_test(process, caps);
@@ -137,7 +138,7 @@ pub mod cross_crate_test_support {
     /// target state in one shot from `bootstrap_init_process`'s root
     /// starting point.
     pub fn set_cred_ids_for_test(
-        process: &tx_substrate::zone::Cap<crate::process::ProcessIdentity>,
+        process: &crate::adapter::step_engine::Cap<crate::process::ProcessIdentity>,
         uid: u32,
         euid: u32,
         suid: u32,

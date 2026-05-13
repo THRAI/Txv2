@@ -16,6 +16,7 @@
 // CoreInit<P>` block in this file augments the one in `init.rs`.
 
 use super::*;
+use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
@@ -127,12 +128,12 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Boot-time tmpfs ops are synchronous, so Continue/Yield are
         // unreachable and panic if they fire.
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use StepOutcome as V3;
 
         // 1. Create or look up `/bin` directory. Use `mkdir`; on
         //    EEXIST treat the existing dir as the parent.
         let bin_object_id = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.mkdir(root_object_id, b"bin", 0o040755, &cred, &guard);
             match outcome {
                 V3::Done((id, _)) => id,
@@ -149,7 +150,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // 2. Allocate the `/bin/sh` inode.
         let bytes = busybox_fixture::BUSYBOX_BYTES;
         let (file_id, file_meta) = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.create_inode(bin_object_id, b"sh", 0o100755, &cred, &guard);
             match outcome {
                 V3::Done(out) => out,
@@ -160,7 +161,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // 3. Materialise the inode's RNode and grab its
         //    `Cap<PageContainer>`.
         let pc = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
             let rnode = match outcome {
                 V3::Done(rnode) => rnode,
@@ -187,7 +188,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     tx_subsystems::page_backed::MaterializeAccess::Write,
                 )
                 .expect("register_busybox_into_tmpfs: materialize_anon");
-            let frame_base = tx_substrate::page_allocator::frame_kernel_addr(materialised.ppn)
+            let frame_base = page_allocator::frame_kernel_addr(materialised.ppn)
                 .expect("register_busybox_into_tmpfs: direct-map view");
             // SAFETY: `materialised.map_pin` keeps the page resident
             // for this scope; destination region covers exactly
@@ -201,7 +202,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // 5. Set the visible size via FsPageBacking::truncate.
         let size = bytes.len() as u64;
         {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             match fs_page_backing.truncate(file_id, size, &guard) {
                 V3::Done(()) => {}
                 other => panic!("register_busybox_into_tmpfs: truncate({size}): {other:?}"),
@@ -246,12 +247,12 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Boot-time tmpfs ops are synchronous, so Continue/Yield are
         // unreachable and panic if they fire.
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use StepOutcome as V3;
 
         // Allocate the inode. Bootstrap process is root by construction.
         let cred = Credential::root();
         let (file_id, file_meta) = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.create_inode(root_object_id, b"init", 0o100755, &cred, &guard);
             match outcome {
                 V3::Done(out) => out,
@@ -263,7 +264,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // `Cap<PageContainer>`. Tmpfs's Phase-7 override returns
         // `RNodeBacking::PageBacked { pc }` for regular files.
         let pc = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
             let rnode = match outcome {
                 V3::Done(rnode) => rnode,
@@ -290,7 +291,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     tx_subsystems::page_backed::MaterializeAccess::Write,
                 )
                 .expect("register_init_fixture_into_tmpfs: materialize_anon");
-            let frame_base = tx_substrate::page_allocator::frame_kernel_addr(materialised.ppn)
+            let frame_base = page_allocator::frame_kernel_addr(materialised.ppn)
                 .expect("register_init_fixture_into_tmpfs: direct-map view");
             // SAFETY: `materialised.map_pin` keeps the page resident
             // for the duration of this scope; the destination region
@@ -308,7 +309,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // reports the right `meta.size`).
         let size = bytes.len() as u64;
         {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             match fs_page_backing.truncate(file_id, size, &guard) {
                 V3::Done(()) => {}
                 other => panic!("register_init_fixture_into_tmpfs: truncate({size}): {other:?}"),
@@ -390,18 +391,6 @@ impl<P: TxPlatform> CoreInit<P> {
                     Self::write_board_sentinel_prefix();
                     tx_hal::console_write_str::<P>(":bootstrap-exec:sdcard:fail:");
                     tx_hal::console_write_str::<P>(exec_error_tag(e));
-                    if matches!(e, tx_scripts::process::exec::ExecError::NotExecutable) {
-                        tx_hal::console_write_str::<P>(":site=");
-                        tx_hal::console_write_str::<P>(
-                            tx_scripts::process::exec::script::last_notexec_site_label(),
-                        );
-                        tx_hal::console_write_str::<P>(":file_size=");
-                        Self::write_decimal_unsigned(
-                            tx_scripts::process::exec::script::LAST_EXEC_FILE_SIZE
-                                .load(core::sync::atomic::Ordering::Relaxed)
-                                as usize,
-                        );
-                    }
                     tx_hal::console_write_str::<P>("\n");
                     // Fall through to the cmdline-driven path below.
                 }
@@ -449,24 +438,6 @@ impl<P: TxPlatform> CoreInit<P> {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":bootstrap-exec:fallback:");
                 tx_hal::console_write_str::<P>(exec_error_tag(e));
-                // DIAGNOSTIC (temp, 2026-05-12): when the tag is
-                // `not-executable` the kernel's exec_script records a
-                // finer-grained site label in
-                // `tx_scripts::process::exec::LAST_NOTEXEC_SITE`. Emit
-                // that on the same line so the busybox loader gap can
-                // be triaged from the boot log alone.
-                if matches!(e, tx_scripts::process::exec::ExecError::NotExecutable) {
-                    tx_hal::console_write_str::<P>(":site=");
-                    tx_hal::console_write_str::<P>(
-                        tx_scripts::process::exec::script::last_notexec_site_label(),
-                    );
-                    tx_hal::console_write_str::<P>(":file_size=");
-                    Self::write_decimal_unsigned(
-                        tx_scripts::process::exec::script::LAST_EXEC_FILE_SIZE
-                            .load(core::sync::atomic::Ordering::Relaxed)
-                            as usize,
-                    );
-                }
                 tx_hal::console_write_str::<P>("\n");
             }
             Err(e) => {
@@ -566,7 +537,7 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         }
         let Some(tty) = console_tty() else { return };
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
     }
 
@@ -650,54 +621,7 @@ impl<P: TxPlatform> CoreInit<P> {
             // rounds to fully propagate; iteration cadence (driven by
             // task polls + 5 ms timer ticks) finishes that in well
             // under a millisecond.
-            let drain_stats = tx_substrate::epoch::drain_with_budget(64);
-
-            // DIAGNOSTIC: dump counters every Nth loop iteration so we
-            // see flow even when busybox spins on a userspace-side
-            // loop or fast-yielding syscall chain.
-            {
-                use core::sync::atomic::{AtomicUsize, Ordering};
-                static ITER_SINCE_DUMP: AtomicUsize = AtomicUsize::new(0);
-                const DUMP_ITER_PERIOD: usize = 500;
-                if ITER_SINCE_DUMP.fetch_add(1, Ordering::Relaxed) + 1 >= DUMP_ITER_PERIOD {
-                    ITER_SINCE_DUMP.store(0, Ordering::Relaxed);
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":iter_tick:read=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS.load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":ppoll=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS.load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":clone=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_CLONE_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":execve=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_EXECVE_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":wait4=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_WAIT4_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":clone_flags=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_CLONE_LAST_FLAGS.load(Ordering::Relaxed)
-                            as usize,
-                    );
-                    tx_hal::console_write_str::<P>(":clone_reject=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_CLONE_LAST_REJECT_FLAGS
-                            .load(Ordering::Relaxed) as usize,
-                    );
-                    tx_hal::console_write_str::<P>("\n");
-                }
-            }
+            let drain_stats = step_engine::drain_with_budget(64);
 
             // Don't enter WFI if EBR reclaimed anything (reclaim callbacks
             // may have called wake_by_ref() on parked tasks, which is
@@ -706,9 +630,23 @@ impl<P: TxPlatform> CoreInit<P> {
             // advances before they can be reclaimed).
             let ebr_active = drain_stats.reclaimed > 0 || drain_stats.remaining > 0;
             if step.should_idle() && !ebr_active && !init.is_zombie() {
-                if Self::should_wait_for_interrupt(step.next_deadline_ns) {
-                    P::wait_for_interrupt_once();
+                // When the reactor has no pending deadline, the platform
+                // timer was cancelled by `program_hart_loop_deadline`.
+                // Re-arm it here so WFI wakes periodically — the drain
+                // calls below need to fire on every tick. This must only
+                // happen in the userspace reactor loop (not in boot smoke
+                // tests) because the timer interrupt fires
+                // `try_bounded_maintenance_tick`, which acquires zone
+                // locks that boot-time code may already hold.
+                if matches!(
+                    step.deadline_action,
+                    boot_runtime::hart_loop::HartLoopDeadlineAction::Cancel
+                ) {
+                    P::set_deadline_ns(
+                        P::read_ns().saturating_add(crate::init::IDLE_TIMER_PERIOD_NS),
+                    );
                 }
+                P::wait_for_interrupt_once();
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
                 }
@@ -724,47 +662,15 @@ impl<P: TxPlatform> CoreInit<P> {
                 // PLIC path is active since `read_bytes` returns 0 once the
                 // FIFO has already been drained by the IRQ handler.
                 Self::drain_sbi_console_into_tty();
-                // DIAGNOSTIC (temp, 2026-05-12): periodically dump
-                // the syscall counters so we can see what shape
-                // userspace is in even when no userspace exit
-                // sentinel fires (busybox hanging on an unimplemented
-                // syscall, for example).
-                use core::sync::atomic::{AtomicUsize, Ordering};
-                static IDLE_WAKES_SINCE_DUMP: AtomicUsize = AtomicUsize::new(0);
-                const DUMP_PERIOD: usize = 50;
-                if IDLE_WAKES_SINCE_DUMP.fetch_add(1, Ordering::Relaxed) + 1 >= DUMP_PERIOD {
-                    IDLE_WAKES_SINCE_DUMP.store(0, Ordering::Relaxed);
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":syscall_tick:read=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS.load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":ppoll=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS.load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":ioctl=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::fs_basic::SYS_IOCTL_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":clone=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_CLONE_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":execve=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_EXECVE_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>(":wait4=");
-                    Self::write_decimal_unsigned(
-                        tx_shims::linux_syscall::proc::SYS_WAIT4_INVOCATIONS
-                            .load(Ordering::Relaxed),
-                    );
-                    tx_hal::console_write_str::<P>("\n");
-                }
+                // Flush deferred EBR drops so pipe write-end close
+                // propagates to blocked readers. OpenFile::drop() (which
+                // calls decr_writer → EOF signal) fires only when EBR
+                // reclaims the slot; without an explicit drain here the
+                // reactor never calls drain_with_budget unless the retired
+                // queue hits RETIRE_THRESHOLD=64, which a simple pipeline
+                // never reaches. This ensures EOF propagates within a
+                // few timer ticks (~20 ms) after the last writer closes.
+                let _ = step_engine::drain_with_budget(usize::MAX);
             }
         }
 
@@ -776,172 +682,6 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:exited:");
         Self::write_signed_decimal(status_word);
-        tx_hal::console_write_str::<P>("\n");
-
-        // DIAGNOSTIC (temp, 2026-05-12): dump sys_read counters so we
-        // can see what shape the post-prompt EOF takes.
-        use core::sync::atomic::Ordering;
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":sys_read:invocations=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_READ_INVOCATIONS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":done_zero=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_READ_DONE_ZERO.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":done_nonzero=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_READ_DONE_NONZERO.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":yields=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_READ_YIELDS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":wait_none=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_READ_WAIT_NONE.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":err=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_READ_ERR.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":last_errno=");
-        Self::write_signed_decimal(
-            tx_shims::linux_syscall::io::SYS_READ_LAST_ERRNO.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>("\n");
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":step_read:eof_pending=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_EOF_PENDING.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":vmin_none=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_VMIN_NONE.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":vmin_zero=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_VMIN_ZERO_EMPTY.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":vmin_nonzero=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_VMIN_NONZERO.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":threshold_unmet=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_THRESHOLD_UNMET.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":drained=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_DRAINED.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":yield_noncanon_empty=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_YIELD_NONCANON_EMPTY.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":fgpgrp_err=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_FGPGRP_ERR.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":lflag=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_LAST_LFLAG.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":vmin=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_LAST_VMIN.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":vtime=");
-        Self::write_decimal_unsigned(
-            tx_subsystems::tty::execution::STEP_READ_LAST_VTIME.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>("\n");
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":sys_ioctl:invocations=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_INVOCATIONS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":last_request=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_LAST_REQUEST.load(Ordering::Relaxed)
-                as usize,
-        );
-        tx_hal::console_write_str::<P>(":tcsets_calls=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_TCSETS_CALLS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":tcgets_calls=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::SYS_IOCTL_TCGETS_CALLS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":first_tcgets_lflag=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::FIRST_TCGETS_LFLAG.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":first_tcgets_vmin=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::FIRST_TCGETS_VMIN.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":last_tcsets_lflag=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::LAST_TCSETS_LFLAG.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":last_tcsets_vmin=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::LAST_TCSETS_VMIN.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":last_tcsets_vtime=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::LAST_TCSETS_VTIME.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":first_tcsets_lflag=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::FIRST_TCSETS_LFLAG.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":first_tcsets_vmin=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::fs_basic::FIRST_TCSETS_VMIN.load(Ordering::Relaxed) as usize,
-        );
-        tx_hal::console_write_str::<P>(":ppoll_invocations=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_PPOLL_INVOCATIONS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":ppoll_last_nfds=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_PPOLL_LAST_NFDS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":ppoll_last_timeout_ptr=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::io::SYS_PPOLL_LAST_TIMEOUT_PTR.load(Ordering::Relaxed)
-                as usize,
-        );
-        tx_hal::console_write_str::<P>("\n");
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":sys_proc:execve=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::proc::SYS_EXECVE_INVOCATIONS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":clone=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::proc::SYS_CLONE_INVOCATIONS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":wait4=");
-        Self::write_decimal_unsigned(
-            tx_shims::linux_syscall::proc::SYS_WAIT4_INVOCATIONS.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":shebang=");
-        Self::write_decimal_unsigned(
-            tx_scripts::process::exec::script::EXEC_SHEBANG_FIRED.load(Ordering::Relaxed),
-        );
-        tx_hal::console_write_str::<P>(":open-errno=");
-        Self::write_decimal_unsigned(
-            tx_scripts::process::exec::script::EXEC_LAST_OPEN_ERRNO.load(Ordering::Relaxed)
-                as usize,
-        );
         tx_hal::console_write_str::<P>("\n");
     }
 

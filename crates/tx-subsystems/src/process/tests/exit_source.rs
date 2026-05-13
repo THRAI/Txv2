@@ -30,7 +30,7 @@ fn process_payload_exit_source_default_constructed_and_registered() {
 
 #[test]
 fn post_sigchld_to_parent_fires_exit_source() {
-    use tx_reactor::wait::Mask;
+    use crate::process::adapter::wait_routing::Mask;
     let _g = setup();
     let parent = bootstrap();
     let child = step_fork::<TestPmap>(&parent).expect("fork");
@@ -107,7 +107,7 @@ fn zombie_process_exit_source_id_is_none() {
     assert!(init.exit_source_wait_token().is_none());
     // fire_exit_source on a zombie is a no-op (returns 0).
     assert_eq!(
-        init.fire_exit_source(tx_reactor::wait::Mask::from_bits(
+        init.fire_exit_source(crate::process::adapter::wait_routing::Mask::from_bits(
             EXIT_SOURCE_CHILD_ZOMBIFIED
         )),
         0,

@@ -15,7 +15,7 @@
 //! See also `docs/Txv3/02_INVARIANTS_v5.md` DELEGATE-2 (endpoint kind
 //! is type-discriminated; kills covert channels).
 
-use tx_substrate::step_v3::EndpointKind;
+use tx_substrate::step::EndpointKind;
 
 // -- closed catalog smoke ----------------------------------------------------
 

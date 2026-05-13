@@ -56,10 +56,12 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
-use tx_substrate::epoch;
-use tx_substrate::step_v3::{InterestMask, StepOutcome, WaitSourceId, YieldShape};
-use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::wake::{MailboxEvent, TaskMailbox};
+use tx_subsystems::futex::adapter::step_engine::{
+    guard as ebr_guard, InterestMask, StepOutcome, WaitSourceId, YieldShape,
+};
+use tx_subsystems::futex::adapter::wait_routing::{
+    MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+};
 
 use tx_subsystems::futex::{
     bucket_index, bucket_wait_source, bucket_wait_source_for_source_id, step_futex_wait,
@@ -72,7 +74,7 @@ static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
     guard
 }
@@ -81,12 +83,12 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
 /// the mailbox's freshly-claimed generation. Returns the registration
 /// guard (auto-deregisters on drop) and the captured generation.
 fn register<'a>(
-    source: &'a Arc<tx_substrate::wake::WaitSource>,
+    source: &'a Arc<WaitSource>,
     mailbox: &Arc<TaskMailbox>,
     interests: u64,
 ) -> (
-    tx_substrate::wake::WaitRegistrationGuard<'a>,
-    tx_substrate::wake::WaitGeneration,
+    WaitRegistrationGuard<'a>,
+    WaitGeneration,
 ) {
     let gen = mailbox.next_generation();
     let prep = source.prepare(Arc::downgrade(mailbox), gen, InterestMask::new(interests));
@@ -104,7 +106,7 @@ fn register<'a>(
 fn assert_source_fired(
     mailbox: &TaskMailbox,
     source: WaitSourceId,
-    generation: tx_substrate::wake::WaitGeneration,
+    generation: WaitGeneration,
     expected_overlap: u64,
 ) {
     let evt = mailbox
@@ -142,7 +144,7 @@ fn blocked_waiter_on_matching_value_is_woken_on_futex_wake() {
     let (_guard_reg, gen) = register(&source, &mailbox, FUTEX_WAKE_MASK);
     assert!(mailbox.is_empty(), "no events before wake");
 
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let outcome = step_futex_wake(uaddr, 1, &guard);
     drop(guard);
     assert_eq!(outcome, StepOutcome::Done(1));
@@ -168,7 +170,7 @@ fn wake_count_n_fires_source_once_independent_of_n() {
     let (_guard_reg, gen) = register(&source, &mailbox, FUTEX_WAKE_MASK);
 
     // wake with n=7; mailbox still receives exactly one event.
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let outcome = step_futex_wake(uaddr, 7, &guard);
     drop(guard);
     assert_eq!(outcome, StepOutcome::Done(7));
@@ -197,7 +199,7 @@ fn wake_broadcasts_to_all_bucket_subscribers() {
     let (_g_c, gen_c) = register(&source, &mbox_c, FUTEX_WAKE_MASK);
     assert_eq!(source.subscriber_count(), 3);
 
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let outcome = step_futex_wake(uaddr, 1, &guard);
     drop(guard);
     assert_eq!(outcome, StepOutcome::Done(1));
@@ -258,7 +260,7 @@ fn do_disjoint_test(uaddr_a: u64, uaddr_b: u64) {
     let (_g_b, _gen_b) = register(&src_b, &mbox_b, FUTEX_WAKE_MASK);
 
     // Wake on A only.
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let _ = step_futex_wake(uaddr_a, 1, &guard);
     drop(guard);
 
@@ -304,7 +306,7 @@ fn dropping_mailbox_before_wake_compacts_dead_subscriber() {
     // Stale row still present until next notify.
     assert_eq!(source.subscriber_count(), 2);
 
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let _ = step_futex_wake(uaddr, 1, &guard);
     drop(guard);
 
@@ -338,7 +340,7 @@ fn waitsource_notify_stamps_caller_generation_on_event() {
         gen.raw()
     );
 
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let _ = step_futex_wake(uaddr, 1, &guard);
     drop(guard);
 
@@ -362,7 +364,7 @@ fn wait_source_id_round_trips_from_yield_shape_to_bucket_source() {
     // `step_futex_wait` yields with the bucket's `source_id` stamped
     // into `OnWaitSource`. The same `u64` resolves to the bucket's
     // `Arc<WaitSource>` via `bucket_wait_source_for_source_id`.
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let outcome = step_futex_wait(uaddr, 0xdead_beef, &guard);
     drop(guard);
 
@@ -410,7 +412,7 @@ fn wake_fires_both_legacy_channel_and_new_wait_source() {
         "legacy Channel must remain resolvable under the same source_id",
     );
 
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let outcome = step_futex_wake(uaddr, 1, &guard);
     drop(guard);
     assert_eq!(outcome, StepOutcome::Done(1));

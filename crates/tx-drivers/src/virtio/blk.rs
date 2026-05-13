@@ -2,8 +2,7 @@ use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tx_hal::TxPlatform;
-use tx_substrate::step_v3::{NoProgress, StepOutcome};
-use tx_substrate::{page_allocator, SpinMutex};
+use crate::adapter::step_engine::{page_allocator, NoProgress, SpinMutex, StepOutcome};
 use tx_subsystems::{
     device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber},
     execution::{Errno, Guard},

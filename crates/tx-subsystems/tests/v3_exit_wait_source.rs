@@ -58,11 +58,10 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_substrate::epoch;
-use tx_substrate::step_v3::{InterestMask, WaitSourceId};
-use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::wake::{MailboxEvent, TaskMailbox};
-use tx_substrate::zone::Cap;
+use tx_subsystems::process::adapter::step_engine::{Cap, InterestMask, WaitSourceId};
+use tx_subsystems::process::adapter::wait_routing::{
+    MailboxEvent, Mask, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+};
 
 use tx_subsystems::process::structure::{ProcessIdentity, EXIT_SOURCE_CHILD_ZOMBIFIED};
 use tx_subsystems::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
@@ -135,12 +134,12 @@ fn fresh_aspace() -> Cap<AddressSpace> {
 /// return the generation. Returns the registration guard
 /// (auto-deregisters on drop) and the captured generation.
 fn register<'a>(
-    source: &'a Arc<tx_substrate::wake::WaitSource>,
+    source: &'a Arc<WaitSource>,
     mailbox: &Arc<TaskMailbox>,
     interests: u64,
 ) -> (
-    tx_substrate::wake::WaitRegistrationGuard<'a>,
-    tx_substrate::wake::WaitGeneration,
+    WaitRegistrationGuard<'a>,
+    WaitGeneration,
 ) {
     let gen = mailbox.next_generation();
     let prep = source.prepare(Arc::downgrade(mailbox), gen, InterestMask::new(interests));
@@ -151,7 +150,7 @@ fn register<'a>(
 fn assert_source_fired_for(
     mailbox: &TaskMailbox,
     source: WaitSourceId,
-    generation: tx_substrate::wake::WaitGeneration,
+    generation: WaitGeneration,
     expected_overlap: u64,
 ) {
     let evt = mailbox
@@ -184,10 +183,9 @@ fn assert_source_fired_for(
 /// shape).
 #[test]
 fn exit_wait_source_invariants_round_trip() {
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 
     let parent: Cap<ProcessIdentity> = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
 
@@ -196,7 +194,7 @@ fn exit_wait_source_invariants_round_trip() {
     let parent_source_id = parent
         .exit_source_id()
         .expect("live parent has exit_source_id");
-    let parent_source: Arc<tx_substrate::wake::WaitSource> = parent
+    let parent_source: Arc<WaitSource> = parent
         .exit_wait_source()
         .expect("live parent has exit_wait_source");
     assert_eq!(
@@ -218,7 +216,7 @@ fn exit_wait_source_invariants_round_trip() {
     let child_source_id = child
         .exit_source_id()
         .expect("live child has exit_source_id");
-    let child_source_strong: Arc<tx_substrate::wake::WaitSource> = child
+    let child_source_strong: Arc<WaitSource> = child
         .exit_wait_source()
         .expect("live child has exit_wait_source");
     assert_ne!(
@@ -251,7 +249,7 @@ fn exit_wait_source_invariants_round_trip() {
 
     let legacy_channel = tx_subsystems::wait_source::lookup_wait_channel(parent_source_id)
         .expect("legacy resolver still has the carrier");
-    let mut legacy_wait = legacy_channel.wait(tx_reactor::wait::Mask::from_bits(
+    let mut legacy_wait = legacy_channel.wait(Mask::from_bits(
         EXIT_SOURCE_CHILD_ZOMBIFIED,
     ));
     let pre_legacy = Pin::new(&mut legacy_wait).poll(&mut cx);
@@ -347,6 +345,5 @@ fn exit_wait_source_invariants_round_trip() {
 
     // Drop the strong child-source ref so EBR can retire.
     drop(child_source_strong);
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 }

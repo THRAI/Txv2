@@ -32,7 +32,7 @@
 //!    Mirrors W-CC's PR-11 phase 2 `worker_terminates_cleanly` pin.
 //!
 //! 5. **Framework reusability.** The SQPOLL kthread is constructed
-//!    from `tx_substrate::step_v3::with_on_behalf_of` **as-is** — no
+//!    from substrate's `step_v3::with_on_behalf_of` **as-is** — no
 //!    new framework primitive is added. The scaffold's
 //!    [`tx_subsystems::io_uring::spawn_sqpoll_worker`] is a
 //!    row-for-row clone of
@@ -54,9 +54,8 @@ use tx_hal::{
     Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
 };
-use tx_reactor::userspace::SyscallRequest;
-use tx_substrate::step_v3::OnBehalfOfAbort;
-use tx_substrate::zone::Cap;
+use tx_shims::adapter::reactor_entry::SyscallRequest;
+use tx_shims::adapter::step_engine::{Cap, CancelReason, OnBehalfOfAbort};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
@@ -140,10 +139,9 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
     reset_pid_counter();
     reset_tid_counter();
     reset_init_process();
@@ -483,7 +481,7 @@ fn sqpoll_kthread_cancel_worker_trips_cooperative_cancel() {
                 matches!(
                     out,
                     Err(OnBehalfOfAbort::CooperativeCancel(
-                        tx_substrate::step_v3::CancelReason::OwnerRequested
+                        CancelReason::OwnerRequested
                     ))
                 ),
                 "cancel_worker trips CooperativeCancel(OwnerRequested), got {out:?}"
