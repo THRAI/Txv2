@@ -470,8 +470,8 @@ impl<P: TxPlatform> CoreInit<P> {
         };
 
         let payload = MountPayload::new_cap(
-            mount_output.fs_ops(),
-            mount_output.fs_page_backing(),
+            mount_output.fs_ops().clone(),
+            mount_output.fs_page_backing().clone(),
             None,
             mount::allocate_dev_id(),
             MountOptions {
@@ -481,8 +481,6 @@ impl<P: TxPlatform> CoreInit<P> {
             SourceLabel::Static("vda"),
         )
         .expect("mount_rootfs_ext4_vda: payload reservation");
-        mount_output.bind_mount_payload(&payload);
-
         let root_rnode = {
             let raw = RNode::new(
                 mount_output.root_fs_object_id,
@@ -728,7 +726,7 @@ impl<P: TxPlatform> CoreInit<P> {
         };
 
         let image = BlockDeviceImage::new(reg.ops);
-        let (mount_output, ext4_wire) = match mount_ext4_read_only(image) {
+        let mount_output = match mount_ext4_read_only(image) {
             Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
@@ -775,8 +773,8 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Build the ext4 mount payload.
         let ext4_payload = MountPayload::new_cap(
-            mount_output.fs_ops.clone(),
-            mount_output.fs_page_backing.clone(),
+            mount_output.fs_ops().clone(),
+            mount_output.fs_page_backing().clone(),
             None,
             mount::allocate_dev_id(),
             MountOptions::default(),
@@ -787,8 +785,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Give the ext4 backend a MountPayloadPin so materialise_rnode
         // can create File-kind PageContainers for regular files.
-        let ext4_pin = MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(ext4_payload.clone()));
-        ext4_wire.register_pin(ext4_pin);
+        mount_output.bind_mount_payload(&ext4_payload);
 
         // Build the ext4 root RNode with a `containing_mount` hint so
         // the VFS walker's `fs_ops_for` resolves the right FsOps.
