@@ -211,6 +211,18 @@ impl<P: TxPlatform> CoreInit<P> {
     fn init_substrate_if_ready(handoff: BootHandoff) {
         if P::SUBSTRATE_BOOT_READY {
             tx_substrate::init::<P>();
+
+            // OBS-3a: per-hart observation ring init.
+            //
+            // Called after `tx_substrate::init` so the BSP's hart-local slot
+            // and timestamp function are ready.  `NoRing` is benign — boards
+            // without an ivshmem transport keep emitting as no-ops.
+            let bsp_hart = CpuId(0);
+            match tx_observe::init::<P>(bsp_hart) {
+                Ok(()) | Err(tx_observe::InitError::NoRing) => {}
+                Err(e) => panic!("tx_observe init failed on BSP: {:?}", e),
+            }
+
             crate::zones::register_all().expect("tx_kernel zone registration failed");
             Self::init_later(handoff);
             Self::install_kernel_trap_vector();
@@ -844,6 +856,14 @@ impl<P: TxPlatform> CoreInit<P> {
         P::install_early_percpu(cpu_id);
         P::init_early_secondary(cpu_id);
         tx_substrate::init_on_ap(cpu_id).expect("tx_kernel AP substrate initialization failed");
+
+        // OBS-3a: per-hart observation ring init for AP harts.
+        // Mirrors the BSP init in `init_substrate_if_ready`.
+        match tx_observe::init::<P>(cpu_id) {
+            Ok(()) | Err(tx_observe::InitError::NoRing) => {}
+            Err(e) => panic!("tx_observe init failed on AP {}: {:?}", cpu_id.0, e),
+        }
+
         P::init_later_secondary(cpu_id);
         P::install_kernel_trap_vector();
         P::mark_cpu_online(cpu_id);

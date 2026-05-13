@@ -751,6 +751,9 @@ impl crate::page_backed::FsPageBacking for LifecycleFs {
 
 #[test]
 fn fsopsv3_load_inode_meta_returns_done_with_default_meta() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
     setup_host_substrate();
     let guard = tx_substrate::epoch::guard();
     let fs = LifecycleFs::new();
@@ -761,6 +764,9 @@ fn fsopsv3_load_inode_meta_returns_done_with_default_meta() {
 
 #[test]
 fn fsopsv3_create_inode_returns_err_erofs_on_readonly_fixture() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
     setup_host_substrate();
     let guard = tx_substrate::epoch::guard();
     let fs = LifecycleFs::new();
@@ -780,6 +786,9 @@ fn fsopsv3_create_inode_returns_err_erofs_on_readonly_fixture() {
 
 #[test]
 fn fsopsv3_readdir_done_none_for_empty_directory() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
     setup_host_substrate();
     let guard = tx_substrate::epoch::guard();
     let fs = LifecycleFs::new();
@@ -790,6 +799,9 @@ fn fsopsv3_readdir_done_none_for_empty_directory() {
 
 #[test]
 fn fsopsv3_lookup_returns_err_enosys() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
     setup_host_substrate();
     let guard = tx_substrate::epoch::guard();
     let fs = LifecycleFs::new();

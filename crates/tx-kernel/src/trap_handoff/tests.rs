@@ -14,7 +14,7 @@
 
 use tx_hal::{
     Arch, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, FaultInfo, InitIf,
-    PlatformConfig, PlatformInfo, TrapFrameView, TrapPreviousMode, VirtAddr,
+    ObserverIf, PlatformConfig, PlatformInfo, TrapFrameView, TrapPreviousMode, VirtAddr,
 };
 
 use crate::trap_handoff::{
@@ -92,6 +92,7 @@ impl tx_hal::DmaIf for TestPlatform {}
 impl tx_hal::SmpIf for TestPlatform {}
 
 impl tx_hal::EntropyIf for TestPlatform {}
+impl ObserverIf for TestPlatform {}
 
 impl tx_hal::PowerIf for TestPlatform {
     fn system_off() -> ! {

@@ -16,7 +16,7 @@ use core::task::{Context, Poll, Waker};
 
 use tx_hal::{
     AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
-    PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions, PmapReservation,
+    ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PtNode,
 };
 use tx_reactor::userspace::{
@@ -107,6 +107,7 @@ impl tx_hal::CacheIf for TestPlatform {}
 impl tx_hal::DmaIf for TestPlatform {}
 impl tx_hal::SmpIf for TestPlatform {}
 impl tx_hal::EntropyIf for TestPlatform {}
+impl ObserverIf for TestPlatform {}
 
 impl tx_hal::PowerIf for TestPlatform {
     fn system_off() -> ! {

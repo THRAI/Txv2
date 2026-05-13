@@ -309,7 +309,7 @@ impl PipePayload {
             // source. Blocked writers will re-observe and surface
             // EPIPE on the next step (reader_count == 0).
             self.writer_wait_source
-                .notify(InterestMask::new(PIPE_WRITABLE));
+                .notify_emit(InterestMask::new(PIPE_WRITABLE));
         }
     }
 
@@ -326,7 +326,7 @@ impl PipePayload {
             // PR-3D-1 new path. Blocked readers will re-observe and
             // surface EOF (Done(0)) on the next step.
             self.reader_wait_source
-                .notify(InterestMask::new(PIPE_READABLE));
+                .notify_emit(InterestMask::new(PIPE_READABLE));
         }
     }
 
@@ -472,7 +472,7 @@ pub fn step_read(
             .fire(Mask::from_bits(PIPE_WRITABLE));
         payload
             .writer_wait_source
-            .notify(InterestMask::new(PIPE_WRITABLE));
+            .notify_emit(InterestMask::new(PIPE_WRITABLE));
         return tx_substrate::step_v3::StepOutcome::done(copied);
     }
     drop(ring);
@@ -521,7 +521,7 @@ pub fn step_write(
             .fire(Mask::from_bits(PIPE_READABLE));
         payload
             .reader_wait_source
-            .notify(InterestMask::new(PIPE_READABLE));
+            .notify_emit(InterestMask::new(PIPE_READABLE));
         return tx_substrate::step_v3::StepOutcome::done(copied);
     }
     drop(ring);

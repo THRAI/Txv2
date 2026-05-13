@@ -1,8 +1,72 @@
 # txKernel Status
 
-**Updated:** 2026-05-12
+**Updated:** 2026-05-13
 
 ## Current Shape
+
+- 2026-05-13 **OBS-8 LANDED.** L5 Phase events and L6 Mutation events.
+
+  **What changed:**
+
+  - `crates/tx-observe-types/src/payload.rs`: Added `TxPayloadTag::PhaseTransition = 52`,
+    `BootPhaseKind` enum (`SubstrateBsp=0`, `SubstrateAp=1`), and `PayloadPhaseTransition`
+    struct (16 bytes: `phase_kind u8`, `hart_id u8`, `_pad [u8; 14]`).
+  - `crates/tx-observe-types/src/lib.rs`: Re-exported new types, added `Pod` impl,
+    added `size_of::<PayloadPhaseTransition>() == 16` compile-time assertion.
+  - `crates/tx-observe/src/encode.rs`: Added L6 encoders `encode_mutation_zone_sign`,
+    `encode_mutation_index_commit`, `mutation_zone_sign_tag`, `mutation_index_commit_tag`;
+    added L5 encoder `encode_phase_transition`, `phase_transition_tag`.
+  - `crates/tx-substrate/src/zone/reservation.rs`: Added `MUTATION_EMIT_ENABLED`
+    (`AtomicBool`, default off); wired `Instant(MutationZoneSign)` emit in `sign()`
+    after slot goes Live.
+  - `crates/tx-substrate/src/index.rs`: Added `INDEX_MUTATION_EMIT_ENABLED`
+    (`AtomicBool`, default off); wired `Instant(MutationIndexCommit)` emit in
+    `IndexReservation::commit()` after state transitions to COMMITTED.
+  - `crates/tx-substrate/src/zone/mod.rs`: Re-exported `MUTATION_EMIT_ENABLED`.
+  - `crates/tx-substrate/src/lib.rs`: Wired L5 `SpanBegin(phase.SubstrateBsp)` /
+    `SpanEnd` around `init()` body; `SpanBegin(phase.SubstrateAp)` / `SpanEnd` around
+    `init_on_ap()` body. Added `emit_phase_span_begin` / `emit_phase_span_end` helpers.
+  - `tools/tx-trace-daemon/src/decode.rs`: Added `PhaseTransition` to both tag-parse
+    match and `read_payload` match via `read_as!(PayloadPhaseTransition)`.
+  - `docs/Txv3/08_OBSERVATION_SERIALIZATION_v0.md`: Updated §8.7 mutation payload
+    note (gated, daemon decoding); added §8.9 Phase transition payload layout.
+
+  **Tests:** `tests/obs8_zone_sign_emit.rs` (2 tests: gate-enabled emits record,
+  gate-disabled emits nothing); `tests/obs8_index_commit_emit.rs` (2 tests: same
+  discipline for index commit).
+
+  **Verified:** `cargo build -p tx-observe-types -p tx-observe -p tx-substrate` clean;
+  `cargo build --target riscv64gc-unknown-none-elf -p tx-kernel-riscv64-qemu-virt` clean;
+  `cargo test -p tx-observe -p tx-substrate -- --test-threads=1` all green;
+  `cargo test -p tx-subsystems --lib -- --test-threads=1` 623/623 pass;
+  `cargo xtask observe-discipline` clean (392 files, 73 StepOp impls);
+  daemon builds clean.
+
+  **Next step:** land commit; gate both L6 gates on via boot flag if profiling
+  confirms overhead is acceptable; wire daemon Perfetto span reconstruction for
+  L5 phase spans (OBS-9 territory).
+
+  **Blocker:** none.
+
+- 2026-05-13 D16 OBS-4 Drop-barrier resolution (Option C) LANDED.
+  `tx_observe::current()` is now non-generic: a companion
+  `CPU_ID_FN: AtomicU64` stores `fn() -> CpuId` (mirrors the existing
+  `TS_FN` timestamp pattern). `tx_observe::init::<P>` installs the
+  function pointer at boot (BSP + AP). `WaitSource::notify_emit` drops
+  its `<P: PercpuIf>` bound — it now calls `tx_observe::current()`
+  directly. `drive<O, I>` in `tx-scripts` already had no `Plat`
+  parameter. All 13 production `.notify(mask)` sites in
+  `tx-subsystems` (pipe.rs ×4, io_uring.rs ×2, aio.rs ×2,
+  userfaultfd.rs, vfs/structure.rs ×2, signalfd.rs, futex.rs,
+  tty/execution/step_ingest.rs ×2, process/structure.rs) migrated to
+  `.notify_emit(mask)`. Six TestPlatform stubs across tx-kernel tests
+  and tx-substrate tests gained `impl ObserverIf for TestPlatform {}`.
+  **Verified:** tx-substrate full suite pass; tx-kernel 43/43 pass;
+  tx-subsystems 623/623 single-threaded pass; tx-observe 4/4 pass;
+  tx-scripts 48/48 pass; OBS-4 tests (obs4_wait_source_notify_emit ×3,
+  obs4_convergence_point_emit ×1, obs4_cap_trace_id ×1) all green.
+  **Next step:** land commit; run `cargo xtask ci`.
+  ADR: `docs/progress/decisions/2026-05-13-d16-obs4-drop-barrier-resolution.md`.
 
 - 2026-05-12 D12 Phase B (PR-2 scaffolding dead-code allowance)
   LANDED. Closes the D13 follow-up: the 26 PR-2 `StepOp` adapter

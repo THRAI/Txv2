@@ -42,6 +42,8 @@ use crate::SpinMutex;
 
 use crate::wake::mailbox::{MailboxEvent, TaskMailbox, WaitGeneration};
 
+use tx_observe_types::{PayloadWaitSourceNotify, TxTraceLevel};
+
 /// Per-subscriber bookkeeping. The mailbox handle is `Weak` so a
 /// `WaitSource` does not retain dead tasks; `notify` skips and
 /// later compacts dead subscribers.
@@ -193,6 +195,70 @@ impl WaitSource {
                 }
                 // Note: on overflow the mailbox latches its flag;
                 // the subscriber stays registered.
+            }
+            true
+        });
+        posted
+    }
+
+    /// Fire `mask` on this source and emit one `WaitSourceNotify` observation
+    /// record per woken task (OBS-4 convergence-point observation).
+    ///
+    /// Identical wake-delivery semantics to [`Self::notify`]; additionally,
+    /// for each subscriber that receives a `MailboxEvent::SourceFired`, emits
+    /// one `TxTraceKind::Instant` / `TxPayloadTag::WaitSourceNotify` record
+    /// into the current hart's SPSC ring (if the ring is configured).
+    ///
+    /// The platform context is implicit: `tx_observe::current()` reads the
+    /// cpu-id via the function pointer installed by `tx_observe::init` at
+    /// boot (D16 Option C). No type parameter is required at call sites,
+    /// which is the fix for Drop barriers and async kthread bodies that
+    /// cannot supply a `P: PercpuIf` type parameter (OBS-4 / D16).
+    ///
+    /// # OBS-A-1 compliance
+    ///
+    /// This method is a **substrate convergence point** (`notify_emit` is
+    /// called from state-transition paths such as `decr_reader`,
+    /// `decr_writer`, etc.). It is **never** called from inside a
+    /// `StepOp::step()` body.
+    pub fn notify_emit(&self, mask: InterestMask) -> usize {
+        use tx_observe::encode::{encode_wait_source_notify, wait_source_notify_tag};
+        use tx_observe::EventNameId;
+
+        let mut subs = self.subscribers.lock();
+        let mut posted = 0usize;
+
+        subs.retain(|sub| {
+            let Some(mailbox) = sub.mailbox.upgrade() else {
+                return false;
+            };
+            let overlap = sub.interests.raw() & mask.raw();
+            if overlap != 0 {
+                let evt = MailboxEvent::SourceFired {
+                    generation: sub.generation,
+                    source: self.id,
+                    interests: InterestMask::new(overlap),
+                };
+                if mailbox.post(evt) {
+                    posted += 1;
+                    // Emit one Instant record per woken task (OBS-4).
+                    if let Some(em) = tx_observe::current() {
+                        let payload = PayloadWaitSourceNotify {
+                            source_id_low: self.id.raw() as u32,
+                            mask_bits: overlap as u32,
+                            task_id_low: 0, // task-id threading is a later phase
+                            wait_generation_low: sub.generation.raw() as u32,
+                        };
+                        let (payload_bytes, _) = encode_wait_source_notify(&payload);
+                        em.instant(
+                            TxTraceLevel::Yield,
+                            EventNameId::of::<WaitSource>(),
+                            tx_observe::SpanId::NONE,
+                            wait_source_notify_tag(),
+                            &payload_bytes,
+                        );
+                    }
+                }
             }
             true
         });

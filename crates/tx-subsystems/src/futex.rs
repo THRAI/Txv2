@@ -232,7 +232,7 @@ pub fn step_futex_wake(
     // caller that registered a `TaskMailbox` against this bucket's
     // source. Per-waiter re-check on wakeup re-reads `*uaddr` and
     // either returns success or re-parks.
-    wait_source.notify(InterestMask::new(FUTEX_WAKE_MASK));
+    wait_source.notify_emit(InterestMask::new(FUTEX_WAKE_MASK));
     tx_substrate::step_v3::StepOutcome::Done(n)
 }
 

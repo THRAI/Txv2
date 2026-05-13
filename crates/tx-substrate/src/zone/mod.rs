@@ -36,7 +36,7 @@ pub use registry::{
     lookup, register_static_zone, registered_zone_count, snapshot, EmptySlabTrimStats, SlotKey,
     ZoneId, ZoneInfo,
 };
-pub use reservation::{reserve, sign, ZoneReservation};
+pub use reservation::{reserve, sign, ZoneReservation, MUTATION_EMIT_ENABLED};
 pub use runtime::{
     freeze_for_shutdown, init_on_ap, init_on_bsp, is_initialized, state, ZoneRuntimeState,
 };
