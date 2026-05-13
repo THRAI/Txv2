@@ -21,6 +21,7 @@ static TEST_PMAP_RELEASES: AtomicUsize = AtomicUsize::new(0);
 static TEST_TIMER_TRAPS: AtomicUsize = AtomicUsize::new(0);
 static TEST_SYSCALL_TRAPS: AtomicUsize = AtomicUsize::new(0);
 static TEST_IRQ_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+const TEST_PMAP_PAGE_COUNT: usize = 12;
 static mut TEST_ROOT_PAGE: [u64; 512] = [0; 512];
 static mut TEST_IRQ_TABLE: IrqDispatchTable = IrqDispatchTable::new();
 #[derive(Clone, Copy)]
@@ -29,7 +30,8 @@ struct TestPmapPage {
     _entries: [u64; 512],
 }
 
-static mut TEST_PMAP_PAGES: [TestPmapPage; 8] = [TestPmapPage { _entries: [0; 512] }; 8];
+static mut TEST_PMAP_PAGES: [TestPmapPage; TEST_PMAP_PAGE_COUNT] =
+    [TestPmapPage { _entries: [0; 512] }; TEST_PMAP_PAGE_COUNT];
 
 struct RecordingTrapSink;
 
@@ -71,7 +73,7 @@ impl KernelTrapSink<Platform> for RecordingSyscallSink {
 
     fn on_syscall(mut view: TrapFrameMut<'_>) -> TrapAction {
         let snapshot = view.view();
-        assert_eq!(snapshot.pc, VirtAddr(0x2004));
+        assert_eq!(snapshot.pc, VirtAddr(0x2000));
         assert_eq!(snapshot.syscall_number, 172);
         assert_eq!(snapshot.syscall_args, [1, 2, 3, 4, 5, 6]);
         view.set_syscall_return(0x5a);
@@ -271,6 +273,10 @@ fn la64_trap_classification_decodes_interrupts_and_sync_faults() {
         TrapClass::IllegalInstruction
     );
     assert_eq!(
+        classify_la64_trap(LA64_ECODE_FPD << LA64_ESTAT_ECODE_SHIFT),
+        TrapClass::IllegalInstruction
+    );
+    assert_eq!(
         classify_la64_trap(LA64_ECODE_PIS << LA64_ESTAT_ECODE_SHIFT),
         TrapClass::PageFault {
             write: true,
@@ -419,7 +425,7 @@ fn dispatch_timer_trap_enters_irq_context_and_resumes() {
 }
 
 #[test]
-fn dispatch_syscall_advances_era_and_uses_la64_abi() {
+fn dispatch_syscall_preserves_era_for_trap_handoff_and_uses_la64_abi() {
     TEST_SYSCALL_TRAPS.store(0, Ordering::Release);
     let mut frame = La64TrapFrame {
         r: [0; 32],
@@ -443,7 +449,7 @@ fn dispatch_syscall_advances_era_and_uses_la64_abi() {
     );
 
     assert_eq!(TEST_SYSCALL_TRAPS.load(Ordering::Acquire), 1);
-    assert_eq!(frame.era, 0x2004);
+    assert_eq!(frame.era, 0x2000);
     assert_eq!(frame.r[LA64_R_A0], 0x5a);
 }
 
@@ -849,7 +855,9 @@ fn activate_pmap_installs_pgdl_pgdh_and_asid() {
         first.asid().0 as usize
     );
     assert_eq!(LA64_KERNEL_PGDH_PHYS.load(Ordering::Acquire), pgdh);
-    assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 3);
+    // Activation allocates the shared kernel PGDH plus the low-kernel
+    // identity-map intermediates inside the user root.
+    assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 6);
     let pgdh_page = la64_page_table_mut_from_phys(PhysAddr(pgdh));
     assert!(pgdh_page.iter().all(|entry| *entry == 0));
 
@@ -860,11 +868,11 @@ fn activate_pmap_installs_pgdl_pgdh_and_asid() {
         second.asid().0 as usize
     );
     assert_eq!(LA64_ACTIVE_PGDH.load(Ordering::Acquire), pgdh);
-    assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 3);
+    assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 9);
 
     Platform::destroy_pmap_root(first);
     Platform::destroy_pmap_root(second);
-    assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 2);
+    assert_eq!(TEST_PMAP_RELEASES.load(Ordering::Acquire), 8);
 
     reset_pmap_test_state();
 }
@@ -1217,7 +1225,7 @@ fn test_root_phys() -> PhysAddr {
 
 fn test_pmap_allocator() -> Result<PtNode, AllocError> {
     let index = TEST_PMAP_ALLOCATIONS.fetch_add(1, Ordering::AcqRel);
-    if index >= 8 {
+    if index >= TEST_PMAP_PAGE_COUNT {
         return Err(AllocError::Exhausted);
     }
     Ok(PtNode::typed_frame(
@@ -1262,7 +1270,7 @@ fn reset_pmap_test_state() {
         core::ptr::write_bytes(
             core::ptr::addr_of_mut!(TEST_PMAP_PAGES).cast::<u8>(),
             0,
-            core::mem::size_of::<[TestPmapPage; 8]>(),
+            core::mem::size_of::<[TestPmapPage; TEST_PMAP_PAGE_COUNT]>(),
         );
     }
     reset_la64_committed_pt_nodes_for_test();

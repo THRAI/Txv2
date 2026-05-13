@@ -1,7 +1,7 @@
 //! Phase 3b boot-wiring tests.
 //!
 //! Exercises the new ordered steps `register_console_hardware` →
-//! `mount_rootfs_tmpfs` → `mount_devfs_at_dev` →
+//! `mount_rootfs_from_boot_media` → `mount_devfs_at_dev` →
 //! `register_devfs_console_alias` → `bind_init_cwd_and_root`. The
 //! tests bypass `init_substrate_if_ready` (which depends on the full
 //! HAL `BootHandoff` shape) and call each method on a stub
@@ -148,8 +148,8 @@ impl tx_hal::TrapIf for TestPlatform {
     ///    assert Plan B writeback discipline produced the right
     ///    merged value.
     /// 2. Return.
-    fn enter_userspace_with_context(ctx: tx_hal::UserTrapContext) {
-        *LAST_USERSPACE_CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx);
+    fn enter_userspace_with_context(ctx: &tx_hal::UserTrapContext, _root: &tx_hal::PmapRoot) {
+        *LAST_USERSPACE_CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(*ctx);
         USERSPACE_A0_LOG
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -283,7 +283,7 @@ fn drive_boot_wiring() {
     // platform-publication path in the boot-wiring smoke.
     CoreInit::<TestPlatform>::install_irq_handlers();
     CoreInit::<TestPlatform>::init_block_devices();
-    CoreInit::<TestPlatform>::mount_rootfs_tmpfs();
+    CoreInit::<TestPlatform>::mount_rootfs_from_boot_media();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
     CoreInit::<TestPlatform>::bind_init_cwd_and_root();

@@ -256,6 +256,15 @@ impl<P: TxPlatform> CoreInit<P> {
             let outcome = fs_ops.create_inode(root_object_id, b"init", 0o100755, &cred, &guard);
             match outcome {
                 V3::Done(out) => out,
+                V3::Err(step_engine::Errno::EROFS)
+                | V3::Err(step_engine::Errno::ENOSYS)
+                | V3::Err(step_engine::Errno::EEXIST) => {
+                    // Rootfs is read-only (e.g. ext4 mounted from vda).
+                    // The fixture is not needed; the real binary lives on disk.
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":init:fixture:skip:ro\n");
+                    return;
+                }
                 other => panic!("register_init_fixture_into_tmpfs: create_inode(/init): {other:?}"),
             }
         };
@@ -410,6 +419,10 @@ impl<P: TxPlatform> CoreInit<P> {
         //   `tx.profile=busybox` (no init=) -> /bin/sh argv=[sh]
         //   default -> bake-in /init fixture, argv=[init]
         let (init_path, argv0) = parse_init_from_cmdline::<P>();
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":bootstrap-exec:path:");
+        tx_hal::console_write_bytes::<P>(init_path);
+        tx_hal::console_write_str::<P>("\n");
 
         // `exec_script` opens its own fresh epoch guards inside V1
         // (`build_aspace_from_image`) and V2
@@ -532,7 +545,11 @@ impl<P: TxPlatform> CoreInit<P> {
     ///
     /// Cheap when no bytes are pending (`read_bytes` returns 0,
     /// the rest is skipped).
-    pub(super) fn drain_sbi_console_into_tty() {
+    pub(crate) fn drain_pending_uart_rx_into_tty() -> usize {
+        crate::irq::drain_uart_rx_pending()
+    }
+
+    pub(super) fn drain_sbi_console_into_tty() -> usize {
         // 2026-05-13: bumped from 64 to 512 bytes to swallow whole shell
         // command lines in a single SBI poll. The 64-byte cap left the
         // 17-byte tail of an 81-character `ln -s` line stranded in the
@@ -548,11 +565,12 @@ impl<P: TxPlatform> CoreInit<P> {
         let mut buf = [0u8; 512];
         let n = <P as tx_hal::ConsoleIf>::read_bytes(&mut buf);
         if n == 0 {
-            return;
+            return 0;
         }
-        let Some(tty) = console_tty() else { return };
+        let Some(tty) = console_tty() else { return 0 };
         let guard = step_engine::guard();
         let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
+        n
     }
 
     pub(super) fn run_userspace_reactor_loop() {
@@ -578,20 +596,27 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         };
 
-        let task_payload = payload.clone();
+        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        let wrapper_payload = payload.clone();
+        let future_payload = payload.clone();
         let submit_thread = thread.clone();
         let submitted = BOOT_REACTOR.with(|reactor| {
-            reactor.submit_task(crate::thread_future::PerHartSlotted::<P, _>::new(
-                task_payload.clone(),
-                crate::thread_future::run_thread::<P>(submit_thread, task_payload),
-            ));
+            reactor.submit_task_with_meta(
+                crate::thread_future::PerHartSlotted::<P, _>::new(
+                    wrapper_payload,
+                    crate::thread_future::run_thread::<P>(submit_thread, future_payload),
+                ),
+                boot_runtime::InitialSchedMeta::kernel()
+                    .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
+            )
         });
         if submitted.is_none() {
             // Boot reactor not initialised; nothing to drive.
             return;
         }
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":userspace:submitted\n");
 
-        let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
         P::enable_timer_wakeups();
 
         // Drive the BSP reactor loop until init zombifies. Each
@@ -603,6 +628,18 @@ impl<P: TxPlatform> CoreInit<P> {
         loop {
             if init.is_zombie() {
                 break;
+            }
+
+            // UART IRQ handlers cannot touch TTY state directly
+            // because epoch guards are forbidden in IRQ context.
+            // They queue bytes in an IRQ-safe buffer and request a
+            // reactor wake; consume that buffer here in normal
+            // context before deciding whether there is runnable work.
+            if Self::drain_pending_uart_rx_into_tty() != 0 {
+                continue;
+            }
+            if Self::drain_sbi_console_into_tty() != 0 {
+                continue;
             }
 
             // Drain any pending child-thread submits posted from

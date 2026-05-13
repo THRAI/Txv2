@@ -436,6 +436,13 @@ impl Inode {
         &self.i_block
     }
 
+    pub fn inline_symlink_target(&self) -> Result<Option<&[u8]>> {
+        if !self.is_symlink() || self.size > EXTENT_ROOT_BYTES as u64 {
+            return Ok(None);
+        }
+        Ok(Some(slice_at(&self.i_block, 0, self.size as usize)?))
+    }
+
     pub fn is_dir(&self) -> bool {
         self.mode & Self::S_IFMT == Self::S_IFDIR
     }

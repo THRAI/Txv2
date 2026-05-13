@@ -13,7 +13,9 @@ OSCOMP_EXTRA ?=
 
 .PHONY: docker-help docker-build docker-shell docker-ci docker-check docker-ci-slow \
 	docker-build-rv64 docker-build-la64 docker-image-cpio-rv64 docker-image-cpio-la64 \
+	docker-image-ext4-rv64 docker-image-ext4-la64 \
 	docker-qemu-rv64-smoke docker-qemu-rv64-busybox docker-qemu-la64-busybox \
+	docker-run-la64-busybox docker-run-rv64-busybox \
 	docker-busybox-la64 docker-oscomp-doctor docker-oscomp-prepare docker-oscomp-submit \
 	docker-oscomp-run docker-oscomp-qemu
 
@@ -56,6 +58,12 @@ docker-image-cpio-rv64:
 docker-image-cpio-la64:
 	$(DOCKER_RUN) cargo xtask image cpio --profile busybox --target la64-qemu
 
+docker-image-ext4-rv64:
+	$(DOCKER_RUN) cargo xtask image ext4 --profile busybox --target rv64-qemu
+
+docker-image-ext4-la64:
+	$(DOCKER_RUN) cargo xtask image ext4 --profile busybox --target la64-qemu
+
 docker-qemu-rv64-smoke:
 	$(DOCKER_RUN) cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel
 
@@ -64,6 +72,18 @@ docker-qemu-rv64-busybox:
 
 docker-qemu-la64-busybox:
 	$(DOCKER_RUN) cargo xtask qemu --target la64-qemu --profile busybox --interactive
+
+docker-run-la64-busybox:
+	$(DOCKER_RUN) cargo xtask build --target la64-qemu
+	$(DOCKER_RUN) cargo xtask image cpio --profile busybox --target la64-qemu
+	$(DOCKER_RUN) cargo xtask image ext4 --profile busybox --target la64-qemu
+	$(DOCKER_RUN) cargo xtask qemu --target la64-qemu --profile busybox --interactive
+
+docker-run-rv64-busybox:
+	$(DOCKER_RUN) cargo xtask build --target rv64-qemu
+	$(DOCKER_RUN) cargo xtask image cpio --profile busybox --target rv64-qemu
+	$(DOCKER_RUN) cargo xtask image ext4 --profile busybox --target rv64-qemu
+	$(DOCKER_RUN) cargo xtask qemu --target rv64-qemu --profile busybox --interactive
 
 docker-busybox-la64:
 	$(DOCKER_COMPOSE) run --rm busybox-la64

@@ -500,19 +500,23 @@ fn fork_aspace_demotes_parent_pmap_for_private_entries_only() {
     let _child =
         crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
 
-    assert!(
+    assert_eq!(
         parent
             .pmap()
             .lookup(crate::vm::UserVirtAddr(0x24000).containing_page())
-            .is_none(),
-        "MAP_PRIVATE PTE should be torn down on fork"
+            .expect("MAP_PRIVATE PTE should remain mapped after fork")
+            .prot,
+        Prot::READ,
+        "MAP_PRIVATE PTE should be demoted read-only on fork"
     );
-    assert!(
+    assert_eq!(
         parent
             .pmap()
             .lookup(crate::vm::UserVirtAddr(0x26000).containing_page())
-            .is_some(),
-        "MAP_SHARED PTE should remain mapped"
+            .expect("MAP_SHARED PTE should remain mapped")
+            .prot,
+        Prot::READ_WRITE,
+        "MAP_SHARED PTE should keep its original protection"
     );
 }
 
@@ -619,17 +623,20 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
     drop(guard);
 
     // Fork: parent's vme.private should fork_share into child as
-    // SharedCow. Parent's PTE in the private range is torn down.
+    // SharedCow. Parent's PTE in the private range is demoted read-only.
     let child =
         crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
 
-    // Sanity: parent's PTE for the private page is gone (lazy refault).
-    assert!(
+    // Sanity: parent's PTE for the private page remains mapped, but no
+    // longer writable. The next parent write must fault and CoW.
+    assert_eq!(
         parent
             .pmap()
             .lookup(crate::vm::UserVirtAddr(0x40000).containing_page())
-            .is_none(),
-        "fork must demote parent PTE for private mapping"
+            .expect("parent mapping remains after fork")
+            .prot,
+        Prot::READ,
+        "fork must demote parent private PTE to read-only"
     );
 
     // Parent re-reads after fork: read fault should consult vme.private

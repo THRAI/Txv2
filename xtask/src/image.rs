@@ -19,7 +19,8 @@ pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
     match (kind.as_str(), profile) {
         ("cpio" | "initramfs", Profile::Busybox) => image_cpio_busybox(root, target),
         ("ext4", Profile::Busybox) => {
-            image_ext4_busybox(root, &args[1..], target, "busybox-root.ext4")
+            let name = busybox_root_ext4_name(target);
+            image_ext4_busybox(root, &args[1..], target, &name)
         }
         ("m1dock-sd", Profile::Busybox) => {
             image_ext4_busybox(root, &args[1..], target, "m1dock-sd.img")
@@ -31,6 +32,14 @@ pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
             "unknown image kind '{other}', expected cpio, ext4, or m1dock-sd"
         )),
     }
+}
+
+pub(crate) fn busybox_initramfs_name(target: TxTarget) -> String {
+    format!("busybox-initramfs-{}.cpio", target.name())
+}
+
+pub(crate) fn busybox_root_ext4_name(target: TxTarget) -> String {
+    format!("busybox-root-{}.ext4", target.name())
 }
 
 fn image_target(args: &[String]) -> Result<TxTarget> {
@@ -48,9 +57,10 @@ fn image_cpio_busybox(root: &Path, target: TxTarget) -> Result<()> {
     let out = root
         .join("target")
         .join("images")
-        .join("busybox-initramfs.cpio");
+        .join(busybox_initramfs_name(target));
     fs::create_dir_all(out.parent().expect("image path has parent"))
         .map_err(|err| err.to_string())?;
+    remove_existing_image(&out)?;
 
     let script = format!(
         "cd '{}' && find . -print | cpio -o -H newc > '{}'",
@@ -76,6 +86,7 @@ fn image_ext4_busybox(
     let out = root.join("target").join("images").join(output_name);
     fs::create_dir_all(out.parent().expect("image path has parent"))
         .map_err(|err| err.to_string())?;
+    remove_existing_image(&out)?;
 
     run_cmd_owned(
         root,
@@ -96,6 +107,14 @@ fn image_ext4_busybox(
     )?;
     println!("wrote {} ({size})", out.display());
     Ok(())
+}
+
+fn remove_existing_image(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to remove {}: {err}", path.display())),
+    }
 }
 
 /// RV64 in-tree vendored busybox used when `TX_BUSYBOX` is not set.
@@ -149,7 +168,10 @@ fn resolve_busybox(root: &Path, target: TxTarget) -> Result<PathBuf> {
 fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
     let busybox = resolve_busybox(root, target)?;
 
-    let layout = root.join("target").join("rootfs").join("busybox-musl");
+    let layout = root
+        .join("target")
+        .join("rootfs")
+        .join(format!("busybox-musl-{}", target.name()));
     if layout.exists() {
         fs::remove_dir_all(&layout).map_err(|err| err.to_string())?;
     }

@@ -22,6 +22,19 @@ pub enum VirtioPciError {
     Transport,
 }
 
+impl VirtioPciError {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            VirtioPciError::MissingMmioRegion(_) => "missing-mmio-region",
+            VirtioPciError::NoBlockDevice => "no-block-device",
+            VirtioPciError::BarProbe => "bar-probe",
+            VirtioPciError::BarTooLarge => "bar-too-large",
+            VirtioPciError::BarAddressExhausted => "bar-address-exhausted",
+            VirtioPciError::Transport => "transport",
+        }
+    }
+}
+
 pub fn mmio_region<P: TxPlatform>(name: &'static str) -> Result<MmioRegion, VirtioPciError> {
     <P as PlatformInfoIf>::platform_info()
         .mmio_regions

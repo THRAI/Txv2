@@ -22,7 +22,7 @@ use tx_subsystems::vfs::{FsOps, OpenFile};
 
 use crate::linux_syscall::{
     AT_EMPTY_PATH, AT_FDCWD, NR_CHDIR, NR_FCHDIR, NR_FSTAT, NR_GETCWD, NR_GETDENTS64,
-    NR_NEWFSTATAT, NR_UMASK,
+    NR_NEWFSTATAT, NR_STATX, NR_UMASK,
 };
 
 /// errno magnitudes the tests check against (positive Linux RV64
@@ -49,6 +49,13 @@ const STAT_BLKSIZE_OFF: usize = 56;
 /// Total `struct stat` byte size on RV64 generic ABI: matches
 /// `size_of::<StatLayout>` per the field layout in `mod.rs`.
 const STAT_BYTES: usize = 128;
+const STATX_MASK_OFF: usize = 0;
+const STATX_BLKSIZE_OFF: usize = 4;
+const STATX_NLINK_OFF: usize = 16;
+const STATX_MODE_OFF: usize = 28;
+const STATX_INO_OFF: usize = 32;
+const STATX_SIZE_OFF: usize = 40;
+const STATX_BYTES: usize = 256;
 
 /// `linux_dirent64` fixed header byte size (8 + 8 + 2 + 1 = 19).
 const DIRENT_HEADER_BYTES: usize = 19;
@@ -382,6 +389,47 @@ fn dispatch_newfstatat_at_empty_path_stats_cwd() {
     assert_eq!(result, SyscallResult::Return(0));
     let mode = read_u32_at(&statbuf, STAT_MODE_OFF);
     assert_eq!(mode & 0o170000, 0o040000, "expected S_IFDIR; got {mode:#o}");
+    drop(path);
+}
+
+/// `statx(AT_FDCWD, "/", 0, STATX_BASIC_STATS, statxbuf)` follows
+/// the same cwd-relative walker path as `newfstatat` and writes the
+/// Linux `struct statx` byte image used by LA64 busybox `ls`.
+#[test]
+fn dispatch_statx_on_root_writes_statx_struct() {
+    let _setup = stat_setup();
+    let (root_dentry, _tmpfs, root_rnode) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/");
+    let mut statxbuf = vec![0u8; STATX_BYTES];
+    let req = SyscallRequest::new(
+        NR_STATX,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            0,
+            crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+            statxbuf.as_mut_ptr() as u64,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(
+        read_u32_at(&statxbuf, STATX_MASK_OFF),
+        crate::linux_syscall::numbers::STATX_BASIC_STATS
+    );
+    assert_eq!(read_u32_at(&statxbuf, STATX_BLKSIZE_OFF), 4096);
+    assert_eq!(read_u32_at(&statxbuf, STATX_NLINK_OFF), 1);
+    let mode = read_u16_at(&statxbuf, STATX_MODE_OFF);
+    assert_eq!(mode & 0o170000, 0o040000, "expected S_IFDIR; got {mode:#o}");
+    assert_eq!(
+        read_u64_at(&statxbuf, STATX_INO_OFF),
+        root_rnode.fs_object_id().as_u64()
+    );
+    assert_eq!(read_u64_at(&statxbuf, STATX_SIZE_OFF), 0);
     drop(path);
 }
 

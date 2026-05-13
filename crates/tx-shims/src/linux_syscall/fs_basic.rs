@@ -849,6 +849,46 @@ pub(super) struct StatLayout {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct StatxTimestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    __reserved: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StatxLayout {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    __spare0: u16,
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: StatxTimestamp,
+    stx_btime: StatxTimestamp,
+    stx_ctime: StatxTimestamp,
+    stx_mtime: StatxTimestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    stx_dio_mem_align: u32,
+    stx_dio_offset_align: u32,
+    __spare3: [u64; 12],
+}
+
+const _: () = assert!(core::mem::size_of::<StatxTimestamp>() == 16);
+const _: () = assert!(core::mem::size_of::<StatxLayout>() == 256);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct LinuxDirent64Header {
     d_ino: u64,
     d_off: i64,
@@ -886,6 +926,41 @@ pub(super) fn inode_meta_to_stat(meta: &InodeMeta, ino: u64, rdev: u64) -> StatL
     }
 }
 
+fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
+    let ts = |sec, nsec| StatxTimestamp {
+        tv_sec: sec,
+        tv_nsec: nsec as u32,
+        __reserved: 0,
+    };
+
+    StatxLayout {
+        stx_mask: numbers::STATX_BASIC_STATS,
+        stx_blksize: STAT_BLKSIZE as u32,
+        stx_attributes: 0,
+        stx_nlink: meta.nlinks,
+        stx_uid: meta.uid,
+        stx_gid: meta.gid,
+        stx_mode: meta.mode,
+        __spare0: 0,
+        stx_ino: ino,
+        stx_size: meta.size,
+        stx_blocks: meta.blocks,
+        stx_attributes_mask: 0,
+        stx_atime: ts(meta.atime.sec, meta.atime.nsec),
+        stx_btime: ts(0, 0),
+        stx_ctime: ts(meta.ctime.sec, meta.ctime.nsec),
+        stx_mtime: ts(meta.mtime.sec, meta.mtime.nsec),
+        stx_rdev_major: 0,
+        stx_rdev_minor: 0,
+        stx_dev_major: 0,
+        stx_dev_minor: 0,
+        stx_mnt_id: 0,
+        stx_dio_mem_align: 0,
+        stx_dio_offset_align: 0,
+        __spare3: [0; 12],
+    }
+}
+
 /// `fstat(fd, statbuf)`. Linux RV64 generic ABI `__NR_fstat = 80`.
 ///
 /// Reads `OpenFile.rnode().meta()` for the fd and writes the Linux
@@ -917,6 +992,75 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     let stat = inode_meta_to_stat(&meta, ino, 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    SyscallResult::Return(0)
+}
+
+/// `statx(dirfd, path, flags, mask, statxbuf)`. Linux generic ABI
+/// `__NR_statx = 291`.
+///
+/// This is the metadata probe LA64 musl/busybox uses before `ls`
+/// opens a directory. Txv2 reports the same inode metadata already
+/// used by `newfstatat`; unsupported sync policy bits are accepted
+/// because there is no cache coherency distinction in the current VFS
+/// layer.
+pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let flags = args[2] as u32;
+    let _mask = args[3] as u32;
+    let statxbuf_uaddr = args[4];
+
+    if dirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if path_uaddr == 0 || statxbuf_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let known_flags = AT_EMPTY_PATH
+        | AT_NO_AUTOMOUNT
+        | numbers::AT_STATX_SYNC_TYPE
+        | (AT_SYMLINK_NOFOLLOW as u32);
+    if flags & !known_flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+
+    let dentry: Cap<DEntry> = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
+        match ctx.process.cwd() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOENT_VALUE),
+        }
+    } else {
+        let cwd = match ctx.process.cwd() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOENT_VALUE),
+        };
+        let walker_cred = ctx.walker_cred();
+        use step_engine::StepOutcome as V3;
+        let outcome = {
+            let guard = step_engine::guard();
+            poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard))
+        };
+        match outcome {
+            V3::Done(d) => d,
+            V3::Continue { .. } | V3::Yield { .. } => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        }
+    };
+
+    let rnode = dentry.rnode();
+    let meta = rnode.meta();
+    let statx = inode_meta_to_statx(&meta, rnode.fs_object_id().as_u64());
+    if let Err(errno) = bootstrap_write_user::<StatxLayout>(&ctx.aspace, statxbuf_uaddr, statx) {
         return SyscallResult::Error(errno_to_i32(errno));
     }
     SyscallResult::Return(0)
