@@ -39,7 +39,6 @@ use crate::init::{console_tty, dev_mount, root_mount, CoreInit};
 /// deterministic; same shape `tx-fs` uses.
 use crate::test_serialise::KERNEL_TEST_LOCK as INIT_TEST_LOCK;
 use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
-use crate::adapter::boot_runtime::userspace::SyscallRequest;
 
 /// Test-only platform satisfying every `TxPlatform` super-trait. The
 /// pmap surface uses a host-side `Mutex`-guarded `BTreeMap` mirroring

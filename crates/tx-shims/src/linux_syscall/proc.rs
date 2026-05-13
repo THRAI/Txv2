@@ -4,7 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, StepOp};
+use crate::adapter::step_engine::{self as step_engine};
 
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///

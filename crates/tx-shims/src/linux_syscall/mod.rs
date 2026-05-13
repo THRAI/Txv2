@@ -111,7 +111,7 @@ pub mod io_uring;
 use io_uring::*;
 mod signalfd;
 use signalfd::*;
-use crate::adapter::step_engine::{self as step_engine, Cap, StepOp, StepOutcome, SubjectIdentity};
+use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 
 #[cfg(test)]
 mod tests;

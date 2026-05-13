@@ -4,7 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOp, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
 
 /// `fcntl(fd, cmd, arg)` per the Wave 2 ELF-loader plan §"Part 2 —
 /// Per-fd CLOEXEC bitmap + fcntl(F_SETFD) + O_CLOEXEC" plus Slice 7 of
