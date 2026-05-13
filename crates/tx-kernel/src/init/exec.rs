@@ -933,6 +933,15 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_decimal_unsigned(
             tx_shims::linux_syscall::proc::SYS_WAIT4_INVOCATIONS.load(Ordering::Relaxed),
         );
+        tx_hal::console_write_str::<P>(":shebang=");
+        Self::write_decimal_unsigned(
+            tx_scripts::process::exec::script::EXEC_SHEBANG_FIRED.load(Ordering::Relaxed),
+        );
+        tx_hal::console_write_str::<P>(":open-errno=");
+        Self::write_decimal_unsigned(
+            tx_scripts::process::exec::script::EXEC_LAST_OPEN_ERRNO.load(Ordering::Relaxed)
+                as usize,
+        );
         tx_hal::console_write_str::<P>("\n");
     }
 
