@@ -739,7 +739,7 @@ impl TrapIf for Platform {
     /// Returns when the trap shell chooses `TrapAction::Reschedule`
     /// and longjmps back via [`tx_rv64_resume_kernel_after_reschedule`].
     fn enter_userspace_with_context(ctx: &UserTrapContext, root: &PmapRoot) {
-        crate::debug_trace::record_entry(&ctx);
+        crate::debug_trace::record_entry(ctx);
 
         let mut frame = Rv64TrapFrame {
             x: [0; 32],
@@ -751,7 +751,7 @@ impl TrapIf for Platform {
             fcsr: 0,
             _pad_fp: 0,
         };
-        frame.restore_user_context(&ctx);
+        frame.restore_user_context(ctx);
         // `restore_user_context` already calls `prepare_user_return`,
         // which clears SPP and sets SPIE so `sret` lands in user mode
         // with interrupts enabled.

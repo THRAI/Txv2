@@ -1,10 +1,9 @@
-use step_engine::Guard;
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::vfs::structure::FsObjectId;
 
-use crate::adapter::step_engine::{self as step_engine, page_allocator, NoProgress, StepOutcome};
+use crate::adapter::step_engine::{page_allocator, Guard, NoProgress, StepOutcome};
 use crate::read_backend::{inode_no, Ext4FsInstance};
 
 use page_allocator::ZeroPolicy;
@@ -29,7 +28,7 @@ fn materialize_frame(page: &Page4K) -> StepOutcome<Frame, NoProgress> {
 
     let frame_base = match page_allocator::frame_kernel_addr(ppn) {
         Ok(ptr) => ptr,
-        Err(_) => return tx_substrate::step::StepOutcome::err(Errno::EIO.into()),
+        Err(_) => return StepOutcome::err(Errno::EIO.into()),
     };
     unsafe {
         core::ptr::copy_nonoverlapping(page.as_ptr(), frame_base, BLOCK_SIZE);

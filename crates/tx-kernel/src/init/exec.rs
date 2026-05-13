@@ -256,9 +256,9 @@ impl<P: TxPlatform> CoreInit<P> {
             let outcome = fs_ops.create_inode(root_object_id, b"init", 0o100755, &cred, &guard);
             match outcome {
                 V3::Done(out) => out,
-                V3::Err(tx_substrate::step::Errno::EROFS)
-                | V3::Err(tx_substrate::step::Errno::ENOSYS)
-                | V3::Err(tx_substrate::step::Errno::EEXIST) => {
+                V3::Err(step_engine::Errno::EROFS)
+                | V3::Err(step_engine::Errno::ENOSYS)
+                | V3::Err(step_engine::Errno::EEXIST) => {
                     // Rootfs is read-only (e.g. ext4 mounted from vda).
                     // The fixture is not needed; the real binary lives on disk.
                     Self::write_board_sentinel_prefix();
@@ -476,7 +476,7 @@ impl<P: TxPlatform> CoreInit<P> {
     ///
     /// Cheap when no bytes are pending (`read_bytes` returns 0,
     /// the rest is skipped).
-    pub(super) fn drain_pending_uart_rx_into_tty() -> usize {
+    pub(crate) fn drain_pending_uart_rx_into_tty() -> usize {
         crate::irq::drain_uart_rx_pending()
     }
 
@@ -536,7 +536,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     wrapper_payload,
                     crate::thread_future::run_thread::<P>(submit_thread, future_payload),
                 ),
-                tx_reactor::InitialSchedMeta::kernel()
+                boot_runtime::InitialSchedMeta::kernel()
                     .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
             )
         });
@@ -695,22 +695,6 @@ impl<P: TxPlatform> CoreInit<P> {
         }
         let s = core::str::from_utf8(&buf[idx..])
             .expect("write_signed_decimal: ASCII digits are always UTF-8");
-        tx_hal::console_write_str::<P>(s);
-    }
-
-    pub(super) fn write_hex_usize(value: usize) {
-        let mut buf = [0u8; core::mem::size_of::<usize>() * 2];
-        let mut n = value;
-        for idx in (0..buf.len()).rev() {
-            let digit = (n & 0xf) as u8;
-            buf[idx] = if digit < 10 {
-                b'0' + digit
-            } else {
-                b'a' + (digit - 10)
-            };
-            n >>= 4;
-        }
-        let s = core::str::from_utf8(&buf).expect("hex digits are always UTF-8");
         tx_hal::console_write_str::<P>(s);
     }
 

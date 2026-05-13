@@ -5,11 +5,10 @@ use core::ops::{Deref, DerefMut, Drop, FnOnce};
 use core::result::Result;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
 use alloc::sync::Arc;
 use tx_ext4_format::pager::{BlockImage, Ext4Pager, InodeMetaLite, InodeNo};
 use tx_ext4_format::Ext4FormatError;
-use tx_substrate::zone::{Cap, PayloadCap};
-use tx_substrate::SpinMutex;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
 use tx_subsystems::vfs::structure::DirCursor;

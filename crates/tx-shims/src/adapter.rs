@@ -35,9 +35,10 @@ pub mod step_engine {
 #[platform_adapter(
     platform = "reactor",
     domain = "reactor_entry",
-    reason = "wrap reactor::userspace re-exports used by tx-shims test scaffolding"
+    reason = "wrap reactor userspace and wait re-exports used by tx-shims syscall and test scaffolding"
 )]
 pub mod reactor_entry {
     pub use tx_reactor::userspace;
     pub use tx_reactor::userspace::SyscallRequest;
+    pub use tx_reactor::wait::{Mask, WaitProtocol};
 }

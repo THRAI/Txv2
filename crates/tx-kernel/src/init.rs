@@ -452,9 +452,9 @@ impl<P: TxPlatform> CoreInit<P> {
                 RNodeBacking::Directory,
             )
             .with_containing_mount(&payload);
-            let res = tx_substrate::zone::reserve_for::<RNode>()
+            let res = step_engine::reserve_for::<RNode>()
                 .expect("mount_rootfs_ext4_vda: root rnode reservation");
-            tx_substrate::zone::sign_for(res, raw)
+            step_engine::sign_for(res, raw)
         };
         let _root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone())
             .expect("mount_rootfs_ext4_vda: root dentry reservation");
@@ -582,16 +582,10 @@ impl<P: TxPlatform> CoreInit<P> {
             .expect("rootfs payload alive during boot")
             .into_cap()
             .fs_ops
-            .mkdir(
-                root_fs_object_id,
-                b"dev",
-                0o755,
-                &cred,
-                &guard,
-            ) {
+            .mkdir(root_fs_object_id, b"dev", 0o755, &cred, &guard)
+        {
             V3::Done(out) => out,
-            V3::Err(tx_substrate::step::Errno::ENOSYS)
-            | V3::Err(tx_substrate::step::Errno::EROFS) => {
+            V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
                 (root_fs_object_id, root_mount.root().meta())
             }
             other => panic!("mount_devfs_at_dev: mkdir(/dev) failed: {other:?}"),
@@ -1211,7 +1205,7 @@ impl<P: TxPlatform> CoreInit<P> {
                         task_payload.clone(),
                         crate::thread_future::run_thread::<P>(child_thread, task_payload),
                     ),
-                    tx_reactor::InitialSchedMeta::kernel()
+                    boot_runtime::InitialSchedMeta::kernel()
                         .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
                 );
             });

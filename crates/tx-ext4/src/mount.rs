@@ -1,5 +1,6 @@
 use core::marker::Send;
 
+use crate::adapter::step_engine::Cap;
 use alloc::sync::Arc;
 use tx_ext4_format::pager::BlockImage;
 use tx_subsystems::execution::Errno;
@@ -27,10 +28,7 @@ where
         self.backend.clone().fs_page_backing_arc()
     }
 
-    pub fn bind_mount_payload(
-        &self,
-        payload: &tx_substrate::zone::Cap<tx_subsystems::mount::MountPayload>,
-    ) {
+    pub fn bind_mount_payload(&self, payload: &Cap<tx_subsystems::mount::MountPayload>) {
         self.backend.bind_mount_payload(payload);
     }
 }

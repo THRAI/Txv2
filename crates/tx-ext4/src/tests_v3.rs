@@ -21,7 +21,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::adapter::step_engine::{
-    self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOutcome as V3,
+    self as epoch, page_allocator, Errno as V3Errno, NoProgress, SpinMutex, StepOutcome as V3,
 };
 use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
@@ -37,7 +37,7 @@ use crate::read_backend::Ext4FsInstance;
 /// epoch guards (the substrate enforces no-nesting on the same logical
 /// CPU; see `crates/tx-substrate/src/epoch/local.rs`). Every test grabs
 /// this lock before touching epoch / zone state.
-static EXT4_V3_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static EXT4_V3_TEST_LOCK: SpinMutex<()> = SpinMutex::new(());
 
 // === Mock BlockImage ===================================================
 //
@@ -211,7 +211,7 @@ fn open_fs() -> Arc<Ext4FsInstance<MemImage>> {
 
 #[test]
 fn ext4_v3_lookup_round_trips_through_v3_outcome() {
-    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock();
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
@@ -231,7 +231,7 @@ fn ext4_v3_lookup_round_trips_through_v3_outcome() {
 
 #[test]
 fn ext4_v3_load_inode_meta_returns_done_for_real_inode() {
-    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock();
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
@@ -255,7 +255,7 @@ fn ext4_v3_mutation_methods_surface_enosys_through_v3_errno() {
     // link, symlink, destroy_inode, serialize_inode_meta). Pin that
     // `ENOSYS` surfaces cleanly through the trait so walker callers
     // observe a consistent shape across backends.
-    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock();
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
@@ -291,7 +291,7 @@ fn ext4_v3_mutation_methods_surface_enosys_through_v3_errno() {
 
 #[test]
 fn ext4_v3_readdir_done_then_terminator() {
-    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock();
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
@@ -313,7 +313,7 @@ fn ext4_v3_readdir_done_then_terminator() {
 
 #[test]
 fn ext4_v3_fetch_page_returns_done_frame_for_aligned_offset() {
-    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock();
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
@@ -346,7 +346,7 @@ fn ext4_v3_fetch_page_returns_done_frame_for_aligned_offset() {
 #[test]
 fn ext4_v3_truncate_and_fsync_surface_enosys() {
     // Read-only ext4 surface today.
-    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock();
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
@@ -368,7 +368,7 @@ fn ext4_v3_factory_arcs_produce_dyn_v3_traits() {
     // will populate `MountPayload::fs_ops` /
     // `…::fs_page_backing` from. Mirrors `Tmpfs::fs_ops_arc`
     // / `Tmpfs::fs_page_backing_arc`.
-    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _serial = EXT4_V3_TEST_LOCK.lock();
     init_substrate();
     let fs = open_fs();
     let _ops_v3: Arc<dyn FsOps> = fs.clone().fs_ops_arc();

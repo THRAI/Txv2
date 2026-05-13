@@ -1,6 +1,6 @@
+use crate::adapter::step_engine::{page_allocator, StepOutcome};
+use page_allocator::ZeroPolicy;
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
-use tx_substrate::page_allocator::{self, ZeroPolicy};
-use tx_substrate::step::StepOutcome;
 use tx_subsystems::device::{BlockDevice, PhysicalBlockNumber};
 use tx_subsystems::page_backed::Frame;
 

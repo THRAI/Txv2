@@ -500,19 +500,23 @@ fn fork_aspace_demotes_parent_pmap_for_private_entries_only() {
     let _child =
         crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
 
-    assert!(
+    assert_eq!(
         parent
             .pmap()
             .lookup(crate::vm::UserVirtAddr(0x24000).containing_page())
-            .is_none(),
-        "MAP_PRIVATE PTE should be torn down on fork"
+            .expect("MAP_PRIVATE PTE should remain mapped after fork")
+            .prot,
+        Prot::READ,
+        "MAP_PRIVATE PTE should be demoted read-only on fork"
     );
-    assert!(
+    assert_eq!(
         parent
             .pmap()
             .lookup(crate::vm::UserVirtAddr(0x26000).containing_page())
-            .is_some(),
-        "MAP_SHARED PTE should remain mapped"
+            .expect("MAP_SHARED PTE should remain mapped")
+            .prot,
+        Prot::READ_WRITE,
+        "MAP_SHARED PTE should keep its original protection"
     );
 }
 

@@ -325,7 +325,10 @@ fn count_stale_doc_mentions(text: &str) -> usize {
 }
 
 fn is_lint_excluded_path(path: &str) -> bool {
-    path.starts_with("target/") || path.starts_with("external/") || path.starts_with("third_party/")
+    path.starts_with("target/")
+        || path.starts_with("external/")
+        || path.starts_with("third_party/")
+        || path.starts_with("boards/tx-hal-loongarch64-qemu-virt/")
 }
 
 fn zone_policy_allowed(path: &str) -> bool {

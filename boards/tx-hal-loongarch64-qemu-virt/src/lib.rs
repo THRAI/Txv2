@@ -808,11 +808,7 @@ const LA64_CSR_MERRENTRY: usize = 0x93;
 const LA64_CSR_TCFG: usize = 0x41;
 const LA64_CSR_TICLR: usize = 0x44;
 const LA64_CRMD_IE: usize = 1 << 2;
-const LA64_CRMD_DA: usize = 1 << 3;
 const LA64_CRMD_PG: usize = 1 << 4;
-const LA64_CRMD_PLV_MASK: usize = 0x3;
-const LA64_CRMD_DATF_MASK: usize = 0b11 << 5;
-const LA64_CRMD_DATM_MASK: usize = 0b11 << 7;
 const LA64_CRMD_DATF_CC: usize = 0b01 << 5;
 const LA64_CRMD_DATM_CC: usize = 0b01 << 7;
 #[cfg(target_arch = "loongarch64")]
@@ -949,6 +945,7 @@ impl<T> PerHartCell<T> {
     }
 }
 
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 static LA64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; LA64_MAX_BOOT_CPUS] = [
     PerHartCell::new(KernelResumeCtx {
         sp: 0,
@@ -985,6 +982,7 @@ const LA64_TRAP_STACK_SIZE: usize = 16 * 1024;
 #[repr(C, align(16))]
 pub struct La64TrapStack(pub [u8; LA64_TRAP_STACK_SIZE]);
 
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 static LA64_TRAP_STACKS: [PerHartCell<La64TrapStack>; LA64_MAX_BOOT_CPUS] = [
     PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
     PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
@@ -992,20 +990,18 @@ static LA64_TRAP_STACKS: [PerHartCell<La64TrapStack>; LA64_MAX_BOOT_CPUS] = [
     PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
 ];
 
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 pub(crate) fn la64_trap_stack_top_for_cpu(cpu: CpuId) -> usize {
     let stack = LA64_TRAP_STACKS[cpu.0].as_ptr();
     stack as usize + LA64_TRAP_STACK_SIZE
 }
 
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 pub(crate) fn la64_kernel_resume_ctx_ptr_for_cpu(cpu: CpuId) -> *mut KernelResumeCtx {
     LA64_KERNEL_RESUME_CTX[cpu.0].as_ptr()
 }
 
-pub(crate) fn current_la64_kernel_resume_ctx_ptr() -> *mut KernelResumeCtx {
-    let cpu = la64_pmap::la64_current_cpu_id();
-    la64_kernel_resume_ctx_ptr_for_cpu(cpu)
-}
-
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 static LA64_ENTRY_TRAP_FRAMES: [PerHartCell<La64TrapFrame>; LA64_MAX_BOOT_CPUS] = [
     PerHartCell::new(La64TrapFrame::empty()),
     PerHartCell::new(La64TrapFrame::empty()),
@@ -1013,11 +1009,7 @@ static LA64_ENTRY_TRAP_FRAMES: [PerHartCell<La64TrapFrame>; LA64_MAX_BOOT_CPUS] 
     PerHartCell::new(La64TrapFrame::empty()),
 ];
 
-pub(crate) fn current_la64_entry_trap_frame_ptr() -> *mut La64TrapFrame {
-    let cpu = la64_pmap::la64_current_cpu_id();
-    la64_entry_trap_frame_ptr_for_cpu(cpu)
-}
-
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 pub(crate) fn la64_entry_trap_frame_ptr_for_cpu(cpu: CpuId) -> *mut La64TrapFrame {
     LA64_ENTRY_TRAP_FRAMES[cpu.0].as_ptr()
 }
