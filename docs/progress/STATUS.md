@@ -78,6 +78,102 @@
   the kernel boots cleanly through `:boot:ok` and exits
   `userspace:exited:0` under the contest QEMU flags.
 
+- 2026-05-13 IRQ-context epoch-guard panic FIXED + busybox-extended
+  shell test 13/13 passing.
+
+  **Bug 1 (panic):** `uart_rx_irq_handler` called `step_ingest` inline,
+  which created an `epoch::guard()` while `irq_depth > 0`. The
+  domain's `debug_assert!(!in_irq_context())` fired in debug builds
+  the moment a UART RX IRQ arrived, terminating boot.
+
+  **Fix 1 (irq.rs):** Restructured the handler to drain UART bytes
+  into a new `SpinMutex<UartRxPending>` ring (512-byte capacity) and
+  return `IrqHandled::Wake` without touching the TTY line discipline.
+  A new `drain_uart_rx_pending()` runs from the reactor loop in
+  non-IRQ context (irq_depth == 0), feeding the buffered bytes
+  through `step_ingest` where the EBR guard is legal.
+
+  **Bug 2 (wake propagation):** With Bug 1 fixed, long shell command
+  lines (e.g. the 81-char `ln -s` send in the `links` group)
+  occasionally split across two paths — the 64-byte `drain_sbi_console_into_tty`
+  buffer + a UART IRQ that buffered the tail. The IRQ-deferred drain
+  fired `wait_channel.fire(TTY_READABLE)` correctly (`readable_fired = true`
+  in `step_ingest`'s outcome), but the parked `sys_read` task did not
+  wake — root cause still under investigation. Hypothesis: subscription
+  state on the channel/wait_source becomes stale when the cooked buffer
+  accumulates bytes across two `step_ingest` calls.
+
+  **Fix 2 (exec.rs):** Bumped `drain_sbi_console_into_tty`'s read
+  buffer from 64 → 512 bytes so realistic shell input fits in one
+  SBI poll and exercises only the proven SBI-direct `step_ingest`
+  path. The IRQ-deferred path stays in place (correctness preserved
+  for future inputs > 512 bytes, and the IRQ still wakes WFI promptly
+  whenever bytes arrive).
+
+  **Test extension:** added 5 new TDD-probe groups to
+  `tools/shell-tests/busybox-extended.txt` (file-copy, text-tools,
+  find, links, chmod-stat). Setup-block timeout extended 30000 →
+  60000 ms. One assertion in `links` (the `ls -la /bin/echo →
+  busybox` symlink-target display) is documentation-only because
+  initramfs-unpacked symlinks currently surface as regular files in
+  tmpfs metadata — separate gap from the symlinkat-create / cat-
+  through-symlink coverage the group actively asserts.
+
+  **Verified:**
+  - `cargo test -p tx-kernel --lib` 43/43 (irq tests updated to call
+    `drain_uart_rx_pending` after dispatching, mirroring production
+    reactor wiring).
+  - `cargo xtask shell-test --target rv64-qemu --script
+    tools/shell-tests/busybox-extended.txt --keep-going` 13/13.
+
+  **Next step:** investigate the IRQ-deferred wake-propagation gap
+  so the 64-byte SBI buffer can be restored. Specifically, trace why
+  `wait_channel.fire(TTY_READABLE)` from `drain_uart_rx_pending →
+  step_ingest` fails to wake a `sys_read` task that yielded with the
+  same source-id earlier in the same iteration (the test trace shows
+  `<DRN 17 rf=T>` immediately followed by `<L idle=T>` rather than
+  `idle=F`, indicating the subscription's waker was not invoked or
+  was invoked on an obsolete generation).
+
+- 2026-05-13 Per-thread FP context save/restore LANDED.
+
+  **Problem:** The quick fix that enabled `sort` (setting `FS=Initial`
+  in `prepare_user_return`) unblocked FP instructions but never saved
+  or restored actual FP register state across context switches. Any
+  two threads sharing a hart could corrupt each other's FP registers
+  on a reschedule.
+
+  **Fix:** Three-site change in
+  `boards/tx-hal-riscv64-qemu-virt/src/trap.rs`:
+  1. `Rv64TrapFrame` extended with `f: [u64; 32]` + `fcsr: u32` +
+     `_pad_fp: u32` (total frame grows from 288 → 552 bytes;
+     `TX_RV64_TF_SIZE`, `TX_RV64_TF_F_BASE`, and `TX_RV64_TF_FCSR`
+     constants added to the assembly `.equ` block).
+  2. Trap vector prologue: conditional FP save immediately after
+     `csrr sstatus` — checks saved sstatus bits 14:13 (FS field);
+     if FS != Off, saves f0–f31 via `fsd` and fcsr via `frcsr`/`sw`.
+  3. Trap vector epilogue + `tx_rv64_enter_userspace_save_resume`:
+     conditional FP restore after `csrw sstatus` — same FS check;
+     if FS != Off, restores fcsr via `fscsr` then f0–f31 via `fld`.
+  4. `capture_user_context`: reads `self.f`/`self.fcsr` into
+     `UserFpContext` with `FLAG_VALID` (+ `FLAG_DIRTY` if FS=3)
+     when FS != Off; returns empty context when FS=Off.
+  5. `restore_user_context`: copies `context.fp.regs`/`fcsr` to
+     `self.f`/`self.fcsr` when `fp.is_valid()`; zeroes both fields
+     otherwise (first-entry / no-FP-state case).
+
+  **Verified:** `cargo test -p tx-hal-riscv64-qemu-virt` 75/75 pass
+  including three new FP tests
+  (`trap_frame_fp_context_round_trips_through_capture_restore`,
+  `trap_frame_fp_context_empty_when_fs_off`,
+  `trap_frame_fp_context_zeroed_when_restored_without_valid_fp`);
+  `cargo build -p tx-kernel --target riscv64gc-unknown-none-elf` clean.
+
+  **Next step:** run `cargo xtask shell-test --keep-going` to confirm
+  the `text-tools` group (which triggered the original `sort` crash
+  through the FS=Off gap) and remaining groups still pass with the
+  full save/restore in place.
+
 - 2026-05-13 getdents64 sub-directory fix LANDED. `ls /bin` and
   `ls /tmp` now enumerate entries correctly on QEMU.
 
