@@ -139,7 +139,11 @@ impl<T> HartLocal<T> {
     // The `[expr; N]` syntax requires `Copy` for non-const exprs, but
     // `const { Slot::new() }` (a const block) is fine for any `T`.
     //
-    // We use a const helper to avoid requiring `T: Copy`.
+    // We use a const helper to avoid requiring `T: Copy`. The interior
+    // mutability of `Slot` (UnsafeCell + AtomicBool) is intentional —
+    // this `const` is a constructor template consumed by `[Self::NEW_SLOT; N]`,
+    // not a shared value, so the clippy lint does not apply.
+    #[allow(clippy::declare_interior_mutable_const)]
     const NEW_SLOT: Slot<T> = Slot::new();
 
     /// Create an empty `HartLocal<T>`.  Every slot starts uninitialised.
