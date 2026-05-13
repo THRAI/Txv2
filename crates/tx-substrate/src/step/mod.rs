@@ -27,7 +27,7 @@ use crate::zone::Cap;
 /// (variant names, ordering, doc comments).
 ///
 /// Discipline: this enum stays in lock-step with `execution::Errno`. The
-/// `From<execution::Errno> for step_v3::Errno` impl in
+/// `From<execution::Errno> for step::Errno` impl in
 /// `tx_subsystems::execution` is an exhaustive no-wildcard match, so
 /// adding a new variant on one side fails to compile until the same
 /// variant is added here. Removing a variant on either side is
@@ -387,7 +387,7 @@ impl ByteProgress {
     }
     /// Inherent shorthand for `<ByteProgress as StepProgress>::EMPTY`.
     /// Avoids requiring `use StepProgress;` at byte-moving call sites
-    /// (e.g. `step_v3::StepOutcome::yield_on_wait_source(ByteProgress::EMPTY,
+    /// (e.g. `step::StepOutcome::yield_on_wait_source(ByteProgress::EMPTY,
     /// source_id, interest_mask)`).
     pub const EMPTY: Self = Self { bytes: 0 };
 }

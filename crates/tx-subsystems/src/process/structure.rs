@@ -175,7 +175,7 @@ pub struct ProcessIdentity {
 /// thread-identity view, and exit-source id). Concrete types stay
 /// here in the subsystem layer.
 ///
-/// `Restrictions` currently uses the `step_v3::RestrictionStackHandle`
+/// `Restrictions` currently uses the `step::RestrictionStackHandle`
 /// placeholder because the real append-only stack lives in
 /// `tx-policy`, which is still skeleton. PR-K wires the real type
 /// alongside the seccomp/landlock landing. The trait's

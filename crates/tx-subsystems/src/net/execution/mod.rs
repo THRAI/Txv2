@@ -2,7 +2,7 @@
 
 use crate::execution::WaitToken;
 use crate::net::structure::{AcceptWireSet, RecvWireSet, SendWireSet, SocketIdentity, UrgentEvent};
-use tx_substrate::step_v3::{ByteProgress, NoProgress, StepOutcome as V3StepOutcome};
+use tx_substrate::step::{ByteProgress, NoProgress, StepOutcome as V3StepOutcome};
 
 mod step_accept;
 mod step_bind;

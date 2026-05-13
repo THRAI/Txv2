@@ -1209,7 +1209,7 @@ mod tests {
     // - `mockfs_load_inode_meta_v3` — single `Done` outcome over a
     //   non-trivial payload (`InodeMeta`).
     // - `mockfs_fetch_page_v3` — single `Err(ENOSYS)` outcome routed
-    //   through the `From<execution::Errno> for step_v3::Errno` bridge
+    //   through the `From<execution::Errno> for step::Errno` bridge
     //   (`Errno::into()`); pins that conversion path.
 
     /// step_v3-shape sibling of [`MockFs::lookup`]. Returns
@@ -1240,10 +1240,10 @@ mod tests {
 
     /// step_v3-shape sibling of [`MockFs::fetch_page`]. Always returns
     /// `Err(ENOSYS)`, routed through the `From<execution::Errno> for
-    /// step_v3::Errno` bridge so any drift in the errno catalog fails
+    /// step::Errno` bridge so any drift in the errno catalog fails
     /// this test. Mirrors how a real mount-side step fn would surface
     /// an `execution::Errno` into a step_v3 outcome:
-    /// `let errno: step_v3::Errno = exec_err.into()`.
+    /// `let errno: step::Errno = exec_err.into()`.
     fn mockfs_fetch_page_v3(
         _fs_object_id: FsObjectId,
         _offset: u64,

@@ -55,7 +55,7 @@ use core::pin::Pin;
 use core::ptr::null;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use tx_reactor::{wait::WaitOutcome, Reactor};
-use tx_substrate::step_v3::{NoProgress, StepOutcome, YieldShape};
+use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 
 mod byte_io_tests;
 mod delegate_loopback_tests;

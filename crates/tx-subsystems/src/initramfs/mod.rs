@@ -287,7 +287,7 @@ pub fn unpack_into_root_mount(
         })?
         .into_cap();
     // Errnos from the trait surfaces route through
-    // `step_v3::Errno` is the execution errno surface in v3, so the
+    // `step::Errno` is the execution errno surface in v3, so the
     // unpacker can propagate it into the existing
     // `UnpackError::FsOp { errno: Errno, .. }` carrier.
     let fs_ops = payload.fs_ops.clone();

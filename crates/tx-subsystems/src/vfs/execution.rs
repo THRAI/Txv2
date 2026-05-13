@@ -27,7 +27,7 @@ use crate::mount::MountPayload;
 // === FsOps — emits step_v3 outcomes ==================================
 //
 // Per-method progress-type choice: every method in `FsOps` uses
-// `step_v3::NoProgress`. The trait surface is one-shot identity-side
+// `step::NoProgress`. The trait surface is one-shot identity-side
 // queries / mutations (`lookup`, `mkdir`, `unlink`, …): the caller
 // asks one question per call, and the trait's contract has no
 // sub-operation accumulation (`readdir` returns one entry per call;
@@ -52,7 +52,7 @@ use crate::mount::MountPayload;
 /// `FsOps` is **not** the "v4 trait." It is the live VFS operation
 /// boundary dispatched as `Arc<dyn FsOps>` from the shim layer
 /// (`fs_basic.rs`, `fs_mut.rs`, `fs_path.rs`). Once its methods return
-/// `step_v3::StepOutcome`, it is a v3 trait in substance — the name
+/// `step::StepOutcome`, it is a v3 trait in substance — the name
 /// is older than the v3 vocabulary, that is all. See
 /// `docs/progress/decisions/2026-05-11-pr-1-6-keep-fsops.md` for the
 /// rationale (v3 requires StepOutcome shape unification, not
@@ -576,7 +576,7 @@ impl OpenFile {
                 // requires this seek-and-write to be atomic; our model
                 // approximates it by snapping the offset just before the
                 // write helper consumes it.
-                if self.flags.append {
+                if self.flags().append {
                     self.set_offset(pc.size_bytes());
                 }
                 crate::page_backed::step_write_from_kernel(pc, self, bytes, guard)
