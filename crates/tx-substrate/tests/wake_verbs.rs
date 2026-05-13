@@ -5,8 +5,8 @@
 //! `wait_routing::notify_v3_source` wrappers.
 
 use alloc::sync::Arc;
-use tx_substrate::wake::{self, MailboxEvent, TaskMailbox, WaitGeneration};
 use tx_substrate::step::InterestMask;
+use tx_substrate::wake::{self, MailboxEvent, TaskMailbox, WaitGeneration};
 
 extern crate alloc;
 
@@ -19,8 +19,14 @@ fn new_source_returns_unique_arcs() {
     let c = wake::new_source(2);
 
     // Each call produces a fresh allocation.
-    assert!(!Arc::ptr_eq(&a, &b), "same id must still produce distinct Arcs");
-    assert!(!Arc::ptr_eq(&a, &c), "different id must produce distinct Arcs");
+    assert!(
+        !Arc::ptr_eq(&a, &b),
+        "same id must still produce distinct Arcs"
+    );
+    assert!(
+        !Arc::ptr_eq(&a, &c),
+        "different id must produce distinct Arcs"
+    );
 }
 
 /// `new_source` records the id correctly.
@@ -39,11 +45,9 @@ fn notify_passes_mask_bits_through() {
     let mb = Arc::new(TaskMailbox::new());
     let gen = WaitGeneration::new(3);
 
-    let _guard = src.prepare(
-        Arc::downgrade(&mb),
-        gen,
-        InterestMask::new(0b1111),
-    ).install();
+    let _guard = src
+        .prepare(Arc::downgrade(&mb), gen, InterestMask::new(0b1111))
+        .install();
 
     wake::notify(&src, 0b0101);
 
@@ -65,11 +69,9 @@ fn notify_zero_mask_posts_nothing() {
     let mb = Arc::new(TaskMailbox::new());
     let gen = WaitGeneration::new(1);
 
-    let _guard = src.prepare(
-        Arc::downgrade(&mb),
-        gen,
-        InterestMask::new(0b1111),
-    ).install();
+    let _guard = src
+        .prepare(Arc::downgrade(&mb), gen, InterestMask::new(0b1111))
+        .install();
 
     wake::notify(&src, 0);
     assert!(mb.is_empty(), "zero-mask notify should post nothing");

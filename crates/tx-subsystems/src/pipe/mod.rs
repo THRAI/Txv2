@@ -537,10 +537,7 @@ pub struct Pipe2Op {
 impl<I: SubjectIdentity> StepOp<I> for Pipe2Op {
     type Output = (Cap<OpenFile>, Cap<OpenFile>);
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         match step_pipe2(self.flags) {
             Ok(pair) => StepOutcome::Done(pair),
             Err(e) => StepOutcome::Err(e.into()),
@@ -559,10 +556,7 @@ pub struct ReadOp<'a> {
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_read(self.payload, self.out, self.guard, self.nonblocking)
     }
 }
@@ -578,20 +572,15 @@ pub struct WriteOp<'a> {
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_write(self.payload, self.bytes, self.guard, self.nonblocking)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::adapter::step_engine::{guard, Errno as V3Errno, StepOutcome as V3Out, YieldShape};
     use super::*;
-    use super::adapter::step_engine::{
-        guard, Errno as V3Errno, StepOutcome as V3Out, YieldShape,
-    };
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vfs::structure::{RNodeBacking, StructPayload};
     use crate::zones;
@@ -1125,11 +1114,11 @@ mod step_op_wraps {
     //! the outcome shape is preserved. The free-fn tests above remain
     //! the source of truth for the semantic surface; these tests pin
     //! the wrap layer.
-    use super::*;
     use super::adapter::step_engine::{
         guard, ByteProgress, Errno as V3Errno, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
         StepProgress, YieldShape,
     };
+    use super::*;
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vfs::structure::{RNodeBacking, StructPayload};
     use crate::zones;

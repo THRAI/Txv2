@@ -28,17 +28,17 @@
 
 use alloc::vec::Vec;
 
-use tx_hal::PmapIf;
 use step_engine::page_allocator;
 use step_engine::Cap;
+use tx_hal::PmapIf;
 
 use crate::execution::Errno;
 use crate::page_backed::PageContainer;
+use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, StepOutcome};
 use crate::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
     VmFault, VmFaultError, VmMapError, VmPmapError, USER_PAGE_SIZE,
 };
-use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, StepOutcome};
 
 /// Default initial top of the userspace stack for v1 static binaries.
 ///
@@ -535,11 +535,11 @@ mod tests {
     use super::*;
     use crate::page_backed::{AnonSwapPolicy, PageContainerKind};
     use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::vm::adapter::step_engine::StepOutcome as V3StepOutcome;
     use crate::vm::{UserPage, USER_PAGE_SIZE};
     use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
-    use crate::vm::adapter::step_engine::StepOutcome as V3StepOutcome;
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -2,6 +2,7 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 use crate::process::{bootstrap_init_process, ProcessIdentity};
+use crate::signal::adapter::step_engine::Cap;
 use crate::signal::{
     ast_check, default_action, select_next_signal, step_kill_process, step_sigaction, AstOutcome,
     DefaultAction, InterruptSummary, PendingSource, SigDisposition,
@@ -9,7 +10,6 @@ use crate::signal::{
 use crate::thread_runtime::execution::{post_signal, step_sigprocmask, SigmaskHow};
 use crate::thread_runtime::structure::ThreadIdentity;
 use crate::vm::{AddressSpace, TestPmap};
-use crate::signal::adapter::step_engine::Cap;
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let g = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

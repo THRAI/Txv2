@@ -44,10 +44,12 @@ use super::numbers::{
     O_CLOEXEC, O_NONBLOCK, UFFDIO_REGISTER_MODE_MINOR, UFFDIO_REGISTER_MODE_MISSING,
     UFFDIO_REGISTER_MODE_WP, UFFDIO_REGISTER_REPLY_IOCTLS, UFFD_API,
 };
-use crate::adapter::step_engine::{self as step_engine, DelegateReply, TransitionOutcome, UfdReply};
 use super::{
     bootstrap_read_user, bootstrap_write_user, errno_to_i32, SyscallCtx, SyscallResult,
     EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
+};
+use crate::adapter::step_engine::{
+    self as step_engine, DelegateReply, TransitionOutcome, UfdReply,
 };
 
 /// Userland layout of `struct uffdio_range` (Linux generic uapi

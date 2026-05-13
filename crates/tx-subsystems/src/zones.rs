@@ -1,5 +1,5 @@
-use tx_hal::{console_write_str, TxPlatform};
 use crate::adapter::step_engine::{epoch, zone, Zone, ZoneAllocated, ZoneError};
+use tx_hal::{console_write_str, TxPlatform};
 
 use crate::{
     mount::{MountIdentity, MountNamespace, MountPayload},
@@ -314,7 +314,8 @@ mod subject_placeholders {
     use super::*;
 
     pub(super) fn register_zones() -> Result<(), ZoneError> {
-        zone::register_zone_for::<crate::adapter::step_engine::RestrictionStackHandle>().map(|_| ())?;
+        zone::register_zone_for::<crate::adapter::step_engine::RestrictionStackHandle>()
+            .map(|_| ())?;
         Ok(())
     }
 }

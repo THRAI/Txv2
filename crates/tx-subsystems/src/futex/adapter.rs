@@ -60,7 +60,9 @@ pub mod wait_routing {
     use alloc::sync::Arc;
 
     pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};
+    pub use tx_substrate::wake::{
+        MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+    };
 
     /// Mint a `WaitSource` for one futex bucket, keyed by the
     /// bucket's `source_id` so the legacy `Channel` resolver and the

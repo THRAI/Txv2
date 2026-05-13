@@ -1,7 +1,7 @@
 use tx_substrate::epoch;
 use tx_substrate::zone::{
-    self, registered_zone_count, CoLocatedEntity, OperationalCapExt, OperationalRefExt, Zone,
-    ZoneAllocated, ZoneError, ZoneId, ZoneMaintenanceBudget, Cap,
+    self, registered_zone_count, Cap, CoLocatedEntity, OperationalCapExt, OperationalRefExt, Zone,
+    ZoneAllocated, ZoneError, ZoneId, ZoneMaintenanceBudget,
 };
 
 static ZONE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -206,9 +206,7 @@ fn sign_round_trips_a_value() {
 
     let cap: Cap<Object> = zone::sign(Object { id: 42 }).expect("sign succeeds");
     let epoch_guard = epoch::guard();
-    let view = cap
-        .upgrade_operational()
-        .expect("cap is live after sign");
+    let view = cap.upgrade_operational().expect("cap is live after sign");
     assert_eq!(view.id, 42);
     drop(epoch_guard);
 }

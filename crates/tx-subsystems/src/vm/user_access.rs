@@ -36,8 +36,8 @@
 //! materialisation cannot complete inline.
 
 use alloc::vec::Vec;
-use tx_hal::UserPtr;
 use step_engine::page_allocator;
+use tx_hal::UserPtr;
 
 use crate::execution::{Errno, Guard, WaitToken};
 use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};

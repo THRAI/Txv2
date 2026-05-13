@@ -31,19 +31,11 @@ use crate::zones;
 struct NoopOps;
 
 impl CharDeviceOps for NoopOps {
-    fn read(
-        &self,
-        _out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(0)
     }
 
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(bytes.len())
     }
 }

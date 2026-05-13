@@ -1,15 +1,16 @@
 use super::*;
 use crate::execution::Errno;
+use crate::vm::adapter::step_engine::StepOutcome;
 use alloc::vec;
 use alloc::vec::Vec;
 use tx_hal::UserPtr;
-use crate::vm::adapter::step_engine::StepOutcome;
 
 fn setup_host_substrate() {
     tx_test_support::init_host();
     crate::zones::register_all().expect("kernel zones");
     match crate::vm::adapter::step_engine::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(crate::vm::adapter::step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
+        Ok(_)
+        | Err(crate::vm::adapter::step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for VM user-access tests: {error:?}"),
     }
 }

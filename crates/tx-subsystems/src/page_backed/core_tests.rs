@@ -83,10 +83,7 @@ impl crate::vfs::FsOps for RecordingFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
         V3Out::err(V3Errno::EROFS)
     }
 
@@ -128,10 +125,7 @@ impl crate::vfs::FsOps for RecordingFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
         V3Out::err(V3Errno::EROFS)
     }
 
@@ -152,10 +146,7 @@ impl crate::vfs::FsOps for RecordingFs {
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
         V3Out::err(V3Errno::EROFS)
     }
 
@@ -164,10 +155,7 @@ impl crate::vfs::FsOps for RecordingFs {
         _fs_object_id: FsObjectId,
         _cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> V3Out<Option<(DirEntry, DirCursor)>, NoProgress> {
         V3Out::done(None)
     }
 
@@ -215,11 +203,7 @@ impl FsPageBacking for RecordingFs {
         V3Out::done(())
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> V3Out<(), NoProgress> {
+    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
         V3Out::done(())
     }
 }
@@ -269,10 +253,7 @@ impl crate::vfs::FsOps for BlockingFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
         V3Out::err(V3Errno::EROFS)
     }
 
@@ -314,10 +295,7 @@ impl crate::vfs::FsOps for BlockingFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
         V3Out::err(V3Errno::EROFS)
     }
 
@@ -338,10 +316,7 @@ impl crate::vfs::FsOps for BlockingFs {
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
         V3Out::err(V3Errno::EROFS)
     }
 
@@ -350,10 +325,7 @@ impl crate::vfs::FsOps for BlockingFs {
         _fs_object_id: FsObjectId,
         _cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> V3Out<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> V3Out<Option<(DirEntry, DirCursor)>, NoProgress> {
         V3Out::done(None)
     }
 
@@ -376,11 +348,7 @@ impl FsPageBacking for BlockingFs {
         // Yield on `WaitToken(9, 0x44)` so production fns routing
         // through this trait (e.g. `materialize_file_page`)
         // observe a yield rather than `Err(EAGAIN)`.
-        V3Out::yield_on_wait_source(
-            NoProgress,
-            9,
-            0x44,
-        )
+        V3Out::yield_on_wait_source(NoProgress, 9, 0x44)
     }
 
     fn flush_page(
@@ -402,11 +370,7 @@ impl FsPageBacking for BlockingFs {
         V3Out::done(())
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> V3Out<(), NoProgress> {
+    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
         V3Out::done(())
     }
 }

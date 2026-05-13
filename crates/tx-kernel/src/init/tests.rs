@@ -32,13 +32,13 @@ const TEST_PAGE_SIZE: usize = 4096;
 
 use crate::init::{console_tty, dev_mount, root_mount, CoreInit};
 
+use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
 /// Serialise every test in this module against the rest of tx-kernel's
 /// test set: they all touch the global `INIT_PROCESS` / mount / TTY
 /// slots plus the per-CPU epoch domain (which forbids guard nesting
 /// on the same CPU). One lock keeps the kernel test set
 /// deterministic; same shape `tx-fs` uses.
 use crate::test_serialise::KERNEL_TEST_LOCK as INIT_TEST_LOCK;
-use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
 
 /// Test-only platform satisfying every `TxPlatform` super-trait. The
 /// pmap surface uses a host-side `Mutex`-guarded `BTreeMap` mirroring
@@ -571,10 +571,10 @@ fn boot_smoke_init_fds_preopened_to_console() {
 /// per the inverted loop's enter-then-await shape.
 #[test]
 fn boot_smoke_production_userspace_loop_writes_console_then_exits() {
+    use crate::adapter::boot_runtime::userspace::{SyscallRequest, UserspaceTrapInfo};
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll, Waker};
-    use crate::adapter::boot_runtime::userspace::{SyscallRequest, UserspaceTrapInfo};
     use tx_shims::linux_syscall::{NR_EXIT_GROUP, NR_WRITE};
     use tx_subsystems::process::ExitStatus;
 

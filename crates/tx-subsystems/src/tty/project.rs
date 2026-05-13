@@ -298,8 +298,8 @@ impl PtyIndexName {
 // other helpers, per the wave-4/6/7/9a trait-impl convention.
 
 use crate::page_backed::{Frame, FsPageBacking, PageContainer};
-use crate::vfs::FsOps;
 use crate::tty::adapter::step_engine::{NoProgress, StepOutcome};
+use crate::vfs::FsOps;
 
 impl FsOps for DevptsInstance {
     fn lookup(
@@ -332,23 +332,14 @@ impl FsOps for DevptsInstance {
         _guard: &Guard<'_>,
     ) -> StepOutcome<InodeMeta, NoProgress> {
         if fs_object_id == DEVPTS_ROOT_OBJECT_ID {
-            return StepOutcome::done(InodeMeta::new(
-                InodeKind::Directory,
-                0o040755,
-            ));
+            return StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755));
         }
         if fs_object_id == DEVPTS_PTMX_OBJECT_ID {
-            return StepOutcome::done(InodeMeta::new(
-                InodeKind::CharDevice,
-                0o020666,
-            ));
+            return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, 0o020666));
         }
         if let Some(index) = pty_index_from_devpts_object_id(fs_object_id) {
             if registry::contains_pty_slave(index) {
-                return StepOutcome::done(InodeMeta::new(
-                    InodeKind::CharDevice,
-                    0o020620,
-                ));
+                return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, 0o020620));
             }
         }
         StepOutcome::err(Errno::ENOENT.into())
@@ -370,10 +361,7 @@ impl FsOps for DevptsInstance {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::EROFS.into())
     }
 
@@ -415,10 +403,7 @@ impl FsOps for DevptsInstance {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::EROFS.into())
     }
 
@@ -439,10 +424,7 @@ impl FsOps for DevptsInstance {
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::EROFS.into())
     }
 
@@ -451,10 +433,7 @@ impl FsOps for DevptsInstance {
         fs_object_id: FsObjectId,
         cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
         if fs_object_id != DEVPTS_ROOT_OBJECT_ID {
             return StepOutcome::err(Errno::ENOTDIR.into());
         }
@@ -467,10 +446,7 @@ impl FsOps for DevptsInstance {
         let Some(entry) = entries.get(index).copied() else {
             return StepOutcome::done(None);
         };
-        StepOutcome::done(Some((
-            entry,
-            DirCursor::from_u64(cursor.as_u64() + 1),
-        )))
+        StepOutcome::done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
     }
 
     fn destroy_inode(
@@ -528,11 +504,7 @@ impl FsPageBacking for DevptsInstance {
         StepOutcome::err(step_engine::Errno::ENOSYS)
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(), NoProgress> {
+    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         StepOutcome::err(step_engine::Errno::ENOSYS)
     }
 

@@ -5,7 +5,10 @@ use alloc::sync::Arc;
 use alloc::vec;
 use std::collections::BTreeMap;
 
-use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, Errno as V3Errno, NoProgress, SpinMutex, StepOutcome};
+use crate::adapter::step_engine::{
+    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, Errno as V3Errno,
+    NoProgress, SpinMutex, StepOutcome,
+};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
@@ -89,8 +92,7 @@ impl ExecveTestFs {
         let size = bytes.len() as u64;
         let guard = guard();
         match tx_subsystems::page_backed::step_truncate(&pc, size, &guard) {
-            StepOutcome::Done(())
-            | StepOutcome::Continue { .. } => {}
+            StepOutcome::Done(()) | StepOutcome::Continue { .. } => {}
             other => panic!("step_truncate(pc, {size}) failed: {other:?}"),
         }
         drop(guard);
@@ -489,10 +491,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
@@ -534,10 +533,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
@@ -558,10 +554,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
@@ -570,10 +563,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _fs_object_id: FsObjectId,
         _cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
         StepOutcome::done(None)
     }
 
@@ -616,9 +606,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
                     Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
                 }
             }
-            ExecveTestInode::Directory => {
-                StepOutcome::err(Errno::EISDIR.into())
-            }
+            ExecveTestInode::Directory => StepOutcome::err(Errno::EISDIR.into()),
         }
     }
 }
@@ -675,11 +663,7 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecveTestFs {
         StepOutcome::done(())
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(), NoProgress> {
+    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         StepOutcome::done(())
     }
 }
@@ -711,8 +695,8 @@ fn execve_testfs_v3_lookup_round_trips_after_add_regular() {
 
 #[test]
 fn execve_testfs_v3_load_inode_meta_returns_directory_for_root() {
-    use StepOutcome as V3;
     use tx_subsystems::vfs::FsOps;
+    use StepOutcome as V3;
 
     let _setup = execve_setup();
 

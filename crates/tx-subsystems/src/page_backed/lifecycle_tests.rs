@@ -545,8 +545,8 @@ fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
 // identity-side queries / mutations; page accounting belongs to
 // `FsPageBacking`.
 
-use crate::vfs::FsOps;
 use crate::page_backed::adapter::step_engine::Errno as V3Errno;
+use crate::vfs::FsOps;
 
 impl FsOps for LifecycleFs {
     fn lookup(

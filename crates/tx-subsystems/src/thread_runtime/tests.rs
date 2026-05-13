@@ -15,6 +15,8 @@ use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
 use crate::process::{bootstrap_init_process, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
+use crate::thread_runtime::adapter::reactor_entry::{SyscallRequest, UserspaceTrapInfo};
+use crate::thread_runtime::adapter::step_engine::{Cap, PayloadCap};
 use crate::thread_runtime::execution::prepare_userspace_entry_payload;
 use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{
@@ -23,8 +25,6 @@ use crate::thread_runtime::structure::{
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
 use tx_hal::UserTrapContext;
-use crate::thread_runtime::adapter::reactor_entry::{SyscallRequest, UserspaceTrapInfo};
-use crate::thread_runtime::adapter::step_engine::{Cap, PayloadCap};
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -1008,10 +1008,7 @@ pub struct KillProcessOp {
 impl<I: SubjectIdentity> StepOp<I> for KillProcessOp {
     type Output = KillOutcome;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_kill_process(&self.target, self.sig))
     }
 }
@@ -1025,10 +1022,7 @@ pub struct KillPgrpOp {
 impl<I: SubjectIdentity> StepOp<I> for KillPgrpOp {
     type Output = usize;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_kill_pgrp(&self.pgrp, self.sig))
     }
 }
@@ -1043,15 +1037,8 @@ pub struct SigactionOp {
 impl<I: SubjectIdentity> StepOp<I> for SigactionOp {
     type Output = SigDispositionChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_sigaction(
-            &self.process,
-            self.sig,
-            self.disposition,
-        ))
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_sigaction(&self.process, self.sig, self.disposition))
     }
 }
 
@@ -1066,13 +1053,13 @@ mod step_op_wraps {
     use super::*;
     use crate::process::bootstrap_init_process;
     use crate::process::structure::reset_pid_counter_for_test;
+    use crate::signal::adapter::step_engine::{
+        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
+    };
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::thread_runtime::structure::reset_tid_counter_for_test;
     use crate::vm::{AddressSpace, TestPmap};
     use crate::zones;
-    use crate::signal::adapter::step_engine::{
-        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
-    };
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         tx_test_support::init_host();

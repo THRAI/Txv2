@@ -1,4 +1,7 @@
 use super::*;
+use crate::page_backed::adapter::step_engine::{
+    self as step_engine, Errno as V3Errno, StepOutcome as V3Out,
+};
 use crate::vfs::{FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking};
 use crate::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
@@ -6,9 +9,6 @@ use crate::vm::{
 };
 use alloc::vec;
 use alloc::vec::Vec;
-use crate::page_backed::adapter::step_engine::{
-    self as step_engine, Errno as V3Errno, StepOutcome as V3Out,
-};
 use tx_hal::UserPtr;
 
 fn setup_host_substrate() {

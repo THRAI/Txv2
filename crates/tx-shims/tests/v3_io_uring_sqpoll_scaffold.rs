@@ -55,7 +55,7 @@ use tx_hal::{
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
-use tx_shims::adapter::step_engine::{Cap, CancelReason, OnBehalfOfAbort};
+use tx_shims::adapter::step_engine::{CancelReason, Cap, OnBehalfOfAbort};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };

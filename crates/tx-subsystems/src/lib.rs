@@ -109,7 +109,9 @@ pub mod cross_crate_test_support {
     /// This helper closes that gap for unit tests; production callers
     /// drop capabilities through file-cap / `prctl` slices that the
     /// DAC + setuid slice does not ship.
-    pub fn clear_caps_for_test(process: &crate::adapter::step_engine::Cap<crate::process::ProcessIdentity>) {
+    pub fn clear_caps_for_test(
+        process: &crate::adapter::step_engine::Cap<crate::process::ProcessIdentity>,
+    ) {
         crate::cred::clear_caps_for_test(process);
     }
 

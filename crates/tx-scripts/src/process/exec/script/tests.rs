@@ -23,11 +23,13 @@ use alloc::vec::Vec;
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
+use crate::adapter::step_engine::{
+    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, SpinMutex, StepOutcome,
+};
 use tx_hal::{
     Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, SpinMutex, StepOutcome};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
@@ -246,8 +248,7 @@ impl ExecTestFs {
         // than reaching into `set_size_bytes` (pub(crate)).
         let guard = guard();
         match tx_subsystems::page_backed::step_truncate(&pc, size, &guard) {
-            StepOutcome::Done(())
-            | StepOutcome::Continue { .. } => {}
+            StepOutcome::Done(()) | StepOutcome::Continue { .. } => {}
             other => panic!("step_truncate(pc, {size}) failed: {other:?}"),
         }
         drop(guard);

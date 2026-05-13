@@ -5,11 +5,11 @@
 //! and return the evidence execution needs, while reservation and mutation stay
 //! in `execution.rs`.
 
+use crate::vm::adapter::step_engine::{self as step_engine};
 use crate::vm::{
     AccessMode, AddressSpace, MapPlacement, UserRange, VmEntry, VmFault, VmFaultError,
     VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultOutcome, VmMapError,
 };
-use crate::vm::adapter::step_engine::{self as step_engine};
 
 pub fn require_fault_recipe(
     aspace: &AddressSpace,

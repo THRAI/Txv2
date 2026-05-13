@@ -3,11 +3,13 @@
 use crate::tty::adapter::step_engine::{self as step_engine, Cap, PayloadCap};
 
 use crate::execution::{Errno, Guard};
+use crate::tty::adapter::step_engine::{
+    NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 use crate::tty::project;
 use crate::tty::structure::registry;
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
 use crate::vfs::OpenFile;
-use crate::tty::adapter::step_engine::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 // Re-import v3 types via local alias for brevity in fn body.
 
@@ -22,9 +24,7 @@ pub struct OpenPtyOutcome {
 
 /// Create master/slave TTY identities, install peer-linked payloads, publish
 /// the slave into the devpts registry, and return OpenFiles for both sides.
-pub fn step_openpty(
-    guard: &Guard<'_>,
-) -> StepOutcome<OpenPtyOutcome, NoProgress> {
+pub fn step_openpty(guard: &Guard<'_>) -> StepOutcome<OpenPtyOutcome, NoProgress> {
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let index = match registry::allocate_pty_index() {
@@ -154,15 +154,10 @@ pub struct OpenPtyOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for OpenPtyOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenPtyOp<'a> {
     type Output = OpenPtyOutcome;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_openpty(self.guard)
     }
 }

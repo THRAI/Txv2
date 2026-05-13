@@ -7,6 +7,7 @@
 //! identity/payload split is the primary subject under test: zombies
 //! retain identity but drop payload.
 
+use crate::process::adapter::step_engine::{guard as ebr_guard, sign, Cap};
 use crate::process::execution::{
     init_process, reset_init_process_for_test, step_exit_group_with_signal, BootstrapError,
 };
@@ -24,7 +25,6 @@ use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentit
 use crate::vfs::{DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
-use crate::process::adapter::step_engine::{guard as ebr_guard, sign, Cap};
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

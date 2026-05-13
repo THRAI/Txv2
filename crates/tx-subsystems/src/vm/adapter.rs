@@ -30,9 +30,7 @@ use tx_platform_adapter::platform_adapter;
 )]
 pub mod step_engine {
     pub use tx_substrate::epoch::{self as epoch_mod, guard, Guard};
-    pub use tx_substrate::page_allocator::{
-        self, BitmapPageAllocator, CachePin, ZeroPolicy,
-    };
+    pub use tx_substrate::page_allocator::{self, BitmapPageAllocator, CachePin, ZeroPolicy};
     pub use tx_substrate::shootdown::{AddressSpaceShootdownBatch, ShootdownError};
     pub use tx_substrate::step::{
         AbortReason, AgentCancelPolicy, ByteProgress, DelegateRegistry, DelegateReply,

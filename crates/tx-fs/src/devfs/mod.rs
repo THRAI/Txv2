@@ -38,9 +38,7 @@ use alloc::sync::Arc;
 
 pub mod adapter;
 
-use adapter::step_engine::{
-    self as step_engine, Cap, NoProgress, StepOutcome,
-};
+use adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::process;
@@ -116,9 +114,7 @@ fn entry_index_from_object_id(id: FsObjectId) -> Option<usize> {
 ///
 /// Returns `Errno::ENOENT` if the registry has no such alias,
 /// `Errno::EIO` if RNode allocation fails.
-pub fn resolve_console_rnode(
-    name: &[u8],
-) -> StepOutcome<Cap<RNode>, NoProgress> {
+pub fn resolve_console_rnode(name: &[u8]) -> StepOutcome<Cap<RNode>, NoProgress> {
     use StepOutcome as V3;
     let Some(tty) = tty::project::resolve_devfs_alias(name) else {
         return V3::err(Errno::ENOENT.into());
@@ -330,19 +326,13 @@ impl FsOps for Devfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<InodeMeta, NoProgress> {
         if fs_object_id == DEVFS_ROOT_OBJECT_ID {
-            return StepOutcome::done(InodeMeta::new(
-                InodeKind::Directory,
-                DEVFS_ROOT_MODE,
-            ));
+            return StepOutcome::done(InodeMeta::new(InodeKind::Directory, DEVFS_ROOT_MODE));
         }
         if entry_index_from_object_id(fs_object_id)
             .and_then(|idx| tty::project::devfs_alias_entries().into_iter().nth(idx))
             .is_some()
         {
-            return StepOutcome::done(InodeMeta::new(
-                InodeKind::CharDevice,
-                DEVFS_CHAR_MODE,
-            ));
+            return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, DEVFS_CHAR_MODE));
         }
         StepOutcome::err(Errno::ENOENT.into())
     }
@@ -363,10 +353,7 @@ impl FsOps for Devfs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::EROFS.into())
     }
 
@@ -408,10 +395,7 @@ impl FsOps for Devfs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::EROFS.into())
     }
 
@@ -432,10 +416,7 @@ impl FsOps for Devfs {
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::EROFS.into())
     }
 
@@ -444,10 +425,7 @@ impl FsOps for Devfs {
         fs_object_id: FsObjectId,
         cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
         if fs_object_id != DEVFS_ROOT_OBJECT_ID {
             return StepOutcome::err(Errno::ENOTDIR.into());
         }
@@ -464,10 +442,7 @@ impl FsOps for Devfs {
             Ok(de) => de,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        StepOutcome::done(Some((
-            dir_entry,
-            DirCursor::from_u64(cursor.as_u64() + 1),
-        )))
+        StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))))
     }
 
     fn destroy_inode(
@@ -586,11 +561,7 @@ impl FsPageBacking for Devfs {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(), NoProgress> {
+    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 

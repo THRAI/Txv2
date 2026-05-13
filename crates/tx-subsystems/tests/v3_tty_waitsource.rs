@@ -81,19 +81,11 @@ static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct NoopOps;
 
 impl CharDeviceOps for NoopOps {
-    fn read(
-        &self,
-        _out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(0)
     }
 
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(bytes.len())
     }
 }
@@ -132,10 +124,7 @@ fn register<'a>(
     source: &'a Arc<WaitSource>,
     mailbox: &Arc<TaskMailbox>,
     interests: u64,
-) -> (
-    WaitRegistrationGuard<'a>,
-    WaitGeneration,
-) {
+) -> (WaitRegistrationGuard<'a>, WaitGeneration) {
     let gen = mailbox.next_generation();
     let prep = source.prepare(Arc::downgrade(mailbox), gen, InterestMask::new(interests));
     let guard = prep.install_if(|| true).expect("registration installed");

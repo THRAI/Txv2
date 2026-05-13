@@ -58,7 +58,9 @@ pub mod wait_routing {
     use alloc::sync::Arc;
 
     pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};
+    pub use tx_substrate::wake::{
+        MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+    };
 
     /// Delegates to `tx_substrate::wake::new_source`.
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {

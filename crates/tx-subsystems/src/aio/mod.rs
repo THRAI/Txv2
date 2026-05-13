@@ -100,9 +100,9 @@ use core::task::{Context, Poll};
 pub mod adapter;
 
 use adapter::step_engine::{
-    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask,
-    OnBehalfOfAbort, ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource,
-    WaitSourceId, Zone, ZoneAllocated, ZoneError,
+    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask, OnBehalfOfAbort,
+    ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource, WaitSourceId, Zone,
+    ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::Channel;
 
@@ -985,9 +985,7 @@ mod tests {
         assert!(
             matches!(
                 reason,
-                OnBehalfOfAbort::CooperativeCancel(
-                    CancelReason::OwnerRequested
-                )
+                OnBehalfOfAbort::CooperativeCancel(CancelReason::OwnerRequested)
             ),
             "cancel_worker trips OwnerRequested, got {reason:?}"
         );

@@ -85,10 +85,7 @@ pub trait FsOps: Send + Sync + 'static {
         mode: u16,
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    >;
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress>;
 
     fn unlink(
         &self,
@@ -122,10 +119,7 @@ pub trait FsOps: Send + Sync + 'static {
         mode: u16,
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    >;
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress>;
 
     fn rmdir(
         &self,
@@ -142,10 +136,7 @@ pub trait FsOps: Send + Sync + 'static {
         link_target: &[u8],
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    >;
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress>;
 
     /// Per-call one-entry readdir. Cursor is a method input, not
     /// progress — the caller composes multi-entry enumerations by
@@ -158,10 +149,7 @@ pub trait FsOps: Send + Sync + 'static {
         fs_object_id: FsObjectId,
         cursor: super::structure::DirCursor,
         guard: &Guard<'_>,
-    ) -> StepOutcome<
-        Option<(DirEntry, super::structure::DirCursor)>,
-        NoProgress,
-    >;
+    ) -> StepOutcome<Option<(DirEntry, super::structure::DirCursor)>, NoProgress>;
 
     fn destroy_inode(
         &self,
@@ -175,10 +163,7 @@ pub trait FsOps: Send + Sync + 'static {
         &self,
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
-    ) -> StepOutcome<
-        alloc::boxed::Box<[u8]>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
         let _ = (fs_object_id, guard);
         StepOutcome::err(Errno::ENOSYS)
     }
@@ -191,10 +176,7 @@ pub trait FsOps: Send + Sync + 'static {
         fs_object_id: FsObjectId,
         meta: InodeMeta,
         guard: &Guard<'_>,
-    ) -> StepOutcome<
-        Cap<crate::vfs::structure::RNode>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<Cap<crate::vfs::structure::RNode>, NoProgress> {
         let _ = (fs_object_id, meta, guard);
         StepOutcome::err(Errno::ENOSYS)
     }
@@ -558,15 +540,10 @@ pub struct OpenFileReadOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for OpenFileReadOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         self.file.step_read(self.out, self.guard)
     }
 }
@@ -580,15 +557,10 @@ pub struct OpenFileLseekOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for OpenFileLseekOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileLseekOp<'a> {
     type Output = u64;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         self.file.step_lseek(self.offset, self.whence, self.guard)
     }
 }
@@ -600,15 +572,10 @@ pub struct OpenFileWriteOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for OpenFileWriteOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         self.file.step_write(self.bytes, self.guard)
     }
 }
@@ -622,15 +589,10 @@ pub struct OpenFileIoctlOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for OpenFileIoctlOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileIoctlOp<'a> {
     type Output = OpenFileIoctlResult;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         self.file.step_ioctl(self.caller, self.request, self.guard)
     }
 }
@@ -646,24 +608,20 @@ mod step_op_wraps {
     use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
+    use crate::vfs::adapter::step_engine::{
+        guard, reserve_for, sign_for, Cap, PayloadCap, ProcessIdentity, ScriptCtx, StepOp,
+        StepOutcome as V3,
+    };
     use crate::vfs::structure::{
         FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl,
         OpenFileIoctlCaller, OpenFileIoctlResult, RNode, RNodeBacking, StructPayload,
     };
     use crate::zones;
-    use crate::vfs::adapter::step_engine::{
-        guard, reserve_for, sign_for, Cap, PayloadCap, ProcessIdentity, ScriptCtx, StepOp,
-        StepOutcome as V3,
-    };
 
     struct EchoOps;
 
     impl CharDeviceOps for EchoOps {
-        fn read(
-            &self,
-            out: &mut [u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress> {
+        fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             if out.is_empty() {
                 return V3::Done(0);
             }
@@ -671,11 +629,7 @@ mod step_op_wraps {
             V3::Done(1)
         }
 
-        fn write(
-            &self,
-            bytes: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress> {
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             V3::Done(bytes.len())
         }
     }

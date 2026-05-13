@@ -1,6 +1,8 @@
 use super::*;
+use crate::page_backed::adapter::step_engine::{
+    self as step_engine, ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 use crate::vm::AddressSpace;
-use crate::page_backed::adapter::step_engine::{self as step_engine, ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 /// Read up to `len` bytes from `pc` at `of.offset()` into the user buffer at
 /// `dst`, returning the number of bytes actually copied.
@@ -134,7 +136,7 @@ fn step_range_with_user_buffer(
         //   if no progress yet, else partial `Done`.
         // - `Err(errno)` with `advanced == 0` → v3 `Err(errno)`.
         //   Otherwise return v3 `Done(advanced)` (partial-success).
-use crate::page_backed::adapter::step_engine::YieldShape;
+        use crate::page_backed::adapter::step_engine::YieldShape;
         match pc.materialize_page(page_index, access, guard) {
             StepOutcome::Done(materialized) => {
                 match copy_chunk_user(
@@ -529,15 +531,10 @@ pub struct ReadToUserOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for ReadToUserOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for ReadToUserOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_read_to_user(
             self.pc,
             self.of,
@@ -559,15 +556,10 @@ pub struct WriteFromUserOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for WriteFromUserOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for WriteFromUserOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_write_from_user(
             self.pc,
             self.of,

@@ -283,9 +283,7 @@ impl MountIdentity {
 impl Entity for MountIdentity {
     type OperationalEvidence = MountPayloadPin;
 
-    fn upgrade_operational(
-        identity: &Cap<Self>,
-    ) -> Result<Self::OperationalEvidence, Dead> {
+    fn upgrade_operational(identity: &Cap<Self>) -> Result<Self::OperationalEvidence, Dead> {
         Ok(MountPayloadPin::acquire(&identity.payload_cap()?))
     }
 }
@@ -534,8 +532,7 @@ mod tests {
             _parent: FsObjectId,
             name: &[u8],
             _guard: &Guard<'_>,
-        ) -> StepOutcome<FsObjectId, NoProgress>
-        {
+        ) -> StepOutcome<FsObjectId, NoProgress> {
             if name == b"root" {
                 StepOutcome::done(FsObjectId::ROOT)
             } else {
@@ -547,8 +544,7 @@ mod tests {
             &self,
             _fs_object_id: FsObjectId,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<InodeMeta, NoProgress>
-        {
+        ) -> StepOutcome<InodeMeta, NoProgress> {
             StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755))
         }
 
@@ -568,10 +564,7 @@ mod tests {
             _mode: u16,
             _cred: &Credential,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<
-            (FsObjectId, InodeMeta),
-            NoProgress,
-        > {
+        ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
             StepOutcome::err(V3Errno::EROFS)
         }
 
@@ -613,10 +606,7 @@ mod tests {
             _mode: u16,
             _cred: &Credential,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<
-            (FsObjectId, InodeMeta),
-            NoProgress,
-        > {
+        ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
             StepOutcome::err(V3Errno::EROFS)
         }
 
@@ -637,10 +627,7 @@ mod tests {
             _link_target: &[u8],
             _cred: &Credential,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<
-            (FsObjectId, InodeMeta),
-            NoProgress,
-        > {
+        ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
             StepOutcome::err(V3Errno::EROFS)
         }
 
@@ -649,10 +636,7 @@ mod tests {
             _fs_object_id: FsObjectId,
             _cursor: DirCursor,
             _guard: &Guard<'_>,
-        ) -> StepOutcome<
-            Option<(DirEntry, DirCursor)>,
-            NoProgress,
-        > {
+        ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
             StepOutcome::done(None)
         }
 

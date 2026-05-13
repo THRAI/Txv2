@@ -67,8 +67,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    guard, sign, ByteProgress, Cap, InterestMask, SpinMutex, StepOutcome, V3Errno,
-    WaitSource, WaitSourceId, Weak, Zone, ZoneAllocated, ZoneError,
+    guard, sign, ByteProgress, Cap, InterestMask, SpinMutex, StepOutcome, V3Errno, WaitSource,
+    WaitSourceId, Weak, Zone, ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::{Channel, Mask};
 
@@ -441,12 +441,8 @@ mod tests {
         let _g = setup();
         // Use a faked owner_proc_key = 0; for the no-process raw path
         // we sign directly via the zone (skipping the registry).
-        let a = {
-            sign(SignalFd::new(0, 0)).expect("reserve a")
-        };
-        let b = {
-            sign(SignalFd::new(0, 0)).expect("reserve b")
-        };
+        let a = { sign(SignalFd::new(0, 0)).expect("reserve a") };
+        let b = { sign(SignalFd::new(0, 0)).expect("reserve b") };
         assert_ne!(
             a.sfd_id(),
             b.sfd_id(),
@@ -461,9 +457,7 @@ mod tests {
         let sigusr1 = Signum::new(10).expect("SIGUSR1");
         let sigusr2 = Signum::new(12).expect("SIGUSR2");
 
-        let cap = {
-            sign(SignalFd::new(0, sigusr1.bit())).expect("reserve")
-        };
+        let cap = { sign(SignalFd::new(0, sigusr1.bit())).expect("reserve") };
 
         // SIGUSR2 is not in the mask — drop on the floor.
         assert!(!cap.notify(sigusr2));
@@ -482,9 +476,7 @@ mod tests {
     #[test]
     fn signalfd_read_returns_eagain_when_empty_and_nonblocking() {
         let _g = setup();
-        let cap = {
-            sign(SignalFd::new(0, !0u64)).expect("reserve")
-        };
+        let cap = { sign(SignalFd::new(0, !0u64)).expect("reserve") };
         let mut buf = [0u8; SIGNALFD_SIGINFO_SIZE];
         let outcome = signalfd_read(&cap, &mut buf, /* nonblocking = */ true);
         match outcome {
@@ -497,9 +489,7 @@ mod tests {
     fn signalfd_read_serializes_popped_siginfo() {
         let _g = setup();
         let sigusr1 = Signum::new(10).expect("SIGUSR1");
-        let cap = {
-            sign(SignalFd::new(0, sigusr1.bit())).expect("reserve")
-        };
+        let cap = { sign(SignalFd::new(0, sigusr1.bit())).expect("reserve") };
         assert!(cap.notify(sigusr1));
         let mut buf = [0xFFu8; SIGNALFD_SIGINFO_SIZE];
         let outcome = signalfd_read(&cap, &mut buf, false);
@@ -517,9 +507,7 @@ mod tests {
     #[test]
     fn signalfd_read_short_buf_returns_einval() {
         let _g = setup();
-        let cap = {
-            sign(SignalFd::new(0, !0u64)).expect("reserve")
-        };
+        let cap = { sign(SignalFd::new(0, !0u64)).expect("reserve") };
         let mut short_buf = [0u8; SIGNALFD_SIGINFO_SIZE - 1];
         let outcome = signalfd_read(&cap, &mut short_buf, false);
         match outcome {

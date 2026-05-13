@@ -12,9 +12,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, Cap,
-    CachePin, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
-    YieldShape, Zone, ZoneAllocated, ZoneError, ZeroPolicy,
+    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, CachePin,
+    Cap, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+    YieldShape, ZeroPolicy, Zone, ZoneAllocated, ZoneError,
 };
 
 use crate::execution::{Errno, Guard};
@@ -380,8 +380,7 @@ impl PageContainer {
         page: PageIndex,
         access: MaterializeAccess,
         guard: &Guard<'_>,
-    ) -> StepOutcome<MaterializedPage, NoProgress>
-    {
+    ) -> StepOutcome<MaterializedPage, NoProgress> {
         if let Err(error) = self.check_bounds(page) {
             return StepOutcome::Err(page_cache_error_to_errno(error).into());
         }
@@ -409,8 +408,7 @@ impl PageContainer {
         mount: &MountPayloadPin,
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
-    ) -> StepOutcome<MaterializedPage, NoProgress>
-    {
+    ) -> StepOutcome<MaterializedPage, NoProgress> {
         use adapter::step_engine::Errno as V3Errno;
         if let Some(materialized) = self.materialize_cached_page(page, access) {
             return match materialized {
@@ -465,8 +463,7 @@ impl PageContainer {
         access: MaterializeAccess,
         frame: Frame,
         newly_installed: bool,
-    ) -> StepOutcome<MaterializedPage, NoProgress>
-    {
+    ) -> StepOutcome<MaterializedPage, NoProgress> {
         let frame = match cached_frame_from_frame(frame) {
             Ok(frame) => frame,
             Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
@@ -496,8 +493,7 @@ impl PageContainer {
         page: PageIndex,
         base_ppn: Ppn,
         page_count: u64,
-    ) -> StepOutcome<MaterializedPage, NoProgress>
-    {
+    ) -> StepOutcome<MaterializedPage, NoProgress> {
         use adapter::step_engine::Errno as V3Errno;
         if page.as_u64() >= page_count {
             return StepOutcome::Err(V3Errno::EINVAL);
@@ -669,8 +665,7 @@ fn step_range(
         //   were swallowed into a successful partial step).
         use adapter::step_engine::Errno as V3Errno;
         match pc.materialize_page(page_index, access, guard) {
-            StepOutcome::Done(_)
-            | StepOutcome::Continue { .. } => {
+            StepOutcome::Done(_) | StepOutcome::Continue { .. } => {
                 advanced += chunk;
                 offset += chunk as u64;
             }
@@ -735,15 +730,10 @@ pub struct ReadOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for ReadOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_read(self.pc, self.of, self.len, self.guard)
     }
 }
@@ -756,15 +746,10 @@ pub struct WriteOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for WriteOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_write(self.pc, self.of, self.len, self.guard)
     }
 }

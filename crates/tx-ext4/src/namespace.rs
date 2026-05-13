@@ -1,5 +1,5 @@
-use tx_ext4_format::pager::{BlockImage, DirEntryLite};
 use step_engine::Guard;
+use tx_ext4_format::pager::{BlockImage, DirEntryLite};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::vfs::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
@@ -36,8 +36,8 @@ fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
 // sites avoid clashing with `tx_subsystems::execution::Errno`
 // already in scope.
 
-use tx_subsystems::vfs::FsOps;
 use crate::adapter::step_engine::{self as step_engine, NoProgress, StepOutcome};
+use tx_subsystems::vfs::FsOps;
 
 /// Factory for `MountOutput::fs_ops`.
 ///
@@ -105,10 +105,7 @@ where
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
@@ -150,10 +147,7 @@ where
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
@@ -174,10 +168,7 @@ where
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
@@ -186,10 +177,7 @@ where
         fs_object_id: FsObjectId,
         cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),

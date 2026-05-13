@@ -875,10 +875,7 @@ pub struct SetuidOp {
 impl<I: SubjectIdentity> StepOp<I> for SetuidOp {
     type Output = CredChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setuid(&self.target, self.new_uid))
     }
 }
@@ -892,10 +889,7 @@ pub struct SetgidOp {
 impl<I: SubjectIdentity> StepOp<I> for SetgidOp {
     type Output = CredChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setgid(&self.target, self.new_gid))
     }
 }
@@ -912,10 +906,7 @@ pub struct SetreuidOp {
 impl<I: SubjectIdentity> StepOp<I> for SetreuidOp {
     type Output = CredChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setreuid(&self.target, self.ruid, self.euid))
     }
 }
@@ -931,10 +922,7 @@ pub struct SetresuidOp {
 impl<I: SubjectIdentity> StepOp<I> for SetresuidOp {
     type Output = CredChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setresuid(
             &self.target,
             self.ruid,
@@ -955,10 +943,7 @@ pub struct SetresgidOp {
 impl<I: SubjectIdentity> StepOp<I> for SetresgidOp {
     type Output = CredChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setresgid(
             &self.target,
             self.rgid,
@@ -978,10 +963,7 @@ pub struct SetregidOp {
 impl<I: SubjectIdentity> StepOp<I> for SetregidOp {
     type Output = CredChange;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setregid(&self.target, self.rgid, self.egid))
     }
 }
@@ -996,15 +978,10 @@ pub struct ApplySuidForExecOp {
     pub file_mode: u16,
 }
 
-impl<I: SubjectIdentity> StepOp<I>
-    for ApplySuidForExecOp
-{
+impl<I: SubjectIdentity> StepOp<I> for ApplySuidForExecOp {
     type Output = Option<ExecCredOutcome>;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_apply_suid_for_exec(
             &self.target,
             self.file_uid,
@@ -1023,13 +1000,13 @@ mod step_op_wraps {
     //! the privilege/permission rules themselves lives in the
     //! existing `cred::tests` module against the free fns.
     use super::*;
+    use crate::cred::adapter::step_engine::{
+        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
+    };
     use crate::process::bootstrap_init_process;
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vm::{AddressSpace, TestPmap};
     use crate::zones;
-    use crate::cred::adapter::step_engine::{
-        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
-    };
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         tx_test_support::init_host();

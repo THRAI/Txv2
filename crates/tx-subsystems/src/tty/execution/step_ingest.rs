@@ -2,21 +2,23 @@
 
 use core::sync::atomic::Ordering;
 
-use crate::tty::adapter::wait_routing::Mask;
 use crate::tty::adapter::step_engine::Cap;
+use crate::tty::adapter::wait_routing::Mask;
 
 use crate::execution::Guard;
+#[cfg(test)]
+use crate::tty::adapter::step_engine::ByteProgress;
+#[cfg(test)]
+use crate::tty::adapter::step_engine::{self as step_engine};
+use crate::tty::adapter::step_engine::{
+    InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 use crate::tty::checks::require_live_tty;
 use crate::tty::execution::{
     deferred_signal_for_tty, SignalDispatch, TTY_DEFERRED_SIGNAL, TTY_READABLE, TTY_WRITABLE,
 };
 use crate::tty::ldisc::{process_input_byte, FlowCtl, LdiscInputEffect, SignalKind};
 use crate::tty::structure::TtyIdentity;
-use crate::tty::adapter::step_engine::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask};
-#[cfg(test)]
-use crate::tty::adapter::step_engine::ByteProgress;
-#[cfg(test)]
-use crate::tty::adapter::step_engine::{self as step_engine};
 
 /// Deferred signal observed while ingesting bytes.
 ///
@@ -147,15 +149,10 @@ pub struct IngestOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for IngestOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for IngestOp<'a> {
     type Output = IngestOutcome;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_ingest(self.tty, self.bytes, self.guard)
     }
 }
@@ -175,21 +172,11 @@ mod step_op_wraps {
     struct NoopOps;
 
     impl CharDeviceOps for NoopOps {
-        fn read(
-            &self,
-            _out: &mut [u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(0)
         }
 
-        fn write(
-            &self,
-            bytes: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(bytes.len())
         }
     }

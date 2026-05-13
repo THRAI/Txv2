@@ -165,11 +165,7 @@ pub fn bucket_index(uaddr: u64) -> usize {
 ///
 /// Wait never produces `Done`: completion arrives via the carrier
 /// resolution step driven by the script driver after the yield resolves.
-pub fn step_futex_wait(
-    uaddr: u64,
-    val: u32,
-    _guard: &Guard<'_>,
-) -> StepOutcome<(), NoProgress> {
+pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
     if uaddr == 0 || (uaddr & 0x3) != 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
@@ -200,11 +196,7 @@ pub fn step_futex_wait(
 ///   Linux `FUTEX_WAKE` with `n=0` is a defined no-op.
 ///
 /// Wake never produces `Yield`/`Continue`.
-pub fn step_futex_wake(
-    uaddr: u64,
-    n: u32,
-    _guard: &Guard<'_>,
-) -> StepOutcome<u32, NoProgress> {
+pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u32, NoProgress> {
     if uaddr == 0 || (uaddr & 0x3) != 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
@@ -290,10 +282,7 @@ pub struct FutexWaitOp<'a> {
 impl<'a, I: SubjectIdentity> StepOp<I> for FutexWaitOp<'a> {
     type Output = ();
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_futex_wait(self.uaddr, self.val, self.guard)
     }
 }
@@ -309,20 +298,17 @@ pub struct FutexWakeOp<'a> {
 impl<'a, I: SubjectIdentity> StepOp<I> for FutexWakeOp<'a> {
     type Output = u32;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_futex_wake(self.uaddr, self.n, self.guard)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::adapter::step_engine::{
         guard, Errno as V3Errno, StepOutcome, StepProgress, YieldShape,
     };
+    use super::*;
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::zones;
 
@@ -603,12 +589,12 @@ mod tests {
     // primary value — these assert the variant matches what the free
     // fn would have returned.
     mod step_op_wraps {
-        use super::super::{step_futex_wake, FutexWaitOp, FutexWakeOp, FUTEX_WAKE_MASK};
-        use super::setup;
         use super::super::adapter::step_engine::{
             guard, Errno as V3Errno, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
             YieldShape,
         };
+        use super::super::{step_futex_wake, FutexWaitOp, FutexWakeOp, FUTEX_WAKE_MASK};
+        use super::setup;
 
         #[test]
         fn futex_wait_op_step_delegates_to_free_fn() {

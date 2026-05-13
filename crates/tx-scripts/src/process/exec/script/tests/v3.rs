@@ -9,7 +9,9 @@
 
 use alloc::boxed::Box;
 
-use crate::adapter::step_engine::{self as step_engine, guard, Cap, Errno as V3Errno, NoProgress, StepOutcome as V3Outcome};
+use crate::adapter::step_engine::{
+    self as step_engine, guard, Cap, Errno as V3Errno, NoProgress, StepOutcome as V3Outcome,
+};
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::page_backed::{Frame, MaterializeAccess, PageIndex};
 use tx_subsystems::vfs::structure::{

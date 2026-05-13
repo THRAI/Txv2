@@ -5,11 +5,13 @@ use alloc::vec::Vec;
 use crate::tty::adapter::step_engine::{self as step_engine, Cap};
 
 use crate::execution::{Errno, Guard};
+use crate::tty::adapter::step_engine::{
+    ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 use crate::tty::checks::{background_write_signal, require_fg_pgrp, require_live_tty};
 use crate::tty::execution::{step_ingest, TTY_WRITABLE};
 use crate::tty::ldisc::process_output;
 use crate::tty::structure::{termios::TOSTOP, TtyIdentity, TtyTransport};
-use crate::tty::adapter::step_engine::{ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 
 /// Transform user bytes through N_TTY output processing, enqueue them, and
 /// kick the underlying transport.
@@ -48,10 +50,7 @@ pub fn step_write_for_process(
     step_write(tty, bytes, guard)
 }
 
-fn kick_transport(
-    tty: &Cap<TtyIdentity>,
-    guard: &Guard<'_>,
-) -> StepOutcome<usize, ByteProgress> {
+fn kick_transport(tty: &Cap<TtyIdentity>, guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
     use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3Out, YieldShape};
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
@@ -327,15 +326,10 @@ pub struct WriteOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for WriteOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_write(self.tty, self.bytes, self.guard)
     }
 }
@@ -349,15 +343,10 @@ pub struct WriteForCallerOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for WriteForCallerOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for WriteForCallerOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_write_for_caller(self.tty, self.bytes, self.caller, self.guard)
     }
 }
@@ -371,15 +360,10 @@ pub struct WriteForProcessOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for WriteForProcessOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for WriteForProcessOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_write_for_process(self.tty, self.bytes, self.caller, self.guard)
     }
 }
@@ -406,26 +390,12 @@ mod tests {
     }
 
     impl CharDeviceOps for BlockingOps {
-        fn read(
-            &self,
-            _out: &mut [u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(0)
         }
 
-        fn write(
-            &self,
-            _bytes: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
-            StepOutcome::yield_on_wait_source(
-                ByteProgress::EMPTY,
-                self.carrier,
-                self.interest,
-            )
+        fn write(&self, _bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+            StepOutcome::yield_on_wait_source(ByteProgress::EMPTY, self.carrier, self.interest)
         }
     }
 
@@ -434,21 +404,11 @@ mod tests {
     struct CompletingOps;
 
     impl CharDeviceOps for CompletingOps {
-        fn read(
-            &self,
-            _out: &mut [u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(0)
         }
 
-        fn write(
-            &self,
-            bytes: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(bytes.len())
         }
     }
@@ -485,8 +445,8 @@ mod tests {
         payload: TtyPayload,
     ) -> Cap<TtyIdentity> {
         let id_res = reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res = reserve_for::<crate::tty::structure::TtyPayload>()
-            .expect("tty payload reservation");
+        let payload_res =
+            reserve_for::<crate::tty::structure::TtyPayload>().expect("tty payload reservation");
         let payload_cap = PayloadCap::from_cap(sign_for(payload_res, payload));
         let identity = sign_for(id_res, TtyIdentity::new(kind, index, name));
         identity.install_payload(payload_cap);
@@ -688,10 +648,10 @@ mod tests {
     mod step_op_wraps {
         use super::super::{step_engine, WriteForCallerOp, WriteOp};
         use super::{alloc_tty_with, setup, COMPLETING_BINDING};
-        use crate::tty::structure::{TtyKind, TtyPayload};
         use crate::tty::adapter::step_engine::{
             PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome as V3,
         };
+        use crate::tty::structure::{TtyKind, TtyPayload};
 
         #[test]
         fn write_op_empty_bytes_returns_done_zero() {

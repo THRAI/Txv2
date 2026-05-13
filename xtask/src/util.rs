@@ -150,10 +150,7 @@ pub(crate) struct CargoOutcome {
 /// Run `cargo` with `args`, capture all output, and extract the key summary line.
 /// Nothing is printed; the caller decides how to display the result.
 pub(crate) fn compact_cargo(root: &Path, args: &[&str]) -> CargoOutcome {
-    let result = Command::new("cargo")
-        .args(args)
-        .current_dir(root)
-        .output();
+    let result = Command::new("cargo").args(args).current_dir(root).output();
 
     match result {
         Ok(out) => {
@@ -161,7 +158,11 @@ pub(crate) fn compact_cargo(root: &Path, args: &[&str]) -> CargoOutcome {
             combined.push_str(&String::from_utf8_lossy(&out.stdout));
             let ok = out.status.success();
             let summary = cargo_summary_line(&combined);
-            CargoOutcome { ok, summary, output: combined }
+            CargoOutcome {
+                ok,
+                summary,
+                output: combined,
+            }
         }
         Err(e) => CargoOutcome {
             ok: false,

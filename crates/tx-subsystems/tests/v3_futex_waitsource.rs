@@ -86,10 +86,7 @@ fn register<'a>(
     source: &'a Arc<WaitSource>,
     mailbox: &Arc<TaskMailbox>,
     interests: u64,
-) -> (
-    WaitRegistrationGuard<'a>,
-    WaitGeneration,
-) {
+) -> (WaitRegistrationGuard<'a>, WaitGeneration) {
     let gen = mailbox.next_generation();
     let prep = source.prepare(Arc::downgrade(mailbox), gen, InterestMask::new(interests));
     // `install_if(|| true)` is the test pattern (the predicate's

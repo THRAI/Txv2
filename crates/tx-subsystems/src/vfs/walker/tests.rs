@@ -30,19 +30,11 @@ use super::{step_open, step_walk, SYMLOOP_MAX};
 struct CapturingOps;
 
 impl CharDeviceOps for CapturingOps {
-    fn read(
-        &self,
-        _out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> V3<usize, ByteProgress> {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> V3<usize, ByteProgress> {
         V3::Done(0)
     }
 
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> V3<usize, ByteProgress> {
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> V3<usize, ByteProgress> {
         V3::Done(bytes.len())
     }
 }
@@ -650,15 +642,11 @@ fn step_walk_crosses_mount_point_at_dev() {
     // Find the rootfs's MountPayload Cap and the FsObjectId of /dev
     // on rootfs. These form the (parent_payload, child_fs_object_id)
     // key the walker consults via mount::mount_for.
-    let root_dev_id = match <TestFs as FsOps>::lookup(
-        &*topo.rootfs,
-        FsObjectId::new(2),
-        b"dev",
-        &guard(),
-    ) {
-        V3::Done(id) => id,
-        other => panic!("rootfs lookup(dev) failed: {other:?}"),
-    };
+    let root_dev_id =
+        match <TestFs as FsOps>::lookup(&*topo.rootfs, FsObjectId::new(2), b"dev", &guard()) {
+            V3::Done(id) => id,
+            other => panic!("rootfs lookup(dev) failed: {other:?}"),
+        };
     let rootfs_payload = topo
         .root_dentry
         .rnode()

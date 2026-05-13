@@ -67,10 +67,7 @@ impl crate::vfs::FsOps for TestFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::ENOSYS)
     }
 
@@ -112,10 +109,7 @@ impl crate::vfs::FsOps for TestFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::ENOSYS)
     }
 
@@ -136,10 +130,7 @@ impl crate::vfs::FsOps for TestFs {
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::ENOSYS)
     }
 
@@ -148,10 +139,7 @@ impl crate::vfs::FsOps for TestFs {
         _fs_object_id: FsObjectId,
         _cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
         StepOutcome::done(None)
     }
 
@@ -173,9 +161,7 @@ impl crate::vfs::FsOps for TestFs {
             Some((InodeKind::Symlink, Some(target), _, _, _)) => {
                 StepOutcome::done(target.clone().into_boxed_slice())
             }
-            Some(_) => {
-                StepOutcome::err(Errno::EINVAL)
-            }
+            Some(_) => StepOutcome::err(Errno::EINVAL),
             None => StepOutcome::err(Errno::ENOENT),
         }
     }
@@ -210,11 +196,7 @@ impl crate::page_backed::FsPageBacking for TestFs {
         StepOutcome::err(Errno::ENOSYS)
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(), NoProgress> {
+    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         StepOutcome::done(())
     }
 }
@@ -223,8 +205,8 @@ impl crate::page_backed::FsPageBacking for TestFs {
 
 #[test]
 fn testfs_v3_lookup_round_trips_after_add_dir() {
-    use crate::vfs::FsOps;
     use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
+    use crate::vfs::FsOps;
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -247,8 +229,8 @@ fn testfs_v3_lookup_round_trips_after_add_dir() {
 
 #[test]
 fn testfs_v3_read_link_returns_target_bytes() {
-    use crate::vfs::FsOps;
     use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
+    use crate::vfs::FsOps;
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()

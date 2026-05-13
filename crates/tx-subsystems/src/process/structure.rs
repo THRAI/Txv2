@@ -619,7 +619,7 @@ impl ProcessIdentity {
                 // WaitSource share the bit-namespace
                 // (`EXIT_SOURCE_CHILD_ZOMBIFIED` and future stop/cont
                 // bits land in both).
-                wait_routing::notify_v3_source(&p.exit_wait_source(), mask.bits());
+                wait_routing::notify_v3_source(p.exit_wait_source(), mask.bits());
                 released
             })
             .unwrap_or(0)
@@ -671,9 +671,7 @@ impl ProcessIdentity {
 impl Entity for ProcessIdentity {
     type OperationalEvidence = PayloadCap<ProcessPayload>;
 
-    fn upgrade_operational(
-        identity: &Cap<Self>,
-    ) -> Result<Self::OperationalEvidence, Dead> {
+    fn upgrade_operational(identity: &Cap<Self>) -> Result<Self::OperationalEvidence, Dead> {
         identity.payload.lock().as_ref().cloned().ok_or(Dead)
     }
 }
@@ -1284,10 +1282,7 @@ mod subject_identity_tests {
     #[test]
     fn process_identity_implements_subject_identity_with_expected_associated_types() {
         fn assert_credential<I: SubjectIdentity<Credential = crate::cred::Cred>>() {}
-        fn assert_restrictions<
-            I: SubjectIdentity<Restrictions = RestrictionStackHandle>,
-        >() {
-        }
+        fn assert_restrictions<I: SubjectIdentity<Restrictions = RestrictionStackHandle>>() {}
         fn assert_thread<
             I: SubjectIdentity<ThreadIdentity = crate::thread_runtime::ThreadIdentity>,
         >() {
