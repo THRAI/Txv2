@@ -77,58 +77,6 @@ const USER_PAGE_SIZE: u64 = 4096;
 /// `MAX_PHDRS` cap rejects it before this read undershoots.
 const INITIAL_PARSE_READ: usize = 4096;
 
-/// DIAGNOSTIC (temp, 2026-05-12): record which NotExecutable
-/// early-return site fired most recently. Read from
-/// `tx-kernel::init::exec::drive_bootstrap_exec` on the fallback path
-/// so the board sentinel can include a site tag in addition to the
-/// `not-executable` category. The string slices are static-bytes
-/// pointers; reading them back requires walking until NUL.
-pub static LAST_NOTEXEC_SITE: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-/// DIAGNOSTIC (temp): companion to `LAST_NOTEXEC_SITE` — the
-/// observed file size at the most recent exec attempt. Useful for
-/// disambiguating "0-byte file (path wrong / not populated)" from
-/// "short file (some kind of partial write)".
-pub static LAST_EXEC_FILE_SIZE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-
-// NOTEXEC_SITE_NONE = 0 is the implicit initial value of
-// `LAST_NOTEXEC_SITE` (resolves to "none" via the `_` arm in
-// `last_notexec_site_label`); no named constant needed.
-const NOTEXEC_SITE_RNODE_NOT_PAGEBACKED: usize = 1;
-const NOTEXEC_SITE_READ_TOO_SMALL: usize = 2;
-const NOTEXEC_SITE_READ_ENOEXEC: usize = 3;
-const NOTEXEC_SITE_PARSE_ERROR: usize = 4;
-const NOTEXEC_SITE_BUILD_ASPACE_INVALID: usize = 5;
-const NOTEXEC_SITE_PHASE5A_FILE_END_OVERFLOW: usize = 6;
-const NOTEXEC_SITE_PHASE5A_FILE_OFF_OVERFLOW: usize = 7;
-const NOTEXEC_SITE_PHASE5A_READ_ERROR: usize = 8;
-const NOTEXEC_SITE_COMPUTE_BRK_BASE: usize = 9;
-
-/// Resolve the `LAST_NOTEXEC_SITE` index into a static label. Used by
-/// the bootstrap-exec fallback path to print a more specific error
-/// than the bare `not-executable` tag.
-pub fn last_notexec_site_label() -> &'static str {
-    match LAST_NOTEXEC_SITE.load(core::sync::atomic::Ordering::Relaxed) {
-        NOTEXEC_SITE_RNODE_NOT_PAGEBACKED => "rnode-not-pagebacked",
-        NOTEXEC_SITE_READ_TOO_SMALL => "read-too-small",
-        NOTEXEC_SITE_READ_ENOEXEC => "read-enoexec",
-        NOTEXEC_SITE_PARSE_ERROR => "parse-error",
-        NOTEXEC_SITE_BUILD_ASPACE_INVALID => "build-aspace-invalid",
-        NOTEXEC_SITE_PHASE5A_FILE_END_OVERFLOW => "phase5a-file-end-overflow",
-        NOTEXEC_SITE_PHASE5A_FILE_OFF_OVERFLOW => "phase5a-file-off-overflow",
-        NOTEXEC_SITE_PHASE5A_READ_ERROR => "phase5a-read-error",
-        NOTEXEC_SITE_COMPUTE_BRK_BASE => "compute-brk-base",
-        _ => "none",
-    }
-}
-
-fn record_notexec_site(site: usize) -> ExecError {
-    LAST_NOTEXEC_SITE.store(site, core::sync::atomic::Ordering::Relaxed);
-    ExecError::NotExecutable
-}
-
 /// Linux-flavoured exec errors. Mapped to `-errno` by the syscall arm
 /// (Phase 6 of the ELF-loader plan, out of scope here).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -341,10 +289,9 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // executable.
     let file_pc = match openfile.rnode().backing() {
         RNodeBacking::PageBacked { pc } => pc.clone(),
-        _ => return Err(record_notexec_site(NOTEXEC_SITE_RNODE_NOT_PAGEBACKED)),
+        _ => return Err(ExecError::NotExecutable),
     };
     let file_size = file_pc.size_bytes();
-    LAST_EXEC_FILE_SIZE.store(file_size, core::sync::atomic::Ordering::Relaxed);
 
     // ----- Phase 1 (cont) — execute-bit authorisation ----------------
     //
@@ -371,7 +318,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     if read_len < 64 {
         // ELF64 header alone is 64 bytes — anything smaller cannot be
         // a valid binary.
-        return Err(record_notexec_site(NOTEXEC_SITE_READ_TOO_SMALL));
+        return Err(ExecError::NotExecutable);
     }
     let mut header_bytes: Vec<u8> = alloc::vec![0u8; read_len];
     {
@@ -381,13 +328,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         let result = match outcome {
             V3::Done(()) => Ok(()),
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
-            V3::Err(err) => {
-                LAST_NOTEXEC_SITE.store(
-                    NOTEXEC_SITE_READ_ENOEXEC,
-                    core::sync::atomic::Ordering::Relaxed,
-                );
-                Err(ExecError::from_read_errno(err.into()))
-            }
+            V3::Err(err) => Err(ExecError::from_read_errno(err.into())),
         };
         drop(guard);
         result?;
@@ -400,25 +341,15 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // arch / type / no PT_INTERP / no PT_DYNAMIC / phdr-table fits /
     // congruence / overlap / W^X). All failures collapse to
     // `ExecError::NotExecutable` at the syscall boundary.
-    let parsed: ExecImagePlan = parse_image_plan(&header_bytes).map_err(|err| {
-        LAST_NOTEXEC_SITE.store(
-            NOTEXEC_SITE_PARSE_ERROR,
-            core::sync::atomic::Ordering::Relaxed,
-        );
-        ExecError::from_parse_error(err)
-    })?;
+    let parsed: ExecImagePlan =
+        parse_image_plan(&header_bytes).map_err(ExecError::from_parse_error)?;
 
     // Compose the brk base from the image plan: the page-rounded end
     // of the highest LOAD segment's memory footprint. Linux's
     // `setup_arg_pages` does the same — heap starts where the image
     // ends so static binaries can grow up. Computed here so Phase 7
     // is a pure infallible store.
-    let new_brk_base = compute_brk_base(&parsed.load_segments).inspect_err(|_err| {
-        LAST_NOTEXEC_SITE.store(
-            NOTEXEC_SITE_COMPUTE_BRK_BASE,
-            core::sync::atomic::Ordering::Relaxed,
-        );
-    })?;
+    let new_brk_base = compute_brk_base(&parsed.load_segments)?;
 
     // ===== Phase 3.5 — apply S_ISUID / S_ISGID =======================
     //
@@ -459,15 +390,8 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // its own per-call guards internally. Per
     // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE` callers must NOT
     // hold a guard at the call site.
-    let new_aspace = vm_scripts::build_aspace_from_image::<P>(&image_plan).map_err(|err| {
-        if matches!(err, vm_scripts::ScriptError::InvalidImage) {
-            LAST_NOTEXEC_SITE.store(
-                NOTEXEC_SITE_BUILD_ASPACE_INVALID,
-                core::sync::atomic::Ordering::Relaxed,
-            );
-        }
-        ExecError::from_build_aspace_error(err)
-    })?;
+    let new_aspace = vm_scripts::build_aspace_from_image::<P>(&image_plan)
+        .map_err(ExecError::from_build_aspace_error)?;
 
     // ===== Phase 5a — eagerly populate partial-last-page bytes ========
     //
@@ -502,7 +426,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         let file_end = segment
             .vaddr
             .checked_add(segment.filesz)
-            .ok_or_else(|| record_notexec_site(NOTEXEC_SITE_PHASE5A_FILE_END_OVERFLOW))?;
+            .ok_or(ExecError::NotExecutable)?;
         let partial_in_page = file_end & (page_size - 1);
         if partial_in_page == 0 {
             continue;
@@ -515,7 +439,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         let file_off = segment
             .file_offset
             .checked_add(partial_start - segment.vaddr)
-            .ok_or_else(|| record_notexec_site(NOTEXEC_SITE_PHASE5A_FILE_OFF_OVERFLOW))?;
+            .ok_or(ExecError::NotExecutable)?;
         let mut buf = alloc::vec![0u8; partial_in_page as usize];
         {
             use StepOutcome as V3;
@@ -523,7 +447,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
             match read_exact_at(&segment.backing, file_off, &mut buf, &guard) {
                 V3::Done(()) => {}
                 V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
-                V3::Err(_) => return Err(record_notexec_site(NOTEXEC_SITE_PHASE5A_READ_ERROR)),
+                V3::Err(_) => return Err(ExecError::NotExecutable),
             }
         }
         match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {

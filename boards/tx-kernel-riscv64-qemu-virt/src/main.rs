@@ -41,5 +41,19 @@ fn panic(info: &PanicInfo<'_>) -> ! {
         }
     }
     let _ = writeln!(ConsoleWriter, "\ntxkernel:panic: {info}");
+    // Read ra/s0 early so fault-decode can reconstruct the panic call stack.
+    // ra = return address from the panic call site (used as synthetic sepc).
+    // s0 = frame pointer at panic entry (root of the fp-chain walk).
+    let ra: usize;
+    let fp: usize;
+    unsafe {
+        core::arch::asm!(
+            "mv {ra}, ra",
+            "mv {fp}, s0",
+            ra = out(reg) ra,
+            fp = out(reg) fp,
+        );
+        tx_hal_riscv64_qemu_virt::emit_panic_location(fp, ra);
+    }
     tx_kernel::panic_shutdown::<ActivePlatform>()
 }

@@ -44,13 +44,13 @@ guilty syscall, ship the fix, verify with the same script.
 ### 1. Reproduce with `--trap-trace`
 
 Build the kernel with the gated trap-trace feature on and run the
-failing script (or the existing busybox-smoke):
+failing script (or the existing busybox-boot):
 
 ```sh
 cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf --features trap-trace
 cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/YOUR_SCRIPT.txt
 # or, for non-interactive:
-cargo xtask test busybox-smoke --target rv64-qemu --trap-trace
+cargo xtask test busybox-boot --target rv64-qemu --trap-trace
 ```
 
 The kernel emits `txdbg:trap` and `txdbg:ent` records to the
@@ -160,7 +160,7 @@ cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/YOUR_SCRIPT
 # Workspace tests still green
 cargo test --workspace --lib --tests -- --test-threads=1
 # Existing smoke still passes
-cargo xtask test busybox-smoke --target rv64-qemu
+cargo xtask test busybox-boot --target rv64-qemu
 ```
 
 ## Rules
@@ -181,7 +181,7 @@ cargo xtask test busybox-smoke --target rv64-qemu
   the worst failure mode — userspace continues with wrong state.
 - **Trap-trace is debug-only.** The `trap-trace` feature is off
   by default and must stay so for production / CI builds. The
-  default `cargo xtask test busybox-smoke` run emits zero
+  default `cargo xtask test busybox-boot` run emits zero
   `txdbg:` records; verify after every change.
 - **Pair every new sys_* with a shell-test.** A syscall without a
   test will regress silently the moment busybox or musl shifts
@@ -198,7 +198,7 @@ cargo xtask test busybox-smoke --target rv64-qemu
 - The failing script's `expect` directives all pass on a
   default-features kernel build.
 - Workspace host tests are green.
-- `cargo xtask test busybox-smoke` (sentinel-watch lane) still
+- `cargo xtask test busybox-boot` (sentinel-watch lane) still
   passes.
 - The new syscall has:
   - A `numbers.rs` entry with NR + doc comment.

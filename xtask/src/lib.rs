@@ -8,6 +8,7 @@ mod check_build;
 mod ci;
 mod doctor;
 mod fault_decode;
+mod full_build;
 mod image;
 mod lint;
 mod oscomp;
@@ -18,6 +19,7 @@ mod submit;
 mod target;
 mod test;
 mod trap_trace;
+mod unit;
 mod util;
 
 pub fn run() -> Result<()> {
@@ -30,6 +32,7 @@ pub fn run() -> Result<()> {
     let root = workspace_root();
     match cmd.as_str() {
         "doctor" => doctor::doctor(&root),
+        "full-build" => full_build::full_build(&root, args.collect()),
         "ci" => ci::ci(&root),
         "ci-slow" => ci::ci_slow(&root),
         "check" => check_build::check(&root),
@@ -49,6 +52,7 @@ pub fn run() -> Result<()> {
         "progress" => progress::progress(&root, args.collect()),
         "lint" => lint::lint(&root, args.collect()),
         "boundary-report" => boundary_report::boundary_report(&root, args.collect()),
+        "unit" => unit::unit(&root),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -62,15 +66,16 @@ fn print_usage() {
         "txKernel xtask\n\n\
          Commands:\n\
            cargo xtask doctor\n\
+           cargo xtask full-build [--target rv64-qemu|la64-qemu|rv64-m1dock-mock|all] [--skip-doctor] [--no-image]\n\
            cargo xtask ci\n\
            cargo xtask ci-slow\n\
            cargo xtask check\n\
            cargo xtask build --target rv64-qemu|rv64-m1dock-mock|la64-qemu|all\n\
            cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox [--dry-run] [--expect-sentinel] [--timeout-ms N] [--no-block] [--interactive]\n\
-           cargo xtask test [smoke|busybox-smoke] [--target rv64-qemu] [--timeout-ms N] [--dry-run] [--trap-trace]\n\
+           cargo xtask test [smoke|busybox-boot] [--target rv64-qemu] [--timeout-ms N] [--dry-run] [--trap-trace]\n\
            cargo xtask fault-decode --target rv64-qemu [--elf PATH] [--serial PATH [--all] | --scause HEX --sepc HEX --stval HEX | --addr HEX]\n\
            cargo xtask trap-trace --serial PATH [--syscalls | --raw]\n\
-           cargo xtask shell-test --target rv64-qemu --script PATH\n\
+           cargo xtask shell-test --target rv64-qemu --script PATH [--group NAME[,NAME...]] [--list-groups] [--keep-going]\n\
            cargo xtask image cpio --profile busybox [--target rv64-qemu|la64-qemu]\n\
            cargo xtask image ext4 --profile busybox [--target rv64-qemu|la64-qemu] [--size 64M]\n\
            cargo xtask image m1dock-sd --profile busybox [--target rv64-m1dock-mock] [--size 64M]\n\
@@ -81,8 +86,9 @@ fn print_usage() {
            cargo xtask progress new plan|handoff|worktree --id ID --title TITLE [...]\n\
            cargo xtask progress claim plan|worktree --id ID --owner NAME --scope PATH [--scope PATH]\n\
            cargo xtask progress close plan|handoff|worktree --id ID --status STATUS\n\
-           cargo xtask lint arch|docs|unused|boundary\n   \
-           cargo xtask boundary-report [--top N] [--json]\n"
+           cargo xtask lint arch|docs|unused|boundary\n\
+           cargo xtask boundary-report [--top N] [--json]\n\
+           cargo xtask unit\n"
     );
 }
 
