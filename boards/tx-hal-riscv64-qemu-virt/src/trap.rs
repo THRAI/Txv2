@@ -1143,6 +1143,12 @@ pub fn emit_panic_location(fp: usize, ra: usize) {
     console_write_fp_chain(fp);
 }
 
+#[cfg(not(target_arch = "riscv64"))]
+/// Host-build placeholder so the platform surface typechecks on
+/// non-riscv64 hosts. No-op; the real implementation is the riscv64
+/// version above.
+pub fn emit_panic_location(_fp: usize, _ra: usize) {}
+
 #[cfg(target_arch = "riscv64")]
 fn console_write_trap_summary(frame: &Rv64TrapFrame) {
     console_write_literal(b"scause=0x");
