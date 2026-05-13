@@ -1,6 +1,6 @@
 ---
 name: tx-meta-alignment
-description: Use when editing canonical meta-framework docs: concepts, invariants, object model, subsystem anatomy, module map, or index.
+description: "Use when editing canonical meta-framework docs: concepts, invariants, object model, subsystem anatomy, module map, or index."
 ---
 
 # tx-meta-alignment
