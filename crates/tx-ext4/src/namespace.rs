@@ -1,6 +1,6 @@
-use tx_ext4_format::pager::{BlockImage, DirEntryLite};
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
 use step_engine::Guard;
+use tx_ext4_format::pager::{BlockImage, DirEntryLite};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{PageContainer, PageContainerKind};
 use tx_subsystems::vfs::structure::{
@@ -107,10 +107,7 @@ where
         mode: u16,
         cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
@@ -174,10 +171,7 @@ where
         mode: u16,
         cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
@@ -213,10 +207,7 @@ where
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
@@ -225,10 +216,7 @@ where
         fs_object_id: FsObjectId,
         cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
@@ -307,10 +295,7 @@ where
         &self,
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        alloc::boxed::Box<[u8]>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),

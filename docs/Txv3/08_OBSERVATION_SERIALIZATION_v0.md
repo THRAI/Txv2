@@ -631,7 +631,7 @@ pub struct PayloadWaitSourceNotify {
 
 OBS-SER-YIELD-FLOW-MATERIAL: producer-side notify and consumer-side resume both carry `(task_id_low, wait_generation)` material. The daemon hashes `(task_id, wait_gen, flow_kind)` to produce Perfetto flow_ids ([`08_OBSERVATION_v1.md §13.2`](08_OBSERVATION_v1.md)).
 
-OBS-SER-YIELD-GENERATION-FITS: `wait_generation` is u64 in [`Reactor_concept_v5_RefactorSpec`](Reactor_concept_v5_RefactorSpec%20v4.md). The producer payload only carries the low 32 bits; daemon may collide if a single task accumulates >4G yields in one run (negligible). Sufficient for v0.
+OBS-SER-YIELD-GENERATION-FITS: `wait_generation` is u64 in [`Reactor_concept_v5_RefactorSpec`](../design/02_execution/REACTOR_v0.md). The producer payload only carries the low 32 bits; daemon may collide if a single task accumulates >4G yields in one run (negligible). Sufficient for v0.
 
 ### 8.5 Track / metadata payloads
 

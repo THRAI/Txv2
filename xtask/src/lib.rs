@@ -55,6 +55,8 @@ pub fn run() -> Result<()> {
         "lint" => lint::lint(&root, args.collect()),
         "boundary-report" => boundary_report::boundary_report(&root, args.collect()),
         "unit" => unit::unit(&root),
+        "observe" => observe::observe(&root, args.collect()),
+        "observe-discipline" => observe_discipline::observe_discipline(&root),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())

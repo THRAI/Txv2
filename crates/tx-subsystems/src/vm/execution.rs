@@ -24,8 +24,9 @@ use crate::vm::checks::{
 use crate::vm::structure::{PrivatePageError, PrivatePageSet};
 use crate::vm::{
     AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard, UserRange,
-    UserVirtAddr, VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization, VmFaultOutcome,
-    VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest,
+    UserVirtAddr, VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization,
+    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget,
+    VmRemapOutcome, VmRemapRequest,
 };
 
 fn page_align_up(addr: usize) -> usize {

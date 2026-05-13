@@ -566,7 +566,13 @@ impl<I: BlockImage> Ext4Pager<I> {
         let data_block = self.allocate_block()?;
 
         let mut dir_data = [0u8; BLOCK_SIZE];
-        encode_dir_entry(new_ino.get(), 12, 2 /* dir */, b".", &mut dir_data[0..12])?;
+        encode_dir_entry(
+            new_ino.get(),
+            12,
+            2, /* dir */
+            b".",
+            &mut dir_data[0..12],
+        )?;
         encode_dir_entry(
             parent_ino.get(),
             (BLOCK_SIZE - 12) as u16,

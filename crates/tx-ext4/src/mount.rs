@@ -2,7 +2,7 @@ use core::marker::Send;
 
 use crate::adapter::step_engine::Cap;
 use alloc::sync::Arc;
-use tx_ext4_format::pager::{BlockImage, Page4K};
+use tx_ext4_format::pager::BlockImage;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta};

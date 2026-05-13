@@ -411,9 +411,12 @@ impl PageContainer {
     ) -> Result<MaterializedPage, PageCacheError> {
         match &self.kind {
             PageContainerKind::Anon { .. } => self.materialize_anon(page, access),
-            PageContainerKind::File { mount, fs_object_id } => {
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            } => {
                 use StepOutcome as V3;
-                let borrowed = tx_substrate::epoch::borrow_current_guard();
+                let borrowed = adapter::step_engine::epoch::borrow_current_guard();
                 let fresh;
                 let guard: &Guard<'_> = match &borrowed {
                     Some(g) => g,

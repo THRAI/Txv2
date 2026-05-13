@@ -364,24 +364,25 @@ impl<P: TxPlatform> CoreInit<P> {
         // DIAGNOSTIC: emit epoch state right before the sdcard exec to
         // identify whether a guard leak pre-dates drive_bootstrap_exec.
         {
-            let es = tx_substrate::epoch::summary();
-            let cpu0 = tx_substrate::epoch::cpu_summary(tx_hal::CpuId(0));
+            let es = crate::adapter::step_engine::epoch::summary();
+            let cpu0 = crate::adapter::step_engine::epoch::cpu_summary(tx_hal::CpuId(0));
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":diag:pre-sdcard-exec:guards=");
             Self::write_decimal_unsigned(es.active_guards);
             tx_hal::console_write_str::<P>(":epoch=");
             Self::write_decimal_unsigned(es.global_epoch as usize);
             tx_hal::console_write_str::<P>(":cpu0-local=");
-            Self::write_decimal_unsigned(
-                cpu0.map(|c| c.local_epoch as usize).unwrap_or(999),
-            );
+            Self::write_decimal_unsigned(cpu0.map(|c| c.local_epoch as usize).unwrap_or(999));
             tx_hal::console_write_str::<P>("\n");
         }
 
         if super::MUSL_MOUNT.lock().is_some() {
             let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/musl:/musl/musl/basic"];
-            let sdcard_argv: &[&[u8]] =
-                &[b"sh", b"-c", b"cd /musl/musl && ./busybox sh basic_testcode.sh"];
+            let sdcard_argv: &[&[u8]] = &[
+                b"sh",
+                b"-c",
+                b"cd /musl/musl && ./busybox sh basic_testcode.sh",
+            ];
             let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                 &init,
                 &thread,

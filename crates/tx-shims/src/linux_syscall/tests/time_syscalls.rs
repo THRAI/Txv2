@@ -10,7 +10,6 @@ use crate::linux_syscall::{
 
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
-const E_NOSYS: i32 = 38;
 
 /// Mirror of `TimespecLayout` for test-side decoding. The
 /// production layout is private to `mod.rs`, so the tests

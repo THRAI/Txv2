@@ -19,7 +19,6 @@ use siphasher::sip::SipHasher13;
 /// for OBS-6 but unused until OBS-3b/OBS-4 kernel wiring lands.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum FlowKind {
     SourceWake    = 1,
     AgentReply    = 2,

@@ -85,7 +85,6 @@ pub static EXEC_SHEBANG_FIRED: core::sync::atomic::AtomicUsize =
 pub static EXEC_LAST_OPEN_ERRNO: core::sync::atomic::AtomicI32 =
     core::sync::atomic::AtomicI32::new(0);
 
-
 /// Linux-flavoured exec errors. Mapped to `-errno` by the syscall arm
 /// (Phase 6 of the ELF-loader plan, out of scope here).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -282,10 +281,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
             V3::Done(file) => Ok(file),
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
             V3::Err(err) => {
-                EXEC_LAST_OPEN_ERRNO.store(
-                    err as i32,
-                    core::sync::atomic::Ordering::Relaxed,
-                );
+                EXEC_LAST_OPEN_ERRNO.store(err as i32, core::sync::atomic::Ordering::Relaxed);
                 Err(ExecError::from_walker_errno(Errno::from(err)))
             }
         };
@@ -875,25 +871,37 @@ fn shebang_parse(header: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
     } else {
         let (arg, _) = shebang_split_word(rest);
         let arg = shebang_trim_end(arg);
-        if arg.is_empty() { None } else { Some(arg) }
+        if arg.is_empty() {
+            None
+        } else {
+            Some(arg)
+        }
     };
     Some((interp, opt_arg))
 }
 
 fn shebang_trim_start(s: &[u8]) -> &[u8] {
-    let i = s.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(s.len());
+    let i = s
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(s.len());
     &s[i..]
 }
 
 fn shebang_trim_end(s: &[u8]) -> &[u8] {
-    let i = s.iter().rposition(|&b| b != b' ' && b != b'\t' && b != b'\r')
+    let i = s
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t' && b != b'\r')
         .map(|i| i + 1)
         .unwrap_or(0);
     &s[..i]
 }
 
 fn shebang_split_word(s: &[u8]) -> (&[u8], &[u8]) {
-    let i = s.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(s.len());
+    let i = s
+        .iter()
+        .position(|&b| b == b' ' || b == b'\t')
+        .unwrap_or(s.len());
     (&s[..i], &s[i..])
 }
 

@@ -566,6 +566,6 @@ OBS-HOST-V0-RULE-6. **Tests are records, not assertions about Perfetto.** Golden
 
 - Framework: [`08_OBSERVATION_v1.md`](08_OBSERVATION_v1.md).
 - Wire format: [`08_OBSERVATION_SERIALIZATION_v0.md`](08_OBSERVATION_SERIALIZATION_v0.md).
-- Runtime model: [`Reactor_concept_v5_RefactorSpec v4.md`](Reactor_concept_v5_RefactorSpec%20v4.md) for `WaitGeneration` and flow material origins.
+- Runtime model: [`Reactor_concept_v5_RefactorSpec v4.md`](../design/02_execution/REACTOR_v0.md) for `WaitGeneration` and flow material origins.
 - Step model: [`03_STEP_MODEL_v2.md`](03_STEP_MODEL_v2.md) for `StepOutcome` shapes the daemon reconstructs.
 - Perfetto wire format reference (external): https://perfetto.dev/docs/reference/trace-packet-proto and `protos/perfetto/trace/track_event/`.

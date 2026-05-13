@@ -18,10 +18,9 @@ use core::mem::MaybeUninit;
 /// per-hart access backed by `MaybeUninit`.
 ///
 /// SAFETY contract on callers:
-/// - `get(idx)` may only be called after `get_mut(idx)` has written a valid
-///   `T` into the slot (i.e. after `init` has been called for that hart).
-/// - `get(idx)` and `get_mut(idx)` may only be called from the hart whose
-///   id equals `idx`.  No two harts ever access the same slot concurrently.
+/// - `get(idx)` may only be called after `init_slot(idx, ...)` has written a
+///   valid `T` into the slot (i.e. after `init` has been called for that hart).
+/// - `get(idx)` may only be called from the hart whose id equals `idx`.
 ///
 /// The `Send + Sync` impls are manual: see the SAFETY comment below.
 pub(crate) struct HartLocalArray<T, const N: usize> {
@@ -37,34 +36,6 @@ unsafe impl<T, const N: usize> Sync for HartLocalArray<T, N> {}
 unsafe impl<T, const N: usize> Send for HartLocalArray<T, N> {}
 
 impl<T, const N: usize> HartLocalArray<T, N> {
-    /// Construct a new array with every slot uninitialised.
-    ///
-    /// This is a `const fn` so the array can be placed in a `static`.
-    pub(crate) const fn new(_phantom_init: T) -> Self
-    where
-        T: Copy,
-    {
-        // We cannot use `[const { UnsafeCell::new(MaybeUninit::uninit()) }; N]`
-        // in stable const context.  Use transmute from a zeroed MaybeUninit.
-        // SAFETY: `[UnsafeCell<MaybeUninit<T>>; N]` has no validity requirement
-        // beyond being a valid bit pattern for its fields.  `MaybeUninit` makes
-        // any bit pattern valid, and `UnsafeCell` is `repr(transparent)`.
-        // Zeroing is safe because we track initialisation via `valid` flags in
-        // `HartSlot` / the Option discriminant in `HartLocalOptionArray`.
-        //
-        // Note: the `_phantom_init` argument is ignored — it exists only so the
-        // call site `HartLocalArray::new(HartSlot::uninit())` continues to
-        // compile as a readable hint. We do not attempt to use it here because
-        // UnsafeCell<MaybeUninit<T>> is not const-array-repeatable for non-Copy T.
-        let _ = _phantom_init;
-        unsafe {
-            let arr: MaybeUninit<[UnsafeCell<MaybeUninit<T>>; N]> = MaybeUninit::zeroed();
-            Self {
-                slots: arr.assume_init(),
-            }
-        }
-    }
-
     /// Construct a new array with every slot zeroed.
     ///
     /// Use this for types that are not `Copy`.  The zeroed representation must
@@ -95,24 +66,9 @@ impl<T, const N: usize> HartLocalArray<T, N> {
         unsafe { (*self.slots[idx].get()).assume_init_ref() }
     }
 
-    /// Mutable reference to slot `idx`.
-    ///
-    /// # Safety (caller contract)
-    ///
-    /// Same as `get`: the calling hart owns the slot exclusively.
-    ///
-    /// Panics in debug if `idx >= N`.
-    #[inline]
-    #[allow(clippy::mut_from_ref)]
-    pub(crate) fn get_mut(&self, idx: usize) -> &mut T {
-        debug_assert!(idx < N, "HartLocalArray: idx {} out of range {}", idx, N);
-        // SAFETY: per the contract, only one hart accesses this slot.
-        unsafe { (*self.slots[idx].get()).assume_init_mut() }
-    }
-
     /// Write `val` into slot `idx` as the initialisation step.
     ///
-    /// Must be called before `get` / `get_mut` for this slot.
+    /// Must be called before `get` for this slot.
     #[inline]
     pub(crate) fn init_slot(&self, idx: usize, val: T) {
         debug_assert!(idx < N);

@@ -8,10 +8,9 @@
 
 use core::ptr::NonNull;
 
+use crate::devfs::adapter::step_engine::{epoch, page_allocator, StepOutcome, ZeroPolicy};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_ext4_format::{Ext4FormatError, Result};
-use tx_substrate::page_allocator::{self, ZeroPolicy};
-use tx_substrate::step::StepOutcome;
 use tx_subsystems::device::{BlockDevice, PhysicalBlockNumber};
 use tx_subsystems::page_backed::Frame;
 
@@ -31,7 +30,7 @@ impl BlockDeviceImage {
 
     fn sectors_per_ext4_block(&self) -> Option<u64> {
         let sector = self.device.block_size() as u64;
-        if sector == 0 || (BLOCK_SIZE as u64) % sector != 0 {
+        if sector == 0 || !(BLOCK_SIZE as u64).is_multiple_of(sector) {
             return None;
         }
         Some(BLOCK_SIZE as u64 / sector)
@@ -50,9 +49,7 @@ impl BlockImage for BlockDeviceImage {
         let spb = self
             .sectors_per_ext4_block()
             .ok_or(Ext4FormatError::Unsupported)?;
-        let lba = block
-            .checked_mul(spb)
-            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let lba = block.checked_mul(spb).ok_or(Ext4FormatError::OutOfBounds)?;
 
         let reservation = page_allocator::reserve_run(1, 1, ZeroPolicy::UninitFullOverwrite)
             .map_err(|_| Ext4FormatError::Truncated)?;
@@ -65,8 +62,7 @@ impl BlockImage for BlockDeviceImage {
         // trigger the EBR no-nesting debug_assert even though the block device
         // ops ignore the guard parameter entirely.  Fall back to a fresh guard
         // when no guard is active.
-        let guard = tx_substrate::epoch::borrow_current_guard()
-            .unwrap_or_else(tx_substrate::epoch::guard);
+        let guard = epoch::borrow_current_guard().unwrap_or_else(epoch::guard);
         let outcome = self.device.read_blocks(
             PhysicalBlockNumber::new(lba),
             core::slice::from_mut(&mut frame),
@@ -78,8 +74,7 @@ impl BlockImage for BlockDeviceImage {
             _ => return Err(Ext4FormatError::Truncated),
         }
 
-        let src = page_allocator::frame_kernel_addr(ppn)
-            .map_err(|_| Ext4FormatError::Truncated)?;
+        let src = page_allocator::frame_kernel_addr(ppn).map_err(|_| Ext4FormatError::Truncated)?;
         let src_nn = NonNull::new(src).ok_or(Ext4FormatError::Truncated)?;
         // SAFETY: `src_nn` points to BLOCK_SIZE bytes of a frame we own
         // through `run`. `out` is a `&mut [u8; BLOCK_SIZE]`. Both regions
@@ -96,9 +91,7 @@ impl BlockImage for BlockDeviceImage {
         let spb = self
             .sectors_per_ext4_block()
             .ok_or(Ext4FormatError::Unsupported)?;
-        let lba = block
-            .checked_mul(spb)
-            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let lba = block.checked_mul(spb).ok_or(Ext4FormatError::OutOfBounds)?;
 
         let reservation = page_allocator::reserve_run(1, 1, ZeroPolicy::UninitFullOverwrite)
             .map_err(|_| Ext4FormatError::Truncated)?;
@@ -106,8 +99,7 @@ impl BlockImage for BlockDeviceImage {
         let ppn = run.base();
         let frame = Frame::new(ppn);
 
-        let dst = page_allocator::frame_kernel_addr(ppn)
-            .map_err(|_| Ext4FormatError::Truncated)?;
+        let dst = page_allocator::frame_kernel_addr(ppn).map_err(|_| Ext4FormatError::Truncated)?;
         let dst_nn = NonNull::new(dst).ok_or(Ext4FormatError::Truncated)?;
         // SAFETY: `dst_nn` is the kernel direct-map VA of the freshly
         // allocated frame we own through `run`. `data` is `&[u8; BLOCK_SIZE]`.
@@ -116,8 +108,7 @@ impl BlockImage for BlockDeviceImage {
             core::ptr::copy_nonoverlapping(data.as_ptr(), dst_nn.as_ptr(), BLOCK_SIZE);
         }
 
-        let guard = tx_substrate::epoch::borrow_current_guard()
-            .unwrap_or_else(tx_substrate::epoch::guard);
+        let guard = epoch::borrow_current_guard().unwrap_or_else(epoch::guard);
         let outcome = self.device.write_blocks(
             PhysicalBlockNumber::new(lba),
             core::slice::from_ref(&frame),

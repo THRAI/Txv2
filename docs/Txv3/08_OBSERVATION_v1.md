@@ -9,7 +9,7 @@
 - [`08_OBSERVATION_SERIALIZATION_v0.md`](08_OBSERVATION_SERIALIZATION_v0.md) — txtrace-v0 wire format (record schemas, ring layout, ABI).
 - [`08_OBSERVATION_HOST_v0.md`](08_OBSERVATION_HOST_v0.md) — host daemon reconstruction spec.
 - [`03_STEP_MODEL_v2.md`](03_STEP_MODEL_v2.md) — defines `StepOp`, `StepOutcome`, `YieldShape`.
-- [`Reactor_concept_v5_RefactorSpec v4.md`](Reactor_concept_v5_RefactorSpec%20v4.md) — defines `WaitGeneration`, `TaskMailbox`, `WaitSource`.
+- [`Reactor_concept_v5_RefactorSpec v4.md`](../design/02_execution/REACTOR_v0.md) — defines `WaitGeneration`, `TaskMailbox`, `WaitSource`.
 - [`BUS_v1.md`](../design/01_substrate/BUS_v1.md) — defines `RawTrace<P>`, the substrate publication primitive observation extends.
 
 ---
@@ -282,7 +282,7 @@ Numbered for cite-stability. Each is a compile-time, lint-time, or runtime-check
 
 **OBS-11. No reentry.** The emit path must not call back into traced substrate code. Concretely: `tx_observe::emit_*` does not call `zone::sign`, `wake::notify`, `epoch::guard`, or any other substrate verb. A per-hart `AtomicBool` reentrancy guard in the emitter forecloses future regressions: re-entry from inside emit is treated as overflow.
 
-**OBS-12. Cross-yield safety.** Trace records, span guards, ActiveWait annotations, and resume payloads must not contain `Witness`, `IdentRef`, `epoch::Guard`, reservation guards, borrowed user slices, or guard-bound references. Trace types carry only `Cap<T>::trace_id() -> u64`, `OperationalEvidence`, owned descriptors, and plain data. This matches [`YIELD-1`](Reactor_concept_v5_RefactorSpec%20v4.md) from the runtime spec.
+**OBS-12. Cross-yield safety.** Trace records, span guards, ActiveWait annotations, and resume payloads must not contain `Witness`, `IdentRef`, `epoch::Guard`, reservation guards, borrowed user slices, or guard-bound references. Trace types carry only `Cap<T>::trace_id() -> u64`, `OperationalEvidence`, owned descriptors, and plain data. This matches [`YIELD-1`](../design/02_execution/REACTOR_v0.md) from the runtime spec.
 
 **OBS-13. Trace-cross types are `Pod`-only.** Every type reachable from `TxTraceRecord` and `Payload*` is `#[repr(C)]` and `unsafe impl tx_hal::Pod`. No `Debug`, `Serialize`, or `Display` derives on the kernel side. Host-side daemon enables these via the `host` Cargo feature on `tx-observe-types`.
 
@@ -616,7 +616,7 @@ OBS-0/1/2 can land in parallel (independent crates). OBS-3a depends on all three
   - [`STEP-11`](../design/02_execution/STEP_MODEL_v1.md) — step-local tracing.
   - [`THREAD_RUNTIME_v1`](../design/02_execution/THREAD_RUNTIME_v1.md) "observation subsystem (future)" note.
 - Substrate convergence points:
-  - [`Reactor_concept_v5_RefactorSpec v4.md`](Reactor_concept_v5_RefactorSpec%20v4.md) — `WaitGeneration`, `TaskMailbox`, `WaitSource`, `DelegateToken`.
+  - [`Reactor_concept_v5_RefactorSpec v4.md`](../design/02_execution/REACTOR_v0.md) — `WaitGeneration`, `TaskMailbox`, `WaitSource`, `DelegateToken`.
   - [`03_STEP_MODEL_v2.md`](03_STEP_MODEL_v2.md) — `StepOp`, `StepOutcome`, `YieldShape`.
   - [`BUS_v1.md`](../design/01_substrate/BUS_v1.md) — `RawTrace<P>` (L5 hook).
 - Implemented code:
