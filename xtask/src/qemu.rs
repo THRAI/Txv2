@@ -123,16 +123,6 @@ fn qemu_command(
             TxTarget::Rv64M1DockMock => "1",
         }
         .to_string(),
-        // Force multi-threaded TCG: vCPUs run on parallel host threads
-        // instead of round-robin time-slicing on one host thread. Without
-        // this, the boot smoke's BSP busy-spin for AP reactor task
-        // completion (init.rs `wait_for_ap_reactor_task_done`) starves
-        // the AP — the AP never gets CPU time to mark the task done,
-        // which manifests as a smoke panic on the slow GitHub Actions
-        // emulated runner (passes on Apple-silicon TCG because its
-        // round-robin is much faster).
-        "-accel".to_string(),
-        "tcg,thread=multi".to_string(),
         "-display".to_string(),
         "none".to_string(),
     ]);
