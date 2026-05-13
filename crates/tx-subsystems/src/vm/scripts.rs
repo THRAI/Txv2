@@ -28,12 +28,13 @@
 
 use alloc::vec::Vec;
 
+use step_engine::page_allocator;
+use step_engine::Cap;
 use tx_hal::PmapIf;
-use tx_substrate::page_allocator;
-use tx_substrate::zone::Cap;
 
 use crate::execution::Errno;
 use crate::page_backed::PageContainer;
+use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, StepOutcome};
 use crate::vm::{
     AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
     VmFault, VmFaultError, VmMapError, VmPmapError, USER_PAGE_SIZE,
@@ -297,8 +298,8 @@ pub async fn populate_detached_user_range(
     aspace: &Cap<AddressSpace>,
     vaddr: u64,
     bytes: &[u8],
-) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::ByteProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<(), ByteProgress> {
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     if bytes.is_empty() {
         return V3::done(());
     }
@@ -534,18 +535,18 @@ mod tests {
     use super::*;
     use crate::page_backed::{AnonSwapPolicy, PageContainerKind};
     use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::vm::adapter::step_engine::StepOutcome as V3StepOutcome;
     use crate::vm::{UserPage, USER_PAGE_SIZE};
     use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
-    use tx_substrate::step_v3::StepOutcome as V3StepOutcome;
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let lock = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         crate::zones::register_all().expect("kernel zones");
-        match tx_substrate::page_allocator::claim_zero_frame() {
-            Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+        match step_engine::page_allocator::claim_zero_frame() {
+            Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
             Err(error) => panic!("claim zero frame for vm::scripts tests: {error:?}"),
         }
         // No global drain here; nested guards are forbidden so callers

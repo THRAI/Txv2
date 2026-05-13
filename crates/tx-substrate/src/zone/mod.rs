@@ -36,7 +36,7 @@ pub use registry::{
     lookup, register_static_zone, registered_zone_count, snapshot, EmptySlabTrimStats, SlotKey,
     ZoneId, ZoneInfo,
 };
-pub use reservation::{reserve, sign, ZoneReservation};
+pub use reservation::{reserve, ZoneReservation};
 pub use runtime::{
     freeze_for_shutdown, init_on_ap, init_on_bsp, is_initialized, state, ZoneRuntimeState,
 };
@@ -224,7 +224,18 @@ pub fn register_zone_for<T: ZoneAllocated>() -> Result<ZoneInfo, ZoneError> {
 }
 
 pub fn sign_for<T: ZoneAllocated>(reservation: ZoneReservation<T>, value: T) -> Cap<T> {
-    sign(reservation, value)
+    reservation::sign(reservation, value)
+}
+
+/// Reserve a zone slot and sign a value into it in one step.
+///
+/// Convenience for the canonical adapter pattern
+/// `reserve_for::<T>()? → sign_for(res, value)`.
+/// Used by 2+ adapters; defined here so per-adapter wrappers can be
+/// replaced with a direct call to `zone::sign`.
+pub fn sign<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError> {
+    let res = reserve_for::<T>()?;
+    Ok(sign_for(res, value))
 }
 
 pub fn init_ap_for_current_stage(cpu: CpuId) -> Result<(), ZoneError> {

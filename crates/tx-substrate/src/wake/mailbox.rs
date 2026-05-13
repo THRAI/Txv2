@@ -36,7 +36,7 @@ use core::task::Waker;
 
 use alloc::collections::VecDeque;
 
-use crate::step_v3::{AbortReason, DelegateTokenId, InterestMask, WaitSourceId};
+use crate::step::{AbortReason, DelegateTokenId, InterestMask, WaitSourceId};
 use crate::SpinMutex;
 
 /// Generation counter for a [`TaskMailbox`]'s currently-active wait.
@@ -114,7 +114,7 @@ pub enum SignalRouting {
 /// `AgentReplied` / `Abort` variants `WakeHint::AgentReplied` /
 /// `WakeHint::Abort`. They are spelled here as `MailboxEvent::*`
 /// to share the queue with `SourceFired` and to avoid colliding
-/// with `tx_reactor::scheduler::WakeHint` (which classifies
+/// with the reactor's `scheduler::WakeHint` (which classifies
 /// scheduler-input metadata, not wake-event content). See the
 /// module-level naming note.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

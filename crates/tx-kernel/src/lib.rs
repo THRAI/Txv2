@@ -1,6 +1,7 @@
 #![no_std]
 
 extern crate alloc;
+pub mod adapter;
 #[cfg(test)]
 extern crate std;
 

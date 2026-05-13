@@ -12,7 +12,7 @@
 //! - STEP-1 (four-variant outcome reused via StepOutcome)
 //! - STEP-3 (StepProgress monoid bound on the associated type)
 
-use tx_substrate::step_v3::{
+use tx_substrate::step::{
     AbortReason, ByteProgress, DelegateReply, Errno, InterestMask, NoProgress, ResumeOutcome,
     ScriptCtx, StepOp, StepOutcome, StepProgress, TimerId, WaitSourceId, YieldShape,
 };
@@ -33,7 +33,7 @@ fn step_op_trait_has_associated_output_and_progress_types() {
     }
 
     let mut op = OneShotOp;
-    let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+    let mut ctx = ScriptCtx::<tx_substrate::step::ProcessIdentity>::new();
     let out = op.step(&mut ctx);
     assert_eq!(out, StepOutcome::Done(7u32));
 }
@@ -60,7 +60,7 @@ fn step_op_can_yield_with_progress_and_shape() {
     }
 
     let mut op = YieldingOp;
-    let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+    let mut ctx = ScriptCtx::<tx_substrate::step::ProcessIdentity>::new();
     let out = op.step(&mut ctx);
 
     match out {
@@ -97,7 +97,7 @@ fn step_op_can_continue() {
     }
 
     let mut op = ContinuingOp;
-    let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+    let mut ctx = ScriptCtx::<tx_substrate::step::ProcessIdentity>::new();
     let out = op.step(&mut ctx);
 
     match out {
@@ -136,7 +136,7 @@ fn step_op_progress_associated_type_must_implement_step_progress() {
 fn script_ctx_is_constructible() {
     // Default type param `I = ProcessIdentity` doesn't auto-resolve
     // when there's no contextual constraint; name it explicitly.
-    let _ = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+    let _ = ScriptCtx::<tx_substrate::step::ProcessIdentity>::new();
 }
 
 // -- 6. apply_resume default accepts Retry, rejects everything else -----------

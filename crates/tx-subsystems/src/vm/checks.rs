@@ -5,6 +5,7 @@
 //! and return the evidence execution needs, while reservation and mutation stay
 //! in `execution.rs`.
 
+use crate::vm::adapter::step_engine::{self as step_engine};
 use crate::vm::{
     AccessMode, AddressSpace, MapPlacement, UserRange, VmEntry, VmFault, VmFaultError,
     VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultOutcome, VmMapError,
@@ -62,7 +63,7 @@ pub fn require_map_admission(
     entry: &VmEntry,
     placement: MapPlacement,
 ) -> Result<(), VmMapError> {
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     aspace.recipes.validate_map(entry, placement, &guard)
 }
 

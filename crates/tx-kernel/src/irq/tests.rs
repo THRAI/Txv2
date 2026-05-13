@@ -198,7 +198,7 @@ impl tx_hal::PmapIf for IrqTestPlatform {
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = IRQ_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = tx_subsystems::zones::register_all();
     tx_subsystems::cross_crate_test_support::reset_init_process();
     tx_subsystems::cross_crate_test_support::reset_pid_counter();
@@ -312,8 +312,17 @@ fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
 
     // Fake UART bytes ready in the platform's RX source. The boot
     // console TTY runs in cooked mode (ICANON), so a complete line
-    // (`X\n`) is required for the later ldisc drain to flush bytes
-    // into the user-visible input queue.
+    // (`X\n`) is required for the ldisc to flush bytes into the
+    // user-visible input queue.
+    //
+    // 2026-05-13: Per the IRQ-context-safety rewrite, the handler no
+    // longer calls `step_ingest` inline (epoch::guard's
+    // `debug_assert!` rejects creation in IRQ context). Bytes land in
+    // `UART_RX_PENDING` instead, and `drain_uart_rx_pending` is the
+    // non-IRQ counterpart that feeds them to the line discipline. The
+    // test exercises both halves to match the production wiring (the
+    // reactor loop calls `drain_uart_rx_pending` after every WFI
+    // wake).
     {
         let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         queue.extend_from_slice(b"X\n");
@@ -323,10 +332,15 @@ fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
     assert_eq!(
         handled,
         IrqHandled::Wake,
-        "UART input readiness should request a reactor wake",
+        "buffered bytes should request a reactor wake",
     );
 
-    // IRQ context must not consume the bytes or mutate the TTY queue.
+    // Drain the deferred buffer the way the reactor loop does on every
+    // WFI return.
+    let drained = crate::irq::drain_uart_rx_pending();
+    assert_eq!(drained, 2, "drain_uart_rx_pending should consume X\\n");
+
+    // Console TTY input queue should now contain the committed line.
     let tty = console_tty().expect("CONSOLE_TTY populated by register_console_hardware");
     let payload = tty
         .live_payload()

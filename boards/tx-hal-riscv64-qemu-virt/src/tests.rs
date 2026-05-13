@@ -561,9 +561,11 @@ fn trap_frame_prepare_user_return_sets_sret_mode_bits() {
 
     frame.prepare_user_return();
 
-    assert_eq!(frame.sstatus & (1 << 8), 0);
-    assert_ne!(frame.sstatus & (1 << 5), 0);
+    assert_eq!(frame.sstatus & (1 << 8), 0, "SPP must be clear (user mode)");
+    assert_ne!(frame.sstatus & (1 << 5), 0, "SPIE must be set");
     assert_eq!(frame.previous_mode(), TrapPreviousMode::User);
+    // FS must be Initial (01) so FP instructions don't trap on re-entry.
+    assert_eq!((frame.sstatus >> 13) & 3, 1, "FS must be Initial");
 }
 
 #[test]
@@ -660,5 +662,89 @@ fn test_trap_frame(scause: usize, sepc: usize, stval: usize) -> Rv64TrapFrame {
         sepc,
         stval,
         sstatus: 1 << 8,
+        f: [0u64; 32],
+        fcsr: 0,
+        _pad_fp: 0,
     }
+}
+
+#[test]
+fn trap_frame_fp_context_round_trips_through_capture_restore() {
+    // FS=Dirty (3<<13): FP was used since last sret; SPIE set; SPP=0 (user mode).
+    let mut frame = test_trap_frame(8, 0x1000, 0);
+    frame.sstatus = (1 << 5) | (3 << 13);
+    for (i, r) in frame.f.iter_mut().enumerate() {
+        *r = 0xf000_0000_0000_0000 | i as u64;
+    }
+    frame.fcsr = 0x05;
+
+    let ctx = frame.view_mut().capture_user_context();
+
+    assert!(ctx.fp.is_valid(), "FP context must be valid when FS != Off");
+    assert_ne!(
+        ctx.fp.flags & tx_hal::UserFpContext::FLAG_DIRTY,
+        0,
+        "FLAG_DIRTY must be set when FS=Dirty"
+    );
+    assert_eq!(ctx.fp.regs, frame.f, "FP regs must round-trip");
+    assert_eq!(ctx.fp.fcsr, 0x05, "fcsr must round-trip");
+
+    // Restore into a fresh frame and verify FP state is recovered.
+    let mut frame2 = test_trap_frame(8, 0x2000, 0);
+    frame2.sstatus = 0;
+    frame2.view_mut().restore_user_context(&ctx);
+
+    assert_eq!(frame2.f, frame.f, "restored FP regs must match original");
+    assert_eq!(frame2.fcsr, 0x05, "restored fcsr must match original");
+    // prepare_user_return always sets FS=Initial (01).
+    assert_eq!(
+        (frame2.sstatus >> 13) & 3,
+        1,
+        "FS must be Initial after restore_user_context"
+    );
+}
+
+#[test]
+fn trap_frame_fp_context_empty_when_fs_off() {
+    // FS=Off (bits 14:13 = 00): FP disabled; captured FP state must be empty.
+    let mut frame = test_trap_frame(8, 0x1000, 0);
+    frame.sstatus = 0;
+    for (i, r) in frame.f.iter_mut().enumerate() {
+        *r = i as u64 + 1;
+    }
+    frame.fcsr = 0x03;
+
+    let ctx = frame.view_mut().capture_user_context();
+
+    assert!(
+        !ctx.fp.is_valid(),
+        "FP context must not be valid when FS=Off"
+    );
+    assert_eq!(ctx.fp.flags, 0);
+}
+
+#[test]
+fn trap_frame_fp_context_zeroed_when_restored_without_valid_fp() {
+    // restore_user_context with fp.is_valid()==false must zero the frame's FP slots.
+    let mut frame = test_trap_frame(8, 0x1000, 0);
+    frame.sstatus = 0; // FS=Off → capture returns empty fp
+    for (i, r) in frame.f.iter_mut().enumerate() {
+        *r = i as u64 + 1; // non-zero to verify zeroing
+    }
+    frame.fcsr = 0x07;
+
+    let ctx = frame.view_mut().capture_user_context(); // fp.is_valid() == false
+    assert!(!ctx.fp.is_valid());
+
+    let mut frame2 = test_trap_frame(8, 0x2000, 0);
+    for r in frame2.f.iter_mut() {
+        *r = 0xdead_beef_dead_beef;
+    }
+    frame2.view_mut().restore_user_context(&ctx);
+
+    assert_eq!(
+        frame2.f, [0u64; 32],
+        "FP regs must be zeroed when fp not valid"
+    );
+    assert_eq!(frame2.fcsr, 0, "fcsr must be zeroed when fp not valid");
 }

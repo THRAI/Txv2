@@ -11,9 +11,7 @@
 //! - txdoc:STEP-V2-OUTCOME-ALGEBRA-1 (four-variant outcome is closed)
 //! - txdoc:STEP-V2-YIELD-SHAPE-1 (YieldShape is a closed catalog)
 
-use tx_substrate::step_v3::{
-    ByteProgress, Errno, NoProgress, StepOutcome, StepProgress, YieldShape,
-};
+use tx_substrate::step::{ByteProgress, Errno, NoProgress, StepOutcome, StepProgress, YieldShape};
 
 #[test]
 fn step_outcome_done_helper_constructs_done_variant() {

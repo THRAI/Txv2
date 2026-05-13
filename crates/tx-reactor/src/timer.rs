@@ -1,12 +1,12 @@
 //! Host-drivable timer queue used by reactor wait timeouts.
 //!
 //! The PR-8 public timer surface (`TimerWheel`, `TimerGuard`,
-//! `TimerToken`, `TimerGuardRole`) moved down to
-//! [`tx_substrate::wake::timer`] per
+//! `TimerToken`, `TimerGuardRole`) moved down to `wake::timer` (in the
+//! substrate crate) per
 //! [`docs/progress/decisions/2026-05-11-d6-timerwheel-layering.md`].
-//! The re-export at the bottom of this module preserves the
-//! existing `tx_reactor::timer::*` and `crate::timer::*` paths
-//! (including the `pub use` in `crate::lib.rs`).
+//! The re-export at the bottom of this module preserves the existing
+//! `crate::timer::*` paths (including the `pub use` in
+//! `crate::lib.rs`).
 //!
 //! What remains here is the **internal `TimerQueue`** that drives
 //! the reactor's built-in `WaitProtocol::*Timeout` paths. It owns
@@ -26,7 +26,7 @@ use crate::wait::WaitOutcome;
 
 // Re-export the relocated public surface so `tx_reactor::timer::*`
 // and `crate::timer::*` paths continue to resolve.
-pub use tx_substrate::wake::timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
+pub use crate::adapter::bus_wire::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
 
 // =========================================================================
 // Internal: TimerQueue (unchanged; backs existing reactor
@@ -52,7 +52,7 @@ struct TimerWaiter {
 
 /// Internal queue-local token kept private to the `TimerQueue` impl
 /// below. The public [`TimerToken`] (re-exported above from
-/// `tx_substrate::wake::timer`) is a separate type so we don't
+/// `wake::timer` in substrate) is a separate type so we don't
 /// confuse the two roles (queue waiter id vs. wheel registration id).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InternalTimerToken(usize);

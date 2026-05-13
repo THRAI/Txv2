@@ -124,6 +124,16 @@ fn qemu_command(
             TxTarget::Rv64M1DockMock => "1",
         }
         .to_string(),
+        // Force multi-threaded TCG: vCPUs run on parallel host threads
+        // instead of round-robin time-slicing on one host thread. Without
+        // this, the boot smoke's BSP busy-spin for AP reactor task
+        // completion (init.rs `wait_for_ap_reactor_task_done`) starves
+        // the AP — the AP never gets CPU time to mark the task done,
+        // which manifests as a smoke panic on the slow GitHub Actions
+        // emulated runner (passes on Apple-silicon TCG because its
+        // round-robin is much faster).
+        "-accel".to_string(),
+        "tcg,thread=multi".to_string(),
         "-display".to_string(),
         "none".to_string(),
     ]);
@@ -148,7 +158,7 @@ fn qemu_command(
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
             args.push("-bios".into());
-            args.push("default".into());
+            args.push(opensbi_bios(root));
         }
         TxTarget::La64Qemu => {}
     }
@@ -311,6 +321,15 @@ fn run_with_sentinel(
         }
 
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn opensbi_bios(root: &Path) -> String {
+    let silent = root.join("external/opensbi-silent/fw_dynamic.bin");
+    if silent.exists() {
+        silent.display().to_string()
+    } else {
+        "default".to_string()
     }
 }
 

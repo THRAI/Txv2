@@ -25,7 +25,7 @@
 //! - `docs/Txv3/02_INVARIANTS_v5.md` DTOK-1, DTOK-2, DTOK-3,
 //!   DELEGATE-3, DELEGATE-6
 
-use tx_substrate::step_v3::{
+use tx_substrate::step::{
     AgentCancelPolicy, DelegateRegistry, DelegateReply, DelegateRequest, DelegateState,
     DelegateTokenId, TokenDropPolicy, TransitionOutcome,
 };

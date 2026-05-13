@@ -2,15 +2,14 @@
 
 use super::*;
 use crate::execution::Errno;
+use crate::page_backed::adapter::step_engine::{self as step_engine, StepOutcome as V3StepOutcome};
 use alloc::vec;
 use alloc::vec::Vec;
-use tx_substrate::page_allocator;
-use tx_substrate::step_v3::StepOutcome as V3StepOutcome;
 
 fn setup_host_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    tx_test_support::init_host();
+    match step_engine::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for read_exact_at tests: {error:?}"),
     }
 }
@@ -57,7 +56,7 @@ fn read_exact_at_within_single_page_returns_bytes() {
         .lock()
         .expect("read_exact_at epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -81,7 +80,7 @@ fn read_exact_at_across_page_boundary_returns_full_buffer() {
         .lock()
         .expect("read_exact_at epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -107,7 +106,7 @@ fn read_exact_at_short_read_returns_err() {
         .lock()
         .expect("read_exact_at epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -120,7 +119,7 @@ fn read_exact_at_short_read_returns_err() {
     // hits EOF before fill.
     assert_eq!(
         crate::page_backed::step_truncate(&pc, 120, &guard),
-        tx_substrate::step_v3::StepOutcome::Done(())
+        V3StepOutcome::Done(())
     );
     let payload: Vec<u8> = (0u8..120).collect();
     seed_anon_pc_with_bytes(&pc, &payload);
@@ -141,7 +140,7 @@ fn read_exact_at_zero_length_is_done_noop() {
         .lock()
         .expect("read_exact_at epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,

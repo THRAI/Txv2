@@ -1,12 +1,13 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
+use crate::adapter::step_engine::{
+    self as step_engine, guard as ebr_guard, page_allocator, reserve_for, sign_for, Cap,
+    StepOutcome,
+};
 use alloc::sync::Arc;
 use alloc::vec;
-use tx_substrate::step_v3::StepOutcome;
-
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
-use tx_substrate::{page_allocator, zone};
 use tx_subsystems::cred::{step_setresuid, Capability, CapabilitySet, Uid};
 use tx_subsystems::cross_crate_test_support::{
     clear_caps_for_test, install_caps_for_test, set_cred_ids_for_test,
@@ -77,8 +78,8 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
             RNodeBacking::Directory,
         )
         .with_containing_mount(&payload);
-        let res = zone::reserve_for::<RNode>().expect("rnode reservation");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
     };
 
     let _mount = MountIdentity::new_cap(
@@ -116,8 +117,8 @@ fn build_devfs_root() -> Cap<DEntry> {
             RNodeBacking::Directory,
         )
         .with_containing_mount(&payload);
-        let res = zone::reserve_for::<RNode>().expect("rnode reservation");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
     };
 
     let _mount = MountIdentity::new_cap(
@@ -189,7 +190,7 @@ fn dispatch_fchmodat_owner_succeeds() {
         effective_caps: CapabilitySet::EMPTY,
     };
     // Create the file as uid 1000 so the inode is owned by them.
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let (file_id, _) =
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard) {
             StepOutcome::Done(out) => out,
@@ -210,7 +211,7 @@ fn dispatch_fchmodat_owner_succeeds() {
     assert_eq!(result, SyscallResult::Return(0));
 
     // Backend reflects the new mode.
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
         StepOutcome::Done(m) => m,
         other => panic!("load_inode_meta: {other:?}"),
@@ -232,7 +233,7 @@ fn dispatch_fchmodat_non_owner_returns_neg_eperm() {
         gid: 0,
         effective_caps: CapabilitySet::EMPTY,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 
@@ -329,7 +330,7 @@ fn dispatch_fchownat_unprivileged_to_self_succeeds() {
         gid: 200,
         effective_caps: CapabilitySet::EMPTY,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let (file_id, _) =
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard) {
             StepOutcome::Done(out) => out,
@@ -362,7 +363,7 @@ fn dispatch_fchownat_unprivileged_to_self_succeeds() {
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
         StepOutcome::Done(m) => m,
         other => panic!("load_inode_meta: {other:?}"),
@@ -384,7 +385,7 @@ fn dispatch_fchownat_unprivileged_to_other_returns_neg_eperm() {
         gid: 0,
         effective_caps: CapabilitySet::EMPTY,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 
@@ -422,7 +423,7 @@ fn dispatch_fchownat_minus_one_leaves_unchanged() {
         gid: 200,
         effective_caps: CapabilitySet::EMPTY,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let (file_id, _) =
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard) {
             StepOutcome::Done(out) => out,
@@ -451,7 +452,7 @@ fn dispatch_fchownat_minus_one_leaves_unchanged() {
     assert_eq!(result, SyscallResult::Return(0));
 
     // uid/gid unchanged (still 1000/200 from create_inode).
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
         StepOutcome::Done(m) => m,
         other => panic!("load_inode_meta: {other:?}"),
@@ -477,7 +478,7 @@ fn dispatch_faccessat_existing_file_f_ok_returns_zero() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 
@@ -514,7 +515,7 @@ fn dispatch_faccessat_no_read_bit_returns_neg_eacces() {
         gid: 0,
         effective_caps: CapabilitySet::EMPTY,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100000, &owner_cred, &guard);
     drop(guard);
 
@@ -553,7 +554,7 @@ fn dispatch_faccessat_dac_override_bypasses() {
         gid: 0,
         effective_caps: CapabilitySet::EMPTY,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100000, &owner_cred, &guard);
     drop(guard);
 
@@ -597,7 +598,7 @@ fn dispatch_faccessat2_at_eaccess_uses_effective_uid() {
         gid: 0,
         effective_caps: CapabilitySet::EMPTY,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100400, &owner_cred, &guard);
     drop(guard);
 
@@ -662,7 +663,7 @@ fn dispatch_faccessat2_no_x_bit_returns_neg_eacces_even_with_dac_override() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 

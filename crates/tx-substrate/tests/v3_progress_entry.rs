@@ -11,7 +11,7 @@
 //! - txdoc:TXV3-STEP-MODEL-V2
 //! - txdoc:STEP-V2-PROGRESS-TYPED-1
 
-use tx_substrate::step_v3::{DirCursor, EntryProgress, StepProgress};
+use tx_substrate::step::{DirCursor, EntryProgress, StepProgress};
 
 const COUNT_SEEDS: [u32; 5] = [0, 1, 7, 64, 1024];
 const CURSOR_SEEDS: [u64; 5] = [0, 16, 4096, 1_000_000, u64::MAX];
@@ -99,6 +99,6 @@ fn entry_progress_extend_cursor_takes_the_later_position() {
 #[test]
 fn entry_progress_satisfies_step_progress_bound() {
     // Compile-only: `EntryProgress: StepProgress`.
-    fn _bound<P: tx_substrate::step_v3::StepProgress>() {}
+    fn _bound<P: tx_substrate::step::StepProgress>() {}
     _bound::<EntryProgress>();
 }

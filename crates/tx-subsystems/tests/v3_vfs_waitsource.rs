@@ -69,11 +69,10 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
-use tx_substrate::epoch;
-use tx_substrate::step_v3::{InterestMask, WaitSourceId};
-use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::wake::{MailboxEvent, TaskMailbox};
-use tx_substrate::zone::Cap;
+use tx_subsystems::vfs::adapter::step_engine::{Cap, InterestMask, WaitSourceId};
+use tx_subsystems::vfs::adapter::wait_routing::{
+    MailboxEvent, Mask, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+};
 
 use tx_subsystems::vfs::structure::{
     FsObjectId, InodeKind, InodeMeta, RNode, RNodeBacking, VFS_READABLE, VFS_WRITABLE,
@@ -85,22 +84,10 @@ static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
     guard
-}
-
-fn drain_to_quiescence() {
-    let mut quiet = 0u32;
-    while quiet < 2 {
-        let stats = epoch::drain_with_budget(usize::MAX);
-        if stats.reclaimed == 0 {
-            quiet += 1;
-        } else {
-            quiet = 0;
-        }
-    }
 }
 
 fn make_rnode(id: u64) -> Cap<RNode> {
@@ -113,13 +100,10 @@ fn make_rnode(id: u64) -> Cap<RNode> {
 }
 
 fn register<'a>(
-    source: &'a Arc<tx_substrate::wake::WaitSource>,
+    source: &'a Arc<WaitSource>,
     mailbox: &Arc<TaskMailbox>,
     interests: u64,
-) -> (
-    tx_substrate::wake::WaitRegistrationGuard<'a>,
-    tx_substrate::wake::WaitGeneration,
-) {
+) -> (WaitRegistrationGuard<'a>, WaitGeneration) {
     let gen = mailbox.next_generation();
     let prep = source.prepare(Arc::downgrade(mailbox), gen, InterestMask::new(interests));
     let guard = prep.install_if(|| true).expect("registration installed");
@@ -129,7 +113,7 @@ fn register<'a>(
 fn assert_source_fired_for(
     mailbox: &TaskMailbox,
     source: WaitSourceId,
-    generation: tx_substrate::wake::WaitGeneration,
+    generation: WaitGeneration,
     expected_overlap: u64,
 ) {
     let evt = mailbox
@@ -173,8 +157,8 @@ fn vfs_wait_source_invariants_round_trip() {
         read_id, write_id,
         "read and write directions must mint distinct registry slots",
     );
-    let read_source: Arc<tx_substrate::wake::WaitSource> = rnode.read_wait_source().clone();
-    let write_source: Arc<tx_substrate::wake::WaitSource> = rnode.write_wait_source().clone();
+    let read_source: Arc<WaitSource> = rnode.read_wait_source().clone();
+    let write_source: Arc<WaitSource> = rnode.write_wait_source().clone();
     assert_eq!(
         read_source.id(),
         WaitSourceId::new(read_id),
@@ -209,8 +193,7 @@ fn vfs_wait_source_invariants_round_trip() {
 
     let legacy_read_channel = legacy_wait_source::lookup_wait_channel(read_id)
         .expect("legacy resolver still has the read carrier");
-    let mut legacy_read_wait =
-        legacy_read_channel.wait(tx_reactor::wait::Mask::from_bits(VFS_READABLE));
+    let mut legacy_read_wait = legacy_read_channel.wait(Mask::from_bits(VFS_READABLE));
     let pre_legacy_read = Pin::new(&mut legacy_read_wait).poll(&mut cx);
     assert!(
         matches!(pre_legacy_read, Poll::Pending),
@@ -306,7 +289,7 @@ fn vfs_wait_source_invariants_round_trip() {
     drop(_reader_guard);
     drop(_writer_guard);
     drop(rnode);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 
     assert!(
         legacy_wait_source::lookup_wait_channel(read_id).is_none(),
@@ -357,7 +340,7 @@ fn vfs_wait_source_invariants_round_trip() {
         // Drop all caps.
         drop(caps);
     }
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 
     // Post-drop: every minted id is unresolvable. This is the no-leak
     // proof — without `Drop for RNode` releasing the slots, the legacy

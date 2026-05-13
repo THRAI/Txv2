@@ -4,16 +4,15 @@
 //! declared overlap semantics and writer preference while leaving the final
 //! persistent/concurrent interval index for a later substrate fit.
 //!
-//! Each `RangeLock` owns a `tx_reactor::wait::Channel` registered with
+//! Each `RangeLock` owns a `wait_routing::Channel` registered with
 //! `wait_source`. On every release the channel fires the
 //! `RANGE_LOCK_RELEASE_MASK` bit so async script wrappers can convert a
 //! `WouldBlock` outcome into an awaitable wait via `WouldBlock::wait_token`.
 
-use tx_reactor::wait::{Channel, Mask};
-use tx_substrate::step_v3::{
-    InterestMask, NoProgress, StepOutcome as V3StepOutcome, WaitSourceId, YieldShape,
+use crate::vm::adapter::step_engine::{
+    InterestMask, NoProgress, SpinMutex, StepOutcome as V3StepOutcome, WaitSourceId, YieldShape,
 };
-use tx_substrate::SpinMutex;
+use crate::vm::adapter::wait_routing::{Channel, Mask};
 
 use crate::execution::WaitToken;
 use crate::wait_source;

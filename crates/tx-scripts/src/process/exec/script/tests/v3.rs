@@ -9,8 +9,9 @@
 
 use alloc::boxed::Box;
 
-use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3Outcome};
-use tx_substrate::zone::Cap;
+use crate::adapter::step_engine::{
+    self as step_engine, guard, Cap, Errno as V3Errno, NoProgress, StepOutcome as V3Outcome,
+};
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::page_backed::{Frame, MaterializeAccess, PageIndex};
 use tx_subsystems::vfs::structure::{
@@ -258,7 +259,7 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecTestFs {
 
 #[test]
 fn exec_testfs_v3_lookup_round_trips_after_add_regular() {
-    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, NoProgress, StepOutcome as V3};
     use tx_subsystems::vfs::FsOps;
 
     let _setup = super::setup();
@@ -266,7 +267,7 @@ fn exec_testfs_v3_lookup_round_trips_after_add_regular() {
     let bytes = super::minimal_elf_bytes();
     let file_id = fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &bytes);
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     assert_eq!(
         <ExecTestFs as FsOps>::lookup(&*fs, FsObjectId::new(2), b"init", &guard),
         V3::<_, NoProgress>::done(file_id)
@@ -279,7 +280,7 @@ fn exec_testfs_v3_lookup_round_trips_after_add_regular() {
 
 #[test]
 fn exec_testfs_v3_load_inode_meta_returns_regular() {
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use step_engine::StepOutcome as V3;
     use tx_subsystems::vfs::structure::InodeKind;
     use tx_subsystems::vfs::FsOps;
 
@@ -288,7 +289,7 @@ fn exec_testfs_v3_load_inode_meta_returns_regular() {
     let bytes = super::minimal_elf_bytes();
     let file_id = fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &bytes);
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let meta = match <ExecTestFs as FsOps>::load_inode_meta(&*fs, file_id, &guard) {
         V3::Done(meta) => meta,
         other => panic!("load_inode_meta v3: {other:?}"),
@@ -298,13 +299,13 @@ fn exec_testfs_v3_load_inode_meta_returns_regular() {
 
 #[test]
 fn exec_testfs_v3_create_inode_returns_enosys() {
-    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, NoProgress, StepOutcome as V3};
     use tx_subsystems::vfs::FsOps;
 
     let _setup = super::setup();
     let (_root_dentry, fs) = super::build_fs_root();
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
     assert_eq!(
         <ExecTestFs as FsOps>::create_inode(&*fs, FsObjectId::new(2), b"new", 0o644, &cred, &guard),
@@ -314,7 +315,7 @@ fn exec_testfs_v3_create_inode_returns_enosys() {
 
 #[test]
 fn exec_testfs_v3_fetch_page_zero_offset_returns_frame() {
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use step_engine::StepOutcome as V3;
     use tx_subsystems::page_backed::FsPageBacking;
 
     let _setup = super::setup();
@@ -322,7 +323,7 @@ fn exec_testfs_v3_fetch_page_zero_offset_returns_frame() {
     let bytes = super::minimal_elf_bytes();
     let file_id = fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &bytes);
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     match <ExecTestFs as FsPageBacking>::fetch_page(&*fs, file_id, 0, &guard) {
         V3::Done(_frame) => {}
         other => panic!("fetch_page v3: {other:?}"),
@@ -331,13 +332,13 @@ fn exec_testfs_v3_fetch_page_zero_offset_returns_frame() {
 
 #[test]
 fn exec_testfs_v3_fsync_returns_done() {
-    use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
+    use step_engine::{NoProgress, StepOutcome as V3};
     use tx_subsystems::page_backed::FsPageBacking;
 
     let _setup = super::setup();
     let (_root_dentry, fs) = super::build_fs_root();
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     assert_eq!(
         <ExecTestFs as FsPageBacking>::fsync(&*fs, FsObjectId::new(2), &guard),
         V3::<(), NoProgress>::done(())

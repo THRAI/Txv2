@@ -62,11 +62,13 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
-use tx_substrate::epoch;
-use tx_substrate::step_v3::{InterestMask, WaitSourceId};
-use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::wake::{MailboxEvent, TaskMailbox};
-use tx_substrate::zone::{self as zone_mod, Cap, PayloadCap};
+use tx_subsystems::tty::adapter::step_engine::{
+    self as zone_mod, guard as ebr_guard, ByteProgress, Cap, InterestMask, PayloadCap, StepOutcome,
+    WaitSourceId,
+};
+use tx_subsystems::tty::adapter::wait_routing::{
+    MailboxEvent, Mask, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+};
 
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
@@ -79,20 +81,12 @@ static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct NoopOps;
 
 impl CharDeviceOps for NoopOps {
-    fn read(
-        &self,
-        _out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-        tx_substrate::step_v3::StepOutcome::Done(0)
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::Done(0)
     }
 
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-        tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        StepOutcome::Done(bytes.len())
     }
 }
 
@@ -105,22 +99,10 @@ static NOOP_BINDING: CharDeviceBinding = CharDeviceBinding {
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
     guard
-}
-
-fn drain_to_quiescence() {
-    let mut quiet = 0u32;
-    while quiet < 2 {
-        let stats = epoch::drain_with_budget(usize::MAX);
-        if stats.reclaimed == 0 {
-            quiet += 1;
-        } else {
-            quiet = 0;
-        }
-    }
 }
 
 fn alloc_hardware_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
@@ -139,13 +121,10 @@ fn alloc_hardware_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
 }
 
 fn register<'a>(
-    source: &'a Arc<tx_substrate::wake::WaitSource>,
+    source: &'a Arc<WaitSource>,
     mailbox: &Arc<TaskMailbox>,
     interests: u64,
-) -> (
-    tx_substrate::wake::WaitRegistrationGuard<'a>,
-    tx_substrate::wake::WaitGeneration,
-) {
+) -> (WaitRegistrationGuard<'a>, WaitGeneration) {
     let gen = mailbox.next_generation();
     let prep = source.prepare(Arc::downgrade(mailbox), gen, InterestMask::new(interests));
     let guard = prep.install_if(|| true).expect("registration installed");
@@ -155,7 +134,7 @@ fn register<'a>(
 fn assert_source_fired_for(
     mailbox: &TaskMailbox,
     source: WaitSourceId,
-    generation: tx_substrate::wake::WaitGeneration,
+    generation: WaitGeneration,
     expected_overlap: u64,
 ) {
     let evt = mailbox
@@ -193,7 +172,7 @@ fn tty_wait_source_invariants_round_trip() {
 
     // ---- (1) WaitSourceId round-trip pin --------------------------
     let tty_source_id = tty.wait_source_id();
-    let tty_source: Arc<tx_substrate::wake::WaitSource> = tty.wait_source().clone();
+    let tty_source: Arc<WaitSource> = tty.wait_source().clone();
     assert_eq!(
         tty_source.id(),
         WaitSourceId::new(tty_source_id),
@@ -223,7 +202,7 @@ fn tty_wait_source_invariants_round_trip() {
 
     let legacy_channel = tx_subsystems::wait_source::lookup_wait_channel(tty_source_id)
         .expect("legacy resolver still has the carrier");
-    let mut legacy_wait = legacy_channel.wait(tx_reactor::wait::Mask::from_bits(TTY_READABLE));
+    let mut legacy_wait = legacy_channel.wait(Mask::from_bits(TTY_READABLE));
     let pre_legacy = Pin::new(&mut legacy_wait).poll(&mut cx);
     assert!(
         matches!(pre_legacy, Poll::Pending),
@@ -233,10 +212,10 @@ fn tty_wait_source_invariants_round_trip() {
     // Single byte-ingest transition. `\n` commits a cooked line under
     // default_cooked() termios, which fires `input_readable` and
     // both the legacy `wait_channel` and the new `wait_source`.
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let outcome = step_ingest(&tty, b"\n", &guard);
     drop(guard);
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use tx_subsystems::tty::adapter::step_engine::StepOutcome as V3;
     match outcome {
         V3::Done(o) => assert!(o.readable_fired, "expected readable_fired"),
         other => panic!("expected Done(_) with readable_fired, got {other:?}"),
@@ -271,7 +250,7 @@ fn tty_wait_source_invariants_round_trip() {
     let (_reg_guard_hangup, _gen_hangup) = register(&tty_source, &mailbox_hangup, TTY_READABLE);
     assert!(mailbox_hangup.is_empty());
 
-    let guard = epoch::guard();
+    let guard = ebr_guard();
     let hangup = step_hangup(&tty, &guard);
     drop(guard);
     match hangup {
@@ -302,5 +281,5 @@ fn tty_wait_source_invariants_round_trip() {
 
     // Drop strong refs so EBR can retire.
     drop(tty);
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
 }
