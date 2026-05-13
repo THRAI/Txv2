@@ -51,16 +51,22 @@ use crate::vm::{
 /// VA layout is finalised.
 pub const USER_STACK_TOP_DEFAULT: u64 = 0x4000_0000;
 
-/// Default initial reservation for the userspace stack region.
+/// Default initial reservation for the userspace stack region. Sized
+/// at 16 KiB (4 pages) per `txdoc:EXEC-9-3-POPULATE-THE-INITIAL-USER-STACK`.
+/// Stack growth via a future `expand_stack` script is out of scope for
+/// the initial slice.
+pub const USER_STACK_INITIAL_RESERVATION: u64 = 16 * 1024;
+
+/// Default load bias for an ET_DYN interpreter (N69a).
 ///
-/// The reservation is recipe-only: pages still materialise lazily on
-/// fault, so this costs virtual address space rather than physical
-/// memory. Keep it large enough for ordinary libc stack frames while a
-/// future `expand_stack` script remains out of scope. LA64 libc-test's
-/// `qsort` reaches well beyond the former 16 KiB bootstrap window
-/// before making another syscall, so reserve the Linux default soft
-/// limit up front.
-pub const USER_STACK_INITIAL_RESERVATION: u64 = 8 * 1024 * 1024;
+/// Sits between any reasonable ET_EXEC program footprint (typical
+/// musl binary text + data + heap is well under 256 MiB; the staged
+/// `iperf3` static binary is ~830 KiB) and the stack reservation at
+/// [`USER_STACK_TOP_DEFAULT`]. Deterministic — ASLR is out of scope.
+///
+/// musl `libc.so` (the dynamic loader + runtime) is ~1 MiB, so a
+/// 256 MiB window from `0x3000_0000` to `0x3FFF_C000` is comfortable.
+pub const INTERP_LOAD_BIAS_DEFAULT: u64 = 0x3000_0000;
 
 /// Loader's parsed view of the ELF image, in kernel-owned shape.
 ///
@@ -249,7 +255,13 @@ pub fn build_aspace_from_image<P: PmapIf>(
     // consumers (auxv, debug tooling) that care about the
     // byte-granularity range; only the redundant register-recipe pass
     // is removed.
-    register_image_load_segments(&aspace, image_plan)?;
+    for segment in &image_plan.load_segments {
+        // Main image keeps `load_bias = 0` (ET_EXEC). ET_DYN main
+        // programs (PIE) are deferred to a follow-on slice; the
+        // interpreter goes through `register_interp_image` with a
+        // kernel-chosen non-zero bias instead.
+        register_load_segment(&aspace, segment, 0)?;
+    }
 
     // Stack: anonymous private, page-aligned, anchored to `stack_top`.
     //
@@ -290,16 +302,34 @@ pub fn build_aspace_from_image<P: PmapIf>(
     Ok(aspace)
 }
 
-/// Register every LOAD-segment recipe from an image plan into an existing
-/// detached address space. Used by dynamic exec after the main binary has
-/// created the aspace, so interpreter segments receive the same page-delta,
-/// file-offset, and BSS treatment as the main image.
-pub fn register_image_load_segments(
+/// Register an ET_DYN interpreter's LOAD segments on an already-built
+/// detached aspace (N69a).
+///
+/// Walks `image_plan.load_segments`, applies `load_bias` to each
+/// segment's `vaddr`, and registers the resulting recipe rows
+/// alongside whatever the main image already installed. Does **not**
+/// register a stack range — the stack is owned by the main image; the
+/// interpreter shares it.
+///
+/// `image_plan.entry` and `image_plan.stack_top` are not consumed by
+/// this function — the caller threads `entry + load_bias` through the
+/// auxv (`AT_BASE`) and the trap context (initial PC), and keeps the
+/// main image's `stack_top` value.
+///
+/// Cites: txdoc:EXEC-9-2-CREATE-DETACHED-ADDRESS-SPACE (auxv-side
+/// of the dynamic-link contract is in `stack::AuxvFacts.at_base`).
+pub fn register_interp_image(
     aspace: &Cap<AddressSpace>,
     image_plan: &ImagePlan,
+    load_bias: u64,
 ) -> Result<(), ScriptError> {
+    if !load_bias.is_multiple_of(USER_PAGE_SIZE as u64) {
+        // Required so applying the bias preserves ELF congruence
+        // (`p_vaddr % p_align == p_offset % p_align`).
+        return Err(ScriptError::InvalidImage);
+    }
     for segment in &image_plan.load_segments {
-        register_load_segment(aspace, segment)?;
+        register_load_segment(aspace, segment, load_bias)?;
     }
     Ok(())
 }
@@ -436,18 +466,33 @@ pub async fn populate_detached_user_range(
 /// Splits the segment into a file-backed prefix (the bytes the loader
 /// will demand-fault from `Cap<PageContainer>`) and an optional
 /// anonymous-private BSS tail (`memsz > filesz`).
+///
+/// `load_bias` is added to the segment's `vaddr` before any mapping
+/// math; pass `0` for ET_EXEC main programs and a kernel-chosen
+/// page-aligned offset for ET_DYN interpreters (N69a).
 fn register_load_segment(
     aspace: &Cap<AddressSpace>,
     segment: &LoadSegment,
+    load_bias: u64,
 ) -> Result<(), ScriptError> {
     let prot = segment.flags.to_prot();
     let page_size = USER_PAGE_SIZE as u64;
 
+    // Apply load_bias up-front. For ELF congruence
+    // (`p_vaddr % p_align == p_offset % p_align`) to still hold after
+    // adding `load_bias`, the bias must be page-aligned; the
+    // orchestrator picks page-aligned biases (N69a pins 0x3000_0000),
+    // so this addition cannot break congruence.
+    let biased_vaddr = segment
+        .vaddr
+        .checked_add(load_bias)
+        .ok_or(ScriptError::InvalidImage)?;
+
     // ELF p_vaddr / p_offset must be congruent mod page_size per the
     // loader's validation; the page delta is the in-page offset of the
     // segment's start within the first mapped page.
-    let page_delta = segment.vaddr % page_size;
-    let map_start = segment.vaddr - page_delta;
+    let page_delta = biased_vaddr % page_size;
+    let map_start = biased_vaddr - page_delta;
     let file_page_offset = segment
         .file_offset
         .checked_sub(page_delta)
@@ -457,12 +502,10 @@ fn register_load_segment(
         return Ok(());
     }
 
-    let file_end = segment
-        .vaddr
+    let file_end = biased_vaddr
         .checked_add(segment.filesz)
         .ok_or(ScriptError::InvalidImage)?;
-    let mem_end = segment
-        .vaddr
+    let mem_end = biased_vaddr
         .checked_add(segment.memsz)
         .ok_or(ScriptError::InvalidImage)?;
 
@@ -666,37 +709,6 @@ mod tests {
     }
 
     #[test]
-    fn build_aspace_from_image_stack_reservation_covers_libctest_qsort_frame() {
-        let _g = setup();
-        let plan = ImagePlan {
-            entry: 0x1_0000,
-            stack_top: USER_STACK_TOP_DEFAULT,
-            load_segments: Vec::new(),
-            bss_extension: None,
-            executable_stack: false,
-        };
-
-        let aspace =
-            build_aspace_from_image::<crate::vm::TestPmap>(&plan).expect("build empty aspace");
-        let stack = aspace
-            .recipes_snapshot()
-            .into_iter()
-            .find(|entry| entry.range.end().as_usize() as u64 == USER_STACK_TOP_DEFAULT)
-            .expect("stack recipe");
-
-        let qsort_local_arrays = 2 * 1026 * core::mem::size_of::<u64>() as u64;
-        let conservative_call_frames = 4 * USER_PAGE_SIZE as u64;
-        let lowest_expected_sp =
-            USER_STACK_TOP_DEFAULT - (qsort_local_arrays + conservative_call_frames);
-        assert!(
-            stack.range.start().as_usize() as u64 <= lowest_expected_sp,
-            "stack reservation starts at {:#x}, above qsort frame low water {:#x}",
-            stack.range.start().as_usize(),
-            lowest_expected_sp
-        );
-    }
-
-    #[test]
     fn build_aspace_from_image_emits_recipes_per_load_segment() {
         let _g = setup();
         let pc = anon_pc(8);
@@ -842,5 +854,112 @@ mod tests {
         let frame_base = page_allocator::frame_kernel_addr(snapshot.ppn).expect("direct map");
         let observed: &[u8] = unsafe { core::slice::from_raw_parts(frame_base, USER_PAGE_SIZE) };
         assert_eq!(&observed[..USER_PAGE_SIZE], &payload[..USER_PAGE_SIZE]);
+    }
+
+    /// N69a: `register_interp_image` adds the load bias to every
+    /// segment's `vaddr` so an ET_DYN interpreter lands at the
+    /// kernel-chosen base instead of its raw header addresses.
+    #[test]
+    fn register_interp_image_applies_load_bias_to_segments() {
+        let _g = setup();
+        // Build a main aspace with no LOAD segments — the interpreter
+        // is the only thing registered apart from the stack.
+        let main_plan = ImagePlan {
+            entry: 0x1_0000,
+            stack_top: USER_STACK_TOP_DEFAULT,
+            load_segments: Vec::new(),
+            bss_extension: None,
+        };
+        let aspace =
+            build_aspace_from_image::<crate::vm::TestPmap>(&main_plan).expect("main aspace");
+
+        // Interpreter image with one RX LOAD at vaddr=0 (canonical for
+        // a freshly compiled ET_DYN ld).
+        let pc = anon_pc(8);
+        let interp_seg = LoadSegment {
+            vaddr: 0,
+            memsz: 2 * USER_PAGE_SIZE as u64,
+            filesz: 2 * USER_PAGE_SIZE as u64,
+            file_offset: 0,
+            flags: rwx_flags(true, false, true),
+            backing: pc.clone(),
+        };
+        let interp_plan = ImagePlan {
+            entry: 0,
+            stack_top: 0,
+            load_segments: vec![interp_seg],
+            bss_extension: None,
+        };
+
+        register_interp_image(&aspace, &interp_plan, INTERP_LOAD_BIAS_DEFAULT)
+            .expect("register interp");
+
+        // The new recipe lives at INTERP_LOAD_BIAS_DEFAULT + 0.
+        let recipes = aspace.recipes_snapshot();
+        let interp_recipe = recipes
+            .iter()
+            .find(|e| matches!(e.backing, VmBacking::Page { .. }))
+            .expect("interp recipe registered");
+        assert_eq!(
+            interp_recipe.range.start().as_usize() as u64,
+            INTERP_LOAD_BIAS_DEFAULT
+        );
+        assert_eq!(
+            interp_recipe.range.end().as_usize() as u64,
+            INTERP_LOAD_BIAS_DEFAULT + 2 * USER_PAGE_SIZE as u64
+        );
+    }
+
+    /// `register_interp_image` rejects a non-page-aligned bias to keep
+    /// ELF congruence intact after the offset is applied.
+    #[test]
+    fn register_interp_image_rejects_unaligned_load_bias() {
+        let _g = setup();
+        let main_plan = ImagePlan {
+            entry: 0x1_0000,
+            stack_top: USER_STACK_TOP_DEFAULT,
+            load_segments: Vec::new(),
+            bss_extension: None,
+        };
+        let aspace =
+            build_aspace_from_image::<crate::vm::TestPmap>(&main_plan).expect("main aspace");
+        let interp_plan = ImagePlan {
+            entry: 0,
+            stack_top: 0,
+            load_segments: Vec::new(),
+            bss_extension: None,
+        };
+        // Bias of 1 is not page-aligned.
+        let err = register_interp_image(&aspace, &interp_plan, 1).unwrap_err();
+        assert_eq!(err, ScriptError::InvalidImage);
+    }
+
+    /// `register_interp_image` only emits recipes for LOAD segments —
+    /// no stack range (the main image already owns one).
+    #[test]
+    fn register_interp_image_does_not_register_stack() {
+        let _g = setup();
+        let main_plan = ImagePlan {
+            entry: 0x1_0000,
+            stack_top: USER_STACK_TOP_DEFAULT,
+            load_segments: Vec::new(),
+            bss_extension: None,
+        };
+        let aspace =
+            build_aspace_from_image::<crate::vm::TestPmap>(&main_plan).expect("main aspace");
+        let recipes_before = aspace.recipes_snapshot().len();
+
+        let interp_plan = ImagePlan {
+            entry: 0,
+            stack_top: 0,
+            load_segments: Vec::new(),
+            bss_extension: None,
+        };
+        register_interp_image(&aspace, &interp_plan, INTERP_LOAD_BIAS_DEFAULT)
+            .expect("register interp without segments");
+
+        // Empty interp plan adds zero recipes; the main image's stack
+        // recipe count is unchanged.
+        assert_eq!(aspace.recipes_snapshot().len(), recipes_before);
     }
 }

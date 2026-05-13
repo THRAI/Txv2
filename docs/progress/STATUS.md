@@ -2228,6 +2228,30 @@
   **Next step:** none for this bug cluster. Shell prompt milestone
   complete.
 
+- 2026-05-13 N69a dynamic ELF loader (PT_INTERP + ET_DYN interpreter) LANDED.
+  Lifts the kernel exec contract from static-`ET_EXEC`-only to "ET_EXEC main
+  with optional ET_DYN interpreter": `parse_image_plan` now accepts
+  `PT_INTERP`/`PT_DYNAMIC` and emits an `InterpRef` locator; a new
+  `parse_interp_plan` accepts `ET_DYN`; `vm::register_interp_image` registers
+  interp LOAD segments at a kernel-chosen `INTERP_LOAD_BIAS_DEFAULT =
+  0x3000_0000`; `exec_script` opens the interp via the same VFS walker,
+  registers its segments, sets `AT_BASE = load_bias`, and seeds the initial
+  PC at `interp.entry + load_bias`. Glibc ET_DYN main programs (PIE) still
+  rejected — single-slice scope kept tight. Verified: 24 loader tests (+6
+  N69a), 9 vm scripts tests (+3 N69a), 15 exec_script tests (+3 N69a, incl.
+  end-to-end dyn-link fixture), `cargo fmt --check`, `cargo xtask test
+  busybox-boot --target rv64-qemu`, `busybox-iperf3-loopback` shell-test
+  (static binary regression), **`busybox-netperf-help` shell-test** (the
+  N69a target: musl-linked `/bin/netperf -h` + `/bin/netserver -h` both
+  print Usage and return to the shell prompt). Pre-existing failure
+  `boot_smoke_userspace_tcp_loopback_uses_reactor_owned_delegate` (kernel
+  unit test) verified to be broken on baseline `056c149` — not introduced
+  by N69a. Plan: `msp/network-n69a-pt-interp-loader-plan.md`. Result:
+  `msp/network-n69a-pt-interp-loader-result.md`. **Next:** N69b — attempt
+  netperf loopback (`netserver -4 -L 127.0.0.1 -p 12865 &` then
+  `netperf -4 -H 127.0.0.1 -p 12865 -t TCP_STREAM -l 1`), trap-trace any
+  missing syscalls musl-ld exercises beyond what static binaries hit.
+
 - 2026-05-13 N68 shell TCP/UDP smoke LANDED. The BusyBox initramfs can now
   include freestanding RV64 `/bin/tcp-loopback-smoke` and
   `/bin/udp-loopback-smoke` test programs. TCP proves
