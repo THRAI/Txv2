@@ -3,7 +3,7 @@ use super::la64_pmap::*;
 use super::*;
 
 #[cfg(target_arch = "loongarch64")]
-const LA64_BOOT_STACK_STRIDE: usize = 64 * 1024;
+const LA64_BOOT_STACK_STRIDE: usize = 128 * 1024;
 #[cfg(target_arch = "loongarch64")]
 const LA64_IOCSR_IPI_STATUS: usize = 0x1000;
 #[cfg(target_arch = "loongarch64")]
@@ -41,6 +41,14 @@ const LA64_IOCSR_IPI_ACTION_SCHED: u32 = 1;
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
     static __tx_boot_stack_top: u8;
+    fn tx_la64_qemu_activate_enter_userspace(
+        resume_ctx: *mut KernelResumeCtx,
+        frame: *const La64TrapFrame,
+        trap_stack_top: usize,
+        asid: usize,
+        pgdl: usize,
+        pgdh: usize,
+    );
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -134,7 +142,7 @@ fn wait_for_online_secondaries(target: CpuMask) -> usize {
 #[cfg(target_arch = "loongarch64")]
 fn enable_uart_rx_irq() {
     unsafe {
-        let base = QEMU_LA64_UART0_BASE as *mut u8;
+        let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *mut u8;
         core::ptr::write_volatile(base.add(UART_IER), UART_IER_ERBFI);
     }
 
@@ -414,6 +422,39 @@ impl TrapIf for Platform {
 
     fn classify_trap(snapshot: TrapFrameSnapshot) -> TrapClass {
         classify_la64_trap(snapshot.scause)
+    }
+
+    fn enter_userspace_with_context(ctx: &UserTrapContext, root: &PmapRoot) {
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            let cpu = <Platform as SmpIf>::current_cpu_id();
+            let frame = la64_entry_trap_frame_ptr_for_cpu(cpu);
+            (*frame).restore_user_context(ctx);
+            let pgdh = ensure_la64_kernel_pgdh_root().expect("LA64 kernel PGDH root");
+            ensure_la64_low_kernel_identity_mapped(root).expect("LA64 user root kernel identity");
+            configure_la64_page_walk_csrs();
+            let resume_ctx = la64_kernel_resume_ctx_ptr_for_cpu(cpu);
+            let stack_top = la64_trap_stack_top_for_cpu(cpu);
+            tx_la64_qemu_activate_enter_userspace(
+                resume_ctx,
+                frame,
+                stack_top,
+                root.asid().0 as usize & LA64_ASID_MASK,
+                root.phys().0,
+                pgdh.0,
+            );
+        }
+
+        #[cfg(not(target_arch = "loongarch64"))]
+        unsafe {
+            let mut frame = La64TrapFrame::empty();
+            frame.r = ctx.regs;
+            frame.r[0] = 0;
+            frame.era = ctx.pc;
+            frame.prmd = ctx.status;
+            frame.prepare_user_return();
+            return_to_userspace(&frame)
+        }
     }
 }
 impl SignalFrameIf for Platform {

@@ -390,10 +390,10 @@ where
     let from_user = frame.previous_mode() == TrapPreviousMode::User;
     let ecode = (frame.estat >> LA64_ESTAT_ECODE_SHIFT) & LA64_ESTAT_ECODE_MASK;
 
-    // LA64 lazy-FPU first-use path: when user code traps with IPE
-    // (FPU disabled), materialise a clean per-thread FP context and
-    // retry the same instruction.
-    if from_user && ecode == LA64_ECODE_IPE {
+    // LA64 lazy-FPU first-use path: when user code traps with FPU
+    // unavailable/disabled, materialise a clean per-thread FP context
+    // and retry the same instruction.
+    if from_user && (ecode == LA64_ECODE_IPE || ecode == LA64_ECODE_FPD) {
         let mut fp = UserFpContext::empty();
         fp.flags = UserFpContext::FLAG_VALID;
         la64_restore_fp_context(&fp);
@@ -428,10 +428,7 @@ where
             };
             K::on_page_fault(frame.view_mut(), fault)
         }
-        TrapClass::Syscall => {
-            frame.era = frame.era.saturating_add(4);
-            K::on_syscall(frame.view_mut())
-        }
+        TrapClass::Syscall => K::on_syscall(frame.view_mut()),
         TrapClass::TimerInterrupt => {
             write_la64_csr(LA64_CSR_TICLR, LA64_TICLR_CLEAR_TIMER);
             let _irq_context = enter_la64_irq_context();
@@ -533,7 +530,7 @@ pub(crate) const fn classify_la64_trap(estat: usize) -> TrapClass {
         },
         LA64_ECODE_SYS => TrapClass::Syscall,
         LA64_ECODE_BRK => TrapClass::Breakpoint,
-        LA64_ECODE_INE | LA64_ECODE_IPE => TrapClass::IllegalInstruction,
+        LA64_ECODE_INE | LA64_ECODE_IPE | LA64_ECODE_FPD => TrapClass::IllegalInstruction,
         _ => TrapClass::UnknownSync,
     }
 }
@@ -600,6 +597,7 @@ pub(crate) fn la64_tlb_refill_vector_addr() -> usize {
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
     fn tx_kernel_loongarch64_qemu_trap_dispatch(frame: *mut La64TrapFrame) -> TrapAction;
+    fn tx_la64_resume_kernel_after_reschedule(resume_ctx: *const KernelResumeCtx) -> !;
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -611,7 +609,16 @@ extern "C" fn tx_la64_qemu_kernel_trap_entry(frame: &mut La64TrapFrame) {
 
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn apply_la64_trap_action(frame: &La64TrapFrame, action: TrapAction) {
+    let from_user = frame.previous_mode() == TrapPreviousMode::User;
     match action {
+        #[cfg(target_arch = "loongarch64")]
+        TrapAction::Reschedule if from_user => unsafe {
+            let cpu = <Platform as SmpIf>::current_cpu_id();
+            let stack_top = la64_trap_stack_top_for_cpu(cpu);
+            write_la64_csr(LA64_CSR_KSAVE0, stack_top);
+            let resume_ctx = la64_kernel_resume_ctx_ptr_for_cpu(cpu) as *const KernelResumeCtx;
+            tx_la64_resume_kernel_after_reschedule(resume_ctx);
+        },
         TrapAction::Resume | TrapAction::Reschedule | TrapAction::DeliverSignal => {}
         TrapAction::Terminate => tx_la64_qemu_trap_panic(frame),
     }
@@ -755,9 +762,12 @@ pub(crate) fn console_write_literal(bytes: &[u8]) {
     Platform::write_bytes(bytes);
 }
 
+#[cfg(not(target_arch = "loongarch64"))]
+pub(crate) fn console_write_literal(_bytes: &[u8]) {}
+
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn console_write_hex(value: usize) {
-    for shift in (0..usize::BITS).rev().step_by(4) {
+    for shift in (0..usize::BITS).step_by(4).rev() {
         let digit = ((value >> shift) & 0xf) as u8;
         let byte = if digit < 10 {
             b'0' + digit
@@ -767,6 +777,9 @@ pub(crate) fn console_write_hex(value: usize) {
         Platform::write_bytes(&[byte]);
     }
 }
+
+#[cfg(not(target_arch = "loongarch64"))]
+pub(crate) fn console_write_hex(_value: usize) {}
 
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn console_write_decimal(mut value: usize) {
@@ -821,6 +834,27 @@ pub(crate) fn publish_static_boot_facts() {
         <Platform as PlatformConfig>::PAGE_SIZE,
     )
     .min(QEMU_LA64_RAM_END);
+    // DIAGNOSTIC: log the raw firmware_arg and the first 4 bytes at its
+    // cached-alias so DTB-parse failures can be triaged from the boot log.
+    // FDT magic is 0xd00dfeed (big-endian in the file = bytes d0 0d fe ed).
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let fw = LA64_BOOT_FIRMWARE_ARG.load(Ordering::Acquire);
+        console_write_literal(b"txkernel:qemu-loongarch64-virt:bootarg:fw=0x");
+        console_write_hex(fw);
+        if fw != 0 {
+            let phys = la64_kernel_addr_to_phys(fw);
+            let alias = la64_cached_virt(phys);
+            // SAFETY: reading 4 bytes at the cached-alias of the firmware
+            // arg for diagnostic purposes; the read may produce garbage if
+            // fw does not point to mapped memory, but will not fault under
+            // the DMW window (the address is always in the 0x9000... range).
+            let magic = unsafe { core::ptr::read_volatile(alias as *const u32) };
+            console_write_literal(b":magic@cached=0x");
+            console_write_hex(magic as usize);
+        }
+        console_write_literal(b"\n");
+    }
     let parsed_from_dtb = parse_firmware_boot_info(reserved_end);
     let (memory_region_count, initrd, cmdline_len, timebase_frequency_hz, possible_cpu_count) =
         parsed_from_dtb.unwrap_or_else(|| {
@@ -977,20 +1011,36 @@ unsafe fn parse_dtb_boot_info_with_fallbacks(
         parse_boot_info_from_fdt(addr, memory, out)
     };
 
-    if let Some(parsed) = parse(firmware_arg, memory_regions, cmdline) {
+    // Derive the physical address and both DMW aliases. We always probe
+    // the cached-alias first (safe: DMW window bypasses TLB, no fault
+    // risk at early boot). Reading a raw physical address — what a QEMU
+    // direct-boot loader places in `a1` — causes a kernel-mode TLB fault
+    // and Terminate before page tables exist, so we check whether
+    // `firmware_arg` is already in a DMW window before trying it directly.
+    let phys = la64_kernel_addr_to_phys(firmware_arg);
+    let cached_alias = la64_cached_virt(phys);
+    let uncached_alias = la64_uncached_virt(phys);
+
+    // 1. Cached DMW alias — always safe.
+    if let Some(parsed) = parse(cached_alias, memory_regions, cmdline) {
         return Some(parsed);
     }
 
-    let phys = la64_kernel_addr_to_phys(firmware_arg);
-    let cached_alias = la64_cached_virt(phys);
-    if cached_alias != firmware_arg {
-        if let Some(parsed) = parse(cached_alias, memory_regions, cmdline) {
-            return Some(parsed);
+    // 2. firmware_arg itself, only if it is a DMW virtual address (i.e.
+    //    QEMU / firmware already wrapped the physical in a window tag).
+    if firmware_arg != cached_alias && firmware_arg != uncached_alias {
+        let fw_tag = firmware_arg >> 48;
+        let cached_tag = LA64_DMW_CACHED_BASE >> 48;
+        let uncached_tag = LA64_DMW_UNCACHED_BASE >> 48;
+        if fw_tag == cached_tag || fw_tag == uncached_tag {
+            if let Some(parsed) = parse(firmware_arg, memory_regions, cmdline) {
+                return Some(parsed);
+            }
         }
     }
 
-    let uncached_alias = la64_uncached_virt(phys);
-    if uncached_alias != firmware_arg {
+    // 3. Uncached DMW alias.
+    if uncached_alias != cached_alias {
         return parse(uncached_alias, memory_regions, cmdline);
     }
 
@@ -1137,7 +1187,7 @@ pub(crate) fn linked_kernel_image() -> PhysRange {
 
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn linked_kernel_start() -> usize {
-    core::ptr::addr_of!(__kernel_start) as usize
+    la64_kernel_addr_to_phys(core::ptr::addr_of!(__kernel_start) as usize)
 }
 
 #[cfg(not(target_arch = "loongarch64"))]
@@ -1147,7 +1197,7 @@ pub(crate) fn linked_kernel_start() -> usize {
 
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn linked_kernel_end() -> usize {
-    core::ptr::addr_of!(__kernel_end) as usize
+    la64_kernel_addr_to_phys(core::ptr::addr_of!(__kernel_end) as usize)
 }
 
 #[cfg(not(target_arch = "loongarch64"))]

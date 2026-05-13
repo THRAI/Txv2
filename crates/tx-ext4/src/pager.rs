@@ -1,3 +1,5 @@
+use core::marker::Send;
+
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_substrate::epoch::Guard;
 use tx_substrate::page_allocator::{self, ZeroPolicy};
@@ -27,16 +29,12 @@ fn materialize_frame(
     };
     let ppn = owned.ppn();
 
-    #[cfg(test)]
-    {
-        page_allocator::testing::write_frame_bytes_for_test(ppn, 0, page);
-    }
-    #[cfg(not(test))]
-    {
-        // TODO(spec-reconciliation): copy via HAL kernel direct-map once a
-        // non-test path exists. Keeping the frame zeroed in production is
-        // safer than silently dropping bytes.
-        let _ = page;
+    let frame_base = match page_allocator::frame_kernel_addr(ppn) {
+        Ok(ptr) => ptr,
+        Err(_) => return tx_substrate::step_v3::StepOutcome::err(Errno::EIO.into()),
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(page.as_ptr(), frame_base, BLOCK_SIZE);
     }
 
     // Hand off ownership: the permanent-frame token never releases the

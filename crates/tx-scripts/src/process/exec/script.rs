@@ -43,7 +43,7 @@
 
 use alloc::vec::Vec;
 
-use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
+use tx_hal::{Arch, EntropyIf, PmapIf, UserTrapContext};
 use tx_substrate::zone::Cap;
 use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
 use tx_subsystems::execution::Errno;
@@ -92,6 +92,7 @@ pub static LAST_NOTEXEC_SITE: core::sync::atomic::AtomicUsize =
 /// "short file (some kind of partial write)".
 pub static LAST_EXEC_FILE_SIZE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+pub static LAST_EXEC_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // NOTEXEC_SITE_NONE = 0 is the implicit initial value of
 // `LAST_NOTEXEC_SITE` (resolves to "none" via the `_` arm in
@@ -305,29 +306,29 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // `vm::execution::fault_script`.
     let openfile = {
         use tx_substrate::step_v3::StepOutcome as V3;
-        let guard = tx_substrate::epoch::guard();
         let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
-        let outcome = poll_walker_synchronously(step_open(
-            rooted_at,
-            path,
-            OpenFileFlags {
-                read: true,
-                write: false,
-                append: false,
-                cloexec: false,
-                nonblocking: false,
-            },
-            0,
-            cred,
-            &guard,
-        ));
-        let result = match outcome {
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            poll_walker_synchronously(step_open(
+                rooted_at,
+                path,
+                OpenFileFlags {
+                    read: true,
+                    write: false,
+                    append: false,
+                    cloexec: false,
+                    nonblocking: false,
+                },
+                0,
+                cred,
+                &guard,
+            ))
+        };
+        match outcome {
             V3::Done(file) => Ok(file),
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
             V3::Err(err) => Err(ExecError::from_walker_errno(Errno::from(err))),
-        };
-        drop(guard);
-        result?
+        }?
     };
 
     // Snapshot the file's `Cap<PageContainer>` once. The exec image's
@@ -376,8 +377,10 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     let mut header_bytes: Vec<u8> = alloc::vec![0u8; read_len];
     {
         use tx_substrate::step_v3::StepOutcome as V3;
-        let guard = tx_substrate::epoch::guard();
-        let outcome = read_exact_at(&file_pc, 0, &mut header_bytes, &guard);
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            read_exact_at(&file_pc, 0, &mut header_bytes, &guard)
+        };
         let result = match outcome {
             V3::Done(()) => Ok(()),
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
@@ -389,7 +392,6 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
                 Err(ExecError::from_read_errno(err.into()))
             }
         };
-        drop(guard);
         result?;
     }
 
@@ -407,6 +409,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         );
         ExecError::from_parse_error(err)
     })?;
+    LAST_EXEC_ENTRY.store(parsed.entry, core::sync::atomic::Ordering::Relaxed);
 
     // Compose the brk base from the image plan: the page-rounded end
     // of the highest LOAD segment's memory footprint. Linux's
@@ -507,26 +510,40 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         if partial_in_page == 0 {
             continue;
         }
-        let partial_start = file_end - partial_in_page;
-        // File offset of `partial_start`. The segment's
-        // `file_offset` corresponds to `vaddr`; offsetting by
-        // `partial_start - vaddr` gives the file offset of the
-        // partial-last-page's start.
+        let partial_page_start = file_end - partial_in_page;
+        let copy_start = partial_page_start.max(segment.vaddr);
+        let copy_len = file_end
+            .checked_sub(copy_start)
+            .ok_or_else(|| record_notexec_site(NOTEXEC_SITE_PHASE5A_FILE_OFF_OVERFLOW))?;
+        if copy_len == 0 {
+            continue;
+        }
+        // File offset of `copy_start`. For unaligned ELF LOAD
+        // segments, the rounded-down page start can be below
+        // `segment.vaddr`; those leading bytes are not part of the
+        // segment and must remain zero in the anon page.
         let file_off = segment
             .file_offset
-            .checked_add(partial_start - segment.vaddr)
+            .checked_add(
+                copy_start
+                    .checked_sub(segment.vaddr)
+                    .ok_or_else(|| record_notexec_site(NOTEXEC_SITE_PHASE5A_FILE_OFF_OVERFLOW))?,
+            )
             .ok_or_else(|| record_notexec_site(NOTEXEC_SITE_PHASE5A_FILE_OFF_OVERFLOW))?;
-        let mut buf = alloc::vec![0u8; partial_in_page as usize];
+        let mut buf = alloc::vec![0u8; copy_len as usize];
         {
             use tx_substrate::step_v3::StepOutcome as V3;
-            let guard = tx_substrate::epoch::guard();
-            match read_exact_at(&segment.backing, file_off, &mut buf, &guard) {
+            let outcome = {
+                let guard = tx_substrate::epoch::guard();
+                read_exact_at(&segment.backing, file_off, &mut buf, &guard)
+            };
+            match outcome {
                 V3::Done(()) => {}
                 V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
                 V3::Err(_) => return Err(record_notexec_site(NOTEXEC_SITE_PHASE5A_READ_ERROR)),
             }
         }
-        match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
+        match vm_scripts::populate_detached_user_range(&new_aspace, copy_start, &buf).await {
             tx_substrate::step_v3::StepOutcome::Done(()) => {}
             tx_substrate::step_v3::StepOutcome::Continue { .. }
             | tx_substrate::step_v3::StepOutcome::Yield { .. } => {
@@ -684,22 +701,54 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
 }
 
 /// Compose a fresh `UserTrapContext` for the new image's first
-/// userspace entry. RV64 register file is zeroed (per System V psABI:
+/// userspace entry. The register file is zeroed (per System V psABI:
 /// `_start` reads its arguments off the stack, not registers); only
-/// `pc`, `sp` (= `regs[2]`), and `status` are seeded here.
+/// `pc`, the architecture's stack-pointer register, and `status` are
+/// seeded here.
 ///
 /// `status` is left at zero — the platform's
 /// `restore_user_context` decides how to compose `sstatus` for the
 /// fresh image (typically a U-mode entry with interrupts enabled).
-fn make_initial_user_trap_context(pc: usize, sp: usize) -> UserTrapContext {
+pub(crate) fn make_initial_user_trap_context(pc: usize, sp: usize) -> UserTrapContext {
     let mut regs = [0usize; 32];
-    // RV64 SP is x2 per the integer-register assignments in the ABI.
-    regs[2] = sp;
+    regs[initial_user_sp_reg()] = sp;
+    if let Some(tls_reg) = initial_user_tls_reg() {
+        regs[tls_reg] = sp;
+    }
     UserTrapContext {
         regs,
         pc,
         status: 0,
         fp: tx_hal::UserFpContext::empty(),
+    }
+}
+
+fn initial_user_tls_reg() -> Option<usize> {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        Some(2)
+    }
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        None
+    }
+}
+
+pub(crate) const fn initial_user_sp_reg_for_arch(arch: Arch) -> usize {
+    match arch {
+        Arch::Riscv64 => 2,
+        Arch::LoongArch64 => 3,
+    }
+}
+
+fn initial_user_sp_reg() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        initial_user_sp_reg_for_arch(Arch::LoongArch64)
+    }
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        initial_user_sp_reg_for_arch(Arch::Riscv64)
     }
 }
 

@@ -208,6 +208,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_dev_id_counter();
     crate::init::reset_boot_state_for_test();
     crate::irq::reset_dispatch_table_for_test();
+    crate::irq::reset_pending_uart_rx_for_test();
     IRQ_TEST_RX_QUEUE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -257,9 +258,8 @@ fn register_irq_handler_populates_dispatch_table_slot() {
 }
 
 /// `install_irq_handlers::<P>()` registers the UART RX handler under
-/// `<P as IrqIf>::UART_IRQ`, publishes the dispatch table to the
-/// platform via `install_dispatch_table`, sets the priority, and
-/// unmasks the IRQ.
+/// `<P as IrqIf>::UART_IRQ` and publishes the dispatch table to the
+/// platform via `install_dispatch_table`.
 ///
 /// Asserts Open Q #6's late-binding shape: tx-kernel reads the IRQ
 /// number through `<P as IrqIf>::UART_IRQ` only — no `pub const
@@ -288,11 +288,11 @@ fn install_irq_handlers_publishes_table_to_platform() {
     assert_eq!(
         IRQ_TEST_LAST_PRIORITY.load(Ordering::Acquire),
         1,
-        "set_priority should run with priority 1 for the UART IRQ",
+        "UART IRQ should be made deliverable once the IRQ-safe handler is installed",
     );
     assert!(
         IRQ_TEST_UART_UNMASKED.load(Ordering::Acquire),
-        "UART IRQ must be unmasked after install_irq_handlers",
+        "UART IRQ should be unmasked so console input wakes the reactor",
     );
 }
 
@@ -300,8 +300,9 @@ fn install_irq_handlers_publishes_table_to_platform() {
 /// registered, queue a byte through the fake platform's RX source,
 /// invoke the handler directly (the same code path
 /// `Platform::dispatch_irq` walks through the installed table), and
-/// observe the byte landing in the registered console TTY's input
-/// queue.
+/// observe that the handler only requests a reactor wake. The actual
+/// TTY ingest must run later in normal kernel context, where creating
+/// an epoch guard is legal.
 #[test]
 fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
     let _setup = setup();
@@ -311,10 +312,8 @@ fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
 
     // Fake UART bytes ready in the platform's RX source. The boot
     // console TTY runs in cooked mode (ICANON), so a complete line
-    // (`X\n`) is required for the ldisc to flush bytes into the
-    // user-visible input queue. The IRQ-side semantics are
-    // unchanged: every IRQ handler invocation drains the platform's
-    // RX FIFO and feeds it to step_ingest in one shot.
+    // (`X\n`) is required for the later ldisc drain to flush bytes
+    // into the user-visible input queue.
     {
         let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         queue.extend_from_slice(b"X\n");
@@ -324,14 +323,31 @@ fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
     assert_eq!(
         handled,
         IrqHandled::Wake,
-        "ingest of a complete line should request a reactor wake",
+        "UART input readiness should request a reactor wake",
     );
 
-    // Console TTY input queue should now contain the committed line.
+    // IRQ context must not consume the bytes or mutate the TTY queue.
     let tty = console_tty().expect("CONSOLE_TTY populated by register_console_hardware");
     let payload = tty
         .live_payload()
-        .expect("console TTY payload alive after ingest");
+        .expect("console TTY payload alive before deferred ingest");
+    assert!(
+        IRQ_TEST_RX_QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty(),
+        "IRQ handler should drain platform RX into the IRQ-safe pending buffer",
+    );
+    let before: std::vec::Vec<u8> = payload.with_input_queue(|queue| {
+        let mut tmp = [0u8; 64];
+        let n = queue.drain_to_slice(&mut tmp);
+        tmp[..n].to_vec()
+    });
+    assert!(before.is_empty(), "IRQ handler must not ingest into TTY");
+
+    CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty();
+
+    // Normal-context drain should now contain the committed line.
     let snapshot: std::vec::Vec<u8> = payload.with_input_queue(|queue| {
         let mut tmp = [0u8; 64];
         let n = queue.drain_to_slice(&mut tmp);

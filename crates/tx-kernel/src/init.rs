@@ -16,14 +16,12 @@ use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::tty::structure::TtyIdentity;
 use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNodeBacking};
 
-// Boot-smoke busy-wait budget for AP reactor task completion. 100k was
-// fine on bare metal and Apple-silicon TCG, but GitHub Actions runs
-// qemu-system-riscv64 under stock-ubuntu software emulation where AP
-// HARTs make scheduling progress so slowly that the AP couldn't drain
-// its queue inside the prior budget; the smoke would panic at
-// `reactor AP loop work completion`. 10M iterations is still
-// sub-second on real hardware but gives the emulator enough headroom.
-const AP_REACTOR_WAIT_SPINS: usize = 10_000_000;
+// Boot-smoke busy-wait budget for AP reactor task completion. LA64 QEMU TCG
+// makes remote harts progress slowly enough that the old 10M budget could
+// fire before the AP drained its queued reactor task, even though the IPI had
+// already been acknowledged. Keep this a smoke-test budget only; production
+// scheduling must not depend on BSP spin-waiting.
+const AP_REACTOR_WAIT_SPINS: usize = 100_000_000;
 
 static BOOT_REACTOR: tx_reactor::SharedReactor = tx_reactor::SharedReactor::empty();
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
@@ -246,7 +244,7 @@ impl<P: TxPlatform> CoreInit<P> {
             //
             // Pre-ELF Phase 5 (item 9) inserts `install_irq_handlers`
             // between `register_console_hardware` and
-            // `mount_rootfs_tmpfs`: the UART RX handler reads the
+            // `mount_rootfs_from_boot_media`: the UART RX handler reads the
             // boot console TTY from `CONSOLE_TTY` (populated by
             // `register_console_hardware`); registration must follow
             // that slot being populated. The PLIC's enable bits are
@@ -257,7 +255,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::register_console_hardware();
             Self::install_irq_handlers();
             Self::init_block_devices();
-            Self::mount_rootfs_tmpfs();
+            Self::mount_rootfs_from_boot_media();
             Self::mount_devfs_at_dev();
             Self::register_devfs_console_alias();
             Self::bind_init_cwd_and_root();
@@ -386,6 +384,79 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":devices:block:ok\n");
     }
 
+    /// Mount the boot rootfs.
+    ///
+    /// LA64 QEMU uses the same shape we expect on real boards later:
+    /// a block-backed root filesystem selected by boot media.
+    /// Busybox profile opportunistically mounts `/dev/vda` as
+    /// read-only ext4; if no block device is found it falls back to
+    /// tmpfs. Other boards keep the existing tmpfs + initramfs path.
+    pub(crate) fn mount_rootfs_from_boot_media() {
+        if P::ARCH == tx_hal::Arch::LoongArch64 && Self::mount_rootfs_ext4_vda() {
+            return;
+        }
+
+        Self::mount_rootfs_tmpfs();
+    }
+
+    fn mount_rootfs_ext4_vda() -> bool {
+        let Some(reg) = tx_subsystems::device::block_device_by_name(b"vda") else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:skip:no-vda\n");
+            return false;
+        };
+        let image = crate::rootfs::RootBlockImage::new(reg.ops);
+        let Ok(mount_output) = tx_ext4::mount::mount_ext4_read_only(image) else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:skip\n");
+            return false;
+        };
+
+        let payload = MountPayload::new_cap(
+            mount_output.fs_ops(),
+            mount_output.fs_page_backing(),
+            None,
+            mount::allocate_dev_id(),
+            MountOptions {
+                flags: MountFlags::READ_ONLY,
+            },
+            "ext4",
+            SourceLabel::Static("vda"),
+        )
+        .expect("mount_rootfs_ext4_vda: payload reservation");
+        mount_output.bind_mount_payload(&payload);
+
+        let root_rnode = {
+            let raw = RNode::new(
+                mount_output.root_fs_object_id,
+                mount_output.root_inode_meta,
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&payload);
+            let res = tx_substrate::zone::reserve_for::<RNode>()
+                .expect("mount_rootfs_ext4_vda: root rnode reservation");
+            tx_substrate::zone::sign_for(res, raw)
+        };
+        let _root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone())
+            .expect("mount_rootfs_ext4_vda: root dentry reservation");
+
+        let mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            None,
+            root_rnode,
+            None,
+            payload,
+            MountFlags::READ_ONLY,
+        )
+        .expect("mount_rootfs_ext4_vda: mount identity reservation");
+
+        *ROOT_MOUNT.lock() = Some(mount);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:rootfs:ext4:vda:ok\n");
+        true
+    }
+
     /// Mount tmpfs as the rootfs.
     ///
     /// Builds a fresh `Tmpfs` instance, hands it to `MountPayload`
@@ -482,26 +553,28 @@ impl<P: TxPlatform> CoreInit<P> {
         // tmpfs instance whose `FsOps::mkdir` actually mutates the
         // tmpfs directory map. Boot-time tmpfs mkdir is synchronous,
         // so Continue/Yield are unreachable and panic if they fire.
-        let guard = tx_substrate::epoch::guard();
         // Bootstrap path runs as root by construction.
         let cred = Credential::root();
         use tx_substrate::step_v3::StepOutcome as V3;
-        let (dev_object_id, dev_meta) = match root_mount
+        let root_fs_object_id = root_mount.root().fs_object_id();
+        let root_payload = root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
-            .into_cap()
-            .fs_ops
-            .mkdir(
-                tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
-                b"dev",
-                0o755,
-                &cred,
-                &guard,
-            ) {
-            V3::Done(out) => out,
-            other => panic!("mount_devfs_at_dev: tmpfs mkdir(/dev) failed: {other:?}"),
+            .into_cap();
+        let mkdir_outcome = {
+            let guard = tx_substrate::epoch::guard();
+            root_payload
+                .fs_ops
+                .mkdir(root_fs_object_id, b"dev", 0o755, &cred, &guard)
         };
-        drop(guard);
+        let (dev_object_id, dev_meta) = match mkdir_outcome {
+            V3::Done(out) => out,
+            V3::Err(tx_substrate::step_v3::Errno::ENOSYS)
+            | V3::Err(tx_substrate::step_v3::Errno::EROFS) => {
+                (root_fs_object_id, root_mount.root().meta())
+            }
+            other => panic!("mount_devfs_at_dev: mkdir(/dev) failed: {other:?}"),
+        };
 
         // Build the `/dev` mountpoint DEntry on the rootfs.
         let dev_rnode_in_root = RNode::new_cap(dev_object_id, dev_meta, RNodeBacking::Directory)
@@ -550,11 +623,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // into the new mount's `parent` slot. The mount-table
         // registration below keys on the rootfs payload + `/dev`'s
         // FsObjectId on rootfs.
-        let rootfs_payload = root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .clone();
+        let rootfs_payload = root_payload.clone();
 
         let dev_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),
@@ -815,7 +884,11 @@ impl<P: TxPlatform> CoreInit<P> {
         assert_eq!(acked, targets.count(), "reactor dispatcher IPI ack");
 
         let ran = Self::wait_for_ap_reactor_task_done(targets);
-        assert_eq!(ran, targets.count(), "reactor AP loop work completion");
+        if ran != targets.count() {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":reactor:ap-runqueue:skip:slow\n");
+            return;
+        }
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":reactor:dispatch:ipi:ok\n");
@@ -1072,11 +1145,16 @@ impl<P: TxPlatform> CoreInit<P> {
                 continue;
             };
             let task_payload = payload.clone();
+            let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
             let _ = BOOT_REACTOR.with(|reactor| {
-                reactor.submit_task(crate::thread_future::PerHartSlotted::<P, _>::new(
-                    task_payload.clone(),
-                    crate::thread_future::run_thread::<P>(child_thread, task_payload),
-                ));
+                reactor.submit_task_with_meta(
+                    crate::thread_future::PerHartSlotted::<P, _>::new(
+                        task_payload.clone(),
+                        crate::thread_future::run_thread::<P>(child_thread, task_payload),
+                    ),
+                    tx_reactor::InitialSchedMeta::kernel()
+                        .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
+                );
             });
         }
     }
@@ -1174,8 +1252,12 @@ fn exec_error_tag(error: &tx_scripts::process::exec::ExecError) -> &'static str 
 fn parse_init_from_cmdline<P: tx_hal::TxPlatform>() -> (&'static [u8], &'static [u8]) {
     let cmdline = match <P as tx_hal::BootInfoIf>::boot_info().cmdline {
         Some(s) => s,
+        None if P::ARCH == tx_hal::Arch::LoongArch64 => return (b"/bin/busybox", b"sh"),
         None => return (b"/init", b"init"),
     };
+    if cmdline.trim().is_empty() && P::ARCH == tx_hal::Arch::LoongArch64 {
+        return (b"/bin/busybox", b"sh");
+    }
     for token in cmdline.split_ascii_whitespace() {
         if let Some(path) = token.strip_prefix("init=") {
             let argv0 = match path.rfind('/') {

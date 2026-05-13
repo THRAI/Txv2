@@ -70,6 +70,14 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
         target: &mut [Frame],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        self.read_blocks_bootstrap(block_id, target)
+    }
+
+    fn read_blocks_bootstrap(
+        &self,
+        block_id: PhysicalBlockNumber,
+        target: &mut [Frame],
+    ) -> StepOutcome<(), NoProgress> {
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
             return StepOutcome::Err(Errno::ENODEV.into());
@@ -102,6 +110,14 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
         source: &[Frame],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        self.write_blocks_bootstrap(block_id, source)
+    }
+
+    fn write_blocks_bootstrap(
+        &self,
+        block_id: PhysicalBlockNumber,
+        source: &[Frame],
+    ) -> StepOutcome<(), NoProgress> {
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
             return StepOutcome::Err(Errno::ENODEV.into());
@@ -129,6 +145,10 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
     }
 
     fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+        self.barrier_bootstrap()
+    }
+
+    fn barrier_bootstrap(&self) -> StepOutcome<(), NoProgress> {
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
             return StepOutcome::Err(Errno::ENODEV.into());

@@ -1,6 +1,6 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
-use crate::{CpuId, TxPlatform, VirtAddr};
+use crate::{CpuId, PmapRoot, TxPlatform, VirtAddr};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrapClass {
@@ -370,7 +370,7 @@ pub trait TrapIf {
     /// production userspace-entry path override it. Host-test
     /// platforms (no real `sret`) can also override with an infinite
     /// loop or a panic spelling the configuration error.
-    fn enter_userspace_with_context(_ctx: UserTrapContext) {
+    fn enter_userspace_with_context(_ctx: &UserTrapContext, _root: &PmapRoot) {
         panic!("TrapIf::enter_userspace_with_context: platform has no userspace-entry shim");
     }
 }

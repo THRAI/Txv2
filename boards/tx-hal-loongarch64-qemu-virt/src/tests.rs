@@ -271,6 +271,10 @@ fn la64_trap_classification_decodes_interrupts_and_sync_faults() {
         TrapClass::IllegalInstruction
     );
     assert_eq!(
+        classify_la64_trap(LA64_ECODE_FPD << LA64_ESTAT_ECODE_SHIFT),
+        TrapClass::IllegalInstruction
+    );
+    assert_eq!(
         classify_la64_trap(LA64_ECODE_PIS << LA64_ESTAT_ECODE_SHIFT),
         TrapClass::PageFault {
             write: true,

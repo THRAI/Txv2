@@ -418,6 +418,8 @@ name = "tx-kernel"
 version = "0.1.0"
 dependencies = [
  "tx-drivers",
+ "tx-ext4",
+ "tx-ext4-format",
  "tx-fs",
  "tx-hal",
  "tx-reactor",

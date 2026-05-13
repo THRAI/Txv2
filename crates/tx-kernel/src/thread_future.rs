@@ -78,7 +78,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use tx_hal::{PercpuIf, PmapIf, TrapIf, TxPlatform};
+use tx_hal::{PercpuIf, TrapIf, TxPlatform};
 use tx_reactor::ast::AstBatch;
 use tx_reactor::userspace::{
     PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserspaceEntryDecision,
@@ -87,7 +87,7 @@ use tx_reactor::userspace::{
 use tx_substrate::zone::PayloadCap;
 use tx_subsystems::process::execution::step_exit_group_with_signal;
 use tx_subsystems::signal::Signum;
-use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload;
+use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, set_current_thread_payload, ThreadIdentity, ThreadPayload,
 };
@@ -235,7 +235,6 @@ pub async fn run_thread<P: TxPlatform>(
             "checkpoint_userspace_entry_batch must succeed with the freshly-started \
              entry-side request"
         );
-
         // ----------------------------------------------------------------
         // (2) BUILD MERGED CONTEXT AND DIVE INTO USERSPACE.
         //
@@ -260,13 +259,9 @@ pub async fn run_thread<P: TxPlatform>(
         // recording no-op + Pending fallthrough so `run_thread` can
         // be exercised end-to-end.
         // ----------------------------------------------------------------
-        let ctx = prepare_userspace_entry_payload(&payload);
-        payload.set_active_userspace_request(Some(entry_token));
-
-        // Activate the user process's pmap right before sret. Without
-        // this satp keeps pointing at the kernel bootstrap root from
-        // the boot trampoline, which has no user mappings, and every
-        // user-mode instruction fetch faults forever.
+        // Resolve the user process's pmap right before userspace
+        // entry. The HAL copies `ctx` into an architecture trapframe
+        // and activates the root at the final machine handoff point.
         //
         // We re-resolve `process` and `aspace` per iteration rather
         // than caching across the await: the owning process may
@@ -275,15 +270,17 @@ pub async fn run_thread<P: TxPlatform>(
         // stale Cap.
         if let Some(process) = thread.upgrade_owner_proc() {
             if let Some(aspace) = process.aspace_cap() {
-                <P as PmapIf>::activate_user_pmap(aspace.pmap().root_handle());
+                let root = aspace.pmap().root_handle();
+                let mut ctx = tx_hal::UserTrapContext::empty();
+                prepare_userspace_entry_payload_into(&payload, &mut ctx);
+                payload.set_active_userspace_request(Some(entry_token));
+                <P as TrapIf>::enter_userspace_with_context(&ctx, root);
             } else {
                 return;
             }
         } else {
             return;
         }
-
-        <P as TrapIf>::enter_userspace_with_context(ctx);
 
         // ----------------------------------------------------------------
         // (3) AWAIT THE RESOLVED WAIT.

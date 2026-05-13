@@ -92,6 +92,31 @@ pub trait BlockDeviceOps: Send + Sync + 'static {
         &self,
         guard: &Guard<'_>,
     ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+
+    fn read_blocks_bootstrap(
+        &self,
+        block_id: PhysicalBlockNumber,
+        target: &mut [Frame],
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        let guard = tx_substrate::epoch::guard();
+        self.read_blocks(block_id, target, &guard)
+    }
+
+    fn write_blocks_bootstrap(
+        &self,
+        block_id: PhysicalBlockNumber,
+        source: &[Frame],
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        let guard = tx_substrate::epoch::guard();
+        self.write_blocks(block_id, source, &guard)
+    }
+
+    fn barrier_bootstrap(
+        &self,
+    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+        let guard = tx_substrate::epoch::guard();
+        self.barrier(&guard)
+    }
 }
 
 pub trait BlockDevice: BlockDeviceOps {

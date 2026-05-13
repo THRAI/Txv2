@@ -2,8 +2,8 @@
 //!
 //! tx-kernel owns one global `IrqDispatchTable`. Boot-time
 //! `install_irq_handlers::<P>()` populates the UART slot with
-//! `uart_rx_irq_handler::<P>`, publishes the table to the platform via
-//! `<P as IrqIf>::install_dispatch_table`, then unmasks the IRQ.
+//! `uart_rx_irq_handler::<P>` and publishes the table to the platform via
+//! `<P as IrqIf>::install_dispatch_table`.
 //!
 //! Per Open Q #4 (`docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`)
 //! registration is explicit, not linkme: tests can build a controlled
@@ -14,11 +14,13 @@
 //! `<P as IrqIf>::UART_IRQ`; tx-kernel never names a board constant
 //! directly.
 
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use tx_hal::{
     ConsoleIf, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, IRQ_DISPATCH_TABLE_SIZE,
 };
 use tx_substrate::SpinMutex;
-use tx_subsystems::tty::execution::step_ingest;
 
 /// The single global IRQ dispatch table tx-kernel publishes to the
 /// platform. The platform crate stores a raw `&'static
@@ -33,6 +35,44 @@ static IRQ_DISPATCH_TABLE: SpinMutex<IrqDispatchTable> = SpinMutex::new(IrqDispa
 /// this cap keeps a single IRQ from stalling the trap shell while
 /// still draining a typical line in one shot.
 const UART_RX_DRAIN_MAX: usize = 64;
+const UART_RX_PENDING_CAP: usize = 256;
+
+static UART_RX_PENDING: UartRxPending = UartRxPending::new();
+
+struct UartRxPending {
+    lock: AtomicBool,
+    len: AtomicUsize,
+    buf: UnsafeCell<[u8; UART_RX_PENDING_CAP]>,
+}
+
+unsafe impl Sync for UartRxPending {}
+
+struct UartRxPendingGuard<'a> {
+    pending: &'a UartRxPending,
+}
+
+impl UartRxPending {
+    const fn new() -> Self {
+        Self {
+            lock: AtomicBool::new(false),
+            len: AtomicUsize::new(0),
+            buf: UnsafeCell::new([0; UART_RX_PENDING_CAP]),
+        }
+    }
+
+    fn try_lock(&'static self) -> Option<UartRxPendingGuard<'static>> {
+        self.lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+            .then_some(UartRxPendingGuard { pending: self })
+    }
+}
+
+impl Drop for UartRxPendingGuard<'_> {
+    fn drop(&mut self) {
+        self.pending.lock.store(false, Ordering::Release);
+    }
+}
 
 /// Register `handler` as the dispatch entry for IRQ number `irq`.
 ///
@@ -114,43 +154,75 @@ pub(crate) fn install_irq_handlers<P: IrqIf + ConsoleIf>() {
     <P as IrqIf>::unmask(irq);
 }
 
-/// UART RX IRQ handler. Drains pending bytes from the platform
-/// console via `ConsoleIf::read_bytes`, then ingests them into the
-/// boot console TTY through `tty::execution::step_ingest`.
+pub(crate) fn drain_pending_uart_rx_into(buf: &mut [u8]) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+    let Some(_guard) = UART_RX_PENDING.try_lock() else {
+        return 0;
+    };
+    let pending_len = UART_RX_PENDING.len.load(Ordering::Acquire);
+    if pending_len == 0 {
+        return 0;
+    }
+    let n = pending_len.min(buf.len());
+    unsafe {
+        let pending = &mut *UART_RX_PENDING.buf.get();
+        buf[..n].copy_from_slice(&pending[..n]);
+        let remaining = pending_len - n;
+        pending.copy_within(n..pending_len, 0);
+        UART_RX_PENDING.len.store(remaining, Ordering::Release);
+    }
+    n
+}
+
+#[cfg(test)]
+pub(crate) fn reset_pending_uart_rx_for_test() {
+    if let Some(_guard) = UART_RX_PENDING.try_lock() {
+        UART_RX_PENDING.len.store(0, Ordering::Release);
+    }
+}
+
+/// UART RX IRQ handler.
 ///
-/// Returns `IrqHandled::Wake` on any byte ingested (so the trap shell
-/// reschedules the reactor and the blocked `read` future re-polls).
+/// The IRQ path must not create an epoch guard or touch TTY structures:
+/// `epoch::guard()` is deliberately forbidden in interrupt context. Instead,
+/// the handler only reports that UART input is pending. The BSP reactor loop
+/// wakes, returns to normal kernel context, and drains the console through
+/// `CoreInit::drain_sbi_console_into_tty`.
+///
+/// Returns `IrqHandled::Wake` on any pending byte so the trap shell reschedules
+/// the reactor and the blocked `read` future can be re-polled after the normal
+/// context drain.
 /// Returns `IrqHandled::NotMine` if the console TTY hasn't been
 /// registered yet (boot race; `install_irq_handlers` runs after
 /// `register_console_hardware` so this should never happen in
 /// production, but the defensive check keeps a stray pre-boot IRQ
 /// from panicking).
 pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
-    let mut buf = [0u8; UART_RX_DRAIN_MAX];
-    let n = <P as ConsoleIf>::read_bytes(&mut buf);
+    if crate::init::console_tty().is_none() {
+        return IrqHandled::NotMine;
+    }
+
+    let Some(_guard) = UART_RX_PENDING.try_lock() else {
+        return IrqHandled::Wake;
+    };
+    let current = UART_RX_PENDING.len.load(Ordering::Acquire);
+    if current >= UART_RX_PENDING_CAP {
+        return IrqHandled::Wake;
+    }
+
+    let space = UART_RX_PENDING_CAP - current;
+    let read_cap = UART_RX_DRAIN_MAX.min(space);
+    let pending = unsafe { &mut *UART_RX_PENDING.buf.get() };
+    let n = <P as ConsoleIf>::read_bytes(&mut pending[current..current + read_cap]);
     if n == 0 {
-        // Spurious IRQ or already drained.
         return IrqHandled::Done;
     }
-    let Some(tty) = crate::init::console_tty() else {
-        return IrqHandled::NotMine;
-    };
-    let guard = tx_substrate::epoch::guard();
-    use tx_substrate::step_v3::StepOutcome as V3Out;
-    match step_ingest(&tty, &buf[..n], &guard) {
-        V3Out::Done(outcome) => {
-            if outcome.consumed > 0 {
-                IrqHandled::Wake
-            } else {
-                IrqHandled::Done
-            }
-        }
-        // step_ingest only ever returns Done or Err(NotLive). On the
-        // hangup path the carrier is already retired; treat it as
-        // Done so the trap shell completes the IRQ without
-        // rescheduling.
-        _ => IrqHandled::Done,
-    }
+    UART_RX_PENDING
+        .len
+        .store(current + n.min(read_cap), Ordering::Release);
+    IrqHandled::Wake
 }
 
 #[cfg(test)]

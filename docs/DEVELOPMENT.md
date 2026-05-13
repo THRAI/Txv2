@@ -235,7 +235,7 @@ qemu-system-riscv64 -machine virt -m 256M -smp 1 -display none -monitor none \
   -serial file:target/qemu.serial.log -no-reboot \
   -kernel target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt \
   -bios default -no-shutdown \
-  -initrd target/images/busybox-initramfs.cpio \
+  -initrd target/images/busybox-initramfs-rv64-qemu.cpio \
   -append 'tx.profile=busybox console=ttyS0'
 cargo xtask trap-trace --serial target/qemu.serial.log --syscalls
 ```

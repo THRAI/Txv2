@@ -8,6 +8,8 @@ repository.workspace = true
 [dependencies]
 tx-fs = { path = "../tx-fs" }
 tx-drivers = { path = "../tx-drivers" }
+tx-ext4 = { path = "../tx-ext4", default-features = false }
+tx-ext4-format = { path = "../tx-ext4-format" }
 tx-hal = { path = "../tx-hal" }
 tx-reactor = { path = "../tx-reactor" }
 # Phase 7 of the ELF-loader plan: `init.rs::run_bootstrap_exec_for_init`
