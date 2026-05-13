@@ -1,4 +1,5 @@
 use super::*;
+use crate::net::step_socket_close;
 use crate::net::structure::SocketIdentity;
 use tx_substrate::zone::Cap;
 
@@ -1250,6 +1251,41 @@ fn tcp_close_staging_withdraws_connection_and_publishes_broken() {
 }
 
 #[test]
+fn tcp_socket_close_marks_connected_peer_broken() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let (client, listener, _local, _remote) = prepare_loopback_connect(40_188, 50_188);
+    let guard = tx_substrate::epoch::guard();
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("expected accepted child"),
+    };
+
+    assert!(matches!(
+        step_socket_close(&accepted, &guard),
+        StepOutcome::Done(_)
+    ));
+
+    assert!(client.readiness.recv_wq.peek() & RecvWireSet::BROKEN.bits() != 0);
+    assert!(client.readiness.send_wq.peek() & SendWireSet::BROKEN.bits() != 0);
+    assert_eq!(
+        step_send_kernel_bytes(&client, b"x", SendRecvFlags::empty(), &guard),
+        StepOutcome::Err(Errno::EPIPE)
+    );
+    assert_eq!(
+        step_recv(&client, 1, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(0)
+    );
+}
+
+#[test]
 fn tcp_loopback_handshake_connects_bound_client_to_listener() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -1314,6 +1350,66 @@ fn tcp_loopback_handshake_connects_bound_client_to_listener() {
             .expect("client raw tcp")
             .protocol_runtime_state()
             .has_connected
+    );
+}
+
+#[test]
+fn tcp_loopback_handshake_selects_loopback_for_wildcard_bound_client() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+
+    let listener = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("listener");
+    assert_eq!(
+        step_bind(&listener, inet(40_168), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
+
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("client");
+    assert_eq!(
+        step_bind(&client, any_inet(50_168), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&client, inet(40_168), &guard),
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        client
+            .acquire_operational()
+            .expect("client payload")
+            .protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connecting {
+            local: endpoint(50_168),
+            remote: endpoint(40_168),
+        })
+    );
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    assert_eq!(
+        listener
+            .acquire_operational()
+            .expect("listener payload")
+            .io_snapshot()
+            .accept_pending,
+        1
     );
 }
 

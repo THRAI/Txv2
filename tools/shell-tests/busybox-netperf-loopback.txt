@@ -1,0 +1,33 @@
+# busybox-netperf-loopback.txt — N69b TCP_STREAM loopback smoke.
+#
+# Build image with:
+#   TX_OSCOMP_RISCV_MUSL_DIR=/home/msp/learning/rustOS/testcase/riscv/musl \
+#     cargo xtask image cpio --profile busybox --target rv64-qemu
+#
+# Then:
+#   cargo xtask shell-test --target rv64-qemu \
+#     --script tools/shell-tests/busybox-netperf-loopback.txt
+#
+# Pre-req: N69a's dynamic-ELF loader (`net: land n69a dynamic elf loader
+# for musl ld`) — netperf and netserver are musl-dynamic, so without
+# the loader exec fails with "not found".
+
+wait "/ # " within 30000
+sleep 500
+
+# Launch netserver in foreground-detached mode (-D) so it does NOT
+# fork per connection — keeps the workload single-process for the
+# first pass.
+send "/bin/netserver -4 -L 127.0.0.1 -p 12865 -D &\n"
+sleep 1500
+
+# 1-second TCP_STREAM with an explicit small message size so the
+# transferred-bytes count stays well-bounded in case timing wobbles.
+send "/bin/netperf -4 -H 127.0.0.1 -p 12865 -t TCP_STREAM -l 1 -- -m 1024\n"
+# The canonical TCP_STREAM result table prints "10^6bits/sec" on its
+# second header line — that's the gate.
+expect "10^6bits/sec" within 30000
+expect "/ # " within 10000
+
+sleep 500
+quit

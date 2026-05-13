@@ -558,12 +558,15 @@ pub async fn run_thread<P: TxPlatform>(
         // stale Cap.
         if let Some(process) = thread.upgrade_owner_proc() {
             if let Some(aspace) = process.aspace_cap() {
-                let root = aspace.pmap().root_handle();
                 let mut ctx = tx_hal::UserTrapContext::empty();
                 prepare_userspace_entry_payload_into(&payload, &mut ctx);
                 payload.set_active_userspace_request(Some(entry_token));
                 let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
                 let _prev_userspace = set_current_userspace_payload(entry_hart, payload.clone());
+                ctx = tx_shims::linux_syscall::maybe_deliver_itimer_signal::<P>(
+                    ctx, &process, &thread, &aspace,
+                );
+                let root = aspace.pmap().root_handle();
                 <P as TrapIf>::enter_userspace_with_context(&ctx, root);
             } else {
                 return;

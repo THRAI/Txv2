@@ -48,10 +48,9 @@ pub enum SyscallResult {
     /// AST drain + `prepare_userspace_entry_payload` +
     /// `enter_userspace_with_context`.
     ///
-    /// Phase B (first pass): the variant is declared and the thread
-    /// future handles it, but the actual `SignalFrameIf` restore
-    /// (reading `SavedSignalFrame` from user stack) lands in
-    /// Phase D with full handler delivery.
+    /// N69b wires the minimal signal-frame restore path used by
+    /// itimer/SIGALRM delivery; full `SignalFrameIf` integration can
+    /// still replace the compat frame later.
     SigreturnRestored,
 }
 

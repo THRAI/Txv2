@@ -213,6 +213,8 @@ fn setup() -> TestSetup {
     reset_init_process();
     reset_reactor_affinity_seam();
     reset_uts_nodename_for_test();
+    super::reset_itimer_registry_for_test();
+    super::reset_sigaction_restorers_for_test();
     TestSetup { _lock: lock }
 }
 

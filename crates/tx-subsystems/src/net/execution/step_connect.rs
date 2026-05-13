@@ -34,8 +34,9 @@ pub fn step_connect(
             true
         }
         SocketProtocol::Tcp(TcpState::Bound { local }) => {
+            let selected_local = select_tcp_connect_local(*local, witness.remote);
             *protocol = SocketProtocol::Tcp(TcpState::Connecting {
-                local: *local,
+                local: selected_local,
                 remote: witness.remote,
             });
             advanced = true;
@@ -84,4 +85,12 @@ pub fn step_connect(
 
 const fn unspecified_endpoint() -> IpEndpoint {
     IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0)
+}
+
+fn select_tcp_connect_local(local: IpEndpoint, remote: IpEndpoint) -> IpEndpoint {
+    if local.addr == Ipv4Address::UNSPECIFIED && remote.addr == Ipv4Address::LOOPBACK {
+        IpEndpoint::new(Ipv4Address::LOOPBACK, local.port)
+    } else {
+        local
+    }
 }

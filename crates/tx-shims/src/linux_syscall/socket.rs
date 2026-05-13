@@ -11,14 +11,17 @@ use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 use tx_subsystems::net::{
     socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
     step_poll_ready, step_poll_wait_token, step_recv_kernel_bytes, step_send_to_kernel_bytes,
-    step_shutdown, step_socket_close, step_socket_open_file, IpEndpoint, Ipv4Address,
-    KernelSockAddr, LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockShutdownCmd,
-    SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, TcpState, UdpInner,
+    step_shutdown, step_socket_close, step_socket_open_file, step_tcp_loopback_transfer,
+    IpEndpoint, Ipv4Address, KernelSockAddr, LingerOption, PollMask, SendRecvFlags, SockAddrIn,
+    SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, TcpState,
+    UdpInner,
 };
 use tx_subsystems::wait_source;
 
 const SOCKADDR_IN_BYTES: u32 = 16;
 const ACCEPT4_KNOWN_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
+const EPHEMERAL_PORT_START: u16 = 49_152;
+const EPHEMERAL_PORT_END: u16 = 49_216;
 const IOVEC_BYTES: u64 = 16;
 const MSGHDR_BYTES: u64 = 56;
 const MSGHDR_NAMELEN_OFFSET: u64 = 8;
@@ -84,11 +87,7 @@ pub(super) fn sys_bind<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
 
-    let outcome = {
-        let guard = tx_substrate::epoch::guard();
-        step_bind(&socket, addr, &guard)
-    };
-    step_unit_result(outcome)
+    bind_with_ephemeral_port(&socket, addr)
 }
 
 pub(super) fn sys_listen<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -239,7 +238,7 @@ fn maybe_autobind_tcp_client(
         Ipv4Address::UNSPECIFIED
     };
 
-    for port in 49_152..49_216 {
+    for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
         let local = KernelSockAddr::V4(SockAddrIn::new(port, local_addr));
         let outcome = {
             let guard = tx_substrate::epoch::guard();
@@ -254,6 +253,54 @@ fn maybe_autobind_tcp_client(
         }
     }
     Err(Errno::EADDRINUSE)
+}
+
+fn bind_with_ephemeral_port(socket: &Cap<SocketIdentity>, addr: KernelSockAddr) -> SyscallResult {
+    let requested = addr.as_ip_endpoint();
+    if requested.port != 0 {
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            step_bind(socket, addr, &guard)
+        };
+        return step_unit_result(outcome);
+    }
+
+    for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
+        let local = KernelSockAddr::V4(SockAddrIn::new(port, requested.addr));
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            step_bind(socket, local, &guard)
+        };
+        match outcome {
+            StepOutcome::Done(()) => return SyscallResult::Return(0),
+            StepOutcome::Err(Errno::EADDRINUSE) => continue,
+            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                return SyscallResult::Error(EIO_VALUE);
+            }
+        }
+    }
+    SyscallResult::Error(errno_to_i32(Errno::EADDRINUSE))
+}
+
+fn drive_tcp_loopback_after_sendto(socket: &Cap<SocketIdentity>, written: usize) {
+    if written == 0 {
+        return;
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return;
+    };
+    if !matches!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected { .. })
+    ) {
+        return;
+    }
+    let guard = tx_substrate::epoch::guard();
+    let _ = step_tcp_loopback_transfer(socket, written, &guard);
+    socket
+        .readiness
+        .clear_send(tx_subsystems::net::structure::SendWireSet::SPACE);
 }
 
 pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -326,6 +373,8 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             StepOutcome::Done(sent) => {
                 total += sent;
                 if sent == 0 || sent >= remaining.len() {
+                    drive_tcp_loopback_after_sendto(&socket, sent);
+                    tx_reactor::yield_now().await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
@@ -334,6 +383,8 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
                 let sent = progress.bytes();
                 total += sent;
                 if sent == 0 || sent >= remaining.len() {
+                    drive_tcp_loopback_after_sendto(&socket, sent);
+                    tx_reactor::yield_now().await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
@@ -342,10 +393,14 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
                 let sent = progress.bytes();
                 total += sent;
                 if sent >= remaining.len() {
+                    drive_tcp_loopback_after_sendto(&socket, sent);
+                    tx_reactor::yield_now().await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
                 if total > 0 {
+                    drive_tcp_loopback_after_sendto(&socket, total);
+                    tx_reactor::yield_now().await;
                     return SyscallResult::Return(total as i64);
                 }
                 if flags.is_nonblocking() {
@@ -359,6 +414,8 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             }
             StepOutcome::Err(errno) => {
                 if total > 0 {
+                    drive_tcp_loopback_after_sendto(&socket, total);
+                    tx_reactor::yield_now().await;
                     return SyscallResult::Return(total as i64);
                 }
                 maybe_raise_sigpipe(ctx, errno, flags);
@@ -374,9 +431,6 @@ pub(super) async fn sys_recvfrom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
     let len = args[2] as usize;
-    if len > TTY_WRITE_MAX_INLINE {
-        return SyscallResult::Error(E2BIG_VALUE);
-    }
 
     let mut flags = match SendRecvFlags::validate(args[3] as i32) {
         Ok(flags) => flags,
@@ -389,7 +443,7 @@ pub(super) async fn sys_recvfrom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         return SyscallResult::Return(0);
     }
 
-    let mut staging = alloc::vec![0; len];
+    let mut staging = alloc::vec![0; len.min(TTY_WRITE_MAX_INLINE)];
     loop {
         let outcome = {
             let guard = tx_substrate::epoch::guard();

@@ -9,7 +9,6 @@ use crate::linux_syscall::{
 };
 
 const E_BADF: i32 = 9;
-const E_NOSYS: i32 = 38;
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
 const E_PERM: i32 = 1;
@@ -597,7 +596,6 @@ fn dispatch_prlimit64_cross_pid_returns_neg_eperm() {
 // rt_sigreturn (carryover marker).
 // -----------------------------------------------------------------
 
-/// `rt_sigreturn` returns `-ENOSYS` for now. The
 /// `rt_sigreturn` with no parked signal frame returns `-EFAULT`.
 /// The kernel has no pre-handler context to restore — POSIX leaves
 /// this case undefined; we refuse rather than corrupt the live
@@ -613,7 +611,7 @@ fn dispatch_rt_sigreturn_without_frame_returns_neg_efault() {
         SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::Error(14)); // EFAULT
+    assert_eq!(r, SyscallResult::Error(E_FAULT));
 }
 
 /// The syscall-layer fallback still restores the parked pre-handler
