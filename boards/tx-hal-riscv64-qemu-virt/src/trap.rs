@@ -6,9 +6,9 @@ use crate::{current_kernel_resume_ctx_ptr, trap_stack_top_for_cpu, KernelResumeC
 #[cfg(target_arch = "riscv64")]
 use tx_hal::SmpIf;
 use tx_hal::{
-    FaultInfo, KernelTrapSink, SignalHandlerRegs, TrapAction, TrapClass, TrapFrameMut,
-    TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext,
-    UserTrapContext, VirtAddr,
+    FaultInfo, KernelTrapSink, PmapIf, PmapRoot, SignalHandlerRegs, TrapAction, TrapClass,
+    TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode,
+    UserFpContext, UserTrapContext, VirtAddr,
 };
 
 #[cfg(target_arch = "riscv64")]

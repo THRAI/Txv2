@@ -1043,7 +1043,7 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             None => return SyscallResult::Error(ENOENT_VALUE),
         };
         let walker_cred = ctx.walker_cred();
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use tx_substrate::step::StepOutcome as V3;
         let outcome = {
             let guard = tx_substrate::epoch::guard();
             poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard))

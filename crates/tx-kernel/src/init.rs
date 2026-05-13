@@ -576,24 +576,27 @@ impl<P: TxPlatform> CoreInit<P> {
         // Bootstrap path runs as root by construction.
         let cred = Credential::root();
         use StepOutcome as V3;
+        let root_fs_object_id = root_mount.root().fs_object_id();
         let (dev_object_id, dev_meta) = match root_mount
             .payload_cap()
             .expect("rootfs payload alive during boot")
-            .into_cap();
-        let mkdir_outcome = {
-            let guard = tx_substrate::epoch::guard();
-            root_payload
-                .fs_ops
-                .mkdir(root_fs_object_id, b"dev", 0o755, &cred, &guard)
-        };
-        let (dev_object_id, dev_meta) = match mkdir_outcome {
+            .into_cap()
+            .fs_ops
+            .mkdir(
+                root_fs_object_id,
+                b"dev",
+                0o755,
+                &cred,
+                &guard,
+            ) {
             V3::Done(out) => out,
-            V3::Err(tx_substrate::step_v3::Errno::ENOSYS)
-            | V3::Err(tx_substrate::step_v3::Errno::EROFS) => {
+            V3::Err(tx_substrate::step::Errno::ENOSYS)
+            | V3::Err(tx_substrate::step::Errno::EROFS) => {
                 (root_fs_object_id, root_mount.root().meta())
             }
             other => panic!("mount_devfs_at_dev: mkdir(/dev) failed: {other:?}"),
         };
+        drop(guard);
 
         // Build the `/dev` mountpoint DEntry on the rootfs.
         let dev_rnode_in_root = RNode::new_cap(dev_object_id, dev_meta, RNodeBacking::Directory)
@@ -642,7 +645,11 @@ impl<P: TxPlatform> CoreInit<P> {
         // into the new mount's `parent` slot. The mount-table
         // registration below keys on the rootfs payload + `/dev`'s
         // FsObjectId on rootfs.
-        let rootfs_payload = root_payload.clone();
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
 
         let dev_mount = MountIdentity::new_cap(
             mount::allocate_mount_id(),

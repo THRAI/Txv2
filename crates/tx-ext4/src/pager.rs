@@ -29,7 +29,7 @@ fn materialize_frame(page: &Page4K) -> StepOutcome<Frame, NoProgress> {
 
     let frame_base = match page_allocator::frame_kernel_addr(ppn) {
         Ok(ptr) => ptr,
-        Err(_) => return tx_substrate::step_v3::StepOutcome::err(Errno::EIO.into()),
+        Err(_) => return tx_substrate::step::StepOutcome::err(Errno::EIO.into()),
     };
     unsafe {
         core::ptr::copy_nonoverlapping(page.as_ptr(), frame_base, BLOCK_SIZE);

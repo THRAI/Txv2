@@ -62,16 +62,7 @@ impl<P: TxPlatform> VirtioPciBlock<P> {
     }
 }
 
-impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
-    fn read_blocks(
-        &self,
-        block_id: PhysicalBlockNumber,
-        target: &mut [Frame],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(), NoProgress> {
-        self.read_blocks_bootstrap(block_id, target)
-    }
-
+impl<P: TxPlatform> VirtioPciBlock<P> {
     fn read_blocks_bootstrap(
         &self,
         block_id: PhysicalBlockNumber,
@@ -101,15 +92,6 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
             }
         }
         StepOutcome::Done(())
-    }
-
-    fn write_blocks(
-        &self,
-        block_id: PhysicalBlockNumber,
-        source: &[Frame],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(), NoProgress> {
-        self.write_blocks_bootstrap(block_id, source)
     }
 
     fn write_blocks_bootstrap(
@@ -143,10 +125,6 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
         StepOutcome::Done(())
     }
 
-    fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
-        self.barrier_bootstrap()
-    }
-
     fn barrier_bootstrap(&self) -> StepOutcome<(), NoProgress> {
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
@@ -156,6 +134,50 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
             return StepOutcome::Err(Errno::EIO.into());
         }
         StepOutcome::Done(())
+    }
+}
+
+impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
+    fn read_blocks(
+        &self,
+        block_id: PhysicalBlockNumber,
+        target: &mut [Frame],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        self.read_blocks_bootstrap(block_id, target)
+    }
+
+    fn write_blocks(
+        &self,
+        block_id: PhysicalBlockNumber,
+        source: &[Frame],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        self.write_blocks_bootstrap(block_id, source)
+    }
+
+    fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+        self.barrier_bootstrap()
+    }
+
+    fn read_blocks_bootstrap(
+        &self,
+        block_id: PhysicalBlockNumber,
+        target: &mut [Frame],
+    ) -> StepOutcome<(), NoProgress> {
+        self.read_blocks_bootstrap(block_id, target)
+    }
+
+    fn write_blocks_bootstrap(
+        &self,
+        block_id: PhysicalBlockNumber,
+        source: &[Frame],
+    ) -> StepOutcome<(), NoProgress> {
+        self.write_blocks_bootstrap(block_id, source)
+    }
+
+    fn barrier_bootstrap(&self) -> StepOutcome<(), NoProgress> {
+        self.barrier_bootstrap()
     }
 }
 
