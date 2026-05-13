@@ -8,7 +8,7 @@ use tx_hal::SmpIf;
 use tx_hal::{
     FaultInfo, KernelTrapSink, SignalHandlerRegs, TrapAction, TrapClass, TrapFrameMut,
     TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode,
-    UserTrapContext, VirtAddr,
+    UserFpContext, UserTrapContext, VirtAddr,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -52,7 +52,41 @@ core::arch::global_asm!(
     .equ TX_RV64_TF_SEPC, 264
     .equ TX_RV64_TF_STVAL, 272
     .equ TX_RV64_TF_SSTATUS, 280
-    .equ TX_RV64_TF_SIZE, 288
+    .equ TX_RV64_TF_F_BASE, 288
+    .equ TX_RV64_TF_F0,  TX_RV64_TF_F_BASE + 0*8
+    .equ TX_RV64_TF_F1,  TX_RV64_TF_F_BASE + 1*8
+    .equ TX_RV64_TF_F2,  TX_RV64_TF_F_BASE + 2*8
+    .equ TX_RV64_TF_F3,  TX_RV64_TF_F_BASE + 3*8
+    .equ TX_RV64_TF_F4,  TX_RV64_TF_F_BASE + 4*8
+    .equ TX_RV64_TF_F5,  TX_RV64_TF_F_BASE + 5*8
+    .equ TX_RV64_TF_F6,  TX_RV64_TF_F_BASE + 6*8
+    .equ TX_RV64_TF_F7,  TX_RV64_TF_F_BASE + 7*8
+    .equ TX_RV64_TF_F8,  TX_RV64_TF_F_BASE + 8*8
+    .equ TX_RV64_TF_F9,  TX_RV64_TF_F_BASE + 9*8
+    .equ TX_RV64_TF_F10, TX_RV64_TF_F_BASE + 10*8
+    .equ TX_RV64_TF_F11, TX_RV64_TF_F_BASE + 11*8
+    .equ TX_RV64_TF_F12, TX_RV64_TF_F_BASE + 12*8
+    .equ TX_RV64_TF_F13, TX_RV64_TF_F_BASE + 13*8
+    .equ TX_RV64_TF_F14, TX_RV64_TF_F_BASE + 14*8
+    .equ TX_RV64_TF_F15, TX_RV64_TF_F_BASE + 15*8
+    .equ TX_RV64_TF_F16, TX_RV64_TF_F_BASE + 16*8
+    .equ TX_RV64_TF_F17, TX_RV64_TF_F_BASE + 17*8
+    .equ TX_RV64_TF_F18, TX_RV64_TF_F_BASE + 18*8
+    .equ TX_RV64_TF_F19, TX_RV64_TF_F_BASE + 19*8
+    .equ TX_RV64_TF_F20, TX_RV64_TF_F_BASE + 20*8
+    .equ TX_RV64_TF_F21, TX_RV64_TF_F_BASE + 21*8
+    .equ TX_RV64_TF_F22, TX_RV64_TF_F_BASE + 22*8
+    .equ TX_RV64_TF_F23, TX_RV64_TF_F_BASE + 23*8
+    .equ TX_RV64_TF_F24, TX_RV64_TF_F_BASE + 24*8
+    .equ TX_RV64_TF_F25, TX_RV64_TF_F_BASE + 25*8
+    .equ TX_RV64_TF_F26, TX_RV64_TF_F_BASE + 26*8
+    .equ TX_RV64_TF_F27, TX_RV64_TF_F_BASE + 27*8
+    .equ TX_RV64_TF_F28, TX_RV64_TF_F_BASE + 28*8
+    .equ TX_RV64_TF_F29, TX_RV64_TF_F_BASE + 29*8
+    .equ TX_RV64_TF_F30, TX_RV64_TF_F_BASE + 30*8
+    .equ TX_RV64_TF_F31, TX_RV64_TF_F_BASE + 31*8
+    .equ TX_RV64_TF_FCSR, TX_RV64_TF_F_BASE + 256
+    .equ TX_RV64_TF_SIZE, 552
 
     # Per-hart KernelResumeCtx field offsets — must match
     # `boards::tx_hal_riscv64_qemu_virt::KernelResumeCtx` in lib.rs.
@@ -117,6 +151,46 @@ tx_rv64_qemu_minimal_trap_vector:
     sd t0, TX_RV64_TF_STVAL(sp)
     csrr t0, sstatus
     sd t0, TX_RV64_TF_SSTATUS(sp)
+    # t0 = sstatus; save FP regs if FS != Off (bits 14:13 non-zero).
+    # Using t0 is safe: it was already saved to TX_RV64_TF_X5(sp) above.
+    srli t0, t0, 13
+    andi t0, t0, 3
+    beqz t0, 1f
+    fsd f0,  TX_RV64_TF_F0(sp)
+    fsd f1,  TX_RV64_TF_F1(sp)
+    fsd f2,  TX_RV64_TF_F2(sp)
+    fsd f3,  TX_RV64_TF_F3(sp)
+    fsd f4,  TX_RV64_TF_F4(sp)
+    fsd f5,  TX_RV64_TF_F5(sp)
+    fsd f6,  TX_RV64_TF_F6(sp)
+    fsd f7,  TX_RV64_TF_F7(sp)
+    fsd f8,  TX_RV64_TF_F8(sp)
+    fsd f9,  TX_RV64_TF_F9(sp)
+    fsd f10, TX_RV64_TF_F10(sp)
+    fsd f11, TX_RV64_TF_F11(sp)
+    fsd f12, TX_RV64_TF_F12(sp)
+    fsd f13, TX_RV64_TF_F13(sp)
+    fsd f14, TX_RV64_TF_F14(sp)
+    fsd f15, TX_RV64_TF_F15(sp)
+    fsd f16, TX_RV64_TF_F16(sp)
+    fsd f17, TX_RV64_TF_F17(sp)
+    fsd f18, TX_RV64_TF_F18(sp)
+    fsd f19, TX_RV64_TF_F19(sp)
+    fsd f20, TX_RV64_TF_F20(sp)
+    fsd f21, TX_RV64_TF_F21(sp)
+    fsd f22, TX_RV64_TF_F22(sp)
+    fsd f23, TX_RV64_TF_F23(sp)
+    fsd f24, TX_RV64_TF_F24(sp)
+    fsd f25, TX_RV64_TF_F25(sp)
+    fsd f26, TX_RV64_TF_F26(sp)
+    fsd f27, TX_RV64_TF_F27(sp)
+    fsd f28, TX_RV64_TF_F28(sp)
+    fsd f29, TX_RV64_TF_F29(sp)
+    fsd f30, TX_RV64_TF_F30(sp)
+    fsd f31, TX_RV64_TF_F31(sp)
+    frcsr t0
+    sw   t0, TX_RV64_TF_FCSR(sp)
+1:
 
     mv a0, sp
     call tx_rv64_qemu_kernel_trap_entry
@@ -139,6 +213,47 @@ tx_rv64_qemu_minimal_trap_vector:
     csrw sepc, t0
     ld t0, TX_RV64_TF_SSTATUS(sp)
     csrw sstatus, t0
+    # t0 = outgoing sstatus; restore FP regs if FS != Off.
+    # prepare_user_return always sets FS=Initial, so this block
+    # executes on every return to userspace that had FP active.
+    srli t0, t0, 13
+    andi t0, t0, 3
+    beqz t0, 2f
+    lw   t0, TX_RV64_TF_FCSR(sp)
+    fscsr t0
+    fld f0,  TX_RV64_TF_F0(sp)
+    fld f1,  TX_RV64_TF_F1(sp)
+    fld f2,  TX_RV64_TF_F2(sp)
+    fld f3,  TX_RV64_TF_F3(sp)
+    fld f4,  TX_RV64_TF_F4(sp)
+    fld f5,  TX_RV64_TF_F5(sp)
+    fld f6,  TX_RV64_TF_F6(sp)
+    fld f7,  TX_RV64_TF_F7(sp)
+    fld f8,  TX_RV64_TF_F8(sp)
+    fld f9,  TX_RV64_TF_F9(sp)
+    fld f10, TX_RV64_TF_F10(sp)
+    fld f11, TX_RV64_TF_F11(sp)
+    fld f12, TX_RV64_TF_F12(sp)
+    fld f13, TX_RV64_TF_F13(sp)
+    fld f14, TX_RV64_TF_F14(sp)
+    fld f15, TX_RV64_TF_F15(sp)
+    fld f16, TX_RV64_TF_F16(sp)
+    fld f17, TX_RV64_TF_F17(sp)
+    fld f18, TX_RV64_TF_F18(sp)
+    fld f19, TX_RV64_TF_F19(sp)
+    fld f20, TX_RV64_TF_F20(sp)
+    fld f21, TX_RV64_TF_F21(sp)
+    fld f22, TX_RV64_TF_F22(sp)
+    fld f23, TX_RV64_TF_F23(sp)
+    fld f24, TX_RV64_TF_F24(sp)
+    fld f25, TX_RV64_TF_F25(sp)
+    fld f26, TX_RV64_TF_F26(sp)
+    fld f27, TX_RV64_TF_F27(sp)
+    fld f28, TX_RV64_TF_F28(sp)
+    fld f29, TX_RV64_TF_F29(sp)
+    fld f30, TX_RV64_TF_F30(sp)
+    fld f31, TX_RV64_TF_F31(sp)
+2:
 
     # Move trap-time sp into sscratch via t0. Safe to clobber t0
     # because we'll restore the user's t0 from the frame below
@@ -226,6 +341,45 @@ tx_rv64_enter_userspace_save_resume:
     csrw sepc, t0
     ld t0, TX_RV64_TF_SSTATUS(t6)
     csrw sstatus, t0
+    # t0 = outgoing sstatus; restore FP regs if FS != Off.
+    srli t0, t0, 13
+    andi t0, t0, 3
+    beqz t0, 3f
+    lw   t0, TX_RV64_TF_FCSR(t6)
+    fscsr t0
+    fld f0,  TX_RV64_TF_F0(t6)
+    fld f1,  TX_RV64_TF_F1(t6)
+    fld f2,  TX_RV64_TF_F2(t6)
+    fld f3,  TX_RV64_TF_F3(t6)
+    fld f4,  TX_RV64_TF_F4(t6)
+    fld f5,  TX_RV64_TF_F5(t6)
+    fld f6,  TX_RV64_TF_F6(t6)
+    fld f7,  TX_RV64_TF_F7(t6)
+    fld f8,  TX_RV64_TF_F8(t6)
+    fld f9,  TX_RV64_TF_F9(t6)
+    fld f10, TX_RV64_TF_F10(t6)
+    fld f11, TX_RV64_TF_F11(t6)
+    fld f12, TX_RV64_TF_F12(t6)
+    fld f13, TX_RV64_TF_F13(t6)
+    fld f14, TX_RV64_TF_F14(t6)
+    fld f15, TX_RV64_TF_F15(t6)
+    fld f16, TX_RV64_TF_F16(t6)
+    fld f17, TX_RV64_TF_F17(t6)
+    fld f18, TX_RV64_TF_F18(t6)
+    fld f19, TX_RV64_TF_F19(t6)
+    fld f20, TX_RV64_TF_F20(t6)
+    fld f21, TX_RV64_TF_F21(t6)
+    fld f22, TX_RV64_TF_F22(t6)
+    fld f23, TX_RV64_TF_F23(t6)
+    fld f24, TX_RV64_TF_F24(t6)
+    fld f25, TX_RV64_TF_F25(t6)
+    fld f26, TX_RV64_TF_F26(t6)
+    fld f27, TX_RV64_TF_F27(t6)
+    fld f28, TX_RV64_TF_F28(t6)
+    fld f29, TX_RV64_TF_F29(t6)
+    fld f30, TX_RV64_TF_F30(t6)
+    fld f31, TX_RV64_TF_F31(t6)
+3:
     ld ra,  TX_RV64_TF_X1(t6)
     ld gp,  TX_RV64_TF_X3(t6)
     ld tp,  TX_RV64_TF_X4(t6)
@@ -292,6 +446,11 @@ tx_rv64_resume_kernel_after_reschedule:
 
 const RV64_SSTATUS_SPP: usize = 1 << 8;
 const RV64_SSTATUS_SPIE: usize = 1 << 5;
+/// FS field (bits 14:13): 00=Off 01=Initial 10=Clean 11=Dirty.
+/// Must be non-zero before sret so user-space FP/Zd instructions
+/// don't trap with Illegal Instruction (scause=2).
+const RV64_SSTATUS_FS_MASK: usize = 3 << 13;
+const RV64_SSTATUS_FS_INITIAL: usize = 1 << 13;
 const X_SP: usize = 2;
 const X_RA: usize = 1;
 const X_TP: usize = 4;
@@ -306,11 +465,15 @@ const X_A7: usize = 17;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rv64TrapFrame {
-    pub x: [usize; 32],
-    pub scause: usize,
-    pub sepc: usize,
-    pub stval: usize,
-    pub sstatus: usize,
+    pub x: [usize; 32],     // offsets   0..255
+    pub scause: usize,      // offset  256
+    pub sepc: usize,        // offset  264
+    pub stval: usize,       // offset  272
+    pub sstatus: usize,     // offset  280
+    pub f: [u64; 32],       // offsets 288..543  (TX_RV64_TF_F_BASE)
+    pub fcsr: u32,          // offset  544       (TX_RV64_TF_FCSR)
+    pub _pad_fp: u32,       // offset  548       (pad to 8-byte alignment)
+                            // total  = 552 bytes (TX_RV64_TF_SIZE)
 }
 
 impl Rv64TrapFrame {
@@ -416,11 +579,26 @@ impl Rv64TrapFrame {
     }
 
     fn capture_user_context(&self) -> UserTrapContext {
+        let fs = (self.sstatus >> 13) & 3;
+        let fp = if fs != 0 {
+            let mut flags = UserFpContext::FLAG_VALID;
+            if fs == 3 {
+                flags |= UserFpContext::FLAG_DIRTY;
+            }
+            UserFpContext {
+                regs: self.f,
+                fcsr: self.fcsr,
+                flags,
+                ..UserFpContext::empty()
+            }
+        } else {
+            UserFpContext::empty()
+        };
         UserTrapContext {
             regs: self.x,
             pc: self.sepc,
             status: self.sstatus,
-            fp: tx_hal::UserFpContext::empty(),
+            fp,
         }
     }
 
@@ -429,6 +607,13 @@ impl Rv64TrapFrame {
         self.x[0] = 0;
         self.sepc = context.pc;
         self.sstatus = context.status;
+        if context.fp.is_valid() {
+            self.f = context.fp.regs;
+            self.fcsr = context.fp.fcsr;
+        } else {
+            self.f = [0u64; 32];
+            self.fcsr = 0;
+        }
         self.prepare_user_return();
     }
 
@@ -446,6 +631,7 @@ impl Rv64TrapFrame {
     pub fn prepare_user_return(&mut self) {
         self.sstatus &= !RV64_SSTATUS_SPP;
         self.sstatus |= RV64_SSTATUS_SPIE;
+        self.sstatus = (self.sstatus & !RV64_SSTATUS_FS_MASK) | RV64_SSTATUS_FS_INITIAL;
     }
 }
 
@@ -553,6 +739,9 @@ impl TrapIf for Platform {
             sepc: 0,
             stval: 0,
             sstatus: 0,
+            f: [0u64; 32],
+            fcsr: 0,
+            _pad_fp: 0,
         };
         frame.restore_user_context(&ctx);
         // `restore_user_context` already calls `prepare_user_return`,

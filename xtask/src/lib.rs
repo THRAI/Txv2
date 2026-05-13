@@ -73,7 +73,7 @@ fn print_usage() {
            cargo xtask test [smoke|busybox-boot] [--target rv64-qemu] [--timeout-ms N] [--dry-run] [--trap-trace]\n\
            cargo xtask fault-decode --target rv64-qemu [--elf PATH] [--serial PATH [--all] | --scause HEX --sepc HEX --stval HEX | --addr HEX]\n\
            cargo xtask trap-trace --serial PATH [--syscalls | --raw]\n\
-           cargo xtask shell-test --target rv64-qemu --script PATH\n\
+           cargo xtask shell-test --target rv64-qemu --script PATH [--group NAME[,NAME...]] [--list-groups] [--keep-going]\n\
            cargo xtask image cpio --profile busybox [--target rv64-qemu|la64-qemu]\n\
            cargo xtask image ext4 --profile busybox [--target rv64-qemu|la64-qemu] [--size 64M]\n\
            cargo xtask image m1dock-sd --profile busybox [--target rv64-m1dock-mock] [--size 64M]\n\
