@@ -619,17 +619,20 @@ fn fork_aspace_preserves_parent_private_anon_bytes_in_child_via_sharedcow() {
     drop(guard);
 
     // Fork: parent's vme.private should fork_share into child as
-    // SharedCow. Parent's PTE in the private range is torn down.
+    // SharedCow. Parent's PTE in the private range is demoted read-only.
     let child =
         crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
 
-    // Sanity: parent's PTE for the private page is gone (lazy refault).
-    assert!(
+    // Sanity: parent's PTE for the private page remains mapped, but no
+    // longer writable. The next parent write must fault and CoW.
+    assert_eq!(
         parent
             .pmap()
             .lookup(crate::vm::UserVirtAddr(0x40000).containing_page())
-            .is_none(),
-        "fork must demote parent PTE for private mapping"
+            .expect("parent mapping remains after fork")
+            .prot,
+        Prot::READ,
+        "fork must demote parent private PTE to read-only"
     );
 
     // Parent re-reads after fork: read fault should consult vme.private
