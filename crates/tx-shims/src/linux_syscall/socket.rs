@@ -10,10 +10,10 @@ use super::*;
 use tx_substrate::step_v3::{NoProgress, StepOutcome, YieldShape};
 use tx_subsystems::net::{
     socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
-    step_recv_kernel_bytes, step_send_to_kernel_bytes, step_shutdown, step_socket_close,
-    step_socket_open_file, IpEndpoint, Ipv4Address, KernelSockAddr, LingerOption, SendRecvFlags,
-    SockAddrIn, SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol,
-    TcpState, UdpInner,
+    step_poll_ready, step_recv_kernel_bytes, step_send_to_kernel_bytes, step_shutdown,
+    step_socket_close, step_socket_open_file, IpEndpoint, Ipv4Address, KernelSockAddr,
+    LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockShutdownCmd, SocketHandleFlags,
+    SocketIdentity, SocketKind, SocketProtocol, TcpState, UdpInner,
 };
 use tx_subsystems::wait_source;
 
@@ -56,7 +56,7 @@ pub(super) fn sys_socket<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
         StepOutcome::Done(opened) => opened,
         StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-            return SyscallResult::Error(EIO_VALUE)
+            return SyscallResult::Error(EIO_VALUE);
         }
     };
 
@@ -811,6 +811,22 @@ fn socket_identity_from_file(file: &Cap<OpenFile>) -> Result<Cap<SocketIdentity>
         } => Ok(identity.clone()),
         _ => Err(Errno::ENOTSOCK),
     }
+}
+
+pub(super) fn socket_poll_mask_from_file(
+    file: &Cap<OpenFile>,
+    guard: &tx_substrate::epoch::Guard<'_>,
+) -> Option<Result<PollMask, Errno>> {
+    let socket = match socket_identity_from_file(file) {
+        Ok(socket) => socket,
+        Err(Errno::ENOTSOCK) => return None,
+        Err(errno) => return Some(Err(errno)),
+    };
+    Some(match step_poll_ready(&socket, guard) {
+        StepOutcome::Done(mask) => Ok(mask),
+        StepOutcome::Err(errno) => Err(errno),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(PollMask::empty()),
+    })
 }
 
 fn read_sockaddr_in<'a>(

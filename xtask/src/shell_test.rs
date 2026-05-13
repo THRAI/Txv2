@@ -76,6 +76,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::image::busybox_initramfs_name;
+use crate::qemu::{append_net_args, qemu_net};
 use crate::target::{Profile, TxTarget};
 use crate::util::{option_value, optional_option_value, resolve_path};
 use crate::Result;
@@ -187,13 +188,15 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                 let results = Arc::clone(&results_arc);
                 let next = Arc::clone(&next_idx);
                 let root = root.to_path_buf();
+                let args = args.clone();
                 thread::spawn(move || loop {
                     let idx = next.fetch_add(1, Ordering::Relaxed);
                     if idx >= groups.len() {
                         break;
                     }
                     let group = &groups[idx];
-                    let (captured, group_err) = run_group_isolated(&root, target, &setup, group);
+                    let (captured, group_err) =
+                        run_group_isolated(&root, target, &setup, group, &args);
                     let result = match group_err {
                         None => Ok(()),
                         Some(err) => {
@@ -249,7 +252,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     }
 
     // ── Sequential mode (default) ───────────────────────────────────────────
-    let qemu_cmd = build_qemu_command(root, target)?;
+    let qemu_cmd = build_qemu_command(root, target, &args)?;
     println!("shell-test: spawning {}", qemu_cmd.join(" "));
 
     let Some((program, rest)) = qemu_cmd.split_first() else {
@@ -722,9 +725,11 @@ fn run_group_isolated(
     target: TxTarget,
     setup: &[Directive],
     group: &NamedGroup,
+    raw_args: &[String],
 ) -> (String, Option<String>) {
     let buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let group_err = run_group_isolated_inner(root, target, setup, group, Arc::clone(&buffer));
+    let group_err =
+        run_group_isolated_inner(root, target, setup, group, Arc::clone(&buffer), raw_args);
     let captured = buffer.lock().unwrap().clone();
     (captured, group_err)
 }
@@ -735,8 +740,9 @@ fn run_group_isolated_inner(
     setup: &[Directive],
     group: &NamedGroup,
     buffer: Arc<Mutex<String>>,
+    raw_args: &[String],
 ) -> Option<String> {
-    let qemu_cmd = match build_qemu_command(root, target) {
+    let qemu_cmd = match build_qemu_command(root, target, raw_args) {
         Ok(c) => c,
         Err(e) => return Some(format!("qemu command: {e}")),
     };
@@ -788,7 +794,7 @@ fn run_group_isolated_inner(
     result
 }
 
-fn build_qemu_command(root: &Path, target: TxTarget) -> Result<Vec<String>> {
+fn build_qemu_command(root: &Path, target: TxTarget, raw_args: &[String]) -> Result<Vec<String>> {
     // Reuse the existing qemu_command builder by constructing an
     // args list and invoking the same dispatcher path. We can't call
     // the private `qemu_command` directly without exposing it; build
@@ -810,7 +816,15 @@ fn build_qemu_command(root: &Path, target: TxTarget) -> Result<Vec<String>> {
         }
         .into(),
         "-smp".into(),
-        "1".into(),
+        match target {
+            // Keep shell-test single-hart on rv64 so OpenSBI cannot
+            // choose a non-zero boot hart for an interactive userspace
+            // session. SMP boot smoke remains covered by `xtask qemu`.
+            TxTarget::Rv64Qemu => "1",
+            TxTarget::La64Qemu => "4",
+            TxTarget::Rv64M1DockMock => "1",
+        }
+        .into(),
         "-display".into(),
         "none".into(),
         "-serial".into(),
@@ -827,6 +841,28 @@ fn build_qemu_command(root: &Path, target: TxTarget) -> Result<Vec<String>> {
     args.push(initramfs.display().to_string());
     args.push("-append".into());
     args.push("tx.profile=busybox console=ttyS0".into());
+    let net = qemu_net(raw_args)?;
+    append_net_args(&mut args, target, &net);
     let _ = Profile::Busybox; // documentation: this driver always uses busybox.
     Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_test_qemu_command_can_enable_user_networking() {
+        let command = build_qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            &["--net".into(), "user".into()],
+        )
+        .unwrap()
+        .join(" ");
+
+        assert!(command.contains("-smp 1"));
+        assert!(command.contains("-netdev user,id=net0"));
+        assert!(command.contains("-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0"));
+    }
 }

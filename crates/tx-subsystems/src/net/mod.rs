@@ -16,6 +16,7 @@ pub mod protocol;
 pub mod structure;
 
 pub use device::{
+    net_device_by_devt, net_device_by_name, net_device_snapshot, register_net_devices,
     EthernetAddress, NetDeviceOps, NetDeviceRegistration, VirtioNetConfig, VirtioNetDevice,
     VirtioNetFeatureSet, VirtioNetIrqEvent, VirtioNetIrqOutcome, VirtioNetQueueConfig,
     VirtioNetRxInjectOutcome, VirtioNetStats, VirtioNetStatsSnapshot, VirtioNetTxCompleteOutcome,

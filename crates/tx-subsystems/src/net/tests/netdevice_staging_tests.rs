@@ -41,6 +41,7 @@ impl NetDelegateDriver for DeviceDelegateDriver<'_> {
             tcp_connecting: 0,
             tcp_connected: 0,
             udp_bound: 256,
+            raw_icmp: 256,
         }
     }
 }

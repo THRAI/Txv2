@@ -670,6 +670,10 @@ impl PacketTxSink for EtherPacketTxSink<'_> {
         self.readiness(guard)
     }
 
+    fn source_ipv4(&self) -> Option<Ipv4Address> {
+        Some(self.iface.common.ipv4_addr())
+    }
+
     fn transmit(&self, frame: &[u8], guard: &Guard<'_>) -> PacketTxResult {
         self.iface.dispatch_ip_at(frame, Instant::ZERO, guard)
     }

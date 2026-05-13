@@ -117,6 +117,14 @@ impl RawIcmpSocket {
         })
     }
 
+    pub fn peek_tx_echo(&self) -> Option<Icmpv4EchoPacket> {
+        self.tx_queue.lock().front().cloned()
+    }
+
+    pub fn commit_tx_echo_sent(&self) -> Option<RawIcmpTxDrain> {
+        self.pop_tx_echo()
+    }
+
     pub fn ingest_rx_echo_reply(&self, packet: Icmpv4EchoPacket) -> bool {
         let bytes = icmpv4_echo_message_len(&packet);
         let mut rx = self.rx_queue.lock();

@@ -16,6 +16,7 @@ use super::dma::TxVirtioHal;
 pub enum VirtioPciError {
     MissingMmioRegion(&'static str),
     NoBlockDevice,
+    NoNetDevice,
     BarProbe,
     BarTooLarge,
     BarAddressExhausted,
@@ -48,6 +49,26 @@ pub fn find_virtio_blk_transport<P: TxPlatform>(
     ecam_region: MmioRegion,
     mmio32_region: MmioRegion,
 ) -> Result<PciTransport, VirtioPciError> {
+    find_virtio_transport::<P>(ecam_region, mmio32_region, DeviceType::Block).map_err(|err| {
+        match err {
+            VirtioPciError::NoNetDevice => VirtioPciError::NoBlockDevice,
+            other => other,
+        }
+    })
+}
+
+pub fn find_virtio_net_transport<P: TxPlatform>(
+    ecam_region: MmioRegion,
+    mmio32_region: MmioRegion,
+) -> Result<PciTransport, VirtioPciError> {
+    find_virtio_transport::<P>(ecam_region, mmio32_region, DeviceType::Network)
+}
+
+fn find_virtio_transport<P: TxPlatform>(
+    ecam_region: MmioRegion,
+    mmio32_region: MmioRegion,
+    device_type: DeviceType,
+) -> Result<PciTransport, VirtioPciError> {
     let cam = unsafe { MmioCam::new(ecam_region.virt.start.0 as *mut u8, Cam::Ecam) };
     let mut root = PciRoot::new(cam);
     let mut allocator = PciMemory32Allocator::new(
@@ -56,7 +77,7 @@ pub fn find_virtio_blk_transport<P: TxPlatform>(
     )?;
 
     for (device_function, info) in root.enumerate_bus(0) {
-        if virtio_device_type(&info) != Some(DeviceType::Block) {
+        if virtio_device_type(&info) != Some(device_type) {
             continue;
         }
         allocate_bars(&mut root, device_function, &mut allocator)?;
@@ -68,7 +89,11 @@ pub fn find_virtio_blk_transport<P: TxPlatform>(
             .map_err(|_| VirtioPciError::Transport);
     }
 
-    Err(VirtioPciError::NoBlockDevice)
+    match device_type {
+        DeviceType::Block => Err(VirtioPciError::NoBlockDevice),
+        DeviceType::Network => Err(VirtioPciError::NoNetDevice),
+        _ => Err(VirtioPciError::Transport),
+    }
 }
 
 struct PciMemory32Allocator {

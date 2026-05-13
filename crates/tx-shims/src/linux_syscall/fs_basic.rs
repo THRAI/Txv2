@@ -82,10 +82,9 @@ fn allocate_fd_at_least_under_limit<'a>(
 /// CLOEXEC set.
 ///
 /// Slice 7 surface adds `F_DUPFD` / `F_DUPFD_CLOEXEC` / `F_GETFL`.
-/// `F_SETFL` returns `-ENOSYS` (carryover — `OpenFileFlags` is a
-/// plain `Copy`-struct field on `OpenFile`, not behind an atomic /
-/// mutex, so the "replace flags atomically" semantic is unsafe under
-/// the current shape; `TODO(phase-fcntl-setfl)`).
+/// `F_SETFL` updates the per-open-file-description status bits that
+/// are mutable after open. This slice supports `O_APPEND` and
+/// `O_NONBLOCK`; access mode and close-on-exec stay unchanged.
 ///
 /// Validation (fd-ops Wave 1: `EBADF` is now driven by "is this fd
 /// open?" rather than the retired `FD_TABLE_SIZE = 8` ceiling — Linux

@@ -3,6 +3,7 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::target::{Profile, TxTarget};
 use crate::util::{
@@ -179,6 +180,7 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
         fs::create_dir_all(layout.join(dir)).map_err(|err| err.to_string())?;
     }
     fs::copy(&busybox, layout.join("bin").join("busybox")).map_err(|err| err.to_string())?;
+    install_optional_user_smokes(root, target, &layout)?;
 
     // IPC smoke test binary — copy if present
     let ipc_test_src = root.join("tools/images/ipc_test");
@@ -235,7 +237,7 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
         for name in [
             "sh", "ls", "cat", "mkdir", "rm", "rmdir", "mv", "cp", "touch", "pwd", "echo", "ln",
             "chmod", "chown", "uname", "ps", "kill", "grep", "find", "head", "tail", "wc", "sort",
-            "sed", "awk", "mount",
+            "sed", "awk", "mount", "ping", "telnet", "telnetd",
         ] {
             let path = layout.join("bin").join(name);
             if path.exists() {
@@ -258,4 +260,47 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
     }
 
     Ok(layout)
+}
+
+fn install_optional_user_smokes(root: &Path, target: TxTarget, layout: &Path) -> Result<()> {
+    if target != TxTarget::Rv64Qemu {
+        return Ok(());
+    }
+    if !command_exists("riscv64-linux-gnu-gcc") {
+        println!("warn: riscv64-linux-gnu-gcc not found; skipping udp-loopback-smoke");
+        return Ok(());
+    }
+
+    let source = root.join("tools").join("user").join("udp-loopback-smoke.c");
+    if !source.is_file() {
+        return Ok(());
+    }
+    let out = root
+        .join("target")
+        .join("images")
+        .join("udp-loopback-smoke-riscv64");
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let status = Command::new("riscv64-linux-gnu-gcc")
+        .args([
+            "-nostdlib",
+            "-static",
+            "-ffreestanding",
+            "-fno-builtin",
+            "-fno-stack-protector",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .map_err(|err| format!("failed to run riscv64-linux-gnu-gcc: {err}"))?;
+    if !status.success() {
+        return Err(format!("riscv64-linux-gnu-gcc exited with {status}"));
+    }
+    fs::copy(&out, layout.join("bin").join("udp-loopback-smoke")).map_err(|err| err.to_string())?;
+    Ok(())
 }

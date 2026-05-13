@@ -1,0 +1,22 @@
+# busybox-ping-gateway.txt — N66 BusyBox shell ICMP QEMU gateway smoke.
+#
+# Run with:
+#   cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf
+#   cargo xtask image cpio --profile busybox --target rv64-qemu
+#   cargo xtask shell-test --target rv64-qemu --net user --script tools/shell-tests/busybox-ping-gateway.txt
+#
+# This is the first shell-facing real-device ping target. It depends on
+# QEMU user networking's gateway address 10.0.2.2 and the RV64 virtio-net
+# device being registered as eth0 during boot.
+
+wait "txkernel:qemu-riscv64-virt:devices:net:eth0:ok" within 30000
+wait "/ # " within 30000
+
+sleep 500
+send "ping -c 1 10.0.2.2\n"
+expect "PING 10.0.2.2" within 8000
+expect "1 packets transmitted" within 12000
+expect "/ # " within 8000
+
+sleep 500
+quit

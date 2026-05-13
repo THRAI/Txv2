@@ -4,15 +4,17 @@ use tx_substrate::zone::Cap;
 
 use crate::execution::{Guard, StepOutcome};
 use crate::net::packet::{PacketTxReadiness, PacketTxResult, PacketTxSink};
+use crate::net::protocol::build_icmpv4_echo_request;
 use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::structure::{
-    IpEndpoint, SendWireSet, SocketIdentity, SocketProtocol, TcpState, UdpInner,
+    IpEndpoint, Ipv4Address, SendWireSet, SocketIdentity, SocketProtocol, TcpState, UdpInner,
 };
 
 pub const DEVICE_TX_BUDGET_DEFAULT: DeviceTxBudget = DeviceTxBudget {
     tcp_connecting: 16,
     tcp_connected: 32,
     udp_bound: 32,
+    raw_icmp: 32,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +22,7 @@ pub struct DeviceTxBudget {
     pub tcp_connecting: usize,
     pub tcp_connected: usize,
     pub udp_bound: usize,
+    pub raw_icmp: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -34,6 +37,11 @@ pub struct DeviceTxOutcome {
     pub udp_busy: usize,
     pub udp_resolution_pending: usize,
     pub udp_failed: usize,
+    pub raw_icmp_attempted: usize,
+    pub raw_icmp_packets: usize,
+    pub raw_icmp_busy: usize,
+    pub raw_icmp_resolution_pending: usize,
+    pub raw_icmp_failed: usize,
     pub tx_bytes: usize,
     pub sockets_touched: usize,
     pub wakes_fired: usize,
@@ -57,6 +65,11 @@ impl DeviceTxOutcome {
         self.udp_busy += other.udp_busy;
         self.udp_resolution_pending += other.udp_resolution_pending;
         self.udp_failed += other.udp_failed;
+        self.raw_icmp_attempted += other.raw_icmp_attempted;
+        self.raw_icmp_packets += other.raw_icmp_packets;
+        self.raw_icmp_busy += other.raw_icmp_busy;
+        self.raw_icmp_resolution_pending += other.raw_icmp_resolution_pending;
+        self.raw_icmp_failed += other.raw_icmp_failed;
         self.tx_bytes += other.tx_bytes;
         self.sockets_touched += other.sockets_touched;
         self.wakes_fired += other.wakes_fired;
@@ -116,6 +129,21 @@ pub fn step_process_device_tx_pending_at(
             break;
         }
         process_udp_tx_socket(&socket, sink, now, guard, &mut outcome);
+    }
+
+    let mut raw_icmp_seen = Vec::new();
+    for socket in SOCKET_TABLE
+        .snapshot_raw_icmp(guard)
+        .into_iter()
+        .filter(is_raw_icmp)
+    {
+        if !remember_socket(&mut raw_icmp_seen, &socket) {
+            continue;
+        }
+        if outcome.raw_icmp_attempted >= budget.raw_icmp {
+            break;
+        }
+        process_raw_icmp_tx_socket(&socket, sink, now, guard, &mut outcome);
     }
 
     StepOutcome::Done(outcome)
@@ -214,6 +242,62 @@ fn process_udp_tx_socket(
     }
 }
 
+fn process_raw_icmp_tx_socket(
+    socket: &Cap<SocketIdentity>,
+    sink: &dyn PacketTxSink,
+    now: Instant,
+    guard: &Guard<'_>,
+    outcome: &mut DeviceTxOutcome,
+) {
+    let Some(payload) = socket.acquire_operational() else {
+        return;
+    };
+    let Some(mut echo) = payload.peek_icmp_tx_echo() else {
+        return;
+    };
+    if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {
+        outcome.raw_icmp_busy += 1;
+        return;
+    }
+    if is_external_ipv4(echo.dst)
+        && (echo.src == Ipv4Address::LOOPBACK || echo.src == Ipv4Address::UNSPECIFIED)
+    {
+        if let Some(src) = sink.source_ipv4() {
+            echo.src = src;
+        }
+    }
+    let packet = build_icmpv4_echo_request(&echo);
+
+    outcome.raw_icmp_attempted += 1;
+    match sink.transmit_at(packet.as_bytes(), now, guard) {
+        PacketTxResult::Accepted { frame_len } => {
+            let Some(drain) = payload.commit_icmp_tx_echo_sent() else {
+                outcome.raw_icmp_failed += 1;
+                return;
+            };
+            outcome.raw_icmp_packets += 1;
+            outcome.tx_bytes += frame_len;
+            outcome.sockets_touched += 1;
+            if drain.became_available {
+                outcome.wakes_fired += socket.readiness.fire_send(SendWireSet::SPACE);
+            }
+        }
+        PacketTxResult::Busy => {
+            outcome.raw_icmp_busy += 1;
+        }
+        PacketTxResult::PendingResolution { .. } => {
+            outcome.raw_icmp_resolution_pending += 1;
+        }
+        PacketTxResult::Failed { .. } => {
+            outcome.raw_icmp_failed += 1;
+        }
+    }
+}
+
+fn is_external_ipv4(addr: Ipv4Address) -> bool {
+    addr != Ipv4Address::LOOPBACK && addr != Ipv4Address::BROADCAST
+}
+
 fn is_tcp_connecting(socket: &Cap<SocketIdentity>) -> bool {
     socket.acquire_operational().is_some_and(|payload| {
         matches!(
@@ -247,6 +331,12 @@ fn udp_local_endpoint(protocol: &SocketProtocol) -> Option<IpEndpoint> {
         | SocketProtocol::Udp(UdpInner::Connected { local, .. }) => Some(*local),
         _ => None,
     }
+}
+
+fn is_raw_icmp(socket: &Cap<SocketIdentity>) -> bool {
+    socket
+        .acquire_operational()
+        .is_some_and(|payload| matches!(payload.protocol_snapshot(), SocketProtocol::RawIcmp(_)))
 }
 
 fn remember_socket(seen: &mut Vec<u32>, socket: &Cap<SocketIdentity>) -> bool {

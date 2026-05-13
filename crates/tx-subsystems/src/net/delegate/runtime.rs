@@ -12,7 +12,10 @@ use crate::net::packet::{PacketSource, PacketTxSink};
 use crate::net::protocol::{EtherIface, LoopbackIface};
 use crate::wait_source;
 
-use super::{net_delegate_clear, net_delegate_queue, net_delegate_wait_token, DelegateWireSet};
+use super::{
+    net_delegate_clear, net_delegate_kick_poll, net_delegate_queue, net_delegate_wait_token,
+    DelegateWireSet,
+};
 
 pub trait NetDelegateDriver {
     fn now(&self) -> Instant;
@@ -223,6 +226,12 @@ pub fn net_delegate_step_once(
             outcome.device_tx.merge(device_tx);
             outcome.sockets_touched += device_tx.sockets_touched;
             outcome.wakes_fired += device_tx.wakes_fired;
+            if device_tx.tcp_packets != 0
+                || device_tx.udp_packets != 0
+                || device_tx.raw_icmp_packets != 0
+            {
+                outcome.wakes_fired += net_delegate_kick_poll();
+            }
         }
 
         if let Some(iface) = driver.ether_iface() {
@@ -232,6 +241,9 @@ pub fn net_delegate_step_once(
                 return outcome;
             };
             outcome.arp_flush = arp_flush;
+            if arp_flush.sent != 0 {
+                outcome.wakes_fired += net_delegate_kick_poll();
+            }
         }
     }
 
