@@ -247,40 +247,43 @@ fn ext4_v3_load_inode_meta_returns_done_for_real_inode() {
 }
 
 #[test]
-fn ext4_v3_mutation_methods_surface_enosys_through_v3_errno() {
-    // The read-only ext4 surface returns `Errno::ENOSYS` from every
-    // mutating method (create_inode, mkdir, unlink, rmdir, rename,
-    // link, symlink, destroy_inode, serialize_inode_meta). Pin that
-    // `ENOSYS` surfaces cleanly through the trait so walker callers
-    // observe a consistent shape across backends.
+fn ext4_v3_mutation_methods_create_and_mkdir_succeed() {
+    // create_inode and mkdir are now implemented; they succeed on the
+    // in-memory image.  destroy_inode, rename, link, symlink, and
+    // serialize_inode_meta still surface ENOSYS.
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
     let guard = epoch::guard();
     let cred = tx_subsystems::vfs::Credential::root();
 
-    assert_eq!(
-        <Ext4FsInstance<MemImage> as FsOps>::create_inode(
-            &*fs,
-            FsObjectId::new(2),
-            b"new",
-            0o100644,
-            &cred,
-            &guard,
-        ),
-        V3::<(FsObjectId, _), NoProgress>::err(V3Errno::ENOSYS)
+    let result = <Ext4FsInstance<MemImage> as FsOps>::create_inode(
+        &*fs,
+        FsObjectId::new(2),
+        b"new",
+        0o100644,
+        &cred,
+        &guard,
     );
-    assert_eq!(
-        <Ext4FsInstance<MemImage> as FsOps>::mkdir(
-            &*fs,
-            FsObjectId::new(2),
-            b"newdir",
-            0o755,
-            &cred,
-            &guard,
-        ),
-        V3::<(FsObjectId, _), NoProgress>::err(V3Errno::ENOSYS)
+    assert!(
+        matches!(result, V3::Done(_)),
+        "create_inode should succeed: {result:?}"
     );
+
+    let result = <Ext4FsInstance<MemImage> as FsOps>::mkdir(
+        &*fs,
+        FsObjectId::new(2),
+        b"newdir",
+        0o755,
+        &cred,
+        &guard,
+    );
+    assert!(
+        matches!(result, V3::Done(_)),
+        "mkdir should succeed: {result:?}"
+    );
+
+    // destroy_inode is still unimplemented.
     assert_eq!(
         <Ext4FsInstance<MemImage> as FsOps>::destroy_inode(&*fs, FsObjectId::new(12), &guard),
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)

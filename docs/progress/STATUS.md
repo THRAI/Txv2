@@ -1,3 +1,28 @@
+- 2026-05-13 **ext4 write support + brk page-alignment fix: 5 more OSComp tests pass.**
+  Implemented ext4 write operations across three layers:
+  1. `tx-ext4-format/pager.rs`: added `allocate_inode`, `write_inode`, `allocate_block`,
+     `append_dir_entry`, `remove_dir_entry`, `create_regular_file`, `create_directory`.
+     Uses inode/block bitmaps; handles htree-indexed parent directories by writing into
+     the slack of existing dir entries.
+  2. `tx-ext4/namespace.rs`: implemented `FsOps::create_inode`, `FsOps::mkdir`,
+     `FsOps::unlink` (previously all returned ENOSYS).
+  3. `tx-fs/tx_ext4_bridge.rs`: implemented `BlockImage::write_block` using the
+     virtio `write_blocks` DMA path (previously always returned `Truncated`).
+  Also fixed `brk_script` page-alignment bug: `UserRange::new_aligned` requires
+  both start and length to be 4096-aligned, but `brk(current+64)` passed `len=64`.
+  Fix computes `page_align_up(current_brk)` and `page_align_up(requested_brk)` to
+  determine the committed pages range, mapping/unmapping only the delta.
+  **Test:** `cargo xtask oscomp qemu --target rv64-qemu`. Results before/after:
+  - brk: heap pos stayed same → correctly advances (77824→77888→77952)
+  - chdir: Assert Fatal → chdir ret: 0, cwd=/musl/musl/basic/test_chdir
+  - close: Assert Fatal → close 3 success.
+  - mkdir_: -38 ENOSYS → mkdir ret: 0, mkdir success.
+  - unlink: Assert Fatal → unlink success!
+  Remaining failures: clone (partial clone impl), mmap/munmap (file creation cascades
+  needed for content), mount (ENOSYS), openat (dirfd≠AT_FDCWD not yet supported).
+  `cargo -q xtask unit` 4/4 clean (331 tests).
+  **Next step:** fix openat dirfd support and investigate mmap/munmap file-backed paths.
+
 - 2026-05-13 **`nanosleep` / `clock_nanosleep` real-duration sleep implemented.**
   Previously returned `-ENOSYS` for any non-zero duration, causing the OSComp
   `sleep` test to hit `--- Assert Fatal ! ---` immediately. Fix wires a

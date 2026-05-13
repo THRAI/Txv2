@@ -102,26 +102,48 @@ where
 
     fn create_inode(
         &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<
         (FsObjectId, InodeMeta),
         NoProgress,
     > {
-        StepOutcome::err(Errno::ENOSYS.into())
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.with_pager(|pager| {
+            pager.create_regular_file(parent_ino, name, mode, cred.uid, cred.gid, 0)
+        }) {
+            Ok(new_ino) => {
+                let meta = match self.with_pager(|pager| pager.inode_meta(new_ino)) {
+                    Ok(m) => m,
+                    Err(e) => return StepOutcome::err(e.into()),
+                };
+                StepOutcome::done((inode_fs_object_id(new_ino), map_inode_meta(meta)))
+            }
+            Err(e) => StepOutcome::err(e.into()),
+        }
     }
 
     fn unlink(
         &self,
-        _parent: FsObjectId,
-        _name: &[u8],
+        parent: FsObjectId,
+        name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.with_pager(|pager| pager.remove_dir_entry(parent_ino, name)) {
+            Ok(_removed_ino) => StepOutcome::done(()),
+            Err(e) => StepOutcome::err(e.into()),
+        }
     }
 
     fn rename(
@@ -147,16 +169,31 @@ where
 
     fn mkdir(
         &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<
         (FsObjectId, InodeMeta),
         NoProgress,
     > {
-        StepOutcome::err(Errno::ENOSYS.into())
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.with_pager(|pager| {
+            pager.create_directory(parent_ino, name, mode, cred.uid, cred.gid, 0)
+        }) {
+            Ok(new_ino) => {
+                let meta = match self.with_pager(|pager| pager.inode_meta(new_ino)) {
+                    Ok(m) => m,
+                    Err(e) => return StepOutcome::err(e.into()),
+                };
+                StepOutcome::done((inode_fs_object_id(new_ino), map_inode_meta(meta)))
+            }
+            Err(e) => StepOutcome::err(e.into()),
+        }
     }
 
     fn rmdir(
