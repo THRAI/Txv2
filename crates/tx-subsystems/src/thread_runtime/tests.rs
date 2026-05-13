@@ -15,6 +15,8 @@ use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
 use crate::process::{bootstrap_init_process, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
+use crate::thread_runtime::adapter::reactor_entry::{SyscallRequest, UserspaceTrapInfo};
+use crate::thread_runtime::adapter::step_engine::{Cap, PayloadCap};
 use crate::thread_runtime::execution::prepare_userspace_entry_payload;
 use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{
@@ -23,16 +25,12 @@ use crate::thread_runtime::structure::{
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
 use tx_hal::UserTrapContext;
-use tx_reactor::userspace::{SyscallRequest, UserspaceTrapInfo};
-use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::zone::Cap;
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
     reset_pid_counter_for_test();
     reset_tid_counter_for_test();
     reset_init_process_for_test();
@@ -131,8 +129,7 @@ fn weak_owner_proc_flips_dead_after_identity_drop() {
     // reset_init_process_for_test.
     drop(proc_cap);
     reset_init_process_for_test();
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 
     assert!(
         leader.upgrade_owner_proc().is_none(),
@@ -262,7 +259,7 @@ fn pending_syscall_return_drains_at_userspace_entry() {
 const A0_INDEX: usize = 10;
 
 fn install_saved_context(
-    payload: &tx_substrate::zone::PayloadCap<crate::thread_runtime::ThreadPayload>,
+    payload: &PayloadCap<crate::thread_runtime::ThreadPayload>,
 ) -> UserTrapContext {
     let mut ctx = UserTrapContext {
         regs: [0; 32],

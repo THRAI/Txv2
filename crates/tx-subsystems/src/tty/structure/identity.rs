@@ -12,20 +12,19 @@
 //!   in `tx-substrate` or a shared utility crate.
 //!
 //! `AtomicSlot<T>` previously lived here as a staging primitive; it now lives
-//! at `tx_substrate::AtomicSlot` and is consumed via the crate-root re-export.
+//! at `adapter::step_engine::AtomicSlot` and is consumed via the crate-root re-export.
 
 use alloc::sync::Arc;
 
-use tx_reactor::wait::Channel;
-use tx_substrate::bus::{RawPort, RawQueue};
-use tx_substrate::step_v3::WaitSourceId;
-use tx_substrate::wake::WaitSource;
-use tx_substrate::zone::{Dead, Entity, PayloadCap};
-use tx_substrate::{AtomicSlot, SpinMutex};
+use crate::tty::adapter::step_engine::{
+    AtomicSlot, Cap, Dead, Entity, PayloadCap, RawPort, RawQueue, SpinMutex, Weak,
+};
+use crate::tty::adapter::wait_routing::{Channel, WaitSource};
 
 use crate::wait_source;
 
 use super::payload::TtyPayload;
+use crate::tty::adapter::step_engine::{self as step_engine, WaitSourceId};
 
 // ---------------------------------------------------------------------------
 // Staging: FixedName<N>
@@ -84,8 +83,8 @@ pub struct SessionPgrp {
     pub session_id: u32,
     pub session_leader_pgid: u32,
     pub foreground_pgid: u32,
-    pub session: Option<tx_substrate::zone::Weak<crate::process::structure::Session>>,
-    pub foreground_pgrp: Option<tx_substrate::zone::Weak<crate::process::structure::ProcessGroup>>,
+    pub session: Option<Weak<crate::process::structure::Session>>,
+    pub foreground_pgrp: Option<Weak<crate::process::structure::ProcessGroup>>,
 }
 
 impl PartialEq for SessionPgrp {
@@ -126,8 +125,8 @@ impl SessionPgrp {
     /// downgrades to `Weak` refs so the TTY does not retain the
     /// session or pgrp itself.
     pub fn from_typed(
-        session: &tx_substrate::zone::Cap<crate::process::structure::Session>,
-        foreground_pgrp: &tx_substrate::zone::Cap<crate::process::structure::ProcessGroup>,
+        session: &Cap<crate::process::structure::Session>,
+        foreground_pgrp: &Cap<crate::process::structure::ProcessGroup>,
     ) -> Self {
         Self {
             session_id: session.sid.0,
@@ -142,22 +141,18 @@ impl SessionPgrp {
     /// the binding was constructed from a real session and that
     /// session is still alive. Returns `None` for legacy raw-id
     /// bindings or when the session has been dropped.
-    pub fn upgrade_session(
-        &self,
-    ) -> Option<tx_substrate::zone::Cap<crate::process::structure::Session>> {
+    pub fn upgrade_session(&self) -> Option<Cap<crate::process::structure::Session>> {
         let weak = self.session.as_ref()?;
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         weak.upgrade(&guard)
     }
 
     /// Upgrade the typed `Weak<ProcessGroup>` for the foreground pgrp
     /// to a strong `Cap<ProcessGroup>` if alive. Returns `None` for
     /// legacy raw-id bindings or when the pgrp has been dropped.
-    pub fn upgrade_foreground_pgrp(
-        &self,
-    ) -> Option<tx_substrate::zone::Cap<crate::process::structure::ProcessGroup>> {
+    pub fn upgrade_foreground_pgrp(&self) -> Option<Cap<crate::process::structure::ProcessGroup>> {
         let weak = self.foreground_pgrp.as_ref()?;
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         weak.upgrade(&guard)
     }
 }
@@ -345,8 +340,8 @@ impl TtyIdentity {
     /// `bind_session_pgrp(SessionPgrp::from_typed(session, fg))`.
     pub fn bind_session_pgrp_typed(
         &self,
-        session: &tx_substrate::zone::Cap<crate::process::structure::Session>,
-        foreground_pgrp: &tx_substrate::zone::Cap<crate::process::structure::ProcessGroup>,
+        session: &Cap<crate::process::structure::Session>,
+        foreground_pgrp: &Cap<crate::process::structure::ProcessGroup>,
     ) -> Option<SessionPgrp> {
         self.bind_session_pgrp(SessionPgrp::from_typed(session, foreground_pgrp))
     }
@@ -358,9 +353,7 @@ impl TtyIdentity {
     ///
     /// Used by signal-fanout paths that want to call
     /// `signal::step_kill_pgrp` against the foreground pgrp.
-    pub fn foreground_pgrp_cap(
-        &self,
-    ) -> Option<tx_substrate::zone::Cap<crate::process::structure::ProcessGroup>> {
+    pub fn foreground_pgrp_cap(&self) -> Option<Cap<crate::process::structure::ProcessGroup>> {
         self.session_pgrp.snapshot()?.upgrade_foreground_pgrp()
     }
 
@@ -372,9 +365,7 @@ impl TtyIdentity {
 impl Entity for TtyIdentity {
     type OperationalEvidence = PayloadCap<TtyPayload>;
 
-    fn upgrade_operational(
-        identity: &tx_substrate::zone::Cap<Self>,
-    ) -> Result<Self::OperationalEvidence, Dead> {
+    fn upgrade_operational(identity: &Cap<Self>) -> Result<Self::OperationalEvidence, Dead> {
         identity.live_payload().ok_or(Dead)
     }
 }
@@ -385,8 +376,7 @@ mod tests {
     use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
     use crate::execution::Guard;
     use crate::test_support::EPOCH_TEST_LOCK;
-    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
-    use tx_substrate::zone::{self, OperationalCapExt, PayloadCap};
+    use crate::tty::adapter::step_engine::{ByteProgress, OperationalCapExt, StepOutcome as V3};
 
     struct NoopOps;
 
@@ -409,7 +399,7 @@ mod tests {
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         crate::zones::register_all().expect("kernel zones");
         crate::tty::structure::registry::reset_for_tests();
         guard
@@ -419,14 +409,15 @@ mod tests {
     fn tty_operational_upgrade_returns_live_payload_and_fails_after_hangup() {
         let _g = setup();
 
-        let id_res = zone::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res = zone::reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let id_res = step_engine::reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res =
+            step_engine::reserve_for::<TtyPayload>().expect("tty payload reservation");
 
-        let tty = zone::sign_for(
+        let tty = step_engine::sign_for(
             id_res,
             TtyIdentity::new(TtyKind::SerialHardware, 9, "ttyS-operational"),
         );
-        let payload = PayloadCap::from_cap(zone::sign_for(
+        let payload = PayloadCap::from_cap(step_engine::sign_for(
             payload_res,
             TtyPayload::new_hardware(&NOOP_BINDING),
         ));

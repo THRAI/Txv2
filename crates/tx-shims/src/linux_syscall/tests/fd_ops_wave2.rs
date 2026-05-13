@@ -1,12 +1,13 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
+use crate::adapter::step_engine::{
+    self as step_engine, guard as ebr_guard, page_allocator, reserve_for, sign_for, Cap,
+    StepOutcome,
+};
 use alloc::sync::Arc;
 use alloc::vec;
-use tx_substrate::step_v3::StepOutcome;
-
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
-use tx_substrate::{page_allocator, zone};
 use tx_subsystems::cred::{step_setresuid, CapabilitySet, Uid};
 use tx_subsystems::cross_crate_test_support::clear_caps_for_test;
 use tx_subsystems::mount::{
@@ -68,8 +69,8 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
             RNodeBacking::Directory,
         )
         .with_containing_mount(&payload);
-        let res = zone::reserve_for::<RNode>().expect("rnode reservation");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
     };
 
     let _mount = MountIdentity::new_cap(
@@ -136,7 +137,7 @@ fn dispatch_openat_existing_file_o_rdonly_returns_fd() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 
@@ -203,7 +204,7 @@ fn dispatch_openat_o_creat_creates_new_file() {
     assert!(proc_cap.fd(fd as u32).is_some());
 
     // Verify the new inode landed in tmpfs's directory.
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let outcome = tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"new", &guard);
     assert!(
         matches!(outcome, StepOutcome::Done(_)),
@@ -223,7 +224,7 @@ fn dispatch_openat_o_creat_o_excl_existing_returns_neg_eexist() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 
@@ -261,7 +262,7 @@ fn dispatch_openat_o_trunc_truncates_existing() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let (file_id, _) =
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"big", 0o100644, &owner_cred, &guard) {
             StepOutcome::Done(out) => out,
@@ -277,7 +278,7 @@ fn dispatch_openat_o_trunc_truncates_existing() {
 
     // Verify the precondition.
     {
-        let guard = tx_substrate::epoch::guard();
+        let guard = ebr_guard();
         let meta = match tmpfs.load_inode_meta(file_id, &guard) {
             StepOutcome::Done(m) => m,
             other => panic!("load_inode_meta: {other:?}"),
@@ -301,7 +302,7 @@ fn dispatch_openat_o_trunc_truncates_existing() {
     }
 
     // Postcondition: tmpfs reports size 0 for the file.
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
         StepOutcome::Done(m) => m,
         other => panic!("load_inode_meta: {other:?}"),
@@ -322,7 +323,7 @@ fn dispatch_openat_o_cloexec_sets_fd_cloexec_bit() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 
@@ -432,7 +433,7 @@ fn dispatch_openat_no_read_perm_returns_neg_eacces() {
         gid: 0,
         effective_caps: CapabilitySet::EMPTY,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100000, &owner_cred, &guard);
     drop(guard);
 
@@ -473,7 +474,7 @@ fn dispatch_close_open_fd_returns_zero_and_clears_slot() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 
@@ -533,7 +534,7 @@ fn dispatch_close_clears_cloexec_bit() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 
@@ -580,7 +581,7 @@ fn dispatch_dup_returns_lowest_unused_fd_with_same_openfile() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 
@@ -648,7 +649,7 @@ fn dispatch_dup3_at_specific_fd_replaces_existing() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"a", 0o100644, &owner_cred, &guard);
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"b", 0o100644, &owner_cred, &guard);
     drop(guard);
@@ -714,7 +715,7 @@ fn dispatch_dup3_with_o_cloexec_sets_cloexec() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 
@@ -759,7 +760,7 @@ fn dispatch_dup3_same_fd_returns_neg_einval() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 
@@ -801,7 +802,7 @@ fn dispatch_dup3_invalid_flags_returns_neg_einval() {
         gid: 0,
         effective_caps: CapabilitySet::FULL,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = ebr_guard();
     let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     drop(guard);
 

@@ -14,8 +14,8 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU64;
 
-use tx_substrate::zone::Cap;
-use tx_substrate::SpinMutex;
+use crate::tty::adapter::step_engine::Cap;
+use crate::tty::adapter::step_engine::SpinMutex;
 
 use crate::device::CharDeviceBinding;
 use crate::tty::ldisc::on_termios_changed;
@@ -24,7 +24,7 @@ use crate::tty::structure::ring::TtyRing;
 use crate::tty::structure::termios::Termios;
 
 use super::identity::TtyIdentity;
-use tx_substrate::AtomicSlot;
+use crate::tty::adapter::step_engine::AtomicSlot;
 
 // ---------------------------------------------------------------------------
 // Ring capacities
@@ -321,8 +321,8 @@ mod tests {
     use super::*;
     use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
     use crate::execution::Guard;
+    use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3};
     use crate::tty::structure::termios::{ICANON, ISIG};
-    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
 
     struct NoopOps;
 

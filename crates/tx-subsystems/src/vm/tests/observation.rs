@@ -217,10 +217,10 @@ fn vm_msync_is_done_for_anon_only_address_space() {
         .commit()
         .expect("map");
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = crate::vm::adapter::step_engine::guard();
     assert_eq!(
         aspace.msync(range(0x14000, 2), &guard),
-        tx_substrate::step_v3::StepOutcome::Done(())
+        crate::vm::adapter::step_engine::StepOutcome::Done(())
     );
 }
 
@@ -237,9 +237,9 @@ fn vm_msync_skips_anon_page_containers_and_returns_done() {
         .commit()
         .expect("map");
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = crate::vm::adapter::step_engine::guard();
     assert_eq!(
         aspace.msync(range(0x16000, 2), &guard),
-        tx_substrate::step_v3::StepOutcome::Done(())
+        crate::vm::adapter::step_engine::StepOutcome::Done(())
     );
 }

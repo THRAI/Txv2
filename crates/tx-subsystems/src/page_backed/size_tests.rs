@@ -1,12 +1,12 @@
 use super::*;
 use crate::execution::Errno;
+use crate::page_backed::adapter::step_engine::{self as step_engine, StepOutcome as V3Out};
 use crate::vfs::{FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking};
-use tx_substrate::step_v3::StepOutcome as V3Out;
 
 fn setup_host_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    tx_test_support::init_host();
+    match step_engine::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for PageBacked size tests: {error:?}"),
     }
 }
@@ -48,7 +48,7 @@ fn page_container_size_starts_at_fixed_capacity() {
 fn pagebacked_step_read_uses_visible_size_not_capacity() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed size test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -71,7 +71,7 @@ fn pagebacked_step_read_uses_visible_size_not_capacity() {
 fn pagebacked_step_write_extends_visible_size_within_capacity() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed size test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -93,7 +93,7 @@ fn pagebacked_step_write_extends_visible_size_within_capacity() {
 fn pagebacked_step_write_rejects_growth_beyond_capacity_without_size_change() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed size test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,

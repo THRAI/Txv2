@@ -23,13 +23,13 @@ use alloc::vec::Vec;
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
+use crate::adapter::step_engine::{
+    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, SpinMutex, StepOutcome,
+};
 use tx_hal::{
     Arch, Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_substrate::page_allocator;
-use tx_substrate::zone::{self, Cap};
-use tx_substrate::SpinMutex;
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
@@ -246,10 +246,9 @@ impl ExecTestFs {
         // Truncate updates `pc.size_bytes()` to match POSIX semantics;
         // we set it directly via a guard-scoped `step_truncate` rather
         // than reaching into `set_size_bytes` (pub(crate)).
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         match tx_subsystems::page_backed::step_truncate(&pc, size, &guard) {
-            tx_substrate::step_v3::StepOutcome::Done(())
-            | tx_substrate::step_v3::StepOutcome::Continue { .. } => {}
+            StepOutcome::Done(()) | StepOutcome::Continue { .. } => {}
             other => panic!("step_truncate(pc, {size}) failed: {other:?}"),
         }
         drop(guard);
@@ -405,14 +404,13 @@ struct TestSetup {
 
 fn setup() -> TestSetup {
     let lock = SCRIPT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
     match page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+        Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for exec_script tests: {error:?}"),
     }
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
     reset_pid_counter();
     reset_tid_counter();
     reset_init_process();
@@ -442,8 +440,8 @@ fn build_fs_root() -> (Cap<DEntry>, Arc<ExecTestFs>) {
             RNodeBacking::Directory,
         )
         .with_containing_mount(&payload);
-        let res = zone::reserve_for::<RNode>().expect("rnode reservation");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
     };
 
     let _mount = MountIdentity::new_cap(
@@ -692,10 +690,10 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
         // materialise_rnode and produce a PageBacked RNode. Use the
         // root walker cred so the test isn't gated on tmpfs's mode
         // bits — the slice's DAC test coverage lives elsewhere.
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use step_engine::StepOutcome as V3;
         let cred = Credential::root();
         let cwd = process.cwd().expect("cwd bound");
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = block_on(tx_subsystems::vfs::walker::step_open(
             cwd,
             name,

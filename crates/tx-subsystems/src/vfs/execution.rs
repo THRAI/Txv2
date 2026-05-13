@@ -10,7 +10,9 @@ use alloc::sync::Arc;
 use crate::execution::Guard;
 use crate::page_backed::FsPageBacking;
 use crate::tty;
-use tx_substrate::step_v3::{ByteProgress, Errno, NoProgress, StepOutcome};
+use crate::vfs::adapter::step_engine::{
+    ByteProgress, Cap, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 
 use super::structure::{
     Credential, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileBacking, OpenFileIoctl,
@@ -38,7 +40,7 @@ use super::structure::{
 /// `FsOps` — canonical v3 filesystem operation vtable.
 ///
 /// 13 methods returning
-/// `tx_substrate::step_v3::StepOutcome<T, NoProgress>`. Defaults give
+/// `StepOutcome<T, NoProgress>`. Defaults give
 /// projection-only / device-only backends `ENOSYS` without per-impl
 /// boilerplate.
 ///
@@ -61,20 +63,20 @@ pub trait FsOps: Send + Sync + 'static {
         parent: FsObjectId,
         name: &[u8],
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<FsObjectId, NoProgress>;
 
     fn load_inode_meta(
         &self,
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<InodeMeta, NoProgress>;
 
     fn serialize_inode_meta(
         &self,
         fs_object_id: FsObjectId,
         meta: &InodeMeta,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<(), NoProgress>;
 
     fn create_inode(
         &self,
@@ -83,10 +85,7 @@ pub trait FsOps: Send + Sync + 'static {
         mode: u16,
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    >;
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress>;
 
     fn unlink(
         &self,
@@ -94,7 +93,7 @@ pub trait FsOps: Send + Sync + 'static {
         name: &[u8],
         target: FsObjectId,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<(), NoProgress>;
 
     fn rename(
         &self,
@@ -103,7 +102,7 @@ pub trait FsOps: Send + Sync + 'static {
         new_parent: FsObjectId,
         new_name: &[u8],
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<(), NoProgress>;
 
     fn link(
         &self,
@@ -111,7 +110,7 @@ pub trait FsOps: Send + Sync + 'static {
         name: &[u8],
         target: FsObjectId,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<(), NoProgress>;
 
     fn mkdir(
         &self,
@@ -120,10 +119,7 @@ pub trait FsOps: Send + Sync + 'static {
         mode: u16,
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    >;
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress>;
 
     fn rmdir(
         &self,
@@ -131,7 +127,7 @@ pub trait FsOps: Send + Sync + 'static {
         name: &[u8],
         target: FsObjectId,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<(), NoProgress>;
 
     fn symlink(
         &self,
@@ -140,10 +136,7 @@ pub trait FsOps: Send + Sync + 'static {
         link_target: &[u8],
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    >;
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress>;
 
     /// Per-call one-entry readdir. Cursor is a method input, not
     /// progress — the caller composes multi-entry enumerations by
@@ -156,16 +149,13 @@ pub trait FsOps: Send + Sync + 'static {
         fs_object_id: FsObjectId,
         cursor: super::structure::DirCursor,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        Option<(DirEntry, super::structure::DirCursor)>,
-        tx_substrate::step_v3::NoProgress,
-    >;
+    ) -> StepOutcome<Option<(DirEntry, super::structure::DirCursor)>, NoProgress>;
 
     fn destroy_inode(
         &self,
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<(), NoProgress>;
 
     /// Read a symlink's target bytes. Default returns `ENOSYS` (parity
     /// with [`FsOps::read_link`]).
@@ -173,12 +163,9 @@ pub trait FsOps: Send + Sync + 'static {
         &self,
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        alloc::boxed::Box<[u8]>,
-        tx_substrate::step_v3::NoProgress,
-    > {
+    ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
         let _ = (fs_object_id, guard);
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     /// Backend hook for materialising an `RNode` for a non-directory,
@@ -189,12 +176,9 @@ pub trait FsOps: Send + Sync + 'static {
         fs_object_id: FsObjectId,
         meta: InodeMeta,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        tx_substrate::zone::Cap<crate::vfs::structure::RNode>,
-        tx_substrate::step_v3::NoProgress,
-    > {
+    ) -> StepOutcome<Cap<crate::vfs::structure::RNode>, NoProgress> {
         let _ = (fs_object_id, meta, guard);
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     /// Update the inode's mode bits. Default returns `ENOSYS` (parity
@@ -205,9 +189,9 @@ pub trait FsOps: Send + Sync + 'static {
         new_mode: u16,
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         let _ = (fs_object_id, new_mode, cred, guard);
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     /// Update the inode's `(uid, gid)`. Default returns `ENOSYS`
@@ -219,9 +203,9 @@ pub trait FsOps: Send + Sync + 'static {
         new_gid: Option<u32>,
         cred: &Credential,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<(), NoProgress> {
         let _ = (fs_object_id, new_uid, new_gid, cred, guard);
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS)
     }
 }
 
@@ -420,6 +404,13 @@ impl OpenFile {
             // helper handles capacity checks, page materialisation,
             // `of.offset()` advance, and `PC.size` growth.
             RNodeBacking::PageBacked { pc } => {
+                // O_APPEND: seek to current EOF before each write. POSIX
+                // requires this seek-and-write to be atomic; our model
+                // approximates it by snapping the offset just before the
+                // write helper consumes it.
+                if self.flags.append {
+                    self.set_offset(pc.size_bytes());
+                }
                 crate::page_backed::step_write_from_kernel(pc, self, bytes, guard)
             }
             RNodeBacking::Symlink { .. } | RNodeBacking::Projected => {
@@ -465,7 +456,7 @@ impl OpenFile {
 }
 
 fn step_tty_ioctl(
-    tty_id: &tx_substrate::zone::Cap<crate::tty::structure::TtyIdentity>,
+    tty_id: &Cap<crate::tty::structure::TtyIdentity>,
     caller: OpenFileIoctlCaller<'_>,
     request: OpenFileIoctl<'_>,
     guard: &Guard<'_>,
@@ -544,20 +535,15 @@ fn step_tty_ioctl(
 
 /// `StepOp` wrap of [`OpenFile::step_read`].
 pub struct OpenFileReadOp<'a> {
-    pub file: &'a tx_substrate::zone::Cap<super::structure::OpenFile>,
+    pub file: &'a Cap<super::structure::OpenFile>,
     pub out: &'a mut [u8],
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
-    for OpenFileReadOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         self.file.step_read(self.out, self.guard)
     }
 }
@@ -565,41 +551,31 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepO
 /// `StepOp` wrap of [`OpenFile::step_lseek`]. `offset` / `whence` are
 /// scalar; stored by value.
 pub struct OpenFileLseekOp<'a> {
-    pub file: &'a tx_substrate::zone::Cap<super::structure::OpenFile>,
+    pub file: &'a Cap<super::structure::OpenFile>,
     pub offset: i64,
     pub whence: u32,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
-    for OpenFileLseekOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileLseekOp<'a> {
     type Output = u64;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         self.file.step_lseek(self.offset, self.whence, self.guard)
     }
 }
 
 /// `StepOp` wrap of [`OpenFile::step_write`].
 pub struct OpenFileWriteOp<'a> {
-    pub file: &'a tx_substrate::zone::Cap<super::structure::OpenFile>,
+    pub file: &'a Cap<super::structure::OpenFile>,
     pub bytes: &'a [u8],
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
-    for OpenFileWriteOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         self.file.step_write(self.bytes, self.guard)
     }
 }
@@ -607,21 +583,16 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepO
 /// `StepOp` wrap of [`OpenFile::step_ioctl`]. The caller / request enums
 /// borrow `'a`, so the wrap inherits the same lifetime.
 pub struct OpenFileIoctlOp<'a> {
-    pub file: &'a tx_substrate::zone::Cap<super::structure::OpenFile>,
+    pub file: &'a Cap<super::structure::OpenFile>,
     pub caller: OpenFileIoctlCaller<'a>,
     pub request: OpenFileIoctl<'a>,
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
-    for OpenFileIoctlOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileIoctlOp<'a> {
     type Output = OpenFileIoctlResult;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         self.file.step_ioctl(self.caller, self.request, self.guard)
     }
 }
@@ -637,22 +608,20 @@ mod step_op_wraps {
     use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
+    use crate::vfs::adapter::step_engine::{
+        guard, reserve_for, sign_for, Cap, PayloadCap, ProcessIdentity, ScriptCtx, StepOp,
+        StepOutcome as V3,
+    };
     use crate::vfs::structure::{
         FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, OpenFileIoctl,
         OpenFileIoctlCaller, OpenFileIoctlResult, RNode, RNodeBacking, StructPayload,
     };
     use crate::zones;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
-    use tx_substrate::zone::{self as zone_mod, Cap, PayloadCap};
 
     struct EchoOps;
 
     impl CharDeviceOps for EchoOps {
-        fn read(
-            &self,
-            out: &mut [u8],
-            _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, ByteProgress> {
+        fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             if out.is_empty() {
                 return V3::Done(0);
             }
@@ -660,11 +629,7 @@ mod step_op_wraps {
             V3::Done(1)
         }
 
-        fn write(
-            &self,
-            bytes: &[u8],
-            _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, ByteProgress> {
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             V3::Done(bytes.len())
         }
     }
@@ -678,10 +643,9 @@ mod step_op_wraps {
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _ = zones::register_all();
-        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        tx_test_support::drain_to_quiescence();
         crate::tty::structure::registry::reset_for_tests();
         guard
     }
@@ -709,13 +673,13 @@ mod step_op_wraps {
     }
 
     fn make_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
-        let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
-        let payload = PayloadCap::from_cap(zone_mod::sign_for(
+        let id_res = reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload = PayloadCap::from_cap(sign_for(
             payload_res,
             TtyPayload::new_hardware(&ECHO_BINDING),
         ));
-        let identity = zone_mod::sign_for(
+        let identity = sign_for(
             id_res,
             TtyIdentity::new(TtyKind::SerialHardware, index, name),
         );
@@ -769,7 +733,7 @@ mod step_op_wraps {
     #[test]
     fn read_op_delegates_to_step_read() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_char_open_file(true, false);
         let mut buf = [0u8; 4];
         let mut op = OpenFileReadOp {
@@ -777,7 +741,7 @@ mod step_op_wraps {
             out: &mut buf,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Done(n) => {
                 assert_eq!(n, 1);
@@ -790,7 +754,7 @@ mod step_op_wraps {
     #[test]
     fn read_op_propagates_einval_when_not_readable() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_char_open_file(false, true);
         let mut buf = [0u8; 4];
         let mut op = OpenFileReadOp {
@@ -798,7 +762,7 @@ mod step_op_wraps {
             out: &mut buf,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Err(e) => assert_eq!(e, Errno::EINVAL),
             other => panic!("expected Err(EINVAL), got {other:?}"),
@@ -808,14 +772,14 @@ mod step_op_wraps {
     #[test]
     fn write_op_delegates_to_step_write() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_char_open_file(false, true);
         let mut op = OpenFileWriteOp {
             file: &file,
             bytes: b"hello",
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Done(n) => assert_eq!(n, 5),
             other => panic!("expected Done(5), got {other:?}"),
@@ -825,14 +789,14 @@ mod step_op_wraps {
     #[test]
     fn write_op_propagates_einval_when_not_writable() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_char_open_file(true, false);
         let mut op = OpenFileWriteOp {
             file: &file,
             bytes: b"hi",
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Err(e) => assert_eq!(e, Errno::EINVAL),
             other => panic!("expected Err(EINVAL), got {other:?}"),
@@ -842,7 +806,7 @@ mod step_op_wraps {
     #[test]
     fn lseek_op_on_non_seekable_returns_espipe() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_char_open_file(true, false);
         let mut op = OpenFileLseekOp {
             file: &file,
@@ -850,7 +814,7 @@ mod step_op_wraps {
             whence: 0,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Err(e) => assert_eq!(e, Errno::ESPIPE),
             other => panic!("expected Err(ESPIPE), got {other:?}"),
@@ -860,7 +824,7 @@ mod step_op_wraps {
     #[test]
     fn lseek_op_on_directory_returns_eisdir() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_dir_open_file(true);
         let mut op = OpenFileLseekOp {
             file: &file,
@@ -868,7 +832,7 @@ mod step_op_wraps {
             whence: 0,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Err(e) => assert_eq!(e, Errno::EISDIR),
             other => panic!("expected Err(EISDIR), got {other:?}"),
@@ -878,7 +842,7 @@ mod step_op_wraps {
     #[test]
     fn ioctl_op_on_chardev_returns_enosys() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_char_open_file(true, true);
         // Construct an OpenFileIoctlCaller that does not require a real
         // process — `step_ioctl` short-circuits on chardev backings
@@ -898,7 +862,7 @@ mod step_op_wraps {
             request: OpenFileIoctl::Tcgets,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Err(e) => assert_eq!(e, Errno::ENOSYS),
             other => panic!("expected Err(ENOSYS), got {other:?}"),
@@ -908,7 +872,7 @@ mod step_op_wraps {
     #[test]
     fn ioctl_op_on_tty_returns_termios() {
         let _g = setup();
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let file = make_tty_open_file(true, true, 7, "ttyS7-wraptest");
         crate::process::execution::reset_init_process_for_test();
         crate::process::structure::reset_pid_counter_for_test();
@@ -924,7 +888,7 @@ mod step_op_wraps {
             request: OpenFileIoctl::Tcgets,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             V3::Done(OpenFileIoctlResult::Termios(_)) => {}
             other => panic!("expected Done(Termios), got {other:?}"),

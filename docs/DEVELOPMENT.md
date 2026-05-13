@@ -88,6 +88,7 @@ git -C external/humanlayer-reference sparse-checkout set '/.claude/*'
 cargo xtask doctor
 cargo xtask ci
 cargo xtask check
+cargo -q xtask unit
 ```
 
 Build and emulator commands:
@@ -127,6 +128,12 @@ cargo xtask lint docs
 The current milestone is compile-first, not boot-first. QEMU command generation
 and BusyBox image wiring are present so the next boot-stub milestone has a
 stable tool contract to build on.
+
+`cargo -q xtask unit` is the fast local check: builds tx-shims, tx-kernel,
+tx-ext4, and tx-scripts, then runs each `--lib` test suite with
+`--test-threads=1`. Output is one line per step on pass; on failure it shows
+only the failing test name, panic message, and failure list. The `-q` flag
+suppresses cargo's own build headers.
 
 `cargo xtask ci` is the fast CI-facing reporter. It prints concise pass/skip
 lines and expands failed checks with command, status, captured output, and
@@ -196,7 +203,7 @@ cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf \
 or via the test lane's flag:
 
 ```sh
-cargo xtask test busybox-smoke --target rv64-qemu --trap-trace
+cargo xtask test busybox-boot --target rv64-qemu --trap-trace
 ```
 
 Wire format (canonical, see

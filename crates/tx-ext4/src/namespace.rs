@@ -1,8 +1,5 @@
-use core::marker::Send;
-
-use alloc::boxed::Box;
+use step_engine::Guard;
 use tx_ext4_format::pager::{BlockImage, DirEntryLite};
-use tx_substrate::epoch::Guard;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::PageContainer;
 use tx_subsystems::vfs::structure::{
@@ -37,10 +34,11 @@ fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
 // `Advanced` / `Blocked` / `AdvancedThenBlocked` path through this
 // read-only backend today.
 //
-// Fully-qualified `tx_substrate::step_v3::*` references at the impl
+// Fully-qualified `adapter::step_engine::*` references at the impl
 // sites avoid clashing with `tx_subsystems::execution::Errno`
 // already in scope.
 
+use crate::adapter::step_engine::{self as step_engine, NoProgress, StepOutcome};
 use tx_subsystems::vfs::FsOps;
 
 /// Factory for `MountOutput::fs_ops`.
@@ -64,16 +62,16 @@ where
         parent: FsObjectId,
         name: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<FsObjectId, NoProgress> {
         let parent = match inode_no(parent) {
             Ok(parent) => parent,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
 
         match self.with_pager(|pager| pager.lookup(parent, name)) {
-            Ok(Some(inode)) => tx_substrate::step_v3::StepOutcome::done(inode_fs_object_id(inode)),
-            Ok(None) => tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into()),
-            Err(err) => tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Ok(Some(inode)) => StepOutcome::done(inode_fs_object_id(inode)),
+            Ok(None) => StepOutcome::err(Errno::ENOENT.into()),
+            Err(err) => StepOutcome::err(err.into()),
         }
     }
 
@@ -81,15 +79,15 @@ where
         &self,
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<InodeMeta, NoProgress> {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
 
         match self.with_pager(|pager| pager.inode_meta(inode)) {
-            Ok(meta) => tx_substrate::step_v3::StepOutcome::done(map_inode_meta(meta)),
-            Err(err) => tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Ok(meta) => StepOutcome::done(map_inode_meta(meta)),
+            Err(err) => StepOutcome::err(err.into()),
         }
     }
 
@@ -98,8 +96,8 @@ where
         _fs_object_id: FsObjectId,
         _meta: &InodeMeta,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn create_inode(
@@ -109,11 +107,8 @@ where
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn unlink(
@@ -122,8 +117,8 @@ where
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn rename(
@@ -133,8 +128,8 @@ where
         _new_parent: FsObjectId,
         _new_name: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn link(
@@ -143,8 +138,8 @@ where
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn mkdir(
@@ -154,11 +149,8 @@ where
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn rmdir(
@@ -167,8 +159,8 @@ where
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn symlink(
@@ -178,11 +170,8 @@ where
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn readdir(
@@ -190,37 +179,34 @@ where
         fs_object_id: FsObjectId,
         cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        tx_substrate::step_v3::NoProgress,
-    > {
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let index = match cursor_index(cursor) {
             Ok(index) => index,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         if index >= READDIR_WINDOW_ENTRIES {
-            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into());
+            return StepOutcome::err(Errno::ENOSYS.into());
         }
 
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
         let count = match self.with_pager(|pager| pager.read_dir_entries(inode, &mut entries)) {
             Ok(count) => count,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         if index >= count {
-            return tx_substrate::step_v3::StepOutcome::done(None);
+            return StepOutcome::done(None);
         }
 
         let entry = entries[index];
         let name = match InlineName::new(entry.name()) {
             Ok(name) => name,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err.into()),
         };
-        tx_substrate::step_v3::StepOutcome::done(Some((
+        StepOutcome::done(Some((
             DirEntry {
                 name,
                 fs_object_id: inode_fs_object_id(entry.inode),
@@ -234,8 +220,8 @@ where
         &self,
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn read_link(

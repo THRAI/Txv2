@@ -70,10 +70,10 @@ use tx_hal::{
     Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
 };
-use tx_reactor::userspace::SyscallRequest;
-use tx_substrate::page_allocator;
-use tx_substrate::step_v3::{CancelReason, OnBehalfOfAbort};
-use tx_substrate::zone::{self, Cap};
+use tx_shims::adapter::reactor_entry::SyscallRequest;
+use tx_shims::adapter::step_engine::{
+    self as zone, page_allocator, CancelReason, Cap, OnBehalfOfAbort,
+};
 use tx_subsystems::aio::{reset_context_id_counter_for_test, AioWorkerFuture, IOCB_CMD_PREAD};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
@@ -160,7 +160,7 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
     // The tmpfs (page-backed) file writes need the zero-frame page
     // installed; idempotent on re-entry.
@@ -168,8 +168,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
         Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for aio e2e: {error:?}"),
     }
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
     reset_pid_counter();
     reset_tid_counter();
     reset_init_process();
@@ -290,9 +289,9 @@ fn seed_file_content(file: &Cap<OpenFile>, content: &[u8]) {
         },
     )
     .expect("writer open file cap");
-    let guard = tx_substrate::epoch::guard();
+    let guard = zone::guard();
     match step_write_from_kernel(&pc, &writer, content, &guard) {
-        tx_substrate::step_v3::StepOutcome::Done(n) => assert_eq!(
+        zone::StepOutcome::Done(n) => assert_eq!(
             n,
             content.len(),
             "seed: step_write_from_kernel wrote {n}/{} bytes",

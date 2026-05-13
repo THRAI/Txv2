@@ -10,7 +10,6 @@ use crate::linux_syscall::{
 };
 
 const E_BADF: i32 = 9;
-const E_BUSY: i32 = 16;
 const E_FAULT: i32 = 14;
 const E_INVAL: i32 = 22;
 const E_NOTTY: i32 = 25;
@@ -208,11 +207,11 @@ fn dispatch_ioctl_tiocsctty_on_session_leader_succeeds() {
     assert_eq!(result, SyscallResult::Return(0));
 }
 
-/// `ioctl(tty_fd, TIOCSCTTY, 0)` returns `-EBUSY` if a previous
-/// caller has already bound the TTY (`step_ioctl_tiocsctty`'s
-/// already-bound check). Two TIOCSCTTY calls from the same
-/// session-leader caller exercise the dispatch path and the
-/// step's EBUSY rejection.
+/// `ioctl(tty_fd, TIOCSCTTY, 0)` returns `-EINVAL` when the same
+/// caller issues a second TIOCSCTTY. `step_ioctl_tiocsctty_for_process`
+/// sets `session.controlling_tty` on the first successful call, so
+/// `has_controlling_tty()` is true on re-entry and `require_session_leader`
+/// rejects with EINVAL before the EBUSY guard is reached.
 #[test]
 fn dispatch_ioctl_tiocsctty_on_already_bound_tty_returns_neg_ebusy() {
     let _setup = ioctl_setup();
@@ -227,7 +226,10 @@ fn dispatch_ioctl_tiocsctty_on_already_bound_tty_returns_neg_ebusy() {
 
     let req2 = SyscallRequest::new(NR_IOCTL, [0, TIOCSCTTY as u64, 0, 0, 0, 0]);
     let second = block_on(dispatch::<ShimsTestPmap>(req2, &ctx));
-    assert_eq!(second, SyscallResult::Error(E_BUSY));
+    // The process-aware path sets controlling_tty on success, so
+    // has_controlling_tty() is true on the second call and
+    // require_session_leader returns EINVAL before the EBUSY guard.
+    assert_eq!(second, SyscallResult::Error(E_INVAL));
 }
 
 /// `ioctl(tty_fd, 0xDEADBEEF, 0)` returns `-ENOTTY` — unknown

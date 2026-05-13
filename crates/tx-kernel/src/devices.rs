@@ -1,8 +1,8 @@
 use alloc::boxed::Box;
 use core::marker::PhantomData;
 
+use crate::adapter::step_engine::{NoProgress, StepOutcome};
 use tx_hal::{Arch, TxPlatform};
-use tx_substrate::step_v3::{NoProgress, StepOutcome};
 use tx_subsystems::device::{register_block_devices, BlockDeviceRegistration, DevT};
 
 pub struct KernelBlockDevices<P: TxPlatform> {

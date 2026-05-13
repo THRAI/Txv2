@@ -31,12 +31,14 @@
 //!   `aspace.fault_script`. The trap shell itself does not call
 //!   `fault_script` (cannot `.await`).
 
-use tx_hal::{FaultInfo, TrapAction, TrapFrameMut, TrapFrameView, TxPlatform};
-use tx_reactor::userspace::{
+use boot_runtime::userspace::{
     PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserAddr, UserspaceRunError,
     UserspaceRunSlot, UserspaceTrapInfo,
 };
+use tx_hal::{FaultInfo, TrapAction, TrapFrameMut, TrapFrameView, TxPlatform};
 
+use crate::adapter::boot_runtime;
+use crate::adapter::step_engine::PayloadCap;
 /// Re-export of the reactor's `SyscallRequest` so downstream crates
 /// (notably `tx-shims::linux_syscall::dispatch`) consume it through
 /// the kernel-level seam rather than reaching into the reactor crate
@@ -44,8 +46,7 @@ use tx_reactor::userspace::{
 /// `txdoc:REACTOR-USERSPACE-RUN-AS-A-WAIT`; this re-export is the
 /// trio plan's "Phase 1 surface" reference for everyone above the
 /// reactor.
-pub use tx_reactor::userspace::SyscallRequest;
-use tx_substrate::zone::PayloadCap;
+pub use boot_runtime::userspace::SyscallRequest;
 use tx_subsystems::thread_runtime::{current_thread_payload, ThreadPayload};
 
 /// Re-export of the reactor's [`PageFaultAccess`] for the trap-shell
@@ -57,7 +58,7 @@ pub type AccessKind = PageFaultAccess;
 /// `from_user` so the trap-shell branch (user vs. kernel page-fault)
 /// can be expressed in a single value.
 ///
-/// Distinct from `tx_reactor::userspace::PageFaultInfo`: that type is
+/// Distinct from `boot_runtime::userspace::PageFaultInfo`: that type is
 /// the resolved trap delivered to the userspace-run waiter (always
 /// from-user), while this carries the trap-shell decision input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -48,7 +48,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use tx_substrate::epoch;
-use tx_substrate::step_v3::{
+use tx_substrate::step::{
     with_on_behalf_of, AbortSignal, CancelReason, Credential, OnBehalfOfAbort, ProcessIdentity,
     RestrictionStackHandle, ScriptCtx, SubjectAuthority, SubjectContext, ThreadIdentity,
 };

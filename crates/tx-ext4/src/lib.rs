@@ -1,6 +1,7 @@
 //! tx-ext4 adapters.
 
-#![no_std]
+extern crate alloc;
+pub mod adapter;
 
 extern crate alloc;
 #[cfg(any(test, feature = "std"))]

@@ -4,8 +4,9 @@
 //! `Cap<Session>` / `Cap<ProcessGroup>` and exposes
 //! `TtyIdentity::foreground_pgrp_cap` for signal-fanout callers.
 
-use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::zone::{self, Cap, PayloadCap};
+use crate::tty::adapter::step_engine::{
+    guard, reserve_for, sign_for, ByteProgress, Cap, PayloadCap, StepOutcome,
+};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::Guard;
@@ -26,24 +27,15 @@ use crate::tty::structure::termios::TOSTOP;
 use crate::tty::structure::{SessionPgrp, TtyIdentity, TtyKind, TtyPayload};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
-use tx_substrate::step_v3::StepOutcome;
 
 struct NoopOps;
 
 impl CharDeviceOps for NoopOps {
-    fn read(
-        &self,
-        _out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(0)
     }
 
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(bytes.len())
     }
 }
@@ -57,10 +49,9 @@ static NOOP_BINDING: CharDeviceBinding = CharDeviceBinding {
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
     reset_pid_counter_for_test();
     reset_tid_counter_for_test();
     reset_init_process_for_test();
@@ -74,11 +65,11 @@ fn fresh_init() -> Cap<ProcessIdentity> {
 
 fn fresh_tty(name: &str) -> Cap<TtyIdentity> {
     let id = TtyIdentity::new(TtyKind::SerialHardware, 0, name);
-    let res = zone::reserve_for::<TtyIdentity>().expect("identity slot");
-    let cap = zone::sign_for(res, id);
+    let res = reserve_for::<TtyIdentity>().expect("identity slot");
+    let cap = sign_for(res, id);
     let payload_id = TtyPayload::new_hardware(&NOOP_BINDING);
-    let payload_res = zone::reserve_for::<TtyPayload>().expect("payload slot");
-    let payload_cap = zone::sign_for(payload_res, payload_id);
+    let payload_res = reserve_for::<TtyPayload>().expect("payload slot");
+    let payload_cap = sign_for(payload_res, payload_id);
     cap.install_payload(PayloadCap::from_cap(payload_cap));
     cap
 }
@@ -256,7 +247,7 @@ fn process_aware_tiocsctty_binds_tty_and_session_mirror() {
     let _g = setup();
     let init = fresh_init();
     let tty = fresh_tty("ttyS-bind-proc");
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     assert_eq!(
         step_ioctl_tiocsctty_for_process(&tty, &init, &guard),
@@ -283,7 +274,7 @@ fn process_aware_tiocnotty_clears_tty_and_session_links() {
     let _g = setup();
     let init = fresh_init();
     let tty = fresh_tty("ttyS-detach-proc");
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     let _ = step_ioctl_tiocsctty_for_process(&tty, &init, &guard);
     assert!(tty.session_pgrp().is_some());
@@ -310,7 +301,7 @@ fn process_aware_tiocspgrp_rebinds_foreground_to_typed_target() {
     let child_pgrp = child.pgrp_cap();
 
     let tty = fresh_tty("ttyS-fg-rebind");
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let _ = step_ioctl_tiocsctty_for_process(&tty, &init, &guard);
 
     assert_eq!(
@@ -338,13 +329,13 @@ fn step_read_for_process_posts_sigttin_to_background_caller_pgrp() {
     step_setpgid(&child, Pgid(child.pid.0)).expect("child pgrp");
 
     let tty = fresh_tty("ttyS-bg-read");
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let _ = step_ioctl_tiocsctty_for_process(&tty, &init, &guard);
 
     let mut out = [0u8; 1];
     assert_eq!(
         step_read_for_process(&tty, &mut out, &child, &guard),
-        StepOutcome::Err(tx_substrate::step_v3::Errno::EIO)
+        StepOutcome::Err(crate::tty::adapter::step_engine::Errno::EIO)
     );
     assert!(leader_pending(&child, Signum::SIGTTIN));
 }
@@ -357,7 +348,7 @@ fn step_write_for_process_posts_sigttou_to_background_caller_pgrp() {
     step_setpgid(&child, Pgid(child.pid.0)).expect("child pgrp");
 
     let tty = fresh_tty("ttyS-bg-write");
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let _ = step_ioctl_tiocsctty_for_process(&tty, &init, &guard);
 
     let mut termios = match step_ioctl_tcgets(&tty, &guard) {
@@ -371,7 +362,7 @@ fn step_write_for_process_posts_sigttou_to_background_caller_pgrp() {
     }
 
     {
-        use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
+        use crate::tty::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3Out};
         assert_eq!(
             step_write_for_process(&tty, b"x", &child, &guard),
             V3Out::Err(V3Errno::EIO)
@@ -542,7 +533,7 @@ fn step_hangup_exposes_typed_session_leader_pgrp_dispatch() {
     let tty = fresh_tty("ttyS-hup-typed");
     let session = init.pgrp_cap().session_cap();
     let pgrp = init.pgrp_cap();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     tty.bind_session_pgrp_typed(&session, &pgrp);
 

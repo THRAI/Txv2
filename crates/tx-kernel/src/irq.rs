@@ -13,14 +13,27 @@
 //! Per Open Q #6 the UART IRQ number flows through
 //! `<P as IrqIf>::UART_IRQ`; tx-kernel never names a board constant
 //! directly.
+//!
+//! # IRQ-context safety
+//!
+//! `uart_rx_irq_handler` is called inside an `enter_irq_context()` scope
+//! (irq_depth > 0), so it must **not** call `epoch::guard()` — the
+//! domain's `debug_assert!` would fire, and conceptually EBR guards are
+//! illegal in interrupt handlers anyway (re-entrant guard creation would
+//! stall reclaim indefinitely).
+//!
+//! The fix: the IRQ handler reads bytes from the UART FIFO and stores
+//! them in `UART_RX_PENDING` (a SpinMutex-protected ring buffer), then
+//! returns `IrqHandled::Wake` to reschedule the reactor.  The reactor
+//! loop calls `drain_uart_rx_pending` between task-poll iterations;
+//! that draining runs with irq_depth=0 and is free to create epoch
+//! guards and call `step_ingest`.
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
+use crate::adapter::step_engine::{self as step_engine, SpinMutex, StepOutcome};
 use tx_hal::{
     ConsoleIf, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, IRQ_DISPATCH_TABLE_SIZE,
 };
-use tx_substrate::SpinMutex;
+use tx_subsystems::tty::execution::step_ingest;
 
 /// The single global IRQ dispatch table tx-kernel publishes to the
 /// platform. The platform crate stores a raw `&'static
@@ -73,6 +86,30 @@ impl Drop for UartRxPendingGuard<'_> {
         self.pending.lock.store(false, Ordering::Release);
     }
 }
+
+/// Capacity of the deferred UART RX ring buffer.  Sized to hold several
+/// full lines of shell input without overflow.
+const UART_RX_PENDING_CAP: usize = 512;
+
+/// Bytes received via UART RX IRQ that have not yet been ingested into
+/// the TTY line discipline.  The IRQ handler fills this buffer (IRQ
+/// context, no epoch guard allowed); the reactor loop drains it via
+/// `drain_uart_rx_pending` (task context, epoch guard OK).
+struct UartRxPending {
+    bytes: [u8; UART_RX_PENDING_CAP],
+    len: usize,
+}
+
+impl UartRxPending {
+    const fn new() -> Self {
+        Self {
+            bytes: [0u8; UART_RX_PENDING_CAP],
+            len: 0,
+        }
+    }
+}
+
+static UART_RX_PENDING: SpinMutex<UartRxPending> = SpinMutex::new(UartRxPending::new());
 
 /// Register `handler` as the dispatch entry for IRQ number `irq`.
 ///
@@ -154,51 +191,21 @@ pub(crate) fn install_irq_handlers<P: IrqIf + ConsoleIf>() {
     <P as IrqIf>::unmask(irq);
 }
 
-pub(crate) fn drain_pending_uart_rx_into(buf: &mut [u8]) -> usize {
-    if buf.is_empty() {
-        return 0;
-    }
-    let Some(_guard) = UART_RX_PENDING.try_lock() else {
-        return 0;
-    };
-    let pending_len = UART_RX_PENDING.len.load(Ordering::Acquire);
-    if pending_len == 0 {
-        return 0;
-    }
-    let n = pending_len.min(buf.len());
-    unsafe {
-        let pending = &mut *UART_RX_PENDING.buf.get();
-        buf[..n].copy_from_slice(&pending[..n]);
-        let remaining = pending_len - n;
-        pending.copy_within(n..pending_len, 0);
-        UART_RX_PENDING.len.store(remaining, Ordering::Release);
-    }
-    n
-}
-
-#[cfg(test)]
-pub(crate) fn reset_pending_uart_rx_for_test() {
-    if let Some(_guard) = UART_RX_PENDING.try_lock() {
-        UART_RX_PENDING.len.store(0, Ordering::Release);
-    }
-}
-
-/// UART RX IRQ handler.
+/// UART RX IRQ handler. Drains pending bytes from the platform
+/// console FIFO via `ConsoleIf::read_bytes` and stores them in the
+/// `UART_RX_PENDING` ring buffer for deferred processing by
+/// `drain_uart_rx_pending` (called from the reactor loop in non-IRQ
+/// context).
 ///
-/// The IRQ path must not create an epoch guard or touch TTY structures:
-/// `epoch::guard()` is deliberately forbidden in interrupt context. Instead,
-/// the handler only reports that UART input is pending. The BSP reactor loop
-/// wakes, returns to normal kernel context, and drains the console through
-/// `CoreInit::drain_sbi_console_into_tty`.
+/// **IRQ-context safety**: this function runs with `irq_depth > 0` and
+/// therefore must NOT call `epoch::guard()`.  All TTY line-discipline
+/// work is deferred to `drain_uart_rx_pending`.
 ///
-/// Returns `IrqHandled::Wake` on any pending byte so the trap shell reschedules
-/// the reactor and the blocked `read` future can be re-polled after the normal
-/// context drain.
-/// Returns `IrqHandled::NotMine` if the console TTY hasn't been
-/// registered yet (boot race; `install_irq_handlers` runs after
-/// `register_console_hardware` so this should never happen in
-/// production, but the defensive check keeps a stray pre-boot IRQ
-/// from panicking).
+/// Returns `IrqHandled::Wake` when bytes were buffered (reactor should
+/// reschedule the blocked `read` future).  Returns `IrqHandled::Done`
+/// for spurious or already-drained IRQs.  Returns
+/// `IrqHandled::NotMine` if the console TTY hasn't been registered yet
+/// (defensive check against a stray pre-boot IRQ).
 pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
     if crate::init::console_tty().is_none() {
         return IrqHandled::NotMine;
@@ -217,12 +224,66 @@ pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
     let pending = unsafe { &mut *UART_RX_PENDING.buf.get() };
     let n = <P as ConsoleIf>::read_bytes(&mut pending[current..current + read_cap]);
     if n == 0 {
+        // Spurious IRQ or FIFO already drained.
         return IrqHandled::Done;
     }
-    UART_RX_PENDING
-        .len
-        .store(current + n.min(read_cap), Ordering::Release);
+    if crate::init::console_tty().is_none() {
+        // Pre-boot race: TTY not yet registered. Discard the bytes and
+        // return NotMine so the caller knows the IRQ was unexpected.
+        return IrqHandled::NotMine;
+    }
+    // Buffer bytes for non-IRQ ingestion. Bytes that overflow the
+    // pending buffer (UART_RX_PENDING_CAP) are silently dropped — this
+    // is acceptable for a boot console where the reactor loop drains
+    // frequently.
+    let mut pending = UART_RX_PENDING.lock();
+    let start = pending.len;
+    let space = UART_RX_PENDING_CAP - start;
+    let copy = n.min(space);
+    let end = start + copy;
+    pending.bytes[start..end].copy_from_slice(&buf[..copy]);
+    pending.len = end;
     IrqHandled::Wake
+}
+
+/// Drain any bytes buffered by `uart_rx_irq_handler` into the boot
+/// console TTY via `step_ingest`.
+///
+/// **Must be called from non-IRQ context** (irq_depth == 0) so that
+/// creating an epoch guard is legal.  The reactor loop calls this after
+/// every task-poll iteration (alongside `drain_sbi_console_into_tty`).
+///
+/// Returns number of bytes processed (0 if buffer was empty).
+///
+/// Note: when the FIFO/SBI buffer is large enough to swallow the entire
+/// inbound chunk via [`drain_sbi_console_into_tty`] during the same WFI
+/// wake, this returns 0 — the IRQ-deferred path is only exercised when
+/// the SBI poll buffer fills first. See the 2026-05-13 sizing note on
+/// `drain_sbi_console_into_tty` for why we keep both paths.
+pub(crate) fn drain_uart_rx_pending() -> usize {
+    // Snapshot and clear the pending buffer under the lock, then
+    // release before calling step_ingest (which takes its own locks).
+    let (bytes, n) = {
+        let mut pending = UART_RX_PENDING.lock();
+        if pending.len == 0 {
+            return 0;
+        }
+        let mut snapshot = [0u8; UART_RX_PENDING_CAP];
+        snapshot[..pending.len].copy_from_slice(&pending.bytes[..pending.len]);
+        let n = pending.len;
+        pending.len = 0;
+        (snapshot, n)
+    };
+
+    let Some(tty) = crate::init::console_tty() else {
+        return 0;
+    };
+    let guard = step_engine::guard();
+    use StepOutcome as V3Out;
+    match step_ingest(&tty, &bytes[..n], &guard) {
+        V3Out::Done(_) => n,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]

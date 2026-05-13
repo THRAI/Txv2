@@ -7,7 +7,9 @@ repository.workspace = true
 
 [dependencies]
 tx-ext4-format = { path = "../tx-ext4-format" }
+tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-substrate = { path = "../tx-substrate" }
+tx-test-support = { path = "../tx-test-support" }
 tx-subsystems = { path = "../tx-subsystems" }
 
 [features]

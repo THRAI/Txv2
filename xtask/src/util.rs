@@ -139,6 +139,61 @@ pub(crate) fn command_display(program: &str, args: &[&str]) -> String {
     shell_join(&parts)
 }
 
+pub(crate) struct CargoOutcome {
+    pub ok: bool,
+    /// Key summary line extracted from output (e.g. "test result: ok. 233 passed …").
+    pub summary: String,
+    /// Full combined stderr+stdout, always captured.
+    pub output: String,
+}
+
+/// Run `cargo` with `args`, capture all output, and extract the key summary line.
+/// Nothing is printed; the caller decides how to display the result.
+pub(crate) fn compact_cargo(root: &Path, args: &[&str]) -> CargoOutcome {
+    let result = Command::new("cargo").args(args).current_dir(root).output();
+
+    match result {
+        Ok(out) => {
+            let mut combined = String::from_utf8_lossy(&out.stderr).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&out.stdout));
+            let ok = out.status.success();
+            let summary = cargo_summary_line(&combined);
+            CargoOutcome {
+                ok,
+                summary,
+                output: combined,
+            }
+        }
+        Err(e) => CargoOutcome {
+            ok: false,
+            summary: String::new(),
+            output: format!("failed to start cargo: {e}"),
+        },
+    }
+}
+
+fn cargo_summary_line(output: &str) -> String {
+    for line in output.lines().rev() {
+        let t = line.trim();
+        if t.starts_with("test result:") {
+            return t.to_string();
+        }
+    }
+    for line in output.lines().rev() {
+        let t = line.trim();
+        if t.starts_with("Finished") {
+            return t.to_string();
+        }
+    }
+    output
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("ok")
+        .trim()
+        .to_string()
+}
+
 pub(crate) fn tail_lines(text: &str, max_lines: usize) -> String {
     let lines = text.lines().collect::<Vec<_>>();
     let start = lines.len().saturating_sub(max_lines);

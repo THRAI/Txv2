@@ -16,7 +16,7 @@ mod signal_frame;
 mod time;
 mod trap;
 mod user_access;
-pub use trap::{dispatch_trap_frame, return_to_userspace, Rv64TrapFrame};
+pub use trap::{dispatch_trap_frame, emit_panic_location, return_to_userspace, Rv64TrapFrame};
 
 use sbi::read_sbi_console_bytes;
 #[cfg(target_arch = "riscv64")]

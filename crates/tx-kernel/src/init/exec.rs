@@ -16,6 +16,7 @@
 // CoreInit<P>` block in this file augments the one in `init.rs`.
 
 use super::*;
+use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
@@ -127,12 +128,12 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Boot-time tmpfs ops are synchronous, so Continue/Yield are
         // unreachable and panic if they fire.
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use StepOutcome as V3;
 
         // 1. Create or look up `/bin` directory. Use `mkdir`; on
         //    EEXIST treat the existing dir as the parent.
         let bin_object_id = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.mkdir(root_object_id, b"bin", 0o040755, &cred, &guard);
             match outcome {
                 V3::Done((id, _)) => id,
@@ -149,7 +150,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // 2. Allocate the `/bin/sh` inode.
         let bytes = busybox_fixture::BUSYBOX_BYTES;
         let (file_id, file_meta) = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.create_inode(bin_object_id, b"sh", 0o100755, &cred, &guard);
             match outcome {
                 V3::Done(out) => out,
@@ -160,7 +161,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // 3. Materialise the inode's RNode and grab its
         //    `Cap<PageContainer>`.
         let pc = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
             let rnode = match outcome {
                 V3::Done(rnode) => rnode,
@@ -187,7 +188,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     tx_subsystems::page_backed::MaterializeAccess::Write,
                 )
                 .expect("register_busybox_into_tmpfs: materialize_anon");
-            let frame_base = tx_substrate::page_allocator::frame_kernel_addr(materialised.ppn)
+            let frame_base = page_allocator::frame_kernel_addr(materialised.ppn)
                 .expect("register_busybox_into_tmpfs: direct-map view");
             // SAFETY: `materialised.map_pin` keeps the page resident
             // for this scope; destination region covers exactly
@@ -201,7 +202,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // 5. Set the visible size via FsPageBacking::truncate.
         let size = bytes.len() as u64;
         {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             match fs_page_backing.truncate(file_id, size, &guard) {
                 V3::Done(()) => {}
                 other => panic!("register_busybox_into_tmpfs: truncate({size}): {other:?}"),
@@ -246,12 +247,12 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Boot-time tmpfs ops are synchronous, so Continue/Yield are
         // unreachable and panic if they fire.
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use StepOutcome as V3;
 
         // Allocate the inode. Bootstrap process is root by construction.
         let cred = Credential::root();
         let (file_id, file_meta) = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.create_inode(root_object_id, b"init", 0o100755, &cred, &guard);
             match outcome {
                 V3::Done(out) => out,
@@ -272,7 +273,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // `Cap<PageContainer>`. Tmpfs's Phase-7 override returns
         // `RNodeBacking::PageBacked { pc }` for regular files.
         let pc = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
             let rnode = match outcome {
                 V3::Done(rnode) => rnode,
@@ -299,7 +300,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     tx_subsystems::page_backed::MaterializeAccess::Write,
                 )
                 .expect("register_init_fixture_into_tmpfs: materialize_anon");
-            let frame_base = tx_substrate::page_allocator::frame_kernel_addr(materialised.ppn)
+            let frame_base = page_allocator::frame_kernel_addr(materialised.ppn)
                 .expect("register_init_fixture_into_tmpfs: direct-map view");
             // SAFETY: `materialised.map_pin` keeps the page resident
             // for the duration of this scope; the destination region
@@ -317,7 +318,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // reports the right `meta.size`).
         let size = bytes.len() as u64;
         {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             match fs_page_backing.truncate(file_id, size, &guard) {
                 V3::Done(()) => {}
                 other => panic!("register_init_fixture_into_tmpfs: truncate({size}): {other:?}"),
@@ -408,24 +409,6 @@ impl<P: TxPlatform> CoreInit<P> {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":bootstrap-exec:fallback:");
                 tx_hal::console_write_str::<P>(exec_error_tag(e));
-                // DIAGNOSTIC (temp, 2026-05-12): when the tag is
-                // `not-executable` the kernel's exec_script records a
-                // finer-grained site label in
-                // `tx_scripts::process::exec::LAST_NOTEXEC_SITE`. Emit
-                // that on the same line so the busybox loader gap can
-                // be triaged from the boot log alone.
-                if matches!(e, tx_scripts::process::exec::ExecError::NotExecutable) {
-                    tx_hal::console_write_str::<P>(":site=");
-                    tx_hal::console_write_str::<P>(
-                        tx_scripts::process::exec::script::last_notexec_site_label(),
-                    );
-                    tx_hal::console_write_str::<P>(":file_size=");
-                    Self::write_decimal_unsigned(
-                        tx_scripts::process::exec::script::LAST_EXEC_FILE_SIZE
-                            .load(core::sync::atomic::Ordering::Relaxed)
-                            as usize,
-                    );
-                }
                 tx_hal::console_write_str::<P>("\n");
             }
             Err(e) => {
@@ -512,26 +495,26 @@ impl<P: TxPlatform> CoreInit<P> {
     ///
     /// Cheap when no bytes are pending (`read_bytes` returns 0,
     /// the rest is skipped).
-    pub(crate) fn drain_pending_uart_rx_into_tty() -> usize {
-        let mut buf = [0u8; 64];
-        let n = crate::irq::drain_pending_uart_rx_into(&mut buf);
-        if n == 0 {
-            return 0;
-        }
-        let Some(tty) = console_tty() else { return 0 };
-        let guard = tx_substrate::epoch::guard();
-        let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
-        n
-    }
-
-    pub(crate) fn drain_sbi_console_into_tty() -> usize {
-        let mut buf = [0u8; 64];
+    pub(super) fn drain_sbi_console_into_tty() {
+        // 2026-05-13: bumped from 64 to 512 bytes to swallow whole shell
+        // command lines in a single SBI poll. The 64-byte cap left the
+        // 17-byte tail of an 81-character `ln -s` line stranded in the
+        // UART FIFO until the PLIC RX IRQ fired; the IRQ-deferred drain
+        // path then re-entered `step_ingest` and the `wait_channel.fire`
+        // it issued did not propagate to the parked `sys_read` task
+        // (root cause still under investigation — see the
+        // `tools/shell-tests/busybox-extended.txt` links/chmod-stat
+        // groups). Bumping the SBI buffer ensures most realistic shell
+        // input fits in one `step_ingest` call so the proven SBI-direct
+        // path handles it. The IRQ path stays in place so a quiescent
+        // WFI still wakes promptly when bytes arrive.
+        let mut buf = [0u8; 512];
         let n = <P as tx_hal::ConsoleIf>::read_bytes(&mut buf);
         if n == 0 {
             return 0;
         }
-        let Some(tty) = console_tty() else { return 0 };
-        let guard = tx_substrate::epoch::guard();
+        let Some(tty) = console_tty() else { return };
+        let guard = step_engine::guard();
         let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
         n
     }
@@ -616,34 +599,75 @@ impl<P: TxPlatform> CoreInit<P> {
                 Some(step) => step,
                 None => break,
             };
-            if step.should_idle() && !init.is_zombie() {
-                if Self::drain_sbi_console_into_tty() != 0 {
-                    continue;
-                }
-                const CONSOLE_POLL_NS: u64 = 5_000_000;
-                let poll_deadline = P::read_ns().saturating_add(CONSOLE_POLL_NS);
-                if step
-                    .next_deadline_ns
-                    .is_none_or(|deadline| deadline > poll_deadline)
-                {
-                    P::set_deadline_ns(poll_deadline);
+
+            // EBR drain. Caps retired during the task polls above
+            // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd
+            // table teardown, `Cap<ProcessPayload>` from
+            // `step_exit_group`) sit in the per-CPU retired list until
+            // an epoch advance lets them be reclaimed. Without this
+            // call, the retired list only auto-drains at
+            // `RETIRE_THRESHOLD = 64` items — too high for short
+            // pipelines, so `Drop for OpenFile`'s
+            // `decr_reader`/`decr_writer` (which signal pipe EOF/EPIPE
+            // by notifying the peer wait-source) never fires and
+            // blocked readers/writers hang.
+            //
+            // A bounded budget per iteration keeps per-iteration
+            // latency predictable. Two-level deferral chains
+            // (ProcessPayload → fd table → OpenFile) need ~4 drain
+            // rounds to fully propagate; iteration cadence (driven by
+            // task polls + 5 ms timer ticks) finishes that in well
+            // under a millisecond.
+            let drain_stats = step_engine::drain_with_budget(64);
+
+            // Don't enter WFI if EBR reclaimed anything (reclaim callbacks
+            // may have called wake_by_ref() on parked tasks, which is
+            // invisible to step.should_idle() computed before the drain) or
+            // if there are items still pending reclamation (need more epoch
+            // advances before they can be reclaimed).
+            let ebr_active = drain_stats.reclaimed > 0 || drain_stats.remaining > 0;
+            if step.should_idle() && !ebr_active && !init.is_zombie() {
+                // When the reactor has no pending deadline, the platform
+                // timer was cancelled by `program_hart_loop_deadline`.
+                // Re-arm it here so WFI wakes periodically — the drain
+                // calls below need to fire on every tick. This must only
+                // happen in the userspace reactor loop (not in boot smoke
+                // tests) because the timer interrupt fires
+                // `try_bounded_maintenance_tick`, which acquires zone
+                // locks that boot-time code may already hold.
+                if matches!(
+                    step.deadline_action,
+                    boot_runtime::hart_loop::HartLoopDeadlineAction::Cancel
+                ) {
+                    P::set_deadline_ns(
+                        P::read_ns().saturating_add(crate::init::IDLE_TIMER_PERIOD_NS),
+                    );
                 }
                 P::wait_for_interrupt_once();
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
                 }
-                // Drain SBI debug-console bytes into the boot
-                // console TTY on every wake. The QEMU virt UART
-                // path *should* deliver bytes via PLIC IRQ 10
-                // (`uart_rx_irq_handler`), but in our current
-                // configuration that doesn't fire — likely OpenSBI
-                // claims the UART in M-mode for its debug-console
-                // extension. As a fallback the BSP polls SBI on
-                // each idle wake (timer ticks fire ~every 5 ms in
-                // smoke; once we get IRQ-driven RX working this
-                // becomes redundant, but it's harmless when
-                // there are no buffered bytes).
+                // Drain UART RX bytes buffered by `uart_rx_irq_handler`
+                // during the preceding WFI sleep. The IRQ handler cannot
+                // call `epoch::guard()` (irq_depth > 0), so it stores raw
+                // bytes in `UART_RX_PENDING`; `drain_uart_rx_pending` runs
+                // here with irq_depth == 0 and feeds them to `step_ingest`.
+                let _ = crate::irq::drain_uart_rx_pending();
+                // Also poll the SBI debug-console as a fallback for
+                // platforms where the UART IRQ is claimed by firmware
+                // (e.g. OpenSBI M-mode UART handling). Harmless when the
+                // PLIC path is active since `read_bytes` returns 0 once the
+                // FIFO has already been drained by the IRQ handler.
                 Self::drain_sbi_console_into_tty();
+                // Flush deferred EBR drops so pipe write-end close
+                // propagates to blocked readers. OpenFile::drop() (which
+                // calls decr_writer → EOF signal) fires only when EBR
+                // reclaims the slot; without an explicit drain here the
+                // reactor never calls drain_with_budget unless the retired
+                // queue hits RETIRE_THRESHOLD=64, which a simple pipeline
+                // never reaches. This ensures EOF propagates within a
+                // few timer ticks (~20 ms) after the last writer closes.
+                let _ = step_engine::drain_with_budget(usize::MAX);
             }
         }
 

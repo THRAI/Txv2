@@ -17,7 +17,9 @@ doctest = false
 # (a `not(test)` global allocator that always returns null) does not
 # pollute test binaries that link tx-shims.
 tx-reactor = { path = "../tx-reactor" }
+tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-substrate = { path = "../tx-substrate" }
+tx-test-support = { path = "../tx-test-support" }
 tx-subsystems = { path = "../tx-subsystems" }
 # Pre-ELF Phase 6 (NR_EXECVE syscall arm): `sys_execve` calls
 # `tx_scripts::process::exec::exec_script` to drive the eight-phase

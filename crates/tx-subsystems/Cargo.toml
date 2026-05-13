@@ -20,8 +20,10 @@ test-support = []
 
 [dependencies]
 tx-hal = { path = "../tx-hal" }
+tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-reactor = { path = "../tx-reactor" }
 tx-substrate = { path = "../tx-substrate" }
+tx-test-support = { path = "../tx-test-support" }
 
 [dev-dependencies]
 tx-ext4-format = { path = "../tx-ext4-format" }
@@ -31,3 +33,4 @@ tx-ext4-format = { path = "../tx-ext4-format" }
 # D9-C's interrupt-wake pin both need multi-thread setup via
 # `process::execution::spawn_sibling_thread_for_test`).
 tx-subsystems = { path = ".", features = ["test-support"] }
+tx-test-support = { path = "../tx-test-support" }

@@ -55,11 +55,10 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_substrate::epoch;
-use tx_substrate::step_v3::{DelegateReply, DelegateState, DelegateTokenId, UfdReply};
-use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::wake::TaskMailbox;
-use tx_substrate::zone::Cap;
+use tx_subsystems::vm::adapter::step_engine::{
+    page_allocator, Cap, DelegateReply, DelegateState, DelegateTokenId, TaskMailbox,
+    TransitionOutcome, UfdReply,
+};
 
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
@@ -126,33 +125,21 @@ impl PmapIf for StubPmap {
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
     // The materialize_pagebacked tail of fault_script needs a zero
     // frame for the private-anon read fallback; mirror the vm-tests
     // setup so the resume tail can complete.
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    match page_allocator::claim_zero_frame() {
+        Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame: {error:?}"),
     }
-    drain_to_quiescence();
+    tx_test_support::drain_to_quiescence();
     reset_pid_counter();
     reset_tid_counter();
     reset_init_process();
     reset_ufd_id_counter_for_test();
     guard
-}
-
-fn drain_to_quiescence() {
-    let mut quiet = 0u32;
-    while quiet < 2 {
-        let stats = epoch::drain_with_budget(usize::MAX);
-        if stats.reclaimed == 0 {
-            quiet += 1;
-        } else {
-            quiet = 0;
-        }
-    }
 }
 
 // -------- Bounded reactor driver -----------------------------------
@@ -381,7 +368,7 @@ fn pr_10_phase_6_oneagent_canary_full_loop() {
                         );
                         assert_eq!(
                             reply_outcome,
-                            tx_substrate::step_v3::TransitionOutcome::Applied,
+                            TransitionOutcome::Applied,
                             "mark_replied transitions Pending → Replied",
                         );
                         handler_fired = true;
@@ -442,11 +429,7 @@ fn pr_10_phase_6_oneagent_canary_full_loop() {
     );
     let (_user_page, snapshot) = walked[0];
     let mut readback = alloc::vec![0u8; USER_PAGE_SIZE];
-    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(
-        snapshot.ppn,
-        0,
-        &mut readback,
-    );
+    page_allocator::testing::read_frame_bytes_for_test(snapshot.ppn, 0, &mut readback);
     assert!(
         readback.iter().all(|byte| *byte == handler_src_pattern),
         "every byte of the published page must equal the handler's \

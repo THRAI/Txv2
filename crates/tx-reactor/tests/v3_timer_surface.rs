@@ -8,8 +8,8 @@
 //! integration and any future consolidation with the internal
 //! `TimerQueue` keep the published contract stable.
 
+use tx_reactor::adapter::step_engine::Deadline;
 use tx_reactor::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
-use tx_substrate::step_v3::Deadline;
 
 #[test]
 fn timer_token_roundtrips_through_new_and_raw() {

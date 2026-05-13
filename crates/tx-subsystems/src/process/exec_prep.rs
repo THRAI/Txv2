@@ -7,7 +7,7 @@
 //! coherent "post-aspace-swap, pre-user-entry" group called only from
 //! the exec script.
 
-use tx_substrate::zone::Cap;
+use crate::process::adapter::step_engine::Cap;
 
 use crate::process::structure::ProcessIdentity;
 

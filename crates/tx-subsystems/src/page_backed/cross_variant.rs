@@ -1,4 +1,7 @@
 use super::*;
+use crate::page_backed::adapter::step_engine::{
+    self as step_engine, ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 
 /// Copy up to `len` bytes from `in_pc` at `in_offset` into `out_pc` at
 /// `out_offset` page-by-page.
@@ -27,8 +30,8 @@ pub fn step_copy_file_range(
     out_offset: u64,
     len: usize,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-    use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
+) -> StepOutcome<usize, ByteProgress> {
+    use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3};
     if len == 0 {
         return V3::done(0);
     }
@@ -81,18 +84,18 @@ pub fn step_copy_file_range(
         //   byte progress (or `EMPTY` when `advanced == 0`).
         // - `Yield { OnAgent .. }` → unsupported, surface `EIO`/partial.
         // - `Err(errno)` → `Err(errno)` (no progress yet) or partial `Done`.
-        use tx_substrate::step_v3::YieldShape;
+        use crate::page_backed::adapter::step_engine::YieldShape;
         let in_materialized = match in_pc.materialize_page(in_page, MaterializeAccess::Read, guard)
         {
-            tx_substrate::step_v3::StepOutcome::Done(m) => m,
-            tx_substrate::step_v3::StepOutcome::Continue { .. } => {
+            StepOutcome::Done(m) => m,
+            StepOutcome::Continue { .. } => {
                 if advanced == 0 {
-                    return V3::err(tx_substrate::step_v3::Errno::EAGAIN);
+                    return V3::err(step_engine::Errno::EAGAIN);
                 }
                 publish_progress(out_pc, out_offset, advanced);
                 return V3::done(advanced);
             }
-            tx_substrate::step_v3::StepOutcome::Yield {
+            StepOutcome::Yield {
                 shape:
                     YieldShape::OnWaitSource {
                         source: carrier,
@@ -114,14 +117,14 @@ pub fn step_copy_file_range(
                     interests.raw(),
                 );
             }
-            tx_substrate::step_v3::StepOutcome::Yield { .. } => {
+            StepOutcome::Yield { .. } => {
                 if advanced == 0 {
-                    return V3::err(tx_substrate::step_v3::Errno::EIO);
+                    return V3::err(step_engine::Errno::EIO);
                 }
                 publish_progress(out_pc, out_offset, advanced);
                 return V3::done(advanced);
             }
-            tx_substrate::step_v3::StepOutcome::Err(errno) => {
+            StepOutcome::Err(errno) => {
                 if advanced == 0 {
                     return V3::err(errno);
                 }
@@ -132,15 +135,15 @@ pub fn step_copy_file_range(
 
         let out_materialized =
             match out_pc.materialize_page(out_page, MaterializeAccess::Write, guard) {
-                tx_substrate::step_v3::StepOutcome::Done(m) => m,
-                tx_substrate::step_v3::StepOutcome::Continue { .. } => {
+                StepOutcome::Done(m) => m,
+                StepOutcome::Continue { .. } => {
                     if advanced == 0 {
-                        return V3::err(tx_substrate::step_v3::Errno::EAGAIN);
+                        return V3::err(step_engine::Errno::EAGAIN);
                     }
                     publish_progress(out_pc, out_offset, advanced);
                     return V3::done(advanced);
                 }
-                tx_substrate::step_v3::StepOutcome::Yield {
+                StepOutcome::Yield {
                     shape:
                         YieldShape::OnWaitSource {
                             source: carrier,
@@ -162,14 +165,14 @@ pub fn step_copy_file_range(
                         interests.raw(),
                     );
                 }
-                tx_substrate::step_v3::StepOutcome::Yield { .. } => {
+                StepOutcome::Yield { .. } => {
                     if advanced == 0 {
-                        return V3::err(tx_substrate::step_v3::Errno::EIO);
+                        return V3::err(step_engine::Errno::EIO);
                     }
                     publish_progress(out_pc, out_offset, advanced);
                     return V3::done(advanced);
                 }
-                tx_substrate::step_v3::StepOutcome::Err(errno) => {
+                StepOutcome::Err(errno) => {
                     if advanced == 0 {
                         return V3::err(errno);
                     }
@@ -233,15 +236,10 @@ pub struct CopyFileRangeOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
-    for CopyFileRangeOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for CopyFileRangeOp<'a> {
     type Output = usize;
-    type Progress = tx_substrate::step_v3::ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+    type Progress = ByteProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_copy_file_range(
             self.in_pc,
             self.in_offset,
@@ -258,12 +256,12 @@ mod step_op_wraps {
     use super::*;
     use crate::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
     use crate::test_support::EPOCH_TEST_LOCK;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
+    use step_engine::{PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome as V3};
 
     fn setup_host_substrate() {
-        tx_substrate::testing::init_host_for_test_once();
-        match tx_substrate::page_allocator::claim_zero_frame() {
-            Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+        tx_test_support::init_host();
+        match step_engine::page_allocator::claim_zero_frame() {
+            Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
             Err(error) => panic!("claim zero frame for cross-variant op tests: {error:?}"),
         }
     }
@@ -283,7 +281,7 @@ mod step_op_wraps {
             .lock()
             .expect("page-backed cross-variant op test lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let src = anon_pc(1);
         let dst = anon_pc(1);
         let mut op = CopyFileRangeOp {
@@ -294,7 +292,7 @@ mod step_op_wraps {
             len: 0,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3::done(0));
     }
 

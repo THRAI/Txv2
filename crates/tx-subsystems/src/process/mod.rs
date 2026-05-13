@@ -5,6 +5,7 @@
 //! `step_process_exit` (internal last-thread cascade). Signal state, credentials, rlimits, and
 //! fd-table land in follow-up passes.
 
+pub mod adapter;
 pub mod exec_prep;
 pub mod execution;
 pub mod structure;
