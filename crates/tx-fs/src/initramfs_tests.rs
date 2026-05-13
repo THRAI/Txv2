@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::tmpfs::adapter::step_engine::{self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, Errno, NoProgress, StepOutcome};
+use crate::tmpfs::adapter::step_engine::{guard, page_allocator, reserve_for, sign_for, Cap, Errno, NoProgress, StepOutcome};
 use tx_subsystems::initramfs::{unpack_into_root_mount, UnpackError};
 use tx_subsystems::mount::{MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel};
 use tx_subsystems::vfs::{

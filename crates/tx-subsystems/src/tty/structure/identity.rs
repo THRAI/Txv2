@@ -24,7 +24,7 @@ use crate::tty::adapter::wait_routing::{Channel, WaitSource};
 use crate::wait_source;
 
 use super::payload::TtyPayload;
-use crate::tty::adapter::step_engine::{self as step_engine, StepOp, SubjectIdentity, WaitSourceId};
+use crate::tty::adapter::step_engine::{self as step_engine, WaitSourceId};
 
 // ---------------------------------------------------------------------------
 // Staging: FixedName<N>
