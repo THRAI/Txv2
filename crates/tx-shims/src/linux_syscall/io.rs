@@ -5,6 +5,43 @@
 
 use super::*;
 
+fn tty_readable_level(
+    tty: &tx_substrate::zone::Cap<tx_subsystems::tty::structure::TtyIdentity>,
+) -> bool {
+    use tx_subsystems::tty::execution::TTY_READABLE;
+    tty.input_readable.peek() & TTY_READABLE != 0
+}
+
+async fn wait_for_tty_readable(
+    tty: tx_substrate::zone::Cap<tx_subsystems::tty::structure::TtyIdentity>,
+) {
+    use tx_reactor::wait::{Mask, WaitProtocol};
+    use tx_subsystems::tty::execution::TTY_READABLE;
+
+    let channel = tty.wait_channel().clone();
+    let condition_tty = tty.clone();
+    let _ = channel
+        .wait_event(
+            Mask::from_bits(TTY_READABLE),
+            WaitProtocol::Uninterruptible,
+            move || tty_readable_level(&condition_tty),
+        )
+        .await;
+}
+
+fn tty_backing_for_file(
+    file: &tx_substrate::zone::Cap<tx_subsystems::vfs::structure::OpenFile>,
+) -> Option<tx_substrate::zone::Cap<tx_subsystems::tty::structure::TtyIdentity>> {
+    use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
+
+    match file.rnode().backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty),
+        } => Some(tty.clone()),
+        _ => None,
+    }
+}
+
 /// `write(fd, buf, count)`.
 ///
 /// Phase 2a restriction (per the trio plan §"Part 2 — Syscall table"
@@ -188,7 +225,6 @@ pub static SYS_PPOLL_LAST_TIMEOUT_PTR: core::sync::atomic::AtomicU64 =
 ///   timer hookup ships with the OnTimer wave (deferred).
 /// - The signal mask is ignored.
 pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    use tx_subsystems::execution::WaitToken;
     use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
 
     SYS_PPOLL_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -226,7 +262,9 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // backing, write back `revents`, and remember the first TTY fd
     // that requested POLLIN but isn't currently readable. That fd's
     // wait source is what we park on if nothing is ready.
-    let mut park_on_carrier: Option<u64> = None;
+    let mut park_on_tty: Option<
+        tx_substrate::zone::Cap<tx_subsystems::tty::structure::TtyIdentity>,
+    > = None;
     let ready = loop {
         let mut ready: i64 = 0;
         for i in 0..nfds {
@@ -246,11 +284,10 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                             payload: StructPayload::Tty(tty),
                         } = file.rnode().backing()
                         {
-                            use tx_subsystems::tty::execution::TTY_READABLE;
-                            if tty.input_readable.peek() & TTY_READABLE != 0 {
+                            if tty_readable_level(tty) {
                                 revents |= POLLIN;
-                            } else if park_on_carrier.is_none() {
-                                park_on_carrier = Some(tty.wait_source_id());
+                            } else if park_on_tty.is_none() {
+                                park_on_tty = Some(tty.clone());
                             }
                         } else {
                             // Non-TTY backings: punt to the legacy
@@ -285,20 +322,12 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         if !wait_allowed {
             break 0;
         }
-        let Some(carrier_id) = park_on_carrier.take() else {
+        let Some(tty) = park_on_tty.take() else {
             // No carrier to park on (all fds non-TTY, none ready) —
             // give up rather than spin.
             break 0;
         };
-        use tx_subsystems::tty::execution::TTY_READABLE;
-        let token = WaitToken::new(carrier_id, TTY_READABLE);
-        if let Some(future) = wait_source::wait_on_token(token) {
-            let _ = future.await;
-        } else {
-            // Carrier not registered — fall through and return what
-            // we have rather than spinning forever.
-            break 0;
-        }
+        wait_for_tty_readable(tty).await;
     };
 
     SyscallResult::Return(ready)
@@ -646,11 +675,24 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                     return SyscallResult::Return(total as i64);
                 }
                 SYS_READ_YIELDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                let token = WaitToken::new(carrier.raw(), interests.raw());
-                if let Some(future) = wait_source::wait_on_token(token) {
-                    let _ = future.await;
+                if interests.raw() & tx_subsystems::tty::execution::TTY_READABLE != 0 {
+                    if let Some(tty) = tty_backing_for_file(&file) {
+                        wait_for_tty_readable(tty).await;
+                    } else {
+                        let token = WaitToken::new(carrier.raw(), interests.raw());
+                        if let Some(future) = wait_source::wait_on_token(token) {
+                            let _ = future.await;
+                        } else {
+                            SYS_READ_WAIT_NONE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 } else {
-                    SYS_READ_WAIT_NONE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    let token = WaitToken::new(carrier.raw(), interests.raw());
+                    if let Some(future) = wait_source::wait_on_token(token) {
+                        let _ = future.await;
+                    } else {
+                        SYS_READ_WAIT_NONE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
             V3Out::Yield {

@@ -570,7 +570,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 ),
                 tx_reactor::InitialSchedMeta::kernel()
                     .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
-            );
+            )
         });
         if submitted.is_none() {
             // Boot reactor not initialised; nothing to drive.
@@ -600,6 +600,9 @@ impl<P: TxPlatform> CoreInit<P> {
             if Self::drain_pending_uart_rx_into_tty() != 0 {
                 continue;
             }
+            if Self::drain_sbi_console_into_tty() != 0 {
+                continue;
+            }
 
             // Drain any pending child-thread submits posted from
             // sys_clone *before* polling the reactor again. This is
@@ -613,7 +616,6 @@ impl<P: TxPlatform> CoreInit<P> {
                 Some(step) => step,
                 None => break,
             };
-
             if step.should_idle() && !init.is_zombie() {
                 if Self::drain_sbi_console_into_tty() != 0 {
                     continue;

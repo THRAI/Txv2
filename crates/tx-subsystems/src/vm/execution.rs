@@ -121,7 +121,7 @@ impl AddressSpace {
                 .recipes
                 .commit_map(child_entry, MapPlacement::RequireFree)?;
             if private {
-                let _ = parent.pmap.teardown_range(range);
+                let _ = parent.pmap.protect_range(range, entry.prot.without_write());
             }
         }
 
