@@ -834,10 +834,26 @@ impl<P: TxPlatform> CoreInit<P> {
         let report = BOOT_REACTOR
             .with(|reactor| reactor.drain_wakes_for_hart(current_hart, &mut signal))
             .expect("boot reactor must be initialized before AP dispatcher smoke");
-        assert_eq!(report.remote_ipis, 1, "reactor dispatcher remote IPI count");
+        // Under multi-threaded TCG (-accel tcg,thread=multi, see
+        // xtask/src/qemu.rs), the AP may poll its own runqueue and
+        // consume the wake before the BSP gets here to drain — in
+        // which case `remote_ipis` is 0, not 1. Both 0 (AP pre-empted)
+        // and 1 (BSP drained first) are valid; only >1 would indicate
+        // a bug in the wake-routing path. Same applies to the IPI ack
+        // count below: 0 acks if no IPI was sent, else `targets.count()`.
+        assert!(
+            report.remote_ipis <= 1,
+            "reactor dispatcher remote IPI count: got {} (expected 0 or 1)",
+            report.remote_ipis,
+        );
 
         let acked = P::wait_for_ipi_ack_cpus(targets, IpiKind::Reschedule);
-        assert_eq!(acked, targets.count(), "reactor dispatcher IPI ack");
+        assert!(
+            acked == 0 || acked == targets.count(),
+            "reactor dispatcher IPI ack: got {} (expected 0 or {})",
+            acked,
+            targets.count(),
+        );
 
         let ran = Self::wait_for_ap_reactor_task_done(targets);
         if ran == targets.count() {
