@@ -430,7 +430,7 @@ impl PageContainer {
         access: MaterializeAccess,
         guard: &Guard<'_>,
     ) -> Result<MaterializedPage, PageCacheError> {
-        use tx_substrate::step::{StepOutcome as V3, YieldShape};
+        use adapter::step_engine::{StepOutcome as V3, YieldShape};
         match self.materialize_page(page, access, guard) {
             V3::Done(page) => Ok(page),
             V3::Err(errno) => Err(PageCacheError::Backend(errno.into())),

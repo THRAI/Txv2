@@ -804,7 +804,11 @@ fn build_qemu_command(root: &Path, target: TxTarget) -> Result<Vec<String>> {
         "-machine".into(),
         target.qemu_machine().to_string(),
         "-m".into(),
-        "256M".into(),
+        match target {
+            TxTarget::La64Qemu => "1152M",
+            TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => "256M",
+        }
+        .into(),
         "-smp".into(),
         "1".into(),
         "-display".into(),

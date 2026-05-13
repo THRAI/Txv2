@@ -27,19 +27,15 @@ use alloc::vec::Vec;
 
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::header::header64;
-#[allow(unused_imports)]
+#[cfg(not(target_arch = "loongarch64"))]
 use goblin::elf::header::EM_RISCV;
 use goblin::elf::header::{
     Header, EI_CLASS, EI_DATA, EI_VERSION, ELFCLASS64, ELFDATA2LSB, ET_EXEC, EV_CURRENT,
 };
 
-/// LoongArch64 machine type (goblin 0.10.x does not export this constant).
-#[allow(dead_code)]
-const EM_LOONGARCH: u16 = 0x102;
-
 /// Expected `e_machine` for this kernel build.
 #[cfg(target_arch = "loongarch64")]
-const EXPECTED_E_MACHINE: u16 = EM_LOONGARCH;
+const EXPECTED_E_MACHINE: u16 = 0x102;
 #[cfg(not(target_arch = "loongarch64"))]
 const EXPECTED_E_MACHINE: u16 = EM_RISCV;
 use goblin::elf::program_header::{

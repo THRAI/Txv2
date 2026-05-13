@@ -335,12 +335,6 @@ fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
         "buffered bytes should request a reactor wake",
     );
 
-    // Drain the deferred buffer the way the reactor loop does on every
-    // WFI return.
-    let drained = crate::irq::drain_uart_rx_pending();
-    assert_eq!(drained, 2, "drain_uart_rx_pending should consume X\\n");
-
-    // Console TTY input queue should now contain the committed line.
     let tty = console_tty().expect("CONSOLE_TTY populated by register_console_hardware");
     let payload = tty
         .live_payload()
@@ -359,7 +353,10 @@ fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
     });
     assert!(before.is_empty(), "IRQ handler must not ingest into TTY");
 
-    CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty();
+    // Drain the deferred buffer the way the reactor loop does on every
+    // WFI return.
+    let drained = CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty();
+    assert_eq!(drained, 2, "drain_uart_rx_pending should consume X\\n");
 
     // Normal-context drain should now contain the committed line.
     let snapshot: std::vec::Vec<u8> = payload.with_input_queue(|queue| {

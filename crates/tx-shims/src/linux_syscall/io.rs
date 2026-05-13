@@ -4,19 +4,17 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use crate::adapter::reactor_entry;
+use crate::adapter::step_engine::Cap;
 use crate::adapter::step_engine::{self as step_engine};
 
-fn tty_readable_level(
-    tty: &tx_substrate::zone::Cap<tx_subsystems::tty::structure::TtyIdentity>,
-) -> bool {
+fn tty_readable_level(tty: &Cap<tx_subsystems::tty::structure::TtyIdentity>) -> bool {
     use tx_subsystems::tty::execution::TTY_READABLE;
     tty.input_readable.peek() & TTY_READABLE != 0
 }
 
-async fn wait_for_tty_readable(
-    tty: tx_substrate::zone::Cap<tx_subsystems::tty::structure::TtyIdentity>,
-) {
-    use tx_reactor::wait::{Mask, WaitProtocol};
+async fn wait_for_tty_readable(tty: Cap<tx_subsystems::tty::structure::TtyIdentity>) {
+    use reactor_entry::{Mask, WaitProtocol};
     use tx_subsystems::tty::execution::TTY_READABLE;
 
     let channel = tty.wait_channel().clone();
@@ -28,19 +26,6 @@ async fn wait_for_tty_readable(
             move || tty_readable_level(&condition_tty),
         )
         .await;
-}
-
-fn tty_backing_for_file(
-    file: &tx_substrate::zone::Cap<tx_subsystems::vfs::structure::OpenFile>,
-) -> Option<tx_substrate::zone::Cap<tx_subsystems::tty::structure::TtyIdentity>> {
-    use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
-
-    match file.rnode().backing() {
-        RNodeBacking::StructBacked {
-            payload: StructPayload::Tty(tty),
-        } => Some(tty.clone()),
-        _ => None,
-    }
 }
 
 /// `write(fd, buf, count)`.
@@ -253,9 +238,7 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // backing, write back `revents`, and remember the first TTY fd
     // that requested POLLIN but isn't currently readable. That fd's
     // wait source is what we park on if nothing is ready.
-    let mut park_on_tty: Option<
-        tx_substrate::zone::Cap<tx_subsystems::tty::structure::TtyIdentity>,
-    > = None;
+    let mut park_on_tty: Option<Cap<tx_subsystems::tty::structure::TtyIdentity>> = None;
     let ready = loop {
         let mut ready: i64 = 0;
         for i in 0..nfds {

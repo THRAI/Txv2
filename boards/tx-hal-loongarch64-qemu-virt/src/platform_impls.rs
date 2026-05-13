@@ -447,6 +447,7 @@ impl TrapIf for Platform {
 
         #[cfg(not(target_arch = "loongarch64"))]
         unsafe {
+            let _ = root;
             let mut frame = La64TrapFrame::empty();
             frame.r = ctx.regs;
             frame.r[0] = 0;

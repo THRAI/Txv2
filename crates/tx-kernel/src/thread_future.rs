@@ -85,7 +85,7 @@ use boot_runtime::userspace::{
     PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserspaceEntryDecision,
     UserspaceTrapInfo,
 };
-use tx_hal::{PercpuIf, PmapIf, TrapIf, TxPlatform};
+use tx_hal::{PercpuIf, TrapIf, TxPlatform};
 use tx_subsystems::process::execution::step_exit_group_with_signal;
 use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;

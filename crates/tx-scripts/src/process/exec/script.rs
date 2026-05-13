@@ -255,7 +255,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         use StepOutcome as V3;
         let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
         let outcome = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             poll_walker_synchronously(step_open(
                 rooted_at,
                 path,

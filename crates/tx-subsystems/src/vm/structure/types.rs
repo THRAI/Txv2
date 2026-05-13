@@ -5,6 +5,7 @@ use crate::page_backed::{
     PageIndex,
 };
 use crate::vm::adapter::step_engine::Cap;
+use step_engine::guard;
 use step_engine::page_allocator::{self, ZeroPolicy};
 
 use super::private::{
@@ -686,7 +687,7 @@ impl VmFaultOutcome {
             AccessMode::Write => MaterializeAccess::Write,
             _ => MaterializeAccess::Read,
         };
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let page = pc
             .materialize_page_now(page_index, access, &guard)
             .map_err(VmFaultError::PageCache)?;
@@ -842,7 +843,7 @@ impl VmFaultOutcome {
                 if access_byte >= pc.size_bytes() {
                     return Err(VmFaultError::PageBeyondSize);
                 }
-                let guard = tx_substrate::epoch::guard();
+                let guard = guard();
                 pc.materialize_page_now(page_index, MaterializeAccess::Read, &guard)
                     .map_err(VmFaultError::PageCache)?
             }
@@ -878,7 +879,7 @@ impl VmFaultOutcome {
                 if access_byte >= pc.size_bytes() {
                     return Err(VmFaultError::PageBeyondSize);
                 }
-                let guard = tx_substrate::epoch::guard();
+                let guard = guard();
                 let source = pc
                     .materialize_page_now(page_index, MaterializeAccess::Read, &guard)
                     .map_err(VmFaultError::PageCache)?;

@@ -940,7 +940,7 @@ fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
         stx_nlink: meta.nlinks,
         stx_uid: meta.uid,
         stx_gid: meta.gid,
-        stx_mode: (meta.mode & 0xffff) as u16,
+        stx_mode: meta.mode,
         __spare0: 0,
         stx_ino: ino,
         stx_size: meta.size,
@@ -1043,9 +1043,9 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             None => return SyscallResult::Error(ENOENT_VALUE),
         };
         let walker_cred = ctx.walker_cred();
-        use tx_substrate::step::StepOutcome as V3;
+        use step_engine::StepOutcome as V3;
         let outcome = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard))
         };
         match outcome {
