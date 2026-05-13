@@ -243,8 +243,16 @@ impl FsOps for Tmpfs {
         match state.inodes.get(&fs_object_id) {
             Some(inode) => {
                 let mut meta = inode.meta;
-                if let TmpfsPayload::RegularFile { size, .. } = &inode.payload {
-                    meta.size = *size;
+                // For regular files the authoritative size lives in
+                // the PageContainer: writes via `step_write_from_*`
+                // call `pc.grow_size_to`, which the cached
+                // `payload.size`/`meta.size` do not observe (the
+                // syscall path doesn't round-trip through tmpfs).
+                // Truncate keeps both fields in sync, but a plain
+                // `write(2)` only bumps `pc.size_bytes`. Report that
+                // as the visible `st_size`.
+                if let TmpfsPayload::RegularFile { container, .. } = &inode.payload {
+                    meta.size = container.size_bytes();
                 }
                 StepOutcome::done(meta)
             }
@@ -318,6 +326,16 @@ impl FsOps for Tmpfs {
                 );
             }
         };
+        // A fresh file has no addressable bytes. `PageContainer::new`
+        // initialises `size_bytes` to the page-count capacity (right
+        // for VM anon backings, where any unwritten page reads as
+        // zero); for a file-backed container the visible byte size
+        // must start at 0 so reads return `Done(0)` (EOF) until a
+        // write or truncate raises the bound. Without this, `cat`
+        // on a 14-byte file we just wrote would keep reading until
+        // the container's full 4 MiB capacity, surfacing zeros past
+        // the actual content.
+        container.set_size_bytes(0);
 
         let new_id = self.alloc_object_id();
         let mut meta = InodeMeta::new(InodeKind::Regular, mode);
