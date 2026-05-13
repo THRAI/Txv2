@@ -312,9 +312,16 @@ fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
     // Fake UART bytes ready in the platform's RX source. The boot
     // console TTY runs in cooked mode (ICANON), so a complete line
     // (`X\n`) is required for the ldisc to flush bytes into the
-    // user-visible input queue. The IRQ-side semantics are
-    // unchanged: every IRQ handler invocation drains the platform's
-    // RX FIFO and feeds it to step_ingest in one shot.
+    // user-visible input queue.
+    //
+    // 2026-05-13: Per the IRQ-context-safety rewrite, the handler no
+    // longer calls `step_ingest` inline (epoch::guard's
+    // `debug_assert!` rejects creation in IRQ context). Bytes land in
+    // `UART_RX_PENDING` instead, and `drain_uart_rx_pending` is the
+    // non-IRQ counterpart that feeds them to the line discipline. The
+    // test exercises both halves to match the production wiring (the
+    // reactor loop calls `drain_uart_rx_pending` after every WFI
+    // wake).
     {
         let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         queue.extend_from_slice(b"X\n");
@@ -324,8 +331,13 @@ fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
     assert_eq!(
         handled,
         IrqHandled::Wake,
-        "ingest of a complete line should request a reactor wake",
+        "buffered bytes should request a reactor wake",
     );
+
+    // Drain the deferred buffer the way the reactor loop does on every
+    // WFI return.
+    let drained = crate::irq::drain_uart_rx_pending();
+    assert_eq!(drained, 2, "drain_uart_rx_pending should consume X\\n");
 
     // Console TTY input queue should now contain the committed line.
     let tty = console_tty().expect("CONSOLE_TTY populated by register_console_hardware");

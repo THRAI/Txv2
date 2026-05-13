@@ -2,39 +2,6 @@
 
 use core::sync::atomic::Ordering;
 
-/// DIAGNOSTIC (temp, 2026-05-12): bucket counters for each step_read
-/// early-return so we can see which branch fires on the post-prompt
-/// EOF gap.
-pub static STEP_READ_OUT_EMPTY: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static STEP_READ_FGPGRP_ERR: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static STEP_READ_TTY_DEAD: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static STEP_READ_EOF_PENDING: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static STEP_READ_VMIN_NONE: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static STEP_READ_VMIN_ZERO_EMPTY: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static STEP_READ_VMIN_NONZERO: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static STEP_READ_THRESHOLD_UNMET: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static STEP_READ_DRAINED: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static STEP_READ_YIELD_NONCANON_EMPTY: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-/// Raw c_lflag from the most recent step_read termios snapshot.
-pub static STEP_READ_LAST_LFLAG: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0xdead_beef);
-/// Raw c_cc[VMIN] from the most recent step_read termios snapshot.
-pub static STEP_READ_LAST_VMIN: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0xdead_beef);
-/// Raw c_cc[VTIME] from the most recent step_read termios snapshot.
-pub static STEP_READ_LAST_VTIME: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0xdead_beef);
-
 use tx_substrate::zone::Cap;
 
 use crate::execution::Guard;
@@ -57,45 +24,32 @@ pub fn step_read(
     use tx_substrate::step_v3::{ByteProgress, StepOutcome as V3};
 
     if out.is_empty() {
-        STEP_READ_OUT_EMPTY.fetch_add(1, Ordering::Relaxed);
         return V3::Done(0);
     }
 
     if let Err(err) = require_fg_pgrp(tty, guard) {
-        STEP_READ_FGPGRP_ERR.fetch_add(1, Ordering::Relaxed);
         return V3::Err(err.into());
     }
 
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
         Err(err) => {
-            STEP_READ_TTY_DEAD.fetch_add(1, Ordering::Relaxed);
             return V3::Err(err.into());
         }
     };
 
     if payload.eof_pending.swap(false, Ordering::AcqRel) {
-        STEP_READ_EOF_PENDING.fetch_add(1, Ordering::Relaxed);
         tty.input_readable.clear(TTY_READABLE);
         return V3::Done(0);
     }
 
     let vmin_policy = payload.with_termios(|termios| {
-        STEP_READ_LAST_LFLAG.store(termios.c_lflag, Ordering::Relaxed);
-        STEP_READ_LAST_VMIN.store(termios.c_cc[VMIN] as u32, Ordering::Relaxed);
-        STEP_READ_LAST_VTIME.store(termios.c_cc[VTIME] as u32, Ordering::Relaxed);
         if termios.c_lflag & ICANON != 0 || termios.c_cc[VTIME] != 0 {
             None
         } else {
             Some(termios.c_cc[VMIN] as usize)
         }
     });
-
-    match vmin_policy {
-        None => STEP_READ_VMIN_NONE.fetch_add(1, Ordering::Relaxed),
-        Some(0) => STEP_READ_VMIN_ZERO_EMPTY.fetch_add(1, Ordering::Relaxed),
-        Some(_) => STEP_READ_VMIN_NONZERO.fetch_add(1, Ordering::Relaxed),
-    };
 
     let mut threshold_unmet = false;
     let copied = payload.with_input_queue(|queue| {
@@ -116,13 +70,6 @@ pub fn step_read(
         }
         copied
     });
-    if threshold_unmet {
-        STEP_READ_THRESHOLD_UNMET.fetch_add(1, Ordering::Relaxed);
-    } else if copied == 0 && vmin_policy.is_none() {
-        STEP_READ_YIELD_NONCANON_EMPTY.fetch_add(1, Ordering::Relaxed);
-    } else if copied > 0 {
-        STEP_READ_DRAINED.fetch_add(1, Ordering::Relaxed);
-    }
 
     // Pre-ELF Phase 5 (item 9): the wait source is the TTY
     // identity's `wait_channel`, registered with the global
