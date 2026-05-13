@@ -566,7 +566,7 @@ impl<P: TxPlatform> CoreInit<P> {
             // rounds to fully propagate; iteration cadence (driven by
             // task polls + 5 ms timer ticks) finishes that in well
             // under a millisecond.
-            let drain_stats = tx_substrate::epoch::drain_with_budget(64);
+            let drain_stats = step_engine::drain_with_budget(64);
 
             // Don't enter WFI if EBR reclaimed anything (reclaim callbacks
             // may have called wake_by_ref() on parked tasks, which is
