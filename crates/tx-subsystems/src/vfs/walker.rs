@@ -385,7 +385,7 @@ fn walk_inner_v3<'g>(
                 .and_then(|payload| mount::mount_for(payload, child_fs_object_id)),
         };
         if let Some(mount_cap) = crossing_mount {
-            current = match dentry_for_mount_root(&mount_cap) {
+            current = match dentry_for_mount_root(&mount_cap, Some(&child_dentry)) {
                 Ok(d) => d,
                 Err(err) => return V3::err(err.into()),
             };
@@ -536,8 +536,14 @@ fn check_open_perm(meta: &InodeMeta, flags: OpenFileFlags, cred: &Credential) ->
 /// Build a `Cap<DEntry>` over a mount's root RNode. Used when the
 /// walker crosses a mount boundary or restarts from the namespace
 /// root for an absolute symlink target.
-fn dentry_for_mount_root(mount: &Cap<MountIdentity>) -> Result<Cap<DEntry>, Errno> {
-    let raw = DEntry::new(InlineName::ROOT, mount.root().clone());
+fn dentry_for_mount_root(
+    mount: &Cap<MountIdentity>,
+    mount_point: Option<&Cap<DEntry>>,
+) -> Result<Cap<DEntry>, Errno> {
+    let mut raw = DEntry::new(InlineName::ROOT, mount.root().clone());
+    if let Some(parent) = mount_point {
+        raw.set_parent_hint(parent);
+    }
     let res = tx_substrate::zone::reserve_for::<DEntry>().map_err(|_| Errno::ENOMEM)?;
     Ok(tx_substrate::zone::sign_for(res, raw))
 }

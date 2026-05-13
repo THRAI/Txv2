@@ -751,6 +751,44 @@ impl<P: TxPlatform> CoreInit<P> {
 
         *MUSL_MOUNT.lock() = Some(musl_mount);
 
+        // Seed /bin/sh → /musl/musl/busybox in the rootfs tmpfs so
+        // that shebang scripts (e.g. run-all.sh #!/bin/sh) resolve
+        // correctly when no initramfs is loaded (the oscomp boot path
+        // does not pass -initrd). Both steps tolerate EEXIST so a
+        // baked initramfs or busybox_baked path that ran first wins.
+        {
+            let guard = tx_substrate::epoch::guard();
+            let bin_id = match rootfs_payload.fs_ops.mkdir(
+                tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+                b"bin",
+                0o755,
+                &cred,
+                &guard,
+            ) {
+                V3::Done((id, _)) => id,
+                V3::Err(tx_substrate::step_v3::Errno::EEXIST) => {
+                    match rootfs_payload.fs_ops.lookup(
+                        tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+                        b"bin",
+                        &guard,
+                    ) {
+                        V3::Done(id) => id,
+                        other => panic!(
+                            "mount_sdcard_at_musl: /bin lookup after EEXIST: {other:?}"
+                        ),
+                    }
+                }
+                other => panic!("mount_sdcard_at_musl: mkdir /bin: {other:?}"),
+            };
+            let _ = rootfs_payload.fs_ops.symlink(
+                bin_id,
+                b"sh",
+                b"/musl/musl/busybox",
+                &cred,
+                &guard,
+            );
+        }
+
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:sdcard:ext4:ok\n");
     }
