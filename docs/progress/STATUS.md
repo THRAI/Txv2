@@ -917,6 +917,149 @@
   **Next step:** none for this bug cluster. Shell prompt milestone
   complete.
 
+- 2026-05-13 **α: OBS-3b Resume emission + YieldOutcome signature change LANDED.**
+
+  **What changed:**
+
+  - `crates/tx-substrate/src/step_v3/mod.rs`: Added `WaitSourceId::ZERO` sentinel;
+    added `ResumeKind` enum (Retry/WithReply/TimerExpired/Aborted); added
+    `WireAbortReason` enum (None/Signal/Cancelled/Killed); added `YieldResolved`
+    struct (wait_generation, source_id, resume_kind, abort_reason) with `PLACEHOLDER`
+    const; added `YieldOutcome` enum (Resolved/Aborted{..}).
+  - `crates/tx-substrate/src/wake/mailbox.rs`: Added `WaitGeneration::ZERO` sentinel.
+  - `crates/tx-observe/src/encode.rs`: Added `encode_yield_begin` / `yield_begin_tag`
+    (L3 SpanBegin) and `encode_resume` / `resume_tag` (L3 Instant) encoders with full
+    wire-layout comments per §8.4.
+  - `crates/tx-scripts/src/drive.rs`: Changed `yield_resolve` closure return type from
+    `Option<Errno>` to `YieldOutcome`; added L3 SpanBegin(YieldBegin) before
+    `yield_resolve` call; added `emit_resume` helper that emits L3 Instant(Resume) and
+    closes the yield span after `yield_resolve` returns (both resolved and aborted paths).
+  - `crates/tx-scripts/tests/drive_smoke.rs`: Migrated existing test closure to
+    `YieldOutcome::Resolved(YieldResolved::PLACEHOLDER)`; added
+    `drive_emits_l3_yield_begin_and_resume_records` test that drives a yielding op and
+    asserts the 9-record layout (YieldBegin + Resume + span close in the right slots).
+  - `tools/tx-trace-daemon/src/decode.rs`: Added `payload_tag: u16` field to
+    `DecodedRecord` so the writer can route `WaitSourceNotify`/`Resume` instants.
+  - `tools/tx-trace-daemon/src/perfetto/writer.rs`: Removed `#[allow(dead_code)]` from
+    `push_wait_source_notify` and `push_resume`; wired them into the `Instant` arm of
+    `push_record` via `payload_tag` dispatch; added `extract_wait_source_notify_fields`
+    and `extract_resume_fields` helpers.
+  - `tools/tx-trace-daemon/tests/pftrace_integration.rs`: Added
+    `pftrace_resume_flow_reconstruction` test: synthetic WaitSourceNotify + Resume pair
+    round-trips through daemon and produces ≥2 TYPE_INSTANT packets.
+
+  **Verified:**
+  - `cargo build --target riscv64gc-unknown-none-elf -p tx-kernel-riscv64-qemu-virt` clean.
+  - `cargo test -p tx-substrate -p tx-observe -p tx-scripts -p tx-shims -p tx-kernel` green.
+  - `cargo test -p tx-subsystems --lib -- --test-threads=1` three runs:
+    run 1: 623 passed / 0 failed; run 2: 623/0; run 3: 623/0.
+  - `cargo xtask observe-discipline` clean (392 files, 74 StepOp impls).
+  - `cd tools/tx-trace-daemon && cargo test` 21 unit tests + 3 integration tests, all green.
+
+  **Next step:** Wire `with_task_id(tid.0)` into the Resume path so `task_id_low` is
+  non-zero in production Resume records (currently 0, deferred per D17 §8.1). Remove the
+  `TODO(α-followup)` comments at call sites that use `PLACEHOLDER` and populate real
+  `wait_generation` / `source_id` from their `ActiveWait` once the reactor coupling lands.
+
+  **Blocker:** none.
+
+- 2026-05-13 **γ-fix (OBS-4 task-identity threading) LANDED.**
+
+  **What changed:**
+
+  - `crates/tx-substrate/src/wake/mailbox.rs`: Added `task_id_low: u32` field to
+    `TaskMailbox`; `new()` initializes it to 0; `with_task_id(u32)` builder populates it;
+    `task_id_low()` accessor exposes it.
+  - `crates/tx-substrate/src/wake/wait_source.rs`: `notify_emit` reads
+    `mailbox.task_id_low()` per subscriber; removes the `task_id_low: 0` hardcode.
+  - `crates/tx-substrate/src/step_v3/subject_context.rs`: Added `task_id_low(&self) -> u32`
+    to `SubjectIdentity` trait with default impl returning 0.
+  - `crates/tx-subsystems/src/process/structure.rs`: `ProcessIdentity`'s
+    `SubjectIdentity` impl overrides `task_id_low()` to return `self.pid.0`.
+  - `crates/tx-substrate/src/step_v3/mod.rs`: Added `ScriptCtx::task_id_low()` helper
+    that delegates to `subject.process().task_id_low()` (or 0 if no subject).
+  - `crates/tx-scripts/src/drive.rs`: `PayloadDriveBegin::task_id_low` now set to
+    `ctx.task_id_low()` instead of hardcoded `0`.
+  - `crates/tx-substrate/tests/obs4_wait_source_notify_emit.rs`: Assertion comments
+    updated; added `notify_emit_carries_task_id_low_from_mailbox` (asserts non-zero tid
+    lands in ring) and `pipe_eof_emits_correct_task_id_per_task` (two-task discrimination).
+  - `crates/tx-substrate/tests/obs4_convergence_point_emit.rs`: Assertion comment updated.
+
+  **Verified:** `cargo build --target riscv64gc-unknown-none-elf -p tx-kernel-riscv64-qemu-virt`
+  clean; `cargo test -p tx-substrate -p tx-observe -p tx-scripts -p tx-shims -p tx-kernel` all green;
+  `cargo test -p tx-subsystems --lib -- --test-threads=1` 623/623 pass (parallel run is pre-existing
+  flaky due to global-state races unrelated to this change);
+  daemon tests 23/23 pass; `cargo xtask observe-discipline` clean (392 files, 73 StepOp impls).
+
+  **Next step:** integrate `with_task_id(tid.0)` at the thread-future mailbox construction
+  site when the reactor coupling lands (β4 wiring), so user threads carry their TID.
+
+  **Blocker:** none.
+
+- 2026-05-13 **OBS-8 LANDED.** L5 Phase events and L6 Mutation events.
+
+  **What changed:**
+
+  - `crates/tx-observe-types/src/payload.rs`: Added `TxPayloadTag::PhaseTransition = 52`,
+    `BootPhaseKind` enum (`SubstrateBsp=0`, `SubstrateAp=1`), and `PayloadPhaseTransition`
+    struct (16 bytes: `phase_kind u8`, `hart_id u8`, `_pad [u8; 14]`).
+  - `crates/tx-observe-types/src/lib.rs`: Re-exported new types, added `Pod` impl,
+    added `size_of::<PayloadPhaseTransition>() == 16` compile-time assertion.
+  - `crates/tx-observe/src/encode.rs`: Added L6 encoders `encode_mutation_zone_sign`,
+    `encode_mutation_index_commit`, `mutation_zone_sign_tag`, `mutation_index_commit_tag`;
+    added L5 encoder `encode_phase_transition`, `phase_transition_tag`.
+  - `crates/tx-substrate/src/zone/reservation.rs`: Added `MUTATION_EMIT_ENABLED`
+    (`AtomicBool`, default off); wired `Instant(MutationZoneSign)` emit in `sign()`
+    after slot goes Live.
+  - `crates/tx-substrate/src/index.rs`: Added `INDEX_MUTATION_EMIT_ENABLED`
+    (`AtomicBool`, default off); wired `Instant(MutationIndexCommit)` emit in
+    `IndexReservation::commit()` after state transitions to COMMITTED.
+  - `crates/tx-substrate/src/zone/mod.rs`: Re-exported `MUTATION_EMIT_ENABLED`.
+  - `crates/tx-substrate/src/lib.rs`: Wired L5 `SpanBegin(phase.SubstrateBsp)` /
+    `SpanEnd` around `init()` body; `SpanBegin(phase.SubstrateAp)` / `SpanEnd` around
+    `init_on_ap()` body. Added `emit_phase_span_begin` / `emit_phase_span_end` helpers.
+  - `tools/tx-trace-daemon/src/decode.rs`: Added `PhaseTransition` to both tag-parse
+    match and `read_payload` match via `read_as!(PayloadPhaseTransition)`.
+  - `docs/Txv3/08_OBSERVATION_SERIALIZATION_v0.md`: Updated §8.7 mutation payload
+    note (gated, daemon decoding); added §8.9 Phase transition payload layout.
+
+  **Tests:** `tests/obs8_zone_sign_emit.rs` (2 tests: gate-enabled emits record,
+  gate-disabled emits nothing); `tests/obs8_index_commit_emit.rs` (2 tests: same
+  discipline for index commit).
+
+  **Verified:** `cargo build -p tx-observe-types -p tx-observe -p tx-substrate` clean;
+  `cargo build --target riscv64gc-unknown-none-elf -p tx-kernel-riscv64-qemu-virt` clean;
+  `cargo test -p tx-observe -p tx-substrate -- --test-threads=1` all green;
+  `cargo test -p tx-subsystems --lib -- --test-threads=1` 623/623 pass;
+  `cargo xtask observe-discipline` clean (392 files, 73 StepOp impls);
+  daemon builds clean.
+
+  **Next step:** land commit; gate both L6 gates on via boot flag if profiling
+  confirms overhead is acceptable; wire daemon Perfetto span reconstruction for
+  L5 phase spans (OBS-9 territory).
+
+  **Blocker:** none.
+
+- 2026-05-13 D16 OBS-4 Drop-barrier resolution (Option C) LANDED.
+  `tx_observe::current()` is now non-generic: a companion
+  `CPU_ID_FN: AtomicU64` stores `fn() -> CpuId` (mirrors the existing
+  `TS_FN` timestamp pattern). `tx_observe::init::<P>` installs the
+  function pointer at boot (BSP + AP). `WaitSource::notify_emit` drops
+  its `<P: PercpuIf>` bound — it now calls `tx_observe::current()`
+  directly. `drive<O, I>` in `tx-scripts` already had no `Plat`
+  parameter. All 13 production `.notify(mask)` sites in
+  `tx-subsystems` (pipe.rs ×4, io_uring.rs ×2, aio.rs ×2,
+  userfaultfd.rs, vfs/structure.rs ×2, signalfd.rs, futex.rs,
+  tty/execution/step_ingest.rs ×2, process/structure.rs) migrated to
+  `.notify_emit(mask)`. Six TestPlatform stubs across tx-kernel tests
+  and tx-substrate tests gained `impl ObserverIf for TestPlatform {}`.
+  **Verified:** tx-substrate full suite pass; tx-kernel 43/43 pass;
+  tx-subsystems 623/623 single-threaded pass; tx-observe 4/4 pass;
+  tx-scripts 48/48 pass; OBS-4 tests (obs4_wait_source_notify_emit ×3,
+  obs4_convergence_point_emit ×1, obs4_cap_trace_id ×1) all green.
+  **Next step:** land commit; run `cargo xtask ci`.
+  ADR: `docs/progress/decisions/2026-05-13-d16-obs4-drop-barrier-resolution.md`.
+
 - 2026-05-12 D12 Phase B (PR-2 scaffolding dead-code allowance)
   LANDED. Closes the D13 follow-up: the 26 PR-2 `StepOp` adapter
   wraps in `tx-subsystems/{page_backed,tty/execution}/` now carry

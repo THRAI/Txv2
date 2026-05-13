@@ -795,6 +795,8 @@ pub trait PmapIf {
     }
 }
 
+pub mod observer;
+pub use observer::{ObserverIf, RingDescriptor};
 pub mod pmap;
 pub mod trap;
 pub use trap::{
@@ -1304,6 +1306,7 @@ pub trait TxPlatform:
     + SmpIf
     + PowerIf
     + EntropyIf
+    + ObserverIf
     + 'static
 {
 }
@@ -1327,6 +1330,7 @@ impl<T> TxPlatform for T where
         + SmpIf
         + PowerIf
         + EntropyIf
+        + ObserverIf
         + 'static
 {
 }

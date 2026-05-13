@@ -69,7 +69,8 @@ pub fn step_ingest(
         // installed via `WaitSource::prepare(..).install_if(..)`
         // receive a `MailboxEvent::SourceFired` posted under the same
         // payload-observation arm as the Channel fire above.
-        tty.wait_source().notify(InterestMask::new(TTY_READABLE));
+        tty.wait_source()
+            .notify_emit(InterestMask::new(TTY_READABLE));
         outcome.readable_fired = true;
     }
     if linearized.writable_fired {
@@ -111,7 +112,8 @@ pub fn step_ingest(
                             // PR-3D-4 (D2 coexistence): paired notify
                             // on the new `WaitSource`. See the
                             // companion site above for the rationale.
-                            tty.wait_source().notify(InterestMask::new(TTY_READABLE));
+                            tty.wait_source()
+                                .notify_emit(InterestMask::new(TTY_READABLE));
                             outcome.readable_fired = true;
                         }
                         LdiscInputEffect::SignalFgPgrp(signal) => {

@@ -451,16 +451,92 @@ pub mod shootdown {
 }
 
 pub fn init<P: TxPlatform>() {
+    // L5 Phase span: SubstrateBsp begin (OBS-8).
+    //
+    // Emitted before substrate bring-up so the span captures the full
+    // BSP init interval.  `tx_observe::current()` may return None here
+    // if observation has not been initialised yet (normal early-boot
+    // order); the emit is a no-op in that case.
+    let phase_span = emit_phase_span_begin(
+        tx_observe_types::BootPhaseKind::SubstrateBsp,
+        0, // BSP is always hart 0
+    );
+
     let _ = P::platform_info();
     boot_memory::init_from_hal::<P>();
     epoch::init_on_bsp::<P>().expect("tx_substrate::init epoch initialization failed");
     zone::init_on_bsp::<P>().expect("tx_substrate::init zone initialization failed");
     slab::init::<P>().expect("tx_substrate::init slab heap initialization failed");
     slab::allocation_smoke().expect("tx_substrate::init slab allocation smoke failed");
+
+    // L5 Phase span end.
+    emit_phase_span_end(phase_span);
 }
 
 pub fn init_on_ap(cpu: CpuId) -> Result<(), ApInitError> {
+    // L5 Phase span: SubstrateAp begin (OBS-8).
+    let phase_span =
+        emit_phase_span_begin(tx_observe_types::BootPhaseKind::SubstrateAp, cpu.0 as u8);
+
     epoch::init_on_ap(cpu)?;
     zone::init_on_ap(cpu)?;
+
+    // L5 Phase span end.
+    emit_phase_span_end(phase_span);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// L5 Phase span helpers (OBS-8)
+// ---------------------------------------------------------------------------
+
+/// Emit a `SpanBegin(phase.<kind>)` record and return the span id.
+///
+/// Returns `SpanId::NONE` when no emitter is available (before observation
+/// init or on boards without a ring transport).
+///
+/// Convergence point: substrate `init` (BSP) and `init_on_ap` (AP).
+/// Not inside a `StepOp::step` body — substrate init functions are called
+/// before any step machinery runs (OBS-A-1).
+///
+/// Spec ref: `docs/Txv3/08_OBSERVATION_v1.md` §16 OBS-8, §6 L5.
+#[inline]
+fn emit_phase_span_begin(
+    phase_kind: tx_observe_types::BootPhaseKind,
+    hart_id: u8,
+) -> tx_observe::SpanId {
+    if let Some(em) = tx_observe::current() {
+        use tx_observe::encode::{encode_phase_transition, phase_transition_tag};
+        use tx_observe::{EventNameId, TxTraceLevel};
+        use tx_observe_types::PayloadPhaseTransition;
+
+        let p = PayloadPhaseTransition {
+            phase_kind: phase_kind as u8,
+            hart_id,
+            _pad: [0u8; 14],
+        };
+        let (payload_bytes, _) = encode_phase_transition(&p);
+        em.span_begin(
+            TxTraceLevel::Phase,
+            EventNameId::from_raw(phase_kind as u32),
+            tx_observe::SpanId::NONE,
+            phase_transition_tag(),
+            &payload_bytes,
+        )
+    } else {
+        tx_observe::SpanId::NONE
+    }
+}
+
+/// Emit a `SpanEnd` record closing `span`.  A no-op when `span` is
+/// `SpanId::NONE` (no emitter was available at span-begin time).
+#[inline]
+fn emit_phase_span_end(span: tx_observe::SpanId) {
+    if span == tx_observe::SpanId::NONE {
+        return;
+    }
+    if let Some(em) = tx_observe::current() {
+        use tx_observe_types::TxPayloadTag;
+        em.span_end(span, TxPayloadTag::None, &[]);
+    }
 }

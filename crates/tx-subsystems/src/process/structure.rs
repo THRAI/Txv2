@@ -190,6 +190,18 @@ impl step_engine::SubjectIdentity for ProcessIdentity {
     fn exit_source(&self) -> Option<step_engine::WaitSourceId> {
         self.exit_source_id().map(step_engine::WaitSourceId::new)
     }
+
+    /// Returns the process's PID low 32 bits as the task trace identity.
+    ///
+    /// For `drive<O, ProcessIdentity>` call sites the subject is a
+    /// process; the PID is a stable, unique-enough discriminant for
+    /// flow-ID hashing. Per-thread TID resolution is deferred to when
+    /// `ScriptCtx` carries a thread cap; for now PID is sufficient to
+    /// distinguish flows across processes. Kernel actors that use the
+    /// placeholder `ProcessIdentity` inherit the default `0`.
+    fn task_id_low(&self) -> u32 {
+        self.pid.0
+    }
 }
 
 impl ProcessIdentity {
