@@ -146,7 +146,7 @@ pub fn step_process_loopback_pending(
     for socket in SOCKET_TABLE
         .snapshot_udp_bound(guard)
         .into_iter()
-        .filter(is_udp_connected)
+        .filter(|socket| has_udp_loopback_tx_pending(socket, iface))
     {
         if !remember_socket(&mut udp_bound_seen, &socket) {
             continue;
@@ -223,12 +223,14 @@ fn is_tcp_connected(socket: &Cap<SocketIdentity>) -> bool {
     })
 }
 
-fn is_udp_connected(socket: &Cap<SocketIdentity>) -> bool {
+fn has_udp_loopback_tx_pending(socket: &Cap<SocketIdentity>, iface: &LoopbackIface) -> bool {
     socket.acquire_operational().is_some_and(|payload| {
         matches!(
             payload.protocol_snapshot(),
-            SocketProtocol::Udp(UdpInner::Connected { .. })
-        )
+            SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
+        ) && payload
+            .peek_udp_tx_datagram()
+            .is_some_and(|datagram| datagram.dst.addr == iface.local_ipv4())
     })
 }
 

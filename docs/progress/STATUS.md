@@ -2228,6 +2228,20 @@
   **Next step:** none for this bug cluster. Shell prompt milestone
   complete.
 
+- 2026-05-13 N68 shell TCP/UDP smoke LANDED. The BusyBox initramfs can now
+  include freestanding RV64 `/bin/tcp-loopback-smoke` and
+  `/bin/udp-loopback-smoke` test programs. TCP proves
+  `connect -> accept -> write -> read -> close` through shell-launched
+  userspace and the reactor-owned net delegate; UDP proves
+  `bind + sendto(self) + recvfrom`. Fixes: the loopback pending step now
+  processes bound UDP sockets with pending loopback `sendto` datagrams, and
+  blocking `sys_connect` treats `EISCONN` after a delegate wait as successful
+  completion. Verified with `cargo xtask image cpio --profile busybox --target
+  rv64-qemu`, default RV64 kernel build, and both N68 shell-test scripts.
+  Result: `msp/network-n68-shell-udp-tcp-smoke-result.md`. **Next:** start
+  `iperf`/`netperf` prerequisite probing from this smaller TCP/UDP correctness
+  baseline.
+
 - 2026-05-13 xtask: `verb_ratio` column added to `boundary-report` LANDED
   (refactor #7/7, branch cc/crazy-ardinghelli-91c48e). Added `AdapterVerbStats`
   struct with `pub_fn_count`, `total_pub_item_count`, `ratio()` to
