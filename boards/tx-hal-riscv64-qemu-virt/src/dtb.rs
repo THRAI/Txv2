@@ -53,11 +53,11 @@ pub(crate) unsafe fn parse_boot_info_from_fdt(
     let cmdline_len = copy_bootargs(chosen, cmdline);
     let initrd_start = chosen
         .and_then(|node| node.raw_property("linux,initrd-start").ok().flatten())
-        .and_then(|prop| read_cells(prop.value, root_address_cells))
+        .and_then(|prop| read_initrd_addr(prop.value, root_address_cells))
         .map(PhysAddr);
     let initrd_end = chosen
         .and_then(|node| node.raw_property("linux,initrd-end").ok().flatten())
-        .and_then(|prop| read_cells(prop.value, root_address_cells))
+        .and_then(|prop| read_initrd_addr(prop.value, root_address_cells))
         .map(PhysAddr);
 
     let initrd = match (initrd_start, initrd_end) {
@@ -122,6 +122,13 @@ fn read_cells(data: &[u8], cells: usize) -> Option<usize> {
         value = (value << 32) | u32::from_be_bytes(cell.try_into().ok()?) as u64;
     }
     usize::try_from(value).ok()
+}
+
+fn read_initrd_addr(data: &[u8], root_address_cells: usize) -> Option<usize> {
+    if data.len() == 4 {
+        return read_cells(data, 1);
+    }
+    read_cells(data, root_address_cells)
 }
 
 fn read_timebase_frequency_hz(value: &[u8]) -> Option<u64> {

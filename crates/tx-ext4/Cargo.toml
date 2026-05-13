@@ -18,6 +18,15 @@ tx-substrate = { path = "../tx-substrate" }
 tx-test-support = { path = "../tx-test-support" }
 tx-subsystems = { path = "../tx-subsystems" }
 
+[features]
+default = []
+std = []
+
+[[test]]
+name = "async_adapter"
+path = "tests/async_adapter.rs"
+required-features = ["std"]
+
 [dev-dependencies]
 tx-subsystems = { path = "../tx-subsystems", features = ["vfs-read-test-support"] }
 tokio = { version = "1", features = ["macros", "rt", "sync"] }

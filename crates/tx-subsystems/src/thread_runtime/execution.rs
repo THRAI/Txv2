@@ -211,10 +211,14 @@ pub fn post_signal(thread: &Cap<ThreadIdentity>, sig: Signum) {
 // Userspace-entry shim (Plan B writeback discipline)
 // ---------------------------------------------------------------------------
 
-/// RV64 register index of the `a0` argument/return register inside
+/// Register index of the Linux ABI `a0` argument/return register inside
 /// [`UserTrapContext::regs`]. The HAL stores user GPRs at the same
-/// indices the architecture uses (`x10` is `a0`); other arches will
-/// surface their own equivalent before they ship a TrapIf override.
+/// indices the architecture uses.
+#[cfg(target_arch = "loongarch64")]
+const USER_CONTEXT_A0_INDEX: usize = 4;
+#[cfg(target_arch = "riscv64")]
+const USER_CONTEXT_A0_INDEX: usize = 10;
+#[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
 const USER_CONTEXT_A0_INDEX: usize = 10;
 
 /// Build the merged [`UserTrapContext`] the HAL's
@@ -245,7 +249,10 @@ const USER_CONTEXT_A0_INDEX: usize = 10;
 /// **Panics** if no `saved_user_context` is recorded — that means
 /// userspace re-entry was attempted before any trap captured a baseline
 /// context, which is a thread-future invariant violation.
-pub fn prepare_userspace_entry_payload(payload: &PayloadCap<ThreadPayload>) -> UserTrapContext {
+pub fn prepare_userspace_entry_payload_into(
+    payload: &PayloadCap<ThreadPayload>,
+    out: &mut UserTrapContext,
+) {
     let mut ctx = payload
         .saved_user_context()
         .expect("prepare_userspace_entry_payload: no saved_user_context recorded");
@@ -260,6 +267,12 @@ pub fn prepare_userspace_entry_payload(payload: &PayloadCap<ThreadPayload>) -> U
 
     payload.set_active_userspace_request(None);
 
+    *out = ctx;
+}
+
+pub fn prepare_userspace_entry_payload(payload: &PayloadCap<ThreadPayload>) -> UserTrapContext {
+    let mut ctx = UserTrapContext::empty();
+    prepare_userspace_entry_payload_into(payload, &mut ctx);
     ctx
 }
 

@@ -174,6 +174,10 @@ pub fn resolve_console_rnode(name: &[u8]) -> StepOutcome<Cap<RNode>, NoProgress>
 /// `/dev/console`. Both branches indicate the kernel cannot make
 /// further bootstrap progress.
 pub fn open_console_for_init() -> Cap<OpenFile> {
+    open_console_for_init_legacy()
+}
+
+pub fn open_console_for_init_via_walker() -> Cap<OpenFile> {
     if let Some(init) = process::execution::init_process() {
         if let Some(root) = init.cwd() {
             // Bootstrap path: init opens /dev/console as root.

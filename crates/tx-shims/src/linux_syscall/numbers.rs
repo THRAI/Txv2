@@ -866,6 +866,10 @@ pub const NR_NEWFSTATAT: u64 = 79;
 /// from `OpenFile.rnode().meta()` and writes the Linux `struct stat`
 /// layout into the user buffer.
 pub const NR_FSTAT: u64 = 80;
+/// `statx(dirfd, path, flags, mask, statxbuf)`. Linux generic ABI
+/// `__NR_statx = 291`. LA64 musl/busybox prefers this over the older
+/// stat-family calls for directory listing metadata probes.
+pub const NR_STATX: u64 = 291;
 /// `umask(mask)`. Linux RV64 generic ABI `__NR_umask = 166`. Atomic
 /// swap of the per-process file-creation mask, returning the
 /// previous value. Mask is silently truncated to the bottom 9 bits
@@ -890,6 +894,17 @@ pub const AT_EMPTY_PATH: u32 = 0x1000;
 /// ignored. Documented carryover; matches Linux's
 /// "ignored-when-no-automount" lenience.
 pub const AT_NO_AUTOMOUNT: u32 = 0x800;
+/// `AT_STATX_FORCE_SYNC = 0x2000`.
+pub const AT_STATX_FORCE_SYNC: u32 = 0x2000;
+/// `AT_STATX_DONT_SYNC = 0x4000`.
+pub const AT_STATX_DONT_SYNC: u32 = 0x4000;
+/// Mask of the statx-specific synchronisation bits accepted by Linux.
+pub const AT_STATX_SYNC_TYPE: u32 = AT_STATX_FORCE_SYNC | AT_STATX_DONT_SYNC;
+
+/// `STATX_BASIC_STATS`: the metadata set Txv2 can currently report.
+pub const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+pub const STATX_BTIME: u32 = 0x0000_0800;
+pub const STATX_MNT_ID: u32 = 0x0000_1000;
 
 // `linux_dirent64` `d_type` byte values per
 // `include/uapi/linux/dirent.h`. Encoded into each record's

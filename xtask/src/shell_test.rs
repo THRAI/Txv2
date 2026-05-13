@@ -75,6 +75,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::image::busybox_initramfs_name;
 use crate::target::{Profile, TxTarget};
 use crate::util::{option_value, optional_option_value, resolve_path};
 use crate::Result;
@@ -797,13 +798,17 @@ fn build_qemu_command(root: &Path, target: TxTarget) -> Result<Vec<String>> {
     let initramfs = root
         .join("target")
         .join("images")
-        .join("busybox-initramfs.cpio");
+        .join(busybox_initramfs_name(target));
     let mut args = vec![
         target.qemu_binary().to_string(),
         "-machine".into(),
         target.qemu_machine().to_string(),
         "-m".into(),
-        "256M".into(),
+        match target {
+            TxTarget::La64Qemu => "1152M",
+            TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => "256M",
+        }
+        .into(),
         "-smp".into(),
         "1".into(),
         "-display".into(),
