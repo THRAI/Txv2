@@ -1,3 +1,34 @@
+- 2026-05-13 **ET_DYN static-PIE ELF loader support LANDED.** All 32
+  oscomp `basic-musl` test binaries (`brk`, `chdir`, `clone`, …) are
+  static-PIE (`e_type=ET_DYN`, no `DT_NEEDED`, zero RELA entries,
+  `DT_FLAGS_1=DF_1_PIE`). They were silently rejected by the ELF loader
+  with `ParseError::Type` (only `ET_EXEC` was accepted). Two related
+  rejections existed: (1) single combined RWX PT_LOAD segment
+  (`p_flags=0x7`) hit the W^X guard, (2) presence of PT_INTERP/PT_DYNAMIC
+  headers caused early rejection. Changes in
+  `crates/tx-scripts/src/process/exec/loader.rs`:
+  - Accept `ET_DYN`; detect `is_dyn` boolean at parse time.
+  - `ET_DYN_LOAD_BIAS = 0x10000`; apply to all segment vaddrs, entry
+    point, and `AT_PHDR` after PT_LOAD parsing.
+  - PT_INTERP/PT_DYNAMIC headers silently skipped for `ET_DYN` (no
+    interpreter load needed for static-PIE).
+  - W^X rejection is `if !is_dyn && writable && executable` — static-PIE
+    binaries with RWX segments are accepted.
+  - `ExecImagePlan` gains `load_bias: u64` field.
+  - `script.rs` and VM layer required no changes (`at_base=0` was already
+    correct for static-PIE; `Prot::new(r,w,x)` accepts any combination).
+  Two unit tests added/updated in `loader/tests.rs`: 48 tests pass.
+  **Verified:** `cargo -q xtask unit` 4/4 clean (48 loader tests);
+  `cargo xtask full-build --target rv64-qemu --skip-doctor --no-image`
+  clean; `cargo xtask oscomp submit && cargo xtask oscomp qemu --target
+  rv64-qemu` — all 32 test binaries now execute (output visible in serial
+  log), `open-errno=0`, `#### OS COMP TEST GROUP END basic-musl ####`
+  reached, `userspace:exited:0`. Previously: all 32 failed with
+  `./run-all.sh: line 40: ./X: not found`.
+  **Next step:** investigate remaining individual test failures — `sleep`
+  and `unlink` hit `--- Assert Fatal ! ---`; `umount` returns −38
+  (ENOSYS for `mount` syscall). Commit loader changes.
+
 - 2026-05-13 **OSComp `basic-musl` TEST GROUP markers now appear** in the
   oscomp RV64 QEMU serial output. Three fixes landed together:
   1. `read_symlink` implemented in `tx-ext4-format` pager (handles fast
