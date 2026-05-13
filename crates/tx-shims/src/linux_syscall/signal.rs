@@ -4,6 +4,9 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use alloc::collections::BTreeMap;
+
+use crate::adapter::step_engine::SpinMutex;
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
 use tx_subsystems::signal::{KillOutcome, SignalTarget};
@@ -85,6 +88,22 @@ fn drain_stale_signal_events(mailbox: &crate::adapter::reactor_entry::TaskMailbo
     for event in keep {
         let _ = mailbox.post(event);
     }
+}
+
+static SIGACTION_RESTORERS: SpinMutex<BTreeMap<(u32, u8), usize>> = SpinMutex::new(BTreeMap::new());
+
+fn remember_sigaction_restorer(pid: u32, sig: Signum, restorer: u64) {
+    let mut restorers = SIGACTION_RESTORERS.lock();
+    let key = (pid, sig.raw());
+    if restorer == 0 {
+        restorers.remove(&key);
+    } else {
+        restorers.insert(key, restorer as usize);
+    }
+}
+
+pub(super) fn sigaction_restorer(pid: u32, sig: Signum) -> Option<usize> {
+    SIGACTION_RESTORERS.lock().get(&(pid, sig.raw())).copied()
 }
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
@@ -450,8 +469,10 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         }
         let handler = read_u64_le(&bytes[0..8]);
         let flags = SaFlags::new(read_u64_le(&bytes[8..16]));
-        let mask = SignalMask::new(read_u64_le(&bytes[16..24]));
-        let restorer = read_u64_le(&bytes[24..32]);
+        // Linux RV64 kernel sigaction layout is:
+        // handler, flags, restorer, mask.
+        let restorer = read_u64_le(&bytes[16..24]);
+        let mask = SignalMask::new(read_u64_le(&bytes[24..32]));
 
         // SIG_DFL == 0, SIG_IGN == 1 per Linux generic ABI; everything
         // else is a userspace function-pointer handler.
@@ -464,7 +485,7 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     };
 
     // If the caller wants the previous disposition, snapshot it
-    // *before* installing the new one. `step_sigaction` returns the
+    // *before* installing the new one. `SigactionOp` returns the
     // prev as part of `SigDispositionChange`, so a single call suffices
     // for both install and query — but `act_ptr == 0` is "query only",
     // and we must not mutate. Read the live disposition through the
@@ -472,13 +493,17 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let prev_entry: SigActionEntry = match new_entry {
         Some(entry) => {
             let mut script_ctx = build_subject_script_ctx(ctx);
+            let restorer = entry.restorer as u64;
             let mut op = SigactionOp {
                 process: ctx.process.clone(),
                 sig,
                 entry,
             };
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-                Ok(SigDispositionChange::Replaced { prev }) => prev,
+                Ok(SigDispositionChange::Replaced { prev }) => {
+                    remember_sigaction_restorer(ctx.process.pid.0, sig, restorer);
+                    prev
+                }
                 Ok(SigDispositionChange::Uncatchable(prev)) => prev,
                 Ok(SigDispositionChange::ZombieIgnored) => {
                     return SyscallResult::Error(ESRCH_VALUE);
@@ -509,18 +534,23 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         };
         // Build a 32-byte image and copy out through the canonical
         // user-VA lane. RV64 musl layout: 4×u64 little-endian
-        // (handler, flags, mask, unused/restorer).
+        // (handler, flags, restorer, mask).
         let mut image = [0u8; SIGACTION_BYTES];
         image[0..8].copy_from_slice(&handler_value.to_le_bytes());
         image[8..16].copy_from_slice(&prev_entry.flags.bits().to_le_bytes());
-        image[16..24].copy_from_slice(&prev_entry.sa_mask.raw_bits().to_le_bytes());
-        image[24..32].copy_from_slice(&(prev_entry.restorer as u64).to_le_bytes());
+        image[16..24].copy_from_slice(&(prev_entry.restorer as u64).to_le_bytes());
+        image[24..32].copy_from_slice(&prev_entry.sa_mask.raw_bits().to_le_bytes());
         if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, oldact_ptr as u64, &image) {
             return SyscallResult::error_from(errno);
         }
     }
 
     SyscallResult::Return(0)
+}
+
+#[cfg(test)]
+pub(super) fn reset_sigaction_restorers_for_test() {
+    SIGACTION_RESTORERS.lock().clear();
 }
 
 /// `kill(pid, sig)` — Linux RV64 generic ABI `__NR_kill = 129`.
@@ -759,17 +789,40 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
 /// If no signal frame is in flight, the kernel has no parked
 /// context to restore. POSIX leaves this case undefined; we return
 /// `-EFAULT` defensively rather than corrupt the current context.
+///
+/// N69b also keeps the older itimer compatibility frame path alive:
+/// `maybe_deliver_itimer_signal` writes a small RV64 frame directly
+/// on the user stack, so when no parked context exists we restore from
+/// that frame as a fallback. This keeps netperf's SIGALRM completion
+/// path working while the generic `SignalFrameIf` delivery path is
+/// the primary signal route.
 pub(super) fn sys_rt_sigreturn(ctx: &SyscallCtx) -> SyscallResult {
     let Some(payload) = ctx.thread.payload_cap() else {
         return SyscallResult::Error(EFAULT_VALUE);
     };
-    let Some(saved) = payload.take_saved_signal_context() else {
+    if let Some(saved) = payload.take_saved_signal_context() {
+        if let Some(mask) = payload.take_saved_signal_mask() {
+            payload.store_signal_mask(mask);
+        }
+        payload.store_saved_user_context(Some(saved));
+        return SyscallResult::SigreturnRestored;
+    }
+
+    let Some(current) = payload.saved_user_context() else {
         return SyscallResult::Error(EFAULT_VALUE);
     };
-    if let Some(mask) = payload.take_saved_signal_mask() {
-        payload.store_signal_mask(mask);
-    }
-    payload.store_saved_user_context(Some(saved));
+    let frame = match read_compat_signal_frame(&ctx.aspace, current.regs[2] as u64) {
+        Ok(frame) => frame,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SigprocmaskOp {
+        thread: ctx.thread.clone(),
+        how: SigmaskHow::SetMask,
+        next: SignalMask::new(frame.saved_mask.bits),
+    };
+    let _ = step_engine::drive_oneshot(&mut op, &mut script_ctx);
+    payload.store_saved_user_context(Some(frame.user_context));
     SyscallResult::SigreturnRestored
 }
 

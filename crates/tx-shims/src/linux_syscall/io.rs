@@ -601,6 +601,7 @@ pub(super) async fn sys_pselect6<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         let mut except_ready = alloc::vec![0u64; word_count as usize];
         let mut ready_count: i64 = 0;
         let mut wait_token = None;
+        let mut wait_token_is_socket = false;
         let mixed_read_interest = readfds != 0;
         let mut read_interest_count = 0usize;
 
@@ -623,7 +624,6 @@ pub(super) async fn sys_pselect6<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
             if want_read {
                 read_interest_count += 1;
             }
-
             let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
                 return SyscallResult::Error(EBADF_VALUE);
             };
@@ -645,7 +645,7 @@ pub(super) async fn sys_pselect6<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                 if want_except {
                     interests |= tx_subsystems::net::PollMask::ERR;
                 }
-                if want_read && mask.intersects(tx_subsystems::net::PollMask::IN) {
+                if pselect_socket_read_ready(want_read, mask) {
                     fdset_set(&mut read_ready, fd);
                     fd_ready = true;
                 }
@@ -664,20 +664,26 @@ pub(super) async fn sys_pselect6<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                             | tx_subsystems::net::PollMask::HUP
                             | tx_subsystems::net::PollMask::RDHUP,
                     );
-                if read_blocked && wait_token.is_none() {
+                if read_blocked && (wait_token.is_none() || !wait_token_is_socket) {
                     match socket_poll_wait_token_from_file(
                         &file,
                         tx_subsystems::net::PollMask::IN,
                         &guard,
                     ) {
-                        Some(Ok(Some(token))) => wait_token = Some(token),
+                        Some(Ok(Some(token))) => {
+                            wait_token = Some(token);
+                            wait_token_is_socket = true;
+                        }
                         Some(Ok(None)) | None => {}
                         Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
                     }
                 }
-                if !fd_ready && wait_token.is_none() {
+                if !fd_ready && (wait_token.is_none() || !wait_token_is_socket) {
                     match socket_poll_wait_token_from_file(&file, interests, &guard) {
-                        Some(Ok(Some(token))) => wait_token = Some(token),
+                        Some(Ok(Some(token))) => {
+                            wait_token = Some(token);
+                            wait_token_is_socket = true;
+                        }
                         Some(Ok(None)) | None => {}
                         Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
                     }
@@ -697,6 +703,7 @@ pub(super) async fn sys_pselect6<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                                         tty.wait_source_id(),
                                         TTY_READABLE,
                                     ));
+                                    wait_token_is_socket = false;
                                 }
                                 false
                             }
@@ -833,6 +840,19 @@ fn pselect_socket_write_ready(
     };
 
     socket.readiness.send_wq.peek() & tx_subsystems::net::structure::SendWireSet::SPACE.bits() != 0
+}
+
+pub(super) fn pselect_socket_read_ready(
+    want_read: bool,
+    mask: tx_subsystems::net::PollMask,
+) -> bool {
+    want_read
+        && mask.intersects(
+            tx_subsystems::net::PollMask::IN
+                | tx_subsystems::net::PollMask::ERR
+                | tx_subsystems::net::PollMask::HUP
+                | tx_subsystems::net::PollMask::RDHUP,
+        )
 }
 
 /// `ppoll(fds, nfds, tmo_p, sigmask)` — minimal v1 stub for

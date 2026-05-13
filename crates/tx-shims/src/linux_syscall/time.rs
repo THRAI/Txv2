@@ -8,6 +8,9 @@ use alloc::collections::BTreeMap;
 
 use crate::adapter::step_engine::{Cap, SpinMutex};
 use tx_subsystems::process::ProcessIdentity;
+use core::mem::{offset_of, size_of};
+
+use tx_hal::{UserSaFlagsAbi, UserSigInfoAbi, UserSignalMaskAbi, UserTrapContext};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -25,9 +28,38 @@ pub(super) struct TimevalLayout {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct ItimervalLayout {
-    it_interval: TimevalLayout,
-    it_value: TimevalLayout,
+pub(super) struct ItimervalLayout {
+    pub(super) it_interval: TimevalLayout,
+    pub(super) it_value: TimevalLayout,
+}
+
+const SIGALRM_RAW: u8 = 14;
+const RV64_SIGFRAME_ALIGN: usize = 16;
+const RV64_SIGFRAME_MAGIC: u64 = 0x5458_5632_5349_4731; // "TXV2SIG1"
+const RV64_SIGFRAME_VERSION: u32 = 1;
+const RV64_RT_SIGRETURN_SYSCALL: u32 = 139;
+const RV64_ECALL: u32 = 0x0000_0073;
+
+const fn rv64_addi(rd: u32, rs1: u32, imm: u32) -> u32 {
+    ((imm & 0x0fff) << 20) | (rs1 << 15) | (rd << 7) | 0x13
+}
+
+const RV64_SIGRETURN_TRAMPOLINE: [u32; 2] =
+    [rv64_addi(17, 0, RV64_RT_SIGRETURN_SYSCALL), RV64_ECALL];
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub(super) struct CompatSignalFrame {
+    pub(super) magic: u64,
+    pub(super) version: u32,
+    pub(super) frame_size: u32,
+    pub(super) sig_no: u32,
+    pub(super) _reserved0: u32,
+    pub(super) flags: u64,
+    pub(super) siginfo: UserSigInfoAbi,
+    pub(super) saved_mask: UserSignalMaskAbi,
+    pub(super) user_context: UserTrapContext,
+    pub(super) trampoline: [u32; 2],
 }
 
 #[repr(C)]
@@ -569,6 +601,107 @@ pub(super) async fn sleep_until_deadline<'a, P: TimeIf>(
     SyscallResult::Return(0)
 }
 
+pub fn maybe_deliver_itimer_signal<P: TimeIf>(
+    mut ctx: UserTrapContext,
+    process: &Cap<ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+    aspace: &AddressSpace,
+) -> UserTrapContext {
+    let delivered = with_interval_timers(|timers| {
+        let key = (process.pid.0, ITIMER_REAL);
+        let Some(timer) = timers.get_mut(&key) else {
+            return false;
+        };
+        let now_ns = P::read_ns();
+        if timer.deadline_ns == 0 || timer.deadline_ns > now_ns {
+            return false;
+        }
+        if timer.interval_ns == 0 {
+            timers.remove(&key);
+        } else {
+            timer.deadline_ns = now_ns.saturating_add(timer.interval_ns);
+        }
+        true
+    });
+    if !delivered {
+        return ctx;
+    }
+
+    let Some(sig) = Signum::new(SIGALRM_RAW) else {
+        return ctx;
+    };
+    let Some(SigDisposition::Handler(handler)) = process.sig_disposition(sig) else {
+        let _ = step_kill_process(process, sig);
+        return ctx;
+    };
+    let Some(thread_payload) = thread.payload_cap() else {
+        return ctx;
+    };
+
+    let Some(frame_addr) = ctx.regs[2]
+        .checked_sub(size_of::<CompatSignalFrame>())
+        .map(|addr| align_down(addr, RV64_SIGFRAME_ALIGN))
+    else {
+        return ctx;
+    };
+
+    let siginfo_addr = frame_addr + offset_of!(CompatSignalFrame, siginfo);
+    let ucontext_addr = frame_addr + offset_of!(CompatSignalFrame, user_context);
+    let trampoline_pc = frame_addr + offset_of!(CompatSignalFrame, trampoline);
+    let return_pc = sigaction_restorer(process.pid.0, sig).unwrap_or(trampoline_pc);
+    let frame = CompatSignalFrame {
+        magic: RV64_SIGFRAME_MAGIC,
+        version: RV64_SIGFRAME_VERSION,
+        frame_size: size_of::<CompatSignalFrame>() as u32,
+        sig_no: u32::from(SIGALRM_RAW),
+        _reserved0: 0,
+        flags: UserSaFlagsAbi::EMPTY.bits,
+        siginfo: UserSigInfoAbi::ZERO,
+        saved_mask: UserSignalMaskAbi {
+            bits: thread_payload.signal_mask().raw_bits(),
+        },
+        user_context: ctx,
+        trampoline: RV64_SIGRETURN_TRAMPOLINE,
+    };
+
+    if bootstrap_write_user::<CompatSignalFrame>(aspace, frame_addr as u64, frame).is_err() {
+        return ctx;
+    }
+
+    ctx.pc = handler;
+    ctx.regs[1] = return_pc;
+    ctx.regs[2] = frame_addr;
+    ctx.regs[10] = usize::from(SIGALRM_RAW);
+    ctx.regs[11] = siginfo_addr;
+    ctx.regs[12] = ucontext_addr;
+    ctx
+}
+
+pub(super) fn read_compat_signal_frame(
+    aspace: &AddressSpace,
+    frame_addr: u64,
+) -> Result<CompatSignalFrame, i32> {
+    let frame =
+        bootstrap_read_user::<CompatSignalFrame>(aspace, frame_addr).map_err(errno_to_i32)?;
+    if frame.magic != RV64_SIGFRAME_MAGIC
+        || frame.version != RV64_SIGFRAME_VERSION
+        || frame.frame_size as usize != size_of::<CompatSignalFrame>()
+        || frame.trampoline != RV64_SIGRETURN_TRAMPOLINE
+    {
+        return Err(EINVAL_VALUE);
+    }
+    Ok(frame)
+}
+
+const fn align_down(value: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    value & !(align - 1)
+}
+
+#[cfg(test)]
+pub(super) fn reset_itimer_registry_for_test() {
+    with_interval_timers(|timers| timers.clear());
+}
 /// `nanosleep(req, rem)`. Linux RV64 generic ABI
 /// `__NR_nanosleep = 101`.
 ///

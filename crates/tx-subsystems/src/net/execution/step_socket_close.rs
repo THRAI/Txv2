@@ -3,8 +3,8 @@ use tx_substrate::zone::Cap;
 use crate::execution::{Guard, StepOutcome};
 use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::structure::{
-    AcceptWireSet, ConnectionKey, RecvWireSet, SendWireSet, SocketIdentity, SocketProtocol,
-    TcpState, UdpInner,
+    AcceptWireSet, ConnectionKey, RecvWireSet, SendWireSet, SockShutdownCmd, SocketIdentity,
+    SocketProtocol, TcpState, UdpInner,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -18,7 +18,7 @@ pub struct SocketCloseOutcome {
 
 pub fn step_socket_close(
     socket: &Cap<SocketIdentity>,
-    _guard: &Guard<'_>,
+    guard: &Guard<'_>,
 ) -> StepOutcome<SocketCloseOutcome> {
     let Some(payload) = socket.live_payload() else {
         return StepOutcome::Done(SocketCloseOutcome::default());
@@ -35,6 +35,11 @@ pub fn step_socket_close(
         }
         SocketProtocol::Tcp(TcpState::Connecting { local, remote })
         | SocketProtocol::Tcp(TcpState::Connected { local, remote }) => {
+            if let Some(peer) =
+                SOCKET_TABLE.lookup_tcp_connection(ConnectionKey::new(remote, local), guard)
+            {
+                mark_tcp_peer_broken(&peer);
+            }
             bindings_withdrawn += withdraw_ok(
                 SOCKET_TABLE.withdraw_tcp_connection(ConnectionKey::new(local, remote)),
             );
@@ -71,6 +76,19 @@ pub fn step_socket_close(
         send_woken,
         accept_woken,
     })
+}
+
+fn mark_tcp_peer_broken(peer: &Cap<SocketIdentity>) {
+    let Some(payload) = peer.acquire_operational() else {
+        return;
+    };
+    if let Some(raw_tcp) = payload.raw_tcp_socket() {
+        raw_tcp.abort();
+    }
+    payload.mark_shutdown(SockShutdownCmd::Both);
+    payload.refresh_io_from_raw();
+    peer.readiness.fire_recv(RecvWireSet::BROKEN);
+    peer.readiness.fire_send(SendWireSet::BROKEN);
 }
 
 fn withdraw_ok<T>(result: Result<T, tx_substrate::mutation::MutationError>) -> usize {

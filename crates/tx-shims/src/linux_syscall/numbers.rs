@@ -876,7 +876,11 @@ pub const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 pub const NR_NANOSLEEP: u64 = 101;
 /// `getitimer(which, curr_value)`. Linux RV64 generic ABI `__NR_getitimer = 102`.
 pub const NR_GETITIMER: u64 = 102;
-/// `setitimer(which, new_value, old_value)`. Linux RV64 generic ABI `__NR_setitimer = 103`.
+/// `setitimer(which, new_value, old_value)`. Linux RV64 generic ABI
+/// `__NR_setitimer = 103`.
+///
+/// Wires the validation/copy surface needed by netperf and LTP, and
+/// arms interval-timer delivery on kernel-to-user return.
 pub const NR_SETITIMER: u64 = 103;
 /// `clock_gettime(clk_id, ts)`. Linux RV64 generic ABI
 /// `__NR_clock_gettime = 113`.
@@ -945,6 +949,13 @@ pub const CLOCK_TAI: u32 = 11;
 /// (which is independent of relative-vs-absolute interpretation —
 /// already-past deadlines short-circuit either way).
 pub const TIMER_ABSTIME: u32 = 0x1;
+
+/// `setitimer` selector: wall-clock timer delivering SIGALRM.
+pub const ITIMER_REAL: i32 = 0;
+/// `setitimer` selector: user CPU timer delivering SIGVTALRM.
+pub const ITIMER_VIRTUAL: i32 = 1;
+/// `setitimer` selector: process CPU timer delivering SIGPROF.
+pub const ITIMER_PROF: i32 = 2;
 
 /// Tick frequency for `times(2)`'s return value (Linux's
 /// `_SC_CLK_TCK`). Linux's RV64 generic ABI ships this as 100Hz —

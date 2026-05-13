@@ -9,10 +9,12 @@ use crate::linux_syscall::{
     NR_SENDTO, NR_SETSOCKOPT, NR_SOCKET, O_CLOEXEC, O_NONBLOCK, O_RDWR, SOL_SOCKET, SO_ERROR,
     SO_RCVTIMEO, SO_REUSEADDR, SO_TYPE,
 };
+use alloc::vec;
 use tx_subsystems::net::execution::{step_process_loopback_pending, LoopbackPollBudget};
 use tx_subsystems::net::protocol::{
     build_icmpv4_echo_request_message, loopback_iface, parse_icmpv4_payload,
 };
+use tx_subsystems::net::PollMask;
 use tx_subsystems::net::{Icmpv4EchoPacket, Icmpv4Event, Ipv4Address};
 use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
 
@@ -170,6 +172,52 @@ fn dispatch_bind_listen_getsockname_round_trips_inet_addr() {
     assert_eq!(u16::from_le_bytes([out[0], out[1]]), AF_INET);
     assert_eq!(u16::from_be_bytes([out[2], out[3]]), 49_101);
     assert_eq!(&out[4..8], &[127, 0, 0, 1]);
+}
+
+#[test]
+fn dispatch_bind_zero_port_assigns_ephemeral_port() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_stream(&ctx, SOCK_STREAM);
+
+    let addr = sockaddr_in([0, 0, 0, 0], 0);
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                fd as u64,
+                addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out = [0u8; SOCKADDR_IN_BYTES as usize];
+    let mut out_len = SOCKADDR_IN_BYTES;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKNAME,
+            [
+                fd as u64,
+                out.as_mut_ptr() as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out_len, SOCKADDR_IN_BYTES);
+    let port = u16::from_be_bytes([out[2], out[3]]);
+    assert!((49_152..49_216).contains(&port));
+    assert_eq!(&out[4..8], &[0, 0, 0, 0]);
 }
 
 #[test]
@@ -332,6 +380,122 @@ fn dispatch_fcntl_setfl_nonblock_affects_socket_recvfrom() {
         ),
         SyscallResult::Error(11)
     );
+}
+
+#[test]
+fn pselect_socket_read_ready_includes_hup_and_errors() {
+    assert!(crate::linux_syscall::io::pselect_socket_read_ready(
+        true,
+        PollMask::HUP
+    ));
+    assert!(crate::linux_syscall::io::pselect_socket_read_ready(
+        true,
+        PollMask::RDHUP
+    ));
+    assert!(crate::linux_syscall::io::pselect_socket_read_ready(
+        true,
+        PollMask::ERR
+    ));
+    assert!(!crate::linux_syscall::io::pselect_socket_read_ready(
+        false,
+        PollMask::IN
+    ));
+}
+
+#[test]
+fn dispatch_recvfrom_large_user_buffer_returns_short_read() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let server_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let client_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let server_addr = sockaddr_in([127, 0, 0, 1], 49_105);
+    let client_addr = sockaddr_in([127, 0, 0, 1], 49_106);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                server_fd as u64,
+                server_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                client_fd as u64,
+                client_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let payload = *b"netperf-drain";
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                client_fd as u64,
+                payload.as_ptr() as u64,
+                payload.len() as u64,
+                0,
+                server_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+
+    let moved = {
+        let guard = tx_substrate::epoch::guard();
+        match step_process_loopback_pending(
+            smoltcp::time::Instant::ZERO,
+            loopback_iface(),
+            LoopbackPollBudget::default(),
+            &guard,
+        ) {
+            tx_substrate::step::StepOutcome::Done(outcome) => outcome,
+            other => panic!("unexpected loopback outcome: {other:?}"),
+        }
+    };
+    assert_eq!(moved.udp_bytes_moved, payload.len());
+
+    let mut out = vec![0u8; 0x40000];
+    let mut source_addr = [0u8; SOCKADDR_IN_BYTES as usize];
+    let mut source_len = SOCKADDR_IN_BYTES;
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                server_fd as u64,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+                0,
+                source_addr.as_mut_ptr() as u64,
+                (&mut source_len as *mut u32) as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+    assert_eq!(&out[..payload.len()], &payload);
+    assert_eq!(source_len, SOCKADDR_IN_BYTES);
+    assert_eq!(u16::from_be_bytes([source_addr[2], source_addr[3]]), 49_106);
+    assert_eq!(&source_addr[4..8], &[127, 0, 0, 1]);
 }
 
 #[test]

@@ -353,6 +353,8 @@ fn rv64_generic_syscall_names() -> HashMap<u64, &'static str> {
         (99, "set_robust_list"),
         (100, "get_robust_list"),
         (101, "nanosleep"),
+        (102, "getitimer"),
+        (103, "setitimer"),
         (113, "clock_gettime"),
         (114, "clock_getres"),
         (115, "clock_nanosleep"),

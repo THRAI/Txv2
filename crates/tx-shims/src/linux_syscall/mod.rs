@@ -170,6 +170,8 @@ pub use user_layout::{
 mod helpers;
 pub(super) use helpers::*;
 
+pub use time::maybe_deliver_itimer_signal;
+
 #[cfg(test)]
 mod tests;
 
@@ -641,6 +643,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_CLOCK_GETRES => sys_clock_getres(req.args, ctx),
         nr if nr == NR_NANOSLEEP => sys_nanosleep::<P>(req.args, ctx).await,
         nr if nr == NR_CLOCK_NANOSLEEP => sys_clock_nanosleep::<P>(req.args, ctx).await,
+        nr if nr == NR_SETITIMER => sys_setitimer::<P>(req.args, ctx),
         // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY
         // routing. Without this, musl's `isatty(STDIN_FILENO)` check
         // returns false, the shell starts in non-interactive mode, no
