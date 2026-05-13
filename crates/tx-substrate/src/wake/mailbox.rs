@@ -59,6 +59,10 @@ impl WaitGeneration {
     pub const fn raw(self) -> u64 {
         self.0
     }
+    /// Sentinel zero value — used by `YieldResolved::PLACEHOLDER` and
+    /// other callers that have no wait generation in scope (e.g. kernel
+    /// actors that never actually park).
+    pub const ZERO: Self = Self(0);
 }
 
 /// Classification of a [`MailboxEvent::SignalDelivered`] post per
@@ -199,6 +203,12 @@ pub const MAILBOX_QUEUE_BOUND: usize = 64;
 /// **Not tied to `ProcessIdentity`.** A process may have many
 /// reactor tasks (user threads, kthreads, OnBehalfOf-borrowed scope
 /// workers); each owns its own mailbox.
+///
+/// `task_id_low` carries the low 32 bits of the task's trace
+/// identity (thread TID, or 0 for kernel actors). Set at
+/// construction via [`Self::with_task_id`]; read by
+/// [`WaitSource::notify_emit`] when emitting
+/// `PayloadWaitSourceNotify` records.
 pub struct TaskMailbox {
     generation: AtomicU64,
     queue: SpinMutex<VecDeque<MailboxEvent>>,
@@ -208,9 +218,18 @@ pub struct TaskMailbox {
     /// [`Self::post`] when an event arrives so the parked future
     /// gets a re-poll signal. PR-3D step 1.
     waker: SpinMutex<Option<Waker>>,
+    /// Low 32 bits of the task's trace identity (thread TID for
+    /// user threads, 0 for kernel actors). Populated at construction
+    /// via [`Self::with_task_id`]; read by `notify_emit` and other
+    /// substrate convergence-point emitters (OBS-4 / γ-fix).
+    task_id_low: u32,
 }
 
 impl TaskMailbox {
+    /// Construct a mailbox with no task-id attached (kernel actors,
+    /// tests that do not exercise the task-id field). The trace
+    /// identity will be `task_id_low = 0`, which is the documented
+    /// value for kernel-internal actors.
     pub fn new() -> Self {
         Self {
             // Generations are 1-based; `WaitGeneration::new(0)` is a
@@ -220,7 +239,35 @@ impl TaskMailbox {
             queue: SpinMutex::new(VecDeque::new()),
             overflow: AtomicBool::new(false),
             waker: SpinMutex::new(None),
+            task_id_low: 0,
         }
+    }
+
+    /// Builder: attach a task trace identity to this mailbox.
+    ///
+    /// Pass the low 32 bits of the thread/task's canonical trace id
+    /// (typically `Tid.0` for user threads). Kernel actors that have
+    /// no stable identity should use `new()` (implicitly `task_id_low
+    /// = 0`).
+    ///
+    /// ```ignore
+    /// let mailbox = Arc::new(TaskMailbox::new().with_task_id(tid.0));
+    /// ```
+    #[must_use]
+    pub fn with_task_id(mut self, task_id_low: u32) -> Self {
+        self.task_id_low = task_id_low;
+        self
+    }
+
+    /// Low 32 bits of the task's trace identity.
+    ///
+    /// Reads the value set at construction via [`Self::with_task_id`].
+    /// Returns `0` for mailboxes constructed with [`Self::new()`]
+    /// that have not called `with_task_id`. A return value of `0`
+    /// is the documented sentinel for kernel-internal actors.
+    #[inline]
+    pub fn task_id_low(&self) -> u32 {
+        self.task_id_low
     }
 
     /// Register a `core::task::Waker` to be woken when an event is

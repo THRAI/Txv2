@@ -9,7 +9,14 @@ pub mod devfs;
 pub mod devpts {}
 pub mod procfs {}
 pub mod tmpfs;
-pub mod tx_ext4 {}
+
+pub mod tx_ext4 {
+    pub use crate::tx_ext4_bridge::*;
+    pub use tx_ext4::mount::{mount_ext4_read_only, Ext4MountWire};
+    pub use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
+    pub use tx_ext4_format::{Ext4FormatError, Result as Ext4Result};
+}
+mod tx_ext4_bridge;
 
 #[cfg(test)]
 mod initramfs_tests;

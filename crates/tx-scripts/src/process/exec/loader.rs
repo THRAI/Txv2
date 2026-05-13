@@ -11,10 +11,15 @@
 //!   txdoc:EXEC-8-5-PROGRAM-HEADER-VALIDATION
 //!   txdoc:EXEC-8-6-AT-PHDR-COMPUTATION
 //!
-//! Out of scope for the slice (per the plan):
-//!   - ET_DYN / static-PIE handling (Open Q #5 DECIDED 2026-05-06).
-//!   - PT_INTERP / dynamic linker.
-//!   - PT_DYNAMIC.
+//! Supported ELF types:
+//!   - `ET_EXEC`: static executables (load_bias = 0, absolute VAs).
+//!   - `ET_DYN`: static-PIE (position-independent, no `DT_NEEDED`, zero
+//!     relocations). The kernel chooses a fixed load bias
+//!     (`ET_DYN_LOAD_BIAS`) and shifts all virtual addresses. No dynamic
+//!     linker is loaded; `PT_INTERP` / `PT_DYNAMIC` are silently ignored.
+//!
+//! Out of scope for the slice:
+//!   - Full dynamic linking (PT_INTERP interpreter load + relocation).
 //!   - relocations and debug info.
 //!   - elf32 (RV64 only).
 //!
@@ -27,17 +32,10 @@ use alloc::vec::Vec;
 
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::header::header64;
-#[cfg(not(target_arch = "loongarch64"))]
-use goblin::elf::header::EM_RISCV;
 use goblin::elf::header::{
-    Header, EI_CLASS, EI_DATA, EI_VERSION, ELFCLASS64, ELFDATA2LSB, ET_EXEC, EV_CURRENT,
+    Header, EI_CLASS, EI_DATA, EI_VERSION, ELFCLASS64, ELFDATA2LSB, EM_RISCV, ET_DYN, ET_EXEC,
+    EV_CURRENT,
 };
-
-/// Expected `e_machine` for this kernel build.
-#[cfg(target_arch = "loongarch64")]
-const EXPECTED_E_MACHINE: u16 = 0x102;
-#[cfg(not(target_arch = "loongarch64"))]
-const EXPECTED_E_MACHINE: u16 = EM_RISCV;
 use goblin::elf::program_header::{
     ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_PHDR,
 };
@@ -54,6 +52,14 @@ const PAGE_SIZE: u64 = 4096;
 /// `EXEC-8-4`'s MAX_PHDRS). Keeps targeted reads bounded.
 const MAX_PHDRS: u16 = 64;
 
+/// Fixed load bias applied to `ET_DYN` (static-PIE) images.
+///
+/// Linux uses a random base for ASLR; the competition slice uses a
+/// fixed value so test programs land at predictable addresses.
+/// Must be a multiple of `PAGE_SIZE` so the ELF congruence invariant
+/// (`p_vaddr % p_align == p_offset % p_align`) is preserved after bias.
+pub(crate) const ET_DYN_LOAD_BIAS: u64 = 0x10000;
+
 /// Minimum ELF64 header size (`Elf64_Ehdr`), in bytes.
 const ELF64_EHDR_SIZE: usize = 64;
 
@@ -66,11 +72,10 @@ pub enum ParseError {
     /// `e_machine` is not `EM_RISCV` (only RV64 is supported in the
     /// slice).
     Arch,
-    /// `e_type` is not `ET_EXEC`. (`ET_DYN` is out of scope per the
-    /// plan.)
+    /// `e_type` is neither `ET_EXEC` nor `ET_DYN`.
     Type,
-    /// `PT_INTERP` or `PT_DYNAMIC` was found — dynamic linking and
-    /// dynamic-section consumption are not supported in the slice.
+    /// `PT_INTERP` or `PT_DYNAMIC` was found in an `ET_EXEC` binary.
+    /// (`ET_DYN` static-PIE images silently ignore these segments.)
     HasInterp,
     /// At least one `PT_LOAD` is required.
     NoLoad,
@@ -142,6 +147,11 @@ pub struct ExecImagePlan {
     /// Optional BSS extension (the last writable LOAD's
     /// `memsz > filesz` tail).
     pub bss_extension: Option<BssTail>,
+    /// Load bias applied to this image's virtual addresses.
+    /// `0` for `ET_EXEC`; `ET_DYN_LOAD_BIAS` for static-PIE (`ET_DYN`).
+    /// All `vaddr` fields in `load_segments`, `entry`, and `at_phdr`
+    /// already have this value added — callers see final in-memory VAs.
+    pub load_bias: u64,
 }
 
 /// Parse the ELF header + program headers and produce an image plan.
@@ -176,12 +186,16 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
     {
         return Err(ParseError::Magic);
     }
-    if header.e_machine != EXPECTED_E_MACHINE {
+    if header.e_machine != EM_RISCV {
         return Err(ParseError::Arch);
     }
-    if header.e_type != ET_EXEC {
-        return Err(ParseError::Type);
-    }
+    // Accept both ET_EXEC (static, absolute VAs) and ET_DYN (static-PIE,
+    // relative VAs shifted by ET_DYN_LOAD_BIAS). Anything else is rejected.
+    let is_dyn = match header.e_type {
+        ET_EXEC => false,
+        ET_DYN => true,
+        _ => return Err(ParseError::Type),
+    };
 
     // ELF64 program-header size is fixed; assert and propagate.
     if header.e_phentsize as u64 != ELF64_PHENT {
@@ -213,12 +227,20 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
 
     for phdr in &phdrs {
         match phdr.p_type {
-            PT_INTERP | PT_DYNAMIC => return Err(ParseError::HasInterp),
+            PT_INTERP | PT_DYNAMIC if !is_dyn => {
+                // ET_EXEC must not have PT_INTERP or PT_DYNAMIC.
+                return Err(ParseError::HasInterp);
+            }
+            PT_INTERP | PT_DYNAMIC => {
+                // ET_DYN static-PIE: PT_INTERP / PT_DYNAMIC present but
+                // the kernel runs the binary directly at entry + load_bias.
+                // No interpreter is loaded; the segments are silently skipped.
+            }
             PT_PHDR => {
                 pt_phdr_vaddr = Some(phdr.p_vaddr);
             }
             PT_LOAD => {
-                load_segments.push(translate_load(phdr)?);
+                load_segments.push(translate_load(phdr, is_dyn)?);
             }
             // PT_TLS, PT_NOTE, PT_GNU_STACK, PT_GNU_RELRO,
             // PT_GNU_EH_FRAME, ... ignored at parse time. Phase 5
@@ -232,11 +254,36 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
         return Err(ParseError::NoLoad);
     }
 
-    // §8.5: page-rounded LOAD ranges must not overlap.
-    detect_overlap(&load_segments)?;
+    // Choose load bias: 0 for ET_EXEC (absolute VAs already in place),
+    // ET_DYN_LOAD_BIAS for static-PIE (relative VAs shifted to a fixed
+    // kernel-chosen base). Must be a multiple of PAGE_SIZE to preserve
+    // the ELF congruence invariant.
+    let load_bias: u64 = if is_dyn { ET_DYN_LOAD_BIAS } else { 0 };
 
-    // §8.6: AT_PHDR computation.
-    let at_phdr = compute_at_phdr(&header, &load_segments, pt_phdr_vaddr)?;
+    // §8.6: AT_PHDR computation — run on original (pre-bias) vaddrs
+    // so the delta arithmetic inside uses unshifted segment VAs, then
+    // add the bias to produce the final in-memory VA.
+    let at_phdr = compute_at_phdr(&header, &load_segments, pt_phdr_vaddr)?
+        .checked_add(load_bias)
+        .ok_or(ParseError::LoadSegment)?;
+
+    let entry = header
+        .e_entry
+        .checked_add(load_bias)
+        .ok_or(ParseError::LoadSegment)?;
+
+    // Shift all segment VAs by the load bias. After this point every
+    // address in `load_segments` is a final in-memory VA.
+    for seg in &mut load_segments {
+        seg.vaddr = seg
+            .vaddr
+            .checked_add(load_bias)
+            .ok_or(ParseError::LoadSegment)?;
+    }
+
+    // §8.5: page-rounded LOAD ranges must not overlap (checked on
+    // bias-adjusted VAs so the plan reflects the final in-memory layout).
+    detect_overlap(&load_segments)?;
 
     // BSS tail: at most one LOAD may have `memsz > filesz` for the
     // slice. (Multi-BSS LOADs are theoretically legal but unusual
@@ -244,19 +291,23 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
     let bss_extension = compute_bss_extension(&load_segments)?;
 
     Ok(ExecImagePlan {
-        entry: header.e_entry,
+        entry,
         at_phdr,
         at_phent: phent,
         at_phnum: phnum,
         load_segments,
         bss_extension,
+        load_bias,
     })
 }
 
 // ----------------------------------------------------------------------
 // Helpers
 
-fn translate_load(phdr: &ProgramHeader) -> Result<LoadSegment, ParseError> {
+/// `is_dyn`: when `true` (ET_DYN static-PIE), combined W+X `PT_LOAD`
+/// segments are accepted. Some linkers emit a single RWX segment for
+/// small position-independent programs.
+fn translate_load(phdr: &ProgramHeader, is_dyn: bool) -> Result<LoadSegment, ParseError> {
     // §8.5 program-header validation.
     if phdr.p_filesz > phdr.p_memsz {
         return Err(ParseError::LoadSegment);
@@ -284,14 +335,16 @@ fn translate_load(phdr: &ProgramHeader) -> Result<LoadSegment, ParseError> {
         return Err(ParseError::LoadSegment);
     }
 
-    // Reject prot == 0 and W+X (matches `EXEC-8-5`'s policy).
+    // Reject prot == 0. W+X is rejected for ET_EXEC per `EXEC-8-5`
+    // policy but allowed for ET_DYN static-PIE, where some linkers
+    // emit a single combined RWX PT_LOAD for small programs.
     let readable = phdr.p_flags & PF_R != 0;
     let writable = phdr.p_flags & PF_W != 0;
     let executable = phdr.p_flags & PF_X != 0;
     if !(readable || writable || executable) {
         return Err(ParseError::LoadSegment);
     }
-    if writable && executable {
+    if !is_dyn && writable && executable {
         return Err(ParseError::LoadSegment);
     }
 
@@ -373,10 +426,11 @@ fn compute_at_phdr(
     Err(ParseError::Phdr)
 }
 
-/// Returns the BSS extension for the unique LOAD segment whose
-/// `memsz > filesz`. Returns `Err(ParseError::LoadSegment)` if
-/// multiple LOADs have such a tail (TODO: handle multi-BSS in a
-/// future slice).
+/// Returns the BSS extension for the last LOAD segment whose
+/// `memsz > filesz`. Multiple BSS-extending LOADs are legal ELF
+/// (e.g. LA64 busybox has two: .relro_padding and .data/.bss).
+/// The VM mapper handles BSS per-segment; this keeps the last tail
+/// for auxv / debug consumers.
 fn compute_bss_extension(load_segments: &[LoadSegment]) -> Result<Option<BssTail>, ParseError> {
     let mut found: Option<BssTail> = None;
     for seg in load_segments {

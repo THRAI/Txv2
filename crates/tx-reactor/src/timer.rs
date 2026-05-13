@@ -34,7 +34,7 @@ pub use crate::adapter::bus_wire::{TimerGuard, TimerGuardRole, TimerToken, Timer
 // =========================================================================
 
 #[derive(Clone)]
-pub(crate) struct TimerQueue {
+pub struct TimerQueue {
     state: Arc<SpinLock<TimerQueueState>>,
 }
 
@@ -57,14 +57,14 @@ struct TimerWaiter {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InternalTimerToken(usize);
 
-pub(crate) struct DeadlineFuture {
+pub struct DeadlineFuture {
     timers: TimerQueue,
     deadline_ns: u64,
     token: Option<InternalTimerToken>,
 }
 
 impl TimerQueue {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: Arc::new(SpinLock::new(TimerQueueState {
                 now_ns: 0,
@@ -74,7 +74,7 @@ impl TimerQueue {
         }
     }
 
-    pub(crate) fn advance_time_to(&self, now_ns: u64) -> usize {
+    pub fn advance_time_to(&self, now_ns: u64) -> usize {
         let mut wakers = Vec::new();
         {
             let mut state = self.state.lock();
@@ -97,7 +97,7 @@ impl TimerQueue {
         woke
     }
 
-    pub(crate) fn next_deadline_ns(&self) -> Option<u64> {
+    pub fn next_deadline_ns(&self) -> Option<u64> {
         self.state
             .lock()
             .timers
@@ -106,7 +106,7 @@ impl TimerQueue {
             .min()
     }
 
-    pub(crate) fn wait_until(&self, deadline_ns: u64) -> DeadlineFuture {
+    pub fn wait_until(&self, deadline_ns: u64) -> DeadlineFuture {
         DeadlineFuture {
             timers: self.clone(),
             deadline_ns,
@@ -119,6 +119,12 @@ impl TimerQueue {
         if let Some(index) = state.timers.iter().position(|waiter| waiter.token == token) {
             state.timers.swap_remove(index);
         }
+    }
+}
+
+impl Default for TimerQueue {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

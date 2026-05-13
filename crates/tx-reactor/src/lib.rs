@@ -48,6 +48,6 @@ pub use scheduler::{
     SliceConfig, StopReason, TaskHandle, WakeHint,
 };
 pub use task::{TaskDrainRecord, TaskId, TaskKey, TaskLifecycleError, TaskStatus};
-pub use timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
+pub use timer::{DeadlineFuture, TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
 pub use wait_source::{PreparedWaitRegistration, SubscriberId, WaitRegistrationGuard, WaitSource};
 pub use yield_now::{yield_now, YieldNow};

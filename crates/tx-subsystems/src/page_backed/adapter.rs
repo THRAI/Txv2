@@ -17,7 +17,7 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine outcome types, zone role types, page-allocator primitives (BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy), EBR guard, and SpinMutex used by the page_backed subsystem's per-variant fetch/write step ops"
 )]
 pub mod step_engine {
-    pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::epoch::{self as epoch, borrow_current_guard, guard, Guard};
     pub use tx_substrate::page_allocator::{
         self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,
     };

@@ -12,7 +12,7 @@
 //! (`SyscallCtx<'a>` syscall arms, PR-9 phase 5) hand the constructors
 //! clones of caps they already hold; placeholder/test callers mint
 //! caps through the normal zone reserve/sign path. The placeholder
-//! types (`step_v3::ProcessIdentity`, `ThreadIdentity`, `Credential`,
+//! types (`step::ProcessIdentity`, `ThreadIdentity`, `Credential`,
 //! `RestrictionStackHandle`) implement `ZoneAllocated` against
 //! dedicated static placeholder zones so these tests can stand up a
 //! real cap without depending on `tx-subsystems`.

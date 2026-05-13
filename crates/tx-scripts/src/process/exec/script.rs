@@ -43,7 +43,7 @@
 
 use alloc::vec::Vec;
 
-use tx_hal::{Arch, EntropyIf, PmapIf, UserTrapContext};
+use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
 use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{read_exact_at, PageContainer};
@@ -76,6 +76,14 @@ const USER_PAGE_SIZE: u64 = 4096;
 /// If a future image carries more program headers, the parser's
 /// `MAX_PHDRS` cap rejects it before this read undershoots.
 const INITIAL_PARSE_READ: usize = 4096;
+
+/// Cumulative count of times the shebang (`#!`) handler fired.
+pub static EXEC_SHEBANG_FIRED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Errno from the most recent `step_open` failure in `exec_script`.
+pub static EXEC_LAST_OPEN_ERRNO: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(0);
 
 /// Linux-flavoured exec errors. Mapped to `-errno` by the syscall arm
 /// (Phase 6 of the ELF-loader plan, out of scope here).
@@ -253,29 +261,32 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // `vm::execution::fault_script`.
     let openfile = {
         use StepOutcome as V3;
+        let guard = step_engine::guard();
         let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
-        let outcome = {
-            let guard = step_engine::guard();
-            poll_walker_synchronously(step_open(
-                rooted_at,
-                path,
-                OpenFileFlags {
-                    read: true,
-                    write: false,
-                    append: false,
-                    cloexec: false,
-                    nonblocking: false,
-                },
-                0,
-                cred,
-                &guard,
-            ))
-        };
-        match outcome {
+        let outcome = poll_walker_synchronously(step_open(
+            rooted_at,
+            path,
+            OpenFileFlags {
+                read: true,
+                write: false,
+                append: false,
+                cloexec: false,
+                nonblocking: false,
+            },
+            0,
+            cred,
+            &guard,
+        ));
+        let result = match outcome {
             V3::Done(file) => Ok(file),
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
-            V3::Err(err) => Err(ExecError::from_walker_errno(Errno::from(err))),
-        }?
+            V3::Err(err) => {
+                EXEC_LAST_OPEN_ERRNO.store(err as i32, core::sync::atomic::Ordering::Relaxed);
+                Err(ExecError::from_walker_errno(Errno::from(err)))
+            }
+        };
+        drop(guard);
+        result?
     };
 
     // Snapshot the file's `Cap<PageContainer>` once. The exec image's
@@ -330,7 +341,42 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
             V3::Err(err) => Err(ExecError::from_read_errno(err.into())),
         };
+        drop(guard);
         result?;
+    }
+
+    // ===== Phase 2.5 — shebang (#!) dispatch ===========================
+    //
+    // If the file starts with "#!" treat it as a script: parse the
+    // interpreter path (and optional single argument) from the first
+    // line, then re-invoke exec_script with the interpreter as the new
+    // target.  Mirrors Linux binfmt_script.  One level of recursion is
+    // sufficient (the interpreter itself must be a real ELF binary).
+    if header_bytes.starts_with(b"#!") {
+        if let Some((interp, opt_arg)) = shebang_parse(&header_bytes) {
+            EXEC_SHEBANG_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // Build new argv: [interp, opt_arg?, script_path, argv[1..]...]
+            let mut new_argv: Vec<Vec<u8>> = Vec::new();
+            new_argv.push(interp.to_vec());
+            if let Some(arg) = opt_arg {
+                new_argv.push(arg.to_vec());
+            }
+            new_argv.push(path.to_vec());
+            for &a in argv.iter().skip(1) {
+                new_argv.push(a.to_vec());
+            }
+            let interp_path: Vec<u8> = interp.to_vec();
+            let new_argv_refs: Vec<&[u8]> = new_argv.iter().map(|v| v.as_slice()).collect();
+            return alloc::boxed::Box::pin(exec_script::<P>(
+                process,
+                thread,
+                &interp_path,
+                &new_argv_refs,
+                envp,
+                cred,
+            ))
+            .await;
+        }
     }
 
     // ===== Phase 3 — parse + validate (pure CPU) =====================
@@ -430,21 +476,14 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         if partial_in_page == 0 {
             continue;
         }
-        let partial_page_start = file_end - partial_in_page;
-        let copy_start = partial_page_start.max(segment.vaddr);
-        let copy_len = file_end
-            .checked_sub(copy_start)
-            .ok_or(ExecError::NotExecutable)?;
-        if copy_len == 0 {
-            continue;
-        }
-        // File offset of `copy_start`. For unaligned ELF LOAD
-        // segments, the rounded-down page start can be below
-        // `segment.vaddr`; those leading bytes are not part of the
-        // segment and must remain zero in the anon page.
+        let partial_start = file_end - partial_in_page;
+        // File offset of `partial_start`. The segment's
+        // `file_offset` corresponds to `vaddr`; offsetting by
+        // `partial_start - vaddr` gives the file offset of the
+        // partial-last-page's start.
         let file_off = segment
             .file_offset
-            .checked_add(copy_start - segment.vaddr)
+            .checked_add(partial_start - segment.vaddr)
             .ok_or(ExecError::NotExecutable)?;
         let mut buf = alloc::vec![0u8; partial_in_page as usize];
         {
@@ -456,7 +495,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
                 V3::Err(_) => return Err(ExecError::NotExecutable),
             }
         }
-        match vm_scripts::populate_detached_user_range(&new_aspace, copy_start, &buf).await {
+        match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
             StepOutcome::Done(()) => {}
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
                 return Err(ExecError::Busy);
@@ -612,20 +651,17 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
 }
 
 /// Compose a fresh `UserTrapContext` for the new image's first
-/// userspace entry. The register file is zeroed (per System V psABI:
+/// userspace entry. RV64 register file is zeroed (per System V psABI:
 /// `_start` reads its arguments off the stack, not registers); only
-/// `pc`, the architecture's stack-pointer register, and `status` are
-/// seeded here.
+/// `pc`, `sp` (= `regs[2]`), and `status` are seeded here.
 ///
 /// `status` is left at zero — the platform's
 /// `restore_user_context` decides how to compose `sstatus` for the
 /// fresh image (typically a U-mode entry with interrupts enabled).
-pub(crate) fn make_initial_user_trap_context(pc: usize, sp: usize) -> UserTrapContext {
+fn make_initial_user_trap_context(pc: usize, sp: usize) -> UserTrapContext {
     let mut regs = [0usize; 32];
+    // Arch-specific SP register (x2 on RV64, x3 on LA64).
     regs[initial_user_sp_reg()] = sp;
-    if let Some(tls_reg) = initial_user_tls_reg() {
-        regs[tls_reg] = sp;
-    }
     UserTrapContext {
         regs,
         pc,
@@ -634,37 +670,19 @@ pub(crate) fn make_initial_user_trap_context(pc: usize, sp: usize) -> UserTrapCo
     }
 }
 
-fn initial_user_tls_reg() -> Option<usize> {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        Some(2)
-    }
-    #[cfg(not(target_arch = "loongarch64"))]
-    {
-        None
-    }
-}
-
-pub(crate) const fn initial_user_sp_reg_for_arch(arch: Arch) -> usize {
+/// Translate the parser's segment-flag shape (`bool`-named fields) to
+/// the vm-scripts shape (different field names).
+pub(crate) const fn initial_user_sp_reg_for_arch(arch: tx_hal::Arch) -> usize {
     match arch {
-        Arch::Riscv64 => 2,
-        Arch::LoongArch64 => 3,
+        tx_hal::Arch::Riscv64 => 2,
+        tx_hal::Arch::LoongArch64 => 3,
     }
 }
 
 fn initial_user_sp_reg() -> usize {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        initial_user_sp_reg_for_arch(Arch::LoongArch64)
-    }
-    #[cfg(not(target_arch = "loongarch64"))]
-    {
-        initial_user_sp_reg_for_arch(Arch::Riscv64)
-    }
+    initial_user_sp_reg_for_arch(tx_hal::Arch::Riscv64)
 }
 
-/// Translate the parser's segment-flag shape (`bool`-named fields) to
-/// the vm-scripts shape (different field names).
 const fn translate_flags(parsed: ParsedSegmentFlags) -> VmSegmentFlags {
     VmSegmentFlags {
         read: parsed.readable,
@@ -798,8 +816,7 @@ fn poll_walker_synchronously<F: core::future::Future>(future: F) -> F::Output {
 /// `txdoc:VFS-CHECKS-PERMISSIONS-1`.
 fn check_exec_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), ExecError> {
     let mode = meta.mode as u32;
-    let any_x = (mode & 0o111) != 0;
-    if cred.effective_caps.contains(Capability::DAC_OVERRIDE) && any_x {
+    if cred.effective_caps.contains(Capability::DAC_OVERRIDE) {
         return Ok(());
     }
     let bits = if cred.uid == meta.uid {
@@ -824,6 +841,69 @@ fn check_exec_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), ExecError>
 // value" decision is made structurally by Phase 6 of the ELF-loader
 // plan rather than encoded in this function's return type. See the
 // report accompanying Phase 5.
+
+/// Parse a `#!` shebang line from the start of a file's header bytes.
+/// Returns `(interpreter_path, optional_arg)` slices into `header`, or
+/// `None` if the line is malformed (empty interpreter path).
+///
+/// Format: `#! <whitespace>? <interp> <whitespace> <opt_arg>? <newline>`
+/// Only the first argument after the interpreter is captured (Linux
+/// binfmt_script passes at most one optional argument).
+fn shebang_parse(header: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+    debug_assert!(header.starts_with(b"#!"));
+    let line_end = header[2..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| i + 2)
+        .unwrap_or(header.len());
+    let line = shebang_trim_start(&header[2..line_end]);
+    if line.is_empty() {
+        return None;
+    }
+    let (interp, rest) = shebang_split_word(line);
+    let interp = shebang_trim_end(interp);
+    if interp.is_empty() {
+        return None;
+    }
+    let rest = shebang_trim_start(rest);
+    let opt_arg = if rest.is_empty() {
+        None
+    } else {
+        let (arg, _) = shebang_split_word(rest);
+        let arg = shebang_trim_end(arg);
+        if arg.is_empty() {
+            None
+        } else {
+            Some(arg)
+        }
+    };
+    Some((interp, opt_arg))
+}
+
+fn shebang_trim_start(s: &[u8]) -> &[u8] {
+    let i = s
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(s.len());
+    &s[i..]
+}
+
+fn shebang_trim_end(s: &[u8]) -> &[u8] {
+    let i = s
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t' && b != b'\r')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    &s[..i]
+}
+
+fn shebang_split_word(s: &[u8]) -> (&[u8], &[u8]) {
+    let i = s
+        .iter()
+        .position(|&b| b == b' ' || b == b'\t')
+        .unwrap_or(s.len());
+    (&s[..i], &s[i..])
+}
 
 #[cfg(test)]
 mod tests;

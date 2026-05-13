@@ -231,6 +231,9 @@ fn collect_files_inner(
             if matches!(rel.as_str(), ".git" | "target") || rel.ends_with("/target") {
                 continue;
             }
+            if rel.starts_with(".claude/worktrees/") {
+                continue;
+            }
             collect_files_inner(root, &path, extensions, out)?;
         } else if path
             .extension()

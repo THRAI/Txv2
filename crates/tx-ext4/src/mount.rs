@@ -33,6 +33,10 @@ where
     }
 }
 
+/// Wire type so the tx-fs bridge crate can name the mounted
+/// type without depending on the full `tx_ext4` lib.
+pub type Ext4MountWire = MountedExt4<tx_ext4_format::pager::Page4K>;
+
 pub fn mount_ext4_read_only<I>(image: I) -> Result<MountedExt4<I>, Errno>
 where
     I: BlockImage + Send + 'static,

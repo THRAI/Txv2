@@ -86,6 +86,20 @@ pub trait SubjectIdentity: 'static {
     /// Wait-source id of this subject's exit channel. `None` for
     /// zombies (the channel is unreachable after payload teardown).
     fn exit_source(&self) -> Option<WaitSourceId>;
+
+    /// Low 32 bits of this subject's task trace identity.
+    ///
+    /// Used by `PayloadDriveBegin` to populate `task_id_low` so the
+    /// daemon's `compute_flow_id` hashes the right identity (OBS-4 /
+    /// γ-fix). Implementations should return the TID or PID low
+    /// 32 bits; kernel actors with no stable identity return `0`.
+    ///
+    /// Default: `0`. Concrete subsystem impls override this to
+    /// return their thread TID or process PID so flow arrows in
+    /// Perfetto traces are attributed to the right task.
+    fn task_id_low(&self) -> u32 {
+        0
+    }
 }
 
 /// Narrow view of a credential. Exposes only what `step_v3` algebra

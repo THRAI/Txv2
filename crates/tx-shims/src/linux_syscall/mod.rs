@@ -586,15 +586,14 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         // for v1 (CLOCK_REALTIME has no boot-time RTC offset yet;
         // CPU-time clocks have no per-process accounting yet —
         // documented at the constant declarations in `numbers.rs`).
-        // `nanosleep` / `clock_nanosleep` ship the zero-duration /
-        // past-deadline short-circuit only; non-zero durations return
-        // `-ENOSYS` (deferred — needs a per-task timer-fire wait
-        // carrier the slice does not yet wire).
+        // `nanosleep` / `clock_nanosleep` park the task on the reactor
+        // timer queue for real-duration sleeps; zero-duration and
+        // past-deadline cases short-circuit immediately.
         nr if nr == NR_CLOCK_GETTIME => sys_clock_gettime::<P>(req.args, ctx),
         nr if nr == NR_GETTIMEOFDAY => sys_gettimeofday::<P>(req.args, ctx),
         nr if nr == NR_TIMES => sys_times::<P>(req.args, ctx),
-        nr if nr == NR_NANOSLEEP => sys_nanosleep::<P>(req.args, ctx),
-        nr if nr == NR_CLOCK_NANOSLEEP => sys_clock_nanosleep::<P>(req.args, ctx),
+        nr if nr == NR_NANOSLEEP => sys_nanosleep::<P>(req.args, ctx).await,
+        nr if nr == NR_CLOCK_NANOSLEEP => sys_clock_nanosleep::<P>(req.args, ctx).await,
         // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY
         // routing. Without this, musl's `isatty(STDIN_FILENO)` check
         // returns false, the shell starts in non-interactive mode, no

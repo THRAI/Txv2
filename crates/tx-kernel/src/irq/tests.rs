@@ -21,8 +21,8 @@ use std::sync::Mutex;
 
 use tx_hal::{
     AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
-    IrqDispatchTable, IrqHandled, IrqIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError,
-    PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot, PtNode,
+    IrqDispatchTable, IrqHandled, IrqIf, ObserverIf, PhysAddr, PlatformConfig, PlatformInfo,
+    PmapError, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
 
 use crate::init::{console_tty, CoreInit};
@@ -148,6 +148,7 @@ impl tx_hal::DmaIf for IrqTestPlatform {}
 impl tx_hal::SmpIf for IrqTestPlatform {}
 
 impl tx_hal::EntropyIf for IrqTestPlatform {}
+impl ObserverIf for IrqTestPlatform {}
 
 impl tx_hal::PowerIf for IrqTestPlatform {
     fn system_off() -> ! {

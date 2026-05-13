@@ -22,7 +22,9 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine outcome types, zone role types, EBR guard, and SpinMutex used by tx-kernel init and bootstrap wiring"
 )]
 pub mod step_engine {
-    pub use tx_substrate::epoch::{drain_with_budget, guard, Guard};
+    pub use tx_substrate::epoch::{
+        self as epoch, cpu_summary, drain_with_budget, guard, summary, Guard,
+    };
     pub use tx_substrate::step::{
         ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     };

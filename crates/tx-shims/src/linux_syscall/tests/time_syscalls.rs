@@ -10,7 +10,6 @@ use crate::linux_syscall::{
 
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
-const E_NOSYS: i32 = 38;
 
 /// Mirror of `TimespecLayout` for test-side decoding. The
 /// production layout is private to `mod.rs`, so the tests
@@ -227,12 +226,11 @@ fn dispatch_nanosleep_zero_duration_returns_immediately() {
     assert_eq!(result, SyscallResult::Return(0));
 }
 
-/// `nanosleep((1, 0), _)` returns `-ENOSYS` in Slice 4 — real
-/// non-zero durations are deferred to the timer-channel slice.
-/// Pinned here so a future slice that lands real-duration
-/// nanosleep updates this test alongside the implementation.
+/// `nanosleep((1, 0), _)` returns `0` — real-duration sleeps now
+/// complete immediately in the test context (no reactor installed,
+/// so the timer future is skipped and we return success).
 #[test]
-fn dispatch_nanosleep_nonzero_duration_returns_neg_enosys() {
+fn dispatch_nanosleep_nonzero_duration_returns_zero_without_reactor() {
     let (_setup, proc_cap, thread) = time_setup();
     let ctx = make_ctx(proc_cap, thread);
     let req_ts = TestTimespec {
@@ -243,7 +241,7 @@ fn dispatch_nanosleep_nonzero_duration_returns_neg_enosys() {
 
     let req = SyscallRequest::new(NR_NANOSLEEP, [req_uaddr, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(E_NOSYS));
+    assert_eq!(result, SyscallResult::Return(0));
 }
 
 /// `nanosleep((-1, 0), _)` returns `-EINVAL` — negative tv_sec is

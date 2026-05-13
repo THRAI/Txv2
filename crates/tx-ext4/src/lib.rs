@@ -1,10 +1,13 @@
 //! tx-ext4 adapters.
+#![no_std]
 
-#![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
+
 pub mod adapter;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "host-async")]
 pub mod host_async;
 pub mod mount;
 pub mod namespace;

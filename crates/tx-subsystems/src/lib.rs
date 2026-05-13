@@ -21,6 +21,7 @@ pub mod signal;
 pub mod signalfd;
 mod sync;
 pub mod thread_runtime;
+pub mod timer_sleep;
 pub mod tty;
 pub mod userfaultfd;
 pub mod vfs;

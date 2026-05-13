@@ -1,8 +1,6 @@
 use core::cell::UnsafeCell;
 use core::convert::TryFrom;
-use core::marker::{Send, Sync};
-use core::ops::{Deref, DerefMut, Drop, FnOnce};
-use core::result::Result;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
@@ -19,15 +17,20 @@ pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
 
 pub(crate) struct Ext4FsInstance<I> {
     pager: Ext4PagerCell<I>,
-    mount_payload: SpinMutex<Option<MountPayloadPin>>,
+    pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
 }
 
 impl<I: BlockImage> Ext4FsInstance<I> {
     pub(crate) fn open(image: I) -> Result<Arc<Self>, Errno> {
         Ok(Arc::new(Self {
             pager: Ext4PagerCell::new(Ext4Pager::open(image).map_err(map_format_error)?),
-            mount_payload: SpinMutex::new(None),
+            mount_pin: SpinMutex::new(None),
         }))
+    }
+
+    pub(crate) fn bind_mount_payload(&self, payload: &Cap<MountPayload>) {
+        let payload = PayloadCap::from_cap(payload.clone());
+        *self.mount_pin.lock() = Some(MountPayloadPin::acquire(&payload));
     }
 
     pub(crate) fn with_pager<T>(
@@ -36,15 +39,6 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     ) -> Result<T, Errno> {
         let mut pager = self.pager.lock();
         f(&mut pager).map_err(map_format_error)
-    }
-
-    pub(crate) fn bind_mount_payload(&self, payload: &Cap<MountPayload>) {
-        let payload = PayloadCap::from_cap(payload.clone());
-        *self.mount_payload.lock() = Some(MountPayloadPin::acquire(&payload));
-    }
-
-    pub(crate) fn mount_payload_pin(&self) -> Option<MountPayloadPin> {
-        self.mount_payload.lock().clone()
     }
 }
 
