@@ -556,6 +556,8 @@ name = "tx-substrate"
 version = "0.1.0"
 dependencies = [
  "tx-hal",
+ "tx-observe",
+ "tx-observe-types",
 ]
 
 [[package]]

@@ -8,10 +8,10 @@ mod pmap;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, DmaIf, EntropyIf, InitIf,
-    IrqIf, MmioFlags, MmioRegion, PercpuIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo,
-    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SignalFrameIf,
-    SmpIf, SpiSdInfo, TimeIf, TrapIf, VirtAddr, VirtRange,
+    IrqIf, MmioFlags, MmioRegion, ObserverIf, PercpuIf, PhysAddr, PhysRange, PlatformConfig,
+    PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator,
+    SignalFrameIf, SmpIf, SpiSdInfo, TimeIf, TrapIf, VirtAddr, VirtRange,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -381,6 +381,7 @@ impl PowerIf for Platform {
 /// hardware RNG; production m1dock can override with a board-
 /// specific RNG when one is wired.
 impl EntropyIf for Platform {}
+impl ObserverIf for Platform {}
 
 #[cfg(target_arch = "riscv64")]
 fn sbi_console_putchar(byte: u8) {

@@ -20,8 +20,8 @@ use crate::adapter::boot_runtime::userspace::{
 use crate::adapter::step_engine::PayloadCap;
 use tx_hal::{
     AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
-    PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PtNode,
+    ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
 use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult, NR_EXIT_GROUP, NR_WRITE};
 use tx_subsystems::process::ExitStatus;
@@ -107,6 +107,7 @@ impl tx_hal::CacheIf for TestPlatform {}
 impl tx_hal::DmaIf for TestPlatform {}
 impl tx_hal::SmpIf for TestPlatform {}
 impl tx_hal::EntropyIf for TestPlatform {}
+impl ObserverIf for TestPlatform {}
 
 impl tx_hal::PowerIf for TestPlatform {
     fn system_off() -> ! {

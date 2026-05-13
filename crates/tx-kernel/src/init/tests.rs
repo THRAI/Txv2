@@ -20,8 +20,8 @@ use std::sync::Mutex;
 
 use tx_hal::{
     AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
-    PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PtNode,
+    ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
 
 /// Page size used to fabricate distinct test pmap roots. tx-hal
@@ -176,6 +176,7 @@ impl tx_hal::DmaIf for TestPlatform {}
 impl tx_hal::SmpIf for TestPlatform {}
 
 impl tx_hal::EntropyIf for TestPlatform {}
+impl ObserverIf for TestPlatform {}
 
 impl tx_hal::PowerIf for TestPlatform {
     fn system_off() -> ! {

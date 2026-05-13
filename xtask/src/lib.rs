@@ -11,6 +11,8 @@ mod fault_decode;
 mod full_build;
 mod image;
 mod lint;
+mod observe;
+mod observe_discipline;
 mod oscomp;
 mod progress;
 mod qemu;

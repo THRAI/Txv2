@@ -1,0 +1,20 @@
+[package]
+name = "tx-observe-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[features]
+# Enables std-using helpers, Debug, and serde derives for the host daemon.
+# When off the crate is #![no_std].
+host = ["dep:serde"]
+
+[dependencies]
+tx-hal = { path = "../tx-hal" }
+serde = { version = "1", features = ["derive"], optional = true }
