@@ -251,11 +251,46 @@ fn parse_image_plan_minimal_static_elf_round_trip() {
 }
 
 #[test]
-fn parse_image_plan_rejects_et_dyn() {
+fn parse_image_plan_et_dyn_static_pie() {
+    // ET_DYN (static-PIE) is now accepted. Use ET_DYN-idiomatic relative
+    // vaddrs starting from 0x0 so the test is semantically correct.
     let mut cfg = FixtureCfg::minimal();
     cfg.e_type = ET_DYN_U16;
+    cfg.e_entry = 0x80; // relative entry (offset from load base)
+    // PT_LOAD with relative vaddr 0x0 (covers file bytes 0..176).
+    cfg.phdrs[0].p_vaddr = 0x0;
+    cfg.phdrs[0].p_paddr = 0x0;
+    // PT_PHDR vaddr is set by the fixture builder to
+    // phdrs[0].p_vaddr + e_phoff = 0x0 + 64 = 64 (relative).
     let bytes = cfg.build();
-    assert_eq!(parse_image_plan(&bytes).unwrap_err(), ParseError::Type);
+    let plan = parse_image_plan(&bytes).expect("ET_DYN static-PIE must be accepted");
+
+    // load_bias = ET_DYN_LOAD_BIAS = 0x10000.
+    // All addresses have it applied.
+    assert_eq!(plan.load_bias, 0x10000);
+    assert_eq!(plan.entry, 0x80 + 0x10000);
+    // PT_PHDR.vaddr was 64 (relative) → at_phdr = 64 + 0x10000.
+    assert_eq!(plan.at_phdr, 64 + 0x10000);
+    assert_eq!(plan.load_segments.len(), 1);
+    // Segment vaddr = 0x0 + 0x10000.
+    assert_eq!(plan.load_segments[0].vaddr, 0x10000);
+    assert!(plan.bss_extension.is_none());
+}
+
+#[test]
+fn parse_image_plan_et_dyn_accepts_wx_load() {
+    // ET_DYN static-PIE with a combined W+X PT_LOAD: accepted (unlike
+    // ET_EXEC which still rejects W+X per EXEC-8-5).
+    let mut cfg = FixtureCfg::minimal();
+    cfg.e_type = ET_DYN_U16;
+    cfg.e_entry = 0x80;
+    cfg.phdrs[0].p_vaddr = 0x0;
+    cfg.phdrs[0].p_paddr = 0x0;
+    cfg.phdrs[0].p_flags = PF_R_BIT | PF_W_BIT | PF_X_BIT;
+    let bytes = cfg.build();
+    let plan = parse_image_plan(&bytes).expect("ET_DYN with RWX LOAD must be accepted");
+    let seg = &plan.load_segments[0];
+    assert!(seg.flags.readable && seg.flags.writable && seg.flags.executable);
 }
 
 #[test]
