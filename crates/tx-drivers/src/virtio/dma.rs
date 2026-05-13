@@ -1,10 +1,9 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
-use tx_hal::{DmaDirection, DmaIf, PhysAddr, Ppn, TxPlatform};
-use tx_substrate::{
-    page_allocator::{self, BitmapPageAllocator, DmaPin, OwnedFrameRun, ZeroPolicy},
-    SpinMutex,
+use crate::adapter::step_engine::{
+    page_allocator, BitmapPageAllocator, DmaPin, OwnedFrameRun, SpinMutex, ZeroPolicy,
 };
+use tx_hal::{DmaDirection, DmaIf, PhysAddr, Ppn, TxPlatform};
 use virtio_drivers::{BufferDirection, PhysAddr as VirtioPhysAddr};
 
 const PAGE_SIZE: usize = virtio_drivers::PAGE_SIZE;

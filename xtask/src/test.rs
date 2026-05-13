@@ -4,10 +4,10 @@
 //! Lanes:
 //!   - `smoke` (default): build the kernel for the given target and boot it
 //!     under qemu with `--expect-sentinel`. Mirrors `ci-slow`.
-//!   - `busybox-smoke`: same as `smoke` but additionally builds the busybox
+//!   - `busybox-boot`: same as `smoke` but additionally builds the busybox
 //!     cpio initramfs from the vendored musl busybox for the selected target
-//!     and boots qemu in the busybox profile. The kernel still emits the boot
-//!     sentinel before exec'ing /init, so we reuse the same sentinel contract.
+//!     and boots qemu in the busybox profile. Checks only the boot sentinel —
+//!     does not exercise busybox functionality.
 //!
 //! Both lanes accept `--target rv64-qemu` (default), `--timeout-ms N`, and
 //! `--dry-run`. `--dry-run` prints the qemu command line without running it.
@@ -53,9 +53,9 @@ pub(crate) fn test(root: &Path, args: Vec<String>) -> Result<()> {
 
     match lane.as_str() {
         "smoke" => smoke(root, target, rest, /*with_busybox=*/ false),
-        "busybox-smoke" | "busybox" => smoke(root, target, rest, /*with_busybox=*/ true),
+        "busybox-boot" | "busybox" => smoke(root, target, rest, /*with_busybox=*/ true),
         other => Err(format!(
-            "unknown test lane '{other}', expected smoke or busybox-smoke"
+            "unknown test lane '{other}', expected smoke or busybox-boot"
         )),
     }
 }

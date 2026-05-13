@@ -7,19 +7,21 @@
 use super::*;
 use crate::execution::Errno;
 use crate::mount::{DevId, MountOptions, MountPayload, SourceLabel};
+use crate::page_backed::adapter::step_engine::{
+    self as step_engine, Errno as V3Errno, NoProgress, StepOutcome as V3Out,
+};
 use crate::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
     OpenFileFlags, RNode, RNodeBacking,
 };
 use alloc::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tx_substrate::step_v3::StepOutcome as V3Out;
 
 fn setup_host_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     crate::zones::register_all().expect("kernel zones");
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    match step_engine::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for PageBacked tests: {error:?}"),
     }
 }
@@ -53,16 +55,16 @@ impl crate::vfs::FsOps for RecordingFs {
         _parent: FsObjectId,
         _name: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+    ) -> V3Out<FsObjectId, NoProgress> {
+        V3Out::err(V3Errno::ENOSYS)
     }
 
     fn load_inode_meta(
         &self,
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(InodeMeta::new(InodeKind::Regular, 0o100644))
+    ) -> V3Out<InodeMeta, NoProgress> {
+        V3Out::done(InodeMeta::new(InodeKind::Regular, 0o100644))
     }
 
     fn serialize_inode_meta(
@@ -70,8 +72,8 @@ impl crate::vfs::FsOps for RecordingFs {
         _fs_object_id: FsObjectId,
         _meta: &InodeMeta,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
     }
 
     fn create_inode(
@@ -81,11 +83,8 @@ impl crate::vfs::FsOps for RecordingFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn unlink(
@@ -94,8 +93,8 @@ impl crate::vfs::FsOps for RecordingFs {
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn rename(
@@ -105,8 +104,8 @@ impl crate::vfs::FsOps for RecordingFs {
         _new_parent: FsObjectId,
         _new_name: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn link(
@@ -115,8 +114,8 @@ impl crate::vfs::FsOps for RecordingFs {
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn mkdir(
@@ -126,11 +125,8 @@ impl crate::vfs::FsOps for RecordingFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn rmdir(
@@ -139,8 +135,8 @@ impl crate::vfs::FsOps for RecordingFs {
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn symlink(
@@ -150,11 +146,8 @@ impl crate::vfs::FsOps for RecordingFs {
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn readdir(
@@ -162,19 +155,16 @@ impl crate::vfs::FsOps for RecordingFs {
         _fs_object_id: FsObjectId,
         _cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::done(None)
+    ) -> V3Out<Option<(DirEntry, DirCursor)>, NoProgress> {
+        V3Out::done(None)
     }
 
     fn destroy_inode(
         &self,
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
     }
 }
 
@@ -184,12 +174,12 @@ impl FsPageBacking for RecordingFs {
         fs_object_id: FsObjectId,
         offset: u64,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+    ) -> V3Out<Frame, NoProgress> {
         self.fetches.fetch_add(1, Ordering::AcqRel);
         self.last_object
             .store(fs_object_id.as_u64(), Ordering::Release);
         self.last_offset.store(offset, Ordering::Release);
-        tx_substrate::step_v3::StepOutcome::done(Frame::new(
+        V3Out::done(Frame::new(
             page_allocator::zero_frame_ppn().expect("zero frame"),
         ))
     }
@@ -200,8 +190,8 @@ impl FsPageBacking for RecordingFs {
         _offset: u64,
         _frame: &Frame,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
     }
 
     fn truncate(
@@ -209,16 +199,12 @@ impl FsPageBacking for RecordingFs {
         _fs_object_id: FsObjectId,
         _new_size: u64,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
+        V3Out::done(())
     }
 }
 
@@ -239,16 +225,16 @@ impl crate::vfs::FsOps for BlockingFs {
         _parent: FsObjectId,
         _name: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+    ) -> V3Out<FsObjectId, NoProgress> {
+        V3Out::err(V3Errno::ENOSYS)
     }
 
     fn load_inode_meta(
         &self,
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::ENOSYS)
+    ) -> V3Out<InodeMeta, NoProgress> {
+        V3Out::err(V3Errno::ENOSYS)
     }
 
     fn serialize_inode_meta(
@@ -256,8 +242,8 @@ impl crate::vfs::FsOps for BlockingFs {
         _fs_object_id: FsObjectId,
         _meta: &InodeMeta,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
     }
 
     fn create_inode(
@@ -267,11 +253,8 @@ impl crate::vfs::FsOps for BlockingFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn unlink(
@@ -280,8 +263,8 @@ impl crate::vfs::FsOps for BlockingFs {
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn rename(
@@ -291,8 +274,8 @@ impl crate::vfs::FsOps for BlockingFs {
         _new_parent: FsObjectId,
         _new_name: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn link(
@@ -301,8 +284,8 @@ impl crate::vfs::FsOps for BlockingFs {
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn mkdir(
@@ -312,11 +295,8 @@ impl crate::vfs::FsOps for BlockingFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn rmdir(
@@ -325,8 +305,8 @@ impl crate::vfs::FsOps for BlockingFs {
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn symlink(
@@ -336,11 +316,8 @@ impl crate::vfs::FsOps for BlockingFs {
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::err(tx_substrate::step_v3::Errno::EROFS)
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
     }
 
     fn readdir(
@@ -348,19 +325,16 @@ impl crate::vfs::FsOps for BlockingFs {
         _fs_object_id: FsObjectId,
         _cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::done(None)
+    ) -> V3Out<Option<(DirEntry, DirCursor)>, NoProgress> {
+        V3Out::done(None)
     }
 
     fn destroy_inode(
         &self,
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
     }
 }
 
@@ -370,15 +344,11 @@ impl FsPageBacking for BlockingFs {
         _fs_object_id: FsObjectId,
         _offset: u64,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+    ) -> V3Out<Frame, NoProgress> {
         // Yield on `WaitToken(9, 0x44)` so production fns routing
         // through this trait (e.g. `materialize_file_page`)
         // observe a yield rather than `Err(EAGAIN)`.
-        tx_substrate::step_v3::StepOutcome::yield_on_wait_source(
-            tx_substrate::step_v3::NoProgress,
-            9,
-            0x44,
-        )
+        V3Out::yield_on_wait_source(NoProgress, 9, 0x44)
     }
 
     fn flush_page(
@@ -387,8 +357,8 @@ impl FsPageBacking for BlockingFs {
         _offset: u64,
         _frame: &Frame,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
     }
 
     fn truncate(
@@ -396,16 +366,12 @@ impl FsPageBacking for BlockingFs {
         _fs_object_id: FsObjectId,
         _new_size: u64,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
+        V3Out::done(())
     }
 }
 
@@ -427,7 +393,7 @@ fn file_page_container(
     .expect("mount payload");
     PageContainer::new(
         PageContainerKind::File {
-            mount: MountPayloadPin::acquire(&tx_substrate::zone::PayloadCap::from_cap(mount)),
+            mount: MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(mount)),
             fs_object_id,
         },
         page_count,
@@ -560,7 +526,7 @@ fn page_container_cap_materializes_anon_pages() {
 fn page_container_materialize_page_dispatches_anon() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -582,7 +548,7 @@ fn page_container_materialize_page_dispatches_anon() {
 fn page_container_materialize_page_dispatches_file_fetch_once() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = Arc::new(RecordingFs::new());
     let pc = file_page_container(fs.clone(), fs.clone(), FsObjectId::new(55), 4);
 
@@ -613,14 +579,14 @@ fn page_container_materialize_page_dispatches_file_fetch_once() {
 fn page_container_materialize_page_propagates_file_block() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = Arc::new(BlockingFs);
     let pc = file_page_container(fs.clone(), fs, FsObjectId::new(77), 4);
 
     match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
         V3Out::Yield {
             shape:
-                tx_substrate::step_v3::YieldShape::OnWaitSource {
+                step_engine::YieldShape::OnWaitSource {
                     source: carrier,
                     interests,
                 },
@@ -638,7 +604,7 @@ fn page_container_materialize_page_propagates_file_block() {
 fn page_container_materialize_page_wraps_device_ppns() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Device {
             base_ppn: Ppn(0xfeed_0000),
@@ -658,7 +624,7 @@ fn page_container_materialize_page_wraps_device_ppns() {
     assert_eq!(pc.lookup(PageIndex::new(1)), Some(Ppn(0xfeed_0001)));
     match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Read, &guard) {
         V3Out::Err(errno) => {
-            assert_eq!(errno, tx_substrate::step_v3::Errno::EINVAL);
+            assert_eq!(errno, V3Errno::EINVAL);
         }
         other => panic!("expected out-of-bounds error, got {other:?}"),
     }
@@ -668,7 +634,7 @@ fn page_container_materialize_page_wraps_device_ppns() {
 fn pagebacked_step_read_materializes_pages_and_advances_offset() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -690,7 +656,7 @@ fn pagebacked_step_read_materializes_pages_and_advances_offset() {
 fn pagebacked_step_read_eof_does_not_materialize() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -709,7 +675,7 @@ fn pagebacked_step_read_eof_does_not_materialize() {
 fn pagebacked_step_write_marks_dirty_and_advances_offset() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -732,7 +698,7 @@ fn pagebacked_step_write_marks_dirty_and_advances_offset() {
 fn pagebacked_step_read_returns_advanced_then_blocked_after_progress() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = Arc::new(BlockingFs);
     let pc = file_page_container(fs.clone(), fs, FsObjectId::new(88), 2);
     let of = open_file_for_pc(&pc);
@@ -745,7 +711,7 @@ fn pagebacked_step_read_returns_advanced_then_blocked_after_progress() {
     assert_eq!(
         step_read(&pc, &of, crate::vm::USER_PAGE_SIZE + 1, &guard),
         V3Out::yield_on_wait_source(
-            tx_substrate::step_v3::ByteProgress::new(crate::vm::USER_PAGE_SIZE),
+            step_engine::ByteProgress::new(crate::vm::USER_PAGE_SIZE),
             9,
             0x44,
         )
@@ -757,7 +723,7 @@ fn pagebacked_step_read_returns_advanced_then_blocked_after_progress() {
 fn pagebacked_step_write_rejects_device_backing() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Device {
             base_ppn: Ppn(0xface_0000),
@@ -786,13 +752,13 @@ mod step_op_wraps {
     //! live in the free-fn suite.
     use super::*;
     use crate::page_backed::{ReadOp, WriteOp};
-    use tx_substrate::step_v3::{ScriptCtx, StepOp};
+    use step_engine::{PlaceholderProcessSubject, ScriptCtx, StepOp};
 
     #[test]
     fn read_op_advances_offset_through_step() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -807,7 +773,7 @@ mod step_op_wraps {
             len: 32,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(32));
         assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE - 8 + 32) as u64);
     }
@@ -816,7 +782,7 @@ mod step_op_wraps {
     fn read_op_eof_returns_done_zero() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -831,7 +797,7 @@ mod step_op_wraps {
             len: 16,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(0));
         assert_eq!(pc.resident_pages(), 0);
     }
@@ -840,7 +806,7 @@ mod step_op_wraps {
     fn write_op_marks_dirty_and_advances_offset() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -855,7 +821,7 @@ mod step_op_wraps {
             len,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(len));
         assert_eq!(of.offset(), len as u64);
         assert!(pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
@@ -866,7 +832,7 @@ mod step_op_wraps {
     fn write_op_rejects_device_backing() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Device {
                 base_ppn: Ppn(0xface_0000),
@@ -881,7 +847,7 @@ mod step_op_wraps {
             len: 8,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Err(Errno::EINVAL.into()));
         assert_eq!(of.offset(), 0);
         assert_eq!(pc.resident_pages(), 0);

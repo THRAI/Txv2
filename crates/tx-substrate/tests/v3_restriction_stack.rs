@@ -13,7 +13,7 @@
 //! - txdoc:TXV3-STEP-MODEL-V2 (referenced by the upper-half
 //!   restriction-stack walk that participates in the step algebra)
 
-use tx_substrate::step_v3::{RestrictionKind, RestrictionStack};
+use tx_substrate::step::{RestrictionKind, RestrictionStack};
 
 // -- RestrictionKind closed catalog ------------------------------------------
 

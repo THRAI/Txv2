@@ -21,7 +21,7 @@
 //!
 //! Per `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE` and the plan's
 //! "Cross-cutting risks #2", every step that needs an epoch guard
-//! takes a fresh `tx_substrate::epoch::guard()` *inside* the call
+//! takes a fresh `step_engine::guard()` *inside* the call
 //! site. Guards never cross `.await`; `Cap<T>` does (it's
 //! epoch-managed). This mirrors `vm::execution::fault_script`.
 //!
@@ -41,13 +41,13 @@
 
 extern crate alloc;
 
+use crate::adapter::reactor_entry;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use reactor_entry::userspace::SyscallRequest;
 use tx_hal::{EntropyIf, PmapIf, TimeIf, UserPtr};
-use tx_reactor::userspace::SyscallRequest;
 use tx_scripts::process::exec::{exec_script, ExecError};
-use tx_substrate::zone::Cap;
 use tx_subsystems::cred::{
     step_setgid, step_setregid, step_setresgid, step_setresuid, step_setreuid, step_setuid,
     Capability, Cred, CredChange, Gid, Uid,
@@ -67,8 +67,8 @@ use tx_subsystems::thread_runtime::execution::{step_sigprocmask, SigmaskHow, Sig
 use tx_subsystems::thread_runtime::{step_thread_exit, ThreadIdentity};
 use tx_subsystems::tty::execution::{
     step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
-    step_ioctl_tiocnotty, step_ioctl_tiocsctty, step_ioctl_tiocspgrp, step_ioctl_tiocswinsz,
-    IoctlCaller,
+    step_ioctl_tiocnotty, step_ioctl_tiocsctty_for_process, step_ioctl_tiocspgrp,
+    step_ioctl_tiocswinsz, IoctlCaller,
 };
 use tx_subsystems::tty::structure::{Termios, Winsize};
 use tx_subsystems::vfs::structure::{
@@ -110,6 +110,7 @@ use aio::*;
 pub mod io_uring;
 use io_uring::*;
 mod signalfd;
+use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 use signalfd::*;
 
 #[cfg(test)]
@@ -859,8 +860,8 @@ pub(super) fn read_user_cstr_vec(
 /// `aspace.read_user` lane, falling back to the bootstrap
 /// kernel-pointer dance on `EFAULT`.
 pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) -> Result<T, Errno> {
-    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
-    let guard = tx_substrate::epoch::guard();
+    use step_engine::{Errno as V3Errno, StepOutcome as V3};
+    let guard = step_engine::guard();
     match aspace.read_user(UserPtr::<T>::new(uaddr as usize), &guard) {
         V3::Done(v) => Ok(v),
         V3::Err(V3Errno::EFAULT) => {
@@ -883,8 +884,8 @@ pub(super) fn bootstrap_write_user<T: Copy>(
     uaddr: u64,
     value: T,
 ) -> Result<(), Errno> {
-    use tx_substrate::step_v3::StepOutcome as V3;
-    let guard = tx_substrate::epoch::guard();
+    use StepOutcome as V3;
+    let guard = step_engine::guard();
     match aspace.write_user(UserPtr::<T>::new(uaddr as usize), value, &guard) {
         V3::Done(()) | V3::Continue { .. } => Ok(()),
         V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
@@ -908,11 +909,11 @@ pub(super) fn bootstrap_copy_from_user(
     dst: &mut [u8],
     uaddr: u64,
 ) -> Result<(), Errno> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use StepOutcome as V3;
     if dst.is_empty() {
         return Ok(());
     }
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
         V3::Done(_) | V3::Continue { .. } => Ok(()),
         V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
@@ -936,11 +937,11 @@ pub(super) fn bootstrap_copy_to_user(
     uaddr: u64,
     src: &[u8],
 ) -> Result<(), Errno> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use StepOutcome as V3;
     if src.is_empty() {
         return Ok(());
     }
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
         V3::Done(_) | V3::Continue { .. } => Ok(()),
         V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
@@ -968,11 +969,11 @@ pub(super) fn bootstrap_read_user_cstr(
     uaddr: u64,
     max_len: usize,
 ) -> Result<Vec<u8>, Errno> {
-    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, StepOutcome as V3};
     if uaddr == 0 || max_len == 0 {
         return Ok(Vec::new());
     }
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     match aspace.read_user_cstr(UserPtr::<u8>::new(uaddr as usize), max_len, &guard) {
         V3::Done(v) => Ok(v),
         V3::Err(V3Errno::EFAULT) => {

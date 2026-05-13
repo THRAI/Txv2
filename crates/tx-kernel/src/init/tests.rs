@@ -32,6 +32,7 @@ const TEST_PAGE_SIZE: usize = 4096;
 
 use crate::init::{console_tty, dev_mount, root_mount, CoreInit};
 
+use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
 /// Serialise every test in this module against the rest of tx-kernel's
 /// test set: they all touch the global `INIT_PROCESS` / mount / TTY
 /// slots plus the per-CPU epoch domain (which forbids guard nesting
@@ -230,7 +231,7 @@ impl tx_hal::PmapIf for TestPlatform {
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = INIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = tx_subsystems::zones::register_all();
     // Reset every global slot the boot wiring touches. The
     // `cross_crate_test_support::reset_*` helpers are gated on the
@@ -369,8 +370,8 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
         .expect("INIT_PROCESS must be populated post-bootstrap");
     let cwd = init.cwd().expect("init cwd must be bound");
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
-    use tx_substrate::step_v3::StepOutcome as V3;
+    let guard = guard();
+    use step_engine::StepOutcome as V3;
     let outcome = block_on(walker::step_walk(cwd, b"/dev/console", &cred, &guard));
     drop(guard);
 
@@ -421,9 +422,9 @@ fn boot_smoke_init_fds_preopened_to_console() {
     // `CONSOLE_CAPTURED_LEN`).
     let baseline = CONSOLE_CAPTURED_LEN.load(Ordering::Acquire);
     let stdout = init.fd(1).expect("fd 1");
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     match stdout.step_write(b"hi\n", &guard) {
-        tx_substrate::step_v3::StepOutcome::Done(written) => {
+        StepOutcome::Done(written) => {
             assert_eq!(written, 3, "step_write reports the requested byte count");
         }
         other => panic!("fd 1 step_write failed: {other:?}"),
@@ -570,10 +571,10 @@ fn boot_smoke_init_fds_preopened_to_console() {
 /// per the inverted loop's enter-then-await shape.
 #[test]
 fn boot_smoke_production_userspace_loop_writes_console_then_exits() {
+    use crate::adapter::boot_runtime::userspace::{SyscallRequest, UserspaceTrapInfo};
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll, Waker};
-    use tx_reactor::userspace::{SyscallRequest, UserspaceTrapInfo};
     use tx_shims::linux_syscall::{NR_EXIT_GROUP, NR_WRITE};
     use tx_subsystems::process::ExitStatus;
 
@@ -1306,7 +1307,6 @@ fn boot_smoke_setuid_exec_seeds_post_setuid_euid_and_at_secure() {
 /// vs `/init`) and (b) the post-creation chown + chmod to install
 /// the setuid mode + non-root owner.
 fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
-    use tx_substrate::step_v3::StepOutcome;
     use tx_subsystems::vfs::{Credential, RNodeBacking, S_ISUID};
 
     let root_mount =
@@ -1333,7 +1333,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     // step_chmod path under privileged cred.)
     let cred = Credential::root();
     let (file_id, file_meta) = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome =
             fs_ops.create_inode(root_object_id, b"setuid-target", 0o100755, &cred, &guard);
         match outcome {
@@ -1345,7 +1345,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     // Materialise the inode's RNode so we can populate page
     // contents — same shape as register_init_fixture_into_tmpfs.
     let pc = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
         let rnode = match outcome {
             StepOutcome::Done(rnode) => rnode,
@@ -1370,7 +1370,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
                 tx_subsystems::page_backed::MaterializeAccess::Write,
             )
             .expect("register_setuid_fixture: materialize_anon");
-        let frame_base = tx_substrate::page_allocator::frame_kernel_addr(materialised.ppn)
+        let frame_base = page_allocator::frame_kernel_addr(materialised.ppn)
             .expect("register_setuid_fixture: direct-map view");
         // SAFETY: the materialised frame is held resident for the
         // duration of this scope; the destination region covers
@@ -1384,7 +1384,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     // length during exec.
     let size = bytes.len() as u64;
     {
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         match fs_page_backing.truncate(file_id, size, &guard) {
             StepOutcome::Done(()) => {}
             other => panic!("register_setuid_fixture: truncate({size}): {other:?}"),
@@ -1395,7 +1395,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     // values. Cred is root (CAP_FOWNER), so the chown is privileged
     // and the silent-clear-S_ISUID rule does NOT fire.
     {
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         match fs_ops.step_chown(file_id, Some(file_uid), Some(file_gid), &cred, &guard) {
             StepOutcome::Done(()) => {}
             other => {
@@ -1411,7 +1411,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     // for owner-rwx + group/world rx).
     let new_mode = S_ISUID | 0o755;
     {
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         match fs_ops.step_chmod(file_id, new_mode, &cred, &guard) {
             StepOutcome::Done(()) => {}
             other => panic!("register_setuid_fixture: step_chmod({new_mode:#o}): {other:?}"),

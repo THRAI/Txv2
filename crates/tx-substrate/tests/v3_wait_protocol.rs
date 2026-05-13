@@ -10,7 +10,7 @@
 //! - txdoc:TXV3-STEP-MODEL-V2 (entire algebra; wait protocol is referenced
 //!   by the yield-resolution context)
 
-use tx_substrate::step_v3::{WaitOutcome, WaitProtocol};
+use tx_substrate::step::{WaitOutcome, WaitProtocol};
 
 // -- WaitProtocol closed catalog ---------------------------------------------
 

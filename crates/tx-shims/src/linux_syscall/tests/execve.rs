@@ -5,7 +5,10 @@ use alloc::sync::Arc;
 use alloc::vec;
 use std::collections::BTreeMap;
 
-use tx_substrate::{page_allocator, zone, SpinMutex};
+use crate::adapter::step_engine::{
+    self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, Errno as V3Errno,
+    NoProgress, SpinMutex, StepOutcome,
+};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
@@ -87,10 +90,9 @@ impl ExecveTestFs {
             }
         }
         let size = bytes.len() as u64;
-        let guard = tx_substrate::epoch::guard();
+        let guard = guard();
         match tx_subsystems::page_backed::step_truncate(&pc, size, &guard) {
-            tx_substrate::step_v3::StepOutcome::Done(())
-            | tx_substrate::step_v3::StepOutcome::Continue { .. } => {}
+            StepOutcome::Done(()) | StepOutcome::Continue { .. } => {}
             other => panic!("step_truncate(pc, {size}) failed: {other:?}"),
         }
         drop(guard);
@@ -245,8 +247,8 @@ fn build_fs_root() -> (Cap<DEntry>, Arc<ExecveTestFs>) {
             RNodeBacking::Directory,
         )
         .with_containing_mount(&payload);
-        let res = zone::reserve_for::<RNode>().expect("rnode reservation");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
     };
 
     let _mount = MountIdentity::new_cap(
@@ -442,14 +444,14 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         parent: FsObjectId,
         name: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<FsObjectId, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<FsObjectId, NoProgress> {
         let inner = self.inner.lock();
         let Some(map) = inner.children.get(&parent) else {
-            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOTDIR.into());
+            return StepOutcome::err(Errno::ENOTDIR.into());
         };
         match map.get(name) {
-            Some(id) => tx_substrate::step_v3::StepOutcome::done(*id),
-            None => tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into()),
+            Some(id) => StepOutcome::done(*id),
+            None => StepOutcome::err(Errno::ENOENT.into()),
         }
     }
 
@@ -457,10 +459,10 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         &self,
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<InodeMeta, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<InodeMeta, NoProgress> {
         let inner = self.inner.lock();
         let Some(inode) = inner.inodes.get(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let meta = match inode {
             ExecveTestInode::Directory => InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
@@ -470,7 +472,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
                 meta
             }
         };
-        tx_substrate::step_v3::StepOutcome::done(meta)
+        StepOutcome::done(meta)
     }
 
     fn serialize_inode_meta(
@@ -478,8 +480,8 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _fs_object_id: FsObjectId,
         _meta: &InodeMeta,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::done(())
     }
 
     fn create_inode(
@@ -489,11 +491,8 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn unlink(
@@ -502,8 +501,8 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn rename(
@@ -513,8 +512,8 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _new_parent: FsObjectId,
         _new_name: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn link(
@@ -523,8 +522,8 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn mkdir(
@@ -534,11 +533,8 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _mode: u16,
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn rmdir(
@@ -547,8 +543,8 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn symlink(
@@ -558,11 +554,8 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        (FsObjectId, InodeMeta),
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn readdir(
@@ -570,27 +563,24 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _fs_object_id: FsObjectId,
         _cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        tx_substrate::step_v3::NoProgress,
-    > {
-        tx_substrate::step_v3::StepOutcome::done(None)
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
+        StepOutcome::done(None)
     }
 
     fn destroy_inode(
         &self,
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::done(())
     }
 
     fn read_link(
         &self,
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<Box<[u8]>, tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::err(Errno::EINVAL.into())
+    ) -> StepOutcome<Box<[u8]>, NoProgress> {
+        StepOutcome::err(Errno::EINVAL.into())
     }
 
     fn materialise_rnode(
@@ -598,10 +588,10 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         fs_object_id: FsObjectId,
         meta: InodeMeta,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<Cap<RNode>, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<Cap<RNode>, NoProgress> {
         let inner = self.inner.lock();
         let Some(inode) = inner.inodes.get(&fs_object_id) else {
-            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into());
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         match inode {
             ExecveTestInode::Regular { container, .. } => {
@@ -612,13 +602,11 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
                         pc: container.clone(),
                     },
                 ) {
-                    Ok(rnode) => tx_substrate::step_v3::StepOutcome::done(rnode),
-                    Err(_) => tx_substrate::step_v3::StepOutcome::err(Errno::ENOMEM.into()),
+                    Ok(rnode) => StepOutcome::done(rnode),
+                    Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
                 }
             }
-            ExecveTestInode::Directory => {
-                tx_substrate::step_v3::StepOutcome::err(Errno::EISDIR.into())
-            }
+            ExecveTestInode::Directory => StepOutcome::err(Errno::EISDIR.into()),
         }
     }
 }
@@ -629,29 +617,29 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecveTestFs {
         fs_object_id: FsObjectId,
         offset: u64,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress> {
+    ) -> StepOutcome<Frame, NoProgress> {
         let inner = self.inner.lock();
         let container = match inner.inodes.get(&fs_object_id) {
             Some(ExecveTestInode::Regular { container, .. }) => container.clone(),
             Some(ExecveTestInode::Directory) => {
-                return tx_substrate::step_v3::StepOutcome::err(Errno::EISDIR.into());
+                return StepOutcome::err(Errno::EISDIR.into());
             }
             None => {
-                return tx_substrate::step_v3::StepOutcome::err(Errno::ENOENT.into());
+                return StepOutcome::err(Errno::ENOENT.into());
             }
         };
         drop(inner);
 
         let page_size = USER_PAGE_SIZE as u64;
         if !offset.is_multiple_of(page_size) {
-            return tx_substrate::step_v3::StepOutcome::err(Errno::EINVAL.into());
+            return StepOutcome::err(Errno::EINVAL.into());
         }
         let page_index = PageIndex::new(offset / page_size);
-        use tx_substrate::step_v3::StepOutcome as V3;
+        use StepOutcome as V3;
         match container.materialize_page(page_index, MaterializeAccess::Read, guard) {
             V3::Done(materialised) => V3::done(Frame::new(materialised.ppn)),
-            V3::Continue { .. } => V3::err(tx_substrate::step_v3::Errno::EAGAIN),
-            V3::Yield { .. } => V3::err(tx_substrate::step_v3::Errno::EAGAIN),
+            V3::Continue { .. } => V3::err(V3Errno::EAGAIN),
+            V3::Yield { .. } => V3::err(V3Errno::EAGAIN),
             V3::Err(errno) => V3::err(errno),
         }
     }
@@ -662,8 +650,8 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecveTestFs {
         _offset: u64,
         _frame: &Frame,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::done(())
     }
 
     fn truncate(
@@ -671,16 +659,12 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecveTestFs {
         _fs_object_id: FsObjectId,
         _new_size: u64,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::done(())
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+        StepOutcome::done(())
     }
 }
 
@@ -688,7 +672,7 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecveTestFs {
 
 #[test]
 fn execve_testfs_v3_lookup_round_trips_after_add_regular() {
-    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, NoProgress, StepOutcome as V3};
     use tx_subsystems::vfs::FsOps;
 
     let _setup = execve_setup();
@@ -698,7 +682,7 @@ fn execve_testfs_v3_lookup_round_trips_after_add_regular() {
     let fs = ExecveTestFs::new(root_id);
     let file_id = fs.add_regular_with_bytes(root_id, b"init", &bytes);
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     assert_eq!(
         <ExecveTestFs as FsOps>::lookup(&*fs, root_id, b"init", &guard),
         V3::<_, NoProgress>::done(file_id)
@@ -711,15 +695,15 @@ fn execve_testfs_v3_lookup_round_trips_after_add_regular() {
 
 #[test]
 fn execve_testfs_v3_load_inode_meta_returns_directory_for_root() {
-    use tx_substrate::step_v3::StepOutcome as V3;
     use tx_subsystems::vfs::FsOps;
+    use StepOutcome as V3;
 
     let _setup = execve_setup();
 
     let root_id = FsObjectId::new(2);
     let fs = ExecveTestFs::new(root_id);
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let meta = match <ExecveTestFs as FsOps>::load_inode_meta(&*fs, root_id, &guard) {
         V3::Done(meta) => meta,
         other => panic!("load_inode_meta v3: {other:?}"),
@@ -729,7 +713,7 @@ fn execve_testfs_v3_load_inode_meta_returns_directory_for_root() {
 
 #[test]
 fn execve_testfs_v3_read_link_returns_einval_for_regular() {
-    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, NoProgress, StepOutcome as V3};
     use tx_subsystems::vfs::FsOps;
 
     let _setup = execve_setup();
@@ -739,7 +723,7 @@ fn execve_testfs_v3_read_link_returns_einval_for_regular() {
     let fs = ExecveTestFs::new(root_id);
     let file_id = fs.add_regular_with_bytes(root_id, b"f", &bytes);
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     assert_eq!(
         <ExecveTestFs as FsOps>::read_link(&*fs, file_id, &guard),
         V3::<Box<[u8]>, NoProgress>::err(V3Errno::EINVAL)
@@ -748,7 +732,7 @@ fn execve_testfs_v3_read_link_returns_einval_for_regular() {
 
 #[test]
 fn execve_testfs_v3_create_inode_returns_enosys() {
-    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, NoProgress, StepOutcome as V3};
     use tx_subsystems::vfs::structure::InodeMeta;
     use tx_subsystems::vfs::FsOps;
 
@@ -757,7 +741,7 @@ fn execve_testfs_v3_create_inode_returns_enosys() {
     let root_id = FsObjectId::new(2);
     let fs = ExecveTestFs::new(root_id);
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
     assert_eq!(
         <ExecveTestFs as FsOps>::create_inode(&*fs, root_id, b"new", 0o644, &cred, &guard,),
@@ -767,7 +751,7 @@ fn execve_testfs_v3_create_inode_returns_enosys() {
 
 #[test]
 fn execve_testfs_v3_fetch_page_returns_frame_for_regular() {
-    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, NoProgress, StepOutcome as V3};
     use tx_subsystems::page_backed::FsPageBacking;
 
     let _setup = execve_setup();
@@ -778,7 +762,7 @@ fn execve_testfs_v3_fetch_page_returns_frame_for_regular() {
     let fs = ExecveTestFs::new(root_id);
     let file_id = fs.add_regular_with_bytes(root_id, b"f", &bytes);
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     match <ExecveTestFs as FsPageBacking>::fetch_page(&*fs, file_id, 0, &guard) {
         V3::Done(_frame) => {}
         other => panic!("fetch_page v3: {other:?}"),

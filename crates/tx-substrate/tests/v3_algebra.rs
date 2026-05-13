@@ -4,7 +4,7 @@
 //! `docs/Txv3/03_STEP_MODEL_v2.md` so subsequent migration PRs cannot
 //! silently widen the catalog or break the monoid laws on
 //! `StepProgress`. Written PR-0 (test-first); the production types are
-//! a minimum-viable stub in `tx_substrate::step_v3` until later PRs
+//! a minimum-viable stub in `tx_substrate::step` until later PRs
 //! flesh out the resolver / OnAgent / OnEdge variants under ARCH-3.
 //!
 //! txdoc cross-refs (canonical anchors from `docs/Txv3/03_STEP_MODEL_v2.md`):
@@ -14,7 +14,7 @@
 //! - txdoc:STEP-V2-YIELD-SHAPE-1 (YieldShape is a closed catalog)
 //! - txdoc:STEP-V2-DRIVER-MODE-1 (DriveMode classify matrix)
 
-use tx_substrate::step_v3::{
+use tx_substrate::step::{
     AcceptOutcome, ByteProgress, DriveMode, InterestMask, NoProgress, StepOutcome, StepProgress,
     Translation, WaitSourceId, YieldShape,
 };
@@ -38,7 +38,7 @@ fn step_outcome_has_exactly_four_variants_via_exhaustive_match() {
             },
         },
         StepOutcome::Done(42),
-        StepOutcome::Err(tx_substrate::step_v3::Errno::EAGAIN),
+        StepOutcome::Err(tx_substrate::step::Errno::EAGAIN),
     ];
 
     for outcome in cases {
@@ -79,7 +79,7 @@ fn errno_mirrors_v4_catalog() {
     // ::Errno` byte-for-byte (27 variants). Closed-catalog discipline:
     // an exhaustive match with no wildcard arm so adding a variant
     // later requires mirroring it here.
-    use tx_substrate::step_v3::Errno;
+    use tx_substrate::step::Errno;
     let cases = [
         Errno::EACCES,
         Errno::EAGAIN,

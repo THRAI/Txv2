@@ -15,7 +15,7 @@
 //! See also `docs/Txv3/05_DELEGATE_v1.md` for the delegate-side context
 //! that PR-4 will replace these placeholders with.
 
-use tx_substrate::step_v3::{
+use tx_substrate::step::{
     AcceptOutcome, AgentCancelPolicy, Deadline, DelegateEndpoint, DelegateRequest, DelegateToken,
     DriveMode, InterestMask, TimerId, TokenDropPolicy, Translation, WaitSourceId, YieldShape,
 };
@@ -114,7 +114,7 @@ fn delegate_request_catalog_is_a_closed_sum() {
     // friendliness; the `Ufd` arm is the first real typed variant.
     // Adding a new variant without an ARCH-3 review fails to compile
     // here (no wildcard).
-    use tx_substrate::step_v3::{UfdAccessKind, UfdRequest};
+    use tx_substrate::step::{UfdAccessKind, UfdRequest};
     let placeholder = DelegateRequest::Placeholder;
     match placeholder {
         DelegateRequest::Placeholder => {}

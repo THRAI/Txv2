@@ -24,11 +24,12 @@ use crate::execution::Guard;
 use crate::vfs::FsObjectId;
 
 use super::{Frame, PageContainer};
+use crate::page_backed::adapter::step_engine::{NoProgress, StepOutcome};
 
 /// `FsPageBacking` trait emitting `step_v3` outcomes.
 ///
 /// Each stepping method returns
-/// `tx_substrate::step_v3::StepOutcome<T, NoProgress>`. `fallocate`
+/// `StepOutcome<T, NoProgress>`. `fallocate`
 /// defaults to `Done(())` and `supports_reflink` defaults to `false`.
 pub trait FsPageBacking: Send + Sync + 'static {
     fn fetch_page(
@@ -36,7 +37,7 @@ pub trait FsPageBacking: Send + Sync + 'static {
         fs_object_id: FsObjectId,
         offset: u64,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<Frame, tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<Frame, NoProgress>;
 
     fn flush_page(
         &self,
@@ -44,20 +45,16 @@ pub trait FsPageBacking: Send + Sync + 'static {
         offset: u64,
         frame: &Frame,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<(), NoProgress>;
 
     fn truncate(
         &self,
         fs_object_id: FsObjectId,
         new_size: u64,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+    ) -> StepOutcome<(), NoProgress>;
 
-    fn fsync(
-        &self,
-        fs_object_id: FsObjectId,
-        guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress>;
+    fn fsync(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<(), NoProgress>;
 
     /// Default returns `Done(())`.
     fn fallocate(
@@ -65,8 +62,8 @@ pub trait FsPageBacking: Send + Sync + 'static {
         _fs_object_id: FsObjectId,
         _new_size: u64,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::NoProgress> {
-        tx_substrate::step_v3::StepOutcome::done(())
+    ) -> StepOutcome<(), NoProgress> {
+        StepOutcome::done(())
     }
 
     /// Reflink predicate. Default `false`.

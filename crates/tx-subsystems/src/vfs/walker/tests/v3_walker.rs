@@ -9,13 +9,12 @@
 
 use alloc::sync::Arc;
 
-use tx_substrate::zone::{self, Cap};
-
 use crate::execution::Errno;
 use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
 use crate::page_backed::FsPageBacking;
+use crate::vfs::adapter::step_engine::{guard, reserve_for, sign_for, Cap};
 use crate::vfs::structure::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
     RNodeBacking, S_IFDIR,
@@ -54,8 +53,8 @@ fn build_rootfs_v3() -> V3Topology {
             RNodeBacking::Directory,
         )
         .with_containing_mount(&payload);
-        let res = zone::reserve_for::<RNode>().expect("rnode reservation");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
     };
 
     let _mount = MountIdentity::new_cap(
@@ -81,7 +80,7 @@ fn build_rootfs_v3() -> V3Topology {
 #[test]
 #[ignore = "main-side zone-slot cascade flake (Weak upgrade fails)"]
 fn step_walk_resolves_simple_name() {
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use crate::vfs::adapter::step_engine::StepOutcome as V3;
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -92,7 +91,7 @@ fn step_walk_resolves_simple_name() {
     let foo_id = topo.rootfs.add_dir(FsObjectId::new(2), b"foo");
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(topo.root_dentry.clone(), b"foo", &cred, &guard));
     drop(guard);
     let dentry = match outcome {
@@ -106,7 +105,7 @@ fn step_walk_resolves_simple_name() {
 #[test]
 #[ignore = "main-side zone-slot cascade flake (Weak upgrade fails)"]
 fn step_walk_resolves_multi_component_path() {
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use crate::vfs::adapter::step_engine::StepOutcome as V3;
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -119,7 +118,7 @@ fn step_walk_resolves_multi_component_path() {
     let baz_id = topo.rootfs.add_dir(bar_id, b"baz");
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/foo/bar/baz",
@@ -143,7 +142,7 @@ fn step_walk_resolves_multi_component_path() {
 #[test]
 #[ignore = "main-side zone-slot cascade flake; passes in isolation"]
 fn step_walk_returns_enoent_on_missing() {
-    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
+    use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -152,7 +151,7 @@ fn step_walk_returns_enoent_on_missing() {
     let topo = build_rootfs_v3();
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/nope", &cred, &guard));
     drop(guard);
     match outcome {
@@ -164,7 +163,7 @@ fn step_walk_returns_enoent_on_missing() {
 #[test]
 #[ignore = "main-side zone-slot cascade flake (Weak upgrade fails)"]
 fn step_walk_eacces_when_descend_perm_denied() {
-    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
+    use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -184,7 +183,7 @@ fn step_walk_eacces_when_descend_perm_denied() {
         gid: 9999,
         effective_caps: crate::cred::CapabilitySet::EMPTY,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/ownerdir/leaf",
@@ -201,7 +200,7 @@ fn step_walk_eacces_when_descend_perm_denied() {
 #[test]
 #[ignore = "main-side zone-slot cascade flake (same root cause as v4 walker tests; passes in isolation)"]
 fn step_walk_chases_relative_symlink() {
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use crate::vfs::adapter::step_engine::StepOutcome as V3;
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -214,7 +213,7 @@ fn step_walk_chases_relative_symlink() {
         .add_symlink(FsObjectId::new(2), b"alias", b"realdir");
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/alias",
@@ -234,7 +233,7 @@ fn step_walk_chases_relative_symlink() {
 #[test]
 #[ignore = "main-side zone-slot cascade flake; passes in isolation"]
 fn step_open_round_trips_to_directory() {
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use crate::vfs::adapter::step_engine::StepOutcome as V3;
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -245,7 +244,7 @@ fn step_open_round_trips_to_directory() {
     let _dir_id = topo.rootfs.add_dir(FsObjectId::new(2), b"opendir");
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_open(
         topo.root_dentry.clone(),
         b"/opendir",
@@ -270,7 +269,7 @@ fn step_open_round_trips_to_directory() {
 #[test]
 #[ignore = "main-side zone-slot cascade flake (same root cause as v4 walker EACCES tests; passes in isolation)"]
 fn step_open_eacces_without_read_bit() {
-    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
+    use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -290,7 +289,7 @@ fn step_open_eacces_without_read_bit() {
         gid: 0,
         effective_caps: crate::cred::CapabilitySet::EMPTY,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_open(
         topo.root_dentry.clone(),
         b"/locked",
@@ -321,7 +320,7 @@ fn step_open_eacces_without_read_bit() {
 // bridge round-trips ENODEV identically.
 #[test]
 fn errno_v4_to_v3_is_consistent() {
-    use tx_substrate::step_v3::Errno as V3Errno;
+    use crate::vfs::adapter::step_engine::Errno as V3Errno;
     let v3: V3Errno = Errno::ENODEV.into();
     assert_eq!(v3, V3Errno::ENODEV);
 }

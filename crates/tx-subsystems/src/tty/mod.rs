@@ -19,6 +19,7 @@
 //! See `docs/design/06_devices/TTY.md` for the design target and
 //! `docs/progress/decisions/` for staged deviations that have landed.
 
+pub mod adapter;
 pub mod checks;
 pub mod execution;
 pub mod ldisc;

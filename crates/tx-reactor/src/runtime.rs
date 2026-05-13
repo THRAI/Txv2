@@ -6,6 +6,9 @@ use core::{
     task::{Context, Poll},
 };
 
+use crate::adapter::bus_wire::{
+    DeclaredPort, DeclaredQueue, WireDeclaration, WireDeclarationError, WireEventSet,
+};
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect},
     dispatch::{DispatchState, NoopRescheduleSignal, RescheduleSignal, WakeDispatchReport},
@@ -23,9 +26,6 @@ use crate::{
     },
     wait,
     waker::task_waker,
-};
-use tx_substrate::bus::{
-    DeclaredPort, DeclaredQueue, WireDeclaration, WireDeclarationError, WireEventSet,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

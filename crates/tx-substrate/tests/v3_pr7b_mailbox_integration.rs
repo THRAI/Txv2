@@ -29,7 +29,7 @@
 
 use std::sync::Arc;
 
-use tx_substrate::step_v3::{
+use tx_substrate::step::{
     AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply, DelegateRequest,
     DelegateState, DelegateTokenId, InterestMask, TokenDropPolicy, TransitionOutcome, WaitSourceId,
 };

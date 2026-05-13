@@ -5,8 +5,9 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use tx_substrate::step_v3::{Errno, NoProgress, StepOutcome};
-use tx_substrate::zone::Cap;
+use crate::tmpfs::adapter::step_engine::{
+    guard, page_allocator, reserve_for, sign_for, Cap, Errno, NoProgress, StepOutcome,
+};
 use tx_subsystems::initramfs::{unpack_into_root_mount, UnpackError};
 use tx_subsystems::mount::{MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel};
 use tx_subsystems::vfs::{
@@ -18,10 +19,10 @@ use crate::tmpfs::Tmpfs;
 const NEWC_HEADER_LEN: usize = 110;
 
 fn init_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     tx_subsystems::zones::register_all().expect("tx-subsystems zones");
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    match page_allocator::claim_zero_frame() {
+        Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for initramfs tests: {error:?}"),
     }
 }
@@ -50,8 +51,8 @@ fn fresh_rootfs_mount() -> Cap<MountIdentity> {
             RNodeBacking::Directory,
         )
         .with_containing_mount(&payload);
-        let res = tx_substrate::zone::reserve_for::<RNode>().expect("rnode");
-        tx_substrate::zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("rnode");
+        sign_for(res, raw)
     };
     let _root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone()).expect("root dentry");
 
@@ -123,7 +124,7 @@ fn lookup_in_root(mount: &Cap<MountIdentity>, name: &[u8]) -> StepOutcome<FsObje
         .expect("mount payload alive in test")
         .into_cap();
     let root_id = mount.root().fs_object_id();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     payload.fs_ops.lookup(root_id, name, &guard)
 }
 
@@ -136,7 +137,7 @@ fn lookup_in(
         .payload_cap()
         .expect("mount payload alive in test")
         .into_cap();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     payload.fs_ops.lookup(parent, name, &guard)
 }
 
@@ -169,7 +170,7 @@ fn unpack_writes_single_regular_file_with_correct_size() {
         other => panic!("lookup hello: {other:?}"),
     };
     let fs_ops = fs_ops_of(&mount);
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let meta = match fs_ops.load_inode_meta(id, &guard) {
         StepOutcome::Done(m) => m,
         other => panic!("load_inode_meta: {other:?}"),
@@ -200,7 +201,7 @@ fn unpack_creates_parent_dirs_implicitly() {
         other => panic!("lookup bin/sh: {other:?}"),
     };
     let fs_ops = fs_ops_of(&mount);
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let meta = match fs_ops.load_inode_meta(sh_id, &guard) {
         StepOutcome::Done(m) => m,
         other => panic!("load_inode_meta: {other:?}"),
@@ -227,7 +228,7 @@ fn unpack_writes_directory_entry() {
         other => panic!("lookup etc: {other:?}"),
     };
     let fs_ops = fs_ops_of(&mount);
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let meta = match fs_ops.load_inode_meta(id, &guard) {
         StepOutcome::Done(m) => m,
         other => panic!("load_inode_meta: {other:?}"),
@@ -252,7 +253,7 @@ fn unpack_writes_symlink_entry() {
         other => panic!("lookup link: {other:?}"),
     };
     let fs_ops = fs_ops_of(&mount);
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let meta = match fs_ops.load_inode_meta(id, &guard) {
         StepOutcome::Done(m) => m,
         other => panic!("load_inode_meta: {other:?}"),
@@ -312,7 +313,7 @@ fn unpack_handles_multi_page_files() {
         other => panic!("lookup big: {other:?}"),
     };
     let fs_ops = fs_ops_of(&mount);
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let meta = match fs_ops.load_inode_meta(id, &guard) {
         StepOutcome::Done(m) => m,
         other => panic!("load_inode_meta: {other:?}"),

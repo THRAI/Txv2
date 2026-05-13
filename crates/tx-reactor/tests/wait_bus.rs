@@ -9,14 +9,14 @@ use std::{
     task::Wake,
 };
 
+use tx_reactor::adapter::bus_wire::{
+    bus_lifecycle, bus_readiness, DeclaredPort, DeclaredQueue, DeclaredWireError, RawPort,
+    RawQueue, WireDeclaration, WireDeclarationError,
+};
 use tx_reactor::wait::{
     Channel, DeclaredChannel, DeclaredReadinessChannel, Mask, WaitOutcome, WaitProtocol,
 };
 use tx_reactor::{Reactor, RunStats, TaskStatus};
-use tx_substrate::bus::{
-    DeclaredPort, DeclaredQueue, DeclaredWireError, RawPort, RawQueue, WireDeclaration,
-    WireDeclarationError,
-};
 
 struct CountWake {
     wakes: Arc<AtomicUsize>,
@@ -43,14 +43,14 @@ const DECLARED_GONE: u16 = 0x2;
 const DECLARED_READABLE: u16 = 0x1;
 const DECLARED_HUP: u16 = 0x2;
 
-tx_substrate::bus::bus_lifecycle! {
+bus_lifecycle! {
     struct DeclaredWaitEvent {
         const READY = DECLARED_READY;
         const GONE = DECLARED_GONE;
     }
 }
 
-tx_substrate::bus::bus_readiness! {
+bus_readiness! {
     struct DeclaredReadiness {
         const READABLE = DECLARED_READABLE;
         const HUP = DECLARED_HUP;

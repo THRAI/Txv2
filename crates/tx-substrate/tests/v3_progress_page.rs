@@ -10,7 +10,7 @@
 //! - txdoc:TXV3-STEP-MODEL-V2
 //! - txdoc:STEP-V2-PROGRESS-TYPED-1
 
-use tx_substrate::step_v3::{PageProgress, StepProgress};
+use tx_substrate::step::{PageProgress, StepProgress};
 
 const PAGE_SEEDS: [u32; 7] = [0, 1, 4, 16, 256, 4096, 1_000_000];
 
@@ -77,6 +77,6 @@ fn page_progress_extend_accumulates() {
 fn page_progress_satisfies_step_progress_bound() {
     // Compile-only assertion: PageProgress satisfies the StepProgress
     // trait bound. If the bound regresses, this test stops compiling.
-    fn _bound<P: tx_substrate::step_v3::StepProgress>() {}
+    fn _bound<P: tx_substrate::step::StepProgress>() {}
     _bound::<PageProgress>();
 }

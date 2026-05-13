@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod adapter;
 pub mod virtio;
 
 pub mod spi {

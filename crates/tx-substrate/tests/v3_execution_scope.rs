@@ -13,7 +13,7 @@
 //! - txdoc:SCOPE-V1-CATALOG-1 (closed catalog)
 
 use tx_substrate::epoch;
-use tx_substrate::step_v3::{ExecutionScope, ProcessIdentity};
+use tx_substrate::step::{ExecutionScope, ProcessIdentity};
 use tx_substrate::zone::{self, register_zone_for, reserve_for, sign_for, Cap};
 
 static ZONE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

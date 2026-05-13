@@ -1,9 +1,9 @@
 //! TTY execution hardware polling step tests.
 
+use crate::tty::adapter::step_engine::{
+    guard, ByteProgress, Errno as V3Errno, StepOutcome, StepOutcome as V3Out, YieldShape,
+};
 use alloc::boxed::Box;
-use tx_substrate::step_v3::StepOutcome;
-
-use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out, YieldShape};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::Guard;
@@ -15,19 +15,11 @@ use super::support::{alloc_tty, init_zones, NOOP_BINDING, TTY_ZONE_TEST_LOCK};
 struct BlockingReadOps;
 
 impl CharDeviceOps for BlockingReadOps {
-    fn read(
-        &self,
-        _out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> V3Out<usize, tx_substrate::step_v3::ByteProgress> {
-        V3Out::yield_on_wait_source(tx_substrate::step_v3::ByteProgress::EMPTY, 0x55, 0x0f)
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> V3Out<usize, ByteProgress> {
+        V3Out::yield_on_wait_source(ByteProgress::EMPTY, 0x55, 0x0f)
     }
 
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> V3Out<usize, tx_substrate::step_v3::ByteProgress> {
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> V3Out<usize, ByteProgress> {
         V3Out::Done(bytes.len())
     }
 }
@@ -38,7 +30,7 @@ static BLOCKING_READ_OPS: BlockingReadOps = BlockingReadOps;
 fn step_poll_hardware_input_rejects_pty_transport() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     let slave = alloc_tty(
         TtyKind::PtySlave,
@@ -63,7 +55,7 @@ fn step_poll_hardware_input_rejects_pty_transport() {
 fn step_poll_hardware_input_propagates_blocked_driver_read() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     let binding = Box::leak(Box::new(CharDeviceBinding {
         devt: DevT::new(4, 66),
