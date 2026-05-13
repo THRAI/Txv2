@@ -217,7 +217,13 @@ impl EpochDomain {
         if local_epoch == 0 {
             return None;
         }
-        Some(Guard::new_borrowed(self, local, cpu_id, local_epoch, cpu_pin))
+        Some(Guard::new_borrowed(
+            self,
+            local,
+            cpu_id,
+            local_epoch,
+            cpu_pin,
+        ))
     }
 
     unsafe fn retire_raw(

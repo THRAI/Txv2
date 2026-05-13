@@ -122,6 +122,12 @@ impl TimerQueue {
     }
 }
 
+impl Default for TimerQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Future for DeadlineFuture {
     type Output = WaitOutcome;
 

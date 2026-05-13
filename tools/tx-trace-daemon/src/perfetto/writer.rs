@@ -471,7 +471,7 @@ impl PftraceWriter {
     }
 
     /// For testing: return the accumulated packets without writing to disk.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn into_packets(mut self) -> Vec<TracePacket> {
         let remaining = self.spans.flush_all(self.last_ts);
         for cs in remaining {
@@ -481,7 +481,7 @@ impl PftraceWriter {
     }
 
     /// For testing: encode to bytes without writing to disk.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn encode_to_vec(self) -> Result<Vec<u8>, prost::EncodeError> {
         let packets = self.into_packets();
         let trace = Trace { packet: packets };

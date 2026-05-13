@@ -257,7 +257,7 @@ fn parse_image_plan_et_dyn_static_pie() {
     let mut cfg = FixtureCfg::minimal();
     cfg.e_type = ET_DYN_U16;
     cfg.e_entry = 0x80; // relative entry (offset from load base)
-    // PT_LOAD with relative vaddr 0x0 (covers file bytes 0..176).
+                        // PT_LOAD with relative vaddr 0x0 (covers file bytes 0..176).
     cfg.phdrs[0].p_vaddr = 0x0;
     cfg.phdrs[0].p_paddr = 0x0;
     // PT_PHDR vaddr is set by the fixture builder to

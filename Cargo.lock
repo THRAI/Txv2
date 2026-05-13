@@ -503,6 +503,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tx-observe"
+version = "0.1.0"
+dependencies = [
+ "tx-hal",
+ "tx-observe",
+ "tx-observe-types",
+]
+
+[[package]]
+name = "tx-observe-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tx-hal",
+]
+
+[[package]]
 name = "tx-platform-adapter"
 version = "0.1.0"
 dependencies = [

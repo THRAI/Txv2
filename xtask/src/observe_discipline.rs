@@ -165,18 +165,18 @@ fn scan_file(
         // ── State transitions ────────────────────────────────────────────────
 
         // Outside any `impl StepOp` block: look for the opening.
-        if impl_depth.is_none() && !awaiting_impl_brace {
-            if is_impl_step_op_header(stripped) {
-                awaiting_impl_brace = true;
-                *step_op_impls += 1;
-            }
+        if impl_depth.is_none() && !awaiting_impl_brace && is_impl_step_op_header(stripped) {
+            awaiting_impl_brace = true;
+            *step_op_impls += 1;
         }
 
         // Inside `impl StepOp` but not yet in a step body: look for `fn step(`.
-        if impl_depth.is_some() && step_depth.is_none() && !awaiting_step_brace {
-            if is_fn_step_header(stripped) {
-                awaiting_step_brace = true;
-            }
+        if impl_depth.is_some()
+            && step_depth.is_none()
+            && !awaiting_step_brace
+            && is_fn_step_header(stripped)
+        {
+            awaiting_step_brace = true;
         }
 
         // ── Brace scanning ───────────────────────────────────────────────────

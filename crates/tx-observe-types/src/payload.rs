@@ -385,9 +385,9 @@ pub struct PayloadPanic {
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
 pub enum BootPhaseKind {
-    /// Substrate BSP init (`tx_substrate::init`).
+    /// Kernel BSP init (`tx_hal::init_early`).
     SubstrateBsp = 0,
-    /// Substrate AP init (`tx_substrate::init_on_ap`).
+    /// Kernel AP init (`tx_hal::init_later`).
     SubstrateAp = 1,
 }
 

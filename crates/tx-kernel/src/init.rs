@@ -11,7 +11,7 @@ use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::{
-    self, MountFlags, MountIdentity, MountOptions, MountPayload, MountPayloadPin, SourceLabel,
+    self, MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::tty::structure::TtyIdentity;
@@ -718,7 +718,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{BlockDeviceImage, mount_ext4_read_only};
+        use tx_fs::tx_ext4::{mount_ext4_read_only, BlockDeviceImage};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {
@@ -762,9 +762,8 @@ impl<P: TxPlatform> CoreInit<P> {
         drop(guard);
 
         // Build the `/musl` mountpoint DEntry on the rootfs.
-        let musl_rnode_in_root =
-            RNode::new_cap(musl_object_id, musl_meta, RNodeBacking::Directory)
-                .expect("mount_sdcard_at_musl: /musl rnode-on-rootfs reservation");
+        let musl_rnode_in_root = RNode::new_cap(musl_object_id, musl_meta, RNodeBacking::Directory)
+            .expect("mount_sdcard_at_musl: /musl rnode-on-rootfs reservation");
         let musl_dentry_on_root = DEntry::new_cap(
             InlineName::new(b"musl").expect("mount_sdcard_at_musl: /musl inline name"),
             musl_rnode_in_root,
@@ -847,20 +846,17 @@ impl<P: TxPlatform> CoreInit<P> {
                         &guard,
                     ) {
                         V3::Done(id) => id,
-                        other => panic!(
-                            "mount_sdcard_at_musl: /bin lookup after EEXIST: {other:?}"
-                        ),
+                        other => {
+                            panic!("mount_sdcard_at_musl: /bin lookup after EEXIST: {other:?}")
+                        }
                     }
                 }
                 other => panic!("mount_sdcard_at_musl: mkdir /bin: {other:?}"),
             };
-            let _ = rootfs_payload.fs_ops.symlink(
-                bin_id,
-                b"sh",
-                b"/musl/musl/busybox",
-                &cred,
-                &guard,
-            );
+            let _ =
+                rootfs_payload
+                    .fs_ops
+                    .symlink(bin_id, b"sh", b"/musl/musl/busybox", &cred, &guard);
         }
 
         Self::write_board_sentinel_prefix();

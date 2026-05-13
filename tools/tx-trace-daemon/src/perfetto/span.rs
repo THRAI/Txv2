@@ -35,7 +35,6 @@ pub struct SpanTable {
 /// Some fields (`name_iid`, `is_repair`, `span_id`) are read by the Perfetto
 /// writer and/or tests; the `#[allow]` suppresses dead-code warnings when
 /// those callers are in other modules.
-#[allow(dead_code)]
 pub struct ClosedSpan {
     pub begin_ts: u64,
     pub end_ts: u64,
@@ -130,7 +129,7 @@ impl SpanTable {
             .collect()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.by_key.len()
     }

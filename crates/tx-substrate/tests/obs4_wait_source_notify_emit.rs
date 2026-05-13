@@ -27,7 +27,7 @@ use tx_hal::{
 };
 use tx_observe_types::{TxPayloadTag, TxTraceHartRing, TxTraceKind, TxTraceRecord};
 use tx_substrate::{
-    step_v3::{InterestMask, WaitSourceId},
+    step::{InterestMask, WaitSourceId},
     wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitSource},
 };
 

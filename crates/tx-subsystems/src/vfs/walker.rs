@@ -226,10 +226,10 @@ fn walk_inner_v3<'g>(
 
     let must_be_directory = remaining.last().copied() == Some(b'/');
 
-    let mut current_fs_ops: Option<Arc<dyn FsOps>> = fs_ops_for(&current, guard)
-        .or_else(|| fs_ops_for(&mount_root, guard));
-    let mut current_mount_payload: Option<Cap<MountPayload>> = mount_payload_for(&current, guard)
-        .or_else(|| mount_payload_for(&mount_root, guard));
+    let mut current_fs_ops: Option<Arc<dyn FsOps>> =
+        fs_ops_for(&current, guard).or_else(|| fs_ops_for(&mount_root, guard));
+    let mut current_mount_payload: Option<Cap<MountPayload>> =
+        mount_payload_for(&current, guard).or_else(|| mount_payload_for(&mount_root, guard));
 
     let mut hop_count: u32 = 0;
 

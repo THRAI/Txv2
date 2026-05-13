@@ -24,7 +24,6 @@ pub enum TrackKey {
 ///
 /// `parent_uuid` and `name` are recorded for completeness and future queries
 /// (OBS-9 will use them for OnBehalfOf / DelegateEndpoint parenting).
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct TrackEntry {
     /// Assigned Perfetto UUID (non-zero, unique within this run).
@@ -126,7 +125,7 @@ impl TrackRegistry {
 
     /// Look up a hart UUID without creating a new entry.
     /// Used by OBS-9+ when building parent-track relationships.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn hart_uuid(&self, hart: u16) -> Option<u64> {
         self.map.get(&TrackKey::Hart(hart)).map(|e| e.uuid)
     }

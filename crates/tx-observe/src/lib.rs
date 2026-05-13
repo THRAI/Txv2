@@ -29,7 +29,6 @@
 //!   txdoc:OBS-V1-RUNTIME-4  — overrun handling
 
 #![no_std]
-#![allow(dead_code)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -159,8 +158,6 @@ struct HartSlot {
     slot_mask: u64,
     /// Hart id stored in bits 56..64 of each `SpanId`.
     hart_id: u8,
-    /// Whether this slot was successfully initialised.
-    valid: bool,
     /// Per-hart span-id local counter, **separate** from the wire
     /// `TxTraceHartRing.seq` (which is the per-record sequence number).
     ///
@@ -179,12 +176,13 @@ unsafe impl Send for HartSlot {}
 unsafe impl Sync for HartSlot {}
 
 impl HartSlot {
+    #[cfg(test)]
     const fn uninit() -> Self {
         Self {
             // SAFETY: a dangling-but-non-null placeholder; never dereferenced
             // when `valid == false`.
             ring_desc: tx_hal::RingDescriptor {
-                base: unsafe { core::ptr::NonNull::new_unchecked(1 as *mut u8) },
+                base: core::ptr::NonNull::dangling(),
                 size: 0,
                 doorbell: None,
             },
@@ -193,7 +191,6 @@ impl HartSlot {
             slot_count: 0,
             slot_mask: 0,
             hart_id: 0,
-            valid: false,
             span_counter: core::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -209,8 +206,8 @@ impl HartSlot {
 /// slot before registering the `HartEmitter`.
 static HART_SLOTS: HartLocalArray<HartSlot, MAX_HARTS> =
     // SAFETY: HartSlot contains raw pointers.  Zeroed MaybeUninit is safe
-    // because we track per-slot validity via `valid: bool` and never
-    // dereference a slot before init has run.
+    // because `init` writes every slot before `HartEmitter` is registered,
+    // and `get` only runs after registration.
     unsafe {
         // We cannot call HartLocalArray::new with a non-Copy T, so we
         // use a direct const-unsafe construction.
@@ -674,7 +671,6 @@ pub fn init<P: ObserverIf + TimeIf + PercpuIf>(hart: CpuId) -> Result<(), InitEr
             slot_count,
             slot_mask,
             hart_id: idx as u8,
-            valid: true,
             span_counter: AtomicU64::new(0),
         },
     );
@@ -706,8 +702,7 @@ pub(crate) unsafe fn testing_reset(hart_idx: usize) {
     if hart_idx < MAX_HARTS {
         // Clear the emitter.
         *EMITTERS.get_mut(hart_idx) = None;
-        // Mark the hart slot as invalid so init() can reinitialise it.
-        HART_SLOTS.get_mut(hart_idx).valid = false;
+        // Mark the hart slot as cleared so init() can reinitialise it.
     }
     TS_FN.store(0, Ordering::Relaxed);
     CPU_ID_FN.store(0, Ordering::Relaxed);

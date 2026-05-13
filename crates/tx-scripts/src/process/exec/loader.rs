@@ -227,11 +227,11 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
 
     for phdr in &phdrs {
         match phdr.p_type {
+            PT_INTERP | PT_DYNAMIC if !is_dyn => {
+                // ET_EXEC must not have PT_INTERP or PT_DYNAMIC.
+                return Err(ParseError::HasInterp);
+            }
             PT_INTERP | PT_DYNAMIC => {
-                if !is_dyn {
-                    // ET_EXEC must not have PT_INTERP or PT_DYNAMIC.
-                    return Err(ParseError::HasInterp);
-                }
                 // ET_DYN static-PIE: PT_INTERP / PT_DYNAMIC present but
                 // the kernel runs the binary directly at entry + load_bias.
                 // No interpreter is loaded; the segments are silently skipped.

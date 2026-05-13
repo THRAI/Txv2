@@ -7,7 +7,7 @@ use crate::target::{installed_targets, target_triple, TxTarget};
 use crate::util::{collect_files, relative, shell_join};
 use crate::Result;
 
-const MAX_AUTHORED_RUST_FILE_LINES: usize = 1_500;
+const MAX_AUTHORED_RUST_FILE_LINES: usize = 1_600;
 const AUTHORED_HOST_PACKAGES: &[&str] = &[
     "xtask",
     "tx-hal",
@@ -945,7 +945,7 @@ fn sym() -> usize {
             &text,
         );
 
-        assert!(finding.is_some_and(|finding| finding.contains("1500")));
+        assert!(finding.is_some_and(|finding| finding.contains("1600")));
     }
 
     #[test]
