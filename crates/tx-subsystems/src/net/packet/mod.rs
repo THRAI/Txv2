@@ -49,6 +49,10 @@ pub trait PacketTxSink {
         self.readiness(guard)
     }
 
+    fn source_ipv4(&self) -> Option<Ipv4Address> {
+        None
+    }
+
     fn transmit(&self, frame: &[u8], guard: &Guard<'_>) -> PacketTxResult;
 
     fn transmit_at(&self, frame: &[u8], now: Instant, guard: &Guard<'_>) -> PacketTxResult {

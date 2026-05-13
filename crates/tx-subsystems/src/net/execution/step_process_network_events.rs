@@ -4,11 +4,12 @@ use crate::execution::{Guard, StepOutcome};
 use crate::net::packet::{
     NetworkPublish, PacketDispatch, PacketSource, TcpPacketEvent, UdpPacketEvent,
 };
-use crate::net::protocol::LoopbackIface;
+use crate::net::protocol::{Icmpv4Event, LoopbackIface};
 use crate::net::structure::registry;
 use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::structure::{
-    ConnectionKey, SocketAcceptEntry, SocketIdentity, TcpBacklogRetransmitOutcome,
+    ConnectionKey, Ipv4Address, RawIcmpState, SocketAcceptEntry, SocketIdentity, SocketProtocol,
+    TcpBacklogRetransmitOutcome,
 };
 use tx_substrate::zone::Cap;
 
@@ -71,7 +72,13 @@ pub fn step_process_network_events_at(
                     outcome.wakes_fired += publish.publish_to(&socket);
                 }
             }
-            PacketDispatch::Icmp(_) | PacketDispatch::Unsupported | PacketDispatch::Malformed => {}
+            PacketDispatch::Icmp(event) => {
+                if let Some((socket, publish)) = process_icmp_event(event, guard) {
+                    outcome.sockets_touched += 1;
+                    outcome.wakes_fired += publish.publish_to(&socket);
+                }
+            }
+            PacketDispatch::Unsupported | PacketDispatch::Malformed => {}
         }
     }
 
@@ -215,6 +222,41 @@ fn process_tcp_event(
     }
 
     None
+}
+
+fn process_icmp_event(
+    event: Icmpv4Event,
+    guard: &Guard<'_>,
+) -> Option<(Cap<SocketIdentity>, NetworkPublish)> {
+    let Icmpv4Event::EchoReply(reply) = event else {
+        return None;
+    };
+
+    for socket in SOCKET_TABLE.snapshot_raw_icmp(guard) {
+        let payload = socket.acquire_operational()?;
+        if !raw_icmp_accepts_reply(&payload.protocol_snapshot(), reply.dst) {
+            continue;
+        }
+
+        let mut publish = NetworkPublish::none();
+        if payload.record_icmp_recv_echo_reply(reply.clone()) {
+            publish.recv_has_data = true;
+        }
+        if publish.has_any() {
+            return Some((socket, publish));
+        }
+    }
+
+    None
+}
+
+fn raw_icmp_accepts_reply(protocol: &SocketProtocol, dst: Ipv4Address) -> bool {
+    match protocol {
+        SocketProtocol::RawIcmp(RawIcmpState { bound_local, .. }) => {
+            bound_local.is_none_or(|local| local == dst)
+        }
+        _ => false,
+    }
 }
 
 fn process_udp_event(

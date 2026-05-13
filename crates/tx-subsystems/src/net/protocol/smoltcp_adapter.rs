@@ -84,6 +84,10 @@ impl PacketTxSink for SmoltcpPacketTxSink<'_> {
         self.device.ops.tx_readiness(guard)
     }
 
+    fn source_ipv4(&self) -> Option<Ipv4Address> {
+        Some(self.adapter.config.local_ipv4)
+    }
+
     fn transmit(&self, frame: &[u8], guard: &Guard<'_>) -> PacketTxResult {
         SmoltcpPacketTxSink::transmit(self, frame, guard)
     }

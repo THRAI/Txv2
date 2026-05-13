@@ -5,7 +5,7 @@ use tx_substrate::zone::Cap;
 use crate::execution::{Guard, StepOutcome};
 use crate::net::protocol::LoopbackIface;
 use crate::net::structure::table::SOCKET_TABLE;
-use crate::net::structure::{SocketIdentity, SocketProtocol, TcpState, UdpInner};
+use crate::net::structure::{Ipv4Address, SocketIdentity, SocketProtocol, TcpState, UdpInner};
 
 use super::{
     step_process_loopback_icmp_on_iface, step_process_loopback_tcp,
@@ -176,7 +176,7 @@ pub fn step_process_loopback_pending(
     for socket in SOCKET_TABLE
         .snapshot_raw_icmp(guard)
         .into_iter()
-        .filter(is_raw_icmp)
+        .filter(|socket| is_raw_icmp_loopback_pending(socket, iface))
     {
         if !remember_socket(&mut raw_icmp_seen, &socket) {
             continue;
@@ -232,10 +232,13 @@ fn is_udp_connected(socket: &Cap<SocketIdentity>) -> bool {
     })
 }
 
-fn is_raw_icmp(socket: &Cap<SocketIdentity>) -> bool {
-    socket
-        .acquire_operational()
-        .is_some_and(|payload| matches!(payload.protocol_snapshot(), SocketProtocol::RawIcmp(_)))
+fn is_raw_icmp_loopback_pending(socket: &Cap<SocketIdentity>, iface: &LoopbackIface) -> bool {
+    socket.acquire_operational().is_some_and(|payload| {
+        matches!(payload.protocol_snapshot(), SocketProtocol::RawIcmp(_))
+            && payload.peek_icmp_tx_echo().is_some_and(|packet| {
+                packet.dst == iface.local_ipv4() || packet.dst == Ipv4Address::BROADCAST
+            })
+    })
 }
 
 fn remember_socket(seen: &mut Vec<u32>, socket: &Cap<SocketIdentity>) -> bool {

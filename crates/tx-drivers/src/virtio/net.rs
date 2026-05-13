@@ -452,7 +452,7 @@ fn transmit_frame<P: TxPlatform, T: Transport, const QUEUE_SIZE: usize>(
     if !state.raw.can_send() {
         stats.tx_busy.fetch_add(1, Ordering::Relaxed);
         let token = net_delegate_wait_token();
-        return StepOutcome::yield_on_carrier(NoProgress, token.carrier(), token.interest());
+        return StepOutcome::yield_on_wait_source(NoProgress, token.source_id(), token.interest());
     }
 
     let header_len = core::mem::size_of::<VirtioNetHdr>();
@@ -482,7 +482,7 @@ fn transmit_frame<P: TxPlatform, T: Transport, const QUEUE_SIZE: usize>(
         Err(VirtioError::QueueFull) => {
             stats.tx_busy.fetch_add(1, Ordering::Relaxed);
             let token = net_delegate_wait_token();
-            StepOutcome::yield_on_carrier(NoProgress, token.carrier(), token.interest())
+            StepOutcome::yield_on_wait_source(NoProgress, token.source_id(), token.interest())
         }
         Err(_) => {
             stats.tx_errors.fetch_add(1, Ordering::Relaxed);
@@ -561,9 +561,9 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> NetDeviceOps for VirtioMmioNet<P, Q
     fn ack_interrupt_and_fire(&self) -> NetDeviceIrqOutcome {
         let outcome = VirtioMmioNet::ack_interrupt_and_fire(self);
         NetDeviceIrqOutcome {
-            claimed: outcome.claimed,
             rx_ready: outcome.rx_ready,
             tx_completed: outcome.tx_completed,
+            tx_completed_bytes: 0,
             poll_wakes: outcome.poll_wakes,
         }
     }
@@ -606,9 +606,9 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> NetDeviceOps for VirtioPciNet<P, QU
     fn ack_interrupt_and_fire(&self) -> NetDeviceIrqOutcome {
         let outcome = VirtioPciNet::ack_interrupt_and_fire(self);
         NetDeviceIrqOutcome {
-            claimed: outcome.claimed,
             rx_ready: outcome.rx_ready,
             tx_completed: outcome.tx_completed,
+            tx_completed_bytes: 0,
             poll_wakes: outcome.poll_wakes,
         }
     }

@@ -339,6 +339,20 @@ impl SocketPayload {
         })
     }
 
+    pub(crate) fn peek_icmp_tx_echo(&self) -> Option<Icmpv4EchoPacket> {
+        self.raw_icmp.as_ref()?.peek_tx_echo()
+    }
+
+    pub(crate) fn commit_icmp_tx_echo_sent(&self) -> Option<SocketIcmpTxDrain> {
+        let raw_icmp = self.raw_icmp.as_ref()?;
+        let drain = raw_icmp.commit_tx_echo_sent()?;
+        self.refresh_io_from_raw();
+        Some(SocketIcmpTxDrain {
+            packet: drain.packet,
+            became_available: drain.became_available,
+        })
+    }
+
     pub(crate) fn record_icmp_recv_echo_reply(&self, packet: Icmpv4EchoPacket) -> bool {
         let became_readable = self
             .raw_icmp

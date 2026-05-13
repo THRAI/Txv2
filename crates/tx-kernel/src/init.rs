@@ -85,6 +85,7 @@ static MUSL_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 /// `register_console_hardware`; consulted by
 /// `register_devfs_console_alias` to publish `/dev/console`.
 static CONSOLE_TTY: SpinMutex<Option<Cap<TtyIdentity>>> = SpinMutex::new(None);
+static NULL_TTY: SpinMutex<Option<Cap<TtyIdentity>>> = SpinMutex::new(None);
 
 /// Snapshot the boot-time root mount cap. Returns `None` until
 /// `mount_rootfs_tmpfs` has run (test pre-bootstrap or boot-time
@@ -123,6 +124,10 @@ pub(crate) fn mark_boot_reactor_userspace_preempt(cpu_id: CpuId) {
     });
 }
 
+pub fn null_tty() -> Option<Cap<TtyIdentity>> {
+    NULL_TTY.lock().clone()
+}
+
 #[cfg(test)]
 pub fn reset_boot_state_for_test() {
     *ROOT_MOUNT.lock() = None;
@@ -131,10 +136,12 @@ pub fn reset_boot_state_for_test() {
     *MUSL_MOUNT.lock() = None;
     *CONSOLE_TTY.lock() = None;
     *ROOT_DENTRY.lock() = None;
+    *NULL_TTY.lock() = None;
     AP_REACTOR_TASK_DONE_CPUS.store(0, Ordering::Release);
     BSP_REACTOR_TIMER_DONE_CPUS.store(0, Ordering::Release);
     BOOT_REACTOR.reset_for_test();
     net::reset_boot_net_runtime_for_test();
+    tx_subsystems::net::device::reset_net_registry_for_test();
 }
 
 /// Static `CharDeviceOps` impl that forwards `write` to
@@ -179,6 +186,25 @@ impl<P: TxPlatform> CharDeviceOps for ConsoleCharOps<P> {
     }
 }
 
+struct NullCharOps;
+
+impl CharDeviceOps for NullCharOps {
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        tx_substrate::step_v3::StepOutcome::Done(0)
+    }
+
+    fn write(
+        &self,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+        tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+    }
+}
 /// Skeleton H3 boot spine for the generic kernel mainline.
 ///
 /// This type names the ordering that used to live inline in `kernel_main`:
@@ -288,13 +314,16 @@ impl<P: TxPlatform> CoreInit<P> {
             // trap is structurally impossible (Cross-cutting risk
             // #4 in the pre-ELF plan).
             Self::register_console_hardware();
+            Self::register_null_device();
             Self::install_irq_handlers();
             Self::init_block_devices();
+            Self::init_net_devices();
             Self::mount_rootfs_from_boot_media();
             Self::mount_devfs_at_dev();
             Self::register_devfs_console_alias();
             Self::mount_tmpfs_at_dev_shm();
             Self::mount_procfs_at_proc();
+            Self::register_devfs_null_alias();
             Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
             Self::populate_rootfs_shebang_shims();
@@ -388,6 +417,29 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":tty:console:ok\n");
     }
 
+    pub(crate) fn register_null_device() {
+        use alloc::boxed::Box;
+
+        let ops_static: &'static NullCharOps = Box::leak(Box::new(NullCharOps));
+        let binding: &'static CharDeviceBinding = Box::leak(Box::new(CharDeviceBinding {
+            devt: DevT::new(1, 3),
+            name: "null",
+            ops: ops_static,
+        }));
+
+        let guard = tx_substrate::epoch::guard();
+        let tty = match register_hardware("null", 0, binding, &guard) {
+            tx_substrate::step_v3::StepOutcome::Done(tty) => tty,
+            other => panic!("register_null_device: register_hardware failed: {other:?}"),
+        };
+        drop(guard);
+
+        *NULL_TTY.lock() = Some(tty);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":tty:null:ok\n");
+    }
+
     /// Pre-ELF Phase 5 (item 9): install the kernel's IRQ dispatch
     /// table and unmask the platform's UART IRQ.
     ///
@@ -479,6 +531,27 @@ impl<P: TxPlatform> CoreInit<P> {
             });
             tx_hal::console_write_str::<P>("\n");
         }
+    }
+
+    /// Initialize tier-2 net devices before boot net runtime selection.
+    /// Boards without a present virtio-net device legitimately publish
+    /// no net devices; `submit_net_runtime_tasks` will keep using the
+    /// staging registration in that case.
+    pub(crate) fn init_net_devices() {
+        let devices = alloc::boxed::Box::leak(alloc::boxed::Box::new(
+            crate::devices::KernelNetDevices::<P>::new(),
+        ));
+        match devices.init_and_register() {
+            StepOutcome::Done(()) => {}
+            other => panic!("init_net_devices: registration failed: {other:?}"),
+        }
+
+        Self::write_board_sentinel_prefix();
+        if tx_subsystems::net::net_device_by_name(b"eth0").is_some() {
+            tx_hal::console_write_str::<P>(":devices:net:eth0:ok\n");
+            Self::write_board_sentinel_prefix();
+        }
+        tx_hal::console_write_str::<P>(":devices:net:ok\n");
     }
 
     /// Mount tmpfs as the rootfs.
@@ -1195,6 +1268,17 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":devfs:alias:console:ok\n");
     }
 
+    pub(crate) fn register_devfs_null_alias() {
+        let tty = null_tty().expect("register_devfs_null_alias: null TTY must be registered");
+        match register_console_alias("null", tty) {
+            tx_substrate::step_v3::StepOutcome::Done(()) => {}
+            other => panic!("register_devfs_null_alias: register_console_alias failed: {other:?}"),
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":devfs:alias:null:ok\n");
+    }
+
     /// Install init's initial cwd at the rootfs root and preopen
     /// fds 0/1/2 against `/dev/console`.
     ///
@@ -1667,6 +1751,11 @@ impl<P: TxPlatform> CoreInit<P> {
         let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
         let cpu_bit = Self::cpu_bit(current_cpu);
         if cpu_bit == 0 {
+            return;
+        }
+        if P::possible_cpus().count() <= 1 {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":reactor:timer-idle:ok\n");
             return;
         }
 

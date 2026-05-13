@@ -16,7 +16,9 @@ use tx_subsystems::net::delegate::{
 };
 #[cfg(test)]
 use tx_subsystems::net::device::VIRTIO_NET0_DEVICE;
-use tx_subsystems::net::device::VIRTIO_NET0_REGISTRATION;
+use tx_subsystems::net::device::{
+    net_device_by_name, net_device_snapshot, VIRTIO_NET0_REGISTRATION,
+};
 use tx_subsystems::net::execution::{DeviceTxBudget, LoopbackPollBudget};
 use tx_subsystems::net::packet::{
     PacketDispatch, PacketSource, PacketTxReadiness, PacketTxResult, PacketTxSink,
@@ -62,7 +64,7 @@ impl BootNetRuntime {
         smoltcp_base: Instant,
         reactor_base_ns: u64,
     ) -> Self {
-        let netdev = &VIRTIO_NET0_REGISTRATION;
+        let netdev = boot_net_registration();
         Self {
             ether_iface: EtherIface::new(
                 netdev,
@@ -126,6 +128,12 @@ impl BootNetRuntime {
     }
 }
 
+fn boot_net_registration() -> &'static tx_subsystems::net::device::NetDeviceRegistration {
+    net_device_by_name(b"eth0")
+        .or_else(|| net_device_snapshot().into_iter().next())
+        .unwrap_or(&VIRTIO_NET0_REGISTRATION)
+}
+
 impl PacketSource for BootNetRuntime {
     fn next_packet(&self) -> Option<PacketDispatch> {
         let frame = self.ether_iface.netdev.ops.receive()?;
@@ -157,6 +165,10 @@ impl PacketTxSink for BootNetRuntime {
         guard: &tx_subsystems::execution::Guard<'_>,
     ) -> PacketTxReadiness {
         self.readiness(guard)
+    }
+
+    fn source_ipv4(&self) -> Option<Ipv4Address> {
+        Some(BOOT_ETH_IPV4)
     }
 
     fn transmit(

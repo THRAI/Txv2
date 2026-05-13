@@ -132,13 +132,13 @@ pub fn wait_on_token(token: WaitToken) -> Option<RegisteredWaitFuture> {
                 subscription: None,
             },
         ))),
-        RegisteredWaitSource::RawPort(port) => Some(RegisteredWaitFuture::RawPort(Box::new(
-            RawPortWaitFuture {
+        RegisteredWaitSource::RawPort(port) => {
+            Some(RegisteredWaitFuture::RawPort(Box::new(RawPortWaitFuture {
                 port,
                 mask,
                 subscription: None,
-            },
-        ))),
+            })))
+        }
     }
 }
 

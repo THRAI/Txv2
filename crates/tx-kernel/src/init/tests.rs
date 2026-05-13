@@ -303,6 +303,7 @@ fn bootstrap_init() {
 fn drive_boot_wiring() {
     bootstrap_init();
     CoreInit::<TestPlatform>::register_console_hardware();
+    CoreInit::<TestPlatform>::register_null_device();
     // Pre-ELF Phase 5 (item 9): mirrors the production boot order.
     // `TestPlatform`'s `IrqIf` impl uses the trait-default
     // `UART_IRQ = 0`, which `install_irq_handlers` accepts without
@@ -311,10 +312,12 @@ fn drive_boot_wiring() {
     // platform-publication path in the boot-wiring smoke.
     CoreInit::<TestPlatform>::install_irq_handlers();
     CoreInit::<TestPlatform>::init_block_devices();
+    CoreInit::<TestPlatform>::init_net_devices();
     CoreInit::<TestPlatform>::mount_rootfs_from_boot_media();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
     CoreInit::<TestPlatform>::mount_tmpfs_at_dev_shm();
+    CoreInit::<TestPlatform>::register_devfs_null_alias();
     CoreInit::<TestPlatform>::mount_bdevfs_at_dev_block();
     CoreInit::<TestPlatform>::bind_init_cwd_and_root();
 }

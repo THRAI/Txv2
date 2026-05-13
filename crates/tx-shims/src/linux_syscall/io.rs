@@ -686,70 +686,104 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
             let mut revents: i16 = 0;
             if fd >= 0 {
                 if let Some(file) = resolve_fd(&ctx.process, fd as u32) {
-                    let mut handled = false;
-                    if let OpenFileBacking::Rnode { rnode } = file.backing() {
-                        match rnode.backing() {
-                            RNodeBacking::StructBacked {
-                                payload: StructPayload::Tty(tty),
-                            } => {
-                                handled = true;
-                                if events & POLLIN != 0 {
-                                    if tty_readable_level(tty) {
-                                        revents |= POLLIN;
-                                    } else if park_source.is_none() {
-                                        park_source = Some((tty.wait_source_id(), POLLIN as u64));
-                                    }
+                    let guard = tx_substrate::epoch::guard();
+                    let socket_poll = socket_poll_mask_from_file(&file, &guard);
+                    if let Some(result) = socket_poll {
+                        match result {
+                            Ok(mask) => {
+                                if events & POLLIN != 0
+                                    && mask.intersects(tx_subsystems::net::PollMask::IN)
+                                {
+                                    revents |= POLLIN;
                                 }
-                                if events & POLLOUT != 0 {
+                                if events & POLLOUT != 0
+                                    && mask.intersects(tx_subsystems::net::PollMask::OUT)
+                                {
                                     revents |= POLLOUT;
                                 }
+                                if mask.intersects(tx_subsystems::net::PollMask::ERR) {
+                                    revents |= POLLERR;
+                                }
+                                if mask.intersects(tx_subsystems::net::PollMask::HUP) {
+                                    revents |= POLLHUP;
+                                }
                             }
-                            RNodeBacking::StructBacked {
-                                payload: StructPayload::Pipe { payload, side },
-                            } => {
-                                handled = true;
-                                match side {
-                                    PipeSide::Reader => {
-                                        if events & POLLIN != 0 {
-                                            if payload.reader_readable_level() {
-                                                revents |= POLLIN;
-                                            } else if park_source.is_none() {
-                                                park_source = Some((
-                                                    payload.reader_source_id(),
-                                                    POLLIN as u64,
-                                                ));
-                                            }
-                                        }
-                                        if payload.reader_hup_level() {
-                                            revents |= POLLHUP;
+                            Err(errno) => {
+                                return restore_ppoll_sigmask(
+                                    ctx,
+                                    saved_mask,
+                                    temporary_sigmask,
+                                    SyscallResult::Error(errno_to_i32(errno)),
+                                );
+                            }
+                        }
+                    } else {
+                        let mut handled = false;
+                        if let OpenFileBacking::Rnode { rnode } = file.backing() {
+                            match rnode.backing() {
+                                RNodeBacking::StructBacked {
+                                    payload: StructPayload::Tty(tty),
+                                } => {
+                                    handled = true;
+                                    if events & POLLIN != 0 {
+                                        if tty_readable_level(tty) {
+                                            revents |= POLLIN;
+                                        } else if park_source.is_none() {
+                                            park_source =
+                                                Some((tty.wait_source_id(), POLLIN as u64));
                                         }
                                     }
-                                    PipeSide::Writer => {
-                                        if events & POLLOUT != 0 {
-                                            if payload.writer_writable_level() {
-                                                revents |= POLLOUT;
-                                            } else if park_source.is_none() {
-                                                park_source = Some((
-                                                    payload.writer_source_id(),
-                                                    POLLOUT as u64,
-                                                ));
+                                    if events & POLLOUT != 0 {
+                                        revents |= POLLOUT;
+                                    }
+                                }
+                                RNodeBacking::StructBacked {
+                                    payload: StructPayload::Pipe { payload, side },
+                                } => {
+                                    handled = true;
+                                    match side {
+                                        PipeSide::Reader => {
+                                            if events & POLLIN != 0 {
+                                                if payload.reader_readable_level() {
+                                                    revents |= POLLIN;
+                                                } else if park_source.is_none() {
+                                                    park_source = Some((
+                                                        payload.reader_source_id(),
+                                                        POLLIN as u64,
+                                                    ));
+                                                }
+                                            }
+                                            if payload.reader_hup_level() {
+                                                revents |= POLLHUP;
                                             }
                                         }
-                                        if payload.writer_err_level() {
-                                            revents |= POLLERR;
+                                        PipeSide::Writer => {
+                                            if events & POLLOUT != 0 {
+                                                if payload.writer_writable_level() {
+                                                    revents |= POLLOUT;
+                                                } else if park_source.is_none() {
+                                                    park_source = Some((
+                                                        payload.writer_source_id(),
+                                                        POLLOUT as u64,
+                                                    ));
+                                                }
+                                            }
+                                            if payload.writer_err_level() {
+                                                revents |= POLLERR;
+                                            }
                                         }
                                     }
                                 }
+                                _ => {}
                             }
-                            _ => {}
                         }
-                    }
-                    if !handled {
-                        if events & POLLIN != 0 {
-                            revents |= POLLIN;
-                        }
-                        if events & POLLOUT != 0 {
-                            revents |= POLLOUT;
+                        if !handled {
+                            if events & POLLIN != 0 {
+                                revents |= POLLIN;
+                            }
+                            if events & POLLOUT != 0 {
+                                revents |= POLLOUT;
+                            }
                         }
                     }
                 } else {
