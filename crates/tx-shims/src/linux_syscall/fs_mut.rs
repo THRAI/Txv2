@@ -138,8 +138,7 @@ pub(super) fn fs_page_backing_for_dentry(
                 return Some(payload.fs_page_backing.clone());
             }
         }
-        let parent_weak = cursor.parent_hint()?;
-        cursor = parent_weak.upgrade(&guard)?;
+        cursor = cursor.parent_hint()?;
     }
 }
 
