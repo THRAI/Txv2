@@ -17,8 +17,8 @@
 
 extern crate std;
 
-use tx_substrate::zone::{self, Cap, PayloadCap, Zone, ZoneAllocated};
 use tx_substrate::epoch;
+use tx_substrate::zone::{self, Cap, PayloadCap, Zone, ZoneAllocated};
 
 static ZONE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -109,7 +109,11 @@ fn cap_trace_id_properties() {
     let kind_a1: u8 = (id_a1 >> 56) as u8;
 
     // Slot component must equal cap.raw().
-    assert_eq!(slot_a1, a1.raw(), "trace_id bits 0..32 must equal cap.raw()");
+    assert_eq!(
+        slot_a1,
+        a1.raw(),
+        "trace_id bits 0..32 must equal cap.raw()"
+    );
 
     // Generation component must equal what downgrade() reports.
     assert_eq!(
@@ -119,8 +123,7 @@ fn cap_trace_id_properties() {
     );
 
     // Reconstruction formula must hold.
-    let reconstructed =
-        ((kind_a1 as u64) << 56) | ((gen_a1 as u64) << 32) | (slot_a1 as u64);
+    let reconstructed = ((kind_a1 as u64) << 56) | ((gen_a1 as u64) << 32) | (slot_a1 as u64);
     assert_eq!(
         reconstructed, id_a1,
         "formula (kind<<56)|(gen<<32)|slot must reconstruct trace_id"

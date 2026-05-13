@@ -1,32 +1,37 @@
-//! Central `drive` loop — L2 / L4 observation instrumentation (OBS-3a).
+//! Central `drive` loop — L2 / L3 / L4 observation instrumentation (OBS-3a/OBS-3b).
 //!
 //! This module owns the canonical driver that runs a [`StepOp`] to
 //! completion, emitting trace records at:
 //!
 //! - **L2** (`TxTraceLevel::Drive`): one `SpanBegin` at entry and one `SpanEnd`
 //!   at exit of every `drive` invocation.
+//! - **L3** (`TxTraceLevel::Yield`): one `SpanBegin(YieldBegin)` before
+//!   `yield_resolve` and one `Instant(Resume)` after it returns (OBS-3b).
 //! - **L4** (`TxTraceLevel::Step`): one `SpanBegin` / `SpanEnd` pair around
 //!   every `op.step(ctx)` call — the span carries a `PayloadStepOutcome`.
 //!
 //! # Anti-pattern OBS-A-1
 //!
-//! L4 emission happens **at the call site in this module**, never inside the
+//! All emission happens **at call sites in this module**, never inside the
 //! `StepOp::step` body. This is the only correct placement per
 //! `docs/Txv3/08_OBSERVATION_v1.md` §17 (OBS-A-1). Every call to `op.step()`
 //! is wrapped with SpanBegin before and SpanEnd after; no step body emits
 //! observation records directly.
 //!
 //! Spec refs:
-//!   txdoc:OBS-V1-HOOKS-1   — hook surface map (L2 / L4 sites)
+//!   txdoc:OBS-V1-HOOKS-1   — hook surface map (L2 / L3 / L4 sites)
 //!   txdoc:OBS-V1-ANTI-1    — OBS-A-1 anti-pattern (no emit inside step body)
 //!   txdoc:OBS-V1-LEVELS-1  — level catalog
 
 use tx_observe::{EventNameId, SpanId};
 use tx_observe_types::{
-    PayloadDriveBegin, PayloadDriveEnd, PayloadStepOutcome, TxPayloadTag, TxProgressKind,
-    TxTraceLevel, YieldShapeKind,
+    PayloadDriveBegin, PayloadDriveEnd, PayloadResume, PayloadStepOutcome, PayloadYieldBegin,
+    TxPayloadTag, TxProgressKind, TxTraceLevel, YieldShapeKind,
 };
-use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity, YieldShape};
+use tx_substrate::step_v3::{
+    ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity, YieldOutcome, YieldResolved,
+    YieldShape,
+};
 
 /// Outcome returned from [`drive`].
 ///
@@ -45,7 +50,7 @@ pub enum DriveOutcome<T, E> {
     Err(E),
 }
 
-/// Run `op` to completion under `ctx`, emitting L2 and L4 observation
+/// Run `op` to completion under `ctx`, emitting L2, L3, and L4 observation
 /// records via the current hart's emitter (if any).
 ///
 /// # Type parameters
@@ -65,20 +70,25 @@ pub enum DriveOutcome<T, E> {
 /// ```
 /// No emit happens inside `step` bodies; only the driver emits at L4.
 ///
-/// # Yield handling
+/// # Yield handling (OBS-3b)
 ///
 /// When `StepOutcome::Yield { shape, progress }` is returned by the op,
-/// the `yield_resolve` callback is invoked with `(&shape, &mut ctx)`.
-/// It returns `Some(errno)` to abort the loop with `DriveOutcome::Err`,
-/// or `None` to signal that the wait has been resolved and the loop should
-/// re-invoke `op.step(ctx)`.
+/// `drive` emits an L3 `SpanBegin(YieldBegin)` record, then invokes
+/// `yield_resolve(&shape, &mut ctx)`.
 ///
-/// For OBS-3b, the L3 emit (yield begin / resume) will be inserted in the
-/// `yield_resolve` path here; it is intentionally absent in OBS-3a.
+/// The callback returns a [`YieldOutcome`]:
+/// - [`YieldOutcome::Resolved`] — wait resolved; `drive` emits an L3
+///   `Instant(Resume)` and re-invokes `op.step(ctx)`.
+/// - [`YieldOutcome::Aborted`] — wait aborted; `drive` emits an L3
+///   `Instant(Resume)` with `resume_kind=Aborted` and breaks with
+///   `DriveOutcome::Err(errno)`.
+///
+/// This convergence point is the sole L3 emit site per OBS-A-1: no
+/// `StepOp::step` body emits observation records.
 pub fn drive<O, I>(
     op: &mut O,
     ctx: &mut ScriptCtx<I>,
-    mut yield_resolve: impl FnMut(&YieldShape, &mut ScriptCtx<I>) -> Option<tx_substrate::step_v3::Errno>,
+    mut yield_resolve: impl FnMut(&YieldShape, &mut ScriptCtx<I>) -> YieldOutcome,
 ) -> DriveOutcome<O::Output, tx_substrate::step_v3::Errno>
 where
     O: StepOp<I> + 'static,
@@ -94,11 +104,11 @@ where
 
         let begin = PayloadDriveBegin {
             op_type: EventNameId::of::<O>().raw(),
-            mode: 1,           // 1 = Waiting (default for OBS-3a)
-            interrupt: 1,      // 1 = Interruptible
+            mode: 1,      // 1 = Waiting (default for OBS-3a)
+            interrupt: 1, // 1 = Interruptible
             has_deadline: 0,
             _pad: 0,
-            task_id_low: 0,    // task_id threading is OBS-4
+            task_id_low: ctx.task_id_low(),
         };
         let (payload_bytes, _) = encode_drive_begin(&begin);
         em.span_begin(
@@ -167,11 +177,46 @@ where
             }
 
             StepOutcome::Yield { shape, .. } => {
-                // L3 yield/resume hooks will be inserted here in OBS-3b.
-                // For OBS-3a the yield_resolve callback decides the wait.
-                if let Some(errno) = yield_resolve(&shape, ctx) {
-                    break DriveOutcome::Err(errno);
-                }
+                // ── L3 YieldBegin (OBS-3b) ──────────────────────────────
+                let yield_span: SpanId = if let Some(em) = tx_observe::current() {
+                    use tx_observe::encode::{encode_yield_begin, yield_begin_tag};
+                    let yb = PayloadYieldBegin {
+                        shape_kind: yield_shape_kind(&shape),
+                        _pad: [0u8; 3],
+                        task_id_low: ctx.task_id_low(),
+                        wait_generation: 0, // filled from resolved below; begin uses 0 placeholder
+                    };
+                    let (payload_bytes, _) = encode_yield_begin(&yb);
+                    em.span_begin(
+                        TxTraceLevel::Yield,
+                        EventNameId::of::<O>(),
+                        drive_span,
+                        yield_begin_tag(),
+                        &payload_bytes,
+                    )
+                } else {
+                    SpanId::NONE
+                };
+
+                // Invoke yield_resolve — callback parks the task until wake.
+                let outcome = yield_resolve(&shape, ctx);
+
+                // ── L3 Resume (OBS-3b) ──────────────────────────────────
+                // Emit for both resolved and aborted paths before returning.
+                let resolved = match outcome {
+                    YieldOutcome::Resolved(r) => {
+                        emit_resume(ctx, &r, yield_span);
+                        r
+                    }
+                    YieldOutcome::Aborted { resolved, errno } => {
+                        emit_resume(ctx, &resolved, yield_span);
+                        break DriveOutcome::Err(errno);
+                    }
+                };
+                // Use resolved to silence the unused-variable warning if
+                // no downstream code uses it; future steps will consume it
+                // via apply_resume.
+                let _ = resolved;
             }
         }
     };
@@ -203,6 +248,61 @@ where
 // Helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// L3 Resume emit helper (OBS-3b)
+// ---------------------------------------------------------------------------
+
+/// Emit an L3 `Instant(Resume)` record and close the matching `yield_span`.
+///
+/// Called from the `Yield` arm of the drive loop after `yield_resolve` returns,
+/// for both resolved (continue) and aborted (break) paths. The `yield_span`
+/// (opened by the `SpanBegin(YieldBegin)` emit before `yield_resolve`) is
+/// closed with a `span_end` here so the daemon sees a well-formed span pair.
+///
+/// OBS-A-1: this helper is called from `drive`, not from inside any
+/// `StepOp::step` body — placement is correct.
+#[inline]
+fn emit_resume<I: SubjectIdentity>(
+    ctx: &ScriptCtx<I>,
+    resolved: &YieldResolved,
+    yield_span: SpanId,
+) {
+    if let Some(em) = tx_observe::current() {
+        use tx_observe::encode::{encode_resume, encode_yield_begin, resume_tag, yield_begin_tag};
+
+        // Emit the Resume instant (OBS-3b primary record).
+        let resume_payload = PayloadResume {
+            resume_kind: resolved.resume_kind as u8,
+            abort_reason: resolved.abort_reason as u8,
+            _pad: [0u8; 2],
+            object_id_low: (resolved.source_id.raw() & 0xFFFF_FFFF) as u32,
+            wait_generation: resolved.wait_generation.raw(),
+        };
+        let (resume_bytes, _) = encode_resume(&resume_payload);
+        em.instant(
+            TxTraceLevel::Yield,
+            EventNameId::of::<()>(), // resume events use the parent span's name
+            yield_span,
+            resume_tag(),
+            &resume_bytes,
+        );
+
+        // Close the YieldBegin span so Perfetto sees a well-formed slice.
+        // The span_end payload carries the real wait_generation (the begin
+        // payload was emitted with 0 before yield_resolve returned).
+        if yield_span != SpanId::NONE {
+            let yb_end = PayloadYieldBegin {
+                shape_kind: 0, // shape kind already recorded in begin
+                _pad: [0u8; 3],
+                task_id_low: ctx.task_id_low(),
+                wait_generation: resolved.wait_generation.raw(),
+            };
+            let (yb_bytes, _) = encode_yield_begin(&yb_end);
+            em.span_end(yield_span, yield_begin_tag(), &yb_bytes);
+        }
+    }
+}
+
 /// Map a [`tx_substrate::step_v3::Errno`] to a signed i32 for wire encoding.
 ///
 /// Only the variants used in OBS-3a are mapped; the full table lands with
@@ -210,33 +310,33 @@ where
 fn errno_to_i32(e: &tx_substrate::step_v3::Errno) -> i32 {
     use tx_substrate::step_v3::Errno::*;
     match e {
-        EACCES   => 13,
-        EAGAIN   => 11,
-        EBADF    => 9,
-        EBUSY    => 16,
-        EDQUOT   => 122,
-        EEXIST   => 17,
-        EFAULT   => 14,
-        EINVAL   => 22,
-        EIO      => 5,
-        EISDIR   => 21,
-        ELOOP    => 40,
+        EACCES => 13,
+        EAGAIN => 11,
+        EBADF => 9,
+        EBUSY => 16,
+        EDQUOT => 122,
+        EEXIST => 17,
+        EFAULT => 14,
+        EINVAL => 22,
+        EIO => 5,
+        EISDIR => 21,
+        ELOOP => 40,
         ENAMETOOLONG => 36,
-        ENODEV   => 19,
-        ENOEXEC  => 8,
-        ENOMEM   => 12,
-        ENOENT   => 2,
-        ENOSYS   => 38,
-        ENOTDIR  => 20,
+        ENODEV => 19,
+        ENOEXEC => 8,
+        ENOMEM => 12,
+        ENOENT => 2,
+        ENOSYS => 38,
+        ENOTDIR => 20,
         ENOTEMPTY => 39,
-        ENOTTY   => 25,
-        EPERM    => 1,
-        EPIPE    => 32,
-        ERANGE   => 34,
-        EROFS    => 30,
-        ESPIPE   => 29,
-        ESRCH    => 3,
-        ESTALE   => 116,
+        ENOTTY => 25,
+        EPERM => 1,
+        EPIPE => 32,
+        ERANGE => 34,
+        EROFS => 30,
+        ESPIPE => 29,
+        ESRCH => 3,
+        ESTALE => 116,
     }
 }
 
@@ -258,7 +358,14 @@ fn encode_outcome_fields<O: StepOp<I>, I: SubjectIdentity>(
             (1, sk, 0, pv, pk, empty)
         }
         StepOutcome::Done(_) => (2, 0, 0, 0, TxProgressKind::NoProgress as u8, true),
-        StepOutcome::Err(e)  => (3, 0, errno_to_i32(e), 0, TxProgressKind::NoProgress as u8, true),
+        StepOutcome::Err(e) => (
+            3,
+            0,
+            errno_to_i32(e),
+            0,
+            TxProgressKind::NoProgress as u8,
+            true,
+        ),
     }
 }
 
@@ -277,7 +384,7 @@ fn progress_fields<P: StepProgress>(progress: &P) -> (u32, u8, bool) {
 fn yield_shape_kind(shape: &YieldShape) -> u8 {
     match shape {
         YieldShape::OnWaitSource { .. } => YieldShapeKind::OnWaitSource as u8,
-        YieldShape::OnAgent { .. }      => YieldShapeKind::OnAgent as u8,
-        YieldShape::OnTimer { .. }      => YieldShapeKind::OnTimer as u8,
+        YieldShape::OnAgent { .. } => YieldShapeKind::OnAgent as u8,
+        YieldShape::OnTimer { .. } => YieldShapeKind::OnTimer as u8,
     }
 }

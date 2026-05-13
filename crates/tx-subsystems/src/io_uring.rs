@@ -365,7 +365,8 @@ impl IoUring {
         ring.push_back(sqe);
         drop(ring);
         // Wake any parked SQPOLL kthread. Mirrors the AIO push path.
-        self.sqe_arrived.notify_emit(InterestMask::new(SQE_ARRIVED_MASK));
+        self.sqe_arrived
+            .notify_emit(InterestMask::new(SQE_ARRIVED_MASK));
         Ok(())
     }
 

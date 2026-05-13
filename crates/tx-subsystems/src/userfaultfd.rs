@@ -390,7 +390,8 @@ impl UserfaultFd {
         //   consumers,
         // - new `WaitSource::notify` for v3 mailbox-based consumers.
         self.wait_channel.fire(Mask::from_bits(UFD_READABLE));
-        self.wait_source.notify_emit(InterestMask::new(UFD_READABLE));
+        self.wait_source
+            .notify_emit(InterestMask::new(UFD_READABLE));
     }
 
     /// PR-10 phase 5: snapshot the pending-fault queue depth. Tests

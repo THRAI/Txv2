@@ -47,6 +47,9 @@ use hart_local::{HartLocalArray, HartLocalOptionArray};
 pub mod encode;
 mod macros;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 // Re-exports used by the `traced_syscall!` macro so crates that use the macro
 // do not need to directly depend on `tx-observe-types`.
 #[doc(hidden)]
@@ -220,8 +223,7 @@ static HART_SLOTS: HartLocalArray<HartSlot, MAX_HARTS> =
 
 /// Static array of `HartEmitter` instances, one per hart.
 /// Populated during `init`.
-static EMITTERS: HartLocalOptionArray<HartEmitter, MAX_HARTS> =
-    HartLocalOptionArray::new_none();
+static EMITTERS: HartLocalOptionArray<HartEmitter, MAX_HARTS> = HartLocalOptionArray::new_none();
 
 // ---------------------------------------------------------------------------
 // Public facade: HartEmitter
@@ -655,14 +657,8 @@ pub fn init<P: ObserverIf + TimeIf + PercpuIf>(hart: CpuId) -> Result<(), InitEr
             AtomicU64::new(0),
         );
         core::ptr::write(core::ptr::addr_of_mut!((*ring_hdr)._pad2), [0u8; 56]);
-        core::ptr::write(
-            core::ptr::addr_of_mut!((*ring_hdr).lost),
-            AtomicU64::new(0),
-        );
-        core::ptr::write(
-            core::ptr::addr_of_mut!((*ring_hdr).seq),
-            AtomicU64::new(0),
-        );
+        core::ptr::write(core::ptr::addr_of_mut!((*ring_hdr).lost), AtomicU64::new(0));
+        core::ptr::write(core::ptr::addr_of_mut!((*ring_hdr).seq), AtomicU64::new(0));
         // Zero-fill record slots so unread slots read as Nop (kind = 0).
         core::ptr::write_bytes(slots, 0, slot_count as usize);
     }
@@ -687,6 +683,34 @@ pub fn init<P: ObserverIf + TimeIf + PercpuIf>(hart: CpuId) -> Result<(), InitEr
     *EMITTERS.get_mut(idx) = Some(HartEmitter { slot_idx: idx });
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Testing utilities (used by `crate::testing`)
+// ---------------------------------------------------------------------------
+
+/// Reset all per-hart observation state for `hart_idx`.
+///
+/// Clears the emitter slot, marks the hart slot as invalid, and zeroes the
+/// function-pointer atomics (`TS_FN`, `CPU_ID_FN`).  After this call, `init`
+/// can be called again for the same hart as if it were first boot.
+///
+/// # Safety
+///
+/// Must only be called from a test that holds the `TEST_LOCK` mutex so that
+/// no other code is concurrently writing into or reading from the observation
+/// statics.  Calling this while an emitter is in use is undefined behaviour.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) unsafe fn testing_reset(hart_idx: usize) {
+    use core::sync::atomic::Ordering;
+    if hart_idx < MAX_HARTS {
+        // Clear the emitter.
+        *EMITTERS.get_mut(hart_idx) = None;
+        // Mark the hart slot as invalid so init() can reinitialise it.
+        HART_SLOTS.get_mut(hart_idx).valid = false;
+    }
+    TS_FN.store(0, Ordering::Relaxed);
+    CPU_ID_FN.store(0, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------

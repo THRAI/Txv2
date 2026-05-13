@@ -20,8 +20,8 @@ use std::sync::Mutex;
 
 use tx_hal::{
     AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
-    ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PtNode,
+    ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
 
 /// Page size used to fabricate distinct test pmap roots. tx-hal

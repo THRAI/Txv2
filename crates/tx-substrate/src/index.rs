@@ -239,9 +239,7 @@ impl<K, V, const N: usize> IndexReservation<'_, K, V, N> {
         // inside a `StepOp::step` body (OBS-A-1).
         if INDEX_MUTATION_EMIT_ENABLED.load(Ordering::Relaxed) {
             if let Some(em) = tx_observe::current() {
-                use tx_observe::encode::{
-                    encode_mutation_index_commit, mutation_index_commit_tag,
-                };
+                use tx_observe::encode::{encode_mutation_index_commit, mutation_index_commit_tag};
                 use tx_observe::{EventNameId, TxTraceLevel};
                 use tx_observe_types::PayloadMutationIndexCommit;
 

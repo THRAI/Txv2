@@ -623,4 +623,49 @@ OBS-0/1/2 can land in parallel (independent crates). OBS-3a depends on all three
   - [`tx-scripts::drive`](../../crates/tx-scripts/src/drive.rs) — central driver, future hook site.
   - [`tx-hal::HartLocal`](../../crates/tx-hal/src/hart_local.rs) — per-hart slot primitive.
   - [`tx-substrate::verbs`](../../crates/tx-substrate/src/verbs.rs) — curated substrate verb namespace.
+
+## 19. Observation tooling and test helpers
+
+<!-- txdoc:OBS-V1-TOOLING-1 -->
+
+### 19.1 `cargo xtask observe` — pipeline wrappers
+
+`cargo xtask observe` wraps the `tx-trace-daemon` binary so humans and CI can
+drive the observation pipeline without memorising daemon CLI flags.
+
+| Subcommand | Description |
+|---|---|
+| `observe demo --output <path>` | Generate a synthetic `.txtrace` file with a known mix of records (SpanBegin/End, Instant, WaitSourceNotify, Counter; optionally YieldBegin/Resume with `--with-yields`). No daemon required — pure Rust byte writer. |
+| `observe validate --file <path>` | Parse the file header, walk slots, print a one-line summary: `txtrace v0: 1 hart, 16 slots/hart, 4 records, 0 framing errors`. Fast CI smoke check. |
+| `observe replay --file <path> [--out json\|pftrace] [--output <path>] [--filter level=N]` | Decode a `.txtrace` file. Default `--out json` writes NDJSON to stdout (pipeable to `jq`). With `--out pftrace --output <path>` writes a Perfetto `.pftrace` file. |
+| `observe pftrace --file <path> --output <pftrace>` | Convenience alias for `replay --out pftrace`; avoids remembering two flags for the common Perfetto case. |
+
+The daemon CLI surface is documented in [`08_OBSERVATION_HOST_v0.md`](08_OBSERVATION_HOST_v0.md).
+
+### 19.2 `tx_observe::testing` — test helpers
+
+`crates/tx-observe/src/testing.rs` (enabled via `features = ["testing"]` or
+`cfg(test)`) provides `TestPlatform` / `TestObservation` — a RAII harness that
+eliminates the ~150-line `TestPlatform` boilerplate currently repeated in every
+observation integration test.
+
+```ignore
+use tx_observe::testing::TestPlatform;
+
+#[test]
+fn my_test() {
+    let obs = TestPlatform::new().init();
+    obs.emitter().instant(/* ... */);
+    let records = obs.records();
+    assert_eq!(records.len(), 1);
+}
+```
+
+`TestPlatform::init()` acquires a crate-level `Mutex` that serialises all tests
+using the helpers, preventing concurrent races on the observation statics.
+`TestObservation`'s `Drop` resets `TS_FN`, `CPU_ID_FN`, `HART_SLOTS`, and
+`EMITTERS` for the test's hart so the next test starts clean.
+
+Migration reference: `crates/tx-observe/tests/smoke.rs` was migrated from
+~337 lines to ~100 lines using these helpers.
   - [`tx-hal::Pod`](../../crates/tx-hal/src/lib.rs) — POD marker reused for trace records.

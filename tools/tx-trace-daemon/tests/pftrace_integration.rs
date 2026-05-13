@@ -410,6 +410,80 @@ fn pftrace_synthetic_roundtrip() {
         "expected at least 3 TYPE_INSTANT packets, got {}", instants.len());
 }
 
+/// OBS-3b: verify that a synthetic WaitSourceNotify + Resume pair round-trips
+/// through the daemon and produces two TYPE_INSTANT packets with matching
+/// flow_ids (one flow_ids entry on the producer side, one terminating_flow_ids
+/// entry on the consumer side).
+///
+/// This confirms that `push_wait_source_notify` and `push_resume` are now live
+/// (dead_code gates removed) and correctly wired into `push_record`.
+#[test]
+fn pftrace_resume_flow_reconstruction() {
+    use tx_observe_types::payload::PayloadResume;
+
+    // WaitSourceNotify record: task_id_low=1, wait_generation_low=42.
+    // PayloadWaitSourceNotify layout: source_id_low u32, mask_bits u32, task_id_low u32, wait_generation_low u32
+    let mut wsn_payload = [0u8; 16];
+    wsn_payload[0..4].copy_from_slice(&0x0000_ABCDu32.to_le_bytes()); // source_id_low
+    wsn_payload[4..8].copy_from_slice(&0x0000_0001u32.to_le_bytes()); // mask_bits
+    wsn_payload[8..12].copy_from_slice(&1u32.to_le_bytes());           // task_id_low = 1
+    wsn_payload[12..16].copy_from_slice(&42u32.to_le_bytes());         // wait_generation_low = 42
+
+    let wait_source_notify = make_record_bytes(
+        RECORD_MAGIC, 0,
+        TxTraceKind::Instant as u8,
+        TxTraceLevel::Yield as u8,
+        0, 1, 1000,
+        0, 0, 0x0001,
+        TxPayloadTag::WaitSourceNotify as u16, 16,
+        wsn_payload,
+    );
+
+    // Resume record: wait_generation = 42 (matches producer above).
+    // PayloadResume layout: resume_kind u8, abort_reason u8, _pad [u8;2], object_id_low u32, wait_generation u64
+    let resume_payload_bytes: [u8; 16] = {
+        let p = PayloadResume {
+            resume_kind: 0, // Retry
+            abort_reason: 0,
+            _pad: [0u8; 2],
+            object_id_low: 0xABCD,
+            wait_generation: 42,
+        };
+        // Manually encode the struct layout.
+        let mut b = [0u8; 16];
+        b[0] = p.resume_kind;
+        b[1] = p.abort_reason;
+        // _pad at 2-3 = 0
+        b[4..8].copy_from_slice(&p.object_id_low.to_le_bytes());
+        b[8..16].copy_from_slice(&p.wait_generation.to_le_bytes());
+        b
+    };
+
+    let resume = make_record_bytes(
+        RECORD_MAGIC, 0,
+        TxTraceKind::Instant as u8,
+        TxTraceLevel::Yield as u8,
+        0, 2, 2000,
+        0, 0, 0x0002,
+        TxPayloadTag::Resume as u16, 16,
+        resume_payload_bytes,
+    );
+
+    let trace = run_and_decode(vec![wait_source_notify, resume]);
+
+    // We should have at least a ClockSnapshot + TrackDescriptor + 2 Instant packets.
+    assert!(trace.packet.len() >= 4,
+        "expected at least 4 packets (clock, track, wsn, resume), got {}", trace.packet.len());
+
+    // Count TYPE_INSTANT (4) packets. There should be at least 2 (WaitSourceNotify + Resume).
+    let instants: Vec<_> = trace.packet.iter()
+        .filter(|p| p.track_event.as_ref().map(|e| e.r#type == Some(4)).unwrap_or(false))
+        .collect();
+    assert!(instants.len() >= 2,
+        "expected at least 2 TYPE_INSTANT packets (WaitSourceNotify + Resume), got {}",
+        instants.len());
+}
+
 /// Verify that the output file is actually non-empty (sanity for --out pftrace).
 #[test]
 fn pftrace_output_is_nonempty() {

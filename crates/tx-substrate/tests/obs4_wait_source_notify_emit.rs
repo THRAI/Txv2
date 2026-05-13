@@ -254,18 +254,16 @@ fn notify_emit_posts_event_and_emits_wait_source_notify_record() {
     let wait_gen_low = u32::from_le_bytes(payload[12..16].try_into().unwrap());
 
     assert_eq!(
-        source_id_low,
-        SOURCE_ID as u32,
+        source_id_low, SOURCE_ID as u32,
         "source_id_low should be the low 32 bits of the WaitSourceId"
     );
     assert_eq!(
-        mask_bits,
-        0b0010u32,
+        mask_bits, 0b0010u32,
         "mask_bits should be the overlap between fired and subscriber masks"
     );
     assert_eq!(
         task_id_low, 0,
-        "task_id_low is 0 at substrate layer (not yet wired)"
+        "task_id_low is 0 for a mailbox constructed with TaskMailbox::new() (no task id)"
     );
     assert_eq!(
         wait_gen_low,
@@ -301,6 +299,82 @@ fn notify_emit_emits_one_record_per_woken_task() {
     assert_eq!(
         producer, 2,
         "ring should have 2 records (one per woken task)"
+    );
+}
+
+/// `notify_emit` carries the correct `task_id_low` from the mailbox into the ring.
+///
+/// Tests the γ-fix: a mailbox constructed with `with_task_id(tid)` produces a
+/// `WaitSourceNotify` record whose `task_id_low` field equals `tid`, not `0`.
+#[test]
+fn notify_emit_carries_task_id_low_from_mailbox() {
+    let _guard = TEST_LOCK.lock().expect("test lock");
+    reset_ring();
+
+    tx_observe::init::<TestPlatform>(CpuId(0)).expect("observe init");
+
+    const SOURCE_ID: u64 = 77;
+    const TASK_ID: u32 = 42;
+
+    let src = WaitSource::new(WaitSourceId::new(SOURCE_ID));
+    let mailbox = Arc::new(TaskMailbox::new().with_task_id(TASK_ID));
+    let gen = WaitGeneration::new(5);
+    let _ = src.register(Arc::downgrade(&mailbox), gen, InterestMask::new(0b1));
+
+    let posted = src.notify_emit(InterestMask::new(0b1));
+    assert_eq!(posted, 1);
+
+    let (hdr, slots) = unsafe { read_ring(2) };
+    assert_eq!(hdr.producer.load(Ordering::Acquire), 1);
+
+    let payload = &slots[0].payload;
+    let task_id_low = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    assert_eq!(
+        task_id_low, TASK_ID,
+        "task_id_low should be the value set via with_task_id"
+    );
+}
+
+/// Two mailboxes with different `task_id_low` values produce distinct records.
+///
+/// Without the γ-fix both would have `task_id_low = 0`; the daemon's
+/// `compute_flow_id` would produce identical flow IDs for both tasks on the
+/// same `(wait_gen, boot_id)` pair, causing false flow arrows in Perfetto.
+#[test]
+fn pipe_eof_emits_correct_task_id_per_task() {
+    let _guard = TEST_LOCK.lock().expect("test lock");
+    reset_ring();
+
+    tx_observe::init::<TestPlatform>(CpuId(0)).expect("observe init");
+
+    const SOURCE_ID: u64 = 88;
+    const TID_A: u32 = 101;
+    const TID_B: u32 = 202;
+
+    let src = WaitSource::new(WaitSourceId::new(SOURCE_ID));
+    let m_a = Arc::new(TaskMailbox::new().with_task_id(TID_A));
+    let m_b = Arc::new(TaskMailbox::new().with_task_id(TID_B));
+    let gen_a = WaitGeneration::new(10);
+    let gen_b = WaitGeneration::new(11);
+    let _ = src.register(Arc::downgrade(&m_a), gen_a, InterestMask::new(0b1));
+    let _ = src.register(Arc::downgrade(&m_b), gen_b, InterestMask::new(0b1));
+
+    let posted = src.notify_emit(InterestMask::new(0b1));
+    assert_eq!(posted, 2, "both subscribers should be notified");
+
+    let (hdr, slots) = unsafe { read_ring(4) };
+    assert_eq!(hdr.producer.load(Ordering::Acquire), 2);
+
+    let tid0 = u32::from_le_bytes(slots[0].payload[8..12].try_into().unwrap());
+    let tid1 = u32::from_le_bytes(slots[1].payload[8..12].try_into().unwrap());
+
+    // Both task ids must appear (one per subscriber, in registration order).
+    let mut seen = std::vec![tid0, tid1];
+    seen.sort();
+    assert_eq!(
+        seen,
+        std::vec![TID_A, TID_B],
+        "each record must carry its own task_id_low; no collision"
     );
 }
 

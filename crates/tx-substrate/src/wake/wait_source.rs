@@ -241,12 +241,12 @@ impl WaitSource {
                 };
                 if mailbox.post(evt) {
                     posted += 1;
-                    // Emit one Instant record per woken task (OBS-4).
+                    // Emit one Instant record per woken task (OBS-4 / γ-fix).
                     if let Some(em) = tx_observe::current() {
                         let payload = PayloadWaitSourceNotify {
                             source_id_low: self.id.raw() as u32,
                             mask_bits: overlap as u32,
-                            task_id_low: 0, // task-id threading is a later phase
+                            task_id_low: mailbox.task_id_low(),
                             wait_generation_low: sub.generation.raw() as u32,
                         };
                         let (payload_bytes, _) = encode_wait_source_notify(&payload);

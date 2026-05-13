@@ -146,8 +146,8 @@ fn scan_file(
     violations: &mut Vec<String>,
 ) {
     let mut brace_depth: i32 = 0;
-    let mut impl_depth: Option<i32> = None;   // depth after `impl StepOp {` opens
-    let mut step_depth: Option<i32> = None;   // depth after `fn step(` opens
+    let mut impl_depth: Option<i32> = None; // depth after `impl StepOp {` opens
+    let mut step_depth: Option<i32> = None; // depth after `fn step(` opens
     let mut awaiting_impl_brace = false;
     let mut awaiting_step_brace = false;
 
@@ -269,7 +269,7 @@ fn is_impl_step_op_header(line: &str) -> bool {
         return false;
     };
     let after_impl_kw = &line[impl_pos + 4..]; // skip "impl"
-    // Next char must be a space or '<' (to avoid matching e.g. "reimpl").
+                                               // Next char must be a space or '<' (to avoid matching e.g. "reimpl").
     let first_char = after_impl_kw.chars().next().unwrap_or('\0');
     if first_char != ' ' && first_char != '<' {
         return false;
@@ -341,7 +341,10 @@ pub fn drive<O: StepOp>(op: &mut O) {
 "#;
         let (impls, violations) = run_scan(source);
         assert_eq!(impls, 0, "no impl StepOp in this snippet");
-        assert!(violations.is_empty(), "drive wrapper must be clean: {violations:?}");
+        assert!(
+            violations.is_empty(),
+            "drive wrapper must be clean: {violations:?}"
+        );
     }
 
     /// Synthetic violation: `tx_observe::current` inside a step body.
@@ -361,7 +364,9 @@ impl StepOp for BadOp {
         let (impls, violations) = run_scan(source);
         assert_eq!(impls, 1);
         assert!(
-            violations.iter().any(|v| v.contains("tx_observe::current") && v.contains("OBS-A-1")),
+            violations
+                .iter()
+                .any(|v| v.contains("tx_observe::current") && v.contains("OBS-A-1")),
             "expected OBS-A-1 violation for tx_observe::current, got {violations:?}"
         );
     }
@@ -434,7 +439,10 @@ fn helper() {
 "#;
         let (impls, violations) = run_scan(source);
         assert_eq!(impls, 0);
-        assert!(violations.is_empty(), "helpers outside impl StepOp must not be flagged: {violations:?}");
+        assert!(
+            violations.is_empty(),
+            "helpers outside impl StepOp must not be flagged: {violations:?}"
+        );
     }
 
     /// Multiple `impl StepOp` blocks in one file are all counted.

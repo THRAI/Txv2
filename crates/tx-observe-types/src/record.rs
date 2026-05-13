@@ -130,10 +130,10 @@ pub struct TxTraceRecord {
 #[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
 pub enum TxTraceKind {
     /// No-op slot (e.g. daemon-attach-late initial state).  Skip.
-    Nop             = 0,
+    Nop = 0,
 
     /// Clock-translation snapshot record.
-    ClockSnapshot   = 1,
+    ClockSnapshot = 1,
 
     /// Track-descriptor record (kernel-emitted track creation).
     TrackDescriptor = 2,
@@ -142,22 +142,22 @@ pub enum TxTraceKind {
     StringDescriptor = 3,
 
     /// Span open.  Payload identifies the entity; span id is in `span`.
-    SpanBegin       = 10,
+    SpanBegin = 10,
 
     /// Span close.  Payload may carry result data (e.g. `SyscallExit`).
-    SpanEnd         = 11,
+    SpanEnd = 11,
 
     /// Point-in-time event attached to `span`.
-    Instant         = 12,
+    Instant = 12,
 
     /// Counter sample.
-    Counter         = 13,
+    Counter = 13,
 
     /// Track tombstone (object reclaimed).  Daemon ages out the track.
-    TrackTombstone  = 14,
+    TrackTombstone = 14,
 
     /// Panic marker emitted by the kernel panic handler before halt.
-    PanicMarker     = 31,
+    PanicMarker = 31,
 
     /// Argument continuation attached to the most-recent record's `span`.
     ArgContinuation = 40,
@@ -177,10 +177,10 @@ pub enum TxTraceKind {
 #[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
 pub enum TxTraceLevel {
     Boundary = 0,
-    Script   = 1,
-    Drive    = 2,
-    Yield    = 3,
-    Step     = 4,
-    Phase    = 5,
+    Script = 1,
+    Drive = 2,
+    Yield = 3,
+    Step = 4,
+    Phase = 5,
     Mutation = 6,
 }
