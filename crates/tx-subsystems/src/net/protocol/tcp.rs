@@ -81,6 +81,7 @@ impl RawTcpSocket {
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
 
         socket.set_nagle_enabled(!options.tcp.nodelay);
+        socket.set_ack_delay(None);
         if options.socket.keep_alive {
             socket.set_keep_alive(Some(Duration::from_secs(options.tcp.keepidle as u64)));
         }
@@ -264,7 +265,7 @@ impl RawTcpSocket {
     }
 
     pub fn is_recv_closed(&self) -> bool {
-        self.protocol_state.lock().is_recv_shut || !self.socket.lock().may_recv()
+        self.protocol_state.lock().is_recv_shut
     }
 
     pub fn is_send_closed(&self) -> bool {
@@ -360,7 +361,7 @@ impl RawTcpSocket {
             if before.can_send != after.can_send && after.can_send {
                 publish.send_writable = true;
             }
-            if before.may_recv && !after.may_recv && !protocol_state.is_recv_shut {
+            if matches!(segment.tcp.control, TcpControl::Fin) && !protocol_state.is_recv_shut {
                 protocol_state.is_recv_shut = true;
                 publish.recv_readable = true;
                 publish.recv_closed = true;
@@ -517,7 +518,6 @@ struct SocketProtocolObservation {
     state: tcp::State,
     can_recv: bool,
     can_send: bool,
-    may_recv: bool,
     may_send: bool,
     is_active: bool,
 }
@@ -527,7 +527,6 @@ fn observe_socket(socket: &tcp::Socket<'_>) -> SocketProtocolObservation {
         state: socket.state(),
         can_recv: socket.can_recv(),
         can_send: socket.can_send(),
-        may_recv: socket.may_recv(),
         may_send: socket.may_send(),
         is_active: matches!(
             socket.state(),

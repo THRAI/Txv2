@@ -205,6 +205,14 @@ pub fn step_process_loopback_pending(
     StepOutcome::Done(outcome)
 }
 
+pub fn step_process_loopback_pending_zero(
+    iface: &LoopbackIface,
+    budget: LoopbackPollBudget,
+    guard: &Guard<'_>,
+) -> StepOutcome<LoopbackPendingOutcome> {
+    step_process_loopback_pending(Instant::ZERO, iface, budget, guard)
+}
+
 fn is_tcp_connecting(socket: &Cap<SocketIdentity>) -> bool {
     socket.acquire_operational().is_some_and(|payload| {
         matches!(

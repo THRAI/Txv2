@@ -175,13 +175,29 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         }
         F_SETFL => {
             let arg = args[2] as u64;
+            let nonblocking = (arg & O_NONBLOCK as u64) != 0;
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = OpenFileSetFlOp {
                 file: &file,
-                nonblocking: (arg & O_NONBLOCK as u64) != 0,
+                nonblocking,
             };
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-                Ok(()) => SyscallResult::Return(0),
+                Ok(()) => {
+                    if nonblocking {
+                        if let tx_subsystems::vfs::structure::RNodeBacking::StructBacked {
+                            payload:
+                                tx_subsystems::vfs::structure::StructPayload::Socket {
+                                    identity: socket,
+                                },
+                        } = file.rnode().backing()
+                        {
+                            socket
+                                .readiness
+                                .fire_send(tx_subsystems::net::structure::SendWireSet::SPACE);
+                        }
+                    }
+                    SyscallResult::Return(0)
+                }
                 Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
             }
         }

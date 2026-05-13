@@ -10,10 +10,10 @@ use super::*;
 use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 use tx_subsystems::net::{
     socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
-    step_poll_ready, step_recv_kernel_bytes, step_send_to_kernel_bytes, step_shutdown,
-    step_socket_close, step_socket_open_file, IpEndpoint, Ipv4Address, KernelSockAddr,
-    LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockShutdownCmd, SocketHandleFlags,
-    SocketIdentity, SocketKind, SocketProtocol, TcpState, UdpInner,
+    step_poll_ready, step_poll_wait_token, step_recv_kernel_bytes, step_send_to_kernel_bytes,
+    step_shutdown, step_socket_close, step_socket_open_file, IpEndpoint, Ipv4Address,
+    KernelSockAddr, LingerOption, PollMask, SendRecvFlags, SockAddrIn, SockShutdownCmd,
+    SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol, TcpState, UdpInner,
 };
 use tx_subsystems::wait_source;
 
@@ -185,6 +185,9 @@ pub(super) async fn sys_connect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         Ok(remote) => remote,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
+    if let Err(errno) = maybe_autobind_tcp_client(&socket, remote) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
     let nonblocking = file.flags().nonblocking;
     let was_connecting = socket_is_tcp_connecting(&socket);
     let mut waited_for_connect = was_connecting;
@@ -219,6 +222,38 @@ pub(super) async fn sys_connect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
             StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         }
     }
+}
+
+fn maybe_autobind_tcp_client(
+    socket: &Cap<SocketIdentity>,
+    remote: KernelSockAddr,
+) -> Result<(), Errno> {
+    if socket.kind != SocketKind::Tcp {
+        return Ok(());
+    }
+
+    let remote_endpoint = remote.as_ip_endpoint();
+    let local_addr = if remote_endpoint.addr == Ipv4Address::LOOPBACK {
+        Ipv4Address::LOOPBACK
+    } else {
+        Ipv4Address::UNSPECIFIED
+    };
+
+    for port in 49_152..49_216 {
+        let local = KernelSockAddr::V4(SockAddrIn::new(port, local_addr));
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            step_bind(socket, local, &guard)
+        };
+        match outcome {
+            StepOutcome::Done(()) => return Ok(()),
+            StepOutcome::Err(Errno::EADDRINUSE) => continue,
+            StepOutcome::Err(Errno::EINVAL) => return Ok(()),
+            StepOutcome::Err(errno) => return Err(errno),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => return Err(Errno::EIO),
+        }
+    }
+    Err(Errno::EADDRINUSE)
 }
 
 pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -257,9 +292,6 @@ pub(super) async fn sys_sendto<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
     let len = args[2] as usize;
-    if len > TTY_WRITE_MAX_INLINE {
-        return SyscallResult::Error(E2BIG_VALUE);
-    }
 
     let mut flags = match SendRecvFlags::validate(args[3] as i32) {
         Ok(flags) => flags,
@@ -666,6 +698,13 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.tcp.nodelay = on);
             Ok(())
         }
+        (IPPROTO_TCP, TCP_MAXSEG) => {
+            let _ = match read_sockopt_positive_usize(ctx, optval, optlen) {
+                Ok(size) => size,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            Ok(())
+        }
         _ => Err(Errno::ENOPROTOOPT),
     };
 
@@ -755,6 +794,9 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optlen_ptr,
             payload.with_options(|o| o.tcp.nodelay as i32),
         ),
+        (IPPROTO_TCP, TCP_MAXSEG) => write_sockopt_i32(ctx, optval, optlen_ptr, 1460),
+        (IPPROTO_TCP, TCP_INFO) => write_sockopt_bytes(ctx, optval, optlen_ptr, &[0u8; 104]),
+        (IPPROTO_TCP, TCP_CONGESTION) => write_sockopt_bytes(ctx, optval, optlen_ptr, b"reno\0"),
         _ => Err(Errno::ENOPROTOOPT),
     };
 
@@ -831,6 +873,23 @@ pub(super) fn socket_poll_mask_from_file(
         StepOutcome::Done(mask) => Ok(mask),
         StepOutcome::Err(errno) => Err(errno),
         StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(PollMask::empty()),
+    })
+}
+
+pub(super) fn socket_poll_wait_token_from_file(
+    file: &Cap<OpenFile>,
+    interests: PollMask,
+    guard: &tx_substrate::epoch::Guard<'_>,
+) -> Option<Result<Option<tx_subsystems::execution::WaitToken>, Errno>> {
+    let socket = match socket_identity_from_file(file) {
+        Ok(socket) => socket,
+        Err(Errno::ENOTSOCK) => return None,
+        Err(errno) => return Some(Err(errno)),
+    };
+    Some(match step_poll_wait_token(&socket, interests, guard) {
+        StepOutcome::Done(token) => Ok(token),
+        StepOutcome::Err(errno) => Err(errno),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(None),
     })
 }
 
@@ -1183,6 +1242,21 @@ fn write_sockopt_timeval<'a>(
     bytes[0..8].copy_from_slice(&sec.to_le_bytes());
     bytes[8..16].copy_from_slice(&usec.to_le_bytes());
     bootstrap_copy_to_user(&ctx.aspace, optval, &bytes)
+}
+
+fn write_sockopt_bytes<'a>(
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen_ptr: u64,
+    value: &[u8],
+) -> Result<(), Errno> {
+    if optval == 0 || optlen_ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let optlen: u32 = bootstrap_read_user(&ctx.aspace, optlen_ptr)?;
+    let bytes = core::cmp::min(optlen as usize, value.len());
+    bootstrap_write_user(&ctx.aspace, optlen_ptr, bytes as u32)?;
+    bootstrap_copy_to_user(&ctx.aspace, optval, &value[..bytes])
 }
 
 fn socket_type_i32(socket: &Cap<SocketIdentity>) -> i32 {

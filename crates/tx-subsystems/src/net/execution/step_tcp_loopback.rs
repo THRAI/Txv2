@@ -70,13 +70,16 @@ pub fn step_tcp_loopback_handshake_on_iface(
     let Some(listener_payload) = listener.acquire_operational() else {
         return StepOutcome::Err(Errno::ECONNREFUSED);
     };
-    if !matches!(
+    let listener_matches_remote = matches!(
         listener_payload.protocol_snapshot(),
         SocketProtocol::Tcp(TcpState::Listening {
             local: listener_local,
             ..
         }) if listener_local == remote
-    ) {
+            || (listener_local.addr == Ipv4Address::UNSPECIFIED
+                && listener_local.port == remote.port)
+    );
+    if !listener_matches_remote {
         return StepOutcome::Err(Errno::ECONNREFUSED);
     }
 

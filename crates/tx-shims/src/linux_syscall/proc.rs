@@ -70,6 +70,47 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.process.pid.0 as i64)
 }
 
+/// `gettid()` — direct read of the calling thread identity.
+///
+/// musl-linked network tools use this as part of their fork/thread
+/// bookkeeping. txKernel's current thread model already assigns a
+/// stable tid when the `ThreadIdentity` is signed, so the syscall can
+/// expose that id without touching process state.
+pub(super) fn sys_gettid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
+    SyscallResult::Return(ctx.thread.tid.0 as i64)
+}
+
+/// `getrusage(who, usage)` — minimal zeroed resource accounting.
+///
+/// iperf3 probes this for CPU-utilisation reporting after the TCP
+/// control channel is established. txKernel does not yet maintain
+/// per-process CPU/io accounting, so this accepts the Linux `who`
+/// values that userland commonly passes and writes a zeroed
+/// `struct rusage`. That is preferable to `-ENOSYS`: callers can
+/// continue with valid "unknown/zero" counters instead of taking an
+/// error path unrelated to the network data plane.
+pub(super) fn sys_getrusage<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    const RUSAGE_SELF: i32 = 0;
+    const RUSAGE_CHILDREN: i32 = -1;
+    const RUSAGE_THREAD: i32 = 1;
+    const RUSAGE_BYTES_RV64: usize = 18 * 8;
+
+    let who = args[0] as i32;
+    match who {
+        RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD => {}
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    }
+    if args[1] == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let usage = [0u8; RUSAGE_BYTES_RV64];
+    match bootstrap_copy_to_user(&ctx.aspace, args[1], &usage) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
 /// `execve(path, argv, envp)` — Wave 4 / Phase 6 of the ELF-loader
 /// plan.
 ///
