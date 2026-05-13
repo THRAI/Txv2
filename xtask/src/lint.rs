@@ -108,11 +108,13 @@ pub(crate) fn lint_arch(root: &Path) -> Result<()> {
         if is_lint_excluded_path(&normalized) {
             continue;
         }
-        if let Some(finding) = lint_file_size(&normalized, &relative, &text) {
-            findings.push(finding);
-        }
+        // xtask is dev tooling, not authored runtime code; mirrors the
+        // text-content skip below.
         if normalized.starts_with("xtask/") {
             continue;
+        }
+        if let Some(finding) = lint_file_size(&normalized, &relative, &text) {
+            findings.push(finding);
         }
 
         findings.extend(lint_arch_text(&normalized, &relative, &text));
@@ -372,9 +374,14 @@ fn unused_allowance(line: &str) -> bool {
 
 fn lint_arch_text(path: &str, display: &str, text: &str) -> Vec<String> {
     let mut findings = Vec::new();
+    // Integration test files under `crates/*/tests/` are inherently
+    // test-only — they compile only as test binaries, so `#[allow(...)]`
+    // there cannot hide stale runtime code. The unused-allowance check
+    // is meant to catch dead allowances in `src/`, not in tests.
+    let is_integration_test = path.contains("/tests/") && path.ends_with(".rs");
     for (idx, line) in text.lines().enumerate() {
         let line_no = idx + 1;
-        if unused_allowance(line) {
+        if !is_integration_test && unused_allowance(line) {
             findings.push(format!(
                 "{display}:{line_no}: unused/dead-code allowances hide stale boot and API surfaces; remove the item or gate it behind cfg(test)"
             ));
