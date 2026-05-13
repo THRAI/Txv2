@@ -660,7 +660,7 @@ impl RNode {
             .read_wait_channel
             .fire(tx_reactor::wait::Mask::from_bits(mask));
         self.read_wait_source
-            .notify(tx_substrate::step_v3::InterestMask::new(mask));
+            .notify_emit(tx_substrate::step_v3::InterestMask::new(mask));
         released
     }
 
@@ -670,7 +670,7 @@ impl RNode {
             .write_wait_channel
             .fire(tx_reactor::wait::Mask::from_bits(mask));
         self.write_wait_source
-            .notify(tx_substrate::step_v3::InterestMask::new(mask));
+            .notify_emit(tx_substrate::step_v3::InterestMask::new(mask));
         released
     }
 }

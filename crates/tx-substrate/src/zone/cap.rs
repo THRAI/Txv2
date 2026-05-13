@@ -4,6 +4,7 @@
 //! lookup hint. `IdentRef<'g, T>` is a guard-scoped borrowed observation that
 //! can be upgraded into a `Cap<T>` only while the slot is still live.
 
+use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 use core::ops::Deref;
 use core::ptr::NonNull;
@@ -121,6 +122,33 @@ impl<T: 'static> Cap<T> {
         self.raw
     }
 
+    /// Packed trace object id for observation payloads (OBS-4).
+    ///
+    /// Bit layout:
+    /// ```text
+    /// bits  0..32  — slot index (zone_id encoded in upper 8 of the 32 bits,
+    ///                slot_id in the lower 24)
+    /// bits 32..56  — generation (u16 from slot metadata, zero-extended)
+    /// bits 56..64  — kind discriminant: FNV-1a hash of TypeId<T>, low 8 bits
+    /// ```
+    ///
+    /// This accessor is the kernel-side mechanism that downstream payloads will
+    /// use to refer to objects by identity.  Only the accessor is added in
+    /// OBS-4; populating payloads with it is OBS-7/OBS-8 territory.
+    ///
+    /// # Note
+    ///
+    /// Reads the slot's generation from the live atomic metadata word.  The
+    /// read is `Acquire`-ordered consistent with the rest of the cap API.
+    pub fn trace_id(&self) -> u64 {
+        let generation = self
+            .slot()
+            .map(|s| unsafe { s.as_ref().meta().load(Ordering::Acquire).generation() })
+            .unwrap_or(0) as u64;
+        let kind = cap_kind_byte::<T>() as u64;
+        (kind << 56) | (generation << 32) | (self.raw as u64)
+    }
+
     pub fn retain_count(&self) -> u32 {
         let Some(slot) = self.slot() else {
             debug_assert!(false, "zone Cap key no longer resolves to a slot");
@@ -231,6 +259,11 @@ impl<T: 'static> PayloadCap<T> {
 
     pub fn key(&self) -> SlotKey {
         self.inner.key()
+    }
+
+    /// Packed trace object id.  Delegates to [`Cap::trace_id`].
+    pub fn trace_id(&self) -> u64 {
+        self.inner.trace_id()
     }
 }
 
@@ -408,4 +441,40 @@ impl<T: 'static> core::fmt::Debug for PayloadCap<T> {
             .field("key", &self.key())
             .finish_non_exhaustive()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cap::trace_id helpers
+// ---------------------------------------------------------------------------
+
+/// FNV-1a hasher for `#[no_std]` environments.
+struct Fnv1aHasher(u64);
+
+impl Hasher for Fnv1aHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        const FNV_PRIME: u64 = 0x00000100000001B3;
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        let mut h = if self.0 == 0 { FNV_OFFSET } else { self.0 };
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        self.0 = h;
+    }
+}
+
+/// Stable type discriminant byte for `T`, used in `Cap::trace_id`.
+///
+/// Derives the low 8 bits of the FNV-1a hash of `TypeId::of::<T>()`.
+/// Collisions across types in the low byte are benign for observation
+/// payloads — the full (slot, generation, kind) triple is used for
+/// disambiguation by the daemon.
+#[inline]
+fn cap_kind_byte<T: 'static>() -> u8 {
+    let mut h = Fnv1aHasher(0);
+    core::any::TypeId::of::<T>().hash(&mut h);
+    h.finish() as u8
 }

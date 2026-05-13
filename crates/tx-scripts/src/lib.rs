@@ -4,6 +4,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod drive;
 pub mod file_io {}
 pub mod mount {}
 pub mod postlude {}

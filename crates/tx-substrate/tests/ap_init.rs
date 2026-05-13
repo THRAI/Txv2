@@ -2,8 +2,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use tx_hal::{
     Arch, AuxvIf, BootInfo, BootInfoIf, BootPlatformIf, BootProtocol, CacheIf, ConsoleIf, CpuId,
-    CpuMask, DmaIf, EntropyIf, InitIf, IrqIf, MemoryRegion, PercpuIf, PhysRange, PlatformConfig,
-    PlatformInfo, PlatformInfoIf, PmapIf, PowerIf, SignalFrameIf, SmpIf, TimeIf, TrapIf, VirtAddr,
+    CpuMask, DmaIf, EntropyIf, InitIf, IrqIf, MemoryRegion, ObserverIf, PercpuIf, PhysRange,
+    PlatformConfig, PlatformInfo, PlatformInfoIf, PmapIf, PowerIf, SignalFrameIf, SmpIf, TimeIf,
+    TrapIf, VirtAddr,
 };
 use tx_substrate::{epoch, zone};
 
@@ -91,6 +92,7 @@ impl PercpuIf for TestPlatform {
     }
 }
 
+impl ObserverIf for TestPlatform {}
 impl CacheIf for TestPlatform {}
 impl DmaIf for TestPlatform {}
 

@@ -420,6 +420,7 @@ dependencies = [
  "tx-drivers",
  "tx-fs",
  "tx-hal",
+ "tx-observe",
  "tx-reactor",
  "tx-scripts",
  "tx-shims",
@@ -455,6 +456,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tx-observe"
+version = "0.1.0"
+dependencies = [
+ "tx-hal",
+ "tx-observe-types",
+]
+
+[[package]]
+name = "tx-observe-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tx-hal",
+]
+
+[[package]]
 name = "tx-policy"
 version = "0.1.0"
 
@@ -471,6 +488,8 @@ version = "0.1.0"
 dependencies = [
  "goblin",
  "tx-hal",
+ "tx-observe",
+ "tx-observe-types",
  "tx-substrate",
  "tx-subsystems",
 ]
@@ -496,6 +515,8 @@ name = "tx-substrate"
 version = "0.1.0"
 dependencies = [
  "tx-hal",
+ "tx-observe",
+ "tx-observe-types",
 ]
 
 [[package]]

@@ -622,7 +622,7 @@ impl ProcessIdentity {
                 // WaitSource share the bit-namespace
                 // (`EXIT_SOURCE_CHILD_ZOMBIFIED` and future stop/cont
                 // bits land in both).
-                p.exit_wait_source().notify(InterestMask::new(mask.bits()));
+                p.exit_wait_source().notify_emit(InterestMask::new(mask.bits()));
                 released
             })
             .unwrap_or(0)
