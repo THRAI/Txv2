@@ -6,7 +6,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::sync::Arc;
 use tx_ext4_format::pager::{BlockImage, Ext4Pager, InodeMetaLite, InodeNo};
 use tx_ext4_format::Ext4FormatError;
+use tx_substrate::SpinMutex;
 use tx_subsystems::execution::Errno;
+use tx_subsystems::mount::MountPayloadPin;
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
@@ -15,13 +17,19 @@ pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
 
 pub(crate) struct Ext4FsInstance<I> {
     pager: Ext4PagerCell<I>,
+    pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
 }
 
 impl<I: BlockImage> Ext4FsInstance<I> {
     pub(crate) fn open(image: I) -> Result<Arc<Self>, Errno> {
         Ok(Arc::new(Self {
             pager: Ext4PagerCell::new(Ext4Pager::open(image).map_err(map_format_error)?),
+            mount_pin: SpinMutex::new(None),
         }))
+    }
+
+    pub(crate) fn register_mount_pin(&self, pin: MountPayloadPin) {
+        *self.mount_pin.lock() = Some(pin);
     }
 
     pub(crate) fn with_pager<T>(

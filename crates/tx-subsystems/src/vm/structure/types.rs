@@ -687,7 +687,7 @@ impl VmFaultOutcome {
             _ => MaterializeAccess::Read,
         };
         let page = pc
-            .materialize_anon(page_index, access)
+            .materialize_page_for_fault(page_index, access)
             .map_err(VmFaultError::PageCache)?;
         Ok(VmFaultMaterialization {
             backing: VmFaultMaterializationBacking::PageBacked,
@@ -841,7 +841,7 @@ impl VmFaultOutcome {
                 if access_byte >= pc.size_bytes() {
                     return Err(VmFaultError::PageBeyondSize);
                 }
-                pc.materialize_anon(page_index, MaterializeAccess::Read)
+                pc.materialize_page_for_fault(page_index, MaterializeAccess::Read)
                     .map_err(VmFaultError::PageCache)?
             }
             (VmBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
@@ -877,7 +877,7 @@ impl VmFaultOutcome {
                     return Err(VmFaultError::PageBeyondSize);
                 }
                 let source = pc
-                    .materialize_anon(page_index, MaterializeAccess::Read)
+                    .materialize_page_for_fault(page_index, MaterializeAccess::Read)
                     .map_err(VmFaultError::PageCache)?;
                 let new = allocate_private_materialized_page_from_source(source.ppn, true)?;
                 drop(source);

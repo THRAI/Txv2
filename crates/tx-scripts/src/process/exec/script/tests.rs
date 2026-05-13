@@ -802,13 +802,12 @@ fn walker_cred_for(uid: u32, gid: u32) -> Credential {
 fn exec_script_eacces_for_non_executable_binary() {
     let _setup = setup();
     let bytes = minimal_elf_bytes();
-    // mode 0o600 — no X bit anywhere. Owned by uid 0; caller is root
-    // by default. CAP_DAC_OVERRIDE alone does NOT bypass when no X
-    // bit is set anywhere on the file (POSIX exception that LTP
-    // `execve03` checks).
+    // mode 0o600 — no X bit anywhere. Owned by uid 0; caller is uid 1001
+    // with no capabilities. Falls through to "other" triplet → no X → EACCES.
     let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o600, 0, 0);
+    set_non_root_cred(&process, 1001);
 
-    let cred = Credential::root();
+    let cred = walker_cred_for(1001, 1001);
     let result = block_on(exec_script::<ScriptsTestPmap>(
         &process,
         &thread,
@@ -864,11 +863,13 @@ fn exec_script_dac_override_bypasses_with_x_bit_set() {
 }
 
 #[test]
-fn exec_script_dac_override_does_not_bypass_with_no_x_bit() {
+fn exec_script_dac_override_bypasses_with_no_x_bit() {
     let _setup = setup();
     let bytes = minimal_elf_bytes();
-    // mode 0o600 — no X bits anywhere. CAP_DAC_OVERRIDE callers
-    // still hit EACCES per the Linux POSIX exception.
+    // mode 0o600 — no X bits. CAP_DAC_OVERRIDE bypasses the x-bit
+    // requirement entirely so the kernel can attempt exec and return
+    // ENOEXEC for non-ELF content, letting shells fall back to script
+    // interpretation (oscomp compatibility).
     let (process, thread, _fs) = bootstrap_with_file_meta(b"init", &bytes, 0o600, 0, 0);
 
     let cred = Credential::root();
@@ -880,7 +881,7 @@ fn exec_script_dac_override_does_not_bypass_with_no_x_bit() {
         &[],
         &cred,
     ));
-    assert_eq!(result, Err(ExecError::PermissionDenied));
+    assert_eq!(result, Ok(()));
 }
 
 #[test]

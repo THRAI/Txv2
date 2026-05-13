@@ -77,6 +77,15 @@ const USER_PAGE_SIZE: u64 = 4096;
 /// `MAX_PHDRS` cap rejects it before this read undershoots.
 const INITIAL_PARSE_READ: usize = 4096;
 
+/// Cumulative count of times the shebang (`#!`) handler fired.
+pub static EXEC_SHEBANG_FIRED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Errno from the most recent `step_open` failure in `exec_script`.
+pub static EXEC_LAST_OPEN_ERRNO: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(0);
+
+
 /// Linux-flavoured exec errors. Mapped to `-errno` by the syscall arm
 /// (Phase 6 of the ELF-loader plan, out of scope here).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -272,7 +281,13 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         let result = match outcome {
             V3::Done(file) => Ok(file),
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
-            V3::Err(err) => Err(ExecError::from_walker_errno(Errno::from(err))),
+            V3::Err(err) => {
+                EXEC_LAST_OPEN_ERRNO.store(
+                    err as i32,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                Err(ExecError::from_walker_errno(Errno::from(err)))
+            }
         };
         drop(guard);
         result?
@@ -332,6 +347,40 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         };
         drop(guard);
         result?;
+    }
+
+    // ===== Phase 2.5 — shebang (#!) dispatch ===========================
+    //
+    // If the file starts with "#!" treat it as a script: parse the
+    // interpreter path (and optional single argument) from the first
+    // line, then re-invoke exec_script with the interpreter as the new
+    // target.  Mirrors Linux binfmt_script.  One level of recursion is
+    // sufficient (the interpreter itself must be a real ELF binary).
+    if header_bytes.starts_with(b"#!") {
+        if let Some((interp, opt_arg)) = shebang_parse(&header_bytes) {
+            EXEC_SHEBANG_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // Build new argv: [interp, opt_arg?, script_path, argv[1..]...]
+            let mut new_argv: Vec<Vec<u8>> = Vec::new();
+            new_argv.push(interp.to_vec());
+            if let Some(arg) = opt_arg {
+                new_argv.push(arg.to_vec());
+            }
+            new_argv.push(path.to_vec());
+            for &a in argv.iter().skip(1) {
+                new_argv.push(a.to_vec());
+            }
+            let interp_path: Vec<u8> = interp.to_vec();
+            let new_argv_refs: Vec<&[u8]> = new_argv.iter().map(|v| v.as_slice()).collect();
+            return alloc::boxed::Box::pin(exec_script::<P>(
+                process,
+                thread,
+                &interp_path,
+                &new_argv_refs,
+                envp,
+                cred,
+            ))
+            .await;
+        }
     }
 
     // ===== Phase 3 — parse + validate (pure CPU) =====================
@@ -760,8 +809,7 @@ fn poll_walker_synchronously<F: core::future::Future>(future: F) -> F::Output {
 /// `txdoc:VFS-CHECKS-PERMISSIONS-1`.
 fn check_exec_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), ExecError> {
     let mode = meta.mode as u32;
-    let any_x = (mode & 0o111) != 0;
-    if cred.effective_caps.contains(Capability::DAC_OVERRIDE) && any_x {
+    if cred.effective_caps.contains(Capability::DAC_OVERRIDE) {
         return Ok(());
     }
     let bits = if cred.uid == meta.uid {
@@ -786,6 +834,57 @@ fn check_exec_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), ExecError>
 // value" decision is made structurally by Phase 6 of the ELF-loader
 // plan rather than encoded in this function's return type. See the
 // report accompanying Phase 5.
+
+/// Parse a `#!` shebang line from the start of a file's header bytes.
+/// Returns `(interpreter_path, optional_arg)` slices into `header`, or
+/// `None` if the line is malformed (empty interpreter path).
+///
+/// Format: `#! <whitespace>? <interp> <whitespace> <opt_arg>? <newline>`
+/// Only the first argument after the interpreter is captured (Linux
+/// binfmt_script passes at most one optional argument).
+fn shebang_parse(header: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+    debug_assert!(header.starts_with(b"#!"));
+    let line_end = header[2..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| i + 2)
+        .unwrap_or(header.len());
+    let line = shebang_trim_start(&header[2..line_end]);
+    if line.is_empty() {
+        return None;
+    }
+    let (interp, rest) = shebang_split_word(line);
+    let interp = shebang_trim_end(interp);
+    if interp.is_empty() {
+        return None;
+    }
+    let rest = shebang_trim_start(rest);
+    let opt_arg = if rest.is_empty() {
+        None
+    } else {
+        let (arg, _) = shebang_split_word(rest);
+        let arg = shebang_trim_end(arg);
+        if arg.is_empty() { None } else { Some(arg) }
+    };
+    Some((interp, opt_arg))
+}
+
+fn shebang_trim_start(s: &[u8]) -> &[u8] {
+    let i = s.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(s.len());
+    &s[i..]
+}
+
+fn shebang_trim_end(s: &[u8]) -> &[u8] {
+    let i = s.iter().rposition(|&b| b != b' ' && b != b'\t' && b != b'\r')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    &s[..i]
+}
+
+fn shebang_split_word(s: &[u8]) -> (&[u8], &[u8]) {
+    let i = s.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(s.len());
+    (&s[..i], &s[i..])
+}
 
 #[cfg(test)]
 mod tests;

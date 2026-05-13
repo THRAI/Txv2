@@ -11,6 +11,8 @@ test = true
 doctest = false
 
 [dependencies]
+tx-ext4 = { path = "../tx-ext4" }
+tx-ext4-format = { path = "../tx-ext4-format" }
 tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-subsystems = { path = "../tx-subsystems" }
 tx-substrate = { path = "../tx-substrate" }
