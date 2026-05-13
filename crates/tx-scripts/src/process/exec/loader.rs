@@ -426,10 +426,11 @@ fn compute_at_phdr(
     Err(ParseError::Phdr)
 }
 
-/// Returns the BSS extension for the unique LOAD segment whose
-/// `memsz > filesz`. Returns `Err(ParseError::LoadSegment)` if
-/// multiple LOADs have such a tail (TODO: handle multi-BSS in a
-/// future slice).
+/// Returns the BSS extension for the last LOAD segment whose
+/// `memsz > filesz`. Multiple BSS-extending LOADs are legal ELF
+/// (e.g. LA64 busybox has two: .relro_padding and .data/.bss).
+/// The VM mapper handles BSS per-segment; this keeps the last tail
+/// for auxv / debug consumers.
 fn compute_bss_extension(load_segments: &[LoadSegment]) -> Result<Option<BssTail>, ParseError> {
     let mut found: Option<BssTail> = None;
     for seg in load_segments {
@@ -441,12 +442,11 @@ fn compute_bss_extension(load_segments: &[LoadSegment]) -> Result<Option<BssTail
                 .checked_add(seg.filesz)
                 .ok_or(ParseError::LoadSegment)?;
             let tail_size = seg.memsz - seg.filesz;
-            if found.is_some() {
-                // TODO(multi-bss): handle multiple BSS-extending
-                // LOADs. The slice's design only needs one (the
-                // last writable LOAD for static binaries).
-                return Err(ParseError::LoadSegment);
-            }
+            // Multiple BSS-extending LOADs are legal (e.g. LA64
+            // busybox has two: .relro_padding and .data/.bss).
+            // `vm/scripts.rs` ignores `bss_extension` for actual
+            // mapping (handled per-segment by `register_load_segment`);
+            // keep the last one for auxv / debug consumers.
             found = Some(BssTail {
                 vaddr: tail_vaddr,
                 size: tail_size,
