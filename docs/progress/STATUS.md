@@ -1,3 +1,29 @@
+- 2026-05-13 **DEntry parent-chain lifetime fix: `Weak<DEntry>` → `Cap<DEntry>`.**
+  `DEntry.parent` was `Option<Weak<DEntry>>`. During a VFS walk the intermediate
+  DEntries are locals dropped at loop-end, making the parent Weaks dead immediately
+  after the walk returns. After `chdir`, the stored CWD DEntry's parent chain was
+  broken. Two cascading failures:
+  1. `mount_root_dentry` could not walk to the real VFS root — it fell back to
+     returning the CWD itself, so absolute paths (e.g. `#!/bin/sh` shebangs)
+     resolved from the wrong directory and returned ENOENT.
+  2. `cd ..` tried `parent_hint().upgrade(guard)` on the dead Weak, failed silently,
+     and left CWD unchanged — `cd ..` from `basic/` was a no-op.
+  Fix: changed `parent` to `Option<Cap<DEntry>>` (strong reference) so the entire
+  parent chain up to the VFS root is kept alive as long as any child DEntry is alive.
+  `set_parent_hint` now clones the Cap; `parent_hint` returns `Option<Cap<DEntry>>`
+  directly. `render_dentry_path`, walker `..` handling, `fs_ops_for_dentry`, and
+  `fs_page_backing_for_dentry` simplified (no more upgrade step). SMP=1 spin-loop
+  fix also landed in `init.rs` (WFI after `cancel_deadline` could block forever on
+  SMP=1; replaced with `spin_loop`).
+  **Verified:** `cargo xtask oscomp qemu --target rv64-qemu` — full
+  `#### OS COMP TEST GROUP START basic-musl ####` … `#### OS COMP TEST GROUP END
+  basic-musl ####` with all 32 test binaries running; `userspace:exited:0`. Most
+  tests pass; a subset (chdir, close, mount, munmap, openat, sleep, unlink) hit
+  `--- Assert Fatal ! ---` (pre-existing feature gaps). `cargo -q xtask unit`
+  4/4 clean (331 tests).
+  **Next step:** investigate remaining Assert Fatal failures; consider un-ignoring
+  the VFS walker tests that tested this exact Weak-upgrade path.
+
 - 2026-05-13 **Merged 85 commits from `main` (platform-adapter refactor).** All
   crates now compile through `crate::adapter::step_engine` adapters; `step_v3`
   module renamed to `step`; `DEntry.parent` type changed from `Cap<DEntry>` to

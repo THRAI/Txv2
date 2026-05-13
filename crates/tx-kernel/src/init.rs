@@ -1082,16 +1082,10 @@ impl<P: TxPlatform> CoreInit<P> {
         P::enable_ipi_wakeups();
         P::enable_timer_wakeups();
         loop {
-            let Some(step) = Self::step_boot_reactor_once(cpu_id) else {
-                continue;
-            };
-            if !step.should_idle() {
+            if Self::run_secondary_reactor_once(cpu_id) {
                 continue;
             }
             crate::zones::try_bounded_maintenance_tick();
-            if matches!(step.deadline_action, boot_runtime::hart_loop::HartLoopDeadlineAction::Cancel) {
-                P::set_deadline_ns(P::read_ns().saturating_add(crate::init::IDLE_TIMER_PERIOD_NS));
-            }
             P::wait_for_interrupt_once();
             if P::pending_ipi(IpiKind::Reschedule) {
                 P::ack_ipi(IpiKind::Reschedule);
@@ -1238,10 +1232,14 @@ impl<P: TxPlatform> CoreInit<P> {
                 return;
             }
             crate::zones::try_bounded_maintenance_tick();
-            if matches!(step.deadline_action, boot_runtime::hart_loop::HartLoopDeadlineAction::Cancel) {
-                P::set_deadline_ns(P::read_ns().saturating_add(crate::init::IDLE_TIMER_PERIOD_NS));
-            }
-            P::wait_for_interrupt_once();
+            // Spin rather than WFI: on_timer_interrupt calls
+            // cancel_deadline() which clears STIP, so WFI could block
+            // forever on SMP=1 if the interrupt fires and is handled
+            // between the guard check and the WFI instruction. The
+            // reactor's timer queue is unaffected by cancel_deadline,
+            // so each step() call will observe now_ns >= deadline and
+            // fire the task once real time advances past the deadline.
+            core::hint::spin_loop();
         }
 
         panic!("BSP reactor timer idle smoke did not complete");
