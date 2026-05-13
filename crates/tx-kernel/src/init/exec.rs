@@ -463,7 +463,19 @@ impl<P: TxPlatform> CoreInit<P> {
     /// Cheap when no bytes are pending (`read_bytes` returns 0,
     /// the rest is skipped).
     pub(super) fn drain_sbi_console_into_tty() {
-        let mut buf = [0u8; 64];
+        // 2026-05-13: bumped from 64 to 512 bytes to swallow whole shell
+        // command lines in a single SBI poll. The 64-byte cap left the
+        // 17-byte tail of an 81-character `ln -s` line stranded in the
+        // UART FIFO until the PLIC RX IRQ fired; the IRQ-deferred drain
+        // path then re-entered `step_ingest` and the `wait_channel.fire`
+        // it issued did not propagate to the parked `sys_read` task
+        // (root cause still under investigation — see the
+        // `tools/shell-tests/busybox-extended.txt` links/chmod-stat
+        // groups). Bumping the SBI buffer ensures most realistic shell
+        // input fits in one `step_ingest` call so the proven SBI-direct
+        // path handles it. The IRQ path stays in place so a quiescent
+        // WFI still wakes promptly when bytes arrive.
+        let mut buf = [0u8; 512];
         let n = <P as tx_hal::ConsoleIf>::read_bytes(&mut buf);
         if n == 0 {
             return;
@@ -566,17 +578,17 @@ impl<P: TxPlatform> CoreInit<P> {
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
                 }
-                // Drain SBI debug-console bytes into the boot
-                // console TTY on every wake. The QEMU virt UART
-                // path *should* deliver bytes via PLIC IRQ 10
-                // (`uart_rx_irq_handler`), but in our current
-                // configuration that doesn't fire — likely OpenSBI
-                // claims the UART in M-mode for its debug-console
-                // extension. As a fallback the BSP polls SBI on
-                // each idle wake (timer ticks fire ~every 5 ms in
-                // smoke; once we get IRQ-driven RX working this
-                // becomes redundant, but it's harmless when
-                // there are no buffered bytes).
+                // Drain UART RX bytes buffered by `uart_rx_irq_handler`
+                // during the preceding WFI sleep. The IRQ handler cannot
+                // call `epoch::guard()` (irq_depth > 0), so it stores raw
+                // bytes in `UART_RX_PENDING`; `drain_uart_rx_pending` runs
+                // here with irq_depth == 0 and feeds them to `step_ingest`.
+                let _ = crate::irq::drain_uart_rx_pending();
+                // Also poll the SBI debug-console as a fallback for
+                // platforms where the UART IRQ is claimed by firmware
+                // (e.g. OpenSBI M-mode UART handling). Harmless when the
+                // PLIC path is active since `read_bytes` returns 0 once the
+                // FIFO has already been drained by the IRQ handler.
                 Self::drain_sbi_console_into_tty();
             }
         }
