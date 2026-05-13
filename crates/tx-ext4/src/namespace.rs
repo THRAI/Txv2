@@ -1,8 +1,11 @@
-use step_engine::Guard;
 use tx_ext4_format::pager::{BlockImage, DirEntryLite};
+use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
+use step_engine::Guard;
 use tx_subsystems::execution::Errno;
+use tx_subsystems::page_backed::{PageContainer, PageContainerKind};
 use tx_subsystems::vfs::structure::{
-    Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
+    Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
+    RNodeBacking,
 };
 
 use crate::read_backend::{
@@ -36,7 +39,6 @@ fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
 // sites avoid clashing with `tx_subsystems::execution::Errno`
 // already in scope.
 
-use crate::adapter::step_engine::{self as step_engine, NoProgress, StepOutcome};
 use tx_subsystems::vfs::FsOps;
 
 /// Factory for `MountOutput::fs_ops`.
@@ -100,23 +102,48 @@ where
 
     fn create_inode(
         &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<
+        (FsObjectId, InodeMeta),
+        NoProgress,
+    > {
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.with_pager(|pager| {
+            pager.create_regular_file(parent_ino, name, mode, cred.uid, cred.gid, 0)
+        }) {
+            Ok(new_ino) => {
+                let meta = match self.with_pager(|pager| pager.inode_meta(new_ino)) {
+                    Ok(m) => m,
+                    Err(e) => return StepOutcome::err(e.into()),
+                };
+                StepOutcome::done((inode_fs_object_id(new_ino), map_inode_meta(meta)))
+            }
+            Err(e) => StepOutcome::err(e.into()),
+        }
     }
 
     fn unlink(
         &self,
-        _parent: FsObjectId,
-        _name: &[u8],
+        parent: FsObjectId,
+        name: &[u8],
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.with_pager(|pager| pager.remove_dir_entry(parent_ino, name)) {
+            Ok(_removed_ino) => StepOutcome::done(()),
+            Err(e) => StepOutcome::err(e.into()),
+        }
     }
 
     fn rename(
@@ -142,13 +169,31 @@ where
 
     fn mkdir(
         &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _mode: u16,
-        _cred: &Credential,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+    ) -> StepOutcome<
+        (FsObjectId, InodeMeta),
+        NoProgress,
+    > {
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.with_pager(|pager| {
+            pager.create_directory(parent_ino, name, mode, cred.uid, cred.gid, 0)
+        }) {
+            Ok(new_ino) => {
+                let meta = match self.with_pager(|pager| pager.inode_meta(new_ino)) {
+                    Ok(m) => m,
+                    Err(e) => return StepOutcome::err(e.into()),
+                };
+                StepOutcome::done((inode_fs_object_id(new_ino), map_inode_meta(meta)))
+            }
+            Err(e) => StepOutcome::err(e.into()),
+        }
     }
 
     fn rmdir(
@@ -168,7 +213,10 @@ where
         _link_target: &[u8],
         _cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+    ) -> StepOutcome<
+        (FsObjectId, InodeMeta),
+        NoProgress,
+    > {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
@@ -177,7 +225,10 @@ where
         fs_object_id: FsObjectId,
         cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
+    ) -> StepOutcome<
+        Option<(DirEntry, DirCursor)>,
+        NoProgress,
+    > {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
@@ -222,7 +273,53 @@ where
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
-    // `read_link`, `materialise_rnode`, `step_chmod`, `step_chown` all
-    // inherit the trait-default `ENOSYS` mapping; ext4 does not
-    // override those methods.
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>, NoProgress> {
+        let pin = match self.mount_pin.lock().clone() {
+            Some(p) => p,
+            None => return StepOutcome::err(Errno::ENOSYS.into()),
+        };
+
+        const PAGE_SIZE: u64 = 4096;
+        let page_count = meta.size.div_ceil(PAGE_SIZE).max(1);
+        let pc = match PageContainer::new_cap(
+            PageContainerKind::File {
+                mount: pin,
+                fs_object_id,
+            },
+            page_count,
+        ) {
+            Ok(pc) => pc,
+            Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
+        };
+
+        match RNode::new_cap(fs_object_id, meta, RNodeBacking::PageBacked { pc }) {
+            Ok(rnode) => StepOutcome::done(rnode),
+            Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
+        }
+    }
+
+    fn read_link(
+        &self,
+        fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<
+        alloc::boxed::Box<[u8]>,
+        NoProgress,
+    > {
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match self.with_pager(|pager| pager.read_symlink(inode)) {
+            Ok(bytes) => StepOutcome::done(bytes.into_boxed_slice()),
+            Err(err) => StepOutcome::err(err.into()),
+        }
+    }
+
+    // `step_chmod`, `step_chown` inherit the trait-default `ENOSYS`.
 }

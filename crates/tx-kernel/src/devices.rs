@@ -19,7 +19,7 @@ impl<P: TxPlatform> KernelBlockDevices<P> {
     pub fn init_and_register(&'static self) -> StepOutcome<(), NoProgress> {
         match P::ARCH {
             Arch::LoongArch64 => self.init_la64_qemu_virt(),
-            _ => StepOutcome::Done(()),
+            Arch::Riscv64 => self.init_rv64_qemu_virt(),
         }
     }
 
@@ -29,6 +29,25 @@ impl<P: TxPlatform> KernelBlockDevices<P> {
             "pcie-mmio32",
         )));
         if block.init().is_err() {
+            return StepOutcome::Done(());
+        }
+
+        let registration = Box::leak(Box::new(BlockDeviceRegistration {
+            devt: DevT::new(254, 0),
+            name: "vda",
+            ops: block,
+        }));
+        let registrations: &'static [&'static BlockDeviceRegistration] =
+            Box::leak(Box::new([registration as &'static BlockDeviceRegistration]));
+        register_block_devices(registrations)
+    }
+
+    fn init_rv64_qemu_virt(&'static self) -> StepOutcome<(), NoProgress> {
+        let block = Box::leak(Box::new(tx_drivers::virtio::VirtioMmioBlock::<P>::new(
+            "virtio0",
+        )));
+        if let Err(err) = block.init() {
+            let _ = err;
             return StepOutcome::Done(());
         }
 

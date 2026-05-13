@@ -342,6 +342,61 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Bootstrap exec runs as init (root) by construction.
         let cred = Credential::root();
+
+        // When the sdcard ext4 mount is present (RV64 QEMU with vda),
+        // exec busybox sh to run the oscomp basic-musl test suite.
+        // The sdcard's musl/ dir contains busybox (static ET_EXEC),
+        // basic_testcode.sh, and per-test binaries under basic/.
+        //
+        // Use `sh -c "cd /musl/musl && sh basic_testcode.sh"` so the
+        // inner sh inherits CWD=/musl/musl/ and basic_testcode.sh's
+        // relative `./busybox` / `cd ./basic` references resolve
+        // correctly — avoids any kernel-side VFS walk at this stage.
+        // DIAGNOSTIC: emit epoch state right before the sdcard exec to
+        // identify whether a guard leak pre-dates drive_bootstrap_exec.
+        {
+            let es = tx_substrate::epoch::summary();
+            let cpu0 = tx_substrate::epoch::cpu_summary(tx_hal::CpuId(0));
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":diag:pre-sdcard-exec:guards=");
+            Self::write_decimal_unsigned(es.active_guards);
+            tx_hal::console_write_str::<P>(":epoch=");
+            Self::write_decimal_unsigned(es.global_epoch as usize);
+            tx_hal::console_write_str::<P>(":cpu0-local=");
+            Self::write_decimal_unsigned(
+                cpu0.map(|c| c.local_epoch as usize).unwrap_or(999),
+            );
+            tx_hal::console_write_str::<P>("\n");
+        }
+
+        if super::MUSL_MOUNT.lock().is_some() {
+            let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/musl:/musl/musl/basic"];
+            let sdcard_argv: &[&[u8]] =
+                &[b"sh", b"-c", b"cd /musl/musl && ./busybox sh basic_testcode.sh"];
+            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                &init,
+                &thread,
+                b"/musl/musl/busybox",
+                sdcard_argv,
+                sdcard_envp,
+                &cred,
+            ));
+            match outcome {
+                Ok(()) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
+                    return;
+                }
+                Err(ref e) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":bootstrap-exec:sdcard:fail:");
+                    tx_hal::console_write_str::<P>(exec_error_tag(e));
+                    tx_hal::console_write_str::<P>("\n");
+                    // Fall through to the cmdline-driven path below.
+                }
+            }
+        }
+
         // busybox sh needs at least PATH to find applet binaries
         // (`ls`, `cat`, etc.) — without it, command lookup short-
         // circuits to "not found" before the kernel's fork/exec path
@@ -433,6 +488,20 @@ impl<P: TxPlatform> CoreInit<P> {
         );
     }
 
+    /// Install the timer-sleep seam so `sys_nanosleep` / `sys_clock_nanosleep`
+    /// in `tx-shims` can park the calling task until a real deadline fires
+    /// in the BSP reactor's timer queue. Must be called before the reactor
+    /// task loop starts (BOOT_REACTOR lock must not be held at this call site).
+    pub(crate) fn install_sleep_seam() {
+        // Clone the TimerQueue Arc while outside the reactor task loop.
+        // `sleep_until_ns` will later call `tq.wait_until()` from within
+        // a reactor task, acquiring only the TimerQueue's own SpinLock —
+        // not the BOOT_REACTOR lock — avoiding re-entrancy deadlock.
+        if let Some(tq) = BOOT_REACTOR.with(|reactor| reactor.timer_queue()) {
+            tx_subsystems::timer_sleep::install_timer_queue(tq);
+        }
+    }
+
     /// Pre-ELF Phase 7: submit init's leader thread future as a
     /// reactor task, then drive the BSP hart-loop until the future
     /// resolves. Resolution happens when `run_thread` returns — the
@@ -496,6 +565,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // the platform parameter `P` is captured at install time
         // here so the seam stays parameter-free at the call site.
         Self::install_reactor_submit_seam();
+        Self::install_sleep_seam();
 
         let Some(init) = tx_subsystems::process::execution::init_process() else {
             // No init process — nothing to drive. Skip cleanly.

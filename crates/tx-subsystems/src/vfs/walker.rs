@@ -216,7 +216,7 @@ fn walk_inner_v3<'g>(
 ) -> StepOutcome<Cap<DEntry>, NoProgress> {
     use StepOutcome as V3;
 
-    let mount_root = mount_root_dentry(&rooted_at, guard);
+    let mount_root = mount_root_dentry(&rooted_at);
 
     let (mut current, mut remaining): (Cap<DEntry>, Vec<u8>) = if path.first() == Some(&b'/') {
         (mount_root.clone(), path[1..].to_vec())
@@ -226,8 +226,10 @@ fn walk_inner_v3<'g>(
 
     let must_be_directory = remaining.last().copied() == Some(b'/');
 
-    let mut current_fs_ops: Option<Arc<dyn FsOps>> = fs_ops_for(&current, guard);
-    let mut current_mount_payload: Option<Cap<MountPayload>> = mount_payload_for(&current, guard);
+    let mut current_fs_ops: Option<Arc<dyn FsOps>> = fs_ops_for(&current, guard)
+        .or_else(|| fs_ops_for(&mount_root, guard));
+    let mut current_mount_payload: Option<Cap<MountPayload>> = mount_payload_for(&current, guard)
+        .or_else(|| mount_payload_for(&mount_root, guard));
 
     let mut hop_count: u32 = 0;
 
@@ -260,13 +262,11 @@ fn walk_inner_v3<'g>(
             continue;
         }
         if component == b".." {
-            if let Some(parent_weak) = current.parent_hint() {
-                if let Some(parent_cap) = parent_weak.upgrade(guard) {
-                    if !is_same_dentry(&current, &mount_root) {
-                        current = parent_cap;
-                        current_fs_ops = fs_ops_for(&current, guard);
-                        current_mount_payload = mount_payload_for(&current, guard);
-                    }
+            if let Some(parent_cap) = current.parent_hint() {
+                if !is_same_dentry(&current, &mount_root) {
+                    current = parent_cap;
+                    current_fs_ops = fs_ops_for(&current, guard);
+                    current_mount_payload = mount_payload_for(&current, guard);
                 }
             }
             continue;
@@ -390,7 +390,7 @@ fn walk_inner_v3<'g>(
                 .and_then(|payload| mount::mount_for(payload, child_fs_object_id)),
         };
         if let Some(mount_cap) = crossing_mount {
-            current = match dentry_for_mount_root(&mount_cap) {
+            current = match dentry_for_mount_root(&mount_cap, Some(&child_dentry)) {
                 Ok(d) => d,
                 Err(err) => return V3::err(err.into()),
             };
@@ -541,19 +541,22 @@ fn check_open_perm(meta: &InodeMeta, flags: OpenFileFlags, cred: &Credential) ->
 /// Build a `Cap<DEntry>` over a mount's root RNode. Used when the
 /// walker crosses a mount boundary or restarts from the namespace
 /// root for an absolute symlink target.
-fn dentry_for_mount_root(mount: &Cap<MountIdentity>) -> Result<Cap<DEntry>, Errno> {
-    let raw = DEntry::new(InlineName::ROOT, mount.root().clone());
+fn dentry_for_mount_root(
+    mount: &Cap<MountIdentity>,
+    mount_point: Option<&Cap<DEntry>>,
+) -> Result<Cap<DEntry>, Errno> {
+    let mut raw = DEntry::new(InlineName::ROOT, mount.root().clone());
+    if let Some(parent) = mount_point {
+        raw.set_parent_hint(parent);
+    }
     step_engine::sign(raw).map_err(|_| Errno::ENOMEM)
 }
 
 /// Walk `from`'s parent-hint chain to find the namespace's root
 /// dentry. Returns `from` itself when no parent hint is installed.
-fn mount_root_dentry<'g>(from: &Cap<DEntry>, guard: &Guard<'g>) -> Cap<DEntry> {
+fn mount_root_dentry(from: &Cap<DEntry>) -> Cap<DEntry> {
     let mut cursor: Cap<DEntry> = from.clone();
-    while let Some(parent_weak) = cursor.parent_hint() {
-        let Some(parent_cap) = parent_weak.upgrade(guard) else {
-            break;
-        };
+    while let Some(parent_cap) = cursor.parent_hint() {
         cursor = parent_cap;
     }
     cursor
