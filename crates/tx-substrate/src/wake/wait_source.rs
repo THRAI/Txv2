@@ -37,7 +37,7 @@ use alloc::sync::Weak;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::step_v3::{InterestMask, WaitSourceId};
+use crate::step::{InterestMask, WaitSourceId};
 use crate::SpinMutex;
 
 use crate::wake::mailbox::{MailboxEvent, TaskMailbox, WaitGeneration};

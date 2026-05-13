@@ -58,13 +58,11 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_reactor::interrupt::{InterruptSource, InterruptSummary as ReactorSummary};
-use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
-use tx_reactor::Reactor;
-use tx_substrate::epoch;
-use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::wake::TaskMailbox;
-use tx_substrate::zone::{Cap, PayloadCap};
+use tx_subsystems::signal::adapter::step_engine::{Cap, PayloadCap, TaskMailbox};
+use tx_subsystems::signal::adapter::wait_routing::{
+    Channel, InterruptSource, InterruptSummary as ReactorSummary, Mask, Reactor, WaitOutcome,
+    WaitProtocol,
+};
 
 use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::process::structure::ProcessIdentity;
@@ -177,10 +175,9 @@ impl<F: Future + Unpin> Future for MailboxWakeAdapter<F> {
 
 #[test]
 fn pselect_style_wait_resolves_interrupted_via_signal_mailbox() {
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 
     let proc_cap: Cap<ProcessIdentity> = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
     let leader = proc_cap.nth_thread(0).expect("leader");
@@ -292,6 +289,5 @@ fn pselect_style_wait_resolves_interrupted_via_signal_mailbox() {
         "Channel::wait_event resolves to Interrupted via signal mailbox wake",
     );
 
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 }

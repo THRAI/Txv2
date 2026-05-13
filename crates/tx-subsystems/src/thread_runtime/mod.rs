@@ -5,6 +5,7 @@
 //! allocated entities. Signal mask / summary / pending queue and the
 //! reactor TaskKey wiring land in follow-up passes.
 
+pub mod adapter;
 pub mod execution;
 pub mod structure;
 

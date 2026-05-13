@@ -13,6 +13,11 @@ use tx_hal::PmapIf;
 use crate::execution::Guard;
 use crate::execution::WaitToken;
 use crate::page_backed::{step_fsync, PageContainerKind};
+use crate::vm::adapter::step_engine::{
+    self as step_engine, AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply,
+    DelegateRequest, StepOutcome, StepOutcome as V3StepOutcome, TaskMailbox, TokenDropPolicy,
+    UfdAccessKind, UfdReply, UfdRequest, YieldShape,
+};
 use crate::vm::checks::{
     require_disjoint_remap, require_fault_publication, require_fault_recipe, require_map_admission,
 };
@@ -22,11 +27,6 @@ use crate::vm::{
     VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization, VmFaultOutcome, VmMapCommit,
     VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest,
 };
-use tx_substrate::step_v3::{
-    AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply, DelegateRequest,
-    StepOutcome as V3StepOutcome, TokenDropPolicy, UfdAccessKind, UfdReply, UfdRequest, YieldShape,
-};
-use tx_substrate::wake::TaskMailbox;
 
 impl AddressSpace {
     pub fn resolve_fault(&self, fault: VmFault) -> Result<VmFaultOutcome, VmFaultError> {
@@ -125,7 +125,7 @@ impl AddressSpace {
             }
         }
 
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         child.stats.store(child.recipes.stats(&guard));
         Ok(child)
     }
@@ -208,7 +208,7 @@ impl AddressSpace {
     pub async fn fault_script_for_process(
         &self,
         fault: VmFault,
-        process: &tx_substrate::zone::Cap<crate::process::ProcessIdentity>,
+        process: &step_engine::Cap<crate::process::ProcessIdentity>,
         mailbox: Weak<TaskMailbox>,
     ) -> Result<PmapPublishOutcome, VmFaultError> {
         let dispatch = crate::userfaultfd::ProcessUfdDispatch::new(process, mailbox);
@@ -426,7 +426,7 @@ impl AddressSpace {
             };
             let commit = self.recipes.unmap(range)?;
             self.pmap.teardown_range(range)?;
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             self.stats.store(self.recipes.stats(&guard));
             return Ok(commit);
         }
@@ -460,7 +460,7 @@ impl AddressSpace {
             };
             let commit = self.recipes.protect(range, prot)?;
             self.pmap.teardown_range(range)?;
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             self.stats.store(self.recipes.stats(&guard));
             return Ok(commit);
         }
@@ -498,7 +498,7 @@ impl AddressSpace {
                 .recipes
                 .remap_disjoint(request.old_range, request.new_range)?;
             self.pmap.teardown_range(request.old_range)?;
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             self.stats.store(self.recipes.stats(&guard));
             return Ok(VmRemapOutcome {
                 old_range: request.old_range,
@@ -573,7 +573,7 @@ impl AddressSpace {
             .recipes
             .remap_disjoint(request.old_range, request.new_range)?;
         self.pmap.teardown_range(request.old_range)?;
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         self.stats.store(self.recipes.stats(&guard));
         Ok(VmRemapOutcome {
             old_range: request.old_range,
@@ -634,7 +634,7 @@ impl AddressSpace {
         let _guard = self.acquire_writer(range)?;
         let commit = self.recipes.unmap(range)?;
         self.pmap.teardown_range(range)?;
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         self.stats.store(self.recipes.stats(&guard));
         Ok(commit)
     }
@@ -643,7 +643,7 @@ impl AddressSpace {
         let _guard = self.acquire_writer(range)?;
         let commit = self.recipes.protect(range, prot)?;
         self.pmap.teardown_range(range)?;
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         self.stats.store(self.recipes.stats(&guard));
         Ok(commit)
     }
@@ -669,7 +669,7 @@ impl AddressSpace {
         if placement == MapPlacement::FixedReplace {
             self.pmap.teardown_range(range)?;
         }
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         self.stats.store(self.recipes.stats(&guard));
         Ok(commit)
     }
@@ -743,7 +743,7 @@ impl AddressSpace {
             MadviseAdvice::DontNeed | MadviseAdvice::Free => {
                 let _guard = self.acquire_writer(range)?;
                 self.pmap.teardown_range(range)?;
-                let guard = tx_substrate::epoch::guard();
+                let guard = step_engine::guard();
                 self.stats.store(self.recipes.stats(&guard));
                 Ok(())
             }
@@ -763,8 +763,8 @@ impl AddressSpace {
         &self,
         range: UserRange,
         guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<(), tx_substrate::step_v3::PageProgress> {
-        use tx_substrate::step_v3::StepOutcome as V3;
+    ) -> StepOutcome<(), step_engine::PageProgress> {
+        use crate::page_backed::adapter::step_engine::StepOutcome as V3;
         let entries = self.recipes.snapshot(guard);
         let mut visited: BTreeSet<u32> = BTreeSet::new();
         for entry in entries {
@@ -968,7 +968,12 @@ async fn dispatch_ufd_fault<D: UfdDispatch>(
     // The agent-side mark_replied happens via UFFDIO_COPY / ZEROPAGE
     // (phase 5). For phase 4 the test drives mark_replied directly
     // to exercise the plumbing.
-    let outcome = tx_reactor::await_agent_reply(token_id, &mailbox_arc, target.registry).await;
+    let outcome = crate::vm::adapter::wait_routing::await_agent_reply(
+        token_id,
+        &mailbox_arc,
+        target.registry,
+    )
+    .await;
     // Drop the guard *after* the await — if the agent replied
     // successfully the CancelOnDrop transition is a no-op
     // (LateNoOp(Replied)); if the await aborted (AgentDied / Canceled
@@ -1033,10 +1038,10 @@ fn materialize_ufd_copy(
     // bare-metal this is the linear-map VA of the freshly-allocated
     // frame; in tests the page_allocator's test backend installs a
     // direct-map hook that returns a usable `*mut u8`.
-    let dst_kernel_ptr = tx_substrate::page_allocator::frame_kernel_addr(materialization.page.ppn)
+    let dst_kernel_ptr = step_engine::page_allocator::frame_kernel_addr(materialization.page.ppn)
         .map_err(|alloc_err| {
-            VmFaultError::PageCache(crate::page_backed::PageCacheError::Alloc(alloc_err))
-        })?;
+        VmFaultError::PageCache(crate::page_backed::PageCacheError::Alloc(alloc_err))
+    })?;
     // Copy `len` bytes from the agent's `src` buffer into the
     // freshly-allocated frame. `len` is page-multiple and bounded to
     // a single page (the fault-script materializes one user page at

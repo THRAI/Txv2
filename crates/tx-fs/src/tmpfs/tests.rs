@@ -6,7 +6,7 @@
 
 use alloc::sync::Arc;
 
-use tx_substrate::step_v3::{Errno, StepOutcome};
+use super::adapter::step_engine::{self as step_engine, guard, page_allocator, Errno, StepOutcome};
 use tx_subsystems::cred::{Capability, CapabilitySet};
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::{
@@ -16,14 +16,14 @@ use tx_subsystems::vfs::{
 use super::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 
 fn init_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     // tmpfs's `PageContainer::new_cap` requires the
     // `PAGE_CONTAINER_ZONE` to be registered. `register_all` is
     // idempotent (`register_static_zone` is a no-op for zones it
     // already saw).
     tx_subsystems::zones::register_all().expect("tx-subsystems zones");
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    match page_allocator::claim_zero_frame() {
+        Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for tmpfs tests: {error:?}"),
     }
 }
@@ -36,7 +36,7 @@ fn tmpfs_create_then_lookup_round_trip() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     let (file_id, file_meta) =
@@ -79,7 +79,7 @@ fn tmpfs_mkdir_then_readdir_yields_dir_entry() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     let (dev_id, dev_meta) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"dev", 0o755, &cred, &guard) {
@@ -127,7 +127,7 @@ fn tmpfs_unlink_drops_inode() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     let (file_id, _) =
@@ -171,7 +171,7 @@ fn tmpfs_fetch_page_materialises_anon_then_flush_noop() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     let (file_id, _) =
@@ -226,7 +226,7 @@ fn tmpfs_truncate_zeroes_size_and_reflects_in_meta() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     let (file_id, _) =
@@ -279,7 +279,7 @@ fn tmpfs_create_existing_returns_eexist() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     // First create succeeds.
@@ -313,7 +313,7 @@ fn tmpfs_rmdir_nonempty_returns_enotempty() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     let (dir_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"d", 0o755, &cred, &guard) {
@@ -367,7 +367,7 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     let (file_id, file_meta) =
@@ -414,7 +414,7 @@ fn tmpfs_materialise_rnode_for_directory_returns_eisdir() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     // The walker handles Directory inline; reaching the override
     // with a directory inode is a backend bug. The override returns
@@ -438,7 +438,7 @@ fn tmpfs_materialise_rnode_for_symlink_returns_einval() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     let (link_id, link_meta) =
@@ -485,7 +485,7 @@ fn tmpfs_chmod_owner_succeeds() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let owner = cred_with_caps(1000, 0, CapabilitySet::EMPTY);
 
     // Create a file owned by uid 1000 with mode 0o644.
@@ -514,7 +514,7 @@ fn tmpfs_chmod_non_owner_returns_eperm() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let owner = cred_with_caps(1000, 0, CapabilitySet::EMPTY);
     let stranger = cred_with_caps(2000, 0, CapabilitySet::EMPTY);
 
@@ -537,7 +537,7 @@ fn tmpfs_chmod_with_fowner_cap_succeeds() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let owner = cred_with_caps(1000, 0, CapabilitySet::EMPTY);
     let mut admin_caps = CapabilitySet::EMPTY;
     admin_caps.add(Capability::FOWNER);
@@ -567,7 +567,7 @@ fn tmpfs_chown_unprivileged_to_self_succeeds() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let owner = cred_with_caps(1000, 200, CapabilitySet::EMPTY);
     let (file_id, _) =
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner, &guard) {
@@ -596,7 +596,7 @@ fn tmpfs_chown_unprivileged_to_other_returns_eperm() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let owner = cred_with_caps(1000, 200, CapabilitySet::EMPTY);
     let (file_id, _) =
         match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner, &guard) {
@@ -625,7 +625,7 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
     init_substrate();
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let mut admin_caps = CapabilitySet::EMPTY;
     admin_caps.add(Capability::FOWNER);
     let admin = cred_with_caps(0, 0, admin_caps);
@@ -692,11 +692,11 @@ fn tmpfs_v3_lookup_round_trips_after_create() {
         .unwrap_or_else(|p| p.into_inner());
     init_substrate();
 
-    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, NoProgress, StepOutcome as V3};
     use tx_subsystems::vfs::FsOps;
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     // create_inode.
@@ -733,11 +733,11 @@ fn tmpfs_v3_mkdir_yields_directory_inode() {
         .unwrap_or_else(|p| p.into_inner());
     init_substrate();
 
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use step_engine::StepOutcome as V3;
     use tx_subsystems::vfs::FsOps;
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     let (dir_id, dir_meta) = match <Tmpfs as FsOps>::mkdir(
@@ -768,12 +768,12 @@ fn tmpfs_v3_fetch_page_done_for_anon_file() {
         .unwrap_or_else(|p| p.into_inner());
     init_substrate();
 
-    use tx_substrate::step_v3::{Errno as V3Errno, NoProgress, StepOutcome as V3};
+    use step_engine::{Errno as V3Errno, NoProgress, StepOutcome as V3};
     use tx_subsystems::page_backed::FsPageBacking;
     use tx_subsystems::vfs::FsOps;
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     let (file_id, _) = match <Tmpfs as FsOps>::create_inode(
@@ -812,12 +812,12 @@ fn tmpfs_v3_truncate_then_load_meta_reflects_size() {
         .unwrap_or_else(|p| p.into_inner());
     init_substrate();
 
-    use tx_substrate::step_v3::{NoProgress, StepOutcome as V3};
+    use step_engine::{NoProgress, StepOutcome as V3};
     use tx_subsystems::page_backed::FsPageBacking;
     use tx_subsystems::vfs::FsOps;
 
     let tmpfs = Arc::new(Tmpfs::new());
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let cred = Credential::root();
 
     let (file_id, _) = match <Tmpfs as FsOps>::create_inode(
@@ -858,8 +858,7 @@ fn tmpfs_v3_truncate_then_load_meta_reflects_size() {
 
 #[test]
 fn step_walk_against_tmpfs_resolves_real_path() {
-    use tx_substrate::step_v3::StepOutcome as V3;
-    use tx_substrate::zone::{self, Cap};
+    use step_engine::{reserve_for, sign_for, Cap, StepOutcome as V3};
     use tx_subsystems::mount::{
         DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
     };
@@ -893,8 +892,8 @@ fn step_walk_against_tmpfs_resolves_real_path() {
             RNodeBacking::Directory,
         )
         .with_containing_mount(&payload);
-        let res = zone::reserve_for::<RNode>().expect("rnode reservation");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
     };
 
     let _mount = MountIdentity::new_cap(
@@ -913,7 +912,7 @@ fn step_walk_against_tmpfs_resolves_real_path() {
     // Use real Tmpfs mkdir to add an entry the walker has to find by
     // resolving through `FsOps for Tmpfs`.
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let _new_dir = match tmpfs.mkdir(mount_output.root_fs_object_id, b"dir", 0o755, &cred, &guard) {
         V3::Done(out) => out,
         other => panic!("tmpfs mkdir failed: {other:?}"),

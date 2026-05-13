@@ -1,25 +1,19 @@
 use super::*;
 use crate::execution::Errno;
 use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
+use crate::page_backed::adapter::step_engine::{
+    self as step_engine, NoProgress, PageProgress as V3PageProgress, StepOutcome as V3Outcome,
+    StepOutcome as V3Out, YieldShape as V3YieldShape,
+};
 use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};
 use alloc::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tx_substrate::step_v3::{NoProgress, StepOutcome as V3Outcome};
-
-// `step_truncate`, `step_fsync`, `step_fallocate` return
-// `tx_substrate::step_v3::StepOutcome<(), PageProgress>`, so the
-// assertions below use `V3Out::Done(())` against them. LifecycleFs
-// stores its internal outcomes in the `execution::StepOutcome` shape
-// for `FsPageBacking` and translates inside its trait impl below.
-use tx_substrate::step_v3::{
-    PageProgress as V3PageProgress, StepOutcome as V3Out, YieldShape as V3YieldShape,
-};
 
 fn setup_host_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     crate::zones::register_all().expect("kernel zones");
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    match step_engine::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for PageBacked lifecycle tests: {error:?}"),
     }
 }
@@ -90,7 +84,7 @@ fn file_page_container(fs: Arc<LifecycleFs>, fs_object_id: FsObjectId) -> PageCo
     .expect("mount payload");
     PageContainer::new(
         PageContainerKind::File {
-            mount: MountPayloadPin::acquire(&tx_substrate::zone::PayloadCap::from_cap(mount)),
+            mount: MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(mount)),
             fs_object_id,
         },
         4,
@@ -108,7 +102,7 @@ fn pagebacked_step_truncate_withdraws_pages_at_or_beyond_new_size() {
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -141,7 +135,7 @@ fn pagebacked_step_truncate_can_grow_visible_size_without_materializing_pages() 
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -165,7 +159,7 @@ fn pagebacked_step_truncate_asks_file_backing_before_withdrawal() {
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = Arc::new(LifecycleFs::new());
     let pc = file_page_container(fs.clone(), FsObjectId::new(44));
     pc.state
@@ -194,7 +188,7 @@ fn pagebacked_step_truncate_leaves_state_unchanged_when_file_backing_fails() {
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = Arc::new(LifecycleFs::failing_truncate(Errno::EROFS));
     let pc = file_page_container(fs.clone(), FsObjectId::new(45));
     pc.state
@@ -220,7 +214,7 @@ fn pagebacked_step_truncate_rejects_device_and_capacity_growth() {
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let device = PageContainer::new(
         PageContainerKind::Device {
             base_ppn: Ppn(0xface_1000),
@@ -251,7 +245,7 @@ fn pagebacked_step_fsync_flushes_dirty_file_pages_in_order_and_cleans_marks() {
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = Arc::new(LifecycleFs::new());
     let pc = file_page_container(fs.clone(), FsObjectId::new(51));
     for page in [2, 0] {
@@ -285,7 +279,7 @@ fn pagebacked_step_fsync_returns_advanced_then_blocked_after_flush_progress() {
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = Arc::new(LifecycleFs::blocking_after(1));
     let pc = file_page_container(fs.clone(), FsObjectId::new(52));
     for page in 0..2 {
@@ -319,7 +313,7 @@ fn pagebacked_step_fsync_is_noop_for_anon_and_device() {
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let anon = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -344,7 +338,7 @@ fn pagebacked_step_truncate_zeros_partial_eof_tail_in_cached_page() {
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -363,17 +357,17 @@ fn pagebacked_step_truncate_zeros_partial_eof_tail_in_cached_page() {
     let pattern: alloc::vec::Vec<u8> = (0..crate::vm::USER_PAGE_SIZE)
         .map(|i| ((i & 0xff) | 0x40) as u8)
         .collect();
-    tx_substrate::page_allocator::testing::write_frame_bytes_for_test(ppn_page1, 0, &pattern);
+    step_engine::page_allocator::testing::write_frame_bytes_for_test(ppn_page1, 0, &pattern);
 
     let new_size = crate::vm::USER_PAGE_SIZE as u64 + 4;
     assert_eq!(step_truncate(&pc, new_size, &guard), V3Out::Done(()));
 
     let mut head = [0u8; 4];
-    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(ppn_page1, 0, &mut head);
+    step_engine::page_allocator::testing::read_frame_bytes_for_test(ppn_page1, 0, &mut head);
     assert_eq!(&head, &pattern[..4]);
 
     let mut tail = alloc::vec![0xCCu8; crate::vm::USER_PAGE_SIZE - 4];
-    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(ppn_page1, 4, &mut tail);
+    step_engine::page_allocator::testing::read_frame_bytes_for_test(ppn_page1, 4, &mut tail);
     assert!(
         tail.iter().all(|b| *b == 0),
         "tail bytes must be zeroed after truncate-shrink past mid-page"
@@ -386,7 +380,7 @@ fn pagebacked_step_truncate_does_not_touch_surviving_pages_at_page_aligned_shrin
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -402,7 +396,7 @@ fn pagebacked_step_truncate_does_not_touch_surviving_pages_at_page_aligned_shrin
     }
     let ppn_page0 = pc.lookup(PageIndex::new(0)).expect("page 0 cached");
     let pattern = alloc::vec![0xAFu8; crate::vm::USER_PAGE_SIZE];
-    tx_substrate::page_allocator::testing::write_frame_bytes_for_test(ppn_page0, 0, &pattern);
+    step_engine::page_allocator::testing::write_frame_bytes_for_test(ppn_page0, 0, &pattern);
 
     assert_eq!(
         step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
@@ -410,7 +404,7 @@ fn pagebacked_step_truncate_does_not_touch_surviving_pages_at_page_aligned_shrin
     );
 
     let mut readback = alloc::vec![0u8; crate::vm::USER_PAGE_SIZE];
-    tx_substrate::page_allocator::testing::read_frame_bytes_for_test(ppn_page0, 0, &mut readback);
+    step_engine::page_allocator::testing::read_frame_bytes_for_test(ppn_page0, 0, &mut readback);
     assert_eq!(readback, pattern);
 }
 
@@ -420,7 +414,7 @@ fn pagebacked_step_fallocate_grows_anon_visible_size_without_materializing_pages
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let pc = PageContainer::new(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,
@@ -445,7 +439,7 @@ fn pagebacked_step_fallocate_calls_file_backing_before_publishing_size() {
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = Arc::new(LifecycleFs::new());
     let pc = file_page_container(fs.clone(), FsObjectId::new(91));
     assert_eq!(step_truncate(&pc, 16, &guard), V3Out::Done(()));
@@ -467,7 +461,7 @@ fn pagebacked_step_fallocate_leaves_state_unchanged_when_file_backing_fails() {
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = Arc::new(LifecycleFs::failing_fallocate(Errno::EDQUOT));
     let pc = file_page_container(fs.clone(), FsObjectId::new(92));
     assert_eq!(step_truncate(&pc, 16, &guard), V3Out::Done(()));
@@ -488,7 +482,7 @@ fn pagebacked_step_fallocate_rejects_device_and_capacity_growth() {
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let device = PageContainer::new(
         PageContainerKind::Device {
             base_ppn: Ppn(0xface_3000),
@@ -522,7 +516,7 @@ fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
         .lock()
         .expect("page-backed lifecycle test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = Arc::new(LifecycleFs::new());
     let pc = file_page_container(fs.clone(), FsObjectId::new(93));
     assert_eq!(
@@ -551,8 +545,8 @@ fn pagebacked_step_fallocate_is_noop_when_target_size_does_not_grow() {
 // identity-side queries / mutations; page accounting belongs to
 // `FsPageBacking`.
 
+use crate::page_backed::adapter::step_engine::Errno as V3Errno;
 use crate::vfs::FsOps;
-use tx_substrate::step_v3::Errno as V3Errno;
 
 impl FsOps for LifecycleFs {
     fn lookup(
@@ -684,7 +678,7 @@ impl crate::page_backed::FsPageBacking for LifecycleFs {
         _guard: &Guard<'_>,
     ) -> V3Outcome<Frame, NoProgress> {
         V3Outcome::done(Frame::new(
-            tx_substrate::page_allocator::zero_frame_ppn().expect("zero frame"),
+            step_engine::page_allocator::zero_frame_ppn().expect("zero frame"),
         ))
     }
 
@@ -752,7 +746,7 @@ impl crate::page_backed::FsPageBacking for LifecycleFs {
 #[test]
 fn fsopsv3_load_inode_meta_returns_done_with_default_meta() {
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = LifecycleFs::new();
     let outcome = <LifecycleFs as FsOps>::load_inode_meta(&fs, FsObjectId::new(7), &guard);
     let expected = InodeMeta::new(InodeKind::Regular, 0o100644);
@@ -762,7 +756,7 @@ fn fsopsv3_load_inode_meta_returns_done_with_default_meta() {
 #[test]
 fn fsopsv3_create_inode_returns_err_erofs_on_readonly_fixture() {
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = LifecycleFs::new();
     let outcome = <LifecycleFs as FsOps>::create_inode(
         &fs,
@@ -781,7 +775,7 @@ fn fsopsv3_create_inode_returns_err_erofs_on_readonly_fixture() {
 #[test]
 fn fsopsv3_readdir_done_none_for_empty_directory() {
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = LifecycleFs::new();
     let outcome =
         <LifecycleFs as FsOps>::readdir(&fs, FsObjectId::new(1), DirCursor::START, &guard);
@@ -791,7 +785,7 @@ fn fsopsv3_readdir_done_none_for_empty_directory() {
 #[test]
 fn fsopsv3_lookup_returns_err_enosys() {
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = LifecycleFs::new();
     let outcome = <LifecycleFs as FsOps>::lookup(&fs, FsObjectId::new(1), b"missing", &guard);
     assert_eq!(
@@ -806,7 +800,7 @@ fn fsopsv3_default_read_link_returns_enosys() {
     // does not override `read_link`, so the default `ENOSYS` answer
     // must round-trip through the v3 outcome shape.
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let fs = LifecycleFs::new();
     let outcome = <LifecycleFs as FsOps>::read_link(&fs, FsObjectId::new(1), &guard);
     assert_eq!(

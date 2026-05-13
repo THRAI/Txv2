@@ -11,4 +11,5 @@ test = false
 doctest = false
 
 [dependencies]
+tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-substrate = { path = "../tx-substrate" }

@@ -12,9 +12,9 @@
 
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
-use tx_reactor::wait::{Channel, Mask, WaitFuture};
 
-use tx_substrate::SpinMutex;
+use crate::adapter::step_engine::SpinMutex;
+use crate::adapter::wait_routing::{Channel, Mask, WaitFuture};
 
 use crate::execution::WaitToken;
 

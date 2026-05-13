@@ -186,9 +186,9 @@ Adding this rule to the worker brief eliminates ~85% of decision sites for the f
 
 W-page-backed identified the hot fns that need `#[inline]` on their `StepOp::step` impl in PR-2:
 
-- [`crates/tx-subsystems/src/page_backed.rs:659`](../../../crates/tx-subsystems/src/page_backed.rs) — `step_range` (innermost loop)
+- [`crates/tx-subsystems/src/page_backed.rs:659`](../../../crates/tx-subsystems/src/page_backed/mod.rs) — `step_range` (innermost loop)
 - [`crates/tx-subsystems/src/page_backed/user_buffer.rs:108`](../../../crates/tx-subsystems/src/page_backed/user_buffer.rs) — `step_range_with_user_buffer`
-- [`crates/tx-subsystems/src/page_backed.rs:414`](../../../crates/tx-subsystems/src/page_backed.rs) — `materialize_page` (dispatch hub)
+- [`crates/tx-subsystems/src/page_backed.rs:414`](../../../crates/tx-subsystems/src/page_backed/mod.rs) — `materialize_page` (dispatch hub)
 
 Bench `page_backed` and `tmpfs` before/after PR-2 per doc 07 risk register.
 

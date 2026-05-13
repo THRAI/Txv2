@@ -6,13 +6,13 @@ use core::{
     task::{Context, Poll},
 };
 
-use crate::interrupt::{InterruptSource, NoInterrupts};
-use crate::timer::{DeadlineFuture, TimerQueue};
-use tx_substrate::bus::{
+use crate::adapter::bus_wire::{
     DeclaredPort, DeclaredPortSubscription, DeclaredQueue, DeclaredQueueSubscription,
     DeclaredWireError, RawPort, RawPortSubscription, WireDeclaration, WireDeclarationError,
     WireEventSet,
 };
+use crate::interrupt::{InterruptSource, NoInterrupts};
+use crate::timer::{DeadlineFuture, TimerQueue};
 
 /// Bit mask naming the wait events a task cares about on a channel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,6 +241,16 @@ impl Channel {
         }
         self.port.fire(mask.bits())
     }
+}
+
+/// Fire a legacy wait `Channel` with a raw mask value, returning the
+/// number of waiters woken.
+///
+/// Replaces the per-subsystem adapter pattern
+/// `channel.fire(Mask::from_bits(mask_bits))`.
+/// Future observation hooks (tracing, metrics) attach here in one place.
+pub fn fire_legacy(channel: &Channel, mask_bits: u64) -> usize {
+    channel.fire(Mask::from_bits(mask_bits))
 }
 
 impl<E> DeclaredChannel<E>

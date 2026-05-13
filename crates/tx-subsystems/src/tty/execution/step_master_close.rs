@@ -1,21 +1,25 @@
 //! Master-close hangup path for ptys.
 
-use tx_substrate::zone::Cap;
+use crate::tty::adapter::step_engine::Cap;
 
 use super::step_hangup::{step_hangup, HangupOutcome};
 use super::step_ioctl::IoctlSideEffect;
 use crate::execution::{Errno, Guard};
+#[cfg(test)]
+use crate::tty::adapter::step_engine::ByteProgress;
+#[cfg(test)]
+use crate::tty::adapter::step_engine::{self as step_engine};
+use crate::tty::adapter::step_engine::{
+    NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 use crate::tty::checks::require_live_tty;
 use crate::tty::structure::{TtyIdentity, TtyTransport};
 
 pub fn step_master_close_last(
     master: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<
-    (HangupOutcome, IoctlSideEffect),
-    tx_substrate::step_v3::NoProgress,
-> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<(HangupOutcome, IoctlSideEffect), NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let payload = match require_live_tty(master, guard) {
         Ok(payload) => payload,
@@ -48,15 +52,10 @@ pub struct MasterCloseLastOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
-    for MasterCloseLastOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for MasterCloseLastOp<'a> {
     type Output = (HangupOutcome, IoctlSideEffect);
-    type Progress = tx_substrate::step_v3::NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_master_close_last(self.master, self.guard)
     }
 }
@@ -64,8 +63,10 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepO
 #[cfg(test)]
 mod step_op_wraps {
     use super::*;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
-    use tx_substrate::zone::{self as zone_mod, PayloadCap};
+    use crate::tty::adapter::step_engine::{
+        reserve_for, sign_for, PayloadCap, PlaceholderProcessSubject, ScriptCtx, StepOp,
+        StepOutcome as V3,
+    };
 
     use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
     use crate::test_support::EPOCH_TEST_LOCK;
@@ -74,22 +75,12 @@ mod step_op_wraps {
     struct NoopOps;
 
     impl CharDeviceOps for NoopOps {
-        fn read(
-            &self,
-            _out: &mut [u8],
-            _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
-        {
-            tx_substrate::step_v3::StepOutcome::Done(0)
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+            StepOutcome::Done(0)
         }
 
-        fn write(
-            &self,
-            bytes: &[u8],
-            _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
-        {
-            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+            StepOutcome::Done(bytes.len())
         }
     }
 
@@ -102,20 +93,20 @@ mod step_op_wraps {
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _ = crate::zones::register_all();
         crate::tty::structure::registry::reset_for_tests();
         guard
     }
 
     fn alloc_hardware_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
-        let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
-        let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(
+        let id_res = reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_cap = PayloadCap::from_cap(sign_for(
             payload_res,
             TtyPayload::new_hardware(&NOOP_BINDING),
         ));
-        let identity = zone_mod::sign_for(
+        let identity = sign_for(
             id_res,
             TtyIdentity::new(TtyKind::SerialHardware, index, name),
         );
@@ -129,16 +120,16 @@ mod step_op_wraps {
         // A hardware (non-pty) TTY is rejected with EINVAL since its
         // transport isn't `Pty { .. }`.
         let tty = alloc_hardware_tty(400, "ttyV3-master-close-hw");
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = MasterCloseLastOp {
             master: &tty,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
-            V3::Err(tx_substrate::step_v3::Errno::EINVAL) => {}
+            V3::Err(step_engine::Errno::EINVAL) => {}
             other => panic!("expected Err(EINVAL), got {other:?}"),
         }
     }
@@ -148,16 +139,16 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_hardware_tty(401, "ttyV3-master-close-dead");
         let _ = tty.take_payload();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = MasterCloseLastOp {
             master: &tty,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
-            V3::Err(tx_substrate::step_v3::Errno::EIO) => {}
+            V3::Err(step_engine::Errno::EIO) => {}
             other => panic!("expected Err(EIO), got {other:?}"),
         }
     }

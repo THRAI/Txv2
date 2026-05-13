@@ -31,6 +31,7 @@ use super::{
     bootstrap_read_user, errno_to_i32, SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE,
     EINVAL_VALUE, ENOMEM_VALUE,
 };
+use crate::adapter::step_engine::{self as step_engine};
 
 /// Linux's `sigset_t` is 8 bytes on RV64 / x86_64 (a single `u64`).
 /// The signalfd4 syscall takes `sizemask = sizeof(sigset_t) = 8` and
@@ -158,7 +159,7 @@ pub(super) async fn step_signalfd_read(
             let result = signalfd_read(sfd_cap, &mut staging, nonblocking);
             (result, staging)
         };
-        use tx_substrate::step_v3::{StepOutcome as V3Out, YieldShape};
+        use step_engine::{StepOutcome as V3Out, YieldShape};
         match outcome.0 {
             V3Out::Done(read) => {
                 if read == 0 {

@@ -6,8 +6,8 @@
 //! ## PR-7B integration point: DelegateTimeout fires
 //!
 //! `tx-substrate`'s `DelegateRegistry` and the `TimerWheel` now live
-//! in the same crate (per D6 the wheel moved down to
-//! `tx_substrate::wake::timer`; the reactor re-exports it through
+//! in the same crate (per D6 the wheel moved down to substrate's
+//! `wake::timer`; the reactor re-exports it through
 //! [`crate::timer::TimerWheel`] for back-compat). The reactor-side
 //! glue that routes a fired `DelegateTimeout` timer to
 //! `registry.mark_timed_out(...)` lives on the wheel itself, in
@@ -262,20 +262,20 @@ where
     pub signal: &'a mut S,
 }
 
-impl<'a, R, C, S, I> tx_substrate::step_v3::StepOp<I> for HartLoopOp<'a, R, C, S>
+impl<'a, R, C, S, I> crate::adapter::step_engine::StepOp<I> for HartLoopOp<'a, R, C, S>
 where
     R: HartLoopRuntime,
     C: HartLoopClock,
     S: RescheduleSignal,
-    I: tx_substrate::step_v3::SubjectIdentity,
+    I: crate::adapter::step_engine::SubjectIdentity,
 {
     type Output = HartLoopStep;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = crate::adapter::step_engine::NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_hart_loop(
+        _ctx: &mut crate::adapter::step_engine::ScriptCtx<I>,
+    ) -> crate::adapter::step_engine::StepOutcome<Self::Output, Self::Progress> {
+        crate::adapter::step_engine::StepOutcome::Done(step_hart_loop(
             self.runtime,
             self.hart,
             self.clock,
@@ -296,19 +296,19 @@ where
     pub signal: &'a mut S,
 }
 
-impl<'a, R, S, I> tx_substrate::step_v3::StepOp<I> for HartLoopAtOp<'a, R, S>
+impl<'a, R, S, I> crate::adapter::step_engine::StepOp<I> for HartLoopAtOp<'a, R, S>
 where
     R: HartLoopRuntime,
     S: RescheduleSignal,
-    I: tx_substrate::step_v3::SubjectIdentity,
+    I: crate::adapter::step_engine::SubjectIdentity,
 {
     type Output = HartLoopStep;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = crate::adapter::step_engine::NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
-        tx_substrate::step_v3::StepOutcome::Done(step_hart_loop_at(
+        _ctx: &mut crate::adapter::step_engine::ScriptCtx<I>,
+    ) -> crate::adapter::step_engine::StepOutcome<Self::Output, Self::Progress> {
+        crate::adapter::step_engine::StepOutcome::Done(step_hart_loop_at(
             self.runtime,
             self.hart,
             self.now_ns,
@@ -326,8 +326,10 @@ mod step_op_wraps {
     //! coverage lives in the integration tests under
     //! `tests/hart_loop.rs`.
     use super::*;
+    use crate::adapter::step_engine::{
+        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome as V3,
+    };
     use crate::dispatch::NoopRescheduleSignal;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
 
     #[derive(Debug)]
     struct FakeHartRuntime {
@@ -395,7 +397,7 @@ mod step_op_wraps {
             now_ns: 100,
             signal: &mut signal,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             V3::Done(step) => {
@@ -419,7 +421,7 @@ mod step_op_wraps {
             clock: &mut clock,
             signal: &mut signal,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             V3::Done(step) => {
