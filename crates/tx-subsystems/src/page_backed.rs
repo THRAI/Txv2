@@ -374,6 +374,48 @@ impl PageContainer {
         })
     }
 
+    /// Materialize a page for VM fault resolution. Handles both
+    /// `Anon` and `File` PCs. `Anon` delegates to `materialize_anon`;
+    /// `File` borrows the current epoch guard (or acquires a fresh one
+    /// if none is held) and fetches via `FsPageBacking::fetch_page`.
+    /// `Device` is rejected — device mappings install through the pmap
+    /// directly and never fault.
+    pub fn materialize_page_for_fault(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+    ) -> Result<MaterializedPage, PageCacheError> {
+        match &self.kind {
+            PageContainerKind::Anon { .. } => self.materialize_anon(page, access),
+            PageContainerKind::File { mount, fs_object_id } => {
+                use tx_substrate::step_v3::StepOutcome as V3;
+                let borrowed = tx_substrate::epoch::borrow_current_guard();
+                let fresh;
+                let guard: &Guard<'_> = match &borrowed {
+                    Some(g) => g,
+                    None => {
+                        fresh = tx_substrate::epoch::guard();
+                        &fresh
+                    }
+                };
+                match self.materialize_file_page(page, access, mount, *fs_object_id, guard) {
+                    V3::Done(materialized) => Ok(materialized),
+                    V3::Err(errno) => {
+                        if errno == tx_substrate::step_v3::Errno::ENOMEM {
+                            Err(PageCacheError::Alloc(
+                                tx_substrate::page_allocator::AllocError::Exhausted,
+                            ))
+                        } else {
+                            Err(PageCacheError::MissingPage)
+                        }
+                    }
+                    _ => Err(PageCacheError::MissingPage),
+                }
+            }
+            PageContainerKind::Device { .. } => Err(PageCacheError::UnsupportedKind),
+        }
+    }
+
     pub fn materialize_page(
         &self,
         page: PageIndex,

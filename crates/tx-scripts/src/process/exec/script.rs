@@ -838,8 +838,7 @@ fn poll_walker_synchronously<F: core::future::Future>(future: F) -> F::Output {
 /// `txdoc:VFS-CHECKS-PERMISSIONS-1`.
 fn check_exec_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), ExecError> {
     let mode = meta.mode as u32;
-    let any_x = (mode & 0o111) != 0;
-    if cred.effective_caps.contains(Capability::DAC_OVERRIDE) && any_x {
+    if cred.effective_caps.contains(Capability::DAC_OVERRIDE) {
         return Ok(());
     }
     let bits = if cred.uid == meta.uid {

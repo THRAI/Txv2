@@ -1,8 +1,11 @@
 use tx_ext4_format::pager::{BlockImage, DirEntryLite};
 use tx_substrate::epoch::Guard;
+use tx_substrate::zone::Cap;
 use tx_subsystems::execution::Errno;
+use tx_subsystems::page_backed::{PageContainer, PageContainerKind};
 use tx_subsystems::vfs::structure::{
-    Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta,
+    Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
+    RNodeBacking,
 };
 
 use crate::read_backend::{
@@ -233,7 +236,53 @@ where
         tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into())
     }
 
-    // `read_link`, `materialise_rnode`, `step_chmod`, `step_chown` all
-    // inherit the trait-default `ENOSYS` mapping; ext4 does not
-    // override those methods.
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<Cap<RNode>, tx_substrate::step_v3::NoProgress> {
+        let pin = match self.mount_pin.lock().clone() {
+            Some(p) => p,
+            None => return tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into()),
+        };
+
+        const PAGE_SIZE: u64 = 4096;
+        let page_count = meta.size.div_ceil(PAGE_SIZE).max(1);
+        let pc = match PageContainer::new_cap(
+            PageContainerKind::File {
+                mount: pin,
+                fs_object_id,
+            },
+            page_count,
+        ) {
+            Ok(pc) => pc,
+            Err(_) => return tx_substrate::step_v3::StepOutcome::err(Errno::ENOMEM.into()),
+        };
+
+        match RNode::new_cap(fs_object_id, meta, RNodeBacking::PageBacked { pc }) {
+            Ok(rnode) => tx_substrate::step_v3::StepOutcome::done(rnode),
+            Err(_) => tx_substrate::step_v3::StepOutcome::err(Errno::ENOMEM.into()),
+        }
+    }
+
+    fn read_link(
+        &self,
+        fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> tx_substrate::step_v3::StepOutcome<
+        alloc::boxed::Box<[u8]>,
+        tx_substrate::step_v3::NoProgress,
+    > {
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+        };
+        match self.with_pager(|pager| pager.read_symlink(inode)) {
+            Ok(bytes) => tx_substrate::step_v3::StepOutcome::done(bytes.into_boxed_slice()),
+            Err(err) => tx_substrate::step_v3::StepOutcome::err(err.into()),
+        }
+    }
+
+    // `step_chmod`, `step_chown` inherit the trait-default `ENOSYS`.
 }

@@ -5,12 +5,12 @@ use core::{
 
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
 use tx_substrate::step_v3::StepOutcome;
-use tx_substrate::zone::Cap;
+use tx_substrate::zone::{Cap, PayloadCap};
 use tx_substrate::SpinMutex;
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::{
-    self, MountFlags, MountIdentity, MountOptions, MountPayload, SourceLabel,
+    self, MountFlags, MountIdentity, MountOptions, MountPayload, MountPayloadPin, SourceLabel,
 };
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::tty::structure::TtyIdentity;
@@ -39,6 +39,11 @@ static ROOT_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 /// Retained alongside `ROOT_MOUNT` so the mount table remains live
 /// after `init_substrate_if_ready` returns.
 static DEV_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
+
+/// Global sdcard ext4 mount at `/musl`. Populated by
+/// `mount_sdcard_at_musl` when a `vda` block device is registered.
+/// Boards without a block device silently leave this `None`.
+static MUSL_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> = SpinMutex::new(None);
 
 /// Global TTY identity for the boot console hardware. Populated by
 /// `register_console_hardware`; consulted by
@@ -260,6 +265,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_rootfs_tmpfs();
             Self::mount_devfs_at_dev();
             Self::register_devfs_console_alias();
+            Self::mount_sdcard_at_musl();
             Self::bind_init_cwd_and_root();
 
             // Deferred H4 spine slots:
@@ -384,6 +390,38 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":devices:block:ok\n");
+
+        Self::probe_ext4_superblock_smoke();
+    }
+
+    /// If a `vda` block device is registered, read its first 4 KiB through the
+    /// `tx_fs::tx_ext4::BlockDeviceImage` adapter and emit a sentinel reporting
+    /// whether the bytes at offset 1024+56 spell the ext4 magic (`0x53 0xef`).
+    /// Boards without a block device (e.g. m1dock-mock) silently no-op.
+    fn probe_ext4_superblock_smoke() {
+        use tx_fs::tx_ext4::{BlockDeviceImage, BlockImage, BLOCK_SIZE};
+        use tx_subsystems::device::block_device_by_name;
+
+        let Some(reg) = block_device_by_name(b"vda") else {
+            return;
+        };
+        let image = BlockDeviceImage::new(reg.ops);
+        let mut buf = [0u8; BLOCK_SIZE];
+        match image.read_block(0, &mut buf) {
+            Ok(()) => {
+                let magic = u16::from_le_bytes([buf[1024 + 56], buf[1024 + 56 + 1]]);
+                Self::write_board_sentinel_prefix();
+                if magic == 0xef53 {
+                    tx_hal::console_write_str::<P>(":block:ext4-superblock:ok\n");
+                } else {
+                    tx_hal::console_write_str::<P>(":block:ext4-superblock:bad-magic\n");
+                }
+            }
+            Err(_) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":block:ext4-superblock:read-err\n");
+            }
+        }
     }
 
     /// Mount tmpfs as the rootfs.
@@ -580,6 +618,129 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:devfs:ok\n");
+    }
+
+    /// Mount the sdcard ext4 image at `/musl` on the rootfs tmpfs.
+    ///
+    /// If a `vda` block device is registered (RV64 QEMU virtio-blk
+    /// path), opens its ext4 image via `BlockDeviceImage`, mounts it
+    /// read-only, creates `/musl` in the rootfs tmpfs, and binds the
+    /// ext4 mount there. Boards without a block device silently skip.
+    ///
+    /// **Order invariant:** must follow `mount_devfs_at_dev` (ROOT_MOUNT
+    /// already populated, `/dev` already created in tmpfs) and precede
+    /// `bind_init_cwd_and_root`.
+    pub(crate) fn mount_sdcard_at_musl() {
+        use tx_fs::tx_ext4::{BlockDeviceImage, mount_ext4_read_only};
+        use tx_subsystems::device::block_device_by_name;
+
+        let Some(reg) = block_device_by_name(b"vda") else {
+            return;
+        };
+
+        let image = BlockDeviceImage::new(reg.ops);
+        let (mount_output, ext4_wire) = match mount_ext4_read_only(image) {
+            Ok(out) => out,
+            Err(_) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
+                return;
+            }
+        };
+
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("mount_sdcard_at_musl: ROOT_MOUNT must be populated");
+
+        // mkdir("/musl") in the rootfs tmpfs so we have a mountpoint.
+        let guard = tx_substrate::epoch::guard();
+        let cred = Credential::root();
+        use tx_substrate::step_v3::StepOutcome as V3;
+        let (musl_object_id, musl_meta) = match root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .fs_ops
+            .mkdir(
+                tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID,
+                b"musl",
+                0o755,
+                &cred,
+                &guard,
+            ) {
+            V3::Done(out) => out,
+            other => panic!("mount_sdcard_at_musl: tmpfs mkdir(/musl) failed: {other:?}"),
+        };
+        drop(guard);
+
+        // Build the `/musl` mountpoint DEntry on the rootfs.
+        let musl_rnode_in_root =
+            RNode::new_cap(musl_object_id, musl_meta, RNodeBacking::Directory)
+                .expect("mount_sdcard_at_musl: /musl rnode-on-rootfs reservation");
+        let musl_dentry_on_root = DEntry::new_cap(
+            InlineName::new(b"musl").expect("mount_sdcard_at_musl: /musl inline name"),
+            musl_rnode_in_root,
+        )
+        .expect("mount_sdcard_at_musl: /musl dentry-on-rootfs reservation");
+
+        // Build the ext4 mount payload.
+        let ext4_payload = MountPayload::new_cap(
+            mount_output.fs_ops.clone(),
+            mount_output.fs_page_backing.clone(),
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "ext4",
+            SourceLabel::Static("vda"),
+        )
+        .expect("mount_sdcard_at_musl: ext4 payload reservation");
+
+        // Give the ext4 backend a MountPayloadPin so materialise_rnode
+        // can create File-kind PageContainers for regular files.
+        let ext4_pin = MountPayloadPin::acquire(&PayloadCap::from_cap(ext4_payload.clone()));
+        ext4_wire.register_pin(ext4_pin);
+
+        // Build the ext4 root RNode with a `containing_mount` hint so
+        // the VFS walker's `fs_ops_for` resolves the right FsOps.
+        let ext4_root_rnode = {
+            let raw = RNode::new(
+                mount_output.root_fs_object_id,
+                mount_output.root_inode_meta,
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&ext4_payload);
+            let res = tx_substrate::zone::reserve_for::<RNode>()
+                .expect("mount_sdcard_at_musl: ext4 root rnode reservation");
+            tx_substrate::zone::sign_for(res, raw)
+        };
+
+        // Snapshot rootfs payload before consuming root_mount into the
+        // new mount's parent slot.
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
+
+        let musl_mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            Some(musl_dentry_on_root),
+            ext4_root_rnode,
+            Some(root_mount),
+            ext4_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_sdcard_at_musl: mount identity reservation");
+
+        // Register in the VFS mount table so the walker crosses from
+        // tmpfs into ext4 at `/musl`.
+        mount::register_mount(&rootfs_payload, musl_object_id, musl_mount.clone());
+
+        *MUSL_MOUNT.lock() = Some(musl_mount);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:sdcard:ext4:ok\n");
     }
 
     /// Re-publish `console` under devfs's alias table.
@@ -854,20 +1015,20 @@ impl<P: TxPlatform> CoreInit<P> {
         P::enable_ipi_wakeups();
         P::enable_timer_wakeups();
         loop {
-            if Self::run_secondary_reactor_once(cpu_id) {
+            let Some(step) = Self::step_boot_reactor_once(cpu_id) else {
+                continue;
+            };
+            if !step.should_idle() {
                 continue;
             }
-
             crate::zones::try_bounded_maintenance_tick();
-            P::wait_for_interrupt_once();
+            if Self::should_wait_for_interrupt(step.next_deadline_ns) {
+                P::wait_for_interrupt_once();
+            }
             if P::pending_ipi(IpiKind::Reschedule) {
                 P::ack_ipi(IpiKind::Reschedule);
             }
         }
-    }
-
-    fn run_secondary_reactor_once(cpu_id: CpuId) -> bool {
-        Self::step_boot_reactor_once(cpu_id).is_some_and(|step| !step.should_idle())
     }
 
     fn step_boot_reactor_once(cpu_id: CpuId) -> Option<tx_reactor::hart_loop::HartLoopStep> {
@@ -879,6 +1040,21 @@ impl<P: TxPlatform> CoreInit<P> {
         })?;
         Self::program_hart_loop_deadline(step.deadline_action);
         Some(step)
+    }
+
+    /// WFI guard implementing the timer-truth invariant:
+    /// "The kernel must not enter WFI while it can already prove that a
+    /// reactor timer deadline has elapsed."
+    ///
+    /// Returns `true` when WFI is safe (no deadline, or deadline not yet
+    /// elapsed). Returns `false` when the deadline has already passed —
+    /// the caller must skip WFI so the next `advance_time_to(now)` call
+    /// can observe the elapsed deadline and fire the timer queue.
+    fn should_wait_for_interrupt(next_deadline_ns: Option<u64>) -> bool {
+        match next_deadline_ns {
+            None => true,
+            Some(deadline) => P::read_ns() < deadline,
+        }
     }
 
     fn program_hart_loop_deadline(action: tx_reactor::hart_loop::HartLoopDeadlineAction) {
@@ -1005,7 +1181,9 @@ impl<P: TxPlatform> CoreInit<P> {
                 return;
             }
             crate::zones::try_bounded_maintenance_tick();
-            P::wait_for_interrupt_once();
+            if Self::should_wait_for_interrupt(step.next_deadline_ns) {
+                P::wait_for_interrupt_once();
+            }
         }
 
         panic!("BSP reactor timer idle smoke did not complete");

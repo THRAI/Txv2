@@ -341,6 +341,73 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Bootstrap exec runs as init (root) by construction.
         let cred = Credential::root();
+
+        // When the sdcard ext4 mount is present (RV64 QEMU with vda),
+        // exec busybox sh to run the oscomp basic-musl test suite.
+        // The sdcard's musl/ dir contains busybox (static ET_EXEC),
+        // basic_testcode.sh, and per-test binaries under basic/.
+        //
+        // Use `sh -c "cd /musl/musl && sh basic_testcode.sh"` so the
+        // inner sh inherits CWD=/musl/musl/ and basic_testcode.sh's
+        // relative `./busybox` / `cd ./basic` references resolve
+        // correctly — avoids any kernel-side VFS walk at this stage.
+        // DIAGNOSTIC: emit epoch state right before the sdcard exec to
+        // identify whether a guard leak pre-dates drive_bootstrap_exec.
+        {
+            let es = tx_substrate::epoch::summary();
+            let cpu0 = tx_substrate::epoch::cpu_summary(tx_hal::CpuId(0));
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":diag:pre-sdcard-exec:guards=");
+            Self::write_decimal_unsigned(es.active_guards);
+            tx_hal::console_write_str::<P>(":epoch=");
+            Self::write_decimal_unsigned(es.global_epoch as usize);
+            tx_hal::console_write_str::<P>(":cpu0-local=");
+            Self::write_decimal_unsigned(
+                cpu0.map(|c| c.local_epoch as usize).unwrap_or(999),
+            );
+            tx_hal::console_write_str::<P>("\n");
+        }
+
+        if super::MUSL_MOUNT.lock().is_some() {
+            let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/musl:/musl/musl/basic"];
+            let sdcard_argv: &[&[u8]] =
+                &[b"sh", b"-c", b"cd /musl/musl && ./busybox sh basic_testcode.sh"];
+            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                &init,
+                &thread,
+                b"/musl/musl/busybox",
+                sdcard_argv,
+                sdcard_envp,
+                &cred,
+            ));
+            match outcome {
+                Ok(()) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
+                    return;
+                }
+                Err(ref e) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":bootstrap-exec:sdcard:fail:");
+                    tx_hal::console_write_str::<P>(exec_error_tag(e));
+                    if matches!(e, tx_scripts::process::exec::ExecError::NotExecutable) {
+                        tx_hal::console_write_str::<P>(":site=");
+                        tx_hal::console_write_str::<P>(
+                            tx_scripts::process::exec::script::last_notexec_site_label(),
+                        );
+                        tx_hal::console_write_str::<P>(":file_size=");
+                        Self::write_decimal_unsigned(
+                            tx_scripts::process::exec::script::LAST_EXEC_FILE_SIZE
+                                .load(core::sync::atomic::Ordering::Relaxed)
+                                as usize,
+                        );
+                    }
+                    tx_hal::console_write_str::<P>("\n");
+                    // Fall through to the cmdline-driven path below.
+                }
+            }
+        }
+
         // busybox sh needs at least PATH to find applet binaries
         // (`ls`, `cat`, etc.) — without it, command lookup short-
         // circuits to "not found" before the kernel's fork/exec path
@@ -601,7 +668,9 @@ impl<P: TxPlatform> CoreInit<P> {
             }
 
             if step.should_idle() && !init.is_zombie() {
-                P::wait_for_interrupt_once();
+                if Self::should_wait_for_interrupt(step.next_deadline_ns) {
+                    P::wait_for_interrupt_once();
+                }
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
                 }

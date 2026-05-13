@@ -282,6 +282,36 @@ impl<I: BlockImage> Ext4Pager<I> {
         })
     }
 
+    /// Read a symlink's target bytes.
+    ///
+    /// Handles both fast/inline symlinks (target in `i_block`, `size <= 60`)
+    /// and block-based symlinks (target in the first data block).
+    pub fn read_symlink(&mut self, inode: InodeNo) -> Result<Vec<u8>> {
+        let disk_inode = self.read_inode(inode)?;
+        if !disk_inode.is_symlink() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let size = disk_inode.size as usize;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        if size <= 60 {
+            // Fast symlink: target stored inline in i_block.
+            Ok(disk_inode.extent_root_bytes()[..size].to_vec())
+        } else {
+            // Block-based symlink: target in the first data block.
+            let mut page = [0u8; BLOCK_SIZE];
+            match self.resolve_inode_block(&disk_inode, 0)? {
+                BlockMapping::Data(block) => {
+                    self.image.read_block(block, &mut page)?;
+                    Ok(page[..size.min(BLOCK_SIZE)].to_vec())
+                }
+                BlockMapping::Hole => Ok(Vec::new()),
+                BlockMapping::NeedNode(_) => Err(Ext4FormatError::Unsupported),
+            }
+        }
+    }
+
     pub fn replay_journal_for_test(&mut self) -> Result<ReplayReport> {
         let journal_start = self.journal_start.ok_or(Ext4FormatError::Unsupported)?;
         let mut cursor = journal_start + 1;

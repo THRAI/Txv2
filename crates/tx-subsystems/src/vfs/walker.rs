@@ -226,8 +226,10 @@ fn walk_inner_v3<'g>(
 
     let must_be_directory = remaining.last().copied() == Some(b'/');
 
-    let mut current_fs_ops: Option<Arc<dyn FsOps>> = fs_ops_for(&current, guard);
-    let mut current_mount_payload: Option<Cap<MountPayload>> = mount_payload_for(&current, guard);
+    let mut current_fs_ops: Option<Arc<dyn FsOps>> = fs_ops_for(&current, guard)
+        .or_else(|| fs_ops_for(&mount_root, guard));
+    let mut current_mount_payload: Option<Cap<MountPayload>> = mount_payload_for(&current, guard)
+        .or_else(|| mount_payload_for(&mount_root, guard));
 
     let mut hop_count: u32 = 0;
 
@@ -260,13 +262,11 @@ fn walk_inner_v3<'g>(
             continue;
         }
         if component == b".." {
-            if let Some(parent_weak) = current.parent_hint() {
-                if let Some(parent_cap) = parent_weak.upgrade(guard) {
-                    if !is_same_dentry(&current, &mount_root) {
-                        current = parent_cap;
-                        current_fs_ops = fs_ops_for(&current, guard);
-                        current_mount_payload = mount_payload_for(&current, guard);
-                    }
+            if let Some(parent_cap) = current.parent_hint() {
+                if !is_same_dentry(&current, &mount_root) {
+                    current = parent_cap;
+                    current_fs_ops = fs_ops_for(&current, guard);
+                    current_mount_payload = mount_payload_for(&current, guard);
                 }
             }
             continue;
@@ -538,12 +538,9 @@ fn dentry_for_mount_root(mount: &Cap<MountIdentity>) -> Result<Cap<DEntry>, Errn
 
 /// Walk `from`'s parent-hint chain to find the namespace's root
 /// dentry. Returns `from` itself when no parent hint is installed.
-fn mount_root_dentry<'g>(from: &Cap<DEntry>, guard: &Guard<'g>) -> Cap<DEntry> {
+fn mount_root_dentry<'g>(from: &Cap<DEntry>, _guard: &Guard<'g>) -> Cap<DEntry> {
     let mut cursor: Cap<DEntry> = from.clone();
-    while let Some(parent_weak) = cursor.parent_hint() {
-        let Some(parent_cap) = parent_weak.upgrade(guard) else {
-            break;
-        };
+    while let Some(parent_cap) = cursor.parent_hint() {
         cursor = parent_cap;
     }
     cursor

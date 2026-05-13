@@ -1,8 +1,88 @@
 # txKernel Status
 
-**Updated:** 2026-05-12
+**Updated:** 2026-05-13
 
 ## Current Shape
+
+- 2026-05-13 **OSComp `basic-musl` TEST GROUP markers now appear** in the
+  oscomp RV64 QEMU serial output. Three fixes landed together:
+  1. `read_symlink` implemented in `tx-ext4-format` pager (handles fast
+     inline ≤60 B and block-based symlinks); `FsOps::read_link` wired in
+     `tx-ext4/src/namespace.rs`.
+  2. Exec command changed from `sh basic_testcode.sh` (PATH search, `sh`
+     not on sdcard) to `./busybox sh basic_testcode.sh` (explicit busybox).
+  3. `DEntry::parent` changed from `Weak<DEntry>` to `Cap<DEntry>`
+     (strong reference) so the parent-hint chain remains live after the
+     walker frame returns. Walker init gains a fallback: when `fs_ops_for`
+     returns None for the CWD dentry, recover from `mount_root`. Fixes
+     exec from a non-mount-root CWD (e.g., `/musl/musl/` after `cd`).
+  **Verified:** `cargo xtask oscomp qemu --target rv64-qemu` now emits
+  `#### OS COMP TEST GROUP START basic-musl ####` and
+  `#### OS COMP TEST GROUP END basic-musl ####`; `userspace:exited:0`;
+  `execve=4:clone=3:wait4=6`. `cargo -q xtask unit` 4/4 clean (330 tests).
+- 2026-05-13 **`CAP_DAC_OVERRIDE` now bypasses x-bit requirement** in
+  `check_exec_perm` (`crates/tx-scripts/src/process/exec/script.rs`).
+  Removed the `any_x` guard from the `CAP_DAC_OVERRIDE` early-return so
+  root processes can exec files with mode 0o644 (no x bit). The kernel
+  proceeds to ELF/script parse; non-ELF content returns `ENOEXEC`, which
+  causes busybox `sh` to fall back to shell-script interpretation —
+  matching competing oscomp kernel behavior and allowing `run-all.sh`
+  (mode 0o100644 on sdcard) to execute. Updated two unit tests to reflect
+  the new semantics (`exec_script_dac_override_bypasses_with_no_x_bit`,
+  `exec_script_eacces_for_non_executable_binary` now uses a non-root
+  no-cap credential). **Verified:** `cargo -q xtask unit` 4/4 clean
+  (330 tests). **Next step:** run oscomp QEMU to confirm `run-all.sh`
+  inner test binaries execute and scores increase.
+
+- 2026-05-13 Sdcard ext4 VFS mount LANDED. `tx-ext4` is now `#![no_std]`
+  (gated `host_async` behind `host-async` feature); `tx-fs` gains
+  `tx-ext4` as a dep and re-exports `mount_ext4_read_only` through
+  `tx_fs::tx_ext4`. New `CoreInit::mount_sdcard_at_musl` runs between
+  `register_devfs_console_alias` and `bind_init_cwd_and_root`: looks up
+  `vda`, calls `mount_ext4_read_only(BlockDeviceImage::new(reg.ops))`,
+  `mkdir("/musl")` in the tmpfs rootfs, then wires a full
+  `MountPayload`/`MountIdentity`/`register_mount` chain so the VFS
+  walker can cross from tmpfs into ext4 at `/musl`. Boards without `vda`
+  (LA64) silently skip. **Verified:** `cargo xtask oscomp qemu --target
+  rv64-qemu` now prints
+  `txkernel:qemu-riscv64-virt:mount:sdcard:ext4:ok` between
+  `:devfs:alias:console:ok` and `:init:cwd-fds:ok`; boot continues
+  cleanly through `:boot:ok` and `userspace:exited:0`. `cargo -q xtask
+  unit` 4/4 clean (330 tests).
+  **Next step:** walk the VFS from init to verify `/musl` directory is
+  reachable and contains the expected oscomp test tree; then wire the
+  kernel's init to exec `/musl/basic_testcode.sh` (or run individual
+  test binaries directly) and emit the oscomp group markers.
+  **Blocker:** test binaries are PIE dynamic ELFs (`interp
+  /lib/ld-linux-riscv64-lp64d.so.1`) — exec needs ld.so + musl libc
+  visible under `/lib` and a shell to drive `basic_testcode.sh`.
+
+- 2026-05-13 BlockDevice→BlockImage bridge LANDED. Adds
+  `tx_fs::tx_ext4::BlockDeviceImage` (`crates/tx-fs/src/tx_ext4_bridge.rs`):
+  a `tx_ext4_format::BlockImage` impl that takes any
+  `&'static dyn BlockDevice` and serves 4 KiB ext4 blocks by reserving
+  a transient page-frame, calling `read_blocks` through the kernel
+  block-device registry, and copying the page out to the caller's
+  `[u8; 4096]`. Read-only by design (`write_block` returns
+  `Truncated` rather than silently corrupting). `tx-fs` gains a
+  `tx-ext4-format` dep and re-exports `BlockImage`/`Page4K`/`BLOCK_SIZE`
+  through `tx_fs::tx_ext4`. **Verified:** `CoreInit::probe_ext4_superblock_smoke`
+  reads ext4 magic via `BlockDeviceImage` at boot under oscomp QEMU flags.
+
+- 2026-05-13 RV64 QEMU virt virtio-mmio block driver LANDED. Adds
+  `tx-drivers::virtio::VirtioMmioBlock<P>` (mirror of `VirtioPciBlock`
+  using `virtio_drivers::transport::mmio::MmioTransport<'static>`),
+  wired in `tx_kernel::devices::KernelBlockDevices::init_rv64_qemu_virt`
+  against the `virtio0` MMIO region already declared at
+  `0x1000_1000` in `boards/tx-hal-riscv64-qemu-virt/src/boot_static.rs`.
+  RV64 was previously a no-op branch in `init_and_register` and the
+  oscomp sdcard was being attached at the QEMU command line but never
+  probed. **Verified:** `cargo xtask oscomp qemu --target rv64-qemu`
+  with `-bios default -smp 1 -m 1G -drive ... -device virtio-blk-device,
+  bus=virtio-mmio-bus.0` reports `total_blocks=8388608, block_size=512`
+  (4 GiB sdcard image, sectors × 512 B match the disk geometry) and
+  the kernel boots cleanly through `:boot:ok` and exits
+  `userspace:exited:0` under the contest QEMU flags.
 
 - 2026-05-12 D12 Phase B (PR-2 scaffolding dead-code allowance)
   LANDED. Closes the D13 follow-up: the 26 PR-2 `StepOp` adapter
