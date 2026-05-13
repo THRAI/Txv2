@@ -1,8 +1,9 @@
 use crate::ondisk::{
-    encode_journal_commit, encode_journal_descriptor, parse_journal_descriptor, BlockMapping,
-    CommitHeader, DirEntry, DirEntryIter, ExtentNode, GroupDesc, Inode, InodeLocation,
-    InodeTableLayout, Superblock,
+    encode_dir_entry, encode_journal_commit, encode_journal_descriptor, parse_journal_descriptor,
+    BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent, ExtentNode,
+    GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock,
 };
+use crate::ondisk::{read_u16_le, write_u16_le};
 use crate::{Ext4FormatError, Result};
 use alloc::vec::Vec;
 
@@ -344,6 +345,234 @@ impl<I: BlockImage> Ext4Pager<I> {
             transactions,
             blocks_replayed,
         })
+    }
+
+    /// Allocate a free inode in group 0, mark it used in the bitmap, and return
+    /// its number.  Panics on group-desc absence, returns `OutOfBounds` when
+    /// the bitmap is full.
+    pub fn allocate_inode(&mut self) -> Result<InodeNo> {
+        let group = *self.groups.first().ok_or(Ext4FormatError::Corrupt)?;
+        let bitmap_block = group.inode_bitmap_block();
+        let mut bitmap = [0u8; BLOCK_SIZE];
+        self.image.read_block(bitmap_block, &mut bitmap)?;
+        let bit = BitmapView::new(&bitmap)
+            .first_zero()
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        BitmapMut::new(&mut bitmap).set(bit)?;
+        self.image.write_block(bitmap_block, &bitmap)?;
+        Ok(InodeNo::new(bit as u32 + 1))
+    }
+
+    /// Write `inode` directly into the inode table (no journal).
+    pub fn write_inode(&mut self, inode_no: InodeNo, inode: &Inode) -> Result<()> {
+        let loc = self.inode_location(inode_no)?;
+        let mut block = [0u8; BLOCK_SIZE];
+        self.image.read_block(loc.block, &mut block)?;
+        inode.encode(&mut block[loc.offset..loc.offset + loc.len])?;
+        self.image.write_block(loc.block, &block)?;
+        Ok(())
+    }
+
+    /// Allocate a free data block in group 0, mark it used, and return its
+    /// absolute block number.
+    pub fn allocate_block(&mut self) -> Result<u64> {
+        let group = *self.groups.first().ok_or(Ext4FormatError::Corrupt)?;
+        let bitmap_block = group.block_bitmap_block();
+        let mut bitmap = [0u8; BLOCK_SIZE];
+        self.image.read_block(bitmap_block, &mut bitmap)?;
+        let bit = BitmapView::new(&bitmap)
+            .first_zero()
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        BitmapMut::new(&mut bitmap).set(bit)?;
+        self.image.write_block(bitmap_block, &bitmap)?;
+        Ok(self.superblock.first_data_block as u64 + bit as u64)
+    }
+
+    /// Insert a new directory entry `(name → new_ino)` into an existing
+    /// directory by finding slack space in its current data blocks.
+    pub fn append_dir_entry(
+        &mut self,
+        dir_ino: InodeNo,
+        name: &[u8],
+        new_ino: InodeNo,
+        file_type: u8,
+    ) -> Result<()> {
+        if name.len() > 255 {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
+        let new_min = (8usize + name.len() + 3) & !3;
+        let disk_inode = self.read_inode(dir_ino)?;
+        let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
+
+        for page_index in 0..page_count {
+            let mut page = [0u8; BLOCK_SIZE];
+            let phys = match self.resolve_inode_block(&disk_inode, logical_block(page_index)?)? {
+                BlockMapping::Data(b) => b,
+                BlockMapping::Hole => continue,
+                BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+            };
+            self.image.read_block(phys, &mut page)?;
+
+            let mut off = 0usize;
+            while off + 8 <= BLOCK_SIZE {
+                let rec_len = read_u16_le(&page, off + 4)? as usize;
+                if rec_len == 0 || off + rec_len > BLOCK_SIZE {
+                    break;
+                }
+                let ino_here = u32::from_le_bytes(page[off..off + 4].try_into().unwrap());
+                if ino_here == 0 {
+                    if rec_len >= new_min {
+                        encode_dir_entry(
+                            new_ino.get(),
+                            rec_len as u16,
+                            file_type,
+                            name,
+                            &mut page[off..off + rec_len],
+                        )?;
+                        self.image.write_block(phys, &page)?;
+                        return Ok(());
+                    }
+                } else {
+                    let name_len = page[off + 6] as usize;
+                    let used = (8 + name_len + 3) & !3;
+                    let free = rec_len.saturating_sub(used);
+                    if free >= new_min {
+                        write_u16_le(&mut page, off + 4, used as u16)?;
+                        encode_dir_entry(
+                            new_ino.get(),
+                            free as u16,
+                            file_type,
+                            name,
+                            &mut page[off + used..off + rec_len],
+                        )?;
+                        self.image.write_block(phys, &page)?;
+                        return Ok(());
+                    }
+                }
+                off += rec_len;
+            }
+        }
+        Err(Ext4FormatError::OutOfBounds)
+    }
+
+    /// Remove the directory entry named `name` from `dir_ino`.  Returns the
+    /// inode number that was removed.
+    pub fn remove_dir_entry(&mut self, dir_ino: InodeNo, name: &[u8]) -> Result<InodeNo> {
+        let disk_inode = self.read_inode(dir_ino)?;
+        let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
+
+        for page_index in 0..page_count {
+            let mut page = [0u8; BLOCK_SIZE];
+            let phys = match self.resolve_inode_block(&disk_inode, logical_block(page_index)?)? {
+                BlockMapping::Data(b) => b,
+                BlockMapping::Hole => continue,
+                BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+            };
+            self.image.read_block(phys, &mut page)?;
+
+            let mut prev_off: Option<usize> = None;
+            let mut off = 0usize;
+            while off + 8 <= BLOCK_SIZE {
+                let rec_len = read_u16_le(&page, off + 4)? as usize;
+                if rec_len == 0 || off + rec_len > BLOCK_SIZE {
+                    break;
+                }
+                let ino_here = u32::from_le_bytes(page[off..off + 4].try_into().unwrap());
+                if ino_here != 0 {
+                    let name_len = page[off + 6] as usize;
+                    let name_end = off + 8 + name_len;
+                    if name_end <= BLOCK_SIZE
+                        && name_len == name.len()
+                        && &page[off + 8..name_end] == name
+                    {
+                        let found_ino = InodeNo::new(ino_here);
+                        if let Some(prev) = prev_off {
+                            let prev_rec = read_u16_le(&page, prev + 4)? as usize;
+                            let merged = (prev_rec + rec_len) as u16;
+                            write_u16_le(&mut page, prev + 4, merged)?;
+                        } else {
+                            page[off..off + 4].fill(0);
+                        }
+                        self.image.write_block(phys, &page)?;
+                        return Ok(found_ino);
+                    }
+                }
+                prev_off = Some(off);
+                off += rec_len;
+            }
+        }
+        Err(Ext4FormatError::OutOfBounds)
+    }
+
+    /// Create a new regular file in `parent_ino`.  Returns the new inode.
+    pub fn create_regular_file(
+        &mut self,
+        parent_ino: InodeNo,
+        name: &[u8],
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        now_sec: u32,
+    ) -> Result<InodeNo> {
+        let new_ino = self.allocate_inode()?;
+        let mut inode = Inode::default();
+        inode.mode = Inode::S_IFREG | (mode & 0o7777);
+        inode.uid = uid;
+        inode.gid = gid;
+        inode.atime = now_sec;
+        inode.ctime = now_sec;
+        inode.mtime = now_sec;
+        inode.links_count = 1;
+        inode.flags = Inode::EXTENTS_FL;
+        inode.set_extent_root(&[])?;
+        self.write_inode(new_ino, &inode)?;
+        self.append_dir_entry(parent_ino, name, new_ino, 1 /* EXT4_FT_REG_FILE */)?;
+        Ok(new_ino)
+    }
+
+    /// Create a new directory in `parent_ino` with `.` and `..` entries.
+    pub fn create_directory(
+        &mut self,
+        parent_ino: InodeNo,
+        name: &[u8],
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        now_sec: u32,
+    ) -> Result<InodeNo> {
+        let new_ino = self.allocate_inode()?;
+        let data_block = self.allocate_block()?;
+
+        let mut dir_data = [0u8; BLOCK_SIZE];
+        encode_dir_entry(new_ino.get(), 12, 2 /* dir */, b".", &mut dir_data[0..12])?;
+        encode_dir_entry(
+            parent_ino.get(),
+            (BLOCK_SIZE - 12) as u16,
+            2,
+            b"..",
+            &mut dir_data[12..],
+        )?;
+        self.image.write_block(data_block, &dir_data)?;
+
+        let mut inode = Inode::default();
+        inode.mode = Inode::S_IFDIR | (mode & 0o7777);
+        inode.uid = uid;
+        inode.gid = gid;
+        inode.size = BLOCK_SIZE as u64;
+        inode.atime = now_sec;
+        inode.ctime = now_sec;
+        inode.mtime = now_sec;
+        inode.links_count = 2;
+        inode.blocks_512 = 8;
+        inode.flags = Inode::EXTENTS_FL;
+        inode.set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 1,
+            physical_start: data_block,
+        }])?;
+        self.write_inode(new_ino, &inode)?;
+        self.append_dir_entry(parent_ino, name, new_ino, 2 /* EXT4_FT_DIR */)?;
+        Ok(new_ino)
     }
 
     fn read_inode(&mut self, inode: InodeNo) -> Result<Inode> {

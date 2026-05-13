@@ -3,11 +3,8 @@
 //! `Ext4Pager` needs a `BlockImage`: it reads/writes 4 KiB ext4 blocks. The
 //! kernel block-device registry exposes `BlockDevice` / `BlockDeviceOps`:
 //! sector-LBA addressed, page-frame DMA targets, EBR-guarded. This module
-//! bridges the two by allocating a transient frame, issuing a `read_blocks`
-//! into it, and copying the page into the caller's `[u8; 4096]` buffer.
-//!
-//! Reads only — `write_block` returns `Truncated` so any accidental journal
-//! commit fails loudly rather than silently corrupting the underlying disk.
+//! bridges the two by allocating a transient frame, issuing a DMA operation,
+//! and copying between the frame and the caller's `[u8; 4096]` buffer.
 
 use core::ptr::NonNull;
 
@@ -95,8 +92,42 @@ impl BlockImage for BlockDeviceImage {
         Ok(())
     }
 
-    fn write_block(&mut self, _block: u64, _data: &Page4K) -> Result<()> {
-        // The block-device bridge is read-only by design — see module docs.
-        Err(Ext4FormatError::Truncated)
+    fn write_block(&mut self, block: u64, data: &Page4K) -> Result<()> {
+        let spb = self
+            .sectors_per_ext4_block()
+            .ok_or(Ext4FormatError::Unsupported)?;
+        let lba = block
+            .checked_mul(spb)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+
+        let reservation = page_allocator::reserve_run(1, 1, ZeroPolicy::UninitFullOverwrite)
+            .map_err(|_| Ext4FormatError::Truncated)?;
+        let run = reservation.commit();
+        let ppn = run.base();
+        let frame = Frame::new(ppn);
+
+        let dst = page_allocator::frame_kernel_addr(ppn)
+            .map_err(|_| Ext4FormatError::Truncated)?;
+        let dst_nn = NonNull::new(dst).ok_or(Ext4FormatError::Truncated)?;
+        // SAFETY: `dst_nn` is the kernel direct-map VA of the freshly
+        // allocated frame we own through `run`. `data` is `&[u8; BLOCK_SIZE]`.
+        // Both regions are valid for BLOCK_SIZE bytes and disjoint.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), dst_nn.as_ptr(), BLOCK_SIZE);
+        }
+
+        let guard = tx_substrate::epoch::borrow_current_guard()
+            .unwrap_or_else(tx_substrate::epoch::guard);
+        let outcome = self.device.write_blocks(
+            PhysicalBlockNumber::new(lba),
+            core::slice::from_ref(&frame),
+            &guard,
+        );
+        drop(guard);
+        drop(run);
+        match outcome {
+            StepOutcome::Done(()) => Ok(()),
+            _ => Err(Ext4FormatError::Truncated),
+        }
     }
 }
