@@ -11,7 +11,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use tx_hal::UserTrapContext;
 
-use crate::thread_runtime::adapter::reactor_entry::{UserspaceRunRequest, UserspaceRunSlot, TaskKey};
+use crate::thread_runtime::adapter::reactor_entry::{
+    TaskKey, UserspaceRunRequest, UserspaceRunSlot,
+};
 use crate::thread_runtime::adapter::step_engine::{
     Dead, Entity, PayloadCap, SpinMutex, TaskMailbox, Weak, Zone, ZoneAllocated,
 };
@@ -56,7 +58,9 @@ impl ThreadIdentity {
 
     /// Snapshot the owning process via `Weak::upgrade` under a fresh
     /// guard. Returns `None` if the process identity has been dropped.
-    pub fn upgrade_owner_proc(&self) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ProcessIdentity>> {
+    pub fn upgrade_owner_proc(
+        &self,
+    ) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ProcessIdentity>> {
         let guard = crate::thread_runtime::adapter::step_engine::guard();
         self.owner_proc.upgrade(&guard)
     }

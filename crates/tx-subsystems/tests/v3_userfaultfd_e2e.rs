@@ -429,11 +429,7 @@ fn pr_10_phase_6_oneagent_canary_full_loop() {
     );
     let (_user_page, snapshot) = walked[0];
     let mut readback = alloc::vec![0u8; USER_PAGE_SIZE];
-    page_allocator::testing::read_frame_bytes_for_test(
-        snapshot.ppn,
-        0,
-        &mut readback,
-    );
+    page_allocator::testing::read_frame_bytes_for_test(snapshot.ppn, 0, &mut readback);
     assert!(
         readback.iter().all(|byte| *byte == handler_src_pattern),
         "every byte of the published page must equal the handler's \

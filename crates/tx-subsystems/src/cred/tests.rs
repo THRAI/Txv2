@@ -4,6 +4,7 @@
 //! fork-inherits-cred, privileged-vs-non-privileged setuid/setgid,
 //! and zombie ignoring.
 
+use crate::cred::adapter::step_engine::Cap;
 use crate::cred::{
     step_apply_suid_for_exec, step_setgid, step_setregid, step_setresgid, step_setresuid,
     step_setreuid, step_setuid, Capability, CapabilitySet, Cred, CredChange, Gid, Uid,
@@ -17,7 +18,6 @@ use crate::vfs::structure::{S_ISGID, S_ISUID};
 use crate::vfs::Credential;
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
-use crate::cred::adapter::step_engine::Cap;
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

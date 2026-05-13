@@ -25,9 +25,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
 
-use adapter::step_engine::{
-    self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome,
-};
+use adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
 
 use tx_subsystems::cred::Capability;
 use tx_subsystems::execution::Guard;
@@ -292,10 +290,7 @@ impl FsOps for Tmpfs {
         mode: u16,
         cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         // `InlineName::new` is the canonical name-validity check
         // (rejects empty, oversized, or `/` -bearing names). The
         // inline name is also the directory BTreeMap key now that
@@ -321,9 +316,7 @@ impl FsOps for Tmpfs {
         ) {
             Ok(cap) => cap,
             Err(_) => {
-                return StepOutcome::err(
-                    step_engine::Errno::ENOMEM,
-                );
+                return StepOutcome::err(step_engine::Errno::ENOMEM);
             }
         };
         // A fresh file has no addressable bytes. `PageContainer::new`
@@ -397,9 +390,7 @@ impl FsOps for Tmpfs {
         // Reject directory targets — those go through `rmdir`.
         if let Some(target_inode) = state.inodes.get(&found_id) {
             if matches!(target_inode.payload, TmpfsPayload::Directory(_)) {
-                return StepOutcome::err(
-                    step_engine::Errno::EISDIR,
-                );
+                return StepOutcome::err(step_engine::Errno::EISDIR);
             }
         }
         let parent_inode = state
@@ -482,10 +473,7 @@ impl FsOps for Tmpfs {
         mode: u16,
         cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         // `InlineName::new` is the canonical name-validity check
         // (rejects empty, oversized, or `/` -bearing names). The
         // inline name is also the directory BTreeMap key now that
@@ -546,9 +534,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
         if !target_children.is_empty() {
-            return StepOutcome::err(
-                step_engine::Errno::ENOTEMPTY,
-            );
+            return StepOutcome::err(step_engine::Errno::ENOTEMPTY);
         }
 
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
@@ -575,14 +561,9 @@ impl FsOps for Tmpfs {
         link_target: &[u8],
         cred: &Credential,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        (FsObjectId, InodeMeta),
-        NoProgress,
-    > {
+    ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         if link_target.is_empty() || link_target.len() > TMPFS_SYMLINK_MAX {
-            return StepOutcome::err(
-                step_engine::Errno::ENAMETOOLONG,
-            );
+            return StepOutcome::err(step_engine::Errno::ENAMETOOLONG);
         }
         // `InlineName::new` is the canonical name-validity check
         // (rejects empty, oversized, or `/` -bearing names). The
@@ -628,10 +609,7 @@ impl FsOps for Tmpfs {
         fs_object_id: FsObjectId,
         cursor: DirCursor,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        Option<(DirEntry, DirCursor)>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
         let state = self.state.lock();
         let Some(parent_inode) = state.inodes.get(&fs_object_id) else {
             return StepOutcome::err(step_engine::Errno::ENOENT);
@@ -655,10 +633,7 @@ impl FsOps for Tmpfs {
             Ok(e) => e,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        StepOutcome::done(Some((
-            entry,
-            DirCursor::from_u64(cursor.as_u64() + 1),
-        )))
+        StepOutcome::done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
     }
 
     fn destroy_inode(
@@ -691,18 +666,13 @@ impl FsOps for Tmpfs {
         &self,
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> StepOutcome<
-        alloc::boxed::Box<[u8]>,
-        NoProgress,
-    > {
+    ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
         let state = self.state.lock();
         let Some(inode) = state.inodes.get(&fs_object_id) else {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         match &inode.payload {
-            TmpfsPayload::Symlink(bytes) => {
-                StepOutcome::done(bytes.clone().into_boxed_slice())
-            }
+            TmpfsPayload::Symlink(bytes) => StepOutcome::done(bytes.clone().into_boxed_slice()),
             _ => StepOutcome::err(step_engine::Errno::EINVAL),
         }
     }
@@ -757,14 +727,10 @@ impl FsOps for Tmpfs {
             // POSIX-shaped errno rather than panicking so a backend
             // misroute surfaces as a recoverable error.
             TmpfsPayload::Directory(_) => {
-                return StepOutcome::err(
-                    step_engine::Errno::EISDIR,
-                );
+                return StepOutcome::err(step_engine::Errno::EISDIR);
             }
             TmpfsPayload::Symlink(_) => {
-                return StepOutcome::err(
-                    step_engine::Errno::EINVAL,
-                );
+                return StepOutcome::err(step_engine::Errno::EINVAL);
             }
         };
         drop(state);
@@ -827,16 +793,12 @@ impl FsOps for Tmpfs {
         if !privileged {
             if let Some(u) = new_uid {
                 if u != cred.uid {
-                    return StepOutcome::err(
-                        step_engine::Errno::EPERM,
-                    );
+                    return StepOutcome::err(step_engine::Errno::EPERM);
                 }
             }
             if let Some(g) = new_gid {
                 if g != cred.gid {
-                    return StepOutcome::err(
-                        step_engine::Errno::EPERM,
-                    );
+                    return StepOutcome::err(step_engine::Errno::EPERM);
                 }
             }
         }
@@ -870,14 +832,10 @@ impl FsPageBacking for Tmpfs {
         let container = match &inode.payload {
             TmpfsPayload::RegularFile { container, .. } => container.clone(),
             TmpfsPayload::Directory(_) => {
-                return StepOutcome::err(
-                    step_engine::Errno::EISDIR,
-                );
+                return StepOutcome::err(step_engine::Errno::EISDIR);
             }
             TmpfsPayload::Symlink(_) => {
-                return StepOutcome::err(
-                    step_engine::Errno::EINVAL,
-                );
+                return StepOutcome::err(step_engine::Errno::EINVAL);
             }
         };
         drop(state);
@@ -907,11 +865,7 @@ impl FsPageBacking for Tmpfs {
                         interests,
                     },
                 ..
-            } => V3::yield_on_wait_source(
-                NoProgress,
-                carrier.raw(),
-                interests.raw(),
-            ),
+            } => V3::yield_on_wait_source(NoProgress, carrier.raw(), interests.raw()),
             V3::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
@@ -947,21 +901,15 @@ impl FsPageBacking for Tmpfs {
         let container = {
             let state = self.state.lock();
             let Some(inode) = state.inodes.get(&fs_object_id) else {
-                return StepOutcome::err(
-                    step_engine::Errno::ENOENT,
-                );
+                return StepOutcome::err(step_engine::Errno::ENOENT);
             };
             match &inode.payload {
                 TmpfsPayload::RegularFile { container, .. } => container.clone(),
                 TmpfsPayload::Directory(_) => {
-                    return StepOutcome::err(
-                        step_engine::Errno::EISDIR,
-                    );
+                    return StepOutcome::err(step_engine::Errno::EISDIR);
                 }
                 TmpfsPayload::Symlink(_) => {
-                    return StepOutcome::err(
-                        step_engine::Errno::EINVAL,
-                    );
+                    return StepOutcome::err(step_engine::Errno::EINVAL);
                 }
             }
         };
@@ -974,9 +922,7 @@ impl FsPageBacking for Tmpfs {
             StepOutcome::Done(()) => {}
             StepOutcome::Continue { progress: _ } => {}
             StepOutcome::Yield { .. } => {
-                return StepOutcome::err(
-                    step_engine::Errno::EAGAIN,
-                );
+                return StepOutcome::err(step_engine::Errno::EAGAIN);
             }
             StepOutcome::Err(e) => {
                 return StepOutcome::err(e);
@@ -998,11 +944,7 @@ impl FsPageBacking for Tmpfs {
         StepOutcome::done(())
     }
 
-    fn fsync(
-        &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(), NoProgress> {
+    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         // In-memory; durability is trivially satisfied.
         StepOutcome::done(())
     }

@@ -1,7 +1,9 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, reserve_for, sign_for, StepOutcome};
+use crate::adapter::step_engine::{
+    self as step_engine, guard, page_allocator, reserve_for, sign_for, StepOutcome,
+};
 use tx_subsystems::page_backed::{step_truncate, AnonSwapPolicy, PageContainer, PageContainerKind};
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::bootstrap_init_process;
@@ -50,8 +52,7 @@ fn pagebacked_open_file(page_count: u64, size_bytes: u64) -> Cap<OpenFile> {
     .expect("page container cap");
     let guard = guard();
     match step_truncate(&pc, size_bytes, &guard) {
-        StepOutcome::Done(())
-        | StepOutcome::Continue { .. } => {}
+        StepOutcome::Done(()) | StepOutcome::Continue { .. } => {}
         other => panic!("step_truncate({size_bytes}): {other:?}"),
     }
     drop(guard);

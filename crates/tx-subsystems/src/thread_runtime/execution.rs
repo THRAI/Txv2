@@ -284,13 +284,16 @@ pub struct ThreadExitOp {
     pub status: i32,
 }
 
-impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity> crate::thread_runtime::adapter::step_engine::StepOp<I> for ThreadExitOp {
+impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
+    crate::thread_runtime::adapter::step_engine::StepOp<I> for ThreadExitOp
+{
     type Output = ();
     type Progress = crate::thread_runtime::adapter::step_engine::NoProgress;
     fn step(
         &mut self,
         _ctx: &mut crate::thread_runtime::adapter::step_engine::ScriptCtx<I>,
-    ) -> crate::thread_runtime::adapter::step_engine::StepOutcome<Self::Output, Self::Progress> {
+    ) -> crate::thread_runtime::adapter::step_engine::StepOutcome<Self::Output, Self::Progress>
+    {
         step_thread_exit(self.thread.clone(), self.status);
         crate::thread_runtime::adapter::step_engine::StepOutcome::Done(())
     }
@@ -303,13 +306,16 @@ pub struct SigprocmaskOp {
     pub next: SignalMask,
 }
 
-impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity> crate::thread_runtime::adapter::step_engine::StepOp<I> for SigprocmaskOp {
+impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
+    crate::thread_runtime::adapter::step_engine::StepOp<I> for SigprocmaskOp
+{
     type Output = SigprocmaskChange;
     type Progress = crate::thread_runtime::adapter::step_engine::NoProgress;
     fn step(
         &mut self,
         _ctx: &mut crate::thread_runtime::adapter::step_engine::ScriptCtx<I>,
-    ) -> crate::thread_runtime::adapter::step_engine::StepOutcome<Self::Output, Self::Progress> {
+    ) -> crate::thread_runtime::adapter::step_engine::StepOutcome<Self::Output, Self::Progress>
+    {
         crate::thread_runtime::adapter::step_engine::StepOutcome::Done(step_sigprocmask(
             &self.thread,
             self.how,
@@ -332,10 +338,10 @@ mod step_op_wraps {
     use crate::process::structure::reset_pid_counter_for_test;
     use crate::signal::Signum;
     use crate::test_support::EPOCH_TEST_LOCK;
+    use crate::thread_runtime::adapter::step_engine::{Cap, ScriptCtx, StepOp, StepOutcome};
     use crate::thread_runtime::structure::reset_tid_counter_for_test;
     use crate::vm::{AddressSpace, TestPmap};
     use crate::zones;
-    use crate::thread_runtime::adapter::step_engine::{Cap, ScriptCtx, StepOp, StepOutcome};
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -371,7 +377,9 @@ mod step_op_wraps {
             thread: leader.clone(),
             status: 7,
         };
-        let mut ctx = ScriptCtx::<crate::thread_runtime::adapter::step_engine::PlaceholderProcessSubject>::new();
+        let mut ctx = ScriptCtx::<
+            crate::thread_runtime::adapter::step_engine::PlaceholderProcessSubject,
+        >::new();
         let outcome = op.step(&mut ctx);
         assert_eq!(outcome, StepOutcome::Done(()));
         assert!(leader.is_zombie());
@@ -390,7 +398,9 @@ mod step_op_wraps {
             how: SigmaskHow::SetMask,
             next,
         };
-        let mut ctx = ScriptCtx::<crate::thread_runtime::adapter::step_engine::PlaceholderProcessSubject>::new();
+        let mut ctx = ScriptCtx::<
+            crate::thread_runtime::adapter::step_engine::PlaceholderProcessSubject,
+        >::new();
         let outcome = op.step(&mut ctx);
         match outcome {
             StepOutcome::Done(SigprocmaskChange::Replaced { prev, new }) => {

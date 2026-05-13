@@ -5,28 +5,20 @@ use crate::cred::Uid;
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::{Errno, Guard};
 use crate::process::{bootstrap_init_process, step_fork, ProcessIdentity};
+use crate::signal::adapter::step_engine::{
+    reserve_for, sign_for, ByteProgress, PayloadCap, StepOutcome,
+};
 use crate::signal::{deliver_tty_dispatch, signum_for_job_control, DispatchOutcome};
 use crate::tty::execution::{JobControlSignal, SignalDispatch, SignalTarget};
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
 use crate::vm::{AddressSpace, TestPmap};
-use crate::signal::adapter::step_engine::{
-    reserve_for, sign_for, ByteProgress, PayloadCap, StepOutcome,
-};
 
 struct NoopOps;
 impl CharDeviceOps for NoopOps {
-    fn read(
-        &self,
-        _out: &mut [u8],
-        _g: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn read(&self, _out: &mut [u8], _g: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(0)
     }
-    fn write(
-        &self,
-        b: &[u8],
-        _g: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn write(&self, b: &[u8], _g: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(b.len())
     }
 }

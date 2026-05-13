@@ -4,9 +4,9 @@ use crate::tty::adapter::step_engine::{self as step_engine, Cap, PayloadCap};
 
 use crate::device::CharDeviceBinding;
 use crate::execution::{Errno, Guard};
+use crate::tty::adapter::step_engine::{NoProgress, StepOutcome};
 use crate::tty::structure::registry;
 use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
-use crate::tty::adapter::step_engine::{NoProgress, StepOutcome};
 
 /// Create a hardware-backed TTY identity/payload and publish it to the tty
 /// registry. devfs aliases can then materialize RNodes pointing at it.
@@ -46,10 +46,7 @@ pub fn register_hardware(
 }
 
 /// Register a devfs alias, such as `/dev/console`, for an existing TTY.
-pub fn register_console_alias(
-    name: &str,
-    tty: Cap<TtyIdentity>,
-) -> StepOutcome<(), NoProgress> {
+pub fn register_console_alias(name: &str, tty: Cap<TtyIdentity>) -> StepOutcome<(), NoProgress> {
     use crate::tty::adapter::step_engine::StepOutcome as V3Out;
     if registry::register_devfs_alias(name, tty).is_err() {
         return V3Out::err(Errno::EIO.into());

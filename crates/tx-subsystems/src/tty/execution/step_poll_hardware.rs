@@ -10,14 +10,16 @@ use alloc::vec;
 use crate::tty::adapter::step_engine::Cap;
 
 use crate::execution::{Errno, Guard};
-use crate::tty::checks::require_live_tty;
-use crate::tty::execution::{step_ingest, IngestOutcome};
-use crate::tty::structure::{TtyIdentity, TtyTransport};
-use crate::tty::adapter::step_engine::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 #[cfg(test)]
 use crate::tty::adapter::step_engine::ByteProgress;
 #[cfg(test)]
 use crate::tty::adapter::step_engine::{self as step_engine};
+use crate::tty::adapter::step_engine::{
+    NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
+use crate::tty::checks::require_live_tty;
+use crate::tty::execution::{step_ingest, IngestOutcome};
+use crate::tty::structure::{TtyIdentity, TtyTransport};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HardwarePollOutcome {
@@ -60,10 +62,7 @@ pub fn step_poll_hardware_input(
     let drive_ingest = |bytes: &[u8],
                         read: usize,
                         guard: &Guard<'_>|
-     -> StepOutcome<
-        HardwarePollOutcome,
-        NoProgress,
-    > {
+     -> StepOutcome<HardwarePollOutcome, NoProgress> {
         match step_ingest(tty, bytes, guard) {
             V3::Done(ingest) => V3::Done(HardwarePollOutcome {
                 bytes_read: read,
@@ -155,15 +154,10 @@ pub struct PollHardwareInputOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for PollHardwareInputOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for PollHardwareInputOp<'a> {
     type Output = HardwarePollOutcome;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_poll_hardware_input(self.tty, self.max_bytes, self.guard)
     }
 }
@@ -183,21 +177,11 @@ mod step_op_wraps {
     struct NoopOps;
 
     impl CharDeviceOps for NoopOps {
-        fn read(
-            &self,
-            _out: &mut [u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(0)
         }
 
-        fn write(
-            &self,
-            bytes: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(bytes.len())
         }
     }

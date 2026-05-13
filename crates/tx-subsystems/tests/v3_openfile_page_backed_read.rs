@@ -59,11 +59,7 @@ fn setup_substrate() {
     tx_test_support::drain_to_quiescence();
 }
 
-fn make_page_backed_open_file(
-    page_count: u64,
-    read: bool,
-    write: bool,
-) -> zone::Cap<OpenFile> {
+fn make_page_backed_open_file(page_count: u64, read: bool, write: bool) -> zone::Cap<OpenFile> {
     let pc = PageContainer::new_cap(
         PageContainerKind::Anon {
             swap_policy: AnonSwapPolicy::Reclaimable,

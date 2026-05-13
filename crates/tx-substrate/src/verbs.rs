@@ -50,5 +50,5 @@ pub use crate::bus::{RawPort, RawQueue};
 
 // ── Sync ───────────────────────────────────────────────────────────────────
 // In-kernel lock and atomic-slot primitives used across subsystem structures.
-pub use crate::sync::SpinMutex;
 pub use crate::slot::AtomicSlot;
+pub use crate::sync::SpinMutex;

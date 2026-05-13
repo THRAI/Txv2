@@ -310,13 +310,18 @@ fn walk_inner_v3<'g>(
             return V3::err(step_engine::Errno::ENOTDIR);
         }
 
-        let child_rnode_cap =
-            match materialise_child_rnode_v3(&fs_ops, child_fs_object_id, child_meta, current_mount_payload.as_ref(), guard) {
-                V3::Done(rnode) => rnode,
-                V3::Continue { .. } => continue,
-                V3::Yield { progress, shape } => return V3::Yield { progress, shape },
-                V3::Err(err) => return V3::err(err),
-            };
+        let child_rnode_cap = match materialise_child_rnode_v3(
+            &fs_ops,
+            child_fs_object_id,
+            child_meta,
+            current_mount_payload.as_ref(),
+            guard,
+        ) {
+            V3::Done(rnode) => rnode,
+            V3::Continue { .. } => continue,
+            V3::Yield { progress, shape } => return V3::Yield { progress, shape },
+            V3::Err(err) => return V3::err(err),
+        };
 
         let child_inline = match InlineName::new(&component) {
             Ok(n) => n,

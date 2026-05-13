@@ -1,11 +1,11 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
+use crate::vm::adapter::wait_routing::Channel;
 use crate::vm::RANGE_LOCK_RELEASE_MASK;
 use alloc::boxed::Box;
 use core::future::Future;
 use core::ptr::null;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use crate::vm::adapter::wait_routing::Channel;
 
 const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |_| RawWaker::new(null(), &NOOP_WAKER_VTABLE),
@@ -731,8 +731,9 @@ fn range_lock_release_fires_registered_channel_for_external_subscribers() {
     let channel: Channel =
         crate::wait_source::lookup_wait_channel(aspace.range_lock().wait_source_id())
             .expect("RangeLock channel registered");
-    let mut wait_future =
-        Box::pin(channel.wait(crate::vm::adapter::wait_routing::Mask::from_bits(RANGE_LOCK_RELEASE_MASK)));
+    let mut wait_future = Box::pin(channel.wait(
+        crate::vm::adapter::wait_routing::Mask::from_bits(RANGE_LOCK_RELEASE_MASK),
+    ));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 

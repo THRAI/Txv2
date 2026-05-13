@@ -1,8 +1,8 @@
 use super::*;
-use alloc::vec::Vec;
 use crate::page_backed::adapter::step_engine::{
     self as step_engine, PageProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
+use alloc::vec::Vec;
 
 impl PageCacheIndex {
     fn withdraw_from(&mut self, first: PageIndex) {
@@ -75,10 +75,7 @@ fn first_page_after_size(size: u64) -> Option<PageIndex> {
         .map(|rounded| PageIndex::new(rounded / page_size))
 }
 
-pub fn step_fsync(
-    pc: &PageContainer,
-    guard: &Guard<'_>,
-) -> StepOutcome<(), PageProgress> {
+pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), PageProgress> {
     use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
 
     let PageContainerKind::File {
@@ -361,15 +358,10 @@ pub struct FsyncOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for FsyncOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
     type Output = ();
     type Progress = PageProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_fsync(self.pc, self.guard)
     }
 }
@@ -382,15 +374,10 @@ pub struct TruncateOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for TruncateOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for TruncateOp<'a> {
     type Output = ();
     type Progress = PageProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_truncate(self.pc, self.new_size, self.guard)
     }
 }
@@ -403,15 +390,10 @@ pub struct FallocateOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for FallocateOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for FallocateOp<'a> {
     type Output = ();
     type Progress = PageProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_fallocate(self.pc, self.new_size, self.guard)
     }
 }

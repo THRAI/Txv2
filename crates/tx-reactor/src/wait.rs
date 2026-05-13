@@ -6,13 +6,13 @@ use core::{
     task::{Context, Poll},
 };
 
-use crate::interrupt::{InterruptSource, NoInterrupts};
-use crate::timer::{DeadlineFuture, TimerQueue};
 use crate::adapter::bus_wire::{
     DeclaredPort, DeclaredPortSubscription, DeclaredQueue, DeclaredQueueSubscription,
     DeclaredWireError, RawPort, RawPortSubscription, WireDeclaration, WireDeclarationError,
     WireEventSet,
 };
+use crate::interrupt::{InterruptSource, NoInterrupts};
+use crate::timer::{DeadlineFuture, TimerQueue};
 
 /// Bit mask naming the wait events a task cares about on a channel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

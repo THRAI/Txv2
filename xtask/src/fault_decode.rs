@@ -14,17 +14,31 @@ use crate::Result;
 
 static COLOR_ENABLED: AtomicBool = AtomicBool::new(false);
 
-const ANSI_RESET:  &str = "\x1b[0m";
-const ANSI_BOLD:   &str = "\x1b[1m";
-const ANSI_RED:    &str = "\x1b[31m";
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD: &str = "\x1b[1m";
+const ANSI_RED: &str = "\x1b[31m";
 #[allow(dead_code)]
 const ANSI_YELLOW: &str = "\x1b[33m";
-const ANSI_CYAN:   &str = "\x1b[36m";
-const ANSI_GREEN:  &str = "\x1b[32m";
+const ANSI_CYAN: &str = "\x1b[36m";
+const ANSI_GREEN: &str = "\x1b[32m";
 
-fn color_enabled() -> bool { COLOR_ENABLED.load(Ordering::Relaxed) }
-fn col(code: &'static str) -> &'static str { if color_enabled() { code } else { "" } }
-fn col_reset() -> &'static str { if color_enabled() { ANSI_RESET } else { "" } }
+fn color_enabled() -> bool {
+    COLOR_ENABLED.load(Ordering::Relaxed)
+}
+fn col(code: &'static str) -> &'static str {
+    if color_enabled() {
+        code
+    } else {
+        ""
+    }
+}
+fn col_reset() -> &'static str {
+    if color_enabled() {
+        ANSI_RESET
+    } else {
+        ""
+    }
+}
 
 const RV64_KERNEL_WINDOW_SIZE: u64 = 512 * 1024 * 1024;
 const RV64_USER_TOP: u64 = 0x0000_0040_0000_0000;
@@ -41,12 +55,18 @@ pub(crate) fn fault_decode(root: &Path, args: Vec<String>) -> Result<()> {
     let spec = TargetSpec::for_target(config.target, root)?;
     let elf_path = config.elf.unwrap_or_else(|| spec.elf_path.clone());
     let image = ElfImage::load(&elf_path, &spec)?;
-    let user_image: Option<ElfImage> = config.user_elf
+    let user_image: Option<ElfImage> = config
+        .user_elf
         .as_deref()
         .and_then(|path| ElfImage::load_user(path).ok());
 
     if !config.json {
-        println!("{}txKernel fault-decode:{} {}", col(ANSI_BOLD), col_reset(), spec.name);
+        println!(
+            "{}txKernel fault-decode:{} {}",
+            col(ANSI_BOLD),
+            col_reset(),
+            spec.name
+        );
         println!("ELF: {}", elf_path.display());
         if let Some(id) = &image.build_id {
             println!("build-id: {id}");
@@ -95,8 +115,7 @@ pub(crate) fn fault_decode(root: &Path, args: Vec<String>) -> Result<()> {
                     .collect();
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&values)
-                        .unwrap_or_else(|_| "[]".to_string())
+                    serde_json::to_string_pretty(&values).unwrap_or_else(|_| "[]".to_string())
                 );
             } else if config.summary {
                 print_trap_summary_table(&selected, &image, &spec);
@@ -143,8 +162,8 @@ impl FaultDecodeConfig {
             .ok_or_else(|| "missing required option --target".to_string())
             .and_then(|value| TxTarget::parse(&value))?;
         let elf = optional_option_value(args, "--elf").map(|path| resolve_path(root, path.into()));
-        let user_elf = optional_option_value(args, "--user-elf")
-            .map(|path| resolve_path(root, path.into()));
+        let user_elf =
+            optional_option_value(args, "--user-elf").map(|path| resolve_path(root, path.into()));
         let all = args.iter().any(|arg| arg == "--all");
         let brief = args.iter().any(|arg| arg == "--brief");
         let json = args.iter().any(|arg| arg == "--json");
@@ -191,7 +210,16 @@ impl FaultDecodeConfig {
             }
         };
 
-        Ok(Self { target, elf, input, user_elf, brief, json, summary, color })
+        Ok(Self {
+            target,
+            elf,
+            input,
+            user_elf,
+            brief,
+            json,
+            summary,
+            color,
+        })
     }
 }
 
@@ -226,7 +254,6 @@ enum TrapKind {
     Interrupt,
 }
 
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ScauseInfo {
     raw: u64,
@@ -254,7 +281,11 @@ struct SstatusInfo {
 
 impl SstatusInfo {
     fn spp_label(&self) -> &'static str {
-        if self.spp { "S" } else { "U" }
+        if self.spp {
+            "S"
+        } else {
+            "U"
+        }
     }
 
     fn fs_label(&self) -> &'static str {
@@ -531,9 +562,18 @@ impl ElfImage {
 
         let mut symbols = Vec::new();
         for symbol in file.symbols() {
-            if !symbol.is_definition() || symbol.address() == 0 { continue; }
-            if !matches!(symbol.kind(), SymbolKind::Text | SymbolKind::Label | SymbolKind::Data | SymbolKind::Unknown) { continue; }
-            let Ok(name) = symbol.name() else { continue; };
+            if !symbol.is_definition() || symbol.address() == 0 {
+                continue;
+            }
+            if !matches!(
+                symbol.kind(),
+                SymbolKind::Text | SymbolKind::Label | SymbolKind::Data | SymbolKind::Unknown
+            ) {
+                continue;
+            }
+            let Ok(name) = symbol.name() else {
+                continue;
+            };
             symbols.push(SymbolInfo {
                 name: demangle_symbol(name),
                 address: symbol.address(),
@@ -692,12 +732,13 @@ impl ElfImage {
     }
 
     fn bytes_at(&self, addr: u64) -> Option<[u8; 4]> {
-        let section = self.sections.iter().find(|s| {
-            s.size >= 4 && s.address <= addr && addr + 4 <= s.address + s.size
-        })?;
+        let section = self
+            .sections
+            .iter()
+            .find(|s| s.size >= 4 && s.address <= addr && addr + 4 <= s.address + s.size)?;
         let data = section.data.as_deref()?;
         let offset = (addr - section.address) as usize;
-        Some(data.get(offset..offset + 4)?.try_into().ok()?)
+        data.get(offset..offset + 4)?.try_into().ok()
     }
 
     fn trace_data_candidates(
@@ -791,8 +832,12 @@ fn collect_params<R: gimli::Reader>(
 ) -> Vec<FormalParam> {
     let mut iter = dwarf.units();
     while let Ok(Some(header)) = iter.next() {
-        let Ok(unit) = dwarf.unit(header) else { continue };
-        let Ok(mut tree) = unit.entries_tree(None) else { continue };
+        let Ok(unit) = dwarf.unit(header) else {
+            continue;
+        };
+        let Ok(mut tree) = unit.entries_tree(None) else {
+            continue;
+        };
         let Ok(root) = tree.root() else { continue };
         if let Some(params) = find_params_in_node(dwarf, &unit, root, addr, regs) {
             return params;
@@ -875,7 +920,13 @@ fn extract_formal_param<R: gimli::Reader>(
             _ => None,
         };
         let type_name = extract_type_name(dwarf, unit, entry);
-        return Some(FormalParam { name, value, register: None, is_indirect: false, type_name });
+        return Some(FormalParam {
+            name,
+            value,
+            register: None,
+            is_indirect: false,
+            type_name,
+        });
     }
 
     let type_name = extract_type_name(dwarf, unit, entry);
@@ -896,11 +947,25 @@ fn extract_formal_param<R: gimli::Reader>(
             }
             found?
         }
-        _ => return Some(FormalParam { name, value: None, register: None, is_indirect: false, type_name }),
+        _ => {
+            return Some(FormalParam {
+                name,
+                value: None,
+                register: None,
+                is_indirect: false,
+                type_name,
+            })
+        }
     };
 
     let (value, register, is_indirect) = eval_location_expr(expr, unit.encoding(), regs);
-    Some(FormalParam { name, value, register, is_indirect, type_name })
+    Some(FormalParam {
+        name,
+        value,
+        register,
+        is_indirect,
+        type_name,
+    })
 }
 
 fn eval_location_expr<R: gimli::Reader>(
@@ -1153,12 +1218,24 @@ fn scan_stack_code_pointers(
             continue;
         }
         let candidates = address_candidates(word, image.layout, spec);
-        if !candidates.iter().any(|c| text_ranges.iter().any(|r| r.contains(&c.address))) {
+        if !candidates
+            .iter()
+            .any(|c| text_ranges.iter().any(|r| r.contains(&c.address)))
+        {
             continue;
         }
-        let resolved = image.select_candidate(&candidates).map(|c| c.address).unwrap_or(word);
+        let resolved = image
+            .select_candidate(&candidates)
+            .map(|c| c.address)
+            .unwrap_or(word);
         let sym = nearest_symbol(&image.symbols, resolved)
-            .map(|(name, off)| if off == 0 { name } else { format!("{name}+{off:#x}") })
+            .map(|(name, off)| {
+                if off == 0 {
+                    name
+                } else {
+                    format!("{name}+{off:#x}")
+                }
+            })
             .unwrap_or_else(|| format_hex(resolved));
         out.push((stack_addr, word, sym));
     }
@@ -1240,12 +1317,12 @@ fn decode_scause(raw: u64) -> ScauseInfo {
 fn decode_sstatus(raw: u64) -> SstatusInfo {
     SstatusInfo {
         raw,
-        spp:  raw & (1 << 8)  != 0,
-        sie:  raw & (1 << 1)  != 0,
-        spie: raw & (1 << 5)  != 0,
-        sum:  raw & (1 << 18) != 0,
-        mxr:  raw & (1 << 19) != 0,
-        fs:   ((raw >> 13) & 3) as u8,
+        spp: raw & (1 << 8) != 0,
+        sie: raw & (1 << 1) != 0,
+        spie: raw & (1 << 5) != 0,
+        sum: raw & (1 << 18) != 0,
+        mxr: raw & (1 << 19) != 0,
+        fs: ((raw >> 13) & 3) as u8,
     }
 }
 
@@ -1480,7 +1557,13 @@ fn demangle_symbol(name: &str) -> String {
         .unwrap_or_else(|_| name.to_string())
 }
 
-fn print_trap_block(index: usize, trap: &TrapRecord, image: &ElfImage, user_image: Option<&ElfImage>, spec: &TargetSpec) {
+fn print_trap_block(
+    index: usize,
+    trap: &TrapRecord,
+    image: &ElfImage,
+    user_image: Option<&ElfImage>,
+    spec: &TargetSpec,
+) {
     let scause = decode_scause(trap.scause);
     let mode_suffix = trap
         .frame
@@ -1490,7 +1573,15 @@ fn print_trap_block(index: usize, trap: &TrapRecord, image: &ElfImage, user_imag
 
     println!("trap #{index}");
     println!();
-    println!("fault: {}{}{}{}  ({}{})", col(ANSI_RED), col(ANSI_BOLD), scause.name, col_reset(), format_hex(scause.raw), mode_suffix);
+    println!(
+        "fault: {}{}{}{}  ({}{})",
+        col(ANSI_RED),
+        col(ANSI_BOLD),
+        scause.name,
+        col_reset(),
+        format_hex(scause.raw),
+        mode_suffix
+    );
     println!();
 
     println!("call stack:");
@@ -1530,7 +1621,11 @@ fn print_trap_block(index: usize, trap: &TrapRecord, image: &ElfImage, user_imag
         if !code_ptrs.is_empty() {
             println!("stack code pointers (heuristic):");
             for (stack_addr, word, sym) in &code_ptrs {
-                println!("  {}  →  {sym}  [sp+{:#x}]", format_hex(*word), stack_addr.wrapping_sub(trap.stack_dump[0].0));
+                println!(
+                    "  {}  →  {sym}  [sp+{:#x}]",
+                    format_hex(*word),
+                    stack_addr.wrapping_sub(trap.stack_dump[0].0)
+                );
             }
             println!();
         }
@@ -1642,7 +1737,10 @@ fn print_stack_frame(
                 .as_deref()
                 .map(|t| format!("{t} "))
                 .unwrap_or_default();
-            println!("            {}{}: {}{}{}", type_prefix, param.name, val_str, reg_label, ann);
+            println!(
+                "            {}{}: {}{}{}",
+                type_prefix, param.name, val_str, reg_label, ann
+            );
         }
         if let Some((stval, _)) = fault_info {
             for (i, &val) in regs.iter().enumerate() {
@@ -1686,7 +1784,12 @@ fn reg_annotation(value: u64, image: &ElfImage, spec: &TargetSpec) -> Option<Str
     None
 }
 
-fn print_trapframe_dump(frame: &TrapFrameDump, image: &ElfImage, user_image: Option<&ElfImage>, spec: &TargetSpec) {
+fn print_trapframe_dump(
+    frame: &TrapFrameDump,
+    image: &ElfImage,
+    user_image: Option<&ElfImage>,
+    spec: &TargetSpec,
+) {
     println!("trapframe:");
     for (index, value) in frame.x.iter().enumerate() {
         let note = reg_annotation(*value, image, spec)
@@ -1697,8 +1800,11 @@ fn print_trapframe_dump(frame: &TrapFrameDump, image: &ElfImage, user_image: Opt
                 .and_then(|u| nearest_symbol(&u.symbols, *value))
                 .filter(|_| *value < RV64_USER_TOP && *value != 0)
                 .map(|(name, off)| {
-                    if off == 0 { format!("  → user::{name}") }
-                    else { format!("  → user::{name}+{off:#x}") }
+                    if off == 0 {
+                        format!("  → user::{name}")
+                    } else {
+                        format!("  → user::{name}+{off:#x}")
+                    }
                 })
                 .unwrap_or_default()
         } else {
@@ -1706,19 +1812,41 @@ fn print_trapframe_dump(frame: &TrapFrameDump, image: &ElfImage, user_image: Opt
         };
         println!(
             "  x{index:02} ({}{:>4}{}): {}{}{}{}",
-            col(ANSI_GREEN), RV64_REG_NAMES[index], col_reset(),
-            col(ANSI_CYAN), format_hex(*value), col_reset(),
+            col(ANSI_GREEN),
+            RV64_REG_NAMES[index],
+            col_reset(),
+            col(ANSI_CYAN),
+            format_hex(*value),
+            col_reset(),
             note
         );
     }
     let scause = decode_scause(frame.scause);
-    println!("  scause:  {}{}{}  ({})", col(ANSI_CYAN), format_hex(scause.raw), col_reset(), scause.name);
-    println!("  sepc:    {}{}{}", col(ANSI_CYAN), format_hex(frame.sepc), col_reset());
-    println!("  stval:   {}{}{}", col(ANSI_CYAN), format_hex(frame.stval), col_reset());
+    println!(
+        "  scause:  {}{}{}  ({})",
+        col(ANSI_CYAN),
+        format_hex(scause.raw),
+        col_reset(),
+        scause.name
+    );
+    println!(
+        "  sepc:    {}{}{}",
+        col(ANSI_CYAN),
+        format_hex(frame.sepc),
+        col_reset()
+    );
+    println!(
+        "  stval:   {}{}{}",
+        col(ANSI_CYAN),
+        format_hex(frame.stval),
+        col_reset()
+    );
     let ss = decode_sstatus(frame.sstatus);
     println!(
         "  sstatus: {}{}{}  spp={} spie={} sie={} fs={} sum={} mxr={}",
-        col(ANSI_CYAN), format_hex(ss.raw), col_reset(),
+        col(ANSI_CYAN),
+        format_hex(ss.raw),
+        col_reset(),
         ss.spp_label(),
         ss.spie as u8,
         ss.sie as u8,
@@ -1728,7 +1856,13 @@ fn print_trapframe_dump(frame: &TrapFrameDump, image: &ElfImage, user_image: Opt
     );
 }
 
-fn print_address_block(label: &str, addr: u64, image: &ElfImage, user_image: Option<&ElfImage>, spec: &TargetSpec) {
+fn print_address_block(
+    label: &str,
+    addr: u64,
+    image: &ElfImage,
+    user_image: Option<&ElfImage>,
+    spec: &TargetSpec,
+) {
     println!("{label}:");
     print_address_details(addr, image, spec, None);
     if let Some(u) = user_image {
@@ -1862,19 +1996,31 @@ fn decode_rv64_insn(b: [u8; 4]) -> String {
             (0, 1) => "c.fld".to_string(),
             (0, 2) => {
                 let imm = ((w >> 10) & 7) << 3 | ((w >> 6) & 1) << 7 | ((w >> 5) & 1) << 2;
-                format!("c.lw {}, {imm}({})", RV64_REG_NAMES[rdc], RV64_REG_NAMES[rs1c])
+                format!(
+                    "c.lw {}, {imm}({})",
+                    RV64_REG_NAMES[rdc], RV64_REG_NAMES[rs1c]
+                )
             }
             (0, 3) => {
                 let imm = ((w >> 10) & 7) << 3 | ((w >> 5) & 3) << 6;
-                format!("c.ld {}, {imm}({})", RV64_REG_NAMES[rdc], RV64_REG_NAMES[rs1c])
+                format!(
+                    "c.ld {}, {imm}({})",
+                    RV64_REG_NAMES[rdc], RV64_REG_NAMES[rs1c]
+                )
             }
             (0, 6) => {
                 let imm = ((w >> 10) & 7) << 3 | ((w >> 6) & 1) << 7 | ((w >> 5) & 1) << 2;
-                format!("c.sw {}, {imm}({})", RV64_REG_NAMES[rs2c], RV64_REG_NAMES[rs1c])
+                format!(
+                    "c.sw {}, {imm}({})",
+                    RV64_REG_NAMES[rs2c], RV64_REG_NAMES[rs1c]
+                )
             }
             (0, 7) => {
                 let imm = ((w >> 10) & 7) << 3 | ((w >> 5) & 3) << 6;
-                format!("c.sd {}, {imm}({})", RV64_REG_NAMES[rs2c], RV64_REG_NAMES[rs1c])
+                format!(
+                    "c.sd {}, {imm}({})",
+                    RV64_REG_NAMES[rs2c], RV64_REG_NAMES[rs1c]
+                )
             }
             // Quadrant 1
             (1, 0) => {
@@ -1932,11 +2078,26 @@ fn decode_rv64_insn(b: [u8; 4]) -> String {
                     3 => {
                         let sub_op = (w >> 5) & 3;
                         if bit12 == 0 {
-                            let nm = match sub_op { 0=>"c.sub", 1=>"c.xor", 2=>"c.or", _=>"c.and" };
-                            format!("{nm} {}, {}", RV64_REG_NAMES[rs1c_arith], RV64_REG_NAMES[rs2c_arith])
+                            let nm = match sub_op {
+                                0 => "c.sub",
+                                1 => "c.xor",
+                                2 => "c.or",
+                                _ => "c.and",
+                            };
+                            format!(
+                                "{nm} {}, {}",
+                                RV64_REG_NAMES[rs1c_arith], RV64_REG_NAMES[rs2c_arith]
+                            )
                         } else {
-                            let nm = match sub_op { 0=>"c.subw", 1=>"c.addw", _=>"c.arith?" };
-                            format!("{nm} {}, {}", RV64_REG_NAMES[rs1c_arith], RV64_REG_NAMES[rs2c_arith])
+                            let nm = match sub_op {
+                                0 => "c.subw",
+                                1 => "c.addw",
+                                _ => "c.arith?",
+                            };
+                            format!(
+                                "{nm} {}, {}",
+                                RV64_REG_NAMES[rs1c_arith], RV64_REG_NAMES[rs2c_arith]
+                            )
                         }
                     }
                     _ => format!("compressed (op={op} f3={f3} bits={w:#018b})"),
@@ -1997,23 +2158,55 @@ fn decode_rv64_insn(b: [u8; 4]) -> String {
     match opcode {
         0b00000 => {
             let imm = (w as i32) >> 20;
-            let sz = match f3 { 0=>"lb",1=>"lh",2=>"lw",3=>"ld",4=>"lbu",5=>"lhu",6=>"lwu",_=>"l?" };
-            format!("{sz} {}, {imm}({})", RV64_REG_NAMES[rd], RV64_REG_NAMES[rs1])
+            let sz = match f3 {
+                0 => "lb",
+                1 => "lh",
+                2 => "lw",
+                3 => "ld",
+                4 => "lbu",
+                5 => "lhu",
+                6 => "lwu",
+                _ => "l?",
+            };
+            format!(
+                "{sz} {}, {imm}({})",
+                RV64_REG_NAMES[rd], RV64_REG_NAMES[rs1]
+            )
         }
         0b01000 => {
             let imm_lo = (w >> 7) & 0x1f;
             let imm_hi = (w >> 25) & 0x7f;
             let imm = (((imm_hi << 5) | imm_lo) as i32) << 20 >> 20;
-            let sz = match f3 { 0=>"sb",1=>"sh",2=>"sw",3=>"sd",_=>"s?" };
-            format!("{sz} {}, {imm}({})", RV64_REG_NAMES[rs2], RV64_REG_NAMES[rs1])
+            let sz = match f3 {
+                0 => "sb",
+                1 => "sh",
+                2 => "sw",
+                3 => "sd",
+                _ => "s?",
+            };
+            format!(
+                "{sz} {}, {imm}({})",
+                RV64_REG_NAMES[rs2], RV64_REG_NAMES[rs1]
+            )
         }
         0b11000 => {
-            let nm = match f3 { 0=>"beq",1=>"bne",4=>"blt",5=>"bge",6=>"bltu",7=>"bgeu",_=>"b?" };
+            let nm = match f3 {
+                0 => "beq",
+                1 => "bne",
+                4 => "blt",
+                5 => "bge",
+                6 => "bltu",
+                7 => "bgeu",
+                _ => "b?",
+            };
             format!("{nm} {}, {}", RV64_REG_NAMES[rs1], RV64_REG_NAMES[rs2])
         }
         0b11001 => {
             let imm = (w as i32) >> 20;
-            format!("jalr {}, {imm}({})", RV64_REG_NAMES[rd], RV64_REG_NAMES[rs1])
+            format!(
+                "jalr {}, {imm}({})",
+                RV64_REG_NAMES[rd], RV64_REG_NAMES[rs1]
+            )
         }
         0b11011 => format!("jal {}", RV64_REG_NAMES[rd]),
         0b11100 => match w >> 20 {
@@ -2022,7 +2215,10 @@ fn decode_rv64_insn(b: [u8; 4]) -> String {
             v => format!("system ({v:#x})"),
         },
         0b00100 => format!("op-imm {}, {}", RV64_REG_NAMES[rd], RV64_REG_NAMES[rs1]),
-        0b01100 => format!("op {}, {}, {}", RV64_REG_NAMES[rd], RV64_REG_NAMES[rs1], RV64_REG_NAMES[rs2]),
+        0b01100 => format!(
+            "op {}, {}, {}",
+            RV64_REG_NAMES[rd], RV64_REG_NAMES[rs1], RV64_REG_NAMES[rs2]
+        ),
         0b01101 => format!("lui {}", RV64_REG_NAMES[rd]),
         0b00101 => format!("auipc {}", RV64_REG_NAMES[rd]),
         0b00011 => "fence".to_string(),
@@ -2041,12 +2237,12 @@ fn decode_illegal_insn_stval(scause: &ScauseInfo, stval: u64) -> Option<String> 
 
 fn print_trap_summary_table(traps: &[TrapRecord], image: &ElfImage, spec: &TargetSpec) {
     println!(
-        "  {:>3}  {:<32}  {:<30}  {:<18}  {}",
-        "#", "cause", "sepc→symbol", "stval", "flags"
+        "  {:>3}  {:<32}  {:<30}  {:<18}  flags",
+        "#", "cause", "sepc→symbol", "stval"
     );
     println!(
-        "  {:>3}  {:<32}  {:<30}  {:<18}  {}",
-        "─", "─────", "───────────", "─────", "─────"
+        "  {:>3}  {:<32}  {:<30}  {:<18}  ─────",
+        "─", "─────", "───────────", "─────"
     );
 
     for (i, trap) in traps.iter().enumerate() {
@@ -2104,7 +2300,7 @@ fn print_trap_summary_table(traps: &[TrapRecord], image: &ElfImage, spec: &Targe
             counts.push((trap.scause, scause.name, 1));
         }
     }
-    counts.sort_by(|a, b| b.2.cmp(&a.2));
+    counts.sort_by_key(|t| core::cmp::Reverse(t.2));
 
     println!("scause histogram:");
     for (_, name, count) in &counts {
@@ -2119,10 +2315,18 @@ fn format_hex(value: u64) -> String {
 fn print_brief_trap(index: usize, trap: &TrapRecord, image: &ElfImage, spec: &TargetSpec) {
     let scause = decode_scause(trap.scause);
     let sepc_analysis = image.analyze_address(trap.sepc, spec);
-    let resolved = sepc_analysis.selected.as_ref().map(|c| c.address).unwrap_or(trap.sepc);
+    let resolved = sepc_analysis
+        .selected
+        .as_ref()
+        .map(|c| c.address)
+        .unwrap_or(trap.sepc);
     let sym = nearest_symbol(&image.symbols, resolved)
         .map(|(name, off)| {
-            if off == 0 { name } else { format!("{name}+{off:#x}") }
+            if off == 0 {
+                name
+            } else {
+                format!("{name}+{off:#x}")
+            }
         })
         .unwrap_or_else(|| format_hex(trap.sepc));
 
@@ -2157,7 +2361,11 @@ fn build_json_trap(
 
     let scause = decode_scause(trap.scause);
     let sepc_analysis = image.analyze_address(trap.sepc, spec);
-    let resolved = sepc_analysis.selected.as_ref().map(|c| c.address).unwrap_or(trap.sepc);
+    let resolved = sepc_analysis
+        .selected
+        .as_ref()
+        .map(|c| c.address)
+        .unwrap_or(trap.sepc);
 
     let frames: Vec<Value> = {
         let dwarf_frames = image.frames_for(resolved);
@@ -2742,17 +2950,37 @@ trapframe:
     #[test]
     fn nearest_symbol_skips_local_dot_labels() {
         let symbols = vec![
-            SymbolInfo { name: ".L0".into(), address: 0x2010, size: 0 },
-            SymbolInfo { name: "real_fn".into(), address: 0x2000, size: 0x40 },
+            SymbolInfo {
+                name: ".L0".into(),
+                address: 0x2010,
+                size: 0,
+            },
+            SymbolInfo {
+                name: "real_fn".into(),
+                address: 0x2000,
+                size: 0x40,
+            },
         ];
-        assert_eq!(nearest_symbol(&symbols, 0x2016), Some(("real_fn".into(), 0x16)));
+        assert_eq!(
+            nearest_symbol(&symbols, 0x2016),
+            Some(("real_fn".into(), 0x16))
+        );
     }
 
     #[test]
     fn null_deref_stval_annotation() {
-        assert_eq!(null_deref_note(0x48), Some("likely null pointer dereference"));
-        assert_eq!(null_deref_note(0x0), Some("likely null pointer dereference"));
-        assert_eq!(null_deref_note(0xfff), Some("likely null pointer dereference"));
+        assert_eq!(
+            null_deref_note(0x48),
+            Some("likely null pointer dereference")
+        );
+        assert_eq!(
+            null_deref_note(0x0),
+            Some("likely null pointer dereference")
+        );
+        assert_eq!(
+            null_deref_note(0xfff),
+            Some("likely null pointer dereference")
+        );
         assert_eq!(null_deref_note(0x1000), None);
         assert_eq!(null_deref_note(0x8000_0000), None);
     }
@@ -2764,12 +2992,16 @@ panicked at 'index out of bounds: len=3 idx=5', kernel/src/foo.rs:42:8\n\
 scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
         let traps = parse_traps(serial_close);
         assert_eq!(traps.len(), 1);
-        assert!(traps[0].panic_msg.as_deref().unwrap().contains("index out of bounds"));
+        assert!(traps[0]
+            .panic_msg
+            .as_deref()
+            .unwrap()
+            .contains("index out of bounds"));
 
-        let mut serial_far = String::from(
-            "panicked at 'something', kernel/src/bar.rs:10:1\n",
-        );
-        for i in 0..31 { serial_far.push_str(&format!("log line {i}\n")); }
+        let mut serial_far = String::from("panicked at 'something', kernel/src/bar.rs:10:1\n");
+        for i in 0..31 {
+            serial_far.push_str(&format!("log line {i}\n"));
+        }
         serial_far.push_str("scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n");
         let traps_far = parse_traps(&serial_far);
         assert_eq!(traps_far.len(), 1);
@@ -2794,6 +3026,8 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
     #[test]
     fn decode_rv64_insn_compressed() {
         // C.LD: op=0b00 f3=0b011 (low 2 bits=0b00, bits[15:13]=0b011)
+        #[allow(clippy::unusual_byte_groupings)]
+        // groups reflect RISC-V instruction field boundaries
         let cld_word: u32 = 0b011_00000_000_000_00;
         let cld = decode_rv64_insn(cld_word.to_le_bytes());
         assert!(cld.contains("c.ld"), "got '{cld}'");
@@ -2851,8 +3085,8 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
         // null-deref stval should be UserAddress class
         let class = classify_runtime_address(0x48, &spec);
         assert!(matches!(class, RuntimeClass::UserAddress));
-        // stval in null range
-        assert!(0x48u64 < 0x1000);
+        // stval 0x48 is in the null range (< 0x1000) — documents the
+        // classification expectation but is a const fact, so no assert.
         // scause 13 == load page fault
         assert_eq!(decode_scause(13).name, "load page fault");
     }
@@ -2901,6 +3135,8 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
     fn decode_rv64_insn_compressed_c_addi() {
         // C.ADDI: op=1, f3=0, rd=a0(10), nz_imm=1
         // 0b000_01010_00001_01 = op=1, rd=10, bit12=0, bits[6:2]=1
+        #[allow(clippy::unusual_byte_groupings)]
+        // groups reflect RISC-V instruction field boundaries
         let word = 0b000_01010_00001_01u32;
         let result = decode_rv64_insn(word.to_le_bytes());
         assert!(result.contains("c.addi"), "got '{result}'");
@@ -2911,6 +3147,8 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
     fn decode_rv64_insn_compressed_c_beqz() {
         // C.BEQZ: op=1, f3=6, rs1'=0 (=x8), offset=0
         // 0b110_000_000_00000_01
+        #[allow(clippy::unusual_byte_groupings)]
+        // groups reflect RISC-V instruction field boundaries
         let word = 0b110_000_000_00000_01u32;
         let result = decode_rv64_insn(word.to_le_bytes());
         assert!(result.contains("c.beqz"), "got '{result}'");
@@ -2991,8 +3229,14 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
         }
         let count_13 = counts.iter().find(|e| e.0 == 13).map(|e| e.1).unwrap_or(0);
         let count_15 = counts.iter().find(|e| e.0 == 15).map(|e| e.1).unwrap_or(0);
-        assert_eq!(count_13, 2, "expected 2 entries for scause=13 (load page fault)");
-        assert_eq!(count_15, 1, "expected 1 entry for scause=15 (store/AMO page fault)");
+        assert_eq!(
+            count_13, 2,
+            "expected 2 entries for scause=13 (load page fault)"
+        );
+        assert_eq!(
+            count_15, 1,
+            "expected 1 entry for scause=15 (store/AMO page fault)"
+        );
     }
 
     #[test]
@@ -3040,7 +3284,7 @@ scause=0x000000000000000d sepc=0xffffffff80201234 stval=0x0\n";
             "  0xffffffff80218f90: 0x0000000000000003 0x0000000000000000 0x0000000000000000 0x0000000000000000",
             "not-indented",
         ];
-        let line_refs: Vec<&str> = lines.iter().copied().collect();
+        let line_refs: Vec<&str> = lines.to_vec();
         let (dump, consumed) = parse_stack_dump_block(&line_refs);
         assert_eq!(consumed, 3); // header + 2 data lines
         assert_eq!(dump.len(), 8);

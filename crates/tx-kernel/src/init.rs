@@ -3,6 +3,10 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::adapter::boot_runtime;
+use crate::adapter::step_engine::{
+    self as step_engine, init, init_on_ap, ByteProgress, Cap, SpinMutex, StepOutcome,
+};
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
@@ -12,8 +16,6 @@ use tx_subsystems::mount::{
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
 use tx_subsystems::tty::structure::TtyIdentity;
 use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNodeBacking};
-use crate::adapter::step_engine::{self as step_engine, init, init_on_ap, ByteProgress, Cap, SpinMutex, StepOutcome};
-use crate::adapter::boot_runtime;
 
 // Boot-smoke busy-wait budget for AP reactor task completion. 100k was
 // fine on bare metal and Apple-silicon TCG, but GitHub Actions runs
@@ -120,19 +122,11 @@ impl<P: TxPlatform> ConsoleCharOps<P> {
 // compiler treats as thread-safe. The impl therefore only needs the
 // `TxPlatform + 'static` bounds the binding actually consumes.
 impl<P: TxPlatform> CharDeviceOps for ConsoleCharOps<P> {
-    fn read(
-        &self,
-        _out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(0)
     }
 
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         // The HAL exposes byte-oriented console writes; tx-kernel's
         // existing init code uses `console_write_str` which calls
         // `P::write_bytes` under the hood. We bypass the str

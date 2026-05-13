@@ -2,11 +2,11 @@
 
 use core::sync::atomic::Ordering;
 
+#[cfg(test)]
+use crate::tty::adapter::step_engine::ByteProgress;
 use crate::tty::adapter::step_engine::{
     self as step_engine, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Weak,
 };
-#[cfg(test)]
-use crate::tty::adapter::step_engine::ByteProgress;
 
 use crate::execution::{Errno, Guard};
 use crate::signal::{self, DispatchOutcome, SigDisposition, Signum};
@@ -115,10 +115,7 @@ impl IoctlCaller {
     /// `Cap<ProcessIdentity>`. Lets dispatched signals route through
     /// `signal::script_kill_pgrp` against a real pgrp instead of
     /// resolving from the raw `pgrp_id` later.
-    pub fn with_pgrp_weak(
-        mut self,
-        pgrp: Weak<crate::process::structure::ProcessGroup>,
-    ) -> Self {
+    pub fn with_pgrp_weak(mut self, pgrp: Weak<crate::process::structure::ProcessGroup>) -> Self {
         self.pgrp = Some(pgrp);
         self
     }
@@ -232,9 +229,7 @@ impl SignalTarget {
 
     /// Borrow the optional typed pgrp Weak (consumed by
     /// `signal::deliver_tty_dispatch` for upgrade-and-route).
-    pub fn pgrp_weak(
-        &self,
-    ) -> Option<&Weak<crate::process::structure::ProcessGroup>> {
+    pub fn pgrp_weak(&self) -> Option<&Weak<crate::process::structure::ProcessGroup>> {
         match self {
             SignalTarget::ForegroundProcessGroup { pgrp, .. }
             | SignalTarget::SessionLeaderProcessGroup { pgrp, .. }
@@ -626,15 +621,10 @@ pub struct IoctlTiocscttyOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for IoctlTiocscttyOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocscttyOp<'a> {
     type Output = IoctlSideEffect;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocsctty(self.tty, self.caller, self.guard)
     }
 }
@@ -647,15 +637,10 @@ pub struct IoctlTiocscttyForProcessOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for IoctlTiocscttyForProcessOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocscttyForProcessOp<'a> {
     type Output = IoctlSideEffect;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocsctty_for_process(self.tty, self.caller, self.guard)
     }
 }
@@ -668,15 +653,10 @@ pub struct IoctlTiocnottyOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for IoctlTiocnottyOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocnottyOp<'a> {
     type Output = IoctlSideEffect;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocnotty(self.tty, self.caller, self.guard)
     }
 }
@@ -689,15 +669,10 @@ pub struct IoctlTiocnottyForProcessOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for IoctlTiocnottyForProcessOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocnottyForProcessOp<'a> {
     type Output = IoctlSideEffect;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocnotty_for_process(self.tty, self.caller, self.guard)
     }
 }
@@ -711,15 +686,10 @@ pub struct IoctlTiocspgrpOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for IoctlTiocspgrpOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocspgrpOp<'a> {
     type Output = IoctlSideEffect;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocspgrp(self.tty, self.caller, self.new_pgrp, self.guard)
     }
 }
@@ -733,15 +703,10 @@ pub struct IoctlTiocspgrpForProcessOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for IoctlTiocspgrpForProcessOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocspgrpForProcessOp<'a> {
     type Output = IoctlSideEffect;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocspgrp_for_process(self.tty, self.caller, self.new_pgrp, self.guard)
     }
 }
@@ -753,15 +718,10 @@ pub struct IoctlTiocgpgrpOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for IoctlTiocgpgrpOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocgpgrpOp<'a> {
     type Output = u32;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocgpgrp(self.tty, self.guard)
     }
 }
@@ -773,15 +733,10 @@ pub struct IoctlTiocgwinszOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for IoctlTiocgwinszOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocgwinszOp<'a> {
     type Output = Winsize;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocgwinsz(self.tty, self.guard)
     }
 }
@@ -794,15 +749,10 @@ pub struct IoctlTiocswinszOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for IoctlTiocswinszOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocswinszOp<'a> {
     type Output = IoctlSideEffect;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tiocswinsz(self.tty, self.winsize, self.guard)
     }
 }
@@ -814,15 +764,10 @@ pub struct IoctlTcgetsOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for IoctlTcgetsOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTcgetsOp<'a> {
     type Output = Termios;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tcgets(self.tty, self.guard)
     }
 }
@@ -835,15 +780,10 @@ pub struct IoctlTcsetsOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for IoctlTcsetsOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTcsetsOp<'a> {
     type Output = IoctlSideEffect;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_ioctl_tcsets(self.tty, self.new_termios, self.guard)
     }
 }
@@ -863,21 +803,11 @@ mod step_op_wraps {
     struct NoopOps;
 
     impl CharDeviceOps for NoopOps {
-        fn read(
-            &self,
-            _out: &mut [u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(0)
         }
 
-        fn write(
-            &self,
-            bytes: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(bytes.len())
         }
     }

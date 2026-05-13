@@ -11,20 +11,16 @@ use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
 use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::{Termios, TtyIdentity, TtyKind, TtyPayload, Winsize};
-use crate::vm::{AddressSpace, TestPmap};
-use crate::zones;
 use crate::vfs::adapter::step_engine::{
     guard, reserve_for, sign_for, ByteProgress, Cap, Errno, PayloadCap, StepOutcome,
 };
+use crate::vm::{AddressSpace, TestPmap};
+use crate::zones;
 
 struct EchoCharOps;
 
 impl CharDeviceOps for EchoCharOps {
-    fn read(
-        &self,
-        out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         if out.is_empty() {
             return StepOutcome::Done(0);
         }
@@ -32,11 +28,7 @@ impl CharDeviceOps for EchoCharOps {
         StepOutcome::Done(1)
     }
 
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(bytes.len())
     }
 }
@@ -274,11 +266,7 @@ fn open_file_step_ioctl_dispatches_basic_tty_requests() {
 
     let raw = Termios::zeroed();
     assert_eq!(
-        tty_file.step_ioctl(
-            caller,
-            OpenFileIoctl::Tcsets { termios: raw },
-            &guard()
-        ),
+        tty_file.step_ioctl(caller, OpenFileIoctl::Tcsets { termios: raw }, &guard()),
         StepOutcome::Done(OpenFileIoctlResult::SideEffect(Default::default()))
     );
     assert_eq!(
@@ -288,22 +276,14 @@ fn open_file_step_ioctl_dispatches_basic_tty_requests() {
 
     let winsize = Winsize::new(40, 100);
     assert_eq!(
-        tty_file.step_ioctl(
-            caller,
-            OpenFileIoctl::Tiocswinsz { winsize },
-            &guard()
-        ),
+        tty_file.step_ioctl(caller, OpenFileIoctl::Tiocswinsz { winsize }, &guard()),
         StepOutcome::Done(OpenFileIoctlResult::SideEffect(IoctlSideEffect {
             session_ctl_fired: true,
             signal: None,
         }))
     );
     assert_eq!(
-        tty_file.step_ioctl(
-            caller,
-            OpenFileIoctl::Tiocgwinsz,
-            &guard()
-        ),
+        tty_file.step_ioctl(caller, OpenFileIoctl::Tiocgwinsz, &guard()),
         StepOutcome::Done(OpenFileIoctlResult::Winsize(winsize))
     );
 }
@@ -340,22 +320,14 @@ fn open_file_step_ioctl_dispatches_process_aware_tty_session_ops() {
     let init_caller = OpenFileIoctlCaller::from_process(&init);
 
     assert_eq!(
-        tty_file.step_ioctl(
-            init_caller,
-            OpenFileIoctl::Tiocsctty,
-            &guard()
-        ),
+        tty_file.step_ioctl(init_caller, OpenFileIoctl::Tiocsctty, &guard()),
         StepOutcome::Done(OpenFileIoctlResult::SideEffect(IoctlSideEffect {
             session_ctl_fired: true,
             signal: None,
         }))
     );
     assert_eq!(
-        tty_file.step_ioctl(
-            init_caller,
-            OpenFileIoctl::Tiocgpgrp,
-            &guard()
-        ),
+        tty_file.step_ioctl(init_caller, OpenFileIoctl::Tiocgpgrp, &guard()),
         StepOutcome::Done(OpenFileIoctlResult::Pgrp(init.pgrp_cap().pgid.0))
     );
     assert!(init.pgrp_cap().session_cap().has_controlling_tty());
@@ -376,20 +348,12 @@ fn open_file_step_ioctl_dispatches_process_aware_tty_session_ops() {
         }))
     );
     assert_eq!(
-        tty_file.step_ioctl(
-            init_caller,
-            OpenFileIoctl::Tiocgpgrp,
-            &guard()
-        ),
+        tty_file.step_ioctl(init_caller, OpenFileIoctl::Tiocgpgrp, &guard()),
         StepOutcome::Done(OpenFileIoctlResult::Pgrp(peer_pgrp.pgid.0))
     );
 
     assert_eq!(
-        tty_file.step_ioctl(
-            init_caller,
-            OpenFileIoctl::Tiocnotty,
-            &guard()
-        ),
+        tty_file.step_ioctl(init_caller, OpenFileIoctl::Tiocnotty, &guard()),
         StepOutcome::Done(OpenFileIoctlResult::SideEffect(IoctlSideEffect {
             session_ctl_fired: true,
             signal: None,

@@ -452,8 +452,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         }
         match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
             StepOutcome::Done(()) => {}
-            StepOutcome::Continue { .. }
-            | StepOutcome::Yield { .. } => {
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
                 return Err(ExecError::Busy);
             }
             StepOutcome::Err(err) => {
@@ -525,8 +524,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     .await
     {
         StepOutcome::Done(()) => {}
-        StepOutcome::Continue { .. }
-        | StepOutcome::Yield { .. } => {
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
             return Err(ExecError::Busy);
         }
         StepOutcome::Err(err) => {

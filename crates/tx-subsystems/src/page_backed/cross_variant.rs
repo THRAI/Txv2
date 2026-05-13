@@ -1,5 +1,7 @@
 use super::*;
-use crate::page_backed::adapter::step_engine::{self as step_engine, ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+use crate::page_backed::adapter::step_engine::{
+    self as step_engine, ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 
 /// Copy up to `len` bytes from `in_pc` at `in_offset` into `out_pc` at
 /// `out_offset` page-by-page.
@@ -82,7 +84,7 @@ pub fn step_copy_file_range(
         //   byte progress (or `EMPTY` when `advanced == 0`).
         // - `Yield { OnAgent .. }` → unsupported, surface `EIO`/partial.
         // - `Err(errno)` → `Err(errno)` (no progress yet) or partial `Done`.
-use crate::page_backed::adapter::step_engine::YieldShape;
+        use crate::page_backed::adapter::step_engine::YieldShape;
         let in_materialized = match in_pc.materialize_page(in_page, MaterializeAccess::Read, guard)
         {
             StepOutcome::Done(m) => m,
@@ -234,15 +236,10 @@ pub struct CopyFileRangeOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for CopyFileRangeOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for CopyFileRangeOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_copy_file_range(
             self.in_pc,
             self.in_offset,

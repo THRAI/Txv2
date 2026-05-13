@@ -929,28 +929,28 @@ fn sign_process_payload(
     let exit_wait_source = wait_routing::new_wait_source(exit_source_id);
 
     let cap = step_engine::sign(ProcessPayload {
-            aspace: aspace_slot,
-            threads: SpinMutex::new(threads),
-            sig_actions: SigActionTable::new(),
-            group_pending: PendingSignalQueue::new(),
-            cred: cred_slot,
-            cwd: SpinMutex::new(cwd),
-            fds: SpinMutex::new(fds),
-            fd_cloexec: SpinMutex::new(fd_cloexec),
-            brk_base: core::sync::atomic::AtomicU64::new(brk_base),
-            current_brk: core::sync::atomic::AtomicU64::new(current_brk),
-            // Slice 6 of the shell-prompt roadmap. Per-process
-            // file-creation mask. `bootstrap_init_process` seeds with
-            // the Linux default `0o022` (owner keeps full perms,
-            // group/other lose write); `step_fork` propagates the
-            // parent's umask through this argument (umask is
-            // per-process, copied across fork). `step_exec` preserves
-            // the umask (umask survives `exec` per POSIX).
-            umask: core::sync::atomic::AtomicU16::new(umask & 0o777),
-            exit_source,
-            exit_source_id,
-            exit_wait_source,
-        })?;
+        aspace: aspace_slot,
+        threads: SpinMutex::new(threads),
+        sig_actions: SigActionTable::new(),
+        group_pending: PendingSignalQueue::new(),
+        cred: cred_slot,
+        cwd: SpinMutex::new(cwd),
+        fds: SpinMutex::new(fds),
+        fd_cloexec: SpinMutex::new(fd_cloexec),
+        brk_base: core::sync::atomic::AtomicU64::new(brk_base),
+        current_brk: core::sync::atomic::AtomicU64::new(current_brk),
+        // Slice 6 of the shell-prompt roadmap. Per-process
+        // file-creation mask. `bootstrap_init_process` seeds with
+        // the Linux default `0o022` (owner keeps full perms,
+        // group/other lose write); `step_fork` propagates the
+        // parent's umask through this argument (umask is
+        // per-process, copied across fork). `step_exec` preserves
+        // the umask (umask survives `exec` per POSIX).
+        umask: core::sync::atomic::AtomicU16::new(umask & 0o777),
+        exit_source,
+        exit_source_id,
+        exit_wait_source,
+    })?;
     Ok(PayloadCap::from_cap(cap))
 }
 
@@ -1041,15 +1041,10 @@ pub struct ForkOp<'a, P: PmapIf> {
     pub _pmap: core::marker::PhantomData<P>,
 }
 
-impl<'a, P: PmapIf, I: SubjectIdentity> StepOp<I>
-    for ForkOp<'a, P>
-{
+impl<'a, P: PmapIf, I: SubjectIdentity> StepOp<I> for ForkOp<'a, P> {
     type Output = Result<Cap<ProcessIdentity>, ForkError>;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_fork::<P>(self.parent))
     }
 }
@@ -1060,15 +1055,10 @@ pub struct ExitGroupOp<'a> {
     pub status: ExitStatus,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for ExitGroupOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for ExitGroupOp<'a> {
     type Output = ();
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_exit_group(self.process, self.status);
         StepOutcome::Done(())
     }
@@ -1080,15 +1070,10 @@ pub struct ExitGroupWithSignalOp<'a> {
     pub sig: crate::signal::Signum,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for ExitGroupWithSignalOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for ExitGroupWithSignalOp<'a> {
     type Output = ();
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_exit_group_with_signal(self.process, self.sig);
         StepOutcome::Done(())
     }
@@ -1102,15 +1087,10 @@ pub struct WaitpidNohangOp<'a> {
     pub target: WaitTarget,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for WaitpidNohangOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for WaitpidNohangOp<'a> {
     type Output = Result<(Pid, ExitStatus), WaitError>;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_waitpid_nohang(self.parent, self.target))
     }
 }
@@ -1121,15 +1101,10 @@ pub struct ChdirOp<'a> {
     pub new_cwd: Cap<crate::vfs::DEntry>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for ChdirOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for ChdirOp<'a> {
     type Output = ChdirOutcome;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_chdir(self.target, self.new_cwd.clone()))
     }
 }
@@ -1139,15 +1114,10 @@ pub struct GetcwdOp<'a> {
     pub target: &'a Cap<ProcessIdentity>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for GetcwdOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for GetcwdOp<'a> {
     type Output = Option<alloc::vec::Vec<u8>>;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_getcwd(self.target))
     }
 }
@@ -1158,15 +1128,10 @@ pub struct SetpgidOp<'a> {
     pub new_pgid: Pgid,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for SetpgidOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for SetpgidOp<'a> {
     type Output = Result<(), SetpgidError>;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setpgid(self.target, self.new_pgid))
     }
 }
@@ -1176,15 +1141,10 @@ pub struct SetsidOp<'a> {
     pub target: &'a Cap<ProcessIdentity>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for SetsidOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for SetsidOp<'a> {
     type Output = Result<Sid, SetsidError>;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         StepOutcome::Done(step_setsid(self.target))
     }
 }
@@ -1194,15 +1154,10 @@ pub struct CloseCloexecFdsOp<'a> {
     pub process: &'a Cap<ProcessIdentity>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for CloseCloexecFdsOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for CloseCloexecFdsOp<'a> {
     type Output = ();
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         super::exec_prep::step_close_cloexec_fds(self.process);
         StepOutcome::Done(())
     }
@@ -1213,15 +1168,10 @@ pub struct ResetSignalDispositionsForExecOp<'a> {
     pub process: &'a Cap<ProcessIdentity>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for ResetSignalDispositionsForExecOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for ResetSignalDispositionsForExecOp<'a> {
     type Output = ();
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         super::exec_prep::step_reset_signal_dispositions_for_exec(self.process);
         StepOutcome::Done(())
     }
@@ -1233,15 +1183,10 @@ pub struct InstallBrkForExecOp<'a> {
     pub new_brk_base: u64,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for InstallBrkForExecOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for InstallBrkForExecOp<'a> {
     type Output = ();
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         super::exec_prep::step_install_brk_for_exec(self.process, self.new_brk_base);
         StepOutcome::Done(())
     }
@@ -1258,15 +1203,15 @@ mod step_op_wraps {
     //! plus a smoke that the wrap delegates with the expected arg
     //! plumbing.
     use super::*;
+    use crate::process::adapter::step_engine::{
+        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
+    };
     use crate::process::structure::reset_pid_counter_for_test;
     use crate::signal::Signum;
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::thread_runtime::structure::reset_tid_counter_for_test;
     use crate::vm::{AddressSpace, TestPmap};
     use crate::zones;
-    use crate::process::adapter::step_engine::{
-        PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
-    };
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         tx_test_support::init_host();

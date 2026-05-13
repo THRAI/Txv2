@@ -169,8 +169,12 @@ fn drive_yield_on_agent_nonblocking_returns_eagain() {
 #[test]
 fn drive_continue_then_done_retries_loop() {
     let op = MockStepOp::new([
-        StepOutcome::Continue { progress: NoProgress },
-        StepOutcome::Continue { progress: NoProgress },
+        StepOutcome::Continue {
+            progress: NoProgress,
+        },
+        StepOutcome::Continue {
+            progress: NoProgress,
+        },
         StepOutcome::Done(99u32),
     ]);
     let mut ctx = empty_ctx();

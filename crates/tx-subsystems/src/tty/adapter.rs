@@ -29,8 +29,8 @@ pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
-        ByteProgress, Errno, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, StepProgress,
-        SubjectIdentity, WaitSourceId, YieldShape,
+        ByteProgress, Errno, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome,
+        StepProgress, SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
         register_zone_for, reserve_for, sign, sign_for, Cap, Dead, Entity, OperationalCapExt,
@@ -54,7 +54,9 @@ pub mod wait_routing {
     use alloc::sync::Arc;
 
     pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource};
+    pub use tx_substrate::wake::{
+        MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
+    };
 
     /// Delegates to `tx_substrate::wake::new_source`.
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {

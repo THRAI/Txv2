@@ -13,6 +13,11 @@ use tx_hal::PmapIf;
 use crate::execution::Guard;
 use crate::execution::WaitToken;
 use crate::page_backed::{step_fsync, PageContainerKind};
+use crate::vm::adapter::step_engine::{
+    self as step_engine, AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply,
+    DelegateRequest, StepOutcome, StepOutcome as V3StepOutcome, TaskMailbox, TokenDropPolicy,
+    UfdAccessKind, UfdReply, UfdRequest, YieldShape,
+};
 use crate::vm::checks::{
     require_disjoint_remap, require_fault_publication, require_fault_recipe, require_map_admission,
 };
@@ -21,11 +26,6 @@ use crate::vm::{
     AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard, UserRange,
     VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization, VmFaultOutcome, VmMapCommit,
     VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapRequest,
-};
-use crate::vm::adapter::step_engine::{
-    self as step_engine, AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply,
-    DelegateRequest, StepOutcome, StepOutcome as V3StepOutcome, TaskMailbox, TokenDropPolicy,
-    UfdAccessKind, UfdReply, UfdRequest, YieldShape,
 };
 
 impl AddressSpace {
@@ -968,7 +968,12 @@ async fn dispatch_ufd_fault<D: UfdDispatch>(
     // The agent-side mark_replied happens via UFFDIO_COPY / ZEROPAGE
     // (phase 5). For phase 4 the test drives mark_replied directly
     // to exercise the plumbing.
-    let outcome = crate::vm::adapter::wait_routing::await_agent_reply(token_id, &mailbox_arc, target.registry).await;
+    let outcome = crate::vm::adapter::wait_routing::await_agent_reply(
+        token_id,
+        &mailbox_arc,
+        target.registry,
+    )
+    .await;
     // Drop the guard *after* the await — if the agent replied
     // successfully the CancelOnDrop transition is a no-op
     // (LateNoOp(Replied)); if the await aborted (AgentDied / Canceled
@@ -1035,8 +1040,8 @@ fn materialize_ufd_copy(
     // direct-map hook that returns a usable `*mut u8`.
     let dst_kernel_ptr = step_engine::page_allocator::frame_kernel_addr(materialization.page.ppn)
         .map_err(|alloc_err| {
-            VmFaultError::PageCache(crate::page_backed::PageCacheError::Alloc(alloc_err))
-        })?;
+        VmFaultError::PageCache(crate::page_backed::PageCacheError::Alloc(alloc_err))
+    })?;
     // Copy `len` bytes from the agent's `src` buffer into the
     // freshly-allocated frame. `len` is page-multiple and bounded to
     // a single page (the fault-script materializes one user page at

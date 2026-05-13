@@ -7,6 +7,7 @@
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
 use crate::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
+use crate::signal::adapter::step_engine::Cap;
 use crate::signal::{
     step_kill_pgrp, step_kill_process, step_sigaction, KillOutcome, PendingSignalQueue,
     SigDisposition, SigDispositionChange, SignalMask, Signum,
@@ -16,7 +17,6 @@ use crate::thread_runtime::execution::{step_sigprocmask, SigmaskHow, Sigprocmask
 use crate::thread_runtime::structure::{reset_tid_counter_for_test, ThreadIdentity};
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
-use crate::signal::adapter::step_engine::Cap;
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

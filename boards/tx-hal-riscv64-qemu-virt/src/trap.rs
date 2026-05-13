@@ -7,8 +7,8 @@ use crate::{current_kernel_resume_ctx_ptr, trap_stack_top_for_cpu, KernelResumeC
 use tx_hal::SmpIf;
 use tx_hal::{
     FaultInfo, KernelTrapSink, SignalHandlerRegs, TrapAction, TrapClass, TrapFrameMut,
-    TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode,
-    UserFpContext, UserTrapContext, VirtAddr,
+    TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext,
+    UserTrapContext, VirtAddr,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -465,15 +465,15 @@ const X_A7: usize = 17;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rv64TrapFrame {
-    pub x: [usize; 32],     // offsets   0..255
-    pub scause: usize,      // offset  256
-    pub sepc: usize,        // offset  264
-    pub stval: usize,       // offset  272
-    pub sstatus: usize,     // offset  280
-    pub f: [u64; 32],       // offsets 288..543  (TX_RV64_TF_F_BASE)
-    pub fcsr: u32,          // offset  544       (TX_RV64_TF_FCSR)
-    pub _pad_fp: u32,       // offset  548       (pad to 8-byte alignment)
-                            // total  = 552 bytes (TX_RV64_TF_SIZE)
+    pub x: [usize; 32], // offsets   0..255
+    pub scause: usize,  // offset  256
+    pub sepc: usize,    // offset  264
+    pub stval: usize,   // offset  272
+    pub sstatus: usize, // offset  280
+    pub f: [u64; 32],   // offsets 288..543  (TX_RV64_TF_F_BASE)
+    pub fcsr: u32,      // offset  544       (TX_RV64_TF_FCSR)
+    pub _pad_fp: u32,   // offset  548       (pad to 8-byte alignment)
+                        // total  = 552 bytes (TX_RV64_TF_SIZE)
 }
 
 impl Rv64TrapFrame {

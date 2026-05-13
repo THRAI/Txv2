@@ -45,16 +45,8 @@ impl PhysicalBlockNumber {
 }
 
 pub trait CharDeviceOps: Send + Sync + 'static {
-    fn read(
-        &self,
-        out: &mut [u8],
-        guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress>;
-    fn write(
-        &self,
-        bytes: &[u8],
-        guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress>;
+    fn read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress>;
+    fn write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress>;
 }
 
 #[derive(Clone, Copy)]
@@ -88,10 +80,7 @@ pub trait BlockDeviceOps: Send + Sync + 'static {
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress>;
 
-    fn barrier(
-        &self,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<(), NoProgress>;
+    fn barrier(&self, guard: &Guard<'_>) -> StepOutcome<(), NoProgress>;
 }
 
 pub trait BlockDevice: BlockDeviceOps {
@@ -181,10 +170,7 @@ impl BlockDeviceHandle {
         self.reg.ops.write_blocks(block_id, source, guard)
     }
 
-    pub fn barrier(
-        self,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<(), NoProgress> {
+    pub fn barrier(self, guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         self.reg.ops.barrier(guard)
     }
 
@@ -306,10 +292,7 @@ mod tests {
             StepOutcome::done(())
         }
 
-        fn barrier(
-            &self,
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<(), NoProgress> {
+        fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
             StepOutcome::done(())
         }
     }

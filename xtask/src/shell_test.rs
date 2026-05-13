@@ -125,7 +125,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     if let Some(filter) = &group_filter {
         let known: Vec<&str> = script.groups.iter().map(|g| g.name.as_str()).collect();
         for name in filter {
-            if !known.iter().any(|k| *k == name.as_str()) {
+            if !known.contains(&name.as_str()) {
                 return Err(format!(
                     "--group {name:?} not present in script (have: {})",
                     if known.is_empty() {
@@ -175,8 +175,8 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         let setup_arc: Arc<Vec<Directive>> = Arc::new(script.setup.clone());
         let groups_arc: Arc<Vec<NamedGroup>> =
             Arc::new(groups_to_run.iter().map(|g| (*g).clone()).collect());
-        let results_arc: Arc<Mutex<Vec<(String, std::result::Result<(), String>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        type GroupResults = Vec<(String, std::result::Result<(), String>)>;
+        let results_arc: Arc<Mutex<GroupResults>> = Arc::new(Mutex::new(Vec::new()));
         let next_idx = Arc::new(AtomicUsize::new(0));
 
         let handles: Vec<_> = (0..concurrency)
@@ -186,29 +186,26 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                 let results = Arc::clone(&results_arc);
                 let next = Arc::clone(&next_idx);
                 let root = root.to_path_buf();
-                thread::spawn(move || {
-                    loop {
-                        let idx = next.fetch_add(1, Ordering::Relaxed);
-                        if idx >= groups.len() {
-                            break;
-                        }
-                        let group = &groups[idx];
-                        let (captured, group_err) =
-                            run_group_isolated(&root, target, &setup, group);
-                        let result = match group_err {
-                            None => Ok(()),
-                            Some(err) => {
-                                println!(
-                                    "\n--- [{}] captured output ({} bytes) ---",
-                                    group.name,
-                                    captured.len()
-                                );
-                                println!("{captured}");
-                                Err(err)
-                            }
-                        };
-                        results.lock().unwrap().push((group.name.clone(), result));
+                thread::spawn(move || loop {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= groups.len() {
+                        break;
                     }
+                    let group = &groups[idx];
+                    let (captured, group_err) = run_group_isolated(&root, target, &setup, group);
+                    let result = match group_err {
+                        None => Ok(()),
+                        Some(err) => {
+                            println!(
+                                "\n--- [{}] captured output ({} bytes) ---",
+                                group.name,
+                                captured.len()
+                            );
+                            println!("{captured}");
+                            Err(err)
+                        }
+                    };
+                    results.lock().unwrap().push((group.name.clone(), result));
                 })
             })
             .collect();
@@ -225,14 +222,16 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         // Sort results into script order before reporting.
         let mut ordered = group_results;
         ordered.sort_by_key(|(name, _)| {
-            groups_arc.iter().position(|g| &g.name == name).unwrap_or(usize::MAX)
+            groups_arc
+                .iter()
+                .position(|g| &g.name == name)
+                .unwrap_or(usize::MAX)
         });
         let failed_count = ordered.iter().filter(|(_, r)| r.is_err()).count();
         let passed = ordered.len() - failed_count;
         println!(
             "shell-test: groups: {} passed, {} failed",
-            passed,
-            failed_count,
+            passed, failed_count,
         );
         for (name, result) in &ordered {
             match result {
@@ -275,9 +274,14 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let outer = (|| -> Result<()> {
         // Setup always runs. A failure here is fatal regardless of
         // --keep-going (subsequent groups have no usable session).
-        if let Some(err) =
-            run_block(&mut child, &buffer, "setup", &script.setup, &mut anchor, true)?
-        {
+        if let Some(err) = run_block(
+            &mut child,
+            &buffer,
+            "setup",
+            &script.setup,
+            &mut anchor,
+            true,
+        )? {
             return Err(format!("setup: {err}"));
         }
         if directives_quit(&script.setup) {

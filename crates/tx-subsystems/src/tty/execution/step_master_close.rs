@@ -5,21 +5,20 @@ use crate::tty::adapter::step_engine::Cap;
 use super::step_hangup::{step_hangup, HangupOutcome};
 use super::step_ioctl::IoctlSideEffect;
 use crate::execution::{Errno, Guard};
-use crate::tty::checks::require_live_tty;
-use crate::tty::structure::{TtyIdentity, TtyTransport};
-use crate::tty::adapter::step_engine::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 #[cfg(test)]
 use crate::tty::adapter::step_engine::ByteProgress;
 #[cfg(test)]
 use crate::tty::adapter::step_engine::{self as step_engine};
+use crate::tty::adapter::step_engine::{
+    NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
+use crate::tty::checks::require_live_tty;
+use crate::tty::structure::{TtyIdentity, TtyTransport};
 
 pub fn step_master_close_last(
     master: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
-) -> StepOutcome<
-    (HangupOutcome, IoctlSideEffect),
-    NoProgress,
-> {
+) -> StepOutcome<(HangupOutcome, IoctlSideEffect), NoProgress> {
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let payload = match require_live_tty(master, guard) {
@@ -53,15 +52,10 @@ pub struct MasterCloseLastOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for MasterCloseLastOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for MasterCloseLastOp<'a> {
     type Output = (HangupOutcome, IoctlSideEffect);
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_master_close_last(self.master, self.guard)
     }
 }
@@ -81,21 +75,11 @@ mod step_op_wraps {
     struct NoopOps;
 
     impl CharDeviceOps for NoopOps {
-        fn read(
-            &self,
-            _out: &mut [u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(0)
         }
 
-        fn write(
-            &self,
-            bytes: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(bytes.len())
         }
     }

@@ -5,15 +5,17 @@ use core::sync::atomic::Ordering;
 use crate::tty::adapter::step_engine::Cap;
 
 use crate::execution::Guard;
+#[cfg(test)]
+use crate::tty::adapter::step_engine::{self as step_engine};
+use crate::tty::adapter::step_engine::{
+    ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 use crate::tty::checks::{
     background_read_signal, require_fg_pgrp, require_fg_pgrp_for, require_live_tty,
 };
 use crate::tty::execution::TTY_READABLE;
 use crate::tty::structure::termios::{ICANON, VMIN, VTIME};
 use crate::tty::structure::TtyIdentity;
-use crate::tty::adapter::step_engine::{ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
-#[cfg(test)]
-use crate::tty::adapter::step_engine::{self as step_engine};
 
 /// Drain bytes from a live TTY input queue into `out`.
 ///
@@ -159,15 +161,10 @@ pub struct ReadOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for ReadOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_read(self.tty, self.out, self.guard)
     }
 }
@@ -181,15 +178,10 @@ pub struct ReadForCallerOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for ReadForCallerOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for ReadForCallerOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_read_for_caller(self.tty, self.out, self.caller, self.guard)
     }
 }
@@ -203,15 +195,10 @@ pub struct ReadForProcessOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for ReadForProcessOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for ReadForProcessOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_read_for_process(self.tty, self.out, self.caller, self.guard)
     }
 }
@@ -231,21 +218,11 @@ mod step_op_wraps {
     struct NoopOps;
 
     impl CharDeviceOps for NoopOps {
-        fn read(
-            &self,
-            _out: &mut [u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(0)
         }
 
-        fn write(
-            &self,
-            bytes: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(bytes.len())
         }
     }

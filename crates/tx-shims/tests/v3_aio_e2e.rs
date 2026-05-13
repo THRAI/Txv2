@@ -71,7 +71,9 @@ use tx_hal::{
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
-use tx_shims::adapter::step_engine::{self as zone, page_allocator, CancelReason, Cap, OnBehalfOfAbort};
+use tx_shims::adapter::step_engine::{
+    self as zone, page_allocator, CancelReason, Cap, OnBehalfOfAbort,
+};
 use tx_subsystems::aio::{reset_context_id_counter_for_test, AioWorkerFuture, IOCB_CMD_PREAD};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,

@@ -4,12 +4,14 @@ use crate::tty::adapter::step_engine::Cap;
 
 use super::step_ioctl::{JobControlSignal, SessionCtlEvent, SignalDispatch, SignalTarget};
 use crate::execution::{Errno, Guard};
-use crate::tty::structure::TtyIdentity;
-use crate::tty::adapter::step_engine::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
 #[cfg(test)]
 use crate::tty::adapter::step_engine::ByteProgress;
 #[cfg(test)]
 use crate::tty::adapter::step_engine::{self as step_engine};
+use crate::tty::adapter::step_engine::{
+    NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
+use crate::tty::structure::TtyIdentity;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HangupOutcome {
@@ -79,15 +81,10 @@ pub struct HangupOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I>
-    for HangupOp<'a>
-{
+impl<'a, I: SubjectIdentity> StepOp<I> for HangupOp<'a> {
     type Output = HangupOutcome;
     type Progress = NoProgress;
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         step_hangup(self.tty, self.guard)
     }
 }
@@ -107,21 +104,11 @@ mod step_op_wraps {
     struct NoopOps;
 
     impl CharDeviceOps for NoopOps {
-        fn read(
-            &self,
-            _out: &mut [u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(0)
         }
 
-        fn write(
-            &self,
-            bytes: &[u8],
-            _guard: &Guard<'_>,
-        ) -> StepOutcome<usize, ByteProgress>
-        {
+        fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
             StepOutcome::Done(bytes.len())
         }
     }

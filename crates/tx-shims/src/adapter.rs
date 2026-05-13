@@ -18,13 +18,14 @@ use tx_platform_adapter::platform_adapter;
 )]
 pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
         AgentCancelPolicy, ByteProgress, CancelReason, DelegateReply, DelegateRequest,
-        DelegateState, DelegateTokenId, Errno, InterestMask, NoProgress, OnBehalfOfAbort, ScriptCtx,
-        StepOp, StepOutcome, SubjectAuthority, SubjectContext, SubjectIdentity, TokenDropPolicy,
-        TransitionOutcome, UfdAccessKind, UfdReply, UfdRequest, WaitSourceId, YieldShape,
+        DelegateState, DelegateTokenId, Errno, InterestMask, NoProgress, OnBehalfOfAbort,
+        ScriptCtx, StepOp, StepOutcome, SubjectAuthority, SubjectContext, SubjectIdentity,
+        TokenDropPolicy, TransitionOutcome, UfdAccessKind, UfdReply, UfdRequest, WaitSourceId,
+        YieldShape,
     };
-    pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::zone::{
         reserve_for, sign, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
     };

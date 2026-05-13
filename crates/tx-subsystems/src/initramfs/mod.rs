@@ -27,11 +27,11 @@
 
 use alloc::sync::Arc;
 
+use crate::adapter::step_engine::{guard as ebr_guard, page_allocator, Cap, StepOutcome as V3};
 use crate::execution::Errno;
 use crate::mount::MountIdentity;
 use crate::page_backed::{FsPageBacking, MaterializeAccess, PageIndex};
 use crate::vfs::{Credential, FsObjectId, FsOps, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
-use crate::adapter::step_engine::{guard as ebr_guard, page_allocator, Cap, StepOutcome as V3};
 
 #[cfg(test)]
 mod tests;
@@ -515,8 +515,8 @@ fn unpack_regular(
                 op: "materialize_anon",
                 errno: Errno::ENOMEM,
             })?;
-        let frame_base = page_allocator::frame_kernel_addr(materialised.ppn)
-            .map_err(|_| UnpackError::FsOp {
+        let frame_base =
+            page_allocator::frame_kernel_addr(materialised.ppn).map_err(|_| UnpackError::FsOp {
                 op: "frame_kernel_addr",
                 errno: Errno::EFAULT,
             })?;
