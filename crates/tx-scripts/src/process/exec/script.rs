@@ -664,8 +664,8 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
 /// fresh image (typically a U-mode entry with interrupts enabled).
 fn make_initial_user_trap_context(pc: usize, sp: usize) -> UserTrapContext {
     let mut regs = [0usize; 32];
-    // RV64 SP is x2 per the integer-register assignments in the ABI.
-    regs[2] = sp;
+    // Arch-specific SP register (x2 on RV64, x3 on LA64).
+    regs[initial_user_sp_reg()] = sp;
     UserTrapContext {
         regs,
         pc,
@@ -676,6 +676,17 @@ fn make_initial_user_trap_context(pc: usize, sp: usize) -> UserTrapContext {
 
 /// Translate the parser's segment-flag shape (`bool`-named fields) to
 /// the vm-scripts shape (different field names).
+pub(crate) const fn initial_user_sp_reg_for_arch(arch: tx_hal::Arch) -> usize {
+    match arch {
+        tx_hal::Arch::Riscv64 => 2,
+        tx_hal::Arch::LoongArch64 => 3,
+    }
+}
+
+fn initial_user_sp_reg() -> usize {
+    initial_user_sp_reg_for_arch(tx_hal::Arch::Riscv64)
+}
+
 const fn translate_flags(parsed: ParsedSegmentFlags) -> VmSegmentFlags {
     VmSegmentFlags {
         read: parsed.readable,
