@@ -201,6 +201,25 @@ impl EpochDomain {
         self.active_guards.0.fetch_sub(1, Ordering::AcqRel);
     }
 
+    /// Return a borrow-mode guard for the current CPU if one is already active
+    /// (local_epoch != 0).  The returned guard does not call `local.enter()` or
+    /// increment `active_guards`; its Drop is a no-op.  Returns `None` when no
+    /// guard is held.
+    fn borrow_guard(&'static self) -> Option<Guard<'static>> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return None;
+        }
+        let hooks = self.hooks();
+        let cpu_pin = (hooks.pin_current_cpu)();
+        let cpu_id = cpu_pin.cpu_id();
+        let local = self.cpu_state(cpu_id)?;
+        let local_epoch = local.current();
+        if local_epoch == 0 {
+            return None;
+        }
+        Some(Guard::new_borrowed(self, local, cpu_id, local_epoch, cpu_pin))
+    }
+
     unsafe fn retire_raw(
         &'static self,
         ptr: *mut u8,
@@ -562,6 +581,10 @@ pub fn init_on_ap(cpu: CpuId) -> Result<(), EpochError> {
 
 pub(crate) fn guard() -> Guard<'static> {
     GLOBAL_DOMAIN.guard()
+}
+
+pub(crate) fn borrow_guard() -> Option<Guard<'static>> {
+    GLOBAL_DOMAIN.borrow_guard()
 }
 
 pub(crate) unsafe fn retire_raw(

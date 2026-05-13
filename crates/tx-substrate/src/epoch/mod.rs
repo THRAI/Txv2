@@ -46,6 +46,22 @@ pub fn guard() -> Guard<'static> {
     domain::guard()
 }
 
+/// Borrow the current CPU's active epoch guard without modifying epoch counters.
+///
+/// Returns `Some(guard)` when the current CPU already holds a guard
+/// (`local_epoch != 0`).  The returned guard has a no-op Drop: it does not
+/// call `local.leave()` or decrement `active_guards`.
+///
+/// Returns `None` if no guard is currently held; the caller should fall back
+/// to `epoch::guard()`.
+///
+/// Use this when code must satisfy an `&Guard` API but is called from within
+/// an existing epoch window and creating a nested guard would violate the
+/// EBR no-nesting invariant.
+pub fn borrow_current_guard() -> Option<Guard<'static>> {
+    domain::borrow_guard()
+}
+
 /// Try to reclaim at most `budget` expired retired nodes.
 pub fn drain_with_budget(budget: usize) -> DrainStats {
     try_drain(budget)

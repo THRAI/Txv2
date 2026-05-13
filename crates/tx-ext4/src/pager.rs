@@ -33,10 +33,17 @@ fn materialize_frame(
     }
     #[cfg(not(test))]
     {
-        // TODO(spec-reconciliation): copy via HAL kernel direct-map once a
-        // non-test path exists. Keeping the frame zeroed in production is
-        // safer than silently dropping bytes.
-        let _ = page;
+        let dst = match page_allocator::frame_kernel_addr(ppn) {
+            Ok(ptr) => ptr,
+            Err(_) => return tx_substrate::step_v3::StepOutcome::err(Errno::EIO.into()),
+        };
+        // SAFETY: `dst` is the kernel direct-map VA of a freshly
+        // allocated frame we own through `owned`. `page` is a
+        // `&[u8; BLOCK_SIZE]`.  Both regions are disjoint and valid
+        // for BLOCK_SIZE bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(page.as_ptr(), dst, BLOCK_SIZE);
+        }
     }
 
     // Hand off ownership: the permanent-frame token never releases the

@@ -137,7 +137,7 @@ pub(super) fn fs_page_backing_for_dentry(
                 return Some(payload.fs_page_backing.clone());
             }
         }
-        let next = cursor.parent_hint().and_then(|w| w.upgrade(&guard))?;
+        let next = cursor.parent_hint()?;
         cursor = next;
     }
 }

@@ -715,7 +715,7 @@ impl core::fmt::Debug for RNode {
 #[derive(Debug)]
 pub struct DEntry {
     name: InlineName,
-    parent: Option<Weak<DEntry>>,
+    parent: Option<Cap<DEntry>>,
     rnode: Cap<RNode>,
     mounted: Option<Weak<MountIdentity>>,
 }
@@ -744,19 +744,19 @@ impl DEntry {
     }
 
     pub fn set_parent_hint(&mut self, parent: &Cap<DEntry>) {
-        self.parent = Some(parent.downgrade());
+        self.parent = Some(parent.clone());
     }
 
     pub fn set_mounted_hint(&mut self, mount: &Cap<MountIdentity>) {
         self.mounted = Some(mount.downgrade());
     }
 
-    /// Snapshot the parent-hint `Weak<DEntry>` if installed. Used by
-    /// path-render walks (`render_dentry_path`) and (future) by
-    /// chroot-bounded resolution. Returns `None` for root dentries
-    /// or for dentries that haven't had `set_parent_hint` called.
-    pub fn parent_hint(&self) -> Option<Weak<DEntry>> {
-        self.parent
+    /// Return the parent-hint `Cap<DEntry>` if installed. Returns
+    /// `None` for root dentries or dentries that haven't had
+    /// `set_parent_hint` called. The parent is kept alive by the
+    /// strong reference so the chain never breaks due to reclamation.
+    pub fn parent_hint(&self) -> Option<Cap<DEntry>> {
+        self.parent.clone()
     }
 
     /// Snapshot the `mounted` weak hint. Used by the VFS walker
@@ -792,16 +792,10 @@ pub fn render_dentry_path(dentry: &Cap<DEntry>) -> Option<alloc::vec::Vec<u8>> {
     components.push(dentry.name());
 
     let mut current = dentry.parent_hint();
-    let guard = tx_substrate::epoch::guard();
-    while let Some(parent_weak) = current {
-        let Some(parent_cap) = parent_weak.upgrade(&guard) else {
-            // Chain broken — a parent identity has been reclaimed.
-            return None;
-        };
+    while let Some(parent_cap) = current {
         components.push(parent_cap.name());
         current = parent_cap.parent_hint();
     }
-    drop(guard);
 
     // components collected leaf → root; reverse for root → leaf rendering.
     components.reverse();

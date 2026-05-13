@@ -382,6 +382,8 @@ version = "0.1.0"
 name = "tx-fs"
 version = "0.1.0"
 dependencies = [
+ "tx-ext4",
+ "tx-ext4-format",
  "tx-substrate",
  "tx-subsystems",
 ]
