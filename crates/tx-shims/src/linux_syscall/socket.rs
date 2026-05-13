@@ -187,6 +187,7 @@ pub(super) async fn sys_connect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     };
     let nonblocking = file.flags().nonblocking;
     let was_connecting = socket_is_tcp_connecting(&socket);
+    let mut waited_for_connect = was_connecting;
 
     loop {
         let outcome = {
@@ -205,12 +206,16 @@ pub(super) async fn sys_connect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
+                    waited_for_connect = true;
                     let _ = future.await;
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
             }
             StepOutcome::Continue { .. } => {}
+            StepOutcome::Err(Errno::EISCONN) if waited_for_connect => {
+                return SyscallResult::Return(0);
+            }
             StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         }
     }

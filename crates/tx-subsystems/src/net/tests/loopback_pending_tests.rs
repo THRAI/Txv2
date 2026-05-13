@@ -160,6 +160,61 @@ fn loopback_pending_step_drives_udp_connected_datagram() {
 }
 
 #[test]
+fn loopback_pending_step_drives_udp_bound_sendto_datagram() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    let guard = tx_substrate::epoch::guard();
+    let socket = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("socket");
+    assert_eq!(
+        step_bind(&socket, inet(40_194), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &socket,
+            Some(endpoint(40_194)),
+            b"hello",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(5)
+    );
+
+    let outcome = match step_process_loopback_pending(
+        smoltcp::time::Instant::ZERO,
+        loopback_iface(),
+        small_budget(),
+        &guard,
+    ) {
+        StepOutcome::Done(outcome) => outcome,
+        _ => panic!("unexpected loopback pending outcome"),
+    };
+
+    assert_eq!(outcome.udp_transfer_attempted, 1);
+    assert_eq!(outcome.udp_transfer_failed, 0);
+    assert_eq!(outcome.udp_bytes_moved, 5);
+    assert_eq!(
+        socket
+            .acquire_operational()
+            .expect("socket payload")
+            .io_snapshot()
+            .recv_len,
+        5
+    );
+    assert_eq!(
+        step_recv(&socket, 5, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(5)
+    );
+}
+
+#[test]
 fn loopback_pending_step_drives_raw_icmp_echo() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
