@@ -1,7 +1,10 @@
 use tx_substrate::zone::Cap;
 
-use crate::execution::{Guard, StepOutcome};
+use crate::execution::{Guard, StepOutcome, WaitToken};
 use crate::net::checks::require::require_socket_poll_target;
+use crate::net::execution::{
+    socket_accept_wait_token, socket_recv_wait_token, socket_send_wait_token,
+};
 use crate::net::structure::{
     AcceptWireSet, PollMask, RecvWireSet, SendWireSet, SocketIdentity, SocketProtocol, TcpState,
     UdpInner,
@@ -33,7 +36,10 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             mask |= PollMask::IN;
         }
         SocketProtocol::Tcp(TcpState::Connected { .. }) => {
-            if witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0 {
+            let io = payload.io_snapshot();
+            if io.recv_len > 0
+                || witness.identity.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0
+            {
                 mask |= PollMask::IN;
             }
             if witness.identity.readiness.recv_wq.peek() & RecvWireSet::BROKEN.bits() != 0
@@ -41,7 +47,9 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
             {
                 mask |= PollMask::IN | PollMask::RDHUP;
             }
-            if witness.identity.readiness.send_wq.peek() & SendWireSet::SPACE.bits() != 0 {
+            if io.send_space > 0
+                || witness.identity.readiness.send_wq.peek() & SendWireSet::SPACE.bits() != 0
+            {
                 mask |= PollMask::OUT;
             }
         }
@@ -66,4 +74,42 @@ pub fn step_poll_ready(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> StepO
     });
 
     StepOutcome::Done(mask)
+}
+
+pub fn step_poll_wait_token(
+    socket: &Cap<SocketIdentity>,
+    interests: PollMask,
+    guard: &Guard<'_>,
+) -> StepOutcome<Option<WaitToken>> {
+    let witness = match require_socket_poll_target(socket, guard) {
+        Ok(witness) => witness,
+        Err(errno) => return StepOutcome::Err(errno),
+    };
+    let Some(payload) = socket.acquire_operational() else {
+        return StepOutcome::Done(None);
+    };
+
+    let token = payload.with_protocol(|protocol| match protocol {
+        SocketProtocol::Tcp(TcpState::Listening { .. }) if interests.intersects(PollMask::IN) => {
+            Some(socket_accept_wait_token(&witness.identity))
+        }
+        SocketProtocol::Tcp(TcpState::Connected { .. }) if interests.intersects(PollMask::IN) => {
+            Some(socket_recv_wait_token(&witness.identity))
+        }
+        SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
+        | SocketProtocol::RawIcmp(_)
+            if interests.intersects(PollMask::IN) =>
+        {
+            Some(socket_recv_wait_token(&witness.identity))
+        }
+        SocketProtocol::Tcp(TcpState::Connected { .. })
+        | SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
+        | SocketProtocol::RawIcmp(_)
+            if interests.intersects(PollMask::OUT) =>
+        {
+            Some(socket_send_wait_token(&witness.identity))
+        }
+        _ => None,
+    });
+    StepOutcome::Done(token)
 }

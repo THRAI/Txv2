@@ -110,6 +110,10 @@ pub const NR_EXIT: u64 = 93;
 pub const NR_EXIT_GROUP: u64 = 94;
 /// `getpid()`. Linux generic ABI `__NR_getpid`.
 pub const NR_GETPID: u64 = 172;
+/// `gettid()`. Linux generic ABI `__NR_gettid`.
+pub const NR_GETTID: u64 = 178;
+/// `getrusage(who, usage)`. Linux generic ABI `__NR_getrusage`.
+pub const NR_GETRUSAGE: u64 = 165;
 /// `brk(addr)`. Linux generic ABI `__NR_brk`. Per `txdoc:VM-5-8-BRK`,
 /// the dispatcher calls `AddressSpace::brk_script(brk_base,
 /// current_brk, requested_brk)` and returns the new `current_brk`.
@@ -341,6 +345,9 @@ pub const SO_RCVBUF: i32 = 8;
 pub const SO_RCVTIMEO: i32 = 20;
 pub const SO_SNDTIMEO: i32 = 21;
 pub const TCP_NODELAY: i32 = 1;
+pub const TCP_MAXSEG: i32 = 2;
+pub const TCP_INFO: i32 = 11;
+pub const TCP_CONGESTION: i32 = 13;
 
 /// `lseek` whence: set the offset to the absolute value `offset`.
 /// Linux uapi `<unistd.h>` `SEEK_SET`.

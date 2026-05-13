@@ -562,6 +562,279 @@ pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(
     SyscallResult::Return(total)
 }
 
+/// `pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)`.
+///
+/// musl implements `select(2)` on RV64 through the generic `pselect6`
+/// syscall. This keeps the implementation deliberately close to
+/// `sys_ppoll`: sockets use the network readiness projection and TTY
+/// reads peek the input queue. Other fd kinds are left not-ready for
+/// now so network workloads do not spin on unrelated regular files.
+///
+/// Finite non-zero timeouts validate the timespec and then park on the
+/// first socket/TTY wait token when no fd is immediately ready. The
+/// exact deadline is not enforced yet; `{0,0}` remains a true poll.
+pub(super) async fn sys_pselect6<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
+
+    let nfds = args[0];
+    let readfds = args[1];
+    let writefds = args[2];
+    let exceptfds = args[3];
+    let timeout_ptr = args[4];
+
+    if nfds > 1024 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if nfds == 0 {
+        return SyscallResult::Return(0);
+    }
+
+    let timeout = match pselect_timeout_policy(ctx, timeout_ptr) {
+        Ok(wait) => wait,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let word_count = fdset_word_count(nfds);
+    let (read_ready, write_ready, except_ready, ready_count) = loop {
+        drive_loopback_pending();
+        let mut read_ready = alloc::vec![0u64; word_count as usize];
+        let mut write_ready = alloc::vec![0u64; word_count as usize];
+        let mut except_ready = alloc::vec![0u64; word_count as usize];
+        let mut ready_count: i64 = 0;
+        let mut wait_token = None;
+        let mixed_read_interest = readfds != 0;
+        let mut read_interest_count = 0usize;
+
+        for fd in 0..nfds {
+            let want_read = match fdset_contains(ctx, readfds, fd) {
+                Ok(v) => v,
+                Err(errno) => return SyscallResult::Error(errno),
+            };
+            let want_write = match fdset_contains(ctx, writefds, fd) {
+                Ok(v) => v,
+                Err(errno) => return SyscallResult::Error(errno),
+            };
+            let want_except = match fdset_contains(ctx, exceptfds, fd) {
+                Ok(v) => v,
+                Err(errno) => return SyscallResult::Error(errno),
+            };
+            if !want_read && !want_write && !want_except {
+                continue;
+            }
+            if want_read {
+                read_interest_count += 1;
+            }
+
+            let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+                return SyscallResult::Error(EBADF_VALUE);
+            };
+
+            let mut fd_ready = false;
+            let guard = tx_substrate::epoch::guard();
+            if let Some(result) = socket_poll_mask_from_file(&file, &guard) {
+                let mask = match result {
+                    Ok(mask) => mask,
+                    Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                };
+                let mut interests = tx_subsystems::net::PollMask::empty();
+                if want_read {
+                    interests |= tx_subsystems::net::PollMask::IN;
+                }
+                if want_write {
+                    interests |= tx_subsystems::net::PollMask::OUT;
+                }
+                if want_except {
+                    interests |= tx_subsystems::net::PollMask::ERR;
+                }
+                if want_read && mask.intersects(tx_subsystems::net::PollMask::IN) {
+                    fdset_set(&mut read_ready, fd);
+                    fd_ready = true;
+                }
+                if pselect_socket_write_ready(&file, mixed_read_interest, want_write, mask) {
+                    fdset_set(&mut write_ready, fd);
+                    fd_ready = true;
+                }
+                if want_except && mask.intersects(tx_subsystems::net::PollMask::ERR) {
+                    fdset_set(&mut except_ready, fd);
+                    fd_ready = true;
+                }
+                let read_blocked = want_read
+                    && !mask.intersects(
+                        tx_subsystems::net::PollMask::IN
+                            | tx_subsystems::net::PollMask::ERR
+                            | tx_subsystems::net::PollMask::HUP
+                            | tx_subsystems::net::PollMask::RDHUP,
+                    );
+                if read_blocked && wait_token.is_none() {
+                    match socket_poll_wait_token_from_file(
+                        &file,
+                        tx_subsystems::net::PollMask::IN,
+                        &guard,
+                    ) {
+                        Some(Ok(Some(token))) => wait_token = Some(token),
+                        Some(Ok(None)) | None => {}
+                        Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
+                    }
+                }
+                if !fd_ready && wait_token.is_none() {
+                    match socket_poll_wait_token_from_file(&file, interests, &guard) {
+                        Some(Ok(Some(token))) => wait_token = Some(token),
+                        Some(Ok(None)) | None => {}
+                        Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
+                    }
+                }
+            } else {
+                if want_read {
+                    let readable = match file.rnode().backing() {
+                        RNodeBacking::StructBacked {
+                            payload: StructPayload::Tty(tty),
+                        } => {
+                            use tx_subsystems::tty::execution::TTY_READABLE;
+                            if tty.input_readable.peek() & TTY_READABLE != 0 {
+                                true
+                            } else {
+                                if wait_token.is_none() {
+                                    wait_token = Some(tx_subsystems::execution::WaitToken::new(
+                                        tty.wait_source_id(),
+                                        TTY_READABLE,
+                                    ));
+                                }
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if readable {
+                        fdset_set(&mut read_ready, fd);
+                        fd_ready = true;
+                    }
+                }
+            }
+
+            if fd_ready {
+                ready_count += 1;
+            }
+        }
+
+        if ready_count != 0 || timeout == PselectTimeout::Poll {
+            break (read_ready, write_ready, except_ready, ready_count);
+        }
+        if read_interest_count > 1 {
+            tx_reactor::yield_now().await;
+            continue;
+        }
+        let Some(token) = wait_token else {
+            break (read_ready, write_ready, except_ready, ready_count);
+        };
+        if let Some(future) = wait_source::wait_on_token(token) {
+            let _ = future.await;
+        } else {
+            break (read_ready, write_ready, except_ready, ready_count);
+        }
+    };
+
+    if ready_count != 0 {
+        tx_reactor::yield_now().await;
+    }
+
+    if let Err(errno) = fdset_write(ctx, readfds, &read_ready) {
+        return SyscallResult::Error(errno);
+    }
+    if let Err(errno) = fdset_write(ctx, writefds, &write_ready) {
+        return SyscallResult::Error(errno);
+    }
+    if let Err(errno) = fdset_write(ctx, exceptfds, &except_ready) {
+        return SyscallResult::Error(errno);
+    }
+
+    SyscallResult::Return(ready_count)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PselectTimeout {
+    Infinite,
+    FiniteWait,
+    Poll,
+}
+
+fn pselect_timeout_policy<'a>(
+    ctx: &SyscallCtx<'a>,
+    timeout_ptr: u64,
+) -> Result<PselectTimeout, i32> {
+    if timeout_ptr == 0 {
+        return Ok(PselectTimeout::Infinite);
+    }
+
+    let mut bytes = [0u8; 16];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, timeout_ptr).map_err(errno_to_i32)?;
+    let sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Err(EINVAL_VALUE);
+    }
+    if sec == 0 && nsec == 0 {
+        Ok(PselectTimeout::Poll)
+    } else {
+        Ok(PselectTimeout::FiniteWait)
+    }
+}
+
+fn fdset_word_count(nfds: u64) -> u64 {
+    nfds.div_ceil(64)
+}
+
+fn fdset_contains<'a>(ctx: &SyscallCtx<'a>, set_ptr: u64, fd: u64) -> Result<bool, i32> {
+    if set_ptr == 0 {
+        return Ok(false);
+    }
+    let word_idx = fd / 64;
+    let bit = fd % 64;
+    let mut bytes = [0u8; 8];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, set_ptr + word_idx * 8)
+        .map_err(errno_to_i32)?;
+    let word = u64::from_le_bytes(bytes);
+    Ok(word & (1u64 << bit) != 0)
+}
+
+fn fdset_set(words: &mut [u64], fd: u64) {
+    let word_idx = (fd / 64) as usize;
+    let bit = fd % 64;
+    words[word_idx] |= 1u64 << bit;
+}
+
+fn fdset_write<'a>(ctx: &SyscallCtx<'a>, set_ptr: u64, words: &[u64]) -> Result<(), i32> {
+    if set_ptr == 0 {
+        return Ok(());
+    }
+    for (idx, word) in words.iter().enumerate() {
+        bootstrap_copy_to_user(&ctx.aspace, set_ptr + (idx as u64) * 8, &word.to_le_bytes())
+            .map_err(errno_to_i32)?;
+    }
+    Ok(())
+}
+
+fn pselect_socket_write_ready(
+    file: &Cap<OpenFile>,
+    mixed_read_interest: bool,
+    want_write: bool,
+    mask: tx_subsystems::net::PollMask,
+) -> bool {
+    if !want_write || !mask.intersects(tx_subsystems::net::PollMask::OUT) {
+        return false;
+    }
+    if !mixed_read_interest || mask.intersects(tx_subsystems::net::PollMask::IN) {
+        return true;
+    }
+
+    let tx_subsystems::vfs::structure::RNodeBacking::StructBacked {
+        payload: tx_subsystems::vfs::structure::StructPayload::Socket { identity: socket },
+    } = file.rnode().backing()
+    else {
+        return true;
+    };
+
+    socket.readiness.send_wq.peek() & tx_subsystems::net::structure::SendWireSet::SPACE.bits() != 0
+}
+
 /// `ppoll(fds, nfds, tmo_p, sigmask)` — minimal v1 stub for
 /// interactive `busybox sh` so its read loop doesn't trap with
 /// `-ENOSYS`.
@@ -1031,6 +1304,12 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             return SyscallResult::error_from(errno);
         }
     }
+    if let tx_subsystems::vfs::structure::RNodeBacking::StructBacked {
+        payload: tx_subsystems::vfs::structure::StructPayload::Socket { identity: socket },
+    } = file.rnode().backing()
+    {
+        return sys_write_socket(&file, socket.clone(), &bytes).await;
+    }
 
     // PR-9 phase 3b: drive `OpenFile::step_write` via the
     // `OpenFileWriteOp` StepOp wrap and the v3 `drive()` loop
@@ -1165,6 +1444,113 @@ async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
     }
 }
 
+async fn sys_write_socket(
+    file: &Cap<OpenFile>,
+    socket: Cap<tx_subsystems::net::SocketIdentity>,
+    bytes: &[u8],
+) -> SyscallResult {
+    if bytes.is_empty() {
+        return SyscallResult::Return(0);
+    }
+
+    let mut flags = tx_subsystems::net::SendRecvFlags::empty();
+    if file.flags().nonblocking {
+        flags |= tx_subsystems::net::SendRecvFlags::MSG_DONTWAIT;
+    }
+    let mut total = 0usize;
+    let mut remaining = bytes;
+
+    loop {
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            tx_subsystems::net::execution::step_send_kernel_bytes(&socket, remaining, flags, &guard)
+        };
+        match outcome {
+            tx_substrate::step::StepOutcome::Done(written) => {
+                total += written;
+                drive_tcp_loopback_after_socket_write(&socket, written);
+                tx_reactor::yield_now().await;
+                return SyscallResult::Return(total as i64);
+            }
+            tx_substrate::step::StepOutcome::Continue { progress } => {
+                let written = progress.bytes();
+                total += written;
+                drive_tcp_loopback_after_socket_write(&socket, written);
+                let stop = written == 0 || written >= remaining.len();
+                if stop {
+                    tx_reactor::yield_now().await;
+                    return SyscallResult::Return(total as i64);
+                }
+                remaining = &remaining[written..];
+            }
+            tx_substrate::step::StepOutcome::Yield { progress, shape } => {
+                let written = progress.bytes();
+                if written > 0 {
+                    total += written;
+                    drive_tcp_loopback_after_socket_write(&socket, written);
+                    if written >= remaining.len() {
+                        tx_reactor::yield_now().await;
+                        return SyscallResult::Return(total as i64);
+                    }
+                    remaining = &remaining[written..];
+                } else if flags.is_nonblocking() {
+                    if total > 0 {
+                        return SyscallResult::Return(total as i64);
+                    }
+                    return SyscallResult::Error(EAGAIN_VALUE);
+                }
+
+                match shape {
+                    tx_substrate::step::YieldShape::OnWaitSource { source, interests } => {
+                        let token =
+                            tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
+                        if let Some(future) = wait_source::wait_on_token(token) {
+                            let _ = future.await;
+                        }
+                    }
+                    tx_substrate::step::YieldShape::OnAgent { .. }
+                    | tx_substrate::step::YieldShape::OnTimer { .. }
+                    | tx_substrate::step::YieldShape::OnEdge { .. } => {
+                        if total > 0 {
+                            return SyscallResult::Return(total as i64);
+                        }
+                        return SyscallResult::Error(errno_to_i32(Errno::EIO));
+                    }
+                }
+            }
+            tx_substrate::step::StepOutcome::Err(errno) => {
+                if total > 0 {
+                    return SyscallResult::Return(total as i64);
+                }
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+    }
+}
+
+fn drive_tcp_loopback_after_socket_write(
+    socket: &Cap<tx_subsystems::net::SocketIdentity>,
+    written: usize,
+) {
+    if written == 0 {
+        return;
+    }
+    let guard = tx_substrate::epoch::guard();
+    let _ = tx_subsystems::net::execution::step_tcp_loopback_transfer(socket, written, &guard);
+    socket
+        .readiness
+        .clear_send(tx_subsystems::net::structure::SendWireSet::SPACE);
+}
+
+fn drive_loopback_pending() {
+    let guard = tx_substrate::epoch::guard();
+    let _ = tx_subsystems::net::execution::step_process_loopback_pending_zero(
+        tx_subsystems::net::protocol::loopback_iface(),
+        tx_subsystems::net::execution::LOOPBACK_POLL_BUDGET_DEFAULT,
+        &guard,
+    );
+}
+
 /// `read(fd, buf, count)`.
 ///
 /// Mirrors `sys_write`'s structure. For PageBacked files, delegates to
@@ -1228,6 +1614,12 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     if file.timerfd().is_some() {
         return super::timerfd::sys_timerfd_read::<P>(&file, args[1], len, ctx).await;
     }
+    if let tx_subsystems::vfs::structure::RNodeBacking::StructBacked {
+        payload: tx_subsystems::vfs::structure::StructPayload::Socket { identity: socket },
+    } = file.rnode().backing()
+    {
+        return sys_read_socket(&file, socket.clone(), buf_ptr as u64, len, ctx).await;
+    }
 
     let len = if matches!(
         file.rnode().backing(),
@@ -1256,7 +1648,7 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     // the canonical user-VA lane (`bootstrap_copy_to_user` bridges
     // via `aspace.copy_to_user`, falling back to the kernel-pointer
     // dance the trio's earlier exemption used).
-    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
+    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len.min(TTY_WRITE_MAX_INLINE)];
 
     // Phase A.3: drive `OpenFile::step_read` via the v3 `drive()` loop
     // (per `docs/Txv3/03_STEP_MODEL_v2.md` §8). The internal cursor
@@ -1891,4 +2283,65 @@ pub(super) async fn sys_sendfile64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     }
 
     SyscallResult::Return(transferred as i64)
+}
+
+async fn sys_read_socket<'a>(
+    file: &Cap<OpenFile>,
+    socket: Cap<tx_subsystems::net::SocketIdentity>,
+    buf_ptr: u64,
+    len: usize,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let mut flags = tx_subsystems::net::SendRecvFlags::empty();
+    if file.flags().nonblocking {
+        flags |= tx_subsystems::net::SendRecvFlags::MSG_DONTWAIT;
+    }
+    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len.min(TTY_WRITE_MAX_INLINE)];
+
+    loop {
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            tx_subsystems::net::execution::step_recv_kernel_bytes(
+                &socket,
+                &mut staging,
+                flags,
+                &guard,
+            )
+        };
+        match outcome {
+            tx_substrate::step::StepOutcome::Done(recv) => {
+                if recv.bytes > 0 {
+                    if let Err(errno) =
+                        bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..recv.bytes])
+                    {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
+                return SyscallResult::Return(recv.bytes as i64);
+            }
+            tx_substrate::step::StepOutcome::Yield { shape, .. } => {
+                if flags.is_nonblocking() {
+                    return SyscallResult::Error(EAGAIN_VALUE);
+                }
+                match shape {
+                    tx_substrate::step::YieldShape::OnWaitSource { source, interests } => {
+                        let token =
+                            tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
+                        if let Some(future) = wait_source::wait_on_token(token) {
+                            let _ = future.await;
+                        }
+                    }
+                    tx_substrate::step::YieldShape::OnAgent { .. }
+                    | tx_substrate::step::YieldShape::OnTimer { .. }
+                    | tx_substrate::step::YieldShape::OnEdge { .. } => {
+                        return SyscallResult::Error(errno_to_i32(Errno::EIO));
+                    }
+                }
+            }
+            tx_substrate::step::StepOutcome::Continue { .. } => {}
+            tx_substrate::step::StepOutcome::Err(errno) => {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+    }
 }

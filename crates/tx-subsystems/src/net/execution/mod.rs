@@ -42,10 +42,10 @@ pub use step_icmp_loopback::{
 };
 pub use step_listen::step_listen;
 pub use step_loopback_pending::{
-    step_process_loopback_pending, LoopbackPendingOutcome, LoopbackPollBudget,
-    LOOPBACK_POLL_BUDGET_DEFAULT,
+    step_process_loopback_pending, step_process_loopback_pending_zero, LoopbackPendingOutcome,
+    LoopbackPollBudget, LOOPBACK_POLL_BUDGET_DEFAULT,
 };
-pub use step_poll::step_poll_ready;
+pub use step_poll::{step_poll_ready, step_poll_wait_token};
 pub use step_process_network_events::{
     step_process_network_events, step_process_network_events_at, step_process_network_tick,
     step_process_network_tick_loopback, NetworkBacklogTickOutcome, NetworkStepOutcome,

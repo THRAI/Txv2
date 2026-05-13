@@ -181,6 +181,7 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
     }
     fs::copy(&busybox, layout.join("bin").join("busybox")).map_err(|err| err.to_string())?;
     install_optional_user_smokes(root, target, &layout)?;
+    install_optional_oscomp_net_tools(target, &layout)?;
 
     // IPC smoke test binary — copy if present
     let ipc_test_src = root.join("tools/images/ipc_test");
@@ -197,18 +198,7 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
                 musl.display()
             ));
         }
-        let libc = layout.join("lib").join("libc.so");
-        fs::copy(&musl, &libc).map_err(|err| err.to_string())?;
-        #[cfg(unix)]
-        {
-            for loader in ["ld-musl-riscv64.so.1", "ld-musl-loongarch64.so.1"] {
-                let loader_path = layout.join("lib").join(loader);
-                if loader_path.exists() {
-                    fs::remove_file(&loader_path).map_err(|err| err.to_string())?;
-                }
-                unix_fs::symlink("libc.so", loader_path).map_err(|err| err.to_string())?;
-            }
-        }
+        install_musl_libc(&layout, &musl)?;
     }
 
     fs::write(
@@ -260,6 +250,99 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
     }
 
     Ok(layout)
+}
+
+/// Optionally install OSComp/RustOS network benchmark binaries into
+/// the BusyBox rootfs.
+///
+/// This is deliberately opt-in: the benchmark binaries are large,
+/// live outside this repository, and mix static (`iperf3`) with
+/// dynamic (`netperf`/`netserver`) musl layouts depending on the
+/// source tree.
+///
+/// Supported knobs:
+///
+/// - `TX_OSCOMP_RISCV_MUSL_DIR=/path/to/testcase/riscv/musl` copies
+///   `iperf3`, `netperf`, `netserver` when present and installs
+///   `lib/libc.so` as the musl loader payload.
+/// - `TX_IPERF3`, `TX_NETPERF`, `TX_NETSERVER` copy individual
+///   binaries and override files from the directory knob.
+fn install_optional_oscomp_net_tools(target: TxTarget, layout: &Path) -> Result<()> {
+    if target != TxTarget::Rv64Qemu {
+        return Ok(());
+    }
+
+    if let Ok(dir) = env::var("TX_OSCOMP_RISCV_MUSL_DIR") {
+        let dir = PathBuf::from(dir);
+        if !dir.is_dir() {
+            return Err(format!(
+                "TX_OSCOMP_RISCV_MUSL_DIR must point at a directory, got {}",
+                dir.display()
+            ));
+        }
+        for name in ["iperf3", "netperf", "netserver"] {
+            copy_optional_binary(&dir.join(name), &layout.join("bin").join(name))?;
+        }
+        let libc = dir.join("lib").join("libc.so");
+        if libc.is_file() {
+            install_musl_libc(layout, &libc)?;
+        }
+    }
+
+    copy_env_binary("TX_IPERF3", &layout.join("bin").join("iperf3"))?;
+    copy_env_binary("TX_NETPERF", &layout.join("bin").join("netperf"))?;
+    copy_env_binary("TX_NETSERVER", &layout.join("bin").join("netserver"))?;
+
+    Ok(())
+}
+
+fn copy_env_binary(var: &str, dest: &Path) -> Result<()> {
+    let Ok(value) = env::var(var) else {
+        return Ok(());
+    };
+    let source = PathBuf::from(value);
+    if !source.is_file() {
+        return Err(format!(
+            "{var} must point at a file, got {}",
+            source.display()
+        ));
+    }
+    fs::copy(&source, dest).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn copy_optional_binary(source: &Path, dest: &Path) -> Result<()> {
+    if source.is_file() {
+        fs::copy(source, dest).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn install_musl_libc(layout: &Path, musl: &Path) -> Result<()> {
+    let libc = layout.join("lib").join("libc.so");
+    fs::copy(musl, &libc).map_err(|err| err.to_string())?;
+    install_musl_loader_links(layout)
+}
+
+#[cfg(unix)]
+fn install_musl_loader_links(layout: &Path) -> Result<()> {
+    for loader in [
+        "ld-musl-riscv64.so.1",
+        "ld-musl-riscv64-sf.so.1",
+        "ld-musl-loongarch64.so.1",
+    ] {
+        let loader_path = layout.join("lib").join(loader);
+        if loader_path.exists() {
+            fs::remove_file(&loader_path).map_err(|err| err.to_string())?;
+        }
+        unix_fs::symlink("libc.so", loader_path).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_musl_loader_links(_layout: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn install_optional_user_smokes(root: &Path, target: TxTarget, layout: &Path) -> Result<()> {

@@ -246,6 +246,84 @@ fn tcp_loopback_default_steps_use_persistent_loopback_iface() {
 }
 
 #[test]
+fn tcp_loopback_accepted_recv_without_payload_waits() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (client, listener, _local, _remote) = prepare_loopback_connect(40_170, 50_170);
+    let guard = tx_substrate::epoch::guard();
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("unexpected accept outcome"),
+    };
+
+    let mut out = [0u8; 37];
+    assert!(matches!(
+        step_recv_kernel_bytes(&accepted, &mut out, SendRecvFlags::empty(), &guard),
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn tcp_loopback_iperf_like_control_exchange_moves_both_directions() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (client, listener, _local, _remote) = prepare_loopback_connect(40_171, 50_171);
+    let guard = tx_substrate::epoch::guard();
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("unexpected accept outcome"),
+    };
+
+    let mut initial = [0u8; 37];
+    assert!(matches!(
+        step_recv_kernel_bytes(&accepted, &mut initial, SendRecvFlags::empty(), &guard),
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+
+    assert_tcp_payload_round_trip(
+        "client parameters",
+        &client,
+        &accepted,
+        b"client parameters",
+        &guard,
+    );
+    assert_tcp_payload_round_trip(
+        "server parameters",
+        &accepted,
+        &client,
+        b"server parameters",
+        &guard,
+    );
+    assert_tcp_payload_round_trip("client marker", &client, &accepted, b"!", &guard);
+    assert_tcp_payload_round_trip("client length", &client, &accepted, &[1, 0, 0, 0], &guard);
+    assert_tcp_payload_round_trip("server length", &accepted, &client, &[1, 0, 0, 0], &guard);
+    assert_tcp_payload_round_trip("server payload", &accepted, &client, &[0x7b; 123], &guard);
+    assert_tcp_payload_round_trip("client payload", &client, &accepted, &[0x5a; 123], &guard);
+}
+
+#[test]
 fn tcp_loopback_handshake_creates_child_from_listener_first_syn() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -1435,6 +1513,37 @@ fn tcp_loopback_handshake_requires_bound_client_for_now() {
         step_tcp_loopback_handshake(&client, &guard),
         StepOutcome::Err(Errno::EADDRNOTAVAIL)
     ));
+}
+
+fn assert_tcp_payload_round_trip(
+    label: &str,
+    source: &Cap<SocketIdentity>,
+    destination: &Cap<SocketIdentity>,
+    bytes: &[u8],
+    guard: &tx_subsystems::execution::Guard<'_>,
+) {
+    assert_eq!(
+        step_send_kernel_bytes(source, bytes, SendRecvFlags::empty(), guard),
+        StepOutcome::Done(bytes.len())
+    );
+    let transfer = match step_tcp_loopback_transfer(source, bytes.len(), guard) {
+        StepOutcome::Done(transfer) => transfer,
+        _ => panic!("unexpected tcp loopback transfer outcome"),
+    };
+    assert_eq!(transfer.bytes_moved, bytes.len(), "{label}");
+
+    let mut out = alloc::vec![0u8; bytes.len()];
+    assert_eq!(
+        step_recv_kernel_bytes(destination, &mut out, SendRecvFlags::empty(), guard),
+        StepOutcome::Done(crate::net::structure::SocketRecvBytesOutcome {
+            bytes: bytes.len(),
+            source: None,
+            destination: None,
+            truncated: false,
+            became_empty: true,
+        })
+    );
+    assert_eq!(out, bytes);
 }
 
 fn prepare_loopback_connect(
