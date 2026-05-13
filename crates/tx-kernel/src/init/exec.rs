@@ -488,6 +488,20 @@ impl<P: TxPlatform> CoreInit<P> {
         );
     }
 
+    /// Install the timer-sleep seam so `sys_nanosleep` / `sys_clock_nanosleep`
+    /// in `tx-shims` can park the calling task until a real deadline fires
+    /// in the BSP reactor's timer queue. Must be called before the reactor
+    /// task loop starts (BOOT_REACTOR lock must not be held at this call site).
+    pub(crate) fn install_sleep_seam() {
+        // Clone the TimerQueue Arc while outside the reactor task loop.
+        // `sleep_until_ns` will later call `tq.wait_until()` from within
+        // a reactor task, acquiring only the TimerQueue's own SpinLock —
+        // not the BOOT_REACTOR lock — avoiding re-entrancy deadlock.
+        if let Some(tq) = BOOT_REACTOR.with(|reactor| reactor.timer_queue()) {
+            tx_subsystems::timer_sleep::install_timer_queue(tq);
+        }
+    }
+
     /// Pre-ELF Phase 7: submit init's leader thread future as a
     /// reactor task, then drive the BSP hart-loop until the future
     /// resolves. Resolution happens when `run_thread` returns — the
@@ -551,6 +565,7 @@ impl<P: TxPlatform> CoreInit<P> {
         // the platform parameter `P` is captured at install time
         // here so the seam stays parameter-free at the call site.
         Self::install_reactor_submit_seam();
+        Self::install_sleep_seam();
 
         let Some(init) = tx_subsystems::process::execution::init_process() else {
             // No init process — nothing to drive. Skip cleanly.

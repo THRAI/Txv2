@@ -1,3 +1,20 @@
+- 2026-05-13 **`nanosleep` / `clock_nanosleep` real-duration sleep implemented.**
+  Previously returned `-ENOSYS` for any non-zero duration, causing the OSComp
+  `sleep` test to hit `--- Assert Fatal ! ---` immediately. Fix wires a
+  `TimerQueue` seam: `tx-kernel` clones the BSP reactor's internal `TimerQueue`
+  Arc at boot (outside the reactor task loop, so no re-entrancy deadlock) via a
+  new `tx_subsystems::timer_sleep` module with a global `SpinMutex<Option<TimerQueue>>`.
+  `sys_nanosleep` and `sys_clock_nanosleep` become `async fn` and `.await` a
+  `DeadlineFuture` from the queue; when `step_hart_loop_at` calls
+  `advance_time_to` on the next reactor tick past the deadline, the task wakes.
+  `tx-reactor::timer::{TimerQueue, DeadlineFuture}` made pub; `Reactor::sleep_until`
+  and `Reactor::timer_queue` added. `DeadlineFuture` re-exported from `tx_reactor`.
+  **Verified:** `cargo xtask oscomp qemu --target rv64-qemu` — `sleep` test now
+  prints `sleep success.` with `========== END test_sleep ==========`;
+  `cargo -q xtask unit` 4/4 clean (233+43+7+48 tests).
+  **Next step:** investigate remaining Assert Fatal failures (chdir, close, mount,
+  munmap, openat, unlink).
+
 - 2026-05-13 **DEntry parent-chain lifetime fix: `Weak<DEntry>` → `Cap<DEntry>`.**
   `DEntry.parent` was `Option<Weak<DEntry>>`. During a VFS walk the intermediate
   DEntries are locals dropped at loop-end, making the parent Weaks dead immediately

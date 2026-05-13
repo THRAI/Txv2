@@ -152,26 +152,20 @@ pub(super) fn sys_times<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 /// `nanosleep(req, rem)`. Linux RV64 generic ABI
 /// `__NR_nanosleep = 101`.
 ///
-/// **Slice 4 surface.** Validates `*req` (returns `-EINVAL` on
-/// negative fields or `tv_nsec >= 1_000_000_000`); short-circuits to
-/// `Return(0)` on a zero-duration request. Real non-zero durations
-/// return `-ENOSYS` — the per-task timer-fire wait carrier needed for
-/// proper park-until-deadline semantics is deferred (see the slice
-/// header comment). Null `req` returns `-EFAULT`.
+/// Validates `*req` (returns `-EINVAL` on negative fields or
+/// `tv_nsec >= 1_000_000_000`); zero-duration requests short-circuit
+/// immediately to `Return(0)`. Non-zero durations park the task on the
+/// reactor's timer queue until the absolute deadline passes, then
+/// return `0`. Null `req` returns `-EFAULT`.
 ///
-/// `rem` (args[1]) is currently ignored — only the EINTR-with-leftover
-/// path needs to populate it, and the slice does not yet have signal
-/// interruption of nanosleep wired.
-// `P` is unused in the body but kept on the signature so the dispatch
-// arm (`sys_nanosleep::<P>(...)`) keeps the same shape as every other
-// `TimeIf`-parameterised arm; clippy's extra-unused-type-parameters
-// gate is silenced via cfg_attr so the arch-lint substring check
-// (`#[allow(`) does not also fire.
+/// `rem` (args[1]) is ignored — no EINTR path wired yet.
 #[cfg_attr(not(test), allow(clippy::extra_unused_type_parameters))]
 #[cfg_attr(test, allow(clippy::extra_unused_type_parameters))]
-pub(super) fn sys_nanosleep<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let req_uaddr = args[0];
-    // args[1] = rem (ignored — no EINTR path in Slice 4).
     let req_ns = match read_timespec_at(&ctx.aspace, req_uaddr) {
         Some(ns) => ns,
         None if req_uaddr == 0 => return SyscallResult::Error(EFAULT_VALUE),
@@ -180,33 +174,27 @@ pub(super) fn sys_nanosleep<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>)
     if req_ns == 0 {
         return SyscallResult::Return(0);
     }
-    // Real-duration sleeps deferred — see slice header. busybox sh
-    // does not exercise this on the critical path, so returning
-    // -ENOSYS keeps the contract honest while the timer-channel
-    // wiring lands in a follow-up slice.
-    SyscallResult::Error(ENOSYS_VALUE)
+    let deadline_ns = <P as TimeIf>::read_ns().saturating_add(req_ns);
+    if let Some(future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) {
+        let _ = future.await;
+    }
+    SyscallResult::Return(0)
 }
 
 /// `clock_nanosleep(clk_id, flags, req, rem)`. Linux RV64 generic ABI
 /// `__NR_clock_nanosleep = 115`.
 ///
-/// **Slice 4 surface.** Same deferral as `nanosleep`: the
-/// zero-duration / past-deadline short-circuit ships, real
-/// non-zero-future deadlines return `-ENOSYS`. Honours
-/// `TIMER_ABSTIME` for the past-deadline check (when set, `req`
-/// is interpreted as an absolute deadline — past deadlines short-
-/// circuit immediately to `Return(0)`).
-///
-/// Recognised clock ids match `clock_gettime`. Unknown clock ids and
-/// unknown flag bits return `-EINVAL`. Null `req` returns `-EFAULT`.
-pub(super) fn sys_clock_nanosleep<'a, P: TimeIf>(
+/// Same semantics as `nanosleep` plus `TIMER_ABSTIME`: when set `req`
+/// is an absolute deadline; past deadlines return `0` immediately.
+/// Recognised clock ids match `clock_gettime`. Unknown clock ids or
+/// flag bits return `-EINVAL`. Null `req` returns `-EFAULT`.
+pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
     let clk_id = args[0] as u32;
     let flags = args[1] as u32;
     let req_uaddr = args[2];
-    // args[3] = rem (ignored — no EINTR path in Slice 4).
 
     match clk_id {
         CLOCK_REALTIME
@@ -236,6 +224,8 @@ pub(super) fn sys_clock_nanosleep<'a, P: TimeIf>(
     if now >= deadline_ns {
         return SyscallResult::Return(0);
     }
-    // Real-duration sleeps deferred — see `sys_nanosleep`.
-    SyscallResult::Error(ENOSYS_VALUE)
+    if let Some(future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) {
+        let _ = future.await;
+    }
+    SyscallResult::Return(0)
 }
