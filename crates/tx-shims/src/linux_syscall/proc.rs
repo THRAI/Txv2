@@ -4,6 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use crate::adapter::step_engine::{self as step_engine, StepOp};
 
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///
@@ -74,20 +75,10 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 // fn) — no `*Op` wrap exists for the exec orchestration today.
 // When `exec_script` gains a StepOp wrap (or is decomposed into a
 // pipeline of wraps), thread `&mut KernelScriptCtx` here.
-pub static SYS_EXECVE_INVOCATIONS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static SYS_CLONE_INVOCATIONS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static SYS_WAIT4_INVOCATIONS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static SYS_EXECVE_LAST_ERRNO: core::sync::atomic::AtomicI32 =
-    core::sync::atomic::AtomicI32::new(0);
-
 pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
-    SYS_EXECVE_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let path_uaddr = args[0];
     let argv_uaddr = args[1];
     let envp_uaddr = args[2];
@@ -212,22 +203,14 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
 /// v1's single-thread-per-process model). The function is non-`async`
 /// to keep the seam minimal.
-pub static SYS_CLONE_LAST_FLAGS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-pub static SYS_CLONE_LAST_REJECT_FLAGS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-
 pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    SYS_CLONE_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let flags = args[0];
     let stack = args[1];
-    SYS_CLONE_LAST_FLAGS.store(flags, core::sync::atomic::Ordering::Relaxed);
 
     // Validation: bare-SIGCHLD only. Reject any other flag combo
     // (CLONE_VM, CLONE_VFORK, pthread_create OR-set, zero, etc.) and
     // any non-zero stack.
     if flags != SIGCHLD {
-        SYS_CLONE_LAST_REJECT_FLAGS.store(flags, core::sync::atomic::Ordering::Relaxed);
         return SyscallResult::Error(EINVAL_VALUE);
     }
     if stack != 0 {
@@ -259,7 +242,7 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     // syscall entry. `step_fork` reads the parent cred internally
     // (via `payload.cred()`) to seed the child — the subject's role
     // here is SUBJ-1 hygiene, not driving the fork-time cred copy.
-    use tx_substrate::step_v3::{StepOp, StepOutcome as V3Fork};
+    use step_engine::{StepOp, StepOutcome as V3Fork};
     let mut script_ctx = build_subject_script_ctx(ctx);
     let fork_result = {
         let mut op = tx_subsystems::process::execution::ForkOp::<P> {
@@ -369,7 +352,6 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 /// Cites: `txdoc:PROCESS-WAIT-FAMILY-1`
 /// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4).
 pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    SYS_WAIT4_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let pid = args[0] as i64 as i32;
     let wstatus_uaddr = args[1];
     let options = args[2] as i32;

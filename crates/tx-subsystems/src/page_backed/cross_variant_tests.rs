@@ -1,12 +1,14 @@
 use super::*;
 use alloc::vec;
 use alloc::vec::Vec;
-use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
+use crate::page_backed::adapter::step_engine::{
+    self as step_engine, Errno as V3Errno, StepOutcome as V3Out,
+};
 
 fn setup_host_substrate() {
-    tx_substrate::testing::init_host_for_test_once();
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    tx_test_support::init_host();
+    match step_engine::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for cross-variant tests: {error:?}"),
     }
 }
@@ -31,7 +33,7 @@ fn write_pattern(pc: &PageContainer, offset: u64, bytes: &[u8], guard: &Guard<'_
             V3Out::Done(m) => m,
             other => panic!("materialize_page during pattern write: {other:?}"),
         };
-        tx_substrate::page_allocator::testing::write_frame_bytes_for_test(
+        step_engine::page_allocator::testing::write_frame_bytes_for_test(
             materialized.ppn,
             within,
             &left[..chunk],
@@ -54,7 +56,7 @@ fn read_pattern(pc: &PageContainer, offset: u64, len: usize, guard: &Guard<'_>) 
             V3Out::Done(m) => m,
             other => panic!("materialize_page during pattern read: {other:?}"),
         };
-        tx_substrate::page_allocator::testing::read_frame_bytes_for_test(
+        step_engine::page_allocator::testing::read_frame_bytes_for_test(
             materialized.ppn,
             within,
             &mut left[..chunk],
@@ -72,7 +74,7 @@ fn pagebacked_step_copy_file_range_anon_to_anon_within_one_page_each() {
         .lock()
         .expect("page-backed cross-variant test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let src = anon_pc(2);
     let dst = anon_pc(2);
     assert_eq!(step_truncate(&dst, 0, &guard), V3Out::Done(()));
@@ -92,7 +94,7 @@ fn pagebacked_step_copy_file_range_crosses_page_boundary_at_different_alignments
         .lock()
         .expect("page-backed cross-variant test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let src = anon_pc(3);
     let dst = anon_pc(3);
 
@@ -112,7 +114,7 @@ fn pagebacked_step_copy_file_range_truncates_to_source_eof() {
         .lock()
         .expect("page-backed cross-variant test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let src = anon_pc(2);
     let dst = anon_pc(2);
 
@@ -131,7 +133,7 @@ fn pagebacked_step_copy_file_range_returns_done_zero_when_source_is_at_eof() {
         .lock()
         .expect("page-backed cross-variant test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let src = anon_pc(1);
     let dst = anon_pc(1);
 
@@ -151,7 +153,7 @@ fn pagebacked_step_copy_file_range_rejects_device_destination() {
         .lock()
         .expect("page-backed cross-variant test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let src = anon_pc(1);
     let device = PageContainer::new(
         PageContainerKind::Device {
@@ -174,7 +176,7 @@ fn pagebacked_step_copy_file_range_rejects_writes_past_destination_capacity() {
         .lock()
         .expect("page-backed cross-variant test lock");
     setup_host_substrate();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let src = anon_pc(2);
     let dst = anon_pc(1);
 

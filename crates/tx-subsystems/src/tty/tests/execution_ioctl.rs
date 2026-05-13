@@ -1,7 +1,6 @@
 //! TTY execution ioctl step tests.
 
-use tx_substrate::step_v3::StepOutcome;
-
+use crate::tty::adapter::step_engine::{guard, StepOutcome};
 use crate::tty::execution::{step_ioctl_tcgets, step_ioctl_tcsets, step_read, TTY_READABLE};
 use crate::tty::structure::termios::ICANON;
 use crate::tty::structure::{TtyKind, TtyPayload};
@@ -12,7 +11,7 @@ use super::support::{alloc_tty, init_zones, NOOP_BINDING, TTY_ZONE_TEST_LOCK};
 fn tcsets_without_pending_canonical_bytes_leaves_read_side_quiet() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::SerialHardware,
         14,

@@ -70,9 +70,6 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_substrate::step_v3::{StepOp, StepOutcome as V3Out};
-use tx_substrate::zone::Cap;
-use tx_substrate::SpinMutex;
 use tx_subsystems::aio::{
     is_valid_iocb_opcode, spawn_worker_for_context, AioContext, AioWorkerFuture, IoEvent, Iocb,
     IocbDispatcher, EVENTS_AVAILABLE_MASK, IOCB_CMD_PREAD, IOCB_CMD_PWRITE, IO_EVENT_BYTES,
@@ -87,6 +84,8 @@ use tx_subsystems::wait_source;
 
 use super::{bootstrap_copy_from_user, bootstrap_copy_to_user, SyscallCtx, SyscallResult};
 use super::{EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
+use crate::adapter::step_engine::{self as step_engine, Cap, SpinMutex, StepOp, SubjectIdentity};
+use crate::adapter::step_engine::StepOutcome as V3Out;
 
 // === Linux negative-errno values used by the dispatcher =============
 //
@@ -218,7 +217,7 @@ fn dispatch_pwrite(
 /// defensive against unexpected Yield/Err shapes.
 fn run_lseek_set(file: &Cap<OpenFile>, offset: i64) -> bool {
     let mut script_ctx = crate::KernelScriptCtx::new();
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let mut op = OpenFileLseekOp {
         file,
         offset,
@@ -242,7 +241,7 @@ fn run_read(file: &Cap<OpenFile>, out: &mut [u8]) -> Result<usize, i64> {
     let total_len = out.len();
     loop {
         let outcome = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let mut op = OpenFileReadOp {
                 file,
                 out: &mut out[total..],
@@ -289,7 +288,7 @@ fn run_write(file: &Cap<OpenFile>, bytes: &[u8]) -> Result<usize, i64> {
     let mut remaining = bytes;
     loop {
         let outcome = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let mut op = OpenFileWriteOp {
                 file,
                 bytes: remaining,

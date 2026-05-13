@@ -24,12 +24,12 @@
 
 use std::sync::Arc;
 
-use tx_reactor::{TimerGuardRole, TimerWheel};
-use tx_substrate::step_v3::{
+use tx_reactor::adapter::bus_wire::{MailboxEvent, TaskMailbox};
+use tx_reactor::adapter::step_engine::{
     AbortReason, AgentCancelPolicy, Deadline, DelegateRegistry, DelegateReply, DelegateRequest,
     DelegateState, DelegateTokenId, TokenDropPolicy, TransitionOutcome,
 };
-use tx_substrate::wake::{MailboxEvent, TaskMailbox};
+use tx_reactor::{TimerGuardRole, TimerWheel};
 
 // ---------------------------------------------------------------------------
 // 1. install_delegate_timeout shape pin.

@@ -1037,11 +1037,117 @@ fn tx_rv64_qemu_trap_panic(frame: &Rv64TrapFrame) -> ! {
     console_write_literal(b"txkernel:qemu-riscv64-virt:trap\nreason=trap-action-terminate\n");
     console_write_trap_summary(frame);
     console_write_trapframe(frame);
+    console_write_fp_chain(frame.x[8]);
+    console_write_stack_dump(frame.x[2], 32);
 
     loop {
         core::hint::spin_loop();
     }
 }
+
+#[cfg(target_arch = "riscv64")]
+fn console_write_fp_chain(initial_fp: usize) {
+    // Kernel canonical addresses in SV39 have bits [63:39] all set.
+    const KERNEL_ADDR_MIN: usize = 0xffff_0000_0000_0000;
+
+    let mut fp = initial_fp;
+    if fp == 0 || fp < KERNEL_ADDR_MIN || fp & 7 != 0 {
+        return;
+    }
+
+    console_write_literal(b"fp chain:\n");
+
+    for _ in 0..64 {
+        let ra_ptr = fp.wrapping_sub(8);
+        let fp_ptr = fp.wrapping_sub(16);
+        if ra_ptr < KERNEL_ADDR_MIN || fp_ptr < KERNEL_ADDR_MIN {
+            break;
+        }
+        // SAFETY: both addresses are kernel-canonical, aligned, and within
+        // the frame we received from the trap handler's own stack walk. Any
+        // fault here would be a kernel bug, not a user-triggerable path.
+        let saved_ra = unsafe { *(ra_ptr as *const usize) };
+        let saved_fp = unsafe { *(fp_ptr as *const usize) };
+
+        console_write_literal(b"  fp=0x");
+        console_write_hex(fp);
+        console_write_literal(b" ra=0x");
+        console_write_hex(saved_ra);
+        console_write_literal(b"\n");
+
+        // Stack grows down: next fp must be strictly higher and aligned.
+        if saved_fp == 0 || saved_fp <= fp || saved_fp < KERNEL_ADDR_MIN || saved_fp & 7 != 0 {
+            break;
+        }
+        fp = saved_fp;
+    }
+}
+
+/// Emit a raw dump of up to `word_count` 8-byte words starting at `sp`.
+///
+/// Format (parsed by `xtask fault-decode`):
+/// ```text
+/// stack dump: sp=0x{addr}
+///   0x{addr}: 0x{w0} 0x{w1} 0x{w2} 0x{w3}
+///   ...
+/// ```
+#[cfg(target_arch = "riscv64")]
+fn console_write_stack_dump(sp: usize, word_count: usize) {
+    const KERNEL_ADDR_MIN: usize = 0xffff_0000_0000_0000;
+    if sp == 0 || sp < KERNEL_ADDR_MIN || sp & 7 != 0 || word_count == 0 {
+        return;
+    }
+    console_write_literal(b"stack dump: sp=0x");
+    console_write_hex(sp);
+    console_write_literal(b"\n");
+
+    let mut i = 0usize;
+    while i < word_count {
+        let addr = sp.wrapping_add(i * core::mem::size_of::<usize>());
+        if addr < KERNEL_ADDR_MIN {
+            break;
+        }
+        let row_words = (word_count - i).min(4);
+        console_write_literal(b"  0x");
+        console_write_hex(addr);
+        console_write_literal(b":");
+        for j in 0..row_words {
+            let word_addr = addr.wrapping_add(j * core::mem::size_of::<usize>());
+            if word_addr < KERNEL_ADDR_MIN {
+                break;
+            }
+            // SAFETY: word_addr is kernel-canonical, 8-byte aligned, and
+            // within the live kernel stack at the time of the trap.
+            let word = unsafe { *(word_addr as *const usize) };
+            console_write_literal(b" 0x");
+            console_write_hex(word);
+        }
+        console_write_literal(b"\n");
+        i += row_words;
+    }
+}
+
+/// Emit a synthetic scause/sepc/stval summary line and fp-chain for a
+/// software panic, formatted identically to a hardware trap so that
+/// `xtask fault-decode` can analyze the panic site.
+///
+/// `ra` is the return address captured at the panic call site (sepc).
+/// `fp` is the frame pointer at that point; the fp-chain walk starts from it.
+#[cfg(target_arch = "riscv64")]
+pub fn emit_panic_location(fp: usize, ra: usize) {
+    // scause=3 (breakpoint) is used as a synthetic code for software panics
+    // to distinguish them from hardware breakpoints. sepc=ra, stval=0.
+    console_write_literal(b"scause=0x0000000000000003 sepc=0x");
+    console_write_hex(ra);
+    console_write_literal(b" stval=0x0000000000000000\n");
+    console_write_fp_chain(fp);
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Host-build placeholder so the platform surface typechecks on
+/// non-riscv64 hosts. No-op; the real implementation is the riscv64
+/// version above.
+pub fn emit_panic_location(_fp: usize, _ra: usize) {}
 
 #[cfg(target_arch = "riscv64")]
 fn console_write_trap_summary(frame: &Rv64TrapFrame) {

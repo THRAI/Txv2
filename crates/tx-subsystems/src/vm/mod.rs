@@ -7,6 +7,7 @@
 //! epoch recipe snapshots remain a staged seam; pmap materialization owns
 //! HAL `PmapIf` root evidence through `pmap.rs`.
 
+pub mod adapter;
 pub mod checks;
 pub mod execution;
 mod pmap;

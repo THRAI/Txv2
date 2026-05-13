@@ -1,6 +1,9 @@
 #![no_std]
 
+pub mod hart_local;
 pub mod time;
+
+pub use hart_local::{HartLocal, MAX_HARTS};
 
 use core::marker::PhantomData;
 

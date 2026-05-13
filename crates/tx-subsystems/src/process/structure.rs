@@ -30,11 +30,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
-use tx_reactor::wait::{Channel, Mask};
-use tx_substrate::step_v3::InterestMask;
-use tx_substrate::wake::WaitSource;
-use tx_substrate::zone::{Cap, Dead, Entity, PayloadCap, Weak, Zone, ZoneAllocated};
-use tx_substrate::SpinMutex;
+use crate::process::adapter::step_engine::{
+    self, AtomicSlot, Cap, Dead, Entity, PayloadCap, SpinMutex, Weak, Zone, ZoneAllocated,
+};
+use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
 
 use crate::cred::{Cred, Gid, Uid};
 use crate::execution::WaitToken;
@@ -43,7 +42,6 @@ use crate::thread_runtime::ThreadIdentity;
 use crate::tty::structure::identity::TtyIdentity;
 use crate::vfs::{DEntry, OpenFile};
 use crate::vm::AddressSpace;
-use tx_substrate::AtomicSlot;
 
 /// Bit-mask for the "child has zombified" event on the per-process
 /// `exit_source`. Future events (stop, continue) get their own bits
@@ -169,7 +167,7 @@ pub struct ProcessIdentity {
     pub(crate) payload: SpinMutex<Option<PayloadCap<ProcessPayload>>>,
 }
 
-/// `ProcessIdentity` is the production [`tx_substrate::step_v3::SubjectIdentity`]
+/// `ProcessIdentity` is the production [`SubjectIdentity`]
 /// per [D1](../../../../docs/progress/decisions/2026-05-11-d1-scriptctx-trait-bound-identity.md).
 ///
 /// The trait declares what `step_v3` algebra needs to know about a
@@ -184,14 +182,13 @@ pub struct ProcessIdentity {
 /// `Restrictions` associated type will swap to the real type then;
 /// callers using `<I as SubjectIdentity>::Restrictions` will not
 /// need to change.
-impl tx_substrate::step_v3::SubjectIdentity for ProcessIdentity {
+impl step_engine::SubjectIdentity for ProcessIdentity {
     type Credential = crate::cred::Cred;
-    type Restrictions = tx_substrate::step_v3::RestrictionStackHandle;
+    type Restrictions = step_engine::RestrictionStackHandle;
     type ThreadIdentity = crate::thread_runtime::ThreadIdentity;
 
-    fn exit_source(&self) -> Option<tx_substrate::step_v3::WaitSourceId> {
-        self.exit_source_id()
-            .map(tx_substrate::step_v3::WaitSourceId::new)
+    fn exit_source(&self) -> Option<step_engine::WaitSourceId> {
+        self.exit_source_id().map(step_engine::WaitSourceId::new)
     }
 }
 
@@ -208,7 +205,7 @@ impl ProcessIdentity {
     /// and after the parent identity has been fully reclaimed.
     pub fn parent_cap(&self) -> Option<Cap<ProcessIdentity>> {
         let weak = (*self.parent.lock())?;
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         weak.upgrade(&guard)
     }
 
@@ -622,7 +619,7 @@ impl ProcessIdentity {
                 // WaitSource share the bit-namespace
                 // (`EXIT_SOURCE_CHILD_ZOMBIFIED` and future stop/cont
                 // bits land in both).
-                p.exit_wait_source().notify(InterestMask::new(mask.bits()));
+                wait_routing::notify_v3_source(&p.exit_wait_source(), mask.bits());
                 released
             })
             .unwrap_or(0)
@@ -675,7 +672,7 @@ impl Entity for ProcessIdentity {
     type OperationalEvidence = PayloadCap<ProcessPayload>;
 
     fn upgrade_operational(
-        identity: &tx_substrate::zone::Cap<Self>,
+        identity: &Cap<Self>,
     ) -> Result<Self::OperationalEvidence, Dead> {
         identity.payload.lock().as_ref().cloned().ok_or(Dead)
     }
@@ -1185,7 +1182,7 @@ impl Session {
     /// or the TTY identity has been reclaimed.
     pub fn controlling_tty_cap(&self) -> Option<Cap<TtyIdentity>> {
         let weak = (*self.controlling_tty.lock())?;
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         weak.upgrade(&guard)
     }
 
@@ -1214,13 +1211,13 @@ impl Session {
     /// Used by TTY hangup producers that need a typed session-leader pgrp
     /// target for SIGHUP fanout.
     pub fn leader_pgrp_cap(&self) -> Option<Cap<ProcessGroup>> {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         self.leader_pgrp_cap_with_guard(&guard)
     }
 
     pub(crate) fn leader_pgrp_cap_with_guard(
         &self,
-        guard: &tx_substrate::epoch::Guard<'_>,
+        guard: &step_engine::Guard<'_>,
     ) -> Option<Cap<ProcessGroup>> {
         let leader_pgid = Pgid(self.sid.0);
         for weak in self.members.lock().iter() {
@@ -1280,7 +1277,7 @@ pub(crate) fn reset_pid_counter_for_test() {
 #[cfg(test)]
 mod subject_identity_tests {
     use super::ProcessIdentity;
-    use tx_substrate::step_v3::SubjectIdentity;
+    use crate::process::adapter::step_engine::{RestrictionStackHandle, SubjectIdentity};
 
     /// Compile-only smoke: associated types must resolve so generic
     /// bodies `fn step<I: SubjectIdentity>(...)` can name them.
@@ -1288,7 +1285,7 @@ mod subject_identity_tests {
     fn process_identity_implements_subject_identity_with_expected_associated_types() {
         fn assert_credential<I: SubjectIdentity<Credential = crate::cred::Cred>>() {}
         fn assert_restrictions<
-            I: SubjectIdentity<Restrictions = tx_substrate::step_v3::RestrictionStackHandle>,
+            I: SubjectIdentity<Restrictions = RestrictionStackHandle>,
         >() {
         }
         fn assert_thread<

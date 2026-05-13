@@ -79,12 +79,11 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use tx_hal::{PercpuIf, PmapIf, TrapIf, TxPlatform};
-use tx_reactor::ast::AstBatch;
-use tx_reactor::userspace::{
+use boot_runtime::ast::AstBatch;
+use boot_runtime::userspace::{
     PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserspaceEntryDecision,
     UserspaceTrapInfo,
 };
-use tx_substrate::zone::PayloadCap;
 use tx_subsystems::process::execution::step_exit_group_with_signal;
 use tx_subsystems::signal::Signum;
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload;
@@ -92,6 +91,8 @@ use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, set_current_thread_payload, ThreadIdentity, ThreadPayload,
 };
 use tx_subsystems::vm::{AccessMode, UserVirtAddr, VmFault};
+use crate::adapter::step_engine::{Cap, PayloadCap};
+use crate::adapter::boot_runtime;
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
 /// `AccessMode`, which is what `VmFault` consumes. The two enums do
@@ -190,7 +191,7 @@ impl<P: TxPlatform, F: Future> Future for PerHartSlotted<P, F> {
 /// `txdoc:THREAD-4-2-OWNERSHIP`; epoch-managed `Cap` is safe across
 /// yields. No `IdentRef<'g, _>` ever crosses an await.
 pub async fn run_thread<P: TxPlatform>(
-    thread: tx_substrate::zone::Cap<ThreadIdentity>,
+    thread: Cap<ThreadIdentity>,
     payload: PayloadCap<ThreadPayload>,
 ) {
     loop {

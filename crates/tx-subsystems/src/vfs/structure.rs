@@ -11,9 +11,8 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_reactor::wait::Channel;
-use tx_substrate::step_v3::WaitSourceId;
-use tx_substrate::wake::WaitSource;
+use crate::vfs::adapter::step_engine::{self, Cap, Weak, Zone, ZoneAllocated, ZoneError};
+use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
 
 use crate::aio::AioContext;
 use crate::cred::{CapabilitySet, Cred};
@@ -29,7 +28,6 @@ use crate::tty::structure::TtyIdentity;
 use crate::tty::structure::{Termios, Winsize};
 use crate::userfaultfd::UserfaultFd;
 use crate::wait_source;
-use tx_substrate::zone::{self, Cap, Weak, Zone, ZoneAllocated, ZoneError};
 
 pub const VFS_NAME_MAX: usize = 255;
 
@@ -536,10 +534,10 @@ impl RNode {
     pub fn new(fs_object_id: FsObjectId, meta: InodeMeta, backing: RNodeBacking) -> Self {
         let read_wait_channel = Channel::new();
         let read_wait_source_id = wait_source::register_wait_channel(read_wait_channel.clone());
-        let read_wait_source = Arc::new(WaitSource::new(WaitSourceId::new(read_wait_source_id)));
+        let read_wait_source = wait_routing::new_wait_source(read_wait_source_id);
         let write_wait_channel = Channel::new();
         let write_wait_source_id = wait_source::register_wait_channel(write_wait_channel.clone());
-        let write_wait_source = Arc::new(WaitSource::new(WaitSourceId::new(write_wait_source_id)));
+        let write_wait_source = wait_routing::new_wait_source(write_wait_source_id);
         Self {
             fs_object_id,
             meta,
@@ -559,11 +557,7 @@ impl RNode {
         meta: InodeMeta,
         backing: RNodeBacking,
     ) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(
-            reservation,
-            Self::new(fs_object_id, meta, backing),
-        ))
+        step_engine::sign(Self::new(fs_object_id, meta, backing))
     }
 
     /// Like `new_cap` but stamps `containing_mount` immediately so
@@ -578,8 +572,8 @@ impl RNode {
         backing: RNodeBacking,
         mount: &Cap<MountPayload>,
     ) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(
+        let reservation = step_engine::reserve_for::<Self>()?;
+        Ok(step_engine::sign_for(
             reservation,
             Self::new(fs_object_id, meta, backing).with_containing_mount(mount),
         ))
@@ -675,21 +669,15 @@ impl RNode {
     /// either both paths fire or neither does, matching the
     /// exit_source / tty templates).
     pub fn fire_read_wait(&self, mask: u64) -> usize {
-        let released = self
-            .read_wait_channel
-            .fire(tx_reactor::wait::Mask::from_bits(mask));
-        self.read_wait_source
-            .notify(tx_substrate::step_v3::InterestMask::new(mask));
+        let released = wait_routing::fire_legacy_channel(&self.read_wait_channel, mask);
+        wait_routing::notify_v3_source(&self.read_wait_source, mask);
         released
     }
 
     /// Companion to [`Self::fire_read_wait`] for the writable direction.
     pub fn fire_write_wait(&self, mask: u64) -> usize {
-        let released = self
-            .write_wait_channel
-            .fire(tx_reactor::wait::Mask::from_bits(mask));
-        self.write_wait_source
-            .notify(tx_substrate::step_v3::InterestMask::new(mask));
+        let released = wait_routing::fire_legacy_channel(&self.write_wait_channel, mask);
+        wait_routing::notify_v3_source(&self.write_wait_source, mask);
         released
     }
 }
@@ -734,7 +722,7 @@ impl core::fmt::Debug for RNode {
 #[derive(Debug)]
 pub struct DEntry {
     name: InlineName,
-    parent: Option<Cap<DEntry>>,
+    parent: Option<Weak<DEntry>>,
     rnode: Cap<RNode>,
     mounted: Option<Weak<MountIdentity>>,
 }
@@ -750,8 +738,7 @@ impl DEntry {
     }
 
     pub fn new_cap(name: InlineName, rnode: Cap<RNode>) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(reservation, Self::new(name, rnode)))
+        step_engine::sign(Self::new(name, rnode))
     }
 
     pub const fn name(&self) -> InlineName {
@@ -763,18 +750,15 @@ impl DEntry {
     }
 
     pub fn set_parent_hint(&mut self, parent: &Cap<DEntry>) {
-        self.parent = Some(parent.clone());
+        self.parent = Some(parent.downgrade());
     }
 
     pub fn set_mounted_hint(&mut self, mount: &Cap<MountIdentity>) {
         self.mounted = Some(mount.downgrade());
     }
 
-    /// Return the parent-hint `Cap<DEntry>` if installed. Returns
-    /// `None` for root dentries or dentries that haven't had
-    /// `set_parent_hint` called. The parent is kept alive by the
-    /// strong reference so the chain never breaks due to reclamation.
-    pub fn parent_hint(&self) -> Option<Cap<DEntry>> {
+    /// Return the parent-hint `Weak<DEntry>` if installed.
+    pub fn parent_hint(&self) -> Option<Weak<DEntry>> {
         self.parent.clone()
     }
 
@@ -811,7 +795,12 @@ pub fn render_dentry_path(dentry: &Cap<DEntry>) -> Option<alloc::vec::Vec<u8>> {
     components.push(dentry.name());
 
     let mut current = dentry.parent_hint();
-    while let Some(parent_cap) = current {
+    let guard = step_engine::guard();
+    while let Some(parent_weak) = current {
+        let Some(parent_cap) = parent_weak.upgrade(&guard) else {
+            // Chain broken — a parent identity has been reclaimed.
+            return None;
+        };
         components.push(parent_cap.name());
         current = parent_cap.parent_hint();
     }
@@ -955,8 +944,7 @@ impl OpenFile {
     }
 
     pub fn new_cap(rnode: Cap<RNode>, flags: OpenFileFlags) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(reservation, Self::new(rnode, flags)))
+        step_engine::sign(Self::new(rnode, flags))
     }
 
     /// Construct a userfaultfd-backed `OpenFile` (PR-10 phase 0). The
@@ -981,11 +969,7 @@ impl OpenFile {
         ufd: Cap<UserfaultFd>,
         flags: OpenFileFlags,
     ) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(
-            reservation,
-            Self::new_userfaultfd(ufd, flags),
-        ))
+        step_engine::sign(Self::new_userfaultfd(ufd, flags))
     }
 
     /// Construct an AIO-context-backed `OpenFile` (PR-11 phase 1). The
@@ -1011,11 +995,7 @@ impl OpenFile {
         ctx: Cap<AioContext>,
         flags: OpenFileFlags,
     ) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(
-            reservation,
-            Self::new_aio_context(ctx, flags),
-        ))
+        step_engine::sign(Self::new_aio_context(ctx, flags))
     }
 
     /// Construct a signalfd-backed `OpenFile` (D9-D). The resulting
@@ -1036,8 +1016,7 @@ impl OpenFile {
         sfd: Cap<SignalFd>,
         flags: OpenFileFlags,
     ) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(reservation, Self::new_signalfd(sfd, flags)))
+        step_engine::sign(Self::new_signalfd(sfd, flags))
     }
 
     /// Construct an io_uring-backed `OpenFile` (future PR-12 phase 0 —
@@ -1060,8 +1039,7 @@ impl OpenFile {
         ring: Cap<IoUring>,
         flags: OpenFileFlags,
     ) -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(reservation, Self::new_io_uring(ring, flags)))
+        step_engine::sign(Self::new_io_uring(ring, flags))
     }
 
     /// Snapshot the backing shape. Callers that may handle either an

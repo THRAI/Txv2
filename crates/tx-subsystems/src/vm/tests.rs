@@ -76,7 +76,7 @@ fn counting_pmap_counters() -> CountingPmapCounters {
 
 fn wait_for_counting_pmap_counters(expected: CountingPmapCounters) {
     for _ in 0..1024 {
-        let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        let _ = tx_test_support::drain_once_unbounded();
         if counting_pmap_counters() == expected {
             return;
         }
@@ -178,14 +178,13 @@ fn setup_host_substrate() {
             *slot = Some(EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
         }
     });
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     crate::zones::register_all().expect("kernel zones");
-    match tx_substrate::page_allocator::claim_zero_frame() {
-        Ok(_) | Err(tx_substrate::page_allocator::AllocError::AlreadyInstalled) => {}
+    match crate::vm::adapter::step_engine::page_allocator::claim_zero_frame() {
+        Ok(_) | Err(crate::vm::adapter::step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for VM tests: {error:?}"),
     }
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
-    let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 }
 
 fn page_backing(offset: u64) -> VmBacking {
@@ -468,7 +467,7 @@ fn vm_recipe_snapshot_reader_survives_split_rewrite_publication() {
         .expect("initial map");
 
     let before = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = crate::vm::adapter::step_engine::guard();
         aspace.recipes.snapshot_reader(&guard)
     };
 
@@ -1217,7 +1216,7 @@ fn vm_aspace_reserve_user_range_for_access_publishes_private_anon_pages() {
         aspace.reserve_user_range_for_access(range(0x10000, 3), crate::vm::UserAccessKind::Write);
     assert!(matches!(
         outcome,
-        tx_substrate::step_v3::StepOutcome::Done(())
+        crate::vm::adapter::step_engine::StepOutcome::Done(())
     ));
     for page in [UserPage(0x10), UserPage(0x11), UserPage(0x12)] {
         let snap = aspace
@@ -1266,7 +1265,7 @@ fn vm_aspace_reserve_user_range_for_access_returns_efault_for_unmapped() {
         aspace.reserve_user_range_for_access(range(0x30000, 1), crate::vm::UserAccessKind::Read);
     assert_eq!(
         outcome,
-        tx_substrate::step_v3::StepOutcome::err(crate::execution::Errno::EFAULT.into())
+        crate::vm::adapter::step_engine::StepOutcome::err(crate::execution::Errno::EFAULT.into())
     );
     assert_eq!(aspace.pmap().stats().mapped_pages, 0);
 }
@@ -1291,7 +1290,7 @@ fn vm_aspace_reserve_user_range_for_access_propagates_prot_mismatch_efault() {
         aspace.reserve_user_range_for_access(range(0x40000, 1), crate::vm::UserAccessKind::Write);
     assert_eq!(
         outcome,
-        tx_substrate::step_v3::StepOutcome::err(crate::execution::Errno::EFAULT.into())
+        crate::vm::adapter::step_engine::StepOutcome::err(crate::execution::Errno::EFAULT.into())
     );
 }
 
@@ -1317,11 +1316,11 @@ fn vm_aspace_copy_from_user_consistent_with_prior_copy_to_user_for_private_anon(
     .commit()
     .expect("anon map");
 
-    let guard = tx_substrate::epoch::guard();
+    let guard = crate::vm::adapter::step_engine::guard();
     let dst = tx_hal::UserPtr::<u8>::new(user_va);
     let payload: alloc::vec::Vec<u8> = (0u8..200).collect();
     match aspace.copy_to_user(dst, &payload, &guard) {
-        tx_substrate::step_v3::StepOutcome::Done(n) => assert_eq!(n, payload.len()),
+        crate::vm::adapter::step_engine::StepOutcome::Done(n) => assert_eq!(n, payload.len()),
         other => panic!("copy_to_user expected Done, got {other:?}"),
     }
 
@@ -1336,7 +1335,7 @@ fn vm_aspace_copy_from_user_consistent_with_prior_copy_to_user_for_private_anon(
     let mut readback = alloc::vec![0u8; payload.len()];
     let src = tx_hal::UserPtr::<u8>::new(user_va);
     match aspace.copy_from_user(&mut readback, src, &guard) {
-        tx_substrate::step_v3::StepOutcome::Done(n) => assert_eq!(n, payload.len()),
+        crate::vm::adapter::step_engine::StepOutcome::Done(n) => assert_eq!(n, payload.len()),
         other => panic!("copy_from_user expected Done, got {other:?}"),
     }
     assert_eq!(readback, payload, "readback must match prior write");

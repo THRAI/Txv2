@@ -2,8 +2,7 @@
 
 use alloc::vec::Vec;
 use tx_hal::PmapIf;
-use tx_substrate::epoch;
-use tx_substrate::zone::{self, Cap, Zone, ZoneAllocated};
+use crate::vm::adapter::step_engine::{epoch_mod as epoch, Cap, Zone, ZoneAllocated};
 
 #[cfg(test)]
 use crate::vm::pmap::TestPmap;
@@ -14,6 +13,7 @@ use super::{
     AddressSpaceStats, AddressSpaceStatsCell, RangeLock, RecipeIndex, UfdRegistration, UserRange,
     UserVirtAddr, VmEntry, VmMapCommit, VmMapError,
 };
+use crate::vm::adapter::step_engine::{self as step_engine};
 
 static ADDRESS_SPACE_ZONE: Zone<AddressSpace> = Zone::const_new();
 
@@ -29,7 +29,7 @@ unsafe impl ZoneAllocated for AddressSpace {
 // AddressSpace as a whole is still safe to share across CPUs under
 // the kernel's epoch + pmap discipline: external access goes through
 // the zone slot via `Cap<AddressSpace>` and is guarded by
-// `tx_substrate::epoch::guard`. The Send/Sync impls here lift the
+// `adapter::step_engine::guard`. The Send/Sync impls here lift the
 // stricter token-level !Send into a kernel-level shared-by-discipline
 // shape so `Cap<AddressSpace>` can flow through `ProcessPayload`,
 // which is itself shared by `Cap<ProcessIdentity>` references.
@@ -54,8 +54,8 @@ impl AddressSpace {
     }
 
     pub fn new_cap_for_platform<P: PmapIf>() -> Result<Cap<AddressSpace>, VmPmapError> {
-        let reservation = zone::reserve_for::<AddressSpace>()?;
-        Ok(zone::sign_for(reservation, Self::new_for_platform::<P>()?))
+        let reservation = step_engine::reserve_for::<AddressSpace>()?;
+        Ok(step_engine::sign_for(reservation, Self::new_for_platform::<P>()?))
     }
 
     #[cfg(test)]

@@ -5,12 +5,14 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use tx_substrate::zone::{self, Cap, PayloadCap};
+use crate::tty::adapter::step_engine::{
+    guard, reserve_for, sign_for, ByteProgress, Cap, Errno, PayloadCap, StepOutcome,
+};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 // `StepOutcome` here resolves to the v3 outcome shape because most of
 // the assertions in this file go against tty step fns that return
-// `tx_substrate::step_v3::StepOutcome`. The few v4-shaped surfaces
+// `adapter::step_engine::StepOutcome`. The few v4-shaped surfaces
 // (`CharDeviceOps` trait impls, `register_hardware`,
 // `vfs::OpenFile::step_*`) refer to the v4 outcome type via the explicit
 // `crate::execution::StepOutcome` path or the `V4Out` alias below.
@@ -31,8 +33,6 @@ use crate::tty::structure::ring::TtyRing;
 use crate::tty::structure::termios::{Termios, ICANON, IXON, TOSTOP};
 use crate::tty::structure::{SessionPgrp, TtyIdentity, TtyKind, TtyPayload, Winsize};
 use crate::vfs::{Credential, DirCursor, FsOps, InodeKind};
-use tx_substrate::step_v3::Errno;
-use tx_substrate::step_v3::StepOutcome;
 
 struct NoopOps;
 
@@ -41,7 +41,7 @@ impl CharDeviceOps for NoopOps {
         &self,
         _out: &mut [u8],
         _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(0)
     }
 
@@ -49,7 +49,7 @@ impl CharDeviceOps for NoopOps {
         &self,
         bytes: &[u8],
         _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::Done(bytes.len())
     }
 }
@@ -84,7 +84,7 @@ impl CharDeviceOps for ScriptedReadOps {
         &self,
         out: &mut [u8],
         _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> StepOutcome<usize, ByteProgress> {
         let mut script = self.script.lock().expect("script lock");
         let copied = out.len().min(script.len());
         out[..copied].copy_from_slice(&script[..copied]);
@@ -96,7 +96,7 @@ impl CharDeviceOps for ScriptedReadOps {
         &self,
         bytes: &[u8],
         _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> StepOutcome<usize, ByteProgress> {
         self.writes
             .lock()
             .expect("writes lock")
@@ -147,16 +147,16 @@ fn drain(ring: &mut Ring) -> Vec<u8> {
 }
 
 fn init_zones() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     crate::zones::register_all().expect("kernel zones");
     crate::tty::structure::registry::reset_for_tests();
 }
 
 fn alloc_tty(kind: TtyKind, index: u32, name: &str, payload: TtyPayload) -> Cap<TtyIdentity> {
-    let id_res = zone::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-    let payload_res = zone::reserve_for::<TtyPayload>().expect("tty payload reservation");
-    let payload = PayloadCap::from_cap(zone::sign_for(payload_res, payload));
-    let identity = zone::sign_for(id_res, TtyIdentity::new(kind, index, name));
+    let id_res = reserve_for::<TtyIdentity>().expect("tty identity reservation");
+    let payload_res = reserve_for::<TtyPayload>().expect("tty payload reservation");
+    let payload = PayloadCap::from_cap(sign_for(payload_res, payload));
+    let identity = sign_for(id_res, TtyIdentity::new(kind, index, name));
     identity.install_payload(payload);
     identity
 }
@@ -460,7 +460,7 @@ fn icanon_already_off_no_double_flush() {
 fn step_ingest_commits_cooked_line_and_step_read_drains_it() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::SerialHardware,
         0,
@@ -500,7 +500,7 @@ fn step_ingest_commits_cooked_line_and_step_read_drains_it() {
 fn step_ingest_empty_veof_makes_next_read_return_zero() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::SerialHardware,
         1,
@@ -525,7 +525,7 @@ fn step_ingest_empty_veof_makes_next_read_return_zero() {
 fn step_write_to_pty_peer_ingests_peer_input() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let peer = alloc_tty(
         TtyKind::PtySlave,
         0,
@@ -554,7 +554,7 @@ fn step_write_to_pty_peer_ingests_peer_input() {
 fn project_devfs_materializes_hardware_tty_and_console_alias() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     let tty = match register_hardware("ttyS0", 0, &NOOP_BINDING, &guard) {
         StepOutcome::Done(tty) => tty,
@@ -592,7 +592,7 @@ fn project_devfs_materializes_hardware_tty_and_console_alias() {
 fn project_open_devfs_tty_by_name_shares_identity_between_console_and_ttys0() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     let tty = match register_hardware("ttyS0", 0, &NOOP_BINDING, &guard) {
         StepOutcome::Done(tty) => tty,
@@ -639,7 +639,7 @@ fn project_open_devfs_tty_by_name_shares_identity_between_console_and_ttys0() {
 fn step_poll_hardware_input_ingests_uart_bytes_into_registered_console_tty() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     let ops = Box::leak(Box::new(ScriptedReadOps::new(b"hello\n")));
     let binding = Box::leak(Box::new(CharDeviceBinding {
@@ -695,7 +695,7 @@ fn step_poll_hardware_input_ingests_uart_bytes_into_registered_console_tty() {
 fn ioctl_binding_and_termios_roundtrip_work() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::SerialHardware,
         2,
@@ -772,7 +772,7 @@ fn ioctl_binding_and_termios_roundtrip_work() {
 fn ioctl_rejects_rebind_wrong_session_and_detach_without_binding() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::SerialHardware,
         7,
@@ -821,7 +821,7 @@ fn ioctl_rejects_rebind_wrong_session_and_detach_without_binding() {
 fn step_ingest_reports_foreground_signal_dispatch_when_bound() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::PtySlave,
         3,
@@ -855,7 +855,7 @@ fn step_ingest_reports_foreground_signal_dispatch_when_bound() {
 fn step_ingest_signal_dispatch_is_none_without_controlling_binding() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::PtySlave,
         9,
@@ -882,7 +882,7 @@ fn step_ingest_signal_dispatch_is_none_without_controlling_binding() {
 fn step_ingest_reports_sigquit_and_sigtstp_dispatch_when_bound() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::PtySlave,
         12,
@@ -936,7 +936,7 @@ fn step_ingest_reports_sigquit_and_sigtstp_dispatch_when_bound() {
 fn background_write_with_tostop_returns_eio() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::SerialHardware,
         4,
@@ -954,7 +954,7 @@ fn background_write_with_tostop_returns_eio() {
         StepOutcome::Done(Default::default())
     );
 
-    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
+    use crate::tty::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3Out};
     let bg = IoctlCaller::new(1, 11).background();
     assert_eq!(
         step_write_for_caller(&tty, b"x", bg, &guard),
@@ -972,7 +972,7 @@ fn background_write_with_tostop_returns_eio() {
 fn background_read_returns_eio_in_staging_path() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::SerialHardware,
         6,
@@ -1001,7 +1001,7 @@ fn background_read_returns_eio_in_staging_path() {
 fn tcsets_flushes_pending_cooked_buffer_into_read_queue() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::SerialHardware,
         11,
@@ -1044,7 +1044,7 @@ fn tcsets_flushes_pending_cooked_buffer_into_read_queue() {
 fn step_hangup_and_master_close_drop_payload_and_emit_signals() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     let tty = alloc_tty(
         TtyKind::SerialHardware,
@@ -1104,7 +1104,7 @@ fn step_hangup_and_master_close_drop_payload_and_emit_signals() {
 fn slave_close_does_not_hangup_master() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     let pty = match crate::tty::project::open_ptmx(&guard) {
         StepOutcome::Done(pty) => pty,
@@ -1114,7 +1114,7 @@ fn slave_close_does_not_hangup_master() {
     let _ = pty.slave.take_payload();
     assert!(!pty.slave.is_live(), "slave payload should be gone");
     assert!(pty.master.is_live(), "slave close must not hang up master");
-    use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
+    use crate::tty::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3Out};
     assert_eq!(
         step_write(&pty.master, b"x", &guard),
         V3Out::Err(V3Errno::EIO)
@@ -1125,7 +1125,7 @@ fn slave_close_does_not_hangup_master() {
 fn hangup_makes_followup_io_return_eio_and_second_hangup_is_eio() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::SerialHardware,
         10,
@@ -1141,7 +1141,7 @@ fn hangup_makes_followup_io_return_eio_and_second_hangup_is_eio() {
         StepOutcome::Err(Errno::EIO)
     );
     {
-        use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3Out};
+        use crate::tty::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3Out};
         assert_eq!(step_write(&tty, b"x", &guard), V3Out::Err(V3Errno::EIO));
     }
     assert_eq!(step_hangup(&tty, &guard), StepOutcome::Err(Errno::EIO));
@@ -1151,7 +1151,7 @@ fn hangup_makes_followup_io_return_eio_and_second_hangup_is_eio() {
 fn hangup_preserves_identity_but_removes_live_payload() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = alloc_tty(
         TtyKind::SerialHardware,
         13,
@@ -1173,7 +1173,7 @@ fn hangup_preserves_identity_but_removes_live_payload() {
 fn pty_registry_unregister_removes_entry_and_next_open_reuses_slot_space() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     let first = match crate::tty::project::open_ptmx(&guard) {
         StepOutcome::Done(pty) => pty,
@@ -1206,7 +1206,7 @@ fn pty_registry_unregister_removes_entry_and_next_open_reuses_slot_space() {
 fn pty_index_allocation_is_monotonic_while_entries_remain_live() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     let first = match crate::tty::project::open_ptmx(&guard) {
         StepOutcome::Done(pty) => pty,
@@ -1230,7 +1230,7 @@ fn pty_index_allocation_is_monotonic_while_entries_remain_live() {
 fn project_open_ptmx_registers_devpts_slave_and_files_are_usable() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
 
     let pty = match crate::tty::project::open_ptmx(&guard) {
         StepOutcome::Done(pty) => pty,
@@ -1269,7 +1269,7 @@ fn project_open_ptmx_registers_devpts_slave_and_files_are_usable() {
 fn devpts_fs_lookup_meta_and_readdir_follow_registry() {
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devpts = crate::tty::project::DevptsInstance;
 
     let p0 = match crate::tty::project::open_ptmx(&guard) {
@@ -1341,11 +1341,10 @@ fn devpts_fs_lookup_meta_and_readdir_follow_registry() {
 
 #[test]
 fn devpts_fs_is_read_only_and_root_only() {
-    use tx_substrate::step_v3::Errno as V3Errno;
-    use tx_substrate::step_v3::StepOutcome as V3Outcome;
+    use crate::tty::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3Outcome};
     let _serial = TTY_ZONE_TEST_LOCK.lock().expect("tty zone test lock");
     init_zones();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let devpts = crate::tty::project::DevptsInstance;
     let cred = Credential::default();
 

@@ -5,9 +5,6 @@
 //! can be exercised without the full reactor + bootstrap state.
 
 use alloc::sync::Arc;
-use tx_substrate::step_v3::StepOutcome;
-
-use tx_substrate::zone::{self, Cap};
 
 use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::Guard;
@@ -16,12 +13,15 @@ use crate::mount::{
 };
 use crate::tty::execution::{register_console_alias, register_hardware};
 use crate::tty::structure::TtyIdentity;
+use crate::vfs::adapter::step_engine::{
+    guard, reserve_for, sign_for, ByteProgress, Cap, Errno as V3Errno, SpinMutex,
+    StepOutcome as V3, StepOutcome,
+};
 use crate::vfs::structure::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
     RNodeBacking, S_IFDIR,
 };
 use crate::vfs::FsOps;
-use tx_substrate::step_v3::{Errno as V3Errno, StepOutcome as V3};
 
 use super::{step_open, step_walk, SYMLOOP_MAX};
 
@@ -34,7 +34,7 @@ impl CharDeviceOps for CapturingOps {
         &self,
         _out: &mut [u8],
         _guard: &Guard<'_>,
-    ) -> V3<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> V3<usize, ByteProgress> {
         V3::Done(0)
     }
 
@@ -42,7 +42,7 @@ impl CharDeviceOps for CapturingOps {
         &self,
         bytes: &[u8],
         _guard: &Guard<'_>,
-    ) -> V3<usize, tx_substrate::step_v3::ByteProgress> {
+    ) -> V3<usize, ByteProgress> {
         V3::Done(bytes.len())
     }
 }
@@ -55,7 +55,7 @@ static CAPTURING_BINDING: CharDeviceBinding = CharDeviceBinding {
 };
 
 fn init_zones() {
-    tx_substrate::testing::init_host_for_test_once();
+    tx_test_support::init_host();
     crate::zones::register_all().expect("register all subsystem zones");
 }
 
@@ -92,7 +92,7 @@ fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
 /// walker tests. Stores: parent_fs_object_id → (name → FsObjectId), plus
 /// per-inode kind + symlink target (where applicable).
 struct TestFs {
-    inner: tx_substrate::SpinMutex<TestFsInner>,
+    inner: SpinMutex<TestFsInner>,
 }
 
 struct TestFsInner {
@@ -136,7 +136,7 @@ impl TestFs {
             (InodeKind::Directory, None, TEST_DEFAULT_DIR_MODE, 0, 0),
         );
         Arc::new(Self {
-            inner: tx_substrate::SpinMutex::new(inner),
+            inner: SpinMutex::new(inner),
         })
     }
 
@@ -293,8 +293,8 @@ fn build_rootfs() -> Topology {
             RNodeBacking::Directory,
         )
         .with_containing_mount(&payload);
-        let res = zone::reserve_for::<RNode>().expect("rnode reservation");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
     };
 
     let _mount = MountIdentity::new_cap(
@@ -319,7 +319,7 @@ fn build_rootfs() -> Topology {
 /// canonical TTY-side surface so devfs `lookup`-style materialisation
 /// can resolve it.
 fn install_console_tty() -> Cap<TtyIdentity> {
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let tty = match register_hardware("console-walker-hw", 0, &CAPTURING_BINDING, &guard) {
         StepOutcome::Done(t) => t,
         other => panic!("register_hardware failed: {other:?}"),
@@ -367,8 +367,8 @@ fn mount_devfs_at_dev(topo: &Topology) -> (Cap<MountIdentity>, Cap<TtyIdentity>)
             RNodeBacking::Directory,
         )
         .with_containing_mount(&dev_payload);
-        let res = zone::reserve_for::<RNode>().expect("devfs root rnode reservation");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("devfs root rnode reservation");
+        sign_for(res, raw)
     };
 
     // The /dev mount-point dentry on rootfs needs `mounted_hint`
@@ -386,8 +386,8 @@ fn mount_devfs_at_dev(topo: &Topology) -> (Cap<MountIdentity>, Cap<TtyIdentity>)
             InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
             RNodeBacking::Directory,
         );
-        let res = zone::reserve_for::<RNode>().expect("dev mount-point rnode");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("dev mount-point rnode");
+        sign_for(res, raw)
     };
     let dev_mount_point_dentry = DEntry::new_cap(
         InlineName::new(b"dev").expect("dev inline name"),
@@ -424,7 +424,7 @@ fn step_walk_resolves_relative_path_within_rootfs() {
     let _ = bar_id;
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"foo/bar",
@@ -453,7 +453,7 @@ fn step_walk_resolves_absolute_path_from_root() {
     let _ = (foo_id, bar_id);
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/foo/bar",
@@ -477,7 +477,7 @@ fn step_walk_returns_enoent_on_missing() {
     let topo = build_rootfs();
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/nope", &cred, &guard));
     drop(guard);
     match outcome {
@@ -498,7 +498,7 @@ fn step_walk_returns_enotdir_on_trailing_slash_after_file() {
     let _file_id = topo.rootfs.add_regular(FsObjectId::new(2), b"thing");
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/thing/",
@@ -524,7 +524,7 @@ fn step_walk_returns_enotdir_when_traversing_through_file() {
     let _file_id = topo.rootfs.add_regular(FsObjectId::new(2), b"thing");
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/thing/under",
@@ -552,7 +552,7 @@ fn step_walk_chases_relative_symlink_to_target() {
         .add_symlink(FsObjectId::new(2), b"alias", b"realdir");
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/alias",
@@ -584,7 +584,7 @@ fn step_walk_chases_absolute_symlink_from_root() {
         .add_symlink(FsObjectId::new(2), b"jump", b"/foo/bar");
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/jump", &cred, &guard));
     drop(guard);
     match outcome {
@@ -628,7 +628,7 @@ fn step_walk_returns_eloop_after_41_hops() {
         .add_dir(FsObjectId::new(2), final_name.as_bytes());
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/s0", &cred, &guard));
     drop(guard);
     match outcome {
@@ -654,7 +654,7 @@ fn step_walk_crosses_mount_point_at_dev() {
         &*topo.rootfs,
         FsObjectId::new(2),
         b"dev",
-        &tx_substrate::epoch::guard(),
+        &guard(),
     ) {
         V3::Done(id) => id,
         other => panic!("rootfs lookup(dev) failed: {other:?}"),
@@ -664,7 +664,7 @@ fn step_walk_crosses_mount_point_at_dev() {
         .rnode()
         .containing_mount_weak()
         .expect("root rnode has containing_mount")
-        .upgrade(&tx_substrate::epoch::guard())
+        .upgrade(&guard())
         .expect("rootfs payload upgrade");
 
     // Register the mount in the kernel's mount table; the walker
@@ -672,7 +672,7 @@ fn step_walk_crosses_mount_point_at_dev() {
     crate::mount::register_mount(&rootfs_payload, root_dev_id, dev_mount.clone());
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/dev/consoledir",
@@ -728,7 +728,7 @@ fn step_walk_owner_can_traverse_dir_with_owner_x_bit() {
     topo.rootfs.add_dir(_dir, b"leaf");
 
     let cred = unprivileged_cred(1000, 0);
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/ownerdir/leaf",
@@ -759,7 +759,7 @@ fn step_walk_other_cannot_traverse_dir_without_other_x_bit() {
     topo.rootfs.add_dir(dir, b"leaf");
 
     let cred = unprivileged_cred(9999, 9999);
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/ownerdir/leaf",
@@ -795,7 +795,7 @@ fn step_walk_dac_override_short_circuits_perm_check() {
         gid: 9999,
         effective_caps: caps,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/locked/leaf",
@@ -826,7 +826,7 @@ fn step_walk_group_match_uses_group_triplet() {
     topo.rootfs.add_dir(dir, b"leaf");
 
     let cred = unprivileged_cred(2000, 500);
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_walk(
         topo.root_dentry.clone(),
         b"/groupdir/leaf",
@@ -859,7 +859,7 @@ fn step_open_caller_with_read_bit_succeeds() {
     let _ = dir;
 
     let cred = unprivileged_cred(1000, 0);
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_open(
         topo.root_dentry.clone(),
         b"/readdir",
@@ -897,7 +897,7 @@ fn step_open_no_read_bit_returns_eacces() {
         .add_dir_with_perm(FsObjectId::new(2), b"locked", 0o100, 1000, 0);
 
     let cred = unprivileged_cred(1000, 0);
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_open(
         topo.root_dentry.clone(),
         b"/locked",
@@ -935,7 +935,7 @@ fn step_open_caller_with_write_bit_succeeds() {
         .add_dir_with_perm(FsObjectId::new(2), b"rwdir", 0o600, 1000, 0);
 
     let cred = unprivileged_cred(1000, 0);
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_open(
         topo.root_dentry.clone(),
         b"/rwdir",
@@ -979,7 +979,7 @@ fn step_open_dac_override_short_circuits() {
         gid: 9999,
         effective_caps: caps,
     };
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_open(
         topo.root_dentry.clone(),
         b"/locked",
@@ -1012,7 +1012,7 @@ fn step_open_round_trips_to_directory_dentry() {
     let _dir_id = topo.rootfs.add_dir(FsObjectId::new(2), b"opendir");
 
     let cred = Credential::root();
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     let outcome = block_on(step_open(
         topo.root_dentry.clone(),
         b"/opendir",

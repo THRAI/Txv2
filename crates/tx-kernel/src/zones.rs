@@ -1,6 +1,7 @@
 use tx_hal::TxPlatform;
+use crate::adapter::step_engine::ZoneError;
 
-pub(crate) fn register_all() -> Result<(), tx_substrate::zone::ZoneError> {
+pub(crate) fn register_all() -> Result<(), ZoneError> {
     tx_subsystems::zones::register_all()
 }
 

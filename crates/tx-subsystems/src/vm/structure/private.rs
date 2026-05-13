@@ -25,9 +25,9 @@
 
 use alloc::collections::BTreeMap;
 use tx_hal::Ppn;
-use tx_substrate::page_allocator::{self, BitmapPageAllocator, CachePin};
-use tx_substrate::zone::{self, Cap, Zone, ZoneAllocated, ZoneError};
-use tx_substrate::SpinMutex;
+use step_engine::page_allocator::{self, BitmapPageAllocator, CachePin};
+use crate::vm::adapter::step_engine::{Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
+use crate::vm::adapter::step_engine::{self as step_engine};
 
 /// Page offset within a `VmEntry`'s range. `VmPageOff(0)` is the first
 /// page of the entry; offsets are relative to the entry's `range.start`
@@ -154,8 +154,8 @@ impl PrivatePageSet {
     }
 
     pub fn new_cap() -> Result<Cap<Self>, ZoneError> {
-        let reservation = zone::reserve_for::<Self>()?;
-        Ok(zone::sign_for(reservation, Self::new()))
+        let reservation = step_engine::reserve_for::<Self>()?;
+        Ok(step_engine::sign_for(reservation, Self::new()))
     }
 
     /// Read-only snapshot at `off`.

@@ -4,6 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use crate::adapter::step_engine::{self as step_engine, StepOp};
 
 /// `write(fd, buf, count)`.
 ///
@@ -155,13 +156,6 @@ pub(super) async fn sys_readv<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// follow-up). For non-blocking polls (timeout = 0) this would
 /// busy-loop in userspace; address it if/when a real workload hits
 /// it.
-pub static SYS_PPOLL_INVOCATIONS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static SYS_PPOLL_LAST_NFDS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static SYS_PPOLL_LAST_TIMEOUT_PTR: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-
 /// `ppoll(fds, nfds, timeout_ptr, sigmask_ptr)`.
 ///
 /// Minimal implementation that supports the busybox interactive-shell
@@ -191,12 +185,9 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     use tx_subsystems::execution::WaitToken;
     use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
 
-    SYS_PPOLL_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let fds_ptr = args[0];
     let nfds = args[1];
     let timeout_ptr = args[2];
-    SYS_PPOLL_LAST_NFDS.store(nfds as usize, core::sync::atomic::Ordering::Relaxed);
-    SYS_PPOLL_LAST_TIMEOUT_PTR.store(timeout_ptr, core::sync::atomic::Ordering::Relaxed);
 
     if nfds > 1024 {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -341,7 +332,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 
     // Loop on the canonical async wait discipline pattern from
     // `vm::execution::fault_script`. Each iteration takes a fresh
-    // `tx_substrate::epoch::guard()` inside the step's call site so
+    // `step_engine::guard()` inside the step's call site so
     // the guard never crosses an `.await`.
     //
     // PR-9 phase 3b: drive `OpenFile::step_write` via the
@@ -354,7 +345,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // Restrictions cap is a fresh placeholder
     // (`tx_subsystems::cred::placeholder_restrictions_cap`) until PR-K
     // lands the real append-only stack (D5 §7).
-    use tx_substrate::step_v3::{StepOp, StepOutcome as V3Out, YieldShape};
+    use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
     use tx_subsystems::execution::WaitToken;
     use tx_subsystems::vfs::execution::OpenFileWriteOp;
     let mut script_ctx = build_subject_script_ctx(ctx);
@@ -362,7 +353,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let mut remaining = bytes.as_slice();
     loop {
         let outcome = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let mut op = OpenFileWriteOp {
                 file: &file,
                 bytes: remaining,
@@ -468,27 +459,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// TTY's wait `Channel`. On any partial progress (`total > 0`)
 /// the dispatcher returns what it has rather than block again,
 /// matching `sys_write`'s partial-success policy.
-/// DIAGNOSTIC (temp, 2026-05-12): one atomic per sys_read outcome
-/// shape. Read by `tx-kernel::init::exec::run_userspace_reactor_loop`'s
-/// exit sentinel so the boot log can show whether sys_read ever ran,
-/// what it returned, and whether the wait-source carrier was
-/// registered. Helps isolate the post-prompt EOF gap.
-pub static SYS_READ_INVOCATIONS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static SYS_READ_DONE_ZERO: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static SYS_READ_DONE_NONZERO: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static SYS_READ_YIELDS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static SYS_READ_WAIT_NONE: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-pub static SYS_READ_ERR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-pub static SYS_READ_LAST_ERRNO: core::sync::atomic::AtomicI32 =
-    core::sync::atomic::AtomicI32::new(0);
-
 pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    SYS_READ_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let fd = args[0] as i32;
     let buf_ptr = args[1] as usize;
     let len = args[2] as usize;
@@ -542,7 +513,7 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     // Restrictions cap is a fresh placeholder
     // (`tx_subsystems::cred::placeholder_restrictions_cap`) until PR-K
     // lands the real append-only stack (D5 §7).
-    use tx_substrate::step_v3::{StepOp, StepOutcome as V3Out, YieldShape};
+    use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
     use tx_subsystems::execution::WaitToken;
     use tx_subsystems::vfs::execution::OpenFileReadOp;
     let mut script_ctx = build_subject_script_ctx(ctx);
@@ -550,7 +521,7 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     let mut cursor: usize = 0;
     loop {
         let outcome = {
-            let guard = tx_substrate::epoch::guard();
+            let guard = step_engine::guard();
             let mut op = OpenFileReadOp {
                 file: &file,
                 out: &mut staging[cursor..],
@@ -561,7 +532,6 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         match outcome {
             V3Out::Done(read) => {
                 if read > 0 {
-                    SYS_READ_DONE_NONZERO.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     if let Err(errno) = bootstrap_copy_to_user(
                         &ctx.aspace,
                         buf_ptr as u64 + cursor as u64,
@@ -572,8 +542,6 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                         }
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
-                } else {
-                    SYS_READ_DONE_ZERO.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 total += read;
                 return SyscallResult::Return(total as i64);
@@ -645,12 +613,9 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 if total > 0 {
                     return SyscallResult::Return(total as i64);
                 }
-                SYS_READ_YIELDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 let token = WaitToken::new(carrier.raw(), interests.raw());
                 if let Some(future) = wait_source::wait_on_token(token) {
                     let _ = future.await;
-                } else {
-                    SYS_READ_WAIT_NONE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
             V3Out::Yield {
@@ -672,14 +637,11 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 return SyscallResult::Error(errno_to_i32(Errno::EIO));
             }
             V3Out::Err(v3errno) => {
-                SYS_READ_ERR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 if total > 0 {
                     return SyscallResult::Return(total as i64);
                 }
                 let errno: Errno = v3errno.into();
-                let errno_i32 = errno_to_i32(errno);
-                SYS_READ_LAST_ERRNO.store(errno_i32, core::sync::atomic::Ordering::Relaxed);
-                return SyscallResult::Error(errno_i32);
+                return SyscallResult::Error(errno_to_i32(errno));
             }
         }
     }

@@ -2,9 +2,8 @@
 
 use core::sync::atomic::Ordering;
 
-use tx_reactor::wait::Mask;
-use tx_substrate::step_v3::InterestMask;
-use tx_substrate::zone::Cap;
+use crate::tty::adapter::wait_routing::Mask;
+use crate::tty::adapter::step_engine::Cap;
 
 use crate::execution::Guard;
 use crate::tty::checks::require_live_tty;
@@ -13,6 +12,11 @@ use crate::tty::execution::{
 };
 use crate::tty::ldisc::{process_input_byte, FlowCtl, LdiscInputEffect, SignalKind};
 use crate::tty::structure::TtyIdentity;
+use crate::tty::adapter::step_engine::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, InterestMask};
+#[cfg(test)]
+use crate::tty::adapter::step_engine::ByteProgress;
+#[cfg(test)]
+use crate::tty::adapter::step_engine::{self as step_engine};
 
 /// Deferred signal observed while ingesting bytes.
 ///
@@ -38,8 +42,8 @@ pub fn step_ingest(
     tty: &Cap<TtyIdentity>,
     bytes: &[u8],
     guard: &Guard<'_>,
-) -> tx_substrate::step_v3::StepOutcome<IngestOutcome, tx_substrate::step_v3::NoProgress> {
-    use tx_substrate::step_v3::StepOutcome as V3;
+) -> StepOutcome<IngestOutcome, NoProgress> {
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
         Err(err) => return V3::Err(err.into()),
@@ -143,15 +147,15 @@ pub struct IngestOp<'a> {
     pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepOp<I>
+impl<'a, I: SubjectIdentity> StepOp<I>
     for IngestOp<'a>
 {
     type Output = IngestOutcome;
-    type Progress = tx_substrate::step_v3::NoProgress;
+    type Progress = NoProgress;
     fn step(
         &mut self,
-        _ctx: &mut tx_substrate::step_v3::ScriptCtx<I>,
-    ) -> tx_substrate::step_v3::StepOutcome<Self::Output, Self::Progress> {
+        _ctx: &mut ScriptCtx<I>,
+    ) -> StepOutcome<Self::Output, Self::Progress> {
         step_ingest(self.tty, self.bytes, self.guard)
     }
 }
@@ -159,8 +163,10 @@ impl<'a, I: tx_substrate::step_v3::SubjectIdentity> tx_substrate::step_v3::StepO
 #[cfg(test)]
 mod step_op_wraps {
     use super::*;
-    use tx_substrate::step_v3::{ScriptCtx, StepOp, StepOutcome as V3};
-    use tx_substrate::zone::{self as zone_mod, PayloadCap};
+    use crate::tty::adapter::step_engine::{
+        reserve_for, sign_for, PayloadCap, PlaceholderProcessSubject, ScriptCtx, StepOp,
+        StepOutcome as V3,
+    };
 
     use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
     use crate::test_support::EPOCH_TEST_LOCK;
@@ -173,18 +179,18 @@ mod step_op_wraps {
             &self,
             _out: &mut [u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(0)
+            StepOutcome::Done(0)
         }
 
         fn write(
             &self,
             bytes: &[u8],
             _guard: &Guard<'_>,
-        ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress>
+        ) -> StepOutcome<usize, ByteProgress>
         {
-            tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+            StepOutcome::Done(bytes.len())
         }
     }
 
@@ -197,20 +203,20 @@ mod step_op_wraps {
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        tx_substrate::testing::init_host_for_test_once();
+        tx_test_support::init_host();
         let _ = crate::zones::register_all();
         crate::tty::structure::registry::reset_for_tests();
         guard
     }
 
     fn alloc_hardware_tty(index: u32, name: &str) -> Cap<TtyIdentity> {
-        let id_res = zone_mod::reserve_for::<TtyIdentity>().expect("tty identity reservation");
-        let payload_res = zone_mod::reserve_for::<TtyPayload>().expect("tty payload reservation");
-        let payload_cap = PayloadCap::from_cap(zone_mod::sign_for(
+        let id_res = reserve_for::<TtyIdentity>().expect("tty identity reservation");
+        let payload_res = reserve_for::<TtyPayload>().expect("tty payload reservation");
+        let payload_cap = PayloadCap::from_cap(sign_for(
             payload_res,
             TtyPayload::new_hardware(&NOOP_BINDING),
         ));
-        let identity = zone_mod::sign_for(
+        let identity = sign_for(
             id_res,
             TtyIdentity::new(TtyKind::SerialHardware, index, name),
         );
@@ -222,14 +228,14 @@ mod step_op_wraps {
     fn ingest_op_consumes_bytes() {
         let _setup = setup();
         let tty = alloc_hardware_tty(600, "ttyV3-ingest-op-live");
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let bytes: &[u8] = b"hi";
         let mut op = IngestOp {
             tty: &tty,
             bytes,
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {
@@ -243,13 +249,13 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_hardware_tty(601, "ttyV3-ingest-op-dead");
         let _ = tty.take_payload();
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         let mut op = IngestOp {
             tty: &tty,
             bytes: b"x",
             guard: &guard,
         };
-        let mut ctx = ScriptCtx::<tx_substrate::step_v3::ProcessIdentity>::new();
+        let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         drop(guard);
         match outcome {

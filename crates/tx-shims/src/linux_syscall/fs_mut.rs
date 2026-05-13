@@ -4,6 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
 /// re-walk. `path` is a slash-separated sequence; trailing slashes
@@ -69,8 +70,8 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     let parent_dentry: Cap<DEntry> = if parent_path.is_empty() {
         cwd.clone()
     } else {
-        let guard = tx_substrate::epoch::guard();
-        use tx_substrate::step_v3::StepOutcome as V3;
+        let guard = step_engine::guard();
+        use StepOutcome as V3;
         let outcome = poll_walker_synchronously(step_walk(cwd.clone(), parent_path, cred, &guard));
         drop(guard);
         match outcome {
@@ -96,8 +97,8 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     let parent_fs_object_id = parent_dentry.rnode().fs_object_id();
     let new_mode = mode & 0o7777;
     {
-        use tx_substrate::step_v3::StepOutcome as V3;
-        let guard = tx_substrate::epoch::guard();
+        use StepOutcome as V3;
+        let guard = step_engine::guard();
         let outcome = fs_ops.create_inode(parent_fs_object_id, basename, new_mode, cred, &guard);
         match outcome {
             V3::Done(_) => {}
@@ -111,8 +112,8 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     // Re-walk the full path. Lookup now resolves the freshly-created
     // inode; the resulting dentry carries the proper parent-hint
     // chain back to the mount root.
-    let guard = tx_substrate::epoch::guard();
-    use tx_substrate::step_v3::StepOutcome as V3;
+    let guard = step_engine::guard();
+    use StepOutcome as V3;
     let outcome = poll_walker_synchronously(step_walk(cwd.clone(), path, cred, &guard));
     drop(guard);
     match outcome {
@@ -129,7 +130,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
 pub(super) fn fs_page_backing_for_dentry(
     dentry: &Cap<DEntry>,
 ) -> Option<Arc<dyn tx_subsystems::page_backed::FsPageBacking>> {
-    let guard = tx_substrate::epoch::guard();
+    let guard = step_engine::guard();
     let mut cursor: Cap<DEntry> = dentry.clone();
     loop {
         if let Some(weak) = cursor.rnode().containing_mount_weak() {
@@ -137,8 +138,8 @@ pub(super) fn fs_page_backing_for_dentry(
                 return Some(payload.fs_page_backing.clone());
             }
         }
-        let next = cursor.parent_hint()?;
-        cursor = next;
+        let parent_weak = cursor.parent_hint()?;
+        cursor = parent_weak.upgrade(&guard)?;
     }
 }
 
@@ -186,7 +187,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         }
     };
     let parent_id = parent_dentry.rnode().fs_object_id();
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
@@ -196,7 +197,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     let umask = ctx.process.umask();
     let effective_mode = mode & !umask & 0o7777;
     let outcome = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         fs_ops.mkdir(parent_id, basename, effective_mode, &cred, &guard)
     };
     match outcome {
@@ -254,7 +255,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let parent_id = parent_dentry.rnode().fs_object_id();
     let target_id = target_dentry.rnode().fs_object_id();
     let target_kind = target_dentry.rnode().meta().kind();
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
@@ -267,7 +268,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         return SyscallResult::Error(EISDIR_VALUE);
     }
     let outcome = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         if want_rmdir {
             fs_ops.rmdir(parent_id, basename, target_id, &guard)
         } else {
@@ -327,13 +328,13 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         }
     };
     let parent_id = parent_dentry.rnode().fs_object_id();
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
     let outcome = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         fs_ops.symlink(parent_id, basename, &target, &cred, &guard)
     };
     match outcome {
@@ -405,13 +406,13 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         }
     };
     let new_parent_id = new_parent_dentry.rnode().fs_object_id();
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&new_parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
     let outcome = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         fs_ops.link(new_parent_id, new_basename, source_id, &guard)
     };
     match outcome {
@@ -454,10 +455,10 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
     let outcome = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         tx_subsystems::page_backed::step_truncate(&pc, new_size, &guard)
     };
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use StepOutcome as V3;
     match outcome {
         V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
         V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
@@ -489,10 +490,10 @@ pub(super) fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
     let outcome = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         tx_subsystems::page_backed::step_truncate(&pc, new_size, &guard)
     };
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use StepOutcome as V3;
     match outcome {
         V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
         V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
@@ -554,7 +555,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         }
     };
     let parent_id = parent_dentry.rnode().fs_object_id();
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(ENOSYS_VALUE),
@@ -563,7 +564,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     // — bypasses the walker's symlink-chase loop so the symlink's
     // own inode (not its target's) is what we read.
     let target_id = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         match fs_ops.lookup(parent_id, basename, &guard) {
             V3::Done(id) => id,
             V3::Continue { .. } | V3::Yield { .. } => {
@@ -573,7 +574,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         }
     };
     let target_meta = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         match fs_ops.load_inode_meta(target_id, &guard) {
             V3::Done(m) => m,
             V3::Continue { .. } | V3::Yield { .. } => {
@@ -586,7 +587,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         return SyscallResult::Error(EINVAL_VALUE);
     }
     let link_bytes = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         match fs_ops.read_link(target_id, &guard) {
             V3::Done(b) => b,
             V3::Continue { .. } | V3::Yield { .. } => {
@@ -700,13 +701,13 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     }
     let old_parent_id = old_parent_dentry.rnode().fs_object_id();
     let new_parent_id = new_parent_dentry.rnode().fs_object_id();
-    use tx_substrate::step_v3::StepOutcome as V3;
+    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&old_parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
     let outcome = {
-        let guard = tx_substrate::epoch::guard();
+        let guard = step_engine::guard();
         fs_ops.rename(
             old_parent_id,
             old_basename,

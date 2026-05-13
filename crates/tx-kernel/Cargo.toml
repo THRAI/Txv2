@@ -9,6 +9,7 @@ repository.workspace = true
 tx-fs = { path = "../tx-fs" }
 tx-drivers = { path = "../tx-drivers" }
 tx-hal = { path = "../tx-hal" }
+tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-reactor = { path = "../tx-reactor" }
 # Phase 7 of the ELF-loader plan: `init.rs::run_bootstrap_exec_for_init`
 # drives `tx_scripts::process::exec::exec_script` synchronously to
@@ -23,6 +24,7 @@ tx-scripts = { path = "../tx-scripts" }
 # runtime dependency.
 tx-shims = { path = "../tx-shims" }
 tx-substrate = { path = "../tx-substrate" }
+tx-test-support = { path = "../tx-test-support" }
 tx-subsystems = { path = "../tx-subsystems" }
 
 [dev-dependencies]

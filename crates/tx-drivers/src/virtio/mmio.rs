@@ -5,9 +5,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tx_hal::{MmioRegion, PlatformInfoIf, TxPlatform};
-use tx_substrate::page_allocator;
-use tx_substrate::step_v3::{NoProgress, StepOutcome};
-use tx_substrate::SpinMutex;
+use crate::adapter::step_engine::{self as step_engine, NoProgress, StepOutcome};
+use step_engine::page_allocator;
+use step_engine::SpinMutex;
 use tx_subsystems::device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber};
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::page_backed::Frame;

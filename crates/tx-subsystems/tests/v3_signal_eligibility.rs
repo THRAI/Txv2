@@ -41,10 +41,7 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
-use tx_substrate::epoch;
-use tx_substrate::testing::init_host_for_test_once;
-use tx_substrate::wake::{MailboxEvent, SignalRouting, TaskMailbox};
-use tx_substrate::zone::Cap;
+use tx_subsystems::signal::adapter::step_engine::{Cap, MailboxEvent, SignalRouting, TaskMailbox};
 
 use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::process::execution::spawn_sibling_thread_for_test;
@@ -141,10 +138,9 @@ fn count_signal_delivered(mailbox: &TaskMailbox, sig: Signum) -> usize {
 
 #[test]
 fn signal_eligibility_pins() {
-    init_host_for_test_once();
+    tx_test_support::init_host();
     let _ = zones::register_all();
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 
     let proc_cap: Cap<ProcessIdentity> = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
     let leader = proc_cap.nth_thread(0).expect("leader");
@@ -387,6 +383,5 @@ fn signal_eligibility_pins() {
         "all-zombie process returns NoLiveThread, not panic"
     );
 
-    let _ = epoch::drain_with_budget(usize::MAX);
-    let _ = epoch::drain_with_budget(usize::MAX);
+    tx_test_support::drain_to_quiescence();
 }

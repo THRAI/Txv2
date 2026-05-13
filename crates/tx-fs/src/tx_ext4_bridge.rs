@@ -14,7 +14,7 @@ use core::ptr::NonNull;
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_ext4_format::{Ext4FormatError, Result};
 use tx_substrate::page_allocator::{self, ZeroPolicy};
-use tx_substrate::step_v3::StepOutcome;
+use tx_substrate::step::StepOutcome;
 use tx_subsystems::device::{BlockDevice, PhysicalBlockNumber};
 use tx_subsystems::page_backed::Frame;
 

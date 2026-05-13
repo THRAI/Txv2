@@ -1,7 +1,7 @@
 // Auto-extracted from `tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use tx_substrate::{page_allocator, zone};
+use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, reserve_for, sign_for, StepOutcome};
 use tx_subsystems::page_backed::{step_truncate, AnonSwapPolicy, PageContainer, PageContainerKind};
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::bootstrap_init_process;
@@ -48,10 +48,10 @@ fn pagebacked_open_file(page_count: u64, size_bytes: u64) -> Cap<OpenFile> {
         page_count,
     )
     .expect("page container cap");
-    let guard = tx_substrate::epoch::guard();
+    let guard = guard();
     match step_truncate(&pc, size_bytes, &guard) {
-        tx_substrate::step_v3::StepOutcome::Done(())
-        | tx_substrate::step_v3::StepOutcome::Continue { .. } => {}
+        StepOutcome::Done(())
+        | StepOutcome::Continue { .. } => {}
         other => panic!("step_truncate({size_bytes}): {other:?}"),
     }
     drop(guard);
@@ -61,8 +61,8 @@ fn pagebacked_open_file(page_count: u64, size_bytes: u64) -> Cap<OpenFile> {
             InodeMeta::new(InodeKind::Regular, 0o100644),
             RNodeBacking::PageBacked { pc },
         );
-        let res = zone::reserve_for::<RNode>().expect("rnode reservation");
-        zone::sign_for(res, raw)
+        let res = reserve_for::<RNode>().expect("rnode reservation");
+        sign_for(res, raw)
     };
     OpenFile::new_cap(
         rnode,

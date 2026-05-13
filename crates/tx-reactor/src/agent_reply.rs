@@ -33,12 +33,12 @@
 //!
 //! ## Why a separate helper
 //!
-//! The existing `ActiveWait::matches` (per
-//! `tx_substrate::wake::mailbox`) is wait-source-shaped — it filters
+//! The existing `ActiveWait::matches` (per substrate's
+//! `wake::mailbox`) is wait-source-shaped — it filters
 //! `SourceFired` events keyed by `(generation, source, interests)`.
 //! Agent events name a `DelegateTokenId`, not a `WaitSourceId`, so
 //! they need a sibling predicate
-//! ([`tx_substrate::wake::agent_event_matches`]) and a sibling
+//! (substrate's `wake::agent_event_matches`) and a sibling
 //! consumer (this helper). No substrate redesign required (D7 §3.4
 //! "runtime code, not new substrate surface").
 
@@ -47,8 +47,8 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use tx_substrate::step_v3::{AbortReason, DelegateRegistry, DelegateReply, DelegateTokenId};
-use tx_substrate::wake::{agent_event_matches, MailboxEvent, TaskMailbox};
+use crate::adapter::step_engine::{AbortReason, DelegateRegistry, DelegateReply, DelegateTokenId};
+use crate::adapter::bus_wire::{agent_event_matches, MailboxEvent, TaskMailbox};
 
 /// Outcome of [`await_agent_reply`]. Mirrors the `Replied` /
 /// non-`Replied` terminal split in the registry state machine: on

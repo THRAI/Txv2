@@ -4,14 +4,15 @@ use crate::page_backed::{
     MaterializeAccess, MaterializedPage, MaterializedPagePin, PageCacheError, PageContainer,
     PageIndex,
 };
-use tx_substrate::page_allocator::{self, ZeroPolicy};
-use tx_substrate::zone::Cap;
+use step_engine::page_allocator::{self, ZeroPolicy};
+use crate::vm::adapter::step_engine::Cap;
 
 use super::private::{
     PrivateFrame, PrivateFrameIdentity, PrivateFrameSnapshot, PrivateFrameState, PrivatePageError,
     PrivatePageSet, VmPageOff,
 };
 use crate::vm::VmPmapError;
+use crate::vm::adapter::step_engine::{self as step_engine};
 
 pub const USER_PAGE_SIZE: usize = 4096;
 
@@ -1109,6 +1110,6 @@ fn allocate_private_materialized_page_from_source(
     })
 }
 
-const fn page_alloc_error(error: tx_substrate::page_allocator::AllocError) -> VmFaultError {
+const fn page_alloc_error(error: step_engine::page_allocator::AllocError) -> VmFaultError {
     VmFaultError::PageCache(PageCacheError::Alloc(error))
 }
