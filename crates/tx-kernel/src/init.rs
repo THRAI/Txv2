@@ -22,9 +22,11 @@ use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNode
 // qemu-system-riscv64 under stock-ubuntu software emulation where AP
 // HARTs make scheduling progress so slowly that the AP couldn't drain
 // its queue inside the prior budget; the smoke would panic at
-// `reactor AP loop work completion`. 10M iterations is still
-// sub-second on real hardware but gives the emulator enough headroom.
-const AP_REACTOR_WAIT_SPINS: usize = 10_000_000;
+// `reactor AP loop work completion`. The 2026-05-13 merge added
+// per-trap overhead (FP save/restore, IRQ-defer step_ingest) which
+// pushed the AP further behind the 10M budget; bumped to 50M. Still
+// sub-second on real hardware.
+const AP_REACTOR_WAIT_SPINS: usize = 50_000_000;
 
 /// Minimum platform-timer period used in the userspace reactor loop when
 /// the reactor has no pending deadline. Without this, WFI never wakes
