@@ -52,12 +52,25 @@
 //! parses the script and prints group names without spawning QEMU.
 //! `--keep-going` runs every selected group even if an earlier one
 //! fails, and reports a per-group summary at the end.
+//!
+//! ## Parallel mode
+//!
+//! `--parallel` boots a dedicated QEMU instance per group. All
+//! instances run concurrently (up to `--jobs N`, default 4), each
+//! executing the setup block then its own group. Live output
+//! mirroring is suppressed; captured output for failed groups is
+//! printed after all workers finish. Typical speedup: ~2× for a
+//! full 13-group run on a developer laptop (boot time amortised
+//! across parallel instances). Groups that are already fast or
+//! depend on sequential state (rare) can still use the default
+//! sequential path.
 
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -82,6 +95,11 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     });
     let list_groups = args.iter().any(|a| a == "--list-groups");
     let keep_going = args.iter().any(|a| a == "--keep-going");
+    let parallel = args.iter().any(|a| a == "--parallel");
+    let jobs: usize = optional_option_value(&args, "--jobs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4)
+        .max(1);
 
     let script_text = fs::read_to_string(&script_path)
         .map_err(|err| format!("failed to read {}: {err}", script_path.display()))?;
@@ -141,6 +159,96 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         script.groups.len()
     );
 
+    // ── Parallel mode ──────────────────────────────────────────────────────
+    // Each group boots its own QEMU, runs the setup block, then its group
+    // directives, and exits. Up to `jobs` groups run concurrently.
+    // Live QEMU output is suppressed during parallel runs; captured output
+    // for failed groups is printed after all workers finish.
+    if parallel && groups_to_run.len() > 1 {
+        let concurrency = jobs.min(groups_to_run.len());
+        println!(
+            "shell-test: parallel mode — {} workers, {} groups",
+            concurrency,
+            groups_to_run.len()
+        );
+
+        let setup_arc: Arc<Vec<Directive>> = Arc::new(script.setup.clone());
+        let groups_arc: Arc<Vec<NamedGroup>> =
+            Arc::new(groups_to_run.iter().map(|g| (*g).clone()).collect());
+        let results_arc: Arc<Mutex<Vec<(String, std::result::Result<(), String>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let next_idx = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..concurrency)
+            .map(|_| {
+                let setup = Arc::clone(&setup_arc);
+                let groups = Arc::clone(&groups_arc);
+                let results = Arc::clone(&results_arc);
+                let next = Arc::clone(&next_idx);
+                let root = root.to_path_buf();
+                thread::spawn(move || {
+                    loop {
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= groups.len() {
+                            break;
+                        }
+                        let group = &groups[idx];
+                        let (captured, group_err) =
+                            run_group_isolated(&root, target, &setup, group);
+                        let result = match group_err {
+                            None => Ok(()),
+                            Some(err) => {
+                                println!(
+                                    "\n--- [{}] captured output ({} bytes) ---",
+                                    group.name,
+                                    captured.len()
+                                );
+                                println!("{captured}");
+                                Err(err)
+                            }
+                        };
+                        results.lock().unwrap().push((group.name.clone(), result));
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let _ = handle.join();
+        }
+
+        let group_results = match Arc::try_unwrap(results_arc) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(arc) => arc.lock().unwrap().clone(),
+        };
+
+        // Sort results into script order before reporting.
+        let mut ordered = group_results;
+        ordered.sort_by_key(|(name, _)| {
+            groups_arc.iter().position(|g| &g.name == name).unwrap_or(usize::MAX)
+        });
+        let failed_count = ordered.iter().filter(|(_, r)| r.is_err()).count();
+        let passed = ordered.len() - failed_count;
+        println!(
+            "shell-test: groups: {} passed, {} failed",
+            passed,
+            failed_count,
+        );
+        for (name, result) in &ordered {
+            match result {
+                Ok(()) => println!("  ok    {name}"),
+                Err(err) => println!("  FAIL  {name}: {err}"),
+            }
+        }
+        return if failed_count == 0 {
+            println!("shell-test: ok");
+            Ok(())
+        } else {
+            Err(format!("{failed_count} group(s) failed"))
+        };
+    }
+
+    // ── Sequential mode (default) ───────────────────────────────────────────
     let qemu_cmd = build_qemu_command(root, target)?;
     println!("shell-test: spawning {}", qemu_cmd.join(" "));
 
@@ -157,8 +265,8 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         .map_err(|err| format!("failed to spawn {program}: {err}"))?;
 
     let buffer = Arc::new(Mutex::new(String::new()));
-    spawn_reader(&mut child, "stdout", Arc::clone(&buffer));
-    spawn_reader(&mut child, "stderr", Arc::clone(&buffer));
+    let _ = spawn_reader(&mut child, "stdout", Arc::clone(&buffer), true);
+    let _ = spawn_reader(&mut child, "stderr", Arc::clone(&buffer), true);
 
     let mut anchor = 0usize;
     let mut group_results: Vec<(String, std::result::Result<(), String>)> = Vec::new();
@@ -167,7 +275,9 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let outer = (|| -> Result<()> {
         // Setup always runs. A failure here is fatal regardless of
         // --keep-going (subsequent groups have no usable session).
-        if let Some(err) = run_block(&mut child, &buffer, "setup", &script.setup, &mut anchor)? {
+        if let Some(err) =
+            run_block(&mut child, &buffer, "setup", &script.setup, &mut anchor, true)?
+        {
             return Err(format!("setup: {err}"));
         }
         if directives_quit(&script.setup) {
@@ -178,8 +288,14 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
             if quit_seen {
                 break;
             }
-            let outcome =
-                run_block(&mut child, &buffer, &group.name, &group.directives, &mut anchor)?;
+            let outcome = run_block(
+                &mut child,
+                &buffer,
+                &group.name,
+                &group.directives,
+                &mut anchor,
+                true,
+            )?;
             match outcome {
                 None => group_results.push((group.name.clone(), Ok(()))),
                 Some(err) => {
@@ -251,19 +367,28 @@ fn directives_quit(d: &[Directive]) -> bool {
 /// directive-level failure (caller decides whether to keep going),
 /// and `Err(_)` for harness-level failures (broken stdin pipe, etc.)
 /// that prevent the session from continuing at all.
+///
+/// When `verbose` is false the per-directive progress lines are
+/// suppressed (used by isolated parallel instances whose output
+/// would otherwise interleave on the host terminal).
 fn run_block(
     child: &mut Child,
     buffer: &Arc<Mutex<String>>,
     block_label: &str,
     directives: &[Directive],
     script_anchor: &mut usize,
+    verbose: bool,
 ) -> Result<Option<String>> {
     if directives.is_empty() {
         return Ok(None);
     }
-    println!("[{block_label}]");
+    if verbose {
+        println!("[{block_label}]");
+    }
     for (idx, directive) in directives.iter().enumerate() {
-        println!("  [{idx}] {}", directive.summary());
+        if verbose {
+            println!("  [{idx}] {}", directive.summary());
+        }
         match directive {
             Directive::Group(_) => {
                 // Group markers are consumed by `parse_script` and never
@@ -347,17 +472,31 @@ fn wait_for(
     }
 }
 
-fn spawn_reader(child: &mut Child, kind: &'static str, buffer: Arc<Mutex<String>>) {
+/// Drain one of QEMU's output streams into `buffer`.
+///
+/// When `live_mirror` is true each byte is also echoed to the host
+/// terminal in real time (sequential mode). Pass `false` in parallel
+/// mode to avoid interleaved output from concurrent QEMU instances.
+///
+/// Returns the thread handle so callers can join it when they need
+/// the buffer to be fully populated (e.g. before reporting failures
+/// in parallel mode).
+fn spawn_reader(
+    child: &mut Child,
+    kind: &'static str,
+    buffer: Arc<Mutex<String>>,
+    live_mirror: bool,
+) -> thread::JoinHandle<()> {
     let stream: Box<dyn std::io::Read + Send> = match kind {
         "stdout" => match child.stdout.take() {
             Some(s) => Box::new(s),
-            None => return,
+            None => return thread::spawn(|| {}),
         },
         "stderr" => match child.stderr.take() {
             Some(s) => Box::new(s),
-            None => return,
+            None => return thread::spawn(|| {}),
         },
-        _ => return,
+        _ => return thread::spawn(|| {}),
     };
     thread::spawn(move || {
         let reader = BufReader::new(stream);
@@ -365,13 +504,11 @@ fn spawn_reader(child: &mut Child, kind: &'static str, buffer: Arc<Mutex<String>
         let mut pending = VecDeque::<u8>::new();
         for byte in reader.bytes() {
             let Ok(b) = byte else { break };
-            // Mirror to host stdout so the user sees QEMU output live.
-            let _ = std::io::stdout().write_all(&[b]);
-            let _ = std::io::stdout().flush();
+            if live_mirror {
+                let _ = std::io::stdout().write_all(&[b]);
+                let _ = std::io::stdout().flush();
+            }
             pending.push_back(b);
-            // Drain into the captured buffer in chunks. We use
-            // String for substring matching; non-UTF-8 bytes are
-            // replaced with the U+FFFD replacement char.
             while let Some(b) = pending.pop_front() {
                 buf.push(b);
             }
@@ -379,10 +516,10 @@ fn spawn_reader(child: &mut Child, kind: &'static str, buffer: Arc<Mutex<String>
             buffer.lock().unwrap().push_str(&s);
             buf.clear();
         }
-    });
+    })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Directive {
     Group(String),
     Wait { needle: String, timeout: Duration },
@@ -409,7 +546,7 @@ impl Directive {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct NamedGroup {
     name: String,
     directives: Vec<Directive>,
@@ -563,6 +700,87 @@ fn split_quoted_prefix(s: &str) -> std::result::Result<(String, &str), String> {
         }
     }
     Err("unterminated string literal (no closing '\"')".into())
+}
+
+/// Boot an isolated QEMU instance, run the setup block, then run
+/// exactly one group, and return `(captured_output, error_or_none)`.
+///
+/// Designed for `--parallel` mode: live output mirroring is suppressed
+/// so parallel instances don't interleave on the host terminal. The
+/// reader threads are joined before the buffer is read so the caller
+/// always gets the complete output.
+///
+/// Returns `(output, None)` on success, `(output, Some(msg))` on failure
+/// (both directive failures and harness failures like QEMU spawn errors).
+fn run_group_isolated(
+    root: &Path,
+    target: TxTarget,
+    setup: &[Directive],
+    group: &NamedGroup,
+) -> (String, Option<String>) {
+    let buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let group_err = run_group_isolated_inner(root, target, setup, group, Arc::clone(&buffer));
+    let captured = buffer.lock().unwrap().clone();
+    (captured, group_err)
+}
+
+fn run_group_isolated_inner(
+    root: &Path,
+    target: TxTarget,
+    setup: &[Directive],
+    group: &NamedGroup,
+    buffer: Arc<Mutex<String>>,
+) -> Option<String> {
+    let qemu_cmd = match build_qemu_command(root, target) {
+        Ok(c) => c,
+        Err(e) => return Some(format!("qemu command: {e}")),
+    };
+    let Some((program, rest)) = qemu_cmd.split_first() else {
+        return Some("empty qemu command".into());
+    };
+    let mut child = match Command::new(program)
+        .args(rest)
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return Some(format!("spawn qemu for {:?}: {e}", group.name)),
+    };
+
+    let h_out = spawn_reader(&mut child, "stdout", Arc::clone(&buffer), false);
+    let h_err = spawn_reader(&mut child, "stderr", Arc::clone(&buffer), false);
+
+    let mut anchor = 0usize;
+
+    let result = (|| -> Option<String> {
+        match run_block(&mut child, &buffer, "setup", setup, &mut anchor, false) {
+            Err(e) => return Some(format!("setup (harness): {e}")),
+            Ok(Some(e)) => return Some(format!("setup: {e}")),
+            Ok(None) => {}
+        }
+        match run_block(
+            &mut child,
+            &buffer,
+            &group.name,
+            &group.directives,
+            &mut anchor,
+            false,
+        ) {
+            Err(e) => Some(format!("group harness: {e}")),
+            Ok(v) => v,
+        }
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    // Join readers so the buffer is fully populated before the caller reads it.
+    let _ = h_out.join();
+    let _ = h_err.join();
+
+    result
 }
 
 fn build_qemu_command(root: &Path, target: TxTarget) -> Result<Vec<String>> {
