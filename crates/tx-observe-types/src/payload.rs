@@ -16,34 +16,34 @@
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
 pub enum TxPayloadTag {
-    None             = 0,
+    None = 0,
 
     // ── L0 boundary ──────────────────────────────────────────────────────
-    SyscallEnter     = 1,
-    SyscallExit      = 2,
+    SyscallEnter = 1,
+    SyscallExit = 2,
 
     // ── L2 drive / L4 step ───────────────────────────────────────────────
-    DriveBegin       = 10,
-    DriveEnd         = 11,
-    StepOutcome      = 12,
+    DriveBegin = 10,
+    DriveEnd = 11,
+    StepOutcome = 12,
 
     // ── L3 yield/resume / wake ───────────────────────────────────────────
-    YieldBegin       = 20,
-    Resume           = 21,
+    YieldBegin = 20,
+    Resume = 21,
     WaitSourceNotify = 22,
     AgentStateChange = 23,
 
     // ── Track / metadata ─────────────────────────────────────────────────
-    TrackDescriptor  = 30,
-    CounterValue     = 31,
+    TrackDescriptor = 30,
+    CounterValue = 31,
     StringDescriptor = 32,
-    ClockSnapshot    = 33,
+    ClockSnapshot = 33,
 
     // ── Argument continuation ─────────────────────────────────────────────
-    ArgValue         = 40,
+    ArgValue = 40,
 
     // ── Mutation (L6) ─────────────────────────────────────────────────────
-    MutationZoneSign    = 50,
+    MutationZoneSign = 50,
     MutationIndexCommit = 51,
 
     // ── Phase (L5) ────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ pub enum TxPayloadTag {
     PhaseTransition = 52,
 
     // ── Panic (special) ───────────────────────────────────────────────────
-    Panic            = 60,
+    Panic = 60,
 }
 
 // ---------------------------------------------------------------------------
@@ -165,9 +165,9 @@ pub struct PayloadStepOutcome {
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
 pub enum TxProgressKind {
-    NoProgress    = 0,
-    ByteProgress  = 1,
-    PageProgress  = 2,
+    NoProgress = 0,
+    ByteProgress = 1,
+    PageProgress = 2,
     EntryProgress = 3,
     IoVecProgress = 4,
 }
@@ -178,8 +178,8 @@ pub enum TxProgressKind {
 #[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
 pub enum YieldShapeKind {
     OnWaitSource = 1,
-    OnAgent      = 2,
-    OnTimer      = 3,
+    OnAgent = 2,
+    OnTimer = 3,
     // Future: OnEdge = 4, OnHandoff = 5.
 }
 
@@ -307,18 +307,18 @@ pub struct PayloadArgValue {
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
 pub enum TxValueKind {
-    None     = 0,
-    U64      = 1,
-    I64      = 2,
-    Bool     = 3,
+    None = 0,
+    U64 = 1,
+    I64 = 2,
+    Bool = 3,
     /// Raw user VA, opaque.
-    Ptr      = 4,
-    Errno    = 5,
+    Ptr = 4,
+    Errno = 5,
     /// Reference to interned string table.
-    NameId   = 6,
+    NameId = 6,
     /// Packed `(kind, generation, slot)` — see `08_OBSERVATION_v1.md §12`.
     ObjectId = 7,
-    FlowId   = 8,
+    FlowId = 8,
 }
 
 // ---------------------------------------------------------------------------
@@ -388,7 +388,7 @@ pub enum BootPhaseKind {
     /// Substrate BSP init (`tx_substrate::init`).
     SubstrateBsp = 0,
     /// Substrate AP init (`tx_substrate::init_on_ap`).
-    SubstrateAp  = 1,
+    SubstrateAp = 1,
 }
 
 /// Payload for `SpanBegin(phase.<name>)` / `SpanEnd` at kernel boot
@@ -431,8 +431,8 @@ pub struct PayloadPhaseTransition {
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
 pub enum FlowKind {
-    SourceWake    = 1, // WaitSource::notify → resume
-    AgentReply    = 2, // DelegateToken::reply → resume
-    TimerExpire   = 3, // TimerToken expiry → resume
+    SourceWake = 1,    // WaitSource::notify → resume
+    AgentReply = 2,    // DelegateToken::reply → resume
+    TimerExpire = 3,   // TimerToken expiry → resume
     AbortDelivery = 4, // generationless abort → resume
 }

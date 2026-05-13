@@ -22,7 +22,7 @@ use crate::perfetto::proto::{
 use crate::perfetto::span::{SpanEntry, SpanTable};
 use crate::perfetto::track::TrackRegistry;
 
-use tx_observe_types::TxTraceKind;
+use tx_observe_types::{TxPayloadTag, TxTraceKind};
 
 /// The single trusted packet sequence id for this producer.
 const SEQ_ID: u32 = TRUSTED_SEQ_ID;
@@ -230,32 +230,37 @@ impl PftraceWriter {
                 }
             }
             k if k == TxTraceKind::Instant as u8 => {
-                let name_id = parse_hex_u32(&r.name_id);
-                let (iid, new_name) = self.names.intern(name_id);
-                let interned_data = new_name.map(|n| InternedData {
-                    event_names: vec![EventName { iid: Some(iid), name: Some(n) }],
-                    debug_annotation_names: vec![],
-                });
-                let pkt = TracePacket {
-                    timestamp: Some(r.ts),
-                    timestamp_clock_id: Some(self.perfetto_clock_id()),
-                    trusted_packet_sequence_id: Some(SEQ_ID),
-                    track_event: Some(TrackEvent {
-                        track_uuid: Some(hart_uuid),
-                        r#type: Some(TrackEventType::Instant as i32),
-                        name_iid: Some(iid),
+                // Route flow-reconstruction instants through dedicated handlers.
+                // Other instants fall through to the generic interned-name path.
+                if r.payload_tag == TxPayloadTag::WaitSourceNotify as u16 {
+                    let (task_id_low, wait_gen) = extract_wait_source_notify_fields(r);
+                    self.push_wait_source_notify(r.ts, hart_uuid, task_id_low, wait_gen);
+                } else if r.payload_tag == TxPayloadTag::Resume as u16 {
+                    let (task_id_low, wait_gen) = extract_resume_fields(r);
+                    self.push_resume(r.ts, hart_uuid, task_id_low, wait_gen);
+                } else {
+                    let name_id = parse_hex_u32(&r.name_id);
+                    let (iid, new_name) = self.names.intern(name_id);
+                    let interned_data = new_name.map(|n| InternedData {
+                        event_names: vec![EventName { iid: Some(iid), name: Some(n) }],
+                        debug_annotation_names: vec![],
+                    });
+                    let pkt = TracePacket {
+                        timestamp: Some(r.ts),
+                        timestamp_clock_id: Some(self.perfetto_clock_id()),
+                        trusted_packet_sequence_id: Some(SEQ_ID),
+                        track_event: Some(TrackEvent {
+                            track_uuid: Some(hart_uuid),
+                            r#type: Some(TrackEventType::Instant as i32),
+                            name_iid: Some(iid),
+                            ..Default::default()
+                        }),
+                        interned_data,
                         ..Default::default()
-                    }),
-                    interned_data,
-                    ..Default::default()
-                };
-                self.packets.push(pkt);
+                    };
+                    self.packets.push(pkt);
+                }
             }
-            // WaitSourceNotify / Resume — flow reconstruction (§E).
-            // These record kinds are not yet emitted by the kernel (OBS-3b/OBS-4
-            // not wired); push_wait_source_notify / push_resume handle them when
-            // they land. For now, fall through to the default arm.
-            //
             // Nop, ClockSnapshot, StringDescriptor, Counter, TrackTombstone,
             // PanicMarker, ArgContinuation — ignore or no Perfetto packet.
             _ => {}
@@ -280,9 +285,7 @@ impl PftraceWriter {
 
     /// Handle a WaitSourceNotify record — compute flow_id and attach it.
     ///
-    /// Called from push_record when payload_tag == WaitSourceNotify.
-    /// (Structurally complete; not called in OBS-6 real traces.)
-    #[allow(dead_code)]
+    /// Called from push_record when the record's payload tag is `WaitSourceNotify`.
     pub fn push_wait_source_notify(
         &mut self,
         ts: u64,
@@ -310,8 +313,7 @@ impl PftraceWriter {
 
     /// Handle a Resume record — close the terminating flow.
     ///
-    /// (Structurally complete; not called in OBS-6 real traces.)
-    #[allow(dead_code)]
+    /// Called from push_record when the record's payload tag is `Resume`.
     pub fn push_resume(
         &mut self,
         ts: u64,
@@ -514,4 +516,34 @@ fn parse_hex_u64(s: &str) -> u64 {
 
 fn parse_hex_u32(s: &str) -> u32 {
     u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0)
+}
+
+/// Extract `(task_id_low, wait_generation)` from a decoded `WaitSourceNotify`
+/// payload JSON for flow-id computation.
+///
+/// Returns `(0, 0)` if the payload is absent or malformed (safe fallback —
+/// the flow hash will still be computed, just with degenerate inputs).
+fn extract_wait_source_notify_fields(r: &DecodedRecord) -> (u32, u64) {
+    if let Some(p) = &r.payload {
+        let task_id_low = p["task_id_low"].as_u64().unwrap_or(0) as u32;
+        let wait_gen_low = p["wait_generation_low"].as_u64().unwrap_or(0) as u32;
+        (task_id_low, wait_gen_low as u64)
+    } else {
+        (0, 0)
+    }
+}
+
+/// Extract `(task_id_low, wait_generation)` from a decoded `Resume` payload
+/// JSON for flow-id computation.
+///
+/// Returns `(0, 0)` if the payload is absent or malformed.
+fn extract_resume_fields(r: &DecodedRecord) -> (u32, u64) {
+    if let Some(p) = &r.payload {
+        let wait_gen = p["wait_generation"].as_u64().unwrap_or(0);
+        // Resume does not carry task_id_low directly (OBS-3b deferral);
+        // use 0 until task_id threading lands.
+        (0u32, wait_gen)
+    } else {
+        (0, 0)
+    }
 }

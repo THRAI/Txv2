@@ -13,8 +13,8 @@
 
 use tx_observe_types::{
     PayloadDriveBegin, PayloadDriveEnd, PayloadMutationIndexCommit, PayloadMutationZoneSign,
-    PayloadPhaseTransition, PayloadStepOutcome, PayloadSyscallEnter, PayloadSyscallExit,
-    PayloadWaitSourceNotify, TxPayloadTag,
+    PayloadPhaseTransition, PayloadResume, PayloadStepOutcome, PayloadSyscallEnter,
+    PayloadSyscallExit, PayloadWaitSourceNotify, PayloadYieldBegin, TxPayloadTag,
 };
 
 // ---------------------------------------------------------------------------
@@ -336,4 +336,64 @@ pub fn encode_phase_transition(p: &PayloadPhaseTransition) -> ([u8; 16], u16) {
 #[inline]
 pub const fn phase_transition_tag() -> TxPayloadTag {
     TxPayloadTag::PhaseTransition
+}
+
+// ---------------------------------------------------------------------------
+// L3 — YieldBegin / Resume (OBS-3b)
+// ---------------------------------------------------------------------------
+
+/// Encode a [`PayloadYieldBegin`] into a 16-byte buffer.
+///
+/// Wire layout (§8.4):
+/// ```text
+/// offset 0:  shape_kind     u8
+/// offset 1:  _pad           [u8; 3]
+/// offset 4:  task_id_low    u32  LE
+/// offset 8:  wait_generation u64 LE
+/// total = 16
+/// ```
+#[inline]
+pub fn encode_yield_begin(p: &PayloadYieldBegin) -> ([u8; 16], u16) {
+    let mut buf = [0u8; 16];
+    write_u8(&mut buf, 0, p.shape_kind);
+    // _pad at 1-3 stays 0
+    write_u32_le(&mut buf, 4, p.task_id_low);
+    write_u64_le(&mut buf, 8, p.wait_generation);
+    let len = core::mem::size_of::<PayloadYieldBegin>() as u16;
+    (buf, len)
+}
+
+/// Return the correct [`TxPayloadTag`] for a [`PayloadYieldBegin`].
+#[inline]
+pub const fn yield_begin_tag() -> TxPayloadTag {
+    TxPayloadTag::YieldBegin
+}
+
+/// Encode a [`PayloadResume`] into a 16-byte buffer.
+///
+/// Wire layout (§8.4):
+/// ```text
+/// offset 0:  resume_kind    u8
+/// offset 1:  abort_reason   u8
+/// offset 2:  _pad           [u8; 2]
+/// offset 4:  object_id_low  u32  LE
+/// offset 8:  wait_generation u64 LE
+/// total = 16
+/// ```
+#[inline]
+pub fn encode_resume(p: &PayloadResume) -> ([u8; 16], u16) {
+    let mut buf = [0u8; 16];
+    write_u8(&mut buf, 0, p.resume_kind);
+    write_u8(&mut buf, 1, p.abort_reason);
+    // _pad at 2-3 stays 0
+    write_u32_le(&mut buf, 4, p.object_id_low);
+    write_u64_le(&mut buf, 8, p.wait_generation);
+    let len = core::mem::size_of::<PayloadResume>() as u16;
+    (buf, len)
+}
+
+/// Return the correct [`TxPayloadTag`] for a [`PayloadResume`].
+#[inline]
+pub const fn resume_tag() -> TxPayloadTag {
+    TxPayloadTag::Resume
 }

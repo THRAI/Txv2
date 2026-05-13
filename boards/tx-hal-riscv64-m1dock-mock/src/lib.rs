@@ -8,10 +8,10 @@ mod pmap;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootHandoff, BootInfo, BootInfoIf,
     BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, DmaIf, EntropyIf, InitIf,
-    IrqIf, MmioFlags, MmioRegion, ObserverIf, PercpuIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo,
-    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SignalFrameIf,
-    SmpIf, SpiSdInfo, TimeIf, TrapIf, VirtAddr, VirtRange,
+    IrqIf, MmioFlags, MmioRegion, ObserverIf, PercpuIf, PhysAddr, PhysRange, PlatformConfig,
+    PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator,
+    SignalFrameIf, SmpIf, SpiSdInfo, TimeIf, TrapIf, VirtAddr, VirtRange,
 };
 
 #[cfg(target_arch = "riscv64")]

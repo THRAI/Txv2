@@ -139,7 +139,36 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
             &["xtask", "progress", "validate"],
             "txdoc:CI-GATE-PROGRESS-JSON",
         ),
+        // Quick observe smoke: demo writes a synthetic .txtrace, validate
+        // parses the header and counts records. No daemon build required.
+        ci_run(
+            root,
+            "observe demo+validate smoke",
+            "cargo",
+            &[
+                "xtask",
+                "observe",
+                "demo",
+                "--output",
+                "/tmp/txkernel-ci-observe-demo.txtrace",
+            ],
+            "txdoc:CI-GATE-OBSERVE-SMOKE",
+        ),
     ];
+    // observe validate runs after demo produces the file — chain separately.
+    results.push(ci_run(
+        root,
+        "observe validate smoke",
+        "cargo",
+        &[
+            "xtask",
+            "observe",
+            "validate",
+            "--file",
+            "/tmp/txkernel-ci-observe-demo.txtrace",
+        ],
+        "txdoc:CI-GATE-OBSERVE-SMOKE",
+    ));
 
     results.push(ci_target_check(
         root,

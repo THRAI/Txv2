@@ -474,10 +474,8 @@ pub fn init<P: TxPlatform>() {
 
 pub fn init_on_ap(cpu: CpuId) -> Result<(), ApInitError> {
     // L5 Phase span: SubstrateAp begin (OBS-8).
-    let phase_span = emit_phase_span_begin(
-        tx_observe_types::BootPhaseKind::SubstrateAp,
-        cpu.0 as u8,
-    );
+    let phase_span =
+        emit_phase_span_begin(tx_observe_types::BootPhaseKind::SubstrateAp, cpu.0 as u8);
 
     epoch::init_on_ap(cpu)?;
     zone::init_on_ap(cpu)?;

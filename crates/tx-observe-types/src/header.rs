@@ -105,7 +105,7 @@ impl TxTraceHeaderFlags {
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "host", derive(Debug, serde::Serialize, serde::Deserialize))]
 pub enum TxTraceClockId {
-    Unknown   = 0,
+    Unknown = 0,
     RiscvTime = 1, // RV64 `time` CSR
     ArmCntvct = 2, // AArch64 `cntvct_el0`
     X86TscInv = 3, // x86_64 invariant TSC

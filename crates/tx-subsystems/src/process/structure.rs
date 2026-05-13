@@ -193,6 +193,18 @@ impl tx_substrate::step_v3::SubjectIdentity for ProcessIdentity {
         self.exit_source_id()
             .map(tx_substrate::step_v3::WaitSourceId::new)
     }
+
+    /// Returns the process's PID low 32 bits as the task trace identity.
+    ///
+    /// For `drive<O, ProcessIdentity>` call sites the subject is a
+    /// process; the PID is a stable, unique-enough discriminant for
+    /// flow-ID hashing. Per-thread TID resolution is deferred to when
+    /// `ScriptCtx` carries a thread cap; for now PID is sufficient to
+    /// distinguish flows across processes. Kernel actors that use the
+    /// placeholder `ProcessIdentity` inherit the default `0`.
+    fn task_id_low(&self) -> u32 {
+        self.pid.0
+    }
 }
 
 impl ProcessIdentity {
@@ -622,7 +634,8 @@ impl ProcessIdentity {
                 // WaitSource share the bit-namespace
                 // (`EXIT_SOURCE_CHILD_ZOMBIFIED` and future stop/cont
                 // bits land in both).
-                p.exit_wait_source().notify_emit(InterestMask::new(mask.bits()));
+                p.exit_wait_source()
+                    .notify_emit(InterestMask::new(mask.bits()));
                 released
             })
             .unwrap_or(0)

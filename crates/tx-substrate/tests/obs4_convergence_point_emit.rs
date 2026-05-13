@@ -219,8 +219,7 @@ fn convergence_close_path_emits_wait_source_notify_record() {
 
     // Invoke the convergence-point helper (simulates the post-migration
     // decr_writer body).
-    let posted =
-        simulate_last_writer_close(&src, InterestMask::new(READABLE_MASK));
+    let posted = simulate_last_writer_close(&src, InterestMask::new(READABLE_MASK));
     assert_eq!(posted, 1, "one reader should be woken");
 
     // Reader mailbox received SourceFired.
@@ -270,7 +269,10 @@ fn convergence_close_path_emits_wait_source_notify_record() {
         mask_bits, READABLE_MASK as u32,
         "mask_bits should be the readable interest"
     );
-    assert_eq!(task_id_low, 0, "task_id_low is 0 at substrate layer");
+    assert_eq!(
+        task_id_low, 0,
+        "task_id_low is 0 for a mailbox constructed with TaskMailbox::new() (no task id)"
+    );
     assert_eq!(
         wait_gen_low,
         gen.raw() as u32,

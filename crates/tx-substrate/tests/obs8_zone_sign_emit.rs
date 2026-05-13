@@ -232,7 +232,10 @@ fn zone_sign_emits_mutation_zone_sign_record_when_gate_enabled() {
     let producer = hdr.producer.load(Ordering::Acquire);
 
     // Exactly one record from zone::sign.
-    assert_eq!(producer, 1, "ring should have exactly 1 record from zone::sign");
+    assert_eq!(
+        producer, 1,
+        "ring should have exactly 1 record from zone::sign"
+    );
 
     let rec = &slots[0];
 
@@ -290,8 +293,5 @@ fn zone_sign_does_not_emit_when_gate_disabled() {
     let (hdr, _) = unsafe { read_ring(2) };
     let producer = hdr.producer.load(Ordering::Acquire);
 
-    assert_eq!(
-        producer, 0,
-        "ring should be empty when gate is disabled"
-    );
+    assert_eq!(producer, 0, "ring should be empty when gate is disabled");
 }

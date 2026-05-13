@@ -51,6 +51,10 @@ pub struct DecodedRecord {
     pub parent: String,
     /// Event name id as `"0x<hex>"`.
     pub name_id: String,
+    /// Raw `TxPayloadTag` discriminant — used by the Perfetto writer to route
+    /// `WaitSourceNotify` and `Resume` instants through the flow-reconstruction
+    /// path (OBS-3b / OBS-4).
+    pub payload_tag: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
 }
@@ -164,6 +168,7 @@ pub fn decode_slot(hart: u16, slot_bytes: &[u8]) -> DecodedEvent {
         span: format!("0x{:x}", rec.span),
         parent: format!("0x{:x}", rec.parent),
         name_id: format!("0x{:x}", rec.name),
+        payload_tag: rec.payload_tag,
         payload,
     })
 }
