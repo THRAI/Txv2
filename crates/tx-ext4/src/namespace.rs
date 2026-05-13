@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use step_engine::Guard;
 use tx_ext4_format::pager::{BlockImage, DirEntryLite};
 use tx_subsystems::execution::Errno;
@@ -228,14 +229,14 @@ where
         &self,
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<Box<[u8]>, tx_substrate::step_v3::NoProgress> {
+    ) -> tx_substrate::step::StepOutcome<Box<[u8]>, tx_substrate::step::NoProgress> {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Err(err) => return tx_substrate::step::StepOutcome::err(err.into()),
         };
         match self.with_pager(|pager| pager.read_link(inode)) {
-            Ok(target) => tx_substrate::step_v3::StepOutcome::done(target.into_boxed_slice()),
-            Err(err) => tx_substrate::step_v3::StepOutcome::err(err.into()),
+            Ok(target) => tx_substrate::step::StepOutcome::done(target.into_boxed_slice()),
+            Err(err) => tx_substrate::step::StepOutcome::err(err.into()),
         }
     }
 
@@ -244,23 +245,23 @@ where
         fs_object_id: FsObjectId,
         meta: InodeMeta,
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<
+    ) -> tx_substrate::step::StepOutcome<
         tx_substrate::zone::Cap<RNode>,
-        tx_substrate::step_v3::NoProgress,
+        tx_substrate::step::NoProgress,
     > {
         if meta.kind() != InodeKind::Regular {
-            return tx_substrate::step_v3::StepOutcome::err(Errno::ENOSYS.into());
+            return tx_substrate::step::StepOutcome::err(Errno::ENOSYS.into());
         }
         let Some(mount) = self.mount_payload_pin() else {
-            return tx_substrate::step_v3::StepOutcome::err(Errno::ENODEV.into());
+            return tx_substrate::step::StepOutcome::err(Errno::ENODEV.into());
         };
         let pc = match PageContainer::new_file_cap(mount, fs_object_id, meta.size) {
             Ok(pc) => pc,
-            Err(_) => return tx_substrate::step_v3::StepOutcome::err(Errno::ENOMEM.into()),
+            Err(_) => return tx_substrate::step::StepOutcome::err(Errno::ENOMEM.into()),
         };
         match RNode::new_cap(fs_object_id, meta, RNodeBacking::PageBacked { pc }) {
-            Ok(rnode) => tx_substrate::step_v3::StepOutcome::done(rnode),
-            Err(_) => tx_substrate::step_v3::StepOutcome::err(Errno::ENOMEM.into()),
+            Ok(rnode) => tx_substrate::step::StepOutcome::done(rnode),
+            Err(_) => tx_substrate::step::StepOutcome::err(Errno::ENOMEM.into()),
         }
     }
 

@@ -48,44 +48,6 @@ static IRQ_DISPATCH_TABLE: SpinMutex<IrqDispatchTable> = SpinMutex::new(IrqDispa
 /// this cap keeps a single IRQ from stalling the trap shell while
 /// still draining a typical line in one shot.
 const UART_RX_DRAIN_MAX: usize = 64;
-const UART_RX_PENDING_CAP: usize = 256;
-
-static UART_RX_PENDING: UartRxPending = UartRxPending::new();
-
-struct UartRxPending {
-    lock: AtomicBool,
-    len: AtomicUsize,
-    buf: UnsafeCell<[u8; UART_RX_PENDING_CAP]>,
-}
-
-unsafe impl Sync for UartRxPending {}
-
-struct UartRxPendingGuard<'a> {
-    pending: &'a UartRxPending,
-}
-
-impl UartRxPending {
-    const fn new() -> Self {
-        Self {
-            lock: AtomicBool::new(false),
-            len: AtomicUsize::new(0),
-            buf: UnsafeCell::new([0; UART_RX_PENDING_CAP]),
-        }
-    }
-
-    fn try_lock(&'static self) -> Option<UartRxPendingGuard<'static>> {
-        self.lock
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-            .then_some(UartRxPendingGuard { pending: self })
-    }
-}
-
-impl Drop for UartRxPendingGuard<'_> {
-    fn drop(&mut self) {
-        self.pending.lock.store(false, Ordering::Release);
-    }
-}
 
 /// Capacity of the deferred UART RX ring buffer.  Sized to hold several
 /// full lines of shell input without overflow.
@@ -141,6 +103,13 @@ pub fn register_irq_handler(irq: u32, handler: IrqHandlerFn) {
 pub fn reset_dispatch_table_for_test() {
     let mut table = IRQ_DISPATCH_TABLE.lock();
     *table = IrqDispatchTable::new();
+}
+
+/// Test-only: clear the deferred UART RX buffer.
+#[cfg(test)]
+pub fn reset_pending_uart_rx_for_test() {
+    let mut pending = UART_RX_PENDING.lock();
+    pending.len = 0;
 }
 
 /// Snapshot the handler currently registered for `irq`, if any.
@@ -207,22 +176,8 @@ pub(crate) fn install_irq_handlers<P: IrqIf + ConsoleIf>() {
 /// `IrqHandled::NotMine` if the console TTY hasn't been registered yet
 /// (defensive check against a stray pre-boot IRQ).
 pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
-    if crate::init::console_tty().is_none() {
-        return IrqHandled::NotMine;
-    }
-
-    let Some(_guard) = UART_RX_PENDING.try_lock() else {
-        return IrqHandled::Wake;
-    };
-    let current = UART_RX_PENDING.len.load(Ordering::Acquire);
-    if current >= UART_RX_PENDING_CAP {
-        return IrqHandled::Wake;
-    }
-
-    let space = UART_RX_PENDING_CAP - current;
-    let read_cap = UART_RX_DRAIN_MAX.min(space);
-    let pending = unsafe { &mut *UART_RX_PENDING.buf.get() };
-    let n = <P as ConsoleIf>::read_bytes(&mut pending[current..current + read_cap]);
+    let mut buf = [0u8; UART_RX_DRAIN_MAX];
+    let n = <P as ConsoleIf>::read_bytes(&mut buf);
     if n == 0 {
         // Spurious IRQ or FIFO already drained.
         return IrqHandled::Done;

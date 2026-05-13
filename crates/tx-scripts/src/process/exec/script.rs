@@ -43,7 +43,7 @@
 
 use alloc::vec::Vec;
 
-use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
+use tx_hal::{Arch, EntropyIf, PmapIf, UserTrapContext};
 use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{read_exact_at, PageContainer};
@@ -253,7 +253,6 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // `vm::execution::fault_script`.
     let openfile = {
         use StepOutcome as V3;
-        let guard = step_engine::guard();
         let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
         let outcome = {
             let guard = tx_substrate::epoch::guard();
@@ -435,7 +434,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         let copy_start = partial_page_start.max(segment.vaddr);
         let copy_len = file_end
             .checked_sub(copy_start)
-            .ok_or_else(|| record_notexec_site(NOTEXEC_SITE_PHASE5A_FILE_OFF_OVERFLOW))?;
+            .ok_or(ExecError::NotExecutable)?;
         if copy_len == 0 {
             continue;
         }
@@ -445,7 +444,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         // segment and must remain zero in the anon page.
         let file_off = segment
             .file_offset
-            .checked_add(partial_start - segment.vaddr)
+            .checked_add(copy_start - segment.vaddr)
             .ok_or(ExecError::NotExecutable)?;
         let mut buf = alloc::vec![0u8; partial_in_page as usize];
         {
@@ -457,7 +456,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
                 V3::Err(_) => return Err(ExecError::NotExecutable),
             }
         }
-        match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
+        match vm_scripts::populate_detached_user_range(&new_aspace, copy_start, &buf).await {
             StepOutcome::Done(()) => {}
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
                 return Err(ExecError::Busy);

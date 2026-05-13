@@ -256,9 +256,9 @@ impl<P: TxPlatform> CoreInit<P> {
             let outcome = fs_ops.create_inode(root_object_id, b"init", 0o100755, &cred, &guard);
             match outcome {
                 V3::Done(out) => out,
-                V3::Err(tx_substrate::step_v3::Errno::EROFS)
-                | V3::Err(tx_substrate::step_v3::Errno::ENOSYS)
-                | V3::Err(tx_substrate::step_v3::Errno::EEXIST) => {
+                V3::Err(tx_substrate::step::Errno::EROFS)
+                | V3::Err(tx_substrate::step::Errno::ENOSYS)
+                | V3::Err(tx_substrate::step::Errno::EEXIST) => {
                     // Rootfs is read-only (e.g. ext4 mounted from vda).
                     // The fixture is not needed; the real binary lives on disk.
                     Self::write_board_sentinel_prefix();
@@ -381,20 +381,7 @@ impl<P: TxPlatform> CoreInit<P> {
         match outcome {
             Ok(()) => {
                 Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":bootstrap-exec:ok:entry=0x");
-                Self::write_hex_usize(
-                    tx_scripts::process::exec::script::LAST_EXEC_ENTRY
-                        .load(core::sync::atomic::Ordering::Relaxed) as usize,
-                );
-                if let Some(payload) = thread.payload_cap() {
-                    if let Some(ctx) = payload.saved_user_context() {
-                        tx_hal::console_write_str::<P>(":saved-pc=0x");
-                        Self::write_hex_usize(ctx.pc);
-                        tx_hal::console_write_str::<P>(":saved-sp=0x");
-                        Self::write_hex_usize(ctx.regs[3]);
-                    }
-                }
-                tx_hal::console_write_str::<P>("\n");
+                tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
                 return;
             }
             Err(ref e) if init_path != b"/init" => {
@@ -418,12 +405,6 @@ impl<P: TxPlatform> CoreInit<P> {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":bootstrap-exec:fail:");
                 tx_hal::console_write_str::<P>(exec_error_tag(&e));
-                if matches!(e, tx_scripts::process::exec::ExecError::NotExecutable) {
-                    tx_hal::console_write_str::<P>(":site=");
-                    tx_hal::console_write_str::<P>(
-                        tx_scripts::process::exec::script::last_notexec_site_label(),
-                    );
-                }
                 tx_hal::console_write_str::<P>("\n");
                 panic!("bootstrap exec for /init failed: {e:?}");
             }
@@ -495,7 +476,11 @@ impl<P: TxPlatform> CoreInit<P> {
     ///
     /// Cheap when no bytes are pending (`read_bytes` returns 0,
     /// the rest is skipped).
-    pub(super) fn drain_sbi_console_into_tty() {
+    pub(super) fn drain_pending_uart_rx_into_tty() -> usize {
+        crate::irq::drain_uart_rx_pending()
+    }
+
+    pub(super) fn drain_sbi_console_into_tty() -> usize {
         // 2026-05-13: bumped from 64 to 512 bytes to swallow whole shell
         // command lines in a single SBI poll. The 64-byte cap left the
         // 17-byte tail of an 81-character `ln -s` line stranded in the
@@ -513,7 +498,7 @@ impl<P: TxPlatform> CoreInit<P> {
         if n == 0 {
             return 0;
         }
-        let Some(tty) = console_tty() else { return };
+        let Some(tty) = console_tty() else { return 0 };
         let guard = step_engine::guard();
         let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
         n
