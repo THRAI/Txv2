@@ -7,7 +7,7 @@
 
 use super::*;
 
-use tx_substrate::step_v3::{NoProgress, StepOutcome, YieldShape};
+use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 use tx_subsystems::net::{
     socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
     step_poll_ready, step_recv_kernel_bytes, step_send_to_kernel_bytes, step_shutdown,

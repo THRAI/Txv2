@@ -39,7 +39,7 @@ use crate::zone::{Cap, Zone, ZoneAllocated};
 // `tx-kernel` binds the production alias:
 //
 //     pub type KernelScriptCtx =
-//         step_v3::ScriptCtx<tx_subsystems::process::ProcessIdentity>;
+//         step::ScriptCtx<tx_subsystems::process::ProcessIdentity>;
 //
 // PR-9 wires up the generic `ScriptCtx<I>` and threads `&mut KernelScriptCtx`
 // through the 7 canonical syscalls. This module ships only the trait

@@ -154,7 +154,7 @@ impl CapabilitySet {
 /// here in the subsystem layer. The trait body is intentionally
 /// empty — step-level authority helpers consume the rich Cred
 /// surface (uid/gid/effective caps) via inherent methods and the
-/// `From<&Cred> for step_v3::Credential` bridge, not via the
+/// `From<&Cred> for step::Credential` bridge, not via the
 /// abstract view.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Cred {

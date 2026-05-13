@@ -193,16 +193,16 @@ impl CharDeviceOps for NullCharOps {
         &self,
         _out: &mut [u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-        tx_substrate::step_v3::StepOutcome::Done(0)
+    ) -> tx_substrate::step::StepOutcome<usize, tx_substrate::step::ByteProgress> {
+        tx_substrate::step::StepOutcome::Done(0)
     }
 
     fn write(
         &self,
         bytes: &[u8],
         _guard: &Guard<'_>,
-    ) -> tx_substrate::step_v3::StepOutcome<usize, tx_substrate::step_v3::ByteProgress> {
-        tx_substrate::step_v3::StepOutcome::Done(bytes.len())
+    ) -> tx_substrate::step::StepOutcome<usize, tx_substrate::step::ByteProgress> {
+        tx_substrate::step::StepOutcome::Done(bytes.len())
     }
 }
 /// Skeleton H3 boot spine for the generic kernel mainline.
@@ -429,7 +429,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let guard = tx_substrate::epoch::guard();
         let tty = match register_hardware("null", 0, binding, &guard) {
-            tx_substrate::step_v3::StepOutcome::Done(tty) => tty,
+            tx_substrate::step::StepOutcome::Done(tty) => tty,
             other => panic!("register_null_device: register_hardware failed: {other:?}"),
         };
         drop(guard);
@@ -1271,7 +1271,7 @@ impl<P: TxPlatform> CoreInit<P> {
     pub(crate) fn register_devfs_null_alias() {
         let tty = null_tty().expect("register_devfs_null_alias: null TTY must be registered");
         match register_console_alias("null", tty) {
-            tx_substrate::step_v3::StepOutcome::Done(()) => {}
+            tx_substrate::step::StepOutcome::Done(()) => {}
             other => panic!("register_devfs_null_alias: register_console_alias failed: {other:?}"),
         }
 

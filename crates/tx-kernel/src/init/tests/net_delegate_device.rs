@@ -1,6 +1,6 @@
 use std::vec::Vec;
 
-use tx_substrate::step_v3::StepOutcome;
+use tx_substrate::step::StepOutcome;
 use tx_subsystems::net::delegate::{net_delegate_clear, DelegateWireSet, NetDelegateTaskConfig};
 use tx_subsystems::net::device::{
     EthernetAddress, VirtioNetIrqEvent, VIRTIO_NET0_DEVICE, VIRTIO_NET0_REGISTRATION,

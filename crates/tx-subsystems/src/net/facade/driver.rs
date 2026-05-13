@@ -1,7 +1,7 @@
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::facade::{socket_connect_facade, SocketConnectCapability};
 use tx_reactor::wait::WaitProtocol;
-use tx_substrate::step_v3::YieldShape;
+use tx_substrate::step::YieldShape;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketFacadeDriveMode {

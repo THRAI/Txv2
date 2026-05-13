@@ -437,7 +437,7 @@ fn dispatch_sendmsg_recvmsg_udp_loopback_round_trips_source_addr() {
             LoopbackPollBudget::default(),
             &guard,
         ) {
-            tx_substrate::step_v3::StepOutcome::Done(outcome) => outcome,
+            tx_substrate::step::StepOutcome::Done(outcome) => outcome,
             other => panic!("unexpected loopback outcome: {other:?}"),
         }
     };
@@ -566,7 +566,7 @@ fn dispatch_ping_socket_sendto_recvfrom_loopback_echo_reply() {
             LoopbackPollBudget::default(),
             &guard,
         ) {
-            tx_substrate::step_v3::StepOutcome::Done(outcome) => outcome,
+            tx_substrate::step::StepOutcome::Done(outcome) => outcome,
             other => panic!("unexpected loopback outcome: {other:?}"),
         }
     };

@@ -301,7 +301,7 @@ fn step_open_eacces_without_read_bit() {
 // still fires when the rnode lacks a `containing_mount` weak (mount
 // tear-down mid-walk).
 
-// Compile-time sanity: the `From<execution::Errno> for step_v3::Errno`
+// Compile-time sanity: the `From<execution::Errno> for step::Errno`
 // bridge round-trips ENODEV identically.
 #[test]
 fn errno_v4_to_v3_is_consistent() {

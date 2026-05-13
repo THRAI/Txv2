@@ -105,7 +105,7 @@ impl AddressSpace {
     /// state for the caller). The inner v3 `copy_from_user` is bridged
     /// per-variant: `Done`/`Continue` → `Done(value)`,
     /// `Yield { shape, .. }` → `Yield { progress: NoProgress, shape }`,
-    /// `Err` → `Err(errno)` (errno already in `step_v3::Errno`).
+    /// `Err` → `Err(errno)` (errno already in `step::Errno`).
     pub fn read_user<T: Copy>(
         &self,
         src: UserPtr<T>,
