@@ -14,7 +14,8 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::vfs::{DEntry, FsObjectId, InodeMeta, OpenFileFlags};
+use crate::vfs::adapter::step_engine::Cap;
+use crate::vfs::{DEntry, FsObjectId, InodeMeta, RNode};
 
 // ============================================================================
 // WalkMode — closed set of path-resolution intents
@@ -87,7 +88,7 @@ pub enum NonTerminalDenial {
 /// `WalkMode` is an interpreter parameter passed alongside, **not
 /// stored** in state.
 #[derive(Clone, Debug)]
-pub enum WalkState<'g> {
+pub enum WalkState {
     /// Walker has made forward progress and can continue.
     Advance,
     /// Walker emitted an IO request and must yield; `ResumeToken`
@@ -97,7 +98,7 @@ pub enum WalkState<'g> {
         cause: WalkCause,
     },
     /// Walker reached a terminal outcome.
-    Terminal(PathResolution<'g>),
+    Terminal(PathResolution),
 }
 
 // ============================================================================
@@ -118,14 +119,15 @@ pub struct ResumeToken(u64);
 
 /// Terminal outcome of a path walk.
 ///
-/// The `FsObjectId` + `InodeMeta` pair is what the caller needs to
-/// materialise an RNode or construct a witness.  `IdentRef<'g,
-/// DEntry>` witnesses are constructed in `terminal.rs` after the
-/// walker drive loop completes.
+/// Holds the resolved `Cap<DEntry>` and `Cap<RNode>` so that
+/// witness constructors in `terminal.rs` can produce `IdentRef`
+/// handles via `.ident_ref(guard)`.
 #[derive(Clone, Debug)]
-pub struct PathResolution<'g> {
-    /// Terminal entity's DEntry identity.
-    pub dentry: &'g DEntry,
+pub struct PathResolution {
+    /// Terminal entity's DEntry capability.
+    pub dentry: Cap<DEntry>,
+    /// Terminal entity's RNode capability.
+    pub rnode: Cap<RNode>,
     /// Resolved FsObjectId.
     pub fs_object_id: FsObjectId,
     /// Inode metadata from `load_inode_meta`.
@@ -141,9 +143,9 @@ pub struct PathResolution<'g> {
 /// Mode-agnostic δ.  Reads `WalkState` and structure; produces
 /// `KernelStep`.  No mutation.
 #[derive(Clone, Debug)]
-pub enum KernelStep<'g> {
+pub enum KernelStep {
     /// Transition the state machine to the given next state.
-    Continue(WalkState<'g>),
+    Continue(WalkState),
     /// An IO operation must complete before the walker can proceed.
     NeedIO(IORequest, ResumeToken),
     /// The walker cannot proceed for the given reason.
