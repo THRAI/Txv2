@@ -1,6 +1,6 @@
 //! Tests for the ELF parser binding (Phase 4).
 //!
-//! Fixtures are hand-crafted byte-by-byte minimal RV64 ET_EXEC ELF
+//! Fixtures are hand-crafted byte-by-byte minimal ELF64 ET_EXEC
 //! images (we don't ship a checked-in binary; goblin doesn't bundle
 //! one either). Each test mutates the base image to produce the
 //! desired rejection. Layout reference: `Elf64_Ehdr` (64 bytes) +
@@ -29,6 +29,7 @@ const EV_CURRENT_BYTE: u8 = 1;
 const ET_EXEC_U16: u16 = 2;
 const ET_DYN_U16: u16 = 3;
 const EM_RISCV_U16: u16 = 243;
+const EM_LOONGARCH_U16: u16 = 258;
 const EM_X86_64_U16: u16 = 62;
 
 const PT_LOAD_U32: u32 = 1;
@@ -337,6 +338,15 @@ fn parse_image_plan_rejects_non_riscv_arch() {
     cfg.e_machine = EM_X86_64_U16;
     let bytes = cfg.build();
     assert_eq!(parse_image_plan(&bytes).unwrap_err(), ParseError::Arch);
+}
+
+#[test]
+fn parse_image_plan_accepts_loongarch64_arch() {
+    let mut cfg = FixtureCfg::minimal();
+    cfg.e_machine = EM_LOONGARCH_U16;
+    let bytes = cfg.build();
+    let plan = parse_image_plan(&bytes).expect("loongarch64 ELF should parse");
+    assert_eq!(plan.entry, 0x10080);
 }
 
 #[test]

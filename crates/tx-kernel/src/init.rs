@@ -441,75 +441,14 @@ impl<P: TxPlatform> CoreInit<P> {
         }
     }
 
-    /// Mount the boot rootfs.
+    /// Mount tmpfs as the boot rootfs.
     ///
-    /// LA64 QEMU uses the same shape we expect on real boards later:
-    /// a block-backed root filesystem selected by boot media.
-    /// Busybox profile opportunistically mounts `/dev/vda` as
-    /// read-only ext4; if no block device is found it falls back to
-    /// tmpfs. Other boards keep the existing tmpfs + initramfs path.
+    /// Keep LA64 aligned with RV64: `/` is a writable tmpfs used for
+    /// devfs, initramfs overlays, and bootstrap fixtures; block-backed
+    /// ext4 media is mounted later under `/musl` by
+    /// `mount_sdcard_at_musl`.
     pub(crate) fn mount_rootfs_from_boot_media() {
-        if P::ARCH == tx_hal::Arch::LoongArch64 && Self::mount_rootfs_ext4_vda() {
-            return;
-        }
-
         Self::mount_rootfs_tmpfs();
-    }
-
-    fn mount_rootfs_ext4_vda() -> bool {
-        let Some(reg) = tx_subsystems::device::block_device_by_name(b"vda") else {
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:skip:no-vda\n");
-            return false;
-        };
-        let image = crate::rootfs::RootBlockImage::new(reg.ops);
-        let Ok(mount_output) = tx_ext4::mount::mount_ext4_read_only(image) else {
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:skip\n");
-            return false;
-        };
-
-        let payload = MountPayload::new_cap(
-            mount_output.fs_ops().clone(),
-            mount_output.fs_page_backing().clone(),
-            None,
-            mount::allocate_dev_id(),
-            MountOptions {
-                flags: MountFlags::READ_ONLY,
-            },
-            "ext4",
-            SourceLabel::Static("vda"),
-        )
-        .expect("mount_rootfs_ext4_vda: payload reservation");
-        let root_rnode = {
-            let raw = RNode::new(
-                mount_output.root_fs_object_id,
-                mount_output.root_inode_meta,
-                RNodeBacking::Directory,
-            )
-            .with_containing_mount(&payload);
-            let res = step_engine::reserve_for::<RNode>()
-                .expect("mount_rootfs_ext4_vda: root rnode reservation");
-            step_engine::sign_for(res, raw)
-        };
-        let _root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone())
-            .expect("mount_rootfs_ext4_vda: root dentry reservation");
-
-        let mount = MountIdentity::new_cap(
-            mount::allocate_mount_id(),
-            None,
-            root_rnode,
-            None,
-            payload,
-            MountFlags::READ_ONLY,
-        )
-        .expect("mount_rootfs_ext4_vda: mount identity reservation");
-
-        *ROOT_MOUNT.lock() = Some(mount);
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":mount:rootfs:ext4:vda:ok\n");
-        true
     }
 
     /// Mount tmpfs as the rootfs.
@@ -824,11 +763,13 @@ impl<P: TxPlatform> CoreInit<P> {
 
         *MUSL_MOUNT.lock() = Some(musl_mount);
 
-        // Seed /bin/sh → /musl/musl/busybox in the rootfs tmpfs so
+        // Seed /bin/sh → the busybox binary in the rootfs tmpfs so
         // that shebang scripts (e.g. run-all.sh #!/bin/sh) resolve
-        // correctly when no initramfs is loaded (the oscomp boot path
-        // does not pass -initrd). Both steps tolerate EEXIST so a
-        // baked initramfs or busybox_baked path that ran first wins.
+        // correctly when no initramfs is loaded. RV64 OSComp images
+        // place busybox under /musl/musl; the LA64 busybox-root image
+        // built by xtask places it under /bin inside the mounted image.
+        // Both steps tolerate EEXIST so a baked initramfs or
+        // busybox_baked path that ran first wins.
         {
             let guard = step_engine::guard();
             let bin_id = match rootfs_payload.fs_ops.mkdir(
@@ -853,10 +794,14 @@ impl<P: TxPlatform> CoreInit<P> {
                 }
                 other => panic!("mount_sdcard_at_musl: mkdir /bin: {other:?}"),
             };
-            let _ =
-                rootfs_payload
-                    .fs_ops
-                    .symlink(bin_id, b"sh", b"/musl/musl/busybox", &cred, &guard);
+            let sh_target: &[u8] = if P::ARCH == tx_hal::Arch::LoongArch64 {
+                b"/musl/bin/busybox"
+            } else {
+                b"/musl/musl/busybox"
+            };
+            let _ = rootfs_payload
+                .fs_ops
+                .symlink(bin_id, b"sh", sh_target, &cred, &guard);
         }
 
         Self::write_board_sentinel_prefix();
@@ -1312,23 +1257,34 @@ impl<P: TxPlatform> CoreInit<P> {
         );
 
         P::enable_timer_wakeups();
+
+        let mut deadline_reached = false;
         for _ in 0..AP_REACTOR_WAIT_SPINS {
+            if P::read_ns() >= deadline_ns {
+                deadline_reached = true;
+                break;
+            }
+            crate::zones::try_bounded_maintenance_tick();
+            core::hint::spin_loop();
+        }
+
+        assert!(
+            deadline_reached,
+            "BSP reactor timer idle smoke deadline did not arrive"
+        );
+
+        let mut observed_timer_wake = false;
+        for _ in 0..1024 {
             let step = Self::step_boot_reactor_once(current_cpu)
                 .expect("boot reactor timer idle step failed");
+            observed_timer_wake |= step.observed_timer_wakes();
             if Self::bsp_timer_smoke_done(cpu_bit) {
-                assert!(step.observed_timer_wakes(), "BSP timer smoke wake");
+                assert!(observed_timer_wake, "BSP timer smoke wake");
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":reactor:timer-idle:ok\n");
                 return;
             }
             crate::zones::try_bounded_maintenance_tick();
-            // Spin rather than WFI: on_timer_interrupt calls
-            // cancel_deadline() which clears STIP, so WFI could block
-            // forever on SMP=1 if the interrupt fires and is handled
-            // between the guard check and the WFI instruction. The
-            // reactor's timer queue is unaffected by cancel_deadline,
-            // so each step() call will observe now_ns >= deadline and
-            // fire the task once real time advances past the deadline.
             core::hint::spin_loop();
         }
 
@@ -1503,12 +1459,8 @@ fn exec_error_tag(error: &tx_scripts::process::exec::ExecError) -> &'static str 
 fn parse_init_from_cmdline<P: tx_hal::TxPlatform>() -> (&'static [u8], &'static [u8]) {
     let cmdline = match <P as tx_hal::BootInfoIf>::boot_info().cmdline {
         Some(s) => s,
-        None if P::ARCH == tx_hal::Arch::LoongArch64 => return (b"/bin/busybox", b"sh"),
         None => return (b"/init", b"init"),
     };
-    if cmdline.trim().is_empty() && P::ARCH == tx_hal::Arch::LoongArch64 {
-        return (b"/bin/busybox", b"sh");
-    }
     for token in cmdline.split_ascii_whitespace() {
         if let Some(path) = token.strip_prefix("init=") {
             let argv0 = match path.rfind('/') {

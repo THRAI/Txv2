@@ -75,7 +75,7 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 // fn) — no `*Op` wrap exists for the exec orchestration today.
 // When `exec_script` gains a StepOp wrap (or is decomposed into a
 // pipeline of wraps), thread `&mut KernelScriptCtx` here.
-pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf>(
+pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + PlatformConfig>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
