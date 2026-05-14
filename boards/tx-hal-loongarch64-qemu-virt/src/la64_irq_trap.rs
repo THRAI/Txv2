@@ -322,9 +322,16 @@ pub(crate) fn la64_timebase_frequency_hz() -> u64 {
     let detected = la64_detect_timebase_frequency_hz();
     if detected != 0 {
         LA64_TIMEBASE_HZ.store(detected, Ordering::Release);
+        return detected;
     }
 
-    detected
+    // CPUCFG LLFTP bit not set (common in QEMU); fall back to the
+    // timebase frequency parsed from the DTB during early boot.
+    let from_dtb = unsafe { PLATFORM_INFO.timebase_frequency_hz };
+    if from_dtb != 0 {
+        LA64_TIMEBASE_HZ.store(from_dtb, Ordering::Release);
+    }
+    from_dtb
 }
 
 pub(crate) fn la64_detect_timebase_frequency_hz() -> u64 {
