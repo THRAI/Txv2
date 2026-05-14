@@ -33,8 +33,8 @@ use core::task::{Context, Poll, Waker};
 use std::sync::{LazyLock, Mutex};
 
 use tx_hal::{
-    Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
+    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
 use tx_shims::adapter::step_engine::{CancelReason, Cap, OnBehalfOfAbort};
@@ -54,6 +54,11 @@ use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult};
 // -------- Stub PMAP ------------------------------------------------
 
 struct StubPmap;
+
+impl PlatformConfig for StubPmap {
+    const ARCH: Arch = Arch::Riscv64;
+    const BOARD: &'static str = "shims-v3-test";
+}
 
 #[derive(Default)]
 struct StubPmapState {

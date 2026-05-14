@@ -46,10 +46,15 @@ core::arch::global_asm!(
     .equ TX_LA64_IOCSR_IPI_EN, 0x1004
     .globl _start
 _start:
-    // LA64 firmware handoff is platform-owned and not stable across
-    // loaders; use CPUID CSR for hart identity.
+    // QEMU's LoongArch direct-boot ABI passes Linux-style boot
+    // parameters in a0/a1/a2. Preserve them before using argument
+    // registers for Txv2's Rust entry point.
+    move    $s1, $a0
+    move    $s2, $a1
+    move    $s3, $a2
+
+    // Use CPUID CSR for hart identity.
     csrrd   $s0, 0x20
-    move    $s1, $a1
     bnez    $s0, .Ltx_la64_secondary_wait
     la.local $sp, __tx_boot_stack_top
     li.d    $t2, 4
@@ -86,6 +91,8 @@ _start:
     or      $sp, $sp, $t2
     move    $a0, $s0
     move    $a1, $s1
+    move    $a2, $s2
+    move    $a3, $s3
     la.local $t0, rust_entry
     li.d    $t2, TX_LA64_PHYS_ADDR_MASK
     and     $t0, $t0, $t2
@@ -781,6 +788,9 @@ const QEMU_LA64_PCIE_MMIO32_BASE: usize = 0x4000_0000;
 const QEMU_LA64_PCIE_MMIO32_SIZE: usize = 0x4000_0000;
 const QEMU_LA64_PCH_MSI_BASE: usize = 0x2ff0_0000;
 const QEMU_LA64_PCH_MSI_SIZE: usize = 0x8;
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+const QEMU_LA64_FW_CFG_BASE: usize = 0x1e02_0000;
+const QEMU_LA64_FDT_BASE: usize = 0x0010_0000;
 const LA64_MAX_BOOT_CPUS: usize = 4;
 #[cfg(target_arch = "loongarch64")]
 const LA64_DEFAULT_POSSIBLE_CPUS: usize = LA64_MAX_BOOT_CPUS;
@@ -890,6 +900,9 @@ const fn la64_addi_d(rd: u32, rj: u32, imm12: u32) -> u32 {
 
 static BOOT_FACTS_STATE: AtomicU8 = AtomicU8::new(0);
 static LA64_BOOT_FIRMWARE_ARG: AtomicUsize = AtomicUsize::new(0);
+static LA64_BOOT_EFI_BOOT: AtomicUsize = AtomicUsize::new(0);
+static LA64_BOOT_CMDLINE_PTR: AtomicUsize = AtomicUsize::new(0);
+static LA64_BOOT_SYSTEM_TABLE: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED_PT_NODE_ALLOCATOR: AtomicUsize = AtomicUsize::new(0);
 static LA64_TIMEBASE_HZ: AtomicU64 = AtomicU64::new(0);
 static LA64_POSSIBLE_CPU_COUNT: AtomicUsize = AtomicUsize::new(LA64_DEFAULT_POSSIBLE_CPUS);
@@ -913,6 +926,30 @@ static LA64_HOST_EIOINTC_ENABLE0: AtomicU64 = AtomicU64::new(0);
 static LA64_HOST_EIOINTC_COREISR0: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(target_arch = "loongarch64"))]
 static LA64_HOST_PCH_PIC_MASK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+pub fn capture_loongarch64_qemu_boot_args(
+    efi_boot: usize,
+    cmdline_phys: usize,
+    system_table_phys: usize,
+) {
+    LA64_BOOT_EFI_BOOT.store(efi_boot, Ordering::Release);
+    LA64_BOOT_CMDLINE_PTR.store(cmdline_phys, Ordering::Release);
+    LA64_BOOT_SYSTEM_TABLE.store(system_table_phys, Ordering::Release);
+}
+
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+const LA64_FW_CFG_INITRD_CAPACITY: usize = 8 * 1024 * 1024;
+
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+#[repr(C, align(4096))]
+struct La64FwCfgInitrdBuffer {
+    bytes: [u8; LA64_FW_CFG_INITRD_CAPACITY],
+}
+
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+static mut LA64_FW_CFG_INITRD_BUFFER: La64FwCfgInitrdBuffer = La64FwCfgInitrdBuffer {
+    bytes: [0; LA64_FW_CFG_INITRD_CAPACITY],
+};
 
 #[repr(C, align(8))]
 pub struct KernelResumeCtx {

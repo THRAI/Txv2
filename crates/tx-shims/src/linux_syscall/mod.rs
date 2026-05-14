@@ -46,7 +46,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use reactor_entry::userspace::SyscallRequest;
-use tx_hal::{EntropyIf, PmapIf, TimeIf, UserPtr};
+use tx_hal::{EntropyIf, PlatformConfig, PmapIf, TimeIf, UserPtr};
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_subsystems::cred::{
     step_setgid, step_setregid, step_setresgid, step_setresuid, step_setreuid, step_setuid,
@@ -456,7 +456,7 @@ pub enum SyscallResult {
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
+pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + PlatformConfig>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {

@@ -376,7 +376,7 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>("\n");
         }
 
-        if super::MUSL_MOUNT.lock().is_some() {
+        if super::MUSL_MOUNT.lock().is_some() && P::ARCH != tx_hal::Arch::LoongArch64 {
             let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/musl:/musl/musl/basic"];
             let sdcard_argv: &[&[u8]] = &[
                 b"sh",

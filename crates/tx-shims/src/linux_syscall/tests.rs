@@ -57,12 +57,17 @@ use super::{
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use tx_hal::{
-    Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
+    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
 use tx_subsystems::vm::USER_PAGE_SIZE;
 
 struct ShimsTestPmap;
+
+impl PlatformConfig for ShimsTestPmap {
+    const ARCH: Arch = Arch::Riscv64;
+    const BOARD: &'static str = "shims-test";
+}
 
 #[derive(Default)]
 struct ShimsTestPmapState {
