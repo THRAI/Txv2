@@ -1424,7 +1424,7 @@ unsafe fn read_boot_phys<T: Copy>(phys: usize) -> Option<T> {
 
 fn boot_phys_to_ptr<T>(phys: usize) -> Option<*const T> {
     let phys = la64_kernel_addr_to_phys(phys);
-    if phys >= QEMU_LA64_RAM_END && phys < QEMU_LA64_PCIE_ECAM_BASE {
+    if (QEMU_LA64_RAM_END..QEMU_LA64_PCIE_ECAM_BASE).contains(&phys) {
         return None;
     }
 

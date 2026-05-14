@@ -42,7 +42,10 @@ use tx_substrate::{
 // ── Backing ring storage ──────────────────────────────────────────────────────
 
 const RING_BYTES: usize = 2048;
-static mut RING_STORAGE2: [u8; RING_BYTES] = [0u8; RING_BYTES];
+#[repr(align(8))]
+struct AlignedRingStorage2([u8; RING_BYTES]);
+
+static mut RING_STORAGE2: AlignedRingStorage2 = AlignedRingStorage2([0u8; RING_BYTES]);
 static TEST_LOCK2: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static CURRENT_CPU2: AtomicUsize = AtomicUsize::new(0);
 static TS_COUNTER2: AtomicUsize = AtomicUsize::new(0);
@@ -137,7 +140,7 @@ impl ObserverIf for TestPlatform2 {
         if hart.0 != 0 {
             return None;
         }
-        let ptr = core::ptr::addr_of_mut!(RING_STORAGE2) as *mut u8;
+        let ptr = unsafe { core::ptr::addr_of_mut!(RING_STORAGE2.0) as *mut u8 };
         Some(RingDescriptor {
             base: unsafe { NonNull::new_unchecked(ptr) },
             size: RING_BYTES,
@@ -149,7 +152,7 @@ impl ObserverIf for TestPlatform2 {
 fn reset_ring() {
     unsafe {
         core::ptr::write_bytes(
-            core::ptr::addr_of_mut!(RING_STORAGE2) as *mut u8,
+            core::ptr::addr_of_mut!(RING_STORAGE2.0) as *mut u8,
             0,
             RING_BYTES,
         );
@@ -161,7 +164,7 @@ fn reset_ring() {
 /// Read the ring header and the first `n` slots.
 /// SAFETY: must hold `TEST_LOCK2`; no concurrent producer.
 unsafe fn read_ring(n: usize) -> (TxTraceHartRing, std::vec::Vec<TxTraceRecord>) {
-    let base = core::ptr::addr_of!(RING_STORAGE2) as *const u8;
+    let base = core::ptr::addr_of!(RING_STORAGE2.0) as *const u8;
     let hdr = core::ptr::read(base as *const TxTraceHartRing);
     let slots_ptr = base.add(core::mem::size_of::<TxTraceHartRing>()) as *const TxTraceRecord;
     let mut slots = std::vec::Vec::with_capacity(n);
