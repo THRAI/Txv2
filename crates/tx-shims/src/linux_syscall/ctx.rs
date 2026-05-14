@@ -4,6 +4,8 @@
 //! See the parent `mod.rs` dispatch doc for the two-site discipline and
 //! the `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE` anchor.
 
+use alloc::sync::Arc;
+
 use crate::adapter::step_engine;
 use crate::adapter::step_engine::Cap;
 use tx_subsystems::cred::Cred;
@@ -11,11 +13,14 @@ use tx_subsystems::process::ProcessIdentity;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vfs::structure::Credential;
 use tx_subsystems::vm::AddressSpace;
+use tx_substrate::wake::mailbox::TaskMailbox;
 
 pub struct SyscallCtx<'a> {
     pub process: Cap<ProcessIdentity>,
     pub thread: Cap<ThreadIdentity>,
     pub aspace: Cap<AddressSpace>,
+    /// Per-task mailbox for yield resolution (drive-taskmb).
+    pub mailbox: Option<Arc<TaskMailbox>>,
     /// Sliced lifetime so future fields (signal-mask snapshot, cred
     /// snapshot) can be added without ripping every call site.
     pub _lifetime: core::marker::PhantomData<&'a ()>,
@@ -35,8 +40,15 @@ impl<'a> SyscallCtx<'a> {
             process,
             thread,
             aspace,
+            mailbox: None,
             _lifetime: core::marker::PhantomData,
         }
+    }
+
+    /// Attach a task mailbox for yield resolution (drive-taskmb).
+    pub fn with_mailbox(mut self, mailbox: Arc<TaskMailbox>) -> Self {
+        self.mailbox = Some(mailbox);
+        self
     }
 
     /// Snapshot the current process's full credential.
@@ -129,5 +141,9 @@ pub fn build_subject_script_ctx(ctx: &SyscallCtx<'_>) -> crate::KernelScriptCtx 
         ctx.thread.clone(),
         authority,
     );
-    crate::KernelScriptCtx::new().with_subject(subject)
+    let mut script_ctx = crate::KernelScriptCtx::new().with_subject(subject);
+    if let Some(ref mailbox) = ctx.mailbox {
+        script_ctx = script_ctx.with_mailbox(Arc::clone(mailbox));
+    }
+    script_ctx
 }
