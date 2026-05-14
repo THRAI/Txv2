@@ -1990,6 +1990,20 @@
 
 **Updated:** 2026-05-14
 
+- 2026-05-14 **`feature-network` rebased onto `main` 856bd3e.** Replayed the
+  network branch on top of the latest fast-forwarded main, resolving conflicts
+  in the syscall dispatcher, thread userspace-entry path, virtio exports,
+  exec ELF-loader dynamic-interpreter support, and shell-test wiring. Kept
+  main's `ET_DYN` static-PIE loader behavior while preserving N69a `PT_INTERP`
+  / `parse_interp_plan` support, and kept main's `TrapIf::enter_userspace_with_context(ctx, root)`
+  shape while inserting N69b `maybe_deliver_itimer_signal` before userspace
+  entry. Added a small rebase-fallout commit for the regenerated lockfile and
+  `VirtioPciError::NoNetDevice` string arm. `msp/` notes remain untracked.
+  **Verified:** `cargo fmt --check`; `cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`
+  (passes with the existing `current_cpu` unused warning in `tx-kernel/src/init.rs`).
+  **Next step:** run the RV64 shell-test lanes (`busybox-iperf3-loopback`,
+  `busybox-netperf-help`, `busybox-netperf-loopback`) on the rebased branch.
+
 - 2026-05-13 **OSComp `basic-musl` TEST GROUP markers now appear** in the
   oscomp RV64 QEMU serial output. Three fixes landed together:
   1. `read_symlink` implemented in `tx-ext4-format` pager (handles fast
