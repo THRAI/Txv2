@@ -59,7 +59,7 @@
 //! (`docs/design/05_filesystem/VFS_CHECKS_V2.1.md`):
 //!
 //! - At each *intermediate* directory component the walker enforces
-//!   POSIX search (`X`) permission via [`check_descend_perm`]. A
+//!   POSIX search (`X`) permission via [`super::predicates::check_descend_perm`]. A
 //!   caller without the relevant `X` bit on the parent inode's mode
 //!   triplet receives `Errno::EACCES` (mapping to `WalkCause::
 //!   TraverseDenied` for spec-trace consumers); `CAP_DAC_OVERRIDE`
@@ -83,7 +83,6 @@ use alloc::vec::Vec;
 
 use crate::vfs::adapter::step_engine::{self, Cap, NoProgress, StepOutcome, Weak};
 
-use crate::cred::Capability;
 use crate::execution::{Errno, Guard};
 use crate::mount::{self, MountIdentity, MountPayload};
 use crate::vfs::structure::{
@@ -91,6 +90,8 @@ use crate::vfs::structure::{
     RNode, RNodeBacking,
 };
 use crate::vfs::FsOps;
+
+use super::predicates;
 
 /// POSIX symlink-loop budget. Matches Linux's `MAXSYMLINKS = 40`.
 /// The 41st observed symlink (after 40 hops have already been
@@ -206,7 +207,7 @@ pub fn step_open<'g>(
     // Validate the requested open mode against the terminal inode's
     // R/W permission bits.
     let terminal_meta = dentry.rnode().meta();
-    if let Err(err) = check_open_perm(&terminal_meta, flags, cred) {
+    if let Err(err) = predicates::check_open_perm(&terminal_meta, flags, cred) {
         return V3::err(err.into());
     }
 
@@ -300,7 +301,7 @@ fn walk_inner_v3<'g>(
 
         // POSIX search permission.
         let parent_meta = current.rnode().meta();
-        if let Err(err) = check_descend_perm(&parent_meta, cred) {
+        if let Err(err) = predicates::check_descend_perm(&parent_meta, cred) {
             return V3::err(err.into());
         }
 
@@ -495,66 +496,6 @@ fn fs_ops_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Arc<dyn FsO
     let mount_payload_weak: Weak<MountPayload> = dentry.rnode().containing_mount_weak()?;
     let payload = mount_payload_weak.upgrade(guard)?;
     Some(payload.fs_ops().clone())
-}
-
-// === DAC predicates ===================================================
-
-/// Pick the relevant POSIX mode-triplet bits for `cred` against the
-/// inode's owner/group: owner (`>> 6`) > group (`>> 3`) > other.
-/// Returns the bottom 3 bits — `(rwx)` for the chosen triplet.
-fn select_perm_triplet(meta: &InodeMeta, cred: &Credential) -> u32 {
-    let mode = meta.mode as u32;
-    if cred.uid == meta.uid {
-        (mode >> 6) & 0o7
-    } else if cred.gid == meta.gid {
-        (mode >> 3) & 0o7
-    } else {
-        mode & 0o7
-    }
-}
-
-/// DAC search/traversal check for an interior directory component.
-/// Walker invokes this from [`walk_inner_v3`] before descending into a
-/// resolved child directory's `lookup`. POSIX rule: the appropriate
-/// triplet must have the `X` (execute = search) bit set, unless the
-/// caller carries `CAP_DAC_OVERRIDE`.
-///
-/// Slice simplification: directories with at least one X bit also
-/// satisfy `CAP_DAC_OVERRIDE`'s execute-bit constraint by definition,
-/// so the override branch returns success unconditionally for
-/// directories. Per `txdoc:VFS-CHECKS-PERMISSIONS-1`.
-fn check_descend_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), Errno> {
-    if cred.effective_caps.contains(Capability::DAC_OVERRIDE) {
-        return Ok(());
-    }
-    let bits = select_perm_triplet(meta, cred);
-    if bits & 0o1 == 0 {
-        return Err(Errno::EACCES);
-    }
-    Ok(())
-}
-
-/// DAC R/W check for terminal-component open. Validates
-/// `OpenFileFlags::{read, write}` against the inode's owner/group
-/// permission triplet. `CAP_DAC_OVERRIDE` short-circuits.
-///
-/// Slice simplification: full DAC override (real Linux's
-/// `CAP_DAC_OVERRIDE` does not grant exec on regular files unless an
-/// X bit is set, but `step_open` does not enforce exec — that
-/// lives in `exec_script` in Wave 4). Per
-/// `txdoc:VFS-CHECKS-PERMISSIONS-1`.
-fn check_open_perm(meta: &InodeMeta, flags: OpenFileFlags, cred: &Credential) -> Result<(), Errno> {
-    if cred.effective_caps.contains(Capability::DAC_OVERRIDE) {
-        return Ok(());
-    }
-    let bits = select_perm_triplet(meta, cred);
-    if flags.read && bits & 0o4 == 0 {
-        return Err(Errno::EACCES);
-    }
-    if flags.write && bits & 0o2 == 0 {
-        return Err(Errno::EACCES);
-    }
-    Ok(())
 }
 
 // === walker internals =================================================
