@@ -149,6 +149,15 @@ pub enum YieldShape {
     /// [`crate::wake::timer::TimerGuard`] (future PR-8 follow-up)
     /// that the driver retires on resume.
     OnTimer { token: TimerId, deadline: Deadline },
+    /// Edge-triggered epoll subscription. Resolved identically to
+    /// [`OnWaitSource`] at the protocol layer (park on source,
+    /// return [`ResumeOutcome::Retry`]); the edge-vs-level
+    /// distinction is handled by the epoll subsystem's readiness
+    /// tracking, not by the yield-resolve path.
+    OnEdge {
+        source: WaitSourceId,
+        interests: InterestMask,
+    },
 }
 
 impl YieldShape {
@@ -211,9 +220,30 @@ impl<T, P: StepProgress> StepOutcome<T, P> {
 /// Per STEP-3: `(Self, EMPTY, extend)` is monoid-shaped — associative,
 /// with `EMPTY` as identity. The integration tests pin both laws.
 pub trait StepProgress: Sized {
+    /// The concrete value this progress can be converted into via
+    /// [`into_output`](Self::into_output). For progress types that
+    /// track meaningful partial-result quantities (e.g.,
+    /// [`ByteProgress`] tracks bytes read), this is the same as
+    /// `StepOp::Output`; for marker progress types ([`NoProgress`]),
+    /// this is `()` and `into_output` always returns `None`.
+    type Output;
+
     const EMPTY: Self;
     fn is_empty(&self) -> bool;
     fn extend(&mut self, other: Self);
+
+    /// Convert accumulated progress into a concrete output value.
+    ///
+    /// Returns `Some(val)` for progress types that carry partial-result
+    /// semantics (e.g. `ByteProgress → usize`). Returns `None` for
+    /// marker progress (`NoProgress`, `EntryProgress`) that track
+    /// intermediate state but don't represent a partial `StepOp::Output`.
+    ///
+    /// Used by [`drive()`] when `DriveMode::Nonblocking` produces a
+    /// `PartialReturn` translation — the driver has accumulated
+    /// progress across one or more `Continue` steps and surfaces
+    /// that partial work instead of returning `EAGAIN`.
+    fn into_output(self) -> Option<Self::Output>;
 }
 
 /// One-shot ops: open, mkdir, fork, dup, close, mmap-reservation, …
@@ -221,11 +251,15 @@ pub trait StepProgress: Sized {
 pub struct NoProgress;
 
 impl StepProgress for NoProgress {
+    type Output = ();
     const EMPTY: Self = NoProgress;
     fn is_empty(&self) -> bool {
         true
     }
     fn extend(&mut self, _other: Self) {}
+    fn into_output(self) -> Option<()> {
+        None
+    }
 }
 
 /// Byte-moving ops: read, write, splice, sendfile, copy_file_range.
@@ -249,12 +283,16 @@ impl ByteProgress {
 }
 
 impl StepProgress for ByteProgress {
+    type Output = usize;
     const EMPTY: Self = ByteProgress { bytes: 0 };
     fn is_empty(&self) -> bool {
         self.bytes == 0
     }
     fn extend(&mut self, other: Self) {
         self.bytes = self.bytes.saturating_add(other.bytes);
+    }
+    fn into_output(self) -> Option<usize> {
+        Some(self.bytes)
     }
 }
 
@@ -441,9 +479,11 @@ impl DriveMode {
             }
             (DriveMode::Nonblocking, _) => AcceptOutcome::Translate(Translation::PartialReturn),
             (DriveMode::Waiting, YieldShape::OnWaitSource { .. }) => AcceptOutcome::Resolve,
+            (DriveMode::Waiting, YieldShape::OnEdge { .. }) => AcceptOutcome::Resolve,
             (DriveMode::Waiting, YieldShape::OnAgent { .. }) => AcceptOutcome::Resolve,
             (DriveMode::Waiting, YieldShape::OnTimer { .. }) => AcceptOutcome::Resolve,
             (DriveMode::Selecting, YieldShape::OnWaitSource { .. }) => AcceptOutcome::Resolve,
+            (DriveMode::Selecting, YieldShape::OnEdge { .. }) => AcceptOutcome::Resolve,
             (DriveMode::Selecting, YieldShape::OnAgent { .. }) => {
                 AcceptOutcome::Translate(Translation::UnsupportedShape)
             }

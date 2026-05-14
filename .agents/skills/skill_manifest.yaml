@@ -177,3 +177,17 @@ skills:
       - xtask/src/fault_decode.rs
       - tools/shell-tests/busybox-prompt.txt
     purpose: Tight observe→fix→verify loop for missing/broken syscalls when running interactive busybox or other userspace shells under QEMU. Pairs trap-trace + fault-decode + shell-test xtask tools with the syscall-stub edit pattern in tx-shims.
+
+  tx-step-migration:
+    sources:
+      - docs/Txv3/03_STEP_MODEL_v2.md
+      - docs/Txv3/01_CONCEPTS_v5.md
+      - docs/Txv3/02_INVARIANTS_v5.md
+      - docs/Txv3/04_SYSCALL_SHAPE_v1.md
+      - docs/Txv3/05_DELEGATE_v1.md
+      - docs/Txv3/06_EXECUTION_SCOPE_v1.md
+      - docs/Txv3/07_BLAST_RADIUS.md
+      - docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md
+      - docs/design/00_meta-framework/object_model_v2.md
+      - docs/progress/plans/2026-05-09-v3-tdd-migration.md
+    purpose: Wrap free-function step_* fns into StepOp trait impls, migrate ad-hoc step loops to the central drive() loop, and retire v4 vocabulary per the v3 TDD migration plan.

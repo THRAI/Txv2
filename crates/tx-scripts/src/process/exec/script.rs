@@ -263,7 +263,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         use StepOutcome as V3;
         let guard = step_engine::guard();
         let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
-        let outcome = poll_walker_synchronously(step_open(
+        let outcome = step_open(
             rooted_at,
             path,
             OpenFileFlags {
@@ -276,7 +276,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
             0,
             cred,
             &guard,
-        ));
+        );
         let result = match outcome {
             V3::Done(file) => Ok(file),
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
@@ -497,12 +497,10 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         }
         match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
             StepOutcome::Done(()) => {}
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                return Err(ExecError::Busy);
-            }
             StepOutcome::Err(err) => {
                 return Err(ExecError::from_populate_errno(err.into()));
             }
+            _ => return Err(ExecError::Busy),
         }
     }
 
@@ -569,12 +567,10 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     .await
     {
         StepOutcome::Done(()) => {}
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-            return Err(ExecError::Busy);
-        }
         StepOutcome::Err(err) => {
             return Err(ExecError::from_populate_errno(err.into()));
         }
+        _ => return Err(ExecError::Busy),
     }
 
     // ----- Phase 5 (cont) — collapse old-AS work -------------------

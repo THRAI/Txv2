@@ -417,12 +417,12 @@ fn step_walk_resolves_relative_path_within_rootfs() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(
+    let outcome = step_walk(
         topo.root_dentry.clone(),
         b"foo/bar",
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     let dentry = match outcome {
         V3::Done(d) => d,
@@ -446,12 +446,12 @@ fn step_walk_resolves_absolute_path_from_root() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(
+    let outcome = step_walk(
         topo.root_dentry.clone(),
         b"/foo/bar",
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Done(d) => assert_eq!(d.name().as_bytes(), b"bar"),
@@ -470,7 +470,7 @@ fn step_walk_returns_enoent_on_missing() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/nope", &cred, &guard));
+    let outcome = step_walk(topo.root_dentry.clone(), b"/nope", &cred, &guard);
     drop(guard);
     match outcome {
         V3::Err(V3Errno::ENOENT) => {}
@@ -491,12 +491,12 @@ fn step_walk_returns_enotdir_on_trailing_slash_after_file() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(
+    let outcome = step_walk(
         topo.root_dentry.clone(),
         b"/thing/",
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Err(V3Errno::ENOTDIR) => {}
@@ -517,12 +517,12 @@ fn step_walk_returns_enotdir_when_traversing_through_file() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(
+    let outcome = step_walk(
         topo.root_dentry.clone(),
         b"/thing/under",
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Err(V3Errno::ENOTDIR) => {}
@@ -545,12 +545,12 @@ fn step_walk_chases_relative_symlink_to_target() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(
+    let outcome = step_walk(
         topo.root_dentry.clone(),
         b"/alias",
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Done(d) => {
@@ -577,7 +577,7 @@ fn step_walk_chases_absolute_symlink_from_root() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/jump", &cred, &guard));
+    let outcome = step_walk(topo.root_dentry.clone(), b"/jump", &cred, &guard);
     drop(guard);
     match outcome {
         V3::Done(d) => {
@@ -621,7 +621,7 @@ fn step_walk_returns_eloop_after_41_hops() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(topo.root_dentry.clone(), b"/s0", &cred, &guard));
+    let outcome = step_walk(topo.root_dentry.clone(), b"/s0", &cred, &guard);
     drop(guard);
     match outcome {
         V3::Err(V3Errno::ELOOP) => {}
@@ -661,12 +661,12 @@ fn step_walk_crosses_mount_point_at_dev() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_walk(
+    let outcome = step_walk(
         topo.root_dentry.clone(),
         b"/dev/consoledir",
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Done(d) => {
@@ -717,12 +717,12 @@ fn step_walk_owner_can_traverse_dir_with_owner_x_bit() {
 
     let cred = unprivileged_cred(1000, 0);
     let guard = guard();
-    let outcome = block_on(step_walk(
+    let outcome = step_walk(
         topo.root_dentry.clone(),
         b"/ownerdir/leaf",
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
@@ -748,12 +748,12 @@ fn step_walk_other_cannot_traverse_dir_without_other_x_bit() {
 
     let cred = unprivileged_cred(9999, 9999);
     let guard = guard();
-    let outcome = block_on(step_walk(
+    let outcome = step_walk(
         topo.root_dentry.clone(),
         b"/ownerdir/leaf",
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Err(V3Errno::EACCES) => {}
@@ -784,12 +784,12 @@ fn step_walk_dac_override_short_circuits_perm_check() {
         effective_caps: caps,
     };
     let guard = guard();
-    let outcome = block_on(step_walk(
+    let outcome = step_walk(
         topo.root_dentry.clone(),
         b"/locked/leaf",
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
@@ -815,12 +815,12 @@ fn step_walk_group_match_uses_group_triplet() {
 
     let cred = unprivileged_cred(2000, 500);
     let guard = guard();
-    let outcome = block_on(step_walk(
+    let outcome = step_walk(
         topo.root_dentry.clone(),
         b"/groupdir/leaf",
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Done(d) => assert_eq!(d.name().as_bytes(), b"leaf"),
@@ -848,7 +848,7 @@ fn step_open_caller_with_read_bit_succeeds() {
 
     let cred = unprivileged_cred(1000, 0);
     let guard = guard();
-    let outcome = block_on(step_open(
+    let outcome = step_open(
         topo.root_dentry.clone(),
         b"/readdir",
         OpenFileFlags {
@@ -861,7 +861,7 @@ fn step_open_caller_with_read_bit_succeeds() {
         0,
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Done(_) => {}
@@ -886,7 +886,7 @@ fn step_open_no_read_bit_returns_eacces() {
 
     let cred = unprivileged_cred(1000, 0);
     let guard = guard();
-    let outcome = block_on(step_open(
+    let outcome = step_open(
         topo.root_dentry.clone(),
         b"/locked",
         OpenFileFlags {
@@ -899,7 +899,7 @@ fn step_open_no_read_bit_returns_eacces() {
         0,
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Err(V3Errno::EACCES) => {}
@@ -924,7 +924,7 @@ fn step_open_caller_with_write_bit_succeeds() {
 
     let cred = unprivileged_cred(1000, 0);
     let guard = guard();
-    let outcome = block_on(step_open(
+    let outcome = step_open(
         topo.root_dentry.clone(),
         b"/rwdir",
         OpenFileFlags {
@@ -937,7 +937,7 @@ fn step_open_caller_with_write_bit_succeeds() {
         0,
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Done(_) => {}
@@ -968,7 +968,7 @@ fn step_open_dac_override_short_circuits() {
         effective_caps: caps,
     };
     let guard = guard();
-    let outcome = block_on(step_open(
+    let outcome = step_open(
         topo.root_dentry.clone(),
         b"/locked",
         OpenFileFlags {
@@ -981,7 +981,7 @@ fn step_open_dac_override_short_circuits() {
         0,
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     match outcome {
         V3::Done(_) => {}
@@ -1001,7 +1001,7 @@ fn step_open_round_trips_to_directory_dentry() {
 
     let cred = Credential::root();
     let guard = guard();
-    let outcome = block_on(step_open(
+    let outcome = step_open(
         topo.root_dentry.clone(),
         b"/opendir",
         OpenFileFlags {
@@ -1014,7 +1014,7 @@ fn step_open_round_trips_to_directory_dentry() {
         0,
         &cred,
         &guard,
-    ));
+    );
     drop(guard);
     let file = match outcome {
         V3::Done(f) => f,

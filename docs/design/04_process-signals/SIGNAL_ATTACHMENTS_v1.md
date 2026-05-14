@@ -102,10 +102,20 @@ OpenFile itself publishes little; most observable state lives on its RNode. The 
 | Entity | Carrier | Wire | Transition | Polarity | Fired from | Subscribers | Projection link |
 |---|---|---|---|---|---|---|---|
 | ProcessIdentity | RawPort | `exit_source` | Payload transitioned to None (exit) | `fire(Exited{status})` | `process::step_exit_commit` | waitpid (parent), pidfd subscribers, ptrace tracer | ProcessPayload.payload → false |
-| ProcessIdentity | RawPort | `signal_port` | Signal delivered (generated for this process) | `fire(SignalGenerated{sig})` | `process::step_signal_deliver` | signalfd subscribers, ptrace tracer | — (not a projection change) |
+| ProcessPayload | RawPort | `signal_port` | Signal delivered (Gewalt routing or Event posted to thread_pending) | `fire(SIGNAL_GENERATED)` | `signal::step_kill_process` (both Gewalt and Event paths) | signalfd subscribers (via `notify_process_signal` after bus fire), future pidfd/timerfd | — (not a projection change) |
 | ProcessIdentity | RawPort | `ptrace_port` | Ptrace stop point reached | `fire(Stop{reason})` | dispatch/intercept/ptrace via `process::step_intercept_commit` | attached tracer | — |
 | ProcessIdentity | RawTrace | `sched_trace` | Scheduling events, context switches | `emit({from, to, reason})` | scheduler (in reactor), via process wire | ftrace, perf | — |
 | ThreadIdentity | RawPort | `thread_exit_source` | ThreadPayload transitioned to None | `fire(ThreadExited)` | `thread::step_thread_exit_commit` | pthread_join, clear_child_tid futex wake | ThreadPayload.payload → false |
+
+### 3.3a ProcessPayload — readiness wires
+
+<!-- txdoc:SIGNAL-ATTACHMENTS-CATALOG-PAYLOAD-READINESS-1 -->
+
+| Entity | Carrier | Wire | Transition | Polarity | Fired from | Subscribers | Projection link |
+|---|---|---|---|---|---|---|---|
+| ProcessPayload | RawQueue | `exit_source_bus` | Child process zombified (SIGCHLD posted to parent) | `fire(EXIT_SOURCE_CHILD_ZOMBIFIED)` | `process::fire_exit_source` (alongside legacy Channel + WaitSource) | wait4/waitid (future migration from Channel), pidfd | ProcessPayload.children zombie count |
+
+Phase A alignment note: `exit_source_bus` coexists with the legacy `exit_source` (Channel) on `ProcessIdentity`. Both fire from `process::fire_exit_source`. Subscribers drain from both mechanisms; the Channel is the current wait4 path, the RawQueue is the bus-aligned replacement. Once all consumers migrate, the Channel is removed.
 
 Notes on BIF-5 compliance: every row names a single entity (ProcessIdentity or ProcessPayload or ThreadIdentity). No wire spans both Identity and Payload. The `exit_source` fires when Payload transitions to None; the wire lives on Identity (because ProcessPayload has been reclaimed by the time subscribers observe the event — only Identity survives the zombie window). Placing the wire on Identity is the BIF-5-compliant choice.
 

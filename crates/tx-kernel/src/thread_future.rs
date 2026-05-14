@@ -86,8 +86,9 @@ use boot_runtime::userspace::{
     UserspaceTrapInfo,
 };
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
-use tx_subsystems::process::execution::step_exit_group_with_signal;
 use tx_subsystems::signal::Signum;
+use tx_subsystems::signal::{ast_dispatch, AstOutcome};
+use tx_subsystems::signal::deliver_synchronous_fault;
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, set_current_thread_payload, ThreadIdentity, ThreadPayload,
@@ -226,6 +227,53 @@ pub async fn run_thread<P: TxPlatform>(
         };
         let entry_token = entry_wait.request();
         payload.set_active_userspace_request(Some(entry_token));
+
+        // Phase E (stop-state): before entering userspace, check
+        // whether the thread is stopped (SIGSTOP / default-Stop
+        // disposition). A stopped thread must park until SIGCONT
+        // clears the flag.
+        while payload.is_stopped() {
+            // Busy-wait placeholder.  On real hardware this spins
+            // until route_gewalt(SIGCONT) clears the flag.  TODO:
+            // replace with a reactor-managed wait-source woken by
+            // SIGCONT's mailbox post.
+            core::hint::spin_loop();
+        }
+
+        // Phase D (AST checkpoint): run ast_dispatch *before* entering
+        // userspace. This is the entry-side AST checkpoint — it drains
+        // pending signals and, for handler-disposition signals, modifies
+        // `saved_user_context` so the thread enters the handler instead
+        // of its original code on next `enter_userspace_with_context`.
+        //
+        // Per SIGNAL_v1 §15.1: AST checkpoint runs on every kernel→user
+        // transition. Pending signals are selected by signum priority
+        // (lowest first), disposition is consulted, and outcomes that
+        // need materialisation (DefaultTerminate, DeliverHandler) are
+        // handled inline.
+        let ast_outcome = ast_dispatch(&thread);
+        match ast_outcome {
+            AstOutcome::DeliverHandler { sig: _, handler: _ } => {
+                // Phase D: handler delivery — the thread should enter
+                // the installed handler with a signal frame on the
+                // user stack.
+                //
+                // TODO(phase-d-handler-frame): call
+                // SignalFrameIf::write_signal_frame here to construct
+                // the signal frame, modify saved_user_context to enter
+                // the handler trampoline, and set up the sigreturn
+                // trampoline for handler return.
+                //
+                // For now, fall through — the handler is not delivered
+                // and the thread re-enters userspace at the original
+                // instruction. The signal is already dequeued from
+                // the pending queue by ast_check, so it is effectively
+                // dropped.
+            }
+            AstOutcome::InitiateTermination => return,
+            _ => {}
+        }
+
         let decision = payload.userspace_slot().checkpoint_userspace_entry_batch(
             entry_token,
             AstBatch::default(),
@@ -356,6 +404,17 @@ pub async fn run_thread<P: TxPlatform>(
                         // `UserTrapContext`, per
                         // `make_initial_user_trap_context`).
                     }
+                    tx_shims::linux_syscall::SyscallResult::SigreturnRestored => {
+                        // Phase B: rt_sigreturn restored the signal
+                        // frame into saved_user_context.  Same
+                        // fall-through semantics as ExecCommitted:
+                        // MUST NOT drain pending_syscall_return;
+                        // re-enters userspace with the restored
+                        // context.  The actual SignalFrameIf restore
+                        // (read_signal_frame + restore_signal_frame)
+                        // lands in Phase D.
+                        // Fall through to AST drain + re-entry.
+                    }
                 }
             }
             UserspaceTrapInfo::PageFault(info) => {
@@ -394,18 +453,15 @@ pub async fn run_thread<P: TxPlatform>(
                         // `pending_syscall_return` write).
                     }
                     Err(_e) => {
-                        step_exit_group_with_signal(&process, Signum::SIGSEGV);
+                        deliver_synchronous_fault(&thread, Signum::SIGSEGV);
                         return;
                     }
                 }
             }
             UserspaceTrapInfo::Fatal(_info) => {
-                // Out-of-scope for Phase 2; terminate the future
-                // rather than entering a divergent state we can't
-                // express yet.
-                if let Some(process) = thread.upgrade_owner_proc() {
-                    step_exit_group_with_signal(&process, Signum::SIGSEGV);
-                }
+                // Phase B: route fatal trap through canonical
+                // synchronous-fault entry per SIGNAL_v1 §20.
+                deliver_synchronous_fault(&thread, Signum::SIGSEGV);
                 return;
             }
         }

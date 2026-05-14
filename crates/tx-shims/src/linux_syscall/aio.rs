@@ -246,6 +246,7 @@ fn run_read(file: &Cap<OpenFile>, out: &mut [u8]) -> Result<usize, i64> {
                 file,
                 out: &mut out[total..],
                 guard: &guard,
+                cursor: 0,
             };
             op.step(&mut script_ctx)
         };
@@ -293,6 +294,7 @@ fn run_write(file: &Cap<OpenFile>, bytes: &[u8]) -> Result<usize, i64> {
                 file,
                 bytes: remaining,
                 guard: &guard,
+                cursor: 0,
             };
             op.step(&mut script_ctx)
         };

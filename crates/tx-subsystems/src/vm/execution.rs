@@ -849,7 +849,7 @@ async fn await_range_lock(token: WaitToken) {
 fn unreachable_acquire_step() -> ! {
     unreachable!(
         "RangeLock::acquire_step / acquire_pair_step never produce \
-         Continue / Yield-OnAgent / Err / Advanced / AdvancedThenBlocked"
+         Continue / Yield / Err / Done"
     );
 }
 

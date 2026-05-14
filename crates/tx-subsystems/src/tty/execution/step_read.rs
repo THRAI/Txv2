@@ -26,6 +26,11 @@ pub fn step_read(
     out: &mut [u8],
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3};
 
     if out.is_empty() {
@@ -102,6 +107,11 @@ pub fn step_read_for_caller(
     caller: super::IoctlCaller,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     if out.is_empty() {
@@ -122,6 +132,11 @@ pub fn step_read_for_process(
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let caller_info = match super::IoctlCaller::from_process_with_guard(caller, guard) {

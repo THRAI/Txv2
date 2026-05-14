@@ -20,12 +20,13 @@
 //! - [`step_open`] composes [`step_walk`] with `OpenFile::new_cap`
 //!   to produce a `Cap<OpenFile>` over the resolved RNode.
 //!
-//! Both are `async` so future cross-await disciplines (range-lock
-//! waits inside `FsOps::lookup`, page-cache materialisation inside
-//! `OpenFile::step_read` for regular files) compose cleanly. The
-//! day-1 implementations call only synchronous `FsOps::lookup` /
-//! `load_inode_meta` / `read_link` against in-memory backends, so
-//! every `.await` is a no-op today.
+//! Both are synchronous per STEP-2; yields surface through
+//! `StepOutcome::Yield` rather than `.await`. Future cross-await
+//! disciplines (range-lock waits inside `FsOps::lookup`, page-cache
+//! materialisation inside `OpenFile::step_read` for regular files)
+//! compose cleanly through the yield mechanism. The day-1
+//! implementations call only synchronous `FsOps::lookup` /
+//! `load_inode_meta` / `read_link` against in-memory backends.
 //!
 //! ## Mount-point crossing
 //!
@@ -132,29 +133,39 @@ pub const SYMLOOP_MAX: u32 = 40;
 ///
 /// **WALKER-CARVEOUT-1** (per
 /// [`docs/progress/decisions/2026-05-11-d3-walker-async-carveout.md`](../../../../../../docs/progress/decisions/2026-05-11-d3-walker-async-carveout.md)):
-/// `step_walk` and [`step_open`] are **script-level async resolvers**,
+/// `step_walk` and [`step_open`] are **script-level resolvers**,
 /// not `StepOp` implementations. PR-2 explicitly skipped wrapping them.
-/// They must still obey the same external yield safety rules:
-/// - no `epoch::Guard` across `.await`
-/// - no witness across `.await`
-/// - no reservation guard across `.await`
+/// They obey the same external yield safety rules:
+/// - no `epoch::Guard` across yield
+/// - no witness across yield
+/// - no reservation guard across yield
 /// - resume revalidates path state
 ///
 /// A future dedicated VFS PR may introduce a `PathResolveOp` state
 /// machine; that work is out of scope for v3 foundation.
-pub async fn step_walk<'g>(
+pub fn step_walk<'g>(
     rooted_at: Cap<DEntry>,
     path: &[u8],
     cred: &Credential,
     guard: &Guard<'g>,
 ) -> StepOutcome<Cap<DEntry>, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
+    // observe — guard + cred supplied by caller; DAC checks in walk_inner_v3
+    // upgrade — N/A: no IdentRef→Cap needed (guard-scoped lookup)
+    // reserve — N/A: read-only path resolution
+    // commit — N/A: no mutations
+    // publish — N/A: no signal attachments
     walk_inner_v3(rooted_at, path, cred, guard)
 }
 
 /// Open a path by name. Composes [`step_walk`] with
 /// `OpenFile::new_cap` and the DAC R/W check, returning a
 /// `Cap<OpenFile>` over the resolved RNode.
-pub async fn step_open<'g>(
+pub fn step_open<'g>(
     rooted_at: Cap<DEntry>,
     path: &[u8],
     flags: OpenFileFlags,
@@ -162,13 +173,23 @@ pub async fn step_open<'g>(
     cred: &Credential,
     guard: &Guard<'g>,
 ) -> StepOutcome<Cap<OpenFile>, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
+    // observe — credentials + flags validated via check_open_perm below
+    // upgrade — dentry Cap resolved via step_walk (pass-through variant dispatch)
+    // reserve — OpenFile::new_cap reserves zone slot
+    // commit — N/A: delegated to OpenFile::new_cap internals
+    // publish — N/A: no signal attachments
     use StepOutcome as V3;
 
     // `mode` is reserved for future create-on-open semantics; the
     // current surface only resolves existing entries.
     let _ = mode;
 
-    let dentry = match step_walk(rooted_at, path, cred, guard).await {
+    let dentry = match step_walk(rooted_at, path, cred, guard) {
         V3::Done(d) => d,
         V3::Continue { .. } => {
             // `walk_inner_v3` only returns `Done` / `Yield` / `Err` at

@@ -754,6 +754,10 @@ pub struct ProcessPayload {
     /// whose mask permits the signal will sweep it on its next
     /// delivery point.
     pub(crate) group_pending: PendingSignalQueue,
+    /// Per-signum siginfo slots. Written by signal producers
+    /// (post_signal via step_kill_process), read by signalfd
+    /// and the future handler-delivery path. Phase I.
+    pub(crate) siginfo_slots: crate::signal::SigInfoSlots,
     /// Per-process bus wire for signal-generated lifecycle events.
     ///
     /// `RawPort` (edge-triggered) per `SIGNAL_ATTACHMENTS_v1`:

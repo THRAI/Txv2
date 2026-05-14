@@ -55,6 +55,21 @@ impl TimerToken {
     }
 }
 
+// PR-7/8: TimerId (agent.rs) and TimerToken (here) are both u64
+// wrappers. Once the types are unified (PR-8), these From impls
+// become identity conversions or are removed.
+impl From<crate::step::TimerId> for TimerToken {
+    fn from(id: crate::step::TimerId) -> Self {
+        TimerToken(id.raw())
+    }
+}
+
+impl From<TimerToken> for crate::step::TimerId {
+    fn from(token: TimerToken) -> Self {
+        crate::step::TimerId::new(token.raw())
+    }
+}
+
 /// Role of a [`TimerGuard`] registration. Set at install time and
 /// immutable for the guard's lifetime. Per
 /// `docs/Txv3/07_BLAST_RADIUS.md` §4 row H, the three roles are

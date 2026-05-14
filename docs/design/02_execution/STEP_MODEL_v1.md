@@ -15,7 +15,7 @@
 > is retained for historical reference and section anchors that
 > v4 subsystem docs still cite; new prose should use v2.
 
-**Status.** v1 (2026-04-19) — **superseded**.
+**Status.** v1 (2026-04-19) — **superseded**. [deprecated by v5]
 
 **Purpose.** Specify the step primitive: the synchronous, bounded unit of execution that replaces the prepare/commit split as txKernel's operation-building primitive. Define the step outcome algebra, the five-stage in-step discipline, witness scope in practice, and how steps compose with drivers and the wait primitive to form operations.
 

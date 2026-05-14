@@ -28,6 +28,11 @@ use crate::process::structure::ProcessIdentity;
 /// has been removed alongside the fd table's 8-slot ceiling; any `u32`
 /// fd may be marked.
 pub fn step_close_cloexec_fds(process: &Cap<ProcessIdentity>) {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let cloexec = process.fd_cloexec_snapshot();
     if cloexec.is_empty() {
         return;
@@ -57,6 +62,11 @@ pub fn step_close_cloexec_fds(process: &Cap<ProcessIdentity>) {
 ///
 /// Infallible — by EXEC-PONR. No-op for zombies (no payload).
 pub fn step_reset_signal_dispositions_for_exec(process: &Cap<ProcessIdentity>) {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if let Some(payload) = process.payload.lock().as_ref() {
         payload.sig_actions().step_reset_for_exec();
     }
@@ -74,6 +84,11 @@ pub fn step_reset_signal_dispositions_for_exec(process: &Cap<ProcessIdentity>) {
 ///
 /// Infallible — by EXEC-PONR. No-op for zombies (no payload to seed).
 pub fn step_install_brk_for_exec(process: &Cap<ProcessIdentity>, new_brk_base: u64) {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if let Some(payload) = process.payload.lock().as_ref() {
         payload
             .brk_base

@@ -535,6 +535,10 @@ impl PageContainer {
                 ..
             } => StepOutcome::Err(V3Errno::EIO),
             StepOutcome::Yield {
+                shape: YieldShape::OnEdge { .. },
+                ..
+            } => StepOutcome::Err(V3Errno::EIO),
+            StepOutcome::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
             } => StepOutcome::Err(V3Errno::EIO),

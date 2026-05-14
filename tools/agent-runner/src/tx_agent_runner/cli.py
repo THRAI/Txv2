@@ -7,9 +7,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .graph import RunConfig, run_agent_graph
+from .graph import RunConfig, _build_graph, run_agent_graph
 from .leases import validate_worktree_leases
 from .progress import get_git_worktrees, load_worktree_records
+
+try:
+    from langgraph.errors import GraphInterrupt
+except ImportError:  # pragma: no cover
+    GraphInterrupt = Exception
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -21,6 +26,13 @@ def main(argv: list[str] | None = None) -> int:
             return _inspect(args, repo_root)
         if args.command == "run":
             return _run(args, repo_root)
+        if args.command == "resume":
+            return _resume(args)
+        if args.command == "status":
+            return _thread_status(args)
+    except GraphInterrupt as exc:
+        _print_interrupt_and_handoff(exc, args)
+        return 10  # distinct exit code: interrupted, resumeable
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -48,6 +60,31 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--json", action="store_true", help="Print JSON")
     run.add_argument("--codex-bin", default="codex")
     run.add_argument("--output-dir", type=Path, default=Path("target/tx-agent-runs"))
+    run.add_argument("--with-research", action="store_true",
+                     help="Run research subgraph (locate + analyze + find patterns) before dispatch")
+    run.add_argument("--with-plan", action="store_true",
+                     help="Generate an implementation plan from research findings")
+    run.add_argument("--approval", choices=["auto", "manual"], default="auto",
+                     help="Dispatch approval mode: 'auto' runs immediately, 'manual' pauses for human review")
+    run.add_argument("--stream", action="store_true",
+                     help="Stream graph events to stdout in real time")
+    run.add_argument("--thread-id",
+                     help="Stable thread id for checkpointing (auto-generated if not set)")
+    run.add_argument("--interactive", action="store_true",
+                     help="Prompt on stdin at interrupt points instead of exiting")
+
+    resume = subcommands.add_parser("resume", help="Resume an interrupted graph run")
+    resume.add_argument("--thread-id", required=True,
+                        help="Thread id of the interrupted run")
+    resume.add_argument("--action", choices=["approve", "abort"], required=True,
+                        help="Resume action: 'approve' continues, 'abort' cancels")
+    resume.add_argument("--json", action="store_true", help="Print JSON")
+
+    st = subcommands.add_parser("status", help="Show thread checkpoint state")
+    st.add_argument("--thread-id", required=True,
+                    help="Thread id to inspect")
+    st.add_argument("--json", action="store_true", help="Print JSON")
+
     return parser
 
 
@@ -88,8 +125,19 @@ def _run(args: argparse.Namespace, repo_root: Path) -> int:
         dry_run=args.dry_run,
         codex_bin=args.codex_bin,
         output_dir=output_dir,
+        with_research=args.with_research,
+        with_plan=args.with_plan,
+        approval=args.approval,
     )
-    summary = run_agent_graph(config)
+
+    if args.stream:
+        summary = run_agent_graph(
+            config,
+            thread_id=args.thread_id,
+            stream_callback=_make_stream_printer(),
+        )
+    else:
+        summary = run_agent_graph(config, thread_id=args.thread_id)
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
     else:
@@ -112,6 +160,121 @@ def _repo_root(start: Path) -> Path:
     if result.returncode == 0:
         return Path(result.stdout.strip())
     return start.resolve()
+
+
+def _make_stream_printer():
+    """Return a callback that prints graph stream events to stderr."""
+    def _print(node: str, event_type: str, data: dict[str, Any]) -> None:
+        if event_type == "updates":
+            compact = {k: _summarize_value(v) for k, v in data.items()}
+            print(f"[{node}] {compact}", file=sys.stderr)
+    return _print
+
+
+def _summarize_value(v: Any) -> Any:
+    if isinstance(v, list):
+        return f"list[{len(v)}]"
+    if isinstance(v, dict):
+        return f"dict[{len(v)}]"
+    if isinstance(v, str) and len(v) > 60:
+        return v[:57] + "..."
+    return v
+
+
+# ---------------------------------------------------------------------------
+# resume / status / interrupt handling
+# ---------------------------------------------------------------------------
+
+
+def _resume(args: argparse.Namespace) -> int:
+    """Resume an interrupted graph run."""
+    graph = _build_graph()
+    run_config = {"configurable": {"thread_id": args.thread_id}}
+
+    from langgraph.types import Command
+    result = graph.invoke(Command(resume={"action": args.action}), run_config)
+    summary = result.get("summary", {})
+
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(f"resumed {args.thread_id}  status={summary.get('aggregate_status', 'unknown')}")
+        for w in summary.get("workers", []):
+            print(f"  {w['id']} status={w['status']}")
+        for error in summary.get("errors", []):
+            print(f"  error: {error}", file=sys.stderr)
+    return 0 if summary.get("aggregate_status") in {"complete", "dry-run"} else 1
+
+
+def _thread_status(args: argparse.Namespace) -> int:
+    """Print the current state of a graph thread."""
+    graph = _build_graph()
+    run_config = {"configurable": {"thread_id": args.thread_id}}
+
+    try:
+        snapshot = graph.get_state(run_config)
+    except Exception:
+        print(f"thread {args.thread_id}: no checkpoint found", file=sys.stderr)
+        return 1
+
+    if args.json:
+        payload = {
+            "thread_id": args.thread_id,
+            "next": list(snapshot.next) if snapshot.next else [],
+            "step": snapshot.metadata.get("step", "?"),
+            "values_summary": _summarize_state(snapshot.values),
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        next_nodes = ", ".join(snapshot.next) if snapshot.next else "(finished)"
+        step = snapshot.metadata.get("step", "?")
+        print(f"thread {args.thread_id}  step={step}  next={{{next_nodes}}}")
+        if snapshot.values:
+            errors = snapshot.values.get("errors", [])
+            workers = snapshot.values.get("workers", [])
+            if errors:
+                print(f"  errors: {len(errors)}")
+                for e in errors:
+                    print(f"    - {e}")
+            if workers:
+                print(f"  workers: {len(workers)}")
+                for w in workers:
+                    print(f"    {w['id']}  {w['status']}")
+    return 0
+
+
+def _summarize_state(values: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in values.items():
+        if isinstance(v, list):
+            out[k] = f"list[{len(v)}]"
+        elif isinstance(v, dict):
+            out[k] = f"dict[{len(v)}]"
+        elif isinstance(v, str) and len(v) > 80:
+            out[k] = v[:77] + "..."
+        else:
+            out[k] = v
+    return out
+
+
+def _print_interrupt_and_handoff(exc: GraphInterrupt, args: argparse.Namespace) -> None:
+    """Print a human-readable handoff when the graph interrupts."""
+    thread_id = getattr(args, "thread_id", None) or "?"
+    interrupts = getattr(exc, "args", [None])[0] if hasattr(exc, "args") else None
+
+    print(f"\n{'=' * 60}", file=sys.stderr)
+    print(f"Graph interrupted — run is paused, not failed.", file=sys.stderr)
+    print(f"", file=sys.stderr)
+    print(f"  Thread id:  {thread_id}", file=sys.stderr)
+    if isinstance(interrupts, (list, tuple)):
+        for i, iv in enumerate(interrupts):
+            stage = iv.value.get("stage", "?") if hasattr(iv, "value") else "?"
+            print(f"  Interrupt {i}: stage={stage}", file=sys.stderr)
+    print(f"", file=sys.stderr)
+    print(f"  Resume:     tx-agent-runner resume --thread-id {thread_id} --action approve", file=sys.stderr)
+    print(f"  Abort:      tx-agent-runner resume --thread-id {thread_id} --action abort", file=sys.stderr)
+    print(f"  Inspect:    tx-agent-runner status --thread-id {thread_id}", file=sys.stderr)
+    print(f"{'=' * 60}\n", file=sys.stderr)
 
 
 if __name__ == "__main__":

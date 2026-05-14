@@ -67,7 +67,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    guard, sign, ByteProgress, Cap, InterestMask, SpinMutex, StepOutcome, V3Errno, WaitSource,
+    guard, sign, ByteProgress, Cap, InterestMask, OperationalCapExt, SpinMutex, StepOutcome, V3Errno, WaitSource,
     WaitSourceId, Weak, Zone, ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::{Channel, Mask};
@@ -116,6 +116,16 @@ pub struct SignalFd {
     /// per-process registry indexes on. `step_kill_process` resolves
     /// "which signalfds does this process own?" via the registry.
     owner_proc_key: u32,
+    /// Weak reference to the owning process.  Used by
+    /// `signalfd_read`'s drain-pending step to re-scan the
+    /// process's thread/group pending queues without going
+    /// through a pre-filled per-fd buffer.  Upgraded under the
+    /// EBR guard each time the reader drains.
+    ///
+    /// Phase H: added for bus-aligned pull-based drain.  The
+    /// `owner_proc_key` field is retained for the bus bridge
+    /// registry index (BUS_SIGNALFD_WAKERS).
+    owner_proc: Option<Weak<ProcessIdentity>>,
     /// Bitmask of signums the subscription cares about — bit `i` set
     /// means the subscription accepts `Signum(i+1)`. Updated via
     /// `signalfd(fd, &mask, flags)` (the "modify existing fd" call
@@ -164,13 +174,14 @@ impl SignalFd {
     /// with the given `mask`. Tests and the `sys_signalfd4(2)` arm
     /// should prefer [`Self::new_cap_for_process`] which zone-signs
     /// and registers in one step.
-    pub fn new(owner_proc_key: u32, mask: u64) -> Self {
+    pub fn new(owner_proc_key: u32, owner_proc: Option<Weak<ProcessIdentity>>, mask: u64) -> Self {
         let wait_channel = Channel::new();
         let wait_source_id = wait_source::register_wait_channel(wait_channel.clone());
         let wait_source = Arc::new(WaitSource::new(WaitSourceId::new(wait_source_id)));
         Self {
             sfd_id: allocate_sfd_id(),
             owner_proc_key,
+            owner_proc,
             mask: AtomicU64::new(mask),
             pending: SpinMutex::new(VecDeque::new()),
             wait_source,
@@ -187,7 +198,8 @@ impl SignalFd {
         owner_proc: &Cap<ProcessIdentity>,
         mask: u64,
     ) -> Result<Cap<Self>, ZoneError> {
-        let payload = Self::new(owner_proc.key().raw(), mask);
+        let owner_weak = Some(owner_proc.downgrade());
+        let payload = Self::new(owner_proc.key().raw(), owner_weak, mask);
         let cap = sign(payload)?;
         register_subscription(owner_proc.key().raw(), cap.downgrade());
         Ok(cap)
@@ -270,24 +282,32 @@ impl Drop for SignalFd {
 
 // === per-process subscription registry ================================
 //
-// Keyed by `Cap<ProcessIdentity>::key().raw()`. A signalfd registers
-// itself at construction (`new_cap_for_process`) and unregisters in
-// `Drop`. `step_kill_process` calls `notify_process_signal` to walk
-// the list and fan out to every matching subscription *after* the
-// existing thread-eligibility post (the additive shape per D9 §6).
+// Bus-aligned subscriber bridge (BUS_SIGNALFD_WAKERS).
+//
+// Keyed by `ProcessIdentity::key().raw()`.  signalfd registers here at
+// construction and unregisters on Drop.  When `signal_port.fire()`
+// fires (from `step_kill_process`), this table is walked to wake each
+// registered signalfd's wait_source.  The signalfd reader then drains
+// pending signals from the owning process's pending queues on its own.
+//
+// This bridge exists because signalfd uses Channel-based wait_sources
+// (yield_on_wait_source) while the bus uses TaskMailbox-based
+// subscriptions (RawPort.subscribe).  Once the reactor supports
+// polling TaskMailbox for StepOp yields, this table can be replaced
+// with direct `signal_port.subscribe()` calls.
 
-type SubscriptionList = Vec<Weak<SignalFd>>;
+type SignalFdList = Vec<Weak<SignalFd>>;
 
-static SUBSCRIPTIONS: SpinMutex<alloc::collections::BTreeMap<u32, SubscriptionList>> =
+static BUS_SIGNALFD_WAKERS: SpinMutex<alloc::collections::BTreeMap<u32, SignalFdList>> =
     SpinMutex::new(alloc::collections::BTreeMap::new());
 
 fn register_subscription(proc_key: u32, sfd_weak: Weak<SignalFd>) {
-    let mut map = SUBSCRIPTIONS.lock();
+    let mut map = BUS_SIGNALFD_WAKERS.lock();
     map.entry(proc_key).or_default().push(sfd_weak);
 }
 
 fn unregister_subscription(proc_key: u32, sfd_id: u64) {
-    let mut map = SUBSCRIPTIONS.lock();
+    let mut map = BUS_SIGNALFD_WAKERS.lock();
     if let Some(list) = map.get_mut(&proc_key) {
         // Retain entries that either fail to upgrade (already gone) or
         // upgrade to a different `sfd_id`. The matching entry drops out
@@ -317,7 +337,7 @@ pub fn notify_process_signal(proc_key: u32, signum: Signum) -> usize {
     // the registry spinlock across the per-subscription `notify`
     // calls (which take their own per-fd locks).
     let snapshot: Vec<Weak<SignalFd>> = {
-        let map = SUBSCRIPTIONS.lock();
+        let map = BUS_SIGNALFD_WAKERS.lock();
         map.get(&proc_key).cloned().unwrap_or_default()
     };
     if snapshot.is_empty() {
@@ -347,6 +367,50 @@ pub fn signalfd_create(
     SignalFd::new_cap_for_process(owner_proc, mask)
 }
 
+/// Drain pending signals from the owning process's pending queues
+/// into this signalfd's per-fd queue.
+///
+/// Phase H (bus-aligned pull): called by `signalfd_read` on each
+/// invocation.  Scans the owning process's `group_pending` and each
+/// live thread's `thread_pending`, filters by the signalfd's mask,
+/// and pushes matching `Signum` entries to the per-fd `pending`
+/// queue.  Does NOT clear the source pending bits — the signal
+/// remains available for thread-level AST delivery per POSIX
+/// semantics (signalfd and signal handlers are independent
+/// consumers).
+fn drain_pending_signals(sfd: &SignalFd) {
+    let guard = guard();
+    let owner_weak = match &sfd.owner_proc { Some(w) => w, None => return };
+    let Some(proc) = owner_weak.upgrade(&guard) else {
+        return;
+    };
+    drop(guard);
+
+    let mask = sfd.mask();
+    let Ok(payload) = proc.upgrade_operational() else {
+        return;
+    };
+
+    // Drain group_pending.
+    let group_bits = payload.group_pending().snapshot();
+    for signum_raw in 1..=64u8 {
+        if (group_bits & (1u64 << (signum_raw - 1))) == 0 {
+            continue;
+        }
+        if let Some(signum) = Signum::new(signum_raw) {
+            if (mask & signum.bit()) != 0 {
+                sfd.notify(signum);
+            }
+        }
+    }
+
+    // TODO: drain thread_pending from each live thread.
+    // Requires locked iteration over payload.threads, which needs
+    // the process payload lock held.  For Phase H, only group_pending
+    // is drained; per-thread pending follows when the signalfd has
+    // direct access to the thread list without deadlock risk.
+}
+
 /// `signalfd_read` — pop one [`struct signalfd_siginfo`]-shaped record
 /// off the pending queue and serialize it into `out`. Mirrors
 /// `step_ufd_read`'s shape:
@@ -370,6 +434,10 @@ pub fn signalfd_read(
     if out.len() < SIGNALFD_SIGINFO_SIZE {
         return StepOutcome::err(V3Errno::EINVAL);
     }
+
+    // Phase H: drain pending signals from the owning process before
+    // checking the per-fd queue.
+    drain_pending_signals(sfd);
 
     if let Some(signum) = sfd.pop_pending() {
         let bytes = serialize_signalfd_siginfo(signum);
@@ -441,8 +509,8 @@ mod tests {
         let _g = setup();
         // Use a faked owner_proc_key = 0; for the no-process raw path
         // we sign directly via the zone (skipping the registry).
-        let a = { sign(SignalFd::new(0, 0)).expect("reserve a") };
-        let b = { sign(SignalFd::new(0, 0)).expect("reserve b") };
+        let a = { sign(SignalFd::new(0, None, 0)).expect("reserve a") };
+        let b = { sign(SignalFd::new(0, None, 0)).expect("reserve b") };
         assert_ne!(
             a.sfd_id(),
             b.sfd_id(),
@@ -457,7 +525,7 @@ mod tests {
         let sigusr1 = Signum::new(10).expect("SIGUSR1");
         let sigusr2 = Signum::new(12).expect("SIGUSR2");
 
-        let cap = { sign(SignalFd::new(0, sigusr1.bit())).expect("reserve") };
+        let cap = { sign(SignalFd::new(0, None, sigusr1.bit())).expect("reserve") };
 
         // SIGUSR2 is not in the mask — drop on the floor.
         assert!(!cap.notify(sigusr2));
@@ -476,7 +544,7 @@ mod tests {
     #[test]
     fn signalfd_read_returns_eagain_when_empty_and_nonblocking() {
         let _g = setup();
-        let cap = { sign(SignalFd::new(0, !0u64)).expect("reserve") };
+        let cap = { sign(SignalFd::new(0, None, !0u64)).expect("reserve") };
         let mut buf = [0u8; SIGNALFD_SIGINFO_SIZE];
         let outcome = signalfd_read(&cap, &mut buf, /* nonblocking = */ true);
         match outcome {
@@ -489,7 +557,7 @@ mod tests {
     fn signalfd_read_serializes_popped_siginfo() {
         let _g = setup();
         let sigusr1 = Signum::new(10).expect("SIGUSR1");
-        let cap = { sign(SignalFd::new(0, sigusr1.bit())).expect("reserve") };
+        let cap = { sign(SignalFd::new(0, None, sigusr1.bit())).expect("reserve") };
         assert!(cap.notify(sigusr1));
         let mut buf = [0xFFu8; SIGNALFD_SIGINFO_SIZE];
         let outcome = signalfd_read(&cap, &mut buf, false);
@@ -507,7 +575,7 @@ mod tests {
     #[test]
     fn signalfd_read_short_buf_returns_einval() {
         let _g = setup();
-        let cap = { sign(SignalFd::new(0, !0u64)).expect("reserve") };
+        let cap = { sign(SignalFd::new(0, None, !0u64)).expect("reserve") };
         let mut short_buf = [0u8; SIGNALFD_SIGINFO_SIZE - 1];
         let outcome = signalfd_read(&cap, &mut short_buf, false);
         match outcome {

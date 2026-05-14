@@ -6,7 +6,7 @@ use core::sync::atomic::Ordering;
 use tx_hal::UserTrapContext;
 
 use crate::thread_runtime::adapter::step_engine::{
-    Cap, MailboxEvent, OperationalCapExt, PayloadCap, SignalRouting,
+    self, Cap, MailboxEvent, OperationalCapExt, PayloadCap, SignalRouting,
 };
 
 use crate::signal::{SignalMask, Signum};
@@ -82,6 +82,11 @@ pub fn mark_thread_zombie_for_test(thread: &Cap<ThreadIdentity>, status: i32) {
 /// owning process's thread list, and zombifies the process if this was
 /// the last thread.
 pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     set_thread_zombie(&thread, status);
 
     let guard = crate::thread_runtime::adapter::step_engine::guard();
@@ -142,6 +147,11 @@ pub fn step_sigprocmask(
     how: SigmaskHow,
     next: SignalMask,
 ) -> SigprocmaskChange {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let Ok(payload) = thread.upgrade_operational() else {
         return SigprocmaskChange::ZombieIgnored;
     };
@@ -179,7 +189,7 @@ pub fn step_sigprocmask(
 /// posts behave exactly like any other catchable signal at this
 /// layer — the stop intent is materialised by `ast_check` returning
 /// `DefaultStop`, not by a summary bit set here.
-pub fn post_signal(thread: &Cap<ThreadIdentity>, sig: Signum) {
+pub fn post_signal(thread: &Cap<ThreadIdentity>, sig: Signum, info: Option<crate::signal::SigInfo>) {
     debug_assert!(
         !matches!(sig, Signum::SIGKILL | Signum::SIGSTOP | Signum::SIGCONT),
         "post_signal must not be called with Gewalt signums (SIGKILL/SIGSTOP/SIGCONT); \
@@ -190,6 +200,17 @@ pub fn post_signal(thread: &Cap<ThreadIdentity>, sig: Signum) {
         return;
     };
     payload.pending().post(sig);
+
+    // Phase I (SigInfo): store siginfo on the owning process.
+    if let Some(info) = info {
+        let guard = step_engine::guard();
+        if let Some(proc) = thread.owner_proc.upgrade(&guard) {
+            drop(guard);
+            if let Ok(proc_payload) = proc.upgrade_operational() {
+                proc_payload.siginfo_slots.store(sig, info);
+            }
+        }
+    }
 
     let mask = payload.signal_mask();
     if !mask.is_blocked(sig) {

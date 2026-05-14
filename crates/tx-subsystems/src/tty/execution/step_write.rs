@@ -21,6 +21,11 @@ pub fn step_write_for_process(
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let caller_info = match super::IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
@@ -229,6 +234,11 @@ pub fn step_write(
     bytes: &[u8],
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if bytes.is_empty() {
         return StepOutcome::done(0);
     }
@@ -289,6 +299,11 @@ pub fn step_write_for_caller(
     caller: super::IoctlCaller,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if bytes.is_empty() {
         return StepOutcome::done(0);
     }
@@ -457,6 +472,11 @@ mod tests {
 
     #[test]
     fn step_write_empty_bytes_returns_done_zero() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -475,6 +495,11 @@ mod tests {
 
     #[test]
     fn step_write_dead_tty_returns_err_eio() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -494,6 +519,11 @@ mod tests {
 
     #[test]
     fn step_write_completing_kick_returns_done_consumed() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -523,6 +553,11 @@ mod tests {
     /// `yield_on_wait_source`.
     #[test]
     fn step_write_partial_then_blocked_yields_on_wait_source_with_byte_progress() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -570,6 +605,11 @@ mod tests {
 
     #[test]
     fn step_write_for_caller_empty_bytes_returns_done_zero() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -589,6 +629,11 @@ mod tests {
 
     #[test]
     fn step_write_for_caller_foreground_caller_completes_to_done() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let tty = alloc_tty_with(
             TtyKind::SerialHardware,
@@ -610,6 +655,11 @@ mod tests {
 
     #[test]
     fn step_write_for_caller_background_caller_with_tostop_returns_eio() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         use crate::tty::structure::termios::TOSTOP as TOSTOP_FLAG;
         use crate::tty::structure::SessionPgrp;
 

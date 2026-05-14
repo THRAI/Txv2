@@ -1,4 +1,7 @@
-use core::{marker::PhantomData, task::Waker};
+use core::marker::PhantomData;
+use alloc::sync::Weak;
+use crate::wake::mailbox::{TaskMailbox, WaitGeneration};
+use core::task::Waker;
 
 use super::common::{
     RawSubscriptionError, RawSubscriptionState, RawWireError, WireDeclaration,
@@ -163,6 +166,23 @@ impl<const N: usize> SubscriptionGraph<N> {
         &mut self,
         queue: &RawQueue,
         interest: u64,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
+    ) -> Result<SubscriptionGraphKey, SubscriptionGraphError> {
+        if interest == 0 {
+            return Err(SubscriptionGraphError::EmptyInterest);
+        }
+
+        let index = self.free_index().ok_or(SubscriptionGraphError::Full)?;
+        let subscription = queue.try_subscribe(interest, mailbox, generation)?;
+        Ok(self.insert_at(index, GraphSubscription::Queue(subscription)))
+    }
+
+    /// Compatibility bridge: see [`RawQueue::subscribe_with_waker`].
+    pub fn subscribe_queue_with_waker(
+        &mut self,
+        queue: &RawQueue,
+        interest: u64,
         waker: Waker,
     ) -> Result<SubscriptionGraphKey, SubscriptionGraphError> {
         if interest == 0 {
@@ -170,11 +190,28 @@ impl<const N: usize> SubscriptionGraph<N> {
         }
 
         let index = self.free_index().ok_or(SubscriptionGraphError::Full)?;
-        let subscription = queue.try_subscribe(interest, waker)?;
+        let subscription = queue.try_subscribe_with_waker(interest, waker)?;
         Ok(self.insert_at(index, GraphSubscription::Queue(subscription)))
     }
 
     pub fn subscribe_port(
+        &mut self,
+        port: &RawPort,
+        interest: u64,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
+    ) -> Result<SubscriptionGraphKey, SubscriptionGraphError> {
+        if interest == 0 {
+            return Err(SubscriptionGraphError::EmptyInterest);
+        }
+
+        let index = self.free_index().ok_or(SubscriptionGraphError::Full)?;
+        let subscription = port.try_subscribe(interest, mailbox, generation)?;
+        Ok(self.insert_at(index, GraphSubscription::Port(subscription)))
+    }
+
+    /// Compatibility bridge: see [`RawQueue::subscribe_with_waker`].
+    pub fn subscribe_port_with_waker(
         &mut self,
         port: &RawPort,
         interest: u64,
@@ -185,11 +222,31 @@ impl<const N: usize> SubscriptionGraph<N> {
         }
 
         let index = self.free_index().ok_or(SubscriptionGraphError::Full)?;
-        let subscription = port.try_subscribe(interest, waker)?;
+        let subscription = port.try_subscribe_with_waker(interest, waker)?;
         Ok(self.insert_at(index, GraphSubscription::Port(subscription)))
     }
 
     pub fn subscribe_declared_queue<E>(
+        &mut self,
+        queue: &DeclaredQueue<E>,
+        interest: E,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
+    ) -> Result<DeclaredSubscriptionGraphKey<E>, SubscriptionGraphError>
+    where
+        E: WireEventSet,
+    {
+        let interest = Self::validate_declared_bits(queue.declaration(), interest)?;
+        Ok(DeclaredSubscriptionGraphKey::new(self.subscribe_queue(
+            queue.raw(),
+            interest,
+            mailbox,
+            generation,
+        )?))
+    }
+
+    /// Compatibility bridge: see [`RawQueue::subscribe_with_waker`].
+    pub fn subscribe_declared_queue_with_waker<E>(
         &mut self,
         queue: &DeclaredQueue<E>,
         interest: E,
@@ -199,7 +256,7 @@ impl<const N: usize> SubscriptionGraph<N> {
         E: WireEventSet,
     {
         let interest = Self::validate_declared_bits(queue.declaration(), interest)?;
-        Ok(DeclaredSubscriptionGraphKey::new(self.subscribe_queue(
+        Ok(DeclaredSubscriptionGraphKey::new(self.subscribe_queue_with_waker(
             queue.raw(),
             interest,
             waker,
@@ -210,13 +267,33 @@ impl<const N: usize> SubscriptionGraph<N> {
         &mut self,
         port: &DeclaredPort<E>,
         interest: E,
-        waker: Waker,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
     ) -> Result<DeclaredSubscriptionGraphKey<E>, SubscriptionGraphError>
     where
         E: WireEventSet,
     {
         let interest = Self::validate_declared_bits(port.declaration(), interest)?;
         Ok(DeclaredSubscriptionGraphKey::new(self.subscribe_port(
+            port.raw(),
+            interest,
+            mailbox,
+            generation,
+        )?))
+    }
+
+    /// Compatibility bridge: see [`RawQueue::subscribe_with_waker`].
+    pub fn subscribe_declared_port_with_waker<E>(
+        &mut self,
+        port: &DeclaredPort<E>,
+        interest: E,
+        waker: Waker,
+    ) -> Result<DeclaredSubscriptionGraphKey<E>, SubscriptionGraphError>
+    where
+        E: WireEventSet,
+    {
+        let interest = Self::validate_declared_bits(port.declaration(), interest)?;
+        Ok(DeclaredSubscriptionGraphKey::new(self.subscribe_port_with_waker(
             port.raw(),
             interest,
             waker,
@@ -264,19 +341,21 @@ impl<const N: usize> SubscriptionGraph<N> {
         &mut self,
         key: SubscriptionGraphKey,
         interest: u64,
-        waker: Waker,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
     ) -> Result<(), SubscriptionGraphError> {
         if interest == 0 {
             return Err(SubscriptionGraphError::EmptyInterest);
         }
 
         match &mut self.entry_mut(key)?.subscription {
-            GraphSubscription::Queue(subscription) => Ok(subscription.try_update(interest, waker)?),
+            GraphSubscription::Queue(subscription) => Ok(subscription.try_update(interest, mailbox, generation)?),
             GraphSubscription::Port(_) => Err(SubscriptionGraphError::KindMismatch),
         }
     }
 
-    pub fn update_port(
+    /// Compatibility bridge: see [`RawQueue::subscribe_with_waker`].
+    pub fn update_queue_with_waker(
         &mut self,
         key: SubscriptionGraphKey,
         interest: u64,
@@ -287,7 +366,41 @@ impl<const N: usize> SubscriptionGraph<N> {
         }
 
         match &mut self.entry_mut(key)?.subscription {
-            GraphSubscription::Port(subscription) => Ok(subscription.try_update(interest, waker)?),
+            GraphSubscription::Queue(subscription) => Ok(subscription.try_update_with_waker(interest, waker)?),
+            GraphSubscription::Port(_) => Err(SubscriptionGraphError::KindMismatch),
+        }
+    }
+
+    pub fn update_port(
+        &mut self,
+        key: SubscriptionGraphKey,
+        interest: u64,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
+    ) -> Result<(), SubscriptionGraphError> {
+        if interest == 0 {
+            return Err(SubscriptionGraphError::EmptyInterest);
+        }
+
+        match &mut self.entry_mut(key)?.subscription {
+            GraphSubscription::Port(subscription) => Ok(subscription.try_update(interest, mailbox, generation)?),
+            GraphSubscription::Queue(_) => Err(SubscriptionGraphError::KindMismatch),
+        }
+    }
+
+    /// Compatibility bridge: see [`RawQueue::subscribe_with_waker`].
+    pub fn update_port_with_waker(
+        &mut self,
+        key: SubscriptionGraphKey,
+        interest: u64,
+        waker: Waker,
+    ) -> Result<(), SubscriptionGraphError> {
+        if interest == 0 {
+            return Err(SubscriptionGraphError::EmptyInterest);
+        }
+
+        match &mut self.entry_mut(key)?.subscription {
+            GraphSubscription::Port(subscription) => Ok(subscription.try_update_with_waker(interest, waker)?),
             GraphSubscription::Queue(_) => Err(SubscriptionGraphError::KindMismatch),
         }
     }
@@ -296,16 +409,18 @@ impl<const N: usize> SubscriptionGraph<N> {
         &mut self,
         key: DeclaredSubscriptionGraphKey<E>,
         interest: E,
-        waker: Waker,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
     ) -> Result<(), SubscriptionGraphError>
     where
         E: WireEventSet,
     {
         let interest = Self::validate_declared_bits_for_event(interest)?;
-        self.update_queue(key.raw(), interest, waker)
+        self.update_queue(key.raw(), interest, mailbox, generation)
     }
 
-    pub fn update_declared_port<E>(
+    /// Compatibility bridge: see [`RawQueue::subscribe_with_waker`].
+    pub fn update_declared_queue_with_waker<E>(
         &mut self,
         key: DeclaredSubscriptionGraphKey<E>,
         interest: E,
@@ -315,7 +430,35 @@ impl<const N: usize> SubscriptionGraph<N> {
         E: WireEventSet,
     {
         let interest = Self::validate_declared_bits_for_event(interest)?;
-        self.update_port(key.raw(), interest, waker)
+        self.update_queue_with_waker(key.raw(), interest, waker)
+    }
+
+    pub fn update_declared_port<E>(
+        &mut self,
+        key: DeclaredSubscriptionGraphKey<E>,
+        interest: E,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
+    ) -> Result<(), SubscriptionGraphError>
+    where
+        E: WireEventSet,
+    {
+        let interest = Self::validate_declared_bits_for_event(interest)?;
+        self.update_port(key.raw(), interest, mailbox, generation)
+    }
+
+    /// Compatibility bridge: see [`RawQueue::subscribe_with_waker`].
+    pub fn update_declared_port_with_waker<E>(
+        &mut self,
+        key: DeclaredSubscriptionGraphKey<E>,
+        interest: E,
+        waker: Waker,
+    ) -> Result<(), SubscriptionGraphError>
+    where
+        E: WireEventSet,
+    {
+        let interest = Self::validate_declared_bits_for_event(interest)?;
+        self.update_port_with_waker(key.raw(), interest, waker)
     }
 
     pub fn take_ready(

@@ -4,6 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use tx_subsystems::signal::step_kill_pgrp;
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
 ///
@@ -212,10 +213,27 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
 /// - Unknown signum (outside 1..=64): `-EINVAL`.
 /// - Target zombie / no live thread: `-ESRCH` (matches Linux's
 ///   "kill returns ESRCH if no signal could be delivered").
-pub(super) fn sys_kill(args: [u64; 6]) -> SyscallResult {
+pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     let pid = args[0] as i32;
     let sig = args[1] as u32;
 
+    // Phase F: pid == 0 routes to caller's process group.
+    if pid == 0 {
+        if sig == 0 {
+            return SyscallResult::Return(0); // existence probe
+        }
+        let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+            Some(s) => s,
+            None => return SyscallResult::Error(EINVAL_VALUE),
+        };
+        let pgrp = ctx.process.pgrp_cap();
+        let delivered = step_kill_pgrp(&pgrp, signum);
+        return if delivered > 0 {
+            SyscallResult::Return(0)
+        } else {
+            SyscallResult::Error(ESRCH_VALUE)
+        };
+    }
     if pid <= 0 {
         // TODO(phase-pgrp-kill): pgrp-targeted (`pid < 0` /
         // `pid == 0` / `pid == -1`) kills need a global pid-to-pgrp
@@ -254,8 +272,8 @@ pub(super) fn sys_kill(args: [u64; 6]) -> SyscallResult {
 /// per-thread signal state machine yet, so `tkill(tid, sig)` is
 /// treated as `kill(tid, sig)` (the tid is interpreted as a pid).
 /// `TODO(phase-thread-signals)`.
-pub(super) fn sys_tkill(args: [u64; 6]) -> SyscallResult {
-    sys_kill(args)
+pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    sys_kill(args, ctx)
 }
 
 /// `tgkill(tgid, tid, sig)` — Linux RV64 generic ABI
@@ -265,12 +283,12 @@ pub(super) fn sys_tkill(args: [u64; 6]) -> SyscallResult {
 /// interpreted as a pid, `tid` (args[1]) is ignored, and `sig`
 /// (args[2]) is shifted to the kill arg slot.
 /// `TODO(phase-thread-signals)`.
-pub(super) fn sys_tgkill(args: [u64; 6]) -> SyscallResult {
+pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     let mut k_args = args;
     // sys_kill expects (pid, sig) at args[0]/args[1]. tgkill places
     // sig at args[2]; shift it down for the alias.
     k_args[1] = args[2];
-    sys_kill(k_args)
+    sys_kill(k_args, ctx)
 }
 
 /// `rt_sigreturn(...)` — Linux RV64 generic ABI
@@ -287,6 +305,40 @@ pub(super) fn sys_tgkill(args: [u64; 6]) -> SyscallResult {
 /// scope for Slice 7. Real signal handlers are also not yet wired
 /// (no userspace handler trampoline path), so the carryover does not
 /// block any day-1 shell flow. `TODO(phase-signal-frame)`.
-pub(super) fn sys_rt_sigreturn() -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+/// Phase B: returns `SigreturnRestored` to wire the dispatch path
+/// without actual frame mechanics (TODO phase-signal-frame / Phase D).
+pub(super) fn sys_rt_sigreturn(_ctx: &SyscallCtx) -> SyscallResult {
+    // Phase B: dispatch plumbing only — actual SignalFrameIf restore
+    // (read_signal_frame + restore_signal_frame) lands in Phase D.
+    SyscallResult::SigreturnRestored
+}
+
+/// `rt_sigpending(set, sigsetsize)` — Linux RV64 generic ABI
+/// `__NR_rt_sigpending = 136`.
+///
+/// Phase F: reads the calling thread's pending signal bitset
+/// (thread_pending merged with the owning process's group_pending)
+/// and writes it to `set`.
+pub(super) fn sys_rt_sigpending(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    let set_ptr = args[0] as usize;
+    let sigsetsize = args[1];
+
+    if sigsetsize != SIGSETSIZE_BYTES {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    // Phase F: snapshot thread_pending bitset.  TODO: merge in
+    // group_pending masked by thread's signal_mask for full POSIX
+    // compliance.
+    let pending = match ctx.thread.upgrade_operational() {
+        Ok(payload) => payload.pending().snapshot(),
+        Err(_) => {
+            return SyscallResult::Error(ESRCH_VALUE);
+        }
+    };
+    if let Err(errno) = bootstrap_write_user::<u64>(&ctx.aspace, set_ptr as u64, pending) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+
+    SyscallResult::Return(0)
 }

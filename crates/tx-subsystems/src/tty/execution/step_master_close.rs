@@ -19,25 +19,35 @@ pub fn step_master_close_last(
     master: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<(HangupOutcome, IoctlSideEffect), NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
+    // observe — require live TTY payload
     let payload = match require_live_tty(master, guard) {
         Ok(payload) => payload,
         Err(err) => return V3::Err(err.into()),
     };
 
+    // upgrade — N/A (caller holds Cap<TtyIdentity>)
     let peer = match &payload.transport {
         TtyTransport::Pty { peer } => peer.clone(),
         TtyTransport::Hardware { .. } => return V3::Err(Errno::EINVAL.into()),
     };
 
+    // reserve — N/A (no allocation needed for teardown)
     let hangup = match step_hangup(&peer, guard) {
         V3::Done(outcome) => outcome,
         V3::Err(e) => return V3::Err(e),
         V3::Continue { .. } | V3::Yield { .. } => return V3::Err(Errno::EIO.into()),
     };
 
+    // commit — clear master's payload to signal hangup
     let _ = master.take_payload();
+    // publish — N/A (hangup outcome returned to caller for signal dispatch)
     V3::Done((hangup, IoctlSideEffect::default()))
 }
 

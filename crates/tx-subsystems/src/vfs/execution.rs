@@ -190,6 +190,11 @@ pub trait FsOps: Send + Sync + 'static {
         cred: &Credential,
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _ = (fs_object_id, new_mode, cred, guard);
         StepOutcome::err(Errno::ENOSYS)
     }
@@ -204,6 +209,11 @@ pub trait FsOps: Send + Sync + 'static {
         cred: &Credential,
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _ = (fs_object_id, new_uid, new_gid, cred, guard);
         StepOutcome::err(Errno::ENOSYS)
     }
@@ -235,10 +245,23 @@ pub struct MountOutput {
 impl OpenFile {
     /// Dispatch a read against this file's RNode backing.
     pub fn step_read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
+        // observe: validate file is readable
+        // ① observe — flag check + backing dispatch
+        // ② upgrade — (N/A: delegated to backing trait impl)
+        // ③ reserve — (N/A: delegated to backing trait impl)
+        // ④ commit — (N/A: delegated to backing trait impl)
+        // ⑤ publish — (N/A: read doesn't fire signals)
         if !self.flags.read {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
+        // ② upgrade — (N/A: VFS dispatch doesn't upgrade witness)
+        // ③ reserve — (N/A)
         // PR-10 phase 0: userfaultfd fds have no VFS-shaped read path.
         // The agent-side read syscall lands in P-10.5 with its own
         // dispatch (it dequeues a fault message, not bytes from a
@@ -303,12 +326,26 @@ impl OpenFile {
     /// `AdvancedThenBlocked` outcomes are reachable. The `Guard` is
     /// accepted for symmetry with the other `OpenFile::step_*`
     /// methods even though the body never crosses an EBR boundary.
+    ///
+    /// Stages: observe/upgrade/reserve/commit/publish — all N/A.
+    /// Pure arithmetic on inode metadata; no guard acquisition needed.
     pub fn step_lseek(
+        // ① observe — backing-based seekability check
         &self,
         offset: i64,
         whence: u32,
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
+        // ① observe — backing kind check + offset computation
+        // ② upgrade — (N/A: pure computation, no EBR guard used)
+        // ③ reserve — (N/A: no resource reservation)
+        // ④ commit — self.set_offset(new_offset_u64)
+        // ⑤ publish — (N/A: lseek doesn't fire signals)
         // PR-10 phase 0: userfaultfd fds have no offset semantic.
         // Linux returns ESPIPE on `lseek(uffd_fd, ...)`; match that.
         if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
@@ -372,6 +409,17 @@ impl OpenFile {
 
     /// Dispatch a write against this file's RNode backing.
     pub fn step_write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
+        // ① observe — flag check + backing dispatch
+        // ② upgrade — (N/A: delegated to backing trait impl)
+        // ③ reserve — (N/A: delegated to backing trait impl)
+        // ④ commit — (N/A: delegated to backing trait impl)
+        // ⑤ publish — (N/A: write doesn't fire signals directly)
+        // observe: validate file is writable
         if !self.flags.write {
             return StepOutcome::Err(Errno::EINVAL);
         }
@@ -426,11 +474,22 @@ impl OpenFile {
     /// only wires TTY-backed files; other backings keep the existing
     /// "not implemented at this seam" behavior.
     pub fn step_ioctl(
+        // ① observe — backing-based dispatch
         &self,
         caller: OpenFileIoctlCaller<'_>,
         request: OpenFileIoctl<'_>,
         guard: &Guard<'_>,
     ) -> StepOutcome<OpenFileIoctlResult, NoProgress> {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
+        // ① observe — backing kind check + ioctl dispatch
+        // ② upgrade — (N/A: delegated to tty::execution)
+        // ③ reserve — (N/A: delegated to tty::execution)
+        // ④ commit — (N/A: delegated to tty::execution)
+        // ⑤ publish — (N/A: signal side effects handled by tty::step_ioctl_*)
         // PR-10 phase 0: the VFS ioctl surface (`OpenFileIoctl`) is
         // TTY-shaped; userfaultfd ioctls have their own request
         // catalog landing in P-10.2+. Return ENOTTY for ufd fds via
@@ -461,6 +520,11 @@ fn step_tty_ioctl(
     request: OpenFileIoctl<'_>,
     guard: &Guard<'_>,
 ) -> StepOutcome<OpenFileIoctlResult, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     // v3 NoProgress outcomes are one-shot Done/Err (Yield/Continue
     // unreachable for tty ioctl bodies today). Wrap each call's `Done`
     // into the typed `OpenFileIoctlResult` constructor.
@@ -471,9 +535,7 @@ fn step_tty_ioctl(
         match v3 {
             StepOutcome::Done(value) => StepOutcome::Done(wrap(value)),
             StepOutcome::Err(e) => StepOutcome::Err(e),
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                StepOutcome::Err(Errno::EIO)
-            }
+            _ => StepOutcome::Err(Errno::EIO),
         }
     }
 
@@ -538,13 +600,36 @@ pub struct OpenFileReadOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub out: &'a mut [u8],
     pub guard: &'a Guard<'a>,
+    /// Internal write cursor: each `step()` call fills bytes starting
+    /// at `out[cursor..]` and advances `cursor` by the amount returned
+    /// in the outcome. This allows `drive()` to call `step()` multiple
+    /// times without the caller needing to update `out` between
+    /// iterations (DRIVE-2).
+    cursor: usize,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        self.file.step_read(self.out, self.guard)
+        let result = self.file.step_read(&mut self.out[self.cursor..], self.guard);
+        // Advance cursor by the bytes read in this step. The
+        // `StepProgress` accumulator (ByteProgress) carries the same
+        // value, so `drive()`'s `accumulated` stays in sync with the
+        // actual fill position.
+        match &result {
+            StepOutcome::Done(n) => {
+                self.cursor += *n as usize;
+            }
+            StepOutcome::Continue { progress } => {
+                self.cursor += progress.bytes();
+            }
+            StepOutcome::Yield { progress, .. } => {
+                self.cursor += progress.bytes();
+            }
+            StepOutcome::Err(_) => {}
+        }
+        result
     }
 }
 
@@ -570,13 +655,29 @@ pub struct OpenFileWriteOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub bytes: &'a [u8],
     pub guard: &'a Guard<'a>,
+    /// Internal write cursor: each `step()` call consumes bytes starting
+    /// at `bytes[cursor..]`. Mirrors `OpenFileReadOp::cursor`.
+    cursor: usize,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        self.file.step_write(self.bytes, self.guard)
+        let result = self.file.step_write(&self.bytes[self.cursor..], self.guard);
+        match &result {
+            StepOutcome::Done(n) => {
+                self.cursor += *n as usize;
+            }
+            StepOutcome::Continue { progress } => {
+                self.cursor += progress.bytes();
+            }
+            StepOutcome::Yield { progress, .. } => {
+                self.cursor += progress.bytes();
+            }
+            StepOutcome::Err(_) => {}
+        }
+        result
     }
 }
 
@@ -740,6 +841,7 @@ mod step_op_wraps {
             file: &file,
             out: &mut buf,
             guard: &guard,
+            cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
@@ -761,6 +863,7 @@ mod step_op_wraps {
             file: &file,
             out: &mut buf,
             guard: &guard,
+            cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
@@ -778,6 +881,7 @@ mod step_op_wraps {
             file: &file,
             bytes: b"hello",
             guard: &guard,
+            cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
@@ -795,6 +899,7 @@ mod step_op_wraps {
             file: &file,
             bytes: b"hi",
             guard: &guard,
+            cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {

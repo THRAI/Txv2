@@ -25,6 +25,11 @@ pub struct OpenPtyOutcome {
 /// Create master/slave TTY identities, install peer-linked payloads, publish
 /// the slave into the devpts registry, and return OpenFiles for both sides.
 pub fn step_openpty(guard: &Guard<'_>) -> StepOutcome<OpenPtyOutcome, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let index = match registry::allocate_pty_index() {

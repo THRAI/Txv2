@@ -37,8 +37,12 @@ pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
         "docs" => lint_docs(root),
         "unused" => lint_unused(root),
         "boundary" => lint_boundary(root),
+        "invariants" => {
+            let sub = args.get(1).map(|s| s.as_str()).unwrap_or("all");
+            lint_invariants(root, sub)
+        }
         other => Err(format!(
-            "unknown lint kind '{other}', expected arch, docs, unused, or boundary"
+            "unknown lint kind '{other}', expected arch, docs, unused, boundary, or invariants"
         )),
     }
 }
@@ -94,6 +98,71 @@ fn lint_boundary(root: &Path) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Invariants lint dispatch
+// ---------------------------------------------------------------------------
+
+fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
+    match sub {
+        "step-discipline" => crate::lint_invariants_step::lint_invariants_step_discipline(root),
+        "step-v4-vocabulary" => crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary(root),
+        "step-no-await" => crate::lint_invariants_step_v3::lint_invariants_step_no_await(root),
+        "step-sync-signature" => crate::lint_invariants_step_v3::lint_invariants_step_sync_signature(root),
+        "step" => {
+            // Convenience: run all four step-related lints
+            let rules: &[(&str, fn(&Path) -> Result<()>)] = &[
+                ("step-discipline", crate::lint_invariants_step::lint_invariants_step_discipline),
+                ("step-v4-vocabulary", crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary),
+                ("step-no-await", crate::lint_invariants_step_v3::lint_invariants_step_no_await),
+                ("step-sync-signature", crate::lint_invariants_step_v3::lint_invariants_step_sync_signature),
+            ];
+            let mut errors: Vec<String> = Vec::new();
+            for (name, rule) in rules {
+                println!();
+                if let Err(e) = rule(root) {
+                    errors.push(format!("{name}: {e}"));
+                }
+            }
+            if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
+        }
+        "subject-context" => crate::lint_invariants_subj::lint_invariants_subject_context(root),
+        "witness-scope" => crate::lint_invariants_witness::lint_invariants_witness_scope(root),
+        "signal-publish" => crate::lint_invariants_signal::lint_invariants_signal_publish(root),
+        "script-boundary" => crate::lint_invariants_script::lint_invariants_script_boundary(root),
+        "checks-purity" => crate::lint_invariants_checks::lint_invariants_checks_purity(root),
+        "no-adhoc-drive" => crate::lint_invariants_drive::lint_invariants_no_adhoc_drive(root),
+        "all" => {
+            let rules: &[(&str, fn(&Path) -> Result<()>)] = &[
+                ("step-discipline", crate::lint_invariants_step::lint_invariants_step_discipline),
+                ("step-v4-vocabulary", crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary),
+                ("step-no-await", crate::lint_invariants_step_v3::lint_invariants_step_no_await),
+                ("step-sync-signature", crate::lint_invariants_step_v3::lint_invariants_step_sync_signature),
+                ("subject-context", crate::lint_invariants_subj::lint_invariants_subject_context),
+                ("witness-scope", crate::lint_invariants_witness::lint_invariants_witness_scope),
+                ("signal-publish", crate::lint_invariants_signal::lint_invariants_signal_publish),
+                ("script-boundary", crate::lint_invariants_script::lint_invariants_script_boundary),
+                ("checks-purity", crate::lint_invariants_checks::lint_invariants_checks_purity),
+                ("no-adhoc-drive", crate::lint_invariants_drive::lint_invariants_no_adhoc_drive),
+            ];
+            let mut errors: Vec<String> = Vec::new();
+            for (name, rule) in rules {
+                println!();
+                if let Err(e) = rule(root) {
+                    errors.push(format!("{name}: {e}"));
+                }
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("\n"))
+            }
+        }
+        other => Err(format!(
+            "unknown invariants sub-rule '{other}'. Expected: step-discipline, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, all"
+        )),
+    }
 }
 
 pub(crate) fn lint_arch(root: &Path) -> Result<()> {

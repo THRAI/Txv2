@@ -373,7 +373,7 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
     let cred = Credential::root();
     let guard = guard();
     use step_engine::StepOutcome as V3;
-    let outcome = block_on(walker::step_walk(cwd, b"/dev/console", &cred, &guard));
+    let outcome = walker::step_walk(cwd, b"/dev/console", &cred, &guard);
     drop(guard);
 
     let dentry = match outcome {

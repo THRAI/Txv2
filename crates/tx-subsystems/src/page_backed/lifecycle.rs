@@ -131,6 +131,12 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
                 return V3::err(step_engine::Errno::EIO);
             }
             V3::Yield {
+                shape: YieldShape::OnEdge { .. },
+                ..
+            } => {
+                return V3::err(step_engine::Errno::EIO);
+            }
+            V3::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
             } => {
@@ -167,6 +173,10 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         }
         V3::Yield {
             shape: YieldShape::OnAgent { .. },
+            ..
+        } => V3::err(step_engine::Errno::EIO),
+        V3::Yield {
+            shape: YieldShape::OnEdge { .. },
             ..
         } => V3::err(step_engine::Errno::EIO),
         V3::Yield {
@@ -241,6 +251,10 @@ pub fn step_truncate(
             }
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
+                ..
+            } => return V3::err(step_engine::Errno::EIO),
+            V3::Yield {
+                shape: YieldShape::OnEdge { .. },
                 ..
             } => return V3::err(step_engine::Errno::EIO),
             V3::Yield {
@@ -320,6 +334,10 @@ pub fn step_fallocate(
             }
             V3::Yield {
                 shape: YieldShape::OnAgent { .. },
+                ..
+            } => return V3::err(step_engine::Errno::EIO),
+            V3::Yield {
+                shape: YieldShape::OnEdge { .. },
                 ..
             } => return V3::err(step_engine::Errno::EIO),
             V3::Yield {

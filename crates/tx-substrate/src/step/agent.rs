@@ -287,6 +287,18 @@ impl DelegateEndpoint {
     pub const fn placeholder() -> Self {
         Self { _private: () }
     }
+
+    /// Return the endpoint marker used to key the [`DelegateRegistry`].
+    ///
+    /// For zone-allocated endpoints (PR-10+), this is the zone slot
+    /// index. For the current placeholder, this is a constant.
+    /// PR-7 wires this through [`DelegateRegistry::install_request`]
+    /// so `drive()` can resolve `OnAgent` yields.
+    pub const fn marker(&self) -> u64 {
+        // Placeholder: all delegate endpoints share marker 0.
+        // PR-10 replaces this with zone slot extraction.
+        0
+    }
 }
 
 /// Cap-typed delegate token placeholder used as a value carried in
