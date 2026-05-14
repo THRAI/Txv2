@@ -14,7 +14,14 @@ pub mod step_engine {
         ByteProgress, Errno as V3Errno, InterestMask, StepOutcome, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::wake::WaitSource;
-    pub use tx_substrate::zone::{sign, Cap, Weak, Zone, ZoneAllocated, ZoneError};
+    pub use tx_substrate::zone::{
+        sign, sign_for, reserve_for,
+        Cap, PayloadCap, Weak, IdentRef,
+        Dead, ZoneError,
+        Entity, CoLocatedEntity, OperationalCapExt, OperationalRefExt, PayloadBinding,
+        Zone, ZoneAllocated,
+        IdentitySlot, IsPayloadPolicy, CapProducingPolicy, ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy, ZonePolicy,
+    };
     pub use tx_substrate::SpinMutex;
 
     pub fn register_zone_for<T: ZoneAllocated>() -> Result<(), ZoneError> {

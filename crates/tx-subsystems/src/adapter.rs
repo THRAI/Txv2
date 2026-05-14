@@ -26,7 +26,14 @@ pub mod step_engine {
     pub use tx_substrate::step::{
         ByteProgress, Errno as V3Errno, NoProgress, RestrictionStackHandle, StepOutcome,
     };
-    pub use tx_substrate::zone::{self as zone, Cap, Zone, ZoneAllocated, ZoneError, ZoneInfo};
+    pub use tx_substrate::zone::{
+        self as zone, sign, sign_for, reserve_for, register_zone_for,
+        Cap, PayloadCap, Weak, IdentRef,
+        Dead, ZoneError,
+        Entity, CoLocatedEntity, OperationalCapExt, OperationalRefExt, PayloadBinding,
+        Zone, ZoneAllocated, ZoneInfo,
+        IdentitySlot, IsPayloadPolicy, CapProducingPolicy, ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy, ZonePolicy,
+    };
     pub use tx_substrate::SpinMutex;
 }
 

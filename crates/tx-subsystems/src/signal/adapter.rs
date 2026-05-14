@@ -31,7 +31,12 @@ pub mod step_engine {
     };
     pub use tx_substrate::wake::{MailboxEvent, SignalRouting, TaskMailbox};
     pub use tx_substrate::zone::{
-        reserve_for, sign, sign_for, Cap, OperationalCapExt, PayloadCap, ZoneAllocated, ZoneError,
+        sign, sign_for, reserve_for, register_zone_for,
+        Cap, PayloadCap, Weak, IdentRef,
+        Dead, ZoneError,
+        Entity, CoLocatedEntity, OperationalCapExt, OperationalRefExt, PayloadBinding,
+        Zone, ZoneAllocated,
+        IdentitySlot, IsPayloadPolicy, CapProducingPolicy, ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy, ZonePolicy,
     };
     pub use tx_substrate::SpinMutex;
 }
