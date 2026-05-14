@@ -694,7 +694,7 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
         let cred = Credential::root();
         let cwd = process.cwd().expect("cwd bound");
         let guard = guard();
-        let outcome = block_on(tx_subsystems::vfs::walker::step_open(
+        let outcome = tx_subsystems::vfs::walker::step_open(
             cwd,
             name,
             OpenFileFlags {
@@ -707,7 +707,7 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
             0,
             &cred,
             &guard,
-        ));
+        );
         drop(guard);
         match outcome {
             V3::Done(file) => file,

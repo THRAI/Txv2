@@ -295,6 +295,11 @@ pub fn step_ioctl_tiocsctty(
     caller: IoctlCaller,
     guard: &Guard<'_>,
 ) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let _payload = match require_live_tty(tty, guard) {
@@ -329,6 +334,11 @@ pub fn step_ioctl_tiocsctty_for_process(
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
@@ -365,6 +375,11 @@ pub fn step_ioctl_tiocnotty(
     caller: IoctlCaller,
     guard: &Guard<'_>,
 ) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let _payload = match require_live_tty(tty, guard) {
@@ -394,6 +409,11 @@ pub fn step_ioctl_tiocnotty_for_process(
     caller: &Cap<crate::process::structure::ProcessIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
@@ -430,6 +450,11 @@ pub fn step_ioctl_tiocspgrp(
     new_pgrp: u32,
     guard: &Guard<'_>,
 ) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let _payload = match require_live_tty(tty, guard) {
@@ -462,6 +487,11 @@ pub fn step_ioctl_tiocspgrp_for_process(
     new_pgrp: &Cap<crate::process::structure::ProcessGroup>,
     guard: &Guard<'_>,
 ) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let caller_info = match IoctlCaller::from_process_with_guard(caller, guard) {
@@ -499,6 +529,11 @@ pub fn step_ioctl_tiocgpgrp(
     tty: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<u32, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let _payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
@@ -515,6 +550,11 @@ pub fn step_ioctl_tiocgwinsz(
     tty: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<Winsize, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
@@ -530,6 +570,11 @@ pub fn step_ioctl_tiocswinsz(
     winsize: Winsize,
     guard: &Guard<'_>,
 ) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
@@ -557,6 +602,11 @@ pub fn step_ioctl_tcgets(
     tty: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<Termios, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
@@ -570,6 +620,11 @@ pub fn step_ioctl_tcsets(
     new_termios: Termios,
     guard: &Guard<'_>,
 ) -> StepOutcome<IoctlSideEffect, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,

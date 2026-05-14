@@ -12,6 +12,8 @@ use crate::adapter::bus_wire::{
     WireEventSet,
 };
 use crate::interrupt::{InterruptSource, NoInterrupts};
+use alloc::sync::Arc;
+use tx_substrate::wake::mailbox::{TaskMailbox, WaitGeneration};
 use crate::timer::{DeadlineFuture, TimerQueue};
 
 /// Bit mask naming the wait events a task cares about on a channel.
@@ -124,6 +126,7 @@ pub struct WaitFuture {
     channel: Channel,
     mask: Mask,
     subscription: Option<RawPortSubscription>,
+    mailbox: Arc<TaskMailbox>,
 }
 
 /// Future returned by `DeclaredChannel::wait`.
@@ -131,6 +134,7 @@ pub struct DeclaredWaitFuture<E> {
     channel: DeclaredChannel<E>,
     interest: E,
     subscription: Option<DeclaredPortSubscription<E>>,
+    mailbox: Arc<TaskMailbox>,
 }
 
 /// Future returned by `DeclaredReadinessChannel::wait`.
@@ -138,6 +142,7 @@ pub struct DeclaredReadinessWaitFuture<E> {
     channel: DeclaredReadinessChannel<E>,
     interest: E,
     subscription: Option<DeclaredQueueSubscription<E>>,
+    mailbox: Arc<TaskMailbox>,
 }
 
 /// Future returned by `Channel::wait_event`.
@@ -198,6 +203,7 @@ impl Channel {
             channel: self.clone(),
             mask,
             subscription: None,
+            mailbox: Arc::new(TaskMailbox::new()),
         }
     }
 
@@ -301,6 +307,7 @@ where
             channel: self.clone(),
             interest,
             subscription: None,
+            mailbox: Arc::new(TaskMailbox::new()),
         })
     }
 
@@ -445,6 +452,7 @@ where
             channel: self.clone(),
             interest,
             subscription: None,
+            mailbox: Arc::new(TaskMailbox::new()),
         })
     }
 
@@ -562,17 +570,18 @@ impl Future for WaitFuture {
         }
 
         let ready = if let Some(subscription) = this.subscription.as_mut() {
-            if subscription.take_ready() {
+            if this.mailbox.poll().is_some() {
                 true
             } else {
-                subscription.update(this.mask.bits(), cx.waker().clone());
+                subscription.update(this.mask.bits(), Arc::downgrade(&this.mailbox), this.mailbox.next_generation());
                 false
             }
         } else {
+            this.mailbox.register_waker(cx.waker().clone());
             this.subscription = Some(
                 this.channel
                     .port
-                    .subscribe(this.mask.bits(), cx.waker().clone()),
+                    .subscribe(this.mask.bits(), Arc::downgrade(&this.mailbox), this.mailbox.next_generation()),
             );
             false
         };
@@ -607,17 +616,18 @@ where
         }
 
         let ready = if let Some(subscription) = this.subscription.as_mut() {
-            if subscription.take_ready() {
+            if this.mailbox.poll().is_some() {
                 true
             } else {
-                subscription.update(this.interest, cx.waker().clone());
+                subscription.update(this.interest, Arc::downgrade(&this.mailbox), this.mailbox.next_generation());
                 false
             }
         } else {
+            this.mailbox.register_waker(cx.waker().clone());
             this.subscription = Some(
                 this.channel
                     .port
-                    .subscribe(this.interest, cx.waker().clone()),
+                    .subscribe(this.interest, Arc::downgrade(&this.mailbox), this.mailbox.next_generation()),
             );
             false
         };
@@ -652,17 +662,18 @@ where
         }
 
         let ready = if let Some(subscription) = this.subscription.as_mut() {
-            if subscription.take_ready() {
+            if this.mailbox.poll().is_some() {
                 true
             } else {
-                subscription.update(this.interest, cx.waker().clone());
+                subscription.update(this.interest, Arc::downgrade(&this.mailbox), this.mailbox.next_generation());
                 false
             }
         } else {
+            this.mailbox.register_waker(cx.waker().clone());
             this.subscription = Some(
                 this.channel
                     .queue
-                    .subscribe(this.interest, cx.waker().clone()),
+                    .subscribe(this.interest, Arc::downgrade(&this.mailbox), this.mailbox.next_generation()),
             );
             false
         };

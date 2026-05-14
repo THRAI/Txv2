@@ -9,7 +9,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::vfs::adapter::step_engine::{self, Cap, Weak, Zone, ZoneAllocated, ZoneError};
 use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
@@ -921,6 +921,8 @@ pub struct OpenFile {
     /// directory streams.
     readdir_cursor: AtomicU64,
     pub(crate) flags: OpenFileFlags,
+    /// Runtime `O_NONBLOCK` override set via `fcntl(F_SETFL)`.
+    nonblocking_override: AtomicBool,
 }
 
 impl OpenFile {
@@ -929,6 +931,7 @@ impl OpenFile {
             backing: OpenFileBacking::Rnode { rnode },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
             flags,
         }
     }
@@ -948,6 +951,7 @@ impl OpenFile {
             backing: OpenFileBacking::Ufd { ufd },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
             flags,
         }
     }
@@ -974,6 +978,7 @@ impl OpenFile {
             backing: OpenFileBacking::AioContext { ctx },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
             flags,
         }
     }
@@ -997,6 +1002,7 @@ impl OpenFile {
             backing: OpenFileBacking::SignalFd { sfd },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
             flags,
         }
     }
@@ -1020,6 +1026,7 @@ impl OpenFile {
             backing: OpenFileBacking::IoUring { ring },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
             flags,
         }
     }
@@ -1166,8 +1173,16 @@ impl OpenFile {
         self.offset.fetch_add(delta, Ordering::AcqRel) + delta
     }
 
-    pub const fn flags(&self) -> OpenFileFlags {
-        self.flags
+    pub fn flags(&self) -> OpenFileFlags {
+        let mut f = self.flags;
+        if self.nonblocking_override.load(Ordering::Acquire) {
+            f.nonblocking = true;
+        }
+        f
+    }
+
+    pub fn set_nonblocking(&self, val: bool) {
+        self.nonblocking_override.store(val, Ordering::Release);
     }
 
     /// Snapshot the per-fd readdir cursor.

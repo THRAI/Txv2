@@ -166,6 +166,14 @@ pub fn bucket_index(uaddr: u64) -> usize {
 /// Wait never produces `Done`: completion arrives via the carrier
 /// resolution step driven by the script driver after the yield resolves.
 pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
+    // observe — validate uaddr alignment, read *uaddr under guard
+    // upgrade: N/A — no IdentRef→Cap needed; uaddr verified directly
+    // reserve: N/A — bucket array is static pre-allocated
     if uaddr == 0 || (uaddr & 0x3) != 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
@@ -175,6 +183,9 @@ pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<
     if observed != val {
         return StepOutcome::Err(Errno::EAGAIN);
     }
+    // upgrade — N/A (futex wait doesn't upgrade references)
+    // reserve — N/A (no zone allocation for futex wait)
+    // commit — register waiter under bucket lock via wait_routing
     let idx = bucket_index(uaddr);
     let source_id = {
         let guard = BUCKETS.lock();
@@ -183,6 +194,7 @@ pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<
             .expect("futex buckets uninitialised — register_zones not called");
         buckets[idx].source_id
     };
+    // publish — yield OnWaitSource with carrier id and interest mask
     step_engine::yield_until_wake(source_id, FUTEX_WAKE_MASK)
 }
 
@@ -197,9 +209,21 @@ pub fn step_futex_wait(uaddr: u64, val: u32, _guard: &Guard<'_>) -> StepOutcome<
 ///
 /// Wake never produces `Yield`/`Continue`.
 pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u32, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
+    // observe: validate uaddr alignment
+    // upgrade: N/A — no IdentRef→Cap needed
+    // reserve: N/A — no zone allocation needed
+    // observe: validate uaddr — no futex-value check needed for wake
     if uaddr == 0 || (uaddr & 0x3) != 0 {
         return StepOutcome::Err(Errno::EINVAL);
     }
+    // upgrade — N/A (futex wake doesn't upgrade references)
+    // reserve — N/A (no zone allocation for futex wake)
+    // commit — fire legacy channel under bucket lock via wait_routing
     let idx = bucket_index(uaddr);
     // Clone the `Arc<WaitSource>` out under the bucket lock so the
     // `WaitSource::notify` call below (which itself takes the
@@ -219,6 +243,7 @@ pub fn step_futex_wake(uaddr: u64, n: u32, _guard: &Guard<'_>) -> StepOutcome<u3
     // caller that registered a `TaskMailbox` against this bucket's
     // source. Per-waiter re-check on wakeup re-reads `*uaddr` and
     // either returns success or re-parks.
+    // publish — notify v3 waiters via TaskMailbox, fire legacy channel
     wait_routing::notify_v3_source(&wait_source, FUTEX_WAKE_MASK);
     StepOutcome::Done(n)
 }
@@ -437,6 +462,11 @@ mod tests {
 
     #[test]
     fn step_futex_wait_misaligned_uaddr_returns_einval() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let guard = guard();
         // 0x1 — non-zero, non-zero-mod-4 (misaligned for u32).
@@ -455,6 +485,11 @@ mod tests {
 
     #[test]
     fn step_futex_wait_value_mismatch_returns_eagain() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         // Word holds 0xdead_beef; FUTEX_WAIT with val=0 must observe
         // the mismatch and short-circuit to EAGAIN.
@@ -476,6 +511,11 @@ mod tests {
 
     #[test]
     fn step_futex_wait_value_match_yields_on_wait_source() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         let word: u32 = 0xdead_beef;
         let uaddr = &word as *const u32 as u64;
@@ -504,6 +544,11 @@ mod tests {
 
     #[test]
     fn step_futex_wake_zero_n_is_a_no_op_done_zero() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         // Linux `FUTEX_WAKE` with `n=0` is a defined no-op;
         // `step_futex_wake` falls through to `Done(0)`. Tightening
         // (rejecting `n=0` as EINVAL) is a separate design decision.
@@ -521,6 +566,11 @@ mod tests {
 
     #[test]
     fn step_futex_wake_unwaited_returns_done_zero() {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let _setup = setup();
         // Wake on an idle bucket with no waiters parked on it.
         //

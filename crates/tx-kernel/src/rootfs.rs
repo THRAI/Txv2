@@ -1,8 +1,22 @@
-use crate::adapter::step_engine::{page_allocator, StepOutcome};
+use crate::adapter::step_engine::{page_allocator, NoProgress, StepOutcome};
 use page_allocator::ZeroPolicy;
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
+use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::device::{BlockDevice, PhysicalBlockNumber};
 use tx_subsystems::page_backed::Frame;
+
+/// Collapse a bootstrap one-shot `StepOutcome` into `Result`.
+///
+/// Bootstrap block-device I/O never yields or continues — every
+/// operation is a single synchronous step. `Continue` / `Yield`
+/// outcomes are surface as `Unsupported` (defence in depth).
+fn step_to_result(outcome: StepOutcome<(), NoProgress>) -> Result<(), Ext4FormatError> {
+    match outcome {
+        StepOutcome::Done(()) => Ok(()),
+        StepOutcome::Err(_) => Err(Ext4FormatError::OutOfBounds),
+        _ => Err(Ext4FormatError::Unsupported),
+    }
+}
 
 pub(crate) struct RootBlockImage {
     block: &'static dyn BlockDevice,
@@ -29,26 +43,22 @@ impl RootBlockImage {
         let ppn = reservation.ppn();
         let owned = reservation.commit();
         let mut frames = [Frame::new(ppn)];
-        match self
+        let outcome = self
             .block
-            .read_blocks_bootstrap(PhysicalBlockNumber::new(lba), &mut frames)
-        {
-            StepOutcome::Done(()) => {
+            .read_blocks_bootstrap(PhysicalBlockNumber::new(lba), &mut frames);
+        match step_to_result(outcome) {
+            Ok(()) => {
                 let ptr = page_allocator::frame_kernel_addr(ppn)
-                    .map_err(|_| tx_ext4_format::Ext4FormatError::OutOfBounds)?;
+                    .map_err(|_| Ext4FormatError::OutOfBounds)?;
                 unsafe {
                     out.copy_from_slice(core::slice::from_raw_parts(ptr.cast_const(), BLOCK_SIZE));
                 }
                 drop(owned);
                 Ok(())
             }
-            StepOutcome::Err(_) => {
+            Err(e) => {
                 drop(owned);
-                Err(tx_ext4_format::Ext4FormatError::OutOfBounds)
-            }
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                drop(owned);
-                Err(tx_ext4_format::Ext4FormatError::Unsupported)
+                Err(e)
             }
         }
     }
@@ -87,28 +97,16 @@ impl BlockImage for RootBlockImage {
             core::slice::from_raw_parts_mut(ptr, BLOCK_SIZE).copy_from_slice(data);
         }
         let frames = [Frame::new(ppn)];
-        let result = match self
-            .block
-            .write_blocks_bootstrap(PhysicalBlockNumber::new(lba), &frames)
-        {
-            StepOutcome::Done(()) => Ok(()),
-            StepOutcome::Err(_) => Err(tx_ext4_format::Ext4FormatError::OutOfBounds),
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                Err(tx_ext4_format::Ext4FormatError::Unsupported)
-            }
-        };
+        let result = step_to_result(
+            self.block
+                .write_blocks_bootstrap(PhysicalBlockNumber::new(lba), &frames),
+        );
         drop(owned);
         result
     }
 
     fn barrier(&mut self) -> tx_ext4_format::Result<()> {
-        match self.block.barrier_bootstrap() {
-            StepOutcome::Done(()) => Ok(()),
-            StepOutcome::Err(_) => Err(tx_ext4_format::Ext4FormatError::OutOfBounds),
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                Err(tx_ext4_format::Ext4FormatError::Unsupported)
-            }
-        }
+        step_to_result(self.block.barrier_bootstrap())
     }
 }
 

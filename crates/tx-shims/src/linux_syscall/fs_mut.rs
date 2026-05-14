@@ -72,7 +72,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     } else {
         let guard = step_engine::guard();
         use StepOutcome as V3;
-        let outcome = poll_walker_synchronously(step_walk(cwd.clone(), parent_path, cred, &guard));
+        let outcome = step_walk(cwd.clone(), parent_path, cred, &guard);
         drop(guard);
         match outcome {
             V3::Done(d) => d,
@@ -114,7 +114,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     // chain back to the mount root.
     let guard = step_engine::guard();
     use StepOutcome as V3;
-    let outcome = poll_walker_synchronously(step_walk(cwd.clone(), path, cred, &guard));
+    let outcome = step_walk(cwd.clone(), path, cred, &guard);
     drop(guard);
     match outcome {
         V3::Done(d) => Ok(d),

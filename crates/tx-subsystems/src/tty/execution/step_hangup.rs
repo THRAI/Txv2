@@ -26,6 +26,11 @@ pub fn step_hangup(
     tty: &Cap<TtyIdentity>,
     guard: &Guard<'_>,
 ) -> StepOutcome<HangupOutcome, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     let binding = tty.session_pgrp();

@@ -400,7 +400,7 @@ pub(super) fn step_uffdio_register(
 // Driven from `sys_ioctl(fd, UFFDIO_{COPY,ZEROPAGE,CONTINUE}, argp)`
 // when the resolved `OpenFile` is a ufd shape. The userspace agent has
 // already read a fault message via `read(uffd_fd, &mut uffd_msg)`
-// (`step_ufd_read`) and learned the faulting address; the agent now
+// (`sys_ufd_read`) and learned the faulting address; the agent now
 // invokes one of these three ioctls to satisfy the fault. Each handler:
 //
 // 1. Validates the UFFDIO_API handshake completed.
@@ -529,7 +529,7 @@ fn validate_and_match_pending(
     // Look up the front pending message. Linux's userfaultfd delivers
     // one fault at a time per address, so the agent's reply for `dst`
     // is satisfied by the front-most fault whose `fault_addr` equals
-    // `dst` (the address the agent received via `step_ufd_read`).
+    // `dst` (the address the agent received via `sys_ufd_read`).
     let front = ufd.front_fault_msg().ok_or(EINVAL_VALUE)?;
     if front.fault_addr != dst {
         return Err(EINVAL_VALUE);
@@ -701,7 +701,7 @@ pub(super) fn step_uffdio_continue(
 /// - Otherwise parks on the per-ufd wait source (via
 ///   `wait_source::wait_on_token`) and re-polls when a fault is
 ///   pushed.
-pub(super) async fn step_ufd_read(
+pub(super) async fn sys_ufd_read(
     file: &OpenFile,
     buf_ptr: u64,
     len: usize,

@@ -452,7 +452,7 @@ fn dispatch_rt_sigreturn_returns_neg_enosys() {
         SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::Error(E_NOSYS));
+    assert_eq!(r, SyscallResult::SigreturnRestored);
 }
 
 // E_BADF is reserved for the F_DUPFD-against-closed-fd shape;

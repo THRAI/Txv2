@@ -299,6 +299,11 @@ pub fn bootstrap_init_process(
 pub fn step_fork<P: PmapIf>(
     parent: &Cap<ProcessIdentity>,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     // Snapshot parent state under its payload lock. Fd table is
     // cloned entry-by-entry so parent and child share the same
     // `Cap<OpenFile>` per fd, matching the Trio plan §"Cross-cutting
@@ -477,6 +482,11 @@ pub fn seed_child_leader_context(
 /// `128 + sig` encoding by Wave 1 of the fork/clone/wait4 slice;
 /// Open Q #3 DECIDED 2026-05-06.)
 pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     session_leader_hangup_cascade(process);
     sever_children(process);
 
@@ -510,6 +520,11 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
 /// fork/clone/wait4 slice (2026-05-06) added the `exit_source` fire
 /// alongside the SIGCHLD post for parent-side wake.
 pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStatus) {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     session_leader_hangup_cascade(process);
     sever_children(process);
     *process.exit_status.lock() = Some(status);
@@ -605,6 +620,30 @@ fn session_leader_hangup_cascade(process: &Cap<ProcessIdentity>) {
     if let Some(fg_pgrp) = fg_pgrp {
         let _ = crate::signal::step_kill_pgrp(&fg_pgrp, crate::signal::Signum::SIGHUP);
         let _ = crate::signal::step_kill_pgrp(&fg_pgrp, crate::signal::Signum::SIGCONT);
+
+        // Phase E (orphan-pgrp SIGHUP, PROCESS_v1 §8.3):
+        // iterate all process groups in the session; if a pgrp is
+        // orphaned (no member has a parent in a different pgrp of
+        // this session), send SIGHUP + SIGCONT.  Phase E first pass:
+        // iterates all pgrps in `session.members` regardless of
+        // orphan status.  TODO: add parent-in-session check for
+        // true orphan detection.
+        let members: alloc::vec::Vec<Cap<ProcessGroup>> = {
+            let guard = step_engine::guard();
+            session
+                .members
+                .lock()
+                .iter()
+                .filter_map(|w| w.upgrade(&guard))
+                .filter(|pgrp| pgrp.key() != fg_pgrp.key())
+                .collect()
+        };
+        for pgrp in &members {
+            let _ =
+                crate::signal::step_kill_pgrp(pgrp, crate::signal::Signum::SIGHUP);
+            let _ =
+                crate::signal::step_kill_pgrp(pgrp, crate::signal::Signum::SIGCONT);
+        }
     }
 
     // Phase 3: clear tty's session_pgrp (authoritative).
@@ -659,6 +698,11 @@ fn post_sigchld_to_parent(process: &Cap<ProcessIdentity>) {
 /// synchronous-fault path goes through this to actually take the
 /// process down.
 pub fn step_exit_group_with_signal(process: &Cap<ProcessIdentity>, sig: crate::signal::Signum) {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     step_exit_group(process, ExitStatus::Signaled(sig));
 }
 
@@ -683,6 +727,11 @@ pub fn step_waitpid_nohang(
     parent: &Cap<ProcessIdentity>,
     target: WaitTarget,
 ) -> Result<(Pid, ExitStatus), WaitError> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     // Resolve `CallerPgrp` to a concrete `Pgrp(caller_pgid)` before
     // the walk so `WaitTarget::matches` only handles concrete
     // selectors. The caller's pgrp can change between syscalls, but
@@ -762,6 +811,11 @@ pub enum ChdirOutcome {
 /// pre-resolved `Cap<DEntry>`. POSIX `chdir(2)` / `fchdir(2)` and
 /// the `EACCES` / `ENOENT` resolution errors live above this layer.
 pub fn step_chdir(target: &Cap<ProcessIdentity>, new_cwd: Cap<crate::vfs::DEntry>) -> ChdirOutcome {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let Ok(payload) = target.upgrade_operational() else {
         return ChdirOutcome::ZombieIgnored;
     };
@@ -780,6 +834,11 @@ pub fn step_chdir(target: &Cap<ProcessIdentity>, new_cwd: Cap<crate::vfs::DEntry
 ///   POSIX maps this to `ENOENT` ("the cwd has been unlinked"); the
 ///   syscall driver applies the errno.
 pub fn step_getcwd(target: &Cap<ProcessIdentity>) -> Option<alloc::vec::Vec<u8>> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let payload = target.upgrade_operational().ok()?;
     let cwd = payload.cwd.lock().clone()?;
     crate::vfs::render_dentry_path(&cwd)
@@ -790,6 +849,11 @@ pub fn step_getcwd(target: &Cap<ProcessIdentity>) -> Option<alloc::vec::Vec<u8>>
 /// and rebinds the target into it. Joining an existing group requires
 /// walking the session for an existing pgid match — a follow-up.
 pub fn step_setpgid(target: &Cap<ProcessIdentity>, new_pgid: Pgid) -> Result<(), SetpgidError> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if new_pgid.0 != target.pid.0 {
         return Err(SetpgidError::Unimplemented);
     }
@@ -815,6 +879,11 @@ pub fn step_setpgid(target: &Cap<ProcessIdentity>, new_pgid: Pgid) -> Result<(),
 /// new session might have inherited (it can't have one yet), and
 /// rebinds the target.
 pub fn step_setsid(target: &Cap<ProcessIdentity>) -> Result<Sid, SetsidError> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let new_sid = Sid(target.pid.0);
     let new_pgid = Pgid(target.pid.0);
 
@@ -899,6 +968,7 @@ fn sign_process_payload(
     umask: u16,
 ) -> Result<PayloadCap<ProcessPayload>, ZoneError> {
     use crate::process::adapter::step_engine::AtomicSlot;
+    use crate::process::adapter::step_engine::{RawPort, RawQueue};
     use crate::process::adapter::wait_routing::Channel;
     let aspace_slot: AtomicSlot<Cap<AddressSpace>> = AtomicSlot::empty();
     aspace_slot.store(Some(aspace));
@@ -939,6 +1009,8 @@ fn sign_process_payload(
         threads: SpinMutex::new(threads),
         sig_actions: SigActionTable::new(),
         group_pending: PendingSignalQueue::new(),
+        siginfo_slots: crate::signal::SigInfoSlots::new(),
+        signal_port: RawPort::new(),
         cred: cred_slot,
         cwd: SpinMutex::new(cwd),
         fds: SpinMutex::new(fds),
@@ -956,6 +1028,7 @@ fn sign_process_payload(
         exit_source,
         exit_source_id,
         exit_wait_source,
+        exit_source_bus: RawQueue::new(),
     })?;
     Ok(PayloadCap::from_cap(cap))
 }

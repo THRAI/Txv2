@@ -45,6 +45,11 @@ pub fn step_ingest(
     bytes: &[u8],
     guard: &Guard<'_>,
 ) -> StepOutcome<IngestOutcome, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,

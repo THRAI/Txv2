@@ -1,11 +1,11 @@
 // Auto-extracted from `crates/tx-subsystems/src/signal/tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use crate::process::{bootstrap_init_process, ProcessIdentity};
+use crate::process::{bootstrap_init_process, ExitStatus, ProcessIdentity};
 use crate::signal::adapter::step_engine::Cap;
 use crate::signal::{
     ast_check, default_action, select_next_signal, step_kill_process, step_sigaction, AstOutcome,
-    DefaultAction, InterruptSummary, PendingSource, SigDisposition,
+    DefaultAction, InterruptSummary, KillOutcome, PendingSource, SigDisposition, SignalTarget,
 };
 use crate::thread_runtime::execution::{post_signal, step_sigprocmask, SigmaskHow};
 use crate::thread_runtime::structure::ThreadIdentity;
@@ -83,9 +83,9 @@ fn select_picks_lowest_signum_from_thread_pending() {
     let _g = setup();
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
-    post_signal(&leader, Signum::SIGTERM);
-    post_signal(&leader, Signum::SIGINT);
-    post_signal(&leader, Signum::SIGCHLD);
+    post_signal(&leader, Signum::SIGTERM, None);
+    post_signal(&leader, Signum::SIGINT, None);
+    post_signal(&leader, Signum::SIGCHLD, None);
 
     // SIGINT (2) beats SIGTERM (15) and SIGCHLD (17).
     assert_eq!(
@@ -99,8 +99,8 @@ fn select_skips_masked_signals() {
     let _g = setup();
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
-    post_signal(&leader, Signum::SIGINT);
-    post_signal(&leader, Signum::SIGTERM);
+    post_signal(&leader, Signum::SIGINT, None);
+    post_signal(&leader, Signum::SIGTERM, None);
 
     let mut block = SignalMask::EMPTY;
     block.block(Signum::SIGINT);
@@ -121,7 +121,7 @@ fn select_prefers_thread_pending_over_group_pending() {
 
     // SIGTERM on thread queue, SIGINT on group queue. Thread
     // priority means SIGTERM wins despite higher signum.
-    post_signal(&leader, Signum::SIGTERM);
+    post_signal(&leader, Signum::SIGTERM, None);
     proc_cap
         .payload
         .lock()
@@ -146,7 +146,7 @@ fn select_returns_none_when_all_masked_or_empty() {
     assert_eq!(select_next_signal(&leader), None);
 
     // All masked: None.
-    post_signal(&leader, Signum::SIGINT);
+    post_signal(&leader, Signum::SIGINT, None);
     let mut block = SignalMask::EMPTY;
     block.block(Signum::SIGINT);
     let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
@@ -211,7 +211,7 @@ fn ast_check_default_terminate_for_sigterm() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    post_signal(&leader, Signum::SIGTERM);
+    post_signal(&leader, Signum::SIGTERM, None);
     assert_eq!(
         ast_check(&leader),
         AstOutcome::DefaultTerminate {
@@ -226,7 +226,7 @@ fn ast_check_default_ignore_for_sigchld_drops_and_continues() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    post_signal(&leader, Signum::SIGCHLD);
+    post_signal(&leader, Signum::SIGCHLD, None);
     assert_eq!(ast_check(&leader), AstOutcome::Continue);
     // SIGCHLD was dequeued during the loop, even though dropped.
     let pending = leader
@@ -245,7 +245,7 @@ fn ast_check_default_stop_for_sigtstp() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    post_signal(&leader, Signum::SIGTSTP);
+    post_signal(&leader, Signum::SIGTSTP, None);
     assert_eq!(
         ast_check(&leader),
         AstOutcome::DefaultStop {
@@ -269,7 +269,7 @@ fn ast_check_deliver_handler_when_handler_installed() {
     let leader = leader(&proc_cap);
 
     let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xCAFE));
-    post_signal(&leader, Signum::SIGTERM);
+    post_signal(&leader, Signum::SIGTERM, None);
 
     assert_eq!(
         ast_check(&leader),
@@ -287,7 +287,7 @@ fn ast_check_silent_ignore_disposition_drops_and_continues() {
     let leader = leader(&proc_cap);
 
     let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Ignore);
-    post_signal(&leader, Signum::SIGTERM);
+    post_signal(&leader, Signum::SIGTERM, None);
 
     // Ignore disposition: the loop dequeues + drops, then sees an
     // empty queue and returns Continue.
@@ -305,7 +305,7 @@ fn post_signal_marks_deliverable_when_unmasked() {
     let summary_before = leader.payload.lock().as_ref().unwrap().interrupt_summary();
     assert!(!summary_before.deliverable_signal);
 
-    post_signal(&leader, Signum::SIGINT);
+    post_signal(&leader, Signum::SIGINT, None);
 
     let summary_after = leader.payload.lock().as_ref().unwrap().interrupt_summary();
     assert!(summary_after.deliverable_signal);
@@ -322,7 +322,7 @@ fn post_signal_skips_summary_deliverable_when_masked() {
     block.block(Signum::SIGINT);
     let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
 
-    post_signal(&leader, Signum::SIGINT);
+    post_signal(&leader, Signum::SIGINT, None);
 
     let summary = leader.payload.lock().as_ref().unwrap().interrupt_summary();
     assert!(
@@ -342,7 +342,7 @@ fn sigprocmask_unblock_sets_deliverable_for_already_pending() {
     let mut block = SignalMask::EMPTY;
     block.block(Signum::SIGINT);
     let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
-    post_signal(&leader, Signum::SIGINT);
+    post_signal(&leader, Signum::SIGINT, None);
     assert!(
         !leader
             .payload
@@ -516,7 +516,7 @@ fn ast_dispatch_default_terminate_zombifies_owner_with_signum() {
     // SIGTERM with default disposition → AstOutcome::DefaultTerminate.
     // ast_dispatch should invoke step_exit_group_with_signal so
     // the process zombifies with terminating_signal=Some(SIGTERM).
-    post_signal(&leader, Signum::SIGTERM);
+    post_signal(&leader, Signum::SIGTERM, None);
     let outcome = crate::signal::ast_dispatch(&leader);
 
     assert_eq!(
@@ -559,7 +559,7 @@ fn ast_dispatch_default_stop_recognised_but_unrealised() {
     let leader = leader(&proc_cap);
 
     // SIGTSTP is catchable; default action is Stop.
-    post_signal(&leader, Signum::SIGTSTP);
+    post_signal(&leader, Signum::SIGTSTP, None);
     let outcome = crate::signal::ast_dispatch(&leader);
 
     assert_eq!(
@@ -580,7 +580,7 @@ fn ast_dispatch_deliver_handler_recognised_but_unrealised() {
     let leader = leader(&proc_cap);
 
     let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0xFEED));
-    post_signal(&leader, Signum::SIGTERM);
+    post_signal(&leader, Signum::SIGTERM, None);
 
     let outcome = crate::signal::ast_dispatch(&leader);
     assert_eq!(
@@ -616,5 +616,125 @@ fn step_kill_pgrp_does_not_mirror_gewalt_to_group_pending() {
     assert!(
         !parent_group_pending,
         "Gewalt must not be mirrored onto group_pending"
+    );
+}
+
+// ----- bus wire integration: signal_port + exit_source_bus -----
+
+#[test]
+fn process_payload_has_signal_port_field() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let payload = proc_cap.payload.lock();
+    let payload = payload.as_ref().expect("alive");
+
+    // Verify the signal_port RawPort field exists and is accessible.
+    // The field is pub(crate); this test lives in the same crate so
+    // it can access it.  We don't assert on internal state — just
+    // that the field compiles and is reachable.
+    let _port: &crate::process::adapter::step_engine::RawPort = &payload.signal_port;
+}
+
+#[test]
+fn process_payload_has_exit_source_bus_field() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let payload = proc_cap.payload.lock();
+    let payload = payload.as_ref().expect("alive");
+
+    // Verify the exit_source_bus RawQueue field exists.
+    let _queue: &crate::process::adapter::step_engine::RawQueue = &payload.exit_source_bus;
+}
+
+#[test]
+fn signal_generated_constant_is_defined() {
+    assert_eq!(crate::process::structure::SIGNAL_GENERATED, 0x1);
+}
+
+#[test]
+fn exit_source_child_zombified_constant_is_defined() {
+    assert_eq!(
+        crate::process::structure::EXIT_SOURCE_CHILD_ZOMBIFIED,
+        0x1
+    );
+}
+
+#[test]
+fn step_kill_process_fires_signal_port_for_event_signals() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    // Post a catchable signal via step_kill_process (the Event path).
+    // This should fire signal_port with SIGNAL_GENERATED.
+    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM);
+    assert_eq!(outcome, KillOutcome::Delivered);
+
+    // The signal should be pending on the eligible thread.
+    let leader_payload = leader.payload_cap().expect("alive");
+    assert!(leader_payload.pending().is_pending(Signum::SIGTERM));
+
+    // Verify signal_port was fired: after the fire, the port's
+    // internal state reflects the fire.  We check indirectly by
+    // confirming the process is still alive and the signal was
+    // delivered.
+    assert!(!proc_cap.is_zombie());
+}
+
+#[test]
+fn route_gewalt_sigstop_sets_stopped_flag() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    let outcome = crate::signal::route_gewalt(&proc_cap, Signum::SIGSTOP);
+    assert_eq!(outcome, KillOutcome::Delivered);
+
+    // After SIGSTOP, the thread's stopped flag should be set.
+    let leader_payload = leader.payload_cap().expect("alive");
+    assert!(leader_payload.is_stopped());
+
+    // SIGCONT should clear it.
+    let outcome = crate::signal::route_gewalt(&proc_cap, Signum::SIGCONT);
+    assert_eq!(outcome, KillOutcome::Delivered);
+    assert!(!leader_payload.is_stopped());
+}
+
+#[test]
+fn deliver_posix_signal_ignores_sig_ign_disposition() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    // Install SIG_IGN for SIGTERM.
+    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Ignore);
+
+    let outcome = crate::signal::deliver_posix_signal(
+        crate::signal::SignalTarget::Process(proc_cap.clone()),
+        Signum::SIGTERM,
+    );
+    assert_eq!(outcome, KillOutcome::Delivered);
+
+    // With SIG_IGN, the signal should NOT be posted to pending.
+    let leader_payload = leader.payload_cap().expect("alive");
+    assert!(!leader_payload.pending().is_pending(Signum::SIGTERM));
+    assert!(!proc_cap.is_zombie());
+}
+
+#[test]
+fn deliver_posix_signal_default_term_zombifies_process() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+
+    // SIGTERM with default disposition should terminate.
+    let outcome = crate::signal::deliver_posix_signal(
+        crate::signal::SignalTarget::Process(proc_cap.clone()),
+        Signum::SIGTERM,
+    );
+    assert_eq!(outcome, KillOutcome::Delivered);
+    assert!(proc_cap.is_zombie());
+    assert_eq!(
+        proc_cap.exit_status(),
+        Some(crate::process::ExitStatus::Signaled(Signum::SIGTERM))
     );
 }

@@ -14,7 +14,7 @@
 //!    - `signalfd4(-1, &mask, sizemask, flags)` mints a fresh fd.
 //!    - `signalfd4(fd, &mask, sizemask, flags)` replaces the mask
 //!      on an existing signalfd. Returns `fd` on success.
-//! 2. [`step_signalfd_read`] — signalfd-shaped `read(2)` arm that
+//! 2. [`sys_signalfd_read`] — signalfd-shaped `read(2)` arm that
 //!    pops one `struct signalfd_siginfo` (128 bytes) off the per-fd
 //!    pending queue. Parks on the per-fd `WaitSource` when the
 //!    queue is empty and the fd is blocking; returns `EAGAIN` if
@@ -133,7 +133,7 @@ pub(super) fn sys_signalfd4<'a>(
 /// - `Error(EAGAIN)` if the queue is empty and the fd was opened
 ///   with `O_NONBLOCK` / `SFD_NONBLOCK`.
 /// - Otherwise parks on the per-fd wait source.
-pub(super) async fn step_signalfd_read(
+pub(super) async fn sys_signalfd_read(
     file: &OpenFile,
     buf_ptr: u64,
     len: usize,

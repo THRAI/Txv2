@@ -89,7 +89,7 @@ fn resolve_path_at<P: PmapIf>(
     // outcome. Errno routes back through the reverse `From` bridge so
     // the existing `errno_to_i32` table stays the single source of truth.
     use StepOutcome as V3;
-    let outcome = poll_walker_synchronously(tx_subsystems::vfs::step_walk(cwd, path, cred, &guard));
+    let outcome = tx_subsystems::vfs::step_walk(cwd, path, cred, &guard);
     let dentry = match outcome {
         V3::Done(d) => d,
         V3::Continue { .. } | V3::Yield { .. } => {
@@ -439,7 +439,7 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let dentry: Cap<DEntry> = {
         let guard = step_engine::guard();
         use StepOutcome as V3;
-        let outcome = poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard));
+        let outcome = step_walk(cwd, &path, &walker_cred, &guard);
         drop(guard);
         match outcome {
             V3::Done(d) => d,
@@ -575,7 +575,7 @@ pub(super) fn walk_from(
 ) -> Result<Cap<DEntry>, i32> {
     let guard = step_engine::guard();
     use StepOutcome as V3;
-    let outcome = poll_walker_synchronously(step_walk(cwd, path, cred, &guard));
+    let outcome = step_walk(cwd, path, cred, &guard);
     drop(guard);
     match outcome {
         V3::Done(d) => Ok(d),

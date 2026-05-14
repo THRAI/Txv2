@@ -38,7 +38,7 @@ use adapter::step_engine::{
 };
 
 use crate::execution::Errno;
-use crate::process::structure::{ProcessGroup, ProcessIdentity};
+use crate::process::structure::{ProcessGroup, ProcessIdentity, SIGNAL_GENERATED};
 use crate::thread_runtime::execution::{post_signal, post_signal_mailbox};
 
 /// POSIX signal number, 1..=64.
@@ -143,8 +143,58 @@ pub struct PendingSignalQueue {
     bits: AtomicU64,
 }
 
+/// Minimal POSIX `siginfo_t` payload carried with each signal
+/// delivery.  Phase I carries `si_signo`, `si_code`, `si_pid`,
+/// and `si_uid`; `si_addr`, `si_value`, and the status union
+/// (`si_status`) are deferred.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SigInfo {
+    pub si_signo: u32,
+    pub si_code: i32,
+    pub si_pid: u32,
+    pub si_uid: u32,
+}
+
+/// SI_USER: signal sent by kill(2) / tkill(2) / tgkill(2).
+pub const SI_USER: i32 = 0;
+
+/// Per-process siginfo slots — one optional [`SigInfo`] record
+/// per signum.  Lives on `ProcessPayload` alongside `group_pending`.
+pub struct SigInfoSlots {
+    slots: SpinMutex<[Option<SigInfo>; 64]>,
+}
+
+impl SigInfoSlots {
+    pub fn new() -> Self {
+        Self {
+            slots: SpinMutex::new([None; 64]),
+        }
+    }
+
+    pub fn store(&self, signum: Signum, info: SigInfo) {
+        let idx = (signum.raw() - 1) as usize;
+        self.slots.lock()[idx] = Some(info);
+    }
+
+    pub fn get(&self, signum: Signum) -> Option<SigInfo> {
+        let idx = (signum.raw() - 1) as usize;
+        self.slots.lock()[idx]
+    }
+
+    pub fn clear(&self, signum: Signum) {
+        let idx = (signum.raw() - 1) as usize;
+        self.slots.lock()[idx] = None;
+    }
+}
+
+impl Default for SigInfoSlots {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PendingSignalQueue {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             bits: AtomicU64::new(0),
         }
@@ -240,6 +290,11 @@ impl SigActionTable {
     /// Phase 7 — infallible. Called by the exec script after
     /// `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`.
     pub fn step_reset_for_exec(&self) {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
         let mut entries = self.entries.lock();
         for slot in entries.iter_mut() {
             if matches!(slot, SigDisposition::Handler(_)) {
@@ -538,6 +593,139 @@ pub enum KillOutcome {
     NoLiveThread,
 }
 
+/// Deliver a synchronous fault signal (SIGSEGV, SIGILL, SIGBUS, etc.)
+/// to the current thread's owning process.
+///
+/// Per `SIGNAL_v1` §20, synchronous faults are delivered on the
+/// trapping thread and **bypass the signal mask** — the fault
+/// occurs regardless of `sigprocmask` state.  The delivery path
+/// differs from `deliver_posix_signal` in two critical ways:
+///
+/// 1. **No Gewalt routing.** Synchronous faults are always
+///    catchable Event signals — they consult `sig_actions` for
+///    disposition, never trigger control primitives.
+/// 2. **No group-wide scan.** The signal is posted directly to the
+///    trapping thread's `thread_pending` (not the process group
+///    queue) because POSIX requires the fault to be delivered on
+///    the thread that raised it.
+///
+/// If the disposition is `Default` (no handler installed), the
+///    default action is taken immediately — for SIGSEGV/SIGILL/
+///    SIGBUS/SIGFPE this is `Term` or `Core`, which maps to
+///    `step_exit_group_with_signal`.
+///
+/// Phase B (first pass): always takes the default-action path
+///    (calls `step_exit_group_with_signal`).  Handler routing
+///    via `sig_actions` and signal-frame delivery land in
+///    Phase D once `SignalFrameIf` integration is complete.
+///
+/// The `thread` argument supplies the trapping thread's `Cap` so
+///    the function can resolve the owning process.  The faulting
+///    signum must be one of the synchronous set (SIGSEGV, SIGILL,
+///    SIGBUS, SIGFPE, SIGTRAP, SIGSYS); other signums panic.
+///
+/// See: `txdoc:SIGNAL-V1-S20-SYNCHRONOUS-FAULT`.
+pub fn deliver_synchronous_fault(
+    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+    sig: Signum,
+) {
+    let guard = step_engine::guard();
+    if let Some(process) = thread.owner_proc.upgrade(&guard) {
+        drop(guard);
+        // Phase B: always take default action.
+        crate::process::execution::step_exit_group_with_signal(&process, sig);
+    }
+}
+
+/// Deliver a signal via the canonical POSIX entry point.
+///
+/// This is the canonical POSIX signal delivery entry per `SIGNAL_v1`
+/// §12 (`deliver_posix_signal`). It accepts a `SignalTarget` and
+/// routes the signal through three stages:
+///
+/// 1. **Gewalt check** — `SIGKILL`/`SIGSTOP`/`SIGCONT` bypass the
+///    routing table and call control primitives directly.
+/// 2. **Event routing** — all other signums consult `sig_actions`
+///    (disposition) to determine routing:
+///    - `SIG_IGN` → drop immediately (no pending post).
+///    - `SIG_DFL` → take default action immediately (Term/Core/
+///      Stop/Cont/Ignore per POSIX).
+///    - `Handler(addr)` → post to an eligible thread's pending
+///      queue; the AST delivers the handler on next userspace
+///      boundary (Phase D handler delivery).
+/// 3. **Bus wire fire** — after thread-eligibility post and signalfd
+///    notification, `signal_port.fire(SIGNAL_GENERATED)` wakes native
+///    subscribers.
+///
+/// Phase D: consults `sig_actions` for routing; `ProcessGroup` and
+/// `Thread` targets are TODO.
+///
+/// See: `txdoc:SIGNAL-V1-S12-DELIVER-POSIX-SIGNAL`.
+pub fn deliver_posix_signal(
+    target: SignalTarget,
+    sig: Signum,
+) -> KillOutcome {
+    let cap = match target {
+        SignalTarget::Process(cap) => cap,
+        SignalTarget::ProcessGroup(_group) => {
+            todo!("deliver_posix_signal: ProcessGroup not yet implemented");
+        }
+        SignalTarget::Thread(_thread) => {
+            todo!("deliver_posix_signal: per-thread signal not yet implemented");
+        }
+    };
+
+    // Gewalt signums bypass the routing table entirely.
+    if is_gewalt(sig) {
+        return step_kill_process(&cap, sig);
+    }
+
+    // Event signums: consult sig_actions for disposition.
+    let disposition = match cap.upgrade_operational() {
+        Ok(payload) => payload.sig_actions().get(sig),
+        Err(_) => return KillOutcome::NoLiveThread,
+    };
+
+    match disposition {
+        SigDisposition::Ignore => KillOutcome::Delivered,
+        SigDisposition::Default => {
+            // Materialise the default action immediately.
+            match default_action(sig) {
+                DefaultAction::Ignore => KillOutcome::Delivered,
+                DefaultAction::Term | DefaultAction::Core => {
+                    crate::process::execution::step_exit_group_with_signal(&cap, sig);
+                    KillOutcome::Delivered
+                }
+                DefaultAction::Stop => {
+                    route_gewalt(&cap, Signum::SIGSTOP);
+                    KillOutcome::Delivered
+                }
+                DefaultAction::Cont => {
+                    route_gewalt(&cap, Signum::SIGCONT);
+                    KillOutcome::Delivered
+                }
+            }
+        }
+        SigDisposition::Handler(_handler) => {
+            // Post to eligible thread's pending; AST delivers handler.
+            step_kill_process(&cap, sig)
+        }
+    }
+}
+
+/// Target for `deliver_posix_signal`.
+///
+/// Per `SIGNAL_v1` §12, a signal can be addressed to a process
+/// (`pid > 0`), a process group (`pid == 0` or `pid == -pgid`), or a
+/// specific thread (`tkill`/`tgkill`). Phase A supports only
+/// `Process`.
+#[derive(Clone, Debug)]
+pub enum SignalTarget {
+    Process(Cap<ProcessIdentity>),
+    ProcessGroup(Cap<ProcessGroup>),
+    Thread(Cap<crate::thread_runtime::structure::ThreadIdentity>),
+}
+
 /// Deliver `sig` to a single process. Per `SIGNAL_v1` §1, §12.1
 /// dispatches by category:
 ///
@@ -569,6 +757,11 @@ pub enum KillOutcome {
 /// `payload.threads.lock()`, so this order avoids any
 /// post-while-holding-list-lock hazard. Zombies are skipped.
 pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if is_gewalt(sig) {
         let outcome = route_gewalt(target, sig);
         // D9-D: route_gewalt does not currently fan out to signalfd
@@ -584,6 +777,17 @@ pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutc
         // unregister site (Drop for SignalFd runs only when the cap
         // drops, not at thread zombify).
         if outcome == KillOutcome::Delivered {
+            // Phase A (bus wire alignment): Gewalt signums (SIGKILL,
+            // SIGSTOP, SIGCONT) fire signal_port too — Linux delivers
+            // them to signalfd per D9-D comment above. Bus subscribers
+            // wake and re-read pending state after the gewalt routing
+            // completes its per-thread fan-out.
+            // Phase C: signal_port.fire is the canonical driver;
+            // signalfd notification happens as a bus subscriber
+            // reaction after the wire fires.
+            if let Some(payload) = target.payload.lock().as_ref() {
+                payload.signal_port.fire(SIGNAL_GENERATED);
+            }
             crate::signalfd::notify_process_signal(target.key().raw(), sig);
         }
         return outcome;
@@ -623,7 +827,7 @@ pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutc
         return KillOutcome::NoLiveThread;
     };
 
-    post_signal(&chosen, sig);
+    post_signal(&chosen, sig, None);
 
     // D9-D: fan out to every per-process signalfd subscription whose
     // mask covers `sig`. Runs *after* the thread-eligibility post —
@@ -631,6 +835,22 @@ pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutc
     // constraint 1). The thread post still updates the truth-bearing
     // `InterruptSummary` and the bound mailbox; the signalfd post
     // routes signal-as-event to any agent draining via `read(2)`.
+
+    // Phase C (bus-aligned delivery): fire the per-process
+    // `signal_port` RawPort *first* — the bus wire is the canonical
+    // driver. Signalfd notification follows as a bus subscriber
+    // reaction. Native bus subscribers (future pidfd, timerfd) wake
+    // on the edge and re-read their respective pending state.
+    // Single-bit fire per SIGNAL_GENERATED — the signum is carried
+    // in the pending queues, not in the bus event.
+    //
+    // See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-1`,
+    // `docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md`.
+    if let Some(payload) = target.payload.lock().as_ref() {
+        payload.signal_port.fire(SIGNAL_GENERATED);
+    }
+
+    // bus subscriber reaction: push siginfo to signalfd queues
     crate::signalfd::notify_process_signal(target.key().raw(), sig);
 
     KillOutcome::Delivered
@@ -692,6 +912,17 @@ pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
             18 => s.stop_requested = false,
             _ => unreachable!("SIGKILL handled above; is_gewalt guarantees the rest"),
         });
+        // Phase E (stop-state): update the per-thread `stopped` flag
+        // in addition to the summary stop_requested bit. The AST
+        // checkpoint in thread_future reads `stopped` (AtomicBool)
+        // without acquiring the payload lock. SIGSTOP sets it to
+        // prevent userspace re-entry; SIGCONT clears it to allow
+        // resumption.
+        match sig.raw() {
+            19 => thread_payload.set_stopped(true),
+            18 => thread_payload.set_stopped(false),
+            _ => {}
+        }
         // D9-A: post the wake-hint to each thread's mailbox after
         // the summary mutation so a parked future re-polls and
         // observes the new `stop_requested` bit. The routing tag is
@@ -720,6 +951,11 @@ pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
 ///
 /// Returns the count of processes that received the post.
 pub fn step_kill_pgrp(pgrp: &Cap<ProcessGroup>, sig: Signum) -> usize {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let guard = step_engine::guard();
     let mut delivered = 0usize;
     let catchable = !is_gewalt(sig);
@@ -750,6 +986,11 @@ pub fn step_sigaction(
     sig: Signum,
     disposition: SigDisposition,
 ) -> SigDispositionChange {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     let Ok(payload) = process.upgrade_operational() else {
         return SigDispositionChange::ZombieIgnored;
     };

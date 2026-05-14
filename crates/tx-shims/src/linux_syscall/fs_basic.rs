@@ -100,11 +100,14 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             SyscallResult::Return(bits as i64)
         }
         F_SETFL => {
-            // TODO(phase-fcntl-setfl): F_SETFL needs interior-mutable
-            // OpenFileFlags. Future slice owns this — the plain
-            // `Copy`-struct field on OpenFile cannot be mutated
-            // atomically without a structural change.
-            SyscallResult::Error(ENOSYS_VALUE)
+            // Apply O_NONBLOCK if present in the request. Other
+            // settable flags (O_APPEND, O_DIRECT, O_ASYNC) are
+            // deferred — only O_NONBLOCK has a runtime override
+            // field on OpenFile today.
+            let arg = args[2] as u64;
+            let nonblocking = (arg & O_NONBLOCK as u64) != 0;
+            file.set_nonblocking(nonblocking);
+            SyscallResult::Return(0)
         }
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
@@ -231,8 +234,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     use step_engine::{Errno as V3Errno, StepOutcome as V3};
     let walk_first = {
         let guard = step_engine::guard();
-        let outcome =
-            poll_walker_synchronously(step_walk(cwd.clone(), &path, &walker_cred, &guard));
+        let outcome = step_walk(cwd.clone(), &path, &walker_cred, &guard);
         drop(guard);
         outcome
     };
@@ -297,14 +299,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // Same Send-future discipline as Step 1: poll_walker_synchronously.
     let openfile: Cap<OpenFile> = {
         let guard = step_engine::guard();
-        let outcome = poll_walker_synchronously(step_open(
-            cwd,
-            &path,
-            open_flags,
-            mode as u16,
-            &walker_cred,
-            &guard,
-        ));
+        let outcome = step_open(cwd, &path, open_flags, mode as u16, &walker_cred, &guard);
         drop(guard);
         match outcome {
             V3::Done(file) => file,
@@ -1046,7 +1041,7 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         use step_engine::StepOutcome as V3;
         let outcome = {
             let guard = step_engine::guard();
-            poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard))
+            step_walk(cwd, &path, &walker_cred, &guard)
         };
         match outcome {
             V3::Done(d) => d,
@@ -1127,7 +1122,7 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         use StepOutcome as V3;
         let outcome = {
             let guard = step_engine::guard();
-            poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard))
+            step_walk(cwd, &path, &walker_cred, &guard)
         };
         match outcome {
             V3::Done(d) => d,

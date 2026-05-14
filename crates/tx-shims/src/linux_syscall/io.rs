@@ -342,116 +342,45 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         }
     }
 
-    // Loop on the canonical async wait discipline pattern from
-    // `vm::execution::fault_script`. Each iteration takes a fresh
-    // `step_engine::guard()` inside the step's call site so
-    // the guard never crosses an `.await`.
-    //
     // PR-9 phase 3b: drive `OpenFile::step_write` via the
-    // `OpenFileWriteOp` StepOp wrap, threading a `&mut KernelScriptCtx`.
+    // `OpenFileWriteOp` StepOp wrap and the v3 `drive()` loop
+    // (per `docs/Txv3/03_STEP_MODEL_v2.md` §8).
     //
-    // PR-9 phase 5 (D5 Path A): populate `SubjectContext` from
-    // `SyscallCtx`. The subject identifies the calling process+thread
-    // and carries the `Cap<Cred>` snapshot loaded at syscall entry —
-    // SUBJ-1 hygiene per `docs/Txv3/04_SYSCALL_SHAPE_v1.md` §2.
-    // Restrictions cap is a fresh placeholder
-    // (`tx_subsystems::cred::placeholder_restrictions_cap`) until PR-K
-    // lands the real append-only stack (D5 §7).
-    use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
-    use tx_subsystems::execution::WaitToken;
+    // The source buffer (`bytes`) is consumed by successive
+    // `step()` calls (cursor tracked internally by
+    // `OpenFileWriteOp`). After `drive()` returns, the return
+    // value is the total bytes written.
+    use step_engine::StepOp;
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
     use tx_subsystems::vfs::execution::OpenFileWriteOp;
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut total: usize = 0;
-    let mut remaining = bytes.as_slice();
-    loop {
-        let outcome = {
-            let guard = step_engine::guard();
-            let mut op = OpenFileWriteOp {
-                file: &file,
-                bytes: remaining,
-                guard: &guard,
-            };
-            op.step(&mut script_ctx)
-        };
-        match outcome {
-            V3Out::Done(written) => {
-                total += written;
-                return SyscallResult::Return(total as i64);
+    let guard = step_engine::guard();
+    let mode = if file.flags().nonblocking {
+        DriveMode::Nonblocking
+    } else {
+        DriveMode::Waiting
+    };
+    let mut op = OpenFileWriteOp {
+        file: &file,
+        bytes: &bytes,
+        guard: &guard,
+        cursor: 0,
+    };
+    match drive(op, &mut script_ctx, mode, None, None, None).await {
+        Ok(total) => SyscallResult::Return(total as i64),
+        Err(v3errno) => {
+            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            // fd-ops Wave 3 — Q2 DECIDED 2026-05-07. SIGPIPE is
+            // delivered to the calling process before returning
+            // `-EPIPE` to userspace.
+            if errno == tx_subsystems::execution::Errno::EPIPE {
+                let _ = tx_subsystems::signal::step_kill_process(
+                    &ctx.process,
+                    tx_subsystems::signal::Signum::SIGPIPE,
+                );
             }
-            V3Out::Continue { progress } => {
-                let written = progress.bytes();
-                total += written;
-                let stop = written == 0 || written >= remaining.len();
-                if stop {
-                    return SyscallResult::Return(total as i64);
-                }
-                remaining = &remaining[written..];
-            }
-            V3Out::Yield {
-                progress,
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-            } => {
-                let written = progress.bytes();
-                if written > 0 {
-                    total += written;
-                    if written >= remaining.len() {
-                        return SyscallResult::Return(total as i64);
-                    }
-                    remaining = &remaining[written..];
-                    let token = WaitToken::new(carrier.raw(), interests.raw());
-                    if let Some(future) = wait_source::wait_on_token(token) {
-                        let _ = future.await;
-                    }
-                    // Otherwise the carrier has been retired or is a test
-                    // placeholder; fall through and retry immediately.
-                } else {
-                    // No progress made yet; await the carrier and retry.
-                    let token = WaitToken::new(carrier.raw(), interests.raw());
-                    if let Some(future) = wait_source::wait_on_token(token) {
-                        let _ = future.await;
-                    }
-                }
-            }
-            V3Out::Yield {
-                shape: YieldShape::OnAgent { .. },
-                ..
-            } => {
-                if total > 0 {
-                    return SyscallResult::Return(total as i64);
-                }
-                return SyscallResult::Error(errno_to_i32(Errno::EIO));
-            }
-            V3Out::Yield {
-                shape: YieldShape::OnTimer { .. },
-                ..
-            } => {
-                if total > 0 {
-                    return SyscallResult::Return(total as i64);
-                }
-                return SyscallResult::Error(errno_to_i32(Errno::EIO));
-            }
-            V3Out::Err(v3errno) => {
-                if total > 0 {
-                    return SyscallResult::Return(total as i64);
-                }
-                let errno: Errno = v3errno.into();
-                // fd-ops Wave 3 — Q2 DECIDED 2026-05-07. SIGPIPE is
-                // delivered to the calling process before returning
-                // `-EPIPE` to userspace. The pipe `step_write` cannot
-                // do this itself (no process Cap); the syscall arm
-                // is the right boundary because it has `ctx.process`.
-                if errno == Errno::EPIPE {
-                    let _ = tx_subsystems::signal::step_kill_process(
-                        &ctx.process,
-                        tx_subsystems::signal::Signum::SIGPIPE,
-                    );
-                }
-                return SyscallResult::Error(errno_to_i32(errno));
-            }
+            SyscallResult::Error(errno_to_i32(errno))
         }
     }
 }
@@ -498,7 +427,7 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     // EINVAL for ufd backings, so dispatch here before the generic
     // path.
     if file.ufd().is_some() {
-        return super::userfaultfd::step_ufd_read(&file, args[1], len, ctx).await;
+        return super::userfaultfd::sys_ufd_read(&file, args[1], len, ctx).await;
     }
     // D9-D: signalfd fds carry their own `read(2)` arm (drain one
     // 128-byte `struct signalfd_siginfo` off the per-fd pending
@@ -506,7 +435,7 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     // signalfd backing, so this dispatch must run *before* any
     // generic VFS path.
     if file.signalfd().is_some() {
-        return super::signalfd::step_signalfd_read(&file, args[1], len, ctx).await;
+        return super::signalfd::sys_signalfd_read(&file, args[1], len, ctx).await;
     }
 
     // Read into a kernel-side staging buffer, then copy out through
@@ -538,6 +467,7 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 file: &file,
                 out: &mut staging[cursor..],
                 guard: &guard,
+                cursor: 0,
             };
             op.step(&mut script_ctx)
         };

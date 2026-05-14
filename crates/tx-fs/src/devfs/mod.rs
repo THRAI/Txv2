@@ -184,7 +184,7 @@ pub fn open_console_for_init_via_walker() -> Cap<OpenFile> {
             let cred = Credential::root();
             let guard = step_engine::guard();
             use StepOutcome as V3;
-            let outcome = block_on(vfs::step_open(
+            let outcome = vfs::step_open(
                 root,
                 b"/dev/console",
                 OpenFileFlags {
@@ -197,7 +197,7 @@ pub fn open_console_for_init_via_walker() -> Cap<OpenFile> {
                 0,
                 &cred,
                 &guard,
-            ));
+            );
             match outcome {
                 V3::Done(file) => return file,
                 _other => {

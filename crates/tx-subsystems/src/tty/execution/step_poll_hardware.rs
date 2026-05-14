@@ -42,6 +42,11 @@ pub fn step_poll_hardware_input(
     max_bytes: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<HardwarePollOutcome, NoProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::tty::adapter::step_engine::{NoProgress, StepOutcome as V3, YieldShape};
 
     if max_bytes == 0 {

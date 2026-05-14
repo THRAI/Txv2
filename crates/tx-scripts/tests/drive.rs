@@ -101,7 +101,7 @@ fn on_agent_shape() -> YieldShape {
 fn drive_done_immediately_returns_value() {
     let op = MockStepOp::new([StepOutcome::Done(42u32)]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting));
+    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, None, None, None));
     assert_eq!(result, Ok(42u32));
 }
 
@@ -113,7 +113,7 @@ fn drive_done_immediately_returns_value() {
 fn drive_err_surfaces_error() {
     let op = MockStepOp::new([StepOutcome::Err(Errno::ENOENT)]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting));
+    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, None, None, None));
     assert_eq!(result, Err(Errno::ENOENT));
 }
 
@@ -121,7 +121,7 @@ fn drive_err_surfaces_error() {
 fn drive_err_surfaces_einval() {
     let op = MockStepOp::new([StepOutcome::Err(Errno::EINVAL)]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Nonblocking));
+    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Nonblocking, None, None, None));
     assert_eq!(result, Err(Errno::EINVAL));
 }
 
@@ -140,7 +140,7 @@ fn drive_yield_on_wait_source_nonblocking_no_progress_returns_eagain() {
     }]);
     let mut ctx = empty_ctx();
     // Nonblocking + no progress → Translate(Eagain) → Err(EAGAIN)
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Nonblocking));
+    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Nonblocking, None, None, None));
     assert_eq!(result, Err(Errno::EAGAIN));
 }
 
@@ -157,7 +157,7 @@ fn drive_yield_on_agent_nonblocking_returns_eagain() {
     }]);
     let mut ctx = empty_ctx();
     // Nonblocking + no progress → Translate(Eagain) → Err(EAGAIN)
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Nonblocking));
+    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Nonblocking, None, None, None));
     assert_eq!(result, Err(Errno::EAGAIN));
 }
 
@@ -178,7 +178,7 @@ fn drive_continue_then_done_retries_loop() {
         StepOutcome::Done(99u32),
     ]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting));
+    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, None, None, None));
     assert_eq!(result, Ok(99u32));
 }
 
@@ -194,22 +194,28 @@ fn drive_selecting_on_agent_returns_enosys() {
     }]);
     let mut ctx = empty_ctx();
     // Selecting + OnAgent → Translate(UnsupportedShape) → Err(ENOSYS)
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Selecting));
+    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Selecting, None, None, None));
     assert_eq!(result, Err(Errno::ENOSYS));
 }
 
 // ---------------------------------------------------------------------------
-// Bonus: Waiting + OnWaitSource → Resolve → Err(EAGAIN) (stub path)
+// Bonus: Waiting + OnWaitSource → Resolve → parks then retries
 // ---------------------------------------------------------------------------
 
 #[test]
-fn drive_waiting_on_wait_source_resolve_stub_returns_eagain() {
-    let op = MockStepOp::new([StepOutcome::Yield {
-        progress: NoProgress,
-        shape: on_wait_source_shape(7, 0xff),
-    }]);
+fn drive_waiting_on_wait_source_unregistered_token_retries() {
+    // When the wait source id is not registered (test placeholder),
+    // wait_on_token returns None and drive retries immediately.
+    // The op yields, drive skips the await, applies ResumeOutcome::Retry,
+    // loops, and step() returns Done.
+    let op = MockStepOp::new([
+        StepOutcome::Yield {
+            progress: NoProgress,
+            shape: on_wait_source_shape(7, 0xff),
+        },
+        StepOutcome::Done(42),
+    ]);
     let mut ctx = empty_ctx();
-    // Waiting + OnWaitSource → Resolve → Err(EAGAIN) (parking not yet wired)
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting));
-    assert_eq!(result, Err(Errno::EAGAIN));
+    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, None, None, None));
+    assert_eq!(result, Ok(42));
 }
