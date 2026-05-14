@@ -13,7 +13,9 @@
 pub mod adapter;
 pub mod checks;
 pub mod execution;
+pub mod predicates;
 pub mod require;
+pub mod resolution;
 pub mod structure;
 pub mod walker;
 
