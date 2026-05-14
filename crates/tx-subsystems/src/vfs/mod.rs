@@ -13,6 +13,7 @@
 pub mod adapter;
 pub mod checks;
 pub mod execution;
+pub mod require;
 pub mod structure;
 pub mod walker;
 
