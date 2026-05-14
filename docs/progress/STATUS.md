@@ -1988,7 +1988,7 @@
   and `unlink` hit `--- Assert Fatal ! ---`; `umount` returns −38
   (ENOSYS for `mount` syscall). Commit loader changes.
 
-**Updated:** 2026-05-13
+**Updated:** 2026-05-14
 
 - 2026-05-13 **OSComp `basic-musl` TEST GROUP markers now appear** in the
   oscomp RV64 QEMU serial output. Three fixes landed together:
@@ -2227,6 +2227,23 @@
   echo pipe-ok | cat → true && echo done → quit).
   **Next step:** none for this bug cluster. Shell prompt milestone
   complete.
+
+- 2026-05-14 N69b netperf loopback PASS. The target shell-test now prints the
+  TCP_STREAM result table with the `10^6bits/sec` throughput line. Fixes landed
+  locally for the observed chain: port-zero TCP bind ephemeral allocation,
+  wildcard loopback client local-address selection, large `recvfrom` short-read
+  staging, `setitimer(ITIMER_REAL)` state plus cooperative SIGALRM delivery,
+  musl `sa_restorer` capture for executable `rt_sigreturn`, pselect socket
+  `ERR/HUP/RDHUP` read readiness, mixed tty/socket fdset wait-token selection,
+  multi-read-fd pselect rescan/yield, and connected TCP peer close notification.
+  Verification: `cargo fmt --check`; targeted tx-shims/tx-subsystems tests for
+  SIGALRM restorer and TCP peer-close breakage; `cargo xtask full-build --target
+  rv64-qemu --skip-doctor --no-image`; `cargo xtask test busybox-boot --target
+  rv64-qemu`; `busybox-iperf3-loopback`; `busybox-netperf-help`; and
+  `busybox-netperf-loopback` after rebuilding the musl netperf image. No N69b
+  blocker remains; next step is review/commit cleanup. Plan:
+  `msp/network-n69b-netperf-loopback-plan.md`. Result:
+  `msp/network-n69b-netperf-loopback-result.md`.
 
 - 2026-05-13 N69a dynamic ELF loader (PT_INTERP + ET_DYN interpreter) LANDED.
   Lifts the kernel exec contract from static-`ET_EXEC`-only to "ET_EXEC main
