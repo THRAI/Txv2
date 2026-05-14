@@ -28,6 +28,7 @@ impl VirtioPciError {
         match self {
             VirtioPciError::MissingMmioRegion(_) => "missing-mmio-region",
             VirtioPciError::NoBlockDevice => "no-block-device",
+            VirtioPciError::NoNetDevice => "no-net-device",
             VirtioPciError::BarProbe => "bar-probe",
             VirtioPciError::BarTooLarge => "bar-too-large",
             VirtioPciError::BarAddressExhausted => "bar-address-exhausted",
