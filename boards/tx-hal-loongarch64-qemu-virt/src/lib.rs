@@ -194,6 +194,7 @@ _start:
     .equ TX_LA64_CSR_KSAVE0_TRAP, 0x30
     .equ TX_LA64_CSR_KSAVE1_TRAP, 0x31
     .equ TX_LA64_CSR_KSAVE2_TRAP, 0x32
+    .equ TX_LA64_CSR_KSAVE3_TRAP, 0x33
     .equ TX_LA64_CSR_PGD_TRAP, 0x1b
     .equ TX_LA64_CSR_TLBRERA_TRAP, 0x8a
     .equ TX_LA64_CSR_TLBRSAVE_TRAP, 0x8b
@@ -211,10 +212,11 @@ _start:
     .globl tx_la64_qemu_exception_vector
     .type tx_la64_qemu_exception_vector, @function
 tx_la64_qemu_exception_vector:
+    csrwr   $r12, TX_LA64_CSR_KSAVE3_TRAP
     csrrd   $r12, TX_LA64_CSR_PRMD_TRAP
     andi    $r12, $r12, TX_LA64_PRMD_PPLV_USER
-    li.w    $r13, TX_LA64_PRMD_PPLV_USER
-    bne     $r12, $r13, .Ltx_la64_kernel_trap_stack_ready
+    addi.d  $r12, $r12, -TX_LA64_PRMD_PPLV_USER
+    bnez    $r12, .Ltx_la64_kernel_trap_stack_ready
 
     // User trap: switch onto the per-hart trap stack. KSAVE0 is primed
     // with trap_stack_top before entering user mode and on every clean
@@ -222,14 +224,15 @@ tx_la64_qemu_exception_vector:
     csrwr   $sp, TX_LA64_CSR_KSAVE0_TRAP
 .Ltx_la64_kernel_trap_stack_ready:
     addi.d  $sp, $sp, -TX_LA64_TF_SIZE
+    csrrd   $r12, TX_LA64_CSR_KSAVE3_TRAP
     st.d    $r12, $sp, TX_LA64_TF_R12
     st.d    $zero, $sp, TX_LA64_TF_R0
     st.d    $r1, $sp, TX_LA64_TF_R1
     st.d    $r2, $sp, TX_LA64_TF_R2
     csrrd   $r12, TX_LA64_CSR_PRMD_TRAP
     andi    $r12, $r12, TX_LA64_PRMD_PPLV_USER
-    li.w    $r13, TX_LA64_PRMD_PPLV_USER
-    bne     $r12, $r13, .Ltx_la64_save_kernel_sp
+    addi.d  $r12, $r12, -TX_LA64_PRMD_PPLV_USER
+    bnez    $r12, .Ltx_la64_save_kernel_sp
     csrrd   $r12, TX_LA64_CSR_KSAVE0_TRAP
     b       .Ltx_la64_save_sp_done
 .Ltx_la64_save_kernel_sp:

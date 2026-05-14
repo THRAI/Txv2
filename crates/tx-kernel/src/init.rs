@@ -794,14 +794,9 @@ impl<P: TxPlatform> CoreInit<P> {
                 }
                 other => panic!("mount_sdcard_at_musl: mkdir /bin: {other:?}"),
             };
-            let sh_target: &[u8] = if P::ARCH == tx_hal::Arch::LoongArch64 {
-                b"/musl/bin/busybox"
-            } else {
-                b"/musl/musl/busybox"
-            };
             let _ = rootfs_payload
                 .fs_ops
-                .symlink(bin_id, b"sh", sh_target, &cred, &guard);
+                .symlink(bin_id, b"sh", b"/musl/musl/busybox", &cred, &guard);
         }
 
         Self::write_board_sentinel_prefix();
