@@ -7,7 +7,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::runtime::{
-    self, Cap, Dead, Entity, PayloadBinding, PayloadCap, SpinMutex, Zone, ZoneAllocated, ZoneError,
+    self, Cap, Dead, Entity, IdentitySlot, PayloadBinding, PayloadCap, PayloadPolicy, SpinMutex,
+    Zone, ZoneAllocated, ZoneError,
 };
 
 use crate::device::BlockDevice;
@@ -26,6 +27,7 @@ unsafe impl ZoneAllocated for MountIdentity {
 }
 
 unsafe impl ZoneAllocated for MountPayload {
+    type Policy = PayloadPolicy<Self>;
     fn zone() -> &'static Zone<Self> {
         &MOUNT_PAYLOAD_ZONE
     }
@@ -367,7 +369,7 @@ pub struct MountOutput {
 struct MountTableEntry {
     parent_payload_ptr: usize,
     child_fs_object_id: FsObjectId,
-    mount: Cap<MountIdentity>,
+    mount: IdentitySlot<MountIdentity>,
 }
 
 static MOUNT_TABLE: SpinMutex<Vec<MountTableEntry>> = SpinMutex::new(Vec::new());
@@ -401,14 +403,14 @@ pub fn register_mount(
         if entry.parent_payload_ptr == parent_payload_ptr
             && entry.child_fs_object_id == mountpoint_fs_object_id
         {
-            entry.mount = mount;
+            entry.mount = IdentitySlot::from_cap(mount);
             return;
         }
     }
     table.push(MountTableEntry {
         parent_payload_ptr,
         child_fs_object_id: mountpoint_fs_object_id,
-        mount,
+        mount: IdentitySlot::from_cap(mount),
     });
 }
 
@@ -426,7 +428,7 @@ pub fn mount_for(
         if entry.parent_payload_ptr == parent_payload_ptr
             && entry.child_fs_object_id == child_fs_object_id
         {
-            return Some(entry.mount.clone());
+            return Some(entry.mount.clone_cap());
         }
     }
     None
@@ -895,12 +897,7 @@ mod tests {
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::ENOENT) => {}
-            StepOutcome::Continue { .. }
-            | StepOutcome::Yield { .. }
-            | StepOutcome::Done(_)
-            | StepOutcome::Err(_) => {
-                panic!("expected v3 Err(ENOENT), got {outcome:?}");
-            }
+            _ => panic!("expected v3 Err(ENOENT), got {outcome:?}"),
         }
     }
 
@@ -933,12 +930,7 @@ mod tests {
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::ENOSYS) => {}
-            StepOutcome::Continue { .. }
-            | StepOutcome::Yield { .. }
-            | StepOutcome::Done(_)
-            | StepOutcome::Err(_) => {
-                panic!("expected v3 Err(ENOSYS), got {outcome:?}");
-            }
+            _ => panic!("expected v3 Err(ENOSYS), got {outcome:?}"),
         }
     }
 }

@@ -31,7 +31,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::process::adapter::step_engine::{
-    self, AtomicSlot, Cap, Dead, Entity, PayloadCap, SpinMutex, Weak, Zone, ZoneAllocated,
+    self, AtomicSlot, Cap, Dead, Entity, PayloadCap, PayloadPolicy, RawPort, RawQueue, SpinMutex,
+    Weak, Zone, ZoneAllocated,
 };
 use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
 
@@ -51,6 +52,17 @@ use crate::vm::AddressSpace;
 /// (`docs/design/04_process-signals/PROCESS_v1.md` §7.4); plan
 /// `docs/progress/plans/2026-05-06-fork-clone-wait4.md` Open Q #1.
 pub const EXIT_SOURCE_CHILD_ZOMBIFIED: u64 = 0x1;
+
+/// Event bit for `signal_port` (RawPort) fire.
+///
+/// Fired each time a catchable signal is delivered to this process.
+/// All bus subscribers (signalfd, future pidfd/timerfd) wake on this
+/// single bit; the subscribers then re-read their respective pending
+/// state to determine which signal(s) arrived. Single-bit design per
+/// `SIGNAL_ATTACHMENTS_v1` §2 (Carrier = RawPort, Polarity = fire).
+///
+/// See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-1`.
+pub const SIGNAL_GENERATED: u64 = 0x1;
 
 /// Per-process exit disposition, populated by `step_exit_group` /
 /// `step_exit_group_with_signal` / the last-thread cascade. Spec
@@ -632,6 +644,14 @@ impl ProcessIdentity {
                 // (`EXIT_SOURCE_CHILD_ZOMBIFIED` and future stop/cont
                 // bits land in both).
                 wait_routing::notify_v3_source(p.exit_wait_source(), mask.bits());
+                // Phase A (bus wire alignment): set the same mask on
+                // the RawQueue readiness wire so native bus subscribers
+                // (future signalfd, pidfd) wake without going through
+                // the legacy Channel. Level-triggered semantics
+                // (`set` is idempotent); consumers re-read the queue
+                // state via `subscribe` + `try_take_ready`.
+                // See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-2`.
+                p.exit_source_bus.fire(mask.bits());
                 released
             })
             .unwrap_or(0)
@@ -734,6 +754,22 @@ pub struct ProcessPayload {
     /// whose mask permits the signal will sweep it on its next
     /// delivery point.
     pub(crate) group_pending: PendingSignalQueue,
+    /// Per-process bus wire for signal-generated lifecycle events.
+    ///
+    /// `RawPort` (edge-triggered) per `SIGNAL_ATTACHMENTS_v1`:
+    /// fires `SIGNAL_GENERATED` each time a catchable signal is
+    /// delivered to this process. Native consumers (signalfd, pidfd,
+    /// future timerfd) subscribe here; the signal shim also consumes
+    /// this wire internally for handler-vs-default routing.
+    ///
+    /// Phase A (bus wire alignment): declared on ProcessPayload per
+    /// spec; fired in `step_kill_process` after thread-eligibility
+    /// post and signalfd notification. Signalfd migration from
+    /// private subscription table to bus-subscriber is TODO.
+    ///
+    /// See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-1`,
+    /// `docs/design/04_process-signals/SIGNAL_ATTACHMENTS_v1.md`.
+    pub(crate) signal_port: RawPort,
     /// Per-process credential **cap slot**. Mutated via
     /// `cred::step_setuid` / `cred::step_setgid` / ...; readers clone
     /// the cap via [`Self::cred_cap`] or snapshot the value via
@@ -890,6 +926,26 @@ pub struct ProcessPayload {
     /// last fire was already issued under the live-payload guard
     /// inside `fire_exit_source`.
     pub(crate) exit_wait_source: Arc<WaitSource>,
+    /// Bus-aligned readiness wire for process lifecycle events.
+    ///
+    /// `RawQueue` (level-triggered) per `SIGNAL_ATTACHMENTS_v1`:
+    /// sets bits for zombie-children (`EXIT_SOURCE_CHILD_ZOMBIFIED`),
+    /// future thread-stop events, and group-continue events. Native
+    /// consumers (future signalfd, pidfd) subscribe to this wire;
+    /// `wait4`/`waitid` consume the legacy `exit_source` Channel
+    /// until the Channel → RawQueue migration completes.
+    ///
+    /// Phase A: declared alongside the legacy `exit_source` Channel.
+    /// `fire_exit_source` sets bits on both mechanisms; native
+    /// subscribers poll this wire, while the wait4 path still drains
+    /// the Channel. Once all consumers migrate, the Channel is
+    /// removed.
+    ///
+    /// Event bits use the same constants as the Channel
+    /// (`EXIT_SOURCE_CHILD_ZOMBIFIED`).  See the top-level
+    /// constant doc for how the wait4 arm builds its `WaitToken`.
+    /// See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-2`.
+    pub(crate) exit_source_bus: RawQueue,
 }
 
 impl ProcessPayload {
@@ -1254,6 +1310,7 @@ unsafe impl ZoneAllocated for ProcessIdentity {
 }
 
 unsafe impl ZoneAllocated for ProcessPayload {
+    type Policy = PayloadPolicy<Self>;
     fn zone() -> &'static Zone<Self> {
         &PROCESS_PAYLOAD_ZONE
     }

@@ -13,9 +13,10 @@ use core::sync::atomic::Ordering;
 use crate::epoch::{self, Guard};
 
 use super::meta::{SlotState, RETAIN_SENTINEL_DEAD};
+use super::policy::IsPayloadPolicy;
 use super::registry::{self, SlotKey};
 use super::slot::{reclaim_slot, Slot};
-use super::Dead;
+use super::{Dead, ZoneAllocated};
 
 pub struct Cap<T: 'static> {
     /// Compact `zone_id + slot_id` encoding. `Cap` does not store generation
@@ -241,7 +242,17 @@ impl<T: 'static> Deref for Cap<T> {
 }
 
 impl<T: 'static> PayloadCap<T> {
-    pub fn from_cap(cap: Cap<T>) -> Self {
+    pub fn from_cap(cap: Cap<T>) -> Self
+    where
+        T: ZoneAllocated,
+        T::Policy: IsPayloadPolicy,
+    {
+        Self { inner: cap }
+    }
+
+    /// Unchecked constructor for tests and internal substrate code.
+    #[doc(hidden)]
+    pub fn from_cap_unchecked(cap: Cap<T>) -> Self {
         Self { inner: cap }
     }
 

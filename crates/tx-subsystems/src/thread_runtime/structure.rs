@@ -15,7 +15,7 @@ use crate::thread_runtime::adapter::reactor_entry::{
     TaskKey, UserspaceRunRequest, UserspaceRunSlot,
 };
 use crate::thread_runtime::adapter::step_engine::{
-    Dead, Entity, PayloadCap, SpinMutex, TaskMailbox, Weak, Zone, ZoneAllocated,
+    Dead, Entity, PayloadCap, PayloadPolicy, SpinMutex, TaskMailbox, Weak, Zone, ZoneAllocated,
 };
 
 use crate::process::ProcessIdentity;
@@ -180,6 +180,29 @@ pub struct ThreadPayload {
     /// `Arc`-managed at the substrate layer; the eventual zone
     /// migration (PR-3D+) flips this to `zone::Weak<TaskMailbox>`.
     pub(crate) mailbox: SpinMutex<Option<ArcWeak<TaskMailbox>>>,
+    /// Thread stop flag.  Set by `route_gewalt(SIGSTOP)` /
+    /// `DefaultStop` AST materialisation; cleared by
+    /// `route_gewalt(SIGCONT)`.  When `true`, the thread must not
+    /// enter userspace — it is parked until `stopped` becomes
+    /// `false`.
+    ///
+    /// Per POSIX, SIGSTOP/SIGTSTP (default Stop disposition) puts
+    /// the thread in the `TASK_STOPPED` state.  A subsequent
+    /// SIGCONT resumes it.  This flag bridges the entry-side AST
+    /// checkpoint in `thread_future`: before entering userspace,
+    /// the thread checks `stopped` and yields if set.
+    ///
+    /// Phase E (first pass): busy-wait placeholder.  The thread
+    /// future spins on `stopped` until cleared.  TODO: replace with
+    /// a wait-source parked by the reactor, woken by SIGCONT's
+    /// `route_gewalt` clearing the flag + posting to the thread's
+    /// mailbox.
+    ///
+    /// Atomic because `route_gewalt` sets/clears it under the
+    /// thread-list lock, and the AST checkpoint reads it from the
+    /// thread future without acquiring the payload lock.
+    /// See: `txdoc:SIGNAL-V1-S12-3-ROUTE-GEWALT-STOP`.
+    pub(crate) stopped: core::sync::atomic::AtomicBool,
 }
 
 impl ThreadPayload {
@@ -196,6 +219,7 @@ impl ThreadPayload {
             saved_user_context: SpinMutex::new(None),
             pending_syscall_return: SpinMutex::new(None),
             mailbox: SpinMutex::new(None),
+            stopped: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -269,6 +293,20 @@ impl ThreadPayload {
     /// Read the current signal mask.
     pub fn signal_mask(&self) -> SignalMask {
         SignalMask::new(self.signal_mask.load(Ordering::Acquire))
+    }
+
+    /// Whether this thread is stopped (SIGSTOP / default-Stop
+    /// disposition). The AST checkpoint in thread_future uses this
+    /// to decide whether to enter userspace.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Set or clear the stopped flag. Used by
+    /// `route_gewalt(SIGSTOP)` (set) and `route_gewalt(SIGCONT)`
+    /// (clear).
+    pub(crate) fn set_stopped(&self, val: bool) {
+        self.stopped.store(val, core::sync::atomic::Ordering::Release);
     }
 
     /// Borrow the per-thread pending-signal queue.
@@ -413,6 +451,7 @@ unsafe impl ZoneAllocated for ThreadIdentity {
 }
 
 unsafe impl ZoneAllocated for ThreadPayload {
+    type Policy = PayloadPolicy<Self>;
     fn zone() -> &'static Zone<Self> {
         &THREAD_PAYLOAD_ZONE
     }

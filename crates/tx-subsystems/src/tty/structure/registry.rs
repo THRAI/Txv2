@@ -5,7 +5,7 @@
 //! can succeed.
 
 use crate::tty::adapter::step_engine::{
-    register_zone_for, Cap, SpinMutex, Zone, ZoneAllocated, ZoneError,
+    register_zone_for, Cap, PayloadPolicy, SpinMutex, Zone, ZoneAllocated, ZoneError,
 };
 use crate::tty::structure::identity::FixedName;
 
@@ -168,6 +168,7 @@ unsafe impl ZoneAllocated for TtyIdentity {
 
 // SAFETY: same guarantee for `TtyPayload`.
 unsafe impl ZoneAllocated for TtyPayload {
+    type Policy = PayloadPolicy<Self>;
     fn zone() -> &'static Zone<Self> {
         &TTY_PAYLOAD_ZONE
     }

@@ -24,5 +24,12 @@ pub mod step_engine {
         CredentialView, NoProgress, RestrictionStackHandle, ScriptCtx, StepOp, StepOutcome,
         SubjectIdentity,
     };
-    pub use tx_substrate::zone::{sign, Cap, Zone, ZoneAllocated, ZoneError};
+    pub use tx_substrate::zone::{
+        sign, sign_for, reserve_for, register_zone_for,
+        Cap, PayloadCap, Weak, IdentRef,
+        Dead, ZoneError,
+        Entity, CoLocatedEntity, OperationalCapExt, OperationalRefExt, PayloadBinding,
+        Zone, ZoneAllocated,
+        IdentitySlot, IsPayloadPolicy, CapProducingPolicy, ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy, ZonePolicy,
+    };
 }
