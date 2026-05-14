@@ -361,13 +361,14 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     } else {
         DriveMode::Waiting
     };
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let mut op = OpenFileWriteOp {
         file: &file,
         bytes: &bytes,
         guard: &guard,
         cursor: 0,
     };
-    match drive(op, &mut script_ctx, mode, None, None, None).await {
+    match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), None, None).await {
         Ok(total) => SyscallResult::Return(total as i64),
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();

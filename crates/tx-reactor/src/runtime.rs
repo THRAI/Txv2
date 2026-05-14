@@ -9,6 +9,8 @@ use core::{
 use crate::adapter::bus_wire::{
     DeclaredPort, DeclaredQueue, WireDeclaration, WireDeclarationError, WireEventSet,
 };
+use tx_substrate::wake::mailbox::TaskMailbox;
+
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect},
     dispatch::{DispatchState, NoopRescheduleSignal, RescheduleSignal, WakeDispatchReport},
@@ -492,6 +494,11 @@ impl Reactor {
 
     pub fn last_stop_reason(&self, task: TaskId) -> Option<StopReason> {
         self.tasks.last_stop_reason_by_id(task)
+    }
+
+    /// Returns the task's `TaskMailbox` for yield resolution (drive-taskmb).
+    pub fn task_mailbox(&self, task: TaskKey) -> Result<Arc<TaskMailbox>, TaskLifecycleError> {
+        self.tasks.mailbox(task)
     }
 
     pub fn next_scheduled_task(&mut self, hart: HartId) -> Option<(TaskHandle, SliceConfig)> {
