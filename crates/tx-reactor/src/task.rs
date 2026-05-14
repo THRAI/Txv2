@@ -3,6 +3,8 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{future::Future, pin::Pin, task::Waker};
 
+use tx_substrate::wake::mailbox::TaskMailbox;
+
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect, AstSlot},
     scheduler::StopReason,
@@ -93,6 +95,9 @@ pub(crate) struct Task {
     pub(crate) status: TaskStatus,
     pub(crate) wake_state: Arc<TaskWakeState>,
     pub(crate) ast: AstSlot,
+    /// Per-task wake delivery queue for yield resolution.
+    /// Owned by the reactor task; borrowed by `drive()` via `ScriptCtx`.
+    pub(crate) mailbox: Arc<TaskMailbox>,
     last_ast_batch: AstBatch,
     pub(crate) last_stop_reason: Option<StopReason>,
 }
@@ -109,6 +114,7 @@ impl Task {
             status: TaskStatus::Runnable,
             wake_state: Arc::new(TaskWakeState::new()),
             ast: AstSlot::new(),
+            mailbox: Arc::new(TaskMailbox::new()),
             last_ast_batch: AstBatch::default(),
             last_stop_reason: None,
         }
@@ -182,6 +188,12 @@ impl TaskTable {
     pub fn waker(&self, handle: TaskKey) -> Result<Waker, TaskLifecycleError> {
         let task = self.live_nonterminal_task(handle)?;
         Ok(task_waker(Arc::clone(&task.wake_state)))
+    }
+
+    /// Returns a clone of the task's `TaskMailbox` for yield resolution (drive-taskmb).
+    pub fn mailbox(&self, handle: TaskKey) -> Result<Arc<TaskMailbox>, TaskLifecycleError> {
+        let task = self.live_nonterminal_task(handle)?;
+        Ok(Arc::clone(&task.mailbox))
     }
 
     pub fn queue_ast_marker(

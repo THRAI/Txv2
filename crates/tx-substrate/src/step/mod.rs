@@ -340,7 +340,8 @@ pub use binding_obligations::BindingObligation;
 //
 // See `docs/progress/decisions/2026-05-13-d17-obs3b-resume-emission.md` §5.
 
-use crate::wake::mailbox::WaitGeneration;
+use crate::wake::mailbox::{TaskMailbox, WaitGeneration};
+use alloc::sync::Arc;
 
 /// Discriminant encoding why a yield resolved.
 ///
@@ -523,6 +524,9 @@ impl DriveMode {
 pub struct ScriptCtx<I: SubjectIdentity = ProcessIdentity> {
     subject: Option<SubjectContext<I>>,
     deadline: Option<Deadline>,
+    /// Per-task wake delivery queue for yield resolution.
+    /// Owned by the reactor task; `drive()` borrows it to park.
+    mailbox: Option<Arc<TaskMailbox>>,
 }
 
 impl<I: SubjectIdentity> ScriptCtx<I> {
@@ -532,6 +536,7 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
         Self {
             subject: None,
             deadline: None,
+            mailbox: None,
         }
     }
 
@@ -547,6 +552,12 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
         self
     }
 
+    /// Populate the task mailbox for yield resolution (drive-taskmb).
+    pub fn with_mailbox(mut self, mailbox: Arc<TaskMailbox>) -> Self {
+        self.mailbox = Some(mailbox);
+        self
+    }
+
     /// Subject context if populated; `None` for placeholder/test
     /// contexts.
     pub fn subject(&self) -> Option<&SubjectContext<I>> {
@@ -556,6 +567,12 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
     /// Script-level deadline if populated.
     pub fn deadline(&self) -> Option<Deadline> {
         self.deadline
+    }
+
+    /// Task mailbox if populated; `None` for test/placeholder contexts
+    /// or before reactor integration.
+    pub fn mailbox(&self) -> Option<&Arc<TaskMailbox>> {
+        self.mailbox.as_ref()
     }
 
     /// Low 32 bits of the subject's task trace identity.
