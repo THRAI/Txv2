@@ -465,9 +465,44 @@ impl FsOps for DevptsInstance {
         StepOutcome::err(Errno::ENOENT.into())
     }
 
-    // `read_link`, `materialise_rnode`, `step_chmod`, `step_chown`:
-    // devpts does not override these. The v3 trait defaults return
-    // `ENOSYS`, so leave them unimplemented here.
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>, NoProgress> {
+        if fs_object_id == DEVPTS_PTMX_OBJECT_ID {
+            // Opening /dev/ptmx creates a fresh pty pair.  The
+            // master side is materialised as an RNode backed by
+            // the master TtyIdentity; the slave is registered in
+            // the pty-slave table so subsequent lookups under
+            // /dev/pts/<N> can resolve it.
+            let outcome = match execution::step_openpty(guard) {
+                StepOutcome::Done(o) => o,
+                StepOutcome::Err(e) => return StepOutcome::err(e),
+                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                    return StepOutcome::err(Errno::EIO.into());
+                }
+            };
+            match RNode::new_cap(
+                fs_object_id,
+                meta,
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::Tty(outcome.master),
+                },
+            ) {
+                Ok(rnode) => StepOutcome::done(rnode),
+                Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
+            }
+        } else if let Some(index) = pty_index_from_devpts_object_id(fs_object_id) {
+            devpts_rnode_by_index(index, guard)
+        } else {
+            StepOutcome::err(Errno::ENOSYS.into())
+        }
+    }
+
+    // `read_link`, `step_chmod`, `step_chown`: devpts does not
+    // override these. The v3 trait defaults return `ENOSYS`.
 }
 
 impl FsPageBacking for DevptsInstance {
