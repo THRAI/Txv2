@@ -6,41 +6,42 @@
 //! into a typed witness consumed by a VFS step's upgrade sub-phase.
 //!
 //! Each function:
-//! 1. Calls the walker to resolve the path into a terminal `Cap<DEntry>`.
+//! 1. Calls the resolution driver to resolve the path with the
+//!    appropriate `WalkMode`.
 //! 2. Validates the result shape (directory, entity, parent+name).
-//! 3. Constructs an `IdentRef`-carrying witness from the resolved caps
-//!    under the caller's epoch guard.
+//! 3. Constructs an `IdentRef`-carrying witness from the resolved
+//!    `PathResolution` via the terminal witness builders.
 //!
 //! The returned witnesses carry EBR-scoped observations; the consuming
 //! step promotes them to `Cap<T>` during STEP-4 phase 2.
 
 use crate::execution::{Errno, Guard};
-use crate::vfs::adapter::step_engine::{Cap, NoProgress, StepOutcome};
+use crate::vfs::adapter::step_engine::Cap;
 
 use super::checks::{DirectoryAtPath, EntityAtPath, ParentAndName};
-use super::structure::{Credential, DEntry, InlineName, InodeKind, RNode, VfsName};
-use super::walker::{step_walk, SYMLOOP_MAX};
+use super::resolution::driver;
+use super::resolution::state::WalkMode;
+use super::resolution::terminal;
+use super::resolution::PathResolution;
+use super::structure::{Credential, DEntry, InlineName, InodeKind, VfsName};
+use super::walker::SYMLOOP_MAX;
 
 /// Resolve `path` relative to `rooted_at` and return a terminal
 /// entity witness.
 ///
-/// The walker resolves the full path (following symlinks up to
-/// `SYMLOOP_MAX` hops) and checks DAC traverse permission at each
-/// intermediate directory.  On success the returned `EntityAtPath`
-/// carries `IdentRef` handles valid for the duration of `guard`.
+/// Uses `WalkMode::Entity` — the walker resolves the full path
+/// (following symlinks up to `SYMLOOP_MAX` hops) and checks DAC
+/// traverse permission at each intermediate directory.  On success
+/// the returned `EntityAtPath` carries `IdentRef` handles valid for
+/// the duration of `guard`.
 pub fn require_entity<'g>(
     rooted_at: Cap<DEntry>,
     path: &[u8],
     cred: &Credential,
     guard: &'g Guard<'_>,
 ) -> Result<EntityAtPath<'g>, Errno> {
-    let dentry = match step_walk(rooted_at, path, cred, guard) {
-        StepOutcome::Done(d) => d,
-        StepOutcome::Err(e) => return Err(Errno::from(e)),
-        _ => return Err(Errno::EIO),
-    };
-    let rnode = dentry.rnode();
-    Ok(EntityAtPath::from_caps(&dentry, &rnode, guard))
+    let resolved = driver::walk_to_completion(rooted_at, path, WalkMode::Entity, cred, guard)?;
+    terminal::build_entity_witness(&resolved, guard)
 }
 
 /// Resolve `path` to a directory witness.
@@ -54,16 +55,8 @@ pub fn require_directory<'g>(
     cred: &Credential,
     guard: &'g Guard<'_>,
 ) -> Result<DirectoryAtPath<'g>, Errno> {
-    let dentry = match step_walk(rooted_at, path, cred, guard) {
-        StepOutcome::Done(d) => d,
-        StepOutcome::Err(e) => return Err(Errno::from(e)),
-        _ => return Err(Errno::EIO),
-    };
-    let rnode = dentry.rnode();
-    if rnode.meta().kind() != InodeKind::Directory {
-        return Err(Errno::ENOTDIR);
-    }
-    Ok(DirectoryAtPath::from_caps(&dentry, &rnode, guard))
+    let resolved = driver::walk_to_completion(rooted_at, path, WalkMode::Entity, cred, guard)?;
+    terminal::build_directory_witness(&resolved, guard)
 }
 
 /// Walk to the parent of the final component and return a
@@ -85,10 +78,10 @@ pub fn require_parent_and_name<'g>(
     // Strip trailing slashes.
     let path = strip_trailing_slashes(path);
 
-    // Split into (parent_path, final_component).
-    let (parent_path, name_bytes) = match path.rsplitn(2, |&b| b == b'/').next() {
-        Some(b"") | None => {
-            // No separators, or the path IS "/" — parent is rooted_at.
+    // Find the last separator.
+    let (parent_path, name_bytes) = match path.iter().rposition(|&b| b == b'/') {
+        None => {
+            // No separators — parent is rooted_at.
             let name = if path.is_empty() || path == b"/" {
                 return Err(Errno::EINVAL);
             } else {
@@ -97,29 +90,33 @@ pub fn require_parent_and_name<'g>(
             let name = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
             return Ok(ParentAndName::from_cap(&rooted_at, name, guard));
         }
-        Some(name_bytes) => {
-            // Find the split point. rsplitn gives us the last segment.
-            // We need to manually split.
-            let last_slash = path.iter().rposition(|&b| b == b'/').unwrap();
-            let parent_bytes = &path[..last_slash];
-            let name_bytes = &path[last_slash + 1..];
-            (parent_bytes, name_bytes)
-        }
+        Some(pos) => (&path[..pos], &path[pos + 1..]),
     };
 
     let name = InlineName::new(name_bytes).map_err(|_| Errno::ENAMETOOLONG)?;
 
-    let parent_dentry = if parent_path.is_empty() {
-        rooted_at
-    } else {
-        match step_walk(rooted_at, parent_path, cred, guard) {
-            StepOutcome::Done(d) => d,
-            StepOutcome::Err(e) => return Err(Errno::from(e)),
-            _ => return Err(Errno::EIO),
+    let resolved = if parent_path.is_empty() {
+        // path starts with "/" — parent is the namespace root.
+        let rnode = rooted_at.rnode().clone();
+        let meta = rnode.meta();
+        let fs_object_id = rnode.fs_object_id();
+        PathResolution {
+            dentry: rooted_at,
+            rnode,
+            fs_object_id,
+            meta,
         }
+    } else {
+        driver::walk_to_completion(
+            rooted_at,
+            parent_path,
+            WalkMode::ParentAndName,
+            cred,
+            guard,
+        )?
     };
 
-    Ok(ParentAndName::from_cap(&parent_dentry, name, guard))
+    terminal::build_parent_and_name_witness(&resolved, name, guard)
 }
 
 /// Strip trailing `/` bytes from a path slice.
