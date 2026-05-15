@@ -11,6 +11,8 @@ use tx_reactor::{
     HartId, InitialSchedMeta, Phase1Scheduler, Reactor, RescheduleSignal, RunStats, SharedReactor,
     SliceConfig, StopReason, TaskHandle, TaskId, TaskStatus, WakeDispatchReport, WakeHint,
 };
+use tx_substrate::step::{InterestMask, WaitSourceId};
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox, WaitGeneration};
 
 static PENDING_POLLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -924,4 +926,77 @@ fn next_deadline_ns_reports_earliest_and_clears_after_resolution() {
     assert_eq!(reactor.run_until_idle().completed, 1);
     assert_eq!(reactor.task_status(first_task), Some(TaskStatus::Completed));
     assert_eq!(reactor.next_deadline_ns(), None);
+}
+
+// ---------------------------------------------------------------------------
+// drive-taskmb: reactor wake path via TaskMailbox
+// ---------------------------------------------------------------------------
+
+/// A future that parks on a [`TaskMailbox`] using the reactor's waker.
+/// On first poll it registers the reactor's waker with the mailbox,
+/// drains any pre-queued events, and returns `Pending` if none match.
+/// On subsequent polls it drains the queue and completes when a
+/// matching event arrives.
+struct MailboxParkFuture {
+    mailbox: Arc<TaskMailbox>,
+    polls: Arc<AtomicUsize>,
+    completed: Arc<AtomicUsize>,
+}
+
+impl Future for MailboxParkFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        self.mailbox.register_waker(cx.waker().clone());
+
+        while let Some(event) = self.mailbox.poll() {
+            if matches!(event, MailboxEvent::SourceFired { .. }) {
+                self.completed.fetch_add(1, Ordering::SeqCst);
+                return Poll::Ready(());
+            }
+        }
+        Poll::Pending
+    }
+}
+
+/// Verify that posting a [`MailboxEvent`] to a [`TaskMailbox`] that
+/// a parked reactor task is waiting on wakes the task through the
+/// reactor's task-waker mechanism and the task drains the event on
+/// re-poll.
+#[test]
+fn mailbox_post_wakes_parked_reactor_task() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    let mailbox = Arc::new(TaskMailbox::new());
+
+    let mut reactor = Reactor::new();
+    reactor.submit(MailboxParkFuture {
+        mailbox: Arc::clone(&mailbox),
+        polls: Arc::clone(&polls),
+        completed: Arc::clone(&completed),
+    });
+
+    // First poll: task registers waker, polls empty queue, returns Pending.
+    let stats = reactor.run_until_idle();
+    assert_eq!(stats.polled, 1);
+    assert_eq!(stats.completed, 0);
+    assert!(reactor.is_idle());
+
+    // Post an event — should wake the parked task via the stored waker.
+    let posted = mailbox.post(MailboxEvent::SourceFired {
+        generation: WaitGeneration::new(1),
+        source: WaitSourceId::new(1),
+        interests: InterestMask::new(0b1),
+    });
+    assert!(posted);
+
+    // Second poll: reactor wakes task, drains the posted event, completes.
+    let stats = reactor.run_until_idle();
+    assert_eq!(stats.polled, 1);
+    assert_eq!(stats.completed, 1);
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+    assert!(reactor.is_idle());
 }

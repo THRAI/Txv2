@@ -388,11 +388,16 @@ pub async fn run_thread<P: TxPlatform>(
                     // Process zombified concurrently; stop.
                     return;
                 };
-                let ctx = tx_shims::linux_syscall::SyscallCtx::new(
+                let mut ctx = tx_shims::linux_syscall::SyscallCtx::new(
                     process.clone(),
                     thread.clone(),
                     aspace,
                 );
+                // drive-taskmb: inject the current task's mailbox so
+                // drive() can park on it for yield resolution.
+                if let Some(mailbox) = tx_reactor::current_task_mailbox() {
+                    ctx = ctx.with_mailbox(mailbox);
+                }
                 let result = tx_shims::linux_syscall::dispatch::<P>(req, &ctx).await;
 
                 match result {

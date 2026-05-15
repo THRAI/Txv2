@@ -9,6 +9,8 @@ use core::{
 use crate::adapter::bus_wire::{
     DeclaredPort, DeclaredQueue, WireDeclaration, WireDeclarationError, WireEventSet,
 };
+use tx_substrate::wake::mailbox::TaskMailbox;
+
 use crate::{
     ast::{AstBatch, AstMarker, AstQueueEffect},
     dispatch::{DispatchState, NoopRescheduleSignal, RescheduleSignal, WakeDispatchReport},
@@ -405,12 +407,20 @@ impl Reactor {
                 task.wake_state.clear();
                 task.consume_ast_markers();
 
+                // drive-taskmb: expose the task's mailbox so the trampoline
+                // can inject it into SyscallCtx (and from there into ScriptCtx
+                // for drive() yield resolution).
+                crate::task::set_current_mailbox(Some(Arc::clone(&task.mailbox)));
+
                 let Some(future) = task.future.as_mut() else {
+                    crate::task::set_current_mailbox(None);
                     continue;
                 };
 
                 stats.polled += 1;
-                future.as_mut().poll(&mut cx)
+                let result = future.as_mut().poll(&mut cx);
+                crate::task::set_current_mailbox(None);
+                result
             };
 
             match poll {
@@ -492,6 +502,11 @@ impl Reactor {
 
     pub fn last_stop_reason(&self, task: TaskId) -> Option<StopReason> {
         self.tasks.last_stop_reason_by_id(task)
+    }
+
+    /// Returns the task's `TaskMailbox` for yield resolution (drive-taskmb).
+    pub fn task_mailbox(&self, task: TaskKey) -> Result<Arc<TaskMailbox>, TaskLifecycleError> {
+        self.tasks.mailbox(task)
     }
 
     pub fn next_scheduled_task(&mut self, hart: HartId) -> Option<(TaskHandle, SliceConfig)> {
