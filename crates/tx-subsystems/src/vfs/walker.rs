@@ -150,17 +150,19 @@ pub fn step_walk<'g>(
     cred: &Credential,
     guard: &Guard<'g>,
 ) -> StepOutcome<Cap<DEntry>, NoProgress> {
-    // observe
-    // upgrade
-    // reserve
-    // commit
-    // publish
-    // observe — guard + cred supplied by caller; DAC checks in walk_inner_v3
-    // upgrade — N/A: no IdentRef→Cap needed (guard-scoped lookup)
-    // reserve — N/A: read-only path resolution
-    // commit — N/A: no mutations
-    // publish — N/A: no signal attachments
-    walk_inner_v3(rooted_at, path, cred, guard)
+    // Delegated to the resolution state-machine driver.
+    // When the driver encounters a yield, it returns EAGAIN;
+    // synchronous callers see the yield as an error.
+    match crate::vfs::resolution::driver::walk_to_completion(
+        rooted_at,
+        path,
+        crate::vfs::resolution::state::WalkMode::Entity,
+        cred,
+        guard,
+    ) {
+        Ok(resolved) => StepOutcome::done(resolved.dentry),
+        Err(e) => StepOutcome::err(e.into()),
+    }
 }
 
 /// Open a path by name. Composes [`step_walk`] with
@@ -218,275 +220,14 @@ pub fn step_open<'g>(
     }
 }
 
-/// Synchronous core of [`step_walk`].
+/// Synchronous core of [`step_walk`], now delegated to the
+/// resolution state machine (`kernel_step` + driver loop).
 ///
-/// The walker takes a single `&Guard<'_>` borrowed from the caller's
-/// frame; it is not held across an `.await` because the walker itself
-/// never awaits today. When ext4 / page-cache backends grow real
-/// waits, each backend call site will take a fresh per-call guard
-/// inside the `await_*` helper, matching `vm::execution::fault_script`.
-///
-/// All FS calls go through the `FsOps` trait surface
-/// (`Arc<dyn FsOps>`); every `StepOutcome::*` / `Errno::*` is the v3
-/// variant. Mount-crossing rebuilds the v3 fs_ops from the new
-/// mount-root dentry's containing-payload — see `fs_ops_for`.
-fn walk_inner_v3<'g>(
-    rooted_at: Cap<DEntry>,
-    path: &[u8],
-    cred: &Credential,
-    guard: &Guard<'g>,
-) -> StepOutcome<Cap<DEntry>, NoProgress> {
-    use StepOutcome as V3;
-
-    let mount_root = mount_root_dentry(&rooted_at);
-
-    let (mut current, mut remaining): (Cap<DEntry>, Vec<u8>) = if path.first() == Some(&b'/') {
-        (mount_root.clone(), path[1..].to_vec())
-    } else {
-        (rooted_at.clone(), path.to_vec())
-    };
-
-    let must_be_directory = remaining.last().copied() == Some(b'/');
-
-    let mut current_fs_ops: Option<Arc<dyn FsOps>> =
-        fs_ops_for(&current, guard).or_else(|| fs_ops_for(&mount_root, guard));
-    let mut current_mount_payload: Option<Cap<MountPayload>> =
-        mount_payload_for(&current, guard).or_else(|| mount_payload_for(&mount_root, guard));
-
-    let mut hop_count: u32 = 0;
-
-    loop {
-        // Collapse leading `///` runs.
-        while remaining.first() == Some(&b'/') {
-            remaining.remove(0);
-        }
-
-        if remaining.is_empty() {
-            // End of input: enforce the trailing-`/` directory rule.
-            if must_be_directory && current.rnode().meta().kind() != InodeKind::Directory {
-                return V3::err(step_engine::Errno::ENOTDIR);
-            }
-            return V3::done(current);
-        }
-
-        // Extract the next component.
-        let next_slash = remaining
-            .iter()
-            .position(|b| *b == b'/')
-            .unwrap_or(remaining.len());
-        let component: Vec<u8> = remaining.drain(..next_slash).collect();
-        if remaining.first() == Some(&b'/') {
-            remaining.remove(0);
-        }
-
-        // `.` and `..`.
-        if component == b"." {
-            continue;
-        }
-        if component == b".." {
-            if let Some(parent_cap) = current.parent_hint() {
-                if !is_same_dentry(&current, &mount_root) {
-                    current = parent_cap;
-                    current_fs_ops = fs_ops_for(&current, guard);
-                    current_mount_payload = mount_payload_for(&current, guard);
-                }
-            }
-            continue;
-        }
-
-        // Interior components require the current to be a directory.
-        if current.rnode().meta().kind() != InodeKind::Directory {
-            return V3::err(step_engine::Errno::ENOTDIR);
-        }
-
-        // POSIX search permission.
-        let parent_meta = current.rnode().meta();
-        if let Err(err) = predicates::check_descend_perm(&parent_meta, cred) {
-            return V3::err(err.into());
-        }
-
-        let parent_fs_object_id = current.rnode().fs_object_id();
-        let fs_ops = match &current_fs_ops {
-            Some(ops) => ops.clone(),
-            None => return V3::err(step_engine::Errno::ENODEV),
-        };
-        let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
-            V3::Done(id) => id,
-            V3::Continue { .. } => continue,
-            V3::Yield { progress, shape } => return V3::Yield { progress, shape },
-            V3::Err(err) => return V3::err(err),
-        };
-
-        let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
-            V3::Done(m) => m,
-            V3::Continue { .. } => continue,
-            V3::Yield { progress, shape } => return V3::Yield { progress, shape },
-            V3::Err(err) => return V3::err(err),
-        };
-
-        // Mid-path non-directory check.
-        if child_meta.kind() != InodeKind::Directory
-            && child_meta.kind() != InodeKind::Symlink
-            && (!remaining.is_empty() || must_be_directory)
-        {
-            return V3::err(step_engine::Errno::ENOTDIR);
-        }
-
-        let child_rnode_cap = match materialise_child_rnode_v3(
-            &fs_ops,
-            child_fs_object_id,
-            child_meta,
-            current_mount_payload.as_ref(),
-            guard,
-        ) {
-            V3::Done(rnode) => rnode,
-            V3::Continue { .. } => continue,
-            V3::Yield { progress, shape } => return V3::Yield { progress, shape },
-            V3::Err(err) => return V3::err(err),
-        };
-
-        let child_inline = match InlineName::new(&component) {
-            Ok(n) => n,
-            Err(err) => return V3::err(err.into()),
-        };
-        let mut child_dentry_raw = DEntry::new(child_inline, child_rnode_cap.clone());
-        child_dentry_raw.set_parent_hint(&current);
-        let child_dentry = match step_engine::sign(child_dentry_raw) {
-            Ok(cap) => cap,
-            Err(_) => return V3::err(step_engine::Errno::ENOMEM),
-        };
-
-        // === Symlink chasing ============================================
-        if let RNodeBacking::Symlink { target } = child_rnode_cap.backing() {
-            hop_count += 1;
-            if hop_count > SYMLOOP_MAX {
-                return V3::err(step_engine::Errno::ELOOP);
-            }
-            let target_bytes = target.clone();
-            if target_bytes.first() == Some(&b'/') {
-                current = mount_root.clone();
-                current_fs_ops = fs_ops_for(&current, guard);
-                current_mount_payload = mount_payload_for(&current, guard);
-                let mut new_remaining =
-                    Vec::with_capacity(target_bytes.len() + remaining.len() + 1);
-                new_remaining.extend_from_slice(&target_bytes[1..]);
-                if !remaining.is_empty() {
-                    new_remaining.push(b'/');
-                    new_remaining.extend_from_slice(&remaining);
-                }
-                remaining = new_remaining;
-            } else {
-                let mut new_remaining =
-                    Vec::with_capacity(target_bytes.len() + remaining.len() + 1);
-                new_remaining.extend_from_slice(&target_bytes);
-                if !remaining.is_empty() {
-                    new_remaining.push(b'/');
-                    new_remaining.extend_from_slice(&remaining);
-                }
-                remaining = new_remaining;
-            }
-            continue;
-        }
-
-        // === Mount-point crossing =====================================
-        //
-        // Two paths converge here:
-        //
-        // 1. The freshly-built `child_dentry`'s `mounted_hint` is set
-        //    (set explicitly by callers that supply a pre-cached
-        //    mount-point dentry — see `DEntry::set_mounted_hint`).
-        // 2. The kernel's mount table (`mount::register_mount`) has an
-        //    entry for `(parent_mount_payload, child_fs_object_id)`.
-        //    This is the production path: init.rs's
-        //    `mount_devfs_at_dev` registers the entry when devfs is
-        //    published at `/dev`, and the walker looks it up here.
-        //
-        // The two paths produce the same downstream state: a fresh
-        // DEntry over the mount's root rnode, with `current_fs_ops`
-        // switched to the new mount's `payload.fs_ops`.
-        let crossing_mount = child_dentry.mounted_hint().and_then(|w| w.upgrade(guard));
-        let crossing_mount = match crossing_mount {
-            Some(m) => Some(m),
-            None => current_mount_payload
-                .as_ref()
-                .and_then(|payload| mount::mount_for(payload, child_fs_object_id)),
-        };
-        if let Some(mount_cap) = crossing_mount {
-            current = match dentry_for_mount_root(&mount_cap, Some(&child_dentry)) {
-                Ok(d) => d,
-                Err(err) => return V3::err(err.into()),
-            };
-            // `fs_ops_for` reads `payload.fs_ops()` directly via
-            // the new mount-root dentry's `containing_mount_weak`.
-            current_fs_ops = fs_ops_for(&current, guard);
-            current_mount_payload = mount_payload_for(&current, guard);
-            continue;
-        }
-
-        // === Plain advance ==============================================
-        current = child_dentry;
-    }
-}
-
-/// Materialise an `RNode` for a freshly-resolved child inode using
-/// `FsOps`.
-///
-/// - `Directory` → `RNodeBacking::Directory`.
-/// - `Symlink` → call `FsOps::read_link` and wrap the bytes in
-///   `RNodeBacking::Symlink { target }`.
-/// - Other kinds (Regular / CharDevice / BlockDevice / Fifo / Socket)
-///   delegate to the FS's `materialise_rnode` hook; default impl
-///   returns `ENOSYS` for backends that don't yet support the kind.
-fn materialise_child_rnode_v3<'g>(
-    fs_ops: &Arc<dyn FsOps>,
-    child_fs_object_id: FsObjectId,
-    meta: InodeMeta,
-    mount_payload: Option<&Cap<MountPayload>>,
-    guard: &Guard<'g>,
-) -> StepOutcome<Cap<RNode>, NoProgress> {
-    use StepOutcome as V3;
-
-    match meta.kind() {
-        InodeKind::Directory => {
-            let result = if let Some(mp) = mount_payload {
-                RNode::new_cap_in_mount(child_fs_object_id, meta, RNodeBacking::Directory, mp)
-            } else {
-                RNode::new_cap(child_fs_object_id, meta, RNodeBacking::Directory)
-            };
-            match result {
-                Ok(rnode) => V3::done(rnode),
-                Err(_) => V3::err(step_engine::Errno::ENOMEM),
-            }
-        }
-        InodeKind::Symlink => {
-            let target_bytes = match fs_ops.read_link(child_fs_object_id, guard) {
-                V3::Done(b) => b,
-                V3::Continue { .. } => {
-                    // A well-behaved v3 backend never returns Continue
-                    // for read_link (NoProgress identity). Defensively
-                    // surface as ENOSYS — the caller will see the
-                    // symlink is unresolvable.
-                    return V3::err(step_engine::Errno::ENOSYS);
-                }
-                V3::Yield { progress, shape } => return V3::Yield { progress, shape },
-                V3::Err(err) => return V3::err(err),
-            };
-            match RNode::new_cap(
-                child_fs_object_id,
-                meta,
-                RNodeBacking::Symlink {
-                    target: target_bytes,
-                },
-            ) {
-                Ok(rnode) => V3::done(rnode),
-                Err(_) => V3::err(step_engine::Errno::ENOMEM),
-            }
-        }
-        // Regular / CharDevice / BlockDevice / Fifo / Socket — delegate
-        // to the FS's v3 `materialise_rnode` hook.
-        _ => fs_ops.materialise_rnode(child_fs_object_id, meta, guard),
-    }
-}
+/// The old `walk_inner_v3` loop has been lifted into
+/// `resolution::step::kernel_step` and `resolution::driver`.
+/// This function remains as the synchronous shell; callers that
+/// need yield/resume use `resolution::driver::run_walker` /
+/// `resume_walker` directly.
 
 /// Resolve the `Arc<dyn FsOps>` in scope for a given dentry by
 /// upgrading its RNode's containing-mount weak and reading
