@@ -1,6 +1,7 @@
 //! Content renderers for procfs pseudo-files.
 
 use alloc::string::String;
+use tx_subsystems::mount;
 use tx_subsystems::process::{self, Pid};
 use crate::procfs::{
     pid_from_cmdline_id, pid_from_maps_id, pid_from_stat_id, PROCFS_CPUINFO_ID,
