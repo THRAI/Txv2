@@ -132,13 +132,13 @@ pub struct AccessOp<'a> {
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for AccessOp<'a> {
-    type Output = ();
+    type Output = InodeMeta;
     type Progress = NoProgress;
 
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<InodeMeta, NoProgress> {
         let rooted_at = self.rooted_at.clone();
         match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
-            StepOutcome::Done(_d) => StepOutcome::done(()),
+            StepOutcome::Done(d) => StepOutcome::done(d.rnode().meta()),
             StepOutcome::Err(e) => StepOutcome::err(e),
             _ => StepOutcome::err(step_engine::Errno::EIO),
         }
@@ -569,17 +569,20 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LstatOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<InodeMeta, NoProgress> {
-        // v1: same as StatOp — the synchronous walker always follows
-        // symlinks.  When the state-machine walker supports
-        // FinalSymlinkPolicy::NoFollow, this will diverge.
         let target = match self.target.take() {
             Some(d) => d,
             None => {
                 let rooted_at = self.rooted_at.clone();
-                let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
-                    StepOutcome::Done(d) => d,
-                    StepOutcome::Err(e) => return StepOutcome::err(e),
-                    _ => return StepOutcome::err(step_engine::Errno::EIO),
+                let d = match super::resolution::driver::walk_to_completion(
+                    rooted_at,
+                    self.path,
+                    super::resolution::state::WalkMode::EntityUnfollowed,
+                    super::resolution::state::FinalSymlinkPolicy::NoFollow,
+                    self.cred,
+                    self.guard,
+                ) {
+                    Ok(resolved) => resolved.dentry,
+                    Err(e) => return StepOutcome::err(e.into()),
                 };
                 self.target = Some(d.clone());
                 d

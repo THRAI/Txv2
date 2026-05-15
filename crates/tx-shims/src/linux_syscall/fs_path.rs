@@ -349,18 +349,26 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
         effective_caps: cred.effective_caps,
     };
 
-    // Resolve the path. Note: the walker's interior-directory descend
-    // check uses `walker_cred`'s ids — for the AT_EACCESS=0 default
-    // this is the **real** id walk. POSIX `access(2)` is documented
-    // as exactly this shape ("uses the real uid/gid for both the
-    // access check and the path resolution"); no separate walk is
-    // required.
-    let dentry = match resolve_path_at::<P>(dirfd, &path, &walker_cred, ctx) {
+    // Resolve the path via AccessOp + drive_oneshot. Returns InodeMeta
+    // for the DAC checks below.
+    let rooted_at = match resolve_cwd(dirfd, ctx) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
-
-    let inode_meta = dentry.rnode().meta();
+    let inode_meta = {
+        let guard = step_engine::guard();
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = AccessOp {
+            rooted_at: &rooted_at,
+            path: &path,
+            cred: &walker_cred,
+            guard: &guard,
+        };
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(m) => m,
+            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        }
+    };
     let mode_bits = inode_meta.mode as u32;
 
     // F_OK: existence check only. Path resolution succeeded; return 0
