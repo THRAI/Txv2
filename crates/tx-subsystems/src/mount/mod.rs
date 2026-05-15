@@ -17,7 +17,7 @@ use crate::page_backed::{FsPageBacking, PageContainer};
 use crate::execution::Errno;
 use crate::vfs::{
     adapter::step_engine::{self as vfs_step_engine, Guard, NoProgress, StepOutcome},
-    DEntry, FsObjectId, FsOps, InlineName, InodeMeta, RNode,
+    render_dentry_path, DEntry, FsObjectId, FsOps, InlineName, InodeMeta, RNode,
 };
 
 static MOUNT_IDENTITY_ZONE: Zone<MountIdentity> = Zone::const_new();
@@ -436,6 +436,47 @@ pub fn mount_for(
         }
     }
     None
+}
+
+// ============================================================================
+// Mount table snapshot (for /proc/mounts)
+// ============================================================================
+
+/// Snapshot of one mount table entry, suitable for `/proc/mounts` rendering.
+pub struct MountSnapshot {
+    /// Device or source label (e.g. "rootfs", "/dev/vda").
+    pub source: SourceLabel,
+    /// Rendered mount-point path (e.g. "/", "/dev").
+    pub mountpoint_path: alloc::vec::Vec<u8>,
+    /// Filesystem type string (e.g. "tmpfs", "ext4").
+    pub fstype: &'static str,
+    /// Mount flags.
+    pub flags: MountFlags,
+}
+
+/// Return a snapshot of all registered mounts.
+///
+/// Used by procfs to render `/proc/mounts`.  Each entry carries the
+/// source label, mount-point path (computed via `render_dentry_path`),
+/// filesystem type, and mount flags.
+pub fn snapshot_mounts() -> alloc::vec::Vec<MountSnapshot> {
+    let guard = crate::vfs::adapter::step_engine::guard();
+    let table = MOUNT_TABLE.lock();
+    table
+        .iter()
+        .filter_map(|entry| {
+            let mount = entry.mount.clone_cap();
+            let dentry = mount.mountpoint()?;
+            let path = render_dentry_path(dentry).unwrap_or_else(|| b"/?".to_vec());
+            let payload = mount.payload_cap().ok()?;
+            Some(MountSnapshot {
+                source: payload.source_label,
+                mountpoint_path: path,
+                fstype: payload.fstype,
+                flags: payload.options.flags,
+            })
+        })
+        .collect()
 }
 
 /// Reset the mount table. Test-only.
