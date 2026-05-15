@@ -48,6 +48,7 @@ use alloc::vec::Vec;
 use reactor_entry::userspace::SyscallRequest;
 use tx_hal::{EntropyIf, PmapIf, TimeIf, UserPtr};
 use tx_scripts::process::exec::{exec_script, ExecError};
+use tx_subsystems::page_backed::TruncateOp as FdTruncateOp;
 use tx_subsystems::cred::{
     Capability, Cred, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp,
     SetreuidOp, SetuidOp, Uid,
@@ -529,7 +530,7 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_SYMLINKAT => sys_symlinkat(req.args, ctx).await,
         nr if nr == NR_LINKAT => sys_linkat(req.args, ctx).await,
         nr if nr == NR_TRUNCATE => sys_truncate(req.args, ctx).await,
-        nr if nr == NR_FTRUNCATE => sys_ftruncate(req.args, ctx),
+        nr if nr == NR_FTRUNCATE => sys_ftruncate(req.args, ctx).await,
         nr if nr == NR_READLINKAT => sys_readlinkat(req.args, ctx).await,
         nr if nr == NR_RENAMEAT2 => sys_renameat2(req.args, ctx).await,
         // PR-10 phase 2 — `userfaultfd(2)` scaffold. Mints a fresh
