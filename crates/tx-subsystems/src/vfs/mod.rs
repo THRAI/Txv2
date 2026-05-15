@@ -12,6 +12,7 @@
 
 pub mod adapter;
 pub mod checks;
+pub mod composite;
 pub mod execution;
 pub mod predicates;
 pub mod require;
