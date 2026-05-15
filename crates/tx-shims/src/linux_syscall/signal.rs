@@ -4,7 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use tx_subsystems::signal::step_kill_pgrp;
+use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
 ///
@@ -102,6 +102,32 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     }
 
     SyscallResult::Return(0)
+}
+
+// --- Stub syscalls (deferred to post-bringup) -------------------------
+
+pub(super) fn sys_rt_sigsuspend(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+pub(super) fn sys_sigaltstack(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+pub(super) fn sys_rt_sigqueueinfo(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+pub(super) fn sys_rt_sigtimedwait(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+pub(super) fn sys_pidfd_open(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+pub(super) fn sys_pidfd_send_signal(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
 }
 
 /// `rt_sigaction(signum, act, oldact, sigsetsize)` per `SIGNAL_v1`
@@ -279,10 +305,18 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
 
+    let siginfo = Some(SigInfo {
+        si_signo: signum.raw() as u32,
+        si_code: SI_USER,
+        si_pid: ctx.process.pid.0,
+        si_uid: 0, // TODO: populate from cred when available
+    });
+
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = KillProcessOp {
         target: target.clone(),
         sig: signum,
+        info: siginfo,
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(KillOutcome::Delivered) => SyscallResult::Return(0),
@@ -304,16 +338,35 @@ pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
 /// `tgkill(tgid, tid, sig)` — Linux RV64 generic ABI
 /// `__NR_tgkill = 131`.
 ///
-/// Slice 7 v1 aliases this to [`sys_kill`]: `tgid` (args[0]) is
-/// interpreted as a pid, `tid` (args[1]) is ignored, and `sig`
-/// (args[2]) is shifted to the kill arg slot.
-/// `TODO(phase-thread-signals)`.
+/// Phase 4: validates tgid matches the caller's pid, then posts
+/// directly to the target thread. Falls back to `sys_kill` for
+/// single-threaded compatibility.
 pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
-    let mut k_args = args;
-    // sys_kill expects (pid, sig) at args[0]/args[1]. tgkill places
-    // sig at args[2]; shift it down for the alias.
-    k_args[1] = args[2];
-    sys_kill(k_args, ctx)
+    let tgid = args[0] as u32;
+    let tid = args[1] as u32;
+    let sig = args[2] as u32;
+    // Validate tgid.
+    if tgid != ctx.process.pid.0 {
+        return SyscallResult::Error(ESRCH_VALUE);
+    }
+    if sig == 0 {
+        return SyscallResult::Return(0);
+    }
+    let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+        Some(s) => s,
+        None => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    if let Some(thread) = ctx.process.thread_by_tid(tid) {
+        let siginfo = Some(SigInfo {
+            si_signo: signum.raw() as u32,
+            si_code: SI_USER,
+            si_pid: ctx.process.pid.0,
+            si_uid: 0,
+        });
+        tx_subsystems::thread_runtime::execution::post_signal(&thread, signum, siginfo);
+        return SyscallResult::Return(0);
+    }
+    SyscallResult::Error(ESRCH_VALUE)
 }
 
 /// `rt_sigreturn(...)` — Linux RV64 generic ABI
@@ -361,3 +414,4 @@ pub(super) fn sys_rt_sigpending(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResu
 
     SyscallResult::Return(0)
 }
+

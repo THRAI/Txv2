@@ -295,6 +295,7 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mailbox_arc = script_ctx.mailbox().cloned();
         let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
         let guard = step_engine::guard();
         let mut op = tx_subsystems::vfs::composite::PpollOp {
             guard: &guard,
@@ -308,7 +309,7 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             &mut script_ctx,
             DriveMode::Waiting,
             mailbox_arc.as_ref(),
-            None,
+            delegate_registry_arc.as_deref(),
             timer_wheel_arc.as_ref(),
         )
         .await
@@ -380,13 +381,14 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     };
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let mut op = OpenFileWriteOp {
         file: &file,
         bytes: &bytes,
         guard: &guard,
         cursor: 0,
     };
-    match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), None, timer_wheel_arc.as_ref()).await {
+    match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
         Ok(total) => SyscallResult::Return(total as i64),
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
@@ -396,7 +398,8 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             if errno == tx_subsystems::execution::Errno::EPIPE {
                 let _ = tx_subsystems::signal::step_kill_process(
                     &ctx.process, tx_subsystems::signal::Signum::SIGPIPE,
-                , None);
+                    None,
+                );
             }
             SyscallResult::Error(errno_to_i32(errno))
         }
@@ -480,13 +483,14 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     };
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let mut op = OpenFileReadOp {
         file: &file,
         out: &mut staging,
         guard: &guard,
         cursor: 0,
     };
-    match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), None, timer_wheel_arc.as_ref()).await {
+    match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
         Ok(total) => {
             if total > 0 {
                 if let Err(errno) = bootstrap_copy_to_user(

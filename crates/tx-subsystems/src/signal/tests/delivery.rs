@@ -371,7 +371,7 @@ fn sigkill_via_step_kill_zombifies_process_with_status_encoding() {
     let _g = setup();
     let proc_cap = fresh_init();
 
-    let outcome = step_kill_process(&proc_cap, Signum::SIGKILL);
+    let outcome = step_kill_process(&proc_cap, Signum::SIGKILL, None);
     assert_eq!(outcome, KillOutcome::Delivered);
 
     // Per SIGNAL_v1 §12.3 route_sigkill, SIGKILL invokes
@@ -401,7 +401,7 @@ fn sigstop_routed_via_step_kill_sets_summary_stop_requested() {
     // SIGSTOP is Gewalt — must go through step_kill_process which
     // dispatches to route_gewalt; calling post_signal directly
     // would debug_assert.
-    let _ = step_kill_process(&proc_cap, Signum::SIGSTOP);
+    let _ = step_kill_process(&proc_cap, Signum::SIGSTOP, None);
 
     let summary = leader.payload.lock().as_ref().unwrap().interrupt_summary();
     assert!(summary.stop_requested);
@@ -413,7 +413,7 @@ fn sigcont_routed_via_step_kill_clears_stop_requested() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    let _ = step_kill_process(&proc_cap, Signum::SIGSTOP);
+    let _ = step_kill_process(&proc_cap, Signum::SIGSTOP, None);
     assert!(
         leader
             .payload
@@ -424,7 +424,7 @@ fn sigcont_routed_via_step_kill_clears_stop_requested() {
             .stop_requested
     );
 
-    let _ = step_kill_process(&proc_cap, Signum::SIGCONT);
+    let _ = step_kill_process(&proc_cap, Signum::SIGCONT, None);
     assert!(
         !leader
             .payload
@@ -452,7 +452,7 @@ fn sigstop_does_not_enter_thread_pending() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    let _ = step_kill_process(&proc_cap, Signum::SIGSTOP);
+    let _ = step_kill_process(&proc_cap, Signum::SIGSTOP, None);
 
     assert!(!leader
         .payload
@@ -478,7 +478,7 @@ fn sigcont_does_not_enter_thread_pending() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    let _ = step_kill_process(&proc_cap, Signum::SIGCONT);
+    let _ = step_kill_process(&proc_cap, Signum::SIGCONT, None);
 
     assert!(!leader
         .payload
@@ -667,7 +667,7 @@ fn step_kill_process_fires_signal_port_for_event_signals() {
 
     // Post a catchable signal via step_kill_process (the Event path).
     // This should fire signal_port with SIGNAL_GENERATED.
-    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM);
+    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM, None);
     assert_eq!(outcome, KillOutcome::Delivered);
 
     // The signal should be pending on the eligible thread.

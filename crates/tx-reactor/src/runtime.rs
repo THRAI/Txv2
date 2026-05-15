@@ -106,6 +106,7 @@ pub struct Reactor {
     dispatch: DispatchState,
     timers: TimerQueue,
     timer_wheel: tx_substrate::wake::timer::TimerWheel,
+    delegate_registry: Arc<tx_substrate::step::DelegateRegistry>,
     userspace: UserspaceRunSlot,
 }
 
@@ -148,6 +149,7 @@ impl Reactor {
             dispatch: DispatchState::new(),
             timers: TimerQueue::new(),
             timer_wheel: tx_substrate::wake::timer::TimerWheel::new(),
+            delegate_registry: Arc::new(tx_substrate::step::DelegateRegistry::new()),
             userspace: UserspaceRunSlot::new(),
         }
     }
@@ -419,9 +421,16 @@ impl Reactor {
                 // yield resolution.
                 crate::task::set_current_timer_wheel(Some(self.timer_wheel.clone()));
 
+                // drive-taskmb: expose the reactor's delegate registry
+                // for OnAgent yield resolution.
+                crate::task::set_current_delegate_registry(Some(Arc::clone(
+                    &self.delegate_registry,
+                )));
+
                 let Some(future) = task.future.as_mut() else {
                     crate::task::set_current_mailbox(None);
                     crate::task::set_current_timer_wheel(None);
+                    crate::task::set_current_delegate_registry(None);
                     continue;
                 };
 
@@ -429,6 +438,7 @@ impl Reactor {
                 let result = future.as_mut().poll(&mut cx);
                 crate::task::set_current_mailbox(None);
                 crate::task::set_current_timer_wheel(None);
+                crate::task::set_current_delegate_registry(None);
                 result
             };
 

@@ -426,3 +426,24 @@ pub(crate) fn set_current_timer_wheel(wheel: Option<TimerWheel>) {
 pub fn current_timer_wheel() -> Option<TimerWheel> {
     CURRENT_TIMER_WHEEL.lock().clone()
 }
+
+// -----------------------------------------------------------------------
+// drive-taskmb: delegate registry trampoline
+// -----------------------------------------------------------------------
+
+use tx_substrate::step::DelegateRegistry;
+
+/// Set by the reactor before each `future.poll()`, cleared after.
+/// Read by `run_thread` to inject into `SyscallCtx` for `OnAgent` yield
+/// resolution via `resolve_on_agent`.
+static CURRENT_DELEGATE_REGISTRY: SpinLock<Option<Arc<DelegateRegistry>>> = SpinLock::new(None);
+
+/// Set the current reactor's delegate registry (called by reactor before poll).
+pub(crate) fn set_current_delegate_registry(registry: Option<Arc<DelegateRegistry>>) {
+    *CURRENT_DELEGATE_REGISTRY.lock() = registry;
+}
+
+/// Read the current reactor's delegate registry (called by trampoline / `run_thread`).
+pub fn current_delegate_registry() -> Option<Arc<DelegateRegistry>> {
+    CURRENT_DELEGATE_REGISTRY.lock().clone()
+}

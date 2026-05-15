@@ -674,7 +674,7 @@ fn session_leader_hangup_cascade(process: &Cap<ProcessIdentity>) {
 /// `si_status` when the siginfo carrier lands.
 fn post_sigchld_to_parent(process: &Cap<ProcessIdentity>) {
     if let Some(parent) = process.parent_cap() {
-        let _ = crate::signal::step_kill_process(&parent, crate::signal::Signum::SIGCHLD);
+        let _ = crate::signal::step_kill_process(&parent, crate::signal::Signum::SIGCHLD, None);
         // Fire the parent's exit_source. A zombie parent has no payload
         // and `fire_exit_source` returns 0 — no panic, no double-fire.
         let _ = parent.fire_exit_source(Mask::from_bits(

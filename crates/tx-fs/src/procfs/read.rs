@@ -3,8 +3,8 @@
 use alloc::string::String;
 use tx_subsystems::process::{self, Pid};
 use crate::procfs::{
-    pid_from_cmdline_id, pid_from_stat_id, PROCFS_CPUINFO_ID, PROCFS_MOUNTS_ID,
-    PROCFS_UPTIME_ID,
+    pid_from_cmdline_id, pid_from_maps_id, pid_from_stat_id, PROCFS_CPUINFO_ID,
+    PROCFS_MOUNTS_ID, PROCFS_UPTIME_ID,
 };
 use tx_subsystems::vfs::FsObjectId;
 
@@ -14,6 +14,9 @@ pub fn render(fs_object_id: FsObjectId) -> String {
     }
     if let Some(pid) = pid_from_cmdline_id(fs_object_id) {
         return render_cmdline(pid);
+    }
+    if let Some(pid) = pid_from_maps_id(fs_object_id) {
+        return render_maps(pid);
     }
     match fs_object_id {
         PROCFS_MOUNTS_ID => render_mounts(),
@@ -64,6 +67,59 @@ fn render_cpuinfo() -> String {
 
 fn render_uptime() -> String {
     String::from("0.00 0.00\n")
+}
+
+fn render_maps(pid: Pid) -> String {
+    use tx_subsystems::vm::VmBacking;
+
+    let Some(proc) = process::process_by_pid(pid) else {
+        return String::new();
+    };
+    let Some(aspace) = proc.aspace_cap() else {
+        return String::new();
+    };
+
+    let mut entries = aspace.recipes_snapshot();
+    // Sort by start address for canonical output.
+    entries.sort_by_key(|e| e.range.start());
+
+    let mut out = String::new();
+    for entry in entries {
+        let start = entry.range.start().as_usize();
+        let end = entry.range.end().as_usize();
+
+        // Permissions: r/w/x/p based on prot and flags.
+        let r = if entry.prot.read { 'r' } else { '-' };
+        let w = if entry.prot.write { 'w' } else { '-' };
+        let x = if entry.prot.execute { 'x' } else { '-' };
+        let p = if entry.flags.shared { 's' } else { 'p' };
+
+        // Offset and backing description.
+        let (offset, backing_desc) = match &entry.backing {
+            VmBacking::None => (0u64, "[none]"),
+            VmBacking::PrivateAnon => (0u64, "[anon]"),
+            VmBacking::Page { pc, offset: off } => {
+                use tx_subsystems::page_backed::PageContainerKind;
+                let desc = match pc.kind() {
+                    PageContainerKind::Anon { .. } => "[anon]",
+                    PageContainerKind::File { .. } => "[file]",
+                    PageContainerKind::Device { .. } => "[device]",
+                };
+                (*off, desc)
+            }
+        };
+
+        // Locked flag.
+        let locked = if entry.flags.locked { " l" } else { "" };
+
+        use alloc::format;
+        out.push_str(&format!(
+            "{:x}-{:x} {}{}{}{} {:08x} 00:00 0 {}{}\n",
+            start, end, r, w, x, p, offset, backing_desc, locked,
+        ));
+    }
+
+    out
 }
 
 pub fn render_meminfo() -> String {

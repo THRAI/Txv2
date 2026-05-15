@@ -41,7 +41,8 @@ pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
     let mut script_ctx = build_subject_script_ctx(ctx);
         let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, timer_wheel_arc.as_ref()).await {
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
         Ok(new_brk) => {
             ctx.process.set_current_brk(new_brk.0 as u64);
             SyscallResult::Return(new_brk.0 as i64)
@@ -208,7 +209,8 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
     let mut script_ctx = build_subject_script_ctx(ctx);
         let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, timer_wheel_arc.as_ref()).await {
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
         Ok(outcome) => SyscallResult::Return(outcome.range.start().as_usize() as i64),
         Err(errno) => {
             // MAP_FIXED_NOREPLACE → AlreadyMapped maps to EEXIST per
@@ -250,7 +252,8 @@ pub(super) async fn sys_munmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
     let mut script_ctx = build_subject_script_ctx(ctx);
         let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, timer_wheel_arc.as_ref()).await {
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -285,7 +288,8 @@ pub(super) async fn sys_mlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
     let mut script_ctx = build_subject_script_ctx(ctx);
         let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, timer_wheel_arc.as_ref()).await {
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -314,7 +318,8 @@ pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscall
     let mut script_ctx = build_subject_script_ctx(ctx);
         let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, timer_wheel_arc.as_ref()).await {
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -362,7 +367,8 @@ pub(super) async fn sys_mprotect(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
     let mut script_ctx = build_subject_script_ctx(ctx);
         let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, timer_wheel_arc.as_ref()).await {
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -413,7 +419,8 @@ pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
     let mut script_ctx = build_subject_script_ctx(ctx);
         let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, timer_wheel_arc.as_ref()).await {
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
         Ok(outcome) => SyscallResult::Return(outcome.new_range.start().as_usize() as i64),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -493,6 +500,7 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
     let mut op = VmMsyncOp { aspace: &ctx.aspace, range };
     match drive(
         op,

@@ -13,6 +13,7 @@ use tx_subsystems::process::ProcessIdentity;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vfs::structure::Credential;
 use tx_subsystems::vm::AddressSpace;
+use tx_substrate::step::DelegateRegistry;
 use tx_substrate::wake::mailbox::TaskMailbox;
 use tx_substrate::wake::timer::TimerWheel;
 
@@ -24,6 +25,9 @@ pub struct SyscallCtx<'a> {
     pub mailbox: Option<Arc<TaskMailbox>>,
     /// Reactor timer wheel for OnTimer yield resolution (drive-taskmb).
     pub timer_wheel: Option<TimerWheel>,
+    /// Reactor delegate registry for OnAgent yield resolution
+    /// (drive-taskmb).
+    pub delegate_registry: Option<Arc<DelegateRegistry>>,
     /// Sliced lifetime so future fields (signal-mask snapshot, cred
     /// snapshot) can be added without ripping every call site.
     pub _lifetime: core::marker::PhantomData<&'a ()>,
@@ -45,6 +49,7 @@ impl<'a> SyscallCtx<'a> {
             aspace,
             mailbox: None,
             timer_wheel: None,
+            delegate_registry: None,
             _lifetime: core::marker::PhantomData,
         }
     }
@@ -59,6 +64,13 @@ impl<'a> SyscallCtx<'a> {
     /// (drive-taskmb).
     pub fn with_timer_wheel(mut self, wheel: TimerWheel) -> Self {
         self.timer_wheel = Some(wheel);
+        self
+    }
+
+    /// Attach the reactor delegate registry for OnAgent yield
+    /// resolution (drive-taskmb).
+    pub fn with_delegate_registry(mut self, registry: Arc<DelegateRegistry>) -> Self {
+        self.delegate_registry = Some(registry);
         self
     }
 
@@ -158,6 +170,9 @@ pub fn build_subject_script_ctx(ctx: &SyscallCtx<'_>) -> crate::KernelScriptCtx 
     }
     if let Some(ref tw) = ctx.timer_wheel {
         script_ctx = script_ctx.with_timer_wheel(tw.clone());
+    }
+    if let Some(ref dr) = ctx.delegate_registry {
+        script_ctx = script_ctx.with_delegate_registry(Arc::clone(dr));
     }
     script_ctx
 }
