@@ -295,6 +295,12 @@ impl ThreadPayload {
         *self.saved_user_context.lock() = ctx;
     }
 
+    /// Replace the saved signal context. Called by signal delivery
+    /// to preserve the pre-handler context for `rt_sigreturn`.
+    pub fn store_saved_signal_context(&self, ctx: Option<UserTrapContext>) {
+        *self.saved_signal_context.lock() = ctx;
+    }
+
     /// Push a pending syscall return into the per-thread slot. The
     /// userspace-entry shim drains this and writes it into the fresh
     /// trap frame via `set_syscall_return`/`set_syscall_error` before
@@ -363,6 +369,26 @@ impl ThreadPayload {
                 Err(observed) => cur = observed,
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------
+// D9-A bridge: ThreadPayload → reactor InterruptSource
+// ------------------------------------------------------------------
+
+use crate::signal::adapter::wait_routing::InterruptSource;
+
+impl InterruptSource for ThreadPayload {
+    fn deliverable_signal_pending(&self) -> bool {
+        self.interrupt_summary().deliverable_signal
+    }
+
+    fn termination_in_force(&self) -> bool {
+        self.interrupt_summary().termination
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.interrupt_summary().stop_requested
     }
 }
 
