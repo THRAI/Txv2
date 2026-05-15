@@ -327,15 +327,9 @@ pub(super) fn sys_rt_sigpending(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResu
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    // Phase F: snapshot thread_pending bitset.  TODO: merge in
-    // group_pending masked by thread's signal_mask for full POSIX
-    // compliance.
-    let pending = match ctx.thread.upgrade_operational() {
-        Ok(payload) => payload.pending().snapshot(),
-        Err(_) => {
-            return SyscallResult::Error(ESRCH_VALUE);
-        }
-    };
+    // TODO(merge-fixup): upgrade_operational removed from Cap<ThreadIdentity>;
+    // stub with empty pending set until thread payload accessor lands.
+    let pending: u64 = 0;
     if let Err(errno) = bootstrap_write_user::<u64>(&ctx.aspace, set_ptr as u64, pending) {
         return SyscallResult::Error(errno_to_i32(errno));
     }

@@ -444,147 +444,44 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     // dance the trio's earlier exemption used).
     let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
 
-    // PR-9 phase 3b: drive `OpenFile::step_read` via the
-    // `OpenFileReadOp` StepOp wrap, threading a `&mut KernelScriptCtx`.
-    //
-    // PR-9 phase 5 (D5 Path A): populate `SubjectContext` from
-    // `SyscallCtx`. The subject identifies the calling process+thread
-    // and carries the `Cap<Cred>` snapshot loaded at syscall entry —
-    // SUBJ-1 hygiene per `docs/Txv3/04_SYSCALL_SHAPE_v1.md` §2.
-    // Restrictions cap is a fresh placeholder
-    // (`tx_subsystems::cred::placeholder_restrictions_cap`) until PR-K
-    // lands the real append-only stack (D5 §7).
-    use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
-    use tx_subsystems::execution::WaitToken;
+    // Phase A.3: drive `OpenFile::step_read` via the v3 `drive()` loop
+    // (per `docs/Txv3/03_STEP_MODEL_v2.md` §8). The internal cursor
+    // in `OpenFileReadOp` tracks the fill position across successive
+    // `step()` calls; after drive() returns, copy the accumulated
+    // bytes to userspace in a single pass.
+    use step_engine::StepOp;
+    use tx_substrate::step::DriveMode;
     use tx_subsystems::vfs::execution::OpenFileReadOp;
+    use tx_scripts::drive;
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut total: usize = 0;
-    let mut cursor: usize = 0;
-    loop {
-        let outcome = {
-            let guard = step_engine::guard();
-            let mut op = OpenFileReadOp {
-                file: &file,
-                out: &mut staging[cursor..],
-                guard: &guard,
-                cursor: 0,
-            };
-            op.step(&mut script_ctx)
-        };
-        match outcome {
-            V3Out::Done(read) => {
-                if read > 0 {
-                    if let Err(errno) = bootstrap_copy_to_user(
-                        &ctx.aspace,
-                        buf_ptr as u64 + cursor as u64,
-                        &staging[cursor..cursor + read],
-                    ) {
-                        if total > 0 {
-                            return SyscallResult::Return(total as i64);
-                        }
-                        return SyscallResult::Error(errno_to_i32(errno));
-                    }
-                }
-                total += read;
-                return SyscallResult::Return(total as i64);
-            }
-            V3Out::Continue { progress } => {
-                let read = progress.bytes();
-                if read > 0 {
-                    if let Err(errno) = bootstrap_copy_to_user(
-                        &ctx.aspace,
-                        buf_ptr as u64 + cursor as u64,
-                        &staging[cursor..cursor + read],
-                    ) {
-                        if total > 0 {
-                            return SyscallResult::Return(total as i64);
-                        }
-                        return SyscallResult::Error(errno_to_i32(errno));
-                    }
-                }
-                total += read;
-                let stop = read == 0 || cursor + read >= len;
-                if stop {
-                    return SyscallResult::Return(total as i64);
-                }
-                cursor += read;
-            }
-            V3Out::Yield {
-                progress,
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-            } => {
-                let read = progress.bytes();
-                if read > 0 {
-                    if let Err(errno) = bootstrap_copy_to_user(
-                        &ctx.aspace,
-                        buf_ptr as u64 + cursor as u64,
-                        &staging[cursor..cursor + read],
-                    ) {
-                        if total > 0 {
-                            return SyscallResult::Return(total as i64);
-                        }
-                        return SyscallResult::Error(errno_to_i32(errno));
-                    }
-                    total += read;
-                    // Partial-success policy: same as `write`. Return
-                    // what we got rather than blocking; userspace
-                    // re-issues the syscall to drain more.
-                    return SyscallResult::Return(total as i64);
-                }
-                // No progress yet — park on the carrier (Pre-ELF
-                // Phase 5 (item 9)). Park on the registered TTY wait
-                // carrier (fired from `tty::execution::step_ingest`
-                // after UART RX bytes land via
-                // `irq::uart_rx_irq_handler`), then re-poll. Mirrors
-                // the canonical async wait discipline pattern from
-                // `vm::execution::fault_script` /
-                // `RangeLock::WouldBlock`.
-                //
-                // `wait_on_token` returns `None` for test
-                // placeholder tokens (carrier id not registered);
-                // in that case fall through and re-poll immediately.
-                // Production carriers are always registered (see
-                // `TtyIdentity::new`). If a partial read already
-                // happened on a prior iteration (`total > 0`) we
-                // return what we have rather than block, matching
-                // `sys_write`'s partial-success policy.
-                if total > 0 {
-                    return SyscallResult::Return(total as i64);
-                }
-                let token = WaitToken::new(carrier.raw(), interests.raw());
-                if let Some(future) = wait_source::wait_on_token(token) {
-                    let _ = future.await;
+    let guard = step_engine::guard();
+    let mode = if file.flags().nonblocking {
+        DriveMode::Nonblocking
+    } else {
+        DriveMode::Waiting
+    };
+    let mut op = OpenFileReadOp {
+        file: &file,
+        out: &mut staging,
+        guard: &guard,
+        cursor: 0,
+    };
+    match drive(op, &mut script_ctx, mode, None, None, None).await {
+        Ok(total) => {
+            if total > 0 {
+                if let Err(errno) = bootstrap_copy_to_user(
+                    &ctx.aspace,
+                    buf_ptr as u64,
+                    &staging[..total],
+                ) {
+                    return SyscallResult::Error(errno_to_i32(errno));
                 }
             }
-            V3Out::Yield {
-                shape: YieldShape::OnAgent { .. },
-                ..
-            } => {
-                if total > 0 {
-                    return SyscallResult::Return(total as i64);
-                }
-                return SyscallResult::Error(errno_to_i32(Errno::EIO));
-            }
-            V3Out::Yield {
-                shape: YieldShape::OnTimer { .. },
-                ..
-            } => {
-                if total > 0 {
-                    return SyscallResult::Return(total as i64);
-                }
-                return SyscallResult::Error(errno_to_i32(Errno::EIO));
-            }
-            V3Out::Err(v3errno) => {
-                if total > 0 {
-                    return SyscallResult::Return(total as i64);
-                }
-                let errno: Errno = v3errno.into();
-                return SyscallResult::Error(errno_to_i32(errno));
-            }
+            SyscallResult::Return(total as i64)
         }
+        Err(v3errno) => {
+            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            SyscallResult::Error(errno_to_i32(errno))
+        },
     }
 }

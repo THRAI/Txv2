@@ -209,7 +209,7 @@ fn script_kill_pgrp_partial_permission_returns_count_of_permitted() {
         let payload = proc.payload.lock();
         payload
             .as_ref()
-            .map(|p| p.threads.lock()[0].clone())
+            .map(|p| p.threads.nth(0).unwrap())
             .unwrap()
             .payload
             .lock()
@@ -236,7 +236,7 @@ fn signal_zero_is_permission_probe_no_delivery() {
     let leader_pending = {
         let payload = child.payload.lock();
         let payload = payload.as_ref().unwrap();
-        let leader = payload.threads.lock()[0].clone();
+        let leader = payload.threads.nth(0).unwrap();
         let lp = leader.payload.lock();
         lp.as_ref().unwrap().pending().is_pending(Signum::SIGTERM)
     };

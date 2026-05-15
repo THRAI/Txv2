@@ -24,10 +24,19 @@ pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
 }
 
 /// `exit_group(status)` — per `PROCESS_v1` §7.3.2.
+/// PR-3 migration: `ExitGroupOp` is a `OneShotStepOp` — dispatched
+/// via `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let status = args[0] as i32;
-    step_exit_group(&ctx.process, ExitStatus::Exited(status));
-    SyscallResult::NoReturn
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = ExitGroupOp {
+        process: &ctx.process,
+        status: ExitStatus::Exited(status),
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(()) => SyscallResult::NoReturn,
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `getpid()` — direct read of `process.pid` per `PROCESS_v1`

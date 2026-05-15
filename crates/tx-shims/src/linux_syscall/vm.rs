@@ -145,6 +145,13 @@ pub(super) fn sys_mmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     let fixed = flags & MAP_FIXED != 0;
     let fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
     let anonymous = flags & MAP_ANONYMOUS != 0;
+    // MAP_GROWSDOWN: stack-expansion hint. txKernel has no stack
+    // expansion (no `expand_stack` script), so reject it explicitly
+    // rather than silently setting `VmEntryFlags.grows_down` with no
+    // observable effect.
+    if flags & MAP_GROWSDOWN != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
     let entry_flags =
         VmEntryFlags::new(shared, flags & MAP_GROWSDOWN != 0, flags & MAP_LOCKED != 0);
 
@@ -227,6 +234,62 @@ pub(super) fn sys_munmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     };
 
     match ctx.aspace.try_munmap(range) {
+        Ok(_commit) => SyscallResult::Return(0),
+        Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
+    }
+}
+
+/// `mlock(addr, len)` — Linux RV64 generic syscall #228.
+///
+/// Under no-swap, mlock is purely observational: it sets
+/// `VmEntryFlags.locked` on every VMA overlapping the range for
+/// `/proc/<pid>/maps` reporting. No pages are faulted in; the flag is
+/// a hint that survives across fork (the child inherits locked flags
+/// via recipe cloning).
+///
+/// `addr` is rounded down to a page boundary; `len` is rounded up.
+/// Returns 0 on success, `-errno` on failure.
+pub(super) fn sys_mlock<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let addr = args[0];
+    let len_in = args[1] as usize;
+
+    if len_in == 0 {
+        return SyscallResult::Return(0);
+    }
+    let start = addr & !(USER_PAGE_SIZE as u64 - 1);
+    let Some(len) = len_in.checked_next_multiple_of(USER_PAGE_SIZE) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let Ok(range) = UserRange::new_aligned(UserVirtAddr(start as usize), len) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+
+    match ctx.aspace.try_mlock(range, true) {
+        Ok(_commit) => SyscallResult::Return(0),
+        Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
+    }
+}
+
+/// `munlock(addr, len)` — Linux RV64 generic syscall #229.
+///
+/// Clears `VmEntryFlags.locked` on every VMA overlapping the range.
+/// Same rounding and error semantics as `sys_mlock`.
+pub(super) fn sys_munlock<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let addr = args[0];
+    let len_in = args[1] as usize;
+
+    if len_in == 0 {
+        return SyscallResult::Return(0);
+    }
+    let start = addr & !(USER_PAGE_SIZE as u64 - 1);
+    let Some(len) = len_in.checked_next_multiple_of(USER_PAGE_SIZE) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let Ok(range) = UserRange::new_aligned(UserVirtAddr(start as usize), len) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+
+    match ctx.aspace.try_mlock(range, false) {
         Ok(_commit) => SyscallResult::Return(0),
         Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
     }
@@ -431,10 +494,22 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 return SyscallResult::Error(EIO_VALUE);
             }
             V3::Yield {
+                shape: YieldShape::OnEdge { .. },
+                ..
+            } => {
+                return SyscallResult::Error(EIO_VALUE);
+            },
+            V3::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
             } => {
                 return SyscallResult::Error(EIO_VALUE);
+            }
+            V3::Yield {
+                shape: YieldShape::OnEdge { .. },
+                ..
+            } => {
+                return SyscallResult::Error(ENOSYS_VALUE);
             }
             V3::Err(v3_errno) => {
                 return SyscallResult::Error(errno_to_i32(v3_errno.into()));

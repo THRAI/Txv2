@@ -737,7 +737,7 @@ pub enum SignalTarget {
 ///
 /// **D9-B eligibility scan.** Per POSIX, a process-directed signal
 /// must be delivered to a thread whose mask permits the signum if
-/// one exists. The scan runs under `payload.threads.lock()` so that
+/// one exists. The scan runs under `payload.threads.inner.lock()` so that
 /// concurrent `kill(pid, sig)` calls serialise on the thread-list
 /// lock; only one CAS into a thread's `thread_pending` succeeds in
 /// *first* setting the bit (POSIX coalescence for standard signals).
@@ -754,7 +754,7 @@ pub enum SignalTarget {
 ///
 /// The mailbox post happens via `post_signal` *after* the
 /// thread-list lock is dropped — `post_signal` does not reacquire
-/// `payload.threads.lock()`, so this order avoids any
+/// `payload.threads.inner.lock()`, so this order avoids any
 /// post-while-holding-list-lock hazard. Zombies are skipped.
 pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
     // observe
@@ -798,7 +798,7 @@ pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutc
     };
 
     let chosen = {
-        let threads = payload.threads.lock();
+        let threads = payload.threads.snapshot();
 
         // Pass 1: first non-zombie thread with `sig` NOT blocked.
         // The sigmask read goes through the payload's `signal_mask`
@@ -900,7 +900,7 @@ pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
         return KillOutcome::NoLiveThread;
     };
     let threads: alloc::vec::Vec<Cap<crate::thread_runtime::ThreadIdentity>> =
-        payload.threads.lock().iter().cloned().collect();
+        payload.threads.snapshot();
 
     let mut touched = false;
     for thread in &threads {
@@ -959,10 +959,8 @@ pub fn step_kill_pgrp(pgrp: &Cap<ProcessGroup>, sig: Signum) -> usize {
     let guard = step_engine::guard();
     let mut delivered = 0usize;
     let catchable = !is_gewalt(sig);
-    for weak in pgrp.members.lock().iter() {
-        let Some(member) = weak.upgrade(&guard) else {
-            continue;
-        };
+    let members = pgrp.members.snapshot_live(&guard);
+    for member in &members {
         if step_kill_process(&member, sig) == KillOutcome::Delivered {
             // Catchable only: mirror onto group_pending so the
             // delivery step can recognise group-targeted posts.
@@ -1127,12 +1125,7 @@ pub(crate) fn script_kill_pgrp_with_guard(
         .cred();
 
     let mut delivered = 0u32;
-    let members: alloc::vec::Vec<Cap<ProcessIdentity>> = pgrp
-        .members
-        .lock()
-        .iter()
-        .filter_map(|w| w.upgrade(guard))
-        .collect();
+    let members: alloc::vec::Vec<Cap<ProcessIdentity>> = pgrp.members.snapshot_live(guard);
 
     for member in &members {
         let Some(facts) = member.target_proc_cred_for(source) else {

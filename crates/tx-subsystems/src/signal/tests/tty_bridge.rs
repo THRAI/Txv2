@@ -139,7 +139,7 @@ fn typed_tty_vintr_routes_sigint_to_foreground_pgrp() {
     // pending queue.
     for proc_cap in [&parent, &child] {
         let payload = proc_cap.payload.lock();
-        let leader = payload.as_ref().unwrap().threads.lock()[0].clone();
+        let leader = payload.as_ref().unwrap().threads.nth(0).unwrap();
         let leader_payload = leader.payload.lock();
         assert!(leader_payload
             .as_ref()
@@ -200,13 +200,13 @@ fn deliver_tty_dispatch_skips_members_when_source_lacks_permission() {
 
     let parent_pending = {
         let p = parent.payload.lock();
-        let leader = p.as_ref().unwrap().threads.lock()[0].clone();
+        let leader = p.as_ref().unwrap().threads.nth(0).unwrap();
         let lp = leader.payload.lock();
         lp.as_ref().unwrap().pending().is_pending(Signum::SIGINT)
     };
     let child_pending = {
         let p = child.payload.lock();
-        let leader = p.as_ref().unwrap().threads.lock()[0].clone();
+        let leader = p.as_ref().unwrap().threads.nth(0).unwrap();
         let lp = leader.payload.lock();
         lp.as_ref().unwrap().pending().is_pending(Signum::SIGINT)
     };

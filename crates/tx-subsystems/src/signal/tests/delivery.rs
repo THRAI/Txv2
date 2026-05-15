@@ -30,7 +30,7 @@ fn fresh_init() -> Cap<ProcessIdentity> {
 fn leader(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload = proc_cap.payload.lock();
     let payload = payload.as_ref().expect("alive");
-    let threads = payload.threads.lock();
+    let threads = payload.threads.snapshot();
     threads[0].clone()
 }
 

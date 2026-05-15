@@ -666,6 +666,17 @@ impl AddressSpace {
         Ok(commit)
     }
 
+    /// Set or clear the `locked` flag on every recipe overlapping `range`.
+    ///
+    /// Under no-swap, locked is purely observational: it sets
+    /// `VmEntryFlags.locked` for `/proc/<pid>/maps` reporting and takes no
+    /// further kernel action. The range must be fully mapped; partial holes
+    /// return [`VmMapError::MissingMapping`].
+    pub fn try_mlock(&self, range: UserRange, locked: bool) -> Result<VmMapCommit, VmMapError> {
+        let _guard = self.acquire_writer(range)?;
+        self.recipes.set_locked(range, locked)
+    }
+
     fn acquire_writer(&self, range: UserRange) -> Result<RangeGuard<'_>, VmMapError> {
         match self
             .range_lock

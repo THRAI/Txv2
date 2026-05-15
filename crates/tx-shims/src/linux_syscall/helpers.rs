@@ -40,14 +40,14 @@ pub(super) const STAT_BLKSIZE: i32 = 4096;
 
 /// Round `x` up to the nearest multiple of 8. Used by `getdents64` to
 /// pad records to the 8-byte boundary the ABI requires.
-const fn align_up_8(x: usize) -> usize {
+pub(super) const fn align_up_8(x: usize) -> usize {
     (x + 7) & !7
 }
 
 /// Project an `InodeKind` onto the `linux_dirent64` `d_type` byte. The
 /// match exhausts every variant of the enum (verified from
 /// `vfs::structure::InodeKind`).
-const fn inode_kind_to_dt(kind: InodeKind) -> u8 {
+pub(super) const fn inode_kind_to_dt(kind: InodeKind) -> u8 {
     match kind {
         InodeKind::Regular => DT_REG,
         InodeKind::Directory => DT_DIR,

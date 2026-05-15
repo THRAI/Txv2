@@ -21,6 +21,8 @@
 //! - `txdoc:STEP-V2-STEP-OP-1` (StepOp trait shape)
 //! - `txdoc:STEP-V2-DRIVER-MODE-1` (DriveMode classify matrix)
 
+use crate::zone::Cap;
+
 /// Errno surface. Mirrors `tx_subsystems::execution::Errno` byte-for-byte
 /// (variant names, ordering, doc comments).
 ///
@@ -656,4 +658,53 @@ pub trait StepOp<I: SubjectIdentity = ProcessIdentity> {
             _ => Err(Errno::EINVAL),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// OneShotStepOp — a StepOp that terminates on first invocation
+// ---------------------------------------------------------------------------
+
+/// A `StepOp` whose first `step()` returns `Done` or `Err`, never
+/// `Continue` or `Yield`.
+///
+/// Contract (STEP-11, `docs/Txv3/02_INVARIANTS_v5.md`):
+/// - `step()` must return `Done(T)` or `Err(Errno)` on first call.
+/// - Returning `Continue` or `Yield` is an invariant violation.
+/// - `Progress` must be `NoProgress` (one-shot ops don't accumulate).
+///
+/// This is stronger than `Nonblocking` driver mode.
+pub trait OneShotStepOp<I: SubjectIdentity = ProcessIdentity>:
+    StepOp<I, Progress = NoProgress>
+{
+}
+
+/// Synchronous drive for one-shot ops. Does not allocate an
+/// `ActiveWait`, does not enter the reactor, does not register
+/// on a `WaitSource`.
+pub fn drive_oneshot<I: SubjectIdentity, O: OneShotStepOp<I>>(
+    op: &mut O,
+    ctx: &mut ScriptCtx<I>,
+) -> Result<O::Output, Errno> {
+    match op.step(ctx) {
+        StepOutcome::Done(v) => Ok(v),
+        StepOutcome::Err(e) => Err(e),
+        StepOutcome::Continue { .. } => {
+            panic!("OneShotStepOp violated contract: unexpected Continue")
+        }
+        StepOutcome::Yield { .. } => {
+            panic!("OneShotStepOp violated contract: unexpected Yield")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ImmediateCtx — narrow context for pure ABI queries (ImmediateSyscall lane)
+// ---------------------------------------------------------------------------
+
+/// Narrower than `ScriptCtx`: carries only the subject/process/thread
+/// handles needed for pure ABI queries. No VFS, VM, reactor, timer,
+/// or mailbox access.
+pub struct ImmediateCtx<'a, I: SubjectIdentity = ProcessIdentity> {
+    pub process: &'a Cap<I>,
+    pub thread: &'a Cap<I::ThreadIdentity>,
 }

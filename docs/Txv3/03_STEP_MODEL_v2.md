@@ -286,6 +286,69 @@ When `OnAgent` is in a mode's accept set, the mode's `handle` implementation mus
 
 `Selecting` does not accept `OnTimer` either; primary timer waits are not select-shaped.
 
+### 5.3 One-shot driver path
+
+<!-- txdoc:STEP-V2-ONESHOT-1 -->
+
+Some `StepOp` implementations are statically guaranteed to terminate on their first `step()` invocation: they return `Done(T)` or `Err(Errno)`, and never `Continue` or `Yield`. These are **one-shot ops**.
+
+```rust
+/// A StepOp that terminates on first invocation.
+///
+/// Contract: the first call to `step()` returns `Done` or `Err`.
+/// Returning `Continue` or `Yield` is an invariant violation (STEP-11).
+pub trait OneShotStepOp:
+    StepOp<Progress = NoProgress> + sealed::Sealed
+{}
+
+/// Synchronous drive for one-shot ops.
+///
+/// Does not allocate an `ActiveWait`, does not enter the reactor,
+/// does not register on a `WaitSource`. The call is synchronous
+/// within the caller's guard.
+pub fn drive_oneshot<O: OneShotStepOp>(
+    op: &mut O,
+    ctx: &mut ScriptCtx,
+) -> Result<O::Output, Errno> {
+    match op.step(ctx) {
+        StepOutcome::Done(v) => Ok(v),
+        StepOutcome::Err(e) => Err(e),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+            panic!("OneShotStepOp violated contract");
+        }
+    }
+}
+```
+
+`drive_oneshot` is a pure synchronous function — no `.await`, no reactor interaction, no `ActiveWait` allocation. It calls `step()` exactly once and translates the result.
+
+#### 5.3.1 Distinction from Nonblocking
+
+`Nonblocking` is a `DriverMode` for the full async `drive()`. When a step yields under `Nonblocking`, the driver translates the yield to `EAGAIN` and returns to userspace. The op *may* have made partial progress; the user may retry.
+
+`OneShotStepOp` is stronger: yielding is an invariant violation (STEP-11), not a user-visible would-block. The contract is enforced by the type system (the `sealed::Sealed` bound prevents downstream impls) and verified by lint at `impl` sites.
+
+| | Nonblocking mode | OneShotStepOp |
+|---|---|---|
+| Returns on Yield? | Yes — `EAGAIN` | Never — yield is a kernel bug |
+| Returns on Continue? | Yes — re-invoke step | Never — continue is a kernel bug |
+| Allocates ActiveWait? | No | No |
+| Enters reactor? | No (rejects non-OnWaitSource yields) | No |
+| Partial progress? | Possible — via StepProgress | No — `NoProgress` |
+
+#### 5.3.2 Typical one-shot ops
+
+One-shot ops are semantic transitions that follow the five-stage discipline (observe → upgrade → reserve → commit → publish) but never block:
+
+- **Credential changes**: `setuid`, `setgid`, `setresuid` — observe current cred, upgrade to witness, reserve slot, commit new cred, publish signal.
+- **Process state**: `setsid`, `setpgid` — observe session/group, commit new binding, publish.
+- **Signal mask**: `sigprocmask` — observe current mask, commit new mask, publish (no signal fire needed for mask-only changes).
+- **Fd table**: `close`, `dup3` — observe fd slot, upgrade to reservation, commit slot mutation, publish fd-table change signal.
+- **Directory mutations**: `mkdir`, `unlink`, `symlink` — observe parent dentry, reserve name slot, commit dentry/rnode, publish inotify/dnotify.
+- **Simple stat**: `fstat`, `statx` — observe inode metadata under guard, copy to user, return.
+
+These ops benefit from the `StepOp` discipline (auditable stages, witness scoping, publication ordering) but not from the async driver machinery (no yield, no resume, no mailbox).
+
 ## 6. One-step operations (preserved from v1)
 
 <!-- txdoc:STEP-V2-ONE-STEP-1 -->

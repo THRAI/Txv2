@@ -98,9 +98,8 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     let payload_guard = parent.payload.lock();
     let was_last = match payload_guard.as_ref() {
         Some(payload) => {
-            let mut threads = payload.threads.lock();
-            threads.retain(|t| t.key() != thread.key());
-            threads.is_empty()
+            payload.threads.retain(|t| t.key() != thread.key());
+            payload.threads.count() == 0
         }
         None => return,
     };
@@ -397,7 +396,7 @@ mod step_op_wraps {
     ) -> Cap<ThreadIdentity> {
         let payload_guard = proc_cap.payload.lock();
         let payload = payload_guard.as_ref().expect("alive");
-        let threads = payload.threads.lock();
+        let threads = payload.threads.snapshot();
         threads[0].clone()
     }
 

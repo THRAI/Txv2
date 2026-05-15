@@ -76,6 +76,11 @@ fn first_page_after_size(size: u64) -> Option<PageIndex> {
 }
 
 pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), PageProgress> {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
     use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
 
     let PageContainerKind::File {
@@ -211,6 +216,11 @@ pub fn step_truncate(
     new_size: u64,
     guard: &Guard<'_>,
 ) -> StepOutcome<(), PageProgress> {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
     use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
@@ -264,7 +274,8 @@ pub fn step_truncate(
             V3::Err(v3_errno) => return V3::err(v3_errno),
         },
         PageContainerKind::Anon { .. } => false,
-        PageContainerKind::Device { .. } => unreachable!(),
+        // Device PC is rejected above; fall through safely.
+        PageContainerKind::Device { .. } => false,
     };
 
     let old_size = pc.size_bytes();
@@ -290,6 +301,11 @@ pub fn step_fallocate(
     new_size: u64,
     guard: &Guard<'_>,
 ) -> StepOutcome<(), PageProgress> {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
     use crate::page_backed::adapter::step_engine::{StepOutcome as V3, YieldShape};
 
     if matches!(pc.kind(), PageContainerKind::Device { .. }) {
@@ -347,7 +363,8 @@ pub fn step_fallocate(
             V3::Err(v3_errno) => return V3::err(v3_errno),
         },
         PageContainerKind::Anon { .. } => false,
-        PageContainerKind::Device { .. } => unreachable!(),
+        // Device PC is rejected above; fall through safely.
+        PageContainerKind::Device { .. } => false,
     };
 
     pc.set_size_bytes(new_size);

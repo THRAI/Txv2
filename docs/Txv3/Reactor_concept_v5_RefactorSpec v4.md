@@ -2484,6 +2484,11 @@ Do not implement priority donation in R1.
 Do not make mailbox events carry semantic payload.
 Do not let YieldShape resolution change SubjectContext.
 Do not let agent replies become authority.
+
+Do not cover ImmediateSyscall or OneShotStepOp paths.
+  These dispatch lanes do not enter the reactor, do not allocate ActiveWait,
+  and do not register on WaitSource/DelegateEndpoint/TimerToken.
+  The reactor spec covers only the full async drive path.
 ```
 
 ------

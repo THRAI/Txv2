@@ -18,6 +18,7 @@ mod lint_invariants_signal;
 mod lint_invariants_step;
 mod lint_invariants_step_v3;
 mod lint_invariants_subj;
+mod lint_invariants_syscall;
 mod lint_invariants_witness;
 mod observe;
 mod observe_discipline;

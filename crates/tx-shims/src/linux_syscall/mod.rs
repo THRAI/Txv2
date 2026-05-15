@@ -50,13 +50,14 @@ use tx_hal::{EntropyIf, PmapIf, TimeIf, UserPtr};
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_subsystems::cred::{
     step_setgid, step_setregid, step_setresgid, step_setresuid, step_setreuid, step_setuid,
-    Capability, Cred, CredChange, Gid, Uid,
+    Capability, Cred, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp,
+    SetreuidOp, SetuidOp, Uid,
 };
 use tx_subsystems::execution::Errno;
 use tx_subsystems::process::{
-    process_by_pid, seed_child_leader_context, step_chdir, step_exit_group, step_getcwd,
-    step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome, ExitStatus, Pgid, Pid,
-    ProcessIdentity, SetpgidError, SetsidError, WaitError, WaitTarget,
+    process_by_pid, seed_child_leader_context, step_chdir, step_getcwd,
+    step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome, ExitGroupOp, ExitStatus,
+    Pgid, Pid, ProcessIdentity, SetpgidError, SetsidError, WaitError, WaitTarget,
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
@@ -114,9 +115,9 @@ use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 use signalfd::*;
 
 mod ctx;
-pub(super) use ctx::*;
+pub use ctx::*;
 mod result;
-pub(super) use result::*;
+pub use result::*;
 mod user_copy;
 pub(super) use user_copy::*;
 mod helpers;
@@ -143,9 +144,11 @@ pub use numbers::{
     NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID, NR_GETRESUID,
     NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP,
     NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL, NR_LINKAT, NR_LSEEK, NR_MADVISE,
-    NR_MKDIRAT, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
+    NR_MKDIRAT, NR_MLOCK, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
     NR_OPENAT, NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RENAMEAT2,
-    NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_RT_SIGRETURN, NR_SETGID, NR_SETPGID, NR_SETREGID,
+    NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO,
+    NR_RT_SIGRETURN, NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT, NR_SIGALTSTACK, NR_PIDFD_OPEN,
+    NR_PIDFD_SEND_SIGNAL, NR_SETGID, NR_SETPGID, NR_SETREGID,
     NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
     NR_SET_TID_ADDRESS, NR_SIGNALFD, NR_SIGNALFD4, NR_STATX, NR_SYMLINKAT, NR_TGKILL, NR_TIMES,
     NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4,
@@ -261,6 +264,8 @@ pub(super) const EIO_VALUE: i32 = 5;
 /// internal representation). `rt_sigprocmask` / `rt_sigaction`
 /// reject any other value with `-EINVAL`.
 pub(super) const SIGSETSIZE_BYTES: u64 = 8;
+/// Minimum alternate signal stack size (Linux: MINSIGSTKSZ = 2048).
+pub(super) const MINSIGSTKSZ: u64 = 2048;
 /// Size of the kernel `struct sigaction` exchanged via `rt_sigaction`
 /// on RV64 generic ABI.
 ///
@@ -318,6 +323,32 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
+    // ── Lane 1: ImmediateSyscall (pure ABI queries, never yield) ──
+    // Per `docs/Txv3/04_SYSCALL_SHAPE_v1.md §6.1`: these syscalls
+    // do not call drive(), do not enter StepOp, do not construct
+    // YieldShape, and do not access VFS/VM/reactor/timer.
+    match req.nr {
+        NR_GETPID => return sys_getpid(ctx),
+        nr if nr == NR_GETPPID => return sys_getppid(ctx),
+        nr if nr == NR_GETPGRP => return sys_getpgrp(ctx),
+        nr if nr == NR_GETPGID => return sys_getpgid(req.args, ctx),
+        nr if nr == NR_GETSID => return sys_getsid(req.args, ctx),
+        nr if nr == NR_GETUID => return sys_getuid(ctx),
+        nr if nr == NR_GETEUID => return sys_geteuid(ctx),
+        nr if nr == NR_GETGID => return sys_getgid(ctx),
+        nr if nr == NR_GETEGID => return sys_getegid(ctx),
+        nr if nr == NR_GETRESUID => return sys_getresuid(req.args, ctx),
+        nr if nr == NR_GETRESGID => return sys_getresgid(req.args, ctx),
+        nr if nr == NR_TIMES => return sys_times::<P>(req.args, ctx),
+        nr if nr == NR_GETTIMEOFDAY => return sys_gettimeofday::<P>(req.args, ctx),
+        nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
+        nr if nr == NR_UNAME => return sys_uname(req.args, ctx),
+        nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
+        nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
+        _ => {} // fall through to script lanes
+    }
+
+    // ── Lanes 2+3: Script-based (OneShotStepOp + Full async drive) ──
     match req.nr {
         NR_WRITE => sys_write(req.args, ctx).await,
         NR_WRITEV => sys_writev(req.args, ctx).await,
@@ -326,7 +357,6 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         NR_PPOLL => sys_ppoll(req.args, ctx).await,
         NR_EXIT => sys_exit(req.args, ctx),
         NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
-        NR_GETPID => sys_getpid(ctx),
         NR_BRK => sys_brk(req.args, ctx).await,
         NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
         NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
@@ -334,29 +364,19 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
         nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx),
         nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
-        nr if nr == NR_GETPPID => sys_getppid(ctx),
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
-        nr if nr == NR_GETPGID => sys_getpgid(req.args, ctx),
-        nr if nr == NR_GETPGRP => sys_getpgrp(ctx),
-        nr if nr == NR_GETSID => sys_getsid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args),
         // Wave 2 of the DAC + setuid slice — Part 3 (cred-mutation /
         // cred-reading arms). Each wraps a Wave 1 `cred::step_*`
         // helper through the new `ctx.cred()` accessor.
-        nr if nr == NR_GETUID => sys_getuid(ctx),
-        nr if nr == NR_GETEUID => sys_geteuid(ctx),
-        nr if nr == NR_GETGID => sys_getgid(ctx),
-        nr if nr == NR_GETEGID => sys_getegid(ctx),
         nr if nr == NR_SETUID => sys_setuid(req.args, ctx),
         nr if nr == NR_SETGID => sys_setgid(req.args, ctx),
         nr if nr == NR_SETREUID => sys_setreuid(req.args, ctx),
         nr if nr == NR_SETREGID => sys_setregid(req.args, ctx),
         nr if nr == NR_SETRESUID => sys_setresuid(req.args, ctx),
         nr if nr == NR_SETRESGID => sys_setresgid(req.args, ctx),
-        nr if nr == NR_GETRESUID => sys_getresuid(req.args, ctx),
-        nr if nr == NR_GETRESGID => sys_getresgid(req.args, ctx),
         // Wave 4 Part 4 of the DAC + setuid slice — file-mode syscall
         // arms. Each wraps the FsOps surface Wave 3 Part 2 landed
         // (`step_chmod` / `step_chown`) plus a walker-side `access(2)`
@@ -429,6 +449,10 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         // is the only one that may block.
         nr if nr == NR_MMAP => sys_mmap(req.args, ctx),
         nr if nr == NR_MUNMAP => sys_munmap(req.args, ctx),
+        // mlock / munlock are synchronous; the underlying try_mlock
+        // step never yields.
+        nr if nr == NR_MLOCK => sys_mlock(req.args, ctx),
+        nr if nr == NR_MUNLOCK => sys_munlock(req.args, ctx),
         nr if nr == NR_MPROTECT => sys_mprotect(req.args, ctx),
         nr if nr == NR_MREMAP => sys_mremap(req.args, ctx),
         nr if nr == NR_MADVISE => sys_madvise(req.args, ctx),
@@ -448,8 +472,6 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         // timer queue for real-duration sleeps; zero-duration and
         // past-deadline cases short-circuit immediately.
         nr if nr == NR_CLOCK_GETTIME => sys_clock_gettime::<P>(req.args, ctx),
-        nr if nr == NR_GETTIMEOFDAY => sys_gettimeofday::<P>(req.args, ctx),
-        nr if nr == NR_TIMES => sys_times::<P>(req.args, ctx),
         nr if nr == NR_NANOSLEEP => sys_nanosleep::<P>(req.args, ctx).await,
         nr if nr == NR_CLOCK_NANOSLEEP => sys_clock_nanosleep::<P>(req.args, ctx).await,
         // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY
@@ -471,7 +493,6 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_FCHDIR => SyscallResult::Error(ENOSYS_VALUE),
         nr if nr == NR_GETDENTS64 => sys_getdents64(req.args, ctx).await,
         nr if nr == NR_STATX => sys_statx(req.args, ctx).await,
-        nr if nr == NR_UMASK => sys_umask(req.args, ctx),
         // Slice 7 of the shell-prompt roadmap — fcntl extension +
         // day-1 misc syscalls. None individually heavy; each unblocks
         // a specific shell-startup path.
@@ -479,14 +500,11 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_TKILL => sys_tkill(req.args, ctx),
         nr if nr == NR_TGKILL => sys_tgkill(req.args, ctx),
         nr if nr == NR_GETRANDOM => sys_getrandom::<P>(req.args, ctx),
-        nr if nr == NR_UNAME => sys_uname(req.args, ctx),
-        nr if nr == NR_PRLIMIT64 => sys_prlimit64(req.args, ctx),
         // rt_sigreturn: deferred. Returns -ENOSYS — the
         // SignalFrameIf::restore_signal_frame surface needs the trap
         // frame which the dispatcher does not yet pass through. The
         // dispatcher ENOSYS path matches; arm explicitly written for
         // grep-stability and future wiring.
-        nr if nr == NR_RT_SIGRETURN => sys_rt_sigreturn(ctx),
         // Slice 8 of the shell-prompt roadmap — file-mutation syscalls.
         // Each arm wraps an in-tree `FsOps::*` step body
         // (`mkdir`/`rmdir`/`unlink`/`rename`/`link`/`symlink`/
@@ -634,6 +652,9 @@ pub(super) const EISDIR_VALUE: i32 = 21;
 /// Used by Slice 6's `sys_chdir` when the resolved path is not a
 /// directory and by `sys_getdents64` for a non-directory fd.
 pub(super) const ENOTDIR_VALUE: i32 = 20;
+/// Linux generic ABI errno value for "interrupted system call" (`EINTR`).
+/// Used by `sys_rt_sigsuspend`.
+pub(super) const EINTR_VALUE: i32 = 4;
 /// Linux generic ABI errno value for "result out of range" (`ERANGE`).
 /// Used by Slice 6's `sys_getcwd` when the user buffer is too small
 /// for the rendered cwd path (NUL terminator inclusive).

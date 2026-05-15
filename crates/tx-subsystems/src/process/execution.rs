@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use tx_hal::{PmapIf, UserTrapContext};
 
 use crate::process::adapter::step_engine::{
-    self, Cap, IdentRef, NoProgress, OperationalCapExt, PayloadCap, ScriptCtx, SpinMutex, StepOp,
-    StepOutcome, SubjectIdentity, Weak, ZoneError,
+    self, Cap, IdentRef, NoProgress, OneShotStepOp, OperationalCapExt, PayloadCap, ScriptCtx,
+    SpinMutex, StepOp, StepOutcome, SubjectIdentity, Weak, ZoneError,
 };
 use crate::process::adapter::wait_routing::{self, Mask};
 
@@ -18,11 +18,49 @@ use crate::process::structure::{
     allocate_pid, ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,
     Sid,
 };
+use crate::process::topology::{ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers};
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::execution::set_thread_zombie;
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload};
 use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
+
+// ---------------------------------------------------------------------------
+// Global PID → ProcessIdentity table (for procfs / kill cross-pid lookup)
+// ---------------------------------------------------------------------------
+
+static PID_TABLE: SpinMutex<BTreeMap<Pid, Weak<ProcessIdentity>>> = SpinMutex::new(BTreeMap::new());
+
+/// Register a process in the global PID table. Called at `step_fork`
+/// and `bootstrap_init_process`.
+pub(crate) fn register_pid(pid: Pid, proc: Weak<ProcessIdentity>) {
+    PID_TABLE.lock().insert(pid, proc);
+}
+
+/// Remove a process from the global PID table. Called at
+/// `step_process_exit`.
+pub(crate) fn unregister_pid(pid: Pid) {
+    PID_TABLE.lock().remove(&pid);
+}
+
+/// Look up a process by PID. Returns `None` if the PID is not
+/// registered or the process has been reclaimed.
+/// Return all registered PIDs with alive/zombie status.
+/// Used by procfs `/proc` directory listings.
+pub fn all_pids() -> alloc::vec::Vec<(Pid, bool)> {
+    let table = PID_TABLE.lock();
+    table
+        .iter()
+        .map(|(&pid, weak)| (pid, weak.upgrade(&step_engine::guard()).is_some()))
+        .collect()
+}
+
+pub fn process_by_pid(pid: Pid) -> Option<Cap<ProcessIdentity>> {
+    let guard = step_engine::guard();
+    PID_TABLE.lock().get(&pid)?.upgrade(&guard)
+}
+
+
 
 /// Bootstrap value for the program-break base, per the Trio plan
 /// §"Cross-cutting risks #7". Used by `bootstrap_init_process` to
@@ -50,48 +88,6 @@ static INIT_PROCESS: SpinMutex<Option<Cap<ProcessIdentity>>> = SpinMutex::new(No
 /// freely without touching the global slot.
 pub fn init_process() -> Option<Cap<ProcessIdentity>> {
     INIT_PROCESS.lock().clone()
-}
-
-/// Resolve `pid` to a `Cap<ProcessIdentity>` by walking the
-/// process tree rooted at init.
-///
-/// Slice 7 of the shell-prompt roadmap (2026-05-07) introduces this
-/// resolver to back `kill(pid, sig)`. Day-1 has no global pid →
-/// Cap<ProcessIdentity> registry — every process is reachable from
-/// init via the `children` vectors that `step_fork` pushes onto the
-/// parent. The walk visits the init root then recurses through each
-/// `payload.children` snapshot until either the matching pid is found
-/// or every node has been visited.
-///
-/// Live and zombie processes alike are visited (zombies remain in
-/// `parent.children` until reaped per §8.5). Returns `None` if no
-/// process in the tree carries `pid`. Returns `None` before
-/// `bootstrap_init_process` has run.
-///
-/// The walk takes per-process `payload.children` snapshots (`.clone()`
-/// of the `Vec<Cap<ProcessIdentity>>` under the `SpinMutex`), so the
-/// children lock is released before recursion and never held across
-/// callees.
-///
-/// O(n) in the number of live + zombie processes — acceptable for
-/// day-1 where process counts stay small. A future global pid table
-/// (`TODO(phase-pid-resolver)`) would replace this with O(1) lookup.
-pub fn process_by_pid(pid: Pid) -> Option<Cap<ProcessIdentity>> {
-    let init = init_process()?;
-    walk_process_tree(&init, pid)
-}
-
-fn walk_process_tree(node: &Cap<ProcessIdentity>, pid: Pid) -> Option<Cap<ProcessIdentity>> {
-    if node.pid == pid {
-        return Some(node.clone());
-    }
-    let children = node.children.lock().clone();
-    for child in children {
-        if let Some(found) = walk_process_tree(&child, pid) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -245,8 +241,8 @@ pub fn bootstrap_init_process(
 
     let proc_cap = sign_process_identity(pid, None, pgrp.clone())?;
 
-    pgrp.members.lock().push(proc_cap.downgrade());
-    pgrp.session.members.lock().push(pgrp.downgrade());
+    pgrp.members.attach(proc_cap.downgrade());
+    pgrp.session.members.attach(pgrp.downgrade());
 
     let leader = sign_thread(proc_cap.downgrade())?;
     // Day-1: init has no cwd until a rootfs is mounted and an
@@ -349,6 +345,7 @@ pub fn step_fork<P: PmapIf>(
     let child_proc =
         sign_process_identity(child_pid, Some(parent.downgrade()), parent_pgrp.clone())
             .map_err(ForkError::Zone)?;
+    register_pid(child_pid, child_proc.downgrade());
 
     // Leader thread.
     let leader = sign_thread(child_proc.downgrade()).map_err(ForkError::Zone)?;
@@ -375,13 +372,13 @@ pub fn step_fork<P: PmapIf>(
     *child_proc.payload.lock() = Some(payload);
 
     // Register child in parent's pgrp.
-    parent_pgrp.members.lock().push(child_proc.downgrade());
+    parent_pgrp.members.attach(child_proc.downgrade());
 
     // Register child in parent's children list. Materialization of the
     // upward `parent` binding per `PROCESS_v1` §2.1. The list holds
     // strong `Cap` refs — children stay observable here until reaped
     // (§8.5).
-    parent.children.lock().push(child_proc.clone());
+    parent.children.attach(child_proc.clone());
 
     Ok(child_proc)
 }
@@ -487,12 +484,13 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     // reserve
     // commit
     // publish
+    unregister_pid(process.pid);
     session_leader_hangup_cascade(process);
     sever_children(process);
 
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
-        let drained: Vec<Cap<ThreadIdentity>> = core::mem::take(&mut *payload.threads.lock());
+        let drained: Vec<Cap<ThreadIdentity>> = payload.threads.drain();
         for thread in &drained {
             set_thread_zombie(thread, status.wait_status_word());
         }
@@ -525,6 +523,7 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
     // reserve
     // commit
     // publish
+    unregister_pid(process.pid);
     session_leader_hangup_cascade(process);
     sever_children(process);
     *process.exit_status.lock() = Some(status);
@@ -548,17 +547,16 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
 /// In every case the exiting process's `children` list is drained,
 /// so post-sever the dying process owns no child Caps.
 fn sever_children(process: &Cap<ProcessIdentity>) {
-    let children: Vec<Cap<ProcessIdentity>> = core::mem::take(&mut *process.children.lock());
+    let children: Vec<Cap<ProcessIdentity>> = process.children.drain();
 
     let init = init_process();
     let target = init.as_ref().filter(|i| i.key() != process.key());
 
     if let Some(init) = target {
         let init_weak = init.downgrade();
-        let mut init_children = init.children.lock();
         for child in children {
             *child.parent.lock() = Some(init_weak);
-            init_children.push(child);
+            init.children.attach(child);
         }
     } else {
         for child in children {
@@ -630,11 +628,8 @@ fn session_leader_hangup_cascade(process: &Cap<ProcessIdentity>) {
         // true orphan detection.
         let members: alloc::vec::Vec<Cap<ProcessGroup>> = {
             let guard = step_engine::guard();
-            session
-                .members
-                .lock()
-                .iter()
-                .filter_map(|w| w.upgrade(&guard))
+            session.members.snapshot_live(&guard)
+                .into_iter()
                 .filter(|pgrp| pgrp.key() != fg_pgrp.key())
                 .collect()
         };
@@ -745,7 +740,7 @@ pub fn step_waitpid_nohang(
     // Phase 1: walk children once. Track whether any child matches the
     // selector at all (regardless of zombie state) so we can
     // distinguish ECHILD (no match) from NoneReady (match but live).
-    let snapshot: Vec<Cap<ProcessIdentity>> = parent.children.lock().clone();
+    let snapshot: Vec<Cap<ProcessIdentity>> = parent.children.snapshot();
 
     let mut any_match = false;
     let mut reapable: Option<Cap<ProcessIdentity>> = None;
@@ -777,10 +772,10 @@ pub fn step_waitpid_nohang(
     let status = child.exit_status().expect("zombie has exit_status");
     let key = child.key();
 
-    parent.children.lock().retain(|c| c.key() != key);
+    parent.children.retain(|c| c.key() != key);
 
     let pgrp = child.pgrp_cap();
-    pgrp.members.lock().retain(|weak| {
+    pgrp.members.retain(|weak| {
         weak.observe_with_guard(|ident| ident.key() != key)
             .unwrap_or(true)
     });
@@ -864,8 +859,8 @@ pub fn step_setpgid(target: &Cap<ProcessIdentity>, new_pgid: Pgid) -> Result<(),
     let session = old_pgrp.session.clone();
 
     let new_pgrp = sign_process_group(new_pgid, session)?;
-    new_pgrp.session.members.lock().push(new_pgrp.downgrade());
-    new_pgrp.members.lock().push(target.downgrade());
+    new_pgrp.session.members.attach(new_pgrp.downgrade());
+    new_pgrp.members.attach(target.downgrade());
 
     // Drop target from old pgrp.
     drop_member(&old_pgrp, target);
@@ -890,8 +885,8 @@ pub fn step_setsid(target: &Cap<ProcessIdentity>) -> Result<Sid, SetsidError> {
     let new_session = sign_session(new_sid)?;
     let new_pgrp = sign_process_group(new_pgid, new_session.clone())?;
 
-    new_session.members.lock().push(new_pgrp.downgrade());
-    new_pgrp.members.lock().push(target.downgrade());
+    new_session.members.attach(new_pgrp.downgrade());
+    new_pgrp.members.attach(target.downgrade());
 
     let old_pgrp = target.pgrp.lock().clone();
     drop_member(&old_pgrp, target);
@@ -928,7 +923,7 @@ fn sign_session(sid: Sid) -> Result<Cap<Session>, ZoneError> {
     step_engine::sign(Session {
         sid,
         controlling_tty: SpinMutex::new(None),
-        members: SpinMutex::new(Vec::new()),
+        members: SessionMembers::new(),
     })
 }
 
@@ -936,7 +931,7 @@ fn sign_process_group(pgid: Pgid, session: Cap<Session>) -> Result<Cap<ProcessGr
     step_engine::sign(ProcessGroup {
         pgid,
         session,
-        members: SpinMutex::new(Vec::new()),
+        members: ProcessGroupMembers::new(),
     })
 }
 
@@ -948,7 +943,7 @@ fn sign_process_identity(
     step_engine::sign(ProcessIdentity {
         pid,
         parent: SpinMutex::new(parent),
-        children: SpinMutex::new(Vec::new()),
+        children: ProcessChildren::new(),
         pgrp: SpinMutex::new(pgrp),
         exit_status: SpinMutex::new(None),
         payload: SpinMutex::new(None),
@@ -1006,7 +1001,7 @@ fn sign_process_payload(
 
     let cap = step_engine::sign(ProcessPayload {
         aspace: aspace_slot,
-        threads: SpinMutex::new(threads),
+        threads: ProcessThreads::from_vec(threads),
         sig_actions: SigActionTable::new(),
         group_pending: PendingSignalQueue::new(),
         siginfo_slots: crate::signal::SigInfoSlots::new(),
@@ -1029,6 +1024,9 @@ fn sign_process_payload(
         exit_source_id,
         exit_wait_source,
         exit_source_bus: RawQueue::new(),
+        _cmdline: SpinMutex::new(None),
+        _exe_file: SpinMutex::new(None),
+        _comm: SpinMutex::new([0u8; 16]),
     })?;
     Ok(PayloadCap::from_cap(cap))
 }
@@ -1062,14 +1060,14 @@ pub fn spawn_sibling_thread_for_test(
 ) -> Result<Cap<ThreadIdentity>, ZoneError> {
     let sibling = sign_thread(target.downgrade())?;
     if let Some(payload) = target.payload.lock().as_ref() {
-        payload.threads.lock().push(sibling.clone());
+        payload.threads.attach(sibling.clone());
     }
     Ok(sibling)
 }
 
 fn drop_member(pgrp: &Cap<ProcessGroup>, target: &Cap<ProcessIdentity>) {
     let target_key = target.key();
-    pgrp.members.lock().retain(|weak| {
+    pgrp.members.retain(|weak| {
         weak.observe_with_guard(|ident| ident.key() != target_key)
             .unwrap_or(true)
     });
@@ -1143,6 +1141,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ExitGroupOp<'a> {
     }
 }
 
+impl OneShotStepOp<crate::process::ProcessIdentity> for ExitGroupOp<'_> {}
+
 /// `StepOp` wrap of [`step_exit_group_with_signal`].
 pub struct ExitGroupWithSignalOp<'a> {
     pub process: &'a Cap<ProcessIdentity>,
@@ -1188,6 +1188,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChdirOp<'a> {
     }
 }
 
+impl OneShotStepOp<crate::process::ProcessIdentity> for ChdirOp<'_> {}
+
 /// `StepOp` wrap of [`step_getcwd`].
 pub struct GetcwdOp<'a> {
     pub target: &'a Cap<ProcessIdentity>,
@@ -1200,6 +1202,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for GetcwdOp<'a> {
         StepOutcome::Done(step_getcwd(self.target))
     }
 }
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for GetcwdOp<'_> {}
 
 /// `StepOp` wrap of [`step_setpgid`].
 pub struct SetpgidOp<'a> {
