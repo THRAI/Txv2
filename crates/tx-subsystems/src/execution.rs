@@ -26,6 +26,9 @@ pub enum Errno {
     EEXIST,
     EFAULT,
     EINVAL,
+    /// Interrupted system call (EINTR path — D9-A signal delivery
+    /// during a blocked wait).
+    EINTR,
     EIO,
     EISDIR,
     ELOOP,
@@ -78,6 +81,7 @@ impl From<Errno> for crate::adapter::step_engine::V3Errno {
             Errno::EEXIST => Self::EEXIST,
             Errno::EFAULT => Self::EFAULT,
             Errno::EINVAL => Self::EINVAL,
+            Errno::EINTR => Self::EINTR,
             Errno::EIO => Self::EIO,
             Errno::EISDIR => Self::EISDIR,
             Errno::ELOOP => Self::ELOOP,
@@ -120,6 +124,7 @@ impl From<crate::adapter::step_engine::V3Errno> for Errno {
             V3::EEXIST => Errno::EEXIST,
             V3::EFAULT => Errno::EFAULT,
             V3::EINVAL => Errno::EINVAL,
+            V3::EINTR => Errno::EINTR,
             V3::EIO => Errno::EIO,
             V3::EISDIR => Errno::EISDIR,
             V3::ELOOP => Errno::ELOOP,
@@ -139,6 +144,7 @@ impl From<crate::adapter::step_engine::V3Errno> for Errno {
             V3::ESPIPE => Errno::ESPIPE,
             V3::ESRCH => Errno::ESRCH,
             V3::ESTALE => Errno::ESTALE,
+            V3::EINTR => Errno::EINTR,
         }
     }
 }
@@ -191,7 +197,7 @@ mod tests {
         // `step_v3::Errno` + the From impl) fails to compile or this
         // test fails immediately.
         use crate::adapter::step_engine::V3Errno as V3;
-        let table: [(Errno, V3); 27] = [
+        let table: [(Errno, V3); 28] = [
             (Errno::EACCES, V3::EACCES),
             (Errno::EAGAIN, V3::EAGAIN),
             (Errno::EBADF, V3::EBADF),
@@ -200,6 +206,7 @@ mod tests {
             (Errno::EEXIST, V3::EEXIST),
             (Errno::EFAULT, V3::EFAULT),
             (Errno::EINVAL, V3::EINVAL),
+            (Errno::EINTR, V3::EINTR),
             (Errno::EIO, V3::EIO),
             (Errno::EISDIR, V3::EISDIR),
             (Errno::ELOOP, V3::ELOOP),

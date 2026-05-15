@@ -52,6 +52,9 @@ pub enum Errno {
     EEXIST,
     EFAULT,
     EINVAL,
+    /// Interrupted system call (e.g. by signal delivery during a
+    /// blocked wait — D9-A EINTR path).
+    EINTR,
     EIO,
     EISDIR,
     ELOOP,
