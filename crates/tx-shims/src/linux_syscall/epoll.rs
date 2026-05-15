@@ -121,8 +121,13 @@ pub(super) fn sys_epoll_ctl(
     // Call the appropriate step function.
     let _guard = execution::guard();
     let ep_ref = ep_cap.as_ref();
+    // Phase B.2: resolve the monitored fd's WaitSourceId.
+    // Placeholder — Phase B.3 will look up the fd's bus wire.
+    let source = tx_subsystems::adapter::step_engine::WaitSourceId::new(0);
     let outcome = match op {
-        EPOLL_CTL_ADD | EPOLL_CTL_MOD => epoll::step_epoll_ctl_add(ep_ref, fd, interests),
+        EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
+            epoll::step_epoll_ctl_add(ep_ref, fd, interests, source)
+        }
         EPOLL_CTL_DEL => epoll::step_epoll_ctl_del(ep_ref, fd),
         _ => unreachable!(),
     };

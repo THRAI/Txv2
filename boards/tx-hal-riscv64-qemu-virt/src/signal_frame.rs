@@ -10,8 +10,9 @@ use core::mem::{offset_of, size_of};
 use crate::user_access::{board_copy_from_user, board_copy_to_user};
 use crate::Platform;
 use tx_hal::{
-    FaultInfo, Pod, SavedSignalFrame, SignalFrameIf, SignalFramePlacement, SignalFrameWrite,
-    SignalHandlerRegs, TrapFrameMut, UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr,
+    FaultInfo, Pod, SavedSignalFrame, SignalFrameBytes, SignalFrameIf, SignalFramePlacement,
+    SignalFrameWrite, SignalHandlerRegs, TrapFrameMut, UserPtr, UserSignalMaskAbi,
+    UserTrapContext, VirtAddr,
 };
 
 const RV64_SIGFRAME_ALIGN: usize = 16;
@@ -154,6 +155,61 @@ impl SignalFrameIf for Platform {
 
     fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {
         tf.rewind_pc(4);
+    }
+
+    fn prepare_signal_frame(
+        ctx: &UserTrapContext,
+        setup: &SignalFrameWrite,
+    ) -> Result<(UserTrapContext, SignalFrameBytes), FaultInfo> {
+        let frame_size = size_of::<Rv64SignalFrame>();
+        let user_sp = UserPtr::<u8>::new(ctx.regs[2]); // sp = x2
+
+        let Some(unrounded) = user_sp.addr().checked_sub(frame_size) else {
+            return Err(FaultInfo {
+                address: VirtAddr(user_sp.addr()),
+                write: true,
+                instruction: false,
+                from_user: false,
+            });
+        };
+        let frame_addr = align_down(unrounded, RV64_SIGFRAME_ALIGN);
+
+        // Build the signal frame with the full context.
+        let frame = Rv64SignalFrame {
+            magic: RV64_SIGFRAME_MAGIC,
+            version: RV64_SIGFRAME_VERSION,
+            frame_size: frame_size as u32,
+            sig_no: setup.sig_no,
+            _reserved0: 0,
+            flags: setup.flags.bits,
+            siginfo: setup.siginfo,
+            saved_mask: setup.old_mask,
+            user_context: *ctx,
+            trampoline: RV64_SIGRETURN_TRAMPOLINE,
+        };
+
+        // SAFETY: Rv64SignalFrame is Pod.
+        let frame_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                &frame as *const Rv64SignalFrame as *const u8,
+                frame_size,
+            )
+        };
+
+        let trampoline_pc = frame_addr + offset_of!(Rv64SignalFrame, trampoline);
+
+        // Build handler-entry UserTrapContext.
+        let mut handler_ctx = *ctx;
+        handler_ctx.pc = setup.handler_pc.addr();
+        handler_ctx.regs[2] = frame_addr; // sp
+        handler_ctx.regs[1] = trampoline_pc; // ra
+        let siginfo_addr = frame_addr + offset_of!(Rv64SignalFrame, siginfo);
+        let ucontext_addr = frame_addr + offset_of!(Rv64SignalFrame, user_context);
+        handler_ctx.regs[10] = setup.sig_no as usize; // a0
+        handler_ctx.regs[11] = siginfo_addr;           // a1
+        handler_ctx.regs[12] = ucontext_addr;          // a2
+
+        Ok((handler_ctx, SignalFrameBytes::from_slice(frame_bytes)))
     }
 }
 

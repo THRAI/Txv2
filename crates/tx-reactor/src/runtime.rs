@@ -200,6 +200,7 @@ impl Reactor {
 
     /// Advances the reactor-owned absolute nanosecond clock and wakes expired timers.
     pub fn advance_time_to(&mut self, now_ns: u64) -> usize {
+        self.timer_wheel.fire_due(now_ns);
         self.timers.advance_time_to(now_ns)
     }
 

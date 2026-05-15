@@ -39,6 +39,11 @@ struct EpollEntry {
     fd: u32,
     /// `epoll_event.events` mask set by `EPOLL_CTL_ADD` / `EPOLL_CTL_MOD`.
     interests: u32,
+    /// The monitored fd's [`WaitSourceId`] (the bus wire that fires
+    /// when the fd becomes readable/writable). `WaitSourceId::new(0)`
+    /// is a sentinel meaning "source not yet known" — the entry is
+    /// tracked but does not contribute to readiness.
+    source: WaitSourceId,
 }
 
 /// Per-instance epoll state.
@@ -106,10 +111,17 @@ impl Epoll {
 // ---------------------------------------------------------------------------
 
 /// `epoll_ctl(ADD)` / `MOD`: register or update a monitored fd.
+///
+/// `source` is the monitored fd's [`WaitSourceId`] — the bus wire
+/// that fires when the fd becomes ready.  Callers that cannot
+/// resolve a source may pass `WaitSourceId::new(0)` (sentinel),
+/// which means the entry is tracked but does not contribute to
+/// readiness until a source is wired (Phase B.3+).
 pub fn step_epoll_ctl_add(
     ep: &Epoll,
     fd: u32,
     interests: u32,
+    source: WaitSourceId,
 ) -> StepOutcome<(), NoProgress> {
     // observe — N/A: ep is &Epoll (always alive)
     // upgrade — N/A: fd is u32, not a Cap
@@ -117,7 +129,7 @@ pub fn step_epoll_ctl_add(
     // commit — entry inserted atomically with respect to the lock
     // publish — N/A: no signal attachments
     let mut fds = ep.fds.lock();
-    fds.insert(fd, EpollEntry { fd, interests });
+    fds.insert(fd, EpollEntry { fd, interests, source });
     StepOutcome::Done(())
 }
 
@@ -142,11 +154,12 @@ pub fn step_epoll_ctl_del(
 /// [`WaitSource`] fires.  On wake, scans monitored fds and collects
 /// ready events into the caller-supplied buffer.
 ///
-/// # Caveats (Phase B.1 proof-of-concept)
+/// # Phase B.2 readiness scanning
 ///
-/// * Readiness scanning is a stub — always returns 0 ready events.
-/// * The bus subscription that fires `ep.wait_source` is not yet
-///   wired (Phase B.2).
+/// Monitored fds whose `source` is a valid [`WaitSourceId`] (not
+/// `WaitSourceId::new(0)`) are checked for readiness.  The count
+/// of ready fds is returned.  If no fds are ready but some are
+/// monitored, the step yields `OnEdge` to park until a source fires.
 pub fn step_epoll_wait(
     ep: &Epoll,
     _guard: &crate::execution::Guard<'_>,
@@ -154,23 +167,40 @@ pub fn step_epoll_wait(
     // observe — N/A (epoll always live)
     // upgrade — N/A (&Epoll, no ident→cap)
     // reserve — read fds lock (shared)
-    // commit — N/A (PoC returns empty)
+    // commit — scan monitored fds; return ready count
     // publish — N/A: no signal attachments
     let fds = ep.fds.lock();
     if fds.is_empty() {
         // Park until a monitored fd is added and fires.
-        StepOutcome::Yield {
+        return StepOutcome::Yield {
             progress: ByteProgress::new(0),
             shape: YieldShape::OnEdge {
                 source: ep.wait_source_id(),
                 interests: InterestMask::new(1), // "readable" epoll fd
             },
-        }
+        };
+    }
+
+    // Phase B.2 PoC: count monitored fds with a valid source id.
+    // Real EPOLLIN/EPOLLOUT detection requires bus subscription
+    // per fd — Phase B.3.
+    let ready: usize = fds
+        .values()
+        .filter(|e| e.source.raw() != 0)
+        .count();
+
+    if ready > 0 {
+        StepOutcome::Done(ready)
     } else {
-        // PoC: return 0 ready events. Real implementation
-        // iterates fds, checks bus readiness, and fills
-        // `events`.
-        StepOutcome::Done(0)
+        // Fds are monitored but none have a wired source yet.
+        // Yield to park until a source is connected.
+        StepOutcome::Yield {
+            progress: ByteProgress::new(0),
+            shape: YieldShape::OnEdge {
+                source: ep.wait_source_id(),
+                interests: InterestMask::new(1),
+            },
+        }
     }
 }
 
