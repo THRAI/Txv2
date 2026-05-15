@@ -1116,34 +1116,34 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 
     let walker_cred = ctx.walker_cred();
 
-    // AT_EMPTY_PATH + empty path: stat the cwd itself. No walker
-    // invocation — the cwd dentry's rnode meta is the answer.
-    let dentry: Cap<DEntry> = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        match ctx.process.cwd() {
-            Some(d) => d,
-            None => return SyscallResult::Error(ENOENT_VALUE),
-        }
+    // AT_EMPTY_PATH + empty path: stat the cwd itself directly,
+    // bypassing the walker. Otherwise use StatOp + drive_oneshot.
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let meta = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
+        cwd.rnode().meta()
     } else {
-        let cwd = match ctx.process.cwd() {
-            Some(d) => d,
-            None => return SyscallResult::Error(ENOENT_VALUE),
-        };
-        use StepOutcome as V3;
-        let outcome = {
+        let result = {
             let guard = step_engine::guard();
-            step_walk(cwd, &path, &walker_cred, &guard)
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = StatOp {
+                rooted_at: &cwd,
+                path: &path,
+                cred: &walker_cred,
+                guard: &guard,
+                target: None,
+            };
+            step_engine::drive_oneshot(&mut op, &mut script_ctx)
         };
-        match outcome {
-            V3::Done(d) => d,
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        match result {
+            Ok(m) => m,
+            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
         }
     };
 
-    let rnode = dentry.rnode();
-    let meta = rnode.meta();
+    let rnode = cwd.rnode();
     let ino = rnode.fs_object_id().as_u64();
     let stat = inode_meta_to_stat(&meta, ino, 0);
 

@@ -19,10 +19,11 @@
 //! the wheel and [`crate::step::DelegateRegistry`] are substrate
 //! types, so the routing call is a same-crate edge.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{sync::Arc, sync::Weak, vec::Vec};
 
 use crate::step::{Deadline, DelegateRegistry, DelegateTokenId};
 use crate::sync::SpinMutex;
+use crate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 /// Opaque identifier for a timer registered on a [`TimerWheel`].
 ///
@@ -111,7 +112,6 @@ pub enum TimerGuardRole {
 /// `delegate_token = None` because the runtime has no
 /// per-entry routing target for `PrimarySleep` / `DeadlineAbort`
 /// (those wake their bound waiter via a different path).
-#[derive(Clone, Copy, Debug)]
 struct Entry {
     token: TimerToken,
     deadline: Deadline,
@@ -119,6 +119,11 @@ struct Entry {
     /// `Some(id)` only for `DelegateTimeout` entries installed via
     /// [`TimerWheel::install_delegate_timeout`].
     delegate_token: Option<DelegateTokenId>,
+    /// Task mailbox to post `TimerFired` to on expiry (PR-8B).
+    /// `None` for entries installed without a task binding
+    /// (e.g. `install_delegate_timeout` which uses the registry
+    /// callback path instead).
+    mailbox: Option<Weak<TaskMailbox>>,
 }
 
 struct TimerWheelState {
@@ -194,6 +199,7 @@ impl TimerWheel {
                 deadline,
                 role,
                 delegate_token: None,
+                mailbox: None,
             });
             token
         };
@@ -202,6 +208,63 @@ impl TimerWheel {
             token,
             deadline,
             role,
+        }
+    }
+
+    /// Install a timer for a specific task (PR-8B). Like
+    /// [`Self::install`] but also stores a weak reference to the
+    /// task's [`TaskMailbox`] so [`Self::fire_due`] can post a
+    /// `TimerFired` event on expiry.
+    pub fn install_for_task(
+        &self,
+        deadline: Deadline,
+        role: TimerGuardRole,
+        mailbox: Weak<TaskMailbox>,
+    ) -> TimerGuard {
+        let token = {
+            let mut state = self.state.lock();
+            let raw = state.next_token;
+            state.next_token = state.next_token.wrapping_add(1);
+            let token = TimerToken(raw);
+            state.entries.push(Entry {
+                token,
+                deadline,
+                role,
+                delegate_token: None,
+                mailbox: Some(mailbox),
+            });
+            token
+        };
+        TimerGuard {
+            wheel: Some(self.clone_handle()),
+            token,
+            deadline,
+            role,
+        }
+    }
+
+    /// Fire all entries whose deadline has passed (PR-8B
+    /// wheel-mechanics fire path). For each expired entry, posts a
+    /// [`MailboxEvent::TimerFired`] to the bound task mailbox
+    /// (if present). Retires expired entries from the wheel.
+    ///
+    /// Called by the reactor's clock tick.
+    pub fn fire_due(&self, now_ns: u64) {
+        let mut state = self.state.lock();
+        let mut i = 0;
+        while i < state.entries.len() {
+            if state.entries[i].deadline.raw() <= now_ns {
+                let entry = state.entries.remove(i);
+                if let Some(ref mb_weak) = entry.mailbox {
+                    if let Some(mb) = mb_weak.upgrade() {
+                        let _ = mb.post(MailboxEvent::TimerFired {
+                            token: entry.token,
+                        });
+                    }
+                }
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -233,6 +296,7 @@ impl TimerWheel {
                 deadline,
                 role: TimerGuardRole::DelegateTimeout,
                 delegate_token: Some(delegate_token),
+                mailbox: None,
             });
             token
         };

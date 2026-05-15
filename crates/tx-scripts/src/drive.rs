@@ -266,25 +266,21 @@ async fn resolve_on_timer(
     // Convert TimerId → TimerToken (From impl added in PR-7).
     let timer_token = TimerToken::from(token);
 
-    // Install the timer. The guard auto-cancels on drop.
-    let _guard = tw.install(deadline, TimerGuardRole::PrimarySleep);
-    // guard holds the timer registration alive.
+    // PR-8B: Install the timer with a weak mailbox reference so
+    // the reactor's clock tick can post TimerFired on expiry.
+    let _guard = tw.install_for_task(
+        deadline,
+        TimerGuardRole::PrimarySleep,
+        Arc::downgrade(mbox),
+    );
 
-    // Park on mailbox. The reactor's timer-tick path fires the
-    // timer wheel, which posts a mailbox event (PR-8 wiring).
-    //
-    // Until PR-8 lands the fire path, use a simple generation-based
-    // wait: re-poll immediately. The step will see the timer hasn't
-    // fired yet and re-yield. Nonblocking mode translates to EAGAIN.
-    let gen = mbox.next_generation();
-    await_mailbox_event(mbox, |_event| {
-        // TODO(PR-8): match on TimerFired(token) event.
-        // For now, any wake is treated as a timer fire.
-        true
+    // Park on mailbox until the reactor's timer-tick fires the
+    // wheel and posts a TimerFired event for our token.
+    await_mailbox_event(mbox, |event| match event {
+        MailboxEvent::TimerFired { token: fired } => *fired == timer_token,
+        _ => false,
     })
     .await;
-    // Suppress unused warning for gen.
-    let _ = gen;
 
     ResumeOutcome::TimerExpired(token)
 }

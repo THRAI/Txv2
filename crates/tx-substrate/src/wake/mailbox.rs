@@ -37,6 +37,7 @@ use core::task::Waker;
 use alloc::collections::VecDeque;
 
 use crate::step::{AbortReason, DelegateTokenId, InterestMask, WaitSourceId};
+use crate::wake::timer::TimerToken;
 use crate::SpinMutex;
 
 /// Generation counter for a [`TaskMailbox`]'s currently-active wait.
@@ -182,6 +183,13 @@ pub enum MailboxEvent {
     /// - `thread_runtime::execution::set_thread_zombie`
     ///   (terminal-state notification so a parked future observes
     ///   `summary.termination` and resolves to `Killed`/`Interrupted`).
+    /// A [`TimerWheel`] entry has expired (PR-8B). The driver matches
+    /// this against the in-flight `OnTimer` wait's token to resolve
+    /// the yield via `ResumeOutcome::TimerExpired`.
+    ///
+    /// Posted by [`TimerWheel::fire_due`] when the reactor's clock
+    /// tick advances past the entry's deadline.
+    TimerFired { token: TimerToken },
     SignalDelivered { signum: u32, routing: SignalRouting },
 }
 
@@ -415,7 +423,8 @@ impl ActiveWait {
             }
             MailboxEvent::AgentReplied { .. }
             | MailboxEvent::Abort { .. }
-            | MailboxEvent::SignalDelivered { .. } => false,
+            | MailboxEvent::SignalDelivered { .. }
+            | MailboxEvent::TimerFired { .. } => false,
         }
     }
 }
@@ -442,7 +451,9 @@ pub fn agent_event_matches(event: &MailboxEvent, expected: DelegateTokenId) -> b
     match event {
         MailboxEvent::AgentReplied { token_id } => *token_id == expected,
         MailboxEvent::Abort { token_id, .. } => *token_id == expected,
-        MailboxEvent::SourceFired { .. } | MailboxEvent::SignalDelivered { .. } => false,
+        MailboxEvent::SourceFired { .. }
+        | MailboxEvent::SignalDelivered { .. }
+        | MailboxEvent::TimerFired { .. } => false,
     }
 }
 
