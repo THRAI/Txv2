@@ -25,6 +25,7 @@ use tx_scripts::adapter::step_engine::{
     YieldShape,
 };
 use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox, WaitGeneration};
+use tx_substrate::wake::wait_source::{register_source, unregister_source, WaitSource};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -184,6 +185,44 @@ fn drive_continue_then_done_retries_loop() {
     assert_eq!(result, Ok(99u32));
 }
 
+#[test]
+fn wait_source_register_notify_delivers_to_mailbox() {
+    let ws = Arc::new(WaitSource::new(WaitSourceId::new(99)));
+    register_source(Arc::clone(&ws));
+
+    let mb = Arc::new(TaskMailbox::new());
+    let gen = mb.next_generation();
+    let interests = InterestMask::new(0b1);
+
+    // Register the task's mailbox with the WaitSource.
+    let sub_id = ws.register(Arc::downgrade(&mb), gen, interests);
+    assert_eq!(ws.subscriber_count(), 1);
+
+    // Notify from the object side — should deliver to the mailbox.
+    let posted = ws.notify(interests);
+    assert_eq!(posted, 1);
+
+    // Mailbox should have the event.
+    let evt = mb.poll().expect("event should be delivered");
+    match evt {
+        MailboxEvent::SourceFired {
+            generation,
+            source,
+            interests: evt_interests,
+        } => {
+            assert_eq!(generation, gen);
+            assert_eq!(source, WaitSourceId::new(99));
+            assert_eq!(evt_interests, interests);
+        }
+        other => panic!("expected SourceFired, got {other:?}"),
+    }
+
+    // Cleanup.
+    ws.unregister(sub_id);
+    assert_eq!(ws.subscriber_count(), 0);
+    unregister_source(WaitSourceId::new(99));
+}
+
 // ---------------------------------------------------------------------------
 // Bonus: UnsupportedShape via Selecting + OnAgent → ENOSYS
 // ---------------------------------------------------------------------------
@@ -312,3 +351,5 @@ fn drive_yield_on_wait_source_with_mailbox_resolves_on_pre_posted_event() {
     ));
     assert_eq!(result, Ok(99u32));
 }
+
+
