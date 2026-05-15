@@ -283,6 +283,23 @@ impl ProcessIdentity {
         if self.is_zombie() { b'Z' } else { b'R' }
     }
 
+    /// Process command-line (delegates to payload).
+    pub fn ident_cmdline(&self) -> Option<alloc::vec::Vec<u8>> {
+        self.payload.lock().as_ref()?.cmdline()
+    }
+
+    /// Process short name comm (delegates to payload).
+    pub fn ident_comm(&self) -> Option<[u8; 16]> {
+        Some(self.payload.lock().as_ref()?.comm())
+    }
+
+    /// Store siginfo for a delivered signal (delegates to payload).
+    pub fn siginfo_store(&self, sig: crate::signal::Signum, info: crate::signal::SigInfo) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.siginfo_slots.store(sig, info);
+        }
+    }
+
     /// Snapshot the current address space `Cap`, if the process is
     /// alive. Returns `None` for zombies.
     ///
@@ -326,6 +343,31 @@ impl ProcessIdentity {
     /// the v3 subject-population helpers.
     pub fn cred_cap(&self) -> Option<Cap<Cred>> {
         self.payload.lock().as_ref().map(|p| p.cred_cap())
+    }
+
+    /// Process short name (for `/proc/<pid>/stat`). Returns `"?"` for
+    /// zombies (no payload).
+    pub fn comm(&self) -> [u8; 16] {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.comm())
+            .unwrap_or([b'?', 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])
+    }
+
+    /// Process command-line (for `/proc/<pid>/cmdline`). Returns
+    /// `None` for zombies (no payload) or when no cmdline was set.
+    pub fn cmdline(&self) -> Option<alloc::vec::Vec<u8>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .and_then(|p| p.cmdline())
+    }
+
+    /// Process executable file DEntry (for `/proc/<pid>/exe`).
+    /// Returns `None` for zombies (no payload).
+    pub fn exe_file(&self) -> Option<Cap<DEntry>> {
+        self.payload.lock().as_ref().and_then(|p| p.exe_file())
     }
 
     /// Replace this process's address space with `new` and return the
