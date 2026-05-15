@@ -3,7 +3,7 @@
 Per `docs/Txv3/04_SYSCALL_SHAPE_v1.md §6`. One syscall missing from the 90
 dispatch arms is an unresolvable name collision (NR_FCHDIR is an ENOSYS stub).
 
-## Lane 1: ImmediateSyscall — 17 syscalls
+## Lane 1: ImmediateSyscall — 19 syscalls
 
 Pure ABI queries. No `StepOp`, no `drive`, no yield.
 `call()` takes `&ImmediateCtx` (narrower than `SyscallCtx` — no VFS/VM/reactor
@@ -16,6 +16,8 @@ handles).
 | NR_GETPGRP | 81 | getpgrp | `process.pgrp_cap()` |
 | NR_GETPGID | 155 | getpgid | self-only day-1 |
 | NR_GETSID | 156 | getsid | self-only day-1 |
+| NR_SET_TID_ADDRESS | 96 | set_tid_address | returns caller tid (promoted from Lane 2) |
+| NR_SET_ROBUST_LIST | 99 | set_robust_list | returns 0 (promoted from Lane 2) |
 | NR_GETUID | 174 | getuid | `cred().uid` |
 | NR_GETEUID | 175 | geteuid | `cred().euid` |
 | NR_GETGID | 176 | getgid | `cred().gid` |
@@ -45,8 +47,6 @@ Semantic transitions with observe→commit→publish but never yield.
 | NR_SETRESGID | 149 | setresgid | SetresgidOp ✓ |
 | NR_SETSID | 157 | setsid | SetsidOp ✓ |
 | NR_SETPGID | 154 | setpgid | SetpgidOp ✓ |
-| NR_SET_TID_ADDRESS | 96 | set_tid_address | — |
-| NR_SET_ROBUST_LIST | 99 | set_robust_list | — |
 | NR_RT_SIGACTION | 134 | sigaction | — |
 | NR_RT_SIGPROCMASK | 135 | sigprocmask | — |
 | NR_KILL | 129 | kill | — |

@@ -49,8 +49,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    self, ByteProgress, Cap, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome,
-    SubjectIdentity, Zone, ZoneAllocated, ZoneError,
+    self, ByteProgress, Cap, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp,
+    StepOutcome, SubjectIdentity, Zone, ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::{self, Channel, WaitSource};
 
@@ -576,6 +576,9 @@ impl<I: SubjectIdentity> StepOp<I> for Pipe2Op {
         }
     }
 }
+
+impl OneShotStepOp for Pipe2Op {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for Pipe2Op {}
 
 /// `StepOp` wrap of [`step_read`].
 pub struct ReadOp<'a> {

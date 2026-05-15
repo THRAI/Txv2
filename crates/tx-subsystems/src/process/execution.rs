@@ -1212,12 +1212,25 @@ pub struct SetpgidOp<'a> {
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for SetpgidOp<'a> {
-    type Output = Result<(), SetpgidError>;
+    type Output = ();
     type Progress = NoProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_setpgid(self.target, self.new_pgid))
+    /// PR-3 refactored: splits `Done(Ok(()))` / `Err(domain_error)`
+    /// at the `StepOutcome` level so `drive_oneshot` can translate
+    /// domain errors into `Result<(), Errno>`.
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        match step_setpgid(self.target, self.new_pgid) {
+            Ok(()) => StepOutcome::Done(()),
+            Err(SetpgidError::Unimplemented) => StepOutcome::Err(
+                crate::process::adapter::step_engine::Errno::ENOSYS,
+            ),
+            Err(SetpgidError::Zone(_)) => StepOutcome::Err(
+                crate::process::adapter::step_engine::Errno::ENOMEM,
+            ),
+        }
     }
 }
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for SetpgidOp<'_> {}
 
 /// `StepOp` wrap of [`step_setsid`].
 pub struct SetsidOp<'a> {
@@ -1225,12 +1238,21 @@ pub struct SetsidOp<'a> {
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for SetsidOp<'a> {
-    type Output = Result<Sid, SetsidError>;
+    type Output = Sid;
     type Progress = NoProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_setsid(self.target))
+    /// PR-3 refactored: splits `Done(Ok(sid))` / `Err(Zone)` at
+    /// the `StepOutcome` level.
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Sid, NoProgress> {
+        match step_setsid(self.target) {
+            Ok(sid) => StepOutcome::Done(sid),
+            Err(SetsidError::Zone(_)) => StepOutcome::Err(
+                crate::process::adapter::step_engine::Errno::ENOMEM,
+            ),
+        }
     }
 }
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for SetsidOp<'_> {}
 
 /// `StepOp` wrap of [`step_close_cloexec_fds`].
 pub struct CloseCloexecFdsOp<'a> {
@@ -1246,6 +1268,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for CloseCloexecFdsOp<'a> {
     }
 }
 
+impl OneShotStepOp<crate::process::ProcessIdentity> for CloseCloexecFdsOp<'_> {}
+
 /// `StepOp` wrap of [`step_reset_signal_dispositions_for_exec`].
 pub struct ResetSignalDispositionsForExecOp<'a> {
     pub process: &'a Cap<ProcessIdentity>,
@@ -1259,6 +1283,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ResetSignalDispositionsForExecOp<'a> 
         StepOutcome::Done(())
     }
 }
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for ResetSignalDispositionsForExecOp<'_> {}
 
 /// `StepOp` wrap of [`step_install_brk_for_exec`].
 pub struct InstallBrkForExecOp<'a> {
@@ -1274,6 +1300,159 @@ impl<'a, I: SubjectIdentity> StepOp<I> for InstallBrkForExecOp<'a> {
         StepOutcome::Done(())
     }
 }
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for InstallBrkForExecOp<'_> {}
+
+// ---------------------------------------------------------------------------
+// PR-3 fd-table StepOp wraps (close, dup, dup3, fcntl)
+// ---------------------------------------------------------------------------
+
+/// `StepOp` wrap for `close(fd)`. PR-3 fd-table migration.
+///
+/// Concrete `ProcessIdentity` type parameter so `drive_oneshot` works
+/// with the kernel's `ScriptCtx<ProcessIdentity>`.
+pub struct CloseOp {
+    pub process: Cap<ProcessIdentity>,
+    pub fd: u32,
+}
+
+impl StepOp<crate::process::ProcessIdentity> for CloseOp {
+    type Output = ();
+    type Progress = NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
+    ) -> StepOutcome<(), NoProgress> {
+        if self.process.fd(self.fd).is_none() {
+            return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF);
+        }
+        let _prev = self.process.set_fd(self.fd, None);
+        self.process.set_fd_cloexec(self.fd, false);
+        StepOutcome::Done(())
+    }
+}
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for CloseOp {}
+
+/// `StepOp` wrap for `dup(oldfd)`. PR-3 fd-table migration.
+pub struct DupOp {
+    pub process: Cap<ProcessIdentity>,
+    pub oldfd: u32,
+}
+
+impl StepOp<crate::process::ProcessIdentity> for DupOp {
+    type Output = u32;
+    type Progress = NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
+    ) -> StepOutcome<u32, NoProgress> {
+        let file = match self.process.fd(self.oldfd) {
+            Some(f) => f,
+            None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
+        };
+        let newfd = self.process.allocate_fd();
+        let _ = self.process.set_fd(newfd, Some(file));
+        self.process.set_fd_cloexec(newfd, false);
+        StepOutcome::Done(newfd)
+    }
+}
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for DupOp {}
+
+/// `StepOp` wrap for `dup3(oldfd, newfd, flags)`. PR-3 fd-table migration.
+pub struct Dup3Op {
+    pub process: Cap<ProcessIdentity>,
+    pub oldfd: u32,
+    pub newfd: u32,
+    pub flags: u32,
+}
+
+impl StepOp<crate::process::ProcessIdentity> for Dup3Op {
+    type Output = u32;
+    type Progress = NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
+    ) -> StepOutcome<u32, NoProgress> {
+        if self.oldfd == self.newfd {
+            return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EINVAL);
+        }
+        const O_CLOEXEC: u32 = 0o2000000; // Linux generic ABI
+        if self.flags & !O_CLOEXEC != 0 {
+            return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EINVAL);
+        }
+        let file = match self.process.fd(self.oldfd) {
+            Some(f) => f,
+            None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
+        };
+        let _prev = self.process.install_fd(self.newfd, file);
+        let want_cloexec = self.flags & O_CLOEXEC != 0;
+        self.process.set_fd_cloexec(self.newfd, want_cloexec);
+        StepOutcome::Done(self.newfd)
+    }
+}
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for Dup3Op {}
+
+/// `StepOp` wrap for `fcntl(F_GETFD)` and `fcntl(F_SETFD)`.
+/// PR-3 fd-table migration.  Returns `(is_cloexec: bool)` on GET,
+/// `()` on SET.  EBADF if the fd is not open.
+pub struct FcntlFdOp {
+    pub process: Cap<ProcessIdentity>,
+    pub fd: u32,
+    pub set_on: Option<bool>, // None = GET, Some(bit) = SET
+}
+
+impl StepOp<crate::process::ProcessIdentity> for FcntlFdOp {
+    type Output = Option<bool>; // None on SET, Some(bit) on GET
+    type Progress = NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
+    ) -> StepOutcome<Option<bool>, NoProgress> {
+        if self.process.fd(self.fd).is_none() {
+            return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF);
+        }
+        match self.set_on {
+            Some(on) => {
+                self.process.set_fd_cloexec(self.fd, on);
+                StepOutcome::Done(None)
+            }
+            None => StepOutcome::Done(Some(self.process.fd_cloexec(self.fd))),
+        }
+    }
+}
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for FcntlFdOp {}
+
+/// `StepOp` wrap for `fcntl(F_DUPFD)` / `fcntl(F_DUPFD_CLOEXEC)`.
+pub struct FcntlDupFdOp {
+    pub process: Cap<ProcessIdentity>,
+    pub fd: u32,
+    pub min: u32,
+    pub cloexec: bool,
+}
+
+impl StepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {
+    type Output = u32;
+    type Progress = NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
+    ) -> StepOutcome<u32, NoProgress> {
+        if self.process.fd(self.fd).is_none() {
+            return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF);
+        }
+        let new_fd = self.process.allocate_fd_at_least(self.min);
+        let file = self.process.fd(self.fd).unwrap();
+        let _prev = self.process.install_fd(new_fd, file);
+        self.process.set_fd_cloexec(new_fd, self.cloexec);
+        StepOutcome::Done(new_fd)
+    }
+}
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {}
 
 #[cfg(test)]
 mod step_op_wraps {

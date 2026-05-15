@@ -31,7 +31,10 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
-    pub use tx_substrate::step::{NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity};
+    pub use tx_substrate::step::{
+        Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+        drive_oneshot,
+    };
     pub use tx_substrate::wake::{MailboxEvent, SignalRouting, TaskMailbox};
     pub use tx_substrate::zone::{
         sign, sign_for, reserve_for, register_zone_for,

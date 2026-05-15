@@ -29,8 +29,8 @@ pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
-        ByteProgress, Errno, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome,
-        StepProgress, SubjectIdentity, WaitSourceId, YieldShape,
+        ByteProgress, Errno, InterestMask, NoProgress, OneShotStepOp, ScriptCtx, StepOp,
+        StepOutcome, StepProgress, SubjectIdentity, WaitSourceId, YieldShape, drive_oneshot,
     };
     pub use tx_substrate::zone::{
         sign, sign_for, reserve_for, register_zone_for,

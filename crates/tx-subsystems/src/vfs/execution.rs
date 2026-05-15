@@ -6,12 +6,14 @@
 //! that dispatch read/write through the RNode backing.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::execution::Guard;
 use crate::page_backed::FsPageBacking;
 use crate::tty;
 use crate::vfs::adapter::step_engine::{
-    self, ByteProgress, Cap, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+    self, ByteProgress, Cap, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
+    SubjectIdentity,
 };
 
 use super::structure::{
@@ -686,6 +688,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileLseekOp<'a> {
     }
 }
 
+impl OneShotStepOp for OpenFileLseekOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for OpenFileLseekOp<'_> {}
+
 /// `StepOp` wrap of [`OpenFile::step_write`].
 pub struct OpenFileWriteOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
@@ -731,6 +736,111 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileIoctlOp<'a> {
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         self.file.step_ioctl(self.caller, self.request, self.guard)
+    }
+}
+
+impl OneShotStepOp for OpenFileIoctlOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for OpenFileIoctlOp<'_> {}
+
+/// `StepOp` wrap for `fcntl(F_GETFL)` — reads `OpenFile::flags()`.
+pub struct OpenFileGetFlOp<'a> {
+    pub file: &'a Cap<super::structure::OpenFile>,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileGetFlOp<'a> {
+    type Output = super::structure::OpenFileFlags;
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(self.file.flags())
+    }
+}
+
+impl OneShotStepOp for OpenFileGetFlOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for OpenFileGetFlOp<'_> {}
+
+/// `StepOp` wrap for `fcntl(F_SETFL)` — sets `OpenFile::nonblocking`.
+pub struct OpenFileSetFlOp<'a> {
+    pub file: &'a Cap<super::structure::OpenFile>,
+    pub nonblocking: bool,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileSetFlOp<'a> {
+    type Output = ();
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        self.file.set_nonblocking(self.nonblocking);
+        StepOutcome::Done(())
+    }
+}
+
+impl OneShotStepOp for OpenFileSetFlOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for OpenFileSetFlOp<'_> {}
+
+/// `StepOp` wrap for `fstat` — reads inode metadata from an open fd.
+pub struct InodeStatOp<'a> {
+    pub file: &'a Cap<super::structure::OpenFile>,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for InodeStatOp<'a> {
+    type Output = (super::structure::InodeMeta, u64); // (meta, ino)
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let rnode = self.file.rnode();
+        let meta = rnode.meta();
+        let ino = rnode.fs_object_id().as_u64();
+        StepOutcome::Done((meta, ino))
+    }
+}
+
+impl OneShotStepOp for InodeStatOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for InodeStatOp<'_> {}
+
+// ── Async VFS StepOp wrappers (may Yield/Continue) ───────────────────
+
+/// `StepOp` wrap of [`super::walker::step_walk`]. Idempotent: each
+/// `step()` call takes a fresh guard and re-walks from `rooted_at`
+/// with the same `path`/`cred`. The filesystem state advances between
+/// calls, so `Continue` means "try again" without internal resumption
+/// state.
+pub struct PathWalkOp {
+    pub rooted_at: Cap<super::structure::DEntry>,
+    pub path: Vec<u8>,
+    pub cred: super::structure::Credential,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for PathWalkOp {
+    type Output = Cap<super::structure::DEntry>;
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let guard = step_engine::guard();
+        super::walker::step_walk(self.rooted_at.clone(), &self.path, &self.cred, &guard)
+    }
+}
+
+/// `StepOp` wrap of [`super::walker::step_open`]. Composes
+/// [`PathWalkOp`] with `OpenFile::new_cap` and the DAC read/write
+/// permission check.
+pub struct OpenOp {
+    pub rooted_at: Cap<super::structure::DEntry>,
+    pub path: Vec<u8>,
+    pub flags: super::structure::OpenFileFlags,
+    pub mode: u16,
+    pub cred: super::structure::Credential,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for OpenOp {
+    type Output = Cap<super::structure::OpenFile>;
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let guard = step_engine::guard();
+        super::walker::step_open(
+            self.rooted_at.clone(),
+            &self.path,
+            self.flags,
+            self.mode,
+            &self.cred,
+            &guard,
+        )
     }
 }
 

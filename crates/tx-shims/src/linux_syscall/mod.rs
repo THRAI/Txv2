@@ -49,23 +49,23 @@ use reactor_entry::userspace::SyscallRequest;
 use tx_hal::{EntropyIf, PmapIf, TimeIf, UserPtr};
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_subsystems::cred::{
-    step_setgid, step_setregid, step_setresgid, step_setresuid, step_setreuid, step_setuid,
     Capability, Cred, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp,
     SetreuidOp, SetuidOp, Uid,
 };
 use tx_subsystems::execution::Errno;
 use tx_subsystems::process::{
-    process_by_pid, seed_child_leader_context, step_chdir, step_getcwd,
-    step_setpgid, step_setsid, step_waitpid_nohang, ChdirOutcome, ExitGroupOp, ExitStatus,
-    Pgid, Pid, ProcessIdentity, SetpgidError, SetsidError, WaitError, WaitTarget,
+    process_by_pid, seed_child_leader_context, step_chdir,
+    step_waitpid_nohang, ChdirOutcome, CloseOp, DupOp, Dup3Op, ExitGroupOp,
+    ExitStatus, FcntlDupFdOp, FcntlFdOp, GetcwdOp, Pgid, Pid, ProcessIdentity, SetpgidOp,
+    SetsidOp, WaitError, WaitTarget,
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
-    step_kill_process, step_sigaction, KillOutcome, SigDisposition, SigDispositionChange,
+    KillOutcome, KillProcessOp, SigDisposition, SigDispositionChange, SigactionOp,
     SignalMask, Signum,
 };
 use tx_subsystems::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
-use tx_subsystems::thread_runtime::{step_thread_exit, ThreadIdentity};
+use tx_subsystems::thread_runtime::{step_thread_exit, SigprocmaskOp, ThreadExitOp, ThreadIdentity};
 use tx_subsystems::tty::execution::{
     step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
     step_ioctl_tiocnotty, step_ioctl_tiocsctty_for_process, step_ioctl_tiocspgrp,
@@ -75,7 +75,10 @@ use tx_subsystems::tty::structure::{Termios, Winsize};
 use tx_subsystems::vfs::structure::{
     Credential, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking, StructPayload,
 };
-use tx_subsystems::vfs::{step_open, step_walk, DEntry, OpenFile};
+use tx_subsystems::futex::FutexWakeOp;
+use tx_subsystems::vfs::{
+    step_open, step_walk, DEntry, InodeStatOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp, OpenOp,
+};
 use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
     VmEntryFlags, VmMapError, VmMapRequest, VmRemapRequest, USER_PAGE_SIZE,
@@ -345,6 +348,12 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_UNAME => return sys_uname(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
         nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
+        nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
+        nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args),
+        nr if nr == NR_MADVISE => return sys_madvise(req.args, ctx),
+        nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx),
+        nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx),
+        nr if nr == NR_UTIMENSAT => return sys_utimensat(req.args, ctx),
         _ => {} // fall through to script lanes
     }
 
@@ -451,11 +460,8 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_MUNMAP => sys_munmap(req.args, ctx),
         // mlock / munlock are synchronous; the underlying try_mlock
         // step never yields.
-        nr if nr == NR_MLOCK => sys_mlock(req.args, ctx),
-        nr if nr == NR_MUNLOCK => sys_munlock(req.args, ctx),
         nr if nr == NR_MPROTECT => sys_mprotect(req.args, ctx),
         nr if nr == NR_MREMAP => sys_mremap(req.args, ctx),
-        nr if nr == NR_MADVISE => sys_madvise(req.args, ctx),
         nr if nr == NR_MSYNC => sys_msync(req.args, ctx).await,
         // Slice 3 of the shell-prompt roadmap — `futex(2)`. v1 honours
         // `FUTEX_WAIT` / `FUTEX_WAKE` against a 256-bucket hash table;
@@ -524,7 +530,6 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_TRUNCATE => sys_truncate(req.args, ctx).await,
         nr if nr == NR_FTRUNCATE => sys_ftruncate(req.args, ctx),
         nr if nr == NR_READLINKAT => sys_readlinkat(req.args, ctx).await,
-        nr if nr == NR_UTIMENSAT => sys_utimensat(req.args, ctx),
         nr if nr == NR_RENAMEAT2 => sys_renameat2(req.args, ctx).await,
         // PR-10 phase 2 — `userfaultfd(2)` scaffold. Mints a fresh
         // `Cap<UserfaultFd>` (W-Q phase 0 zone), wraps in an

@@ -17,10 +17,19 @@ use crate::adapter::step_engine::{self as step_engine};
 /// step_process_exit"), the dispatcher therefore calls **only**
 /// `step_thread_exit`. Calling `step_exit_group` here would
 /// double-zombify the payload and corrupt the recorded exit status.
+/// PR-3 migration: `ThreadExitOp` is a `OneShotStepOp` — dispatched
+/// via `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let status = args[0] as i32;
-    step_thread_exit(ctx.thread.clone(), status);
-    SyscallResult::NoReturn
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = ThreadExitOp {
+        thread: ctx.thread.clone(),
+        status,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(()) => SyscallResult::NoReturn,
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `exit_group(status)` — per `PROCESS_v1` §7.3.2.
@@ -472,10 +481,14 @@ pub(super) fn sys_setpgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
         pgid as u32
     };
 
-    match step_setpgid(&ctx.process, Pgid(new_pgid_raw)) {
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SetpgidOp {
+        target: &ctx.process,
+        new_pgid: Pgid(new_pgid_raw),
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::Return(0),
-        Err(SetpgidError::Unimplemented) => SyscallResult::Error(EPERM_VALUE),
-        Err(SetpgidError::Zone(_)) => SyscallResult::Error(ENOMEM_VALUE),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 
@@ -522,9 +535,11 @@ pub(super) fn sys_getsid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
 /// this and the slice ships the trio's behaviour. Flagged as a
 /// follow-up (`TODO(phase-process-topology)`).
 pub(super) fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
-    match step_setsid(&ctx.process) {
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SetsidOp { target: &ctx.process };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(sid) => SyscallResult::Return(sid.0 as i64),
-        Err(SetsidError::Zone(_)) => SyscallResult::Error(ENOMEM_VALUE),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 

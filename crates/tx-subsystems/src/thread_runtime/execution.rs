@@ -6,7 +6,7 @@ use core::sync::atomic::Ordering;
 use tx_hal::UserTrapContext;
 
 use crate::thread_runtime::adapter::step_engine::{
-    self, Cap, MailboxEvent, OperationalCapExt, PayloadCap, SignalRouting,
+    self, Cap, MailboxEvent, OneShotStepOp, OperationalCapExt, PayloadCap, SignalRouting,
 };
 
 use crate::signal::{SignalMask, Signum};
@@ -332,6 +332,8 @@ impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
     }
 }
 
+impl OneShotStepOp<ProcessIdentity> for ThreadExitOp {}
+
 /// `StepOp` wrap for [`step_sigprocmask`]. PR-2 wave 2.
 pub struct SigprocmaskOp {
     pub thread: Cap<ThreadIdentity>,
@@ -356,6 +358,9 @@ impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
         ))
     }
 }
+
+use crate::process::ProcessIdentity;
+impl OneShotStepOp<ProcessIdentity> for SigprocmaskOp {}
 
 #[cfg(test)]
 mod step_op_wraps {
