@@ -1453,3 +1453,32 @@ pub const SFD_CLOEXEC: u32 = O_CLOEXEC;
 /// `SFD_NONBLOCK` — set non-blocking mode on the resulting fd. Same
 /// bit value as `O_NONBLOCK` per Linux's signalfd4 flag convention.
 pub const SFD_NONBLOCK: u32 = O_NONBLOCK;
+
+// =====================================================================
+// Phase B.1 — epoll syscall numbers
+//
+// Spec: `docs/Txv3/03_STEP_MODEL_v2.md` §5 `YieldShape::OnEdge`.
+// =====================================================================
+
+/// `epoll_create1(flags)`. Linux generic uapi `__NR_epoll_create1 = 291`.
+/// Allocates a fresh [`tx_subsystems::epoll::Epoll`] cap, wraps it in
+/// an `OpenFile` with `OpenFileBacking::Epoll`, and installs it at the
+/// lowest free fd.
+pub const NR_EPOLL_CREATE1: u64 = 291;
+
+/// `epoll_ctl(epfd, op, fd, event_ptr)`. Linux generic uapi
+/// `__NR_epoll_ctl = 233`. ADD, MOD, or DEL a monitored fd.
+pub const NR_EPOLL_CTL: u64 = 233;
+
+/// `epoll_wait(epfd, events, maxevents, timeout)`. Linux generic uapi
+/// `__NR_epoll_wait = 232`. Block until ready events arrive.
+/// (Note: the newer `epoll_pwait` = 281 is a superset with sigmask;
+/// not wired in Phase B.1.)
+pub const NR_EPOLL_WAIT: u64 = 232;
+
+/// `epoll_pwait(epfd, events, maxevents, timeout, sigmask)`.
+/// Linux generic uapi `__NR_epoll_pwait = 281`. Block until ready
+/// events arrive, atomically updating the signal mask. Phase B.1c
+/// stubs the sigmask; real signal-mask manipulation is deferred to
+/// a future signal-subsystem PR.
+pub const NR_EPOLL_PWAIT: u64 = 281;

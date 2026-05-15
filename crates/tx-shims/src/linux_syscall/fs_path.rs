@@ -68,6 +68,15 @@ use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 // arch-lint substring check (`#[allow(`) does not also fire.
 #[cfg_attr(not(test), allow(clippy::extra_unused_type_parameters))]
 #[cfg_attr(test, allow(clippy::extra_unused_type_parameters))]
+/// Translate a dirfd into the root dentry for path resolution.
+/// Returns `EBADF` for non-`AT_FDCWD` dirfds (dirfd support TBD).
+fn resolve_cwd(dirfd: i32, ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
+    if dirfd != AT_FDCWD {
+        return Err(EBADF_VALUE);
+    }
+    ctx.process.cwd().ok_or(ENOENT_VALUE)
+}
+
 fn resolve_path_at<P: PmapIf>(
     dirfd: i32,
     path: &[u8],
@@ -197,25 +206,28 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
-    let walker_cred = ctx.walker_cred();
-    let dentry = match resolve_path_at::<P>(dirfd, &path, &walker_cred, ctx) {
+    let rooted_at = match resolve_cwd(dirfd, ctx) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
-    let fs_object_id = dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
-    let fs_ops = match fs_ops_for_dentry(&dentry) {
-        Some(o) => o,
-        None => return SyscallResult::Error(EROFS_VALUE),
-    };
-    // Mask to the bottom 12 bits (rwx + S_ISUID/S_ISGID/S_ISVTX);
-    // callers can't change S_IFMT bits via chmod.
+    let walker_cred = ctx.walker_cred();
     let new_mode = (mode & 0o7777) as u16;
-    let guard = step_engine::guard();
-    match fs_ops.step_chmod(fs_object_id, new_mode, &walker_cred, &guard) {
-        V3::Done(()) => SyscallResult::Return(0),
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
+    let result = {
+        let guard = step_engine::guard();
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = ChmodOp {
+            rooted_at: &rooted_at,
+            path: &path,
+            mode: new_mode,
+            cred: &walker_cred,
+            guard: &guard,
+            target: None,
+        };
+        step_engine::drive_oneshot(&mut op, &mut script_ctx)
+    };
+    match result {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(v3errno))),
     }
 }
 
@@ -240,25 +252,32 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
     let walker_cred = ctx.walker_cred();
-    let dentry = match resolve_path_at::<P>(dirfd, &path, &walker_cred, ctx) {
+    let uid = decode_uid_arg(uid_arg).map(|u| u.0);
+    let gid = decode_gid_arg(gid_arg).map(|g| g.0);
+    let rooted_at = match resolve_cwd(dirfd, ctx) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
-    let fs_object_id = dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
-    let fs_ops = match fs_ops_for_dentry(&dentry) {
-        Some(o) => o,
-        None => return SyscallResult::Error(EROFS_VALUE),
+    let result = {
+        let guard = step_engine::guard();
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = ChownOp {
+            rooted_at: &rooted_at,
+            path: &path,
+            uid,
+            gid,
+            cred: &walker_cred,
+            guard: &guard,
+            target: None,
+        };
+        step_engine::drive_oneshot(&mut op, &mut script_ctx)
     };
-    let uid_opt = decode_uid_arg(uid_arg).map(|u| u.raw());
-    let gid_opt = decode_gid_arg(gid_arg).map(|g| g.raw());
-    let guard = step_engine::guard();
-    match fs_ops.step_chown(fs_object_id, uid_opt, gid_opt, &walker_cred, &guard) {
-        V3::Done(()) => SyscallResult::Return(0),
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
+    match result {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(v3errno))),
     }
 }
+
 
 /// `faccessat(dirfd, path, mode)`. Linux RV64 generic ABI. POSIX
 /// `access(2)` shape: the access check uses the caller's **real**

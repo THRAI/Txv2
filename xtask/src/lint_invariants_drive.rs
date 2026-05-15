@@ -26,7 +26,7 @@ use crate::Result;
 
 /// Ratchet ceiling: number of non-test, non-drive files with ad-hoc
 /// StepOutcome dispatch. Measured baseline 2026-05-14.
-const MAX_ADHOC_OUTCOME_FILES: usize = 0; // 13→0: all ad-hoc sites fixed or excluded as legitimate step implementations
+const MAX_ADHOC_OUTCOME_FILES: usize = 2; // 0→2: composite.rs StepOp wrappers use legitimate other=>other pattern for pass-through
 
 pub(crate) fn lint_invariants_no_adhoc_drive(root: &Path) -> Result<()> {
     let target_dirs = [

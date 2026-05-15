@@ -79,6 +79,9 @@ use tx_subsystems::futex::FutexWakeOp;
 use tx_subsystems::vfs::{
     step_open, step_walk, DEntry, InodeStatOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp, OpenOp,
 };
+use tx_subsystems::vfs::composite::{
+    AccessOp, ChmodOp, ChownOp, LinkOp, MkdirOp, RenameOp, SymlinkOp, TruncateOp, UnlinkOp,
+};
 use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
     VmEntryFlags, VmMapError, VmMapRequest, VmRemapRequest, USER_PAGE_SIZE,
@@ -351,8 +354,8 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
         nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args),
         nr if nr == NR_MADVISE => return sys_madvise(req.args, ctx),
-        nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx),
-        nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx),
+        nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx).await,
+        nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
         nr if nr == NR_UTIMENSAT => return sys_utimensat(req.args, ctx),
         _ => {} // fall through to script lanes
     }
@@ -450,18 +453,14 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
             req.args[2] as u32,
             ctx,
         ),
-        // Slice 2 of the shell-prompt roadmap — VM syscalls. Pure
-        // plumbing on top of `vm::execution::*` primitives. mmap /
-        // munmap / mprotect / mremap / madvise are synchronous (the
-        // underlying `try_*` step variants never `.await`); msync
-        // calls into `step_fsync` for File-backed page containers and
-        // is the only one that may block.
-        nr if nr == NR_MMAP => sys_mmap(req.args, ctx),
-        nr if nr == NR_MUNMAP => sys_munmap(req.args, ctx),
-        // mlock / munlock are synchronous; the underlying try_mlock
-        // step never yields.
-        nr if nr == NR_MPROTECT => sys_mprotect(req.args, ctx),
-        nr if nr == NR_MREMAP => sys_mremap(req.args, ctx),
+        // Slice 2 of the shell-prompt roadmap — VM syscalls. mmap /
+        // munmap / mprotect / mremap / madvise use StepOp wrappers
+        // (VmMapOp / VmUnmapOp etc.) that yield on RangeLock
+        // conflicts; the drive loop parks on WaitSource and retries.
+        nr if nr == NR_MMAP => sys_mmap(req.args, ctx).await,
+        nr if nr == NR_MUNMAP => sys_munmap(req.args, ctx).await,
+        nr if nr == NR_MPROTECT => sys_mprotect(req.args, ctx).await,
+        nr if nr == NR_MREMAP => sys_mremap(req.args, ctx).await,
         nr if nr == NR_MSYNC => sys_msync(req.args, ctx).await,
         // Slice 3 of the shell-prompt roadmap — `futex(2)`. v1 honours
         // `FUTEX_WAIT` / `FUTEX_WAKE` against a 256-bucket hash table;
