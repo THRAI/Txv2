@@ -42,7 +42,10 @@ pub use mailbox::{
     MAILBOX_QUEUE_BOUND,
 };
 pub use timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
-pub use wait_source::{PreparedWaitRegistration, SubscriberId, WaitRegistrationGuard, WaitSource};
+pub use wait_source::{
+    lookup_source, register_source, unregister_source, PreparedWaitRegistration, SubscriberId,
+    WaitRegistrationGuard, WaitSource,
+};
 
 /// Construct a new `WaitSource` wrapped in an `Arc`, keyed by `id`.
 ///
