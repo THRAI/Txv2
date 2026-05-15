@@ -31,6 +31,7 @@ pub fn walk_to_completion<'g>(
     rooted_at: Cap<DEntry>,
     path: &[u8],
     mode: WalkMode,
+    policy: FinalSymlinkPolicy,
     cred: &Credential,
     guard: &'g Guard<'_>,
 ) -> Result<PathResolution, Errno> {
@@ -80,7 +81,7 @@ pub fn walk_to_completion<'g>(
             mount_payload,
             cred,
             mode,
-            FinalSymlinkPolicy::Follow,
+            policy,
             guard,
         ) {
             KernelStep::Continue(next) => state = next,
@@ -98,12 +99,13 @@ pub fn run_walker<'g>(
     rooted_at: Cap<DEntry>,
     path: &[u8],
     mode: WalkMode,
+    policy: FinalSymlinkPolicy,
     cred: &Credential,
     guard: &'g Guard<'_>,
 ) -> WalkState {
     let rooted = rooted_at.clone();
     let root2 = rooted.clone();
-    match walk_to_completion(rooted_at, path, mode, cred, guard) {
+    match walk_to_completion(rooted_at, path, mode, policy, cred, guard) {
         Ok(resolved) => WalkState::Terminal(resolved),
         Err(_err) => WalkState::Walking(WalkingState {
             current: rooted,
