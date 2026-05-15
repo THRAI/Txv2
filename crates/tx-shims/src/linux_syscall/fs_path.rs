@@ -473,9 +473,15 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return SyscallResult::Error(ENOTDIR_VALUE);
     }
 
-    match step_chdir(&ctx.process, dentry) {
-        ChdirOutcome::Replaced { .. } => SyscallResult::Return(0),
-        ChdirOutcome::ZombieIgnored => SyscallResult::Error(ESRCH_VALUE),
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = ChdirOp {
+        target: &ctx.process,
+        new_cwd: dentry,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(ChdirOutcome::Replaced { .. }) => SyscallResult::Return(0),
+        Ok(ChdirOutcome::ZombieIgnored) => SyscallResult::Error(ESRCH_VALUE),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 
