@@ -4,43 +4,12 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOp, StepOutcome, YieldShape};
-use tx_subsystems::execution::WaitToken;
-use tx_subsystems::wait_source;
+use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use tx_scripts::drive;
+use tx_substrate::step::DriveMode;
 use tx_subsystems::vm::step_ops::{
     VmBrkOp, VmMapOp, VmMlockOp, VmMunlockOp, VmProtectOp, VmRemapOp, VmUnmapOp,
 };
-
-/// Drive a VM StepOp to completion, awaiting on RangeLock releases.
-///
-/// The loop calls `op.step()` repeatedly; on `Yield { OnWaitSource }`
-/// it awaits the range-lock release channel and retries. All other
-/// `Yield` / `Continue` outcomes surface `-EIO`.
-async fn drive_vm_op<S>(mut op: S, ctx: &mut crate::KernelScriptCtx) -> Result<S::Output, step_engine::Errno>
-where
-    S: StepOp<tx_subsystems::process::ProcessIdentity, Progress = NoProgress>,
-{
-    loop {
-        match op.step(ctx) {
-            StepOutcome::Done(v) => return Ok(v),
-            StepOutcome::Err(e) => return Err(e),
-            StepOutcome::Yield { ref shape, .. }
-                if matches!(shape, YieldShape::OnWaitSource { .. }) =>
-            {
-                let YieldShape::OnWaitSource { source, interests } = *shape else {
-                    unreachable!();
-                };
-                let token = WaitToken::new(source.raw(), interests.raw());
-                if let Some(fut) = wait_source::wait_on_token(token) {
-                    fut.await;
-                }
-            }
-            StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                return Err(crate::adapter::step_engine::Errno::EIO);
-            }
-        }
-    }
-}
 
 /// `brk(requested)` per `txdoc:VM-5-8-BRK`.
 ///
@@ -70,7 +39,8 @@ pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
 
     let mut op = VmBrkOp { aspace: &ctx.aspace, brk_base: base, current_brk: cur, requested_brk: req };
     let mut script_ctx = build_subject_script_ctx(ctx);
-    match drive_vm_op(op, &mut script_ctx).await {
+        let mailbox_arc = script_ctx.mailbox().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, None).await {
         Ok(new_brk) => {
             ctx.process.set_current_brk(new_brk.0 as u64);
             SyscallResult::Return(new_brk.0 as i64)
@@ -235,7 +205,8 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
 
     let mut op = VmMapOp { aspace: &ctx.aspace, request };
     let mut script_ctx = build_subject_script_ctx(ctx);
-    match drive_vm_op(op, &mut script_ctx).await {
+        let mailbox_arc = script_ctx.mailbox().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, None).await {
         Ok(outcome) => SyscallResult::Return(outcome.range.start().as_usize() as i64),
         Err(errno) => {
             // MAP_FIXED_NOREPLACE → AlreadyMapped maps to EEXIST per
@@ -275,7 +246,8 @@ pub(super) async fn sys_munmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
 
     let mut op = VmUnmapOp { aspace: &ctx.aspace, range };
     let mut script_ctx = build_subject_script_ctx(ctx);
-    match drive_vm_op(op, &mut script_ctx).await {
+        let mailbox_arc = script_ctx.mailbox().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, None).await {
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -308,7 +280,8 @@ pub(super) async fn sys_mlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
 
     let mut op = VmMlockOp { aspace: &ctx.aspace, range };
     let mut script_ctx = build_subject_script_ctx(ctx);
-    match drive_vm_op(op, &mut script_ctx).await {
+        let mailbox_arc = script_ctx.mailbox().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, None).await {
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -335,7 +308,8 @@ pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscall
 
     let mut op = VmMunlockOp { aspace: &ctx.aspace, range };
     let mut script_ctx = build_subject_script_ctx(ctx);
-    match drive_vm_op(op, &mut script_ctx).await {
+        let mailbox_arc = script_ctx.mailbox().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, None).await {
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -381,7 +355,8 @@ pub(super) async fn sys_mprotect(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
     };
     let mut op = VmProtectOp { aspace: &ctx.aspace, range, prot };
     let mut script_ctx = build_subject_script_ctx(ctx);
-    match drive_vm_op(op, &mut script_ctx).await {
+        let mailbox_arc = script_ctx.mailbox().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, None).await {
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -430,7 +405,8 @@ pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
     let request = VmRemapRequest::new(old_range, new_range);
     let mut op = VmRemapOp { aspace: &ctx.aspace, request };
     let mut script_ctx = build_subject_script_ctx(ctx);
-    match drive_vm_op(op, &mut script_ctx).await {
+        let mailbox_arc = script_ctx.mailbox().cloned();
+    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, None).await {
         Ok(outcome) => SyscallResult::Return(outcome.new_range.start().as_usize() as i64),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }

@@ -223,7 +223,8 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             mode: mode as u16,
             cred: ctx.walker_cred(),
         };
-        let openfile = match drive(op, &mut script_ctx, DriveMode::Waiting, None, None, None).await
+        let mailbox_arc = script_ctx.mailbox().cloned();
+        let openfile = match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), None, None).await
         {
             Ok(file) => file,
             Err(v3errno) => {
