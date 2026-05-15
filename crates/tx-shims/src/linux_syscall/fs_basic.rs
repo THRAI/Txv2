@@ -1037,34 +1037,33 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
 
-    let dentry: Cap<DEntry> = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        match ctx.process.cwd() {
-            Some(d) => d,
-            None => return SyscallResult::Error(ENOENT_VALUE),
-        }
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let (statx_result, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
+        (StatxResult { meta: cwd.rnode().meta() }, cwd.rnode().fs_object_id())
     } else {
-        let cwd = match ctx.process.cwd() {
-            Some(d) => d,
-            None => return SyscallResult::Error(ENOENT_VALUE),
-        };
         let walker_cred = ctx.walker_cred();
-        use step_engine::StepOutcome as V3;
-        let outcome = {
+        let result = {
             let guard = step_engine::guard();
-            step_walk(cwd, &path, &walker_cred, &guard)
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = StatxOp {
+                rooted_at: &cwd,
+                path: &path,
+                cred: &walker_cred,
+                guard: &guard,
+                target: None,
+            };
+            step_engine::drive_oneshot(&mut op, &mut script_ctx)
         };
-        match outcome {
-            V3::Done(d) => d,
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        match result {
+            Ok((sr, id)) => (sr, id),
+            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
         }
     };
 
-    let rnode = dentry.rnode();
-    let meta = rnode.meta();
-    let statx = inode_meta_to_statx(&meta, rnode.fs_object_id().as_u64());
+    let statx = inode_meta_to_statx(&statx_result.meta, ino.as_u64());
     if let Err(errno) = bootstrap_write_user::<StatxLayout>(&ctx.aspace, statxbuf_uaddr, statx) {
         return SyscallResult::Error(errno_to_i32(errno));
     }
