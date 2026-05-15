@@ -48,7 +48,7 @@ fn bootstrap() -> Cap<ProcessIdentity> {
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");
-    let threads = payload.threads.lock();
+    let threads = payload.threads.snapshot();
     threads[0].clone()
 }
 

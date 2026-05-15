@@ -133,6 +133,9 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
         "script-boundary" => crate::lint_invariants_script::lint_invariants_script_boundary(root),
         "checks-purity" => crate::lint_invariants_checks::lint_invariants_checks_purity(root),
         "no-adhoc-drive" => crate::lint_invariants_drive::lint_invariants_no_adhoc_drive(root),
+        "syscall-adhoc-loop" => crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop(root),
+        "syscall-no-await" => crate::lint_invariants_syscall::lint_invariants_syscall_no_await(root),
+        "syscall-ctx-bridge" => crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge(root),
         "all" => {
             let rules: &[(&str, fn(&Path) -> Result<()>)] = &[
                 ("step-discipline", crate::lint_invariants_step::lint_invariants_step_discipline),
@@ -145,6 +148,9 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
                 ("script-boundary", crate::lint_invariants_script::lint_invariants_script_boundary),
                 ("checks-purity", crate::lint_invariants_checks::lint_invariants_checks_purity),
                 ("no-adhoc-drive", crate::lint_invariants_drive::lint_invariants_no_adhoc_drive),
+                ("syscall-adhoc-loop", crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop),
+                ("syscall-no-await", crate::lint_invariants_syscall::lint_invariants_syscall_no_await),
+                ("syscall-ctx-bridge", crate::lint_invariants_syscall::lint_invariants_syscall_ctx_bridge),
             ];
             let mut errors: Vec<String> = Vec::new();
             for (name, rule) in rules {
@@ -160,7 +166,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
             }
         }
         other => Err(format!(
-            "unknown invariants sub-rule '{other}'. Expected: step-discipline, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, all"
+            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, all"
         )),
     }
 }

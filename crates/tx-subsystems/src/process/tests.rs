@@ -48,7 +48,7 @@ fn bootstrap() -> Cap<ProcessIdentity> {
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");
-    let threads = payload.threads.lock();
+    let threads = payload.threads.snapshot();
     threads[0].clone()
 }
 
@@ -219,8 +219,7 @@ fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
 
     let guard = ebr_guard();
     let live: usize = pgrp
-        .members
-        .lock()
+        .members.inner.lock()
         .iter()
         .filter(|w| w.upgrade(&guard).is_some())
         .count();
@@ -244,8 +243,7 @@ fn pgrp_member_weak_observation_returns_live_process_until_identity_drops() {
 
     let guard = ebr_guard();
     let live_after: usize = pgrp
-        .members
-        .lock()
+        .members.inner.lock()
         .iter()
         .filter(|w| w.upgrade(&guard).is_some())
         .count();
@@ -691,7 +689,7 @@ fn waitpid_pgrp_selector_with_live_match_returns_none_ready() {
 
 fn leader_has_sigchld_pending(proc_cap: &Cap<ProcessIdentity>) -> bool {
     let payload = proc_cap.payload.lock();
-    let leader = payload.as_ref().expect("alive").threads.lock()[0].clone();
+    let leader = payload.as_ref().expect("alive").threads.nth(0).unwrap();
     drop(payload);
     let leader_payload = leader.payload.lock();
     leader_payload
@@ -777,7 +775,7 @@ fn zombie_parent_does_not_receive_sigchld() {
     let child = step_fork::<TestPmap>(&parent).expect("fork");
 
     // Manually clear parent.children so sever doesn't run on the child.
-    parent.children.lock().clear();
+    parent.children.clear();
     step_exit_group(&parent, ExitStatus::Exited(0));
     assert!(parent.is_zombie());
     // child still has parent slot pointing at the (now zombie) parent.

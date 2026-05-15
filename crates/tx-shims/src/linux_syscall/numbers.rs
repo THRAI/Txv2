@@ -506,6 +506,13 @@ pub const NR_MPROTECT: u64 = 226;
 /// `__NR_msync = 227`. Wraps `AddressSpace::msync` (the StepOutcome
 /// shape — async over the `step_fsync` blocking lane).
 pub const NR_MSYNC: u64 = 227;
+/// `mlock(addr, len)`. Linux RV64 generic ABI `__NR_mlock = 228`.
+/// Under no-swap this is purely observational; sets
+/// `VmEntryFlags.locked` for `/proc/<pid>/maps` reporting.
+pub const NR_MLOCK: u64 = 228;
+/// `munlock(addr, len)`. Linux RV64 generic ABI `__NR_munlock = 229`.
+/// Clears `VmEntryFlags.locked`.
+pub const NR_MUNLOCK: u64 = 229;
 /// `madvise(addr, length, advice)`. Linux RV64 generic ABI
 /// `__NR_madvise = 233`. Wraps `AddressSpace::madvise`.
 pub const NR_MADVISE: u64 = 233;
@@ -981,6 +988,26 @@ pub const NR_TGKILL: u64 = 131;
 /// so the carryover does not block any day-1 shell flow.
 /// `TODO(phase-signal-frame)`.
 pub const NR_RT_SIGRETURN: u64 = 139;
+/// `rt_sigsuspend(mask, sigsetsize)` — Linux RV64 `__NR_rt_sigsuspend = 133`.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
+pub const NR_RT_SIGSUSPEND: u64 = 133;
+/// `rt_sigpending(set, sigsetsize)` — Linux RV64 `__NR_rt_sigpending = 136`.
+pub const NR_RT_SIGPENDING: u64 = 136;
+/// `sigaltstack(ss, old_ss)` — Linux RV64 `__NR_sigaltstack`.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
+pub const NR_SIGALTSTACK: u64 = 132;
+/// `rt_sigqueueinfo(pid, sig, info)` — Linux RV64 `__NR_rt_sigqueueinfo = 138`.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
+pub const NR_RT_SIGQUEUEINFO: u64 = 138;
+/// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — Linux RV64.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
+pub const NR_RT_SIGTIMEDWAIT: u64 = 137;
+/// `pidfd_open(pid, flags)` — Linux RV64.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
+pub const NR_PIDFD_OPEN: u64 = 434;
+/// `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
+pub const NR_PIDFD_SEND_SIGNAL: u64 = 424;
 /// `uname(buf)`. Linux RV64 generic ABI `__NR_uname = 160`. Writes
 /// the static utsname (`sysname` / `nodename` / `release` / `version`
 /// / `machine` / `domainname`, each `[u8; 65]`) to `buf`. Slice 7

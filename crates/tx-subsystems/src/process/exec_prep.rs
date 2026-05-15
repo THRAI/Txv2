@@ -9,7 +9,7 @@
 
 use crate::process::adapter::step_engine::Cap;
 
-use crate::process::structure::ProcessIdentity;
+use crate::process::structure::{ProcessIdentity, ProcessPayload};
 
 /// Close every fd marked `CLOEXEC` in `process.fd_table`, then clear
 /// the `cloexec` set.
@@ -97,4 +97,32 @@ pub fn step_install_brk_for_exec(process: &Cap<ProcessIdentity>, new_brk_base: u
             .current_brk
             .store(new_brk_base, core::sync::atomic::Ordering::Release);
     }
+}
+
+/// Store the new exec identity: command-line, executable DEntry, and
+/// process short name (comm). Called inside `exec_script` after
+/// Phase 6 (aspace swap) and before userspace entry.
+///
+/// Per `txdoc:EXEC-12-5-INSTALL-EXEC-IDENTITY`. Infallible — by
+/// EXEC-PONR. No-op for zombies.
+///
+/// `cmdline` is the full argv as a flat NUL-separated byte slice.
+/// `exe_dentry` is the resolved DEntry of the loaded binary.
+/// `comm_bytes` is the basename of the executable (≤15 bytes).
+pub fn step_store_exec_identity(
+    process: &Cap<ProcessIdentity>,
+    cmdline: &[u8],
+    exe_dentry: Cap<crate::vfs::DEntry>,
+    comm_bytes: &[u8],
+) {
+    let Some(payload_cap) = process.payload.lock().clone() else {
+        return;
+    };
+    let payload: &ProcessPayload = &payload_cap;
+    *payload._cmdline.lock() = Some(cmdline.to_vec());
+    *payload._exe_file.lock() = Some(exe_dentry);
+    let mut buf = [0u8; 16];
+    let len = (comm_bytes.len()).min(15);
+    buf[..len].copy_from_slice(&comm_bytes[..len]);
+    *payload._comm.lock() = buf;
 }

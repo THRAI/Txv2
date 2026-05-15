@@ -377,6 +377,14 @@ impl VmEntry {
         self
     }
 
+    /// Builder helper: return a clone of `self` with the `locked`
+    /// flag set. Used by the mlock/munlock path to tag VMAs without
+    /// bypassing the EBR-published recipe-tree contract.
+    pub fn with_locked(mut self, locked: bool) -> Self {
+        self.flags.locked = locked;
+        self
+    }
+
     pub fn split_for_unmap(&self, hole: UserRange) -> Result<VmEntryRewrite, VmEntryError> {
         self.split_rewrite(hole, None)
     }

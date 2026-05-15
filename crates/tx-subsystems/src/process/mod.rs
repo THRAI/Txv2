@@ -9,6 +9,7 @@ pub mod adapter;
 pub mod exec_prep;
 pub mod execution;
 pub mod structure;
+pub mod topology;
 
 #[cfg(test)]
 mod tests;
@@ -17,11 +18,15 @@ pub use exec_prep::{
     step_close_cloexec_fds, step_install_brk_for_exec, step_reset_signal_dispositions_for_exec,
 };
 pub use execution::{
-    bootstrap_init_process, init_process, process_by_pid, seed_child_leader_context, step_chdir,
-    step_exit_group, step_fork, step_getcwd, step_setpgid, step_setsid, step_waitpid_nohang,
-    ChdirOutcome, ForkError, SetpgidError, SetsidError, WaitError, WaitTarget,
+    all_pids, bootstrap_init_process, init_process, process_by_pid, seed_child_leader_context,
+    step_chdir, step_exit_group, step_fork, step_getcwd, step_setpgid, step_setsid,
+    step_waitpid_nohang, ChdirOp, ChdirOutcome, ExitGroupOp, ForkError, GetcwdOp,
+    SetpgidError, SetsidError, WaitError, WaitTarget,
 };
 pub use structure::{
     allocate_pid, ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,
     Sid, EXIT_SOURCE_CHILD_ZOMBIFIED,
+};
+pub use topology::{
+    ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers,
 };

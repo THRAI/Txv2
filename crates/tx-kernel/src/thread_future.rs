@@ -149,6 +149,15 @@ pub struct PerHartSlotted<P: TxPlatform, F: Future> {
     _platform: core::marker::PhantomData<fn() -> P>,
 }
 
+// SAFETY: `PerHartSlotted` owns a `PayloadCap<ThreadPayload>` (Send)
+// and an `F: Future`. The EBR `Guard` held transiently inside `F`'s
+// async state machine is created and dropped within a single poll
+// boundary — it never crosses an `.await` point. The `Send` bound on
+// `F` is the caller's responsibility; `submit_task_with_meta` already
+// requires `F: Send`.
+unsafe impl<P: TxPlatform, F: Future> Send for PerHartSlotted<P, F> where F: Send {}
+unsafe impl<P: TxPlatform, F: Future> Sync for PerHartSlotted<P, F> where F: Sync {}
+
 impl<P: TxPlatform, F: Future> PerHartSlotted<P, F> {
     pub fn new(payload: PayloadCap<ThreadPayload>, inner: F) -> Self {
         Self {
@@ -253,22 +262,43 @@ pub async fn run_thread<P: TxPlatform>(
         // handled inline.
         let ast_outcome = ast_dispatch(&thread);
         match ast_outcome {
-            AstOutcome::DeliverHandler { sig: _, handler: _ } => {
-                // Phase D: handler delivery — the thread should enter
-                // the installed handler with a signal frame on the
-                // user stack.
+            AstOutcome::DeliverHandler { sig, handler } => {
+                // Phase D: redirect the thread's saved_user_context
+                // to the installed handler. Without a live
+                // TrapFrameMut (only available in the trap handler),
+                // we cannot call SignalFrameIf::write_signal_frame
+                // to construct the full RV64 signal frame with
+                // siginfo and sigreturn trampoline.
                 //
-                // TODO(phase-d-handler-frame): call
-                // SignalFrameIf::write_signal_frame here to construct
-                // the signal frame, modify saved_user_context to enter
-                // the handler trampoline, and set up the sigreturn
-                // trampoline for handler return.
+                // MVP: modify saved_user_context in-place.
+                // sepc → handler address (the thread enters the
+                // handler), a0 → signal number (POSIX convention).
+                // RA is left unchanged — the handler MUST NOT
+                // return (no sigreturn frame). A full implementation
+                // requires reactor integration: the AST checkpoint
+                // moves to the trap exit path where TrapFrameMut is
+                // available for SignalFrameIf::write_signal_frame.
                 //
-                // For now, fall through — the handler is not delivered
-                // and the thread re-enters userspace at the original
-                // instruction. The signal is already dequeued from
-                // the pending queue by ast_check, so it is effectively
-                // dropped.
+                // See: `txdoc:SIGNAL-V1-S15-HANDLER-DELIVERY`.
+                if let Some(mut ctx) = payload.saved_user_context() {
+                    // Save the current context as the signal context
+                    // (pre-handler state).  sigreturn restores from
+                    // this slot to resume the original execution.
+                    payload.store_saved_signal_context(Some(ctx));
+
+                    // Redirect the thread to the installed handler.
+                    // sepC → handler address.
+                    ctx.pc = handler as usize;
+                    // RV64 calling convention: a0 (x10) = signal number.
+                    ctx.regs[10] = sig.raw() as usize;
+                    // RA (x1) → original PC + 4.  When the handler
+                    // returns (via `ret`), it jumps to the instruction
+                    // after the interrupted one — close to SA_RESTART
+                    // semantics without a sigreturn trampoline.
+                    ctx.regs[1] = ctx.pc + 4;
+
+                    payload.store_saved_user_context(Some(ctx));
+                }
             }
             AstOutcome::InitiateTermination => return,
             _ => {}

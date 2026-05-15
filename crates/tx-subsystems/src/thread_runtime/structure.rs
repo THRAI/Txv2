@@ -147,6 +147,13 @@ pub struct ThreadPayload {
     /// `view.capture_user_context()`, restored before next userspace
     /// entry. Per `THREAD-5-1-STATE-PLACEMENT`.
     pub(crate) saved_user_context: SpinMutex<Option<UserTrapContext>>,
+    /// Saved signal context: the `UserTrapContext` that was active
+    /// before the most recent handler delivery.  Written by the AST
+    /// checkpoint in `thread_future` when `DeliverHandler` fires;
+    /// consumed by `sys_rt_sigreturn` to restore the original
+    /// execution state.  `None` when no handler is currently
+    /// executing.
+    pub(crate) saved_signal_context: SpinMutex<Option<UserTrapContext>>,
     /// Result of the last completed syscall, drained by the
     /// userspace-entry checkpoint and written into the (then-fresh)
     /// trap frame via `set_syscall_return` / `set_syscall_error`
@@ -203,6 +210,10 @@ pub struct ThreadPayload {
     /// thread future without acquiring the payload lock.
     /// See: `txdoc:SIGNAL-V1-S12-3-ROUTE-GEWALT-STOP`.
     pub(crate) stopped: core::sync::atomic::AtomicBool,
+    /// Alternate signal stack (`sigaltstack(2)`).  `None` means
+    /// "no alternate stack" (deliver on the normal stack).
+    /// `Some((base, size))` gives the alternate stack range.
+    pub(crate) alt_stack: SpinMutex<Option<(usize, usize)>>,
 }
 
 impl ThreadPayload {
@@ -217,9 +228,11 @@ impl ThreadPayload {
             userspace_slot: UserspaceRunSlot::new(),
             active_request: SpinMutex::new(None),
             saved_user_context: SpinMutex::new(None),
+            saved_signal_context: SpinMutex::new(None),
             pending_syscall_return: SpinMutex::new(None),
             mailbox: SpinMutex::new(None),
             stopped: core::sync::atomic::AtomicBool::new(false),
+            alt_stack: SpinMutex::new(None),
         }
     }
 
@@ -307,6 +320,17 @@ impl ThreadPayload {
     /// (clear).
     pub(crate) fn set_stopped(&self, val: bool) {
         self.stopped.store(val, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Snapshot the alternate signal stack (base, size).
+    /// `None` means use the normal stack.
+    pub fn alt_stack(&self) -> Option<(usize, usize)> {
+        *self.alt_stack.lock()
+    }
+
+    /// Set or clear the alternate signal stack.
+    pub fn set_alt_stack(&self, stack: Option<(usize, usize)>) {
+        *self.alt_stack.lock() = stack;
     }
 
     /// Borrow the per-thread pending-signal queue.

@@ -11,13 +11,15 @@ use crate::execution::Guard;
 use crate::page_backed::FsPageBacking;
 use crate::tty;
 use crate::vfs::adapter::step_engine::{
-    ByteProgress, Cap, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+    self, ByteProgress, Cap, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
 
 use super::structure::{
-    Credential, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileBacking, OpenFileIoctl,
-    OpenFileIoctlCaller, OpenFileIoctlResult, RNodeBacking, StructPayload,
+    Credential, DEntry, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile,
+    OpenFileBacking, OpenFileFlags, OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult, RNode,
+    RNodeBacking, StructPayload,
 };
+use crate::mount::{MountIdentity, MountPayload};
 
 // === FsOps — emits step_v3 outcomes ==================================
 //
@@ -217,6 +219,20 @@ pub trait FsOps: Send + Sync + 'static {
         let _ = (fs_object_id, new_uid, new_gid, cred, guard);
         StepOutcome::err(Errno::ENOSYS)
     }
+
+    /// Read content from a projected inode (procfs, sysfs, etc.).
+    /// Called by `OpenFile::step_read` when `RNodeBacking::Projected`.
+    /// Default: `ENOSYS`.
+    fn step_read_projected(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        buf: &mut [u8],
+        guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
+        let _ = (fs_object_id, offset, buf, guard);
+        StepOutcome::err(Errno::ENOSYS)
+    }
 }
 
 /// Filesystem driver output produced at mount time and consumed by Mount
@@ -297,8 +313,28 @@ impl OpenFile {
             RNodeBacking::PageBacked { pc } => {
                 crate::page_backed::step_read_to_kernel(pc, self, out, guard)
             }
-            RNodeBacking::Symlink { .. } | RNodeBacking::Projected => {
+            RNodeBacking::Symlink { .. } => {
                 StepOutcome::Err(Errno::ENOSYS)
+            }
+            RNodeBacking::Projected => {
+                let rnode = self.rnode();
+                let off = self.offset();
+                match rnode.containing_mount_weak().and_then(|mw| mw.upgrade(guard)) {
+                    Some(mp) => {
+                        match mp.fs_ops().step_read_projected(
+                            rnode.fs_object_id(), off, out, guard,
+                        ) {
+                            StepOutcome::Done(n) => {
+                                self.set_offset(off + n);
+                                StepOutcome::Done(n as usize)
+                            }
+                            StepOutcome::Err(e) => StepOutcome::Err(e),
+                            StepOutcome::Continue { .. } => StepOutcome::Err(Errno::EAGAIN),
+                            StepOutcome::Yield { .. } => StepOutcome::Err(Errno::EIO),
+                        }
+                    }
+                    None => StepOutcome::Err(Errno::ENOENT),
+                }
             }
         }
     }
@@ -605,7 +641,7 @@ pub struct OpenFileReadOp<'a> {
     /// in the outcome. This allows `drive()` to call `step()` multiple
     /// times without the caller needing to update `out` between
     /// iterations (DRIVE-2).
-    cursor: usize,
+    pub cursor: usize,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadOp<'a> {
@@ -657,7 +693,7 @@ pub struct OpenFileWriteOp<'a> {
     pub guard: &'a Guard<'a>,
     /// Internal write cursor: each `step()` call consumes bytes starting
     /// at `bytes[cursor..]`. Mirrors `OpenFileReadOp::cursor`.
-    cursor: usize,
+    pub cursor: usize,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteOp<'a> {
@@ -973,6 +1009,116 @@ mod step_op_wraps {
             other => panic!("expected Err(ENOSYS), got {other:?}"),
         }
     }
+
+// === Bootstrap helpers (initramfs unpack) =============================
+//
+// Synchronous helpers that call `FsOps` and materialise `DEntry` /
+// `RNode` / `OpenFile` without going through the VFS walker. Used
+// by the initramfs cpio unpacker and other boot-time VFS population.
+// These are NOT step ops — they drive FsOps calls to completion
+// synchronously (bootstrap-only; production uses the walker).
+
+/// Create a directory under `parent_dentry`.
+/// Returns the new `Cap<DEntry>`.
+pub fn kernel_mkdir(
+    parent_dentry: &Cap<DEntry>,
+    mount_payload: &Cap<MountPayload>,
+    name: &[u8],
+    mode: u16,
+    guard: &Guard<'_>,
+) -> Result<Cap<DEntry>, Errno> {
+    let fs_ops = mount_payload.fs_ops();
+    let parent_fs_id = parent_dentry.rnode().fs_object_id();
+    let cred = Credential::root();
+
+    let (child_fs_id, meta) = match fs_ops.mkdir(parent_fs_id, name, mode, &cred, guard) {
+        StepOutcome::Done(v) => v,
+        StepOutcome::Err(e) => return Err(e),
+        _ => return Err(Errno::EIO),
+    };
+
+    let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, guard) {
+        StepOutcome::Done(r) => r,
+        StepOutcome::Err(e) => return Err(e),
+        _ => return Err(Errno::EIO),
+    };
+
+    let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
+    let dentry = DEntry::new(iname, rnode);
+    step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)
+}
+
+/// Create a regular file under `parent_dentry` and open it.
+/// Returns `(DEntry, OpenFile)`.
+pub fn kernel_create(
+    parent_dentry: &Cap<DEntry>,
+    mount_payload: &Cap<MountPayload>,
+    name: &[u8],
+    mode: u16,
+    guard: &Guard<'_>,
+) -> Result<(Cap<DEntry>, Cap<OpenFile>), Errno> {
+    let fs_ops = mount_payload.fs_ops();
+    let parent_fs_id = parent_dentry.rnode().fs_object_id();
+    let cred = Credential::root();
+
+    let (child_fs_id, meta) = match fs_ops.create_inode(parent_fs_id, name, mode, &cred, guard) {
+        StepOutcome::Done(v) => v,
+        StepOutcome::Err(e) => return Err(e),
+        _ => return Err(Errno::EIO),
+    };
+
+    let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, guard) {
+        StepOutcome::Done(r) => r,
+        StepOutcome::Err(e) => return Err(e),
+        _ => return Err(Errno::EIO),
+    };
+
+    let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
+    let dentry = DEntry::new(iname, rnode.clone());
+    let dentry_cap = step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)?;
+
+    let open_file = OpenFile::new_cap(rnode, OpenFileFlags {
+        read: false,
+        write: true,
+        append: false,
+        cloexec: false,
+        nonblocking: false,
+    })
+        .map_err(|_| Errno::ENOMEM)?;
+
+    Ok((dentry_cap, open_file))
+}
+
+/// Create a symlink under `parent_dentry`.
+pub fn kernel_symlink(
+    parent_dentry: &Cap<DEntry>,
+    mount_payload: &Cap<MountPayload>,
+    name: &[u8],
+    target: &[u8],
+    guard: &Guard<'_>,
+) -> Result<Cap<DEntry>, Errno> {
+    let fs_ops = mount_payload.fs_ops();
+    let parent_fs_id = parent_dentry.rnode().fs_object_id();
+    let cred = Credential::root();
+
+    let (child_fs_id, meta) = match fs_ops.symlink(parent_fs_id, name, target, &cred, guard) {
+        StepOutcome::Done(v) => v,
+        StepOutcome::Err(e) => return Err(e),
+        _ => return Err(Errno::EIO),
+    };
+
+    let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, guard) {
+        StepOutcome::Done(r) => r,
+        StepOutcome::Err(e) => return Err(e),
+        _ => return Err(Errno::EIO),
+    };
+
+    let iname = InlineName::new(name).map_err(|_| Errno::ENAMETOOLONG)?;
+    let dentry = DEntry::new(iname, rnode);
+    step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)
+}
+
+// === tests =============================================================
 
     #[test]
     fn ioctl_op_on_tty_returns_termios() {

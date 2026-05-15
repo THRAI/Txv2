@@ -213,7 +213,7 @@ fn session_foreground_pgrp_cap_none_when_tty_has_no_binding() {
 /// Helper: read SIGHUP / SIGCONT pending state on `proc`'s leader.
 fn leader_pending(proc_cap: &Cap<ProcessIdentity>, sig: Signum) -> bool {
     let payload = proc_cap.payload.lock();
-    let leader = payload.as_ref().expect("alive").threads.lock()[0].clone();
+    let leader = payload.as_ref().expect("alive").threads.nth(0).unwrap();
     drop(payload);
     let leader_payload = leader.payload.lock();
     leader_payload

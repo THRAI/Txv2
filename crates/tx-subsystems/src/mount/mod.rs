@@ -14,7 +14,11 @@ use adapter::runtime::{
 use crate::device::BlockDevice;
 use crate::execution::KernelResult;
 use crate::page_backed::{FsPageBacking, PageContainer};
-use crate::vfs::{DEntry, FsObjectId, FsOps, InodeMeta, RNode};
+use crate::execution::Errno;
+use crate::vfs::{
+    adapter::step_engine::{self as vfs_step_engine, Guard, NoProgress, StepOutcome},
+    DEntry, FsObjectId, FsOps, InlineName, InodeMeta, RNode,
+};
 
 static MOUNT_IDENTITY_ZONE: Zone<MountIdentity> = Zone::const_new();
 static MOUNT_PAYLOAD_ZONE: Zone<MountPayload> = Zone::const_new();
@@ -438,6 +442,80 @@ pub fn mount_for(
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_mount_table_for_test() {
     MOUNT_TABLE.lock().clear();
+}
+
+/// Bootstrap a mount: create a `MountIdentity` for `source_payload`
+/// on `mountpoint`, registered in the global mount table.
+///
+/// This is a **bootstrap helper** — it drives `FsOps` calls to
+/// completion synchronously via an inline `drive()` loop, assuming
+/// single-threaded boot context where no reactor is yet running.
+/// Production hot-path mount/umount will be proper step ops.
+///
+/// Returns the new `MountIdentity` cap on success.
+pub fn bootstrap_mount(
+    source_payload: Cap<MountPayload>,
+    mountpoint: Cap<DEntry>,
+    parent_mount: Option<Cap<MountIdentity>>,
+    guard: &Guard<'_>,
+) -> Result<Cap<MountIdentity>, Errno> {
+    let fs_ops = source_payload.fs_ops().clone();
+    let root_id = FsObjectId::ROOT;
+
+    // Drive load_inode_meta to completion.
+    let root_meta = match drive_step_outcome_to_done(
+        || fs_ops.load_inode_meta(root_id, guard),
+        guard,
+    ) {
+        Ok(meta) => meta,
+        Err(e) => return Err(e.into()),
+    };
+
+    // Drive materialise_rnode to completion.
+    let root_rnode = match drive_step_outcome_to_done(
+        || fs_ops.materialise_rnode(root_id, root_meta, guard),
+        guard,
+    ) {
+        Ok(rnode) => rnode,
+        Err(e) => return Err(e.into()),
+    };
+
+    // Sign MountIdentity.
+    let id = allocate_mount_id();
+    let mount = MountIdentity::new_cap(
+        id,
+        Some(mountpoint.clone()),
+        root_rnode,
+        parent_mount,
+        source_payload.clone(),
+        MountFlags::empty(),
+    )
+    .map_err(|_| Errno::ENOMEM)?;
+
+    // Register in the global mount table.
+    let mountpoint_fs_object_id = mountpoint.rnode().fs_object_id();
+    register_mount(&source_payload, mountpoint_fs_object_id, mount.clone());
+
+    Ok(mount)
+}
+
+/// Drive a `StepOutcome<T, NoProgress>` closure to completion,
+/// spinning on `Yield` until `Done` or `Err`.
+fn drive_step_outcome_to_done<T>(
+    mut step_fn: impl FnMut() -> StepOutcome<T, NoProgress>,
+    guard: &Guard<'_>,
+) -> Result<T, crate::execution::Errno> {
+    loop {
+        match step_fn() {
+            StepOutcome::Done(value) => return Ok(value),
+            StepOutcome::Err(e) => return Err(e.into()),
+            _ => {
+                // In bootstrap context, Continue/Yield are not expected;
+                // spin once and retry.
+                core::hint::spin_loop();
+            }
+        }
+    }
 }
 
 // === MountId / DevId allocators ======================================

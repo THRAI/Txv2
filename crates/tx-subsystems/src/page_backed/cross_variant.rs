@@ -31,6 +31,11 @@ pub fn step_copy_file_range(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
     use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3};
     if len == 0 {
         return V3::done(0);

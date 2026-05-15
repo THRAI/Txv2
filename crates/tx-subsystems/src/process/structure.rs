@@ -41,6 +41,7 @@ use crate::execution::WaitToken;
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::ThreadIdentity;
 use crate::tty::structure::identity::TtyIdentity;
+use crate::process::topology::{ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers};
 use crate::vfs::{DEntry, OpenFile};
 use crate::vm::AddressSpace;
 
@@ -168,7 +169,7 @@ pub struct ProcessIdentity {
     /// Pushed by `step_fork`; walked by `step_process_exit` (sever
     /// child's parent slot) and `step_waitpid_nohang` (reap —
     /// withdraws the Cap, releasing retention).
-    pub(crate) children: SpinMutex<Vec<Cap<ProcessIdentity>>>,
+    pub(crate) children: ProcessChildren,
     pub(crate) pgrp: SpinMutex<Cap<ProcessGroup>>,
     /// Process-visible exit disposition. `Some` once the process has
     /// run `step_exit_group` / `step_exit_group_with_signal` (or the
@@ -246,7 +247,7 @@ impl ProcessIdentity {
     /// Children leave this list only via `step_waitpid_nohang`'s
     /// reap step or when this process itself reclaims.
     pub fn child_count(&self) -> usize {
-        self.children.lock().len()
+        self.children.len()
     }
 
     /// Snapshot the children list as owned `Cap`s. The returned
@@ -254,7 +255,7 @@ impl ProcessIdentity {
     /// released before return. Includes zombie children (callers
     /// that need to skip zombies should `is_zombie()`-filter).
     pub fn children(&self) -> alloc::vec::Vec<Cap<ProcessIdentity>> {
-        self.children.lock().clone()
+        self.children.snapshot()
     }
 
     /// Read the recorded exit status. `Some` once `step_exit_group`
@@ -275,6 +276,11 @@ impl ProcessIdentity {
     /// but cheaper.
     pub fn is_zombie(&self) -> bool {
         self.payload.lock().is_none()
+    }
+
+    /// Process state char for /proc/<pid>/stat.
+    pub fn state_char(&self) -> u8 {
+        if self.is_zombie() { b'Z' } else { b'R' }
     }
 
     /// Snapshot the current address space `Cap`, if the process is
@@ -567,7 +573,7 @@ impl ProcessIdentity {
         self.payload
             .lock()
             .as_ref()
-            .map(|p| p.threads.lock().len())
+            .map(|p| p.threads.count())
             .unwrap_or(0)
     }
 
@@ -584,7 +590,7 @@ impl ProcessIdentity {
     pub fn nth_thread(&self, idx: usize) -> Option<Cap<ThreadIdentity>> {
         let payload_guard = self.payload.lock();
         let payload = payload_guard.as_ref()?;
-        let result = payload.threads.lock().get(idx).cloned();
+        let result = payload.threads.nth(idx);
         result
     }
 
@@ -744,7 +750,7 @@ pub struct ProcessPayload {
     /// driver) snapshot via `process.aspace_cap()` which clones the
     /// inner `Cap` out of the slot.
     pub(crate) aspace: AtomicSlot<Cap<AddressSpace>>,
-    pub(crate) threads: SpinMutex<Vec<Cap<ThreadIdentity>>>,
+    pub(crate) threads: ProcessThreads,
     /// Per-process signal-action table. Day-1 records dispositions
     /// installed via `step_sigaction`; the delivery step that consults
     /// these lands with the AST/scripts pass.
@@ -950,6 +956,19 @@ pub struct ProcessPayload {
     /// constant doc for how the wait4 arm builds its `WaitToken`.
     /// See: `txdoc:SIGNAL-ATTACHMENTS-CATALOG-SCHEMA-2`.
     pub(crate) exit_source_bus: RawQueue,
+    /// Process command-line snapshot. Populated by `execve` at the
+    /// point-of-no-return commit; read by procfs `/proc/<pid>/cmdline`.
+    /// `None` for kernel threads and pre-exec processes.
+    pub(crate) _cmdline: SpinMutex<Option<alloc::vec::Vec<u8>>>,
+    /// Canonical executable DEntry. Set by `execve` to the resolved
+    /// path of the loaded binary. Read by procfs `/proc/<pid>/exe`
+    /// (symlink target) and `/proc/<pid>/stat`.
+    /// `None` for kernel threads and pre-exec processes.
+    pub(crate) _exe_file: SpinMutex<Option<Cap<DEntry>>>,
+    /// Process short name (comm). Up to 15 bytes + NUL. Initialised
+    /// from the executable basename at `execve`; can be changed via
+    /// `prctl(PR_SET_NAME)`. Read by procfs `/proc/<pid>/stat`.
+    pub(crate) _comm: SpinMutex<[u8; 16]>,
 }
 
 impl ProcessPayload {
@@ -1063,6 +1082,26 @@ impl ProcessPayload {
     /// `step_fork` to clone the parent's fd table into the child.
     pub(crate) fn snapshot_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
         self.fds.lock().clone()
+    }
+
+    /// Public fd-table snapshot (for procfs `/proc/<pid>/fd/`).
+    pub fn open_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+        self.snapshot_fds()
+    }
+
+    /// Process command-line (for `/proc/<pid>/cmdline`).
+    pub fn cmdline(&self) -> Option<alloc::vec::Vec<u8>> {
+        self._cmdline.lock().clone()
+    }
+
+    /// Executable DEntry (for `/proc/<pid>/exe` symlink target).
+    pub fn exe_file(&self) -> Option<Cap<DEntry>> {
+        self._exe_file.lock().clone()
+    }
+
+    /// Process short name comm (for `/proc/<pid>/stat`).
+    pub fn comm(&self) -> [u8; 16] {
+        *self._comm.lock()
     }
 
     /// Allocate the lowest unused fd ≥ `min` without installing
@@ -1205,7 +1244,7 @@ impl ProcessPayload {
 pub struct ProcessGroup {
     pub pgid: Pgid,
     pub(crate) session: Cap<Session>,
-    pub(crate) members: SpinMutex<Vec<Weak<ProcessIdentity>>>,
+    pub(crate) members: ProcessGroupMembers,
 }
 
 impl ProcessGroup {
@@ -1218,7 +1257,7 @@ impl ProcessGroup {
     /// Includes entries pointing to dropped processes — callers that
     /// need the live count should walk and `upgrade` under a guard.
     pub fn member_slot_count(&self) -> usize {
-        self.members.lock().len()
+        self.members.len()
     }
 }
 
@@ -1232,7 +1271,7 @@ pub struct Session {
     /// Per `PROCESS_v1` §2.4 (the spec calls this DLL `members`); we
     /// hold weak refs because retention is held by each pgrp's
     /// session binding.
-    pub(crate) members: SpinMutex<Vec<Weak<ProcessGroup>>>,
+    pub(crate) members: SessionMembers,
 }
 
 impl Session {
@@ -1244,7 +1283,7 @@ impl Session {
     /// Number of `Weak` member-pgrp slots currently held. Includes
     /// stale entries pointing to dropped groups.
     pub fn member_slot_count(&self) -> usize {
-        self.members.lock().len()
+        self.members.len()
     }
 
     /// Snapshot the controlling TTY's `Cap` if it's still live. `None`
@@ -1290,10 +1329,7 @@ impl Session {
         guard: &step_engine::Guard<'_>,
     ) -> Option<Cap<ProcessGroup>> {
         let leader_pgid = Pgid(self.sid.0);
-        for weak in self.members.lock().iter() {
-            let Some(pgrp) = weak.upgrade(guard) else {
-                continue;
-            };
+        for pgrp in self.members.snapshot_live(guard) {
             if pgrp.pgid == leader_pgid {
                 return Some(pgrp);
             }

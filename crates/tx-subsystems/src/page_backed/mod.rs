@@ -670,6 +670,11 @@ pub fn step_read(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
     if len == 0 {
         return StepOutcome::done(0);
     }
@@ -691,6 +696,11 @@ pub fn step_write(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+        // observe
+        // upgrade
+        // reserve
+        // commit
+        // publish
     if len == 0 {
         return StepOutcome::done(0);
     }
