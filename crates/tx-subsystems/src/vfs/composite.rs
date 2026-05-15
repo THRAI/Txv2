@@ -674,6 +674,183 @@ impl OneShotStepOp<ProcessIdentity> for ReadLinkOp<'_> {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for ReadLinkOp<'_> {}
 
 // ============================================================================
+// Getdents64Op — getdents64
+// ============================================================================
+
+/// `getdents64` composite op: walk to directory, loop readdir into a
+/// caller-supplied buffer as `linux_dirent64` records.
+///
+/// Each `step()` call fills as many entries as fit in `buf`.  When the
+/// directory is exhausted (readdir returns `None`), the op returns
+/// `Done(0)` to signal EOF.
+pub struct Getdents64Op<'a> {
+    pub rooted_at: &'a Cap<DEntry>,
+    pub path: &'a [u8],
+    pub cred: &'a Credential,
+    pub guard: &'a Guard<'a>,
+    /// Output buffer — caller provides.
+    pub buf: &'a mut [u8],
+    // Internal state
+    target: Option<Cap<DEntry>>,
+    cursor: u64,
+    pos: usize,
+}
+
+/// Size of a `linux_dirent64` header (without the name).
+const DIRENT64_HEADER_SIZE: usize = 19; // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1)
+
+impl<'a, I: SubjectIdentity> StepOp<I> for Getdents64Op<'a> {
+    type Output = usize; // bytes written, 0 = EOF
+    type Progress = NoProgress;
+
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<usize, NoProgress> {
+        let target = match self.target.take() {
+            Some(d) => {
+                self.target = Some(d.clone());
+                d
+            }
+            None => {
+                let rooted_at = self.rooted_at.clone();
+                let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
+                    StepOutcome::Done(d) => d,
+                    StepOutcome::Err(e) => return StepOutcome::err(e),
+                    _ => return StepOutcome::err(step_engine::Errno::EIO),
+                };
+                self.target = Some(d.clone());
+                d
+            }
+        };
+
+        let fs_ops =
+            walker::fs_ops_for(&target, self.guard).expect("NoFsOps for Getdents64Op");
+        let fs_object_id = target.rnode().fs_object_id();
+
+        let cursor = crate::vfs::structure::DirCursor::from_u64(self.cursor);
+
+        match fs_ops.readdir(fs_object_id, cursor, self.guard) {
+            StepOutcome::Done(Some((entry, next_cursor))) => {
+                let name_bytes = entry.name.as_bytes();
+                let reclen = DIRENT64_HEADER_SIZE + name_bytes.len() + 1; // +1 for null terminator
+                let aligned = (reclen + 7) & !7; // 8-byte aligned
+
+                if self.pos + aligned > self.buf.len() {
+                    // Buffer full — save cursor for next call.
+                    self.cursor = cursor.as_u64();
+                    return StepOutcome::done(self.pos);
+                }
+
+                // Write linux_dirent64 record.
+                let buf = &mut self.buf[self.pos..];
+                // d_ino
+                buf[0..8].copy_from_slice(&entry.fs_object_id.as_u64().to_le_bytes());
+                // d_off
+                buf[8..16].copy_from_slice(&next_cursor.as_u64().to_le_bytes());
+                // d_reclen
+                buf[16..18].copy_from_slice(&(aligned as u16).to_le_bytes());
+                // d_type
+                buf[18] = match entry.kind {
+                    crate::vfs::structure::InodeKind::Regular => 8u8,  // DT_REG
+                    crate::vfs::structure::InodeKind::Directory => 4u8, // DT_DIR
+                    crate::vfs::structure::InodeKind::Symlink => 10u8, // DT_LNK
+                    crate::vfs::structure::InodeKind::CharDevice => 2u8, // DT_CHR
+                    crate::vfs::structure::InodeKind::BlockDevice => 6u8, // DT_BLK
+                    crate::vfs::structure::InodeKind::Fifo => 1u8,     // DT_FIFO
+                    crate::vfs::structure::InodeKind::Socket => 12u8,  // DT_SOCK
+                };
+                // d_name
+                buf[19..19 + name_bytes.len()].copy_from_slice(name_bytes);
+                buf[19 + name_bytes.len()] = 0; // null terminator
+
+                self.pos += aligned;
+                self.cursor = next_cursor.as_u64();
+                StepOutcome::done(self.pos)
+            }
+            StepOutcome::Done(None) => {
+                // End of directory.
+                let written = self.pos;
+                self.pos = 0; // reset for potential re-read
+                StepOutcome::done(written)
+            }
+            StepOutcome::Err(e) => StepOutcome::err(e),
+            StepOutcome::Continue { .. } => StepOutcome::done(self.pos),
+            StepOutcome::Yield { shape, .. } => StepOutcome::Yield {
+                progress: NoProgress,
+                shape,
+            },
+        }
+    }
+}
+
+// ============================================================================
+// PpollOp — ppoll (single-fd v1)
+// ============================================================================
+
+/// `ppoll` composite op: block until one of the registered fds is
+/// readable/writable, or a timeout expires.
+///
+/// v1: single fd only.  Returns the number of ready fds (0 or 1).
+pub struct PpollOp<'a> {
+    pub guard: &'a Guard<'a>,
+    /// Interest mask for the single fd.
+    pub interest: u64,
+    /// Timeout in milliseconds, or `None` for infinite.
+    pub timeout_ms: Option<u64>,
+    // Internal state
+    started: bool,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for PpollOp<'a> {
+    type Output = usize; // 0 = timeout, 1 = ready
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<usize, NoProgress> {
+        if !self.started {
+            self.started = true;
+            // v1 stub: always return timeout (0).
+            // Full implementation would register a wait token and
+            // yield via StepOutcome::Yield { shape: OnWaitSource { .. } }.
+            if let Some(_ms) = self.timeout_ms {
+                return StepOutcome::done(0);
+            }
+            // Infinite timeout — would yield forever.
+            // For now, return EAGAIN as a placeholder.
+            return StepOutcome::err(step_engine::Errno::ENOSYS);
+        }
+        StepOutcome::done(0)
+    }
+}
+
+// ============================================================================
+// NanosleepOp — nanosleep / clock_nanosleep
+// ============================================================================
+
+/// `nanosleep` composite op: suspend the calling task for at least
+/// the requested duration.
+///
+/// v1 stub: returns `ENOSYS` (timer infrastructure not yet wired).
+pub struct NanosleepOp {
+    /// Requested sleep duration in nanoseconds.
+    pub nanos: u64,
+    started: bool,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for NanosleepOp {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        if !self.started {
+            self.started = true;
+            // v1 stub: timer yield not yet available.
+            // Full implementation would yield via
+            // StepOutcome::Yield { shape: OnTimer { .. } }.
+            return StepOutcome::err(step_engine::Errno::ENOSYS);
+        }
+        StepOutcome::done(())
+    }
+}
+
+// ============================================================================
 // Shared helpers
 // ============================================================================
 
