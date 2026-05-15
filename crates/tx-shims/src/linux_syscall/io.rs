@@ -217,28 +217,15 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return SyscallResult::Return(0);
     }
 
-    // Pollfd layout: { i32 fd; i16 events; i16 revents } — 8 bytes
-    // packed on Linux RV64 generic ABI.
     const POLLFD_BYTES: u64 = 8;
     const POLLIN: i16 = 0x0001;
 
-    // Snapshot the timeout treatment: NULL → infinite wait, else
-    // treat any non-NULL pointer as "wait but bounded" — the timer
-    // wire isn't actually consulted today (see header comment), so
-    // for non-NULL we still wait on the carrier (the re-poll loop
-    // returns whatever's ready on wake) and trust the caller to
-    // retry. Empty timespec ({0,0}) would be the "poll-without-wait"
-    // shape, but distinguishing it from "wait forever" requires
-    // reading two u64s; the busybox flow uses NULL = forever, so we
-    // only implement that branch precisely.
-    let wait_allowed = true;
-    let _ = timeout_ptr; // see header note
+    let wait_allowed = timeout_ptr == 0; // NULL = infinite wait
+    let _ = timeout_ptr;
 
-    // First pass: read each pollfd, check readability against the
-    // backing, write back `revents`, and remember the first TTY fd
-    // that requested POLLIN but isn't currently readable. That fd's
-    // wait source is what we park on if nothing is ready.
-    let mut park_on_tty: Option<Cap<tx_subsystems::tty::structure::TtyIdentity>> = None;
+    // Track the first TTY fd's WaitSourceId for parking.
+    let mut park_source: Option<(u64, u64)> = None; // (source_id_raw, interests_raw)
+
     let ready = loop {
         let mut ready: i64 = 0;
         for i in 0..nfds {
@@ -253,25 +240,22 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             if fd >= 0 {
                 if let Some(file) = resolve_fd(&ctx.process, fd as u32) {
                     if events & POLLIN != 0 {
-                        // TTY backing: peek the readable level.
                         if let RNodeBacking::StructBacked {
                             payload: StructPayload::Tty(tty),
                         } = file.rnode().backing()
                         {
                             if tty_readable_level(tty) {
                                 revents |= POLLIN;
-                            } else if park_on_tty.is_none() {
-                                park_on_tty = Some(tty.clone());
+                            } else if park_source.is_none() {
+                                park_source = Some((
+                                    file.rnode().read_wait_source_id(),
+                                    POLLIN as u64,
+                                ));
                             }
                         } else {
-                            // Non-TTY backings: punt to the legacy
-                            // "always ready" shape so files / pipes
-                            // / chardevs don't regress to a hang.
                             revents |= POLLIN;
                         }
                     }
-                    // POLLOUT-only polls: legacy semantics — TTYs
-                    // and most other fds are always writable in v1.
                     let pollout: i16 = 0x0004;
                     if events & pollout != 0 {
                         revents |= pollout;
@@ -296,12 +280,45 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         if !wait_allowed {
             break 0;
         }
-        let Some(tty) = park_on_tty.take() else {
-            // No carrier to park on (all fds non-TTY, none ready) —
-            // give up rather than spin.
+        let Some((source_id, interests)) = park_source.take() else {
             break 0;
         };
-        wait_for_tty_readable(tty).await;
+
+        // drive-taskmb: park on the fd's WaitSource via drive() +
+        // PpollOp. The driver registers the task mailbox with the
+        // WaitSource, parks, and wakes when the fd fires.
+        use crate::adapter::step_engine as step_engine;
+        use step_engine::{InterestMask, WaitSourceId};
+        use tx_substrate::step::DriveMode;
+        use tx_scripts::drive;
+
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mailbox_arc = script_ctx.mailbox().cloned();
+        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let guard = step_engine::guard();
+        let mut op = tx_subsystems::vfs::composite::PpollOp {
+            guard: &guard,
+            wait_source_id: WaitSourceId::new(source_id),
+            interests: InterestMask::new(interests),
+            timeout_ms: None,
+            started: false,
+        };
+        match drive(
+            op,
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            None,
+            timer_wheel_arc.as_ref(),
+        )
+        .await
+        {
+            Ok(1) => {
+                // Fd is ready; re-scan to update revents.
+            }
+            Ok(_) => break 0,
+            Err(_e) => break 0,
+        }
     };
 
     SyscallResult::Return(ready)
@@ -378,9 +395,8 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             // `-EPIPE` to userspace.
             if errno == tx_subsystems::execution::Errno::EPIPE {
                 let _ = tx_subsystems::signal::step_kill_process(
-                    &ctx.process,
-                    tx_subsystems::signal::Signum::SIGPIPE,
-                );
+                    &ctx.process, tx_subsystems::signal::Signum::SIGPIPE,
+                , None);
             }
             SyscallResult::Error(errno_to_i32(errno))
         }

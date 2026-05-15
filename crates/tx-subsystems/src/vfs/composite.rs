@@ -27,8 +27,8 @@ use alloc::boxed::Box;
 use crate::execution::Guard;
 use crate::page_backed::FsPageBacking;
 use crate::vfs::adapter::step_engine::{
-    self, Cap, Deadline, NoProgress, OneShotStepOp, ProcessIdentity, ResumeOutcome, ScriptCtx,
-    StepOp, StepOutcome, SubjectIdentity, TimerId, YieldShape,
+    self, Cap, Deadline, InterestMask, NoProgress, OneShotStepOp, ProcessIdentity, ResumeOutcome,
+    ScriptCtx, StepOp, StepOutcome, SubjectIdentity, TimerId, WaitSourceId, YieldShape,
 };
 use crate::vfs::{Credential, DEntry, FsObjectId, FsOps, InlineName, InodeMeta};
 use crate::vfs::walker;
@@ -526,10 +526,10 @@ pub struct StatOp<'a> {
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for StatOp<'a> {
-    type Output = InodeMeta;
+    type Output = (InodeMeta, FsObjectId);
     type Progress = NoProgress;
 
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<InodeMeta, NoProgress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(InodeMeta, FsObjectId), NoProgress> {
         let target = match self.target.take() {
             Some(d) => d,
             None => {
@@ -543,7 +543,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for StatOp<'a> {
                 d
             }
         };
-        StepOutcome::done(target.rnode().meta())
+        let meta = target.rnode().meta();
+        let ino = target.rnode().fs_object_id();
+        StepOutcome::done((meta, ino))
     }
 }
 
@@ -608,10 +610,10 @@ pub struct StatxResult {
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for StatxOp<'a> {
-    type Output = StatxResult;
+    type Output = (StatxResult, FsObjectId);
     type Progress = NoProgress;
 
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<StatxResult, NoProgress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(StatxResult, FsObjectId), NoProgress> {
         let target = match self.target.take() {
             Some(d) => d,
             None => {
@@ -625,9 +627,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for StatxOp<'a> {
                 d
             }
         };
-        StepOutcome::done(StatxResult {
-            meta: target.rnode().meta(),
-        })
+        let meta = target.rnode().meta();
+        let ino = target.rnode().fs_object_id();
+        StepOutcome::done((StatxResult { meta }, ino))
     }
 }
 
@@ -788,35 +790,63 @@ impl<'a, I: SubjectIdentity> StepOp<I> for Getdents64Op<'a> {
 /// `ppoll` composite op: block until one of the registered fds is
 /// readable/writable, or a timeout expires.
 ///
-/// v1: single fd only.  Returns the number of ready fds (0 or 1).
+/// v1: single fd only.  Yields [`YieldShape::OnWaitSource`] with the
+/// fd's wait-source id; `drive()` parks on the reactor mailbox until
+/// the fd's `WaitSource` fires, then returns `Done(1)` (ready).
 pub struct PpollOp<'a> {
     pub guard: &'a Guard<'a>,
-    /// Interest mask for the single fd.
-    pub interest: u64,
+    /// `WaitSourceId` of the fd to park on.
+    pub wait_source_id: WaitSourceId,
+    /// Interest mask for the wait registration.
+    pub interests: InterestMask,
     /// Timeout in milliseconds, or `None` for infinite.
     pub timeout_ms: Option<u64>,
-    // Internal state
-    started: bool,
+    /// Private: set by step().
+    pub started: bool,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for PpollOp<'a> {
-    type Output = usize; // 0 = timeout, 1 = ready
+    type Output = usize;
     type Progress = NoProgress;
 
-    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<usize, NoProgress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<usize, NoProgress> {
         if !self.started {
             self.started = true;
-            // v1 stub: always return timeout (0).
-            // Full implementation would register a wait token and
-            // yield via StepOutcome::Yield { shape: OnWaitSource { .. } }.
-            if let Some(_ms) = self.timeout_ms {
-                return StepOutcome::done(0);
+            // drive-taskmb: yield OnWaitSource. drive()'s
+            // resolve_on_wait_source registers the task mailbox
+            // with the fd's WaitSource, parks, and resumes when
+            // the fd becomes readable.
+            if self.timeout_ms.is_some() {
+                // Timeout: for now, yield without timeout (the
+                // TimerWheel fire path needs deadline plumbing).
+                // Future: combine OnWaitSource + OnTimer via
+                // composite yield.
+                return StepOutcome::Yield {
+                    progress: NoProgress,
+                    shape: YieldShape::OnWaitSource {
+                        source: self.wait_source_id,
+                        interests: self.interests,
+                    },
+                };
             }
-            // Infinite timeout — would yield forever.
-            // For now, return EAGAIN as a placeholder.
-            return StepOutcome::err(step_engine::Errno::ENOSYS);
+            // Infinite timeout — yield and park until the fd fires.
+            return StepOutcome::Yield {
+                progress: NoProgress,
+                shape: YieldShape::OnWaitSource {
+                    source: self.wait_source_id,
+                    interests: self.interests,
+                },
+            };
         }
-        StepOutcome::done(0)
+        // Resumed after wake: fd is ready.
+        StepOutcome::done(1)
+    }
+
+    fn apply_resume(&mut self, resume: ResumeOutcome) -> Result<(), step_engine::Errno> {
+        match resume {
+            ResumeOutcome::Retry => Ok(()),
+            _ => Err(step_engine::Errno::EINVAL),
+        }
     }
 }
 
