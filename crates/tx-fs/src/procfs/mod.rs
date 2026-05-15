@@ -14,8 +14,8 @@ use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::{
-    Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, RNode, RNodeBacking,
-    S_IFDIR, S_IFREG, S_IFLNK,
+    render_dentry_path, Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind,
+    InodeMeta, RNode, RNodeBacking, S_IFDIR, S_IFREG, S_IFLNK,
 };
 
 pub const PROCFS_ROOT_ID: FsObjectId = FsObjectId::new(0x7072_6F00);
@@ -42,6 +42,11 @@ pub fn pid_from_mem_id(id: FsObjectId) -> Option<Pid> {
 pub fn pid_from_maps_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
     let base = PROCFS_PID_BASE + PROCFS_MAPS_OFFSET;
+    if r >= base && r < base + 0x10000 { Some(Pid((r - base) as u32)) } else { None }
+}
+pub fn pid_from_exe_id(id: FsObjectId) -> Option<Pid> {
+    let r = id.as_u64();
+    let base = PROCFS_PID_BASE + PROCFS_EXE_OFFSET;
     if r >= base && r < base + 0x10000 { Some(Pid((r - base) as u32)) } else { None }
 }
 
@@ -103,6 +108,9 @@ impl FsOps for Procfs {
             if name == b"maps" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_maps_id(pid));
             }
+            if name == b"exe" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_exe_id(pid));
+            }
             return StepOutcome::err(Errno::ENOENT.into());
         }
         StepOutcome::err(Errno::ENOENT.into())
@@ -119,6 +127,7 @@ impl FsOps for Procfs {
             id if pid_from_cmdline_id(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE)),
             id if pid_from_mem_id(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE | 0o600)),
             id if pid_from_maps_id(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE)),
+            id if pid_from_exe_id(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Symlink, PROCFS_SYMLINK_MODE)),
             _ => StepOutcome::err(Errno::ENOENT.into()),
         }
     }
@@ -143,6 +152,7 @@ impl FsOps for Procfs {
                 (b"cmdline", pid_cmdline_id(pid), InodeKind::Regular),
                 (b"mem", pid_mem_id(pid), InodeKind::Regular),
                 (b"maps", pid_maps_id(pid), InodeKind::Regular),
+                (b"exe", pid_exe_id(pid), InodeKind::Symlink),
             ];
             let fi = idx.saturating_sub(2);
             if fi < files.len() {
@@ -196,7 +206,20 @@ impl FsOps for Procfs {
 
     fn read_link(&self, id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
         if id == PROCFS_SELF_ID {
+            // v1: /proc/self always points to pid 1.
+            // Full implementation requires caller pid context.
             StepOutcome::done(alloc::boxed::Box::from(&b"1"[..]))
+        } else if let Some(pid) = pid_from_exe_id(id) {
+            let Some(proc) = process::process_by_pid(pid) else {
+                return StepOutcome::err(Errno::ENOENT.into());
+            };
+            let Some(exe_dentry) = proc.exe_file() else {
+                return StepOutcome::err(Errno::ENOENT.into());
+            };
+            match render_dentry_path(&exe_dentry) {
+                Some(path) => StepOutcome::done(path.into_boxed_slice()),
+                None => StepOutcome::err(Errno::ENOENT.into()),
+            }
         } else {
             StepOutcome::err(Errno::ENOENT.into())
         }
