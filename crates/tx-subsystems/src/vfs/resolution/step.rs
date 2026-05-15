@@ -1,54 +1,386 @@
 //! Shared transition kernel per `txdoc:VFS-CHECKS-THE-SHARED-KERNEL-KERNEL-STEP-1` (§6).
 //!
-//! `kernel_step` is the mode-agnostic δ function: it reads the
-//! current `WalkState` and the caller-supplied `WalkMode`, and
-//! produces a `KernelStep` describing the next action — continue,
-//! wait for IO, or fail.
+//! `kernel_step` advances the walker one component at a time.
+//! Each call extracts the next path segment, calls `FsOps`
+//! (`lookup` → `load_inode_meta` → `materialise_rnode`), handles
+//! symlink chasing and mount-point crossing, then returns a
+//! `KernelStep` for the driver to act on.
 //!
-//! ## v1
-//!
-//! The current implementation is a thin dispatcher.  The real
-//! component-by-component walk logic lives in the synchronous
-//! `walker::walk_inner_v3` loop.  When ext4 / disk-backed backends
-//! grow real IO yields, the walker's component loop will be lifted
-//! into `kernel_step` as a proper state machine that can yield at
-//! each `FsOps::lookup` / `load_inode_meta` call site and resume
-//! through `ResumeToken`.
+//! The kernel is mode-agnostic: `WalkMode` only affects which
+//! terminal outcome `accepts` permits; the component-by-component
+//! advance is identical for all modes.
+
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::execution::Guard;
+use crate::vfs::adapter::step_engine::Errno as V3Errno;
+use crate::mount::{MountIdentity, MountPayload};
+use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome, Weak};
+use crate::vfs::structure::{
+    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking,
+};
+use crate::vfs::FsOps;
+use crate::vfs::predicates;
+use crate::vfs::walker::{self, SYMLOOP_MAX};
 
-use super::state::{FinalSymlinkPolicy, KernelStep, WalkCause, WalkMode, WalkState};
+use super::state::{
+    FinalSymlinkPolicy, IORequest, KernelStep, PathResolution, ResumeToken, WalkCause, WalkMode,
+    WalkState, WalkingState,
+};
 use super::terminal;
 
-/// Mode-agnostic transition kernel.
+/// Advance the walker one component.
 ///
-/// Reads `WalkState` and `mode`; produces `KernelStep`.  No mutation.
+/// Reads the current `WalkingState`, the caller-supplied `mode` and
+/// `policy`, and the epoch `guard`.  Produces `KernelStep::Continue`
+/// (next state), `NeedIO` (must yield), or `Error` (terminal failure).
 ///
-/// Per `txdoc:VFS-CHECKS-THE-SHARED-KERNEL-KERNEL-STEP-1`.
+/// The driver wraps this in a loop until terminal.
 pub fn kernel_step(
-    state: WalkState,
+    walking: WalkingState,
+    fs_ops: Arc<dyn FsOps>,
+    mount_payload: Option<Cap<MountPayload>>,
+    cred: &Credential,
     mode: WalkMode,
-    _policy: FinalSymlinkPolicy,
-    _guard: &Guard<'_>,
+    policy: FinalSymlinkPolicy,
+    guard: &Guard<'_>,
 ) -> KernelStep {
-    match state {
-        WalkState::Advance => {
-            // v1: the synchronous walker handles component-by-component
-            // advance in walk_inner_v3.  Advance → Continue(Advance)
-            // lets the driver loop iterate.
-            KernelStep::Continue(WalkState::Advance)
+    let WalkingState {
+        mut current,
+        mut remaining,
+        mut hop_count,
+        mount_root,
+        must_be_directory,
+    } = walking;
+
+    // --- collapse leading slashes ---
+    while remaining.first() == Some(&b'/') {
+        remaining.remove(0);
+    }
+
+    // --- end of input ---
+    if remaining.is_empty() {
+        if must_be_directory && current.rnode().meta().kind() != InodeKind::Directory {
+            return KernelStep::Error(WalkCause::NotADirectory);
         }
-        WalkState::Defer { resume, cause } => {
-            // v1: no IO-resume path.  Treat Defer as a terminal error.
-            let _ = resume;
-            KernelStep::Error(cause)
+        let rnode = current.rnode().clone();
+        let meta = rnode.meta();
+        let fs_object_id = rnode.fs_object_id();
+        let resolved = PathResolution {
+            dentry: current,
+            rnode,
+            fs_object_id,
+            meta,
+        };
+        if terminal::accepts(&WalkState::Terminal(resolved.clone()), mode) {
+            return KernelStep::Continue(WalkState::Terminal(resolved));
         }
-        WalkState::Terminal(resolved) => {
-            if terminal::accepts(&WalkState::Terminal(resolved.clone()), mode) {
-                KernelStep::Continue(WalkState::Terminal(resolved))
-            } else {
-                KernelStep::Error(WalkCause::ComponentNotFound)
+        return KernelStep::Error(WalkCause::ComponentNotFound);
+    }
+
+    // --- extract next component ---
+    let next_slash = remaining
+        .iter()
+        .position(|b| *b == b'/')
+        .unwrap_or(remaining.len());
+    let component: Vec<u8> = remaining.drain(..next_slash).collect();
+    if remaining.first() == Some(&b'/') {
+        remaining.remove(0);
+    }
+
+    // --- `.` and `..` ---
+    if component == b"." {
+        return KernelStep::Continue(WalkState::Walking(WalkingState {
+            current,
+            remaining,
+            hop_count,
+            mount_root,
+            must_be_directory,
+        }));
+    }
+    if component == b".." {
+        if let Some(parent_cap) = current.parent_hint() {
+            let is_mount_root = walker::is_same_dentry(&current, &mount_root);
+            if !is_mount_root {
+                current = parent_cap;
             }
         }
+        return KernelStep::Continue(WalkState::Walking(WalkingState {
+            current,
+            remaining,
+            hop_count,
+            mount_root,
+            must_be_directory,
+        }));
+    }
+
+    // --- directory check ---
+    let current_kind = current.rnode().meta().kind();
+    if current_kind != InodeKind::Directory {
+        return KernelStep::Error(WalkCause::NotADirectory);
+    }
+
+    // --- POSIX search permission ---
+    let parent_meta = current.rnode().meta();
+    if let Err(err) = predicates::check_descend_perm(&parent_meta, cred) {
+        return KernelStep::Error(WalkCause::Permission(
+            super::state::NonTerminalDenial::SearchDenied,
+        ));
+    }
+
+    // --- lookup ---
+    let parent_fs_object_id = current.rnode().fs_object_id();
+    let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
+        StepOutcome::Done(id) => id,
+        StepOutcome::Yield { shape, .. } => {
+            let token = ResumeToken {
+                walking: WalkingState {
+                    current,
+                    remaining,
+                    hop_count,
+                    mount_root,
+                    must_be_directory,
+                },
+                hop_count,
+            };
+            return KernelStep::NeedIO(
+                IORequest::DirLookup {
+                    fs_object_id: parent_fs_object_id,
+                    name: component.into_boxed_slice(),
+                },
+                token,
+            );
+        }
+        StepOutcome::Err(e) => return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e))),
+        StepOutcome::Continue { .. } => {
+            // Re-enter lookup (v3 continue without yield).
+            return KernelStep::Continue(WalkState::Walking(WalkingState {
+                current,
+                remaining,
+                hop_count,
+                mount_root,
+                must_be_directory,
+            }));
+        }
+    };
+
+    // --- load inode meta ---
+    let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
+        StepOutcome::Done(m) => m,
+        StepOutcome::Yield { shape, .. } => {
+            let token = ResumeToken {
+                walking: WalkingState {
+                    current,
+                    remaining,
+                    hop_count,
+                    mount_root,
+                    must_be_directory,
+                },
+                hop_count,
+            };
+            return KernelStep::NeedIO(
+                IORequest::LoadInodeMeta {
+                    fs_object_id: child_fs_object_id,
+                },
+                token,
+            );
+        }
+        StepOutcome::Err(e) => return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e))),
+        StepOutcome::Continue { .. } => {
+            return KernelStep::Continue(WalkState::Walking(WalkingState {
+                current,
+                remaining,
+                hop_count,
+                mount_root,
+                must_be_directory,
+            }));
+        }
+    };
+
+    // --- mid-path non-directory check ---
+    if child_meta.kind() != InodeKind::Directory
+        && child_meta.kind() != InodeKind::Symlink
+        && (!remaining.is_empty() || must_be_directory)
+    {
+        return KernelStep::Error(WalkCause::NotADirectory);
+    }
+
+    // --- materialise child RNode ---
+    let child_rnode_cap = match materialise_child(
+        &fs_ops,
+        child_fs_object_id,
+        &child_meta,
+        mount_payload.as_ref(),
+        &WalkingState {
+            current: current.clone(),
+            remaining: remaining.clone(),
+            hop_count,
+            mount_root: mount_root.clone(),
+            must_be_directory,
+        },
+        guard,
+    ) {
+        Ok(rnode) => rnode,
+        Err(KernelStep::NeedIO(req, token)) => return KernelStep::NeedIO(req, token),
+        Err(KernelStep::Error(cause)) => return KernelStep::Error(cause),
+        Err(_) => return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EIO)),
+    };
+
+    // --- build child DEntry ---
+    let child_inline = match InlineName::new(&component) {
+        Ok(n) => n,
+        Err(_) => return KernelStep::Error(WalkCause::ComponentNotFound),
+    };
+    let mut child_dentry_raw = DEntry::new(child_inline, child_rnode_cap.clone());
+    child_dentry_raw.set_parent_hint(&current);
+    let child_dentry = match step_engine::sign(child_dentry_raw) {
+        Ok(cap) => cap,
+        Err(_) => return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM)),
+    };
+
+    // --- symlink chasing ---
+    if let RNodeBacking::Symlink { target } = child_rnode_cap.backing() {
+        hop_count += 1;
+        if hop_count > SYMLOOP_MAX {
+            return KernelStep::Error(WalkCause::SymlinkLimit);
+        }
+        let target_bytes = target.clone();
+        if target_bytes.first() == Some(&b'/') {
+            // Absolute symlink: restart from mount_root.
+            let mut new_remaining = Vec::with_capacity(target_bytes.len() + remaining.len() + 1);
+            new_remaining.extend_from_slice(&target_bytes[1..]);
+            if !remaining.is_empty() {
+                new_remaining.push(b'/');
+                new_remaining.extend_from_slice(&remaining);
+            }
+            return KernelStep::Continue(WalkState::Walking(WalkingState {
+                current: mount_root.clone(),
+                remaining: new_remaining,
+                hop_count,
+                mount_root,
+                must_be_directory,
+            }));
+        } else {
+            // Relative symlink: prepend target to remaining.
+            let mut new_remaining = Vec::with_capacity(target_bytes.len() + remaining.len() + 1);
+            new_remaining.extend_from_slice(&target_bytes);
+            if !remaining.is_empty() {
+                new_remaining.push(b'/');
+                new_remaining.extend_from_slice(&remaining);
+            }
+            return KernelStep::Continue(WalkState::Walking(WalkingState {
+                current,
+                remaining: new_remaining,
+                hop_count,
+                mount_root,
+                must_be_directory,
+            }));
+        }
+    }
+
+    // --- mount-point crossing ---
+    let crossing_mount = child_dentry
+        .mounted_hint()
+        .and_then(|w| w.upgrade(guard));
+    let crossing_mount = match crossing_mount {
+        Some(m) => Some(m),
+        None => mount_payload
+            .as_ref()
+            .and_then(|payload| crate::mount::mount_for(payload, child_fs_object_id)),
+    };
+    if let Some(mount_cap) = crossing_mount {
+        let new_current = match walker::dentry_for_mount_root(&mount_cap, Some(&child_dentry)) {
+            Ok(d) => d,
+            Err(_) => return KernelStep::Error(WalkCause::MountPointGap),
+        };
+        return KernelStep::Continue(WalkState::Walking(WalkingState {
+            current: new_current,
+            remaining,
+            hop_count,
+            mount_root,
+            must_be_directory,
+        }));
+    }
+
+    // --- plain advance ---
+    KernelStep::Continue(WalkState::Walking(WalkingState {
+        current: child_dentry,
+        remaining,
+        hop_count,
+        mount_root,
+        must_be_directory,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Internal: materialise_child
+// ---------------------------------------------------------------------------
+
+/// Materialise an RNode for a freshly-resolved child inode.
+///
+/// Returns `Ok(Cap<RNode>)` on success, or `Err(KernelStep)` on
+/// yield / error (the driver continues or errors accordingly).
+fn materialise_child(
+    fs_ops: &Arc<dyn FsOps>,
+    child_fs_object_id: crate::vfs::FsObjectId,
+    child_meta: &InodeMeta,
+    mount_payload: Option<&Cap<MountPayload>>,
+    walking: &WalkingState,
+    guard: &Guard<'_>,
+) -> Result<Cap<RNode>, KernelStep> {
+    match child_meta.kind() {
+        InodeKind::Directory => {
+            let result = if let Some(mp) = mount_payload {
+                RNode::new_cap_in_mount(
+                    child_fs_object_id,
+                    child_meta.clone(),
+                    RNodeBacking::Directory,
+                    mp,
+                )
+            } else {
+                RNode::new_cap(child_fs_object_id, child_meta.clone(), RNodeBacking::Directory)
+            };
+            result.map_err(|_| KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM)))
+        }
+        InodeKind::Symlink => match fs_ops.read_link(child_fs_object_id, guard) {
+            StepOutcome::Done(b) => RNode::new_cap(
+                child_fs_object_id,
+                child_meta.clone(),
+                RNodeBacking::Symlink { target: b },
+            )
+            .map_err(|_| KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM))),
+            StepOutcome::Yield { shape, .. } => Err(KernelStep::NeedIO(
+                IORequest::ReadLink {
+                    fs_object_id: child_fs_object_id,
+                },
+                ResumeToken {
+                    walking: walking.clone(),
+                    hop_count: walking.hop_count,
+                },
+            )),
+            StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e)))),
+            StepOutcome::Continue { .. } => {
+                Err(KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOSYS)))
+            }
+        },
+        _ => match fs_ops.materialise_rnode(child_fs_object_id, child_meta.clone(), guard) {
+            StepOutcome::Done(rnode) => Ok(rnode),
+            StepOutcome::Yield { shape, .. } => Err(KernelStep::NeedIO(
+                IORequest::MaterialiseRnode {
+                    fs_object_id: child_fs_object_id,
+                    meta: child_meta.clone(),
+                },
+                ResumeToken {
+                    walking: walking.clone(),
+                    hop_count: walking.hop_count,
+                },
+            )),
+            StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e)))),
+            StepOutcome::Continue { .. } => {
+                Err(KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOSYS)))
+            }
+        },
     }
 }
