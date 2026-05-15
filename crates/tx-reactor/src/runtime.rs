@@ -105,6 +105,7 @@ pub struct Reactor {
     scheduler: Phase1Scheduler,
     dispatch: DispatchState,
     timers: TimerQueue,
+    timer_wheel: tx_substrate::wake::timer::TimerWheel,
     userspace: UserspaceRunSlot,
 }
 
@@ -146,6 +147,7 @@ impl Reactor {
             scheduler: Phase1Scheduler::new(),
             dispatch: DispatchState::new(),
             timers: TimerQueue::new(),
+            timer_wheel: tx_substrate::wake::timer::TimerWheel::new(),
             userspace: UserspaceRunSlot::new(),
         }
     }
@@ -412,14 +414,20 @@ impl Reactor {
                 // for drive() yield resolution).
                 crate::task::set_current_mailbox(Some(Arc::clone(&task.mailbox)));
 
+                // drive-taskmb: expose the reactor's timer wheel for OnTimer
+                // yield resolution.
+                crate::task::set_current_timer_wheel(Some(self.timer_wheel.clone()));
+
                 let Some(future) = task.future.as_mut() else {
                     crate::task::set_current_mailbox(None);
+                    crate::task::set_current_timer_wheel(None);
                     continue;
                 };
 
                 stats.polled += 1;
                 let result = future.as_mut().poll(&mut cx);
                 crate::task::set_current_mailbox(None);
+                crate::task::set_current_timer_wheel(None);
                 result
             };
 

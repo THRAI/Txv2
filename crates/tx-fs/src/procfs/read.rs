@@ -7,7 +7,8 @@
 use alloc::string::String;
 use tx_subsystems::process::{self, Pid, ProcessIdentity};
 use crate::procfs::{
-    pid_from_stat_id, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_SELF_ID, PROCFS_ROOT_ID,
+    pid_from_cmdline_id, pid_from_stat_id, PROCFS_CPUINFO_ID, PROCFS_MOUNTS_ID,
+    PROCFS_ROOT_ID, PROCFS_SELF_ID, PROCFS_UPTIME_ID,
 };
 
 use tx_subsystems::vfs::FsObjectId;
@@ -17,9 +18,13 @@ pub fn render(fs_object_id: FsObjectId) -> String {
     if let Some(pid) = pid_from_stat_id(fs_object_id) {
         return render_stat(pid);
     }
+    if let Some(pid) = pid_from_cmdline_id(fs_object_id) {
+        return render_cmdline(pid);
+    }
     match fs_object_id {
         PROCFS_MOUNTS_ID => render_mounts(),
-        PROCFS_MEMINFO_ID => render_meminfo(),
+        PROCFS_CPUINFO_ID => render_cpuinfo(),
+        PROCFS_UPTIME_ID => render_uptime(),
         _ => String::new(),
     }
 }
@@ -53,9 +58,34 @@ fn render_stat(pid: Pid) -> String {
     )
 }
 
+/// `/proc/<pid>/cmdline` — NUL-separated argv.
+fn render_cmdline(pid: Pid) -> String {
+    let Some(proc) = process::process_by_pid(pid) else {
+        return String::new();
+    };
+    let payload = proc.payload.lock();
+    let Some(payload) = payload.as_ref() else {
+        return String::new();
+    };
+    match payload.cmdline() {
+        Some(cmdline) => String::from_utf8_lossy(&cmdline).replace('\0', " "),
+        None => String::new(),
+    }
+}
+
 /// `/proc/mounts` — stub.
 fn render_mounts() -> String {
     "rootfs / rootfs rw 0 0\n".to_string()
+}
+
+/// `/proc/cpuinfo` — stub (bringup: single cpu).
+fn render_cpuinfo() -> String {
+    "processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n".to_string()
+}
+
+/// `/proc/uptime` — stub.
+fn render_uptime() -> String {
+    "0.00 0.00\n".to_string()
 }
 
 /// `/proc/meminfo` — stub.

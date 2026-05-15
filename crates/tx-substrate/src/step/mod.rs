@@ -522,13 +522,18 @@ impl DriveMode {
 /// `.await`/yield). See D1 §"guard is step-local, not ScriptCtx-held".
 ///
 /// PR-9 phase 3 populates `subject` / `deadline` from the syscall
-/// trampoline; subsequent waves populate `mailbox` and `trace`.
+/// trampoline; subsequent waves populate `mailbox`, `timer_wheel`,
+/// and `trace`.
 pub struct ScriptCtx<I: SubjectIdentity = ProcessIdentity> {
     subject: Option<SubjectContext<I>>,
     deadline: Option<Deadline>,
     /// Per-task wake delivery queue for yield resolution.
     /// Owned by the reactor task; `drive()` borrows it to park.
     mailbox: Option<Arc<TaskMailbox>>,
+    /// Reactor timer wheel for OnTimer yield resolution
+    /// (drive-taskmb). Shared across all tasks; clone is cheap
+    /// (internal Arc).
+    timer_wheel: Option<crate::wake::timer::TimerWheel>,
 }
 
 impl<I: SubjectIdentity> ScriptCtx<I> {
@@ -539,6 +544,7 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
             subject: None,
             deadline: None,
             mailbox: None,
+            timer_wheel: None,
         }
     }
 
@@ -571,10 +577,23 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
         self.deadline
     }
 
+    /// Populate the reactor timer wheel for OnTimer yield resolution
+    /// (drive-taskmb).
+    pub fn with_timer_wheel(mut self, wheel: crate::wake::timer::TimerWheel) -> Self {
+        self.timer_wheel = Some(wheel);
+        self
+    }
+
     /// Task mailbox if populated; `None` for test/placeholder contexts
     /// or before reactor integration.
     pub fn mailbox(&self) -> Option<&Arc<TaskMailbox>> {
         self.mailbox.as_ref()
+    }
+
+    /// Reactor timer wheel if populated; `None` for test/placeholder
+    /// contexts or before reactor integration.
+    pub fn timer_wheel(&self) -> Option<&crate::wake::timer::TimerWheel> {
+        self.timer_wheel.as_ref()
     }
 
     /// Low 32 bits of the subject's task trace identity.

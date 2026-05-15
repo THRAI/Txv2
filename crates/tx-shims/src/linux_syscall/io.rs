@@ -362,13 +362,14 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         DriveMode::Waiting
     };
     let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let mut op = OpenFileWriteOp {
         file: &file,
         bytes: &bytes,
         guard: &guard,
         cursor: 0,
     };
-    match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), None, None).await {
+    match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), None, timer_wheel_arc.as_ref()).await {
         Ok(total) => SyscallResult::Return(total as i64),
         Err(v3errno) => {
             let errno: tx_subsystems::execution::Errno = v3errno.into();
@@ -462,13 +463,14 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         DriveMode::Waiting
     };
     let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let mut op = OpenFileReadOp {
         file: &file,
         out: &mut staging,
         guard: &guard,
         cursor: 0,
     };
-    match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), None, None).await {
+    match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), None, timer_wheel_arc.as_ref()).await {
         Ok(total) => {
             if total > 0 {
                 if let Err(errno) = bootstrap_copy_to_user(

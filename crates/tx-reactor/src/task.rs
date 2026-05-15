@@ -405,3 +405,24 @@ pub(crate) fn set_current_mailbox(mailbox: Option<Arc<TaskMailbox>>) {
 pub fn current_task_mailbox() -> Option<Arc<TaskMailbox>> {
     CURRENT_MAILBOX.lock().clone()
 }
+
+// -----------------------------------------------------------------------
+// drive-taskmb: timer wheel trampoline (same pattern as CURRENT_MAILBOX)
+// -----------------------------------------------------------------------
+
+use tx_substrate::wake::timer::TimerWheel;
+
+/// Set by the reactor before each `future.poll()`, cleared after.
+/// Read by `run_thread` to inject into `SyscallCtx` for `OnTimer` yield
+/// resolution via `resolve_on_timer`.
+static CURRENT_TIMER_WHEEL: SpinLock<Option<TimerWheel>> = SpinLock::new(None);
+
+/// Set the current reactor's timer wheel (called by reactor before poll).
+pub(crate) fn set_current_timer_wheel(wheel: Option<TimerWheel>) {
+    *CURRENT_TIMER_WHEEL.lock() = wheel;
+}
+
+/// Read the current reactor's timer wheel (called by trampoline / `run_thread`).
+pub fn current_timer_wheel() -> Option<TimerWheel> {
+    CURRENT_TIMER_WHEEL.lock().clone()
+}

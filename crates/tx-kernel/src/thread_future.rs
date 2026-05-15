@@ -398,6 +398,11 @@ pub async fn run_thread<P: TxPlatform>(
                 if let Some(mailbox) = tx_reactor::current_task_mailbox() {
                     ctx = ctx.with_mailbox(mailbox);
                 }
+                // drive-taskmb: inject the reactor's timer wheel for
+                // OnTimer yield resolution.
+                if let Some(tw) = tx_reactor::current_timer_wheel() {
+                    ctx = ctx.with_timer_wheel(tw);
+                }
                 let result = tx_shims::linux_syscall::dispatch::<P>(req, &ctx).await;
 
                 match result {
