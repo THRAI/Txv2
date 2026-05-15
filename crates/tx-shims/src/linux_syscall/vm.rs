@@ -617,12 +617,32 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             let timer_wheel_arc = script_ctx.timer_wheel().cloned();
             let delegate_registry_arc = script_ctx.delegate_registry().cloned();
 
-            // Loop: drive() parks on the futex bucket's WaitSource
-            // via resolve_on_wait_source.  EAGAIN on first
-            // mismatch means "user word != val"; after parking at
-            // least once, EAGAIN means the wake was meaningful
-            // (word changed → return 0).
-            let mut parked = false;
+            // First, probe the futex word without parking. EAGAIN
+            // here means "word != val" → return -EAGAIN immediately
+            // (the predecessor equality check, per POSIX).
+            {
+                let guard = step_engine::guard();
+                let outcome =
+                    tx_subsystems::futex::step_futex_wait(uaddr, val, &guard);
+                match outcome {
+                    StepOutcome::Err(e) if e == Errno::EAGAIN => {
+                        return SyscallResult::Error(errno_to_i32(Errno::EAGAIN));
+                    }
+                    StepOutcome::Err(e) => {
+                        return SyscallResult::Error(errno_to_i32(
+                            Errno::from(e),
+                        ));
+                    }
+                    // Yield / Continue / Done: fall through to drive().
+                    _ => {}
+                }
+            }
+
+            // Park and wait.  drive() parks on the futex bucket's
+            // WaitSource via resolve_on_wait_source, wakes when
+            // step_futex_wake fires the bucket, and re-steps.
+            // After waking, EAGAIN means "word changed → wake was
+            // meaningful" → return 0.
             loop {
                 let guard = step_engine::guard();
                 let mut op = FutexWaitOp {
@@ -644,13 +664,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                     Err(v3errno) => {
                         let errno: Errno = v3errno.into();
                         if errno == Errno::EAGAIN {
-                            if parked {
-                                return SyscallResult::Return(0);
-                            } else {
-                                return SyscallResult::Error(
-                                    errno_to_i32(Errno::EAGAIN),
-                                );
-                            }
+                            return SyscallResult::Return(0);
                         }
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
@@ -658,7 +672,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             }
         }
         FUTEX_WAKE => {
-            let mut script_ctx = build_subject_script_ctx(_ctx);
+            let mut script_ctx = build_subject_script_ctx(ctx);
             let guard = step_engine::guard();
             let mut op = FutexWakeOp {
                 uaddr,
