@@ -4,7 +4,10 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use tx_hal::UserPtr;
+
 pub mod adapter;
+mod read;
 
 use adapter::step_engine::{self, Cap, NoProgress, StepOutcome};
 use tx_subsystems::execution::{Errno, Guard};
@@ -200,8 +203,7 @@ impl FsOps for Procfs {
         meta: InodeMeta,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
-        let rnode = RNode::new(id, meta, RNodeBacking::Projected);
-        match Err("zone unavailable") /* TODO: step_engine::sign removed */ {
+        match RNode::new_cap(id, meta, RNodeBacking::Projected) {
             Ok(cap) => StepOutcome::done(cap),
             Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }
@@ -218,22 +220,22 @@ impl FsOps for Procfs {
         // `offset` is the virtual address to read from.
         if let Some(pid) = pid_from_mem_id(fs_object_id) {
             let Some(proc) = process::process_by_pid(pid) else {
-                return StepOutcome::err(Errno::ESRCH);
+                return StepOutcome::err(Errno::ESRCH.into());
             };
             let Some(aspace) = proc.aspace_cap() else {
-                return StepOutcome::err(Errno::ESRCH);
+                return StepOutcome::err(Errno::ESRCH.into());
             };
-            let src = tx_hal::UserPtr::<u8>::from(offset as usize);
+            let src = UserPtr::<u8>::new(offset as usize);
             match aspace.copy_from_user(buf, src, guard) {
                 StepOutcome::Done(n) => StepOutcome::done(n as u64),
-                StepOutcome::Err(e) => StepOutcome::err(e),
+                StepOutcome::Err(e) => StepOutcome::err(e.into()),
                 StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                    StepOutcome::err(Errno::EIO)
+                    StepOutcome::err(Errno::EIO.into())
                 }
             }
         } else {
-            // Other projected files: return empty for now.
-            let content: Vec<u8> = Vec::new();
+            // Other projected files: render content via read::render.
+            let content: Vec<u8> = read::render(fs_object_id).into_bytes();
             let bytes = content.as_slice();
             let off = offset as usize;
             if off >= bytes.len() {
