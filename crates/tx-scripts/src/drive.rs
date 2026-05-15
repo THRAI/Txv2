@@ -28,8 +28,8 @@ use crate::adapter::step_engine::{
     SubjectIdentity, Translation, YieldShape,
 };
 use crate::adapter::wake::{
-    agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, TimerGuardRole, TimerToken,
-    TimerWheel,
+    agent_event_matches, lookup_source, ActiveWait, MailboxEvent, TaskMailbox, TimerGuardRole,
+    TimerToken, TimerWheel,
 };
 use alloc::sync::{Arc, Weak};
 
@@ -109,6 +109,22 @@ where
                             &shape, mailbox, delegate_registry, timer_wheel,
                         )
                         .await;
+                        // D9-A: translate Aborted(Interrupted/Killed) to
+                        // the appropriate errno without calling
+                        // apply_resume (which defaults to rejecting
+                        // non-Retry outcomes).
+                        if matches!(
+                            resume,
+                            ResumeOutcome::Aborted(AbortReason::Interrupted)
+                        ) {
+                            return Err(Errno::EINTR);
+                        }
+                        if matches!(
+                            resume,
+                            ResumeOutcome::Aborted(AbortReason::Killed)
+                        ) {
+                            return Err(Errno::EINTR);
+                        }
                         op.apply_resume(resume).map_err(|_| Errno::EIO)?;
                     }
                 }
@@ -174,7 +190,26 @@ async fn resolve_on_wait_source(
     if let Some(mbox) = mailbox {
         let gen = mbox.next_generation();
         let active = ActiveWait::new(gen, source, interests);
-        await_mailbox_event(mbox, |event| active.matches(event)).await;
+
+        // Register this task's mailbox with the object's WaitSource so
+        // the object side can wake us when its state changes.  The
+        // registration is scoped to the park; we unregister on wake.
+        let ws = lookup_source(source);
+        let sub_id = ws.as_ref().map(|ws| {
+            ws.register(Arc::downgrade(mbox), gen, interests)
+        });
+
+        let interrupted = await_mailbox_event(mbox, |event| active.matches(event)).await;
+
+        // Clean up the WaitSource subscription now that we're awake.
+        if let (Some(ws), Some(id)) = (&ws, sub_id) {
+            ws.unregister(id);
+        }
+
+        // D9-A: signal interrupt during blocked wait.
+        if interrupted {
+            return ResumeOutcome::Aborted(AbortReason::Interrupted);
+        }
     } else {
         let token = WaitToken::new(source.raw(), interests.raw());
         if let Some(future) = wait_source::wait_on_token(token) {
@@ -233,7 +268,13 @@ async fn resolve_on_agent(
 
     // Park on mailbox until the agent replies or the request is aborted.
     let token_id = _guard.id();
-    await_mailbox_event(mbox, move |event| agent_event_matches(event, token_id)).await;
+    let interrupted =
+        await_mailbox_event(mbox, move |event| agent_event_matches(event, token_id)).await;
+
+    // D9-A: signal interrupt during blocked wait.
+    if interrupted {
+        return ResumeOutcome::Aborted(AbortReason::Interrupted);
+    }
 
     // Extract the reply.
     match registry.take_reply(token_id) {
@@ -276,11 +317,16 @@ async fn resolve_on_timer(
 
     // Park on mailbox until the reactor's timer-tick fires the
     // wheel and posts a TimerFired event for our token.
-    await_mailbox_event(mbox, |event| match event {
+    let interrupted = await_mailbox_event(mbox, |event| match event {
         MailboxEvent::TimerFired { token: fired } => *fired == timer_token,
         _ => false,
     })
     .await;
+
+    // D9-A: signal interrupt during blocked wait.
+    if interrupted {
+        return ResumeOutcome::Aborted(AbortReason::Interrupted);
+    }
 
     ResumeOutcome::TimerExpired(token)
 }
@@ -290,8 +336,17 @@ async fn resolve_on_timer(
 // ---------------------------------------------------------------------------
 
 /// Park the current task on `mailbox` until `predicate` matches an
-/// incoming event. Spurious wakes are consumed and the task re-parks.
-async fn await_mailbox_event<F>(mailbox: &TaskMailbox, predicate: F)
+/// incoming event.  Spurious wakes are consumed and the task re-parks.
+///
+/// Returns `true` if the wake was caused by a
+/// [`MailboxEvent::SignalDelivered`] (D9-A signal interrupt);
+/// `false` if the predicate matched normally.
+///
+/// When a `SignalDelivered` is encountered, the future returns
+/// immediately with `Ready(true)` **without consuming the event**
+/// — the event stays in the queue so the caller's re-poll path
+/// (AST drain / `InterruptSummary` check) can observe it.
+async fn await_mailbox_event<F>(mailbox: &TaskMailbox, predicate: F) -> bool
 where
     F: Fn(&MailboxEvent) -> bool,
 {
@@ -305,14 +360,25 @@ where
     }
 
     impl<'a, F: Fn(&MailboxEvent) -> bool> Future for MailboxFuture<'a, F> {
-        type Output = ();
+        type Output = bool;
 
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
             self.mailbox.register_waker(cx.waker().clone());
+            // Peek the queue without consuming (we re-post
+            // SignalDelivered after the check so the caller's
+            // AST/interrupt path sees it).
             while let Some(event) = self.mailbox.poll() {
+                // D9-A: SignalDelivered interrupts blocked waits.
+                // Re-post the event so the caller's re-poll /
+                // AST-drain path can observe it.
+                if matches!(event, MailboxEvent::SignalDelivered { .. }) {
+                    let _ = self.mailbox.post(event);
+                    self.mailbox.clear_waker();
+                    return Poll::Ready(true);
+                }
                 if (self.predicate)(&event) {
                     self.mailbox.clear_waker();
-                    return Poll::Ready(());
+                    return Poll::Ready(false);
                 }
             }
             Poll::Pending
