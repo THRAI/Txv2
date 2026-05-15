@@ -175,10 +175,28 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
         return SyscallResult::Return(0);
     }
     let deadline_ns = <P as TimeIf>::read_ns().saturating_add(req_ns);
-    if let Some(future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) {
-        let _ = future.await;
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let mut op = NanosleepOp {
+        nanos: req_ns,
+        deadline_ns,
+        started: false,
+    };
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        None,
+        None,
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
-    SyscallResult::Return(0)
 }
 
 /// `clock_nanosleep(clk_id, flags, req, rem)`. Linux RV64 generic ABI
@@ -224,8 +242,26 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     if now >= deadline_ns {
         return SyscallResult::Return(0);
     }
-    if let Some(future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) {
-        let _ = future.await;
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let mut op = NanosleepOp {
+        nanos: req_ns,
+        deadline_ns,
+        started: false,
+    };
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        None,
+        None,
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
-    SyscallResult::Return(0)
 }

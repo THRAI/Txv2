@@ -864,7 +864,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for PpollOp<'a> {
 pub struct NanosleepOp {
     /// Requested sleep duration in nanoseconds.
     pub nanos: u64,
-    started: bool,
+    /// Absolute deadline in nanoseconds (platform timebase).
+    pub deadline_ns: u64,
+    pub started: bool,
 }
 
 impl<I: SubjectIdentity> StepOp<I> for NanosleepOp {
@@ -874,17 +876,11 @@ impl<I: SubjectIdentity> StepOp<I> for NanosleepOp {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         if !self.started {
             self.started = true;
-            // drive-taskmb: yield OnTimer.  The driver parks on the
-            // reactor's TimerWheel via resolve_on_timer.  Until PR-8
-            // lands the timer-fire → MailboxEvent::TimerFired path,
-            // any mailbox wake resolves the yield (pseudo-sleep).
-            // Full implementation will replace Deadline::NEVER with
-            // a clock-derived absolute deadline.
             return StepOutcome::Yield {
                 progress: NoProgress,
                 shape: YieldShape::OnTimer {
                     token: step_engine::TimerId::new(1),
-                    deadline: Deadline::NEVER,
+                    deadline: Deadline::from_raw(self.deadline_ns),
                 },
             };
         }
