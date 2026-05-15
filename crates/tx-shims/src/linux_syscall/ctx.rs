@@ -14,6 +14,7 @@ use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vfs::structure::Credential;
 use tx_subsystems::vm::AddressSpace;
 use tx_substrate::wake::mailbox::TaskMailbox;
+use tx_substrate::wake::timer::TimerWheel;
 
 pub struct SyscallCtx<'a> {
     pub process: Cap<ProcessIdentity>,
@@ -21,6 +22,8 @@ pub struct SyscallCtx<'a> {
     pub aspace: Cap<AddressSpace>,
     /// Per-task mailbox for yield resolution (drive-taskmb).
     pub mailbox: Option<Arc<TaskMailbox>>,
+    /// Reactor timer wheel for OnTimer yield resolution (drive-taskmb).
+    pub timer_wheel: Option<TimerWheel>,
     /// Sliced lifetime so future fields (signal-mask snapshot, cred
     /// snapshot) can be added without ripping every call site.
     pub _lifetime: core::marker::PhantomData<&'a ()>,
@@ -41,6 +44,7 @@ impl<'a> SyscallCtx<'a> {
             thread,
             aspace,
             mailbox: None,
+            timer_wheel: None,
             _lifetime: core::marker::PhantomData,
         }
     }
@@ -48,6 +52,13 @@ impl<'a> SyscallCtx<'a> {
     /// Attach a task mailbox for yield resolution (drive-taskmb).
     pub fn with_mailbox(mut self, mailbox: Arc<TaskMailbox>) -> Self {
         self.mailbox = Some(mailbox);
+        self
+    }
+
+    /// Attach the reactor timer wheel for OnTimer yield resolution
+    /// (drive-taskmb).
+    pub fn with_timer_wheel(mut self, wheel: TimerWheel) -> Self {
+        self.timer_wheel = Some(wheel);
         self
     }
 
@@ -144,6 +155,9 @@ pub fn build_subject_script_ctx(ctx: &SyscallCtx<'_>) -> crate::KernelScriptCtx 
     let mut script_ctx = crate::KernelScriptCtx::new().with_subject(subject);
     if let Some(ref mailbox) = ctx.mailbox {
         script_ctx = script_ctx.with_mailbox(Arc::clone(mailbox));
+    }
+    if let Some(ref tw) = ctx.timer_wheel {
+        script_ctx = script_ctx.with_timer_wheel(tw.clone());
     }
     script_ctx
 }

@@ -145,6 +145,7 @@ struct TimerWheelState {
 /// role-tagged registrations the step model reasons about. PR-7+
 /// may consolidate the two; PR-8 publishes the role-shaped surface
 /// without touching the wake path.
+#[derive(Clone)]
 pub struct TimerWheel {
     state: Arc<SpinMutex<TimerWheelState>>,
 }

@@ -27,8 +27,8 @@ use alloc::boxed::Box;
 use crate::execution::Guard;
 use crate::page_backed::FsPageBacking;
 use crate::vfs::adapter::step_engine::{
-    self, Cap, NoProgress, OneShotStepOp, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
-    SubjectIdentity,
+    self, Cap, Deadline, NoProgress, OneShotStepOp, ProcessIdentity, ResumeOutcome, ScriptCtx,
+    StepOp, StepOutcome, SubjectIdentity, TimerId, YieldShape,
 };
 use crate::vfs::{Credential, DEntry, FsObjectId, FsOps, InlineName, InodeMeta};
 use crate::vfs::walker;
@@ -838,15 +838,33 @@ impl<I: SubjectIdentity> StepOp<I> for NanosleepOp {
     type Output = ();
     type Progress = NoProgress;
 
-    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         if !self.started {
             self.started = true;
-            // v1 stub: timer yield not yet available.
-            // Full implementation would yield via
-            // StepOutcome::Yield { shape: OnTimer { .. } }.
-            return StepOutcome::err(step_engine::Errno::ENOSYS);
+            // drive-taskmb: yield OnTimer.  The driver parks on the
+            // reactor's TimerWheel via resolve_on_timer.  Until PR-8
+            // lands the timer-fire → MailboxEvent::TimerFired path,
+            // any mailbox wake resolves the yield (pseudo-sleep).
+            // Full implementation will replace Deadline::NEVER with
+            // a clock-derived absolute deadline.
+            return StepOutcome::Yield {
+                progress: NoProgress,
+                shape: YieldShape::OnTimer {
+                    token: step_engine::TimerId::new(1),
+                    deadline: Deadline::NEVER,
+                },
+            };
         }
         StepOutcome::done(())
+    }
+
+    /// Accept TimerExpired from resolve_on_timer (default impl rejects
+    /// non-Retry resumes with EINVAL).
+    fn apply_resume(&mut self, resume: ResumeOutcome) -> Result<(), step_engine::Errno> {
+        match resume {
+            ResumeOutcome::Retry | ResumeOutcome::TimerExpired(_) => Ok(()),
+            _ => Err(step_engine::Errno::EINVAL),
+        }
     }
 }
 
