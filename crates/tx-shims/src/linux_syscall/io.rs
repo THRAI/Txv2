@@ -461,13 +461,14 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     } else {
         DriveMode::Waiting
     };
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let mut op = OpenFileReadOp {
         file: &file,
         out: &mut staging,
         guard: &guard,
         cursor: 0,
     };
-    match drive(op, &mut script_ctx, mode, None, None, None).await {
+    match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), None, None).await {
         Ok(total) => {
             if total > 0 {
                 if let Err(errno) = bootstrap_copy_to_user(
