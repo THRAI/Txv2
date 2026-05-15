@@ -384,3 +384,24 @@ impl Default for TaskTable {
 const fn is_terminal(status: TaskStatus) -> bool {
     matches!(status, TaskStatus::Completed | TaskStatus::Cancelled)
 }
+
+// ---------------------------------------------------------------------------
+// Per-hart current-task mailbox slot (drive-taskmb trampoline injection)
+// ---------------------------------------------------------------------------
+
+use crate::spin_lock::SpinLock;
+
+/// Global slot holding the currently-polling task's mailbox.
+/// Set by the reactor before each `future.poll()`, cleared after.
+/// Read by `run_thread` (or any trampoline) to inject into `SyscallCtx`.
+static CURRENT_MAILBOX: SpinLock<Option<Arc<TaskMailbox>>> = SpinLock::new(None);
+
+/// Set the current task's mailbox (called by reactor before poll).
+pub(crate) fn set_current_mailbox(mailbox: Option<Arc<TaskMailbox>>) {
+    *CURRENT_MAILBOX.lock() = mailbox;
+}
+
+/// Read the current task's mailbox (called by trampoline / `run_thread`).
+pub fn current_task_mailbox() -> Option<Arc<TaskMailbox>> {
+    CURRENT_MAILBOX.lock().clone()
+}

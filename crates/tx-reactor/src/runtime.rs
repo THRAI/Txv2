@@ -407,12 +407,20 @@ impl Reactor {
                 task.wake_state.clear();
                 task.consume_ast_markers();
 
+                // drive-taskmb: expose the task's mailbox so the trampoline
+                // can inject it into SyscallCtx (and from there into ScriptCtx
+                // for drive() yield resolution).
+                crate::task::set_current_mailbox(Some(Arc::clone(&task.mailbox)));
+
                 let Some(future) = task.future.as_mut() else {
+                    crate::task::set_current_mailbox(None);
                     continue;
                 };
 
                 stats.polled += 1;
-                future.as_mut().poll(&mut cx)
+                let result = future.as_mut().poll(&mut cx);
+                crate::task::set_current_mailbox(None);
+                result
             };
 
             match poll {
