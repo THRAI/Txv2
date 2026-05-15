@@ -473,7 +473,7 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
 /// the OpenFile's PageBacked container. Non-page-backed fds surface as
 /// `-EINVAL` (matches Linux for char devices, sockets, pipes); a fd
 /// pointing at a directory backing returns `-EISDIR`.
-pub(super) fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let new_size = args[1];
     if fd < 0 {
@@ -488,15 +488,29 @@ pub(super) fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         RNodeBacking::Directory => return SyscallResult::Error(EISDIR_VALUE),
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
-    let outcome = {
-        let guard = step_engine::guard();
-        tx_subsystems::page_backed::step_truncate(&pc, new_size, &guard)
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    let guard = step_engine::guard();
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let mut op = FdTruncateOp {
+        pc: &pc,
+        new_size: new_size as u64,
+        guard: &guard,
     };
-    use StepOutcome as V3;
-    match outcome {
-        V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
-        V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(v3_errno) => SyscallResult::Error(errno_to_i32(v3_errno.into())),
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        None,
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 
