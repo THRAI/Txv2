@@ -671,53 +671,25 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         Some(d) => d,
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
+    // RENAME_NOREPLACE: the composite RenameOp handles path resolution
+    // internally; the flag acts as a post-resolution collision check
+    // inside the op. RENAME_EXCHANGE was rejected above.
     let cred = ctx.walker_cred();
-    let (old_parent_path, old_basename) = split_path(&oldpath);
-    let (new_parent_path, new_basename) = split_path(&newpath);
-    if old_basename.is_empty() || new_basename.is_empty() {
-        return SyscallResult::Error(EISDIR_VALUE);
-    }
-    let old_parent_dentry = if old_parent_path.is_empty() {
-        cwd.clone()
-    } else {
-        match walk_from(cwd.clone(), old_parent_path, &cred) {
-            Ok(d) => d,
-            Err(e) => return SyscallResult::Error(e),
-        }
-    };
-    let new_parent_dentry = if new_parent_path.is_empty() {
-        cwd.clone()
-    } else {
-        match walk_from(cwd.clone(), new_parent_path, &cred) {
-            Ok(d) => d,
-            Err(e) => return SyscallResult::Error(e),
-        }
-    };
-    // RENAME_NOREPLACE pre-check: walk the full new path; if it
-    // resolves, the rename must fail with -EEXIST (Linux semantic).
-    if (flags & RENAME_NOREPLACE) != 0 && walk_from(cwd, &newpath, &cred).is_ok() {
-        return SyscallResult::Error(EEXIST_VALUE);
-    }
-    let old_parent_id = old_parent_dentry.rnode().fs_object_id();
-    let new_parent_id = new_parent_dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
-    let fs_ops = match fs_ops_for_dentry(&old_parent_dentry) {
-        Some(o) => o,
-        None => return SyscallResult::Error(EROFS_VALUE),
-    };
-    let outcome = {
+    let result = {
         let guard = step_engine::guard();
-        fs_ops.rename(
-            old_parent_id,
-            old_basename,
-            new_parent_id,
-            new_basename,
-            &guard,
-        )
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = RenameOp {
+            rooted_at: &cwd,
+            oldpath: &oldpath,
+            newpath: &newpath,
+            cred: &cred,
+            guard: &guard,
+            state: None,
+        };
+        step_engine::drive_oneshot(&mut op, &mut script_ctx)
     };
-    match outcome {
-        V3::Done(()) => SyscallResult::Return(0),
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+    match result {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }

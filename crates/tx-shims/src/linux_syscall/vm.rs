@@ -4,7 +4,43 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOp, StepOutcome, YieldShape};
+use tx_subsystems::execution::WaitToken;
+use tx_subsystems::wait_source;
+use tx_subsystems::vm::step_ops::{
+    VmBrkOp, VmMapOp, VmMlockOp, VmMunlockOp, VmProtectOp, VmRemapOp, VmUnmapOp,
+};
+
+/// Drive a VM StepOp to completion, awaiting on RangeLock releases.
+///
+/// The loop calls `op.step()` repeatedly; on `Yield { OnWaitSource }`
+/// it awaits the range-lock release channel and retries. All other
+/// `Yield` / `Continue` outcomes surface `-EIO`.
+async fn drive_vm_op<S>(mut op: S, ctx: &mut crate::KernelScriptCtx) -> Result<S::Output, step_engine::Errno>
+where
+    S: StepOp<tx_subsystems::process::ProcessIdentity, Progress = NoProgress>,
+{
+    loop {
+        match op.step(ctx) {
+            StepOutcome::Done(v) => return Ok(v),
+            StepOutcome::Err(e) => return Err(e),
+            StepOutcome::Yield { ref shape, .. }
+                if matches!(shape, YieldShape::OnWaitSource { .. }) =>
+            {
+                let YieldShape::OnWaitSource { source, interests } = *shape else {
+                    unreachable!();
+                };
+                let token = WaitToken::new(source.raw(), interests.raw());
+                if let Some(fut) = wait_source::wait_on_token(token) {
+                    fut.await;
+                }
+            }
+            StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+                return Err(crate::adapter::step_engine::Errno::EIO);
+            }
+        }
+    }
+}
 
 /// `brk(requested)` per `txdoc:VM-5-8-BRK`.
 ///
@@ -15,7 +51,7 @@ use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 ///   Linux's brk(2) **never** returns a negative errno; on failure
 ///   userspace observes "the break didn't move" and is responsible
 ///   for noticing.
-pub(super) async fn sys_brk<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let requested = args[0];
 
     let brk_base = ctx.process.brk_base();
@@ -32,12 +68,14 @@ pub(super) async fn sys_brk<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     let cur = UserVirtAddr(current_brk as usize);
     let req = UserVirtAddr(requested as usize);
 
-    match ctx.aspace.brk_script(base, cur, req).await {
+    let mut op = VmBrkOp { aspace: &ctx.aspace, brk_base: base, current_brk: cur, requested_brk: req };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    match drive_vm_op(op, &mut script_ctx).await {
         Ok(new_brk) => {
             ctx.process.set_current_brk(new_brk.0 as u64);
             SyscallResult::Return(new_brk.0 as i64)
         }
-        Err(VmMapError::InvalidRange) | Err(_) => {
+        Err(_) => {
             // Linux: brk(2) never returns -errno. On failure (range
             // below brk_base, OOM, mapping conflict) report the
             // unchanged current break. Userspace detects "no
@@ -99,7 +137,7 @@ pub(super) async fn sys_brk<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
 /// - File-backed mmap requires `fd` to resolve to an `OpenFile` whose
 ///   rnode is `RNodeBacking::PageBacked` — TTY / pipe / chardev /
 ///   directory / symlink → `-ENODEV`.
-pub(super) fn sys_mmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let addr = args[0];
     let length_in = args[1] as usize;
     let prot_bits = args[2];
@@ -195,17 +233,19 @@ pub(super) fn sys_mmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
         VmMapRequest::anywhere(window, page_count, prot, entry_flags, backing)
     };
 
-    match ctx.aspace.try_mmap(request) {
+    let mut op = VmMapOp { aspace: &ctx.aspace, request };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    match drive_vm_op(op, &mut script_ctx).await {
         Ok(outcome) => SyscallResult::Return(outcome.range.start().as_usize() as i64),
-        Err(error) => {
+        Err(errno) => {
             // MAP_FIXED_NOREPLACE → AlreadyMapped maps to EEXIST per
             // Linux's distinct semantic for that flag.
-            let errno = if fixed_noreplace && error == VmMapError::AlreadyMapped {
+            let code = if fixed_noreplace && errno == crate::adapter::step_engine::Errno::EEXIST {
                 errno_to_i32(Errno::EEXIST)
             } else {
-                vmmap_error_to_i32(error)
+                errno_to_i32(Into::<Errno>::into(errno))
             };
-            SyscallResult::Error(errno)
+            SyscallResult::Error(code)
         }
     }
 }
@@ -214,7 +254,7 @@ pub(super) fn sys_mmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
 ///
 /// `addr` must be page-aligned and `length` is rounded up to a whole
 /// page (matching Linux). Wraps `AddressSpace::try_munmap`.
-pub(super) fn sys_munmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_munmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let addr = args[0];
     let length_in = args[1] as usize;
 
@@ -233,9 +273,11 @@ pub(super) fn sys_munmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    match ctx.aspace.try_munmap(range) {
+    let mut op = VmUnmapOp { aspace: &ctx.aspace, range };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    match drive_vm_op(op, &mut script_ctx).await {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
+        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
 }
 
@@ -249,7 +291,7 @@ pub(super) fn sys_munmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
 ///
 /// `addr` is rounded down to a page boundary; `len` is rounded up.
 /// Returns 0 on success, `-errno` on failure.
-pub(super) fn sys_mlock<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_mlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let addr = args[0];
     let len_in = args[1] as usize;
 
@@ -264,9 +306,11 @@ pub(super) fn sys_mlock<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         return SyscallResult::Error(EINVAL_VALUE);
     };
 
-    match ctx.aspace.try_mlock(range, true) {
+    let mut op = VmMlockOp { aspace: &ctx.aspace, range };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    match drive_vm_op(op, &mut script_ctx).await {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
+        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
 }
 
@@ -274,7 +318,7 @@ pub(super) fn sys_mlock<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 ///
 /// Clears `VmEntryFlags.locked` on every VMA overlapping the range.
 /// Same rounding and error semantics as `sys_mlock`.
-pub(super) fn sys_munlock<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let addr = args[0];
     let len_in = args[1] as usize;
 
@@ -289,9 +333,11 @@ pub(super) fn sys_munlock<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
         return SyscallResult::Error(EINVAL_VALUE);
     };
 
-    match ctx.aspace.try_mlock(range, false) {
+    let mut op = VmMunlockOp { aspace: &ctx.aspace, range };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    match drive_vm_op(op, &mut script_ctx).await {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
+        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
 }
 
@@ -300,7 +346,7 @@ pub(super) fn sys_munlock<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
 /// Wraps `AddressSpace::try_mprotect`. PROT_GROWSDOWN/GROWSUP not
 /// supported (returns `-ENOSYS`); other prot validation matches
 /// `sys_mmap`.
-pub(super) fn sys_mprotect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_mprotect(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let addr = args[0];
     let length_in = args[1] as usize;
     let prot_bits = args[2];
@@ -333,9 +379,11 @@ pub(super) fn sys_mprotect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
         Ok(r) => r,
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
-    match ctx.aspace.try_mprotect(range, prot) {
+    let mut op = VmProtectOp { aspace: &ctx.aspace, range, prot };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    match drive_vm_op(op, &mut script_ctx).await {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
+        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
 }
 
@@ -347,7 +395,7 @@ pub(super) fn sys_mprotect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
 /// `MREMAP_FIXED | MREMAP_MAYMOVE` shape musl emits maps cleanly to
 /// this contract; in-place grow without `MAYMOVE` would need
 /// `try_mremap`'s contract extended (deferred).
-pub(super) fn sys_mremap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let old_addr = args[0];
     let old_size_in = args[1] as usize;
     let new_size_in = args[2] as usize;
@@ -379,12 +427,12 @@ pub(super) fn sys_mremap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    match ctx
-        .aspace
-        .try_mremap(VmRemapRequest::new(old_range, new_range))
-    {
+    let request = VmRemapRequest::new(old_range, new_range);
+    let mut op = VmRemapOp { aspace: &ctx.aspace, request };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    match drive_vm_op(op, &mut script_ctx).await {
         Ok(outcome) => SyscallResult::Return(outcome.new_range.start().as_usize() as i64),
-        Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
+        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
 }
 

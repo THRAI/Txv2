@@ -29,7 +29,7 @@ use crate::vm::{
     VmRemapOutcome, VmRemapRequest,
 };
 
-fn page_align_up(addr: usize) -> usize {
+pub fn page_align_up(addr: usize) -> usize {
     const PAGE_SIZE: usize = 4096;
     (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }

@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod aio;
 pub mod cred;
 pub mod device;
+pub mod epoll;
 pub mod execution;
 pub mod futex;
 pub mod initramfs;

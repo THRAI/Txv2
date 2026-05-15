@@ -43,7 +43,7 @@ pub struct ChmodOp<'a> {
     pub mode: u16,
     pub cred: &'a Credential,
     pub guard: &'a Guard<'a>,
-    target: Option<Cap<DEntry>>,
+    pub target: Option<Cap<DEntry>>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ChmodOp<'a> {
@@ -71,6 +71,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChmodOp<'a> {
 }
 
 impl OneShotStepOp<ProcessIdentity> for ChmodOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for ChmodOp<'_> {}
 
 // ============================================================================
 // ChownOp — fchownat
@@ -83,7 +84,7 @@ pub struct ChownOp<'a> {
     pub gid: Option<u32>,
     pub cred: &'a Credential,
     pub guard: &'a Guard<'a>,
-    target: Option<Cap<DEntry>>,
+    pub target: Option<Cap<DEntry>>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ChownOp<'a> {
@@ -117,6 +118,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChownOp<'a> {
 }
 
 impl OneShotStepOp<ProcessIdentity> for ChownOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for ChownOp<'_> {}
 
 // ============================================================================
 // AccessOp — faccessat / faccessat2
@@ -144,6 +146,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for AccessOp<'a> {
 }
 
 impl OneShotStepOp<ProcessIdentity> for AccessOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for AccessOp<'_> {}
 
 // ============================================================================
 // MkdirOp — mkdirat
@@ -155,7 +158,7 @@ pub struct MkdirOp<'a> {
     pub mode: u16,
     pub cred: &'a Credential,
     pub guard: &'a Guard<'a>,
-    parent: Option<(Cap<DEntry>, InlineName)>,
+    pub parent: Option<(Cap<DEntry>, InlineName)>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for MkdirOp<'a> {
@@ -203,6 +206,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MkdirOp<'a> {
 }
 
 impl OneShotStepOp<ProcessIdentity> for MkdirOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for MkdirOp<'_> {}
 
 // ============================================================================
 // UnlinkOp — unlinkat
@@ -213,7 +217,7 @@ pub struct UnlinkOp<'a> {
     pub path: &'a [u8],
     pub cred: &'a Credential,
     pub guard: &'a Guard<'a>,
-    parent_and_child: Option<(Cap<DEntry>, InlineName, FsObjectId)>,
+    pub parent_and_child: Option<(Cap<DEntry>, InlineName, FsObjectId)>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for UnlinkOp<'a> {
@@ -253,6 +257,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for UnlinkOp<'a> {
 }
 
 impl OneShotStepOp<ProcessIdentity> for UnlinkOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for UnlinkOp<'_> {}
 
 // ============================================================================
 // SymlinkOp — symlinkat
@@ -312,6 +317,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for SymlinkOp<'a> {
 }
 
 impl OneShotStepOp<ProcessIdentity> for SymlinkOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for SymlinkOp<'_> {}
 
 // ============================================================================
 // LinkOp — linkat
@@ -323,7 +329,7 @@ pub struct LinkOp<'a> {
     pub newpath: &'a [u8],
     pub cred: &'a Credential,
     pub guard: &'a Guard<'a>,
-    state: Option<(FsObjectId, Cap<DEntry>, InlineName)>,
+    pub state: Option<(FsObjectId, Cap<DEntry>, InlineName)>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for LinkOp<'a> {
@@ -376,6 +382,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LinkOp<'a> {
 }
 
 impl OneShotStepOp<ProcessIdentity> for LinkOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for LinkOp<'_> {}
 
 // ============================================================================
 // RenameOp — renameat2
@@ -387,7 +394,7 @@ pub struct RenameOp<'a> {
     pub newpath: &'a [u8],
     pub cred: &'a Credential,
     pub guard: &'a Guard<'a>,
-    state: Option<(Cap<DEntry>, InlineName, Cap<DEntry>, InlineName)>,
+    pub state: Option<(Cap<DEntry>, InlineName, Cap<DEntry>, InlineName)>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
@@ -395,6 +402,11 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        // observe
+        // upgrade — N/A: path-walk read-only
+        // reserve — N/A: rename reserves zone slots via FsOps
+        // commit
+        // publish — N/A: no signal attachments
         let (old_parent, old_name, new_parent, new_name) = match self.state.take() {
             Some(p) => p,
             None => {
@@ -454,6 +466,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
 }
 
 impl OneShotStepOp<ProcessIdentity> for RenameOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for RenameOp<'_> {}
 
 // ============================================================================
 // TruncateOp — truncate / ftruncate
@@ -465,7 +478,7 @@ pub struct TruncateOp<'a> {
     pub length: u64,
     pub cred: &'a Credential,
     pub guard: &'a Guard<'a>,
-    target: Option<Cap<DEntry>>,
+    pub target: Option<Cap<DEntry>>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for TruncateOp<'a> {
@@ -496,6 +509,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for TruncateOp<'a> {
         page_backing.truncate(target.rnode().fs_object_id(), self.length, self.guard)
     }
 }
+impl OneShotStepOp<ProcessIdentity> for TruncateOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for TruncateOp<'_> {}
+
 
 // ============================================================================
 // StatOp — newfstatat / fstat
@@ -506,7 +522,7 @@ pub struct StatOp<'a> {
     pub path: &'a [u8],
     pub cred: &'a Credential,
     pub guard: &'a Guard<'a>,
-    target: Option<Cap<DEntry>>,
+    pub target: Option<Cap<DEntry>>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for StatOp<'a> {
@@ -532,6 +548,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for StatOp<'a> {
 }
 
 impl OneShotStepOp<ProcessIdentity> for StatOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for StatOp<'_> {}
 
 // ============================================================================
 // LstatOp — lstat
@@ -542,7 +559,7 @@ pub struct LstatOp<'a> {
     pub path: &'a [u8],
     pub cred: &'a Credential,
     pub guard: &'a Guard<'a>,
-    target: Option<Cap<DEntry>>,
+    pub target: Option<Cap<DEntry>>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for LstatOp<'a> {
@@ -571,6 +588,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LstatOp<'a> {
 }
 
 impl OneShotStepOp<ProcessIdentity> for LstatOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for LstatOp<'_> {}
 
 // ============================================================================
 // StatxOp — statx
@@ -581,7 +599,7 @@ pub struct StatxOp<'a> {
     pub path: &'a [u8],
     pub cred: &'a Credential,
     pub guard: &'a Guard<'a>,
-    target: Option<Cap<DEntry>>,
+    pub target: Option<Cap<DEntry>>,
 }
 
 #[derive(Clone, Debug)]
@@ -614,6 +632,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for StatxOp<'a> {
 }
 
 impl OneShotStepOp<ProcessIdentity> for StatxOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for StatxOp<'_> {}
 
 // ============================================================================
 // ReadLinkOp — readlinkat
@@ -624,7 +643,7 @@ pub struct ReadLinkOp<'a> {
     pub path: &'a [u8],
     pub cred: &'a Credential,
     pub guard: &'a Guard<'a>,
-    target: Option<Cap<DEntry>>,
+    pub target: Option<Cap<DEntry>>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadLinkOp<'a> {
@@ -652,6 +671,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ReadLinkOp<'a> {
 }
 
 impl OneShotStepOp<ProcessIdentity> for ReadLinkOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for ReadLinkOp<'_> {}
 
 // ============================================================================
 // Shared helpers

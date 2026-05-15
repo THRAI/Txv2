@@ -15,6 +15,7 @@ use crate::vfs::adapter::step_engine::{self, Cap, Weak, Zone, ZoneAllocated, Zon
 use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
 
 use crate::aio::AioContext;
+use crate::epoll::Epoll;
 use crate::cred::{CapabilitySet, Cred};
 use crate::device::{BlockDeviceRegistration, CharDeviceBinding};
 use crate::execution::Errno;
@@ -886,6 +887,10 @@ pub enum OpenFileBacking {
     /// borrow body observes the cooperative-cancel reason and the
     /// kthread aborts.
     IoUring { ring: Cap<IoUring> },
+    /// `epoll_create1(2)` open file (Phase B.1). The cap is the
+    /// substrate-side [`Epoll`] identity used to route readiness
+    /// notifications via `YieldShape::OnEdge`.
+    Epoll { ep: Cap<Epoll> },
 }
 
 /// Per-fd file-position carrier.
@@ -1015,6 +1020,27 @@ impl OpenFile {
         step_engine::sign(Self::new_signalfd(sfd, flags))
     }
 
+    /// Construct an epoll-backed `OpenFile` (Phase B.1).
+    /// The resulting value carries `OpenFileBacking::Epoll { ep }`
+    /// and no `Cap<RNode>` — epoll instances are a non-VFS fd kind.
+    pub fn new_epoll(ep: Cap<Epoll>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::Epoll { ep },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
+            flags,
+        }
+    }
+
+    /// Zone-sign a fresh epoll-backed `OpenFile` (Phase B.1).
+    pub fn new_epoll_cap(
+        ep: Cap<Epoll>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_epoll(ep, flags))
+    }
+
     /// Construct an io_uring-backed `OpenFile` (future PR-12 phase 0 —
     /// second `OnBehalfOf<P>` canary). The resulting value carries
     /// `OpenFileBacking::IoUring { ring }` and no `Cap<RNode>` —
@@ -1072,6 +1098,10 @@ impl OpenFile {
                 "OpenFile::rnode() called on a signalfd-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::signalfd() first",
             ),
+            OpenFileBacking::Epoll { .. } => panic!(
+                "OpenFile::rnode() called on an epoll-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::epoll() first",
+            ),
             OpenFileBacking::IoUring { .. } => panic!(
                 "OpenFile::rnode() called on an io_uring-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::io_uring() first",
@@ -1091,7 +1121,8 @@ impl OpenFile {
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::AioContext { .. }
             | OpenFileBacking::SignalFd { .. }
-            | OpenFileBacking::IoUring { .. } => None,
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Epoll { .. } => None,
         }
     }
 
@@ -1108,7 +1139,8 @@ impl OpenFile {
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::Ufd { .. }
             | OpenFileBacking::SignalFd { .. }
-            | OpenFileBacking::IoUring { .. } => None,
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Epoll { .. } => None,
         }
     }
 
@@ -1124,7 +1156,8 @@ impl OpenFile {
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::Ufd { .. }
             | OpenFileBacking::AioContext { .. }
-            | OpenFileBacking::IoUring { .. } => None,
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Epoll { .. } => None,
         }
     }
 
@@ -1141,7 +1174,8 @@ impl OpenFile {
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::Ufd { .. }
             | OpenFileBacking::AioContext { .. }
-            | OpenFileBacking::SignalFd { .. } => None,
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::Epoll { .. } => None,
         }
     }
 
