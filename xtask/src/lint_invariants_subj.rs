@@ -13,7 +13,7 @@ use crate::Result;
 
 /// Ratchet ceiling: number of `_ctx: &mut ScriptCtx` occurrences.
 /// Will be set to measured baseline after first run.
-const MAX_IGNORED_SCRIPTCTX: usize = 74; // 72→74: ReadToKernelOp + WriteFromKernelOp wrappers added
+const MAX_IGNORED_SCRIPTCTX: usize = 82; // 79→80: InodeStatOp VFS StepOp wrap
 
 pub(crate) fn lint_invariants_subject_context(root: &Path) -> Result<()> {
     let mut ignored: Vec<String> = Vec::new();

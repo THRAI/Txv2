@@ -136,7 +136,7 @@ impl FsOps for Procfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         let rnode = RNode::new(id, meta, RNodeBacking::Projected);
-        match Err(tx_subsystems::cred::ZoneError::Zone) /* TODO: step_engine::sign removed */ {
+        match Err("zone unavailable") /* TODO: step_engine::sign removed */ {
             Ok(cap) => StepOutcome::done(cap),
             Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }
@@ -150,7 +150,7 @@ impl FsOps for Procfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
         let content: Vec<u8> = Vec::new(); // TODO: procfs read::render removed in merge
-        let bytes = content.as_bytes();
+        let bytes = content.as_slice();
         let off = offset as usize;
         if off >= bytes.len() {
             return StepOutcome::done(0); // EOF

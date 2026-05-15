@@ -115,14 +115,19 @@ pub fn step_store_exec_identity(
     exe_dentry: Cap<crate::vfs::DEntry>,
     comm_bytes: &[u8],
 ) {
+    // observe: payload cap (zombie guard)
     let Some(payload_cap) = process.payload.lock().clone() else {
         return;
     };
     let payload: &ProcessPayload = &payload_cap;
+    // upgrade: (no witness needed — payload is Copy-accessible)
+    // reserve: (no slot allocation — overwriting existing Option slots)
+    // commit: write cmdline, exe_file, comm atomically
     *payload._cmdline.lock() = Some(cmdline.to_vec());
     *payload._exe_file.lock() = Some(exe_dentry);
     let mut buf = [0u8; 16];
     let len = (comm_bytes.len()).min(15);
     buf[..len].copy_from_slice(&comm_bytes[..len]);
     *payload._comm.lock() = buf;
+    // publish: (no publication — fields are polled by procfs/readlink)
 }

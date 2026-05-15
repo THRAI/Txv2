@@ -60,7 +60,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    self, Errno, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, ZoneError,
+    self, Errno, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome,
+    SubjectIdentity, ZoneError,
 };
 use adapter::wait_routing::{self, Channel, WaitSource};
 
@@ -327,6 +328,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FutexWakeOp<'a> {
         step_futex_wake(self.uaddr, self.n, self.guard)
     }
 }
+
+impl OneShotStepOp for FutexWakeOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for FutexWakeOp<'_> {}
 
 #[cfg(test)]
 mod tests {

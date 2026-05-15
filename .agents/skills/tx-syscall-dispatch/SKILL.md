@@ -174,9 +174,35 @@ cargo xtask unit                # unit test suite
 
 | Lane | Count | Ceiling | Status |
 |------|-------|---------|--------|
-| Immediate | 17/17 migrated | — | done |
-| One-shot (StepOp exists) | 1/43 migrated (setuid) | — | in progress |
-| Full async | 2/29 migrated (read, write) | — | in progress |
-| Ad-hoc V3:: loops | 8 files / 86 sites | 8 | ok |
+| Immediate | 22 migrated | — | done |
+| One-shot (StepOp migrated) | 23/43 migrated | — | done |
+| Full async | 2/29 migrated (read, write) | — | deferred |
+| Ad-hoc V3:: loops | 8 files | 8 | ok |
 | .await in syscall fns | 15 sites | 60 | ok |
-| ScriptCtx bridging | 5/88 (6%) | — | info |
+| ScriptCtx bridging | 23/82 (28%) | — | info |
+| Full invariants suite | all pass | — | clean |
+
+**Next phase (tx-step-migration skill territory):**
+- Create StepOp wrappers for ~23 remaining Lane 2 syscalls
+- Refactor SetpgidOp/SetsidOp-style Result<T,E> Output ops
+- Migrate full async drive for 27 remaining Lane 3 syscalls
+- Resolve VFS/pipe/TTY orphan rule boundary for ProcessIdentity
+
+**OneShotStepOp migrated to drive_oneshot (23):**
+setuid, setgid, setreuid, setregid, setresuid, setresgid, exit, exit_group,
+kill (pid>0), sigaction, getcwd, setpgid, setsid,
+close, dup, dup3, fcntl (F_GETFD/SETFD), sigprocmask, pipe2, lseek
+
+**OneShotStepOp marker only (internal ops, not dispatch-mapped):**
+CloseCloexecFdsOp, ResetSignalDispositionsForExecOp, InstallBrkForExecOp,
+FutexWakeOp, KillPgrpOp, Pipe2Op, OpenFileLseekOp, OpenFileIoctlOp
+
+**Adapters with OneShotStepOp + drive_oneshot exports:**
+shims, cred, process, signal, futex, vfs, pipe, tty
+
+**Known limitation:** VFS/TTY/pipe ops use polymorphic `StepOp<I>` with
+default `PlaceholderProcessSubject`, but the kernel uses
+`ScriptCtx<ProcessIdentity>`. The orphan rule prevents adding
+`OneShotStepOp<ProcessIdentity>` bridge impls outside the defining crate.
+Dispatch arms for these ops retain manual `StepOutcome` match patterns;
+the `OneShotStepOp` markers serve as documentation/lint anchors.

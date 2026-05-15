@@ -57,20 +57,37 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     // but the cleanest shape is to call `step_sigprocmask` always
     // when `how` is Some, and for the query-only branch bypass it.
     let prev_mask: SignalMask = match how {
-        Some(how) => match step_sigprocmask(&ctx.thread, how, next_mask) {
-            SigprocmaskChange::Replaced { prev, .. } => prev,
-            SigprocmaskChange::ZombieIgnored => {
-                return SyscallResult::Error(ESRCH_VALUE);
-            }
-        },
-        None => {
-            // Query-only path. Use `Block` of EMPTY (a no-op) to
-            // pull the current mask out without changing it. SIG_BLOCK
-            // with empty `next` cannot alter the mask: `new = prev | 0`.
-            match step_sigprocmask(&ctx.thread, SigmaskHow::Block, SignalMask::EMPTY) {
-                SigprocmaskChange::Replaced { prev, .. } => prev,
-                SigprocmaskChange::ZombieIgnored => {
+        Some(how) => {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = SigprocmaskOp {
+                thread: ctx.thread.clone(),
+                how,
+                next: next_mask,
+            };
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(SigprocmaskChange::Replaced { prev, .. }) => prev,
+                Ok(SigprocmaskChange::ZombieIgnored) => {
                     return SyscallResult::Error(ESRCH_VALUE);
+                }
+                Err(v3errno) => {
+                    return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                }
+            }
+        }
+        None => {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = SigprocmaskOp {
+                thread: ctx.thread.clone(),
+                how: SigmaskHow::Block,
+                next: SignalMask::EMPTY,
+            };
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(SigprocmaskChange::Replaced { prev, .. }) => prev,
+                Ok(SigprocmaskChange::ZombieIgnored) => {
+                    return SyscallResult::Error(ESRCH_VALUE);
+                }
+                Err(v3errno) => {
+                    return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
                 }
             }
         }
@@ -148,22 +165,24 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     // and we must not mutate. Read the live disposition through the
     // process's `sig_actions` table accessor in that case.
     let prev_disposition: SigDisposition = match new_disposition {
-        Some(disp) => match step_sigaction(&ctx.process, sig, disp) {
-            SigDispositionChange::Replaced { prev } => prev,
-            SigDispositionChange::Uncatchable(prev) => {
-                // SIGKILL/SIGSTOP — `step_sigaction` silently keeps
-                // them at default. Treat the call as a successful
-                // query: return the (unchanged) prev to oldact, and
-                // the syscall returns 0. Linux allows installing
-                // SIG_DFL on these; installing handlers fails. For
-                // simplicity (and matching `step_sigaction`'s shape)
-                // we report success either way.
-                prev
+        Some(disp) => {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = SigactionOp {
+                process: ctx.process.clone(),
+                sig,
+                disposition: disp,
+            };
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(SigDispositionChange::Replaced { prev }) => prev,
+                Ok(SigDispositionChange::Uncatchable(prev)) => prev,
+                Ok(SigDispositionChange::ZombieIgnored) => {
+                    return SyscallResult::Error(ESRCH_VALUE);
+                }
+                Err(v3errno) => {
+                    return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                }
             }
-            SigDispositionChange::ZombieIgnored => {
-                return SyscallResult::Error(ESRCH_VALUE);
-            }
-        },
+        }
         None => {
             // Query-only: read directly via the process's
             // `sig_disposition` accessor. Returns `None` for zombies
@@ -260,9 +279,15 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    match step_kill_process(&target, signum) {
-        KillOutcome::Delivered => SyscallResult::Return(0),
-        KillOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = KillProcessOp {
+        target: target.clone(),
+        sig: signum,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(KillOutcome::Delivered) => SyscallResult::Return(0),
+        Ok(KillOutcome::NoLiveThread) => SyscallResult::Error(ESRCH_VALUE),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 

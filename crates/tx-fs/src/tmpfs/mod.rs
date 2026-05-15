@@ -245,7 +245,7 @@ impl FsOps for Tmpfs {
         match state.inodes.get(&fs_object_id) {
             Some(inode) => {
                 let mut meta = inode.meta;
-                // meta.nlink = inode.nlink as u64; // TODO: nlink field removed from InodeMeta
+                // // meta.nlink = inode.nlink as u64; // TODO: nlink removed from InodeMeta // TODO: nlink field removed from InodeMeta
                 // For regular files the authoritative size lives in
                 // the PageContainer: writes via `step_write_from_*`
                 // call `pc.grow_size_to`, which the cached
@@ -409,7 +409,7 @@ impl FsOps for Tmpfs {
         }
         // Decrement link count; only free the inode when it reaches 0.
         if let Some(target_inode) = state.inodes.get_mut(&found_id) {
-            // target_inode.nlink = target_inode.nlink.saturating_sub(1); // TODO: nlink removed
+            // // target_inode.nlink = target_inode.nlink.saturating_sub(1); // TODO: nlink removed // TODO: nlink removed
             if true /* target_inode.nlink == 0 */ { // TODO: nlink removed
                 drop(target_inode);
                 state.inodes.remove(&found_id);
@@ -472,30 +472,34 @@ impl FsOps for Tmpfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         let mut state = self.state.lock();
-        // Validate parent exists and is a directory.
-        let parent_inode = match state.inodes.get(&parent) {
-            Some(i) if matches!(i.payload, TmpfsPayload::Directory(_)) => i,
-            _ => return StepOutcome::err(step_engine::Errno::ENOTDIR),
-        };
         // Validate name is valid.
         let iname = match InlineName::new(name) {
             Ok(n) => n,
             Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
         };
-        // Target must exist and be a regular file.
+        // Phase 1: immutable checks — parent exists, is a directory,
+        // name is free.
+        {
+            let parent_inode = match state.inodes.get(&parent) {
+                Some(i) if matches!(i.payload, TmpfsPayload::Directory(_)) => i,
+                _ => return StepOutcome::err(step_engine::Errno::ENOTDIR),
+            };
+            if let TmpfsPayload::Directory(ref children) = parent_inode.payload {
+                if children.contains_key(&iname) {
+                    return StepOutcome::err(step_engine::Errno::EEXIST);
+                }
+            }
+        }
+        // Phase 2: mutable ops — validate target, insert link.
         let target_inode = match state.inodes.get_mut(&target) {
             Some(i) if matches!(i.payload, TmpfsPayload::RegularFile { .. }) => i,
             Some(_) => return StepOutcome::err(step_engine::Errno::EPERM),
             None => return StepOutcome::err(step_engine::Errno::ENOENT),
         };
-        // Name must not already exist in parent.
-        if let TmpfsPayload::Directory(ref children) = parent_inode.payload {
-            if children.contains_key(&iname) {
-                return StepOutcome::err(step_engine::Errno::EEXIST);
-            }
-        }
-        // Add the link.
-        // target_inode.nlink += 1; // TODO: nlink removed
+        let parent_inode = match state.inodes.get_mut(&parent) {
+            Some(i) => i,
+            None => return StepOutcome::err(step_engine::Errno::ENOTDIR),
+        };
         if let TmpfsPayload::Directory(ref mut children) = parent_inode.payload {
             children.insert(iname, target);
         }

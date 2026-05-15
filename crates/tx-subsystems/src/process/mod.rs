@@ -20,8 +20,9 @@ pub use exec_prep::{
 pub use execution::{
     all_pids, bootstrap_init_process, init_process, process_by_pid, seed_child_leader_context,
     step_chdir, step_exit_group, step_fork, step_getcwd, step_setpgid, step_setsid,
-    step_waitpid_nohang, ChdirOp, ChdirOutcome, ExitGroupOp, ForkError, GetcwdOp,
-    SetpgidError, SetsidError, WaitError, WaitTarget,
+    step_waitpid_nohang, ChdirOp, ChdirOutcome, CloseOp, DupOp, Dup3Op, ExitGroupOp,
+    FcntlDupFdOp, FcntlFdOp, ForkError, GetcwdOp,
+    SetpgidOp, SetsidOp, SetpgidError, SetsidError, WaitError, WaitTarget,
 };
 pub use structure::{
     allocate_pid, ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,

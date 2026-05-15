@@ -670,23 +670,16 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> Sysc
             }
         }
         FUTEX_WAKE => {
-            let n = val;
-            let outcome = {
-                let guard = step_engine::guard();
-                tx_subsystems::futex::step_futex_wake(uaddr, n, &guard)
+            let mut script_ctx = build_subject_script_ctx(_ctx);
+            let guard = step_engine::guard();
+            let mut op = FutexWakeOp {
+                uaddr,
+                n: val,
+                guard: &guard,
             };
-            use StepOutcome as V3;
-            match outcome {
-                V3::Done(woken) => SyscallResult::Return(woken as i64),
-                V3::Continue { .. } | V3::Yield { .. } => {
-                    // FUTEX_WAKE is not a blocking op. The step
-                    // never yields in practice; map to EIO.
-                    SyscallResult::Error(EIO_VALUE)
-                }
-                V3::Err(v3_errno) => {
-                    let errno: Errno = v3_errno.into();
-                    SyscallResult::Error(errno_to_i32(errno))
-                }
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(woken) => SyscallResult::Return(woken as i64),
+                Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
             }
         }
         // FUTEX_REQUEUE / CMP_REQUEUE / WAKE_OP / LOCK_PI /

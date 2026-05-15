@@ -487,9 +487,12 @@ pub(super) fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let path = match step_getcwd(&ctx.process) {
-        Some(p) => p,
-        None => return SyscallResult::Error(ENOENT_VALUE),
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = GetcwdOp { target: &ctx.process };
+    let path = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(Some(p)) => p,
+        Ok(None) => return SyscallResult::Error(ENOENT_VALUE),
+        Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     };
     // `path` is the rendered absolute path bytes (no NUL terminator);
     // `size` must accommodate `path.len() + 1` to fit the terminator.

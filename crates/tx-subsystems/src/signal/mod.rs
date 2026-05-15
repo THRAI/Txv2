@@ -33,8 +33,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    self, Cap, Guard, NoProgress, OperationalCapExt, ScriptCtx, SignalRouting, SpinMutex, StepOp,
-    StepOutcome, SubjectIdentity,
+    self, Cap, Guard, NoProgress, OneShotStepOp, OperationalCapExt, ScriptCtx, SignalRouting,
+    SpinMutex, StepOp, StepOutcome, SubjectIdentity,
 };
 
 use crate::execution::Errno;
@@ -1247,6 +1247,8 @@ impl<I: SubjectIdentity> StepOp<I> for KillProcessOp {
     }
 }
 
+impl OneShotStepOp<crate::process::ProcessIdentity> for KillProcessOp {}
+
 /// `StepOp` wrap for [`step_kill_pgrp`]. PR-2 wave 2.
 pub struct KillPgrpOp {
     pub pgrp: Cap<ProcessGroup>,
@@ -1260,6 +1262,8 @@ impl<I: SubjectIdentity> StepOp<I> for KillPgrpOp {
         StepOutcome::Done(step_kill_pgrp(&self.pgrp, self.sig))
     }
 }
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for KillPgrpOp {}
 
 /// `StepOp` wrap for [`step_sigaction`]. PR-2 wave 2.
 pub struct SigactionOp {
@@ -1275,6 +1279,8 @@ impl<I: SubjectIdentity> StepOp<I> for SigactionOp {
         StepOutcome::Done(step_sigaction(&self.process, self.sig, self.disposition))
     }
 }
+
+impl OneShotStepOp<crate::process::ProcessIdentity> for SigactionOp {}
 
 #[cfg(test)]
 mod step_op_wraps {

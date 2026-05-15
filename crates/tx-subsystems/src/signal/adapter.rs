@@ -27,7 +27,8 @@ pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
-        ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+        ByteProgress, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
+        SubjectIdentity, drive_oneshot,
     };
     pub use tx_substrate::wake::{MailboxEvent, SignalRouting, TaskMailbox};
     pub use tx_substrate::zone::{

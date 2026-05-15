@@ -284,7 +284,7 @@ pub async fn run_thread<P: TxPlatform>(
                     // Save the current context as the signal context
                     // (pre-handler state).  sigreturn restores from
                     // this slot to resume the original execution.
-                    payload.store_saved_signal_context(Some(ctx));
+                    payload.store_saved_user_context(Some(ctx));
 
                     // Redirect the thread to the installed handler.
                     // sepC → handler address.
