@@ -157,6 +157,7 @@ pub fn step_walk<'g>(
         rooted_at,
         path,
         crate::vfs::resolution::state::WalkMode::Entity,
+        crate::vfs::resolution::state::FinalSymlinkPolicy::Follow,
         cred,
         guard,
     ) {

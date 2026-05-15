@@ -242,6 +242,20 @@ pub fn kernel_step(
 
     // --- symlink chasing ---
     if let RNodeBacking::Symlink { target } = child_rnode_cap.backing() {
+        // NoFollow: if this is the final component and the caller
+        // asked us not to follow, return the symlink as terminal.
+        if policy == FinalSymlinkPolicy::NoFollow && remaining.is_empty() {
+            let rnode = child_rnode_cap.clone();
+            let meta = child_meta.clone();
+            let fs_object_id = rnode.fs_object_id();
+            let resolved = PathResolution {
+                dentry: child_dentry,
+                rnode,
+                fs_object_id,
+                meta,
+            };
+            return KernelStep::Continue(WalkState::Terminal(resolved));
+        }
         hop_count += 1;
         if hop_count > SYMLOOP_MAX {
             return KernelStep::Error(WalkCause::SymlinkLimit);
