@@ -99,7 +99,7 @@ fn kill_process_routes_signal_to_first_live_thread() {
     let proc_cap = bootstrap();
     let leader = first_thread(&proc_cap);
 
-    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM);
+    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM, None);
     assert_eq!(outcome, KillOutcome::Delivered);
 
     let pending = leader
@@ -116,7 +116,7 @@ fn kill_zombie_process_returns_no_live_thread() {
     let proc_cap = bootstrap();
     step_exit_group(&proc_cap, ExitStatus::Exited(0));
 
-    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM);
+    let outcome = step_kill_process(&proc_cap, Signum::SIGTERM, None);
     assert_eq!(outcome, KillOutcome::NoLiveThread);
 }
 
@@ -267,8 +267,8 @@ fn deliverable_bits_filter_blocked_pending_correctly() {
     block.block(Signum::SIGTERM);
     let _ = step_sigprocmask(&leader, SigmaskHow::Block, block);
 
-    step_kill_process(&proc_cap, Signum::SIGTERM);
-    step_kill_process(&proc_cap, Signum::SIGINT);
+    step_kill_process(&proc_cap, Signum::SIGTERM, None);
+    step_kill_process(&proc_cap, Signum::SIGINT, None);
 
     let payload_guard = leader.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");

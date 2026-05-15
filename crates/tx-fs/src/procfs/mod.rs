@@ -26,13 +26,22 @@ pub const PROCFS_UPTIME_ID: FsObjectId = FsObjectId::new(0x7072_6F04);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_STAT_OFFSET: u64 = 0x10000;
 const PROCFS_MEM_OFFSET: u64 = 0x10002;
+const PROCFS_MAPS_OFFSET: u64 = 0x10003;
+const PROCFS_EXE_OFFSET: u64 = 0x10004;
 const fn pid_dir_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64) }
 const fn pid_stat_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_STAT_OFFSET) }
 const fn pid_cmdline_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_STAT_OFFSET + 1) }
 const fn pid_mem_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_MEM_OFFSET) }
+const fn pid_maps_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_MAPS_OFFSET) }
+const fn pid_exe_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_EXE_OFFSET) }
 pub fn pid_from_mem_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
     let base = PROCFS_PID_BASE + PROCFS_MEM_OFFSET;
+    if r >= base && r < base + 0x10000 { Some(Pid((r - base) as u32)) } else { None }
+}
+pub fn pid_from_maps_id(id: FsObjectId) -> Option<Pid> {
+    let r = id.as_u64();
+    let base = PROCFS_PID_BASE + PROCFS_MAPS_OFFSET;
     if r >= base && r < base + 0x10000 { Some(Pid((r - base) as u32)) } else { None }
 }
 
@@ -91,6 +100,9 @@ impl FsOps for Procfs {
             if name == b"mem" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_mem_id(pid));
             }
+            if name == b"maps" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_maps_id(pid));
+            }
             return StepOutcome::err(Errno::ENOENT.into());
         }
         StepOutcome::err(Errno::ENOENT.into())
@@ -106,6 +118,7 @@ impl FsOps for Procfs {
             id if pid_from_stat_id(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE)),
             id if pid_from_cmdline_id(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE)),
             id if pid_from_mem_id(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE | 0o600)),
+            id if pid_from_maps_id(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE)),
             _ => StepOutcome::err(Errno::ENOENT.into()),
         }
     }
@@ -129,6 +142,7 @@ impl FsOps for Procfs {
                 (b"stat", pid_stat_id(pid), InodeKind::Regular),
                 (b"cmdline", pid_cmdline_id(pid), InodeKind::Regular),
                 (b"mem", pid_mem_id(pid), InodeKind::Regular),
+                (b"maps", pid_maps_id(pid), InodeKind::Regular),
             ];
             let fi = idx.saturating_sub(2);
             if fi < files.len() {

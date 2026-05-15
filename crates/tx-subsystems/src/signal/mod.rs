@@ -677,7 +677,7 @@ pub fn deliver_posix_signal(
 
     // Gewalt signums bypass the routing table entirely.
     if is_gewalt(sig) {
-        return step_kill_process(&cap, sig);
+        return step_kill_process(&cap, sig, None);
     }
 
     // Event signums: consult sig_actions for disposition.
@@ -708,7 +708,7 @@ pub fn deliver_posix_signal(
         }
         SigDisposition::Handler(_handler) => {
             // Post to eligible thread's pending; AST delivers handler.
-            step_kill_process(&cap, sig)
+            step_kill_process(&cap, sig, None)
         }
     }
 }
@@ -756,7 +756,11 @@ pub enum SignalTarget {
 /// thread-list lock is dropped — `post_signal` does not reacquire
 /// `payload.threads.inner.lock()`, so this order avoids any
 /// post-while-holding-list-lock hazard. Zombies are skipped.
-pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
+pub fn step_kill_process(
+    target: &Cap<ProcessIdentity>,
+    sig: Signum,
+    info: Option<SigInfo>,
+) -> KillOutcome {
     // observe
     // upgrade
     // reserve
@@ -827,7 +831,12 @@ pub fn step_kill_process(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutc
         return KillOutcome::NoLiveThread;
     };
 
-    post_signal(&chosen, sig, None);
+    // Store SigInfo in the process slots before posting.
+    if let Some(ref sinfo) = info {
+        target.siginfo_store(sig, *sinfo);
+    }
+
+    post_signal(&chosen, sig, info);
 
     // D9-D: fan out to every per-process signalfd subscription whose
     // mask covers `sig`. Runs *after* the thread-eligibility post —
@@ -961,7 +970,7 @@ pub fn step_kill_pgrp(pgrp: &Cap<ProcessGroup>, sig: Signum) -> usize {
     let catchable = !is_gewalt(sig);
     let members = pgrp.members.snapshot_live(&guard);
     for member in &members {
-        if step_kill_process(&member, sig) == KillOutcome::Delivered {
+        if step_kill_process(&member, sig, None) == KillOutcome::Delivered {
             // Catchable only: mirror onto group_pending so the
             // delivery step can recognise group-targeted posts.
             // Gewalt bypasses pending queues entirely.
@@ -1057,7 +1066,7 @@ pub fn script_kill_process(
 
     let _auth = crate::cred::require_signal_send(source_cred, &target_facts, sig, &guard)?;
 
-    Ok(match step_kill_process(target, sig) {
+    Ok(match step_kill_process(target, sig, None) {
         KillOutcome::Delivered => KillScriptOutcome::Delivered,
         KillOutcome::NoLiveThread => KillScriptOutcome::NoLiveThread,
     })
@@ -1134,7 +1143,7 @@ pub(crate) fn script_kill_pgrp_with_guard(
         if crate::cred::require_signal_send(source_cred, &facts, sig, guard).is_err() {
             continue;
         }
-        if step_kill_process(member, sig) == KillOutcome::Delivered {
+        if step_kill_process(member, sig, None) == KillOutcome::Delivered {
             // Catchable only: mirror onto group_pending. Gewalt
             // signals (SIGKILL/SIGSTOP/SIGCONT) bypass pending
             // queues entirely per SIGNAL_v1 §2 Consequence 2.
@@ -1237,17 +1246,18 @@ pub fn deliver_tty_dispatch_with_guard(
 pub struct KillProcessOp {
     pub target: Cap<ProcessIdentity>,
     pub sig: Signum,
+    pub info: Option<SigInfo>,
 }
 
 impl<I: SubjectIdentity> StepOp<I> for KillProcessOp {
     type Output = KillOutcome;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_kill_process(&self.target, self.sig))
+        StepOutcome::Done(step_kill_process(&self.target, self.sig, self.info))
     }
 }
 
-impl OneShotStepOp<crate::process::ProcessIdentity> for KillProcessOp {}
+impl<I: SubjectIdentity> OneShotStepOp<I> for KillProcessOp {}
 
 /// `StepOp` wrap for [`step_kill_pgrp`]. PR-2 wave 2.
 pub struct KillPgrpOp {
@@ -1320,8 +1330,7 @@ mod step_op_wraps {
         let _g = setup();
         let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
         let mut op = KillProcessOp {
-            target: proc_cap.clone(),
-            sig: Signum::SIGTERM,
+            target: proc_cap.clone(), sig: Signum::SIGTERM,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);

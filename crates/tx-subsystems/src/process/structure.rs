@@ -300,6 +300,11 @@ impl ProcessIdentity {
         }
     }
 
+    /// Find a thread by its tid within this process.
+    pub fn thread_by_tid(&self, tid: u32) -> Option<Cap<ThreadIdentity>> {
+        self.payload.lock().as_ref()?.threads.find_by_tid(tid)
+    }
+
     /// Snapshot the current address space `Cap`, if the process is
     /// alive. Returns `None` for zombies.
     ///

@@ -534,6 +534,9 @@ pub struct ScriptCtx<I: SubjectIdentity = ProcessIdentity> {
     /// (drive-taskmb). Shared across all tasks; clone is cheap
     /// (internal Arc).
     timer_wheel: Option<crate::wake::timer::TimerWheel>,
+    /// Reactor delegate registry for OnAgent yield resolution
+    /// (drive-taskmb). Shared across all tasks.
+    delegate_registry: Option<alloc::sync::Arc<crate::step::DelegateRegistry>>,
 }
 
 impl<I: SubjectIdentity> ScriptCtx<I> {
@@ -545,6 +548,7 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
             deadline: None,
             mailbox: None,
             timer_wheel: None,
+            delegate_registry: None,
         }
     }
 
@@ -590,10 +594,28 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
         self.mailbox.as_ref()
     }
 
+    /// Populate the reactor delegate registry for OnAgent yield
+    /// resolution (drive-taskmb).
+    pub fn with_delegate_registry(
+        mut self,
+        registry: alloc::sync::Arc<crate::step::DelegateRegistry>,
+    ) -> Self {
+        self.delegate_registry = Some(registry);
+        self
+    }
+
     /// Reactor timer wheel if populated; `None` for test/placeholder
     /// contexts or before reactor integration.
     pub fn timer_wheel(&self) -> Option<&crate::wake::timer::TimerWheel> {
         self.timer_wheel.as_ref()
+    }
+
+    /// Reactor delegate registry if populated; `None` for
+    /// test/placeholder contexts or before reactor integration.
+    pub fn delegate_registry(
+        &self,
+    ) -> Option<&alloc::sync::Arc<crate::step::DelegateRegistry>> {
+        self.delegate_registry.as_ref()
     }
 
     /// Low 32 bits of the subject's task trace identity.

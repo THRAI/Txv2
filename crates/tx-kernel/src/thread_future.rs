@@ -263,41 +263,65 @@ pub async fn run_thread<P: TxPlatform>(
         let ast_outcome = ast_dispatch(&thread);
         match ast_outcome {
             AstOutcome::DeliverHandler { sig, handler } => {
-                // Phase D: redirect the thread's saved_user_context
-                // to the installed handler. Without a live
-                // TrapFrameMut (only available in the trap handler),
-                // we cannot call SignalFrameIf::write_signal_frame
-                // to construct the full RV64 signal frame with
-                // siginfo and sigreturn trampoline.
-                //
-                // MVP: modify saved_user_context in-place.
-                // sepc → handler address (the thread enters the
-                // handler), a0 → signal number (POSIX convention).
-                // RA is left unchanged — the handler MUST NOT
-                // return (no sigreturn frame). A full implementation
-                // requires reactor integration: the AST checkpoint
-                // moves to the trap exit path where TrapFrameMut is
-                // available for SignalFrameIf::write_signal_frame.
+                // Phase D: full signal-frame delivery via
+                // SignalFrameIf::prepare_signal_frame (added in the
+                // HAL for this purpose).  The HAL builds the
+                // platform-specific frame bytes + handler-entry
+                // UserTrapContext; we write the bytes to the user
+                // stack via the process AddressSpace, then store
+                // the modified context for the next userspace entry.
                 //
                 // See: `txdoc:SIGNAL-V1-S15-HANDLER-DELIVERY`.
-                if let Some(mut ctx) = payload.saved_user_context() {
-                    // Save the current context as the signal context
-                    // (pre-handler state).  sigreturn restores from
-                    // this slot to resume the original execution.
-                    payload.store_saved_user_context(Some(ctx));
+                if let Some(orig_ctx) = payload.saved_user_context() {
+                    // Resolve owning process for aspace + fallback exit.
+                    let Some(process) = thread.upgrade_owner_proc() else {
+                        return;
+                    };
+                    let Some(aspace) = process.aspace_cap() else {
+                        return;
+                    };
 
-                    // Redirect the thread to the installed handler.
-                    // sepC → handler address.
-                    ctx.pc = handler as usize;
-                    // RV64 calling convention: a0 (x10) = signal number.
-                    ctx.regs[10] = sig.raw() as usize;
-                    // RA (x1) → original PC + 4.  When the handler
-                    // returns (via `ret`), it jumps to the instruction
-                    // after the interrupted one — close to SA_RESTART
-                    // semantics without a sigreturn trampoline.
-                    ctx.regs[1] = ctx.pc + 4;
+                    // Save pre-handler context for sigreturn.
+                    payload.store_saved_signal_context(Some(orig_ctx));
 
-                    payload.store_saved_user_context(Some(ctx));
+                    // Read current mask to pass to the handler.
+                    let old_mask = payload.signal_mask();
+                    let guard = boot_runtime::ast::guard();
+
+                    // Build the signal frame write descriptor.
+                    let stack_top = tx_hal::UserPtr::<u8>::new(orig_ctx.regs[2]); // sp
+                    let setup = tx_hal::SignalFrameWrite {
+                        stack_top,
+                        sig_no: sig.raw() as u32,
+                        siginfo: tx_hal::UserSigInfoAbi::default(),
+                        old_mask: tx_hal::UserSignalMaskAbi(old_mask.raw_bits()),
+                        flags: tx_hal::UserSaFlagsAbi(0),
+                        handler_pc: tx_hal::UserPtr::<()>::new(handler as usize),
+                    };
+
+                    match <P as tx_hal::SignalFrameIf>::prepare_signal_frame(
+                        &orig_ctx, &setup,
+                    ) {
+                        Ok((handler_ctx, frame_bytes)) => {
+                            // Write frame to user stack.
+                            let frame_addr = handler_ctx.regs[2];
+                            let _ = aspace.copy_to_user(
+                                tx_hal::UserPtr::<u8>::new(frame_addr),
+                                frame_bytes.as_slice(),
+                                &guard,
+                            );
+                            // Set the handler-entry context.
+                            payload.store_saved_user_context(Some(handler_ctx));
+                        }
+                        Err(_) => {
+                            // Signal frame write failed (bad stack).
+                            // Take default action: terminate.
+                            crate::process::execution::step_exit_group_with_signal(
+                                &process, sig,
+                            );
+                            return;
+                        }
+                    }
                 }
             }
             AstOutcome::InitiateTermination => return,
@@ -402,6 +426,11 @@ pub async fn run_thread<P: TxPlatform>(
                 // OnTimer yield resolution.
                 if let Some(tw) = tx_reactor::current_timer_wheel() {
                     ctx = ctx.with_timer_wheel(tw);
+                }
+                // drive-taskmb: inject the reactor's delegate registry
+                // for OnAgent yield resolution.
+                if let Some(dr) = tx_reactor::current_delegate_registry() {
+                    ctx = ctx.with_delegate_registry(dr);
                 }
                 let result = tx_shims::linux_syscall::dispatch::<P>(req, &ctx).await;
 

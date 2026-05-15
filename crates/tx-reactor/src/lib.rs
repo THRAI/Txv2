@@ -48,7 +48,8 @@ pub use scheduler::{
     SliceConfig, StopReason, TaskHandle, WakeHint,
 };
 pub use task::{
-    current_task_mailbox, current_timer_wheel, TaskDrainRecord, TaskId, TaskKey,
+    current_delegate_registry, current_task_mailbox, current_timer_wheel, TaskDrainRecord,
+    TaskId, TaskKey,
     TaskLifecycleError, TaskStatus,
 };
 pub use timer::{DeadlineFuture, TimerGuard, TimerGuardRole, TimerToken, TimerWheel};

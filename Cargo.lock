@@ -424,6 +424,7 @@ version = "0.1.0"
 dependencies = [
  "tx-ext4",
  "tx-ext4-format",
+ "tx-hal",
  "tx-platform-adapter",
  "tx-substrate",
  "tx-subsystems",
