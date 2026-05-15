@@ -928,6 +928,9 @@ pub struct OpenFile {
     pub(crate) flags: OpenFileFlags,
     /// Runtime `O_NONBLOCK` override set via `fcntl(F_SETFL)`.
     nonblocking_override: AtomicBool,
+    /// Best-effort DEntry hint set by `step_open`. `None` for
+    /// non-VFS shapes (ufd, aio, etc.). Used by `fchdir`.
+    opendir_dentry: Option<Cap<DEntry>>,
 }
 
 impl OpenFile {
@@ -938,6 +941,7 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicBool::new(false),
             flags,
+            opendir_dentry: None,
         }
     }
 
@@ -958,6 +962,7 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicBool::new(false),
             flags,
+            opendir_dentry: None,
         }
     }
 
@@ -974,6 +979,7 @@ impl OpenFile {
     /// Construct an AIO-context-backed `OpenFile` (PR-11 phase 1). The
     /// resulting value carries `OpenFileBacking::AioContext { ctx }`
     /// and no `Cap<RNode>` — AIO contexts are a non-VFS fd kind
+    #[allow(clippy::too_many_arguments)]
     /// (joining ufd in the OpenFileBacking enum, see D8 §4.1).
     /// Existing VFS-only paths (`step_read` / `step_write` /
     /// `step_lseek` / etc.) must not be called against this shape;
@@ -985,6 +991,7 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicBool::new(false),
             flags,
+            opendir_dentry: None,
         }
     }
 
@@ -1009,6 +1016,7 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicBool::new(false),
             flags,
+            opendir_dentry: None,
         }
     }
 
@@ -1030,6 +1038,7 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicBool::new(false),
             flags,
+            opendir_dentry: None,
         }
     }
 
@@ -1054,6 +1063,7 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicBool::new(false),
             flags,
+            opendir_dentry: None,
         }
     }
 
