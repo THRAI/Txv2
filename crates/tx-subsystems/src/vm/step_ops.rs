@@ -15,7 +15,7 @@
 //! reactors and shim layers that drive via `tx_scripts::drive`.
 
 use crate::vm::adapter::step_engine::{
-    Errno, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+    self, Errno, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     WaitSourceId, YieldShape,
 };
 use crate::vm::{
@@ -275,6 +275,39 @@ impl<'a, I: SubjectIdentity> StepOp<I> for VmMunlockOp<'a> {
             Ok(commit) => StepOutcome::Done(commit),
             Err(VmMapError::WouldBlock) => range_lock_blocked(self.aspace),
             Err(error) => StepOutcome::Err(vmmap_error_to_errno(error)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VmMsyncOp
+// ---------------------------------------------------------------------------
+
+/// `StepOp` wrap of [`AddressSpace::msync`].
+///
+/// `AddressSpace::msync` returns `StepOutcome<(), PageProgress>` because
+/// it may call `step_fsync` internally on file-backed pages. This wrapper
+/// converts `PageProgress` to `NoProgress`, mapping `Continue { progress }`
+/// to `Continue { progress: NoProgress }` (discarding the intermediate
+/// progress value, which is acceptable because msync's progress is
+/// boolean: "more pages to sync").
+pub struct VmMsyncOp<'a> {
+    pub aspace: &'a AddressSpace,
+    pub range: UserRange,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for VmMsyncOp<'a> {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        use StepOutcome as V3;
+        let guard = step_engine::guard();
+        match self.aspace.msync(self.range, &guard) {
+            V3::Done(()) => V3::Done(()),
+            V3::Err(e) => V3::Err(e),
+            V3::Continue { .. } => V3::Continue { progress: NoProgress },
+            V3::Yield { shape, .. } => V3::Yield { progress: NoProgress, shape },
         }
     }
 }

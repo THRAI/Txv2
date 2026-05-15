@@ -8,7 +8,7 @@ use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 use tx_scripts::drive;
 use tx_substrate::step::DriveMode;
 use tx_subsystems::vm::step_ops::{
-    VmBrkOp, VmMapOp, VmMlockOp, VmMunlockOp, VmProtectOp, VmRemapOp, VmUnmapOp,
+    VmBrkOp, VmMapOp, VmMlockOp, VmMunlockOp, VmMsyncOp, VmProtectOp, VmRemapOp, VmUnmapOp,
 };
 
 /// `brk(requested)` per `txdoc:VM-5-8-BRK`.
@@ -490,62 +490,22 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    // Loop on the canonical wait-carrier discipline mirroring
-    // `sys_write` — fresh epoch guard inside the call site, never
-    // crossing an `.await`.
-    use step_engine::{StepOutcome as V3, YieldShape};
-    loop {
-        let outcome = {
-            let guard = step_engine::guard();
-            ctx.aspace.msync(range, &guard)
-        };
-        match outcome {
-            V3::Done(()) | V3::Continue { .. } => {
-                return SyscallResult::Return(0);
-            }
-            V3::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                let token =
-                    tx_subsystems::execution::WaitToken::new(carrier.raw(), interests.raw());
-                if let Some(future) = wait_source::wait_on_token(token) {
-                    let _ = future.await;
-                }
-                // Otherwise re-poll immediately.
-            }
-            V3::Yield {
-                shape: YieldShape::OnAgent { .. },
-                ..
-            } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Yield {
-                shape: YieldShape::OnEdge { .. },
-                ..
-            } => {
-                return SyscallResult::Error(EIO_VALUE);
-            },
-            V3::Yield {
-                shape: YieldShape::OnTimer { .. },
-                ..
-            } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Yield {
-                shape: YieldShape::OnEdge { .. },
-                ..
-            } => {
-                return SyscallResult::Error(ENOSYS_VALUE);
-            }
-            V3::Err(v3_errno) => {
-                return SyscallResult::Error(errno_to_i32(v3_errno.into()));
-            }
-        }
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let mut op = VmMsyncOp { aspace: &ctx.aspace, range };
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        None,
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 
