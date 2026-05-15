@@ -54,8 +54,8 @@ use tx_subsystems::cred::{
 };
 use tx_subsystems::execution::Errno;
 use tx_subsystems::process::{
-    process_by_pid, seed_child_leader_context, step_chdir,
-    step_waitpid_nohang, ChdirOutcome, CloseOp, DupOp, Dup3Op, ExitGroupOp,
+    process_by_pid, seed_child_leader_context,
+    step_waitpid_nohang, ChdirOp, ChdirOutcome, CloseOp, DupOp, Dup3Op, ExitGroupOp,
     ExitStatus, FcntlDupFdOp, FcntlFdOp, GetcwdOp, Pgid, Pid, ProcessIdentity, SetpgidOp,
     SetsidOp, WaitError, WaitTarget,
 };
@@ -149,7 +149,8 @@ pub use numbers::{
     NR_FSTAT, NR_FTRUNCATE, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID,
     NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID, NR_GETRESUID,
     NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP,
-    NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL, NR_LINKAT, NR_LSEEK, NR_MADVISE,
+    NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_EPOLL_CREATE1, NR_EPOLL_CTL,
+    NR_EPOLL_WAIT, NR_EPOLL_PWAIT, NR_KILL, NR_LINKAT, NR_LSEEK, NR_MADVISE,
     NR_MKDIRAT, NR_MLOCK, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
     NR_OPENAT, NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RENAMEAT2,
     NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO,
