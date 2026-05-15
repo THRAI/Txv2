@@ -28,12 +28,15 @@ const PROCFS_STAT_OFFSET: u64 = 0x10000;
 const PROCFS_MEM_OFFSET: u64 = 0x10002;
 const PROCFS_MAPS_OFFSET: u64 = 0x10003;
 const PROCFS_EXE_OFFSET: u64 = 0x10004;
+const PROCFS_FD_OFFSET: u64 = 0x20000;
 const fn pid_dir_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64) }
 const fn pid_stat_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_STAT_OFFSET) }
 const fn pid_cmdline_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_STAT_OFFSET + 1) }
 const fn pid_mem_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_MEM_OFFSET) }
 const fn pid_maps_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_MAPS_OFFSET) }
 const fn pid_exe_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_EXE_OFFSET) }
+const fn pid_fd_dir_id(pid: Pid) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_FD_OFFSET) }
+const fn pid_fd_id(pid: Pid, fd: u32) -> FsObjectId { FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_FD_OFFSET + 1 + fd as u64) }
 pub fn pid_from_mem_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
     let base = PROCFS_PID_BASE + PROCFS_MEM_OFFSET;
@@ -48,6 +51,21 @@ pub fn pid_from_exe_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
     let base = PROCFS_PID_BASE + PROCFS_EXE_OFFSET;
     if r >= base && r < base + 0x10000 { Some(Pid((r - base) as u32)) } else { None }
+}
+fn pid_from_fd_dir(id: FsObjectId) -> Option<Pid> {
+    let r = id.as_u64();
+    let base = PROCFS_PID_BASE + PROCFS_FD_OFFSET;
+    if r >= base && r < base + 1 { Some(Pid((r - base) as u32)) } else { None }
+}
+fn pid_from_fd_id(id: FsObjectId) -> Option<(Pid, u32)> {
+    let r = id.as_u64();
+    let base = PROCFS_PID_BASE + PROCFS_FD_OFFSET + 1;
+    if r >= base {
+        let offset = r - base;
+        let pid = Pid((offset / 0x10000) as u32);
+        let fd = (offset % 0x10000) as u32;
+        Some((pid, fd))
+    } else { None }
 }
 
 fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
@@ -111,6 +129,9 @@ impl FsOps for Procfs {
             if name == b"exe" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_exe_id(pid));
             }
+            if name == b"fd" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_fd_dir_id(pid));
+            }
             return StepOutcome::err(Errno::ENOENT.into());
         }
         StepOutcome::err(Errno::ENOENT.into())
@@ -128,6 +149,8 @@ impl FsOps for Procfs {
             id if pid_from_mem_id(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE | 0o600)),
             id if pid_from_maps_id(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE)),
             id if pid_from_exe_id(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Symlink, PROCFS_SYMLINK_MODE)),
+            id if pid_from_fd_dir(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE)),
+            id if pid_from_fd_id(id).is_some() => StepOutcome::done(InodeMeta::new(InodeKind::Symlink, PROCFS_SYMLINK_MODE)),
             _ => StepOutcome::err(Errno::ENOENT.into()),
         }
     }
@@ -153,6 +176,7 @@ impl FsOps for Procfs {
                 (b"mem", pid_mem_id(pid), InodeKind::Regular),
                 (b"maps", pid_maps_id(pid), InodeKind::Regular),
                 (b"exe", pid_exe_id(pid), InodeKind::Symlink),
+                (b"fd", pid_fd_dir_id(pid), InodeKind::Directory),
             ];
             let fi = idx.saturating_sub(2);
             if fi < files.len() {
@@ -209,6 +233,17 @@ impl FsOps for Procfs {
             // v1: /proc/self always points to pid 1.
             // Full implementation requires caller pid context.
             StepOutcome::done(alloc::boxed::Box::from(&b"1"[..]))
+        } else if let Some((pid, fd_num)) = pid_from_fd_id(id) {
+            // /proc/<pid>/fd/N — symlink target is the path of the open file.
+            let Some(proc) = process::process_by_pid(pid) else {
+                return StepOutcome::err(Errno::ENOENT.into());
+            };
+            let Some(_open_file) = proc.fd(fd_num) else {
+                return StepOutcome::err(Errno::ENOENT.into());
+            };
+            // v1: render as "fd:N" since we don't have reverse-path from OpenFile.
+            let target = alloc::format!("anon_inode:[{}]", fd_num);
+            StepOutcome::done(target.into_bytes().into_boxed_slice())
         } else if let Some(pid) = pid_from_exe_id(id) {
             let Some(proc) = process::process_by_pid(pid) else {
                 return StepOutcome::err(Errno::ENOENT.into());
