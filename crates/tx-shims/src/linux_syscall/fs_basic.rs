@@ -1122,8 +1122,8 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         Some(d) => d,
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
-    let meta = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        cwd.rnode().meta()
+    let (meta, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
+        (cwd.rnode().meta(), cwd.rnode().fs_object_id())
     } else {
         let result = {
             let guard = step_engine::guard();
@@ -1138,14 +1138,12 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             step_engine::drive_oneshot(&mut op, &mut script_ctx)
         };
         match result {
-            Ok(m) => m,
+            Ok((m, id)) => (m, id),
             Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
         }
     };
 
-    let rnode = cwd.rnode();
-    let ino = rnode.fs_object_id().as_u64();
-    let stat = inode_meta_to_stat(&meta, ino, 0);
+    let stat = inode_meta_to_stat(&meta, ino.as_u64(), 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
         return SyscallResult::Error(errno_to_i32(errno));
