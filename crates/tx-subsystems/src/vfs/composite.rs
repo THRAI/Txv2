@@ -25,10 +25,9 @@
 use alloc::boxed::Box;
 
 use crate::execution::Guard;
-use crate::page_backed::adapter::step_engine::PageProgress;
 use crate::page_backed::FsPageBacking;
 use crate::vfs::adapter::step_engine::{
-    Cap, NoProgress, OneShotStepOp, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
+    self, Cap, NoProgress, OneShotStepOp, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
     SubjectIdentity,
 };
 use crate::vfs::{Credential, DEntry, FsObjectId, FsOps, InlineName, InodeMeta};
@@ -59,7 +58,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChmodOp<'a> {
                 let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
-                    _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                    _ => return StepOutcome::err(step_engine::Errno::EIO),
                 };
                 self.target = Some(d.clone());
                 d
@@ -99,7 +98,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChownOp<'a> {
                 let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
-                    _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                    _ => return StepOutcome::err(step_engine::Errno::EIO),
                 };
                 self.target = Some(d.clone());
                 d
@@ -139,7 +138,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for AccessOp<'a> {
         match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
             StepOutcome::Done(_d) => StepOutcome::done(()),
             StepOutcome::Err(e) => StepOutcome::err(e),
-            _ => StepOutcome::err(crate::execution::Errno::EIO),
+            _ => StepOutcome::err(step_engine::Errno::EIO),
         }
     }
 }
@@ -175,12 +174,12 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MkdirOp<'a> {
                     match walker::step_walk(rooted_at, parent_path, self.cred, self.guard) {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
-                        _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                        _ => return StepOutcome::err(step_engine::Errno::EIO),
                     }
                 };
                 let name = match InlineName::new(name_bytes) {
                     Ok(n) => n,
-                    Err(_) => return StepOutcome::err(crate::execution::Errno::ENAMETOOLONG),
+                    Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
                 };
                 self.parent = Some((parent_dentry.clone(), name.clone()));
                 (parent_dentry, name)
@@ -188,13 +187,18 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MkdirOp<'a> {
         };
         let fs_ops =
             walker::fs_ops_for(&parent, self.guard).expect("NoFsOps for MkdirOp");
-        fs_ops.mkdir(
+        match fs_ops.mkdir(
             parent.rnode().fs_object_id(),
             name.as_bytes(),
             self.mode,
             self.cred,
             self.guard,
-        )
+        ) {
+            StepOutcome::Done(_id) => StepOutcome::Done(()),
+            StepOutcome::Err(e) => StepOutcome::Err(e),
+            StepOutcome::Continue { progress: _ } => StepOutcome::Continue { progress: NoProgress },
+            StepOutcome::Yield { progress: _, shape } => StepOutcome::Yield { progress: NoProgress, shape },
+        }
     }
 }
 
@@ -225,7 +229,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for UnlinkOp<'a> {
                     match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
-                        _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                        _ => return StepOutcome::err(step_engine::Errno::EIO),
                     };
                 let parent_dentry = child_dentry
                     .parent_hint()
@@ -279,12 +283,12 @@ impl<'a, I: SubjectIdentity> StepOp<I> for SymlinkOp<'a> {
                     match walker::step_walk(rooted_at, parent_path, self.cred, self.guard) {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
-                        _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                        _ => return StepOutcome::err(step_engine::Errno::EIO),
                     }
                 };
                 let name = match InlineName::new(name_bytes) {
                     Ok(n) => n,
-                    Err(_) => return StepOutcome::err(crate::execution::Errno::ENAMETOOLONG),
+                    Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
                 };
                 self.parent_and_name = Some((parent_dentry.clone(), name.clone()));
                 (parent_dentry, name)
@@ -292,13 +296,18 @@ impl<'a, I: SubjectIdentity> StepOp<I> for SymlinkOp<'a> {
         };
         let fs_ops =
             walker::fs_ops_for(&parent, self.guard).expect("NoFsOps for SymlinkOp");
-        fs_ops.symlink(
+        match fs_ops.symlink(
             parent.rnode().fs_object_id(),
             name.as_bytes(),
             self.target,
             self.cred,
             self.guard,
-        )
+        ) {
+            StepOutcome::Done(_id) => StepOutcome::Done(()),
+            StepOutcome::Err(e) => StepOutcome::Err(e),
+            StepOutcome::Continue { progress: _ } => StepOutcome::Continue { progress: NoProgress },
+            StepOutcome::Yield { progress: _, shape } => StepOutcome::Yield { progress: NoProgress, shape },
+        }
     }
 }
 
@@ -334,7 +343,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LinkOp<'a> {
                 ) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
-                    _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                    _ => return StepOutcome::err(step_engine::Errno::EIO),
                 };
                 let target_id = old_dentry.rnode().fs_object_id();
                 let (new_parent_path, new_name_bytes) = split_parent_and_name(self.newpath);
@@ -344,12 +353,12 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LinkOp<'a> {
                     match walker::step_walk(rooted_at, new_parent_path, self.cred, self.guard) {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
-                        _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                        _ => return StepOutcome::err(step_engine::Errno::EIO),
                     }
                 };
                 let new_name = match InlineName::new(new_name_bytes) {
                     Ok(n) => n,
-                    Err(_) => return StepOutcome::err(crate::execution::Errno::ENAMETOOLONG),
+                    Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
                 };
                 self.state = Some((target_id, new_parent.clone(), new_name.clone()));
                 (target_id, new_parent, new_name)
@@ -402,12 +411,12 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
                     ) {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
-                        _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                        _ => return StepOutcome::err(step_engine::Errno::EIO),
                     }
                 };
                 let old_name = match InlineName::new(old_name_bytes) {
                     Ok(n) => n,
-                    Err(_) => return StepOutcome::err(crate::execution::Errno::ENAMETOOLONG),
+                    Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
                 };
                 let (new_parent_path, new_name_bytes) = split_parent_and_name(self.newpath);
                 let new_parent = if new_parent_path.is_empty() {
@@ -416,12 +425,12 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
                     match walker::step_walk(rooted_at, new_parent_path, self.cred, self.guard) {
                         StepOutcome::Done(d) => d,
                         StepOutcome::Err(e) => return StepOutcome::err(e),
-                        _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                        _ => return StepOutcome::err(step_engine::Errno::EIO),
                     }
                 };
                 let new_name = match InlineName::new(new_name_bytes) {
                     Ok(n) => n,
-                    Err(_) => return StepOutcome::err(crate::execution::Errno::ENAMETOOLONG),
+                    Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
                 };
                 self.state = Some((
                     old_parent.clone(),
@@ -461,17 +470,17 @@ pub struct TruncateOp<'a> {
 
 impl<'a, I: SubjectIdentity> StepOp<I> for TruncateOp<'a> {
     type Output = ();
-    type Progress = PageProgress;
+    type Progress = NoProgress;
 
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), PageProgress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         let target = match self.target.take() {
             Some(d) => d,
             None => {
                 let rooted_at = self.rooted_at.clone();
                 let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
                     StepOutcome::Done(d) => d,
-                    StepOutcome::Err(e) => return StepOutcome::map_err(e),
-                    _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                    StepOutcome::Err(e) => return StepOutcome::err(e),
+                    _ => return StepOutcome::err(step_engine::Errno::EIO),
                 };
                 self.target = Some(d.clone());
                 d
@@ -481,7 +490,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for TruncateOp<'a> {
             let weak = target.rnode().containing_mount_weak();
             match weak.and_then(|w| w.upgrade(self.guard)) {
                 Some(mp) => mp.fs_page_backing().clone(),
-                None => return StepOutcome::err(crate::execution::Errno::ENODEV),
+                None => return StepOutcome::err(step_engine::Errno::ENODEV),
             }
         };
         page_backing.truncate(target.rnode().fs_object_id(), self.length, self.guard)
@@ -512,7 +521,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for StatOp<'a> {
                 let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
-                    _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                    _ => return StepOutcome::err(step_engine::Errno::EIO),
                 };
                 self.target = Some(d.clone());
                 d
@@ -551,7 +560,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LstatOp<'a> {
                 let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
-                    _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                    _ => return StepOutcome::err(step_engine::Errno::EIO),
                 };
                 self.target = Some(d.clone());
                 d
@@ -592,7 +601,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for StatxOp<'a> {
                 let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
-                    _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                    _ => return StepOutcome::err(step_engine::Errno::EIO),
                 };
                 self.target = Some(d.clone());
                 d
@@ -630,7 +639,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ReadLinkOp<'a> {
                 let d = match walker::step_walk(rooted_at, self.path, self.cred, self.guard) {
                     StepOutcome::Done(d) => d,
                     StepOutcome::Err(e) => return StepOutcome::err(e),
-                    _ => return StepOutcome::err(crate::execution::Errno::EIO),
+                    _ => return StepOutcome::err(step_engine::Errno::EIO),
                 };
                 self.target = Some(d.clone());
                 d

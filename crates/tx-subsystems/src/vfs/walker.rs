@@ -503,7 +503,7 @@ pub(crate) fn fs_ops_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<
 /// Build a `Cap<DEntry>` over a mount's root RNode. Used when the
 /// walker crosses a mount boundary or restarts from the namespace
 /// root for an absolute symlink target.
-fn dentry_for_mount_root(
+pub(crate) fn dentry_for_mount_root(
     mount: &Cap<MountIdentity>,
     mount_point: Option<&Cap<DEntry>>,
 ) -> Result<Cap<DEntry>, Errno> {
@@ -516,7 +516,7 @@ fn dentry_for_mount_root(
 
 /// Walk `from`'s parent-hint chain to find the namespace's root
 /// dentry. Returns `from` itself when no parent hint is installed.
-fn mount_root_dentry(from: &Cap<DEntry>) -> Cap<DEntry> {
+pub(crate) fn mount_root_dentry(from: &Cap<DEntry>) -> Cap<DEntry> {
     let mut cursor: Cap<DEntry> = from.clone();
     while let Some(parent_cap) = cursor.parent_hint() {
         cursor = parent_cap;
@@ -527,7 +527,7 @@ fn mount_root_dentry(from: &Cap<DEntry>) -> Cap<DEntry> {
 /// Resolve the `Cap<MountPayload>` in scope for a given dentry by
 /// upgrading its RNode's containing-mount weak. Used as the parent
 /// key for `mount::mount_for` lookups during a walk.
-fn mount_payload_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Cap<MountPayload>> {
+pub(crate) fn mount_payload_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Cap<MountPayload>> {
     let weak: Weak<MountPayload> = dentry.rnode().containing_mount_weak()?;
     weak.upgrade(guard)
 }
@@ -536,7 +536,7 @@ fn mount_payload_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Cap<
 /// `..` ascend-only-up-to-mount-root rule. The comparison is
 /// approximate (it does not check zone identity) but sufficient for
 /// the boot-time chroot-shaped namespace.
-fn is_same_dentry(a: &Cap<DEntry>, b: &Cap<DEntry>) -> bool {
+pub(crate) fn is_same_dentry(a: &Cap<DEntry>, b: &Cap<DEntry>) -> bool {
     a.rnode().fs_object_id() == b.rnode().fs_object_id()
         && a.name().as_bytes() == b.name().as_bytes()
 }
