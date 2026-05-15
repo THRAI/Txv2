@@ -240,6 +240,14 @@ pub(crate) fn fs_ops_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<
     Some(payload.fs_ops().clone())
 }
 
+/// Like [`fs_ops_for`] but takes an `RNode` directly — used by
+/// fd-based ops that don't have a `DEntry` in hand.
+pub(crate) fn fs_ops_for_rnode<'g>(rnode: &Cap<RNode>, guard: &Guard<'g>) -> Option<Arc<dyn FsOps>> {
+    let mount_payload_weak: Weak<MountPayload> = rnode.containing_mount_weak()?;
+    let payload = mount_payload_weak.upgrade(guard)?;
+    Some(payload.fs_ops().clone())
+}
+
 // === walker internals =================================================
 
 /// Build a `Cap<DEntry>` over a mount's root RNode. Used when the

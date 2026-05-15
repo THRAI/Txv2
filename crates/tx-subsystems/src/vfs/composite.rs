@@ -787,6 +787,81 @@ impl<'a, I: SubjectIdentity> StepOp<I> for Getdents64Op<'a> {
 }
 
 // ============================================================================
+// Getdents64FdOp — fd-based getdents64
+// ============================================================================
+
+/// `getdents64` fd-based op: loops `FsOps::readdir` into a
+/// caller-supplied buffer as `linux_dirent64` records.
+///
+/// Takes an already-opened `OpenFile` cap (resolved from fd by the
+/// syscall layer).  Each `step()` fills one entry; EOF returns 0.
+pub struct Getdents64FdOp<'a> {
+    pub file: &'a Cap<crate::vfs::structure::OpenFile>,
+    pub guard: &'a Guard<'a>,
+    pub buf: &'a mut [u8],
+    cursor: u64,
+    pos: usize,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for Getdents64FdOp<'a> {
+    type Output = usize;
+    type Progress = NoProgress;
+
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<usize, NoProgress> {
+        let rnode = self.file.rnode();
+        let fs_object_id = rnode.fs_object_id();
+        let fs_ops = walker::fs_ops_for_rnode(rnode, self.guard)
+            .expect("NoFsOps for Getdents64FdOp");
+
+        let cursor = crate::vfs::structure::DirCursor::from_u64(self.cursor);
+
+        match fs_ops.readdir(fs_object_id, cursor, self.guard) {
+            StepOutcome::Done(Some((entry, next_cursor))) => {
+                let name_bytes = entry.name.as_bytes();
+                let reclen = 19 + name_bytes.len() + 1;
+                let aligned = (reclen + 7) & !7;
+
+                if self.pos + aligned > self.buf.len() {
+                    self.cursor = cursor.as_u64();
+                    return StepOutcome::done(self.pos);
+                }
+
+                let buf = &mut self.buf[self.pos..];
+                buf[0..8].copy_from_slice(&entry.fs_object_id.as_u64().to_le_bytes());
+                buf[8..16].copy_from_slice(&next_cursor.as_u64().to_le_bytes());
+                buf[16..18].copy_from_slice(&(aligned as u16).to_le_bytes());
+                buf[18] = match entry.kind {
+                    crate::vfs::structure::InodeKind::Regular => 8u8,
+                    crate::vfs::structure::InodeKind::Directory => 4u8,
+                    crate::vfs::structure::InodeKind::Symlink => 10u8,
+                    crate::vfs::structure::InodeKind::CharDevice => 2u8,
+                    crate::vfs::structure::InodeKind::BlockDevice => 6u8,
+                    crate::vfs::structure::InodeKind::Fifo => 1u8,
+                    crate::vfs::structure::InodeKind::Socket => 12u8,
+                };
+                buf[19..19 + name_bytes.len()].copy_from_slice(name_bytes);
+                buf[19 + name_bytes.len()] = 0;
+
+                self.pos += aligned;
+                self.cursor = next_cursor.as_u64();
+                StepOutcome::done(self.pos)
+            }
+            StepOutcome::Done(None) => {
+                let written = self.pos;
+                self.pos = 0;
+                StepOutcome::done(written)
+            }
+            StepOutcome::Err(e) => StepOutcome::err(e),
+            StepOutcome::Continue { .. } => StepOutcome::done(self.pos),
+            StepOutcome::Yield { shape, .. } => StepOutcome::Yield {
+                progress: NoProgress,
+                shape,
+            },
+        }
+    }
+}
+
+// ============================================================================
 // PpollOp — ppoll (single-fd v1)
 // ============================================================================
 
