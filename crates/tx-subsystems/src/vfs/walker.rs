@@ -492,7 +492,7 @@ fn materialise_child_rnode_v3<'g>(
 /// upgrading its RNode's containing-mount weak and reading
 /// `MountPayload::fs_ops` directly. The field is populated at
 /// mount-publication time.
-fn fs_ops_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Arc<dyn FsOps>> {
+pub(crate) fn fs_ops_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Arc<dyn FsOps>> {
     let mount_payload_weak: Weak<MountPayload> = dentry.rnode().containing_mount_weak()?;
     let payload = mount_payload_weak.upgrade(guard)?;
     Some(payload.fs_ops().clone())
