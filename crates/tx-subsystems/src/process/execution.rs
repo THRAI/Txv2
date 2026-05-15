@@ -1589,8 +1589,8 @@ mod step_op_wraps {
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
-            StepOutcome::Done(Err(SetpgidError::Unimplemented)) => {}
-            other => panic!("expected Done(Err(Unimplemented)), got {other:?}"),
+            StepOutcome::Err(v3_errno) if Into::<crate::execution::Errno>::into(v3_errno) == crate::execution::Errno::ENOSYS => {}
+            other => panic!("expected Err(crate::execution::Errno::ENOSYS), got {other:?}"),
         }
     }
 
@@ -1603,7 +1603,7 @@ mod step_op_wraps {
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
-            StepOutcome::Done(Ok(sid)) => {
+            StepOutcome::Done(sid) => {
                 assert_eq!(sid.0, child.pid.0);
             }
             other => panic!("expected Done(Ok(sid)), got {other:?}"),
