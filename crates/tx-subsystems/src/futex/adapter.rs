@@ -79,7 +79,9 @@ pub mod wait_routing {
     ///
     /// Delegates to `tx_substrate::wake::new_source`.
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
-        tx_substrate::wake::new_source(source_id)
+        let source = tx_substrate::wake::new_source(source_id);
+        tx_substrate::wake::register_source(Arc::clone(&source));
+        source
     }
 
     /// Fire the legacy `Channel` for one futex bucket — D2

@@ -599,71 +599,60 @@ pub(super) fn vmmap_error_to_i32(error: VmMapError) -> i32 {
 ///    showed the word changed" (return `0` per the WAIT contract)
 ///    via the `parked` flag tracked across loop iterations.
 /// 5. Other `Err(errno)` → return `-errno`.
-pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let uaddr = args[0];
     let op_full = args[1] as u32;
     let val = args[2] as u32;
-    // args[3] = timeout pointer (ignored — Slice 4 carryover).
-    // args[4] = uaddr2 (REQUEUE-family only).
-    // args[5] = val3 (BITSET-family only).
 
     let op = op_full & FUTEX_CMD_MASK;
 
     match op {
         FUTEX_WAIT => {
-            // Track whether we've parked at least once. EAGAIN
-            // from `step_futex_wait` means "user word != val". If
-            // parked is false, this is the first-call mismatch
-            // (return -EAGAIN). If parked is true, this is a
-            // post-wake re-check showing the word changed (the
-            // wake was meaningful — return 0).
+            use tx_subsystems::futex::FutexWaitOp;
+            use tx_substrate::step::DriveMode;
+            use tx_scripts::drive;
+
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mailbox_arc = script_ctx.mailbox().cloned();
+            let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+            let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+
+            // Loop: drive() parks on the futex bucket's WaitSource
+            // via resolve_on_wait_source.  EAGAIN on first
+            // mismatch means "user word != val"; after parking at
+            // least once, EAGAIN means the wake was meaningful
+            // (word changed → return 0).
             let mut parked = false;
             loop {
-                let outcome = {
-                    let guard = step_engine::guard();
-                    tx_subsystems::futex::step_futex_wait(uaddr, val, &guard)
+                let guard = step_engine::guard();
+                let mut op = FutexWaitOp {
+                    uaddr,
+                    val,
+                    guard: &guard,
                 };
-                use step_engine::{StepOutcome as V3, YieldShape};
-                match outcome {
-                    V3::Done(()) => {
-                        return SyscallResult::Return(0);
-                    }
-                    V3::Continue { .. } => {
-                        // No-progress retry hint: re-poll immediately.
-                        continue;
-                    }
-                    V3::Yield {
-                        shape:
-                            YieldShape::OnWaitSource {
-                                source: carrier,
-                                interests,
-                            },
-                        ..
-                    } => {
-                        parked = true;
-                        let token = tx_subsystems::execution::WaitToken::new(
-                            carrier.raw(),
-                            interests.raw(),
-                        );
-                        if let Some(future) = wait_source::wait_on_token(token) {
-                            let _ = future.await;
-                        }
-                        continue;
-                    }
-                    V3::Yield { .. } => {
-                        return SyscallResult::Error(EIO_VALUE);
-                    }
-                    V3::Err(v3_errno) => {
-                        let errno: Errno = v3_errno.into();
-                        return if errno == Errno::EAGAIN {
+                match drive(
+                    op,
+                    &mut script_ctx,
+                    DriveMode::Waiting,
+                    mailbox_arc.as_ref(),
+                    delegate_registry_arc.as_deref(),
+                    timer_wheel_arc.as_ref(),
+                )
+                .await
+                {
+                    Ok(()) => return SyscallResult::Return(0),
+                    Err(v3errno) => {
+                        let errno: Errno = v3errno.into();
+                        if errno == Errno::EAGAIN {
                             if parked {
-                                SyscallResult::Return(0)
+                                return SyscallResult::Return(0);
                             } else {
-                                SyscallResult::Error(errno_to_i32(Errno::EAGAIN))
+                                return SyscallResult::Error(
+                                    errno_to_i32(Errno::EAGAIN),
+                                );
                             }
-                        } else {
-                            SyscallResult::Error(errno_to_i32(errno))
-                        };
+                        }
+                        return SyscallResult::Error(errno_to_i32(errno));
                     }
                 }
             }
