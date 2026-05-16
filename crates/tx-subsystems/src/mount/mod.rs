@@ -308,19 +308,68 @@ impl Entity for MountIdentity {
 #[derive(Debug)]
 pub struct MountNamespace {
     root: Cap<MountIdentity>,
+    mounts: SpinMutex<Vec<MountTableEntry>>,
 }
 
 impl MountNamespace {
     pub fn new(root: Cap<MountIdentity>) -> Self {
-        Self { root }
+        Self { root, mounts: SpinMutex::new(Vec::new()) }
     }
 
     pub fn new_cap(root: Cap<MountIdentity>) -> Result<Cap<Self>, ZoneError> {
         runtime::sign(Self::new(root))
     }
 
-    pub fn root(&self) -> &Cap<MountIdentity> {
-        &self.root
+    pub fn root(&self) -> &Cap<MountIdentity> { &self.root }
+
+    pub fn register_mount(&self, parent_payload: &Cap<MountPayload>, child_fs_object_id: FsObjectId, mount: Cap<MountIdentity>) {
+        let ptr = cap_payload_ptr(parent_payload);
+        let mut t = self.mounts.lock();
+        for e in t.iter_mut() {
+            if e.parent_payload_ptr == ptr && e.child_fs_object_id == child_fs_object_id {
+                e.mount = IdentitySlot::from_cap(mount); return;
+            }
+        }
+        t.push(MountTableEntry { parent_payload_ptr: ptr, child_fs_object_id, mount: IdentitySlot::from_cap(mount) });
+    }
+
+    pub fn mount_for(&self, parent_payload: &Cap<MountPayload>, child_fs_object_id: FsObjectId) -> Option<Cap<MountIdentity>> {
+        let ptr = cap_payload_ptr(parent_payload);
+        for e in self.mounts.lock().iter() {
+            if e.parent_payload_ptr == ptr && e.child_fs_object_id == child_fs_object_id {
+                return Some(e.mount.clone_cap());
+            }
+        }
+        None
+    }
+
+    pub fn snapshot_mounts(&self) -> alloc::vec::Vec<MountSnapshot> {
+        let guard = crate::vfs::adapter::step_engine::guard();
+        self.mounts.lock().iter().filter_map(|e| {
+            let m = e.mount.clone_cap();
+            let d = m.mountpoint()?;
+            let path = render_dentry_path(d).unwrap_or_else(|| b"/?".to_vec());
+            let p = m.payload_cap().ok()?;
+            Some(MountSnapshot { source: p.source_label, mountpoint_path: path, fstype: p.fstype, flags: p.options.flags })
+        }).collect()
+    }
+
+    pub fn umount(&self, target: &Cap<DEntry>, pp: &Cap<MountPayload>) -> Result<(), Errno> {
+        let ptr = cap_payload_ptr(pp);
+        let id = target.rnode().fs_object_id();
+        let mut t = self.mounts.lock();
+        if let Some(i) = t.iter().position(|e| e.parent_payload_ptr == ptr && e.child_fs_object_id == id) {
+            t.remove(i); Ok(())
+        } else { Err(Errno::EINVAL) }
+    }
+
+    pub fn clone_ns(&self) -> Result<Cap<Self>, ZoneError> {
+        let cloned: Vec<MountTableEntry> = self.mounts.lock().iter().map(|e| MountTableEntry {
+            parent_payload_ptr: e.parent_payload_ptr,
+            child_fs_object_id: e.child_fs_object_id,
+            mount: e.mount.clone(),
+        }).collect();
+        runtime::sign(Self { root: self.root.clone(), mounts: SpinMutex::new(cloned) })
     }
 }
 
@@ -381,6 +430,7 @@ pub struct MountOutput {
 /// `MountPayload` `Cap`'s underlying allocation — sound to use as a
 /// stable id because mount payloads are zone-allocated and never
 /// reused while live caps exist.
+#[derive(Debug)]
 struct MountTableEntry {
     parent_payload_ptr: usize,
     child_fs_object_id: FsObjectId,
