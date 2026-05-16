@@ -294,6 +294,7 @@ pub fn bootstrap_init_process(
 /// child identity.
 pub fn step_fork<P: PmapIf>(
     parent: &Cap<ProcessIdentity>,
+    clone_vm: bool,
 ) -> Result<Cap<ProcessIdentity>, ForkError> {
     // observe
     // upgrade
@@ -335,9 +336,13 @@ pub fn step_fork<P: PmapIf>(
     };
     let parent_pgrp = parent.pgrp.lock().clone();
 
-    // Fork the address space, then publish into the AddressSpace zone.
-    let child_aspace = AddressSpace::fork_aspace::<P>(&parent_aspace)?;
-    let child_aspace_cap = step_engine::sign(child_aspace)?;
+    // Address space: fork (CoW clone) or share (CLONE_VM).
+    let child_aspace_cap = if clone_vm {
+        parent_aspace.clone()
+    } else {
+        let child_aspace = AddressSpace::fork_aspace::<P>(&parent_aspace)?;
+        step_engine::sign(child_aspace)?
+    };
 
     // Identity first (payload=None) so the leader thread can hold a
     // Weak<ProcessIdentity> back-reference.
@@ -1130,6 +1135,7 @@ impl<T: 'static> WeakObserveExt<T> for Weak<T> {
 /// `Vm` / `Zone` variants without an Errno crush.
 pub struct ForkOp<'a, P: PmapIf> {
     pub parent: &'a Cap<ProcessIdentity>,
+    pub clone_vm: bool,
     pub _pmap: core::marker::PhantomData<P>,
 }
 
@@ -1137,7 +1143,7 @@ impl<'a, P: PmapIf, I: SubjectIdentity> StepOp<I> for ForkOp<'a, P> {
     type Output = Result<Cap<ProcessIdentity>, ForkError>;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_fork::<P>(self.parent))
+        StepOutcome::Done(step_fork::<P>(self.parent, self.clone_vm))
     }
 }
 
@@ -1531,7 +1537,7 @@ mod step_op_wraps {
     fn exit_group_op_delegates_to_step_exit_group() {
         let _g = setup();
         let parent = bootstrap();
-        let child = step_fork::<TestPmap>(&parent).expect("fork");
+        let child = step_fork::<TestPmap>(&parent, false).expect("fork");
         let mut op = ExitGroupOp {
             process: &child,
             status: ExitStatus::Exited(0),
@@ -1547,7 +1553,7 @@ mod step_op_wraps {
     fn exit_group_with_signal_op_delegates_to_step_exit_group_with_signal() {
         let _g = setup();
         let parent = bootstrap();
-        let child = step_fork::<TestPmap>(&parent).expect("fork");
+        let child = step_fork::<TestPmap>(&parent, false).expect("fork");
         let mut op = ExitGroupWithSignalOp {
             process: &child,
             sig: Signum::SIGKILL,
@@ -1613,7 +1619,7 @@ mod step_op_wraps {
     fn setsid_op_delegates_to_step_setsid() {
         let _g = setup();
         let parent = bootstrap();
-        let child = step_fork::<TestPmap>(&parent).expect("fork");
+        let child = step_fork::<TestPmap>(&parent, false).expect("fork");
         let mut op = SetsidOp { target: &child };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);

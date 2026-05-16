@@ -257,6 +257,7 @@ pub const NR_CLONE: u64 = 220;
 pub const SIGCHLD: u64 = 17;
 
 pub const CLONE_SETTLS: u64 = 0x80000;
+pub const CLONE_VM: u64 = 0x100;
 
 /// `getppid()`. Linux generic ABI `__NR_getppid`. Wraps
 /// `ProcessIdentity::parent_pid()`. Returns `0` (`Pid::RESERVED`)

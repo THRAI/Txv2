@@ -1142,6 +1142,8 @@ impl OpenFile {
     /// `ioctl(UFFDIO_*)` paths branch on this — phase 0 only
     /// exposes it for the fd-table scaffold tests to verify the
     /// install/retrieve round-trip preserves the inner cap identity.
+    pub fn ufd(&self) -> Option<&Cap<UserfaultFd>> {
+        match &self.backing {
             OpenFileBacking::Ufd { ufd } => Some(ufd),
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::AioContext { .. }

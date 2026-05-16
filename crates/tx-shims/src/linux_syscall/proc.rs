@@ -235,8 +235,9 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     if flags & SIGCHLD == 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
+    let clone_vm = (flags & CLONE_VM) != 0;
     let clone_settls = (flags & CLONE_SETTLS) != 0;
-    let allowed_mask = SIGCHLD | CLONE_SETTLS;
+    let allowed_mask = SIGCHLD | CLONE_SETTLS | CLONE_VM;
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
@@ -275,6 +276,7 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let fork_result = {
         let mut op = tx_subsystems::process::execution::ForkOp::<P> {
             parent: &ctx.process,
+            clone_vm,
             _pmap: core::marker::PhantomData,
         };
         match op.step(&mut script_ctx) {

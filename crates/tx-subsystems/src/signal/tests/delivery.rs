@@ -493,7 +493,7 @@ fn sigcont_does_not_enter_thread_pending() {
 fn route_gewalt_sigkill_zombifies_target_only() {
     let _g = setup();
     let parent = fresh_init();
-    let child = crate::process::step_fork::<TestPmap>(&parent).expect("fork");
+    let child = crate::process::step_fork::<TestPmap>(&parent, false).expect("fork");
 
     // SIGKILL on the parent zombifies only the parent — fork's
     // threads are owned by the child process and are independent.
@@ -599,7 +599,7 @@ fn ast_dispatch_deliver_handler_recognised_but_unrealised() {
 fn step_kill_pgrp_does_not_mirror_gewalt_to_group_pending() {
     let _g = setup();
     let parent = fresh_init();
-    let _child = crate::process::step_fork::<TestPmap>(&parent).expect("fork");
+    let _child = crate::process::step_fork::<TestPmap>(&parent, false).expect("fork");
     let pgrp = parent.pgrp_cap();
 
     let _ = crate::signal::step_kill_pgrp(&pgrp, Signum::SIGSTOP);
