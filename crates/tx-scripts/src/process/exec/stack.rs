@@ -54,6 +54,15 @@ const AT_GID: u64 = 13;
 const AT_EGID: u64 = 14;
 const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
+const AT_HWCAP: u64 = 16;
+const AT_HWCAP2: u64 = 26;
+const AT_PLATFORM: u64 = 15;
+const AT_CLKTCK: u64 = 17;
+const AT_EXECFN: u64 = 31;
+const AT_FLAGS: u64 = 8;
+const AT_SYSINFO_EHDR: u64 = 33;
+pub(crate) const CLKTCK_VALUE: u64 = 100;
+
 
 /// Auxv pair size in bytes (`a_type: u64, a_val: u64`).
 const AUXV_PAIR_SIZE: usize = 16;
@@ -80,7 +89,7 @@ const STACK_ALIGN: usize = 16;
 /// 16 bytes, so the upper-table region grew by 7 × 16 = 112 bytes
 /// over the pre-Part-6 baseline; the existing alignment helper handles
 /// the size change automatically.
-const AUXV_PAIR_COUNT: usize = 13;
+const AUXV_PAIR_COUNT: usize = 20;
 
 /// Composed stack image ready to write into a detached `AddressSpace`.
 pub struct UserStackImage {
@@ -156,6 +165,15 @@ pub struct AuxvFacts {
     /// pass deterministic values (`[0; 16]` or test-chosen bytes)
     /// to keep image-layout assertions stable.
     pub at_random_bytes: [u8; 16],
+    pub at_hwcap: u64,
+    pub at_hwcap2: u64,
+    pub at_platform: Option<u64>,
+    pub platform_string: &'static [u8],
+    pub at_clktck: u64,
+    pub at_execfn: Option<u64>,
+    pub execfn_string: &'static [u8],
+    pub at_flags: u64,
+    pub at_sysinfo_ehdr: Option<u64>,
 }
 
 /// Build the initial userspace stack image for execve.
@@ -395,6 +413,13 @@ pub fn build_initial_user_stack(
         (AT_EGID, auxv_facts.at_egid),
         (AT_SECURE, auxv_facts.at_secure),
         (AT_RANDOM, at_random_base),
+        (AT_HWCAP, auxv_facts.at_hwcap),
+        (AT_HWCAP2, auxv_facts.at_hwcap2),
+        (AT_PLATFORM, auxv_facts.at_platform.unwrap_or(0)),
+        (AT_CLKTCK, auxv_facts.at_clktck),
+        (AT_SYSINFO_EHDR, auxv_facts.at_sysinfo_ehdr.unwrap_or(0)),
+        (AT_EXECFN, auxv_facts.at_execfn.unwrap_or(0)),
+        (AT_FLAGS, auxv_facts.at_flags),
         (AT_NULL, 0),
     ];
     for (a_type, a_val) in auxv_entries {
@@ -475,6 +500,15 @@ mod tests {
             at_egid: 0,
             at_secure: 0,
             at_random_bytes: [0u8; 16],
+            at_hwcap: 0,
+            at_hwcap2: 0,
+            at_platform: None,
+            platform_string: b"",
+            at_clktck: CLKTCK_VALUE,
+            at_execfn: None,
+            execfn_string: b"",
+            at_flags: 0,
+            at_sysinfo_ehdr: None,
         }
     }
 
@@ -565,7 +599,14 @@ mod tests {
         assert_eq!(pair(9), (AT_EGID, 0));
         assert_eq!(pair(10), (AT_SECURE, 0));
         assert_eq!(pair(11).0, AT_RANDOM);
-        assert_eq!(pair(12), (AT_NULL, 0));
+        assert_eq!(pair(12).0, AT_HWCAP);
+        assert_eq!(pair(13).0, AT_HWCAP2);
+        assert_eq!(pair(14).0, AT_PLATFORM);
+        assert_eq!(pair(15).0, AT_CLKTCK);
+        assert_eq!(pair(16).0, AT_SYSINFO_EHDR);
+        assert_eq!(pair(17).0, AT_EXECFN);
+        assert_eq!(pair(18).0, AT_FLAGS);
+        assert_eq!(pair(19), (AT_NULL, 0));
 
         // AT_RANDOM region is 16 bytes of zero in the image.
         let at_random_ptr = pair(11).1;
@@ -710,7 +751,7 @@ mod tests {
         };
 
         // Thirteen entries (12 facts + AT_NULL terminator).
-        assert_eq!(AUXV_PAIR_COUNT, 13);
+        assert_eq!(AUXV_PAIR_COUNT, 20);
         assert_eq!(pair(0).0, AT_PHDR);
         assert_eq!(pair(1).0, AT_PHENT);
         assert_eq!(pair(2).0, AT_PHNUM);
@@ -723,7 +764,14 @@ mod tests {
         assert_eq!(pair(9).0, AT_EGID);
         assert_eq!(pair(10).0, AT_SECURE);
         assert_eq!(pair(11).0, AT_RANDOM);
-        assert_eq!(pair(12), (AT_NULL, 0));
+        assert_eq!(pair(12).0, AT_HWCAP);
+        assert_eq!(pair(13).0, AT_HWCAP2);
+        assert_eq!(pair(14).0, AT_PLATFORM);
+        assert_eq!(pair(15).0, AT_CLKTCK);
+        assert_eq!(pair(16).0, AT_SYSINFO_EHDR);
+        assert_eq!(pair(17).0, AT_EXECFN);
+        assert_eq!(pair(18).0, AT_FLAGS);
+        assert_eq!(pair(19), (AT_NULL, 0));
     }
 
     /// AT_UID lives at index 6 of the auxv table — the first cred-

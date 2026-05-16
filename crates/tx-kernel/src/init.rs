@@ -454,6 +454,18 @@ impl<P: TxPlatform> CoreInit<P> {
         }
 
         Self::mount_rootfs_tmpfs();
+        // Initialise the vDSO image and high-res clock parameters.
+        // Must run after the substrate page allocator is ready.
+        if let Err(e) = crate::vdso::init::<P>() {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":vdso:init:fail:");
+            tx_hal::console_write_str::<P>(match e {
+                tx_subsystems::vdso::VdsoInitError::ImageNotAvailable => "stub",
+                tx_subsystems::vdso::VdsoInitError::Alloc => "alloc",
+                tx_subsystems::vdso::VdsoInitError::DirectMap => "dmap",
+            });
+            tx_hal::console_write_str::<P>("\n");
+        }
     }
 
     fn mount_rootfs_ext4_vda() -> bool {
@@ -962,7 +974,15 @@ impl<P: TxPlatform> CoreInit<P> {
     ///    `thread.payload().saved_user_context` with the fixture's
     ///    entry-point + initial stack pointer.
     pub(crate) fn run_bootstrap_exec_for_init() {
-        Self::register_init_fixture_into_tmpfs();
+        // When an initramfs is present, skip the embedded fixture —
+        // the cpio archive supplies its own `/init` (possibly a
+        // dynamically-linked binary needing its shared libraries
+        // from the same archive).  Without an initramfs, fall back
+        // to the embedded fork/wait fixture for CI smoke.
+        let has_initramfs = Self::boot_info().initrd.is_some();
+        if !has_initramfs {
+            Self::register_init_fixture_into_tmpfs();
+        }
         // Shell-prompt roadmap Slice 10 (2026-05-08): when the build
         // script bakes a busybox binary via `TX_BUSYBOX`, also
         // register it at `/bin/sh` so the bootstrap fixture's

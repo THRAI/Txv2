@@ -214,6 +214,9 @@ pub struct ThreadPayload {
     /// "no alternate stack" (deliver on the normal stack).
     /// `Some((base, size))` gives the alternate stack range.
     pub(crate) alt_stack: SpinMutex<Option<(usize, usize)>>,
+    /// `clear_child_tid` pointer from `set_tid_address`.  Written
+    /// atomically to 0 on thread exit when futex wake is supported.
+    pub clear_child_tid: SpinMutex<Option<u64>>,
 }
 
 impl ThreadPayload {
@@ -233,6 +236,7 @@ impl ThreadPayload {
             mailbox: SpinMutex::new(None),
             stopped: core::sync::atomic::AtomicBool::new(false),
             alt_stack: SpinMutex::new(None),
+            clear_child_tid: SpinMutex::new(None),
         }
     }
 

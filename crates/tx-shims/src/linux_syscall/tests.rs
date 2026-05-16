@@ -144,6 +144,12 @@ impl PmapIf for ShimsTestPmap {
 // reproducible, no hardware dependency.
 impl EntropyIf for ShimsTestPmap {}
 
+impl tx_hal::PlatformConfig for ShimsTestPmap {
+    const ARCH: tx_hal::Arch = tx_hal::Arch::Riscv64;
+    const BOARD: &'static str = "shims-test-pmap";
+}
+impl tx_hal::AuxvIf for ShimsTestPmap {}
+
 // Slice 4 of the shell-prompt roadmap (2026-05-07) added a `TimeIf`
 // bound to `dispatch::<P>` so the time-syscall arms can read the
 // platform monotonic clock through `<P as TimeIf>::read_ns()`. The

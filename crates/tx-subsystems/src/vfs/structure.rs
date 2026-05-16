@@ -949,6 +949,18 @@ impl OpenFile {
         step_engine::sign(Self::new(rnode, flags))
     }
 
+    /// Like [`Self::new_cap`] but also records the DEntry that
+    /// `step_open` resolved so `fchdir` can recover it later.
+    pub fn new_cap_with_dentry(
+        rnode: Cap<RNode>,
+        flags: OpenFileFlags,
+        dentry: Cap<DEntry>,
+    ) -> Result<Cap<Self>, ZoneError> {
+        let mut file = Self::new(rnode, flags);
+        file.opendir_dentry = Some(dentry);
+        step_engine::sign(file)
+    }
+
     /// Construct a userfaultfd-backed `OpenFile` (PR-10 phase 0). The
     /// resulting value carries `OpenFileBacking::Ufd { ufd }` and no
     /// `Cap<RNode>` — userfaultfd is a non-VFS fd kind (see D7 §3.7).

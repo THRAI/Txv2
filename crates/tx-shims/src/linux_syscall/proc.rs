@@ -35,6 +35,11 @@ pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
 /// `exit_group(status)` — per `PROCESS_v1` §7.3.2.
 /// PR-3 migration: `ExitGroupOp` is a `OneShotStepOp` — dispatched
 /// via `drive_oneshot` (no reactor, no yield).
+/// `gettid()` — return the callers thread id.
+pub(super) fn sys_gettid(ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Return(ctx.thread.tid.0 as i64)
+}
+
 pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let status = args[0] as i32;
     let mut script_ctx = build_subject_script_ctx(ctx);
@@ -93,7 +98,7 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 // fn) — no `*Op` wrap exists for the exec orchestration today.
 // When `exec_script` gains a StepOp wrap (or is decomposed into a
 // pipeline of wraps), thread `&mut KernelScriptCtx` here.
-pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf>(
+pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -225,10 +230,14 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let flags = args[0];
     let stack = args[1];
 
-    // Validation: bare-SIGCHLD only. Reject any other flag combo
-    // (CLONE_VM, CLONE_VFORK, pthread_create OR-set, zero, etc.) and
-    // any non-zero stack.
-    if flags != SIGCHLD {
+    // Validation: must include SIGCHLD. Only CLONE_SETTLS is
+    // accepted as an additional flag.
+    if flags & SIGCHLD == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let clone_settls = (flags & CLONE_SETTLS) != 0;
+    let allowed_mask = SIGCHLD | CLONE_SETTLS;
+    if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
     if stack != 0 {
@@ -248,6 +257,7 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         .saved_user_context()
         .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
 
+    let tls = if clone_settls { args[3] } else { 0 };
     // PR-9 phase 3b: drive `step_fork::<P>` via the `ForkOp::<P>`
     // StepOp wrap, threading a `&mut KernelScriptCtx`. The wrap lifts
     // the `Result<Cap<...>, ForkError>` into `StepOutcome::Done(inner_result)`
@@ -302,8 +312,8 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         .expect(":clone:no-leader: kernel-invariant violation, fresh child has no leader thread");
 
     // Seed the child's leader trap context with the parent's GPRs
-    // (a0 := 0, pc := pc + 4). Infallible.
-    seed_child_leader_context(&child_thread, &parent_user_ctx);
+    // (a0 := 0, tp := tls when CLONE_SETTLS, pc := pc + 4). Infallible.
+    seed_child_leader_context(&child_thread, &parent_user_ctx, tls as usize);
 
     // Hand the child's leader thread to the reactor. Panics with
     // `:clone:no-reactor-seam` if the boot path didn't install the
@@ -552,7 +562,19 @@ pub(super) fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 ///
 /// TODO(phase-tls): wire `tidptr` through to a per-thread
 /// `clear_child_tid` slot per `THREAD_RUNTIME_v1` §2.6.
-pub(super) fn sys_set_tid_address<'a>(_args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_set_tid_address<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let tidptr = args[0];
+    // Store the clear_child_tid pointer on the thread payload.
+    // NULL clears the slot; otherwise record the userspace address
+    // where a futex wake + zero-write should occur on thread exit.
+    if let Some(payload) = ctx.thread.payload_cap() {
+        let mut slot = payload.clear_child_tid.lock();
+        if tidptr == 0 {
+            *slot = None;
+        } else {
+            *slot = Some(tidptr);
+        }
+    }
     SyscallResult::Return(ctx.thread.tid.0 as i64)
 }
 

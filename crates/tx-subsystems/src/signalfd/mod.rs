@@ -65,6 +65,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
+pub mod ops;
 
 use adapter::step_engine::{
     guard, sign, ByteProgress, Cap, InterestMask, OperationalCapExt, SpinMutex, StepOutcome, V3Errno, WaitSource,

@@ -141,6 +141,12 @@ impl PmapIf for ScriptsTestPmap {
 // reproducible, no hardware dependency.
 impl EntropyIf for ScriptsTestPmap {}
 
+impl tx_hal::PlatformConfig for ScriptsTestPmap {
+    const ARCH: tx_hal::Arch = tx_hal::Arch::Riscv64;
+    const BOARD: &'static str = "scripts-test-pmap";
+}
+impl tx_hal::AuxvIf for ScriptsTestPmap {}
+
 // ---------------------------------------------------------------------------
 // Minimal in-test FS that knows how to materialise regular files as
 // `RNodeBacking::PageBacked { pc }` over a kernel-built PageContainer.

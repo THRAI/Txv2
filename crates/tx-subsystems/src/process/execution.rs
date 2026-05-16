@@ -435,15 +435,30 @@ const CLONE_CHILD_RETURN_REG_INDEX: usize = 4;
 #[cfg(not(target_arch = "loongarch64"))]
 const CLONE_CHILD_RETURN_REG_INDEX: usize = 10;
 
+/// Register index for the thread pointer (`tp` on RV64 = x4,
+/// r2 on LoongArch64). Used to seed the child's TLS pointer when
+/// `clone()` passes `CLONE_SETTLS`.
+#[cfg(target_arch = "loongarch64")]
+const TLS_REG_INDEX: usize = 2;
+#[cfg(not(target_arch = "loongarch64"))]
+const TLS_REG_INDEX: usize = 4;
+
 pub fn seed_child_leader_context(
     child_thread: &Cap<ThreadIdentity>,
     parent_user_ctx: &UserTrapContext,
+    tls: usize,
 ) {
     // (1) Clone the parent context.
     let mut child_ctx = *parent_user_ctx;
     // (2) a0 = 0: child's clone-syscall return value.
     child_ctx.regs[CLONE_CHILD_RETURN_REG_INDEX] = 0;
-    // (3) PC already points past `ecall`: the trap shell
+    // (3) tp = tls: seed the thread pointer for TLS access.
+    //     When CLONE_SETTLS is not set, the caller passes 0 and tp
+    //     inherits the parent's value (preserved from the clone).
+    if tls != 0 {
+        child_ctx.regs[TLS_REG_INDEX] = tls;
+    }
+    // (4) PC already points past `ecall`: the trap shell
     // (`tx-kernel::trap_handoff::hand_off_syscall`) added the 4-byte
     // RV64 `ecall` insn width to `pc` at trap-capture time before
     // storing into `saved_user_context`. Adding another 4 here would
@@ -458,7 +473,7 @@ pub fn seed_child_leader_context(
     // for an applet) place a `mv` or load between the ecall and the
     // branch, and the +4 turns into a wild PC.
 
-    // (4) Store on the leader thread's payload. payload_cap == None
+    // (5) Store on the leader thread's payload. payload_cap == None
     // here means a freshly forked thread already lost its payload,
     // which is a kernel-invariant violation: step_fork's post-condition
     // is exactly that the child leader is live-with-payload.
