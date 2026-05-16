@@ -75,6 +75,7 @@ pub struct MountFlags(u64);
 impl MountFlags {
     pub const READ_ONLY: Self = Self(1 << 0);
     pub const NO_ATIME: Self = Self(1 << 1);
+    pub const NOSUID: Self = Self(1 << 2);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -83,10 +84,15 @@ impl MountFlags {
     pub const fn bits(self) -> u64 {
         self.0
     }
+
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MountOptions {
+    /// Mount flags (read-only, nosuid, noexec, etc.)
     pub flags: MountFlags,
 }
 
@@ -223,7 +229,7 @@ pub struct MountIdentity {
     root: Cap<RNode>,
     parent: Option<Cap<MountIdentity>>,
     payload: PayloadBinding<MountPayload>,
-    flags: MountFlags,
+    flags: AtomicU64,
 }
 
 impl MountIdentity {
@@ -241,7 +247,7 @@ impl MountIdentity {
             root,
             parent,
             payload,
-            flags,
+            flags: AtomicU64::new(flags.bits()),
         }
     }
 
@@ -281,8 +287,13 @@ impl MountIdentity {
         self.payload.upgrade()
     }
 
-    pub const fn flags(&self) -> MountFlags {
-        self.flags
+    pub fn flags(&self) -> MountFlags {
+        MountFlags(self.flags.load(Ordering::Acquire))
+    }
+
+    /// Atomically replace mount flags (for `MS_REMOUNT`).
+    pub fn set_flags(&self, new_flags: MountFlags) {
+        self.flags.store(new_flags.bits(), Ordering::Release);
     }
 }
 
@@ -450,7 +461,7 @@ pub struct MountSnapshot {
     pub mountpoint_path: alloc::vec::Vec<u8>,
     /// Filesystem type string (e.g. "tmpfs", "ext4").
     pub fstype: &'static str,
-    /// Mount flags.
+    /// Mount flags (read-only, nosuid, etc.)
     pub flags: MountFlags,
 }
 
@@ -499,6 +510,55 @@ pub fn bind_mount<'g>(
     register_mount(target_parent_payload, target_fs_object_id, mount_cap.clone());
 
     Ok(BindMountOutput { mount: mount_cap })
+}
+
+// ============================================================================
+// Umount
+// ============================================================================
+
+/// Unmount a filesystem: remove the mount-point registration so
+/// future walks no longer cross into this mount.
+///
+/// v1: synchronous detach only.  Returns `EINVAL` if the path is
+/// not a registered mountpoint.
+pub fn umount(
+    target_dentry: &Cap<DEntry>,
+    parent_payload: &Cap<MountPayload>,
+) -> Result<(), crate::execution::Errno> {
+    use crate::execution::Errno;
+
+    let parent_payload_ptr = cap_payload_ptr(parent_payload);
+    let child_fs_object_id = target_dentry.rnode().fs_object_id();
+
+    let mut table = MOUNT_TABLE.lock();
+    let pos = table.iter().position(|entry| {
+        entry.parent_payload_ptr == parent_payload_ptr
+            && entry.child_fs_object_id == child_fs_object_id
+    });
+
+    match pos {
+        Some(idx) => {
+            table.remove(idx);
+            Ok(())
+        }
+        None => Err(Errno::EINVAL),
+    }
+}
+
+// ============================================================================
+// Remount
+// ============================================================================
+
+/// Remount an existing mount with new flags (MS_REMOUNT).
+///
+/// `mount` is the `MountIdentity` cap obtained via
+/// `mount_for()` or `snapshot_mounts()`.  Flags are atomically
+/// replaced; concurrent walkers see either the old or new flags,
+/// never a torn value.
+///
+/// v1: supports `MS_RDONLY` toggle; other flags accepted but no-op.
+pub fn remount(mount: &Cap<MountIdentity>, new_flags: MountFlags) {
+    mount.set_flags(new_flags);
 }
 
 /// Return a snapshot of all registered mounts.
