@@ -852,6 +852,20 @@ pub const NR_CHDIR: u64 = 49;
 /// used by shells, so the carryover does not block Slice 11's QEMU
 /// shell smoke.
 pub const NR_FCHDIR: u64 = 50;
+/// `statfs(path, buf)`. Linux RV64 ABI `__NR_statfs = 43`.
+pub const NR_STATFS: u64 = 43;
+/// `fstatfs(fd, buf)`. Linux RV64 ABI `__NR_fstatfs = 44`.
+pub const NR_FSTATFS: u64 = 44;
+/// `sync()`. Linux RV64 ABI `__NR_sync = 81`.
+pub const NR_SYNC: u64 = 81;
+/// `syncfs(fd)`. Linux RV64 ABI `__NR_syncfs = 267` (same as RV64).
+pub const NR_SYNCFS: u64 = 267;
+/// `fsync(fd)`. Linux RV64 ABI `__NR_fsync = 82`.
+pub const NR_FSYNC: u64 = 82;
+/// `fdatasync(fd)`. Linux RV64 ABI `__NR_fdatasync = 83`.
+pub const NR_FDATASYNC: u64 = 83;
+/// `flock(fd, operation)`. Linux RV64 ABI `__NR_flock = 32`.
+pub const NR_FLOCK: u64 = 32;
 /// `mount(source, target, fstype, flags, data)`. Linux RV64 ABI `__NR_mount = 40`.
 pub const NR_MOUNT: u64 = 40;
 /// `umount2(target, flags)`. Linux RV64 ABI `__NR_umount2 = 39`.
