@@ -454,6 +454,53 @@ pub struct MountSnapshot {
     pub flags: MountFlags,
 }
 
+// ============================================================================
+// Bind mount
+// ============================================================================
+
+/// Outcome of a bind-mount operation.
+pub struct BindMountOutput {
+    /// The newly-created mount identity.
+    pub mount: Cap<MountIdentity>,
+}
+
+/// Create a bind mount: expose `source` at `target` path.
+///
+/// The bind mount shares the source filesystem's backend (`FsOps` +
+/// `FsPageBacking`) — no new backend is created.  The walker sees
+/// `target` as a mountpoint and traverses into `source`'s subtree.
+///
+/// v1: non-recursive, no propagation.
+pub fn bind_mount<'g>(
+    source_dentry: Cap<DEntry>,
+    target_dentry: Cap<DEntry>,
+    target_parent_payload: &Cap<MountPayload>,
+    guard: &'g Guard<'_>,
+) -> Result<BindMountOutput, crate::execution::Errno> {
+    use crate::execution::Errno;
+
+    let source_payload = crate::vfs::walker::mount_payload_for(&source_dentry, guard)
+        .ok_or(Errno::ENODEV)?;
+
+    let source_rnode = source_dentry.rnode().clone();
+    let target_fs_object_id = target_dentry.rnode().fs_object_id();
+
+    let mount_id = allocate_mount_id();
+    let mount_cap = MountIdentity::new_cap(
+        mount_id,
+        Some(target_dentry),
+        source_rnode,
+        None,
+        source_payload,
+        MountFlags::empty(),
+    )
+    .map_err(|_| Errno::ENOMEM)?;
+
+    register_mount(target_parent_payload, target_fs_object_id, mount_cap.clone());
+
+    Ok(BindMountOutput { mount: mount_cap })
+}
+
 /// Return a snapshot of all registered mounts.
 ///
 /// Used by procfs to render `/proc/mounts`.  Each entry carries the
