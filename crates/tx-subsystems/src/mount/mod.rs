@@ -611,6 +611,28 @@ pub fn remount(mount: &Cap<MountIdentity>, new_flags: MountFlags) {
     mount.set_flags(new_flags);
 }
 
+// ============================================================================
+// Filesystem factory
+// ============================================================================
+
+/// Output of a filesystem backend factory.
+pub struct FsOutput {
+    pub fs_ops: Arc<dyn crate::vfs::FsOps>,
+    pub fs_page_backing: Arc<dyn crate::page_backed::FsPageBacking>,
+    pub root_fs_object_id: FsObjectId,
+    pub root_inode_meta: InodeMeta,
+    pub fstype: &'static str,
+}
+
+/// Create a filesystem backend from a fstype string.
+///
+/// v1: returns `None` for all types — backend crates (tx-fs) are
+/// not accessible from tx-subsystems.  The shims layer provides
+/// the crate-level dispatch via `create_filesystem_for_mount`.
+pub fn create_filesystem(_fstype: &str) -> Option<FsOutput> {
+    None
+}
+
 /// Return a snapshot of all registered mounts.
 ///
 /// Used by procfs to render `/proc/mounts`.  Each entry carries the
