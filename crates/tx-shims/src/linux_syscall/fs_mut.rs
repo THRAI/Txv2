@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use tx_subsystems::mount::{self, MountPayload};
 
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
 /// re-walk. `path` is a slash-separated sequence; trailing slashes
@@ -616,6 +617,114 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         }
     }
     SyscallResult::Return(to_copy as i64)
+}
+
+/// `mount(source, target, fstype, flags, data)`. Linux RV64 ABI `__NR_mount = 40`.
+///
+/// v1: supports `MS_BIND` only (bind mount).
+pub(super) async fn sys_mount<P: PmapIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let source_uaddr = args[0];
+    let target_uaddr = args[1];
+    let flags = args[3] as u64;
+
+    const MS_BIND: u64 = 4096;
+    if (flags & MS_BIND) == 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+
+    let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let cred = ctx.walker_cred();
+
+    let guard = step_engine::guard();
+    use StepOutcome as V3;
+    let source_dentry = match step_walk(cwd.clone(), &source, &cred, &guard) {
+        V3::Done(d) => d,
+        V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        _ => return SyscallResult::Error(EIO_VALUE),
+    };
+    let target_dentry = match step_walk(cwd.clone(), &target, &cred, &guard) {
+        V3::Done(d) => d,
+        V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        _ => return SyscallResult::Error(EIO_VALUE),
+    };
+    let parent_payload = match mount_payload_for_dentry(&target_dentry) {
+        Some(p) => p,
+        None => return SyscallResult::Error(ENODEV_VALUE),
+    };
+
+    match mount::bind_mount(source_dentry, target_dentry, &parent_payload, &guard) {
+        Ok(_) => SyscallResult::Return(0),
+        Err(e) => SyscallResult::Error(errno_to_i32(e)),
+    }
+}
+
+/// `umount2(target, flags)`. Linux RV64 ABI `__NR_umount2 = 39`.
+pub(super) async fn sys_umount2<P: PmapIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let target_uaddr = args[0];
+    let flags = args[1] as u64;
+
+    if flags != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+
+    let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let cred = ctx.walker_cred();
+
+    let guard = step_engine::guard();
+    use StepOutcome as V3;
+    let target_dentry = match step_walk(cwd.clone(), &target, &cred, &guard) {
+        V3::Done(d) => d,
+        V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        _ => return SyscallResult::Error(EIO_VALUE),
+    };
+    let parent_payload = match mount_payload_for_dentry(&target_dentry) {
+        Some(p) => p,
+        None => return SyscallResult::Error(ENODEV_VALUE),
+    };
+
+    match mount::umount(&target_dentry, &parent_payload) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(e) => SyscallResult::Error(errno_to_i32(e)),
+    }
+}
+
+/// `mknodat(dirfd, path, mode, dev)`. Linux RV64 ABI `__NR_mknodat = 33`.
+///
+/// v1: ENOSYS — needs FsOps::mknod + InodeMeta.rdev.
+pub(super) async fn sys_mknodat<P: PmapIf>(
+    _args: [u64; 6],
+    _ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    SyscallResult::Error(ENOSYS_VALUE)
 }
 
 /// `utimensat(dirfd, pathname, times, flags)`. Linux RV64 generic ABI

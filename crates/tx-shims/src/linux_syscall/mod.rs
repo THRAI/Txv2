@@ -153,14 +153,14 @@ pub use numbers::{
     NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP,
     NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_EPOLL_CREATE1, NR_EPOLL_CTL,
     NR_EPOLL_WAIT, NR_EPOLL_PWAIT, NR_KILL, NR_LINKAT, NR_LSEEK, NR_MADVISE,
-    NR_MKDIRAT, NR_MLOCK, NR_MMAP, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
+    NR_MKNODAT, NR_MKDIRAT, NR_MLOCK, NR_MMAP, NR_MOUNT, NR_MPROTECT, NR_MREMAP, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NANOSLEEP, NR_NEWFSTATAT,
     NR_OPENAT, NR_PIPE2, NR_PPOLL, NR_PRLIMIT64, NR_READ, NR_READLINKAT, NR_READV, NR_RENAMEAT2,
     NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO,
     NR_RT_SIGRETURN, NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT, NR_SIGALTSTACK, NR_PIDFD_OPEN,
     NR_PIDFD_SEND_SIGNAL, NR_SETGID, NR_SETPGID, NR_SETREGID,
     NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
     NR_SET_TID_ADDRESS, NR_SIGNALFD, NR_SIGNALFD4, NR_STATX, NR_SYMLINKAT, NR_TGKILL, NR_TIMES,
-    NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4,
+    NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2, NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4,
     NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK,
     O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE,
     PROT_READ, PROT_WRITE, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS,
@@ -206,6 +206,7 @@ pub const EXECVE_VEC_MAX: usize = 256;
 /// Used as the `-ENOSYS` magnitude returned from `dispatch` for every
 /// syscall number not handled by Phase 2a / 2b.
 pub(super) const ENOSYS_VALUE: i32 = 38;
+pub(super) const ENODEV_VALUE: i32 = 19;
 /// Linux generic ABI errno value for "bad file descriptor" (`EBADF`).
 pub(super) const EBADF_VALUE: i32 = 9;
 /// Linux generic ABI errno value for "bad address" (`EFAULT`).
@@ -500,6 +501,9 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_GETCWD => sys_getcwd(req.args, ctx),
         nr if nr == NR_CHDIR => sys_chdir(req.args, ctx).await,
         nr if nr == NR_FCHDIR => SyscallResult::Error(ENOSYS_VALUE),
+        nr if nr == NR_MOUNT => sys_mount::<P>(req.args, ctx).await,
+        nr if nr == NR_UMOUNT2 => sys_umount2::<P>(req.args, ctx).await,
+        nr if nr == NR_MKNODAT => sys_mknodat::<P>(req.args, ctx).await,
         nr if nr == NR_GETDENTS64 => sys_getdents64(req.args, ctx).await,
         nr if nr == NR_STATX => sys_statx(req.args, ctx).await,
         // Slice 7 of the shell-prompt roadmap — fcntl extension +
