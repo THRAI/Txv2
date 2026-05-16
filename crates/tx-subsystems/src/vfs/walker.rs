@@ -215,11 +215,8 @@ pub fn step_open<'g>(
     }
 
     let rnode = dentry.rnode().clone();
-    match OpenFile::new_cap(rnode, flags) {
-        Ok(mut open) => {
-            open.set_opendir_dentry(dentry);
-            V3::done(open)
-        }
+    match OpenFile::new_cap_with_dentry(rnode, flags, dentry) {
+        Ok(open) => V3::done(open),
         Err(_) => V3::err(step_engine::Errno::EIO),
     }
 }
