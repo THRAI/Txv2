@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use tx_subsystems::mount::MountPayload;
 
 // =====================================================================
 // Wave 4 Part 4 of the DAC + setuid slice — file-mode syscall arms.
@@ -597,6 +598,21 @@ pub(super) fn sys_umask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 //
 // See `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 8.
 // =====================================================================
+
+/// Return the mount payload in scope for a dentry, ascending the
+/// parent-hint chain to find the containing mount.  Used by
+/// `sys_mount` / `sys_umount2`.
+pub(super) fn mount_payload_for_dentry(dentry: &Cap<DEntry>) -> Option<Cap<MountPayload>> {
+    let guard = step_engine::guard();
+    let mut cursor = dentry.clone();
+    loop {
+        let weak = cursor.rnode().containing_mount_weak()?;
+        if let Some(payload) = weak.upgrade(&guard) {
+            return Some(payload);
+        }
+        cursor = cursor.parent_hint()?;
+    }
+}
 
 /// Walk `path` from `cwd` synchronously, returning the resolved
 /// dentry or a positive-magnitude `-errno`. Mirrors

@@ -852,6 +852,12 @@ pub const NR_CHDIR: u64 = 49;
 /// used by shells, so the carryover does not block Slice 11's QEMU
 /// shell smoke.
 pub const NR_FCHDIR: u64 = 50;
+/// `mount(source, target, fstype, flags, data)`. Linux RV64 ABI `__NR_mount = 40`.
+pub const NR_MOUNT: u64 = 40;
+/// `umount2(target, flags)`. Linux RV64 ABI `__NR_umount2 = 39`.
+pub const NR_UMOUNT2: u64 = 39;
+/// `mknodat(dirfd, path, mode, dev)`. Linux RV64 ABI `__NR_mknodat = 33`.
+pub const NR_MKNODAT: u64 = 33;
 /// `getdents64(fd, dirp, count)`. Linux RV64 generic ABI
 /// `__NR_getdents64 = 61`. Calls `FsOps::readdir` with the per-fd
 /// readdir cursor and encodes each `DirEntry` into the user buffer
