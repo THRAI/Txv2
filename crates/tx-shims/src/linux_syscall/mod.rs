@@ -500,7 +500,7 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_NEWFSTATAT => sys_newfstatat(req.args, ctx).await,
         nr if nr == NR_GETCWD => sys_getcwd(req.args, ctx),
         nr if nr == NR_CHDIR => sys_chdir(req.args, ctx).await,
-        nr if nr == NR_FCHDIR => SyscallResult::Error(ENOSYS_VALUE),
+        nr if nr == NR_FCHDIR => sys_fchdir::<P>(req.args, ctx).await,
         nr if nr == NR_MOUNT => sys_mount::<P>(req.args, ctx).await,
         nr if nr == NR_UMOUNT2 => sys_umount2::<P>(req.args, ctx).await,
         nr if nr == NR_MKNODAT => sys_mknodat::<P>(req.args, ctx).await,
