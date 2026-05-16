@@ -6,6 +6,7 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 use tx_subsystems::mount::{self, MountPayload};
+use tx_fs;
 
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
 /// re-walk. `path` is a slash-separated sequence; trailing slashes
@@ -621,7 +622,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 
 /// `mount(source, target, fstype, flags, data)`. Linux RV64 ABI `__NR_mount = 40`.
 ///
-/// v1: supports `MS_BIND` only (bind mount).
+/// v1: supports `MS_BIND` (bind mount) and new mounts (tmpfs/devfs/proc).
 pub(super) async fn sys_mount<P: PmapIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'_>,
@@ -629,17 +630,9 @@ pub(super) async fn sys_mount<P: PmapIf>(
     let _ = core::marker::PhantomData::<P>;
     let source_uaddr = args[0];
     let target_uaddr = args[1];
+    let fstype_uaddr = args[2];
     let flags = args[3] as u64;
 
-    const MS_BIND: u64 = 4096;
-    if (flags & MS_BIND) == 0 {
-        return SyscallResult::Error(ENOSYS_VALUE);
-    }
-
-    let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
-        Ok(p) => p,
-        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-    };
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
@@ -653,25 +646,127 @@ pub(super) async fn sys_mount<P: PmapIf>(
 
     let guard = step_engine::guard();
     use StepOutcome as V3;
-    let source_dentry = match step_walk(cwd.clone(), &source, &cred, &guard) {
-        V3::Done(d) => d,
-        V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
-        _ => return SyscallResult::Error(EIO_VALUE),
-    };
-    let target_dentry = match step_walk(cwd.clone(), &target, &cred, &guard) {
-        V3::Done(d) => d,
-        V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
-        _ => return SyscallResult::Error(EIO_VALUE),
+    let target_dentry = match walk_from(cwd.clone(), &target, &cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
     };
     let parent_payload = match mount_payload_for_dentry(&target_dentry) {
         Some(p) => p,
         None => return SyscallResult::Error(ENODEV_VALUE),
     };
 
-    match mount::bind_mount(source_dentry, target_dentry, &parent_payload, &guard) {
-        Ok(_) => SyscallResult::Return(0),
-        Err(e) => SyscallResult::Error(errno_to_i32(e)),
+    const MS_BIND: u64 = 4096;
+    if (flags & MS_BIND) != 0 {
+        // Bind mount.
+        let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
+            Ok(p) => p,
+            Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        };
+        let source_dentry = match walk_from(cwd, &source, &cred) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        };
+        match mount::bind_mount(source_dentry, target_dentry, &parent_payload, &guard) {
+            Ok(_) => return SyscallResult::Return(0),
+            Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+        }
     }
+
+    // New filesystem mount.
+    let fstype = match read_user_cstr(&ctx.aspace, fstype_uaddr, 64) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+    let fstype_str = match core::str::from_utf8(&fstype) {
+        Ok(s) => s,
+        Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    // Build backend via crate-level factory.
+    let (fs_ops, fs_page_backing, root_id, root_meta, fstype_label): (
+        alloc::sync::Arc<dyn tx_subsystems::vfs::FsOps>,
+        alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+        tx_subsystems::vfs::FsObjectId,
+        tx_subsystems::vfs::InodeMeta,
+        &str,
+    ) = match fstype_str {
+        "tmpfs" => (
+            tx_fs::tmpfs::Tmpfs::fs_ops_arc(),
+            tx_fs::tmpfs::Tmpfs::fs_page_backing_arc(),
+            tx_subsystems::vfs::FsObjectId::ROOT,
+            tx_subsystems::vfs::InodeMeta::new(
+                tx_subsystems::vfs::InodeKind::Directory, 0o755,
+            ),
+            "tmpfs",
+        ),
+        "devfs" => (
+            tx_fs::devfs::Devfs::fs_ops_arc(),
+            tx_fs::devfs::Devfs::fs_page_backing_arc(),
+            tx_fs::devfs::DEVFS_ROOT_OBJECT_ID,
+            tx_subsystems::vfs::InodeMeta::new(
+                tx_subsystems::vfs::InodeKind::Directory,
+                tx_fs::devfs::DEVFS_ROOT_MODE,
+            ),
+            "devfs",
+        ),
+        "proc" => (
+            tx_fs::procfs::Procfs::fs_ops_arc(),
+            alloc::sync::Arc::new(tx_fs::procfs::Procfs) as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+            tx_fs::procfs::PROCFS_ROOT_ID,
+            tx_subsystems::vfs::InodeMeta::new(
+                tx_subsystems::vfs::InodeKind::Directory,
+                tx_fs::procfs::PROCFS_DIR_MODE,
+            ),
+            "proc",
+        ),
+        _ => return SyscallResult::Error(ENOSYS_VALUE),
+    };
+
+    let mount_payload = match mount::MountPayload::new_cap(
+        fs_ops,
+        fs_page_backing,
+        None,
+        mount::allocate_dev_id(),
+        mount::MountOptions::default(),
+        fstype_label,
+        mount::SourceLabel::Static("none"),
+    ) {
+        Ok(p) => p,
+        Err(_) => return SyscallResult::Error(Errno::ENOMEM as i32),
+    };
+
+    let root_rnode = {
+        use tx_subsystems::vfs::RNodeBacking;
+        let raw = tx_subsystems::vfs::RNode::new(root_id, root_meta, RNodeBacking::Directory)
+            .with_containing_mount(&mount_payload);
+        match step_engine::reserve_for::<tx_subsystems::vfs::RNode>() {
+            Ok(res) => match step_engine::sign_for(res, raw) {
+                Ok(cap) => cap,
+                Err(_) => return SyscallResult::Error(Errno::ENOMEM as i32),
+            },
+            Err(_) => return SyscallResult::Error(Errno::ENOMEM as i32),
+        }
+    };
+
+    let mount_cap = match mount::MountIdentity::new_cap(
+        mount::allocate_mount_id(),
+        Some(target_dentry),
+        root_rnode,
+        None,
+        mount_payload,
+        mount::MountFlags::empty(),
+    ) {
+        Ok(m) => m,
+        Err(_) => return SyscallResult::Error(Errno::ENOMEM as i32),
+    };
+
+    mount::register_mount(
+        &parent_payload,
+        target_dentry.rnode().fs_object_id(),
+        mount_cap,
+    );
+
+    SyscallResult::Return(0)
 }
 
 /// `umount2(target, flags)`. Linux RV64 ABI `__NR_umount2 = 39`.
