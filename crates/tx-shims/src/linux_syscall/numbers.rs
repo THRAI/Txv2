@@ -256,6 +256,8 @@ pub const NR_CLONE: u64 = 220;
 /// only flag combination Wave 2's `sys_clone` accepts.
 pub const SIGCHLD: u64 = 17;
 
+pub const CLONE_SETTLS: u64 = 0x80000;
+
 /// `getppid()`. Linux generic ABI `__NR_getppid`. Wraps
 /// `ProcessIdentity::parent_pid()`. Returns `0` (`Pid::RESERVED`)
 /// for orphans (init's pid 1 has no parent). Real Linux returns
@@ -263,6 +265,7 @@ pub const SIGCHLD: u64 = 17;
 /// init when init is registered, so under normal flows the difference
 /// is invisible.
 pub const NR_GETPPID: u64 = 173;
+pub const NR_GETTID: u64 = 178;
 
 /// `setpgid(pid, pgid)`. Linux generic ABI `__NR_setpgid`. Wraps
 /// `step_setpgid`. The trio's day-1 step only supports

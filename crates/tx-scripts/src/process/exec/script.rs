@@ -46,22 +46,25 @@ use alloc::vec::Vec;
 use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
 use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
 use tx_subsystems::execution::Errno;
+use tx_subsystems::mount::MountFlags;
 use tx_subsystems::page_backed::{read_exact_at, PageContainer};
 use tx_subsystems::process::{
     step_close_cloexec_fds, step_install_brk_for_exec, step_reset_signal_dispositions_for_exec,
     ProcessIdentity,
 };
 use tx_subsystems::thread_runtime::ThreadIdentity;
-use tx_subsystems::vfs::structure::{Credential, InodeMeta, OpenFileFlags, RNodeBacking};
+use tx_subsystems::vfs::structure::{Credential, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking};
 use tx_subsystems::vfs::walker::step_open;
+use tx_subsystems::vm::{MapPlacement, MapReserveResult, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags};
 use tx_subsystems::vm::scripts::{
     self as vm_scripts, BssTail as VmBssTail, ImagePlan as VmImagePlan,
     LoadSegment as VmLoadSegment, SegmentFlags as VmSegmentFlags, USER_STACK_TOP_DEFAULT,
 };
 
-use super::loader::{
+use super::loader::{ET_DYN_LOAD_BIAS, 
     parse_image_plan, ExecImagePlan, LoadSegment as ParsedLoadSegment, ParseError,
     SegmentFlags as ParsedSegmentFlags, ELF64_PHENT,
+    InterpreterPlan,
 };
 use super::stack::{build_initial_user_stack, AuxvFacts};
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
@@ -69,6 +72,11 @@ use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 /// User page size — RV64 today; mirrors `vm::USER_PAGE_SIZE` so the
 /// brk-base round-up doesn't require pulling in another import.
 const USER_PAGE_SIZE: u64 = 4096;
+
+const INTERP_BASE: u64 = 0x3F_F000_0000;
+
+// ASLR functions moved inline to exec_script_inner
+
 
 /// Initial-read window over the ELF image used to cover the header and
 /// program-header table. Sized at one page (4 KiB) which is well over
@@ -80,6 +88,9 @@ const INITIAL_PARSE_READ: usize = 4096;
 /// Cumulative count of times the shebang (`#!`) handler fired.
 pub static EXEC_SHEBANG_FIRED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+
+/// Maximum shebang recursion depth (Linux default: 4).
+const SHEBANG_MAX_DEPTH: usize = 4;
 
 /// Errno from the most recent `step_open` failure in `exec_script`.
 pub static EXEC_LAST_OPEN_ERRNO: core::sync::atomic::AtomicI32 =
@@ -231,7 +242,7 @@ impl ExecError {
 ///
 /// Cites: `txdoc:EXEC-7-EIGHT-PHASES`,
 /// `txdoc:EXEC-15-THE-EXEC-PONR-INVARIANT`.
-pub async fn exec_script<P: PmapIf + EntropyIf>(
+pub async fn exec_script<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
     path: &[u8],
@@ -239,6 +250,44 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     envp: &[&[u8]],
     cred: &Credential,
 ) -> Result<(), ExecError> {
+    exec_script_inner::<P>(0, process, thread, path, argv, envp, cred).await
+}
+
+async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
+    depth: usize,
+    process: &Cap<ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+    path: &[u8],
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+    cred: &Credential,
+) -> Result<(), ExecError> {
+    // Shebang recursion guard (Linux limit: 4).
+    if depth > SHEBANG_MAX_DEPTH {
+        return Err(ExecError::IoError); // maps to ELOOP
+    }
+
+    // ---- ASLR helpers (inline closures, capture P) -----------------
+    let randomize_et_dyn_base = || -> u64 {
+        let mut buf = [0u8; 8];
+        <P as tx_hal::EntropyIf>::fill_random(&mut buf);
+        let r = u64::from_le_bytes(buf);
+        let offset = r & ((1 << 24) - 1) & !(USER_PAGE_SIZE - 1);
+        ET_DYN_LOAD_BIAS + offset
+    };
+    let randomize_interp_base = || -> u64 {
+        let mut buf = [0u8; 8];
+        <P as tx_hal::EntropyIf>::fill_random(&mut buf);
+        let r = u64::from_le_bytes(buf);
+        let offset = r & ((1 << 24) - 1) & !(USER_PAGE_SIZE - 1);
+        INTERP_BASE + offset
+    };
+    let randomize_stack_top = || -> u64 {
+        let mut buf = [0u8; 8];
+        <P as tx_hal::EntropyIf>::fill_random(&mut buf);
+        USER_STACK_TOP_DEFAULT + (u64::from_le_bytes(buf) & 0x7F_FFFF) & !(USER_PAGE_SIZE - 1)
+    };
+
     // ===== Phase 1 — resolve path + open file =========================
     //
     // `txdoc:EXEC-8-1-RESOLVE-AND-OPEN`. Snapshot a fresh epoch guard,
@@ -317,6 +366,11 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     let exec_meta = openfile.rnode().meta();
     check_exec_perm(&exec_meta, cred)?;
 
+    // Refuse to exec a directory (EACCES).
+    if exec_meta.kind() == InodeKind::Directory {
+        return Err(ExecError::PermissionDenied);
+    }
+
     // ===== Phase 2 — read header + program headers ===================
     //
     // `txdoc:EXEC-8-3-PARSE-AND-VALIDATE`. One bounded targeted read
@@ -367,7 +421,8 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
             }
             let interp_path: Vec<u8> = interp.to_vec();
             let new_argv_refs: Vec<&[u8]> = new_argv.iter().map(|v| v.as_slice()).collect();
-            return alloc::boxed::Box::pin(exec_script::<P>(
+            return alloc::boxed::Box::pin(exec_script_inner::<P>(
+                depth + 1,
                 process,
                 thread,
                 &interp_path,
@@ -386,8 +441,101 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // arch / type / no PT_INTERP / no PT_DYNAMIC / phdr-table fits /
     // congruence / overlap / W^X). All failures collapse to
     // `ExecError::NotExecutable` at the syscall boundary.
-    let parsed: ExecImagePlan =
+    let mut parsed: ExecImagePlan =
         parse_image_plan(&header_bytes).map_err(ExecError::from_parse_error)?;
+
+    // ASLR: for ET_DYN images, shift the fixed load_bias by a
+    // random offset.  ET_EXEC binaries (load_bias == 0) are not
+    // randomised — they use absolute virtual addresses.
+    let aslr_delta: i64 = if parsed.load_bias != 0 {
+        let new_bias = randomize_et_dyn_base();
+        let delta = (new_bias as i64) - (parsed.load_bias as i64);
+        parsed.load_bias = new_bias;
+        delta
+    } else {
+        0
+    };
+    // Apply delta to entry, at_phdr, and all LOAD segment vaddrs.
+    parsed.entry = (parsed.entry as i64 + aslr_delta) as u64;
+    parsed.at_phdr = (parsed.at_phdr as i64 + aslr_delta) as u64;
+    for seg in &mut parsed.load_segments {
+        seg.vaddr = (seg.vaddr as i64 + aslr_delta) as u64;
+    }
+
+    // ===== Phase 3b — load interpreter (if PT_INTERP present) =========
+    //
+    // When the main binary carries PT_INTERP, open and parse the
+    // interpreter ELF.  The interpreter is loaded above the main
+    // binary at a fixed high address (INTERP_LOAD_BIAS).
+    let interp_data: Option<(InterpreterPlan, Cap<tx_subsystems::page_backed::PageContainer>)> =
+        if let Some(ref interp_path) = parsed.interpreter_path {
+            let interp_file = {
+                use StepOutcome as V3;
+                let guard = step_engine::guard();
+                let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
+                let outcome = step_open(
+                    rooted_at,
+                    interp_path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                    },
+                    0,
+                    cred,
+                    &guard,
+                );
+                match outcome {
+                    V3::Done(file) => file,
+                    V3::Err(_) => return Err(ExecError::IoError),
+                    _ => return Err(ExecError::Busy),
+                }
+            };
+            // Extract PageContainer from the interpreter file's RNode.
+            let interp_pc: Cap<PageContainer> = match interp_file.rnode().backing() {
+                RNodeBacking::PageBacked { pc } => pc.clone(),
+                _ => return Err(ExecError::NotExecutable),
+            };
+            // Read interpreter ELF header + program headers.
+            let mut interp_hdr = [0u8; 4096];
+            let guard = step_engine::guard();
+            let outcome = read_exact_at(&interp_pc, 0, &mut interp_hdr, &guard);
+            match outcome {
+                StepOutcome::Done(()) => {}
+                _ => return Err(ExecError::IoError),
+            }
+            let interp_parsed = parse_image_plan(&interp_hdr)
+                .map_err(ExecError::from_parse_error)?;
+            let mut interp_segs: Vec<ParsedLoadSegment> = Vec::new();
+            let interp_lowest_vaddr = interp_parsed.load_segments.iter()
+                .map(|s| s.vaddr)
+                .min()
+                .unwrap_or(0);
+            // Fixed high address for the interpreter.
+            
+            let interp_load_bias = randomize_interp_base() - interp_lowest_vaddr;
+            for seg in &interp_parsed.load_segments {
+                interp_segs.push(ParsedLoadSegment {
+                    vaddr: seg.vaddr + interp_load_bias,
+                    memsz: seg.memsz,
+                    filesz: seg.filesz,
+                    file_offset: seg.file_offset,
+                    flags: seg.flags,
+                    align: seg.align,
+                });
+            }
+            Some((InterpreterPlan {
+                load_bias: interp_load_bias,
+                entry: interp_parsed.entry + interp_load_bias,
+                load_segments: interp_segs,
+                bss_extension: interp_parsed.bss_extension,
+                executable_stack: interp_parsed.executable_stack,
+            }, interp_pc))
+        } else {
+            None
+        };
 
     // Compose the brk base from the image plan: the page-rounded end
     // of the highest LOAD segment's memory footprint. Linux's
@@ -413,13 +561,28 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     //
     // The recompute MUST run before Phase 5's auxv build so the
     // `AT_SECURE` slot reflects the post-recompute effective-id delta.
+    //
+    // nosuid mount check: if the file resides on a mount with the
+    // `NOSUID` flag, skip S_ISUID/S_ISGID processing and keep the
+    // caller's credentials.  `AT_SECURE` is not set.
+    let mount_nosuid = openfile
+        .rnode()
+        .containing_mount_weak()
+        .and_then(|w| {
+            let guard = step_engine::guard();
+            w.upgrade(&guard)
+        })
+        .is_some_and(|mp| mp.options.flags.contains(MountFlags::NOSUID));
+
+    let at_secure = if mount_nosuid { false } else {
     let exec_outcome = step_apply_suid_for_exec(
         process,
         Uid(exec_meta.uid),
         Gid(exec_meta.gid),
         exec_meta.mode,
     );
-    let at_secure = exec_outcome.is_some_and(|o| o.at_secure);
+    exec_outcome.is_some_and(|o| o.at_secure)
+};
 
     // ===== Phase 4 — build detached AddressSpace =====================
     //
@@ -430,13 +593,60 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // for demand-faulting bytes from the file). Every LOAD segment
     // shares the same backing `Cap` (they all view different ranges
     // of the same file).
-    let image_plan = build_vm_image_plan(&parsed, &file_pc);
+        let interp_exec_stack = interp_data.as_ref().map_or(false, |(i, _)| i.executable_stack);
+    let stack_top = randomize_stack_top();
+    let image_plan = build_vm_image_plan(&parsed, interp_exec_stack, stack_top, &file_pc);
     // V1 (`build_aspace_from_image`) takes no `&Guard` — it acquires
     // its own per-call guards internally. Per
     // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE` callers must NOT
     // hold a guard at the call site.
     let new_aspace = vm_scripts::build_aspace_from_image::<P>(&image_plan)
         .map_err(ExecError::from_build_aspace_error)?;
+
+    // ===== Phase 4a.2 — register interpreter LOAD segments =========
+    //
+    // The interpreter's PageContainer-backed LOAD segments are
+    // registered as additional VmEntry recipes in the detached
+    // aspace, alongside the main binary's entries.  Overlap with the
+    // main binary's segments was validated in Phase 4a.1.
+    if let Some((ref interp, ref interp_pc)) = interp_data {
+        for seg in &interp.load_segments {
+            let seg_range = match vm_scripts::align_range(
+                seg.vaddr,
+                seg.memsz,
+            ) {
+                Some(r) => r,
+                None => return Err(ExecError::NotExecutable),
+            };
+            let prot = if seg.flags.writable {
+                if seg.flags.executable {
+                    Prot::new(true, true, true)
+                } else {
+                    Prot::READ_WRITE
+                }
+            } else if seg.flags.executable {
+                Prot::READ_EXECUTE
+            } else {
+                Prot::READ
+            };
+            let entry = VmEntry::new(
+                seg_range,
+                prot,
+                VmEntryFlags::PRIVATE,
+                VmBacking::Page {
+                    pc: interp_pc.clone(),
+                    offset: seg.file_offset,
+                },
+            );
+            match new_aspace.reserve_map(entry, MapPlacement::RequireFree) {
+                MapReserveResult::Reserved(r) => {
+                    r.commit().map_err(|_| ExecError::OutOfMemory)?;
+                }
+                MapReserveResult::Blocked(_) => return Err(ExecError::Busy),
+                MapReserveResult::Err(_) => return Err(ExecError::OutOfMemory),
+            }
+        }
+    }
 
     // ===== Phase 5a — eagerly populate partial-last-page bytes ========
     //
@@ -528,8 +738,9 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
     // model (no ASLR, no untrusted input).
     let mut at_random_bytes = [0u8; 16];
     <P as EntropyIf>::fill_random(&mut at_random_bytes);
+    let arch = <P as tx_hal::AuxvIf>::arch_auxv_facts();
 
-    let auxv_facts = AuxvFacts {
+    let mut auxv_facts = AuxvFacts {
         at_phdr: parsed.at_phdr,
         at_phent: ELF64_PHENT,
         at_phnum: parsed.at_phnum,
@@ -554,8 +765,17 @@ pub async fn exec_script<P: PmapIf + EntropyIf>(
         // refine.
         at_secure: if at_secure { 1 } else { 0 },
         at_random_bytes,
+        at_hwcap: arch.hwcap,
+        at_hwcap2: arch.hwcap2,
+        at_platform: None,
+        platform_string: arch.platform.as_bytes(),
+        at_clktck: super::stack::CLKTCK_VALUE,
+        at_execfn: None,
+        execfn_string: b"",
+        at_flags: 0,
+        at_sysinfo_ehdr: None,
     };
-    let stack_image = build_initial_user_stack(USER_STACK_TOP_DEFAULT, argv, envp, &auxv_facts);
+    let stack_image = build_initial_user_stack(stack_top, argv, envp, &mut auxv_facts);
 
     // V2 (`populate_detached_user_range`) also acquires its own
     // guards internally; same discipline as V1.
@@ -689,7 +909,7 @@ const fn translate_flags(parsed: ParsedSegmentFlags) -> VmSegmentFlags {
 
 /// Bridge `parse_image_plan`'s view (no PageContainer) to the
 /// vm-scripts view (LOAD segments carry the file's `Cap<PageContainer>`).
-fn build_vm_image_plan(parsed: &ExecImagePlan, file_pc: &Cap<PageContainer>) -> VmImagePlan {
+fn build_vm_image_plan(parsed: &ExecImagePlan, interp_exec_stack: bool, stack_top: u64, file_pc: &Cap<PageContainer>) -> VmImagePlan {
     let load_segments: alloc::vec::Vec<VmLoadSegment> = parsed
         .load_segments
         .iter()
@@ -710,9 +930,10 @@ fn build_vm_image_plan(parsed: &ExecImagePlan, file_pc: &Cap<PageContainer>) -> 
 
     VmImagePlan {
         entry: parsed.entry,
-        stack_top: USER_STACK_TOP_DEFAULT,
+        stack_top,
         load_segments,
         bss_extension,
+        executable_stack: parsed.executable_stack || interp_exec_stack,
     }
 }
 

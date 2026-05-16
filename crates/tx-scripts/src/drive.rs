@@ -28,9 +28,10 @@ use crate::adapter::step_engine::{
     SubjectIdentity, Translation, YieldShape,
 };
 use crate::adapter::wake::{
-    agent_event_matches, lookup_source, ActiveWait, MailboxEvent, TaskMailbox, TimerGuardRole,
+    agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, TimerGuardRole,
     TimerToken, TimerWheel,
 };
+use tx_substrate::wake::wait_source::lookup_source;
 use alloc::sync::{Arc, Weak};
 
 use tx_subsystems::execution::WaitToken;

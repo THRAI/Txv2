@@ -7,6 +7,7 @@ use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 use tx_scripts::drive;
 use tx_substrate::step::DriveMode;
+use tx_substrate::step::Errno as V3Errno;
 use tx_subsystems::vm::step_ops::{
     VmBrkOp, VmMapOp, VmMlockOp, VmMunlockOp, VmMsyncOp, VmProtectOp, VmRemapOp, VmUnmapOp,
 };
@@ -625,7 +626,7 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 let outcome =
                     tx_subsystems::futex::step_futex_wait(uaddr, val, &guard);
                 match outcome {
-                    StepOutcome::Err(e) if e == Errno::EAGAIN => {
+                    StepOutcome::Err(e) if e == V3Errno::EAGAIN => {
                         return SyscallResult::Error(errno_to_i32(Errno::EAGAIN));
                     }
                     StepOutcome::Err(e) => {

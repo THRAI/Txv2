@@ -39,7 +39,7 @@ fn seed_child_leader_context_zeroes_a0() {
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();
-    seed_child_leader_context(&leader, &parent_ctx);
+    seed_child_leader_context(&leader, &parent_ctx, 0);
 
     let saved = leader
         .payload_cap()
@@ -51,6 +51,11 @@ fn seed_child_leader_context_zeroes_a0() {
         "RV64 a0 (regs[10]) must be 0 in the child — Linux fork-clone ABI: \
          child's syscall return value is 0",
     );
+    // With tls=0 (no CLONE_SETTLS), tp inherits the parent's value.
+    assert_eq!(
+        saved.regs[4], parent_ctx.regs[4],
+        "RV64 tp (regs[4]) must match parent when tls=0",
+    );
 }
 
 #[test]
@@ -61,7 +66,7 @@ fn seed_child_leader_context_inherits_pc() {
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();
-    seed_child_leader_context(&leader, &parent_ctx);
+    seed_child_leader_context(&leader, &parent_ctx, 0);
 
     let saved = leader
         .payload_cap()
@@ -85,7 +90,7 @@ fn seed_child_leader_context_preserves_other_gprs_and_sp() {
     let leader = child_leader(&child);
 
     let parent_ctx = synthetic_parent_ctx();
-    seed_child_leader_context(&leader, &parent_ctx);
+    seed_child_leader_context(&leader, &parent_ctx, 0);
 
     let saved = leader
         .payload_cap()

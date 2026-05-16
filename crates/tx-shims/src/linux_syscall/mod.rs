@@ -46,7 +46,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use reactor_entry::userspace::SyscallRequest;
-use tx_hal::{EntropyIf, PmapIf, TimeIf, UserPtr};
+use tx_hal::{AuxvIf, EntropyIf, PmapIf, TimeIf, UserPtr};
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_subsystems::page_backed::TruncateOp as FdTruncateOp;
 use tx_subsystems::cred::{
@@ -149,7 +149,7 @@ pub use numbers::{
     NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLONE, NR_CLOSE, NR_DUP, NR_DUP3, NR_EXECVE, NR_EXIT,
     NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHDIR, NR_FCHMODAT, NR_FCHOWNAT, NR_FCNTL,
     NR_FSTAT, NR_FTRUNCATE, NR_FUTEX, NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID,
-    NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETRANDOM, NR_GETRESGID, NR_GETRESUID,
+    NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETTID, NR_GETRANDOM, NR_GETRESGID, NR_GETRESUID,
     NR_GETSID, NR_GETTIMEOFDAY, NR_GETUID, NR_IOCTL, NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP,
     NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_EPOLL_CREATE1, NR_EPOLL_CTL,
     NR_EPOLL_WAIT, NR_EPOLL_PWAIT, NR_KILL, NR_LINKAT, NR_LSEEK, NR_MADVISE,
@@ -167,7 +167,7 @@ pub use numbers::{
     RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK,
     RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO,
     RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK, RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END,
-    SEEK_SET, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME, TIMES_NS_PER_TICK,
+    SEEK_SET, SIGCHLD, CLONE_SETTLS, TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME, TIMES_NS_PER_TICK,
     TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ, UTIME_NOW, UTIME_OMIT,
     WNOHANG, W_OK, X_OK,
 };
@@ -328,7 +328,7 @@ pub(super) const SIGACTION_BYTES: usize = 32;
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
-pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
+pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
@@ -338,6 +338,7 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf>(
     // YieldShape, and do not access VFS/VM/reactor/timer.
     match req.nr {
         NR_GETPID => return sys_getpid(ctx),
+        NR_GETTID => return sys_gettid(ctx),
         nr if nr == NR_GETPPID => return sys_getppid(ctx),
         nr if nr == NR_GETPGRP => return sys_getpgrp(ctx),
         nr if nr == NR_GETPGID => return sys_getpgid(req.args, ctx),

@@ -25,6 +25,7 @@ pub mod thread_runtime;
 pub mod timer_sleep;
 pub mod tty;
 pub mod userfaultfd;
+pub mod vdso;
 pub mod vfs;
 pub mod vm;
 pub mod wait_source;
