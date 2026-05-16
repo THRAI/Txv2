@@ -124,8 +124,8 @@ fn kill_zombie_process_returns_no_live_thread() {
 fn kill_pgrp_fans_out_to_every_live_member() {
     let _g = setup();
     let parent = bootstrap();
-    let child_a = step_fork::<TestPmap>(&parent).expect("fork a");
-    let child_b = step_fork::<TestPmap>(&parent).expect("fork b");
+    let child_a = step_fork::<TestPmap>(&parent, false).expect("fork a");
+    let child_b = step_fork::<TestPmap>(&parent, false).expect("fork b");
     let pgrp = parent.pgrp_cap();
 
     let delivered = step_kill_pgrp(&pgrp, Signum::SIGINT);
@@ -146,7 +146,7 @@ fn kill_pgrp_fans_out_to_every_live_member() {
 fn kill_pgrp_skips_zombie_members_in_count() {
     let _g = setup();
     let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent).expect("fork");
+    let child = step_fork::<TestPmap>(&parent, false).expect("fork");
     step_exit_group(&child, ExitStatus::Exited(0));
 
     let pgrp = parent.pgrp_cap();

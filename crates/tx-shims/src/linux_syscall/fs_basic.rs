@@ -1353,3 +1353,64 @@ pub(super) fn fs_ops_for_rnode(
     let payload = weak.upgrade(&guard)?;
     Some(payload.fs_ops.clone())
 }
+
+/// `statfs(path, buf)`. Linux RV64 ABI `__NR_statfs = 43`.
+pub(super) async fn sys_statfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let buf_uaddr = args[1];
+    let mut buf = [0u8; 120];
+    buf[0..8].copy_from_slice(&0x01021994u64.to_le_bytes());
+    buf[8..16].copy_from_slice(&4096u64.to_le_bytes());
+    buf[88..96].copy_from_slice(&255u64.to_le_bytes());
+    buf[96..104].copy_from_slice(&4096u64.to_le_bytes());
+    if let Err(e) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &buf) { return SyscallResult::Error(errno_to_i32(e)); }
+    SyscallResult::Return(0)
+}
+
+/// `fstatfs(fd, buf)`. Linux RV64 ABI `__NR_fstatfs = 44`.
+pub(super) async fn sys_fstatfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let fd = args[0] as u32;
+    if ctx.process.fd(fd).is_none() { return SyscallResult::Error(EBADF_VALUE); }
+    sys_statfs::<P>(args, ctx).await
+}
+
+/// `sync()`. Linux RV64 ABI `__NR_sync = 81`.
+pub(super) async fn sys_sync<P: PmapIf>(_args: [u64; 6], _ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    SyscallResult::Return(0)
+}
+
+/// `syncfs(fd)`. Linux RV64 ABI `__NR_syncfs = 267`.
+pub(super) async fn sys_syncfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let fd = args[0] as u32;
+    let open_file = match ctx.process.fd(fd) { Some(f) => f, None => return SyscallResult::Error(EBADF_VALUE) };
+    let guard = step_engine::guard();
+    let rnode = open_file.rnode();
+    let page_backing = match rnode.containing_mount_weak().and_then(|w| w.upgrade(&guard)) {
+        Some(mp) => mp.fs_page_backing().clone(),
+        None => return SyscallResult::Error(ENODEV_VALUE),
+    };
+    match page_backing.fsync(tx_subsystems::vfs::FsObjectId::ROOT, &guard) {
+        StepOutcome::Done(()) => SyscallResult::Return(0),
+        StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(Errno::from(e))),
+        _ => SyscallResult::Error(EIO_VALUE),
+    }
+}
+
+/// `fsync(fd)`. Linux RV64 ABI `__NR_fsync = 82`.
+pub(super) async fn sys_fsync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    sys_syncfs::<P>(args, ctx).await
+}
+
+/// `fdatasync(fd)`. Linux RV64 ABI `__NR_fdatasync = 83`.
+pub(super) async fn sys_fdatasync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    sys_syncfs::<P>(args, ctx).await
+}
+
+/// `flock(fd, operation)`. Linux RV64 ABI `__NR_flock = 32`.
+pub(super) async fn sys_flock<P: PmapIf>(_args: [u64; 6], _ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    SyscallResult::Error(ENOSYS_VALUE)
+}

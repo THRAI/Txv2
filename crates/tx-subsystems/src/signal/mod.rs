@@ -1330,7 +1330,7 @@ mod step_op_wraps {
         let _g = setup();
         let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
         let mut op = KillProcessOp {
-            target: proc_cap.clone(), sig: Signum::SIGTERM,
+            target: proc_cap.clone(), sig: Signum::SIGTERM, info: None, info: None,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
@@ -1344,7 +1344,7 @@ mod step_op_wraps {
         let pgrp = proc_cap.pgrp_cap();
         let mut op = KillPgrpOp {
             pgrp,
-            sig: Signum::SIGINT,
+            sig: Signum::SIGINT, info: None,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
@@ -1358,7 +1358,7 @@ mod step_op_wraps {
         let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
         let mut op = SigactionOp {
             process: proc_cap.clone(),
-            sig: Signum::SIGTERM,
+            sig: Signum::SIGTERM, info: None,
             disposition: SigDisposition::Ignore,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
@@ -1377,7 +1377,7 @@ mod step_op_wraps {
         let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
         let mut op = SigactionOp {
             process: proc_cap.clone(),
-            sig: Signum::SIGKILL,
+            sig: Signum::SIGKILL, info: None,
             disposition: SigDisposition::Ignore,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();

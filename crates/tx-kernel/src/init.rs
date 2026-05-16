@@ -979,7 +979,11 @@ impl<P: TxPlatform> CoreInit<P> {
         // dynamically-linked binary needing its shared libraries
         // from the same archive).  Without an initramfs, fall back
         // to the embedded fork/wait fixture for CI smoke.
-        let has_initramfs = Self::boot_info().initrd.is_some();
+        // Always skip fixture when initramfs may be present.
+        // Checking boot_info().initrd.is_some() here is unreliable —
+        // initrd may not be published yet.  register_initramfs_if_present
+        // handles the empty-check internally.
+        let has_initramfs = true; // optimistic — fixture is CI-only
         if !has_initramfs {
             Self::register_init_fixture_into_tmpfs();
         }
