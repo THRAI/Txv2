@@ -1002,7 +1002,29 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     SyscallResult::Return(0)
 }
 
-/// `statx(dirfd, path, flags, mask, statxbuf)`. Linux generic ABI
+
+/// `fchdir(fd)`. Linux RV64 ABI `__NR_fchdir = 50`.
+pub(super) async fn sys_fchdir<P: PmapIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let fd = args[0] as u32;
+    let open_file = match ctx.process.fd(fd) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let dentry = match open_file.opendir_dentry() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOTDIR_VALUE),
+    };
+    match tx_subsystems::process::step_chdir(&ctx.process, dentry) {
+        tx_subsystems::process::ChdirOutcome::Replaced { .. } => SyscallResult::Return(0),
+        tx_subsystems::process::ChdirOutcome::ZombieIgnored => SyscallResult::Error(EACCES_VALUE),
+    }
+}
+
+/// `statx/// `statx(dirfd, path, flags, mask, statxbuf)`. Linux generic ABI
 /// `__NR_statx = 291`.
 ///
 /// This is the metadata probe LA64 musl/busybox uses before `ls`

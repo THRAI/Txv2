@@ -1131,14 +1131,18 @@ impl OpenFile {
         }
     }
 
+    /// Return the DEntry hint set by step_open.  Used by fchdir.
+    pub fn opendir_dentry(&self) -> Option<Cap<DEntry>> {
+        self.opendir_dentry.clone()
+    }
+
     /// `Some(&Cap<UserfaultFd>)` iff this `OpenFile` is the
     /// userfaultfd-backed shape (PR-10 phase 0). Returns `None` for
     /// every VFS-backed `OpenFile`. The future `sys_close` /
     /// `ioctl(UFFDIO_*)` paths branch on this — phase 0 only
     /// exposes it for the fd-table scaffold tests to verify the
     /// install/retrieve round-trip preserves the inner cap identity.
-    pub fn ufd(&self) -> Option<&Cap<UserfaultFd>> {
-        match &self.backing {
+    /// Return the DEntry hint set by step_open.  Used by fchdir.
             OpenFileBacking::Ufd { ufd } => Some(ufd),
             OpenFileBacking::Rnode { .. }
             | OpenFileBacking::AioContext { .. }
