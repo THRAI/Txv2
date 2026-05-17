@@ -26,6 +26,11 @@ impl<I: SubjectIdentity> StepOp<I> for SignalfdCreateOp {
         &mut self,
         _ctx: &mut ScriptCtx<I>,
     ) -> StepOutcome<Self::Output, Self::Progress> {
+        // observe — owner_proc Cap + mask validated by signalfd_create
+        // upgrade — N/A: Cap<SignalFd> allocated via signalfd_create
+        // reserve — signalfd_create handles zone reservation internally
+        // commit — Cap returned as Done(result)
+        // publish — N/A: no signal attachments (subscriber list managed by signal module)
         let result = signalfd_create(&self.owner_proc, self.mask);
         StepOutcome::Done(result)
     }

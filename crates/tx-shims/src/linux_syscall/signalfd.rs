@@ -84,10 +84,18 @@ pub(super) fn sys_signalfd4<'a>(
     };
 
     if fd < 0 {
-        // Create a fresh signalfd.
-        let sfd_cap = match signalfd_create(&ctx.process, mask) {
-            Ok(cap) => cap,
-            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+        // Create a fresh signalfd via SignalfdCreateOp + drive_oneshot.
+        let sfd_cap = {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = SignalfdCreateOp {
+                owner_proc: ctx.process.clone(),
+                mask,
+            };
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(Ok(cap)) => cap,
+                Ok(Err(_)) => return SyscallResult::Error(ENOMEM_VALUE),
+                Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            }
         };
 
         let open_flags = OpenFileFlags {

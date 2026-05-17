@@ -61,6 +61,7 @@ use tx_subsystems::process::{
     SetsidOp, WaitError, WaitTarget,
 };
 use tx_subsystems::reactor_submit;
+use tx_subsystems::signalfd::ops::SignalfdCreateOp;
 use tx_subsystems::signal::{
     KillOutcome, KillProcessOp, SigDisposition, SigDispositionChange, SigactionOp,
     SignalMask, Signum,
@@ -167,7 +168,7 @@ pub use numbers::{
     RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK,
     RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO,
     RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK, RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END,
-    SEEK_SET, SIGCHLD, CLONE_SETTLS, CLONE_VM, TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME, TIMES_NS_PER_TICK,
+    SEEK_SET, SIGCHLD, CLONE_SETTLS, CLONE_VM, CLONE_FS, CLONE_FILES, CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_PARENT, CLONE_CHILD_CLEARTID, CLONE_PARENT_SETTID, TCGETS, TCSETS, TCSETSF, TCSETSW, TIMER_ABSTIME, TIMES_NS_PER_TICK,
     TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ, UTIME_NOW, UTIME_OMIT,
     WNOHANG, W_OK, X_OK,
 };
@@ -379,7 +380,7 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
         NR_FCNTL => sys_fcntl(req.args, ctx),
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
-        nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx),
+        nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
         nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
