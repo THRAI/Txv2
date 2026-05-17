@@ -43,6 +43,9 @@ use goblin::elf::program_header::{
 /// PT_GNU_STACK program header type (not in goblin's constants).
 const PT_GNU_STACK: u32 = 0x6474_e551;
 
+/// PT_GNU_RELRO program header type.
+const PT_GNU_RELRO: u32 = 0x6474_e552;
+
 /// ELF64 program-header size, in bytes. (Elf64_Phdr is 56 bytes.)
 pub const ELF64_PHENT: u64 = 56;
 

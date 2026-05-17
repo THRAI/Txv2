@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use tx_hal::{PmapIf, UserTrapContext};
 
 use crate::process::adapter::step_engine::{
-    self, Cap, IdentRef, NoProgress, OneShotStepOp, OperationalCapExt, PayloadCap, ScriptCtx,
+    self, Cap, IdentRef, NoProgress, OneShotStepOp, OperationalCapExt, PayloadCap, ScriptCtx, YieldShape,
     SpinMutex, StepOp, StepOutcome, SubjectIdentity, Weak, ZoneError,
 };
 use crate::process::adapter::wait_routing::{self, Mask};
@@ -1247,8 +1247,23 @@ pub struct WaitpidNohangOp<'a> {
 impl<'a, I: SubjectIdentity> StepOp<I> for WaitpidNohangOp<'a> {
     type Output = Result<(Pid, ExitStatus), WaitError>;
     type Progress = NoProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_waitpid_nohang(self.parent, self.target))
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let result = step_waitpid_nohang(self.parent, self.target);
+        match result {
+            Ok(outcome) => StepOutcome::Done(Ok(outcome)),
+            Err(WaitError::NoneReady) => {
+                // No child has exited yet — yield on the process's
+                // exit_source wait channel.  The drive loop parks
+                // the task; when a child exits, step_process_exit
+                // fires exit_source, and drive() re-calls step().
+                if let Some(exit_id) = self.parent.exit_source_id() {
+                    return StepOutcome::Yield { progress: NoProgress, shape: YieldShape::on_wait_source(exit_id, 1) };
+                }
+                // No exit source registered — would spin forever.
+                StepOutcome::Done(Err(WaitError::NoneReady))
+            }
+            Err(e) => StepOutcome::Done(Err(e)),
+        }
     }
 }
 
