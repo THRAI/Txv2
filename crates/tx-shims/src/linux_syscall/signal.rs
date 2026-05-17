@@ -314,16 +314,23 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
         si_uid: 0, // TODO: populate from cred when available
     });
 
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = KillProcessOp {
-        target: target.clone(),
-        sig: signum,
-        info: siginfo,
-    };
-    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(KillOutcome::Delivered) => SyscallResult::Return(0),
-        Ok(KillOutcome::NoLiveThread) => SyscallResult::Error(ESRCH_VALUE),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    // Route through the cred-checked script entry point. Drives
+    // `cred::require_signal_send` against the caller's syscall-entry
+    // snapshot (per cred_service_v_1 §"In flight" + §"Checks
+    // surface") and only then commits the post via `step_kill_process`.
+    // Going through `KillProcessOp::drive_oneshot` directly would
+    // bypass the cred check, since `KillProcessOp::step` calls the
+    // primitive `step_kill_process` without authorization.
+    match tx_subsystems::signal::script_kill_process(&ctx.process, &target, signum, siginfo) {
+        Ok(tx_subsystems::signal::KillScriptOutcome::Delivered) => SyscallResult::Return(0),
+        Ok(tx_subsystems::signal::KillScriptOutcome::NoLiveThread) => {
+            SyscallResult::Error(ESRCH_VALUE)
+        }
+        // `Probed` is the signal-0 outcome of `script_kill_probe`;
+        // `script_kill_process` never produces it. Map to 0
+        // defensively in case the variant becomes reachable.
+        Ok(tx_subsystems::signal::KillScriptOutcome::Probed) => SyscallResult::Return(0),
+        Err(e) => SyscallResult::Error(errno_to_i32(e)),
     }
 }
 
