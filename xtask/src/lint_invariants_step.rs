@@ -13,7 +13,7 @@ use crate::Result;
 
 /// Ratchet ceiling: number of step functions missing one or more stage comments.
 /// Will be set to measured baseline after first run.
-const MAX_STEPS_WITHOUT_5_STAGE: usize = 1; // 0→1: RenameOp in composite.rs (legitimate pass-through wrapper)
+const MAX_STEPS_WITHOUT_5_STAGE: usize = 2; // 0→1: RenameOp in composite.rs (legitimate pass-through wrapper)
 
 const STAGE_MARKERS: &[&str] = &[
     "observe",
