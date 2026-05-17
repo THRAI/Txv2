@@ -156,16 +156,38 @@ impl<'a, P: PmapIf + EntropyIf + AuxvIf, I: step_engine::SubjectIdentity> StepOp
 
             ExecProgress::Delegating => {
                 // Phases 3-8: delegate to exec_script for all remaining work.
-                // v1: exec_script runs synchronously on tmpfs (no I/O waits).
+                // v1: block_on is safe because tmpfs operations are synchronous.
                 // v2: individual phases will be migrated here with Yield support.
                 let _parsed = self.parsed.take().expect("ExecOp: parsed missing");
 
-                // TODO: call exec_script_inner here.
-                // For now, this is a stub — the real sys_execve still uses
-                // the old async path.  The ExecOp scaffold is ready for
-                // incremental migration.
-
-                StepOutcome::Done(())
+                // Build a Future from exec_script and block_on it.
+                // In v1 (tmpfs, no block device I/O), this returns Done
+                // immediately.  In v2, this phase will be split into
+                // individual sub-phases with Yield propagation.
+                let fut = tx_scripts::process::exec::exec_script::<P>(
+                    self.process,
+                    self.thread,
+                    self.path,
+                    self.argv,
+                    self.envp,
+                    self.cred,
+                );
+                match crate::adapter::step_engine::block_on(fut) {
+                    Ok(()) => StepOutcome::Done(()),
+                    Err(e) => {
+                        // Map ExecError to V3Errno
+                        let errno = match e {
+                            tx_scripts::process::exec::ExecError::PathNotFound => step_engine::Errno::ENOENT,
+                            tx_scripts::process::exec::ExecError::PermissionDenied => step_engine::Errno::EACCES,
+                            tx_scripts::process::exec::ExecError::NotExecutable => step_engine::Errno::ENOEXEC,
+                            tx_scripts::process::exec::ExecError::OutOfMemory => step_engine::Errno::ENOMEM,
+                            tx_scripts::process::exec::ExecError::IoError => step_engine::Errno::EIO,
+                            tx_scripts::process::exec::ExecError::Busy => step_engine::Errno::EBUSY,
+                            _ => step_engine::Errno::EIO,
+                        };
+                        StepOutcome::Err(errno)
+                    }
+                }
             }
         }
     }
