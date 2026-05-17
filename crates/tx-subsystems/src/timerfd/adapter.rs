@@ -1,8 +1,9 @@
-//! Substrate / reactor adapter for eventfd.
+//! Substrate / reactor adapter for timerfd.
 //!
 //! Two `#[platform_adapter]`-marked modules: step_engine (zone
 //! allocation, step outcomes, WaitSource) and wait_routing (Channel
-//! for legacy coexistence).  Mirrors the pipe / signalfd adapters.
+//! for legacy coexistence).  Mirrors the pipe / signalfd / eventfd
+//! adapters.
 
 use tx_platform_adapter::platform_adapter;
 
@@ -10,7 +11,7 @@ use tx_platform_adapter::platform_adapter;
     platform = "substrate",
     domain = "step_engine",
     apis = ["step", "zone", "wake"],
-    reason = "expose substrate step engine outcome/error types, zone allocation, EBR guard, and WaitSource for eventfd read/write step ops"
+    reason = "expose substrate step engine outcome/error types, zone allocation, EBR guard, and WaitSource for timerfd step ops"
 )]
 pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
@@ -26,7 +27,6 @@ pub mod step_engine {
         Dead, ZoneError,
         Entity, CoLocatedEntity, OperationalCapExt, OperationalRefExt, PayloadBinding,
         Zone, ZoneAllocated,
-        IdentitySlot, IsPayloadPolicy, CapProducingPolicy, ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy, ZonePolicy,
     };
     pub use tx_substrate::SpinMutex;
 
@@ -40,16 +40,12 @@ pub mod step_engine {
         StepOutcome::err(V3Errno::EAGAIN)
     }
 
-    pub fn eagain_no_progress() -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(V3Errno::EAGAIN)
+    pub fn einval() -> ByteOutcome {
+        StepOutcome::err(V3Errno::EINVAL)
     }
 
     pub fn yield_until_readable(wait_source_id: u64, mask: u64) -> ByteOutcome {
         StepOutcome::yield_on_wait_source(ByteProgress::EMPTY, wait_source_id, mask)
-    }
-
-    pub fn yield_until_writable(wait_source_id: u64, mask: u64) -> StepOutcome<(), NoProgress> {
-        StepOutcome::yield_on_wait_source(NoProgress, wait_source_id, mask)
     }
 
     pub fn register_zone_for<T: ZoneAllocated>() -> Result<(), ZoneError> {
@@ -61,12 +57,12 @@ pub mod step_engine {
     platform = "substrate",
     domain = "wait_routing",
     apis = ["wake"],
-    reason = "wrap WaitSource registration and v3 mailbox notify for eventfd"
+    reason = "wrap WaitSource registration and v3 mailbox notify for timerfd"
 )]
 #[platform_adapter(
     platform = "reactor",
     domain = "wait_routing",
-    reason = "wrap reactor Channel/Mask as eventfd legacy wakeup verbs (D2 coexistence)"
+    reason = "wrap reactor Channel/Mask as timerfd legacy wakeup verbs (D2 coexistence)"
 )]
 pub mod wait_routing {
     use alloc::sync::Arc;
