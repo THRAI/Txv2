@@ -115,6 +115,7 @@ mod misc;
 use misc::*;
 mod userfaultfd;
 use userfaultfd::*;
+pub mod clone_op;
 pub mod aio;
 use aio::*;
 pub mod io_uring;
@@ -520,7 +521,6 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_KILL => sys_kill(req.args, ctx),
         nr if nr == NR_TKILL => sys_tkill(req.args, ctx),
         nr if nr == NR_TGKILL => sys_tgkill(req.args, ctx),
-        nr if nr == NR_GETRANDOM => sys_getrandom::<P>(req.args, ctx),
         // rt_sigreturn: deferred. Returns -ENOSYS — the
         // SignalFrameIf::restore_signal_frame surface needs the trap
         // frame which the dispatcher does not yet pass through. The
