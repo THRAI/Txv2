@@ -21,16 +21,20 @@
 | 05 | [`05_DELEGATE_v1.md`](05_DELEGATE_v1.md) | The `OnAgent` yield shape. Cap-owned `DelegateEndpoint`. Token-as-cap. Typed request/reply with fd_injections and continuation. Cancellation policies. Coverage: userfaultfd, FUSE, fanotify-perm, ptrace. |
 | 06 | [`06_EXECUTION_SCOPE_v1.md`](06_EXECUTION_SCOPE_v1.md) | The `OnBehalfOf<P>` execution scope. Borrow primitive. Abandonment via Killable wait. Resource scoping. Coverage: io_uring SQPOLL, AIO, FUSE helper, network softirq. |
 | 07 | [`07_BLAST_RADIUS.md`](07_BLAST_RADIUS.md) | Migration cost: code volume, surface counts, per-change blast radius, recommended landing order, risk register. |
+| 08 | [`08_SYSV_IPC_v1.md`](08_SYSV_IPC_v1.md) | SysV + POSIX IPC subsystem family (sem / shm / msg) as a worked composition of v3 primitives. Canary doc: a real 30-syscall Linux family lands with zero closed-catalog growth. |
 
 ## 2. Reading orders
 
 <!-- txdoc:TXV3-INDEX-READING-1 -->
 
 **For a new contributor.**
-00 → 01 → skim 02 → 03 → 04 → pick a feature doc (05 or 06).
+00 → 01 → skim 02 → 03 → 04 → pick a feature doc (05 or 06) → optionally 08 for a worked subsystem.
 
 **For a feature designer proposing a new YieldShape or ExecutionScope.**
 00 §5 → 01 §closed-catalogs → 05 (worked example of new YieldShape) → 06 (worked example of new ExecutionScope) → write your ADR following the same shape.
+
+**For a subsystem author wanting a composition reference.**
+03 → 04 → 08 (SysV IPC: a real Linux family composing from existing primitives without catalog growth).
 
 **For a reviewer evaluating an in-flight subsystem.**
 02 (canonical) → 03 §10 (anti-patterns) → 04 (upper/lower discipline) → existing v4 subsystem doc.
