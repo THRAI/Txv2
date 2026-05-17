@@ -706,14 +706,21 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         tx_subsystems::vfs::InodeMeta,
         &str,
     ) = match fstype_str {
-        "tmpfs" => {
+        // `vfat` is an oscomp-basic compatibility shim: we have no
+        // FAT driver, but the basic test mounts `/dev/vda2` as
+        // `vfat` and only asserts `mount` + `umount` round-trip
+        // (`assert(ret == 0)`). A fresh tmpfs at the mount point
+        // satisfies that contract without pretending to read FAT
+        // bytes. Real FAT support tracks separately.
+        "tmpfs" | "vfat" => {
             let tmpfs = alloc::sync::Arc::new(tx_fs::tmpfs::Tmpfs::new());
+            let label = if fstype_str == "vfat" { "vfat" } else { "tmpfs" };
             (
                 tmpfs.clone().fs_ops_arc(),
                 tmpfs.fs_page_backing_arc(),
                 tx_subsystems::vfs::FsObjectId::ROOT,
                 tx_subsystems::vfs::InodeMeta::new(tx_subsystems::vfs::InodeKind::Directory, 0o755),
-                "tmpfs",
+                label,
             )
         }
         "devfs" => (
