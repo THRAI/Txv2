@@ -730,8 +730,15 @@ pub trait PmapIf {
 
     fn destroy_pmap_root(_root: PmapRoot) {}
 
-    fn activate_pmap(_root: &PmapRoot) -> Result<(), PmapError> {
-        Err(PmapError::Unsupported)
+    /// VM-facing alias for activating a user address-space root.
+    ///
+    /// `PmapRoot` is intentionally architecture-defined. RV64 boards may make
+    /// it a complete root containing both user and copied kernel-half entries;
+    /// LA64 boards may make it the per-process PGDL while keeping kernel
+    /// mappings in a board-global PGDH.
+    fn activate_pmap(root: &PmapRoot) -> Result<(), PmapError> {
+        Self::activate_user_pmap(root);
+        Ok(())
     }
 
     fn reserve_mapping(
@@ -780,8 +787,9 @@ pub trait PmapIf {
     /// Activate `root` as the current hart's user pmap.
     ///
     /// On RV64 this is `csrw satp, ((root.phys >> 12) | SV_MODE_BITS)
-    ///     + sfence.vma`. On LA64 the equivalent is the user-mode page-walk
-    ///     register write.
+    ///     + sfence.vma`. On LA64 this writes the active ASID/PGDL/PGDH state:
+    ///     `root` is the user PGDL and kernel mappings live in the board-global
+    ///     PGDH.
     ///
     /// Called by the thread runtime immediately before
     /// `TrapIf::enter_userspace_with_context` so the MMU consults the

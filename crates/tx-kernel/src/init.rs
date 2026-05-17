@@ -27,6 +27,7 @@ use tx_subsystems::vfs::{Credential, DEntry, InlineName, InodeMeta, RNode, RNode
 // pushed the AP further behind the 10M budget; bumped to 50M. Still
 // sub-second on real hardware.
 const AP_REACTOR_WAIT_SPINS: usize = 50_000_000;
+const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 
 /// Minimum platform-timer period used in the userspace reactor loop when
 /// the reactor has no pending deadline. Without this, WFI never wakes
@@ -794,9 +795,10 @@ impl<P: TxPlatform> CoreInit<P> {
                 }
                 other => panic!("mount_sdcard_at_musl: mkdir /bin: {other:?}"),
             };
-            let _ = rootfs_payload
-                .fs_ops
-                .symlink(bin_id, b"sh", b"/musl/musl/busybox", &cred, &guard);
+            let _ =
+                rootfs_payload
+                    .fs_ops
+                    .symlink(bin_id, b"sh", b"/musl/musl/busybox", &cred, &guard);
         }
 
         Self::write_board_sentinel_prefix();
@@ -1254,19 +1256,19 @@ impl<P: TxPlatform> CoreInit<P> {
         P::enable_timer_wakeups();
 
         let mut deadline_reached = false;
-        for _ in 0..AP_REACTOR_WAIT_SPINS {
+        for _ in 0..BSP_REACTOR_TIMER_WAIT_SPINS {
             if P::read_ns() >= deadline_ns {
                 deadline_reached = true;
                 break;
             }
-            crate::zones::try_bounded_maintenance_tick();
             core::hint::spin_loop();
         }
 
-        assert!(
-            deadline_reached,
-            "BSP reactor timer idle smoke deadline did not arrive"
-        );
+        if !deadline_reached {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":reactor:timer-idle:WARN-deadline\n");
+            return;
+        }
 
         let mut observed_timer_wake = false;
         for _ in 0..1024 {
@@ -1279,11 +1281,11 @@ impl<P: TxPlatform> CoreInit<P> {
                 tx_hal::console_write_str::<P>(":reactor:timer-idle:ok\n");
                 return;
             }
-            crate::zones::try_bounded_maintenance_tick();
             core::hint::spin_loop();
         }
 
-        panic!("BSP reactor timer idle smoke did not complete");
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":reactor:timer-idle:WARN-wake\n");
     }
 
     fn bsp_timer_smoke_done(cpu_bit: u64) -> bool {

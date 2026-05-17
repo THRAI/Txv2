@@ -1,3 +1,160 @@
+- 2026-05-17 **LA64 QEMU SMP shape made explicit.**
+  Added a `--smp N` override to `cargo xtask qemu`, keeping the default LA64
+  smoke lane at `-smp 4` while making `-smp 1` directly reproducible when
+  needed. OSComp local QEMU remains fixed at `-smp 1` to mirror the contest
+  shape; the normal smoke lane now documents and preserves the split instead of
+  hiding it behind comments. Verified that both `cargo xtask qemu --target
+  la64-qemu --profile smoke --expect-sentinel` (default `-smp 4`) and the new
+  `--smp 1` override reach `boot:ok`.
+  **Verified:** `cargo test -p xtask qemu`; `cargo fmt --check`; `cargo xtask
+  qemu --target la64-qemu --profile smoke --dry-run`; `cargo xtask qemu
+  --target la64-qemu --profile smoke --expect-sentinel --smp 1`; `make
+  docker-build-la64`.
+  **Next step:** continue with any remaining LA64 cleanup or move on to the
+  next requested area.
+
+- 2026-05-17 **LA64 boot Phase 7 completed: verbose boot trace gated.**
+  Added `la64-boot-trace` features to the LA64 HAL crate and LA64 kernel board
+  crate, with the board feature forwarding to the HAL feature. Default LA64
+  builds no longer print raw direct-boot registers (`bootarg`), boot facts
+  summaries (`bootinfo`), or pmap activation CSR breadcrumbs (`pmap:*`) on the
+  serial console. The trace helpers remain available when building the LA64
+  kernel board with `--features la64-boot-trace`; fatal trap dumps remain
+  ungated because they are failure diagnostics rather than routine boot trace.
+  **Verified:** `rustfmt --edition 2021 --check` on touched LA64 HAL files;
+  `cargo test -p tx-hal-loongarch64-qemu-virt` 43/43;
+  `cargo test -p tx-hal-loongarch64-qemu-virt --features la64-boot-trace` 43/43;
+  `CARGO_TARGET_DIR=/tmp/txv2-trace-target cargo build -p
+  tx-kernel-loongarch64-qemu-virt --target loongarch64-unknown-none --features
+  la64-boot-trace`; `make docker-build-la64`;
+  `timeout 20s cargo xtask qemu --target la64-qemu --profile smoke
+  --expect-sentinel`. Default serial log now has no
+  `txkernel:qemu-loongarch64-virt:bootarg`, `bootinfo`, or `pmap:` trace lines;
+  the trace build emits `bootarg`/`bootinfo` as expected.
+  **Next step:** Phase 8, decide whether to keep normal LA64 QEMU at SMP=4 while
+  OSComp stays SMP=1, or document/adjust the lane split.
+
+- 2026-05-16 **LA64 boot Phase 6 completed: DMW bootstrap pmap semantics explicit.**
+  Added an internal `La64BootstrapMapping` in
+  `boards/tx-hal-loongarch64-qemu-virt/src/boot_facts.rs` so
+  `BootstrapPmapInfo` is now derived from a named DMW-backed bootstrap mapping
+  instead of an inline struct literal. The type makes the current contract
+  explicit: early direct-map addressability comes from DMW, `root=PhysAddr(0)`
+  means there is no RV64-style bootstrap page-table root, and the real LA64
+  kernel PGDH root is established later in `la64_pmap` before userspace entry.
+  Added small DMW range helpers in `la64_pmap.rs`, documented the
+  `PmapIf::bootstrap_pmap_info()` glue, and extended the pmap test to assert the
+  mapping type and published `BootstrapPmapInfo` stay identical.
+  **Verified:** `rustfmt --edition 2021 --check` on touched LA64 HAL files;
+  `cargo test -p tx-hal-loongarch64-qemu-virt` 43/43;
+  `CARGO_TARGET_DIR=/tmp/txv2-target cargo xtask build --target la64-qemu`;
+  `make docker-build-la64`;
+  `timeout 20s cargo xtask qemu --target la64-qemu --profile smoke --expect-sentinel`.
+  **Next step:** Phase 7, gate noisy LA64 boot diagnostics behind a
+  `la64-boot-trace` feature while keeping stable sentinels.
+
+- 2026-05-16 **LA64 timer-smoke boot stall narrowed and shortened.**
+  The intermittent-looking stop after `:reactor:runtime-loop:ok` was reproduced
+  as a short-timeout boot stall inside `run_bsp_reactor_timer_idle_smoke()`.
+  The smoke loop was calling `try_bounded_maintenance_tick()` on every spin,
+  which can stretch a 5ms timer probe enough that the local OSComp QEMU target
+  is killed before it reaches userspace. Removed those maintenance ticks from
+  the dedicated timer-smoke wait loops; zone maintenance still runs on the real
+  idle/runtime paths. After rebuilding and refreshing `target/oscomp/submit`,
+  a 6s LA64 OSComp QEMU run reaches `:reactor:timer-idle:ok`,
+  `:process:init:ok`, `:userspace:submitted`, and
+  `#### OS COMP TEST GROUP START basic-musl ####`.
+  **Verified:** `rustfmt --edition 2021 --check crates/tx-kernel/src/init.rs`;
+  `cargo test -p tx-kernel init` 27/27; `make docker-build-la64`;
+  `cargo xtask oscomp submit --submit target/oscomp/submit`;
+  `timeout 6s make oscomp-qemu-la64` reaches the basic-musl group start before
+  the intentional timeout.
+  **Next step:** continue Phase 6 by making the LA64 DMW-backed bootstrap pmap
+  semantics explicit in `boot_facts.rs`.
+
+- 2026-05-16 **LA64 boot Phase 4-5 completed: boot facts storage + SMP helpers split.**
+  Finished Phase 4 by moving `BOOT_MEMORY_REGIONS`, `BOOT_CMDLINE`, `BOOT_INFO`,
+  `BOOTSTRAP_PMAP_INFO`, and `PLATFORM_INFO` storage out of `lib.rs` into
+  `boards/tx-hal-loongarch64-qemu-virt/src/boot_facts.rs`. Firmware parsing now
+  writes those buffers through narrow `boot_facts` pointer/capacity accessors.
+  Added `boot_smp.rs` for IOCSR mailbox/IPI helpers, secondary CPU start, boot
+  stack selection, and online wait; `platform_impls.rs` now keeps the `SmpIf`
+  trait glue and delegates the low-level SMP work to `boot_smp`.
+  **Verified:** `cargo test -p tx-hal-loongarch64-qemu-virt` 43/43;
+  `CARGO_TARGET_DIR=/tmp/txv2-target cargo xtask build --target la64-qemu`
+  clean.
+  **Next step:** Phase 6, make the LA64 DMW-backed bootstrap pmap semantics
+  explicit with a small internal bootstrap-mapping type.
+
+- 2026-05-16 **LA64 boot timer-smoke hang guarded with WARN sentinels.**
+  The reported intermittent stop after `:reactor:runtime-loop:ok` lands inside
+  `CoreInit::run_bsp_reactor_timer_idle_smoke()`, before
+  `:reactor:timer-idle:ok`. That smoke validates the BSP reactor timeout path,
+  but on LA64/QEMU it can intermittently wait too long for the emulated timer.
+  Changed the smoke to use a smaller dedicated spin budget and emit
+  `:reactor:timer-idle:WARN-deadline` or `:reactor:timer-idle:WARN-wake`
+  instead of wedging boot. This is a kernel startup-smoke guard, not a HAL
+  semantic change; the next LA64 run will tell us whether the unstable leg is
+  timebase progress or reactor wake observation.
+  **Verified:** `cargo test -p tx-kernel init` 27/27 filtered tests;
+  `cargo test -p tx-hal-loongarch64-qemu-virt` 43/43;
+  `CARGO_TARGET_DIR=/tmp/txv2-target cargo xtask build --target la64-qemu`
+  clean.
+  **Next step:** run the LA64 busybox/full boot and inspect whether the log shows
+  `:reactor:timer-idle:ok`, `WARN-deadline`, or `WARN-wake`.
+
+- 2026-05-16 **LA64 boot Phase 4 first cut landed: boot facts publisher split out.**
+  Added `boards/tx-hal-loongarch64-qemu-virt/src/boot_facts.rs` and moved
+  `ensure_static_boot_facts()`, `publish_static_boot_facts()`, boot summary
+  logging, and linked-kernel image discovery out of `la64_irq_trap.rs`.
+  `BootInfoIf`, `PlatformInfoIf`, and `PmapIf::bootstrap_pmap_info()` now read
+  through `boot_facts`, while `la64_irq_trap.rs` keeps trap/IRQ helpers.
+  The existing static `BOOT_INFO`/`PLATFORM_INFO`/`BOOTSTRAP_PMAP_INFO` storage
+  remains in `lib.rs` for this cut to keep the storage-layout move separate
+  from the publisher move.
+  **Verified:** `cargo test -p tx-hal-loongarch64-qemu-virt` 43/43;
+  `CARGO_TARGET_DIR=/tmp/txv2-target cargo xtask build --target la64-qemu`
+  clean.
+  **Next step:** finish Phase 4 by moving the static boot buffers/storage behind
+  `boot_facts` accessors or proceed to `boot_smp.rs` if we want to keep storage
+  stable for one more checkpoint.
+
+- 2026-05-16 **LA64 boot Phase 3 landed: firmware parsing moved out of trap path.**
+  Added `boards/tx-hal-loongarch64-qemu-virt/src/boot_firmware.rs` for EFI,
+  QEMU fw_cfg, FDT probing, cmdline/initrd discovery, and firmware-derived
+  memory-region population. `la64_irq_trap.rs` now calls
+  `boot_firmware::parse_firmware_boot_info()` and keeps the boot-facts
+  publication/summary path, while trap/IRQ code no longer owns the firmware
+  parser helpers.
+  **Verified:** `rustfmt --edition 2021` on touched LA64 HAL files; `cargo test
+  -p tx-hal-loongarch64-qemu-virt` 43/43; `CARGO_TARGET_DIR=/tmp/txv2-target
+  cargo xtask build --target la64-qemu` clean.
+  **Next step:** introduce `boot_facts.rs` and move the static BootInfo,
+  PlatformInfo, BootstrapPmapInfo publication state out of `la64_irq_trap.rs`.
+
+- 2026-05-16 **LA64 boot Phase 1-2 landed: asm split + raw boot args isolated.**
+  Moved the LA64 early-boot and trap/userspace-entry raw asm out of
+  `boards/tx-hal-loongarch64-qemu-virt/src/lib.rs` into `boot_asm.rs` and
+  `trap_asm.rs`, then added `boot_args.rs` as the single home for direct-boot
+  atomics. `rust_entry` in `boards/tx-kernel-loongarch64-qemu-virt/src/main.rs`
+  now passes `cpu_id` into `capture_loongarch64_qemu_boot_args`, and
+  `la64_irq_trap.rs` snapshots boot args instead of reading scattered globals.
+  **Verified:** `rustfmt --edition 2021 --check` on touched files; `cargo test -p
+  tx-hal-loongarch64-qemu-virt` 43/43; `CARGO_TARGET_DIR=/tmp/txv2-target
+  cargo xtask build --target la64-qemu` clean. Plain `cargo xtask build
+  --target la64-qemu` is blocked by an existing permission-denied write under
+  `target/loongarch64-unknown-none/...`, not by the code change.
+  **Next step:** extract `boot_firmware.rs` from `la64_irq_trap.rs` so firmware
+  parsing no longer lives beside trap/IRQ code.
+
+- 2026-05-16 **LA64 boot 启动路径重构方案文档已补充。**
+  在 `docs/ljs/LA64_BOOT_REFACTOR_PLAN_2026-05-16.md` 记录 LA64 early boot
+  结构债务、目标文件布局、BootArgs/BootFacts 管线、分阶段迁移计划、验收命令
+  和回滚策略。该文档是设计/执行方案，未改代码。
+  **Verified:** 文档新增，无运行代码验证。
+  **Next step:** 按 Phase 1 先做行为保持型 `boot_asm.rs` / `trap_asm.rs`
+  机械拆分，再引入 `boot_args.rs`。
+
 - 2026-05-13 **ext4 write support + brk page-alignment fix: 5 more OSComp tests pass.**
   Implemented ext4 write operations across three layers:
   1. `tx-ext4-format/pager.rs`: added `allocate_inode`, `write_inode`, `allocate_block`,
