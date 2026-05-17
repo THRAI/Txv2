@@ -686,7 +686,7 @@ mod v3_tests {
             self.truncate_outcome
         }
 
-        fn fsync(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Outcome<(), NoProgress> {
+        fn fsync_file(&self, fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Outcome<(), NoProgress> {
             self.fsyncs.fetch_add(1, Ordering::AcqRel);
             self.last_object
                 .store(fs_object_id.as_u64(), Ordering::Release);

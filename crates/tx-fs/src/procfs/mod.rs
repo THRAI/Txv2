@@ -338,5 +338,5 @@ impl FsPageBacking for Procfs {
     fn fetch_page(&self, _: FsObjectId, _: u64, _: &Guard<'_>) -> StepOutcome<Frame, NoProgress> { StepOutcome::err(Errno::ENOSYS.into()) }
     fn flush_page(&self, _: FsObjectId, _: u64, _: &Frame, _: &Guard<'_>) -> StepOutcome<(), NoProgress> { StepOutcome::err(Errno::ENOSYS.into()) }
     fn truncate(&self, _: FsObjectId, _: u64, _: &Guard<'_>) -> StepOutcome<(), NoProgress> { StepOutcome::err(Errno::ENOSYS.into()) }
-    fn fsync(&self, _: FsObjectId, _: &Guard<'_>) -> StepOutcome<(), NoProgress> { StepOutcome::err(Errno::ENOSYS.into()) }
+    fn fsync_file(&self, _: FsObjectId, _: &Guard<'_>) -> StepOutcome<(), NoProgress> { StepOutcome::err(Errno::ENOSYS.into()) }
 }

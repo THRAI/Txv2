@@ -54,7 +54,7 @@ pub trait FsPageBacking: Send + Sync + 'static {
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress>;
 
-    fn fsync(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<(), NoProgress>;
+    fn fsync_file(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<(), NoProgress>;
 
     /// Default returns `Done(())`.
     fn fallocate(

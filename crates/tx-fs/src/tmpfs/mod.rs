@@ -986,7 +986,7 @@ impl FsPageBacking for Tmpfs {
         StepOutcome::done(())
     }
 
-    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         // In-memory; durability is trivially satisfied.
         StepOutcome::done(())
     }
