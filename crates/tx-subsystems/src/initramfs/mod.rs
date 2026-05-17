@@ -443,6 +443,7 @@ fn mkdir_idempotent(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn unpack_regular(
     fs_ops: &Arc<dyn FsOps>,
     fs_page_backing: &Arc<dyn FsPageBacking>,

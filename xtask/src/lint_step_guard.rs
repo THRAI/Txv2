@@ -76,7 +76,11 @@ pub(crate) fn lint_invariants_step_guard(root: &Path) -> Result<()> {
     let count = violations.len();
     println!("Invariants Lint — step-guard (STEP_MODEL_v2 §1 / EBR-7)");
     println!("=======================================================");
-    let status = if count > MAX_GUARD_FIELDS { "OVER" } else { "ok" };
+    let status = if count > MAX_GUARD_FIELDS {
+        "OVER"
+    } else {
+        "ok"
+    };
     println!(
         "`pub guard: &Guard` fields in StepOp wraps: {:>4}  (ceiling {})  {}",
         count, MAX_GUARD_FIELDS, status

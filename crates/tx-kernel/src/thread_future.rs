@@ -86,9 +86,9 @@ use boot_runtime::userspace::{
     UserspaceTrapInfo,
 };
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
+use tx_subsystems::signal::deliver_synchronous_fault;
 use tx_subsystems::signal::Signum;
 use tx_subsystems::signal::{ast_dispatch, AstOutcome};
-use tx_subsystems::signal::deliver_synchronous_fault;
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, set_current_thread_payload, ThreadIdentity, ThreadPayload,
@@ -293,17 +293,18 @@ pub async fn run_thread<P: TxPlatform>(
                         stack_top,
                         sig_no: sig.raw() as u32,
                         siginfo: tx_hal::UserSigInfoAbi::ZERO,
-                        old_mask: tx_hal::UserSignalMaskAbi { bits: old_mask.raw_bits() },
+                        old_mask: tx_hal::UserSignalMaskAbi {
+                            bits: old_mask.raw_bits(),
+                        },
                         flags: tx_hal::UserSaFlagsAbi { bits: 0 },
-                        handler_pc: tx_hal::UserPtr::<()>::new(handler as usize),
+                        handler_pc: tx_hal::UserPtr::<()>::new(handler),
                     };
 
                     // Guard is scoped inside this block so it does not
                     // straddle the next `.await` further down in
                     // `run_thread` (the spawned future must be `Send`).
-                    let prepared = <P as tx_hal::SignalFrameIf>::prepare_signal_frame(
-                        &orig_ctx, &setup,
-                    );
+                    let prepared =
+                        <P as tx_hal::SignalFrameIf>::prepare_signal_frame(&orig_ctx, &setup);
                     match prepared {
                         Ok((handler_ctx, frame_bytes)) => {
                             let frame_addr = handler_ctx.regs[2];

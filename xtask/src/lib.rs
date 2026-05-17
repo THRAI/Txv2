@@ -17,11 +17,11 @@ mod lint_invariants_script;
 mod lint_invariants_signal;
 mod lint_invariants_step;
 mod lint_invariants_step_v3;
-#[path = "lint_step_guard.rs"]
-mod lint_step_guard;
 mod lint_invariants_subj;
 mod lint_invariants_syscall;
 mod lint_invariants_witness;
+#[path = "lint_step_guard.rs"]
+mod lint_step_guard;
 mod observe;
 mod observe_discipline;
 mod oscomp;

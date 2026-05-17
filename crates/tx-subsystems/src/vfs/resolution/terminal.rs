@@ -14,7 +14,7 @@
 
 use crate::execution::{Errno, Guard};
 use crate::vfs::checks::{DirectoryAtPath, EntityAtPath, ParentAndName};
-use crate::vfs::structure::{InodeKind, InlineName};
+use crate::vfs::structure::{InlineName, InodeKind};
 
 use super::state::{PathResolution, WalkMode, WalkState};
 
@@ -53,7 +53,11 @@ pub fn build_entity_witness<'g>(
     resolved: &PathResolution,
     guard: &'g Guard<'_>,
 ) -> Result<EntityAtPath<'g>, Errno> {
-    Ok(EntityAtPath::from_caps(&resolved.dentry, &resolved.rnode, guard))
+    Ok(EntityAtPath::from_caps(
+        &resolved.dentry,
+        &resolved.rnode,
+        guard,
+    ))
 }
 
 /// Build a `DirectoryAtPath` witness from a terminal `PathResolution`.
@@ -67,7 +71,11 @@ pub fn build_directory_witness<'g>(
     if resolved.meta.kind() != InodeKind::Directory {
         return Err(Errno::ENOTDIR);
     }
-    Ok(DirectoryAtPath::from_caps(&resolved.dentry, &resolved.rnode, guard))
+    Ok(DirectoryAtPath::from_caps(
+        &resolved.dentry,
+        &resolved.rnode,
+        guard,
+    ))
 }
 
 /// Build a `ParentAndName` witness from a terminal `PathResolution`

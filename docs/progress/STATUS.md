@@ -7,20 +7,20 @@
   This pass makes the surface honest:
   - `Ext4FsInstance` gained a `read_only: AtomicBool` set at
     `open(image, read_only)` time, with `is_read_only()` accessor
-    ([read_backend.rs:27](crates/tx-ext4/src/read_backend.rs)).
+    ([read_backend.rs:27](../../crates/tx-ext4/src/read_backend.rs)).
   - New `mount_ext4_read_write(image)` entry point in
-    [mount.rs:46](crates/tx-ext4/src/mount.rs);
+    [mount.rs:46](../../crates/tx-ext4/src/mount.rs);
     `mount_ext4_read_only(image)` retained and delegates through the
     shared private `open_ext4` helper. Both exported from
     `tx_fs::tx_ext4`.
   - `Ext4FsInstance` `FsOps::{create_inode, mkdir, unlink}` mutators
     short-circuit with `-EROFS` when the mount is RO
-    ([namespace.rs:104](crates/tx-ext4/src/namespace.rs)). Matches
+    ([namespace.rs:104](../../crates/tx-ext4/src/namespace.rs)). Matches
     Linux's `MS_RDONLY` semantics: reads/lookup keep working, every
     write returns EROFS.
   - `sys_mount("ext4", ..., flags, ...)` now parses Linux's
     `MS_RDONLY = 1` from the flags word
-    ([fs_mut.rs:768](crates/tx-shims/src/linux_syscall/fs_mut.rs)) and
+    ([fs_mut.rs:768](../../crates/tx-shims/src/linux_syscall/fs_mut.rs)) and
     picks the right entry point; the resulting `MountFlags::READ_ONLY`
     bit is also threaded into the kernel `MountPayload.options.flags`
     so a future `remount(2)` arm has the state to flip.
@@ -28,12 +28,12 @@
     `ext4_v3_mutation_methods_rejected_on_read_only_mount_with_erofs`
     pins the EROFS short-circuit on `create_inode`/`mkdir`/`unlink`
     while confirming `lookup` still resolves
-    ([tests_v3.rs:293](crates/tx-ext4/src/tests_v3.rs)).
+    ([tests_v3.rs:293](../../crates/tx-ext4/src/tests_v3.rs)).
 
   **Scope gap (intentional, not regressed by this pass):**
   - File-content writeback (`FsPageBacking::flush_page`/`truncate`/
     `fsync_file` for `Ext4FsInstance` at
-    [pager.rs:105](crates/tx-ext4/src/pager.rs)) still returns
+    [pager.rs:105](../../crates/tx-ext4/src/pager.rs)) still returns
     `-ENOSYS`. Namespace writes (file/dir create/unlink/remove) go
     through the pager's direct-write path
     (`create_regular_file`/`create_directory`/`remove_dir_entry` →
@@ -53,13 +53,13 @@
   syscall routes through:
   1. Walk `source` to a dentry; require the underlying RNode to be a
      bdev-fs inode (per the design doc's §8.1 bridge).
-  2. Call new helper [`tx_fs::bdevfs::block_device_for_object_id`](crates/tx-fs/src/bdevfs/mod.rs) —
+  2. Call new helper [`tx_fs::bdevfs::block_device_for_object_id`](../../crates/tx-fs/src/bdevfs/mod.rs) —
      the canonical `bdev_fs::block_device_handle_for` from BDEV_FS §8.1
      — to map the bdev-fs `FsObjectId` back to its
      `&'static BlockDeviceRegistration`.
   3. Wrap the registration's ops in
-     [`BlockDeviceImage`](crates/tx-fs/src/tx_ext4_bridge.rs) and call
-     [`mount_ext4_read_only`](crates/tx-ext4/src/mount.rs).
+     [`BlockDeviceImage`](../../crates/tx-fs/src/tx_ext4_bridge.rs) and call
+     [`mount_ext4_read_only`](../../crates/tx-ext4/src/mount.rs).
   4. Sign the kernel-side `MountPayload`, then call
      `MountedExt4::bind_mount_payload(&payload)` so the backend's
      `materialise_rnode` can stamp `PageContainerKind::File { mount, .. }`
@@ -84,7 +84,7 @@
   instance exists per system, mounted at `/dev/block`" — and §7.3
   (devfs/bdev-fs interaction):
   - Added a synthetic `DEVFS_BLOCK_DIR_OBJECT_ID` directory entry to
-    devfs ([devfs/mod.rs:64](crates/tx-fs/src/devfs/mod.rs)). It is a
+    devfs ([devfs/mod.rs:64](../../crates/tx-fs/src/devfs/mod.rs)). It is a
     read-only stub whose sole purpose is to serve as the bdev-fs
     mountpoint (devfs as a whole still rejects `mkdir` with `EROFS`,
     matching the design's "no userspace path to create new entries"
@@ -92,7 +92,7 @@
     `Directory` meta, `readdir` emits it at cursor index
     `entries.len()` after the TTY aliases.
   - New kernel boot step
-    [`mount_bdevfs_at_dev_block`](crates/tx-kernel/src/init.rs) builds
+    [`mount_bdevfs_at_dev_block`](../../crates/tx-kernel/src/init.rs) builds
     `BdevFsMountPayload::new()`, wraps it in a `MountPayload`, and
     publishes the mount on devfs's `/dev/block` stub via
     `mount::register_mount`. Runs between `register_devfs_console_alias`
@@ -191,7 +191,7 @@
     unregisters on teardown. This unblocked the `dispatch_kill_*`
     family.
   - `sys_getrandom` wired into the dispatch table at
-    [linux_syscall/mod.rs:374](crates/tx-shims/src/linux_syscall/mod.rs).
+    [linux_syscall/mod.rs:374](../../crates/tx-shims/src/linux_syscall/mod.rs).
   - **New CI gate `cargo xtask lint invariants step-guard`**: scans
     `tx-subsystems`, `tx-scripts`, `tx-shims` for
     `pub guard: &'_ … Guard<'_>` field declarations on any StepOp
@@ -206,7 +206,7 @@
     `RNode::new_cap_in_mount` instead of `RNode::new_cap`, so the
     materialised RNode advertises its containing mount via
     `containing_mount_weak()`. The walker's
-    [`resolution/step::materialise_child`](crates/tx-subsystems/src/vfs/resolution/step.rs:382)
+    [`resolution/step::materialise_child`](../../crates/tx-subsystems/src/vfs/resolution/step.rs)
     forwards the parent's `mount_payload`; `mount::bootstrap_mount`
     and `initramfs::unpack_regular` pass the payload they already hold;
     `vfs::execution::kernel_{mkdir,create,symlink}` take `mount_payload`

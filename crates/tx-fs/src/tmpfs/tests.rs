@@ -32,7 +32,9 @@ fn init_substrate() {
 /// call `FsOps::materialise_rnode` can satisfy the trait's
 /// mount-stamping contract (`docs/Txv3/02_INVARIANTS_v5.md` BIF-… and
 /// `walker::fs_ops_for` resolution).
-fn test_mount_payload(tmpfs: &alloc::sync::Arc<Tmpfs>) -> step_engine::Cap<tx_subsystems::mount::MountPayload> {
+fn test_mount_payload(
+    tmpfs: &alloc::sync::Arc<Tmpfs>,
+) -> step_engine::Cap<tx_subsystems::mount::MountPayload> {
     use tx_subsystems::mount::{DevId, MountOptions, MountPayload, SourceLabel};
     MountPayload::new_cap(
         tmpfs.clone() as alloc::sync::Arc<dyn tx_subsystems::vfs::FsOps>,
@@ -399,7 +401,13 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
     // discriminant; the `Cap<PageContainer>::key` (or any other
     // identity check) would suffice but the variant alone is the
     // contract Phase 7 needs.
-    let rnode = match <Tmpfs as FsOps>::materialise_rnode(&*tmpfs, file_id, file_meta, &test_mount_payload(&tmpfs), &guard) {
+    let rnode = match <Tmpfs as FsOps>::materialise_rnode(
+        &*tmpfs,
+        file_id,
+        file_meta,
+        &test_mount_payload(&tmpfs),
+        &guard,
+    ) {
         StepOutcome::Done(rnode) => rnode,
         other => panic!("materialise_rnode for regular file: {other:?}"),
     };
@@ -443,7 +451,13 @@ fn tmpfs_materialise_rnode_for_directory_returns_eisdir() {
         other => panic!("load_inode_meta(root): {other:?}"),
     };
     assert_eq!(
-        <Tmpfs as FsOps>::materialise_rnode(&*tmpfs, TMPFS_ROOT_OBJECT_ID, meta, &test_mount_payload(&tmpfs), &guard),
+        <Tmpfs as FsOps>::materialise_rnode(
+            &*tmpfs,
+            TMPFS_ROOT_OBJECT_ID,
+            meta,
+            &test_mount_payload(&tmpfs),
+            &guard
+        ),
         StepOutcome::Err(Errno::EISDIR)
     );
 }
@@ -470,7 +484,13 @@ fn tmpfs_materialise_rnode_for_symlink_returns_einval() {
     // mirroring the Linux `inode_operations.lookup` shape for non-
     // page-backed kinds tmpfs intentionally rejects here.
     assert_eq!(
-        <Tmpfs as FsOps>::materialise_rnode(&*tmpfs, link_id, link_meta, &test_mount_payload(&tmpfs), &guard),
+        <Tmpfs as FsOps>::materialise_rnode(
+            &*tmpfs,
+            link_id,
+            link_meta,
+            &test_mount_payload(&tmpfs),
+            &guard
+        ),
         StepOutcome::Err(Errno::EINVAL)
     );
 }
@@ -883,7 +903,6 @@ fn step_walk_against_tmpfs_resolves_real_path() {
     use tx_subsystems::vfs::structure::{
         DEntry, InlineName, InodeMeta, RNode, RNodeBacking, S_IFDIR,
     };
-    use tx_subsystems::vfs::walker::step_walk;
 
     let _serial = crate::test_support::FS_TEST_LOCK
         .lock()
@@ -944,12 +963,14 @@ fn step_walk_against_tmpfs_resolves_real_path() {
     // shape mirrors what a block-backed FS would drive through the
     // reactor's `tx_scripts::drive::drive::<PathWalkOp, _>` loop.
     drop(guard);
+    use tx_substrate::step::{
+        NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome as V3Outcome,
+    };
     use tx_subsystems::vfs::PathWalkOp;
-    use tx_substrate::step::{NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome as V3Outcome};
     let mut op = PathWalkOp {
         rooted_at: root_dentry.clone(),
         path: b"/dir".to_vec(),
-        cred: cred.clone(),
+        cred,
     };
     let mut ctx = ScriptCtx::<ProcessIdentity>::new();
     let outcome: V3<Cap<DEntry>, NoProgress> = loop {

@@ -665,7 +665,11 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecveTestFs {
         StepOutcome::done(())
     }
 
-    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
         StepOutcome::done(())
     }
 }

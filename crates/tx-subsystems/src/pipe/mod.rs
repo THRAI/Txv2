@@ -49,8 +49,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    self, ByteProgress, Cap, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp,
-    StepOutcome, SubjectIdentity, Zone, ZoneAllocated, ZoneError,
+    self, ByteProgress, Cap, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome,
+    SubjectIdentity, Zone, ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::{self, Channel, WaitSource};
 
@@ -926,7 +926,7 @@ mod tests {
         let outcome = step_pipe2(PipeFlags::default());
         match outcome {
             // publish: N/A — pipe creation doesn't publish signals
-    Ok((reader, writer)) => {
+            Ok((reader, writer)) => {
                 assert_eq!(side_of(&reader), PipeSide::Reader);
                 assert_eq!(side_of(&writer), PipeSide::Writer);
                 assert!(reader.flags().read);
@@ -950,7 +950,7 @@ mod tests {
         });
         match outcome {
             // publish: N/A — pipe creation doesn't publish signals
-    Ok((reader, writer)) => {
+            Ok((reader, writer)) => {
                 assert!(reader.flags().cloexec);
                 assert!(reader.flags().nonblocking);
                 assert!(writer.flags().cloexec);
@@ -1278,7 +1278,6 @@ mod step_op_wraps {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = guard();
         let mut empty: [u8; 0] = [];
         let mut op = ReadOp {
             payload: &payload,
@@ -1286,7 +1285,6 @@ mod step_op_wraps {
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Done(0) => {}
             other => panic!("expected Done(0), got {other:?}"),
@@ -1298,7 +1296,6 @@ mod step_op_wraps {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = guard();
         let mut buf = [0u8; 4];
         let mut op = ReadOp {
             payload: &payload,
@@ -1306,7 +1303,6 @@ mod step_op_wraps {
             nonblocking: true,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EAGAIN) => {}
             other => panic!("expected Err(EAGAIN), got {other:?}"),
@@ -1319,9 +1315,12 @@ mod step_op_wraps {
         let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let _ = writer; // hold writer alive so step_read sees writer_count > 0
-        let guard = guard();
-        // Seed via the free fn.
-        let _ = step_write(&payload, b"hello", &guard, false);
+                        // Seed via the free fn (its own guard scope so the StepOp wrap
+                        // below acquires its own per STEP_MODEL §1).
+        {
+            let guard = guard();
+            let _ = step_write(&payload, b"hello", &guard, false);
+        }
         let mut buf = [0u8; 8];
         let mut op = ReadOp {
             payload: &payload,
@@ -1329,7 +1328,6 @@ mod step_op_wraps {
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Done(n) => {
                 assert_eq!(n, 5);
@@ -1344,7 +1342,6 @@ mod step_op_wraps {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = guard();
         let mut buf = [0u8; 4];
         let mut op = ReadOp {
             payload: &payload,
@@ -1352,7 +1349,6 @@ mod step_op_wraps {
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Yield {
                 progress,
@@ -1375,7 +1371,6 @@ mod step_op_wraps {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
-        let guard = guard();
         let bytes: &[u8] = &[];
         let mut op = WriteOp {
             payload: &payload,
@@ -1383,7 +1378,6 @@ mod step_op_wraps {
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Done(0) => {}
             other => panic!("expected Done(0), got {other:?}"),
@@ -1397,7 +1391,6 @@ mod step_op_wraps {
         let payload = payload_of(&reader);
         let _ = writer; // hold writer alive
         let _ = reader; // hold reader alive
-        let guard = guard();
         let bytes: &[u8] = b"hello";
         let mut op = WriteOp {
             payload: &payload,
@@ -1405,7 +1398,6 @@ mod step_op_wraps {
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Done(n) => assert_eq!(n, 5),
             other => panic!("expected Done(5), got {other:?}"),
@@ -1420,7 +1412,6 @@ mod step_op_wraps {
         drop(reader);
         tx_test_support::drain_to_quiescence();
         assert_eq!(payload.reader_count_snapshot(), 0);
-        let guard = guard();
         let bytes: &[u8] = b"x";
         let mut op = WriteOp {
             payload: &payload,
@@ -1428,7 +1419,6 @@ mod step_op_wraps {
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
-        drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EPIPE) => {}
             other => panic!("expected Err(EPIPE), got {other:?}"),

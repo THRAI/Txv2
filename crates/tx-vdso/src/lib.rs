@@ -42,4 +42,4 @@ pub static VDSO_IMAGE: &[u8] = &[];
 pub const VDSO_IMAGE_SIZE: usize = VDSO_IMAGE.len();
 
 /// Number of 4 KiB pages the vDSO image occupies.
-pub const VDSO_NUM_PAGES: usize = (VDSO_IMAGE_SIZE + 4095) / 4096;
+pub const VDSO_NUM_PAGES: usize = VDSO_IMAGE_SIZE.div_ceil(4096);

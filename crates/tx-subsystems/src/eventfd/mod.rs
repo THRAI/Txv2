@@ -13,10 +13,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    guard, sign, ByteProgress, ByteOutcome, Cap, Guard, NoProgress, OneShotStepOp,
-    ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, V3Errno, WaitSource,
-    Zone, ZoneAllocated, ZoneError, eagain, eagain_no_progress, yield_until_readable,
-    yield_until_writable,
+    eagain, eagain_no_progress, sign, yield_until_readable, yield_until_writable, ByteOutcome,
+    ByteProgress, Cap, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+    V3Errno, WaitSource, Zone, ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::{self, Channel};
 
@@ -74,18 +73,33 @@ impl EventFd {
         }
     }
 
-    pub fn counter(&self) -> u64 { self.counter.load(Ordering::Acquire) }
-    pub fn flags(&self) -> u32 { self.flags.load(Ordering::Acquire) as u32 }
-    pub fn reader_source_id(&self) -> u64 { self.reader_source_id }
-    pub fn writer_source_id(&self) -> u64 { self.writer_source_id }
-    fn is_semaphore(&self) -> bool { (self.flags() & EFD_SEMAPHORE) != 0 }
-    fn is_nonblocking(&self) -> bool { (self.flags() & EFD_NONBLOCK) != 0 }
+    pub fn counter(&self) -> u64 {
+        self.counter.load(Ordering::Acquire)
+    }
+    pub fn flags(&self) -> u32 {
+        self.flags.load(Ordering::Acquire) as u32
+    }
+    pub fn reader_source_id(&self) -> u64 {
+        self.reader_source_id
+    }
+    pub fn writer_source_id(&self) -> u64 {
+        self.writer_source_id
+    }
+    fn is_semaphore(&self) -> bool {
+        (self.flags() & EFD_SEMAPHORE) != 0
+    }
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
+    fn is_nonblocking(&self) -> bool {
+        (self.flags() & EFD_NONBLOCK) != 0
+    }
 }
 
 static EVENTFD_ZONE: Zone<EventFd> = Zone::const_new();
 
 unsafe impl ZoneAllocated for EventFd {
-    fn zone() -> &'static Zone<Self> { &EVENTFD_ZONE }
+    fn zone() -> &'static Zone<Self> {
+        &EVENTFD_ZONE
+    }
 }
 
 pub(crate) fn register_zones() -> Result<(), ZoneError> {
@@ -98,28 +112,34 @@ pub fn eventfd_create(init_val: u64, flags: u32) -> Result<Cap<EventFd>, ZoneErr
     sign(efd)
 }
 
-pub fn step_eventfd_read(
-    efd: &EventFd,
-    out: &mut [u8; 8],
-    nonblocking: bool,
-) -> ByteOutcome {
+pub fn step_eventfd_read(efd: &EventFd, out: &mut [u8; 8], nonblocking: bool) -> ByteOutcome {
     if efd.is_semaphore() {
         loop {
             let current = efd.counter.load(Ordering::Acquire);
             if current == 0 {
-                if nonblocking { return eagain(); }
+                if nonblocking {
+                    return eagain();
+                }
                 return yield_until_readable(efd.reader_source_id, EVENTFD_READABLE);
             }
-            if efd.counter.compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if efd
+                .counter
+                .compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
                 out.copy_from_slice(&1u64.to_le_bytes());
-                if current - 1 >= EVENTFD_MAX { efd.fire_writable(); }
+                if current > EVENTFD_MAX {
+                    efd.fire_writable();
+                }
                 return ByteOutcome::done(8);
             }
         }
     }
     let val = efd.counter.swap(0, Ordering::AcqRel);
     if val == 0 {
-        if nonblocking { return eagain(); }
+        if nonblocking {
+            return eagain();
+        }
         return yield_until_readable(efd.reader_source_id, EVENTFD_READABLE);
     }
     out.copy_from_slice(&val.to_le_bytes());
@@ -139,12 +159,20 @@ pub fn step_eventfd_write(
         let current = efd.counter.load(Ordering::Acquire);
         let max_add = EVENTFD_MAX.saturating_sub(current);
         if val > max_add {
-            if nonblocking { return eagain_no_progress(); }
+            if nonblocking {
+                return eagain_no_progress();
+            }
             return yield_until_writable(efd.writer_source_id, EVENTFD_WRITABLE);
         }
         let new_val = current + val;
-        if efd.counter.compare_exchange(current, new_val, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            if current == 0 && new_val > 0 { efd.fire_readable(); }
+        if efd
+            .counter
+            .compare_exchange(current, new_val, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if current == 0 && new_val > 0 {
+                efd.fire_readable();
+            }
             return StepOutcome::done(());
         }
     }
@@ -152,16 +180,27 @@ pub fn step_eventfd_write(
 
 impl EventFd {
     fn fire_readable(&self) {
-        if let Some(ref ch) = self.reader_channel { wait_routing::fire_legacy_channel(ch, EVENTFD_READABLE); }
-        if let Some(ref src) = self.reader_source { wait_routing::notify_v3_source(src, EVENTFD_READABLE); }
+        if let Some(ref ch) = self.reader_channel {
+            wait_routing::fire_legacy_channel(ch, EVENTFD_READABLE);
+        }
+        if let Some(ref src) = self.reader_source {
+            wait_routing::notify_v3_source(src, EVENTFD_READABLE);
+        }
     }
     fn fire_writable(&self) {
-        if let Some(ref ch) = self.writer_channel { wait_routing::fire_legacy_channel(ch, EVENTFD_WRITABLE); }
-        if let Some(ref src) = self.writer_source { wait_routing::notify_v3_source(src, EVENTFD_WRITABLE); }
+        if let Some(ref ch) = self.writer_channel {
+            wait_routing::fire_legacy_channel(ch, EVENTFD_WRITABLE);
+        }
+        if let Some(ref src) = self.writer_source {
+            wait_routing::notify_v3_source(src, EVENTFD_WRITABLE);
+        }
     }
 }
 
-pub struct EventfdCreateOp { pub init_val: u64, pub flags: u32 }
+pub struct EventfdCreateOp {
+    pub init_val: u64,
+    pub flags: u32,
+}
 impl<I: SubjectIdentity> StepOp<I> for EventfdCreateOp {
     type Output = Result<Cap<EventFd>, ZoneError>;
     type Progress = NoProgress;
@@ -171,7 +210,11 @@ impl<I: SubjectIdentity> StepOp<I> for EventfdCreateOp {
 }
 impl<I: SubjectIdentity> OneShotStepOp<I> for EventfdCreateOp {}
 
-pub struct EventfdReadOp<'a> { pub efd: &'a EventFd, pub out: &'a mut [u8; 8], pub nonblocking: bool, pub guard: &'a Guard<'a> }
+pub struct EventfdReadOp<'a> {
+    pub efd: &'a EventFd,
+    pub out: &'a mut [u8; 8],
+    pub nonblocking: bool,
+}
 impl<I: SubjectIdentity> StepOp<I> for EventfdReadOp<'_> {
     type Output = usize;
     type Progress = ByteProgress;
@@ -180,7 +223,11 @@ impl<I: SubjectIdentity> StepOp<I> for EventfdReadOp<'_> {
     }
 }
 
-pub struct EventfdWriteOp<'a> { pub efd: &'a EventFd, pub val: u64, pub nonblocking: bool, pub guard: &'a Guard<'a> }
+pub struct EventfdWriteOp<'a> {
+    pub efd: &'a EventFd,
+    pub val: u64,
+    pub nonblocking: bool,
+}
 impl<I: SubjectIdentity> StepOp<I> for EventfdWriteOp<'_> {
     type Output = ();
     type Progress = NoProgress;
@@ -221,7 +268,10 @@ mod tests {
         let cap = eventfd_create(42, 0).expect("create");
         let mut buf = [0xFFu8; 8];
         match step_eventfd_read(&cap, &mut buf, false) {
-            StepOutcome::Done(n) => { assert_eq!(n, 8); assert_eq!(u64::from_le_bytes(buf), 42); }
+            StepOutcome::Done(n) => {
+                assert_eq!(n, 8);
+                assert_eq!(u64::from_le_bytes(buf), 42);
+            }
             other => panic!("expected Done(8), got {other:?}"),
         }
         assert_eq!(cap.counter(), 0);
@@ -263,13 +313,19 @@ mod tests {
     fn write_einval_for_zero() {
         let _g = setup();
         let cap = eventfd_create(0, 0).expect("create");
-        assert_eq!(step_eventfd_write(&cap, 0, false), StepOutcome::Err(V3Errno::EINVAL));
+        assert_eq!(
+            step_eventfd_write(&cap, 0, false),
+            StepOutcome::Err(V3Errno::EINVAL)
+        );
     }
 
     #[test]
     fn create_op_delegates_to_free_fn() {
         let _g = setup();
-        let mut op = EventfdCreateOp { init_val: 10, flags: 0 };
+        let mut op = EventfdCreateOp {
+            init_val: 10,
+            flags: 0,
+        };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
             StepOutcome::Done(Ok(cap)) => assert_eq!(cap.counter(), 10),

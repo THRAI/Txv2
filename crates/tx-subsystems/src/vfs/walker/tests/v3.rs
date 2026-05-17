@@ -196,7 +196,11 @@ impl crate::page_backed::FsPageBacking for TestFs {
         StepOutcome::err(Errno::ENOSYS)
     }
 
-    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
         StepOutcome::done(())
     }
 }

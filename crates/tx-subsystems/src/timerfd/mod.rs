@@ -10,10 +10,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
 
+#[cfg(test)]
+use adapter::step_engine::V3Errno;
 use adapter::step_engine::{
-    guard, sign, ByteProgress, ByteOutcome, Cap, Guard, NoProgress, OneShotStepOp,
-    ScriptCtx, StepOp, StepOutcome, SubjectIdentity, V3Errno, WaitSource, Zone,
-    ZoneAllocated, ZoneError, eagain, einval, yield_until_readable,
+    eagain, sign, yield_until_readable, ByteOutcome, Cap, NoProgress, OneShotStepOp, ScriptCtx,
+    StepOp, StepOutcome, SubjectIdentity, WaitSource, Zone, ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::{self, Channel};
 
@@ -50,9 +51,16 @@ impl ItimerSpec {
         let ival_nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
         let val_sec = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
         let val_nsec = i64::from_le_bytes(bytes[24..32].try_into().unwrap());
-        let it_interval_ns = (ival_sec.max(0) as u64).saturating_mul(1_000_000_000).saturating_add(ival_nsec.max(0) as u64);
-        let it_value_ns = (val_sec.max(0) as u64).saturating_mul(1_000_000_000).saturating_add(val_nsec.max(0) as u64);
-        ItimerSpec { it_interval_ns, it_value_ns }
+        let it_interval_ns = (ival_sec.max(0) as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ival_nsec.max(0) as u64);
+        let it_value_ns = (val_sec.max(0) as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(val_nsec.max(0) as u64);
+        ItimerSpec {
+            it_interval_ns,
+            it_value_ns,
+        }
     }
 }
 
@@ -82,11 +90,22 @@ impl TimerFd {
         }
     }
 
-    pub fn deadline_ns(&self) -> u64 { self.deadline_ns.load(Ordering::Acquire) }
-    pub fn interval_ns(&self) -> u64 { self.interval_ns.load(Ordering::Acquire) }
-    pub fn source_id(&self) -> u64 { self.source_id }
-    pub fn flags(&self) -> u32 { self.flags.load(Ordering::Acquire) as u32 }
-    fn is_nonblocking(&self) -> bool { (self.flags() & TFD_NONBLOCK) != 0 }
+    pub fn deadline_ns(&self) -> u64 {
+        self.deadline_ns.load(Ordering::Acquire)
+    }
+    pub fn interval_ns(&self) -> u64 {
+        self.interval_ns.load(Ordering::Acquire)
+    }
+    pub fn source_id(&self) -> u64 {
+        self.source_id
+    }
+    pub fn flags(&self) -> u32 {
+        self.flags.load(Ordering::Acquire) as u32
+    }
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
+    fn is_nonblocking(&self) -> bool {
+        (self.flags() & TFD_NONBLOCK) != 0
+    }
 
     pub fn arm(&self, deadline_ns: u64, interval_ns: u64) {
         self.deadline_ns.store(deadline_ns, Ordering::Release);
@@ -99,12 +118,18 @@ impl TimerFd {
         self.interval_ns.store(0, Ordering::Release);
     }
 
-    pub fn expiration_count(&self) -> u64 { self.expiration_count.load(Ordering::Acquire) }
+    pub fn expiration_count(&self) -> u64 {
+        self.expiration_count.load(Ordering::Acquire)
+    }
 
     fn bump_expirations(&self, now_ns: u64) -> u64 {
         let deadline = self.deadline_ns.load(Ordering::Acquire);
-        if deadline == 0 { return 0; }
-        if now_ns < deadline { return 0; }
+        if deadline == 0 {
+            return 0;
+        }
+        if now_ns < deadline {
+            return 0;
+        }
         let interval = self.interval_ns.load(Ordering::Acquire);
         if interval == 0 {
             self.deadline_ns.store(0, Ordering::Release);
@@ -119,18 +144,26 @@ impl TimerFd {
         prev + count
     }
 
-    fn drain_count(&self) -> u64 { self.expiration_count.swap(0, Ordering::AcqRel) }
+    fn drain_count(&self) -> u64 {
+        self.expiration_count.swap(0, Ordering::AcqRel)
+    }
 
     fn fire_readable(&self) {
-        if let Some(ref ch) = self.channel { wait_routing::fire_legacy_channel(ch, TIMERFD_READABLE); }
-        if let Some(ref src) = self.source { wait_routing::notify_v3_source(src, TIMERFD_READABLE); }
+        if let Some(ref ch) = self.channel {
+            wait_routing::fire_legacy_channel(ch, TIMERFD_READABLE);
+        }
+        if let Some(ref src) = self.source {
+            wait_routing::notify_v3_source(src, TIMERFD_READABLE);
+        }
     }
 }
 
 static TIMERFD_ZONE: Zone<TimerFd> = Zone::const_new();
 
 unsafe impl ZoneAllocated for TimerFd {
-    fn zone() -> &'static Zone<Self> { &TIMERFD_ZONE }
+    fn zone() -> &'static Zone<Self> {
+        &TIMERFD_ZONE
+    }
 }
 
 pub(crate) fn register_zones() -> Result<(), ZoneError> {
@@ -151,31 +184,52 @@ pub fn timerfd_settime(
     old_value: Option<&mut ItimerSpec>,
 ) {
     if let Some(old) = old_value {
-        *old = ItimerSpec { it_interval_ns: tfd.interval_ns(), it_value_ns: tfd.deadline_ns() };
+        *old = ItimerSpec {
+            it_interval_ns: tfd.interval_ns(),
+            it_value_ns: tfd.deadline_ns(),
+        };
     }
     let it_value = new_value.it_value_ns;
-    if it_value == 0 { tfd.disarm(); return; }
-    let deadline = if abstime { it_value } else { now_ns.saturating_add(it_value) };
+    if it_value == 0 {
+        tfd.disarm();
+        return;
+    }
+    let deadline = if abstime {
+        it_value
+    } else {
+        now_ns.saturating_add(it_value)
+    };
     tfd.arm(deadline, new_value.it_interval_ns);
     let count = tfd.bump_expirations(now_ns);
-    if count > 0 { tfd.fire_readable(); }
+    if count > 0 {
+        tfd.fire_readable();
+    }
 }
 
 pub fn step_timerfd_read(
-    tfd: &TimerFd, now_ns: u64, out: &mut [u8; 8], nonblocking: bool,
+    tfd: &TimerFd,
+    now_ns: u64,
+    out: &mut [u8; 8],
+    nonblocking: bool,
 ) -> ByteOutcome {
     let count = tfd.bump_expirations(now_ns);
     if count > 0 {
         let drained = tfd.drain_count();
-        if tfd.interval_ns() > 0 { let _ = tfd.bump_expirations(now_ns); }
+        if tfd.interval_ns() > 0 {
+            let _ = tfd.bump_expirations(now_ns);
+        }
         out.copy_from_slice(&drained.to_le_bytes());
         return ByteOutcome::done(8);
     }
-    if nonblocking { return eagain(); }
+    if nonblocking {
+        return eagain();
+    }
     yield_until_readable(tfd.source_id, TIMERFD_READABLE)
 }
 
-pub struct TimerfdCreateOp { pub flags: u32 }
+pub struct TimerfdCreateOp {
+    pub flags: u32,
+}
 impl<I: SubjectIdentity> StepOp<I> for TimerfdCreateOp {
     type Output = Result<Cap<TimerFd>, ZoneError>;
     type Progress = NoProgress;
@@ -215,9 +269,21 @@ mod tests {
         let _g = setup();
         let cap = timerfd_create(0).expect("create");
         let now = 1_000_000_000;
-        timerfd_settime(&cap, false, now, ItimerSpec { it_interval_ns: 0, it_value_ns: 100_000_000 }, None);
+        timerfd_settime(
+            &cap,
+            false,
+            now,
+            ItimerSpec {
+                it_interval_ns: 0,
+                it_value_ns: 100_000_000,
+            },
+            None,
+        );
         let mut buf = [0u8; 8];
-        match step_timerfd_read(&cap, now, &mut buf, false) { StepOutcome::Yield { .. } => {} other => panic!("expected Yield, got {other:?}"), }
+        match step_timerfd_read(&cap, now, &mut buf, false) {
+            StepOutcome::Yield { .. } => {}
+            other => panic!("expected Yield, got {other:?}"),
+        }
         let now2 = now + 200_000_000;
         match step_timerfd_read(&cap, now2, &mut buf, false) {
             StepOutcome::Done(8) => assert_eq!(u64::from_le_bytes(buf), 1),
@@ -230,15 +296,36 @@ mod tests {
         let _g = setup();
         let cap = timerfd_create(0).expect("create");
         let now = 1_000_000_000;
-        timerfd_settime(&cap, false, now, ItimerSpec { it_interval_ns: 0, it_value_ns: 100_000_000 }, None);
+        timerfd_settime(
+            &cap,
+            false,
+            now,
+            ItimerSpec {
+                it_interval_ns: 0,
+                it_value_ns: 100_000_000,
+            },
+            None,
+        );
         assert_eq!(cap.deadline_ns(), now + 100_000_000);
-        timerfd_settime(&cap, false, now, ItimerSpec { it_interval_ns: 0, it_value_ns: 0 }, None);
+        timerfd_settime(
+            &cap,
+            false,
+            now,
+            ItimerSpec {
+                it_interval_ns: 0,
+                it_value_ns: 0,
+            },
+            None,
+        );
         assert_eq!(cap.deadline_ns(), 0);
     }
 
     #[test]
     fn itimerspec_roundtrip() {
-        let spec = ItimerSpec { it_interval_ns: 1_500_000_000, it_value_ns: 500_000_000 };
+        let spec = ItimerSpec {
+            it_interval_ns: 1_500_000_000,
+            it_value_ns: 500_000_000,
+        };
         let bytes = spec.to_bytes();
         let parsed = ItimerSpec::from_bytes(&bytes);
         assert_eq!(parsed.it_interval_ns, 1_500_000_000);

@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
-use tx_subsystems::mount::{self, MountPayload};
 use tx_fs;
+use tx_subsystems::mount::{self};
 
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
 /// re-walk. `path` is a slash-separated sequence; trailing slashes
@@ -623,10 +623,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 /// `mount(source, target, fstype, flags, data)`. Linux RV64 ABI `__NR_mount = 40`.
 ///
 /// v1: supports `MS_BIND` (bind mount) and new mounts (tmpfs/devfs/proc).
-pub(super) async fn sys_mount<P: PmapIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let source_uaddr = args[0];
     let target_uaddr = args[1];
@@ -645,7 +642,7 @@ pub(super) async fn sys_mount<P: PmapIf>(
     let cred = ctx.walker_cred();
 
     let guard = step_engine::guard();
-    use StepOutcome as V3;
+
     let target_dentry = match walk_from(cwd.clone(), &target, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
@@ -689,9 +686,8 @@ pub(super) async fn sys_mount<P: PmapIf>(
     // kept alive in this scope; we later call `bind_mount_payload`
     // on it after the kernel `MountPayload` is signed so the backend
     // can stamp the mount onto materialised RNodes.
-    let mut ext4_mount: Option<
-        tx_fs::tx_ext4::MountedExt4<tx_fs::tx_ext4::BlockDeviceImage>,
-    > = None;
+    let mut ext4_mount: Option<tx_fs::tx_ext4::MountedExt4<tx_fs::tx_ext4::BlockDeviceImage>> =
+        None;
     let source_label_for_ext4: Option<alloc::vec::Vec<u8>> = if fstype_str == "ext4" {
         let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
             Ok(p) => p,
@@ -716,12 +712,10 @@ pub(super) async fn sys_mount<P: PmapIf>(
                 tmpfs.clone().fs_ops_arc(),
                 tmpfs.fs_page_backing_arc(),
                 tx_subsystems::vfs::FsObjectId::ROOT,
-                tx_subsystems::vfs::InodeMeta::new(
-                    tx_subsystems::vfs::InodeKind::Directory, 0o755,
-                ),
+                tx_subsystems::vfs::InodeMeta::new(tx_subsystems::vfs::InodeKind::Directory, 0o755),
                 "tmpfs",
             )
-        },
+        }
         "devfs" => (
             tx_fs::devfs::Devfs::fs_ops_arc(),
             tx_fs::devfs::Devfs::fs_page_backing_arc(),
@@ -734,7 +728,8 @@ pub(super) async fn sys_mount<P: PmapIf>(
         ),
         "proc" => (
             tx_fs::procfs::Procfs::fs_ops_arc(),
-            alloc::sync::Arc::new(tx_fs::procfs::Procfs) as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+            alloc::sync::Arc::new(tx_fs::procfs::Procfs)
+                as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
             tx_fs::procfs::PROCFS_ROOT_ID,
             tx_subsystems::vfs::InodeMeta::new(
                 tx_subsystems::vfs::InodeKind::Directory,
@@ -783,7 +778,7 @@ pub(super) async fn sys_mount<P: PmapIf>(
             let fs_page_backing = mounted.fs_page_backing();
             ext4_mount = Some(mounted);
             (fs_ops, fs_page_backing, root_id, root_meta, "ext4")
-        },
+        }
         _ => return SyscallResult::Error(ENOSYS_VALUE),
     };
 
@@ -797,9 +792,7 @@ pub(super) async fn sys_mount<P: PmapIf>(
     if (flags & MS_RDONLY) != 0 {
         mount_flags = mount::MountFlags::READ_ONLY;
     }
-    let mount_options = mount::MountOptions {
-        flags: mount_flags,
-    };
+    let mount_options = mount::MountOptions { flags: mount_flags };
 
     let mount_payload = match mount::MountPayload::new_cap(
         fs_ops,
@@ -854,10 +847,7 @@ pub(super) async fn sys_mount<P: PmapIf>(
 }
 
 /// `umount2(target, flags)`. Linux RV64 ABI `__NR_umount2 = 39`.
-pub(super) async fn sys_umount2<P: PmapIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let target_uaddr = args[0];
     let flags = args[1] as u64;
@@ -904,10 +894,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(
 /// file type (S_IFCHR, S_IFBLK, S_IFIFO, S_IFREG).  `dev` encodes
 /// major/minor (major = (dev >> 8) & 0xfff, minor = dev & 0xff
 /// | (dev >> 12) & 0xfff00).
-pub(super) async fn sys_mknodat<P: PmapIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let _dirfd = args[0] as u32;
     let path_uaddr = args[1];

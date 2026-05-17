@@ -111,7 +111,9 @@ impl PartitionTable {
 
     /// Look up a partition by its parent devt + index.
     pub fn get(&self, parent_devt: DevT, index: u32) -> Option<&PartitionEntry> {
-        self.entries.get(&index).filter(|e| e.parent_devt == parent_devt)
+        self.entries
+            .get(&index)
+            .filter(|e| e.parent_devt == parent_devt)
     }
 }
 
@@ -346,7 +348,12 @@ impl FsOps for BdevFsMountPayload {
             Err(e) => return StepOutcome::err(e.into()),
         };
 
-        match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc: container }, mount) {
+        match RNode::new_cap_in_mount(
+            fs_object_id,
+            meta,
+            RNodeBacking::PageBacked { pc: container },
+            mount,
+        ) {
             Ok(rnode) => StepOutcome::done(rnode),
             Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }
@@ -522,7 +529,7 @@ impl FsPageBacking for BdevFsMountPayload {
         let block_size = reg.ops.block_size() as u64;
         let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
 
-        if offset % page_size != 0 {
+        if !offset.is_multiple_of(page_size) {
             return StepOutcome::err(Errno::EINVAL.into());
         }
 
@@ -585,11 +592,9 @@ impl FsPageBacking for BdevFsMountPayload {
                             Ok(addr) => addr,
                             Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
                         };
-                        let byte_offset = (i as u64).saturating_mul(block_size) as usize;
-                        let bytes_to_copy = core::cmp::min(
-                            block_size as usize,
-                            page_size as usize - byte_offset,
-                        );
+                        let byte_offset = i.saturating_mul(block_size) as usize;
+                        let bytes_to_copy =
+                            core::cmp::min(block_size as usize, page_size as usize - byte_offset);
                         unsafe {
                             core::ptr::copy_nonoverlapping(
                                 src_addr,
@@ -634,7 +639,7 @@ impl FsPageBacking for BdevFsMountPayload {
         let block_size = reg.ops.block_size() as u64;
         let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
 
-        if offset % page_size != 0 {
+        if !offset.is_multiple_of(page_size) {
             return StepOutcome::err(Errno::EINVAL.into());
         }
 
@@ -647,8 +652,8 @@ impl FsPageBacking for BdevFsMountPayload {
         }
 
         if blocks_per_page == 1 {
-            let mut frames = [*frame];
-            match handle.write_blocks(start_lba, &mut frames, guard) {
+            let frames = [*frame];
+            match handle.write_blocks(start_lba, &frames, guard) {
                 StepOutcome::Done(()) => StepOutcome::done(()),
                 StepOutcome::Err(e) => StepOutcome::err(e),
                 StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
@@ -676,7 +681,7 @@ impl FsPageBacking for BdevFsMountPayload {
                     Ok(addr) => addr,
                     Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
                 };
-                let byte_offset = (i as u64).saturating_mul(block_size) as usize;
+                let byte_offset = i.saturating_mul(block_size) as usize;
                 let bytes_to_copy =
                     core::cmp::min(block_size as usize, page_size as usize - byte_offset);
 
@@ -688,8 +693,8 @@ impl FsPageBacking for BdevFsMountPayload {
                     );
                 }
 
-                let mut frames = [Frame::new(temp_ppn)];
-                match handle.write_blocks(lba, &mut frames, guard) {
+                let frames = [Frame::new(temp_ppn)];
+                match handle.write_blocks(lba, &frames, guard) {
                     StepOutcome::Done(()) => {}
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
@@ -712,7 +717,11 @@ impl FsPageBacking for BdevFsMountPayload {
         StepOutcome::err(Errno::EINVAL.into())
     }
 
-    fn fsync_file(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    fn fsync_file(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
         let Some(idx) = entry_index(fs_object_id) else {
             return StepOutcome::err(Errno::ENOENT.into());
         };
@@ -811,7 +820,12 @@ impl FsOps for BdevFs {
             Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
         };
 
-        match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc: container }, mount) {
+        match RNode::new_cap_in_mount(
+            fs_object_id,
+            meta,
+            RNodeBacking::PageBacked { pc: container },
+            mount,
+        ) {
             Ok(rnode) => StepOutcome::done(rnode),
             Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }
@@ -981,7 +995,7 @@ impl FsPageBacking for BdevFs {
         let block_size = reg.ops.block_size() as u64;
         let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
 
-        if offset % page_size != 0 {
+        if !offset.is_multiple_of(page_size) {
             return StepOutcome::err(Errno::EINVAL.into());
         }
 
@@ -1044,11 +1058,9 @@ impl FsPageBacking for BdevFs {
                             Ok(addr) => addr,
                             Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
                         };
-                        let byte_offset = (i as u64).saturating_mul(block_size) as usize;
-                        let bytes_to_copy = core::cmp::min(
-                            block_size as usize,
-                            page_size as usize - byte_offset,
-                        );
+                        let byte_offset = i.saturating_mul(block_size) as usize;
+                        let bytes_to_copy =
+                            core::cmp::min(block_size as usize, page_size as usize - byte_offset);
                         unsafe {
                             core::ptr::copy_nonoverlapping(
                                 src_addr,
@@ -1093,7 +1105,7 @@ impl FsPageBacking for BdevFs {
         let block_size = reg.ops.block_size() as u64;
         let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
 
-        if offset % page_size != 0 {
+        if !offset.is_multiple_of(page_size) {
             return StepOutcome::err(Errno::EINVAL.into());
         }
 
@@ -1106,8 +1118,8 @@ impl FsPageBacking for BdevFs {
         }
 
         if blocks_per_page == 1 {
-            let mut frames = [*frame];
-            match handle.write_blocks(start_lba, &mut frames, guard) {
+            let frames = [*frame];
+            match handle.write_blocks(start_lba, &frames, guard) {
                 StepOutcome::Done(()) => StepOutcome::done(()),
                 StepOutcome::Err(e) => StepOutcome::err(e),
                 StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
@@ -1135,7 +1147,7 @@ impl FsPageBacking for BdevFs {
                     Ok(addr) => addr,
                     Err(_) => return StepOutcome::err(Errno::EFAULT.into()),
                 };
-                let byte_offset = (i as u64).saturating_mul(block_size) as usize;
+                let byte_offset = i.saturating_mul(block_size) as usize;
                 let bytes_to_copy =
                     core::cmp::min(block_size as usize, page_size as usize - byte_offset);
 
@@ -1147,8 +1159,8 @@ impl FsPageBacking for BdevFs {
                     );
                 }
 
-                let mut frames = [Frame::new(temp_ppn)];
-                match handle.write_blocks(lba, &mut frames, guard) {
+                let frames = [Frame::new(temp_ppn)];
+                match handle.write_blocks(lba, &frames, guard) {
                     StepOutcome::Done(()) => {}
                     StepOutcome::Err(e) => return StepOutcome::err(e),
                     StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
@@ -1170,7 +1182,11 @@ impl FsPageBacking for BdevFs {
         StepOutcome::err(Errno::EINVAL.into())
     }
 
-    fn fsync_file(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    fn fsync_file(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
         let Some(idx) = entry_index(fs_object_id) else {
             return StepOutcome::err(Errno::ENOENT.into());
         };

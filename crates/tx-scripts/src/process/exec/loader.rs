@@ -43,6 +43,7 @@ use goblin::elf::program_header::{
 const PT_GNU_STACK: u32 = 0x6474_e551;
 
 /// PT_GNU_RELRO program header type.
+#[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
 const PT_GNU_RELRO: u32 = 0x6474_e552;
 
 /// ELF64 program-header size, in bytes. (Elf64_Phdr is 56 bytes.)

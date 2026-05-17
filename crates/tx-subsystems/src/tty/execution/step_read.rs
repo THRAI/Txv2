@@ -278,7 +278,6 @@ mod step_op_wraps {
     fn read_op_empty_out_returns_done_zero() {
         let _setup = setup();
         let tty = alloc_tty(200, "ttyV3-read-op-empty");
-        let guard = step_engine::guard();
         let mut buf: [u8; 0] = [];
         let mut op = ReadOp {
             tty: &tty,
@@ -286,7 +285,6 @@ mod step_op_wraps {
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(0) => {}
             other => panic!("expected Done(0), got {other:?}"),
@@ -297,7 +295,6 @@ mod step_op_wraps {
     fn read_for_caller_op_empty_out_returns_done_zero() {
         let _setup = setup();
         let tty = alloc_tty(201, "ttyV3-read-caller-op-empty");
-        let guard = step_engine::guard();
         let mut buf: [u8; 0] = [];
         let caller = super::super::IoctlCaller::new(1, 1);
         let mut op = ReadForCallerOp {
@@ -307,7 +304,6 @@ mod step_op_wraps {
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(0) => {}
             other => panic!("expected Done(0), got {other:?}"),
@@ -319,7 +315,6 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_tty(202, "ttyV3-read-op-dead");
         let _ = tty.take_payload();
-        let guard = step_engine::guard();
         let mut buf = [0u8; 4];
         let mut op = ReadOp {
             tty: &tty,
@@ -327,7 +322,6 @@ mod step_op_wraps {
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Err(step_engine::Errno::EIO) => {}
             other => panic!("expected Err(EIO), got {other:?}"),

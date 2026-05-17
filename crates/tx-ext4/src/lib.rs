@@ -2,7 +2,7 @@
 #![no_std]
 
 extern crate alloc;
-#[cfg(test)]
+#[cfg(any(test, feature = "host-async"))]
 extern crate std;
 
 pub mod adapter;

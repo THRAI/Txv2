@@ -82,7 +82,6 @@ pub fn mark_thread_zombie_for_test(thread: &Cap<ThreadIdentity>, status: i32) {
 /// owning process's thread list, and zombifies the process if this was
 /// the last thread.
 pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
-
     // GroupExit coordination (PROCESS_v1 §5): if the owning process
     // has an active group-exit episode (exit_group or multi-threaded
     // execve), decrement the remaining_threads counter.  The
@@ -92,7 +91,9 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     if let Some(parent) = thread.owner_proc.upgrade(&guard) {
         if let Some(payload) = parent.payload.lock().as_ref() {
             if let Some(ref ge) = *payload.group_exit.lock() {
-                let prev = ge.remaining_threads.fetch_sub(1, core::sync::atomic::Ordering::Release);
+                let prev = ge
+                    .remaining_threads
+                    .fetch_sub(1, core::sync::atomic::Ordering::Release);
                 // If this was the last non-initiator thread, the initiator
                 // (blocked on `remaining_threads == 0`) can proceed.
                 if prev == 1 {
@@ -209,7 +210,11 @@ pub fn step_sigprocmask(
 /// posts behave exactly like any other catchable signal at this
 /// layer — the stop intent is materialised by `ast_check` returning
 /// `DefaultStop`, not by a summary bit set here.
-pub fn post_signal(thread: &Cap<ThreadIdentity>, sig: Signum, info: Option<crate::signal::SigInfo>) {
+pub fn post_signal(
+    thread: &Cap<ThreadIdentity>,
+    sig: Signum,
+    info: Option<crate::signal::SigInfo>,
+) {
     debug_assert!(
         !matches!(sig, Signum::SIGKILL | Signum::SIGSTOP | Signum::SIGCONT),
         "post_signal must not be called with Gewalt signums (SIGKILL/SIGSTOP/SIGCONT); \
@@ -399,8 +404,10 @@ impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
     fn step(
         &mut self,
         _ctx: &mut crate::thread_runtime::adapter::step_engine::ScriptCtx<I>,
-    ) -> crate::thread_runtime::adapter::step_engine::StepOutcome<(), crate::thread_runtime::adapter::step_engine::NoProgress>
-    {
+    ) -> crate::thread_runtime::adapter::step_engine::StepOutcome<
+        (),
+        crate::thread_runtime::adapter::step_engine::NoProgress,
+    > {
         // observe — thread Cap + sig validated by post_signal internally
         // upgrade — N/A
         // reserve — N/A

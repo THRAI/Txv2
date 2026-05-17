@@ -329,7 +329,8 @@ impl ThreadPayload {
     /// `route_gewalt(SIGSTOP)` (set) and `route_gewalt(SIGCONT)`
     /// (clear).
     pub(crate) fn set_stopped(&self, val: bool) {
-        self.stopped.store(val, core::sync::atomic::Ordering::Release);
+        self.stopped
+            .store(val, core::sync::atomic::Ordering::Release);
     }
 
     /// Snapshot the alternate signal stack (base, size).

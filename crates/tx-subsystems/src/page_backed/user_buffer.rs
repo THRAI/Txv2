@@ -20,11 +20,11 @@ pub fn step_read_to_user(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-        // observe
-        // upgrade
-        // reserve
-        // commit
-        // publish
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     if len == 0 {
         return V3::done(0);
@@ -64,11 +64,11 @@ pub fn step_write_from_user(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-        // observe
-        // upgrade
-        // reserve
-        // commit
-        // publish
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     if len == 0 {
         return V3::done(0);
@@ -313,11 +313,11 @@ pub fn step_read_to_kernel(
     dst: &mut [u8],
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-        // observe
-        // upgrade
-        // reserve
-        // commit
-        // publish
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     let len = dst.len();
     if len == 0 {
@@ -347,11 +347,11 @@ pub fn step_write_from_kernel(
     src: &[u8],
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-        // observe
-        // upgrade
-        // reserve
-        // commit
-        // publish
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     let len = src.len();
     if len == 0 {
@@ -555,14 +555,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ReadToUserOp<'a> {
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let __guard = step_engine::guard();
-        step_read_to_user(
-            self.pc,
-            self.of,
-            self.aspace,
-            self.dst,
-            self.len,
-            &__guard,
-        )
+        step_read_to_user(self.pc, self.of, self.aspace, self.dst, self.len, &__guard)
     }
 }
 
@@ -580,13 +573,6 @@ impl<'a, I: SubjectIdentity> StepOp<I> for WriteFromUserOp<'a> {
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let __guard = step_engine::guard();
-        step_write_from_user(
-            self.pc,
-            self.of,
-            self.aspace,
-            self.src,
-            self.len,
-            &__guard,
-        )
+        step_write_from_user(self.pc, self.of, self.aspace, self.src, self.len, &__guard)
     }
 }

@@ -39,6 +39,12 @@ pub struct VvarPage {
 
 unsafe impl Sync for VvarPage {}
 
+impl Default for VvarPage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VvarPage {
     pub const fn new() -> Self {
         Self {
@@ -86,7 +92,9 @@ impl VvarPage {
         #[cfg(target_arch = "riscv64")]
         {
             let now: u64;
-            unsafe { core::arch::asm!("rdtime {t}", t = out(reg) now, options(nomem, nostack)); }
+            unsafe {
+                core::arch::asm!("rdtime {t}", t = out(reg) now, options(nomem, nostack));
+            }
             self.cycle_last.store(now, Ordering::Relaxed);
         }
         #[cfg(not(target_arch = "riscv64"))]
@@ -123,14 +131,11 @@ pub fn init_vdso() -> Result<(), VdsoInitError> {
         let end = core::cmp::min(start + 4096, image.len());
         let slice = &image[start..end];
 
-        let owned = page_allocator::reserve_frame(
-            page_allocator::ZeroPolicy::UninitFullOverwrite,
-        )
-        .map_err(|_| VdsoInitError::Alloc)?
-        .commit();
+        let owned = page_allocator::reserve_frame(page_allocator::ZeroPolicy::UninitFullOverwrite)
+            .map_err(|_| VdsoInitError::Alloc)?
+            .commit();
         let ppn = owned.ppn();
-        let dst = page_allocator::frame_kernel_addr(ppn)
-            .map_err(|_| VdsoInitError::DirectMap)?;
+        let dst = page_allocator::frame_kernel_addr(ppn).map_err(|_| VdsoInitError::DirectMap)?;
         unsafe {
             core::ptr::copy_nonoverlapping(slice.as_ptr(), dst, slice.len());
             if slice.len() < 4096 {
@@ -147,11 +152,16 @@ pub fn init_vdso() -> Result<(), VdsoInitError> {
     let vvar_ppn = vvar_owned.ppn();
     let vvar_ptr: *mut VvarPage = page_allocator::frame_kernel_addr(vvar_ppn)
         .map_err(|_| VdsoInitError::DirectMap)? as *mut VvarPage;
-    unsafe { core::ptr::write(vvar_ptr, VvarPage::new()); }
+    unsafe {
+        core::ptr::write(vvar_ptr, VvarPage::new());
+    }
     let _vvar_permanent = vvar_owned.into_permanent_frame();
 
     unsafe {
-        KERNEL_VDSO = Some(KernelVdso { num_pages, frames: frames.leak() });
+        KERNEL_VDSO = Some(KernelVdso {
+            num_pages,
+            frames: frames.leak(),
+        });
         VVAR_PPN = Some(vvar_ppn);
         VVAR_PTR = vvar_ptr;
     }
@@ -159,6 +169,7 @@ pub fn init_vdso() -> Result<(), VdsoInitError> {
 }
 
 pub fn kernel_vdso() -> &'static KernelVdso {
+    #[allow(static_mut_refs)]
     unsafe { KERNEL_VDSO.as_ref() }.expect("kernel_vdso() called before init_vdso()")
 }
 
@@ -171,7 +182,12 @@ pub fn vvar_page() -> &'static VvarPage {
 }
 
 pub fn vdso_available() -> bool {
-    tx_vdso::VDSO_AVAILABLE && !tx_vdso::VDSO_IMAGE.is_empty() && unsafe { KERNEL_VDSO.is_some() }
+    #[allow(static_mut_refs)]
+    {
+        tx_vdso::VDSO_AVAILABLE
+            && !tx_vdso::VDSO_IMAGE.is_empty()
+            && unsafe { KERNEL_VDSO.is_some() }
+    }
 }
 
 #[derive(Debug)]

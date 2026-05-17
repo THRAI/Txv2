@@ -20,12 +20,10 @@ pub mod step_engine {
         SubjectIdentity, TimerId, Translation, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        sign, sign_for, reserve_for, register_zone_for,
-        Cap, PayloadCap, Weak, IdentRef,
-        Dead, ZoneError,
-        Entity, CoLocatedEntity, OperationalCapExt, OperationalRefExt, PayloadBinding,
-        Zone, ZoneAllocated, IdentitySlot,
-        IsPayloadPolicy, CapProducingPolicy, ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy, ZonePolicy,
+        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
+        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
     pub use tx_substrate::{page_allocator, SpinMutex};
 }
@@ -37,10 +35,10 @@ pub mod step_engine {
     reason = "expose substrate wake primitives (TaskMailbox, ActiveWait, MailboxEvent) for drive() reactor integration"
 )]
 pub mod wake {
+    pub use tx_substrate::wake::timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
     pub use tx_substrate::wake::{
         agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, WaitGeneration,
     };
-    pub use tx_substrate::wake::timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
 }
 
 #[platform_adapter(

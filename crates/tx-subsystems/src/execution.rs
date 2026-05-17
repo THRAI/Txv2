@@ -144,7 +144,6 @@ impl From<crate::adapter::step_engine::V3Errno> for Errno {
             V3::ESPIPE => Errno::ESPIPE,
             V3::ESRCH => Errno::ESRCH,
             V3::ESTALE => Errno::ESTALE,
-            V3::EINTR => Errno::EINTR,
         }
     }
 }
@@ -227,7 +226,7 @@ mod tests {
             (Errno::ESRCH, V3::ESRCH),
             (Errno::ESTALE, V3::ESTALE),
         ];
-        assert_eq!(table.len(), 27);
+        assert_eq!(table.len(), 28);
         for (v4, expected_v3) in table {
             let mapped: V3 = v4.into();
             assert_eq!(

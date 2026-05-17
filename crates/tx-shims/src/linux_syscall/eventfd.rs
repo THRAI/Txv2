@@ -4,17 +4,13 @@
 //! or written (adds to the counter).  Subsystem dispatch lives in
 //! `tx_subsystems::eventfd`.
 
-use tx_subsystems::eventfd::{
-    step_eventfd_read, step_eventfd_write, EventFd, EFD_SEMAPHORE,
-};
+use tx_subsystems::eventfd::{step_eventfd_read, step_eventfd_write, EventFd, EFD_SEMAPHORE};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::wait_source;
 
-use super::numbers::{
-    EFD_CLOEXEC_FLAG, EFD_NONBLOCK_FLAG, NR_EVENTFD2,
-};
+use super::numbers::{EFD_CLOEXEC_FLAG, EFD_NONBLOCK_FLAG, NR_EVENTFD2};
 use super::{
     bootstrap_copy_to_user, bootstrap_read_user, errno_to_i32, SyscallCtx, SyscallResult,
     EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
@@ -33,11 +29,7 @@ use crate::adapter::step_engine::{self as step_engine};
 /// - `Return(fd)` on success.
 /// - `Error(EINVAL)` for bad flags.
 /// - `Error(ENOMEM)` if zone allocation fails.
-pub(super) fn sys_eventfd2<'a>(
-    init_val: u64,
-    flags: u32,
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+pub(super) fn sys_eventfd2<'a>(init_val: u64, flags: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     use super::numbers::EFD_SEMAPHORE_FLAG;
 
     let recognised = EFD_SEMAPHORE_FLAG | EFD_CLOEXEC_FLAG | EFD_NONBLOCK_FLAG;
@@ -121,9 +113,7 @@ pub(super) async fn sys_eventfd_read(
         use step_engine::{StepOutcome as V3Out, YieldShape};
         match outcome {
             V3Out::Done(n) => {
-                if let Err(errno) =
-                    bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..n])
-                {
+                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..n]) {
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
                 return SyscallResult::Return(n as i64);

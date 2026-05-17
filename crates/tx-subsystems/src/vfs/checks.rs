@@ -47,19 +47,40 @@ pub struct ParentAndName<'g> {
 // --- Construction helpers ---
 
 impl<'g> EntityAtPath<'g> {
-    pub fn from_caps(dentry: &Cap<DEntry>, rnode: &Cap<RNode>, guard: &'g crate::execution::Guard<'_>) -> Self {
-        Self { dentry: dentry.ident_ref(guard), rnode: rnode.ident_ref(guard) }
+    pub fn from_caps(
+        dentry: &Cap<DEntry>,
+        rnode: &Cap<RNode>,
+        guard: &'g crate::execution::Guard<'_>,
+    ) -> Self {
+        Self {
+            dentry: dentry.ident_ref(guard),
+            rnode: rnode.ident_ref(guard),
+        }
     }
 }
 
 impl<'g> DirectoryAtPath<'g> {
-    pub fn from_caps(dentry: &Cap<DEntry>, rnode: &Cap<RNode>, guard: &'g crate::execution::Guard<'_>) -> Self {
-        Self { dentry: dentry.ident_ref(guard), rnode: rnode.ident_ref(guard) }
+    pub fn from_caps(
+        dentry: &Cap<DEntry>,
+        rnode: &Cap<RNode>,
+        guard: &'g crate::execution::Guard<'_>,
+    ) -> Self {
+        Self {
+            dentry: dentry.ident_ref(guard),
+            rnode: rnode.ident_ref(guard),
+        }
     }
 }
 
 impl<'g> ParentAndName<'g> {
-    pub fn from_cap(parent: &Cap<DEntry>, name: InlineName, guard: &'g crate::execution::Guard<'_>) -> Self {
-        Self { parent: parent.ident_ref(guard), name }
+    pub fn from_cap(
+        parent: &Cap<DEntry>,
+        name: InlineName,
+        guard: &'g crate::execution::Guard<'_>,
+    ) -> Self {
+        Self {
+            parent: parent.ident_ref(guard),
+            name,
+        }
     }
 }

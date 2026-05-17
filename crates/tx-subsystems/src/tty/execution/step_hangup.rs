@@ -151,13 +151,9 @@ mod step_op_wraps {
     fn hangup_op_on_live_tty_returns_done() {
         let _setup = setup();
         let tty = alloc_hardware_tty(500, "ttyV3-hangup-op-live");
-        let guard = step_engine::guard();
-        let mut op = HangupOp {
-            tty: &tty,
-        };
+        let mut op = HangupOp { tty: &tty };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(o) => {
                 assert!(o.had_payload);
@@ -173,13 +169,9 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_hardware_tty(501, "ttyV3-hangup-op-dead");
         let _ = tty.take_payload();
-        let guard = step_engine::guard();
-        let mut op = HangupOp {
-            tty: &tty,
-        };
+        let mut op = HangupOp { tty: &tty };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Err(step_engine::Errno::EIO) => {}
             other => panic!("expected Err(EIO), got {other:?}"),
