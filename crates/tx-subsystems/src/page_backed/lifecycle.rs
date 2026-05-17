@@ -151,7 +151,7 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         }
     }
 
-    match mount.payload().fs_page_backing.fsync(*fs_object_id, guard) {
+    match mount.payload().fs_page_backing.fsync_file(*fs_object_id, guard) {
         V3::Done(()) => V3::done(()),
         V3::Continue { progress: _ } => {
             let progress = if pages_so_far == 0 {
