@@ -1054,31 +1054,15 @@ pub fn script_kill_process(
     sig: Signum,
     info: Option<SigInfo>,
 ) -> Result<KillScriptOutcome, Errno> {
-    // Phase 1 — authorise. The cred check runs inside its own guard
-    // scope; the scope ends before any commit-side call so the inner
-    // `step_kill_process` → `post_signal` chain can take its own
-    // guard for SigInfo storage without violating
-    // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`'s no-nested-guard
-    // rule.
-    {
-        let guard = step_engine::guard();
+    use crate::cred::checks::{authorize_signal_send, AuthOutcome};
 
-        // Capture the source's syscall-entry credential snapshot.
-        // `None` means the source is a zombie (payload reaped) —
-        // ESRCH per the outcome doc above.
-        let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
-
-        let Some(target_facts) = target.target_proc_cred_for(source) else {
-            return Ok(KillScriptOutcome::NoLiveThread);
-        };
-
-        let _auth =
-            crate::cred::require_signal_send(&source_snapshot, &target_facts, sig, &guard)?;
-        // _auth and guard drop here.
+    match authorize_signal_send(source, target, sig)? {
+        AuthOutcome::NoLiveTarget => return Ok(KillScriptOutcome::NoLiveThread),
+        AuthOutcome::Authorized => {}
     }
-
-    // Phase 2 — commit. `step_kill_process` is the primitive
-    // (no cred check); we just authorised, so commit unconditionally.
+    // Commit. `step_kill_process` is the primitive (no cred check);
+    // authorize_signal_send dropped its guard before returning, so
+    // post_signal's inner guard for SigInfo storage doesn't nest.
     Ok(match step_kill_process(target, sig, info) {
         KillOutcome::Delivered => KillScriptOutcome::Delivered,
         KillOutcome::NoLiveThread => KillScriptOutcome::NoLiveThread,
@@ -1092,28 +1076,17 @@ pub fn script_kill_probe(
     source: &Cap<ProcessIdentity>,
     target: &Cap<ProcessIdentity>,
 ) -> Result<KillScriptOutcome, Errno> {
-    let guard = step_engine::guard();
-
-    let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
-
-    let Some(target_facts) = target.target_proc_cred_for(source) else {
-        return Ok(KillScriptOutcome::NoLiveThread);
-    };
+    use crate::cred::checks::{authorize_signal_send, AuthOutcome};
 
     // Use SIGTERM as the rule's signum input — the no-deliver probe
     // applies the same rule POSIX kill(pid, 0) does, which is
-    // signum-independent except for SIGCONT-same-session. We pass a
-    // signum that doesn't trigger the SIGCONT bypass to keep the
-    // probe consistent with how userspace expects kill(pid, 0) to
-    // behave.
-    let _auth = crate::cred::require_signal_send(
-        &source_snapshot,
-        &target_facts,
-        Signum::SIGTERM,
-        &guard,
-    )?;
-
-    Ok(KillScriptOutcome::Probed)
+    // signum-independent except for SIGCONT-same-session. SIGTERM
+    // doesn't trigger the SIGCONT bypass, matching how userspace
+    // expects kill(pid, 0) to behave.
+    match authorize_signal_send(source, target, Signum::SIGTERM)? {
+        AuthOutcome::NoLiveTarget => Ok(KillScriptOutcome::NoLiveThread),
+        AuthOutcome::Authorized => Ok(KillScriptOutcome::Probed),
+    }
 }
 
 /// Permission-checked process-group fanout per `SIGNAL_v1` §12.2.
@@ -1142,17 +1115,20 @@ pub(crate) fn script_kill_pgrp_with_guard(
     sig: Signum,
     guard: &Guard<'_>,
 ) -> Result<u32, Errno> {
+    use crate::cred::checks::{authorize_signal_send_under_guard, AuthOutcome};
+
     let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
 
     let mut delivered = 0u32;
     let members: alloc::vec::Vec<Cap<ProcessIdentity>> = pgrp.members.snapshot_live(guard);
 
     for member in &members {
-        let Some(facts) = member.target_proc_cred_for(source) else {
-            continue;
-        };
-        if crate::cred::require_signal_send(&source_snapshot, &facts, sig, guard).is_err() {
-            continue;
+        // Per-member cred check using the snapshot captured once
+        // outside the loop. Denials / no-live-target both fold into
+        // "skip" — SIGNAL_v1 §12.2 members-independent rule.
+        match authorize_signal_send_under_guard(&source_snapshot, source, member, sig, guard) {
+            Ok(AuthOutcome::Authorized) => {}
+            Ok(AuthOutcome::NoLiveTarget) | Err(_) => continue,
         }
         if step_kill_process(member, sig, None) == KillOutcome::Delivered {
             // Catchable only: mirror onto group_pending. Gewalt
@@ -1210,17 +1186,13 @@ pub fn script_deliver_signal(
         SignalTarget::ProcessGroup(_) => return Ok(KillOutcome::NoLiveThread),
     };
 
-    // Phase 1 — authorise under a fresh guard. The block scope ends
-    // before commit so the inner delivery path can take its own
-    // guard for SigInfo storage / weak upgrades without nesting.
-    {
-        let guard = step_engine::guard();
-        let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
-        let Some(target_facts) = target_proc.target_proc_cred_for(source) else {
-            return Ok(KillOutcome::NoLiveThread);
-        };
-        let _auth =
-            crate::cred::require_signal_send(&source_snapshot, &target_facts, sig, &guard)?;
+    // Phase 1 — authorise. authorize_signal_send takes + drops its
+    // own guard, so the commit phase can take its own guard for
+    // SigInfo storage / weak upgrades without nesting.
+    use crate::cred::checks::{authorize_signal_send, AuthOutcome};
+    match authorize_signal_send(source, &target_proc, sig)? {
+        AuthOutcome::NoLiveTarget => return Ok(KillOutcome::NoLiveThread),
+        AuthOutcome::Authorized => {}
     }
 
     // Phase 2 — commit. We pass `SignalTarget::Process(target_proc)`

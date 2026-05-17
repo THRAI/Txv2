@@ -33,9 +33,11 @@
 use core::marker::PhantomData;
 
 use crate::execution::Errno;
+use crate::process::structure::ProcessIdentity;
+use crate::signal::Signum;
 use crate::vfs::structure::{Credential, InodeMeta, OpenFileFlags};
 
-use super::adapter::step_engine::Guard;
+use super::adapter::step_engine::{guard as fresh_guard, Cap, Guard};
 use super::CredSnapshot;
 
 // ----- Witness types (zero-sized, guard-bound) -----
@@ -127,3 +129,93 @@ pub fn require_open<'g>(
 // Re-export the existing signal-send check so the cred::checks::* surface
 // is the single discovery point for authorization predicates.
 pub use super::{require_signal_send, signal_permitted, SignalAuthorized};
+
+// ----- authorize_* combinators -----
+//
+// The `require_*` predicates above are the witness-producing primitives
+// (one input → one Authorized<'g>). The `authorize_*` combinators sit
+// one level up: they package the recurring "capture snapshot →
+// resolve target facts → require under a guard" sequence that every
+// signal script repeated, and present a 3-state outcome that maps
+// cleanly onto syscall-arm dispatch. Callers no longer manage:
+//   • snapshot capture + ESRCH-on-zombie mapping
+//   • foreign-value-type resolution from a target Cap
+//   • the auth-phase epoch-guard scope (must drop before commit to
+//     avoid nesting with downstream guards in `post_signal`,
+//     `upgrade_owner_proc`, etc.)
+//
+// Two flavours per check: the bare form captures its own guard +
+// snapshot (use it when you only do one check per syscall); the
+// `_under_guard` form takes a caller-held snapshot + guard so a fanout
+// loop (`script_kill_pgrp`) reuses one snapshot across N members
+// instead of re-loading the `AtomicSlot<Cap<Cred>>` per iteration.
+
+/// Outcome of an `authorize_*` combinator.
+///
+/// `Ok(Authorized)` — caller may proceed to commit.
+/// `Ok(NoLiveTarget)` — target has no payload (zombie/dropped Weak);
+///                      caller's commit branch should short-circuit
+///                      to the no-delivery outcome (typically
+///                      `NoLiveThread` for the signal scripts).
+/// `Err(Errno::EPERM)` — cred check denied the operation.
+/// `Err(Errno::ESRCH)` — source itself is a zombie (no snapshot).
+///
+/// 3-stating "denied" vs. "no live target" matters: POSIX kill returns
+/// `EPERM` for the former and `ESRCH`/`0-delivered` for the latter,
+/// and the scripts route them to different `SyscallResult` branches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "authorization outcomes must drive a commit-or-skip decision"]
+pub enum AuthOutcome {
+    /// Cred check passed — caller may commit the side-effect.
+    Authorized,
+    /// Target has no payload (zombie / dropped Weak). Skip commit;
+    /// translate to the caller's "no live target" outcome.
+    NoLiveTarget,
+}
+
+/// Authorise `source` to send `sig` to `target`.
+///
+/// Captures a fresh epoch guard for the cred check and drops it
+/// before returning, so the caller's commit phase (which may take
+/// its own guards via `post_signal` / `upgrade_owner_proc` / etc.)
+/// never nests under the auth guard.
+///
+/// Folds the recurring snapshot + target-facts + `require_signal_send`
+/// sequence into one call.
+pub fn authorize_signal_send(
+    source: &Cap<ProcessIdentity>,
+    target: &Cap<ProcessIdentity>,
+    sig: Signum,
+) -> Result<AuthOutcome, Errno> {
+    let guard = fresh_guard();
+    let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
+    let Some(target_facts) = target.target_proc_cred_for(source) else {
+        return Ok(AuthOutcome::NoLiveTarget);
+    };
+    let _w = require_signal_send(&source_snapshot, &target_facts, sig, &guard)?;
+    Ok(AuthOutcome::Authorized)
+}
+
+/// Per-iteration variant of [`authorize_signal_send`] for fanout
+/// callers (e.g. `script_kill_pgrp`) that:
+/// - already captured the source's snapshot once outside the loop,
+///   avoiding N `AtomicSlot::load`s, and
+/// - already hold the iteration's `Guard<'g>` for
+///   `pgrp.members.snapshot_live(guard)`.
+///
+/// Returns the same 3-state outcome as the bare form. The caller is
+/// responsible for the lifetime of `guard`; this function takes no
+/// new guard.
+pub fn authorize_signal_send_under_guard(
+    source_snapshot: &CredSnapshot,
+    source: &Cap<ProcessIdentity>,
+    target: &Cap<ProcessIdentity>,
+    sig: Signum,
+    guard: &Guard<'_>,
+) -> Result<AuthOutcome, Errno> {
+    let Some(target_facts) = target.target_proc_cred_for(source) else {
+        return Ok(AuthOutcome::NoLiveTarget);
+    };
+    let _w = require_signal_send(source_snapshot, &target_facts, sig, guard)?;
+    Ok(AuthOutcome::Authorized)
+}
