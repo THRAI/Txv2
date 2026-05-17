@@ -844,6 +844,48 @@ impl<I: SubjectIdentity> StepOp<I> for OpenOp {
     }
 }
 
+/// `StepOp` wrap for `flock(2)` advisory lock acquire/release.
+pub struct FlockOp<'a> {
+    pub file: &'a Cap<super::structure::OpenFile>,
+    pub lock_type: u32,
+    pub blocking: bool,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for FlockOp<'a> {
+    type Output = ();
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        match self.file.flock_acquire(self.lock_type, self.blocking) {
+            Ok(()) => StepOutcome::Done(()),
+            Err(e) => StepOutcome::Err(e),
+        }
+    }
+}
+
+impl OneShotStepOp for FlockOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for FlockOp<'_> {}
+
+/// `StepOp` wrap for per-file `fsync` via `PageBacking::fsync`.
+pub struct FileFsyncOp<'a> {
+    pub page_backing: alloc::sync::Arc<dyn crate::page_backed::FsPageBacking>,
+    pub fs_object_id: super::structure::FsObjectId,
+    pub guard: &'a crate::execution::Guard<'a>,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for FileFsyncOp<'a> {
+    type Output = ();
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        use StepOutcome as V3;
+        match self.page_backing.fsync(self.fs_object_id, self.guard) {
+            V3::Done(()) => V3::Done(()),
+            V3::Err(e) => V3::Err(e),
+            V3::Continue { .. } => V3::Continue { progress: NoProgress },
+            V3::Yield { shape, .. } => V3::Yield { progress: NoProgress, shape },
+        }
+    }
+}
+
 #[cfg(test)]
 mod step_op_wraps {
     //! PR-2 wave-3 StepOp wrap tests. Each test constructs a minimal
