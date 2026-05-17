@@ -1055,16 +1055,16 @@ pub fn script_kill_process(
 ) -> Result<KillScriptOutcome, Errno> {
     let guard = step_engine::guard();
 
-    let source_cred = source
-        .upgrade_operational()
-        .map_err(|_| Errno::ESRCH)?
-        .cred();
+    // Capture the source's syscall-entry credential snapshot. `None`
+    // means the source is a zombie (payload reaped) — ESRCH per the
+    // outcome doc above.
+    let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
 
     let Some(target_facts) = target.target_proc_cred_for(source) else {
         return Ok(KillScriptOutcome::NoLiveThread);
     };
 
-    let _auth = crate::cred::require_signal_send(source_cred, &target_facts, sig, &guard)?;
+    let _auth = crate::cred::require_signal_send(&source_snapshot, &target_facts, sig, &guard)?;
 
     Ok(match step_kill_process(target, sig, None) {
         KillOutcome::Delivered => KillScriptOutcome::Delivered,
@@ -1081,10 +1081,7 @@ pub fn script_kill_probe(
 ) -> Result<KillScriptOutcome, Errno> {
     let guard = step_engine::guard();
 
-    let source_cred = source
-        .upgrade_operational()
-        .map_err(|_| Errno::ESRCH)?
-        .cred();
+    let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
 
     let Some(target_facts) = target.target_proc_cred_for(source) else {
         return Ok(KillScriptOutcome::NoLiveThread);
@@ -1096,8 +1093,12 @@ pub fn script_kill_probe(
     // signum that doesn't trigger the SIGCONT bypass to keep the
     // probe consistent with how userspace expects kill(pid, 0) to
     // behave.
-    let _auth =
-        crate::cred::require_signal_send(source_cred, &target_facts, Signum::SIGTERM, &guard)?;
+    let _auth = crate::cred::require_signal_send(
+        &source_snapshot,
+        &target_facts,
+        Signum::SIGTERM,
+        &guard,
+    )?;
 
     Ok(KillScriptOutcome::Probed)
 }
@@ -1128,10 +1129,7 @@ pub(crate) fn script_kill_pgrp_with_guard(
     sig: Signum,
     guard: &Guard<'_>,
 ) -> Result<u32, Errno> {
-    let source_cred = source
-        .upgrade_operational()
-        .map_err(|_| Errno::ESRCH)?
-        .cred();
+    let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
 
     let mut delivered = 0u32;
     let members: alloc::vec::Vec<Cap<ProcessIdentity>> = pgrp.members.snapshot_live(guard);
@@ -1140,7 +1138,7 @@ pub(crate) fn script_kill_pgrp_with_guard(
         let Some(facts) = member.target_proc_cred_for(source) else {
             continue;
         };
-        if crate::cred::require_signal_send(source_cred, &facts, sig, guard).is_err() {
+        if crate::cred::require_signal_send(&source_snapshot, &facts, sig, guard).is_err() {
             continue;
         }
         if step_kill_process(member, sig, None) == KillOutcome::Delivered {

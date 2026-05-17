@@ -825,7 +825,7 @@ impl SignalAuthorized<'_> {
     }
 }
 
-/// Pure permission rule: may a caller with `source` cred send `sig` to
+/// Pure permission rule: may a caller carrying `source` send `sig` to
 /// a target whose facts are `target`? Implements the day-1 simplified
 /// shape of `SIGNAL_v1` §32:
 ///
@@ -840,7 +840,13 @@ impl SignalAuthorized<'_> {
 /// the Linux 4-way `(uid,euid) × (uid,suid,ruid)` match collapses to
 /// `(uid,euid) × (uid,euid)`. Extends without reshaping callers when
 /// saved-set IDs land.
-pub fn signal_permitted(source: Cred, target: &TargetProcCred, sig: Signum) -> bool {
+///
+/// Takes `&CredSnapshot` rather than `Cred` by value so the syscall-
+/// entry snapshot threads through the cred → signal check boundary
+/// per `cred_service_v_1` §"In flight". Callers that hold the raw
+/// `Cred` can wrap via `CredSnapshot::from_cred(cred)`.
+pub fn signal_permitted(source: &CredSnapshot, target: &TargetProcCred, sig: Signum) -> bool {
+    let source = source.as_cred();
     if sig == Signum::SIGCONT && target.same_session {
         return true;
     }
@@ -857,8 +863,13 @@ pub fn signal_permitted(source: Cred, target: &TargetProcCred, sig: Signum) -> b
 /// `SignalAuthorized` witness on success, `Errno::EPERM` on denial.
 /// Live-checked per `cred_service_v_1` §"Not every operation is
 /// tokenized" — kill mints no reusable grant.
+///
+/// `source` is the caller's syscall-entry [`CredSnapshot`]; the check
+/// runs against that snapshot, not a fresh load of the canonical cred
+/// — matching the "scripts hold a by-value metadata copy" rule in
+/// `cred_service_v_1` §"In flight".
 pub fn require_signal_send<'g>(
-    source: Cred,
+    source: &CredSnapshot,
     target: &TargetProcCred,
     sig: Signum,
     guard: &'g Guard<'_>,
