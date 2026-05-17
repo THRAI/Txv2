@@ -1988,7 +1988,21 @@
   and `unlink` hit `--- Assert Fatal ! ---`; `umount` returns −38
   (ENOSYS for `mount` syscall). Commit loader changes.
 
-**Updated:** 2026-05-14
+**Updated:** 2026-05-17
+
+- 2026-05-17 **`feature-network` rebased onto `main` 96a6b60.** Created
+  `feature-network-backup-before-main-rebase-20260517` before replaying the
+  network stack over the latest main. Resolved the boot-order conflict by
+  keeping main's tmpfs-root `/` + `/musl` mount strategy while preserving
+  `init_net_devices()` / `submit_net_runtime_tasks()`. Resolved N69a exec
+  conflicts by keeping main's LA64 ELF support and architecture-specific
+  initial SP register while preserving `PT_INTERP`, `parse_interp_plan`, and
+  interpreter partial-page population. `msp/` notes remain untracked.
+  **Verified:** `cargo fmt --check`; `cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`
+  (passes with the existing `current_cpu` unused warning in `tx-kernel/src/init.rs`).
+  **Next step:** run the RV64 shell-test lanes on the rebased branch, especially
+  `busybox-iperf3-loopback`, `busybox-netperf-help`, and
+  `busybox-netperf-loopback`.
 
 - 2026-05-14 **`feature-network` rebased onto `main` 856bd3e.** Replayed the
   network branch on top of the latest fast-forwarded main, resolving conflicts
