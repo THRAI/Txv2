@@ -166,6 +166,11 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MkdirOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        // observe
+        // upgrade — N/A: path-walk read-only
+        // reserve — create_inode reserves zone slot
+        // commit
+        // publish — N/A: inode published via dentry
         let (parent, name) = match self.parent.take() {
             Some(p) => p,
             None => {
@@ -225,6 +230,11 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MknodOp<'a> {
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        // observe
+        // upgrade — N/A: path-walk read-only
+        // reserve — create_inode reserves zone slot
+        // commit
+        // publish — N/A: inode published via dentry
         let (parent, name) = match self.parent.take() {
             Some(p) => p,
             None => {
