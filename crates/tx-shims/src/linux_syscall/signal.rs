@@ -4,7 +4,9 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use tx_subsystems::process::numbers::{resolve_pid_number, PidName};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
+use tx_subsystems::signal::{KillOutcome, SignalTarget, deliver_posix_signal};
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
 ///
@@ -330,8 +332,30 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
 /// Slice 7 v1 aliases this to [`sys_kill`]: txKernel has no
 /// per-thread signal state machine yet, so `tkill(tid, sig)` is
 /// treated as `kill(tid, sig)` (the tid is interpreted as a pid).
-/// `TODO(phase-thread-signals)`.
 pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    let tid = args[0];
+    let sig = args[1] as u32;
+
+    if sig > 64 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    // Resolve tid → ThreadIdentity via PidName namespace
+    if let Some(PidName::Thread(thread_cap)) = resolve_pid_number(tid) {
+        let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+            Some(s) => s,
+            None => return SyscallResult::Error(EINVAL_VALUE),
+        };
+        return match deliver_posix_signal(
+            tx_subsystems::signal::SignalTarget::Thread(thread_cap),
+            signum,
+        ) {
+            tx_subsystems::signal::KillOutcome::Delivered => SyscallResult::Return(0),
+            tx_subsystems::signal::KillOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+        };
+    }
+
+    // Fall back to process-level kill
     sys_kill(args, ctx)
 }
 
@@ -414,4 +438,3 @@ pub(super) fn sys_rt_sigpending(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResu
 
     SyscallResult::Return(0)
 }
-

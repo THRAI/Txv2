@@ -258,6 +258,14 @@ pub const SIGCHLD: u64 = 17;
 
 pub const CLONE_SETTLS: u64 = 0x80000;
 pub const CLONE_VM: u64 = 0x100;
+pub const CLONE_FS: u64 = 0x200;
+pub const CLONE_FILES: u64 = 0x400;
+pub const CLONE_SIGHAND: u64 = 0x800;
+pub const CLONE_VFORK: u64 = 0x4000;
+pub const CLONE_PARENT: u64 = 0x8000;
+pub const CLONE_THREAD: u64 = 0x10000;
+pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+pub const CLONE_PARENT_SETTID: u64 = 0x100000;
 
 /// `getppid()`. Linux generic ABI `__NR_getppid`. Wraps
 /// `ProcessIdentity::parent_pid()`. Returns `0` (`Pid::RESERVED`)
