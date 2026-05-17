@@ -15,8 +15,18 @@ impl KernelMain<ActivePlatform> for Kernel {
 }
 
 #[no_mangle]
-pub extern "C" fn rust_entry(cpu_id: usize, firmware_arg: usize) -> ! {
-    tx_hal::entry::<ActivePlatform, Kernel>(cpu_id, firmware_arg)
+pub extern "C" fn rust_entry(
+    cpu_id: usize,
+    efi_boot: usize,
+    cmdline_phys: usize,
+    system_table_phys: usize,
+) -> ! {
+    tx_hal_loongarch64_qemu_virt::capture_loongarch64_qemu_boot_args(
+        efi_boot,
+        cmdline_phys,
+        system_table_phys,
+    );
+    tx_hal::entry::<ActivePlatform, Kernel>(cpu_id, system_table_phys)
 }
 
 #[no_mangle]
