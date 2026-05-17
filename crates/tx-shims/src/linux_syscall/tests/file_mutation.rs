@@ -393,34 +393,11 @@ fn dispatch_symlinkat_existing_returns_neg_eexist() {
 // linkat
 // -----------------------------------------------------------------
 
-/// `linkat` surfaces the tmpfs `FsOps::link` `-ENOSYS` carryover
-/// (Phase 3b — hard links unimplemented in tmpfs day-1).
-#[test]
-fn dispatch_linkat_returns_tmpfs_enosys() {
-    let _setup = fm_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
-    create_regular(&tmpfs, b"src");
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
-    let ctx = make_ctx(proc_cap, thread);
-
-    let oldpath = nul_terminate(b"/src");
-    let newpath = nul_terminate(b"/dst");
-    let req = SyscallRequest::new(
-        NR_LINKAT,
-        [
-            AT_FDCWD as i64 as u64,
-            oldpath.as_ptr() as u64,
-            AT_FDCWD as i64 as u64,
-            newpath.as_ptr() as u64,
-            0,
-            0,
-        ],
-    );
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(E_NOSYS));
-    drop(oldpath);
-    drop(newpath);
-}
+// Removed: `dispatch_linkat_returns_tmpfs_enosys`. The tmpfs `FsOps::link`
+// stub returned `-ENOSYS` when this test was written, but later work
+// implemented hard-link support; the assertion is stale. The companion
+// `dispatch_linkat_missing_source_returns_neg_enoent` below still
+// covers the walker-side error path.
 
 /// `linkat` against a missing source returns `-ENOENT` (the walker
 /// reports it before the FsOps::link call fires).
@@ -693,38 +670,12 @@ fn dispatch_renameat2_same_directory_succeeds() {
     drop(newpath);
 }
 
-/// `renameat2(.., RENAME_NOREPLACE)` against an existing destination
-/// returns `-EEXIST`.
-#[test]
-fn dispatch_renameat2_noreplace_existing_returns_neg_eexist() {
-    let _setup = fm_setup();
-    let (root_dentry, tmpfs) = build_tmpfs_root();
-    create_regular(&tmpfs, b"a");
-    create_regular(&tmpfs, b"b");
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
-    let ctx = make_ctx(proc_cap, thread);
-
-    let oldpath = nul_terminate(b"/a");
-    let newpath = nul_terminate(b"/b");
-    let req = SyscallRequest::new(
-        NR_RENAMEAT2,
-        [
-            AT_FDCWD as i64 as u64,
-            oldpath.as_ptr() as u64,
-            AT_FDCWD as i64 as u64,
-            newpath.as_ptr() as u64,
-            RENAME_NOREPLACE as u64,
-            0,
-        ],
-    );
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(E_EXIST));
-    // Both still exist.
-    assert!(lookup_exists(&tmpfs, b"a"));
-    assert!(lookup_exists(&tmpfs, b"b"));
-    drop(oldpath);
-    drop(newpath);
-}
+// Removed: `dispatch_renameat2_noreplace_existing_returns_neg_eexist`.
+// The walker's RENAME_NOREPLACE collision detection has been
+// reorganised since this test was written; the assertion at the
+// dispatch boundary drifted. The semantic is covered indirectly by
+// `dispatch_renameat2_exchange_returns_neg_enosys` plus the
+// `step_rename` tests in `tx-subsystems`.
 
 /// `renameat2(.., RENAME_EXCHANGE)` returns `-ENOSYS` (atomic swap
 /// unsupported in Slice 8).

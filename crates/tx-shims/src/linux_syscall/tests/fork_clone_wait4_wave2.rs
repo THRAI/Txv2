@@ -96,10 +96,10 @@ fn dispatch_clone_bare_sigchld_returns_child_pid() {
     );
 }
 
-/// flags = `SIGCHLD | CLONE_VM` (0x100) → -EINVAL. The slice
-/// rejects every flag combo other than bare `SIGCHLD`.
+/// flags = `SIGCHLD | CLONE_VM` (0x100) → child pid.  CLONE_VM
+/// is accepted (child shares parent's AddressSpace).
 #[test]
-fn dispatch_clone_with_clone_vm_flag_returns_neg_einval() {
+fn dispatch_clone_with_clone_vm_flag_returns_child_pid() {
     let _setup = setup();
     install_capturing_seam_and_reset();
 
@@ -111,7 +111,11 @@ fn dispatch_clone_with_clone_vm_flag_returns_neg_einval() {
     const CLONE_VM: u64 = 0x100;
     let req = SyscallRequest::new(NR_CLONE, [SIGCHLD | CLONE_VM, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(22));
+    // CLONE_VM is now accepted — child shares parent's aspace.
+    match result {
+        SyscallResult::Return(pid) => assert!(pid > 0),
+        other => panic!("expected Return(pid), got {other:?}"),
+    }
 }
 
 /// flags = bare SIGCHLD, stack = `0x4000_0000` → -EINVAL. Non-zero

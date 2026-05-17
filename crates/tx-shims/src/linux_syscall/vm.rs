@@ -5,6 +5,12 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use tx_scripts::drive;
+use tx_substrate::step::DriveMode;
+use tx_substrate::step::Errno as V3Errno;
+use tx_subsystems::vm::step_ops::{
+    VmBrkOp, VmMapOp, VmMlockOp, VmMsyncOp, VmMunlockOp, VmProtectOp, VmRemapOp, VmUnmapOp,
+};
 
 /// `brk(requested)` per `txdoc:VM-5-8-BRK`.
 ///
@@ -15,7 +21,7 @@ use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 ///   Linux's brk(2) **never** returns a negative errno; on failure
 ///   userspace observes "the break didn't move" and is responsible
 ///   for noticing.
-pub(super) async fn sys_brk<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let requested = args[0];
 
     let brk_base = ctx.process.brk_base();
@@ -32,12 +38,31 @@ pub(super) async fn sys_brk<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     let cur = UserVirtAddr(current_brk as usize);
     let req = UserVirtAddr(requested as usize);
 
-    match ctx.aspace.brk_script(base, cur, req).await {
+    let op = VmBrkOp {
+        aspace: &ctx.aspace,
+        brk_base: base,
+        current_brk: cur,
+        requested_brk: req,
+    };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(new_brk) => {
             ctx.process.set_current_brk(new_brk.0 as u64);
             SyscallResult::Return(new_brk.0 as i64)
         }
-        Err(VmMapError::InvalidRange) | Err(_) => {
+        Err(_) => {
             // Linux: brk(2) never returns -errno. On failure (range
             // below brk_base, OOM, mapping conflict) report the
             // unchanged current break. Userspace detects "no
@@ -99,7 +124,7 @@ pub(super) async fn sys_brk<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
 /// - File-backed mmap requires `fd` to resolve to an `OpenFile` whose
 ///   rnode is `RNodeBacking::PageBacked` — TTY / pipe / chardev /
 ///   directory / symlink → `-ENODEV`.
-pub(super) fn sys_mmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let addr = args[0];
     let length_in = args[1] as usize;
     let prot_bits = args[2];
@@ -145,6 +170,13 @@ pub(super) fn sys_mmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     let fixed = flags & MAP_FIXED != 0;
     let fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
     let anonymous = flags & MAP_ANONYMOUS != 0;
+    // MAP_GROWSDOWN: stack-expansion hint. txKernel has no stack
+    // expansion (no `expand_stack` script), so reject it explicitly
+    // rather than silently setting `VmEntryFlags.grows_down` with no
+    // observable effect.
+    if flags & MAP_GROWSDOWN != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
     let entry_flags =
         VmEntryFlags::new(shared, flags & MAP_GROWSDOWN != 0, flags & MAP_LOCKED != 0);
 
@@ -188,17 +220,34 @@ pub(super) fn sys_mmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
         VmMapRequest::anywhere(window, page_count, prot, entry_flags, backing)
     };
 
-    match ctx.aspace.try_mmap(request) {
+    let op = VmMapOp {
+        aspace: &ctx.aspace,
+        request,
+    };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(outcome) => SyscallResult::Return(outcome.range.start().as_usize() as i64),
-        Err(error) => {
+        Err(errno) => {
             // MAP_FIXED_NOREPLACE → AlreadyMapped maps to EEXIST per
             // Linux's distinct semantic for that flag.
-            let errno = if fixed_noreplace && error == VmMapError::AlreadyMapped {
+            let code = if fixed_noreplace && errno == crate::adapter::step_engine::Errno::EEXIST {
                 errno_to_i32(Errno::EEXIST)
             } else {
-                vmmap_error_to_i32(error)
+                errno_to_i32(Into::<Errno>::into(errno))
             };
-            SyscallResult::Error(errno)
+            SyscallResult::Error(code)
         }
     }
 }
@@ -207,7 +256,7 @@ pub(super) fn sys_mmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
 ///
 /// `addr` must be page-aligned and `length` is rounded up to a whole
 /// page (matching Linux). Wraps `AddressSpace::try_munmap`.
-pub(super) fn sys_munmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_munmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let addr = args[0];
     let length_in = args[1] as usize;
 
@@ -226,9 +275,116 @@ pub(super) fn sys_munmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    match ctx.aspace.try_munmap(range) {
+    let op = VmUnmapOp {
+        aspace: &ctx.aspace,
+        range,
+    };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
+        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
+    }
+}
+
+/// `mlock(addr, len)` — Linux RV64 generic syscall #228.
+///
+/// Under no-swap, mlock is purely observational: it sets
+/// `VmEntryFlags.locked` on every VMA overlapping the range for
+/// `/proc/<pid>/maps` reporting. No pages are faulted in; the flag is
+/// a hint that survives across fork (the child inherits locked flags
+/// via recipe cloning).
+///
+/// `addr` is rounded down to a page boundary; `len` is rounded up.
+/// Returns 0 on success, `-errno` on failure.
+pub(super) async fn sys_mlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let addr = args[0];
+    let len_in = args[1] as usize;
+
+    if len_in == 0 {
+        return SyscallResult::Return(0);
+    }
+    let start = addr & !(USER_PAGE_SIZE as u64 - 1);
+    let Some(len) = len_in.checked_next_multiple_of(USER_PAGE_SIZE) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let Ok(range) = UserRange::new_aligned(UserVirtAddr(start as usize), len) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+
+    let op = VmMlockOp {
+        aspace: &ctx.aspace,
+        range,
+    };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(_commit) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
+    }
+}
+
+/// `munlock(addr, len)` — Linux RV64 generic syscall #229.
+///
+/// Clears `VmEntryFlags.locked` on every VMA overlapping the range.
+/// Same rounding and error semantics as `sys_mlock`.
+pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let addr = args[0];
+    let len_in = args[1] as usize;
+
+    if len_in == 0 {
+        return SyscallResult::Return(0);
+    }
+    let start = addr & !(USER_PAGE_SIZE as u64 - 1);
+    let Some(len) = len_in.checked_next_multiple_of(USER_PAGE_SIZE) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let Ok(range) = UserRange::new_aligned(UserVirtAddr(start as usize), len) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+
+    let op = VmMunlockOp {
+        aspace: &ctx.aspace,
+        range,
+    };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(_commit) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
 }
 
@@ -237,7 +393,7 @@ pub(super) fn sys_munmap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
 /// Wraps `AddressSpace::try_mprotect`. PROT_GROWSDOWN/GROWSUP not
 /// supported (returns `-ENOSYS`); other prot validation matches
 /// `sys_mmap`.
-pub(super) fn sys_mprotect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_mprotect(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let addr = args[0];
     let length_in = args[1] as usize;
     let prot_bits = args[2];
@@ -270,9 +426,27 @@ pub(super) fn sys_mprotect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
         Ok(r) => r,
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
-    match ctx.aspace.try_mprotect(range, prot) {
+    let op = VmProtectOp {
+        aspace: &ctx.aspace,
+        range,
+        prot,
+    };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(_commit) => SyscallResult::Return(0),
-        Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
+        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
 }
 
@@ -284,7 +458,7 @@ pub(super) fn sys_mprotect<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
 /// `MREMAP_FIXED | MREMAP_MAYMOVE` shape musl emits maps cleanly to
 /// this contract; in-place grow without `MAYMOVE` would need
 /// `try_mremap`'s contract extended (deferred).
-pub(super) fn sys_mremap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let old_addr = args[0];
     let old_size_in = args[1] as usize;
     let new_size_in = args[2] as usize;
@@ -316,12 +490,27 @@ pub(super) fn sys_mremap<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    match ctx
-        .aspace
-        .try_mremap(VmRemapRequest::new(old_range, new_range))
+    let request = VmRemapRequest::new(old_range, new_range);
+    let op = VmRemapOp {
+        aspace: &ctx.aspace,
+        request,
+    };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
     {
         Ok(outcome) => SyscallResult::Return(outcome.new_range.start().as_usize() as i64),
-        Err(error) => SyscallResult::Error(vmmap_error_to_i32(error)),
+        Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
 }
 
@@ -396,50 +585,26 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    // Loop on the canonical wait-carrier discipline mirroring
-    // `sys_write` — fresh epoch guard inside the call site, never
-    // crossing an `.await`.
-    use step_engine::{StepOutcome as V3, YieldShape};
-    loop {
-        let outcome = {
-            let guard = step_engine::guard();
-            ctx.aspace.msync(range, &guard)
-        };
-        match outcome {
-            V3::Done(()) | V3::Continue { .. } => {
-                return SyscallResult::Return(0);
-            }
-            V3::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                let token =
-                    tx_subsystems::execution::WaitToken::new(carrier.raw(), interests.raw());
-                if let Some(future) = wait_source::wait_on_token(token) {
-                    let _ = future.await;
-                }
-                // Otherwise re-poll immediately.
-            }
-            V3::Yield {
-                shape: YieldShape::OnAgent { .. },
-                ..
-            } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Yield {
-                shape: YieldShape::OnTimer { .. },
-                ..
-            } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Err(v3_errno) => {
-                return SyscallResult::Error(errno_to_i32(v3_errno.into()));
-            }
-        }
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let _delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = VmMsyncOp {
+        aspace: &ctx.aspace,
+        range,
+    };
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        None,
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 
@@ -525,93 +690,79 @@ pub(super) fn vmmap_error_to_i32(error: VmMapError) -> i32 {
 ///    showed the word changed" (return `0` per the WAIT contract)
 ///    via the `parked` flag tracked across loop iterations.
 /// 5. Other `Err(errno)` → return `-errno`.
-pub(super) async fn sys_futex<'a>(args: [u64; 6], _ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let uaddr = args[0];
     let op_full = args[1] as u32;
     let val = args[2] as u32;
-    // args[3] = timeout pointer (ignored — Slice 4 carryover).
-    // args[4] = uaddr2 (REQUEUE-family only).
-    // args[5] = val3 (BITSET-family only).
 
     let op = op_full & FUTEX_CMD_MASK;
 
     match op {
         FUTEX_WAIT => {
-            // Track whether we've parked at least once. EAGAIN
-            // from `step_futex_wait` means "user word != val". If
-            // parked is false, this is the first-call mismatch
-            // (return -EAGAIN). If parked is true, this is a
-            // post-wake re-check showing the word changed (the
-            // wake was meaningful — return 0).
-            let mut parked = false;
-            loop {
-                let outcome = {
-                    let guard = step_engine::guard();
-                    tx_subsystems::futex::step_futex_wait(uaddr, val, &guard)
-                };
-                use step_engine::{StepOutcome as V3, YieldShape};
+            use tx_scripts::drive;
+            use tx_substrate::step::DriveMode;
+            use tx_subsystems::futex::FutexWaitOp;
+
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mailbox_arc = script_ctx.mailbox().cloned();
+            let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+            let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+
+            // First, probe the futex word without parking. EAGAIN
+            // here means "word != val" → return -EAGAIN immediately
+            // (the predecessor equality check, per POSIX).
+            {
+                let guard = step_engine::guard();
+                let outcome = tx_subsystems::futex::step_futex_wait(uaddr, val, &guard);
                 match outcome {
-                    V3::Done(()) => {
-                        return SyscallResult::Return(0);
+                    StepOutcome::Err(e) if e == V3Errno::EAGAIN => {
+                        return SyscallResult::Error(errno_to_i32(Errno::EAGAIN));
                     }
-                    V3::Continue { .. } => {
-                        // No-progress retry hint: re-poll immediately.
-                        continue;
+                    StepOutcome::Err(e) => {
+                        return SyscallResult::Error(errno_to_i32(Errno::from(e)));
                     }
-                    V3::Yield {
-                        shape:
-                            YieldShape::OnWaitSource {
-                                source: carrier,
-                                interests,
-                            },
-                        ..
-                    } => {
-                        parked = true;
-                        let token = tx_subsystems::execution::WaitToken::new(
-                            carrier.raw(),
-                            interests.raw(),
-                        );
-                        if let Some(future) = wait_source::wait_on_token(token) {
-                            let _ = future.await;
-                        }
-                        continue;
-                    }
-                    V3::Yield { .. } => {
-                        return SyscallResult::Error(EIO_VALUE);
-                    }
-                    V3::Err(v3_errno) => {
-                        let errno: Errno = v3_errno.into();
-                        return if errno == Errno::EAGAIN {
-                            if parked {
-                                SyscallResult::Return(0)
-                            } else {
-                                SyscallResult::Error(errno_to_i32(Errno::EAGAIN))
-                            }
-                        } else {
-                            SyscallResult::Error(errno_to_i32(errno))
-                        };
+                    // Yield / Continue / Done: fall through to drive().
+                    _ => {}
+                }
+            }
+
+            // Park and wait.  drive() parks on the futex bucket's
+            // WaitSource via resolve_on_wait_source, wakes when
+            // step_futex_wake fires the bucket, and re-steps.
+            // After waking, EAGAIN means "word changed → wake was
+            // meaningful" → return 0.
+            //
+            // Op acquires its own epoch guard inside `step()`; no
+            // guard crosses `drive(...).await` (REACTOR_v0,
+            // STEP_MODEL_v2 §1, INVARIANTS_v5 EBR-7).
+            let op = FutexWaitOp { uaddr, val };
+            match drive(
+                op,
+                &mut script_ctx,
+                DriveMode::Waiting,
+                mailbox_arc.as_ref(),
+                delegate_registry_arc.as_deref(),
+                timer_wheel_arc.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => SyscallResult::Return(0),
+                Err(v3errno) => {
+                    let errno: Errno = v3errno.into();
+                    if errno == Errno::EAGAIN {
+                        SyscallResult::Return(0)
+                    } else {
+                        SyscallResult::Error(errno_to_i32(errno))
                     }
                 }
             }
         }
         FUTEX_WAKE => {
-            let n = val;
-            let outcome = {
-                let guard = step_engine::guard();
-                tx_subsystems::futex::step_futex_wake(uaddr, n, &guard)
-            };
-            use StepOutcome as V3;
-            match outcome {
-                V3::Done(woken) => SyscallResult::Return(woken as i64),
-                V3::Continue { .. } | V3::Yield { .. } => {
-                    // FUTEX_WAKE is not a blocking op. The step
-                    // never yields in practice; map to EIO.
-                    SyscallResult::Error(EIO_VALUE)
-                }
-                V3::Err(v3_errno) => {
-                    let errno: Errno = v3_errno.into();
-                    SyscallResult::Error(errno_to_i32(errno))
-                }
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = FutexWakeOp { uaddr, n: val };
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(woken) => SyscallResult::Return(woken as i64),
+                Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
             }
         }
         // FUTEX_REQUEUE / CMP_REQUEUE / WAKE_OP / LOCK_PI /

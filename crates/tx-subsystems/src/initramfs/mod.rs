@@ -29,7 +29,7 @@ use alloc::sync::Arc;
 
 use crate::adapter::step_engine::{guard as ebr_guard, page_allocator, Cap, StepOutcome as V3};
 use crate::execution::Errno;
-use crate::mount::MountIdentity;
+use crate::mount::{MountIdentity, MountPayload};
 use crate::page_backed::{FsPageBacking, MaterializeAccess, PageIndex};
 use crate::vfs::{Credential, FsObjectId, FsOps, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 
@@ -328,6 +328,7 @@ pub fn unpack_into_root_mount(
                 unpack_regular(
                     &fs_ops,
                     &fs_page_backing,
+                    &payload,
                     parent_id,
                     filename,
                     mode_low,
@@ -442,9 +443,11 @@ fn mkdir_idempotent(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn unpack_regular(
     fs_ops: &Arc<dyn FsOps>,
     fs_page_backing: &Arc<dyn FsPageBacking>,
+    mount: &Cap<MountPayload>,
     parent_id: FsObjectId,
     name: &[u8],
     mode_low: u16,
@@ -479,7 +482,7 @@ fn unpack_regular(
     // direct-map path `register_init_fixture_into_tmpfs` uses.
     let pc = {
         let guard = ebr_guard();
-        let outcome = fs_ops.materialise_rnode(file_id, file_meta, &guard);
+        let outcome = fs_ops.materialise_rnode(file_id, file_meta, mount, &guard);
         let rnode = match outcome {
             V3::Done(r) => r,
             V3::Err(v3_errno) => {

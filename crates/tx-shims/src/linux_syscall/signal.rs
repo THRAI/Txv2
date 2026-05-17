@@ -4,6 +4,9 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use tx_subsystems::process::numbers::{resolve_pid_number, PidName};
+use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
+use tx_subsystems::signal::{KillOutcome, SignalTarget};
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
 ///
@@ -56,20 +59,37 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     // but the cleanest shape is to call `step_sigprocmask` always
     // when `how` is Some, and for the query-only branch bypass it.
     let prev_mask: SignalMask = match how {
-        Some(how) => match step_sigprocmask(&ctx.thread, how, next_mask) {
-            SigprocmaskChange::Replaced { prev, .. } => prev,
-            SigprocmaskChange::ZombieIgnored => {
-                return SyscallResult::Error(ESRCH_VALUE);
-            }
-        },
-        None => {
-            // Query-only path. Use `Block` of EMPTY (a no-op) to
-            // pull the current mask out without changing it. SIG_BLOCK
-            // with empty `next` cannot alter the mask: `new = prev | 0`.
-            match step_sigprocmask(&ctx.thread, SigmaskHow::Block, SignalMask::EMPTY) {
-                SigprocmaskChange::Replaced { prev, .. } => prev,
-                SigprocmaskChange::ZombieIgnored => {
+        Some(how) => {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = SigprocmaskOp {
+                thread: ctx.thread.clone(),
+                how,
+                next: next_mask,
+            };
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(SigprocmaskChange::Replaced { prev, .. }) => prev,
+                Ok(SigprocmaskChange::ZombieIgnored) => {
                     return SyscallResult::Error(ESRCH_VALUE);
+                }
+                Err(v3errno) => {
+                    return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                }
+            }
+        }
+        None => {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = SigprocmaskOp {
+                thread: ctx.thread.clone(),
+                how: SigmaskHow::Block,
+                next: SignalMask::EMPTY,
+            };
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(SigprocmaskChange::Replaced { prev, .. }) => prev,
+                Ok(SigprocmaskChange::ZombieIgnored) => {
+                    return SyscallResult::Error(ESRCH_VALUE);
+                }
+                Err(v3errno) => {
+                    return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
                 }
             }
         }
@@ -84,6 +104,32 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     }
 
     SyscallResult::Return(0)
+}
+
+// --- Stub syscalls (deferred to post-bringup) -------------------------
+
+pub(super) fn sys_rt_sigsuspend(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+pub(super) fn sys_sigaltstack(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+pub(super) fn sys_rt_sigqueueinfo(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+pub(super) fn sys_rt_sigtimedwait(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+pub(super) fn sys_pidfd_open(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
+}
+
+pub(super) fn sys_pidfd_send_signal(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
+    SyscallResult::Error(ENOSYS_VALUE)
 }
 
 /// `rt_sigaction(signum, act, oldact, sigsetsize)` per `SIGNAL_v1`
@@ -147,22 +193,24 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     // and we must not mutate. Read the live disposition through the
     // process's `sig_actions` table accessor in that case.
     let prev_disposition: SigDisposition = match new_disposition {
-        Some(disp) => match step_sigaction(&ctx.process, sig, disp) {
-            SigDispositionChange::Replaced { prev } => prev,
-            SigDispositionChange::Uncatchable(prev) => {
-                // SIGKILL/SIGSTOP — `step_sigaction` silently keeps
-                // them at default. Treat the call as a successful
-                // query: return the (unchanged) prev to oldact, and
-                // the syscall returns 0. Linux allows installing
-                // SIG_DFL on these; installing handlers fails. For
-                // simplicity (and matching `step_sigaction`'s shape)
-                // we report success either way.
-                prev
+        Some(disp) => {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = SigactionOp {
+                process: ctx.process.clone(),
+                sig,
+                disposition: disp,
+            };
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(SigDispositionChange::Replaced { prev }) => prev,
+                Ok(SigDispositionChange::Uncatchable(prev)) => prev,
+                Ok(SigDispositionChange::ZombieIgnored) => {
+                    return SyscallResult::Error(ESRCH_VALUE);
+                }
+                Err(v3errno) => {
+                    return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                }
             }
-            SigDispositionChange::ZombieIgnored => {
-                return SyscallResult::Error(ESRCH_VALUE);
-            }
-        },
+        }
         None => {
             // Query-only: read directly via the process's
             // `sig_disposition` accessor. Returns `None` for zombies
@@ -212,10 +260,27 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
 /// - Unknown signum (outside 1..=64): `-EINVAL`.
 /// - Target zombie / no live thread: `-ESRCH` (matches Linux's
 ///   "kill returns ESRCH if no signal could be delivered").
-pub(super) fn sys_kill(args: [u64; 6]) -> SyscallResult {
+pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     let pid = args[0] as i32;
     let sig = args[1] as u32;
 
+    // Phase F: pid == 0 routes to caller's process group.
+    if pid == 0 {
+        if sig == 0 {
+            return SyscallResult::Return(0); // existence probe
+        }
+        let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+            Some(s) => s,
+            None => return SyscallResult::Error(EINVAL_VALUE),
+        };
+        let pgrp = ctx.process.pgrp_cap();
+        let delivered = step_kill_pgrp(&pgrp, signum);
+        return if delivered > 0 {
+            SyscallResult::Return(0)
+        } else {
+            SyscallResult::Error(ESRCH_VALUE)
+        };
+    }
     if pid <= 0 {
         // TODO(phase-pgrp-kill): pgrp-targeted (`pid < 0` /
         // `pid == 0` / `pid == -1`) kills need a global pid-to-pgrp
@@ -242,9 +307,23 @@ pub(super) fn sys_kill(args: [u64; 6]) -> SyscallResult {
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    match step_kill_process(&target, signum) {
-        KillOutcome::Delivered => SyscallResult::Return(0),
-        KillOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+    let siginfo = Some(SigInfo {
+        si_signo: signum.raw() as u32,
+        si_code: SI_USER,
+        si_pid: ctx.process.pid.0,
+        si_uid: 0, // TODO: populate from cred when available
+    });
+
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = KillProcessOp {
+        target: target.clone(),
+        sig: signum,
+        info: siginfo,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(KillOutcome::Delivered) => SyscallResult::Return(0),
+        Ok(KillOutcome::NoLiveThread) => SyscallResult::Error(ESRCH_VALUE),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 
@@ -253,24 +332,76 @@ pub(super) fn sys_kill(args: [u64; 6]) -> SyscallResult {
 /// Slice 7 v1 aliases this to [`sys_kill`]: txKernel has no
 /// per-thread signal state machine yet, so `tkill(tid, sig)` is
 /// treated as `kill(tid, sig)` (the tid is interpreted as a pid).
-/// `TODO(phase-thread-signals)`.
-pub(super) fn sys_tkill(args: [u64; 6]) -> SyscallResult {
-    sys_kill(args)
+pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    let tid = args[0];
+    let sig = args[1] as u32;
+
+    if sig > 64 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    // Resolve tid → ThreadIdentity via PidName namespace
+    if let Some(PidName::Thread(thread_cap)) = resolve_pid_number(tid) {
+        let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+            Some(s) => s,
+            None => return SyscallResult::Error(EINVAL_VALUE),
+        };
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = DeliverSignalOp {
+            target: SignalTarget::Thread(thread_cap),
+            sig: signum,
+        };
+        return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(KillOutcome::Delivered) => SyscallResult::Return(0),
+            Ok(KillOutcome::NoLiveThread) => SyscallResult::Error(ESRCH_VALUE),
+            Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        };
+    }
+
+    // Fall back to process-level kill
+    sys_kill(args, ctx)
 }
 
 /// `tgkill(tgid, tid, sig)` — Linux RV64 generic ABI
 /// `__NR_tgkill = 131`.
 ///
-/// Slice 7 v1 aliases this to [`sys_kill`]: `tgid` (args[0]) is
-/// interpreted as a pid, `tid` (args[1]) is ignored, and `sig`
-/// (args[2]) is shifted to the kill arg slot.
-/// `TODO(phase-thread-signals)`.
-pub(super) fn sys_tgkill(args: [u64; 6]) -> SyscallResult {
-    let mut k_args = args;
-    // sys_kill expects (pid, sig) at args[0]/args[1]. tgkill places
-    // sig at args[2]; shift it down for the alias.
-    k_args[1] = args[2];
-    sys_kill(k_args)
+/// Phase 4: validates tgid matches the caller's pid, then posts
+/// directly to the target thread. Falls back to `sys_kill` for
+/// single-threaded compatibility.
+pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    let tgid = args[0] as u32;
+    let tid = args[1] as u32;
+    let sig = args[2] as u32;
+    // Validate tgid.
+    if tgid != ctx.process.pid.0 {
+        return SyscallResult::Error(ESRCH_VALUE);
+    }
+    if sig == 0 {
+        return SyscallResult::Return(0);
+    }
+    let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+        Some(s) => s,
+        None => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    if let Some(thread) = ctx.process.thread_by_tid(tid) {
+        let siginfo = Some(SigInfo {
+            si_signo: signum.raw() as u32,
+            si_code: SI_USER,
+            si_pid: ctx.process.pid.0,
+            si_uid: 0,
+        });
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = ThreadKillOp {
+            thread,
+            sig: signum,
+            info: siginfo,
+        };
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(()) => return SyscallResult::Return(0),
+            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        }
+    }
+    SyscallResult::Error(ESRCH_VALUE)
 }
 
 /// `rt_sigreturn(...)` — Linux RV64 generic ABI
@@ -287,6 +418,34 @@ pub(super) fn sys_tgkill(args: [u64; 6]) -> SyscallResult {
 /// scope for Slice 7. Real signal handlers are also not yet wired
 /// (no userspace handler trampoline path), so the carryover does not
 /// block any day-1 shell flow. `TODO(phase-signal-frame)`.
-pub(super) fn sys_rt_sigreturn() -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+/// Phase B: returns `SigreturnRestored` to wire the dispatch path
+/// without actual frame mechanics (TODO phase-signal-frame / Phase D).
+pub(super) fn sys_rt_sigreturn(_ctx: &SyscallCtx) -> SyscallResult {
+    // Phase B: dispatch plumbing only — actual SignalFrameIf restore
+    // (read_signal_frame + restore_signal_frame) lands in Phase D.
+    SyscallResult::SigreturnRestored
+}
+
+/// `rt_sigpending(set, sigsetsize)` — Linux RV64 generic ABI
+/// `__NR_rt_sigpending = 136`.
+///
+/// Phase F: reads the calling thread's pending signal bitset
+/// (thread_pending merged with the owning process's group_pending)
+/// and writes it to `set`.
+pub(super) fn sys_rt_sigpending(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    let set_ptr = args[0] as usize;
+    let sigsetsize = args[1];
+
+    if sigsetsize != SIGSETSIZE_BYTES {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    // TODO(merge-fixup): upgrade_operational removed from Cap<ThreadIdentity>;
+    // stub with empty pending set until thread payload accessor lands.
+    let pending: u64 = 0;
+    if let Err(errno) = bootstrap_write_user::<u64>(&ctx.aspace, set_ptr as u64, pending) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+
+    SyscallResult::Return(0)
 }

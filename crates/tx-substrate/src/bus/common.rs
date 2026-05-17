@@ -1,11 +1,13 @@
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::{
     cell::UnsafeCell,
     marker::PhantomData,
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, Ordering},
-    task::Waker,
 };
+
+use crate::step::{InterestMask, WaitSourceId};
+use crate::wake::mailbox::{TaskMailbox, WaitGeneration};
 use tx_hal::CpuId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,11 +232,47 @@ impl<E: WireEventSet> WireDeclaration<E> {
     }
 }
 
+/// Subscriber entry stored in bus queue/port subscriber lists.
+///
+/// Each subscriber represents a task waiting on this wire. When the wire
+/// fires matching bits, the subscriber's [`TaskMailbox`] receives a
+/// [`MailboxEvent::SourceFired`] carrying the wire's [`WaitSourceId`],
+/// the matching interest mask, and the subscriber's captured generation.
+/// The task's driver compares the generation against its `ActiveWait`
+/// to detect stale deliveries (wrap-around-safe monotonic).
 pub(super) struct Subscriber {
     pub(super) id: SubscriptionId,
     pub(super) interest: u64,
-    pub(super) ready: bool,
-    pub(super) waker: Waker,
+    /// Weak handle to the subscriber task's mailbox. `fire()` upgrades
+    /// and posts to live mailboxes; dead subscribers are cleaned up
+    /// lazily (mailbox dropped = subscriber silent-noop).
+    pub(super) mailbox: Weak<TaskMailbox>,
+    /// Generation captured when the subscriber registered or last
+    /// updated. The mailbox event carries this value so the driver
+    /// can reject stale deliveries.
+    pub(super) generation: WaitGeneration,
+}
+
+/// Convenience: post a [`MailboxEvent::SourceFired`] to a subscriber.
+///
+/// Returns `true` if the subscriber's mailbox was alive and received
+/// the post; `false` if the subscriber has been dropped (dead mailbox,
+/// lazy cleanup candidate).
+#[inline]
+pub(super) fn post_source_fired(
+    subscriber: &Subscriber,
+    source: WaitSourceId,
+    interests: InterestMask,
+) -> bool {
+    if let Some(mailbox) = subscriber.mailbox.upgrade() {
+        mailbox.post(crate::wake::mailbox::MailboxEvent::SourceFired {
+            generation: subscriber.generation,
+            source,
+            interests,
+        })
+    } else {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

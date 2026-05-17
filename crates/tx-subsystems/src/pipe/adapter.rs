@@ -31,10 +31,16 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::{
-        ByteProgress, Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp,
-        StepOutcome, StepProgress, SubjectIdentity, WaitSourceId, YieldShape,
+        drive_oneshot, ByteProgress, Errno, InterestMask, NoProgress, OneShotStepOp,
+        ProcessIdentity, ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity,
+        WaitSourceId, YieldShape,
     };
-    pub use tx_substrate::zone::{sign, Cap, Zone, ZoneAllocated, ZoneError};
+    pub use tx_substrate::zone::{
+        reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity, Dead, Entity,
+        IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy, OperationalCapExt,
+        OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak,
+        Zone, ZoneAllocated, ZoneError, ZonePolicy,
+    };
     pub use tx_substrate::SpinMutex;
 
     pub type ByteOutcome = StepOutcome<usize, ByteProgress>;

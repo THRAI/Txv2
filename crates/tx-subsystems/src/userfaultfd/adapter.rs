@@ -15,7 +15,12 @@ pub mod step_engine {
         Errno as V3Errno, InterestMask, StepOutcome, TransitionOutcome, UfdReply, WaitSourceId,
     };
     pub use tx_substrate::wake::{TaskMailbox, WaitSource};
-    pub use tx_substrate::zone::{sign, Cap, Zone, ZoneAllocated, ZoneError};
+    pub use tx_substrate::zone::{
+        reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity, Dead, Entity,
+        IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy, OperationalCapExt,
+        OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak,
+        Zone, ZoneAllocated, ZoneError, ZonePolicy,
+    };
     pub use tx_substrate::SpinMutex;
 
     pub fn register_zone_for<T: ZoneAllocated>() -> Result<(), ZoneError> {

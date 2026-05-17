@@ -256,6 +256,17 @@ pub const NR_CLONE: u64 = 220;
 /// only flag combination Wave 2's `sys_clone` accepts.
 pub const SIGCHLD: u64 = 17;
 
+pub const CLONE_SETTLS: u64 = 0x80000;
+pub const CLONE_VM: u64 = 0x100;
+pub const CLONE_FS: u64 = 0x200;
+pub const CLONE_FILES: u64 = 0x400;
+pub const CLONE_SIGHAND: u64 = 0x800;
+pub const CLONE_VFORK: u64 = 0x4000;
+pub const CLONE_PARENT: u64 = 0x8000;
+pub const CLONE_THREAD: u64 = 0x10000;
+pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+pub const CLONE_PARENT_SETTID: u64 = 0x100000;
+
 /// `getppid()`. Linux generic ABI `__NR_getppid`. Wraps
 /// `ProcessIdentity::parent_pid()`. Returns `0` (`Pid::RESERVED`)
 /// for orphans (init's pid 1 has no parent). Real Linux returns
@@ -263,6 +274,7 @@ pub const SIGCHLD: u64 = 17;
 /// init when init is registered, so under normal flows the difference
 /// is invisible.
 pub const NR_GETPPID: u64 = 173;
+pub const NR_GETTID: u64 = 178;
 
 /// `setpgid(pid, pgid)`. Linux generic ABI `__NR_setpgid`. Wraps
 /// `step_setpgid`. The trio's day-1 step only supports
@@ -506,6 +518,13 @@ pub const NR_MPROTECT: u64 = 226;
 /// `__NR_msync = 227`. Wraps `AddressSpace::msync` (the StepOutcome
 /// shape — async over the `step_fsync` blocking lane).
 pub const NR_MSYNC: u64 = 227;
+/// `mlock(addr, len)`. Linux RV64 generic ABI `__NR_mlock = 228`.
+/// Under no-swap this is purely observational; sets
+/// `VmEntryFlags.locked` for `/proc/<pid>/maps` reporting.
+pub const NR_MLOCK: u64 = 228;
+/// `munlock(addr, len)`. Linux RV64 generic ABI `__NR_munlock = 229`.
+/// Clears `VmEntryFlags.locked`.
+pub const NR_MUNLOCK: u64 = 229;
 /// `madvise(addr, length, advice)`. Linux RV64 generic ABI
 /// `__NR_madvise = 233`. Wraps `AddressSpace::madvise`.
 pub const NR_MADVISE: u64 = 233;
@@ -842,6 +861,26 @@ pub const NR_CHDIR: u64 = 49;
 /// used by shells, so the carryover does not block Slice 11's QEMU
 /// shell smoke.
 pub const NR_FCHDIR: u64 = 50;
+/// `statfs(path, buf)`. Linux RV64 ABI `__NR_statfs = 43`.
+pub const NR_STATFS: u64 = 43;
+/// `fstatfs(fd, buf)`. Linux RV64 ABI `__NR_fstatfs = 44`.
+pub const NR_FSTATFS: u64 = 44;
+/// `sync()`. Linux RV64 ABI `__NR_sync = 81`.
+pub const NR_SYNC: u64 = 81;
+/// `syncfs(fd)`. Linux RV64 ABI `__NR_syncfs = 267` (same as RV64).
+pub const NR_SYNCFS: u64 = 267;
+/// `fsync(fd)`. Linux RV64 ABI `__NR_fsync = 82`.
+pub const NR_FSYNC: u64 = 82;
+/// `fdatasync(fd)`. Linux RV64 ABI `__NR_fdatasync = 83`.
+pub const NR_FDATASYNC: u64 = 83;
+/// `flock(fd, operation)`. Linux RV64 ABI `__NR_flock = 32`.
+pub const NR_FLOCK: u64 = 32;
+/// `mount(source, target, fstype, flags, data)`. Linux RV64 ABI `__NR_mount = 40`.
+pub const NR_MOUNT: u64 = 40;
+/// `umount2(target, flags)`. Linux RV64 ABI `__NR_umount2 = 39`.
+pub const NR_UMOUNT2: u64 = 39;
+/// `mknodat(dirfd, path, mode, dev)`. Linux RV64 ABI `__NR_mknodat = 33`.
+pub const NR_MKNODAT: u64 = 33;
 /// `getdents64(fd, dirp, count)`. Linux RV64 generic ABI
 /// `__NR_getdents64 = 61`. Calls `FsOps::readdir` with the per-fd
 /// readdir cursor and encodes each `DirEntry` into the user buffer
@@ -981,6 +1020,26 @@ pub const NR_TGKILL: u64 = 131;
 /// so the carryover does not block any day-1 shell flow.
 /// `TODO(phase-signal-frame)`.
 pub const NR_RT_SIGRETURN: u64 = 139;
+/// `rt_sigsuspend(mask, sigsetsize)` — Linux RV64 `__NR_rt_sigsuspend = 133`.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
+pub const NR_RT_SIGSUSPEND: u64 = 133;
+/// `rt_sigpending(set, sigsetsize)` — Linux RV64 `__NR_rt_sigpending = 136`.
+pub const NR_RT_SIGPENDING: u64 = 136;
+/// `sigaltstack(ss, old_ss)` — Linux RV64 `__NR_sigaltstack`.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
+pub const NR_SIGALTSTACK: u64 = 132;
+/// `rt_sigqueueinfo(pid, sig, info)` — Linux RV64 `__NR_rt_sigqueueinfo = 138`.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
+pub const NR_RT_SIGQUEUEINFO: u64 = 138;
+/// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — Linux RV64.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
+pub const NR_RT_SIGTIMEDWAIT: u64 = 137;
+/// `pidfd_open(pid, flags)` — Linux RV64.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
+pub const NR_PIDFD_OPEN: u64 = 434;
+/// `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
+pub const NR_PIDFD_SEND_SIGNAL: u64 = 424;
 /// `uname(buf)`. Linux RV64 generic ABI `__NR_uname = 160`. Writes
 /// the static utsname (`sysname` / `nodename` / `release` / `version`
 /// / `machine` / `domainname`, each `[u8; 65]`) to `buf`. Slice 7
@@ -1426,3 +1485,71 @@ pub const SFD_CLOEXEC: u32 = O_CLOEXEC;
 /// `SFD_NONBLOCK` — set non-blocking mode on the resulting fd. Same
 /// bit value as `O_NONBLOCK` per Linux's signalfd4 flag convention.
 pub const SFD_NONBLOCK: u32 = O_NONBLOCK;
+
+// =====================================================================
+// Phase B.1 — epoll syscall numbers
+//
+// Spec: `docs/Txv3/03_STEP_MODEL_v2.md` §5 `YieldShape::OnEdge`.
+// =====================================================================
+
+/// `epoll_create1(flags)`. Linux generic uapi `__NR_epoll_create1 = 291`.
+/// Allocates a fresh [`tx_subsystems::epoll::Epoll`] cap, wraps it in
+/// an `OpenFile` with `OpenFileBacking::Epoll`, and installs it at the
+/// lowest free fd.
+pub const NR_EPOLL_CREATE1: u64 = 291;
+
+/// `epoll_ctl(epfd, op, fd, event_ptr)`. Linux generic uapi
+/// `__NR_epoll_ctl = 233`. ADD, MOD, or DEL a monitored fd.
+pub const NR_EPOLL_CTL: u64 = 233;
+
+/// `epoll_wait(epfd, events, maxevents, timeout)`. Linux generic uapi
+/// `__NR_epoll_wait = 232`. Block until ready events arrive.
+/// (Note: the newer `epoll_pwait` = 281 is a superset with sigmask;
+/// not wired in Phase B.1.)
+pub const NR_EPOLL_WAIT: u64 = 232;
+
+/// `epoll_pwait(epfd, events, maxevents, timeout, sigmask)`.
+/// Linux generic uapi `__NR_epoll_pwait = 281`. Block until ready
+/// events arrive, atomically updating the signal mask. Phase B.1c
+/// stubs the sigmask; real signal-mask manipulation is deferred to
+/// a future signal-subsystem PR.
+pub const NR_EPOLL_PWAIT: u64 = 281;
+
+// =====================================================================
+// eventfd / timerfd syscall numbers
+//
+// `man 2 eventfd2`, `man 2 timerfd_create`.
+// =====================================================================
+
+/// `eventfd2(init_val, flags)`. Linux generic uapi `__NR_eventfd2 = 290`.
+/// Mints a fresh [`tx_subsystems::eventfd::EventFd`] cap, wraps it in
+/// an `OpenFile` with `OpenFileBacking::Eventfd`, and installs it at
+/// the lowest free fd.
+pub const NR_EVENTFD2: u64 = 290;
+
+/// Recognised `eventfd2` flags. EFD_SEMAPHORE is read by the eventfd
+/// subsystem; EFD_CLOEXEC / EFD_NONBLOCK are translated to OpenFileFlags.
+pub const EFD_SEMAPHORE_FLAG: u32 = 0x1;
+pub const EFD_CLOEXEC_FLAG: u32 = O_CLOEXEC;
+pub const EFD_NONBLOCK_FLAG: u32 = O_NONBLOCK;
+
+/// `timerfd_create(clockid, flags)`. Linux generic uapi
+/// `__NR_timerfd_create = 283`. Mints a fresh
+/// [`tx_subsystems::timerfd::TimerFd`] cap.
+pub const NR_TIMERFD_CREATE: u64 = 283;
+
+/// `timerfd_settime(fd, flags, new_value, old_value)`. Linux generic
+/// uapi `__NR_timerfd_settime = 286`. Arms/disarms the timer.
+pub const NR_TIMERFD_SETTIME: u64 = 286;
+
+/// `timerfd_gettime(fd, curr_value)`. Linux generic uapi
+/// `__NR_timerfd_gettime = 287`. Returns the current timer state.
+pub const NR_TIMERFD_GETTIME: u64 = 287;
+
+/// Recognised `timerfd_create` flags. TFD_CLOEXEC / TFD_NONBLOCK are
+/// translated to OpenFileFlags.
+pub const TFD_CLOEXEC_FLAG: u32 = O_CLOEXEC;
+pub const TFD_NONBLOCK_FLAG: u32 = O_NONBLOCK;
+
+/// `TFD_TIMER_ABSTIME` — interpret `it_value` as an absolute time.
+pub const TFD_TIMER_ABSTIME_FLAG: u32 = 1;

@@ -66,14 +66,34 @@ pub(super) fn sys_getegid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// returns `-EPERM`.
 pub(super) fn sys_setuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let target = Uid(args[0] as u32);
-    cred_change_to_result(step_setuid(&ctx.process, target))
+    // PR-3: one-shot dispatch via drive_oneshot (no reactor, no yield)
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SetuidOp {
+        target: ctx.process.clone(),
+        new_uid: target,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(change) => cred_change_to_result(change),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `setgid(gid)`. Wraps `cred::step_setgid` (Wave 1). Same privilege
 /// rules as `setuid` applied to the gid family.
+///
+/// PR-3 migration: `SetgidOp` is a `OneShotStepOp` — dispatched via
+/// `drive_oneshot` (no reactor, no ActiveWait, no yield).
 pub(super) fn sys_setgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let target = Gid(args[0] as u32);
-    cred_change_to_result(step_setgid(&ctx.process, target))
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SetgidOp {
+        target: ctx.process.clone(),
+        new_gid: target,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(change) => cred_change_to_result(change),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `setreuid(ruid, euid)`. Wraps `cred::step_setreuid` (Wave 1).
@@ -88,7 +108,16 @@ pub(super) fn sys_setgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
 pub(super) fn sys_setreuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let ruid = decode_uid_arg(args[0] as u32);
     let euid = decode_uid_arg(args[1] as u32);
-    cred_change_to_result(step_setreuid(&ctx.process, ruid, euid))
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SetreuidOp {
+        target: ctx.process.clone(),
+        ruid,
+        euid,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(change) => cred_change_to_result(change),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `setregid(rgid, egid)`. Gid analog of `sys_setreuid`. Wraps
@@ -96,7 +125,16 @@ pub(super) fn sys_setreuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
 pub(super) fn sys_setregid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let rgid = decode_gid_arg(args[0] as u32);
     let egid = decode_gid_arg(args[1] as u32);
-    cred_change_to_result(step_setregid(&ctx.process, rgid, egid))
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SetregidOp {
+        target: ctx.process.clone(),
+        rgid,
+        egid,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(change) => cred_change_to_result(change),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `setresuid(ruid, euid, suid)`. Wraps `cred::step_setresuid`
@@ -110,7 +148,17 @@ pub(super) fn sys_setresuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     let ruid = decode_uid_arg(args[0] as u32);
     let euid = decode_uid_arg(args[1] as u32);
     let suid = decode_uid_arg(args[2] as u32);
-    cred_change_to_result(step_setresuid(&ctx.process, ruid, euid, suid))
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SetresuidOp {
+        target: ctx.process.clone(),
+        ruid,
+        euid,
+        suid,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(change) => cred_change_to_result(change),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `setresgid(rgid, egid, sgid)`. Gid analog of `sys_setresuid`.
@@ -119,7 +167,17 @@ pub(super) fn sys_setresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     let rgid = decode_gid_arg(args[0] as u32);
     let egid = decode_gid_arg(args[1] as u32);
     let sgid = decode_gid_arg(args[2] as u32);
-    cred_change_to_result(step_setresgid(&ctx.process, rgid, egid, sgid))
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SetresgidOp {
+        target: ctx.process.clone(),
+        rgid,
+        egid,
+        sgid,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(change) => cred_change_to_result(change),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `getresuid(ruid_uaddr, euid_uaddr, suid_uaddr)`. Reads

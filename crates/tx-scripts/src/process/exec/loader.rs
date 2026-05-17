@@ -39,6 +39,13 @@ use goblin::elf::program_header::{
     ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_PHDR,
 };
 
+/// PT_GNU_STACK program header type (not in goblin's constants).
+const PT_GNU_STACK: u32 = 0x6474_e551;
+
+/// PT_GNU_RELRO program header type.
+#[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
+const PT_GNU_RELRO: u32 = 0x6474_e552;
+
 /// ELF64 program-header size, in bytes. (Elf64_Phdr is 56 bytes.)
 pub const ELF64_PHENT: u64 = 56;
 
@@ -129,6 +136,24 @@ pub struct BssTail {
     pub size: u64,
 }
 
+/// Interpreter image plan.  Built from a separate ELF parse when
+/// the main binary carries PT_INTERP.  Unlike ExecImagePlan
+/// (main + interpreter), this is just the interpreter's image.
+#[derive(Debug, Clone)]
+pub struct InterpreterPlan {
+    /// Load bias computed from the interpreter's first LOAD segment
+    /// (`INTERP_BASE - lowest_load_vaddr`).
+    pub load_bias: u64,
+    /// Interpreter entry point, already bias-adjusted.
+    pub entry: u64,
+    /// LOAD segments, already bias-adjusted.
+    pub load_segments: Vec<LoadSegment>,
+    /// Optional BSS tail.
+    pub bss_extension: Option<BssTail>,
+    /// Whether PT_GNU_STACK requests an executable stack.
+    pub executable_stack: bool,
+}
+
 /// txKernel-owned image plan produced from a parsed ELF. The output
 /// is pure data — no kernel handles, no caps, no async machinery.
 #[derive(Debug, Clone)]
@@ -153,6 +178,11 @@ pub struct ExecImagePlan {
     /// All `vaddr` fields in `load_segments`, `entry`, and `at_phdr`
     /// already have this value added — callers see final in-memory VAs.
     pub load_bias: u64,
+    /// Whether PT_GNU_STACK requests an executable stack.
+    /// Default false; true only when the binary explicitly adds PF_X.
+    pub executable_stack: bool,
+    /// Interpreter plan (from PT_INTERP).  None for static binaries.
+    pub interpreter_path: Option<Vec<u8>>,
 }
 
 /// Parse the ELF header + program headers and produce an image plan.
@@ -226,12 +256,32 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
 
     let mut load_segments: Vec<LoadSegment> = Vec::new();
     let mut pt_phdr_vaddr: Option<u64> = None;
+    let mut exec_stack: bool = false;
+    let mut interp_path: Option<Vec<u8>> = None;
 
     for phdr in &phdrs {
         match phdr.p_type {
             PT_INTERP | PT_DYNAMIC if !is_dyn => {
-                // ET_EXEC must not have PT_INTERP or PT_DYNAMIC.
-                return Err(ParseError::HasInterp);
+                if phdr.p_type == PT_INTERP {
+                    // Extract interpreter path from ELF bytes.
+                    let off = phdr.p_offset as usize;
+                    let len = (phdr.p_filesz as usize).min(4096);
+                    if off + len <= elf_bytes.len() {
+                        let path = elf_bytes[off..off + len]
+                            .split(|&b| b == 0)
+                            .next()
+                            .unwrap_or(&[])
+                            .to_vec();
+                        interp_path = Some(path);
+                    }
+                }
+                // PT_DYNAMIC in ET_EXEC: reject (no dynamic linking in
+                // static executables; only PT_INTERP-interpreted
+                // binaries are accepted).
+                if phdr.p_type == PT_DYNAMIC {
+                    return Err(ParseError::HasInterp);
+                }
+                // PT_INTERP path was extracted above; fall through.
             }
             PT_INTERP | PT_DYNAMIC => {
                 // ET_DYN static-PIE: PT_INTERP / PT_DYNAMIC present but
@@ -244,13 +294,17 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
             PT_LOAD => {
                 load_segments.push(translate_load(phdr, is_dyn)?);
             }
-            // PT_TLS, PT_NOTE, PT_GNU_STACK, PT_GNU_RELRO,
-            // PT_GNU_EH_FRAME, ... ignored at parse time. Phase 5
-            // can revisit if/when LTP coverage demands TLS or stack
-            // executability checks.
-            _ => {}
+            // PT_TLS, PT_NOTE, PT_GNU_RELRO, PT_GNU_EH_FRAME, ...
+            // ignored at parse time.
+            _ => {
+                if phdr.p_type == PT_GNU_STACK && (phdr.p_flags & PF_X) != 0 {
+                    exec_stack = true;
+                }
+            }
         }
     }
+
+    let _executable_stack = exec_stack;
 
     if load_segments.is_empty() {
         return Err(ParseError::NoLoad);
@@ -300,6 +354,8 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
         load_segments,
         bss_extension,
         load_bias,
+        executable_stack: exec_stack,
+        interpreter_path: interp_path,
     })
 }
 

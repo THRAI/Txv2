@@ -21,6 +21,8 @@
 //! - `txdoc:STEP-V2-STEP-OP-1` (StepOp trait shape)
 //! - `txdoc:STEP-V2-DRIVER-MODE-1` (DriveMode classify matrix)
 
+use crate::zone::Cap;
+
 /// Errno surface. Mirrors `tx_subsystems::execution::Errno` byte-for-byte
 /// (variant names, ordering, doc comments).
 ///
@@ -50,6 +52,9 @@ pub enum Errno {
     EEXIST,
     EFAULT,
     EINVAL,
+    /// Interrupted system call (e.g. by signal delivery during a
+    /// blocked wait — D9-A EINTR path).
+    EINTR,
     EIO,
     EISDIR,
     ELOOP,
@@ -149,6 +154,15 @@ pub enum YieldShape {
     /// [`crate::wake::timer::TimerGuard`] (future PR-8 follow-up)
     /// that the driver retires on resume.
     OnTimer { token: TimerId, deadline: Deadline },
+    /// Edge-triggered epoll subscription. Resolved identically to
+    /// [`OnWaitSource`] at the protocol layer (park on source,
+    /// return [`ResumeOutcome::Retry`]); the edge-vs-level
+    /// distinction is handled by the epoll subsystem's readiness
+    /// tracking, not by the yield-resolve path.
+    OnEdge {
+        source: WaitSourceId,
+        interests: InterestMask,
+    },
 }
 
 impl YieldShape {
@@ -211,9 +225,30 @@ impl<T, P: StepProgress> StepOutcome<T, P> {
 /// Per STEP-3: `(Self, EMPTY, extend)` is monoid-shaped — associative,
 /// with `EMPTY` as identity. The integration tests pin both laws.
 pub trait StepProgress: Sized {
+    /// The concrete value this progress can be converted into via
+    /// [`into_output`](Self::into_output). For progress types that
+    /// track meaningful partial-result quantities (e.g.,
+    /// [`ByteProgress`] tracks bytes read), this is the same as
+    /// `StepOp::Output`; for marker progress types ([`NoProgress`]),
+    /// this is `()` and `into_output` always returns `None`.
+    type Output;
+
     const EMPTY: Self;
     fn is_empty(&self) -> bool;
     fn extend(&mut self, other: Self);
+
+    /// Convert accumulated progress into a concrete output value.
+    ///
+    /// Returns `Some(val)` for progress types that carry partial-result
+    /// semantics (e.g. `ByteProgress → usize`). Returns `None` for
+    /// marker progress (`NoProgress`, `EntryProgress`) that track
+    /// intermediate state but don't represent a partial `StepOp::Output`.
+    ///
+    /// Used by [`drive()`] when `DriveMode::Nonblocking` produces a
+    /// `PartialReturn` translation — the driver has accumulated
+    /// progress across one or more `Continue` steps and surfaces
+    /// that partial work instead of returning `EAGAIN`.
+    fn into_output(self) -> Option<Self::Output>;
 }
 
 /// One-shot ops: open, mkdir, fork, dup, close, mmap-reservation, …
@@ -221,11 +256,15 @@ pub trait StepProgress: Sized {
 pub struct NoProgress;
 
 impl StepProgress for NoProgress {
+    type Output = ();
     const EMPTY: Self = NoProgress;
     fn is_empty(&self) -> bool {
         true
     }
     fn extend(&mut self, _other: Self) {}
+    fn into_output(self) -> Option<()> {
+        None
+    }
 }
 
 /// Byte-moving ops: read, write, splice, sendfile, copy_file_range.
@@ -249,12 +288,16 @@ impl ByteProgress {
 }
 
 impl StepProgress for ByteProgress {
+    type Output = usize;
     const EMPTY: Self = ByteProgress { bytes: 0 };
     fn is_empty(&self) -> bool {
         self.bytes == 0
     }
     fn extend(&mut self, other: Self) {
         self.bytes = self.bytes.saturating_add(other.bytes);
+    }
+    fn into_output(self) -> Option<usize> {
+        Some(self.bytes)
     }
 }
 
@@ -302,7 +345,8 @@ pub use binding_obligations::BindingObligation;
 //
 // See `docs/progress/decisions/2026-05-13-d17-obs3b-resume-emission.md` §5.
 
-use crate::wake::mailbox::WaitGeneration;
+use crate::wake::mailbox::{TaskMailbox, WaitGeneration};
+use alloc::sync::Arc;
 
 /// Discriminant encoding why a yield resolved.
 ///
@@ -441,9 +485,11 @@ impl DriveMode {
             }
             (DriveMode::Nonblocking, _) => AcceptOutcome::Translate(Translation::PartialReturn),
             (DriveMode::Waiting, YieldShape::OnWaitSource { .. }) => AcceptOutcome::Resolve,
+            (DriveMode::Waiting, YieldShape::OnEdge { .. }) => AcceptOutcome::Resolve,
             (DriveMode::Waiting, YieldShape::OnAgent { .. }) => AcceptOutcome::Resolve,
             (DriveMode::Waiting, YieldShape::OnTimer { .. }) => AcceptOutcome::Resolve,
             (DriveMode::Selecting, YieldShape::OnWaitSource { .. }) => AcceptOutcome::Resolve,
+            (DriveMode::Selecting, YieldShape::OnEdge { .. }) => AcceptOutcome::Resolve,
             (DriveMode::Selecting, YieldShape::OnAgent { .. }) => {
                 AcceptOutcome::Translate(Translation::UnsupportedShape)
             }
@@ -479,10 +525,21 @@ impl DriveMode {
 /// `.await`/yield). See D1 §"guard is step-local, not ScriptCtx-held".
 ///
 /// PR-9 phase 3 populates `subject` / `deadline` from the syscall
-/// trampoline; subsequent waves populate `mailbox` and `trace`.
+/// trampoline; subsequent waves populate `mailbox`, `timer_wheel`,
+/// and `trace`.
 pub struct ScriptCtx<I: SubjectIdentity = ProcessIdentity> {
     subject: Option<SubjectContext<I>>,
     deadline: Option<Deadline>,
+    /// Per-task wake delivery queue for yield resolution.
+    /// Owned by the reactor task; `drive()` borrows it to park.
+    mailbox: Option<Arc<TaskMailbox>>,
+    /// Reactor timer wheel for OnTimer yield resolution
+    /// (drive-taskmb). Shared across all tasks; clone is cheap
+    /// (internal Arc).
+    timer_wheel: Option<crate::wake::timer::TimerWheel>,
+    /// Reactor delegate registry for OnAgent yield resolution
+    /// (drive-taskmb). Shared across all tasks.
+    delegate_registry: Option<alloc::sync::Arc<crate::step::DelegateRegistry>>,
 }
 
 impl<I: SubjectIdentity> ScriptCtx<I> {
@@ -492,6 +549,9 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
         Self {
             subject: None,
             deadline: None,
+            mailbox: None,
+            timer_wheel: None,
+            delegate_registry: None,
         }
     }
 
@@ -507,6 +567,12 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
         self
     }
 
+    /// Populate the task mailbox for yield resolution (drive-taskmb).
+    pub fn with_mailbox(mut self, mailbox: Arc<TaskMailbox>) -> Self {
+        self.mailbox = Some(mailbox);
+        self
+    }
+
     /// Subject context if populated; `None` for placeholder/test
     /// contexts.
     pub fn subject(&self) -> Option<&SubjectContext<I>> {
@@ -516,6 +582,41 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
     /// Script-level deadline if populated.
     pub fn deadline(&self) -> Option<Deadline> {
         self.deadline
+    }
+
+    /// Populate the reactor timer wheel for OnTimer yield resolution
+    /// (drive-taskmb).
+    pub fn with_timer_wheel(mut self, wheel: crate::wake::timer::TimerWheel) -> Self {
+        self.timer_wheel = Some(wheel);
+        self
+    }
+
+    /// Task mailbox if populated; `None` for test/placeholder contexts
+    /// or before reactor integration.
+    pub fn mailbox(&self) -> Option<&Arc<TaskMailbox>> {
+        self.mailbox.as_ref()
+    }
+
+    /// Populate the reactor delegate registry for OnAgent yield
+    /// resolution (drive-taskmb).
+    pub fn with_delegate_registry(
+        mut self,
+        registry: alloc::sync::Arc<crate::step::DelegateRegistry>,
+    ) -> Self {
+        self.delegate_registry = Some(registry);
+        self
+    }
+
+    /// Reactor timer wheel if populated; `None` for test/placeholder
+    /// contexts or before reactor integration.
+    pub fn timer_wheel(&self) -> Option<&crate::wake::timer::TimerWheel> {
+        self.timer_wheel.as_ref()
+    }
+
+    /// Reactor delegate registry if populated; `None` for
+    /// test/placeholder contexts or before reactor integration.
+    pub fn delegate_registry(&self) -> Option<&alloc::sync::Arc<crate::step::DelegateRegistry>> {
+        self.delegate_registry.as_ref()
     }
 
     /// Low 32 bits of the subject's task trace identity.
@@ -616,4 +717,53 @@ pub trait StepOp<I: SubjectIdentity = ProcessIdentity> {
             _ => Err(Errno::EINVAL),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// OneShotStepOp — a StepOp that terminates on first invocation
+// ---------------------------------------------------------------------------
+
+/// A `StepOp` whose first `step()` returns `Done` or `Err`, never
+/// `Continue` or `Yield`.
+///
+/// Contract (STEP-11, `docs/Txv3/02_INVARIANTS_v5.md`):
+/// - `step()` must return `Done(T)` or `Err(Errno)` on first call.
+/// - Returning `Continue` or `Yield` is an invariant violation.
+/// - `Progress` must be `NoProgress` (one-shot ops don't accumulate).
+///
+/// This is stronger than `Nonblocking` driver mode.
+pub trait OneShotStepOp<I: SubjectIdentity = ProcessIdentity>:
+    StepOp<I, Progress = NoProgress>
+{
+}
+
+/// Synchronous drive for one-shot ops. Does not allocate an
+/// `ActiveWait`, does not enter the reactor, does not register
+/// on a `WaitSource`.
+pub fn drive_oneshot<I: SubjectIdentity, O: OneShotStepOp<I>>(
+    op: &mut O,
+    ctx: &mut ScriptCtx<I>,
+) -> Result<O::Output, Errno> {
+    match op.step(ctx) {
+        StepOutcome::Done(v) => Ok(v),
+        StepOutcome::Err(e) => Err(e),
+        StepOutcome::Continue { .. } => {
+            panic!("OneShotStepOp violated contract: unexpected Continue")
+        }
+        StepOutcome::Yield { .. } => {
+            panic!("OneShotStepOp violated contract: unexpected Yield")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ImmediateCtx — narrow context for pure ABI queries (ImmediateSyscall lane)
+// ---------------------------------------------------------------------------
+
+/// Narrower than `ScriptCtx`: carries only the subject/process/thread
+/// handles needed for pure ABI queries. No VFS, VM, reactor, timer,
+/// or mailbox access.
+pub struct ImmediateCtx<'a, I: SubjectIdentity = ProcessIdentity> {
+    pub process: &'a Cap<I>,
+    pub thread: &'a Cap<I::ThreadIdentity>,
 }

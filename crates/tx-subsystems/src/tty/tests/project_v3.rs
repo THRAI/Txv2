@@ -287,7 +287,7 @@ fn devpts_v3_fs_page_backing_returns_enosys() {
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
     assert_eq!(
-        <DevptsInstance as FsPageBacking>::fsync(&devpts, DEVPTS_PTMX_OBJECT_ID, &guard),
+        <DevptsInstance as FsPageBacking>::fsync_file(&devpts, DEVPTS_PTMX_OBJECT_ID, &guard),
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
 }

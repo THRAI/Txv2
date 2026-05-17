@@ -20,14 +20,17 @@ pub mod step_engine {
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
-        AgentCancelPolicy, ByteProgress, CancelReason, DelegateReply, DelegateRequest,
-        DelegateState, DelegateTokenId, Errno, InterestMask, NoProgress, OnBehalfOfAbort,
-        ScriptCtx, StepOp, StepOutcome, SubjectAuthority, SubjectContext, SubjectIdentity,
-        TokenDropPolicy, TransitionOutcome, UfdAccessKind, UfdReply, UfdRequest, WaitSourceId,
-        YieldShape,
+        drive_oneshot, AgentCancelPolicy, ByteProgress, CancelReason, DelegateReply,
+        DelegateRequest, DelegateState, DelegateTokenId, Errno, InterestMask, NoProgress,
+        OnBehalfOfAbort, OneShotStepOp, ScriptCtx, StepOp, StepOutcome, SubjectAuthority,
+        SubjectContext, SubjectIdentity, TokenDropPolicy, TransitionOutcome, UfdAccessKind,
+        UfdReply, UfdRequest, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        reserve_for, sign, sign_for, Cap, Zone, ZoneAllocated, ZoneError,
+        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
+        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
     pub use tx_substrate::{page_allocator, SpinMutex};
 }

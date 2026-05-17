@@ -141,6 +141,13 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
         ),
         ci_run(
             root,
+            "invariants lint (all)",
+            "cargo",
+            &["xtask", "lint", "invariants", "all"],
+            "txdoc:CI-GATE-INVARIANTS-LINT",
+        ),
+        ci_run(
+            root,
             "progress json",
             "cargo",
             &["xtask", "progress", "validate"],

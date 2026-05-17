@@ -18,11 +18,14 @@
 //! - txdoc:STEP-V2-DRIVER-1  (drive loop algorithm)
 //! - txdoc:STEP-V2-DRIVER-MODE-1 (DriveMode classify matrix)
 
+use std::sync::Arc;
 use tx_scripts::adapter::step_engine::{
     AgentCancelPolicy, Deadline, DelegateEndpoint, DelegateRequest, DelegateToken, DriveMode,
     Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome, WaitSourceId,
     YieldShape,
 };
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox, WaitGeneration};
+use tx_substrate::wake::wait_source::{register_source, unregister_source, WaitSource};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -101,7 +104,14 @@ fn on_agent_shape() -> YieldShape {
 fn drive_done_immediately_returns_value() {
     let op = MockStepOp::new([StepOutcome::Done(42u32)]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Ok(42u32));
 }
 
@@ -113,7 +123,14 @@ fn drive_done_immediately_returns_value() {
 fn drive_err_surfaces_error() {
     let op = MockStepOp::new([StepOutcome::Err(Errno::ENOENT)]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Err(Errno::ENOENT));
 }
 
@@ -121,7 +138,14 @@ fn drive_err_surfaces_error() {
 fn drive_err_surfaces_einval() {
     let op = MockStepOp::new([StepOutcome::Err(Errno::EINVAL)]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Nonblocking));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Nonblocking,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Err(Errno::EINVAL));
 }
 
@@ -140,7 +164,14 @@ fn drive_yield_on_wait_source_nonblocking_no_progress_returns_eagain() {
     }]);
     let mut ctx = empty_ctx();
     // Nonblocking + no progress → Translate(Eagain) → Err(EAGAIN)
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Nonblocking));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Nonblocking,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Err(Errno::EAGAIN));
 }
 
@@ -157,7 +188,14 @@ fn drive_yield_on_agent_nonblocking_returns_eagain() {
     }]);
     let mut ctx = empty_ctx();
     // Nonblocking + no progress → Translate(Eagain) → Err(EAGAIN)
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Nonblocking));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Nonblocking,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Err(Errno::EAGAIN));
 }
 
@@ -178,8 +216,53 @@ fn drive_continue_then_done_retries_loop() {
         StepOutcome::Done(99u32),
     ]);
     let mut ctx = empty_ctx();
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Ok(99u32));
+}
+
+#[test]
+fn wait_source_register_notify_delivers_to_mailbox() {
+    let ws = Arc::new(WaitSource::new(WaitSourceId::new(99)));
+    register_source(Arc::clone(&ws));
+
+    let mb = Arc::new(TaskMailbox::new());
+    let gen = mb.next_generation();
+    let interests = InterestMask::new(0b1);
+
+    // Register the task's mailbox with the WaitSource.
+    let sub_id = ws.register(Arc::downgrade(&mb), gen, interests);
+    assert_eq!(ws.subscriber_count(), 1);
+
+    // Notify from the object side — should deliver to the mailbox.
+    let posted = ws.notify(interests);
+    assert_eq!(posted, 1);
+
+    // Mailbox should have the event.
+    let evt = mb.poll().expect("event should be delivered");
+    match evt {
+        MailboxEvent::SourceFired {
+            generation,
+            source,
+            interests: evt_interests,
+        } => {
+            assert_eq!(generation, gen);
+            assert_eq!(source, WaitSourceId::new(99));
+            assert_eq!(evt_interests, interests);
+        }
+        other => panic!("expected SourceFired, got {other:?}"),
+    }
+
+    // Cleanup.
+    ws.unregister(sub_id);
+    assert_eq!(ws.subscriber_count(), 0);
+    unregister_source(WaitSourceId::new(99));
 }
 
 // ---------------------------------------------------------------------------
@@ -194,22 +277,133 @@ fn drive_selecting_on_agent_returns_enosys() {
     }]);
     let mut ctx = empty_ctx();
     // Selecting + OnAgent → Translate(UnsupportedShape) → Err(ENOSYS)
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Selecting));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Selecting,
+        None,
+        None,
+        None,
+    ));
     assert_eq!(result, Err(Errno::ENOSYS));
 }
 
 // ---------------------------------------------------------------------------
-// Bonus: Waiting + OnWaitSource → Resolve → Err(EAGAIN) (stub path)
+// Bonus: Waiting + OnWaitSource → Resolve → parks then retries
 // ---------------------------------------------------------------------------
 
 #[test]
-fn drive_waiting_on_wait_source_resolve_stub_returns_eagain() {
-    let op = MockStepOp::new([StepOutcome::Yield {
-        progress: NoProgress,
-        shape: on_wait_source_shape(7, 0xff),
-    }]);
+fn drive_waiting_on_wait_source_unregistered_token_retries() {
+    // When the wait source id is not registered (test placeholder),
+    // wait_on_token returns None and drive retries immediately.
+    // The op yields, drive skips the await, applies ResumeOutcome::Retry,
+    // loops, and step() returns Done.
+    let op = MockStepOp::new([
+        StepOutcome::Yield {
+            progress: NoProgress,
+            shape: on_wait_source_shape(7, 0xff),
+        },
+        StepOutcome::Done(42),
+    ]);
     let mut ctx = empty_ctx();
-    // Waiting + OnWaitSource → Resolve → Err(EAGAIN) (parking not yet wired)
-    let result = block_on(tx_scripts::drive(op, &mut ctx, DriveMode::Waiting));
-    assert_eq!(result, Err(Errno::EAGAIN));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        None,
+        None,
+        None,
+    ));
+    assert_eq!(result, Ok(42));
+}
+
+// ---------------------------------------------------------------------------
+// drive-taskmb: basic TaskMailbox round-trip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mailbox_post_poll_roundtrip() {
+    let mb = TaskMailbox::new();
+    let gen = mb.next_generation();
+    // TaskMailbox counter starts at 1, so first next_generation() is 1.
+    assert_eq!(gen.raw(), 1);
+    let evt = MailboxEvent::SourceFired {
+        generation: gen,
+        source: WaitSourceId::new(1),
+        interests: InterestMask::new(0b1),
+    };
+    assert!(mb.post(evt));
+    assert_eq!(mb.len(), 1);
+    let polled = mb.poll();
+    assert!(polled.is_some());
+    let polled = polled.unwrap();
+    assert!(matches!(polled, MailboxEvent::SourceFired { .. }));
+    assert_eq!(mb.len(), 0);
+}
+
+#[test]
+fn mailbox_active_wait_matches() {
+    let mb = TaskMailbox::new();
+    let source = WaitSourceId::new(7);
+    let interests = InterestMask::new(0b101);
+    let gen = mb.next_generation();
+    let active = tx_substrate::wake::mailbox::ActiveWait::new(gen, source, interests);
+    let evt = MailboxEvent::SourceFired {
+        generation: gen,
+        source,
+        interests: InterestMask::new(0b001),
+    };
+    assert!(active.matches(&evt), "overlapping interests should match");
+    let evt2 = MailboxEvent::SourceFired {
+        generation: gen,
+        source: WaitSourceId::new(99),
+        interests,
+    };
+    assert!(!active.matches(&evt2), "different source should not match");
+}
+
+// ---------------------------------------------------------------------------
+// drive-taskmb: yield OnWaitSource with real TaskMailbox resolves on pre-posted event
+// ---------------------------------------------------------------------------
+
+#[test]
+fn drive_yield_on_wait_source_with_mailbox_resolves_on_pre_posted_event() {
+    let mailbox = Arc::new(TaskMailbox::new());
+    let source_id = WaitSourceId::new(42);
+    let interests = InterestMask::new(0b1);
+
+    // resolve_on_wait_source calls mailbox.next_generation() internally
+    // (counter starts at 1, so first call returns generation 1).
+    // Pre-post an event with generation 1 so they match.
+    assert!(
+        mailbox.post(MailboxEvent::SourceFired {
+            generation: WaitGeneration::new(1),
+            source: source_id,
+            interests,
+        }),
+        "mailbox should accept event"
+    );
+
+    // StepOp: yield OnWaitSource, then Done.
+    let op = MockStepOp::new([
+        StepOutcome::Yield {
+            progress: NoProgress,
+            shape: YieldShape::OnWaitSource {
+                source: source_id,
+                interests,
+            },
+        },
+        StepOutcome::Done(99u32),
+    ]);
+
+    let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        Some(&mailbox),
+        None,
+        None,
+    ));
+    assert_eq!(result, Ok(99u32));
 }

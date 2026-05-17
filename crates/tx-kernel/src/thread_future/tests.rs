@@ -578,8 +578,10 @@ fn thread_future_pf_err_routes_sigsegv_and_zombifies() {
         "fault on unmapped address must surface NoRecipe"
     );
 
-    // What run_thread does on Err: route default-action SIGSEGV and
-    // return.
+    // Phase B: run_thread routes VM-fault Err through
+    // deliver_synchronous_fault per SIGNAL_v1 §20. The default-action
+    // path in deliver_synchronous_fault calls step_exit_group_with_signal,
+    // which is what this test exercises directly.
     tx_subsystems::process::execution::step_exit_group_with_signal(&init, Signum::SIGSEGV);
 
     assert!(init.is_zombie(), "SIGSEGV routing zombifies process");
@@ -665,6 +667,7 @@ fn thread_future_execve_continues_loop_without_writing_pending_return() {
         }
         SyscallResult::NoReturn => true,
         SyscallResult::ExecCommitted => false,
+        SyscallResult::SigreturnRestored => false,
     };
 
     assert!(
