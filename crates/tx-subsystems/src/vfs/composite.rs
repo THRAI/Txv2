@@ -208,6 +208,65 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MkdirOp<'a> {
 impl OneShotStepOp<ProcessIdentity> for MkdirOp<'_> {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for MkdirOp<'_> {}
 
+/// Composite StepOp: walk to parent dir, then call `FsOps::create_inode`
+/// with an arbitrary `InodeKind` (used by `mknodat` for device nodes).
+pub struct MknodOp<'a> {
+    pub rooted_at: &'a Cap<DEntry>,
+    pub path: &'a [u8],
+    pub mode: u16,
+    pub kind: InodeKind,
+    pub cred: &'a Credential,
+    pub guard: &'a Guard<'a>,
+    pub parent: Option<(Cap<DEntry>, InlineName)>,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for MknodOp<'a> {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        let (parent, name) = match self.parent.take() {
+            Some(p) => p,
+            None => {
+                let rooted_at = self.rooted_at.clone();
+                let (parent_path, name_bytes) = split_parent_and_name(self.path);
+                let parent_dentry = if parent_path.is_empty() {
+                    rooted_at
+                } else {
+                    match walker::step_walk(rooted_at, parent_path, self.cred, self.guard) {
+                        StepOutcome::Done(d) => d,
+                        StepOutcome::Err(e) => return StepOutcome::err(e),
+                        _ => return StepOutcome::err(step_engine::Errno::EIO),
+                    }
+                };
+                let name = match InlineName::new(name_bytes) {
+                    Ok(n) => n,
+                    Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
+                };
+                self.parent = Some((parent_dentry.clone(), name.clone()));
+                (parent_dentry, name)
+            }
+        };
+        let fs_ops =
+            walker::fs_ops_for(&parent, self.guard).expect("NoFsOps for MknodOp");
+        match fs_ops.create_inode(
+            parent.rnode().fs_object_id(),
+            name,
+            self.kind,
+            self.mode,
+            self.cred,
+            self.guard,
+        ) {
+            StepOutcome::Done(_) => StepOutcome::Done(()),
+            StepOutcome::Err(e) => StepOutcome::Err(e),
+            other => other,
+        }
+    }
+}
+
+impl OneShotStepOp<ProcessIdentity> for MknodOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for MknodOp<'_> {}
+
 // ============================================================================
 // UnlinkOp — unlinkat
 // ============================================================================

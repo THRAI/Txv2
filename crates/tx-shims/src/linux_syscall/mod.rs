@@ -85,8 +85,8 @@ use tx_subsystems::vfs::{
     OpenFileSetFlOp, OpenOp,
 };
 use tx_subsystems::vfs::composite::{
-    AccessOp, ChmodOp, ChownOp, LinkOp, MkdirOp, NanosleepOp, ReadLinkOp, RenameOp, StatOp,
-    StatxOp, StatxResult, SymlinkOp, TruncateOp, UnlinkOp,
+    AccessOp, ChmodOp, ChownOp, LinkOp, MkdirOp, MknodOp, NanosleepOp, ReadLinkOp, RenameOp,
+    StatOp, StatxOp, StatxResult, SymlinkOp, TruncateOp, UnlinkOp,
 };
 use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
