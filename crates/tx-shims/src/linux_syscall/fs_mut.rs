@@ -814,12 +814,62 @@ pub(super) async fn sys_umount2<P: PmapIf>(
 /// `mknodat(dirfd, path, mode, dev)`. Linux RV64 ABI `__NR_mknodat = 33`.
 ///
 /// v1: ENOSYS — needs FsOps::mknod + InodeMeta.rdev.
+/// `mknodat(dirfd, path, mode, dev)`. Linux RV64 ABI `__NR_mknodat = 33`.
+///
+/// Creates a device node at the given path.  `mode` encodes the
+/// file type (S_IFCHR, S_IFBLK, S_IFIFO, S_IFREG).  `dev` encodes
+/// major/minor (major = (dev >> 8) & 0xfff, minor = dev & 0xff
+/// | (dev >> 12) & 0xfff00).
 pub(super) async fn sys_mknodat<P: PmapIf>(
-    _args: [u64; 6],
-    _ctx: &SyscallCtx<'_>,
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
-    SyscallResult::Error(ENOSYS_VALUE)
+    let _dirfd = args[0] as u32;
+    let path_uaddr = args[1];
+    let mode = args[2] as u32;
+    let _dev = args[3] as u64;
+
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+        Ok(p) => p,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+    };
+
+    let S_IFREG: u32 = 0o100000;
+    let S_IFCHR: u32 = 0o020000;
+    let S_IFBLK: u32 = 0o060000;
+    let S_IFIFO: u32 = 0o010000;
+
+    let cred = ctx.walker_cred();
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
+    };
+    let kind = match mode & 0o170000u32 {
+        t if t == S_IFREG || t == 0 => tx_subsystems::vfs::InodeKind::Regular,
+        t if t == S_IFCHR => tx_subsystems::vfs::InodeKind::CharDevice,
+        t if t == S_IFBLK => tx_subsystems::vfs::InodeKind::BlockDevice,
+        t if t == S_IFIFO => tx_subsystems::vfs::InodeKind::Fifo,
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let result = {
+        let guard = step_engine::guard();
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = MknodOp {
+            rooted_at: &cwd,
+            path: &path,
+            mode: mode as u16,
+            kind,
+            cred: &cred,
+            guard: &guard,
+            parent: None,
+        };
+        step_engine::drive_oneshot(&mut op, &mut script_ctx)
+    };
+    match result {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
 
 /// `utimensat(dirfd, pathname, times, flags)`. Linux RV64 generic ABI
