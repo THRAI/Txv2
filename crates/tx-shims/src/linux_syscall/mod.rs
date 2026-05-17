@@ -63,8 +63,8 @@ use tx_subsystems::process::{
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signalfd::ops::SignalfdCreateOp;
 use tx_subsystems::signal::{
-    KillOutcome, KillProcessOp, SigDisposition, SigDispositionChange, SigactionOp,
-    SignalMask, Signum,
+    DeliverSignalOp, KillOutcome, KillProcessOp, SigDisposition, SigDispositionChange,
+    SigactionOp, SignalMask, SignalTarget, Signum,
 };
 use tx_subsystems::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
 use tx_subsystems::thread_runtime::{

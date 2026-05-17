@@ -346,12 +346,15 @@ pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             Some(s) => s,
             None => return SyscallResult::Error(EINVAL_VALUE),
         };
-        return match deliver_posix_signal(
-            tx_subsystems::signal::SignalTarget::Thread(thread_cap),
-            signum,
-        ) {
-            tx_subsystems::signal::KillOutcome::Delivered => SyscallResult::Return(0),
-            tx_subsystems::signal::KillOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = DeliverSignalOp {
+            target: SignalTarget::Thread(thread_cap),
+            sig: signum,
+        };
+        return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(KillOutcome::Delivered) => SyscallResult::Return(0),
+            Ok(KillOutcome::NoLiveThread) => SyscallResult::Error(ESRCH_VALUE),
+            Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
         };
     }
 
