@@ -203,3 +203,26 @@ skills:
       - xtask/src/lint_invariants_syscall.rs
       - xtask/src/lint.rs
     purpose: Classify syscalls into Immediate/OneShotStepOp/FullAsync lanes, manage dispatch-lane migration, and run syscall lint ratchets (adhoc-loop, no-await, ctx-bridge).
+
+  tx-xtask:
+    sources:
+      - xtask/src/lib.rs
+      - xtask/src/unit.rs
+      - xtask/src/full_build.rs
+      - xtask/src/qemu.rs
+      - xtask/src/test.rs
+      - xtask/src/fault_decode.rs
+      - xtask/src/trap_trace.rs
+      - xtask/src/shell_test.rs
+      - xtask/src/image.rs
+      - xtask/src/lint.rs
+      - xtask/src/boundary_report.rs
+      - xtask/src/check_build.rs
+      - xtask/src/ci.rs
+      - xtask/src/doctor.rs
+      - xtask/src/observe.rs
+      - xtask/src/observe_discipline.rs
+      - xtask/src/oscomp.rs
+      - xtask/src/submit.rs
+      - xtask/src/progress
+    purpose: Reference for every `cargo xtask` subcommand — fast feedback (unit, check, lint, boundary-report), build & image (doctor, full-build, build, image), run (qemu, test, shell-test), diagnose (fault-decode, trap-trace), and progress/observation tooling.
