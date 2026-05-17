@@ -34,8 +34,8 @@ use core::marker::PhantomData;
 pub mod adapter;
 
 use adapter::step_engine::{
-    self, Cap, CredentialView, Guard, NoProgress, OneShotStepOp, RestrictionStackHandle,
-    ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Zone, ZoneAllocated, ZoneError,
+    self, Cap, CredentialView, Guard, NoProgress, OneShotStepOp, RestrictionStackHandle, ScriptCtx,
+    StepOp, StepOutcome, SubjectIdentity, Zone, ZoneAllocated, ZoneError,
 };
 
 use crate::execution::Errno;

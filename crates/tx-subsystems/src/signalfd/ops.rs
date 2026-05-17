@@ -9,7 +9,7 @@ use crate::process::structure::ProcessIdentity;
 use crate::signal::adapter::step_engine::{
     NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
-use crate::signalfd::adapter::step_engine::{sign, Cap, ZoneError};
+use crate::signalfd::adapter::step_engine::{Cap, ZoneError};
 use crate::signalfd::{signalfd_create, SignalFd};
 
 /// StepOp wrapper for [`signalfd_create`].
@@ -22,10 +22,7 @@ impl<I: SubjectIdentity> StepOp<I> for SignalfdCreateOp {
     type Output = Result<Cap<SignalFd>, ZoneError>;
     type Progress = NoProgress;
 
-    fn step(
-        &mut self,
-        _ctx: &mut ScriptCtx<I>,
-    ) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         // observe — owner_proc Cap + mask validated by signalfd_create
         // upgrade — N/A: Cap<SignalFd> allocated via signalfd_create
         // reserve — signalfd_create handles zone reservation internally

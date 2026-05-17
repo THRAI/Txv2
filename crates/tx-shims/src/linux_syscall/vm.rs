@@ -9,7 +9,7 @@ use tx_scripts::drive;
 use tx_substrate::step::DriveMode;
 use tx_substrate::step::Errno as V3Errno;
 use tx_subsystems::vm::step_ops::{
-    VmBrkOp, VmMapOp, VmMlockOp, VmMunlockOp, VmMsyncOp, VmProtectOp, VmRemapOp, VmUnmapOp,
+    VmBrkOp, VmMapOp, VmMlockOp, VmMsyncOp, VmMunlockOp, VmProtectOp, VmRemapOp, VmUnmapOp,
 };
 
 /// `brk(requested)` per `txdoc:VM-5-8-BRK`.
@@ -38,12 +38,26 @@ pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
     let cur = UserVirtAddr(current_brk as usize);
     let req = UserVirtAddr(requested as usize);
 
-    let mut op = VmBrkOp { aspace: &ctx.aspace, brk_base: base, current_brk: cur, requested_brk: req };
+    let op = VmBrkOp {
+        aspace: &ctx.aspace,
+        brk_base: base,
+        current_brk: cur,
+        requested_brk: req,
+    };
     let mut script_ctx = build_subject_script_ctx(ctx);
-        let mailbox_arc = script_ctx.mailbox().cloned();
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(new_brk) => {
             ctx.process.set_current_brk(new_brk.0 as u64);
             SyscallResult::Return(new_brk.0 as i64)
@@ -206,12 +220,24 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
         VmMapRequest::anywhere(window, page_count, prot, entry_flags, backing)
     };
 
-    let mut op = VmMapOp { aspace: &ctx.aspace, request };
+    let op = VmMapOp {
+        aspace: &ctx.aspace,
+        request,
+    };
     let mut script_ctx = build_subject_script_ctx(ctx);
-        let mailbox_arc = script_ctx.mailbox().cloned();
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(outcome) => SyscallResult::Return(outcome.range.start().as_usize() as i64),
         Err(errno) => {
             // MAP_FIXED_NOREPLACE → AlreadyMapped maps to EEXIST per
@@ -249,12 +275,24 @@ pub(super) async fn sys_munmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
 
-    let mut op = VmUnmapOp { aspace: &ctx.aspace, range };
+    let op = VmUnmapOp {
+        aspace: &ctx.aspace,
+        range,
+    };
     let mut script_ctx = build_subject_script_ctx(ctx);
-        let mailbox_arc = script_ctx.mailbox().cloned();
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -285,12 +323,24 @@ pub(super) async fn sys_mlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
         return SyscallResult::Error(EINVAL_VALUE);
     };
 
-    let mut op = VmMlockOp { aspace: &ctx.aspace, range };
+    let op = VmMlockOp {
+        aspace: &ctx.aspace,
+        range,
+    };
     let mut script_ctx = build_subject_script_ctx(ctx);
-        let mailbox_arc = script_ctx.mailbox().cloned();
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -315,12 +365,24 @@ pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscall
         return SyscallResult::Error(EINVAL_VALUE);
     };
 
-    let mut op = VmMunlockOp { aspace: &ctx.aspace, range };
+    let op = VmMunlockOp {
+        aspace: &ctx.aspace,
+        range,
+    };
     let mut script_ctx = build_subject_script_ctx(ctx);
-        let mailbox_arc = script_ctx.mailbox().cloned();
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -364,12 +426,25 @@ pub(super) async fn sys_mprotect(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
         Ok(r) => r,
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
-    let mut op = VmProtectOp { aspace: &ctx.aspace, range, prot };
+    let op = VmProtectOp {
+        aspace: &ctx.aspace,
+        range,
+        prot,
+    };
     let mut script_ctx = build_subject_script_ctx(ctx);
-        let mailbox_arc = script_ctx.mailbox().cloned();
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -416,12 +491,24 @@ pub(super) async fn sys_mremap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallR
     };
 
     let request = VmRemapRequest::new(old_range, new_range);
-    let mut op = VmRemapOp { aspace: &ctx.aspace, request };
+    let op = VmRemapOp {
+        aspace: &ctx.aspace,
+        request,
+    };
     let mut script_ctx = build_subject_script_ctx(ctx);
-        let mailbox_arc = script_ctx.mailbox().cloned();
+    let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    match drive(op, &mut script_ctx, DriveMode::Waiting, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
         Ok(outcome) => SyscallResult::Return(outcome.new_range.start().as_usize() as i64),
         Err(errno) => SyscallResult::Error(errno_to_i32(Into::<Errno>::into(errno))),
     }
@@ -501,8 +588,11 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let mut op = VmMsyncOp { aspace: &ctx.aspace, range };
+    let _delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = VmMsyncOp {
+        aspace: &ctx.aspace,
+        range,
+    };
     match drive(
         op,
         &mut script_ctx,
@@ -609,9 +699,9 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 
     match op {
         FUTEX_WAIT => {
-            use tx_subsystems::futex::FutexWaitOp;
-            use tx_substrate::step::DriveMode;
             use tx_scripts::drive;
+            use tx_substrate::step::DriveMode;
+            use tx_subsystems::futex::FutexWaitOp;
 
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mailbox_arc = script_ctx.mailbox().cloned();
@@ -623,16 +713,13 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             // (the predecessor equality check, per POSIX).
             {
                 let guard = step_engine::guard();
-                let outcome =
-                    tx_subsystems::futex::step_futex_wait(uaddr, val, &guard);
+                let outcome = tx_subsystems::futex::step_futex_wait(uaddr, val, &guard);
                 match outcome {
                     StepOutcome::Err(e) if e == V3Errno::EAGAIN => {
                         return SyscallResult::Error(errno_to_i32(Errno::EAGAIN));
                     }
                     StepOutcome::Err(e) => {
-                        return SyscallResult::Error(errno_to_i32(
-                            Errno::from(e),
-                        ));
+                        return SyscallResult::Error(errno_to_i32(Errno::from(e)));
                     }
                     // Yield / Continue / Done: fall through to drive().
                     _ => {}
@@ -644,42 +731,35 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             // step_futex_wake fires the bucket, and re-steps.
             // After waking, EAGAIN means "word changed → wake was
             // meaningful" → return 0.
-            loop {
-                let guard = step_engine::guard();
-                let mut op = FutexWaitOp {
-                    uaddr,
-                    val,
-                    guard: &guard,
-                };
-                match drive(
-                    op,
-                    &mut script_ctx,
-                    DriveMode::Waiting,
-                    mailbox_arc.as_ref(),
-                    delegate_registry_arc.as_deref(),
-                    timer_wheel_arc.as_ref(),
-                )
-                .await
-                {
-                    Ok(()) => return SyscallResult::Return(0),
-                    Err(v3errno) => {
-                        let errno: Errno = v3errno.into();
-                        if errno == Errno::EAGAIN {
-                            return SyscallResult::Return(0);
-                        }
-                        return SyscallResult::Error(errno_to_i32(errno));
+            //
+            // Op acquires its own epoch guard inside `step()`; no
+            // guard crosses `drive(...).await` (REACTOR_v0,
+            // STEP_MODEL_v2 §1, INVARIANTS_v5 EBR-7).
+            let op = FutexWaitOp { uaddr, val };
+            match drive(
+                op,
+                &mut script_ctx,
+                DriveMode::Waiting,
+                mailbox_arc.as_ref(),
+                delegate_registry_arc.as_deref(),
+                timer_wheel_arc.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => SyscallResult::Return(0),
+                Err(v3errno) => {
+                    let errno: Errno = v3errno.into();
+                    if errno == Errno::EAGAIN {
+                        SyscallResult::Return(0)
+                    } else {
+                        SyscallResult::Error(errno_to_i32(errno))
                     }
                 }
             }
         }
         FUTEX_WAKE => {
             let mut script_ctx = build_subject_script_ctx(ctx);
-            let guard = step_engine::guard();
-            let mut op = FutexWakeOp {
-                uaddr,
-                n: val,
-                guard: &guard,
-            };
+            let mut op = FutexWakeOp { uaddr, n: val };
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(woken) => SyscallResult::Return(woken as i64),
                 Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),

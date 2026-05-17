@@ -587,6 +587,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         &self,
         fs_object_id: FsObjectId,
         meta: InodeMeta,
+        mount: &Cap<MountPayload>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         let inner = self.inner.lock();
@@ -595,12 +596,13 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         };
         match inode {
             ExecveTestInode::Regular { container, .. } => {
-                match RNode::new_cap(
+                match RNode::new_cap_in_mount(
                     fs_object_id,
                     meta,
                     RNodeBacking::PageBacked {
                         pc: container.clone(),
                     },
+                    mount,
                 ) {
                     Ok(rnode) => StepOutcome::done(rnode),
                     Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
@@ -663,7 +665,11 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecveTestFs {
         StepOutcome::done(())
     }
 
-    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
         StepOutcome::done(())
     }
 }
@@ -774,7 +780,7 @@ fn execve_testfs_v3_fetch_page_returns_frame_for_regular() {
     );
     // Truncate / fsync / flush_page are synchronous Done(()).
     assert_eq!(
-        <ExecveTestFs as FsPageBacking>::fsync(&*fs, file_id, &guard),
+        <ExecveTestFs as FsPageBacking>::fsync_file(&*fs, file_id, &guard),
         V3::<(), NoProgress>::done(())
     );
 }

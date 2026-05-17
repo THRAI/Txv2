@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use core::{ptr::NonNull, task::Waker};
 use std::{
     sync::{
@@ -459,7 +461,8 @@ fn declared_queue_retire_records_epoch_terminal_handshake() {
     let queue = DeclaredQueue::new(WireDeclaration::<Readiness>::queue("pipe.read_source"))
         .expect("valid queue declaration");
     let wakes = Arc::new(AtomicUsize::new(0));
-    let mut subscription = queue.subscribe_with_waker(Readiness::HAS_DATA, counting_waker(Arc::clone(&wakes)));
+    let mut subscription =
+        queue.subscribe_with_waker(Readiness::HAS_DATA, counting_waker(Arc::clone(&wakes)));
     let guard = epoch::guard();
 
     let retirement = queue.retire(Readiness::BROKEN, &guard);
@@ -507,8 +510,10 @@ fn owner_retire_fence_queues_storage_reclaim_after_embedded_wire_retire() {
     let port = RawPort::new();
     let queue_wakes = Arc::new(AtomicUsize::new(0));
     let port_wakes = Arc::new(AtomicUsize::new(0));
-    let mut queue_subscription = queue.subscribe_with_waker(0x1, counting_waker(Arc::clone(&queue_wakes)));
-    let mut port_subscription = port.subscribe_with_waker(0x2, counting_waker(Arc::clone(&port_wakes)));
+    let mut queue_subscription =
+        queue.subscribe_with_waker(0x1, counting_waker(Arc::clone(&queue_wakes)));
+    let mut port_subscription =
+        port.subscribe_with_waker(0x2, counting_waker(Arc::clone(&port_wakes)));
     let guard = epoch::guard();
 
     let mut fence =
@@ -590,8 +595,10 @@ fn typed_owner_manifest_retires_wires_and_queues_typed_reclaim() {
     let port = owner_ref.port.clone();
     let queue_wakes = Arc::new(AtomicUsize::new(0));
     let port_wakes = Arc::new(AtomicUsize::new(0));
-    let mut queue_subscription = queue.subscribe_with_waker(0x1, counting_waker(Arc::clone(&queue_wakes)));
-    let mut port_subscription = port.subscribe_with_waker(0x2, counting_waker(Arc::clone(&port_wakes)));
+    let mut queue_subscription =
+        queue.subscribe_with_waker(0x1, counting_waker(Arc::clone(&queue_wakes)));
+    let mut port_subscription =
+        port.subscribe_with_waker(0x2, counting_waker(Arc::clone(&port_wakes)));
     let guard = epoch::guard();
 
     let reclaim = unsafe { retire_wire_owner(owner, &guard) }.expect("typed owner retire");

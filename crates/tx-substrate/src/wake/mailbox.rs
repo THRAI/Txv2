@@ -183,6 +183,7 @@ pub enum MailboxEvent {
     /// - `thread_runtime::execution::set_thread_zombie`
     ///   (terminal-state notification so a parked future observes
     ///   `summary.termination` and resolves to `Killed`/`Interrupted`).
+    SignalDelivered { signum: u32, routing: SignalRouting },
     /// A [`TimerWheel`] entry has expired (PR-8B). The driver matches
     /// this against the in-flight `OnTimer` wait's token to resolve
     /// the yield via `ResumeOutcome::TimerExpired`.
@@ -190,7 +191,6 @@ pub enum MailboxEvent {
     /// Posted by [`TimerWheel::fire_due`] when the reactor's clock
     /// tick advances past the entry's deadline.
     TimerFired { token: TimerToken },
-    SignalDelivered { signum: u32, routing: SignalRouting },
 }
 
 /// Bounded MPSC queue capacity for a single mailbox.
@@ -311,6 +311,36 @@ impl TaskMailbox {
     pub fn post(&self, event: MailboxEvent) -> bool {
         let enqueued = {
             let mut q = self.queue.lock();
+            // Coalesce consecutive `SourceFired` deliveries for the
+            // same `(generation, source)` so repeated `fire()` calls
+            // between observations only wake once. Drivers re-observe
+            // the underlying source on poll, so widening the OR'd
+            // interest mask is safe.
+            if let MailboxEvent::SourceFired {
+                generation,
+                source,
+                interests,
+            } = event
+            {
+                let mut coalesced = false;
+                for existing in q.iter_mut() {
+                    if let MailboxEvent::SourceFired {
+                        generation: g,
+                        source: s,
+                        interests: i,
+                    } = existing
+                    {
+                        if *g == generation && *s == source {
+                            *i = crate::step::InterestMask::new(i.raw() | interests.raw());
+                            coalesced = true;
+                            break;
+                        }
+                    }
+                }
+                if coalesced {
+                    return false;
+                }
+            }
             if q.len() >= MAILBOX_QUEUE_BOUND {
                 self.overflow.store(true, Ordering::Release);
                 false

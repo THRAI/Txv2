@@ -1,6 +1,6 @@
-use core::marker::PhantomData;
-use alloc::sync::Weak;
 use crate::wake::mailbox::{TaskMailbox, WaitGeneration};
+use alloc::sync::Weak;
+use core::marker::PhantomData;
 use core::task::Waker;
 
 use super::common::{
@@ -256,11 +256,9 @@ impl<const N: usize> SubscriptionGraph<N> {
         E: WireEventSet,
     {
         let interest = Self::validate_declared_bits(queue.declaration(), interest)?;
-        Ok(DeclaredSubscriptionGraphKey::new(self.subscribe_queue_with_waker(
-            queue.raw(),
-            interest,
-            waker,
-        )?))
+        Ok(DeclaredSubscriptionGraphKey::new(
+            self.subscribe_queue_with_waker(queue.raw(), interest, waker)?,
+        ))
     }
 
     pub fn subscribe_declared_port<E>(
@@ -293,11 +291,9 @@ impl<const N: usize> SubscriptionGraph<N> {
         E: WireEventSet,
     {
         let interest = Self::validate_declared_bits(port.declaration(), interest)?;
-        Ok(DeclaredSubscriptionGraphKey::new(self.subscribe_port_with_waker(
-            port.raw(),
-            interest,
-            waker,
-        )?))
+        Ok(DeclaredSubscriptionGraphKey::new(
+            self.subscribe_port_with_waker(port.raw(), interest, waker)?,
+        ))
     }
 
     pub fn remove(&mut self, key: SubscriptionGraphKey) -> Result<(), SubscriptionGraphError> {
@@ -349,7 +345,9 @@ impl<const N: usize> SubscriptionGraph<N> {
         }
 
         match &mut self.entry_mut(key)?.subscription {
-            GraphSubscription::Queue(subscription) => Ok(subscription.try_update(interest, mailbox, generation)?),
+            GraphSubscription::Queue(subscription) => {
+                Ok(subscription.try_update(interest, mailbox, generation)?)
+            }
             GraphSubscription::Port(_) => Err(SubscriptionGraphError::KindMismatch),
         }
     }
@@ -366,7 +364,9 @@ impl<const N: usize> SubscriptionGraph<N> {
         }
 
         match &mut self.entry_mut(key)?.subscription {
-            GraphSubscription::Queue(subscription) => Ok(subscription.try_update_with_waker(interest, waker)?),
+            GraphSubscription::Queue(subscription) => {
+                Ok(subscription.try_update_with_waker(interest, waker)?)
+            }
             GraphSubscription::Port(_) => Err(SubscriptionGraphError::KindMismatch),
         }
     }
@@ -383,7 +383,9 @@ impl<const N: usize> SubscriptionGraph<N> {
         }
 
         match &mut self.entry_mut(key)?.subscription {
-            GraphSubscription::Port(subscription) => Ok(subscription.try_update(interest, mailbox, generation)?),
+            GraphSubscription::Port(subscription) => {
+                Ok(subscription.try_update(interest, mailbox, generation)?)
+            }
             GraphSubscription::Queue(_) => Err(SubscriptionGraphError::KindMismatch),
         }
     }
@@ -400,7 +402,9 @@ impl<const N: usize> SubscriptionGraph<N> {
         }
 
         match &mut self.entry_mut(key)?.subscription {
-            GraphSubscription::Port(subscription) => Ok(subscription.try_update_with_waker(interest, waker)?),
+            GraphSubscription::Port(subscription) => {
+                Ok(subscription.try_update_with_waker(interest, waker)?)
+            }
             GraphSubscription::Queue(_) => Err(SubscriptionGraphError::KindMismatch),
         }
     }
@@ -624,6 +628,13 @@ impl GraphSubscription {
     }
 
     fn try_take_ready(&mut self) -> Result<bool, RawSubscriptionError> {
+        // The wrapped subscription getters are themselves deprecated in
+        // favour of `TaskMailbox::poll()` + `ActiveWait::matches()`,
+        // but this dispatcher forwards both shapes one level down so
+        // existing call sites keep working until the migration lands.
+        // Allow the deprecation locally for the same call-through
+        // reason — the real callers are already migrated.
+        #[allow(deprecated)]
         match self {
             Self::Queue(subscription) => subscription.try_take_ready(),
             Self::Port(subscription) => subscription.try_take_ready(),

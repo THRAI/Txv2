@@ -68,8 +68,8 @@ pub mod adapter;
 pub mod ops;
 
 use adapter::step_engine::{
-    guard, sign, ByteProgress, Cap, InterestMask, OperationalCapExt, SpinMutex, StepOutcome, V3Errno, WaitSource,
-    WaitSourceId, Weak, Zone, ZoneAllocated, ZoneError,
+    guard, sign, ByteProgress, Cap, InterestMask, OperationalCapExt, SpinMutex, StepOutcome,
+    V3Errno, WaitSource, WaitSourceId, Weak, Zone, ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::{Channel, Mask};
 
@@ -381,7 +381,10 @@ pub fn signalfd_create(
 /// consumers).
 fn drain_pending_signals(sfd: &SignalFd) {
     let guard = guard();
-    let owner_weak = match &sfd.owner_proc { Some(w) => w, None => return };
+    let owner_weak = match &sfd.owner_proc {
+        Some(w) => w,
+        None => return,
+    };
     let Some(proc) = owner_weak.upgrade(&guard) else {
         return;
     };

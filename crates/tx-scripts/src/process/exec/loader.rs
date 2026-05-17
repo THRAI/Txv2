@@ -33,8 +33,7 @@ use alloc::vec::Vec;
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::header::header64;
 use goblin::elf::header::{
-    Header, EI_CLASS, EI_DATA, EI_VERSION, ELFCLASS64, ELFDATA2LSB, EM_RISCV, ET_DYN, ET_EXEC,
-    EV_CURRENT,
+    Header, EI_CLASS, EI_DATA, EI_VERSION, ELFCLASS64, ELFDATA2LSB, ET_DYN, ET_EXEC, EV_CURRENT,
 };
 use goblin::elf::program_header::{
     ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_PHDR,
@@ -44,6 +43,7 @@ use goblin::elf::program_header::{
 const PT_GNU_STACK: u32 = 0x6474_e551;
 
 /// PT_GNU_RELRO program header type.
+#[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
 const PT_GNU_RELRO: u32 = 0x6474_e552;
 
 /// ELF64 program-header size, in bytes. (Elf64_Phdr is 56 bytes.)
@@ -66,6 +66,9 @@ const MAX_PHDRS: u16 = 64;
 /// (`p_vaddr % p_align == p_offset % p_align`) is preserved after bias.
 pub(crate) const ET_DYN_LOAD_BIAS: u64 = 0x10000;
 
+const EM_RISCV: u16 = 243;
+const EM_LOONGARCH: u16 = 258;
+
 /// Minimum ELF64 header size (`Elf64_Ehdr`), in bytes.
 const ELF64_EHDR_SIZE: usize = 64;
 
@@ -75,8 +78,7 @@ pub enum ParseError {
     /// ELF magic missing or wrong architecture class / endianness /
     /// version.
     Magic,
-    /// `e_machine` is not `EM_RISCV` (only RV64 is supported in the
-    /// slice).
+    /// `e_machine` is not an architecture txKernel can enter.
     Arch,
     /// `e_type` is neither `ET_EXEC` nor `ET_DYN`.
     Type,
@@ -185,8 +187,9 @@ pub struct ExecImagePlan {
 
 /// Parse the ELF header + program headers and produce an image plan.
 ///
-/// Validates: ELFCLASS64, ELFDATA2LSB, EV_CURRENT, EM_RISCV, ET_EXEC,
-/// no PT_INTERP, no PT_DYNAMIC, ≥ 1 PT_LOAD. Walks PT_LOAD segments;
+/// Validates: ELFCLASS64, ELFDATA2LSB, EV_CURRENT, supported machine,
+/// ET_EXEC or static-PIE ET_DYN, no unsupported interpreter handoff, ≥ 1 PT_LOAD.
+/// Walks PT_LOAD segments;
 /// rejects overlap, bad alignment, congruence violations, multiple
 /// BSS-extending LOADs.
 ///
@@ -215,7 +218,7 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
     {
         return Err(ParseError::Magic);
     }
-    if header.e_machine != EM_RISCV {
+    if !matches!(header.e_machine, EM_RISCV | EM_LOONGARCH) {
         return Err(ParseError::Arch);
     }
     // Accept both ET_EXEC (static, absolute VAs) and ET_DYN (static-PIE,
@@ -246,7 +249,7 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
     }
 
     // ----- Program headers ----------------------------------------
-    // RV64 ELF64 little-endian. The slice is a single arch.
+    // Supported ELF64 little-endian machines share the same program-header layout.
     let ctx = Ctx::new(Container::Big, Endian::Little);
     let phdrs = ProgramHeader::parse(elf_bytes, phoff as usize, phnum as usize, ctx)
         .map_err(|_| ParseError::Phdr)?;

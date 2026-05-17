@@ -1,23 +1,24 @@
 //! Process subsystem execution: fork, exit-group, setpgid, setsid, and
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use tx_hal::{PmapIf, UserTrapContext};
 
 use crate::process::adapter::step_engine::{
-    self, Cap, IdentRef, NoProgress, OneShotStepOp, OperationalCapExt, PayloadCap, ScriptCtx, YieldShape,
-    SpinMutex, StepOp, StepOutcome, SubjectIdentity, Weak, ZoneError,
+    self, Cap, IdentRef, NoProgress, OneShotStepOp, OperationalCapExt, PayloadCap, ScriptCtx,
+    SpinMutex, StepOp, StepOutcome, SubjectIdentity, Weak, YieldShape, ZoneError,
 };
 use crate::process::adapter::wait_routing::{self, Mask};
 
 use crate::cred::Cred;
 use crate::process::structure::{
-    ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,
-    Sid,
+    ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,
 };
-use crate::process::topology::{ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers};
+use crate::process::topology::{
+    ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers,
+};
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::execution::set_thread_zombie;
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload};
@@ -29,8 +30,8 @@ use crate::vm::{AddressSpace, VmMapError};
 // ---------------------------------------------------------------------------
 
 use crate::process::numbers::{
-    allocate_pid, PidName, PidNameKind, register_pid as ns_register_pid,
-    register_tid, unregister_pid_number, resolve_pid_number, with_namespace,
+    allocate_pid, register_pid as ns_register_pid, resolve_pid_number, unregister_pid_number,
+    with_namespace, PidName, PidNameKind,
 };
 
 /// Register a process pid → Cap binding. The Cap must be fully
@@ -66,11 +67,10 @@ pub fn all_pids() -> alloc::vec::Vec<(Pid, bool)> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
 pub(crate) fn reset_pid_counter_for_test() {
     crate::process::numbers::reset_pid_counter_for_test();
 }
-
-
 
 /// Bootstrap value for the program-break base, per the Trio plan
 /// §"Cross-cutting risks #7". Used by `bootstrap_init_process` to
@@ -102,7 +102,9 @@ pub fn init_process() -> Option<Cap<ProcessIdentity>> {
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reset_init_process_for_test() {
-    *INIT_PROCESS.lock() = None;
+    if let Some(prev) = INIT_PROCESS.lock().take() {
+        unregister_pid(prev.pid);
+    }
 }
 
 /// Errors from `bootstrap_init_process`.
@@ -301,6 +303,13 @@ pub fn bootstrap_init_process(
     // outlives every other reference (matches POSIX init lifetime).
     *INIT_PROCESS.lock() = Some(proc_cap.clone());
 
+    // Register init in the pid namespace so `process_by_pid(Pid::INIT)`
+    // resolves: kill/tkill/tgkill, /proc/<pid>/, waitpid, and the
+    // SIGCHLD reparenting path all use this lookup. `step_fork`
+    // registers child pids; init has no fork parent, so the bootstrap
+    // path must register itself.
+    register_pid(pid, proc_cap.clone());
+
     Ok(proc_cap)
 }
 
@@ -323,8 +332,7 @@ pub fn step_clone_thread(
 
     // 3. Reserve — allocate new ThreadIdentity
     let tid = allocate_tid();
-    let thread = sign_thread(process.downgrade())
-        .map_err(|_| ForkError::PidNamespace)?;
+    let thread = sign_thread(process.downgrade()).map_err(|_| ForkError::PidNamespace)?;
 
     // 4. Commit (infallible)
     let payload_guard = process.payload.lock();
@@ -335,7 +343,7 @@ pub fn step_clone_thread(
 
     // Seed child's user context from parent
     if let Some(payload_cap) = thread.payload_cap() {
-        payload_cap.store_saved_user_context(Some(parent_ctx.clone()));
+        payload_cap.store_saved_user_context(Some(*parent_ctx));
     }
 
     Ok(thread)
@@ -591,7 +599,9 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
 /// alongside the SIGCHLD post for parent-side wake.
 pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     // observe
-    if let Some(payload) = process.payload.lock().as_ref() { payload.notify_vfork_done(); }
+    if let Some(payload) = process.payload.lock().as_ref() {
+        payload.notify_vfork_done();
+    }
     // upgrade
     // reserve
     // commit
@@ -701,16 +711,16 @@ fn session_leader_hangup_cascade(process: &Cap<ProcessIdentity>) {
         // true orphan detection.
         let members: alloc::vec::Vec<Cap<ProcessGroup>> = {
             let guard = step_engine::guard();
-            session.members.snapshot_live(&guard)
+            session
+                .members
+                .snapshot_live(&guard)
                 .into_iter()
                 .filter(|pgrp| pgrp.key() != fg_pgrp.key())
                 .collect()
         };
         for pgrp in &members {
-            let _ =
-                crate::signal::step_kill_pgrp(pgrp, crate::signal::Signum::SIGHUP);
-            let _ =
-                crate::signal::step_kill_pgrp(pgrp, crate::signal::Signum::SIGCONT);
+            let _ = crate::signal::step_kill_pgrp(pgrp, crate::signal::Signum::SIGHUP);
+            let _ = crate::signal::step_kill_pgrp(pgrp, crate::signal::Signum::SIGCONT);
         }
     }
 
@@ -1249,7 +1259,7 @@ pub struct WaitpidNohangOp<'a> {
 impl<'a, I: SubjectIdentity> StepOp<I> for WaitpidNohangOp<'a> {
     type Output = Result<(Pid, ExitStatus), WaitError>;
     type Progress = NoProgress;
-    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let result = step_waitpid_nohang(self.parent, self.target);
         match result {
             Ok(outcome) => StepOutcome::Done(Ok(outcome)),
@@ -1259,7 +1269,10 @@ impl<'a, I: SubjectIdentity> StepOp<I> for WaitpidNohangOp<'a> {
                 // the task; when a child exits, step_process_exit
                 // fires exit_source, and drive() re-calls step().
                 if let Some(exit_id) = self.parent.exit_source_id() {
-                    return StepOutcome::Yield { progress: NoProgress, shape: YieldShape::on_wait_source(exit_id, 1) };
+                    return StepOutcome::Yield {
+                        progress: NoProgress,
+                        shape: YieldShape::on_wait_source(exit_id, 1),
+                    };
                 }
                 // No exit source registered — would spin forever.
                 StepOutcome::Done(Err(WaitError::NoneReady))
@@ -1315,12 +1328,12 @@ impl<'a, I: SubjectIdentity> StepOp<I> for SetpgidOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         match step_setpgid(self.target, self.new_pgid) {
             Ok(()) => StepOutcome::Done(()),
-            Err(SetpgidError::Unimplemented) => StepOutcome::Err(
-                crate::process::adapter::step_engine::Errno::ENOSYS,
-            ),
-            Err(SetpgidError::Zone(_)) => StepOutcome::Err(
-                crate::process::adapter::step_engine::Errno::ENOMEM,
-            ),
+            Err(SetpgidError::Unimplemented) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::ENOSYS)
+            }
+            Err(SetpgidError::Zone(_)) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::ENOMEM)
+            }
         }
     }
 }
@@ -1340,9 +1353,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for SetsidOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Sid, NoProgress> {
         match step_setsid(self.target) {
             Ok(sid) => StepOutcome::Done(sid),
-            Err(SetsidError::Zone(_)) => StepOutcome::Err(
-                crate::process::adapter::step_engine::Errno::ENOMEM,
-            ),
+            Err(SetsidError::Zone(_)) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::ENOMEM)
+            }
         }
     }
 }
@@ -1594,6 +1607,7 @@ mod step_op_wraps {
         let parent = bootstrap();
         let mut op = ForkOp::<TestPmap> {
             parent: &parent,
+            clone_vm: false,
             _pmap: core::marker::PhantomData,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
@@ -1684,7 +1698,9 @@ mod step_op_wraps {
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         match outcome {
-            StepOutcome::Err(v3_errno) if Into::<crate::execution::Errno>::into(v3_errno) == crate::execution::Errno::ENOSYS => {}
+            StepOutcome::Err(v3_errno)
+                if Into::<crate::execution::Errno>::into(v3_errno)
+                    == crate::execution::Errno::ENOSYS => {}
             other => panic!("expected Err(crate::execution::Errno::ENOSYS), got {other:?}"),
         }
     }

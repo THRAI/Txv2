@@ -77,6 +77,13 @@ pub struct RawQueueSubscription {
     queue: RawQueue,
     id: Option<SubscriptionId>,
     terminal_snapshot: bool,
+    /// Retain the mailbox built by `subscribe_with_waker` for legacy
+    /// tests so its `Weak` reference stays upgradeable for the lifetime
+    /// of the subscription. `None` for callers that pass an external
+    /// `Weak<TaskMailbox>` via `subscribe(...)`.
+    _waker_mailbox: Option<Arc<TaskMailbox>>,
+    /// One-shot terminal edge for the deprecated `take_ready` API.
+    terminal_observed: bool,
 }
 
 impl RawQueue {
@@ -114,7 +121,9 @@ impl RawQueue {
         let mailbox = Arc::new(TaskMailbox::new());
         mailbox.register_waker(waker);
         let gen = mailbox.next_generation();
-        self.subscribe(interest, Arc::downgrade(&mailbox), gen)
+        let mut sub = self.subscribe(interest, Arc::downgrade(&mailbox), gen);
+        sub._waker_mailbox = Some(mailbox);
+        sub
     }
 
     /// Compatibility bridge: see [`Self::subscribe_with_waker`].
@@ -126,7 +135,9 @@ impl RawQueue {
         let mailbox = Arc::new(TaskMailbox::new());
         mailbox.register_waker(waker);
         let gen = mailbox.next_generation();
-        self.try_subscribe(interest, Arc::downgrade(&mailbox), gen)
+        let mut sub = self.try_subscribe(interest, Arc::downgrade(&mailbox), gen)?;
+        sub._waker_mailbox = Some(mailbox);
+        Ok(sub)
     }
 
     pub const fn from_static(storage: &'static StaticRawQueue) -> Self {
@@ -155,6 +166,8 @@ impl RawQueue {
                 queue: self.clone(),
                 id: None,
                 terminal_snapshot: true,
+                _waker_mailbox: None,
+                terminal_observed: false,
             };
         }
 
@@ -194,6 +207,8 @@ impl RawQueue {
             queue: self.clone(),
             id: Some(id),
             terminal_snapshot: false,
+            _waker_mailbox: None,
+            terminal_observed: false,
         }
     }
 
@@ -223,10 +238,10 @@ impl RawQueue {
             let interests = InterestMask::new(new_bits);
             // Post SourceFired to each subscriber whose interest overlaps.
             for subscriber in &mut state.subscribers {
-                if subscriber.interest & new_bits != 0 {
-                    if post_source_fired(subscriber, source, interests) {
-                        woke += 1;
-                    }
+                if subscriber.interest & new_bits != 0
+                    && post_source_fired(subscriber, source, interests)
+                {
+                    woke += 1;
                 }
             }
         }
@@ -350,6 +365,7 @@ impl RawQueue {
         }
     }
 
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
     fn take_ready(&self, id: SubscriptionId) -> Result<bool, RawSubscriptionError> {
         let state = self.state.lock();
         if state.terminal {
@@ -461,11 +477,7 @@ impl<E: WireEventSet> DeclaredQueue<E> {
     }
 
     /// Compatibility bridge: see [`RawQueue::subscribe_with_waker`].
-    pub fn subscribe_with_waker(
-        &self,
-        interest: E,
-        waker: Waker,
-    ) -> DeclaredQueueSubscription<E> {
+    pub fn subscribe_with_waker(&self, interest: E, waker: Waker) -> DeclaredQueueSubscription<E> {
         let bits = self
             .validated_bits(interest)
             .expect("typed bus queue subscription must use declared bits");
@@ -578,12 +590,7 @@ impl<E: WireEventSet> DeclaredQueueSubscription<E> {
         self.raw.unsubscribe()
     }
 
-    pub fn update(
-        &mut self,
-        interest: E,
-        mailbox: Weak<TaskMailbox>,
-        generation: WaitGeneration,
-    ) {
+    pub fn update(&mut self, interest: E, mailbox: Weak<TaskMailbox>, generation: WaitGeneration) {
         let _ = self.try_update(interest, mailbox, generation);
     }
 
@@ -591,7 +598,7 @@ impl<E: WireEventSet> DeclaredQueueSubscription<E> {
     pub fn update_with_waker(&mut self, interest: E, waker: Waker) {
         let bits = interest.bits();
         let _ = self.declaration.validate_bits(bits);
-        let _ = self.raw.update_with_waker(bits, waker);
+        self.raw.update_with_waker(bits, waker);
     }
 
     pub fn try_update(
@@ -677,7 +684,10 @@ impl RawQueueSubscription {
         let mailbox = Arc::new(TaskMailbox::new());
         mailbox.register_waker(waker);
         let gen = mailbox.next_generation();
-        self.try_update(interest, Arc::downgrade(&mailbox), gen)
+        self.try_update(interest, Arc::downgrade(&mailbox), gen)?;
+        self._waker_mailbox = Some(mailbox);
+        self.terminal_observed = false;
+        Ok(())
     }
 
     pub fn try_update(
@@ -687,7 +697,9 @@ impl RawQueueSubscription {
         generation: WaitGeneration,
     ) -> Result<(), RawSubscriptionError> {
         match self.id {
-            Some(id) => self.queue.update_subscription(id, interest, mailbox, generation),
+            Some(id) => self
+                .queue
+                .update_subscription(id, interest, mailbox, generation),
             None if self.terminal_snapshot => Err(RawSubscriptionError::Terminal),
             None => Err(RawSubscriptionError::Unsubscribed),
         }
@@ -695,21 +707,42 @@ impl RawQueueSubscription {
 
     /// Deprecated: readiness is now delivered via [`TaskMailbox`]
     /// events. The mailbox driver filters events with
-    /// [`crate::wake::mailbox::ActiveWait::matches`]; this method
-    /// always returns `false`. Callers should migrate to polling
-    /// their mailbox instead.
+    /// [`crate::wake::mailbox::ActiveWait::matches`]. For legacy
+    /// callers that constructed the subscription via
+    /// `subscribe_with_waker`, this method drains the embedded
+    /// mailbox and returns `true` if a `SourceFired` event was
+    /// observed. Callers should migrate to polling their mailbox
+    /// directly.
     #[deprecated(note = "use TaskMailbox::poll() + ActiveWait::matches() instead")]
     pub fn take_ready(&mut self) -> bool {
+        if let Some(mb) = self._waker_mailbox.as_ref() {
+            while let Some(event) = mb.poll() {
+                if matches!(
+                    event,
+                    crate::wake::mailbox::MailboxEvent::SourceFired { .. }
+                ) {
+                    return true;
+                }
+            }
+        }
+        if !self.terminal_observed && self.state() == RawSubscriptionState::Terminal {
+            self.terminal_observed = true;
+            return true;
+        }
         false
     }
 
     /// Deprecated: see [`Self::take_ready`].
     #[deprecated(note = "use TaskMailbox::poll() + ActiveWait::matches() instead")]
     pub fn try_take_ready(&mut self) -> Result<bool, RawSubscriptionError> {
-        match self.id {
-            Some(_) => Ok(false),
-            None if self.terminal_snapshot => Err(RawSubscriptionError::Terminal),
-            None => Err(RawSubscriptionError::Unsubscribed),
+        match self.state() {
+            RawSubscriptionState::Subscribed =>
+            {
+                #[allow(deprecated)]
+                Ok(self.take_ready())
+            }
+            RawSubscriptionState::Terminal => Err(RawSubscriptionError::Terminal),
+            RawSubscriptionState::Unsubscribed => Err(RawSubscriptionError::Unsubscribed),
         }
     }
 }

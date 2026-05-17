@@ -257,9 +257,7 @@ impl TimerWheel {
                 let entry = state.entries.remove(i);
                 if let Some(ref mb_weak) = entry.mailbox {
                     if let Some(mb) = mb_weak.upgrade() {
-                        let _ = mb.post(MailboxEvent::TimerFired {
-                            token: entry.token,
-                        });
+                        let _ = mb.post(MailboxEvent::TimerFired { token: entry.token });
                     }
                 }
             } else {
