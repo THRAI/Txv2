@@ -126,6 +126,10 @@ use io_uring::*;
 mod signalfd;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 use signalfd::*;
+mod eventfd;
+use eventfd::*;
+mod timerfd;
+use timerfd::*;
 
 mod ctx;
 pub use ctx::*;
@@ -164,7 +168,8 @@ pub use numbers::{
     NR_RT_SIGRETURN, NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT, NR_SIGALTSTACK, NR_PIDFD_OPEN,
     NR_PIDFD_SEND_SIGNAL, NR_SETGID, NR_SETPGID, NR_SETREGID,
     NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETSID, NR_SETUID, NR_SET_ROBUST_LIST,
-    NR_SET_TID_ADDRESS, NR_SIGNALFD, NR_SIGNALFD4, NR_STATFS, NR_STATX, NR_SYMLINKAT, NR_SYNC, NR_SYNCFS, NR_TGKILL, NR_TIMES,
+    NR_SET_TID_ADDRESS, NR_SIGNALFD, NR_SIGNALFD4, NR_EVENTFD2, NR_TIMERFD_CREATE, NR_TIMERFD_SETTIME, NR_TIMERFD_GETTIME,
+    NR_STATFS, NR_STATX, NR_SYMLINKAT, NR_SYNC, NR_SYNCFS, NR_TGKILL, NR_TIMES,
     NR_TKILL, NR_TRUNCATE, NR_UMASK, NR_UMOUNT2, NR_UNAME, NR_UNLINKAT, NR_USERFAULTFD, NR_UTIMENSAT, NR_WAIT4,
     NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK,
     O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE,
@@ -614,6 +619,32 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
             req.args[1],
             req.args[2],
             req.args[3] as u32,
+            ctx,
+        ),
+        // eventfd2(init_val, flags) — mints an eventfd.
+        nr if nr == NR_EVENTFD2 => sys_eventfd2(
+            req.args[0],
+            req.args[1] as u32,
+            ctx,
+        ),
+        // timerfd_create(clockid, flags) — mints a timerfd.
+        nr if nr == NR_TIMERFD_CREATE => sys_timerfd_create(
+            req.args[0] as u32,
+            req.args[1] as u32,
+            ctx,
+        ),
+        // timerfd_settime(fd, flags, new_value, old_value).
+        nr if nr == NR_TIMERFD_SETTIME => sys_timerfd_settime::<P>(
+            req.args[0] as u32,
+            req.args[1] as u32,
+            req.args[2],
+            req.args[3],
+            ctx,
+        ),
+        // timerfd_gettime(fd, curr_value).
+        nr if nr == NR_TIMERFD_GETTIME => sys_timerfd_gettime(
+            req.args[0] as u32,
+            req.args[2],
             ctx,
         ),
         _ => SyscallResult::Error(ENOSYS_VALUE),
