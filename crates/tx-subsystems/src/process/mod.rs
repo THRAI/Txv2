@@ -8,6 +8,7 @@
 pub mod adapter;
 pub mod exec_prep;
 pub mod execution;
+pub mod numbers;
 pub mod structure;
 pub mod topology;
 
@@ -25,7 +26,7 @@ pub use execution::{
     SetpgidOp, SetsidOp, SetpgidError, SetsidError, WaitError, WaitTarget,
 };
 pub use structure::{
-    allocate_pid, ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,
+    ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,
     Sid, EXIT_SOURCE_CHILD_ZOMBIFIED,
 };
 pub use topology::{

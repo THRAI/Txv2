@@ -41,11 +41,13 @@
 //! `Ok(())`. There is no `?`, no `.await`, and no fallible call
 //! between the Phase-6 swap and the function's return.
 
+use core::sync::atomic::Ordering;
 use alloc::vec::Vec;
 
 use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
 use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
 use tx_subsystems::execution::Errno;
+use tx_subsystems::process::adapter::wait_routing::Mask;
 use tx_subsystems::mount::MountFlags;
 use tx_subsystems::page_backed::{read_exact_at, PageContainer};
 use tx_subsystems::process::{
@@ -853,6 +855,9 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     step_close_cloexec_fds(process);
     step_reset_signal_dispositions_for_exec(process);
     step_install_brk_for_exec(process, new_brk_base);
+    // vfork completion: if the parent is waiting on CLONE_VFORK,
+    // unblock it now that exec has completed.
+    process.fire_exit_source(Mask::from_bits(1));
 
     // ===== Phase 8 — userspace re-entry ==============================
     //
