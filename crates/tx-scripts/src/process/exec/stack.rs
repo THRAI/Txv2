@@ -63,7 +63,6 @@ const AT_FLAGS: u64 = 8;
 const AT_SYSINFO_EHDR: u64 = 33;
 pub const CLKTCK_VALUE: u64 = 100;
 
-
 /// Auxv pair size in bytes (`a_type: u64, a_val: u64`).
 const AUXV_PAIR_SIZE: usize = 16;
 

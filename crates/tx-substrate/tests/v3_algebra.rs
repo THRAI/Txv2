@@ -187,7 +187,7 @@ fn yield_shape_has_onwaitsource_variant_with_source_and_interests() {
         }
         YieldShape::OnAgent { .. } => panic!("expected OnWaitSource, got OnAgent"),
         YieldShape::OnTimer { .. } => panic!("expected OnWaitSource, got OnTimer"),
-            YieldShape::OnEdge { .. } => panic!("expected OnWaitSource, got OnEdge"),
+        YieldShape::OnEdge { .. } => panic!("expected OnWaitSource, got OnEdge"),
     }
 }
 

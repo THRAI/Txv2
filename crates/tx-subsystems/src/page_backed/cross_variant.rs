@@ -31,11 +31,11 @@ pub fn step_copy_file_range(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-        // observe
-        // upgrade
-        // reserve
-        // commit
-        // publish
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3};
     if len == 0 {
         return V3::done(0);
@@ -286,10 +286,8 @@ mod step_op_wraps {
             .lock()
             .expect("page-backed cross-variant op test lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let src = anon_pc(1);
         let dst = anon_pc(1);
-        drop(guard);
         let mut op = CopyFileRangeOp {
             in_pc: &src,
             in_offset: 0,

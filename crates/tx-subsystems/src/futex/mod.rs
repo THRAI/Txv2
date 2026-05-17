@@ -678,7 +678,6 @@ mod tests {
                 }
                 other => panic!("expected Yield::OnWaitSource, got {other:?}"),
             }
-            drop(guard);
         }
 
         #[test]
@@ -687,10 +686,7 @@ mod tests {
             // Zero uaddr → EINVAL. Output type is u32, not ().
             // FutexWakeOp acquires its own guard inside step() per
             // STEP_MODEL_v2 §1; outer guard would nest (EBR-7).
-            let mut op = FutexWakeOp {
-                uaddr: 0,
-                n: 1,
-            };
+            let mut op = FutexWakeOp { uaddr: 0, n: 1 };
             let mut ctx = ScriptCtx::<ProcessIdentity>::new();
             let outcome: StepOutcome<u32, NoProgress> = op.step(&mut ctx);
             assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));

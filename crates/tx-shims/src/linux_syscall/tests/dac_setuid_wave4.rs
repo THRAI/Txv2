@@ -102,7 +102,11 @@ fn build_tmpfs_root() -> TmpfsRoot {
     .expect("mount identity");
 
     let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
-    TmpfsRoot { dentry: root_dentry, tmpfs, _mount: mount }
+    TmpfsRoot {
+        dentry: root_dentry,
+        tmpfs,
+        _mount: mount,
+    }
 }
 
 /// Devfs analog of `build_tmpfs_root`. Mounts the shipping

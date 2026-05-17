@@ -275,7 +275,6 @@ pub(super) fn sys_fchownat<P: PmapIf>(
     }
 }
 
-
 /// `faccessat(dirfd, path, mode)`. Linux RV64 generic ABI. POSIX
 /// `access(2)` shape: the access check uses the caller's **real**
 /// uid/gid (not effective). Implemented in terms of
@@ -516,7 +515,9 @@ pub(super) fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     }
 
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = GetcwdOp { target: &ctx.process };
+    let mut op = GetcwdOp {
+        target: &ctx.process,
+    };
     let path = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(Some(p)) => p,
         Ok(None) => return SyscallResult::Error(ENOENT_VALUE),

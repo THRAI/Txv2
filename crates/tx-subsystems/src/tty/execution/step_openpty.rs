@@ -186,11 +186,9 @@ mod step_op_wraps {
     #[test]
     fn openpty_op_returns_done_with_pair() {
         let _setup = setup();
-        let guard = step_engine::guard();
         let mut op = OpenPtyOp;
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(_) => {}
             other => panic!("expected Done(OpenPtyOutcome), got {other:?}"),

@@ -217,7 +217,6 @@ fn dispatch_pwrite(
 /// defensive against unexpected Yield/Err shapes.
 fn run_lseek_set(file: &Cap<OpenFile>, offset: i64) -> bool {
     let mut script_ctx = crate::KernelScriptCtx::new();
-    let guard = step_engine::guard();
     let mut op = OpenFileLseekOp {
         file,
         offset,

@@ -696,7 +696,7 @@ mod tests {
     // delegates to the matching free fn. Compile-check is the primary
     // value.
     mod step_op_wraps {
-        use super::super::{step_engine, WriteForCallerOp, WriteOp};
+        use super::super::{WriteForCallerOp, WriteOp};
         use super::{alloc_tty_with, setup, COMPLETING_BINDING};
         use crate::tty::adapter::step_engine::{
             PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome as V3,
@@ -712,14 +712,12 @@ mod tests {
                 "ttyV3-op-empty",
                 TtyPayload::new_hardware(&COMPLETING_BINDING),
             );
-            let guard = step_engine::guard();
             let mut op = WriteOp {
                 tty: &tty,
                 bytes: b"",
             };
             let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let outcome = op.step(&mut ctx);
-            drop(guard);
             match outcome {
                 V3::Done(0) => {}
                 other => panic!("expected Done(0), got {other:?}"),
@@ -735,14 +733,12 @@ mod tests {
                 "ttyV3-op-done",
                 TtyPayload::new_hardware(&COMPLETING_BINDING),
             );
-            let guard = step_engine::guard();
             let mut op = WriteOp {
                 tty: &tty,
                 bytes: b"hello",
             };
             let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let outcome = op.step(&mut ctx);
-            drop(guard);
             match outcome {
                 V3::Done(5) => {}
                 other => panic!("expected Done(5), got {other:?}"),
@@ -758,7 +754,6 @@ mod tests {
                 "ttyV3-op-caller-empty",
                 TtyPayload::new_hardware(&COMPLETING_BINDING),
             );
-            let guard = step_engine::guard();
             let caller = super::super::super::IoctlCaller::new(1, 1);
             let mut op = WriteForCallerOp {
                 tty: &tty,
@@ -767,7 +762,6 @@ mod tests {
             };
             let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let outcome = op.step(&mut ctx);
-            drop(guard);
             match outcome {
                 V3::Done(0) => {}
                 other => panic!("expected Done(0), got {other:?}"),
@@ -783,7 +777,6 @@ mod tests {
                 "ttyV3-op-caller-match",
                 TtyPayload::new_hardware(&COMPLETING_BINDING),
             );
-            let guard = step_engine::guard();
             let caller = super::super::super::IoctlCaller::new(1, 1);
             let mut op = WriteForCallerOp {
                 tty: &tty,
@@ -796,7 +789,6 @@ mod tests {
             // same tty without re-fixturing, so the wrap outcome is
             // checked against an expected Done(2) (CompletingOps reports
             // the queued bytes).
-            drop(guard);
             match wrap_outcome {
                 V3::Done(2) => {}
                 other => panic!("expected Done(2), got {other:?}"),

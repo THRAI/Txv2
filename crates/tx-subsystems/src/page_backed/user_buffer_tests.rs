@@ -396,12 +396,10 @@ mod step_op_wraps {
             2,
         );
         let fixture = UserBufferFixture::new(0x70_0000, 1);
-        let guard = step_engine::guard();
 
         let payload: Vec<u8> = (0u8..200).collect();
         fixture.seed_user_bytes(&payload);
         let writer = open_file_for_pc(&pc);
-        drop(guard);
         let mut op = WriteFromUserOp {
             pc: &pc,
             of: &writer,
@@ -477,9 +475,7 @@ mod step_op_wraps {
             1,
         );
         let fixture = UserBufferFixture::new(0x90_0000, 1);
-        let guard = step_engine::guard();
         let reader = open_file_for_pc(&pc);
-        drop(guard);
         let mut op = ReadToUserOp {
             pc: &pc,
             of: &reader,
@@ -505,10 +501,8 @@ mod step_op_wraps {
             1,
         );
         let empty_aspace = AddressSpace::new();
-        let guard = step_engine::guard();
         let dangling = UserPtr::<u8>::new(0xA0_0000);
         let writer = open_file_for_pc(&pc);
-        drop(guard);
         let mut op = WriteFromUserOp {
             pc: &pc,
             of: &writer,

@@ -758,7 +758,6 @@ mod step_op_wraps {
     fn read_op_advances_offset_through_step() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -767,7 +766,6 @@ mod step_op_wraps {
         );
         let of = open_file_for_pc(&pc);
         of.set_offset((crate::vm::USER_PAGE_SIZE - 8) as u64);
-        drop(guard);
         let mut op = ReadOp {
             pc: &pc,
             of: &of,
@@ -782,7 +780,6 @@ mod step_op_wraps {
     fn read_op_eof_returns_done_zero() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -791,7 +788,6 @@ mod step_op_wraps {
         );
         let of = open_file_for_pc(&pc);
         of.set_offset(crate::vm::USER_PAGE_SIZE as u64);
-        drop(guard);
         let mut op = ReadOp {
             pc: &pc,
             of: &of,
@@ -806,7 +802,6 @@ mod step_op_wraps {
     fn write_op_marks_dirty_and_advances_offset() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -815,7 +810,6 @@ mod step_op_wraps {
         );
         let of = open_file_for_pc(&pc);
         let len = crate::vm::USER_PAGE_SIZE + 17;
-        drop(guard);
         let mut op = WriteOp {
             pc: &pc,
             of: &of,
@@ -832,7 +826,6 @@ mod step_op_wraps {
     fn write_op_rejects_device_backing() {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup_host_substrate();
-        let guard = step_engine::guard();
         let pc = PageContainer::new(
             PageContainerKind::Device {
                 base_ppn: Ppn(0xface_0000),
@@ -841,7 +834,6 @@ mod step_op_wraps {
             1,
         );
         let of = open_file_for_pc(&pc);
-        drop(guard);
         let mut op = WriteOp {
             pc: &pc,
             of: &of,

@@ -12,9 +12,9 @@ use crate::adapter::bus_wire::{
     WireEventSet,
 };
 use crate::interrupt::{InterruptSource, NoInterrupts};
-use alloc::sync::Arc;
-use tx_substrate::wake::mailbox::{TaskMailbox, WaitGeneration};
 use crate::timer::{DeadlineFuture, TimerQueue};
+use alloc::sync::Arc;
+use tx_substrate::wake::mailbox::TaskMailbox;
 
 /// Bit mask naming the wait events a task cares about on a channel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -573,16 +573,20 @@ impl Future for WaitFuture {
             if this.mailbox.poll().is_some() {
                 true
             } else {
-                subscription.update(this.mask.bits(), Arc::downgrade(&this.mailbox), this.mailbox.next_generation());
+                subscription.update(
+                    this.mask.bits(),
+                    Arc::downgrade(&this.mailbox),
+                    this.mailbox.next_generation(),
+                );
                 false
             }
         } else {
             this.mailbox.register_waker(cx.waker().clone());
-            this.subscription = Some(
-                this.channel
-                    .port
-                    .subscribe(this.mask.bits(), Arc::downgrade(&this.mailbox), this.mailbox.next_generation()),
-            );
+            this.subscription = Some(this.channel.port.subscribe(
+                this.mask.bits(),
+                Arc::downgrade(&this.mailbox),
+                this.mailbox.next_generation(),
+            ));
             false
         };
 
@@ -619,16 +623,20 @@ where
             if this.mailbox.poll().is_some() {
                 true
             } else {
-                subscription.update(this.interest, Arc::downgrade(&this.mailbox), this.mailbox.next_generation());
+                subscription.update(
+                    this.interest,
+                    Arc::downgrade(&this.mailbox),
+                    this.mailbox.next_generation(),
+                );
                 false
             }
         } else {
             this.mailbox.register_waker(cx.waker().clone());
-            this.subscription = Some(
-                this.channel
-                    .port
-                    .subscribe(this.interest, Arc::downgrade(&this.mailbox), this.mailbox.next_generation()),
-            );
+            this.subscription = Some(this.channel.port.subscribe(
+                this.interest,
+                Arc::downgrade(&this.mailbox),
+                this.mailbox.next_generation(),
+            ));
             false
         };
 
@@ -665,16 +673,20 @@ where
             if this.mailbox.poll().is_some() {
                 true
             } else {
-                subscription.update(this.interest, Arc::downgrade(&this.mailbox), this.mailbox.next_generation());
+                subscription.update(
+                    this.interest,
+                    Arc::downgrade(&this.mailbox),
+                    this.mailbox.next_generation(),
+                );
                 false
             }
         } else {
             this.mailbox.register_waker(cx.waker().clone());
-            this.subscription = Some(
-                this.channel
-                    .queue
-                    .subscribe(this.interest, Arc::downgrade(&this.mailbox), this.mailbox.next_generation()),
-            );
+            this.subscription = Some(this.channel.queue.subscribe(
+                this.interest,
+                Arc::downgrade(&this.mailbox),
+                this.mailbox.next_generation(),
+            ));
             false
         };
 

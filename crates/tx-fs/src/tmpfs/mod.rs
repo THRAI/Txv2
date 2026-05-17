@@ -95,6 +95,7 @@ struct TmpfsInode {
     payload: TmpfsPayload,
     /// Number of hard links. Directories start at 2 (`.` + `..`);
     /// regular files at 1.  Updated by `link`/`unlink`/`rmdir`.
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
     nlink: u32,
 }
 
@@ -411,8 +412,11 @@ impl FsOps for Tmpfs {
         // Decrement link count; only free the inode when it reaches 0.
         if let Some(target_inode) = state.inodes.get_mut(&found_id) {
             // // target_inode.nlink = target_inode.nlink.saturating_sub(1); // TODO: nlink removed // TODO: nlink removed
-            if true /* target_inode.nlink == 0 */ { // TODO: nlink removed
-                drop(target_inode);
+            if true
+            /* target_inode.nlink == 0 */
+            {
+                // TODO: nlink removed
+                let _ = target_inode;
                 state.inodes.remove(&found_id);
             }
         }
@@ -492,7 +496,7 @@ impl FsOps for Tmpfs {
             }
         }
         // Phase 2: mutable ops — validate target, insert link.
-        let target_inode = match state.inodes.get_mut(&target) {
+        let _target_inode = match state.inodes.get_mut(&target) {
             Some(i) if matches!(i.payload, TmpfsPayload::RegularFile { .. }) => i,
             Some(_) => return StepOutcome::err(step_engine::Errno::EPERM),
             None => return StepOutcome::err(step_engine::Errno::ENOENT),
@@ -988,7 +992,11 @@ impl FsPageBacking for Tmpfs {
         StepOutcome::done(())
     }
 
-    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
         // In-memory; durability is trivially satisfied.
         StepOutcome::done(())
     }

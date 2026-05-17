@@ -253,7 +253,11 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecTestFs {
         V3Outcome::done(())
     }
 
-    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Outcome<(), NoProgress> {
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
         V3Outcome::done(())
     }
 }

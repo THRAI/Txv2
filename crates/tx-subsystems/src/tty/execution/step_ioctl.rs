@@ -901,13 +901,9 @@ mod step_op_wraps {
     fn tcgets_op_returns_done_on_live_tty() {
         let _setup = setup();
         let tty = alloc_tty(300, "ttyV3-tcgets-op");
-        let guard = step_engine::guard();
-        let mut op = IoctlTcgetsOp {
-            tty: &tty,
-        };
+        let mut op = IoctlTcgetsOp { tty: &tty };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(_) => {}
             other => panic!("expected Done(termios), got {other:?}"),
@@ -919,13 +915,9 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_tty(301, "ttyV3-tcgets-dead");
         let _ = tty.take_payload();
-        let guard = step_engine::guard();
-        let mut op = IoctlTcgetsOp {
-            tty: &tty,
-        };
+        let mut op = IoctlTcgetsOp { tty: &tty };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Err(step_engine::Errno::EIO) => {}
             other => panic!("expected Err(EIO), got {other:?}"),
@@ -936,13 +928,9 @@ mod step_op_wraps {
     fn tiocgpgrp_op_unbound_returns_einval() {
         let _setup = setup();
         let tty = alloc_tty(302, "ttyV3-tiocgpgrp-unbound");
-        let guard = step_engine::guard();
-        let mut op = IoctlTiocgpgrpOp {
-            tty: &tty,
-        };
+        let mut op = IoctlTiocgpgrpOp { tty: &tty };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Err(step_engine::Errno::EINVAL) => {}
             other => panic!("expected Err(EINVAL), got {other:?}"),
@@ -953,13 +941,9 @@ mod step_op_wraps {
     fn tiocgwinsz_op_returns_done() {
         let _setup = setup();
         let tty = alloc_tty(303, "ttyV3-tiocgwinsz-op");
-        let guard = step_engine::guard();
-        let mut op = IoctlTiocgwinszOp {
-            tty: &tty,
-        };
+        let mut op = IoctlTiocgwinszOp { tty: &tty };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(_) => {}
             other => panic!("expected Done(winsize), got {other:?}"),
@@ -970,14 +954,12 @@ mod step_op_wraps {
     fn tiocswinsz_op_returns_done_and_fires_session_ctl() {
         let _setup = setup();
         let tty = alloc_tty(304, "ttyV3-tiocswinsz-op");
-        let guard = step_engine::guard();
         let mut op = IoctlTiocswinszOp {
             tty: &tty,
             winsize: Winsize::default(),
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(side) => assert!(side.session_ctl_fired),
             other => panic!("expected Done(side_effect), got {other:?}"),
@@ -989,14 +971,9 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_tty(305, "ttyV3-tiocnotty-op");
         let caller = IoctlCaller::new(1, 1).as_session_leader();
-        let guard = step_engine::guard();
-        let mut op = IoctlTiocnottyOp {
-            tty: &tty,
-            caller,
-        };
+        let mut op = IoctlTiocnottyOp { tty: &tty, caller };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Err(step_engine::Errno::EINVAL) => {}
             other => panic!("expected Err(EINVAL), got {other:?}"),

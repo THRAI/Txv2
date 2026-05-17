@@ -273,6 +273,7 @@ fn open_console_for_init_legacy() -> Cap<OpenFile> {
 /// `FsOps` call site is synchronous in-memory), so this loop
 /// terminates on the first poll for the bootstrap path; we cap at
 /// 1024 polls to surface a runaway future during development.
+#[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
 fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -482,10 +483,7 @@ impl FsOps for Devfs {
                 Ok(de) => de,
                 Err(err) => return StepOutcome::err(err.into()),
             };
-            return StepOutcome::done(Some((
-                dir_entry,
-                DirCursor::from_u64(cursor.as_u64() + 1),
-            )));
+            return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
         }
         if index == entries.len() {
             let dir_entry = match DirEntry::new(
@@ -496,10 +494,7 @@ impl FsOps for Devfs {
                 Ok(de) => de,
                 Err(err) => return StepOutcome::err(err.into()),
             };
-            return StepOutcome::done(Some((
-                dir_entry,
-                DirCursor::from_u64(cursor.as_u64() + 1),
-            )));
+            return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
         }
         StepOutcome::done(None)
     }
@@ -622,7 +617,11 @@ impl FsPageBacking for Devfs {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 
-    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    fn fsync_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
         StepOutcome::err(Errno::ENOSYS.into())
     }
 

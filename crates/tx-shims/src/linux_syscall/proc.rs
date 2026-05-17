@@ -508,7 +508,10 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 // Should not reach here — op yields on NoneReady.
                 // Fall through to the exit_source wait.
             }
-            V3Out::Yield { shape: YieldShape::OnWaitSource { source, .. }, .. } => {
+            V3Out::Yield {
+                shape: YieldShape::OnWaitSource { source, .. },
+                ..
+            } => {
                 let token = tx_subsystems::execution::WaitToken::new(source.raw(), 1);
                 if let Some(future) = wait_source::wait_on_token(token) {
                     future.await;
@@ -615,7 +618,9 @@ pub(super) fn sys_getsid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
 /// follow-up (`TODO(phase-process-topology)`).
 pub(super) fn sys_setsid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = SetsidOp { target: &ctx.process };
+    let mut op = SetsidOp {
+        target: &ctx.process,
+    };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(sid) => SyscallResult::Return(sid.0 as i64),
         Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),

@@ -41,10 +41,7 @@ const MAX_ASYNC_STEP_SIG: usize = 0; // signalfd/userfaultfd renamed to sys_* �
 // V4 vocabulary identifiers — every occurrence must eventually go to zero.
 // ---------------------------------------------------------------------------
 
-const V4_OUTCOME_VARIANTS: &[&str] = &[
-    "Advanced",
-    "AdvancedThenBlocked",
-];
+const V4_OUTCOME_VARIANTS: &[&str] = &["Advanced", "AdvancedThenBlocked"];
 
 const V4_YIELD_VOCABULARY: &[&str] = &[
     "WakeCarrier",
@@ -77,7 +74,8 @@ pub(crate) fn lint_invariants_v4_vocabulary(root: &Path) -> Result<()> {
 
     let identifiers = v4_identifiers();
     let mut hits: Vec<String> = Vec::new();
-    let mut per_id_counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut per_id_counts: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
 
     for dir in &target_dirs {
         let dir_path = root.join(dir);
@@ -95,7 +93,11 @@ pub(crate) fn lint_invariants_v4_vocabulary(root: &Path) -> Result<()> {
                 let trimmed = line.trim();
 
                 // Skip pure comments and doc comments
-                if trimmed.starts_with("//") || trimmed.starts_with("///") || trimmed.starts_with("/*") || trimmed.starts_with("*") {
+                if trimmed.starts_with("//")
+                    || trimmed.starts_with("///")
+                    || trimmed.starts_with("/*")
+                    || trimmed.starts_with("*")
+                {
                     continue;
                 }
 
@@ -111,10 +113,7 @@ pub(crate) fn lint_invariants_v4_vocabulary(root: &Path) -> Result<()> {
                         // Be specific: `Blocked(` to avoid matching unrelated
                         // words like "unblocked". For the others, the PascalCase
                         // is distinctive enough in Rust code.
-                        hits.push(format!(
-                            "{rel}:{} — v4 identifier `{id}`",
-                            line_num + 1
-                        ));
+                        hits.push(format!("{rel}:{} — v4 identifier `{id}`", line_num + 1));
                         *per_id_counts.entry(id).or_insert(0) += 1;
                         break; // one hit per line
                     }
@@ -134,7 +133,11 @@ pub(crate) fn lint_invariants_v4_vocabulary(root: &Path) -> Result<()> {
         println!("  {id:.<30} {count:>4}");
     }
 
-    let status = if total > MAX_V4_VOCABULARY { "OVER" } else { "ok" };
+    let status = if total > MAX_V4_VOCABULARY {
+        "OVER"
+    } else {
+        "ok"
+    };
     println!(
         "total v4 identifiers: {:>4}  (ceiling {})  {}",
         total, MAX_V4_VOCABULARY, status
@@ -192,8 +195,8 @@ pub(crate) fn lint_invariants_step_no_await(root: &Path) -> Result<()> {
                 let line = lines[i].trim();
 
                 // Match step function definitions: `fn step(` or `fn step_*`
-                let is_step_fn = (line.contains("fn step(") || line.contains("fn step_"))
-                    && line.contains('(');
+                let is_step_fn =
+                    (line.contains("fn step(") || line.contains("fn step_")) && line.contains('(');
 
                 if is_step_fn && !line.contains("// A-3") {
                     // Find function body
@@ -253,7 +256,11 @@ pub(crate) fn lint_invariants_step_no_await(root: &Path) -> Result<()> {
     println!("Invariants Lint — step-no-await (A-3)");
     println!("=======================================");
 
-    let status = if count > MAX_AWAIT_IN_STEP { "OVER" } else { "ok" };
+    let status = if count > MAX_AWAIT_IN_STEP {
+        "OVER"
+    } else {
+        "ok"
+    };
     println!(
         ".await in step fn bodies: {:>4}  (ceiling {})  {}",
         count, MAX_AWAIT_IN_STEP, status
@@ -340,7 +347,11 @@ pub(crate) fn lint_invariants_step_sync_signature(root: &Path) -> Result<()> {
     println!("Invariants Lint — step-sync-signature (STEP-2)");
     println!("================================================");
 
-    let status = if count > MAX_ASYNC_STEP_SIG { "OVER" } else { "ok" };
+    let status = if count > MAX_ASYNC_STEP_SIG {
+        "OVER"
+    } else {
+        "ok"
+    };
     println!(
         "async step fn signatures: {:>4}  (ceiling {})  {}",
         count, MAX_ASYNC_STEP_SIG, status

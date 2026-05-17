@@ -625,10 +625,7 @@ pub enum KillOutcome {
 ///    SIGBUS, SIGFPE, SIGTRAP, SIGSYS); other signums panic.
 ///
 /// See: `txdoc:SIGNAL-V1-S20-SYNCHRONOUS-FAULT`.
-pub fn deliver_synchronous_fault(
-    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
-    sig: Signum,
-) {
+pub fn deliver_synchronous_fault(thread: &Cap<crate::thread_runtime::ThreadIdentity>, sig: Signum) {
     let guard = step_engine::guard();
     if let Some(process) = thread.owner_proc.upgrade(&guard) {
         drop(guard);
@@ -661,10 +658,7 @@ pub fn deliver_synchronous_fault(
 /// `Thread` targets are TODO.
 ///
 /// See: `txdoc:SIGNAL-V1-S12-DELIVER-POSIX-SIGNAL`.
-pub fn deliver_posix_signal(
-    target: SignalTarget,
-    sig: Signum,
-) -> KillOutcome {
+pub fn deliver_posix_signal(target: SignalTarget, sig: Signum) -> KillOutcome {
     let cap = match target {
         SignalTarget::Process(cap) => cap,
         SignalTarget::ProcessGroup(_group) => {
@@ -673,7 +667,7 @@ pub fn deliver_posix_signal(
         }
         SignalTarget::Thread(thread_cap) => {
             // Upgrade to owning process cap for signal routing.
-            let guard = step_engine::guard();
+            let _guard = step_engine::guard();
             match thread_cap.upgrade_owner_proc() {
                 Some(proc) => proc,
                 None => return KillOutcome::NoLiveThread,
@@ -976,7 +970,7 @@ pub fn step_kill_pgrp(pgrp: &Cap<ProcessGroup>, sig: Signum) -> usize {
     let catchable = !is_gewalt(sig);
     let members = pgrp.members.snapshot_live(&guard);
     for member in &members {
-        if step_kill_process(&member, sig, None) == KillOutcome::Delivered {
+        if step_kill_process(member, sig, None) == KillOutcome::Delivered {
             // Catchable only: mirror onto group_pending so the
             // delivery step can recognise group-targeted posts.
             // Gewalt bypasses pending queues entirely.
@@ -1352,7 +1346,9 @@ mod step_op_wraps {
         let _g = setup();
         let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
         let mut op = KillProcessOp {
-            target: proc_cap.clone(), sig: Signum::SIGTERM, info: None,
+            target: proc_cap.clone(),
+            sig: Signum::SIGTERM,
+            info: None,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);

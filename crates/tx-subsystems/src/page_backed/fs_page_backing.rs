@@ -54,7 +54,11 @@ pub trait FsPageBacking: Send + Sync + 'static {
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress>;
 
-    fn fsync_file(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<(), NoProgress>;
+    fn fsync_file(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress>;
 
     /// Filesystem-wide flush, the storage backend for `syncfs(2)`.
     /// Default delegates to `fsync_file(ROOT)`; journaling filesystems

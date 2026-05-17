@@ -6,22 +6,19 @@
 
 use tx_subsystems::execution::Errno;
 use tx_subsystems::timerfd::{
-    timerfd_create, timerfd_settime, step_timerfd_read, ItimerSpec, TimerFd,
-    ITIMERSPEC_BYTES, TFD_TIMER_ABSTIME,
+    step_timerfd_read, timerfd_settime, ItimerSpec, TimerFd, ITIMERSPEC_BYTES,
 };
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::wait_source;
 
 use super::numbers::{
+    CLOCK_MONOTONIC, CLOCK_REALTIME, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME,
     TFD_CLOEXEC_FLAG, TFD_NONBLOCK_FLAG, TFD_TIMER_ABSTIME_FLAG,
-    NR_TIMERFD_CREATE, NR_TIMERFD_SETTIME, NR_TIMERFD_GETTIME,
-    CLOCK_MONOTONIC, CLOCK_REALTIME,
 };
 use super::{
-    bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user, errno_to_i32,
-    SyscallCtx, SyscallResult,
-    EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE, EFAULT_VALUE,
+    bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user, errno_to_i32, SyscallCtx,
+    SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{self as step_engine};
 
@@ -120,7 +117,7 @@ pub(super) fn sys_timerfd_settime<'a, P: super::TimeIf>(
     let abstime = (flags & TFD_TIMER_ABSTIME_FLAG) != 0;
 
     // Read new_value from userspace.
-    let mut new_bytes = [0u8; ITIMERSPEC_BYTES];
+    let new_bytes = [0u8; ITIMERSPEC_BYTES];
     if let Err(errno) = bootstrap_read_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, new_value_ptr) {
         return SyscallResult::Error(errno_to_i32(errno));
     }
@@ -141,7 +138,9 @@ pub(super) fn sys_timerfd_settime<'a, P: super::TimeIf>(
     // Write old_value back to userspace if requested.
     if let Some(old) = old_spec {
         let old_bytes = old.to_bytes();
-        if let Err(errno) = bootstrap_write_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, old_value_ptr, old_bytes) {
+        if let Err(errno) =
+            bootstrap_write_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, old_value_ptr, old_bytes)
+        {
             return SyscallResult::Error(errno_to_i32(errno));
         }
     }
@@ -179,7 +178,9 @@ pub(super) fn sys_timerfd_gettime<'a>(
         it_value_ns: tfd_cap.deadline_ns(),
     };
     let bytes = spec.to_bytes();
-    if let Err(errno) = bootstrap_write_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, curr_value_ptr, bytes) {
+    if let Err(errno) =
+        bootstrap_write_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, curr_value_ptr, bytes)
+    {
         return SyscallResult::Error(errno_to_i32(errno));
     }
     SyscallResult::Return(0)
@@ -223,9 +224,7 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
         use step_engine::{StepOutcome as V3Out, YieldShape};
         match outcome {
             V3Out::Done(n) => {
-                if let Err(errno) =
-                    bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..n])
-                {
+                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..n]) {
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
                 return SyscallResult::Return(n as i64);

@@ -224,14 +224,12 @@ mod step_op_wraps {
     fn poll_hardware_input_op_zero_max_bytes_returns_done_default() {
         let _setup = setup();
         let tty = alloc_tty(300, "ttyV3-poll-op-zero");
-        let guard = step_engine::guard();
         let mut op = PollHardwareInputOp {
             tty: &tty,
             max_bytes: 0,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(out) => {
                 assert_eq!(out.bytes_read, 0);
@@ -245,14 +243,12 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_tty(301, "ttyV3-poll-op-dead");
         let _ = tty.take_payload();
-        let guard = step_engine::guard();
         let mut op = PollHardwareInputOp {
             tty: &tty,
             max_bytes: 8,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Err(_) => {}
             other => panic!("expected Err, got {other:?}"),

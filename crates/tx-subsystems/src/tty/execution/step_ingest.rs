@@ -221,15 +221,10 @@ mod step_op_wraps {
     fn ingest_op_consumes_bytes() {
         let _setup = setup();
         let tty = alloc_hardware_tty(600, "ttyV3-ingest-op-live");
-        let guard = step_engine::guard();
         let bytes: &[u8] = b"hi";
-        let mut op = IngestOp {
-            tty: &tty,
-            bytes,
-        };
+        let mut op = IngestOp { tty: &tty, bytes };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(o) => assert_eq!(o.consumed, bytes.len()),
             other => panic!("expected Done(_), got {other:?}"),
@@ -241,14 +236,12 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_hardware_tty(601, "ttyV3-ingest-op-dead");
         let _ = tty.take_payload();
-        let guard = step_engine::guard();
         let mut op = IngestOp {
             tty: &tty,
             bytes: b"x",
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Err(_) => {}
             other => panic!("expected Err(_), got {other:?}"),

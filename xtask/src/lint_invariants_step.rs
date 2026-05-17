@@ -15,13 +15,7 @@ use crate::Result;
 /// Will be set to measured baseline after first run.
 const MAX_STEPS_WITHOUT_5_STAGE: usize = 5; // 0→1: RenameOp in composite.rs (legitimate pass-through wrapper)
 
-const STAGE_MARKERS: &[&str] = &[
-    "observe",
-    "upgrade",
-    "reserve",
-    "commit",
-    "publish",
-];
+const STAGE_MARKERS: &[&str] = &["observe", "upgrade", "reserve", "commit", "publish"];
 
 /// Count step functions that are missing stage comments.
 pub(crate) fn lint_invariants_step_discipline(root: &Path) -> Result<()> {
@@ -85,7 +79,8 @@ pub(crate) fn lint_invariants_step_discipline(root: &Path) -> Result<()> {
                             // Accept: // observe, //observe, // ① observe, // observe:, // observe —, etc.
                             let is_comment_line = trimmed_body.starts_with("//");
                             if is_comment_line && trimmed_body.contains(marker) {
-                                found_stages |= 1 << STAGE_MARKERS.iter().position(|m| m == marker).unwrap();
+                                found_stages |=
+                                    1 << STAGE_MARKERS.iter().position(|m| m == marker).unwrap();
                             }
                         }
 
@@ -104,10 +99,8 @@ pub(crate) fn lint_invariants_step_discipline(root: &Path) -> Result<()> {
                         .filter(|(idx, _)| found_stages & (1 << idx) == 0)
                         .map(|(_, m)| *m)
                         .collect();
-                    missing_stages.push(format!(
-                        "{rel}:{fn_name} — missing: {}",
-                        missing.join(", ")
-                    ));
+                    missing_stages
+                        .push(format!("{rel}:{fn_name} — missing: {}", missing.join(", ")));
                 }
 
                 i = j;

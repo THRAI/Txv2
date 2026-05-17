@@ -254,7 +254,11 @@ pub fn build_aspace_from_image<P: PmapIf>(
         .ok_or(ScriptError::InvalidImage)?;
     let stack_entry = VmEntry::new(
         stack_range,
-        if image_plan.executable_stack { Prot::new(true, true, true) } else { Prot::READ_WRITE },
+        if image_plan.executable_stack {
+            Prot::new(true, true, true)
+        } else {
+            Prot::READ_WRITE
+        },
         VmEntryFlags::PRIVATE,
         VmBacking::PrivateAnon,
     );
