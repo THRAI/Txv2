@@ -28,7 +28,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::process::adapter::step_engine::{
     self, AtomicSlot, Cap, Dead, Entity, PayloadCap, PayloadPolicy, RawPort, RawQueue, SpinMutex,
@@ -218,6 +218,12 @@ impl step_engine::SubjectIdentity for ProcessIdentity {
 }
 
 impl ProcessIdentity {
+    /// Access the process payload slot.  Returns `None` when the
+    /// process is a zombie (payload dropped).
+    pub fn payload_slot(&self) -> &SpinMutex<Option<PayloadCap<ProcessPayload>>> {
+        &self.payload
+    }
+
     /// Snapshot the current process-group `Cap`. The returned `Cap` is a
     /// strong reference; it remains valid until dropped even if the
     /// target rebinds via `setpgid`.
@@ -653,6 +659,25 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().map(|p| p.exit_source_id())
     }
 
+    /// Notify a vfork-parent that this child process has exec'd or
+    /// exited.  Forwards to [`ProcessPayload::notify_vfork_done`].
+    /// No-op for zombie processes (no payload).
+    pub fn notify_vfork_done(&self) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.notify_vfork_done();
+        }
+    }
+
+    /// Check whether the child has exec'd or exited (vfork_done).
+    /// Returns `true` for zombie processes (payload dropped → process
+    /// has exited).
+    pub fn is_vfork_done(&self) -> bool {
+        self.payload
+            .lock()
+            .as_ref()
+            .map_or(true, |p| p.vfork_done.load(Ordering::Acquire))
+    }
+
     /// Build the `WaitToken` an awaiter parks on while waiting for any
     /// child of this process to zombify. Returns `None` for zombies
     /// (no payload).
@@ -783,6 +808,14 @@ pub struct TargetProcCred {
 /// Holds the address space and the live thread list. Future fields
 /// (`rlimits`, `fd_table`) land in follow-up passes without changing
 /// the existing surface.
+/// Group-exit coordination state (PROCESS_v1 §5).
+#[derive(Debug, Clone)]
+pub(crate) struct GroupExitState {
+    pub status: ExitStatus,
+    pub is_exec: bool,
+    pub remaining_threads: u32,
+}
+
 pub struct ProcessPayload {
     /// Authoritative address-space slot for this process. Per Open Q #2
     /// (DECIDED 2026-05-06, `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`),
@@ -1016,9 +1049,31 @@ pub struct ProcessPayload {
     /// from the executable basename at `execve`; can be changed via
     /// `prctl(PR_SET_NAME)`. Read by procfs `/proc/<pid>/stat`.
     pub(crate) _comm: SpinMutex<[u8; 16]>,
+    pub(crate) thread_count: AtomicU32,
+    pub(crate) group_exit: SpinMutex<Option<GroupExitState>>,
+    pub vfork_done: AtomicBool,
+    /// Waker for a vfork-parent that is parked in `sys_clone` waiting
+    /// for this process to exec or exit.  Set by the parent before
+    /// parking; taken and fired by the child's exec and exit paths.
+    pub(crate) vfork_waiter: SpinMutex<Option<core::task::Waker>>,
 }
 
 impl ProcessPayload {
+    /// Snapshot the current address-space `Cap` out of the
+    /// `AtomicSlot<Cap<AddressSpace>>` slot. Panics if the slot is
+    /// empty — by construction the initial state is always populated
+    /// (`bootstrap_init_process` / `step_fork`) and the only mutator
+    /// is exec's phase 6 store, which atomically swaps to a fresh
+    /// `Cap` and never leaves the slot empty.
+    /// Notify a vfork-parent that this child process has exec'd or
+    /// exited.  Sets `vfork_done` and fires the stored waker (if any).
+    pub fn notify_vfork_done(&self) {
+        self.vfork_done.store(true, Ordering::Release);
+        if let Some(waker) = self.vfork_waiter.lock().take() {
+            waker.wake();
+        }
+    }
+
     /// Snapshot the current address-space `Cap` out of the
     /// `AtomicSlot<Cap<AddressSpace>>` slot. Panics if the slot is
     /// empty — by construction the initial state is always populated
@@ -1416,17 +1471,10 @@ unsafe impl ZoneAllocated for Session {
 }
 
 /// Simple atomic PID allocator. PID 1 is reserved for init; allocator
-/// starts at 2. PidNamespace and reuse-after-reap policy land later.
-static NEXT_PID: AtomicU32 = AtomicU32::new(2);
-
-pub fn allocate_pid() -> Pid {
-    Pid(NEXT_PID.fetch_add(1, Ordering::Relaxed))
-}
+// PID/TID allocation moved to `crate::process::numbers`.
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn reset_pid_counter_for_test() {
-    NEXT_PID.store(2, Ordering::Relaxed);
-}
+pub use crate::process::numbers::reset_pid_counter_for_test;
 
 #[cfg(test)]
 mod subject_identity_tests {
