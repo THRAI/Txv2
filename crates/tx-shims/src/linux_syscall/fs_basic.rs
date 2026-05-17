@@ -679,22 +679,18 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 
     match request {
         TCGETS => {
-            let outcome = {
-                let guard = step_engine::guard();
-                step_ioctl_tcgets(&tty, &guard)
-            };
-            match unwrap_v3(outcome) {
-                Ok(termios) => {
-                    if argp == 0 {
-                        return SyscallResult::Error(EFAULT_VALUE);
-                    }
-                    if let Err(errno) = bootstrap_write_user::<Termios>(&ctx.aspace, argp, termios)
-                    {
+            let guard = step_engine::guard();
+            let op = tx_subsystems::tty::execution::IoctlTcgetsOp { tty: &tty, guard: &guard };
+            match crate::adapter::step_engine::drive_oneshot(op, &PlaceholderProcessSubject, &mut NoProgress) {
+                StepOutcome::Done(termios) => {
+                    if argp == 0 { return SyscallResult::Error(EFAULT_VALUE); }
+                    if let Err(errno) = bootstrap_write_user::<Termios>(&ctx.aspace, argp, termios) {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                     SyscallResult::Return(0)
                 }
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(Errno::from(e))),
+                _ => SyscallResult::Error(EIO_VALUE),
             }
         }
         TCSETS | TCSETSW | TCSETSF => {
