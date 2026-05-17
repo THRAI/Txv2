@@ -508,10 +508,21 @@ const TLS_REG_INDEX: usize = 2;
 #[cfg(not(target_arch = "loongarch64"))]
 const TLS_REG_INDEX: usize = 4;
 
+/// Register index for the stack pointer (`sp` on RV64 = x2,
+/// r3 on LoongArch64). Used to seed the child's sp when the
+/// userspace `clone(2)` `newsp` argument is non-zero (libc-style
+/// `clone(fn, stack, flags, arg, ...)` wraps push the fn/arg pair
+/// on the new stack and pass it through).
+#[cfg(target_arch = "loongarch64")]
+const STACK_REG_INDEX: usize = 3;
+#[cfg(not(target_arch = "loongarch64"))]
+const STACK_REG_INDEX: usize = 2;
+
 pub fn seed_child_leader_context(
     child_thread: &Cap<ThreadIdentity>,
     parent_user_ctx: &UserTrapContext,
     tls: usize,
+    stack: usize,
 ) {
     // (1) Clone the parent context.
     let mut child_ctx = *parent_user_ctx;
@@ -522,6 +533,15 @@ pub fn seed_child_leader_context(
     //     inherits the parent's value (preserved from the clone).
     if tls != 0 {
         child_ctx.regs[TLS_REG_INDEX] = tls;
+    }
+    // (3b) sp = stack: seed the stack pointer when the syscall's
+    //     `newsp` argument is non-zero. Linux `clone(2)`: a non-zero
+    //     `newsp` means "the child enters userspace with sp = newsp"
+    //     (the libc clone wrapper has already pushed `fn`/`arg` to
+    //     that stack); a zero `newsp` means "the child shares the
+    //     parent's sp" (bare fork convention).
+    if stack != 0 {
+        child_ctx.regs[STACK_REG_INDEX] = stack;
     }
     // (4) PC already points past `ecall`: the trap shell
     // (`tx-kernel::trap_handoff::hand_off_syscall`) added the 4-byte
