@@ -82,6 +82,27 @@ pub fn mark_thread_zombie_for_test(thread: &Cap<ThreadIdentity>, status: i32) {
 /// owning process's thread list, and zombifies the process if this was
 /// the last thread.
 pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
+
+    // GroupExit coordination (PROCESS_v1 §5): if the owning process
+    // has an active group-exit episode (exit_group or multi-threaded
+    // execve), decrement the remaining_threads counter.  The
+    // initiating thread (the one that set group_exit) is NOT counted
+    // — it continues through its own path after the collapse.
+    let guard = crate::thread_runtime::adapter::step_engine::guard();
+    if let Some(parent) = thread.owner_proc.upgrade(&guard) {
+        if let Some(payload) = parent.payload.lock().as_ref() {
+            if let Some(ref ge) = *payload.group_exit.lock() {
+                let prev = ge.remaining_threads.fetch_sub(1, core::sync::atomic::Ordering::Release);
+                // If this was the last non-initiator thread, the initiator
+                // (blocked on `remaining_threads == 0`) can proceed.
+                if prev == 1 {
+                    // Last thread — the initiator is now unblocked.
+                }
+            }
+        }
+    }
+    drop(guard);
+
     // observe
     // upgrade
     // reserve

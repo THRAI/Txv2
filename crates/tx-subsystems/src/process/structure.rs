@@ -809,11 +809,11 @@ pub struct TargetProcCred {
 /// (`rlimits`, `fd_table`) land in follow-up passes without changing
 /// the existing surface.
 /// Group-exit coordination state (PROCESS_v1 §5).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct GroupExitState {
     pub status: ExitStatus,
     pub is_exec: bool,
-    pub remaining_threads: u32,
+    pub remaining_threads: AtomicU32,
 }
 
 pub struct ProcessPayload {
@@ -1039,12 +1039,12 @@ pub struct ProcessPayload {
     /// Process command-line snapshot. Populated by `execve` at the
     /// point-of-no-return commit; read by procfs `/proc/<pid>/cmdline`.
     /// `None` for kernel threads and pre-exec processes.
-    pub(crate) _cmdline: SpinMutex<Option<alloc::vec::Vec<u8>>>,
+    pub _cmdline: SpinMutex<Option<alloc::vec::Vec<u8>>>,
     /// Canonical executable DEntry. Set by `execve` to the resolved
     /// path of the loaded binary. Read by procfs `/proc/<pid>/exe`
     /// (symlink target) and `/proc/<pid>/stat`.
     /// `None` for kernel threads and pre-exec processes.
-    pub(crate) _exe_file: SpinMutex<Option<Cap<DEntry>>>,
+    pub _exe_file: SpinMutex<Option<Cap<DEntry>>>,
     /// Process short name (comm). Up to 15 bytes + NUL. Initialised
     /// from the executable basename at `execve`; can be changed via
     /// `prctl(PR_SET_NAME)`. Read by procfs `/proc/<pid>/stat`.
