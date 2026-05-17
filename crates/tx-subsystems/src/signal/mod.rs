@@ -1052,21 +1052,34 @@ pub fn script_kill_process(
     source: &Cap<ProcessIdentity>,
     target: &Cap<ProcessIdentity>,
     sig: Signum,
+    info: Option<SigInfo>,
 ) -> Result<KillScriptOutcome, Errno> {
-    let guard = step_engine::guard();
+    // Phase 1 — authorise. The cred check runs inside its own guard
+    // scope; the scope ends before any commit-side call so the inner
+    // `step_kill_process` → `post_signal` chain can take its own
+    // guard for SigInfo storage without violating
+    // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`'s no-nested-guard
+    // rule.
+    {
+        let guard = step_engine::guard();
 
-    // Capture the source's syscall-entry credential snapshot. `None`
-    // means the source is a zombie (payload reaped) — ESRCH per the
-    // outcome doc above.
-    let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
+        // Capture the source's syscall-entry credential snapshot.
+        // `None` means the source is a zombie (payload reaped) —
+        // ESRCH per the outcome doc above.
+        let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
 
-    let Some(target_facts) = target.target_proc_cred_for(source) else {
-        return Ok(KillScriptOutcome::NoLiveThread);
-    };
+        let Some(target_facts) = target.target_proc_cred_for(source) else {
+            return Ok(KillScriptOutcome::NoLiveThread);
+        };
 
-    let _auth = crate::cred::require_signal_send(&source_snapshot, &target_facts, sig, &guard)?;
+        let _auth =
+            crate::cred::require_signal_send(&source_snapshot, &target_facts, sig, &guard)?;
+        // _auth and guard drop here.
+    }
 
-    Ok(match step_kill_process(target, sig, None) {
+    // Phase 2 — commit. `step_kill_process` is the primitive
+    // (no cred check); we just authorised, so commit unconditionally.
+    Ok(match step_kill_process(target, sig, info) {
         KillOutcome::Delivered => KillScriptOutcome::Delivered,
         KillOutcome::NoLiveThread => KillScriptOutcome::NoLiveThread,
     })

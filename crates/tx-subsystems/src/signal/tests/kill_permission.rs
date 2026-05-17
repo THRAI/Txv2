@@ -138,7 +138,7 @@ fn script_kill_process_same_uid_delivers() {
     let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
     // Both inherit root cred; same euid.
 
-    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM);
+    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM, None);
     assert_eq!(outcome, Ok(KillScriptOutcome::Delivered));
 }
 
@@ -156,7 +156,7 @@ fn script_kill_process_different_uid_returns_eperm() {
     set_cred(&parent, limited_cred(1000));
     set_cred(&child, limited_cred(2000));
 
-    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM);
+    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM, None);
     assert_eq!(outcome, Err(Errno::EPERM));
 }
 
@@ -169,7 +169,7 @@ fn script_kill_process_zombie_target_returns_no_live_thread() {
 
     // Even without permission, target_proc_cred returns None for
     // a zombie, short-circuiting before the cred check.
-    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM);
+    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM, None);
     assert_eq!(outcome, Ok(KillScriptOutcome::NoLiveThread));
 }
 
@@ -180,7 +180,7 @@ fn script_kill_process_zombie_source_returns_esrch() {
     let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
     crate::process::step_exit_group(&parent, ExitStatus::Exited(0));
 
-    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM);
+    let outcome = script_kill_process(&parent, &child, Signum::SIGTERM, None);
     assert_eq!(outcome, Err(Errno::ESRCH));
 }
 
