@@ -179,7 +179,7 @@ pub(super) async fn sys_nanosleep<'a, P: TimeIf>(
     use tx_substrate::step::DriveMode;
     let mut script_ctx = build_subject_script_ctx(ctx);
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let mut op = NanosleepOp {
+    let op = NanosleepOp {
         nanos: req_ns,
         deadline_ns,
         started: false,
@@ -246,7 +246,7 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     use tx_substrate::step::DriveMode;
     let mut script_ctx = build_subject_script_ctx(ctx);
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let mut op = NanosleepOp {
+    let op = NanosleepOp {
         nanos: req_ns,
         deadline_ns,
         started: false,

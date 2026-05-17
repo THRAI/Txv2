@@ -30,7 +30,10 @@ use tx_substrate::index::{Index, INDEX_MUTATION_EMIT_ENABLED};
 // ── Backing ring storage ──────────────────────────────────────────────────────
 
 const RING_BYTES: usize = 4096;
-static mut RING_STORAGE: [u8; RING_BYTES] = [0u8; RING_BYTES];
+#[repr(align(8))]
+struct AlignedRingStorage([u8; RING_BYTES]);
+
+static mut RING_STORAGE: AlignedRingStorage = AlignedRingStorage([0u8; RING_BYTES]);
 
 /// Serialise all tests: they share ring storage and emitter state.
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -127,7 +130,7 @@ impl ObserverIf for TestPlatform {
         if hart.0 != 0 {
             return None;
         }
-        let ptr = core::ptr::addr_of_mut!(RING_STORAGE) as *mut u8;
+        let ptr = unsafe { core::ptr::addr_of_mut!(RING_STORAGE.0) as *mut u8 };
         Some(RingDescriptor {
             base: unsafe { NonNull::new_unchecked(ptr) },
             size: RING_BYTES,
@@ -141,7 +144,7 @@ impl ObserverIf for TestPlatform {
 fn reset_ring() {
     unsafe {
         core::ptr::write_bytes(
-            core::ptr::addr_of_mut!(RING_STORAGE) as *mut u8,
+            core::ptr::addr_of_mut!(RING_STORAGE.0) as *mut u8,
             0,
             RING_BYTES,
         );
@@ -154,7 +157,7 @@ fn reset_ring() {
 ///
 /// SAFETY: must hold `TEST_LOCK`; no concurrent producer.
 unsafe fn read_ring(n: usize) -> (TxTraceHartRing, std::vec::Vec<TxTraceRecord>) {
-    let base = core::ptr::addr_of!(RING_STORAGE) as *const u8;
+    let base = core::ptr::addr_of!(RING_STORAGE.0) as *const u8;
     let hdr = core::ptr::read(base as *const TxTraceHartRing);
     let slots_ptr = base.add(core::mem::size_of::<TxTraceHartRing>()) as *const TxTraceRecord;
     let mut slots = std::vec::Vec::with_capacity(n);

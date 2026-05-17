@@ -37,6 +37,8 @@ pub fn register_all() -> Result<(), ZoneError> {
     io_uring::register_zones()?;
     signalfd::register_zones()?;
     epoll::register_zones()?;
+    eventfd::register_zones()?;
+    timerfd::register_zones()?;
     subject_placeholders::register_zones()?;
     Ok(())
 }
@@ -310,6 +312,22 @@ mod epoll {
     pub(super) fn register_zones() -> Result<(), ZoneError> {
         // TODO: epoll not yet landed
         Ok(())
+    }
+}
+
+mod eventfd {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::eventfd::register_zones()
+    }
+}
+
+mod timerfd {
+    use super::*;
+
+    pub(super) fn register_zones() -> Result<(), ZoneError> {
+        crate::timerfd::register_zones()
     }
 }
 

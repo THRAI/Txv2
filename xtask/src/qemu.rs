@@ -172,20 +172,32 @@ fn qemu_command(
             .join("target")
             .join("images")
             .join(busybox_initramfs_name(target));
+        let cmdline = if target == TxTarget::Rv64M1DockMock {
+            "tx.profile=busybox tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0"
+        } else {
+            "tx.profile=busybox console=ttyS0"
+        };
         args.push("-initrd".into());
         args.push(initramfs.display().to_string());
         args.push("-append".into());
-        if target == TxTarget::Rv64M1DockMock {
-            args.push("tx.profile=busybox tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0".into());
-        } else {
-            args.push("tx.profile=busybox console=ttyS0".into());
+        args.push(cmdline.into());
+        if target == TxTarget::La64Qemu {
+            args.push("-fw_cfg".into());
+            args.push(format!("name=opt/tx.cmdline,string={cmdline}"));
+            args.push("-fw_cfg".into());
+            args.push(format!("name=opt/tx.initrd,file={}", initramfs.display()));
         }
     } else {
-        args.push("-append".into());
-        if target == TxTarget::Rv64M1DockMock {
-            args.push("tx.profile=smoke tx.board=m1dock-mock console=ttyS0".into());
+        let cmdline = if target == TxTarget::Rv64M1DockMock {
+            "tx.profile=smoke tx.board=m1dock-mock console=ttyS0"
         } else {
-            args.push("tx.profile=smoke console=ttyS0".into());
+            "tx.profile=smoke console=ttyS0"
+        };
+        args.push("-append".into());
+        args.push(cmdline.into());
+        if target == TxTarget::La64Qemu {
+            args.push("-fw_cfg".into());
+            args.push(format!("name=opt/tx.cmdline,string={cmdline}"));
         }
     }
 
@@ -635,6 +647,9 @@ mod tests {
         assert!(rendered.contains("-m 1152M"));
         assert!(rendered.contains("-smp 4"));
         assert!(rendered.contains("-serial file:target/qemu-la64-qemu-smoke.serial.log"));
+        assert!(
+            rendered.contains("-fw_cfg name=opt/tx.cmdline,string=tx.profile=smoke console=ttyS0")
+        );
         assert!(rendered.contains("tx-kernel-loongarch64-qemu-virt"));
     }
 
@@ -657,6 +672,9 @@ mod tests {
 
         assert!(rendered.contains("-device virtio-blk-pci-non-transitional,drive=txblk0,rombar=0"));
         assert!(!rendered.contains("virtio-blk-device,drive=txblk0"));
+        assert!(rendered
+            .contains("-fw_cfg name=opt/tx.cmdline,string=tx.profile=busybox console=ttyS0"));
+        assert!(rendered.contains("-fw_cfg name=opt/tx.initrd,file=/tmp/tx/target/images/busybox-initramfs-la64-qemu.cpio"));
         assert!(rendered.contains(
             "-drive driver=raw,file.driver=file,file.filename=target/images/busybox-root-la64-qemu.ext4,file.locking=off,if=none,id=txblk0,read-only=on"
         ));

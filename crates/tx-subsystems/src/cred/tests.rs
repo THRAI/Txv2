@@ -646,7 +646,7 @@ fn cred_snapshot_returns_none_for_zombie() {
     // PR-9 phase 5 for the AtomicSlot<Cap<Cred>> shape).
     let _g = setup();
     let proc_cap = bootstrap();
-    let _ = step_exit_group(&proc_cap, ExitStatus(0));
+    let _ = step_exit_group(&proc_cap, ExitStatus::Exited(0));
 
     assert!(proc_cap.cred_snapshot().is_none());
 }

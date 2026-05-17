@@ -73,6 +73,7 @@ fn step_op_can_yield_with_progress_and_shape() {
                 }
                 YieldShape::OnAgent { .. } => panic!("expected OnWaitSource, got OnAgent"),
                 YieldShape::OnTimer { .. } => panic!("expected OnWaitSource, got OnTimer"),
+                YieldShape::OnEdge { .. } => panic!("expected OnWaitSource, got OnEdge"),
             }
         }
         other => panic!("expected Yield, got {:?}", other),

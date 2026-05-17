@@ -204,7 +204,11 @@ fn build_image() -> MemImage {
 }
 
 fn open_fs() -> Arc<Ext4FsInstance<MemImage>> {
-    Ext4FsInstance::open(build_image()).expect("open ext4 mem image")
+    Ext4FsInstance::open(build_image(), false).expect("open ext4 mem image")
+}
+
+fn open_fs_read_only() -> Arc<Ext4FsInstance<MemImage>> {
+    Ext4FsInstance::open(build_image(), true).expect("open ext4 mem image (RO)")
 }
 
 // === Tests =============================================================
@@ -293,6 +297,65 @@ fn ext4_v3_mutation_methods_create_and_mkdir_succeed() {
 }
 
 #[test]
+fn ext4_v3_mutation_methods_rejected_on_read_only_mount_with_erofs() {
+    // Linux `MS_RDONLY` semantics: every mutating FsOps method must
+    // short-circuit with `-EROFS` when the mount was opened
+    // read-only. Read-only is signalled by passing `true` to
+    // `Ext4FsInstance::open`; `mount_ext4_read_only` does this at
+    // its sole call site.
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs_read_only();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::create_inode(
+            &*fs,
+            FsObjectId::new(2),
+            b"new",
+            0o100644,
+            &cred,
+            &guard,
+        ),
+        V3::<_, NoProgress>::err(V3Errno::EROFS),
+        "create_inode on RO mount must return EROFS",
+    );
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::mkdir(
+            &*fs,
+            FsObjectId::new(2),
+            b"newdir",
+            0o755,
+            &cred,
+            &guard,
+        ),
+        V3::<_, NoProgress>::err(V3Errno::EROFS),
+        "mkdir on RO mount must return EROFS",
+    );
+
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::unlink(
+            &*fs,
+            FsObjectId::new(2),
+            b"hello",
+            FsObjectId::new(12),
+            &guard,
+        ),
+        V3::<(), NoProgress>::err(V3Errno::EROFS),
+        "unlink on RO mount must return EROFS",
+    );
+
+    // Read-side lookup still works — RO doesn't break observation.
+    assert_eq!(
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, FsObjectId::new(2), b"hello", &guard),
+        V3::<_, NoProgress>::done(FsObjectId::new(12)),
+        "lookup on RO mount still succeeds",
+    );
+}
+
+#[test]
 fn ext4_v3_readdir_done_then_terminator() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
@@ -359,7 +422,7 @@ fn ext4_v3_truncate_and_fsync_surface_enosys() {
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
     assert_eq!(
-        <Ext4FsInstance<MemImage> as FsPageBacking>::fsync(&*fs, FsObjectId::new(12), &guard),
+        <Ext4FsInstance<MemImage> as FsPageBacking>::fsync_file(&*fs, FsObjectId::new(12), &guard),
         V3::<(), NoProgress>::err(V3Errno::ENOSYS)
     );
 }

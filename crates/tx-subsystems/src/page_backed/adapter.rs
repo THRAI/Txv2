@@ -27,12 +27,10 @@ pub mod step_engine {
         SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        sign, sign_for, reserve_for, register_zone_for,
-        Cap, PayloadCap, Weak, IdentRef,
-        Dead, ZoneError,
-        Entity, CoLocatedEntity, OperationalCapExt, OperationalRefExt, PayloadBinding,
-        Zone, ZoneAllocated,
-        IdentitySlot, IsPayloadPolicy, CapProducingPolicy, ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy, ZonePolicy,
+        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
+        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
     pub use tx_substrate::SpinMutex;
 }

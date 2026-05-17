@@ -27,8 +27,8 @@ use crate::adapter::step_engine::{
     self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, SpinMutex, StepOutcome,
 };
 use tx_hal::{
-    Arch, Asid, EntropyIf, PhysAddr, PmapError, PmapIf, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
+    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
@@ -61,6 +61,11 @@ use super::{exec_script, ExecError};
 // ---------------------------------------------------------------------------
 
 struct ScriptsTestPmap;
+
+impl PlatformConfig for ScriptsTestPmap {
+    const ARCH: Arch = Arch::Riscv64;
+    const BOARD: &'static str = "scripts-test";
+}
 
 #[derive(Default)]
 struct ScriptsTestPmapState {
@@ -141,10 +146,6 @@ impl PmapIf for ScriptsTestPmap {
 // reproducible, no hardware dependency.
 impl EntropyIf for ScriptsTestPmap {}
 
-impl tx_hal::PlatformConfig for ScriptsTestPmap {
-    const ARCH: tx_hal::Arch = tx_hal::Arch::Riscv64;
-    const BOARD: &'static str = "scripts-test-pmap";
-}
 impl tx_hal::AuxvIf for ScriptsTestPmap {}
 
 // ---------------------------------------------------------------------------
@@ -558,6 +559,10 @@ fn exec_script_loads_minimal_elf_seeds_saved_user_context() {
 fn initial_user_context_uses_arch_specific_stack_register() {
     assert_eq!(super::initial_user_sp_reg_for_arch(Arch::Riscv64), 2);
     assert_eq!(super::initial_user_sp_reg_for_arch(Arch::LoongArch64), 3);
+
+    let ctx = super::make_initial_user_trap_context(Arch::LoongArch64, 0x1000, 0x4000);
+    assert_eq!(ctx.regs[3], 0x4000);
+    assert_eq!(ctx.regs[2], 0);
 }
 
 #[test]
