@@ -102,7 +102,9 @@ pub fn init_process() -> Option<Cap<ProcessIdentity>> {
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reset_init_process_for_test() {
-    *INIT_PROCESS.lock() = None;
+    if let Some(prev) = INIT_PROCESS.lock().take() {
+        unregister_pid(prev.pid);
+    }
 }
 
 /// Errors from `bootstrap_init_process`.
@@ -300,6 +302,13 @@ pub fn bootstrap_init_process(
     // Register globally. The slot retains a strong Cap so init
     // outlives every other reference (matches POSIX init lifetime).
     *INIT_PROCESS.lock() = Some(proc_cap.clone());
+
+    // Register init in the pid namespace so `process_by_pid(Pid::INIT)`
+    // resolves: kill/tkill/tgkill, /proc/<pid>/, waitpid, and the
+    // SIGCHLD reparenting path all use this lookup. `step_fork`
+    // registers child pids; init has no fork parent, so the bootstrap
+    // path must register itself.
+    register_pid(pid, proc_cap.clone());
 
     Ok(proc_cap)
 }
@@ -1594,6 +1603,7 @@ mod step_op_wraps {
         let parent = bootstrap();
         let mut op = ForkOp::<TestPmap> {
             parent: &parent,
+            clone_vm: false,
             _pmap: core::marker::PhantomData,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();

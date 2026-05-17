@@ -56,6 +56,15 @@ pub trait FsPageBacking: Send + Sync + 'static {
 
     fn fsync_file(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<(), NoProgress>;
 
+    /// Filesystem-wide flush, the storage backend for `syncfs(2)`.
+    /// Default delegates to `fsync_file(ROOT)`; journaling filesystems
+    /// override to issue a single barrier across all dirty inodes.
+    /// See commit "refactor(fsync): split fsync into fsync_file +
+    /// sync_filesystem" for the design split.
+    fn sync_filesystem(&self, guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+        self.fsync_file(super::super::vfs::structure::FsObjectId::ROOT, guard)
+    }
+
     /// Default returns `Done(())`.
     fn fallocate(
         &self,

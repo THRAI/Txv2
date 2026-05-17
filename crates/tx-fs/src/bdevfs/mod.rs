@@ -49,6 +49,7 @@ use adapter::step_engine::{
 
 use tx_subsystems::device::{self, BlockDeviceHandle, DevT};
 use tx_subsystems::execution::{Errno, Guard};
+use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{
     AnonSwapPolicy, Frame, FsPageBacking, PageContainer, PageContainerKind,
 };
@@ -243,6 +244,23 @@ fn device_by_index(index: usize) -> Option<&'static device::BlockDeviceRegistrat
     device::block_device_snapshot().into_iter().nth(index)
 }
 
+/// Resolve a bdev-fs `FsObjectId` to its underlying
+/// `&'static BlockDeviceRegistration`.
+///
+/// Returns `None` when the id is the bdev-fs root, refers to a slot
+/// that has since been removed from the registry, or was minted by a
+/// non-bdev-fs backend. This is the helper called out as
+/// `bdev_fs::block_device_handle_for` in
+/// `docs/design/05_filesystem/BDEV_FS.md` §8.1 — the bridge a
+/// filesystem (tx-ext4) uses at mount-time to turn a userspace
+/// `/dev/block/<name>` path into a block-device handle.
+pub fn block_device_for_object_id(
+    fs_object_id: FsObjectId,
+) -> Option<&'static device::BlockDeviceRegistration> {
+    let index = entry_index(fs_object_id)?;
+    device_by_index(index)
+}
+
 fn block_device_meta(reg: &device::BlockDeviceRegistration) -> InodeMeta {
     let block_size = reg.ops.block_size() as u64;
     let total_bytes = reg.ops.total_blocks().saturating_mul(block_size);
@@ -305,6 +323,7 @@ impl FsOps for BdevFsMountPayload {
         &self,
         fs_object_id: FsObjectId,
         meta: InodeMeta,
+        mount: &Cap<MountPayload>,
         guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         if meta.kind() != InodeKind::BlockDevice {
@@ -327,7 +346,7 @@ impl FsOps for BdevFsMountPayload {
             Err(e) => return StepOutcome::err(e.into()),
         };
 
-        match RNode::new_cap(fs_object_id, meta, RNodeBacking::PageBacked { pc: container }) {
+        match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc: container }, mount) {
             Ok(rnode) => StepOutcome::done(rnode),
             Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }
@@ -763,6 +782,7 @@ impl FsOps for BdevFs {
         &self,
         fs_object_id: FsObjectId,
         meta: InodeMeta,
+        mount: &Cap<MountPayload>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         // No coherence index — every call allocates a fresh PC.
@@ -791,7 +811,7 @@ impl FsOps for BdevFs {
             Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
         };
 
-        match RNode::new_cap(fs_object_id, meta, RNodeBacking::PageBacked { pc: container }) {
+        match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc: container }, mount) {
             Ok(rnode) => StepOutcome::done(rnode),
             Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }

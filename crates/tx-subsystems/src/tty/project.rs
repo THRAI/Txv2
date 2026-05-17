@@ -10,6 +10,7 @@ use crate::tty::adapter::step_engine::StepOutcome as V3Out;
 use crate::tty::adapter::step_engine::{self as step_engine, Cap};
 
 use crate::execution::{Errno, Guard};
+use crate::mount::MountPayload;
 use crate::tty::execution;
 use crate::tty::structure::registry;
 use crate::tty::structure::TtyIdentity;
@@ -469,6 +470,7 @@ impl FsOps for DevptsInstance {
         &self,
         fs_object_id: FsObjectId,
         meta: InodeMeta,
+        mount: &Cap<MountPayload>,
         guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         if fs_object_id == DEVPTS_PTMX_OBJECT_ID {
@@ -484,17 +486,23 @@ impl FsOps for DevptsInstance {
                     return StepOutcome::err(Errno::EIO.into());
                 }
             };
-            match RNode::new_cap(
+            match RNode::new_cap_in_mount(
                 fs_object_id,
                 meta,
                 RNodeBacking::StructBacked {
                     payload: StructPayload::Tty(outcome.master),
                 },
+                mount,
             ) {
                 Ok(rnode) => StepOutcome::done(rnode),
                 Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
             }
         } else if let Some(index) = pty_index_from_devpts_object_id(fs_object_id) {
+            // The devpts pty-slave path still resolves via the
+            // process-wide registry; it constructs its own RNode
+            // without a mount stamp because devpts inodes are not
+            // page-backed and have no FsOps-side operations.
+            let _ = mount;
             devpts_rnode_by_index(index, guard)
         } else {
             StepOutcome::err(Errno::ENOSYS.into())

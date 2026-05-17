@@ -542,12 +542,10 @@ pub(super) fn sys_lseek<'a>(
         None => return SyscallResult::Error(EBADF_VALUE),
     };
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let guard = step_engine::guard();
     let mut op = tx_subsystems::vfs::OpenFileLseekOp {
         file: &file,
         offset,
         whence,
-        guard: &guard,
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(new_offset) => SyscallResult::Return(new_offset as i64),
@@ -679,18 +677,22 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 
     match request {
         TCGETS => {
-            let guard = step_engine::guard();
-            let op = tx_subsystems::tty::execution::IoctlTcgetsOp { tty: &tty, guard: &guard };
-            match crate::adapter::step_engine::drive_oneshot(op, &PlaceholderProcessSubject, &mut NoProgress) {
-                StepOutcome::Done(termios) => {
-                    if argp == 0 { return SyscallResult::Error(EFAULT_VALUE); }
-                    if let Err(errno) = bootstrap_write_user::<Termios>(&ctx.aspace, argp, termios) {
+            let outcome = {
+                let guard = step_engine::guard();
+                step_ioctl_tcgets(&tty, &guard)
+            };
+            match unwrap_v3(outcome) {
+                Ok(termios) => {
+                    if argp == 0 {
+                        return SyscallResult::Error(EFAULT_VALUE);
+                    }
+                    if let Err(errno) = bootstrap_write_user::<Termios>(&ctx.aspace, argp, termios)
+                    {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                     SyscallResult::Return(0)
                 }
-                StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(Errno::from(e))),
-                _ => SyscallResult::Error(EIO_VALUE),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
         TCSETS | TCSETSW | TCSETSF => {
@@ -1064,13 +1066,11 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     } else {
         let walker_cred = ctx.walker_cred();
         let result = {
-            let guard = step_engine::guard();
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = StatxOp {
                 rooted_at: &cwd,
                 path: &path,
                 cred: &walker_cred,
-                guard: &guard,
                 target: None,
             };
             step_engine::drive_oneshot(&mut op, &mut script_ctx)
@@ -1144,13 +1144,11 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         (cwd.rnode().meta(), cwd.rnode().fs_object_id())
     } else {
         let result = {
-            let guard = step_engine::guard();
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = StatOp {
                 rooted_at: &cwd,
                 path: &path,
                 cred: &walker_cred,
-                guard: &guard,
                 target: None,
             };
             step_engine::drive_oneshot(&mut op, &mut script_ctx)
@@ -1389,8 +1387,9 @@ pub(super) async fn sys_syncfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
         Some(mp) => mp.fs_page_backing().clone(),
         None => return SyscallResult::Error(ENODEV_VALUE),
     };
-    // syncfs: flush the entire filesystem through its root inode.
-    match page_backing.fsync(tx_subsystems::vfs::FsObjectId::ROOT, &guard) {
+    // syncfs: flush the entire filesystem. The default impl falls back
+    // to `fsync_file(ROOT)`; journaling filesystems can override.
+    match page_backing.sync_filesystem(&guard) {
         StepOutcome::Done(()) => SyscallResult::Return(0),
         StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(Errno::from(e))),
         _ => SyscallResult::Error(EIO_VALUE),
@@ -1403,12 +1402,17 @@ pub(super) async fn sys_fsync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let _ = core::marker::PhantomData::<P>;
     let fd = args[0] as u32;
     let open_file = match ctx.process.fd(fd) { Some(f) => f, None => return SyscallResult::Error(EBADF_VALUE) };
-    let guard = step_engine::guard();
     let rnode = open_file.rnode();
     let fs_object_id = rnode.fs_object_id();
-    let page_backing = match rnode.containing_mount_weak().and_then(|w| w.upgrade(&guard)) {
-        Some(mp) => mp.fs_page_backing().clone(),
-        None => return SyscallResult::Error(ENODEV_VALUE),
+    // The mount-weak upgrade and the page-backing clone are done inside
+    // a scoped guard so no guard crosses the subsequent
+    // `drive(...).await` (INVARIANTS_v5 EBR-7).
+    let page_backing = {
+        let guard = step_engine::guard();
+        match rnode.containing_mount_weak().and_then(|w| w.upgrade(&guard)) {
+            Some(mp) => mp.fs_page_backing().clone(),
+            None => return SyscallResult::Error(ENODEV_VALUE),
+        }
     };
     // fsync: sync the specific file via FileFsyncOp + drive().
     use tx_scripts::drive;
@@ -1416,10 +1420,9 @@ pub(super) async fn sys_fsync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-    let mut op = FileFsyncOp {
+    let op = FileFsyncOp {
         page_backing,
         fs_object_id,
-        guard: &guard,
     };
     match drive(
         op,

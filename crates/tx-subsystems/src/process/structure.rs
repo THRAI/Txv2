@@ -1074,6 +1074,13 @@ impl ProcessPayload {
         }
     }
 
+    /// Register a [`core::task::Waker`] to be fired when this process
+    /// next reaches `notify_vfork_done`. Overwrites any prior waker.
+    /// Used by the `CLONE_VFORK` parent-park loop in the syscall arm.
+    pub fn store_vfork_waiter(&self, waker: core::task::Waker) {
+        *self.vfork_waiter.lock() = Some(waker);
+    }
+
     /// Snapshot the current address-space `Cap` out of the
     /// `AtomicSlot<Cap<AddressSpace>>` slot. Panics if the slot is
     /// empty — by construction the initial state is always populated
@@ -1199,6 +1206,25 @@ impl ProcessPayload {
     /// Executable DEntry (for `/proc/<pid>/exe` symlink target).
     pub fn exe_file(&self) -> Option<Cap<DEntry>> {
         self._exe_file.lock().clone()
+    }
+
+    /// EXEC Phase 5 — install the group-exit state that collapses every
+    /// sibling thread of the calling process. Returns `true` if more
+    /// than one thread was live and the group_exit slot was populated;
+    /// `false` if the process was single-threaded and no collapse is
+    /// needed. `txdoc:EXEC-10-COLLAPSE-OLD-AS-WORK`.
+    pub fn install_exec_group_exit(&self) -> bool {
+        let n = self.thread_count.load(core::sync::atomic::Ordering::Acquire);
+        if n > 1 {
+            *self.group_exit.lock() = Some(GroupExitState {
+                status: ExitStatus::Exited(0),
+                is_exec: true,
+                remaining_threads: AtomicU32::new(n - 1),
+            });
+            true
+        } else {
+            false
+        }
     }
 
     /// Process short name comm (for `/proc/<pid>/stat`).

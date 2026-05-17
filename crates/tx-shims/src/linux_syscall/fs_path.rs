@@ -214,14 +214,12 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     let walker_cred = ctx.walker_cred();
     let new_mode = (mode & 0o7777) as u16;
     let result = {
-        let guard = step_engine::guard();
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = ChmodOp {
             rooted_at: &rooted_at,
             path: &path,
             mode: new_mode,
             cred: &walker_cred,
-            guard: &guard,
             target: None,
         };
         step_engine::drive_oneshot(&mut op, &mut script_ctx)
@@ -260,7 +258,6 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let result = {
-        let guard = step_engine::guard();
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = ChownOp {
             rooted_at: &rooted_at,
@@ -268,7 +265,6 @@ pub(super) fn sys_fchownat<P: PmapIf>(
             uid,
             gid,
             cred: &walker_cred,
-            guard: &guard,
             target: None,
         };
         step_engine::drive_oneshot(&mut op, &mut script_ctx)
@@ -357,13 +353,11 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let inode_meta = {
-        let guard = step_engine::guard();
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = AccessOp {
             rooted_at: &rooted_at,
             path: &path,
             cred: &walker_cred,
-            guard: &guard,
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(m) => m,

@@ -145,37 +145,26 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     // `SyscallCtx` (kernel-side bootstrap path).
     let cred = ctx.walker_cred();
 
-    // Drive ExecOp through the v3 StepOp loop.
-    // Phases that need I/O (step_open, read_exact_at) yield;
-    // the drive loop parks the task and resumes on I/O completion.
-    use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
-    use super::exec_op::ExecOp;
-    let mut op = ExecOp::<P>::new(
+    // `exec_script` is the canonical multi-phase async free fn that
+    // realises the EXEC_v1 protocol. The StepOp-shaped `ExecOp` wrap
+    // in `super::exec_op` is an unfinished refactor; the syscall arm
+    // drives `exec_script` directly until that lands.
+    let outcome = exec_script::<P>(
         &ctx.process,
         &ctx.thread,
         &path_buf,
         &argv_slices,
         &envp_slices,
         &cred,
-    );
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    loop {
-        match op.step(&mut script_ctx) {
-            V3Out::Done(()) => return SyscallResult::ExecCommitted,
-            V3Out::Err(e) => return SyscallResult::Error(errno_to_i32(e)),
-            V3Out::Yield(YieldShape::OnWaitSource { source, .. }) => {
-                use tx_subsystems::execution::WaitToken;
-                let token = WaitToken::new(source.raw(), 1);
-                if let Some(future) = super::wait_source::wait_on_token(token) {
-                    future.await;
-                }
-            }
-            V3Out::Continue { .. } => {
-                // ExecOp::step returns Continue between phases.
-                // Loop back immediately — no I/O wait needed.
-            }
-            _ => return SyscallResult::Error(EIO_VALUE),
+    )
+    .await;
+
+    match outcome {
+        Ok(()) => {
+            ctx.process.notify_vfork_done();
+            SyscallResult::ExecCommitted
         }
+        Err(e) => SyscallResult::Error(execve_errno_magnitude(e)),
     }
 }
 
@@ -322,6 +311,12 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         Err(tx_subsystems::process::ForkError::Zone(_)) => {
             return SyscallResult::Error(ENOMEM_VALUE);
         }
+        Err(tx_subsystems::process::ForkError::Busy) => {
+            return SyscallResult::Error(EAGAIN_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::PidNamespace) => {
+            return SyscallResult::Error(ENOMEM_VALUE);
+        }
     };
 
     // Resolve the child's leader thread (always at slot 0 by
@@ -361,7 +356,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
                     // ProcessPayload so the child's exec/exit paths
                     // can wake us.
                     if let Some(payload) = self.child.payload_slot().lock().as_ref() {
-                        *payload.vfork_waiter.lock() = Some(cx.waker().clone());
+                        payload.store_vfork_waiter(cx.waker().clone());
                     }
                     self.stored = true;
                 }
@@ -513,7 +508,7 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 // Should not reach here — op yields on NoneReady.
                 // Fall through to the exit_source wait.
             }
-            V3Out::Yield(YieldShape::OnWaitSource { source, .. }) => {
+            V3Out::Yield { shape: YieldShape::OnWaitSource { source, .. }, .. } => {
                 let token = tx_subsystems::execution::WaitToken::new(source.raw(), 1);
                 if let Some(future) = wait_source::wait_on_token(token) {
                     future.await;

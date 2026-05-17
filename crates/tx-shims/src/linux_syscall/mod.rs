@@ -118,8 +118,14 @@ mod misc;
 use misc::*;
 mod userfaultfd;
 use userfaultfd::*;
-pub mod clone_op;
-pub mod exec_op;
+// `clone_op` and `exec_op` are unfinished StepOp-shaped refactors —
+// both target an older API surface (Credential::euid/egid,
+// SegmentFlags readable/writable, UserTrapContext::set_sepc, struct-
+// variant StepOutcome::Yield(...) tuple form, etc.) that no longer
+// exists. `sys_clone` and `sys_execve` drive their underlying step
+// functions directly until these wrappers land.
+// pub mod clone_op;
+// pub mod exec_op;
 pub mod aio;
 use aio::*;
 pub mod io_uring;
@@ -365,6 +371,7 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
         nr if nr == NR_GETTIMEOFDAY => return sys_gettimeofday::<P>(req.args, ctx),
         nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
         nr if nr == NR_UNAME => return sys_uname(req.args, ctx),
+        nr if nr == NR_GETRANDOM => return sys_getrandom::<P>(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
         nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
         nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
@@ -380,8 +387,8 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf>(
     match req.nr {
         NR_WRITE => sys_write(req.args, ctx).await,
         NR_WRITEV => sys_writev(req.args, ctx).await,
-        NR_READ => sys_read(req.args, ctx).await,
-        NR_READV => sys_readv(req.args, ctx).await,
+        NR_READ => sys_read::<P>(req.args, ctx).await,
+        NR_READV => sys_readv::<P>(req.args, ctx).await,
         NR_PPOLL => sys_ppoll(req.args, ctx).await,
         NR_EXIT => sys_exit(req.args, ctx),
         NR_EXIT_GROUP => sys_exit_group(req.args, ctx),

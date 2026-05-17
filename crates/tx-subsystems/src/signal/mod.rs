@@ -1291,7 +1291,7 @@ impl<I: SubjectIdentity> StepOp<I> for DeliverSignalOp {
     type Output = KillOutcome;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(deliver_posix_signal(self.target, self.sig))
+        StepOutcome::Done(deliver_posix_signal(self.target.clone(), self.sig))
     }
 }
 
@@ -1352,7 +1352,7 @@ mod step_op_wraps {
         let _g = setup();
         let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
         let mut op = KillProcessOp {
-            target: proc_cap.clone(), sig: Signum::SIGTERM, info: None, info: None,
+            target: proc_cap.clone(), sig: Signum::SIGTERM, info: None,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
@@ -1366,7 +1366,7 @@ mod step_op_wraps {
         let pgrp = proc_cap.pgrp_cap();
         let mut op = KillPgrpOp {
             pgrp,
-            sig: Signum::SIGINT, info: None,
+            sig: Signum::SIGINT,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
@@ -1380,7 +1380,7 @@ mod step_op_wraps {
         let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
         let mut op = SigactionOp {
             process: proc_cap.clone(),
-            sig: Signum::SIGTERM, info: None,
+            sig: Signum::SIGTERM,
             disposition: SigDisposition::Ignore,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
@@ -1399,7 +1399,7 @@ mod step_op_wraps {
         let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
         let mut op = SigactionOp {
             process: proc_cap.clone(),
-            sig: Signum::SIGKILL, info: None,
+            sig: Signum::SIGKILL,
             disposition: SigDisposition::Ignore,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();

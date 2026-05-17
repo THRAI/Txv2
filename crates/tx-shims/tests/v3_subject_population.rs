@@ -100,6 +100,7 @@ impl PmapIf for StubPmap {
 }
 
 impl EntropyIf for StubPmap {}
+impl tx_hal::AuxvIf for StubPmap {}
 
 // -------- Setup -----------------------------------------------------
 

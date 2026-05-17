@@ -40,6 +40,7 @@ pub mod adapter;
 
 use adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
 use tx_subsystems::execution::{Errno, Guard};
+use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::process;
 use tx_subsystems::tty;
@@ -61,6 +62,24 @@ pub const DEVFS_ROOT_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7600);
 /// stable across re-registrations. devfs has no inode persistence; the
 /// `FsObjectId` here is observation-only.
 const DEVFS_ENTRY_OBJECT_BASE: u64 = 0x6465_7601;
+
+/// Stable `FsObjectId` for the synthetic `/dev/block` directory.
+///
+/// bdev-fs (`docs/design/05_filesystem/BDEV_FS.md` §7.1) is mounted on
+/// this directory at boot. The directory is a static read-only stub
+/// owned by devfs; its sole purpose is to be a mountpoint. Without
+/// this entry there is no path for bdev-fs to attach to, because
+/// devfs as a whole rejects `mkdir` with `EROFS`.
+///
+/// Disjoint from `DEVFS_ENTRY_OBJECT_BASE`'s id range
+/// (`0x6465_7601..0x6465_77FF`) and the devfs root id.
+pub const DEVFS_BLOCK_DIR_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7800);
+
+/// `/dev/block` directory name as the lookup key.
+const DEVFS_BLOCK_DIR_NAME: &[u8] = b"block";
+
+/// Mode for the synthetic `/dev/block` mountpoint directory.
+pub const DEVFS_BLOCK_DIR_MODE: u16 = S_IFDIR | 0o755;
 
 /// Mode for any character-device alias resolved by devfs (per the
 /// Phase 3a plan §"devfs FsOps surface": `S_IFCHR | 0o620`).
@@ -308,6 +327,12 @@ impl FsOps for Devfs {
         if parent != DEVFS_ROOT_OBJECT_ID {
             return StepOutcome::err(Errno::ENOENT.into());
         }
+        // `/dev/block` is a synthetic mountpoint directory: bdev-fs
+        // (`docs/design/05_filesystem/BDEV_FS.md` §7.1) attaches here
+        // at boot so `/dev/block/vda*` open as page-backed files.
+        if name == DEVFS_BLOCK_DIR_NAME {
+            return StepOutcome::done(DEVFS_BLOCK_DIR_OBJECT_ID);
+        }
         if tty::project::resolve_devfs_alias(name).is_some() {
             // Identify the entry by its position in the live alias
             // snapshot. Stable for one snapshot, opaque to the caller —
@@ -331,6 +356,9 @@ impl FsOps for Devfs {
     ) -> StepOutcome<InodeMeta, NoProgress> {
         if fs_object_id == DEVFS_ROOT_OBJECT_ID {
             return StepOutcome::done(InodeMeta::new(InodeKind::Directory, DEVFS_ROOT_MODE));
+        }
+        if fs_object_id == DEVFS_BLOCK_DIR_OBJECT_ID {
+            return StepOutcome::done(InodeMeta::new(InodeKind::Directory, DEVFS_BLOCK_DIR_MODE));
         }
         if entry_index_from_object_id(fs_object_id)
             .and_then(|idx| tty::project::devfs_alias_entries().into_iter().nth(idx))
@@ -430,23 +458,50 @@ impl FsOps for Devfs {
         cursor: DirCursor,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
+        if fs_object_id == DEVFS_BLOCK_DIR_OBJECT_ID {
+            // bdev-fs is mounted on top of `/dev/block`; this stub
+            // is an empty directory until that mount publishes (and
+            // after publication the walker crosses into bdev-fs
+            // before this readdir would observe contents).
+            return StepOutcome::done(None);
+        }
         if fs_object_id != DEVFS_ROOT_OBJECT_ID {
             return StepOutcome::err(Errno::ENOTDIR.into());
         }
         let entries = tty::project::devfs_alias_entries();
         let index = cursor.as_u64() as usize;
-        let Some(entry) = entries.get(index) else {
-            return StepOutcome::done(None);
-        };
-        let dir_entry = match DirEntry::new(
-            FsObjectId::new(DEVFS_ENTRY_OBJECT_BASE + index as u64),
-            InodeKind::CharDevice,
-            &entry.name,
-        ) {
-            Ok(de) => de,
-            Err(err) => return StepOutcome::err(err.into()),
-        };
-        StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))))
+        // Cursor 0..entries.len() emits the TTY aliases; the next
+        // cursor slot emits the synthetic `block` mountpoint stub.
+        if index < entries.len() {
+            let entry = &entries[index];
+            let dir_entry = match DirEntry::new(
+                FsObjectId::new(DEVFS_ENTRY_OBJECT_BASE + index as u64),
+                InodeKind::CharDevice,
+                &entry.name,
+            ) {
+                Ok(de) => de,
+                Err(err) => return StepOutcome::err(err.into()),
+            };
+            return StepOutcome::done(Some((
+                dir_entry,
+                DirCursor::from_u64(cursor.as_u64() + 1),
+            )));
+        }
+        if index == entries.len() {
+            let dir_entry = match DirEntry::new(
+                DEVFS_BLOCK_DIR_OBJECT_ID,
+                InodeKind::Directory,
+                DEVFS_BLOCK_DIR_NAME,
+            ) {
+                Ok(de) => de,
+                Err(err) => return StepOutcome::err(err.into()),
+            };
+            return StepOutcome::done(Some((
+                dir_entry,
+                DirCursor::from_u64(cursor.as_u64() + 1),
+            )));
+        }
+        StepOutcome::done(None)
     }
 
     fn destroy_inode(
@@ -480,6 +535,7 @@ impl FsOps for Devfs {
         &self,
         fs_object_id: FsObjectId,
         meta: InodeMeta,
+        mount: &Cap<MountPayload>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         if meta.kind() != InodeKind::CharDevice {
@@ -497,12 +553,13 @@ impl FsOps for Devfs {
             return StepOutcome::err(Errno::ENOENT.into());
         };
         let tty = entry.tty;
-        match RNode::new_cap(
+        match RNode::new_cap_in_mount(
             fs_object_id,
             meta,
             RNodeBacking::StructBacked {
                 payload: StructPayload::Tty(tty),
             },
+            mount,
         ) {
             Ok(rnode) => StepOutcome::done(rnode),
             Err(_) => StepOutcome::err(Errno::EIO.into()),

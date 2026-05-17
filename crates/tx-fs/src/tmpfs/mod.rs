@@ -29,6 +29,7 @@ use adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, Step
 
 use tx_subsystems::cred::Capability;
 use tx_subsystems::execution::Guard;
+use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{
     step_truncate, AnonSwapPolicy, Frame, MaterializeAccess, PageContainer, PageContainerKind,
     PageIndex,
@@ -754,6 +755,7 @@ impl FsOps for Tmpfs {
         &self,
         fs_object_id: FsObjectId,
         meta: InodeMeta,
+        mount: &Cap<MountPayload>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         let state = self.state.lock();
@@ -777,7 +779,7 @@ impl FsOps for Tmpfs {
         };
         drop(state);
 
-        match RNode::new_cap(fs_object_id, meta, backing) {
+        match RNode::new_cap_in_mount(fs_object_id, meta, backing, mount) {
             Ok(rnode) => StepOutcome::done(rnode),
             Err(_) => StepOutcome::err(step_engine::Errno::ENOMEM),
         }

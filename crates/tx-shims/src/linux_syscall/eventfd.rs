@@ -5,7 +5,7 @@
 //! `tx_subsystems::eventfd`.
 
 use tx_subsystems::eventfd::{
-    eventfd_create, step_eventfd_read, step_eventfd_write, EventFd, EFD_SEMAPHORE_FLAG,
+    step_eventfd_read, step_eventfd_write, EventFd, EFD_SEMAPHORE,
 };
 use tx_subsystems::execution::Errno;
 use tx_subsystems::vfs::structure::OpenFileFlags;
@@ -50,7 +50,7 @@ pub(super) fn sys_eventfd2<'a>(
 
     // Build the subsystem flags — strip CLOEXEC/NONBLOCK (handled at
     // OpenFile level) and keep SEMAPHORE.
-    let efd_flags = if semaphore { EFD_SEMAPHORE_FLAG } else { 0 };
+    let efd_flags = if semaphore { EFD_SEMAPHORE } else { 0 };
 
     // Create the eventfd cap via a one-shot step op.
     let efd_cap = {

@@ -131,7 +131,7 @@ pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(args: [u64; 6], ctx: &Sysca
         }
 
         let read_args = [args[0], base, len, 0, 0, 0];
-        match sys_read(read_args, ctx).await {
+        match sys_read::<P>(read_args, ctx).await {
             SyscallResult::Return(n) => {
                 total += n;
                 if (n as u64) < len {
@@ -296,9 +296,8 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         let mailbox_arc = script_ctx.mailbox().cloned();
         let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-        let guard = step_engine::guard();
-        let mut op = tx_subsystems::vfs::composite::PpollOp {
-            guard: &guard,
+        // PpollOp does not need an epoch guard (`yield → park` only).
+        let op = tx_subsystems::vfs::composite::PpollOp {
             wait_source_id: WaitSourceId::new(source_id),
             interests: InterestMask::new(interests),
             timeout_ms: None,
@@ -379,7 +378,9 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     use tx_substrate::step::DriveMode;
     use tx_subsystems::vfs::execution::OpenFileWriteOp;
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let guard = step_engine::guard();
+    // The op acquires its own epoch guard inside `step()` per
+    // STEP_MODEL_v2 §1; the syscall handler must not hold a guard
+    // across `drive(...).await` (INVARIANTS_v5 YIELD-5 / EBR-7).
     let mode = if file.flags().nonblocking {
         DriveMode::Nonblocking
     } else {
@@ -388,10 +389,9 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let mut op = OpenFileWriteOp {
+    let op = OpenFileWriteOp {
         file: &file,
         bytes: &bytes,
-        guard: &guard,
         cursor: 0,
     };
     match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {
@@ -491,7 +491,8 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(args: [u64; 6], ctx: &Syscal
     use tx_subsystems::vfs::execution::OpenFileReadOp;
     use tx_scripts::drive;
     let mut script_ctx = build_subject_script_ctx(ctx);
-    let guard = step_engine::guard();
+    // The op acquires its own epoch guard inside `step()` (STEP_MODEL_v2
+    // §1, INVARIANTS_v5 YIELD-5 / EBR-7); no guard crosses `.await`.
     let mode = if file.flags().nonblocking {
         DriveMode::Nonblocking
     } else {
@@ -500,10 +501,9 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(args: [u64; 6], ctx: &Syscal
     let mailbox_arc = script_ctx.mailbox().cloned();
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-    let mut op = OpenFileReadOp {
+    let op = OpenFileReadOp {
         file: &file,
         out: &mut staging,
-        guard: &guard,
         cursor: 0,
     };
     match drive(op, &mut script_ctx, mode, mailbox_arc.as_ref(), delegate_registry_arc.as_deref(), timer_wheel_arc.as_ref()).await {

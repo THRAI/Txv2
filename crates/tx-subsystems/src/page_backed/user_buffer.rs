@@ -548,20 +548,20 @@ pub struct ReadToUserOp<'a> {
     pub aspace: &'a AddressSpace,
     pub dst: UserPtr<u8>,
     pub len: usize,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadToUserOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let __guard = step_engine::guard();
         step_read_to_user(
             self.pc,
             self.of,
             self.aspace,
             self.dst,
             self.len,
-            self.guard,
+            &__guard,
         )
     }
 }
@@ -573,20 +573,20 @@ pub struct WriteFromUserOp<'a> {
     pub aspace: &'a AddressSpace,
     pub src: UserPtr<u8>,
     pub len: usize,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteFromUserOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let __guard = step_engine::guard();
         step_write_from_user(
             self.pc,
             self.of,
             self.aspace,
             self.src,
             self.len,
-            self.guard,
+            &__guard,
         )
     }
 }

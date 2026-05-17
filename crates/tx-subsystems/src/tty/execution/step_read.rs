@@ -5,7 +5,9 @@ use core::sync::atomic::Ordering;
 use crate::tty::adapter::step_engine::Cap;
 
 use crate::execution::Guard;
-#[cfg(test)]
+// `step_engine` alias is used both at runtime (by the StepOp wraps
+// that acquire their own epoch guard per STEP_MODEL_v2 §1) and by
+// tests, so it must not be cfg-test gated.
 use crate::tty::adapter::step_engine::{self as step_engine};
 use crate::tty::adapter::step_engine::{
     ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
@@ -173,14 +175,14 @@ pub fn step_read_for_process(
 pub struct ReadOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub out: &'a mut [u8],
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_read(self.tty, self.out, self.guard)
+        let __guard = step_engine::guard();
+        step_read(self.tty, self.out, &__guard)
     }
 }
 
@@ -190,14 +192,14 @@ pub struct ReadForCallerOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub out: &'a mut [u8],
     pub caller: super::IoctlCaller,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadForCallerOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_read_for_caller(self.tty, self.out, self.caller, self.guard)
+        let __guard = step_engine::guard();
+        step_read_for_caller(self.tty, self.out, self.caller, &__guard)
     }
 }
 
@@ -207,14 +209,14 @@ pub struct ReadForProcessOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub out: &'a mut [u8],
     pub caller: &'a Cap<crate::process::structure::ProcessIdentity>,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadForProcessOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_read_for_process(self.tty, self.out, self.caller, self.guard)
+        let __guard = step_engine::guard();
+        step_read_for_process(self.tty, self.out, self.caller, &__guard)
     }
 }
 
@@ -281,7 +283,6 @@ mod step_op_wraps {
         let mut op = ReadOp {
             tty: &tty,
             out: &mut buf,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
@@ -303,7 +304,6 @@ mod step_op_wraps {
             tty: &tty,
             out: &mut buf,
             caller,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
@@ -324,7 +324,6 @@ mod step_op_wraps {
         let mut op = ReadOp {
             tty: &tty,
             out: &mut buf,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);

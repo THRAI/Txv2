@@ -767,11 +767,11 @@ mod step_op_wraps {
         );
         let of = open_file_for_pc(&pc);
         of.set_offset((crate::vm::USER_PAGE_SIZE - 8) as u64);
+        drop(guard);
         let mut op = ReadOp {
             pc: &pc,
             of: &of,
             len: 32,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(32));
@@ -791,11 +791,11 @@ mod step_op_wraps {
         );
         let of = open_file_for_pc(&pc);
         of.set_offset(crate::vm::USER_PAGE_SIZE as u64);
+        drop(guard);
         let mut op = ReadOp {
             pc: &pc,
             of: &of,
             len: 16,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(0));
@@ -815,11 +815,11 @@ mod step_op_wraps {
         );
         let of = open_file_for_pc(&pc);
         let len = crate::vm::USER_PAGE_SIZE + 17;
+        drop(guard);
         let mut op = WriteOp {
             pc: &pc,
             of: &of,
             len,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Done(len));
@@ -841,11 +841,11 @@ mod step_op_wraps {
             1,
         );
         let of = open_file_for_pc(&pc);
+        drop(guard);
         let mut op = WriteOp {
             pc: &pc,
             of: &of,
             len: 8,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Out::Err(Errno::EINVAL.into()));
