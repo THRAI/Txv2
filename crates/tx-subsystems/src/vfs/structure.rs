@@ -16,6 +16,7 @@ use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
 
 use crate::aio::AioContext;
 use crate::epoll::Epoll;
+use crate::eventfd::EventFd;
 use crate::cred::{CapabilitySet, Cred};
 use crate::device::{BlockDeviceRegistration, CharDeviceBinding};
 use crate::execution::Errno;
@@ -25,6 +26,7 @@ use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
 use crate::signalfd::SignalFd;
 use crate::tty::execution::IoctlSideEffect;
+use crate::timerfd::TimerFd;
 use crate::tty::structure::TtyIdentity;
 use crate::tty::structure::{Termios, Winsize};
 use crate::userfaultfd::UserfaultFd;
@@ -891,6 +893,19 @@ pub enum OpenFileBacking {
     /// substrate-side [`Epoll`] identity used to route readiness
     /// notifications via `YieldShape::OnEdge`.
     Epoll { ep: Cap<Epoll> },
+    /// `eventfd(2)` open file. The cap is the substrate-side
+    /// [`EventFd`] identity carrying a 64-bit counter.  Read drains
+    /// the counter; write adds to it.  Drop semantics: when the last
+    /// `Cap<OpenFile>` for an eventfd is released and EBR retires
+    /// this slot, the inner `Cap<EventFd>` drops too — no side
+    /// effects (eventfd has no external registrations to clean up).
+    Eventfd { efd: Cap<EventFd> },
+    /// `timerfd_create(2)` open file. The cap is the substrate-side
+    /// [`TimerFd`] identity carrying a deadline and expiration
+    /// counter.  Read returns the number of expirations since the
+    /// last read.  Drop semantics: same as eventfd — the inner
+    /// `Cap<TimerFd>` drops via EBR with no external cleanup needed.
+    Timerfd { tfd: Cap<TimerFd> },
 }
 
 /// Per-fd file-position carrier.
@@ -931,6 +946,7 @@ pub struct OpenFile {
     /// Best-effort DEntry hint set by `step_open`. `None` for
     /// non-VFS shapes (ufd, aio, etc.). Used by `fchdir`.
     opendir_dentry: Option<Cap<DEntry>>,
+
     /// Advisory file lock state: 0 = unlocked, non-zero = exclusive-locked.
     /// Per open-file-description, not per-inode (POSIX flock semantics).
     flock_state: core::sync::atomic::AtomicU64,
@@ -1069,6 +1085,52 @@ impl OpenFile {
         step_engine::sign(Self::new_epoll(ep, flags))
     }
 
+    /// Construct an eventfd-backed `OpenFile`.
+    /// The resulting value carries `OpenFileBacking::Eventfd { efd }`
+    /// and no `Cap<RNode>`.
+    pub fn new_eventfd(efd: Cap<EventFd>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::Eventfd { efd },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
+            flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Zone-sign a fresh eventfd-backed `OpenFile`.
+    pub fn new_eventfd_cap(
+        efd: Cap<EventFd>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_eventfd(efd, flags))
+    }
+
+    /// Construct a timerfd-backed `OpenFile`.
+    /// The resulting value carries `OpenFileBacking::Timerfd { tfd }`
+    /// and no `Cap<RNode>`.
+    pub fn new_timerfd(tfd: Cap<TimerFd>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::Timerfd { tfd },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicBool::new(false),
+            flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Zone-sign a fresh timerfd-backed `OpenFile`.
+    pub fn new_timerfd_cap(
+        tfd: Cap<TimerFd>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_timerfd(tfd, flags))
+    }
+
     /// Construct an io_uring-backed `OpenFile` (future PR-12 phase 0 —
     /// second `OnBehalfOf<P>` canary). The resulting value carries
     /// `OpenFileBacking::IoUring { ring }` and no `Cap<RNode>` —
@@ -1136,6 +1198,14 @@ impl OpenFile {
                 "OpenFile::rnode() called on an io_uring-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::io_uring() first",
             ),
+            OpenFileBacking::Eventfd { .. } => panic!(
+                "OpenFile::rnode() called on an eventfd-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::eventfd() first",
+            ),
+            OpenFileBacking::Timerfd { .. } => panic!(
+                "OpenFile::rnode() called on a timerfd-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::timerfd() first",
+            ),
         }
     }
 
@@ -1190,7 +1260,9 @@ impl OpenFile {
             | OpenFileBacking::AioContext { .. }
             | OpenFileBacking::SignalFd { .. }
             | OpenFileBacking::IoUring { .. }
-            | OpenFileBacking::Epoll { .. } => None,
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. } => None,
         }
     }
 
@@ -1208,7 +1280,9 @@ impl OpenFile {
             | OpenFileBacking::Ufd { .. }
             | OpenFileBacking::SignalFd { .. }
             | OpenFileBacking::IoUring { .. }
-            | OpenFileBacking::Epoll { .. } => None,
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. } => None,
         }
     }
 
@@ -1225,7 +1299,39 @@ impl OpenFile {
             | OpenFileBacking::Ufd { .. }
             | OpenFileBacking::AioContext { .. }
             | OpenFileBacking::IoUring { .. }
-            | OpenFileBacking::Epoll { .. } => None,
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. } => None,
+        }
+    }
+
+    /// `Some(&Cap<EventFd>)` iff this `OpenFile` is the eventfd-backed
+    /// shape.  Returns `None` for every non-eventfd `OpenFile`.
+    pub fn eventfd(&self) -> Option<&Cap<EventFd>> {
+        match &self.backing {
+            OpenFileBacking::Eventfd { efd } => Some(efd),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Timerfd { .. } => None,
+        }
+    }
+
+    /// `Some(&Cap<TimerFd>)` iff this `OpenFile` is the timerfd-backed
+    /// shape.  Returns `None` for every non-timerfd `OpenFile`.
+    pub fn timerfd(&self) -> Option<&Cap<TimerFd>> {
+        match &self.backing {
+            OpenFileBacking::Timerfd { tfd } => Some(tfd),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. } => None,
         }
     }
 
@@ -1243,7 +1349,9 @@ impl OpenFile {
             | OpenFileBacking::Ufd { .. }
             | OpenFileBacking::AioContext { .. }
             | OpenFileBacking::SignalFd { .. }
-            | OpenFileBacking::Epoll { .. } => None,
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. } => None,
         }
     }
 

@@ -650,6 +650,18 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         }
     }
 
+    // ===== Phase 5 — thread-group collapse (if multi-threaded) =======
+    if let Some(payload) = process.payload_slot().lock().as_ref() {
+        let n = payload.thread_count.load(std::sync::atomic::Ordering::Acquire);
+        if n > 1 {
+            *payload.group_exit.lock() = Some(GroupExitState {
+                status: ExitStatus::Exited(0),
+                is_exec: true,
+                remaining_threads: AtomicU32::new(n - 1),
+            });
+        }
+    }
+
     // ===== Phase 5a — eagerly populate partial-last-page bytes ========
     //
     // Per the ELF spec, bytes in the LAST file-backed page of a LOAD
@@ -855,6 +867,14 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     step_close_cloexec_fds(process);
     step_reset_signal_dispositions_for_exec(process);
     step_install_brk_for_exec(process, new_brk_base);
+    // Store executable reference and cmdline for procfs (§EXEC_v1 §3.7).
+    if let Some(payload) = process.payload_slot().lock().as_ref() {
+        if let Some(dentry) = openfile.opendir_dentry() {
+            *payload._exe_file.lock() = Some(dentry.clone());
+        }
+        let cmdline_bytes = argv.first().map(|s| s.to_vec()).unwrap_or_default();
+        *payload._cmdline.lock() = Some(cmdline_bytes);
+    }
     // vfork completion: if the parent is waiting on CLONE_VFORK,
     // unblock it now that exec has completed.
     process.fire_exit_source(Mask::from_bits(1));
