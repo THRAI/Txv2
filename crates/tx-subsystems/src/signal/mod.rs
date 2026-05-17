@@ -668,10 +668,16 @@ pub fn deliver_posix_signal(
     let cap = match target {
         SignalTarget::Process(cap) => cap,
         SignalTarget::ProcessGroup(_group) => {
-            todo!("deliver_posix_signal: ProcessGroup not yet implemented");
+            // Not yet implemented — surface as no-live-thread.
+            return KillOutcome::NoLiveThread;
         }
-        SignalTarget::Thread(_thread) => {
-            todo!("deliver_posix_signal: per-thread signal not yet implemented");
+        SignalTarget::Thread(thread_cap) => {
+            // Upgrade to owning process cap for signal routing.
+            let guard = step_engine::guard();
+            match thread_cap.upgrade_owner_proc() {
+                Some(proc) => proc,
+                None => return KillOutcome::NoLiveThread,
+            }
         }
     };
 
@@ -1274,6 +1280,22 @@ impl<I: SubjectIdentity> StepOp<I> for KillPgrpOp {
 }
 
 impl OneShotStepOp<crate::process::ProcessIdentity> for KillPgrpOp {}
+
+/// `StepOp` wrap for [`deliver_posix_signal`].
+pub struct DeliverSignalOp {
+    pub target: SignalTarget,
+    pub sig: Signum,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for DeliverSignalOp {
+    type Output = KillOutcome;
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(deliver_posix_signal(self.target, self.sig))
+    }
+}
+
+impl<I: SubjectIdentity> OneShotStepOp<I> for DeliverSignalOp {}
 
 /// `StepOp` wrap for [`step_sigaction`]. PR-2 wave 2.
 pub struct SigactionOp {
