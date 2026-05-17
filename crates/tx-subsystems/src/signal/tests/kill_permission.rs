@@ -223,6 +223,52 @@ fn script_kill_pgrp_partial_permission_returns_count_of_permitted() {
 }
 
 #[test]
+fn authorize_signal_send_yields_three_state_outcome() {
+    // Pin the three-state contract of `cred::checks::authorize_signal_send`:
+    //   • same uid                  → Ok(Authorized)
+    //   • different uid, no caps    → Err(EPERM)
+    //   • target zombie             → Ok(NoLiveTarget)
+    //   • source zombie             → Err(ESRCH)
+    // The four outcomes drive the dispatch branches in every signal
+    // script that consumes the combinator.
+    use crate::cred::checks::{authorize_signal_send, AuthOutcome};
+
+    let _g = setup();
+    let parent = fresh_init();
+    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
+
+    // Same uid (both root inherited from bootstrap).
+    assert_eq!(
+        authorize_signal_send(&parent, &child, Signum::SIGTERM),
+        Ok(AuthOutcome::Authorized),
+    );
+
+    // Mismatched non-privileged uids.
+    set_cred(&parent, limited_cred(1000));
+    set_cred(&child, limited_cred(2000));
+    assert_eq!(
+        authorize_signal_send(&parent, &child, Signum::SIGTERM),
+        Err(Errno::EPERM),
+    );
+
+    // Zombie target: re-bootstrap a fresh child, reap it, and check.
+    crate::process::step_exit_group(&child, crate::process::ExitStatus::Exited(0));
+    assert_eq!(
+        authorize_signal_send(&parent, &child, Signum::SIGTERM),
+        Ok(AuthOutcome::NoLiveTarget),
+    );
+
+    // Zombie source.
+    let live_target =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
+    crate::process::step_exit_group(&parent, crate::process::ExitStatus::Exited(0));
+    assert_eq!(
+        authorize_signal_send(&parent, &live_target, Signum::SIGTERM),
+        Err(Errno::ESRCH),
+    );
+}
+
+#[test]
 fn script_deliver_signal_to_thread_denied_for_mismatched_uid() {
     use crate::signal::{script_deliver_signal, KillOutcome, SignalTarget};
 
