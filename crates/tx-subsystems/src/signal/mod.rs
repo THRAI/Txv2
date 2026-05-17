@@ -1170,6 +1170,76 @@ pub(crate) fn script_kill_pgrp_with_guard(
     Ok(delivered)
 }
 
+/// Cred-checked counterpart to [`deliver_posix_signal`].
+///
+/// Runs `cred::require_signal_send` against `source`'s syscall-entry
+/// snapshot before invoking the disposition-aware delivery primitive.
+/// Used by `sys_tkill` / `sys_tgkill` so a thread-targeted post is
+/// authorised by the same POSIX rule as a process-targeted `kill`
+/// (txKernel has no per-thread cred today; the rule resolves to the
+/// owning process's cred).
+///
+/// `target` may be [`SignalTarget::Process`] or
+/// [`SignalTarget::Thread`]. The `ProcessGroup` variant is rejected
+/// with `Ok(NoLiveThread)` — pgrp fanout flows through
+/// [`script_kill_pgrp`] instead.
+///
+/// Returns:
+/// - `Ok(Delivered)` / `Ok(NoLiveThread)` — outcome of the delivery
+///   primitive after a successful cred check.
+/// - `Err(Errno::ESRCH)` — `source` is a zombie.
+/// - `Err(Errno::EPERM)` — cred check denied the post.
+pub fn script_deliver_signal(
+    source: &Cap<ProcessIdentity>,
+    target: SignalTarget,
+    sig: Signum,
+) -> Result<KillOutcome, Errno> {
+    // Resolve the target's owning process *before* taking the
+    // auth-phase guard — `upgrade_owner_proc()` takes its own guard
+    // internally, and nesting would trip the no-nested-guard
+    // invariant.
+    let target_proc = match &target {
+        SignalTarget::Process(cap) => cap.clone(),
+        SignalTarget::Thread(t) => match t.upgrade_owner_proc() {
+            Some(p) => p,
+            None => return Ok(KillOutcome::NoLiveThread),
+        },
+        // Pgrp fanout has its own cred-checked script
+        // (`script_kill_pgrp`). Reject here defensively rather than
+        // delivering unchecked.
+        SignalTarget::ProcessGroup(_) => return Ok(KillOutcome::NoLiveThread),
+    };
+
+    // Phase 1 — authorise under a fresh guard. The block scope ends
+    // before commit so the inner delivery path can take its own
+    // guard for SigInfo storage / weak upgrades without nesting.
+    {
+        let guard = step_engine::guard();
+        let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
+        let Some(target_facts) = target_proc.target_proc_cred_for(source) else {
+            return Ok(KillOutcome::NoLiveThread);
+        };
+        let _auth =
+            crate::cred::require_signal_send(&source_snapshot, &target_facts, sig, &guard)?;
+    }
+
+    // Phase 2 — commit. We pass `SignalTarget::Process(target_proc)`
+    // (the already-resolved owning process) rather than the original
+    // `target`, even for thread-targeted calls. Reasons:
+    //   • `deliver_posix_signal`'s `SignalTarget::Thread` branch
+    //     calls `upgrade_owner_proc` under a held guard, which would
+    //     nest a guard inside `Weak::upgrade`'s own guard and trip
+    //     the no-nested-guard invariant.
+    //   • txKernel currently delivers process-targeted even for
+    //     `tkill`/`tgkill` (thread-specific delivery is a later
+    //     phase); routing through Process matches that behaviour.
+    // `deliver_posix_signal` honours the target's `sig_actions` for
+    // catchable signals, default-action mapping for unhandled ones,
+    // and gewalt routing for SIGKILL/SIGSTOP/SIGCONT.
+    drop(target);
+    Ok(deliver_posix_signal(SignalTarget::Process(target_proc), sig))
+}
+
 // ----- TTY job-control bridge -----
 
 /// Map a TTY [`JobControlSignal`](crate::tty::execution::JobControlSignal)

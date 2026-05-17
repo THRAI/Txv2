@@ -274,11 +274,24 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             None => return SyscallResult::Error(EINVAL_VALUE),
         };
         let pgrp = ctx.process.pgrp_cap();
-        let delivered = step_kill_pgrp(&pgrp, signum);
+        // Route through script_kill_pgrp (cred-checked per-member fanout)
+        // rather than the primitive step_kill_pgrp, which would deliver
+        // without consulting cred::require_signal_send.
+        // script_kill_pgrp returns Err(ESRCH) only if the caller itself
+        // is a zombie — impossible inside a live syscall arm, but
+        // bubbled up via errno_to_i32 for parity.
+        let delivered =
+            match tx_subsystems::signal::script_kill_pgrp(&ctx.process, &pgrp, signum) {
+                Ok(n) => n,
+                Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+            };
         return if delivered > 0 {
             SyscallResult::Return(0)
         } else {
-            SyscallResult::Error(ESRCH_VALUE)
+            // POSIX: kill(0, sig) returns -EPERM when no member was
+            // both live AND permitted. script_kill_pgrp folds zombies
+            // and permission denials into the same 0-count return.
+            SyscallResult::Error(EPERM_VALUE)
         };
     }
     if pid <= 0 {
@@ -353,15 +366,19 @@ pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             Some(s) => s,
             None => return SyscallResult::Error(EINVAL_VALUE),
         };
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = DeliverSignalOp {
-            target: SignalTarget::Thread(thread_cap),
-            sig: signum,
-        };
-        return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        // Route through the cred-checked thread-deliver script.
+        // POSIX: tkill(tid, sig) is permission-governed by the same
+        // rule as kill(pid, sig) (txKernel has no per-thread cred;
+        // require_signal_send resolves against the owning process's
+        // cred). The previous DeliverSignalOp drive bypassed this.
+        return match tx_subsystems::signal::script_deliver_signal(
+            &ctx.process,
+            SignalTarget::Thread(thread_cap),
+            signum,
+        ) {
             Ok(KillOutcome::Delivered) => SyscallResult::Return(0),
             Ok(KillOutcome::NoLiveThread) => SyscallResult::Error(ESRCH_VALUE),
-            Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(e) => SyscallResult::Error(errno_to_i32(e)),
         };
     }
 
@@ -379,7 +396,11 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     let tgid = args[0] as u32;
     let tid = args[1] as u32;
     let sig = args[2] as u32;
-    // Validate tgid.
+    // Validate tgid. v1 limitation: tgid must match the caller's pid
+    // (caller may only tgkill threads in its own thread group). This
+    // is what makes the cred check below trivially self-permitted —
+    // when cross-process tgkill lands the dispatch must route through
+    // `script_deliver_signal` (cred-checked) the way sys_tkill does.
     if tgid != ctx.process.pid.0 {
         return SyscallResult::Error(ESRCH_VALUE);
     }

@@ -223,6 +223,60 @@ fn script_kill_pgrp_partial_permission_returns_count_of_permitted() {
 }
 
 #[test]
+fn script_deliver_signal_to_thread_denied_for_mismatched_uid() {
+    use crate::signal::{script_deliver_signal, KillOutcome, SignalTarget};
+
+    let _g = setup();
+    let parent = fresh_init();
+    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
+
+    set_cred(&parent, limited_cred(1000));
+    set_cred(&child, limited_cred(2000));
+
+    // Target the child's leader thread directly. The script must
+    // resolve the thread → owning process → cred check, and the
+    // mismatched uids without CAP_KILL must surface as EPERM.
+    let leader = {
+        let payload = child.payload.lock();
+        let payload = payload.as_ref().expect("alive");
+        payload.threads.nth(0).expect("leader")
+    };
+
+    let outcome = script_deliver_signal(&parent, SignalTarget::Thread(leader), Signum::SIGTERM);
+    assert_eq!(outcome, Err(Errno::EPERM));
+
+    // No post should have happened — verify the child's leader has
+    // no pending SIGTERM.
+    let pending = {
+        let payload = child.payload.lock();
+        let payload = payload.as_ref().unwrap();
+        let leader = payload.threads.nth(0).unwrap();
+        let lp = leader.payload.lock();
+        lp.as_ref().unwrap().pending().is_pending(Signum::SIGTERM)
+    };
+    assert!(!pending, "denied delivery must not post");
+}
+
+#[test]
+fn script_deliver_signal_to_thread_delivers_when_authorized() {
+    use crate::signal::{script_deliver_signal, KillOutcome, SignalTarget};
+
+    let _g = setup();
+    let parent = fresh_init();
+    let child = crate::process::step_fork::<crate::vm::TestPmap>(&parent, false).expect("fork");
+
+    // Both inherit root cred → same euid → permitted.
+    let leader = {
+        let payload = child.payload.lock();
+        let payload = payload.as_ref().expect("alive");
+        payload.threads.nth(0).expect("leader")
+    };
+
+    let outcome = script_deliver_signal(&parent, SignalTarget::Thread(leader), Signum::SIGTERM);
+    assert_eq!(outcome, Ok(KillOutcome::Delivered));
+}
+
+#[test]
 fn signal_zero_is_permission_probe_no_delivery() {
     let _g = setup();
     let parent = fresh_init();
