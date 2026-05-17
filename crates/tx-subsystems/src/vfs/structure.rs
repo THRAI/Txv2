@@ -15,7 +15,7 @@ use crate::vfs::adapter::step_engine::{self, Cap, Weak, Zone, ZoneAllocated, Zon
 use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
 
 use crate::aio::AioContext;
-use crate::cred::{CapabilitySet, Cred};
+use crate::cred::{CapabilitySet, Cred, CredSnapshot};
 use crate::device::{BlockDeviceRegistration, CharDeviceBinding};
 use crate::epoll::Epoll;
 use crate::eventfd::EventFd;
@@ -145,6 +145,18 @@ impl From<&Cred> for Credential {
             gid: cred.egid.raw(),
             effective_caps: cred.effective_caps,
         }
+    }
+}
+
+/// Project a syscall-entry [`CredSnapshot`] onto the walker-side
+/// `Credential` directly, skipping the intermediate by-value `Cred`
+/// copy. Same projection rule as `From<&Cred>` (DAC uses **euid** /
+/// **egid**, drops `permitted_caps`), but call sites that hold a
+/// `&CredSnapshot` from `SyscallCtx::cred_snapshot()` can land here in
+/// one step.
+impl From<&CredSnapshot> for Credential {
+    fn from(snapshot: &CredSnapshot) -> Self {
+        Self::from(snapshot.as_cred())
     }
 }
 

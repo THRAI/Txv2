@@ -132,17 +132,19 @@ impl<'a> SyscallCtx<'a> {
     }
 
     /// Walker-side projection of the current cred. Builds a fresh
-    /// [`Credential`] from `self.cred()` via the
-    /// `From<&Cred> for Credential` bridge (Wave 1) — uses **euid**
-    /// and **egid** (the POSIX rule for DAC checks), and forwards
+    /// [`Credential`] directly from [`Self::cred_snapshot`] via the
+    /// `From<&CredSnapshot> for Credential` bridge — uses **euid**
+    /// and **egid** (the POSIX rule for DAC checks) and forwards
     /// `effective_caps` so the walker can short-circuit on
     /// `CAP_DAC_OVERRIDE` without re-locking the per-process cred.
     ///
-    /// Returned by value (never as a reference into the lock) so the
-    /// snapshot can be held across `.await` points in callers like
-    /// `sys_execve` that drive the multi-phase `exec_script`.
+    /// Returned by value so the projection can be held across
+    /// `.await` points in callers like `sys_execve` that drive the
+    /// multi-phase `exec_script`. The projection reflects the same
+    /// frozen syscall-entry snapshot every other `ctx.cred*` accessor
+    /// reads from.
     pub fn walker_cred(&self) -> Credential {
-        Credential::from(&self.cred())
+        Credential::from(&self.cred_snapshot)
     }
 
     /// Snapshot the current process's `Cap<Cred>`. Returns a cloned
