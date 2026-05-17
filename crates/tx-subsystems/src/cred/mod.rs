@@ -32,6 +32,7 @@
 use core::marker::PhantomData;
 
 pub mod adapter;
+pub mod checks;
 
 use adapter::step_engine::{
     self, Cap, CredentialView, Guard, NoProgress, OneShotStepOp, RestrictionStackHandle, ScriptCtx,
