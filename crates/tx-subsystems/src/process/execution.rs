@@ -1,6 +1,5 @@
 //! Process subsystem execution: fork, exit-group, setpgid, setsid, and
-//! the internal `step_process_exit` last-thread cascade.
-
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -15,7 +14,7 @@ use crate::process::adapter::wait_routing::{self, Mask};
 
 use crate::cred::Cred;
 use crate::process::structure::{
-    allocate_pid, ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,
+    ExitStatus, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session,
     Sid,
 };
 use crate::process::topology::{ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers};
@@ -26,38 +25,49 @@ use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
 
 // ---------------------------------------------------------------------------
-// Global PID → ProcessIdentity table (for procfs / kill cross-pid lookup)
+// PID namespacing — delegates to `crate::process::numbers`
 // ---------------------------------------------------------------------------
 
-static PID_TABLE: SpinMutex<BTreeMap<Pid, Weak<ProcessIdentity>>> = SpinMutex::new(BTreeMap::new());
+use crate::process::numbers::{
+    allocate_pid, PidName, PidNameKind, register_pid as ns_register_pid,
+    register_tid, unregister_pid_number, resolve_pid_number, with_namespace,
+};
 
-/// Register a process in the global PID table. Called at `step_fork`
-/// and `bootstrap_init_process`.
-pub(crate) fn register_pid(pid: Pid, proc: Weak<ProcessIdentity>) {
-    PID_TABLE.lock().insert(pid, proc);
+/// Register a process pid → Cap binding. The Cap must be fully
+/// constructed before this call (call it AFTER `step_engine::sign`).
+pub(crate) fn register_pid(pid: Pid, cap: Cap<ProcessIdentity>) {
+    ns_register_pid(pid, cap);
 }
 
-/// Remove a process from the global PID table. Called at
-/// `step_process_exit`.
+/// Remove a pid/tid from the namespace.
 pub(crate) fn unregister_pid(pid: Pid) {
-    PID_TABLE.lock().remove(&pid);
+    unregister_pid_number(pid.0 as u64);
 }
 
-/// Look up a process by PID. Returns `None` if the PID is not
-/// registered or the process has been reclaimed.
-/// Return all registered PIDs with alive/zombie status.
-/// Used by procfs `/proc` directory listings.
-pub fn all_pids() -> alloc::vec::Vec<(Pid, bool)> {
-    let table = PID_TABLE.lock();
-    table
-        .iter()
-        .map(|(&pid, weak)| (pid, weak.upgrade(&step_engine::guard()).is_some()))
-        .collect()
-}
-
+/// Look up a process by PID.
 pub fn process_by_pid(pid: Pid) -> Option<Cap<ProcessIdentity>> {
-    let guard = step_engine::guard();
-    PID_TABLE.lock().get(&pid)?.upgrade(&guard)
+    match resolve_pid_number(pid.0 as u64) {
+        Some(PidName::Process(cap)) => Some(cap),
+        _ => None,
+    }
+}
+
+/// Return all registered PIDs with alive status (for procfs).
+pub fn all_pids() -> alloc::vec::Vec<(Pid, bool)> {
+    let mut out = alloc::vec::Vec::new();
+    with_namespace(|ns| {
+        for (&num, name) in ns.iter() {
+            if matches!(name.kind(), PidNameKind::Process) {
+                out.push((Pid(num as u32), true));
+            }
+        }
+    });
+    out
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn reset_pid_counter_for_test() {
+    crate::process::numbers::reset_pid_counter_for_test();
 }
 
 
@@ -119,6 +129,11 @@ pub enum ForkError {
     ParentZombie,
     /// VM-side fork failed.
     Vm(VmMapError),
+    /// Transient failure — resource contention (GroupExit in progress,
+    /// clone-thread during shutdown, etc.)
+    Busy,
+    /// Tid allocation or pid-namespace registration failed.
+    PidNamespace,
     /// Zone allocator could not satisfy the reservation.
     Zone(ZoneError),
 }
@@ -289,6 +304,43 @@ pub fn bootstrap_init_process(
     Ok(proc_cap)
 }
 
+/// Clone a new thread into an existing process (CLONE_THREAD).
+///
+/// Five-phase protocol — PROCESS_v1 §7.1.3.
+pub fn step_clone_thread(
+    process: &Cap<ProcessIdentity>,
+    parent_ctx: &UserTrapContext,
+) -> Result<Cap<ThreadIdentity>, ForkError> {
+    use crate::process::numbers::register_tid;
+    use crate::thread_runtime::structure::allocate_tid;
+
+    // 1. Observe — check GroupExit not in progress
+    if let Some(payload) = process.payload.lock().as_ref() {
+        if payload.group_exit.lock().is_some() {
+            return Err(ForkError::ParentZombie);
+        }
+    }
+
+    // 3. Reserve — allocate new ThreadIdentity
+    let tid = allocate_tid();
+    let thread = sign_thread(process.downgrade())
+        .map_err(|_| ForkError::PidNamespace)?;
+
+    // 4. Commit (infallible)
+    let payload_guard = process.payload.lock();
+    let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
+    payload.threads.attach(thread.clone());
+    payload.thread_count.fetch_add(1, Ordering::Relaxed);
+    register_tid(tid, thread.clone());
+
+    // Seed child's user context from parent
+    if let Some(payload_cap) = thread.payload_cap() {
+        payload_cap.store_saved_user_context(Some(parent_ctx.clone()));
+    }
+
+    Ok(thread)
+}
+
 /// Fork a process: clones the parent's address space, allocates a new
 /// pid + leader tid, inherits the parent's pgrp/session, returns the
 /// child identity.
@@ -350,7 +402,7 @@ pub fn step_fork<P: PmapIf>(
     let child_proc =
         sign_process_identity(child_pid, Some(parent.downgrade()), parent_pgrp.clone())
             .map_err(ForkError::Zone)?;
-    register_pid(child_pid, child_proc.downgrade());
+    register_pid(child_pid, child_proc.clone());
 
     // Leader thread.
     let leader = sign_thread(child_proc.downgrade()).map_err(ForkError::Zone)?;
@@ -539,6 +591,7 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
 /// alongside the SIGCHLD post for parent-side wake.
 pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     // observe
+    if let Some(payload) = process.payload.lock().as_ref() { payload.notify_vfork_done(); }
     // upgrade
     // reserve
     // commit
@@ -1047,6 +1100,10 @@ fn sign_process_payload(
         _cmdline: SpinMutex::new(None),
         _exe_file: SpinMutex::new(None),
         _comm: SpinMutex::new([0u8; 16]),
+        thread_count: AtomicU32::new(1), // leader thread
+        group_exit: SpinMutex::new(None),
+        vfork_done: AtomicBool::new(false),
+        vfork_waiter: SpinMutex::new(None),
     })?;
     Ok(PayloadCap::from_cap(cap))
 }

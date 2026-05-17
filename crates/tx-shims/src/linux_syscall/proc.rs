@@ -158,7 +158,12 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     .await;
 
     match outcome {
-        Ok(()) => SyscallResult::ExecCommitted,
+        Ok(()) => {
+            // vfork parent notification: wake any parent parked in
+            // sys_clone waiting for this process to exec.
+            ctx.process.notify_vfork_done();
+            SyscallResult::ExecCommitted
+        }
         Err(e) => SyscallResult::Error(execve_errno_magnitude(e)),
     }
 }
@@ -226,7 +231,10 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
 /// v1's single-thread-per-process model). The function is non-`async`
 /// to keep the seam minimal.
-pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_clone<'a, P: PmapIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let flags = args[0];
     let stack = args[1];
 
@@ -236,8 +244,9 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         return SyscallResult::Error(EINVAL_VALUE);
     }
     let clone_vm = (flags & CLONE_VM) != 0;
+    let clone_vfork = (flags & CLONE_VFORK) != 0;
     let clone_settls = (flags & CLONE_SETTLS) != 0;
-    let allowed_mask = SIGCHLD | CLONE_SETTLS | CLONE_VM;
+    let allowed_mask = SIGCHLD | CLONE_SETTLS | CLONE_VM | CLONE_VFORK;
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
@@ -322,9 +331,47 @@ pub(super) fn sys_clone<'a, P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     // seam — that's a boot-time invariant violation.
     reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
 
-    // Parent observes the child's pid. The trap shell drains
-    // `pending_syscall_return` into the parent's fresh trap frame's
-    // a0 before re-entry per Plan B.
+    // vfork: parent blocks until the child execs or exits.  The
+    // child's exec and exit paths both call notify_vfork_done(),
+    // which fires the waker we store here.
+    if clone_vfork {
+        use core::future::Future;
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+
+        struct VforkWait<'a> {
+            child: &'a Cap<ProcessIdentity>,
+            stored: bool,
+        }
+
+        impl Future for VforkWait<'_> {
+            type Output = ();
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if !self.stored {
+                    // Store the parent's waker on the child's
+                    // ProcessPayload so the child's exec/exit paths
+                    // can wake us.
+                    if let Some(payload) = self.child.payload_slot().lock().as_ref() {
+                        *payload.vfork_waiter.lock() = Some(cx.waker().clone());
+                    }
+                    self.stored = true;
+                }
+                if self.child.is_vfork_done() {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            }
+        }
+
+        VforkWait {
+            child: &child,
+            stored: false,
+        }
+        .await;
+    }
+
+    // Parent observes the child's pid.
     SyscallResult::Return(child.pid.0 as i64)
 }
 
