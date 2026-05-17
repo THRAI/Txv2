@@ -12,7 +12,6 @@ use crate::tty::adapter::step_engine::Cap;
 use crate::execution::{Errno, Guard};
 #[cfg(test)]
 use crate::tty::adapter::step_engine::ByteProgress;
-#[cfg(test)]
 use crate::tty::adapter::step_engine::{self as step_engine};
 use crate::tty::adapter::step_engine::{
     NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
@@ -156,14 +155,14 @@ pub fn step_poll_hardware_input(
 pub struct PollHardwareInputOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub max_bytes: usize,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for PollHardwareInputOp<'a> {
     type Output = HardwarePollOutcome;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_poll_hardware_input(self.tty, self.max_bytes, self.guard)
+        let __guard = step_engine::guard();
+        step_poll_hardware_input(self.tty, self.max_bytes, &__guard)
     }
 }
 
@@ -229,7 +228,6 @@ mod step_op_wraps {
         let mut op = PollHardwareInputOp {
             tty: &tty,
             max_bytes: 0,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
@@ -251,7 +249,6 @@ mod step_op_wraps {
         let mut op = PollHardwareInputOp {
             tty: &tty,
             max_bytes: 8,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);

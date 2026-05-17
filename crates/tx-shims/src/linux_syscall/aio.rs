@@ -222,7 +222,6 @@ fn run_lseek_set(file: &Cap<OpenFile>, offset: i64) -> bool {
         file,
         offset,
         whence: 0, // SEEK_SET
-        guard: &guard,
     };
     matches!(
         op.step(&mut script_ctx),
@@ -241,11 +240,10 @@ fn run_read(file: &Cap<OpenFile>, out: &mut [u8]) -> Result<usize, i64> {
     let total_len = out.len();
     loop {
         let outcome = {
-            let guard = step_engine::guard();
+            // Op acquires its own guard inside `step()` (STEP_MODEL_v2 §1).
             let mut op = OpenFileReadOp {
                 file,
                 out: &mut out[total..],
-                guard: &guard,
                 cursor: 0,
             };
             op.step(&mut script_ctx)
@@ -289,11 +287,9 @@ fn run_write(file: &Cap<OpenFile>, bytes: &[u8]) -> Result<usize, i64> {
     let mut remaining = bytes;
     loop {
         let outcome = {
-            let guard = step_engine::guard();
             let mut op = OpenFileWriteOp {
                 file,
                 bytes: remaining,
-                guard: &guard,
                 cursor: 0,
             };
             op.step(&mut script_ctx)

@@ -584,7 +584,6 @@ impl OneShotStepOp<crate::process::ProcessIdentity> for Pipe2Op {}
 pub struct ReadOp<'a> {
     pub payload: &'a Cap<PipePayload>,
     pub out: &'a mut [u8],
-    pub guard: &'a Guard<'a>,
     pub nonblocking: bool,
 }
 
@@ -592,7 +591,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_read(self.payload, self.out, self.guard, self.nonblocking)
+        let __guard = step_engine::guard();
+        step_read(self.payload, self.out, &__guard, self.nonblocking)
     }
 }
 
@@ -600,7 +600,6 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
 pub struct WriteOp<'a> {
     pub payload: &'a Cap<PipePayload>,
     pub bytes: &'a [u8],
-    pub guard: &'a Guard<'a>,
     pub nonblocking: bool,
 }
 
@@ -608,7 +607,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_write(self.payload, self.bytes, self.guard, self.nonblocking)
+        let __guard = step_engine::guard();
+        step_write(self.payload, self.bytes, &__guard, self.nonblocking)
     }
 }
 
@@ -1283,7 +1283,6 @@ mod step_op_wraps {
         let mut op = ReadOp {
             payload: &payload,
             out: &mut empty,
-            guard: &guard,
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
@@ -1304,7 +1303,6 @@ mod step_op_wraps {
         let mut op = ReadOp {
             payload: &payload,
             out: &mut buf,
-            guard: &guard,
             nonblocking: true,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
@@ -1328,7 +1326,6 @@ mod step_op_wraps {
         let mut op = ReadOp {
             payload: &payload,
             out: &mut buf,
-            guard: &guard,
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
@@ -1352,7 +1349,6 @@ mod step_op_wraps {
         let mut op = ReadOp {
             payload: &payload,
             out: &mut buf,
-            guard: &guard,
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
@@ -1384,7 +1380,6 @@ mod step_op_wraps {
         let mut op = WriteOp {
             payload: &payload,
             bytes,
-            guard: &guard,
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
@@ -1407,7 +1402,6 @@ mod step_op_wraps {
         let mut op = WriteOp {
             payload: &payload,
             bytes,
-            guard: &guard,
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
@@ -1431,7 +1425,6 @@ mod step_op_wraps {
         let mut op = WriteOp {
             payload: &payload,
             bytes,
-            guard: &guard,
             nonblocking: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());

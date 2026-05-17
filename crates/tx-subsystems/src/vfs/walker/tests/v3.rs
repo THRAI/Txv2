@@ -196,7 +196,7 @@ impl crate::page_backed::FsPageBacking for TestFs {
         StepOutcome::err(Errno::ENOSYS)
     }
 
-    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         StepOutcome::done(())
     }
 }
@@ -292,7 +292,7 @@ fn testfs_v3_fetch_page_default_returns_enosys() {
         V3::<Frame, NoProgress>::err(V3Errno::ENOSYS)
     );
     assert_eq!(
-        <TestFs as FsPageBacking>::fsync(&*testfs, FsObjectId::new(2), &guard),
+        <TestFs as FsPageBacking>::fsync_file(&*testfs, FsObjectId::new(2), &guard),
         V3::<(), NoProgress>::done(())
     );
 }

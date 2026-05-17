@@ -286,37 +286,41 @@ pub async fn run_thread<P: TxPlatform>(
 
                     // Read current mask to pass to the handler.
                     let old_mask = payload.signal_mask();
-                    let guard = boot_runtime::ast::guard();
 
                     // Build the signal frame write descriptor.
                     let stack_top = tx_hal::UserPtr::<u8>::new(orig_ctx.regs[2]); // sp
                     let setup = tx_hal::SignalFrameWrite {
                         stack_top,
                         sig_no: sig.raw() as u32,
-                        siginfo: tx_hal::UserSigInfoAbi::default(),
-                        old_mask: tx_hal::UserSignalMaskAbi(old_mask.raw_bits()),
-                        flags: tx_hal::UserSaFlagsAbi(0),
+                        siginfo: tx_hal::UserSigInfoAbi::ZERO,
+                        old_mask: tx_hal::UserSignalMaskAbi { bits: old_mask.raw_bits() },
+                        flags: tx_hal::UserSaFlagsAbi { bits: 0 },
                         handler_pc: tx_hal::UserPtr::<()>::new(handler as usize),
                     };
 
-                    match <P as tx_hal::SignalFrameIf>::prepare_signal_frame(
+                    // Guard is scoped inside this block so it does not
+                    // straddle the next `.await` further down in
+                    // `run_thread` (the spawned future must be `Send`).
+                    let prepared = <P as tx_hal::SignalFrameIf>::prepare_signal_frame(
                         &orig_ctx, &setup,
-                    ) {
+                    );
+                    match prepared {
                         Ok((handler_ctx, frame_bytes)) => {
-                            // Write frame to user stack.
                             let frame_addr = handler_ctx.regs[2];
-                            let _ = aspace.copy_to_user(
-                                tx_hal::UserPtr::<u8>::new(frame_addr),
-                                frame_bytes.as_slice(),
-                                &guard,
-                            );
-                            // Set the handler-entry context.
+                            {
+                                let guard = crate::adapter::step_engine::guard();
+                                let _ = aspace.copy_to_user(
+                                    tx_hal::UserPtr::<u8>::new(frame_addr),
+                                    frame_bytes.as_slice(),
+                                    &guard,
+                                );
+                            }
                             payload.store_saved_user_context(Some(handler_ctx));
                         }
                         Err(_) => {
                             // Signal frame write failed (bad stack).
                             // Take default action: terminate.
-                            crate::process::execution::step_exit_group_with_signal(
+                            tx_subsystems::process::execution::step_exit_group_with_signal(
                                 &process, sig,
                             );
                             return;

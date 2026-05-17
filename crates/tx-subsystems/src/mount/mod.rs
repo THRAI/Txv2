@@ -693,7 +693,7 @@ pub fn bootstrap_mount(
 
     // Drive materialise_rnode to completion.
     let root_rnode = match drive_step_outcome_to_done(
-        || fs_ops.materialise_rnode(root_id, root_meta, guard),
+        || fs_ops.materialise_rnode(root_id, root_meta, &source_payload, guard),
         guard,
     ) {
         Ok(rnode) => rnode,
@@ -978,7 +978,7 @@ mod tests {
             StepOutcome::err(V3Errno::EROFS)
         }
 
-        fn fsync(
+        fn fsync_file(
             &self,
             _fs_object_id: FsObjectId,
             _guard: &Guard<'_>,

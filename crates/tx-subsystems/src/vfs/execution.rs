@@ -173,15 +173,24 @@ pub trait FsOps: Send + Sync + 'static {
     }
 
     /// Backend hook for materialising an `RNode` for a non-directory,
-    /// non-symlink inode. Default returns `ENOSYS` (parity with
-    /// [`FsOps::materialise_rnode`]).
+    /// non-symlink inode. Implementations MUST stamp the returned
+    /// `Cap<RNode>` with `mount` so the walker can resolve the
+    /// in-scope `FsOps` for the resulting dentry via
+    /// `containing_mount_weak()`. Use
+    /// [`RNode::new_cap_in_mount`] (not `RNode::new_cap`).
+    ///
+    /// Without this stamp, `walker::fs_ops_for(target)` returns
+    /// `None` and any subsequent op against the file (chmod, chown,
+    /// statx, etc.) panics with `NoFsOps for ChmodOp`. Default
+    /// returns `ENOSYS`.
     fn materialise_rnode(
         &self,
         fs_object_id: FsObjectId,
         meta: InodeMeta,
+        mount: &Cap<MountPayload>,
         guard: &Guard<'_>,
     ) -> StepOutcome<Cap<crate::vfs::structure::RNode>, NoProgress> {
-        let _ = (fs_object_id, meta, guard);
+        let _ = (fs_object_id, meta, mount, guard);
         StepOutcome::err(Errno::ENOSYS)
     }
 
@@ -634,10 +643,14 @@ fn step_tty_ioctl(
 // step_read::ReadOp`).
 
 /// `StepOp` wrap of [`OpenFile::step_read`].
+///
+/// Per `STEP_MODEL_v2` §1 + `INVARIANTS_v5` YIELD-5/EBR-7, each `step()`
+/// call acquires its own epoch guard; the op carries no `&Guard` field
+/// so the wrapping future is `Send` (the reactor contract) and the
+/// guard never crosses `.await`.
 pub struct OpenFileReadOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub out: &'a mut [u8],
-    pub guard: &'a Guard<'a>,
     /// Internal write cursor: each `step()` call fills bytes starting
     /// at `out[cursor..]` and advances `cursor` by the amount returned
     /// in the outcome. This allows `drive()` to call `step()` multiple
@@ -650,7 +663,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        let result = self.file.step_read(&mut self.out[self.cursor..], self.guard);
+        let guard = step_engine::guard();
+        let result = self.file.step_read(&mut self.out[self.cursor..], &guard);
         // Advance cursor by the bytes read in this step. The
         // `StepProgress` accumulator (ByteProgress) carries the same
         // value, so `drive()`'s `accumulated` stays in sync with the
@@ -677,14 +691,14 @@ pub struct OpenFileLseekOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub offset: i64,
     pub whence: u32,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileLseekOp<'a> {
     type Output = u64;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        self.file.step_lseek(self.offset, self.whence, self.guard)
+        let __guard = step_engine::guard();
+        self.file.step_lseek(self.offset, self.whence, &__guard)
     }
 }
 
@@ -692,10 +706,11 @@ impl OneShotStepOp for OpenFileLseekOp<'_> {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for OpenFileLseekOp<'_> {}
 
 /// `StepOp` wrap of [`OpenFile::step_write`].
+///
+/// Each `step()` call acquires its own epoch guard (STEP_MODEL_v2 §1).
 pub struct OpenFileWriteOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub bytes: &'a [u8],
-    pub guard: &'a Guard<'a>,
     /// Internal write cursor: each `step()` call consumes bytes starting
     /// at `bytes[cursor..]`. Mirrors `OpenFileReadOp::cursor`.
     pub cursor: usize,
@@ -705,7 +720,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        let result = self.file.step_write(&self.bytes[self.cursor..], self.guard);
+        let guard = step_engine::guard();
+        let result = self.file.step_write(&self.bytes[self.cursor..], &guard);
         match &result {
             StepOutcome::Done(n) => {
                 self.cursor += *n as usize;
@@ -728,14 +744,14 @@ pub struct OpenFileIoctlOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub caller: OpenFileIoctlCaller<'a>,
     pub request: OpenFileIoctl<'a>,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileIoctlOp<'a> {
     type Output = OpenFileIoctlResult;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        self.file.step_ioctl(self.caller, self.request, self.guard)
+        let __guard = step_engine::guard();
+        self.file.step_ioctl(self.caller, self.request, &__guard)
     }
 }
 
@@ -857,7 +873,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FlockOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         match self.file.flock_acquire(self.lock_type, self.blocking) {
             Ok(()) => StepOutcome::Done(()),
-            Err(e) => StepOutcome::Err(e),
+            Err(e) => StepOutcome::Err(e.into()),
         }
     }
 }
@@ -865,19 +881,23 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FlockOp<'a> {
 impl OneShotStepOp for FlockOp<'_> {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for FlockOp<'_> {}
 
-/// `StepOp` wrap for per-file `fsync` via `PageBacking::fsync`.
-pub struct FileFsyncOp<'a> {
+/// `StepOp` wrap for per-file `fsync` via `FsPageBacking::fsync_file`.
+///
+/// Each `step()` acquires its own epoch guard (STEP_MODEL_v2 §1) so
+/// the op is `Send` and the driving future satisfies the reactor's
+/// `Send + 'static` bound (REACTOR_v0, INVARIANTS_v5 EBR-7).
+pub struct FileFsyncOp {
     pub page_backing: alloc::sync::Arc<dyn crate::page_backed::FsPageBacking>,
     pub fs_object_id: super::structure::FsObjectId,
-    pub guard: &'a crate::execution::Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I> for FileFsyncOp<'a> {
+impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
     type Output = ();
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         use StepOutcome as V3;
-        match self.page_backing.fsync(self.fs_object_id, self.guard) {
+        let guard = step_engine::guard();
+        match self.page_backing.fsync_file(self.fs_object_id, &guard) {
             V3::Done(()) => V3::Done(()),
             V3::Err(e) => V3::Err(e),
             V3::Continue { .. } => V3::Continue { progress: NoProgress },
@@ -1028,7 +1048,6 @@ mod step_op_wraps {
         let mut op = OpenFileReadOp {
             file: &file,
             out: &mut buf,
-            guard: &guard,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1050,7 +1069,6 @@ mod step_op_wraps {
         let mut op = OpenFileReadOp {
             file: &file,
             out: &mut buf,
-            guard: &guard,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1068,7 +1086,6 @@ mod step_op_wraps {
         let mut op = OpenFileWriteOp {
             file: &file,
             bytes: b"hello",
-            guard: &guard,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1086,7 +1103,6 @@ mod step_op_wraps {
         let mut op = OpenFileWriteOp {
             file: &file,
             bytes: b"hi",
-            guard: &guard,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1105,7 +1121,6 @@ mod step_op_wraps {
             file: &file,
             offset: 0,
             whence: 0,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
@@ -1123,7 +1138,6 @@ mod step_op_wraps {
             file: &file,
             offset: 0,
             whence: 0,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
@@ -1153,7 +1167,6 @@ mod step_op_wraps {
             file: &file,
             caller,
             request: OpenFileIoctl::Tcgets,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
@@ -1189,7 +1202,7 @@ pub fn kernel_mkdir(
         _ => return Err(Errno::EIO),
     };
 
-    let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, guard) {
+    let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, mount_payload, guard) {
         StepOutcome::Done(r) => r,
         StepOutcome::Err(e) => return Err(e),
         _ => return Err(Errno::EIO),
@@ -1219,7 +1232,7 @@ pub fn kernel_create(
         _ => return Err(Errno::EIO),
     };
 
-    let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, guard) {
+    let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, mount_payload, guard) {
         StepOutcome::Done(r) => r,
         StepOutcome::Err(e) => return Err(e),
         _ => return Err(Errno::EIO),
@@ -1259,7 +1272,7 @@ pub fn kernel_symlink(
         _ => return Err(Errno::EIO),
     };
 
-    let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, guard) {
+    let rnode = match fs_ops.materialise_rnode(child_fs_id, meta, mount_payload, guard) {
         StepOutcome::Done(r) => r,
         StepOutcome::Err(e) => return Err(e),
         _ => return Err(Errno::EIO),
@@ -1289,7 +1302,6 @@ pub fn kernel_symlink(
             file: &file,
             caller,
             request: OpenFileIoctl::Tcgets,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {

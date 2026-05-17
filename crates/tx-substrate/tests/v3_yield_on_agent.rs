@@ -57,6 +57,7 @@ fn yield_shape_on_agent_constructs_with_placeholder_types() {
         }
         YieldShape::OnWaitSource { .. } => panic!("expected OnAgent, got OnWaitSource"),
         YieldShape::OnTimer { .. } => panic!("expected OnAgent, got OnTimer"),
+        YieldShape::OnEdge { .. } => panic!("expected OnAgent, got OnEdge"),
     }
 }
 
@@ -82,6 +83,7 @@ fn yield_shape_has_exactly_three_variants_via_exhaustive_match() {
             YieldShape::OnWaitSource { .. } => {}
             YieldShape::OnAgent { .. } => {}
             YieldShape::OnTimer { .. } => {}
+            YieldShape::OnEdge { .. } => {}
         }
     }
 }

@@ -299,38 +299,43 @@ pub fn bucket_wait_source_for_source_id(source_id: u64) -> Option<Arc<WaitSource
 // field is held to pin the lifetime.
 
 /// StepOp wrap for [`step_futex_wait`]. PR-2 pilot.
-pub struct FutexWaitOp<'a> {
+///
+/// Carries no `&Guard` field: each `step()` call acquires its own
+/// epoch guard per STEP_MODEL_v2 §1, so the op stays `Send` and the
+/// driving future satisfies the reactor's `Send + 'static` contract
+/// (REACTOR_v0 §Submission, INVARIANTS_v5 EBR-7).
+pub struct FutexWaitOp {
     pub uaddr: u64,
     pub val: u32,
-    pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I> for FutexWaitOp<'a> {
+impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp {
     type Output = ();
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_futex_wait(self.uaddr, self.val, self.guard)
+        let guard = adapter::step_engine::guard();
+        step_futex_wait(self.uaddr, self.val, &guard)
     }
 }
 
 /// StepOp wrap for [`step_futex_wake`]. PR-2 pilot. Note `Output = u32`,
 /// not `()` — wake returns the requested wake count.
-pub struct FutexWakeOp<'a> {
+pub struct FutexWakeOp {
     pub uaddr: u64,
     pub n: u32,
-    pub guard: &'a Guard<'a>,
 }
 
-impl<'a, I: SubjectIdentity> StepOp<I> for FutexWakeOp<'a> {
+impl<I: SubjectIdentity> StepOp<I> for FutexWakeOp {
     type Output = u32;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_futex_wake(self.uaddr, self.n, self.guard)
+        let guard = adapter::step_engine::guard();
+        step_futex_wake(self.uaddr, self.n, &guard)
     }
 }
 
-impl OneShotStepOp for FutexWakeOp<'_> {}
-impl OneShotStepOp<crate::process::ProcessIdentity> for FutexWakeOp<'_> {}
+impl OneShotStepOp for FutexWakeOp {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for FutexWakeOp {}
 
 #[cfg(test)]
 mod tests {
@@ -656,11 +661,11 @@ mod tests {
             // Word holds 0xdead_beef; matching val parks → Yield::OnWaitSource.
             let word: u32 = 0xdead_beef;
             let uaddr = &word as *const u32 as u64;
-            let guard = guard();
+            // FutexWaitOp acquires its own guard inside step() per
+            // STEP_MODEL_v2 §1; outer guard would nest (EBR-7).
             let mut op = FutexWaitOp {
                 uaddr,
                 val: 0xdead_beef,
-                guard: &guard,
             };
             let mut ctx = ScriptCtx::<ProcessIdentity>::new();
             let outcome = op.step(&mut ctx);
@@ -680,16 +685,17 @@ mod tests {
         fn futex_wake_op_step_delegates_to_free_fn() {
             let _setup = setup();
             // Zero uaddr → EINVAL. Output type is u32, not ().
-            let guard = guard();
+            // FutexWakeOp acquires its own guard inside step() per
+            // STEP_MODEL_v2 §1; outer guard would nest (EBR-7).
             let mut op = FutexWakeOp {
                 uaddr: 0,
                 n: 1,
-                guard: &guard,
             };
             let mut ctx = ScriptCtx::<ProcessIdentity>::new();
             let outcome: StepOutcome<u32, NoProgress> = op.step(&mut ctx);
             assert_eq!(outcome, StepOutcome::Err(V3Errno::EINVAL));
             // Sanity: parallel free-fn call matches.
+            let guard = guard();
             let free = step_futex_wake(0, 1, &guard);
             drop(guard);
             assert_eq!(outcome, free);

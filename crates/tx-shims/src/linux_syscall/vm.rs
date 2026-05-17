@@ -645,11 +645,12 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             // After waking, EAGAIN means "word changed → wake was
             // meaningful" → return 0.
             loop {
-                let guard = step_engine::guard();
-                let mut op = FutexWaitOp {
+                // Op acquires its own epoch guard inside `step()`;
+                // no guard crosses `drive(...).await` (REACTOR_v0,
+                // STEP_MODEL_v2 §1, INVARIANTS_v5 EBR-7).
+                let op = FutexWaitOp {
                     uaddr,
                     val,
-                    guard: &guard,
                 };
                 match drive(
                     op,
@@ -674,11 +675,9 @@ pub(super) async fn sys_futex<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         }
         FUTEX_WAKE => {
             let mut script_ctx = build_subject_script_ctx(ctx);
-            let guard = step_engine::guard();
             let mut op = FutexWakeOp {
                 uaddr,
                 n: val,
-                guard: &guard,
             };
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(woken) => SyscallResult::Return(woken as i64),

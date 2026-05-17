@@ -11,6 +11,7 @@ mod read;
 
 use adapter::step_engine::{self, Cap, NoProgress, StepOutcome};
 use tx_subsystems::execution::{Errno, Guard};
+use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::{
@@ -273,9 +274,10 @@ impl FsOps for Procfs {
         &self,
         id: FsObjectId,
         meta: InodeMeta,
+        mount: &Cap<MountPayload>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
-        match RNode::new_cap(id, meta, RNodeBacking::Projected) {
+        match RNode::new_cap_in_mount(id, meta, RNodeBacking::Projected, mount) {
             Ok(cap) => StepOutcome::done(cap),
             Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }

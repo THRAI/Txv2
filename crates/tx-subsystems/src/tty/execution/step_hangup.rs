@@ -6,7 +6,6 @@ use super::step_ioctl::{JobControlSignal, SessionCtlEvent, SignalDispatch, Signa
 use crate::execution::{Errno, Guard};
 #[cfg(test)]
 use crate::tty::adapter::step_engine::ByteProgress;
-#[cfg(test)]
 use crate::tty::adapter::step_engine::{self as step_engine};
 use crate::tty::adapter::step_engine::{
     NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
@@ -83,14 +82,14 @@ pub fn step_hangup(
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct HangupOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for HangupOp<'a> {
     type Output = HangupOutcome;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_hangup(self.tty, self.guard)
+        let __guard = step_engine::guard();
+        step_hangup(self.tty, &__guard)
     }
 }
 
@@ -155,7 +154,6 @@ mod step_op_wraps {
         let guard = step_engine::guard();
         let mut op = HangupOp {
             tty: &tty,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
@@ -178,7 +176,6 @@ mod step_op_wraps {
         let guard = step_engine::guard();
         let mut op = HangupOp {
             tty: &tty,
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);

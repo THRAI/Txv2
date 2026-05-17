@@ -961,6 +961,7 @@ impl OpenFile {
             nonblocking_override: AtomicBool::new(false),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1237,7 +1238,7 @@ impl OpenFile {
             self.flock_state.compare_exchange(0, 1,
                 core::sync::atomic::Ordering::Acquire,
                 core::sync::atomic::Ordering::Relaxed,
-            ).map_err(|_| crate::execution::Errno::EWOULDBLOCK)?;
+            ).map_err(|_| crate::execution::Errno::EAGAIN)?;
             Ok(())
         }
     }

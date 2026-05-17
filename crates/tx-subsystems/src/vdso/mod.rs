@@ -56,6 +56,14 @@ impl VvarPage {
     }
 
     pub fn init_clock_params(&self, timebase_hz: u64) {
+        // Test platforms (and any boot path that has not yet probed the
+        // timebase) can call this with `timebase_hz = 0`. Guard against
+        // div-by-zero and leave the params at their default zeros — the
+        // vDSO clock path treats `mult == 0` as "uninitialised" and
+        // falls back to the syscall lane.
+        if timebase_hz == 0 {
+            return;
+        }
         const NSEC_PER_SEC: u64 = 1_000_000_000;
         let max_mult: u64 = (1u64 << 32) - 1;
         let mut shift: u64 = 0;

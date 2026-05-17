@@ -28,6 +28,24 @@ fn init_substrate() {
     }
 }
 
+/// Build a throw-away `Cap<MountPayload>` over `tmpfs` so tests that
+/// call `FsOps::materialise_rnode` can satisfy the trait's
+/// mount-stamping contract (`docs/Txv3/02_INVARIANTS_v5.md` BIF-… and
+/// `walker::fs_ops_for` resolution).
+fn test_mount_payload(tmpfs: &alloc::sync::Arc<Tmpfs>) -> step_engine::Cap<tx_subsystems::mount::MountPayload> {
+    use tx_subsystems::mount::{DevId, MountOptions, MountPayload, SourceLabel};
+    MountPayload::new_cap(
+        tmpfs.clone() as alloc::sync::Arc<dyn tx_subsystems::vfs::FsOps>,
+        tmpfs.clone() as alloc::sync::Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
+        None,
+        DevId::new(1),
+        MountOptions::default(),
+        "tmpfs",
+        SourceLabel::Static("tmpfs-test"),
+    )
+    .expect("test mount payload")
+}
+
 #[test]
 fn tmpfs_create_then_lookup_round_trip() {
     let _serial = crate::test_support::FS_TEST_LOCK
@@ -201,7 +219,7 @@ fn tmpfs_fetch_page_materialises_anon_then_flush_noop() {
     );
     // fsync is a no-op too.
     assert_eq!(
-        <Tmpfs as FsPageBacking>::fsync(&*tmpfs, file_id, &guard),
+        <Tmpfs as FsPageBacking>::fsync_file(&*tmpfs, file_id, &guard),
         StepOutcome::Done(())
     );
 
@@ -381,7 +399,7 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
     // discriminant; the `Cap<PageContainer>::key` (or any other
     // identity check) would suffice but the variant alone is the
     // contract Phase 7 needs.
-    let rnode = match <Tmpfs as FsOps>::materialise_rnode(&*tmpfs, file_id, file_meta, &guard) {
+    let rnode = match <Tmpfs as FsOps>::materialise_rnode(&*tmpfs, file_id, file_meta, &test_mount_payload(&tmpfs), &guard) {
         StepOutcome::Done(rnode) => rnode,
         other => panic!("materialise_rnode for regular file: {other:?}"),
     };
@@ -425,7 +443,7 @@ fn tmpfs_materialise_rnode_for_directory_returns_eisdir() {
         other => panic!("load_inode_meta(root): {other:?}"),
     };
     assert_eq!(
-        <Tmpfs as FsOps>::materialise_rnode(&*tmpfs, TMPFS_ROOT_OBJECT_ID, meta, &guard),
+        <Tmpfs as FsOps>::materialise_rnode(&*tmpfs, TMPFS_ROOT_OBJECT_ID, meta, &test_mount_payload(&tmpfs), &guard),
         StepOutcome::Err(Errno::EISDIR)
     );
 }
@@ -452,7 +470,7 @@ fn tmpfs_materialise_rnode_for_symlink_returns_einval() {
     // mirroring the Linux `inode_operations.lookup` shape for non-
     // page-backed kinds tmpfs intentionally rejects here.
     assert_eq!(
-        <Tmpfs as FsOps>::materialise_rnode(&*tmpfs, link_id, link_meta, &guard),
+        <Tmpfs as FsOps>::materialise_rnode(&*tmpfs, link_id, link_meta, &test_mount_payload(&tmpfs), &guard),
         StepOutcome::Err(Errno::EINVAL)
     );
 }
@@ -846,7 +864,7 @@ fn tmpfs_v3_truncate_then_load_meta_reflects_size() {
 
     // fsync is a no-op on tmpfs in v3 too.
     assert_eq!(
-        <Tmpfs as FsPageBacking>::fsync(&*tmpfs, file_id, &guard),
+        <Tmpfs as FsPageBacking>::fsync_file(&*tmpfs, file_id, &guard),
         V3::<(), NoProgress>::done(())
     );
 }
@@ -918,34 +936,32 @@ fn step_walk_against_tmpfs_resolves_real_path() {
         other => panic!("tmpfs mkdir failed: {other:?}"),
     };
 
-    // Walker must use the wide block_on shape from the v3 walker
-    // tests; reuse a simple poll loop here.
-    use core::future::Future;
-    use core::pin::Pin;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    fn raw_clone(_: *const ()) -> RawWaker {
-        RawWaker::new(core::ptr::null(), &VTABLE)
-    }
-    fn raw_wake(_: *const ()) {}
-    fn raw_wake_by_ref(_: *const ()) {}
-    fn raw_drop(_: *const ()) {}
-    static VTABLE: RawWakerVTable =
-        RawWakerVTable::new(raw_clone, raw_wake, raw_wake_by_ref, raw_drop);
-    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
-    let waker = unsafe { Waker::from_raw(raw) };
-    let mut cx = Context::from_waker(&waker);
-
-    let outcome = {
-        let mut fut = step_walk(root_dentry.clone(), b"/dir", &cred, &guard);
-        let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
-        loop {
-            match pinned.as_mut().poll(&mut cx) {
-                Poll::Ready(o) => break o,
-                Poll::Pending => continue,
+    // Block-device-backed mounts can yield from `step_walk` (via
+    // `FsPageBacking::fetch_page` returning `Yield` while a sector
+    // load is in flight), so the canonical drive shape is async via
+    // the `PathWalkOp` StepOp wrap. tmpfs itself never yields, so the
+    // inline `step()` loop here resolves on the first poll — but the
+    // shape mirrors what a block-backed FS would drive through the
+    // reactor's `tx_scripts::drive::drive::<PathWalkOp, _>` loop.
+    drop(guard);
+    use tx_subsystems::vfs::PathWalkOp;
+    use tx_substrate::step::{NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome as V3Outcome};
+    let mut op = PathWalkOp {
+        rooted_at: root_dentry.clone(),
+        path: b"/dir".to_vec(),
+        cred: cred.clone(),
+    };
+    let mut ctx = ScriptCtx::<ProcessIdentity>::new();
+    let outcome: V3<Cap<DEntry>, NoProgress> = loop {
+        match StepOp::<ProcessIdentity>::step(&mut op, &mut ctx) {
+            V3Outcome::Done(d) => break V3::Done(d),
+            V3Outcome::Err(e) => break V3::Err(e),
+            V3Outcome::Continue { .. } => continue,
+            V3Outcome::Yield { .. } => {
+                panic!("tmpfs walk should not yield; block-backed fs would park here");
             }
         }
     };
-    drop(guard);
     match outcome {
         V3::Done(d) => {
             assert_eq!(d.name().as_bytes(), b"dir");

@@ -379,7 +379,19 @@ fn materialise_child(
                 Err(KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOSYS)))
             }
         },
-        _ => match fs_ops.materialise_rnode(child_fs_object_id, child_meta.clone(), guard) {
+        _ => {
+            // The walker must stamp the child RNode with the
+            // containing mount so subsequent ops can resolve `FsOps`
+            // via `containing_mount_weak()`. Without `mount_payload`
+            // we can't satisfy `materialise_rnode`'s contract — the
+            // root-rnode bootstrap path is the only caller without a
+            // mount, and it goes through `mount/mod.rs` directly.
+            let Some(mount) = mount_payload else {
+                return Err(KernelStep::Error(WalkCause::FsOpsRejected(
+                    crate::execution::Errno::EIO,
+                )));
+            };
+            match fs_ops.materialise_rnode(child_fs_object_id, child_meta.clone(), mount, guard) {
             StepOutcome::Done(rnode) => Ok(rnode),
             StepOutcome::Yield { shape, .. } => Err(KernelStep::NeedIO(
                 IORequest::MaterialiseRnode {
@@ -395,6 +407,7 @@ fn materialise_child(
             StepOutcome::Continue { .. } => {
                 Err(KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOSYS)))
             }
-        },
+            }
+        }
     }
 }

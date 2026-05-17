@@ -652,14 +652,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
 
     // ===== Phase 5 — thread-group collapse (if multi-threaded) =======
     if let Some(payload) = process.payload_slot().lock().as_ref() {
-        let n = payload.thread_count.load(std::sync::atomic::Ordering::Acquire);
-        if n > 1 {
-            *payload.group_exit.lock() = Some(GroupExitState {
-                status: ExitStatus::Exited(0),
-                is_exec: true,
-                remaining_threads: AtomicU32::new(n - 1),
-            });
-        }
+        payload.install_exec_group_exit();
     }
 
     // ===== Phase 5a — eagerly populate partial-last-page bytes ========

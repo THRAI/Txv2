@@ -338,14 +338,14 @@ pub fn step_write_for_caller(
 pub struct WriteOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub bytes: &'a [u8],
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_write(self.tty, self.bytes, self.guard)
+        let __guard = step_engine::guard();
+        step_write(self.tty, self.bytes, &__guard)
     }
 }
 
@@ -355,14 +355,14 @@ pub struct WriteForCallerOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub bytes: &'a [u8],
     pub caller: super::IoctlCaller,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteForCallerOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_write_for_caller(self.tty, self.bytes, self.caller, self.guard)
+        let __guard = step_engine::guard();
+        step_write_for_caller(self.tty, self.bytes, self.caller, &__guard)
     }
 }
 
@@ -372,14 +372,14 @@ pub struct WriteForProcessOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub bytes: &'a [u8],
     pub caller: &'a Cap<crate::process::structure::ProcessIdentity>,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteForProcessOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_write_for_process(self.tty, self.bytes, self.caller, self.guard)
+        let __guard = step_engine::guard();
+        step_write_for_process(self.tty, self.bytes, self.caller, &__guard)
     }
 }
 
@@ -716,7 +716,6 @@ mod tests {
             let mut op = WriteOp {
                 tty: &tty,
                 bytes: b"",
-                guard: &guard,
             };
             let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let outcome = op.step(&mut ctx);
@@ -740,7 +739,6 @@ mod tests {
             let mut op = WriteOp {
                 tty: &tty,
                 bytes: b"hello",
-                guard: &guard,
             };
             let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let outcome = op.step(&mut ctx);
@@ -766,7 +764,6 @@ mod tests {
                 tty: &tty,
                 bytes: b"",
                 caller,
-                guard: &guard,
             };
             let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let outcome = op.step(&mut ctx);
@@ -792,7 +789,6 @@ mod tests {
                 tty: &tty,
                 bytes: b"hi",
                 caller,
-                guard: &guard,
             };
             let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
             let wrap_outcome = op.step(&mut ctx);

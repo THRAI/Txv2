@@ -192,6 +192,7 @@ impl<I: SubjectIdentity> StepOp<I> for EventfdWriteOp<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::ProcessIdentity;
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::zones;
 
