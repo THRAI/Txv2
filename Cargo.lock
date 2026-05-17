@@ -424,6 +424,7 @@ version = "0.1.0"
 dependencies = [
  "tx-ext4",
  "tx-ext4-format",
+ "tx-hal",
  "tx-platform-adapter",
  "tx-substrate",
  "tx-subsystems",
@@ -590,6 +591,7 @@ dependencies = [
  "tx-substrate",
  "tx-subsystems",
  "tx-test-support",
+ "tx-vdso",
 ]
 
 [[package]]
@@ -599,6 +601,10 @@ dependencies = [
  "tx-platform-adapter",
  "tx-substrate",
 ]
+
+[[package]]
+name = "tx-vdso"
+version = "0.1.0"
 
 [[package]]
 name = "typed-arena"

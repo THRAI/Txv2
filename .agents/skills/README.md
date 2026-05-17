@@ -37,6 +37,9 @@ Current orientation skills:
   broken syscalls when an interactive busybox/musl shell hangs, crashes, or
   diverges; pairs the trap-trace + fault-decode + shell-test xtask tools with
   the syscall-stub edit pattern in `tx-shims`.
+- `tx-step-migration` wraps free-function `step_*` fns into `StepOp` trait
+  impls, migrates ad-hoc step loops to the central `drive()` loop, and retires
+  v4 vocabulary per the Txv3 migration plan and `07_BLAST_RADIUS.md`.
 - `tx-subsystem-manifest` covers subsystem specs and zone-derived type policy
   tables.
 - `tx-vfs-filesystem` covers VFS, Mount, PageBacked filesystem interfaces,

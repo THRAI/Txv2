@@ -2,10 +2,16 @@
 
 <!-- txdoc:02-EXECUTION-THREAD-RUNTIME-V1 -->
 
+> **[deprecated by v5]** — Superseded by `docs/Txv3/` step model
+> (03_STEP_MODEL_v2.md), execution scope (06_EXECUTION_SCOPE_v1.md),
+> and `docs/Txv3/07_BLAST_RADIUS.md` migration plan. v4 vocabulary
+> (`Blocked`, `WakeCarrier`, `InterestConditions`) is fully retired
+> from code. This document is retained for historical reference only.
+
 ## Status
 <!-- txdoc:THREAD-STATUS -->
 
-Draft v1.5.
+Draft v1.5. [deprecated by v5]
 
 This document specifies the **runtime semantics of a thread** in txKernel: what a thread is as a running entity, what states it occupies, how it interacts with the reactor, and how signal delivery is realized across the step/script/reactor boundary.
 

@@ -13,6 +13,7 @@ pub mod execution;
 mod pmap;
 pub mod project;
 pub mod scripts;
+pub mod step_ops;
 mod structure;
 mod user_access;
 

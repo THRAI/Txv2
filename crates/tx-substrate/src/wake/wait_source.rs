@@ -266,6 +266,50 @@ impl WaitSource {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Global WaitSource registry — bridges object-side sources to driver-side
+// yield resolution.  Semantic objects insert their WaitSource at creation
+// time; resolve_on_wait_source looks up by WaitSourceId to register the
+// task mailbox before parking.
+// ---------------------------------------------------------------------------
+
+use alloc::sync::Arc;
+
+/// Global registry mapping [`WaitSourceId`] → [`WaitSource`].
+///
+/// Indexed by `WaitSourceId::raw()` for O(1) lookup. Slot reuse is not
+/// needed — the id space is large enough for the system lifetime and
+/// sources are never destroyed in practice (they're embedded in
+/// long-lived semantic objects).
+static REGISTRY: SpinMutex<Vec<Option<Arc<WaitSource>>>> = SpinMutex::new(Vec::new());
+
+/// Register a source in the global registry so the driver can find it
+/// by [`WaitSourceId`] during yield resolution.
+pub fn register_source(source: Arc<WaitSource>) {
+    let id = source.id().raw() as usize;
+    let mut reg = REGISTRY.lock();
+    while reg.len() <= id {
+        reg.push(None);
+    }
+    reg[id] = Some(source);
+}
+
+/// Remove a source from the global registry.
+pub fn unregister_source(id: WaitSourceId) {
+    let mut reg = REGISTRY.lock();
+    if let Some(slot) = reg.get_mut(id.raw() as usize) {
+        *slot = None;
+    }
+}
+
+/// Look up a source by id. Returns `None` if the id is unknown or
+/// the source was never registered.
+pub fn lookup_source(id: WaitSourceId) -> Option<Arc<WaitSource>> {
+    REGISTRY.lock().get(id.raw() as usize)?.clone()
+}
+
+// ---------------------------------------------------------------------------
+
 /// A registration that has been **prepared** but not yet committed
 /// to the [`WaitSource`]'s subscriber list. Construct via
 /// [`WaitSource::prepare`]; commit via [`Self::install_if`].

@@ -31,7 +31,7 @@ mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
 pub use fs_page_backing::FsPageBacking;
-pub use lifecycle::{step_fallocate, step_fsync, step_truncate};
+pub use lifecycle::{step_fallocate, step_fsync, step_truncate, TruncateOp};
 pub use reflink::{cow_replace_into_private, install_shared_page};
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
@@ -535,6 +535,10 @@ impl PageContainer {
                 ..
             } => StepOutcome::Err(V3Errno::EIO),
             StepOutcome::Yield {
+                shape: YieldShape::OnEdge { .. },
+                ..
+            } => StepOutcome::Err(V3Errno::EIO),
+            StepOutcome::Yield {
                 shape: YieldShape::OnTimer { .. },
                 ..
             } => StepOutcome::Err(V3Errno::EIO),
@@ -666,6 +670,11 @@ pub fn step_read(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if len == 0 {
         return StepOutcome::done(0);
     }
@@ -687,6 +696,11 @@ pub fn step_write(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if len == 0 {
         return StepOutcome::done(0);
     }
@@ -812,14 +826,14 @@ pub struct ReadOp<'a> {
     pub pc: &'a PageContainer,
     pub of: &'a OpenFile,
     pub len: usize,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_read(self.pc, self.of, self.len, self.guard)
+        let __guard = step_engine::guard();
+        step_read(self.pc, self.of, self.len, &__guard)
     }
 }
 
@@ -828,14 +842,14 @@ pub struct WriteOp<'a> {
     pub pc: &'a PageContainer,
     pub of: &'a OpenFile,
     pub len: usize,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_write(self.pc, self.of, self.len, self.guard)
+        let __guard = step_engine::guard();
+        step_write(self.pc, self.of, self.len, &__guard)
     }
 }
 

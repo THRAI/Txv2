@@ -19,7 +19,10 @@ pub mod step_engine {
         ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     };
     pub use tx_substrate::zone::{
-        reserve_for, sign, sign_for, Cap, PayloadCap, Zone, ZoneAllocated, ZoneError,
+        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
+        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
     pub use tx_substrate::SpinMutex;
 }

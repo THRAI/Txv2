@@ -101,11 +101,20 @@ OpenFile itself publishes little; most observable state lives on its RNode. The 
 
 | Entity | Carrier | Wire | Transition | Polarity | Fired from | Subscribers | Projection link |
 |---|---|---|---|---|---|---|---|
-| ProcessIdentity | RawPort | `exit_source` | Payload transitioned to None (exit) | `fire(Exited{status})` | `process::step_exit_commit` | waitpid (parent), pidfd subscribers, ptrace tracer | ProcessPayload.payload → false |
-| ProcessIdentity | RawPort | `signal_port` | Signal delivered (generated for this process) | `fire(SignalGenerated{sig})` | `process::step_signal_deliver` | signalfd subscribers, ptrace tracer | — (not a projection change) |
+| ProcessIdentity | Channel | `exit_source` *(legacy)* | Payload transitioned to None (exit) | `fire(Exited{status})` | `process::fire_exit_source` (Channel + WaitSource notify) | waitpid (parent), ptrace tracer | ProcessPayload.payload → false |
+| ProcessPayload | RawQueue | `exit_source_bus` *(bus-aligned)* | Child zombified → parent notified | `fire(EXIT_SOURCE_CHILD_ZOMBIFIED)` | `process::fire_exit_source` (same commit, RawQueue path) | future waitid/poll/epoll consumers | ProcessPayload.children zombie count |
+| ProcessPayload | RawPort | `signal_port` | Signal delivered (Gewalt routing or Event posted to thread_pending) | `fire(SIGNAL_GENERATED)` | `signal::step_kill_process` (both Gewalt and Event paths) | signalfd subscribers (via `notify_process_signal` after bus fire), future pidfd/timerfd | — (not a projection change) |
 | ProcessIdentity | RawPort | `ptrace_port` | Ptrace stop point reached | `fire(Stop{reason})` | dispatch/intercept/ptrace via `process::step_intercept_commit` | attached tracer | — |
 | ProcessIdentity | RawTrace | `sched_trace` | Scheduling events, context switches | `emit({from, to, reason})` | scheduler (in reactor), via process wire | ftrace, perf | — |
-| ThreadIdentity | RawPort | `thread_exit_source` | ThreadPayload transitioned to None | `fire(ThreadExited)` | `thread::step_thread_exit_commit` | pthread_join, clear_child_tid futex wake | ThreadPayload.payload → false |
+| ThreadIdentity | RawPort | `thread_exit_source` | ThreadPayload transitioned to None | `fire(ThreadExited)` | `thread_runtime::step_thread_exit` (set_thread_zombie → drops payload) | pthread_join, clear_child_tid futex wake | ThreadPayload.payload → false |
+
+### 3.3a ProcessPayload — readiness wires (moved into §3.3 main table)
+
+<!-- txdoc:SIGNAL-ATTACHMENTS-CATALOG-PAYLOAD-READINESS-1 -->
+
+`exit_source_bus` is now listed in the main §3.3 table alongside the legacy `exit_source` (Channel).  The two rows coexist: the Channel serves current wait4 consumers; the RawQueue is the bus-aligned replacement.  Once all consumers migrate, the Channel row is removed.
+
+Phase A alignment note preserved: both fire from `process::fire_exit_source`.
 
 Notes on BIF-5 compliance: every row names a single entity (ProcessIdentity or ProcessPayload or ThreadIdentity). No wire spans both Identity and Payload. The `exit_source` fires when Payload transitions to None; the wire lives on Identity (because ProcessPayload has been reclaimed by the time subscribers observe the event — only Identity survives the zombie window). Placing the wire on Identity is the BIF-5-compliant choice.
 
@@ -115,7 +124,7 @@ Notes on BIF-5 compliance: every row names a single entity (ProcessIdentity or P
 
 | Entity | Carrier | Wire | Transition | Polarity | Fired from | Subscribers | Projection link |
 |---|---|---|---|---|---|---|---|
-| SignalFd | RawQueue | `signalfd_readable` | New signal matching mask enqueued | `set(HasSignal)` | `process::step_signal_enqueue` (when signal routes to a signalfd) | poll/select, epoll | — |
+| SignalFd | Channel | `signalfd_readable` *(bridge)* | Signal matching mask posted | `set(HasSignal)` | `signal_port.fire` → `BUS_SIGNALFD_WAKERS` → `notify_process_signal` | poll/select, epoll | — |
 | PidFd | RawQueue | `pidfd_readable` | Target process exited (pidfd becomes readable with exit info) | `set(HasExit)` | `process::step_exit_commit` | poll/select, epoll | ProcessPayload.payload → false |
 
 PidFd's `HasExit` and ProcessIdentity's `exit_source` fire on the same underlying transition (process exit) but target different subscriber shapes: pidfd for poll-based readers holding an fd, exit_source for waitpid-style direct observers. Both fire from the same step-commit; the step publishes to both wires as separate `fire` calls.
@@ -158,7 +167,7 @@ Notes:
 |---|---|---|---|---|---|---|---|
 | Timerfd | RawQueue | `timer_wq` | Timer expired (counter incremented) | `set(Expired)` | `timer::step_expire_commit` (from reactor's timer subsystem) | poll/select, epoll, blocking read | Timerfd.expirations_pending projection |
 | Eventfd | RawQueue | `event_wq` | Counter written (either via write(2) or peer) | `set(HasCount)` | `eventfd::step_write_commit` | poll/select, epoll, blocking read | — |
-| Signalfd | RawQueue | `signalfd_wq` | Signal matching mask received | `set(HasSignal)` | `process::step_signal_enqueue` (routes through signalfd filter) | poll/select, epoll, blocking read | — |
+| Signalfd | Channel | `signalfd_wq` *(bridge)* | Signal matching mask posted | `set(HasSignal)` | `signal_port.fire` → `BUS_SIGNALFD_WAKERS` → `notify_process_signal` | poll/select, epoll, blocking read | — |
 
 These are Linux-specific fd-ified notification mechanisms; each is a capability whose whole purpose is to expose an event stream as a readable fd. The readiness wires are straightforward RawQueue attachments.
 

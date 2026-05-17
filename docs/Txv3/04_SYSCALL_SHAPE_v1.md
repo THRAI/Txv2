@@ -259,7 +259,125 @@ The shim layer (Linux syscall trampoline) is responsible for:
 
 For OnBehalfOf cases (io_uring SQPOLL, AIO worker), the trampoline is replaced by a kthread loop that materializes the SubjectContext via `with_on_behalf_of` and dispatches to the same script functions.
 
-## 6. Migration note
+## 6. Dispatch lanes
+
+<!-- txdoc:SYSCALL-V1-DISPATCH-LANES-1 -->
+
+A syscall enters one of three dispatch lanes after the trampoline materializes the `SubjectContext`. The lanes differ in whether they enter `StepOp` / `drive`, and whether they may yield.
+
+| Lane | Enters StepOp? | Enters drive? | May yield? | Typical syscalls |
+|---|---|---|---|---|
+| **ImmediateSyscall** | no | no | no | getpid, getuid, umask, times |
+| **OneShotStepOp** | yes | drive_oneshot only | no | setuid, sigaction, setsid, chdir, close |
+| **Full async script** | yes | async drive | yes | read, write, open, futex_wait, poll |
+
+### 6.1 ImmediateSyscall
+
+An `ImmediateSyscall` is a syscall whose entire call chain is statically non-yielding. It does not:
+
+- call `drive()` or `drive_oneshot()`;
+- construct a `StepOutcome` or `YieldShape`;
+- enter VFS path resolution or VM materialization;
+- register on a `WaitSource` or `DelegateEndpoint`;
+- acquire a guard that crosses the return boundary.
+
+It *may* acquire short-lived guards for reading subject/process state; the guard must be dropped before return and no guard handle may escape the call.
+
+```rust
+/// Marker trait for syscalls that never yield.
+trait ImmediateSyscall: sealed::Sealed {
+    type Output;
+
+    fn call(ctx: &ImmediateCtx, args: SyscallArgs)
+        -> Result<Self::Output, Errno>;
+}
+```
+
+`ImmediateCtx` is narrower than `ScriptCtx` — it carries `&SubjectContext`, `&ThreadTask`, and `&TrapFrameView`, but no VFS, VM, reactor, timer, or mailbox handle.
+
+Immediate syscalls in the current surface (17 of 90 wired):
+
+```
+getpid / getppid / getpgrp / getpgid / getsid
+getuid / geteuid / getgid / getegid
+getresuid / getresgid
+times / gettimeofday / umask / prlimit64 / uname
+rt_sigreturn
+```
+
+### 6.2 OneShotStepOp
+
+A `OneShotStepOp` is a `StepOp<Progress = NoProgress>` whose first `step()` invocation returns `Done(T)` or `Err(Errno)`. It never returns `Continue` or `Yield`.
+
+```rust
+/// A StepOp that terminates on first invocation.
+trait OneShotStepOp:
+    StepOp<Progress = NoProgress> + sealed::Sealed
+{}
+
+/// Synchronous drive for one-shot ops.
+fn drive_oneshot<O: OneShotStepOp>(
+    op: &mut O,
+    ctx: &mut ScriptCtx,
+) -> Result<O::Output, Errno> {
+    match op.step(ctx) {
+        StepOutcome::Done(v) => Ok(v),
+        StepOutcome::Err(e) => Err(e),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+            kernel_bug!("OneShotStepOp violated contract")
+        }
+    }
+}
+```
+
+If a `OneShotStepOp` yields, it is a kernel invariant violation (STEP-11), not a user-visible `EAGAIN`. This is stronger than the `Nonblocking` driver mode, which *translates* unexpected yields to `EAGAIN`.
+
+One-shot syscalls have semantic transitions (observe → upgrade → reserve → commit → publish) but never block. They are the middle lane between pure ABI queries and full async scripts.
+
+One-shot syscalls in the current surface (43 of 90 wired):
+
+```
+Credential:    setuid, setgid, setreuid, setregid, setresuid, setresgid
+Process:       setsid, setpgid, set_tid_address, set_robust_list
+Signal:        sigaction, sigprocmask, kill, tkill, tgkill
+Exit:          exit, exit_group
+Fd table:      close, dup, dup3, fcntl, pipe2
+Directory:     chdir, mkdirat, unlinkat, symlinkat, linkat, renameat2
+File attr:     fchmodat, fchownat, utimensat, faccessat, faccessat2
+Stat:          newfstatat, fstat, statx
+Other:         ioctl (sync variants), lseek, readlinkat, madvise, signalfd4 (create)
+```
+
+### 6.3 Full async script
+
+A full async script may `Continue`, `Yield` (any `YieldShape`), and requires the full driver loop with `DriverMode`, `ActiveWait`, `WaitProtocol`, and `apply_resume`. These syscalls enter `drive(op, ctx, mode).await`.
+
+Full async syscalls in the current surface (29 of 90 wired):
+
+```
+IO:            read, write, readv, writev
+Path:          openat
+Poll:          ppoll
+Directory:     getdents64
+Futex:         futex (wait+wake composite)
+Timer:         nanosleep, clock_nanosleep, clock_gettime
+VM:            brk, mmap, munmap, mprotect, mremap, msync
+Process:       clone, execve, wait4
+AIO:           io_setup, io_submit, io_getevents, io_destroy
+Other:         io_uring_setup, io_uring_enter, userfaultfd, getrandom
+```
+
+### 6.4 Design rationale
+
+The three lanes exist because forcing all syscalls through `async drive` would impose unnecessary cost on the 60% of wired syscalls that never yield (17 immediate + 43 one-shot). It would also obscure the architectural distinction between:
+
+- **ABI queries** — pure reads of kernel-side process/credential/time state.
+- **Semantic transitions** — mutations with observe→commit→publish discipline but no blocking.
+- **Progressive operations** — data transfer or blocking ops that may yield to VFS/VM/timer/wait sources.
+
+The `ImmediateSyscall` trait and `OneShotStepOp` trait are the type-level markers that enable lint enforcement: a function implementing `ImmediateSyscall` must not call `drive`; a function implementing `OneShotStepOp` must not return `Yield`. These are checked by `SCRIPT-V5-4` and `STEP-11` respectively.
+
+## 7. Migration note
 
 <!-- txdoc:SYSCALL-V1-MIGRATION-1 -->
 

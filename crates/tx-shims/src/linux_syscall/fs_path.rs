@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use tx_subsystems::mount::MountPayload;
 
 // =====================================================================
 // Wave 4 Part 4 of the DAC + setuid slice — file-mode syscall arms.
@@ -68,6 +69,15 @@ use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 // arch-lint substring check (`#[allow(`) does not also fire.
 #[cfg_attr(not(test), allow(clippy::extra_unused_type_parameters))]
 #[cfg_attr(test, allow(clippy::extra_unused_type_parameters))]
+/// Translate a dirfd into the root dentry for path resolution.
+/// Returns `EBADF` for non-`AT_FDCWD` dirfds (dirfd support TBD).
+fn resolve_cwd(dirfd: i32, ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
+    if dirfd != AT_FDCWD {
+        return Err(EBADF_VALUE);
+    }
+    ctx.process.cwd().ok_or(ENOENT_VALUE)
+}
+
 fn resolve_path_at<P: PmapIf>(
     dirfd: i32,
     path: &[u8],
@@ -89,7 +99,7 @@ fn resolve_path_at<P: PmapIf>(
     // outcome. Errno routes back through the reverse `From` bridge so
     // the existing `errno_to_i32` table stays the single source of truth.
     use StepOutcome as V3;
-    let outcome = poll_walker_synchronously(tx_subsystems::vfs::step_walk(cwd, path, cred, &guard));
+    let outcome = tx_subsystems::vfs::step_walk(cwd, path, cred, &guard);
     let dentry = match outcome {
         V3::Done(d) => d,
         V3::Continue { .. } | V3::Yield { .. } => {
@@ -197,25 +207,26 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
-    let walker_cred = ctx.walker_cred();
-    let dentry = match resolve_path_at::<P>(dirfd, &path, &walker_cred, ctx) {
+    let rooted_at = match resolve_cwd(dirfd, ctx) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
-    let fs_object_id = dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
-    let fs_ops = match fs_ops_for_dentry(&dentry) {
-        Some(o) => o,
-        None => return SyscallResult::Error(EROFS_VALUE),
-    };
-    // Mask to the bottom 12 bits (rwx + S_ISUID/S_ISGID/S_ISVTX);
-    // callers can't change S_IFMT bits via chmod.
+    let walker_cred = ctx.walker_cred();
     let new_mode = (mode & 0o7777) as u16;
-    let guard = step_engine::guard();
-    match fs_ops.step_chmod(fs_object_id, new_mode, &walker_cred, &guard) {
-        V3::Done(()) => SyscallResult::Return(0),
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
+    let result = {
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = ChmodOp {
+            rooted_at: &rooted_at,
+            path: &path,
+            mode: new_mode,
+            cred: &walker_cred,
+            target: None,
+        };
+        step_engine::drive_oneshot(&mut op, &mut script_ctx)
+    };
+    match result {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(v3errno))),
     }
 }
 
@@ -240,23 +251,27 @@ pub(super) fn sys_fchownat<P: PmapIf>(
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
     let walker_cred = ctx.walker_cred();
-    let dentry = match resolve_path_at::<P>(dirfd, &path, &walker_cred, ctx) {
+    let uid = decode_uid_arg(uid_arg).map(|u| u.0);
+    let gid = decode_gid_arg(gid_arg).map(|g| g.0);
+    let rooted_at = match resolve_cwd(dirfd, ctx) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
-    let fs_object_id = dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
-    let fs_ops = match fs_ops_for_dentry(&dentry) {
-        Some(o) => o,
-        None => return SyscallResult::Error(EROFS_VALUE),
+    let result = {
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = ChownOp {
+            rooted_at: &rooted_at,
+            path: &path,
+            uid,
+            gid,
+            cred: &walker_cred,
+            target: None,
+        };
+        step_engine::drive_oneshot(&mut op, &mut script_ctx)
     };
-    let uid_opt = decode_uid_arg(uid_arg).map(|u| u.raw());
-    let gid_opt = decode_gid_arg(gid_arg).map(|g| g.raw());
-    let guard = step_engine::guard();
-    match fs_ops.step_chown(fs_object_id, uid_opt, gid_opt, &walker_cred, &guard) {
-        V3::Done(()) => SyscallResult::Return(0),
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
+    match result {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(v3errno))),
     }
 }
 
@@ -330,18 +345,24 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
         effective_caps: cred.effective_caps,
     };
 
-    // Resolve the path. Note: the walker's interior-directory descend
-    // check uses `walker_cred`'s ids — for the AT_EACCESS=0 default
-    // this is the **real** id walk. POSIX `access(2)` is documented
-    // as exactly this shape ("uses the real uid/gid for both the
-    // access check and the path resolution"); no separate walk is
-    // required.
-    let dentry = match resolve_path_at::<P>(dirfd, &path, &walker_cred, ctx) {
+    // Resolve the path via AccessOp + drive_oneshot. Returns InodeMeta
+    // for the DAC checks below.
+    let rooted_at = match resolve_cwd(dirfd, ctx) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
-
-    let inode_meta = dentry.rnode().meta();
+    let inode_meta = {
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = AccessOp {
+            rooted_at: &rooted_at,
+            path: &path,
+            cred: &walker_cred,
+        };
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(m) => m,
+            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        }
+    };
     let mode_bits = inode_meta.mode as u32;
 
     // F_OK: existence check only. Path resolution succeeded; return 0
@@ -439,7 +460,7 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let dentry: Cap<DEntry> = {
         let guard = step_engine::guard();
         use StepOutcome as V3;
-        let outcome = poll_walker_synchronously(step_walk(cwd, &path, &walker_cred, &guard));
+        let outcome = step_walk(cwd, &path, &walker_cred, &guard);
         drop(guard);
         match outcome {
             V3::Done(d) => d,
@@ -454,9 +475,15 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return SyscallResult::Error(ENOTDIR_VALUE);
     }
 
-    match step_chdir(&ctx.process, dentry) {
-        ChdirOutcome::Replaced { .. } => SyscallResult::Return(0),
-        ChdirOutcome::ZombieIgnored => SyscallResult::Error(ESRCH_VALUE),
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = ChdirOp {
+        target: &ctx.process,
+        new_cwd: dentry,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(ChdirOutcome::Replaced { .. }) => SyscallResult::Return(0),
+        Ok(ChdirOutcome::ZombieIgnored) => SyscallResult::Error(ESRCH_VALUE),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 
@@ -487,9 +514,14 @@ pub(super) fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let path = match step_getcwd(&ctx.process) {
-        Some(p) => p,
-        None => return SyscallResult::Error(ENOENT_VALUE),
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = GetcwdOp {
+        target: &ctx.process,
+    };
+    let path = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(Some(p)) => p,
+        Ok(None) => return SyscallResult::Error(ENOENT_VALUE),
+        Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     };
     // `path` is the rendered absolute path bytes (no NUL terminator);
     // `size` must accommodate `path.len() + 1` to fit the terminator.
@@ -562,6 +594,21 @@ pub(super) fn sys_umask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 // See `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 8.
 // =====================================================================
 
+/// Return the mount payload in scope for a dentry, ascending the
+/// parent-hint chain to find the containing mount.  Used by
+/// `sys_mount` / `sys_umount2`.
+pub(super) fn mount_payload_for_dentry(dentry: &Cap<DEntry>) -> Option<Cap<MountPayload>> {
+    let guard = step_engine::guard();
+    let mut cursor = dentry.clone();
+    loop {
+        let weak = cursor.rnode().containing_mount_weak()?;
+        if let Some(payload) = weak.upgrade(&guard) {
+            return Some(payload);
+        }
+        cursor = cursor.parent_hint()?;
+    }
+}
+
 /// Walk `path` from `cwd` synchronously, returning the resolved
 /// dentry or a positive-magnitude `-errno`. Mirrors
 /// `resolve_path_at`'s shape but takes the cwd directly so callers
@@ -575,7 +622,7 @@ pub(super) fn walk_from(
 ) -> Result<Cap<DEntry>, i32> {
     let guard = step_engine::guard();
     use StepOutcome as V3;
-    let outcome = poll_walker_synchronously(step_walk(cwd, path, cred, &guard));
+    let outcome = step_walk(cwd, path, cred, &guard);
     drop(guard);
     match outcome {
         V3::Done(d) => Ok(d),

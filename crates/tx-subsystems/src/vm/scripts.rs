@@ -80,6 +80,9 @@ pub struct ImagePlan {
     /// exceeds its `file_size` and the tail extends past the
     /// page-rounded end of the file-backed prefix.
     pub bss_extension: Option<BssTail>,
+    /// Whether PT_GNU_STACK with PF_X was found in the ELF.
+    /// When true, the stack region gets `PROT_EXEC`.
+    pub executable_stack: bool,
 }
 
 /// One LOAD segment from the ELF image.
@@ -251,7 +254,11 @@ pub fn build_aspace_from_image<P: PmapIf>(
         .ok_or(ScriptError::InvalidImage)?;
     let stack_entry = VmEntry::new(
         stack_range,
-        Prot::READ_WRITE,
+        if image_plan.executable_stack {
+            Prot::new(true, true, true)
+        } else {
+            Prot::READ_WRITE
+        },
         VmEntryFlags::PRIVATE,
         VmBacking::PrivateAnon,
     );
@@ -503,7 +510,7 @@ fn round_up(value: u64, align: u64) -> Option<u64> {
     value.checked_add(mask).map(|v| v & !mask)
 }
 
-fn align_range(start: u64, len: u64) -> Option<UserRange> {
+pub fn align_range(start: u64, len: u64) -> Option<UserRange> {
     let page_size = USER_PAGE_SIZE as u64;
     if !start.is_multiple_of(page_size) {
         return None;
@@ -598,6 +605,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
 
         let aspace =
@@ -634,6 +642,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: vec![segment],
             bss_extension: None,
+            executable_stack: false,
         };
 
         let aspace = build_aspace_from_image::<crate::vm::TestPmap>(&plan).expect("build aspace");
@@ -670,6 +679,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: vec![segment],
             bss_extension: None,
+            executable_stack: false,
         };
 
         let aspace = build_aspace_from_image::<crate::vm::TestPmap>(&plan).expect("build aspace");
@@ -698,6 +708,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
         let aspace = build_aspace_from_image::<crate::vm::TestPmap>(&plan).expect("build aspace");
 
@@ -723,6 +734,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
         let aspace = build_aspace_from_image::<crate::vm::TestPmap>(&plan).expect("build aspace");
 
@@ -741,6 +753,7 @@ mod tests {
             stack_top: USER_STACK_TOP_DEFAULT,
             load_segments: Vec::new(),
             bss_extension: None,
+            executable_stack: false,
         };
         let aspace = build_aspace_from_image::<crate::vm::TestPmap>(&plan).expect("build aspace");
 
