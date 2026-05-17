@@ -667,6 +667,7 @@ fn thread_future_execve_continues_loop_without_writing_pending_return() {
         }
         SyscallResult::NoReturn => true,
         SyscallResult::ExecCommitted => false,
+        SyscallResult::SigreturnRestored => false,
     };
 
     assert!(

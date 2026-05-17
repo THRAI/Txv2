@@ -27,12 +27,10 @@ pub mod step_engine {
         ByteProgress, Errno as V3Errno, NoProgress, RestrictionStackHandle, StepOutcome,
     };
     pub use tx_substrate::zone::{
-        self as zone, sign, sign_for, reserve_for, register_zone_for,
-        Cap, PayloadCap, Weak, IdentRef,
-        Dead, ZoneError,
-        Entity, CoLocatedEntity, OperationalCapExt, OperationalRefExt, PayloadBinding,
-        Zone, ZoneAllocated, ZoneInfo,
-        IdentitySlot, IsPayloadPolicy, CapProducingPolicy, ObserverNodePolicy, PayloadPolicy, RetainedEntityPolicy, ZonePolicy,
+        self as zone, register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy,
+        CoLocatedEntity, Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZoneInfo, ZonePolicy,
     };
     pub use tx_substrate::SpinMutex;
 }

@@ -10,20 +10,18 @@
 //! terminal outcome `accepts` permits; the component-by-component
 //! advance is identical for all modes.
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::execution::Guard;
-use crate::vfs::adapter::step_engine::Errno as V3Errno;
-use crate::mount::{MountIdentity, MountPayload};
-use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome, Weak};
+use crate::mount::MountPayload;
+use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome};
+use crate::vfs::predicates;
 use crate::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking,
 };
-use crate::vfs::FsOps;
-use crate::vfs::predicates;
 use crate::vfs::walker::{self, SYMLOOP_MAX};
+use crate::vfs::FsOps;
 
 use super::state::{
     FinalSymlinkPolicy, IORequest, KernelStep, PathResolution, ResumeToken, WalkCause, WalkMode,
@@ -124,7 +122,7 @@ pub fn kernel_step(
 
     // --- POSIX search permission ---
     let parent_meta = current.rnode().meta();
-    if let Err(err) = predicates::check_descend_perm(&parent_meta, cred) {
+    if let Err(_err) = predicates::check_descend_perm(&parent_meta, cred) {
         return KernelStep::Error(WalkCause::Permission(
             super::state::NonTerminalDenial::SearchDenied,
         ));
@@ -134,7 +132,7 @@ pub fn kernel_step(
     let parent_fs_object_id = current.rnode().fs_object_id();
     let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
         StepOutcome::Done(id) => id,
-        StepOutcome::Yield { shape, .. } => {
+        StepOutcome::Yield { .. } => {
             let token = ResumeToken {
                 walking: WalkingState {
                     current,
@@ -153,7 +151,9 @@ pub fn kernel_step(
                 token,
             );
         }
-        StepOutcome::Err(e) => return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e))),
+        StepOutcome::Err(e) => {
+            return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e)))
+        }
         StepOutcome::Continue { .. } => {
             // Re-enter lookup (v3 continue without yield).
             return KernelStep::Continue(WalkState::Walking(WalkingState {
@@ -169,7 +169,7 @@ pub fn kernel_step(
     // --- load inode meta ---
     let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
         StepOutcome::Done(m) => m,
-        StepOutcome::Yield { shape, .. } => {
+        StepOutcome::Yield { .. } => {
             let token = ResumeToken {
                 walking: WalkingState {
                     current,
@@ -187,7 +187,9 @@ pub fn kernel_step(
                 token,
             );
         }
-        StepOutcome::Err(e) => return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e))),
+        StepOutcome::Err(e) => {
+            return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e)))
+        }
         StepOutcome::Continue { .. } => {
             return KernelStep::Continue(WalkState::Walking(WalkingState {
                 current,
@@ -237,7 +239,9 @@ pub fn kernel_step(
     child_dentry_raw.set_parent_hint(&current);
     let child_dentry = match step_engine::sign(child_dentry_raw) {
         Ok(cap) => cap,
-        Err(_) => return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM)),
+        Err(_) => {
+            return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM))
+        }
     };
 
     // --- symlink chasing ---
@@ -246,7 +250,7 @@ pub fn kernel_step(
         // asked us not to follow, return the symlink as terminal.
         if policy == FinalSymlinkPolicy::NoFollow && remaining.is_empty() {
             let rnode = child_rnode_cap.clone();
-            let meta = child_meta.clone();
+            let meta = child_meta;
             let fs_object_id = rnode.fs_object_id();
             let resolved = PathResolution {
                 dentry: child_dentry,
@@ -295,9 +299,7 @@ pub fn kernel_step(
     }
 
     // --- mount-point crossing ---
-    let crossing_mount = child_dentry
-        .mounted_hint()
-        .and_then(|w| w.upgrade(guard));
+    let crossing_mount = child_dentry.mounted_hint().and_then(|w| w.upgrade(guard));
     let crossing_mount = match crossing_mount {
         Some(m) => Some(m),
         None => mount_payload
@@ -336,6 +338,7 @@ pub fn kernel_step(
 ///
 /// Returns `Ok(Cap<RNode>)` on success, or `Err(KernelStep)` on
 /// yield / error (the driver continues or errors accordingly).
+#[allow(clippy::result_large_err)]
 fn materialise_child(
     fs_ops: &Arc<dyn FsOps>,
     child_fs_object_id: crate::vfs::FsObjectId,
@@ -349,23 +352,27 @@ fn materialise_child(
             let result = if let Some(mp) = mount_payload {
                 RNode::new_cap_in_mount(
                     child_fs_object_id,
-                    child_meta.clone(),
+                    *child_meta,
                     RNodeBacking::Directory,
                     mp,
                 )
             } else {
-                RNode::new_cap(child_fs_object_id, child_meta.clone(), RNodeBacking::Directory)
+                RNode::new_cap(child_fs_object_id, *child_meta, RNodeBacking::Directory)
             };
-            result.map_err(|_| KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM)))
+            result.map_err(|_| {
+                KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM))
+            })
         }
         InodeKind::Symlink => match fs_ops.read_link(child_fs_object_id, guard) {
             StepOutcome::Done(b) => RNode::new_cap(
                 child_fs_object_id,
-                child_meta.clone(),
+                *child_meta,
                 RNodeBacking::Symlink { target: b },
             )
-            .map_err(|_| KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM))),
-            StepOutcome::Yield { shape, .. } => Err(KernelStep::NeedIO(
+            .map_err(|_| {
+                KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM))
+            }),
+            StepOutcome::Yield { .. } => Err(KernelStep::NeedIO(
                 IORequest::ReadLink {
                     fs_object_id: child_fs_object_id,
                 },
@@ -374,27 +381,44 @@ fn materialise_child(
                     hop_count: walking.hop_count,
                 },
             )),
-            StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e)))),
-            StepOutcome::Continue { .. } => {
-                Err(KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOSYS)))
-            }
+            StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(
+                crate::execution::Errno::from(e),
+            ))),
+            StepOutcome::Continue { .. } => Err(KernelStep::Error(WalkCause::FsOpsRejected(
+                crate::execution::Errno::ENOSYS,
+            ))),
         },
-        _ => match fs_ops.materialise_rnode(child_fs_object_id, child_meta.clone(), guard) {
-            StepOutcome::Done(rnode) => Ok(rnode),
-            StepOutcome::Yield { shape, .. } => Err(KernelStep::NeedIO(
-                IORequest::MaterialiseRnode {
-                    fs_object_id: child_fs_object_id,
-                    meta: child_meta.clone(),
-                },
-                ResumeToken {
-                    walking: walking.clone(),
-                    hop_count: walking.hop_count,
-                },
-            )),
-            StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(e)))),
-            StepOutcome::Continue { .. } => {
-                Err(KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOSYS)))
+        _ => {
+            // The walker must stamp the child RNode with the
+            // containing mount so subsequent ops can resolve `FsOps`
+            // via `containing_mount_weak()`. Without `mount_payload`
+            // we can't satisfy `materialise_rnode`'s contract — the
+            // root-rnode bootstrap path is the only caller without a
+            // mount, and it goes through `mount/mod.rs` directly.
+            let Some(mount) = mount_payload else {
+                return Err(KernelStep::Error(WalkCause::FsOpsRejected(
+                    crate::execution::Errno::EIO,
+                )));
+            };
+            match fs_ops.materialise_rnode(child_fs_object_id, *child_meta, mount, guard) {
+                StepOutcome::Done(rnode) => Ok(rnode),
+                StepOutcome::Yield { .. } => Err(KernelStep::NeedIO(
+                    IORequest::MaterialiseRnode {
+                        fs_object_id: child_fs_object_id,
+                        meta: *child_meta,
+                    },
+                    ResumeToken {
+                        walking: walking.clone(),
+                        hop_count: walking.hop_count,
+                    },
+                )),
+                StepOutcome::Err(e) => Err(KernelStep::Error(WalkCause::FsOpsRejected(
+                    crate::execution::Errno::from(e),
+                ))),
+                StepOutcome::Continue { .. } => Err(KernelStep::Error(WalkCause::FsOpsRejected(
+                    crate::execution::Errno::ENOSYS,
+                ))),
             }
-        },
+        }
     }
 }

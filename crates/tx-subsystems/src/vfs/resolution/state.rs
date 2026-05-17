@@ -6,12 +6,10 @@
 //! component per call; the driver loops until terminal or error.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::vfs::adapter::step_engine::Cap;
-use crate::vfs::{DEntry, FsObjectId, FsOps, InodeMeta, RNode};
-use crate::mount::{MountPayload, MountIdentity};
+use crate::vfs::{DEntry, FsObjectId, InodeMeta, RNode};
 
 // ============================================================================
 // WalkMode
@@ -127,11 +125,21 @@ pub enum KernelStep {
 
 #[derive(Clone, Debug)]
 pub enum IORequest {
-    DirLookup { fs_object_id: FsObjectId, name: Box<[u8]> },
-    LoadInodeMeta { fs_object_id: FsObjectId },
-    ReadLink { fs_object_id: FsObjectId },
+    DirLookup {
+        fs_object_id: FsObjectId,
+        name: Box<[u8]>,
+    },
+    LoadInodeMeta {
+        fs_object_id: FsObjectId,
+    },
+    ReadLink {
+        fs_object_id: FsObjectId,
+    },
     /// Materialise an RNode for a freshly-looked-up inode.
-    MaterialiseRnode { fs_object_id: FsObjectId, meta: InodeMeta },
+    MaterialiseRnode {
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+    },
 }
 
 // ============================================================================
@@ -153,20 +161,32 @@ pub struct WalkTrail<'g> {
 }
 
 impl<'g> WalkTrail<'g> {
-    pub fn new() -> Self { Self { entries: Vec::new() } }
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
     pub fn push_dentry(&mut self, dentry: &'g DEntry) {
         self.entries.push(TrailEntry::DEntry(dentry));
     }
     pub fn push_mount_boundary(&mut self, was_at: &'g DEntry) {
         self.entries.push(TrailEntry::MountBoundary { was_at });
     }
-    pub fn pop(&mut self) -> Option<TrailEntry<'g>> { self.entries.pop() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
-    pub fn len(&self) -> usize { self.entries.len() }
+    pub fn pop(&mut self) -> Option<TrailEntry<'g>> {
+        self.entries.pop()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 impl<'g> Default for WalkTrail<'g> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -162,7 +162,7 @@ fn signalfd_d9d_pins_create_route_and_drain() {
     // SIGUSR2). `step_kill_process` posts to the thread-eligibility
     // first, then fans out to every matching signalfd subscription.
     assert_eq!(
-        step_kill_process(&proc_cap, sigusr1),
+        step_kill_process(&proc_cap, sigusr1, None),
         KillOutcome::Delivered,
     );
     assert_eq!(
@@ -187,7 +187,7 @@ fn signalfd_d9d_pins_create_route_and_drain() {
 
     // Now deliver SIGUSR2 — sfd_b receives it, sfd_a does not.
     assert_eq!(
-        step_kill_process(&proc_cap, sigusr2),
+        step_kill_process(&proc_cap, sigusr2, None),
         KillOutcome::Delivered,
     );
     assert_eq!(sfd_b.pending_count(), 1, "sfd_b's mask covers SIGUSR2");

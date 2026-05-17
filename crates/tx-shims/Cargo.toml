@@ -27,7 +27,7 @@ tx-subsystems = { path = "../tx-subsystems" }
 # does NOT pull tx-shims), so no cycle is introduced.
 tx-hal = { path = "../tx-hal" }
 tx-scripts = { path = "../tx-scripts" }
+tx-fs = { path = "../tx-fs" }
 
 [dev-dependencies]
-tx-fs = { path = "../tx-fs" }
 tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }

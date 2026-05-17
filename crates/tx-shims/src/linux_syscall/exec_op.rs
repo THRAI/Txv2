@@ -24,10 +24,11 @@
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use step_engine::{self, StepOp, StepOutcome, YieldShape, NoProgress, Cap};
+use super::step_engine::{self, StepOp, StepOutcome, YieldShape, NoProgress, Cap};
 
-use tx_hal::{PmapIf, EntropyIf, AuxvIf};
-use tx_subsystems::cred::{Credential, Gid, Uid, step_apply_suid_for_exec, Capability};
+use tx_hal::{PmapIf, EntropyIf, AuxvIf, UserTrapContext};
+use tx_subsystems::cred::{Gid, Uid, step_apply_suid_for_exec, Capability};
+use tx_subsystems::vfs::structure::Credential;
 use tx_subsystems::vfs::walker::step_open;
 use tx_subsystems::vfs::structure::{OpenFileFlags, RNodeBacking, InodeMeta};
 use tx_subsystems::vfs::OpenFile;
@@ -40,8 +41,7 @@ use tx_subsystems::vm::{
 };
 use tx_subsystems::mount::MountFlags;
 use tx_subsystems::process::ProcessIdentity;
-use tx_subsystems::process::structure::GroupExitState;
-use tx_subsystems::process::execution::{
+use tx_subsystems::process::{
     step_close_cloexec_fds, step_install_brk_for_exec, step_reset_signal_dispositions_for_exec,
 };
 use tx_subsystems::thread_runtime::structure::ThreadIdentity;

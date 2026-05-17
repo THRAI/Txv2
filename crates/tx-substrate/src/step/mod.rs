@@ -615,9 +615,7 @@ impl<I: SubjectIdentity> ScriptCtx<I> {
 
     /// Reactor delegate registry if populated; `None` for
     /// test/placeholder contexts or before reactor integration.
-    pub fn delegate_registry(
-        &self,
-    ) -> Option<&alloc::sync::Arc<crate::step::DelegateRegistry>> {
+    pub fn delegate_registry(&self) -> Option<&alloc::sync::Arc<crate::step::DelegateRegistry>> {
         self.delegate_registry.as_ref()
     }
 

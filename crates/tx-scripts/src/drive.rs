@@ -19,20 +19,19 @@
 //! txdoc anchor: `txdoc:STEP-V2-DRIVER-1`
 
 use crate::adapter::delegate_runtime::{
-    AbortReason, AgentTokenGuard, DelegateRegistry, DelegateReply, DelegateTokenId,
-    TokenDropPolicy,
+    AbortReason, AgentTokenGuard, DelegateRegistry, TokenDropPolicy,
 };
 use crate::adapter::step_engine::{
     AcceptOutcome, AgentCancelPolicy, Deadline, DelegateEndpoint, DelegateRequest, DelegateToken,
-    DriveMode, Errno, ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress,
-    SubjectIdentity, Translation, YieldShape,
+    DriveMode, Errno, ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity,
+    Translation, YieldShape,
 };
 use crate::adapter::wake::{
-    agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, TimerGuardRole,
-    TimerToken, TimerWheel,
+    agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, TimerGuardRole, TimerToken,
+    TimerWheel,
 };
-use tx_substrate::wake::wait_source::lookup_source;
 use alloc::sync::{Arc, Weak};
+use tx_substrate::wake::wait_source::lookup_source;
 
 use tx_subsystems::execution::WaitToken;
 use tx_subsystems::wait_source;
@@ -95,8 +94,7 @@ where
                             // (usize for ByteProgress). The compiler
                             // cannot prove this, but the impl contract
                             // guarantees it.
-                            let output: S::Output =
-                                unsafe { core::mem::transmute_copy(&val) };
+                            let output: S::Output = unsafe { core::mem::transmute_copy(&val) };
                             core::mem::forget(val);
                             return Ok(output);
                         }
@@ -106,24 +104,16 @@ where
                         return Err(Errno::ENOSYS);
                     }
                     AcceptOutcome::Resolve => {
-                        let resume = resolve_yield(
-                            &shape, mailbox, delegate_registry, timer_wheel,
-                        )
-                        .await;
+                        let resume =
+                            resolve_yield(&shape, mailbox, delegate_registry, timer_wheel).await;
                         // D9-A: translate Aborted(Interrupted/Killed) to
                         // the appropriate errno without calling
                         // apply_resume (which defaults to rejecting
                         // non-Retry outcomes).
-                        if matches!(
-                            resume,
-                            ResumeOutcome::Aborted(AbortReason::Interrupted)
-                        ) {
+                        if matches!(resume, ResumeOutcome::Aborted(AbortReason::Interrupted)) {
                             return Err(Errno::EINTR);
                         }
-                        if matches!(
-                            resume,
-                            ResumeOutcome::Aborted(AbortReason::Killed)
-                        ) {
+                        if matches!(resume, ResumeOutcome::Aborted(AbortReason::Killed)) {
                             return Err(Errno::EINTR);
                         }
                         op.apply_resume(resume).map_err(|_| Errno::EIO)?;
@@ -151,15 +141,13 @@ async fn resolve_yield(
     timer_wheel: Option<&TimerWheel>,
 ) -> ResumeOutcome {
     match shape {
-        YieldShape::OnWaitSource {
-            source,
-            interests,
-        } => resolve_on_wait_source(*source, *interests, mailbox).await,
+        YieldShape::OnWaitSource { source, interests } => {
+            resolve_on_wait_source(*source, *interests, mailbox).await
+        }
 
-        YieldShape::OnEdge {
-            source,
-            interests,
-        } => resolve_on_wait_source(*source, *interests, mailbox).await,
+        YieldShape::OnEdge { source, interests } => {
+            resolve_on_wait_source(*source, *interests, mailbox).await
+        }
 
         YieldShape::OnAgent {
             endpoint,
@@ -167,11 +155,19 @@ async fn resolve_yield(
             token,
             deadline,
             cancel,
-        } => resolve_on_agent(
-            endpoint, request, token, *deadline, *cancel, mailbox, delegate_registry,
-            timer_wheel,
-        )
-        .await,
+        } => {
+            resolve_on_agent(
+                endpoint,
+                request,
+                token,
+                *deadline,
+                *cancel,
+                mailbox,
+                delegate_registry,
+                timer_wheel,
+            )
+            .await
+        }
 
         YieldShape::OnTimer { token, deadline } => {
             resolve_on_timer(*token, *deadline, mailbox, timer_wheel).await
@@ -196,9 +192,9 @@ async fn resolve_on_wait_source(
         // the object side can wake us when its state changes.  The
         // registration is scoped to the park; we unregister on wake.
         let ws = lookup_source(source);
-        let sub_id = ws.as_ref().map(|ws| {
-            ws.register(Arc::downgrade(mbox), gen, interests)
-        });
+        let sub_id = ws
+            .as_ref()
+            .map(|ws| ws.register(Arc::downgrade(mbox), gen, interests));
 
         let interrupted = await_mailbox_event(mbox, |event| active.matches(event)).await;
 
@@ -224,6 +220,7 @@ async fn resolve_on_wait_source(
 // OnAgent resolution
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_on_agent(
     endpoint: &DelegateEndpoint,
     request: &DelegateRequest,
@@ -310,11 +307,7 @@ async fn resolve_on_timer(
 
     // PR-8B: Install the timer with a weak mailbox reference so
     // the reactor's clock tick can post TimerFired on expiry.
-    let _guard = tw.install_for_task(
-        deadline,
-        TimerGuardRole::PrimarySleep,
-        Arc::downgrade(mbox),
-    );
+    let _guard = tw.install_for_task(deadline, TimerGuardRole::PrimarySleep, Arc::downgrade(mbox));
 
     // Park on mailbox until the reactor's timer-tick fires the
     // wheel and posts a TimerFired event for our token.
@@ -390,9 +383,5 @@ where
         fn drop(&mut self) {}
     }
 
-    MailboxFuture {
-        mailbox,
-        predicate,
-    }
-    .await
+    MailboxFuture { mailbox, predicate }.await
 }

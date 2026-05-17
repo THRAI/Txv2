@@ -10,10 +10,10 @@ mod zones;
 pub mod devices;
 pub mod init;
 pub mod irq;
-mod rootfs;
 pub mod thread_future;
 pub mod trap;
 pub mod trap_handoff;
+pub mod vdso;
 
 use tx_hal::{BootHandoff, TxPlatform};
 

@@ -41,11 +41,7 @@ pub(crate) fn lint_invariants_script_boundary(root: &Path) -> Result<()> {
 
             // Match: line contains both `tx_subsystems` AND `::structure`
             if trimmed.contains("tx_subsystems") && trimmed.contains("::structure") {
-                violations.push(format!(
-                    "{rel}:{} — {}",
-                    line_num + 1,
-                    trimmed
-                ));
+                violations.push(format!("{rel}:{} — {}", line_num + 1, trimmed));
             }
         }
     }
