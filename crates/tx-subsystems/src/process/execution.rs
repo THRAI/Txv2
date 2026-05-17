@@ -1204,6 +1204,8 @@ impl<'a, P: PmapIf, I: SubjectIdentity> StepOp<I> for ForkOp<'a, P> {
     }
 }
 
+impl<P: PmapIf, I: SubjectIdentity> OneShotStepOp<I> for ForkOp<'_, P> {}
+
 /// `StepOp` wrap of [`step_exit_group`].
 pub struct ExitGroupOp<'a> {
     pub process: &'a Cap<ProcessIdentity>,
