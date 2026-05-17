@@ -280,7 +280,6 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     // syscall entry. `step_fork` reads the parent cred internally
     // (via `payload.cred()`) to seed the child — the subject's role
     // here is SUBJ-1 hygiene, not driving the fork-time cred copy.
-    use step_engine::{StepOp, StepOutcome as V3Fork};
     let mut script_ctx = build_subject_script_ctx(ctx);
     let fork_result = {
         let mut op = tx_subsystems::process::execution::ForkOp::<P> {
@@ -288,11 +287,9 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             clone_vm,
             _pmap: core::marker::PhantomData,
         };
-        match op.step(&mut script_ctx) {
-            V3Fork::Done(r) => r,
-            V3Fork::Err(_) | V3Fork::Continue { .. } | V3Fork::Yield { .. } => {
-                return SyscallResult::Error(EAGAIN_VALUE);
-            }
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(r) => r,
+            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
         }
     };
     // step_fork: mint a child ProcessIdentity + leader ThreadIdentity
