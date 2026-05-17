@@ -81,7 +81,8 @@ use tx_subsystems::vfs::structure::{
 };
 use tx_subsystems::futex::FutexWakeOp;
 use tx_subsystems::vfs::{
-    step_open, step_walk, DEntry, InodeStatOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp, OpenOp,
+    step_open, step_walk, DEntry, FileFsyncOp, FlockOp, InodeStatOp, OpenFile, OpenFileGetFlOp,
+    OpenFileSetFlOp, OpenOp,
 };
 use tx_subsystems::vfs::composite::{
     AccessOp, ChmodOp, ChownOp, LinkOp, MkdirOp, NanosleepOp, ReadLinkOp, RenameOp, StatOp,

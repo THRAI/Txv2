@@ -1410,11 +1410,29 @@ pub(super) async fn sys_fsync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         Some(mp) => mp.fs_page_backing().clone(),
         None => return SyscallResult::Error(ENODEV_VALUE),
     };
-    // fsync: sync the specific file, not the filesystem root.
-    match page_backing.fsync(fs_object_id, &guard) {
-        StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(Errno::from(e))),
-        _ => SyscallResult::Error(EIO_VALUE),
+    // fsync: sync the specific file via FileFsyncOp + drive().
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let mut op = FileFsyncOp {
+        page_backing,
+        fs_object_id,
+        guard: &guard,
+    };
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        None,
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
     }
 }
 
@@ -1425,7 +1443,45 @@ pub(super) async fn sys_fdatasync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_
 }
 
 /// `flock(fd, operation)`. Linux RV64 ABI `__NR_flock = 32`.
-pub(super) async fn sys_flock<P: PmapIf>(_args: [u64; 6], _ctx: &SyscallCtx<'_>) -> SyscallResult {
+///
+/// v1: exclusive-lock only per open-file-description.  LOCK_SH
+/// maps to LOCK_EX.  No deadlock detection.  Per POSIX flock
+/// semantics (advisory, not enforced on I/O).
+pub(super) async fn sys_flock<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
-    SyscallResult::Error(ENOSYS_VALUE)
+    let fd = args[0] as u32;
+    let operation = args[1] as u32;
+
+    const LOCK_SH: u32 = 1;
+    const LOCK_EX: u32 = 2;
+    const LOCK_UN: u32 = 8;
+    const LOCK_NB: u32 = 4;
+
+    let open_file = match ctx.process.fd(fd) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    if (operation & LOCK_UN) != 0 {
+        open_file.flock_release();
+        return SyscallResult::Return(0);
+    }
+
+    let lock_type = operation & 3; // LOCK_SH=1 or LOCK_EX=2
+    if lock_type != LOCK_SH && lock_type != LOCK_EX {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let blocking = (operation & LOCK_NB) == 0;
+
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = FlockOp {
+        file: &open_file,
+        lock_type,
+        blocking,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+    }
 }
