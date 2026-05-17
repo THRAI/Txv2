@@ -54,7 +54,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(Some(cloexec)) => SyscallResult::Return(if cloexec { FD_CLOEXEC as i64 } else { 0 }),
             Ok(None) => SyscallResult::Return(0),
-            Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
         };
     }
 
@@ -69,7 +69,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(new_fd) => SyscallResult::Return(new_fd as i64),
-                Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
             };
         }
         F_GETFL => {
@@ -78,7 +78,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             let f = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(flags) => flags,
                 Err(v3errno) => {
-                    return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                    return SyscallResult::error_from(Errno::from(v3errno));
                 }
             };
             let mut bits: u64 = match (f.read, f.write) {
@@ -104,7 +104,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(()) => SyscallResult::Return(0),
-                Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
             }
         }
         _ => SyscallResult::Error(ENOSYS_VALUE),
@@ -236,7 +236,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         {
             Ok(file) => file,
             Err(v3errno) => {
-                return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                return SyscallResult::error_from(Errno::from(v3errno));
             }
         };
         let fd = ctx.process.allocate_fd();
@@ -292,7 +292,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
                 Err(e) => return SyscallResult::Error(e),
             }
         }
-        V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
     };
 
     // Step 2: O_TRUNC. Apply *before* materialising the OpenFile so
@@ -318,7 +318,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
                     return SyscallResult::Error(EIO_VALUE);
                 }
                 V3Trunc::Err(errno) => {
-                    return SyscallResult::Error(errno_to_i32(Errno::from(errno)));
+                    return SyscallResult::error_from(Errno::from(errno));
                 }
             }
         }
@@ -343,7 +343,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
 
@@ -384,7 +384,7 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -404,7 +404,7 @@ pub(super) fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(newfd) => SyscallResult::Return(newfd as i64),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -439,7 +439,7 @@ pub(super) fn sys_dup3<'a>(
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(fd) => SyscallResult::Return(fd as i64),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -492,7 +492,7 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(pair) => pair,
             Err(v3errno) => {
-                return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                return SyscallResult::error_from(Errno::from(v3errno));
             }
         }
     };
@@ -517,7 +517,7 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     if let Err(errno) =
         bootstrap_write_user::<[u32; 2]>(&ctx.aspace, pipefd_uaddr, [reader_fd, writer_fd])
     {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
 
     SyscallResult::Return(0)
@@ -555,7 +555,7 @@ pub(super) fn sys_lseek<'a>(
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(new_offset) => SyscallResult::Return(new_offset as i64),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -656,7 +656,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             super::numbers::UFFDIO_CONTINUE => {
                 super::userfaultfd::step_uffdio_continue(&file, argp, ctx)
             }
-            _ => SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
+            _ => SyscallResult::error_from(Errno::EINVAL),
         };
     }
 
@@ -667,7 +667,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         RNodeBacking::StructBacked {
             payload: StructPayload::Tty(tty),
         } => tty.clone(),
-        _ => return SyscallResult::Error(errno_to_i32(Errno::ENOTTY)),
+        _ => return SyscallResult::error_from(Errno::ENOTTY),
     };
 
     // v3 step_ioctl_* return Done/Err only in practice; helper to
@@ -694,11 +694,11 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     }
                     if let Err(errno) = bootstrap_write_user::<Termios>(&ctx.aspace, argp, termios)
                     {
-                        return SyscallResult::Error(errno_to_i32(errno));
+                        return SyscallResult::error_from(errno);
                     }
                     SyscallResult::Return(0)
                 }
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TCSETS | TCSETSW | TCSETSF => {
@@ -712,7 +712,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             // output queue.
             let new_termios: Termios = match bootstrap_read_user::<Termios>(&ctx.aspace, argp) {
                 Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => return SyscallResult::error_from(errno),
             };
             let outcome = {
                 let guard = step_engine::guard();
@@ -720,7 +720,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TIOCGPGRP => {
@@ -734,11 +734,11 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
                     if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, argp, pgid) {
-                        return SyscallResult::Error(errno_to_i32(errno));
+                        return SyscallResult::error_from(errno);
                     }
                     SyscallResult::Return(0)
                 }
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TIOCSPGRP => {
@@ -747,7 +747,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             }
             let new_pgrp: u32 = match bootstrap_read_user::<u32>(&ctx.aspace, argp) {
                 Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => return SyscallResult::error_from(errno),
             };
             let caller = make_ioctl_caller(ctx);
             let outcome = {
@@ -756,7 +756,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TIOCGWINSZ => {
@@ -770,11 +770,11 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
                     if let Err(errno) = bootstrap_write_user::<Winsize>(&ctx.aspace, argp, ws) {
-                        return SyscallResult::Error(errno_to_i32(errno));
+                        return SyscallResult::error_from(errno);
                     }
                     SyscallResult::Return(0)
                 }
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TIOCSWINSZ => {
@@ -783,7 +783,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             }
             let ws: Winsize = match bootstrap_read_user::<Winsize>(&ctx.aspace, argp) {
                 Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => return SyscallResult::error_from(errno),
             };
             let outcome = {
                 let guard = step_engine::guard();
@@ -791,7 +791,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TIOCSCTTY => {
@@ -809,7 +809,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         TIOCNOTTY => {
@@ -820,7 +820,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => SyscallResult::error_from(errno),
             }
         }
         // Unknown ioctl request → -ENOTTY (the POSIX `man ioctl_tty`
@@ -828,7 +828,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         // hits this arm, but other libc paths (or buggy userspace)
         // observing -ENOTTY here is the canonical Linux signal that
         // the request is not a terminal ioctl on this fd.
-        _ => SyscallResult::Error(errno_to_i32(Errno::ENOTTY)),
+        _ => SyscallResult::error_from(Errno::ENOTTY),
     }
 }
 
@@ -1001,7 +1001,7 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     let stat = inode_meta_to_stat(&meta, ino, 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -1084,13 +1084,13 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         };
         match result {
             Ok((sr, id)) => (sr, id),
-            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
 
     let statx = inode_meta_to_statx(&statx_result.meta, ino.as_u64());
     if let Err(errno) = bootstrap_write_user::<StatxLayout>(&ctx.aspace, statxbuf_uaddr, statx) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -1162,14 +1162,14 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         };
         match result {
             Ok((m, id)) => (m, id),
-            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
 
     let stat = inode_meta_to_stat(&meta, ino.as_u64(), 0);
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
 }
@@ -1299,7 +1299,7 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
                     if written > 0 {
                         return SyscallResult::Return(written as i64);
                     }
-                    return SyscallResult::Error(errno_to_i32(errno));
+                    return SyscallResult::error_from(errno);
                 }
                 written += total_len;
                 cursor = next_cursor;
@@ -1324,7 +1324,7 @@ pub(super) async fn sys_getdents64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
                 if written > 0 {
                     return SyscallResult::Return(written as i64);
                 }
-                return SyscallResult::Error(errno_to_i32(Errno::from(errno)));
+                return SyscallResult::error_from(Errno::from(errno));
             }
         }
     }
@@ -1365,7 +1365,7 @@ pub(super) async fn sys_statfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
     buf[88..96].copy_from_slice(&255u64.to_le_bytes());
     buf[96..104].copy_from_slice(&4096u64.to_le_bytes());
     if let Err(e) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &buf) {
-        return SyscallResult::Error(errno_to_i32(e));
+        return SyscallResult::error_from(e);
     }
     SyscallResult::Return(0)
 }
@@ -1408,7 +1408,7 @@ pub(super) async fn sys_syncfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
     // to `fsync_file(ROOT)`; journaling filesystems can override.
     match page_backing.sync_filesystem(&guard) {
         StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(Errno::from(e))),
+        StepOutcome::Err(e) => SyscallResult::error_from(Errno::from(e)),
         _ => SyscallResult::Error(EIO_VALUE),
     }
 }
@@ -1458,7 +1458,7 @@ pub(super) async fn sys_fsync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -1511,6 +1511,6 @@ pub(super) async fn sys_flock<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }

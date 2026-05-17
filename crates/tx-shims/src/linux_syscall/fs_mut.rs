@@ -204,7 +204,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     match outcome {
         V3::Done(_) => SyscallResult::Return(0),
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -279,7 +279,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     match outcome {
         V3::Done(()) => SyscallResult::Return(0),
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -341,7 +341,7 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     match outcome {
         V3::Done(_) => SyscallResult::Return(0),
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -419,7 +419,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     match outcome {
         V3::Done(()) => SyscallResult::Return(0),
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -463,7 +463,7 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     match outcome {
         V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
         V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(v3_errno) => SyscallResult::Error(errno_to_i32(v3_errno.into())),
+        V3::Err(v3_errno) => SyscallResult::error_from(v3_errno.into()),
     }
 }
 
@@ -512,7 +512,7 @@ pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -585,7 +585,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     let target_meta = {
@@ -595,7 +595,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     if target_meta.kind() != InodeKind::Symlink {
@@ -608,13 +608,13 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     let to_copy = core::cmp::min(link_bytes.len(), buf_len);
     if to_copy > 0 {
         if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &link_bytes[..to_copy]) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
     SyscallResult::Return(to_copy as i64)
@@ -665,7 +665,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         };
         match mount::bind_mount(source_dentry, target_dentry, &parent_payload, &guard) {
             Ok(_) => return SyscallResult::Return(0),
-            Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+            Err(e) => return SyscallResult::error_from(e),
         }
     }
 
@@ -770,7 +770,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
             };
             let mounted = match mounted {
                 Ok(m) => m,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                Err(errno) => return SyscallResult::error_from(errno),
             };
             let root_id = mounted.root_fs_object_id;
             let root_meta = mounted.root_inode_meta.clone();
@@ -871,7 +871,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     use StepOutcome as V3;
     let target_dentry = match step_walk(cwd.clone(), &target, &cred, &guard) {
         V3::Done(d) => d,
-        V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+        V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         _ => return SyscallResult::Error(EIO_VALUE),
     };
     let parent_payload = match mount_payload_for_dentry(&target_dentry) {
@@ -881,7 +881,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
 
     match mount::umount(&target_dentry, &parent_payload) {
         Ok(()) => SyscallResult::Return(0),
-        Err(e) => SyscallResult::Error(errno_to_i32(e)),
+        Err(e) => SyscallResult::error_from(e),
     }
 }
 
@@ -937,7 +937,7 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     };
     match result {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -1025,6 +1025,6 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     };
     match result {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }

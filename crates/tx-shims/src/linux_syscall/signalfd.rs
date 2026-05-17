@@ -76,13 +76,13 @@ pub(super) fn sys_signalfd4<'a>(
         return SyscallResult::Error(EINVAL_VALUE);
     }
     if mask_ptr == 0 {
-        return SyscallResult::Error(errno_to_i32(Errno::EFAULT));
+        return SyscallResult::error_from(Errno::EFAULT);
     }
 
     // Read the sigset_t from userspace as a u64.
     let mask: u64 = match bootstrap_read_user::<u64>(&ctx.aspace, mask_ptr) {
         Ok(v) => v,
-        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        Err(errno) => return SyscallResult::error_from(errno),
     };
 
     if fd < 0 {
@@ -96,7 +96,7 @@ pub(super) fn sys_signalfd4<'a>(
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(Ok(cap)) => cap,
                 Ok(Err(_)) => return SyscallResult::Error(ENOMEM_VALUE),
-                Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+                Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
             }
         };
 
@@ -178,7 +178,7 @@ pub(super) async fn sys_signalfd_read(
                 if let Err(errno) =
                     super::bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &outcome.1[..read])
                 {
-                    return SyscallResult::Error(errno_to_i32(errno));
+                    return SyscallResult::error_from(errno);
                 }
                 return SyscallResult::Return(read as i64);
             }
@@ -187,7 +187,7 @@ pub(super) async fn sys_signalfd_read(
                 if errno == Errno::EAGAIN {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
-                return SyscallResult::Error(errno_to_i32(errno));
+                return SyscallResult::error_from(errno);
             }
             V3Out::Yield {
                 shape:
@@ -204,7 +204,7 @@ pub(super) async fn sys_signalfd_read(
                 // Re-poll on next loop iteration.
             }
             V3Out::Continue { .. } | V3Out::Yield { .. } => {
-                return SyscallResult::Error(errno_to_i32(Errno::EIO));
+                return SyscallResult::error_from(Errno::EIO);
             }
         }
     }

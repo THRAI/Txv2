@@ -360,7 +360,7 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(m) => m,
-            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
     let mode_bits = inode_meta.mode as u32;
@@ -467,7 +467,7 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::Error(errno_to_i32(Errno::from(errno))),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
 
@@ -483,7 +483,7 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(ChdirOutcome::Replaced { .. }) => SyscallResult::Return(0),
         Ok(ChdirOutcome::ZombieIgnored) => SyscallResult::Error(ESRCH_VALUE),
-        Err(v3errno) => SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -521,7 +521,7 @@ pub(super) fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     let path = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(Some(p)) => p,
         Ok(None) => return SyscallResult::Error(ENOENT_VALUE),
-        Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
     };
     // `path` is the rendered absolute path bytes (no NUL terminator);
     // `size` must accommodate `path.len() + 1` to fit the terminator.
@@ -536,7 +536,7 @@ pub(super) fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     buf.extend_from_slice(&path);
     buf.push(0);
     if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &buf) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(needed as i64)
 }
