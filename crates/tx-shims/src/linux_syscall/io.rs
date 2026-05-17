@@ -102,7 +102,7 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
 }
 
 /// `readv(fd, iov, iovcnt)` — scatter-read counterpart of `sys_writev`.
-pub(super) async fn sys_readv<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let iov_ptr = args[1];
     let iovcnt = args[2] as i32;
 
@@ -346,6 +346,12 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         None => return SyscallResult::Error(EBADF_VALUE),
     };
 
+    // eventfd fds carry their own `write(2)` arm — add a 64-bit
+    // value to the counter. Dispatch before the generic VFS path.
+    if file.eventfd().is_some() {
+        return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
+    }
+
     // Pull the user buffer into kernel memory through the canonical
     // user-VA lane (`bootstrap_copy_from_user` bridges via
     // `aspace.copy_from_user`, falling back to the kernel-pointer
@@ -421,7 +427,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// TTY's wait `Channel`. On any partial progress (`total > 0`)
 /// the dispatcher returns what it has rather than block again,
 /// matching `sys_write`'s partial-success policy.
-pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let buf_ptr = args[1] as usize;
     let len = args[2] as usize;
@@ -457,6 +463,16 @@ pub(super) async fn sys_read<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     // generic VFS path.
     if file.signalfd().is_some() {
         return super::signalfd::sys_signalfd_read(&file, args[1], len, ctx).await;
+    }
+    // eventfd fds carry their own `read(2)` arm — drain the 64-bit
+    // counter. Mirrors the ufd / signalfd dispatch shape.
+    if file.eventfd().is_some() {
+        return super::eventfd::sys_eventfd_read(&file, args[1], len, ctx).await;
+    }
+    // timerfd fds carry their own `read(2)` arm — return the
+    // expiration count as an 8-byte u64.
+    if file.timerfd().is_some() {
+        return super::timerfd::sys_timerfd_read::<P>(&file, args[1], len, ctx).await;
     }
 
     // Read into a kernel-side staging buffer, then copy out through

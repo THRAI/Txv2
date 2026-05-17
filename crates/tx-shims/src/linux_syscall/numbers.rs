@@ -1514,3 +1514,42 @@ pub const NR_EPOLL_WAIT: u64 = 232;
 /// stubs the sigmask; real signal-mask manipulation is deferred to
 /// a future signal-subsystem PR.
 pub const NR_EPOLL_PWAIT: u64 = 281;
+
+// =====================================================================
+// eventfd / timerfd syscall numbers
+//
+// `man 2 eventfd2`, `man 2 timerfd_create`.
+// =====================================================================
+
+/// `eventfd2(init_val, flags)`. Linux generic uapi `__NR_eventfd2 = 290`.
+/// Mints a fresh [`tx_subsystems::eventfd::EventFd`] cap, wraps it in
+/// an `OpenFile` with `OpenFileBacking::Eventfd`, and installs it at
+/// the lowest free fd.
+pub const NR_EVENTFD2: u64 = 290;
+
+/// Recognised `eventfd2` flags. EFD_SEMAPHORE is read by the eventfd
+/// subsystem; EFD_CLOEXEC / EFD_NONBLOCK are translated to OpenFileFlags.
+pub const EFD_SEMAPHORE_FLAG: u32 = 0x1;
+pub const EFD_CLOEXEC_FLAG: u32 = O_CLOEXEC;
+pub const EFD_NONBLOCK_FLAG: u32 = O_NONBLOCK;
+
+/// `timerfd_create(clockid, flags)`. Linux generic uapi
+/// `__NR_timerfd_create = 283`. Mints a fresh
+/// [`tx_subsystems::timerfd::TimerFd`] cap.
+pub const NR_TIMERFD_CREATE: u64 = 283;
+
+/// `timerfd_settime(fd, flags, new_value, old_value)`. Linux generic
+/// uapi `__NR_timerfd_settime = 286`. Arms/disarms the timer.
+pub const NR_TIMERFD_SETTIME: u64 = 286;
+
+/// `timerfd_gettime(fd, curr_value)`. Linux generic uapi
+/// `__NR_timerfd_gettime = 287`. Returns the current timer state.
+pub const NR_TIMERFD_GETTIME: u64 = 287;
+
+/// Recognised `timerfd_create` flags. TFD_CLOEXEC / TFD_NONBLOCK are
+/// translated to OpenFileFlags.
+pub const TFD_CLOEXEC_FLAG: u32 = O_CLOEXEC;
+pub const TFD_NONBLOCK_FLAG: u32 = O_NONBLOCK;
+
+/// `TFD_TIMER_ABSTIME` — interpret `it_value` as an absolute time.
+pub const TFD_TIMER_ABSTIME_FLAG: u32 = 1;
