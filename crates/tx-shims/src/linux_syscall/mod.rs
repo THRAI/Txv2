@@ -119,6 +119,7 @@ use misc::*;
 mod userfaultfd;
 use userfaultfd::*;
 pub mod clone_op;
+pub mod exec_op;
 pub mod aio;
 use aio::*;
 pub mod io_uring;
