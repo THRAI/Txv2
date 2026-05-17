@@ -362,6 +362,36 @@ impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
 use crate::process::ProcessIdentity;
 impl OneShotStepOp<ProcessIdentity> for SigprocmaskOp {}
 
+/// StepOp wrapper for [`post_signal`] — per-thread signal delivery
+/// (used by `tkill` and `tgkill`).
+pub struct ThreadKillOp {
+    pub thread: Cap<ThreadIdentity>,
+    pub sig: Signum,
+    pub info: Option<crate::signal::SigInfo>,
+}
+
+impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
+    crate::thread_runtime::adapter::step_engine::StepOp<I> for ThreadKillOp
+{
+    type Output = ();
+    type Progress = crate::thread_runtime::adapter::step_engine::NoProgress;
+    fn step(
+        &mut self,
+        _ctx: &mut crate::thread_runtime::adapter::step_engine::ScriptCtx<I>,
+    ) -> crate::thread_runtime::adapter::step_engine::StepOutcome<(), crate::thread_runtime::adapter::step_engine::NoProgress>
+    {
+        // observe — thread Cap + sig validated by post_signal internally
+        // upgrade — N/A
+        // reserve — N/A
+        // commit — post_signal delivers to thread's pending queue
+        // publish — post_signal sends MailboxEvent if mailbox bound
+        post_signal(&self.thread, self.sig, self.info);
+        crate::thread_runtime::adapter::step_engine::StepOutcome::Done(())
+    }
+}
+
+impl OneShotStepOp<ProcessIdentity> for ThreadKillOp {}
+
 #[cfg(test)]
 mod step_op_wraps {
     //! PR-2 wave-2 `StepOp` wrap tests for the thread-runtime
