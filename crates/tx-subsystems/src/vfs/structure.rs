@@ -931,6 +931,9 @@ pub struct OpenFile {
     /// Best-effort DEntry hint set by `step_open`. `None` for
     /// non-VFS shapes (ufd, aio, etc.). Used by `fchdir`.
     opendir_dentry: Option<Cap<DEntry>>,
+    /// Advisory file lock state: 0 = unlocked, non-zero = exclusive-locked.
+    /// Per open-file-description, not per-inode (POSIX flock semantics).
+    flock_state: core::sync::atomic::AtomicU64,
 }
 
 impl OpenFile {
@@ -975,6 +978,7 @@ impl OpenFile {
             nonblocking_override: AtomicBool::new(false),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1004,6 +1008,7 @@ impl OpenFile {
             nonblocking_override: AtomicBool::new(false),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1029,6 +1034,7 @@ impl OpenFile {
             nonblocking_override: AtomicBool::new(false),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1051,6 +1057,7 @@ impl OpenFile {
             nonblocking_override: AtomicBool::new(false),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1076,6 +1083,7 @@ impl OpenFile {
             nonblocking_override: AtomicBool::new(false),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1134,6 +1142,39 @@ impl OpenFile {
     /// Return the DEntry hint set by step_open.  Used by fchdir.
     pub fn opendir_dentry(&self) -> Option<Cap<DEntry>> {
         self.opendir_dentry.clone()
+    }
+
+    /// Acquire an advisory file lock (POSIX flock).
+    ///
+    /// Returns `Ok(())` on success, `Err(EWOULDBLOCK)` if
+    /// non-blocking and another holder has the lock.
+    /// `lock_type`: `LOCK_SH` (1) or `LOCK_EX` (2).
+    /// `blocking`: `false` = `LOCK_NB`.
+    pub fn flock_acquire(&self, _lock_type: u32, blocking: bool) -> Result<(), crate::execution::Errno> {
+        // v1: exclusive-only, per-open-file-description.
+        // Any shared lock maps to exclusive.
+        if blocking {
+            // Simple spin-wait for v1.
+            loop {
+                if self.flock_state.compare_exchange(0, 1,
+                    core::sync::atomic::Ordering::Acquire,
+                    core::sync::atomic::Ordering::Relaxed,
+                ).is_ok() {
+                    return Ok(());
+                }
+            }
+        } else {
+            self.flock_state.compare_exchange(0, 1,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            ).map_err(|_| crate::execution::Errno::EWOULDBLOCK)?;
+            Ok(())
+        }
+    }
+
+    /// Release a held advisory lock.
+    pub fn flock_release(&self) {
+        self.flock_state.store(0, core::sync::atomic::Ordering::Release);
     }
 
     /// `Some(&Cap<UserfaultFd>)` iff this `OpenFile` is the
