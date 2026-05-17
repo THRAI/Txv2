@@ -1378,6 +1378,7 @@ pub(super) async fn sys_sync<P: PmapIf>(_args: [u64; 6], _ctx: &SyscallCtx<'_>) 
 }
 
 /// `syncfs(fd)`. Linux RV64 ABI `__NR_syncfs = 267`.
+/// Syncs the filesystem containing the given fd.
 pub(super) async fn sys_syncfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let fd = args[0] as u32;
@@ -1388,6 +1389,7 @@ pub(super) async fn sys_syncfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
         Some(mp) => mp.fs_page_backing().clone(),
         None => return SyscallResult::Error(ENODEV_VALUE),
     };
+    // syncfs: flush the entire filesystem through its root inode.
     match page_backing.fsync(tx_subsystems::vfs::FsObjectId::ROOT, &guard) {
         StepOutcome::Done(()) => SyscallResult::Return(0),
         StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(Errno::from(e))),
@@ -1396,13 +1398,30 @@ pub(super) async fn sys_syncfs<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
 }
 
 /// `fsync(fd)`. Linux RV64 ABI `__NR_fsync = 82`.
+/// Syncs the specific file referenced by `fd` (data + metadata).
 pub(super) async fn sys_fsync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    sys_syncfs::<P>(args, ctx).await
+    let _ = core::marker::PhantomData::<P>;
+    let fd = args[0] as u32;
+    let open_file = match ctx.process.fd(fd) { Some(f) => f, None => return SyscallResult::Error(EBADF_VALUE) };
+    let guard = step_engine::guard();
+    let rnode = open_file.rnode();
+    let fs_object_id = rnode.fs_object_id();
+    let page_backing = match rnode.containing_mount_weak().and_then(|w| w.upgrade(&guard)) {
+        Some(mp) => mp.fs_page_backing().clone(),
+        None => return SyscallResult::Error(ENODEV_VALUE),
+    };
+    // fsync: sync the specific file, not the filesystem root.
+    match page_backing.fsync(fs_object_id, &guard) {
+        StepOutcome::Done(()) => SyscallResult::Return(0),
+        StepOutcome::Err(e) => SyscallResult::Error(errno_to_i32(Errno::from(e))),
+        _ => SyscallResult::Error(EIO_VALUE),
+    }
 }
 
 /// `fdatasync(fd)`. Linux RV64 ABI `__NR_fdatasync = 83`.
+/// Syncs file data (not metadata).  v1: delegates to fsync.
 pub(super) async fn sys_fdatasync<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    sys_syncfs::<P>(args, ctx).await
+    sys_fsync::<P>(args, ctx).await
 }
 
 /// `flock(fd, operation)`. Linux RV64 ABI `__NR_flock = 32`.
