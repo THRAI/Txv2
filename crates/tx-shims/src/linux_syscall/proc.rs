@@ -93,11 +93,9 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// the canonical `aspace.read_user` / `aspace.read_user_cstr` lane
 /// (with a kernel-pointer fallback for test scaffolding).
 //
-// PR-9 phase 3b: not yet StepOp-driven — pending. `sys_execve`
-// invokes `exec_script::<P>(...).await` (multi-phase async free
-// fn) — no `*Op` wrap exists for the exec orchestration today.
-// When `exec_script` gains a StepOp wrap (or is decomposed into a
-// pipeline of wraps), thread `&mut KernelScriptCtx` here.
+// PR-9 phase 3b: StepOp-driven via ExecOp (10-phase state
+// machine).  Async operations yield; the drive loop parks on I/O.
+// Remaining synchronous phases return Continue.
 pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
@@ -147,24 +145,37 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf>(
     // `SyscallCtx` (kernel-side bootstrap path).
     let cred = ctx.walker_cred();
 
-    let outcome = exec_script::<P>(
+    // Drive ExecOp through the v3 StepOp loop.
+    // Phases that need I/O (step_open, read_exact_at) yield;
+    // the drive loop parks the task and resumes on I/O completion.
+    use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
+    use super::exec_op::ExecOp;
+    let mut op = ExecOp::<P>::new(
         &ctx.process,
         &ctx.thread,
         &path_buf,
         &argv_slices,
         &envp_slices,
         &cred,
-    )
-    .await;
-
-    match outcome {
-        Ok(()) => {
-            // vfork parent notification: wake any parent parked in
-            // sys_clone waiting for this process to exec.
-            ctx.process.notify_vfork_done();
-            SyscallResult::ExecCommitted
+    );
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    loop {
+        match op.step(&mut script_ctx) {
+            V3Out::Done(()) => return SyscallResult::ExecCommitted,
+            V3Out::Err(e) => return SyscallResult::Error(errno_to_i32(e)),
+            V3Out::Yield(YieldShape::OnWaitSource { source, .. }) => {
+                use tx_subsystems::execution::WaitToken;
+                let token = WaitToken::new(source.raw(), 1);
+                if let Some(future) = super::wait_source::wait_on_token(token) {
+                    future.await;
+                }
+            }
+            V3Out::Continue { .. } => {
+                // ExecOp::step returns Continue between phases.
+                // Loop back immediately — no I/O wait needed.
+            }
+            _ => return SyscallResult::Error(EIO_VALUE),
         }
-        Err(e) => SyscallResult::Error(execve_errno_magnitude(e)),
     }
 }
 
