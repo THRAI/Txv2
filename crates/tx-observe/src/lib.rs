@@ -175,31 +175,7 @@ struct HartSlot {
 unsafe impl Send for HartSlot {}
 unsafe impl Sync for HartSlot {}
 
-impl HartSlot {
-    #[cfg(test)]
-    const fn uninit() -> Self {
-        Self {
-            // SAFETY: a dangling-but-non-null placeholder; never dereferenced
-            // when `valid == false`.
-            ring_desc: tx_hal::RingDescriptor {
-                base: core::ptr::NonNull::dangling(),
-                size: 0,
-                doorbell: None,
-            },
-            ring_hdr: core::ptr::null_mut(),
-            slots: core::ptr::null_mut(),
-            slot_count: 0,
-            slot_mask: 0,
-            hart_id: 0,
-            span_counter: core::sync::atomic::AtomicU64::new(0),
-        }
-    }
-}
-
 /// Per-hart slot storage.  Each entry is initialised by `init`.
-///
-/// The `HartSlot::uninit()` argument is a hint only — `HartLocalArray::new`
-/// ignores it (see `hart_local.rs`).  We pass it for readability.
 ///
 /// SAFETY: Before any `HART_SLOTS.get(idx)` call, `init` must have called
 /// `HART_SLOTS.init_slot(idx, ...)`.  This is upheld by `init` writing the

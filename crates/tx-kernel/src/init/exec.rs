@@ -376,17 +376,59 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>("\n");
         }
 
-        if super::MUSL_MOUNT.lock().is_some() {
-            let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/musl:/musl/musl/basic"];
-            let sdcard_argv: &[&[u8]] = &[
-                b"sh",
-                b"-c",
-                b"cd /musl/musl && ./busybox sh basic_testcode.sh",
-            ];
+        let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+        let sdcard_boot = boot_info.initrd.is_none() && boot_info.cmdline.is_none();
+
+        if super::MUSL_MOUNT.lock().is_some() && sdcard_boot {
+            // Per-arch busybox path and test-script chain.
+            //
+            // la64 sdcard has both glibc/ and musl/ test directories;
+            // run both.  rv64 sdcard is musl-only (old code confirmed
+            // this: "cd /musl/musl && ./busybox sh basic_testcode.sh").
+            //
+            // All testcode.sh scripts expect CWD = their own directory
+            // and use `./busybox` for echo/cat etc., so we `cd` first.
+            let (sdcard_bin, sdcard_cmd): (&[u8], &[u8]) = match P::ARCH {
+                tx_hal::Arch::LoongArch64 => (
+                    // la64 sdcard has both glibc/ (dynamic) and musl/
+                    // (static). Use the musl static busybox; the kernel
+                    // does not yet support PT_INTERP (dynamic linker).
+                    b"/musl/musl/busybox",
+                    b"cd /musl/musl \
+                      && ./busybox sh basic_testcode.sh \
+                      && ./busybox sh busybox_testcode.sh \
+                      && ./busybox sh libctest_testcode.sh \
+                      && ./busybox sh libcbench_testcode.sh \
+                      && ./busybox sh lua_testcode.sh \
+                      && ./busybox sh lmbench_testcode.sh \
+                      && ./busybox sh iozone_testcode.sh \
+                      && ./busybox sh netperf_testcode.sh \
+                      && ./busybox sh iperf_testcode.sh \
+                      && ./busybox sh cyclictest_testcode.sh \
+                      && ./busybox sh ltp_testcode.sh",
+                ),
+                tx_hal::Arch::Riscv64 => (
+                    b"/musl/musl/busybox",
+                    b"cd /musl/musl \
+                      && ./busybox sh basic_testcode.sh \
+                      && ./busybox sh busybox_testcode.sh \
+                      && ./busybox sh libctest_testcode.sh \
+                      && ./busybox sh libcbench_testcode.sh \
+                      && ./busybox sh lua_testcode.sh \
+                      && ./busybox sh lmbench_testcode.sh \
+                      && ./busybox sh iozone_testcode.sh \
+                      && ./busybox sh netperf_testcode.sh \
+                      && ./busybox sh iperf_testcode.sh \
+                      && ./busybox sh cyclictest_testcode.sh \
+                      && ./busybox sh ltp_testcode.sh",
+                ),
+            };
+            let sdcard_envp: &[&[u8]] = &[b"PATH=/musl/glibc:/musl/musl"];
+            let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd];
             let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                 &init,
                 &thread,
-                b"/musl/musl/busybox",
+                sdcard_bin,
                 sdcard_argv,
                 sdcard_envp,
                 &cred,

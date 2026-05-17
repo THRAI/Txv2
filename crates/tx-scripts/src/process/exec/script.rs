@@ -44,7 +44,7 @@
 use core::sync::atomic::Ordering;
 use alloc::vec::Vec;
 
-use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
+use tx_hal::{EntropyIf, PlatformConfig, PmapIf, UserTrapContext};
 use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::process::adapter::wait_routing::Mask;
@@ -700,11 +700,12 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         if partial_in_page == 0 {
             continue;
         }
-        let partial_start = file_end - partial_in_page;
-        // File offset of `partial_start`. The segment's
-        // `file_offset` corresponds to `vaddr`; offsetting by
-        // `partial_start - vaddr` gives the file offset of the
-        // partial-last-page's start.
+        let partial_start = (file_end - partial_in_page).max(segment.vaddr);
+        // File offset of `partial_start`. The segment's `file_offset`
+        // corresponds to `vaddr`; offsetting by `partial_start - vaddr`
+        // gives the file offset of the bytes we need to seed. If the
+        // segment starts mid-page, the page floor can precede `vaddr`,
+        // so `partial_start` is clamped to the segment start.
         let file_off = segment
             .file_offset
             .checked_add(partial_start - segment.vaddr)
@@ -851,7 +852,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
 
     let entry_pc = parsed.entry as usize;
     let initial_sp = stack_image.initial_sp as usize;
-    let user_ctx = make_initial_user_trap_context(entry_pc, initial_sp);
+    let user_ctx = make_initial_user_trap_context(P::ARCH, entry_pc, initial_sp);
     if let Some(payload) = thread.payload_cap() {
         payload.store_saved_user_context(Some(user_ctx));
     }
@@ -899,10 +900,10 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
 /// `status` is left at zero — the platform's
 /// `restore_user_context` decides how to compose `sstatus` for the
 /// fresh image (typically a U-mode entry with interrupts enabled).
-fn make_initial_user_trap_context(pc: usize, sp: usize) -> UserTrapContext {
+fn make_initial_user_trap_context(arch: tx_hal::Arch, pc: usize, sp: usize) -> UserTrapContext {
     let mut regs = [0usize; 32];
     // Arch-specific SP register (x2 on RV64, x3 on LA64).
-    regs[initial_user_sp_reg()] = sp;
+    regs[initial_user_sp_reg_for_arch(arch)] = sp;
     UserTrapContext {
         regs,
         pc,
@@ -918,10 +919,6 @@ pub(crate) const fn initial_user_sp_reg_for_arch(arch: tx_hal::Arch) -> usize {
         tx_hal::Arch::Riscv64 => 2,
         tx_hal::Arch::LoongArch64 => 3,
     }
-}
-
-fn initial_user_sp_reg() -> usize {
-    initial_user_sp_reg_for_arch(tx_hal::Arch::Riscv64)
 }
 
 const fn translate_flags(parsed: ParsedSegmentFlags) -> VmSegmentFlags {
