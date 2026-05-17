@@ -15,18 +15,18 @@ use crate::vfs::adapter::step_engine::{self, Cap, Weak, Zone, ZoneAllocated, Zon
 use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
 
 use crate::aio::AioContext;
-use crate::epoll::Epoll;
-use crate::eventfd::EventFd;
 use crate::cred::{CapabilitySet, Cred};
 use crate::device::{BlockDeviceRegistration, CharDeviceBinding};
+use crate::epoll::Epoll;
+use crate::eventfd::EventFd;
 use crate::execution::Errno;
 use crate::io_uring::IoUring;
 use crate::mount::{MountIdentity, MountPayload};
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
 use crate::signalfd::SignalFd;
-use crate::tty::execution::IoctlSideEffect;
 use crate::timerfd::TimerFd;
+use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::TtyIdentity;
 use crate::tty::structure::{Termios, Winsize};
 use crate::userfaultfd::UserfaultFd;
@@ -961,6 +961,7 @@ impl OpenFile {
             nonblocking_override: AtomicBool::new(false),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1078,10 +1079,7 @@ impl OpenFile {
     }
 
     /// Zone-sign a fresh epoll-backed `OpenFile` (Phase B.1).
-    pub fn new_epoll_cap(
-        ep: Cap<Epoll>,
-        flags: OpenFileFlags,
-    ) -> Result<Cap<Self>, ZoneError> {
+    pub fn new_epoll_cap(ep: Cap<Epoll>, flags: OpenFileFlags) -> Result<Cap<Self>, ZoneError> {
         step_engine::sign(Self::new_epoll(ep, flags))
     }
 
@@ -1220,31 +1218,46 @@ impl OpenFile {
     /// non-blocking and another holder has the lock.
     /// `lock_type`: `LOCK_SH` (1) or `LOCK_EX` (2).
     /// `blocking`: `false` = `LOCK_NB`.
-    pub fn flock_acquire(&self, _lock_type: u32, blocking: bool) -> Result<(), crate::execution::Errno> {
+    pub fn flock_acquire(
+        &self,
+        _lock_type: u32,
+        blocking: bool,
+    ) -> Result<(), crate::execution::Errno> {
         // v1: exclusive-only, per-open-file-description.
         // Any shared lock maps to exclusive.
         if blocking {
             // Simple spin-wait for v1.
             loop {
-                if self.flock_state.compare_exchange(0, 1,
-                    core::sync::atomic::Ordering::Acquire,
-                    core::sync::atomic::Ordering::Relaxed,
-                ).is_ok() {
+                if self
+                    .flock_state
+                    .compare_exchange(
+                        0,
+                        1,
+                        core::sync::atomic::Ordering::Acquire,
+                        core::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
                     return Ok(());
                 }
             }
         } else {
-            self.flock_state.compare_exchange(0, 1,
-                core::sync::atomic::Ordering::Acquire,
-                core::sync::atomic::Ordering::Relaxed,
-            ).map_err(|_| crate::execution::Errno::EWOULDBLOCK)?;
+            self.flock_state
+                .compare_exchange(
+                    0,
+                    1,
+                    core::sync::atomic::Ordering::Acquire,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .map_err(|_| crate::execution::Errno::EAGAIN)?;
             Ok(())
         }
     }
 
     /// Release a held advisory lock.
     pub fn flock_release(&self) {
-        self.flock_state.store(0, core::sync::atomic::Ordering::Release);
+        self.flock_state
+            .store(0, core::sync::atomic::Ordering::Release);
     }
 
     /// `Some(&Cap<UserfaultFd>)` iff this `OpenFile` is the

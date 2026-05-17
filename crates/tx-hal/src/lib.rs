@@ -1,5 +1,6 @@
 #![no_std]
 
+#[cfg_attr(not(test), allow(unused_extern_crates))]
 extern crate alloc;
 
 pub mod hart_local;

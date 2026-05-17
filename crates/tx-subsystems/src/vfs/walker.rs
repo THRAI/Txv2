@@ -79,16 +79,12 @@
 //! [`Credential::root`] when the caller is root by construction.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use crate::vfs::adapter::step_engine::{self, Cap, NoProgress, StepOutcome, Weak};
 
 use crate::execution::{Errno, Guard};
-use crate::mount::{self, MountIdentity, MountPayload};
-use crate::vfs::structure::{
-    Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile, OpenFileFlags,
-    RNode, RNodeBacking,
-};
+use crate::mount::{MountIdentity, MountPayload};
+use crate::vfs::structure::{Credential, DEntry, InlineName, OpenFile, OpenFileFlags, RNode};
 use crate::vfs::FsOps;
 
 use super::predicates;
@@ -229,7 +225,6 @@ pub fn step_open<'g>(
 /// This function remains as the synchronous shell; callers that
 /// need yield/resume use `resolution::driver::run_walker` /
 /// `resume_walker` directly.
-
 /// Resolve the `Arc<dyn FsOps>` in scope for a given dentry by
 /// upgrading its RNode's containing-mount weak and reading
 /// `MountPayload::fs_ops` directly. The field is populated at
@@ -242,7 +237,10 @@ pub(crate) fn fs_ops_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<
 
 /// Like [`fs_ops_for`] but takes an `RNode` directly — used by
 /// fd-based ops that don't have a `DEntry` in hand.
-pub(crate) fn fs_ops_for_rnode<'g>(rnode: &Cap<RNode>, guard: &Guard<'g>) -> Option<Arc<dyn FsOps>> {
+pub(crate) fn fs_ops_for_rnode<'g>(
+    rnode: &Cap<RNode>,
+    guard: &Guard<'g>,
+) -> Option<Arc<dyn FsOps>> {
     let mount_payload_weak: Weak<MountPayload> = rnode.containing_mount_weak()?;
     let payload = mount_payload_weak.upgrade(guard)?;
     Some(payload.fs_ops().clone())
@@ -277,7 +275,10 @@ pub(crate) fn mount_root_dentry(from: &Cap<DEntry>) -> Cap<DEntry> {
 /// Resolve the `Cap<MountPayload>` in scope for a given dentry by
 /// upgrading its RNode's containing-mount weak. Used as the parent
 /// key for `mount::mount_for` lookups during a walk.
-pub(crate) fn mount_payload_for<'g>(dentry: &Cap<DEntry>, guard: &Guard<'g>) -> Option<Cap<MountPayload>> {
+pub(crate) fn mount_payload_for<'g>(
+    dentry: &Cap<DEntry>,
+    guard: &Guard<'g>,
+) -> Option<Cap<MountPayload>> {
     let weak: Weak<MountPayload> = dentry.rnode().containing_mount_weak()?;
     weak.upgrade(guard)
 }

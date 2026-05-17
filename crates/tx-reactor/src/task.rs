@@ -11,6 +11,12 @@ use crate::{
     waker::{task_waker, TaskWakeState},
 };
 
+// Per REACTOR_v0 §Submission: submitted futures must be `Send + 'static`.
+// Substrate's `Guard<'_>` is intentionally `!Send`/`!Sync` (EBR-7); StepOps
+// that hold `&Guard` are confined to synchronous `drive_oneshot` paths and
+// must not be carried across `.await`. The async `drive(...).await` path
+// instead uses StepOps that acquire their own guard inside `step()` per
+// STEP_MODEL_v2 §1, so the boxed future remains `Send`.
 pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

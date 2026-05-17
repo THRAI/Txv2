@@ -6,7 +6,7 @@
 use super::*;
 use tx_subsystems::process::numbers::{resolve_pid_number, PidName};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
-use tx_subsystems::signal::{KillOutcome, SignalTarget, deliver_posix_signal};
+use tx_subsystems::signal::{KillOutcome, SignalTarget};
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
 ///

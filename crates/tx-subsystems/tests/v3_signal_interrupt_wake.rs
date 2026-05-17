@@ -263,7 +263,7 @@ fn pselect_style_wait_resolves_interrupted_via_signal_mailbox() {
     // The reactor's task waker, registered via
     // `MailboxWakeAdapter::poll`, marks the task runnable.
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM),
+        step_kill_process(&proc_cap, Signum::SIGTERM, None),
         KillOutcome::Delivered
     );
     assert!(

@@ -23,8 +23,7 @@ use super::resolution::driver;
 use super::resolution::state::{FinalSymlinkPolicy, WalkMode};
 use super::resolution::terminal;
 use super::resolution::PathResolution;
-use super::structure::{Credential, DEntry, InlineName, InodeKind, VfsName};
-use super::walker::SYMLOOP_MAX;
+use super::structure::{Credential, DEntry, InlineName};
 
 /// Resolve `path` relative to `rooted_at` and return a terminal
 /// entity witness.
@@ -41,7 +40,12 @@ pub fn require_entity<'g>(
     guard: &'g Guard<'_>,
 ) -> Result<EntityAtPath<'g>, Errno> {
     let resolved = driver::walk_to_completion(
-        rooted_at, path, WalkMode::Entity, FinalSymlinkPolicy::Follow, cred, guard,
+        rooted_at,
+        path,
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        cred,
+        guard,
     )?;
     terminal::build_entity_witness(&resolved, guard)
 }
@@ -58,7 +62,12 @@ pub fn require_directory<'g>(
     guard: &'g Guard<'_>,
 ) -> Result<DirectoryAtPath<'g>, Errno> {
     let resolved = driver::walk_to_completion(
-        rooted_at, path, WalkMode::Entity, FinalSymlinkPolicy::Follow, cred, guard,
+        rooted_at,
+        path,
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        cred,
+        guard,
     )?;
     terminal::build_directory_witness(&resolved, guard)
 }

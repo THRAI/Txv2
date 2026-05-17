@@ -7,7 +7,6 @@ use super::step_ioctl::IoctlSideEffect;
 use crate::execution::{Errno, Guard};
 #[cfg(test)]
 use crate::tty::adapter::step_engine::ByteProgress;
-#[cfg(test)]
 use crate::tty::adapter::step_engine::{self as step_engine};
 use crate::tty::adapter::step_engine::{
     NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
@@ -59,14 +58,14 @@ pub fn step_master_close_last(
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct MasterCloseLastOp<'a> {
     pub master: &'a Cap<TtyIdentity>,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for MasterCloseLastOp<'a> {
     type Output = (HangupOutcome, IoctlSideEffect);
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_master_close_last(self.master, self.guard)
+        let __guard = step_engine::guard();
+        step_master_close_last(self.master, &__guard)
     }
 }
 
@@ -130,14 +129,9 @@ mod step_op_wraps {
         // A hardware (non-pty) TTY is rejected with EINVAL since its
         // transport isn't `Pty { .. }`.
         let tty = alloc_hardware_tty(400, "ttyV3-master-close-hw");
-        let guard = step_engine::guard();
-        let mut op = MasterCloseLastOp {
-            master: &tty,
-            guard: &guard,
-        };
+        let mut op = MasterCloseLastOp { master: &tty };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Err(step_engine::Errno::EINVAL) => {}
             other => panic!("expected Err(EINVAL), got {other:?}"),
@@ -149,14 +143,9 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_hardware_tty(401, "ttyV3-master-close-dead");
         let _ = tty.take_payload();
-        let guard = step_engine::guard();
-        let mut op = MasterCloseLastOp {
-            master: &tty,
-            guard: &guard,
-        };
+        let mut op = MasterCloseLastOp { master: &tty };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Err(step_engine::Errno::EIO) => {}
             other => panic!("expected Err(EIO), got {other:?}"),

@@ -24,8 +24,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    sign, ByteProgress, Cap, InterestMask, NoProgress, SpinMutex, StepOutcome, V3Errno, WaitSource,
-    WaitSourceId, YieldShape, Zone, ZoneAllocated, ZoneError,
+    ByteProgress, InterestMask, NoProgress, SpinMutex, StepOutcome, WaitSource, WaitSourceId,
+    YieldShape, Zone, ZoneAllocated, ZoneError,
 };
 
 // ---------------------------------------------------------------------------
@@ -33,6 +33,7 @@ use adapter::step_engine::{
 // ---------------------------------------------------------------------------
 
 /// Monitored fd entry.
+#[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
 #[derive(Clone, Debug)]
 struct EpollEntry {
     /// Userspace fd number.
@@ -78,6 +79,7 @@ unsafe impl ZoneAllocated for Epoll {
     }
 }
 
+#[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
 pub(crate) fn register_zones() -> Result<(), ZoneError> {
     adapter::step_engine::register_zone_for::<Epoll>()?;
     Ok(())
@@ -86,6 +88,12 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
 // ---------------------------------------------------------------------------
 // Epoll impl
 // ---------------------------------------------------------------------------
+
+impl Default for Epoll {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Epoll {
     pub fn new() -> Self {
@@ -129,15 +137,19 @@ pub fn step_epoll_ctl_add(
     // commit — entry inserted atomically with respect to the lock
     // publish — N/A: no signal attachments
     let mut fds = ep.fds.lock();
-    fds.insert(fd, EpollEntry { fd, interests, source });
+    fds.insert(
+        fd,
+        EpollEntry {
+            fd,
+            interests,
+            source,
+        },
+    );
     StepOutcome::Done(())
 }
 
 /// `epoll_ctl(DEL)`: remove a monitored fd.
-pub fn step_epoll_ctl_del(
-    ep: &Epoll,
-    fd: u32,
-) -> StepOutcome<(), NoProgress> {
+pub fn step_epoll_ctl_del(ep: &Epoll, fd: u32) -> StepOutcome<(), NoProgress> {
     // observe — N/A
     // upgrade — N/A
     // reserve — BTreeMap remove under SpinMutex
@@ -184,10 +196,7 @@ pub fn step_epoll_wait(
     // Phase B.2 PoC: count monitored fds with a valid source id.
     // Real EPOLLIN/EPOLLOUT detection requires bus subscription
     // per fd — Phase B.3.
-    let ready: usize = fds
-        .values()
-        .filter(|e| e.source.raw() != 0)
-        .count();
+    let ready: usize = fds.values().filter(|e| e.source.raw() != 0).count();
 
     if ready > 0 {
         StepOutcome::Done(ready)

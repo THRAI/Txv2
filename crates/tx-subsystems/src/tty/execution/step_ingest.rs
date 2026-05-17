@@ -8,7 +8,6 @@ use crate::tty::adapter::wait_routing::Mask;
 use crate::execution::Guard;
 #[cfg(test)]
 use crate::tty::adapter::step_engine::ByteProgress;
-#[cfg(test)]
 use crate::tty::adapter::step_engine::{self as step_engine};
 use crate::tty::adapter::step_engine::{
     InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
@@ -153,14 +152,14 @@ pub fn step_ingest(
 pub struct IngestOp<'a> {
     pub tty: &'a Cap<TtyIdentity>,
     pub bytes: &'a [u8],
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for IngestOp<'a> {
     type Output = IngestOutcome;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_ingest(self.tty, self.bytes, self.guard)
+        let __guard = step_engine::guard();
+        step_ingest(self.tty, self.bytes, &__guard)
     }
 }
 
@@ -222,16 +221,10 @@ mod step_op_wraps {
     fn ingest_op_consumes_bytes() {
         let _setup = setup();
         let tty = alloc_hardware_tty(600, "ttyV3-ingest-op-live");
-        let guard = step_engine::guard();
         let bytes: &[u8] = b"hi";
-        let mut op = IngestOp {
-            tty: &tty,
-            bytes,
-            guard: &guard,
-        };
+        let mut op = IngestOp { tty: &tty, bytes };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Done(o) => assert_eq!(o.consumed, bytes.len()),
             other => panic!("expected Done(_), got {other:?}"),
@@ -243,15 +236,12 @@ mod step_op_wraps {
         let _setup = setup();
         let tty = alloc_hardware_tty(601, "ttyV3-ingest-op-dead");
         let _ = tty.take_payload();
-        let guard = step_engine::guard();
         let mut op = IngestOp {
             tty: &tty,
             bytes: b"x",
-            guard: &guard,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
-        drop(guard);
         match outcome {
             V3::Err(_) => {}
             other => panic!("expected Err(_), got {other:?}"),

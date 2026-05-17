@@ -12,7 +12,9 @@ pub mod tmpfs;
 
 pub mod tx_ext4 {
     pub use crate::tx_ext4_bridge::*;
-    pub use tx_ext4::mount::{mount_ext4_read_only, Ext4MountWire};
+    pub use tx_ext4::mount::{
+        mount_ext4_read_only, mount_ext4_read_write, Ext4MountWire, MountedExt4,
+    };
     pub use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
     pub use tx_ext4_format::{Ext4FormatError, Result as Ext4Result};
 }

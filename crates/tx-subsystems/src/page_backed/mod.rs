@@ -670,11 +670,11 @@ pub fn step_read(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-        // observe
-        // upgrade
-        // reserve
-        // commit
-        // publish
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if len == 0 {
         return StepOutcome::done(0);
     }
@@ -696,11 +696,11 @@ pub fn step_write(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
-        // observe
-        // upgrade
-        // reserve
-        // commit
-        // publish
+    // observe
+    // upgrade
+    // reserve
+    // commit
+    // publish
     if len == 0 {
         return StepOutcome::done(0);
     }
@@ -826,14 +826,14 @@ pub struct ReadOp<'a> {
     pub pc: &'a PageContainer,
     pub of: &'a OpenFile,
     pub len: usize,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ReadOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_read(self.pc, self.of, self.len, self.guard)
+        let __guard = step_engine::guard();
+        step_read(self.pc, self.of, self.len, &__guard)
     }
 }
 
@@ -842,14 +842,14 @@ pub struct WriteOp<'a> {
     pub pc: &'a PageContainer,
     pub of: &'a OpenFile,
     pub len: usize,
-    pub guard: &'a Guard<'a>,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_write(self.pc, self.of, self.len, self.guard)
+        let __guard = step_engine::guard();
+        step_write(self.pc, self.of, self.len, &__guard)
     }
 }
 
