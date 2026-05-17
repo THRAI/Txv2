@@ -652,6 +652,110 @@ fn cred_snapshot_returns_none_for_zombie() {
 }
 
 #[test]
+fn require_path_search_passes_for_dac_override() {
+    use crate::cred::checks::require_path_search;
+    use crate::cred::adapter::step_engine::guard;
+    use crate::vfs::structure::InodeMeta;
+
+    let _g = setup();
+
+    // Caller carries CAP_DAC_OVERRIDE → the directory's X bits don't
+    // matter; require_path_search returns SearchAuthorized.
+    let mut effective_caps = CapabilitySet::EMPTY;
+    effective_caps.add(Capability::DAC_OVERRIDE);
+    let snap = CredSnapshot::from_cred(Cred {
+        uid: Uid(1000),
+        euid: Uid(1000),
+        suid: Uid(1000),
+        gid: Gid(1000),
+        egid: Gid(1000),
+        sgid: Gid(1000),
+        effective_caps,
+        permitted_caps: CapabilitySet::EMPTY,
+    });
+
+    // Directory with mode 0o600 (no traversal for anyone) — still passes.
+    let mut meta = InodeMeta::new(crate::vfs::structure::InodeKind::Directory, 0o600);
+    meta.uid = 0;
+    meta.gid = 0;
+
+    let g = guard();
+    let _w = require_path_search(&snap, &meta, &g).expect("CAP_DAC_OVERRIDE bypass");
+}
+
+#[test]
+fn require_path_search_denies_without_x_bit() {
+    use crate::cred::checks::require_path_search;
+    use crate::cred::adapter::step_engine::guard;
+    use crate::execution::Errno;
+    use crate::vfs::structure::InodeMeta;
+
+    let _g = setup();
+
+    // Caller without CAP_DAC_OVERRIDE; directory has no X bit for "other".
+    let snap = CredSnapshot::from_cred(Cred {
+        uid: Uid(1000),
+        euid: Uid(1000),
+        suid: Uid(1000),
+        gid: Gid(1000),
+        egid: Gid(1000),
+        sgid: Gid(1000),
+        effective_caps: CapabilitySet::EMPTY,
+        permitted_caps: CapabilitySet::EMPTY,
+    });
+    let mut meta = InodeMeta::new(crate::vfs::structure::InodeKind::Directory, 0o644);
+    meta.uid = 2000;
+    meta.gid = 2000;
+
+    let g = guard();
+    let err = require_path_search(&snap, &meta, &g).err().expect("denied");
+    assert_eq!(err, Errno::EACCES);
+}
+
+#[test]
+fn require_open_honors_read_and_write_bits() {
+    use crate::cred::checks::require_open;
+    use crate::cred::adapter::step_engine::guard;
+    use crate::execution::Errno;
+    use crate::vfs::structure::{InodeMeta, OpenFileFlags};
+
+    let _g = setup();
+
+    let snap = CredSnapshot::from_cred(Cred {
+        uid: Uid(1000),
+        euid: Uid(1000),
+        suid: Uid(1000),
+        gid: Gid(1000),
+        egid: Gid(1000),
+        sgid: Gid(1000),
+        effective_caps: CapabilitySet::EMPTY,
+        permitted_caps: CapabilitySet::EMPTY,
+    });
+
+    // Owner-only readable file (0o400), caller is owner.
+    let mut meta = InodeMeta::new(crate::vfs::structure::InodeKind::Regular, 0o400);
+    meta.uid = 1000;
+    meta.gid = 1000;
+    let flags_r = OpenFileFlags {
+        read: true,
+        write: false,
+        ..Default::default()
+    };
+    let flags_rw = OpenFileFlags {
+        read: true,
+        write: true,
+        ..Default::default()
+    };
+
+    let g = guard();
+    let _w = require_open(&snap, &meta, flags_r, &g).expect("read-only owner open");
+    let err = require_open(&snap, &meta, flags_rw, &g)
+        .err()
+        .expect("rw on read-only mode");
+    assert_eq!(err, Errno::EACCES);
+}
+
+#[test]
 fn step_apply_suid_for_exec_at_secure_false_when_no_change() {
     let _g = setup();
     let proc_cap = bootstrap();
