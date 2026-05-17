@@ -28,6 +28,8 @@ Start with:
 - `tx-hal-axhal` when editing HAL, boot, page substrate, traps, pmap, or platform docs.
 - `tx-subsystem-manifest` when editing subsystem specs.
 - `tx-implementation-readiness` when deciding if docs are ready to code from.
+- `tx-xtask` when running, building, imaging, decoding traps, linting, or any
+  other `cargo xtask` invocation — full reference for every subcommand.
 
 ## Rules
 
