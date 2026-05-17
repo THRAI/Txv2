@@ -387,8 +387,16 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             si_pid: ctx.process.pid.0,
             si_uid: 0,
         });
-        tx_subsystems::thread_runtime::execution::post_signal(&thread, signum, siginfo);
-        return SyscallResult::Return(0);
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = ThreadKillOp {
+            thread,
+            sig: signum,
+            info: siginfo,
+        };
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(()) => return SyscallResult::Return(0),
+            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+        }
     }
     SyscallResult::Error(ESRCH_VALUE)
 }
