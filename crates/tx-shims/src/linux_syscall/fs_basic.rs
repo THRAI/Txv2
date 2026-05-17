@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOp, StepOutcome};
+use tx_subsystems::vfs::InlineName;
 
 /// `fcntl(fd, cmd, arg)` per the Wave 2 ELF-loader plan §"Part 2 —
 /// Per-fd CLOEXEC bitmap + fcntl(F_SETFD) + O_CLOEXEC" plus Slice 7 of
@@ -159,14 +160,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     mode: u32,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
-    // Wave 2 slice: AT_FDCWD only. Real dirfd-relative resolution
-    // requires directory file descriptors — the slice's fd table
-    // doesn't carry them yet. (TODO(phase-dirfd): mirror Wave 4
-    // Part 4's `resolve_path_at` once dirfds land.)
-    if dirfd != AT_FDCWD {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
-
     // Bounded inline copy of the user path. Same `EXECVE_PATH_MAX = 4096`
     // budget as the existing `execve` / `fchmodat` arms (and matches
     // Linux's `PATH_MAX`). Empty paths surface as `-ENOENT` from the
@@ -195,14 +188,47 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         nonblocking: flags & O_NONBLOCK != 0,
     };
 
-    // Resolve the cwd anchor. Zombies + uninitialised init pre-rootfs
-    // both surface `cwd() == None`; the alive caller of `openat` always
-    // has a cwd installed by `step_chdir` / bootstrap. No-cwd is a
-    // defensive `-ENOENT` (matches Linux's "no such directory" shape
-    // for an unreachable cwd).
-    let cwd: Cap<DEntry> = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
+    // Resolve the base-directory anchor.
+    //
+    // AT_FDCWD (-100): use the process cwd. Zombies + uninitialised init
+    // pre-rootfs both surface `cwd() == None`; the alive caller of `openat`
+    // always has a cwd installed by `step_chdir` / bootstrap. No-cwd is a
+    // defensive `-ENOENT`.
+    //
+    // Real dirfd (>= 0): look up the fd, verify it is a directory, and
+    // build a synthetic `Cap<DEntry>` wrapping its rnode. The rnode carries
+    // `containing_mount_weak()` (set by `materialise_child_rnode_v3` via
+    // `RNode::new_cap_in_mount` during the original directory open), so the
+    // walker's `fs_ops_for` finds the in-scope `FsOps` immediately.
+    //
+    // Any negative value other than AT_FDCWD: -EBADF (matches Linux).
+    let cwd: Cap<DEntry> = if dirfd == AT_FDCWD {
+        match ctx.process.cwd() {
+            Some(d) => d,
+            None => return SyscallResult::Error(ENOENT_VALUE),
+        }
+    } else if dirfd >= 0 {
+        let file = match ctx.process.fd(dirfd as u32) {
+            Some(f) => f,
+            None => return SyscallResult::Error(EBADF_VALUE),
+        };
+        // Only directory fds are valid as a base for openat. Non-directory
+        // fds (regular files, pipes, TTYs) return -ENOTDIR per Linux.
+        match file.rnode().backing() {
+            RNodeBacking::Directory => {}
+            _ => return SyscallResult::Error(ENOTDIR_VALUE),
+        }
+        let rnode = file.rnode().clone();
+        // Mint a synthetic dentry anchored at the directory rnode. No
+        // parent-hint chain is set (the rnode's containing_mount_weak
+        // provides the FsOps link the walker needs). ROOT name so the
+        // dentry is treated as a resolution anchor (not a named child).
+        match DEntry::new_cap(InlineName::ROOT, rnode) {
+            Ok(d) => d,
+            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+        }
+    } else {
+        return SyscallResult::Error(EBADF_VALUE);
     };
 
     let walker_cred = ctx.walker_cred();
