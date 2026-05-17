@@ -46,7 +46,7 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     } else {
         match bootstrap_read_user::<u64>(&ctx.aspace, set_ptr as u64) {
             Ok(bits) => SignalMask::new(bits),
-            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            Err(errno) => return SyscallResult::error_from(errno),
         }
     };
 
@@ -72,7 +72,7 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                     return SyscallResult::Error(ESRCH_VALUE);
                 }
                 Err(v3errno) => {
-                    return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                    return SyscallResult::error_from(Errno::from(v3errno));
                 }
             }
         }
@@ -89,7 +89,7 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                     return SyscallResult::Error(ESRCH_VALUE);
                 }
                 Err(v3errno) => {
-                    return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                    return SyscallResult::error_from(Errno::from(v3errno));
                 }
             }
         }
@@ -99,7 +99,7 @@ pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         if let Err(errno) =
             bootstrap_write_user::<u64>(&ctx.aspace, oldset_ptr as u64, prev_mask.raw_bits())
         {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
 
@@ -165,7 +165,7 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     } else {
         let mut bytes = [0u8; SIGACTION_BYTES];
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, act_ptr as u64) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
         let handler = read_u64_le(&bytes[0..8]);
         // sa_flags / sa_restorer / sa_mask are decoded but unused at
@@ -207,7 +207,7 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
                     return SyscallResult::Error(ESRCH_VALUE);
                 }
                 Err(v3errno) => {
-                    return SyscallResult::Error(errno_to_i32(Errno::from(v3errno)));
+                    return SyscallResult::error_from(Errno::from(v3errno));
                 }
             }
         }
@@ -239,7 +239,7 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         image[0..8].copy_from_slice(&handler_value.to_le_bytes());
         // image[8..32] already zero.
         if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, oldact_ptr as u64, &image) {
-            return SyscallResult::Error(errno_to_i32(errno));
+            return SyscallResult::error_from(errno);
         }
     }
 
@@ -277,22 +277,19 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
         // Route through script_kill_pgrp (cred-checked per-member fanout)
         // rather than the primitive step_kill_pgrp, which would deliver
         // without consulting cred::require_signal_send.
-        // script_kill_pgrp returns Err(ESRCH) only if the caller itself
-        // is a zombie — impossible inside a live syscall arm, but
-        // bubbled up via errno_to_i32 for parity.
-        let delivered =
-            match tx_subsystems::signal::script_kill_pgrp(&ctx.process, &pgrp, signum) {
-                Ok(n) => n,
-                Err(e) => return SyscallResult::Error(errno_to_i32(e)),
-            };
-        return if delivered > 0 {
-            SyscallResult::Return(0)
-        } else {
-            // POSIX: kill(0, sig) returns -EPERM when no member was
-            // both live AND permitted. script_kill_pgrp folds zombies
-            // and permission denials into the same 0-count return.
-            SyscallResult::Error(EPERM_VALUE)
-        };
+        // POSIX: kill(0, sig) returns -EPERM when no member was both
+        // live AND permitted; script_kill_pgrp folds zombies and
+        // permission denials into the same 0-count return.
+        return dispatch_errno(
+            tx_subsystems::signal::script_kill_pgrp(&ctx.process, &pgrp, signum),
+            |n| {
+                if n > 0 {
+                    SyscallResult::Return(0)
+                } else {
+                    SyscallResult::Error(EPERM_VALUE)
+                }
+            },
+        );
     }
     if pid <= 0 {
         // TODO(phase-pgrp-kill): pgrp-targeted (`pid < 0` /
@@ -334,17 +331,14 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     // Going through `KillProcessOp::drive_oneshot` directly would
     // bypass the cred check, since `KillProcessOp::step` calls the
     // primitive `step_kill_process` without authorization.
-    match tx_subsystems::signal::script_kill_process(&ctx.process, &target, signum, siginfo) {
-        Ok(tx_subsystems::signal::KillScriptOutcome::Delivered) => SyscallResult::Return(0),
-        Ok(tx_subsystems::signal::KillScriptOutcome::NoLiveThread) => {
-            SyscallResult::Error(ESRCH_VALUE)
-        }
-        // `Probed` is the signal-0 outcome of `script_kill_probe`;
-        // `script_kill_process` never produces it. Map to 0
-        // defensively in case the variant becomes reachable.
-        Ok(tx_subsystems::signal::KillScriptOutcome::Probed) => SyscallResult::Return(0),
-        Err(e) => SyscallResult::Error(errno_to_i32(e)),
-    }
+    use tx_subsystems::signal::KillScriptOutcome;
+    dispatch_errno(
+        tx_subsystems::signal::script_kill_process(&ctx.process, &target, signum, siginfo),
+        |outcome| match outcome {
+            KillScriptOutcome::Delivered | KillScriptOutcome::Probed => SyscallResult::Return(0),
+            KillScriptOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+        },
+    )
 }
 
 /// `tkill(tid, sig)` — Linux RV64 generic ABI `__NR_tkill = 130`.
@@ -371,15 +365,17 @@ pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
         // rule as kill(pid, sig) (txKernel has no per-thread cred;
         // require_signal_send resolves against the owning process's
         // cred). The previous DeliverSignalOp drive bypassed this.
-        return match tx_subsystems::signal::script_deliver_signal(
-            &ctx.process,
-            SignalTarget::Thread(thread_cap),
-            signum,
-        ) {
-            Ok(KillOutcome::Delivered) => SyscallResult::Return(0),
-            Ok(KillOutcome::NoLiveThread) => SyscallResult::Error(ESRCH_VALUE),
-            Err(e) => SyscallResult::Error(errno_to_i32(e)),
-        };
+        return dispatch_errno(
+            tx_subsystems::signal::script_deliver_signal(
+                &ctx.process,
+                SignalTarget::Thread(thread_cap),
+                signum,
+            ),
+            |outcome| match outcome {
+                KillOutcome::Delivered => SyscallResult::Return(0),
+                KillOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+            },
+        );
     }
 
     // Fall back to process-level kill
@@ -426,7 +422,7 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(()) => return SyscallResult::Return(0),
-            Err(v3errno) => return SyscallResult::Error(errno_to_i32(Errno::from(v3errno))),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     }
     SyscallResult::Error(ESRCH_VALUE)
@@ -472,7 +468,7 @@ pub(super) fn sys_rt_sigpending(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResu
     // stub with empty pending set until thread payload accessor lands.
     let pending: u64 = 0;
     if let Err(errno) = bootstrap_write_user::<u64>(&ctx.aspace, set_ptr as u64, pending) {
-        return SyscallResult::Error(errno_to_i32(errno));
+        return SyscallResult::error_from(errno);
     }
 
     SyscallResult::Return(0)
