@@ -693,7 +693,7 @@ impl FsPageBacking for BdevFsMountPayload {
         StepOutcome::err(Errno::EINVAL.into())
     }
 
-    fn fsync(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    fn fsync_file(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         let Some(idx) = entry_index(fs_object_id) else {
             return StepOutcome::err(Errno::ENOENT.into());
         };
@@ -1150,7 +1150,7 @@ impl FsPageBacking for BdevFs {
         StepOutcome::err(Errno::EINVAL.into())
     }
 
-    fn fsync(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    fn fsync_file(&self, fs_object_id: FsObjectId, guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         let Some(idx) = entry_index(fs_object_id) else {
             return StepOutcome::err(Errno::ENOENT.into());
         };

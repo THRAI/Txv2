@@ -539,7 +539,7 @@ impl FsPageBacking for DevptsInstance {
         StepOutcome::err(step_engine::Errno::ENOSYS)
     }
 
-    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
         StepOutcome::err(step_engine::Errno::ENOSYS)
     }
 

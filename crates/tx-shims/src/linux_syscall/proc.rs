@@ -452,12 +452,9 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 
     let wnohang = (options & WNOHANG) != 0;
 
-    // Polling loop with the canonical async-wait double-check shape.
-    // Each iteration: poll → if Done(zombie) reap+return; if NoneReady
-    // and WNOHANG return 0; else build a WaitToken and await.
-    loop {
-        let outcome = step_waitpid_nohang(&ctx.process, target);
-        match outcome {
+    if wnohang {
+        // WNOHANG: one-shot poll, no waiting.
+        match step_waitpid_nohang(&ctx.process, target) {
             Ok((child_pid, status)) => {
                 if wstatus_uaddr != 0 {
                     let word = status.wait_status_word();
@@ -469,30 +466,50 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 }
                 return SyscallResult::Return(child_pid.0 as i64);
             }
-            Err(WaitError::NoChildren) => {
+            Err(WaitError::NoChildren) => return SyscallResult::Error(ECHILD_VALUE),
+            Err(WaitError::NoneReady) => return SyscallResult::Return(0),
+        }
+    }
+
+    // Blocking wait: drive WaitpidNohangOp through the v3 StepOp loop.
+    // The op yields on NoneReady via YieldShape::OnWaitSource;
+    // the drive loop parks the parent task, child exit fires the
+    // source, and step() is re-called on wake.
+    use step_engine::{StepOp, StepOutcome as V3Out, YieldShape};
+    use tx_subsystems::process::execution::WaitpidNohangOp;
+    let mut op = WaitpidNohangOp {
+        parent: &ctx.process,
+        target,
+    };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    loop {
+        match op.step(&mut script_ctx) {
+            V3Out::Done(Ok((child_pid, status))) => {
+                if wstatus_uaddr != 0 {
+                    let word = status.wait_status_word();
+                    if let Err(errno) =
+                        bootstrap_write_user::<i32>(&ctx.aspace, wstatus_uaddr, word)
+                    {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
+                return SyscallResult::Return(child_pid.0 as i64);
+            }
+            V3Out::Done(Err(WaitError::NoChildren)) => {
                 return SyscallResult::Error(ECHILD_VALUE);
             }
-            Err(WaitError::NoneReady) => {
-                if wnohang {
-                    return SyscallResult::Return(0);
-                }
-                // Build the WaitToken from the parent's exit_source
-                // carrier id (registered at payload-sign time, Wave 1).
-                // `None` means the calling process is itself a zombie
-                // — race against our own exit; surface as -ECHILD per
-                // POSIX (no children to wait for from a dead process).
-                let Some(token) = ctx.process.exit_source_wait_token() else {
-                    return SyscallResult::Error(ECHILD_VALUE);
-                };
-                if let Some(future) = wait_source::wait_on_token(token) {
-                    let _ = future.await;
-                }
-                // Either `wait_on_token` returned None (test placeholder
-                // carrier; should be `Some` for the live process payload)
-                // or the future resolved. Loop and re-poll. The wake
-                // races a third party reaping the same zombie, so the
-                // re-poll may still observe NoneReady — fine, we re-park.
+            V3Out::Done(Err(WaitError::NoneReady)) => {
+                // Should not reach here — op yields on NoneReady.
+                // Fall through to the exit_source wait.
             }
+            V3Out::Yield(YieldShape::OnWaitSource { source, .. }) => {
+                let token = tx_subsystems::execution::WaitToken::new(source.raw(), 1);
+                if let Some(future) = wait_source::wait_on_token(token) {
+                    future.await;
+                }
+            }
+            V3Out::Err(e) => return SyscallResult::Error(errno_to_i32(e.into())),
+            _ => {}
         }
     }
 }

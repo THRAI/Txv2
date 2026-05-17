@@ -203,7 +203,7 @@ impl FsPageBacking for RecordingFs {
         V3Out::done(())
     }
 
-    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
+    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
         V3Out::done(())
     }
 }
@@ -370,7 +370,7 @@ impl FsPageBacking for BlockingFs {
         V3Out::done(())
     }
 
-    fn fsync(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
+    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
         V3Out::done(())
     }
 }
