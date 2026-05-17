@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 
 use crate::adapter::step_engine;
 use crate::adapter::step_engine::Cap;
-use tx_subsystems::cred::Cred;
+use tx_subsystems::cred::{Cred, CredSnapshot};
 use tx_subsystems::process::ProcessIdentity;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vfs::structure::Credential;
@@ -28,8 +28,22 @@ pub struct SyscallCtx<'a> {
     /// Reactor delegate registry for OnAgent yield resolution
     /// (drive-taskmb).
     pub delegate_registry: Option<Arc<DelegateRegistry>>,
-    /// Sliced lifetime so future fields (signal-mask snapshot, cred
-    /// snapshot) can be added without ripping every call site.
+    /// Syscall-entry credential snapshot.
+    ///
+    /// Per `cred_service_v_1` §"In flight": canonical credential state
+    /// lives in `ProcessPayload.cred` (`AtomicSlot<Cap<Cred>>`); the
+    /// script holds a by-value metadata copy captured **once** at
+    /// syscall entry. `SyscallCtx::new` populates this from
+    /// `process.cred_snapshot()` (or falls back to
+    /// `CredSnapshot::root()` for zombies — impossible in practice
+    /// from inside a live syscall arm). Subsequent calls to
+    /// [`Self::cred`] read from this snapshot without re-loading the
+    /// atomic slot, so a mid-syscall `setuid` on the same process does
+    /// not perturb authorization decisions taken later in the same
+    /// script frame.
+    cred_snapshot: CredSnapshot,
+    /// Sliced lifetime so future fields (signal-mask snapshot, NOSUID
+    /// mount hint) can be added without ripping every call site.
     pub _lifetime: core::marker::PhantomData<&'a ()>,
 }
 
@@ -43,6 +57,18 @@ impl<'a> SyscallCtx<'a> {
         thread: Cap<ThreadIdentity>,
         aspace: Cap<AddressSpace>,
     ) -> Self {
+        // Capture the syscall-entry credential snapshot exactly once.
+        // Per `cred_service_v_1` §"In flight" the script holds a
+        // by-value metadata copy, not a live re-reader; subsequent
+        // mid-syscall `setuid` on the same process must not perturb
+        // checks already taken under this snapshot.
+        //
+        // `cred_snapshot()` returns `None` only for zombies (payload
+        // dropped — cred unobservable). A live syscall arm reaches
+        // this code path with `self.process` alive by definition; the
+        // `CredSnapshot::root()` fallback is purely defensive and
+        // mirrors today's `Cred::root()` fallback in `Self::cred`.
+        let cred_snapshot = process.cred_snapshot().unwrap_or_else(CredSnapshot::root);
         Self {
             process,
             thread,
@@ -50,6 +76,7 @@ impl<'a> SyscallCtx<'a> {
             mailbox: None,
             timer_wheel: None,
             delegate_registry: None,
+            cred_snapshot,
             _lifetime: core::marker::PhantomData,
         }
     }
@@ -74,29 +101,35 @@ impl<'a> SyscallCtx<'a> {
         self
     }
 
-    /// Snapshot the current process's full credential.
+    /// Syscall-entry credential value.
     ///
-    /// Returns a fresh [`Cred`] value (`Copy`); the payload's
-    /// `AtomicSlot<Cap<Cred>>` is loaded once (PR-9 phase 5 / D5 Path
-    /// A — was `SpinMutex<Cred>`), the resulting cap is derefed to
-    /// `&Cred`, and the value is copied out; the cap clone drops
-    /// before return, so the snapshot is independent of the slot and
-    /// safe to hold across `.await` points. Holding a reference
-    /// through the cap would still be sound (the cap retain-count
-    /// keeps the slab entry live), but callers that need the
-    /// long-lived cap shape should use [`Self::cred_cap`] instead.
+    /// Returns the `Cred` captured into [`Self::cred_snapshot`] at
+    /// `SyscallCtx::new`. Per `cred_service_v_1` §"In flight" this is
+    /// **not** a fresh load of `ProcessPayload.cred` — once the
+    /// snapshot is taken, every check, projection, and read inside
+    /// the same syscall frame sees the same value, so a concurrent
+    /// `setuid` on the same process (impossible in v1's single-thread-
+    /// per-syscall model but architecturally permitted in phase 2)
+    /// cannot perturb authorization decisions mid-script.
     ///
-    /// Falls back to [`Cred::root`] for zombies (impossible in
-    /// practice from inside a live syscall arm — the caller is by
-    /// definition alive). The defensive default keeps every
-    /// downstream arm's signature noise-free; callers that need to
-    /// distinguish zombie vs. alive use `ctx.process.is_zombie()`
-    /// directly.
+    /// Callers that genuinely need the live value (procfs adapters
+    /// rendering the *current* status of an arbitrary process) should
+    /// call `Cap<ProcessIdentity>::cred()` on the target directly.
     ///
     /// Companion to [`Self::walker_cred`] (the walker-side
     /// projection consumed by VFS path resolution).
     pub fn cred(&self) -> Cred {
-        self.process.cred().unwrap_or_else(Cred::root)
+        self.cred_snapshot.cred()
+    }
+
+    /// Borrow the syscall-entry [`CredSnapshot`] directly.
+    ///
+    /// Used by check sites that want to thread the snapshot through
+    /// authorization predicates by reference, matching the
+    /// `cred::checks::require_*(snapshot, foreign_input, &guard)`
+    /// shape described in `cred_service_v_1` §"Checks surface".
+    pub fn cred_snapshot(&self) -> &CredSnapshot {
+        &self.cred_snapshot
     }
 
     /// Walker-side projection of the current cred. Builds a fresh

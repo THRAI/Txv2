@@ -36,7 +36,7 @@ use crate::process::adapter::step_engine::{
 };
 use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
 
-use crate::cred::{Cred, Gid, Uid};
+use crate::cred::{Cred, CredSnapshot, Gid, Uid};
 use crate::execution::WaitToken;
 use crate::signal::{PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::ThreadIdentity;
@@ -354,6 +354,24 @@ impl ProcessIdentity {
     /// the v3 subject-population helpers.
     pub fn cred_cap(&self) -> Option<Cap<Cred>> {
         self.payload.lock().as_ref().map(|p| p.cred_cap())
+    }
+
+    /// Capture a syscall-entry credential snapshot for this process.
+    ///
+    /// Per `cred_service_v_1` §"In flight": the script holds a by-value
+    /// metadata copy of the credential, taken once at syscall entry and
+    /// threaded through prelude → checks → commit. This is the
+    /// `Cap<ProcessIdentity>`-side entry point producing that snapshot.
+    ///
+    /// Returns `None` for zombies (payload dropped — credential
+    /// unobservable). Live syscall arms never reach `None` by
+    /// construction; `SyscallCtx` falls back to `CredSnapshot::root()`
+    /// defensively at construction time.
+    pub fn cred_snapshot(&self) -> Option<CredSnapshot> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.cred_snapshot())
     }
 
     /// Process short name (for `/proc/<pid>/stat`). Returns `"?"` for
@@ -1108,6 +1126,18 @@ impl ProcessPayload {
     /// `SpinMutex<Cred>` snapshot.
     pub fn cred(&self) -> Cred {
         *self.cred_cap()
+    }
+
+    /// Capture a syscall-entry [`CredSnapshot`].
+    ///
+    /// Per `cred_service_v_1` §"In flight": scripts hold a by-value
+    /// metadata copy of the credential, captured once at syscall entry.
+    /// This is the `ProcessPayload`-side entry point producing that
+    /// snapshot — one `AtomicSlot` load + cap deref + value-copy +
+    /// drop, identical cost to [`Self::cred`] but typed as the
+    /// architectural snapshot rather than a raw `Cred`.
+    pub fn cred_snapshot(&self) -> CredSnapshot {
+        CredSnapshot::from_cred(self.cred())
     }
 
     /// Snapshot the current `Cap<Cred>` out of the

@@ -7,7 +7,8 @@
 use crate::cred::adapter::step_engine::Cap;
 use crate::cred::{
     step_apply_suid_for_exec, step_setgid, step_setregid, step_setresgid, step_setresuid,
-    step_setreuid, step_setuid, Capability, CapabilitySet, Cred, CredChange, Gid, Uid,
+    step_setreuid, step_setuid, Capability, CapabilitySet, Cred, CredChange, CredSnapshot, Gid,
+    Uid,
 };
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
@@ -591,6 +592,63 @@ fn step_apply_suid_for_exec_at_secure_true_when_euid_changes() {
     let outcome = step_apply_suid_for_exec(&proc_cap, Uid(1000), Gid(0), S_ISUID | 0o755)
         .expect("alive process");
     assert!(outcome.at_secure);
+}
+
+#[test]
+fn cred_snapshot_freezes_value_against_later_mutation() {
+    // cred_service_v_1 §"In flight": the snapshot is a by-value copy
+    // captured once at syscall entry. A subsequent setuid on the same
+    // process must publish a new cap into the AtomicSlot without
+    // mutating the snapshot a prior caller already holds.
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    let payload_guard = proc_cap.payload.lock();
+    let payload = payload_guard.as_ref().expect("alive");
+    let snap = payload.cred_snapshot();
+    drop(payload_guard);
+
+    assert!(snap.cred().euid.is_root());
+    assert!(snap.is_privileged_for(Capability::SETUID));
+
+    // Mutate the canonical cred underneath the snapshot.
+    let change = step_setuid(&proc_cap, Uid(1000));
+    assert!(matches!(change, CredChange::Replaced { .. }));
+
+    // The snapshot still reflects the pre-mutation value; the live
+    // cred has moved on.
+    assert!(snap.cred().euid.is_root());
+    assert_eq!(cred_of(&proc_cap).euid, Uid(1000));
+
+    // A fresh snapshot taken now sees the new value.
+    let fresh = proc_cap
+        .cred_snapshot()
+        .expect("alive process produces a snapshot");
+    assert_eq!(fresh.cred().euid, Uid(1000));
+}
+
+#[test]
+fn cred_snapshot_root_constructor_matches_root_cred() {
+    // CredSnapshot::root() is the defensive fallback used by SyscallCtx
+    // when the target process is a zombie at construction time.
+    let snap = CredSnapshot::root();
+    let cred = Cred::root();
+    assert_eq!(snap.cred(), cred);
+    assert_eq!(snap.as_cred(), &cred);
+    assert!(snap.is_privileged_for(Capability::KILL));
+}
+
+#[test]
+fn cred_snapshot_returns_none_for_zombie() {
+    // After step_exit_group reaps the payload, cred_snapshot() must
+    // surface `None` so callers can fall back to CredSnapshot::root()
+    // (mirroring the cred()/cred_cap() pair already established by
+    // PR-9 phase 5 for the AtomicSlot<Cap<Cred>> shape).
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let _ = step_exit_group(&proc_cap, ExitStatus(0));
+
+    assert!(proc_cap.cred_snapshot().is_none());
 }
 
 #[test]

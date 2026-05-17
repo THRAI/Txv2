@@ -261,6 +261,79 @@ impl Cred {
     }
 }
 
+/// Syscall-entry credential snapshot — the by-value metadata copy a
+/// script carries from prelude through commit.
+///
+/// Per `cred_service_v_1` §"In flight": the canonical credential lives
+/// in `ProcessPayload.cred` as `AtomicSlot<Cap<Cred>>`, and the script
+/// holds only a by-value copy captured once at syscall entry. Authoring
+/// the snapshot as its own type (rather than a bare `Cred`) gives the
+/// architectural distinction a name and lets future fields (a
+/// generation tag for racing-setuid detection, a NOSUID mount hint, a
+/// `Cap<Cred>` retention handle if PR-K wants one) land without
+/// touching every check signature.
+///
+/// `Copy` so it can sit in `SyscallCtx` and be passed by value to
+/// authorization predicates. Construction goes through
+/// [`CredSnapshot::from_cred`] (or [`CredSnapshot::root`]); the inner
+/// `Cred` is read via [`CredSnapshot::cred`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[must_use = "the snapshot is the syscall-entry credential — discarding it forces a live re-read elsewhere"]
+pub struct CredSnapshot {
+    cred: Cred,
+}
+
+impl CredSnapshot {
+    /// Wrap a `Cred` value as a snapshot. Captured once at syscall
+    /// entry (`ProcessPayload::cred_snapshot`) or in test setup.
+    pub const fn from_cred(cred: Cred) -> Self {
+        Self { cred }
+    }
+
+    /// Root-credential snapshot. Used as the defensive fallback when a
+    /// `SyscallCtx` is constructed against a zombie (impossible in
+    /// practice from inside a live syscall arm) and by tests that need
+    /// a known-root subject without touching a `ProcessPayload`.
+    pub const fn root() -> Self {
+        Self {
+            cred: Cred::root(),
+        }
+    }
+
+    /// The captured `Cred` value. `Copy`; safe to hold across `.await`.
+    pub const fn cred(self) -> Cred {
+        self.cred
+    }
+
+    /// Borrowed view into the captured `Cred`. Useful when the caller
+    /// already owns a `&CredSnapshot` and wants to feed a `&Cred`
+    /// directly into a `cred::checks::require_*` signature.
+    pub const fn as_cred(&self) -> &Cred {
+        &self.cred
+    }
+
+    /// `true` if the snapshot's effective uid is 0 *or* the requested
+    /// capability is in the effective set. Mirrors
+    /// [`Cred::is_privileged_for`] so call sites that already hold a
+    /// `CredSnapshot` don't have to unwrap to `Cred` for the common
+    /// privilege test.
+    pub fn is_privileged_for(self, cap: Capability) -> bool {
+        self.cred.is_privileged_for(cap)
+    }
+}
+
+impl From<Cred> for CredSnapshot {
+    fn from(cred: Cred) -> Self {
+        Self::from_cred(cred)
+    }
+}
+
+impl AsRef<Cred> for CredSnapshot {
+    fn as_ref(&self) -> &Cred {
+        &self.cred
+    }
+}
+
 /// Outcome of a credential mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CredChange {
