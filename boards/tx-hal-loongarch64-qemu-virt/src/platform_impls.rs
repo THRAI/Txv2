@@ -1,46 +1,13 @@
+use super::boot_smp;
 use super::la64_irq_trap::*;
 use super::la64_pmap::*;
 use super::*;
 
-#[cfg(target_arch = "loongarch64")]
-const LA64_BOOT_STACK_STRIDE: usize = 128 * 1024;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_STATUS: usize = 0x1000;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_ENABLE: usize = 0x1004;
-const LA64_IOCSR_IPI_CLEAR: usize = 0x100c;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_SEND: usize = 0x1040;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_MBUF_SEND: usize = 0x1048;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_SEND_CPU_SHIFT: usize = 16;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_SEND_BLOCKING: u32 = 1 << 31;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_VEC_SCHED: u32 = 0;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_MBUF_SEND_CPU_SHIFT: usize = 16;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_MBUF_SEND_BOX_SHIFT: usize = 2;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_MBUF_SEND_BUF_SHIFT: usize = 32;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_MBUF_SEND_BLOCKING: u64 = 1 << 31;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_MBUF_SEND_H32_MASK: u64 = 0xffff_ffff_0000_0000;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_AP_ENTRY_MAILBOX: usize = 0;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_AP_STACK_MAILBOX: usize = 1;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_AP_LOGICAL_ID_MAILBOX: usize = 2;
-#[cfg(target_arch = "loongarch64")]
-const LA64_IOCSR_IPI_ACTION_SCHED: u32 = 1;
+#[cfg(not(target_arch = "loongarch64"))]
+use core::sync::atomic::AtomicU8;
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
-    static __tx_boot_stack_top: u8;
     fn tx_la64_qemu_activate_enter_userspace(
         resume_ctx: *mut KernelResumeCtx,
         frame: *const La64TrapFrame,
@@ -48,95 +15,8 @@ unsafe extern "C" {
         asid: usize,
         pgdl: usize,
         pgdh: usize,
+        switch_required: usize,
     );
-}
-
-#[cfg(target_arch = "loongarch64")]
-#[inline]
-fn la64_iocsr_write_u32(addr: usize, value: u32) {
-    unsafe {
-        core::arch::asm!("iocsrwr.w {value}, {addr}", value = in(reg) value, addr = in(reg) addr);
-    }
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
-#[inline]
-fn la64_iocsr_write_u32(_addr: usize, _value: u32) {}
-
-#[cfg(target_arch = "loongarch64")]
-#[inline]
-fn la64_iocsr_write_u64(addr: usize, value: u64) {
-    unsafe {
-        core::arch::asm!("iocsrwr.d {value}, {addr}", value = in(reg) value, addr = in(reg) addr);
-    }
-}
-
-#[cfg(target_arch = "loongarch64")]
-#[inline]
-fn la64_iocsr_read_u32(addr: usize) -> u32 {
-    let value: u32;
-    unsafe {
-        core::arch::asm!("iocsrrd.w {value}, {addr}", value = out(reg) value, addr = in(reg) addr);
-    }
-    value
-}
-
-#[cfg(target_arch = "loongarch64")]
-#[inline]
-fn la64_send_mail_u64(target_cpu: CpuId, mailbox: usize, value: u64) {
-    let hi_box = mailbox * 2 + 1;
-    let lo_box = mailbox * 2;
-    let target = target_cpu.0 as u64;
-
-    let hi = LA64_IOCSR_MBUF_SEND_BLOCKING
-        | ((hi_box as u64) << LA64_IOCSR_MBUF_SEND_BOX_SHIFT)
-        | (target << LA64_IOCSR_MBUF_SEND_CPU_SHIFT)
-        | (value & LA64_IOCSR_MBUF_SEND_H32_MASK);
-    let lo = LA64_IOCSR_MBUF_SEND_BLOCKING
-        | ((lo_box as u64) << LA64_IOCSR_MBUF_SEND_BOX_SHIFT)
-        | (target << LA64_IOCSR_MBUF_SEND_CPU_SHIFT)
-        | (value << LA64_IOCSR_MBUF_SEND_BUF_SHIFT);
-    la64_iocsr_write_u64(LA64_IOCSR_MBUF_SEND, hi);
-    la64_iocsr_write_u64(LA64_IOCSR_MBUF_SEND, lo);
-}
-
-#[cfg(target_arch = "loongarch64")]
-#[inline]
-fn la64_boot_stack_top_for_cpu(cpu: CpuId) -> usize {
-    let top = core::ptr::addr_of!(__tx_boot_stack_top) as usize;
-    top.saturating_sub(cpu.0.saturating_mul(LA64_BOOT_STACK_STRIDE))
-}
-
-#[cfg(target_arch = "loongarch64")]
-fn la64_start_secondary_cpu(cpu: CpuId, entry: SecondaryEntry) {
-    let entry = entry as *const () as usize as u64;
-    let stack_top = la64_boot_stack_top_for_cpu(cpu) as u64;
-
-    la64_send_mail_u64(cpu, LA64_IOCSR_AP_ENTRY_MAILBOX, entry);
-    la64_send_mail_u64(cpu, LA64_IOCSR_AP_STACK_MAILBOX, stack_top);
-    la64_send_mail_u64(cpu, LA64_IOCSR_AP_LOGICAL_ID_MAILBOX, cpu.0 as u64);
-
-    let value = LA64_IOCSR_IPI_SEND_BLOCKING
-        | ((cpu.0 as u32) << LA64_IOCSR_IPI_SEND_CPU_SHIFT)
-        | LA64_IOCSR_IPI_VEC_SCHED;
-    la64_iocsr_write_u32(LA64_IOCSR_IPI_SEND, value);
-}
-
-#[cfg(target_arch = "loongarch64")]
-fn wait_for_online_secondaries(target: CpuMask) -> usize {
-    let target = target.bits();
-    if target == 0 {
-        return 0;
-    }
-
-    for _ in 0..500_000 {
-        let online = LA64_ONLINE_CPUS.load(Ordering::Acquire) & target;
-        if online == target {
-            return online.count_ones() as usize;
-        }
-        core::hint::spin_loop();
-    }
-    (LA64_ONLINE_CPUS.load(Ordering::Acquire) & target).count_ones() as usize
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -263,9 +143,9 @@ unsafe fn la64_read_user<T: Pod>(src: UserPtr<T>) -> Result<T, FaultInfo> {
 
 impl PmapIf for Platform {
     fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo> {
-        ensure_static_boot_facts();
-
-        unsafe { Some(&*core::ptr::addr_of!(BOOTSTRAP_PMAP_INFO)) }
+        // LA64 reaches generic boot through DMW, so the published bootstrap
+        // facts describe that direct map rather than an early page-table root.
+        boot_facts::bootstrap_pmap_info()
     }
 
     fn alloc_pt_node() -> Result<PtNode, AllocError> {
@@ -430,18 +310,20 @@ impl TrapIf for Platform {
             let cpu = <Platform as SmpIf>::current_cpu_id();
             let frame = la64_entry_trap_frame_ptr_for_cpu(cpu);
             (*frame).restore_user_context(ctx);
-            let pgdh = ensure_la64_kernel_pgdh_root().expect("LA64 kernel PGDH root");
-            ensure_la64_low_kernel_identity_mapped(root).expect("LA64 user root kernel identity");
-            configure_la64_page_walk_csrs();
+            let pmap_switch = prepare_la64_pmap_switch(root).expect("LA64 user pmap switch");
+            if pmap_switch.switch_required {
+                record_la64_pmap_switch(&pmap_switch);
+            }
             let resume_ctx = la64_kernel_resume_ctx_ptr_for_cpu(cpu);
             let stack_top = la64_trap_stack_top_for_cpu(cpu);
             tx_la64_qemu_activate_enter_userspace(
                 resume_ctx,
                 frame,
                 stack_top,
-                root.asid().0 as usize & LA64_ASID_MASK,
-                root.phys().0,
-                pgdh.0,
+                pmap_switch.asid,
+                pmap_switch.pgdl,
+                pmap_switch.pgdh,
+                pmap_switch.switch_required as usize,
             );
         }
 
@@ -687,45 +569,11 @@ impl SmpIf for Platform {
     }
 
     fn boot_secondary_cpus(_entry: SecondaryEntry) -> usize {
-        #[cfg(target_arch = "loongarch64")]
-        {
-            let possible = Self::possible_cpus();
-            let current = la64_current_cpu_id();
-            let target_mask =
-                CpuMask::from_bits(possible.bits() & !CpuMask::single(current).bits());
-            if target_mask.is_empty() {
-                return 0;
-            }
-
-            LA64_IPI_ACKED_CPUS.store(0, Ordering::Release);
-
-            let mut bits = target_mask.bits();
-            while bits != 0 {
-                let cpu = bits.trailing_zeros() as usize;
-                la64_start_secondary_cpu(CpuId(cpu), _entry);
-                bits &= bits - 1;
-            }
-
-            let online = wait_for_online_secondaries(target_mask);
-            online
-        }
-
-        #[cfg(not(target_arch = "loongarch64"))]
-        {
-            let _ = _entry;
-            0
-        }
+        boot_smp::boot_secondary_cpus(_entry)
     }
 
     fn enable_ipi_wakeups() {
-        #[cfg(target_arch = "loongarch64")]
-        la64_iocsr_write_u32(LA64_IOCSR_IPI_ENABLE, u32::MAX);
-
-        let ecfg = read_la64_csr(LA64_CSR_ECFG) | LA64_ESTAT_IS_IPI;
-        write_la64_csr(LA64_CSR_ECFG, ecfg);
-
-        let crmd = read_la64_csr(LA64_CSR_CRMD) | LA64_CRMD_IE;
-        write_la64_csr(LA64_CSR_CRMD, crmd);
+        boot_smp::enable_ipi_wakeups();
     }
 
     fn wait_for_interrupt_once() {
@@ -733,36 +581,13 @@ impl SmpIf for Platform {
     }
 
     fn pending_ipi(_kind: IpiKind) -> bool {
-        #[cfg(target_arch = "loongarch64")]
-        {
-            la64_iocsr_read_u32(LA64_IOCSR_IPI_STATUS) & LA64_IOCSR_IPI_ACTION_SCHED != 0
-        }
-
-        #[cfg(not(target_arch = "loongarch64"))]
-        {
-            let _ = _kind;
-            false
-        }
+        let _ = _kind;
+        boot_smp::pending_ipi()
     }
 
     fn send_ipi(target: CpuId, _kind: IpiKind) {
-        if target == la64_current_cpu_id() {
-            return;
-        }
-
-        #[cfg(target_arch = "loongarch64")]
-        {
-            let value = LA64_IOCSR_IPI_SEND_BLOCKING
-                | ((target.0 as u32) << LA64_IOCSR_IPI_SEND_CPU_SHIFT)
-                | LA64_IOCSR_IPI_VEC_SCHED;
-            la64_iocsr_write_u32(LA64_IOCSR_IPI_SEND, value);
-        }
-
-        #[cfg(not(target_arch = "loongarch64"))]
-        {
-            let _ = _kind;
-            assert_eq!(target, la64_current_cpu_id());
-        }
+        let _ = _kind;
+        boot_smp::send_ipi(target);
     }
 
     fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
@@ -776,19 +601,18 @@ impl SmpIf for Platform {
     }
 
     fn ack_ipi(_kind: IpiKind) {
-        la64_iocsr_write_u32(LA64_IOCSR_IPI_CLEAR, u32::MAX);
-        LA64_IPI_ACKED_CPUS.fetch_or(
-            CpuMask::single(la64_current_cpu_id()).bits(),
-            Ordering::AcqRel,
-        );
+        let _ = _kind;
+        boot_smp::ack_ipi();
     }
 
     fn clear_ipi_ack_cpus(_kind: IpiKind, mask: CpuMask) {
-        LA64_IPI_ACKED_CPUS.fetch_and(!mask.bits(), Ordering::AcqRel);
+        let _ = _kind;
+        boot_smp::clear_ipi_ack_cpus(mask);
     }
 
     fn ipi_ack_cpus(_kind: IpiKind) -> CpuMask {
-        CpuMask::from_bits(LA64_IPI_ACKED_CPUS.load(Ordering::Acquire))
+        let _ = _kind;
+        boot_smp::ipi_ack_cpus()
     }
 }
 
