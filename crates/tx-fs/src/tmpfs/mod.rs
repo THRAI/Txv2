@@ -789,10 +789,18 @@ impl FsOps for Tmpfs {
         }
     }
 
-    /// Update the inode's mode bits. Caller must be the inode owner
-    /// or carry `CAP_FOWNER`. Preserves `S_IFMT` (file kind is set
-    /// at creation and immutable through chmod). Per the DAC +
-    /// setuid plan §"FsOps::step_chmod / step_chown".
+    /// Update the inode's mode bits. Permission delegated to the
+    /// single source of truth in
+    /// [`tx_subsystems::vfs::predicates::check_chmod_perm`] —
+    /// previously the rule was inlined here, duplicating the cred-
+    /// side rule. The syscall arm
+    /// (`tx_shims::linux_syscall::sys_fchmodat`) already runs
+    /// `cred::checks::authorize_chmod` against `ctx.cred_snapshot()`
+    /// before reaching this code path; the check here is defense-
+    /// in-depth for kernel-internal callers (none today) and the
+    /// canonical site if the syscall-arm gate ever changes.
+    /// Preserves `S_IFMT` (file kind is immutable through chmod).
+    /// Per the DAC + setuid plan §"FsOps::step_chmod / step_chown".
     fn step_chmod(
         &self,
         fs_object_id: FsObjectId,
@@ -804,9 +812,8 @@ impl FsOps for Tmpfs {
         let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
-        // Permission: owner or CAP_FOWNER.
-        if !cred.effective_caps.contains(Capability::FOWNER) && cred.uid != inode.meta.uid {
-            return StepOutcome::err(step_engine::Errno::EPERM);
+        if let Err(e) = tx_subsystems::vfs::predicates::check_chmod_perm(&inode.meta, cred) {
+            return StepOutcome::err(e.into());
         }
         // Preserve the IFMT bits from the existing meta — kind is
         // immutable through chmod (matches `serialize_inode_meta`).
@@ -819,12 +826,13 @@ impl FsOps for Tmpfs {
     }
 
     /// Update the inode's `(uid, gid)`. `None` for either field
-    /// leaves it unchanged. Privilege rule: only `CAP_FOWNER` grants
-    /// arbitrary changes; non-privileged callers may chown only to
-    /// their own uid/gid. Linux's silent-clear-`S_ISUID`/`S_ISGID`
-    /// rule applies for non-privileged callers (matches LTP
-    /// `chown03`). Per the DAC + setuid plan §"FsOps::step_chmod /
-    /// step_chown".
+    /// leaves it unchanged. Permission delegated to the single
+    /// source of truth in
+    /// [`tx_subsystems::vfs::predicates::check_chown_perm`] (the
+    /// same body the syscall-arm `cred::checks::authorize_chown`
+    /// consumes). Linux's silent-clear-`S_ISUID`/`S_ISGID` rule
+    /// applies for non-privileged callers (matches LTP `chown03`).
+    /// Per the DAC + setuid plan §"FsOps::step_chmod / step_chown".
     fn step_chown(
         &self,
         fs_object_id: FsObjectId,
@@ -837,19 +845,12 @@ impl FsOps for Tmpfs {
         let Some(inode) = state.inodes.get_mut(&fs_object_id) else {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
-        let privileged = cred.effective_caps.contains(Capability::FOWNER);
-        if !privileged {
-            if let Some(u) = new_uid {
-                if u != cred.uid {
-                    return StepOutcome::err(step_engine::Errno::EPERM);
-                }
-            }
-            if let Some(g) = new_gid {
-                if g != cred.gid {
-                    return StepOutcome::err(step_engine::Errno::EPERM);
-                }
-            }
+        if let Err(e) =
+            tx_subsystems::vfs::predicates::check_chown_perm(&inode.meta, new_uid, new_gid, cred)
+        {
+            return StepOutcome::err(e.into());
         }
+        let privileged = cred.effective_caps.contains(Capability::FOWNER) || cred.uid == 0;
         if let Some(u) = new_uid {
             inode.meta.uid = u;
         }
