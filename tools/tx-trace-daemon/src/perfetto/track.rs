@@ -211,9 +211,18 @@ impl TrackRegistry {
             return None;
         }
         entry.name = comm.to_string();
+        // Preserve the ORIGINAL `parent_uuid` from the track's first
+        // descriptor. Perfetto's TrackDescriptor compatibility check
+        // rejects any later descriptor that changes `parent_uuid` —
+        // the previous version of this method dropped the parent
+        // (set to `None`) and triggered ~40
+        // `track_descriptor_conflicting_reservation` warnings per
+        // trace whenever a process re-emitted its comm after execve.
+        let original_parent = entry.parent_uuid;
+        let uuid = entry.uuid;
         Some(TrackDescriptor {
-            uuid: Some(entry.uuid),
-            parent_uuid: None,
+            uuid: Some(uuid),
+            parent_uuid: if original_parent != 0 { Some(original_parent) } else { None },
             name: Some(comm.to_string()),
             process: Some(ProcessDescriptor {
                 pid: Some(pid as i32),
