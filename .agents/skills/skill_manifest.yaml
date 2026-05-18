@@ -225,4 +225,9 @@ skills:
       - xtask/src/oscomp.rs
       - xtask/src/submit.rs
       - xtask/src/progress
-    purpose: Reference for every `cargo xtask` subcommand — fast feedback (unit, check, lint, boundary-report), build & image (doctor, full-build, build, image), run (qemu, test, shell-test), diagnose (fault-decode, trap-trace), and progress/observation tooling.
+      - tools/tx-trace-daemon/src/main.rs
+      - tools/tx-trace-daemon/src/replay.rs
+      - docs/Txv3/08_OBSERVATION_v1.md
+      - docs/Txv3/08_OBSERVATION_SERIALIZATION_v0.md
+      - docs/Txv3/08_OBSERVATION_HOST_v0.md
+    purpose: Reference for every `cargo xtask` subcommand — fast feedback (unit, check, lint, boundary-report), build & image (doctor, full-build, build, image), run (qemu, test, shell-test), diagnose (fault-decode, trap-trace), progress, and the observation pipeline (replay/pftrace/validate/demo/discipline against tx-trace-daemon).
