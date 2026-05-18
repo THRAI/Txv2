@@ -261,11 +261,11 @@ pub fn post_signal(
 /// [`UserTrapContext::regs`]. The HAL stores user GPRs at the same
 /// indices the architecture uses.
 #[cfg(target_arch = "loongarch64")]
-const USER_CONTEXT_A0_INDEX: usize = 4;
+pub const USER_CONTEXT_A0_INDEX: usize = 4;
 #[cfg(target_arch = "riscv64")]
-const USER_CONTEXT_A0_INDEX: usize = 10;
+pub const USER_CONTEXT_A0_INDEX: usize = 10;
 #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
-const USER_CONTEXT_A0_INDEX: usize = 10;
+pub const USER_CONTEXT_A0_INDEX: usize = 10;
 
 /// Build the merged [`UserTrapContext`] the HAL's
 /// `TrapIf::enter_userspace_with_context` consumes on the next userspace

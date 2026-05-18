@@ -110,6 +110,89 @@
 
   **Blocker:** none.
 
+- 2026-05-18 **All 32 basic-musl OSComp tests now pass on rv64-qemu.**
+  Three sessions of work on `cc/great-ptolemy-982e05` brought the count
+  from ~27 to 32/32. Final blocker was a v3 WaitSource registration gap
+  causing pipe reads via `drive()` to park forever.
+
+  **Root cause (pipe hang):** `pipe/adapter.rs::new_wait_source` (and
+  eventfd, timerfd, process adapters) called `new_source()` without
+  `register_source()`. The `drive()` resolver calls `lookup_source()` to
+  subscribe the task mailbox to the object's WaitSource before parking;
+  with an unregistered source `lookup_source` returned `None`, no
+  subscription was made, and no one ever posted a wakeup event to the
+  parked task. Fix: add `register_source(Arc::clone(&source))` in all
+  four adapters (matching vfs/adapter.rs and futex/adapter.rs), plus
+  `unregister_source` in `PipePayload::drop`.
+
+  **Other fixes in this session set (merged from cc/flamboyant-ramanujan-801c0b):**
+  - `sys_clone` honours non-zero `newsp` (libc clone shape)
+  - `mount_ext4_read_write` replaces read-only sdcard mount (enables mmap/munmap)
+  - `sys_mount("vfat", ...)` aliases to tmpfs (enables mount/umount test)
+  - umount dentry lookup fixed to scan by root rnode
+  - `sys_openat` dirfd resolution via `open_file.opendir_dentry()`
+
+  **Verification:** `cargo xtask oscomp qemu --target rv64-qemu` shows all
+  32 basic-musl tests completing with correct output. busybox-musl continues
+  past without QEMU kill signal. Commit: `39084d8`.
+
+  **Next:** busybox-musl pass rate (currently some fail: df/dmesg/ps/free/touch
+  due to missing /proc and utimensat). No blocker on basic-musl.
+
+- 2026-05-18 **oscomp basic `test_clone` + `test_mount` unblocked.**
+  Two narrow fixes targeting two of the four reported failures in the
+  oscomp basic-musl suite. The other two (`test_mmap` segfault,
+  `test_munmap` EINVAL) still need runtime diagnosis and are tracked
+  as the next priorities.
+
+  1. **`sys_clone` now honours non-zero `newsp` (libc `clone(2)` shape).**
+     Previously rejected with `-EINVAL`
+     ([proc.rs:253 pre-fix](../../crates/tx-shims/src/linux_syscall/proc.rs)).
+     The oscomp `test_clone` calls libc-style `clone(fn, NULL, stack,
+     1024, SIGCHLD)`; basic's `__clone` asm
+     ([clone.s](https://github.com/oscomp/testsuits-for-oskernel/blob/pre-20250615/basic/user/lib/arch/riscv/clone.s))
+     pushes `fn`/`arg` to the new stack and passes `newsp` through to
+     the syscall — the child code path reads `0(sp)` and `8(sp)` to
+     find the function pointer, so it requires `sp = newsp` on
+     userspace re-entry. Fix:
+     - New `STACK_REG_INDEX` constant (RV64 `regs[2]` / LA64 `regs[3]`)
+       in
+       [execution.rs:511](../../crates/tx-subsystems/src/process/execution.rs).
+     - `seed_child_leader_context` now takes a fourth `stack: usize`
+       argument and stamps `child_ctx.regs[STACK_REG_INDEX] = stack`
+       when non-zero. Zero preserves the bare-fork convention
+       (child shares parent's sp).
+     - `sys_clone` plumbs `args[1]` through and drops the EINVAL
+       guard. Reactor seam unchanged.
+     - Existing `dispatch_clone_with_nonzero_stack_returns_neg_einval`
+       test inverted into
+       `dispatch_clone_with_nonzero_stack_seeds_child_sp`, plus a new
+       `seed_child_leader_context_overrides_sp_when_stack_nonzero`
+       unit test on the seed helper.
+
+  2. **`sys_mount("vfat", ...)` aliases to tmpfs (oscomp-compat stub).**
+     Previously returned `-ENOSYS` (`-38`)
+     ([fs_mut.rs:782 default arm](../../crates/tx-shims/src/linux_syscall/fs_mut.rs)).
+     The oscomp `test_mount` mounts `/dev/vda2` with fstype `vfat` and
+     only asserts `mount` + `umount` round-trip succeed; no FAT bytes
+     are read. A fresh tmpfs at the mount point satisfies the
+     contract without pretending to be FAT. Real FAT support tracks
+     separately. Implementation: `"vfat"` joins the `"tmpfs"` arm with
+     the `vfat` label preserved through `MountPayload.fstype` for
+     `/proc/mounts` honesty.
+
+  **Verified:** `cargo -q xtask unit` — 331 tests pass (229 tx-shims,
+  44 tx-kernel, 8 tx-ext4, 50 tx-scripts). `cargo xtask full-build
+  --target rv64-qemu --skip-doctor --no-image` and the LA64 variant
+  both succeed. QEMU runtime re-check pending (the user reported the
+  failures from an external run).
+
+  **Next:** runtime-diagnose `test_mmap` segfault (suspected: page
+  fault handler not materialising `VmBacking::Page` for shared
+  file-backed VMAs) and `test_munmap` EINVAL (path through
+  `try_munmap` returning `Errno::EINVAL` for a range that mmap just
+  produced — needs serial log).
+
 - 2026-05-18 **ext4 mount-time RO/RW distinction + Linux `MS_RDONLY` honoured.**
   Previously `mount_ext4_read_only` was the only entry point and its
   name was a misnomer — the underlying `Ext4FsInstance` and its

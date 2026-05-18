@@ -70,12 +70,20 @@ use tx_subsystems::mount::MountPayload;
 #[cfg_attr(not(test), allow(clippy::extra_unused_type_parameters))]
 #[cfg_attr(test, allow(clippy::extra_unused_type_parameters))]
 /// Translate a dirfd into the root dentry for path resolution.
-/// Returns `EBADF` for non-`AT_FDCWD` dirfds (dirfd support TBD).
+/// `AT_FDCWD` resolves to the process's cwd; any other dirfd is
+/// looked up in the fd table and must reference a directory
+/// (`OpenFile::opendir_dentry()` carries the dentry for fds opened
+/// with `O_DIRECTORY`). Returns `EBADF` for closed/invalid fds and
+/// `ENOTDIR` for fds that aren't directories.
 fn resolve_cwd(dirfd: i32, ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
-    if dirfd != AT_FDCWD {
+    if dirfd == AT_FDCWD {
+        return ctx.process.cwd().ok_or(ENOENT_VALUE);
+    }
+    if dirfd < 0 {
         return Err(EBADF_VALUE);
     }
-    ctx.process.cwd().ok_or(ENOENT_VALUE)
+    let open_file = ctx.process.fd(dirfd as u32).ok_or(EBADF_VALUE)?;
+    open_file.opendir_dentry().ok_or(ENOTDIR_VALUE)
 }
 
 fn resolve_path_at<P: PmapIf>(
@@ -84,15 +92,7 @@ fn resolve_path_at<P: PmapIf>(
     cred: &Credential,
     ctx: &SyscallCtx<'_>,
 ) -> Result<Cap<DEntry>, i32> {
-    if dirfd != AT_FDCWD {
-        // TODO(phase-dirfd): real dirfd-relative paths once the fd
-        // table grows directory-fd semantics.
-        return Err(EBADF_VALUE);
-    }
-    let cwd: Cap<DEntry> = match ctx.process.cwd() {
-        Some(d) => d,
-        None => return Err(EBADF_VALUE),
-    };
+    let cwd: Cap<DEntry> = resolve_cwd(dirfd, ctx)?;
     let guard = step_engine::guard();
     // Uses `step_walk` (consuming `FsOps` via the direct
     // `MountPayload::fs_ops` field) and matches the four-variant

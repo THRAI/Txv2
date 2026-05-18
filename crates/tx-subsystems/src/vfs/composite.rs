@@ -614,8 +614,22 @@ impl<'a, I: SubjectIdentity> StepOp<I> for StatOp<'a> {
                 d
             }
         };
-        let meta = target.rnode().meta();
+        // Prefer the FS's live metadata so writes that grow a file
+        // (`pc.grow_size_to` inside `step_write_from_*`) surface as
+        // the correct `st_size`. The cached `target.rnode().meta()`
+        // is the snapshot from materialisation time and doesn't see
+        // in-place writes.
         let ino = target.rnode().fs_object_id();
+        let meta = match target.rnode().containing_mount_weak() {
+            Some(weak) => match weak.upgrade(&__guard) {
+                Some(payload) => match payload.fs_ops().load_inode_meta(ino, &__guard) {
+                    StepOutcome::Done(m) => m,
+                    _ => target.rnode().meta(),
+                },
+                None => target.rnode().meta(),
+            },
+            None => target.rnode().meta(),
+        };
         StepOutcome::done((meta, ino))
     }
 }

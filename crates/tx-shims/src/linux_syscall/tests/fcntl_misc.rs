@@ -415,12 +415,12 @@ fn dispatch_prlimit64_cross_pid_returns_neg_eperm() {
 // -----------------------------------------------------------------
 
 /// `rt_sigreturn` returns `-ENOSYS` for now. The
-/// `SignalFrameIf::restore_signal_frame` surface needs a
-/// `TrapFrameMut` the dispatcher doesn't yet expose; carryover
-/// is documented at the syscall arm itself
-/// (`TODO(phase-signal-frame)`).
+/// `rt_sigreturn` with no parked signal frame returns `-EFAULT`.
+/// The kernel has no pre-handler context to restore — POSIX leaves
+/// this case undefined; we refuse rather than corrupt the live
+/// `saved_user_context`.
 #[test]
-fn dispatch_rt_sigreturn_returns_neg_enosys() {
+fn dispatch_rt_sigreturn_without_frame_returns_neg_efault() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
@@ -430,7 +430,41 @@ fn dispatch_rt_sigreturn_returns_neg_enosys() {
         SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
         &ctx,
     ));
+    assert_eq!(r, SyscallResult::Error(14)); // EFAULT
+}
+
+/// `rt_sigreturn` with a parked signal frame restores it into
+/// `saved_user_context` and returns `SigreturnRestored` so the
+/// syscall-return path in `thread_future` skips the normal
+/// pending-return drain.
+#[test]
+fn dispatch_rt_sigreturn_restores_parked_signal_context() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    // Park a synthetic pre-signal context. In production this is
+    // stored at `thread_future.rs:285` by the AST checkpoint when
+    // it flips `saved_user_context` to the handler-entry context.
+    let payload = thread.payload_cap().expect("thread has payload");
+    let mut parked = tx_hal::UserTrapContext::empty();
+    parked.pc = 0x1234_5678;
+    parked.regs[10] = 0xdead_beef;
+    payload.store_saved_signal_context(Some(parked));
+
+    let ctx = make_ctx(proc_cap, thread.clone());
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
+        &ctx,
+    ));
     assert_eq!(r, SyscallResult::SigreturnRestored);
+
+    let restored = thread
+        .payload_cap()
+        .expect("thread has payload")
+        .saved_user_context()
+        .expect("rt_sigreturn must have stored the parked context");
+    assert_eq!(restored.pc, 0x1234_5678);
+    assert_eq!(restored.regs[10], 0xdead_beef);
 }
 
 // E_BADF is reserved for the F_DUPFD-against-closed-fd shape;
