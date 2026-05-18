@@ -231,6 +231,12 @@ pub struct TaskMailbox {
     /// via [`Self::with_task_id`]; read by `notify_emit` and other
     /// substrate convergence-point emitters (OBS-4 / γ-fix).
     task_id_low: u32,
+    /// Low 32 bits of the owning process trace identity (PID for
+    /// user threads; 0 for kernel-internal actors and tests). Set via
+    /// [`Self::with_process_id`]; read by `emit_sched_*` so the daemon
+    /// can render per-process ProcessDescriptor tracks parenting
+    /// per-thread tracks (OBS-V1 §15.6 sched_switch view).
+    process_id_low: u32,
 }
 
 impl TaskMailbox {
@@ -248,6 +254,7 @@ impl TaskMailbox {
             overflow: AtomicBool::new(false),
             waker: SpinMutex::new(None),
             task_id_low: 0,
+            process_id_low: 0,
         }
     }
 
@@ -265,6 +272,26 @@ impl TaskMailbox {
     pub fn with_task_id(mut self, task_id_low: u32) -> Self {
         self.task_id_low = task_id_low;
         self
+    }
+
+    /// Builder: attach a process trace identity to this mailbox.
+    ///
+    /// Pass the low 32 bits of the owning process's canonical
+    /// `Pid.0`. Kernel actors with no stable identity may leave the
+    /// default of `0`.
+    #[must_use]
+    pub fn with_process_id(mut self, process_id_low: u32) -> Self {
+        self.process_id_low = process_id_low;
+        self
+    }
+
+    /// Low 32 bits of the owning process's trace identity.
+    ///
+    /// Returns the value set via [`Self::with_process_id`], or `0`
+    /// for kernel-internal actors.
+    #[inline]
+    pub fn process_id_low(&self) -> u32 {
+        self.process_id_low
     }
 
     /// Low 32 bits of the task's trace identity.

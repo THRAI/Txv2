@@ -69,6 +69,12 @@ pub struct InitialSchedMeta {
     /// `PayloadDriveBegin` carry per-thread identity in observation
     /// records (OBS-V1 §13.2 flow-id material).
     pub task_id_low: u32,
+    /// Low 32 bits of the owning process's trace identity (PID for
+    /// user threads, 0 for kernel-internal tasks). Threaded through
+    /// [`TaskTable::submit_with_ids`] → [`TaskMailbox::with_process_id`]
+    /// so `emit_sched_*` records carry PID for per-process
+    /// ProcessDescriptor track routing (OBS-V1 §15.6 sched_switch view).
+    pub process_id_low: u32,
 }
 
 impl InitialSchedMeta {
@@ -80,6 +86,7 @@ impl InitialSchedMeta {
             affinity: u64::MAX,
             kernel_only: false,
             task_id_low: 0,
+            process_id_low: 0,
         }
     }
 
@@ -91,6 +98,7 @@ impl InitialSchedMeta {
             affinity: u64::MAX,
             kernel_only: true,
             task_id_low: 0,
+            process_id_low: 0,
         }
     }
 
@@ -107,6 +115,18 @@ impl InitialSchedMeta {
     /// and `WaitSource::notify_emit` emits per-thread `task_id_low`.
     pub const fn with_task_id(mut self, task_id_low: u32) -> Self {
         self.task_id_low = task_id_low;
+        self
+    }
+
+    /// Install the owning process's trace identity (PID low 32 bits).
+    ///
+    /// Production call sites: `tx-kernel`'s thread-future submit path
+    /// reads `child_process.pid.0` and chains this builder alongside
+    /// [`Self::with_task_id`] so the daemon can build per-process
+    /// ProcessDescriptor tracks parenting per-thread tracks
+    /// (OBS-V1 §15.6).
+    pub const fn with_process_id(mut self, process_id_low: u32) -> Self {
+        self.process_id_low = process_id_low;
         self
     }
 }

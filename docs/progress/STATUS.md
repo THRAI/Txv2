@@ -1,3 +1,51 @@
+- 2026-05-18 **OBS: real PID/TID in Perfetto slice details + per-syscall
+  arg annotations.** Slices in `oscomp.pftrace` no longer show the
+  synthetic `hart0[0] / txKernel[1]` placeholder pair — each reactor
+  task carries an owning `process_id_low` alongside `task_id_low`
+  end-to-end:
+  - `PayloadSchedSwitch` wire format extended (`offset 4: process_id_low
+    u32`, `_pad: [u8; 5]`); `encode_sched_switch` writes both fields.
+  - `TaskMailbox` gains a `process_id_low` field + `with_process_id`
+    builder + accessor, mirroring the `task_id_low` plumbing
+    (`crates/tx-substrate/src/wake/mailbox.rs`).
+  - `InitialSchedMeta::process_id_low` + `with_process_id` builder;
+    `TaskTable::submit_with_ids(future, tid, pid)` plumbs both into
+    `Task::new_for_handle`. Old `submit_with_task_id` kept as a thin
+    wrapper. `Reactor::submit_task_with_meta` threads
+    `initial_meta.process_id_low` through.
+  - `emit_sched_begin/end` read `mailbox.process_id_low()` next to
+    `task_id_low()` and stamp both into `PayloadSchedSwitch`.
+  - Kernel submit sites updated: leader thread in `init/exec.rs` reads
+    `init.pid.0`; `sys_clone` children in
+    `init.rs::drain_pending_child_submits` read
+    `child_thread.upgrade_owner_proc()?.pid.0`.
+  - Daemon `extract_sched_ids` returns `(tid, pid)`. Writer keeps
+    `current_pid_per_hart` in lockstep with `current_task_per_hart` via
+    SpanBegin/End(Sched). When both are known, non-Sched slices route to
+    `TrackRegistry::ensure_thread_track_under_process(pid, hart, tid)`:
+    a top-level `ProcessDescriptor (pid-<N>)` parents a
+    `ThreadDescriptor (tid-<M>, pid=<N> tid=<M>)`. Verified
+    `oscomp.pftrace` carries ~60 `pid-<N>` / `tid-<M>` track pairs
+    matching each basic-musl test process.
+  - **Syscall args (separate strand finished same day):** `tx-shims`
+    `emit_syscall_enter` now emits six `ArgValue` Instants (`a0..a5`)
+    as continuations of the L0 SpanBegin. Daemon renders them as
+    `DebugAnnotation { name="value", uint_value=… }`, surfacing
+    register state in the slice arg panel; `a0..a5` are pre-populated
+    in `observe names` so they read with friendly labels.
+  - **Verification.** `cargo -q xtask unit` — 332 tests pass.
+    `cargo test -p tx-trace-daemon` — 3 integration tests pass.
+    End-to-end `cargo xtask oscomp qemu --target rv64-qemu` ran to the
+    bounded-trace threshold; extracted via `cargo xtask observe extract`,
+    pftrace'd via `cargo xtask observe pftrace`; resulting
+    `target/oscomp/pftrace/oscomp.pftrace` has ~60 distinct `(pid, tid)`
+    pairs visible in the protobuf string table.
+  - **Next:** open the regenerated pftrace in Perfetto UI and confirm
+    slice details now read `pid=<real> tid=<real>`. Also: SpanEnd
+    records currently emit at `TxTraceLevel::Boundary` regardless of
+    SpanBegin's level — daemon could correlate SpanEnd level via
+    span_id for cleaner Sched-only filters (cosmetic, not blocking).
+
 - 2026-05-18 **OBS pipeline: full-stack debugger interface from real
   oscomp run to Perfetto UI.** Build on top of the L0/L2/L3/L4 emits
   that landed earlier in the day; this push closes every step between

@@ -634,7 +634,11 @@ impl<P: TxPlatform> CoreInit<P> {
         // OBS-V1 §13.2: install init's TID on the task's mailbox so
         // observation records for the leader thread carry a non-zero
         // `task_id_low` (read by `notify_emit` and `PayloadDriveBegin`).
+        // OBS-V1 §15.6: also install the owning process's PID so the
+        // daemon can build per-process tracks (ProcessDescriptor) that
+        // parent the per-thread tracks.
         let tid_low = thread.tid.0;
+        let pid_low = init.pid.0;
         let submitted = BOOT_REACTOR.with(|reactor| {
             reactor.submit_task_with_meta(
                 crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -643,7 +647,8 @@ impl<P: TxPlatform> CoreInit<P> {
                 ),
                 boot_runtime::InitialSchedMeta::kernel()
                     .with_affinity(tx_hal::CpuMask::single(current_cpu).bits())
-                    .with_task_id(tid_low),
+                    .with_task_id(tid_low)
+                    .with_process_id(pid_low),
             )
         });
         if submitted.is_none() {

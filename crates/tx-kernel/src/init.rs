@@ -1531,7 +1531,14 @@ impl<P: TxPlatform> CoreInit<P> {
             // `PayloadDriveBegin` emit per-thread identity rather than
             // 0. The TID is read from `child_thread` while we still have
             // the cap; once the future moves it, the cap is consumed.
+            // OBS-V1 §15.6: also resolve the owning process PID so the
+            // daemon can build a ProcessDescriptor parent track for the
+            // per-thread tracks.
             let tid_low = child_thread.tid.0;
+            let pid_low = child_thread
+                .upgrade_owner_proc()
+                .map(|p| p.pid.0)
+                .unwrap_or(0);
             let _ = BOOT_REACTOR.with(|reactor| {
                 reactor.submit_task_with_meta(
                     crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -1540,7 +1547,8 @@ impl<P: TxPlatform> CoreInit<P> {
                     ),
                     boot_runtime::InitialSchedMeta::kernel()
                         .with_affinity(tx_hal::CpuMask::single(current_cpu).bits())
-                        .with_task_id(tid_low),
+                        .with_task_id(tid_low)
+                        .with_process_id(pid_low),
                 );
             });
         }
