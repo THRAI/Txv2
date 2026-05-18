@@ -29,6 +29,8 @@ goblin = { version = "0.10", default-features = false, features = ["alloc", "end
 # but the exec script also calls `tx_substrate::epoch::guard()`
 # directly so we declare the dep explicitly.
 tx-hal = { path = "../tx-hal" }
+tx-observe = { path = "../tx-observe" }
+tx-observe-types = { path = "../tx-observe-types" }
 tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-substrate = { path = "../tx-substrate" }
 tx-test-support = { path = "../tx-test-support" }
@@ -38,3 +40,6 @@ tx-subsystems = { path = "../tx-subsystems" }
 # Cross-crate test helpers (zone reset / pid counter reset / init slot
 # reset) for the Phase 5 exec_script tests.
 tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }
+# Observation testing harness (`TestPlatform`) for `tests/drive_observe.rs`.
+tx-observe = { path = "../tx-observe", features = ["testing"] }
+tx-observe-types = { path = "../tx-observe-types" }

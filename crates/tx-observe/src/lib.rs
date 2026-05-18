@@ -76,6 +76,71 @@ impl SpanId {
     pub fn raw(self) -> u64 {
         self.0
     }
+
+    /// Reconstruct a `SpanId` from its raw wire value.
+    ///
+    /// Used when a parent span id has been threaded through a non-trace
+    /// channel (e.g. the per-hart parent-span slot or `ScriptCtx`)
+    /// and needs to be fed back into `HartEmitter::span_begin` as
+    /// `parent`. A raw of `0` maps to `SpanId::NONE` (no ancestor).
+    #[inline]
+    pub const fn from_raw_or_none(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-hart current-parent-span slot
+//
+// Used to thread the "currently open ancestor span" id from L0 (syscall
+// boundary) down to L2 (`drive`) without having to thread it through every
+// `ScriptCtx` construction in tx-shims. The slot is installed by the
+// dispatcher with `set_current_parent_span(l0_span)` and read by `drive`
+// with `current_parent_span()`. Each `set_*` returns the previous value so
+// the caller can restore it (RAII-style) at scope exit.
+//
+// Concurrency: the slot is per-hart (`HartLocalArray`-style indexing); the
+// dispatcher always executes on the hart that opened the L0 span. Cross-
+// hart task migration during a yield is handled by the daemon-side parent
+// reconstruction fallback (timestamp + hart_id correlation per OBS-V1
+// §13.1). For single-hart syscall arms (the common case), the parent
+// linkage is exact.
+// ---------------------------------------------------------------------------
+
+static PARENT_SPANS: [AtomicU64; MAX_HARTS] = {
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    [ZERO; MAX_HARTS]
+};
+
+/// Install a parent span for the current hart's emit calls.
+///
+/// Returns the previous value so the caller can restore it once the scope
+/// that owns the new parent ends (typical pattern: save → run inner →
+/// restore). Returns `SpanId::NONE` when no emitter is installed on this
+/// hart (the per-hart slot is still updated, but reading it later will
+/// behave identically to never having set it).
+#[inline]
+pub fn set_current_parent_span(span: SpanId) -> SpanId {
+    let idx = read_current_cpu_id().map(|c| c.0 as usize).unwrap_or(MAX_HARTS);
+    if idx >= MAX_HARTS {
+        return SpanId::NONE;
+    }
+    let prev = PARENT_SPANS[idx].swap(span.0, Ordering::Relaxed);
+    SpanId(prev)
+}
+
+/// Read the parent span installed on the current hart.
+///
+/// Returns `SpanId::NONE` if no parent was installed or the hart id is
+/// out of range. Used by [`HartEmitter`] internals and by the `drive`
+/// loop to attach `PayloadDriveBegin` to its L0 ancestor.
+#[inline]
+pub fn current_parent_span() -> SpanId {
+    let idx = read_current_cpu_id().map(|c| c.0 as usize).unwrap_or(MAX_HARTS);
+    if idx >= MAX_HARTS {
+        return SpanId::NONE;
+    }
+    SpanId(PARENT_SPANS[idx].load(Ordering::Relaxed))
 }
 
 /// Event name id — low 32 bits of `core::any::TypeId`.

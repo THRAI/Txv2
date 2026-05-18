@@ -146,22 +146,39 @@ fn observe_pftrace(root: &Path, args: &[String]) -> Result<()> {
 
     ensure_daemon_built(root)?;
 
+    // Auto-discover sibling `<stem>.names.json` next to the .txtrace so the
+    // daemon can resolve EventNameId → human name without an explicit flag.
+    // Explicit `--names` overrides the discovery.
+    let explicit_names = optional_option_value(args, "--names");
+    let sibling_names = file.with_extension("names.json");
+    let names_path = explicit_names
+        .map(PathBuf::from)
+        .or_else(|| sibling_names.exists().then_some(sibling_names));
+
     eprintln!(
-        "observe: tx-trace-daemon replay --file {} --out pftrace --output {} ...",
+        "observe: tx-trace-daemon replay --file {} --out pftrace --output {}{} ...",
         file.display(),
         output,
+        names_path
+            .as_deref()
+            .map(|p| format!(" --names {}", p.display()))
+            .unwrap_or_default(),
     );
 
-    let status = Command::new(daemon_bin(root))
-        .args([
-            "replay",
-            "--file",
-            &file.to_string_lossy(),
-            "--out",
-            "pftrace",
-            "--output",
-            &output,
-        ])
+    let mut cmd = Command::new(daemon_bin(root));
+    cmd.args([
+        "replay",
+        "--file",
+        &file.to_string_lossy(),
+        "--out",
+        "pftrace",
+        "--output",
+        &output,
+    ]);
+    if let Some(p) = names_path.as_deref() {
+        cmd.args(["--names", &p.to_string_lossy()]);
+    }
+    let status = cmd
         .status()
         .map_err(|err| format!("failed to run tx-trace-daemon: {err}"))?;
 
@@ -323,108 +340,164 @@ fn observe_demo(args: &[String]) -> Result<()> {
     const RINGS_OFF: usize = HEADER_SIZE;
     const RING_PRODUCER_OFF: usize = 64;
 
-    // ── Build record list ─────────────────────────────────────────────────────
-    let span_id: u64 = 0x0000_0000_0000_0001;
+    // ── FNV-1a 32 ── matches `op_name_id` in tx-scripts/src/drive.rs so the
+    // daemon's intern table resolves the synthetic name ids the same way it
+    // resolves production-emitted ones.
+    fn fnv1a32(s: &str) -> u32 {
+        let mut hash: u32 = 0x811c_9dc5;
+        for &b in s.as_bytes() {
+            hash ^= b as u32;
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        hash
+    }
 
-    // Base records
-    let mut record_payloads: Vec<DemoRecord> = vec![
-        // (kind, level, name, span, parent, payload_tag, payload_len, payload)
-        // 1. SpanBegin
-        (
-            10u8, // SpanBegin
-            2u8,  // Drive
-            0x0000_0001u32,
-            span_id,
-            0u64,
-            0u16, // TxPayloadTag::None
-            0u16,
-            [0u8; 16],
-        ),
-        // 2. Instant — WaitSourceNotify
-        {
-            // PayloadWaitSourceNotify: source_id_low=0x1234, mask_bits=0b11, task_id_low=0, wait_gen_low=7
-            let mut payload = [0u8; 16];
-            payload[0..4].copy_from_slice(&0x1234u32.to_le_bytes());
-            payload[4..8].copy_from_slice(&0b11u32.to_le_bytes());
-            payload[8..12].copy_from_slice(&0u32.to_le_bytes());
-            payload[12..16].copy_from_slice(&7u32.to_le_bytes());
-            (
-                12u8, // Instant
-                0u8,  // Boundary
-                0x0000_0002u32,
-                0u64,
-                span_id,
-                8u16, // TxPayloadTag::WaitSourceNotify
-                16u16,
-                payload,
-            )
-        },
-        // 3. Counter — CounterValue
-        {
-            // PayloadCounterValue: counter_id=3, _pad=0, value=42
-            let mut payload = [0u8; 16];
-            payload[0..4].copy_from_slice(&3u32.to_le_bytes()); // counter_id
-                                                                // _pad = 0 (bytes 4..8)
-            payload[8..16].copy_from_slice(&42u64.to_le_bytes()); // value
-            (
-                13u8, // Counter
-                0u8,  // Boundary
-                0x0000_0003u32,
-                0u64,
-                0u64,
-                11u16, // TxPayloadTag::CounterValue
-                16u16,
-                payload,
-            )
-        },
-        // 4. SpanEnd
-        (
-            11u8, // SpanEnd
-            0u8,  // Boundary
-            0x0000_0000u32,
-            span_id,
-            0u64,
-            0u16, // TxPayloadTag::None
-            0u16,
-            [0u8; 16],
-        ),
+    // ── Build a realistic sys_read scenario ───────────────────────────────────
+    //
+    // Hierarchy (matches the v1 spec's worked example, §9):
+    //   L0 SpanBegin sys_read
+    //     L2 SpanBegin drive.PipeReadOp
+    //       L4 SpanBegin step.iteration_0
+    //       L4 SpanEnd   step.iteration_0 (StepOutcome=Yield, OnWaitSource)
+    //       L3 SpanBegin yield.OnWaitSource       [with_yields]
+    //       L3 Instant   wake.notify              [always — producer side]
+    //       L3 Instant   resume                   [with_yields]
+    //       L3 SpanEnd   yield.OnWaitSource       [with_yields]
+    //       L4 SpanBegin step.iteration_1         [with_yields]
+    //       L4 SpanEnd   step.iteration_1 (StepOutcome=Done, 4096 bytes)
+    //     L2 SpanEnd   drive.PipeReadOp
+    //   L0 SpanEnd   sys_read
+    let n_sys_read = fnv1a32("sys_read");
+    let n_drive = fnv1a32("drive.tx_subsystems::pipe::PipeReadOp");
+    let n_step0 = fnv1a32("step.iteration_0");
+    let n_step1 = fnv1a32("step.iteration_1");
+    let n_yield = fnv1a32("yield.OnWaitSource");
+    let n_wake = fnv1a32("wake.notify");
+    let n_resume = fnv1a32("resume");
+
+    let names_table = [
+        (n_sys_read, "sys_read"),
+        (n_drive, "drive.tx_subsystems::pipe::PipeReadOp"),
+        (n_step0, "step.iteration_0"),
+        (n_step1, "step.iteration_1"),
+        (n_yield, "yield.OnWaitSource"),
+        (n_wake, "wake.notify"),
+        (n_resume, "resume"),
     ];
 
-    // Optional yield/resume pair
-    if with_yields {
-        // 5. Instant — YieldBegin
-        let mut yield_payload = [0u8; 16];
-        yield_payload[0] = 0u8; // shape_kind
-        yield_payload[4..8].copy_from_slice(&0x99u32.to_le_bytes()); // task_id_low
-        yield_payload[8..16].copy_from_slice(&1u64.to_le_bytes()); // wait_generation
-        record_payloads.push((
-            12u8, // Instant
-            3u8,  // Yield
-            0x0000_0004u32,
-            0u64,
-            span_id,
-            6u16, // TxPayloadTag::YieldBegin
-            16u16,
-            yield_payload,
-        ));
+    let sys_span: u64 = 0x0000_0000_0000_0001;
+    let drv_span: u64 = 0x0000_0000_0000_0002;
+    let step0_span: u64 = 0x0000_0000_0000_0003;
+    let yield_span: u64 = 0x0000_0000_0000_0004;
+    let step1_span: u64 = 0x0000_0000_0000_0005;
 
-        // 6. Instant — Resume
-        let mut resume_payload = [0u8; 16];
-        resume_payload[0] = 0u8; // resume_kind
-        resume_payload[1] = 0u8; // abort_reason
-        resume_payload[4..8].copy_from_slice(&0x99u32.to_le_bytes()); // object_id_low
-        resume_payload[8..16].copy_from_slice(&1u64.to_le_bytes()); // wait_generation
-        record_payloads.push((
-            12u8, // Instant
-            3u8,  // Yield
-            0x0000_0005u32,
-            0u64,
-            span_id,
-            7u16, // TxPayloadTag::Resume
-            16u16,
-            resume_payload,
-        ));
+    // Helper payload builders (kept inline to avoid bloating the function
+    // surface with a payload-builder module).
+    let payload_syscall_enter = {
+        // PayloadSyscallEnter: sysno=63 (Linux NR_READ rv64), abi=0, argc=6
+        let mut p = [0u8; 16];
+        p[0..4].copy_from_slice(&63u32.to_le_bytes());
+        p[4..6].copy_from_slice(&0u16.to_le_bytes());
+        p[6..8].copy_from_slice(&6u16.to_le_bytes());
+        p
+    };
+    let payload_syscall_exit = {
+        // PayloadSyscallExit: ret=4096, errno=0, result_kind=0 (Ok)
+        let mut p = [0u8; 16];
+        p[0..8].copy_from_slice(&4096i64.to_le_bytes());
+        p[8..12].copy_from_slice(&0i32.to_le_bytes());
+        p[12] = 0u8; // result_kind
+        p
+    };
+    let payload_drive_begin = {
+        // PayloadDriveBegin: op_type, mode=1(Waiting), interrupt=1, has_deadline=0, task_id_low=0x42
+        let mut p = [0u8; 16];
+        p[0..4].copy_from_slice(&n_drive.to_le_bytes());
+        p[4] = 1u8;
+        p[5] = 1u8;
+        p[6] = 0u8;
+        p[8..12].copy_from_slice(&0x42u32.to_le_bytes());
+        p
+    };
+    let payload_drive_end_ok = {
+        // PayloadDriveEnd: ret=0, errno=0, result_kind=0 (Done)
+        let mut p = [0u8; 16];
+        p[12] = 0u8;
+        p
+    };
+    let payload_step_yield = {
+        // PayloadStepOutcome: variant=1 (Yield), progress_empty=1, progress_kind=1 (ByteProgress),
+        // shape_kind=1 (OnWaitSource), errno=0, progress_value=0
+        let mut p = [0u8; 16];
+        p[0] = 1; // variant=Yield
+        p[1] = 1; // progress_empty
+        p[2] = 1; // progress_kind=Byte
+        p[3] = 1; // shape_kind=OnWaitSource
+        // errno (4..8) = 0
+        // progress_value (8..12) = 0
+        p
+    };
+    let payload_step_done = {
+        // PayloadStepOutcome: variant=2 (Done), progress_empty=0, progress_kind=1, progress_value=4096
+        let mut p = [0u8; 16];
+        p[0] = 2; // variant=Done
+        p[1] = 0;
+        p[2] = 1; // ByteProgress
+        p[3] = 0;
+        p[8..12].copy_from_slice(&4096u32.to_le_bytes()); // progress_value
+        p
+    };
+    let payload_yield_begin = {
+        // PayloadYieldBegin: shape_kind=1, task_id_low=0x42, wait_generation=7
+        let mut p = [0u8; 16];
+        p[0] = 1;
+        p[4..8].copy_from_slice(&0x42u32.to_le_bytes());
+        p[8..16].copy_from_slice(&7u64.to_le_bytes());
+        p
+    };
+    let payload_wait_source_notify = {
+        // PayloadWaitSourceNotify: source_id_low=0x1234, mask_bits=1, task_id_low=0x42, wait_generation_low=7
+        let mut p = [0u8; 16];
+        p[0..4].copy_from_slice(&0x1234u32.to_le_bytes());
+        p[4..8].copy_from_slice(&1u32.to_le_bytes());
+        p[8..12].copy_from_slice(&0x42u32.to_le_bytes());
+        p[12..16].copy_from_slice(&7u32.to_le_bytes());
+        p
+    };
+    let payload_resume = {
+        // PayloadResume: resume_kind=0 (Retry), abort_reason=0, object_id_low=0x1234, wait_generation=7
+        let mut p = [0u8; 16];
+        p[0] = 0;
+        p[1] = 0;
+        p[4..8].copy_from_slice(&0x1234u32.to_le_bytes());
+        p[8..16].copy_from_slice(&7u64.to_le_bytes());
+        p
+    };
+
+    // Records list — kinds: 10=SpanBegin, 11=SpanEnd, 12=Instant.
+    // Levels: 0=Boundary(L0), 2=Drive(L2), 3=Yield(L3), 4=Step(L4).
+    // Payload tags: 1=SyscallEnter, 2=SyscallExit, 10=DriveBegin, 11=DriveEnd,
+    //               12=StepOutcome, 20=YieldBegin, 21=Resume, 22=WaitSourceNotify.
+    let mut record_payloads: Vec<DemoRecord> = vec![
+        (10, 0, n_sys_read, sys_span, 0, 1, 8, payload_syscall_enter),
+        (10, 2, n_drive, drv_span, sys_span, 10, 12, payload_drive_begin),
+        (10, 4, n_step0, step0_span, drv_span, 0, 0, [0u8; 16]),
+        (11, 4, 0, step0_span, 0, 12, 16, payload_step_yield),
+    ];
+
+    if with_yields {
+        record_payloads.push((10, 3, n_yield, yield_span, drv_span, 20, 16, payload_yield_begin));
     }
+    // Producer-side wake.notify always emits (independent of consumer state).
+    record_payloads.push((12, 3, n_wake, 0, drv_span, 22, 16, payload_wait_source_notify));
+    if with_yields {
+        record_payloads.push((12, 3, n_resume, 0, yield_span, 21, 16, payload_resume));
+        record_payloads.push((11, 3, 0, yield_span, 0, 0, 0, [0u8; 16]));
+        record_payloads.push((10, 4, n_step1, step1_span, drv_span, 0, 0, [0u8; 16]));
+        record_payloads.push((11, 4, 0, step1_span, 0, 12, 16, payload_step_done));
+    }
+    record_payloads.push((11, 2, 0, drv_span, 0, 11, 16, payload_drive_end_ok));
+    record_payloads.push((11, 0, 0, sys_span, 0, 2, 16, payload_syscall_exit));
 
     // Apply --records override (truncate or pad with Instant records)
     if let Some(n) = records_arg {
@@ -497,6 +570,20 @@ fn observe_demo(args: &[String]) -> Result<()> {
     fs::write(&output_path, &buf)
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
 
+    // Sibling `<stem>.names.json` — picked up automatically by
+    // `xtask observe pftrace` so the rendered timeline shows human names
+    // (`sys_read`, `drive.PipeReadOp`, `step.iteration_0`, …) instead of
+    // the `name_0xNNNN` fallback.
+    let names_path = output_path.with_extension("names.json");
+    let mut json = String::from("{\n  \"name_table\": {\n");
+    for (i, (id, name)) in names_table.iter().enumerate() {
+        let sep = if i + 1 == names_table.len() { "" } else { "," };
+        json.push_str(&format!("    \"{}\": \"{}\"{}\n", id, name, sep));
+    }
+    json.push_str("  }\n}\n");
+    fs::write(&names_path, &json)
+        .map_err(|err| format!("failed to write {}: {err}", names_path.display()))?;
+
     eprintln!(
         "observe: demo file written to {} ({} bytes, {} records{})",
         output_path.display(),
@@ -504,6 +591,7 @@ fn observe_demo(args: &[String]) -> Result<()> {
         num_records,
         if with_yields { ", with yields" } else { "" }
     );
+    eprintln!("observe: names.json written to {}", names_path.display());
     Ok(())
 }
 

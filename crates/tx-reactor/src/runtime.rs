@@ -263,11 +263,15 @@ impl Reactor {
     }
 
     /// Submit a task with explicit scheduler metadata.
+    ///
+    /// `initial_meta.task_id_low` is threaded into the task's
+    /// `TaskMailbox` via `TaskTable::submit_with_task_id`; the scheduler
+    /// also sees the full meta for fairness/affinity bookkeeping.
     pub fn submit_task_with_meta<F>(&mut self, future: F, initial_meta: InitialSchedMeta) -> TaskKey
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let key = self.tasks.submit(future);
+        let key = self.tasks.submit_with_task_id(future, initial_meta.task_id_low);
         self.scheduler
             .task_submitted(key.id(), TaskHandle::new(key.id()), initial_meta);
         key

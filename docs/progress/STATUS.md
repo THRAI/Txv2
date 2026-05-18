@@ -1,3 +1,115 @@
+- 2026-05-18 **OBS-3a + L0 + L4 drive observation hooks LANDED.**
+  The central `drive<S, I>` loop in `crates/tx-scripts/src/drive.rs` and
+  the Linux syscall dispatch in
+  `crates/tx-shims/src/linux_syscall/mod.rs` now emit the convergence-
+  point records the v1 observation spec calls for. The previous state
+  was "L2/L3/L4 deliberately absent" (drive.rs preamble comment); after
+  this pass `drive` opens an `L2 SpanBegin(DriveBegin)`, wraps every
+  `op.step(ctx)` call in an `L4 SpanBegin/SpanEnd(StepOutcome)` pair,
+  opens an `L3 SpanBegin(YieldBegin)` on `AcceptOutcome::Resolve`,
+  emits an `L3 Instant(Resume)` + matching `L3 SpanEnd` after
+  `resolve_yield`, and closes the drive span with
+  `L2 SpanEnd(DriveEnd)` at every exit path. `dispatch()` now wraps
+  the body of every Linux syscall in `L0 SpanBegin(SyscallEnter)` +
+  `SpanEnd(SyscallExit)` with the kernel-side `Errno` mapped to its
+  Linux numeric value via the new `Errno::linux_i32()` method.
+
+  **What changed:**
+
+  - `crates/tx-substrate/src/step/mod.rs`: Added `Errno::linux_i32()`
+    (centralises the previously-only-in-tx-shims errno → i32 mapping
+    so trace records carry meaningful Linux error codes without a
+    cycle into tx-shims). Added `trace_kind()` and `trace_value()`
+    default methods to `StepProgress` so `PayloadStepOutcome` carries
+    the progress shape and count.
+  - `crates/tx-substrate/src/step/{page_progress,entry_progress,
+    iovec_progress}.rs`: Override `trace_kind` / `trace_value` for
+    PageProgress (kind=2, pages), EntryProgress (kind=3, count), and
+    IoVecProgress (kind=4, iovecs_complete). ByteProgress (kind=1)
+    overrides in mod.rs.
+  - `crates/tx-scripts/src/drive.rs`: Replaced the early-return
+    structure with a labeled `'drive:` loop so every exit path closes
+    the L2 drive span exactly once. New `emit_drive_begin`,
+    `emit_step_begin`, `emit_step_end`, `emit_yield_begin`,
+    `emit_resume_end`, `emit_drive_end` helpers (all `#[inline]` and
+    no-op when `tx_observe::current()` is None). Uses
+    `core::any::type_name::<S>()` FNV-1a-hashed to a u32 for the
+    op_name id — avoids the `'static` bound that would have broken
+    ~22 borrowed-StepOp impls in tx-shims.
+  - `crates/tx-shims/src/linux_syscall/mod.rs`: Renamed the existing
+    `dispatch` body to `dispatch_inner` and added a thin `dispatch`
+    wrapper that emits L0 boundary spans around the call. New
+    `emit_syscall_enter` / `emit_syscall_exit` helpers map
+    `SyscallResult` variants to the `PayloadSyscallExit` shape
+    (Return=Ok, Error=Err, NoReturn/ExecCommitted/SigreturnRestored
+    all classified as NoReturn=4 so the daemon's syscall slice
+    closes cleanly when no `a0` write occurs).
+  - `crates/tx-scripts/Cargo.toml`, `crates/tx-shims/Cargo.toml`:
+    Added explicit `tx-observe` + `tx-observe-types` dependencies
+    (previously only transitive through tx-substrate).
+  - `crates/tx-scripts/tests/drive_observe.rs`: New integration test
+    (4 cases) — Done-in-first-step (4 records), Continue→Done (6
+    records), Err with linux errno=38 propagating into both L4 step
+    end and L2 drive end, Nonblocking-yield → EAGAIN translation with
+    `shape_kind=OnWaitSource=1`.
+
+  **Verified:**
+  - `cargo -q xtask unit` clean: tx-shims 229/229, tx-kernel 44/44,
+    tx-ext4 8/8, tx-scripts 50/50.
+  - `cargo test -p tx-scripts --test drive_observe -- --test-threads=1`
+    4/4 pass.
+  - `cargo test -p tx-substrate --tests -- --test-threads=1` all OBS
+    integration tests still pass (obs4_cap_trace_id 1/1,
+    obs4_convergence_point_emit 1/1, obs4_wait_source_notify_emit 5/5,
+    obs8_index_commit_emit 2/2, obs8_zone_sign_emit 2/2).
+  - `cargo xtask observe-discipline` clean (471 files, 194 StepOp
+    impls).
+  - `cargo build --target riscv64gc-unknown-none-elf -p
+    tx-kernel-riscv64-qemu-virt` clean — confirms no_std compatible.
+
+  **Follow-on landings in the same pass:**
+
+  - L0 → L2 → L4 parent span linkage via a per-hart `PARENT_SPANS:
+    [AtomicU64; MAX_HARTS]` slot in `tx-observe::lib.rs`. The
+    dispatcher swaps its L0 span id in around `dispatch_inner()`;
+    `drive()` reads the slot into the parent argument of
+    `emit_drive_begin`, then swaps the L2 span in for its own body
+    so step span begins attach to the drive span. Reactor-task
+    migration across harts is handled by the daemon-side timestamp
+    fallback (OBS-V1 §13.1) — single-hart syscall arms get exact
+    parent linkage. New integration case
+    `drive_l2_links_to_l0_parent_via_per_hart_slot` pins the
+    behavior: synthetic L0 span → drive → 6 records with
+    `record.parent` forming the L0 → L2 → L4 chain.
+  - L6 mutation gates (`zone::MUTATION_EMIT_ENABLED`,
+    `index::INDEX_MUTATION_EMIT_ENABLED`) flipped to default-on at
+    `tx_substrate::init::<P>()` BSP entry. Existing `obs8_*` tests
+    that explicitly disable the gate still pass (they `store(false,
+    Release)` before the assertion); production builds now emit
+    `MutationZoneSign` / `MutationIndexCommit` instants scoped inside
+    the L4 step that triggered them.
+
+  **Final verification (post-follow-on):**
+  - `cargo -q xtask unit` clean: 331/331 tests.
+  - `cargo test -p tx-scripts --test drive_observe -- --test-threads=1`
+    5/5 pass (added parent-linkage case).
+  - `cargo test -p tx-substrate --test obs8_zone_sign_emit
+    --test obs8_index_commit_emit -- --test-threads=1` 4/4 pass.
+  - `cargo xtask observe-discipline` clean (471 files, 194 StepOp
+    impls).
+  - `cargo build --target riscv64gc-unknown-none-elf -p
+    tx-kernel-riscv64-qemu-virt` clean.
+
+  **Next step:** wire `with_task_id(tid.0)` at thread-future mailbox
+  construction so `PayloadResume.task_id_low` and
+  `PayloadDriveBegin.task_id_low` are non-zero in production traces
+  (today they pick up the subject's PID when a `SubjectContext` is
+  populated; kernel-internal actors still emit 0). After that, only
+  OBS-9 (reactor scheduler track) and dynamic string interning
+  remain on the v1 deferred list.
+
+  **Blocker:** none.
+
 - 2026-05-18 **ext4 mount-time RO/RW distinction + Linux `MS_RDONLY` honoured.**
   Previously `mount_ext4_read_only` was the only entry point and its
   name was a misnomer — the underlying `Ext4FsInstance` and its

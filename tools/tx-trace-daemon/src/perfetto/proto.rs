@@ -41,7 +41,13 @@ pub struct TracePacket {
     #[prost(uint64, optional, tag = "8")]
     pub timestamp: Option<u64>,
 
-    /// Clock domain for `timestamp`.  64 = BUILTIN_CLOCK_BOOTTIME.
+    /// Clock domain for `timestamp`.
+    ///
+    /// Builtin clock ids: `1=REALTIME`, `3=MONOTONIC`, `6=BOOTTIME`.
+    /// The sequence-scoped custom-clock range is `64..=127` — values in
+    /// that range MUST be declared in a `ClockSnapshot` paired with a
+    /// builtin clock at the same instant, or the trace processor emits
+    /// `CLOCK_SYNC_FAILURE_NO_PATH` and drops every referencing packet.
     #[prost(uint32, optional, tag = "58")]
     pub timestamp_clock_id: Option<u32>,
 
@@ -123,7 +129,16 @@ pub struct ProcessDescriptor {
 
 /// `perfetto.protos.TrackEvent`
 ///
-/// TYPE_SLICE_BEGIN = 1, TYPE_SLICE_END = 2, TYPE_INSTANT = 4.
+/// `perfetto.protos.TrackEvent.Type`:
+///   TYPE_UNSPECIFIED = 0
+///   TYPE_SLICE_BEGIN = 1
+///   TYPE_SLICE_END   = 2
+///   TYPE_INSTANT     = 3
+///   TYPE_COUNTER     = 4
+/// — see Perfetto's `protos/perfetto/trace/track_event/track_event.proto`.
+/// Earlier versions of this comment incorrectly listed `TYPE_INSTANT = 4`,
+/// which collided with `TYPE_COUNTER` and produced spurious
+/// "counter without counter_value" import errors in the UI.
 #[derive(Clone, PartialEq, Message)]
 pub struct TrackEvent {
     /// Track UUID this event belongs to.
@@ -166,7 +181,8 @@ pub enum TrackEventType {
     Unspecified = 0,
     SliceBegin  = 1,
     SliceEnd    = 2,
-    Instant     = 4,
+    Instant     = 3,
+    Counter     = 4,
 }
 
 // ── DebugAnnotation ───────────────────────────────────────────────────────────

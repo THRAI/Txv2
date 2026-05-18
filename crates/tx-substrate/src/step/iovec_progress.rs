@@ -63,6 +63,13 @@ impl StepProgress for IoVecProgress {
         None
     }
 
+    fn trace_kind(&self) -> u8 {
+        4
+    }
+    fn trace_value(&self) -> u32 {
+        self.iovecs_complete
+    }
+
     fn extend(&mut self, other: Self) {
         if other.iovecs_complete > 0 {
             self.iovecs_complete = self.iovecs_complete.saturating_add(other.iovecs_complete);

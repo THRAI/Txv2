@@ -1498,6 +1498,12 @@ impl<P: TxPlatform> CoreInit<P> {
             };
             let task_payload = payload.clone();
             let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+            // OBS-V1 §13.2: thread the user-thread TID into the task's
+            // `TaskMailbox` so `WaitSource::notify_emit` and
+            // `PayloadDriveBegin` emit per-thread identity rather than
+            // 0. The TID is read from `child_thread` while we still have
+            // the cap; once the future moves it, the cap is consumed.
+            let tid_low = child_thread.tid.0;
             let _ = BOOT_REACTOR.with(|reactor| {
                 reactor.submit_task_with_meta(
                     crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -1505,7 +1511,8 @@ impl<P: TxPlatform> CoreInit<P> {
                         crate::thread_future::run_thread::<P>(child_thread, task_payload),
                     ),
                     boot_runtime::InitialSchedMeta::kernel()
-                        .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
+                        .with_affinity(tx_hal::CpuMask::single(current_cpu).bits())
+                        .with_task_id(tid_low),
                 );
             });
         }

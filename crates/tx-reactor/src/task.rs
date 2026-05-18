@@ -109,7 +109,7 @@ pub(crate) struct Task {
 }
 
 impl Task {
-    fn new_for_handle<F>(handle: TaskKey, future: F) -> Self
+    fn new_for_handle<F>(handle: TaskKey, future: F, task_id_low: u32) -> Self
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -120,7 +120,12 @@ impl Task {
             status: TaskStatus::Runnable,
             wake_state: Arc::new(TaskWakeState::new()),
             ast: AstSlot::new(),
-            mailbox: Arc::new(TaskMailbox::new()),
+            // OBS-V1 §13.2 flow-id material: per-thread TID rides on
+            // the task's mailbox so `WaitSource::notify_emit` and
+            // `PayloadDriveBegin` carry the right identity. `0` is
+            // the documented sentinel for "no TID known" (kernel
+            // tasks, test contexts, pre-thread-runtime contexts).
+            mailbox: Arc::new(TaskMailbox::new().with_task_id(task_id_low)),
             last_ast_batch: AstBatch::default(),
             last_stop_reason: None,
         }
@@ -159,11 +164,24 @@ impl TaskTable {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.submit_with_task_id(future, 0)
+    }
+
+    /// Submit a task with an explicit observation TID.
+    ///
+    /// Plumbed by [`Reactor::submit_task_with_meta`] so the per-thread
+    /// trace identity threads into [`TaskMailbox::with_task_id`] at
+    /// construction time. Kernel-only tasks pass `0` (the documented
+    /// "no TID" sentinel).
+    pub fn submit_with_task_id<F>(&mut self, future: F, task_id_low: u32) -> TaskKey
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let (id, generation) = self
             .take_reusable_slot()
             .unwrap_or_else(|| self.push_fresh_slot());
         let handle = TaskKey::new(id, generation);
-        self.slots[id.index()].task = Some(Task::new_for_handle(handle, future));
+        self.slots[id.index()].task = Some(Task::new_for_handle(handle, future, task_id_low));
         handle
     }
 
