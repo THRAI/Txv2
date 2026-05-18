@@ -428,20 +428,23 @@ def main():
     results = {}
 
     for group, group_lines in sorted(groups.items()):
-        if group not in judges:
-            print(f"[{group}] 无对应 judge 脚本，跳过")
-            continue
-        judge_path = judges[group]
-        proc = subprocess.run(
-            [sys.executable, judge_path],
-            input="".join(group_lines).encode(),
-            capture_output=True,
-        )
-        try:
-            data = json.loads(proc.stdout.decode())
-        except Exception:
-            print(f"[{group}] judge 解析失败: {proc.stderr.decode()[:200]}")
-            continue
+        if group in judges:
+            judge_path = judges[group]
+            proc = subprocess.run(
+                [sys.executable, judge_path],
+                input="".join(group_lines).encode(),
+                capture_output=True,
+            )
+            try:
+                data = json.loads(proc.stdout.decode())
+            except Exception:
+                print(f"[{group}] judge 解析失败: {proc.stderr.decode()[:200]}")
+                continue
+        else:
+            data = fallback_results(group, group_lines)
+            if data is None:
+                print(f"[{group}] 无对应 judge 脚本，跳过")
+                continue
 
         if not official_only:
             data = adapt_ltp_detail_counts(group, group_lines, data)
@@ -459,6 +462,40 @@ def main():
 
     print()
     print(f"总分: {total_pass}/{total_all}")
+
+
+def base_group(group):
+    for suffix in ("-musl", "-glibc"):
+        if group.endswith(suffix):
+            return group[: -len(suffix)]
+    return group
+
+
+def fallback_results(group, group_lines):
+    """Parse stable output emitted by official testsuits shell scripts."""
+    group = base_group(group)
+    text = "".join(group_lines)
+    if group == "busybox":
+        return command_results(text, r"testcase busybox (.*?) (success|fail)\s*$")
+    if group in ("iperf", "netperf"):
+        return command_results(
+            text, rf"====== {re.escape(group)} (.*?) end: (success|fail) ======"
+        )
+    return None
+
+
+def command_results(text, pattern):
+    items = []
+    for match in re.finditer(pattern, text, flags=re.MULTILINE):
+        name, status = match.groups()
+        items.append(
+            {
+                "name": name.strip(),
+                "pass": 1 if status == "success" else 0,
+                "all": 1,
+            }
+        )
+    return items or None
 
 
 if __name__ == "__main__":
